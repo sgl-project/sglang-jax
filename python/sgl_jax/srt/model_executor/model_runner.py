@@ -711,52 +711,28 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                     _index_topk,
                     cfg.index_topk,
                 )
-            # ── PR1 scope guards: DSA sparse PREFILL (DSA_PREFILL_SPARSE=1) ──
-            # This is the INITIAL single-sequence, single-shot sparse-MLA prefill.
-            # It assumes a single-shot extend from position 0 and does NOT yet
-            # support: radix/prefix caching (a cache hit turns prefill into a
-            # partial extend the current-chunk page table can't represent),
-            # batching (max_running>1 ⇒ multi-seq ragged extend), or chunked
-            # prefill (a split prompt references pages outside the chunk). Fail
-            # fast with an actionable message instead of silently emitting
-            # garbage. Gated on the opt-in flag, so the dense-prefill/decode
-            # paths — and CI, which never sets DSA_PREFILL_SPARSE — are unaffected.
+            # ── DSA sparse PREFILL (DSA_PREFILL_SPARSE=1) ──
+            # The packed-ragged sparse-MLA prefill path now supports the full serving
+            # surface: multi-request batching (max_running>1), radix/prefix caching
+            # (a cache hit is an extend with a non-zero prefix), and chunked prefill
+            # (each chunk is an extend with the growing prefix as its cache). All
+            # three reduce to the same per-query-token kernel contract — the kernel
+            # uses the full ``seq_lens`` causal bound, absolute ``positions`` and
+            # prefix/chunk pages via ``page_indices``; the IndexShare carry is intra-
+            # pass so full layers rescore the full kv every chunk (no cross-chunk
+            # state). Validated by the CPU-interpret parity gates G0–G6 + A1/A2 in
+            # test/srt/kernels/dsa/test_sparse_mla_prefill_parity.py. Gated on the
+            # opt-in flag, so the dense-prefill/decode paths — and CI, which never
+            # sets DSA_PREFILL_SPARSE — are unaffected.
             if os.environ.get("DSA_PREFILL_SPARSE", "0") == "1":
                 sa = self.server_args
-                ctx_len = sa.context_length or getattr(self.model_config, "context_len", None)
-                problems = []
-                if not sa.disable_radix_cache:
-                    problems.append(
-                        "radix/prefix cache is ENABLED — pass --disable-radix-cache "
-                        "(a cache hit makes prefill a partial extend the sparse page "
-                        "table cannot represent → garbage output)"
-                    )
-                if sa.max_running_requests != 1:
-                    problems.append(
-                        f"max_running_requests={sa.max_running_requests} — set "
-                        "--max-running-requests 1 (batching needs multi-seq ragged "
-                        "extend, not supported yet)"
-                    )
-                if sa.chunked_prefill_size is None or (
-                    ctx_len is not None and sa.chunked_prefill_size < ctx_len
-                ):
-                    problems.append(
-                        f"chunked_prefill_size={sa.chunked_prefill_size} < "
-                        f"context_length={ctx_len} — set --chunked-prefill-size >= "
-                        "context length so prompts prefill single-shot (no chunking)"
-                    )
-                if problems:
-                    raise ValueError(
-                        "DSA_PREFILL_SPARSE=1 (initial single-sequence sparse-prefill) "
-                        "is incompatible with the current server args:\n  - "
-                        + "\n  - ".join(problems)
-                        + "\nThis is an initial version; radix-cache, batching and "
-                        "chunking support are follow-ups."
-                    )
                 logger.warning(
-                    "DSA sparse PREFILL enabled (initial single-seq, single-shot "
-                    "scope): radix-cache OFF, max_running=1, single-shot prefill "
-                    "(chunk>=context). index_topk=%s.",
+                    "DSA sparse PREFILL enabled (packed-ragged): batching + radix + "
+                    "chunked-prefill supported. max_running=%s, radix_cache=%s, "
+                    "chunked_prefill_size=%s, index_topk=%s.",
+                    sa.max_running_requests,
+                    not sa.disable_radix_cache,
+                    sa.chunked_prefill_size,
                     _index_topk,
                 )
             full_attn_backend = DSASparseAttentionBackend(

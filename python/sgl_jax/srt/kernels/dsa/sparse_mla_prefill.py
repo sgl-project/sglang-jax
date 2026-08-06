@@ -50,8 +50,10 @@ def _sparse_mla_kernel_chunked_hminor(
     q_ref,  # [1, 1, Hp, Dk]  Hp padded to the bf16 sublane tile (16), NOT to 128
     idx_ref,  # [1, 1, 1, K]    SMEM
     pos_ref,  # [1, 1, 1, 1]    SMEM
+    kvlen_ref,  # [1, 1, 1, 1]  SMEM  per-query causal bound (seq_lens[rid]; == T single-seq)
+    base_ref,  # [1, 1, 1, 1]   SMEM  per-query page-table base (cu_kv_lens[rid]//ps; 0 single-seq)
     kv_hbm,  # flat: [B, T(+RBF), Dk] HBM;  paged: [1, num_pages*page_size, Dk] HBM
-    pt_ref,  # [1, 1, 1, max_pages] SMEM  page table for this request (paged only; dummy if flat)
+    pt_ref,  # [1, 1, 1, PTW] SMEM  page table (per-request slice at base + logical page)
     o_ref,  # [1, 1, Hp, Dv]
     kv_scratch,  # [CBR, Dk] VMEM  one chunk of gathered latent
     sem,  # DMA semaphores (G,)
@@ -60,12 +62,12 @@ def _sparse_mla_kernel_chunked_hminor(
     Dv: int,
     RB: int,
     RBF: int,
-    T: int,
     K: int,
     G: int,
     CBR: int,  # G*RBF rounded up to the 128-lane tile (score's key axis is the lane axis)
     paged: bool = False,  # read from the packed 4D paged latent cache via pt_ref
     page_size: int = 0,  # tokens per page (paged only; static)
+    PTW: int = 1,  # page-table width (max_pages single-seq / total packed pages ragged)
 ):
     """Head-minor relayout of the chunked kernel for **few heads/device** (head-TP).
 
@@ -86,6 +88,8 @@ def _sparse_mla_kernel_chunked_hminor(
     Hp = q_ref.shape[2]
     q = q_ref[0, 0]  # [Hp, Dk] bf16
     qpos = pos_ref[0, 0, 0, 0]
+    kv_len = kvlen_ref[0, 0, 0, 0]  # per-query causal bound (== T in single-seq)
+    base = base_ref[0, 0, 0, 0]  # per-query page-table base (== 0 in single-seq)
     NC = (K + G - 1) // G
 
     lane = jnp.arange(CBR, dtype=jnp.int32)  # [CBR] iota on the key (lane) axis
@@ -103,10 +107,16 @@ def _sparse_mla_kernel_chunked_hminor(
             # but pp (from the page table) is opaque to Mosaic. Express the offset as
             # an explicit `r8 * 8` (page_size and o0 are both %8) so divisibility is
             # provable — the same idiom the dense paged kernel uses.
-            lt = u * RB  # logical token start
+            #
+            # ``u`` is a SEQ-LOCAL logical page id; the request's pages start at
+            # ``base`` in the packed page table (base==0 for the single-seq per-b
+            # table). Clamp base+lp to the table width so a padded/-1 lane can't
+            # gather out of range (the lane is masked out below anyway).
+            lt = u * RB  # logical token start (within the request)
             lp = lt // page_size  # logical page (static divisor)
             o0 = lt - lp * page_size  # in-page offset (multiple of RB)
-            pp = pt_ref[0, 0, 0, lp]  # physical page id
+            pidx = jnp.minimum(base + lp, PTW - 1)
+            pp = pt_ref[0, 0, 0, pidx]  # physical page id
             r8 = pp * (page_size // 8) + o0 // 8  # (P*page_size + o0) // 8, exact
             return kv_hbm.at[0, pl.ds(r8 * 8, RBF), :]
         return kv_hbm.at[b, pl.ds(u * RB, RBF), :]
@@ -149,10 +159,12 @@ def _sparse_mla_kernel_chunked_hminor(
             u_vec = jnp.where(sel, u_g, u_vec)
             row_vec = jnp.where(sel, lane - lo, row_vec)
             ir_vec = jnp.where(sel, inr, ir_vec)
-        kp = u_vec * RB + row_vec  # [CBR] key positions
+        kp = u_vec * RB + row_vec  # [CBR] seq-local key positions
         # (u_vec >= 0) drops topk padding lanes (unit id -1); their DMA was
         # clamped to unit 0, so the read is safe and only the mask excludes them.
-        valid = (u_vec >= 0) & (row_vec < RB) & (ir_vec > 0) & (kp <= qpos) & (kp < T)
+        # ``kv_len`` is the per-request bound (seq_lens[rid]); in the single-seq
+        # path it equals the static T, so this is a strict generalisation.
+        valid = (u_vec >= 0) & (row_vec < RB) & (ir_vec > 0) & (kp <= qpos) & (kp < kv_len)
         bias = jnp.where(valid, 0.0, -jnp.inf)  # [CBR] fp32
 
         for g in range(G):
@@ -208,7 +220,17 @@ def sparse_mla_attention(
     page_table=None,  # [B, max_pages] int32: logical page -> physical page. When set,
     # ``kv`` is the packed 4D paged cache and the kernel gathers from it.
     page_size: int | None = None,  # tokens/page (required with page_table)
-    seq_len: int | None = None,  # logical T for the causal mask (required with page_table)
+    seq_len: int | None = None,  # logical T for the causal mask (required, non-ragged paged)
+    # ── packed-ragged mode (multi-request extend) ────────────────────────────
+    # When ``q_seq_id`` is set, ``q`` is packed as [1, total_tokens, H, Dk] and the
+    # per-query causal bound / page-table base are resolved per token from the same
+    # ragged metadata the dense path uses. ``page_indices`` (flat packed physical
+    # pages) replaces the per-request ``page_table``; ``indices`` are seq-local page
+    # ids relative to each request's window (page_indices[cu_kv_lens[rid]//ps + p]).
+    q_seq_id=None,  # [total_tokens] int32  token -> request id (enables ragged mode)
+    seq_lens=None,  # [num_seqs] int32       per-request kv length (causal bound)
+    cu_kv_lens=None,  # [num_seqs+1] int32    page-aligned kv offsets (page_indices stride)
+    page_indices=None,  # [total_pages] int32  packed physical page ids
 ):
     """Sparse MLA-latent attention (head-minor chunked kernel).
     Returns ``[B, S, H, kv_lora_rank]`` (float32).
@@ -236,7 +258,12 @@ def sparse_mla_attention(
     K = indices.shape[2]
     Dv = kv_lora_rank
     RB = read_block
-    paged = page_table is not None
+    ragged = q_seq_id is not None
+    paged = (page_table is not None) or ragged
+    if ragged and B != 1:
+        raise ValueError(f"ragged mode packs all requests into B=1 (got B={B})")
+    if ragged and (seq_lens is None or cu_kv_lens is None or page_indices is None):
+        raise ValueError("ragged mode requires seq_lens, cu_kv_lens and page_indices")
     if not block_units or block_units < 1:
         raise ValueError("sparse_mla_attention requires block_units >= 1")
     if sm_scale is None:
@@ -261,11 +288,15 @@ def sparse_mla_attention(
     if paged:
         if RB % 16 != 0:
             raise ValueError("paged KV requires read_block % 16 == 0 (no cross-page over-fetch)")
-        if page_size is None or seq_len is None:
-            raise ValueError("paged KV requires page_size and seq_len")
+        if page_size is None:
+            raise ValueError("paged KV requires page_size")
+        if not ragged and seq_len is None:
+            raise ValueError("non-ragged paged KV requires seq_len")
         if kv.shape[-1] != Dk_pad:
             raise ValueError(f"paged cache last dim {kv.shape[-1]} != Dk_pad {Dk_pad}")
-        T = seq_len
+        # T is the causal bound only in the non-ragged path (a single static scalar);
+        # ragged resolves the bound per token from seq_lens[q_seq_id] instead.
+        T = seq_len if not ragged else S
         # flatten [num_pages, ps//packing, packing, Dk_pad] -> [1, num_pages*page_size, Dk_pad]
         num_pages = kv.shape[0]
         kv = kv.reshape(1, num_pages * page_size, Dk_pad)
@@ -283,19 +314,30 @@ def sparse_mla_attention(
     # heads on the sublane axis (padded to the bf16 sublane tile of 16, not 128).
     G = max(1, min(block_units, K))
     RBF = ((RB + 15) // 16) * 16
-    if paged:
-        ps = page_size  # RBF == RB (RB%16==0) => no over-fetch
-        max_pages = (T + ps - 1) // ps
+    ps = page_size or 0
+    if ragged:
+        # packed page table: one flat physical-page list; each request's window
+        # starts at cu_kv_lens[rid]//ps (the per-query ``base``). Per-query causal
+        # bound is seq_lens[rid]. Both are resolved per token below.
+        PTW = page_indices.shape[0]
+        pt_arg = page_indices.reshape(1, 1, 1, PTW).astype(jnp.int32)
+        qsid = jnp.clip(q_seq_id, 0, seq_lens.shape[0] - 1).astype(jnp.int32)
+        kvlen_arg = seq_lens[qsid].reshape(B, S, 1, 1).astype(jnp.int32)
+        base_arg = (cu_kv_lens[qsid] // ps).reshape(B, S, 1, 1).astype(jnp.int32)
+    elif paged:
+        PTW = (T + ps - 1) // ps  # max_pages
         # page table is per-REQUEST (same for all query tokens s) => index by b only.
-        pt_arg = page_table.reshape(B, 1, 1, max_pages).astype(jnp.int32)
-        pt_spec = pl.BlockSpec(
-            (1, 1, 1, max_pages), lambda b, s: (b, 0, 0, 0), memory_space=pltpu.SMEM
-        )
+        pt_arg = page_table.reshape(B, 1, 1, PTW).astype(jnp.int32)
+        kvlen_arg = jnp.full((B, S, 1, 1), T, jnp.int32)  # static causal bound
+        base_arg = jnp.zeros((B, S, 1, 1), jnp.int32)  # per-b table => base 0
     else:
         kv = jnp.pad(kv, ((0, 0), (0, RBF), (0, 0)))
         # dummy 1-wide page table so the kernel signature is uniform (unused when flat).
+        PTW = 1
         pt_arg = jnp.zeros((B, 1, 1, 1), jnp.int32)
-        pt_spec = pl.BlockSpec((1, 1, 1, 1), lambda b, s: (b, 0, 0, 0), memory_space=pltpu.SMEM)
+        kvlen_arg = jnp.full((B, S, 1, 1), T, jnp.int32)
+        base_arg = jnp.zeros((B, S, 1, 1), jnp.int32)
+    pt_spec = pl.BlockSpec((1, 1, 1, PTW), lambda b, s: (b, 0, 0, 0), memory_space=pltpu.SMEM)
     CBR = ((G * RBF + 127) // 128) * 128  # key (lane) axis: %128
     Hq = ((H + 15) // 16) * 16  # heads on sublane: %16 (bf16 tile)
     if Hq != H:
@@ -306,31 +348,29 @@ def sparse_mla_attention(
         Dv=Dv,
         RB=RB,
         RBF=RBF,
-        T=T,
         K=K,
         G=G,
         CBR=CBR,
         paged=paged,
-        page_size=(page_size or 0),
+        page_size=ps,
+        PTW=PTW,
     )
     scratch_shapes = [
         pltpu.VMEM((CBR, Dk_pad), kv.dtype),  # one chunk of gathered latent
         pltpu.SemaphoreType.DMA((G,)),  # one semaphore per unit
     ]
 
+    smem = pltpu.SMEM
     in_specs = [
         pl.BlockSpec((1, 1, Hq, Dk_pad), lambda b, s: (b, s, 0, 0)),  # q (VMEM)
-        pl.BlockSpec(
-            (1, 1, 1, K), lambda b, s: (b, s, 0, 0), memory_space=pltpu.SMEM
-        ),  # indices (SMEM)
-        pl.BlockSpec(
-            (1, 1, 1, 1), lambda b, s: (b, s, 0, 0), memory_space=pltpu.SMEM
-        ),  # positions (SMEM)
-        pl.BlockSpec(memory_space=pltpu.HBM),  # kv (untiled HBM,
-        #                                                              full — DMA-gathered)
+        pl.BlockSpec((1, 1, 1, K), lambda b, s: (b, s, 0, 0), memory_space=smem),  # indices
+        pl.BlockSpec((1, 1, 1, 1), lambda b, s: (b, s, 0, 0), memory_space=smem),  # positions
+        pl.BlockSpec((1, 1, 1, 1), lambda b, s: (b, s, 0, 0), memory_space=smem),  # kv_len bound
+        pl.BlockSpec((1, 1, 1, 1), lambda b, s: (b, s, 0, 0), memory_space=smem),  # page base
+        pl.BlockSpec(memory_space=pltpu.HBM),  # kv (untiled HBM, full — DMA-gathered)
         pt_spec,  # page table (SMEM)
     ]
-    call_args = [q, indices4, positions4, kv, pt_arg]
+    call_args = [q, indices4, positions4, kvlen_arg, base_arg, kv, pt_arg]
 
     out = pl.pallas_call(
         kernel,
@@ -417,6 +457,87 @@ def prefill_write_and_attend(
         page_table=pt.reshape(1, -1),
         page_size=ps,
         seq_len=T,
+        interpret=interpret,
+    )
+    return out.reshape(T, H, Dv), cache_new
+
+
+def prefill_write_and_attend_ragged(
+    ql,  # [total_tokens, H, kv_lora_rank]   absorbed latent query (nope)
+    qpe,  # [total_tokens, H, rope]           rope query
+    kvc,  # [total_tokens, kv_lora_rank]      new c_kv to write
+    kpe,  # [total_tokens, rope]              new k_rope to write
+    cache,  # [P, ps//pk, pk, Dk_pad]         paged fused latent cache
+    topk_pages,  # [total_tokens, K] int32    seq-local page ids (-1 padded)
+    positions,  # [total_tokens] int32        absolute query positions (causal bound)
+    loc,  # [total_tokens] int32              physical flat slot per token (out_cache_loc)
+    seq_lens,  # [num_seqs] int32             per-request kv length
+    cu_q_lens,  # [num_seqs+1] int32          per-request query offsets (ragged segments)
+    cu_kv_lens,  # [num_seqs+1] int32         page-aligned kv offsets (page_indices stride)
+    page_indices,  # [total_pages] int32      packed physical page ids
+    *,
+    kv_lora_rank: int,
+    page_size: int,
+    sm_scale: float,
+    read_block: int | None = None,  # defaults to page_size (page-level selection)
+    interpret: bool = False,
+):
+    """Packed-ragged self-write + sparse-MLA prefill for **multi-request** extend.
+
+    Generalises :func:`prefill_write_and_attend` to a batch of ragged sequences
+    packed along the token axis (the same layout the dense ``mla_ragged_paged_attention``
+    and the indexer consume). Differences from the single-sequence wrapper:
+
+    * The self-write is unchanged — ``loc`` (out_cache_loc) already names each token's
+      physical slot, so ``flat.at[loc].set(...)`` is correct for any number of
+      sequences and any prefix (padded ``-1`` slots are dropped).
+    * The page table is **not** derived by the ``loc[::ps]`` stride (only valid for one
+      contiguous request). Instead the kernel reads the packed ``page_indices`` at a
+      per-request base ``cu_kv_lens[rid]//ps`` and uses ``seq_lens[rid]`` as the causal
+      bound, with ``rid = q_seq_id[token]`` recovered from ``cu_q_lens``.
+
+    Returns ``(o[total_tokens, H, kv_lora_rank], updated_cache)``.
+    """
+    T, H, Dv = ql.shape
+    rope = qpe.shape[-1]
+    ps = page_size
+    RB = read_block if read_block is not None else ps
+    assert ps % RB == 0, f"read_block {RB} must divide page_size {ps} (page-aligned units)"
+    Pn, pspk, pk, Dk_pad = cache.shape
+    K = topk_pages.shape[-1]
+    S = seq_lens.shape[0]
+
+    q_sparse = jnp.concatenate([ql, qpe], axis=-1)  # [T, H, Dv+rope]
+
+    # self-write: per-token scatter to out_cache_loc (suffix-safe, prefix-agnostic).
+    # mode="drop"+wrap_negative_indices=False drops padded -1 slots (see single-seq).
+    row = jnp.zeros((T, Dk_pad), cache.dtype)
+    row = row.at[:, :Dv].set(kvc.astype(cache.dtype))
+    row = row.at[:, Dv : Dv + rope].set(kpe.reshape(T, rope).astype(cache.dtype))
+    flat = cache.reshape(Pn * ps, Dk_pad)
+    flat = flat.at[loc].set(row, mode="drop", wrap_negative_indices=False)
+    cache_new = flat.reshape(Pn, pspk, pk, Dk_pad)
+
+    # token -> request id (same convention as _scatter_paged / the ref oracle).
+    t = jnp.arange(T, dtype=jnp.int32)
+    q_seq_id = jnp.clip(jnp.searchsorted(cu_q_lens[1:], t, side="right"), 0, S - 1).astype(
+        jnp.int32
+    )
+
+    out = sparse_mla_attention(
+        q_sparse.reshape(1, T, H, q_sparse.shape[2]),
+        cache_new,
+        topk_pages.reshape(1, T, -1),
+        positions.reshape(1, T),
+        kv_lora_rank=Dv,
+        read_block=RB,
+        block_units=K,
+        sm_scale=float(sm_scale),
+        page_size=ps,
+        q_seq_id=q_seq_id,
+        seq_lens=seq_lens,
+        cu_kv_lens=cu_kv_lens,
+        page_indices=page_indices,
         interpret=interpret,
     )
     return out.reshape(T, H, Dv), cache_new
