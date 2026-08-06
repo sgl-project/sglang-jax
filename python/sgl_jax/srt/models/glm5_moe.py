@@ -1422,6 +1422,7 @@ class Glm5ForCausalLM(nnx.Module):
 
             if is_static_quant:
                 new_moe_mappings = {}
+                use_model_mesh_for_scale = moe_backend in ("fused", "fused_v2")
 
                 for key, mapping in moe_mappings.items():
                     target_param = mapping.target_path[0]
@@ -1439,13 +1440,15 @@ class Glm5ForCausalLM(nnx.Module):
                     target_scale_param = target_param + "_scale"
                     scale_src_paths = [p.replace(".weight", ".weight_scale_inv") for p in src_paths]
 
-                    # Stacked HF scale is [E, out_blocks, in_blocks]. Load EP-sharded
-                    # and replicated on the block dims (matches deepseek_v3); the
-                    # loader's _maybe_convert_epmoe_scale_for_kernel handles the
-                    # [E, out_blocks, k_blocks] → [E, k_blocks, 1, n_out] expand.
+                    # Fused kernels execute on the model (data, tensor) mesh, so
+                    # their scales must use the same expert-axis sharding as the
+                    # routed weights. EPMoE keeps its dedicated expert mesh.
+                    scale_sharding = (
+                        mapping.sharding if use_model_mesh_for_scale else ("expert", None, None)
+                    )
                     new_moe_mappings[scale_key] = WeightMapping(
                         target_path=[target_scale_param] + scale_src_paths,
-                        sharding=("expert", None, None),
+                        sharding=scale_sharding,
                         transpose=False,
                         concat_axis=mapping.concat_axis,
                         physical_to_logical_map=mapping.physical_to_logical_map,
