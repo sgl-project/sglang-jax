@@ -9,10 +9,12 @@ cache-miss or partial results.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import random
 import statistics
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import requests
@@ -189,6 +191,73 @@ def _stop_profile(base_url: str) -> None:
         raise RuntimeError(f"profile did not stop cleanly: {status.text}")
 
 
+def _run_native_batch_with_admission_barrier(
+    base_url: str,
+    input_ids: list[list[int]],
+    output_len: int,
+    *,
+    label: str,
+    on_admitted: Callable[[], None],
+    timeout_s: float = 60,
+) -> dict:
+    """Queue a native batch atomically before releasing the scheduler.
+
+    Profiling startup can otherwise race the tokenizer manager's per-request
+    enqueue loop and split a native C32 request into, for example, C29 + C3.
+    Pausing an idle scheduler lets every request reach the waiting queue before
+    the stage profiler is armed and inference resumes.
+    """
+    pause = requests.post(
+        f"{base_url}/pause_generation",
+        json={"mode": "in_place"},
+        timeout=(30, None),
+    )
+    pause.raise_for_status()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            _run_native_batch,
+            base_url,
+            input_ids,
+            output_len,
+            label=label,
+        )
+        try:
+            deadline = time.monotonic() + timeout_s
+            while True:
+                if future.done():
+                    future.result()
+                    raise RuntimeError("native batch finished while generation was paused")
+                server_info = requests.get(
+                    f"{base_url}/get_server_info", timeout=60
+                )
+                server_info.raise_for_status()
+                internal_states = server_info.json().get("internal_states", [])
+                waiting_sizes = [
+                    int(state.get("waiting_queue_size", -1))
+                    for state in internal_states
+                ]
+                if waiting_sizes and min(waiting_sizes) >= len(input_ids):
+                    break
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "native batch did not reach every scheduler waiting queue: "
+                        f"expected={len(input_ids)}, observed={waiting_sizes}"
+                    )
+                time.sleep(0.1)
+
+            on_admitted()
+        finally:
+            resume = requests.post(
+                f"{base_url}/continue_generation",
+                json={},
+                timeout=(30, None),
+            )
+            resume.raise_for_status()
+
+        return future.result()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://localhost:30000")
@@ -221,6 +290,14 @@ def main() -> None:
         "--profile-by-stage",
         action="store_true",
         help="Write separate traces for the selected prefill/decode stages.",
+    )
+    parser.add_argument(
+        "--profile-admission-barrier",
+        action="store_true",
+        help=(
+            "Pause an idle scheduler until the measured native batch is fully "
+            "queued, then arm profiling and resume inference."
+        ),
     )
     parser.add_argument(
         "--profile-stages",
@@ -263,21 +340,39 @@ def main() -> None:
     flush.raise_for_status()
     warm = _run_native_batch(base_url, warm_inputs, 1, label="warm-prefix")
     profile_started = False
-    try:
-        if args.profile_output_dir is not None:
-            _start_profile(
-                base_url,
-                args.profile_output_dir,
-                host_tracer_level=args.profile_host_tracer_level,
-                python_tracer_level=args.profile_python_tracer_level,
-                num_steps=args.profile_num_steps,
-                profile_by_stage=args.profile_by_stage,
-                profile_stages=args.profile_stages,
-            )
-            profile_started = True
-        measured = _run_native_batch(
-            base_url, extended, args.output_len, label="cache-hit-extend-decode"
+
+    def start_profile() -> None:
+        nonlocal profile_started
+        assert args.profile_output_dir is not None
+        _start_profile(
+            base_url,
+            args.profile_output_dir,
+            host_tracer_level=args.profile_host_tracer_level,
+            python_tracer_level=args.profile_python_tracer_level,
+            num_steps=args.profile_num_steps,
+            profile_by_stage=args.profile_by_stage,
+            profile_stages=args.profile_stages,
         )
+        profile_started = True
+
+    if args.profile_admission_barrier and args.profile_output_dir is None:
+        raise ValueError("--profile-admission-barrier requires --profile-output-dir")
+
+    try:
+        if args.profile_admission_barrier:
+            measured = _run_native_batch_with_admission_barrier(
+                base_url,
+                extended,
+                args.output_len,
+                label="cache-hit-extend-decode",
+                on_admitted=start_profile,
+            )
+        else:
+            if args.profile_output_dir is not None:
+                start_profile()
+            measured = _run_native_batch(
+                base_url, extended, args.output_len, label="cache-hit-extend-decode"
+            )
     finally:
         if profile_started:
             _stop_profile(base_url)
@@ -311,6 +406,7 @@ def main() -> None:
         "profile_output_dir": (
             str(args.profile_output_dir) if args.profile_output_dir is not None else None
         ),
+        "profile_admission_barrier": args.profile_admission_barrier,
         "minimum_expected_cache_hit": minimum_expected_hit,
         "warm_wall_s": warm["wall_s"],
         "wall_s": measured["wall_s"],

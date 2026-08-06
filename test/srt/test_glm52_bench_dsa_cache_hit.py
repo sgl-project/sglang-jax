@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import threading
 from pathlib import Path
 from unittest import mock
 
@@ -116,6 +117,54 @@ def test_stop_profile_is_a_noop_after_stage_profile_auto_completes() -> None:
 
     post.assert_not_called()
     idle_response.raise_for_status.assert_called_once_with()
+
+
+def test_profile_admission_barrier_queues_full_native_batch_before_resume() -> None:
+    paused_response = mock.Mock()
+    resumed_response = mock.Mock()
+    server_info_response = mock.Mock()
+    server_info_response.json.return_value = {
+        "internal_states": [
+            {"waiting_queue_size": 4},
+            {"waiting_queue_size": 4},
+        ]
+    }
+    resumed = threading.Event()
+
+    def fake_post(url, **kwargs):
+        if url.endswith("/pause_generation"):
+            return paused_response
+        assert url.endswith("/continue_generation")
+        resumed.set()
+        return resumed_response
+
+    def fake_run_native_batch(*args, **kwargs):
+        assert resumed.wait(timeout=2)
+        return {"wall_s": 1.0}
+
+    on_admitted = mock.Mock()
+    with mock.patch.object(BENCHMARK.requests, "post", side_effect=fake_post) as post:
+        with mock.patch.object(
+            BENCHMARK.requests, "get", return_value=server_info_response
+        ):
+            with mock.patch.object(
+                BENCHMARK, "_run_native_batch", side_effect=fake_run_native_batch
+            ):
+                result = BENCHMARK._run_native_batch_with_admission_barrier(
+                    "http://server",
+                    [[1], [2], [3], [4]],
+                    1,
+                    label="profile",
+                    on_admitted=on_admitted,
+                )
+
+    assert result == {"wall_s": 1.0}
+    on_admitted.assert_called_once_with()
+    assert post.call_args_list[0].args == ("http://server/pause_generation",)
+    assert post.call_args_list[1].args == ("http://server/continue_generation",)
+    paused_response.raise_for_status.assert_called_once_with()
+    resumed_response.raise_for_status.assert_called_once_with()
+    server_info_response.raise_for_status.assert_called_once_with()
 
 
 def test_variant_flag_can_label_radix_topk() -> None:
