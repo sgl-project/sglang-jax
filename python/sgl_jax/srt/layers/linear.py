@@ -481,6 +481,14 @@ class QuantizedLinear(nnx.Module):
         else:
             # Per-channel scale: [n_out]
             w_scale_spec = P(output_axis)
+        # jax[tpu] 0.10 runs the mesh in Explicit-axis mode ("sharding in types"):
+        # shard_map requires each input's committed sharding to match in_specs
+        # exactly, and with_sharding_constraint is only an assert. FP8 block-quant
+        # scales can arrive REPLICATED from the weight loader (the kernel-ready 3D
+        # expansion drops the sharding), which trips col-parallel projections such
+        # as q_b_proj. Explicitly reshard the scale to its expected spec — a no-op
+        # when it is already correctly sharded.
+        scale_val = jax.sharding.reshard(scale_val, NamedSharding(self.mesh, w_scale_spec))
         in_specs = (P("data", input_axis), P(output_axis, input_axis), w_scale_spec)
 
         target = out_sharding or NamedSharding(self.mesh, P("data", output_axis))
