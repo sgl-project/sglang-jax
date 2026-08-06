@@ -44,7 +44,11 @@ def replicate_across_mesh(array: ArrayLike, mesh: Mesh) -> jax.Array:
     spec = NamedSharding(mesh, PartitionSpec())
     if not isinstance(array, jax.Array):
         return jax.device_put(array, spec)
-    if array.sharding == spec:
+    # JAX canonicalizes a rank-N replicated output to ``P(None, ..., None)``
+    # even when it was requested with ``P()``.  Compare the effective layout
+    # instead of the syntactic PartitionSpec so an already-replicated encoder
+    # result does not compile an identity reshard on the first real request.
+    if array.sharding.is_fully_replicated and array.sharding.device_set == spec.device_set:
         return array
     return _replicate_fn(mesh, array.ndim)(array)
 
@@ -90,13 +94,12 @@ def pack_lanes(
     *,
     buckets: tuple[int, ...],
     merge_unit: int,
-    feature_of: Callable[[MultimodalDataItem], ArrayLike] = lambda item: item.feature,
     dtype: np.dtype | type = np.float32,
 ) -> PackedLanes:
     # I extracted the pack from qwen2.5VL and qwen3VL into a function,
     # but this might not be a good practice.
     # Gemma4 has a fixed shape, so there is clearly a better approach.
-    features_np = [np.asarray(feature_of(item)) for item in items]
+    features_np = [np.asarray(item.feature) for item in items]
     lengths = [feature.shape[0] for feature in features_np]
     lanes = balance_lanes(lengths, num_lanes)
     lane_loads = [sum(lengths[index] for index in lane) for lane in lanes]
@@ -134,7 +137,6 @@ def pack_batch(
     pack_metadata: Callable[[list[MultimodalDataItem]], Any] | None = None,
     empty_metadata: Callable[[int], Any] | None = None,
     pad_metadata: Callable[[Any, int], Any] | None = None,
-    feature_of: Callable[[MultimodalDataItem], ArrayLike] = lambda item: item.feature,
     dtype: np.dtype | type = np.float32,
 ):
     """Pack items into lanes and move features (+ per-lane metadata) to device.
@@ -160,7 +162,6 @@ def pack_batch(
         num_lanes,
         buckets=buckets,
         merge_unit=merge_unit,
-        feature_of=feature_of,
         dtype=dtype,
     )
     features = put_batch(packed.features)
@@ -193,12 +194,11 @@ def to_packed_embedding(
 
     ``output`` must be in the packed ``[num_lanes, cap, F]`` layout produced by
     :func:`pack_lanes` (``F == (1 + deepstack_dim) * H``, deepstack planes
-    already concatenated onto the trailing axis) -- the leading two dims are read
-    back as ``num_lanes`` and ``cap``, and ``placements`` indexes into it. When
+    already concatenated onto the trailing axis) -- ``placements`` indexes into
+    it and ``num_lanes``/``cap`` are read back off the shape by the wrapper. When
     ``mesh`` is set, the output is replicated across the mesh before wrapping.
     """
     if mesh is not None:
         with jax.set_mesh(mesh):
             output = replicate_across_mesh(output, mesh)
-    num_lanes, cap = int(output.shape[0]), int(output.shape[1])
-    return PackedMultimodalEmbedding(output, placements, num_lanes, cap, deepstack_dim)
+    return PackedMultimodalEmbedding(output, placements, deepstack_dim)

@@ -229,8 +229,6 @@ class CompilationManager:
                 packed = PackedMultimodalEmbedding(
                     output=_replicated((num_lanes, cap, hidden * (1 + deepstack_dim))),
                     placements=((0, 0, length),),
-                    num_lanes=num_lanes,
-                    cap=cap,
                     deepstack_dim=deepstack_dim,
                 )
                 running, merged_deepstack = _gather_merge(target, None, packed, (task,), mesh)

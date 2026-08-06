@@ -1,3 +1,6 @@
+import asyncio
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -27,6 +30,14 @@ def test_build_cache_input_ids_uses_item_hash():
         2,
     ]
     assert input_ids == [1, IMAGE_TOKEN, IMAGE_TOKEN, 2]
+
+
+def test_qwen_vl_rejects_audio_inputs():
+    processor = QwenVLProcessor(SimpleNamespace(), SimpleNamespace(), object())
+    request = SimpleNamespace(audio_data=["audio.wav"])
+
+    with pytest.raises(ValueError, match="does not support audio"):
+        asyncio.run(processor.process_mm_data_async(None, "prompt", request))
 
 
 def test_placeholder_ranges_are_half_open():
@@ -69,6 +80,22 @@ def test_build_items_splits_features_and_metadata():
     assert [item.feature.shape for item in items] == [(8, 1), (16, 1)]
     assert [item.placeholder_ranges for item in items] == [[(2, 4)], [(5, 9)]]
     np.testing.assert_array_equal(items[1].get("image_grid_thw"), [[1, 4, 4]])
+
+
+def test_video_timing_changes_item_identity():
+    def make_item(seconds):
+        item = QwenVLProcessor._build_items(
+            np.ones((8, 1)),
+            [(1, 2, 4)],
+            [(0, 2)],
+            Modality.VIDEO,
+            "video_grid_thw",
+        )[0]
+        QwenVLProcessor._set_video_timing([item], [seconds])
+        item.set_pad_value()
+        return item
+
+    assert make_item(0.5).hash != make_item(1.0).hash
 
 
 @pytest.mark.parametrize(

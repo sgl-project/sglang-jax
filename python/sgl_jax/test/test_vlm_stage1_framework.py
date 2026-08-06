@@ -5,7 +5,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from flax import nnx
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec
 
 from sgl_jax.srt.managers.schedule_batch import (
@@ -14,8 +13,7 @@ from sgl_jax.srt.managers.schedule_batch import (
     ScheduleReqsInfo,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sgl_jax.srt.models.qwen2_5_vl import Qwen2_5_VisionTransformer, _vision_attention
-from sgl_jax.srt.models.qwen3_vl import Qwen3VLVisionModel
+from sgl_jax.srt.models.qwen2_5_vl import Qwen2_5_VisionTransformer
 from sgl_jax.srt.multimodal.common.modality_enum import (
     Modality,
     MultimodalDataItem,
@@ -31,10 +29,12 @@ from sgl_jax.srt.multimodal.in_model.interface import (
     InModelMultimodalContract,
     PackedMultimodalEmbedding,
 )
-from sgl_jax.srt.multimodal.in_model.lane_packing import balance_lanes
-from sgl_jax.srt.multimodal.kernels.flash_attention import SegmentIds
+from sgl_jax.srt.multimodal.in_model.lane_packing import (
+    balance_lanes,
+    replicate_across_mesh,
+)
 from sgl_jax.srt.multimodal.layers.attention.flash_attention_backend import (
-    VisionFlashAttentionBackend,
+    vision_segment_ids_from_cu_seqlens,
 )
 from sgl_jax.srt.multimodal.layers.vision_sharding import VisionShardSpecs
 from sgl_jax.srt.multimodal.processors.qwen_vl import QwenVLProcessor
@@ -213,7 +213,7 @@ def test_vision_batch_layout_uses_all_encoder_lanes(vision_tp, expected_lanes):
 
     fake_mesh = SimpleNamespace(axis_names=("data", "tensor"))
     expected_axis = "data" if vision_tp else ("data", "tensor")
-    assert VisionShardSpecs(fake_mesh, vision_tp).batch_spec(None) == PartitionSpec(
+    assert PartitionSpec(VisionShardSpecs(fake_mesh, vision_tp).batch_axis, None) == PartitionSpec(
         expected_axis,
         None,
     )
@@ -222,22 +222,13 @@ def test_vision_batch_layout_uses_all_encoder_lanes(vision_tp, expected_lanes):
 def _assert_vision_precompile(visual):
     calls = []
 
-    def encode(patches, metadata, valid):
-        calls.append(
-            (
-                patches.shape,
-                valid.shape,
-                tuple(leaf.shape[0] for leaf in jax.tree.leaves(metadata)),
-            )
-        )
+    def encode(*inputs):
+        calls.append(tuple(leaf.shape for leaf in jax.tree.leaves(inputs)))
 
     with patch.object(type(visual), "encode", side_effect=encode):
         visual.precompile()
 
-    assert calls == [
-        ((1, 4, 1), (1,), (1, 1, 1, 1)),
-        ((1, 8, 1), (1,), (1, 1, 1, 1)),
-    ]
+    return calls
 
 
 def test_qwen2_vision_precompile_warms_configured_buckets():
@@ -247,7 +238,10 @@ def test_qwen2_vision_precompile_warms_configured_buckets():
         num_position_embeddings=16,
         deepstack_visual_indexes=[],
     )
-    _assert_vision_precompile(_visual(config=config, input_buckets=(4, 8)))
+    assert _assert_vision_precompile(_visual(config=config, input_buckets=(4, 8))) == [
+        ((1, 4, 1), (1, 1, 2), (1, 4, 2), (1, 2), (1, 2)),
+        ((1, 8, 1), (1, 2, 2), (1, 8, 2), (1, 3), (1, 3)),
+    ]
 
 
 def test_qwen2_vision_rejects_unaligned_buckets():
@@ -267,7 +261,8 @@ def test_qwen2_global_batch_spmd(encoder_tp):
         [(1, 1, length) for length in (8, 4, 2, 7, 6)],
         [(0, length) for length in (8, 4, 2, 7, 6)],
     )
-    patches, _, valid, placements = visual._batch_items(items)
+    patches, metadata, placements = visual._batch_items(items)
+    valid = metadata.full_attn.cu_seqlens[:, -1]
 
     if encoder_tp:
         assert placements == ((0, 0, 8), (0, 8, 4), (0, 12, 2), (1, 0, 7), (1, 7, 6))
@@ -322,8 +317,8 @@ def test_qwen2_encode_items_spmd(encoder_tp):
         input_buckets=(4,),
     )
     items = _items([(1, 1, 4), (1, 1, 2)], [(0, 4), (4, 6)])
-    patches, metadata, valid, _ = visual._batch_items(items)
-    encoded = visual.encode(patches, metadata, valid)
+    patches, metadata, _ = visual._batch_items(items)
+    encoded = visual.encode(patches, metadata)
     assert encoded.sharding.is_fully_replicated
     assert encoded.sharding.spec == PartitionSpec(None, None, None)
     packed = visual.encode_items(items)
@@ -362,59 +357,14 @@ def test_qwen2_encode_items_spmd(encoder_tp):
     assert calls == 2
 
 
-def test_qwen3_vision_precompile_warms_configured_buckets():
-    config = _vision_config(
-        spatial_merge_size=2,
-        window_size=2,
-        num_position_embeddings=16,
-        deepstack_visual_indexes=[],
-    )
-    mesh = _mesh()
-    with jax.set_mesh(mesh):
-        visual = Qwen3VLVisionModel(
-            config,
-            jnp.float32,
-            mesh=mesh,
-            input_buckets=(4, 8),
-        )
-    _assert_vision_precompile(visual)
-
-
-def test_qwen3_vision_rejects_unaligned_buckets():
-    with pytest.raises(ValueError, match="positive multiples of 4"):
-        Qwen3VLVisionModel(
-            _vision_config(spatial_merge_size=2),
-            jnp.float32,
-            mesh=_mesh(),
-            input_buckets=(3,),
-        )
-
-
-@pytest.mark.parametrize("encoder_tp", [False, True])
-def test_qwen3_encode_items_spmd(encoder_tp):
+def test_replicate_across_mesh_reuses_rank_explicit_replication():
     mesh = _mesh(dp=2, tp=2)
-    config = _vision_config(
-        num_position_embeddings=16,
-        depth=1,
-        deepstack_visual_indexes=[0],
-        num_heads=2,
+    value = jax.device_put(
+        jnp.zeros((4, 8, 16)),
+        NamedSharding(mesh, PartitionSpec(None, None, None)),
     )
-    with jax.set_mesh(mesh):
-        visual = Qwen3VLVisionModel(
-            config,
-            jnp.float32,
-            mesh=mesh,
-            tp=encoder_tp,
-            input_buckets=(4,),
-        )
-    items = _items([(1, 1, 2), (1, 1, 4)], [(0, 2), (2, 6)])
-    packed = visual.encode_items(items)
-    assert [length for _, _, length in packed.placements] == [2, 4]
-    assert packed.output.sharding.is_fully_replicated
-    assert packed.output.sharding.device_set == set(mesh.devices.flat)
-    assert packed.deepstack is not None
-    assert packed.deepstack.sharding.is_fully_replicated
-    assert packed.deepstack.sharding.device_set == set(mesh.devices.flat)
+
+    assert replicate_across_mesh(value, mesh) is value
 
 
 def test_batch_separates_patch_and_placeholder_counts():
@@ -497,39 +447,6 @@ def test_batch_routes_video_modality():
     assert batch[Modality.VIDEO][0].item is video[0]
 
 
-@pytest.mark.parametrize(
-    ("max_segment_len", "alignment"),
-    [(None, 2048), (64, 256)],
-)
-def test_long_vision_attention_pads_to_tuned_alignment(max_segment_len, alignment):
-    class _CaptureBackend:
-        def __init__(self):
-            self.max_segment_len = max_segment_len
-            self.shape = None
-
-        def __call__(self, q, k, v, segment_ids):
-            del k, v, segment_ids
-            self.shape = q.shape
-            return q
-
-    sequence_length = 64 * 1024 + 1
-    shape = (1, sequence_length, 1, 1)
-    q = jnp.ones(shape, dtype=jnp.bfloat16)
-    backend = _CaptureBackend()
-
-    output = _vision_attention(
-        backend,
-        q,
-        q,
-        q,
-        jnp.zeros((1, sequence_length), dtype=jnp.int32),
-    )
-
-    expected_length = ((sequence_length + alignment - 1) // alignment) * alignment
-    assert backend.shape == (1, 1, expected_length, 1)
-    assert output.shape == shape
-
-
 def test_qwen_window_blocks_enable_bounded_segment_grid():
     config = _vision_config(
         depth=2,
@@ -546,56 +463,27 @@ def test_qwen_window_blocks_enable_bounded_segment_grid():
             norm_eps=1e-6,
         )
 
-    assert visual.blocks[0].attn.attn_backend.max_segment_len == 64
     assert not visual.blocks[0].attn.attn_backend.block_sparse_segments
-    assert visual.blocks[1].attn.attn_backend.max_segment_len is None
     assert visual.blocks[1].attn.attn_backend.block_sparse_segments
 
 
-@pytest.mark.skipif(
-    "TPU" not in jax.devices()[0].device_kind or jax.device_count() < 4,
-    reason="Requires a four-device TPU mesh.",
-)
-def test_block_sparse_vision_backend_tpu_integration():
-    mesh = Mesh(
-        np.asarray(jax.devices()[:4]).reshape(1, 4),
-        ("data", "tensor"),
+@pytest.mark.parametrize("search_method", ["compare_all", "scan"])
+def test_vision_backend_expands_cu_seqlens_to_segment_ids(search_method):
+    cu_seqlens = jnp.asarray(
+        [[0, 2, 5, 5], [0, 0, 0, 0], [0, 3, 3, 3]],
+        dtype=jnp.int32,
     )
-    batch_size = 4
-    seq_len = 64 * 1024
-    qkv_shape = (batch_size, 1, seq_len, 80)
-    qkv_sharding = NamedSharding(
-        mesh,
-        PartitionSpec(("data", "tensor"), None, None, None),
+    segment_ids = vision_segment_ids_from_cu_seqlens(
+        cu_seqlens,
+        7,
+        search_method=search_method,
     )
-    segment_sharding = NamedSharding(
-        mesh,
-        PartitionSpec(("data", "tensor"), None),
+    expected = np.asarray(
+        [[0, 0, 1, 1, 1, -1, -1], [-1] * 7, [0, 0, 0, -1, -1, -1, -1]],
+        dtype=np.int32,
     )
-    qkv = jax.device_put(jnp.ones(qkv_shape, dtype=jnp.bfloat16), qkv_sharding)
-    segments = jax.device_put(
-        jnp.broadcast_to(
-            (jnp.arange(seq_len, dtype=jnp.int32) // (16 * 1024))[None, :],
-            (batch_size, seq_len),
-        ),
-        segment_sharding,
-    )
-    backend = VisionFlashAttentionBackend(
-        mesh,
-        block_sparse_segments=True,
-    )
-
-    output = jax.jit(
-        lambda qkv, segments: backend(
-            qkv,
-            qkv,
-            qkv,
-            SegmentIds(q=segments, kv=segments),
-        )
-    )(qkv, segments)
-
-    assert output.shape == qkv_shape
-    assert float(output[0, 0, 0, 0]) == 1.0
+    np.testing.assert_array_equal(segment_ids.q, expected)
+    np.testing.assert_array_equal(segment_ids.kv, expected)
 
 
 def test_vision_weight_tp_specs():
@@ -636,8 +524,6 @@ def test_merge_preserves_unmasked_tokens():
                 Modality.AUDIO: lambda _: PackedMultimodalEmbedding(
                     output=jnp.array([[[10.0, 11.0], [20.0, 21.0]]]),  # [1, 2, 2]
                     placements=((0, 0, 2),),
-                    num_lanes=1,
-                    cap=2,
                 )
             }
 
@@ -685,8 +571,6 @@ def test_packed_gather_merge_preserves_data_sharding():
                         output, NamedSharding(mesh, PartitionSpec(None, None, None))
                     ),
                     placements=((0, 0, 2), (1, 0, 2)),
-                    num_lanes=2,
-                    cap=2,
                     deepstack_dim=1,
                 )
 
@@ -722,7 +606,7 @@ def test_packed_gather_merge_handles_chunk_split():
         def get_multimodal_encode_funcs(self):
             return {
                 Modality.IMAGE: lambda items: PackedMultimodalEmbedding(
-                    output=full[None], placements=((0, 0, 4),), num_lanes=1, cap=4
+                    output=full[None], placements=((0, 0, 4),)
                 )
             }
 
@@ -746,9 +630,7 @@ def test_embedding_pool_replays_encoder_output():
             def encode(items):
                 nonlocal calls
                 calls += 1
-                return PackedMultimodalEmbedding(
-                    output=output, placements=((0, 0, 2),), num_lanes=1, cap=2
-                )
+                return PackedMultimodalEmbedding(output=output, placements=((0, 0, 2),))
 
             return {Modality.IMAGE: encode}
 
@@ -779,8 +661,6 @@ def test_embedding_pool_hit_matches_miss_with_deepstack():
                 Modality.IMAGE: lambda items: PackedMultimodalEmbedding(
                     output=output,
                     placements=((0, 0, 2),),
-                    num_lanes=1,
-                    cap=2,
                     deepstack_dim=1,
                 )
             }
@@ -816,8 +696,6 @@ def test_embedding_pool_reads_hit_before_miss_can_evict_it():
                 return PackedMultimodalEmbedding(
                     output=jnp.asarray([[[20.0]]]),
                     placements=((0, 0, 1),),
-                    num_lanes=1,
-                    cap=1,
                 )
 
             return {Modality.IMAGE: encode}
@@ -855,9 +733,7 @@ def test_embedding_pool_reuses_full_item_across_chunks():
             def encode(items):
                 nonlocal calls
                 calls += 1
-                return PackedMultimodalEmbedding(
-                    output=output, placements=((0, 0, 4),), num_lanes=1, cap=4
-                )
+                return PackedMultimodalEmbedding(output=output, placements=((0, 0, 4),))
 
             return {Modality.IMAGE: encode}
 
@@ -886,7 +762,6 @@ def test_embedding_pool_reuses_full_item_across_chunks():
     ("arch", "chunked", "radix", "mixed_chunk"),
     [
         (ARCH, 4096, False, True),
-        ("Qwen3VLForConditionalGeneration", 4096, False, False),
         ("UnsupportedVLM", -1, True, False),
     ],
 )
@@ -975,70 +850,53 @@ def test_overlap_copy_rebuilds_multimodal_batch_from_requests():
     assert Modality.IMAGE in rebuilt
 
 
-def test_qwen2_item_metadata_is_cached_per_grid():
-    visual = _visual(
-        config=_vision_config(spatial_merge_size=2, window_size=2),
-        input_buckets=(8,),
-    )
-    grid = (1, 2, 4)
-    (item_a,) = _items([grid], [(0, int(np.prod(grid)))])
-    (item_b,) = _items([grid], [(0, int(np.prod(grid)))])
-
-    first = visual._item_metadata(item_a)
-    second = visual._item_metadata(item_b)
-
-    # Same resolution -> served from cache (identity), not recomputed.
-    assert first is second
-    assert list(visual._metadata_cache) == [grid]
-
-    other = (2, 2, 4)
-    (item_c,) = _items([other], [(0, int(np.prod(other)))])
-    third = visual._item_metadata(item_c)
-    assert third is not first
-    assert set(visual._metadata_cache) == {grid, other}
+def _assert_no_grid_layout_planning(jaxpr):
+    text = str(jaxpr)
+    for primitive in ("cumsum", "repeat", "scatter", "sort"):
+        assert f"= {primitive}[" not in text
 
 
-def test_qwen3_grid_metadata_is_cached_per_grid():
+def test_qwen2_metadata_is_host_planned_and_bucket_stable():
     config = _vision_config(
         spatial_merge_size=2,
-        window_size=2,
-        num_position_embeddings=16,
-        deepstack_visual_indexes=[],
+        window_size=4,
+        depth=2,
+        fullatt_block_indexes=[1],
     )
-    mesh = _mesh()
-    with jax.set_mesh(mesh):
-        visual = Qwen3VLVisionModel(config, jnp.float32, mesh=mesh, input_buckets=(4, 8))
+    visual = _visual(config=config, input_buckets=(32,))
+    first = _items([(1, 4, 6)], [(0, 6)])
+    patches, metadata, placements = visual._batch_items(first)
+    indices = np.asarray(metadata.indices)
+    position_ids = np.asarray(metadata.position_ids)
 
-    grid = (1, 2, 2)
-    first = visual._grid_metadata(grid)
-    second = visual._grid_metadata(grid)
-    assert first is second
-    assert grid in visual._metadata_cache
-
-    other = (1, 2, 4)
-    assert visual._grid_metadata(other) is not first
-    assert set(visual._metadata_cache) >= {grid, other}
-
-
-def test_qwen3_grid_metadata_survives_abstract_model_construction():
-    config = _vision_config(
-        spatial_merge_size=2,
-        window_size=2,
-        num_position_embeddings=16,
-        deepstack_visual_indexes=[],
+    assert placements == ((0, 0, 6),)
+    assert position_ids.shape == (1, 32, 2)
+    np.testing.assert_array_equal(indices[0, :, 0], [0, 1, 3, 4, 2, 5, 6, 7])
+    np.testing.assert_array_equal(indices[0, :, 1], [0, 1, 4, 2, 3, 5, 6, 7])
+    np.testing.assert_array_equal(
+        position_ids[0, [0, 4, 8, 12, 16, 20]],
+        [[0, 0], [0, 2], [2, 0], [2, 2], [0, 4], [2, 4]],
     )
-    mesh = _mesh()
-    with jax.set_mesh(mesh):
-        visual = nnx.eval_shape(
-            lambda: Qwen3VLVisionModel(
-                config,
-                jnp.float32,
-                mesh=mesh,
-                input_buckets=(4, 8),
-            )
-        )
+    # window layout at [:, 0], full-frame at [:, 1]; tails repeat the final end.
+    np.testing.assert_array_equal(
+        np.asarray(metadata.window_attn.cu_seqlens)[0], [0, 16, 24, 24, 24, 24, 24, 24, 24]
+    )
+    np.testing.assert_array_equal(
+        np.asarray(metadata.full_attn.cu_seqlens)[0], [0, 24, 24, 24, 24, 24, 24, 24, 24]
+    )
+    np.testing.assert_array_equal(
+        visual._build_metadata([[]], 32).window_attn.cu_seqlens,
+        np.zeros((1, 9), dtype=np.int32),
+    )
+    _assert_no_grid_layout_planning(jax.make_jaxpr(visual)(patches, metadata))
 
-    metadata = visual._grid_metadata((1, 2, 2))
-    assert isinstance(metadata.rotary_pos_emb, np.ndarray)
-    assert metadata.rotary_pos_emb.shape == (4, 2)
-    assert np.isfinite(metadata.rotary_pos_emb).all()
+    jax.block_until_ready(visual.encode(patches, metadata))
+    cache_size = visual._encode_jit._cache_size()
+    second = _items([(1, 4, 4), (2, 2, 2)], [(0, 4), (4, 6)])
+    second_patches, second_metadata, _ = visual._batch_items(second)
+    np.testing.assert_array_equal(
+        np.asarray(second_metadata.full_attn.cu_seqlens)[0],
+        [0, 16, 20, 24, 24, 24, 24, 24, 24],
+    )
+    jax.block_until_ready(visual.encode(second_patches, second_metadata))
+    assert visual._encode_jit._cache_size() == cache_size

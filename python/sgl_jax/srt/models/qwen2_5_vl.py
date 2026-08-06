@@ -1,11 +1,14 @@
+import dataclasses
 import logging
 import math
 from collections.abc import Callable
 from functools import partial
 from types import SimpleNamespace
+from typing import Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from transformers import modeling_flax_utils
@@ -13,90 +16,86 @@ from transformers import modeling_flax_utils
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.hf_transformers_utils import get_hf_text_config
 from sgl_jax.srt.layers.embeddings import ParallelLMHead
+from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.qwen2 import Qwen2Model, create_qwen2_weight_mappings
-
-# Import the Qwen2.5-VL vision-metadata module so model import triggers builder
-# registration; the encode body consumes only the opaque ``meta`` pytree.
-from sgl_jax.srt.models.vision_metadata import (  # noqa: F401
-    qwen2_5_vl as _qwen25vl_vision_metadata,
-)
+from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
 from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
     QwenVLModelVitConfig,
 )
-from sgl_jax.srt.multimodal.kernels.flash_attention import SegmentIds
+from sgl_jax.srt.multimodal.in_model.interface import (
+    InModelMultimodalContract,
+    PackedMultimodalEmbedding,
+)
+from sgl_jax.srt.multimodal.in_model.lane_packing import pack_lanes, to_packed_embedding
+from sgl_jax.srt.multimodal.layers.attention.flash_attention_backend import (
+    VisionAttentionMetadata,
+    make_vision_attention_backend,
+)
+from sgl_jax.srt.multimodal.layers.vision_sharding import (
+    VisionShardSpecs,
+    apply_data_sharding,
+    resolve_encoder_tp,
+)
+from sgl_jax.srt.utils.common_utils import resolve_vision_patch_buckets
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-init_fn = nnx.initializers.uniform()
+_init_fn = nnx.initializers.uniform()
 
 
-def _apply_data_sharding(x: jax.Array, mesh: Mesh, spec: PartitionSpec) -> jax.Array:
-    sharding = NamedSharding(mesh, spec)
-    if "data" in mesh.abstract_mesh.explicit_axes:
-        return jax.sharding.reshard(x, sharding)
-    return jax.lax.with_sharding_constraint(x, sharding)
+@dataclasses.dataclass
+class Qwen2_5VisionMetadata:
+    """Host-planned inputs for one ViT encode, threaded as a single object.
+
+    ``indices`` packs the window-reorder indices (``[..., 0]``) and their
+    inverse (``[..., 1]``); ``position_ids`` drives the rotary embedding. The
+    ViT alternates window- and full-attention layers, so it carries a
+    :class:`VisionAttentionMetadata` for each layout, selected per block via
+    ``fullatt_block_indexes``.
+    """
+
+    indices: Any
+    position_ids: Any
+    window_attn: VisionAttentionMetadata
+    full_attn: VisionAttentionMetadata
 
 
-def _apply_rotary_pos_emb_vision(x: jax.Array, rotary_pos_emb: jax.Array) -> jax.Array:
-    # x: [dp, T, N, H]; rotary_pos_emb: [dp, T, rot] (per-image, dp-leading).
-    _, _, _, H = x.shape
-    half_dim = H // 2
-
-    x_real = x[..., :half_dim]
-    x_imag = x[..., half_dim:]
-
-    cos_emb = jnp.cos(rotary_pos_emb)
-    sin_emb = jnp.sin(rotary_pos_emb)
-
-    # rope already carries the dp (batch) axis -> only insert the heads (N) axis.
-    cos_emb = cos_emb[:, :, None, :]  # [dp, T, 1, rot]
-    sin_emb = sin_emb[:, :, None, :]
-
-    x_rotated_real = x_real * cos_emb - x_imag * sin_emb
-    x_rotated_imag = x_real * sin_emb + x_imag * cos_emb
-
-    return jnp.concatenate([x_rotated_real, x_rotated_imag], axis=-1)
+jax.tree_util.register_dataclass(
+    Qwen2_5VisionMetadata,
+    data_fields=["indices", "position_ids", "window_attn", "full_attn"],
+    meta_fields=[],
+)
 
 
-def _vision_attention(
-    backend,
-    q: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
-    seg: jax.Array,
+def _item_grid_thw(item: MultimodalDataItem) -> tuple[int, int, int]:
+    grid = item.get("image_grid_thw")
+    if grid is None:
+        grid = item.get("video_grid_thw")
+    return tuple(int(value) for value in np.asarray(grid).reshape(3))
+
+
+def _apply_rotary_pos_emb_vision(
+    x: jax.Array,
+    cos: jax.Array,
+    sin: jax.Array,
 ) -> jax.Array:
-    """Run DP-leading block-diagonal vision attention."""
-    dp, T, N, H = q.shape
-
-    # [dp, T, N, H] -> [dp, N, T, H] for the kernel.
-    q = jnp.transpose(q, (0, 2, 1, 3))
-    k = jnp.transpose(k, (0, 2, 1, 3))
-    v = jnp.transpose(v, (0, 2, 1, 3))
-
-    # Pad T to the kernel block size; padding rows use a masked sentinel segment.
-    T_aligned = ((T + 127) // 128) * 128
-    pad = T_aligned - T
-    if pad > 0:
-        q = jnp.pad(q, ((0, 0), (0, 0), (0, pad), (0, 0)))
-        k = jnp.pad(k, ((0, 0), (0, 0), (0, pad), (0, 0)))
-        v = jnp.pad(v, ((0, 0), (0, 0), (0, pad), (0, 0)))
-        seg = jnp.pad(seg, ((0, 0), (0, pad)), constant_values=-1)  # [dp, T_aligned]
-
-    segment_ids = SegmentIds(q=seg, kv=seg)
-
-    output = backend(q, k, v, segment_ids)  # [dp, N, T_aligned, H]
-
-    output = output[:, :, :T, :]  # slice back to real seq
-    # [dp, N, T, H] -> [dp, T, N, H]
-    return jnp.transpose(output, (0, 2, 1, 3))
+    """Apply precomputed vision RoPE to ``x[B, T, heads, head_dim]``."""
+    half_dim = x.shape[-1] // 2
+    x_real, x_imag = x[..., :half_dim], x[..., half_dim:]
+    return jnp.concatenate(
+        [x_real * cos - x_imag * sin, x_real * sin + x_imag * cos],
+        axis=-1,
+    ).astype(x.dtype)
 
 
 class Qwen2_5_VisionPatchEmbed(nnx.Module):
+    """3D (temporal × spatial) patch embedding conv."""
+
     def __init__(
         self,
         rngs: nnx.Rngs = None,
@@ -106,212 +105,201 @@ class Qwen2_5_VisionPatchEmbed(nnx.Module):
         hidden_size: int = 1152,
         dtype: jnp.dtype = jnp.bfloat16,
         mesh: Mesh = None,
+        vision_tp: bool = False,
     ) -> None:
         self.patch_size = patch_size
         self.temporal_patch_size = temporal_patch_size
         self.hidden_size = hidden_size
         self.mesh = mesh
-        kernel_size = (temporal_patch_size, patch_size, patch_size)
+        self.specs = VisionShardSpecs(mesh, vision_tp)
 
         self.proj = nnx.Conv(
             in_features=in_channels,
             out_features=hidden_size,
-            kernel_size=kernel_size,
-            strides=kernel_size,
+            kernel_size=(temporal_patch_size, patch_size, patch_size),
+            strides=(temporal_patch_size, patch_size, patch_size),
             use_bias=False,
             param_dtype=dtype,
-            rngs=rngs or nnx.Rngs(0),  # Use dummy rngs if None (for eval_shape)
+            rngs=rngs or nnx.Rngs(0),
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        # x is (dp, seq_len, C * T * H * W) -- dp-leading batched;
-        # seq_len == the per-request packed patch count (== patch_k in the plan).
-        dp, seq_len, dim = x.shape
-        C = dim // (self.temporal_patch_size * self.patch_size * self.patch_size)
-        x = x.reshape(
-            dp,
-            seq_len,
-            C,
-            self.temporal_patch_size,
-            self.patch_size,
-            self.patch_size,
-        )
+        """*x*: ``[B, S, C·T·H·W]`` → ``[B, S, hidden_size]``."""
+        B, S, D = x.shape
+        C = D // (self.temporal_patch_size * self.patch_size * self.patch_size)
+        x = x.reshape(B, S, C, self.temporal_patch_size, self.patch_size, self.patch_size)
         if self.mesh is not None:
-            x = _apply_data_sharding(
-                x,
-                self.mesh,
-                PartitionSpec("data", None, None, None, None, None),
-            )
-        # [dp, seq, C, T, H, W] -> [dp, seq, T, H, W, C]
+            x = apply_data_sharding(x, self.mesh, PartitionSpec(self.specs.batch_axis))
+
+        # [B, S, C, T, H, W] → [B, S, T, H, W, C]
         x = jnp.transpose(x, (0, 1, 3, 4, 5, 2))
-        flat_sharding = out_sharding = None
+
+        sh = None
         if self.mesh is not None and "data" in self.mesh.abstract_mesh.explicit_axes:
-            flat_sharding = NamedSharding(self.mesh, PartitionSpec("data", None, None, None, None))
-            out_sharding = NamedSharding(
-                self.mesh,
-                PartitionSpec("data", None, None, None, None, None),
-            )
+            sh = self.specs.sharding(self.specs.batch_axis)
+
         x = x.reshape(
-            dp * seq_len,
+            B * S,
             self.temporal_patch_size,
             self.patch_size,
             self.patch_size,
             C,
-            out_sharding=flat_sharding,
+            out_sharding=sh,
         )
-        x = self.proj(x, out_sharding=flat_sharding)
-        x = x.reshape(
-            dp,
-            seq_len,
-            1,
-            1,
-            1,
-            self.hidden_size,
-            out_sharding=out_sharding,
-        )
-        # After conv: [dp, seq, 1, 1, 1, hidden_size].
-        x = jnp.squeeze(x, axis=(2, 3, 4))
-        if self.mesh is not None:
-            x = _apply_data_sharding(
-                x,
-                self.mesh,
-                PartitionSpec("data", None, None),
-            )
-        return x
+        x = self.proj(x, out_sharding=sh)
+        x = x.reshape(B, S, 1, 1, 1, self.hidden_size, out_sharding=sh)
+        return jnp.squeeze(x, axis=(2, 3, 4))
 
 
 class Qwen2_5_VLMLP(nnx.Module):
-    def __init__(self, config: QwenVLModelVitConfig, dtype: jnp.dtype, rngs: nnx.Rngs = None):
-        in_features = config.hidden_size
-        hidden_features = config.intermediate_size
-        act_fn = modeling_flax_utils.ACT2FN[config.hidden_act]
+    """ViT MLP: gate/up → SiLU gate → down."""
 
-        # Use dummy rngs if None (for eval_shape)
-        _rngs = rngs or nnx.Rngs(0)
-
-        self.gate_proj = nnx.Linear(
-            in_features,
-            hidden_features,
-            use_bias=True,
-            param_dtype=dtype,
-            rngs=_rngs,
-        )
-        self.up_proj = nnx.Linear(
-            in_features,
-            hidden_features,
-            use_bias=True,
-            param_dtype=dtype,
-            rngs=_rngs,
-        )
-        self.down_proj = nnx.Linear(
-            hidden_features,
-            in_features,
-            use_bias=True,
-            param_dtype=dtype,
-            rngs=_rngs,
-        )
-        self.act_fn = act_fn
-
-    def __call__(self, x: jax.Array) -> jax.Array:
-        gate = self.act_fn(self.gate_proj(x))
-        up = self.up_proj(x)
-        fuse = gate * up
-        return self.down_proj(fuse)
-
-
-class Qwen2_5_VisionAttention(nnx.Module):
     def __init__(
         self,
         config: QwenVLModelVitConfig,
         dtype: jnp.dtype,
         rngs: nnx.Rngs = None,
         mesh: Mesh = None,
+        vision_tp: bool = False,
+    ):
+        self.specs = VisionShardSpecs(mesh, vision_tp)
+        self.act_fn = modeling_flax_utils.ACT2FN[config.hidden_act]
+
+        self.gate_proj = LinearBase(
+            config.hidden_size,
+            config.intermediate_size,
+            mesh=mesh,
+            use_bias=True,
+            kernel_axes=self.specs.col_kernel_axes,
+            params_dtype=dtype,
+        )
+        self.up_proj = LinearBase(
+            config.hidden_size,
+            config.intermediate_size,
+            mesh=mesh,
+            use_bias=True,
+            kernel_axes=self.specs.col_kernel_axes,
+            params_dtype=dtype,
+        )
+        self.down_proj = LinearBase(
+            config.intermediate_size,
+            config.hidden_size,
+            mesh=mesh,
+            use_bias=True,
+            kernel_axes=self.specs.row_kernel_axes,
+            params_dtype=dtype,
+        )
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        specs = self.specs
+        col = specs.sharding(specs.batch_axis, None, specs.tensor_axis)
+        row = specs.sharding(specs.batch_axis)
+        gate, _ = self.gate_proj(x, out_sharding=col)
+        up, _ = self.up_proj(x, out_sharding=col)
+        out, _ = self.down_proj(self.act_fn(gate) * up, out_sharding=row)
+        return out
+
+
+class Qwen2_5_VisionAttention(nnx.Module):
+    """ViT self-attention with fused QKV, RoPE, and block-diagonal flash attn."""
+
+    def __init__(
+        self,
+        config: QwenVLModelVitConfig,
+        dtype: jnp.dtype,
+        rngs: nnx.Rngs = None,
+        mesh: Mesh = None,
+        vision_tp: bool = False,
     ):
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_heads
         self.head_dim = self.hidden_size // self.num_heads
-        self.scale = 1.0 / math.sqrt(self.head_dim)
         self.mesh = mesh
+        self.specs = VisionShardSpecs(mesh, vision_tp)
 
-        # Use dummy rngs if None (for eval_shape)
-        _rngs = rngs or nnx.Rngs(0)
+        if self.specs.tp:
+            tp_size = int(mesh.shape["tensor"]) if mesh is not None else 1
+            assert (
+                self.num_heads % tp_size == 0
+            ), f"vision num_heads={self.num_heads} must be divisible by tp={tp_size}"
 
-        self.qkv_proj = nnx.Linear(
+        self.q_proj = LinearBase(
             self.hidden_size,
-            3 * self.hidden_size,
+            self.hidden_size,
+            mesh=mesh,
             use_bias=True,
-            param_dtype=dtype,
-            rngs=_rngs,
+            kernel_axes=self.specs.col_kernel_axes,
+            params_dtype=dtype,
+        )
+        self.k_proj = LinearBase(
+            self.hidden_size,
+            self.hidden_size,
+            mesh=mesh,
+            use_bias=True,
+            kernel_axes=self.specs.col_kernel_axes,
+            params_dtype=dtype,
+        )
+        self.v_proj = LinearBase(
+            self.hidden_size,
+            self.hidden_size,
+            mesh=mesh,
+            use_bias=True,
+            kernel_axes=self.specs.col_kernel_axes,
+            params_dtype=dtype,
+        )
+        self.proj = LinearBase(
+            self.hidden_size,
+            self.hidden_size,
+            mesh=mesh,
+            use_bias=True,
+            kernel_axes=self.specs.row_kernel_axes,
+            params_dtype=dtype,
         )
 
-        self.proj = nnx.Linear(
-            self.hidden_size,
-            self.hidden_size,
-            use_bias=True,
-            param_dtype=dtype,
-            rngs=_rngs,
-        )
-
-        # DP-only vision attention backend reused across all
-        # in-model VLMs. Lazy import avoids a module-level import cycle
-        # (flash_attention_backend -> schedule_batch -> models). ``mesh`` is None
-        # only during eval_shape (which never calls __call__), so guard it.
         if mesh is not None:
-            from sgl_jax.srt.multimodal.layers.attention.flash_attention_backend import (
-                VisionFlashAttentionBackend,
+            self.attn_backend = make_vision_attention_backend(
+                mesh,
+                sm_scale=1.0 / math.sqrt(self.head_dim),
+                causal=False,
+                head_tp=self.specs.tp,
+                use_varlen=True,
             )
-
-            self.attn_backend = VisionFlashAttentionBackend(mesh, sm_scale=self.scale, causal=False)
         else:
             self.attn_backend = None
 
     def __call__(
         self,
         x: jax.Array,
-        rotary_pos_emb: jax.Array,
-        cu_window_seqlens: jax.Array,
-        valid: jax.Array | None = None,
+        rotary_cos: jax.Array,
+        rotary_sin: jax.Array,
+        metadata: VisionAttentionMetadata,
     ) -> jax.Array:
-        """Run one dp-leading ViT attention block."""
-        dp, T, D = x.shape
+        B, T, D = x.shape
+        specs = self.specs
+        col = specs.sharding(specs.batch_axis, None, specs.tensor_axis)
 
-        positions = jnp.arange(T, dtype=cu_window_seqlens.dtype)
-        seg = jnp.sum(
-            cu_window_seqlens[:, :, None] <= positions[None, None, :],
-            axis=1,
-        ).astype(jnp.int32)
-        if self.mesh is not None:
-            seg = _apply_data_sharding(seg, self.mesh, PartitionSpec("data", None))
-        if valid is not None:
-            is_real = positions[None, :] < jnp.reshape(valid, (dp, 1))
-            if self.mesh is not None:
-                is_real = _apply_data_sharding(is_real, self.mesh, PartitionSpec("data", None))
-            seg = jnp.where(is_real, seg, jnp.full_like(seg, -1))
+        # Project Q, K, V separately (TP-safe: each is independently column-parallel).
+        q, _ = self.q_proj(x, out_sharding=col)
+        k, _ = self.k_proj(x, out_sharding=col)
+        v, _ = self.v_proj(x, out_sharding=col)
 
-        # Project to Q, K, V
-        qkv = self.qkv_proj(x)  # [dp, T, 3D]
-        q, k, v = jnp.split(qkv, 3, axis=-1)  # [dp, T, D] each
+        hs = specs.sharding(specs.batch_axis, None, specs.tensor_axis, None)
+        q = q.reshape(B, T, self.num_heads, self.head_dim, out_sharding=hs)
+        k = k.reshape(B, T, self.num_heads, self.head_dim, out_sharding=hs)
+        v = v.reshape(B, T, self.num_heads, self.head_dim, out_sharding=hs)
 
-        # Wrapper uses dp-leading [dp, T, N, H]; _vision_attention adapts this
-        # layout to the backend's kernel contract.
-        q = q.reshape(dp, T, self.num_heads, self.head_dim)
-        k = k.reshape(dp, T, self.num_heads, self.head_dim)
-        v = v.reshape(dp, T, self.num_heads, self.head_dim)
+        q = _apply_rotary_pos_emb_vision(q, rotary_cos, rotary_sin)
+        k = _apply_rotary_pos_emb_vision(k, rotary_cos, rotary_sin)
 
-        # Apply rotary embeddings (rope is per-image [dp, T, rot])
-        q = _apply_rotary_pos_emb_vision(q, rotary_pos_emb)
-        k = _apply_rotary_pos_emb_vision(k, rotary_pos_emb)
-
-        # Block-diagonal segment flash attention via the DP-only backend.
-        output = _vision_attention(self.attn_backend, q, k, v, seg)  # [dp, T, N, H]
-
-        # [dp, T, N, H] -> [dp, T, D]
-        output = output.reshape(dp, T, D)
-
-        return self.proj(output)
+        out = self.attn_backend(q, k, v, metadata)
+        out = out.reshape(B, T, D, out_sharding=col)
+        out, _ = self.proj(out, out_sharding=specs.sharding(specs.batch_axis))
+        return out
 
 
 class Qwen2_5_VisionBlock(nnx.Module):
+    """One ViT transformer block: attn (pre-norm) + MLP (pre-norm)."""
+
     def __init__(
         self,
         config: QwenVLModelVitConfig,
@@ -319,35 +307,39 @@ class Qwen2_5_VisionBlock(nnx.Module):
         rngs: nnx.Rngs = None,
         mesh: Mesh = None,
         norm_eps: float = 1e-6,
+        vision_tp: bool = False,
     ):
-        dim = config.hidden_size
-        norm_layer = partial(
-            nnx.RMSNorm,
-            epsilon=norm_eps,
-            scale_init=nnx.with_partitioning(init_fn, (None,)),
+        _rngs = rngs or nnx.Rngs(0)
+        norm = partial(
+            nnx.RMSNorm, epsilon=norm_eps, scale_init=nnx.with_partitioning(_init_fn, (None,))
         )
 
-        # Use dummy rngs if None (for eval_shape)
-        _rngs = rngs or nnx.Rngs(0)
-
-        self.norm1 = norm_layer(dim, dtype=dtype, rngs=_rngs)
-        self.norm2 = norm_layer(dim, dtype=dtype, rngs=_rngs)
-        self.attn = Qwen2_5_VisionAttention(config=config, dtype=dtype, rngs=rngs, mesh=mesh)
-        self.mlp = Qwen2_5_VLMLP(config=config, dtype=dtype, rngs=rngs)
+        self.norm1 = norm(config.hidden_size, dtype=dtype, rngs=_rngs)
+        self.norm2 = norm(config.hidden_size, dtype=dtype, rngs=_rngs)
+        self.attn = Qwen2_5_VisionAttention(
+            config,
+            dtype,
+            rngs=rngs,
+            mesh=mesh,
+            vision_tp=vision_tp,
+        )
+        self.mlp = Qwen2_5_VLMLP(config, dtype, rngs=rngs, mesh=mesh, vision_tp=vision_tp)
 
     def __call__(
         self,
         x: jax.Array,
-        rotary_pos_emb: jax.Array,
-        cu_window_seqlens: jax.Array,
-        valid: jax.Array | None = None,
+        rotary_cos: jax.Array,
+        rotary_sin: jax.Array,
+        metadata: VisionAttentionMetadata,
     ) -> jax.Array:
-        x = x + self.attn(self.norm1(x), rotary_pos_emb, cu_window_seqlens, valid)
+        x = x + self.attn(self.norm1(x), rotary_cos, rotary_sin, metadata)
         x = x + self.mlp(self.norm2(x))
         return x
 
 
 class Qwen2_5_VisionPatchMerger(nnx.Module):
+    """Spatial merge: LN → reshape(sms²) → 2-layer MLP → [B, T/sms², d_model]."""
+
     def __init__(
         self,
         d_model: int,
@@ -357,57 +349,53 @@ class Qwen2_5_VisionPatchMerger(nnx.Module):
         dtype: jnp.dtype,
         rngs: nnx.Rngs = None,
         mesh: Mesh = None,
+        vision_tp: bool = False,
     ):
         self.hidden_size = context_dim * (spatial_merge_size**2)
         self.mesh = mesh
-
-        # Use dummy rngs if None (for eval_shape)
+        self.specs = VisionShardSpecs(mesh, vision_tp)
         _rngs = rngs or nnx.Rngs(0)
 
         self.ln_q = norm_layer(
-            context_dim, dtype=dtype, rngs=_rngs, scale_init=nnx.with_partitioning(init_fn, (None,))
-        )
-        self.mlp_fc1 = nnx.Linear(
-            self.hidden_size,
-            self.hidden_size,
-            use_bias=True,
-            param_dtype=dtype,
+            context_dim,
+            dtype=dtype,
             rngs=_rngs,
+            scale_init=nnx.with_partitioning(_init_fn, (None,)),
+        )
+        self.mlp_fc1 = LinearBase(
+            self.hidden_size,
+            self.hidden_size,
+            mesh=mesh,
+            use_bias=True,
+            kernel_axes=self.specs.col_kernel_axes,
+            params_dtype=dtype,
         )
         self.mlp_act = modeling_flax_utils.ACT2FN["gelu"]
-        self.mlp_fc2 = nnx.Linear(
+        self.mlp_fc2 = LinearBase(
             self.hidden_size,
             d_model,
+            mesh=mesh,
             use_bias=True,
-            param_dtype=dtype,
-            rngs=_rngs,
+            kernel_axes=self.specs.row_kernel_axes,
+            params_dtype=dtype,
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        # x: [dp, T, ctx] (dp-leading).
+        specs = self.specs
+        row = specs.sharding(specs.batch_axis)
         x = self.ln_q(x)
-        dp = x.shape[0]
-        # Keep dp on axis 0: the sms² spatial-merge stays WITHIN each image.
-        # ``reshape(-1, ...)`` here would interleave T and dp and silently mix
-        # across images.
-        out_sharding = None
-        if self.mesh is not None and "data" in self.mesh.abstract_mesh.explicit_axes:
-            out_sharding = NamedSharding(self.mesh, PartitionSpec("data", None, None))
-        x = x.reshape(
-            dp,
-            -1,
-            self.hidden_size,
-            out_sharding=out_sharding,
-        )  # [dp, T/sms², ctx*sms²]
-        if self.mesh is not None and out_sharding is None:
-            x = _apply_data_sharding(x, self.mesh, PartitionSpec("data", None, None))
-        x = self.mlp_fc1(x)
+        B = x.shape[0]
+        x = x.reshape(B, -1, self.hidden_size, out_sharding=row)
+        x, _ = self.mlp_fc1(
+            x, out_sharding=specs.sharding(specs.batch_axis, None, specs.tensor_axis)
+        )
         x = self.mlp_act(x)
-        x = self.mlp_fc2(x)
-        return x  # [dp, T/sms², d_model]
+        x, _ = self.mlp_fc2(x, out_sharding=row)
+        return x
 
 
 class Qwen2_5_VisionTransformer(nnx.Module):
+    """Qwen2.5-VL ViT: patch embed → window / full-attn blocks → merge → reorder."""
 
     def __init__(
         self,
@@ -416,10 +404,19 @@ class Qwen2_5_VisionTransformer(nnx.Module):
         rngs: nnx.Rngs = None,
         mesh: Mesh = None,
         norm_eps: float = 1e-6,
+        vision_tp: bool = False,
+        input_buckets: tuple[int, ...] | None = None,
     ):
-        self.config = config
-        self.dtype = dtype
         self.mesh = mesh
+        self.vision_tp = vision_tp
+        self.specs = VisionShardSpecs(mesh, vision_tp)
+        self.input_buckets = input_buckets or tuple(resolve_vision_patch_buckets(None))
+        self.spatial_merge_size = config.spatial_merge_size
+        self.spatial_merge_unit = self.spatial_merge_size**2
+        if any(bucket <= 0 or bucket % self.spatial_merge_unit for bucket in self.input_buckets):
+            raise ValueError(
+                f"vision patch buckets must be positive multiples of {self.spatial_merge_unit}"
+            )
 
         self.patch_embed = Qwen2_5_VisionPatchEmbed(
             patch_size=config.patch_size,
@@ -429,21 +426,21 @@ class Qwen2_5_VisionTransformer(nnx.Module):
             dtype=dtype,
             rngs=rngs,
             mesh=mesh,
+            vision_tp=vision_tp,
         )
-
         self.blocks = nnx.List(
             [
                 Qwen2_5_VisionBlock(
-                    config=config,
-                    dtype=dtype,
+                    config,
+                    dtype,
                     rngs=rngs,
                     mesh=mesh,
                     norm_eps=norm_eps,
+                    vision_tp=vision_tp,
                 )
-                for _ in range(config.depth)
+                for i in range(config.depth)
             ]
         )
-
         self.merger = Qwen2_5_VisionPatchMerger(
             d_model=config.out_hidden_size,
             context_dim=config.hidden_size,
@@ -452,102 +449,234 @@ class Qwen2_5_VisionTransformer(nnx.Module):
             dtype=dtype,
             rngs=rngs,
             mesh=mesh,
+            vision_tp=vision_tp,
         )
 
-        self.spatial_merge_size = config.spatial_merge_size
         self.fullatt_block_indexes = config.fullatt_block_indexes
-        self.spatial_merge_unit = self.spatial_merge_size**2
+        self.patch_size = config.patch_size
+        self.patch_dim = config.in_channels * config.temporal_patch_size * config.patch_size**2
+        self.window_size = config.window_size
+        self.rotary_dim = config.hidden_size // config.num_heads // 2
+        self.theta = float(getattr(config, "rope_theta", 10000.0))
+        self.rot_dim = 2 * len(range(0, self.rotary_dim, 2))
 
     def __call__(
         self,
-        pixels: jax.Array,
-        meta,
-        valid: jax.Array | None = None,
+        patches: jax.Array,
+        metadata: Qwen2_5VisionMetadata,
     ) -> jax.Array:
-        return self.compute_hidden_states(
-            pixels,
-            meta.window_index,
-            meta.cu_window_seqlens,
-            meta.rotary_pos_emb,
-            meta.cu_image_seqlens,
-            valid,
+        """Full ViT forward: patch embed → window-reorder → blocks → merge → un-reorder."""
+        B, S = patches.shape[:2]
+        u = self.spatial_merge_unit
+        n_units = S // u
+        metadata = self._pin(metadata)
+        window_index, reverse_indices = metadata.indices[:, :, 0], metadata.indices[:, :, 1]
+        inv_freq = 1.0 / (
+            self.theta ** (jnp.arange(0, self.rotary_dim, 2, dtype=jnp.float32) / self.rotary_dim)
+        )
+        rotary_pos_emb = (metadata.position_ids[..., None].astype(jnp.float32) * inv_freq).reshape(
+            B, S, self.rot_dim
+        )
+        rotary_cos = jnp.cos(rotary_pos_emb)[:, :, None, :]
+        rotary_sin = jnp.sin(rotary_pos_emb)[:, :, None, :]
+
+        x = self.patch_embed(patches)
+        x = x.reshape(B, n_units, u, -1)
+
+        # Window reorder (batch axis stays on 0).
+        x = jnp.take_along_axis(x, window_index[:, :, None, None], axis=1)
+        x = x.reshape(B, S, -1)
+
+        # Select the pre-planned metadata per block: full-frame for the layers in
+        # ``fullatt_block_indexes``, otherwise the local-window layout.
+        layout_metadata = (metadata.window_attn, metadata.full_attn)
+        for i, blk in enumerate(self.blocks):
+            block_meta = layout_metadata[int(i in self.fullatt_block_indexes)]
+            x = blk(x, rotary_cos, rotary_sin, block_meta)
+
+        x = self.merger(x)
+        return jnp.take_along_axis(x, reverse_indices[:, :, None], axis=1)
+
+    def encode(
+        self,
+        patches: jax.Array,
+        metadata: Qwen2_5VisionMetadata,
+    ) -> jax.Array:
+        if self.mesh is None:
+            return self._encode_jit(patches, metadata)
+        with jax.set_mesh(self.mesh):
+            return self._encode_jit(patches, metadata)
+
+    def precompile(self) -> None:
+        for capacity in self.input_buckets:
+            item = MultimodalDataItem(
+                Modality.IMAGE,
+                feature=np.zeros((capacity, self.patch_dim), dtype=np.float32),
+                model_specific_data={
+                    "image_grid_thw": np.asarray(
+                        [[1, self.spatial_merge_size, capacity // self.spatial_merge_size]]
+                    )
+                },
+            )
+            patches, metadata, _ = self._batch_items([item])
+            jax.block_until_ready(self.encode(patches, metadata))
+
+    def encode_items(self, items: list[MultimodalDataItem]) -> PackedMultimodalEmbedding:
+        """Native packed output + placements, without slicing back to per-item.
+
+        The merge gathers directly from ``output`` [num_lanes, cap, H], whose
+        row dim is a mesh constant and cap dim is bucketed, so it compiles a
+        bounded number of shapes regardless of image size or request packing.
+        """
+        if not items:
+            return PackedMultimodalEmbedding(jnp.zeros((0, 0, 0), jnp.float32), ())
+        patches, metadata, placements = self._batch_items(items)
+        output = self.encode(patches, metadata)
+        return to_packed_embedding(output, placements, self.mesh)
+
+    def _num_lanes(self) -> int:
+        if self.mesh is None:
+            return 1
+        data_size = int(self.mesh.shape.get("data", 1))
+        tensor_size = int(self.mesh.shape.get("tensor", 1))
+        return data_size * (1 if self.vision_tp else tensor_size)
+
+    def _build_metadata(
+        self,
+        lane_grids: list[list[tuple[int, int, int]]],
+        capacity: int,
+    ) -> Qwen2_5VisionMetadata:
+        """Plan one ViT encode on the host: reorder indices, rotary positions,
+        and the window / full-frame attention layouts, bundled into a single
+        :class:`Qwen2_5VisionMetadata`.
+
+        Each layout's ``cu_seqlens`` starts with zero, contains real cumulative
+        ends, then repeats the lane's final valid length to capacity.
+        """
+        batch = len(lane_grids)
+        merge = self.spatial_merge_size
+        unit = self.spatial_merge_unit
+        num_units = capacity // unit
+        window = self.window_size // merge // self.patch_size
+        unit_range = np.arange(num_units, dtype=np.int32)
+        indices = np.broadcast_to(unit_range[None, :, None], (batch, num_units, 2)).copy()
+        position_ids = np.zeros((batch, capacity, 2), dtype=np.int32)
+        cu_seqlens = np.zeros((batch, 2, num_units + 1), dtype=np.int32)
+
+        def grid_layout(t: int, h: int, w: int):
+            grid_h, grid_w = h // merge, w // merge
+            index = np.arange(t * grid_h * grid_w).reshape(t, grid_h, grid_w)
+            pad_h, pad_w = (-grid_h) % window, (-grid_w) % window
+            windows_h, windows_w = (grid_h + pad_h) // window, (grid_w + pad_w) // window
+            index = np.pad(index, ((0, 0), (0, pad_h), (0, pad_w)), constant_values=-1)
+            index = index.reshape(t, windows_h, window, windows_w, window)
+            index = index.transpose(0, 1, 3, 2, 4).reshape(-1, window, window)
+            window_lengths = (index != -1).sum(axis=(1, 2)).astype(np.int32) * unit
+            index = index.reshape(-1)
+            index = index[index != -1].astype(np.int32)
+
+            y, x = np.indices((h, w))
+            coords = np.stack((y, x), axis=-1)
+            coords = coords.reshape(grid_h, merge, grid_w, merge, 2)
+            coords = coords.transpose(0, 2, 1, 3, 4).reshape(h * w, 2)
+            coords = np.tile(coords, (t, 1))
+            coords = coords.reshape(-1, unit, 2)[index].reshape(t * h * w, 2)
+            return index, window_lengths, coords
+
+        for lane, grids in enumerate(lane_grids):
+            patch_offset = unit_offset = 0
+            window_ends = []
+            frame_ends = []
+            for t, h, w in grids:
+                window_index, window_lengths, coords = grid_layout(t, h, w)
+                patch_count = t * h * w
+                unit_count = patch_count // unit
+                patch_slice = slice(patch_offset, patch_offset + patch_count)
+                unit_slice = slice(unit_offset, unit_offset + unit_count)
+                indices[lane, unit_slice, 0] = window_index + unit_offset
+                position_ids[lane, patch_slice] = coords
+                window_ends.extend(patch_offset + np.cumsum(window_lengths))
+                frame_ends.extend(patch_offset + np.arange(1, t + 1, dtype=np.int32) * h * w)
+                patch_offset += patch_count
+                unit_offset += unit_count
+            indices[lane, :, 1] = np.argsort(indices[lane, :, 0]).astype(np.int32)
+            for layout, ends in enumerate((window_ends, frame_ends)):
+                count = len(ends)
+                cu_seqlens[lane, layout, 1 : count + 1] = ends
+                cu_seqlens[lane, layout, count + 1 :] = patch_offset
+        # cu_seqlens[:, 0] is the window layout, [:, 1] the full-frame layout.
+        return Qwen2_5VisionMetadata(
+            indices,
+            position_ids,
+            VisionAttentionMetadata(cu_seqlens[:, 0]),
+            VisionAttentionMetadata(cu_seqlens[:, 1]),
         )
 
-    def compute_hidden_states(
-        self,
-        pixels: jax.Array,
-        window_index: jax.Array,
-        cu_window_seqlens: jax.Array,
-        rotary_pos_emb: jax.Array,
-        cu_image_seqlens: jax.Array,
-        valid: jax.Array | None = None,
-    ) -> jax.Array:
-        """Run the dp-leading ViT encode body."""
-        # pixels: [dp, seq, dim_in] (dp-leading batched).
-        hidden_states = self.patch_embed(pixels)  # [dp, seq, D]
-        dp = pixels.shape[0]
-        seq_len = pixels.shape[1]
-        u = self.spatial_merge_unit
+    def _batch_items(self, items: list[MultimodalDataItem]):
+        for item in items:
+            grid = _item_grid_thw(item)
+            t, h, w = grid
+        packed = pack_lanes(
+            items,
+            self._num_lanes(),
+            buckets=self.input_buckets,
+            merge_unit=self.spatial_merge_unit,
+        )
+        patches = self._put_batch(packed.features)
+        lane_grids = [[_item_grid_thw(items[index]) for index in lane] for lane in packed.lanes]
+        metadata = self._build_metadata(lane_grids, packed.cap)
+        return patches, self._put_batch(metadata), packed.placements
 
-        hidden_states = hidden_states.reshape(dp, seq_len // u, u, -1)  # [dp, seq//u, u, D]
-        # Reorder spatial-merge units into window order per image.
-        gather_idx = jnp.broadcast_to(window_index[:, :, None, None], hidden_states.shape)
-        hidden_states = jnp.take_along_axis(hidden_states, gather_idx, axis=1)
-        hidden_states = hidden_states.reshape(dp, seq_len, -1)  # [dp, T, D]
-
-        for layer_num, blk in enumerate(self.blocks):
-            # Full-attention blocks must segment by image, not by the packed
-            # request length, otherwise later images can leak into earlier image
-            # outputs. Windowed blocks keep the Qwen window boundaries.
-            cu_seqlens = (
-                cu_image_seqlens if layer_num in self.fullatt_block_indexes else cu_window_seqlens
-            )
-            hidden_states = blk(
-                hidden_states,
-                rotary_pos_emb,
-                cu_seqlens,
-                valid,
-            )
-
-        # adapter (merger): [dp, T, D] -> [dp, T/sms², d_model]
-        hidden_states = self.merger(hidden_states)
-        # Restore raster order per image.
-        reverse_indices = jnp.argsort(window_index, axis=1)  # [dp, seq//u]
-        rev_idx = jnp.broadcast_to(reverse_indices[:, :, None], hidden_states.shape)
-        hidden_states = jnp.take_along_axis(hidden_states, rev_idx, axis=1)
-        return hidden_states  # [dp, out_rows, H]
-
-    def encode(self, pixels: jax.Array, meta, valid: jax.Array | None = None) -> jax.Array:
+    def _put_batch(self, value):
+        """Move a host array (or a pytree of them, e.g. the vision metadata) to
+        the ViT batch sharding. Static (non-array) pytree leaves are untouched."""
         if self.mesh is None:
-            return self.encode_jit(pixels, meta, valid)
-        try:
-            ctx = jax.sharding.use_mesh(self.mesh)
-        except AttributeError:
-            try:
-                ctx = jax.set_mesh(self.mesh)
-            except AttributeError:
-                ctx = self.mesh
-        with ctx:
-            return self.encode_jit(pixels, meta, valid)
+            return jax.tree.map(jnp.asarray, value)
+        return jax.device_put(
+            value,
+            self.specs.sharding(self.specs.batch_axis),
+        )
 
     @jax.jit
-    def encode_jit(self, pixels: jax.Array, meta, valid: jax.Array | None = None) -> jax.Array:
-        features = self(pixels, meta, valid)  # [dp, out_rows, H]
+    def _encode_jit(
+        self,
+        patches: jax.Array,
+        metadata: Qwen2_5VisionMetadata,
+    ) -> jax.Array:
+        features = self(patches, metadata)
         if self.mesh is None:
             return features
-        return _apply_data_sharding(
+        # Keep the DP lane-to-replicated transition inside the compiled encode.
+        # An eager reshard of a multi-device result can otherwise stage through
+        # the host when no source device owns the complete array.
+        return jax.sharding.reshard(
             features,
-            self.mesh,
-            PartitionSpec("data", None, None),
+            NamedSharding(
+                self.mesh,
+                PartitionSpec(*([None] * features.ndim)),
+            ),
+        )
+
+    def _pin(self, metadata: Qwen2_5VisionMetadata) -> Qwen2_5VisionMetadata:
+        """Reshard the host-planned metadata's array leaves to the ViT batch
+        spec. Static (non-array) pytree leaves pass through untouched."""
+        if self.mesh is None:
+            return jax.tree.map(jnp.asarray, metadata)
+        spec = PartitionSpec(self.specs.batch_axis)
+        return jax.tree.map(
+            lambda leaf: apply_data_sharding(jnp.asarray(leaf), self.mesh, spec),
+            metadata,
         )
 
 
-class Qwen2_5_VLForConditionalGeneration(nnx.Module):
-    """In-model Qwen2.5-VL (single-file): vision tower + Qwen2 backbone (+ MRoPE)
-    + lm_head. The visual encode/merge surfaces stay outside the backbone JIT;
-    MRoPE is handled transparently by the plain ``Qwen2Model`` (mrope-aware
-    ``get_rope`` + 3-D ``forward_batch.mrope_positions``), so no backbone subclass.
+class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
+    """Qwen2.5-VL: vision tower + Qwen2 backbone (+ MRoPE) + lm_head.
+
+    The visual encode stays outside the backbone JIT.  MRoPE is handled
+    transparently by ``Qwen2Model`` (mrope-aware RoPE + 3-D positions).
     """
+
+    mrope_position_axes = 3
 
     def __init__(self, config=None, dtype=None, mesh=None, rngs=None):
         super().__init__()
@@ -556,7 +685,7 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         self.text_config = get_hf_text_config(config) or config
         self.dtype = dtype or jnp.bfloat16
 
-        # Language backbone (Qwen2 + MRoPE) + lm_head + logits.
+        # Language backbone.
         self.model = Qwen2Model(self.text_config, mesh=mesh, dtype=self.dtype)
         if not getattr(self.text_config, "tie_word_embeddings", False):
             self.lm_head = ParallelLMHead(
@@ -570,72 +699,84 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         self.image_token_id = getattr(self.config, "image_token_id", None)
         self.video_token_id = getattr(self.config, "video_token_id", None)
 
-        # Vision tower. `self.visual` IS the ViT; the in-model embedder is
-        # `get_image_feature` (resolved by `embed_mm_inputs` via
-        # `getattr(model, "get_image_feature")`, no `mm_embedders` dict).
-        self.visual_config = getattr(config, "vision_config", None)
-        if self.visual_config is None:
-            raise ValueError("Qwen2.5-VL requires config.vision_config.")
+        # Vision tower.
+        self.visual_config = config.vision_config
+
+        from sgl_jax.srt.managers.schedule_batch import global_server_args_dict
+
+        vision_tp = resolve_encoder_tp(
+            mesh, global_server_args_dict.get("vision_encoder_parallel", "dp")
+        )
         self.visual = Qwen2_5_VisionTransformer(
             config=self.visual_config,
             dtype=self.dtype,
             rngs=rngs,
             mesh=mesh,
             norm_eps=getattr(self.visual_config, "rms_norm_eps", 1e-6),
+            vision_tp=vision_tp,
+            input_buckets=tuple(
+                resolve_vision_patch_buckets(
+                    global_server_args_dict.get("precompile_vision_patch_paddings")
+                )
+            ),
         )
 
-    def get_image_feature(self, enc):
-        """Encode one DP round of images.
+    def get_input_embeddings(self) -> Callable[[jax.Array], jax.Array]:
+        return self.model.get_input_embeddings()
 
-        ``enc.meta`` carries scheduler-built ViT aux
-        (``window_index`` / ``cu_window_seqlens`` / ``cu_image_seqlens`` /
-        ``rotary_pos_emb``).
-        Returns dp-leading image features with shape ``[dp, out_rows, H]``.
-        """
-        return self.visual.encode(enc.pixels, enc.meta, enc.valid)
+    def precompile_multimodal(self) -> None:
+        self.visual.precompile()
 
-    def load_weights(self, model_config: ModelConfig):
-        # Load text backbone and lm_head weights.
+    def get_multimodal_embedding_packed_shapes(self) -> tuple[tuple[int, int], ...]:
+        rows = self.visual._num_lanes()
+        unit = self.visual.spatial_merge_unit
+        return tuple((rows, bucket // unit) for bucket in self.visual.input_buckets)
+
+    def get_multimodal_encode_funcs(self):
+        encode = self.visual.encode_items
+        return {
+            Modality.IMAGE: encode,
+            Modality.MULTI_IMAGES: encode,
+            Modality.VIDEO: encode,
+        }
+
+    def load_weights(self, model_config: ModelConfig) -> None:
+        # Text backbone + lm_head.
         loader = WeightLoader(
-            model=self,
-            model_config=model_config,
-            mesh=self.mesh,
-            dtype=self.dtype,
+            model=self, model_config=model_config, mesh=self.mesh, dtype=self.dtype
         )
         loader.load_weights_from_safetensors(create_qwen2_weight_mappings(self.text_config))
-        logger.info("Qwen2.5-VL (LLM) weights loaded successfully!")
-        # Vision (ViT) weights -- second WeightLoader pass mapping only visual.*.
-        # The vision loader reads ONLY `model_path` (WeightLoader's safetensors
-        # glob); the head/kv block in weight_utils is skipped for the
-        # string-target vision mappings, so no other config field is needed.
-        visual_loader_config = SimpleNamespace(model_path=model_config.model_path)
-        self._load_vision_weights(visual_loader_config)
+        logger.info("Qwen2.5-VL (LLM) weights loaded.")
+        # ViT weights — carry vision head info so _split_qkv_weight can slice the
+        # fused ``qkv.weight`` / ``qkv.bias`` into q_proj, k_proj, v_proj.
+        vc = self.visual_config
+        vision_model_config = SimpleNamespace(
+            model_path=model_config.model_path,
+            num_attention_heads=vc.num_heads,
+            hidden_size=vc.hidden_size,
+            get_total_num_kv_heads=lambda: vc.num_heads,  # no GQA in ViT
+        )
+        self._load_vision_weights(vision_model_config)
 
     def _load_vision_weights(self, model_config) -> None:
-        """Load the ViT (``self.visual``) weights from safetensors.
-
-        This pass maps only ``visual.*`` keys; text embeddings are owned by the
-        language backbone.
-        """
         loader = WeightLoader(
-            model=self,
-            model_config=model_config,
-            mesh=self.mesh,
-            dtype=self.dtype,
+            model=self, model_config=model_config, mesh=self.mesh, dtype=self.dtype
         )
-        weight_mappings = self._create_qwen2_5_vl_vision_weight_mappings()
+        mappings = self._vision_weight_mappings()
         if self.mesh is not None:
             with self.mesh:
-                loader.load_weights_from_safetensors(weight_mappings)
+                loader.load_weights_from_safetensors(mappings)
         else:
-            loader.load_weights_from_safetensors(weight_mappings)
-        logger.info("Qwen2.5-VL ViT weights loaded successfully!")
+            loader.load_weights_from_safetensors(mappings)
+        logger.info("Qwen2.5-VL ViT weights loaded.")
 
-    def _create_qwen2_5_vl_vision_weight_mappings(self) -> dict:
-        # Vision layers use replicated weights (no tensor parallelism). Targets are
-        # relative to `self` (the wrapper), whose `self.visual` IS the ViT tower.
+    def _vision_weight_mappings(self) -> dict:
+        tp = self.visual.specs.tp
+        col = (None, "tensor") if tp else (None, None)
+        row = ("tensor", None) if tp else (None, None)
+
         mappings = {
-            # Patch embed Conv3D: PyTorch [out,in,kd,kh,kw] -> JAX [kd,kh,kw,in,out]
+            # Patch embed Conv3D: PyTorch [out,in,kd,kh,kw] → JAX [kd,kh,kw,in,out].
             "visual.patch_embed.proj.weight": WeightMapping(
                 target_path="visual.patch_embed.proj.kernel",
                 sharding=(None, None, None, None, None),
@@ -646,109 +787,98 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
                 sharding=(None,),
                 transpose=False,
             ),
-            "visual.merger.mlp.0.weight": WeightMapping(
-                target_path="visual.merger.mlp_fc1.kernel",
-                sharding=(None, None),
-                transpose=True,
-            ),
-            "visual.merger.mlp.0.bias": WeightMapping(
-                target_path="visual.merger.mlp_fc1.bias",
-                sharding=(None,),
-                transpose=False,
-            ),
-            "visual.merger.mlp.2.weight": WeightMapping(
-                target_path="visual.merger.mlp_fc2.kernel",
-                sharding=(None, None),
-                transpose=True,
-            ),
-            "visual.merger.mlp.2.bias": WeightMapping(
-                target_path="visual.merger.mlp_fc2.bias",
-                sharding=(None,),
-                transpose=False,
-            ),
+            **self._merger_mlp_mappings(col, row),
         }
-        num_vision_layers = getattr(self.visual_config, "depth", 0)
-        for layer_idx in range(num_vision_layers):
-            mappings.update(self._create_vision_layer_mappings(layer_idx))
+        for i in range(getattr(self.visual_config, "depth", 0)):
+            mappings.update(self._block_mappings(i, col, row))
         return mappings
 
-    def _create_vision_layer_mappings(self, layer_idx: int) -> dict:
-        # Qwen2.5-VL uses visual.blocks.{i}.* for vision layers (replicated).
-        prefix = f"visual.blocks.{layer_idx}"
-        target_prefix = f"visual.blocks.{layer_idx}"
+    @staticmethod
+    def _merger_mlp_mappings(col, row) -> dict:
+        """Weight mappings for the patch merger MLP (mlp.0 / mlp.2 in HF)."""
         return {
-            f"{prefix}.norm1.weight": WeightMapping(
-                target_path=f"{target_prefix}.norm1.scale",
-                sharding=(None,),
-                transpose=False,
+            "visual.merger.mlp.0.weight": WeightMapping(
+                target_path="visual.merger.mlp_fc1.weight", sharding=col, transpose=True
             ),
-            f"{prefix}.norm2.weight": WeightMapping(
-                target_path=f"{target_prefix}.norm2.scale",
-                sharding=(None,),
-                transpose=False,
+            "visual.merger.mlp.0.bias": WeightMapping(
+                target_path="visual.merger.mlp_fc1.bias", sharding=(None,), transpose=False
             ),
-            f"{prefix}.attn.qkv.weight": WeightMapping(
-                target_path=f"{target_prefix}.attn.qkv_proj.kernel",
-                sharding=(None, None),
+            "visual.merger.mlp.2.weight": WeightMapping(
+                target_path="visual.merger.mlp_fc2.weight", sharding=row, transpose=True
+            ),
+            "visual.merger.mlp.2.bias": WeightMapping(
+                target_path="visual.merger.mlp_fc2.bias", sharding=(None,), transpose=False
+            ),
+        }
+
+    @staticmethod
+    def _block_mappings(layer_idx: int, col, row) -> dict:
+        """Weight mappings for one ViT block (``visual.blocks.{i}.*``).
+
+        The fused ``qkv.weight`` / ``qkv.bias`` are split into separate
+        q/k/v projections so column-parallel sharding is TP-safe (each
+        projection independently stripe-interleaves its own output slice).
+        """
+        p = f"visual.blocks.{layer_idx}"
+        return {
+            f"{p}.norm1.weight": WeightMapping(
+                target_path=f"{p}.norm1.scale", sharding=(None,), transpose=False
+            ),
+            f"{p}.norm2.weight": WeightMapping(
+                target_path=f"{p}.norm2.scale", sharding=(None,), transpose=False
+            ),
+            f"{p}.attn.qkv.weight": WeightMapping(
+                target_path=[
+                    f"{p}.attn.q_proj.weight",
+                    f"{p}.attn.k_proj.weight",
+                    f"{p}.attn.v_proj.weight",
+                ],
+                sharding=col,
                 transpose=True,
             ),
-            f"{prefix}.attn.qkv.bias": WeightMapping(
-                target_path=f"{target_prefix}.attn.qkv_proj.bias",
+            f"{p}.attn.qkv.bias": WeightMapping(
+                target_path=[
+                    f"{p}.attn.q_proj.bias",
+                    f"{p}.attn.k_proj.bias",
+                    f"{p}.attn.v_proj.bias",
+                ],
                 sharding=(None,),
                 transpose=False,
             ),
-            f"{prefix}.attn.proj.weight": WeightMapping(
-                target_path=f"{target_prefix}.attn.proj.kernel",
-                sharding=(None, None),
-                transpose=True,
+            f"{p}.attn.proj.weight": WeightMapping(
+                target_path=f"{p}.attn.proj.weight", sharding=row, transpose=True
             ),
-            f"{prefix}.attn.proj.bias": WeightMapping(
-                target_path=f"{target_prefix}.attn.proj.bias",
-                sharding=(None,),
-                transpose=False,
+            f"{p}.attn.proj.bias": WeightMapping(
+                target_path=f"{p}.attn.proj.bias", sharding=(None,), transpose=False
             ),
-            f"{prefix}.mlp.gate_proj.weight": WeightMapping(
-                target_path=f"{target_prefix}.mlp.gate_proj.kernel",
-                sharding=(None, None),
-                transpose=True,
+            f"{p}.mlp.gate_proj.weight": WeightMapping(
+                target_path=f"{p}.mlp.gate_proj.weight", sharding=col, transpose=True
             ),
-            f"{prefix}.mlp.gate_proj.bias": WeightMapping(
-                target_path=f"{target_prefix}.mlp.gate_proj.bias",
-                sharding=(None,),
-                transpose=False,
+            f"{p}.mlp.gate_proj.bias": WeightMapping(
+                target_path=f"{p}.mlp.gate_proj.bias", sharding=(None,), transpose=False
             ),
-            f"{prefix}.mlp.up_proj.weight": WeightMapping(
-                target_path=f"{target_prefix}.mlp.up_proj.kernel",
-                sharding=(None, None),
-                transpose=True,
+            f"{p}.mlp.up_proj.weight": WeightMapping(
+                target_path=f"{p}.mlp.up_proj.weight", sharding=col, transpose=True
             ),
-            f"{prefix}.mlp.up_proj.bias": WeightMapping(
-                target_path=f"{target_prefix}.mlp.up_proj.bias",
-                sharding=(None,),
-                transpose=False,
+            f"{p}.mlp.up_proj.bias": WeightMapping(
+                target_path=f"{p}.mlp.up_proj.bias", sharding=(None,), transpose=False
             ),
-            f"{prefix}.mlp.down_proj.weight": WeightMapping(
-                target_path=f"{target_prefix}.mlp.down_proj.kernel",
-                sharding=(None, None),
-                transpose=True,
+            f"{p}.mlp.down_proj.weight": WeightMapping(
+                target_path=f"{p}.mlp.down_proj.weight", sharding=row, transpose=True
             ),
-            f"{prefix}.mlp.down_proj.bias": WeightMapping(
-                target_path=f"{target_prefix}.mlp.down_proj.bias",
-                sharding=(None,),
-                transpose=False,
+            f"{p}.mlp.down_proj.bias": WeightMapping(
+                target_path=f"{p}.mlp.down_proj.bias", sharding=(None,), transpose=False
             ),
         }
 
     def get_embed_and_head(self):
         if getattr(self.text_config, "tie_word_embeddings", False):
-            weight = self.model.embed_tokens.embedding.value
-            return (weight, weight)
+            w = self.model.embed_tokens.embedding.value
+            return (w, w)
         return (self.model.embed_tokens.embedding.value, self.lm_head.embedding.value)
 
     def set_embed_and_head(
-        self,
-        embed_weight: jax.Array | None = None,
-        head_weight: jax.Array | None = None,
+        self, embed_weight: jax.Array | None = None, head_weight: jax.Array | None = None
     ) -> None:
         if embed_weight is not None:
             self.model.embed_tokens.embedding.value = embed_weight
@@ -761,14 +891,15 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         memory_pools: MemoryPools,
         logits_metadata: LogitsMetadata,
     ):
-        token_to_kv_pool = memory_pools.token_to_kv_pool
         hidden_states, layers_kv_fused, layers_callback_flag = self.model(
-            forward_batch, token_to_kv_pool
+            forward_batch, memory_pools.token_to_kv_pool
         )
-        if not getattr(self.text_config, "tie_word_embeddings", False):
-            output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
-        else:
-            output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
+        head = (
+            self.model.embed_tokens
+            if getattr(self.text_config, "tie_word_embeddings", False)
+            else self.lm_head
+        )
+        output = self.logits_processor(hidden_states, head, logits_metadata)
         return output, layers_kv_fused, layers_callback_flag, None
 
 
