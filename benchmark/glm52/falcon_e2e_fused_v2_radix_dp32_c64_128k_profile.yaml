@@ -274,7 +274,7 @@ role_to_task_spec:
       - name: sglang-jax
         type: git
         repo: https://github.com/cjx0709/sglang-jax.git
-        ref: develop/glm52-fused-v2-e2e-rebased-20260806
+        ref: develop/glm52-fused-v2-e2e-source-20260806
         commit: 1ffcd5d3cabce93c7b0f60a041bc3731d2e5eecb
         path: /workspace/sglang-jax
         auth:

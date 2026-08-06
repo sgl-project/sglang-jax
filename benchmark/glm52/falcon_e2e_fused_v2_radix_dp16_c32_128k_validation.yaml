@@ -1,6 +1,6 @@
 # GLM-5.2 FP8 8-chip validation for the repaired basic/cache-hit eval path.
 # The 16-chip benchmark/profile manifest is intentionally kept separately.
-name: glm52-fused-v2-radix-dp16-c32-128k-validation-20260806-r1
+name: glm52-fused-v2-radix-dp16-c32-128k-validation-20260806-r3
 exp_type: TRAINING
 artifact_type: metrics
 cluster_name: tpu-training-antgroup
@@ -247,7 +247,7 @@ role_to_task_spec:
       - name: sglang-jax
         type: git
         repo: https://github.com/cjx0709/sglang-jax.git
-        ref: develop/glm52-fused-v2-e2e-rebased-20260806
+        ref: develop/glm52-fused-v2-e2e-source-20260806
         commit: 1ffcd5d3cabce93c7b0f60a041bc3731d2e5eecb
         path: /workspace/sglang-jax
         auth:
