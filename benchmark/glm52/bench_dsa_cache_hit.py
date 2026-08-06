@@ -226,6 +226,22 @@ def _stop_profile(base_url: str) -> None:
         raise RuntimeError(f"profile did not stop cleanly: {status.text}")
 
 
+def _set_scheduler_paused(base_url: str, paused: bool) -> None:
+    """Pause only model scheduling while leaving HTTP admission active."""
+    response = requests.post(
+        f"{base_url}/set_internal_state",
+        json={
+            "request_id": "profile-admission-barrier",
+            "state_data": {"engine_paused": paused},
+        },
+        timeout=(30, None),
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not payload.get("success", False):
+        raise RuntimeError(f"could not update scheduler pause state: {payload}")
+
+
 def _run_native_batch_with_admission_barrier(
     base_url: str,
     input_ids: list[list[int]],
@@ -242,12 +258,7 @@ def _run_native_batch_with_admission_barrier(
     Independent handlers let all C32 requests reach the waiting queue while the
     scheduler is paused. Profiling is then armed before inference resumes.
     """
-    pause = requests.post(
-        f"{base_url}/pause_generation",
-        json={"mode": "in_place"},
-        timeout=(30, None),
-    )
-    pause.raise_for_status()
+    _set_scheduler_paused(base_url, True)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(
@@ -290,12 +301,7 @@ def _run_native_batch_with_admission_barrier(
 
             on_admitted()
         finally:
-            resume = requests.post(
-                f"{base_url}/continue_generation",
-                json={},
-                timeout=(30, None),
-            )
-            resume.raise_for_status()
+            _set_scheduler_paused(base_url, False)
 
         return future.result()
 
@@ -337,7 +343,7 @@ def main() -> None:
         "--profile-admission-barrier",
         action="store_true",
         help=(
-            "Pause an idle scheduler until the measured native batch is fully "
+            "Pause an idle scheduler until the measured requests are fully "
             "queued, then arm profiling and resume inference."
         ),
     )

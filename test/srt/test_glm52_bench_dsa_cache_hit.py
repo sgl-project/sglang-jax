@@ -149,8 +149,10 @@ def test_parallel_single_requests_preserve_result_order() -> None:
 
 
 def test_profile_admission_barrier_queues_all_requests_before_resume() -> None:
-    paused_response = mock.Mock()
-    resumed_response = mock.Mock()
+    pause_response = mock.Mock()
+    pause_response.json.return_value = {"success": True}
+    resume_response = mock.Mock()
+    resume_response.json.return_value = {"success": True}
     server_info_response = mock.Mock()
     scheduler_states = iter(
         [
@@ -165,11 +167,11 @@ def test_profile_admission_barrier_queues_all_requests_before_resume() -> None:
     resumed = threading.Event()
 
     def fake_post(url, **kwargs):
-        if url.endswith("/pause_generation"):
-            return paused_response
-        assert url.endswith("/continue_generation")
+        assert url.endswith("/set_internal_state")
+        if kwargs["json"]["state_data"]["engine_paused"]:
+            return pause_response
         resumed.set()
-        return resumed_response
+        return resume_response
 
     def fake_run_parallel_single_requests(*args, **kwargs):
         assert resumed.wait(timeout=2)
@@ -195,10 +197,16 @@ def test_profile_admission_barrier_queues_all_requests_before_resume() -> None:
 
     assert result == {"wall_s": 1.0}
     on_admitted.assert_called_once_with()
-    assert post.call_args_list[0].args == ("http://server/pause_generation",)
-    assert post.call_args_list[1].args == ("http://server/continue_generation",)
-    paused_response.raise_for_status.assert_called_once_with()
-    resumed_response.raise_for_status.assert_called_once_with()
+    assert post.call_args_list[0].args == ("http://server/set_internal_state",)
+    assert post.call_args_list[0].kwargs["json"]["state_data"] == {
+        "engine_paused": True
+    }
+    assert post.call_args_list[1].args == ("http://server/set_internal_state",)
+    assert post.call_args_list[1].kwargs["json"]["state_data"] == {
+        "engine_paused": False
+    }
+    pause_response.raise_for_status.assert_called_once_with()
+    resume_response.raise_for_status.assert_called_once_with()
     assert server_info_response.raise_for_status.call_count == 3
 
 
