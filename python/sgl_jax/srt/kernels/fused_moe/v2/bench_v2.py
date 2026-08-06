@@ -14,6 +14,7 @@ Env vars:
   BENCH_QBK     — quant_block_k for fp8 (default: 128)
   BENCH_DIRECT_SCALED_DOT — 1 to use direct-scaled-dot for both FFN1/FFN2
   BENCH_INTERLEAVE_BT — comma-separated 0/1 interleave BT gather banking
+                        (use 0 above 1024 local tokens per EP rank)
   BENCH_VARIANT — label written to BENCH_JSONL for ablation tracking
   BENCH_KERNEL_ABLATION — static in-kernel stage cut (default: full)
   BENCH_TUNE    — 1 to auto-generate bt/bf candidates
@@ -1192,6 +1193,13 @@ for num_tokens in token_candidates:
             continue
 
 # --- Summary ---
+if not results:
+    raise RuntimeError(
+        "No fused MoE v2 configurations produced valid timings. "
+        "Check the block configs and static kernel flags; shapes above 1024 "
+        "local tokens per EP rank require BENCH_INTERLEAVE_BT=0."
+    )
+
 if results:
     log("")
     log("=== Summary ===")

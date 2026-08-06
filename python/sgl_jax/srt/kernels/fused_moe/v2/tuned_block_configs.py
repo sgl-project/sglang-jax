@@ -18,6 +18,12 @@ from .kernel import FusedMoEBlockConfig
 
 logger = logging.getLogger(__name__)
 
+# Interleaved gather allocates one routing SMEM bank per local token block. On
+# TPU v7, keeping that path above 1024 tokens per EP rank can exceed the 1 MiB
+# SMEM budget. Keep the small-shape fast path and fall back to the kernel's
+# fixed two-bank path for larger shapes.
+MAX_INTERLEAVED_LOCAL_TOKENS = 1024
+
 # Key (without device_name):
 #   (tokens_dtype, weight_dtype, num_tokens, num_experts, top_k,
 #    hidden_size, intermediate_size, ep_size, use_shared_expert, use_grouped_topk,
@@ -66,6 +72,9 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         ('bfloat16', 'float8_e4m3fn', 4096, 256, 8, 6144, 2048, 16, True, False, True): (128, 1024, 64, 1024, 128),
         ('bfloat16', 'float8_e4m3fn', 8192, 256, 8, 6144, 2048, 16, True, False, True): (128, 1024, 64, 1024, 128),
         ('bfloat16', 'float8_e4m3fn', 16384, 256, 8, 6144, 2048, 16, True, False, True): (256, 512, 64, 512, 256),
+        # 32768 uses interleave_bt=False. Tuned on the same EP16 topology on
+        # 2026-08-06 (Falcon exp-l4uk7szwz7, confirmed by exp-4ir7bfizgu).
+        ('bfloat16', 'float8_e4m3fn', 32768, 256, 8, 6144, 2048, 16, True, False, True): (128, 1024, 64, 1024, 128),
         # GLM-5.2: E=256, H=6144, I=2048, top_k=8, routed FP8 block-wise
         # K=128, ep=32, in-kernel shared expert, act_quant ON, no grouped top-k.
         # Tuned on 16 TPU v7x chips, 2026-08-03 (Falcon exp-bkbi8g86uy).
@@ -110,6 +119,15 @@ DEFAULT_V2_BLOCK_CONFIG = FusedMoEBlockConfig(
     btc=32,
     bse=256,
 )
+
+
+def should_interleave_fused_moe_v2_bt(*, num_tokens: int, ep_size: int) -> bool:
+    """Return whether gather routing banks fit the TPU v7 SMEM budget."""
+    if ep_size <= 0:
+        raise ValueError(f"Expected {ep_size=} to be > 0.")
+    if num_tokens % ep_size != 0:
+        raise ValueError(f"Expected {num_tokens=} to be aligned to {ep_size=}.")
+    return num_tokens // ep_size <= MAX_INTERLEAVED_LOCAL_TOKENS
 
 
 def get_simplified_key(
