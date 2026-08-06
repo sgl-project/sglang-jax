@@ -14,7 +14,12 @@ Env vars:
   BENCH_QBK     — quant_block_k for fp8 (default: 128)
   BENCH_DIRECT_SCALED_DOT — 1 to use direct-scaled-dot for both FFN1/FFN2
   BENCH_INTERLEAVE_BT — comma-separated 0/1 interleave BT gather banking
+  BENCH_VARIANT — label written to BENCH_JSONL for ablation tracking
+  BENCH_KERNEL_ABLATION — static in-kernel stage cut (default: full)
   BENCH_TUNE    — 1 to auto-generate bt/bf candidates
+  BENCH_MAX_CONFIGS — maximum auto-tune candidates per token shape (default: 48)
+  BENCH_TUNE_VMEM_HEADROOM — VMEM budget ratio used by the tuner (default: 0.95)
+  BENCH_JSONL   — optional path for rank-0 structured measurements
   BENCH_WARMUP  — warmup iterations (default: 2)
   BENCH_ITERS   — timed iterations (default: 5)
   BENCH_CHECK   — 1 to run correctness check (single-host only)
@@ -32,6 +37,7 @@ import math
 import os
 import pathlib
 import re
+import shutil
 import sys
 import time
 from typing import Any
@@ -47,7 +53,7 @@ TRACE_ROOT = "/tmp/tpu_logs/v2_trace"
 
 
 def log(msg):
-    print(f"[{time.time()-t0:.1f}s][p{jax.process_index()}] {msg}", flush=True)
+    print(f"[{time.time() - t0:.1f}s][p{jax.process_index()}] {msg}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -153,13 +159,13 @@ def trace_timeit(run_fn, warmup: int, iters: int) -> list[float]:
             out = run_fn()
             jax.block_until_ready(out)
 
-    if jax.process_index() != 0:
-        return []
     try:
         trace = _load_trace(trace_dir)
         return _extract_durations_ms(trace)
     except FileNotFoundError:
         return []
+    finally:
+        shutil.rmtree(trace_dir, ignore_errors=True)
 
 
 def wall_timeit(run_fn, warmup: int, iters: int) -> list[float]:
@@ -251,11 +257,6 @@ log(f"initialized: {jax.device_count()} devices, {jax.process_count()} procs")
 
 from kernel import FusedMoEBlockConfig, fused_ep_moe_v2, ref_moe
 
-from sgl_jax.srt.kernels.fused_moe.v2.tuned_block_configs import (
-    DEFAULT_V2_BLOCK_CONFIG,
-    get_tuned_fused_moe_v2_block_config,
-)
-
 P = jax.sharding.PartitionSpec
 num_devices = jax.device_count()
 devices = np.array(jax.devices()).reshape(1, num_devices)
@@ -285,6 +286,20 @@ use_fp8 = os.environ.get("BENCH_FP8", "0") == "1"
 _qbk_str = os.environ.get("BENCH_QBK", "128")
 quant_block_k = None if _qbk_str.lower() == "none" else int(_qbk_str)
 tune_mode = os.environ.get("BENCH_TUNE", "0") == "1"
+tune_max_configs = int(os.environ.get("BENCH_MAX_CONFIGS", "48"))
+tune_vmem_headroom = float(os.environ.get("BENCH_TUNE_VMEM_HEADROOM", "0.95"))
+metrics_jsonl = os.environ.get("BENCH_JSONL")
+benchmark_variant = os.environ.get("BENCH_VARIANT", "fused_moe_v2_tune")
+kernel_ablation_mode = os.environ.get("BENCH_KERNEL_ABLATION", "full")
+_explicit_block_shape = any(
+    os.environ.get(k) is not None for k in ("BENCH_BT", "BENCH_BF", "BENCH_BTC", "BENCH_BTS")
+)
+auto_tuned_block = (not tune_mode) and (not _explicit_block_shape)
+if auto_tuned_block:
+    from sgl_jax.srt.kernels.fused_moe.v2.tuned_block_configs import (
+        DEFAULT_V2_BLOCK_CONFIG,
+        get_tuned_fused_moe_v2_block_config,
+    )
 use_wall = os.environ.get("BENCH_WALL", "0") == "1"
 use_split = os.environ.get("BENCH_SPLIT", "0") == "1"
 direct_scaled_dot = os.environ.get("BENCH_DIRECT_SCALED_DOT", "0") == "1"
@@ -304,11 +319,29 @@ if invalid_modes:
         f"Unsupported BENCH_CROSS_EXPERT_PREFETCH values {invalid_modes}; "
         "expected one of none, full, or w13."
     )
+valid_kernel_ablation_modes = {
+    "full",
+    "no_shared",
+    "no_weight_hbm",
+    "routed_no_gather",
+    "ffn_io_store_only",
+    "ffn_io_only",
+    "token_io_only",
+    "scatter_only",
+    "metadata_prequant",
+    "metadata_only",
+}
+if kernel_ablation_mode not in valid_kernel_ablation_modes:
+    raise ValueError(
+        f"Unsupported BENCH_KERNEL_ABLATION={kernel_ablation_mode!r}; "
+        f"expected one of {sorted(valid_kernel_ablation_modes)}."
+    )
+if check_correctness and kernel_ablation_mode != "full":
+    raise ValueError("BENCH_CHECK=1 is only valid with BENCH_KERNEL_ABLATION=full.")
 valid_routing_modes = {"random", "deterministic", "hot_expert"}
 if routing_mode not in valid_routing_modes:
     raise ValueError(
-        f"Unsupported BENCH_ROUTING_MODE={routing_mode!r}; "
-        "expected one of random or deterministic."
+        f"Unsupported BENCH_ROUTING_MODE={routing_mode!r}; expected one of random or deterministic."
     )
 if use_split:
     timeit_fn = None
@@ -322,6 +355,8 @@ if direct_scaled_dot:
 if enable_bt_scatter_overlap:
     log("bt_scatter_overlap=True (next-BT scatter HBM bank overlap)")
 log(f"cross_expert_prefetch={cross_expert_prefetch_modes}")
+if kernel_ablation_mode != "full":
+    log(f"kernel_ablation_mode={kernel_ablation_mode} (benchmark-only, output is invalid)")
 if interleave_bt_modes != [True]:
     log(f"interleave_bt sweep: {interleave_bt_modes}")
 
@@ -331,17 +366,12 @@ btc_candidates = parse_csv_int("BENCH_BTC", [128])
 bts_candidates = parse_csv_int_or_none("BENCH_BTS")
 token_candidates = parse_csv_int("BENCH_TOKENS", [4096])
 
+
 # Tuned-first defaulting: when the user did NOT explicitly pin any block-shape
 # param (BT/BF/BTC/BTS) and we're not sweeping (BENCH_TUNE), look the shape up in
 # tuned_block_configs per token count and use that. Falls back to the BENCH_BT/BF
 # defaults only when no tuned entry matches. Avoids silently benchmarking the
 # default bf=256 when a tuned (e.g. bf=1024) config exists for the shape.
-_explicit_block_shape = any(
-    os.environ.get(k) is not None for k in ("BENCH_BT", "BENCH_BF", "BENCH_BTC", "BENCH_BTS")
-)
-auto_tuned_block = (not tune_mode) and (not _explicit_block_shape)
-
-
 def _align_to(x, a):
     return ((x + a - 1) // a) * a
 
@@ -514,7 +544,7 @@ def _estimate_vmem_bytes_v2(
     )
 
     if verbose:
-        mb = lambda b: f"{b / (1024*1024):.2f}"
+        mb = lambda b: f"{b / (1024 * 1024):.2f}"
         log(f"    VMEM Breakdown (bt={bt} bf={bf} btc={btc} bts={bts}):")
         log(f"      a2a_g_acc:      {mb(b_a2a_g_acc)} MB  (2,{top_k},{acc_bt},{hidden_size})")
         log(f"      topk_weights:   {mb(b_topk_w)} MB  ({smem_banks},{bt},{padded_top_k}) f32")
@@ -678,8 +708,8 @@ def generate_tune_candidates(
                             log(
                                 f"  VMEM skip bt={bc_eff.bt},bf={bc_eff.bf},"
                                 f"btc={bc_eff.btc},bts={bc_eff.bts},bse={bc_eff.bse}: "
-                                f"{est/(1024*1024):.1f}MB > "
-                                f"{effective_budget/(1024*1024):.1f}MB"
+                                f"{est / (1024 * 1024):.1f}MB > "
+                                f"{effective_budget / (1024 * 1024):.1f}MB"
                             )
                             continue
                         configs.append(bc)
@@ -693,7 +723,33 @@ def generate_tune_candidates(
         bk = (cfg.bt, cfg.bts or cfg.bt)
         buckets.setdefault(bk, []).append(cfg)
     for bk in buckets:
-        buckets[bk].sort(key=lambda c: (c.bf, c.bse, c.btc), reverse=True)
+        # Preserve BF and BTC diversity under the max-config cap. Sorting the
+        # whole bucket by BF first can spend every slot on bf=1024; naively
+        # round-robining BF can then spend every slot on the same btc. Build a
+        # small Latin-style traversal over (BF, BTC), starting near btc=32 but
+        # rotating the starting BTC for each BF.
+        by_pair = {}
+        for cfg in buckets[bk]:
+            by_pair.setdefault((cfg.bf, cfg.btc), []).append(cfg)
+        for pair in by_pair:
+            by_pair[pair].sort(key=lambda c: c.bse, reverse=True)
+        ordered = []
+        bf_keys = sorted({cfg.bf for cfg in buckets[bk]}, reverse=True)
+        btc_keys = sorted(
+            {cfg.btc for cfg in buckets[bk]},
+            key=lambda btc: (abs(math.log2(btc / 32)), -btc),
+        )
+        round_idx = 0
+        while any(by_pair[pair] for pair in by_pair):
+            for bf_idx, bf in enumerate(bf_keys):
+                for offset in range(len(btc_keys)):
+                    btc = btc_keys[(round_idx + bf_idx + offset) % len(btc_keys)]
+                    queue = by_pair.get((bf, btc), [])
+                    if queue:
+                        ordered.append(queue.pop(0))
+                        break
+            round_idx += 1
+        buckets[bk] = ordered
 
     selected = []
     selected_keys = set()
@@ -882,10 +938,12 @@ if use_fp8:
     qbk_arg = quant_block_k
     log("fp8 quantization done")
 
-# Shared-expert fp8 quant (per-channel, replicated). The in-kernel SE reuses the
-# routed fp8 weight/token/output VMEM buffers, so SE weights must also be fp8.
+# Shared-expert fp8 quant (per-channel, replicated). Production uses per-channel
+# shared-expert scales even when routed experts use block-wise FP8 scales. The
+# in-kernel SE reuses the routed fp8 weight/token/output VMEM buffers, so SE
+# weights must also be fp8 when activation quantization is enabled.
 w1_shared_scale = w2_shared_scale = w3_shared_scale = None
-if use_shared_expert and use_fp8 and quant_block_k is None:
+if use_shared_expert and use_fp8:
     log("quantizing shared-expert weights to fp8 (per-channel, replicated)...")
     repl_sharding2 = jax.sharding.NamedSharding(mesh, P())
 
@@ -935,6 +993,8 @@ for num_tokens in token_candidates:
             bse=bse,
             use_shared_expert=use_shared_expert,
             se_inter=se_inter,
+            vmem_headroom=tune_vmem_headroom,
+            max_configs=tune_max_configs,
             verbose=(num_tokens == token_candidates[0]),
         )
         block_configs_to_try = tune_configs
@@ -1026,7 +1086,8 @@ for num_tokens in token_candidates:
             f"bt={bt},bf={bf},btc={btc},bts={bts},bse={bc.bse},"
             f"xprefetch={xprefetch_mode},"
             f"direct={int(direct_scaled_dot)},"
-            f"ilv_bt={int(interleave_bt)}"
+            f"ilv_bt={int(interleave_bt)},"
+            f"ablation={kernel_ablation_mode}"
         )
 
         padded_nt = num_tokens
@@ -1047,7 +1108,8 @@ for num_tokens in token_candidates:
             f"btc={bc_resolved.btc},bts={bc_resolved.bts},bse={bc_resolved.bse},"
             f"xprefetch={xprefetch_mode},"
             f"direct={int(direct_scaled_dot)},"
-            f"ilv_bt={int(interleave_bt)}"
+            f"ilv_bt={int(interleave_bt)},"
+            f"ablation={kernel_ablation_mode}"
         )
         resolved_key = (
             bc_resolved.bt,
@@ -1057,6 +1119,7 @@ for num_tokens in token_candidates:
             xprefetch_mode,
             direct_scaled_dot,
             interleave_bt,
+            kernel_ablation_mode,
         )
         if resolved_key in seen_resolved_configs:
             log(f"  SKIP duplicate resolved config {tag} -> {tag_resolved}")
@@ -1091,12 +1154,13 @@ for num_tokens in token_candidates:
                 cross_expert_prefetch_mode=xprefetch_mode,
                 interleave_bt=interleave_bt,
                 enable_bt_scatter_overlap=enable_bt_scatter_overlap,
+                kernel_ablation_mode=kernel_ablation_mode,
             )
 
         try:
             if use_split:
                 dispatch_times, wait_times = split_timeit(run_fn, warmup=warmup, iters=iters)
-                if jax.process_index() == 0 and dispatch_times:
+                if dispatch_times:
                     d_avg = np.mean(dispatch_times)
                     w_avg = np.mean(wait_times)
                     wall_avg = d_avg + w_avg
@@ -1115,21 +1179,20 @@ for num_tokens in token_candidates:
                     )
             else:
                 times = timeit_fn(run_fn, warmup=warmup, iters=iters)
-                if jax.process_index() == 0:
-                    if times:
-                        avg = np.mean(times)
-                        log(
-                            f"  {tag_resolved}: {avg:.3f} ms ({timing_label}) | samples={[round(t, 3) for t in times]}"
-                        )
-                        results.append((num_tokens, tag_resolved, avg, times))
-                    else:
-                        log(f"  {tag_resolved}: no timing data")
+                if times:
+                    avg = np.mean(times)
+                    log(
+                        f"  {tag_resolved}: {avg:.3f} ms ({timing_label}) | samples={[round(t, 3) for t in times]}"
+                    )
+                    results.append((num_tokens, tag_resolved, avg, times))
+                else:
+                    log(f"  {tag_resolved}: no timing data")
         except Exception as e:
             log(f"  FAIL {tag}: {e}")
             continue
 
 # --- Summary ---
-if jax.process_index() == 0 and results:
+if results:
     log("")
     log("=== Summary ===")
     by_tokens: dict[int, list[tuple[str, float, list[float]]]] = {}
@@ -1142,6 +1205,42 @@ if jax.process_index() == 0 and results:
         if len(entries) > 1:
             for tag, avg, _ in entries[1:]:
                 log(f"    {avg:.3f}ms [{tag}]")
+
+    if metrics_jsonl:
+        metrics_path = pathlib.Path(metrics_jsonl)
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        with metrics_path.open("w", encoding="utf-8") as fh:
+            for nt in sorted(by_tokens):
+                entries = sorted(by_tokens[nt], key=lambda x: x[1])
+                best_avg = entries[0][1]
+                for tag, avg, times in entries:
+                    record = {
+                        "variant": benchmark_variant,
+                        "tokens": nt,
+                        "num_experts": E,
+                        "top_k": top_k,
+                        "hidden_size": d,
+                        "intermediate_size": f,
+                        "ep_size": ep_size,
+                        "process_index": jax.process_index(),
+                        "activation_dtype": "bfloat16",
+                        "weight_dtype": "float8_e4m3fn" if use_fp8 else "bfloat16",
+                        "quant_block_k": quant_block_k,
+                        "use_shared_expert": use_shared_expert,
+                        "shared_expert_intermediate_size": se_inter if use_shared_expert else 0,
+                        "enable_act_quant": enable_act_quant,
+                        "enable_bt_scatter_overlap": enable_bt_scatter_overlap,
+                        "kernel_ablation_mode": kernel_ablation_mode,
+                        "routing_mode": routing_mode,
+                        "block_config": tag,
+                        "latency_ms": float(avg),
+                        "latency_p50_ms": float(np.median(times)),
+                        "latency_min_ms": float(np.min(times)),
+                        "samples_ms": [float(t) for t in times],
+                        "is_best_for_tokens": bool(avg == best_avg),
+                    }
+                    fh.write(json.dumps(record, sort_keys=True) + "\n")
+        log(f"wrote structured metrics to {metrics_path}")
 
 # --- Correctness check (optional, single-host only) ---
 if check_correctness:

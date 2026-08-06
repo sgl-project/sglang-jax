@@ -52,6 +52,33 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         # MiMo V2 Pro: E=384, H=6144, I=2048, top_k=8, fp8 e4m3, ep=8
         # Decode configs (tuned on bench-4 single-host v7x-16, 2026-05-21)
         ('bfloat16', 'float8_e4m3fn', 512, 384, 8, 6144, 2048, 8, False, False): (64, 1024, 32, 256, 32),
+        # GLM-5.2: E=256, H=6144, I=2048, top_k=8, routed FP8 block-wise
+        # K=128, ep=16, in-kernel shared expert, act_quant ON, no grouped top-k.
+        # Tuned on 8 TPU v7x chips / 16 JAX devices, 2026-08-04
+        # (Falcon exp-fvmfgcw2y9).
+        ('bfloat16', 'float8_e4m3fn', 32, 256, 8, 6144, 2048, 16, True, False, True): (8, 512, 8, 128, 8),
+        ('bfloat16', 'float8_e4m3fn', 64, 256, 8, 6144, 2048, 16, True, False, True): (8, 512, 8, 128, 8),
+        ('bfloat16', 'float8_e4m3fn', 128, 256, 8, 6144, 2048, 16, True, False, True): (8, 1024, 8, 128, 8),
+        ('bfloat16', 'float8_e4m3fn', 256, 256, 8, 6144, 2048, 16, True, False, True): (16, 512, 16, 128, 16),
+        ('bfloat16', 'float8_e4m3fn', 512, 256, 8, 6144, 2048, 16, True, False, True): (32, 1024, 16, 1024, 32),
+        ('bfloat16', 'float8_e4m3fn', 1024, 256, 8, 6144, 2048, 16, True, False, True): (64, 1024, 64, 1024, 64),
+        ('bfloat16', 'float8_e4m3fn', 2048, 256, 8, 6144, 2048, 16, True, False, True): (128, 1024, 64, 1024, 128),
+        ('bfloat16', 'float8_e4m3fn', 4096, 256, 8, 6144, 2048, 16, True, False, True): (128, 1024, 64, 1024, 128),
+        ('bfloat16', 'float8_e4m3fn', 8192, 256, 8, 6144, 2048, 16, True, False, True): (128, 1024, 64, 1024, 128),
+        ('bfloat16', 'float8_e4m3fn', 16384, 256, 8, 6144, 2048, 16, True, False, True): (256, 512, 64, 512, 256),
+        # GLM-5.2: E=256, H=6144, I=2048, top_k=8, routed FP8 block-wise
+        # K=128, ep=32, in-kernel shared expert, act_quant ON, no grouped top-k.
+        # Tuned on 16 TPU v7x chips, 2026-08-03 (Falcon exp-bkbi8g86uy).
+        ('bfloat16', 'float8_e4m3fn', 32, 256, 8, 6144, 2048, 32, True, False, True): (8, 512, 8, 128, 8),
+        ('bfloat16', 'float8_e4m3fn', 64, 256, 8, 6144, 2048, 32, True, False, True): (8, 512, 8, 128, 8),
+        ('bfloat16', 'float8_e4m3fn', 128, 256, 8, 6144, 2048, 32, True, False, True): (8, 512, 16, 128, 16),
+        ('bfloat16', 'float8_e4m3fn', 256, 256, 8, 6144, 2048, 32, True, False, True): (8, 512, 16, 128, 16),
+        ('bfloat16', 'float8_e4m3fn', 512, 256, 8, 6144, 2048, 32, True, False, True): (16, 1024, 32, 1024, 32),
+        ('bfloat16', 'float8_e4m3fn', 1024, 256, 8, 6144, 2048, 32, True, False, True): (32, 1024, 64, 1024, 64),
+        ('bfloat16', 'float8_e4m3fn', 2048, 256, 8, 6144, 2048, 32, True, False, True): (64, 1024, 40, 1024, 80),
+        ('bfloat16', 'float8_e4m3fn', 4096, 256, 8, 6144, 2048, 32, True, False, True): (128, 1024, 32, 1024, 160),
+        ('bfloat16', 'float8_e4m3fn', 8192, 256, 8, 6144, 2048, 32, True, False, True): (128, 1024, 32, 1024, 160),
+        ('bfloat16', 'float8_e4m3fn', 16384, 256, 8, 6144, 2048, 32, True, False, True): (128, 1024, 32, 1024, 160),
         # Ling 2.6-1T: E=256, H=8192, I=2048, top_k=8, fp8 e4m3 per-channel, ep=32
         # Tuned 2026-05-27
         ('bfloat16', 'float8_e4m3fn', 64, 256, 8, 8192, 2048, 32, False, True): (8, 256, 8, 256, 8),

@@ -206,7 +206,7 @@ class ModelWorker:
         # covered even when the raw server_args string stays at "epmoe".
         effective_moe_backend = self.model_runner.model_config.moe_backend.value
         mesh_ep_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
-        if effective_moe_backend == "fused" and mesh_ep_size > 1:
+        if effective_moe_backend in ("fused", "fused_v2") and mesh_ep_size > 1:
             from sgl_jax.srt.utils.common_utils import align_bs_for_fused_ep
 
             assert mesh_ep_size % dp_size == 0, (
