@@ -1,0 +1,254 @@
+# GLM-5.2 FP8 8-chip validation for the repaired basic/cache-hit eval path.
+# The 16-chip benchmark/profile manifest is intentionally kept separately.
+name: glm52-fused-v2-radix-dp16-c32-128k-validation-20260806-r1
+exp_type: TRAINING
+artifact_type: metrics
+cluster_name: tpu-training-antgroup
+tags:
+  - validation
+  - e2e
+  - glm52
+  - fused-moe-v2
+  - radix-topk
+  - dp16
+  - ep16
+  - cache-hit
+  - no-sequence-parallel
+model_version: 1ffcd5d3cabce93c7b0f60a041bc3731d2e5eecb
+config: '{"model":"GLM-5.2-FP8","tp":16,"dp":16,"ep":16,"physical_chips":8,"jax_devices":16,"prefix_tokens":131072,"extend_tokens":1024,"decode_tokens":128,"max_prefill_tokens":32768,"max_total_tokens":"auto","concurrency":32,"concurrency_per_dp":2,"prefix_mode":"shared","dsa_sparse_impl":"exact","dsa_topk_impl":"radix","moe_backend":"fused_v2","mem_fraction_static":0.83,"precompile_token_padding":32768,"sequence_parallel":false,"source_commit":"1ffcd5d3cabce93c7b0f60a041bc3731d2e5eecb"}'
+role_to_task_spec:
+  worker:
+    command: |
+      bash <<'BASH'
+      set -euo pipefail
+      ulimit -c 0
+
+      export PYTHONUNBUFFERED=1
+      export TMPDIR="${TMPDIR:-/tmp/tpu_logs/tmp}"
+      export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/tmp/tpu_logs/pip-cache}"
+      export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/tpu_logs/uv-cache}"
+      export JAX_COMPILATION_CACHE_DIR="${JAX_COMPILATION_CACHE_DIR:-/tmp/tpu_logs/jax-compilation-cache}"
+      export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:+$LIBTPU_INIT_ARGS }--xla_tpu_dvfs_p_state=7"
+
+      OUT="${ARTIFACT_LOCAL_DIR:-/tmp/glm52-fused-v2-radix-dp16-validation-artifact}"
+      RANK="${FALCON_RANK:-${FALCON_JAX_PROCESS_ID:-${JOB_COMPLETION_INDEX:-0}}}"
+      WORLD="${FALCON_WORLD_SIZE:-2}"
+      MODEL_PATH=/models/GLM-5.2-FP8
+      POD_HOST="$(hostname)"
+      JOB_BASE="${POD_HOST%-*}"
+      MASTER_ADDR="$JOB_BASE-0.$JOB_BASE"
+      RANK_OUT="$OUT/rank-$RANK"
+      LOCAL_ROOT="/tmp/tpu_logs/glm52-fused-v2-radix-dp16-validation-rank-$RANK"
+      SERVER_LOG="$LOCAL_ROOT/server.log"
+      SERVER_PID=0
+      TAIL_PID=0
+
+      mkdir -p "$RANK_OUT" "$OUT/workload" "$LOCAL_ROOT" \
+        "$TMPDIR" "$PIP_CACHE_DIR" "$UV_CACHE_DIR" "$JAX_COMPILATION_CACHE_DIR"
+
+      cd /workspace/sglang-jax
+      test "$(git rev-parse HEAD)" = "1ffcd5d3cabce93c7b0f60a041bc3731d2e5eecb"
+      git rev-parse HEAD > "$RANK_OUT/source-revision.txt"
+      python3 -m pip install -q --upgrade pip uv
+      uv venv --python 3.12 --seed /tmp/tpu_logs/sglang-dp16-validation-venv
+      . /tmp/tpu_logs/sglang-dp16-validation-venv/bin/activate
+      uv pip install -q -e 'python[tpu]' pytest
+      export PYTHONPATH=/workspace/sglang-jax/python:${PYTHONPATH:-}
+
+      python3 -m pytest -q test/srt/test_glm52_bench_dsa_cache_hit.py \
+        > "$RANK_OUT/benchmark-script-tests.txt" 2>&1
+
+      python3 - <<'PY' > "$RANK_OUT/runtime-versions.txt"
+      import importlib.metadata as md
+      for package in ("jax", "jaxlib", "libtpu", "sglang-jax", "transformers"):
+          try:
+              print(f"{package}={md.version(package)}")
+          except md.PackageNotFoundError:
+              print(f"{package}=MISSING")
+      PY
+
+      python3 - "$MODEL_PATH" <<'PY' > "$RANK_OUT/model-config-check.json"
+      import json
+      import pathlib
+      import sys
+
+      model_path = pathlib.Path(sys.argv[1])
+      config_path = model_path / "config.json"
+      index_path = model_path / "model.safetensors.index.json"
+      marker_path = model_path / "_DOWNLOAD_COMPLETE"
+      if not config_path.is_file() or not index_path.is_file() or not marker_path.is_file():
+          raise SystemExit(f"incomplete model mount: {model_path}")
+      config = json.loads(config_path.read_text())
+      quant = config.get("quantization_config")
+      if not isinstance(quant, dict) or quant.get("quant_method") != "fp8":
+          raise SystemExit(f"unexpected quantization config: {quant}")
+      print(json.dumps({
+          "model_type": config.get("model_type"),
+          "architectures": config.get("architectures"),
+          "quantization_config": quant,
+      }, indent=2, sort_keys=True))
+      PY
+
+      stop_process() {
+        local pid="$1"
+        if [ "$pid" -le 0 ]; then
+          return
+        fi
+        kill "$pid" 2>/dev/null || true
+        for _ in $(seq 1 30); do
+          if ! kill -0 "$pid" 2>/dev/null; then
+            wait "$pid" 2>/dev/null || true
+            return
+          fi
+          sleep 1
+        done
+        kill -9 "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+      }
+
+      cleanup_rank0() {
+        set +e
+        stop_process "$SERVER_PID"
+        stop_process "$TAIL_PID"
+        cp "$SERVER_LOG" "$RANK_OUT/server.log" 2>/dev/null || true
+        touch "$OUT/ALL_DONE"
+      }
+
+      echo "GLM52_VALIDATION_SERVER_LAUNCH rank=$RANK world=$WORLD host=$POD_HOST master=$MASTER_ADDR"
+      python3 -m sgl_jax.launch_server \
+        --model-path "$MODEL_PATH" \
+        --trust-remote-code \
+        --device tpu \
+        --dtype bfloat16 \
+        --kv-cache-dtype bf16 \
+        --attention-backend dsa_sparse \
+        --dsa-sparse-impl exact \
+        --dsa-topk-impl radix \
+        --dsa-use-pallas \
+        --page-size 64 \
+        --chunked-prefill-size 2048 \
+        --max-prefill-tokens 32768 \
+        --context-length 135168 \
+        --tp-size 16 \
+        --dp-size 16 \
+        --dp-schedule-policy round_robin \
+        --ep-size 16 \
+        --moe-backend fused_v2 \
+        --mem-fraction-static 0.83 \
+        --max-running-requests 32 \
+        --precompile-bs-paddings 32 \
+        --precompile-token-paddings 32768 \
+        --skip-server-warmup \
+        --random-seed 3 \
+        --stream-output \
+        --stream-interval 1 \
+        --nnodes "$WORLD" \
+        --node-rank "$RANK" \
+        --dist-init-addr "$MASTER_ADDR:25000" \
+        --host 0.0.0.0 \
+        --port 30000 \
+        >"$SERVER_LOG" 2>&1 &
+      SERVER_PID=$!
+      tail -n +1 -F "$SERVER_LOG" &
+      TAIL_PID=$!
+
+      if [ "$RANK" != "0" ]; then
+        while [ ! -f "$OUT/ALL_DONE" ]; do
+          if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+            echo "GLM52_VALIDATION_SERVER_DIED rank=$RANK"
+            cp "$SERVER_LOG" "$RANK_OUT/server.log" 2>/dev/null || true
+            exit 1
+          fi
+          sleep 15
+        done
+        stop_process "$SERVER_PID"
+        stop_process "$TAIL_PID"
+        cp "$SERVER_LOG" "$RANK_OUT/server.log" 2>/dev/null || true
+        echo "GLM52_VALIDATION_RANK_COMPLETE rank=$RANK"
+        exit 0
+      fi
+
+      trap cleanup_rank0 EXIT
+      READY=0
+      for i in $(seq 1 1080); do
+        if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+          echo "GLM52_VALIDATION_SERVER_DIED_BEFORE_READY rank=0"
+          exit 1
+        fi
+        if curl -sf http://localhost:30000/get_server_info > "$OUT/server-info-ready.json"; then
+          echo "GLM52_VALIDATION_SERVER_READY elapsed_seconds=$((i * 10))"
+          READY=1
+          break
+        fi
+        sleep 10
+      done
+      if [ "$READY" != "1" ]; then
+        echo "GLM52_VALIDATION_SERVER_READY_TIMEOUT seconds=10800"
+        exit 1
+      fi
+
+      python3 benchmark/glm52/eval_basic_generation.py \
+        --base-url http://localhost:30000 \
+        --output "$OUT/workload/basic-eval.json" \
+        2>&1 | tee "$OUT/workload/basic-eval.log"
+      echo "GLM52_VALIDATION_BASIC_EVAL_COMPLETE"
+
+      python3 benchmark/glm52/bench_dsa_cache_hit.py \
+        --base-url http://localhost:30000 \
+        --concurrency 32 \
+        --dp-size 16 \
+        --prefix-mode shared \
+        --prefix-len 131072 \
+        --extend-len 1024 \
+        --output-len 128 \
+        --random-seed 3 \
+        --variant exact_dsa_radix_topk \
+        --cache-hit-tolerance 64 \
+        --output "$OUT/workload/metrics.jsonl" \
+        2>&1 | tee "$OUT/workload/benchmark.log"
+      echo "GLM52_VALIDATION_BENCHMARK_COMPLETE"
+
+      curl -sf http://localhost:30000/get_server_info > "$OUT/server-info-final.json"
+      env | sort | grep -E '^(LIBTPU_INIT_ARGS|XLA_FLAGS|JAX_|TF_XLA_FLAGS|SGLANG_|FALCON_)=' \
+        > "$RANK_OUT/runtime-env.txt" || true
+      cp "$SERVER_LOG" "$RANK_OUT/server.log"
+      echo "GLM52_FUSED_V2_RADIX_DP16_C32_128K_VALIDATION_COMPLETE"
+      BASH
+    replica: 2
+    image: python:3.12
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x2
+    envs:
+      JAX_COMPILATION_CACHE_DIR: /tmp/tpu_logs/jax-compilation-cache
+      PIP_CACHE_DIR: /tmp/tpu_logs/pip-cache
+      PYTHONUNBUFFERED: "1"
+      TMPDIR: /tmp/tpu_logs/tmp
+      UV_CACHE_DIR: /tmp/tpu_logs/uv-cache
+    mounts:
+      - name: glm52-model
+        type: gcs
+        bucket: inference-model-storage-poc-tpu-hns
+        prefix: GLM-5.2-FP8
+        mount_path: /models/GLM-5.2-FP8
+        read_only: true
+        mount_options:
+          - implicit-dirs
+          - metadata-cache:ttl-secs:-1
+          - metadata-cache:stat-cache-max-size-mb:-1
+          - metadata-cache:type-cache-max-size-mb:-1
+          - file-system:kernel-list-cache-ttl-secs:-1
+          - read:enable-buffered-read:true
+          - read:block-size-mb:32
+          - read:max-blocks-per-handle:64
+          - read:global-max-blocks:2048
+          - read_ahead_kb=1024
+    sources:
+      - name: sglang-jax
+        type: git
+        repo: https://github.com/cjx0709/sglang-jax.git
+        ref: develop/glm52-fused-v2-e2e-rebased-20260806
+        commit: 1ffcd5d3cabce93c7b0f60a041bc3731d2e5eecb
+        path: /workspace/sglang-jax
+        auth:
+          cred: github-cjx0709-sglang-jax-codex
