@@ -237,12 +237,19 @@ def _run_native_batch_with_admission_barrier(
                     int(state.get("waiting_queue_size", -1))
                     for state in internal_states
                 ]
-                if waiting_sizes and min(waiting_sizes) >= len(input_ids):
-                    break
+                if waiting_sizes:
+                    expected_min = len(input_ids) // len(waiting_sizes)
+                    if (
+                        sum(waiting_sizes) >= len(input_ids)
+                        and min(waiting_sizes) >= expected_min
+                    ):
+                        break
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
-                        "native batch did not reach every scheduler waiting queue: "
-                        f"expected={len(input_ids)}, observed={waiting_sizes}"
+                        "native batch did not reach the DP scheduler waiting queues: "
+                        f"expected_total={len(input_ids)}, "
+                        f"expected_min_per_dp={len(input_ids) // len(waiting_sizes) if waiting_sizes else 'unknown'}, "
+                        f"observed={waiting_sizes}"
                     )
                 time.sleep(0.1)
 

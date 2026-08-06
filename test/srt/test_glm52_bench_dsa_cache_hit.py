@@ -123,11 +123,15 @@ def test_profile_admission_barrier_queues_full_native_batch_before_resume() -> N
     paused_response = mock.Mock()
     resumed_response = mock.Mock()
     server_info_response = mock.Mock()
-    server_info_response.json.return_value = {
-        "internal_states": [
-            {"waiting_queue_size": 4},
-            {"waiting_queue_size": 4},
+    scheduler_states = iter(
+        [
+            [{"waiting_queue_size": 1}, {"waiting_queue_size": 1}],
+            [{"waiting_queue_size": 3}, {"waiting_queue_size": 1}],
+            [{"waiting_queue_size": 2}, {"waiting_queue_size": 2}],
         ]
+    )
+    server_info_response.json.side_effect = lambda: {
+        "internal_states": next(scheduler_states)
     }
     resumed = threading.Event()
 
@@ -164,7 +168,7 @@ def test_profile_admission_barrier_queues_full_native_batch_before_resume() -> N
     assert post.call_args_list[1].args == ("http://server/continue_generation",)
     paused_response.raise_for_status.assert_called_once_with()
     resumed_response.raise_for_status.assert_called_once_with()
-    server_info_response.raise_for_status.assert_called_once_with()
+    assert server_info_response.raise_for_status.call_count == 3
 
 
 def test_variant_flag_can_label_radix_topk() -> None:
