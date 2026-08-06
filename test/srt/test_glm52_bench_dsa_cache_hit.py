@@ -182,18 +182,20 @@ def test_profile_admission_barrier_queues_all_requests_before_resume() -> None:
         with mock.patch.object(
             BENCHMARK.requests, "get", return_value=server_info_response
         ):
-            with mock.patch.object(
-                BENCHMARK,
-                "_run_parallel_single_requests",
-                side_effect=fake_run_parallel_single_requests,
-            ):
-                result = BENCHMARK._run_native_batch_with_admission_barrier(
-                    "http://server",
-                    [[1], [2], [3], [4]],
-                    1,
-                    label="profile",
-                    on_admitted=on_admitted,
-                )
+            with mock.patch.object(BENCHMARK.time, "sleep") as sleep:
+                with mock.patch.object(
+                    BENCHMARK,
+                    "_run_parallel_single_requests",
+                    side_effect=fake_run_parallel_single_requests,
+                ):
+                    result = BENCHMARK._run_native_batch_with_admission_barrier(
+                        "http://server",
+                        [[1], [2], [3], [4]],
+                        1,
+                        label="profile",
+                        on_admitted=on_admitted,
+                        profile_settle_s=0.25,
+                    )
 
     assert result == {"wall_s": 1.0}
     on_admitted.assert_called_once_with()
@@ -208,6 +210,7 @@ def test_profile_admission_barrier_queues_all_requests_before_resume() -> None:
     pause_response.raise_for_status.assert_called_once_with()
     resume_response.raise_for_status.assert_called_once_with()
     assert server_info_response.raise_for_status.call_count == 3
+    assert sleep.call_args_list[-1] == mock.call(0.25)
 
 
 def test_variant_flag_can_label_radix_topk() -> None:

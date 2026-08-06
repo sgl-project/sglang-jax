@@ -249,6 +249,7 @@ def _run_native_batch_with_admission_barrier(
     *,
     label: str,
     on_admitted: Callable[[], None],
+    profile_settle_s: float = 5.0,
     timeout_s: float = 180,
 ) -> dict:
     """Queue independent HTTP requests before releasing the scheduler.
@@ -300,6 +301,11 @@ def _run_native_batch_with_admission_barrier(
                 time.sleep(0.5)
 
             on_admitted()
+            # TPU device tracing is initialized asynchronously after the control
+            # request returns. Give it a bounded head start before the first
+            # measured forward is admitted, otherwise an otherwise successful
+            # manual profile can produce no XPlane files.
+            time.sleep(profile_settle_s)
         finally:
             _set_scheduler_paused(base_url, False)
 
