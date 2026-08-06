@@ -1313,6 +1313,7 @@ class Scheduler(
         req.bootstrap_host = recv_req.bootstrap_host
         req.bootstrap_port = recv_req.bootstrap_port
         req.bootstrap_room = recv_req.bootstrap_room
+        req.disagg_prefill_dp_rank = getattr(recv_req, "disagg_prefill_dp_rank", None)
         req.disagg_transfer_id = recv_req.disagg_transfer_id or req.rid
         if hasattr(recv_req, "mm_inputs") and recv_req.mm_inputs:
             req.mm_inputs = recv_req.mm_inputs
@@ -2741,7 +2742,7 @@ class Scheduler(
                 if entry.receiver is not None:
                     entry.receiver.abort()
                 if entry.kv_indices is not None:
-                    self._release_decode_kv_indices(entry.kv_indices)
+                    self._release_decode_kv_indices(entry.kv_indices, entry.req.dp_rank)
                 self._abort_decode_request(
                     entry.req,
                     "abort_request",

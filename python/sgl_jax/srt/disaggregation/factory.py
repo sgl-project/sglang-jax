@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from sgl_jax.srt.disaggregation.common.capacity import per_rank_inflight_limit
+
 if TYPE_CHECKING:
     from sgl_jax.srt.disaggregation.base.transfer import TransferBackend
     from sgl_jax.srt.managers.scheduler import Scheduler
@@ -140,18 +142,23 @@ def _create_raiden_backend(
     )
     page_size = max(1, int(server_args.page_size))
     max_blocks = (int(scheduler.max_req_input_len) + page_size - 1) // page_size
-    num_slots = int(server_args.disaggregation_max_inflight_transfers)
+    num_slots = per_rank_inflight_limit(
+        server_args.disaggregation_max_inflight_transfers,
+        server_args.dp_size,
+    )
     wrapper.start(
         kv_caches=list(kv_pool.kv_buffer),
         max_blocks=max_blocks,
         num_slots=num_slots,
+        dp_size=server_args.dp_size,
         timeout_s=float(server_args.disaggregation_pull_timeout_seconds),
     )
     logger.info(
-        "Raiden backend ready: max_blocks=%d num_slots=%d layers=%d",
+        "Raiden backend ready: max_blocks=%d slots_per_rank=%d layers=%d dp_size=%d",
         max_blocks,
         num_slots,
         kv_pool.layer_num,
+        server_args.dp_size,
     )
     return RaidenTransferKVManager(
         wrapper,

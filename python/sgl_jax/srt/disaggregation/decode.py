@@ -21,6 +21,7 @@ from sgl_jax.srt.disaggregation.base.transfer import (
     TransferBackend,
 )
 from sgl_jax.srt.disaggregation.bootstrap import BootstrapClient, PrefillInfoCache
+from sgl_jax.srt.disaggregation.common.capacity import per_rank_inflight_limit
 from sgl_jax.srt.mem_cache.memory_pool import write_kv_layer
 
 if TYPE_CHECKING:
@@ -28,6 +29,43 @@ if TYPE_CHECKING:
     from sgl_jax.srt.managers.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
+
+
+def _batch_req_count(batch) -> int:
+    if batch is None:
+        return 0
+    reqs_info = getattr(batch, "reqs_info", None)
+    if reqs_info is None:
+        return len(getattr(batch, "reqs", ()) or ())
+    return sum(len(info.reqs) if info.reqs else 0 for info in reqs_info)
+
+
+def _batch_req_count_for_dp(batch, dp_rank: int) -> int:
+    if batch is None:
+        return 0
+    reqs_info = getattr(batch, "reqs_info", None)
+    if reqs_info is not None:
+        info = reqs_info[dp_rank]
+        return len(info.reqs) if info.reqs else 0
+    return sum(
+        1
+        for req in (getattr(batch, "reqs", ()) or ())
+        if (getattr(req, "dp_rank", None) if getattr(req, "dp_rank", None) is not None else 0)
+        == dp_rank
+    )
+
+
+def _request_dp_rank(req, dp_size: int, *, prefill: bool = False) -> int:
+    field = "disagg_prefill_dp_rank" if prefill else "dp_rank"
+    value = getattr(req, field, None)
+    if value is None:
+        if dp_size == 1:
+            return 0
+        raise ValueError(f"PD request {req.rid!r} is missing {field} for dp_size={dp_size}")
+    value = int(value)
+    if not 0 <= value < dp_size:
+        raise ValueError(f"PD request {req.rid!r} has {field}={value} outside [0, {dp_size})")
+    return value
 
 
 @dataclass
@@ -111,6 +149,13 @@ class DecodeTransferQueue:
             if entry.req_id in self._entries:
                 raise ValueError(f"DecodeTransferQueue already tracks req_id={entry.req_id!r}")
             self._entries[entry.req_id] = entry
+
+    def count_by_rank(self, dp_size: int) -> list[int]:
+        counts = [0] * dp_size
+        with self._lock:
+            for entry in self._entries.values():
+                counts[_request_dp_rank(entry.req, dp_size)] += 1
+        return counts
 
     def drain_terminal(self) -> list[DecodeBookkeeping]:
         """Return entries whose receiver reached SUCCESS or FAILED."""
@@ -209,10 +254,13 @@ class SchedulerDisaggregationDecodeMixin:
         except Exception:
             ns, nr = (-1, -1)
         try:
-            kv_avail = self.token_to_kv_pool_allocator.available_size()
+            kv_avail = [
+                self.token_to_kv_pool_allocator.available_size(dp_rank)
+                for dp_rank in range(self.dp_size)
+            ]
         except Exception:
             kv_avail = -1
-        running = len(self.running_batch.reqs) if self.running_batch is not None else 0
+        running = _batch_req_count(self.running_batch)
         return (
             f"prealloc_q={prealloc} transfer_q={transfer} "
             f"inflight_send={ns} inflight_recv={nr} "
@@ -246,17 +294,20 @@ class SchedulerDisaggregationDecodeMixin:
             try:
                 from sgl_jax.srt.disaggregation.common.metrics import time_phase
 
+                prefill_dp_rank = _request_dp_rank(req, self.dp_size, prefill=True)
                 self._pd_mark_time(req, "bootstrap_start")
                 with time_phase("bootstrap", "decode"):
                     if jax.process_count() > 1:
                         # Multi-host caches the matched peer after the first
                         # lookup, so this does no per-request network I/O.
-                        p_info = self._pick_prefill_peer_for_this_host()
+                        p_info = self._pick_prefill_peer_for_this_host(prefill_dp_rank)
                     else:
                         # Local cache resolution (sglang-style): a warm cache
                         # does zero network I/O, so this no longer blocks the
                         # event loop.
-                        p_info = self.disagg_prefill_info_cache.pick_for_room(req.bootstrap_room)
+                        p_info = self.disagg_prefill_info_cache.pick_for_room(
+                            req.bootstrap_room, prefill_dp_rank
+                        )
                 self._pd_mark_time(req, "bootstrap_done")
             except Exception:
                 logger.exception(
@@ -289,6 +340,8 @@ class SchedulerDisaggregationDecodeMixin:
                     local_page_size=self.server_args.page_size,
                     local_kv_dtype=resolve_kv_dtype_name(local_kv_pool.dtype),
                     expected_transfer_engine=(None if manager is None else manager.engine_name),
+                    expected_dp_rank=prefill_dp_rank,
+                    expected_dp_size=self.dp_size,
                 )
             except ValueError as exc:
                 logger.error(
@@ -343,7 +396,7 @@ class SchedulerDisaggregationDecodeMixin:
                     state = KVPoll.FAILED
             if entry.cancelled:
                 if entry.kv_indices is not None:
-                    self._release_decode_kv_indices(entry.kv_indices)
+                    self._release_decode_kv_indices(entry.kv_indices, entry.req.dp_rank)
                 continue
             if state == KVPoll.SUCCESS:
                 try:
@@ -374,7 +427,7 @@ class SchedulerDisaggregationDecodeMixin:
                         entry.req_id,
                     )
                     if entry.kv_indices is not None:
-                        self._release_decode_kv_indices(entry.kv_indices)
+                        self._release_decode_kv_indices(entry.kv_indices, entry.req.dp_rank)
                     self._abort_decode_request(
                         entry.req,
                         "kv_writeback",
@@ -388,35 +441,42 @@ class SchedulerDisaggregationDecodeMixin:
                 )
                 self._record_decode_transfer_failure("receiver_terminal_failed")
                 if entry.kv_indices is not None:
-                    self._release_decode_kv_indices(entry.kv_indices)
+                    self._release_decode_kv_indices(entry.kv_indices, entry.req.dp_rank)
                 self._abort_decode_request(
                     entry.req,
                     "receiver_terminal_failed",
                     cleanup_transfer=False,
                 )
 
-    def _pick_prefill_peer_for_this_host(self: Scheduler) -> dict[str, object]:
+    def _pick_prefill_peer_for_this_host(self: Scheduler, dp_rank: int) -> dict[str, object]:
         """Multi-host: find the P host whose jax_process_index matches ours.
         That host's local KV shard is exactly the slice this D host needs.
         Requires P/D to have the same nproc (same-TP constraint).
         """
-        if getattr(self, "_disagg_prefill_peer", None) is not None:
-            return self._disagg_prefill_peer
+        peers = getattr(self, "_disagg_prefill_peers", None)
+        if peers is None:
+            peers = self._disagg_prefill_peers = {}
+        if dp_rank in peers:
+            return peers[dp_rank]
         my_pidx = jax.process_index()
         my_nproc = jax.process_count()
         all_p = self.disagg_bootstrap_client.list_prefills()
         for p in all_p:
-            if int(p.get("jax_process_index", -1)) == my_pidx:
+            if (
+                int(p.get("jax_process_index", -1)) == my_pidx
+                and int(p.get("system_dp_rank", 0)) == dp_rank
+            ):
                 if int(p.get("jax_process_count", 0)) != my_nproc:
                     raise RuntimeError(
                         f"P/D process_count mismatch: P={p.get('jax_process_count')} "
                         f"D={my_nproc}. Per-host shard transfer requires same nproc."
                     )
-                self._disagg_prefill_peer = p
+                peers[dp_rank] = p
                 return p
         raise RuntimeError(
-            f"no prefill host with jax_process_index={my_pidx} registered "
-            f"(got {[(p.get('host'), p.get('jax_process_index')) for p in all_p]})"
+            f"no prefill host with jax_process_index={my_pidx}, dp_rank={dp_rank} "
+            "registered (got "
+            f"{[(p.get('host'), p.get('jax_process_index'), p.get('system_dp_rank')) for p in all_p]})"
         )
 
     def _drain_transfer_queue_synced(self: Scheduler) -> list[DecodeBookkeeping]:
@@ -456,16 +516,7 @@ class SchedulerDisaggregationDecodeMixin:
         return out
 
     def _admit_decode_prealloc(self: Scheduler) -> None:
-        """Capacity-gated FIFO admission of preallocated PD reqs.
-
-        Pops reqs from the prealloc queue into the transfer queue only while
-        the paged pool has room, reserving ``num_reserved_decode_tokens`` of
-        headroom per in-flight/running request so a running decode step can
-        always alloc its next token even when every other req is mid-transfer
-        (transfer-queue reqs cannot be retracted). KV indices are allocated
-        here, not at intake. Reqs that don't fit stay queued and retry next
-        tick — deferral, never abort.
-        """
+        """Admit transfers without consuming non-retractable Decode headroom."""
 
         allocator = self.token_to_kv_pool_allocator
         if allocator is None:
@@ -474,31 +525,42 @@ class SchedulerDisaggregationDecodeMixin:
         page_size = allocator.page_size
         reserved_per = self.server_args.disaggregation_num_reserved_decode_tokens
         max_inflight = self.server_args.disaggregation_max_inflight_transfers
-        n_running = len(self.running_batch.reqs) if self.running_batch is not None else 0
+        per_rank_inflight = per_rank_inflight_limit(max_inflight, self.dp_size)
         n_transfer = len(self.disagg_transfer_queue)
         admitted = 0
+        transfer_per_dp = self.disagg_transfer_queue.count_by_rank(self.dp_size)
+        admitted_per_dp = [0] * self.dp_size
+        capacity_blocked_ranks: set[int] = set()
 
         for entry in self.disagg_prealloc_queue.items_fifo():
-            # In-flight transfer cap: each admitted transfer holds a pulled KV
-            # destination buffer on decode HBM (untracked by the paged-pool
-            # budget below) until it is scattered. Stop admitting once the cap
-            # is reached so a burst of concurrent requests cannot allocate that
-            # many transient buffers at once and OOM. Excess reqs stay queued
-            # and retry next tick (deferral, never abort).
+            decode_dp_rank = _request_dp_rank(entry.req, self.dp_size)
+            prefill_dp_rank = _request_dp_rank(entry.req, self.dp_size, prefill=True)
+            # Pulled KV buffers remain outside paged-pool accounting until scatter.
             if max_inflight > 0 and (n_transfer + admitted) >= max_inflight:
                 break
+            # Preserve FIFO within a blocked rank without stalling other ranks.
+            if decode_dp_rank in capacity_blocked_ranks:
+                continue
+            if (
+                per_rank_inflight > 0
+                and transfer_per_dp[decode_dp_rank] + admitted_per_dp[decode_dp_rank]
+                >= per_rank_inflight
+            ):
+                continue
             seqlen = len(entry.req.origin_input_ids)
             page_aligned = ((seqlen + page_size - 1) // page_size) * page_size
-            reserved = reserved_per * (n_running + n_transfer + admitted)
-            if page_aligned + reserved > allocator.available_size():
-                # Insufficient capacity: defer this and all later (FIFO) reqs.
-                break
+            n_running = _batch_req_count_for_dp(self.running_batch, decode_dp_rank)
+            reserved = reserved_per * (
+                n_running + transfer_per_dp[decode_dp_rank] + admitted_per_dp[decode_dp_rank]
+            )
+            if page_aligned + reserved > allocator.available_size(decode_dp_rank):
+                capacity_blocked_ranks.add(decode_dp_rank)
+                continue
 
-            kv_indices = allocator.alloc(page_aligned)
+            kv_indices = allocator.alloc(page_aligned, dp_rank=decode_dp_rank)
             if kv_indices is None:
-                # Budget check should prevent this; treat a surprise shortfall
-                # as transient and retry next tick rather than abort.
-                break
+                capacity_blocked_ranks.add(decode_dp_rank)
+                continue
 
             try:
                 admission = self.disagg_kv_manager.try_start_decode(
@@ -506,6 +568,8 @@ class SchedulerDisaggregationDecodeMixin:
                         req_id=entry.req.rid,
                         transfer_id=entry.req.disagg_transfer_id or entry.req.rid,
                         bootstrap_room=entry.req.bootstrap_room,
+                        decode_dp_rank=decode_dp_rank,
+                        prefill_dp_rank=prefill_dp_rank,
                         peer_info=entry.p_info or {},
                         kv_indices=kv_indices,
                         page_size=page_size,
@@ -522,13 +586,13 @@ class SchedulerDisaggregationDecodeMixin:
                     entry.req.rid,
                 )
                 self._record_decode_transfer_failure("receiver_init")
-                self._release_decode_kv_indices(kv_indices)
+                self._release_decode_kv_indices(kv_indices, decode_dp_rank)
                 self.disagg_prealloc_queue.remove(entry.req_id)
                 self._abort_decode_request(entry.req, "receiver_init")
                 continue
 
             if admission.state == AdmissionState.DEFERRED:
-                self._release_decode_kv_indices(kv_indices)
+                self._release_decode_kv_indices(kv_indices, decode_dp_rank)
                 timeout_s = self.server_args.disaggregation_pull_timeout_seconds
                 if timeout_s > 0 and time.monotonic() - entry.created_at >= timeout_s:
                     self.disagg_prealloc_queue.remove(entry.req_id)
@@ -547,6 +611,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.disagg_prealloc_queue.remove(entry.req_id)
             self.disagg_transfer_queue.add(entry)
             admitted += 1
+            admitted_per_dp[decode_dp_rank] += 1
 
     # ------------------------------------------------------------------
     # Overridable / test-friendly hooks
@@ -566,7 +631,7 @@ class SchedulerDisaggregationDecodeMixin:
             req.pd_time_stats = ts
         ts.mark(name)
 
-    def _release_decode_kv_indices(self: Scheduler, kv_indices) -> None:
+    def _release_decode_kv_indices(self: Scheduler, kv_indices, dp_rank: int | None) -> None:
         """Release KV indices back to the allocator."""
 
         if kv_indices is None:
@@ -574,7 +639,8 @@ class SchedulerDisaggregationDecodeMixin:
         allocator = self.token_to_kv_pool_allocator
         if allocator is not None:
             try:
-                allocator.free(kv_indices)
+                rank = 0 if dp_rank is None and self.dp_size == 1 else int(dp_rank)
+                allocator.free(kv_indices, dp_rank=rank)
             except Exception:
                 logger.exception("failed to free kv_indices=%r", kv_indices)
 
@@ -749,11 +815,35 @@ class SchedulerDisaggregationDecodeMixin:
         manager = getattr(self, "disagg_kv_manager", None)
         room = getattr(req, "bootstrap_room", None)
         if manager is not None and cleanup_transfer:
-            with suppress(Exception):
-                manager.cleanup_transfer(
+            try:
+                prefill_dp_rank = _request_dp_rank(req, self.dp_size, prefill=True)
+            except Exception:
+                logger.warning(
+                    "cannot resolve Prefill DP rank while cleaning up aborted "
+                    "req_id=%s bootstrap_room=%s reason=%s; transfer metadata "
+                    "will expire by TTL",
+                    req.rid,
                     room,
-                    jax_process_index=getattr(req, "disagg_peer_process_index", None),
+                    reason,
+                    exc_info=True,
                 )
+            else:
+                try:
+                    manager.cleanup_transfer(
+                        room,
+                        jax_process_index=getattr(req, "disagg_peer_process_index", None),
+                        prefill_dp_rank=prefill_dp_rank,
+                    )
+                except Exception:
+                    logger.warning(
+                        "failed to clean up transfer metadata for req_id=%s "
+                        "bootstrap_room=%s prefill_dp_rank=%s reason=%s",
+                        req.rid,
+                        room,
+                        prefill_dp_rank,
+                        reason,
+                        exc_info=True,
+                    )
         self._release_decode_req_resources(req)
         try:
             from sgl_jax.srt.managers.io_struct import AbortReq

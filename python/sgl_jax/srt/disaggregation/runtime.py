@@ -21,9 +21,10 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
     mode = server_args.disaggregation_mode
     if mode == "null":
         return
-    if server_args.dp_size > 1:
+    if server_args.dp_size > 1 and not server_args.disaggregation_use_raiden:
         raise RuntimeError(
-            f"PD disaggregation does not yet support dp_size>1 (got dp_size={server_args.dp_size})."
+            "PD disaggregation with dp_size>1 requires the Raiden transfer "
+            f"engine (got dp_size={server_args.dp_size})."
         )
     if server_args.disaggregation_bootstrap_url is None:
         raise RuntimeError("disaggregation_mode != null requires bootstrap_url")
@@ -99,26 +100,32 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
         prefill_kv_pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
         kv_dtype_name = resolve_kv_dtype_name(prefill_kv_pool.dtype)
 
-        bootstrap_key = f"{local_host}:{transfer_port}"
-        scheduler.disagg_bootstrap_client.register_prefill(
-            bootstrap_key=bootstrap_key,
-            host=local_host,
-            transfer_port=transfer_port,
-            side_channel_port=side_channel_port,
-            tp_rank=server_args.node_rank,
-            tp_size=server_args.tp_size,
-            system_dp_rank=0,
-            jax_process_index=jax.process_index(),
-            jax_process_count=jax.process_count(),
-            page_size=server_args.page_size,
-            kv_dtype=kv_dtype_name,
-            transport_metadata=scheduler.disagg_kv_manager.prefill_transport_metadata(),
-        )
+        bootstrap_keys = []
+        for dp_rank in range(server_args.dp_size):
+            bootstrap_key = f"{local_host}:{transfer_port}:dp_{dp_rank}"
+            scheduler.disagg_bootstrap_client.register_prefill(
+                bootstrap_key=bootstrap_key,
+                host=local_host,
+                transfer_port=transfer_port,
+                side_channel_port=side_channel_port,
+                tp_rank=server_args.node_rank,
+                tp_size=server_args.tp_size // server_args.dp_size,
+                system_dp_rank=dp_rank,
+                jax_process_index=jax.process_index(),
+                jax_process_count=jax.process_count(),
+                page_size=server_args.page_size,
+                kv_dtype=kv_dtype_name,
+                transport_metadata=(
+                    scheduler.disagg_kv_manager.prefill_transport_metadata(dp_rank)
+                ),
+            )
+            bootstrap_keys.append(bootstrap_key)
         scheduler.disagg_heartbeat = HeartbeatDaemon(
-            scheduler.disagg_bootstrap_client, bootstrap_key
+            scheduler.disagg_bootstrap_client, bootstrap_keys
         )
         scheduler.disagg_heartbeat.start()
-        scheduler.disagg_bootstrap_key = bootstrap_key
+        scheduler.disagg_bootstrap_keys = bootstrap_keys
+        scheduler.disagg_bootstrap_key = bootstrap_keys[0]
     else:
         scheduler.disagg_prefill_info_cache = PrefillInfoCache(scheduler.disagg_bootstrap_client)
         scheduler.disagg_prealloc_queue = DecodePreallocQueue()
@@ -160,14 +167,20 @@ def _make_disagg_shutdown(scheduler: Scheduler, mode: str):
             return
         state["done"] = True
         if mode == "prefill":
-            try:
-                key = scheduler.disagg_bootstrap_key
-                scheduler.disagg_bootstrap_client.unregister_prefill(key)
-            except Exception:
-                logger.warning(
-                    "PD shutdown: unregister_prefill failed",
-                    exc_info=True,
-                )
+            keys = getattr(
+                scheduler,
+                "disagg_bootstrap_keys",
+                [scheduler.disagg_bootstrap_key],
+            )
+            for key in keys:
+                try:
+                    scheduler.disagg_bootstrap_client.unregister_prefill(key)
+                except Exception:
+                    logger.warning(
+                        "PD shutdown: unregister_prefill failed for %s",
+                        key,
+                        exc_info=True,
+                    )
             with suppress(Exception):
                 scheduler.disagg_heartbeat.stop()
         try:

@@ -26,6 +26,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _batch_reqs(batch) -> tuple[Req, ...]:
+    if batch is None:
+        return ()
+    reqs_info = getattr(batch, "reqs_info", None)
+    if reqs_info is None:
+        return tuple(getattr(batch, "reqs", ()) or ())
+    return tuple(req for info in reqs_info for req in (info.reqs or ()))
+
+
 # Bucket page counts to bound XLA's per-shape compile pool.
 # Largest bucket (512 pages × 128 tokens/page) covers 64k-token prompts.
 _KV_GATHER_PAGE_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
@@ -39,6 +48,37 @@ def _pad_to_page_bucket(num_pages: int) -> int:
     # never truncate KV, while keeping the set of compiled shapes bounded.
     largest = _KV_GATHER_PAGE_BUCKETS[-1]
     return ((num_pages + largest - 1) // largest) * largest
+
+
+def _globalize_rank_local_page_ids(
+    page_ids,
+    *,
+    dp_rank: int,
+    dp_size: int,
+    total_pages: int,
+):
+    """Preserve each DP shard's padding page when indexing the global page axis."""
+
+    import numpy as np
+
+    ids = np.asarray(page_ids)
+    dp_rank = int(dp_rank)
+    dp_size = int(dp_size)
+    total_pages = int(total_pages)
+    if dp_size <= 0:
+        raise ValueError(f"dp_size must be positive, got {dp_size}")
+    if not 0 <= dp_rank < dp_size:
+        raise ValueError(f"dp_rank={dp_rank} is outside [0, {dp_size})")
+    if total_pages <= 0 or total_pages % dp_size:
+        raise ValueError(
+            f"global KV page count {total_pages} is not divisible by dp_size={dp_size}"
+        )
+    pages_per_rank = total_pages // dp_size
+    if np.any(ids < 0) or np.any(ids >= pages_per_rank):
+        raise ValueError(
+            f"rank-local KV page IDs must be in [0, {pages_per_rank}); got {ids.tolist()}"
+        )
+    return ids + dp_rank * pages_per_rank
 
 
 @partial(jax.jit, static_argnames=("out_sharding",))
@@ -202,7 +242,8 @@ class SchedulerDisaggregationPrefillMixin:
             self.cur_batch = batch
 
             if batch:
-                for req in batch.reqs:
+                batch_reqs = _batch_reqs(batch)
+                for req in batch_reqs:
                     if req.bootstrap_room is not None:
                         self._pd_mark_time(req, "forward_start")
                 result = self.run_batch(batch)
@@ -216,14 +257,16 @@ class SchedulerDisaggregationPrefillMixin:
             self.send_kv_chunk()
             # PD reqs are finished and released inside process_prefill_chunk;
             # do not merge them into running_batch.
+            batch_reqs = _batch_reqs(batch)
             self.last_batch = (
-                None if batch and any(r.bootstrap_room is not None for r in batch.reqs) else batch
+                None if batch and any(r.bootstrap_room is not None for r in batch_reqs) else batch
             )
 
     def process_prefill_chunk(self: Scheduler, batch, result) -> None:
         """Extract KV for PD reqs and hand off to sender."""
 
-        pd_reqs = [req for req in batch.reqs if req.bootstrap_room is not None]
+        batch_reqs = _batch_reqs(batch)
+        pd_reqs = [req for req in batch_reqs if req.bootstrap_room is not None]
         if not pd_reqs:
             self.process_batch_result(batch, result)
             return
@@ -243,7 +286,7 @@ class SchedulerDisaggregationPrefillMixin:
         if ready_to_transfer:
             kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
             self.disagg_kv_manager.prepare_prefill_batch(kv_pool.kv_buffer)
-        for req in batch.reqs:
+        for req in batch_reqs:
             if req.bootstrap_room is None:
                 continue
             req_id = req.rid
@@ -267,13 +310,16 @@ class SchedulerDisaggregationPrefillMixin:
                         req_id=req_id,
                         transfer_id=req.disagg_transfer_id or req_id,
                         bootstrap_room=req.bootstrap_room,
+                        dp_rank=int(req.dp_rank),
                         buffer_id=req.disagg_host_buffer_id,
                         payload_factory=lambda req_obj=req: {"kv": self._extract_req_kv(req_obj)},
                         block_ids_factory=lambda req_obj=req: self._extract_req_block_ids(req_obj),
-                        on_payload=lambda payload, req_obj=req: self._maybe_log_prefill_extract_debug(
-                            req_obj,
-                            payload["kv"],
-                            use_d2h_staging=self.disagg_use_d2h_staging,
+                        on_payload=lambda payload, req_obj=req: (
+                            self._maybe_log_prefill_extract_debug(
+                                req_obj,
+                                payload["kv"],
+                                use_d2h_staging=self.disagg_use_d2h_staging,
+                            )
                         ),
                         on_ready=lambda req_obj=req: self._pd_mark_time(req_obj, "transfer_start"),
                     )
@@ -371,12 +417,6 @@ class SchedulerDisaggregationPrefillMixin:
             page_ids = _np.concatenate(
                 [page_ids, _np.zeros(padded_pages - num_pages, dtype=page_ids.dtype)]
             )
-        idx_sharding = _NamedSharding(kv_pool.mesh, _P(None))
-        page_indices = jax.device_put(page_ids, idx_sharding)
-        # out_sharding describes the gather output, not the pool.
-        pool_pspec = kv_pool.kv_sharding.spec
-        gather_pspec = _P(None, *pool_pspec[1:])
-        gather_out_sharding = _NamedSharding(kv_pool.mesh, gather_pspec)
         layer_buffers = [
             kv_pool.get_kv_buffer(layer_id)
             for layer_id in range(
@@ -384,6 +424,20 @@ class SchedulerDisaggregationPrefillMixin:
                 kv_pool.start_layer + kv_pool.layer_num,
             )
         ]
+        if not layer_buffers:
+            raise ValueError("cannot gather debug KV from an empty layer range")
+        page_ids = _globalize_rank_local_page_ids(
+            page_ids,
+            dp_rank=int(getattr(req, "dp_rank", 0) or 0),
+            dp_size=int(getattr(kv_pool, "dp_size", 1)),
+            total_pages=int(layer_buffers[0].shape[0]),
+        )
+        idx_sharding = _NamedSharding(kv_pool.mesh, _P(None))
+        page_indices = jax.device_put(page_ids, idx_sharding)
+        # Page indices are replicated; preserve pool sharding on the remaining axes.
+        pool_pspec = kv_pool.kv_sharding.spec
+        gather_pspec = _P(None, *pool_pspec[1:])
+        gather_out_sharding = _NamedSharding(kv_pool.mesh, gather_pspec)
         layer_kvs = _jit_gather_all_layers(layer_buffers, page_indices, gather_out_sharding)
         if jax.process_count() > 1:
             # Multi-host: expose only this host's TP shard as a fully-addressable

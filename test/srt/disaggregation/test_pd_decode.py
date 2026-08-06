@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
+from types import SimpleNamespace
+from unittest import mock
 
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
 from sgl_jax.srt.disaggregation.base.transfer import DecodeAdmission
@@ -358,18 +361,45 @@ class _Allocator:
         self._capacity = capacity
         self._used = 0
         self.freed = []
+        self.available_ranks = []
+        self.alloc_ranks = []
 
-    def available_size(self):
+    def available_size(self, dp_rank=0):
+        self.available_ranks.append(dp_rank)
         return self._capacity - self._used
 
-    def alloc(self, n):
+    def alloc(self, n, dp_rank=0):
+        self.alloc_ranks.append(dp_rank)
         if self._used + n > self._capacity:
             return None
         self._used += n
         return object()
 
-    def free(self, idx):
-        self.freed.append(idx)
+    def free(self, idx, dp_rank=0):
+        self.freed.append((idx, dp_rank))
+
+
+class _PerRankAllocator:
+    def __init__(self, capacities, *, fail_alloc_ranks=()):
+        self.page_size = 1
+        self._capacities = list(capacities)
+        self._used = [0] * len(self._capacities)
+        self._fail_alloc_ranks = set(fail_alloc_ranks)
+        self.freed = []
+
+    def available_size(self, dp_rank=0):
+        return self._capacities[dp_rank] - self._used[dp_rank]
+
+    def alloc(self, n, dp_rank=0):
+        if dp_rank in self._fail_alloc_ranks:
+            return None
+        if self._used[dp_rank] + n > self._capacities[dp_rank]:
+            return None
+        self._used[dp_rank] += n
+        return (dp_rank, n)
+
+    def free(self, idx, dp_rank=0):
+        self.freed.append((idx, dp_rank))
 
 
 class _Receiver:
@@ -412,6 +442,8 @@ class _AdmReq:
         self.disagg_transfer_id = None
         self.bootstrap_room = 1
         self.origin_input_ids = list(range(seqlen))
+        self.dp_rank = 0
+        self.disagg_prefill_dp_rank = 0
 
 
 class _Batch:
@@ -423,9 +455,16 @@ class _AdmScheduler:
     _admit_decode_prealloc = SchedulerDisaggregationDecodeMixin._admit_decode_prealloc
 
     def __init__(
-        self, capacity, reserved, page_size=1, n_running=0, raise_on_init=False, max_inflight=0
+        self,
+        capacity,
+        reserved,
+        page_size=1,
+        n_running=0,
+        raise_on_init=False,
+        max_inflight=0,
     ):
         self.token_to_kv_pool_allocator = _Allocator(capacity, page_size)
+        self.dp_size = 1
         self.server_args = _AdmServerArgs(reserved, max_inflight=max_inflight)
         self.running_batch = _Batch(n_running)
         self.disagg_prealloc_queue = DecodePreallocQueue()
@@ -443,8 +482,8 @@ class _AdmScheduler:
     def _record_decode_transfer_failure(self, reason):
         self.failures.append(reason)
 
-    def _release_decode_kv_indices(self, kv_indices):
-        self.token_to_kv_pool_allocator.free(kv_indices)
+    def _release_decode_kv_indices(self, kv_indices, dp_rank):
+        self.token_to_kv_pool_allocator.free(kv_indices, dp_rank=dp_rank)
 
     def _abort_decode_request(self, req, reason):
         self.aborted.append((req.rid, reason))
@@ -452,6 +491,34 @@ class _AdmScheduler:
 
 def _adm_p_info():
     return {"host": "1.2.3.4", "transfer_port": 5000, "side_channel_port": 5001}
+
+
+def test_abort_logs_when_prefill_rank_cannot_be_resolved(caplog):
+    class _AbortScheduler:
+        _abort_decode_request = SchedulerDisaggregationDecodeMixin._abort_decode_request
+
+        def __init__(self):
+            self.dp_size = 2
+            self.disagg_kv_manager = mock.Mock()
+            self._comm_backend = None
+            self.send_to_tokenizer = SimpleNamespace(send_pyobj=mock.Mock())
+
+        def _release_decode_req_resources(self, req):
+            pass
+
+    sched = _AbortScheduler()
+    req = SimpleNamespace(
+        rid="missing-prefill-rank",
+        bootstrap_room=17,
+        disagg_prefill_dp_rank=None,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        sched._abort_decode_request(req, "bootstrap_lookup")
+
+    sched.disagg_kv_manager.cleanup_transfer.assert_not_called()
+    assert "cannot resolve Prefill DP rank" in caplog.text
+    sched.send_to_tokenizer.send_pyobj.assert_called_once()
 
 
 def _enqueue(sched, rid, seqlen):
@@ -470,6 +537,57 @@ def test_admit_when_capacity_sufficient():
     assert len(sched.disagg_prealloc_queue) == 0
     assert len(sched.disagg_transfer_queue) == 2
     assert sched.aborted == []
+
+
+def test_admission_routes_allocator_and_transfer_to_decode_and_prefill_ranks():
+    sched = _AdmScheduler(capacity=100, reserved=0)
+    sched.dp_size = 4
+    entry = _enqueue(sched, "cross-rank", seqlen=4)
+    entry.req.dp_rank = 3
+    entry.req.disagg_prefill_dp_rank = 1
+
+    sched._admit_decode_prealloc()
+
+    assert sched.token_to_kv_pool_allocator.available_ranks[-1] == 3
+    assert sched.token_to_kv_pool_allocator.alloc_ranks == [3]
+    context = sched.disagg_kv_manager.created[0][1].inited
+    assert context.decode_dp_rank == 3
+    assert context.prefill_dp_rank == 1
+
+
+def test_rank_local_capacity_block_does_not_starve_other_ranks_or_break_rank_fifo():
+    sched = _AdmScheduler(capacity=100, reserved=0, max_inflight=4)
+    sched.dp_size = 2
+    sched.token_to_kv_pool_allocator = _PerRankAllocator([0, 100])
+    rank0_head = _enqueue(sched, "rank0-head", seqlen=4)
+    rank0_head.req.dp_rank = 0
+    rank1 = _enqueue(sched, "rank1", seqlen=4)
+    rank1.req.dp_rank = 1
+    rank0_tail = _enqueue(sched, "rank0-tail", seqlen=1)
+    rank0_tail.req.dp_rank = 0
+
+    sched._admit_decode_prealloc()
+
+    assert sched.disagg_transfer_queue.count_by_rank(2) == [0, 1]
+    assert [entry.req_id for entry in sched.disagg_prealloc_queue.items_fifo()] == [
+        "rank0-head",
+        "rank0-tail",
+    ]
+
+
+def test_rank_local_alloc_shortfall_does_not_starve_other_ranks():
+    sched = _AdmScheduler(capacity=100, reserved=0, max_inflight=4)
+    sched.dp_size = 2
+    sched.token_to_kv_pool_allocator = _PerRankAllocator([100, 100], fail_alloc_ranks={0})
+    rank0 = _enqueue(sched, "rank0", seqlen=4)
+    rank0.req.dp_rank = 0
+    rank1 = _enqueue(sched, "rank1", seqlen=4)
+    rank1.req.dp_rank = 1
+
+    sched._admit_decode_prealloc()
+
+    assert sched.disagg_transfer_queue.count_by_rank(2) == [0, 1]
+    assert [entry.req_id for entry in sched.disagg_prealloc_queue.items_fifo()] == ["rank0"]
 
 
 def test_defer_when_capacity_insufficient_does_not_abort():
@@ -597,6 +715,56 @@ def test_cancel_matching_retains_inflight_entry_until_terminal():
     assert len(queue) == 1
 
 
+def test_cancelled_terminal_transfer_releases_decode_rank_pages():
+    class _CancelledDrainScheduler:
+        process_decode_queue = SchedulerDisaggregationDecodeMixin.process_decode_queue
+
+        def __init__(self, entry):
+            self.entry = entry
+            self.released = []
+
+        def _admit_decode_prealloc(self):
+            return
+
+        def _drain_transfer_queue_synced(self):
+            return [self.entry]
+
+        def _release_decode_kv_indices(self, kv_indices, dp_rank):
+            self.released.append((kv_indices, dp_rank))
+
+    req = _AdmReq("cancelled", 4)
+    req.dp_rank = 3
+    entry = DecodeBookkeeping(
+        req_id=req.rid,
+        req=req,
+        receiver=object(),
+        kv_indices=[12, 13, 14, 15],
+        synced_state=KVPoll.SUCCESS,
+        cancelled=True,
+    )
+    sched = _CancelledDrainScheduler(entry)
+
+    sched.process_decode_queue()
+
+    assert sched.released == [([12, 13, 14, 15], 3)]
+
+
+def test_inflight_cap_is_partitioned_per_rank_without_cross_rank_head_of_line():
+    sched = _AdmScheduler(capacity=100, reserved=0, max_inflight=8)
+    sched.dp_size = 4
+    _enqueue(sched, "rank0-a", seqlen=4).req.dp_rank = 0
+    _enqueue(sched, "rank0-b", seqlen=4).req.dp_rank = 0
+    _enqueue(sched, "rank0-c", seqlen=4).req.dp_rank = 0
+    _enqueue(sched, "rank1-a", seqlen=4).req.dp_rank = 1
+
+    sched._admit_decode_prealloc()
+
+    assert len(sched.disagg_transfer_queue) == 3
+    assert len(sched.disagg_prealloc_queue) == 1
+    assert sched.token_to_kv_pool_allocator.alloc_ranks == [0, 0, 1]
+    assert sched.aborted == []
+
+
 # ---- from test_pd_decode_bootstrap_cache.py ----
 
 
@@ -606,6 +774,8 @@ class _Req:
         self.bootstrap_room = room
         self.disagg_transfer_id = None
         self.origin_input_ids = [1, 2, 3, 4]
+        self.dp_rank = 0
+        self.disagg_prefill_dp_rank = 0
 
 
 class _ServerArgs:
@@ -631,7 +801,7 @@ class _FakeCache:
         self._results = list(results)
         self.calls = 0
 
-    def pick_for_room(self, room):
+    def pick_for_room(self, _room, _dp_rank=0):
         self.calls += 1
         return self._results.pop(0) if self._results else None
 
@@ -646,6 +816,7 @@ class _FakeScheduler:
 
     def __init__(self, cache):
         self.server_args = _ServerArgs()
+        self.dp_size = 1
         self.waiting_queue = []
         self.disagg_prefill_info_cache = cache
         self.disagg_prealloc_queue = DecodePreallocQueue()
@@ -823,7 +994,11 @@ class TestReaperLifecycle:
         assert m._reaper_thread is None
 
     def test_reaper_thread_fails_stale_participant(self):
-        m = _Mgr(ack_timeout_seconds=0.05, pull_timeout_seconds=0.0, reaper_interval_seconds=0.01)
+        m = _Mgr(
+            ack_timeout_seconds=0.05,
+            pull_timeout_seconds=0.0,
+            reaper_interval_seconds=0.01,
+        )
         s = _FakeParticipant(started_at=time.monotonic() - 1.0)
         m.register_sender("r1", s)
         m.start_reaper()
@@ -840,7 +1015,11 @@ class TestTerminalRecords:
     def test_record_and_get(self):
         m = _mgr()
         m.record_terminal(
-            "r1", role="prefill", transfer_id="t1", state=KVPoll.FAILED, reason="timeout"
+            "r1",
+            role="prefill",
+            transfer_id="t1",
+            state=KVPoll.FAILED,
+            reason="timeout",
         )
         rec = m.get_terminal_record("r1", role="prefill")
         assert rec is not None

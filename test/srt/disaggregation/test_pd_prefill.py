@@ -26,6 +26,7 @@ from sgl_jax.srt.disaggregation.jax_transfer.wrapper import JaxTransferWrapper
 from sgl_jax.srt.disaggregation.prefill import (
     _KV_GATHER_PAGE_BUCKETS,
     PrefillBootstrapQueue,
+    _globalize_rank_local_page_ids,
     _jit_gather_all_layers,
     _jit_gather_one_layer,
     _pad_to_page_bucket,
@@ -284,6 +285,22 @@ def test_room_modulo_selection_matches_server():
     assert cache.pick_for_room(4)["bootstrap_key"] == "b"  # 4 % 3 == 1
 
 
+def test_prefill_info_cache_filters_by_dp_rank():
+    clock = _Clock()
+    client = _FakeClient(
+        [
+            _pf("rank-1", system_dp_rank=1),
+            _pf("rank-0", system_dp_rank=0),
+            _pf("rank-3", system_dp_rank=3),
+            _pf("rank-2", system_dp_rank=2),
+        ]
+    )
+    cache = PrefillInfoCache(client, refresh_interval_s=1.0, clock=clock)
+
+    for rank in range(4):
+        assert cache.pick_for_room(123, rank)["bootstrap_key"] == f"rank-{rank}"
+
+
 def test_miss_is_rate_limited_then_resolves():
     clock = _Clock()
     client = _FakeClient([])  # no prefill registered yet
@@ -514,7 +531,13 @@ def _make_mesh():
 def _make_kv_buffers(mesh, num_layers=_NUM_LAYERS, rng_seed=42):
     """Create per-layer KV buffers mimicking memory_pool.py layout."""
     rng = np.random.default_rng(rng_seed)
-    shape = (_NUM_PAGES_POOL, _PAGE_SIZE, _HEAD_NUM_KV * 2 // _PACKING, _PACKING, _HEAD_DIM)
+    shape = (
+        _NUM_PAGES_POOL,
+        _PAGE_SIZE,
+        _HEAD_NUM_KV * 2 // _PACKING,
+        _PACKING,
+        _HEAD_DIM,
+    )
     sharding = NamedSharding(mesh, P("data", None, "tensor", None, None))
     buffers = []
     for _ in range(num_layers):
@@ -563,7 +586,13 @@ class TestPerLayerGather:
             idx_sharding,
         )
         results = _jit_gather_all_layers(buffers, page_indices, gather_sharding)
-        expected_shape = (num_pages, _PAGE_SIZE, _HEAD_NUM_KV * 2 // _PACKING, _PACKING, _HEAD_DIM)
+        expected_shape = (
+            num_pages,
+            _PAGE_SIZE,
+            _HEAD_NUM_KV * 2 // _PACKING,
+            _PACKING,
+            _HEAD_DIM,
+        )
         for result in results:
             assert result.shape == expected_shape
 
@@ -642,6 +671,29 @@ class TestPadToPageBucket:
     )
     def test_bucket_selection(self, input_pages, expected_bucket):
         assert _pad_to_page_bucket(input_pages) == expected_bucket
+
+
+class TestGlobalizeRankLocalPageIds:
+    def test_offsets_each_rank_by_its_padded_global_page_shard(self):
+        local_ids = np.array([0, 1, 4], dtype=np.int32)
+
+        actual = _globalize_rank_local_page_ids(
+            local_ids,
+            dp_rank=2,
+            dp_size=4,
+            total_pages=20,
+        )
+
+        np.testing.assert_array_equal(actual, np.array([10, 11, 14], dtype=np.int32))
+
+    def test_rejects_page_ids_outside_the_rank_local_shard(self):
+        with pytest.raises(ValueError, match="rank-local KV page IDs"):
+            _globalize_rank_local_page_ids(
+                np.array([5], dtype=np.int32),
+                dp_rank=0,
+                dp_size=4,
+                total_pages=20,
+            )
 
 
 class TestGatherCompileCaching:

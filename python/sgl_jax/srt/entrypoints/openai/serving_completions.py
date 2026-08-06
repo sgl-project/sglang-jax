@@ -82,9 +82,11 @@ class OpenAIServingCompletion(OpenAIServingBase):
             extra_key=request.extra_key,
             rid=request.rid,
             return_routed_experts=request.return_routed_experts,
+            dp_rank=request.dp_rank,
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,
+            disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
             disagg_transfer_id=request.disagg_transfer_id,
         )
 

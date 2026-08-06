@@ -26,7 +26,7 @@ BOOTSTRAP_CAPABILITIES = ("transfer_metadata",)
 
 # PD wire protocol version. Bump when ``PrefillInfo``
 # or any of the 4 endpoint payloads change shape.
-PROTOCOL_VERSION: int = 3
+PROTOCOL_VERSION: int = 4
 MIN_COMPATIBLE_VERSION: int = 1
 
 
@@ -106,6 +106,8 @@ def check_prefill_compat(
     local_page_size: int,
     local_kv_dtype: str,
     expected_transfer_engine: str | None = None,
+    expected_dp_rank: int | None = None,
+    expected_dp_size: int | None = None,
 ) -> None:
     """Raise ``ValueError`` if the prefill peer's KV layout is incompatible.
 
@@ -137,6 +139,19 @@ def check_prefill_compat(
         raise ValueError(
             f"PD transfer engine mismatch: prefill={peer_engine}, decode={expected_transfer_engine}"
         )
+    peer_dp_rank = int(info.get("system_dp_rank", 0))
+    if expected_dp_rank is not None and peer_dp_rank != expected_dp_rank:
+        raise ValueError(
+            f"PD Prefill rank mismatch: prefill={peer_dp_rank}, expected={expected_dp_rank}"
+        )
+    peer_dp_size = int(
+        transport_metadata.get("dp_size", 1) if isinstance(transport_metadata, dict) else 1
+    )
+    if expected_dp_size is not None and peer_dp_size != expected_dp_size:
+        raise ValueError(
+            f"PD topology mismatch: prefill dp_size={peer_dp_size}, "
+            f"decode dp_size={expected_dp_size}"
+        )
 
 
 class RegisterPrefillRequest(BaseModel):
@@ -159,6 +174,7 @@ class RegisterTransferRequest(BaseModel):
     bootstrap_room: int
     transfer_id: str
     jax_process_index: int = 0
+    prefill_dp_rank: int = 0
     transport_metadata: dict[str, object]
 
 
@@ -180,8 +196,8 @@ class _Registry:
     ttl_seconds: float = HEARTBEAT_TTL_SECONDS
     clock: Callable[[], float] = time.monotonic
     # A multi-host request has distinct physical page IDs on every P process.
-    transfers: dict[tuple[int, int], dict[str, object]] = field(default_factory=dict)
-    transfer_last_seen: dict[tuple[int, int], float] = field(default_factory=dict)
+    transfers: dict[tuple[int, int, int], dict[str, object]] = field(default_factory=dict)
+    transfer_last_seen: dict[tuple[int, int, int], float] = field(default_factory=dict)
     transfer_ttl_seconds: float = TRANSFER_METADATA_TTL_SECONDS
 
     def now(self) -> float:
@@ -225,14 +241,19 @@ class _Registry:
             self._evict_stale_locked()
             return list(self.prefills.values())
 
-    def pick_for_room(self, bootstrap_room: int) -> PrefillInfo | None:
+    def pick_for_room(self, bootstrap_room: int, dp_rank: int = 0) -> PrefillInfo | None:
         with self.lock:
             self._evict_stale_locked()
-            if not self.prefills:
+            matching = {
+                key: info
+                for key, info in self.prefills.items()
+                if info.system_dp_rank == int(dp_rank)
+            }
+            if not matching:
                 return None
-            keys = sorted(self.prefills.keys())
+            keys = sorted(matching)
             chosen = keys[bootstrap_room % len(keys)]
-            return self.prefills[chosen]
+            return matching[chosen]
 
     def _evict_stale_transfers_locked(self) -> None:
         cutoff = self.now() - self.transfer_ttl_seconds
@@ -246,23 +267,34 @@ class _Registry:
             self._evict_stale_transfers_locked()
             room = int(info["bootstrap_room"])
             process_index = int(info.get("jax_process_index", 0))
+            prefill_dp_rank = int(info.get("prefill_dp_rank", 0))
             if not str(info.get("transfer_id", "")):
                 raise ValueError("transfer_id must be non-empty")
-            key = (room, process_index)
+            key = (room, process_index, prefill_dp_rank)
             self.transfers[key] = info
             self.transfer_last_seen[key] = self.now()
 
     def get_transfer(
-        self, bootstrap_room: int, jax_process_index: int = 0
+        self,
+        bootstrap_room: int,
+        jax_process_index: int = 0,
+        prefill_dp_rank: int = 0,
     ) -> dict[str, object] | None:
         with self.lock:
             self._evict_stale_transfers_locked()
-            info = self.transfers.get((int(bootstrap_room), int(jax_process_index)))
+            info = self.transfers.get(
+                (int(bootstrap_room), int(jax_process_index), int(prefill_dp_rank))
+            )
             return dict(info) if info is not None else None
 
-    def pop_room(self, bootstrap_room: int, jax_process_index: int = 0) -> None:
+    def pop_room(
+        self,
+        bootstrap_room: int,
+        jax_process_index: int = 0,
+        prefill_dp_rank: int = 0,
+    ) -> None:
         with self.lock:
-            key = (int(bootstrap_room), int(jax_process_index))
+            key = (int(bootstrap_room), int(jax_process_index), int(prefill_dp_rank))
             self.transfers.pop(key, None)
             self.transfer_last_seen.pop(key, None)
 
@@ -337,8 +369,8 @@ def build_app(
         return {"prefills": [p.to_dict() for p in registry.list_all()]}
 
     @app.get("/get_prefill_info")
-    def get_prefill_info(bootstrap_room: int) -> dict[str, object]:
-        info = registry.pick_for_room(bootstrap_room)
+    def get_prefill_info(bootstrap_room: int, dp_rank: int = 0) -> dict[str, object]:
+        info = registry.pick_for_room(bootstrap_room, dp_rank)
         if info is None:
             raise HTTPException(
                 status_code=503,
@@ -355,8 +387,12 @@ def build_app(
         return {"status": "registered"}
 
     @app.get("/get_transfer_info")
-    def get_transfer_info(bootstrap_room: int, jax_process_index: int = 0) -> dict[str, object]:
-        info = registry.get_transfer(bootstrap_room, jax_process_index)
+    def get_transfer_info(
+        bootstrap_room: int,
+        jax_process_index: int = 0,
+        prefill_dp_rank: int = 0,
+    ) -> dict[str, object]:
+        info = registry.get_transfer(bootstrap_room, jax_process_index, prefill_dp_rank)
         if info is None:
             # Not registered yet: 404 lets the decode side treat it as
             # "defer + retry" (never abort) rather than a hard error.
@@ -364,14 +400,19 @@ def build_app(
                 status_code=404,
                 detail=(
                     f"no transfer info for bootstrap_room={bootstrap_room}, "
-                    f"jax_process_index={jax_process_index}"
+                    f"jax_process_index={jax_process_index}, "
+                    f"prefill_dp_rank={prefill_dp_rank}"
                 ),
             )
         return info
 
     @app.post("/pop_transfer")
-    def pop_transfer(bootstrap_room: int, jax_process_index: int = 0) -> dict[str, str]:
-        registry.pop_room(bootstrap_room, jax_process_index)
+    def pop_transfer(
+        bootstrap_room: int,
+        jax_process_index: int = 0,
+        prefill_dp_rank: int = 0,
+    ) -> dict[str, str]:
+        registry.pop_room(bootstrap_room, jax_process_index, prefill_dp_rank)
         return {"status": "popped"}
 
     # Bootstrap runs as a standalone single process and does NOT inherit
@@ -614,10 +655,10 @@ class BootstrapClient:
         r.raise_for_status()
         return r.json()["prefills"]
 
-    def get_prefill_info(self, bootstrap_room: int) -> dict[str, object]:
+    def get_prefill_info(self, bootstrap_room: int, dp_rank: int = 0) -> dict[str, object]:
         r = self._client.get(
             f"{self._base_url}/get_prefill_info",
-            params={"bootstrap_room": bootstrap_room},
+            params={"bootstrap_room": bootstrap_room, "dp_rank": dp_rank},
             timeout=self._timeout_s,
             headers=self._headers(),
         )
@@ -633,12 +674,14 @@ class BootstrapClient:
         transfer_id: str,
         *,
         jax_process_index: int = 0,
+        prefill_dp_rank: int = 0,
         transport_metadata: dict[str, object],
     ) -> None:
         payload = {
             "bootstrap_room": bootstrap_room,
             "transfer_id": transfer_id,
             "jax_process_index": jax_process_index,
+            "prefill_dp_rank": prefill_dp_rank,
             "transport_metadata": transport_metadata,
         }
         r = self._client.post(
@@ -650,13 +693,18 @@ class BootstrapClient:
         r.raise_for_status()
 
     def get_transfer_info(
-        self, bootstrap_room: int, *, jax_process_index: int = 0
+        self,
+        bootstrap_room: int,
+        *,
+        jax_process_index: int = 0,
+        prefill_dp_rank: int = 0,
     ) -> dict[str, object] | None:
         r = self._client.get(
             f"{self._base_url}/get_transfer_info",
             params={
                 "bootstrap_room": bootstrap_room,
                 "jax_process_index": jax_process_index,
+                "prefill_dp_rank": prefill_dp_rank,
             },
             timeout=self._timeout_s,
             headers=self._headers(),
@@ -666,12 +714,19 @@ class BootstrapClient:
         r.raise_for_status()
         return r.json()
 
-    def pop_transfer(self, bootstrap_room: int, *, jax_process_index: int = 0) -> None:
+    def pop_transfer(
+        self,
+        bootstrap_room: int,
+        *,
+        jax_process_index: int = 0,
+        prefill_dp_rank: int = 0,
+    ) -> None:
         r = self._client.post(
             f"{self._base_url}/pop_transfer",
             params={
                 "bootstrap_room": bootstrap_room,
                 "jax_process_index": jax_process_index,
+                "prefill_dp_rank": prefill_dp_rank,
             },
             timeout=self._timeout_s,
             headers=self._headers(),
@@ -716,13 +771,18 @@ class PrefillInfoCache:
         self._sorted_keys = sorted(by_key)
         self._last_refresh = self._clock()
 
-    def _pick_locked(self, bootstrap_room: int) -> dict[str, object] | None:
-        if not self._sorted_keys:
+    def _pick_locked(self, bootstrap_room: int, dp_rank: int = 0) -> dict[str, object] | None:
+        keys = [
+            key
+            for key in self._sorted_keys
+            if int(self._by_key[key].get("system_dp_rank", 0)) == int(dp_rank)
+        ]
+        if not keys:
             return None
-        chosen = self._sorted_keys[bootstrap_room % len(self._sorted_keys)]
+        chosen = keys[bootstrap_room % len(keys)]
         return self._by_key[chosen]
 
-    def pick_for_room(self, bootstrap_room: int) -> dict[str, object] | None:
+    def pick_for_room(self, bootstrap_room: int, dp_rank: int = 0) -> dict[str, object] | None:
         """Return prefill info for ``bootstrap_room``, or ``None`` if no
         prefill is registered yet (caller should defer + retry).
 
@@ -758,7 +818,7 @@ class PrefillInfoCache:
                             len(self._sorted_keys),
                             exc,
                         )
-            info = self._pick_locked(bootstrap_room)
+            info = self._pick_locked(bootstrap_room, dp_rank)
         if info is None:
             return None
         _reject_if_below_protocol_floor(info)
@@ -774,11 +834,15 @@ class HeartbeatDaemon:
     def __init__(
         self,
         client: BootstrapClient,
-        bootstrap_key: str,
+        bootstrap_keys: str | list[str],
         interval_s: float = HEARTBEAT_INTERVAL_SECONDS,
     ) -> None:
         self._client = client
-        self._bootstrap_key = bootstrap_key
+        self._bootstrap_keys = (
+            [bootstrap_keys] if isinstance(bootstrap_keys, str) else list(bootstrap_keys)
+        )
+        if not self._bootstrap_keys:
+            raise ValueError("HeartbeatDaemon requires at least one bootstrap key")
         self._interval_s = interval_s
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -790,7 +854,7 @@ class HeartbeatDaemon:
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._loop,
-            name=f"BootstrapHeartbeat-{self._bootstrap_key}",
+            name=f"BootstrapHeartbeat-{self._bootstrap_keys[0]}",
             daemon=True,
         )
         self._thread.start()
@@ -807,12 +871,16 @@ class HeartbeatDaemon:
 
     def _loop(self) -> None:
         while not self._stop_event.is_set():
+            self._heartbeat_once()
+            self._stop_event.wait(self._interval_s)
+
+    def _heartbeat_once(self) -> None:
+        for bootstrap_key in self._bootstrap_keys:
             try:
-                self._client.heartbeat(self._bootstrap_key)
+                self._client.heartbeat(bootstrap_key)
             except Exception:
                 logger.warning(
                     "bootstrap heartbeat for %s failed; will retry",
-                    self._bootstrap_key,
+                    bootstrap_key,
                     exc_info=True,
                 )
-            self._stop_event.wait(self._interval_s)

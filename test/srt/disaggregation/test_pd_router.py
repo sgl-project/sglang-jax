@@ -176,6 +176,8 @@ def lb_instance(router_args):
     import sgl_jax.srt.disaggregation.mini_lb as mini_lb_module
 
     instance = MiniLoadBalancer(router_args)
+    instance.prefill_dp_size = 1
+    instance.decode_dp_size = 1
     mini_lb_module.lb = instance
     yield instance
     mini_lb_module.lb = None
@@ -283,6 +285,40 @@ class TestGenerateEndpoint:
         assert data == {"text": "hello world"}
 
 
+class TestDpRouting:
+    def test_normal_routing_aligns_prefill_and_decode_rank(self, lb_instance):
+        lb_instance.prefill_dp_size = 4
+        lb_instance.decode_dp_size = 4
+        prefill, decode = asyncio.run(
+            lb_instance._align_dp_requests({"bootstrap_room": 6, "text": "hello"})
+        )
+        assert prefill["dp_rank"] == 2
+        assert decode["dp_rank"] == 2
+        assert decode["disagg_prefill_dp_rank"] == 2
+
+    def test_batch_routing_aligns_each_room(self, lb_instance):
+        lb_instance.prefill_dp_size = 4
+        lb_instance.decode_dp_size = 4
+        prefill, decode = asyncio.run(
+            lb_instance._align_dp_requests({"bootstrap_room": [4, 7], "text": ["a", "b"]})
+        )
+        assert prefill["dp_rank"] == [0, 3]
+        assert decode["dp_rank"] == [0, 3]
+        assert decode["disagg_prefill_dp_rank"] == [0, 3]
+
+    def test_normal_routing_rejects_heterogeneous_dp(self, lb_instance):
+        lb_instance.prefill_dp_size = 4
+        lb_instance.decode_dp_size = 2
+        with pytest.raises(RuntimeError, match="homogeneous DP topology"):
+            asyncio.run(lb_instance._align_dp_requests({"bootstrap_room": 1}))
+
+    def test_external_routing_rejects_heterogeneous_dp(self, lb_instance):
+        lb_instance.prefill_dp_size = 4
+        lb_instance.decode_dp_size = 2
+        with pytest.raises(RuntimeError, match="homogeneous DP topology"):
+            lb_instance._fork_dp_requests({"bootstrap_room": 1})
+
+
 class TestV1CompletionsEndpoint:
     @patch("aiohttp.ClientSession")
     def test_completions(self, mock_session_cls, client, lb_instance):
@@ -358,6 +394,8 @@ class TestBootstrapInjection:
             prefill_bootstrap_host="10.31.0.1",
         )
         instance = MiniLoadBalancer(args)
+        instance.prefill_dp_size = 1
+        instance.decode_dp_size = 1
         mini_lb_module.lb = instance
 
         captured_requests = []
@@ -707,11 +745,15 @@ class TestProtocolFields:
             bootstrap_host="10.0.0.1",
             bootstrap_port=8998,
             bootstrap_room=12345,
+            dp_rank=3,
+            disagg_prefill_dp_rank=1,
             disagg_transfer_id="tid-001",
         )
         assert req.bootstrap_host == "10.0.0.1"
         assert req.bootstrap_port == 8998
         assert req.bootstrap_room == 12345
+        assert req.dp_rank == 3
+        assert req.disagg_prefill_dp_rank == 1
         assert req.disagg_transfer_id == "tid-001"
 
     def test_completion_request_has_bootstrap_fields(self):
@@ -721,11 +763,15 @@ class TestProtocolFields:
             bootstrap_host="10.0.0.2",
             bootstrap_port=9998,
             bootstrap_room=67890,
+            dp_rank=2,
+            disagg_prefill_dp_rank=0,
             disagg_transfer_id="tid-002",
         )
         assert req.bootstrap_host == "10.0.0.2"
         assert req.bootstrap_port == 9998
         assert req.bootstrap_room == 67890
+        assert req.dp_rank == 2
+        assert req.disagg_prefill_dp_rank == 0
         assert req.disagg_transfer_id == "tid-002"
 
     def test_completion_request_accepts_batch_bootstrap_fields(self):
@@ -735,11 +781,15 @@ class TestProtocolFields:
             bootstrap_host=["10.0.0.1", "10.0.0.1"],
             bootstrap_port=[8998, 8998],
             bootstrap_room=[1, 2],
+            dp_rank=[2, 3],
+            disagg_prefill_dp_rank=[0, 1],
             disagg_transfer_id=["tid-0", "tid-1"],
         )
         assert req.bootstrap_host == ["10.0.0.1", "10.0.0.1"]
         assert req.bootstrap_port == [8998, 8998]
         assert req.bootstrap_room == [1, 2]
+        assert req.dp_rank == [2, 3]
+        assert req.disagg_prefill_dp_rank == [0, 1]
         assert req.disagg_transfer_id == ["tid-0", "tid-1"]
 
     def test_bootstrap_fields_default_none(self):
@@ -750,6 +800,8 @@ class TestProtocolFields:
         assert req.bootstrap_host is None
         assert req.bootstrap_port is None
         assert req.bootstrap_room is None
+        assert req.dp_rank is None
+        assert req.disagg_prefill_dp_rank is None
         assert req.disagg_transfer_id is None
 
 

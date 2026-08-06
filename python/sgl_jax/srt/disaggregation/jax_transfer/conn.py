@@ -196,10 +196,12 @@ class JaxTransferKVManager(CommonKVManager):
             raise RuntimeError("host KV pool is full")
         return buffer_id
 
-    def prepare_prefill_batch(self, kv_buffers: Any) -> None:  # noqa: ARG002
+    def prepare_prefill_batch(self, kv_buffers: Any) -> None:
+        del kv_buffers
         return
 
-    def prefill_transport_metadata(self) -> dict[str, object]:
+    def prefill_transport_metadata(self, dp_rank: int = 0) -> dict[str, object]:
+        del dp_rank
         return {"engine": self.engine_name}
 
     def start_prefill(self, context: PrefillTransferContext) -> PrefillTransfer:
@@ -253,8 +255,10 @@ class JaxTransferKVManager(CommonKVManager):
         self,
         bootstrap_room: int | None,
         *,
-        jax_process_index: int | None = None,  # noqa: ARG002
-    ) -> None:  # noqa: ARG002
+        jax_process_index: int | None = None,
+        prefill_dp_rank: int = 0,
+    ) -> None:
+        del bootstrap_room, jax_process_index, prefill_dp_rank
         return
 
     # ------------------------------------------------------------------
@@ -378,7 +382,8 @@ class JaxTransferKVSender(KVSender, StateHolder):
     def transfer_started_at(self) -> float | None:
         return self._transfer_started_at
 
-    def init(self, kv_indices, transfer_id: str | None = None) -> None:  # noqa: ARG002
+    def init(self, kv_indices, transfer_id: str | None = None) -> None:
+        del kv_indices
         with self._state_lock:
             self._transfer_id = transfer_id or self._req_id
             self._transition_to(KVPoll.WAITING_FOR_INPUT)
