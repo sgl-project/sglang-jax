@@ -146,10 +146,9 @@ def _enforce_recurrent_state_server_constraints(server_args, is_lightning: bool 
         "(--hicache-storage must be 'disable' for linear-recurrent models)."
     )
     if not server_args.enable_recurrent_extra_buffer:
-        assert server_args.page_size == 1, (
-            "Recurrent radix caching requires --page-size 1 unless "
-            "--enable-recurrent-extra-buffer."
-        )
+        assert (
+            server_args.page_size == 1
+        ), "Recurrent radix caching requires --page-size 1 unless --enable-recurrent-extra-buffer."
 
 
 # Fraction of a rank's recurrent slots reserved for cross-request snapshots when
@@ -289,7 +288,6 @@ def _build_non_hybrid_memory_pools(token_to_kv_pool) -> MemoryPools:
 
 
 class ModelRunnerKVCacheMixin:
-
     def _compute_cell_size(self: ModelRunner) -> int:
         """Per-token KV cache cost in bytes per device, summed across layers."""
 
@@ -618,6 +616,91 @@ class ModelRunnerKVCacheMixin:
             **kvcache_kwargs,
         )
 
+    def _build_dsa_layerwise_kv_pool(
+        self: ModelRunner,
+        *,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        dp_size: int,
+    ):
+        """Build dense-MLA and sparse-DSA layer pools behind one router.
+
+        Both children intentionally use ``MLATokenToKVPool`` today. Keeping
+        them as independent children makes the future DSA kernel layout a
+        local substitution without changing model or allocator interfaces.
+        """
+
+        from sgl_jax.srt.kernels.dsa.ref import build_index_share_map
+        from sgl_jax.srt.mem_cache.memory_pool import (
+            LayerwiseHybridKVPool,
+            MLATokenToKVPool,
+        )
+
+        config = self.model_config.hf_text_config
+        # Preserve the effective layer count used by the previous monolithic
+        # pool (notably for draft workers that compact the model after load).
+        num_layers = self._kv_pool_layer_count()
+        if not isinstance(num_layers, int):
+            raise TypeError(f"DSA KV pool layer count must be an integer, got {num_layers!r}")
+        configured_dense_layer_count = getattr(config, "index_skip_topk_offset", 0)
+        if not 0 <= configured_dense_layer_count <= config.num_hidden_layers:
+            raise ValueError(
+                "index_skip_topk_offset must be in "
+                f"[0, {config.num_hidden_layers}], got {configured_dense_layer_count}"
+            )
+        dense_layer_count = min(configured_dense_layer_count, num_layers)
+
+        dense_layer_ids = list(range(dense_layer_count))
+        dsa_layer_ids = list(range(dense_layer_count, num_layers))
+        layer_ids_by_pool = {
+            name: layer_ids
+            for name, layer_ids in (("mla", dense_layer_ids), ("dsa", dsa_layer_ids))
+            if layer_ids
+        }
+        indexer_pool_name = "dsa" if dsa_layer_ids else "mla"
+
+        indexer_types = getattr(config, "indexer_types", None)
+        if indexer_types is not None:
+            indexer_types = indexer_types[:num_layers]
+        _, _, num_full_indexers = build_index_share_map(
+            indexer_types,
+            dense_layer_count,
+            num_layers,
+        )
+        pool_kwargs = {
+            "size": self.max_total_num_tokens,
+            "page_size": self.page_size,
+            "dtype": self.kv_cache_dtype,
+            "kv_lora_rank": kv_lora_rank,
+            "qk_rope_head_dim": qk_rope_head_dim,
+            "mesh": self.mesh,
+            "dp_size": dp_size,
+        }
+        pools = {}
+        for pool_name, layer_ids in layer_ids_by_pool.items():
+            child_kwargs = dict(pool_kwargs)
+            if pool_name == indexer_pool_name:
+                child_kwargs.update(
+                    indexer_key_dim=config.index_head_dim,
+                    num_indexer_layers=num_full_indexers,
+                )
+            pools[pool_name] = MLATokenToKVPool(
+                layer_num=len(layer_ids),
+                **child_kwargs,
+            )
+
+        logger.info(
+            "DSA layerwise KV pool: MLA layers=%s, DSA layers=%s; "
+            "both currently use MLATokenToKVPool layout",
+            dense_layer_ids,
+            dsa_layer_ids,
+        )
+        return LayerwiseHybridKVPool(
+            pools=pools,
+            layer_ids_by_pool=layer_ids_by_pool,
+            indexer_pool_name=indexer_pool_name,
+        )
+
     def _init_pools(self: ModelRunner, max_num_reqs: int, dp_size: int):
         """Create ReqToTokenPool, KV pool, allocator, and MemoryPools."""
         from sgl_jax.srt.mem_cache.allocator import (
@@ -685,25 +768,19 @@ class ModelRunnerKVCacheMixin:
                     f"kv_lora_rank={kv_lora_rank}, qk_rope_head_dim={qk_rope_head_dim}."
                 )
 
-            dsa_kwargs = {}
             if self.server_args.attention_backend == "dsa_sparse":
-                from sgl_jax.srt.kernels.dsa.ref import build_index_share_map
-
-                _, _, num_full = build_index_share_map(
-                    getattr(hf_text_config, "indexer_types", None),
-                    getattr(hf_text_config, "index_skip_topk_offset", 0),
-                    hf_text_config.num_hidden_layers,
+                self.token_to_kv_pool = self._build_dsa_layerwise_kv_pool(
+                    kv_lora_rank=kv_lora_rank,
+                    qk_rope_head_dim=qk_rope_head_dim,
+                    dp_size=dp_size,
                 )
-                dsa_kwargs["indexer_key_dim"] = hf_text_config.index_head_dim
-                dsa_kwargs["num_indexer_layers"] = num_full
-
-            self.token_to_kv_pool = self._maybe_wrap_hybrid_kv_pool(
-                MLATokenToKVPool,
-                kv_lora_rank=kv_lora_rank,
-                qk_rope_head_dim=qk_rope_head_dim,
-                dp_size=dp_size,
-                **dsa_kwargs,
-            )
+            else:
+                self.token_to_kv_pool = self._maybe_wrap_hybrid_kv_pool(
+                    MLATokenToKVPool,
+                    kv_lora_rank=kv_lora_rank,
+                    qk_rope_head_dim=qk_rope_head_dim,
+                    dp_size=dp_size,
+                )
         else:
             self.token_to_kv_pool = self._maybe_wrap_hybrid_kv_pool(
                 MHATokenToKVPool,

@@ -111,3 +111,77 @@ following:
 
 The basic generation script checks transport and non-empty decoding only. It
 is not a model-quality evaluation.
+
+## MLA tuning for the dense prefix
+
+GLM-5.2 uses dense MLA for layers 0-2 and exact DSA for the remaining layers.
+The serving topology maps the MLA shapes as follows:
+
+```text
+2 Falcon replicas * 8 devices = 16 DP ranks
+attention_tp = TP16 / DP16 = 1
+decode: global BS32 / DP16 = 2 tokens per rank
+extend: global 32768 / DP16 = 2048 tokens per rank
+extend sequences: C32 / DP16 = 2 sequences per rank, 1024 tokens each
+```
+
+MLA has no attention collective when `attention_tp=1`, so tuning does not need
+the full serving topology. Use Falcon's minimum v7x allocation: one replica,
+eight devices, four chips, topology `2x2x1`. The tuner explicitly selects one
+local device because every device executes the same independent DP-rank
+kernel shape.
+
+Run the reviewed GLM-5.2 scenario with:
+
+```bash
+python benchmark/kernels/mla/get_block_spec_config_mla.py \
+  --scenario glm52-dp16-128k \
+  --device-index 0 \
+  --tries 5 \
+  --output-jsonl /tmp/mla-tune/metrics.jsonl
+```
+
+The preset tunes only two table keys:
+
+- decode: 64 query heads, page size 64, local token bucket 2, KV length
+  133,120;
+- mixed/extend: 64 query heads, page size 64, local token bucket 2,048,
+  two 1,024-token sequences, KV length 132,096.
+
+The decode tuner measures the active `MLA-d` tail for the historical
+`decode_batch_size=4` fallback when the local bucket is only two tokens. It
+measures `MLA-bd` for divisible candidate batch sizes, avoiding the empty-grid
+timing bug that would otherwise make the fallback comparison invalid.
+The JSONL output records latency in milliseconds together with the best and
+fallback configurations, attempted/failed candidate counts, and whether the
+measured gain clears the table-entry threshold.
+
+The production preset was tuned on Falcon `exp-segouwkl9w` (TPU v7,
+`v7x-8`, topology `2x2x1`):
+
+- decode selected `(32, 1, 2)`: 1.1511 ms -> 0.4033 ms, a 65.0% kernel-time
+  reduction;
+- mixed/extend selected `(8, 64)`: 435.2249 ms -> 71.3998 ms, an 83.6%
+  kernel-time reduction.
+
+Compile-time VMEM rejections are expected during a sweep. They are counted in
+the JSONL audit row and logged as `SKIP_VMEM`; the tuner continues with the
+remaining candidates.
+
+After checking in the selected entries, verify the production lookup path
+against the explicit fallback with:
+
+```bash
+python benchmark/kernels/mla/bench_mla.py \
+  --scenario glm52-dp16-128k \
+  --output-jsonl /tmp/mla-lookup/metrics.jsonl
+```
+
+That lookup A/B was verified on Falcon `exp-aovgukczde`; the full MLA wrapper
+(including cache update and dispatch overhead) measured:
+
+- decode: 2.1335 ms -> 1.3069 ms, a 38.7% reduction;
+- mixed/extend: 437.3139 ms -> 73.4938 ms, an 83.2% reduction.
+
+Falcon `operator-analysis` record `an-ez63cziwkk` accepted both structured
+metric rows with status `OK` and no warnings.

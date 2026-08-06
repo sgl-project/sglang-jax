@@ -140,27 +140,39 @@ def create_mla_mixed_uniform_data(
     qk_rope_head_dim: int,
     page_size: int,
     kv_len: int = 16384,
+    num_seqs: int = 1,
     dtype=jnp.bfloat16,
     seed: int = 42,
 ) -> dict:
-    """Mixed/extend-mode workload: 1 seq doing a chunked prefill of `max_num_tokens`
-    tokens against an existing prefix totalling `kv_len` tokens.
+    """Mixed/extend-mode workload with uniform query lengths per sequence.
 
-    distribution = [0, 0, 1] so only the MIXED pallas_call (slot[2]) does work.
+    ``max_num_tokens`` is the local token bucket across ``num_seqs``. For
+    example, the GLM-5.2 DP16 C32 workload has two requests per DP rank, so its
+    local 2,048-token bucket is represented as two 1,024-token sequences.
+
+    distribution = [0, 0, num_seqs] so only the MIXED pallas_call (slot[2])
+    does work.
     The kernel still compiles BATCHED_DECODE / DECODE branches but their grid
     is `(0,)` -> no-op.
     """
+    if num_seqs <= 0:
+        raise ValueError(f"num_seqs must be positive, got {num_seqs}")
+    if max_num_tokens % num_seqs != 0:
+        raise ValueError(
+            f"max_num_tokens={max_num_tokens} must be divisible by "
+            f"num_seqs={num_seqs} for uniform mixed inputs"
+        )
     if kv_len < max_num_tokens:
         raise ValueError(
             f"kv_len={kv_len} must be >= max_num_tokens={max_num_tokens}; "
             "for mixed, kv_len represents the total ctx including the new chunk."
         )
-    num_seqs = 1
+    query_len_per_seq = max_num_tokens // num_seqs
     aligned_kv_len = align_to(kv_len, page_size)
     pages_per_seq = aligned_kv_len // page_size
 
-    cu_q_lens = jnp.asarray([0, max_num_tokens], dtype=jnp.int32)
-    cu_kv_lens = jnp.asarray([0, aligned_kv_len], dtype=jnp.int32)
+    cu_q_lens = jnp.arange(num_seqs + 1, dtype=jnp.int32) * query_len_per_seq
+    cu_kv_lens = jnp.arange(num_seqs + 1, dtype=jnp.int32) * aligned_kv_len
     distribution = np.asarray([0, 0, num_seqs], dtype=np.int32)
 
     base = _build_kernel_inputs(

@@ -25,6 +25,12 @@ Usage:
         --num-q-heads 8 --page-sizes 256 --kv-len 16384 \\
         --decode-mnt 16,32,64,128 --mixed-mnt 512
 
+    # GLM-5.2 DSA DP16 C32, 128K hit + 1K extend + 1K decode. Falcon only
+    # needs one v7x-8 slice (4 chips / 8 devices); attention_tp=1 means one
+    # selected device is representative of every independent DP rank.
+    python benchmark/kernels/mla/get_block_spec_config_mla.py \\
+        --scenario glm52-dp16-128k --device-index 0
+
 For multi-worker dispatch (FALCON_RANK aware), use --shard auto,N.
 """
 
@@ -32,13 +38,19 @@ from __future__ import annotations
 
 import argparse
 import functools
+import json
 import os
 from math import inf
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from utils import create_mla_decode_uniform_data, create_mla_mixed_uniform_data
+
+try:
+    from .utils import create_mla_decode_uniform_data, create_mla_mixed_uniform_data
+except ImportError:
+    from utils import create_mla_decode_uniform_data, create_mla_mixed_uniform_data
 
 from sgl_jax.srt.kernels.mla.v2.kernel import mla_ragged_paged_attention
 from sgl_jax.srt.kernels.utils.perf import multiple_iteration_timeit_from_trace
@@ -63,6 +75,30 @@ _DEFAULT_NUM_Q_HEADS = (8, 16)
 
 # Production page_size=256; 128 included for comparison only.
 _DEFAULT_PAGE_SIZES = (128, 256)
+
+# GLM-5.2 production mapping:
+#   Falcon serving allocation: 2 replicas * 8 devices = DP16
+#   attention_tp = global TP16 / DP16 = 1
+#   global decode BS32 / DP16 = 2 tokens per rank
+#   global extend bucket 32768 / DP16 = 2048 tokens per rank
+#   each rank owns 2 requests, so extend is 2 seqs * 1024 tokens
+#
+# A tuner run only needs Falcon's minimum v7x-8 allocation. MLA contains no
+# collectives for attention_tp=1, so one selected device reproduces the local
+# Pallas shape; the other seven devices do not change the tuned key.
+_SCENARIOS = {
+    "glm52-dp16-128k": {
+        "num_q_heads": (64,),
+        "page_sizes": (64,),
+        "decode_mnt": (2,),
+        "mixed_mnt": (2048,),
+        # Extend sees the 128K cached prefix plus the 1K extension.
+        "mixed_kv_len": 131072 + 1024,
+        # Decode is tuned at the largest KV length reached by the 1K decode.
+        "decode_kv_len": 131072 + 1024 + 1024,
+        "mixed_num_seqs": 2,
+    }
+}
 
 # Inner search space.
 _BKV_P_CANDIDATES = (1, 2, 3, 4, 6, 8, 16, 32)
@@ -154,7 +190,8 @@ def _bench_one(
 ) -> float:
     """Compile + warmup + measure mean latency for one config.
 
-    Returns mean ms. Raises on compile/runtime error so caller can `try`.
+    Returns mean milliseconds. Raises on compile/runtime error so caller can
+    ``try``.
     """
     attn = _make_jitted_attn(case_label)
     bound = functools.partial(
@@ -209,8 +246,39 @@ def _enum_decode_candidates(max_q_per_block: int):
                 # dbs>mnt would extract a no-op event time. Skip.
                 if dbs > max_q_per_block:
                     continue
+                # Keep a single active Pallas call per measurement. All
+                # production buckets are powers of two, so this does not
+                # remove a useful production candidate and avoids having to
+                # add BATCHED_DECODE and DECODE-tail event durations.
+                if max_q_per_block % dbs != 0:
+                    continue
                 out.append((bkv_p, bq, dbs))
     return out
+
+
+def _decode_trace_scope(
+    *, max_num_tokens: int, bkv_p: int, page_size: int, decode_batch_size: int
+) -> str:
+    """Return the active decode Pallas scope for a candidate.
+
+    The historical fallback uses ``decode_batch_size=4``. For the GLM-5.2
+    DP16 local decode bucket, ``max_num_tokens=2``; therefore the batched grid
+    is empty and all work runs in the ``MLA-d`` tail. The old tuner always
+    selected ``MLA-bd`` and could benchmark a no-op event for this shape.
+
+    Candidate decode batch sizes are constrained to divisors of the token
+    bucket, so exactly one of BATCHED_DECODE or DECODE-tail is active.
+    """
+    batched_tokens = (max_num_tokens // decode_batch_size) * decode_batch_size
+    tail_tokens = max_num_tokens - batched_tokens
+    if batched_tokens == 0:
+        return f"MLA-d-bq_1-bkvp_{bkv_p}-p_{page_size}-bsz_1"
+    if tail_tokens == 0:
+        return f"MLA-bd-bq_1-bkvp_{bkv_p}-p_{page_size}-bsz_{decode_batch_size}"
+    raise ValueError(
+        "decode tuner requires decode_batch_size to divide max_num_tokens "
+        f"or exceed it, got mnt={max_num_tokens}, dbs={decode_batch_size}"
+    )
 
 
 def _enum_mixed_candidates(max_q_per_block: int):
@@ -221,6 +289,24 @@ def _enum_mixed_candidates(max_q_per_block: int):
                 continue
             out.append((bkv_p, bq))
     return out
+
+
+def _candidate_failure_label(error: Exception) -> str:
+    """Summarize an expected candidate rejection without dumping megabytes.
+
+    TPU compile-time VMEM exhaustion is a normal outcome while sweeping block
+    sizes, not a failed benchmark. Keeping it as a short ``SKIP_VMEM`` line
+    also prevents generic artifact analyzers from treating the expected
+    rejection as a workload exception.
+    """
+    message = str(error)
+    message_lower = message.lower()
+    if "resource_exhausted" in message_lower and (
+        "vmem" in message_lower or "out of memory" in message_lower
+    ):
+        return "SKIP_VMEM"
+    first_line = message.splitlines()[0] if message else "no error message"
+    return f"FAIL: {type(error).__name__}: {first_line}"
 
 
 def _sweep_decode(
@@ -260,17 +346,15 @@ def _sweep_decode(
         # benchmarks — fill placeholders.
         nkv = (bkv_p, 1, 1)
         nq = (bq, 1, 1)
-        # IMPORTANT: scope must match the kernel's pallas_call name (set by
-        # kernel.py:1582) so multiple_iteration_timeit_from_trace's regex
-        # extractor pulls the actual `device_duration_ps` from the BATCHED_
-        # DECODE pallas event. Otherwise it falls back to MARKER-wall-time,
-        # which conflates 3 pallas_calls + jit dispatch overhead and is
-        # noisy.
-        # Kernel scope for BATCHED_DECODE (clamps bq_sz=1, batch_size=dbs):
-        #   "MLA-bd-bq_1-bkvp_{bkv_p}-p_{page_size}-bsz_{dbs}"
-        # We've already filtered dbs <= mnt so BATCHED_DECODE handles all
-        # work and DECODE-tail is empty.
-        scope = f"MLA-bd-bq_1-bkvp_{bkv_p}-p_{page_size}-bsz_{dbs}"
+        # Match the Pallas call that actually performs the work. This is
+        # MLA-bd for divisible candidate batch sizes, but MLA-d for the dbs=4
+        # fallback when the local GLM decode bucket is only two tokens.
+        scope = _decode_trace_scope(
+            max_num_tokens=max_num_tokens,
+            bkv_p=bkv_p,
+            page_size=page_size,
+            decode_batch_size=dbs,
+        )
         try:
             t_ms = _bench_one(
                 "decode",
@@ -284,19 +368,20 @@ def _sweep_decode(
                 scope,
             )
         except Exception as e:  # noqa: BLE001
-            tag = f"# [{i + 1}/{len(candidates)}] decode mnt={max_num_tokens} bkv_p={bkv_p} bq={bq} dbs={dbs} FAIL: {type(e).__name__}: {e}"
+            failure_label = _candidate_failure_label(e)
+            tag = f"# [{i + 1}/{len(candidates)}] decode mnt={max_num_tokens} bkv_p={bkv_p} bq={bq} dbs={dbs} {failure_label}"
             print(tag, flush=True)
             if (bkv_p, bq, dbs) == _HEURISTIC_DECODE:
                 print(
                     f"# heur-FAILURE decode mnt={max_num_tokens} h={num_q_heads} "
-                    f"ps={page_size}: {type(e).__name__}: {e}",
+                    f"ps={page_size}: {failure_label}",
                     flush=True,
                 )
             n_failed += 1
             continue
         print(
             f"# [{i + 1}/{len(candidates)}] decode mnt={max_num_tokens} "
-            f"bkv_p={bkv_p} bq={bq} dbs={dbs} t={t_ms * 1000:.4f}ms",
+            f"bkv_p={bkv_p} bq={bq} dbs={dbs} t={t_ms:.4f}ms",
             flush=True,
         )
         if (bkv_p, bq, dbs) == _HEURISTIC_DECODE:
@@ -315,6 +400,7 @@ def _sweep_mixed(
     qk_rope_head_dim: int,
     page_size: int,
     kv_len: int,
+    num_seqs: int,
     vmem_limit_bytes: int,
     tries: int,
     dtype,
@@ -327,6 +413,7 @@ def _sweep_mixed(
         qk_rope_head_dim=qk_rope_head_dim,
         page_size=page_size,
         kv_len=max(kv_len, max_num_tokens),
+        num_seqs=num_seqs,
         dtype=dtype,
     )
     sm_scale = (kv_lora_rank + qk_rope_head_dim) ** -0.5
@@ -363,22 +450,23 @@ def _sweep_mixed(
                 scope,
             )
         except Exception as e:  # noqa: BLE001
+            failure_label = _candidate_failure_label(e)
             print(
                 f"# [{i + 1}/{len(candidates)}] mixed mnt={max_num_tokens} "
-                f"bkv_p={bkv_p} bq={bq} FAIL: {type(e).__name__}: {e}",
+                f"bkv_p={bkv_p} bq={bq} {failure_label}",
                 flush=True,
             )
             if (bkv_p, bq) == _HEURISTIC_MIXED:
                 print(
                     f"# heur-FAILURE mixed mnt={max_num_tokens} h={num_q_heads} "
-                    f"ps={page_size}: {type(e).__name__}: {e}",
+                    f"ps={page_size}: {failure_label}",
                     flush=True,
                 )
             n_failed += 1
             continue
         print(
             f"# [{i + 1}/{len(candidates)}] mixed mnt={max_num_tokens} "
-            f"bkv_p={bkv_p} bq={bq} t={t_ms * 1000:.4f}ms",
+            f"bkv_p={bkv_p} bq={bq} t={t_ms:.4f}ms",
             flush=True,
         )
         if (bkv_p, bq) == _HEURISTIC_MIXED:
@@ -438,6 +526,12 @@ def _table_key(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
+        "--scenario",
+        choices=sorted(_SCENARIOS),
+        default=None,
+        help="reviewed workload preset; explicit shape flags override it",
+    )
+    parser.add_argument(
         "--cases",
         default="decode,mixed",
         help="comma-separated subset of decode/mixed",
@@ -468,8 +562,22 @@ def main():
     parser.add_argument(
         "--kv-len",
         type=int,
-        default=16384,
-        help="actual seq KV length used to size the cache (Ling 16k input case)",
+        default=None,
+        help="common KV length for both cases; case-specific flags override it",
+    )
+    parser.add_argument("--decode-kv-len", type=int, default=None)
+    parser.add_argument("--mixed-kv-len", type=int, default=None)
+    parser.add_argument(
+        "--mixed-num-seqs",
+        type=int,
+        default=None,
+        help="number of uniform local extend sequences (GLM DP16 C32 uses 2)",
+    )
+    parser.add_argument(
+        "--device-index",
+        type=int,
+        default=0,
+        help="local JAX device used for the single-device kernel sweep",
     )
     parser.add_argument(
         "--vmem-limit-bytes",
@@ -486,9 +594,15 @@ def main():
         "--write-threshold-pct",
         type=float,
         default=10.0,
-        help="only emit a table entry if tuned beats heuristic by ≥ this %",
+        help="only emit a table entry if tuned beats heuristic by ≥ this %%",
+    )
+    parser.add_argument(
+        "--output-jsonl",
+        default=None,
+        help="optional path for one best-vs-heuristic metrics row per shape",
     )
     args = parser.parse_args()
+    scenario = _SCENARIOS.get(args.scenario, {})
 
     cases = [c.strip() for c in args.cases.split(",") if c.strip()]
     for c in cases:
@@ -496,19 +610,69 @@ def main():
             raise SystemExit(f"unknown case {c!r}; expected 'decode' or 'mixed'")
 
     num_q_heads_list = (
-        _csv_ints(args.num_q_heads) if args.num_q_heads else list(_DEFAULT_NUM_Q_HEADS)
+        _csv_ints(args.num_q_heads)
+        if args.num_q_heads
+        else list(scenario.get("num_q_heads", _DEFAULT_NUM_Q_HEADS))
     )
-    page_sizes = _csv_ints(args.page_sizes) if args.page_sizes else list(_DEFAULT_PAGE_SIZES)
-    decode_mnt_list = _csv_ints(args.decode_mnt) if args.decode_mnt else list(_DEFAULT_DECODE_MNT)
-    mixed_mnt_list = _csv_ints(args.mixed_mnt) if args.mixed_mnt else list(_DEFAULT_MIXED_MNT)
+    page_sizes = (
+        _csv_ints(args.page_sizes)
+        if args.page_sizes
+        else list(scenario.get("page_sizes", _DEFAULT_PAGE_SIZES))
+    )
+    decode_mnt_list = (
+        _csv_ints(args.decode_mnt)
+        if args.decode_mnt
+        else list(scenario.get("decode_mnt", _DEFAULT_DECODE_MNT))
+    )
+    mixed_mnt_list = (
+        _csv_ints(args.mixed_mnt)
+        if args.mixed_mnt
+        else list(scenario.get("mixed_mnt", _DEFAULT_MIXED_MNT))
+    )
+    common_kv_len = args.kv_len
+    decode_kv_len = (
+        args.decode_kv_len
+        if args.decode_kv_len is not None
+        else (
+            common_kv_len
+            if common_kv_len is not None
+            else int(scenario.get("decode_kv_len", 16384))
+        )
+    )
+    mixed_kv_len = (
+        args.mixed_kv_len
+        if args.mixed_kv_len is not None
+        else (
+            common_kv_len if common_kv_len is not None else int(scenario.get("mixed_kv_len", 16384))
+        )
+    )
+    mixed_num_seqs = (
+        args.mixed_num_seqs
+        if args.mixed_num_seqs is not None
+        else int(scenario.get("mixed_num_seqs", 1))
+    )
+
+    local_devices = jax.local_devices()
+    if not 0 <= args.device_index < len(local_devices):
+        raise SystemExit(
+            f"--device-index={args.device_index} out of range for "
+            f"{len(local_devices)} local devices"
+        )
+    selected_device = local_devices[args.device_index]
 
     device = get_device_name()
     shard_rank, shard_total = _parse_shard(args.shard)
     print(f"# Device: {device}")
-    print(f"# {jax.devices()}")
+    print(f"# allocated local devices ({len(local_devices)}): {local_devices}")
+    print(f"# selected local device: index={args.device_index} {selected_device}")
+    if args.scenario == "glm52-dp16-128k":
+        print("# Falcon allocation: v7x-8 = 4 chips / 8 devices / topology 2x2x1")
+        print("# Production mapping: 2 replicas * 8 devices = DP16; attention_tp=1")
     print(
         f"# cases={cases} num_q_heads={num_q_heads_list} page_sizes={page_sizes} "
-        f"kv_len={args.kv_len} decode_mnt={decode_mnt_list} mixed_mnt={mixed_mnt_list}"
+        f"decode_kv_len={decode_kv_len} mixed_kv_len={mixed_kv_len} "
+        f"decode_mnt={decode_mnt_list} mixed_mnt={mixed_mnt_list} "
+        f"mixed_num_seqs={mixed_num_seqs}"
     )
     print(f"# shard={shard_rank}/{shard_total}")
     print()
@@ -529,76 +693,147 @@ def main():
         from jax.experimental.pallas import tpu as pltpu
 
         args.vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
-    print(f"# vmem_limit_bytes={args.vmem_limit_bytes} ({args.vmem_limit_bytes / (1<<20):.1f} MiB)")
+    print(
+        f"# vmem_limit_bytes={args.vmem_limit_bytes} ({args.vmem_limit_bytes / (1 << 20):.1f} MiB)"
+    )
 
     dtype = jnp.bfloat16
     q_dtype_name = jnp.dtype(dtype).name
 
     rows = []
-    for case, num_q_heads, page_size, mnt in my_work:
-        if case == "decode":
-            best, best_t, heur, heur_t, n_attempted, n_failed = _sweep_decode(
-                max_num_tokens=mnt,
-                num_q_heads=num_q_heads,
-                kv_lora_rank=args.kv_lora_rank,
-                qk_rope_head_dim=args.qk_rope_head_dim,
-                page_size=page_size,
-                kv_len=args.kv_len,
-                vmem_limit_bytes=args.vmem_limit_bytes,
-                tries=args.tries,
-                dtype=dtype,
+    with jax.default_device(selected_device):
+        for case, num_q_heads, page_size, mnt in my_work:
+            case_kv_len = decode_kv_len if case == "decode" else mixed_kv_len
+            if case == "decode":
+                best, best_t, heur, heur_t, n_attempted, n_failed = _sweep_decode(
+                    max_num_tokens=mnt,
+                    num_q_heads=num_q_heads,
+                    kv_lora_rank=args.kv_lora_rank,
+                    qk_rope_head_dim=args.qk_rope_head_dim,
+                    page_size=page_size,
+                    kv_len=case_kv_len,
+                    vmem_limit_bytes=args.vmem_limit_bytes,
+                    tries=args.tries,
+                    dtype=dtype,
+                )
+            else:
+                best, best_t, heur, heur_t, n_attempted, n_failed = _sweep_mixed(
+                    max_num_tokens=mnt,
+                    num_q_heads=num_q_heads,
+                    kv_lora_rank=args.kv_lora_rank,
+                    qk_rope_head_dim=args.qk_rope_head_dim,
+                    page_size=page_size,
+                    kv_len=case_kv_len,
+                    num_seqs=mixed_num_seqs,
+                    vmem_limit_bytes=args.vmem_limit_bytes,
+                    tries=args.tries,
+                    dtype=dtype,
+                )
+            if best is None or heur_t == inf:
+                print(
+                    f"# DROP case={case} h={num_q_heads} ps={page_size} "
+                    f"mnt={mnt} kv_len={case_kv_len}: best={best} "
+                    f"heur_t={heur_t} attempted={n_attempted} failed={n_failed}"
+                )
+                continue
+            delta_pct = (heur_t - best_t) / heur_t * 100.0
+            key = _table_key(
+                case,
+                q_dtype_name,
+                q_dtype_name,
+                num_q_heads,
+                args.kv_lora_rank,
+                args.qk_rope_head_dim,
+                page_size,
+                mnt,
             )
-        else:
-            best, best_t, heur, heur_t, n_attempted, n_failed = _sweep_mixed(
-                max_num_tokens=mnt,
-                num_q_heads=num_q_heads,
-                kv_lora_rank=args.kv_lora_rank,
-                qk_rope_head_dim=args.qk_rope_head_dim,
-                page_size=page_size,
-                kv_len=args.kv_len,
-                vmem_limit_bytes=args.vmem_limit_bytes,
-                tries=args.tries,
-                dtype=dtype,
+            rows.append(
+                (
+                    key,
+                    best,
+                    best_t,
+                    heur,
+                    heur_t,
+                    delta_pct,
+                    n_attempted,
+                    n_failed,
+                    case_kv_len,
+                )
             )
-        if best is None or heur_t == inf:
+            win = "WIN " if delta_pct >= args.write_threshold_pct else "skip"
             print(
-                f"# DROP case={case} h={num_q_heads} ps={page_size} mnt={mnt}: "
-                f"best={best} heur_t={heur_t} attempted={n_attempted} failed={n_failed}"
+                f"# [{win}] {key}: kv_len={case_kv_len} "
+                f"heur={heur} {heur_t:.4f}ms "
+                f"best={best} {best_t:.4f}ms Δ={delta_pct:+.1f}% "
+                f"(tried {n_attempted}, failed {n_failed})"
             )
-            continue
-        delta_pct = (heur_t - best_t) / heur_t * 100.0
-        key = _table_key(
-            case,
-            q_dtype_name,
-            q_dtype_name,
-            num_q_heads,
-            args.kv_lora_rank,
-            args.qk_rope_head_dim,
-            page_size,
-            mnt,
-        )
-        rows.append((key, best, best_t, heur, heur_t, delta_pct, n_attempted, n_failed))
-        win = "WIN " if delta_pct >= args.write_threshold_pct else "skip"
-        print(
-            f"# [{win}] {key}: heur={heur} {heur_t * 1000:.4f}ms "
-            f"best={best} {best_t * 1000:.4f}ms Δ={delta_pct:+.1f}% "
-            f"(tried {n_attempted}, failed {n_failed})"
-        )
+
+    if args.output_jsonl:
+        output_path = Path(args.output_jsonl)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w", encoding="utf-8") as output_file:
+            for (
+                key,
+                best,
+                best_t,
+                heur,
+                heur_t,
+                delta_pct,
+                n_attempted,
+                n_failed,
+                case_kv_len,
+            ) in rows:
+                case_label = key[0]
+                metric = {
+                    "variant": "tuned",
+                    "scenario": args.scenario or "custom",
+                    "case": case_label,
+                    "q_dtype": key[1],
+                    "kv_dtype": key[2],
+                    "num_q_heads": key[3],
+                    "kv_lora_rank": key[4],
+                    "qk_rope_head_dim": key[5],
+                    "page_size": key[6],
+                    "max_num_tokens": key[7],
+                    "kv_len": case_kv_len,
+                    "num_seqs": mixed_num_seqs if case_label == "mixed" else key[7],
+                    "heuristic_config": list(heur),
+                    "best_config": list(best),
+                    "heuristic_latency_ms": heur_t,
+                    "latency_ms": best_t,
+                    "speedup_pct": delta_pct,
+                    "attempted_configs": n_attempted,
+                    "failed_configs": n_failed,
+                    "write_threshold_pct": args.write_threshold_pct,
+                    "table_entry_selected": delta_pct >= args.write_threshold_pct,
+                }
+                output_file.write(json.dumps(metric, sort_keys=True) + "\n")
+        print(f"# wrote metrics: {output_path}")
 
     print()
     print(
         f"# --- Paste into TUNED_BLOCK_SIZES_MLA[{device!r}] (≥{args.write_threshold_pct}% win only) ---"
     )
-    for key, best, _, _, _, delta_pct, _, _ in rows:
+    for key, best, _, _, _, delta_pct, _, _, _ in rows:
         if delta_pct >= args.write_threshold_pct:
             print(f"        {key}: {best},")
     print()
     print("# --- All measured (for audit) ---")
-    for key, best, best_t, heur, heur_t, delta_pct, n_attempted, n_failed in rows:
+    for (
+        key,
+        best,
+        best_t,
+        heur,
+        heur_t,
+        delta_pct,
+        n_attempted,
+        n_failed,
+        case_kv_len,
+    ) in rows:
         print(
-            f"# {key}: best={best} ({best_t * 1000:.4f}ms) "
-            f"heur={heur} ({heur_t * 1000:.4f}ms) Δ={delta_pct:+.1f}% "
-            f"(tried {n_attempted}, failed {n_failed})"
+            f"# {key}: best={best} ({best_t:.4f}ms) "
+            f"heur={heur} ({heur_t:.4f}ms) Δ={delta_pct:+.1f}% "
+            f"kv_len={case_kv_len} (tried {n_attempted}, failed {n_failed})"
         )
 
 

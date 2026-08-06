@@ -26,6 +26,7 @@ def _patch_env(monkeypatch, *, tpu_version: int = 7, device: str = "TPU v7"):
 
 def test_empty_table_returns_none(monkeypatch):
     _patch_env(monkeypatch)
+    tuned_block_sizes.TUNED_BLOCK_SIZES_MLA["TPU v7"] = {}
     assert (
         get_tuned_block_sizes_mla("decode", jnp.bfloat16, jnp.bfloat16, 8, 512, 64, 256, 128)
         is None
@@ -54,6 +55,19 @@ def test_mixed_hit_returns_2tuple(monkeypatch):
         4,
         32,
     )
+
+
+def test_glm52_dp16_production_entries(monkeypatch):
+    _patch_env(monkeypatch)
+
+    assert get_tuned_block_sizes_mla("decode", jnp.bfloat16, jnp.bfloat16, 64, 512, 64, 64, 2) == (
+        32,
+        1,
+        2,
+    )
+    assert get_tuned_block_sizes_mla(
+        "mixed", jnp.bfloat16, jnp.bfloat16, 64, 512, 64, 64, 2048
+    ) == (8, 64)
 
 
 def test_decode_and_mixed_buckets_are_separate(monkeypatch):
@@ -114,6 +128,7 @@ def test_pre_v5_returns_none(monkeypatch):
 def test_warned_misses_is_one_shot_per_key(monkeypatch, caplog):
     """Each unique miss-key logs INFO at most once."""
     _patch_env(monkeypatch)
+    tuned_block_sizes.TUNED_BLOCK_SIZES_MLA["TPU v7"] = {}
     import logging
 
     # Bind caplog to the module's logger explicitly — relying on root-level

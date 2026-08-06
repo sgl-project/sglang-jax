@@ -117,6 +117,22 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 256, 1024): (8, 256),
         ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 256, 2048): (8, 256),
         ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 256, 4096): (8, 256),
+        # ===== GLM-5.2 DP16 exact DSA (dense MLA layers 0-2) =====
+        # Production: TP16 / DP16 => attention_tp=1, hence 64 Q heads per
+        # rank; page_size=64. C32 maps to two requests per rank. At the 128K
+        # cache-hit workload the hot local shapes are decode mnt=2 at
+        # kv_len=133120 and mixed mnt=2048 (2 * 1024) at kv_len=132096.
+        #
+        # Tuned 2026-08-05 on Falcon exp-segouwkl9w, v7x-8 (2x2x1), using
+        # scope-matched Pallas device time and the exact two-sequence mixed
+        # input. The decode fallback dbs=4 runs in the MLA-d tail for mnt=2.
+        #
+        #   decode: 1.1511ms -> 0.4033ms (+65.0%)
+        #   mixed:  435.2249ms -> 71.3998ms (+83.6%)
+        # Production lookup A/B on exp-aovgukczde also covered the complete
+        # MLA wrapper: decode +38.7% and mixed +83.2%.
+        ("decode", "bfloat16", "bfloat16", 64, 512, 64, 64, 2): (32, 1, 2),
+        ("mixed", "bfloat16", "bfloat16", 64, 512, 64, 64, 2048): (8, 64),
         # ===== DeepSeek-V3 671B (num_q_heads=128 → 16/shard, kv_lora=512,
         # page=128). decode reuses v6e sweep; mixed bq capped at 128 — v7x
         # scoped VMEM limit is 57.6M (< v6e), bq=256 OOMs by 3.6M at mnt≥256.
