@@ -6,11 +6,22 @@ import numpy as np
 import pytest
 
 from sgl_jax.srt.kernels.dsa.ref import (
+    _mask_and_compact_topk_indices,
     build_index_share_map,
     score_and_select_index_tokens,
     sparse_mla_ref,
     streamindex_page_topk_ref,
 )
+
+
+def test_mask_and_compact_topk_indices_preserves_unordered_valid_set():
+    values = jnp.asarray([[3.0, -jnp.inf, 1.0, -jnp.inf], [4.0, 2.0, 3.0, 1.0]])
+    indices = jnp.asarray([[9, 99, 5, 88], [7, 2, 6, 4]], dtype=jnp.int32)
+
+    got = np.asarray(jax.jit(_mask_and_compact_topk_indices)(values, indices))
+
+    np.testing.assert_array_equal(got[0], np.asarray([9, 5, -1, -1]))
+    np.testing.assert_array_equal(got[1], np.asarray([7, 2, 6, 4]))
 
 jax.config.update("jax_platform_name", "cpu")
 
@@ -102,7 +113,8 @@ def test_score_and_select_index_tokens_matches_numpy():
         assert (got[t] == -1).sum() == max(0, k - n_valid)
 
 
-def test_score_and_select_index_tokens_exact_topk_matches_numpy():
+@pytest.mark.parametrize("score_query_block_size", [1, 14])
+def test_score_and_select_index_tokens_exact_topk_matches_numpy(score_query_block_size):
     rng = np.random.default_rng(11)
     T, H, D, KV, page_size, k = 3, 2, 8, 24, 8, 7
     q = rng.normal(size=(T, H, D)).astype(np.float32)
@@ -123,6 +135,7 @@ def test_score_and_select_index_tokens_exact_topk_matches_numpy():
             k=k,
             pages_per_seq=cache.shape[0],
             topk_impl="exact_lax",
+            score_query_block_size=score_query_block_size,
         )
     )
 
@@ -136,6 +149,242 @@ def test_score_and_select_index_tokens_exact_topk_matches_numpy():
         scores[abs_t + 1 :] = -np.inf
         expected = np.argsort(-scores)[:k]
         np.testing.assert_array_equal(got[t], expected)
+
+
+def test_score_and_select_index_tokens_packed_multiseq_matches_numpy():
+    """Ragged extend scores each packed query once against its own sequence."""
+    rng = np.random.default_rng(17)
+    H, D, page_size, k = 2, 8, 4, 5
+    q_lens = np.array([2, 3], np.int32)
+    kv_lens = np.array([8, 12], np.int32)
+    T = int(q_lens.sum())
+
+    q = rng.normal(size=(T, H, D)).astype(np.float32)
+    weights = rng.normal(size=(T, H)).astype(np.float32)
+    seq_keys = [
+        rng.normal(size=(int(kv_len), D)).astype(np.float32) for kv_len in kv_lens
+    ]
+
+    # Ragged-packed page table: seq0 owns two pages, seq1 owns three, and the
+    # final page is static padding so page_indices.shape[0] / S == 3.
+    padding_page = np.zeros((page_size, D), np.float32)
+    cache = np.concatenate([*seq_keys, padding_page], axis=0).reshape(-1, page_size, D)
+    page_indices = np.arange(cache.shape[0], dtype=np.int32)
+    cu_q_lens = np.array([0, 2, 5], np.int32)
+    cu_kv_lens = np.array([0, 8, 20], np.int32)
+
+    got = np.asarray(
+        score_and_select_index_tokens(
+            jnp.asarray(q),
+            jnp.asarray(weights),
+            jnp.asarray(cache),
+            jnp.asarray(kv_lens),
+            jnp.asarray(page_indices),
+            jnp.asarray(cu_q_lens),
+            jnp.asarray(cu_kv_lens),
+            jnp.asarray([0, 0, 2], np.int32),
+            k=k,
+            pages_per_seq=cache.shape[0] // len(kv_lens),
+            topk_impl="exact_lax",
+        )
+    )
+
+    for seq_id, keys in enumerate(seq_keys):
+        q_start = int(cu_q_lens[seq_id])
+        q_len = int(q_lens[seq_id])
+        prefix_len = int(kv_lens[seq_id] - q_len)
+        for local_q in range(q_len):
+            token_id = q_start + local_q
+            scores = np.einsum(
+                "h,hk->k",
+                weights[token_id],
+                np.maximum(np.einsum("hd,kd->hk", q[token_id], keys), 0),
+            )
+            scores[prefix_len + local_q + 1 :] = -np.inf
+            expected = np.argsort(-scores)[:k]
+            np.testing.assert_array_equal(got[token_id], expected)
+
+
+def test_score_and_select_index_tokens_multiblock_ragged_matches_numpy():
+    """A sequence crossing the fixed query-block boundary is scored once."""
+    rng = np.random.default_rng(19)
+    H, D, page_size, k = 2, 4, 8, 4
+    q_lens = np.array([257, 3], np.int32)
+    kv_lens = np.array([264, 16], np.int32)
+    T = int(q_lens.sum())
+
+    q = rng.normal(size=(T, H, D)).astype(np.float32)
+    weights = (np.abs(rng.normal(size=(T, H))) + 0.1).astype(np.float32)
+    seq_keys = [
+        rng.normal(size=(int(kv_len), D)).astype(np.float32) for kv_len in kv_lens
+    ]
+
+    pages_per_seq = 33
+    total_pages = pages_per_seq * len(kv_lens)
+    actual_pages = sum(int(kv_len) // page_size for kv_len in kv_lens)
+    padding = np.zeros(((total_pages - actual_pages) * page_size, D), np.float32)
+    cache = np.concatenate([*seq_keys, padding], axis=0).reshape(-1, page_size, D)
+    page_indices = np.arange(total_pages, dtype=np.int32)
+    cu_q_lens = np.array([0, 257, 260], np.int32)
+    cu_kv_lens = np.array([0, 264, 280], np.int32)
+
+    got = np.asarray(
+        score_and_select_index_tokens(
+            jnp.asarray(q),
+            jnp.asarray(weights),
+            jnp.asarray(cache),
+            jnp.asarray(kv_lens),
+            jnp.asarray(page_indices),
+            jnp.asarray(cu_q_lens),
+            jnp.asarray(cu_kv_lens),
+            jnp.asarray([0, 0, 2], np.int32),
+            k=k,
+            pages_per_seq=pages_per_seq,
+            topk_impl="exact_lax",
+        )
+    )
+
+    for seq_id, keys in enumerate(seq_keys):
+        q_start = int(cu_q_lens[seq_id])
+        q_len = int(q_lens[seq_id])
+        prefix_len = int(kv_lens[seq_id] - q_len)
+        for local_q in range(q_len):
+            token_id = q_start + local_q
+            scores = np.einsum(
+                "h,hk->k",
+                weights[token_id],
+                np.maximum(np.einsum("hd,kd->hk", q[token_id], keys), 0),
+            )
+            scores[prefix_len + local_q + 1 :] = -np.inf
+            expected = np.argsort(-scores)[:k]
+            np.testing.assert_array_equal(
+                got[token_id], expected, err_msg=f"seq={seq_id}, token={token_id}"
+            )
+
+
+def test_score_and_select_index_tokens_three_block_pipeline_matches_numpy():
+    """The score/top-k pipeline handles fill, repeated overlap, and drain."""
+    rng = np.random.default_rng(23)
+    T, H, D, KV, page_size, k = 513, 2, 4, 520, 8, 7
+    q = rng.normal(size=(T, H, D)).astype(np.float32)
+    weights = (np.abs(rng.normal(size=(T, H))) + 0.1).astype(np.float32)
+    keys = rng.normal(size=(KV, D)).astype(np.float32)
+    cache, page_idx = _make_paged(keys, page_size)
+
+    got = np.asarray(
+        score_and_select_index_tokens(
+            jnp.asarray(q),
+            jnp.asarray(weights),
+            jnp.asarray(cache),
+            jnp.asarray([KV], np.int32),
+            jnp.asarray(page_idx),
+            jnp.asarray([0, T], np.int32),
+            jnp.asarray([0, cache.shape[0] * page_size], np.int32),
+            jnp.asarray([0, 0, 1], np.int32),
+            k=k,
+            pages_per_seq=cache.shape[0],
+            topk_impl="exact_lax",
+        )
+    )
+
+    prefix_len = KV - T
+    for token_id in range(T):
+        scores = np.einsum(
+            "h,hk->k",
+            weights[token_id],
+            np.maximum(np.einsum("hd,kd->hk", q[token_id], keys), 0),
+        )
+        scores[prefix_len + token_id + 1 :] = -np.inf
+        np.testing.assert_array_equal(got[token_id], np.argsort(-scores)[:k])
+
+
+@pytest.mark.parametrize("active_num_seqs", [0, 1, 2, 3])
+def test_score_and_select_index_tokens_decode_pipeline_matches_general(active_num_seqs):
+    """Decode ping-pong matches general scoring at every pipeline boundary."""
+    rng = np.random.default_rng(29)
+    H, D, page_size, pages_per_seq, k = 2, 8, 8, 4, 4
+    kv_lens = [24, 31, 0]
+    num_seqs = len(kv_lens)
+    q = rng.normal(size=(num_seqs, H, D)).astype(np.float32)
+    weights = np.abs(rng.normal(size=(num_seqs, H))).astype(np.float32)
+
+    pages = []
+    page_indices = []
+    for kv_len in kv_lens:
+        keys = rng.normal(size=(max(kv_len, 1), D)).astype(np.float32)
+        seq_pages, _ = _make_paged(keys, page_size)
+        padding = np.zeros(
+            (pages_per_seq - seq_pages.shape[0], page_size, D),
+            np.float32,
+        )
+        seq_pages = np.concatenate([seq_pages, padding]) if padding.size else seq_pages
+        page_start = len(pages) * pages_per_seq
+        pages.append(seq_pages)
+        page_indices.append(
+            np.arange(page_start, page_start + pages_per_seq, dtype=np.int32)
+        )
+
+    args = (
+        jnp.asarray(q),
+        jnp.asarray(weights),
+        jnp.asarray(np.concatenate(pages)),
+        jnp.asarray(kv_lens, np.int32),
+        jnp.asarray(np.concatenate(page_indices)),
+        jnp.asarray(np.arange(num_seqs + 1), np.int32),
+        jnp.asarray(
+            [i * pages_per_seq * page_size for i in range(num_seqs + 1)],
+            np.int32,
+        ),
+        jnp.asarray([0, active_num_seqs, active_num_seqs], np.int32),
+    )
+    general = np.asarray(
+        score_and_select_index_tokens(
+            *args,
+            k=k,
+            pages_per_seq=pages_per_seq,
+            topk_impl="exact_lax",
+        )
+    )
+    decode = np.asarray(
+        score_and_select_index_tokens(
+            *args,
+            k=k,
+            pages_per_seq=pages_per_seq,
+            one_token_per_seq=True,
+            topk_impl="exact_lax",
+        )
+    )
+
+    np.testing.assert_array_equal(decode, general)
+    assert (decode[-1] == -1).all()
+
+
+def test_score_and_select_index_tokens_skips_inactive_sequences():
+    """Rows beyond distribution.num_seqs stay padded in the extend pipeline."""
+    rng = np.random.default_rng(31)
+    T, H, D, page_size, pages_per_seq, k = 4, 2, 4, 4, 2, 3
+    q = rng.normal(size=(T, H, D)).astype(np.float32)
+    weights = rng.normal(size=(T, H)).astype(np.float32)
+    cache = rng.normal(size=(4, page_size, D)).astype(np.float32)
+
+    got = np.asarray(
+        score_and_select_index_tokens(
+            jnp.asarray(q),
+            jnp.asarray(weights),
+            jnp.asarray(cache),
+            jnp.asarray([8, 8], np.int32),
+            jnp.asarray([0, 1, 2, 3], np.int32),
+            jnp.asarray([0, 2, 4], np.int32),
+            jnp.asarray([0, 8, 16], np.int32),
+            jnp.asarray([0, 0, 1], np.int32),
+            k=k,
+            pages_per_seq=pages_per_seq,
+            topk_impl="exact_lax",
+        )
+    )
+
+    assert (got[:2] >= 0).all()
+    assert (got[2:] == -1).all()
 
 
 def test_sparse_mla_full_topk_equals_dense():

@@ -380,9 +380,9 @@ def _logical_topk_to_physical_slots(
     physical_slots = jnp.where(valid, physical_slots, jnp.int32(0))
     selected_counts = jnp.sum(valid, axis=1, dtype=jnp.int32)
 
-    # ``lax.top_k`` places all finite values before -inf padding, so valid
-    # entries are a prefix as required by selected_counts. Keep this helper
-    # pure/JIT-compatible; correctness tests cover the prefix invariant.
+    # The indexer compacts invalid candidates after selection, so valid entries
+    # are a prefix as required by selected_counts. Their score order is not
+    # relevant to sparse attention.
     del topk_size
     return physical_slots.astype(jnp.int32), selected_counts
 

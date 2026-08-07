@@ -203,5 +203,5 @@ def test_profile_admission_barrier_queues_all_requests_before_resume() -> None:
 def test_variant_flag_can_label_radix_topk() -> None:
     parser_source = BENCHMARK_PATH.read_text()
 
-    assert '"--variant"' in parser_source
+    assert parser_source.count('"--variant"') == 1
     assert '"variant": args.variant' in parser_source

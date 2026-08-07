@@ -22,8 +22,10 @@ def select_indexer_topk(
     """Return top-k score values and sequence-local token indices.
 
     Score construction and masking belong to the DSA scorer. This adapter only
-    selects candidates and normalizes every implementation to the ordered
-    ``(values, indices)`` ABI consumed by the cache/gather path.
+    selects candidates and normalizes every implementation to a
+    ``(values, indices)`` ABI consumed by the cache/gather path. Candidate
+    order is intentionally unspecified: DSA consumes the selected positions
+    as a set.
     """
 
     if scores.ndim != 2:
@@ -64,7 +66,10 @@ def select_indexer_topk(
             num_digits=config.num_digits,
             use_tc_tiling_on_sc=config.use_tc_tiling_on_sc,
         )
-        return _order_candidates(candidate_values, candidate_indices, k=k)
+        # Radix selection already returns the exact top-k set. Sorting that
+        # K-sized set again adds an XLA sort but does not change sparse
+        # attention, whose gather is permutation invariant.
+        return candidate_values[..., :k], candidate_indices[..., :k]
 
     raise ValueError(f"unknown DSA top-k implementation: {implementation}")
 

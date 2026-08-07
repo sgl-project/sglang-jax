@@ -32,6 +32,7 @@ from sgl_jax.srt.layers.moe import (
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import (
     dequantize_tensor,
     quantize_tensor,
@@ -251,6 +252,7 @@ class GlmDsaIndexer(nnx.Module):
             scope_name="weights_proj",
         )
 
+    @named_scope("Projection")
     def _project(
         self, hidden_states: jax.Array, qr: jax.Array, positions: jax.Array, rotary_emb: Any
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -279,6 +281,7 @@ class GlmDsaIndexer(nnx.Module):
         weights, _ = self.weights_proj(hidden_states)
         return query, key, weights
 
+    @named_scope("DSAIndexer")
     def __call__(
         self,
         hidden_states: jax.Array,

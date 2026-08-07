@@ -40,7 +40,7 @@ class DSAIndexerOutput:
         return cls(*children)
 
 
-@named_scope
+@named_scope("CacheAndTopK")
 def update_index_cache_and_select(
     q_idx: jax.Array,
     k_idx: jax.Array,

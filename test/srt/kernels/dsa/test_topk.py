@@ -25,7 +25,7 @@ def test_exact_lax_matches_jax_top_k():
     np.testing.assert_array_equal(np.asarray(actual_indices), np.asarray(expected_indices))
 
 
-def test_radix_dispatch_pads_and_normalizes_candidate_order(monkeypatch):
+def test_radix_dispatch_pads_and_preserves_unordered_exact_set(monkeypatch):
     scores = jax.random.normal(jax.random.key(1), (2, 130), dtype=jnp.float32)
     called = False
 
@@ -58,8 +58,8 @@ def test_radix_dispatch_pads_and_normalizes_candidate_order(monkeypatch):
     )
 
     assert called
-    np.testing.assert_array_equal(np.asarray(actual_values), np.asarray(expected_values))
-    np.testing.assert_array_equal(np.asarray(actual_indices), np.asarray(expected_indices))
+    np.testing.assert_array_equal(np.asarray(actual_values), np.asarray(expected_values)[:, ::-1])
+    np.testing.assert_array_equal(np.asarray(actual_indices), np.asarray(expected_indices)[:, ::-1])
 
 
 def test_radix_dispatch_uses_score_size_topk_tuned_config(monkeypatch):
