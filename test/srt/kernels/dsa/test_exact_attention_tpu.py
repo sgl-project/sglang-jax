@@ -20,7 +20,7 @@ def _require_sparse_core_tpu() -> None:
 
 
 def _reference(q_latent, q_rope, cache, slots, counts, scale):
-    gathered = cache[slots]
+    gathered = cache[slots].reshape(*slots.shape, -1)
     q = jnp.concatenate([q_latent, q_rope], axis=-1).astype(jnp.float32)
     k = gathered[..., : q.shape[-1]].astype(jnp.float32)
     scores = jnp.einsum("qhd,qkd->qhk", q, k) * scale
@@ -38,7 +38,7 @@ def test_exact_dsa_matches_reference() -> None:
     keys = jax.random.split(jax.random.PRNGKey(17), 4)
     q_latent = (jax.random.normal(keys[0], (q_size, heads, latent)) * 0.1).astype(jnp.bfloat16)
     q_rope = (jax.random.normal(keys[1], (q_size, heads, rope)) * 0.1).astype(jnp.bfloat16)
-    cache = (jax.random.normal(keys[2], (cache_size, 640)) * 0.1).astype(jnp.bfloat16)
+    cache = (jax.random.normal(keys[2], (cache_size, 2, 384)) * 0.1).astype(jnp.bfloat16)
     slots = jax.random.randint(keys[3], (q_size, topk), 0, cache_size, dtype=jnp.int32)
     counts = (jnp.arange(q_size, dtype=jnp.int32) * 13) % (topk + 1)
     slots = jnp.where(jnp.arange(topk)[None, :] < counts[:, None], slots, 0)
@@ -52,7 +52,7 @@ def test_exact_dsa_matches_reference() -> None:
         counts,
         scale,
         bq_sparse=128,
-        bq=32,
+        bq=16,
         b_topk=128,
     )
     expected = _reference(q_latent, q_rope, cache, slots, counts, scale)
@@ -65,14 +65,14 @@ def test_exact_dsa_matches_reference() -> None:
 
 @pytest.mark.parametrize(
     ("q_size", "bq_sparse", "bq"),
-    [(2, 2, 1), (128, 128, 32)],
+    [(2, 2, 1), (128, 128, 16)],
     ids=["decode-c2-h64-k2048", "extend-h64-k2048"],
 )
 def test_exact_dsa_glm52_production_shape_smoke(q_size, bq_sparse, bq) -> None:
     _require_sparse_core_tpu()
     q_latent = jnp.zeros((q_size, 64, 512), jnp.bfloat16)
     q_rope = jnp.zeros((q_size, 64, 64), jnp.bfloat16)
-    cache = jnp.zeros((4096, 640), jnp.bfloat16)
+    cache = jnp.zeros((4096, 2, 384), jnp.bfloat16)
     slots = jnp.zeros((q_size, 2048), jnp.int32)
     counts = jnp.zeros((q_size,), jnp.int32)
 

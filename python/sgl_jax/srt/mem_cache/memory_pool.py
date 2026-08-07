@@ -1325,11 +1325,18 @@ class MLATokenToKVPool(KVCache):
             kv_dtype=self.dtype,
         )
         if self.page_layout == "flat":
-            # Exact DSA addresses slots with the allocator's logical page size.
-            # Do not inherit MLA's dtype-packing padding here: for bf16 and
-            # page_size=1 that would turn one logical slot into two physical
-            # slots and corrupt logical-topk -> physical-slot translation.
-            return (shape[0], self.page_size, shape[3])
+            if kv_dim != self.kv_dim:
+                # Indexer keys are consumed as ordinary feature vectors by the
+                # scoring path; they do not use Exact DSA feature packing.
+                return (shape[0], self.page_size, shape[3])
+            # Exact DSA keeps latent and RoPE contiguous and pads only the tail.
+            # Extract packing from the combined feature dimension so the final
+            # dimension remains 128-aligned for SparseCore DMA.
+            packing = shape[2]
+            logical_dim = self.kv_lora_rank + self.qk_rope_head_dim
+            alignment = 128 * packing
+            aligned_dim = (logical_dim + alignment - 1) // alignment * alignment
+            return (shape[0], self.page_size, packing, aligned_dim // packing)
         return shape
 
     def _create_buffers(self):
@@ -1373,6 +1380,10 @@ class MLATokenToKVPool(KVCache):
             self.indexer_key_buffer = []
             if self.indexer_key_dim > 0 and self.num_indexer_layers > 0:
                 idx_shape = self._cache_shape(self.indexer_key_dim)
+                indexer_sharding = NamedSharding(
+                    self.mesh,
+                    P("data", *([None] * (len(idx_shape) - 1))),
+                )
                 logger.info(
                     "DSA indexer-key cache: %d slots × %s (%.2f GB total)",
                     self.num_indexer_layers,
@@ -1382,7 +1393,9 @@ class MLATokenToKVPool(KVCache):
                     * jnp.dtype(self.dtype).itemsize
                     / GB,
                 )
-                allocate_indexer = _get_kv_zero_allocator(idx_shape, self.dtype, self.kv_sharding)
+                allocate_indexer = _get_kv_zero_allocator(
+                    idx_shape, self.dtype, indexer_sharding
+                )
                 for _ in range(self.num_indexer_layers):
                     self.indexer_key_buffer.append(allocate_indexer())
 
@@ -1424,8 +1437,22 @@ class MLATokenToKVPool(KVCache):
         return self.kv_buffer[layer_id - self.start_layer]
 
     def get_kv_buffer(self, layer_id: int) -> tuple[jax.Array, jax.Array]:
-        """Split the latent buffer into (c_kv, k_pe) views for non-kernel fallbacks."""
+        """Return logical ``(c_kv, k_pe)`` tensors for non-kernel fallbacks."""
         buf = self.kv_buffer[layer_id - self.start_layer]
+        if self.page_layout == "flat":
+            packed_dim = buf.shape[-1]
+            kv_positions = jnp.arange(self.kv_lora_rank, dtype=jnp.int32)
+            c_kv = buf[
+                ..., kv_positions // packed_dim, kv_positions % packed_dim
+            ]
+            rope_positions = self.kv_lora_rank + jnp.arange(
+                self.qk_rope_head_dim, dtype=jnp.int32
+            )
+            k_pe = buf[
+                ..., rope_positions // packed_dim, rope_positions % packed_dim
+            ]
+            return c_kv, k_pe
+
         c_kv = buf[..., : self.kv_lora_rank]
         k_pe = buf[..., self.nope_dim : self.nope_dim + self.qk_rope_head_dim]
         return c_kv, k_pe

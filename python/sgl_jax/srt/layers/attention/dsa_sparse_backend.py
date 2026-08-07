@@ -134,7 +134,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
 
     def _run_exact(self, ql, qpe, kvc, kpe, cache, topk, sm_scale, dpa, md):
         """Write the fused KV cache, map logical top-k to slots, then attend."""
-        cache_spec = P(dpa, None, None) if cache.ndim == 3 else P(dpa, None, None, None)
+        cache_spec = P(dpa, None, None, None)
         in_specs = (
             P(dpa, "tensor", None),
             P(dpa, "tensor", None),
@@ -152,15 +152,9 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
 
         def _run(ql_, qpe_, kvc_, kpe_, cache_, topk_, seq_lens_, pi_, cuq_, cukv_, dist_):
             del dist_
-            flat_page_layout = cache_.ndim == 3
-            page_size = cache_.shape[1] if flat_page_layout else cache_.shape[1] * cache_.shape[2]
-            cache3d = (
-                cache_
-                if flat_page_layout
-                else cache_.reshape(cache_.shape[0], page_size, cache_.shape[-1])
-            )
-            cache3d = _scatter_fused_kv_paged(
-                cache3d,
+            page_size = cache_.shape[1]
+            cache4d = _scatter_fused_kv_paged(
+                cache_,
                 kvc_,
                 kpe_,
                 seq_lens_,
@@ -177,7 +171,10 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             # For C=2 decode, bq_sparse=2 is the smallest valid choice at K=2048.
             # Larger extend batches use the kernel's validated 128-query tile.
             bq_sparse = 2 if ql_.shape[0] < 128 else 128
-            bq = 1 if bq_sparse == 2 else 32
+            # A packed BF16 cache row is 2 * 384 elements for GLM-5.  Using
+            # bq=32 makes the double-buffered TensorCore scratch exceed the
+            # TPU's 32 MiB scoped VMEM limit, so extend uses a 16-query tile.
+            bq = 1 if bq_sparse == 2 else 16
             q_padded = _pad_first_axis(ql_, bq_sparse)
             qpe_padded = _pad_first_axis(qpe_, bq_sparse)
             slots_padded = _pad_first_axis(physical_slots, bq_sparse)
@@ -185,7 +182,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             output = sparse_core_tensor_core_dsa(
                 q_padded,
                 qpe_padded,
-                cache3d.reshape(-1, cache3d.shape[-1]),
+                cache4d.reshape(-1, cache4d.shape[-2], cache4d.shape[-1]),
                 slots_padded,
                 counts_padded,
                 sm_scale,
@@ -193,8 +190,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 bq=bq,
                 b_topk=128,
             )
-            updated_cache = cache3d if flat_page_layout else cache3d.reshape(cache_.shape)
-            return output[: ql_.shape[0]], updated_cache
+            return output[: ql_.shape[0]], cache4d
 
         return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(
             ql,
@@ -317,7 +313,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
 
 
 def _scatter_fused_kv_paged(
-    cache3d: jax.Array,
+    cache4d: jax.Array,
     new_kv_c: jax.Array,
     new_k_pe: jax.Array,
     seq_lens: jax.Array,
@@ -327,15 +323,25 @@ def _scatter_fused_kv_paged(
     *,
     kv_lora_rank: int,
 ) -> jax.Array:
-    """Pack latent KV + RoPE exactly as ``MLATokenToKVPool`` and scatter it."""
-    rope_offset = (kv_lora_rank + 127) // 128 * 128
-    packed = jnp.zeros((new_kv_c.shape[0], cache3d.shape[-1]), dtype=cache3d.dtype)
-    packed = packed.at[:, :kv_lora_rank].set(new_kv_c.astype(cache3d.dtype))
-    packed = packed.at[:, rope_offset : rope_offset + new_k_pe.shape[-1]].set(
-        new_k_pe.astype(cache3d.dtype)
+    """Pack contiguous latent KV + RoPE into explicit feature-packing axes."""
+    packing, packed_dim = cache4d.shape[-2:]
+    packed = jnp.zeros(
+        (new_kv_c.shape[0], packing, packed_dim), dtype=cache4d.dtype
+    )
+
+    kv_positions = jnp.arange(kv_lora_rank, dtype=jnp.int32)
+    packed = packed.at[:, kv_positions // packed_dim, kv_positions % packed_dim].set(
+        new_kv_c.astype(cache4d.dtype)
+    )
+
+    rope_positions = kv_lora_rank + jnp.arange(new_k_pe.shape[-1], dtype=jnp.int32)
+    packed = packed.at[
+        :, rope_positions // packed_dim, rope_positions % packed_dim
+    ].set(
+        new_k_pe.astype(cache4d.dtype)
     )
     return scatter_paged_cache(
-        cache3d,
+        cache4d,
         packed,
         seq_lens,
         page_indices,

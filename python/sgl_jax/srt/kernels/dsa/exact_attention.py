@@ -45,13 +45,11 @@ def _sparse_core_gather(
     table: jax.Array,
     indices: jax.Array,
 ) -> jax.Array:
-    """Gather complete BF16 rows using SparseCore hardware row packing."""
-    if table.dtype != jnp.bfloat16 or table.ndim != 2:
-        raise TypeError("SparseCore table must be a rank-2 bfloat16 array.")
-    if table.shape[0] % 2:
-        raise ValueError("SparseCore BF16 row packing requires an even row count.")
-    if table.shape[1] % 128:
-        raise ValueError("SparseCore indirect DMA requires cache dimension C divisible by 128.")
+    """Gather complete ``[2, D]`` BF16 cache pairs by slot index."""
+    if table.dtype != jnp.bfloat16 or table.ndim != 3 or table.shape[1] != 2:
+        raise TypeError("SparseCore table must be a BF16 array with shape [S, 2, D].")
+    if table.shape[-1] % 128:
+        raise ValueError("SparseCore cache pair dimension D must be divisible by 128.")
     if indices.dtype != jnp.int32 or indices.ndim != 1:
         raise TypeError("SparseCore indices must be a rank-1 int32 array.")
 
@@ -87,66 +85,43 @@ def _sparse_core_gather(
             row_chunk = subcore_first_row_chunk + pl.program_id(0)
             row_subchunk_size = info.num_lanes
             num_row_subchunks = _SC_GATHER_WINDOW // row_subchunk_size
-            packed_output_rows = row_subchunk_size // 2
-
             @functools.partial(
                 pltpu.emit_pipeline,
                 grid=(num_row_subchunks, 1),
                 in_specs=pl.BlockSpec(
-                    (pl.Indirect(row_subchunk_size), value_dim),
+                    (pl.Indirect(row_subchunk_size), 1, value_dim),
                     lambda row_subchunk, _col: (
-                        lax.div(
-                            indices_vmem[
-                                pl.ds(
-                                    row_subchunk * row_subchunk_size,
-                                    row_subchunk_size,
-                                )
-                            ],
-                            2,
-                        ),
+                        indices_vmem[
+                            pl.ds(
+                                row_subchunk * row_subchunk_size,
+                                row_subchunk_size,
+                            )
+                        ],
+                        0,
                         0,
                     ),
                 ),
                 out_specs=pl.BlockSpec(
-                    (packed_output_rows, value_dim),
+                    (row_subchunk_size, 1, value_dim),
                     lambda row_subchunk, _col: (
                         row_chunk * num_row_subchunks + row_subchunk,
+                        0,
                         0,
                     ),
                 ),
             )
             def data_pipeline(gather_vmem, output_vmem):
-                gather_bf16 = gather_vmem.bitcast(jnp.bfloat16)
-                output_bf16 = output_vmem.bitcast(jnp.bfloat16)
-                row_subchunk = pl.program_id(0)
-                index_slice = indices_vmem[
-                    pl.ds(
-                        row_subchunk * row_subchunk_size,
-                        row_subchunk_size,
-                    )
-                ]
-
                 @plsc.parallel_loop(0, value_dim, step=32)
                 def copy_columns(column):
-                    rows = []
-                    for row in range(row_subchunk_size):
-                        packed_rows = gather_bf16[
-                            pl.ds(row * 2, 2),
-                            pl.ds(column, 32),
-                        ].astype(jnp.float32)
-                        rows.append(
-                            jnp.where(
-                                lax.bitwise_and(index_slice[row], 1) == 0,
-                                packed_rows[0],
-                                packed_rows[1],
-                            )
-                        )
-                    output_bf16[
+                    output_vmem[
                         pl.ds(0, row_subchunk_size),
+                        pl.ds(0, 1),
                         pl.ds(column, 32),
-                    ] = jnp.stack(
-                        rows, axis=0
-                    ).astype(jnp.bfloat16)
+                    ] = gather_vmem[
+                        pl.ds(0, row_subchunk_size),
+                        pl.ds(0, 1),
+                        pl.ds(column, 32),
+                    ]
 
             data_pipeline(
                 table_hbm.bitcast(jnp.int32),
@@ -156,7 +131,7 @@ def _sparse_core_gather(
         index_pipeline(indices_hbm)
 
     output = jax.ShapeDtypeStruct(
-        (num_indices, value_dim),
+        (num_indices, 2, value_dim),
         jnp.bfloat16,
     )
     compiler_param_kwargs = {"use_tc_tiling_on_sc": True}
@@ -184,7 +159,7 @@ def _gather_cache_microbatch(
     """Gather one cache microbatch from prevalidated physical slots."""
     batch_size, topk = safe_slots.shape
     gathered = _sparse_core_gather(cache, safe_slots.reshape(-1))
-    return gathered.reshape(batch_size, topk, cache.shape[-1])
+    return gathered.reshape(batch_size, topk, 2, cache.shape[-1])
 
 
 def _dsa_tensor_core_kernel(
@@ -283,7 +258,9 @@ def _dsa_tensor_core_kernel(
             # SMEM supports scalar loads only. Static unrolling constructs the VMEM
             # vector without asking Mosaic to lower a vector-valued SMEM load.
             selected_counts = jnp.stack([selected_counts_ref[q_step * bq + i] for i in range(bq)])
-            cache = cache_x2_ref[cache_buffer]
+            cache = cache_x2_ref[cache_buffer].reshape(
+                (bq, b_topk, cache_x2_ref.shape[-2] * cache_x2_ref.shape[-1])
+            )
 
             scores = lax.dot_general(
                 q,
@@ -400,7 +377,7 @@ def _tensor_core_attention(
             scratch_shapes=[
                 pltpu.VMEM((2, bq, num_heads, padded_q_dim), q_latent.dtype),
                 pltpu.VMEM(
-                    (2, bq, b_topk, gathered_cache.shape[-1]),
+                    (2, bq, b_topk, 2, gathered_cache.shape[-1]),
                     gathered_cache.dtype,
                 ),
                 pltpu.VMEM(
@@ -439,7 +416,7 @@ def sparse_core_tensor_core_dsa(
     sm_scale: jax.Array | float,
     *,
     bq_sparse: int = 128,
-    bq: int = 32,
+    bq: int = 16,
     b_topk: int = 128,
 ) -> jax.Array:
     """Compute sparse DSA attention with overlapped SparseCore and TensorCore work.
@@ -448,10 +425,8 @@ def sparse_core_tensor_core_dsa(
       q_latent: BF16 latent queries, shape ``[Q, H, V]``. ``Q`` is the
         number of query tokens and ``H`` is the number of query heads.
       q_rope: Rotary query components, shape ``[Q, H, R]`` and the same dtype.
-      cache: Physical-slot cache, shape ``[S, C]`` and the same dtype. ``S`` is
-        the number of directly addressable cache rows. The first ``V`` elements
-        of each row are both latent key and output value, the following ``R`` are
-        the rotary key, and any remainder is padding.
+      cache: Paired physical-slot cache with shape ``[S, 2, D]`` and BF16
+        dtype. ``cache[s].reshape(2 * D)`` is one logical cache row.
       physical_slots: INT32 cache-row indices in ``[0, S)``, shape ``[Q, K]``.
         Only entries before the corresponding ``selected_counts`` value are read.
       selected_counts: INT32 valid top-k counts, shape ``[Q]``. Values are
@@ -474,6 +449,10 @@ def sparse_core_tensor_core_dsa(
         raise TypeError("q_latent must have dtype bfloat16.")
     if q_rope.dtype != q_latent.dtype or cache.dtype != q_latent.dtype:
         raise TypeError("q_latent, q_rope, and cache must have the same dtype.")
+    if cache.ndim != 3 or cache.shape[1] != 2:
+        raise ValueError(f"cache must have shape [S, 2, D], got {cache.shape}.")
+    if cache.shape[-1] % 128:
+        raise ValueError("cache pair dimension D must be divisible by 128.")
     if physical_slots.dtype != jnp.int32 or selected_counts.dtype != jnp.int32:
         raise TypeError("physical_slots and selected_counts must have dtype int32.")
     if bq_sparse <= 0 or bq <= 0 or b_topk <= 0:
@@ -481,7 +460,7 @@ def sparse_core_tensor_core_dsa(
 
     num_queries, _, latent_dim = q_latent.shape
     rope_dim = q_rope.shape[-1]
-    cache_dim = cache.shape[-1]
+    cache_dim = cache.shape[1] * cache.shape[2]
     topk = physical_slots.shape[1]
     if cache_dim < latent_dim + rope_dim:
         raise ValueError(
