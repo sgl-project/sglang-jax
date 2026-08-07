@@ -45,9 +45,7 @@ def _clone_slots_kernel(
     # direct load/store.  For the no-op sentinel, copy dst onto itself; this
     # avoids a read from the output alias while preserving its contents.
     source_slot = jnp.where(src == 0, dst, src)
-    gather = pltpu.make_async_copy(
-        buffer_ref.at[source_slot, payload_slice], scratch_ref, sem
-    )
+    gather = pltpu.make_async_copy(buffer_ref.at[source_slot, payload_slice], scratch_ref, sem)
     gather.start()
     gather.wait()
     scatter = pltpu.make_async_copy(scratch_ref, out_ref.at[dst, payload_slice], sem)
