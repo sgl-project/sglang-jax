@@ -1,6 +1,10 @@
-"""Correctness tests for NativeAttention decode masking under a paged KV layout.
+"""Correctness tests for NativeAttention masking under a paged KV layout.
 
-Decode ``cache_loc`` is built page-aligned per request (``ScheduleBatch._merge_cache_loc``):
+Both mask paths are covered: ``_apply_decode_mask`` and ``_apply_extend_mask``. They share
+the key axis -- one ``_merge_cache_loc``, same page-aligned blocks -- and had the same
+defect, so the extend class mirrors the decode one case for case.
+
+``cache_loc`` is built page-aligned per request (``ScheduleBatch._merge_cache_loc``):
 each request occupies ``ceil(seq_len / page_size) * page_size`` slots and the per-request
 offsets are ``cumsum(aligned_lens)``. ``native_backend._apply_decode_mask`` however
 reconstructs the per-sequence key ranges from a dense ``cumsum(seq_lens)``.
@@ -52,8 +56,12 @@ def _cpu_mesh() -> Mesh:
     return Mesh(np.array(jax.devices()).reshape(1, 1), ("data", "tensor"))
 
 
-def _build_paged_fixture(page_size, seq_lens, num_heads, num_kv_heads, seed=0):
-    """Hand-build the decode inputs ``forward_attention`` receives in serving.
+def _build_paged_fixture(page_size, seq_lens, num_heads, num_kv_heads, seed=0, extend_lens=None):
+    """Hand-build the inputs ``forward_attention`` receives in serving.
+
+    ``extend_lens=None`` builds a decode batch (one query row per request); passing it
+    builds an extend batch (``extend_lens[i]`` query rows for request ``i``). The KV side
+    is identical either way -- both paths go through the same ``_merge_cache_loc``.
 
     The req_to_token ledger mirrors PagedTokenToKVPoolAllocator: slot indices inside a
     page are consecutive (``req_to_token[i, p * ps + j] == req_to_token[i, p * ps] + j``)
@@ -66,6 +74,8 @@ def _build_paged_fixture(page_size, seq_lens, num_heads, num_kv_heads, seed=0):
     """
     rng = np.random.default_rng(seed)
     num_reqs = len(seq_lens)
+    # Decode contributes one query row per request; extend contributes extend_lens[i].
+    num_queries = num_reqs if extend_lens is None else int(sum(extend_lens))
     pages_per_req = max(-(-int(length) // page_size) for length in seq_lens)
     max_ctx = pages_per_req * page_size
     assert num_reqs * max_ctx <= POOL_SLOTS, "fixture does not fit the fixed KV pool"
@@ -82,12 +92,13 @@ def _build_paged_fixture(page_size, seq_lens, num_heads, num_kv_heads, seed=0):
     ).astype(np.int32)
 
     return {
-        "q": rng.normal(size=(num_reqs, num_heads, HEAD_DIM)).astype(np.float32),
+        "q": rng.normal(size=(num_queries, num_heads, HEAD_DIM)).astype(np.float32),
         "k_cache": rng.normal(size=(POOL_SLOTS, num_kv_heads, HEAD_DIM)).astype(np.float32),
         "v_cache": rng.normal(size=(POOL_SLOTS, num_kv_heads, HEAD_DIM)).astype(np.float32),
         "seq_lens": np.asarray(seq_lens, dtype=np.int32),
         "cache_loc": cache_loc,
         "own_slots": [req_to_token[i, : int(length)] for i, length in enumerate(seq_lens)],
+        "extend_lens": None if extend_lens is None else np.asarray(extend_lens, dtype=np.int32),
     }
 
 
@@ -114,6 +125,38 @@ def _reference_decode_attention(fixture, num_heads, num_kv_heads, scale, sliding
             probs /= probs.sum()
             out[i, h] = probs @ values[:, kv_head, :]
     return out.reshape(num_reqs, num_heads * HEAD_DIM)
+
+
+def _reference_extend_attention(fixture, num_heads, num_kv_heads, scale, sliding_window_size=None):
+    """Per-sequence causal attention over only that sequence's own KV slots.
+
+    Same independence rules as the decode reference: no flat concatenation, no mask, no
+    cumsum, no notion of pages -- a shared prefix-sum here would reproduce the very bug
+    under test on both sides and the comparison would pass regardless.
+
+    Row ``r`` of request ``i`` is the token at absolute position ``prefix_len_i + r``, so it
+    sees its own keys ``[0, pos]``; a sliding window further trims that to the last
+    ``sliding_window_size`` of them.
+    """
+    copies = num_heads // num_kv_heads
+    extend_lens = fixture["extend_lens"]
+    out = np.zeros((int(extend_lens.sum()), num_heads, HEAD_DIM), dtype=np.float32)
+    row = 0
+    for i, slots in enumerate(fixture["own_slots"]):
+        keys = fixture["k_cache"][slots]
+        values = fixture["v_cache"][slots]
+        prefix_len = len(slots) - int(extend_lens[i])
+        for r in range(int(extend_lens[i])):
+            pos = prefix_len + r
+            lo = 0 if sliding_window_size is None else max(0, pos + 1 - sliding_window_size)
+            for h in range(num_heads):
+                kv_head = h // copies
+                logits = (fixture["q"][row][h] @ keys[lo : pos + 1, kv_head, :].T) * scale
+                probs = np.exp(logits - logits.max())
+                probs /= probs.sum()
+                out[row, h] = probs @ values[lo : pos + 1, kv_head, :]
+            row += 1
+    return out.reshape(-1, num_heads * HEAD_DIM)
 
 
 class TestNativeAttentionPagedDecode(unittest.TestCase):
@@ -235,6 +278,169 @@ class TestNativeAttentionPagedDecode(unittest.TestCase):
         """Padding behind the last sequence shifts nobody: this must pass either way."""
         self._assert_matches_reference(4, (4, 3), *DEFAULT_HEADS)
         self._assert_matches_reference(4, (8, 4, 1), *DEFAULT_HEADS)
+
+
+class TestNativeAttentionPagedExtend(unittest.TestCase):
+    """The extend half of the same defect.
+
+    Extend shares the key axis with decode -- one ``_merge_cache_loc``, same page-aligned
+    blocks -- and differs only on the query axis, where each request contributes
+    ``extend_seq_lens[i]`` rows instead of one. ``_apply_extend_mask`` reconstructed the key
+    blocks from a dense ``cumsum(seq_lens)`` and bounded validity with a single
+    ``arange < sum(seq_lens)``, so it drifted exactly like the decode mask did, with the
+    same necessary-and-sufficient condition: a request errs iff the page padding ahead of
+    it is non-zero.
+
+    The scalar bound is the part decode does not have. Block starts alone are not enough:
+    ``k_batch_ids`` comes from a non-decreasing cumsum and so has no "unowned" value --
+    every column, page tails included, is assigned to some request. Only a per-column end
+    excludes them.
+    """
+
+    def _assert_matches_reference(
+        self,
+        page_size,
+        seq_lens,
+        extend_lens,
+        num_heads,
+        num_kv_heads,
+        seed=0,
+        sliding_window_size=None,
+        token_bucket=None,
+        loc_bucket=None,
+    ):
+        assert all(e <= s for e, s in zip(extend_lens, seq_lens))
+        fixture = _build_paged_fixture(
+            page_size, seq_lens, num_heads, num_kv_heads, seed, extend_lens=extend_lens
+        )
+        scale = 1.0 / np.sqrt(HEAD_DIM)
+        num_queries = int(sum(extend_lens))
+        prefix_lens = np.asarray(seq_lens, np.int32) - np.asarray(extend_lens, np.int32)
+        q, cache_loc = fixture["q"], fixture["cache_loc"]
+        if token_bucket is not None:
+            pad_rows = token_bucket - num_queries
+            q = np.concatenate([q, np.zeros((pad_rows, num_heads, HEAD_DIM), np.float32)])
+        if loc_bucket is not None:
+            # Same stale-tail construction as the decode test: the host cache_loc buffer is
+            # never re-zeroed, so its tail holds in-bounds slot indices from earlier batches.
+            stale = np.arange(101, 101 + loc_bucket - len(cache_loc), dtype=np.int32)
+            cache_loc = np.concatenate([cache_loc, stale])
+
+        got = forward_attention(
+            jnp.asarray(q),
+            jnp.asarray(fixture["k_cache"]),
+            jnp.asarray(fixture["v_cache"]),
+            jnp.asarray(fixture["seq_lens"]),
+            jnp.asarray(cache_loc),
+            jnp.asarray(prefix_lens),
+            jnp.asarray(np.asarray(extend_lens, np.int32)),
+            num_heads,
+            num_kv_heads,
+            scale,
+            True,  # is_causal: extend queries are ordered within their own sequence
+            ForwardMode.EXTEND,
+            None,  # kv_sharding
+            page_size=page_size,
+            mesh=_cpu_mesh(),
+            sliding_window_size=sliding_window_size,
+        )
+        expected = _reference_extend_attention(
+            fixture, num_heads, num_kv_heads, scale, sliding_window_size
+        )
+        got = np.asarray(got)
+        context = (
+            f"page_size={page_size} seq_lens={list(seq_lens)} extend_lens={list(extend_lens)} "
+            f"heads={num_heads}/{num_kv_heads} window={sliding_window_size} "
+            f"token_bucket={token_bucket} loc_bucket={loc_bucket}"
+        )
+        np.testing.assert_allclose(
+            got[:num_queries], expected, rtol=1e-5, atol=1e-5, err_msg=context
+        )
+        self.assertTrue(np.isfinite(got[num_queries:]).all(), f"non-finite padding rows: {context}")
+
+    def test_multi_sequence_unequal_lengths(self):
+        """Several requests whose lengths are not page multiples."""
+        for page_size, seq_lens, extend_lens in (
+            (4, (3, 2), (3, 2)),  # minimal repro: cold prefill of two prompts
+            (16, (7, 1, 9), (7, 1, 9)),  # three requests: drift accumulates
+            (256, (100, 100), (100, 100)),  # the page size the bug report used
+        ):
+            with self.subTest(page_size=page_size, seq_lens=seq_lens):
+                self._assert_matches_reference(page_size, seq_lens, extend_lens, *DEFAULT_HEADS)
+
+    def test_prefix_lens(self):
+        """extend_prefix_lens is the axis decode does not have.
+
+        A page-aligned prefix is what a radix-cache hit produces (match_prefix truncates to
+        a page boundary); an unaligned one is what a continued chunk produces, because
+        cache_unfinished_req hands back the tree-owned page-aligned part plus the
+        request-owned tail. Both must place the causal diagonal at the absolute position.
+        """
+        for seq_lens, extend_lens, note in (
+            ((9, 5), (3, 5), "unaligned prefix 6 + no prefix"),
+            ((8, 5), (4, 5), "aligned prefix 4 + no prefix"),
+            ((6, 5, 7), (2, 5, 3), "prefix > 0 mixed with prefix == 0"),
+        ):
+            with self.subTest(note=note):
+                self._assert_matches_reference(4, seq_lens, extend_lens, *DEFAULT_HEADS)
+
+    def test_head_configurations(self):
+        """The drift is on the key axis, so it must reproduce for MHA, GQA and MQA alike."""
+        for num_heads, num_kv_heads in HEAD_CONFIGS:
+            with self.subTest(num_heads=num_heads, num_kv_heads=num_kv_heads):
+                self._assert_matches_reference(4, (3, 2), (3, 2), num_heads, num_kv_heads)
+
+    def test_page_size_1_is_dense(self):
+        """page_size == 1 leaves no page padding, so the dense assumption holds."""
+        for num_heads, num_kv_heads in HEAD_CONFIGS:
+            with self.subTest(num_heads=num_heads, num_kv_heads=num_kv_heads):
+                self._assert_matches_reference(1, (3, 2, 7), (3, 2, 4), num_heads, num_kv_heads)
+
+    def test_single_sequence(self):
+        """A batch of one starts at offset 0, so no drift is possible."""
+        for page_size, seq_lens, extend_lens in ((4, (3,), (3,)), (4, (9,), (3,))):
+            with self.subTest(page_size=page_size, seq_lens=seq_lens):
+                self._assert_matches_reference(page_size, seq_lens, extend_lens, *DEFAULT_HEADS)
+
+    def test_exact_page_multiples(self):
+        """Every length an exact page multiple: aligned_lens == seq_lens."""
+        self._assert_matches_reference(4, (4, 8, 4), (4, 4, 4), *DEFAULT_HEADS)
+
+    def test_padding_only_on_last_sequence(self):
+        """Padding behind the last request shifts nobody: this must pass either way."""
+        self._assert_matches_reference(4, (4, 3), (2, 3), *DEFAULT_HEADS)
+        self._assert_matches_reference(4, (8, 4, 1), (4, 4, 1), *DEFAULT_HEADS)
+
+    def test_sliding_window(self):
+        """The SWA bound rides on the same block offsets, so it drifts with them."""
+        for window in (2, 8):  # 8 exceeds every sequence here: the window must be a no-op
+            with self.subTest(window=window):
+                self._assert_matches_reference(
+                    4, (3, 2), (3, 2), *DEFAULT_HEADS, sliding_window_size=window
+                )
+
+    def test_bucket_padding(self):
+        """Extend pins bs and cache_loc to the largest bucket and buckets the token count.
+
+        Trailing zero-length requests are therefore the norm, not an edge case, and they
+        make q_starts / k_starts repeat -- ``.at[].set(1)`` merges the duplicate markers and
+        drops any index that lands past the end of the array.
+        """
+        for seq_lens, extend_lens, token_bucket, loc_bucket in (
+            ((3, 2), (3, 2), 8, None),
+            ((3, 2), (3, 2), 8, 16),
+            ((3, 2, 0, 0), (3, 2, 0, 0), None, None),
+            ((4, 3, 0, 0), (2, 3, 0, 0), 8, 16),
+        ):
+            with self.subTest(seq_lens=seq_lens, token_bucket=token_bucket):
+                self._assert_matches_reference(
+                    4,
+                    seq_lens,
+                    extend_lens,
+                    *DEFAULT_HEADS,
+                    token_bucket=token_bucket,
+                    loc_bucket=loc_bucket,
+                )
 
 
 if __name__ == "__main__":

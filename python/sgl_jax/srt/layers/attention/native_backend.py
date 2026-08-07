@@ -297,6 +297,7 @@ def forward_attention(
             is_causal,
             sliding_window_size,
             mesh=mesh,
+            page_size=page_size,
         )
     else:
         attn_logits = _apply_decode_mask(
@@ -341,10 +342,14 @@ def _apply_extend_mask(
     is_causal: bool = True,
     sliding_window_size: int | None = None,
     mesh: Mesh | None = None,
+    *,
+    page_size: int,
 ):
     """
     Applies a block-diagonal and optionally a causal/SWA mask in a unified,
     efficient way, correctly handling padding.
+
+    page_size: KV pool page size; extend `loc` blocks are page-aligned per request.
     """
     query_len, _, key_len = attn_weights.shape
 
@@ -357,17 +362,24 @@ def _apply_extend_mask(
 
     # --- Create validity masks to handle padding ---
     q_valid_mask = jnp.arange(query_len) < jnp.sum(extend_seq_lens)
-    k_valid_mask = jnp.arange(key_len) < jnp.sum(seq_lengths)
 
     # --- 1. Generate Batch IDs (Optimized) ---
     q_starts = jnp.cumsum(extend_seq_lens, dtype=jnp.int32) - extend_seq_lens
     q_batch_indicators = jnp.zeros(query_len, dtype=jnp.int32).at[q_starts].set(1)
     q_batch_ids = jnp.cumsum(q_batch_indicators, dtype=jnp.int32) - 1
 
-    full_seq_lens = seq_lengths
-    k_starts = jnp.cumsum(full_seq_lens, dtype=jnp.int32) - full_seq_lens
+    # `cache_loc` blocks are page-aligned per request (_merge_cache_loc), so the block
+    # offsets step by the aligned lengths while each block's valid span stays at the real
+    # length; the gap in between is that request's page tail.
+    aligned_lengths = ((seq_lengths + page_size - 1) // page_size) * page_size
+    k_starts = jnp.cumsum(aligned_lengths, dtype=jnp.int32) - aligned_lengths
     k_batch_indicators = jnp.zeros(key_len, dtype=jnp.int32).at[k_starts].set(1)
     k_batch_ids = jnp.cumsum(k_batch_indicators, dtype=jnp.int32) - 1
+
+    # Per-column end, not a single `arange < sum(seq_lens)`: k_batch_ids assigns every
+    # column to some request, so only an end term excludes the page tails. It subsumes the
+    # trailing batch padding the scalar bound used to cut.
+    k_valid_mask = jnp.arange(key_len) < (k_starts + seq_lengths)[k_batch_ids]
 
     # --- 2. Create block-diagonal mask ---
     final_mask = q_batch_ids[:, None] == k_batch_ids[None, :]
