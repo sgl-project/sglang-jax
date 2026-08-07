@@ -83,7 +83,7 @@ def _collect_precompile_batches(cm, mode):
             return_value=MagicMock(),
         ),
         patch(
-            "sgl_jax.srt.sampling.sampling_batch_info." "SamplingMetadata.from_model_worker_batch",
+            "sgl_jax.srt.sampling.sampling_batch_info.SamplingMetadata.from_model_worker_batch",
             return_value=MagicMock(),
         ),
     ):
@@ -127,18 +127,32 @@ class TestBucketComputation(unittest.TestCase):
             assert b % 4 == 0, f"bucket {b} not divisible by dp_size=4"
 
     def test_bs_buckets_fused_moe_minimum(self):
-        cm = CompilationManager(
-            server_args=_make_server_args(moe_backend="fused"),
-            max_padded_batch_size=128,
-            max_padded_num_tokens=2048,
-            dp_size=1,
-            tp_size=4,
-            page_size=128,
-            max_req_len=4096,
-            vocab_size=32000,
-        )
-        for b in cm.bs_buckets:
-            assert b >= 8, f"bucket {b} < tp_size*2=8 for fused moe"
+        for backend in ("fused", "fused_v2"):
+            cm = CompilationManager(
+                server_args=_make_server_args(moe_backend=backend),
+                max_padded_batch_size=128,
+                max_padded_num_tokens=2048,
+                dp_size=1,
+                tp_size=4,
+                page_size=128,
+                max_req_len=4096,
+                vocab_size=32000,
+            )
+            for b in cm.bs_buckets:
+                assert b >= 8, f"bucket {b} < tp_size*2=8 for {backend}"
+
+    def test_bs_buckets_fused_v2_rejects_cap_below_ep_minimum(self):
+        with self.assertRaisesRegex(ValueError, "minimum 2 \\* mesh_ep_size=32"):
+            CompilationManager(
+                server_args=_make_server_args(moe_backend="fused_v2"),
+                max_padded_batch_size=8,
+                max_padded_num_tokens=2048,
+                dp_size=2,
+                tp_size=16,
+                page_size=128,
+                max_req_len=4096,
+                vocab_size=32000,
+            )
 
     def test_bs_buckets_raw_epmoe_unfiltered(self):
         """Raw server_args.moe_backend='epmoe' (GMM path, e.g. DeepSeek-V3)

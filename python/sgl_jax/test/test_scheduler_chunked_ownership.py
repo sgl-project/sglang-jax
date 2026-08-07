@@ -2,7 +2,11 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from sgl_jax.srt.managers.io_struct import AbortReq, PauseGenerationReqInput
+from sgl_jax.srt.managers.io_struct import (
+    AbortReq,
+    PauseGenerationReqInput,
+    SetInternalStateReq,
+)
 from sgl_jax.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sgl_jax.srt.managers.scheduler import GenerationBatchResult, Scheduler
 from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
@@ -113,6 +117,21 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
             cache_miss_count=0,
             bid=1,
         )
+
+    def test_internal_state_can_pause_only_the_scheduler(self):
+        scheduler, _ = self._make_scheduler([[]])
+
+        paused = scheduler.set_internal_state(
+            SetInternalStateReq(request_id="profile-admission", state_data={"engine_paused": True})
+        )
+        assert paused.success
+        assert scheduler._engine_paused
+
+        resumed = scheduler.set_internal_state(
+            SetInternalStateReq(request_id="profile-admission", state_data={"engine_paused": False})
+        )
+        assert resumed.success
+        assert not scheduler._engine_paused
 
     def test_parked_chunk_without_new_kv_is_not_cached_again(self):
         req = self._make_req("parked", [1, 2], [10, 11])

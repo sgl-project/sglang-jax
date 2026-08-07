@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -13,12 +15,17 @@ from sgl_jax.srt.kernels.dsa.ref import (
 jax.config.update("jax_platform_name", "cpu")
 
 
-def test_build_index_share_map_glm52():
-    """GLM-5.2 pattern: [full×3, shared×3, full, shared×3, ...] for 78 layers."""
+def _glm52_indexer_types():
     types = ["full"] * 3
     for _ in range(75 // 4):
         types += ["shared"] * 3 + ["full"]
     types += ["shared"] * (78 - len(types))
+    return types
+
+
+def test_build_index_share_map_glm52():
+    """GLM-5.2 pattern: [full×3, shared×3, full, shared×3, ...] for 78 layers."""
+    types = _glm52_indexer_types()
     assert len(types) == 78
 
     full_slot, src_slot, num_full = build_index_share_map(types, skip_offset=3, num_layers=78)
@@ -259,6 +266,152 @@ def test_scatter_fused_kv_matches_mla_cache_layout():
     np.testing.assert_array_equal(out[0, 0, :512], np.asarray(latent[0].astype(jnp.bfloat16)))
     np.testing.assert_array_equal(out[0, 1, 512:576], np.asarray(rope[1].astype(jnp.bfloat16)))
     assert not np.any(out[0, :2, 576:])
+
+
+def test_exact_dsa_pool_uses_native_flat_page_layout():
+    from jax.sharding import Mesh
+
+    from sgl_jax.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+    mesh = Mesh(np.asarray(jax.devices()).reshape(1, 1), ("data", "tensor"))
+    common = {
+        "size": 128,
+        "page_size": 64,
+        "dtype": jnp.bfloat16,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "layer_num": 1,
+        "mesh": mesh,
+        "indexer_key_dim": 128,
+        "num_indexer_layers": 1,
+    }
+    mla_pool = MLATokenToKVPool(**common)
+    dsa_pool = MLATokenToKVPool(**common, page_layout="flat")
+
+    assert mla_pool.kv_buffer[0].shape == (3, 32, 2, 640)
+    assert dsa_pool.kv_buffer[0].shape == (3, 64, 640)
+    assert dsa_pool.indexer_key_buffer[0].shape == (3, 64, 128)
+    assert dsa_pool.kv_sharding.spec == jax.sharding.PartitionSpec("data", None, None)
+    assert dsa_pool.get_kv_size_bytes() == mla_pool.get_kv_size_bytes()
+    assert dsa_pool.get_kv_size_bytes() == 294_912
+
+    leaves, tree = jax.tree_util.tree_flatten(dsa_pool)
+    restored = jax.tree_util.tree_unflatten(tree, leaves)
+    assert restored.page_layout == "flat"
+    assert restored.kv_buffer[0].shape == dsa_pool.kv_buffer[0].shape
+
+
+def test_exact_dsa_flat_layout_uses_logical_page_size_without_mla_packing_padding():
+    from jax.sharding import Mesh
+
+    from sgl_jax.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+    mesh = Mesh(np.asarray(jax.devices()).reshape(1, 1), ("data", "tensor"))
+    common = {
+        "size": 128,
+        "page_size": 1,
+        "dtype": jnp.bfloat16,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "layer_num": 1,
+        "mesh": mesh,
+        "indexer_key_dim": 128,
+        "num_indexer_layers": 1,
+    }
+    mla_pool = MLATokenToKVPool(**common)
+    dsa_pool = MLATokenToKVPool(**common, page_layout="flat")
+
+    assert mla_pool.kv_buffer[0].shape == (129, 1, 2, 640)
+    assert dsa_pool.kv_buffer[0].shape == (129, 1, 640)
+    assert dsa_pool.indexer_key_buffer[0].shape == (129, 1, 128)
+    assert dsa_pool.get_kv_size_bytes() * 2 == mla_pool.get_kv_size_bytes()
+
+
+def test_exact_dsa_cell_size_includes_indexer_cache():
+    from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
+        ModelRunnerKVCacheMixin,
+    )
+
+    config = SimpleNamespace(
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        index_head_dim=128,
+        index_skip_topk_offset=3,
+        indexer_types=_glm52_indexer_types(),
+    )
+    runner = SimpleNamespace(
+        kv_cache_dtype=jnp.bfloat16,
+        use_mla_backend=True,
+        server_args=SimpleNamespace(
+            attention_backend="dsa_sparse",
+            dsa_sparse_impl="exact",
+        ),
+        model_config=SimpleNamespace(hf_text_config=config),
+        page_size=64,
+        _kv_pool_layer_count=lambda: 78,
+    )
+
+    main_kv_bytes = 78 * 640 * 2
+    indexer_kv_bytes = 21 * 128 * 2
+    assert ModelRunnerKVCacheMixin._compute_cell_size(runner) == (main_kv_bytes + indexer_kv_bytes)
+
+
+def test_exact_dsa_backend_preserves_native_cache_layout(monkeypatch):
+    from jax.sharding import Mesh, NamedSharding
+    from jax.sharding import PartitionSpec as P
+
+    import sgl_jax.srt.layers.attention.dsa_sparse_backend as dsa_backend
+    from sgl_jax.srt.layers.attention.mla_backend import MLAAttentionMetadata
+
+    mesh = Mesh(np.asarray(jax.devices()).reshape(1, 1), ("data", "tensor"))
+
+    def put(value, spec):
+        return jax.device_put(value, NamedSharding(mesh, spec))
+
+    backend = dsa_backend.DSASparseAttentionBackend(
+        sparse_impl="exact",
+        num_attn_heads=1,
+        kv_lora_rank=4,
+        qk_nope_head_dim=4,
+        qk_rope_head_dim=2,
+        v_head_dim=4,
+        page_size=4,
+        mesh=mesh,
+        vmem_limit_bytes=1 << 20,
+    )
+
+    def fake_exact_attention(q, qpe, cache, slots, counts, scale, **kwargs):
+        del qpe, cache, slots, counts, scale, kwargs
+        return jnp.zeros_like(q)
+
+    monkeypatch.setattr(dsa_backend, "sparse_core_tensor_core_dsa", fake_exact_attention)
+    metadata = MLAAttentionMetadata(
+        cu_q_lens=put(jnp.array([0, 1], jnp.int32), P("data")),
+        cu_kv_lens=put(jnp.array([0, 4], jnp.int32), P("data")),
+        page_indices=put(jnp.array([0], jnp.int32), P("data")),
+        seq_lens=put(jnp.array([1], jnp.int32), P("data")),
+        distribution=put(jnp.array([0, 1, 1], jnp.int32), P("data")),
+    )
+    common_args = (
+        put(jnp.ones((1, 1, 4), jnp.bfloat16), P("data", "tensor", None)),
+        put(jnp.ones((1, 1, 2), jnp.bfloat16), P("data", "tensor", None)),
+        put(jnp.arange(4, dtype=jnp.bfloat16).reshape(1, 4), P("data", None)),
+        put(jnp.arange(2, dtype=jnp.bfloat16).reshape(1, 2), P("data", None)),
+    )
+    topk = put(jnp.array([[0]], jnp.int32), P("data", None))
+
+    with jax.set_mesh(mesh):
+        flat = put(jnp.zeros((2, 4, 256), jnp.bfloat16), P("data", None, None))
+        packed = put(
+            jnp.zeros((2, 2, 2, 256), jnp.bfloat16),
+            P("data", None, None, None),
+        )
+        _, flat_out = backend._run_exact(*common_args, flat, topk, 1.0, "data", metadata)
+        _, packed_out = backend._run_exact(*common_args, packed, topk, 1.0, "data", metadata)
+
+    assert flat_out.shape == flat.shape
+    assert packed_out.shape == packed.shape
+    np.testing.assert_array_equal(np.asarray(flat_out), np.asarray(packed_out).reshape(flat.shape))
 
 
 def test_sparse_mla_multi_seq_packed_layout():

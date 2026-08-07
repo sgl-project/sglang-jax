@@ -558,6 +558,7 @@ class FusedEPMoEV2(FusedEPMoE):
         from sgl_jax.srt.kernels.fused_moe.v2.kernel import fused_ep_moe_v2
         from sgl_jax.srt.kernels.fused_moe.v2.tuned_block_configs import (
             get_tuned_fused_moe_v2_block_config,
+            should_interleave_fused_moe_v2_bt,
         )
 
         assert hidden_states.ndim == 2
@@ -605,6 +606,10 @@ class FusedEPMoEV2(FusedEPMoE):
             )
 
         direct_scaled_dot = w1_scale is not None
+        interleave_bt = should_interleave_fused_moe_v2_bt(
+            num_tokens=hidden_states.shape[0],
+            ep_size=self.ep_size,
+        )
         kernel_sharding = jax.sharding.NamedSharding(self.mesh, P(("data", "tensor"), None))
         hidden_states = jax.sharding.reshard(hidden_states, kernel_sharding)
         topk_weights = jax.sharding.reshard(topk_weights, kernel_sharding)
@@ -635,6 +640,7 @@ class FusedEPMoEV2(FusedEPMoE):
             w3_shared_scale=w3_shared_scale,
             enable_act_quant=enable_act_quant,
             direct_scaled_dot=direct_scaled_dot,
+            interleave_bt=interleave_bt,
             dp_axis_name="data",
             tp_axis_name="tensor",
         )

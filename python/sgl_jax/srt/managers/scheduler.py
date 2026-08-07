@@ -1530,6 +1530,13 @@ class Scheduler(
         error_msg = ""
 
         try:
+            if "engine_paused" in recv_req.state_data:
+                engine_paused = recv_req.state_data["engine_paused"]
+                if not isinstance(engine_paused, bool):
+                    raise ValueError("engine_paused must be a boolean")
+                self._engine_paused = engine_paused
+                logger.info("[SCHEDULER] Updated engine_paused to: %s", self._engine_paused)
+
             if "precision_tracer" in recv_req.state_data:
                 tracer_config = recv_req.state_data["precision_tracer"]
 

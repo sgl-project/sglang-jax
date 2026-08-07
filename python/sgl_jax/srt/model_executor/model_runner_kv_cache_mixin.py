@@ -306,8 +306,46 @@ class ModelRunnerKVCacheMixin:
             dtype_bits = dtype_size * 8
             kv_packing = 32 // dtype_bits
             aligned_ps = (self.page_size + kv_packing - 1) // kv_packing * kv_packing
-            per_token = kv_dim * aligned_ps * dtype_size // self.page_size
-            return per_token * num_layers
+            packed_bytes_per_token = kv_dim * aligned_ps * dtype_size // self.page_size
+
+            if self.server_args.attention_backend != "dsa_sparse":
+                return packed_bytes_per_token * num_layers
+
+            from sgl_jax.srt.kernels.dsa.ref import build_index_share_map
+
+            dense_layer_count = min(
+                getattr(cfg, "index_skip_topk_offset", 0),
+                num_layers,
+            )
+            dsa_layer_count = num_layers - dense_layer_count
+            exact_dsa = self.server_args.dsa_sparse_impl == "exact"
+            flat_bytes_per_token = kv_dim * dtype_size
+            dsa_bytes_per_token = flat_bytes_per_token if exact_dsa else packed_bytes_per_token
+
+            indexer_types = getattr(cfg, "indexer_types", None)
+            if indexer_types is not None:
+                indexer_types = indexer_types[:num_layers]
+            _, _, num_full_indexers = build_index_share_map(
+                indexer_types,
+                dense_layer_count,
+                num_layers,
+            )
+            indexer_dim = align128(cfg.index_head_dim)
+            indexer_packed_bytes_per_token = indexer_dim * aligned_ps * dtype_size // self.page_size
+            # The Indexer cache is owned by the DSA child whenever sparse
+            # layers exist; otherwise it stays with the packed MLA child.
+            indexer_uses_flat_layout = exact_dsa and dsa_layer_count > 0
+            indexer_bytes_per_token = (
+                indexer_dim * dtype_size
+                if indexer_uses_flat_layout
+                else indexer_packed_bytes_per_token
+            )
+
+            return (
+                packed_bytes_per_token * dense_layer_count
+                + dsa_bytes_per_token * dsa_layer_count
+                + indexer_bytes_per_token * num_full_indexers
+            )
 
         swa_num_kv_heads = getattr(self.model_config.hf_config, "swa_num_key_value_heads", None)
         if swa_num_kv_heads is not None:
@@ -625,9 +663,9 @@ class ModelRunnerKVCacheMixin:
     ):
         """Build dense-MLA and sparse-DSA layer pools behind one router.
 
-        Both children intentionally use ``MLATokenToKVPool`` today. Keeping
-        them as independent children makes the future DSA kernel layout a
-        local substitution without changing model or allocator interfaces.
+        Dense MLA keeps the packed 4D Pallas ABI. Exact DSA stores cache pages
+        natively as ``[num_pages, page_size, dim]`` so its scatter/gather path
+        does not copy every full cache layer through a physical 4D<->3D reshape.
         """
 
         from sgl_jax.srt.kernels.dsa.ref import build_index_share_map
@@ -679,6 +717,8 @@ class ModelRunnerKVCacheMixin:
         pools = {}
         for pool_name, layer_ids in layer_ids_by_pool.items():
             child_kwargs = dict(pool_kwargs)
+            if pool_name == "dsa" and self.server_args.dsa_sparse_impl == "exact":
+                child_kwargs["page_layout"] = "flat"
             if pool_name == indexer_pool_name:
                 child_kwargs.update(
                     indexer_key_dim=config.index_head_dim,
@@ -690,10 +730,10 @@ class ModelRunnerKVCacheMixin:
             )
 
         logger.info(
-            "DSA layerwise KV pool: MLA layers=%s, DSA layers=%s; "
-            "both currently use MLATokenToKVPool layout",
+            "DSA layerwise KV pool: MLA layers=%s, DSA layers=%s, DSA layout=%s",
             dense_layer_ids,
             dsa_layer_ids,
+            "flat" if self.server_args.dsa_sparse_impl == "exact" else "mla",
         )
         return LayerwiseHybridKVPool(
             pools=pools,

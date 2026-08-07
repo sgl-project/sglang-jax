@@ -9,10 +9,12 @@ cache-miss or partial results.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import random
 import statistics
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import requests
@@ -52,9 +54,7 @@ def _make_inputs(
     rng = random.Random(random_seed)
 
     def random_tokens(length: int) -> list[int]:
-        return [
-            rng.randrange(random_token_min, random_token_max) for _ in range(length)
-        ]
+        return [rng.randrange(random_token_min, random_token_max) for _ in range(length)]
 
     prefixes = []
     extended = []
@@ -139,10 +139,164 @@ def _run_native_batch(
             int(final_meta[i].get("cached_tokens", 0)) for i in range(len(input_ids))
         ],
         "completion_tokens": [
-            int(final_meta[i].get("completion_tokens", 0))
-            for i in range(len(input_ids))
+            int(final_meta[i].get("completion_tokens", 0)) for i in range(len(input_ids))
         ],
     }
+
+
+def _run_parallel_single_requests(
+    base_url: str,
+    input_ids: list[list[int]],
+    output_len: int,
+    *,
+    label: str,
+) -> dict:
+    """Submit one request per HTTP handler and combine their measurements."""
+    started = time.perf_counter()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(input_ids)) as executor:
+        futures = [
+            executor.submit(
+                _run_native_batch,
+                base_url,
+                [request_input_ids],
+                output_len,
+                label=f"{label}-{request_id}",
+            )
+            for request_id, request_input_ids in enumerate(input_ids)
+        ]
+        results = [future.result() for future in futures]
+
+    return {
+        "wall_s": time.perf_counter() - started,
+        "ttft_s": [result["ttft_s"][0] for result in results],
+        "decode_s": [result["decode_s"][0] for result in results],
+        "cached_tokens": [result["cached_tokens"][0] for result in results],
+        "completion_tokens": [result["completion_tokens"][0] for result in results],
+    }
+
+
+def _start_profile(
+    base_url: str,
+    output_dir: Path,
+    *,
+    host_tracer_level: int,
+    python_tracer_level: int,
+    num_steps: int | None = None,
+    profile_by_stage: bool = False,
+    profile_stages: list[str] | None = None,
+) -> None:
+    payload = {
+        "output_dir": str(output_dir),
+        "host_tracer_level": host_tracer_level,
+        "python_tracer_level": python_tracer_level,
+    }
+    if num_steps is not None:
+        payload["num_steps"] = num_steps
+    if profile_by_stage:
+        payload["profile_by_stage"] = True
+    if profile_stages is not None:
+        payload["profile_stages"] = profile_stages
+
+    response = requests.post(
+        f"{base_url}/start_profile",
+        json=payload,
+        timeout=(30, None),
+    )
+    response.raise_for_status()
+
+
+def _stop_profile(base_url: str) -> None:
+    status = requests.get(f"{base_url}/profile_status", timeout=60)
+    status.raise_for_status()
+    if status.json().get("status") == "idle":
+        return
+
+    response = requests.post(f"{base_url}/stop_profile", timeout=(30, None))
+    response.raise_for_status()
+    status = requests.get(f"{base_url}/profile_status", timeout=60)
+    status.raise_for_status()
+    if status.json().get("status") != "idle":
+        raise RuntimeError(f"profile did not stop cleanly: {status.text}")
+
+
+def _set_scheduler_paused(base_url: str, paused: bool) -> None:
+    """Pause only model scheduling while leaving HTTP admission active."""
+    response = requests.post(
+        f"{base_url}/set_internal_state",
+        json={
+            "request_id": "profile-admission-barrier",
+            "state_data": {"engine_paused": paused},
+        },
+        timeout=(30, None),
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not payload.get("success", False):
+        raise RuntimeError(f"could not update scheduler pause state: {payload}")
+
+
+def _run_native_batch_with_admission_barrier(
+    base_url: str,
+    input_ids: list[list[int]],
+    output_len: int,
+    *,
+    label: str,
+    on_admitted: Callable[[], None],
+    profile_settle_s: float = 5.0,
+    timeout_s: float = 180,
+) -> dict:
+    """Queue independent HTTP requests before releasing the scheduler.
+
+    A paused tokenizer handler does not expose the members of one native batch
+    to the scheduler until the handler has finished processing the whole batch.
+    Independent handlers let all C32 requests reach the waiting queue while the
+    scheduler is paused. Profiling is then armed before inference resumes.
+    """
+    _set_scheduler_paused(base_url, True)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            _run_parallel_single_requests,
+            base_url,
+            input_ids,
+            output_len,
+            label=label,
+        )
+        try:
+            deadline = time.monotonic() + timeout_s
+            while True:
+                if future.done():
+                    future.result()
+                    raise RuntimeError("native batch finished while generation was paused")
+                server_info = requests.get(f"{base_url}/get_server_info", timeout=60)
+                server_info.raise_for_status()
+                internal_states = server_info.json().get("internal_states", [])
+                waiting_sizes = [
+                    int(state.get("waiting_queue_size", -1)) for state in internal_states
+                ]
+                if waiting_sizes:
+                    expected_min = len(input_ids) // len(waiting_sizes)
+                    if sum(waiting_sizes) >= len(input_ids) and min(waiting_sizes) >= expected_min:
+                        break
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "native batch did not reach the DP scheduler waiting queues: "
+                        f"expected_total={len(input_ids)}, "
+                        f"expected_min_per_dp={len(input_ids) // len(waiting_sizes) if waiting_sizes else 'unknown'}, "
+                        f"observed={waiting_sizes}"
+                    )
+                time.sleep(0.5)
+
+            on_admitted()
+            # TPU device tracing is initialized asynchronously after the control
+            # request returns. Give it a bounded head start before the first
+            # measured forward is admitted, otherwise an otherwise successful
+            # manual profile can produce no XPlane files.
+            time.sleep(profile_settle_s)
+        finally:
+            _set_scheduler_paused(base_url, False)
+
+        return future.result()
 
 
 def main() -> None:
@@ -156,6 +310,42 @@ def main() -> None:
     parser.add_argument("--random-seed", type=int, default=3)
     parser.add_argument("--random-token-min", type=int, default=1000)
     parser.add_argument("--random-token-max", type=int, default=32000)
+    parser.add_argument(
+        "--variant",
+        default="exact_dsa_exact_lax_topk",
+        help="Label recorded in the output metrics for the serving variant.",
+    )
+    parser.add_argument(
+        "--profile-output-dir",
+        type=Path,
+        help="Profile only the measured cache-hit extend/decode request.",
+    )
+    parser.add_argument("--profile-host-tracer-level", type=int, default=0)
+    parser.add_argument("--profile-python-tracer-level", type=int, default=0)
+    parser.add_argument(
+        "--profile-num-steps",
+        type=int,
+        help="Number of forward steps to trace per selected stage.",
+    )
+    parser.add_argument(
+        "--profile-by-stage",
+        action="store_true",
+        help="Write separate traces for the selected prefill/decode stages.",
+    )
+    parser.add_argument(
+        "--profile-admission-barrier",
+        action="store_true",
+        help=(
+            "Pause an idle scheduler until the measured requests are fully "
+            "queued, then arm profiling and resume inference."
+        ),
+    )
+    parser.add_argument(
+        "--profile-stages",
+        nargs="+",
+        choices=("prefill", "decode"),
+        help="Stages to trace when --profile-by-stage is set.",
+    )
     parser.add_argument(
         "--prefix-mode",
         choices=("independent", "shared"),
@@ -177,9 +367,7 @@ def main() -> None:
     )
     if args.prefix_mode == "shared":
         if args.dp_size > args.concurrency:
-            raise ValueError(
-                "dp_size cannot exceed concurrency for shared-prefix warmup"
-            )
+            raise ValueError("dp_size cannot exceed concurrency for shared-prefix warmup")
         # With round-robin DP scheduling, one identical request per rank installs
         # the shared prefix on every rank. The measured C=2/DP batch can then hit
         # the same rank-local prefix without recomputing 32 independent prefixes.
@@ -190,9 +378,43 @@ def main() -> None:
     flush = requests.post(f"{base_url}/flush_cache", timeout=60)
     flush.raise_for_status()
     warm = _run_native_batch(base_url, warm_inputs, 1, label="warm-prefix")
-    measured = _run_native_batch(
-        base_url, extended, args.output_len, label="cache-hit-extend-decode"
-    )
+    profile_started = False
+
+    def start_profile() -> None:
+        nonlocal profile_started
+        assert args.profile_output_dir is not None
+        _start_profile(
+            base_url,
+            args.profile_output_dir,
+            host_tracer_level=args.profile_host_tracer_level,
+            python_tracer_level=args.profile_python_tracer_level,
+            num_steps=args.profile_num_steps,
+            profile_by_stage=args.profile_by_stage,
+            profile_stages=args.profile_stages,
+        )
+        profile_started = True
+
+    if args.profile_admission_barrier and args.profile_output_dir is None:
+        raise ValueError("--profile-admission-barrier requires --profile-output-dir")
+
+    try:
+        if args.profile_admission_barrier:
+            measured = _run_native_batch_with_admission_barrier(
+                base_url,
+                extended,
+                args.output_len,
+                label="cache-hit-extend-decode",
+                on_admitted=start_profile,
+            )
+        else:
+            if args.profile_output_dir is not None:
+                start_profile()
+            measured = _run_native_batch(
+                base_url, extended, args.output_len, label="cache-hit-extend-decode"
+            )
+    finally:
+        if profile_started:
+            _stop_profile(base_url)
 
     minimum_expected_hit = args.prefix_len - args.cache_hit_tolerance
     if min(measured["cached_tokens"]) < minimum_expected_hit:
@@ -201,15 +423,13 @@ def main() -> None:
             f"expected>={minimum_expected_hit}"
         )
     if measured["completion_tokens"] != [args.output_len] * args.concurrency:
-        raise RuntimeError(
-            f"completion invariant failed: {measured['completion_tokens']}"
-        )
+        raise RuntimeError(f"completion invariant failed: {measured['completion_tokens']}")
 
     ttft = measured["ttft_s"]
     decode = measured["decode_s"]
     tpots_ms = [value * 1000 / max(args.output_len - 1, 1) for value in decode]
     result = {
-        "variant": "exact_dsa_exact_lax_topk",
+        "variant": args.variant,
         "concurrency": args.concurrency,
         "dp_size": args.dp_size,
         "prefix_mode": args.prefix_mode,
@@ -220,6 +440,10 @@ def main() -> None:
         "random_seed": args.random_seed,
         "random_token_min": args.random_token_min,
         "random_token_max": args.random_token_max,
+        "profile_output_dir": (
+            str(args.profile_output_dir) if args.profile_output_dir is not None else None
+        ),
+        "profile_admission_barrier": args.profile_admission_barrier,
         "minimum_expected_cache_hit": minimum_expected_hit,
         "warm_wall_s": warm["wall_s"],
         "wall_s": measured["wall_s"],
@@ -230,9 +454,7 @@ def main() -> None:
         "decode_p50_s": statistics.median(decode),
         "tpot_p50_ms": statistics.median(tpots_ms),
         "tpot_p95_ms": _percentile(tpots_ms, 0.95),
-        "output_throughput_tok_s": args.concurrency
-        * args.output_len
-        / measured["wall_s"],
+        "output_throughput_tok_s": args.concurrency * args.output_len / measured["wall_s"],
         "cached_tokens_min": min(measured["cached_tokens"]),
         "cached_tokens_max": max(measured["cached_tokens"]),
         "cached_tokens": measured["cached_tokens"],

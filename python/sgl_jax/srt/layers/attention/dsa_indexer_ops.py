@@ -62,24 +62,28 @@ def update_index_cache_and_select(
     """
 
     dpa = attention_data_partition_axis
+    cache_spec = P(dpa, None, None) if index_cache.ndim == 3 else P(dpa, None, None, None)
     in_specs = (
         P(dpa, None, None),
         P(dpa, None),
         P(dpa, None),
-        P(dpa, None, None, None),
+        cache_spec,
         P(dpa),
         P(dpa),
         P(dpa),
         P(dpa),
         P(dpa),
     )
-    out_specs = (P(dpa, None, None, None), P(dpa, None))
+    out_specs = (cache_spec, P(dpa, None))
 
     def _run(q_, k_, w_, cache_, seq_lens_, pi_, cuq_, cukv_, dist_):
-        page_size = cache_.shape[1] * cache_.shape[2]
-        idx_dim = cache_.shape[3]
+        flat_page_layout = cache_.ndim == 3
+        page_size = cache_.shape[1] if flat_page_layout else cache_.shape[1] * cache_.shape[2]
+        idx_dim = cache_.shape[-1]
         pages_per_seq = pi_.shape[0] // seq_lens_.shape[0]
-        cache3d = cache_.reshape(cache_.shape[0], page_size, idx_dim)
+        cache3d = (
+            cache_ if flat_page_layout else cache_.reshape(cache_.shape[0], page_size, idx_dim)
+        )
         cache3d = scatter_paged_cache(
             cache3d,
             k_,
@@ -108,7 +112,8 @@ def update_index_cache_and_select(
             # Keep shard_map's output tree static.  The placeholder is discarded
             # immediately after the call and never reaches attention.
             topk = jnp.full((q_.shape[0], 1), -1, jnp.int32)
-        return cache3d.reshape(cache_.shape), topk
+        updated_cache = cache3d if flat_page_layout else cache3d.reshape(cache_.shape)
+        return updated_cache, topk
 
     index_cache, topk_indices = jax.shard_map(
         _run,

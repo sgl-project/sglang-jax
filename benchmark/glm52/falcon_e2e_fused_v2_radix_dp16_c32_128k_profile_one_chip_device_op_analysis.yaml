@@ -1,0 +1,387 @@
+schema_version: 1
+exp_id: exp-yhzh27or5d
+spec:
+  name: glm52-dp16-c32-device0-stage-op-inventory
+  command: /bin/sh "$FALCON_SCRIPT_PATH"
+  script_content: |
+    #!/usr/bin/env sh
+    set -eu
+    python3 - <<'PY'
+    import bisect
+    import json
+    import os
+    import re
+    import statistics
+    from collections import Counter, defaultdict
+    from pathlib import Path
+
+    root = Path(os.environ["ARTIFACT_LOCAL_DIR"])
+    out = Path(os.environ["RESULT_LOCAL_DIR"])
+    profile_root = (
+        "profiling/glm52-fused-v2-radix-dp16-c32-128k-one-chip-stage"
+    )
+    candidates = sorted(root.glob(
+        profile_root + "/*/plugins/profile/**/*.xplane.pb"
+    ))
+    if not candidates:
+        raise SystemExit("no stage XPlane files found")
+
+    def varint(buf, pos):
+        value = 0
+        shift = 0
+        while True:
+            byte = buf[pos]
+            pos += 1
+            value |= (byte & 0x7f) << shift
+            if not byte & 0x80:
+                return value, pos
+            shift += 7
+
+    def fields(buf):
+        pos = 0
+        size = len(buf)
+        while pos < size:
+            tag, pos = varint(buf, pos)
+            number = tag >> 3
+            wire = tag & 7
+            if wire == 0:
+                value, pos = varint(buf, pos)
+                yield number, wire, value
+            elif wire == 1:
+                yield number, wire, buf[pos:pos + 8]
+                pos += 8
+            elif wire == 2:
+                length, pos = varint(buf, pos)
+                value = buf[pos:pos + length]
+                pos += length
+                yield number, wire, value
+            elif wire == 5:
+                yield number, wire, buf[pos:pos + 4]
+                pos += 4
+            else:
+                raise ValueError(f"unsupported wire type {wire}")
+
+    def text(buf):
+        return bytes(buf).decode("utf-8", errors="replace")
+
+    def metadata_entry(buf):
+        key = None
+        value = None
+        for number, wire, item in fields(buf):
+            if number == 1 and wire == 0:
+                key = item
+            elif number == 2 and wire == 2:
+                value = item
+        name = ""
+        display = ""
+        if value is not None:
+            for number, wire, item in fields(value):
+                if number == 2 and wire == 2:
+                    name = text(item)
+                elif number == 4 and wire == 2:
+                    display = text(item)
+        return key, name, display
+
+    def event_header(buf):
+        metadata_id = 0
+        offset_ps = 0
+        duration_ps = 0
+        for number, wire, item in fields(buf):
+            if number == 1 and wire == 0:
+                metadata_id = item
+            elif number == 2 and wire == 0:
+                offset_ps = item
+            elif number == 3 and wire == 0:
+                duration_ps = item
+        return metadata_id, offset_ps, duration_ps
+
+    def category(combined):
+        low = combined.lower()
+        if any(value in combined for value in ("MLA-m-", "MLA-d-", "MLA-bd-")):
+            return "mla"
+        if "gmm-g_" in low or "gmm_g_" in low:
+            return "fused_moe_gmm"
+        if "quantized_matmul" in low:
+            return "quantized_matmul"
+        if any(value in low for value in (
+            "all-gather", "all_gather", "all-reduce", "all_reduce",
+            "all-to-all", "all_to_all", "collective-permute",
+            "collective_permute"
+        )):
+            return "collective"
+        if "top_k" in low or "top-k" in low or "sort" in low:
+            return "reduce_sort_topk"
+        if "dot" in low or "matmul" in low:
+            return "other_dot_matmul"
+        if "custom-call" in low or "custom_call" in low:
+            return "other_custom_call"
+        if "fusion" in low:
+            return "fusion"
+        if "copy" in low or "slice" in low or "dynamic-update" in low:
+            return "copy_slice"
+        if "transpose" in low or "reshape" in low or "broadcast" in low:
+            return "layout_shape"
+        if "reduce" in low:
+            return "other_reduce"
+        return "other_hlo"
+
+    def normalized(name, display):
+        combined = " ".join(value for value in (display, name) if value).strip()
+        if "MLA-m-" in combined:
+            return "MLA-m-*"
+        if "MLA-bd-" in combined:
+            return "MLA-bd-*"
+        if "MLA-d-" in combined:
+            return "MLA-d-*"
+        value = display or name or "<unnamed>"
+        value = re.sub(r"\.\d+(?=\b|$)", ".#", value)
+        value = re.sub(r"\b\d{3,}\b", "#", value)
+        value = re.sub(r"\s+", " ", value)
+        return value[:240]
+
+    def percentile(values, fraction):
+        ordered = sorted(values)
+        if not ordered:
+            return 0.0
+        index = round((len(ordered) - 1) * fraction)
+        return ordered[index]
+
+    result = {
+        "method": (
+            "direct XPlane protobuf walk; XLA Modules bind XLA Ops by "
+            "timestamp; durations are summed per jitted model module"
+        ),
+        "profile_root": profile_root,
+        "files": [],
+    }
+    for path in candidates:
+        stage = "prefill" if "prefill" in path.parts else "decode"
+        data = memoryview(path.read_bytes())
+        file_row = {
+            "stage": stage,
+            "path": str(path.relative_to(root)),
+            "size_bytes": path.stat().st_size,
+            "devices": [],
+        }
+        for number, wire, plane_buf in fields(data):
+            if number != 1 or wire != 2:
+                continue
+            plane_name = ""
+            metadata = {}
+            lines = []
+            for pnumber, pwire, pitem in fields(plane_buf):
+                if pnumber == 2 and pwire == 2:
+                    plane_name = text(pitem)
+                elif pnumber == 3 and pwire == 2:
+                    lines.append(pitem)
+                elif pnumber == 4 and pwire == 2:
+                    key, name, display = metadata_entry(pitem)
+                    if key is not None:
+                        metadata[key] = (name, display)
+            if plane_name != "/device:TPU:0":
+                continue
+
+            line_data = {}
+            for line_buf in lines:
+                line_name = ""
+                timestamp_ps = 0
+                event_bufs = []
+                for lnumber, lwire, litem in fields(line_buf):
+                    if lnumber == 2 and lwire == 2:
+                        line_name = text(litem)
+                    elif lnumber == 3 and lwire == 0:
+                        timestamp_ps = litem * 1000
+                    elif lnumber == 4 and lwire == 2:
+                        event_bufs.append(litem)
+                if line_name in ("XLA Modules", "XLA Ops"):
+                    line_data[line_name] = (timestamp_ps, event_bufs)
+            if "XLA Modules" not in line_data or "XLA Ops" not in line_data:
+                continue
+
+            module_ts, module_bufs = line_data["XLA Modules"]
+            modules = []
+            for module_buf in module_bufs:
+                metadata_id, offset_ps, duration_ps = event_header(module_buf)
+                name, display = metadata.get(
+                    metadata_id, (f"metadata:{metadata_id}", "")
+                )
+                combined = " ".join(value for value in (name, display) if value)
+                if "jit_jitted_run_model(" not in combined:
+                    continue
+                modules.append({
+                    "name": display or name,
+                    "start_ps": module_ts + offset_ps,
+                    "duration_ps": duration_ps,
+                    "ops": Counter(),
+                    "categories": Counter(),
+                    "samples": defaultdict(Counter),
+                })
+            modules.sort(key=lambda row: row["start_ps"])
+            starts = [row["start_ps"] for row in modules]
+
+            ops_ts, op_bufs = line_data["XLA Ops"]
+            for op_buf in op_bufs:
+                metadata_id, offset_ps, duration_ps = event_header(op_buf)
+                start_ps = ops_ts + offset_ps
+                index = bisect.bisect_right(starts, start_ps) - 1
+                if index < 0:
+                    continue
+                module = modules[index]
+                module_end_ps = module["start_ps"] + module["duration_ps"]
+                if start_ps >= module_end_ps:
+                    continue
+                clipped_ps = min(start_ps + duration_ps, module_end_ps) - start_ps
+                if clipped_ps <= 0:
+                    continue
+                name, display = metadata.get(
+                    metadata_id, (f"metadata:{metadata_id}", "")
+                )
+                combined = " ".join(value for value in (name, display) if value)
+                norm = normalized(name, display)
+                module["ops"][norm] += clipped_ps
+                module["categories"][category(combined)] += clipped_ps
+                module["samples"][norm][combined[:500]] += clipped_ps
+
+            rows = []
+            for module in modules:
+                rows.append({
+                    "module_wall_ms": module["duration_ps"] / 1e9,
+                    "ops_ms": {
+                        name: duration / 1e9
+                        for name, duration in module["ops"].items()
+                    },
+                    "categories_ms": {
+                        name: duration / 1e9
+                        for name, duration in module["categories"].items()
+                    },
+                    "samples": {
+                        name: values.most_common(3)
+                        for name, values in module["samples"].items()
+                    },
+                })
+            file_row["devices"].append({
+                "device": plane_name,
+                "modules": rows,
+            })
+        result["files"].append(file_row)
+        del data
+
+    summaries = []
+    for file_row in result["files"]:
+        for device_row in file_row["devices"]:
+            rows = device_row["modules"]
+            if not rows:
+                continue
+            op_names = sorted({name for row in rows for name in row["ops_ms"]})
+            category_names = sorted({
+                name for row in rows for name in row["categories_ms"]
+            })
+            raw_samples = defaultdict(Counter)
+            for row in rows:
+                for name, values in row["samples"].items():
+                    for raw, duration_ps in values:
+                        raw_samples[name][raw] += duration_ps
+            top_ops = []
+            for name in op_names:
+                values = [row["ops_ms"].get(name, 0.0) for row in rows]
+                top_ops.append({
+                    "name": name,
+                    "median_ms_per_step": statistics.median(values),
+                    "mean_ms_per_step": statistics.mean(values),
+                    "p90_ms_per_step": percentile(values, 0.9),
+                    "nonzero_steps": sum(value > 0 for value in values),
+                    "steps": len(values),
+                    "raw_samples": [
+                        sample for sample, _ in raw_samples[name].most_common(3)
+                    ],
+                })
+            top_ops.sort(key=lambda row: row["mean_ms_per_step"], reverse=True)
+            categories = []
+            for name in category_names:
+                values = [
+                    row["categories_ms"].get(name, 0.0) for row in rows
+                ]
+                categories.append({
+                    "name": name,
+                    "median_ms_per_step": statistics.median(values),
+                    "mean_ms_per_step": statistics.mean(values),
+                    "p90_ms_per_step": percentile(values, 0.9),
+                })
+            categories.sort(
+                key=lambda row: row["mean_ms_per_step"], reverse=True
+            )
+            summaries.append({
+                "stage": file_row["stage"],
+                "device": device_row["device"],
+                "steps": len(rows),
+                "module_wall_median_ms": statistics.median(
+                    row["module_wall_ms"] for row in rows
+                ),
+                "module_wall_mean_ms": statistics.mean(
+                    row["module_wall_ms"] for row in rows
+                ),
+                "module_wall_p90_ms": percentile(
+                    [row["module_wall_ms"] for row in rows], 0.9
+                ),
+                "categories": categories,
+                "top_ops": top_ops[:120],
+            })
+    result["summaries"] = summaries
+    if not summaries:
+        raise SystemExit("no jitted model modules found in TPU planes")
+    (out / "device_op_inventory.json").write_text(json.dumps(result, indent=2))
+
+    with (out / "report.md").open("w") as report:
+        report.write("# GLM-5.2 stage device-op inventory\n\n")
+        report.write(result["method"] + ".\n\n")
+        for summary in summaries:
+            report.write(
+                f"## {summary['stage']} — {summary['device']} "
+                f"({summary['steps']} steps)\n\n"
+            )
+            report.write(
+                "module wall median/mean/p90: "
+                f"{summary['module_wall_median_ms']:.3f} / "
+                f"{summary['module_wall_mean_ms']:.3f} / "
+                f"{summary['module_wall_p90_ms']:.3f} ms\n\n"
+            )
+            report.write("### Categories\n\n")
+            report.write(
+                "| category | median ms/step | mean ms/step | p90 ms/step |\n"
+                "|---|---:|---:|---:|\n"
+            )
+            for row in summary["categories"]:
+                report.write(
+                    f"| {row['name']} | {row['median_ms_per_step']:.3f} | "
+                    f"{row['mean_ms_per_step']:.3f} | "
+                    f"{row['p90_ms_per_step']:.3f} |\n"
+                )
+            report.write("\n### Top normalized XLA ops\n\n")
+            report.write(
+                "| op | median ms/step | mean ms/step | p90 ms/step | seen |\n"
+                "|---|---:|---:|---:|---:|\n"
+            )
+            for row in summary["top_ops"][:50]:
+                report.write(
+                    f"| `{row['name']}` | {row['median_ms_per_step']:.3f} | "
+                    f"{row['mean_ms_per_step']:.3f} | "
+                    f"{row['p90_ms_per_step']:.3f} | "
+                    f"{row['nonzero_steps']}/{row['steps']} |\n"
+                )
+            report.write("\n")
+        report.write(
+            "Durations are XLA-op device intervals grouped by normalized name. "
+            "Category sums are descriptive and may include compiler-scheduled overlap.\n"
+        )
+    PY
+  outputs:
+    - path: report.md
+      type: markdown
+      required: true
+      description: per-stage and per-device model-step operator timing inventory
+    - path: device_op_inventory.json
+      type: json
+      required: true
+      description: structured module, category, and normalized XLA-op durations
+  resources:
+    memory_limit: 32Gi
