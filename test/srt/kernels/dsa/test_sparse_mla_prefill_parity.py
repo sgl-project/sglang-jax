@@ -495,8 +495,15 @@ def _seq_slice(c, i):
 
 
 def test_ragged_parity_varlen():
-    """Ragged multi-request prefill vs masked-softmax oracle (varying seq_lens)."""
-    o, _, c = _run_ragged([384, 200, 512, 129], K=4, seed=1)
+    """Ragged multi-request prefill vs masked-softmax oracle (varying seq_lens).
+
+    Lengths span the boundary corners as well as multi-page requests:
+    ``1`` = a decode step packed as a single-query extend (MIXED mode) — the
+    minimal per-request block, exercising the base-offset / causal-bound math;
+    ``128`` = exactly one full page (== page_size), no partial remainder; plus
+    partial (200, 129) and multi-page-exact (384, 512) requests.
+    """
+    o, _, c = _run_ragged([384, 200, 512, 129, 1, 128], K=4, seed=1)
     ref = _ragged_reference(c)
     real = c["real"]
     err = np.abs(o[real] - ref[real])
@@ -631,6 +638,30 @@ def test_gate_G4_dense_equals_sparse_superset():
     assert d < 2e-3, f"G4: full-selection sparse != dense: {d}"
 
 
+def test_gate_G6_metadata_invariants():
+    """G6: the host-side packing-metadata contract the kernel relies on holds for
+    every batch shape — ``cu_q_lens`` covers all packed tokens (== ``len(loc)`` ==
+    num_seqs*S_pad), the flat page table has exactly ``num_seqs*pages_per_seq``
+    slots, and every seq-local top-k page id is in ``[-1, pages_per_seq)``. These
+    are asserted fail-fast inside ``_assemble`` (so G0–G5/A1/A2 already exercise
+    them); this is the standalone, CI-collected gate so the advertised G0–G6 list
+    matches what actually runs."""
+    for shape in ([512], [384, 200, 512, 129, 1, 128], [300, 128, 400]):
+        c = _make_ragged_batch(shape, K=4, seed=13)
+        loc = np.asarray(c["loc"])
+        cu_q = np.asarray(c["cu_q_lens"])
+        pidx = np.asarray(c["page_indices"])
+        tp = np.asarray(c["topk_pages"])
+        num_seqs = len(shape)
+        pps = c["pages_per_seq"]
+        assert (
+            cu_q[-1] == loc.shape[0] == num_seqs * c["S_pad"]
+        ), f"G6 cu_q_lens/total mismatch: seqs={shape}"
+        assert pidx.shape[0] == num_seqs * pps, f"G6 page-table width mismatch: seqs={shape}"
+        assert ((tp >= -1) & (tp < pps)).all(), f"G6 topk page id out of [-1,{pps}): seqs={shape}"
+        print(f"[G6 metadata] ok  seqs={shape}  pps={pps}  ptw={pidx.shape[0]}")
+
+
 def test_gate_A1_prefix_equivalence():
     """A1 (radix/prefix caching): a prompt prefilled single-shot must produce the
     same suffix outputs as prefilling it as [cached prefix] + [extend suffix].
@@ -754,6 +785,7 @@ if __name__ == "__main__":
     test_gate_G2_cross_seq_no_bleed()
     test_gate_G3_permutation_invariance()
     test_gate_G4_dense_equals_sparse_superset()
+    test_gate_G6_metadata_invariants()
     test_gate_A1_prefix_equivalence()
     test_gate_A2_chunked_equivalence()
     print("PARITY OK")

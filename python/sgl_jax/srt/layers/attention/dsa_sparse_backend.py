@@ -57,9 +57,12 @@ _INDEXER_KERNEL_KV_PAGES_PER_BLOCK = 64
 # (``sparse_mla_prefill.sparse_mla_attention``) at page granularity instead of the
 # dense fallback. Default OFF ⇒ prefill behaviour is unchanged. Page-level
 # selection (read_block == page_size) consumes the indexer's page-topk directly.
-# Scope: packed-ragged extend — supports batching (max_running>1) via the same
-# ragged metadata the dense path uses. Radix/prefix caching and chunked prefill are
-# still gated off in model_runner (follow-ups A1/A2).
+# Scope: packed-ragged extend — supports the full serving surface via the same
+# ragged metadata the dense path uses: multi-request batching (max_running>1),
+# radix/prefix caching (a cache hit is an extend with a non-zero prefix), and
+# chunked prefill (each chunk is an extend over the growing prefix). All three
+# reduce to the same per-query-token kernel contract and are validated by the
+# A1/A2 parity gates in test/srt/kernels/dsa/test_sparse_mla_prefill_parity.py.
 _PREFILL_SPARSE = int(os.environ.get("DSA_PREFILL_SPARSE", "0"))
 
 
