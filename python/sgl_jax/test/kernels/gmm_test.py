@@ -332,6 +332,7 @@ class GmmTest(jtu.JaxTestCase):
         num_groups=[16, 32],
         weight_dtype=[jnp.int8, jnp.float8_e4m3fn],
         group_offset=[0, 2, 3],
+        block_size=[128, None],
     )
     def test_gmm_v2_activation_weight_quantized(
         self,
@@ -341,9 +342,12 @@ class GmmTest(jtu.JaxTestCase):
         num_groups,
         weight_dtype,
         group_offset,
+        block_size,
     ):
-        # TODO(kyuyeunk, wenxindong): Add subchannel quantization on gmm_v2.
-        block_size = in_size
+        # block_size=None -> per-channel; block_size=128 -> sub-channel
+        # (W8A8 + block-wise rhs_scale, e.g. DeepSeek/GLM static FP8 ckpts).
+        if block_size is None:
+            block_size = in_size
         num_local_groups = num_groups - group_offset
         key = jax.random.key(0)
 
@@ -371,7 +375,12 @@ class GmmTest(jtu.JaxTestCase):
             maybe_quantize_lhs=True,
         ).astype(lhs.dtype)
 
-        self.assertArraysAllClose(actual, expected, atol=1.1, rtol=1.1)
+        # Sub-channel accumulates per-K-block partials in bf16 with a rescale
+        # between blocks, which reorders roundings vs the f32 reference; the
+        # per-channel tolerance leaves single-element margin violations
+        # (~1e-5 of elements) on v7x, so allow slightly more slack there.
+        tol = 1.5 if block_size < in_size else 1.1
+        self.assertArraysAllClose(actual, expected, atol=tol, rtol=tol)
 
 
 if __name__ == "__main__":

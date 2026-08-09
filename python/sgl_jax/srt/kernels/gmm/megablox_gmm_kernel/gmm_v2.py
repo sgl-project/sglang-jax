@@ -239,7 +239,8 @@ def inner_kernel(
                         tiled_rhs[start_k:end_k, :],
                         preferred_element_type=jnp.float32,
                     ).astype(acc_ref.dtype)
-                    acc += block_acc * tiled_rhs_ref.scale[blk_i, 0, :].astype(acc_ref.dtype)
+                    # Keep the scale slice 2D [1, tile_n] for strict rank promotion.
+                    acc += block_acc * tiled_rhs_ref.scale[blk_i, 0:1, :].astype(acc_ref.dtype)
             else:
                 # Unquantized matmul path.
                 acc = jnp.matmul(
@@ -299,7 +300,16 @@ def inner_kernel(
                         preferred_element_type=preferred_element_type,
                     ).astype(acc_ref.dtype)
 
-                    acc_n += block_acc * block_scale.astype(acc_ref.dtype)
+                    block_acc = block_acc * block_scale.astype(acc_ref.dtype)
+                    if is_block_rhs_scale:
+                        # W8A8 block-wise rhs_scale: q_block_size == rhs_block
+                        # (enforced in make_gmm_configs), so this K block maps
+                        # 1:1 onto rhs scale row start_k // rhs_block. Keep the
+                        # slice 2D [1, col] for strict rank promotion.
+                        block_acc = block_acc * tiled_rhs_ref.scale[
+                            start_k // rhs_block, 0:1, start_n:end_n
+                        ].astype(acc_ref.dtype)
+                    acc_n += block_acc
 
                 acc_list.append(acc_n)
             acc = jnp.concatenate(acc_list, axis=1)
@@ -845,19 +855,20 @@ def make_gmm_configs(
             if tpu_info.int8_ops_per_second > 0:
                 lhs_q_dtype = jnp.int8.dtype
 
-    if lhs_q_dtype is not None and rhs_scale is not None and rhs_scale.shape[1] > 1:
-        raise NotImplementedError(
-            "gmm_v2 block-wise rhs_scale + lhs activation quant not yet supported; "
-            "pass maybe_quantize_lhs=False for W8A16."
-        )
+    # Default lhs quantization block: input quantization involves reading all
+    # elements in a block to compute the scale value. Since this operation is
+    # very memory intensive, we use a block size that is small enough to
+    # minimize memory overhead but large enough to minimize compute overhead.
+    lhs_quant_block_size = 512
+    if lhs_q_dtype is not None and block_size is not None and block_size < dims.size_k:
+        # W8A8 + block-wise rhs_scale: each K block's partial product must be
+        # rescaled by its own rhs scale before accumulation, so the lhs quant
+        # granularity must match the rhs block grid exactly.
+        lhs_quant_block_size = block_size
 
     lhs_cfgs = InputConfigs(
         quant_dtype=lhs_q_dtype,
-        # Input quantization involves reading all elements in a block to compute
-        # scale value. Since this operation is very memory intensive, we use a
-        # block size that is small enough to minimize memory overhead but large
-        # enough to minimize compute overhead of quantization.
-        quant_block_size=512,
+        quant_block_size=lhs_quant_block_size,
     )
 
     if out_dtype is None:
@@ -1071,11 +1082,8 @@ def is_supported_by_gmm_v2(
 ) -> bool:
     if rhs_scale is None:
         return True
-    if rhs_scale.ndim != 4:
-        return False
-    if rhs_scale.shape[1] == 1:
-        return True
-    # Block-wise rhs_scale (k_blocks > 1) is only implemented for the W8A16
-    # path (no lhs activation quant). Route W8A8 + block-scale to gmm_v1,
-    # which supports it via pre-quantized lhs in the backend.
-    return not maybe_quantize_lhs
+    # Per-channel (k_blocks == 1) and block-wise (k_blocks > 1) rhs_scale are
+    # both supported, with and without lhs activation quant. The W8A8 +
+    # block-scale path rescales each K block's partial product by its own rhs
+    # scale inside the quantized matmul loop.
+    return rhs_scale.ndim == 4

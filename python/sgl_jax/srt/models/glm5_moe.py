@@ -1307,9 +1307,14 @@ class Glm5ForCausalLM(nnx.Module):
                     # and replicated on the block dims (matches deepseek_v3); the
                     # loader's _maybe_convert_epmoe_scale_for_kernel handles the
                     # [E, out_blocks, k_blocks] → [E, k_blocks, 1, n_out] expand.
+                    # The expert-dim spec must follow the weight mapping's:
+                    # epmoe loads on the ("expert","tensor") moe_mesh, but
+                    # fused/fused_v2 run shard_map on the main mesh with
+                    # P(("data","tensor")) — a hardcoded "expert" here makes
+                    # shard_map reject the scale under fused_v2 static FP8.
                     new_moe_mappings[scale_key] = WeightMapping(
                         target_path=[target_scale_param] + scale_src_paths,
-                        sharding=("expert", None, None),
+                        sharding=(mapping.sharding[0], None, None),
                         transpose=False,
                         concat_axis=mapping.concat_axis,
                         physical_to_logical_map=mapping.physical_to_logical_map,
