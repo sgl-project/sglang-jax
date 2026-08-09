@@ -54,11 +54,6 @@ def test_recurrent_admission_cap_already_aligned_unchanged():
     assert cap == 8
 
 
-# ---------------------------------------------------------------------------
-# _compute_cell_size must budget the DSA indexer key cache
-# ---------------------------------------------------------------------------
-
-
 class _CellSizeRunner(ModelRunnerKVCacheMixin):
     """Minimal stand-in exposing only what _compute_cell_size reads."""
 
@@ -89,11 +84,30 @@ class _CellSizeRunner(ModelRunnerKVCacheMixin):
         return self._num_layers
 
 
-# align128(512) + align128(64) = 640 dims; 640 * 128 * 2 // 128 = 1280 B/layer.
-_MLA_BYTES_PER_TOKEN = 1280 * 78
-# The indexer cache uses the same layout with kv_dim = align128(128) = 128,
-# i.e. 256 B/layer over the 21 "full" layers.
-_INDEXER_BYTES_PER_TOKEN = 256 * 21
+def _allocated_bytes_per_token(kv_dim, page_size=128):
+    """Per-token bytes the POOL would allocate for a buffer of this width.
+
+    Derived from `get_kv_cache_shape` — the function `_create_buffers` actually
+    allocates with — rather than from hand arithmetic. The budget open-codes the
+    formula, so this keeps the test pinning budget-against-allocation instead of
+    budget-against-a-comment; if the alignment or packing rule ever changes, the
+    allocation moves and these assertions move with it.
+    """
+    import jax.numpy as jnp
+
+    from sgl_jax.srt.kernels.mla.v2.kernel import get_kv_cache_shape
+
+    pages, rows, packing, dim = get_kv_cache_shape(
+        total_num_pages=1, page_size=page_size, kv_dim=kv_dim, kv_dtype=jnp.bfloat16
+    )
+    per_page = pages * rows * packing * dim * jnp.dtype(jnp.bfloat16).itemsize
+    return per_page // page_size
+
+
+# GLM-5.2: latent width align128(512) + align128(64) = 640, over 78 layers.
+_MLA_BYTES_PER_TOKEN = _allocated_bytes_per_token(640) * 78
+# Indexer keys: align128(128) = 128, over the 21 "full" layers.
+_INDEXER_BYTES_PER_TOKEN = _allocated_bytes_per_token(128) * 21
 
 
 def test_cell_size_excludes_indexer_for_non_dsa_mla():
@@ -112,14 +126,11 @@ def test_cell_size_includes_dsa_indexer_cache():
     assert cell > _MLA_BYTES_PER_TOKEN
 
 
-def test_dsa_indexer_params_match_index_share_map():
-    """The helper must agree with the map the pool itself is built from."""
-    from sgl_jax.srt.kernels.dsa.ref import build_index_share_map
+def test_dsa_indexer_params_report_the_full_layer_count():
+    """21 of GLM-5.2's 78 layers are "full" and each gets an indexer buffer.
 
-    runner = _CellSizeRunner("dsa_sparse")
-    cfg = runner.model_config.hf_text_config
-    _, _, num_full = build_index_share_map(
-        cfg.indexer_types, cfg.index_skip_topk_offset, cfg.num_hidden_layers
-    )
-    assert runner._dsa_indexer_cache_params() == (cfg.index_head_dim, num_full)
+    Asserted against the concrete expected count rather than against a second
+    call to `build_index_share_map`, which no plausible implementation could fail.
+    """
+    assert _CellSizeRunner("dsa_sparse")._dsa_indexer_cache_params() == (128, 21)
     assert _CellSizeRunner("fa")._dsa_indexer_cache_params() == (0, 0)

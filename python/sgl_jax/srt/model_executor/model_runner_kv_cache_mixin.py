@@ -291,15 +291,11 @@ def _build_non_hybrid_memory_pools(token_to_kv_pool) -> MemoryPools:
 class ModelRunnerKVCacheMixin:
 
     def _dsa_indexer_cache_params(self: ModelRunner) -> tuple[int, int]:
-        """``(indexer_key_dim, num_indexer_layers)`` for the DSA indexer key cache.
+        """``(indexer_key_dim, num_indexer_layers)``, or ``(0, 0)`` when no DSA
+        indexer key cache is allocated.
 
-        Returns ``(0, 0)`` when no indexer cache is allocated.
-
-        Single source of truth for the two places that must agree: the memory
-        *budget* (:meth:`_compute_cell_size`) and the actual *allocation*
-        (``MLATokenToKVPool._create_buffers``). They previously derived this
-        independently — in practice only the allocation side did — so the
-        profiler sized the KV pool as though the indexer buffer did not exist.
+        Shared by the KV pool's memory budget (:meth:`_compute_cell_size`) and its
+        allocation (``MLATokenToKVPool._create_buffers``), which must agree.
         """
         if self.server_args.attention_backend != "dsa_sparse":
             return 0, 0
@@ -335,13 +331,18 @@ class ModelRunnerKVCacheMixin:
             per_token = kv_dim * aligned_ps * dtype_size // self.page_size
             cell_size = per_token * num_layers
 
-            # DSA allocates a SECOND paged buffer, for indexer keys, one slot per
-            # "full" layer (`MLATokenToKVPool._create_buffers`). It is laid out by
-            # the same `get_kv_cache_shape`, so it costs the same per token with
-            # `kv_dim` replaced by the aligned indexer key dim. Omitting it made
-            # the profiler over-provision the pool, and the excess came out of the
-            # (1 - mem_fraction) activation reserve rather than out of KV — the
-            # resource that actually binds at long context.
+            # DSA allocates a second paged buffer for indexer keys, one slot per
+            # "full" layer. It uses the same `get_kv_cache_shape` layout, so it
+            # costs the same per token with `kv_dim` replaced by the aligned
+            # indexer key dim.
+            # Note the two terms use different layer counts, deliberately: they
+            # mirror two different allocations. The latent buffer exists per
+            # KV-pool layer (`_kv_pool_layer_count`, which drops non-attention
+            # layers on hybrid-recurrent models); the indexer buffer exists per
+            # "full" layer, counted over the whole model by the same
+            # `build_index_share_map` the pool is constructed from. Budget
+            # matching allocation is the invariant here, not the two counts
+            # matching each other.
             indexer_key_dim, num_indexer_layers = self._dsa_indexer_cache_params()
             if indexer_key_dim > 0 and num_indexer_layers > 0:
                 indexer_per_token = (
@@ -725,8 +726,6 @@ class ModelRunnerKVCacheMixin:
                     f"kv_lora_rank={kv_lora_rank}, qk_rope_head_dim={qk_rope_head_dim}."
                 )
 
-            # Same helper the cell-size budget uses, so the pool can never
-            # allocate a buffer the profiler did not account for.
             dsa_kwargs = {}
             indexer_key_dim, num_indexer_layers = self._dsa_indexer_cache_params()
             if indexer_key_dim > 0:
