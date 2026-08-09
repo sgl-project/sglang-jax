@@ -319,6 +319,16 @@ def sparse_mla_attention(
         # packed page table: one flat physical-page list; each request's window
         # starts at cu_kv_lens[rid]//ps (the per-query ``base``). Per-query causal
         # bound is seq_lens[rid]. Both are resolved per token below.
+        #
+        # SMEM footprint: the whole flat table (PTW = sum of pages_per_seq over the
+        # packed batch) lives resident in SMEM via ``pt_spec`` at 4*PTW bytes. The
+        # block index map is constant in ``s`` (and ragged is B=1), so it is copied
+        # in once, not re-DMA'd per grid step. PTW is bounded by what fits in HBM:
+        # each page costs page_size*Dk_pad*2 HBM bytes vs 4 SMEM bytes (~1e4x), so
+        # any batch whose KV fits in HBM keeps this block in the low-KB range (~8KB
+        # at ctx 8k / page 128 / max_running 32). Reaching ~1MB here (~270k pages,
+        # e.g. 128k ctx / page 64 / max_running 128) implies ~20GB of resident KV,
+        # i.e. an HBM OOM would hit first.
         PTW = page_indices.shape[0]
         pt_arg = page_indices.reshape(1, 1, 1, PTW).astype(jnp.int32)
         qsid = jnp.clip(q_seq_id, 0, seq_lens.shape[0] - 1).astype(jnp.int32)
