@@ -94,20 +94,21 @@ def update_index_cache_and_select(
         )
 
         if compute_topk:
-            topk = score_and_select_index_tokens(
-                q_,
-                w_,
-                cache3d,
-                seq_lens_,
-                pi_,
-                cuq_,
-                cukv_,
-                dist_,
-                k=index_topk,
-                pages_per_seq=pages_per_seq,
-                one_token_per_seq=one_token_per_seq,
-                topk_impl=topk_impl,
-            )
+            with jax.named_scope("topk"):
+                topk = score_and_select_index_tokens(
+                    q_,
+                    w_,
+                    cache3d,
+                    seq_lens_,
+                    pi_,
+                    cuq_,
+                    cukv_,
+                    dist_,
+                    k=index_topk,
+                    pages_per_seq=pages_per_seq,
+                    one_token_per_seq=one_token_per_seq,
+                    topk_impl=topk_impl,
+                )
         else:
             # Keep shard_map's output tree static.  The placeholder is discarded
             # immediately after the call and never reaches attention.

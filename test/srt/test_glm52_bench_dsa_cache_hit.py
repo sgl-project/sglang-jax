@@ -49,23 +49,25 @@ def test_profile_wraps_only_the_measured_phase_api() -> None:
     idle_response = mock.Mock()
     idle_response.json.return_value = {"status": "idle"}
 
-    with mock.patch.object(
-        BENCHMARK.requests,
-        "post",
-        side_effect=(start_response, stop_response),
-    ) as post:
-        with mock.patch.object(
+    with (
+        mock.patch.object(
+            BENCHMARK.requests,
+            "post",
+            side_effect=(start_response, stop_response),
+        ) as post,
+        mock.patch.object(
             BENCHMARK.requests,
             "get",
             side_effect=(running_response, idle_response),
-        ):
-            BENCHMARK._start_profile(
-                "http://server",
-                Path("/tmp/profile"),
-                host_tracer_level=0,
-                python_tracer_level=0,
-            )
-            BENCHMARK._stop_profile("http://server")
+        ) as get,
+    ):
+        BENCHMARK._start_profile(
+            "http://server",
+            Path("/tmp/profile"),
+            host_tracer_level=0,
+            python_tracer_level=0,
+        )
+        BENCHMARK._stop_profile("http://server")
 
     assert post.call_args_list[0].args == ("http://server/start_profile",)
     assert post.call_args_list[0].kwargs["json"] == {
@@ -74,6 +76,10 @@ def test_profile_wraps_only_the_measured_phase_api() -> None:
         "python_tracer_level": 0,
     }
     assert post.call_args_list[1].args == ("http://server/stop_profile",)
+    assert [call.kwargs["timeout"] for call in get.call_args_list] == [
+        BENCHMARK.PROFILE_CONTROL_TIMEOUT_S,
+        BENCHMARK.PROFILE_CONTROL_TIMEOUT_S,
+    ]
     start_response.raise_for_status.assert_called_once_with()
     stop_response.raise_for_status.assert_called_once_with()
     running_response.raise_for_status.assert_called_once_with()
@@ -108,11 +114,14 @@ def test_stop_profile_is_a_noop_after_stage_profile_auto_completes() -> None:
     idle_response = mock.Mock()
     idle_response.json.return_value = {"status": "idle"}
 
-    with mock.patch.object(BENCHMARK.requests, "get", return_value=idle_response):
-        with mock.patch.object(BENCHMARK.requests, "post") as post:
-            BENCHMARK._stop_profile("http://server")
+    with (
+        mock.patch.object(BENCHMARK.requests, "get", return_value=idle_response) as get,
+        mock.patch.object(BENCHMARK.requests, "post") as post,
+    ):
+        BENCHMARK._stop_profile("http://server")
 
     post.assert_not_called()
+    assert get.call_args.kwargs["timeout"] == BENCHMARK.PROFILE_CONTROL_TIMEOUT_S
     idle_response.raise_for_status.assert_called_once_with()
 
 
@@ -122,6 +131,11 @@ def test_parallel_single_requests_preserve_result_order() -> None:
         return {
             "wall_s": float(request_id),
             "ttft_s": [request_id + 0.1],
+            "request_to_headers_s": [request_id + 0.01],
+            "headers_to_first_token_s": [request_id + 0.09],
+            "request_start_unix_ns": [request_id * 100],
+            "response_headers_unix_ns": [request_id * 100 + 10],
+            "first_token_unix_ns": [request_id * 100 + 20],
             "decode_s": [request_id + 0.2],
             "cached_tokens": [request_id + 10],
             "completion_tokens": [request_id + 20],
@@ -136,6 +150,11 @@ def test_parallel_single_requests_preserve_result_order() -> None:
 
     assert result["wall_s"] >= 0
     assert result["ttft_s"] == [1.1, 2.1, 3.1, 4.1]
+    assert result["request_to_headers_s"] == [1.01, 2.01, 3.01, 4.01]
+    assert result["headers_to_first_token_s"] == [1.09, 2.09, 3.09, 4.09]
+    assert result["request_start_unix_ns"] == [100, 200, 300, 400]
+    assert result["response_headers_unix_ns"] == [110, 210, 310, 410]
+    assert result["first_token_unix_ns"] == [120, 220, 320, 420]
     assert result["decode_s"] == [1.2, 2.2, 3.2, 4.2]
     assert result["cached_tokens"] == [11, 12, 13, 14]
     assert result["completion_tokens"] == [21, 22, 23, 24]
@@ -171,22 +190,24 @@ def test_profile_admission_barrier_queues_all_requests_before_resume() -> None:
         return {"wall_s": 1.0}
 
     on_admitted = mock.Mock()
-    with mock.patch.object(BENCHMARK.requests, "post", side_effect=fake_post) as post:
-        with mock.patch.object(BENCHMARK.requests, "get", return_value=server_info_response):
-            with mock.patch.object(BENCHMARK.time, "sleep") as sleep:
-                with mock.patch.object(
-                    BENCHMARK,
-                    "_run_parallel_single_requests",
-                    side_effect=fake_run_parallel_single_requests,
-                ):
-                    result = BENCHMARK._run_native_batch_with_admission_barrier(
-                        "http://server",
-                        [[1], [2], [3], [4]],
-                        1,
-                        label="profile",
-                        on_admitted=on_admitted,
-                        profile_settle_s=0.25,
-                    )
+    with (
+        mock.patch.object(BENCHMARK.requests, "post", side_effect=fake_post) as post,
+        mock.patch.object(BENCHMARK.requests, "get", return_value=server_info_response),
+        mock.patch.object(BENCHMARK.time, "sleep") as sleep,
+        mock.patch.object(
+            BENCHMARK,
+            "_run_parallel_single_requests",
+            side_effect=fake_run_parallel_single_requests,
+        ),
+    ):
+        result = BENCHMARK._run_native_batch_with_admission_barrier(
+            "http://server",
+            [[1], [2], [3], [4]],
+            1,
+            label="profile",
+            on_admitted=on_admitted,
+            profile_settle_s=0.25,
+        )
 
     assert result == {"wall_s": 1.0}
     on_admitted.assert_called_once_with()

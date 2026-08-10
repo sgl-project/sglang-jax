@@ -31,7 +31,7 @@ def _make_profiler_options(
     host_tracer_level: int | None,
     python_tracer_level: int | None,
 ) -> jax.profiler.ProfileOptions:
-    """Build JAX profiler options, including the optional TPU chip limit."""
+    """Build JAX profiler options, including optional TPU collector limits."""
 
     profiler_options = jax.profiler.ProfileOptions()
     if host_tracer_level is not None:
@@ -39,17 +39,42 @@ def _make_profiler_options(
     if python_tracer_level is not None:
         profiler_options.python_tracer_level = python_tracer_level
 
-    raw_num_chips = os.getenv("SGLANG_PROFILE_NUM_CHIPS_PER_TASK")
-    if raw_num_chips is not None:
+    # A newly constructed ProfileOptions has no advanced settings, so collect
+    # all requested TPU settings and assign them to the backend in one update.
+    advanced_configuration: dict[str, int] = {}
+    collector_limits = (
+        (
+            "SGLANG_PROFILE_NUM_CHIPS_PER_TASK",
+            "tpu_num_chips_to_profile_per_task",
+        ),
+        (
+            "SGLANG_PROFILE_NUM_SPARSE_CORES_TO_TRACE",
+            "tpu_num_sparse_cores_to_trace",
+        ),
+        (
+            "SGLANG_PROFILE_NUM_SPARSE_CORE_TILES_TO_TRACE",
+            "tpu_num_sparse_core_tiles_to_trace",
+        ),
+    )
+    for environment_name, option_name in collector_limits:
+        raw_value = os.getenv(environment_name)
+        if raw_value is None:
+            continue
         try:
-            num_chips = int(raw_num_chips)
+            value = int(raw_value)
         except ValueError as exc:
-            raise ValueError(
-                "SGLANG_PROFILE_NUM_CHIPS_PER_TASK must be a positive integer"
-            ) from exc
-        if num_chips <= 0:
-            raise ValueError("SGLANG_PROFILE_NUM_CHIPS_PER_TASK must be a positive integer")
-        profiler_options.tpu_num_chips_to_profile_per_task = num_chips
+            raise ValueError(f"{environment_name} must be a positive integer") from exc
+        if value <= 0:
+            raise ValueError(f"{environment_name} must be a positive integer")
+        # TPU collector controls are parsed only from advanced_configuration.
+        # Setting an arbitrary Python attribute appears to work because the
+        # nanobind wrapper has a __dict__, but ProfilerSession silently ignores
+        # it. Unbounded TPU chip/SparseCore fanout can then exhaust the trace
+        # buffer before a large serving executable finishes.
+        advanced_configuration[option_name] = value
+
+    if advanced_configuration:
+        profiler_options.advanced_configuration = advanced_configuration
 
     return profiler_options
 
@@ -128,11 +153,12 @@ class _StageBasedTrigger:
 class _ProfileManager:
     """Manages stage-based profiling with JAX profiler backend."""
 
-    def __init__(self):
+    def __init__(self, synchronize: Callable[[], None] | None = None):
         self._trigger = _StageBasedTrigger(
             on_start=self._do_start,
             on_stop=self._do_stop,
         )
+        self._synchronize = synchronize
         self._output_dir: str = ""
         self._host_tracer_level: int | None = None
         self._python_tracer_level: int | None = None
@@ -170,7 +196,7 @@ class _ProfileManager:
     def _do_start(self, stage: str):
         if not _should_profile_this_process():
             logger.info(
-                "Stage-based profiling skipped on process %d due to " "SGLANG_PROFILE_MAX_HOSTS",
+                "Stage-based profiling skipped on process %d due to SGLANG_PROFILE_MAX_HOSTS",
                 jax.process_index(),
             )
             return
@@ -188,10 +214,20 @@ class _ProfileManager:
         self._trace_active = True
 
     def _do_stop(self):
+        # Stage transitions are observed before the next forward is submitted.
+        # In overlap mode, the previous stage can still be executing. Settle it
+        # on every PJRT process, including hosts excluded from trace capture.
+        if self._synchronize is not None:
+            self._synchronize()
+
         if self._trace_active:
-            logger.info("Stage-based profiling: stopping trace")
-            jax.profiler.stop_trace()
-            self._trace_active = False
+            logger.info("Stage-based profiling: waiting for device effects")
+            try:
+                jax.effects_barrier()
+                logger.info("Stage-based profiling: stopping trace")
+                jax.profiler.stop_trace()
+            finally:
+                self._trace_active = False
 
 
 class SchedulerProfilerMixin:
@@ -205,7 +241,14 @@ class SchedulerProfilerMixin:
         self.host_tracer_level: int | None = None
         self.python_tracer_level: int | None = None
         self.profiler_trace_active: bool = False
-        self._profile_manager = _ProfileManager()
+        self._profile_manager = _ProfileManager(synchronize=self._synchronize_profile_trace)
+
+    def _synchronize_profile_trace(self):
+        worker = getattr(self, "tp_worker", None)
+        synchronize = getattr(worker, "synchronize_for_profile", None)
+        if synchronize is not None:
+            logger.info("Stage-based profiling: waiting for overlap forwards")
+            synchronize()
 
     def start_profile(
         self,

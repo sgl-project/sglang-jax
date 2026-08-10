@@ -223,7 +223,12 @@ class WeightLoader:
 
     @staticmethod
     def create_bf16_linear(
-        weight: jax.Array, kernel_axes, mesh, use_bias=False, bias=None
+        weight: jax.Array,
+        kernel_axes,
+        mesh,
+        use_bias=False,
+        bias=None,
+        scope_name: str = "linear_base",
     ) -> "LinearBase":
         """Create a bf16 LinearBase from a weight array [in, out]."""
         from sgl_jax.srt.layers.linear import LinearBase
@@ -237,6 +242,7 @@ class WeightLoader:
                 use_bias=use_bias,
                 params_dtype=jnp.bfloat16,
                 mesh=mesh,
+                scope_name=scope_name,
             )
             new_linear.weight = nnx.Param(weight)
             if bias is not None:
@@ -272,8 +278,14 @@ class WeightLoader:
             raise ValueError(f"Unexpected weight_scale ndim={weight_scale.ndim}")
 
         bias = ql.bias.value if ql.bias is not None else None
+        scope_name = getattr(ql, "name", "quantized_linear").removeprefix("quantized_")
         return self.create_bf16_linear(
-            weight_bf16, ql.kernel_axes, ql.mesh, ql.bias is not None, bias
+            weight_bf16,
+            ql.kernel_axes,
+            ql.mesh,
+            ql.bias is not None,
+            bias,
+            scope_name=scope_name,
         )
 
     @staticmethod

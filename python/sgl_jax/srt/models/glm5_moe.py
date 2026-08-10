@@ -41,6 +41,15 @@ from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
+_GLM5_BF16_LINEAR_SPECS = [("self_attn.o_proj", None)]
+
+
+def _dequantize_glm5_latency_sensitive_linears(loader: WeightLoader, layers: list) -> None:
+    """Materialize latency-sensitive static-FP8 linears as BF16 once at load time."""
+    if not loader.is_static_quant:
+        return
+    loader.dequant_fp8_layers(layers, specs=_GLM5_BF16_LINEAR_SPECS)
+
 
 @partial(jax.jit, static_argnames=("quantized_dtype",))
 def _requantize_blockwise_shared_weight(
@@ -611,6 +620,7 @@ class Glm5Attention(nnx.Module):
         attn_output = attn_output.reshape(-1, self.num_heads * self.v_head_dim)
         return attn_output, kv_fused
 
+    @named_scope("dsa")
     def __call__(
         self,
         positions: jax.Array,
@@ -1094,23 +1104,27 @@ class Glm5DecoderLayer(nnx.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
 
         if self.is_moe_layer:
-            if self.shared_experts is not None:
-                shared_output = self.shared_experts(hidden_states)
-            else:
-                shared_output = None
-            router_logits = self.moe_gate(hidden_states)
+            with jax.named_scope("moe"):
+                if self.shared_experts is not None:
+                    shared_output = self.shared_experts(hidden_states)
+                else:
+                    shared_output = None
+                router_logits = self.moe_gate(hidden_states)
 
-            correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
-            topk_weights, topk_ids = self.topk(
-                router_logits,
-                correction_bias,
-                dispatch_info=dispatch_info,
-            )
+                correction_bias = (
+                    self.moe_gate.bias.value if self.moe_gate.bias is not None else None
+                )
+                with jax.named_scope("topk"):
+                    topk_weights, topk_ids = self.topk(
+                        router_logits,
+                        correction_bias,
+                        dispatch_info=dispatch_info,
+                    )
 
-            hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
+                hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
 
-            if shared_output is not None:
-                hidden_states = hidden_states + shared_output
+                if shared_output is not None:
+                    hidden_states = hidden_states + shared_output
         else:
             hidden_states = self.mlp(hidden_states)
             topk_ids = None
@@ -1254,6 +1268,12 @@ class Glm5ForCausalLM(nnx.Module):
         )
         weight_mappings = self._create_glm5_weight_mappings(model_config)
         loader.load_weights_from_safetensors(weight_mappings)
+
+        # MiMo-V2-style load-time conversion: o_proj's block-wise FP8 path
+        # otherwise quantizes activations on every layer/step. Its row-parallel
+        # BF16 weight is TP-sharded, so the latency win costs only the local
+        # shard's additional byte per parameter rather than replicating it.
+        _dequantize_glm5_latency_sensitive_linears(loader, self.model.layers)
 
         for layer in self.model.layers:
             layer.self_attn.post_load_weights()

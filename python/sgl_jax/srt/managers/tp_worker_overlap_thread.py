@@ -25,6 +25,13 @@ from sgl_jax.utils import get_exception_traceback
 logger = logging.getLogger(__name__)
 
 
+@dataclasses.dataclass(frozen=True)
+class _ProfileSyncRequest:
+    """A FIFO barrier for stage-based profiling in the overlap worker."""
+
+    done: threading.Event
+
+
 class ModelWorkerClient:
     """A tensor parallel model worker."""
 
@@ -55,6 +62,7 @@ class ModelWorkerClient:
         # Launch threads
         self.input_queue = Queue()
         self.output_queue = Queue()
+        self._last_forward_result = None
         # JAX handles device execution automatically, no need for explicit streams
         self.forward_thread = threading.Thread(
             target=self.forward_thread_func,
@@ -107,12 +115,21 @@ class ModelWorkerClient:
 
     def forward_thread_func_(self):
         while True:
+            request = self.input_queue.get()
+            if isinstance(request, _ProfileSyncRequest):
+                try:
+                    if self._last_forward_result is not None:
+                        jax.block_until_ready(self._last_forward_result)
+                finally:
+                    request.done.set()
+                continue
+
             (
                 model_worker_batch,
                 future_token_ids_ct,
                 sampling_metadata,
                 forward_metadata,
-            ) = self.input_queue.get()
+            ) = request
             if not model_worker_batch:
                 break
 
@@ -135,6 +152,7 @@ class ModelWorkerClient:
                         )
                     )
                 self.future_token_ids_map = new_future_map
+                self._record_profile_sync_result(logits_output, next_token_ids)
                 self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
                 continue
 
@@ -171,7 +189,30 @@ class ModelWorkerClient:
             # client->proxy->worker RTT (#772).
             if hasattr(next_token_ids, "copy_to_host_async"):
                 next_token_ids.copy_to_host_async()
+            self._record_profile_sync_result(logits_output, next_token_ids)
             self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
+
+    def _record_profile_sync_result(self, logits_output, next_token_ids):
+        """Keep the complete observable forward state for profile shutdown."""
+
+        self._last_forward_result = (
+            logits_output,
+            next_token_ids,
+            self.worker.model_runner.memory_pools,
+        )
+
+    def synchronize_for_profile(self):
+        """Wait for all previously queued overlap forwards to finish on device.
+
+        The scheduler observes a stage transition before the overlap worker has
+        necessarily completed the previous stage. A FIFO request ensures all
+        earlier forwards have been submitted, then blocks on their complete
+        observable state without consuming the scheduler's output queue.
+        """
+
+        request = _ProfileSyncRequest(done=threading.Event())
+        self.input_queue.put(request)
+        request.done.wait()
 
     def resolve_last_batch_result(self, launch_done: threading.Event | None = None):
         """

@@ -20,6 +20,12 @@ from pathlib import Path
 import requests
 
 
+# A complete TPU XPlane can take several minutes to flush after the measured
+# request finishes. Profile-control RPCs wait for that flush on the server, so
+# their read timeout must be longer than ordinary health/status requests.
+PROFILE_CONTROL_TIMEOUT_S = 600
+
+
 def _percentile(values: list[float], quantile: float) -> float:
     ordered = sorted(values)
     if not ordered:
@@ -85,6 +91,7 @@ def _run_native_batch(
     label: str,
 ) -> dict:
     started = time.perf_counter()
+    started_unix_ns = time.time_ns()
     response = requests.post(
         f"{base_url}/generate",
         json={
@@ -103,8 +110,11 @@ def _run_native_batch(
         timeout=(30, None),
     )
     response.raise_for_status()
+    response_headers_at = time.perf_counter()
+    response_headers_unix_ns = time.time_ns()
 
     first_token_at: dict[int, float] = {}
+    first_token_unix_ns: dict[int, int] = {}
     finished_at: dict[int, float] = {}
     final_meta: dict[int, dict] = {}
     for raw_line in response.iter_lines(decode_unicode=True):
@@ -121,6 +131,7 @@ def _run_native_batch(
         now = time.perf_counter()
         if meta.get("completion_tokens", 0) >= 1 and index not in first_token_at:
             first_token_at[index] = now
+            first_token_unix_ns[index] = time.time_ns()
         if meta.get("finish_reason") is not None:
             finished_at[index] = now
             final_meta[index] = meta
@@ -134,6 +145,17 @@ def _run_native_batch(
     return {
         "wall_s": ended - started,
         "ttft_s": [first_token_at[i] - started for i in range(len(input_ids))],
+        "request_to_headers_s": [
+            response_headers_at - started for _ in range(len(input_ids))
+        ],
+        "headers_to_first_token_s": [
+            first_token_at[i] - response_headers_at for i in range(len(input_ids))
+        ],
+        "request_start_unix_ns": [started_unix_ns for _ in range(len(input_ids))],
+        "response_headers_unix_ns": [
+            response_headers_unix_ns for _ in range(len(input_ids))
+        ],
+        "first_token_unix_ns": [first_token_unix_ns[i] for i in range(len(input_ids))],
         "decode_s": [finished_at[i] - first_token_at[i] for i in range(len(input_ids))],
         "cached_tokens": [
             int(final_meta[i].get("cached_tokens", 0)) for i in range(len(input_ids))
@@ -169,6 +191,15 @@ def _run_parallel_single_requests(
     return {
         "wall_s": time.perf_counter() - started,
         "ttft_s": [result["ttft_s"][0] for result in results],
+        "request_to_headers_s": [result["request_to_headers_s"][0] for result in results],
+        "headers_to_first_token_s": [
+            result["headers_to_first_token_s"][0] for result in results
+        ],
+        "request_start_unix_ns": [result["request_start_unix_ns"][0] for result in results],
+        "response_headers_unix_ns": [
+            result["response_headers_unix_ns"][0] for result in results
+        ],
+        "first_token_unix_ns": [result["first_token_unix_ns"][0] for result in results],
         "decode_s": [result["decode_s"][0] for result in results],
         "cached_tokens": [result["cached_tokens"][0] for result in results],
         "completion_tokens": [result["completion_tokens"][0] for result in results],
@@ -206,14 +237,18 @@ def _start_profile(
 
 
 def _stop_profile(base_url: str) -> None:
-    status = requests.get(f"{base_url}/profile_status", timeout=60)
+    status = requests.get(
+        f"{base_url}/profile_status", timeout=PROFILE_CONTROL_TIMEOUT_S
+    )
     status.raise_for_status()
     if status.json().get("status") == "idle":
         return
 
     response = requests.post(f"{base_url}/stop_profile", timeout=(30, None))
     response.raise_for_status()
-    status = requests.get(f"{base_url}/profile_status", timeout=60)
+    status = requests.get(
+        f"{base_url}/profile_status", timeout=PROFILE_CONTROL_TIMEOUT_S
+    )
     status.raise_for_status()
     if status.json().get("status") != "idle":
         raise RuntimeError(f"profile did not stop cleanly: {status.text}")
@@ -426,6 +461,8 @@ def main() -> None:
         raise RuntimeError(f"completion invariant failed: {measured['completion_tokens']}")
 
     ttft = measured["ttft_s"]
+    request_to_headers = measured["request_to_headers_s"]
+    headers_to_first_token = measured["headers_to_first_token_s"]
     decode = measured["decode_s"]
     tpots_ms = [value * 1000 / max(args.output_len - 1, 1) for value in decode]
     result = {
@@ -450,6 +487,15 @@ def main() -> None:
         "ttft_mean_s": statistics.fmean(ttft),
         "ttft_p50_s": statistics.median(ttft),
         "ttft_p95_s": _percentile(ttft, 0.95),
+        "request_to_headers_p50_ms": statistics.median(request_to_headers) * 1000,
+        "request_to_headers_p95_ms": _percentile(request_to_headers, 0.95) * 1000,
+        "headers_to_first_token_p50_ms": statistics.median(headers_to_first_token) * 1000,
+        "headers_to_first_token_p95_ms": (
+            _percentile(headers_to_first_token, 0.95) * 1000
+        ),
+        "request_start_unix_ns": measured["request_start_unix_ns"],
+        "response_headers_unix_ns": measured["response_headers_unix_ns"],
+        "first_token_unix_ns": measured["first_token_unix_ns"],
         "decode_mean_s": statistics.fmean(decode),
         "decode_p50_s": statistics.median(decode),
         "tpot_p50_ms": statistics.median(tpots_ms),
