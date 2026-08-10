@@ -81,7 +81,7 @@ def build_accuracy_result(
     if case.score_threshold is None or score is None:
         passed = None
     else:
-        passed = score >= case.score_threshold
+        passed = bool(score >= case.score_threshold)
 
     return {
         "schema_version": ACCURACY_RESULT_SCHEMA_VERSION,

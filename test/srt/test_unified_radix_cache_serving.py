@@ -214,14 +214,18 @@ class TestUnifiedRadixCacheServingRecurrent(CustomTestCase):
         "--context-length",
         "8192",
         "--chunked-prefill-size",
-        "512",
+        "4096",
+        "--recurrent-track-interval",
+        "4096",
         "--page-size",
         str(_RECURRENT_PAGE_SIZE),
         "--max-running-requests",
         "16",
         "--random-seed",
         "42",
-        "--disable-overlap-schedule",
+        # Keep this cache-correctness gate independent of optional MoE
+        # routing-kernel changes; the JAX top-k path is the stable baseline.
+        "--disable-topk-kernel",
         # bs paddings pinned to multiples of tp_size*t_packing (=8): keeps the
         # decode batch divisible by the device count (sampler lax.cond) and gives
         # each device >=2 tokens, satisfying the fused MoE t_packing=2 alignment
@@ -232,6 +236,8 @@ class TestUnifiedRadixCacheServingRecurrent(CustomTestCase):
         "--precompile-token-paddings",
         "512",
         "1024",
+        "2048",
+        "4096",
     ]
     _ENV = {"JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache"}
 
@@ -270,6 +276,9 @@ class TestUnifiedRadixCacheServingRecurrent(CustomTestCase):
             assert info["page_size"] == _RECURRENT_PAGE_SIZE, (
                 f"server page_size={info.get('page_size')!r}, " f"expected {_RECURRENT_PAGE_SIZE}"
             )
+            assert (
+                info["disable_overlap_schedule"] is False
+            ), "recurrent determinism must cover the default overlap scheduler"
         except Exception:
             kill_process_tree(cls.process.pid)
             raise
@@ -340,10 +349,9 @@ class TestUnifiedRadixCacheServingRecurrent(CustomTestCase):
             "models can perform text generation, translation, summarization, and "
             "question answering. "
         )
-        # Long enough to cross a recurrent track boundary (track_interval
-        # defaults to chunked_prefill_size=512), so the recurrent snapshot is
-        # actually cached and reused on the hit -- not just the full-KV pages.
-        prompt = paragraph * 16
+        # Long enough to cross the 4096-token recurrent track boundary, so the
+        # recurrent snapshot is actually cached and reused on the hit.
+        prompt = paragraph * 180
 
         # 1. Cold: empty tree -> nothing cached.
         flush_cache(self.base_url)
