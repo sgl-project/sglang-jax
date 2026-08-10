@@ -131,7 +131,17 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         #   mixed:  435.2249ms -> 71.3998ms (+83.6%)
         # Production lookup A/B on exp-aovgukczde also covered the complete
         # MLA wrapper: decode +38.7% and mixed +83.2%.
+        #
+        # Decode-concurrency buckets mnt={2,4,8} were swept again on
+        # 2026-08-09 (Falcon exp-f4picvgxet) across KV lengths 1K..133120.
+        # The selected configs favor the stable short/mid-KV winner when the
+        # long-KV winner differs by less than 0.5%.
         ("decode", "bfloat16", "bfloat16", 64, 512, 64, 64, 2): (32, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 64, 512, 64, 64, 4): (32, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 64, 512, 64, 64, 8): (32, 1, 2),
+        ("mixed", "bfloat16", "bfloat16", 64, 512, 64, 64, 2): (32, 1),
+        ("mixed", "bfloat16", "bfloat16", 64, 512, 64, 64, 4): (32, 4),
+        ("mixed", "bfloat16", "bfloat16", 64, 512, 64, 64, 8): (32, 8),
         ("mixed", "bfloat16", "bfloat16", 64, 512, 64, 64, 2048): (8, 64),
         # ===== DeepSeek-V3 671B (num_q_heads=128 → 16/shard, kv_lora=512,
         # page=128). decode reuses v6e sweep; mixed bq capped at 128 — v7x

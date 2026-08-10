@@ -62,6 +62,10 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         # K=128, ep=16, in-kernel shared expert, act_quant ON, no grouped top-k.
         # Tuned on 8 TPU v7x chips / 16 JAX devices, 2026-08-04
         # (Falcon exp-fvmfgcw2y9).
+        # Decode shapes 16..256 were re-swept with random and hot-expert
+        # routing on 2026-08-09 (Falcon exp-11xkf5j57c). Existing 32..256
+        # entries remained optimal or statistically equivalent; 16 is new.
+        ('bfloat16', 'float8_e4m3fn', 16, 256, 8, 6144, 2048, 16, True, False, True): (8, 512, 8, 128, 8),
         ('bfloat16', 'float8_e4m3fn', 32, 256, 8, 6144, 2048, 16, True, False, True): (8, 512, 8, 128, 8),
         ('bfloat16', 'float8_e4m3fn', 64, 256, 8, 6144, 2048, 16, True, False, True): (8, 512, 8, 128, 8),
         ('bfloat16', 'float8_e4m3fn', 128, 256, 8, 6144, 2048, 16, True, False, True): (8, 1024, 8, 128, 8),

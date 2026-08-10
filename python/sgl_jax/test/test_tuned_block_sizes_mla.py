@@ -60,11 +60,19 @@ def test_mixed_hit_returns_2tuple(monkeypatch):
 def test_glm52_dp16_production_entries(monkeypatch):
     _patch_env(monkeypatch)
 
-    assert get_tuned_block_sizes_mla("decode", jnp.bfloat16, jnp.bfloat16, 64, 512, 64, 64, 2) == (
-        32,
-        1,
-        2,
-    )
+    for max_num_tokens in (2, 4, 8):
+        assert get_tuned_block_sizes_mla(
+            "decode", jnp.bfloat16, jnp.bfloat16, 64, 512, 64, 64, max_num_tokens
+        ) == (32, 1, 2)
+
+    for max_num_tokens, expected in {2: (32, 1), 4: (32, 4), 8: (32, 8)}.items():
+        assert (
+            get_tuned_block_sizes_mla(
+                "mixed", jnp.bfloat16, jnp.bfloat16, 64, 512, 64, 64, max_num_tokens
+            )
+            == expected
+        )
+
     assert get_tuned_block_sizes_mla(
         "mixed", jnp.bfloat16, jnp.bfloat16, 64, 512, 64, 64, 2048
     ) == (8, 64)
