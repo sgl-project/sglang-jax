@@ -24,6 +24,7 @@ from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.kernels.dsa.ref import streamindex_page_topk_ref, streamindex_topk_ref
 from sgl_jax.srt.kernels.dsa.sparse_mla import compute_topk_pages, sparse_mla_page_level
+from sgl_jax.srt.kernels.dsa.streamindex_topk import streamindex_topk
 from sgl_jax.srt.kernels.mla.v2.kernel import mla_ragged_paged_attention
 from sgl_jax.srt.layers.attention.mla_backend import MLAAttentionBackend
 from sgl_jax.srt.utils.profiling_utils import named_scope
@@ -42,6 +43,15 @@ _DEBUG_N_HIT = False
 # token-topk + page-union path with k_pages_max=512). Bounds sparse-MLA cost
 # to O(budget) flat vs the union path which saturates 512 pages at long ctx.
 _PAGE_TOPK_BUDGET = int(os.environ.get("DSA_PAGE_TOPK", "0"))
+# Opt-in: score+topk via the Pallas streamindex kernel instead of the jnp
+# reference. The kernel reads O(actual kv_len) pages (vs the ref's O(max_ctx)
+# padded gather) and shares the ref's exact scoring semantics
+# (sum_h relu(q·k)·w_h, approx_max_k). Token-topk path only; DSA_PAGE_TOPK
+# takes precedence when both are set.
+_INDEXER_KERNEL = os.environ.get("DSA_INDEXER_KERNEL", "0") == "1"
+# bkv block of 64 pages (4K tokens @ page 64) benched fastest across
+# B=8..64, ctx 8K..128K on v7x/v6e.
+_INDEXER_KERNEL_KV_PAGES_PER_BLOCK = 64
 
 
 @register_pytree_node_class
@@ -299,7 +309,22 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                     one_token_per_seq=True,
                 )
                 return cache3d.reshape(cache_.shape), topk, topk_pages
-            if compute_topk:
+            if compute_topk and _INDEXER_KERNEL:
+                topk = streamindex_topk(
+                    q_,
+                    w_,
+                    cache3d.reshape(cache_.shape),
+                    seq_lens_,
+                    _fixed_stride_pages(pi_, cukv_, page_size, pages_per_seq),
+                    cuq_,
+                    dist_,
+                    k=self.index_topk,
+                    # GLM indexer keys are uncompressed (one key per token).
+                    compression_ratio=1,
+                    num_kv_pages_per_block=_INDEXER_KERNEL_KV_PAGES_PER_BLOCK,
+                    num_queries_per_block=1,
+                )
+            elif compute_topk:
                 topk = streamindex_topk_ref(
                     q_,
                     w_,
@@ -460,6 +485,29 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             md.cu_kv_lens,
             md.distribution,
         )
+
+
+def _fixed_stride_pages(
+    page_indices: jax.Array,
+    cu_kv_lens: jax.Array,
+    page_size: int,
+    pages_per_seq: int,
+) -> jax.Array:
+    """Repack the packed page table into the kernel's fixed-stride layout.
+
+    sglang packs seq i's pages starting at ``cu_kv_lens[i] // page_size``
+    (cu_kv_lens is page-aligned by construction); the streamindex kernel
+    indexes ``page_indices[seq_id * pages_per_seq + page_id]``. The two
+    coincide only when every sequence occupies exactly ``pages_per_seq``
+    slots (e.g. single-seq decode), so gather-repack here. Tail entries
+    beyond seq i's actual pages may alias a later sequence's pages — same
+    as the reference's ``dynamic_slice`` over the packed table — which is
+    harmless because both mask scores past ``kv_len``.
+    """
+    starts = cu_kv_lens[:-1] // page_size
+    gidx = starts[:, None] + jnp.arange(pages_per_seq)[None, :]
+    gidx = jnp.minimum(gidx, page_indices.shape[0] - 1)
+    return page_indices[gidx].reshape(-1)
 
 
 def _scatter_paged(
