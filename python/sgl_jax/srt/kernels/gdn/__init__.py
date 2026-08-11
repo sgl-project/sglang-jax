@@ -12,16 +12,16 @@ Public entry points:
   depthwise causal conv1d helpers (ragged prefill + single-token decode).
 """
 
+from sgl_jax.srt.kernels.gdn.fused_chunk_parallel_adapter import (
+    GDNPrefillCapabilityError,
+    fused_chunk_parallel_prefill,
+)
 from sgl_jax.srt.kernels.gdn.gated_delta import (
     chunked_gated_delta_rule_jax,
     decode_gated_delta_rule_ref,
     jax_causal_conv1d_prefill,
     jax_causal_conv1d_update,
     ragged_gated_delta_rule_ref,
-)
-from sgl_jax.srt.kernels.gdn.fused_chunk_parallel_adapter import (
-    GDNPrefillCapabilityError,
-    fused_chunk_parallel_prefill,
 )
 
 __all__ = [

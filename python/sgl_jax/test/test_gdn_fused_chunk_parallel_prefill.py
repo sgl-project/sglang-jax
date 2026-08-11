@@ -10,13 +10,13 @@ import numpy as np
 import pytest
 
 import sgl_jax.srt.kernels.gdn.fused_chunk_parallel_adapter as adapter
+from sgl_jax.srt.kernels.gdn.fused_chunk_parallel import fused_conv1d_gdn
 from sgl_jax.srt.kernels.gdn.gated_delta import (
     decode_gated_delta_rule_ref,
     jax_causal_conv1d_prefill,
     jax_causal_conv1d_update,
     ragged_gated_delta_rule_ref,
 )
-from sgl_jax.srt.kernels.gdn.fused_chunk_parallel import fused_conv1d_gdn
 
 pytestmark = pytest.mark.skipif(
     not any(device.platform == "tpu" for device in jax.local_devices()),
