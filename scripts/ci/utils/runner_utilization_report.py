@@ -130,7 +130,9 @@ def get_runners(repo, online_only=False):
                 inferred = (
                     m.group(1)
                     if m
-                    else ("arc-runner-cpu-us-south1-b" if name.startswith("runnerdeploy-") else None)
+                    else (
+                        "arc-runner-cpu-us-south1-b" if name.startswith("runnerdeploy-") else None
+                    )
                 )
                 if inferred:
                     runner.setdefault("labels", []).append({"name": inferred})
