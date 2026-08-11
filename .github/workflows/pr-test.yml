@@ -27,11 +27,21 @@ jobs:
   unit-test-1-tpu:
     needs: [coordinator]
     if: needs.coordinator.outputs.run_main_test == 'true'
-    runs-on: arc-runner-v6e-1
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1, 2, 3, 4]
+        include:
+          - part: 0
+            runner: arc-runner-v6e-1-us-south1-canary
+          - part: 1
+            runner: arc-runner-v6e-1
+          - part: 2
+            runner: arc-runner-v6e-1
+          - part: 3
+            runner: arc-runner-v6e-1
+          - part: 4
+            runner: arc-runner-v6e-1
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
