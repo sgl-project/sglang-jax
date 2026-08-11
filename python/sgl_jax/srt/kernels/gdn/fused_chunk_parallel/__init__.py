@@ -12,6 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from sgl_jax.srt.kernels.gdn.tpu_inference_v3.wrapper import fused_conv1d_gdn
+from sgl_jax.srt.kernels.gdn.fused_chunk_parallel.wrapper import fused_conv1d_gdn
 
 __all__ = ["fused_conv1d_gdn"]

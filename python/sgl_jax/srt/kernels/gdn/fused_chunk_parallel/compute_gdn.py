@@ -15,7 +15,7 @@
 import jax
 import jax.numpy as jnp
 
-from sgl_jax.srt.kernels.gdn.tpu_inference_v3 import config
+from sgl_jax.srt.kernels.gdn.fused_chunk_parallel import config
 
 
 def l2_norm(x: jax.Array, eps: float = 1e-6) -> jax.Array:

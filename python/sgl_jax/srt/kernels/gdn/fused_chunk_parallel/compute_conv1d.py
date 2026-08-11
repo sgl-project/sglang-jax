@@ -15,7 +15,7 @@
 import jax
 import jax.numpy as jnp
 
-from sgl_jax.srt.kernels.gdn.tpu_inference_v3 import config
+from sgl_jax.srt.kernels.gdn.fused_chunk_parallel import config
 
 
 def causal_conv1d(

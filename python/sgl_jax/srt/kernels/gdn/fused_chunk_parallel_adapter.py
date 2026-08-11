@@ -1,7 +1,8 @@
-"""Startup validation and state-pool adaptation for TPU-Inference GDN v3."""
+"""Startup validation and state-pool adaptation for fused chunk-parallel GDN."""
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable
 
 import jax
@@ -10,6 +11,11 @@ import numpy as np
 from jax.sharding import PartitionSpec as P
 
 _TPU_LANE_WIDTH = 128
+_TRACK_VALIDATION_ENV = "SGLANG_JAX_GDN_DEBUG_VALIDATE_TRACK_INDICES"
+
+
+def _debug_track_validation_enabled() -> bool:
+    return os.environ.get(_TRACK_VALIDATION_ENV, "0").lower() in {"1", "true"}
 
 
 class GDNPrefillCapabilityError(RuntimeError):
@@ -28,7 +34,7 @@ def _mesh_devices(mesh) -> tuple[object, ...]:
     return (devices,)
 
 
-def validate_tpu_inference_v3_capability(
+def validate_fused_chunk_parallel_capability(
     *,
     mesh,
     dtype,
@@ -45,36 +51,36 @@ def validate_tpu_inference_v3_capability(
     )
     if not mesh_is_tpu:
         raise GDNPrefillCapabilityError(
-            "tpu_inference_v3 requires a TPU mesh; CPU Pallas interpret is not "
+            "fused_chunk_parallel requires a TPU mesh; CPU Pallas interpret is not "
             "a supported execution path for the fused DMA/state pipeline."
         )
     if dtype is None:
-        raise GDNPrefillCapabilityError("tpu_inference_v3 requires a BF16 activation dtype.")
+        raise GDNPrefillCapabilityError("fused_chunk_parallel requires a BF16 activation dtype.")
     if jnp.dtype(dtype) != jnp.dtype(jnp.bfloat16):
-        raise GDNPrefillCapabilityError("tpu_inference_v3 requires BF16 activation dtype.")
+        raise GDNPrefillCapabilityError("fused_chunk_parallel requires BF16 activation dtype.")
     if min(num_k_heads, num_v_heads, head_k_dim, head_v_dim) <= 0:
         raise GDNPrefillCapabilityError(
-            "tpu_inference_v3 requires positive head counts and dimensions."
+            "fused_chunk_parallel requires positive head counts and dimensions."
         )
     for name, head_dim in (("head_k_dim", head_k_dim), ("head_v_dim", head_v_dim)):
         if head_dim % _TPU_LANE_WIDTH:
             raise GDNPrefillCapabilityError(
-                f"tpu_inference_v3 requires {name} to be divisible by "
+                f"fused_chunk_parallel requires {name} to be divisible by "
                 f"the TPU lane width {_TPU_LANE_WIDTH}; got {head_dim}."
             )
     if num_v_heads % num_k_heads != 0:
         raise GDNPrefillCapabilityError(
-            "tpu_inference_v3 requires num_v_heads to be divisible by num_k_heads."
+            "fused_chunk_parallel requires num_v_heads to be divisible by num_k_heads."
         )
     if conv_kernel_size < 2:
         raise GDNPrefillCapabilityError(
-            "tpu_inference_v3 requires conv_kernel_size >= 2 for its state shape."
+            "fused_chunk_parallel requires conv_kernel_size >= 2 for its state shape."
         )
 
 
-def _vendor_fused_conv1d_gdn(*args, **kwargs):
-    """Import the TPU implementation only when the selected path executes."""
-    from sgl_jax.srt.kernels.gdn.tpu_inference_v3 import fused_conv1d_gdn
+def _fused_chunk_parallel_kernel(*args, **kwargs):
+    """Import the fused kernel only when the selected path executes."""
+    from sgl_jax.srt.kernels.gdn.fused_chunk_parallel import fused_conv1d_gdn
 
     return fused_conv1d_gdn(*args, **kwargs)
 
@@ -105,7 +111,7 @@ def _validate_track_indices(
         mask = None if track_mask is None else np.asarray(track_mask, dtype=np.bool_)
     except jax.errors.TracerArrayConversionError:
         # Under JIT, keep the same checks as a runtime assertion. The eager
-        # path above raises ValueError before the vendor callable is entered.
+        # path above raises ValueError before the fused kernel is entered.
         active = track_indices != 0 if track_mask is None else track_mask.astype(jnp.bool_)
         duplicate = jnp.any(
             active[:, None]
@@ -211,7 +217,7 @@ def _scatter_active(
     return pool.at[indices].set(safe_values)
 
 
-def fused_conv1d_gdn_prefill(
+def _fused_chunk_parallel_prefill_local(
     mixed_qkv,
     b,
     a,
@@ -232,8 +238,7 @@ def fused_conv1d_gdn_prefill(
     d_v,
     kernel_size,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Adapt SGL-JAX metadata and full state pools to the frozen vendor ABI."""
-    _validate_track_indices(track_indices, state_indices, conv_state.shape[0])
+    """Adapt one local shard and its state pool to the fused-kernel ABI."""
 
     initial_conv = conv_state[state_indices]
     initial_recurrent = recurrent_state[state_indices]
@@ -248,12 +253,12 @@ def fused_conv1d_gdn_prefill(
         jnp.zeros_like(initial_recurrent),
     )
 
-    vendor_conv_pool = _scatter_active(
+    kernel_conv_pool = _scatter_active(
         conv_state.swapaxes(-1, -2),
         state_indices,
         initial_conv.swapaxes(-1, -2),
     )
-    vendor_recurrent_pool = _scatter_active(
+    kernel_recurrent_pool = _scatter_active(
         recurrent_state,
         state_indices,
         initial_recurrent,
@@ -263,12 +268,12 @@ def fused_conv1d_gdn_prefill(
         dtype=jnp.int32,
     )
 
-    (vendor_conv_result, vendor_recurrent_result), output = _vendor_fused_conv1d_gdn(
+    (kernel_conv_result, kernel_recurrent_result), output = _fused_chunk_parallel_kernel(
         mixed_qkv,
         b,
         a,
-        vendor_conv_pool,
-        vendor_recurrent_pool,
+        kernel_conv_pool,
+        kernel_recurrent_pool,
         conv_weight[:, None, :],
         None,
         a_log,
@@ -286,8 +291,8 @@ def fused_conv1d_gdn_prefill(
 
     query_lens = cu_seqlens[1:] - cu_seqlens[:-1]
     has_tokens = query_lens > 0
-    running_conv = vendor_conv_result[state_indices].swapaxes(-1, -2)
-    running_recurrent = vendor_recurrent_result[state_indices]
+    running_conv = kernel_conv_result[state_indices].swapaxes(-1, -2)
+    running_recurrent = kernel_recurrent_result[state_indices]
     running_conv = jnp.where(
         has_tokens[:, None, None],
         running_conv,
@@ -325,7 +330,7 @@ def fused_conv1d_gdn_prefill(
     )
 
 
-def tpu_inference_v3_prefill(
+def fused_chunk_parallel_prefill(
     backend,
     mixed_qkv,
     conv_state,
@@ -349,13 +354,15 @@ def tpu_inference_v3_prefill(
     dp = int(backend.mesh.shape.get("data", 1))
     if conv_state.shape[0] % dp:
         raise ValueError(f"state pool size {conv_state.shape[0]} must be divisible by DP={dp}.")
-    invalid_track = _validate_track_indices_per_dp(
-        track_indices,
-        state_indices,
-        conv_state.shape[0] // dp,
-        dp,
-        track_mask=track_mask,
-    )
+    invalid_track = None
+    if _debug_track_validation_enabled():
+        invalid_track = _validate_track_indices_per_dp(
+            track_indices,
+            state_indices,
+            conv_state.shape[0] // dp,
+            dp,
+            track_mask=track_mask,
+        )
 
     tp = int(backend.mesh.shape.get("tensor", 1))
     data_axis = "data" if "data" in backend.mesh.shape else None
@@ -380,7 +387,7 @@ def tpu_inference_v3_prefill(
     ):
         if track_indices_l is not None:
             track_indices_l = jnp.where(track_mask_l, track_indices_l, 0)
-        return fused_conv1d_gdn_prefill(
+        return _fused_chunk_parallel_prefill_local(
             mixed_qkv_l,
             b_l,
             a_l,
@@ -433,7 +440,7 @@ def tpu_inference_v3_prefill(
         in_specs += [P(data_axis), P(data_axis)]
         args += [track_indices, track_mask]
 
-    def _run_vendor(_):
+    def _run_fused(_):
         return jax.shard_map(
             _prefill_local,
             mesh=backend.mesh,
@@ -447,7 +454,7 @@ def tpu_inference_v3_prefill(
         )(*args)
 
     if invalid_track is None:
-        return _run_vendor(None)
+        return _run_fused(None)
 
     def _reject_invalid(_):
         return (
@@ -460,11 +467,11 @@ def tpu_inference_v3_prefill(
         )
 
     # Runtime-invalid metadata takes this branch under the enclosing model JIT.
-    # The vendor shard_map is confined to the other branch, so no state update
+    # The fused shard_map is confined to the other branch, so no state update
     # can be computed or published after the fail-loud callback above.
     return jax.lax.cond(
         invalid_track,
         _reject_invalid,
-        _run_vendor,
+        _run_fused,
         operand=None,
     )

@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from sgl_jax.srt.kernels.gdn.tpu_inference_v3 import config, memory_ref
+from sgl_jax.srt.kernels.gdn.fused_chunk_parallel import config, memory_ref
 
 
 def compute_batched_seq_metadata(

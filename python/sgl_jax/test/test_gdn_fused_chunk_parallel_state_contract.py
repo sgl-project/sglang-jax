@@ -1,4 +1,4 @@
-"""State-pool contract tests for the TPU-Inference v3 GDN adapter."""
+"""State-pool contract tests for the fused chunk-parallel GDN adapter."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-import sgl_jax.srt.kernels.gdn.tpu_inference_adapter as adapter
+import sgl_jax.srt.kernels.gdn.fused_chunk_parallel_adapter as adapter
 import sgl_jax.srt.layers.attention.linear.gdn_backend as gdn_backend
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     LinearRecurrentAttnBackendMetadata,
@@ -96,13 +96,13 @@ def _inputs():
 
 def _call(*, track_indices, vendor):
     inputs = _inputs()
-    original = getattr(adapter, "_vendor_fused_conv1d_gdn", None)
-    adapter._vendor_fused_conv1d_gdn = vendor
+    original = getattr(adapter, "_fused_chunk_parallel_kernel", None)
+    adapter._fused_chunk_parallel_kernel = vendor
     try:
         entrypoint = getattr(
             adapter,
-            "fused_conv1d_gdn_prefill",
-            adapter.tpu_inference_v3_prefill,
+            "_fused_chunk_parallel_prefill_local",
+            adapter.fused_chunk_parallel_prefill,
         )
         result = entrypoint(
             *inputs[:10],
@@ -116,9 +116,9 @@ def _call(*, track_indices, vendor):
         )
     finally:
         if original is None:
-            del adapter._vendor_fused_conv1d_gdn
+            del adapter._fused_chunk_parallel_kernel
         else:
-            adapter._vendor_fused_conv1d_gdn = original
+            adapter._fused_chunk_parallel_kernel = original
     return inputs, result
 
 
@@ -266,20 +266,38 @@ def test_adapter_converts_layout_metadata_and_preserves_pool_contract():
         ([1, 5, 0], "running state"),
     ],
 )
-def test_invalid_track_indices_fail_before_vendor_call(track_indices, match):
-    def vendor(*args, **kwargs):
-        del args, kwargs
-        raise AssertionError("vendor must not run for invalid track metadata")
-
+def test_debug_validator_rejects_invalid_track_indices(track_indices, match):
     with pytest.raises(ValueError, match=match):
-        _call(track_indices=jnp.asarray(track_indices, dtype=jnp.int32), vendor=vendor)
+        adapter._validate_track_indices(
+            jnp.asarray(track_indices, dtype=jnp.int32),
+            jnp.asarray([1, 2, 3], dtype=jnp.int32),
+            pool_size=8,
+        )
+
+
+def test_local_adapter_does_not_repeat_track_validation(monkeypatch):
+    def vendor(qkv, b, a, conv_state, recurrent_state, *args, **kwargs):
+        del b, a, args, kwargs
+        output = jnp.zeros((qkv.shape[0], N_V * D_V), dtype=qkv.dtype)
+        return (conv_state, recurrent_state), output
+
+    monkeypatch.setattr(
+        adapter,
+        "_validate_track_indices",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("local shard must not repeat track validation")
+        ),
+    )
+
+    _call(track_indices=jnp.asarray([4, 5, 6], dtype=jnp.int32), vendor=vendor)
 
 
 def test_forward_extend_rejects_active_dummy_track_before_vendor(monkeypatch):
-    monkeypatch.setenv("SGLANG_JAX_GDN_PREFILL_IMPL", "tpu_inference_v3")
+    monkeypatch.setenv("SGLANG_JAX_GDN_PREFILL_IMPL", "fused_chunk_parallel")
+    monkeypatch.setenv(adapter._TRACK_VALIDATION_ENV, "1")
     monkeypatch.setattr(
         gdn_backend,
-        "validate_tpu_inference_v3_capability",
+        "validate_fused_chunk_parallel_capability",
         lambda **_: None,
     )
 
@@ -287,7 +305,7 @@ def test_forward_extend_rejects_active_dummy_track_before_vendor(monkeypatch):
         del args, kwargs
         raise AssertionError("vendor must not run for invalid active track metadata")
 
-    monkeypatch.setattr(adapter, "_vendor_fused_conv1d_gdn", vendor)
+    monkeypatch.setattr(adapter, "_fused_chunk_parallel_kernel", vendor)
     backend = gdn_backend.GDNAttnBackend(
         num_k_heads=N_KQ,
         num_v_heads=N_V,
@@ -320,6 +338,7 @@ def test_forward_extend_rejects_active_dummy_track_before_vendor(monkeypatch):
 
 
 def test_prefill_rejects_track_outside_dp_local_pool_before_shard_map(monkeypatch):
+    monkeypatch.setenv(adapter._TRACK_VALIDATION_ENV, "1")
     metadata = LinearRecurrentAttnBackendMetadata(
         cu_q_lens=jnp.asarray([0, 1, 2], dtype=jnp.int32),
         recurrent_indices=jnp.asarray([1, 1], dtype=jnp.int32),
@@ -346,7 +365,7 @@ def test_prefill_rejects_track_outside_dp_local_pool_before_shard_map(monkeypatc
     )
 
     with pytest.raises(ValueError, match="out of range"):
-        adapter.tpu_inference_v3_prefill(
+        adapter.fused_chunk_parallel_prefill(
             backend,
             jnp.ones((2, DIM), dtype=jnp.bfloat16),
             jnp.zeros((8, DIM, KERNEL_SIZE - 1), dtype=jnp.bfloat16),
@@ -361,6 +380,7 @@ def test_prefill_rejects_track_outside_dp_local_pool_before_shard_map(monkeypatc
 
 
 def test_jitted_invalid_track_does_not_execute_vendor(monkeypatch):
+    monkeypatch.setenv(adapter._TRACK_VALIDATION_ENV, "1")
     vendor_calls = []
 
     def vendor(qkv, b, a, conv_state, recurrent_state, *args, **kwargs):
@@ -368,7 +388,7 @@ def test_jitted_invalid_track_does_not_execute_vendor(monkeypatch):
         jax.debug.callback(lambda: vendor_calls.append("called"))
         return (conv_state, recurrent_state), jnp.zeros((qkv.shape[0], N_V * D_V), dtype=qkv.dtype)
 
-    monkeypatch.setattr(adapter, "_vendor_fused_conv1d_gdn", vendor)
+    monkeypatch.setattr(adapter, "_fused_chunk_parallel_kernel", vendor)
     mesh = _mesh()
 
     @jax.jit
@@ -388,7 +408,7 @@ def test_jitted_invalid_track_does_not_execute_vendor(monkeypatch):
             head_v_dim=D_V,
             conv_kernel_size=KERNEL_SIZE,
         )
-        return adapter.tpu_inference_v3_prefill(
+        return adapter.fused_chunk_parallel_prefill(
             backend,
             jnp.ones((1, DIM), dtype=jnp.bfloat16),
             jnp.zeros((3, DIM, KERNEL_SIZE - 1), dtype=jnp.bfloat16),
@@ -421,14 +441,21 @@ class _ForwardFixture:
 
 
 def test_forward_extend_executes_the_callable_frozen_at_initialization(monkeypatch):
-    monkeypatch.setenv("SGLANG_JAX_GDN_PREFILL_IMPL", "tpu_inference_v3")
+    monkeypatch.setenv("SGLANG_JAX_GDN_PREFILL_IMPL", "fused_chunk_parallel")
     monkeypatch.setattr(
         gdn_backend,
-        "validate_tpu_inference_v3_capability",
+        "validate_fused_chunk_parallel_capability",
         lambda **_: None,
     )
     fixture = _ForwardFixture()
-    monkeypatch.setattr(adapter, "_vendor_fused_conv1d_gdn", fixture.vendor, raising=False)
+    monkeypatch.setattr(adapter, "_fused_chunk_parallel_kernel", fixture.vendor, raising=False)
+    monkeypatch.setattr(
+        adapter,
+        "_validate_track_indices_per_dp",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("production prefill must not build debug validation")
+        ),
+    )
     backend = gdn_backend.GDNAttnBackend(
         num_k_heads=N_KQ,
         num_v_heads=N_V,
@@ -440,10 +467,10 @@ def test_forward_extend_executes_the_callable_frozen_at_initialization(monkeypat
     )
     # Mutating both selector state and the backend module's symbol after
     # construction must not replace the initialized callable.
-    monkeypatch.setenv("SGLANG_JAX_GDN_PREFILL_IMPL", "reference")
+    monkeypatch.setenv("SGLANG_JAX_GDN_PREFILL_IMPL", "token_scan")
     monkeypatch.setattr(
         gdn_backend,
-        "tpu_inference_v3_prefill",
+        "fused_chunk_parallel_prefill",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("not frozen")),
     )
 

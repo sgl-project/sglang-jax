@@ -1,4 +1,4 @@
-"""Numerical contract tests for the real TPU-Inference v3 GDN prefill."""
+"""Numerical contract tests for the real fused chunk-parallel GDN prefill."""
 
 from __future__ import annotations
 
@@ -9,18 +9,18 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-import sgl_jax.srt.kernels.gdn.tpu_inference_adapter as adapter
+import sgl_jax.srt.kernels.gdn.fused_chunk_parallel_adapter as adapter
 from sgl_jax.srt.kernels.gdn.gated_delta import (
     decode_gated_delta_rule_ref,
     jax_causal_conv1d_prefill,
     jax_causal_conv1d_update,
     ragged_gated_delta_rule_ref,
 )
-from sgl_jax.srt.kernels.gdn.tpu_inference_v3 import fused_conv1d_gdn
+from sgl_jax.srt.kernels.gdn.fused_chunk_parallel import fused_conv1d_gdn
 
 pytestmark = pytest.mark.skipif(
     not any(device.platform == "tpu" for device in jax.local_devices()),
-    reason="the fused TPU-Inference v3 DMA/state contract requires real TPU hardware",
+    reason="the fused chunk-parallel DMA/state contract requires real TPU hardware",
 )
 
 
@@ -124,8 +124,8 @@ def _vendor_prefill(monkeypatch, f: _Fixture):
         calls.append("actual-v3")
         return fused_conv1d_gdn(*args, **kwargs)
 
-    monkeypatch.setattr(adapter, "_vendor_fused_conv1d_gdn", counted_vendor)
-    result = adapter.fused_conv1d_gdn_prefill(
+    monkeypatch.setattr(adapter, "_fused_chunk_parallel_kernel", counted_vendor)
+    result = adapter._fused_chunk_parallel_prefill_local(
         f.mixed_qkv,
         f.b,
         f.a,

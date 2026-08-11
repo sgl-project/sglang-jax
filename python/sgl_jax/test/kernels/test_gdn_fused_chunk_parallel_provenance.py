@@ -1,4 +1,4 @@
-"""Contract tests for the frozen TPU-Inference GDN v3 vendor snapshot."""
+"""Contract tests for the frozen fused chunk-parallel GDN v3 vendor snapshot."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import importlib
 import sys
 from pathlib import Path
 
-VENDOR_DIR = Path(__file__).parents[2] / "srt" / "kernels" / "gdn" / "tpu_inference_v3"
+VENDOR_DIR = Path(__file__).parents[2] / "srt" / "kernels" / "gdn" / "fused_chunk_parallel"
 PROVENANCE = VENDOR_DIR / "PROVENANCE.md"
 MODULES = {
     "__init__.py",
@@ -19,7 +19,7 @@ MODULES = {
     "vmem_ldst.py",
     "wrapper.py",
 }
-PACKAGE_NAME = "sgl_jax.srt.kernels.gdn.tpu_inference_v3"
+PACKAGE_NAME = "sgl_jax.srt.kernels.gdn.fused_chunk_parallel"
 
 
 def test_vendor_snapshot_has_only_the_approved_modules_and_headers():

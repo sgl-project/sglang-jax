@@ -21,7 +21,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sgl_jax.srt.kernels.gdn.tpu_inference_v3 import config
+from sgl_jax.srt.kernels.gdn.fused_chunk_parallel import config
 
 
 @jax.tree_util.register_dataclass

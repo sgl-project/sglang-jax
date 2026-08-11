@@ -37,12 +37,12 @@ from jax.sharding import PartitionSpec as P
 from sgl_jax.srt.kernels.gdn import (
     chunked_gated_delta_rule_jax,
     decode_gated_delta_rule_ref,
+    fused_chunk_parallel_prefill,
     jax_causal_conv1d_prefill,
     jax_causal_conv1d_update,
-    tpu_inference_v3_prefill,
 )
-from sgl_jax.srt.kernels.gdn.tpu_inference_adapter import (
-    validate_tpu_inference_v3_capability,
+from sgl_jax.srt.kernels.gdn.fused_chunk_parallel_adapter import (
+    validate_fused_chunk_parallel_capability,
 )
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     LinearRecurrentAttnBackend,
@@ -124,21 +124,20 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
                 f"of num_k_heads={num_k_heads} (GQA repeat factor)."
             )
 
-        self.requested_prefill_impl = os.environ.get("SGLANG_JAX_GDN_PREFILL_IMPL", "reference")
-        if self.requested_prefill_impl not in {"reference", "tpu_inference_v3"}:
+        self.prefill_impl = os.environ.get("SGLANG_JAX_GDN_PREFILL_IMPL", "token_scan")
+        if self.prefill_impl not in {"token_scan", "fused_chunk_parallel"}:
             raise ValueError(
-                "SGLANG_JAX_GDN_PREFILL_IMPL must be one of 'reference' or 'tpu_inference_v3'."
+                "SGLANG_JAX_GDN_PREFILL_IMPL must be one of "
+                "'token_scan' or 'fused_chunk_parallel'."
             )
-        self.fallback_reason = None
         self._decode_callable: Callable[..., tuple[jax.Array, jax.Array]] = (
             decode_gated_delta_rule_ref
         )
         self._prefill_callable: Callable[..., tuple[jax.Array, jax.Array, jax.Array]]
-        if self.requested_prefill_impl == "reference":
-            self.effective_prefill_impl = "reference"
-            self._prefill_callable = GDNAttnBackend._forward_extend_reference
+        if self.prefill_impl == "token_scan":
+            self._prefill_callable = GDNAttnBackend._forward_extend_token_scan
         else:
-            validate_tpu_inference_v3_capability(
+            validate_fused_chunk_parallel_capability(
                 mesh=mesh,
                 dtype=dtype,
                 num_k_heads=num_k_heads,
@@ -147,14 +146,8 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
                 head_v_dim=head_v_dim,
                 conv_kernel_size=conv_kernel_size,
             )
-            self.effective_prefill_impl = "tpu_inference_v3"
-            self._prefill_callable = tpu_inference_v3_prefill
-        logger.info(
-            "GDN prefill implementation requested=%s effective=%s fallback_reason=%s",
-            self.requested_prefill_impl,
-            self.effective_prefill_impl,
-            self.fallback_reason,
-        )
+            self._prefill_callable = fused_chunk_parallel_prefill
+        logger.info("GDN prefill implementation=%s", self.prefill_impl)
 
     # ------------------------------------------------------------------
     # Dispatch
@@ -375,7 +368,7 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
             seq_lens,
         )
 
-    def _forward_extend_reference(
+    def _forward_extend_token_scan(
         self,
         mixed_qkv: jax.Array,
         conv_state_in: jax.Array,
@@ -387,7 +380,7 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
         dt_bias: jax.Array,
         seq_lens: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """Packed ragged batch through ``chunked_gated_delta_rule_jax``."""
+        """Process a packed ragged batch with the chunked JAX implementation."""
         del seq_lens
         meta = self.forward_metadata
         cu_seqlens = meta.cu_q_lens

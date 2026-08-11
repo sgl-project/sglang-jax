@@ -359,18 +359,23 @@ suites = {
         ),
         TestFile("python/sgl_jax/test/models/test_qwen3_5.py", 2, runner="pytest"),
         TestFile(
-            "python/sgl_jax/test/kernels/test_gdn_tpu_inference_v3_vendor.py",
+            "python/sgl_jax/test/kernels/test_gdn_fused_chunk_parallel_provenance.py",
             0.1,
             runner="pytest",
         ),
         TestFile(
-            "python/sgl_jax/test/test_gdn_tpu_inference_prefill_dispatch.py",
+            "python/sgl_jax/test/test_gdn_prefill_dispatch.py",
             0.2,
             runner="pytest",
         ),
         TestFile(
-            "python/sgl_jax/test/test_gdn_tpu_inference_state_contract.py",
+            "python/sgl_jax/test/test_gdn_fused_chunk_parallel_state_contract.py",
             0.5,
+            runner="pytest",
+        ),
+        TestFile(
+            "python/sgl_jax/test/test_gdn_fused_chunk_parallel_prefill.py",
+            3,
             runner="pytest",
         ),
         TestFile(
@@ -432,12 +437,7 @@ suites = {
         TestFile("python/sgl_jax/test/test_gdn_attention.py", 6.5),
         TestFile("python/sgl_jax/test/test_gdn_attention_dp.py", 6),
         TestFile(
-            "python/sgl_jax/test/test_gdn_tpu_inference_prefill.py",
-            3,
-            runner="pytest",
-        ),
-        TestFile(
-            "python/sgl_jax/test/test_gdn_tpu_inference_prefill_dp.py",
+            "python/sgl_jax/test/test_gdn_fused_chunk_parallel_prefill_dp.py",
             0.2,
             runner="pytest",
         ),

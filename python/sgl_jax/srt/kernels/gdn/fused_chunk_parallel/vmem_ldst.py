@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
-from sgl_jax.srt.kernels.gdn.tpu_inference_v3 import config, memory_ref
+from sgl_jax.srt.kernels.gdn.fused_chunk_parallel import config, memory_ref
 
 
 def load_as_qkv_large(
