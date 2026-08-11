@@ -127,7 +127,7 @@ Pass/fail is conveyed through the process **exit code**:
 
 ## Triggering CI
 
-The v6e-4 suites run on the `arc-runner-v6e-4` runner via
+The v6e-4 suites run on the `arc-runner-v6e-4-us-south1-ai1b` runner via
 `.github/workflows/nightly-test-daily.yml`:
 
 - `nightly-test-accuracy-text-models-4-tpu-daily` → `--suite accuracy-text-models-v6e-4`

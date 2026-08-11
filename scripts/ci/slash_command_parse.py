@@ -115,9 +115,9 @@ def format_nightly_list():
 
 
 RUNNER_SUFFIXES = [
-    ("-cpu", "arc-runner-cpu"),
-    ("-v6e-4", "arc-runner-v6e-4"),
-    ("-v6e-1", "arc-runner-v6e-1"),
+    ("-cpu", "arc-runner-cpu-us-south1-b"),
+    ("-v6e-4", "arc-runner-v6e-4-us-south1-ai1b"),
+    ("-v6e-1", "arc-runner-v6e-1-us-south1-ai1b"),
 ]
 
 STAGE_JOBS = {
@@ -145,15 +145,15 @@ STAGE_ALIASES = {
 }
 
 JOB_TO_SUITE = {
-    "unit-test-1-tpu": ("unit-test-tpu-v6e-1", "arc-runner-v6e-1"),
-    "unit-test-cpu": ("unit-test-cpu", "arc-runner-cpu"),
-    "unit-test-4-tpu": ("unit-test-tpu-v6e-4", "arc-runner-v6e-4"),
-    "e2e-test-1-tpu": ("e2e-test-tpu-v6e-1", "arc-runner-v6e-1"),
-    "e2e-test-4-tpu": ("e2e-test-tpu-v6e-4", "arc-runner-v6e-4"),
-    "accuracy-test-1-tpu": ("accuracy-test-tpu-v6e-1", "arc-runner-v6e-1"),
-    "accuracy-test-4-tpu": ("accuracy-test-tpu-v6e-4", "arc-runner-v6e-4"),
-    "performance-test-1-tpu": ("performance-test-tpu-v6e-1", "arc-runner-v6e-1"),
-    "performance-test-4-tpu": ("performance-test-tpu-v6e-4", "arc-runner-v6e-4"),
+    "unit-test-1-tpu": ("unit-test-tpu-v6e-1", "arc-runner-v6e-1-us-south1-ai1b"),
+    "unit-test-cpu": ("unit-test-cpu", "arc-runner-cpu-us-south1-b"),
+    "unit-test-4-tpu": ("unit-test-tpu-v6e-4", "arc-runner-v6e-4-us-south1-ai1b"),
+    "e2e-test-1-tpu": ("e2e-test-tpu-v6e-1", "arc-runner-v6e-1-us-south1-ai1b"),
+    "e2e-test-4-tpu": ("e2e-test-tpu-v6e-4", "arc-runner-v6e-4-us-south1-ai1b"),
+    "accuracy-test-1-tpu": ("accuracy-test-tpu-v6e-1", "arc-runner-v6e-1-us-south1-ai1b"),
+    "accuracy-test-4-tpu": ("accuracy-test-tpu-v6e-4", "arc-runner-v6e-4-us-south1-ai1b"),
+    "performance-test-1-tpu": ("performance-test-tpu-v6e-1", "arc-runner-v6e-1-us-south1-ai1b"),
+    "performance-test-4-tpu": ("performance-test-tpu-v6e-4", "arc-runner-v6e-4-us-south1-ai1b"),
 }
 
 

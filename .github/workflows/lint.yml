@@ -4,16 +4,18 @@ on: [ pull_request ]
 
 jobs:
   lint:
-    runs-on: arc-runner-cpu
+    runs-on: arc-runner-cpu-us-south1-b
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
+        with:
+          install-target: ''
+          extra-packages: pre-commit
+
       - name: Install pre-commit hook
-        run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install pre-commit
-          pre-commit install
+        run: pre-commit install
 
       - name: Linting
         run: |

@@ -11,7 +11,7 @@ on:
         default: '24'
         type: string
       filter:
-        description: 'Filter runner labels (e.g., arc-runner-v6e-1, arc-runner-v6e-4)'
+        description: 'Filter runner labels (e.g., arc-runner-v6e-1-us-south1-ai1b, arc-runner-v6e-4-us-south1-ai1b)'
         required: false
         type: string
 
