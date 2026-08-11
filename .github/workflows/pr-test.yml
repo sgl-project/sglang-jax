@@ -45,6 +45,11 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
+      - name: Install Python venv support on the canary runner
+        if: matrix.runner == 'arc-runner-v6e-1-us-south1-canary'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3.12-venv
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
       - name: Run unit test
