@@ -13,6 +13,38 @@ from sgl_jax.srt.kernels.radix_topk.tuned_configs import (
 _NEG_INF = float("-inf")
 
 
+def _validate_scores(scores: jax.Array, k: int) -> None:
+    if scores.ndim != 2:
+        raise ValueError(f"DSA top-k scores must be rank 2, got shape={scores.shape}")
+    if scores.dtype != jnp.float32:
+        raise TypeError(f"DSA top-k scores must be float32, got dtype={scores.dtype}")
+    if not 1 <= k <= scores.shape[-1]:
+        raise ValueError(f"index_topk must be in [1, {scores.shape[-1]}], got {k}")
+
+
+def select_indexer_radix_topk_indices(scores: jax.Array, *, k: int) -> jax.Array:
+    """Return exact unordered radix top-k positions without selected scores."""
+
+    _validate_scores(scores, k)
+    from sgl_jax.srt.kernels.radix_topk import radix_topk_pallas
+
+    config = get_tuned_radix_topk_config(scores.shape[-1], k)
+    if config is None:
+        config = DEFAULT_RADIX_TOPK_CONFIG
+    padding = (-scores.shape[-1]) % config.input_alignment
+    padded_scores = jnp.pad(scores, ((0, 0), (0, padding)), constant_values=_NEG_INF)
+    return radix_topk_pallas(
+        padded_scores,
+        k=k,
+        use_approx_top_k=False,
+        num_seq_windows=config.num_seq_windows,
+        digit_width=config.digit_width,
+        num_digits=config.num_digits,
+        use_tc_tiling_on_sc=config.use_tc_tiling_on_sc,
+        indices_only=True,
+    )[..., :k]
+
+
 def select_indexer_topk(
     scores: jax.Array,
     *,
@@ -28,12 +60,7 @@ def select_indexer_topk(
     as a set.
     """
 
-    if scores.ndim != 2:
-        raise ValueError(f"DSA top-k scores must be rank 2, got shape={scores.shape}")
-    if scores.dtype != jnp.float32:
-        raise TypeError(f"DSA top-k scores must be float32, got dtype={scores.dtype}")
-    if not 1 <= k <= scores.shape[-1]:
-        raise ValueError(f"index_topk must be in [1, {scores.shape[-1]}], got {k}")
+    _validate_scores(scores, k)
 
     if implementation == "exact_lax":
         return jax.lax.top_k(scores, k)
@@ -48,24 +75,11 @@ def select_indexer_topk(
         return _order_candidates(candidate_values, candidate_indices, k=k)
 
     if implementation == "radix":
-        from sgl_jax.srt.kernels.radix_topk import radix_topk_pallas
-
-        config = get_tuned_radix_topk_config(scores.shape[-1], k)
-        if config is None:
-            config = DEFAULT_RADIX_TOPK_CONFIG
-        # Runtime cache buckets are page-aligned but need not satisfy the tuned
-        # SparseCore window alignment, so make that constraint local here.
-        padding = (-scores.shape[-1]) % config.input_alignment
-        padded_scores = jnp.pad(scores, ((0, 0), (0, padding)), constant_values=_NEG_INF)
-        candidate_values, candidate_indices = radix_topk_pallas(
-            padded_scores,
-            k=k,
-            use_approx_top_k=False,
-            num_seq_windows=config.num_seq_windows,
-            digit_width=config.digit_width,
-            num_digits=config.num_digits,
-            use_tc_tiling_on_sc=config.use_tc_tiling_on_sc,
-        )
+        candidate_indices = select_indexer_radix_topk_indices(scores, k=k)
+        in_bounds = (candidate_indices >= 0) & (candidate_indices < scores.shape[-1])
+        safe_indices = jnp.clip(candidate_indices, 0, scores.shape[-1] - 1)
+        candidate_values = jnp.take_along_axis(scores, safe_indices, axis=-1)
+        candidate_values = jnp.where(in_bounds, candidate_values, _NEG_INF)
         # Radix selection already returns the exact top-k set. Sorting that
         # K-sized set again adds an XLA sort but does not change sparse
         # attention, whose gather is permutation invariant.

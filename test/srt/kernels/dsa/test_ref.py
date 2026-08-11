@@ -5,12 +5,16 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from sgl_jax.srt.kernels.dsa.ref import (
+from sgl_jax.srt.kernels.dsa.indexer import (
     _mask_and_compact_topk_indices,
+    _select_topk_indices,
+    compute_scores_and_select_topk_indices,
+)
+from sgl_jax.srt.kernels.dsa.ref import (
     build_index_share_map,
-    score_and_select_index_tokens,
     sparse_mla_ref,
     streamindex_page_topk_ref,
+    streamindex_topk_ref,
 )
 
 
@@ -22,6 +26,28 @@ def test_mask_and_compact_topk_indices_preserves_unordered_valid_set():
 
     np.testing.assert_array_equal(got[0], np.asarray([9, 5, -1, -1]))
     np.testing.assert_array_equal(got[1], np.asarray([7, 2, 6, 4]))
+
+
+def test_radix_indices_only_uses_valid_lengths_without_score_gather(monkeypatch):
+    import sgl_jax.srt.kernels.dsa.indexer as indexer
+
+    selected = jnp.asarray([[2, 7, 0, 6], [7, 1, 4, 3]], dtype=jnp.int32)
+    monkeypatch.setattr(
+        indexer,
+        "select_indexer_radix_topk_indices",
+        lambda scores, *, k: selected,
+    )
+
+    got = _select_topk_indices(
+        jnp.zeros((2, 8), dtype=jnp.float32),
+        jnp.asarray([3, 8], dtype=jnp.int32),
+        k=4,
+        topk_impl="radix",
+    )
+
+    np.testing.assert_array_equal(np.asarray(got[0]), np.asarray([2, 0, -1, -1]))
+    np.testing.assert_array_equal(np.asarray(got[1]), np.asarray([7, 1, 4, 3]))
+
 
 jax.config.update("jax_platform_name", "cpu")
 
@@ -71,7 +97,41 @@ def _make_paged(keys_flat: np.ndarray, page_size: int):
     return pages, np.arange(pages.shape[0], dtype=np.int32)
 
 
-def test_score_and_select_index_tokens_matches_numpy():
+def test_streamindex_topk_ref_matches_numpy_exactly():
+    rng = np.random.default_rng(0)
+    T, H, D, KV, page_size, k = 4, 2, 8, 32, 8, 5
+    q = rng.normal(size=(T, H, D)).astype(np.float32)
+    weights = rng.normal(size=(T, H)).astype(np.float32)
+    keys = rng.normal(size=(KV, D)).astype(np.float32)
+    cache, page_idx = _make_paged(keys, page_size)
+
+    got = np.asarray(
+        streamindex_topk_ref(
+            jnp.asarray(q),
+            jnp.asarray(weights),
+            jnp.asarray(cache),
+            jnp.asarray([KV], np.int32),
+            jnp.asarray(page_idx),
+            jnp.asarray([0, T], np.int32),
+            jnp.asarray([0, cache.shape[0] * page_size], np.int32),
+            jnp.asarray([0, 1, 1], np.int32),
+            k=k,
+            pages_per_seq=cache.shape[0],
+        )
+    )
+
+    for token_id in range(T):
+        abs_pos = KV - T + token_id
+        scores = np.einsum(
+            "h,hk->k",
+            weights[token_id],
+            np.maximum(np.einsum("hd,kd->hk", q[token_id], keys), 0),
+        )
+        scores[abs_pos + 1 :] = -np.inf
+        np.testing.assert_array_equal(got[token_id], np.argsort(-scores)[:k])
+
+
+def test_compute_scores_and_select_topk_indices_extend_matches_numpy():
     rng = np.random.default_rng(0)
     T, H, D, KV, page_size, k = 4, 2, 8, 32, 8, 5
     q = rng.normal(size=(T, H, D)).astype(np.float32)
@@ -84,7 +144,7 @@ def test_score_and_select_index_tokens_matches_numpy():
     dist = np.array([0, 1, 1], np.int32)
 
     got = np.asarray(
-        score_and_select_index_tokens(
+        compute_scores_and_select_topk_indices(
             jnp.array(q),
             jnp.array(weights),
             jnp.array(cache),
@@ -114,7 +174,9 @@ def test_score_and_select_index_tokens_matches_numpy():
 
 
 @pytest.mark.parametrize("score_query_block_size", [1, 14])
-def test_score_and_select_index_tokens_exact_topk_matches_numpy(score_query_block_size):
+def test_compute_scores_and_select_topk_indices_extend_exact_topk_matches_numpy(
+    score_query_block_size,
+):
     rng = np.random.default_rng(11)
     T, H, D, KV, page_size, k = 3, 2, 8, 24, 8, 7
     q = rng.normal(size=(T, H, D)).astype(np.float32)
@@ -123,7 +185,7 @@ def test_score_and_select_index_tokens_exact_topk_matches_numpy(score_query_bloc
     cache, page_idx = _make_paged(keys, page_size)
 
     got = np.asarray(
-        score_and_select_index_tokens(
+        compute_scores_and_select_topk_indices(
             jnp.array(q),
             jnp.array(weights),
             jnp.array(cache),
@@ -151,7 +213,7 @@ def test_score_and_select_index_tokens_exact_topk_matches_numpy(score_query_bloc
         np.testing.assert_array_equal(got[t], expected)
 
 
-def test_score_and_select_index_tokens_packed_multiseq_matches_numpy():
+def test_compute_scores_and_select_topk_indices_extend_packed_multiseq_matches_numpy():
     """Ragged extend scores each packed query once against its own sequence."""
     rng = np.random.default_rng(17)
     H, D, page_size, k = 2, 8, 4, 5
@@ -161,9 +223,7 @@ def test_score_and_select_index_tokens_packed_multiseq_matches_numpy():
 
     q = rng.normal(size=(T, H, D)).astype(np.float32)
     weights = rng.normal(size=(T, H)).astype(np.float32)
-    seq_keys = [
-        rng.normal(size=(int(kv_len), D)).astype(np.float32) for kv_len in kv_lens
-    ]
+    seq_keys = [rng.normal(size=(int(kv_len), D)).astype(np.float32) for kv_len in kv_lens]
 
     # Ragged-packed page table: seq0 owns two pages, seq1 owns three, and the
     # final page is static padding so page_indices.shape[0] / S == 3.
@@ -174,7 +234,7 @@ def test_score_and_select_index_tokens_packed_multiseq_matches_numpy():
     cu_kv_lens = np.array([0, 8, 20], np.int32)
 
     got = np.asarray(
-        score_and_select_index_tokens(
+        compute_scores_and_select_topk_indices(
             jnp.asarray(q),
             jnp.asarray(weights),
             jnp.asarray(cache),
@@ -205,7 +265,7 @@ def test_score_and_select_index_tokens_packed_multiseq_matches_numpy():
             np.testing.assert_array_equal(got[token_id], expected)
 
 
-def test_score_and_select_index_tokens_multiblock_ragged_matches_numpy():
+def test_compute_scores_and_select_topk_indices_extend_multiblock_ragged_matches_numpy():
     """A sequence crossing the fixed query-block boundary is scored once."""
     rng = np.random.default_rng(19)
     H, D, page_size, k = 2, 4, 8, 4
@@ -215,9 +275,7 @@ def test_score_and_select_index_tokens_multiblock_ragged_matches_numpy():
 
     q = rng.normal(size=(T, H, D)).astype(np.float32)
     weights = (np.abs(rng.normal(size=(T, H))) + 0.1).astype(np.float32)
-    seq_keys = [
-        rng.normal(size=(int(kv_len), D)).astype(np.float32) for kv_len in kv_lens
-    ]
+    seq_keys = [rng.normal(size=(int(kv_len), D)).astype(np.float32) for kv_len in kv_lens]
 
     pages_per_seq = 33
     total_pages = pages_per_seq * len(kv_lens)
@@ -229,7 +287,7 @@ def test_score_and_select_index_tokens_multiblock_ragged_matches_numpy():
     cu_kv_lens = np.array([0, 264, 280], np.int32)
 
     got = np.asarray(
-        score_and_select_index_tokens(
+        compute_scores_and_select_topk_indices(
             jnp.asarray(q),
             jnp.asarray(weights),
             jnp.asarray(cache),
@@ -262,7 +320,7 @@ def test_score_and_select_index_tokens_multiblock_ragged_matches_numpy():
             )
 
 
-def test_score_and_select_index_tokens_three_block_pipeline_matches_numpy():
+def test_compute_scores_and_select_topk_indices_extend_three_block_pipeline_matches_numpy():
     """The score/top-k pipeline handles fill, repeated overlap, and drain."""
     rng = np.random.default_rng(23)
     T, H, D, KV, page_size, k = 513, 2, 4, 520, 8, 7
@@ -272,7 +330,7 @@ def test_score_and_select_index_tokens_three_block_pipeline_matches_numpy():
     cache, page_idx = _make_paged(keys, page_size)
 
     got = np.asarray(
-        score_and_select_index_tokens(
+        compute_scores_and_select_topk_indices(
             jnp.asarray(q),
             jnp.asarray(weights),
             jnp.asarray(cache),
@@ -299,8 +357,10 @@ def test_score_and_select_index_tokens_three_block_pipeline_matches_numpy():
 
 
 @pytest.mark.parametrize("active_num_seqs", [0, 1, 2, 3])
-def test_score_and_select_index_tokens_decode_pipeline_matches_general(active_num_seqs):
-    """Decode ping-pong matches general scoring at every pipeline boundary."""
+def test_compute_scores_and_select_topk_indices_decode_matches_extend(
+    active_num_seqs,
+):
+    """Decode batched top-k matches extend scoring for one query per sequence."""
     rng = np.random.default_rng(29)
     H, D, page_size, pages_per_seq, k = 2, 8, 8, 4, 4
     kv_lens = [24, 31, 0]
@@ -320,34 +380,44 @@ def test_score_and_select_index_tokens_decode_pipeline_matches_general(active_nu
         seq_pages = np.concatenate([seq_pages, padding]) if padding.size else seq_pages
         page_start = len(pages) * pages_per_seq
         pages.append(seq_pages)
-        page_indices.append(
-            np.arange(page_start, page_start + pages_per_seq, dtype=np.int32)
-        )
+        page_indices.append(np.arange(page_start, page_start + pages_per_seq, dtype=np.int32))
 
-    args = (
-        jnp.asarray(q),
-        jnp.asarray(weights),
-        jnp.asarray(np.concatenate(pages)),
-        jnp.asarray(kv_lens, np.int32),
-        jnp.asarray(np.concatenate(page_indices)),
-        jnp.asarray(np.arange(num_seqs + 1), np.int32),
-        jnp.asarray(
-            [i * pages_per_seq * page_size for i in range(num_seqs + 1)],
-            np.int32,
-        ),
-        jnp.asarray([0, active_num_seqs, active_num_seqs], np.int32),
+    q_array = jnp.asarray(q)
+    weights_array = jnp.asarray(weights)
+    cache = jnp.asarray(np.concatenate(pages))
+    seq_lens = jnp.asarray(kv_lens, np.int32)
+    page_indices = jnp.asarray(np.concatenate(page_indices))
+    cu_q_lens = jnp.asarray(np.arange(num_seqs + 1), np.int32)
+    cu_kv_lens = jnp.asarray(
+        [i * pages_per_seq * page_size for i in range(num_seqs + 1)],
+        np.int32,
     )
-    general = np.asarray(
-        score_and_select_index_tokens(
-            *args,
+    distribution = jnp.asarray([0, active_num_seqs, active_num_seqs], np.int32)
+    extend = np.asarray(
+        compute_scores_and_select_topk_indices(
+            q_array,
+            weights_array,
+            cache,
+            seq_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            distribution,
             k=k,
             pages_per_seq=pages_per_seq,
             topk_impl="exact_lax",
         )
     )
     decode = np.asarray(
-        score_and_select_index_tokens(
-            *args,
+        compute_scores_and_select_topk_indices(
+            q_array,
+            weights_array,
+            cache,
+            seq_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            distribution,
             k=k,
             pages_per_seq=pages_per_seq,
             one_token_per_seq=True,
@@ -355,11 +425,11 @@ def test_score_and_select_index_tokens_decode_pipeline_matches_general(active_nu
         )
     )
 
-    np.testing.assert_array_equal(decode, general)
+    np.testing.assert_array_equal(decode, extend)
     assert (decode[-1] == -1).all()
 
 
-def test_score_and_select_index_tokens_skips_inactive_sequences():
+def test_compute_scores_and_select_topk_indices_extend_skips_inactive_sequences():
     """Rows beyond distribution.num_seqs stay padded in the extend pipeline."""
     rng = np.random.default_rng(31)
     T, H, D, page_size, pages_per_seq, k = 4, 2, 4, 4, 2, 3
@@ -368,7 +438,7 @@ def test_score_and_select_index_tokens_skips_inactive_sequences():
     cache = rng.normal(size=(4, page_size, D)).astype(np.float32)
 
     got = np.asarray(
-        score_and_select_index_tokens(
+        compute_scores_and_select_topk_indices(
             jnp.asarray(q),
             jnp.asarray(weights),
             jnp.asarray(cache),
@@ -784,14 +854,7 @@ def test_page_topk_top1_page_contains_top1_token():
         jnp.array([0, pages_per_seq * page_size], np.int32),
         jnp.array([0, 1, 1], np.int32),
     )
-    top1_token = np.asarray(
-        score_and_select_index_tokens(
-            *args,
-            k=1,
-            pages_per_seq=pages_per_seq,
-            topk_impl="approx",
-        )
-    )[0, 0]
+    top1_token = np.asarray(streamindex_topk_ref(*args, k=1, pages_per_seq=pages_per_seq))[0, 0]
     top1_page = np.asarray(
         streamindex_page_topk_ref(*args, k_pages=1, pages_per_seq=pages_per_seq)
     )[0, 0]

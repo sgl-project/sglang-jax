@@ -1,7 +1,8 @@
 """Standalone GLM-5.2 DSA indexer score + top-k microbenchmark.
 
 The default shape models two independent sequences with a 128K cached prefix
-and a 1K extend each. It invokes only ``score_and_select_index_tokens``: no
+and a 1K extend each. It invokes only
+``compute_scores_and_select_topk_indices``: no
 model weights, server, HTTP traffic, prefix warmup, or MLA attention.
 """
 
@@ -17,7 +18,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from sgl_jax.srt.kernels.dsa.ref import score_and_select_index_tokens
+from sgl_jax.srt.kernels.dsa.indexer import (
+    _INDEXER_QUERY_BLOCK_SIZE,
+    compute_scores_and_select_topk_indices,
+)
 
 
 @dataclass(frozen=True)
@@ -130,7 +134,7 @@ def _make_run(
 ):
     def run(inputs: dict[str, jax.Array]) -> jax.Array:
         with jax.named_scope("dsa_indexer_topk_microbench"):
-            return score_and_select_index_tokens(
+            return compute_scores_and_select_topk_indices(
                 inputs["q_idx"],
                 inputs["idx_weights"],
                 inputs["index_key_cache"],
@@ -203,7 +207,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--page-size", type=int, default=64)
     parser.add_argument("--num-heads", type=int, default=32)
     parser.add_argument("--head-dim", type=int, default=128)
-    parser.add_argument("--score-query-block-size", type=int, default=14)
+    parser.add_argument(
+        "--score-query-block-size",
+        type=int,
+        default=_INDEXER_QUERY_BLOCK_SIZE,
+    )
     parser.add_argument(
         "--q-dtype",
         choices=("float32", "bfloat16"),

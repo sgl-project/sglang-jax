@@ -39,10 +39,11 @@ def test_radix_dispatch_pads_and_preserves_unordered_exact_set(monkeypatch):
             "digit_width": 8,
             "num_digits": 4,
             "use_tc_tiling_on_sc": False,
+            "indices_only": True,
         }
-        values, indices = jax.lax.top_k(keys, k)
+        _, indices = jax.lax.top_k(keys, k)
         # The real radix kernel returns an exact, potentially unordered set.
-        return values[:, ::-1], indices[:, ::-1]
+        return indices[:, ::-1]
 
     monkeypatch.setitem(
         sys.modules,
@@ -86,8 +87,9 @@ def test_radix_dispatch_uses_score_size_topk_tuned_config(monkeypatch):
             "digit_width": 8,
             "num_digits": 4,
             "use_tc_tiling_on_sc": True,
+            "indices_only": True,
         }
-        return jax.lax.top_k(keys, k)
+        return jax.lax.top_k(keys, k)[1]
 
     monkeypatch.setattr(dsa_topk, "get_tuned_radix_topk_config", fake_lookup)
     monkeypatch.setitem(

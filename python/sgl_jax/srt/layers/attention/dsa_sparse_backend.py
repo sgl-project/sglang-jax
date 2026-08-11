@@ -325,9 +325,7 @@ def _scatter_fused_kv_paged(
 ) -> jax.Array:
     """Pack contiguous latent KV + RoPE into explicit feature-packing axes."""
     packing, packed_dim = cache4d.shape[-2:]
-    packed = jnp.zeros(
-        (new_kv_c.shape[0], packing, packed_dim), dtype=cache4d.dtype
-    )
+    packed = jnp.zeros((new_kv_c.shape[0], packing, packed_dim), dtype=cache4d.dtype)
 
     kv_positions = jnp.arange(kv_lora_rank, dtype=jnp.int32)
     packed = packed.at[:, kv_positions // packed_dim, kv_positions % packed_dim].set(
@@ -335,9 +333,7 @@ def _scatter_fused_kv_paged(
     )
 
     rope_positions = kv_lora_rank + jnp.arange(new_k_pe.shape[-1], dtype=jnp.int32)
-    packed = packed.at[
-        :, rope_positions // packed_dim, rope_positions % packed_dim
-    ].set(
+    packed = packed.at[:, rope_positions // packed_dim, rope_positions % packed_dim].set(
         new_k_pe.astype(cache4d.dtype)
     )
     return scatter_paged_cache(

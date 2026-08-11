@@ -7,10 +7,10 @@ from unittest import mock
 import jax
 
 from sgl_jax.srt.managers.scheduler_profiler_mixing import (
-    _ProfileManager,
-    _StageBasedTrigger,
     _make_profiler_options,
+    _ProfileManager,
     _should_profile_this_process,
+    _StageBasedTrigger,
 )
 
 

@@ -15,9 +15,8 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
-from sgl_jax.srt.kernels.dsa.ref import score_and_select_index_tokens
+from sgl_jax.srt.kernels.dsa.indexer import compute_scores_and_select_topk_indices
 from sgl_jax.srt.layers.attention.dsa_cache_ops import scatter_paged_cache
-from sgl_jax.srt.utils.profiling_utils import named_scope
 
 if TYPE_CHECKING:
     from sgl_jax.srt.layers.attention.mla_backend import MLAAttentionMetadata
@@ -40,7 +39,6 @@ class DSAIndexerOutput:
         return cls(*children)
 
 
-@named_scope("CacheAndTopK")
 def update_index_cache_and_select(
     q_idx: jax.Array,
     k_idx: jax.Array,
@@ -84,31 +82,31 @@ def update_index_cache_and_select(
         cache3d = (
             cache_ if flat_page_layout else cache_.reshape(cache_.shape[0], page_size, idx_dim)
         )
-        cache3d = scatter_paged_cache(
-            cache3d,
-            k_,
-            seq_lens_,
-            pi_,
-            cuq_,
-            cukv_,
-        )
+        with jax.named_scope("IndexCacheWrite"):
+            cache3d = scatter_paged_cache(
+                cache3d,
+                k_,
+                seq_lens_,
+                pi_,
+                cuq_,
+                cukv_,
+            )
 
         if compute_topk:
-            with jax.named_scope("topk"):
-                topk = score_and_select_index_tokens(
-                    q_,
-                    w_,
-                    cache3d,
-                    seq_lens_,
-                    pi_,
-                    cuq_,
-                    cukv_,
-                    dist_,
-                    k=index_topk,
-                    pages_per_seq=pages_per_seq,
-                    one_token_per_seq=one_token_per_seq,
-                    topk_impl=topk_impl,
-                )
+            topk = compute_scores_and_select_topk_indices(
+                q_,
+                w_,
+                cache3d,
+                seq_lens_,
+                pi_,
+                cuq_,
+                cukv_,
+                dist_,
+                k=index_topk,
+                pages_per_seq=pages_per_seq,
+                one_token_per_seq=one_token_per_seq,
+                topk_impl=topk_impl,
+            )
         else:
             # Keep shard_map's output tree static.  The placeholder is discarded
             # immediately after the call and never reaches attention.

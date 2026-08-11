@@ -274,7 +274,8 @@ class GlmDsaIndexer(nnx.Module):
         query = query.reshape(-1, self.n_head, self.head_dim)
 
         key, _ = self.wk(hidden_states)
-        key = self.k_norm(key)
+        with jax.named_scope("IndexKeyNorm"):
+            key = self.k_norm(key)
 
         rope_dim = 64
         q_rope = query[:, :, :rope_dim]
@@ -283,9 +284,10 @@ class GlmDsaIndexer(nnx.Module):
         query = query.at[:, :, :rope_dim].set(q_rope)
         key = key.at[:, :rope_dim].set(k_rope.squeeze(1))
 
-        h_matrix = get_hadamard_matrix(128) * (128**-0.5)
-        query = jnp.einsum("thd,de->the", query, h_matrix)
-        key = jnp.einsum("td,de->te", key, h_matrix)
+        with jax.named_scope("Hadamard"):
+            h_matrix = get_hadamard_matrix(128) * (128**-0.5)
+            query = jnp.einsum("thd,de->the", query, h_matrix)
+            key = jnp.einsum("td,de->te", key, h_matrix)
 
         weights, _ = self.weights_proj(hidden_states)
         return query, key, weights
@@ -860,6 +862,7 @@ class Glm5DecoderLayer(nnx.Module):
         dsa_plan: GlmDsaLayerPlan | None = None,
     ):
         self.layer_id = layer_id
+        self.name = f"Layer_{layer_id:03d}"
         self.hidden_size = config.hidden_size
         rope_params = getattr(config, "rope_parameters", None) or {}
         rope_theta = getattr(config, "rope_theta", None) or rope_params.get("rope_theta", 1000000)
@@ -1067,6 +1070,7 @@ class Glm5DecoderLayer(nnx.Module):
             scope_name="post_attention_layernorm",
         )
 
+    @named_scope
     def __call__(
         self,
         positions: jax.Array,

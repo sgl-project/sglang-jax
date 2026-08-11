@@ -1393,9 +1393,7 @@ class MLATokenToKVPool(KVCache):
                     * jnp.dtype(self.dtype).itemsize
                     / GB,
                 )
-                allocate_indexer = _get_kv_zero_allocator(
-                    idx_shape, self.dtype, indexer_sharding
-                )
+                allocate_indexer = _get_kv_zero_allocator(idx_shape, self.dtype, indexer_sharding)
                 for _ in range(self.num_indexer_layers):
                     self.indexer_key_buffer.append(allocate_indexer())
 
@@ -1442,15 +1440,9 @@ class MLATokenToKVPool(KVCache):
         if self.page_layout == "flat":
             packed_dim = buf.shape[-1]
             kv_positions = jnp.arange(self.kv_lora_rank, dtype=jnp.int32)
-            c_kv = buf[
-                ..., kv_positions // packed_dim, kv_positions % packed_dim
-            ]
-            rope_positions = self.kv_lora_rank + jnp.arange(
-                self.qk_rope_head_dim, dtype=jnp.int32
-            )
-            k_pe = buf[
-                ..., rope_positions // packed_dim, rope_positions % packed_dim
-            ]
+            c_kv = buf[..., kv_positions // packed_dim, kv_positions % packed_dim]
+            rope_positions = self.kv_lora_rank + jnp.arange(self.qk_rope_head_dim, dtype=jnp.int32)
+            k_pe = buf[..., rope_positions // packed_dim, rope_positions % packed_dim]
             return c_kv, k_pe
 
         c_kv = buf[..., : self.kv_lora_rank]

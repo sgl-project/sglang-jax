@@ -1,122 +1,17 @@
-"""JNP reference implementations for DSA sparse attention.
+"""JNP reference implementations and static utilities for DSA sparse attention.
 
-These are correctness oracles for the Pallas kernels in this directory, and
-also serve as the Phase-A e2e path (``--dsa-use-pallas=false``). All functions
-are jit-compatible with static shapes.
+These functions are correctness oracles for the optimized kernels in this
+directory. All functions are jit-compatible with static shapes.
 """
 
 from __future__ import annotations
 
 import functools
-from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
 
-from sgl_jax.srt.kernels.dsa.topk import select_indexer_topk
-
 _NEG_INF = float("-inf")
-# v7x optimum for H=32 and the 135168-token GLM-5.2 score bucket. Sixteen
-# rows cross the dense all-head materialization guard below and fall back to
-# the much slower per-head accumulator loop.
-_INDEXER_QUERY_BLOCK_SIZE = 14
-
-
-def _mask_and_compact_topk_indices(values: jax.Array, indices: jax.Array) -> jax.Array:
-    """Mask invalid candidates and compact them without sorting valid scores."""
-
-    valid = values > _NEG_INF
-    masked = jnp.where(valid, indices, -1)
-
-    def compact_invalid_to_end() -> jax.Array:
-        num_rows, k = indices.shape
-        destination = jnp.where(
-            valid,
-            jnp.cumsum(valid, axis=-1, dtype=jnp.int32) - 1,
-            k,
-        )
-        row = jnp.arange(num_rows, dtype=jnp.int32)[:, None]
-        compacted = jnp.full((num_rows, k + 1), -1, dtype=indices.dtype)
-        compacted = compacted.at[row, destination].set(masked)
-        return compacted[:, :k]
-
-    # Long-context rows have K finite candidates, so the serving hot path
-    # bypasses compaction. Short-context/padded rows take the O(K) fallback to
-    # preserve the valid-prefix ABI required by exact sparse attention.
-    return jax.lax.cond(jnp.all(valid), lambda: masked, compact_invalid_to_end)
-
-
-def _run_score_select_pipeline(
-    num_tiles: jax.Array,
-    score_tile: Callable[[jax.Array], jax.Array],
-    select_and_store_tile: Callable[[jax.Array, jax.Array, jax.Array], jax.Array],
-    out: jax.Array,
-) -> jax.Array:
-    """Ping-pong score construction with selection of the preceding tile."""
-
-    def run_nonempty(pipeline_out):
-        score_buffer_0 = score_tile(jnp.int32(0))
-        score_buffer_1 = jnp.empty_like(score_buffer_0)
-
-        def pipeline_body(tile_id, pipeline_carry):
-            def run_step(current_scores, current_out):
-                # Scoring the next tile and selecting the current tile have no
-                # data dependency, allowing TensorCore/SparseCore overlap.
-                next_scores = score_tile(tile_id + 1)
-                current_out = select_and_store_tile(
-                    tile_id,
-                    current_scores,
-                    current_out,
-                )
-                return next_scores, current_out
-
-            def even_step(buffers):
-                scores_0, scores_1, current_out = buffers
-                next_scores, current_out = run_step(scores_0, current_out)
-                return scores_0, next_scores, current_out
-
-            def odd_step(buffers):
-                scores_0, scores_1, current_out = buffers
-                next_scores, current_out = run_step(scores_1, current_out)
-                return next_scores, scores_1, current_out
-
-            return jax.lax.cond(
-                jax.lax.bitwise_and(tile_id, 1) == 0,
-                even_step,
-                odd_step,
-                pipeline_carry,
-            )
-
-        score_buffer_0, score_buffer_1, pipeline_out = jax.lax.fori_loop(
-            0,
-            num_tiles - 1,
-            pipeline_body,
-            (score_buffer_0, score_buffer_1, pipeline_out),
-        )
-
-        final_tile = num_tiles - 1
-
-        def drain_buffer_0(buffers):
-            scores_0, _, current_out = buffers
-            return select_and_store_tile(final_tile, scores_0, current_out)
-
-        def drain_buffer_1(buffers):
-            _, scores_1, current_out = buffers
-            return select_and_store_tile(final_tile, scores_1, current_out)
-
-        return jax.lax.cond(
-            jax.lax.bitwise_and(final_tile, 1) == 0,
-            drain_buffer_0,
-            drain_buffer_1,
-            (score_buffer_0, score_buffer_1, pipeline_out),
-        )
-
-    return jax.lax.cond(
-        num_tiles > 0,
-        run_nonempty,
-        lambda pipeline_out: pipeline_out,
-        out,
-    )
 
 
 def build_index_share_map(
@@ -152,20 +47,11 @@ def build_index_share_map(
     return full_slot, src_slot, len(full_slot)
 
 
-@functools.partial(
-    jax.jit,
-    static_argnames=(
-        "k",
-        "pages_per_seq",
-        "one_token_per_seq",
-        "topk_impl",
-        "score_query_block_size",
-    ),
-)
-def score_and_select_index_tokens(
-    q_idx: jax.Array,
-    idx_weights: jax.Array,
-    index_key_cache: jax.Array,
+@functools.partial(jax.jit, static_argnames=("k", "pages_per_seq", "one_token_per_seq"))
+def streamindex_topk_ref(
+    q: jax.Array,
+    weights: jax.Array,
+    cache_kv: jax.Array,
     seq_lens: jax.Array,
     page_indices: jax.Array,
     cu_q_lens: jax.Array,
@@ -175,197 +61,83 @@ def score_and_select_index_tokens(
     k: int,
     pages_per_seq: int,
     one_token_per_seq: bool = False,
-    topk_impl: str,
-    score_query_block_size: int = _INDEXER_QUERY_BLOCK_SIZE,
 ) -> jax.Array:
-    """Score cached index keys and select the top-k token positions.
+    """Exact token-level reference for DSA indexer scoring and top-k.
 
-    ``one_token_per_seq=True`` (decode: T == num_seqs, token i belongs to
-    seq i) scores only each iteration's own query row — O(S * max_kv) total
-    instead of O(S * T * max_kv). Each sequence's ``[1, max_kv]`` score row is
-    one pipeline tile, so scoring sequence ``n + 1`` can overlap selection for
-    sequence ``n`` without combining their page tables; see
-    ``streamindex_page_topk_ref``.
+    Scores are ``sum_h relu(q_h . key) * weight_h``. The selected indices are
+    sequence-local KV token positions; causally masked and padding positions
+    are returned as ``-1``. This deliberately uses exact ``jax.lax.top_k`` so
+    it remains an independent oracle for optimized indexer implementations.
 
-    Scores are ``sum_h relu(q_h · k) * w_h`` per DSA semantics. Because ReLU
-    sits before the head sum, the naive ``[T, H, max_kv]`` intermediate OOMs
-    at chunked-prefill sizes. Extend streams fixed-size query blocks through a
-    score/selection software pipeline: while SparseCore selects block ``n``,
-    TensorCore can construct scores for block ``n + 1``. Only the two pipeline
-    score buffers are live instead of one packed ``[T, max_kv]`` allocation.
-
-    Args:
-      q_idx:         f[T, H, D]  indexer query heads
-      idx_weights:   f[T, H]     per-head mixing weights
-      index_key_cache: f[P, page_size, D]  paged indexer keys
-      seq_lens:     i32[S]      kv length per sequence
-      page_indices: i32[N_pages]  packed; seq i's pages start at cu_kv_lens[i]//page_size
-      cu_q_lens:    i32[S+1]
-      cu_kv_lens:   i32[S+1]    cumsum of page-aligned kv lens (page_indices stride)
-      distribution: i32[3]      (decode_end, prefill_end, num_seqs)
-      k:            top-k budget
-      pages_per_seq: static, maximum pages materialized per sequence
-      topk_impl: selection backend: approximate XLA, exact XLA, or exact
-        SparseCore radix selection (``approx``, ``exact_lax``, or ``radix``).
-      score_query_block_size: query rows carried in one score buffer. At long
-        context, a sufficiently small block keeps the all-head score temporary
-        below the dense-path threshold, allowing XLA to fuse the head reduction
-        instead of updating a loop-carried score matrix once per head.
+    ``one_token_per_seq=True`` handles decode-shaped batches where query row
+    ``i`` belongs to sequence ``i`` without scoring unrelated query rows.
 
     Returns:
-      i32[T, k]  top-k kv positions per query token; -1 for padding.
+      i32[T, k] token positions per query token; -1 for padding.
     """
-    T, H, D = q_idx.shape
-    page_size = index_key_cache.shape[1]
+    T, H, D = q.shape
+    page_size = cache_kv.shape[1]
     max_kv = pages_per_seq * page_size
     num_seqs = seq_lens.shape[0]
-    active_num_seqs = jnp.clip(distribution[2], 0, num_seqs)
-    if score_query_block_size < 1:
-        raise ValueError(f"score_query_block_size must be positive, got {score_query_block_size}")
 
-    idx_weights_f32 = idx_weights.astype(jnp.float32)
-    kv_pos = jnp.arange(max_kv, dtype=jnp.int32)
-
-    def score_index_tile(q_tile, weights_tile, seq_k_idx):
-        if q_tile.shape[0] * H * max_kv <= 1 << 26:
-            similarities = jnp.einsum(
-                "thd,kd->thk",
-                q_tile,
-                seq_k_idx,
-                preferred_element_type=jnp.float32,
-            )
-            return jnp.einsum("th,thk->tk", weights_tile, jax.nn.relu(similarities))
-
-        def accumulate_head(head_id, scores):
-            q_head = jax.lax.dynamic_index_in_dim(q_tile, head_id, axis=1, keepdims=False)
-            weight_head = jax.lax.dynamic_index_in_dim(weights_tile, head_id, axis=1, keepdims=True)
-            similarities = jnp.einsum(
-                "td,kd->tk",
-                q_head,
-                seq_k_idx,
-                preferred_element_type=jnp.float32,
-            )
-            return scores + jax.nn.relu(similarities) * weight_head
-
-        return jax.lax.fori_loop(
-            0,
-            H,
-            accumulate_head,
-            jnp.zeros((q_tile.shape[0], max_kv), jnp.float32),
-        )
-
-    def select_topk_indices(scores):
-        values, indices = select_indexer_topk(
-            scores,
-            k=k,
-            implementation=topk_impl,
-        )
-        return _mask_and_compact_topk_indices(values, indices)
+    weights_f32 = weights.astype(jnp.float32)
+    out = jnp.full((T, k), -1, dtype=jnp.int32)
 
     if one_token_per_seq:
-        out = jnp.full((T, k), -1, dtype=jnp.int32)
 
-        def score_decode_tile(seq_id):
+        def body_decode(seq_id, current_out):
             kv_len = seq_lens[seq_id]
             seq_pages = jax.lax.dynamic_slice_in_dim(
                 page_indices, cu_kv_lens[seq_id] // page_size, pages_per_seq
             )
-            seq_k_idx = index_key_cache[seq_pages].reshape(max_kv, D)
-            q_idx_i = jax.lax.dynamic_slice_in_dim(q_idx, seq_id, 1, axis=0)  # [1, H, D]
-            idx_weights_i = jax.lax.dynamic_slice_in_dim(
-                idx_weights_f32, seq_id, 1, axis=0
-            )  # [1, H]
+            keys = cache_kv[seq_pages].reshape(max_kv, D)
+            q_i = jax.lax.dynamic_slice_in_dim(q, seq_id, 1, axis=0)
+            weights_i = jax.lax.dynamic_slice_in_dim(weights_f32, seq_id, 1, axis=0)
+            similarities = jnp.einsum("thd,kd->thk", q_i, keys, preferred_element_type=jnp.float32)
+            scores = jnp.einsum("th,thk->tk", weights_i, jax.nn.relu(similarities))
+            scores = jnp.where(jnp.arange(max_kv)[None, :] < kv_len, scores, _NEG_INF)
+            values, indices = jax.lax.top_k(scores, k)
+            indices = jnp.where(values > _NEG_INF, indices, -1)
+            return jax.lax.dynamic_update_slice_in_dim(current_out, indices, seq_id, axis=0)
 
-            with jax.named_scope("dsa_indexer_decode_score_tile"):
-                scores = score_index_tile(q_idx_i, idx_weights_i, seq_k_idx)
+        return jax.lax.fori_loop(0, num_seqs, body_decode, out)
 
-            return jnp.where(kv_pos[None, :] < kv_len, scores, _NEG_INF)
-
-        def select_and_store_decode_tile(seq_id, scores, decode_out):
-            with jax.named_scope("dsa_indexer_decode_topk_tile"):
-                idx = select_topk_indices(scores)
-            return jax.lax.dynamic_update_slice_in_dim(
-                decode_out,
-                idx,
-                seq_id,
-                axis=0,
-            )
-
-        return _run_score_select_pipeline(
-            active_num_seqs,
-            score_decode_tile,
-            select_and_store_decode_tile,
-            out,
-        )
-
-    # Keep each loop-carried score tile small enough to avoid materializing the
-    # OOM-sized [T, H, max_kv] tensor. Padding the query axis prevents
-    # dynamic_slice from clamping the final ragged block back into valid rows.
-    query_block_size = min(score_query_block_size, T)
-    q_idx_padded = jnp.pad(q_idx, ((0, query_block_size), (0, 0), (0, 0)))
-    idx_weights_padded = jnp.pad(idx_weights_f32, ((0, query_block_size), (0, 0)))
-    out_padded = jnp.full((T + query_block_size, k), -1, dtype=jnp.int32)
-
-    def body(seq_id, packed_out):
+    def body(seq_id, current_out):
         q_start = cu_q_lens[seq_id]
         q_end = cu_q_lens[seq_id + 1]
-        q_len = jnp.maximum(q_end - q_start, 0)
         kv_len = seq_lens[seq_id]
         seq_pages = jax.lax.dynamic_slice_in_dim(
             page_indices, cu_kv_lens[seq_id] // page_size, pages_per_seq
         )
-        seq_k_idx = index_key_cache[seq_pages].reshape(max_kv, D)
+        keys = cache_kv[seq_pages].reshape(max_kv, D)
 
-        num_query_blocks = (q_len + query_block_size - 1) // query_block_size
+        q_pos = jnp.arange(T)
+        kv_pos = jnp.arange(max_kv)
+        in_seq_q = (q_pos >= q_start) & (q_pos < q_end)
+        abs_q = kv_len - (q_end - q_start) + (q_pos - q_start)
+        mask = in_seq_q[:, None] & (kv_pos[None, :] < kv_len) & (kv_pos[None, :] <= abs_q[:, None])
 
-        def score_block(block_id):
-            block_start = q_start + block_id * query_block_size
-            q_block = jax.lax.dynamic_slice_in_dim(
-                q_idx_padded, block_start, query_block_size, axis=0
-            )
-            weights_block = jax.lax.dynamic_slice_in_dim(
-                idx_weights_padded, block_start, query_block_size, axis=0
-            )
+        if T * H * max_kv <= 1 << 26:
+            similarities = jnp.einsum("thd,kd->thk", q, keys, preferred_element_type=jnp.float32)
+            scores = jnp.einsum("th,thk->tk", weights_f32, jax.nn.relu(similarities))
+        else:
 
-            local_q_pos = block_id * query_block_size + jnp.arange(
-                query_block_size, dtype=jnp.int32
-            )
-            query_valid = local_q_pos < q_len
-            abs_q = kv_len - q_len + local_q_pos
-            mask = (
-                query_valid[:, None]
-                & (kv_pos[None, :] < kv_len)
-                & (kv_pos[None, :] <= abs_q[:, None])
-            )
+            def accumulate_head(head_id, scores):
+                q_h = jax.lax.dynamic_index_in_dim(q, head_id, axis=1, keepdims=False)
+                weight_h = jax.lax.dynamic_index_in_dim(weights_f32, head_id, axis=1, keepdims=True)
+                similarities_h = jnp.einsum(
+                    "td,kd->tk", q_h, keys, preferred_element_type=jnp.float32
+                )
+                return scores + jax.nn.relu(similarities_h) * weight_h
 
-            with jax.named_scope("dsa_indexer_score_block"):
-                scores_block = score_index_tile(q_block, weights_block, seq_k_idx)
+            scores = jax.lax.fori_loop(0, H, accumulate_head, jnp.zeros((T, max_kv), jnp.float32))
 
-            scores_block = jnp.where(mask, scores_block, _NEG_INF)
-            return scores_block
+        scores = jnp.where(mask, scores, _NEG_INF)
+        values, indices = jax.lax.top_k(scores, k)
+        indices = jnp.where(values > _NEG_INF, indices, -1)
+        return jnp.where(in_seq_q[:, None], indices, current_out)
 
-        def select_and_store(block_id, scores_block, block_out):
-            with jax.named_scope("dsa_indexer_topk_block"):
-                # The adapter owns candidate selection. Radix candidates remain
-                # unordered; invalid/padded entries are compacted behind them.
-                idx = select_topk_indices(scores_block)
-            block_start = q_start + block_id * query_block_size
-            return jax.lax.dynamic_update_slice_in_dim(
-                block_out,
-                idx,
-                block_start,
-                axis=0,
-            )
-
-        return _run_score_select_pipeline(
-            num_query_blocks,
-            score_block,
-            select_and_store,
-            packed_out,
-        )
-
-    out_padded = jax.lax.fori_loop(0, active_num_seqs, body, out_padded)
-    return out_padded[:T]
+    return jax.lax.fori_loop(0, num_seqs, body, out)
 
 
 @functools.partial(jax.jit, static_argnames=("k_pages", "pages_per_seq", "one_token_per_seq"))
@@ -392,7 +164,7 @@ def streamindex_page_topk_ref(
     path's O(S * T * max_kv), which collapses under multi-request decode
     (each iteration would score the full [T, max_kv] and mask all but one row).
 
-    Vs the token-level path (``score_and_select_index_tokens`` + page union, which
+    Vs the token-level path (``streamindex_topk_ref`` + page union, which
     saturates k_pages_max at long context): the page budget is exact, the
     top_k runs over [T, pages_per_seq] instead of [T, max_kv] (page_size×
     smaller), and sparse-MLA cost becomes a true O(k_pages) flat.

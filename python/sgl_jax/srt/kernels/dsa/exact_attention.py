@@ -85,6 +85,7 @@ def _sparse_core_gather(
             row_chunk = subcore_first_row_chunk + pl.program_id(0)
             row_subchunk_size = info.num_lanes
             num_row_subchunks = _SC_GATHER_WINDOW // row_subchunk_size
+
             @functools.partial(
                 pltpu.emit_pipeline,
                 grid=(num_row_subchunks, 1),
