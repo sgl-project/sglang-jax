@@ -75,7 +75,7 @@ jobs:
 
   nightly-test-accuracy-text-models-1-tpu-daily:
     if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-accuracy-text-models-1-tpu-daily')
-    runs-on: arc-runner-v6e-1
+    runs-on: arc-runner-v6e-1-us-south1-ai1b
     env:
       TZ: Asia/Shanghai
       JAX_COMPILATION_CACHE_DIR: /xla-cache
@@ -96,7 +96,7 @@ jobs:
 
   nightly-test-perf-text-models-1-tpu-daily:
     if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-perf-text-models-1-tpu-daily')
-    runs-on: arc-runner-v6e-1
+    runs-on: arc-runner-v6e-1-us-south1-ai1b
     env:
       TZ: Asia/Shanghai
       JAX_COMPILATION_CACHE_DIR: /xla-cache
@@ -117,7 +117,7 @@ jobs:
 
   nightly-test-openai-api-surface-1-tpu-daily:
     if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-openai-api-surface-1-tpu-daily')
-    runs-on: arc-runner-v6e-1
+    runs-on: arc-runner-v6e-1-us-south1-ai1b
     env:
       TZ: Asia/Shanghai
       JAX_COMPILATION_CACHE_DIR: /xla-cache
@@ -147,7 +147,7 @@ jobs:
 
   nightly-infra-smoke-1-tpu-daily:
     if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-infra-smoke-1-tpu-daily')
-    runs-on: arc-runner-v6e-1
+    runs-on: arc-runner-v6e-1-us-south1-ai1b
     env:
       TZ: Asia/Shanghai
       JAX_COMPILATION_CACHE_DIR: /xla-cache
@@ -168,7 +168,7 @@ jobs:
 
   nightly-test-accuracy-text-models-4-tpu-daily:
     if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-accuracy-text-models-4-tpu-daily')
-    runs-on: arc-runner-v6e-4
+    runs-on: arc-runner-v6e-4-us-south1-ai1b
     # Read-only + persist-credentials:false — this job runs PR-HEAD code, so it must not
     # hold a write token; PASS/FAIL is posted from the separate comment job below.
     permissions:
@@ -240,7 +240,7 @@ jobs:
 
   nightly-test-perf-text-models-4-tpu-daily:
     if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-perf-text-models-4-tpu-daily')
-    runs-on: arc-runner-v6e-4
+    runs-on: arc-runner-v6e-4-us-south1-ai1b
     # Read-only + persist-credentials:false — runs PR-HEAD code, no write token here;
     # PASS/FAIL is posted from the separate comment job below.
     permissions:
@@ -365,7 +365,7 @@ jobs:
       - nightly-test-accuracy-text-models-4-tpu-daily
       - nightly-test-perf-text-models-4-tpu-daily
     if: always() && github.ref == 'refs/heads/main' && github.repository == 'sgl-project/sglang-jax' && inputs.pr_number == ''
-    runs-on: arc-runner-v6e-4
+    runs-on: arc-runner-v6e-4-us-south1-ai1b
     continue-on-error: true
     timeout-minutes: 20
     env:

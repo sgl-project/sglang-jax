@@ -12,6 +12,11 @@ inputs:
 runs:
   using: "composite"
   steps:
+    - name: Install Python 3.12 and venv support
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y python3.12 python3.12-venv
     - name: Create venv and install dependencies
       shell: bash
       env:

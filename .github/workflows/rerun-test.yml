@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       runner:
-        description: 'Runner label (arc-runner-v6e-1, arc-runner-v6e-4, arc-runner-cpu)'
+        description: 'Runner label (arc-runner-v6e-1-us-south1-ai1b, arc-runner-v6e-4-us-south1-ai1b, arc-runner-cpu-us-south1-b)'
         required: true
         type: string
       ref:

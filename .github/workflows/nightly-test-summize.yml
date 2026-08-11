@@ -20,7 +20,7 @@ permissions:
 jobs:
   generate-summary:
     if: github.repository == 'sgl-project/sglang-jax'
-    runs-on: arc-runner-v6e-1
+    runs-on: arc-runner-v6e-1-us-south1-ai1b
     continue-on-error: true
     env:
       TZ: Asia/Shanghai

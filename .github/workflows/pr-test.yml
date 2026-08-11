@@ -27,29 +27,14 @@ jobs:
   unit-test-1-tpu:
     needs: [coordinator]
     if: needs.coordinator.outputs.run_main_test == 'true'
-    runs-on: ${{ matrix.runner }}
+    runs-on: arc-runner-v6e-1-us-south1-ai1b
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - part: 0
-            runner: arc-runner-v6e-1-us-south1-canary
-          - part: 1
-            runner: arc-runner-v6e-1
-          - part: 2
-            runner: arc-runner-v6e-1
-          - part: 3
-            runner: arc-runner-v6e-1
-          - part: 4
-            runner: arc-runner-v6e-1
+        part: [0, 1, 2, 3, 4]
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
-      - name: Install Python venv support on the canary runner
-        if: matrix.runner == 'arc-runner-v6e-1-us-south1-canary'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y python3.12-venv
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
       - name: Run unit test
@@ -67,7 +52,7 @@ jobs:
   unit-test-4-tpu:
     needs: [coordinator, unit-test-1-tpu, unit-test-cpu]
     if: needs.coordinator.outputs.run_main_test == 'true'
-    runs-on: arc-runner-v6e-4
+    runs-on: arc-runner-v6e-4-us-south1-ai1b
     strategy:
       fail-fast: false
       matrix:
@@ -92,7 +77,7 @@ jobs:
   unit-test-cpu:
     needs: [coordinator]
     if: needs.coordinator.outputs.run_main_test == 'true'
-    runs-on: arc-runner-cpu
+    runs-on: arc-runner-cpu-us-south1-b
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -112,7 +97,7 @@ jobs:
   e2e-test-1-tpu:
     needs: [coordinator, unit-test-1-tpu, unit-test-cpu]
     if: needs.coordinator.outputs.run_main_test == 'true'
-    runs-on: arc-runner-v6e-1
+    runs-on: arc-runner-v6e-1-us-south1-ai1b
     strategy:
       fail-fast: false
       matrix:
@@ -140,7 +125,7 @@ jobs:
   e2e-test-4-tpu:
     needs: [coordinator, unit-test-1-tpu, unit-test-cpu]
     if: needs.coordinator.outputs.run_main_test == 'true'
-    runs-on: arc-runner-v6e-4
+    runs-on: arc-runner-v6e-4-us-south1-ai1b
     strategy:
       fail-fast: false
       matrix:
@@ -169,7 +154,7 @@ jobs:
   accuracy-test-1-tpu:
     needs: [coordinator, unit-test-1-tpu, unit-test-cpu]
     if: needs.coordinator.outputs.run_main_test == 'true'
-    runs-on: arc-runner-v6e-1
+    runs-on: arc-runner-v6e-1-us-south1-ai1b
     strategy:
       fail-fast: false
       matrix:
@@ -198,7 +183,7 @@ jobs:
     needs: [coordinator, unit-test-1-tpu, unit-test-cpu]
     if: needs.coordinator.outputs.run_main_test == 'true'
 
-    runs-on: arc-runner-v6e-4
+    runs-on: arc-runner-v6e-4-us-south1-ai1b
     strategy:
       fail-fast: false
       matrix:
@@ -229,7 +214,7 @@ jobs:
     if: >-
       needs.coordinator.outputs.run_main_test == 'true' &&
       (needs.coordinator.outputs.requires_4tpu == 'true' || needs.coordinator.outputs.run_full == 'true')
-    runs-on: arc-runner-v6e-4
+    runs-on: arc-runner-v6e-4-us-south1-ai1b
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -257,7 +242,7 @@ jobs:
     if: >-
       needs.coordinator.outputs.run_main_test == 'true' &&
       (needs.coordinator.outputs.run_accuracy_extra == 'true' || needs.coordinator.outputs.run_full == 'true')
-    runs-on: arc-runner-v6e-1
+    runs-on: arc-runner-v6e-1-us-south1-ai1b
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -283,7 +268,7 @@ jobs:
   performance-test-1-tpu:
     needs: [coordinator, unit-test-4-tpu, e2e-test-1-tpu, e2e-test-4-tpu, accuracy-test-1-tpu, accuracy-test-4-tpu]
     if: needs.coordinator.outputs.run_main_test == 'true'
-    runs-on: arc-runner-v6e-1
+    runs-on: arc-runner-v6e-1-us-south1-ai1b
     strategy:
       fail-fast: false
       matrix:
@@ -311,7 +296,7 @@ jobs:
   performance-test-4-tpu:
     needs: [coordinator, unit-test-4-tpu, e2e-test-1-tpu, e2e-test-4-tpu, accuracy-test-1-tpu, accuracy-test-4-tpu]
     if: needs.coordinator.outputs.run_main_test == 'true'
-    runs-on: arc-runner-v6e-4
+    runs-on: arc-runner-v6e-4-us-south1-ai1b
     strategy:
       fail-fast: false
       matrix:
@@ -342,7 +327,7 @@ jobs:
     if: >-
       needs.coordinator.outputs.run_main_test == 'true' &&
       (needs.coordinator.outputs.run_perf == 'true' || needs.coordinator.outputs.run_full == 'true')
-    runs-on: arc-runner-v6e-1
+    runs-on: arc-runner-v6e-1-us-south1-ai1b
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -367,7 +352,7 @@ jobs:
   pallas-kernel-benchmark:
     needs: [coordinator]
     if: needs.coordinator.outputs.run_pallas_bench == 'true'
-    runs-on: arc-runner-v6e-1
+    runs-on: arc-runner-v6e-1-us-south1-ai1b
     strategy:
       fail-fast: false
       matrix:
