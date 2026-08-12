@@ -128,7 +128,7 @@ def get_config(
 
     if isinstance(model, str) and text_config is not None:
         for key, val in text_config.__dict__.items():
-            if not hasattr(config, key) and getattr(text_config, key, None) is not None:
+            if not hasattr(config, key) and val is not None:
                 setattr(config, key, val)
 
     if config.model_type in _CONFIG_REGISTRY:

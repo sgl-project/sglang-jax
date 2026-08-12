@@ -10,6 +10,23 @@ from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
 from sgl_jax.srt.server_args import ServerArgs
 
 
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("bf16", jnp.bfloat16),
+        ("fp8_e4m3", jnp.float8_e4m3fn),
+        ("fp8_e5m2", jnp.float8_e5m2),
+    ],
+)
+def test_init_kv_cache_dtype(name, expected):
+    runner = types.SimpleNamespace(
+        dtype=jnp.float32,
+        server_args=types.SimpleNamespace(kv_cache_dtype=name),
+    )
+    ModelRunnerKVCacheMixin._init_kv_cache_dtype(runner)
+    assert runner.kv_cache_dtype == expected
+
+
 def test_recurrent_state_legacy_disable_radix_cache_passes():
     sa = ServerArgs(model_path="dummy", disable_radix_cache=True)
     _enforce_recurrent_state_server_constraints(sa)  # no raise

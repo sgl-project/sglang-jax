@@ -951,6 +951,7 @@ multimodal_model_archs = [
     "DeepseekVL2ForCausalLM",
     "Gemma3ForConditionalGeneration",
     "Gemma3nForConditionalGeneration",
+    "Gemma4ForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
     "LlavaLlamaForCausalLM",
