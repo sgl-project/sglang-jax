@@ -57,7 +57,15 @@ def test_recurrent_admission_cap_already_aligned_unchanged():
 class _CellSizeRunner(ModelRunnerKVCacheMixin):
     """Minimal stand-in exposing only what _compute_cell_size reads."""
 
-    def __init__(self, attention_backend, num_layers=78, page_size=128):
+    def __init__(
+        self,
+        attention_backend,
+        num_layers=78,
+        page_size=128,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        index_head_dim=128,
+    ):
         import jax.numpy as jnp
 
         self.kv_cache_dtype = jnp.bfloat16
@@ -71,10 +79,10 @@ class _CellSizeRunner(ModelRunnerKVCacheMixin):
             indexer_types[i] = "full"
         self.model_config = types.SimpleNamespace(
             hf_text_config=types.SimpleNamespace(
-                kv_lora_rank=512,
-                qk_rope_head_dim=64,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
                 num_hidden_layers=num_layers,
-                index_head_dim=128,
+                index_head_dim=index_head_dim,
                 index_skip_topk_offset=3,
                 indexer_types=indexer_types,
             )
@@ -87,11 +95,9 @@ class _CellSizeRunner(ModelRunnerKVCacheMixin):
 def _allocated_bytes_per_token(kv_dim, page_size=128):
     """Per-token bytes the POOL would allocate for a buffer of this width.
 
-    Derived from `get_kv_cache_shape` — the function `_create_buffers` actually
-    allocates with — rather than from hand arithmetic. The budget open-codes the
-    formula, so this keeps the test pinning budget-against-allocation instead of
-    budget-against-a-comment; if the alignment or packing rule ever changes, the
-    allocation moves and these assertions move with it.
+    Derived from `get_kv_cache_shape` — what `_create_buffers` allocates with —
+    so these assertions pin the budget against the allocation, and follow it if
+    the alignment or packing rule changes.
     """
     import jax.numpy as jnp
 
@@ -126,11 +132,28 @@ def test_cell_size_includes_dsa_indexer_cache():
     assert cell > _MLA_BYTES_PER_TOKEN
 
 
-def test_dsa_indexer_params_report_the_full_layer_count():
-    """21 of GLM-5.2's 78 layers are "full" and each gets an indexer buffer.
+@pytest.mark.parametrize("page_size", [1, 64, 128])
+def test_cell_size_pads_page_size_to_the_kv_packing_boundary(page_size):
+    """With bf16 (packing=2) and page_size=1 a page holds 2 slots for 1 token,
+    so the per-token cost is double the naive width. Both terms pay it."""
+    cell = _CellSizeRunner("dsa_sparse", page_size=page_size)._compute_cell_size()
+    assert cell == _allocated_bytes_per_token(640, page_size) * 78 + (
+        _allocated_bytes_per_token(128, page_size) * 21
+    )
 
-    Asserted against the concrete expected count rather than against a second
-    call to `build_index_share_map`, which no plausible implementation could fail.
-    """
+
+def test_cell_size_pads_latent_segments_independently():
+    """The latent width is align(lora,128) + align(rope,128), NOT
+    align(lora + rope, 128) — the kernel slices nope and rope as adjacent
+    buffers. lora=192/rope=64 separates the two formulas (384 vs 256); the
+    GLM/DeepSeek shape (512/64) does not, since both give 640."""
+    cell = _CellSizeRunner(
+        "fa", kv_lora_rank=192, qk_rope_head_dim=64
+    )._compute_cell_size()
+    assert cell == _allocated_bytes_per_token(256 + 128) * 78
+
+
+def test_dsa_indexer_params_report_the_full_layer_count():
+    """21 of GLM-5.2's 78 layers are "full" and each gets an indexer buffer."""
     assert _CellSizeRunner("dsa_sparse")._dsa_indexer_cache_params() == (128, 21)
     assert _CellSizeRunner("fa")._dsa_indexer_cache_params() == (0, 0)

@@ -308,6 +308,8 @@ class ModelRunnerKVCacheMixin:
             getattr(cfg, "index_skip_topk_offset", 0),
             cfg.num_hidden_layers,
         )
+        if num_full == 0:
+            return 0, 0
         return cfg.index_head_dim, num_full
 
     def _compute_cell_size(self: ModelRunner) -> int:
@@ -332,19 +334,11 @@ class ModelRunnerKVCacheMixin:
             cell_size = per_token * num_layers
 
             # DSA allocates a second paged buffer for indexer keys, one slot per
-            # "full" layer. It uses the same `get_kv_cache_shape` layout, so it
-            # costs the same per token with `kv_dim` replaced by the aligned
-            # indexer key dim.
-            # Note the two terms use different layer counts, deliberately: they
-            # mirror two different allocations. The latent buffer exists per
-            # KV-pool layer (`_kv_pool_layer_count`, which drops non-attention
-            # layers on hybrid-recurrent models); the indexer buffer exists per
-            # "full" layer, counted over the whole model by the same
-            # `build_index_share_map` the pool is constructed from. Budget
-            # matching allocation is the invariant here, not the two counts
-            # matching each other.
+            # "full" layer, in the same `get_kv_cache_shape` layout with `kv_dim`
+            # replaced by the aligned indexer key dim. Its layer count is per
+            # full layer over the whole model, not per KV-pool layer.
             indexer_key_dim, num_indexer_layers = self._dsa_indexer_cache_params()
-            if indexer_key_dim > 0 and num_indexer_layers > 0:
+            if indexer_key_dim > 0:
                 indexer_per_token = (
                     align128(indexer_key_dim) * aligned_ps * dtype_size // self.page_size
                 )

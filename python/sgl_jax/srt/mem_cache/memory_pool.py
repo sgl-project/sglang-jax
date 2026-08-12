@@ -1396,13 +1396,16 @@ class MLATokenToKVPool(KVCache):
         indexer_bytes = self._indexer_buffer_bytes() * self.num_indexer_layers
         self.mem_usage = (latent_bytes + indexer_bytes) / GB
 
+        breakdown = (
+            f" (latent {latent_bytes / GB:.2f} GB + DSA indexer {indexer_bytes / GB:.2f} GB)"
+            if indexer_bytes
+            else ""
+        )
         logger.info(
-            "JAX MLA KV Cache allocated. #tokens: %s, KV size: %.2f GB"
-            " (latent %.2f GB + DSA indexer %.2f GB)",
+            "JAX MLA KV Cache allocated. #tokens: %s, KV size: %.2f GB%s",
             self.size,
             self.mem_usage,
-            latent_bytes / GB,
-            indexer_bytes / GB,
+            breakdown,
         )
 
     def _buffer_bytes(self, kv_dim: int | None = None) -> int:
@@ -1425,12 +1428,7 @@ class MLATokenToKVPool(KVCache):
         return self._buffer_bytes(kv_dim=self.indexer_key_dim)
 
     def get_kv_size_bytes(self):
-        """Resident bytes for this pool, including the DSA indexer key buffers.
-
-        Counting only the latent buffers under-stated resident HBM by the
-        indexer's share (~5% on GLM-5.2) — the same blind spot that let the
-        pool over-provision without it showing up in the startup log.
-        """
+        """Resident bytes for this pool, including the DSA indexer key buffers."""
         latent = self._buffer_bytes() * self.layer_num
         return latent + self._indexer_buffer_bytes() * self.num_indexer_layers
 
