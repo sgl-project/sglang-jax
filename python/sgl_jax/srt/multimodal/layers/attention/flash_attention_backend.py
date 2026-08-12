@@ -15,7 +15,6 @@ if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 
 
-@jax.tree_util.register_dataclass
 @dataclasses.dataclass
 class VisionAttentionMetadata:
     """Block-diagonal (packed) self-attention layout for the vision tower.
@@ -23,10 +22,22 @@ class VisionAttentionMetadata:
     ``cu_seqlens`` are bucket-shaped cumulative segment boundaries with shape
     ``[num_lanes, K + 1]``: each row starts with zero, holds a lane's cumulative
     segment ends, then repeats the final valid end through the padding slots.
-    Registered as a JAX pytree so it threads through ``jax.jit`` / ``shard_map``.
+    ``max_seq_len`` is a host-computed upper bound on every positive boundary
+    difference. It is static JAX metadata so the varlen backend can select
+    compile-time block sizes without inspecting traced boundary values. The
+    bound should be stable for an input-shape bucket to avoid recompilation for
+    different segment values with the same shapes.
     """
 
     cu_seqlens: Any
+    max_seq_len: int | None = None
+
+
+jax.tree_util.register_dataclass(
+    VisionAttentionMetadata,
+    data_fields=["cu_seqlens"],
+    meta_fields=["max_seq_len"],
+)
 
 
 def vision_segment_ids_from_cu_seqlens(
@@ -231,8 +242,7 @@ class VisionVarlenAttentionBackend(AttentionBackend):
     of positive-length segments in its bucket row -- the repeated tail ends
     become zero-length segments the kernel skips. Unlike the flash backend this
     kernel supports GQA, per-call local ``window_size`` and per-head attention
-    sinks, so it backs models like MiMo-V2. On CPU meshes it runs the same
-    kernel in interpret mode.
+    sinks, so it backs models like MiMo-V2. It is TPU-only.
     """
 
     def __init__(
@@ -241,13 +251,12 @@ class VisionVarlenAttentionBackend(AttentionBackend):
         sm_scale: float = 1.0,
         head_tp: bool = False,
         vmem_limit_bytes: int = 128 * 1024 * 1024,
-        tune_layout: str | None = None,
     ):
         self.mesh = mesh
         self.sm_scale = sm_scale
         self.vmem_limit_bytes = vmem_limit_bytes
-        self.tune_layout = tune_layout
-        self.interpret = mesh.devices.flat[0].platform == "cpu"
+        if mesh.devices.flat[0].platform != "tpu":
+            raise ValueError("VisionVarlenAttentionBackend requires a TPU mesh")
         if head_tp:
             if "tensor" not in mesh.axis_names:
                 raise ValueError("head_tp requires a tensor mesh axis")
@@ -273,7 +282,9 @@ class VisionVarlenAttentionBackend(AttentionBackend):
         # Accept either a raw cu_seqlens array (MiMo/Omni) or the shared
         # VisionAttentionMetadata (Qwen VL), so this backend is a drop-in for
         # VisionFlashAttentionBackend's (q, k, v, metadata) contract too.
+        max_seq_len = None
         if isinstance(cu_seqlens, VisionAttentionMetadata):
+            max_seq_len = cu_seqlens.max_seq_len
             cu_seqlens = cu_seqlens.cu_seqlens
         if q.shape[0] != cu_seqlens.shape[0]:
             raise ValueError(
@@ -295,9 +306,8 @@ class VisionVarlenAttentionBackend(AttentionBackend):
                 sm_scale=self.sm_scale,
                 window_size=window_size,
                 attention_sink=lane_sink,
+                max_seq_len=max_seq_len,
                 vmem_limit_bytes=self.vmem_limit_bytes,
-                tune_layout=self.tune_layout,
-                interpret=self.interpret,
             )
 
         # A sink is a shard_map input so it follows the head sharding; without one
@@ -335,15 +345,17 @@ def make_vision_attention_backend(
     head_tp: bool = False,
     use_varlen: bool = False,
 ) -> AttentionBackend:
-    """Build the batch-sharded vision attention backend (interpret on CPU meshes).
+    """Build the batch-sharded vision attention backend.
 
-    ``use_varlen`` routes the tower through the packed ``varlen_attention``
-    kernel instead of the dense/block-sparse ``flash_attention`` kernel. Varlen
-    walks each cu_seqlens segment, so window layers cost O(sum segment^2) rather
-    than the dense O(T^2); ``tune_layout`` picks the v7x-tuned block sizes
-    (``full`` for the whole-frame layers, ``window`` for the windowed layers).
+    On TPU, ``use_varlen`` routes the tower through the packed
+    ``varlen_attention`` kernel instead of the dense ``flash_attention``
+    kernel. Varlen walks each cu_seqlens segment, so window
+    layers cost O(sum segment^2) rather than the dense O(T^2). The host-computed
+    maximum segment length in :class:`VisionAttentionMetadata` selects the
+    v7x-tuned block sizes. CPU meshes use the flash backend's test-only
+    interpreter path.
     """
-    if use_varlen:
+    if use_varlen and mesh.devices.flat[0].platform == "tpu":
         return VisionVarlenAttentionBackend(
             mesh,
             sm_scale=sm_scale,

@@ -605,11 +605,22 @@ class Qwen2_5_VisionTransformer(nnx.Module):
                 cu_seqlens[lane, layout, 1 : count + 1] = ends
                 cu_seqlens[lane, layout, count + 1 :] = patch_offset
         # cu_seqlens[:, 0] is the window layout, [:, 1] the full-frame layout.
+        window_cu_seqlens = cu_seqlens[:, 0]
+        full_cu_seqlens = cu_seqlens[:, 1]
+        # Static bounds must depend only on the compile bucket, not the request's
+        # exact segment values, so requests in one bucket share a compilation.
+        window_max_seq_len = min(capacity, window * window * unit)
         return Qwen2_5VisionMetadata(
             indices,
             position_ids,
-            VisionAttentionMetadata(cu_seqlens[:, 0]),
-            VisionAttentionMetadata(cu_seqlens[:, 1]),
+            VisionAttentionMetadata(
+                window_cu_seqlens,
+                max_seq_len=window_max_seq_len,
+            ),
+            VisionAttentionMetadata(
+                full_cu_seqlens,
+                max_seq_len=capacity,
+            ),
         )
 
     def _batch_items(self, items: list[MultimodalDataItem]):

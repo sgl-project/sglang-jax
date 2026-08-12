@@ -447,7 +447,7 @@ def test_batch_routes_video_modality():
     assert batch[Modality.VIDEO][0].item is video[0]
 
 
-def test_qwen_window_blocks_enable_bounded_segment_grid():
+def test_qwen_attention_layouts_use_static_max_seq_len_bounds():
     config = _vision_config(
         depth=2,
         fullatt_block_indexes=[1],
@@ -463,8 +463,9 @@ def test_qwen_window_blocks_enable_bounded_segment_grid():
             norm_eps=1e-6,
         )
 
-    assert not visual.blocks[0].attn.attn_backend.block_sparse_segments
-    assert visual.blocks[1].attn.attn_backend.block_sparse_segments
+    metadata = visual._build_metadata([[]], 256)
+    assert metadata.window_attn.max_seq_len == 64
+    assert metadata.full_attn.max_seq_len == 256
 
 
 @pytest.mark.parametrize("search_method", ["compare_all", "scan"])
