@@ -159,18 +159,18 @@ class CompilationManager:
             batch.apply_for_deepstack = True
 
     @staticmethod
-    def _packed_multimodal_shapes(model_runner: ModelRunner) -> tuple[tuple[int, int], ...]:
+    def _packed_multimodal_capacities(model_runner: ModelRunner) -> tuple[int, ...]:
         getter = getattr(
             model_runner.model,
-            "get_multimodal_embedding_packed_shapes",
+            "get_multimodal_embedding_packed_capacities",
             None,
         )
         if not callable(getter):
             return ()
-        shapes = tuple((int(rows), int(cap)) for rows, cap in getter())
-        if any(rows <= 0 or cap <= 0 for rows, cap in shapes):
-            raise ValueError(f"invalid multimodal packed shapes: {shapes}")
-        return shapes
+        capacities = tuple(map(int, getter()))
+        if any(capacity <= 0 for capacity in capacities):
+            raise ValueError(f"invalid multimodal packed capacities: {capacities}")
+        return capacities
 
     @staticmethod
     def _embedding_pool(model_runner: ModelRunner):
@@ -183,7 +183,7 @@ class CompilationManager:
     def _warm_multimodal_merge(
         forward_batch,
         input_embedding: Callable,
-        packed_shapes: tuple[tuple[int, int], ...] = (),
+        packed_capacities: tuple[int, ...] = (),
         embedding_pool=None,
         mesh=None,
     ) -> None:
@@ -198,7 +198,6 @@ class CompilationManager:
             _gather_merge,
             _MergeMapping,
         )
-        from sgl_jax.srt.multimodal.in_model.interface import PackedMultimodalEmbedding
 
         if mesh is None:
             mesh = getattr(getattr(forward_batch.input_ids, "sharding", None), "mesh", None)
@@ -216,25 +215,23 @@ class CompilationManager:
                 return zeros
 
             deepstack = getattr(forward_batch, "deepstack_visual_embedding", None)
-            deepstack_dim = deepstack.shape[0] if deepstack is not None else 0
-            shapes = packed_shapes or ((1, num_tokens),)
-            running, merged_deepstack = target, None
-            for num_lanes, cap in shapes:
-                length = min(num_tokens, cap)
+            capacities = packed_capacities or (num_tokens,)
+            running = target
+            if deepstack is not None:
+                running = jnp.pad(
+                    running,
+                    ((0, 0), (0, deepstack.shape[0] * hidden)),
+                )
+            for capacity in capacities:
+                length = min(num_tokens, capacity)
                 task = ItemTask(
                     item=None,
                     output_len=length,
                     merge_mappings=(_MergeMapping(0, 0, length),),
                 )
-                packed = PackedMultimodalEmbedding(
-                    output=_replicated((num_lanes, cap, hidden * (1 + deepstack_dim))),
-                    placements=((0, 0, length),),
-                    deepstack_dim=deepstack_dim,
-                )
-                running, merged_deepstack = _gather_merge(target, None, packed, (task,), mesh)
+                packed = _replicated((capacity, running.shape[-1]))
+                running = _gather_merge(running, packed, (task,), mesh)
                 jax.block_until_ready(running)
-                if merged_deepstack is not None:
-                    jax.block_until_ready(merged_deepstack)
 
             if embedding_pool is not None:
                 length = min(num_tokens, embedding_pool.page_size)
@@ -244,21 +241,25 @@ class CompilationManager:
                     merge_mappings=(_MergeMapping(0, 0, length),),
                 )
                 entry = EmbeddingPoolEntry(np.asarray([0], dtype=np.int32), length)
-                running, merged_deepstack = _gather_from_pool(
-                    target,
-                    None,
+                running = _gather_from_pool(
+                    running,
                     embedding_pool,
                     (task,),
                     (entry,),
                     mesh,
                 )
                 jax.block_until_ready(running)
-                if merged_deepstack is not None:
-                    jax.block_until_ready(merged_deepstack)
 
-        forward_batch.input_embedding = running
-        if merged_deepstack is not None:
-            forward_batch.deepstack_visual_embedding = merged_deepstack
+        forward_batch.input_embedding = running[:, :hidden]
+        if deepstack is not None:
+            merged_deepstack = (
+                running[:, hidden:]
+                .reshape(num_tokens, deepstack.shape[0], hidden)
+                .transpose(1, 0, 2)
+            )
+            forward_batch.deepstack_visual_embedding = jax.sharding.reshard(
+                merged_deepstack, deepstack.sharding
+            )
 
     # ---- Pre-compilation ----
 
@@ -277,8 +278,8 @@ class CompilationManager:
             model_runner.model.precompile_multimodal()
             embedding_pool = self._embedding_pool(model_runner)
             if embedding_pool is not None:
-                for num_lanes, cap in self._packed_multimodal_shapes(model_runner):
-                    embedding_pool.precompile_packed_write(num_lanes, cap)
+                for capacity in self._packed_multimodal_capacities(model_runner):
+                    embedding_pool.precompile_packed_write(capacity)
         self._precompile_decode(
             forward_fn, model_runner, mesh, prepare_lora_fn, future_token_ids_map
         )
@@ -296,7 +297,7 @@ class CompilationManager:
         from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 
         start_time = time.perf_counter()
-        packed_shapes = self._packed_multimodal_shapes(model_runner)
+        packed_capacities = self._packed_multimodal_capacities(model_runner)
         embedding_pool = self._embedding_pool(model_runner)
         bs = self.max_padded_batch_size
         variant_names = self._extend_variant_names()
@@ -335,7 +336,7 @@ class CompilationManager:
                     self._warm_multimodal_merge(
                         batch.forward_batch,
                         model_runner.model.get_input_embeddings(),
-                        packed_shapes,
+                        packed_capacities,
                         embedding_pool,
                         mesh,
                     )

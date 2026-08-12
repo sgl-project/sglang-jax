@@ -589,13 +589,13 @@ class TestDummyBatch(unittest.TestCase):
             self.cm._warm_multimodal_merge(
                 forward_batch,
                 lambda _: jax.device_put(jnp.ones((4, 2), jnp.float32), tokens),
-                packed_shapes=((2, 3), (2, 5)),
+                packed_capacities=(6, 10),
                 embedding_pool=pool,
             )
 
-        assert [call.args[2].output.shape for call in fresh_merge.call_args_list] == [
-            (2, 3, 2),
-            (2, 5, 2),
+        assert [call.args[1].shape for call in fresh_merge.call_args_list] == [
+            (6, 2),
+            (10, 2),
         ]
         pool_merge.assert_called_once()
 
@@ -614,10 +614,7 @@ class TestDummyBatch(unittest.TestCase):
         events = []
         model_runner = MagicMock()
         model_runner.model.precompile_multimodal.side_effect = lambda: events.append("vision")
-        model_runner.model.get_multimodal_embedding_packed_shapes.return_value = (
-            (2, 3),
-            (2, 5),
-        )
+        model_runner.model.get_multimodal_embedding_packed_capacities.return_value = (6, 10)
         model_runner.embedding_pool = EmbeddingPool(
             num_pages=2,
             page_size=2,
@@ -632,7 +629,7 @@ class TestDummyBatch(unittest.TestCase):
             cm.precompile_all(MagicMock(), model_runner, MagicMock())
 
         assert events == ["extend", "vision", "decode"]
-        assert [call.args for call in warm_writer.call_args_list] == [(2, 3), (2, 5)]
+        assert [call.args for call in warm_writer.call_args_list] == [(6,), (10,)]
 
     def test_invalid_cache_loc_raises(self):
         with self.assertRaises(ValueError):

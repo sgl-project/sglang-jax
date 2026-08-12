@@ -27,7 +27,7 @@ def _write(pool, item_hash, emb, ds=None):
     if ds is not None:
         ds = jnp.asarray(ds)
         emb = jnp.concatenate([emb, ds.reshape(ds.shape[0], -1)], axis=-1)
-    (entry,) = pool.write_packed((item_hash,), emb[None], ((0, 0, emb.shape[0]),))
+    (entry,) = pool.write_packed((item_hash,), emb, (emb.shape[0],))
     return entry
 
 
@@ -89,43 +89,46 @@ def test_deepstack_roundtrips():
     np.testing.assert_array_equal(np.asarray(pool.pages[page, off, pool.hidden :]), [3, 4])
 
 
-def test_write_packed_roundtrips_lane_offset_and_drops_padding():
+def test_write_packed_roundtrips_items_and_drops_padding():
     pool = EmbeddingPool(num_pages=4, page_size=2, hidden=1, dtype=jnp.float32)
     pool._pages = pool.pages.at[-1, -1, 0].set(99)
     packed = jnp.asarray(
         [
-            [[100.0], [101.0], [102.0], [103.0]],
-            [[200.0], [201.0], [202.0], [203.0]],
+            [101.0],
+            [102.0],
+            [103.0],
+            [200.0],
+            [201.0],
+            [202.0],
+            [203.0],
         ]
     )
 
-    (entry,) = pool.write_packed((1,), packed, ((0, 1, 3),))
+    (entry,) = pool.write_packed((1,), packed, (3,))
 
     assert entry is not None
     assert entry.length == 3
     assert len(entry.page_ids) == 2
     np.testing.assert_array_equal(_read(pool, entry)[:, 0], [101, 102, 103])
-    # Every non-placement row maps to the positive OOB sentinel and must not
-    # wrap around to the final physical pool row.
     assert np.asarray(pool.pages[-1, -1, 0]) == 99
 
 
 def test_write_packed_keeps_writer_shape_fixed_across_true_lengths():
     pool = EmbeddingPool(num_pages=8, page_size=2, hidden=1, dtype=jnp.float32)
-    packed = jnp.arange(8, dtype=jnp.float32).reshape(2, 4, 1)
+    packed = jnp.arange(8, dtype=jnp.float32).reshape(8, 1)
 
     with patch.object(
         embedding_pool_module,
         "_scatter_rows",
         wraps=embedding_pool_module._scatter_rows,
     ) as scatter:
-        pool.write_packed((1, 2), packed, ((0, 0, 1), (1, 1, 3)))
-        pool.write_packed((3,), packed, ((0, 1, 2),))
+        pool.write_packed((1, 2), packed, (1, 3))
+        pool.write_packed((3,), packed, (2,))
 
-    assert [call.args[1].shape for call in scatter.call_args_list] == [(2, 4), (2, 4)]
+    assert [call.args[1].shape for call in scatter.call_args_list] == [(8,), (8,)]
     assert [call.args[2].shape for call in scatter.call_args_list] == [
-        (2, 4, 1),
-        (2, 4, 1),
+        (8, 1),
+        (8, 1),
     ]
 
 
@@ -137,19 +140,17 @@ def test_write_packed_deepstack_uses_same_placement():
         dtype=jnp.float32,
         deepstack_dim=2,
     )
-    # [1, cap=4, (1+D)*H=3]: primary col 0, deepstack planes cols 1..2.
+    # [cap=4, (1+D)*H=3]: primary col 0, deepstack planes cols 1..2.
     packed = jnp.asarray(
         [
-            [
-                [1.0, 10.0, 11.0],
-                [2.0, 20.0, 21.0],
-                [3.0, 30.0, 31.0],
-                [4.0, 40.0, 41.0],
-            ]
+            [2.0, 20.0, 21.0],
+            [3.0, 30.0, 31.0],
+            [4.0, 40.0, 41.0],
+            [0.0, 0.0, 0.0],
         ]
     )
 
-    (entry,) = pool.write_packed((1,), packed, ((0, 1, 2),))
+    (entry,) = pool.write_packed((1,), packed, (2,))
 
     assert entry is not None
     np.testing.assert_array_equal(_read(pool, entry)[:, 0], [2, 3])
@@ -162,7 +163,7 @@ def test_write_packed_deepstack_uses_same_placement():
 
 def test_write_packed_scatter_once_and_skips_entries_evicted_during_planning():
     pool = EmbeddingPool(num_pages=2, page_size=1, hidden=1, dtype=jnp.float32)
-    packed = jnp.asarray([[[10.0], [20.0], [30.0]]])
+    packed = jnp.asarray([[10.0], [20.0], [30.0]])
 
     with patch.object(
         embedding_pool_module,
@@ -172,7 +173,7 @@ def test_write_packed_scatter_once_and_skips_entries_evicted_during_planning():
         entries = pool.write_packed(
             (1, 2, 3),
             packed,
-            ((0, 0, 1), (0, 1, 1), (0, 2, 1)),
+            (1, 1, 1),
         )
 
     scatter.assert_called_once()
@@ -186,12 +187,12 @@ def test_write_packed_scatter_once_and_skips_entries_evicted_during_planning():
 
 def test_write_packed_duplicate_hash_keeps_only_last_placement():
     pool = EmbeddingPool(num_pages=2, page_size=1, hidden=1, dtype=jnp.float32)
-    packed = jnp.asarray([[[10.0], [20.0]]])
+    packed = jnp.asarray([[10.0], [20.0]])
 
     first, last = pool.write_packed(
         (1, 1),
         packed,
-        ((0, 0, 1), (0, 1, 1)),
+        (1, 1),
     )
 
     assert first is None
@@ -203,12 +204,12 @@ def test_write_packed_duplicate_hash_keeps_only_last_placement():
 def test_write_packed_oversized_item_does_not_disturb_other_entries():
     pool = EmbeddingPool(num_pages=2, page_size=1, hidden=1, dtype=jnp.float32)
     existing = _write(pool, 1, jnp.asarray([[5.0]]))
-    packed = jnp.asarray([[[10.0], [11.0], [12.0], [20.0]]])
+    packed = jnp.asarray([[10.0], [11.0], [12.0], [20.0]])
 
     oversized, normal = pool.write_packed(
         (1, 2),
         packed,
-        ((0, 0, 3), (0, 3, 1)),
+        (3, 1),
     )
 
     assert oversized is None

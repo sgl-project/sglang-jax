@@ -25,13 +25,15 @@ from sgl_jax.srt.multimodal.in_model.host_orchestration import (
     _MergeMapping,
     build_multimodal_batch,
 )
-from sgl_jax.srt.multimodal.in_model.interface import (
-    InModelMultimodalContract,
-    PackedMultimodalEmbedding,
-)
+from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
 from sgl_jax.srt.multimodal.in_model.lane_packing import (
     balance_lanes,
+    encoder_num_lanes,
+    pack_vision_inputs,
+    put_sharded_batch,
     replicate_across_mesh,
+    restore_encoder_output,
+    run_dp_sharded_encoder,
 )
 from sgl_jax.srt.multimodal.layers.attention.flash_attention_backend import (
     vision_segment_ids_from_cu_seqlens,
@@ -112,6 +114,39 @@ def _items(grids, ranges, modality=Modality.IMAGE):
     rows = sum(int(np.prod(grid)) for grid in grids)
     features = np.arange(rows, dtype=np.float32).reshape(rows, 1)
     return _build_items(features, grids, ranges, modality)
+
+
+def _pack_qwen2(visual, items):
+    patches, grid_thw, output_indices = pack_vision_inputs(
+        items,
+        num_lanes=encoder_num_lanes(visual.mesh, visual.vision_tp),
+        buckets=visual.input_buckets,
+        merge_unit=visual.spatial_merge_unit,
+    )
+    patches = put_sharded_batch(patches, visual.mesh, visual.specs.batch_axis)
+    return patches, grid_thw, output_indices
+
+
+def _qwen2_metadata(visual, grid_thw, capacity):
+    return put_sharded_batch(
+        visual._build_metadata(grid_thw, capacity),
+        visual.mesh,
+        visual.specs.batch_axis,
+    )
+
+
+def _run_grid_vision(visual, items):
+    if not visual.vision_tp:
+        return run_dp_sharded_encoder(
+            visual,
+            items,
+            num_lanes=encoder_num_lanes(visual.mesh, visual.vision_tp),
+            buckets=visual.input_buckets,
+            merge_unit=visual.spatial_merge_unit,
+        )
+    patches, grid_thw, output_indices = _pack_qwen2(visual, items)
+    output = visual(patches, grid_thw)
+    return restore_encoder_output(output, output_indices, visual.mesh)
 
 
 def _req(items, extend_len):
@@ -219,11 +254,40 @@ def test_vision_batch_layout_uses_all_encoder_lanes(vision_tp, expected_lanes):
     )
 
 
+def test_dp_encoder_restores_item_order_and_padding():
+    items = [
+        MultimodalDataItem(Modality.IMAGE, placeholder_ranges=[(0, 2)]),
+        MultimodalDataItem(Modality.IMAGE, placeholder_ranges=[(0, 1)]),
+        MultimodalDataItem(Modality.IMAGE, placeholder_ranges=[(0, 1)]),
+    ]
+
+    class Encoder:
+        mesh = None
+
+        def _batch_items(self, values):
+            assert values == items
+            lanes = jnp.asarray([[[20.0], [30.0], [99.0]], [[10.0], [11.0], [99.0]]])
+            return lanes, np.asarray([3, 4, 0, 1, -1, -1], dtype=np.int32)
+
+        @staticmethod
+        def encode(lanes):
+            return lanes
+
+    encoder = Encoder()
+    lanes, output_indices = encoder._batch_items(items)
+    packed = restore_encoder_output(encoder.encode(lanes), output_indices, encoder.mesh)
+
+    np.testing.assert_array_equal(packed[:, 0], [10, 11, 20, 30, 0, 0])
+
+
 def _assert_vision_precompile(visual):
     calls = []
 
     def encode(*inputs):
-        calls.append(tuple(leaf.shape for leaf in jax.tree.leaves(inputs)))
+        if isinstance(visual, Qwen2_5_VisionTransformer):
+            calls.append((inputs[0].shape, np.asarray(inputs[1]).tolist()))
+        else:
+            calls.append(tuple(leaf.shape for leaf in jax.tree.leaves(inputs)))
 
     with patch.object(type(visual), "encode", side_effect=encode):
         visual.precompile()
@@ -239,8 +303,8 @@ def test_qwen2_vision_precompile_warms_configured_buckets():
         deepstack_visual_indexes=[],
     )
     assert _assert_vision_precompile(_visual(config=config, input_buckets=(4, 8))) == [
-        ((1, 4, 1), (1, 1, 2), (1, 4, 2), (1, 2), (1, 2)),
-        ((1, 8, 1), (1, 2, 2), (1, 8, 2), (1, 3), (1, 3)),
+        ((1, 4, 1), [[[1, 2, 2]]]),
+        ((1, 8, 1), [[[1, 2, 4]]]),
     ]
 
 
@@ -261,11 +325,16 @@ def test_qwen2_global_batch_spmd(encoder_tp):
         [(1, 1, length) for length in (8, 4, 2, 7, 6)],
         [(0, length) for length in (8, 4, 2, 7, 6)],
     )
-    patches, metadata, placements = visual._batch_items(items)
-    valid = metadata.full_attn.cu_seqlens[:, -1]
+    patches, grid_thw, output_indices = _pack_qwen2(visual, items)
+    metadata = _qwen2_metadata(visual, grid_thw, patches.shape[1])
+    _, _, _, full_attn = metadata
+    valid = full_attn.cu_seqlens[:, -1]
 
     if encoder_tp:
-        assert placements == ((0, 0, 8), (0, 8, 4), (0, 12, 2), (1, 0, 7), (1, 7, 6))
+        np.testing.assert_array_equal(
+            output_indices[:27],
+            np.concatenate((np.arange(14), np.arange(16, 29))),
+        )
         expected_valid = {
             mesh.devices[0, 0]: (14,),
             mesh.devices[0, 1]: (14,),
@@ -280,7 +349,17 @@ def test_qwen2_global_batch_spmd(encoder_tp):
         }
         expected_spec = PartitionSpec("data")
     else:
-        assert placements == ((0, 0, 8), (3, 0, 4), (3, 4, 2), (1, 0, 7), (2, 0, 6))
+        np.testing.assert_array_equal(
+            output_indices[:27],
+            np.concatenate(
+                (
+                    np.arange(8),
+                    np.arange(24, 30),
+                    np.arange(8, 15),
+                    np.arange(16, 22),
+                )
+            ),
+        )
         expected_valid = {
             mesh.devices[0, 0]: (8,),
             mesh.devices[0, 1]: (7,),
@@ -309,7 +388,7 @@ def test_qwen2_global_batch_spmd(encoder_tp):
 
 
 @pytest.mark.parametrize("encoder_tp", [False, True])
-def test_qwen2_encode_items_spmd(encoder_tp):
+def test_qwen2_get_image_feature_spmd(encoder_tp):
     mesh = _mesh(dp=2, tp=2)
     visual = _visual(
         mesh=mesh,
@@ -317,14 +396,18 @@ def test_qwen2_encode_items_spmd(encoder_tp):
         input_buckets=(4,),
     )
     items = _items([(1, 1, 4), (1, 1, 2)], [(0, 4), (4, 6)])
-    patches, metadata, _ = visual._batch_items(items)
-    encoded = visual.encode(patches, metadata)
+    patches, grid_thw, output_indices = _pack_qwen2(visual, items)
+    encoded = visual.encode(patches, grid_thw)
     assert encoded.sharding.is_fully_replicated
     assert encoded.sharding.spec == PartitionSpec(None, None, None)
-    packed = visual.encode_items(items)
-    assert packed.output.sharding.is_fully_replicated
-    assert packed.output.sharding.device_set == set(mesh.devices.flat)
-    assert [length for _, _, length in packed.placements] == [4, 2]
+    packed = _run_grid_vision(visual, items)
+    assert packed.sharding.is_fully_replicated
+    assert packed.sharding.device_set == set(mesh.devices.flat)
+    expected_rows = encoder_num_lanes(visual.mesh, visual.vision_tp)
+    assert packed.shape[0] == expected_rows * visual.input_buckets[0]
+    expected = encoded.reshape(-1, encoded.shape[-1])[output_indices[output_indices >= 0]]
+    np.testing.assert_allclose(packed[: len(expected)], expected)
+    np.testing.assert_array_equal(packed[len(expected) :], 0)
     calls = 0
 
     class Model(_TestInModelModel):
@@ -337,7 +420,7 @@ def test_qwen2_encode_items_spmd(encoder_tp):
         def encode(values):
             nonlocal calls
             calls += 1
-            return visual.encode_items(values)
+            return _run_grid_vision(visual, values)
 
     running = jax.device_put(
         jnp.zeros((8, 4)),
@@ -463,9 +546,10 @@ def test_qwen_attention_layouts_use_static_max_seq_len_bounds():
             norm_eps=1e-6,
         )
 
-    metadata = visual._build_metadata([[]], 256)
-    assert metadata.window_attn.max_seq_len == 64
-    assert metadata.full_attn.max_seq_len == 256
+    empty_grid = np.zeros((1, 1, 3), dtype=np.int32)
+    _, _, window_attn, full_attn = visual._build_metadata(empty_grid, 256)
+    assert window_attn.max_seq_len == 64
+    assert full_attn.max_seq_len == 256
 
 
 @pytest.mark.parametrize("search_method", ["compare_all", "scan"])
@@ -521,12 +605,7 @@ def test_merge_preserves_unmasked_tokens():
 
     class Model(_TestInModelModel):
         def get_multimodal_encode_funcs(self):
-            return {
-                Modality.AUDIO: lambda _: PackedMultimodalEmbedding(
-                    output=jnp.array([[[10.0, 11.0], [20.0, 21.0]]]),  # [1, 2, 2]
-                    placements=((0, 0, 2),),
-                )
-            }
+            return {Modality.AUDIO: lambda _: jnp.array([[10.0, 11.0], [20.0, 21.0]])}
 
     running = jnp.array([[1, 2], [3, 4], [5, 6]], dtype=jnp.float32)
     output, _ = host_orchestration.embed_multimodal_inputs(
@@ -557,23 +636,15 @@ def test_packed_gather_merge_preserves_data_sharding():
         2,
     )
 
-    # output[row, pos, (1+D)*H]; item i lives at placements[i] = (row, offset, length).
-    # Primary is [..., :H]; the single deepstack plane is [..., H:].
-    output = jnp.asarray(
-        [[[10.0, 30.0], [11.0, 31.0]], [[20.0, 40.0], [21.0, 41.0]]]
-    )  # [num_lanes=2, cap=2, (1+D)*H=2]
+    output = jnp.asarray([[10.0, 30.0], [11.0, 31.0], [20.0, 40.0], [21.0, 41.0]])
 
     class Model(_TestInModelModel):
+        deepstack_visual_layers = 1
+
         def get_multimodal_encode_funcs(self):
             def encode(items):
                 assert items == [rank0, rank1]
-                return PackedMultimodalEmbedding(
-                    output=jax.device_put(
-                        output, NamedSharding(mesh, PartitionSpec(None, None, None))
-                    ),
-                    placements=((0, 0, 2), (1, 0, 2)),
-                    deepstack_dim=1,
-                )
+                return jax.device_put(output, NamedSharding(mesh, PartitionSpec(None, None)))
 
             return {Modality.IMAGE: encode}
 
@@ -605,11 +676,7 @@ def test_packed_gather_merge_handles_chunk_split():
 
     class Model(_TestInModelModel):
         def get_multimodal_encode_funcs(self):
-            return {
-                Modality.IMAGE: lambda items: PackedMultimodalEmbedding(
-                    output=full[None], placements=((0, 0, 4),)
-                )
-            }
+            return {Modality.IMAGE: lambda items: full}
 
     running = jnp.zeros((3, 1))
     out, _ = host_orchestration.embed_multimodal_inputs(
@@ -618,20 +685,19 @@ def test_packed_gather_merge_handles_chunk_split():
     np.testing.assert_array_equal(out[:, 0], [11, 12, 13])
 
 
-def test_embedding_pool_replays_encoder_output():
-    """A second request for the same item is served from the pool, not the encoder."""
+def test_embedding_pool_skips_write_after_final_merge():
     item = MultimodalDataItem(
         Modality.IMAGE, hash=5, feature=np.ones((2, 1)), placeholder_ranges=[(0, 2)]
     )
     calls = 0
-    output = jnp.asarray([[[10.0], [11.0]]])  # [num_lanes=1, cap=2, H=1]
+    output = jnp.asarray([[10.0], [11.0]])
 
     class Model(_TestInModelModel):
         def get_multimodal_encode_funcs(self):
             def encode(items):
                 nonlocal calls
                 calls += 1
-                return PackedMultimodalEmbedding(output=output, placements=((0, 0, 2),))
+                return output
 
             return {Modality.IMAGE: encode}
 
@@ -647,39 +713,42 @@ def test_embedding_pool_replays_encoder_output():
     second, _ = host_orchestration.embed_multimodal_inputs(*args)
     np.testing.assert_array_equal(first[:, 0], [10, 11])
     np.testing.assert_array_equal(second[:, 0], [10, 11])
-    assert calls == 1  # second call hits the pool
+    assert calls == 2
+    assert pool.lookup(item.hash) is None
 
 
 def test_embedding_pool_hit_matches_miss_with_deepstack():
     item = MultimodalDataItem(
         Modality.IMAGE, hash=6, feature=np.ones((2, 1)), placeholder_ranges=[(0, 2)]
     )
-    output = jnp.asarray([[[10.0, 30.0], [11.0, 31.0]]])  # [num_lanes=1, cap=2, (1+D)*H=2]
+    output = jnp.asarray([[10.0, 30.0], [11.0, 31.0]])
 
     class Model(_TestInModelModel):
+        deepstack_visual_layers = 1
+
         def get_multimodal_encode_funcs(self):
-            return {
-                Modality.IMAGE: lambda items: PackedMultimodalEmbedding(
-                    output=output,
-                    placements=((0, 0, 2),),
-                    deepstack_dim=1,
-                )
-            }
+            return {Modality.IMAGE: lambda items: output}
 
     pool = EmbeddingPool(num_pages=4, page_size=2, hidden=1, dtype=jnp.float32, deepstack_dim=1)
-    args = (
-        _batch([item]),
-        jnp.zeros(2, dtype=jnp.int32),
-        lambda _: jnp.zeros((2, 1), dtype=jnp.float32),
-        Model(),
+    model = Model()
+    first, first_ds = host_orchestration.embed_multimodal_inputs(
+        _batch([item], extend=1, per_dp_token=1),
+        jnp.zeros(1, dtype=jnp.int32),
+        lambda _: jnp.zeros((1, 1), dtype=jnp.float32),
+        model,
         pool,
     )
-    first, first_ds = host_orchestration.embed_multimodal_inputs(*args)
-    second, second_ds = host_orchestration.embed_multimodal_inputs(*args)
-    np.testing.assert_array_equal(first[:, 0], [10, 11])
-    np.testing.assert_array_equal(second[:, 0], [10, 11])
-    np.testing.assert_array_equal(first_ds[0, :, 0], [30, 31])
-    np.testing.assert_array_equal(second_ds[0, :, 0], [30, 31])
+    second, second_ds = host_orchestration.embed_multimodal_inputs(
+        _batch([item], prefix=1, extend=1, per_dp_token=1),
+        jnp.zeros(1, dtype=jnp.int32),
+        lambda _: jnp.zeros((1, 1), dtype=jnp.float32),
+        model,
+        pool,
+    )
+    np.testing.assert_array_equal(first[:, 0], [10])
+    np.testing.assert_array_equal(second[:, 0], [11])
+    np.testing.assert_array_equal(first_ds[0, :, 0], [30])
+    np.testing.assert_array_equal(second_ds[0, :, 0], [31])
 
 
 def test_embedding_pool_reads_hit_before_miss_can_evict_it():
@@ -689,35 +758,36 @@ def test_embedding_pool_reads_hit_before_miss_can_evict_it():
     miss = MultimodalDataItem(
         Modality.IMAGE, hash=20, feature=np.ones((1, 1)), placeholder_ranges=[(1, 2)]
     )
+    partial_miss = MultimodalDataItem(
+        Modality.IMAGE, hash=30, feature=np.ones((2, 1)), placeholder_ranges=[(2, 4)]
+    )
 
     class Model(_TestInModelModel):
         def get_multimodal_encode_funcs(self):
             def encode(items):
-                assert items == [miss]
-                return PackedMultimodalEmbedding(
-                    output=jnp.asarray([[[20.0]]]),
-                    placements=((0, 0, 1),),
-                )
+                assert items == [miss, partial_miss]
+                return jnp.asarray([[20.0], [30.0], [31.0]])
 
             return {Modality.IMAGE: encode}
 
-    pool = EmbeddingPool(num_pages=1, page_size=1, hidden=1, dtype=jnp.float32)
-    pool.write_packed((hit.hash,), jnp.asarray([[[10.0]]]), ((0, 0, 1),))
+    pool = EmbeddingPool(num_pages=1, page_size=2, hidden=1, dtype=jnp.float32)
+    pool.write_packed((hit.hash,), jnp.asarray([[10.0]]), (1,))
     out, _ = host_orchestration.embed_multimodal_inputs(
-        _batch([hit, miss]),
-        jnp.zeros(2, dtype=jnp.int32),
-        lambda _: jnp.zeros((2, 1), dtype=jnp.float32),
+        _batch([hit, miss, partial_miss], extend=3, per_dp_token=3),
+        jnp.zeros(3, dtype=jnp.int32),
+        lambda _: jnp.zeros((3, 1), dtype=jnp.float32),
         Model(),
         pool,
     )
 
-    np.testing.assert_array_equal(out[:, 0], [10, 20])
+    np.testing.assert_array_equal(out[:, 0], [10, 20, 30])
     assert pool.lookup(hit.hash) is None
-    miss_entry = pool.lookup(miss.hash)
-    assert miss_entry is not None
+    assert pool.lookup(miss.hash) is None
+    partial_entry = pool.lookup(partial_miss.hash)
+    assert partial_entry is not None
     np.testing.assert_array_equal(
-        np.asarray(pool.pages[int(miss_entry.page_ids[0]), 0, 0]),
-        20,
+        np.asarray(pool.pages[int(partial_entry.page_ids[0]), :, 0]),
+        [30, 31],
     )
 
 
@@ -727,14 +797,14 @@ def test_embedding_pool_reuses_full_item_across_chunks():
         Modality.IMAGE, hash=7, feature=np.ones((4, 1)), placeholder_ranges=[(0, 4)]
     )
     calls = 0
-    output = jnp.asarray([[[10.0], [11.0], [12.0], [13.0]]])  # [num_lanes=1, cap=4, H=1]
+    output = jnp.asarray([[10.0], [11.0], [12.0], [13.0]])
 
     class Model(_TestInModelModel):
         def get_multimodal_encode_funcs(self):
             def encode(items):
                 nonlocal calls
                 calls += 1
-                return PackedMultimodalEmbedding(output=output, placements=((0, 0, 4),))
+                return output
 
             return {Modality.IMAGE: encode}
 
@@ -866,11 +936,13 @@ def test_qwen2_metadata_is_host_planned_and_bucket_stable():
     )
     visual = _visual(config=config, input_buckets=(32,))
     first = _items([(1, 4, 6)], [(0, 6)])
-    patches, metadata, placements = visual._batch_items(first)
-    indices = np.asarray(metadata.indices)
-    position_ids = np.asarray(metadata.position_ids)
+    patches, grid_thw, output_indices = _pack_qwen2(visual, first)
+    metadata = _qwen2_metadata(visual, grid_thw, patches.shape[1])
+    indices, position_ids, window_attn, full_attn = metadata
+    indices = np.asarray(indices)
+    position_ids = np.asarray(position_ids)
 
-    assert placements == ((0, 0, 6),)
+    np.testing.assert_array_equal(output_indices[:6], np.arange(6))
     assert position_ids.shape == (1, 32, 2)
     np.testing.assert_array_equal(indices[0, :, 0], [0, 1, 3, 4, 2, 5, 6, 7])
     np.testing.assert_array_equal(indices[0, :, 1], [0, 1, 4, 2, 3, 5, 6, 7])
@@ -880,24 +952,27 @@ def test_qwen2_metadata_is_host_planned_and_bucket_stable():
     )
     # window layout at [:, 0], full-frame at [:, 1]; tails repeat the final end.
     np.testing.assert_array_equal(
-        np.asarray(metadata.window_attn.cu_seqlens)[0], [0, 16, 24, 24, 24, 24, 24, 24, 24]
+        np.asarray(window_attn.cu_seqlens)[0], [0, 16, 24, 24, 24, 24, 24, 24, 24]
     )
     np.testing.assert_array_equal(
-        np.asarray(metadata.full_attn.cu_seqlens)[0], [0, 24, 24, 24, 24, 24, 24, 24, 24]
+        np.asarray(full_attn.cu_seqlens)[0], [0, 24, 24, 24, 24, 24, 24, 24, 24]
     )
     np.testing.assert_array_equal(
-        visual._build_metadata([[]], 32).window_attn.cu_seqlens,
+        visual._build_metadata(np.zeros((1, 1, 3), dtype=np.int32), 32)[2].cu_seqlens,
         np.zeros((1, 9), dtype=np.int32),
     )
-    _assert_no_grid_layout_planning(jax.make_jaxpr(visual)(patches, metadata))
+    _assert_no_grid_layout_planning(
+        jax.make_jaxpr(lambda p, *m: visual._forward(p, *m))(patches, *metadata)
+    )
 
-    jax.block_until_ready(visual.encode(patches, metadata))
+    jax.block_until_ready(visual.encode(patches, grid_thw))
     cache_size = visual._encode_jit._cache_size()
     second = _items([(1, 4, 4), (2, 2, 2)], [(0, 4), (4, 6)])
-    second_patches, second_metadata, _ = visual._batch_items(second)
+    second_patches, second_grid_thw, _ = _pack_qwen2(visual, second)
+    second_metadata = _qwen2_metadata(visual, second_grid_thw, second_patches.shape[1])
     np.testing.assert_array_equal(
-        np.asarray(second_metadata.full_attn.cu_seqlens)[0],
+        np.asarray(second_metadata[3].cu_seqlens)[0],
         [0, 16, 20, 24, 24, 24, 24, 24, 24],
     )
-    jax.block_until_ready(visual.encode(second_patches, second_metadata))
+    jax.block_until_ready(visual.encode(second_patches, second_grid_thw))
     assert visual._encode_jit._cache_size() == cache_size

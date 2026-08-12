@@ -263,7 +263,7 @@ class ServerArgs:
     # Multimodal
     multimodal: bool = False
     limit_mm_data_per_request: dict[str, int] | None = None
-    mm_embedding_cache_size_mb: int = 0
+    mm_embedding_cache_size_mb: int | None = None
     mm_embedding_page_size: int = 64
 
     enable_return_routed_experts: bool = False
@@ -528,7 +528,7 @@ class ServerArgs:
             self.model_path = download_from_hf(self.model_path, allow_patterns=None)
             if self.limit_mm_data_per_request is None:
                 self.limit_mm_data_per_request = {"image": 16}
-        if self.mm_embedding_cache_size_mb < 0:
+        if self.mm_embedding_cache_size_mb is not None and self.mm_embedding_cache_size_mb < 0:
             raise ValueError("--mm-embedding-cache-size-mb must be non-negative")
         if self.mm_embedding_page_size <= 0:
             raise ValueError("--mm-embedding-page-size must be positive")
@@ -1599,7 +1599,8 @@ class ServerArgs:
             "--mm-embedding-cache-size-mb",
             type=int,
             default=ServerArgs.mm_embedding_cache_size_mb,
-            help="Per-device memory budget in MiB for multimodal embeddings; 0 disables it.",
+            help="Per-device multimodal embedding cache budget in MiB. By default, "
+            "it holds max-prefill-tokens embeddings; 0 disables it.",
         )
         parser.add_argument(
             "--mm-embedding-page-size",

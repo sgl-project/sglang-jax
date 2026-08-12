@@ -62,6 +62,7 @@ def _embedding_pool_bytes(
     model_config: ModelConfig | MockModelConfig,
     server_args: ServerArgs,
     is_draft_worker: bool = False,
+    deepstack_dim: int = 0,
 ) -> int:
     """Per-device byte budget reserved for the multimodal embedding pool."""
     enabled = (
@@ -72,7 +73,18 @@ def _embedding_pool_bytes(
         and not server_args.enable_lora
         and server_args.disaggregation_mode != "decode"
     )
-    return server_args.mm_embedding_cache_size_mb * 1024**2 if enabled else 0
+    if not enabled or server_args.mm_embedding_cache_size_mb == 0:
+        return 0
+    if server_args.mm_embedding_cache_size_mb is not None:
+        return server_args.mm_embedding_cache_size_mb * 1024**2
+    page_size = server_args.mm_embedding_page_size
+    capacity = -(-server_args.max_prefill_tokens // page_size) * page_size
+    return (
+        capacity
+        * int(model_config.hidden_size)
+        * jnp.dtype(model_config.dtype).itemsize
+        * (1 + deepstack_dim)
+    )
 
 
 def _maybe_apply_recurrent_cow(forward_batch, memory_pools):
@@ -214,7 +226,10 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
     def embedding_pool_bytes(self) -> int:
         """Per-device bytes reserved for the multimodal embedding pool (derived)."""
         return _embedding_pool_bytes(
-            self.model_config, self.server_args, getattr(self, "is_draft_worker", False)
+            self.model_config,
+            self.server_args,
+            getattr(self, "is_draft_worker", False),
+            int(getattr(self.model, "deepstack_visual_layers", 0) or 0),
         )
 
     def _build_embedding_pool(self):

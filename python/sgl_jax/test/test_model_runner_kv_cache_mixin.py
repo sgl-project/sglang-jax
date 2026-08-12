@@ -1,5 +1,6 @@
 import types
 
+import jax.numpy as jnp
 import pytest
 
 from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
@@ -79,14 +80,20 @@ def test_embedding_pool_bytes_only_for_in_model_prefill():
 
     config = types.SimpleNamespace(
         is_multimodal=True,
+        hidden_size=8,
+        dtype=jnp.bfloat16,
         hf_config=types.SimpleNamespace(architectures=["Qwen2_5_VLForConditionalGeneration"]),
     )
     args = types.SimpleNamespace(
-        mm_embedding_cache_size_mb=128,
+        mm_embedding_cache_size_mb=None,
+        mm_embedding_page_size=64,
+        max_prefill_tokens=100,
         multimodal=False,
         enable_lora=False,
         disaggregation_mode="null",
     )
+    assert _embedding_pool_bytes(config, args) == 128 * 8 * 2
+    args.mm_embedding_cache_size_mb = 128
     assert _embedding_pool_bytes(config, args) == 128 * 1024**2
     args.multimodal = True
     assert _embedding_pool_bytes(config, args) == 0

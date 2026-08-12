@@ -1,34 +1,45 @@
-"""Encoder-agnostic lane packing for the in-model multimodal contract.
-
-Every in-model encoder (vision, audio, ...) turns a list of items into the
-packed ``[num_lanes, cap, ...]`` layout that :class:`PackedMultimodalEmbedding`
-requires: items are balanced across a fixed number of lanes (one per encoder
-device), each lane is zero-padded to a bucketed capacity, and every item records
-where its output lands via ``placements[i] = Placement(lane, offset, length)``.
-
-That bookkeeping is identical across modalities; only a few knobs vary (how long
-an item is, how many output tokens it produces, and the bucket ladder).  This
-module owns the mechanical part so each encoder supplies just those knobs and
-keeps its own metadata packing.
-"""
+"""Lane packing and output restoration for multimodal encoders."""
 
 from __future__ import annotations
 
 import functools
-from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jax.typing import ArrayLike
 
 from sgl_jax.srt.multimodal.common.modality_enum import MultimodalDataItem
-from sgl_jax.srt.multimodal.in_model.interface import (
-    PackedMultimodalEmbedding,
-    Placement,
-)
+
+
+class _Encoder(Protocol):
+    mesh: Mesh | None
+
+    def encode(self, *inputs: Any) -> jax.Array: ...
+
+
+def get_grid_thw(item: MultimodalDataItem) -> tuple[int, int, int]:
+    value = item.get("image_grid_thw")
+    if value is None:
+        value = item.get("video_grid_thw")
+    return tuple(int(entry) for entry in np.asarray(value).reshape(3))
+
+
+def put_sharded_batch(value: Any, mesh: Mesh | None, batch_axis: Any):
+    if mesh is None:
+        return jax.tree.map(jnp.asarray, value)
+    return jax.device_put(value, NamedSharding(mesh, PartitionSpec(batch_axis)))
+
+
+def encoder_num_lanes(mesh: Mesh | None, tensor_parallel: bool) -> int:
+    if mesh is None:
+        return 1
+    data_size = int(mesh.shape.get("data", 1))
+    tensor_size = int(mesh.shape.get("tensor", 1))
+    return data_size * (1 if tensor_parallel else tensor_size)
 
 
 @functools.cache
@@ -66,16 +77,9 @@ def balance_lanes(item_lengths: list[int] | tuple[int, ...], num_lanes: int) -> 
 
 @dataclass(frozen=True)
 class PackedLanes:
-    """Host-side packing result, before the features are encoded.
-
-    ``lanes`` is exposed so the encoder can pack its own (modality-specific)
-    per-lane metadata against the same lane assignment -- keeping a single source
-    of truth for which item lives in which lane.
-    """
-
     features: np.ndarray  # [num_lanes, cap, *feature_shape]
     valid: np.ndarray  # [num_lanes], filled input length per lane
-    placements: tuple[Placement, ...]
+    output_indices: np.ndarray
     lanes: list[list[int]]
     cap: int
 
@@ -96,9 +100,6 @@ def pack_lanes(
     merge_unit: int,
     dtype: np.dtype | type = np.float32,
 ) -> PackedLanes:
-    # I extracted the pack from qwen2.5VL and qwen3VL into a function,
-    # but this might not be a good practice.
-    # Gemma4 has a fixed shape, so there is clearly a better approach.
     features_np = [np.asarray(item.feature) for item in items]
     lengths = [feature.shape[0] for feature in features_np]
     lanes = balance_lanes(lengths, num_lanes)
@@ -106,99 +107,111 @@ def pack_lanes(
     cap = _bucket_capacity(max(lane_loads), buckets, merge_unit)
     features = np.zeros((num_lanes, cap, *features_np[0].shape[1:]), dtype=dtype)
     valid = np.zeros(num_lanes, dtype=np.int32)
-    placements: list[Placement | None] = [None] * len(items)
+    output_cap = cap // merge_unit
+    output_starts = np.zeros(len(items), dtype=np.int32)
 
-    def fill_lane(lane_index: int) -> None:
+    for lane_index, lane in enumerate(lanes):
         input_offset = 0
         output_offset = 0
-        for item_index in lanes[lane_index]:
+        for item_index in lane:
             feature = features_np[item_index]
             end = input_offset + feature.shape[0]
             features[lane_index, input_offset:end] = feature
             out_len = feature.shape[0] // merge_unit
-            placements[item_index] = Placement(lane_index, output_offset, out_len)
+            output_starts[item_index] = lane_index * output_cap + output_offset
             input_offset = end
             output_offset += out_len
         valid[lane_index] = input_offset
 
-    for lane_index in range(num_lanes):
-        fill_lane(lane_index)
-    assert all(placement is not None for placement in placements)
-    return PackedLanes(features, valid, tuple(placements), lanes, cap)
+    output_indices = np.full(num_lanes * output_cap, -1, dtype=np.int32)
+    cursor = 0
+    for length, source_start in zip(lengths, output_starts, strict=True):
+        output_len = length // merge_unit
+        output_indices[cursor : cursor + output_len] = source_start + np.arange(
+            output_len, dtype=np.int32
+        )
+        cursor += output_len
+    return PackedLanes(features, valid, output_indices, lanes, cap)
 
 
-def pack_batch(
+def pack_vision_inputs(
     items: list[MultimodalDataItem],
-    num_lanes: int,
     *,
+    num_lanes: int,
     buckets: tuple[int, ...],
     merge_unit: int,
-    put_batch: Callable[[np.ndarray], jax.Array],
-    pack_metadata: Callable[[list[MultimodalDataItem]], Any] | None = None,
-    empty_metadata: Callable[[int], Any] | None = None,
-    pad_metadata: Callable[[Any, int], Any] | None = None,
-    dtype: np.dtype | type = np.float32,
-):
-    """Pack items into lanes and move features (+ per-lane metadata) to device.
-
-    This is the device-side template shared by every in-model encoder's
-    ``_batch_items``: it balances/buckets via :func:`pack_lanes`, kicks the
-    (largest) features H2D transfer off *before* building metadata so the copy
-    overlaps the metadata CPU work, then pads each lane's metadata to ``cap`` and
-    stacks it into a ``[num_lanes, ...]`` pytree.
-
-    Encoders supply only their knobs: ``merge_unit``, the ``put_batch`` device
-    placement, and (for metadata-bearing encoders) the ``pack_metadata`` /
-    ``empty_metadata`` / ``pad_metadata`` trio -- the same per-lane metadata is
-    packed against ``pack_lanes``' lane assignment, keeping one source of truth
-    for which item lives in which lane.
-
-    Returns ``(features, metadata, valid, placements)`` when the metadata
-    callbacks are given, else ``(features, valid, placements)`` for encoders that
-    carry no per-lane metadata (e.g. audio codes).
-    """
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     packed = pack_lanes(
         items,
         num_lanes,
         buckets=buckets,
         merge_unit=merge_unit,
-        dtype=dtype,
     )
-    features = put_batch(packed.features)
-    if pack_metadata is None:
-        return features, put_batch(packed.valid), packed.placements
-
-    dummy_metadata = pad_metadata(empty_metadata(packed.cap), packed.cap)
-    metadata = [dummy_metadata] * len(packed.lanes)
+    grid_thw = np.zeros(
+        (num_lanes, max(map(len, packed.lanes)), 3),
+        dtype=np.int32,
+    )
     for lane_index, lane in enumerate(packed.lanes):
-        if not lane:
-            continue
-        lane_items = [items[index] for index in lane]
-        metadata[lane_index] = pad_metadata(pack_metadata(lane_items), packed.cap)
-    metadata = jax.tree.map(lambda *values: np.stack(values), *metadata)
-    return (
-        features,
-        jax.tree.map(put_batch, metadata),
-        put_batch(packed.valid),
-        packed.placements,
+        for item_offset, item_index in enumerate(lane):
+            grid_thw[lane_index, item_offset] = get_grid_thw(items[item_index])
+    return packed.features, grid_thw, packed.output_indices
+
+
+def _restore_input_order(
+    output: jax.Array,
+    indices: jax.Array,
+    mask: jax.Array,
+    *,
+    out_sharding: NamedSharding | None = None,
+) -> jax.Array:
+    output = output.reshape(-1, output.shape[-1])
+    output = (
+        output[indices]
+        if out_sharding is None
+        else output.at[indices].get(out_sharding=out_sharding)
+    )
+    return jnp.where(mask[:, None], output, jnp.zeros((), output.dtype))
+
+
+_restore_input_order_jit = jax.jit(_restore_input_order)
+
+
+@functools.cache
+def _restore_input_order_mesh_jit(mesh: Mesh):
+    out_sharding = NamedSharding(mesh, PartitionSpec())
+    return jax.jit(
+        functools.partial(_restore_input_order, out_sharding=out_sharding),
+        out_shardings=out_sharding,
     )
 
 
-def to_packed_embedding(
+def restore_encoder_output(
     output: jax.Array,
-    placements: tuple[Placement, ...],
+    output_indices: np.ndarray,
     mesh: Mesh | None,
-    deepstack_dim: int = 0,
-) -> PackedMultimodalEmbedding:
-    """Wrap an encoder's packed output in :class:`PackedMultimodalEmbedding`.
+) -> jax.Array:
+    output_indices = np.asarray(output_indices, dtype=np.int32)
+    mask = output_indices >= 0
+    indices = np.maximum(output_indices, 0)
 
-    ``output`` must be in the packed ``[num_lanes, cap, F]`` layout produced by
-    :func:`pack_lanes` (``F == (1 + deepstack_dim) * H``, deepstack planes
-    already concatenated onto the trailing axis) -- ``placements`` indexes into
-    it and ``num_lanes``/``cap`` are read back off the shape by the wrapper. When
-    ``mesh`` is set, the output is replicated across the mesh before wrapping.
-    """
-    if mesh is not None:
-        with jax.set_mesh(mesh):
-            output = replicate_across_mesh(output, mesh)
-    return PackedMultimodalEmbedding(output, placements, deepstack_dim)
+    if mesh is None:
+        return _restore_input_order_jit(output, indices, mask)
+    return _restore_input_order_mesh_jit(mesh)(output, indices, mask)
+
+
+def run_dp_sharded_encoder(
+    encoder: _Encoder,
+    items: list[MultimodalDataItem],
+    *,
+    num_lanes: int,
+    buckets: tuple[int, ...],
+    merge_unit: int,
+) -> jax.Array:
+    patches, grid_thw, output_indices = pack_vision_inputs(
+        items,
+        num_lanes=num_lanes,
+        buckets=buckets,
+        merge_unit=merge_unit,
+    )
+    output = encoder.encode(patches, grid_thw)
+    return restore_encoder_output(output, output_indices, encoder.mesh)

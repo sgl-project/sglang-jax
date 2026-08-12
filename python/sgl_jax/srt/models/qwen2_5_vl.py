@@ -1,10 +1,8 @@
-import dataclasses
 import logging
 import math
 from collections.abc import Callable
 from functools import partial
 from types import SimpleNamespace
-from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -25,11 +23,14 @@ from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalData
 from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
     QwenVLModelVitConfig,
 )
-from sgl_jax.srt.multimodal.in_model.interface import (
-    InModelMultimodalContract,
-    PackedMultimodalEmbedding,
+from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
+from sgl_jax.srt.multimodal.in_model.lane_packing import (
+    encoder_num_lanes,
+    pack_vision_inputs,
+    put_sharded_batch,
+    restore_encoder_output,
+    run_dp_sharded_encoder,
 )
-from sgl_jax.srt.multimodal.in_model.lane_packing import pack_lanes, to_packed_embedding
 from sgl_jax.srt.multimodal.layers.attention.flash_attention_backend import (
     VisionAttentionMetadata,
     make_vision_attention_backend,
@@ -46,37 +47,6 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 _init_fn = nnx.initializers.uniform()
-
-
-@dataclasses.dataclass
-class Qwen2_5VisionMetadata:
-    """Host-planned inputs for one ViT encode, threaded as a single object.
-
-    ``indices`` packs the window-reorder indices (``[..., 0]``) and their
-    inverse (``[..., 1]``); ``position_ids`` drives the rotary embedding. The
-    ViT alternates window- and full-attention layers, so it carries a
-    :class:`VisionAttentionMetadata` for each layout, selected per block via
-    ``fullatt_block_indexes``.
-    """
-
-    indices: Any
-    position_ids: Any
-    window_attn: VisionAttentionMetadata
-    full_attn: VisionAttentionMetadata
-
-
-jax.tree_util.register_dataclass(
-    Qwen2_5VisionMetadata,
-    data_fields=["indices", "position_ids", "window_attn", "full_attn"],
-    meta_fields=[],
-)
-
-
-def _item_grid_thw(item: MultimodalDataItem) -> tuple[int, int, int]:
-    grid = item.get("image_grid_thw")
-    if grid is None:
-        grid = item.get("video_grid_thw")
-    return tuple(int(value) for value in np.asarray(grid).reshape(3))
 
 
 def _apply_rotary_pos_emb_vision(
@@ -463,18 +433,26 @@ class Qwen2_5_VisionTransformer(nnx.Module):
     def __call__(
         self,
         patches: jax.Array,
-        metadata: Qwen2_5VisionMetadata,
+        grid_thw: np.ndarray | jax.Array,
     ) -> jax.Array:
-        """Full ViT forward: patch embed → window-reorder → blocks → merge → un-reorder."""
+        return self.encode(patches, grid_thw)
+
+    def _forward(
+        self,
+        patches: jax.Array,
+        indices: jax.Array,
+        position_ids: jax.Array,
+        window_attn: VisionAttentionMetadata,
+        full_attn: VisionAttentionMetadata,
+    ) -> jax.Array:
         B, S = patches.shape[:2]
         u = self.spatial_merge_unit
         n_units = S // u
-        metadata = self._pin(metadata)
-        window_index, reverse_indices = metadata.indices[:, :, 0], metadata.indices[:, :, 1]
+        window_index, reverse_indices = indices[:, :, 0], indices[:, :, 1]
         inv_freq = 1.0 / (
             self.theta ** (jnp.arange(0, self.rotary_dim, 2, dtype=jnp.float32) / self.rotary_dim)
         )
-        rotary_pos_emb = (metadata.position_ids[..., None].astype(jnp.float32) * inv_freq).reshape(
+        rotary_pos_emb = (position_ids[..., None].astype(jnp.float32) * inv_freq).reshape(
             B, S, self.rot_dim
         )
         rotary_cos = jnp.cos(rotary_pos_emb)[:, :, None, :]
@@ -489,7 +467,7 @@ class Qwen2_5_VisionTransformer(nnx.Module):
 
         # Select the pre-planned metadata per block: full-frame for the layers in
         # ``fullatt_block_indexes``, otherwise the local-window layout.
-        layout_metadata = (metadata.window_attn, metadata.full_attn)
+        layout_metadata = (window_attn, full_attn)
         for i, blk in enumerate(self.blocks):
             block_meta = layout_metadata[int(i in self.fullatt_block_indexes)]
             x = blk(x, rotary_cos, rotary_sin, block_meta)
@@ -500,59 +478,36 @@ class Qwen2_5_VisionTransformer(nnx.Module):
     def encode(
         self,
         patches: jax.Array,
-        metadata: Qwen2_5VisionMetadata,
+        grid_thw: np.ndarray | jax.Array,
     ) -> jax.Array:
+        patches = put_sharded_batch(patches, self.mesh, self.specs.batch_axis)
+        metadata = self._build_metadata(grid_thw, patches.shape[1])
+        metadata = put_sharded_batch(metadata, self.mesh, self.specs.batch_axis)
         if self.mesh is None:
-            return self._encode_jit(patches, metadata)
+            return self._encode_jit(patches, *metadata)
         with jax.set_mesh(self.mesh):
-            return self._encode_jit(patches, metadata)
+            return self._encode_jit(patches, *metadata)
 
     def precompile(self) -> None:
+        num_lanes = encoder_num_lanes(self.mesh, self.vision_tp)
         for capacity in self.input_buckets:
-            item = MultimodalDataItem(
-                Modality.IMAGE,
-                feature=np.zeros((capacity, self.patch_dim), dtype=np.float32),
-                model_specific_data={
-                    "image_grid_thw": np.asarray(
-                        [[1, self.spatial_merge_size, capacity // self.spatial_merge_size]]
-                    )
-                },
+            patches = np.zeros(
+                (num_lanes, capacity, self.patch_dim),
+                dtype=np.float32,
             )
-            patches, metadata, _ = self._batch_items([item])
-            jax.block_until_ready(self.encode(patches, metadata))
-
-    def encode_items(self, items: list[MultimodalDataItem]) -> PackedMultimodalEmbedding:
-        """Native packed output + placements, without slicing back to per-item.
-
-        The merge gathers directly from ``output`` [num_lanes, cap, H], whose
-        row dim is a mesh constant and cap dim is bucketed, so it compiles a
-        bounded number of shapes regardless of image size or request packing.
-        """
-        if not items:
-            return PackedMultimodalEmbedding(jnp.zeros((0, 0, 0), jnp.float32), ())
-        patches, metadata, placements = self._batch_items(items)
-        output = self.encode(patches, metadata)
-        return to_packed_embedding(output, placements, self.mesh)
-
-    def _num_lanes(self) -> int:
-        if self.mesh is None:
-            return 1
-        data_size = int(self.mesh.shape.get("data", 1))
-        tensor_size = int(self.mesh.shape.get("tensor", 1))
-        return data_size * (1 if self.vision_tp else tensor_size)
+            grid = (1, self.spatial_merge_size, capacity // self.spatial_merge_size)
+            grid_thw = np.zeros((num_lanes, 1, 3), dtype=np.int32)
+            grid_thw[0, 0] = grid
+            jax.block_until_ready(self.encode(patches, grid_thw))
 
     def _build_metadata(
         self,
-        lane_grids: list[list[tuple[int, int, int]]],
+        lane_grids: np.ndarray | jax.Array,
         capacity: int,
-    ) -> Qwen2_5VisionMetadata:
-        """Plan one ViT encode on the host: reorder indices, rotary positions,
-        and the window / full-frame attention layouts, bundled into a single
-        :class:`Qwen2_5VisionMetadata`.
-
-        Each layout's ``cu_seqlens`` starts with zero, contains real cumulative
-        ends, then repeats the lane's final valid length to capacity.
-        """
+    ) -> tuple[np.ndarray, np.ndarray, VisionAttentionMetadata, VisionAttentionMetadata]:
+        lane_grids = np.asarray(jax.device_get(lane_grids), dtype=np.int32)
+        if lane_grids.ndim == 2:
+            lane_grids = lane_grids[None]
         batch = len(lane_grids)
         merge = self.spatial_merge_size
         unit = self.spatial_merge_unit
@@ -587,9 +542,12 @@ class Qwen2_5_VisionTransformer(nnx.Module):
             patch_offset = unit_offset = 0
             window_ends = []
             frame_ends = []
-            for t, h, w in grids:
-                window_index, window_lengths, coords = grid_layout(t, h, w)
+            for grid in grids:
+                if not np.any(grid):
+                    continue
+                t, h, w = map(int, grid)
                 patch_count = t * h * w
+                window_index, window_lengths, coords = grid_layout(t, h, w)
                 unit_count = patch_count // unit
                 patch_slice = slice(patch_offset, patch_offset + patch_count)
                 unit_slice = slice(unit_offset, unit_offset + unit_count)
@@ -610,7 +568,7 @@ class Qwen2_5_VisionTransformer(nnx.Module):
         # Static bounds must depend only on the compile bucket, not the request's
         # exact segment values, so requests in one bucket share a compilation.
         window_max_seq_len = min(capacity, window * window * unit)
-        return Qwen2_5VisionMetadata(
+        return (
             indices,
             position_ids,
             VisionAttentionMetadata(
@@ -623,38 +581,16 @@ class Qwen2_5_VisionTransformer(nnx.Module):
             ),
         )
 
-    def _batch_items(self, items: list[MultimodalDataItem]):
-        for item in items:
-            grid = _item_grid_thw(item)
-            t, h, w = grid
-        packed = pack_lanes(
-            items,
-            self._num_lanes(),
-            buckets=self.input_buckets,
-            merge_unit=self.spatial_merge_unit,
-        )
-        patches = self._put_batch(packed.features)
-        lane_grids = [[_item_grid_thw(items[index]) for index in lane] for lane in packed.lanes]
-        metadata = self._build_metadata(lane_grids, packed.cap)
-        return patches, self._put_batch(metadata), packed.placements
-
-    def _put_batch(self, value):
-        """Move a host array (or a pytree of them, e.g. the vision metadata) to
-        the ViT batch sharding. Static (non-array) pytree leaves are untouched."""
-        if self.mesh is None:
-            return jax.tree.map(jnp.asarray, value)
-        return jax.device_put(
-            value,
-            self.specs.sharding(self.specs.batch_axis),
-        )
-
     @jax.jit
     def _encode_jit(
         self,
         patches: jax.Array,
-        metadata: Qwen2_5VisionMetadata,
+        indices: jax.Array,
+        position_ids: jax.Array,
+        window_attn: VisionAttentionMetadata,
+        full_attn: VisionAttentionMetadata,
     ) -> jax.Array:
-        features = self(patches, metadata)
+        features = self._forward(patches, indices, position_ids, window_attn, full_attn)
         if self.mesh is None:
             return features
         # Keep the DP lane-to-replicated transition inside the compiled encode.
@@ -666,17 +602,6 @@ class Qwen2_5_VisionTransformer(nnx.Module):
                 self.mesh,
                 PartitionSpec(*([None] * features.ndim)),
             ),
-        )
-
-    def _pin(self, metadata: Qwen2_5VisionMetadata) -> Qwen2_5VisionMetadata:
-        """Reshard the host-planned metadata's array leaves to the ViT batch
-        spec. Static (non-array) pytree leaves pass through untouched."""
-        if self.mesh is None:
-            return jax.tree.map(jnp.asarray, metadata)
-        spec = PartitionSpec(self.specs.batch_axis)
-        return jax.tree.map(
-            lambda leaf: apply_data_sharding(jnp.asarray(leaf), self.mesh, spec),
-            metadata,
         )
 
 
@@ -738,17 +663,42 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
     def precompile_multimodal(self) -> None:
         self.visual.precompile()
 
-    def get_multimodal_embedding_packed_shapes(self) -> tuple[tuple[int, int], ...]:
-        rows = self.visual._num_lanes()
+    def get_multimodal_embedding_packed_capacities(self) -> tuple[int, ...]:
+        rows = encoder_num_lanes(self.mesh, self.visual.vision_tp)
         unit = self.visual.spatial_merge_unit
-        return tuple((rows, bucket // unit) for bucket in self.visual.input_buckets)
+        return tuple(rows * bucket // unit for bucket in self.visual.input_buckets)
+
+    def get_image_feature(self, items: list[MultimodalDataItem]) -> jax.Array:
+        return self._get_visual_feature(items)
+
+    def get_video_feature(self, items: list[MultimodalDataItem]) -> jax.Array:
+        return self._get_visual_feature(items)
+
+    def _get_visual_feature(self, items: list[MultimodalDataItem]) -> jax.Array:
+        num_lanes = encoder_num_lanes(self.mesh, self.visual.vision_tp)
+        if not self.visual.vision_tp:
+            return run_dp_sharded_encoder(
+                self.visual,
+                items,
+                num_lanes=num_lanes,
+                buckets=self.visual.input_buckets,
+                merge_unit=self.visual.spatial_merge_unit,
+            )
+
+        patches, grid_thw, output_indices = pack_vision_inputs(
+            items,
+            num_lanes=num_lanes,
+            buckets=self.visual.input_buckets,
+            merge_unit=self.visual.spatial_merge_unit,
+        )
+        output = self.visual(patches, grid_thw)
+        return restore_encoder_output(output, output_indices, self.mesh)
 
     def get_multimodal_encode_funcs(self):
-        encode = self.visual.encode_items
         return {
-            Modality.IMAGE: encode,
-            Modality.MULTI_IMAGES: encode,
-            Modality.VIDEO: encode,
+            Modality.IMAGE: self.get_image_feature,
+            Modality.MULTI_IMAGES: self.get_image_feature,
+            Modality.VIDEO: self.get_video_feature,
         }
 
     def load_weights(self, model_config: ModelConfig) -> None:

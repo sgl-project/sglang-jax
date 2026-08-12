@@ -8,14 +8,8 @@ addressed* -- an entry is keyed by ``MultimodalDataItem.hash`` (the whole
 image / audio clip), not by token ids -- because multimodal embeddings share no
 token-level prefix.
 
-Storage layout is chosen so the merge can gather from the pool with the *same*
-kernel it uses for the encoder's packed output: ``pages`` is
-``[num_pages, page_size, (1 + deepstack_dim) * H]`` -- the primary token
-embedding plus ``deepstack_dim`` deepstack planes concatenated on the trailing
-axis, exactly as :class:`PackedMultimodalEmbedding.output`. A token that is the
-``k``-th token of an entry lives at page ``page_ids[k // page_size]``, offset
-``k % page_size`` -- i.e. ``(page, offset)`` plays exactly the role of
-``(row, pos)`` in the packed contract.
+``pages`` stores the primary embedding and any deepstack planes contiguously as
+``[num_pages, page_size, (1 + deepstack_dim) * H]``.
 
 Writes are performed by a ``jit``+``donate`` scatter so the large device buffer
 is updated in place (eager ``.at[].set`` would copy the whole pool per write).
@@ -35,7 +29,6 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jax.typing import ArrayLike
 
-from sgl_jax.srt.multimodal.in_model.interface import Placement
 from sgl_jax.srt.multimodal.in_model.lane_packing import replicate_across_mesh
 
 
@@ -92,8 +85,6 @@ class EmbeddingPool:
         self.page_size = page_size
         self.hidden = hidden
         self.deepstack_dim = deepstack_dim
-        # One buffer holds the primary embedding + deepstack planes contiguously,
-        # matching PackedMultimodalEmbedding.output's trailing feature width.
         self.feature_width = hidden * (1 + deepstack_dim)
         self.mesh = mesh
 
@@ -165,73 +156,52 @@ class EmbeddingPool:
         self,
         item_hashes: Sequence[int],
         packed_embeddings: ArrayLike,
-        placements: Sequence[Placement],
+        lengths: Sequence[int],
+        *,
+        write_mask: Sequence[bool] | None = None,
     ) -> tuple[EmbeddingPoolEntry | None, ...]:
-        """Cache a batch directly from one bucket-shaped encoder output.
-
-        ``packed_embeddings`` is ``[num_lanes, cap, (1 + deepstack_dim) * H]`` (the
-        primary embedding with deepstack planes concatenated on the trailing
-        axis) and each placement is a :class:`Placement` ``(row, offset,
-        true_length)``. All items are planned on the host, then the device
-        consumes the complete bucket exactly once using a fixed ``[num_lanes,
-        cap]`` slot map. True lengths affect only map values and page allocation,
-        never the JIT signature.
-
-        If later items evict earlier items from the same batch, only entries
-        still resident after planning are written. This keeps valid scatter
-        destinations unique and avoids writing data that cannot be reused.
-        """
+        """Cache one padded encoder output whose items are packed in input order."""
         item_hashes = tuple(map(int, item_hashes))
-        placements = tuple(
-            Placement(*(int(value) for value in placement)) for placement in placements
-        )
-        if len(item_hashes) != len(placements):
-            raise ValueError(
-                f"item/placement count mismatch: {len(item_hashes)} != {len(placements)}"
-            )
+        lengths = tuple(map(int, lengths))
+        write_mask = (True,) * len(lengths) if write_mask is None else tuple(map(bool, write_mask))
+        if len(item_hashes) != len(lengths):
+            raise ValueError(f"item/length count mismatch: {len(item_hashes)} != {len(lengths)}")
+        if len(write_mask) != len(lengths):
+            raise ValueError(f"mask/length count mismatch: {len(write_mask)} != {len(lengths)}")
 
         packed_embeddings = self._replicate(packed_embeddings)
-        if packed_embeddings.ndim != 3 or packed_embeddings.shape[2] != self.feature_width:
+        if packed_embeddings.ndim != 2 or packed_embeddings.shape[1] != self.feature_width:
             raise ValueError(
                 "packed embeddings must have shape "
-                f"[num_lanes, cap, {self.feature_width}], got {packed_embeddings.shape}"
+                f"[capacity, {self.feature_width}], got {packed_embeddings.shape}"
             )
-        num_lanes, cap = map(int, packed_embeddings.shape[:2])
-        for placement in placements:
-            if (
-                placement.row < 0
-                or placement.row >= num_lanes
-                or placement.offset < 0
-                or placement.length < 0
-                or placement.offset + placement.length > cap
-            ):
-                raise ValueError(
-                    f"invalid packed placement {placement} for shape {packed_embeddings.shape}"
-                )
+        capacity = int(packed_embeddings.shape[0])
+        if any(length < 0 for length in lengths) or sum(lengths) > capacity:
+            raise ValueError(f"invalid item lengths {lengths} for capacity {capacity}")
 
-        planned: list[tuple[int, EmbeddingPoolEntry, Placement] | None] = []
-        for item_hash, placement in zip(item_hashes, placements, strict=True):
-            length = placement.length
-            page_ids = self._reserve(item_hash, self._pages_for(length))
+        planned: list[tuple[int, EmbeddingPoolEntry, int, int] | None] = []
+        offset = 0
+        for item_hash, length, should_write in zip(item_hashes, lengths, write_mask, strict=True):
+            page_ids = self._reserve(item_hash, self._pages_for(length)) if should_write else None
             if page_ids is None:
                 planned.append(None)
-                continue
+            else:
+                entry = EmbeddingPoolEntry(page_ids, length)
+                self._entries[item_hash] = entry
+                planned.append((item_hash, entry, offset, length))
+            offset += length
 
-            entry = EmbeddingPoolEntry(page_ids, length)
-            self._entries[item_hash] = entry
-            planned.append((item_hash, entry, placement))
-
-        slots = np.full((num_lanes, cap), -1, dtype=np.int32)
+        slots = np.full(capacity, -1, dtype=np.int32)
         results: list[EmbeddingPoolEntry | None] = []
         for plan in planned:
             if plan is None:
                 results.append(None)
                 continue
-            item_hash, entry, (lane, offset, length) = plan
+            item_hash, entry, offset, length = plan
             if self._entries.get(item_hash) is not entry:
                 results.append(None)
                 continue
-            slots[lane, offset : offset + length] = self._slots(entry.page_ids)[:length]
+            slots[offset : offset + length] = self._slots(entry.page_ids)[:length]
             results.append(entry)
 
         if any(entry is not None and entry.length for entry in results):
@@ -239,13 +209,13 @@ class EmbeddingPool:
             self._pages = _scatter_rows(self._pages, slots, packed_embeddings)
         return tuple(results)
 
-    def precompile_packed_write(self, num_lanes: int, cap: int) -> None:
+    def precompile_packed_write(self, capacity: int) -> None:
         """Compile the packed writer for one encoder bucket without changing LRU state."""
-        if num_lanes <= 0 or cap <= 0:
-            raise ValueError("packed writer dimensions must be positive")
+        if capacity <= 0:
+            raise ValueError("packed writer capacity must be positive")
         with jax.set_mesh(self.mesh) if self.mesh is not None else nullcontext():
-            slots = self._replicate(np.full((num_lanes, cap), -1, dtype=np.int32))
-            rows = self._zeros((num_lanes, cap, self.feature_width), self._pages.dtype)
+            slots = self._replicate(np.full(capacity, -1, dtype=np.int32))
+            rows = self._zeros((capacity, self.feature_width), self._pages.dtype)
             self._pages = _scatter_rows(self._pages, slots, rows)
             jax.block_until_ready(self._pages)
 
