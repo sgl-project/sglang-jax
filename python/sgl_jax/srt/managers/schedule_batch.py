@@ -1424,25 +1424,6 @@ class ScheduleBatch:
             reqs_to_abort: Requests aborted due to OOM
         """
 
-        # Helper function: check if memory is sufficient for given DP rank
-        def has_sufficient_memory(dp_rank: int, indices: list[int]) -> bool:
-            num_tokens = self.new_tokens_required_next_decode(dp_rank, indices)
-
-            evict_from_tree_cache(self.tree_cache, num_tokens, dp_rank=dp_rank)
-
-            if self.is_hybrid:
-                full_ok = (
-                    self.token_to_kv_pool_allocator.full_available_size(dp_rank=dp_rank)
-                    >= num_tokens
-                )
-                swa_ok = (
-                    self.token_to_kv_pool_allocator.swa_available_size(dp_rank=dp_rank)
-                    >= num_tokens
-                )
-                return full_ok and swa_ok
-            else:
-                return self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank) >= num_tokens
-
         retracted_reqs = []
         reqs_to_abort = []
         keep_indices_per_dp = {}
@@ -1466,39 +1447,34 @@ class ScheduleBatch:
                 reverse=True,
             )
 
-            # Retract until sufficient for this rank
-            first_iter = True
-            while first_iter or (not has_sufficient_memory(dp_rank, sorted_indices)):
-                if len(sorted_indices) == 1:
-                    # Keep at least one request in the loop; handle OOM below.
+            while True:
+                num_tokens = self.new_tokens_required_next_decode(dp_rank, sorted_indices)
+                requirements = {dp_rank: num_tokens}
+                self._evict_tree_cache_if_needed(requirements)
+                if self._is_available_size_sufficient(requirements):
                     break
 
-                first_iter = False
                 retract_idx = sorted_indices.pop()
                 req = info.reqs[retract_idx]
-                retracted_reqs.append(req)
+                if sorted_indices:
+                    retracted_reqs.append(req)
+                    self.release_req(retract_idx, dp_rank, len(sorted_indices), server_args)
+                    continue
 
-                # Release the request using its local index within this DP rank
-                self.release_req(retract_idx, dp_rank, len(sorted_indices), server_args)
-
-            # If the last remaining request still can't fit, abort it gracefully
-            # instead of crashing the scheduler (follows upstream sglang).
-            if len(sorted_indices) <= 1 and not has_sufficient_memory(dp_rank, sorted_indices):
-                last_idx = sorted_indices.pop()
-                last_req = info.reqs[last_idx]
-                last_req.to_finish = FINISH_ABORT(
+                req.to_finish = FINISH_ABORT(
                     f"Out of memory in DP rank {dp_rank} even after retracting all other requests "
                     "in the decode batch. Aborting the last request.",
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     "InternalServerError",
                 )
-                reqs_to_abort.append(last_req)
-                self.release_req(last_idx, dp_rank, 0, server_args)
+                reqs_to_abort.append(req)
+                self.release_req(retract_idx, dp_rank, 0, server_args)
                 logger.warning(
                     "retract_decode: aborted last request %s in DP rank %d due to OOM",
-                    last_req.rid,
+                    req.rid,
                     dp_rank,
                 )
+                break
 
             keep_indices_per_dp[dp_rank] = sorted_indices
 
@@ -3384,34 +3360,9 @@ class ScheduleBatch:
         )
 
     def _evict_tree_cache_if_needed(self, num_tokens_per_dp: dict[int, int]) -> None:
-        """Evict from tree cache if needed for any DP rank.
-
-        Per-DP aware implementation. Tree cache is global, eviction affects all DP ranks.
-
-        Args:
-            num_tokens_per_dp: Dict mapping dp_rank to tokens needed for that rank
-        """
-        if isinstance(self.tree_cache, ChunkCache):
-            return
-
-        # Per-DP loop
+        """Evict from tree cache for each DP rank that needs capacity."""
         for dp_rank, num_tokens in num_tokens_per_dp.items():
-            if self.is_hybrid:
-                full_available = self.token_to_kv_pool_allocator.full_available_size(
-                    dp_rank=dp_rank
-                )
-                swa_available = self.token_to_kv_pool_allocator.swa_available_size(dp_rank=dp_rank)
-
-                if (full_available < num_tokens or swa_available < num_tokens) and self.tree_cache:
-                    full_num = max(0, num_tokens - full_available)
-                    swa_num = max(0, num_tokens - swa_available)
-                    self.tree_cache.evict(
-                        EvictParams(num_tokens=full_num, swa_num_tokens=swa_num, dp_rank=dp_rank)
-                    )
-            else:
-                available = self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank)
-                if available < num_tokens and self.tree_cache:
-                    self.tree_cache.evict(EvictParams(num_tokens=num_tokens, dp_rank=dp_rank))
+            evict_from_tree_cache(self.tree_cache, num_tokens, dp_rank=dp_rank)
 
     def _is_available_size_sufficient(self, num_tokens_per_dp: dict[int, int]) -> bool:
         """Check if sufficient memory available across all DP ranks.
