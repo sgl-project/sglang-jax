@@ -299,8 +299,13 @@ class JAXModelLoader(DefaultModelLoader):
         ):
             is_static = model_config.quantization_config.is_static_checkpoint
 
-            if is_static:
-                logger.info("Applying STATIC quantization structure preparation...")
+            quantize_on_load = bool(
+                getattr(model_config.quantization_config, "quantize_on_load", False)
+            )
+
+            if is_static or quantize_on_load:
+                mode = "STATIC" if is_static else "LOAD-TIME"
+                logger.info("Applying %s quantization structure preparation...", mode)
                 from sgl_jax.srt.utils.quantization.quantization_utils import (
                     apply_linear_quantization,
                     apply_moe_quantization,

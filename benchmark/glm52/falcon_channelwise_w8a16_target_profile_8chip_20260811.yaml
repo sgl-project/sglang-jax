@@ -1,0 +1,87 @@
+name: glm52-channelwise-w8a16-target-c32-128k-1k-1k-profile-8chip-20260811-r4
+exp_type: PROFILING
+artifact_type: trace
+cluster_name: tpu-training-antgroup
+profile: true
+priority: 0
+tags:
+  - profile
+  - glm52
+  - channelwise-w8a16-target
+config: '{"target":"channelwise-w8a16","model":"GLM5.2-fp8-channel-wise","weight_dtype":"fp8-per-channel","activation_dtype":"bf16","tp":16,"dp":16,"ep":16,"physical_chips":8,"jax_devices":16,"concurrency":32,"shared_prefix_tokens":131072,"extend_tokens":1024,"decode_tokens":1024,"profile_max_hosts":1,"profile_num_chips_per_task":1,"profile_by_stage":true,"profile_steps":3,"profile_stages":["prefill","decode"],"profile_mode":"runtime-stage-lightweight","compiler_metadata":false,"production_mla_mixed_2048":[8,64],"prior_compiler_metadata_failures":["exp-zpr2wpa0kn","exp-sgx0qqo76b"],"dsa_sparse_impl":"exact","dsa_topk_impl":"radix","moe_backend":"fused_v2","kv_cache_dtype":"bf16","fused_moe_tune_exp":"exp-39vsflxses","source_commit":"3a83b2b3c56f1e6e1f3e018cdaf503bfa669f427","patch_sha256":"4370536c37860eb0d8b5ccb6c2d9e4baf7117b8f8c403d0f2de5c37b986cf858","tuned_config_sha256":"47b45cbda847f4e192bd6d1d13ea51fdb393ea9d7a92e40c841822565604114b","quant_config_sha256":"933efcb013f457b7d40cbef3a736a13e5f39c4f31503e72f50a1aeee910c8233","bench_script_sha256":"3791090e43858e0885cb2ccb53f1be6af22c839e55150d43c660c92694d99362","runner_sha256":"74437a954257326105c73ebc9cf1a75b98b9a7abc81c888ebf4deb408d33f901"}'
+role_to_task_spec:
+  worker:
+    command: |
+      bash <<'BASH'
+      set -euo pipefail
+      ulimit -c 0
+      RUNNER=/tmp/glm52-w8a16-target-runner.sh
+      PATCH=/tmp/glm52-static-channelwise-w8a8.patch
+      TUNED=/tmp/glm52-w8a16-tuned-block-configs.py
+      QUANT=/tmp/fp8_glm52_static_per_channel_w8a16.yaml
+      BENCH=/tmp/bench_dsa_cache_hit.py
+      waited=0
+      while [ "$(stat -c %s "$RUNNER" 2>/dev/null || printf 0)" -ne 9386 ] || \
+            [ "$(stat -c %s "$PATCH" 2>/dev/null || printf 0)" -ne 37267 ] || \
+            [ "$(stat -c %s "$TUNED" 2>/dev/null || printf 0)" -ne 14555 ] || \
+            [ "$(stat -c %s "$QUANT" 2>/dev/null || printf 0)" -ne 544 ] || \
+            [ "$(stat -c %s "$BENCH" 2>/dev/null || printf 0)" -ne 49786 ]; do
+        if [ "$waited" -ge 1200 ]; then
+          printf 'timed out waiting for target payloads\n' >&2
+          exit 1
+        fi
+        sleep 2
+        waited=$((waited + 2))
+      done
+      printf '%s  %s\n' 74437a954257326105c73ebc9cf1a75b98b9a7abc81c888ebf4deb408d33f901 "$RUNNER" | sha256sum -c -
+      printf '%s  %s\n' 4370536c37860eb0d8b5ccb6c2d9e4baf7117b8f8c403d0f2de5c37b986cf858 "$PATCH" | sha256sum -c -
+      printf '%s  %s\n' 47b45cbda847f4e192bd6d1d13ea51fdb393ea9d7a92e40c841822565604114b "$TUNED" | sha256sum -c -
+      printf '%s  %s\n' 933efcb013f457b7d40cbef3a736a13e5f39c4f31503e72f50a1aeee910c8233 "$QUANT" | sha256sum -c -
+      printf '%s  %s\n' 3791090e43858e0885cb2ccb53f1be6af22c839e55150d43c660c92694d99362 "$BENCH" | sha256sum -c -
+      exec bash "$RUNNER"
+      BASH
+    replica: 2
+    image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x2
+    envs:
+      BENCH_SCRIPT_SHA256: 3791090e43858e0885cb2ccb53f1be6af22c839e55150d43c660c92694d99362
+      JAX_COMPILATION_CACHE_DIR: /tmp/tpu_logs/jax-compilation-cache
+      PIP_CACHE_DIR: /tmp/tpu_logs/pip-cache
+      PYTHONUNBUFFERED: "1"
+      QUANT_CONFIG_SHA256: 933efcb013f457b7d40cbef3a736a13e5f39c4f31503e72f50a1aeee910c8233
+      RUN_MODE: profile
+      SGLANG_PROFILE_COMPILER_METADATA: "0"
+      SGLANG_PROFILE_MAX_HOSTS: "1"
+      SGLANG_PROFILE_NUM_CHIPS_PER_TASK: "1"
+      TMPDIR: /tmp/tpu_logs/tmp
+      TUNED_CONFIG_SHA256: 47b45cbda847f4e192bd6d1d13ea51fdb393ea9d7a92e40c841822565604114b
+      UV_CACHE_DIR: /tmp/tpu_logs/uv-cache
+    mounts:
+      - name: glm52-channelwise-model
+        type: gcs
+        bucket: inference-model-storage-poc-tpu-hns
+        prefix: GLM5.2-fp8-channel-wise
+        mount_path: /models/GLM5.2-fp8-channel-wise
+        read_only: true
+        mount_options:
+          - implicit-dirs
+          - metadata-cache:ttl-secs:-1
+          - metadata-cache:stat-cache-max-size-mb:-1
+          - metadata-cache:type-cache-max-size-mb:-1
+          - file-system:kernel-list-cache-ttl-secs:-1
+          - read:enable-buffered-read:true
+          - read:block-size-mb:32
+          - read:max-blocks-per-handle:64
+          - read:global-max-blocks:2048
+          - read_ahead_kb=1024
+    sources:
+      - name: sglang-jax
+        type: git
+        repo: git@github.com:primatrix-glm/sglang-jax-private.git
+        ref: epic/glm_5_2
+        commit: 3a83b2b3c56f1e6e1f3e018cdaf503bfa669f427
+        path: /workspace/sglang-jax
+        auth:
+          cred: github-primatrix-glm-sglang-jax-private-ssh-codex

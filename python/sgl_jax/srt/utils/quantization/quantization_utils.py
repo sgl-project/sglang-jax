@@ -122,6 +122,11 @@ def apply_linear_quantization(
             else getattr(quant_config, "weight_block_size", None)
         )
         weight_block_size = normalize_weight_block_size(weight_block_size)
+        if getattr(quant_config, "quantize_on_load", False) and weight_block_size is not None:
+            raise ValueError(
+                "quantize_on_load currently supports per-channel linear weights only; "
+                f"rule {rule['module_path']!r} must set weight_block_size to null"
+            )
 
         # Convert string dtypes to jnp dtypes
         weight_dtype = DTYPE_MAP.get(weight_dtype_str)

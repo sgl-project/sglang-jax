@@ -374,16 +374,16 @@ class FusedEPMoE(nnx.Module):
                     w2_scale, self.hidden_size, self.quant_block_n
                 )
             else:
-                # (E, K//wsz, N) → (E, K//wsz, 1, N)
-                w1_scale_4d = w1_scale.reshape(
-                    w1_scale.shape[0], w1_scale.shape[1], 1, w1_scale.shape[2]
-                )
-                w3_scale_4d = w3_scale.reshape(
-                    w3_scale.shape[0], w3_scale.shape[1], 1, w3_scale.shape[2]
-                )
-                w2_scale_4d = w2_scale.reshape(
-                    w2_scale.shape[0], w2_scale.shape[1], 1, w2_scale.shape[2]
-                )
+                if self.quant_block_k is None:
+                    # Per-channel reduction over K returns [E, N].
+                    w1_scale_4d = w1_scale[:, None, None, :]
+                    w3_scale_4d = w3_scale[:, None, None, :]
+                    w2_scale_4d = w2_scale[:, None, None, :]
+                else:
+                    # Sub-channel [E, K//wsz, N] -> [E, K//wsz, 1, N].
+                    w1_scale_4d = w1_scale[:, :, None, :]
+                    w3_scale_4d = w3_scale[:, :, None, :]
+                    w2_scale_4d = w2_scale[:, :, None, :]
 
             if hasattr(self, "w1_scale"):
                 del self.w1_scale
@@ -589,6 +589,12 @@ class FusedEPMoEV2(FusedEPMoE):
         enable_act_quant = (
             self.activation_quantized_dtype is not None and self.enable_act_quant_cfg is not False
         ) and (w1_scale is not None)
+        quant_block_k = self.quant_block_k if hasattr(self, "quant_block_k") else None
+        quant_mode = (
+            "none"
+            if w1_scale is None
+            else ("per_channel" if quant_block_k is None else "blockwise")
+        )
 
         if block_config is None:
             block_config = get_tuned_fused_moe_v2_block_config(
@@ -603,6 +609,7 @@ class FusedEPMoEV2(FusedEPMoE):
                 use_shared_expert=self.w1_shared is not None,
                 use_grouped_topk=self.use_grouped_topk,
                 enable_act_quant=enable_act_quant,
+                quant_mode=quant_mode,
             )
 
         direct_scaled_dot = w1_scale is not None
@@ -628,7 +635,7 @@ class FusedEPMoEV2(FusedEPMoE):
             swiglu_limit=swiglu_limit,
             shared_swiglu_limit=shared_swiglu_limit,
             block_config=block_config,
-            quant_block_k=self.quant_block_k if hasattr(self, "quant_block_k") else None,
+            quant_block_k=quant_block_k,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             w3_scale=w3_scale,

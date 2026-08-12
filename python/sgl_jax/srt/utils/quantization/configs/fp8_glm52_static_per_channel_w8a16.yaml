@@ -1,0 +1,19 @@
+# GLM-5.2 offline FP8 E4M3FN per-output-channel checkpoint.
+# Weights stay FP8, while regular Linear and fused-MoE activations remain
+# BF16. Embedding, lm_head, norms, router gate, and indexer.weights_proj retain
+# their model-specific unquantized types.
+
+quantization:
+  is_static_checkpoint: true
+  weight_block_size: null
+
+  linear:
+    rules:
+      - module_path: '.*'
+        weight_dtype: 'float8_e4m3fn'
+        activation_dtype: null
+        weight_block_size: null
+
+  moe:
+    weight_dtype: 'float8_e4m3fn'
+    activation_dtype: null

@@ -205,6 +205,109 @@ class WeightLoader:
         quant_cfg = getattr(self.model_config, "quantization_config", None)
         return quant_cfg is not None and quant_cfg.is_static_checkpoint
 
+    @property
+    def is_load_time_quant(self) -> bool:
+        """Check if full-precision weights must be quantized as they are loaded."""
+        quant_cfg = getattr(self.model_config, "quantization_config", None)
+        return bool(quant_cfg is not None and getattr(quant_cfg, "quantize_on_load", False))
+
+    @staticmethod
+    def _reshard_like(value: jax.Array, model_param: nnx.Variable) -> jax.Array:
+        target_sharding = getattr(model_param.value, "sharding", None)
+        if target_sharding is None:
+            return value
+        if isinstance(target_sharding, jax.sharding.NamedSharding):
+            return jax.sharding.reshard(value, target_sharding)
+        return jax.device_put(value, target_sharding)
+
+    def _assign_load_time_quantized_weight(
+        self,
+        params: nnx.State,
+        target_path: str,
+        weight: jax.Array,
+    ) -> bool:
+        """Quantize one BF16/F16 weight and assign its FP8 value and scale.
+
+        The quantized model structure is created before checkpoint loading, so
+        the target weight and scale placeholders already exist. This helper is
+        intentionally per-channel only: each invocation keeps at most one
+        full-precision source tensor alive and drains the quantization before
+        the loader advances to the next tensor.
+        """
+        if not self.is_load_time_quant:
+            return False
+
+        quant_cfg = self.model_config.quantization_config
+        scale_path: str
+        quant_axis: int
+
+        if target_path.endswith(".weight_q"):
+            target_param = self._get_param(params, target_path)
+            target_dtype = target_param.value.dtype
+            scale_path = target_path[: -len("weight_q")] + "weight_scale"
+            quant_axis = 1
+        elif target_path.endswith((".w1", ".w2", ".w3", ".wi_0", ".wi_1", ".wo")):
+            target_param = self._get_param(params, target_path)
+            target_dtype = quant_cfg.get_moe_weight_dtype()
+            scale_path = f"{target_path}_scale"
+            quant_axis = 1
+        elif target_path.endswith((".w1_shared", ".w2_shared", ".w3_shared")):
+            target_param = self._get_param(params, target_path)
+            target_dtype = quant_cfg.get_moe_weight_dtype()
+            scale_path = f"{target_path}_scale"
+            quant_axis = 0
+        else:
+            return False
+
+        if target_dtype is None:
+            return False
+        if weight.ndim not in (2, 3):
+            raise ValueError(
+                f"Load-time per-channel quantization expects a 2D/3D weight, "
+                f"got {target_path} shape={weight.shape}"
+            )
+
+        try:
+            scale_param = self._get_param(params, scale_path)
+        except Exception as exc:
+            raise ValueError(
+                f"Missing scale placeholder {scale_path!r} for load-time quantized "
+                f"weight {target_path!r}"
+            ) from exc
+
+        from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
+
+        weight_q, scale = quantize_tensor(target_dtype, weight, axis=quant_axis)
+        expected_scale_shape = tuple(scale_param.value.shape)
+        if target_path.endswith(".weight_q"):
+            scale = scale.reshape(expected_scale_shape)
+        elif weight.ndim == 3:
+            scale = scale.reshape(scale.shape[0], 1, 1, scale.shape[-1])
+        else:
+            scale = scale.reshape(1, 1, scale.shape[-1])
+
+        if tuple(scale.shape) != expected_scale_shape:
+            raise ValueError(
+                f"Load-time scale shape mismatch for {target_path}: "
+                f"computed={scale.shape}, expected={expected_scale_shape}"
+            )
+
+        weight_q = self._reshard_like(weight_q, target_param)
+        scale = self._reshard_like(scale, scale_param)
+        weight_q.block_until_ready()
+        scale.block_until_ready()
+        target_param.value = weight_q
+        scale_param.value = scale
+        logger.info(
+            "Load-time per-channel quantized %s: %s %s -> %s, scale=%s",
+            target_path,
+            weight.dtype,
+            weight.shape,
+            weight_q.dtype,
+            scale.shape,
+        )
+        return True
+
     def is_quant_ignored(self, hf_path: str) -> bool:
         """Check if a HuggingFace weight path is in the quantization ignored_layers list."""
         quant_cfg = getattr(self.model_config, "quantization_config", None)
@@ -1477,8 +1580,7 @@ class WeightLoader:
         if do_transpose and len(single_expert_shape) >= 2 and weight_dims_unsharded:
             defer_transpose = True
             logger.info(
-                "MoE defer_transpose=True: will load in HF layout and "
-                "transpose on TPU (shape=%s)",
+                "MoE defer_transpose=True: will load in HF layout and transpose on TPU (shape=%s)",
                 single_expert_shape,
             )
 
@@ -2055,6 +2157,12 @@ class WeightLoader:
                         target_path = mapping.target_path
                         model_param = self._get_param(params, target_path)
 
+                        if self._assign_load_time_quantized_weight(
+                            params, target_path, lazy_weight
+                        ):
+                            del lazy_weight
+                            continue
+
                         # Expand 2D block-quant scale to 3D kernel-ready layout.
                         lazy_weight = self._maybe_expand_linear_block_scale(
                             lazy_weight, model_param, target_path
@@ -2166,7 +2274,10 @@ class WeightLoader:
                         final_sharding = jax.sharding.NamedSharding(self.mesh, P(*mapping.sharding))
 
                     target_path = mapping.target_path[0]
-                    _pd_cache = os.environ.get("SGLANG_PD_WEIGHT_CACHE") == "1"
+                    _pd_cache = (
+                        os.environ.get("SGLANG_PD_WEIGHT_CACHE") == "1"
+                        and not self.is_load_time_quant
+                    )
                     if _pd_cache and target_path in _PD_WEIGHT_CACHE:
                         _t0 = time.monotonic()
                         cached = _PD_WEIGHT_CACHE[target_path]
@@ -2205,11 +2316,14 @@ class WeightLoader:
                     # 3. Direct assignment
                     model_param = self._get_param(params, target_path)
                     _t_conv_start = time.monotonic()
-                    stacked_weight = self._maybe_convert_epmoe_scale_for_kernel(
-                        stacked_weight,
-                        model_param,
-                        target_path,
-                    )
+                    if self._assign_load_time_quantized_weight(params, target_path, stacked_weight):
+                        stacked_weight = model_param.value
+                    else:
+                        stacked_weight = self._maybe_convert_epmoe_scale_for_kernel(
+                            stacked_weight,
+                            model_param,
+                            target_path,
+                        )
                     _t_conv = time.monotonic() - _t_conv_start
 
                     if is_static_quant and moe_key.endswith("_scale"):
@@ -2319,11 +2433,14 @@ class WeightLoader:
 
                     target_path = mapping.target_path[0]
                     model_param = self._get_param(params, target_path)
-                    expert_weights = self._maybe_convert_epmoe_scale_for_kernel(
-                        expert_weights,
-                        model_param,
-                        target_path,
-                    )
+                    if self._assign_load_time_quantized_weight(params, target_path, expert_weights):
+                        expert_weights = model_param.value
+                    else:
+                        expert_weights = self._maybe_convert_epmoe_scale_for_kernel(
+                            expert_weights,
+                            model_param,
+                            target_path,
+                        )
 
                     if is_static_quant and moe_key.endswith("_scale"):
                         logger.debug(
@@ -2386,7 +2503,6 @@ class WeightLoader:
                 regular_mappings[hf_key] = mapping
 
         for hf_key, mapping in regular_mappings.items():
-
             if isinstance(mapping, str | list):
                 mapping = WeightMapping(target_path=mapping)
             elif not isinstance(mapping, WeightMapping):
@@ -2600,6 +2716,9 @@ class WeightLoader:
 
         try:
             model_param = self._get_param(params, jax_path)
+
+            if self._assign_load_time_quantized_weight(params, jax_path, sharded_weight):
+                return
 
             # Expand 2D block-quant scale to 3D kernel-ready layout.
             sharded_weight = self._maybe_expand_linear_block_scale(

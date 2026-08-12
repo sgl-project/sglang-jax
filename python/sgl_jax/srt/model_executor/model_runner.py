@@ -289,7 +289,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             rng_step,
             *args,
         ):
-
             model_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
             sampler = nnx.merge(sampler_def, model_state)
             rng_key = jax.random.fold_in(base_rng_key, rng_step)
@@ -556,8 +555,11 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                     f"requires TPU backend, but got {jax.default_backend()!r}."
                 )
             is_static = self.model_config.quantization_config.is_static_checkpoint
+            quantize_on_load = bool(
+                getattr(self.model_config.quantization_config, "quantize_on_load", False)
+            )
 
-            if not is_static:
+            if not is_static and not quantize_on_load:
                 logger.info("Applying DYNAMIC (online) quantization...")
                 from sgl_jax.srt.utils.quantization.quantization_utils import (
                     apply_linear_quantization,
@@ -577,7 +579,10 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                         self.model_config, self.model, is_static_input=False
                     )
             else:
-                logger.info("Static quantization detected. Skipping online requantization.")
+                logger.info(
+                    "%s quantization detected. Skipping post-load requantization.",
+                    "Static" if is_static else "Load-time",
+                )
         # Parse other args
         self.sliding_window_size = self.model_config.sliding_window
         self.dtype = self.model_config.dtype

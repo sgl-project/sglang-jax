@@ -75,13 +75,13 @@ def normalize_weight_block_size(
     block_n, block_k = weight_block_size
     if not isinstance(block_n, Integral) or not isinstance(block_k, Integral):
         raise ValueError(
-            "quantization.weight_block_size values must be integers, " f"got {weight_block_size!r}"
+            f"quantization.weight_block_size values must be integers, got {weight_block_size!r}"
         )
     block_n = int(block_n)
     block_k = int(block_k)
     if block_n <= 0 or block_k <= 0:
         raise ValueError(
-            "quantization.weight_block_size values must be > 0, " f"got {weight_block_size!r}"
+            f"quantization.weight_block_size values must be > 0, got {weight_block_size!r}"
         )
     return (block_n, block_k)
 
@@ -95,6 +95,9 @@ class QuantizationConfig:
         moe_weight_dtype: Dtype for MoE weight quantization (None = no quantization)
         moe_activation_dtype: Dtype for MoE activation quantization (None = no quantization)
         is_static_checkpoint: Whether the checkpoint is static (true for checkpoints quantized offline, false for on-the-fly quantization)
+        quantize_on_load: Whether an unquantized checkpoint should be quantized
+            tensor-by-tensor while it is loaded, avoiding a full-precision model
+            materialization in device memory.
         ignored_layers: Optional list of layer name patterns to exclude from quantization
         weight_block_size: Optional block sizes for block quantization (e.g., [128, 128])
     """
@@ -103,6 +106,7 @@ class QuantizationConfig:
     moe_weight_dtype: jnp.dtype | None = None
     moe_activation_dtype: jnp.dtype | None = None
     is_static_checkpoint: bool = False
+    quantize_on_load: bool = False
     ignored_layers: list[str] | None = None
     weight_block_size: tuple[int, int] | None = None
     allow_narrow_n_blockwise: bool = False
@@ -120,6 +124,7 @@ class QuantizationConfig:
                 str(self.moe_activation_dtype) if self.moe_activation_dtype is not None else None
             ),
             "is_static_checkpoint": self.is_static_checkpoint,
+            "quantize_on_load": self.quantize_on_load,
             "ignored_layers": self.ignored_layers,
             "weight_block_size": (
                 list(self.weight_block_size) if self.weight_block_size is not None else None
@@ -179,14 +184,27 @@ class QuantizationConfig:
         moe_weight_dtype = _str_to_dtype(moe_section.get("weight_dtype"))
         moe_activation_dtype = _str_to_dtype(moe_section.get("activation_dtype"))
         is_static_checkpoint = quant.get("is_static_checkpoint", False)
+        quantize_on_load = quant.get("quantize_on_load", False)
         weight_block_size = normalize_weight_block_size(quant.get("weight_block_size"))
         allow_narrow_n_blockwise = quant.get("allow_narrow_n_blockwise", False)
+
+        if is_static_checkpoint and quantize_on_load:
+            raise ValueError(
+                "quantization.is_static_checkpoint and quantization.quantize_on_load "
+                "cannot both be true"
+            )
+        if quantize_on_load and weight_block_size is not None:
+            raise ValueError(
+                "quantization.quantize_on_load currently supports per-channel weights only; "
+                "weight_block_size must be null"
+            )
 
         return cls(
             linear_rules=linear_rules,
             moe_weight_dtype=moe_weight_dtype,
             moe_activation_dtype=moe_activation_dtype,
             is_static_checkpoint=is_static_checkpoint,
+            quantize_on_load=quantize_on_load,
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
             allow_narrow_n_blockwise=allow_narrow_n_blockwise,

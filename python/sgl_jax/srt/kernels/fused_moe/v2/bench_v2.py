@@ -1024,6 +1024,11 @@ for num_tokens in token_candidates:
                     use_shared_expert=use_shared_expert,
                     use_grouped_topk=False,
                     enable_act_quant=enable_act_quant,
+                    quant_mode=(
+                        "none"
+                        if not use_fp8
+                        else ("per_channel" if quant_block_k is None else "blockwise")
+                    ),
                 )
             except Exception as e:  # e.g. num_tokens not aligned to ep_size
                 log(f"  tuned lookup skipped ({e}); using defaults")

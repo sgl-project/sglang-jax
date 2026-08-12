@@ -1,0 +1,21 @@
+# GLM-5.2 BF16 checkpoint -> FP8 per-channel during checkpoint loading.
+#
+# Full-precision tensors are quantized one at a time before the loader advances,
+# so the complete BF16 model is never resident in HBM. Linear activations and
+# fused-MoE activations use dynamic per-token FP8 quantization at runtime.
+
+quantization:
+  is_static_checkpoint: false
+  quantize_on_load: true
+  weight_block_size: null
+
+  linear:
+    rules:
+      - module_path: '.*'
+        weight_dtype: 'float8_e4m3fn'
+        activation_dtype: 'float8_e4m3fn'
+        weight_block_size: null
+
+  moe:
+    weight_dtype: 'float8_e4m3fn'
+    activation_dtype: 'float8_e4m3fn'

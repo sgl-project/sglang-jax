@@ -27,10 +27,11 @@ MAX_INTERLEAVED_LOCAL_TOKENS = 1024
 # Key (without device_name):
 #   (tokens_dtype, weight_dtype, num_tokens, num_experts, top_k,
 #    hidden_size, intermediate_size, ep_size, use_shared_expert, use_grouped_topk,
-#    enable_act_quant)
-# enable_act_quant is the last field (Mode 1 fp8-token vs Mode 2 bf16-token want
-# different configs, esp. for shared-expert prefill). Lookup falls back to the
-# legacy 10-field key (no enable_act_quant) for pre-existing entries.
+#    enable_act_quant, quant_mode)
+# enable_act_quant distinguishes Mode 1 fp8-token from Mode 2 bf16-token, while
+# quant_mode distinguishes
+# blockwise and per-channel FP8, whose winners differ for GLM-5.2. Lookup falls
+# back through the pre-existing keys without quant_mode / enable_act_quant.
 #
 # Value: (bt, bf, btc, bse, bts)
 # fmt: off
@@ -76,6 +77,33 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         ('bfloat16', 'float8_e4m3fn', 4096, 256, 8, 6144, 2048, 16, True, False, True): (128, 1024, 64, 1024, 128),
         ('bfloat16', 'float8_e4m3fn', 8192, 256, 8, 6144, 2048, 16, True, False, True): (128, 1024, 64, 1024, 128),
         ('bfloat16', 'float8_e4m3fn', 16384, 256, 8, 6144, 2048, 16, True, False, True): (256, 512, 64, 512, 256),
+        # GLM-5.2 routed FP8 per-channel, ep=16, in-kernel shared expert,
+        # act_quant ON. Tuned by Falcon exp-pzvs0oxstq and independently
+        # rechecked against blockwise by exp-07o5vq6cgo (2026-08-07).
+        ('bfloat16', 'float8_e4m3fn', 32, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (8, 1024, 8, 128, 8),
+        ('bfloat16', 'float8_e4m3fn', 64, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (8, 1024, 8, 128, 8),
+        ('bfloat16', 'float8_e4m3fn', 128, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (8, 512, 8, 128, 8),
+        ('bfloat16', 'float8_e4m3fn', 256, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (16, 512, 16, 128, 16),
+        ('bfloat16', 'float8_e4m3fn', 512, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (32, 512, 32, 512, 32),
+        ('bfloat16', 'float8_e4m3fn', 1024, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (64, 1024, 64, 1024, 64),
+        ('bfloat16', 'float8_e4m3fn', 2048, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (128, 1024, 64, 1024, 128),
+        ('bfloat16', 'float8_e4m3fn', 4096, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (128, 1024, 64, 1024, 128),
+        ('bfloat16', 'float8_e4m3fn', 8192, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (128, 1024, 64, 1024, 128),
+        ('bfloat16', 'float8_e4m3fn', 16384, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (256, 512, 64, 512, 256),
+        # GLM-5.2 W8A16 per-channel hot buckets for the production C32
+        # 128K-prefix / 1K-extend / 1K-decode workload. Unlike the entries
+        # above, activations remain BF16. A bounded 8-candidate sweep on the
+        # full EP16 topology selected these configs (Falcon exp-39vsflxses,
+        # 2026-08-11); do not reuse them for activation-quantized W8A8.
+        ('bfloat16', 'float8_e4m3fn', 32, 256, 8, 6144, 2048, 16, True, False, False, 'per_channel'): (8, 256, 8, 256, 8),
+        ('bfloat16', 'float8_e4m3fn', 32768, 256, 8, 6144, 2048, 16, True, False, False, 'per_channel'): (128, 1024, 32, 1024, 128),
+        # GLM-5.2 W8A16 per-channel hot buckets for the C64 two-prefix
+        # 128K-hit / 1K-extend / 1K-decode workload on EP32. A bounded
+        # three-candidate decode sweep selected btc=16; the established
+        # 64K extend config measured 11.379 ms. Falcon exp-kyhm3emafb
+        # (2026-08-12). The bt=256 extend alternative exceeded v7 VMEM.
+        ('bfloat16', 'float8_e4m3fn', 64, 256, 8, 6144, 2048, 32, True, False, False, 'per_channel'): (8, 512, 16, 128, 16),
+        ('bfloat16', 'float8_e4m3fn', 65536, 256, 8, 6144, 2048, 32, True, False, False, 'per_channel'): (128, 1024, 32, 1024, 160),
         # 32768 uses interleave_bt=False. Tuned on the same EP16 topology on
         # 2026-08-06 (Falcon exp-l4uk7szwz7, confirmed by exp-4ir7bfizgu).
         ('bfloat16', 'float8_e4m3fn', 32768, 256, 8, 6144, 2048, 16, True, False, True): (128, 1024, 64, 1024, 128),
@@ -150,11 +178,14 @@ def get_simplified_key(
     use_shared_expert: bool,
     use_grouped_topk: bool,
     enable_act_quant: bool = False,
+    quant_mode: str | None = None,
 ) -> tuple:
     if ep_size <= 0:
         raise ValueError(f"Expected {ep_size=} to be > 0.")
     if num_tokens % ep_size != 0:
         raise ValueError(f"Expected {num_tokens=} to be aligned to {ep_size=}.")
+    if quant_mode not in (None, "none", "blockwise", "per_channel"):
+        raise ValueError(f"Unsupported {quant_mode=}")
 
     device = get_device_name()
     dtype_name = jnp.dtype(dtype).name
@@ -172,6 +203,7 @@ def get_simplified_key(
         bool(use_shared_expert),
         bool(use_grouped_topk),
         bool(enable_act_quant),
+        quant_mode,
     )
 
 
@@ -188,6 +220,7 @@ def get_tuned_fused_moe_v2_block_config(
     use_shared_expert: bool = False,
     use_grouped_topk: bool = False,
     enable_act_quant: bool = False,
+    quant_mode: str | None = None,
 ) -> FusedMoEBlockConfig:
     keys = get_simplified_key(
         dtype=dtype,
@@ -201,11 +234,11 @@ def get_tuned_fused_moe_v2_block_config(
         use_shared_expert=use_shared_expert,
         use_grouped_topk=use_grouped_topk,
         enable_act_quant=enable_act_quant,
+        quant_mode=quant_mode,
     )
     device_name = keys[0]
-    table_key = keys[1:]  # includes enable_act_quant (last element)
-    # Backward compatible: prefer the act_quant-specific key, then fall back to
-    # the legacy key (without enable_act_quant) so pre-existing entries still hit.
+    table_key_quant = keys[1:]
+    table_key = table_key_quant[:-1]
     table_key_legacy = table_key[:-1]
 
     def _lookup(k):
@@ -216,7 +249,9 @@ def get_tuned_fused_moe_v2_block_config(
             cfg = TUNED_BLOCK_CONFIGS.get("*", {}).get(k)
         return cfg
 
-    cfg_tuple = _lookup(table_key)
+    cfg_tuple = _lookup(table_key_quant)
+    if cfg_tuple is None:
+        cfg_tuple = _lookup(table_key)
     if cfg_tuple is None:
         cfg_tuple = _lookup(table_key_legacy)
 

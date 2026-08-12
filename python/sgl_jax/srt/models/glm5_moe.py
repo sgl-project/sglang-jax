@@ -48,6 +48,11 @@ def _dequantize_glm5_latency_sensitive_linears(loader: WeightLoader, layers: lis
     """Materialize latency-sensitive static-FP8 linears as BF16 once at load time."""
     if not loader.is_static_quant:
         return
+    quant_cfg = getattr(loader.model_config, "quantization_config", None)
+    if getattr(quant_cfg, "weight_block_size", None) is None:
+        # The unified channel-wise checkpoint keeps o_proj in FP8. The BF16
+        # compatibility path is only for the existing block-wise checkpoint.
+        return
     loader.dequant_fp8_layers(layers, specs=_GLM5_BF16_LINEAR_SPECS)
 
 
@@ -1319,6 +1324,9 @@ class Glm5ForCausalLM(nnx.Module):
 
         quant_config = getattr(model_config, "quantization_config", None)
         is_static_quant = quant_config is not None and quant_config.is_static_checkpoint
+        is_load_time_quant = bool(
+            quant_config is not None and getattr(quant_config, "quantize_on_load", False)
+        )
 
         hf_layer_indices = list(range(num_layers))
         for layer_idx in range(num_layers):
@@ -1328,6 +1336,7 @@ class Glm5ForCausalLM(nnx.Module):
                 target_idx,
                 target_idx < first_k_dense_replace,
                 is_static_quant=is_static_quant,
+                is_load_time_quant=is_load_time_quant,
                 has_indexer=indexer_types is None or indexer_types[target_idx] == "full",
             )
             mappings.update(layer_mappings)
@@ -1340,10 +1349,15 @@ class Glm5ForCausalLM(nnx.Module):
         target_idx: int,
         is_mlp_layer: bool,
         is_static_quant: bool = False,
+        is_load_time_quant: bool = False,
         has_indexer: bool = True,
     ) -> dict:
         prefix = f"model.layers.{target_idx}"
         target_prefix = f"model.layers.{layer_idx}"
+        quant_config = getattr(getattr(self, "config", None), "quantization_config", None)
+        is_static_per_channel = bool(
+            is_static_quant and getattr(quant_config, "weight_block_size", None) is None
+        )
 
         mappings = {
             f"{prefix}.input_layernorm.weight": WeightMapping(
@@ -1362,12 +1376,14 @@ class Glm5ForCausalLM(nnx.Module):
             """Mirror deepseek_v3._create_layer_mappings.add_linear.
 
             HF weight is [out, in]. Unquantized → LinearBase.weight [in, out]
-            (transpose=True, sharding=kernel_axes). Static FP8 → QuantizedLinear
-            .weight_q [out, in] (transpose=False, sharding swapped) plus the
-            block-wise weight_scale_inv sidecar. force_unquant covers modules in
-            the FP8 checkpoint's modules_to_not_convert (indexer.weights_proj).
+            (transpose=True, sharding=kernel_axes). Static FP8 and BF16
+            load-time quantization → QuantizedLinear.weight_q [out, in]
+            (transpose=False, sharding swapped). Only the static checkpoint has
+            a weight_scale_inv sidecar; load-time quantization creates the scale.
+            force_unquant covers indexer.weights_proj.
             """
-            if force_unquant or not is_static_quant:
+            has_quantized_structure = is_static_quant or is_load_time_quant
+            if force_unquant or not has_quantized_structure:
                 mappings[f"{hf}.weight"] = WeightMapping(
                     target_path=f"{tgt}.weight", sharding=sharding_std, transpose=True
                 )
@@ -1381,9 +1397,13 @@ class Glm5ForCausalLM(nnx.Module):
             # _maybe_expand_linear_block_scale runs after _shard_weight and expands to
             # [in_blocks, 1, n_out]; assignment into model_param then reshards to the
             # QuantizedLinear placeholder's 3D sharding.
-            mappings[f"{hf}.weight_scale_inv"] = WeightMapping(
-                target_path=f"{tgt}.weight_scale", sharding=(None, None), transpose=False
-            )
+            if is_static_quant:
+                scale_sharding = (sharding_q[0],) if is_static_per_channel else (None, None)
+                mappings[f"{hf}.weight_scale_inv"] = WeightMapping(
+                    target_path=f"{tgt}.weight_scale",
+                    sharding=scale_sharding,
+                    transpose=False,
+                )
 
         ap = f"{prefix}.self_attn"
         tp = f"{target_prefix}.self_attn"
@@ -1467,16 +1487,32 @@ class Glm5ForCausalLM(nnx.Module):
                     target_scale_param = target_param + "_scale"
                     scale_src_paths = [p.replace(".weight", ".weight_scale_inv") for p in src_paths]
 
+                    scale_reshape = None
+                    scale_repeat = None
+
                     # Fused kernels execute on the model (data, tensor) mesh, so
                     # their scales must use the same expert-axis sharding as the
                     # routed weights. EPMoE keeps its dedicated expert mesh.
-                    scale_sharding = (
-                        mapping.sharding if use_model_mesh_for_scale else ("expert", None, None)
-                    )
+                    if is_static_per_channel:
+                        is_w2 = target_param.endswith(("w2", "wo"))
+                        out_dim = (
+                            self.config.hidden_size if is_w2 else self.config.moe_intermediate_size
+                        )
+                        scale_reshape = (num_logical_experts, 1, 1, out_dim)
+                        # The checkpoint stack is [E, N]. Keep the source
+                        # sharding rank-correct; reshape preserves expert-axis
+                        # sharding and adds the two singleton kernel axes.
+                        scale_sharding = (mapping.sharding[0], None)
+                    else:
+                        scale_sharding = (
+                            mapping.sharding if use_model_mesh_for_scale else ("expert", None, None)
+                        )
                     new_moe_mappings[scale_key] = WeightMapping(
                         target_path=[target_scale_param] + scale_src_paths,
                         sharding=scale_sharding,
                         transpose=False,
+                        reshape=scale_reshape,
+                        repeat=scale_repeat,
                         concat_axis=mapping.concat_axis,
                         physical_to_logical_map=mapping.physical_to_logical_map,
                     )
@@ -1500,11 +1536,24 @@ class Glm5ForCausalLM(nnx.Module):
                             transpose=True,
                         )
                         if is_static_quant:
-                            mappings[f"{sp}.{hf_name}.weight_scale_inv"] = WeightMapping(
-                                target_path=f"{target_path}_block_scale",
-                                sharding=(None, None),
-                                transpose=False,
-                            )
+                            if is_static_per_channel:
+                                out_dim = (
+                                    self.config.hidden_size
+                                    if target_name == "w2_shared"
+                                    else self.config.moe_intermediate_size * num_shared
+                                )
+                                mappings[f"{sp}.{hf_name}.weight_scale_inv"] = WeightMapping(
+                                    target_path=f"{target_path}_scale",
+                                    sharding=(None, None, None),
+                                    transpose=False,
+                                    reshape=(1, 1, out_dim),
+                                )
+                            else:
+                                mappings[f"{sp}.{hf_name}.weight_scale_inv"] = WeightMapping(
+                                    target_path=f"{target_path}_block_scale",
+                                    sharding=(None, None),
+                                    transpose=False,
+                                )
                 else:
                     st = f"{target_prefix}.shared_experts"
                     add_linear(f"{sp}.gate_proj", f"{st}.gate_proj", (None, "tensor"))
@@ -1528,7 +1577,10 @@ class GlmMoeDsaForCausalLM(Glm5ForCausalLM):
         # GLM-5.1-FP8 ships modules_to_not_convert with HF naming (e.g.
         # `self_attn.indexers_proj`); translate to sglang-jax module paths so
         # quantize_model leaves the unquantized indexer head-gate as LinearBase.
-        if mc.quantization_config is not None and mc.quantization_config.is_static_checkpoint:
+        if mc.quantization_config is not None and (
+            mc.quantization_config.is_static_checkpoint
+            or getattr(mc.quantization_config, "quantize_on_load", False)
+        ):
             mc.quantization_config.ignored_layers = list(
                 mc.quantization_config.ignored_layers or []
             ) + ["indexer.weights_proj"]
