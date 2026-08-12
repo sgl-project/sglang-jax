@@ -22,6 +22,7 @@ from __future__ import annotations
 from typing import Any
 
 from transformers.configuration_utils import PretrainedConfig
+from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig
 
 __all__ = ["Qwen3_5HybridConfig", "Qwen3_5DenseConfig", "get_qwen3_5_hybrid_config"]
 
@@ -204,7 +205,10 @@ class Qwen3_5HybridConfig(PretrainedConfig):
     """
 
     model_type = "qwen3_5_moe"
-    sub_configs = {"text_config": _Qwen3_5TextConfig}
+    sub_configs = {
+        "text_config": _Qwen3_5TextConfig,
+        "vision_config": Qwen3VLVisionConfig,
+    }
     keys_to_ignore_at_inference = ["past_key_values"]
 
     # 35B-A3B disk layout is pre-fused (gate_up + experts merged at export).
@@ -228,8 +232,8 @@ class Qwen3_5HybridConfig(PretrainedConfig):
             text_config = _Qwen3_5TextConfig(**text_config)
         self.text_config = text_config
 
-        # Keep vision_config as a plain dict — base inference path doesn't
-        # construct vision layers, so we don't need a typed sub-config.
+        if isinstance(vision_config, dict):
+            vision_config = Qwen3VLVisionConfig(**vision_config)
         self.vision_config = vision_config
 
         self.image_token_id = image_token_id
