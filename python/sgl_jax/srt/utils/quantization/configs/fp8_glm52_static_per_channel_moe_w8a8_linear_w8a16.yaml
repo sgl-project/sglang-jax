@@ -1,0 +1,26 @@
+# GLM-5.2 offline FP8 E4M3FN per-output-channel checkpoint.
+#
+# Hybrid activation policy:
+# - regular Linear layers keep BF16 activations (W8A16) and use the Pallas
+#   per-channel matmul backend;
+# - fused-MoE routed and shared experts dynamically quantize activations to
+#   FP8 per token (W8A8).
+#
+# Embedding, lm_head, norms, router gate, and indexer.weights_proj retain their
+# model-specific unquantized types.
+
+quantization:
+  is_static_checkpoint: true
+  weight_block_size: null
+  per_channel_matmul_backend: pallas
+
+  linear:
+    rules:
+      - module_path: '.*'
+        weight_dtype: 'float8_e4m3fn'
+        activation_dtype: null
+        weight_block_size: null
+
+  moe:
+    weight_dtype: 'float8_e4m3fn'
+    activation_dtype: 'float8_e4m3fn'

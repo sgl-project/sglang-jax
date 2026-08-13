@@ -1,5 +1,9 @@
 # GLM-5.2 exact DSA DP16 benchmark
 
+> For the supported 8/16-chip block-wise and channel-wise delivery entry
+> points, start with [`delivery/README.md`](delivery/README.md). The dated files
+> in this directory are retained as historical experiment records.
+
 This directory contains the correctness-first GLM-5.2 exact DSA serving checks
 for the global `TP16 / DP16 / EP16` topology. Sequence parallelism is disabled:
 `--tp-size 16` is the global/sum TP size, so the tensor size inside each DP rank

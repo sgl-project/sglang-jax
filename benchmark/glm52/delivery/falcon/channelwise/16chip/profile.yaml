@@ -1,0 +1,57 @@
+name: glm52-delivery-channelwise-16chip-profile
+exp_type: PROFILING
+artifact_type: trace
+profile: true
+cluster_name: tpu-training-antgroup
+priority: 0
+tags: [glm52, delivery, profile, c64, unique-prefix, 128k, channelwise, moe-w8a8, linear-w8a16, 16chip]
+config: '{"scenario":"profile","model":"GLM5.2-fp8-channel-wise","quantization":"per-channel-weight-moe-w8a8-linear-w8a16","quant_config":"fp8_glm52_static_per_channel_moe_w8a8_linear_w8a16.yaml","physical_chips":16,"jax_devices":32,"hosts":4,"devices_per_host":8,"tp":32,"dp":32,"ep":32,"max_running_requests":64,"max_prefill_tokens":65536,"context_length":135168,"mem_fraction_static":0.88,"dsa_sparse_impl":"exact","dsa_topk_impl":"radix","moe_backend":"fused_v2","kv_cache_dtype":"bf16","concurrency":64,"requests_per_dp":2,"prefix_mode":"unique","prefix_tokens":131072,"extend_tokens":1024,"decode_tokens":1024,"profile_by_stage":true,"profile_stages":["prefill","decode"],"profile_num_steps":3,"profile_max_hosts":1,"profile_chips_per_task":1,"profile_sparse_cores":1,"profile_sparse_core_tiles":1,"source_commit":"190312672ae6bc948d8aa43ad8f968752efbffac"}'
+role_to_task_spec:
+  worker:
+    command: |
+      cd /workspace/sglang-jax
+      exec bash benchmark/glm52/delivery/falcon/runner.sh
+    replica: 4
+    image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x4
+    envs:
+      SOURCE_COMMIT: 190312672ae6bc948d8aa43ad8f968752efbffac
+      GLM52_PHYSICAL_CHIPS: "16"
+      GLM52_QUANTIZATION: channelwise
+      MODEL_PATH: /models/GLM5.2-fp8-channel-wise
+      RUN_MODE: profile
+      PYTHONUNBUFFERED: "1"
+      TMPDIR: /tmp/tpu_logs/tmp
+      PIP_CACHE_DIR: /tmp/tpu_logs/pip-cache
+      UV_CACHE_DIR: /tmp/tpu_logs/uv-cache
+      JAX_COMPILATION_CACHE_DIR: /tmp/tpu_logs/jax-compilation-cache
+    mounts:
+      - name: glm52-channelwise-model
+        type: gcs
+        bucket: inference-model-storage-poc-tpu-hns
+        prefix: GLM5.2-fp8-channel-wise
+        mount_path: /models/GLM5.2-fp8-channel-wise
+        read_only: true
+        mount_options:
+          - implicit-dirs
+          - metadata-cache:ttl-secs:-1
+          - metadata-cache:stat-cache-max-size-mb:-1
+          - metadata-cache:type-cache-max-size-mb:-1
+          - file-system:kernel-list-cache-ttl-secs:-1
+          - read:enable-buffered-read:true
+          - read:block-size-mb:32
+          - read:max-blocks-per-handle:64
+          - read:global-max-blocks:2048
+          - read_ahead_kb=1024
+    sources:
+      - name: sglang-jax
+        type: git
+        repo: git@github.com:primatrix-glm/sglang-jax-private.git
+        ref: develop/glm52-delivery-scripts
+        commit: 190312672ae6bc948d8aa43ad8f968752efbffac
+        path: /workspace/sglang-jax
+        auth:
+          cred: github-primatrix-glm-sglang-jax-private-ssh-codex
+
