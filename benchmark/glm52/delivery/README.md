@@ -8,6 +8,9 @@ and accuracy-evaluation entry points for the GLM-5.2 FP8 delivery.
 ```text
 benchmark/glm52/delivery/
 ├── README.md
+├── convert/
+│   ├── convert_channelwise_fp8.py
+│   └── run.sh
 ├── serve/
 │   ├── common.sh
 │   ├── blockwise_8chip.sh
@@ -32,8 +35,8 @@ benchmark/glm52/delivery/
         └── 16chip/{benchmark,profile,eval}.yaml
 ```
 
-The public scripts under `serve/`, `benchmark/`, and `eval/` do not
-require Falcon or another particular scheduler.
+The public scripts under `convert/`, `serve/`, `benchmark/`, and `eval/` do
+not require Falcon or another particular scheduler.
 
 ## Supported deployment matrix
 
@@ -68,6 +71,55 @@ python3 -m pip install -e '.[tpu]'
 
 Every host must use the same checkout and be able to read the same complete
 checkpoint directory.
+
+## Convert the BF16 checkpoint
+
+External deployments that do not already have the static channel-wise
+checkpoint can generate it from the complete GLM-5.2 BF16 checkpoint. This is
+a CPU and shared-filesystem workflow; it does not require TPU devices. Run it
+once from the repository root on a machine that can read and write the model
+directories:
+
+```bash
+SOURCE_MODEL=/models/GLM-5.2 \
+TARGET_MODEL=/models/GLM5.2-fp8-channel-wise \
+WORKERS=16 \
+  benchmark/glm52/delivery/convert/run.sh
+```
+
+The regular `python[tpu]` environment already provides NumPy and `ml_dtypes`.
+For a conversion-only environment, install just those dependencies first:
+
+```bash
+python3 -m pip install numpy ml-dtypes
+```
+
+The converter applies FP8 E4M3FN per-output-channel weight quantization to the
+attention, indexer, routed/shared expert, and dense MLP projection matrices.
+Each `[out, in]` weight gets a FP32 `[out]` `weight_scale_inv` sidecar. Embedding,
+normalization, router gate, `indexer.weights_proj`, and non-matrix tensors are
+copied unchanged. The serve wrapper then uses the checked-in YAML to select
+dynamic per-token FP8 activation for MoE and BF16 activation for other Linear
+layers.
+
+The default wrapper pins the validated GLM-5.2 source revision by requiring
+282 shards, 59,044 converted tensors, and 118,629 final index keys. It converts
+one bounded row chunk at a time, resumes valid shards from
+`${TARGET_MODEL}.staging-v1`, validates checksums and index/header consistency,
+and writes `${TARGET_MODEL}/_DOWNLOAD_COMPLETE` only after publication passes.
+Rerunning the same command resumes an interrupted staging directory or exits
+successfully after revalidating an already complete target. It refuses to
+overwrite a non-empty incomplete target directory.
+
+Keep source, staging, and target on a shared writable filesystem. Local scratch
+under `/tmp/glm52-fp8-channelwise` only needs room for one output shard per
+worker. The validated output is about 756.3 GB; because staging and final are
+kept separately for atomic publication, reserve about 1.6 TB in addition to the
+source checkpoint during conversion. After the published checkpoint passes
+serve/eval validation, the staging directory can be removed according to the
+deployment's retention policy. For an intentionally different compatible checkpoint revision, adjust
+`EXPECTED_SHARDS`, `EXPECTED_SELECTED_TENSORS`, and
+`EXPECTED_WEIGHT_MAP_COUNT` explicitly after reviewing the tensor policy.
 
 ## Serve
 

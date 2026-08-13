@@ -16,6 +16,9 @@ channel-wise 启动脚本以当前已经验证的“MoE W8A8、其余 Linear W8A
 ```text
 benchmark/glm52/delivery/
 ├── README.md
+├── convert/
+│   ├── convert_channelwise_fp8.py
+│   └── run.sh
 ├── serve/
 │   ├── common.sh
 │   ├── blockwise_8chip.sh
@@ -32,7 +35,7 @@ benchmark/glm52/delivery/
     └── validate_delivery_config.py
 ```
 
-这些公开脚本只依赖普通 shell、Python 环境和多机 TPU 网络，不依赖特定调度系统。
+这些公开脚本只依赖普通 shell、Python 环境和多机 TPU 网络，不依赖特定调度系统；其中权重转换只使用 CPU 和共享文件系统，不要求 TPU。
 
 ## 2. 硬件和拓扑
 
@@ -64,6 +67,45 @@ python3 -m pip install -e '.[tpu]'
 每个 host 必须能访问相同的完整 checkpoint 目录，且至少包含 `config.json`、`model.safetensors.index.json` 和 index 中列出的全部 shard。rank 0 的 25000 端口用于分布式初始化，30000 端口提供服务。
 
 启动脚本默认设置 TPU DVFS p-state 7；如部署环境统一管理频率，可设置 `GLM52_DVFS_P_STATE=off`。不要设置跳过 GCSFuse warmup 或禁止 MoE bulk read 的环境变量，真实 checkpoint 加载依赖顺序预热和 host bulk load。
+
+### 3.1 从 BF16 生成 channel-wise checkpoint
+
+如果交付环境只有完整的 GLM-5.2 BF16 checkpoint，没有内部已经转换好的 channel-wise 权重，在仓库根目录执行一次：
+
+```bash
+SOURCE_MODEL=/models/GLM-5.2 \
+TARGET_MODEL=/models/GLM5.2-fp8-channel-wise \
+WORKERS=16 \
+  benchmark/glm52/delivery/convert/run.sh
+```
+
+正常的 `python[tpu]` 环境已经包含转换所需的 NumPy 和 `ml_dtypes`。如果使用仅转换权重的轻量 CPU 环境，可先安装：
+
+```bash
+python3 -m pip install numpy ml-dtypes
+```
+
+转换脚本对 attention、indexer、dense MLP、routed/shared expert 的二维投影权重做 FP8 E4M3FN per-output-channel 静态量化。对于 Hugging Face `[out, in]` 权重，第 `i` 个输出 channel 使用：
+
+```text
+scale_i = max(abs(weight_i)) / 448
+weight_fp8_i = clip(weight_i / scale_i, -448, 448).astype(float8_e4m3fn)
+```
+
+全零 channel 的持久化 scale 为 0，计算时使用安全除数 1，避免 NaN。每个被转换的 `*.weight` 都会新增一个 FP32、形状为 `[out]` 的 `*.weight_scale_inv`。embedding、norm、router gate、`indexer.weights_proj`、bias 和非二维 tensor 原样复制。checkpoint 的 `quantization_config` 标记静态 FP8 weight；Serve 时再由仓库 YAML 将 MoE activation 设为动态 per-token FP8，其余 Linear activation 保持 BF16。
+
+默认 wrapper 对当前交付用 GLM-5.2 BF16 revision 做精确计数检查：
+
+| 校验项 | 期望值 |
+| --- | ---: |
+| safetensors shards | 282 |
+| 转换的 weight tensors | 59,044 |
+| 最终 index keys | 118,629 |
+| 转换 schema | `glm52-fp8-e4m3fn-output-channel-v1` |
+
+转换过程按 shard 分配给 16 个 CPU worker，每次只把有限行转换为 FP32，不会把完整 shard 同时展开到内存。中间结果默认写入 `${TARGET_MODEL}.staging-v1`；重跑同一命令会校验并复用已经完成的 shard。所有 shard、checksum、safetensors header、index 和总字节数全部校验通过后，才会发布 `${TARGET_MODEL}/_DOWNLOAD_COMPLETE`。如果目标目录非空但没有有效完成标记，脚本会拒绝覆盖，需人工确认目录状态。
+
+source、staging 和 target 必须位于可读写的共享文件系统。worker 本地目录默认为 `/tmp/glm52-fp8-channelwise`，每个 worker 只需容纳一个临时输出 shard。已验证的最终 checkpoint 约为 756.3 GB；为了 staging 完成后再原子发布 final，转换期间除 BF16 source 外还需预留约 1.6 TB。final 完成 Serve/Eval 验收后，再按照交付环境的数据保留策略清理 staging。若明确要转换另一份兼容 revision，需人工核对 tensor policy 后显式设置 `EXPECTED_SHARDS`、`EXPECTED_SELECTED_TENSORS` 和 `EXPECTED_WEIGHT_MAP_COUNT`，不能静默绕过 revision 差异。
 
 ## 4. Serve 启动
 
