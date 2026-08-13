@@ -21,6 +21,7 @@ DTYPE_MAP = {
     "float32": jnp.float32,
     None: None,
 }
+PER_CHANNEL_MATMUL_BACKENDS = ("dot", "pallas")
 
 # Path to built-in quantization config files
 BUILTIN_CONFIG_PATH = os.path.join(
@@ -86,6 +87,16 @@ def normalize_weight_block_size(
     return (block_n, block_k)
 
 
+def normalize_per_channel_matmul_backend(backend: str) -> str:
+    """Validate the global per-channel quantized matmul backend."""
+    if backend not in PER_CHANNEL_MATMUL_BACKENDS:
+        raise ValueError(
+            "quantization.per_channel_matmul_backend must be one of "
+            f"{PER_CHANNEL_MATMUL_BACKENDS}, got {backend!r}"
+        )
+    return backend
+
+
 @dataclass
 class QuantizationConfig:
     """Quantization configuration with explicit settings (no fallbacks).
@@ -100,6 +111,9 @@ class QuantizationConfig:
             materialization in device memory.
         ignored_layers: Optional list of layer name patterns to exclude from quantization
         weight_block_size: Optional block sizes for block quantization (e.g., [128, 128])
+        per_channel_matmul_backend: Global backend for every per-channel linear.
+            ``dot`` always uses ``lax.dot_general``; ``pallas`` requires an
+            exact tuned entry for every encountered workload.
     """
 
     linear_rules: list[dict] | None = None
@@ -110,6 +124,12 @@ class QuantizationConfig:
     ignored_layers: list[str] | None = None
     weight_block_size: tuple[int, int] | None = None
     allow_narrow_n_blockwise: bool = False
+    per_channel_matmul_backend: str = "dot"
+
+    def __post_init__(self) -> None:
+        self.per_channel_matmul_backend = normalize_per_channel_matmul_backend(
+            self.per_channel_matmul_backend
+        )
 
     def to_dict(self) -> dict:
         # Required by transformers.PretrainedConfig.to_json_string when this
@@ -130,6 +150,7 @@ class QuantizationConfig:
                 list(self.weight_block_size) if self.weight_block_size is not None else None
             ),
             "allow_narrow_n_blockwise": self.allow_narrow_n_blockwise,
+            "per_channel_matmul_backend": self.per_channel_matmul_backend,
         }
 
     @classmethod
@@ -139,6 +160,7 @@ class QuantizationConfig:
         Expected YAML format:
         ```yaml
         quantization:
+          per_channel_matmul_backend: dot  # dot or pallas, applies globally
           linear:
             rules:
               - module_path: '.*'
@@ -187,6 +209,9 @@ class QuantizationConfig:
         quantize_on_load = quant.get("quantize_on_load", False)
         weight_block_size = normalize_weight_block_size(quant.get("weight_block_size"))
         allow_narrow_n_blockwise = quant.get("allow_narrow_n_blockwise", False)
+        per_channel_matmul_backend = normalize_per_channel_matmul_backend(
+            quant.get("per_channel_matmul_backend", "dot")
+        )
 
         if is_static_checkpoint and quantize_on_load:
             raise ValueError(
@@ -208,6 +233,7 @@ class QuantizationConfig:
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
             allow_narrow_n_blockwise=allow_narrow_n_blockwise,
+            per_channel_matmul_backend=per_channel_matmul_backend,
         )
 
     @classmethod

@@ -221,6 +221,8 @@ class QuantizedLinear(nnx.Module):
         compute_dtype: Optional dtype override for the quantized kernel.
         weight_block_size: Optional block size ``(block_n, block_k)`` for
             block-wise weight quantization.
+        per_channel_matmul_backend: Global per-channel backend, either ``dot``
+            or ``pallas``. It does not affect block-wise quantization.
         scope_name: Name used for profiling scope.
     """
 
@@ -237,6 +239,7 @@ class QuantizedLinear(nnx.Module):
         compute_dtype: jnp.dtype | None = None,
         weight_block_size: tuple[int, int] | None = None,
         allow_narrow_n_blockwise: bool = False,
+        per_channel_matmul_backend: str = "dot",
         scope_name: str = "quantized_linear",
     ):
         """Initialize the quantized linear layer with pre-quantized weights."""
@@ -276,6 +279,7 @@ class QuantizedLinear(nnx.Module):
         self.compute_dtype = compute_dtype
         self.weight_block_size = weight_block_size
         self.allow_narrow_n_blockwise = allow_narrow_n_blockwise
+        self.per_channel_matmul_backend = per_channel_matmul_backend
         self.name = scope_name
 
     @classmethod
@@ -287,6 +291,7 @@ class QuantizedLinear(nnx.Module):
         is_static_input: bool = False,
         weight_block_size: Sequence[int] | None = None,
         allow_narrow_n_blockwise: bool = False,
+        per_channel_matmul_backend: str = "dot",
     ) -> "QuantizedLinear":
         """Convert a LinearBase layer to a QuantizedLinear layer.
 
@@ -302,6 +307,8 @@ class QuantizedLinear(nnx.Module):
                 pre-quantized weights.
             weight_block_size: Optional ``(block_n, block_k)`` for
                 block-wise weight quantization.
+            per_channel_matmul_backend: Global per-channel backend, either
+                ``dot`` or ``pallas``.
 
         Returns:
             A new QuantizedLinear layer with quantized weights.
@@ -434,6 +441,7 @@ class QuantizedLinear(nnx.Module):
             params_dtype=linear.params_dtype,
             weight_block_size=effective_weight_block_size,
             allow_narrow_n_blockwise=allow_narrow_n_blockwise,
+            per_channel_matmul_backend=per_channel_matmul_backend,
             scope_name=f"quantized_{linear.name}",
         )
 
@@ -495,6 +503,7 @@ class QuantizedLinear(nnx.Module):
                 weight_block_size=self.weight_block_size,
                 activation_quant_dtype=self.activation_dtype,
                 allow_narrow_n_blockwise=self.allow_narrow_n_blockwise,
+                per_channel_matmul_backend=self.per_channel_matmul_backend,
                 output_scatter_dimension=output_partition_dim,
             ),
             mesh=self.mesh,

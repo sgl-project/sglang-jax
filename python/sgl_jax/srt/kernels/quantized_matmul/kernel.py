@@ -10,7 +10,10 @@ from sgl_jax.srt.kernels.quantized_matmul.blockwise_utils import (
     get_safe_blockwise_tuned_value,
     should_use_blockwise_kernel,
 )
-from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor_simple
+from sgl_jax.srt.kernels.quantized_matmul.per_channel_utils import (
+    get_exact_per_channel_tuned_entry,
+    get_per_channel_kernel,
+)
 
 
 def xla_quantized_matmul_local(
@@ -23,6 +26,7 @@ def xla_quantized_matmul_local(
     weight_block_size: tuple[int, int] | None = None,
     activation_quant_dtype: jnp.dtype | None = None,
     allow_narrow_n_blockwise: bool = False,
+    per_channel_matmul_backend: str = "dot",
     output_scatter_dimension: int | None = None,
 ) -> jax.Array:
     """
@@ -40,6 +44,8 @@ def xla_quantized_matmul_local(
         reduce_axis: Axis name for psum reduction (e.g., "tensor"). None skips reduction.
         weight_block_size: ``(block_n, block_k)`` for block-wise quantization.
         activation_quant_dtype: Dtype for activation quantization.
+        per_channel_matmul_backend: Global per-channel backend. ``dot`` never
+            loads Pallas; ``pallas`` requires an exact tuned registry entry.
 
     Returns:
         Output of the quantized matmul.
@@ -106,7 +112,49 @@ def xla_quantized_matmul_local(
 
     else:
         # === Standard Per-Channel Quantization Path ===
-        if quantize_activation:
+        x_q_dtype = act_quant_dtype if quantize_activation else x.dtype
+        if per_channel_matmul_backend == "pallas":
+            if jnp.dtype(compute_dtype) != jnp.dtype(jnp.float32):
+                raise ValueError(
+                    "per_channel_matmul_backend='pallas' requires float32 accumulation, "
+                    f"got compute_dtype={jnp.dtype(compute_dtype).name}"
+                )
+            tuned_entry = get_exact_per_channel_tuned_entry(
+                n_batch=int(x.shape[0]),
+                n_out=int(w_q.shape[0]),
+                n_in=int(w_q.shape[1]),
+                x_dtype=x.dtype,
+                x_q_dtype=x_q_dtype,
+                w_q_dtype=w_q.dtype,
+            )
+            if tuned_entry is None:
+                raise ValueError(
+                    "per_channel_matmul_backend='pallas' requires an exact tuned entry for "
+                    f"M={x.shape[0]}, N={w_q.shape[0]}, K={w_q.shape[1]}, "
+                    f"x_dtype={jnp.dtype(x.dtype).name}, "
+                    f"x_q_dtype={jnp.dtype(x_q_dtype).name}, "
+                    f"w_q_dtype={jnp.dtype(w_q.dtype).name}"
+                )
+            per_channel_kernel = get_per_channel_kernel()
+            out = per_channel_kernel(
+                x=x,
+                w_q=w_q,
+                w_scale=w_scale,
+                x_q_dtype=x_q_dtype,
+                tuned_value=tuned_entry.tuned_value,
+            )
+        elif per_channel_matmul_backend != "dot":
+            raise ValueError(
+                "per_channel_matmul_backend must be 'dot' or 'pallas', "
+                f"got {per_channel_matmul_backend!r}"
+            )
+        elif quantize_activation:
+            # Keep the W8A16 import/data path independent of activation
+            # quantization helpers. This branch is static under JAX tracing.
+            from sgl_jax.srt.utils.quantization.quantization_utils import (
+                quantize_tensor_simple,
+            )
+
             x_q, x_scale = quantize_tensor_simple(x, act_quant_dtype, dim=-1)
             out = lax.dot_general(
                 x_q,

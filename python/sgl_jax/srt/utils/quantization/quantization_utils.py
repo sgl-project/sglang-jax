@@ -203,6 +203,9 @@ def apply_linear_quantization(
                             allow_narrow_n_blockwise=getattr(
                                 quant_config, "allow_narrow_n_blockwise", False
                             ),
+                            per_channel_matmul_backend=getattr(
+                                quant_config, "per_channel_matmul_backend", "dot"
+                            ),
                         )
                         # Replace the attribute and free old weights
                         setattr(obj, attr_name, quantized_linear)

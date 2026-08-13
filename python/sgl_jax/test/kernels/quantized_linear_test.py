@@ -249,6 +249,7 @@ def test_linear_rule_weight_block_size_override():
             ),
             "ignored_layers": None,
             "weight_block_size": [128, 128],
+            "per_channel_matmul_backend": "pallas",
         },
     )()
 
@@ -257,6 +258,7 @@ def test_linear_rule_weight_block_size_override():
     assert isinstance(model.proj, QuantizedLinear)
     assert model.proj.weight_block_size is None
     assert model.proj.weight_scale.value.ndim == 1
+    assert model.proj.per_channel_matmul_backend == "pallas"
 
 
 def test_linear_return_contract_with_bias():
@@ -408,6 +410,54 @@ quantization:
     )
 
     with pytest.raises(ValueError, match="weight_block_size"):
+        QuantizationConfig.from_yaml(str(config_path))
+
+
+@pytest.mark.parametrize("backend", ["dot", "pallas"])
+def test_quantization_config_parses_per_channel_matmul_backend(tmp_path, backend):
+    config_path = tmp_path / "quant.yaml"
+    config_path.write_text(
+        f"""
+quantization:
+  per_channel_matmul_backend: {backend}
+  linear:
+    rules:
+      - module_path: '.*'
+        weight_dtype: 'float8_e4m3fn'
+        activation_dtype: null
+  moe:
+    weight_dtype: null
+    activation_dtype: null
+""".strip()
+    )
+
+    config = QuantizationConfig.from_yaml(str(config_path))
+    assert config.per_channel_matmul_backend == backend
+    assert config.to_dict()["per_channel_matmul_backend"] == backend
+
+
+def test_quantization_config_defaults_per_channel_matmul_backend_to_dot():
+    assert QuantizationConfig().per_channel_matmul_backend == "dot"
+
+
+def test_quantization_config_rejects_invalid_per_channel_matmul_backend(tmp_path):
+    config_path = tmp_path / "invalid_backend.yaml"
+    config_path.write_text(
+        """
+quantization:
+  per_channel_matmul_backend: auto
+  linear:
+    rules:
+      - module_path: '.*'
+        weight_dtype: 'float8_e4m3fn'
+        activation_dtype: null
+  moe:
+    weight_dtype: null
+    activation_dtype: null
+""".strip()
+    )
+
+    with pytest.raises(ValueError, match="per_channel_matmul_backend"):
         QuantizationConfig.from_yaml(str(config_path))
 
 

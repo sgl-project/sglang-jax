@@ -207,12 +207,21 @@ def get_vmem_limit(
     save_acc: bool,
     save_x_q: bool,
     upper_limit_bytes: int,
+    has_x_abs_max: bool = True,
 ):
-    """Calculate VMEM limit for the kernel."""
+    """Calculate VMEM limit for the kernel.
+
+    ``has_x_abs_max`` describes the physical Pallas input ABI rather than the
+    activation quantization mode. Blockwise kernels quantize activations
+    without an external absmax operand, while the per-channel kernel only
+    carries that operand when dynamic activation quantization is enabled. The
+    default preserves the estimate used by existing callers; new callers
+    should pass the physical ABI explicitly.
+    """
 
     # Calculate in/out VMEM size.
     x_size = batch_block_size * in_block_size * _dtype_bits(x_dtype)
-    x_abs_max_size = batch_block_size * _dtype_bits(scale_dtype)
+    x_abs_max_size = batch_block_size * _dtype_bits(scale_dtype) if has_x_abs_max else 0
     w_q_size = out_block_size * in_block_size * _dtype_bits(w_q_dtype)
     w_scale_size = out_block_size * _dtype_bits(scale_dtype)
     out_size = batch_block_size * out_block_size * _dtype_bits(out_dtype)
@@ -250,7 +259,7 @@ def validate_inputs(
     x: jax.Array,
     w_q: jax.Array,
     w_scale: jax.Array,
-    x_abs_max: jax.Array,
+    x_abs_max: jax.Array | None,
     x_q_dtype: jnp.dtype,
     batch_block_size: int,
     out_block_size: int,
