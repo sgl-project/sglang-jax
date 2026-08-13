@@ -1863,6 +1863,17 @@ class Scheduler(
             if req.is_chunked > 0:
                 continue
 
+            # A chunk sender may still be reading these source KV pages. Hand
+            # finalization to its terminal callback; clearing scheduler
+            # ownership here prevents the request from being rescheduled while
+            # keeping the allocation alive until Raiden reports every child
+            # transfer done.
+            if getattr(req, "disagg_chunk_sender", None) is not None:
+                self.chunked_reqs[dp_rank] = None
+                self._pending_chunked_abort_reqs[dp_rank] = None
+                consumed[dp_rank] = req
+                continue
+
             self._finalize_chunked_abort(req, dp_rank)
             abort_out = AbortReq(rid=req.rid)
             if self._comm_backend is not None:
@@ -1890,6 +1901,13 @@ class Scheduler(
         retracted_request_ids = {id(req) for req in retracted_reqs}
         for dp_rank, req in enumerate(self.chunked_reqs):
             if req is None:
+                continue
+            sender = getattr(req, "disagg_chunk_sender", None)
+            if sender is not None:
+                assert self._pending_chunked_abort_reqs[dp_rank] is None
+                req.disagg_retract_pending = True
+                sender.abort()
+                self.chunked_reqs[dp_rank] = None
                 continue
             if id(req) in retracted_request_ids:
                 assert self._pending_chunked_abort_reqs[dp_rank] is None

@@ -156,6 +156,16 @@ class RaidenChunkedMetadata:
     direct_commit: Callable[[Mapping[str, object] | None], None] | None = None
 
 
+@dataclass(frozen=True)
+class _PendingSenderChunk:
+    chunk_index: int
+    block_ids: tuple[int, ...]
+    bootstrap_room: int
+    chunk_page_offset: int
+    is_final: bool
+    dp_rank: int
+
+
 def _normalize_transfer_bundle(
     info: Mapping[str, object],
 ) -> tuple[dict[int, Mapping[str, object]], int]:
@@ -559,7 +569,9 @@ class RaidenTransferKVSender(KVSender, StateHolder):
         self._pending_failure_reason: str | None = None
         self._debug_metadata: Mapping[str, object] | None = None
         self._chunk_mode = False
+        self._pump_lock = threading.RLock()
         self._started_chunks: set[int] = set()
+        self._pending_chunks: dict[int, _PendingSenderChunk] = {}
         self._num_chunks: int | None = None
 
     @property
@@ -611,7 +623,7 @@ class RaidenTransferKVSender(KVSender, StateHolder):
         is_final: bool,
         dp_rank: int = 0,
     ) -> None:
-        """Register and publish one newly-computed prefill chunk."""
+        """Queue one newly-computed chunk and fill available Raiden slots."""
 
         if not self._manager.enable_chunk_prefill_transfer:
             raise RuntimeError("chunk transfer is disabled on this Raiden manager")
@@ -620,60 +632,96 @@ class RaidenTransferKVSender(KVSender, StateHolder):
             raise ValueError("chunk_index must be non-negative")
         if not block_ids:
             raise ValueError("Raiden chunk transfer requires at least one KV block")
-        child_id = f"{self.uuid}#c{chunk_index}"
-        with self._state_lock:
-            if self.state not in (KVPoll.WAITING_FOR_INPUT, KVPoll.TRANSFERRING):
-                raise RuntimeError(f"cannot send chunk from terminal state {self.state.value}")
-            if chunk_index in self._started_chunks:
-                raise RuntimeError(f"chunk_index={chunk_index} was already registered")
-            if self._num_chunks is not None:
-                raise RuntimeError("cannot register a chunk after the final chunk")
+        pending = _PendingSenderChunk(
+            chunk_index=chunk_index,
+            block_ids=tuple(int(block_id) for block_id in block_ids),
+            bootstrap_room=int(bootstrap_room),
+            chunk_page_offset=int(chunk_page_offset),
+            is_final=bool(is_final),
+            dp_rank=int(dp_rank),
+        )
+        with self._pump_lock:
+            with self._state_lock:
+                if self.state not in (KVPoll.WAITING_FOR_INPUT, KVPoll.TRANSFERRING):
+                    raise RuntimeError(f"cannot send chunk from terminal state {self.state.value}")
+                if self._pending_failure_reason is not None:
+                    raise RuntimeError("cannot send a chunk after transfer cancellation")
+                if chunk_index in self._started_chunks or chunk_index in self._pending_chunks:
+                    raise RuntimeError(f"chunk_index={chunk_index} was already registered")
+                if self._num_chunks is not None:
+                    raise RuntimeError("cannot register a chunk after the final chunk")
+                self._chunk_mode = True
+                self._bootstrap_room = pending.bootstrap_room
+                self._dp_rank = pending.dp_rank
+                self._pending_chunks[chunk_index] = pending
+                if is_final:
+                    self._num_chunks = chunk_index + 1
+            self._pump_pending_chunks(raise_on_error=True)
 
+    def _pump_pending_chunks(self, *, raise_on_error: bool) -> None:
+        """Register at most ``CHUNK_TRANSFER_WINDOW`` active child reads."""
+
+        with self._pump_lock:
+            while True:
+                with self._state_lock:
+                    if self.state in (KVPoll.SUCCESS, KVPoll.FAILED):
+                        return
+                    if self._pending_failure_reason is not None or not self._pending_chunks:
+                        return
+                    started_chunks = tuple(self._started_chunks)
+                    pending = next(iter(self._pending_chunks.values()))
+
+                active = sum(
+                    not self._manager.sender_done(f"{self.uuid}#c{index}")
+                    for index in started_chunks
+                )
+                if active >= CHUNK_TRANSFER_WINDOW:
+                    return
+
+                try:
+                    self._start_pending_chunk(pending)
+                except Exception:
+                    logger.exception(
+                        "Raiden chunk registration failed for req_id=%s chunk=%d",
+                        self._req_id,
+                        pending.chunk_index,
+                    )
+                    self.request_abort("chunk_register")
+                    if raise_on_error:
+                        raise
+                    return
+
+    def _start_pending_chunk(self, pending: _PendingSenderChunk) -> None:
+        child_id = f"{self.uuid}#c{pending.chunk_index}"
         needed = self._manager.register_read(
             child_id,
             child_id,
-            list(block_ids),
-            dp_rank=int(dp_rank),
+            list(pending.block_ids),
+            dp_rank=pending.dp_rank,
         )
         if not needed:
             raise RuntimeError(f"Raiden declined non-empty chunk transfer for {child_id!r}")
 
         with self._state_lock:
-            self._chunk_mode = True
-            self._bootstrap_room = int(bootstrap_room)
-            self._dp_rank = int(dp_rank)
-            self._started_chunks.add(chunk_index)
-            if is_final:
-                self._num_chunks = chunk_index + 1
+            self._pending_chunks.pop(pending.chunk_index)
+            self._started_chunks.add(pending.chunk_index)
             if self.state == KVPoll.WAITING_FOR_INPUT:
                 self._transition_to(KVPoll.TRANSFERRING)
                 self._timer = time_phase("ack", "prefill")
                 self._timer.__enter__()
-            # Timeout each producer-to-consumer progress interval rather than
-            # the whole long prompt. Otherwise a healthy multi-chunk request
-            # can exceed ack_timeout solely because later chunks are computing.
             self._transfer_started_at = time.monotonic()
 
-        try:
-            self._manager.publish_transfer(
-                child_id,
-                list(block_ids),
-                int(bootstrap_room),
-                None,
-                dp_rank=int(dp_rank),
-                base_transfer_id=self.uuid,
-                chunk_index=chunk_index,
-                num_chunks=(chunk_index + 1 if is_final else 0),
-                chunk_page_offset=int(chunk_page_offset),
-            )
-        except Exception:
-            logger.exception(
-                "Raiden chunk metadata publish failed for req_id=%s chunk=%d",
-                self._req_id,
-                chunk_index,
-            )
-            self.request_abort("bootstrap_register")
-            raise
+        self._manager.publish_transfer(
+            child_id,
+            list(pending.block_ids),
+            pending.bootstrap_room,
+            None,
+            dp_rank=pending.dp_rank,
+            base_transfer_id=self.uuid,
+            chunk_index=pending.chunk_index,
+            num_chunks=(pending.chunk_index + 1 if pending.is_final else 0),
+            chunk_page_offset=pending.chunk_page_offset,
+        )
 
     def send(self) -> None:
         if self._block_ids is None:
@@ -717,12 +765,27 @@ class RaidenTransferKVSender(KVSender, StateHolder):
             pending_failure = self._pending_failure_reason
         self._manager.poll_engine()
         if chunk_mode:
+            if pending_failure is None:
+                self._pump_pending_chunks(raise_on_error=False)
+            with self._state_lock:
+                if self.state != KVPoll.TRANSFERRING:
+                    return self.state
+                started_chunks = tuple(sorted(self._started_chunks))
+                pending_chunks = bool(self._pending_chunks)
+                num_chunks = self._num_chunks
+                pending_failure = self._pending_failure_reason
             child_ids = [f"{self.uuid}#c{k}" for k in started_chunks]
             if not all(self._manager.sender_done(child_id) for child_id in child_ids):
                 return KVPoll.TRANSFERRING
             if pending_failure is not None:
                 return self._finish(KVPoll.FAILED, pending_failure)
+            if pending_chunks:
+                return KVPoll.TRANSFERRING
             if num_chunks is None or started_chunks != tuple(range(num_chunks)):
+                # No engine read is active while the next prefill chunk is
+                # computing, so the Raiden ack timeout must not cover compute.
+                with self._state_lock:
+                    self._transfer_started_at = None
                 return KVPoll.TRANSFERRING
             return self._finish(KVPoll.SUCCESS, "raiden_chunks_done_sending")
         if not self._manager.sender_done(self.uuid):
@@ -752,7 +815,7 @@ class RaidenTransferKVSender(KVSender, StateHolder):
 
     def request_abort(self, reason: str) -> bool:
         finish_now = False
-        with self._state_lock:
+        with self._pump_lock, self._state_lock:
             if self.state in (KVPoll.SUCCESS, KVPoll.FAILED):
                 return False
             if self._pending_failure_reason is not None:

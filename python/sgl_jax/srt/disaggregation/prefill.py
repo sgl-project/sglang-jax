@@ -236,6 +236,10 @@ class SchedulerDisaggregationPrefillMixin:
             self.process_input_requests(recv_reqs)
 
             if self._engine_paused:
+                # Cancellation/retract keeps Raiden-owned source pages alive
+                # until the sender becomes terminal. Continue draining those
+                # senders while scheduling itself is paused.
+                self.send_kv_chunk()
                 continue
 
             batch = self.get_next_batch_to_run()
@@ -648,8 +652,23 @@ class SchedulerDisaggregationPrefillMixin:
         req: Req,
         sender: KVSender,
     ) -> None:
+        if req.disagg_chunk_sender is not None and req.disagg_chunk_sender is not sender:
+            # A callback from an older transfer attempt must never finish or
+            # release allocations belonging to a re-admitted request.
+            logger.warning("Ignoring stale prefill sender callback for req_id=%s", req.rid)
+            sender.clear()
+            return
+
+        retract_pending = bool(getattr(req, "disagg_retract_pending", False))
         try:
-            if sender.poll() == KVPoll.SUCCESS:
+            state = sender.poll()
+            if retract_pending:
+                pass
+            elif req.to_finish is not None:
+                req.check_finished()
+                req.output_ids = []
+                self._stream_prefill_req(req)
+            elif state == KVPoll.SUCCESS:
                 self._finish_prefill_only_success(req)
             else:
                 self._finish_prefill_only_failure(req, sender)
@@ -664,6 +683,12 @@ class SchedulerDisaggregationPrefillMixin:
             )
             sender.clear()
             self._release_prefill_req_resources(req)
+            if req.disagg_chunk_sender is sender:
+                req.disagg_chunk_sender = None
+
+        if retract_pending:
+            req.reset_for_retract()
+            self._add_request_to_queue(req)
 
     def _finish_prefill_only_success(self: Scheduler, req: Req) -> None:
         from sgl_jax.srt.managers.schedule_batch import FINISH_LENGTH

@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 
+from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
 from sgl_jax.srt.managers.io_struct import AbortReq, PauseGenerationReqInput
 from sgl_jax.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sgl_jax.srt.managers.scheduler import GenerationBatchResult, Scheduler
@@ -192,6 +193,44 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
         self.assertEqual(scheduler.chunked_reqs, [None])
         self.assertEqual(scheduler._pending_chunked_abort_reqs, [None])
         self.assertEqual(scheduler.last_batch.reqs_info[0].reqs, [])
+
+    def test_abort_defers_pd_chunk_release_until_sender_is_terminal(self):
+        req = self._make_req("pd-sending", [1, 2, 3], [10, 11])
+        sender = SimpleNamespace(
+            abort=Mock(),
+            poll=Mock(return_value=KVPoll.FAILED),
+            clear=Mock(),
+        )
+        req.disagg_chunk_sender = sender
+        scheduler, _ = self._make_scheduler(req, active_reqs=req)
+        scheduler.pd = "prefill"
+        scheduler.server_args = SimpleNamespace(enable_request_time_stats_logging=False)
+        scheduler.disagg_prefill_queue = SimpleNamespace(
+            cancel_matching=lambda *_args: [SimpleNamespace(req_id=req.rid, sender=sender)]
+        )
+
+        with patch(
+            "sgl_jax.srt.managers.scheduler_output_processor_mixin.release_kv_cache"
+        ) as release:
+            scheduler.abort_request(AbortReq(rid=req.rid))
+            consumed = scheduler._process_pending_chunked_aborts()
+
+        sender.abort.assert_called_once_with()
+        release.assert_not_called()
+        scheduler._release_prefill_host_buffer.assert_not_called()
+        self.assertEqual(consumed, {0: req})
+        self.assertEqual(scheduler.chunked_reqs, [None])
+        self.assertEqual(scheduler._pending_chunked_abort_reqs, [None])
+        self.assertEqual(scheduler.send_to_tokenizer.send_pyobj.call_count, 0)
+
+        scheduler._release_prefill_req_resources = Mock()
+        scheduler._on_prefill_transfer_terminal(req, sender)
+
+        scheduler._release_prefill_req_resources.assert_called_once_with(req)
+        sender.clear.assert_called_once_with()
+        self.assertTrue(req.finished())
+        self.assertIsNone(req.disagg_chunk_sender)
+        scheduler.stream_output.assert_called_once()
 
     def test_pause_retires_consumed_chunk_owner_from_batch(self):
         req = self._make_req("parked", [1, 2, 3], [10, 11])
@@ -477,6 +516,39 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
         self.assertTrue(req.is_retracted)
         self.assertEqual(scheduler.chunked_reqs, [None])
         self.assertEqual(scheduler._pending_chunked_abort_reqs, [None])
+
+    def test_retract_waits_for_pd_chunk_sender_before_reset_and_requeue(self):
+        req = self._make_req("pd-retract", [1, 2], [10, 11])
+        sender = SimpleNamespace(
+            abort=Mock(),
+            poll=Mock(return_value=KVPoll.FAILED),
+            clear=Mock(),
+        )
+        req.disagg_chunk_sender = sender
+        scheduler, _ = self._make_scheduler(req, active_reqs=req)
+        scheduler.pd = "prefill"
+        scheduler.server_args = SimpleNamespace(enable_request_time_stats_logging=False)
+        scheduler._release_prefill_req_resources = Mock()
+
+        with patch("sgl_jax.srt.managers.scheduler.release_kv_cache") as release:
+            scheduler._retract_parked_chunked_reqs([])
+
+        sender.abort.assert_called_once_with()
+        release.assert_not_called()
+        self.assertTrue(req.disagg_retract_pending)
+        self.assertFalse(req.is_retracted)
+        self.assertEqual(scheduler.waiting_queue, [])
+        self.assertEqual(scheduler.chunked_reqs, [None])
+
+        scheduler._on_prefill_transfer_terminal(req, sender)
+
+        sender.clear.assert_called_once_with()
+        scheduler._release_prefill_req_resources.assert_called_once_with(req)
+        self.assertIsNone(req.disagg_chunk_sender)
+        self.assertFalse(req.disagg_retract_pending)
+        self.assertTrue(req.is_retracted)
+        self.assertEqual(scheduler.waiting_queue, [req])
+        scheduler.stream_output.assert_not_called()
 
     def test_retract_does_not_release_batch_owned_chunk_twice(self):
         req = self._make_req("active", [1, 2], [10, 11])

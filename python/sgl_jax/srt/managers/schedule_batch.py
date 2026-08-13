@@ -230,6 +230,7 @@ class Req:
         self.disagg_peer_process_index: int = 0
         self.disagg_chunk_index: int = 0
         self.disagg_chunk_sender = None
+        self.disagg_retract_pending: bool = False
 
         # Memory pool info
         self.req_pool_idx: int | None = None
@@ -672,6 +673,7 @@ class Req:
         self.start_send_idx = 0
         self.disagg_chunk_index = 0
         self.disagg_chunk_sender = None
+        self.disagg_retract_pending = False
         self.cache_protected_len = 0
         self.recurrent_pool_idx = None
         self.recurrent_cow_src_index = None

@@ -21,7 +21,10 @@ from sgl_jax.srt.disaggregation.base.transfer import (
     DecodeTransferContext,
     slots_to_page_ids,
 )
-from sgl_jax.srt.disaggregation.common.capacity import per_rank_inflight_limit
+from sgl_jax.srt.disaggregation.common.capacity import (
+    CHUNK_TRANSFER_WINDOW,
+    per_rank_inflight_limit,
+)
 from sgl_jax.srt.disaggregation.factory import (
     _raiden_transfer_pool_shape,
     _tree_cache_supports_swa,
@@ -208,6 +211,67 @@ def test_raiden_chunk_sender_waits_for_final_descriptor_and_every_child_ack():
     raiden.stats = (["wire-chunk-send#c0", "wire-chunk-send#c1"], [], [])
     assert sender.poll() == KVPoll.SUCCESS
     assert bootstrap.popped == [(81, {"jax_process_index": 0, "prefill_dp_rank": 0})]
+
+
+def test_raiden_chunk_sender_limits_active_children_to_transfer_window():
+    raiden = _FakeRaiden()
+    bootstrap = _FakeBootstrap()
+    manager = _chunk_manager(raiden, bootstrap)
+    sender = manager.create_sender("req-chunk-window")
+    sender.init(None, transfer_id="wire-chunk-window")
+
+    for chunk_index in range(CHUNK_TRANSFER_WINDOW + 1):
+        sender.send_chunk(
+            chunk_index,
+            [chunk_index + 1],
+            bootstrap_room=83,
+            chunk_page_offset=chunk_index,
+            is_final=chunk_index == CHUNK_TRANSFER_WINDOW,
+        )
+
+    assert [call[0][0] for call in raiden.registered] == [
+        f"wire-chunk-window#c{index}" for index in range(CHUNK_TRANSFER_WINDOW)
+    ]
+    assert len(bootstrap.registered) == CHUNK_TRANSFER_WINDOW
+
+    raiden.stats = (["wire-chunk-window#c0"], [], [])
+    assert sender.poll() == KVPoll.TRANSFERRING
+    assert [call[0][0] for call in raiden.registered] == [
+        f"wire-chunk-window#c{index}" for index in range(CHUNK_TRANSFER_WINDOW + 1)
+    ]
+
+    raiden.stats = (
+        [f"wire-chunk-window#c{index}" for index in range(CHUNK_TRANSFER_WINDOW + 1)],
+        [],
+        [],
+    )
+    assert sender.poll() == KVPoll.SUCCESS
+
+
+def test_raiden_chunk_sender_drops_queued_children_after_abort():
+    raiden = _FakeRaiden()
+    manager = _chunk_manager(raiden, _FakeBootstrap())
+    sender = manager.create_sender("req-chunk-window-abort")
+    sender.init(None, transfer_id="wire-chunk-window-abort")
+
+    for chunk_index in range(CHUNK_TRANSFER_WINDOW + 1):
+        sender.send_chunk(
+            chunk_index,
+            [chunk_index + 1],
+            bootstrap_room=84,
+            chunk_page_offset=chunk_index,
+            is_final=chunk_index == CHUNK_TRANSFER_WINDOW,
+        )
+
+    sender.abort()
+    raiden.stats = (
+        [f"wire-chunk-window-abort#c{index}" for index in range(CHUNK_TRANSFER_WINDOW)],
+        [],
+        [],
+    )
+
+    assert sender.poll() == KVPoll.FAILED
+    assert len(raiden.registered) == CHUNK_TRANSFER_WINDOW
 
 
 def test_raiden_chunk_sender_abort_waits_for_started_children():
