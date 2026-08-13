@@ -266,6 +266,18 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
         self.assertIsNone(scheduler.last_batch.reqs_info[0].chunked_req)
         self.assertEqual(scheduler.send_to_tokenizer.send_pyobj.call_count, 1)
 
+    def test_retract_marks_both_pd_transfer_queues(self):
+        req = self._make_req("pd-retract", [1, 2], [10, 11])
+        scheduler, _ = self._make_scheduler(req)
+        scheduler.disagg_prefill_queue = Mock()
+        scheduler.disagg_transfer_queue = Mock()
+
+        with patch("sgl_jax.srt.managers.scheduler.release_kv_cache"):
+            scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        scheduler.disagg_prefill_queue.retract_all.assert_called_once_with()
+        scheduler.disagg_transfer_queue.retract_all.assert_called_once_with()
+
     def test_pending_abort_chunk_is_not_rescheduled(self):
         req = self._make_req("inflight", [1, 2], [10, 11])
         scheduler, _ = self._make_scheduler(req, active_reqs=req)
@@ -457,7 +469,8 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
             def __init__(self):
                 self._entries = {}
 
-            def add(self, req_id, sender, on_terminal=None):
+            def add(self, req_id, sender, on_terminal=None, req=None):
+                del req
                 self._entries[req_id] = (sender, on_terminal)
 
         scheduler, _ = self._make_scheduler(req, active_reqs=req)

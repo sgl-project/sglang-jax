@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest import mock
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -110,7 +113,29 @@ def test_cancel_matching_retains_prefill_entry_until_sender_terminal():
     cancelled = queue.cancel_matching("req-a", abort_all=False)
 
     assert [entry.req_id for entry in cancelled] == ["req-a"]
+    assert cancelled[0].cancelled is True
     assert len(queue) == 1
+
+
+def test_retract_all_aborts_live_entries_but_does_not_resurrect_cancelled_ones():
+    queue = PrefillBootstrapQueue()
+    _, live_sender = _make_sender()
+    _, cancelled_sender = _make_sender()
+    live_sender.abort = mock.Mock()
+    cancelled_sender.abort = mock.Mock()
+    live_req = SimpleNamespace(disagg_retract_pending=False)
+    cancelled_req = SimpleNamespace(disagg_retract_pending=False)
+    queue.add("live", live_sender, req=live_req)
+    queue.add("cancelled", cancelled_sender, req=cancelled_req)
+    queue.cancel_matching("cancelled", abort_all=False)
+
+    retracted = queue.retract_all()
+
+    assert [entry.req_id for entry in retracted] == ["live"]
+    assert live_req.disagg_retract_pending is True
+    assert cancelled_req.disagg_retract_pending is False
+    live_sender.abort.assert_called_once_with()
+    cancelled_sender.abort.assert_not_called()
 
 
 def test_staging_send_handoff_failure_unregisters_and_keeps_payload():

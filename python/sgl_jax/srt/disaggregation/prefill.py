@@ -155,10 +155,12 @@ class PrefillBookkeeping:
 
     req_id: str
     sender: KVSender
+    req: Req | None = None
     # Optional callback the scheduler runs when this entry reaches a
     # terminal state — used to release ``req_to_token_pool`` and any
     # owned KV indices.
     on_terminal: object | None = None
+    cancelled: bool = False
 
 
 class PrefillBootstrapQueue:
@@ -177,12 +179,16 @@ class PrefillBootstrapQueue:
         req_id: str,
         sender: KVSender,
         on_terminal=None,
+        req: Req | None = None,
     ) -> None:
         with self._lock:
             if req_id in self._entries:
                 raise ValueError(f"PrefillBootstrapQueue already tracks req_id={req_id!r}")
             self._entries[req_id] = PrefillBookkeeping(
-                req_id=req_id, sender=sender, on_terminal=on_terminal
+                req_id=req_id,
+                sender=sender,
+                req=req,
+                on_terminal=on_terminal,
             )
 
     def drain_terminal(self) -> list[PrefillBookkeeping]:
@@ -209,11 +215,26 @@ class PrefillBootstrapQueue:
         """Return matching entries without releasing their owned KV pages."""
 
         with self._lock:
-            return [
+            out = []
+            for req_id, entry in self._entries.items():
+                if abort_all or req_id.startswith(rid_prefix):
+                    entry.cancelled = True
+                    out.append(entry)
+            return out
+
+    def retract_all(self) -> list[PrefillBookkeeping]:
+        """Mark live, non-cancelled transfers for retry after terminal drain."""
+
+        with self._lock:
+            entries = [
                 entry
-                for req_id, entry in self._entries.items()
-                if abort_all or req_id.startswith(rid_prefix)
+                for entry in self._entries.values()
+                if not entry.cancelled and entry.req is not None
             ]
+        for entry in entries:
+            entry.req.disagg_retract_pending = True
+            entry.sender.abort()
+        return entries
 
 
 class SchedulerDisaggregationPrefillMixin:
@@ -359,7 +380,12 @@ class SchedulerDisaggregationPrefillMixin:
             def _on_terminal(req_obj=req, sender_obj=transfer.sender):
                 self._on_prefill_transfer_terminal(req_obj, sender_obj)
 
-            self.disagg_prefill_queue.add(req_id, transfer.sender, on_terminal=_on_terminal)
+            self.disagg_prefill_queue.add(
+                req_id,
+                transfer.sender,
+                on_terminal=_on_terminal,
+                req=req,
+            )
 
     def send_kv_chunk(self: Scheduler) -> None:
         """Reap senders that reached SUCCESS / FAILED."""
@@ -512,7 +538,12 @@ class SchedulerDisaggregationPrefillMixin:
         def _on_terminal(req_obj=req, sender_obj=sender):
             self._on_prefill_transfer_terminal(req_obj, sender_obj)
 
-        self.disagg_prefill_queue.add(req.rid, sender, on_terminal=_on_terminal)
+        self.disagg_prefill_queue.add(
+            req.rid,
+            sender,
+            on_terminal=_on_terminal,
+            req=req,
+        )
 
     def _retire_failed_chunk_producer(self: Scheduler, req: Req) -> None:
         dp_rank = int(req.dp_rank)

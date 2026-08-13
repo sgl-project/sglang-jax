@@ -86,6 +86,7 @@ class DecodeBookkeeping:
     # receiver setup can be deferred to the capacity-gated admission step.
     p_info: dict | None = None
     cancelled: bool = False
+    retracted: bool = False
     created_at: float = field(default_factory=time.monotonic)
 
 
@@ -189,6 +190,18 @@ class DecodeTransferQueue:
                     out.append(entry)
         return out
 
+    def retract_all(self) -> list[DecodeBookkeeping]:
+        """Mark active, non-cancelled receivers for retry after terminal drain."""
+
+        with self._lock:
+            entries = [entry for entry in self._entries.values() if not entry.cancelled]
+            for entry in entries:
+                entry.retracted = True
+        for entry in entries:
+            assert entry.receiver is not None
+            entry.receiver.abort()
+        return entries
+
 
 class SchedulerDisaggregationDecodeMixin:
     """Mixin for PD decode mode on Scheduler."""
@@ -217,6 +230,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_input_requests_disagg_decode(recv_reqs)
 
             if self._engine_paused:
+                self._drain_decode_transfer_terminals()
                 continue
 
             wd.beat("process_decode_queue")
@@ -384,6 +398,10 @@ class SchedulerDisaggregationDecodeMixin:
         """Drive prealloc -> transfer -> ready transitions."""
 
         self._admit_decode_prealloc()
+        self._drain_decode_transfer_terminals()
+
+    def _drain_decode_transfer_terminals(self: Scheduler) -> None:
+        """Finalize terminal receivers without admitting new work."""
 
         for entry in self._drain_transfer_queue_synced():
             assert entry.receiver is not None
@@ -397,6 +415,12 @@ class SchedulerDisaggregationDecodeMixin:
             if entry.cancelled:
                 if entry.kv_indices is not None:
                     self._release_decode_kv_indices(entry.kv_indices, entry.req.dp_rank)
+                continue
+            if entry.retracted:
+                if entry.kv_indices is not None:
+                    self._release_decode_kv_indices(entry.kv_indices, entry.req.dp_rank)
+                entry.req.reset_for_retract()
+                self._pd_pending_bootstrap.append(entry.req)
                 continue
             if state == KVPoll.SUCCESS:
                 try:

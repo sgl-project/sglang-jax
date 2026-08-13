@@ -2826,6 +2826,10 @@ class Scheduler(
             self._pd_quiesce()
 
         if recv_req.mode == "retract":
+            if self.disagg_prefill_queue is not None:
+                self.disagg_prefill_queue.retract_all()
+            if self.disagg_transfer_queue is not None:
+                self.disagg_transfer_queue.retract_all()
             self.running_batch.filter_batch()
             all_reqs = [
                 req for info in self.running_batch.reqs_info for req in info.reqs if info.reqs
