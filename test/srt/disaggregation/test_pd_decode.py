@@ -811,6 +811,7 @@ def test_retracted_terminal_transfer_releases_pages_and_retries_bootstrap():
 
     assert sched.released == [([20, 21], 2)]
     req.reset_for_retract.assert_called_once_with()
+    assert req.disagg_transfer_attempt == 1
     assert sched._pd_pending_bootstrap == [req]
 
 

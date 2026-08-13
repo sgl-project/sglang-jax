@@ -532,6 +532,7 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
 
     def test_retract_waits_for_pd_chunk_sender_before_reset_and_requeue(self):
         req = self._make_req("pd-retract", [1, 2], [10, 11])
+        req.disagg_transfer_id = "wire-pd-retract"
         sender = SimpleNamespace(
             abort=Mock(),
             poll=Mock(return_value=KVPoll.FAILED),
@@ -560,6 +561,8 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
         self.assertIsNone(req.disagg_chunk_sender)
         self.assertFalse(req.disagg_retract_pending)
         self.assertTrue(req.is_retracted)
+        self.assertEqual(req.disagg_transfer_attempt, 1)
+        self.assertEqual(req.disagg_transport_id, "wire-pd-retract#r1")
         self.assertEqual(scheduler.waiting_queue, [req])
         scheduler.stream_output.assert_not_called()
 

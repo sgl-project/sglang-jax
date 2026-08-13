@@ -18,6 +18,10 @@ from sgl_jax.srt.disaggregation.base.transfer import (
     PrefillTransferContext,
     TransferBackend,
 )
+from sgl_jax.srt.managers.schedule_batch import (
+    advance_disagg_transfer_attempt,
+    get_disagg_transport_id,
+)
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import Req
@@ -349,7 +353,7 @@ class SchedulerDisaggregationPrefillMixin:
                 transfer = self.disagg_kv_manager.start_prefill(
                     PrefillTransferContext(
                         req_id=req_id,
-                        transfer_id=req.disagg_transfer_id or req_id,
+                        transfer_id=get_disagg_transport_id(req),
                         bootstrap_room=req.bootstrap_room,
                         dp_rank=int(req.dp_rank),
                         buffer_id=req.disagg_host_buffer_id,
@@ -482,7 +486,7 @@ class SchedulerDisaggregationPrefillMixin:
         created_sender = False
         if sender is None:
             sender = self.disagg_kv_manager.create_sender(req_id)
-            sender.init(None, transfer_id=req.disagg_transfer_id or req_id)
+            sender.init(None, transfer_id=get_disagg_transport_id(req))
             req.disagg_chunk_sender = sender
             created_sender = True
 
@@ -718,6 +722,7 @@ class SchedulerDisaggregationPrefillMixin:
                 req.disagg_chunk_sender = None
 
         if retract_pending:
+            advance_disagg_transfer_attempt(req)
             req.reset_for_retract()
             self._add_request_to_queue(req)
 

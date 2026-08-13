@@ -354,11 +354,20 @@ class _Registry:
         bootstrap_room: int,
         jax_process_index: int = 0,
         prefill_dp_rank: int = 0,
-    ) -> None:
+        expected_transfer_id: str | None = None,
+    ) -> bool:
         with self.lock:
             key = (int(bootstrap_room), int(jax_process_index), int(prefill_dp_rank))
+            bundle = self.transfers.get(key)
+            if (
+                expected_transfer_id is not None
+                and bundle is not None
+                and bundle.get("base_transfer_id") != expected_transfer_id
+            ):
+                return False
             self.transfers.pop(key, None)
             self.transfer_last_seen.pop(key, None)
+            return bundle is not None
 
 
 def build_app(
@@ -473,8 +482,14 @@ def build_app(
         bootstrap_room: int,
         jax_process_index: int = 0,
         prefill_dp_rank: int = 0,
+        expected_transfer_id: str | None = None,
     ) -> dict[str, str]:
-        registry.pop_room(bootstrap_room, jax_process_index, prefill_dp_rank)
+        registry.pop_room(
+            bootstrap_room,
+            jax_process_index,
+            prefill_dp_rank,
+            expected_transfer_id,
+        )
         return {"status": "popped"}
 
     # Bootstrap runs as a standalone single process and does NOT inherit
@@ -790,14 +805,18 @@ class BootstrapClient:
         *,
         jax_process_index: int = 0,
         prefill_dp_rank: int = 0,
+        expected_transfer_id: str | None = None,
     ) -> None:
+        params: dict[str, object] = {
+            "bootstrap_room": bootstrap_room,
+            "jax_process_index": jax_process_index,
+            "prefill_dp_rank": prefill_dp_rank,
+        }
+        if expected_transfer_id is not None:
+            params["expected_transfer_id"] = expected_transfer_id
         r = self._client.post(
             f"{self._base_url}/pop_transfer",
-            params={
-                "bootstrap_room": bootstrap_room,
-                "jax_process_index": jax_process_index,
-                "prefill_dp_rank": prefill_dp_rank,
-            },
+            params=params,
             timeout=self._timeout_s,
             headers=self._headers(),
         )

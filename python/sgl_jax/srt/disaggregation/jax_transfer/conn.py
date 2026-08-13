@@ -257,8 +257,9 @@ class JaxTransferKVManager(CommonKVManager):
         *,
         jax_process_index: int | None = None,
         prefill_dp_rank: int = 0,
+        expected_transfer_id: str | None = None,
     ) -> None:
-        del bootstrap_room, jax_process_index, prefill_dp_rank
+        del bootstrap_room, jax_process_index, prefill_dp_rank, expected_transfer_id
         return
 
     # ------------------------------------------------------------------

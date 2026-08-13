@@ -210,7 +210,16 @@ def test_raiden_chunk_sender_waits_for_final_descriptor_and_every_child_ack():
 
     raiden.stats = (["wire-chunk-send#c0", "wire-chunk-send#c1"], [], [])
     assert sender.poll() == KVPoll.SUCCESS
-    assert bootstrap.popped == [(81, {"jax_process_index": 0, "prefill_dp_rank": 0})]
+    assert bootstrap.popped == [
+        (
+            81,
+            {
+                "jax_process_index": 0,
+                "prefill_dp_rank": 0,
+                "expected_transfer_id": "wire-chunk-send",
+            },
+        )
+    ]
 
 
 def test_raiden_chunk_sender_limits_active_children_to_transfer_window():
@@ -294,7 +303,16 @@ def test_raiden_chunk_sender_abort_waits_for_started_children():
 
     raiden.stats = (["wire-chunk-abort#c0"], [], [])
     assert sender.poll() == KVPoll.FAILED
-    assert bootstrap.popped == [(82, {"jax_process_index": 0, "prefill_dp_rank": 0})]
+    assert bootstrap.popped == [
+        (
+            82,
+            {
+                "jax_process_index": 0,
+                "prefill_dp_rank": 0,
+                "expected_transfer_id": "wire-chunk-abort",
+            },
+        )
+    ]
 
 
 def test_raiden_receiver_starts_direct_block_read_and_pops_metadata():
@@ -323,7 +341,16 @@ def test_raiden_receiver_starts_direct_block_read_and_pops_metadata():
 
     raiden.stats = ([], ["wire-2"], [])
     assert receiver.poll() == KVPoll.SUCCESS
-    assert bootstrap.popped == [(43, {"jax_process_index": 3, "prefill_dp_rank": 0})]
+    assert bootstrap.popped == [
+        (
+            43,
+            {
+                "jax_process_index": 3,
+                "prefill_dp_rank": 0,
+                "expected_transfer_id": "wire-2",
+            },
+        )
+    ]
     assert "req-2" not in manager._receivers
 
 
@@ -375,7 +402,16 @@ def test_raiden_chunk_receiver_discovers_new_chunks_and_commits_after_all_done()
     assert receiver.poll() == KVPoll.SUCCESS
     receiver.commit(lambda _: None)
     assert committed == [None]
-    assert bootstrap.popped == [(83, {"jax_process_index": 0, "prefill_dp_rank": 0})]
+    assert bootstrap.popped == [
+        (
+            83,
+            {
+                "jax_process_index": 0,
+                "prefill_dp_rank": 0,
+                "expected_transfer_id": "wire-chunk-recv",
+            },
+        )
+    ]
 
 
 def test_raiden_chunk_receiver_failure_waits_for_all_started_children():
@@ -415,7 +451,16 @@ def test_raiden_chunk_receiver_failure_waits_for_all_started_children():
 
     raiden.stats = ([], ["wire-chunk-fail#c1"], ["wire-chunk-fail#c0"])
     assert receiver.poll() == KVPoll.FAILED
-    assert bootstrap.popped == [(84, {"jax_process_index": 0, "prefill_dp_rank": 0})]
+    assert bootstrap.popped == [
+        (
+            84,
+            {
+                "jax_process_index": 0,
+                "prefill_dp_rank": 0,
+                "expected_transfer_id": "wire-chunk-fail",
+            },
+        )
+    ]
 
 
 def test_raiden_chunk_receiver_rejects_overlapping_page_ranges():
@@ -579,7 +624,16 @@ def test_raiden_failure_and_abort_cleanup_are_terminal_and_idempotent():
     raiden.stats = ([], [], ["wire-3"])
     assert receiver.poll() == KVPoll.FAILED
     receiver.abort()
-    assert bootstrap.popped == [(44, {"jax_process_index": 0, "prefill_dp_rank": 0})]
+    assert bootstrap.popped == [
+        (
+            44,
+            {
+                "jax_process_index": 0,
+                "prefill_dp_rank": 0,
+                "expected_transfer_id": "wire-3",
+            },
+        )
+    ]
 
 
 def test_raiden_abort_waits_for_engine_terminal_before_cleanup():
@@ -600,7 +654,16 @@ def test_raiden_abort_waits_for_engine_terminal_before_cleanup():
     raiden.stats = (["wire-abort"], [], [])
     assert sender.poll() == KVPoll.FAILED
     assert "req-abort" not in manager._senders
-    assert bootstrap.popped == [(48, {"jax_process_index": 0, "prefill_dp_rank": 0})]
+    assert bootstrap.popped == [
+        (
+            48,
+            {
+                "jax_process_index": 0,
+                "prefill_dp_rank": 0,
+                "expected_transfer_id": "wire-abort",
+            },
+        )
+    ]
 
 
 def test_raiden_receiver_abort_waits_for_engine_terminal():
@@ -628,7 +691,16 @@ def test_raiden_receiver_abort_waits_for_engine_terminal():
     raiden.stats = ([], ["wire-abort"], [])
     assert receiver.poll() == KVPoll.FAILED
     assert "req-abort" not in manager._receivers
-    assert bootstrap.popped == [(49, {"jax_process_index": 0, "prefill_dp_rank": 0})]
+    assert bootstrap.popped == [
+        (
+            49,
+            {
+                "jax_process_index": 0,
+                "prefill_dp_rank": 0,
+                "expected_transfer_id": "wire-abort",
+            },
+        )
+    ]
 
 
 def test_raiden_reaper_marks_timeout_without_pruning_sender():

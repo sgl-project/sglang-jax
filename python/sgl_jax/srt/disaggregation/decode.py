@@ -22,6 +22,10 @@ from sgl_jax.srt.disaggregation.base.transfer import (
 )
 from sgl_jax.srt.disaggregation.bootstrap import BootstrapClient, PrefillInfoCache
 from sgl_jax.srt.disaggregation.common.capacity import per_rank_inflight_limit
+from sgl_jax.srt.managers.schedule_batch import (
+    advance_disagg_transfer_attempt,
+    get_disagg_transport_id,
+)
 from sgl_jax.srt.mem_cache.memory_pool import write_kv_layer
 
 if TYPE_CHECKING:
@@ -419,6 +423,7 @@ class SchedulerDisaggregationDecodeMixin:
             if entry.retracted:
                 if entry.kv_indices is not None:
                     self._release_decode_kv_indices(entry.kv_indices, entry.req.dp_rank)
+                advance_disagg_transfer_attempt(entry.req)
                 entry.req.reset_for_retract()
                 self._pd_pending_bootstrap.append(entry.req)
                 continue
@@ -590,7 +595,7 @@ class SchedulerDisaggregationDecodeMixin:
                 admission = self.disagg_kv_manager.try_start_decode(
                     DecodeTransferContext(
                         req_id=entry.req.rid,
-                        transfer_id=entry.req.disagg_transfer_id or entry.req.rid,
+                        transfer_id=get_disagg_transport_id(entry.req),
                         bootstrap_room=entry.req.bootstrap_room,
                         decode_dp_rank=decode_dp_rank,
                         prefill_dp_rank=prefill_dp_rank,
@@ -857,6 +862,7 @@ class SchedulerDisaggregationDecodeMixin:
                         room,
                         jax_process_index=getattr(req, "disagg_peer_process_index", None),
                         prefill_dp_rank=prefill_dp_rank,
+                        expected_transfer_id=get_disagg_transport_id(req),
                     )
                 except Exception:
                     logger.warning(

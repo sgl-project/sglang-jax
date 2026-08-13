@@ -438,6 +438,23 @@ def test_transfer_metadata_is_reusable_per_process_and_ttl_bounded():
     assert registry.get_transfer(7, 1) is None
 
 
+def test_stale_generation_cleanup_does_not_pop_replacement_metadata():
+    registry = _Registry()
+    for transfer_id in ("wire#r0", "wire#r1"):
+        registry.register_transfer(
+            {
+                "bootstrap_room": 8,
+                "transfer_id": transfer_id,
+                "transport_metadata": {"remote_block_ids": [1]},
+            }
+        )
+
+    assert registry.pop_room(8, expected_transfer_id="wire#r0") is False
+    assert registry.get_transfer(8)["base_transfer_id"] == "wire#r1"
+    assert registry.pop_room(8, expected_transfer_id="wire#r1") is True
+    assert registry.get_transfer(8) is None
+
+
 def test_transfer_metadata_namespaces_same_page_ids_by_prefill_dp_rank():
     registry = _Registry()
     for prefill_dp_rank in range(4):

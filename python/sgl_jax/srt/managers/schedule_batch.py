@@ -79,6 +79,17 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "pd_disaggregation",
 ]
 
+
+def get_disagg_transport_id(req: Any) -> str:
+    base = getattr(req, "disagg_transfer_id", None) or req.rid
+    attempt = int(getattr(req, "disagg_transfer_attempt", 0))
+    return base if attempt == 0 else f"{base}#r{attempt}"
+
+
+def advance_disagg_transfer_attempt(req: Any) -> None:
+    req.disagg_transfer_attempt = int(getattr(req, "disagg_transfer_attempt", 0)) + 1
+
+
 PADDING_BUCKETS = [1 << i for i in range(6, 21)]
 
 # Put some global args for easy access
@@ -226,6 +237,9 @@ class Req:
         self.bootstrap_room: int | None = None
         self.disagg_prefill_dp_rank: int | None = None
         self.disagg_transfer_id: str | None = None
+        # Retracted transfers must not reuse a transport UUID while the
+        # previous Raiden read may still be retiring asynchronously.
+        self.disagg_transfer_attempt: int = 0
         self.disagg_host_buffer_id: int | None = None
         self.disagg_peer_process_index: int = 0
         self.disagg_chunk_index: int = 0
@@ -680,6 +694,13 @@ class Req:
         self.recurrent_ping_pong_track_buffer = None
         self.recurrent_next_track_idx = None
         self.recurrent_last_track_seqlen = None
+
+    @property
+    def disagg_transport_id(self) -> str:
+        return get_disagg_transport_id(self)
+
+    def advance_disagg_transfer_attempt(self) -> None:
+        advance_disagg_transfer_attempt(self)
 
     def set_finish_with_abort(self, error_msg: str):
         # set it to one token to skip the long prefill

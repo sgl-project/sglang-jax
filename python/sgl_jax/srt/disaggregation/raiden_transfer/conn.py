@@ -473,6 +473,7 @@ class RaidenTransferKVManager(CommonKVManager):
         *,
         jax_process_index: int | None = None,
         prefill_dp_rank: int = 0,
+        expected_transfer_id: str | None = None,
     ) -> None:
         if bootstrap_room is None:
             return
@@ -483,6 +484,7 @@ class RaidenTransferKVManager(CommonKVManager):
                 bootstrap_room,
                 jax_process_index=jax_process_index,
                 prefill_dp_rank=prefill_dp_rank,
+                expected_transfer_id=expected_transfer_id,
             )
 
     def poll_engine(self) -> None:
@@ -850,6 +852,7 @@ class RaidenTransferKVSender(KVSender, StateHolder):
         self._manager.cleanup_transfer(
             self._bootstrap_room,
             prefill_dp_rank=self._dp_rank,
+            expected_transfer_id=self.uuid,
         )
         if state == KVPoll.FAILED:
             with suppress(Exception):
@@ -1247,6 +1250,7 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
             metadata.bootstrap_room if metadata else None,
             jax_process_index=metadata.jax_process_index if metadata else None,
             prefill_dp_rank=metadata.prefill_dp_rank if metadata else 0,
+            expected_transfer_id=transfer_id,
         )
         if state == KVPoll.FAILED:
             with suppress(Exception):
