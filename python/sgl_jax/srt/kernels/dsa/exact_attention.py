@@ -41,11 +41,45 @@ def _make_sparse_core_mesh(info):
     )
 
 
+def _sparse_core_gather_cost_estimate(
+    num_indices: int,
+    value_dim: int,
+    *,
+    table_dtype: jnp.dtype,
+    indices_dtype: jnp.dtype,
+    output_dtype: jnp.dtype,
+) -> pl.CostEstimate:
+    """Estimate the HBM traffic for one SparseCore gather launch.
+
+    The table is indexed indirectly, so only the selected rows are read.  A
+    gather has no arithmetic work; the value bytes are counted once for the
+    HBM read and once for the HBM write.
+    """
+    value_elements = num_indices * 2 * value_dim
+    bytes_accessed = (
+        num_indices * jnp.dtype(indices_dtype).itemsize
+        + value_elements * jnp.dtype(table_dtype).itemsize
+        + value_elements * jnp.dtype(output_dtype).itemsize
+    )
+    return pl.CostEstimate(
+        flops=0,
+        bytes_accessed=bytes_accessed,
+        transcendentals=0,
+    )
+
+
 def _sparse_core_gather(
     table: jax.Array,
     indices: jax.Array,
+    output_buffer: jax.Array | None = None,
+    output_buffer_index: jax.Array | int | None = None,
 ) -> jax.Array:
-    """Gather complete ``[2, D]`` BF16 cache pairs by slot index."""
+    """Gather complete ``[2, D]`` BF16 cache pairs by slot index.
+
+    If ``output_buffer`` is supplied, it is a two-slot pool and the SparseCore
+    kernel writes into the selected slot through a stateful Ref. This keeps
+    the pool in one fixed loop-state position.
+    """
     if table.dtype != jnp.bfloat16 or table.ndim != 3 or table.shape[1] != 2:
         raise TypeError("SparseCore table must be a BF16 array with shape [S, 2, D].")
     if table.shape[-1] % 128:
@@ -150,24 +184,88 @@ def _sparse_core_gather(
     else:
         kwargs["out_shape"] = output
         kwargs["scratch_shapes"] = kwargs.pop("scratch_types")
-    return pl.kernel(kernel, **kwargs)(table, indices)
+    kwargs["cost_estimate"] = _sparse_core_gather_cost_estimate(
+        num_indices,
+        value_dim,
+        table_dtype=table.dtype,
+        indices_dtype=indices.dtype,
+        output_dtype=output.dtype,
+    )
+    if output_buffer is None:
+        if output_buffer_index is not None:
+            raise ValueError("output_buffer_index requires output_buffer.")
+        return pl.kernel(kernel, **kwargs)(table, indices)
+
+    if (
+        output_buffer.dtype != output.dtype
+        or output_buffer.ndim < 2
+        or output_buffer.shape[0] != 2
+        or output_buffer.size != 2 * num_indices * 2 * value_dim
+    ):
+        raise TypeError(
+            "SparseCore gather output pool must have leading dimension 2 and "
+            f"two slots of size {output.shape}, got "
+            f"{output_buffer.shape} and {output_buffer.dtype}."
+        )
+    if output_buffer_index is None:
+        raise ValueError("output_buffer_index is required for an output pool.")
+
+    compiler_params = kwargs["compiler_params"]
+    cost_estimate = kwargs["cost_estimate"]
+
+    def run_stateful_gather(output_slot):
+        def stateful_gather(refs):
+            table_ref, indices_ref, output_ref = refs
+
+            def run_kernel():
+                kernel(
+                    table_ref,
+                    indices_ref,
+                    output_ref.at[output_slot].reshape(-1, 2, value_dim),
+                )
+
+            pl.core_map(
+                mesh,
+                compiler_params=compiler_params,
+                cost_estimate=cost_estimate,
+                name="dsa_sparse_core_gather_into",
+            )(run_kernel)
+
+        _, _, updated_buffer = pl.run_state(stateful_gather)(
+            (table, indices, output_buffer)
+        )
+        return updated_buffer
+
+    return lax.cond(
+        output_buffer_index == 0,
+        lambda _: run_stateful_gather(0),
+        lambda _: run_stateful_gather(1),
+        operand=None,
+    )
 
 
-def _gather_cache_microbatch(
+
+def _gather_cache_microbatch_into(
     cache: jax.Array,
     safe_slots: jax.Array,
+    output_pool: jax.Array,
+    output_buffer_index: jax.Array | int,
 ) -> jax.Array:
-    """Gather one cache microbatch from prevalidated physical slots."""
-    batch_size, topk = safe_slots.shape
-    gathered = _sparse_core_gather(cache, safe_slots.reshape(-1))
-    return gathered.reshape(batch_size, topk, 2, cache.shape[-1])
+    """Gather one cache microbatch into one slot of ``output_pool``."""
+    return _sparse_core_gather(
+        cache,
+        safe_slots.reshape(-1),
+        output_buffer=output_pool,
+        output_buffer_index=output_buffer_index,
+    )
 
 
 def _dsa_tensor_core_kernel(
     sm_scale_ref,  # FP32 scalar, SMEM
     selected_counts_ref,  # INT32 [B], SMEM
+    cache_buffer_index_ref,  # INT32 scalar, SMEM
     q_hbm_ref,  # [B, H, align(V + R, 128)], HBM
-    cache_hbm_ref,  # [B, K, C_pad], HBM
+    cache_hbm_ref,  # [2, B, K, 2, D], HBM; first dim is the ping-pong pool
     output_hbm_ref,  # [B, H, V_pad], HBM
     q_x2_ref,  # [2, bq, H, align(V + R, 128)], VMEM
     cache_x2_ref,  # [2, bq, b_topk, C_pad], VMEM
@@ -215,6 +313,7 @@ def _dsa_tensor_core_kernel(
         else:
             async_copy(
                 cache_hbm_ref.at[
+                    cache_buffer_index_ref[()],
                     pl.ds(q_step * bq, bq),
                     pl.ds(k_step * b_topk, b_topk),
                 ],
@@ -324,8 +423,9 @@ def _dsa_tensor_core_kernel(
 def _tensor_core_attention(
     q_latent: jax.Array,
     q_rope: jax.Array,
-    gathered_cache: jax.Array,
+    cache_buffers: jax.Array,
     selected_counts: jax.Array,
+    cache_buffer_index: jax.Array,
     *,
     sm_scale: float,
     bq: int,
@@ -336,7 +436,7 @@ def _tensor_core_attention(
     latent_dim = q_latent.shape[-1]
     rope_dim = q_rope.shape[-1]
     q_dim = latent_dim + rope_dim
-    topk = gathered_cache.shape[1]
+    topk = cache_buffers.shape[2]
     num_q_steps = batch_size // bq
     num_k_steps = topk // b_topk
     padded_latent_dim = _align_to(latent_dim, 128)
@@ -351,6 +451,26 @@ def _tensor_core_attention(
             ),
         ),
         axis=-1,
+    )
+
+    # The cache is streamed once for every query tile.  Count the padded
+    # dimensions because those are the dimensions consumed by the actual
+    # TensorCore dot operations and DMA buffers.
+    flops = 2 * batch_size * num_heads * topk * (
+        padded_q_dim + padded_latent_dim
+    )
+    transcendentals = batch_size * num_heads * (num_k_steps + topk)
+    bytes_accessed = (
+        q.size * q.dtype.itemsize
+        + (num_q_steps * cache_buffers.size // 2) * cache_buffers.dtype.itemsize
+        + batch_size * num_heads * padded_latent_dim * q_latent.dtype.itemsize
+        + jnp.dtype(jnp.float32).itemsize
+        + selected_counts.size * selected_counts.dtype.itemsize
+    )
+    cost_estimate = pl.CostEstimate(
+        flops=flops,
+        bytes_accessed=bytes_accessed,
+        transcendentals=transcendentals,
     )
 
     padded_output = pl.pallas_call(
@@ -368,7 +488,7 @@ def _tensor_core_attention(
             q_latent.dtype,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2,
+            num_scalar_prefetch=3,
             grid=(),
             in_specs=[
                 pl.BlockSpec(memory_space=pltpu.HBM),
@@ -378,8 +498,8 @@ def _tensor_core_attention(
             scratch_shapes=[
                 pltpu.VMEM((2, bq, num_heads, padded_q_dim), q_latent.dtype),
                 pltpu.VMEM(
-                    (2, bq, b_topk, 2, gathered_cache.shape[-1]),
-                    gathered_cache.dtype,
+                    (2, bq, b_topk, 2, cache_buffers.shape[-1]),
+                    cache_buffers.dtype,
                 ),
                 pltpu.VMEM(
                     (2, bq, num_heads, padded_latent_dim),
@@ -394,12 +514,14 @@ def _tensor_core_attention(
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=(),
         ),
+        cost_estimate=cost_estimate,
         name="dsa_tensor_core_attention",
     )(
         jnp.asarray(sm_scale, dtype=jnp.float32),
         selected_counts,
+        cache_buffer_index,
         q,
-        gathered_cache,
+        cache_buffers,
     )
     return padded_output[..., :latent_dim]
 
@@ -440,11 +562,12 @@ def sparse_core_tensor_core_dsa(
     Returns:
       Sparse-attention output with shape ``[Q, H, V]`` and query dtype.
 
-    The outer ``lax.fori_loop`` carries one gathered microbatch. In each
-    iteration SparseCore gathers the next cache microbatch while TensorCore
-    consumes the pending one, so at most two gathered buffers are live. All
-    launch parameters are static, making this API safe to call either directly
-    or from another ``jax.jit``-compiled function.
+    The outer ``lax.fori_loop`` carries one cache pool whose leading dimension
+    is two. The low bit of ``batch_id`` selects the current slice and the
+    opposite slice is used as the gather destination. The pool itself never
+    changes position in the loop state. All launch parameters are static,
+    making this API safe to call either directly or from another
+    ``jax.jit``-compiled function.
     """
     if q_latent.dtype != jnp.bfloat16:
         raise TypeError("q_latent must have dtype bfloat16.")
@@ -503,75 +626,61 @@ def sparse_core_tensor_core_dsa(
         rope_dim,
     )
 
-    def gather(batch_id):
-        return _gather_cache_microbatch(
+    def gather_into(batch_id, output_pool, output_buffer_index):
+        return _gather_cache_microbatch_into(
             cache,
             lax.dynamic_index_in_dim(safe_slot_batches, batch_id, keepdims=False),
+            output_pool,
+            output_buffer_index,
         )
 
-    cache_buffer_0 = gather(0)
-    cache_buffer_1 = jnp.empty_like(cache_buffer_0)
+    cache_buffers = jnp.empty(
+        (2, bq_sparse, topk, 2, cache.shape[-1]),
+        dtype=cache.dtype,
+    )
+    cache_buffers = gather_into(0, cache_buffers, jnp.int32(0))
     output = jnp.empty_like(q_latent)
 
     def pipeline_step(batch_id, carry):
-        def run_step(current_cache, standby_cache, output_buffer):
-            del standby_cache
-            next_cache = gather(batch_id + 1)
-            current_output = _tensor_core_attention(
-                lax.dynamic_index_in_dim(q_latent_batches, batch_id, keepdims=False),
-                lax.dynamic_index_in_dim(q_rope_batches, batch_id, keepdims=False),
-                current_cache,
-                lax.dynamic_index_in_dim(count_batches, batch_id, keepdims=False),
-                sm_scale=sm_scale,
-                bq=bq,
-                b_topk=b_topk,
-            )
-            output_buffer = lax.dynamic_update_slice_in_dim(
-                output_buffer,
-                current_output,
-                batch_id * bq_sparse,
-                axis=0,
-            )
-            return next_cache, output_buffer
-
-        def even_step(buffers):
-            buffer_0, buffer_1, output_buffer = buffers
-            next_cache, output_buffer = run_step(
-                buffer_0,
-                buffer_1,
-                output_buffer,
-            )
-            return buffer_0, next_cache, output_buffer
-
-        def odd_step(buffers):
-            buffer_0, buffer_1, output_buffer = buffers
-            next_cache, output_buffer = run_step(
-                buffer_1,
-                buffer_0,
-                output_buffer,
-            )
-            return next_cache, buffer_1, output_buffer
-
-        return lax.cond(
-            lax.bitwise_and(batch_id, 1) == 0,
-            even_step,
-            odd_step,
-            carry,
+        cache_buffers, output_buffer = carry
+        current_buffer_index = lax.bitwise_and(batch_id, jnp.int32(1))
+        next_buffer_index = lax.bitwise_xor(current_buffer_index, jnp.int32(1))
+        cache_buffers = gather_into(
+            batch_id + 1,
+            cache_buffers,
+            next_buffer_index,
         )
+        current_output = _tensor_core_attention(
+            lax.dynamic_index_in_dim(q_latent_batches, batch_id, keepdims=False),
+            lax.dynamic_index_in_dim(q_rope_batches, batch_id, keepdims=False),
+            cache_buffers,
+            lax.dynamic_index_in_dim(count_batches, batch_id, keepdims=False),
+            current_buffer_index,
+            sm_scale=sm_scale,
+            bq=bq,
+            b_topk=b_topk,
+        )
+        output_buffer = lax.dynamic_update_slice_in_dim(
+            output_buffer,
+            current_output,
+            batch_id * bq_sparse,
+            axis=0,
+        )
+        return cache_buffers, output_buffer
 
-    cache_buffer_0, cache_buffer_1, output = lax.fori_loop(
+    cache_buffers, output = lax.fori_loop(
         0,
         num_microbatches - 1,
         pipeline_step,
-        (cache_buffer_0, cache_buffer_1, output),
+        (cache_buffers, output),
     )
     final_batch = num_microbatches - 1
-    final_cache = cache_buffer_0 if final_batch % 2 == 0 else cache_buffer_1
     final_output = _tensor_core_attention(
         lax.dynamic_index_in_dim(q_latent_batches, final_batch, keepdims=False),
         lax.dynamic_index_in_dim(q_rope_batches, final_batch, keepdims=False),
-        final_cache,
+        cache_buffers,
         lax.dynamic_index_in_dim(count_batches, final_batch, keepdims=False),
+        jnp.int32(final_batch & 1),
         sm_scale=sm_scale,
         bq=bq,
         b_topk=b_topk,
