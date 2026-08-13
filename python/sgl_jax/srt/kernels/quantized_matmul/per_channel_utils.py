@@ -77,6 +77,32 @@ PER_CHANNEL_TUNED_ENTRIES: dict[PerChannelTunedKey, PerChannelTunedEntry] = {
     PerChannelTunedKey(7, 2, 128, 6144, "bfloat16", "bfloat16", "float8_e4m3fn"): (
         PerChannelTunedEntry(PerChannelTunedValue(2, 128, 3072))
     ),
+    # M=8 evaluation workloads. Selected by the exact-shape TPU7 XProf sweep
+    # exp-gh4so4dlad; all entries passed correctness and three-run CV <= 2%.
+    PerChannelTunedKey(7, 8, 2048, 6144, "bfloat16", "bfloat16", "float8_e4m3fn"): (
+        PerChannelTunedEntry(PerChannelTunedValue(8, 512, 6144))
+    ),
+    PerChannelTunedKey(7, 8, 16384, 2048, "bfloat16", "bfloat16", "float8_e4m3fn"): (
+        PerChannelTunedEntry(PerChannelTunedValue(8, 2048, 2048))
+    ),
+    PerChannelTunedKey(7, 8, 576, 6144, "bfloat16", "bfloat16", "float8_e4m3fn"): (
+        PerChannelTunedEntry(PerChannelTunedValue(8, 256, 6144))
+    ),
+    PerChannelTunedKey(7, 8, 6144, 16384, "bfloat16", "bfloat16", "float8_e4m3fn"): (
+        PerChannelTunedEntry(PerChannelTunedValue(8, 512, 16384))
+    ),
+    PerChannelTunedKey(7, 8, 12288, 6144, "bfloat16", "bfloat16", "float8_e4m3fn"): (
+        PerChannelTunedEntry(PerChannelTunedValue(8, 4096, 3072))
+    ),
+    PerChannelTunedKey(7, 8, 6144, 12288, "bfloat16", "bfloat16", "float8_e4m3fn"): (
+        PerChannelTunedEntry(PerChannelTunedValue(8, 512, 12288))
+    ),
+    PerChannelTunedKey(7, 8, 4096, 2048, "bfloat16", "bfloat16", "float8_e4m3fn"): (
+        PerChannelTunedEntry(PerChannelTunedValue(8, 4096, 2048))
+    ),
+    PerChannelTunedKey(7, 8, 128, 6144, "bfloat16", "bfloat16", "float8_e4m3fn"): (
+        PerChannelTunedEntry(PerChannelTunedValue(8, 128, 6144))
+    ),
     # M=1024 attention projections.
     PerChannelTunedKey(7, 1024, 2048, 6144, "bfloat16", "bfloat16", "float8_e4m3fn"): (
         PerChannelTunedEntry(PerChannelTunedValue(1024, 1024, 3072))
