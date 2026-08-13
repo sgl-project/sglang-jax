@@ -18,11 +18,10 @@ from .kernel import FusedMoEBlockConfig
 
 logger = logging.getLogger(__name__)
 
-# Interleaved gather allocates one routing SMEM bank per local token block. On
-# TPU v7, keeping that path above 1024 tokens per EP rank can exceed the 1 MiB
-# SMEM budget. Keep the small-shape fast path and fall back to the kernel's
-# fixed two-bank path for larger shapes.
-MAX_INTERLEAVED_LOCAL_TOKENS = 1024
+# Gather-compute overlap is unconditional for num_bt > 1 via the kernel's fixed-K
+# rotating gather banks (fixed_gather_banks, default 2): the K-deep sliding window
+# keeps gather SMEM/VMEM at O(K) for any token count, so there is no token-count
+# gate any more.
 
 # Key (without device_name):
 #   (tokens_dtype, weight_dtype, num_tokens, num_experts, top_k,
@@ -67,6 +66,9 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         # routing on 2026-08-09 (Falcon exp-11xkf5j57c). Existing 32..256
         # entries remained optimal or statistically equivalent; 16 is new.
         ('bfloat16', 'float8_e4m3fn', 16, 256, 8, 6144, 2048, 16, True, False, True): (8, 512, 8, 128, 8),
+        # GLM-5.2 ep16 BLOCKWISE / legacy fallback (6-tuple key, no quant_mode).
+        # Values from epic's blockwise tune. Production GLM-5.2 uses PER-CHANNEL
+        # and hits the 'per_channel' key below; these serve blockwise requests only.
         ('bfloat16', 'float8_e4m3fn', 32, 256, 8, 6144, 2048, 16, True, False, True): (8, 512, 8, 128, 8),
         ('bfloat16', 'float8_e4m3fn', 64, 256, 8, 6144, 2048, 16, True, False, True): (8, 512, 8, 128, 8),
         ('bfloat16', 'float8_e4m3fn', 128, 256, 8, 6144, 2048, 16, True, False, True): (8, 1024, 8, 128, 8),
@@ -77,26 +79,43 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         ('bfloat16', 'float8_e4m3fn', 4096, 256, 8, 6144, 2048, 16, True, False, True): (128, 1024, 64, 1024, 128),
         ('bfloat16', 'float8_e4m3fn', 8192, 256, 8, 6144, 2048, 16, True, False, True): (128, 1024, 64, 1024, 128),
         ('bfloat16', 'float8_e4m3fn', 16384, 256, 8, 6144, 2048, 16, True, False, True): (256, 512, 64, 512, 256),
-        # GLM-5.2 routed FP8 per-channel, ep=16, in-kernel shared expert,
-        # act_quant ON. Tuned by Falcon exp-pzvs0oxstq and independently
-        # rechecked against blockwise by exp-07o5vq6cgo (2026-08-07).
-        ('bfloat16', 'float8_e4m3fn', 32, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (8, 1024, 8, 128, 8),
-        ('bfloat16', 'float8_e4m3fn', 64, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (8, 1024, 8, 128, 8),
-        ('bfloat16', 'float8_e4m3fn', 128, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (8, 512, 8, 128, 8),
-        ('bfloat16', 'float8_e4m3fn', 256, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (16, 512, 16, 128, 16),
+        ('bfloat16', 'float8_e4m3fn', 32768, 256, 8, 6144, 2048, 16, True, False, True): (128, 1024, 64, 1024, 128),
+        # GLM-5.2 ep16 PER-CHANNEL W8A8 -- the production path. Re-tuned 2026-08-12
+        # with the FIXED tuner (corner-seeding + bse-dedup, commit ea52014; Falcon
+        # exp-mmjfl55aod/exp-zsm7vwqave), replacing the 2026-08-07 values. Decode
+        # self-selects bse=512, prefill btc=128; 16384 = bt128/bf1024/bse1024
+        # 3.033ms (-16.6% vs old bt256/bf512/bse512), 32768 clean bench 6.031ms.
+        # Tiling-only numerically (bit-identical bt/bts/btc; bse/bf K-dim accum
+        # rel_err-equivalent, exp-trkv8umq53/exp-h4zshl4vzw). Tuple=(bt,bf,btc,bse,bts).
+        ('bfloat16', 'float8_e4m3fn', 32, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (8, 1024, 8, 512, 8),
+        ('bfloat16', 'float8_e4m3fn', 64, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (8, 1024, 8, 512, 8),
+        ('bfloat16', 'float8_e4m3fn', 128, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (8, 512, 8, 512, 8),
+        ('bfloat16', 'float8_e4m3fn', 256, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (16, 512, 16, 512, 16),
         ('bfloat16', 'float8_e4m3fn', 512, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (32, 512, 32, 512, 32),
         ('bfloat16', 'float8_e4m3fn', 1024, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (64, 1024, 64, 1024, 64),
-        ('bfloat16', 'float8_e4m3fn', 2048, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (128, 1024, 64, 1024, 128),
-        ('bfloat16', 'float8_e4m3fn', 4096, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (128, 1024, 64, 1024, 128),
-        ('bfloat16', 'float8_e4m3fn', 8192, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (128, 1024, 64, 1024, 128),
-        ('bfloat16', 'float8_e4m3fn', 16384, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (256, 512, 64, 512, 256),
-        # GLM-5.2 W8A16 per-channel hot buckets for the production C32
-        # 128K-prefix / 1K-extend / 1K-decode workload. Unlike the entries
-        # above, activations remain BF16. A bounded 8-candidate sweep on the
-        # full EP16 topology selected these configs (Falcon exp-39vsflxses,
-        # 2026-08-11); do not reuse them for activation-quantized W8A8.
-        ('bfloat16', 'float8_e4m3fn', 32, 256, 8, 6144, 2048, 16, True, False, False, 'per_channel'): (8, 256, 8, 256, 8),
-        ('bfloat16', 'float8_e4m3fn', 32768, 256, 8, 6144, 2048, 16, True, False, False, 'per_channel'): (128, 1024, 32, 1024, 128),
+        ('bfloat16', 'float8_e4m3fn', 2048, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (128, 1024, 128, 1024, 128),
+        ('bfloat16', 'float8_e4m3fn', 4096, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (128, 1024, 128, 1024, 128),
+        ('bfloat16', 'float8_e4m3fn', 8192, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (128, 1024, 128, 1024, 128),
+        ('bfloat16', 'float8_e4m3fn', 16384, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (128, 1024, 128, 1024, 128),
+        ('bfloat16', 'float8_e4m3fn', 32768, 256, 8, 6144, 2048, 16, True, False, True, 'per_channel'): (128, 1024, 128, 1024, 128),
+        # GLM-5.2 ep16 W8A16 per-channel (activations stay BF16), production C32
+        # 128K-prefix / 1K-extend / 1K-decode workload. Re-tuned full 32..32768 on
+        # 2026-08-12 with the FIXED tuner (Falcon exp-iqqef5fdtr / exp-sif4qtwfwt),
+        # replacing the 2026-08-11 bounded 8-candidate sweep (exp-39vsflxses) that
+        # only had tok32/32768 and picked btc=32. The fixed tuner selects btc=128
+        # for prefill HERE TOO -- W8A16 does NOT prefer small btc; the old btc=32
+        # was a corner-seeding blind-spot, not a W8A16 trait. Tuple=(bt,bf,btc,bse,bts).
+        ('bfloat16', 'float8_e4m3fn', 32, 256, 8, 6144, 2048, 16, True, False, False, 'per_channel'): (8, 1024, 8, 512, 8),
+        ('bfloat16', 'float8_e4m3fn', 64, 256, 8, 6144, 2048, 16, True, False, False, 'per_channel'): (8, 1024, 8, 512, 8),
+        ('bfloat16', 'float8_e4m3fn', 128, 256, 8, 6144, 2048, 16, True, False, False, 'per_channel'): (8, 1024, 8, 512, 8),
+        ('bfloat16', 'float8_e4m3fn', 256, 256, 8, 6144, 2048, 16, True, False, False, 'per_channel'): (16, 512, 16, 512, 16),
+        ('bfloat16', 'float8_e4m3fn', 512, 256, 8, 6144, 2048, 16, True, False, False, 'per_channel'): (32, 1024, 32, 1024, 32),
+        ('bfloat16', 'float8_e4m3fn', 1024, 256, 8, 6144, 2048, 16, True, False, False, 'per_channel'): (64, 1024, 64, 512, 64),
+        ('bfloat16', 'float8_e4m3fn', 2048, 256, 8, 6144, 2048, 16, True, False, False, 'per_channel'): (128, 1024, 128, 1024, 128),
+        ('bfloat16', 'float8_e4m3fn', 4096, 256, 8, 6144, 2048, 16, True, False, False, 'per_channel'): (128, 1024, 128, 1024, 128),
+        ('bfloat16', 'float8_e4m3fn', 8192, 256, 8, 6144, 2048, 16, True, False, False, 'per_channel'): (128, 1024, 128, 1024, 128),
+        ('bfloat16', 'float8_e4m3fn', 16384, 256, 8, 6144, 2048, 16, True, False, False, 'per_channel'): (128, 1024, 128, 1024, 128),
+        ('bfloat16', 'float8_e4m3fn', 32768, 256, 8, 6144, 2048, 16, True, False, False, 'per_channel'): (128, 1024, 128, 1024, 128),
         # GLM-5.2 W8A16 per-channel hot buckets for the C64 two-prefix
         # 128K-hit / 1K-extend / 1K-decode workload on EP32. A bounded
         # three-candidate decode sweep selected btc=16; the established
@@ -104,9 +123,25 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         # (2026-08-12). The bt=256 extend alternative exceeded v7 VMEM.
         ('bfloat16', 'float8_e4m3fn', 64, 256, 8, 6144, 2048, 32, True, False, False, 'per_channel'): (8, 512, 16, 128, 16),
         ('bfloat16', 'float8_e4m3fn', 65536, 256, 8, 6144, 2048, 32, True, False, False, 'per_channel'): (128, 1024, 32, 1024, 160),
-        # 32768 uses interleave_bt=False. Tuned on the same EP16 topology on
-        # 2026-08-06 (Falcon exp-l4uk7szwz7, confirmed by exp-4ir7bfizgu).
-        ('bfloat16', 'float8_e4m3fn', 32768, 256, 8, 6144, 2048, 16, True, False, True): (128, 1024, 64, 1024, 128),
+        # GLM-5.2 ep32 PER-CHANNEL W8A8 -- the production per-channel path on EP32
+        # (C64 workload: 64 concurrency, 65536 prefill = 64 x 1K extend). Re-tuned
+        # 2026-08-12 with the FIXED tuner (corner-seeding + bse-dedup; Falcon
+        # exp-jetp6ikcno 32..4096 / exp-9djm99v09t 8192..65536). Before this, ep32
+        # W8A8 fell back to the 6-tuple blockwise key below. Decode self-selects
+        # bse=512/1024 (bse-fix); ep32's smaller per-device local rows keep btc<=160
+        # -- it does NOT prefer ep16's large-btc regime (fixed-K let 65536 compile
+        # where the old num_bt-banks OOM'd). Tuple=(bt,bf,btc,bse,bts).
+        ('bfloat16', 'float8_e4m3fn', 32, 256, 8, 6144, 2048, 32, True, False, True, 'per_channel'): (8, 512, 8, 512, 8),
+        ('bfloat16', 'float8_e4m3fn', 64, 256, 8, 6144, 2048, 32, True, False, True, 'per_channel'): (8, 512, 8, 512, 8),
+        ('bfloat16', 'float8_e4m3fn', 128, 256, 8, 6144, 2048, 32, True, False, True, 'per_channel'): (8, 512, 16, 512, 16),
+        ('bfloat16', 'float8_e4m3fn', 256, 256, 8, 6144, 2048, 32, True, False, True, 'per_channel'): (8, 512, 16, 512, 16),
+        ('bfloat16', 'float8_e4m3fn', 512, 256, 8, 6144, 2048, 32, True, False, True, 'per_channel'): (16, 512, 32, 512, 32),
+        ('bfloat16', 'float8_e4m3fn', 1024, 256, 8, 6144, 2048, 32, True, False, True, 'per_channel'): (32, 1024, 64, 1024, 64),
+        ('bfloat16', 'float8_e4m3fn', 2048, 256, 8, 6144, 2048, 32, True, False, True, 'per_channel'): (64, 1024, 80, 1024, 80),
+        ('bfloat16', 'float8_e4m3fn', 4096, 256, 8, 6144, 2048, 32, True, False, True, 'per_channel'): (64, 1024, 80, 1024, 80),
+        ('bfloat16', 'float8_e4m3fn', 8192, 256, 8, 6144, 2048, 32, True, False, True, 'per_channel'): (128, 1024, 160, 1024, 160),
+        ('bfloat16', 'float8_e4m3fn', 16384, 256, 8, 6144, 2048, 32, True, False, True, 'per_channel'): (128, 1024, 160, 512, 160),
+        ('bfloat16', 'float8_e4m3fn', 65536, 256, 8, 6144, 2048, 32, True, False, True, 'per_channel'): (64, 1024, 128, 1024, 128),
         # GLM-5.2: E=256, H=6144, I=2048, top_k=8, routed FP8 block-wise
         # K=128, ep=32, in-kernel shared expert, act_quant ON, no grouped top-k.
         # Tuned on 16 TPU v7x chips, 2026-08-03 (Falcon exp-bkbi8g86uy).
@@ -120,8 +155,9 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         ('bfloat16', 'float8_e4m3fn', 4096, 256, 8, 6144, 2048, 32, True, False, True): (128, 1024, 32, 1024, 160),
         ('bfloat16', 'float8_e4m3fn', 8192, 256, 8, 6144, 2048, 32, True, False, True): (128, 1024, 32, 1024, 160),
         ('bfloat16', 'float8_e4m3fn', 16384, 256, 8, 6144, 2048, 32, True, False, True): (128, 1024, 32, 1024, 160),
-        # 65536 uses interleave_bt=False. Broad-tuned on 2026-08-06 with
-        # Falcon exp-xcd5xzd8tk and confirmed by exp-aj0v4d01se.
+        # 65536@ep32 num_bt=16 -> fixed-K gather banks (K=2) after the interleave_bt
+        # switch removal (2026-08-12). Value from the 2026-08-06 broad-tune (Falcon
+        # exp-xcd5xzd8tk); fixed-K perf on this ep32 shape is re-verify-pending.
         ('bfloat16', 'float8_e4m3fn', 65536, 256, 8, 6144, 2048, 32, True, False, True): (128, 1024, 32, 1024, 160),
         # Ling 2.6-1T: E=256, H=8192, I=2048, top_k=8, fp8 e4m3 per-channel, ep=32
         # Tuned 2026-05-27
@@ -157,12 +193,15 @@ DEFAULT_V2_BLOCK_CONFIG = FusedMoEBlockConfig(
 
 
 def should_interleave_fused_moe_v2_bt(*, num_tokens: int, ep_size: int) -> bool:
-    """Return whether gather routing banks fit the TPU v7 SMEM budget."""
+    """Deprecated shim: gather overlap is now unconditional for num_bt > 1 via
+    the kernel's fixed-K gather banks, so there is no token-count gate. Retained
+    only to validate inputs for callers that still probe it; always returns True.
+    """
     if ep_size <= 0:
         raise ValueError(f"Expected {ep_size=} to be > 0.")
     if num_tokens % ep_size != 0:
         raise ValueError(f"Expected {num_tokens=} to be aligned to {ep_size=}.")
-    return num_tokens // ep_size <= MAX_INTERLEAVED_LOCAL_TOKENS
+    return True
 
 
 def get_simplified_key(

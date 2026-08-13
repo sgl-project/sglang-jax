@@ -62,7 +62,7 @@ def test_glm52_ep16_per_channel_uses_distinct_tuned_v7_config(monkeypatch):
         quant_mode="blockwise",
     )
 
-    assert per_channel == FusedMoEBlockConfig(bt=8, bf=512, btc=8, bse=128, bts=8)
+    assert per_channel == FusedMoEBlockConfig(bt=8, bf=512, btc=8, bse=512, bts=8)
     assert blockwise == FusedMoEBlockConfig(bt=8, bf=1024, btc=8, bse=128, bts=8)
 
 
@@ -85,11 +85,11 @@ def test_glm52_ep16_w8a16_per_channel_uses_hot_bucket_configs(monkeypatch):
             quant_mode="per_channel",
         )
 
-    assert lookup(32) == FusedMoEBlockConfig(bt=8, bf=256, btc=8, bse=256, bts=8)
+    assert lookup(32) == FusedMoEBlockConfig(bt=8, bf=1024, btc=8, bse=512, bts=8)
     assert lookup(32768) == FusedMoEBlockConfig(
         bt=128,
         bf=1024,
-        btc=32,
+        btc=128,
         bse=1024,
         bts=128,
     )
@@ -156,12 +156,31 @@ def test_glm52_ep32_64k_uses_confirmed_v7_config(monkeypatch):
     )
 
 
-def test_ep32_interleave_policy_switches_after_32k_tokens():
-    assert tuned_block_configs.should_interleave_fused_moe_v2_bt(
-        num_tokens=32768,
-        ep_size=32,
+def test_glm52_ep32_per_channel_w8a8_uses_tuned_configs(monkeypatch):
+    monkeypatch.setattr(tuned_block_configs, "get_device_name", lambda: "TPU v7")
+
+    def lookup(num_tokens):
+        return tuned_block_configs.get_tuned_fused_moe_v2_block_config(
+            num_tokens=num_tokens,
+            num_experts=256,
+            top_k=8,
+            hidden_size=6144,
+            intermediate_size=2048,
+            dtype=jnp.bfloat16,
+            weight_dtype=jnp.float8_e4m3fn,
+            ep_size=32,
+            use_shared_expert=True,
+            use_grouped_topk=False,
+            enable_act_quant=True,
+            quant_mode="per_channel",
+        )
+
+    # ep32 W8A8 per-channel now has its own key (previously fell back to the
+    # 6-tuple blockwise table). Decode self-selects bse=512; the 65536 prefill
+    # (C64 = 64 concurrency x 1K extend) tuned to btc=128.
+    assert lookup(32) == FusedMoEBlockConfig(bt=8, bf=512, btc=8, bse=512, bts=8)
+    assert lookup(512) == FusedMoEBlockConfig(bt=16, bf=512, btc=32, bse=512, bts=32)
+    assert lookup(65536) == FusedMoEBlockConfig(
+        bt=64, bf=1024, btc=128, bse=1024, bts=128
     )
-    assert not tuned_block_configs.should_interleave_fused_moe_v2_bt(
-        num_tokens=65536,
-        ep_size=32,
-    )
+
