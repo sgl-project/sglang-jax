@@ -205,11 +205,14 @@ class Glm45Detector(BaseReasoningFormatDetector):
             If True, streams reasoning content as it arrives.
     """
 
-    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False):
+    def __init__(self, stream_reasoning: bool = True):
+        # GLM chat templates append `<think>` to the generation prompt, so the
+        # model starts already inside the reasoning block and only ever emits
+        # `</think>`. Force reasoning mode or nothing is ever detected.
         super().__init__(
             "<think>",
             "</think>",
-            force_reasoning=force_reasoning,
+            force_reasoning=True,
             stream_reasoning=stream_reasoning,
             tool_start_token="<tool_call>",
         )

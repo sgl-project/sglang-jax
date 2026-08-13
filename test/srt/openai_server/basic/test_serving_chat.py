@@ -194,6 +194,54 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertEqual(params["min_new_tokens"], 5)
             self.assertEqual(params["stop"], ["</s>"])
 
+    def test_tool_call_grammar_forces_explicit_thinking_off(self):
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Use the tool"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+            tool_choice="required",
+            chat_template_kwargs={"enable_thinking": True},
+        )
+        processed = Mock()
+
+        with (
+            patch("sgl_jax.srt.entrypoints.openai.serving_chat.FunctionCallParser") as parser_cls,
+            patch.object(
+                self.chat,
+                "_apply_conversation_template",
+                return_value=processed,
+            ),
+        ):
+            parser_cls.return_value.get_structure_constraint.return_value = (
+                "json_schema",
+                {},
+            )
+            result = self.chat._process_messages(request, is_multimodal=False)
+
+        self.assertIs(result, processed)
+        self.assertFalse(request.chat_template_kwargs["enable_thinking"])
+        self.assertEqual(processed.tool_call_constraint, ("json_schema", {}))
+
+    def test_glm_reasoning_parser_respects_enable_thinking(self):
+        self.tm.server_args.reasoning_parser = "glm45"
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi"}],
+            chat_template_kwargs={"enable_thinking": True},
+        )
+        self.assertTrue(self.chat._get_reasoning_from_request(request))
+
+        request.chat_template_kwargs["enable_thinking"] = False
+        self.assertFalse(self.chat._get_reasoning_from_request(request))
+
     async def test_unstreamed_tool_args_completion(self):
         """Test that remaining tool call arguments are sent when generation finishes."""
 

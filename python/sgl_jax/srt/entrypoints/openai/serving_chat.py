@@ -129,15 +129,24 @@ class OpenAIServingChat(OpenAIServingBase):
             parser = FunctionCallParser(request.tools, tool_call_parser)
             tool_call_constraint = parser.get_structure_constraint(request.tool_choice)
 
-        # Structural_tag grammars block special tokens like <think>.
-        # Disable thinking so the template injects an empty <think></think>
-        # prefix instead of letting the model generate <think> itself.
-        if tool_call_constraint and tool_call_constraint[0] == "structural_tag":
+        # Tool-call grammars constrain the completion to bare tool-call syntax, so
+        # the model can never emit `<think>`/`</think>`: structural_tag blocks the
+        # special tokens outright, and json_schema (tool_choice="required" or a
+        # named function) forces a bare JSON array. Disable thinking so the
+        # template injects a closed `<think></think>` prefix, and so
+        # `_get_reasoning_from_request` keeps a force-on reasoning detector from
+        # swallowing the whole tool call as reasoning_content.
+        if tool_call_constraint:
             if request.chat_template_kwargs is None:
                 request.chat_template_kwargs = {}
-            if "enable_thinking" not in request.chat_template_kwargs:
-                logger.debug("Disabling thinking mode: incompatible with structural_tag grammar")
-            request.chat_template_kwargs.setdefault("enable_thinking", False)
+            if request.chat_template_kwargs.get("enable_thinking") is not False:
+                logger.debug(
+                    "Disabling thinking mode: incompatible with %s grammar",
+                    tool_call_constraint[0],
+                )
+            # A caller may explicitly request thinking in extra_body. The
+            # grammar still cannot represent a think block, so it must win.
+            request.chat_template_kwargs["enable_thinking"] = False
 
         # Use chat template
         if self.template_manager.chat_template_name is None:
@@ -879,15 +888,20 @@ Assistant: {% endif %}"""
         """Decide whether reasoning should be parsed for this request.
 
         MIMO's chat template defaults enable_thinking=False; user must explicitly
-        set True to opt into reasoning. Qwen3 is reverse (default True, opt-out
-        via False). Both reuse the same Qwen3Detector, but the enable_thinking
-        semantics are inverted, so the serving layer must gate.
+        set True to opt into reasoning. Qwen3 and GLM are the reverse (default
+        True, opt-out via False). MIMO reuses Qwen3Detector but with inverted
+        enable_thinking semantics, so the serving layer must gate.
+
+        Gating matters because these detectors force reasoning mode on: with
+        enable_thinking=False the template injects a closed `<think></think>`
+        prefix, so the completion carries no tags at all and an ungated detector
+        would report the entire answer as reasoning_content with empty content.
         """
         parser = self.tokenizer_manager.server_args.reasoning_parser
         if not parser:
             return False
         kwargs = request.chat_template_kwargs or {}
-        if parser == "qwen3":
+        if parser in ("qwen3", "glm45"):
             return kwargs.get("enable_thinking") is not False
         if parser == "mimo":
             return kwargs.get("enable_thinking") is True

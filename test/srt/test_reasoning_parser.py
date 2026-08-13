@@ -47,6 +47,21 @@ class TestReasoningParserQwen3(CustomTestCase):
 
 
 class TestReasoningParserGlm(CustomTestCase):
+    def test_glm_reasoning_without_open_tag(self):
+        """GLM templates emit the opening tag as part of the prompt."""
+        parser = ReasoningParser(model_type="glm45")
+        reasoning, normal = parser.parse_non_stream("this is reasoning</think>this is normal")
+        self.assertEqual(reasoning, "this is reasoning")
+        self.assertEqual(normal, "this is normal")
+
+    def test_glm_streaming_without_open_tag(self):
+        parser = ReasoningParser(model_type="glm45")
+        r1, n1 = parser.parse_stream_chunk("this is ")
+        r2, n2 = parser.parse_stream_chunk("reasoning</think>")
+        r3, n3 = parser.parse_stream_chunk("this is normal")
+        self.assertEqual((r1 + r2 + r3).strip(), "this is reasoning")
+        self.assertEqual((n1 + n2 + n3).strip(), "this is normal")
+
     def test_glm47_reasoning(self):
         parser = ReasoningParser(model_type="glm45")
         reasoning, normal = parser.parse_non_stream(
@@ -58,7 +73,7 @@ class TestReasoningParserGlm(CustomTestCase):
     def test_glm47_interruption(self):
         parser = ReasoningParser(model_type="glm45")
         # Glm45Detector uses tool_start_token="<tool_call>"
-        reasoning, normal = parser.parse_non_stream("<think>thinking...<tool_call>func")
+        reasoning, normal = parser.parse_non_stream("thinking...<tool_call>func")
         self.assertEqual(reasoning, "thinking...")
         self.assertEqual(normal, "<tool_call>func")
 
