@@ -921,6 +921,22 @@ def test_overlap_copy_rebuilds_multimodal_batch_from_requests():
     assert Modality.IMAGE in rebuilt
 
 
+def test_mixed_chunk_keeps_multimodal_items():
+    item = _items([(1, 4, 4)], [(1, 5)])[0]
+    batch = _schedule_batch(_req([item], 2), _model_config())
+    batch.forward_mode = ForwardMode.MIXED
+    worker_batch = batch.get_model_worker_batch(
+        token_paddings=[2],
+        bs_paddings=[1],
+        cache_loc_paddings=[2],
+        page_size=1,
+    )
+
+    task = worker_batch.multimodal_batch[Modality.IMAGE][0]
+    assert task.item is item
+    assert task.merge_mappings == (_MergeMapping(0, 1, 1),)
+
+
 def _assert_no_grid_layout_planning(jaxpr):
     text = str(jaxpr)
     for primitive in ("cumsum", "repeat", "scatter", "sort"):

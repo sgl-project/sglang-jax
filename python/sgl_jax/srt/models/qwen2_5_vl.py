@@ -433,7 +433,7 @@ class Qwen2_5_VisionTransformer(nnx.Module):
     def __call__(
         self,
         patches: jax.Array,
-        grid_thw: np.ndarray | jax.Array,
+        grid_thw: np.ndarray,
     ) -> jax.Array:
         return self.encode(patches, grid_thw)
 
@@ -478,7 +478,7 @@ class Qwen2_5_VisionTransformer(nnx.Module):
     def encode(
         self,
         patches: jax.Array,
-        grid_thw: np.ndarray | jax.Array,
+        grid_thw: np.ndarray,
     ) -> jax.Array:
         patches = put_sharded_batch(patches, self.mesh, self.specs.batch_axis)
         metadata = self._build_metadata(grid_thw, patches.shape[1])
@@ -502,10 +502,10 @@ class Qwen2_5_VisionTransformer(nnx.Module):
 
     def _build_metadata(
         self,
-        lane_grids: np.ndarray | jax.Array,
+        lane_grids: np.ndarray,
         capacity: int,
     ) -> tuple[np.ndarray, np.ndarray, VisionAttentionMetadata, VisionAttentionMetadata]:
-        lane_grids = np.asarray(jax.device_get(lane_grids), dtype=np.int32)
+        lane_grids = np.asarray(lane_grids, dtype=np.int32)
         if lane_grids.ndim == 2:
             lane_grids = lane_grids[None]
         batch = len(lane_grids)

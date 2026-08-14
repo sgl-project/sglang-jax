@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import math
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -26,6 +27,26 @@ def get_grid_thw(item: MultimodalDataItem) -> tuple[int, int, int]:
     if value is None:
         value = item.get("video_grid_thw")
     return tuple(int(entry) for entry in np.asarray(value).reshape(3))
+
+
+def _validate_vision_items(items: list[MultimodalDataItem], merge_unit: int) -> None:
+    for item_index, item in enumerate(items):
+        feature = item.feature
+        # When the Processor creates an Item, if the feature is None, it should not create the Item.
+        if feature is None or feature.ndim == 0:
+            raise ValueError(f"Vision item {item_index} feature must have a patch dimension.")
+
+        feature_patches = int(feature.shape[0])
+        grid_patches = math.prod(get_grid_thw(item))
+        placeholder_patches = (
+            sum(end - start for start, end in item.placeholder_ranges or ()) * merge_unit
+        )
+        if not feature_patches == grid_patches == placeholder_patches:
+            raise ValueError(
+                f"Vision item {item_index} patch counts must match: "
+                f"feature rows={feature_patches}, grid_thw product={grid_patches}, "
+                f"placeholder tokens * merge_unit={placeholder_patches}."
+            )
 
 
 def put_sharded_batch(value: Any, mesh: Mesh | None, batch_axis: Any):
@@ -141,6 +162,7 @@ def pack_vision_inputs(
     buckets: tuple[int, ...],
     merge_unit: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    _validate_vision_items(items, merge_unit)
     packed = pack_lanes(
         items,
         num_lanes,

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from tqdm import tqdm
 
+from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
 from sgl_jax.srt.utils.common_utils import (
     PRECOMPILE_DEFAULT_BS_PADDINGS,
     PRECOMPILE_DEFAULT_TOKEN_PADDINGS,
@@ -160,15 +161,12 @@ class CompilationManager:
 
     @staticmethod
     def _packed_multimodal_capacities(model_runner: ModelRunner) -> tuple[int, ...]:
-        getter = getattr(
-            model_runner.model,
-            "get_multimodal_embedding_packed_capacities",
-            None,
-        )
+        getter = getattr(model_runner.model, "get_multimodal_embedding_packed_capacities", None)
         if not callable(getter):
             return ()
-        capacities = tuple(map(int, getter()))
-        if any(capacity <= 0 for capacity in capacities):
+
+        capacities = tuple(int(x) for x in getter())
+        if any(c <= 0 for c in capacities):
             raise ValueError(f"invalid multimodal packed capacities: {capacities}")
         return capacities
 
@@ -222,10 +220,13 @@ class CompilationManager:
                     running,
                     ((0, 0), (0, deepstack.shape[0] * hidden)),
                 )
+
+            dummy_item = MultimodalDataItem(modality=Modality.IMAGE)
+
             for capacity in capacities:
                 length = min(num_tokens, capacity)
                 task = ItemTask(
-                    item=None,
+                    item=dummy_item,
                     output_len=length,
                     merge_mappings=(_MergeMapping(0, 0, length),),
                 )
@@ -236,7 +237,7 @@ class CompilationManager:
             if embedding_pool is not None:
                 length = min(num_tokens, embedding_pool.page_size)
                 task = ItemTask(
-                    item=None,
+                    item=dummy_item,
                     output_len=length,
                     merge_mappings=(_MergeMapping(0, 0, length),),
                 )

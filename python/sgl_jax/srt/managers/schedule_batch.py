@@ -3158,8 +3158,8 @@ class ScheduleBatch:
         mrope_positions = _mm["mrope_positions"]
         apply_for_deepstack = _mm["apply_for_deepstack"]
         deepstack_visual_embedding = _mm["deepstack_visual_embedding"]
-        # Keep items whose placeholder rows intersect the current extend window.
-        if self.forward_mode == ForwardMode.EXTEND:
+        # Keep items whose placeholder rows intersect the current prefill window.
+        if self.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
             multimodal_batch = build_multimodal_batch(
                 self.reqs_info,
                 self.dp_size,
