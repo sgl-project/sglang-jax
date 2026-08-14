@@ -810,6 +810,36 @@ Assistant: {% endif %}"""
                 finish_reason["matched"] = None
             try:
                 text, call_info_list = parser.parse_non_stream(text)
+                glm_control_markers = (
+                    "<think>",
+                    "</think>",
+                    "<tool_call>",
+                    "</tool_call>",
+                    "<arg_key>",
+                    "</arg_key>",
+                    "<arg_value>",
+                    "</arg_value>",
+                )
+                if tool_call_parser in {"glm45", "glm47"} and (
+                    any(marker in text for marker in glm_control_markers)
+                    or any(
+                        marker in call_info.parameters
+                        for call_info in call_info_list
+                        for marker in glm_control_markers
+                    )
+                ):
+                    # GLM tool arguments are carried inside XML-like structural
+                    # tags.  A control tag inside the decoded JSON arguments or
+                    # leftover content means the model nested/repeated a
+                    # reasoning or tool block.  Executing that value can turn
+                    # repeated protocol text into a shell command, while
+                    # returning the leftover leaks protocol markup as visible
+                    # content.  Reject the entire malformed action as an empty
+                    # normal response so an agent client can nudge/retry it.
+                    logger.warning("Rejecting GLM tool call with nested control markup")
+                    finish_reason["type"] = "stop"
+                    finish_reason["matched"] = None
+                    return None, "", finish_reason
                 tool_calls = [
                     ToolCall(
                         id=f"call_{uuid.uuid4().hex[:24]}",

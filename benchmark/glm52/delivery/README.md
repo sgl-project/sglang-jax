@@ -23,6 +23,8 @@ benchmark/glm52/delivery/
 │   └── run_16chip.sh
 ├── eval/
 │   └── run.sh
+├── evalscope/
+│   └── run.sh
 ├── validation/
 │   └── validate_delivery_config.py
 └── falcon/
@@ -221,6 +223,54 @@ MODEL_PATH=/models/GLM5.2-fp8-channel-wise \
 `OUT_ROOT`, `NUM_THREADS`, and sampling variables are also configurable,
 but changing sampling parameters makes results no longer directly comparable
 with the documented baseline.
+
+### EvalScope agent smoke
+
+The EvalScope path is separate from the classic `sgl-eval` path above. It
+validates OpenAI-compatible structured tool calling and the native EvalScope
+agent loop with the default `officeqa_pro` subset. A smoke run uses 16
+samples, 16 concurrent agents (one per DP rank), and a 15-step cap. The
+Falcon runner overrides the throughput-oriented round-robin scheduler with
+`cache_aware` for this scenario so each multi-turn agent returns to the DP
+rank holding its prefix. The API request timeout defaults to 3,600 seconds so
+long-tail 4,096-token generations do not get recomputed by the OpenAI client
+under 16-way concurrency. The 16-case smoke has observed individual agent
+generations beyond 1,800 seconds. It records the complete
+EvalScope work directory, including debug logs, predictions, reviews, reports,
+per-sample `agent_trace` events, progress, and request performance metrics.
+
+Initialize the pinned submodule and install it into an isolated evaluator
+environment before invoking this entry point. The OfficeQA dataset directory
+defaults to `/models/evalscope/officeqa`; Falcon mounts that path from a
+writable, persistent GCS prefix so the approximately 460 MB corpus downloaded
+on the first run is reused by subsequent runs.
+
+```bash
+git submodule update --init --recursive third_party/evalscope
+python3 -m pip install -e third_party/evalscope
+
+EVALSCOPE_DATASET_DIR=/models/evalscope/officeqa \
+MODEL_PATH=/models/GLM5.2-fp8-channel-wise \
+  benchmark/glm52/delivery/evalscope/run.sh officeqa
+```
+
+The runner first verifies that thinking output is separated into non-empty
+`reasoning_content` and final `content` fields without literal thinking tags.
+It then sends a named-function request with thinking requested and requires the
+server's grammar path to suppress reasoning while returning a structured
+`tool_calls` response. Finally, it repeats a unique long-prefix request and
+requires the second OpenAI usage record to report cached tokens. After
+evaluation it audits the server-log window for real agent cache hits and every
+review row for a function-calling trace, structured
+reasoning, no thinking-tag leakage, matching tool call/result IDs, and a
+terminal submit or error event. Expected agent-quality outcomes such as
+exhausting the step limit or a non-zero tool command exit are retained as
+`quality_issues` rather than infrastructure failures. Accuracy is retained in
+the report but is deliberately not a pass/fail criterion for the 16-sample
+smoke. The submodule pins an unmodified upstream EvalScope revision, so bash
+observations, model-request retries, the agent state machine, and scoring all
+retain upstream behavior. Delivery-specific trace and cache checks run only
+after evaluation and do not alter prompts, observations, retries, or scores.
 
 ## Internal Falcon manifests
 

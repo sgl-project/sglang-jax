@@ -33,6 +33,23 @@ case "$GLM52_PHYSICAL_CHIPS" in
     ;;
 esac
 
+CONTEXT_LENGTH="${GLM52_CONTEXT_LENGTH:-135168}"
+CONCURRENCY="${GLM52_MAX_RUNNING_REQUESTS:-$CONCURRENCY}"
+PRECOMPILE_BS_PADDING="${GLM52_PRECOMPILE_BS_PADDING:-$CONCURRENCY}"
+for value_name in CONTEXT_LENGTH CONCURRENCY PRECOMPILE_BS_PADDING; do
+  value="${!value_name}"
+  if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s must be a positive integer, got: %s\n' "$value_name" "$value" >&2
+    exit 2
+  fi
+done
+MIN_FUSED_MOE_REQUESTS=$((2 * PARALLEL_SIZE))
+if (( CONCURRENCY < MIN_FUSED_MOE_REQUESTS )); then
+  printf 'GLM52_MAX_RUNNING_REQUESTS=%s is below the fused-MoE minimum 2 * EP=%s\n' \
+    "$CONCURRENCY" "$MIN_FUSED_MOE_REQUESTS" >&2
+  exit 2
+fi
+
 if [[ "$WORLD" != "$EXPECTED_WORLD" ]]; then
   printf 'WORLD=%s does not match %s physical chips; expected WORLD=%s v7x-8 hosts\n' \
     "$WORLD" "$GLM52_PHYSICAL_CHIPS" "$EXPECTED_WORLD" >&2
@@ -113,7 +130,7 @@ LAUNCH_ARGS=(
   --page-size 64 \
   --chunked-prefill-size 2048 \
   --max-prefill-tokens "$MAX_PREFILL_TOKENS" \
-  --context-length 135168 \
+  --context-length "$CONTEXT_LENGTH" \
   --tp-size "$PARALLEL_SIZE" \
   --dp-size "$PARALLEL_SIZE" \
   --dp-schedule-policy round_robin \
@@ -121,7 +138,7 @@ LAUNCH_ARGS=(
   --moe-backend fused_v2 \
   --mem-fraction-static "$MEM_FRACTION_STATIC" \
   --max-running-requests "$CONCURRENCY" \
-  --precompile-bs-paddings "$CONCURRENCY" \
+  --precompile-bs-paddings "$PRECOMPILE_BS_PADDING" \
   --precompile-token-paddings "$MAX_PREFILL_TOKENS" \
   --skip-server-warmup \
   --random-seed 3 \

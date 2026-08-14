@@ -242,6 +242,114 @@ class ServingChatTestCase(unittest.TestCase):
         request.chat_template_kwargs["enable_thinking"] = False
         self.assertFalse(self.chat._get_reasoning_from_request(request))
 
+    def test_glm_tool_call_rejects_nested_control_markup(self):
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Use bash"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"command": {"type": "string"}},
+                            "required": ["command"],
+                        },
+                    },
+                }
+            ],
+        )
+        text = (
+            "<tool_call>bash"
+            "<arg_key>command</arg_key>"
+            "<arg_value>echo safe</think><tool_call>bash"
+            "<arg_key>command</arg_key><arg_value>pwd</arg_value>"
+            "</tool_call></arg_value></tool_call>"
+        )
+        finish_reason = {"type": "stop", "matched": "</tool_call>"}
+
+        tool_calls, content, updated_finish_reason = self.chat._process_tool_calls(
+            text,
+            request.tools,
+            "glm47",
+            finish_reason,
+        )
+
+        self.assertIsNone(tool_calls)
+        self.assertEqual(content, "")
+        self.assertEqual(updated_finish_reason, {"type": "stop", "matched": None})
+
+    def test_glm_tool_call_rejects_control_markup_in_leftover_content(self):
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Use bash"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"command": {"type": "string"}},
+                            "required": ["command"],
+                        },
+                    },
+                }
+            ],
+        )
+        text = (
+            "<tool_call>bash<arg_key>command</arg_key>"
+            "<arg_value>pwd</arg_value></tool_call>"
+            "Let me search the document.</think></tool_call>"
+        )
+        finish_reason = {"type": "stop", "matched": "</tool_call>"}
+
+        tool_calls, content, updated_finish_reason = self.chat._process_tool_calls(
+            text,
+            request.tools,
+            "glm47",
+            finish_reason,
+        )
+
+        self.assertIsNone(tool_calls)
+        self.assertEqual(content, "")
+        self.assertEqual(updated_finish_reason, {"type": "stop", "matched": None})
+
+    def test_glm_tool_call_accepts_clean_arguments(self):
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Use bash"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"command": {"type": "string"}},
+                            "required": ["command"],
+                        },
+                    },
+                }
+            ],
+        )
+        finish_reason = {"type": "stop", "matched": "</tool_call>"}
+
+        tool_calls, content, updated_finish_reason = self.chat._process_tool_calls(
+            "<tool_call>bash<arg_key>command</arg_key>"
+            "<arg_value>pwd</arg_value></tool_call>",
+            request.tools,
+            "glm47",
+            finish_reason,
+        )
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0].function.name, "bash")
+        self.assertEqual(tool_calls[0].function.arguments, '{"command": "pwd"}')
+        self.assertEqual(content, "")
+        self.assertEqual(updated_finish_reason, {"type": "tool_calls", "matched": None})
+
     async def test_unstreamed_tool_args_completion(self):
         """Test that remaining tool call arguments are sent when generation finishes."""
 

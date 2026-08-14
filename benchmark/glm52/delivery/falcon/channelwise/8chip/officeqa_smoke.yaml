@@ -1,0 +1,94 @@
+name: glm52-delivery-channelwise-8chip-officeqa-smoke
+exp_type: TRAINING
+artifact_type: metrics
+cluster_name: tpu-training-antgroup
+priority: 0
+tags: [glm52, delivery, evalscope, officeqa-pro, agent-eval, tool-calling, prefix-cache, smoke-16, channelwise, 8chip]
+config: '{"scenario":"agent_eval","framework":"evalscope","dataset":"officeqa","subset":"officeqa_pro","dataset_cache":"gs://inference-model-storage-poc-tpu-hns/evalscope/datasets/officeqa mounted at /models/evalscope/officeqa","limit":16,"eval_batch_size":16,"agent_strategy":"function_calling","agent_max_steps":15,"command_timeout_seconds":60,"bash_output_policy":"unmodified","api_timeout_seconds":3600,"dp_schedule_policy":"cache_aware","radix_cache":true,"cache_report":true,"prefix_cache_preflight":true,"server_prefix_cache_audit":true,"long_context_preflight_tokens":150000,"minimum_kv_headroom_tokens":8192,"debug":true,"collect_perf":true,"progress_tracker":true,"trace_audit":true,"reasoning_preflight":true,"tool_call_preflight":true,"tool_call_parser":"glm47","reasoning_parser":"glm45","model":"GLM5.2-fp8-channel-wise","quantization":"per-channel-weight-moe-w8a8-linear-w8a16","quant_config":"fp8_glm52_static_per_channel_moe_w8a8_linear_w8a16.yaml","physical_chips":8,"jax_devices":16,"hosts":2,"devices_per_host":8,"tp":16,"dp":16,"ep":16,"max_running_requests":32,"max_prefill_tokens":32768,"context_length":202752,"mem_fraction_static":0.89,"dsa_sparse_impl":"exact","dsa_topk_impl":"radix","moe_backend":"fused_v2","kv_cache_dtype":"bf16","temperature":0.0,"top_p":1.0,"seed":3,"max_tokens":4096,"source_commit":"92d164a917297cb79fd7344d0cac00a7385a0899","evalscope_commit":"31ccc8c02671832df1f0a4aba64689c850898c95"}'
+role_to_task_spec:
+  worker:
+    command: |
+      cd /workspace/sglang-jax
+      exec bash benchmark/glm52/delivery/falcon/runner.sh
+    replica: 2
+    image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x2
+    envs:
+      SOURCE_COMMIT: 92d164a917297cb79fd7344d0cac00a7385a0899
+      EVALSCOPE_COMMIT: 31ccc8c02671832df1f0a4aba64689c850898c95
+      GLM52_PHYSICAL_CHIPS: "8"
+      GLM52_QUANTIZATION: channelwise
+      GLM52_TOOL_CALL_PARSER: glm47
+      GLM52_REASONING_PARSER: glm45
+      GLM52_DP_SCHEDULE_POLICY: cache_aware
+      GLM52_CONTEXT_LENGTH: "202752"
+      GLM52_MAX_RUNNING_REQUESTS: "32"
+      GLM52_PRECOMPILE_BS_PADDING: "32"
+      GLM52_KV_HEADROOM_TOKENS: "8192"
+      GLM52_LONG_CONTEXT_PROBE_TOKENS: "150000"
+      MEM_FRACTION_STATIC: "0.89"
+      MODEL_PATH: /models/GLM5.2-fp8-channel-wise
+      RUN_MODE: agent_eval
+      EVALSCOPE_DATASET: officeqa
+      EVALSCOPE_MODEL_ID: glm52-channelwise-8chip
+      EVALSCOPE_DATASET_DIR: /models/evalscope/officeqa
+      EVALSCOPE_LIMIT: "16"
+      EVALSCOPE_BATCH_SIZE: "16"
+      EVALSCOPE_MAX_STEPS: "15"
+      EVALSCOPE_COMMAND_TIMEOUT: "60"
+      EVALSCOPE_API_TIMEOUT: "3600"
+      EVALSCOPE_MAX_TOKENS: "4096"
+      EVALSCOPE_SEED: "3"
+      EVALSCOPE_ENABLE_THINKING: "true"
+      EVALSCOPE_DEBUG: "1"
+      PYTHONUNBUFFERED: "1"
+      TMPDIR: /tmp/tpu_logs/tmp
+      PIP_CACHE_DIR: /tmp/tpu_logs/pip-cache
+      UV_CACHE_DIR: /tmp/tpu_logs/uv-cache
+      JAX_COMPILATION_CACHE_DIR: /tmp/tpu_logs/jax-compilation-cache
+    mounts:
+      - name: glm52-channelwise-model
+        type: gcs
+        bucket: inference-model-storage-poc-tpu-hns
+        prefix: GLM5.2-fp8-channel-wise
+        mount_path: /models/GLM5.2-fp8-channel-wise
+        read_only: true
+        mount_options:
+          - implicit-dirs
+          - metadata-cache:ttl-secs:-1
+          - metadata-cache:stat-cache-max-size-mb:-1
+          - metadata-cache:type-cache-max-size-mb:-1
+          - file-system:kernel-list-cache-ttl-secs:-1
+          - read:enable-buffered-read:true
+          - read:block-size-mb:32
+          - read:max-blocks-per-handle:64
+          - read:global-max-blocks:2048
+          - read_ahead_kb=1024
+      - name: evalscope-officeqa-dataset
+        type: gcs
+        bucket: inference-model-storage-poc-tpu-hns
+        prefix: evalscope/datasets/officeqa
+        mount_path: /models/evalscope/officeqa
+        read_only: false
+        mount_options:
+          - implicit-dirs
+          - metadata-cache:ttl-secs:-1
+          - metadata-cache:stat-cache-max-size-mb:-1
+          - metadata-cache:type-cache-max-size-mb:-1
+          - file-system:kernel-list-cache-ttl-secs:-1
+          - read:enable-buffered-read:true
+          - read:block-size-mb:32
+          - read:max-blocks-per-handle:64
+          - read:global-max-blocks:2048
+          - read_ahead_kb=1024
+    sources:
+      - name: sglang-jax
+        type: git
+        repo: git@github.com:primatrix-glm/sglang-jax-private.git
+        ref: develop/glm52-officeqa-falcon-runtime
+        commit: 92d164a917297cb79fd7344d0cac00a7385a0899
+        path: /workspace/sglang-jax
+        auth:
+          cred: github-primatrix-glm-sglang-jax-private-ssh-codex
