@@ -14,7 +14,6 @@ placeholder-range helpers.  It differs in two ways:
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import copy
 import io
@@ -167,6 +166,9 @@ class _MiMoAudioCodec:
 
 
 class MiMoV2Processor(QwenVLProcessor):
+    auto_mm_io_worker_num = 4
+    auto_mm_processor_worker_num = 1
+    supports_mm_processor_concurrency = False
     models = (
         "MiMoV2ForConditionalGeneration",
         "MiMoV2FlashForConditionalGeneration",
@@ -231,7 +233,7 @@ class MiMoV2Processor(QwenVLProcessor):
 
         if not sources:
             return output
-        codes = await asyncio.to_thread(lambda: [self._encode_audio(s) for s in sources])
+        codes = await self._run_io_async(lambda: [self._encode_audio(s) for s in sources])
         self._merge_audio(output, codes)
         return output
 

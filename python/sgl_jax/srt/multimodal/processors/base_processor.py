@@ -2,6 +2,7 @@ import asyncio
 import base64
 import concurrent.futures
 import io
+import logging
 import os
 from abc import ABC, abstractmethod
 from urllib.parse import unquote, urlparse
@@ -11,20 +12,14 @@ import requests
 from PIL import Image
 
 from sgl_jax.srt.multimodal.common.modality_enum import MultimodalInputs
+from sgl_jax.srt.multimodal.processors.executor import MultimodalProcessorExecutor
+
+logger = logging.getLogger(__name__)
 
 # Safety limits for fetching remote multimodal payloads. These are intentionally
 # conservative and should become configurable via ServerArgs.
 DEFAULT_HTTP_TIMEOUT_SECS = 30
 MAX_REMOTE_BYTES = 64 * 1024 * 1024  # 64 MiB hard cap per asset
-
-IMAGE_IO_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=8,
-    thread_name_prefix="image-data-executor",
-)
-HF_PROCESSOR_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=4,
-    thread_name_prefix="hf-mm-processor",
-)
 
 
 def _fetch_url(url: str) -> bytes:
@@ -69,11 +64,53 @@ def _normalize_image_source(source) -> bytes | str:
 
 class BaseMultimodalProcessor(ABC):
     models: tuple[str, ...] = ()
+    auto_mm_io_worker_num = 4
+    auto_mm_processor_worker_num = 1
+    supports_mm_processor_concurrency = False
 
     def __init__(self, hf_config, server_args, processor):
         self.hf_config = hf_config
         self.server_args = server_args
         self.processor = processor
+        self._shutdown = False
+
+        requested_io_workers = getattr(server_args, "mm_io_worker_num", 0)
+        env_io_workers = os.environ.get("SGLANG_IO_WORKERS")
+        self.mm_io_worker_num = (
+            requested_io_workers
+            or (int(env_io_workers) if env_io_workers is not None else 0)
+            or self.auto_mm_io_worker_num
+        )
+        if self.mm_io_worker_num <= 0:
+            raise ValueError("Multimodal I/O worker count must be positive.")
+        self.io_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.mm_io_worker_num,
+            thread_name_prefix="sgl-jax-mm-io",
+        )
+
+        self.mm_processor_worker_num = (
+            getattr(server_args, "mm_processor_worker_num", 0) or self.auto_mm_processor_worker_num
+        )
+        if self.mm_processor_worker_num <= 0:
+            raise ValueError("Multimodal processor worker count must be positive.")
+        if self.mm_processor_worker_num > 1 and not self.supports_mm_processor_concurrency:
+            logger.warning(
+                "%s does not support concurrent multimodal processing; using one worker.",
+                type(self).__name__,
+            )
+            self.mm_processor_worker_num = 1
+        try:
+            self.mm_processor_executor = MultimodalProcessorExecutor(
+                processor, self.mm_processor_worker_num
+            )
+        except Exception:
+            logger.warning(
+                "Unable to clone %s processor; using one worker.",
+                type(self).__name__,
+                exc_info=True,
+            )
+            self.mm_processor_worker_num = 1
+            self.mm_processor_executor = MultimodalProcessorExecutor(processor, 1)
 
     def apply_chat_template(self, *args, **kwargs):
         return self.processor.apply_chat_template(*args, **kwargs)
@@ -116,10 +153,12 @@ class BaseMultimodalProcessor(ABC):
             return Image.open(io.BytesIO(payload)).convert("RGB")
         return Image.open(payload).convert("RGB")
 
-    @classmethod
-    async def load_image_async(cls, source) -> Image.Image:
-        future = IMAGE_IO_EXECUTOR.submit(cls.load_image, source)
-        return await asyncio.wrap_future(future)
+    async def _run_io_async(self, function, *args):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self.io_executor, function, *args)
+
+    async def load_image_async(self, source) -> Image.Image:
+        return await self._run_io_async(self.load_image, source)
 
     async def _run_hf_processor_async(
         self,
@@ -128,17 +167,25 @@ class BaseMultimodalProcessor(ABC):
         videos: list | None,
         processor_kwargs: dict,
     ):
-        def run_hf_processor():
+        images = await asyncio.gather(*(self.load_image_async(source) for source in image_sources))
+
+        def run_hf_processor(*, processor):
             kwargs = {
                 "text": [input_text],
-                "images": [self.load_image(source) for source in image_sources] or None,
+                "images": images or None,
                 "padding": True,
                 "return_tensors": "pt",
                 **processor_kwargs,
             }
             if videos is not None:
                 kwargs["videos"] = videos or None
-            return self.processor(**kwargs)
+            return processor(**kwargs)
 
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(HF_PROCESSOR_EXECUTOR, run_hf_processor)
+        return await self.mm_processor_executor.run(run_hf_processor)
+
+    def shutdown(self) -> None:
+        if self._shutdown:
+            return
+        self._shutdown = True
+        self.io_executor.shutdown(wait=False, cancel_futures=True)
+        self.mm_processor_executor.shutdown()
