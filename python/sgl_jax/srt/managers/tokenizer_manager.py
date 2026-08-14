@@ -200,6 +200,7 @@ class TokenizerManager:
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
+                    use_fast=True,
                 )
                 self.mm_processor = mm_processor_cls(
                     self.model_config.hf_config, server_args, self.processor

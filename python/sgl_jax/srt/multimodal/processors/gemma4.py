@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
-
 import numpy as np
 
 from sgl_jax.srt.multimodal.common.modality_enum import (
@@ -56,12 +54,12 @@ class Gemma4Processor(BaseMultimodalProcessor):
         if self.normalize_data(getattr(request_obj, "audio_data", None)):
             raise ValueError("Gemma 4 audio inputs are not supported yet.")
 
-        images = await self._load_images(image_data)
-        processor_output = self.processor(
-            text=[input_text],
-            images=images or None,
-            padding=True,
-            return_tensors="pt",
+        image_sources = self.normalize_data(image_data)
+        processor_output = await self._run_hf_processor_async(
+            input_text,
+            image_sources,
+            None,
+            {},
         )
         input_ids_array = self._to_numpy(processor_output.get("input_ids"))
         if input_ids_array is None:
@@ -74,7 +72,8 @@ class Gemma4Processor(BaseMultimodalProcessor):
             # vLLM's Gemma 4 input contract uses this compatibility name.
             pixel_position_ids = self._to_numpy(processor_output.get("pixel_position_ids"))
         image_token_id = int(self.hf_config.image_token_id)
-        if not images:
+        image_count = len(image_sources)
+        if not image_count:
             return MultimodalInputs(mm_items=[], input_ids=input_ids)
         if pixel_values is None or pixel_position_ids is None:
             raise ValueError("Gemma 4 processor must return pixel_values and image_position_ids.")
@@ -82,18 +81,18 @@ class Gemma4Processor(BaseMultimodalProcessor):
             pixel_values = pixel_values[None]
         if pixel_position_ids.ndim == 2:
             pixel_position_ids = pixel_position_ids[None]
-        if pixel_values.shape[0] != len(images) or pixel_position_ids.shape[0] != len(images):
+        if pixel_values.shape[0] != image_count or pixel_position_ids.shape[0] != image_count:
             raise ValueError(
                 "Gemma 4 processor image batch does not match the request: "
-                f"{pixel_values.shape[0]}, {pixel_position_ids.shape[0]} != {len(images)}"
+                f"{pixel_values.shape[0]}, {pixel_position_ids.shape[0]} != {image_count}"
             )
 
         pooling_unit = int(self.hf_config.vision_config.pooling_kernel_size) ** 2
         placeholder_runs = self._placeholder_runs(input_ids, image_token_id)
-        if len(placeholder_runs) != len(images):
+        if len(placeholder_runs) != image_count:
             raise ValueError(
                 "Gemma 4 image placeholder count does not match image count: "
-                f"{len(placeholder_runs)} != {len(images)}"
+                f"{len(placeholder_runs)} != {image_count}"
             )
 
         items = []
@@ -137,9 +136,4 @@ class Gemma4Processor(BaseMultimodalProcessor):
             im_start_id=getattr(self.hf_config, "boi_token_id", None),
             im_end_id=getattr(self.hf_config, "eoi_token_id", None),
             im_token_id=image_token_id,
-        )
-
-    async def _load_images(self, image_data):
-        return await asyncio.gather(
-            *(self.load_image_async(item) for item in self.normalize_data(image_data))
         )

@@ -238,7 +238,7 @@ class MiMoV2Processor(QwenVLProcessor):
     # -- vision -----------------------------------------------------------
 
     async def _process_vision(self, image_data, input_text, request_obj) -> MultimodalInputs:
-        images = await self._load_images_async(image_data)
+        image_sources = self.normalize_data(image_data)
         video_data = self.normalize_data(getattr(request_obj, "video_data", None))
         video_config = self._build_video_config(request_obj)
         videos = await self._load_videos_async(video_data, video_config)
@@ -251,13 +251,11 @@ class MiMoV2Processor(QwenVLProcessor):
                 "fps": video_config.get("fps", FPS),
             }
 
-        processor_output = self.processor(
-            text=[input_text],
-            images=images or None,
-            videos=videos or None,
-            padding=True,
-            return_tensors="pt",
-            **processor_kwargs,
+        processor_output = await self._run_hf_processor_async(
+            input_text,
+            image_sources,
+            videos,
+            processor_kwargs,
         )
 
         input_ids_array = self._to_numpy(processor_output.get("input_ids"))

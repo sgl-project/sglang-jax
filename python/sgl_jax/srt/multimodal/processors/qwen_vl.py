@@ -260,7 +260,7 @@ class QwenVLProcessor(BaseMultimodalProcessor):
                 "Please provide text input instead."
             )
 
-        images = await self._load_images_async(image_data)
+        image_sources = self.normalize_data(image_data)
         video_data = self.normalize_data(getattr(request_obj, "video_data", None))
         video_config = self._build_video_config(request_obj)
         videos = await self._load_videos_async(video_data, video_config)
@@ -274,13 +274,11 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         if uses_qwen3vl_processor:
             processor_kwargs["return_mm_token_type_ids"] = True
 
-        processor_output = self.processor(
-            text=[input_text],
-            images=images or None,
-            videos=videos or None,
-            padding=True,
-            return_tensors="pt",
-            **processor_kwargs,
+        processor_output = await self._run_hf_processor_async(
+            input_text,
+            image_sources,
+            videos,
+            processor_kwargs,
         )
 
         input_ids_array = self._to_numpy(processor_output.get("input_ids"))
@@ -292,11 +290,11 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         image_grid_thw = self._to_grid_list(processor_output.get("image_grid_thw"))
         video_grid_thw = self._to_grid_list(processor_output.get("video_grid_thw"))
         mm_token_type_ids = self._to_numpy(processor_output.get("mm_token_type_ids"))
-        if images or videos:
+        if image_sources or videos:
             logger.info(
                 "Qwen-VL processor output: images=%s, videos=%s, image_grid_thw=%s, "
                 "video_grid_thw=%s, pixel_values_shape=%s, pixel_values_videos_shape=%s",
-                len(images),
+                len(image_sources),
                 len(videos),
                 image_grid_thw,
                 video_grid_thw,
@@ -437,11 +435,6 @@ class QwenVLProcessor(BaseMultimodalProcessor):
             raise ValueError("Video timing count does not match video inputs.")
         for item, seconds in zip(items, second_per_grid_ts, strict=True):
             item.set("second_per_grid_ts", seconds)
-
-    async def _load_images_async(self, image_data):
-        return await asyncio.gather(
-            *(self.load_image_async(item) for item in self.normalize_data(image_data))
-        )
 
     @staticmethod
     def _compute_image_placeholder_ranges(input_ids, grids, image_token_id, spatial_merge_size):

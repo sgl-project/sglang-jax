@@ -35,10 +35,6 @@ def _positions_with_padding():
     return np.concatenate((positions, np.full((3, 2), -1, dtype=np.int32)))
 
 
-async def _one_image(_):
-    return [object()]
-
-
 def test_gemma4_processor_builds_dynamic_image_item(monkeypatch):
     position_ids = _positions_with_padding()
     hf_processor = _FakeProcessor(
@@ -49,7 +45,7 @@ def test_gemma4_processor_builds_dynamic_image_item(monkeypatch):
         }
     )
     processor = Gemma4Processor(_config(), SimpleNamespace(), hf_processor)
-    monkeypatch.setattr(processor, "_load_images", _one_image)
+    monkeypatch.setattr(processor, "load_image", lambda _: object())
     request = SimpleNamespace(video_data=None, audio_data=None)
 
     result = asyncio.run(
@@ -83,7 +79,7 @@ def test_gemma4_processor_accepts_vllm_position_name(monkeypatch):
         }
     )
     processor = Gemma4Processor(_config(), SimpleNamespace(), hf_processor)
-    monkeypatch.setattr(processor, "_load_images", _one_image)
+    monkeypatch.setattr(processor, "load_image", lambda _: object())
 
     result = asyncio.run(
         processor.process_mm_data_async(
