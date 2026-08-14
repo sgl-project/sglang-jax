@@ -15,9 +15,15 @@ from sgl_jax.srt.kernels.dsa.ref import build_index_share_map
 from sgl_jax.srt.kernels.fused_mlp import apply_fused_mlp_with_padding
 from sgl_jax.srt.layers.attention.dsa_indexer_ops import (
     DSAIndexerOutput,
+    project_index_keys_update_cache_and_select,
     update_index_cache_and_select,
 )
-from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
+from sgl_jax.srt.layers.embeddings import (
+    Embed,
+    ParallelLMHead,
+    RotaryEmbedding,
+    apply_rotary_emb,
+)
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -222,6 +228,7 @@ class GlmDsaIndexer(nnx.Module):
         cache_slot: int,
         mesh: jax.sharding.Mesh,
         topk_impl: str = "exact_lax",
+        output_physical_slots: bool = False,
         attention_data_partition_axis: str = "data",
         dtype: jnp.dtype = jnp.bfloat16,
         scope_name: str = "indexer",
@@ -232,6 +239,7 @@ class GlmDsaIndexer(nnx.Module):
         self.cache_slot = cache_slot
         self.mesh = mesh
         self.topk_impl = topk_impl
+        self.output_physical_slots = output_physical_slots
         self.attention_data_partition_axis = attention_data_partition_axis
         if topk_impl not in ("approx", "exact_lax", "radix"):
             raise ValueError(f"unknown DSA top-k implementation: {topk_impl}")
@@ -297,6 +305,38 @@ class GlmDsaIndexer(nnx.Module):
         weights, _ = self.weights_proj(hidden_states)
         return query, key, weights
 
+    @named_scope("Projection")
+    def _project_query_and_weights(
+        self,
+        hidden_states: jax.Array,
+        qr: jax.Array,
+        positions: jax.Array,
+        rotary_emb: Any,
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+        """Run the unchanged native Q/Weight projection for fused-K Extend."""
+
+        query, _ = self.wq_b(qr)
+        query = query.reshape(-1, self.n_head, self.head_dim)
+
+        rope_cos, rope_sin = rotary_emb._compute_cos_sin(positions.flatten())
+        rope_cos = rope_cos.astype(rotary_emb.dtype)
+        rope_sin = rope_sin.astype(rotary_emb.dtype)
+        rope_dim = 64
+        q_rope = apply_rotary_emb(
+            query[:, :, :rope_dim],
+            rope_cos,
+            rope_sin,
+            rotary_emb.is_neox_style,
+        )
+        query = query.at[:, :, :rope_dim].set(q_rope)
+
+        with jax.named_scope("Hadamard"):
+            hadamard = get_hadamard_matrix(128) * (128**-0.5)
+            query = jnp.einsum("thd,de->the", query, hadamard)
+
+        weights, _ = self.weights_proj(hidden_states)
+        return query, weights, rope_cos, rope_sin, hadamard
+
     @named_scope("DSAIndexer")
     def __call__(
         self,
@@ -316,13 +356,6 @@ class GlmDsaIndexer(nnx.Module):
         module.
         """
 
-        q_idx, k_idx, idx_weights = self._project(
-            hidden_states,
-            q_compressed,
-            positions,
-            rotary_emb,
-        )
-
         attention_backend = forward_batch.attn_backend
         metadata_owner = getattr(attention_backend, "full_attn_backend", attention_backend)
         metadata = getattr(metadata_owner, "forward_metadata", None)
@@ -330,6 +363,44 @@ class GlmDsaIndexer(nnx.Module):
             raise ValueError("DSA Indexer requires initialized MLA forward metadata")
 
         index_cache = token_to_kv_pool.get_indexer_key_buffer(self.cache_slot)
+        one_token_per_seq = forward_batch.forward_mode.is_decode()
+        if not one_token_per_seq and hasattr(self.wk, "weight"):
+            q_idx, idx_weights, rope_cos, rope_sin, hadamard = self._project_query_and_weights(
+                hidden_states,
+                q_compressed,
+                positions,
+                rotary_emb,
+            )
+            return project_index_keys_update_cache_and_select(
+                q_idx,
+                hidden_states,
+                self.wk.weight.value,
+                self.k_norm.weight.value,
+                self.k_norm.bias.value,
+                rope_cos,
+                rope_sin,
+                hadamard,
+                idx_weights,
+                index_cache,
+                metadata,
+                index_topk=self.index_topk,
+                compute_topk=compute_topk,
+                topk_impl=self.topk_impl,
+                output_physical_slots=self.output_physical_slots,
+                attention_data_partition_axis=self.attention_data_partition_axis,
+            )
+
+        # Static FP8 checkpoints replace ``wk`` with QuantizedLinear, whose
+        # weight_q/weight_scale representation is not accepted by the BF16
+        # fused projection-scatter kernel.  Keep the established projection
+        # and cache-write path for that representation; selection still uses
+        # the configured score -> pure Top-K -> physical mapping pipeline.
+        q_idx, k_idx, idx_weights = self._project(
+            hidden_states,
+            q_compressed,
+            positions,
+            rotary_emb,
+        )
         return update_index_cache_and_select(
             q_idx,
             k_idx,
@@ -339,7 +410,8 @@ class GlmDsaIndexer(nnx.Module):
             index_topk=self.index_topk,
             compute_topk=compute_topk,
             topk_impl=self.topk_impl,
-            one_token_per_seq=forward_batch.forward_mode.is_decode(),
+            one_token_per_seq=one_token_per_seq,
+            output_physical_slots=self.output_physical_slots,
             attention_data_partition_axis=self.attention_data_partition_axis,
         )
 
@@ -471,6 +543,7 @@ class Glm5Attention(nnx.Module):
                 cache_slot=index_cache_slot,
                 mesh=mesh,
                 topk_impl=topk_impl,
+                output_physical_slots=sparse_impl == "exact",
                 dtype=dtype,
                 scope_name="indexer",
             )

@@ -40,11 +40,13 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         self,
         *,
         sparse_impl: str = "exact",
+        topk_indices_are_physical: bool = False,
         **mla_kwargs,
     ):
         if sparse_impl not in ("page", "exact"):
             raise ValueError(f"unknown DSA sparse implementation: {sparse_impl}")
         self.sparse_impl = sparse_impl
+        self.topk_indices_are_physical = topk_indices_are_physical
         super().__init__(**mla_kwargs)
 
     def tree_flatten(self):
@@ -52,6 +54,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         aux = {
             **aux,
             "sparse_impl": self.sparse_impl,
+            "topk_indices_are_physical": self.topk_indices_are_physical,
         }
         return children, aux
 
@@ -59,6 +62,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
     def tree_unflatten(cls, aux_data, children):
         obj = cls(
             sparse_impl=aux_data.get("sparse_impl", "exact"),
+            topk_indices_are_physical=aux_data.get("topk_indices_are_physical", False),
             num_attn_heads=aux_data["num_attn_heads"],
             kv_lora_rank=aux_data["kv_lora_rank"],
             qk_nope_head_dim=aux_data["qk_nope_head_dim"],
@@ -163,9 +167,15 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 cukv_,
                 kv_lora_rank=self.kv_lora_rank,
             )
-            physical_slots, selected_counts = _logical_topk_to_physical_slots(
-                topk_, seq_lens_, pi_, cuq_, cukv_, page_size
-            )
+            if self.topk_indices_are_physical:
+                with jax.named_scope("PhysicalTopKValidation"):
+                    valid = (topk_ >= 0) & (topk_ < cache4d.shape[0] * page_size)
+                    physical_slots = jnp.where(valid, topk_, jnp.int32(0))
+                    selected_counts = jnp.sum(valid, axis=1, dtype=jnp.int32)
+            else:
+                physical_slots, selected_counts = _logical_topk_to_physical_slots(
+                    topk_, seq_lens_, pi_, cuq_, cukv_, page_size
+                )
 
             # SparseCore requires bq_sparse*K to be a gather-wave multiple.
             # For C=2 decode, bq_sparse=2 is the smallest valid choice at K=2048.

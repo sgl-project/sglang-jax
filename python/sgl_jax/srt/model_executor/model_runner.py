@@ -704,6 +704,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             cfg = self.model_config.hf_text_config
             full_attn_backend = DSASparseAttentionBackend(
                 sparse_impl=self.server_args.dsa_sparse_impl,
+                topk_indices_are_physical=self.server_args.dsa_sparse_impl == "exact",
                 num_attn_heads=self.num_attn_heads,
                 kv_lora_rank=cfg.kv_lora_rank,
                 qk_nope_head_dim=cfg.qk_nope_head_dim,

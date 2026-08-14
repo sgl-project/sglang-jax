@@ -8,7 +8,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from sgl_jax.srt.kernels.dsa.topk import select_indexer_topk
+from sgl_jax.srt.kernels.dsa.topk import (
+    select_indexer_radix_topk_indices,
+    select_indexer_topk,
+)
 
 
 def test_exact_lax_matches_jax_top_k():
@@ -25,7 +28,7 @@ def test_exact_lax_matches_jax_top_k():
     np.testing.assert_array_equal(np.asarray(actual_indices), np.asarray(expected_indices))
 
 
-def test_radix_dispatch_pads_and_preserves_unordered_exact_set(monkeypatch):
+def test_radix_indices_pad_and_preserve_unordered_exact_set(monkeypatch):
     scores = jax.random.normal(jax.random.key(1), (2, 130), dtype=jnp.float32)
     called = False
 
@@ -51,19 +54,17 @@ def test_radix_dispatch_pads_and_preserves_unordered_exact_set(monkeypatch):
         SimpleNamespace(radix_topk_pallas=fake_radix_topk),
     )
 
-    expected_values, expected_indices = jax.lax.top_k(scores, 5)
-    actual_values, actual_indices = select_indexer_topk(
+    _, expected_indices = jax.lax.top_k(scores, 5)
+    actual_indices = select_indexer_radix_topk_indices(
         scores,
         k=5,
-        implementation="radix",
     )
 
     assert called
-    np.testing.assert_array_equal(np.asarray(actual_values), np.asarray(expected_values)[:, ::-1])
     np.testing.assert_array_equal(np.asarray(actual_indices), np.asarray(expected_indices)[:, ::-1])
 
 
-def test_radix_dispatch_uses_score_size_topk_tuned_config(monkeypatch):
+def test_radix_indices_use_score_size_topk_tuned_config(monkeypatch):
     from sgl_jax.srt.kernels.dsa import topk as dsa_topk
     from sgl_jax.srt.kernels.radix_topk.tuned_configs import RadixTopKConfig
 
@@ -98,15 +99,25 @@ def test_radix_dispatch_uses_score_size_topk_tuned_config(monkeypatch):
         SimpleNamespace(radix_topk_pallas=fake_radix_topk),
     )
 
-    expected_values, expected_indices = jax.lax.top_k(scores, 9)
-    actual_values, actual_indices = select_indexer_topk(
+    _, expected_indices = jax.lax.top_k(scores, 9)
+    actual_indices = select_indexer_radix_topk_indices(
         scores,
         k=9,
-        implementation="radix",
     )
 
-    np.testing.assert_array_equal(np.asarray(actual_values), np.asarray(expected_values))
     np.testing.assert_array_equal(np.asarray(actual_indices), np.asarray(expected_indices))
+
+
+def test_public_radix_topk_rejects_physical_mapping_arguments():
+    from sgl_jax.srt.kernels.radix_topk import radix_topk_pallas
+
+    with pytest.raises(TypeError, match="output_page_table"):
+        radix_topk_pallas(
+            jnp.zeros((2, 4096), jnp.float32),
+            k=128,
+            indices_only=True,
+            output_page_table=jnp.zeros((64,), jnp.int32),
+        )
 
 
 @pytest.mark.parametrize(

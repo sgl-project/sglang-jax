@@ -22,8 +22,12 @@ def _validate_scores(scores: jax.Array, k: int) -> None:
         raise ValueError(f"index_topk must be in [1, {scores.shape[-1]}], got {k}")
 
 
-def select_indexer_radix_topk_indices(scores: jax.Array, *, k: int) -> jax.Array:
-    """Return exact unordered radix top-k positions without selected scores."""
+def select_indexer_radix_topk_indices(
+    scores: jax.Array,
+    *,
+    k: int,
+) -> jax.Array:
+    """Return exact unordered logical radix top-k positions without scores."""
 
     _validate_scores(scores, k)
     from sgl_jax.srt.kernels.radix_topk import radix_topk_pallas
@@ -51,13 +55,13 @@ def select_indexer_topk(
     k: int,
     implementation: str,
 ) -> tuple[jax.Array, jax.Array]:
-    """Return top-k score values and sequence-local token indices.
+    """Return XLA top-k score values and sequence-local token indices.
 
     Score construction and masking belong to the DSA scorer. This adapter only
-    selects candidates and normalizes every implementation to a
-    ``(values, indices)`` ABI consumed by the cache/gather path. Candidate
-    order is intentionally unspecified: DSA consumes the selected positions
-    as a set.
+    selects candidates for the XLA implementations and normalizes them to a
+    ``(values, indices)`` ABI. Radix selection uses the indices-only
+    ``select_indexer_radix_topk_indices`` adapter instead, avoiding a redundant
+    gather of selected score values.
     """
 
     _validate_scores(scores, k)
@@ -73,17 +77,6 @@ def select_indexer_topk(
             aggregate_to_topk=False,
         )
         return _order_candidates(candidate_values, candidate_indices, k=k)
-
-    if implementation == "radix":
-        candidate_indices = select_indexer_radix_topk_indices(scores, k=k)
-        in_bounds = (candidate_indices >= 0) & (candidate_indices < scores.shape[-1])
-        safe_indices = jnp.clip(candidate_indices, 0, scores.shape[-1] - 1)
-        candidate_values = jnp.take_along_axis(scores, safe_indices, axis=-1)
-        candidate_values = jnp.where(in_bounds, candidate_values, _NEG_INF)
-        # Radix selection already returns the exact top-k set. Sorting that
-        # K-sized set again adds an XLA sort but does not change sparse
-        # attention, whose gather is permutation invariant.
-        return candidate_values[..., :k], candidate_indices[..., :k]
 
     raise ValueError(f"unknown DSA top-k implementation: {implementation}")
 

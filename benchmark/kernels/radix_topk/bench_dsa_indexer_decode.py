@@ -24,9 +24,8 @@ from benchmark.kernels.radix_topk.bench_dsa_indexer_topk import (
     _make_inputs,
     _validate_output,
 )
-from sgl_jax.srt.kernels.dsa.indexer import _NEG_INF, _mask_and_compact_topk_indices
+from sgl_jax.srt.kernels.dsa.indexer import _NEG_INF, _select_topk_indices
 from sgl_jax.srt.kernels.dsa.paged_score import paged_decode_scores_pallas
-from sgl_jax.srt.kernels.dsa.topk import select_indexer_topk
 
 
 def _make_gathered_score_run(shape: BenchmarkShape):
@@ -151,12 +150,12 @@ def _make_serial_run(shape: BenchmarkShape, topk_impl: str):
                 scores = jnp.where(kv_pos[None, :] < kv_len, scores, _NEG_INF)
 
             with jax.named_scope("dsa_indexer_decode_serial_topk"):
-                values, indices = select_indexer_topk(
+                indices = _select_topk_indices(
                     scores,
+                    jnp.reshape(kv_len, (1,)),
                     k=shape.topk,
-                    implementation=topk_impl,
+                    topk_impl=topk_impl,
                 )
-                indices = _mask_and_compact_topk_indices(values, indices)
 
             return jax.lax.dynamic_update_slice_in_dim(
                 serial_out,
@@ -196,12 +195,12 @@ def _make_batched_run(
             coalesce_page_dma=coalesce_page_dma,
             interpret=interpret,
         )
-        values, indices = select_indexer_topk(
+        return _select_topk_indices(
             scores,
+            inputs["seq_lens"],
             k=shape.topk,
-            implementation=topk_impl,
+            topk_impl=topk_impl,
         )
-        return _mask_and_compact_topk_indices(values, indices)
 
     return jax.jit(run)
 

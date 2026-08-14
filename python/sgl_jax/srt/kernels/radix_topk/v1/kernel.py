@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Top-K implementation supporting multiple Vector Subcores.
+"""Pure SparseCore radix Top-K implementation.
 
 High-level algorithm:
 The file implements a Top-K selection algorithm targeting Vector Subcores.
@@ -122,6 +122,8 @@ class TopKScratch:
     sem: Ref
     input_sems: Ref
     output_sems: Ref
+    histogram_sem: Ref
+    global_histogram_sem: Ref
     num_to_process: Ref
     num_remaining_global: Ref
     top_k_found: Ref
@@ -287,6 +289,11 @@ def _sc_top_k_impl(
     overlap_digit_histogram_clear = (
         num_seq_windows == 1 and num_cooperating_tiles == mesh.num_subcores
     )
+    # For sufficiently many rows, deriving the next-round global counts from
+    # the already-reduced histogram is cheaper than a second cross-subcore
+    # rendezvous after survivor filtering. Small batches do not amortize the
+    # extra histogram bookkeeping, so retain their original count reduction.
+    derive_global_counts_from_histogram = overlap_digit_histogram_clear and batch_size >= 32
     synthesize_first_pass_indices = not maybe_values and num_seq_windows == 1
 
     carryforward_padding = 0
@@ -301,6 +308,10 @@ def _sc_top_k_impl(
         sem=pltpu.SemaphoreType.DMA,
         input_sems=pltpu.SemaphoreType.DMA((num_pipeline_banks,)),
         output_sems=pltpu.SemaphoreType.DMA((num_pipeline_banks,)),
+        histogram_sem=pltpu.SemaphoreType.DMA,
+        global_histogram_sem=(
+            pltpu.SemaphoreType.DMA if derive_global_counts_from_histogram else None
+        ),
         num_to_process=pltpu.SMEM((1,), jnp.int32),
         num_remaining_global=pltpu.SMEM((1,), jnp.int32),
         top_k_found=pltpu.SMEM((1,), jnp.int32),
@@ -343,7 +354,11 @@ def _sc_top_k_impl(
             output_vmshd_vals_alt=None,
         )
     if not overlap_digit_histogram_clear:
-        scratch_types = dataclasses.replace(scratch_types, shared_zeros_histogram=None)
+        scratch_types = dataclasses.replace(
+            scratch_types,
+            histogram_sem=None,
+            shared_zeros_histogram=None,
+        )
     if num_cooperating_tiles == 1:
         scratch_types = dataclasses.replace(
             scratch_types,
@@ -380,7 +395,11 @@ def _sc_top_k_impl(
         ),
         debug=debug,
     )
-    def _kernel(keys_ref, values_ref, *outputs_and_scratch):
+    def _kernel(
+        keys_ref,
+        values_ref,
+        *outputs_and_scratch,
+    ):
         if indices_only:
             output_keys_ref = None
             output_values_ref, *scratch = outputs_and_scratch
@@ -608,7 +627,7 @@ def _sc_top_k_impl(
                                 pltpu.make_async_copy(
                                     scratch.shared_zeros_histogram,
                                     scratch.histogram,
-                                    scratch.sem,
+                                    scratch.histogram_sem,
                                 ).wait()
 
                         else:
@@ -621,9 +640,22 @@ def _sc_top_k_impl(
                         # On last window, coop leader starts DMA to clear global histogram.
                         @pl.when(is_coop_leader & is_last_coop_window)
                         def start_clearing_global_histogram():
-                            pltpu.async_copy(
-                                scratch.zeros_histogram, scratch.global_histogram, scratch.sem
-                            )
+                            if derive_global_counts_from_histogram:
+
+                                @pl.when(args.digit_num == num_digits - 1)
+                                def clear_first_global_histogram():
+                                    pltpu.make_async_copy(
+                                        scratch.zeros_histogram,
+                                        scratch.global_histogram,
+                                        scratch.global_histogram_sem,
+                                    ).start()
+
+                            else:
+                                pltpu.async_copy(
+                                    scratch.zeros_histogram,
+                                    scratch.global_histogram,
+                                    scratch.sem,
+                                )
 
                     with jax.named_scope("fill_histogram"):
 
@@ -632,7 +664,11 @@ def _sc_top_k_impl(
                             digits = batch_scratch.digits(args.digit_num, digit_width)[
                                 pl.ds(i, vec_dim)
                             ]
-                            counts, mask = plsc.scan_count(digits)
+                            if derive_global_counts_from_histogram and not synthesize_indices:
+                                valid = batch_values[pl.ds(i, vec_dim)] != INVALID_VALUE
+                                counts, mask = plsc.scan_count(digits, mask=valid)
+                            else:
+                                counts, mask = plsc.scan_count(digits)
                             plsc.addupdate_scatter(scratch.histogram, [digits], counts, mask=mask)
 
                     @pl.when(is_last_coop_window)
@@ -640,9 +676,18 @@ def _sc_top_k_impl(
                     def sync_global_histogram():
                         @pl.when(is_coop_leader)
                         def wait_clearing_global_histogram():
-                            pltpu.make_async_copy(
-                                scratch.zeros_histogram, scratch.global_histogram, scratch.sem
-                            ).wait()
+                            if derive_global_counts_from_histogram:
+                                pltpu.make_async_copy(
+                                    scratch.zeros_histogram,
+                                    scratch.global_histogram,
+                                    scratch.global_histogram_sem,
+                                ).wait()
+                            else:
+                                pltpu.make_async_copy(
+                                    scratch.zeros_histogram,
+                                    scratch.global_histogram,
+                                    scratch.sem,
+                                ).wait()
 
                         plsc.subcore_barrier()
                         pltpu.sync_copy(
@@ -655,24 +700,90 @@ def _sc_top_k_impl(
 
                     with jax.named_scope("find_target_digit"):
                         n_minus_k = args.num_remaining_global - (k - args.num_global_outputs)
-                        init = [jnp.zeros(vec_dim, jnp.int32)] * 2
-
-                        @plsc.parallel_loop(0, histogram_size, vec_dim, carry=init)
-                        def find_target_digit(i, carry):
-                            [num_less, inclusive_sums] = carry
-                            histogram_chunk = scratch.histogram[pl.ds(i, vec_dim)]
-                            chunk_cumsum = jnp.cumsum(histogram_chunk)
-                            digits_below_n_minus_k_this_chunk = plsc.all_reduce_ffs(
-                                (chunk_cumsum + inclusive_sums) >= n_minus_k
+                        if derive_global_counts_from_histogram:
+                            init = (
+                                jnp.zeros(vec_dim, jnp.int32),
+                                jnp.zeros(vec_dim, jnp.int32),
+                                jnp.zeros(vec_dim, jnp.int32),
+                                jnp.zeros(vec_dim, jnp.int32),
+                                jnp.zeros(vec_dim, jnp.bool_),
                             )
-                            return [
-                                num_less + digits_below_n_minus_k_this_chunk,
-                                inclusive_sums + chunk_cumsum[vec_dim - 1],
-                            ]
 
-                        [target_digit, _] = (
-                            find_target_digit  # pylint: disable=unpacking-non-sequence
-                        )
+                            @plsc.parallel_loop(0, histogram_size, vec_dim, carry=init)
+                            def find_target_digit_and_counts(i, carry):
+                                (
+                                    target_digit,
+                                    inclusive_sums,
+                                    target_bucket_count,
+                                    count_through_target,
+                                    target_found,
+                                ) = carry
+                                histogram_chunk = scratch.histogram[pl.ds(i, vec_dim)]
+                                chunk_cumsum = jnp.cumsum(histogram_chunk)
+                                target_offset = plsc.all_reduce_ffs(
+                                    (chunk_cumsum + inclusive_sums) >= n_minus_k
+                                )
+                                found_here = (~target_found) & (target_offset < vec_dim)
+                                lanes = jnp.arange(vec_dim)
+                                bucket_count_here = jnp.cumsum(
+                                    jnp.where(lanes == target_offset, histogram_chunk, 0)
+                                )[-1]
+                                count_through_here = (
+                                    inclusive_sums
+                                    + jnp.cumsum(
+                                        jnp.where(lanes <= target_offset, histogram_chunk, 0)
+                                    )[-1]
+                                )
+                                return (
+                                    jnp.where(
+                                        target_found,
+                                        target_digit,
+                                        target_digit + target_offset,
+                                    ),
+                                    inclusive_sums + chunk_cumsum[vec_dim - 1],
+                                    jnp.where(
+                                        found_here,
+                                        bucket_count_here,
+                                        target_bucket_count,
+                                    ),
+                                    jnp.where(
+                                        found_here,
+                                        count_through_here,
+                                        count_through_target,
+                                    ),
+                                    target_found | found_here,
+                                )
+
+                            (
+                                target_digit,
+                                _,
+                                target_bucket_count,
+                                count_through_target,
+                                _,
+                            ) = find_target_digit_and_counts
+                            next_num_remaining_global = target_bucket_count[0]
+                            next_num_global_outputs = (
+                                args.num_global_outputs
+                                + args.num_remaining_global
+                                - count_through_target[0]
+                            )
+                        else:
+                            init = [jnp.zeros(vec_dim, jnp.int32)] * 2
+
+                            @plsc.parallel_loop(0, histogram_size, vec_dim, carry=init)
+                            def find_target_digit(i, carry):
+                                [num_less, inclusive_sums] = carry
+                                histogram_chunk = scratch.histogram[pl.ds(i, vec_dim)]
+                                chunk_cumsum = jnp.cumsum(histogram_chunk)
+                                digits_below_n_minus_k_this_chunk = plsc.all_reduce_ffs(
+                                    (chunk_cumsum + inclusive_sums) >= n_minus_k
+                                )
+                                return [
+                                    num_less + digits_below_n_minus_k_this_chunk,
+                                    inclusive_sums + chunk_cumsum[vec_dim - 1],
+                                ]
+
+                            [target_digit, _] = find_target_digit  # pylint: disable=unpacking-non-sequence
                         # target_digit is the largest digit such that all entries with digit
                         # smaller can be safely discarded. The vector is a splat.
 
@@ -685,8 +796,18 @@ def _sc_top_k_impl(
                             pltpu.make_async_copy(
                                 scratch.shared_zeros_histogram,
                                 scratch.histogram,
-                                scratch.sem,
+                                scratch.histogram_sem,
                             ).start()
+
+                            if derive_global_counts_from_histogram:
+
+                                @pl.when(is_coop_leader & is_last_coop_window)
+                                def start_clearing_next_global_histogram():
+                                    pltpu.make_async_copy(
+                                        scratch.zeros_histogram,
+                                        scratch.global_histogram,
+                                        scratch.global_histogram_sem,
+                                    ).start()
 
                     with jax.named_scope("filter_top_k_elements"):
                         # Entries with digit > target_digit are surely in the output
@@ -735,9 +856,7 @@ def _sc_top_k_impl(
                                 num_local_outputs + all_reduce_popcount(is_top_k)[0],
                             )
 
-                        num_survivors, num_local_outputs = (
-                            filter_top_k_elements  # pylint: disable=unpacking-non-sequence
-                        )
+                        num_survivors, num_local_outputs = filter_top_k_elements  # pylint: disable=unpacking-non-sequence
 
                     # Pad the last chunk of survivors with 0, INVALID_VALUE.
                     num_unaligned = num_survivors % vec_dim
@@ -752,17 +871,21 @@ def _sc_top_k_impl(
                     # Give the next iter chunk-aligned num_remaining.
                     pad_amount = (vec_dim - num_unaligned) % vec_dim
                     num_remaining = num_survivors + pad_amount
-                    # Sync across subcores on last window (if cooperating).
-                    num_remaining_global, num_global_outputs = jax.lax.cond(
-                        is_last_coop_window,
-                        lambda: sum_across_subcores(
-                            [
-                                (scratch.num_remaining_global, num_remaining),
-                                (scratch.top_k_found_global, num_local_outputs),
-                            ]
-                        ),
-                        lambda: [num_remaining, num_local_outputs],
-                    )
+                    if derive_global_counts_from_histogram:
+                        num_remaining_global = next_num_remaining_global
+                        num_global_outputs = next_num_global_outputs
+                    else:
+                        # Sync across subcores on last window (if cooperating).
+                        num_remaining_global, num_global_outputs = jax.lax.cond(
+                            is_last_coop_window,
+                            lambda: sum_across_subcores(
+                                [
+                                    (scratch.num_remaining_global, num_remaining),
+                                    (scratch.top_k_found_global, num_local_outputs),
+                                ]
+                            ),
+                            lambda: [num_remaining, num_local_outputs],
+                        )
 
                     return dataclasses.replace(
                         args,
@@ -790,8 +913,20 @@ def _sc_top_k_impl(
                         pltpu.make_async_copy(
                             scratch.shared_zeros_histogram,
                             scratch.histogram,
-                            scratch.sem,
+                            scratch.histogram_sem,
                         ).wait()
+
+                        if derive_global_counts_from_histogram:
+
+                            @pl.when(is_coop_leader & is_last_coop_window)
+                            def drain_global_histogram_clear():
+                                pltpu.make_async_copy(
+                                    scratch.zeros_histogram,
+                                    scratch.global_histogram,
+                                    scratch.global_histogram_sem,
+                                ).wait()
+
+                            plsc.subcore_barrier()
 
                 num_local_outputs = digit_loop_result.num_local_outputs
                 num_global_outputs = digit_loop_result.num_global_outputs
@@ -830,9 +965,7 @@ def _sc_top_k_impl(
                                 mask = jnp.arange(vec_dim) < num_unaligned
                                 if not indices_only:
                                     plsc.store_compressed(
-                                        scratch.topk_keys.at[
-                                            pl.ds(offset + num_aligned, vec_dim)
-                                        ],
+                                        scratch.topk_keys.at[pl.ds(offset + num_aligned, vec_dim)],
                                         jnp.where(is_valid, keys_chunk, 0),
                                         mask=mask,
                                     )
@@ -1085,9 +1218,7 @@ def _sc_top_k_impl(
             last_output_vmshd_keys = None
             if not indices_only:
                 last_output_vmshd_keys = (
-                    scratch.output_vmshd_keys
-                    if last_bank == 0
-                    else scratch.output_vmshd_keys_alt
+                    scratch.output_vmshd_keys if last_bank == 0 else scratch.output_vmshd_keys_alt
                 )
             last_output_vmshd_vals = (
                 scratch.output_vmshd_vals if last_bank == 0 else scratch.output_vmshd_vals_alt
@@ -1098,9 +1229,7 @@ def _sc_top_k_impl(
                 last_batch_idx = (
                     batch_index_begin + last_iteration * batch_elements_executing_in_parallel
                 )
-                last_batch_indices = jnp.unravel_index(
-                    last_batch_idx, output_values_ref.shape[:-1]
-                )
+                last_batch_indices = jnp.unravel_index(last_batch_idx, output_values_ref.shape[:-1])
                 if not indices_only:
                     pltpu.make_async_copy(
                         last_output_vmshd_keys.at[:aligned_k],
@@ -1152,7 +1281,10 @@ def _sc_top_k_impl(
 
             plsc.subcore_barrier()
 
-    outputs = _kernel(keys, *(maybe_values if maybe_values else [None]))
+    outputs = _kernel(
+        keys,
+        *(maybe_values if maybe_values else [None]),
+    )
     if indices_only:
         return (outputs[..., :k],)
     return tuple(jax.tree.map(lambda t: t[..., :k], outputs))
@@ -1168,9 +1300,15 @@ def _impl(*_, **__):
 
 
 @sc_top_k_p.def_abstract_eval
-def _sc_top_k_abstract_eval(keys, *maybe_values, k, indices_only, **_):
-    if maybe_values:
-        (values,) = maybe_values
+def _sc_top_k_abstract_eval(
+    keys,
+    *operands,
+    k,
+    indices_only,
+    **_,
+):
+    if operands:
+        (values,) = operands
         if values.dtype != jnp.int32 or values.shape != keys.shape:
             raise ValueError(
                 f"`values` has dtype {values.dtype} and shape {values.shape}, but "
@@ -1279,3 +1417,6 @@ def radix_topk_pallas(
         debug=debug,
     )
     return results[0] if indices_only else tuple(results)
+
+
+__all__ = ["radix_topk_pallas"]

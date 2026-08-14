@@ -8,9 +8,7 @@ import pytest
 from sgl_jax.srt.kernels.radix_topk import radix_topk_pallas
 
 
-@pytest.mark.skipif(
-    jax.devices()[0].platform != "tpu", reason="SparseCore requires TPU"
-)
+@pytest.mark.skipif(jax.devices()[0].platform != "tpu", reason="SparseCore requires TPU")
 @pytest.mark.parametrize("width", [4096, 8192])
 def test_radix_topk_matches_lax_membership(width):
     scores = jax.random.normal(jax.random.key(width), (2, width), dtype=jnp.float32)
@@ -26,14 +24,13 @@ def test_radix_topk_matches_lax_membership(width):
     )
 
 
-@pytest.mark.skipif(
-    jax.devices()[0].platform != "tpu", reason="SparseCore requires TPU"
-)
+@pytest.mark.skipif(jax.devices()[0].platform != "tpu", reason="SparseCore requires TPU")
 @pytest.mark.parametrize(
     ("batch_size", "width", "k"),
     [
         (4, 8192, 128),
         (14, 135168, 2048),
+        (32, 131072, 2048),
     ],
 )
 def test_radix_topk_pipelined_batch_rows_match_lax_membership(batch_size, width, k):
@@ -72,10 +69,8 @@ def test_radix_topk_pipelined_batch_rows_match_lax_membership(batch_size, width,
     )
 
 
-@pytest.mark.skipif(
-    jax.devices()[0].platform != "tpu", reason="SparseCore requires TPU"
-)
-@pytest.mark.parametrize("batch_size", [2, 4])
+@pytest.mark.skipif(jax.devices()[0].platform != "tpu", reason="SparseCore requires TPU")
+@pytest.mark.parametrize("batch_size", [2, 4, 32])
 def test_radix_topk_overlapped_histogram_clear_drains_on_early_exit(batch_size):
     """The async histogram clear must finish when the first digit finds all K."""
 
@@ -85,9 +80,7 @@ def test_radix_topk_overlapped_histogram_clear_drains_on_early_exit(batch_size):
 
     actual_values, actual_indices = radix_topk_pallas(scores, k=k)
 
-    np.testing.assert_array_equal(
-        np.asarray(actual_values), np.full((batch_size, k), 1000.0)
-    )
+    np.testing.assert_array_equal(np.asarray(actual_values), np.full((batch_size, k), 1000.0))
     np.testing.assert_array_equal(
         np.sort(np.asarray(actual_indices), axis=-1),
         np.broadcast_to(np.arange(k), (batch_size, k)),
