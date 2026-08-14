@@ -99,13 +99,14 @@ class EmbeddingPool:
         return self._pages
 
     def _zeros(self, shape: tuple[int, ...], dtype: jnp.dtype) -> jax.Array:
-        array = jnp.zeros(shape, dtype=dtype)
         if self.mesh is None:
-            return array
-        return jax.device_put(
-            array,
-            NamedSharding(self.mesh, PartitionSpec(*([None] * len(shape)))),
+            return jnp.zeros(shape, dtype=dtype)
+        sharding = NamedSharding(
+            self.mesh,
+            PartitionSpec(*([None] * len(shape))),
         )
+        with jax.set_mesh(self.mesh):
+            return jnp.zeros(shape, dtype=dtype, out_sharding=sharding)
 
     def _replicate(self, value: ArrayLike) -> jax.Array:
         if self.mesh is None:
