@@ -21,6 +21,10 @@ IMAGE_IO_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=8,
     thread_name_prefix="image-data-executor",
 )
+HF_PROCESSOR_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4,
+    thread_name_prefix="hf-mm-processor",
+)
 
 
 def _fetch_url(url: str) -> bytes:
@@ -116,3 +120,25 @@ class BaseMultimodalProcessor(ABC):
     async def load_image_async(cls, source) -> Image.Image:
         future = IMAGE_IO_EXECUTOR.submit(cls.load_image, source)
         return await asyncio.wrap_future(future)
+
+    async def _run_hf_processor_async(
+        self,
+        input_text: str,
+        image_sources: list,
+        videos: list | None,
+        processor_kwargs: dict,
+    ):
+        def run_hf_processor():
+            kwargs = {
+                "text": [input_text],
+                "images": [self.load_image(source) for source in image_sources] or None,
+                "padding": True,
+                "return_tensors": "pt",
+                **processor_kwargs,
+            }
+            if videos is not None:
+                kwargs["videos"] = videos or None
+            return self.processor(**kwargs)
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(HF_PROCESSOR_EXECUTOR, run_hf_processor)
