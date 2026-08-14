@@ -4,13 +4,11 @@ import itertools
 import logging
 import time
 from collections.abc import Callable
-from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 import numpy as np
 from tqdm import tqdm
 
-from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
 from sgl_jax.srt.utils.common_utils import (
     PRECOMPILE_DEFAULT_BS_PADDINGS,
     PRECOMPILE_DEFAULT_TOKEN_PADDINGS,
@@ -130,138 +128,6 @@ class CompilationManager:
             for bs in self.bs_buckets
         ]
 
-    def _extend_variant_names(self) -> tuple[str, ...]:
-        variants = ["text"]
-        if self.precompile_in_model_multimodal:
-            variants.append("multimodal")
-        return tuple(variants)
-
-    @staticmethod
-    def _populate_dummy_multimodal_inputs(batch, model_runner: ModelRunner) -> None:
-        """Populate the array leaves produced by the runtime vision merge.
-
-        The values are irrelevant for compilation. Shapes, dtypes, and shardings
-        are established by ``ForwardBatch.init_new`` to match real VLM EXTEND
-        batches.
-        """
-        hidden_size = model_runner.model_config.hidden_size
-        num_tokens = len(batch.input_ids)
-        dtype = np.dtype(model_runner.model_config.dtype)
-        batch.input_embedding = np.zeros((num_tokens, hidden_size), dtype=dtype)
-
-        deepstack_layers = getattr(model_runner.model, "deepstack_visual_layers", 0)
-        if isinstance(deepstack_layers, int) and deepstack_layers > 0:
-            batch.deepstack_visual_embedding = np.zeros(
-                (deepstack_layers, num_tokens, hidden_size),
-                dtype=dtype,
-            )
-            # Real Qwen3-VL requests carry True. Keeping the dummy identical also
-            # exercises the DeepStack addition branch while adding only zeros.
-            batch.apply_for_deepstack = True
-
-    @staticmethod
-    def _packed_multimodal_capacities(model_runner: ModelRunner) -> tuple[int, ...]:
-        getter = getattr(model_runner.model, "get_multimodal_embedding_packed_capacities", None)
-        if not callable(getter):
-            return ()
-
-        capacities = tuple(int(x) for x in getter())
-        if any(c <= 0 for c in capacities):
-            raise ValueError(f"invalid multimodal packed capacities: {capacities}")
-        return capacities
-
-    @staticmethod
-    def _embedding_pool(model_runner: ModelRunner):
-        from sgl_jax.srt.multimodal.in_model.embedding_pool import EmbeddingPool
-
-        pool = getattr(model_runner, "embedding_pool", None)
-        return pool if isinstance(pool, EmbeddingPool) else None
-
-    @staticmethod
-    def _warm_multimodal_merge(
-        forward_batch,
-        input_embedding: Callable,
-        packed_capacities: tuple[int, ...] = (),
-        embedding_pool=None,
-        mesh=None,
-    ) -> None:
-        import jax
-        import jax.numpy as jnp
-        from jax.sharding import NamedSharding, PartitionSpec
-
-        from sgl_jax.srt.multimodal.in_model.embedding_pool import EmbeddingPoolEntry
-        from sgl_jax.srt.multimodal.in_model.host_orchestration import (
-            ItemTask,
-            _gather_from_pool,
-            _gather_merge,
-            _MergeMapping,
-        )
-
-        if mesh is None:
-            mesh = getattr(getattr(forward_batch.input_ids, "sharding", None), "mesh", None)
-        with jax.set_mesh(mesh) if mesh is not None else nullcontext():
-            target = input_embedding(forward_batch.input_ids)  # [T, H]
-            num_tokens, hidden = target.shape[0], target.shape[1]
-
-            def _replicated(shape) -> jax.Array:
-                zeros = jnp.zeros(shape, target.dtype)
-                if mesh is not None:
-                    zeros = jax.device_put(
-                        zeros,
-                        NamedSharding(mesh, PartitionSpec(*([None] * len(shape)))),
-                    )
-                return zeros
-
-            deepstack = getattr(forward_batch, "deepstack_visual_embedding", None)
-            capacities = packed_capacities or (num_tokens,)
-            running = target
-            if deepstack is not None:
-                running = jnp.pad(
-                    running,
-                    ((0, 0), (0, deepstack.shape[0] * hidden)),
-                )
-
-            dummy_item = MultimodalDataItem(modality=Modality.IMAGE)
-
-            for capacity in capacities:
-                length = min(num_tokens, capacity)
-                task = ItemTask(
-                    item=dummy_item,
-                    output_len=length,
-                    merge_mappings=(_MergeMapping(0, 0, length),),
-                )
-                packed = _replicated((capacity, running.shape[-1]))
-                running = _gather_merge(running, packed, (task,), mesh)
-                jax.block_until_ready(running)
-
-            if embedding_pool is not None:
-                length = min(num_tokens, embedding_pool.page_size)
-                task = ItemTask(
-                    item=dummy_item,
-                    output_len=length,
-                    merge_mappings=(_MergeMapping(0, 0, length),),
-                )
-                entry = EmbeddingPoolEntry(np.asarray([0], dtype=np.int32), length)
-                running = _gather_from_pool(
-                    running,
-                    embedding_pool,
-                    (task,),
-                    (entry,),
-                    mesh,
-                )
-                jax.block_until_ready(running)
-
-        forward_batch.input_embedding = running[:, :hidden]
-        if deepstack is not None:
-            merged_deepstack = (
-                running[:, hidden:]
-                .reshape(num_tokens, deepstack.shape[0], hidden)
-                .transpose(1, 0, 2)
-            )
-            forward_batch.deepstack_visual_embedding = jax.sharding.reshard(
-                merged_deepstack, deepstack.sharding
-            )
-
     # ---- Pre-compilation ----
 
     def precompile_all(
@@ -276,11 +142,11 @@ class CompilationManager:
             forward_fn, model_runner, mesh, prepare_lora_fn, future_token_ids_map
         )
         if self.precompile_in_model_multimodal:
-            model_runner.model.precompile_multimodal()
-            embedding_pool = self._embedding_pool(model_runner)
-            if embedding_pool is not None:
-                for capacity in self._packed_multimodal_capacities(model_runner):
-                    embedding_pool.precompile_packed_write(capacity)
+            from sgl_jax.srt.multimodal.in_model.host_orchestration import (
+                precompile_multimodal_components,
+            )
+
+            precompile_multimodal_components(model_runner.model, model_runner.embedding_pool)
         self._precompile_decode(
             forward_fn, model_runner, mesh, prepare_lora_fn, future_token_ids_map
         )
@@ -298,10 +164,8 @@ class CompilationManager:
         from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 
         start_time = time.perf_counter()
-        packed_capacities = self._packed_multimodal_capacities(model_runner)
-        embedding_pool = self._embedding_pool(model_runner)
         bs = self.max_padded_batch_size
-        variant_names = self._extend_variant_names()
+        variant_names = ("text", "multimodal") if self.precompile_in_model_multimodal else ("text",)
         logger.info(
             "[EXTEND] Begin to precompile variants=%s bs_paddings=%s token_paddings=%s",
             variant_names,
@@ -325,8 +189,6 @@ class CompilationManager:
                     dp_size=self.dp_size,
                     per_dp_bs_size=bs_val // self.dp_size,
                 )
-                if variant_name == "multimodal":
-                    self._populate_dummy_multimodal_inputs(batch, model_runner)
                 if prepare_lora_fn is not None:
                     prepare_lora_fn(batch)
                 sampling_metadata = SamplingMetadata.from_model_worker_batch(
@@ -334,13 +196,18 @@ class CompilationManager:
                 )
                 batch.forward_batch = ForwardBatch.init_new(batch, model_runner)
                 if variant_name == "multimodal":
-                    self._warm_multimodal_merge(
-                        batch.forward_batch,
-                        model_runner.model.get_input_embeddings(),
-                        packed_capacities,
-                        embedding_pool,
-                        mesh,
+                    from sgl_jax.srt.multimodal.in_model.host_orchestration import (
+                        precompile_multimodal_inputs,
                     )
+
+                    input_embedding, deepstack = precompile_multimodal_inputs(
+                        batch.forward_batch.input_ids,
+                        model_runner.model,
+                        model_runner.embedding_pool,
+                    )
+                    batch.forward_batch.input_embedding = input_embedding
+                    batch.forward_batch.deepstack_visual_embedding = deepstack
+                    batch.forward_batch.apply_for_deepstack = deepstack is not None
                 if future_token_ids_map is not None:
                     from sgl_jax.srt.managers.utils import resolve_future_token_ids
 

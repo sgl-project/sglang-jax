@@ -253,6 +253,73 @@ def _write_misses_to_pool(
     )
 
 
+def _split_embeddings(
+    running: jax.Array,
+    hidden: int,
+    deepstack_dim: int,
+    mesh: Mesh | None,
+) -> tuple[jax.Array, jax.Array | None]:
+    if not deepstack_dim:
+        return running, None
+    running, deepstack = jnp.split(running, (hidden,), axis=-1)
+    deepstack = deepstack.reshape(running.shape[0], deepstack_dim, hidden).transpose(1, 0, 2)
+    if isinstance(running.sharding, NamedSharding):
+        token_spec = running.sharding.spec[0] if running.sharding.spec else None
+        deepstack = jax.sharding.reshard(
+            deepstack,
+            NamedSharding(mesh, PartitionSpec(None, token_spec, None)),
+        )
+    return running, deepstack
+
+
+def precompile_multimodal_inputs(
+    input_ids: jax.Array,
+    multimodal_model: InModelMultimodalContract,
+    embedding_pool: EmbeddingPool | None = None,
+) -> tuple[jax.Array, jax.Array | None]:
+    """Warm merge kernels and return a multimodal-shaped forward input."""
+    capacities = tuple(map(int, multimodal_model.get_multimodal_embedding_packed_capacities()))
+    if any(capacity <= 0 for capacity in capacities):
+        raise ValueError(f"invalid multimodal packed capacities: {capacities}")
+
+    mesh = multimodal_model.mesh
+    with jax.set_mesh(mesh) if mesh is not None else nullcontext():
+        running = multimodal_model.get_input_embeddings()(input_ids)
+        num_tokens, hidden = running.shape
+        deepstack_dim = multimodal_model.deepstack_visual_layers
+        if deepstack_dim:
+            running = jnp.pad(running, ((0, 0), (0, hidden * deepstack_dim)))
+
+        item = MultimodalDataItem(modality=Modality.IMAGE)
+        for capacity in capacities or (num_tokens,):
+            length = min(num_tokens, capacity)
+            task = ItemTask(item, length, (_MergeMapping(0, 0, length),))
+            packed = jnp.zeros((capacity, running.shape[-1]), running.dtype)
+            if mesh is not None:
+                packed = jax.device_put(packed, NamedSharding(mesh, PartitionSpec()))
+            running = _gather_merge(running, packed, (task,), mesh)
+            jax.block_until_ready(running)
+
+        if embedding_pool is not None:
+            length = min(num_tokens, embedding_pool.page_size)
+            task = ItemTask(item, length, (_MergeMapping(0, 0, length),))
+            entry = EmbeddingPoolEntry(np.asarray([0], dtype=np.int32), length)
+            running = _gather_from_pool(running, embedding_pool, (task,), (entry,), mesh)
+            jax.block_until_ready(running)
+
+    return _split_embeddings(running, hidden, deepstack_dim, mesh)
+
+
+def precompile_multimodal_components(
+    multimodal_model: InModelMultimodalContract,
+    embedding_pool: EmbeddingPool | None = None,
+) -> None:
+    multimodal_model.precompile_multimodal()
+    if embedding_pool is not None:
+        for capacity in multimodal_model.get_multimodal_embedding_packed_capacities():
+            embedding_pool.precompile_packed_write(capacity)
+
+
 def embed_multimodal_inputs(
     multimodal_batch: _MultimodalBatch,
     input_ids: jax.Array,
@@ -307,14 +374,4 @@ def embed_multimodal_inputs(
                 running = _gather_merge(running, packed, tuple(miss_tasks), mesh)
                 _write_misses_to_pool(embedding_pool, packed, miss_tasks)
 
-        if not deepstack_dim:
-            return running, None
-        running, deepstack = jnp.split(running, (hidden,), axis=-1)
-        deepstack = deepstack.reshape(running.shape[0], deepstack_dim, hidden).transpose(1, 0, 2)
-        if isinstance(running.sharding, NamedSharding):
-            token_spec = running.sharding.spec[0] if running.sharding.spec else None
-            deepstack = jax.sharding.reshard(
-                deepstack,
-                NamedSharding(mesh, PartitionSpec(None, token_spec, None)),
-            )
-        return running, deepstack
+        return _split_embeddings(running, hidden, deepstack_dim, mesh)

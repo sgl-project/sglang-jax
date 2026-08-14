@@ -659,6 +659,80 @@ def test_packed_gather_merge_preserves_data_sharding():
     assert ds.sharding.spec == PartitionSpec(None, "data", None)
 
 
+def test_precompile_multimodal_inputs_matches_runtime_layout():
+    mesh = _mesh()
+    data = NamedSharding(mesh, PartitionSpec("data"))
+    tokens = NamedSharding(mesh, PartitionSpec("data", None))
+
+    class Model(_TestInModelModel):
+        deepstack_visual_layers = 2
+
+        def get_input_embeddings(self):
+            return lambda _: expected
+
+    Model.mesh = mesh
+    expected = jax.device_put(jnp.ones((4, 8), jnp.float32), tokens)
+    with patch.object(
+        host_orchestration,
+        "_gather_merge",
+        wraps=host_orchestration._gather_merge,
+    ) as merge:
+        output, deepstack = host_orchestration.precompile_multimodal_inputs(
+            jax.device_put(jnp.arange(4), data),
+            Model(),
+        )
+
+    merge.assert_called_once()
+    np.testing.assert_array_equal(output, 0)
+    np.testing.assert_array_equal(deepstack, 0)
+    assert output.dtype == jnp.float32
+    assert deepstack.dtype == jnp.float32
+    assert output.sharding.spec == PartitionSpec("data", None)
+    assert deepstack.sharding.spec == PartitionSpec(None, "data", None)
+
+
+def test_precompile_multimodal_inputs_covers_packed_and_pool_shapes():
+    mesh = _mesh()
+    data = NamedSharding(mesh, PartitionSpec("data"))
+    tokens = NamedSharding(mesh, PartitionSpec("data", None))
+
+    class Model(_TestInModelModel):
+        def get_multimodal_embedding_packed_capacities(self):
+            return (6, 10)
+
+        def get_input_embeddings(self):
+            return lambda _: jax.device_put(jnp.ones((4, 2), jnp.float32), tokens)
+
+    Model.mesh = mesh
+    pool = EmbeddingPool(
+        num_pages=2,
+        page_size=2,
+        hidden=2,
+        dtype=jnp.float32,
+        mesh=mesh,
+    )
+    with (
+        patch.object(
+            host_orchestration,
+            "_gather_merge",
+            wraps=host_orchestration._gather_merge,
+        ) as fresh_merge,
+        patch.object(
+            host_orchestration,
+            "_gather_from_pool",
+            wraps=host_orchestration._gather_from_pool,
+        ) as pool_merge,
+    ):
+        host_orchestration.precompile_multimodal_inputs(
+            jax.device_put(jnp.arange(4), data),
+            Model(),
+            pool,
+        )
+
+    assert [call.args[1].shape for call in fresh_merge.call_args_list] == [(6, 2), (10, 2)]
+    pool_merge.assert_called_once()
+
+
 def test_packed_gather_merge_handles_chunk_split():
     """A placeholder only partly visible in the chunk uses source_start > 0."""
     # Item spans tokens [0, 4); chunk covers [1, 4) so only 3 of its 4 tokens show.

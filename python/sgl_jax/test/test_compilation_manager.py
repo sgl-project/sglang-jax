@@ -2,11 +2,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import AxisType, Mesh, NamedSharding
-from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
 from sgl_jax.srt.model_executor.forward_batch_info import (
@@ -15,7 +12,6 @@ from sgl_jax.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sgl_jax.srt.multimodal.in_model import host_orchestration
-from sgl_jax.srt.multimodal.in_model.embedding_pool import EmbeddingPool
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.utils.common_utils import align_bs_for_fused_ep, pad_to_bucket
 
@@ -50,7 +46,6 @@ def _make_server_args(**overrides):
     args = MagicMock()
     args.precompile_token_paddings = None
     args.precompile_bs_paddings = None
-    args.precompile_vision_patch_paddings = None
     args.moe_backend = "none"
     args.enable_static_lora = False
     args.multimodal = False
@@ -465,27 +460,36 @@ class TestDummyBatch(unittest.TestCase):
             precompile_in_model_multimodal=True,
         )
         model_runner = MagicMock()
-        model_runner.model.deepstack_visual_layers = 2
-        model_runner.model_config.hidden_size = 8
-        model_runner.model_config.dtype = jnp.bfloat16
         calls = []
 
         def forward_fn(batch, **kwargs):
             calls.append(
                 {
-                    "input_embedding": batch.input_embedding,
-                    "deepstack": batch.deepstack_visual_embedding,
-                    "apply_deepstack": batch.apply_for_deepstack,
+                    "input_embedding": batch.forward_batch.input_embedding,
+                    "deepstack": batch.forward_batch.deepstack_visual_embedding,
+                    "apply_deepstack": batch.forward_batch.apply_for_deepstack,
                     "skip_sample": kwargs["skip_sample"],
                 }
             )
 
         def init_forward_batch(batch, _model_runner):
-            return SimpleNamespace(input_ids=batch.input_ids)
+            return SimpleNamespace(
+                input_ids=batch.input_ids,
+                input_embedding=None,
+                deepstack_visual_embedding=None,
+                apply_for_deepstack=False,
+            )
 
         with (
-            patch.object(cm, "_warm_multimodal_merge") as warm_merge,
             patch.object(ForwardBatch, "init_new", side_effect=init_forward_batch),
+            patch.object(
+                host_orchestration,
+                "precompile_multimodal_inputs",
+                return_value=(
+                    jnp.zeros((4, 8), jnp.bfloat16),
+                    jnp.zeros((2, 4, 8), jnp.bfloat16),
+                ),
+            ) as precompile_multimodal_inputs,
             patch.object(
                 SamplingMetadata,
                 "from_model_worker_batch",
@@ -511,93 +515,7 @@ class TestDummyBatch(unittest.TestCase):
         assert calls[1]["deepstack"].shape == (2, 4, 8)
         assert calls[1]["apply_deepstack"] is True
         assert calls[1]["skip_sample"] is True
-        warm_merge.assert_called_once()
-
-    def test_warm_multimodal_merge_uses_runtime_embedding_layout(self):
-        mesh = Mesh(
-            np.asarray(jax.devices()[:1]),
-            ("data",),
-            axis_types=(AxisType.Explicit,),
-        )
-        data = NamedSharding(mesh, P("data"))
-        tokens = NamedSharding(mesh, P("data", None))
-        forward_batch = SimpleNamespace(
-            input_ids=jax.device_put(jnp.arange(4), data),
-            input_embedding=jax.device_put(jnp.ones((4, 8), jnp.bfloat16), tokens),
-            deepstack_visual_embedding=jax.device_put(
-                jnp.ones((2, 4, 8), jnp.bfloat16),
-                NamedSharding(mesh, P(None, "data", None)),
-            ),
-        )
-        expected = jnp.arange(32, dtype=jnp.float32).reshape(4, 8)
-
-        with patch.object(
-            host_orchestration,
-            "_gather_merge",
-            wraps=host_orchestration._gather_merge,
-        ) as merge:
-            self.cm._warm_multimodal_merge(
-                forward_batch,
-                lambda _: jax.device_put(expected, tokens),
-            )
-        jax.block_until_ready(
-            (forward_batch.input_embedding, forward_batch.deepstack_visual_embedding)
-        )
-
-        merge.assert_called_once()
-        # The warmup gathers from a zeros packed source over every token.
-        np.testing.assert_array_equal(forward_batch.input_embedding, 0)
-        np.testing.assert_array_equal(forward_batch.deepstack_visual_embedding, 0)
-        assert forward_batch.input_embedding.dtype == jnp.float32
-        assert forward_batch.deepstack_visual_embedding.dtype == jnp.float32
-        assert forward_batch.input_embedding.sharding.spec == P("data", None)
-        assert forward_batch.deepstack_visual_embedding.sharding.spec == P(None, "data", None)
-
-    def test_warm_multimodal_merge_covers_packed_and_pool_shapes(self):
-        mesh = Mesh(
-            np.asarray(jax.devices()[:1]),
-            ("data",),
-            axis_types=(AxisType.Explicit,),
-        )
-        data = NamedSharding(mesh, P("data"))
-        tokens = NamedSharding(mesh, P("data", None))
-        forward_batch = SimpleNamespace(
-            input_ids=jax.device_put(jnp.arange(4), data),
-            input_embedding=jax.device_put(jnp.ones((4, 2), jnp.float32), tokens),
-            deepstack_visual_embedding=None,
-        )
-        pool = EmbeddingPool(
-            num_pages=2,
-            page_size=2,
-            hidden=2,
-            dtype=jnp.float32,
-            mesh=mesh,
-        )
-
-        with (
-            patch.object(
-                host_orchestration,
-                "_gather_merge",
-                wraps=host_orchestration._gather_merge,
-            ) as fresh_merge,
-            patch.object(
-                host_orchestration,
-                "_gather_from_pool",
-                wraps=host_orchestration._gather_from_pool,
-            ) as pool_merge,
-        ):
-            self.cm._warm_multimodal_merge(
-                forward_batch,
-                lambda _: jax.device_put(jnp.ones((4, 2), jnp.float32), tokens),
-                packed_capacities=(6, 10),
-                embedding_pool=pool,
-            )
-
-        assert [call.args[1].shape for call in fresh_merge.call_args_list] == [
-            (6, 2),
-            (10, 2),
-        ]
-        pool_merge.assert_called_once()
+        precompile_multimodal_inputs.assert_called_once()
 
     def test_precompile_all_warms_multimodal_encoder_between_model_modes(self):
         cm = CompilationManager(
@@ -615,21 +533,16 @@ class TestDummyBatch(unittest.TestCase):
         model_runner = MagicMock()
         model_runner.model.precompile_multimodal.side_effect = lambda: events.append("vision")
         model_runner.model.get_multimodal_embedding_packed_capacities.return_value = (6, 10)
-        model_runner.embedding_pool = EmbeddingPool(
-            num_pages=2,
-            page_size=2,
-            hidden=1,
-            dtype=jnp.float32,
-        )
         with (
             patch.object(cm, "_precompile_extend", side_effect=lambda *_: events.append("extend")),
             patch.object(cm, "_precompile_decode", side_effect=lambda *_: events.append("decode")),
-            patch.object(model_runner.embedding_pool, "precompile_packed_write") as warm_writer,
         ):
             cm.precompile_all(MagicMock(), model_runner, MagicMock())
 
         assert events == ["extend", "vision", "decode"]
-        assert [call.args for call in warm_writer.call_args_list] == [(6,), (10,)]
+        assert [
+            call.args for call in model_runner.embedding_pool.precompile_packed_write.call_args_list
+        ] == [(6,), (10,)]
 
     def test_invalid_cache_loc_raises(self):
         with self.assertRaises(ValueError):
