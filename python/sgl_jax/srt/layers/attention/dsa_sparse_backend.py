@@ -170,7 +170,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             # SparseCore requires bq_sparse*K to be a gather-wave multiple.
             # For C=2 decode, bq_sparse=2 is the smallest valid choice at K=2048.
             # Larger extend batches use the kernel's validated 128-query tile.
-            bq_sparse = 2 if ql_.shape[0] < 128 else 128
+            bq_sparse = 2 if ql_.shape[0] < 128 else 256
             # A packed BF16 cache row is 2 * 384 elements for GLM-5.  Using
             # bq=32 makes the double-buffered TensorCore scratch exceed the
             # TPU's 32 MiB scoped VMEM limit, so extend uses a 16-query tile.
@@ -188,7 +188,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 sm_scale,
                 bq_sparse=bq_sparse,
                 bq=bq,
-                b_topk=128,
+                b_topk=256,
             )
             return output[: ql_.shape[0]], cache4d
 
