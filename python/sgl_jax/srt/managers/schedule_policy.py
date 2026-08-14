@@ -307,14 +307,12 @@ class PrefillAdder:
                 info = running_batch.reqs_info[dp_rank]
                 if info.reqs:
                     self.rem_total_token_offset[dp_rank] += sum(
-                        [
-                            min(
-                                (r.sampling_params.max_new_tokens - len(r.output_ids)),
-                                CLIP_MAX_NEW_TOKENS_ESTIMATION,
-                            )
-                            * self.new_token_ratio
-                            for r in info.reqs
-                        ]
+                        min(
+                            (r.sampling_params.max_new_tokens - len(r.output_ids)),
+                            CLIP_MAX_NEW_TOKENS_ESTIMATION,
+                        )
+                        * (1.0 if r.sampling_params.ignore_eos else self.new_token_ratio)
+                        for r in info.reqs
                     )
 
         self.is_hybrid = isinstance(self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
@@ -552,19 +550,18 @@ class PrefillAdder:
         else:
             add_req_state(req, insert_sort=True)
 
-        if not self.is_hybrid:
-            cur_rem_tokens = self.cur_rem_tokens_for_dp(dp_rank) - self.ceil_paged_tokens(
-                req.extend_input_len
-            )
-            tokens_freed = 0
-            for i, (tokens_left, tokens_occupied) in enumerate(self.req_states[dp_rank]):
-                # tokens_left gives a reservative calculation as the last token is not stored
-                bs = len(self.req_states[dp_rank]) - i
-                min_free_tokens = cur_rem_tokens + tokens_freed - tokens_left * bs
-                # reserve tokens for corner cases
-                if min_free_tokens <= IGNORE_EOS_RESERVE_TOKENS * bs:
-                    return AddReqResult.NO_TOKEN
-                tokens_freed += tokens_occupied
+        cur_rem_tokens = self.cur_rem_tokens_for_dp(dp_rank) - self.ceil_paged_tokens(
+            req.extend_input_len
+        )
+        tokens_freed = 0
+        for i, (tokens_left, tokens_occupied) in enumerate(self.req_states[dp_rank]):
+            # tokens_left gives a reservative calculation as the last token is not stored
+            bs = len(self.req_states[dp_rank]) - i
+            min_free_tokens = cur_rem_tokens + tokens_freed - tokens_left * bs
+            # reserve tokens for corner cases
+            if min_free_tokens <= IGNORE_EOS_RESERVE_TOKENS * bs:
+                return AddReqResult.NO_TOKEN
+            tokens_freed += tokens_occupied
 
         if (
             self.rem_chunk_tokens_list is None  # chunked prefill is disabled
