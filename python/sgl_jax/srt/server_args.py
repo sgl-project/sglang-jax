@@ -319,16 +319,6 @@ class ServerArgs:
             else:
                 self.device = "tpu"
 
-        if self.device == "tt":
-            self.attention_backend = "tt"
-            if self.page_size == 1:
-                self.page_size = 32
-            if self.page_size < 32 or self.page_size % 32:
-                raise ValueError("TT requires --page-size to be divisible by 32")
-            # The initial TT backend has an in-place cache and no prefix path.
-            self.disable_overlap_schedule = True
-            self.disable_radix_cache = True
-
         if self.served_model_name is None:
             self.served_model_name = self.model_path
 

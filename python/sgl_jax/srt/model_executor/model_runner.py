@@ -258,7 +258,17 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         if not jit_compiler_options:
             jit_compiler_options = None
 
-        def run_model(
+        @partial(
+            jax.jit,
+            donate_argnames=(
+                []
+                if getattr(self.attn_backend, "updates_cache_in_place", False)
+                else ["memory_pools"]
+            ),
+            static_argnames=["model_state_def"],
+            compiler_options=jit_compiler_options,
+        )
+        def jitted_run_model(
             model_def,
             model_state_def,
             model_state_leaves,
@@ -276,17 +286,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             memory_pools = _maybe_apply_recurrent_cow(forward_batch, memory_pools)
             with LoraBatchContext.set_batch(forward_batch):
                 return model(forward_batch, memory_pools, logits_metadata)
-
-        jitted_run_model = jax.jit(
-            run_model,
-            donate_argnames=(
-                []
-                if getattr(self.attn_backend, "updates_cache_in_place", False)
-                else ["memory_pools"]
-            ),
-            static_argnames=["model_state_def"],
-            compiler_options=jit_compiler_options,
-        )
 
         # Capture base RNG key as a constant in the JIT closure.
         # fold_in(constant, dynamic_step) is computed inside JIT, avoiding
@@ -881,6 +880,8 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self,
         logits_output: LogitsProcessorOutput,
         sampling_metadata: SamplingMetadata,
+        *,
+        allow_fast_greedy: bool = True,
     ) -> jax.Array:
         """Sample and compute logprobs and update logits_output.
 
@@ -891,6 +892,15 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         Returns:
             A list of next_token_ids
         """
+        if (
+            allow_fast_greedy
+            and getattr(self.attn_backend, "use_fast_greedy_sampler", False)
+            and sampling_metadata.is_all_greedy
+            and not sampling_metadata.do_penalties
+            and not sampling_metadata.apply_vocab_mask
+        ):
+            return self.jitted_greedy_sampler(logits_output), None, None
+
         # Advance step counter (pure Python, zero device overhead).
         # fold_in(base_key, step) inside JIT produces a unique RNG per step.
         self._sampler_step += 1
@@ -903,9 +913,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
     def compute_logprobs(self, logits, token_ids: jax.Array) -> jax.Array:
         return self.jitted_compute_logprobs(logits, token_ids)
-
-    def greedy_sample(self, logits_output: LogitsProcessorOutput):
-        return self.jitted_greedy_sampler(logits_output), None, None
 
     def set_num_token_hybrid(self):
         assert self.sliding_window_size is not None and self.sliding_window_size > 0
