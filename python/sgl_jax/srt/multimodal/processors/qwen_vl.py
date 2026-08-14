@@ -236,6 +236,9 @@ def preprocess_video(source, video_config: dict) -> np.ndarray:
 
 
 class QwenVLProcessor(BaseMultimodalProcessor):
+    auto_mm_io_worker_num = 16
+    auto_mm_processor_worker_num = 2
+    supports_mm_processor_concurrency = True
     models = (
         "Qwen2VLForConditionalGeneration",
         "Qwen2_5_VLForConditionalGeneration",
@@ -506,7 +509,7 @@ class QwenVLProcessor(BaseMultimodalProcessor):
     async def _load_videos_async(self, video_data, video_config):
         return await asyncio.gather(
             *(
-                asyncio.to_thread(preprocess_video, item, video_config)
+                self._run_io_async(preprocess_video, item, video_config)
                 for item in self.normalize_data(video_data)
             )
         )
