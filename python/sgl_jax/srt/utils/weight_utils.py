@@ -161,6 +161,9 @@ class WeightLoader:
         self.model_config = model_config
         self.mesh = mesh
         self.dtype = dtype
+        self._load_weights_directly = any(
+            device.platform == "tt" for device in np.asarray(mesh.devices).flat
+        )
         self.dummy_mode = getattr(model_config, "_dummy_mode", False)
         self._weight_info_cache: dict[str, list[dict]] | None = None
         if hasattr(model_config, "num_attention_heads"):
@@ -1141,6 +1144,12 @@ class WeightLoader:
 
             filename = info["file"]
 
+            if self._load_weights_directly and target_sharding is None:
+                data = file_manager.get_handle(filename).get_tensor(hf_key)
+                data = _reinterpret_dtype_if_needed(data, target_dtype)
+                lazy_arrays.append(jnp.asarray(data, dtype=target_dtype))
+                continue
+
             if target_sharding is not None:
                 # Load only what this host needs (Global Loading)
                 sharding = target_sharding
@@ -1990,6 +1999,7 @@ class WeightLoader:
                     and not mapping.head_dim_padding
                     and mapping.sharding is not None
                     and hf_key != "d2t"
+                    and not self._load_weights_directly
                 )
 
                 if can_optimize:

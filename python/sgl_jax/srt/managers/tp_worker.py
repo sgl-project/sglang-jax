@@ -564,10 +564,26 @@ class ModelWorker:
                 self._update_grammar_vocab_mask(model_worker_batch, sampling_metadata)
 
             with jtu.count_pjit_cpp_cache_miss() as count:
-                next_token_ids_device, token_logprobs, new_logits_output = self.model_runner.sample(
-                    logits_output,
-                    sampling_metadata,
+                use_fast_greedy = (
+                    getattr(
+                        self.model_runner.attn_backend,
+                        "use_fast_greedy_sampler",
+                        False,
+                    )
+                    and sampling_metadata.is_all_greedy
+                    and not sampling_metadata.do_penalties
+                    and not sampling_metadata.apply_vocab_mask
+                    and not model_worker_batch.return_logprob
+                    and not model_worker_batch.return_output_logprob_only
                 )
+                if use_fast_greedy:
+                    next_token_ids_device, token_logprobs, new_logits_output = (
+                        self.model_runner.greedy_sample(logits_output)
+                    )
+                else:
+                    next_token_ids_device, token_logprobs, new_logits_output = (
+                        self.model_runner.sample(logits_output, sampling_metadata)
+                    )
                 cache_miss_count += count()
             # `selector` reorders DP-interleaved per-req tensors back to
             # original request order. For DP=1 it's just np.arange(real_bs).

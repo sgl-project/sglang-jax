@@ -319,6 +319,16 @@ class ServerArgs:
             else:
                 self.device = "tpu"
 
+        if self.device == "tt":
+            self.attention_backend = "tt"
+            if self.page_size == 1:
+                self.page_size = 32
+            if self.page_size < 32 or self.page_size % 32:
+                raise ValueError("TT requires --page-size to be divisible by 32")
+            # The initial TT backend has an in-place cache and no prefix path.
+            self.disable_overlap_schedule = True
+            self.disable_radix_cache = True
+
         if self.served_model_name is None:
             self.served_model_name = self.model_path
 
@@ -1387,6 +1397,7 @@ class ServerArgs:
                 "fa",
                 "fa_mha",
                 "dsa_sparse",
+                "tt",
             ],
             default=ServerArgs.attention_backend,
             help=(
@@ -1396,7 +1407,8 @@ class ServerArgs:
                 "(decompress latent KV per-forward via kv_b_proj; ~70x more KV cache than 'fa', "
                 "intended for kernel A/B on short contexts). "
                 "'dsa_sparse' = DeepSeek Sparse Attention (lightning-indexer top-k + sparse MLA) "
-                "with IndexShare cross-layer reuse; MLA models with index_* config only."
+                "with IndexShare cross-layer reuse; MLA models with index_* config only. "
+                "'tt' = TTNN prefill and paged decode."
             ),
         )
         parser.add_argument(
