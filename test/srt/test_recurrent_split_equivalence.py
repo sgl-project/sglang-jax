@@ -19,6 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from sgl_jax.srt.kernels.gdn.gated_delta import (
+    chunked_gated_delta_rule_jax,
     jax_causal_conv1d_prefill,
     ragged_gated_delta_rule_ref,
 )
@@ -64,7 +65,15 @@ def _make_inputs(seed: int = 0):
     }
 
 
-def _run_chunks(inputs, chunk_sizes, *, conv_dtype, rec_dtype, io_dtype):
+def _run_chunks(
+    inputs,
+    chunk_sizes,
+    *,
+    conv_dtype,
+    rec_dtype,
+    io_dtype,
+    kernel_fn=ragged_gated_delta_rule_ref,
+):
     """Run the GDN forward as a chain of chunks, carrying the FULL pool tables.
 
     The pool-table dtypes (conv_dtype / rec_dtype) drive the production
@@ -104,7 +113,7 @@ def _run_chunks(inputs, chunk_sizes, *, conv_dtype, rec_dtype, io_dtype):
             has_init,
             "silu",
         )
-        rec_table, out = ragged_gated_delta_rule_ref(
+        rec_table, out = kernel_fn(
             y.T,
             b[start:end],
             a[start:end],
@@ -150,6 +159,7 @@ class _SplitEquivalenceBase(unittest.TestCase):
     REC_DTYPE = jnp.float32
     IO_DTYPE = jnp.float32
     BITEXACT_REC = False
+    KERNEL_FN = staticmethod(ragged_gated_delta_rule_ref)
 
     RTOL = 2e-2
     ATOL = 1e-2
@@ -170,6 +180,7 @@ class _SplitEquivalenceBase(unittest.TestCase):
             conv_dtype=self.CONV_DTYPE,
             rec_dtype=self.REC_DTYPE,
             io_dtype=self.IO_DTYPE,
+            kernel_fn=self.KERNEL_FN,
         )
         single = _run_chunks(self.inputs, [length], **kw)
         split = _run_chunks(self.inputs, chunk_sizes, **kw)
@@ -216,6 +227,7 @@ class TestSplitEquivalenceProd(_SplitEquivalenceBase):
     REC_DTYPE = jnp.float32
     IO_DTYPE = jnp.bfloat16
     BITEXACT_REC = False
+    KERNEL_FN = staticmethod(ragged_gated_delta_rule_ref)
 
 
 class TestSplitEquivalenceFp32(_SplitEquivalenceBase):
@@ -226,6 +238,29 @@ class TestSplitEquivalenceFp32(_SplitEquivalenceBase):
     REC_DTYPE = jnp.float32
     IO_DTYPE = jnp.float32
     BITEXACT_REC = True
+    KERNEL_FN = staticmethod(ragged_gated_delta_rule_ref)
+
+
+class TestChunkedSplitEquivalenceProd(_SplitEquivalenceBase):
+    """Chunked recurrence in production dtypes: conv pool bfloat16, recurrent pool float32."""
+
+    VARIANT = "V_chunked_prod"
+    CONV_DTYPE = jnp.bfloat16
+    REC_DTYPE = jnp.float32
+    IO_DTYPE = jnp.bfloat16
+    BITEXACT_REC = False
+    KERNEL_FN = staticmethod(chunked_gated_delta_rule_jax)
+
+
+class TestChunkedSplitEquivalenceFp32(_SplitEquivalenceBase):
+    """Chunked recurrence in fp32."""
+
+    VARIANT = "V_chunked_fp32"
+    CONV_DTYPE = jnp.float32
+    REC_DTYPE = jnp.float32
+    IO_DTYPE = jnp.float32
+    BITEXACT_REC = False
+    KERNEL_FN = staticmethod(chunked_gated_delta_rule_jax)
 
 
 if __name__ == "__main__":

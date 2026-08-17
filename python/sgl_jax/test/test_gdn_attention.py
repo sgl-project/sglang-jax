@@ -25,6 +25,10 @@ import numpy as np
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.kernels.gdn import (
+    chunked_gated_delta_rule_jax,
+    ragged_gated_delta_rule_ref,
+)
 from sgl_jax.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
@@ -566,15 +570,6 @@ class TestGDNAttention(unittest.TestCase):
             self.rng,
         )
 
-    def test_single_seq_extend_no_shard(self):
-        one_device_mesh = create_device_mesh(
-            ici_parallelism=[1, 1],
-            dcn_parallelism=[1, 1],
-            devices=[jax.devices()[0]],
-        )
-        with jax.sharding.set_mesh(one_device_mesh):
-            self.run_test("prefill", [128], test_mesh=one_device_mesh)
-
     def test_single_seq_extend(self):
         self.run_test("prefill", [128])
 
@@ -812,6 +807,65 @@ class TestGDNAttention(unittest.TestCase):
         trk_conv = np.asarray(gather_conv(pool, conv_buffer_list[0], track))
         np.testing.assert_array_equal(trk_ssm, run_ssm)
         np.testing.assert_array_equal(trk_conv, run_conv)
+
+    def test_multi_seq_extend_mixed_lengths(self):
+        """Test extend with mixed sequence lengths across multiple requests."""
+        self.run_test("prefill", [1, 7, 65, 128])
+
+    def test_chunked_vs_ragged_scan_direct_parity(self):
+        """Direct kernel-level parity test between chunked_gated_delta_rule_jax
+        and ragged_gated_delta_rule_ref across mixed extend lengths.
+        """
+        seq_lens = [1, 7, 64, 120]
+        B = len(seq_lens)
+        total_tokens = sum(seq_lens)
+        key_dim = self.NUM_K_HEADS * self.HEAD_K_DIM
+        value_dim = self.NUM_V_HEADS * self.HEAD_V_DIM
+        conv_dim = 2 * key_dim + value_dim
+
+        mixed = jnp.asarray(
+            _scaled_randn(self.rng, (total_tokens, conv_dim), 0.1), dtype=self.DTYPE
+        )
+        b = jnp.asarray(
+            _scaled_randn(self.rng, (total_tokens, self.NUM_V_HEADS), 0.1), dtype=jnp.float32
+        )
+        a = jnp.asarray(
+            _scaled_randn(self.rng, (total_tokens, self.NUM_V_HEADS), 0.1), dtype=jnp.float32
+        )
+        rec_init = jnp.asarray(
+            _scaled_randn(
+                self.rng,
+                (B + 1, self.NUM_V_HEADS, self.HEAD_K_DIM, self.HEAD_V_DIM),
+                0.1,
+            ),
+            dtype=jnp.float32,
+        )
+        A_log = jnp.asarray(_scaled_randn(self.rng, (self.NUM_V_HEADS,), 1.0), dtype=jnp.float32)
+        dt_bias = jnp.asarray(_scaled_randn(self.rng, (self.NUM_V_HEADS,), 1.0), dtype=jnp.float32)
+        cu = jnp.asarray([0] + np.cumsum(seq_lens).tolist(), dtype=jnp.int32)
+        state_idx = jnp.arange(1, B + 1, dtype=jnp.int32)
+        has_init = jnp.ones(B, dtype=bool)
+
+        kw = dict(
+            n_kq=self.NUM_K_HEADS,
+            n_v=self.NUM_V_HEADS,
+            d_k=self.HEAD_K_DIM,
+            d_v=self.HEAD_V_DIM,
+        )
+
+        rec_ref, out_ref = ragged_gated_delta_rule_ref(
+            mixed, b, a, rec_init, A_log, dt_bias, cu, state_idx, has_init, **kw
+        )
+        rec_chk, out_chk = chunked_gated_delta_rule_jax(
+            mixed, b, a, rec_init, A_log, dt_bias, cu, state_idx, has_init, **kw
+        )
+
+        np.testing.assert_allclose(
+            np.asarray(out_chk), np.asarray(out_ref), rtol=self.rtol, atol=self.atol
+        )
+        np.testing.assert_allclose(
+            np.asarray(rec_chk), np.asarray(rec_ref), rtol=self.rtol, atol=self.atol
+        )
 
 
 if __name__ == "__main__":

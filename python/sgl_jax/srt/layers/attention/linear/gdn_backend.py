@@ -32,10 +32,10 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.gdn import (
+    chunked_gated_delta_rule_jax,
     decode_gated_delta_rule_ref,
     jax_causal_conv1d_prefill,
     jax_causal_conv1d_update,
-    ragged_gated_delta_rule_ref,
 )
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     LinearRecurrentAttnBackend,
@@ -317,7 +317,7 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
         A_log: jax.Array,
         dt_bias: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """Packed ragged batch through ``ragged_gated_delta_rule_ref``."""
+        """Packed ragged batch through ``chunked_gated_delta_rule_jax``."""
         meta = self.forward_metadata
         cu_seqlens = meta.cu_q_lens
         state_indices = meta.recurrent_indices
@@ -348,7 +348,7 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
             # jax_causal_conv1d_prefill operates on [D, T] (channel-first).
             # Pass `has_initial_state` so brand-new prefills don't pick up
             # stale conv state from a freshly-allocated slot (same mask
-            # contract as `ragged_gated_delta_rule_ref`).
+            # contract as `chunked_gated_delta_rule_jax`).
             conv_out_dt, new_conv = jax_causal_conv1d_prefill(
                 x=mixed_qkv_l.T,
                 weight=conv_weight_l,
@@ -362,7 +362,7 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
                 track_mask=track_mask_l,
             )
             conv_out = conv_out_dt.T  # [T, D]
-            new_rec, out = ragged_gated_delta_rule_ref(
+            new_rec, out = chunked_gated_delta_rule_jax(
                 conv_out,
                 b_l,
                 a_l,
