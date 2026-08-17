@@ -26,10 +26,9 @@ from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
 from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
 from sgl_jax.srt.multimodal.in_model.lane_packing import (
     encoder_num_lanes,
-    pack_vision_inputs,
+    precompile_mrope_vision_model,
     put_sharded_batch,
-    restore_encoder_output,
-    run_dp_sharded_encoder,
+    run_mrope_vision_model,
 )
 from sgl_jax.srt.multimodal.layers.attention.flash_attention_backend import (
     VisionAttentionMetadata,
@@ -489,16 +488,15 @@ class Qwen2_5_VisionTransformer(nnx.Module):
             return self._encode_jit(patches, *metadata)
 
     def precompile(self) -> None:
-        num_lanes = encoder_num_lanes(self.mesh, self.vision_tp)
-        for capacity in self.input_buckets:
-            patches = np.zeros(
-                (num_lanes, capacity, self.patch_dim),
-                dtype=np.float32,
-            )
-            grid = (1, self.spatial_merge_size, capacity // self.spatial_merge_size)
-            grid_thw = np.zeros((num_lanes, 1, 3), dtype=np.int32)
-            grid_thw[0, 0] = grid
-            jax.block_until_ready(self.encode(patches, grid_thw))
+        precompile_mrope_vision_model(
+            self,
+            mesh=self.mesh,
+            num_lanes=encoder_num_lanes(self.mesh, self.vision_tp),
+            buckets=self.input_buckets,
+            patch_dim=self.patch_dim,
+            merge_unit=self.spatial_merge_unit,
+            rope_type="rope_3d",
+        )
 
     def _build_metadata(
         self,
@@ -676,23 +674,15 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
 
     def _get_visual_feature(self, items: list[MultimodalDataItem]) -> jax.Array:
         num_lanes = encoder_num_lanes(self.mesh, self.visual.vision_tp)
-        if not self.visual.vision_tp:
-            return run_dp_sharded_encoder(
-                self.visual,
-                items,
-                num_lanes=num_lanes,
-                buckets=self.visual.input_buckets,
-                merge_unit=self.visual.spatial_merge_unit,
-            )
-
-        patches, grid_thw, output_indices = pack_vision_inputs(
+        return run_mrope_vision_model(
+            self.visual,
             items,
+            mesh=self.mesh,
             num_lanes=num_lanes,
             buckets=self.visual.input_buckets,
             merge_unit=self.visual.spatial_merge_unit,
+            rope_type="rope_3d",
         )
-        output = self.visual(patches, grid_thw)
-        return restore_encoder_output(output, output_indices, self.mesh)
 
     def get_multimodal_encode_funcs(self):
         return {

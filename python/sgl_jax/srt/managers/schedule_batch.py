@@ -2201,13 +2201,27 @@ class ScheduleBatch:
                         base = np.arange(start, start + ext_len, dtype=np.int32)
                         mchunk = np.broadcast_to(base.reshape(1, -1), (3, ext_len))
                     else:
-                        mchunk = np.asarray(mm_positions)[:, start : start + ext_len]
-                        if mchunk.size == 0:
+                        mm_positions = np.asarray(mm_positions)
+                        positions_len = mm_positions.shape[1]
+                        known_end = min(end, positions_len)
+                        known_len = max(known_end - start, 0)
+                        mchunk = np.empty((3, ext_len), dtype=np.int32)
+                        if known_len:
+                            mchunk[:, :known_len] = mm_positions[:, start:known_end]
+
+                        # mRoPE positions only cover the original multimodal
+                        # prompt.  A retracted decode request is re-prefilled
+                        # with ``origin_input_ids + output_ids``, so its extend
+                        # window can straddle the end of that array.  Continue
+                        # generated-token positions exactly like decode mode
+                        # instead of assigning a short slice into ``ext_len``.
+                        if known_len < ext_len:
                             delta = _extract_mm_value(req.mm_inputs, "mrope_position_delta")
-                            base = np.arange(start, start + ext_len, dtype=np.int32)
+                            tail_start = start + known_len
+                            base = np.arange(tail_start, end, dtype=np.int32)
                             if delta is not None:
                                 base = base + _as_int_scalar(delta)
-                            mchunk = np.broadcast_to(base.reshape(1, -1), (3, ext_len))
+                            mchunk[:, known_len:] = base
                     mrope[:, offset + local : offset + local + ext_len] = mchunk
 
                 # deepstack: densify sparse visual rows into batched layout,

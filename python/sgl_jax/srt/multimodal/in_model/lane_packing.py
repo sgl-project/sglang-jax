@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import functools
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Literal
 
 import jax
 import jax.numpy as jnp
@@ -13,13 +14,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jax.typing import ArrayLike
 
-from sgl_jax.srt.multimodal.common.modality_enum import MultimodalDataItem
-
-
-class _Encoder(Protocol):
-    mesh: Mesh | None
-
-    def encode(self, *inputs: Any) -> jax.Array: ...
+from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
 
 
 def get_grid_thw(item: MultimodalDataItem) -> tuple[int, int, int]:
@@ -179,6 +174,70 @@ def pack_vision_inputs(
     return packed.features, grid_thw, packed.output_indices
 
 
+def pack_2d_position_inputs(
+    items: list[MultimodalDataItem],
+    *,
+    num_lanes: int,
+    buckets: tuple[int, ...],
+    merge_unit: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Pack vision inputs that carry explicit per-patch 2D positions."""
+    item_positions = []
+    for item_index, item in enumerate(items):
+        positions_value = item.get("pixel_position_ids")
+        if positions_value is None:
+            raise ValueError(f"Vision item {item_index} is missing pixel_position_ids.")
+        positions = np.asarray(positions_value, dtype=np.int32)
+        if positions.ndim != 2 or positions.shape[1] != 2:
+            raise ValueError(
+                f"Vision item {item_index} pixel_position_ids must have shape "
+                f"[patches, 2], got {positions.shape}."
+            )
+        feature = item.feature
+        if feature is None or feature.ndim == 0:
+            raise ValueError(f"Vision item {item_index} feature must have a patch dimension.")
+        item_length = int(feature.shape[0])
+        if len(positions) != item_length:
+            raise ValueError(
+                f"Vision item {item_index} patch and position counts must match: "
+                f"feature rows={item_length}, position rows={len(positions)}."
+            )
+        if item_length % merge_unit:
+            raise ValueError(
+                f"Vision item {item_index} patch count {item_length} must be divisible "
+                f"by merge unit {merge_unit}."
+            )
+        if np.any(positions < 0):
+            raise ValueError(f"Vision item {item_index} pixel_position_ids must be non-negative.")
+        item_positions.append(positions)
+
+    packed = pack_lanes(
+        items,
+        num_lanes,
+        buckets=buckets,
+        merge_unit=merge_unit,
+    )
+    position_ids = np.full(
+        (num_lanes, packed.cap, 2),
+        -1,
+        dtype=np.int32,
+    )
+    patch_counts = np.zeros(
+        (num_lanes, max(map(len, packed.lanes))),
+        dtype=np.int32,
+    )
+    for lane_index, lane in enumerate(packed.lanes):
+        offset = 0
+        for item_offset, item_index in enumerate(lane):
+            positions = item_positions[item_index]
+            item_length = len(positions)
+            end = offset + item_length
+            position_ids[lane_index, offset:end] = positions
+            patch_counts[lane_index, item_offset] = item_length
+            offset = end
+    return packed.features, position_ids, patch_counts, packed.output_indices
+
+
 def _restore_input_order(
     output: jax.Array,
     indices: jax.Array,
@@ -221,19 +280,75 @@ def restore_encoder_output(
     return _restore_input_order_mesh_jit(mesh)(output, indices, mask)
 
 
-def run_dp_sharded_encoder(
-    encoder: _Encoder,
+def run_mrope_vision_model(
+    vision_model: Callable[..., jax.Array],
     items: list[MultimodalDataItem],
     *,
+    mesh: Mesh | None,
     num_lanes: int,
     buckets: tuple[int, ...],
     merge_unit: int,
+    rope_type: Literal["rope_3d", "rope_2d", "rope_2d_packed"],
 ) -> jax.Array:
-    patches, grid_thw, output_indices = pack_vision_inputs(
-        items,
-        num_lanes=num_lanes,
-        buckets=buckets,
-        merge_unit=merge_unit,
-    )
-    output = encoder.encode(patches, grid_thw)
-    return restore_encoder_output(output, output_indices, encoder.mesh)
+    """Pack, run, and restore a sharded vision model with RoPE metadata."""
+    if rope_type == "rope_2d_packed":
+        patches, position_ids, patch_counts, output_indices = pack_2d_position_inputs(
+            items,
+            num_lanes=num_lanes,
+            buckets=buckets,
+            merge_unit=merge_unit,
+        )
+        output = vision_model(patches, position_ids, patch_counts)
+    elif rope_type in ("rope_3d", "rope_2d"):
+        patches, grid_thw, output_indices = pack_vision_inputs(
+            items,
+            num_lanes=num_lanes,
+            buckets=buckets,
+            merge_unit=merge_unit,
+        )
+        output = vision_model(patches, grid_thw)
+    else:
+        raise ValueError(f"Unsupported vision RoPE type: {rope_type}")
+
+    if mesh is None:
+        return restore_encoder_output(output, output_indices, None)
+    with jax.set_mesh(mesh):
+        return restore_encoder_output(output, output_indices, mesh)
+
+
+def precompile_mrope_vision_model(
+    vision_model: Callable[..., jax.Array],
+    *,
+    mesh: Mesh | None,
+    num_lanes: int,
+    buckets: tuple[int, ...],
+    patch_dim: int,
+    merge_unit: int,
+    rope_type: Literal["rope_3d", "rope_2d", "rope_2d_packed"],
+) -> None:
+    merge_size = math.isqrt(merge_unit)
+    for capacity in buckets:
+        model_specific_data = {}
+        if rope_type == "rope_2d_packed":
+            y, x = np.indices((merge_size, capacity // merge_size))
+            model_specific_data["pixel_position_ids"] = np.stack((x, y), axis=-1).reshape(-1, 2)
+        else:
+            model_specific_data["image_grid_thw"] = np.asarray(
+                (1, merge_size, capacity // merge_size), dtype=np.int32
+            )
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            feature=np.zeros((capacity, patch_dim), dtype=np.float32),
+            placeholder_ranges=[(0, capacity // merge_unit)],
+            model_specific_data=model_specific_data,
+        )
+        output = run_mrope_vision_model(
+            vision_model,
+            [item],
+            mesh=mesh,
+            num_lanes=num_lanes,
+            buckets=buckets,
+            merge_unit=merge_unit,
+            rope_type=rope_type,
+        )
+        jax.block_until_ready(output)

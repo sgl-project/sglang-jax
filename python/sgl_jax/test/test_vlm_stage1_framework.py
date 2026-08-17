@@ -33,7 +33,7 @@ from sgl_jax.srt.multimodal.in_model.lane_packing import (
     put_sharded_batch,
     replicate_across_mesh,
     restore_encoder_output,
-    run_dp_sharded_encoder,
+    run_mrope_vision_model,
 )
 from sgl_jax.srt.multimodal.layers.attention.flash_attention_backend import (
     vision_segment_ids_from_cu_seqlens,
@@ -136,17 +136,15 @@ def _qwen2_metadata(visual, grid_thw, capacity):
 
 
 def _run_grid_vision(visual, items):
-    if not visual.vision_tp:
-        return run_dp_sharded_encoder(
-            visual,
-            items,
-            num_lanes=encoder_num_lanes(visual.mesh, visual.vision_tp),
-            buckets=visual.input_buckets,
-            merge_unit=visual.spatial_merge_unit,
-        )
-    patches, grid_thw, output_indices = _pack_qwen2(visual, items)
-    output = visual(patches, grid_thw)
-    return restore_encoder_output(output, output_indices, visual.mesh)
+    return run_mrope_vision_model(
+        visual,
+        items,
+        mesh=visual.mesh,
+        num_lanes=encoder_num_lanes(visual.mesh, visual.vision_tp),
+        buckets=visual.input_buckets,
+        merge_unit=visual.spatial_merge_unit,
+        rope_type="rope_3d",
+    )
 
 
 def _req(items, extend_len):
@@ -286,6 +284,13 @@ def _assert_vision_precompile(visual):
     def encode(*inputs):
         if isinstance(visual, Qwen2_5_VisionTransformer):
             calls.append((inputs[0].shape, np.asarray(inputs[1]).tolist()))
+            return jnp.zeros(
+                (
+                    inputs[0].shape[0],
+                    inputs[0].shape[1] // visual.spatial_merge_unit,
+                    1,
+                )
+            )
         else:
             calls.append(tuple(leaf.shape for leaf in jax.tree.leaves(inputs)))
 
@@ -977,6 +982,45 @@ def test_mrope_positions_reach_worker_batch():
         page_size=1,
     )
     np.testing.assert_array_equal(worker_batch.mrope_positions[:, :3], positions)
+
+
+def test_mrope_positions_continue_past_prompt_after_retraction():
+    positions = np.array(
+        [[0, 1, 2, 30, 31], [0, 1, 2, 40, 41], [0, 1, 2, 50, 51]],
+        dtype=np.int32,
+    )
+    req = SimpleNamespace(
+        mm_inputs={"mrope_positions": positions, "mrope_position_delta": -2},
+        extend_input_len=5,
+        lora_id="0",
+    )
+    info = ScheduleReqsInfo(
+        reqs=[req],
+        input_ids=np.arange(5, dtype=np.int32),
+        seq_lens=np.array([8], dtype=np.int32),
+        out_cache_loc=np.arange(1, 6, dtype=np.int32),
+        req_pool_indices=np.array([0], dtype=np.int32),
+        prefix_lens=np.array([3], dtype=np.int32),
+        extend_lens=np.array([5], dtype=np.int32),
+        extend_logprob_start_lens=np.array([0], dtype=np.int32),
+    )
+    batch = ScheduleBatch(
+        reqs_info=[info],
+        dp_size=1,
+        forward_mode=ForwardMode.EXTEND,
+        return_logprob=False,
+        model_config=None,
+    )
+
+    merged = batch._merge_multimodal(per_dp_token_size=5, total_token_size=5)
+
+    np.testing.assert_array_equal(
+        merged["mrope_positions"],
+        np.array(
+            [[30, 31, 3, 4, 5], [40, 41, 3, 4, 5], [50, 51, 3, 4, 5]],
+            dtype=np.int32,
+        ),
+    )
 
 
 def test_overlap_copy_rebuilds_multimodal_batch_from_requests():
