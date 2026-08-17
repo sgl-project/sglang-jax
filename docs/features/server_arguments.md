@@ -186,13 +186,13 @@ implementation at server startup. It is an environment variable rather than a
 
 | Value | Behavior |
 |---|---|
-| `chunked_jax` | Run the native JAX Conv1D path with chunkwise-parallel GDN recurrence. This is the default. |
-| `fused_chunk_parallel` | Process chunks in parallel with fused Conv1D and GDN recurrence. Decode is unchanged. |
+| `chunked_jax` | Run the native JAX Conv1D path with chunkwise-parallel GDN recurrence. |
+| `fused_chunk_parallel` | Process chunks in parallel with fused Conv1D and GDN recurrence. This is the default. Decode is unchanged. |
 
-The optimized path is an explicit TPU/BF16 opt-in. Unsupported configurations
-fail during backend initialization; they do not silently fall back to
-`chunked_jax`. The selected implementation is frozen at backend initialization
-and logged once.
+The default fused path requires a supported TPU/BF16 configuration. Unsupported
+configurations fail during backend initialization; they do not silently fall
+back to `chunked_jax`. The selected implementation is frozen at backend
+initialization and logged once.
 
 Example:
 

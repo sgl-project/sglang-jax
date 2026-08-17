@@ -16,8 +16,10 @@ single source of truth for GDN numerics after P1.
 
 from __future__ import annotations
 
+import os
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -48,6 +50,15 @@ mesh = create_device_mesh(
     ici_parallelism=[1, 1], dcn_parallelism=[1, 1], devices=[jax.devices()[0]]
 )
 jax.sharding.set_mesh(mesh)
+
+
+def _chunked_jax_backend(**kwargs) -> GDNAttnBackend:
+    """Keep the native integration suite pinned to the route it validates."""
+    with mock.patch.dict(
+        os.environ,
+        {"SGLANG_JAX_GDN_PREFILL_IMPL": "chunked_jax"},
+    ):
+        return GDNAttnBackend(**kwargs)
 
 
 def _scaled_randn(rng: np.random.Generator, shape, scale: float = 0.1) -> np.ndarray:
@@ -406,7 +417,7 @@ def create_test_data(
     has_initial_state_np = np.asarray(has_initial_state_per_req, dtype=np.bool_)
 
     backend = GDNAttnBackendForTest(
-        GDNAttnBackend(
+        _chunked_jax_backend(
             num_k_heads=num_k_heads,
             num_v_heads=num_v_heads,
             head_k_dim=head_k_dim,

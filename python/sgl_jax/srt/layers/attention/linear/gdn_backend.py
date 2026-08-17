@@ -124,7 +124,7 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
                 f"of num_k_heads={num_k_heads} (GQA repeat factor)."
             )
 
-        self.prefill_impl = os.environ.get("SGLANG_JAX_GDN_PREFILL_IMPL", "chunked_jax")
+        self.prefill_impl = os.environ.get("SGLANG_JAX_GDN_PREFILL_IMPL", "fused_chunk_parallel")
         if self.prefill_impl not in {"chunked_jax", "fused_chunk_parallel"}:
             raise ValueError(
                 "SGLANG_JAX_GDN_PREFILL_IMPL must be one of "

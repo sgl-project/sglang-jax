@@ -15,8 +15,10 @@ self-contained.
 
 from __future__ import annotations
 
+import os
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -33,6 +35,15 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardM
 from sgl_jax.srt.utils.common_utils import pad_to_bucket
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.test.test_utils import CustomTestCase, GDNAttnBackendForTest
+
+
+def _chunked_jax_backend(**kwargs) -> GDNAttnBackend:
+    """Keep the native DP integration suite pinned to the route it validates."""
+    with mock.patch.dict(
+        os.environ,
+        {"SGLANG_JAX_GDN_PREFILL_IMPL": "chunked_jax"},
+    ):
+        return GDNAttnBackend(**kwargs)
 
 
 def _scaled_randn(rng: np.random.Generator, shape, scale: float = 0.1) -> np.ndarray:
@@ -518,7 +529,7 @@ def create_test_data(
 
     real_bs_per_dp = [len(lens_per_rank.get(r, [])) for r in range(dp_size)]
     backend = GDNAttnBackendForTest(
-        GDNAttnBackend(
+        _chunked_jax_backend(
             num_k_heads=num_k_heads,
             num_v_heads=num_v_heads,
             head_k_dim=head_k_dim,

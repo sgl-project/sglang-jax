@@ -39,18 +39,25 @@ def _backend(monkeypatch, *, impl=None, dtype=None, **overrides):
     return GDNAttnBackend(**config)
 
 
-def test_unset_selector_uses_frozen_chunked_jax_prefill(monkeypatch, caplog):
+def test_unset_selector_uses_frozen_fused_chunk_parallel_prefill(monkeypatch, caplog):
     caplog.set_level("INFO", logger="sgl_jax.srt.layers.attention.linear.gdn_backend")
-    backend = _backend(monkeypatch)
+    monkeypatch.setattr(
+        "sgl_jax.srt.kernels.gdn.fused_chunk_parallel_adapter._mesh_devices",
+        lambda _: (SimpleNamespace(platform="tpu"),),
+    )
+    backend = _backend(monkeypatch, dtype=jnp.bfloat16)
 
-    assert backend.prefill_impl == "chunked_jax"
-    assert backend._prefill_callable is GDNAttnBackend._forward_extend_chunked_jax
+    assert backend.prefill_impl == "fused_chunk_parallel"
+    assert backend._prefill_callable is fused_chunk_parallel_prefill
     assert backend._decode_callable is decode_gated_delta_rule_ref
     assert not hasattr(backend, "requested_prefill_impl")
     assert not hasattr(backend, "effective_prefill_impl")
     assert not hasattr(backend, "fallback_reason")
     assert (
-        sum("GDN prefill implementation=chunked_jax" in record.message for record in caplog.records)
+        sum(
+            "GDN prefill implementation=fused_chunk_parallel" in record.message
+            for record in caplog.records
+        )
         == 1
     )
 
