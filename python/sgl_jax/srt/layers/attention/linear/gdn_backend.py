@@ -124,18 +124,18 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
                 f"of num_k_heads={num_k_heads} (GQA repeat factor)."
             )
 
-        self.prefill_impl = os.environ.get("SGLANG_JAX_GDN_PREFILL_IMPL", "token_scan")
-        if self.prefill_impl not in {"token_scan", "fused_chunk_parallel"}:
+        self.prefill_impl = os.environ.get("SGLANG_JAX_GDN_PREFILL_IMPL", "chunked_jax")
+        if self.prefill_impl not in {"chunked_jax", "fused_chunk_parallel"}:
             raise ValueError(
                 "SGLANG_JAX_GDN_PREFILL_IMPL must be one of "
-                "'token_scan' or 'fused_chunk_parallel'."
+                "'chunked_jax' or 'fused_chunk_parallel'."
             )
         self._decode_callable: Callable[..., tuple[jax.Array, jax.Array]] = (
             decode_gated_delta_rule_ref
         )
         self._prefill_callable: Callable[..., tuple[jax.Array, jax.Array, jax.Array]]
-        if self.prefill_impl == "token_scan":
-            self._prefill_callable = GDNAttnBackend._forward_extend_token_scan
+        if self.prefill_impl == "chunked_jax":
+            self._prefill_callable = GDNAttnBackend._forward_extend_chunked_jax
         else:
             validate_fused_chunk_parallel_capability(
                 mesh=mesh,
@@ -368,7 +368,7 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
             seq_lens,
         )
 
-    def _forward_extend_token_scan(
+    def _forward_extend_chunked_jax(
         self,
         mixed_qkv: jax.Array,
         conv_state_in: jax.Array,

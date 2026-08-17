@@ -467,7 +467,7 @@ def test_forward_extend_executes_the_callable_frozen_at_initialization(monkeypat
     )
     # Mutating both selector state and the backend module's symbol after
     # construction must not replace the initialized callable.
-    monkeypatch.setenv("SGLANG_JAX_GDN_PREFILL_IMPL", "token_scan")
+    monkeypatch.setenv("SGLANG_JAX_GDN_PREFILL_IMPL", "chunked_jax")
     monkeypatch.setattr(
         gdn_backend,
         "fused_chunk_parallel_prefill",

@@ -39,27 +39,27 @@ def _backend(monkeypatch, *, impl=None, dtype=None, **overrides):
     return GDNAttnBackend(**config)
 
 
-def test_unset_selector_uses_frozen_token_scan_prefill(monkeypatch, caplog):
+def test_unset_selector_uses_frozen_chunked_jax_prefill(monkeypatch, caplog):
     caplog.set_level("INFO", logger="sgl_jax.srt.layers.attention.linear.gdn_backend")
     backend = _backend(monkeypatch)
 
-    assert backend.prefill_impl == "token_scan"
-    assert backend._prefill_callable is GDNAttnBackend._forward_extend_token_scan
+    assert backend.prefill_impl == "chunked_jax"
+    assert backend._prefill_callable is GDNAttnBackend._forward_extend_chunked_jax
     assert backend._decode_callable is decode_gated_delta_rule_ref
     assert not hasattr(backend, "requested_prefill_impl")
     assert not hasattr(backend, "effective_prefill_impl")
     assert not hasattr(backend, "fallback_reason")
     assert (
-        sum("GDN prefill implementation=token_scan" in record.message for record in caplog.records)
+        sum("GDN prefill implementation=chunked_jax" in record.message for record in caplog.records)
         == 1
     )
 
 
-def test_explicit_token_scan_uses_existing_prefill(monkeypatch):
-    backend = _backend(monkeypatch, impl="token_scan")
+def test_explicit_chunked_jax_uses_existing_prefill(monkeypatch):
+    backend = _backend(monkeypatch, impl="chunked_jax")
 
-    assert backend.prefill_impl == "token_scan"
-    assert backend._prefill_callable is GDNAttnBackend._forward_extend_token_scan
+    assert backend.prefill_impl == "chunked_jax"
+    assert backend._prefill_callable is GDNAttnBackend._forward_extend_chunked_jax
     assert backend._decode_callable is decode_gated_delta_rule_ref
 
 
@@ -69,14 +69,14 @@ def test_fused_chunk_parallel_uses_distinct_frozen_adapter(monkeypatch):
         lambda _: (SimpleNamespace(platform="tpu"),),
     )
     backend = _backend(monkeypatch, impl="fused_chunk_parallel", dtype=jnp.bfloat16)
-    monkeypatch.setenv("SGLANG_JAX_GDN_PREFILL_IMPL", "token_scan")
+    monkeypatch.setenv("SGLANG_JAX_GDN_PREFILL_IMPL", "chunked_jax")
 
     assert backend.prefill_impl == "fused_chunk_parallel"
     assert backend._prefill_callable is fused_chunk_parallel_prefill
     assert backend._decode_callable is decode_gated_delta_rule_ref
 
 
-@pytest.mark.parametrize("impl", ["reference", "separate", "chunkwise"])
+@pytest.mark.parametrize("impl", ["reference", "separate", "chunkwise", "token_scan"])
 def test_invalid_selector_fails_during_initialization(monkeypatch, impl):
     with pytest.raises(ValueError, match="SGLANG_JAX_GDN_PREFILL_IMPL"):
         _backend(monkeypatch, impl=impl)
