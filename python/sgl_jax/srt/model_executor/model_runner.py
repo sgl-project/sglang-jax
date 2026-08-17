@@ -245,18 +245,20 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         enable_tpu_log_recorder = jax.default_backend() == "tpu" and (
             get_bool_env_var("SGLANG_JAX_ENABLE_KERNEL_LOG_RECORDER")
         )
-        jit_compiler_options = dict(
-            getattr(self.attn_backend, "compiler_options", {})
+        jit_compiler_options = (
+            {"xla_tpu_enable_log_recorder": "true"} if enable_tpu_log_recorder else None
         )
-        if enable_tpu_log_recorder:
-            jit_compiler_options["xla_tpu_enable_log_recorder"] = "true"
         if enable_tpu_log_recorder:
             logger.info(
                 "Enabling TPU log recorder for JIT compilation "
                 "(compiler_options: xla_tpu_enable_log_recorder=true)."
             )
-        if not jit_compiler_options:
-            jit_compiler_options = None
+        backend_compiler_options = getattr(self.attn_backend, "compiler_options", None)
+        if backend_compiler_options:
+            jit_compiler_options = {
+                **backend_compiler_options,
+                **(jit_compiler_options or {}),
+            }
 
         @partial(
             jax.jit,
