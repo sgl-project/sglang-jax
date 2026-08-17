@@ -32,9 +32,7 @@ def test_fused_chain_overlap_uses_common_relay_envelope():
         per_dp_bs_size=3,
     )
     prepare_verify = Mock(return_value=("token-map", True))
-    launch_draft = Mock(
-        return_value=SimpleNamespace(updated_relay_buffers="new-buffers")
-    )
+    launch_draft = Mock(return_value=SimpleNamespace(updated_relay_buffers="new-buffers"))
 
     with patch(
         "sgl_jax.srt.speculative.draft_extend_fused.spec_decode_verify",

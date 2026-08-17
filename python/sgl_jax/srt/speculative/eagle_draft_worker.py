@@ -34,9 +34,7 @@ class EagleDraftWorker(BaseDraftWorker):
             server_args.speculative_algorithm
         )
         if not self.speculative_algorithm.is_eagle() or self.topk != 1:
-            raise ValueError(
-                "EagleDraftWorker only supports EAGLE/EAGLE3/NEXTN with topk=1."
-            )
+            raise ValueError("EagleDraftWorker only supports EAGLE/EAGLE3/NEXTN with topk=1.")
         self.hot_token_ids = None
 
         req_to_token_pool, _ = target_worker.get_memory_pool()
@@ -127,9 +125,7 @@ class EagleDraftWorker(BaseDraftWorker):
             model_worker_batch,
         )
         if not has_raw_recurrent_chain:
-            from sgl_jax.srt.speculative.draft_extend_fused import (
-                bootstrap_eagle_chain,
-            )
+            from sgl_jax.srt.speculative.draft_extend_fused import bootstrap_eagle_chain
 
             model_worker_batch.spec_info_padded.topk_index = bootstrap_eagle_chain(
                 self,
@@ -258,9 +254,9 @@ class EagleDraftWorker(BaseDraftWorker):
             ):
                 r = int(seq_idx) // per_dp_bs
                 base = r * per_dp_cache_len + intra_rank_off[r]
-                assert base + aligned_len <= (r + 1) * per_dp_cache_len, (
-                    f"rank {r} cache_loc overflow: {intra_rank_off[r] + aligned_len} > {per_dp_cache_len}"
-                )
+                assert (
+                    base + aligned_len <= (r + 1) * per_dp_cache_len
+                ), f"rank {r} cache_loc overflow: {intra_rank_off[r] + aligned_len} > {per_dp_cache_len}"
                 if uses_host_state:
                     cache_loc_cpu[base : base + allocate_len] = token_indices_with_all_reqs[
                         seq_idx, :allocate_len

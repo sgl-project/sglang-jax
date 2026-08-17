@@ -382,9 +382,7 @@ class SchedulerOutputProcessorMixin:
             result.cache_miss_count,
         )
         is_spec_decode = self.spec_algorithm is not None and not self.spec_algorithm.is_none()
-        uses_host_state = uses_host_eagle_state(
-            self.enable_overlap, self.spec_algorithm
-        )
+        uses_host_state = uses_host_eagle_state(self.enable_overlap, self.spec_algorithm)
         if is_spec_decode:
             from sgl_jax.srt.speculative.overlap_utils import (
                 resolve_spec_decode_token_ids,
@@ -517,10 +515,7 @@ class SchedulerOutputProcessorMixin:
                     )
                 elif (
                     is_spec_decode
-                    and (
-                        self.spec_algorithm.is_eagle()
-                        or self.spec_algorithm.is_dflash()
-                    )
+                    and (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash())
                     and not uses_host_state
                 ):
                     req.kv_committed_len += new_accepted_len - 1

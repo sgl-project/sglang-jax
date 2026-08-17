@@ -9,8 +9,8 @@ from sgl_jax.srt.layers.attention.flashattention_metadata import (
     build_target_verify_metadata,
     pad_page_indices,
 )
-from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput, _mask_draft_kv_writes
 from sgl_jax.srt.speculative.base_worker import BaseSpecWorker
+from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput, _mask_draft_kv_writes
 from sgl_jax.srt.speculative.dflash_worker import DFlashWorker
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -100,14 +100,10 @@ def test_verify_metadata_uses_explicit_active_slots():
         dp_size=1,
     )
 
-    np.testing.assert_array_equal(
-        np.asarray(metadata.cu_q_lens), np.array([0, 4, 8, 8, 8])
-    )
+    np.testing.assert_array_equal(np.asarray(metadata.cu_q_lens), np.array([0, 4, 8, 8, 8]))
     np.testing.assert_array_equal(np.asarray(metadata.cu_kv_lens), np.array([0, 8, 12, 12, 12]))
     np.testing.assert_array_equal(np.asarray(metadata.seq_lens), np.array([8, 4, 0, 0]))
-    np.testing.assert_array_equal(
-        np.asarray(metadata.distribution), np.array([0, 2, 2])
-    )
+    np.testing.assert_array_equal(np.asarray(metadata.distribution), np.array([0, 2, 2]))
 
 
 def test_build_page_indices_preserves_dp_rank_sections():

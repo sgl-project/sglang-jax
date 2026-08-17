@@ -153,9 +153,7 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         model_worker_batch.spec_info_padded.capture_hidden_mode = CaptureHiddenMode.FULL
 
-        from sgl_jax.srt.speculative.draft_extend_fused import (
-            mtp_prefill_draft_extend,
-        )
+        from sgl_jax.srt.speculative.draft_extend_fused import mtp_prefill_draft_extend
 
         selected_hidden, token_chain = mtp_prefill_draft_extend(
             self,
@@ -165,9 +163,9 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         model_worker_batch.spec_info_padded.hidden_states = selected_hidden
         model_worker_batch.spec_info_padded.topk_index = token_chain
         model_worker_batch.spec_info_padded.verified_id = verified_id
-        model_worker_batch.spec_info_padded.allocate_lens = np.asarray(
-            model_worker_batch.seq_lens
-        )[selector]
+        model_worker_batch.spec_info_padded.allocate_lens = np.asarray(model_worker_batch.seq_lens)[
+            selector
+        ]
 
     def draft_extend_for_decode(
         self,

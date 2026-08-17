@@ -1829,18 +1829,14 @@ class ServerArgs:
             if self.speculative_eagle_topk != 1:
                 raise ValueError(f"{algorithm} requires --speculative-eagle-topk=1.")
             if self.speculative_num_steps <= 1:
-                raise ValueError(
-                    f"{algorithm} fused decode requires --speculative-num-steps>1."
-                )
+                raise ValueError(f"{algorithm} fused decode requires --speculative-num-steps>1.")
             if self.speculative_num_draft_tokens != self.speculative_num_steps + 1:
                 raise ValueError(
                     f"{algorithm} requires --speculative-num-draft-tokens == "
                     "--speculative-num-steps + 1."
                 )
             if self.attention_backend != "fa":
-                raise ValueError(
-                    f"{algorithm}+FA fused decode requires --attention-backend=fa."
-                )
+                raise ValueError(f"{algorithm}+FA fused decode requires --attention-backend=fa.")
 
         # DFLASH: non-causal one-shot diffusion draft + linear-chain greedy verify.
         if self.speculative_algorithm == "DFLASH":

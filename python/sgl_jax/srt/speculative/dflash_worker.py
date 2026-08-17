@@ -678,6 +678,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
 
         from sgl_jax.srt.lora.context_manager import LoraBatchContext
         from sgl_jax.srt.model_executor.model_runner import _maybe_apply_recurrent_cow
+
         runner = self.draft_model_runner
         model_def = runner._model_def
         model_state_def = runner._model_state_def
@@ -864,6 +865,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
 
         from sgl_jax.srt.lora.context_manager import LoraBatchContext
         from sgl_jax.srt.model_executor.model_runner import _maybe_apply_recurrent_cow
+
         runner = self.target_worker.model_runner
         model_def = runner._model_def
         model_state_def = runner._model_state_def

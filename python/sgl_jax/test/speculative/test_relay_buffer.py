@@ -7,6 +7,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.speculative.overlap_utils import prefetch_published_new_seq_lens
 from sgl_jax.srt.speculative.relay_buffer import (
     DFlashRelayBuffers,
     SpecRelayBuffers,
@@ -16,7 +17,6 @@ from sgl_jax.srt.speculative.relay_buffer import (
     gather_relay_buffers,
     scatter_relay_buffers,
 )
-from sgl_jax.srt.speculative.overlap_utils import prefetch_published_new_seq_lens
 
 
 def test_build_relay_batch_plan_separates_compact_and_padded_indices():

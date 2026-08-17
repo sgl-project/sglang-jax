@@ -144,9 +144,7 @@ def gather_relay_buffers(buffers, future_indices, *, dp_size: int):
     def _gather_leaf(buffer):
         buffer_sharding = jax.typeof(buffer).sharding
         if isinstance(buffer_sharding, NamedSharding) and not buffer_sharding.mesh.empty:
-            gathered = buffer.at[dp_indices, indices].get(
-                out_sharding=buffer_sharding.spec
-            )
+            gathered = buffer.at[dp_indices, indices].get(out_sharding=buffer_sharding.spec)
         else:
             gathered = buffer.at[dp_indices, indices].get()
         gathered = gathered.reshape(future_indices.shape + buffer.shape[2:])

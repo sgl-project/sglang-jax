@@ -180,9 +180,7 @@ def greedy_chain_verify(
         target_predict_2d = jax.sharding.reshard(target_predict_2d, data_2d)
 
     child_matches = draft_2d[:, 1:] == target_predict_2d[:, :-1]
-    accepted_children = jnp.cumprod(child_matches.astype(jnp.int32), axis=1).astype(
-        jnp.bool_
-    )
+    accepted_children = jnp.cumprod(child_matches.astype(jnp.int32), axis=1).astype(jnp.bool_)
     if valid_mask is not None:
         accepted_children = jnp.where(
             valid_mask.reshape((-1, 1)),

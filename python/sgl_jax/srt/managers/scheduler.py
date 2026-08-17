@@ -1931,9 +1931,8 @@ class Scheduler(
         self._process_pending_chunked_aborts()
 
         force_eagle_bootstrap_decode = False
-        if (
-            self._eagle_overlap_parked_batch is not None
-            and not (self.last_batch and self.last_batch.forward_mode.is_extend())
+        if self._eagle_overlap_parked_batch is not None and not (
+            self.last_batch and self.last_batch.forward_mode.is_extend()
         ):
             # The isolated bootstrap decode has now published relay state.
             # Restore the older running requests first so request/spec state
@@ -2536,10 +2535,7 @@ class Scheduler(
                 batch_output.next_token_ids
                 if (
                     self.spec_algorithm is not None
-                    and (
-                        self.spec_algorithm.is_eagle()
-                        or self.spec_algorithm.is_dflash()
-                    )
+                    and (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash())
                     and (batch.forward_mode.is_decode() or defer_spec_prefill_output)
                     and self.enable_overlap
                 )
@@ -2629,9 +2625,8 @@ class Scheduler(
         use_spec_prefill_overlap = can_use_spec_prefill_overlap(
             self.enable_overlap, self.spec_algorithm, batch
         ) and self.draft_worker._can_use_fused_spec_prefill(model_worker_batch)
-        uses_host_eagle_decode_state = (
-            batch.forward_mode.is_decode()
-            and uses_host_eagle_state(self.enable_overlap, self.spec_algorithm)
+        uses_host_eagle_decode_state = batch.forward_mode.is_decode() and uses_host_eagle_state(
+            self.enable_overlap, self.spec_algorithm
         )
         if use_spec_decode_overlap:
             batch_output, published_new_seq_lens = (

@@ -602,9 +602,7 @@ class TestFusedEagle(CustomTestCase):
         )
         batch = SimpleNamespace(
             seq_lens=np.array([10, 20], dtype=np.int32),
-            spec_info_padded=EagleDraftInput(
-                future_indices=np.array([3, 5], dtype=np.int32)
-            ),
+            spec_info_padded=EagleDraftInput(future_indices=np.array([3, 5], dtype=np.int32)),
         )
 
         _prepare_verify(worker, batch)
@@ -618,9 +616,7 @@ class TestFusedEagle(CustomTestCase):
             CaptureHiddenMode,
             ForwardMode,
         )
-        from sgl_jax.srt.speculative.draft_extend_fused import (
-            _prepare_logits_metadata,
-        )
+        from sgl_jax.srt.speculative.draft_extend_fused import _prepare_logits_metadata
 
         metadata = _prepare_logits_metadata(
             SimpleNamespace(
@@ -788,7 +784,6 @@ class TestFusedEagle(CustomTestCase):
             np.asarray(out.new_seq_lens),
             np.array([105, 308], dtype=np.int32),
         )
-
 
 
 if __name__ == "__main__":

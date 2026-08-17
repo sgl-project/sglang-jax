@@ -593,10 +593,13 @@ def _build_mtp_prefill_draft_extend(num_layers: int):
         selected_indices = draft_logits_indices
         if dp_size > 1:
             per_dp_tokens = layer0_hidden.shape[0] // dp_size
-            rank_ids = jnp.arange(
-                selected_indices.shape[0],
-                dtype=jnp.int32,
-            ) // per_dp_bs
+            rank_ids = (
+                jnp.arange(
+                    selected_indices.shape[0],
+                    dtype=jnp.int32,
+                )
+                // per_dp_bs
+            )
             selected_indices = selected_indices + rank_ids * per_dp_tokens
         selected_hidden = _gather_rows_preserve_sharding(
             layer0_hidden,
@@ -710,10 +713,13 @@ def _build_mtp_draft_extend(num_layers: int):
         if dp_size > 1:
             per_dp_tokens = layer0_hidden.shape[0] // dp_size
             per_dp_bs = selected_indices.shape[0] // dp_size
-            rank_ids = jnp.arange(
-                selected_indices.shape[0],
-                dtype=jnp.int32,
-            ) // per_dp_bs
+            rank_ids = (
+                jnp.arange(
+                    selected_indices.shape[0],
+                    dtype=jnp.int32,
+                )
+                // per_dp_bs
+            )
             selected_indices = selected_indices + rank_ids * per_dp_tokens
         selected_hidden = _gather_rows_preserve_sharding(
             layer0_hidden,
@@ -828,9 +834,7 @@ def _build_eagle3_bootstrap(num_steps: int):
 
         raw_token = initial_raw_token
         token = (
-            raw_token
-            if hot_token_ids is None
-            else _map_eagle3_token_ids(raw_token, hot_token_ids)
+            raw_token if hot_token_ids is None else _map_eagle3_token_ids(raw_token, hot_token_ids)
         )
         hidden = initial_hidden
         raw_tokens = [raw_token]
@@ -1104,9 +1108,7 @@ def _build_verify():
                 _,
                 relay_verified_id,
                 relay_new_seq_lens,
-            ) = gather_relay_buffers(
-                relay_buffers, relay_future_indices, dp_size=dp_size
-            )
+            ) = gather_relay_buffers(relay_buffers, relay_future_indices, dp_size=dp_size)
             valid_seq_lens = target_forward_batch.seq_lens > 0
             target_forward_batch.seq_lens = jnp.where(
                 valid_seq_lens,
@@ -1117,15 +1119,13 @@ def _build_verify():
             previous_token_list = relay_topk_index
 
         if use_relay_state or rebuild_verify_metadata:
-            target_forward_batch.attn_backend.forward_metadata = (
-                build_target_verify_metadata(
-                    target_forward_batch.attn_backend.forward_metadata,
-                    target_forward_batch.seq_lens,
-                    verify_allocate_lens,
-                    draft_width=speculative_num_draft_tokens,
-                    page_size=target_forward_batch.attn_backend.page_size,
-                    dp_size=dp_size,
-                )
+            target_forward_batch.attn_backend.forward_metadata = build_target_verify_metadata(
+                target_forward_batch.attn_backend.forward_metadata,
+                target_forward_batch.seq_lens,
+                verify_allocate_lens,
+                draft_width=speculative_num_draft_tokens,
+                page_size=target_forward_batch.attn_backend.page_size,
+                dp_size=dp_size,
             )
 
         if draft_to_target_token_ids is not None:
@@ -1547,16 +1547,13 @@ def mtp_prefill_draft_extend(draft_worker, model_worker_batch, target_hidden):
         "mtp_prefill.allocate_lens",
     )
 
-    all_memory_pools = tuple(
-        worker.model_runner.memory_pools for worker in draft_worker._workers
-    )
+    all_memory_pools = tuple(worker.model_runner.memory_pools for worker in draft_worker._workers)
     all_leaves = tuple(
-        tuple(worker.model_runner.model_state_leaves)
-        for worker in draft_worker._workers
+        tuple(worker.model_runner.model_state_leaves) for worker in draft_worker._workers
     )
     if not hasattr(draft_worker, "_fused_mtp_prefill_draft_extend_jit_fn"):
-        draft_worker._fused_mtp_prefill_draft_extend_jit_fn = (
-            _build_mtp_prefill_draft_extend(draft_worker.speculative_num_steps)
+        draft_worker._fused_mtp_prefill_draft_extend_jit_fn = _build_mtp_prefill_draft_extend(
+            draft_worker.speculative_num_steps
         )
 
     with jax.set_mesh(draft_worker.mesh):
@@ -1772,9 +1769,7 @@ def launch_mtp_draft_extend_for_decode(
     if selected_positions is None:
         selected_positions = getattr(batch_output.next_draft_input, "sel_pos", None)
     if selected_positions is None:
-        selected_positions = jnp.clip(batch_output.accept_lens - 1, 0, None).astype(
-            jnp.int32
-        )
+        selected_positions = jnp.clip(batch_output.accept_lens - 1, 0, None).astype(jnp.int32)
     selected_positions = _prepare_device_array(
         selected_positions,
         data_sharding,
@@ -1802,9 +1797,7 @@ def launch_mtp_draft_extend_for_decode(
             model_worker_batch.seq_lens,
             dtype=np.int32,
         )
-        draft_allocate_lens[selector] = np.asarray(
-            batch_output.next_draft_input.allocate_lens
-        )
+        draft_allocate_lens[selector] = np.asarray(batch_output.next_draft_input.allocate_lens)
     draft_allocate_lens = _prepare_device_array(
         draft_allocate_lens,
         data_sharding,
@@ -1837,12 +1830,9 @@ def launch_mtp_draft_extend_for_decode(
             "mtp_draft_extend.relay_valid_mask",
         )
 
-    all_memory_pools = tuple(
-        worker.model_runner.memory_pools for worker in draft_worker._workers
-    )
+    all_memory_pools = tuple(worker.model_runner.memory_pools for worker in draft_worker._workers)
     all_leaves = tuple(
-        tuple(worker.model_runner.model_state_leaves)
-        for worker in draft_worker._workers
+        tuple(worker.model_runner.model_state_leaves) for worker in draft_worker._workers
     )
     if not hasattr(draft_worker, "_fused_mtp_draft_extend_jit_fn"):
         draft_worker._fused_mtp_draft_extend_jit_fn = _build_mtp_draft_extend(
@@ -2035,28 +2025,26 @@ def launch_eagle_recurrent_draft_extend_for_decode(
             topk_index_stacked,
             pool_updates,
             updated_relay_buffers,
-        ) = (
-            draft_worker._fused_eagle3_recurrent_draft_extend_jit_fn(
-                runner._model_def,
-                runner._model_state_def,
-                tuple(runner.model_state_leaves),
-                forward_batch,
-                runner.memory_pools,
-                logits_metadata,
-                target_hidden,
-                draft_logits_indices,
-                draft_verify_seq_lens,
-                draft_allocate_lens,
-                next_verified_id,
-                next_new_seq_lens,
-                draft_worker.hot_token_ids,
-                relay_buffers,
-                relay_future_indices,
-                relay_valid_mask,
-                num_steps=draft_worker.speculative_num_steps,
-                update_relay=update_relay,
-                dp_size=model_worker_batch.dp_size,
-            )
+        ) = draft_worker._fused_eagle3_recurrent_draft_extend_jit_fn(
+            runner._model_def,
+            runner._model_state_def,
+            tuple(runner.model_state_leaves),
+            forward_batch,
+            runner.memory_pools,
+            logits_metadata,
+            target_hidden,
+            draft_logits_indices,
+            draft_verify_seq_lens,
+            draft_allocate_lens,
+            next_verified_id,
+            next_new_seq_lens,
+            draft_worker.hot_token_ids,
+            relay_buffers,
+            relay_future_indices,
+            relay_valid_mask,
+            num_steps=draft_worker.speculative_num_steps,
+            update_relay=update_relay,
+            dp_size=model_worker_batch.dp_size,
         )
 
     runner.memory_pools.replace_all(pool_updates)
@@ -2127,14 +2115,12 @@ def spec_decode_verify(
     spec_info.prepare_for_verify(model_worker_batch)
     rebuild_verify_metadata = draft_padding_prepared
     if not (rebuild_verify_metadata or use_relay_state):
-        raise RuntimeError(
-            "EAGLE/EAGLE3/NEXTN verify requires device-built fused metadata."
-        )
+        raise RuntimeError("EAGLE/EAGLE3/NEXTN verify requires device-built fused metadata.")
     # Relay verify replaces seq_lens from the device relay buffer; first-round
     # verify uses the padded bootstrap lengths. Both rebuild complete metadata
     # inside fused_verify from this physical page layout.
-    target_mr.attn_backend.forward_metadata = (
-        target_mr.attn_backend.prepare_paged_kv_layout(model_worker_batch)
+    target_mr.attn_backend.forward_metadata = target_mr.attn_backend.prepare_paged_kv_layout(
+        model_worker_batch
     )
     target_forward_batch = _make_forward_batch(model_worker_batch, target_mr)
     target_forward_batch.bid = model_worker_batch.bid
@@ -2180,9 +2166,7 @@ def spec_decode_verify(
         if sampling_inputs is None:
             sampling_inputs = (
                 _prepare_device_array(np.ones((_sv_tbs, 1), np.float32), data_sharding),
-                _prepare_device_array(
-                    np.full((_sv_tbs,), TOP_K_ALL, np.int32), data_sharding
-                ),
+                _prepare_device_array(np.full((_sv_tbs,), TOP_K_ALL, np.int32), data_sharding),
                 _prepare_device_array(np.ones((_sv_tbs,), np.float32), data_sharding),
             )
             constant_cache[sampling_key] = sampling_inputs

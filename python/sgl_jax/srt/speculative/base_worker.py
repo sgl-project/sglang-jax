@@ -81,16 +81,11 @@ class BaseSpecWorker:
             and self.speculative_num_steps > 1
             and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
         )
-        is_multi_layer_mtp = bool(
-            getattr(draft_worker, "is_multi_layer_mtp", False)
-        )
+        is_multi_layer_mtp = bool(getattr(draft_worker, "is_multi_layer_mtp", False))
         self._can_use_fused_eagle_verify = (
             (
                 self.speculative_algorithm.is_eagle_family()
-                or (
-                    self.speculative_algorithm.is_nextn()
-                    and not is_multi_layer_mtp
-                )
+                or (self.speculative_algorithm.is_nextn() and not is_multi_layer_mtp)
             )
             and can_use_linear_fused_verify
             and server_args.attention_backend == "fa"
@@ -102,10 +97,7 @@ class BaseSpecWorker:
             and can_use_linear_fused_verify
             and server_args.attention_backend == "fa"
         )
-        if (
-            self.speculative_algorithm.is_eagle_family()
-            and not self._can_use_fused_eagle_verify
-        ):
+        if self.speculative_algorithm.is_eagle_family() and not self._can_use_fused_eagle_verify:
             raise ValueError(
                 "EAGLE/EAGLE3 only support the fused topk=1 FA path; check num_steps, "
                 "num_draft_tokens, attention_backend, and "
@@ -180,8 +172,7 @@ class BaseSpecWorker:
                 "prefill overlap uses forward_batch_speculative_generation()."
             )
         if not (
-            self._can_use_fused_eagle_verify
-            or getattr(self, "_can_use_fused_mtp_verify", False)
+            self._can_use_fused_eagle_verify or getattr(self, "_can_use_fused_mtp_verify", False)
         ):
             raise NotImplementedError(
                 "Spec overlap entry only supports fused topk=1 EAGLE/EAGLE3/NEXTN decode."
