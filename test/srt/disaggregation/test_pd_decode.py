@@ -719,9 +719,7 @@ def test_retract_all_aborts_live_receivers_but_skips_cancelled_entries():
     queue = DecodeTransferQueue()
     live_receiver = mock.Mock()
     cancelled_receiver = mock.Mock()
-    live = DecodeBookkeeping(
-        req_id="live", req=_AdmReq("live", 4), receiver=live_receiver
-    )
+    live = DecodeBookkeeping(req_id="live", req=_AdmReq("live", 4), receiver=live_receiver)
     cancelled = DecodeBookkeeping(
         req_id="cancelled",
         req=_AdmReq("cancelled", 4),
