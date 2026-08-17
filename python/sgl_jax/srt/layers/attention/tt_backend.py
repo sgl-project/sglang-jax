@@ -16,6 +16,7 @@ from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.radix_attention import RadixAttention
+from sgl_jax.srt.kernels import tt_attention as tt_ops
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -26,51 +27,9 @@ from sgl_jax.srt.utils.profiling_utils import named_scope
 logger = logging.getLogger(__name__)
 
 
-def _tt_call(target, result, *operands, config=""):
-    return jax.ffi.ffi_call(
-        target,
-        jax.ShapeDtypeStruct(result.shape, result.dtype),
-        custom_call_api_version=2,
-        legacy_backend_config=config,
-    )(*operands)
-
-
-def _prefill_attention(query, key, value):
-    return _tt_call("tt.scaled_dot_product_attention", query, query, key, value)
-
-
-def _decode_attention(query, key, value, page_table, positions):
-    return _tt_call(
-        "tt.paged_scaled_dot_product_attention_decode",
-        query,
-        query,
-        key,
-        value,
-        page_table,
-        positions,
-    )
-
-
-def _update_cache(cache, value, positions, page_table):
-    return _tt_call(
-        "tt.paged_update_cache", cache, cache, value, positions, page_table
-    )
-
-
-def _fill_cache(cache, value, page_table, batch_indices):
-    return _tt_call(
-        "tt.paged_fill_cache", cache, cache, value, page_table, batch_indices
-    )
-
-
 def prepare_weight(tensor):
-    """Mark a JIT argument as a TT parameter and select its storage dtype."""
-    original_shape = tensor.shape
-    if tensor.ndim < 3:
-        tensor = jnp.reshape(tensor, (1,) * (3 - tensor.ndim) + original_shape)
-    dtype = "bf16" if len(original_shape) == 1 else "bfp_bf8"
-    tensor = _tt_call("tt.weight_dtype_override", tensor, tensor, config=dtype)
-    return jnp.reshape(tensor, original_shape)
+    dtype = "bf16" if tensor.ndim == 1 else "bfp_bf8"
+    return tt_ops.annotate_weight_dtype(tensor, dtype)
 
 
 @register_pytree_node_class
@@ -351,13 +310,13 @@ class TTAttention(AttentionBackend):
             raise ValueError("TT prefill metadata is missing")
 
         k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        k_cache = _fill_cache(
+        k_cache = tt_ops.paged_fill_cache(
             k_cache,
             self._prefill_cache_value(k, k_cache.shape[-1]),
             metadata.fill_page_table,
             metadata.fill_batch_indices,
         )
-        v_cache = _fill_cache(
+        v_cache = tt_ops.paged_fill_cache(
             v_cache,
             self._prefill_cache_value(v, v_cache.shape[-1]),
             metadata.fill_page_table,
@@ -378,13 +337,17 @@ class TTAttention(AttentionBackend):
             padding = ((0, 0), (0, padded_tokens - tokens), (0, 0), (0, 0))
             q, k, v = (jnp.pad(value, padding) for value in (q, k, v))
 
-        output = _prefill_attention(
+        output = tt_ops.scaled_dot_product_attention(
             jnp.transpose(q, (0, 2, 1, 3)),
             jnp.transpose(k, (0, 2, 1, 3)),
             jnp.transpose(v, (0, 2, 1, 3)),
         )
         output = jnp.transpose(output, (0, 2, 1, 3))[:, :tokens]
-        output = output.reshape(active_tokens, -1)
+        output = output.reshape(
+            active_tokens,
+            -1,
+            out_sharding=NamedSharding(self.mesh, P("data", "tensor")),
+        )
         if active_tokens < total_tokens:
             output = jnp.pad(output, ((0, total_tokens - active_tokens), (0, 0)))
         return output, (k_cache, v_cache)
@@ -403,11 +366,11 @@ class TTAttention(AttentionBackend):
 
         k_update = self._decode_cache_value(k, k_cache.shape[-1])
         v_update = self._decode_cache_value(v, v_cache.shape[-1])
-        k_cache = _update_cache(k_cache, k_update, positions, page_table)
-        v_cache = _update_cache(v_cache, v_update, positions, page_table)
+        k_cache = tt_ops.paged_update_cache(k_cache, k_update, positions, page_table)
+        v_cache = tt_ops.paged_update_cache(v_cache, v_update, positions, page_table)
         k_cache, v_cache = self._cache_barrier((k_cache, v_cache))
 
-        output = _decode_attention(
+        output = tt_ops.paged_scaled_dot_product_attention_decode(
             q,
             k_cache,
             v_cache,
