@@ -115,10 +115,10 @@ def matmul_kernel(
             acc += acc_scratch[...]
 
         if is_last_step:
-            acc *= w_scale_ref[...]
             if quantize_activation:
                 # TODO(kyuyeunk): Investigate caching broadcast.
                 acc *= x_scale_tmp
+            acc *= w_scale_ref[...]
             out_ref[...] = acc.astype(x_ref_dtype)
         else:
             assert save_acc
