@@ -180,9 +180,8 @@ For the compiled model path, see [Global JIT Compile](global_jit_compile.md). Fo
 
 ### GDN Prefill Implementation
 
-`SGLANG_JAX_GDN_PREFILL_IMPL` selects the Gated DeltaNet prefill
-implementation at server startup. It is an environment variable rather than a
-`launch_server` argument.
+`--gdn-prefill-impl` selects the Gated DeltaNet prefill implementation at
+server startup.
 
 | Value | Behavior |
 |---|---|
@@ -197,11 +196,11 @@ initialization and logged once.
 Example:
 
 ```bash
-SGLANG_JAX_GDN_PREFILL_IMPL=fused_chunk_parallel \
 python3 -u -m sgl_jax.launch_server \
   --model-path <QWEN3_5_MODEL_PATH> \
   --device tpu \
   --dtype bfloat16 \
+  --gdn-prefill-impl fused_chunk_parallel \
   <OTHER_SERVE_ARGUMENTS>
 ```
 

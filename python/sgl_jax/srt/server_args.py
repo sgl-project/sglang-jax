@@ -182,6 +182,7 @@ class ServerArgs:
 
     # Kernel backend
     attention_backend: str | None = "fa"
+    gdn_prefill_impl: str = "fused_chunk_parallel"
     dsa_use_pallas: bool = True  # deprecated no-op; jnp-ref e2e path removed
     moe_backend: str = "epmoe"
     disable_jax_allreduce_metadata: bool = False
@@ -1397,6 +1398,18 @@ class ServerArgs:
                 "intended for kernel A/B on short contexts). "
                 "'dsa_sparse' = DeepSeek Sparse Attention (lightning-indexer top-k + sparse MLA) "
                 "with IndexShare cross-layer reuse; MLA models with index_* config only."
+            ),
+        )
+        parser.add_argument(
+            "--gdn-prefill-impl",
+            type=str,
+            choices=["chunked_jax", "fused_chunk_parallel"],
+            default=ServerArgs.gdn_prefill_impl,
+            help=(
+                "Choose the Qwen3.5 GDN prefill implementation. "
+                "'chunked_jax' uses the native JAX recurrence; "
+                "'fused_chunk_parallel' uses the Pallas fused Conv1D+GDN kernel. "
+                "Decode uses the base JAX implementation for both choices."
             ),
         )
         parser.add_argument(

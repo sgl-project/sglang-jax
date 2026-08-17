@@ -15,10 +15,8 @@ self-contained.
 
 from __future__ import annotations
 
-import os
 import unittest
 from types import SimpleNamespace
-from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -39,11 +37,7 @@ from sgl_jax.test.test_utils import CustomTestCase, GDNAttnBackendForTest
 
 def _chunked_jax_backend(**kwargs) -> GDNAttnBackend:
     """Keep the native DP integration suite pinned to the route it validates."""
-    with mock.patch.dict(
-        os.environ,
-        {"SGLANG_JAX_GDN_PREFILL_IMPL": "chunked_jax"},
-    ):
-        return GDNAttnBackend(**kwargs)
+    return GDNAttnBackend(prefill_impl="chunked_jax", **kwargs)
 
 
 def _scaled_randn(rng: np.random.Generator, shape, scale: float = 0.1) -> np.ndarray:

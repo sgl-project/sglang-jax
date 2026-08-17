@@ -26,7 +26,6 @@ inference. Returns ``(core_attn_out, new_conv, new_rec)`` shaped for
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -84,6 +83,7 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
         conv_kernel_size: int,
         mesh: jax.sharding.Mesh,
         dtype: jnp.dtype | None = None,
+        prefill_impl: str = "fused_chunk_parallel",
     ):
         super().__init__(mesh=mesh)
         self.num_k_heads = num_k_heads
@@ -124,12 +124,9 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
                 f"of num_k_heads={num_k_heads} (GQA repeat factor)."
             )
 
-        self.prefill_impl = os.environ.get("SGLANG_JAX_GDN_PREFILL_IMPL", "fused_chunk_parallel")
+        self.prefill_impl = prefill_impl
         if self.prefill_impl not in {"chunked_jax", "fused_chunk_parallel"}:
-            raise ValueError(
-                "SGLANG_JAX_GDN_PREFILL_IMPL must be one of "
-                "'chunked_jax' or 'fused_chunk_parallel'."
-            )
+            raise ValueError("gdn_prefill_impl must be 'chunked_jax' or 'fused_chunk_parallel'.")
         self._decode_callable: Callable[..., tuple[jax.Array, jax.Array]] = (
             decode_gated_delta_rule_ref
         )

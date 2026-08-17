@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from types import SimpleNamespace
 
 import jax
@@ -15,6 +16,7 @@ from sgl_jax.srt.kernels.gdn.fused_chunk_parallel_adapter import (
 )
 from sgl_jax.srt.layers.attention import hybrid_linear_attn_backend
 from sgl_jax.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+from sgl_jax.srt.server_args import ServerArgs
 
 
 def _mesh():
@@ -22,10 +24,6 @@ def _mesh():
 
 
 def _backend(monkeypatch, *, impl=None, dtype=None, **overrides):
-    if impl is None:
-        monkeypatch.delenv("SGLANG_JAX_GDN_PREFILL_IMPL", raising=False)
-    else:
-        monkeypatch.setenv("SGLANG_JAX_GDN_PREFILL_IMPL", impl)
     config = dict(
         num_k_heads=2,
         num_v_heads=4,
@@ -35,11 +33,30 @@ def _backend(monkeypatch, *, impl=None, dtype=None, **overrides):
         mesh=_mesh(),
         dtype=dtype,
     )
+    if impl is not None:
+        config["prefill_impl"] = impl
     config.update(overrides)
     return GDNAttnBackend(**config)
 
 
-def test_unset_selector_uses_frozen_fused_chunk_parallel_prefill(monkeypatch, caplog):
+@pytest.mark.parametrize(
+    ("extra_args", "expected"),
+    [
+        ([], "fused_chunk_parallel"),
+        (["--gdn-prefill-impl", "chunked_jax"], "chunked_jax"),
+    ],
+)
+def test_server_args_parses_gdn_prefill_impl(extra_args, expected):
+    parser = argparse.ArgumentParser()
+    ServerArgs.add_cli_args(parser)
+
+    namespace = parser.parse_args(["--model-path", "dummy", *extra_args])
+    server_args = ServerArgs.from_cli_args(namespace)
+
+    assert server_args.gdn_prefill_impl == expected
+
+
+def test_default_selector_uses_frozen_fused_chunk_parallel_prefill(monkeypatch, caplog):
     caplog.set_level("INFO", logger="sgl_jax.srt.layers.attention.linear.gdn_backend")
     monkeypatch.setattr(
         "sgl_jax.srt.kernels.gdn.fused_chunk_parallel_adapter._mesh_devices",
@@ -76,7 +93,6 @@ def test_fused_chunk_parallel_uses_distinct_frozen_adapter(monkeypatch):
         lambda _: (SimpleNamespace(platform="tpu"),),
     )
     backend = _backend(monkeypatch, impl="fused_chunk_parallel", dtype=jnp.bfloat16)
-    monkeypatch.setenv("SGLANG_JAX_GDN_PREFILL_IMPL", "chunked_jax")
 
     assert backend.prefill_impl == "fused_chunk_parallel"
     assert backend._prefill_callable is fused_chunk_parallel_prefill
@@ -85,7 +101,7 @@ def test_fused_chunk_parallel_uses_distinct_frozen_adapter(monkeypatch):
 
 @pytest.mark.parametrize("impl", ["reference", "separate", "chunkwise", "token_scan"])
 def test_invalid_selector_fails_during_initialization(monkeypatch, impl):
-    with pytest.raises(ValueError, match="SGLANG_JAX_GDN_PREFILL_IMPL"):
+    with pytest.raises(ValueError, match="gdn_prefill_impl"):
         _backend(monkeypatch, impl=impl)
 
 
@@ -117,7 +133,7 @@ def test_fused_chunk_parallel_requires_tpu_mesh_even_with_interpret(monkeypatch)
         _backend(monkeypatch, impl="fused_chunk_parallel", dtype=jnp.bfloat16)
 
 
-def test_production_constructor_passes_model_dtype_to_backend(monkeypatch):
+def test_production_constructor_passes_model_dtype_and_prefill_impl_to_backend(monkeypatch):
     captured = {}
 
     def fake_gdn_backend(**kwargs):
@@ -142,8 +158,10 @@ def test_production_constructor_passes_model_dtype_to_backend(monkeypatch):
         lightning_config=None,
         mesh=_mesh(),
         model_config=SimpleNamespace(dtype=jnp.bfloat16),
+        server_args=SimpleNamespace(gdn_prefill_impl="chunked_jax"),
     )
 
     hybrid_linear_attn_backend.attn_backend_wrapper(runner, SimpleNamespace())
 
     assert captured["dtype"] == jnp.bfloat16
+    assert captured["prefill_impl"] == "chunked_jax"

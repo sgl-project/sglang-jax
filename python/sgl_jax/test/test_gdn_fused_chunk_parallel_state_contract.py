@@ -293,7 +293,6 @@ def test_local_adapter_does_not_repeat_track_validation(monkeypatch):
 
 
 def test_forward_extend_rejects_active_dummy_track_before_vendor(monkeypatch):
-    monkeypatch.setenv("SGLANG_JAX_GDN_PREFILL_IMPL", "fused_chunk_parallel")
     monkeypatch.setenv(adapter._TRACK_VALIDATION_ENV, "1")
     monkeypatch.setattr(
         gdn_backend,
@@ -314,6 +313,7 @@ def test_forward_extend_rejects_active_dummy_track_before_vendor(monkeypatch):
         conv_kernel_size=KERNEL_SIZE,
         mesh=_mesh(),
         dtype=jnp.bfloat16,
+        prefill_impl="fused_chunk_parallel",
     )
     backend.forward_metadata = LinearRecurrentAttnBackendMetadata(
         cu_q_lens=jnp.asarray([0, 1], dtype=jnp.int32),
@@ -441,7 +441,6 @@ class _ForwardFixture:
 
 
 def test_forward_extend_executes_the_callable_frozen_at_initialization(monkeypatch):
-    monkeypatch.setenv("SGLANG_JAX_GDN_PREFILL_IMPL", "fused_chunk_parallel")
     monkeypatch.setattr(
         gdn_backend,
         "validate_fused_chunk_parallel_capability",
@@ -464,10 +463,11 @@ def test_forward_extend_executes_the_callable_frozen_at_initialization(monkeypat
         conv_kernel_size=KERNEL_SIZE,
         mesh=_mesh(),
         dtype=jnp.bfloat16,
+        prefill_impl="fused_chunk_parallel",
     )
     # Mutating both selector state and the backend module's symbol after
     # construction must not replace the initialized callable.
-    monkeypatch.setenv("SGLANG_JAX_GDN_PREFILL_IMPL", "chunked_jax")
+    backend.prefill_impl = "chunked_jax"
     monkeypatch.setattr(
         gdn_backend,
         "fused_chunk_parallel_prefill",
