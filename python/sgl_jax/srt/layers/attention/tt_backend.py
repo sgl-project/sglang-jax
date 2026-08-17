@@ -178,7 +178,6 @@ class TTAttention(AttentionBackend):
     """TTNN prefill and paged-decode attention with an in-place KV cache."""
 
     token_to_kv_pool_class = TTTokenToKVPool
-    updates_cache_in_place = True
     use_fast_greedy_sampler = True
     compiler_options = {
         "math_fidelity": "hifi4",

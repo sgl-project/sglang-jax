@@ -260,11 +260,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
         @partial(
             jax.jit,
-            donate_argnames=(
-                []
-                if getattr(self.attn_backend, "updates_cache_in_place", False)
-                else ["memory_pools"]
-            ),
+            donate_argnames=["memory_pools"],
             static_argnames=["model_state_def"],
             compiler_options=jit_compiler_options,
         )
