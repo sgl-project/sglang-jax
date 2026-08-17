@@ -9,7 +9,11 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from sgl_jax.srt.managers.schedule_batch import Req, ScheduleBatch
+from sgl_jax.srt.managers.schedule_batch import (
+    Req,
+    ScheduleBatch,
+    swa_eviction_peak_tokens,
+)
 from sgl_jax.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -317,6 +321,11 @@ class PrefillAdder:
 
         self.is_hybrid = isinstance(self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
         self.rem_swa_token_offset = [0] * dp_size
+        if self.is_hybrid and running_batch is not None:
+            for dp_rank, info in enumerate(running_batch.reqs_info):
+                self.rem_swa_token_offset[dp_rank] = sum(
+                    self._swa_headroom_for_running_req(req) for req in (info.reqs or [])
+                )
 
     def rem_total_tokens_for_dp(self, dp_rank: int) -> int:
         """Calculate remaining total tokens for a specific DP rank.
@@ -363,17 +372,27 @@ class PrefillAdder:
     def _swa_budget_for_req(self, extend_input_len: int, dp_rank: int) -> int:
         """SWA pool budget per request.
 
-        With chunked prefill + overlap, peak SWA occupancy per request is
-        one chunk plus the sliding window. Floor at sliding_window_size
-        to reserve room for decode phase.
+        Eviction protects one extra page, rounds its boundary down, and the
+        live allocation up. The shared peak formula includes both page margins
+        plus the allocations made between eviction ticks.
         """
         rem_chunk = (
             self.rem_chunk_tokens_list[dp_rank] if self.rem_chunk_tokens_list is not None else None
         )
         alloc = min(extend_input_len, rem_chunk) if rem_chunk is not None else extend_input_len
-        return (
-            self.ceil_paged_tokens(max(alloc, self.tree_cache.sliding_window_size)) + self.page_size
+        return self.ceil_paged_tokens(max(alloc, self._swa_decode_peak_tokens()))
+
+    def _swa_decode_peak_tokens(self) -> int:
+        return self.ceil_paged_tokens(
+            swa_eviction_peak_tokens(self.tree_cache.sliding_window_size, self.page_size)
         )
+
+    def _swa_headroom_for_running_req(self, req: Req) -> int:
+        live_tokens = max(
+            0,
+            self.ceil_paged_tokens(req.kv_allocated_len) - req.swa_evicted_seqlen,
+        )
+        return max(0, self._swa_decode_peak_tokens() - live_tokens)
 
     @property
     def rem_total_tokens(self):

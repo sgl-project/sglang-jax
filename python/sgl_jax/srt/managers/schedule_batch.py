@@ -809,6 +809,20 @@ def _build_recurrent_track_entries(
     )
 
 
+def swa_eviction_interval(sliding_window_size: int, page_size: int) -> int:
+    """Return the page-aligned decode interval between SWA evictions."""
+    multiplier = float(os.environ.get("SGL_JAX_SWA_EVICTION_INTERVAL_MULTIPLIER", "1.0"))
+    interval = max(page_size, int(sliding_window_size * multiplier))
+    return (interval // page_size) * page_size
+
+
+def swa_eviction_peak_tokens(sliding_window_size: int, page_size: int) -> int:
+    """Return the maximum live SWA tokens held between decode evictions."""
+    return (
+        sliding_window_size + swa_eviction_interval(sliding_window_size, page_size) + 2 * page_size
+    )
+
+
 @dataclasses.dataclass
 class ScheduleBatch:
     """Store all information of a batch on the scheduler.
@@ -1557,9 +1571,7 @@ class ScheduleBatch:
         )
 
         if self.forward_mode is not None and self.forward_mode.is_decode():
-            multiplier = float(os.environ.get("SGL_JAX_SWA_EVICTION_INTERVAL_MULTIPLIER", "1.0"))
-            evict_interval = max(page_size, int(sliding_window_size * multiplier))
-            evict_interval = (evict_interval // page_size) * page_size
+            evict_interval = swa_eviction_interval(sliding_window_size, page_size)
             for dp_rank, info in enumerate(self.reqs_info):
                 if not info.reqs:
                     continue
