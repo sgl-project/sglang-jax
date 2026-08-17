@@ -19,10 +19,20 @@ from sgl_jax.srt.kernels.dsa.topk import (
 )
 
 _NEG_INF = float("-inf")
-# v7x optimum for H=32 and the 135168-token GLM-5.2 score bucket. Thirty-two
-# query rows expose 1024 query-head rows to MXU while keeping score/top-k
-# pipeline buffers bounded.
+# Keep 32 as the supported Pallas query-block ceiling and explicit benchmark
+# default. Serving chooses a smaller Extend block from the global device count.
 _INDEXER_QUERY_BLOCK_SIZE = 32
+_SMALL_DEVICE_EXTEND_QUERY_BLOCK_SIZE = 16
+_LARGE_DEVICE_EXTEND_QUERY_BLOCK_SIZE = 24
+_LARGE_EXTEND_DEVICE_COUNT_THRESHOLD = 32
+
+
+def _default_extend_query_block_size() -> int:
+    """Choose the measured Extend query block for the global TPU slice."""
+
+    if jax.device_count() >= _LARGE_EXTEND_DEVICE_COUNT_THRESHOLD:
+        return _LARGE_DEVICE_EXTEND_QUERY_BLOCK_SIZE
+    return _SMALL_DEVICE_EXTEND_QUERY_BLOCK_SIZE
 
 
 def _compact_topk_indices(valid: jax.Array, indices: jax.Array) -> jax.Array:
@@ -599,7 +609,7 @@ def _compute_extend_scores_and_select_topk_indices(
     pages_per_seq: int,
     topk_impl: str,
     output_physical_slots: bool,
-    score_query_block_size: int = _INDEXER_QUERY_BLOCK_SIZE,
+    score_query_block_size: int | None = None,
 ) -> jax.Array:
     """Score packed extend queries through a bounded score/top-k pipeline.
 
@@ -613,6 +623,8 @@ def _compute_extend_scores_and_select_topk_indices(
     max_kv = pages_per_seq * page_size
     num_seqs = seq_lens.shape[0]
     active_num_seqs = jnp.clip(distribution[2], 0, num_seqs)
+    if score_query_block_size is None:
+        score_query_block_size = _default_extend_query_block_size()
     if score_query_block_size < 1:
         raise ValueError(f"score_query_block_size must be positive, got {score_query_block_size}")
 
@@ -840,7 +852,7 @@ def compute_scores_and_select_topk_indices(
     one_token_per_seq: bool = False,
     topk_impl: str,
     output_physical_slots: bool = False,
-    score_query_block_size: int = _INDEXER_QUERY_BLOCK_SIZE,
+    score_query_block_size: int | None = None,
 ) -> jax.Array:
     """Score indexer queries and select top-k token positions.
 
@@ -849,7 +861,9 @@ def compute_scores_and_select_topk_indices(
     the resulting ``[T, max_kv]`` score matrix to one batched top-k call.
 
     Otherwise the extend implementation gathers each sequence's keys once and
-    streams its query blocks through the score/top-k ping-pong pipeline.
+    streams its query blocks through the score/top-k ping-pong pipeline. Its
+    default query block is 24 on global slices with at least 32 devices and 16
+    on smaller slices; an explicit ``score_query_block_size`` overrides it.
 
     By default the result contains sequence-local logical positions. When
     ``output_physical_slots=True``, selection also resolves those positions to

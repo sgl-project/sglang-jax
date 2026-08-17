@@ -29,6 +29,20 @@ def test_mask_and_compact_topk_indices_preserves_unordered_valid_set():
     np.testing.assert_array_equal(got[1], np.asarray([7, 2, 6, 4]))
 
 
+@pytest.mark.parametrize(
+    ("device_count", "expected_query_block_size"),
+    [(1, 16), (16, 16), (31, 16), (32, 24), (64, 24)],
+)
+def test_default_extend_query_block_size_uses_global_device_count(
+    monkeypatch, device_count, expected_query_block_size
+):
+    import sgl_jax.srt.kernels.dsa.indexer as indexer
+
+    monkeypatch.setattr(indexer.jax, "device_count", lambda: device_count)
+
+    assert indexer._default_extend_query_block_size() == expected_query_block_size
+
+
 @pytest.mark.parametrize("num_tiles", [0, 1, 2, 3, 6])
 def test_score_topk_mapping_pipeline_fill_steady_state_and_drain(num_tiles):
     max_tiles, rows, width, topk = 6, 2, 4, 2
