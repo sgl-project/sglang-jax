@@ -21,10 +21,12 @@ logger = logging.getLogger(__name__)
 # Key (without device_name):
 #   (tokens_dtype, weight_dtype, num_tokens, num_experts, top_k,
 #    hidden_size, intermediate_size, ep_size, use_shared_expert, use_grouped_topk,
-#    enable_act_quant)
-# enable_act_quant is the last field (Mode 1 fp8-token vs Mode 2 bf16-token want
-# different configs, esp. for shared-expert prefill). Lookup falls back to the
-# legacy 10-field key (no enable_act_quant) for pre-existing entries.
+#    enable_act_quant, quant_mode)
+# enable_act_quant and quant_mode are optional trailing fields. quant_mode
+# ("per_channel" | "blockwise" | "none") lets a shape store distinct winners for
+# per-channel vs block-wise FP8, whose optimal tiles differ. Lookup is 3-level:
+# the full key (with quant_mode) -> the key without quant_mode -> the legacy
+# 10-field key (no enable_act_quant), so pre-existing entries still hit.
 #
 # Value: (bt, bf, btc, bse, bts)
 # fmt: off
@@ -112,6 +114,18 @@ DEFAULT_V2_BLOCK_CONFIG = FusedMoEBlockConfig(
 )
 
 
+def should_interleave_fused_moe_v2_bt(*, num_tokens: int, ep_size: int) -> bool:
+    """Deprecated shim: gather overlap is now unconditional for num_bt > 1 via
+    the kernel's fixed-K gather banks, so there is no token-count gate. Retained
+    only to validate inputs for callers that still probe it; always returns True.
+    """
+    if ep_size <= 0:
+        raise ValueError(f"Expected {ep_size=} to be > 0.")
+    if num_tokens % ep_size != 0:
+        raise ValueError(f"Expected {num_tokens=} to be aligned to {ep_size=}.")
+    return True
+
+
 def get_simplified_key(
     *,
     dtype: jnp.dtype,
@@ -125,11 +139,14 @@ def get_simplified_key(
     use_shared_expert: bool,
     use_grouped_topk: bool,
     enable_act_quant: bool = False,
+    quant_mode: str | None = None,
 ) -> tuple:
     if ep_size <= 0:
         raise ValueError(f"Expected {ep_size=} to be > 0.")
     if num_tokens % ep_size != 0:
         raise ValueError(f"Expected {num_tokens=} to be aligned to {ep_size=}.")
+    if quant_mode not in (None, "none", "blockwise", "per_channel"):
+        raise ValueError(f"Unsupported {quant_mode=}")
 
     device = get_device_name()
     dtype_name = jnp.dtype(dtype).name
@@ -147,6 +164,7 @@ def get_simplified_key(
         bool(use_shared_expert),
         bool(use_grouped_topk),
         bool(enable_act_quant),
+        quant_mode,
     )
 
 
@@ -163,6 +181,7 @@ def get_tuned_fused_moe_v2_block_config(
     use_shared_expert: bool = False,
     use_grouped_topk: bool = False,
     enable_act_quant: bool = False,
+    quant_mode: str | None = None,
 ) -> FusedMoEBlockConfig:
     keys = get_simplified_key(
         dtype=dtype,
@@ -176,11 +195,13 @@ def get_tuned_fused_moe_v2_block_config(
         use_shared_expert=use_shared_expert,
         use_grouped_topk=use_grouped_topk,
         enable_act_quant=enable_act_quant,
+        quant_mode=quant_mode,
     )
     device_name = keys[0]
-    table_key = keys[1:]  # includes enable_act_quant (last element)
-    # Backward compatible: prefer the act_quant-specific key, then fall back to
-    # the legacy key (without enable_act_quant) so pre-existing entries still hit.
+    # 3-level fallback: full key (with quant_mode) -> without quant_mode ->
+    # legacy 10-field key (no enable_act_quant), so pre-existing entries still hit.
+    table_key_quant = keys[1:]
+    table_key = table_key_quant[:-1]
     table_key_legacy = table_key[:-1]
 
     def _lookup(k):
@@ -191,7 +212,9 @@ def get_tuned_fused_moe_v2_block_config(
             cfg = TUNED_BLOCK_CONFIGS.get("*", {}).get(k)
         return cfg
 
-    cfg_tuple = _lookup(table_key)
+    cfg_tuple = _lookup(table_key_quant)
+    if cfg_tuple is None:
+        cfg_tuple = _lookup(table_key)
     if cfg_tuple is None:
         cfg_tuple = _lookup(table_key_legacy)
 
