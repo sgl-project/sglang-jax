@@ -25,8 +25,7 @@ from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalData
 from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
 from sgl_jax.srt.multimodal.in_model.lane_packing import (
     encoder_num_lanes,
-    pack_lanes,
-    restore_encoder_output,
+    run_mrope_vision_model,
 )
 from sgl_jax.srt.multimodal.layers.vision_sharding import resolve_encoder_tp
 from sgl_jax.srt.precision_tracer import precision_tracer
@@ -999,30 +998,15 @@ class Gemma4ForConditionalGeneration(Gemma4ForCausalLM, InModelMultimodalContrac
 
     def _get_visual_feature(self, items: list[MultimodalDataItem]) -> jax.Array:
         num_lanes = encoder_num_lanes(self.mesh, self.visual.vision_tp)
-        packed = pack_lanes(
+        return run_mrope_vision_model(
+            self.visual,
             items,
-            num_lanes,
+            mesh=self.mesh,
+            num_lanes=num_lanes,
             buckets=self.visual.input_buckets,
             merge_unit=self.visual.pooling_unit,
+            rope_type="rope_2d_packed",
         )
-        position_ids = np.full(
-            (num_lanes, packed.cap, 2),
-            -1,
-            dtype=np.int32,
-        )
-        patch_counts = np.zeros(
-            (num_lanes, max(map(len, packed.lanes))),
-            dtype=np.int32,
-        )
-        for lane_index, lane in enumerate(packed.lanes):
-            offset = 0
-            for item_offset, item_index in enumerate(lane):
-                positions = np.asarray(items[item_index].get("pixel_position_ids"))
-                position_ids[lane_index, offset : offset + len(positions)] = positions
-                patch_counts[lane_index, item_offset] = len(positions)
-                offset += len(positions)
-        output = self.visual(packed.features, position_ids, patch_counts)
-        return restore_encoder_output(output, packed.output_indices, self.mesh)
 
     def get_multimodal_encode_funcs(self):
         return {

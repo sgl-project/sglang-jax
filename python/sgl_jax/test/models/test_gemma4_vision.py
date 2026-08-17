@@ -131,6 +131,21 @@ def test_patch_position_embedding_supports_jitted_dynamic_indices():
     np.testing.assert_allclose(compiled, eager, rtol=1e-5, atol=1e-5)
 
 
+def test_default_buckets_precompile_two_images_per_lane():
+    mesh = _mesh()
+    with jax.set_mesh(mesh):
+        model = Gemma4VisionModel(
+            _vision_config(),
+            text_hidden_size=12,
+            dtype=jnp.float32,
+            rngs=None,
+            mesh=mesh,
+            vision_tp=False,
+        )
+
+    assert model.input_buckets == (18, 36)
+
+
 def test_lane_metadata_keeps_packed_images_as_separate_attention_segments():
     mesh = _mesh()
     with jax.set_mesh(mesh):

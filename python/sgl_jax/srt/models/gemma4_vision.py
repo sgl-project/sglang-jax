@@ -16,7 +16,10 @@ from jax.sharding import Mesh
 
 from sgl_jax.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
-from sgl_jax.srt.multimodal.in_model.lane_packing import encoder_num_lanes
+from sgl_jax.srt.multimodal.in_model.lane_packing import (
+    encoder_num_lanes,
+    precompile_mrope_vision_model,
+)
 from sgl_jax.srt.multimodal.layers.attention.flash_attention_backend import (
     VisionAttentionMetadata,
     make_vision_attention_backend,
@@ -387,7 +390,7 @@ class Gemma4VisionModel(nnx.Module):
         self.pooling_kernel_size = int(config.pooling_kernel_size)
         self.pooling_unit = self.pooling_kernel_size**2
         default_capacity = int(config.default_output_length) * self.pooling_unit
-        buckets = input_buckets or (default_capacity,)
+        buckets = input_buckets or (default_capacity, 2 * default_capacity)
         self.input_buckets = tuple(
             sorted(
                 {
@@ -570,17 +573,12 @@ class Gemma4VisionModel(nnx.Module):
         return tuple(rows * capacity // self.pooling_unit for capacity in self.input_buckets)
 
     def precompile(self) -> None:
-        num_lanes = encoder_num_lanes(self.mesh, self.vision_tp)
-        kernel = self.pooling_kernel_size
-        for capacity in self.input_buckets:
-            rows, columns = kernel, capacity // kernel
-            y, x = np.indices((rows, columns))
-            patches = np.zeros(
-                (num_lanes, capacity, self.patch_dim),
-                dtype=np.float32,
-            )
-            position_ids = np.full((num_lanes, capacity, 2), POSITIONS_PAD_VALUE, dtype=np.int32)
-            position_ids[0] = np.stack((x, y), axis=-1).reshape(-1, 2)
-            patch_counts = np.zeros((num_lanes, 1), dtype=np.int32)
-            patch_counts[0, 0] = capacity
-            jax.block_until_ready(self.encode(patches, position_ids, patch_counts))
+        precompile_mrope_vision_model(
+            self,
+            mesh=self.mesh,
+            num_lanes=encoder_num_lanes(self.mesh, self.vision_tp),
+            buckets=self.input_buckets,
+            patch_dim=self.patch_dim,
+            merge_unit=self.pooling_unit,
+            rope_type="rope_2d_packed",
+        )

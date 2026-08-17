@@ -14,6 +14,7 @@ from sgl_jax.srt.multimodal.processors.base_processor import BaseMultimodalProce
 
 class Gemma4Processor(BaseMultimodalProcessor):
     models = ("Gemma4ForConditionalGeneration",)
+    supports_mm_processor_concurrency = True
 
     @staticmethod
     def _to_numpy(value):
