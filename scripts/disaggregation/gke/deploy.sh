@@ -1,26 +1,29 @@
 #!/usr/bin/env bash
-# Deploy PD e2e test job on GKE.
+# Deploy the PD single-host eval/benchmark job on GKE.
 #
 # Usage:
 #   ./scripts/disaggregation/gke/deploy.sh [--delete-only]
 #
+# Optional overrides:
+#   JOB_NAME=... GH_ORG=... BRANCH=... ./scripts/disaggregation/gke/deploy.sh
+#
 # Prerequisites:
 #   - gcloud + kubectl configured, USE_GKE_GCLOUD_AUTH_PLUGIN=True
-#   - Cluster ainfer-tpu-test with node pool pd-v6e-1 (2 x ct6e-standard-1t)
+#   - Cluster ainfer-tpu-bench with node pool pd-v6e-1 (2 x ct6e-standard-1t)
 #   - SSH key at ~/.ssh/id_rsa for repo clone
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-JOB_NAME="pd-e2e-test"
-GH_ORG="sgl-project"
-BRANCH="pd/scheduler"
-TEMPLATE="${SCRIPT_DIR}/pd_e2e_job.yaml"
+JOB_NAME="${JOB_NAME:-pd-singlehost-eval}"
+GH_ORG="${GH_ORG:-sgl-project}"
+BRANCH="${BRANCH:-main}"
+TEMPLATE="${SCRIPT_DIR}/pd_singlehost_eval_job.yaml"
 GENERATED="/tmp/${JOB_NAME}.yaml"
 
 export USE_GKE_GCLOUD_AUTH_PLUGIN=True
 
 # Ensure we have the right cluster context
-gcloud container clusters get-credentials ainfer-tpu-test \
+gcloud container clusters get-credentials ainfer-tpu-bench \
   --zone asia-northeast1-b --project tpu-service-473302 2>/dev/null
 
 # Clean up any previous run

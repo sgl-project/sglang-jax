@@ -1,114 +1,45 @@
-## Goals
-SGLang JAX supports multiple attention backends. Each of them has different pros and cons. You can test them according to your needs.
+# Attention Backend
 
-## Design
+SGL-JAX exposes a small user-facing attention backend switch, while the runtime may wrap that backend for MLA or hybrid linear-recurrent models.
 
-SGLang JAX adopts a plugin-based design pattern for Attention Backends, enabling developers to flexibly add and choose different attention mechanism implementations. The core design principles include:
+## User-facing choices
 
-### Abstract Base Class Design
-All attention backends inherit from the `AttentionBackend` base class (`python/sgl_jax/srt/layers/attention/base_attn_backend.py`), which defines two core abstract methods:
+`--attention-backend` accepts three values:
 
-- `get_forward_metadata(forward_batch)`: Initialize metadata required for forward pass and return it
-- `__call__(q, k, v, layer, forward_batch, **kwargs)`: Execute the actual attention computation
+| Value | Runtime behavior |
+|---|---|
+| `fa` | Default. Uses FlashAttention for MHA/GQA models and the absorbed MLA Pallas backend for MLA models. |
+| `fa_mha` | Forces MLA models through the decompressed MHA FlashAttention path. This is useful for kernel A/B checks, but uses much more KV cache than absorbed MLA. |
+| `native` | Pure JAX/native attention path, mainly for CPU/debugging. If `fa` or `fa_mha` is requested on CPU, the runtime falls back to `native`. |
 
-### Unified Interface Design
-All backends follow the same input/output interface:
-- **Input**: Query, Key, Value, RadixAttention layer object, ForwardBatch batch information
-- **Output**: Attention output array and updated KV cache
+Example:
 
-### Metadata Management
-Each backend can define its own specific metadata structure to optimize computation, for example:
-- FlashAttention uses `FlashAttentionMetadata` to manage paged indices and sequence length information
-- Native backend requires no additional metadata
-
-## Implementation
-
-To implement a new attention backend, follow these steps:
-
-### 1. Inherit from AttentionBackend Base Class
-
-```python
-from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
-
-class YourCustomAttention(AttentionBackend):
-    def __init__(self, num_attn_heads, num_kv_heads, **kwargs):
-        # Initialize your backend-specific parameters
-        pass
+```bash
+python3 -u -m sgl_jax.launch_server \
+  --model-path Qwen/Qwen-7B-Chat \
+  --trust-remote-code \
+  --device=tpu \
+  --attention-backend=fa
 ```
 
-### 2. Implement Required Methods
+## Runtime backend matrix
 
-#### ```get_forward_metadata``` Method
-```python
-def get_forward_metadata(self, batch: ModelWorkerBatch):
-    """get forward pass metadata"""
-    # Create your required metadata based on model_worker_batch and return it
-    # e.g., compute sequence lengths, create indices, etc.
-    pass
-```
+| Backend class | Selected by | Main use |
+|---|---|---|
+| `FlashAttention` | `--attention-backend=fa` for MHA/GQA, or `fa_mha` for MLA fallback | TPU production attention with paged KV cache, SWA metadata, and Pallas kernels. |
+| `MLAAttentionBackend` | `--attention-backend=fa` when `model_config.attention_arch == MLA` | Absorbed MLA path for DeepSeek-family models. |
+| `NativeAttention` | `--attention-backend=native`, or CPU fallback | Debugging and CPU execution. |
+| `HybridLinearAttnBackend` | Automatic wrapper for hybrid recurrent models | Routes full-attention layers to `FlashAttention`/`MLAAttentionBackend` and linear recurrent layers to KDA/GDN/Lightning backends. |
+| `KDAAttnBackend` | Automatic under `HybridLinearAttnBackend` for Kimi Linear | Kimi Delta Attention recurrent branch. |
+| `GDNAttnBackend` | Automatic under `HybridLinearAttnBackend` for Qwen3.5 hybrid configs | Gated DeltaNet recurrent branch. |
+| `LightningAttnBackend` | Automatic under `HybridLinearAttnBackend` for Bailing MoE V2.5 / Ling-2.6-flash | Lightning / Simple GLA recurrent branch. |
 
-#### ```__call__``` Method
-```python
-def __call__(self, q, k, v, layer, forward_batch, **kwargs):
-    """Execute attention computation"""
-    # 1. Get and update KV cache
-    k_buffer, v_buffer = self._get_and_set_kv_cache(k, v, forward_batch, layer.layer_id)
+## Notes for contributors
 
-    # 2. Execute your attention computation logic
-    attn_output = your_attention_implementation(q, k_buffer, v_buffer, ...)
+All attention backends inherit from `AttentionBackend` in `python/sgl_jax/srt/layers/attention/base_attn_backend.py`. A backend provides:
 
-    # 3. Return results
-    return attn_output, k_buffer, v_buffer
-```
+- `get_forward_metadata(batch)` for host-side metadata construction.
+- `__call__(q, k, v, layer, forward_batch, **kwargs)` for the JIT-side attention computation.
+- PyTree flatten/unflatten support when backend state crosses the JIT boundary.
 
-### 3. PyTree Support
-
-To support JAX JIT compilation, implement PyTree support:
-
-```python
-def tree_flatten(self):
-    children = (self.forward_metadata,)  # Mutable state
-    aux_data = {
-        "num_heads": self.num_heads,
-        "param1": self.param1,
-        # Other immutable parameters
-    }
-    return (children, aux_data)
-
-@classmethod
-def tree_unflatten(cls, aux_data, children):
-    obj = cls(**aux_data)
-    obj.forward_metadata = children[0]
-    return obj
-```
-
-### 4. Import Custom Backend
-Please import you backend in ```_get_attention_backend``` func, see in ```python/sgl_jax/srt/model_executor/model_runner.py```
-
-### 5. Pallas Kernel
-Please put you pallas kernel file in ```python/sgl_jax/srt/layers/attention``` folder (see flash attention implement). The implementation of the Pallas kernel should be designed with a single TPU in mind, so it is not advisable to incorporate distributed logic into the kernel. When using you pallas kernel in distributed scenario, please use ```shard_map``` to wrap you kernel call in you custom attention backend implement.
-
-### 6. Test and Benchmark
-Test and benchmark is important and required. Please add benchmark in ```benchmark/kernels``` folder and test in ```python/sgl_jax/test``` folder.
-
-## Usage Guide
-### Supporting matrix for different attention backends
-
-| Backend | Paged Attention | Spec Decoding | MLA | Sliding Window |
-|---------|----------------|---------------|-----|----------------|
-| FlashAttention | ✅ | ❌ | ❌ | ✅ |
-| NativeAttention | ❌ | ❌ | ❌ | ❌ |
-
-### Launch command for different attention backends
-
-#### FlashAttention
-Recommended for production environments, memory efficient, supports long sequences
-```
- python3 -u -m sgl_jax.launch_server --model-path Qwen/Qwen-7B-Chat --trust-remote-code --device=tpu --attention-backend=fa
-```
-
-#### NativeAttention
-Recommended for debugging and development, simple and straightforward logic
-```
- python3 -u -m sgl_jax.launch_server --model-path Qwen/Qwen-7B-Chat --trust-remote-code --device=tpu --attention-backend=native
-```
+Backend selection is centralized in `ModelRunner._get_attention_backend()`. Hybrid recurrent wrapping happens after the full-attention backend is created. For implementation details, see [Layers and Attention](../architecture/06-layers-and-attention.md).

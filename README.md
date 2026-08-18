@@ -29,7 +29,7 @@ SGL-JAX operates on a distributed architecture designed for scalability and perf
 5.  **Model Runner(Included in TP Worker)**: Manages the actual JAX-based model execution, including the forward pass, attention computation, and KV cache operations.
 6. **DetokenizerManager**: Runs in a subprocess, handles output token decoding
 
-More details in [architecture](https://github.com/sgl-project/sglang-jax/blob/main/docs/architecture/project-core-structure.md).
+More details in [architecture](docs/architecture/index.md).
 
 ---
 
@@ -37,13 +37,13 @@ More details in [architecture](https://github.com/sgl-project/sglang-jax/blob/ma
 
 - [Install SGL-JAX](https://github.com/sgl-project/sglang-jax/blob/main/docs/get_started/install.md)
 - [Cookbook (model recipes)](https://github.com/sgl-project/sglang-jax/blob/main/docs/cookbook/index.md)
-- [Quick Start (Qwen3 on TPU v6e-4)](https://github.com/sgl-project/sglang-jax/blob/main/docs/cookbook/autoregressive/qwen3.md)
+- [Quick Start (Qwen3 on TPU v6e-4)](https://github.com/sgl-project/sglang-jax/blob/main/docs/cookbook/autoregressive/Qwen/Qwen3.md)
 - [Benchmark and Profiling](https://github.com/sgl-project/sglang-jax/blob/main/docs/developer_guide/benchmark_and_profiling.md)
 - [Contribution Guide](https://github.com/sgl-project/sglang-jax/blob/main/docs/developer_guide/contribution_guide.md)
 
 ## Documentation
 
-For more features and usage details, please read the documents in the [`docs`](https://github.com/sgl-project/sglang-jax/tree/main/docs) directory.
+For more features and usage details, please read the Sphinx-style documents in the [`docs`](https://github.com/sgl-project/sglang-jax/tree/main/docs) directory and the Mintlify-style model recipes in [`docs/cookbook`](https://github.com/sgl-project/sglang-jax/tree/main/docs/cookbook).
 
 ## Supported Models
 
@@ -68,7 +68,7 @@ SGL-JAX also supports multimodal models with the same usage interface as LLMs. T
 -   **Wan 2.2 T2V**: Text-to-Video generation model. Uses different DiT models at different noise stages for denoising.
 -   **Qwen2.5-VL**: Vision-language model series based on Qwen2.5.
 
-For multimodal model usage, see the [Usage Guide](docs/mutlimodal/multimodal_usage.md) and [Architecture Design](docs/mutlimodal/design/[RFC]multimodal_architechure.md).
+For multimodal model usage, see the [Usage Guide](docs/multimodal/multimodal_usage.md) and [Architecture Design](docs/architecture/12-multimodal.md).
 
 
 ## Performance and Benchmarking

@@ -20,9 +20,12 @@ from sgl_jax.srt.speculative.base_worker import BaseDraftWorker, replicate_to_me
 from sgl_jax.srt.speculative.eagle_util import (
     EagleDraftInput,
     EagleVerifyInput,
+    build_chain_verify_inputs,
+    build_chain_verify_inputs_device,
     build_tree_kernel_efficient,
     build_tree_mask_for_draft_decode,
 )
+from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
 from sgl_jax.srt.utils.jax_utils import device_array
@@ -136,29 +139,67 @@ class EagleDraftWorker(BaseDraftWorker):
         self.padding_for_decode(model_worker_batch)
         score_list, token_list, parents_list = self.draft_forward(model_worker_batch)
         verified_seq_lens = model_worker_batch.seq_lens - 1
-        max_seq_len = int(np.max(verified_seq_lens)) if verified_seq_lens.size > 0 else 1
-        max_context_len = self._pick_context_len(max_seq_len)
-        (
-            tree_mask,
-            position,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
-            draft_tokens,
-        ) = build_tree_kernel_efficient(
-            model_worker_batch.spec_info_padded.verified_id,
-            score_list,
-            token_list,
-            parents_list,
-            verified_seq_lens,
-            np.sum(verified_seq_lens),
-            self.topk,
-            self.speculative_num_draft_tokens,
-            max_context_len,
-            model_worker_batch.seq_lens.shape[0],
-            model_worker_batch.speculative_num_steps,
-            self.mesh,
-        )
+        bs = model_worker_batch.seq_lens.shape[0]
+
+        if self.topk == 1:
+            n = self.speculative_num_draft_tokens
+            verified_id = model_worker_batch.spec_info_padded.verified_id
+            if any(isinstance(x, jax.Array) for x in (verified_id, token_list, verified_seq_lens)):
+                rep = NamedSharding(self.mesh, P())
+                verified_id, token_list, verified_seq_lens = jax.device_put(
+                    (verified_id, token_list, verified_seq_lens),
+                    rep,
+                )
+                packed = build_chain_verify_inputs_device(
+                    verified_id, token_list, verified_seq_lens, n, bs
+                )
+                packed = jax.device_put(packed, rep)
+            else:
+                packed_np = build_chain_verify_inputs(
+                    np.asarray(verified_id, dtype=np.int32),
+                    np.asarray(token_list, dtype=np.int32),
+                    np.asarray(verified_seq_lens, dtype=np.int32),
+                    n,
+                    bs,
+                )
+                # One allgather instead of five: pack into a single (5, bs*n)
+                # buffer, device_put once, then slice on device.
+                packed = (
+                    jax.device_put(packed_np, NamedSharding(self.mesh, P()))
+                    if self.mesh is not None
+                    else packed_np
+                )
+            draft_tokens = packed[0]
+            position = packed[1]
+            retrive_index = packed[2].reshape(bs, n)
+            retrive_next_token = packed[3].reshape(bs, n)
+            retrive_next_sibling = packed[4].reshape(bs, n)
+            tree_mask = None
+        else:
+            max_seq_len = int(np.max(verified_seq_lens)) if verified_seq_lens.size > 0 else 1
+            max_context_len = self._pick_context_len(max_seq_len)
+            (
+                tree_mask,
+                position,
+                retrive_index,
+                retrive_next_token,
+                retrive_next_sibling,
+                draft_tokens,
+            ) = build_tree_kernel_efficient(
+                model_worker_batch.spec_info_padded.verified_id,
+                score_list,
+                token_list,
+                parents_list,
+                verified_seq_lens,
+                np.sum(verified_seq_lens),
+                self.topk,
+                self.speculative_num_draft_tokens,
+                max_context_len,
+                bs,
+                model_worker_batch.speculative_num_steps,
+                self.mesh,
+            )
+
         model_worker_batch.spec_info_padded = EagleVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,
@@ -238,7 +279,7 @@ class EagleDraftWorker(BaseDraftWorker):
             return
         draft_input = EagleDraftInput(
             hidden_states=batch_output.logits_output.hidden_states,
-            allocate_lens=batch_output.allocate_lens,
+            allocate_lens=batch_output.next_draft_input.allocate_lens,
         )
         model_worker_batch, logits_metadata = draft_input.prepare_for_extend_after_verify(
             model_worker_batch,
@@ -255,7 +296,9 @@ class EagleDraftWorker(BaseDraftWorker):
             logits_metadata=logits_metadata,
         )
         sel = np.asarray(model_worker_batch.logits_indices_selector)
-        accept_host = np.asarray(jax.device_get(batch_output.accept_lens))
+        if hasattr(batch_output.accept_lens, "copy_to_host_async"):
+            batch_output.accept_lens.copy_to_host_async()
+        accept_host = np.asarray(batch_output.accept_lens)
         select_index = sel * (self.speculative_num_steps + 1) + accept_host[sel] - 1
         rep_logits, rep_hidden = replicate_to_mesh(
             self.mesh, draft_logits_output.next_token_logits, draft_logits_output.hidden_states
@@ -279,7 +322,9 @@ class EagleDraftWorker(BaseDraftWorker):
         batch_output.next_draft_input.topk_p = topk_p
         batch_output.next_draft_input.topk_index = topk_index
         batch_output.next_draft_input.verified_id = verified_id
-        batch_output.allocate_lens = batch_output.allocate_lens[: model_worker_batch.real_bs]
+        batch_output.next_draft_input.allocate_lens = batch_output.next_draft_input.allocate_lens[
+            : model_worker_batch.real_bs
+        ]
         batch_output.accept_lens = accept_host
 
     # -- Internal draft helpers --
@@ -315,9 +360,13 @@ class EagleDraftWorker(BaseDraftWorker):
         seq_lens_cpu = model_worker_batch.seq_lens
         page_size = self.page_size
         req_to_token_pool, _ = self.target_worker_ref.get_memory_pool()
-        token_indices_with_all_reqs = req_to_token_pool.req_to_token[
-            model_worker_batch.req_pool_indices
-        ]
+        legacy_non_overlap = use_legacy_eagle3_non_overlap(
+            not self.server_args.disable_overlap_schedule, self.speculative_algorithm
+        )
+        if legacy_non_overlap:
+            token_indices_with_all_reqs = req_to_token_pool.req_to_token[
+                model_worker_batch.req_pool_indices
+            ]
         spec_info = model_worker_batch.spec_info_padded
         assert isinstance(spec_info, EagleDraftInput)
         # At dp>1 spec_info arrays arrive at (real_bs,) but seq_lens_cpu is
@@ -351,9 +400,15 @@ class EagleDraftWorker(BaseDraftWorker):
                 assert (
                     base + aligned_len <= (r + 1) * per_dp_cache_len
                 ), f"rank {r} cache_loc overflow: {intra_rank_off[r]+aligned_len} > {per_dp_cache_len}"
-                cache_loc_cpu[base : base + allocate_len] = token_indices_with_all_reqs[
-                    seq_idx, :allocate_len
-                ]
+                if legacy_non_overlap:
+                    cache_loc_cpu[base : base + allocate_len] = token_indices_with_all_reqs[
+                        seq_idx, :allocate_len
+                    ]
+                else:
+                    page_offsets = np.arange(0, aligned_len, page_size)
+                    cache_loc_cpu[base + page_offsets] = req_to_token_pool.req_to_token[
+                        model_worker_batch.req_pool_indices[seq_idx], page_offsets
+                    ]
                 intra_rank_off[r] += aligned_len
 
         model_worker_batch.cache_loc = cache_loc_cpu
@@ -361,7 +416,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
         topk_index = spec_info.topk_index
         if self.hot_token_ids is not None:
-            model_worker_batch.spec_info_padded.topk_index = self.hot_token_ids[topk_index]
+            model_worker_batch.spec_info_padded.topk_index = self._map_hot_token_ids(topk_index)
         if self.topk > 1:
             self.draft_model_runner.attn_backend.forward_metadata.custom_mask = (
                 build_tree_mask_for_draft_decode(
@@ -466,10 +521,14 @@ class EagleDraftWorker(BaseDraftWorker):
             topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits, self.topk)
 
             if self.hot_token_ids is not None:
-                topk_index = self.hot_token_ids[topk_index]
+                topk_index = self._map_hot_token_ids(topk_index)
             hidden_states = replicate_to_mesh(self.mesh, logits_output.hidden_states)
 
         return score_list, token_list, parents_list
+
+    def _map_hot_token_ids(self, topk_index):
+        out_sharding = jax.typeof(topk_index).sharding
+        return self.hot_token_ids.at[topk_index].get(out_sharding=out_sharding)
 
     def _pick_context_len(self, max_seq_len: int) -> int:
         if self.precompile_token_paddings:
@@ -478,42 +537,33 @@ class EagleDraftWorker(BaseDraftWorker):
         return 1 << (max_seq_len - 1).bit_length()
 
     def copy_model_worker_batch_to_cpu(self, model_worker_batch: ModelWorkerBatch):
-        model_worker_batch.input_ids = np.array(
-            jax.device_get(model_worker_batch.input_ids), dtype=model_worker_batch.input_ids.dtype
-        )
-        model_worker_batch.seq_lens = np.array(
-            jax.device_get(model_worker_batch.seq_lens), dtype=model_worker_batch.seq_lens.dtype
-        )
-        model_worker_batch.out_cache_loc = np.array(
-            jax.device_get(model_worker_batch.out_cache_loc),
-            dtype=model_worker_batch.out_cache_loc.dtype,
-        )
-        model_worker_batch.positions = np.array(
-            jax.device_get(model_worker_batch.positions), dtype=model_worker_batch.positions.dtype
-        )
-        model_worker_batch.req_pool_indices = np.array(
-            jax.device_get(model_worker_batch.req_pool_indices),
-            dtype=model_worker_batch.req_pool_indices.dtype,
-        )
-        model_worker_batch.cache_loc = np.array(
-            jax.device_get(model_worker_batch.cache_loc), dtype=model_worker_batch.cache_loc.dtype
-        )
-        model_worker_batch.extend_prefix_lens = (
-            np.array(
-                jax.device_get(model_worker_batch.extend_prefix_lens),
-                dtype=model_worker_batch.extend_prefix_lens.dtype,
-            )
-            if model_worker_batch.extend_prefix_lens is not None
-            else None
-        )
-        model_worker_batch.extend_seq_lens = (
-            np.array(
-                jax.device_get(model_worker_batch.extend_seq_lens),
-                dtype=model_worker_batch.extend_seq_lens.dtype,
-            )
-            if model_worker_batch.extend_seq_lens is not None
-            else None
-        )
+        mwb = model_worker_batch
+        fields = [
+            "input_ids",
+            "seq_lens",
+            "out_cache_loc",
+            "positions",
+            "req_pool_indices",
+            "cache_loc",
+        ]
+        optional = ["extend_prefix_lens", "extend_seq_lens"]
+
+        for name in fields:
+            arr = getattr(mwb, name)
+            if hasattr(arr, "copy_to_host_async"):
+                arr.copy_to_host_async()
+        for name in optional:
+            arr = getattr(mwb, name)
+            if arr is not None and hasattr(arr, "copy_to_host_async"):
+                arr.copy_to_host_async()
+
+        for name in fields:
+            arr = getattr(mwb, name)
+            setattr(mwb, name, np.asarray(arr))
+        for name in optional:
+            arr = getattr(mwb, name)
+            if arr is not None:
+                setattr(mwb, name, np.asarray(arr))
 
     def get_padding_bs(self, real_bs: int) -> int:
         self.precompile_bs_paddings.sort()
@@ -578,21 +628,28 @@ def update_eagle_lists(
 ):
     bs = score_list.shape[0]
     scores_update, tokens_update, parents_update = tree_info
+    score_sharding = jax.typeof(scores_update).sharding
+    token_sharding = jax.typeof(tokens_update).sharding
+    parent_sharding = jax.typeof(parents_update).sharding
     if i == 0:
-        score_list = score_list.at[:bs, :1, :].set(scores_update[:bs])
-        token_list = token_list.at[:bs, :topk].set(tokens_update[:bs])
-        parents_list = parents_list.at[:bs, : topk + 1].set(parents_update[:bs])
+        score_list = score_list.at[:bs, :1, :].set(scores_update[:bs], out_sharding=score_sharding)
+        token_list = token_list.at[:bs, :topk].set(tokens_update[:bs], out_sharding=token_sharding)
+        parents_list = parents_list.at[:bs, : topk + 1].set(
+            parents_update[:bs], out_sharding=parent_sharding
+        )
     else:
         score_start = 1 + (i - 1) * topk
         token_start = topk + (i - 1) * topk * topk
         parent_start = topk + 1 + (i - 1) * topk
 
-        score_list = score_list.at[:bs, score_start : score_start + topk, :].set(scores_update[:bs])
+        score_list = score_list.at[:bs, score_start : score_start + topk, :].set(
+            scores_update[:bs], out_sharding=score_sharding
+        )
         token_list = token_list.at[:bs, token_start : token_start + topk * topk].set(
-            tokens_update[:bs]
+            tokens_update[:bs], out_sharding=token_sharding
         )
         parents_list = parents_list.at[:bs, parent_start : parent_start + topk].set(
-            parents_update[:bs]
+            parents_update[:bs], out_sharding=parent_sharding
         )
     return score_list, token_list, parents_list
 
@@ -675,7 +732,9 @@ def select_top_k_tokens_step_greater_0(
         selected_input_index = topk_cs_index.flatten() // topk + jnp.repeat(
             jnp.arange(0, hidden_states.shape[0], topk), topk
         )
-        hidden_states = hidden_states[selected_input_index, :]
+        hidden_states = hidden_states.at[selected_input_index, :].get(
+            out_sharding=jax.typeof(hidden_states).sharding
+        )
     tree_info = (
         expand_scores,
         topk_index,

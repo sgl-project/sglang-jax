@@ -23,7 +23,7 @@ import logging
 import os
 import threading
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import jax
 import numpy as np
@@ -58,6 +58,7 @@ from sgl_jax.srt.precision_tracer import (
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sgl_jax.srt.sampling.sampling_params import DEFAULT_SAMPLING_SEED, SamplingParams
 from sgl_jax.srt.server_args import ServerArgs
+from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
 from sgl_jax.srt.utils.common_utils import get_bool_env_var, pad_to_bucket
 
 if TYPE_CHECKING:
@@ -71,9 +72,11 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "device",
     "chunked_prefill_size",
     "disable_radix_cache",
+    "speculative_algorithm",
     "speculative_accept_threshold_single",
     "speculative_accept_threshold_acc",
     "enable_deterministic_sampling",
+    "pd_disaggregation",
 ]
 
 PADDING_BUCKETS = [1 << i for i in range(6, 21)]
@@ -221,11 +224,24 @@ class Req:
         self.bootstrap_host: str | None = None
         self.bootstrap_port: int | None = None
         self.bootstrap_room: int | None = None
+        self.disagg_prefill_dp_rank: int | None = None
         self.disagg_transfer_id: str | None = None
+        self.disagg_host_buffer_id: int | None = None
+        self.disagg_peer_process_index: int = 0
 
         # Memory pool info
         self.req_pool_idx: int | None = None
         self.recurrent_pool_idx: int | None = None
+        # One-shot recurrent CoW src slot: set on a fresh match, consumed at the
+        # next extend forward, cleared everywhere else (re-match, merge, retract).
+        self.recurrent_cow_src_index: int | None = None
+        # Extra-buffer ping-pong track slots holding materialized page-boundary
+        # snapshots (dormant unless enable_recurrent_extra_buffer).
+        self.recurrent_ping_pong_track_buffer: list[int] | None = None
+        self.recurrent_next_track_idx: int | None = None
+        # Watermark seqlen of the last materialized track slot; set ONLY by a real
+        # track scatter, never from a prefix match.
+        self.recurrent_last_track_seqlen: int | None = None
 
         # Check finish
         self.tokenizer = None
@@ -362,6 +378,9 @@ class Req:
         self.has_log_time_stats: bool = False
         self.queue_time_start = None
         self.queue_time_end = None
+        # PD disaggregation per-request phase timing (None unless
+        # --enable-request-time-stats-logging and PD mode).
+        self.pd_time_stats = None
 
         # the start index of the sent kv cache
         # We want to send it chunk by chunk for chunked prefill.
@@ -408,6 +427,8 @@ class Req:
         self,
         tree_cache: BasePrefixCache | None = None,
     ):
+        # Reset so a non-admitted re-match never clones from a stale/evicted slot.
+        self.recurrent_cow_src_index = None
         self.fill_ids = (
             self.origin_input_ids + self.output_ids if self.output_ids else self.origin_input_ids
         )
@@ -423,11 +444,20 @@ class Req:
             self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
             return
         # PD req with empty output_ids: skip match_prefix to avoid
-        # stale radix cache hits.
+        # stale radix cache hits, but preserve prefix_indices set by
+        # cache_unfinished_req for chunked-prefill continuation rounds
+        # (otherwise extend_input_len never shrinks and a req longer than
+        # chunked-prefill-size loops forever, and a budget-chunked short
+        # req leaks its first round's pages).
+        # TODO(pd-radix): PD chunked-prefill is currently validated with
+        # ChunkCache (--disable-radix-cache). If RadixCache support is added,
+        # continuation rounds must also preserve/update last_node and radix
+        # lock state, not just prefix_indices.
         if getattr(self, "bootstrap_room", None) is not None and not self.output_ids:
-            self.prefix_indices = []
-            self.last_matched_prefix_len = 0
-            self.extend_input_len = len(self.fill_ids)
+            if getattr(self, "is_chunked", 0) == 0:
+                self.prefix_indices = []
+                self.last_matched_prefix_len = 0
+            self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
             root = getattr(tree_cache, "root_node", None) if tree_cache is not None else None
             self.last_node = root
             self.last_host_node = root
@@ -440,9 +470,20 @@ class Req:
                 self.last_host_node = tree_cache.root_node
                 self.host_hit_length = 0
             else:
+                # A running recurrent req already OWNS its state (running slot):
+                # no re-clone (cow_recurrent=False), FULL-only match -- its
+                # unfinished prefix is not gated on recurrent-tree validation.
+                is_running_recurrent = (
+                    tree_cache.supports_recurrent() and self.recurrent_pool_idx is not None
+                )
                 match_result = tree_cache.match_prefix(
                     MatchPrefixParams(
-                        key=RadixKey(self.adjust_max_prefix_ids(), self.extra_key, self.dp_rank)
+                        key=RadixKey(self.adjust_max_prefix_ids(), self.extra_key, self.dp_rank),
+                        cow_recurrent=(
+                            tree_cache.supports_recurrent() and not is_running_recurrent
+                        ),
+                        full_only=is_running_recurrent,
+                        req=self,
                     )
                 )
                 self.prefix_indices = match_result.device_indices
@@ -473,17 +514,18 @@ class Req:
         return self.fill_ids[:max_prefix_len]
 
     def pop_committed_kv_cache(self) -> int:
-        assert (
-            not self.kv_committed_freed
-        ), f"Committed KV cache already freed ({self.kv_committed_len=})"
+        # Idempotent: the PD prefill abort path can run release a second time
+        # (cache_finished_req) after a handoff failure already freed the KV.
+        # Return 0 on repeat so the caller frees an empty slice instead of
+        # crashing the scheduler on a double-free assertion.
+        if self.kv_committed_freed:
+            return 0
         self.kv_committed_freed = True
         return self.kv_committed_len
 
     def pop_overallocated_kv_cache(self) -> tuple[int, int]:
-        assert not self.kv_overallocated_freed, (
-            "Overallocated KV cache already freed, "
-            f"{self.kv_committed_len=}, {self.kv_allocated_len=}"
-        )
+        if self.kv_overallocated_freed:
+            return 0, 0
         self.kv_overallocated_freed = True
         return self.kv_committed_len, self.kv_allocated_len
 
@@ -623,6 +665,10 @@ class Req:
         self.latest_bid = None
         self.cache_protected_len = 0
         self.recurrent_pool_idx = None
+        self.recurrent_cow_src_index = None
+        self.recurrent_ping_pong_track_buffer = None
+        self.recurrent_next_track_idx = None
+        self.recurrent_last_track_seqlen = None
 
     def set_finish_with_abort(self, error_msg: str):
         # set it to one token to skip the long prefill
@@ -695,6 +741,64 @@ class ScheduleReqsInfo:
 
     # Recurrent state indices for hybrid recurrent models (per DP)
     recurrent_indices: np.ndarray | None = None
+
+    # Recurrent CoW src slot per req (0 = no clone), per DP.
+    recurrent_cow_src_indices: np.ndarray | None = None
+
+    # Recurrent track metadata per DP (extra-buffer; mask 0 = no boundary).
+    recurrent_track_indices: np.ndarray | None = None
+    recurrent_track_mask: np.ndarray | None = None
+
+
+def _build_recurrent_cow_src_indices(reqs: list[Req]) -> np.ndarray:
+    """Build fixed-shape CoW metadata; zero means no clone for that request."""
+    vals = [r.recurrent_cow_src_index or 0 for r in reqs]
+    return np.asarray(vals, dtype=np.int32)
+
+
+class _RecurrentTrackEntry(NamedTuple):
+    track_mask: bool
+    track_index: int
+
+
+def _recurrent_track_entry(
+    req: Req, final_seq_len: int, *, interval: int, pool, is_extend: bool
+) -> _RecurrentTrackEntry:
+    """Per-req extra-buffer track entry for the forward at ``final_seq_len``.
+
+    On a real track boundary, reads the ping-pong slot at ``recurrent_next_track_idx``
+    BEFORE flipping it (read-then-flip), records the watermark seqlen, and flips
+    the next-scatter target. Off a boundary, returns a dormant (0,) entry and
+    leaves the req's bookkeeping untouched."""
+    if is_extend:
+        track_mask = req.extend_input_len > 0 and final_seq_len % interval == 0
+    else:
+        track_mask = final_seq_len % interval == 0
+    if not track_mask:
+        return _RecurrentTrackEntry(False, 0)
+    idx = req.recurrent_next_track_idx
+    track_index = req.recurrent_ping_pong_track_buffer[idx]
+    req.recurrent_last_track_seqlen = final_seq_len
+    req.recurrent_next_track_idx = pool.get_recurrent_ping_pong_other_idx(idx)
+    return _RecurrentTrackEntry(True, track_index)
+
+
+def _build_recurrent_track_entries(
+    reqs: list[Req], final_seq_lens: list[int], *, interval: int, pool, is_extend: bool
+):
+    """Build fixed-shape track indices and a 0/1 boundary mask."""
+    indices: list[int] = []
+    mask: list[int] = []
+    for req, final_seq_len in zip(reqs, final_seq_lens):
+        entry = _recurrent_track_entry(
+            req, final_seq_len, interval=interval, pool=pool, is_extend=is_extend
+        )
+        indices.append(entry.track_index)
+        mask.append(1 if entry.track_mask else 0)
+    return (
+        np.asarray(indices, dtype=np.int32),
+        np.asarray(mask, dtype=np.int32),
+    )
 
 
 @dataclasses.dataclass
@@ -881,13 +985,37 @@ class ScheduleBatch:
         return self.batch_size() == 0
 
     def alloc_req_slots(self, reqs: list[Req]):
+        if (
+            self.is_hybrid_recurrent
+            and self.tree_cache is not None
+            and self.tree_cache.supports_recurrent()
+        ):
+            dp_rank = reqs[0].dp_rank if reqs and reqs[0].dp_rank is not None else 0
+            per_req = self.req_to_token_pool.request_owned_slots
+            demand = per_req * sum(1 for r in reqs if r.recurrent_pool_idx is None)
+            available = self.req_to_token_pool.recurrent_available_size(dp_rank)
+            if available < demand:
+                self.tree_cache.evict(
+                    EvictParams(recurrent_num=demand - available, dp_rank=dp_rank)
+                )
         req_pool_indices = self.req_to_token_pool.alloc(reqs)
         if req_pool_indices is None:
+            detail = f"{self.req_to_token_pool.available_size()=}, {len(reqs)=}"
+            if (
+                self.is_hybrid_recurrent
+                and self.tree_cache is not None
+                and self.tree_cache.supports_recurrent()
+            ):
+                # Throttled upstream by admission backpressure, so unreachable for
+                # recurrent; report the recurrent pool (the constrained resource).
+                dp_rank = reqs[0].dp_rank if reqs and reqs[0].dp_rank is not None else 0
+                detail += (
+                    f", recurrent_available={self.req_to_token_pool.recurrent_available_size(dp_rank)}"
+                    f", request_owned_slots={self.req_to_token_pool.request_owned_slots}"
+                )
             raise RuntimeError(
                 "alloc_req_slots runs out of memory. "
-                "Please set a smaller number for `--max-running-requests`. "
-                f"{self.req_to_token_pool.available_size()=}, "
-                f"{len(reqs)=}, "
+                f"Please set a smaller number for `--max-running-requests`. {detail}"
             )
         return req_pool_indices
 
@@ -1009,6 +1137,8 @@ class ScheduleBatch:
                 info.recurrent_indices = self.req_to_token_pool.get_linear_recurrent_indices(
                     info.req_pool_indices
                 )
+                if self.tree_cache is not None and self.tree_cache.supports_recurrent():
+                    info.recurrent_cow_src_indices = _build_recurrent_cow_src_indices(info.reqs)
 
             info.extend_num_tokens = (info.extend_num_tokens or 0) + added_count
 
@@ -1042,8 +1172,10 @@ class ScheduleBatch:
 
             # Init arrays
             seq_lens = [len(r.fill_ids) for r in reqs]
-            prefix_lens = [len(r.prefix_indices) for r in reqs]
             extend_lens = [r.extend_input_len for r in reqs]
+            # Derive from main-thread-owned fields: r.prefix_indices can be
+            # concurrently reassigned by the PD P-thread eager-stash path.
+            prefix_lens = [s - e for s, e in zip(seq_lens, extend_lens)]
             extend_num_tokens = sum(extend_lens)
 
             req_pool_indices_cpu = np.array(req_pool_indices, dtype=np.int32)
@@ -1065,13 +1197,16 @@ class ScheduleBatch:
 
                 req.kv_committed_len = seq_len
                 req.kv_allocated_len = seq_len
-                req.cache_protected_len = pre_len
+                # Tree-owned floor is last_matched_prefix_len, NOT pre_len: a
+                # recurrent off-boundary chunk skip advances prefix_indices past the
+                # published boundary, and pre_len would mark that request-owned tail
+                # tree-protected and leak it on finish.
+                req.cache_protected_len = req.last_matched_prefix_len
 
-                prefix_indices = req.prefix_indices
                 if pre_len > 0:
-                    # note: prefix_indices has to locate on device, or will meet Received incompatible devices for jitted computation
+                    # Slice: same P-thread race on prefix_indices as above.
                     self.req_to_token_pool.write(
-                        (req.req_pool_idx, slice(0, pre_len)), prefix_indices
+                        (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices[:pre_len]
                     )
 
                 req.cached_tokens += pre_len - req.already_computed
@@ -1102,10 +1237,7 @@ class ScheduleBatch:
                     # input_logprobs = [1, 2, 3, 4]
                     # fill_ids = [3, 4]
                     # extend_input_logprob_token_id = [4, 0]
-                    global_start_idx, global_end_idx = (
-                        len(req.prefix_indices),
-                        len(req.fill_ids),
-                    )
+                    global_start_idx, global_end_idx = (pre_len, seq_len)
                     # Apply logprob_start_len
                     if global_start_idx < req.logprob_start_len:
                         global_start_idx = req.logprob_start_len
@@ -1175,6 +1307,23 @@ class ScheduleBatch:
                 info.recurrent_indices = self.req_to_token_pool.get_linear_recurrent_indices(
                     req_pool_indices_cpu
                 )
+                if self.tree_cache is not None and self.tree_cache.supports_recurrent():
+                    info.recurrent_cow_src_indices = _build_recurrent_cow_src_indices(reqs)
+                # Boundary splitting guarantees an EXTEND ends on a boundary or
+                # is a non-final chunk, so seq_len % interval == 0 iff the
+                # snapshot should be taken this round.
+                if self.tree_cache is not None and self.tree_cache.recurrent_extra_buffer_active():
+                    interval = self.tree_cache.recurrent_track_interval
+                    (
+                        info.recurrent_track_indices,
+                        info.recurrent_track_mask,
+                    ) = _build_recurrent_track_entries(
+                        reqs,
+                        seq_lens,
+                        interval=interval,
+                        pool=self.req_to_token_pool,
+                        is_extend=True,
+                    )
 
             # Write to req_to_token_pool
             pt = 0
@@ -1221,6 +1370,10 @@ class ScheduleBatch:
         requests = (
             info.reqs if selected_indices is None else [info.reqs[i] for i in selected_indices]
         )
+
+        spec_info = getattr(info, "spec_info", None)
+        if spec_info is not None and hasattr(spec_info, "new_tokens_required_next_decode"):
+            return spec_info.new_tokens_required_next_decode(requests, page_size)
 
         new_pages = sum(1 for r in requests if r.kv_committed_len % page_size == 0)
         return new_pages * page_size
@@ -1507,7 +1660,9 @@ class ScheduleBatch:
         # prepare_for_decode requires cross-rank-flat allocate_lens
         # (asserts shape[0] == batch_size); rebuild via _concat, run it, then
         # split allocate_lens back to per-rank.
-        if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
+        if self.spec_algorithm is not None and (
+            self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash()
+        ):
             for info in self.reqs_info:
                 if not info.reqs:
                     info.input_ids = None
@@ -1515,7 +1670,16 @@ class ScheduleBatch:
                     info.seq_lens = None
                     info.out_cache_loc = None
                     info.seq_lens_sum = 0
+                    info.spec_info = None
+                elif (
+                    info.spec_info is not None
+                    and getattr(info.spec_info, "allocate_lens", None) is not None
+                    and len(info.spec_info.allocate_lens) != len(info.reqs)
+                ):
+                    info.spec_info.trim_to_length(len(info.reqs))
             flat_spec = self._concat_spec_info_per_rank([info.spec_info for info in self.reqs_info])
+            if getattr(flat_spec, "pending_draft_extend_result", None) is not None:
+                flat_spec.resolve_pending_draft_extend_result()
             flat_spec.prepare_for_decode(self)
             real_bs_per_dp = [len(info.reqs) if info.reqs else 0 for info in self.reqs_info]
             per_rank_spec = self._split_spec_info_per_rank(flat_spec, real_bs_per_dp)
@@ -1581,6 +1745,20 @@ class ScheduleBatch:
                 info.recurrent_indices = self.req_to_token_pool.get_linear_recurrent_indices(
                     info.req_pool_indices
                 )
+                info.recurrent_cow_src_indices = None
+                if self.tree_cache is not None and self.tree_cache.recurrent_extra_buffer_active():
+                    interval = self.tree_cache.recurrent_track_interval
+                    new_seq_lens = [int(s) for s in info.seq_lens]
+                    (
+                        info.recurrent_track_indices,
+                        info.recurrent_track_mask,
+                    ) = _build_recurrent_track_entries(
+                        reqs,
+                        new_seq_lens,
+                        interval=interval,
+                        pool=self.req_to_token_pool,
+                        is_extend=False,
+                    )
 
             # Allocate memory for this DP rank
             if self.token_to_kv_pool_allocator.page_size == 1:
@@ -1657,10 +1835,19 @@ class ScheduleBatch:
                 info.token_ids_logprobs = None
                 info.sampling_info = None
                 info.spec_info = None
+                info.recurrent_cow_src_indices = None
                 continue
 
             # Early exit: No filtering needed if all requests kept
             if len(keep_indices_dp) == len(info.reqs):
+                spec_info_len = (
+                    None
+                    if info.spec_info is None
+                    or getattr(info.spec_info, "allocate_lens", None) is None
+                    else len(info.spec_info.allocate_lens)
+                )
+                if spec_info_len is not None and spec_info_len != len(info.reqs):
+                    info.spec_info.trim_to_length(len(info.reqs))
                 continue
 
             # Filter reqs list
@@ -1793,7 +1980,8 @@ class ScheduleBatch:
                     and other_info.top_logprobs_nums is not None
                 ):
                     self_info.top_logprobs_nums.extend(other_info.top_logprobs_nums)
-                    self_info.token_ids_logprobs.extend(other_info.token_ids_logprobs)
+                self_info.token_ids_logprobs.extend(other_info.token_ids_logprobs)
+
             elif self.return_logprob and self_info.top_logprobs_nums is not None:
                 self_info.top_logprobs_nums.extend([0] * len(other_info.reqs))
                 self_info.token_ids_logprobs.extend([None] * len(other_info.reqs))
@@ -2193,6 +2381,9 @@ class ScheduleBatch:
 
         offset_bs = 0
         req_to_token = self.req_to_token_pool.req_to_token
+        max_context_len = req_to_token.shape[1]
+        req_to_token_flat = req_to_token.reshape(-1)
+        page_ramp = np.arange(page_size, dtype=req_to_token.dtype) if page_size > 1 else None
 
         for dp_rank in range(self.dp_size):
             info = self.reqs_info[dp_rank]
@@ -2201,27 +2392,40 @@ class ScheduleBatch:
                 offset_bs += per_dp_cache_loc_size
                 continue
 
-            seq_lens = info.seq_lens
-            req_pool_indices = info.req_pool_indices
+            seq_lens = np.asarray(info.seq_lens)
+            req_pool_indices = np.asarray(info.req_pool_indices)
 
             n_reqs = len(seq_lens)
-            if n_reqs > 0:
-                # Page-aligned offsets per request
-                aligned_lens = ((seq_lens + page_size - 1) // page_size) * page_size
-                offsets = np.empty(n_reqs, dtype=np.int64)
-                offsets[0] = 0
-                np.cumsum(aligned_lens[:-1], out=offsets[1:])
+            # Page-aligned offsets per request
+            aligned_lens = ((seq_lens + page_size - 1) // page_size) * page_size
+            offsets = np.empty(n_reqs, dtype=np.int64)
+            offsets[0] = 0
+            np.cumsum(aligned_lens[:-1], out=offsets[1:])
 
-                # Per-req contiguous slice copy from req_to_token directly.
-                # Avoids:
-                #  - the 8MB-per-DP intermediate `req_to_token[req_pool_indices]`
-                #    full-row gather (only first seq_len of each row is used)
-                #  - the 1M-element fancy-index scatter, which numpy serialises
-                #    at Python level rather than as a contiguous memcpy.
-                # Measured ~40x speedup at BSZ=64 OSL=16K decode vs the
-                # vectorised fancy-index version (~12ms -> ~0.3ms).
-                # Byte-for-byte identical output (verified with 14 edge cases
-                # incl. BSZ in {1,8,32,64,512}, empty DPs, page boundaries).
+            if page_size > 1:
+                # PagedTokenToKVPoolAllocator writes page-contiguous slot indices
+                # (req_to_token[i, p*ps+j] == req_to_token[i, p*ps] + j), so the
+                # per-req loop can be replaced by one gather of page-start values
+                # plus a broadcast-add. Padding tail [seq_len:aligned] lands in
+                # the same allocated page so remains safe.
+                n_pages = aligned_lens // page_size
+                total_pages = int(n_pages.sum())
+                if total_pages > 0:
+                    total_aligned = total_pages * page_size
+                    # flat_src[g] = idx[r]*W + p*ps = (idx[r]*W - page_cum[r]*ps) + g*ps
+                    page_cum = offsets // page_size
+                    row_base = req_pool_indices.astype(np.int64) * max_context_len
+                    flat_src = np.repeat(row_base - page_cum * page_size, n_pages)
+                    flat_src += np.arange(total_pages, dtype=np.int64) * page_size
+                    page_starts = req_to_token_flat[flat_src]
+                    dest = cache_loc_cpu[offset_bs : offset_bs + total_aligned]
+                    np.add(
+                        page_starts.reshape(total_pages, 1),
+                        page_ramp.reshape(1, page_size),
+                        out=dest.reshape(total_pages, page_size),
+                    )
+            else:
+                # Non-paged allocator has no page-contiguity guarantee.
                 for r in range(n_reqs):
                     sl = int(seq_lens[r])
                     dest_start = int(offsets[r]) + offset_bs
@@ -2232,6 +2436,11 @@ class ScheduleBatch:
             # Move to next DP rank's section (fixed stride)
             offset_bs += per_dp_cache_loc_size
 
+        # cache_loc_cpu is a view into the reusable host_buf; PD eager-stash
+        # can overwrite it via _disp(nxt) before this batch's H2D consumes the
+        # view. Single-threaded (native/colocated) callers don't need the copy.
+        if global_server_args_dict.get("pd_disaggregation") == "pathways":
+            return cache_loc_cpu.copy()
         return cache_loc_cpu
 
     def _merge_sampling_info(
@@ -2361,13 +2570,32 @@ class ScheduleBatch:
             logits_indices_selector,
         ) = self._merge_batch_metadata(per_dp_bs, total_bs)
         sampling_info = self._merge_sampling_info(per_dp_bs, total_bs)
+        for dp_rank, info in enumerate(self.reqs_info):
+            spec_info_dp = info.spec_info
+            future_indices = getattr(spec_info_dp, "future_indices", None)
+            if future_indices is None:
+                continue
+            num_reqs = len(info.reqs) if info.reqs is not None else 0
+            assert len(future_indices) == num_reqs, (
+                f"future_indices length mismatch on dp_rank={dp_rank}: "
+                f"{len(future_indices)=}, {num_reqs=}"
+            )
         # Concat per-rank spec_info into a cross-rank-flat EagleDraftInput,
         # then scatter into DP-padded (total_bs, ...) slots so spec_info[i]
         # aligns with seq_lens[i]. Returns a new object — does not mutate
         # the per-rank cross-round state on reqs_info[r].spec_info.
         flat_spec = self._concat_spec_info_per_rank([info.spec_info for info in self.reqs_info])
+        if getattr(flat_spec, "pending_draft_extend_result", None) is not None:
+            flat_spec.resolve_pending_draft_extend_result()
+        legacy_eagle3_non_overlap = use_legacy_eagle3_non_overlap(
+            self.enable_overlap, self.spec_algorithm
+        )
         spec_info = self._scatter_spec_info_to_dp_slots(
-            flat_spec, logits_indices_selector, total_bs
+            flat_spec,
+            logits_indices_selector,
+            total_bs,
+            mesh=self.mesh,
+            legacy_host_scatter=legacy_eagle3_non_overlap,
         )
         # Per-rank out_cache_loc chunks (set in spec prepare_for_decode) have
         # variable length (∝ accept_len). DP-segment: pad each to max_len with
@@ -2381,10 +2609,21 @@ class ScheduleBatch:
             )
             for i in self.reqs_info
         ]
-        # Pad each rank's out_cache_loc to per_dp_bs * draft_token_num so the
-        # merged shape is stable across runtime bs. max_chunk_len defensive.
+        # Spec prepare_for_decode conservatively reserves up to
+        # 2 * ALLOC_LEN_PER_DECODE tokens per request. Keep the JIT-visible
+        # out_cache_loc shape on that same conservative bucket instead of the
+        # smaller draft-token count, otherwise high-running batches can escape
+        # precompile with shapes like 656/928/1024.
         max_chunk_len = max((len(c) for c in ocl_chunks), default=0)
-        target_per_rank_ocl = max(per_dp_bs * draft_token_num, max_chunk_len)
+        if use_legacy_eagle3_non_overlap(self.enable_overlap, self.spec_algorithm):
+            target_per_rank_ocl = max(per_dp_bs * draft_token_num, max_chunk_len)
+        else:
+            target_per_rank_ocl = per_dp_bs * draft_token_num * 2
+            assert max_chunk_len <= target_per_rank_ocl, (
+                "spec decode out_cache_loc escaped precompile bucket: "
+                f"max_chunk_len={max_chunk_len}, bucket_per_rank={target_per_rank_ocl}, "
+                f"per_dp_bs={per_dp_bs}, draft_token_num={draft_token_num}"
+            )
         out_cache_loc = (
             np.concatenate(
                 [
@@ -2395,7 +2634,7 @@ class ScheduleBatch:
             if target_per_rank_ocl > 0
             else np.empty(0, dtype=np.int32)
         )
-        return ModelWorkerBatch(
+        model_worker_batch = ModelWorkerBatch(
             bid=acc_global_bid(),
             forward_mode=self.forward_mode,
             input_ids=np.empty(0, dtype=np.int32),
@@ -2433,33 +2672,119 @@ class ScheduleBatch:
             tree_cache=self.tree_cache,
             mrope_positions=None,
         )
+        return model_worker_batch
 
     @staticmethod
-    def _scatter_spec_info_to_dp_slots(flat, selector: np.ndarray, total_bs: int):
+    def _scatter_spec_info_to_dp_slots(
+        flat,
+        selector: np.ndarray,
+        total_bs: int,
+        mesh: mesh_lib.Mesh = None,
+        legacy_host_scatter: bool = False,
+    ):
         """Scatter global-flat spec_info arrays into DP-padded ``(total_bs, …)``.
 
         ``selector[k]`` is the DP-padded slot of the k-th global-flat req
         (== ``logits_indices_selector``). Returns a new ``EagleDraftInput``;
         the cross-round flat state on ``reqs_info[r].spec_info`` is unchanged.
         """
+        from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput
 
-        def _scatter1(arr):
+        if isinstance(flat, DFlashDraftInput):
+
+            def _scatter_dflash_1d(arr, field: str, *, fill_value: int = 0):
+                if arr is None:
+                    raise ValueError(f"DFLASH state field {field!r} is missing before DP scatter.")
+                a = np.asarray(arr)
+                if a.shape[0] != len(selector):
+                    raise ValueError(
+                        "DFLASH state length does not match real request slots before DP scatter: "
+                        f"field={field}, state_bs={a.shape[0]}, real_bs={len(selector)}."
+                    )
+                out = np.full((total_bs,), fill_value, dtype=a.dtype)
+                out[selector] = a
+                return out
+
+            def _scatter_dflash_hidden(arr):
+                if arr is None:
+                    return None
+                a = np.asarray(arr)
+                if a.shape[0] != len(selector):
+                    return None
+                out = np.zeros((total_bs,) + a.shape[1:], dtype=a.dtype)
+                out[selector] = a
+                return out
+
+            relay_state = flat.future_indices is not None
+            return DFlashDraftInput(
+                verified_id=(
+                    None if relay_state else _scatter_dflash_1d(flat.verified_id, "verified_id")
+                ),
+                target_hidden=_scatter_dflash_hidden(flat.target_hidden),
+                ctx_lens=(None if relay_state else _scatter_dflash_1d(flat.ctx_lens, "ctx_lens")),
+                draft_seq_lens=(
+                    None
+                    if relay_state
+                    else _scatter_dflash_1d(flat.draft_seq_lens, "draft_seq_lens")
+                ),
+                allocate_lens=(
+                    None
+                    if flat.allocate_lens is None
+                    else _scatter_dflash_1d(flat.allocate_lens, "allocate_lens")
+                ),
+                reservation_base_lens=(
+                    None
+                    if flat.reservation_base_lens is None
+                    else _scatter_dflash_1d(flat.reservation_base_lens, "reservation_base_lens")
+                ),
+                future_indices=(
+                    None
+                    if flat.future_indices is None
+                    else _scatter_dflash_1d(flat.future_indices, "future_indices")
+                ),
+                block_size=flat.block_size,
+            )
+
+        def _scatter1(arr, *, require_selector_len: bool = True, data_sharded: bool = False):
             if arr is None:
                 return None
             a = np.asarray(arr)
+            if require_selector_len and a.shape[0] != len(selector):
+                return None
             out = np.zeros((total_bs,) + a.shape[1:], dtype=a.dtype)
             out[selector] = a
+            if data_sharded and mesh is not None:
+                from jax.sharding import NamedSharding
+                from jax.sharding import PartitionSpec as P
+
+                return jax.device_put(out, NamedSharding(mesh, P("data")))
             return out
 
+        if legacy_host_scatter:
+            return type(flat)(
+                topk_p=_scatter1(flat.topk_p),
+                topk_index=_scatter1(flat.topk_index),
+                hidden_states=_scatter1(flat.hidden_states),
+                verified_id=_scatter1(flat.verified_id),
+                allocate_lens=_scatter1(flat.allocate_lens),
+                capture_hidden_mode=flat.capture_hidden_mode,
+                accept_length=flat.accept_length,
+                accept_length_cpu=flat.accept_length_cpu,
+                new_seq_lens=_scatter1(flat.new_seq_lens),
+                future_indices=_scatter1(flat.future_indices),
+            )
+
         return type(flat)(
-            topk_p=_scatter1(flat.topk_p),
-            topk_index=_scatter1(flat.topk_index),
+            topk_p=_scatter1(flat.topk_p, data_sharded=True),
+            topk_index=_scatter1(flat.topk_index, data_sharded=True),
             hidden_states=_scatter1(flat.hidden_states),
-            verified_id=_scatter1(flat.verified_id),
+            verified_id=_scatter1(flat.verified_id, data_sharded=True),
             allocate_lens=_scatter1(flat.allocate_lens),
             capture_hidden_mode=flat.capture_hidden_mode,
-            accept_length=flat.accept_length,
-            accept_length_cpu=flat.accept_length_cpu,
+            accept_length=_scatter1(flat.accept_length),
+            accept_length_cpu=_scatter1(flat.accept_length_cpu),
+            new_seq_lens=_scatter1(flat.new_seq_lens),
+            future_indices=_scatter1(flat.future_indices),
         )
 
     @staticmethod
@@ -2473,7 +2798,79 @@ class ScheduleBatch:
         if flat is None:
             return [None] * len(real_bs_per_dp)
 
-        flat._ensure_host()
+        from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput
+
+        if isinstance(flat, DFlashDraftInput):
+
+            def _slice(v, start: int, end: int):
+                return None if v is None else v[start:end]
+
+            relay_state = flat.future_indices is not None
+            out = []
+            offset = 0
+            for n in real_bs_per_dp:
+                if n == 0:
+                    out.append(None)
+                    continue
+
+                end = offset + n
+                out.append(
+                    DFlashDraftInput(
+                        verified_id=(
+                            None if relay_state else _slice(flat.verified_id, offset, end)
+                        ),
+                        target_hidden=(
+                            None if relay_state else _slice(flat.target_hidden, offset, end)
+                        ),
+                        ctx_lens=None if relay_state else _slice(flat.ctx_lens, offset, end),
+                        draft_seq_lens=(
+                            None if relay_state else _slice(flat.draft_seq_lens, offset, end)
+                        ),
+                        allocate_lens=_slice(flat.allocate_lens, offset, end),
+                        reservation_base_lens=_slice(flat.reservation_base_lens, offset, end),
+                        future_indices=_slice(flat.future_indices, offset, end),
+                        block_size=flat.block_size,
+                    )
+                )
+                offset = end
+            return out
+
+        has_future_indices = getattr(flat, "future_indices", None) is not None
+        if getattr(flat, "pending_draft_extend_result", None) is not None:
+            flat.resolve_pending_draft_extend_result()
+        if not has_future_indices:
+            flat._ensure_host()
+            required_fields = ("topk_p", "topk_index", "hidden_states", "verified_id")
+            missing = [f for f in required_fields if getattr(flat, f, None) is None]
+            if missing:
+
+                def _field_state(v):
+                    if v is None:
+                        return None
+                    shape = getattr(v, "shape", None)
+                    if shape is not None:
+                        return shape
+                    return len(v)
+
+                field_states = {
+                    f: _field_state(getattr(flat, f, None))
+                    for f in (
+                        "topk_p",
+                        "topk_index",
+                        "hidden_states",
+                        "verified_id",
+                        "allocate_lens",
+                        "accept_length",
+                        "accept_length_cpu",
+                        "new_seq_lens",
+                        "future_indices",
+                    )
+                }
+                raise RuntimeError(
+                    "_split_spec_info_per_rank got incomplete EagleDraftInput "
+                    f"without pending_draft_extend_result; missing={missing}, "
+                    f"field_states={field_states}, real_bs_per_dp={real_bs_per_dp}"
+                )
 
         per_req_fields = (
             "topk_p",
@@ -2483,6 +2880,8 @@ class ScheduleBatch:
             "allocate_lens",
             "accept_length",
             "accept_length_cpu",
+            "new_seq_lens",
+            "future_indices",
         )
 
         out = []
@@ -2494,38 +2893,102 @@ class ScheduleBatch:
             kwargs = {"capture_hidden_mode": flat.capture_hidden_mode}
             for f in per_req_fields:
                 v = getattr(flat, f, None)
-                kwargs[f] = None if v is None else v[offset : offset + n]
+                if has_future_indices and f not in (
+                    "allocate_lens",
+                    "new_seq_lens",
+                    "accept_length_cpu",
+                    "future_indices",
+                ):
+                    kwargs[f] = None
+                else:
+                    kwargs[f] = None if v is None else v[offset : offset + n]
             out.append(type(flat)(**kwargs))
             offset += n
         return out
 
     @staticmethod
     def _concat_spec_info_per_rank(per_rank: list):
-        """Concat per-rank EagleDraftInputs into a single cross-rank-flat one.
+        """Concat per-rank draft inputs into a single cross-rank-flat one.
 
         ``None`` entries are skipped. Returns ``None`` if every entry is ``None``.
         Used at forward input boundary (``_get_spec_decode_mwb_dp``) to build the
         flat shape ``_scatter_spec_info_to_dp_slots`` expects.
         """
+        from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput
+
         nonempty = [s for s in per_rank if s is not None]
         if not nonempty:
             return None
 
-        per_req_fields = (
-            "topk_p",
-            "topk_index",
-            "hidden_states",
-            "verified_id",
-            "allocate_lens",
-            "accept_length",
-            "accept_length_cpu",
-        )
+        is_dflash = isinstance(nonempty[0], DFlashDraftInput)
+        if is_dflash:
+            has_future_indices = any(s.future_indices is not None for s in nonempty)
+            if has_future_indices and not all(s.future_indices is not None for s in nonempty):
+                raise ValueError(
+                    "DFLASH overlap concat requires future_indices on every nonempty rank."
+                )
+            per_req_fields = (
+                "verified_id",
+                "ctx_lens",
+                "draft_seq_lens",
+                "target_hidden",
+                "allocate_lens",
+                "reservation_base_lens",
+                "future_indices",
+            )
+        else:
+            has_future_indices = any(
+                getattr(s, "future_indices", None) is not None for s in nonempty
+            )
+            if has_future_indices:
+                assert all(getattr(s, "future_indices", None) is not None for s in nonempty), (
+                    "_concat_spec_info_per_rank requires every nonempty rank to carry "
+                    "future_indices on the relay-buffer path"
+                )
+            else:
+                for spec_info in nonempty:
+                    spec_info.resolve_pending_draft_extend_result()
 
-        kwargs = {"capture_hidden_mode": nonempty[0].capture_hidden_mode}
+            per_req_fields = (
+                "topk_p",
+                "topk_index",
+                "hidden_states",
+                "verified_id",
+                "allocate_lens",
+                "accept_length",
+                "accept_length_cpu",
+                "new_seq_lens",
+                "future_indices",
+            )
+
+        kwargs = {} if is_dflash else {"capture_hidden_mode": nonempty[0].capture_hidden_mode}
+        if is_dflash:
+            kwargs["block_size"] = nonempty[0].block_size
         for f in per_req_fields:
             vals = [getattr(s, f, None) for s in nonempty]
+            if (
+                is_dflash
+                and has_future_indices
+                and f
+                in (
+                    "verified_id",
+                    "ctx_lens",
+                    "draft_seq_lens",
+                    "target_hidden",
+                )
+            ):
+                kwargs[f] = None
+                continue
+            if is_dflash and f == "target_hidden":
+                materialized = [v for v in vals if v is not None and v.shape[0] > 0]
+                if not materialized:
+                    kwargs[f] = None
+                    continue
             nonnull = [v for v in vals if v is not None]
             if not nonnull:
+                kwargs[f] = None
+                continue
+            if f in ("accept_length", "accept_length_cpu") and len(nonnull) != len(nonempty):
                 kwargs[f] = None
                 continue
             # All nonempty ranks should agree on which optional fields they
@@ -2612,7 +3075,49 @@ class ScheduleBatch:
                         )
                 offset_bs += per_dp_bs_padding
 
-        # Step 5.6: has_initial_state[i] = True iff slot i already holds
+        # Step 5.5b: Merge recurrent CoW src indices (extend only) and consume
+        # the per-req src so later decode/mixed forwards don't re-clone.
+        recurrent_cow_src_indices_cpu = None
+        if any(info.recurrent_cow_src_indices is not None for info in self.reqs_info):
+            recurrent_cow_src_indices_cpu = np.zeros(total_bs, dtype=np.int32)
+            offset_bs = 0
+            for dp_rank in range(self.dp_size):
+                info = self.reqs_info[dp_rank]
+                if info.seq_lens is not None and len(info.seq_lens) > 0:
+                    dp_bs = len(info.seq_lens)
+                    if info.recurrent_cow_src_indices is not None:
+                        recurrent_cow_src_indices_cpu[offset_bs : offset_bs + dp_bs] = (
+                            info.recurrent_cow_src_indices
+                        )
+                offset_bs += per_dp_bs_padding
+            for info in self.reqs_info:
+                info.recurrent_cow_src_indices = None
+                for r in info.reqs or []:
+                    r.recurrent_cow_src_index = None
+        # Merge recurrent track metadata (extra-buffer; see ScheduleReqsInfo).
+        recurrent_track_indices_cpu = None
+        recurrent_track_mask_cpu = None
+        if any(info.recurrent_track_mask is not None for info in self.reqs_info):
+            recurrent_track_indices_cpu = np.zeros(total_bs, dtype=np.int32)
+            recurrent_track_mask_cpu = np.zeros(total_bs, dtype=np.int32)
+            offset_bs = 0
+            for dp_rank in range(self.dp_size):
+                info = self.reqs_info[dp_rank]
+                if info.seq_lens is not None and len(info.seq_lens) > 0:
+                    dp_bs = len(info.seq_lens)
+                    if info.recurrent_track_indices is not None:
+                        recurrent_track_indices_cpu[offset_bs : offset_bs + dp_bs] = (
+                            info.recurrent_track_indices
+                        )
+                    if info.recurrent_track_mask is not None:
+                        recurrent_track_mask_cpu[offset_bs : offset_bs + dp_bs] = (
+                            info.recurrent_track_mask
+                        )
+                offset_bs += per_dp_bs_padding
+            for info in self.reqs_info:
+                info.recurrent_track_indices = None
+                info.recurrent_track_mask = None
+        # has_initial_state[i] = True iff slot i already holds
         # prior KV/recurrent state (extend with prefix, or any decode slot).
         has_initial_state_cpu = np.ones(total_bs, dtype=np.bool_)
         if self.forward_mode.is_extend():
@@ -2759,6 +3264,9 @@ class ScheduleBatch:
             apply_for_deepstack=apply_for_deepstack,
             deepstack_visual_embedding=deepstack_visual_embedding,
             recurrent_indices=recurrent_indices_cpu,
+            recurrent_cow_src_indices=recurrent_cow_src_indices_cpu,
+            recurrent_track_indices=recurrent_track_indices_cpu,
+            recurrent_track_mask=recurrent_track_mask_cpu,
             has_initial_state=has_initial_state_cpu,
             spec_algorithm=self.spec_algorithm,
         )
@@ -2821,13 +3329,20 @@ class ScheduleBatch:
         for info in self.reqs_info:
             # Create a new ScheduleReqsInfo with shallow copies of necessary fields
             new_info = ScheduleReqsInfo()
-            new_info.reqs = info.reqs  # Shallow copy (list reference)
+            new_info.reqs = list(info.reqs) if info.reqs else info.reqs
             new_info.out_cache_loc = info.out_cache_loc
-            new_info.decoding_reqs = info.decoding_reqs
+            new_info.decoding_reqs = (
+                list(info.decoding_reqs) if info.decoding_reqs else info.decoding_reqs
+            )
             # process_batch_result compacts per-DP padded input logprobs via
             # _input_logprob_lens_per_dp, which reads these.
-            new_info.extend_lens = info.extend_lens
-            new_info.extend_logprob_start_lens = info.extend_logprob_start_lens
+            new_info.extend_lens = list(info.extend_lens) if info.extend_lens else info.extend_lens
+            new_info.extend_logprob_start_lens = (
+                list(info.extend_logprob_start_lens)
+                if info.extend_logprob_start_lens
+                else info.extend_logprob_start_lens
+            )
+            new_info.spec_info = info.spec_info
             copied_reqs_info.append(new_info)
 
         return ScheduleBatch(
@@ -3206,6 +3721,13 @@ class ModelWorkerBatch:
 
     # Recurrent state indices for hybrid recurrent models
     recurrent_indices: np.ndarray | None = None
+
+    # Recurrent CoW src slot per req (0 = no clone); clone dst = recurrent_indices.
+    recurrent_cow_src_indices: np.ndarray | None = None
+
+    # Recurrent track metadata (extra-buffer); padded to total_bs, P("data").
+    recurrent_track_indices: np.ndarray | None = None
+    recurrent_track_mask: np.ndarray | None = None
 
     # Whether each request has prior recurrent state (lazy zero-on-read)
     has_initial_state: np.ndarray | None = None

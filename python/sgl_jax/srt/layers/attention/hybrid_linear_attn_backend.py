@@ -32,9 +32,19 @@ class LinearRecurrentAttnBackendMetadata:
     cu_q_lens: jax.Array = None
     recurrent_indices: jax.Array = None
     has_initial_state: jax.Array = None
+    # Recurrent track metadata (extra-buffer snapshot at track boundaries).
+    # Optional: None when the batch crosses no track boundary.
+    recurrent_track_indices: jax.Array = None
+    recurrent_track_mask: jax.Array = None
 
     def tree_flatten(self):
-        children = (self.cu_q_lens, self.recurrent_indices, self.has_initial_state)
+        children = (
+            self.cu_q_lens,
+            self.recurrent_indices,
+            self.has_initial_state,
+            self.recurrent_track_indices,
+            self.recurrent_track_mask,
+        )
         aux_data = {}
         return children, aux_data
 
@@ -44,12 +54,14 @@ class LinearRecurrentAttnBackendMetadata:
             cu_q_lens=children[0],
             recurrent_indices=children[1],
             has_initial_state=children[2],
+            recurrent_track_indices=children[3],
+            recurrent_track_mask=children[4],
         )
 
 
 @dataclass
 class LinearRecurrentAttnBackend(AttentionBackend):
-    """Base class for linear recurrent attention backends (KDA, GDN, Mamba2).
+    """Base class for linear recurrent attention backends (e.g. KDA, GDN).
 
     Provides metadata computation and pytree infrastructure.
     Subclasses implement ``__call__`` with model-specific forward logic.
@@ -95,6 +107,18 @@ class LinearRecurrentAttnBackend(AttentionBackend):
             (cu_q_lens, batch.recurrent_indices, batch.has_initial_state),
             sharding=NamedSharding(self.mesh, sharding_spec),
         )
+
+        # Track metadata may be None (no boundary): guard each device_array.
+        if batch.recurrent_track_indices is not None:
+            (metadata.recurrent_track_indices,) = device_array(
+                (batch.recurrent_track_indices,),
+                sharding=NamedSharding(self.mesh, sharding_spec),
+            )
+        if batch.recurrent_track_mask is not None:
+            (metadata.recurrent_track_mask,) = device_array(
+                (batch.recurrent_track_mask,),
+                sharding=NamedSharding(self.mesh, sharding_spec),
+            )
 
         return metadata
 

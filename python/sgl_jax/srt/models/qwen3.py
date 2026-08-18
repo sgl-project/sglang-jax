@@ -574,6 +574,12 @@ class Qwen3ForCausalLM(nnx.Module):
         else:
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]):
+        if layer_ids is None:
+            raise ValueError("DFLASH requires explicit target layer ids.")
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
     def __call__(
         self,
         forward_batch: ForwardBatch,
@@ -584,6 +590,8 @@ class Qwen3ForCausalLM(nnx.Module):
         hidden_states, aux_hidden_states, layers_kv_fused, layers_callback_flag = self.model(
             forward_batch, kv_pool
         )
+        if not self.capture_aux_hidden_states:
+            aux_hidden_states = None
         if not getattr(self.config, "tie_word_embeddings", False):
             output = self.logits_processor(
                 hidden_states, self.lm_head, logits_metadata, aux_hidden_states=aux_hidden_states

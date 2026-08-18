@@ -131,9 +131,9 @@ class _ProfileManager:
         logger.info("Stage-based profiling: starting trace for '%s' -> %s", stage, stage_dir)
 
         profiler_options = jax.profiler.ProfileOptions()
-        if self._host_tracer_level:
+        if self._host_tracer_level is not None:
             profiler_options.host_tracer_level = self._host_tracer_level
-        if self._python_tracer_level:
+        if self._python_tracer_level is not None:
             profiler_options.python_tracer_level = self._python_tracer_level
 
         jax.profiler.start_trace(stage_dir, profiler_options=profiler_options)
@@ -176,15 +176,15 @@ class SchedulerProfilerMixin:
         if output_dir is None:
             output_dir = os.getenv("SGLANG_JAX_PROFILER_DIR", "/tmp")
 
-        # check permission for output_dir
-        tmp_output_dir = output_dir
-        while not os.path.exists(tmp_output_dir):
-            tmp_output_dir = os.path.dirname(tmp_output_dir)
-        if not os.access(tmp_output_dir, os.W_OK):
-            return ProfileReqOutput(
-                success=False,
-                message=f"no permission to write the {output_dir}",
-            )
+        if not output_dir.startswith("gs://"):
+            tmp_output_dir = output_dir
+            while not os.path.exists(tmp_output_dir):
+                tmp_output_dir = os.path.dirname(tmp_output_dir)
+            if not os.access(tmp_output_dir, os.W_OK):
+                return ProfileReqOutput(
+                    success=False,
+                    message=f"no permission to write the {output_dir}",
+                )
 
         self.profiler_output_dir = output_dir
         self.profile_id = profile_id
@@ -213,17 +213,32 @@ class SchedulerProfilerMixin:
         )
 
         profiler_options = jax.profiler.ProfileOptions()
-        if host_tracer_level:
+        if host_tracer_level is not None:
             profiler_options.host_tracer_level = host_tracer_level
-        if python_tracer_level:
+        if python_tracer_level is not None:
             profiler_options.python_tracer_level = python_tracer_level
 
         print(f"profiler_options: {profiler_options}")
 
-        jax.profiler.start_trace(
-            self.profiler_output_dir,
-            profiler_options=profiler_options,
-        )
+        if os.getenv("JAX_PLATFORMS") != "proxy":
+            jax.profiler.start_trace(self.profiler_output_dir, profiler_options=profiler_options)
+        elif self.profiler_output_dir.startswith("gs://"):
+            # Pathways: worker device trace only. Client-side python tracer
+            # OOMs head pod on stop (millions of events); patch it out.
+            from pathwaysutils import profiling as _pwp
+
+            _pwp._original_start_trace = lambda *a, **k: None
+            _pwp._original_stop_trace = lambda *a, **k: None
+            jax.profiler.start_trace(
+                self.profiler_output_dir,
+                profiler_options=profiler_options,
+                max_num_hosts=int(os.getenv("SGLANG_PROFILE_MAX_HOSTS", "8")),
+            )
+        else:
+            # Pathways local: client-side host trace only (bypass worker RPC)
+            from pathwaysutils.profiling import _original_start_trace
+
+            _original_start_trace(self.profiler_output_dir, profiler_options=profiler_options)
 
         self.profile_in_progress = True
         return ProfileReqOutput(success=True, message="Succeeded")
@@ -284,11 +299,15 @@ class SchedulerProfilerMixin:
                 message="Profiling is not in progress. Call /start_profile first.",
             )
 
-        if not Path(self.profiler_output_dir).exists():
-            Path(self.profiler_output_dir).mkdir(parents=True, exist_ok=True)
-
         logger.info("Stop profiling...")
-        jax.profiler.stop_trace()
+        if os.getenv("JAX_PLATFORMS") != "proxy" or self.profiler_output_dir.startswith("gs://"):
+            jax.profiler.stop_trace()
+        else:
+            if not Path(self.profiler_output_dir).exists():
+                Path(self.profiler_output_dir).mkdir(parents=True, exist_ok=True)
+            from pathwaysutils.profiling import _original_stop_trace
+
+            _original_stop_trace()
 
         logger.info(
             "Profiling done. Traces are saved to: %s",

@@ -2,8 +2,10 @@
 
 import dataclasses
 import logging
+import os
 import signal
 import threading
+import time
 from queue import Queue
 
 import jax
@@ -14,7 +16,11 @@ from jax.sharding import NamedSharding, PartitionSpec
 
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.managers.tp_worker import ModelWorker
-from sgl_jax.srt.managers.utils import resolve_future_token_ids, set_future_token_ids
+from sgl_jax.srt.managers.utils import (
+    future_slot_indices,
+    resolve_future_token_ids,
+    set_future_token_ids,
+)
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
@@ -39,12 +45,15 @@ class ModelWorkerClient:
         self.worker.need_prepare_lora_batch = False
 
         self.max_running_requests = self.worker.max_running_requests
+        self.max_total_num_tokens = self.worker.max_total_num_tokens
         self.device = self.worker.device
+        self.cur_sampling_info = None
 
-        # Init future mappings
-        self.future_token_ids_ct = 0
-        self.future_token_ids_limit = self.max_running_requests * 3
-        self.future_token_ids_map = jnp.zeros((self.max_running_requests * 5,), dtype=jnp.int32)
+        # Init future mappings. The map is indexed by req_pool_idx + 1 (one
+        # pending-token slot per request slot; index 0 reserved), not by a
+        # running cursor -- see set_future_token_ids.
+        self.future_map_size = self.worker.model_runner.req_to_token_pool.size + 2
+        self.future_token_ids_map = jnp.zeros((self.future_map_size,), dtype=jnp.int32)
         self.mesh = mesh
         sharding = NamedSharding(mesh, PartitionSpec(None))
         self.future_token_ids_map = jax.device_put(self.future_token_ids_map, sharding)
@@ -60,6 +69,14 @@ class ModelWorkerClient:
         self.parent_process = psutil.Process().parent()
         replicated_sharding = NamedSharding(mesh, PartitionSpec())
         self.async_gather_fn = jax.jit(lambda x: x, out_shardings=replicated_sharding)
+
+    @property
+    def model_runner(self):
+        return self.worker.model_runner
+
+    @property
+    def model_config(self):
+        return self.worker.model_config
 
     def get_model_runner(self):
         return self.worker.get_model_runner()
@@ -97,12 +114,34 @@ class ModelWorkerClient:
         while True:
             (
                 model_worker_batch,
-                future_token_ids_ct,
+                future_slot_indices_np,
                 sampling_metadata,
                 forward_metadata,
             ) = self.input_queue.get()
             if not model_worker_batch:
                 break
+
+            if self.worker._pd_fuse_for_batch(model_worker_batch):
+                # Fused path: resolve/set_future are inlined into the single jit.
+                # Batch-level check (not the worker flag): logprob batches take
+                # the regular 3-tuple path inside forward_batch_generation, so
+                # selecting the fused 4-tuple unpack here would crash on them.
+                with jax.profiler.TraceAnnotation(
+                    f"forward_batch_generation {model_worker_batch.bid}"
+                ):
+                    logits_output, next_token_ids, cache_miss_count, new_future_map = (
+                        self.worker.forward_batch_generation(
+                            model_worker_batch,
+                            model_worker_batch.launch_done,
+                            sampling_metadata=sampling_metadata,
+                            forward_metadata=forward_metadata,
+                            future_map=self.future_token_ids_map,
+                            future_slots=future_slot_indices_np,
+                        )
+                    )
+                self.future_token_ids_map = new_future_map
+                self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
+                continue
 
             # Resolve future tokens in the input
             input_ids = model_worker_batch.forward_batch.input_ids
@@ -120,14 +159,23 @@ class ModelWorkerClient:
                         forward_metadata=forward_metadata,
                     )
                 )
-            next_token_ids = self.async_gather_fn(next_token_ids)
-            # Update the future token ids map
+            # Feed the raw sampler output (stable P('data') sharding) so
+            # set_future's cpp-fastpath cache hits; async_gather afterwards.
             self.future_token_ids_map = set_future_token_ids(
                 self.future_token_ids_map,
-                future_token_ids_ct,
+                future_slot_indices_np,
                 next_token_ids,
                 self.mesh,
             )
+            next_token_ids = self.async_gather_fn(next_token_ids)
+            # Kick off the D2H transfer here, on the forward thread, so the
+            # scheduler's resolve_last_batch_result finds the copy in flight
+            # instead of paying the full interactive device_get round-trip.
+            # Matters most under the Pathways proxy backend, where a blocking
+            # device_get of even a few hundred bytes costs ~20 ms of
+            # client->proxy->worker RTT (#772).
+            if hasattr(next_token_ids, "copy_to_host_async"):
+                next_token_ids.copy_to_host_async()
             self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
 
     def resolve_last_batch_result(self, launch_done: threading.Event | None = None):
@@ -140,7 +188,9 @@ class ModelWorkerClient:
         overlap on PCIe rather than serializing the per-array sync that
         jax.device_get does.
         """
+        _r0 = time.perf_counter()
         _, logits_output, next_token_ids, cache_miss_count = self.output_queue.get()
+        _r1 = time.perf_counter()
         # Step 1: kick off async D2H copies for everything we need
         async_next_logprobs = (
             jax.copy_to_host_async(logits_output.next_token_logprobs)
@@ -157,6 +207,26 @@ class ModelWorkerClient:
             if logits_output.hidden_states is not None
             else None
         )
+        if os.environ.get("SGLANG_PD_DBG_NTOK"):
+            try:
+                _all = next_token_ids.addressable_shards
+                _sh = [
+                    (s.device.id, np.asarray(s.data).flatten()[:4].tolist())
+                    for s in (_all[:2] + _all[len(_all) // 2 : len(_all) // 2 + 2])
+                ]
+                _sp = getattr(next_token_ids.sharding, "spec", "?")
+            except Exception as _e:
+                _sh, _sp = f"err:{_e}", "?"
+            _full = np.asarray(jax.device_get(next_token_ids)).flatten()
+            _n = len(_full)
+            logger.info(
+                "[D-ntok] shape=%s spec=%s dp0[:4]=%s dp1[:4]=%s shards=%s",
+                _full.shape,
+                _sp,
+                _full[: min(4, _n // 2)].tolist(),
+                _full[_n // 2 : _n // 2 + 4].tolist(),
+                _sh,
+            )
         next_token_ids = jax.device_get(next_token_ids).tolist()
 
         # Step 2: materialize. The first np.asarray waits for that array's
@@ -167,9 +237,29 @@ class ModelWorkerClient:
             logits_output.input_token_logprobs = np.asarray(async_input_logprobs).tolist()
         if async_hidden_states is not None:
             logits_output.hidden_states = np.asarray(async_hidden_states)
+        _r2 = _r2a = _r3 = time.perf_counter()
 
         if launch_done is not None:
             launch_done.wait()
+        _r4 = time.perf_counter()
+        if os.environ.get("SGLANG_PD_DBG") and _r4 - _r0 > 0.5:
+            import gc as _gc
+
+            import jax as _jax
+
+            logger.info(
+                "[pd-resolve] total=%.0fms qget=%.0f logprobs=%.0f ntok_d2h=%.0f "
+                "(bur=%.0f d2h=%.0f) launch_wait=%.0f n_live=%d gc=%s",
+                (_r4 - _r0) * 1e3,
+                (_r1 - _r0) * 1e3,
+                (_r2 - _r1) * 1e3,
+                (_r3 - _r2) * 1e3,
+                (_r2a - _r2) * 1e3,
+                (_r3 - _r2a) * 1e3,
+                (_r4 - _r3) * 1e3,
+                len(_jax.live_arrays()),
+                _gc.get_count(),
+            )
 
         return logits_output, next_token_ids, cache_miss_count
 
@@ -207,30 +297,28 @@ class ModelWorkerClient:
             model_worker_batch, self.worker.get_model_runner()
         )
 
+        # Per-request slots: placeholder value -(req_pool_idx + 1) round-trips
+        # through resolve_future_token_ids (map[-id]); padding rows get 0
+        # (a non-negative id, resolved as-is and never consumed).
+        seq_lens_np = np.asarray(model_worker_batch.seq_lens)
+        req_pool_np = np.asarray(model_worker_batch.req_pool_indices)
+        slots = future_slot_indices(seq_lens_np, req_pool_np, self.future_map_size)
+
         # Push a new batch to the queue (JAX handles synchronization automatically)
         self.input_queue.put(
             (
                 model_worker_batch,
-                self.future_token_ids_ct,
+                slots,
                 sampling_metadata,
                 forward_metadata,
             )
         )
 
-        # Allocate output future objects
-        bs = len(model_worker_batch.seq_lens)
-
-        future_next_token_ids = np.arange(
-            -(self.future_token_ids_ct + 1),
-            -(self.future_token_ids_ct + 1 + bs),
-            -1,
-            dtype=np.int32,
-        )
-        self.future_token_ids_ct = (self.future_token_ids_ct + bs) % self.future_token_ids_limit
+        future_next_token_ids = np.where(seq_lens_np > 0, -slots, 0).astype(np.int32)
         return None, future_next_token_ids, 0
 
-    def run_precompile(self):
-        self.worker.run_precompile(self.future_token_ids_map)
+    def run_precompile(self, only: str | None = None):
+        self.worker.run_precompile(self.future_token_ids_map, only=only)
 
     @property
     def page_size(self) -> int:

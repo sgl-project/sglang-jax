@@ -4,7 +4,7 @@ title: "GLM-4.5"
 
 # GLM-4.5 MoE on SGL-JAX
 
-> **Validated recipe** — GLM-4.5-Air (106B) validated on TPU v6e-32 with sglang-jax 0.1.0; sanity + GSM8K + bench all pass. Pin to sglang-jax 0.1.0+ — earlier builds have a stale `q_proj` weight-transpose mapping that fails at first prefill.
+> **Validated recipe** — GLM-4.5-Air (106B) validated on TPU v6e-32 with sglang-jax 0.1.0; sanity + GSM8K pass, and §4.2 now includes the recommended v7x-4 high-throughput `bench_serving` row with the historical v6e-32 baseline kept as context. Pin to sglang-jax 0.1.0+ — earlier builds have a stale `q_proj` weight-transpose mapping that fails at first prefill.
 
 ## 1. Model Introduction
 
@@ -23,19 +23,20 @@ title: "GLM-4.5"
 
 | Model | TPU | Topology | Nodes | Chips | `--tp-size` | `--ep-size` | Notes |
 |---|---|---|---|---|---|---|---|
+| GLM-4.5-Air (106B) | **v7x-4** | 2x2x1 | 1 | 4 chips / 8 devices | 8 | 8 | Recommended throughput recipe in §4.2. v7x exposes 2 JAX devices/chip. |
 | GLM-4.5-Air (106B) | **v6e-32** | 4x8 | 8  | 32 | 32 | 32 | This is the slice we measured on. BF16 ~210 GB. |
 
-See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants, scaled-down configs), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
+See [TPU topology reference](/base/tpu-topology-reference) for the TPU generation reference. For other slices (larger v6e, v7x variants, scaled-down configs), see [Adapting to other topologies](/base/tpu-topology-reference#adapting-to-other-topologies).
 
 ### 2.2 Environment
 
-Install per [Install guide](../../../get_started/install.md). Multi-host required — use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](../../deployment/skypilot.md).
+Install per [Install guide](/get_started/install). Multi-host required — use [GKE Indexed Job launcher](/deployment/gke-indexed-job) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](/deployment/skypilot).
 
 ### 2.3 Launch
 
 #### Multi-host — TPU v6e-32
 
-Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=glm-4-5-air`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x8`, `parallelism: 8`, and `completions: 8`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
+Use [GKE Indexed Job launcher](/deployment/gke-indexed-job) with `<JOB>=glm-4-5-air`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x8`, `parallelism: 8`, and `completions: 8`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
 
 ```bash
   --model-path zai-org/GLM-4.5-Air \
@@ -53,7 +54,7 @@ Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=
 
 > `--moe-backend epmoe` is mandatory for GLM-4.5-Air. The fused Pallas backend requires `moe_intermediate_size % 512 == 0`; GLM-4.5-Air's `moe_intermediate_size=1408` fails that alignment and crashes at startup (`tile_n` divisibility assert).
 
-For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../deployment/skypilot.md) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
+For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](/deployment/skypilot) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
 
 ### 2.4 Configuration Tips
 
@@ -76,13 +77,13 @@ For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../.
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per node.
 - Mount a shared PVC across the cluster's nodes to amortize compilation.
 
-For full flag definitions see [Launch flags reference](../../base/launch-flags-reference.md).
+For full flag definitions see [Launch flags reference](/base/launch-flags-reference).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-For full cURL + native `/generate` patterns see [Basic API usage](../../base/basic-api-usage.md).
+For full cURL + native `/generate` patterns see [Basic API usage](/base/basic-api-usage).
 
 Short Python OpenAI client example (replace `<rank0-ip>` with your rank-0 internal IP):
 
@@ -237,7 +238,7 @@ To see the full set of `--reasoning-parser` / `--tool-call-parser` keys availabl
 | Expert Parallelism | 32 |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3](#multi-host-gke-indexed-job--tpu-v6e-32-glm-45-air).
+**Deployment Command** — same as [§2.3](/autoregressive/GLM/GLM-4.5#2-3-launch).
 
 **Benchmark Command** — example for GSM8K:
 
@@ -264,29 +265,61 @@ Recommended additional datasets: MMLU, GPQA Diamond, AIME 2025.
 
 ### 4.2 Speed
 
-> **Layout B — methodology + command template.** No measured numbers yet; PR back full `============ Serving Benchmark Result ============` blocks from `bench_serving` to upgrade to Validated.
+> **High-throughput v7x-4 row.** This cookbook row uses fixed-length random requests (ISL=1024, OSL=1024), `max_concurrency=128`, 384 prompts, `random_range_ratio=1`, `seed=42`, and no warmup requests. DP scheduling uses `round_robin`.
 
-**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.2](../Qwen/Qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the GLM-4.5 checkpoint, remove the vLLM half).
+**Test Environment**
 
-**Test Results** — GLM-4.5-Air, Layout B (`bench_serving` random 1024→1024, N=100, max-concurrency 16), v6e-32 + `--moe-backend epmoe`, sglang-jax 0.1.0:
+| Field | Value |
+|---|---|
+| Hardware | TPU v7x-4 (1 node x 4 chips, 8 JAX devices) |
+| Model | zai-org/GLM-4.5-Air (real BF16 weights) |
+| Tensor Parallelism | 8 |
+| Expert Parallelism | 8 |
+| Tested build | origin/main (`2d97c787f712f715784216f7c414a4f477ea8218`) |
 
+**Serving Flags Used**
+
+```bash
+JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
+  --model-path /models/GLM-4.5-Air \
+  --trust-remote-code \
+  --tp-size 8 --ep-size 8 \
+  --moe-backend epmoe \
+  --dtype bfloat16 \
+  --context-length 32768 \
+  --chunked-prefill-size 2048 \
+  --page-size 128 \
+  --max-running-requests 256 \
+  --dp-schedule-policy round_robin \
+  --skip-server-warmup \
+  --host 0.0.0.0 --port 30000
 ```
-============ Serving Benchmark Result ============
-Backend:                  sgl-jax
-Successful requests:      100
-Benchmark duration (s):   95.10
-Request throughput:       1.05 req/s
-Input throughput:         1076.76 tok/s
-Output throughput:        1076.76 tok/s
-Total throughput:         2153.51 tok/s
-Mean E2E Latency (ms):    14229.21
-Mean TTFT (ms):           576.77
-Mean TPOT (ms):           13.35
-==================================================
+
+**Benchmark Command**
+
+```bash
+PYTHONPATH=/tmp/sglang-jax/python python -m sgl_jax.bench_serving \
+  --backend sgl-jax \
+  --model /models/GLM-4.5-Air \
+  --tokenizer /models/GLM-4.5-Air \
+  --dataset-name random --random-input-len 1024 --random-output-len 1024 \
+  --num-prompts 384 --max-concurrency 128 \
+  --random-range-ratio 1 \
+  --seed 42 \
+  --warmup-requests 0 \
+  --host 127.0.0.1 --port 30000
 ```
+
+**Test Results**
+
+| ISL | OSL | Max concurrency | Prompts | Input tok/s | Output tok/s | Peak output tok/s | Mean TTFT (ms) | Mean TPOT (ms) | Duration (s) | OK |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 1024 | 128 | 384 | 4013.55 | 4013.55 | 4992.00 | 3126.11 | 28.84 | 97.97 | 384 |
+
+> Historical v6e-32 baseline: `1024/1024/c16`, 100 prompts, 1076.76 output tok/s. The v7x-4 row above uses fewer chips and is the recommended throughput-oriented recipe.
 
 ## Additional Resources
 
 - [GLM-4.5-Air model card](https://huggingface.co/zai-org/GLM-4.5-Air)
-- [Launch flags reference](../../base/launch-flags-reference.md)
-- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.
+- [Launch flags reference](/base/launch-flags-reference)
+- [Cross-recipe troubleshooting](/deployment/troubleshooting) — cross-recipe generic issues.

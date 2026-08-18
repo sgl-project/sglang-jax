@@ -307,6 +307,8 @@ class PrefillAdder:
         self.new_chunked_reqs = [None] * dp_size
         self.log_hit_tokens = 0
         self.log_input_tokens = 0
+        # HiCache: H2D flush plans from init_load_back (post-budget-gate only).
+        self.pending_h2d: list = []
 
         if running_batch is not None:
             # Calculate token offset per DP rank
@@ -403,6 +405,18 @@ class PrefillAdder:
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
+    def _recurrent_boundary_cap(self, prefix_len: int) -> int | None:
+        """Max EXTEND length that keeps a recurrent track from CROSSING a boundary.
+
+        Returns the distance from ``prefix_len`` to the first track boundary
+        strictly after it (in ``(0, interval]``), or None when extra-buffer
+        recurrent caching is inactive (no cap)."""
+        if not self.tree_cache.recurrent_extra_buffer_active():
+            return None
+        interval = self.tree_cache.recurrent_track_interval
+        first_boundary = (prefix_len // interval + 1) * interval
+        return first_boundary - prefix_len
+
     def align_page_size(self, size: int) -> int:
         return (size + self.page_size - 1) // self.page_size * self.page_size
 
@@ -453,6 +467,10 @@ class PrefillAdder:
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices)]
                 return req
             _rem_tokens = self.rem_chunk_tokens_list[dp_rank]
+        boundary_cap = self._recurrent_boundary_cap(len(req.prefix_indices))
+        boundary_truncated = boundary_cap is not None and req.extend_input_len > boundary_cap
+        if boundary_cap is not None:
+            _rem_tokens = min(_rem_tokens, boundary_cap)
         truncated = req.extend_input_len > _rem_tokens
         req.extend_input_len = min(req.extend_input_len, _rem_tokens)
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
@@ -462,14 +480,13 @@ class PrefillAdder:
             req.extend_input_len,
             (
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION)
-                if not truncated
+                if not (truncated or boundary_truncated)
                 else 0
             ),
             dp_rank,
         )
 
-        # Return if chunked prefill not finished
-        return req if truncated else None
+        return req if (truncated or boundary_truncated) else None
 
     def _update_prefill_budget(
         self, prefix_len: int, extend_input_len: int, max_new_tokens: int, dp_rank: int
@@ -628,8 +645,49 @@ class PrefillAdder:
                 swa_needed = self._swa_budget_for_req(req.extend_input_len, dp_rank)
                 if swa_needed >= self.rem_swa_tokens_for_dp(dp_rank):
                     return AddReqResult.NO_TOKEN
+
+            # HiCache: if chunked prefill would reject (trunc_len <= 0), bail
+            # before init_load_back — it allocates device pages, un-tombstones
+            # nodes, and queues H2D work, none of which the chunked rejection
+            # path rolls back. Using the original extend_input_len is a
+            # conservative over-estimate; after load-back it can only shrink.
+            if self.rem_chunk_tokens_list is not None:
+                input_tokens_est = self.ceil_paged_tokens(req.extend_input_len)
+                if input_tokens_est > self.rem_chunk_tokens_list[dp_rank]:
+                    trunc_est = (
+                        self.rem_chunk_tokens_list[dp_rank] // self.page_size * self.page_size
+                    )
+                    if trunc_est <= 0:
+                        return AddReqResult.OTHER
+
+            # HiCache: after budget gate, pull host-only prefix back to device.
+            # Must happen after NO_TOKEN check so rejected reqs never trigger H2D.
+            if getattr(self.tree_cache, "hicache_enabled", False) and req.host_hit_length > 0:
+                mem_quota = self.token_to_kv_pool_allocator.available_size(dp_rank)
+                new_indices, last_node, flush_plan = self.tree_cache.init_load_back(
+                    req.last_host_node, req.host_hit_length, mem_quota=mem_quota
+                )
+                if len(new_indices) > 0:
+                    self.pending_h2d.extend(flush_plan)
+                    req.prefix_indices = np.concatenate([req.prefix_indices, new_indices])
+                    req.last_node = last_node
+                    req.last_host_node = last_node
+                    req.host_hit_length = max(0, req.host_hit_length - len(new_indices))
+                    prefix_len = len(req.prefix_indices)
+                    req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
+
             req.last_matched_prefix_len = prefix_len
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
+
+            # Recurrent track-boundary cap: never let a scheduled EXTEND cross a
+            # boundary. A boundary-only split (chunk budget had room) is still
+            # marked chunked so the next round continues from the protected prefix.
+            boundary_cap = self._recurrent_boundary_cap(prefix_len)
+            boundary_truncated = boundary_cap is not None and req.extend_input_len > boundary_cap
+            if boundary_truncated:
+                req.extend_input_len = boundary_cap
+                req.fill_ids = req.fill_ids[: prefix_len + boundary_cap]
+                input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
             total_can_run = sum(len(v) for v in self.can_run_list.values())
             if (
@@ -639,10 +697,11 @@ class PrefillAdder:
             ):
                 return AddReqResult.OTHER
 
-            if (
+            chunk_budget_ok = (
                 self.rem_chunk_tokens_list is None
                 or input_tokens <= self.rem_chunk_tokens_list[dp_rank]
-            ):
+            )
+            if chunk_budget_ok and not boundary_truncated:
                 # Non-chunked prefill
                 self.can_run_list[dp_rank].append(req)
                 res = self.tree_cache.inc_lock_ref(req.last_node)
@@ -656,13 +715,19 @@ class PrefillAdder:
                     ),
                     dp_rank,
                 )
+            elif chunk_budget_ok and boundary_truncated:
+                self.can_run_list[dp_rank].append(req)
+                self.new_chunked_reqs[dp_rank] = req
+                res = self.tree_cache.inc_lock_ref(req.last_node)
+                req.swa_uuid_for_lock = res.swa_uuid_for_lock
+                self._update_prefill_budget(prefix_len, input_tokens, 0, dp_rank)
             else:
                 # Make sure at least one page is available
                 trunc_len = self.rem_chunk_tokens_list[dp_rank] // self.page_size * self.page_size
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
 
-                # Chunked prefill
+                # Chunk budget tighter than the boundary cap: min of the two.
                 req.extend_input_len = trunc_len
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
 

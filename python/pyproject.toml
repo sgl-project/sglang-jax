@@ -21,6 +21,7 @@ dependencies = [
     "numpy~=2.2.6",
     "orjson~=3.11.1",
     "pillow~=11.3.0",
+    "prometheus-client>=0.20.0",
     "psutil~=7.0.0",
     "pydantic~=2.11.7",
     "python-multipart>=0.0.20",
@@ -40,7 +41,7 @@ dependencies = [
     "aiohttp",
     "pybase64",
     "partial_json_parser",
-    "pathwaysutils",
+    "pathwaysutils>=0.1.7,<0.1.9",
     "omegaconf",
     "imageio[ffmpeg]",
     "librosa>=0.10",
@@ -54,16 +55,16 @@ fastokens = [
     "fastokens>=0.1.1,<0.2.0",
 ]
 tpu = [
-    "jax[tpu]==0.8.1",
+    "jax[tpu]==0.10.2",
 ]
 gpu = [
-    "jax[cuda12]==0.8.1",
+    "jax[cuda12]==0.10.2",
 ]
 cpu = [
-    "jax[cpu]==0.8.1",
+    "jax[cpu]==0.10.2",
 ]
 all = [
-    "jax[tpu]==0.8.1",
+    "jax[tpu]==0.10.2",
     "fastokens>=0.1.1,<0.2.0",
 ]
 multimodal = [

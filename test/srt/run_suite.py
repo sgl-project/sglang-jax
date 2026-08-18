@@ -254,17 +254,22 @@ suites = {
     "unit-test-tpu-v6e-1": [
         TestFile("python/sgl_jax/test/kernels/quantized_linear_test.py", 0.3, runner="pytest"),
         TestFile("python/sgl_jax/test/kernels/moe_block_quant_test.py", 0.2, runner="pytest"),
-        TestFile("python/sgl_jax/test/test_flashattention_mha.py", 11),
-        TestFile("python/sgl_jax/test/test_flashattention_gqa.py", 11),
-        TestFile("python/sgl_jax/test/test_flashattention_misc.py", 7),
+        TestFile("python/sgl_jax/test/kernels/kda_test.py", 10, runner="pytest"),
+        # Pytest tears down the shared FlashAttention mesh cleanly on JAX 0.10.2.
+        TestFile("python/sgl_jax/test/test_flashattention_mha.py", 11, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_flashattention_gqa.py", 11, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_flashattention_misc.py", 7, runner="pytest"),
         TestFile("python/sgl_jax/test/test_mla_attention.py", 2.5),
         TestFile("python/sgl_jax/test/test_moe_topk.py", 0.3),
         TestFile("python/sgl_jax/test/kernels/fused_moe_v1_test.py", 9),
         TestFile("python/sgl_jax/test/kernels/fused_moe_v2_test.py", 3),
+        TestFile("python/sgl_jax/test/kernels/biased_topk_test.py", 1, runner="pytest"),
+        TestFile("python/sgl_jax/test/kernels/grouped_topk_test.py", 1, runner="pytest"),
         TestFile("python/sgl_jax/test/test_sampler.py", 0.2),
         TestFile("python/sgl_jax/test/test_sampler_deterministic_cond.py", 0.3),
         TestFile("python/sgl_jax/test/test_utils.py", 0.1),
         TestFile("python/sgl_jax/test/mem_cache/test_kv_cache.py", 0.7),
+        TestFile("python/sgl_jax/test/mem_cache/test_hicache_e2e_tpu.py", 1, runner="pytest"),
         TestFile("python/sgl_jax/test/speculative/test_eagle_tree_build.py", 0.2),
         TestFile("python/sgl_jax/test/speculative/test_eagle_utils.py", 0.2),
         TestFile("python/sgl_jax/test/multimodal/test_wan_vae_precision.py", 0.5),
@@ -275,8 +280,9 @@ suites = {
         TestFile("test/srt/lora/test_align_lora_accuracy.py", 5.5),
         TestFile("python/sgl_jax/test/kernels/simple_gla_fused_test.py", 1, runner="pytest"),
         TestFile("python/sgl_jax/test/layers/test_merged_column_parallel_linear.py", 0.1),
+        TestFile("test/srt/kernels/dsa/test_streamindex_topk.py", 3, runner="pytest"),
     ],
-    # CPU-only unit tests — moved off arc-runner-v6e-1 to a dedicated
+    # CPU-only unit tests — moved off the v6e-1 TPU runner to a dedicated
     # CPU runner so they don't consume TPU capacity. Either pure
     # Python / numpy / mocks (no JAX device ops) or JAX kernels whose
     # header already pins JAX_PLATFORMS=cpu and which target CPU
@@ -285,28 +291,67 @@ suites = {
     # cpu-test CI job sets that env var.
     "unit-test-cpu": [
         TestFile("test/srt/test_tokenizer_manager_event.py", 0.1),
-        TestFile("test/srt/disaggregation/test_wrapper.py", 0.2, runner="pytest"),
-        TestFile("test/srt/disaggregation/test_transport.py", 0.3, runner="pytest"),
-        TestFile("test/srt/disaggregation/test_conn.py", 0.5, runner="pytest"),
-        TestFile("test/srt/disaggregation/test_infra.py", 0.3, runner="pytest"),
-        TestFile("test/srt/disaggregation/test_zmq_pull_notifier.py", 0.2, runner="pytest"),
-        TestFile("test/srt/disaggregation/test_bootstrap_server.py", 0.5, runner="pytest"),
-        TestFile("test/srt/disaggregation/test_pd_utils.py", 0.3, runner="pytest"),
-        TestFile("test/srt/disaggregation/test_scheduler_mixins.py", 0.5, runner="pytest"),
+        TestFile("test/srt/disaggregation/test_pd_auth.py", 0.3, runner="pytest"),
+        TestFile("test/srt/disaggregation/test_pd_bootstrap.py", 0.5, runner="pytest"),
+        TestFile("test/srt/disaggregation/test_pd_decode.py", 0.5, runner="pytest"),
+        TestFile("test/srt/disaggregation/test_pd_lifecycle.py", 0.5, runner="pytest"),
+        TestFile("test/srt/disaggregation/test_pd_metrics.py", 0.3, runner="pytest"),
+        TestFile("test/srt/disaggregation/test_pd_prefill.py", 0.5, runner="pytest"),
+        TestFile("test/srt/disaggregation/test_pd_raiden.py", 0.5, runner="pytest"),
+        TestFile("test/srt/disaggregation/test_pd_router.py", 0.5, runner="pytest"),
+        TestFile("test/srt/disaggregation/test_pd_transfer.py", 0.5, runner="pytest"),
         TestFile(
-            "test/srt/disaggregation/test_tokenizer_bootstrap_passthrough.py",
-            0.3,
+            "python/sgl_jax/test/test_model_runner_kv_cache_mixin.py",
+            0.2,
             runner="pytest",
         ),
-        TestFile("test/srt/disaggregation/test_pd_e2e_single_host.py", 1.0, runner="pytest"),
+        TestFile(
+            "python/sgl_jax/test/test_tp_worker_overlap_thread.py",
+            0.2,
+            runner="pytest",
+        ),
+        TestFile(
+            "python/sgl_jax/test/managers/test_future_token_map.py",
+            0.2,
+            runner="pytest",
+        ),
+        TestFile("python/sgl_jax/test/test_scheduler_idle_check.py", 0.1),
+        TestFile("python/sgl_jax/test/test_scheduler_chunked_ownership.py", 0.1),
+        TestFile("test/srt/test_dtype_config_llama.py", 1),
+        TestFile("test/srt/test_dtype_config_consistency.py", 10),
         TestFile("python/sgl_jax/test/test_compilation_manager.py", 1),
         TestFile("python/sgl_jax/test/test_kernel_utils.py", 1),
+        TestFile("python/sgl_jax/test/speculative/test_dflash_info.py", 0.2, runner="pytest"),
+        TestFile(
+            "python/sgl_jax/test/speculative/test_dflash_server_args.py",
+            0.2,
+            runner="pytest",
+        ),
+        TestFile(
+            "python/sgl_jax/test/speculative/test_dflash_worker.py",
+            0.2,
+            runner="pytest",
+        ),
         TestFile("python/sgl_jax/test/speculative/test_spec_info.py", 0.2, runner="pytest"),
+        TestFile("python/sgl_jax/test/models/test_dflash.py", 0.2, runner="pytest"),
         TestFile("python/sgl_jax/test/models/test_mimo_v2_nextn.py", 0.2, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/multimodal/test_kimi_k25_weight_mapping.py", 0.2, runner="pytest"
         ),
+        TestFile(
+            "python/sgl_jax/test/multimodal/test_stage_config_routing.py", 0.1, runner="pytest"
+        ),
+        TestFile(
+            "python/sgl_jax/test/multimodal/test_mimo_audio_tokenizer_model.py",
+            0.2,
+            runner="pytest",
+        ),
         TestFile("python/sgl_jax/test/models/test_qwen3_5.py", 2, runner="pytest"),
+        TestFile(
+            "python/sgl_jax/test/test_moe_weight_loader_sharding.py",
+            0.2,
+            runner="pytest",
+        ),
         TestFile("python/sgl_jax/test/mem_cache/test_req_to_token_pool.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_hybrid_req_to_token_pool.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_swa_allocator.py", 1),
@@ -315,7 +360,15 @@ suites = {
         TestFile("python/sgl_jax/test/mem_cache/test_unified_radix_cache.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_unified_radix_tree_flag.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_paged_allocator_multi_dp.py", 1),
+        TestFile("python/sgl_jax/test/mem_cache/test_host_kv_pool.py", 1, runner="pytest"),
+        TestFile("python/sgl_jax/test/mem_cache/test_hicache_controller.py", 0.5, runner="pytest"),
+        TestFile("python/sgl_jax/test/mem_cache/test_hicache_e2e.py", 5, runner="pytest"),
         TestFile("python/sgl_jax/test/test_kv_cache_builder.py", 0.1, runner="pytest"),
+        TestFile("test/srt/test_dp_schedule_policy.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_dp_schedule_shape_aware.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_dp_rank_assignment.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_bench_recurrent_reuse_sweep.py", 0.2, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_mixed_chunk_dp.py", 0.2),
         TestFile("test/srt/function_call/test_qwen3_coder_detector.py", 0.1),
         TestFile("test/srt/function_call/test_glm4_moe_detector.py", 0.1),
         TestFile("test/srt/function_call/test_qwen25_detector.py", 0.1),
@@ -327,6 +380,13 @@ suites = {
         TestFile("test/srt/test_reasoning_parser.py", 0.1),
         TestFile("test/srt/eval/test_simple_eval_common.py", 0.1, runner="pytest"),
         TestFile("test/srt/test_server_info.py", 0.1),
+        TestFile("test/srt/test_recurrent_cow_metadata.py", 0.2),
+        TestFile("test/srt/test_recurrent_track_metadata.py", 0.2),
+        TestFile("test/srt/test_recurrent_boundary_split.py", 0.2),
+        TestFile("test/srt/test_recurrent_state_sizing.py", 0.2),
+        TestFile("test/srt/test_recurrent_track_scatter.py", 0.3),
+        TestFile("test/srt/test_recurrent_split_equivalence.py", 0.3),
+        TestFile("test/srt/test_prepare_for_extend_protected_len.py", 0.2),
     ],
     "unit-test-tpu-v6e-4": [
         TestFile("python/sgl_jax/test/test_mesh.py", 0.4),
@@ -338,6 +398,8 @@ suites = {
         TestFile("python/sgl_jax/test/test_gdn_attention_dp.py", 6),
         TestFile("python/sgl_jax/test/layers/test_lightning_backend.py", 8, runner="pytest"),
         TestFile("test/srt/test_moe_block_quant_e2e.py", 1.5, runner="pytest"),
+        TestFile("python/sgl_jax/test/mem_cache/test_host_kv_pool_tpu.py", 1, runner="pytest"),
+        TestFile("python/sgl_jax/test/mem_cache/test_host_kv_pool_tpu_dp.py", 1, runner="pytest"),
     ],
     "kernel-performance-test-tpu-v6e-1": [
         TestFile("benchmark/kernels/flash_attention/bench_flashattention.py", 5),
@@ -383,12 +445,19 @@ suites = {
         TestFile("test/srt/lora/test_bgmv_backend.py", 6),
         TestFile("test/srt/lora/test_dynamic_lora.py", 10),
         TestFile("test/srt/lora/test_static_lora.py", 10),
-        TestFile("test/srt/test_unified_radix_cache_serving.py", 8),
+        # Dense (non-hybrid) class only. The recurrent (GDN-hybrid) class is a
+        # heavy 4-chip / 35B determinism run kept out of per-PR CI (nightly
+        # recurrent gate: #1425).
+        TestFile(
+            "test/srt/test_unified_radix_cache_serving.py",
+            8,
+            ["TestUnifiedRadixCacheServing"],
+        ),
     ],
     "e2e-test-tpu-v6e-4": [
         TestFile("test/srt/openai_server/basic/test_tool_calls.py", 2),
         TestFile("test/srt/test_features.py", 3),
-        TestFile("test/srt/test_chunked_prefill_size.py", 2),
+        TestFile("test/srt/test_chunked_prefill_size.py", 6),
         # TestFile("test/srt/test_sliding_window_attention.py", 30), # add after gpt-oss supported
         TestFile("test/srt/test_logprobs_dp.py", 3),
         TestFile("test/srt/test_model_loader.py", 1),

@@ -482,6 +482,11 @@ class FusedEPMoE(nnx.Module):
 
         quant_block_k = self.quant_block_k if self.quant_block_k is not None else None
 
+        kernel_sharding = jax.sharding.NamedSharding(self.mesh, P(("data", "tensor"), None))
+        hidden_states = jax.sharding.reshard(hidden_states, kernel_sharding)
+        topk_weights = jax.sharding.reshard(topk_weights, kernel_sharding)
+        topk_ids = jax.sharding.reshard(topk_ids, kernel_sharding)
+
         output = fused_ep_moe(
             mesh=self.mesh,
             tokens=hidden_states,
@@ -600,6 +605,10 @@ class FusedEPMoEV2(FusedEPMoE):
             )
 
         direct_scaled_dot = w1_scale is not None
+        kernel_sharding = jax.sharding.NamedSharding(self.mesh, P(("data", "tensor"), None))
+        hidden_states = jax.sharding.reshard(hidden_states, kernel_sharding)
+        topk_weights = jax.sharding.reshard(topk_weights, kernel_sharding)
+        topk_ids = jax.sharding.reshard(topk_ids, kernel_sharding)
 
         output = fused_ep_moe_v2(
             self.mesh,
@@ -614,12 +623,6 @@ class FusedEPMoEV2(FusedEPMoE):
             swiglu_limit=swiglu_limit,
             shared_swiglu_limit=shared_swiglu_limit,
             block_config=block_config,
-            disable_a2a=self.disable_a2a,
-            disable_dynamic_ffn1=self.disable_dynamic_ffn1,
-            disable_dynamic_ffn2=self.disable_dynamic_ffn2,
-            disable_weight_load=self.disable_weight_load,
-            disable_shared_expert=self.disable_shared_expert,
-            disable_sync_barrier=self.disable_sync_barrier,
             quant_block_k=self.quant_block_k if hasattr(self, "quant_block_k") else None,
             w1_scale=w1_scale,
             w2_scale=w2_scale,

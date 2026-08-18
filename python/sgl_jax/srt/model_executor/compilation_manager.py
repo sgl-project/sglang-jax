@@ -34,19 +34,30 @@ class CompilationManager:
         page_size: int,
         max_req_len: int,
         vocab_size: int,
+        max_total_num_tokens: int = 0,
         multimodal: bool = False,
         has_recurrent_state: bool = False,
+        supports_recurrent_cow: bool = False,
+        supports_recurrent_track: bool = False,
+        moe_backend: str | None = None,
     ):
         self.dp_size = dp_size
         self.tp_size = tp_size
         self.page_size = page_size
         self.max_req_len = max_req_len
+        self.max_total_num_tokens = max_total_num_tokens
         self.max_padded_batch_size = max_padded_batch_size
         self.max_padded_num_tokens = max_padded_num_tokens
         self.vocab_size = vocab_size
         self.multimodal = multimodal
         self.has_recurrent_state = has_recurrent_state
-        self.moe_backend = server_args.moe_backend
+        self.supports_recurrent_cow = supports_recurrent_cow
+        self.supports_recurrent_track = supports_recurrent_track
+        # Callers pass the *effective* backend (ModelConfig.moe_backend), which
+        # resolves architectures that hard-code FusedEPMoE (e.g. Qwen3.5) to
+        # "fused" so the bs-bucket filter below applies. Fall back to the raw
+        # server_args string for callers that don't have a ModelConfig yet.
+        self.moe_backend = moe_backend if moe_backend is not None else server_args.moe_backend
         self.enable_static_lora = server_args.enable_static_lora
 
         self.token_buckets = self._compute_token_buckets(server_args.precompile_token_paddings)
@@ -79,11 +90,20 @@ class CompilationManager:
 
     def _compute_bs_buckets(self, user_paddings: list[int] | None) -> list[int]:
         bs_list = user_paddings if user_paddings is not None else PRECOMPILE_DEFAULT_BS_PADDINGS
+        is_fused_moe = self.moe_backend in ("fused", "fused_v2")
+        min_fused_bs = self.tp_size * 2
+        if is_fused_moe and self.max_padded_batch_size < min_fused_bs:
+            raise ValueError(
+                f"max_padded_batch_size={self.max_padded_batch_size} is below the fused-MoE "
+                f"minimum 2 * mesh_ep_size={min_fused_bs}. Increase --max-running-requests "
+                "or reduce the EP group size."
+            )
+
         buckets = []
         for bs in bs_list:
             if (
                 bs <= self.max_padded_batch_size
-                and (self.moe_backend not in ("fused", "fused_v2") or bs >= self.tp_size * 2)
+                and (not is_fused_moe or bs >= min_fused_bs)
                 and bs >= self.dp_size
             ):
                 buckets.append(bs)
@@ -93,8 +113,19 @@ class CompilationManager:
         return buckets
 
     def _compute_cache_loc_buckets(self) -> list[int]:
+        # bs reqs together can never exceed max_total_num_tokens, so cap the
+        # per-bs bucket at the pool size (helps Pathways gRPC H2D; see tp_worker
+        # for why the cap is proxy-only).
         pages_per_req = (self.max_req_len + self.page_size - 1) // self.page_size * self.page_size
-        return [bs * pages_per_req for bs in self.bs_buckets]
+        pool_aligned = (
+            (self.max_total_num_tokens + self.page_size - 1) // self.page_size * self.page_size
+            if self.max_total_num_tokens
+            else None
+        )
+        return [
+            min(bs * pages_per_req, pool_aligned) if pool_aligned else bs * pages_per_req
+            for bs in self.bs_buckets
+        ]
 
     # ---- Pre-compilation ----
 
@@ -230,7 +261,14 @@ class CompilationManager:
                 )
                 if future_token_ids_map is not None:
                     _, next_token_ids, _ = result
-                    set_future_token_ids(future_token_ids_map, 0, next_token_ids, mesh)
+                    from sgl_jax.srt.managers.utils import future_slot_indices
+
+                    slots = future_slot_indices(
+                        np.asarray(batch.seq_lens),
+                        np.asarray(batch.req_pool_indices),
+                        future_token_ids_map.shape[0],
+                    )
+                    set_future_token_ids(future_token_ids_map, slots, next_token_ids, mesh)
                 self._compiled_variants.add((ForwardMode.DECODE, bs_val, bs_val, False))
 
         end_time = time.perf_counter()
@@ -286,10 +324,13 @@ class CompilationManager:
 
         if speculative_algorithm is None:
             sampling_info = ModelWorkerSamplingInfo.generate_for_precompile(bs, self.vocab_size)
+            return_output_logprob_only = True
         else:
             sampling_info = ModelWorkerSamplingInfo.generate_for_precompile_all_greedy(
                 bs, self.vocab_size
             )
+            sampling_info.vocab_mask = None
+            return_output_logprob_only = False
 
         return ModelWorkerBatch(
             bid=1,
@@ -301,7 +342,7 @@ class CompilationManager:
             seq_lens=np.array([1] * bs, dtype=np.int32),
             out_cache_loc=np.concat([valid_out_cache_loc, invalid_out_cache_loc], axis=0),
             return_logprob=False,
-            return_output_logprob_only=True,
+            return_output_logprob_only=return_output_logprob_only,
             sampling_info=sampling_info,
             extend_input_logprob_token_ids=None,
             positions=np.concat([valid_positions, invalid_positions], axis=0),
@@ -328,6 +369,17 @@ class CompilationManager:
             # non-recurrent backends are unaffected.
             recurrent_indices=(np.zeros(bs, dtype=np.int32) if self.has_recurrent_state else None),
             has_initial_state=(np.zeros(bs, dtype=np.bool_) if self.has_recurrent_state else None),
+            recurrent_cow_src_indices=(
+                np.zeros(bs, dtype=np.int32)
+                if self.supports_recurrent_cow and mode == ForwardMode.EXTEND
+                else None
+            ),
+            recurrent_track_indices=(
+                np.zeros(bs, dtype=np.int32) if self.supports_recurrent_track else None
+            ),
+            recurrent_track_mask=(
+                np.zeros(bs, dtype=np.int32) if self.supports_recurrent_track else None
+            ),
         )
 
     # ---- Lazy compilation tracking ----

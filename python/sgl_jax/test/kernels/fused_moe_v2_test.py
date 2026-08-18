@@ -183,23 +183,29 @@ class MoEV2KernelTest(jtu.JaxTestCase):
 
         block_config = FusedMoEBlockConfig(bt=bt, bf=bf, btc=btc, bse=bse)
 
+        # Shard kernel inputs while keeping replicated originals for ref_moe.
+        ep = jax.sharding.NamedSharding(self.mesh, P(("data", "tensor")))
+
+        def shard(x):
+            return None if x is None else jax.device_put(x, ep)
+
         actual = fused_ep_moe_v2(
             self.mesh,
-            a,
-            w1,
-            w2,
-            w3,
-            topk_weights,
-            topk_ids,
+            shard(a),
+            shard(w1),
+            shard(w2),
+            shard(w3),
+            shard(topk_weights),
+            shard(topk_ids),
             top_k,
             act_fn=act_fn,
             swiglu_limit=swiglu_limit,
             shared_swiglu_limit=shared_swiglu_limit,
             block_config=block_config,
             quant_block_k=quant_block_k,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
-            w3_scale=w3_scale,
+            w1_scale=shard(w1_scale),
+            w2_scale=shard(w2_scale),
+            w3_scale=shard(w3_scale),
             w1_shared=w1_sh,
             w2_shared=w2_sh,
             w3_shared=w3_sh,
@@ -246,6 +252,7 @@ class MoEV2KernelTest(jtu.JaxTestCase):
             x = lax.all_gather(x, axis_name="data", axis=0, tiled=True)
             return x
 
+        expected = jax.reshard(expected, ep)
         actual_host = np.asarray(jax.device_get(_replicate(actual)))
         expected_host = np.asarray(jax.device_get(_replicate(expected)))
         self.assertAllClose(actual_host, expected_host, atol=atol, rtol=rtol)
@@ -330,6 +337,36 @@ class MoEV2KernelTest(jtu.JaxTestCase):
             atol=5e-2,
             rtol=5e-2,
         )
+
+    # --------------------------------- num_bf==1 (global-rolling weight buffer)
+
+    def test_num_bf1_rolling_wb(self):
+        # bf == intermediate_size => num_bf == 1 => the global-rolling weight
+        # double-buffer path (expert-parity slot), now the default. Previously
+        # only reachable via the removed SGLJAX_MOE_V2_GLOBAL_ROLLING_WB flag.
+        self._test_moe(bf=256)
+
+    def test_num_bf1_rolling_wb_fp8_shared(self):
+        # num_bf==1 (single bf block per expert) + per-channel fp8 weights +
+        # in-kernel shared expert.
+        self._test_moe(
+            bf=256,
+            bse=256,
+            w_dtype=FP8,
+            quant_block_k=None,
+            direct_scaled_dot=True,
+            has_shared_expert=True,
+            atol=5e-2,
+            rtol=5e-2,
+        )
+
+    # ------------------------------------------ compact loop empty-expert skip
+
+    def test_compact_skip_empty_experts(self):
+        # Many experts + few tokens + top_k=1 => several local experts receive
+        # no tokens, exercising the compact active-expert list (n_active <
+        # local_num_experts).
+        self._test_moe(num_experts=32, num_tokens=16, top_k=1)
 
     # --------------------------------------------------- block config (no TPU)
 

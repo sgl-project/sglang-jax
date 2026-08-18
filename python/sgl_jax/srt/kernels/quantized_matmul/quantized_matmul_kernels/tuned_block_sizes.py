@@ -640,6 +640,44 @@ TUNED_BLOCK_SIZES_RAW = {
     (7, 8192, 5120, 8192, "float8_e4m3fn", "float8_e4m3fn"): (512, 5120, 2048),
     (7, 8192, 8192, 14336, "float8_e4m3fn", "float8_e4m3fn"): (1024, 4096, 1024),
     (7, 8192, 8192, 4096, "float8_e4m3fn", "float8_e4m3fn"): (1024, 2048, 4096),
+    # ===== GLM-5.2 on TPU v7x tp16 (per-device dense linear shapes: MLA
+    # q_a/q_b/kv_a/o_proj, dense-layer MLP, shared experts, indexer).
+    # Tiles are chosen to divide the operand dims exactly (no jnp.pad on
+    # the way into the kernel) with whole-K in_block where VMEM allows;
+    # out_block must stay a multiple of the 256-lane MXU column. Validated
+    # on v7x 2026-08-09. n_out=128 shapes keep the fallback path.
+    (7, 1, 2048, 6144, "bfloat16", "float8_e4m3fn"): (1, 2048, 2048),
+    (7, 8, 2048, 6144, "bfloat16", "float8_e4m3fn"): (8, 2048, 2048),
+    (7, 32, 2048, 6144, "bfloat16", "float8_e4m3fn"): (32, 2048, 2048),
+    (7, 64, 2048, 6144, "bfloat16", "float8_e4m3fn"): (64, 2048, 2048),
+    (7, 1, 1024, 2048, "bfloat16", "float8_e4m3fn"): (1, 1024, 2048),
+    (7, 8, 1024, 2048, "bfloat16", "float8_e4m3fn"): (8, 1024, 2048),
+    (7, 32, 1024, 2048, "bfloat16", "float8_e4m3fn"): (32, 1024, 2048),
+    (7, 64, 1024, 2048, "bfloat16", "float8_e4m3fn"): (64, 1024, 2048),
+    (7, 1, 576, 6144, "bfloat16", "float8_e4m3fn"): (1, 256, 2048),
+    (7, 8, 576, 6144, "bfloat16", "float8_e4m3fn"): (8, 256, 2048),
+    (7, 32, 576, 6144, "bfloat16", "float8_e4m3fn"): (32, 256, 2048),
+    (7, 64, 576, 6144, "bfloat16", "float8_e4m3fn"): (64, 256, 2048),
+    (7, 1, 6144, 1024, "bfloat16", "float8_e4m3fn"): (1, 2048, 1024),
+    (7, 8, 6144, 1024, "bfloat16", "float8_e4m3fn"): (8, 2048, 1024),
+    (7, 32, 6144, 1024, "bfloat16", "float8_e4m3fn"): (32, 2048, 1024),
+    (7, 64, 6144, 1024, "bfloat16", "float8_e4m3fn"): (64, 2048, 1024),
+    (7, 1, 6144, 128, "bfloat16", "float8_e4m3fn"): (1, 2048, 128),
+    (7, 8, 6144, 128, "bfloat16", "float8_e4m3fn"): (8, 2048, 128),
+    (7, 32, 6144, 128, "bfloat16", "float8_e4m3fn"): (32, 2048, 128),
+    (7, 64, 6144, 128, "bfloat16", "float8_e4m3fn"): (64, 2048, 128),
+    (7, 1, 768, 6144, "bfloat16", "float8_e4m3fn"): (1, 768, 2048),
+    (7, 8, 768, 6144, "bfloat16", "float8_e4m3fn"): (8, 768, 2048),
+    (7, 32, 768, 6144, "bfloat16", "float8_e4m3fn"): (32, 768, 2048),
+    (7, 64, 768, 6144, "bfloat16", "float8_e4m3fn"): (64, 768, 2048),
+    (7, 1, 6144, 768, "bfloat16", "float8_e4m3fn"): (1, 2048, 768),
+    (7, 8, 6144, 768, "bfloat16", "float8_e4m3fn"): (8, 2048, 768),
+    (7, 32, 6144, 768, "bfloat16", "float8_e4m3fn"): (32, 2048, 768),
+    (7, 64, 6144, 768, "bfloat16", "float8_e4m3fn"): (64, 2048, 768),
+    (7, 1, 4096, 2048, "bfloat16", "float8_e4m3fn"): (1, 2048, 2048),
+    (7, 8, 4096, 2048, "bfloat16", "float8_e4m3fn"): (8, 2048, 2048),
+    (7, 32, 4096, 2048, "bfloat16", "float8_e4m3fn"): (32, 2048, 2048),
+    (7, 64, 4096, 2048, "bfloat16", "float8_e4m3fn"): (64, 2048, 2048),
     # go/keep-sorted end
 }
 

@@ -1,7 +1,6 @@
 # Run in Pathways
 
-**Note**:
-Before you execute the following script, please ensure your google account has been a member of PROJECT. Contact with @Prayer3th.
+Status: experimental deployment note. Replace the project, registry, cluster, and zone values with resources from your own Google Cloud environment.
 
 ## Prerequisites
 
@@ -27,11 +26,13 @@ Ensure the following tools are installed and configured before proceeding.
 ## Create Cluster
 
 ```zsh
-export PROJECT_ID=tpu-service-473302
-export CLUSTER_NAME=rl-pathway
+export PROJECT_ID=<YOUR_GCP_PROJECT>
+export REGION=<YOUR_ARTIFACT_REGISTRY_REGION>
+export REPOSITORY=<YOUR_ARTIFACT_REGISTRY_REPOSITORY>
+export CLUSTER_NAME=<YOUR_PATHWAYS_CLUSTER>
 export TPU_TYPE=v6e-16
 export NUM_SLICES=1
-export ZONE=asia-northeast1-b
+export ZONE=<YOUR_GCP_ZONE>
 
 xpk cluster create-pathways \
 --cluster $CLUSTER_NAME \
@@ -50,7 +51,7 @@ make push
 The command will print the full image path at the end, for example:
 
 ```
-Pushed image: asia-northeast1-docker.pkg.dev/tpu-service-473302/sglang-project/sglang-jax:20260302-152303-hongmao
+Pushed image: ${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/sglang-jax:<IMAGE_TAG>
 ```
 
 Copy the image tag (the part after `:`) and use it in the next step.
@@ -62,29 +63,34 @@ Copy the image tag (the part after `:`) and use it in the next step.
 Replace `<IMAGE_TAG>` with the tag printed by `make push`.
 
 ```zsh
-export CLUSTER_NAME=rl-pathway
+export PROJECT_ID=<YOUR_GCP_PROJECT>
+export REGION=<YOUR_ARTIFACT_REGISTRY_REGION>
+export REPOSITORY=<YOUR_ARTIFACT_REGISTRY_REPOSITORY>
+export CLUSTER_NAME=<YOUR_PATHWAYS_CLUSTER>
+export WORKLOAD_NAME=<YOUR_PATHWAYS_WORKLOAD>
 export TPU_TYPE=v6e-16
 export NUM_SLICES=1
-export ZONE=asia-northeast1-b
+export ZONE=<YOUR_GCP_ZONE>
 
 xpk workload create-pathways \
-  --workload rl-pathway \
+  --workload $WORKLOAD_NAME \
   --num-slices=$NUM_SLICES \
   --tpu-type=$TPU_TYPE \
   --cluster=$CLUSTER_NAME \
   --zone=$ZONE \
-  --docker-name='rl-pathway-workload' \
-  --docker-image="asia-northeast1-docker.pkg.dev/tpu-service-473302/sglang-project/sglang-jax:<IMAGE_TAG>" \
+  --docker-name="${WORKLOAD_NAME}-container" \
+  --docker-image="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/sglang-jax:<IMAGE_TAG>" \
   --command="JAX_PLATFORMS=proxy JAX_BACKEND_TARGET=grpc://127.0.0.1:29000 JAX_USE_SHARDY_PARTITIONER=0 python3 -u -m sgl_jax.launch_server --model-path deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --trust-remote-code --tp-size=4 --mem-fraction-static=0.8 --chunked-prefill-size=2048 --download-dir=/tmp --dtype=bfloat16 --max-running-requests 8 --skip-server-warmup --page-size=64 --max-total-tokens=257536 --random-seed=27 --precompile-token-paddings=2048 --precompile-bs-paddings=8 --enable-single-process"
 ```
 
 To resubmit, delete the existing workload first (requires the environment variables above to be set):
 
 ```zsh
-export CLUSTER_NAME=rl-pathway
-export ZONE=asia-northeast1-b
+export CLUSTER_NAME=<YOUR_PATHWAYS_CLUSTER>
+export WORKLOAD_NAME=<YOUR_PATHWAYS_WORKLOAD>
+export ZONE=<YOUR_GCP_ZONE>
 
-xpk workload delete --workload rl-pathway --cluster $CLUSTER_NAME --zone $ZONE
+xpk workload delete --workload $WORKLOAD_NAME --cluster $CLUSTER_NAME --zone $ZONE
 ```
 
 ## Verify the Deployment
@@ -99,11 +105,11 @@ Expected output:
 
 ```
 NAME                                 READY   STATUS    RESTARTS   AGE
-rl-pathway-pathways-head-0-0-rqx6k   3/3     Running   0          93s
-rl-pathway-worker-0-0-2rfbr          1/1     Running   0          89s
-rl-pathway-worker-0-1-2f94j          1/1     Running   0          88s
-rl-pathway-worker-0-2-c8qw5          1/1     Running   0          88s
-rl-pathway-worker-0-3-8vkrb          1/1     Running   0          88s
+<workload>-pathways-head-0-0-xxxxx   3/3     Running   0          93s
+<workload>-worker-0-0-xxxxx          1/1     Running   0          89s
+<workload>-worker-0-1-xxxxx          1/1     Running   0          88s
+<workload>-worker-0-2-xxxxx          1/1     Running   0          88s
+<workload>-worker-0-3-xxxxx          1/1     Running   0          88s
 ```
 
 ### 2. Forward the server port

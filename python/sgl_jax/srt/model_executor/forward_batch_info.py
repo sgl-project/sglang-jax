@@ -203,6 +203,13 @@ class ForwardBatch:
 
     # Recurrent state indices [batch_size]
     recurrent_indices: jax.Array | None = None
+    # Recurrent CoW src slots [batch_size] (0 = no clone)
+    recurrent_cow_src_indices: jax.Array | None = None
+    # Recurrent track metadata [batch_size] (extra-buffer snapshot at track
+    # boundaries). Populated on extend batches that cross a track boundary; None
+    # otherwise.
+    recurrent_track_indices: jax.Array | None = None
+    recurrent_track_mask: jax.Array | None = None
 
     def tree_flatten(self):
         children = (
@@ -226,6 +233,9 @@ class ForwardBatch:
             self.apply_for_deepstack,
             self.deepstack_visual_embedding,
             self.recurrent_indices,
+            self.recurrent_cow_src_indices,
+            self.recurrent_track_indices,
+            self.recurrent_track_mask,
         )
 
         aux_data = {
@@ -241,6 +251,10 @@ class ForwardBatch:
     def tree_unflatten(cls, aux_data, children):
         obj = cls.__new__(cls)
 
+        # bid is intentionally not in aux_data (would break jit cache); only
+        # used by precision_tracer outside jit, so a sentinel is fine after a
+        # pytree round-trip (e.g. compilation_manager padding path).
+        obj.bid = 0
         obj.forward_mode = aux_data["forward_mode"]
         obj.batch_size = aux_data["batch_size"]
         obj.spec_algorithm = aux_data["spec_algorithm"]
@@ -270,6 +284,9 @@ class ForwardBatch:
         obj.apply_for_deepstack = children[17]
         obj.deepstack_visual_embedding = children[18]
         obj.recurrent_indices = children[19]
+        obj.recurrent_cow_src_indices = children[20]
+        obj.recurrent_track_indices = children[21]
+        obj.recurrent_track_mask = children[22]
         return obj
 
     def __repr__(self) -> str:
@@ -408,6 +425,27 @@ class ForwardBatch:
                 sharding=(NamedSharding(model_runner.mesh, PartitionSpec("data"))),
             )
 
+        recurrent_cow_src_indices = None
+        if batch.recurrent_cow_src_indices is not None:
+            (recurrent_cow_src_indices,) = device_array(
+                (batch.recurrent_cow_src_indices,),
+                sharding=(NamedSharding(model_runner.mesh, PartitionSpec("data"))),
+            )
+
+        recurrent_track_indices = None
+        if batch.recurrent_track_indices is not None:
+            (recurrent_track_indices,) = device_array(
+                (batch.recurrent_track_indices,),
+                sharding=(NamedSharding(model_runner.mesh, PartitionSpec("data"))),
+            )
+
+        recurrent_track_mask = None
+        if batch.recurrent_track_mask is not None:
+            (recurrent_track_mask,) = device_array(
+                (batch.recurrent_track_mask,),
+                sharding=(NamedSharding(model_runner.mesh, PartitionSpec("data"))),
+            )
+
         obj = cls(
             bid=batch.bid,
             forward_mode=batch.forward_mode,
@@ -434,6 +472,9 @@ class ForwardBatch:
             deepstack_visual_embedding=deepstack_visual_embedding,
             expert_location_metadata=expert_location_metadata,
             recurrent_indices=recurrent_indices,
+            recurrent_cow_src_indices=recurrent_cow_src_indices,
+            recurrent_track_indices=recurrent_track_indices,
+            recurrent_track_mask=recurrent_track_mask,
         )
 
         # Auto-generate attention mask for Encoder-only models (e.g. UMT5Encoder, BERT)

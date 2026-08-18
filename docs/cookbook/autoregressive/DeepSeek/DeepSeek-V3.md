@@ -4,7 +4,7 @@ title: "DeepSeek V3"
 
 # DeepSeek V3 on SGL-JAX
 
-> **Validated recipe** — TPU v6e-64 path validated on sglang-jax 0.1.0: server starts, greedy output correct, GSM8K accuracy 97.5% (200 examples), `bench_serving` numbers in §4.2.
+> **Validated recipe** — TPU v6e-64 path validated on sglang-jax 0.1.0: server starts, greedy output correct, GSM8K accuracy 97.5% (200 examples). §4.2 includes a v7x-16 launch and `bench_serving` template.
 
 ## 1. Model Introduction
 
@@ -27,13 +27,14 @@ title: "DeepSeek V3"
 
 | TPU | Topology | Nodes | Chips / JAX devices | `--tp-size` | `--dp-size` | Tensor axis | `--ep-size` | Notes |
 |---|---|---|---|---|---|---|---|---|
+| **v7x-16** | 2x2x4 | 4 | 16 chips / 32 devices | 32 | 4 | 8 | 32 | Launch and benchmark template in §4.2. v7x exposes 2 JAX devices/chip; keep tensor axis 8 for the FP8 block-quant and MLA layout. |
 | **v6e-64** | 8x8 | 16 | 64 | 64 | 8 | 8 | 64 | This is the slice we measured on. `dp=8` is required for FP8 shared-expert block-quant compatibility (`2048/8=256 > 128 = block_size`); `dp=4` silently collapses. HBM is tight at `dp=8`; see §2.4 Memory Management. |
 
-See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants, scaled-down configs), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
+See [TPU topology reference](/base/tpu-topology-reference) for the TPU generation reference. For other slices (larger v6e, v7x variants, scaled-down configs), see [Adapting to other topologies](/base/tpu-topology-reference#adapting-to-other-topologies).
 
 ### 2.2 Environment
 
-Install per [Install guide](../../../get_started/install.md). Multi-host required — use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](../../deployment/skypilot.md).
+Install per [Install guide](/get_started/install). Multi-host required — use [GKE Indexed Job launcher](/deployment/gke-indexed-job) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](/deployment/skypilot).
 
 For evaluation, additionally install `evalscope` in the client environment (any host that can reach the served `:30000` port — typically a port-forwarded client laptop):
 
@@ -45,7 +46,7 @@ pip install evalscope==0.17.1
 
 #### Multi-host — TPU v6e-64
 
-Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=deepseek-v3`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=8x8`, `parallelism: 16`, `completions: 16`, and `backoffLimit: 16` (transient GKE control-plane blips happen; a non-zero backoff lets the job survive). Put these model-specific flags into `<LAUNCH_FLAGS>`:
+Use [GKE Indexed Job launcher](/deployment/gke-indexed-job) with `<JOB>=deepseek-v3`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=8x8`, `parallelism: 16`, `completions: 16`, and `backoffLimit: 16` (transient GKE control-plane blips happen; a non-zero backoff lets the job survive). Put these model-specific flags into `<LAUNCH_FLAGS>`:
 
 ```bash
   --model-path deepseek-ai/DeepSeek-V3 \
@@ -63,7 +64,7 @@ Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=
 
 Mount a shared `JAX_COMPILATION_CACHE_DIR` on the same PVC as the model weights — first-time compile is ~4 minutes total (EXTEND ~70 s + DECODE ~3 min); subsequent restarts with the same mesh shape skip almost all of that.
 
-For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../deployment/skypilot.md) with the same launch flags.
+For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](/deployment/skypilot) with the same launch flags.
 
 ### 2.4 Configuration Tips
 
@@ -88,13 +89,13 @@ For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../.
 - `JAX_COMPILATION_CACHE_DIR` is mandatory — without it, first request blocks ~4 min per node and is repeated on every restart.
 - Mount a shared PVC at the cache directory to amortize compilation across all 16 nodes and across pod restarts. Mesh shape (`data × tensor`) is part of the cache key; changing `--dp-size` invalidates the cache.
 
-For full flag definitions see [Launch flags reference](../../base/launch-flags-reference.md).
+For full flag definitions see [Launch flags reference](/base/launch-flags-reference).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-For full cURL + native `/generate` patterns see [Basic API usage](../../base/basic-api-usage.md).
+For full cURL + native `/generate` patterns see [Basic API usage](/base/basic-api-usage).
 
 Short Python OpenAI client example (replace `<rank0-ip>` with your rank-0 internal IP):
 
@@ -113,7 +114,7 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
-> DeepSeek V3 is non-reasoning and has no native tool-call format. For those workloads, see the **Parser key reference** in [Parser key reference](../index.md#parser-key-reference) for the list of cookbook recipes with reasoning / tool-call parsers registered.
+> DeepSeek V3 is non-reasoning and has no native tool-call format. For those workloads, see the **Parser key reference** in [Parser key reference](/autoregressive#parser-key-reference) for the list of cookbook recipes with reasoning / tool-call parsers registered.
 
 ## 4. Benchmark
 
@@ -132,7 +133,7 @@ print(resp.choices[0].message.content)
 | Expert Parallelism | 64 |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3](#multi-host-gke-indexed-job--tpu-v6e-64).
+**Deployment Command** — same as [§2.3](/autoregressive/DeepSeek/DeepSeek-V3#2-3-launch).
 
 **Benchmark Command**
 
@@ -158,11 +159,42 @@ Recommended additional datasets to PR back: MMLU, GPQA Diamond, HumanEval, LiveC
 
 ### 4.2 Speed
 
-> **Layout F — single-workload sweep (one data point).** Standard chat (ISL=1000, OSL=1000), `max_concurrency=16`, 80 prompts, `seed=42`. Future PRs can add Low / High concurrency rows or sweep MoE backend / chunked-prefill-size.
+> **v7x-16 benchmark template.** Fixed-length random requests (ISL=1024, OSL=1024), `max_concurrency=128`, 384 prompts, `random_range_ratio=1`, `seed=42`, and no warmup requests.
 
-**Test Environment** — same hardware/build as §4.1.
+**Test Environment**
 
-**Workload** — `bench_serving` with `--dataset-name random --random-input-len 1000 --random-output-len 1000 --num-prompts 80 --max-concurrency 16 --seed 42`.
+| Field | Value |
+|---|---|
+| Hardware | TPU v7x-16 (4 nodes x 4 chips, 32 JAX devices) |
+| Model | deepseek-ai/DeepSeek-V3 (real FP8 weights; runtime dtype bfloat16) |
+| Tensor Parallelism | 32 (tensor axis 8 via `--dp-size 4`) |
+| Data Parallelism | 4 |
+| Expert Parallelism | 32 |
+| Tested build | origin/main (`2d97c787f712f715784216f7c414a4f477ea8218`) |
+
+**Serving Flags Used**
+
+```bash
+JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
+  --model-path /models/DeepSeek-V3 \
+  --trust-remote-code \
+  --tp-size 32 --dp-size 4 --ep-size 32 \
+  --moe-backend epmoe \
+  --dtype bfloat16 \
+  --context-length 32768 \
+  --chunked-prefill-size 1024 \
+  --mem-fraction-static 0.88 \
+  --page-size 128 \
+  --max-running-requests 128 \
+  --attention-backend fa \
+  --dp-schedule-policy round_robin \
+  --skip-server-warmup \
+  --nnodes 4 --node-rank ${NODE_RANK} \
+  --dist-init-addr ${MASTER_ADDR} \
+  --host 0.0.0.0 --port 30000
+```
+
+**Workload** — `bench_serving` with `--dataset-name random --random-input-len 1024 --random-output-len 1024 --num-prompts 384 --max-concurrency 128 --random-range-ratio 1 --seed 42 --warmup-requests 0`.
 
 **Benchmark Command**
 
@@ -173,54 +205,16 @@ PYTHONPATH=/tmp/sglang-jax/python python -m sgl_jax.bench_serving \
   --tokenizer /models/DeepSeek-V3 \
   --host 127.0.0.1 --port 30000 \
   --dataset-name random \
-  --random-input-len 1000 --random-output-len 1000 \
-  --num-prompts 80 --max-concurrency 16 \
-  --seed 42
-```
-
-**Test Results**
-
-```text
-============ Serving Benchmark Result ============
-Backend:                                 sgl-jax
-Traffic request rate:                    inf
-Max request concurrency:                 16
-Successful requests:                     80
-Benchmark duration (s):                  153.73
-Total input tokens:                      37205
-Total generated tokens:                  38314
-Request throughput (req/s):              0.52
-Input token throughput (tok/s):          242.02
-Output token throughput (tok/s):         249.24
-Peak output token throughput (tok/s):    464.00
-Peak concurrent requests:                18
-Total token throughput (tok/s):          491.26
-Concurrency:                             13.93
-----------------End-to-End Latency----------------
-Mean E2E Latency (ms):                   26762.89
-Median E2E Latency (ms):                 26193.67
-P90 E2E Latency (ms):                    49473.94
-P99 E2E Latency (ms):                    57531.47
----------------Time to First Token----------------
-Mean TTFT (ms):                          1018.63
-Median TTFT (ms):                        1294.61
-P99 TTFT (ms):                           1960.82
------Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          59.32
-Median TPOT (ms):                        54.48
-P99 TPOT (ms):                           164.09
----------------Inter-Token Latency----------------
-Mean ITL (ms):                           53.87
-Median ITL (ms):                         34.51
-P95 ITL (ms):                            37.46
-P99 ITL (ms):                            1256.43
-Max ITL (ms):                            2517.66
-==================================================
+  --random-input-len 1024 --random-output-len 1024 \
+  --num-prompts 384 --max-concurrency 128 \
+  --random-range-ratio 1 \
+  --seed 42 \
+  --warmup-requests 0
 ```
 
 ## Additional Resources
 
 - [DeepSeek-V3 model card](https://huggingface.co/deepseek-ai/DeepSeek-V3)
 - [SGLang DeepSeek V3 guide](https://docs.sglang.io/docs/basic_usage/deepseek_v3)
-- [Launch flags reference](../../base/launch-flags-reference.md)
-- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.
+- [Launch flags reference](/base/launch-flags-reference)
+- [Cross-recipe troubleshooting](/deployment/troubleshooting) — cross-recipe generic issues.

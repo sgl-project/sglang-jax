@@ -23,7 +23,7 @@ def _make_fused_cache(cache_size, num_heads, head_dim, page_size, dtype=jnp.bflo
     num_pages = (cache_size + page_size - 1) // page_size + 1  # +1 sentinel page
     shape = (num_pages, page_size, num_heads * 2 // packing, packing, head_dim_aligned)
     cache = jnp.zeros(shape, dtype=dtype)
-    return jax.device_put(cache, P(None, None, "tensor", None, None))
+    return jax.device_put(cache, P("data", None, "tensor", None, None))
 
 
 def _extract_kv_from_fused(fused_cache):
@@ -97,12 +97,12 @@ class TestKVCache(unittest.TestCase):
 
         # Merge k/v into 5D fused format
         fused_kv = merge_kv(k, v)
-        fused_kv = jax.device_put(fused_kv, P(None, None, "tensor", None, None))
+        fused_kv = jax.device_put(fused_kv, P("data", None, "tensor", None, None))
 
         # Create 5D fused cache
         kv_cache = _make_fused_cache(cache_size, self.num_heads, self.head_dim, page_size)
 
-        loc = jax.device_put(loc, P(None))
+        loc = jax.device_put(loc, P("data"))
 
         return fused_kv, loc, kv_cache, k, v
 
@@ -178,6 +178,7 @@ class TestKVCache(unittest.TestCase):
 
         # Make all tokens padding
         loc = jnp.full((total_tokens,), -1, dtype=jnp.int32)
+        loc = jax.device_put(loc, P("data"))
 
         original_cache = kv_cache.copy()
 
@@ -194,6 +195,7 @@ class TestKVCache(unittest.TestCase):
         loc = loc.at[0:7].set(jnp.arange(11, 18))
         loc = loc.at[7:11].set(jnp.arange(22, 26))
         loc = loc.at[11:21].set(jnp.arange(30, 40))
+        loc = jax.device_put(loc, P("data"))
 
         k = jax.random.uniform(
             jax.random.PRNGKey(42),
@@ -208,7 +210,7 @@ class TestKVCache(unittest.TestCase):
 
         cache_size = total_tokens + 50
         fused_kv = merge_kv(k, v)
-        fused_kv = jax.device_put(fused_kv, P(None, None, "tensor", None, None))
+        fused_kv = jax.device_put(fused_kv, P("data", None, "tensor", None, None))
 
         for page_size in [1, 2, 4, 8]:
             with self.subTest(page_size=page_size):

@@ -1,6 +1,8 @@
 import jax
 import jax.numpy as jnp
 
+from sgl_jax.srt.layers.binary_search import float32_bsearch, topk_mask
+
 
 def create_extend_after_decode_spec_info(
     verified_id,
@@ -90,6 +92,14 @@ def verify_tree_greedy(
     return accept_index, accept_token_num, predicts
 
 
+# top-k / top-p renorm only need an inclusion *threshold* (keep every prob >= t),
+# not a sorted order -- and on TPU a sort / large-k top_k over the vocab dominated
+# device time (~29ms, ~48% of the verify step). We reuse the shared, TPU-tuned
+# bit-exact binary search from layers/binary_search.py (the same primitive the
+# regular sampler's mask path uses): mass/count above t is monotone in t, so the
+# threshold is found with a fixed bit-search and no sort.
+
+
 def top_k_renorm_prob(probs, top_k_values):
     """Renormalizing probabilities by top-k thresholding.
 
@@ -105,14 +115,10 @@ def top_k_renorm_prob(probs, top_k_values):
         probs.shape[0] == top_k_values.shape[0]
     ), f"probs.shape[0]: {probs.shape[0]} should equal to top_k_values.shape[0]: {top_k_values.shape}"
 
-    # TODO: optimize alg of top_k by avoiding sort
-    def process_single_sample(prob_row, k):
-        ranks = jnp.argsort(jnp.argsort(prob_row)[::-1])
-        mask = ranks < k
-        masked_probs = jnp.where(mask, prob_row, 0.0)
-        return masked_probs / jnp.sum(masked_probs)
-
-    return jax.vmap(process_single_sample, in_axes=(0, 0))(probs, top_k_values)
+    # topk_mask keeps the largest k values per row (ties may keep >k) and zeros the
+    # rest; k covering the whole vocabulary (TOP_K_ALL) keeps everything.
+    masked_probs = topk_mask(probs, top_k_values.reshape(-1), replace_val=0.0)
+    return masked_probs / jnp.sum(masked_probs, axis=-1, keepdims=True)
 
 
 def top_p_renorm_prob(probs, top_p_values):
@@ -130,22 +136,21 @@ def top_p_renorm_prob(probs, top_p_values):
         probs.shape[0] == top_p_values.shape[0]
     ), f"probs.shape[0]: {probs.shape[0]} should equal to top_k_values.shape[0]: {top_p_values.shape}"
 
-    # TODO: optimize alg of top_p by avoiding sort
-    def process_single_sample(prob_row, top_p):
-        sorted_indices = jnp.argsort(prob_row)[::-1]
-        sorted_probs = prob_row[sorted_indices]
+    # Largest threshold whose kept probability mass is still >= top_p, via the shared
+    # bit-exact float32 binary search. The vocab axis is moved to second-to-last so
+    # the per-step reductions don't run across vector lanes (slow on TPU) -- the same
+    # layout trick as binary_search.topp_mask.
+    p = top_p_values.reshape(-1)
+    probs_t = jnp.swapaxes(probs, -1, -2)
 
-        cumsum_probs = jnp.cumsum(sorted_probs)
-        cutoff_idx = jnp.argmax(cumsum_probs >= top_p)
+    def predicate(threshold):
+        threshold = jax.lax.expand_dims(threshold, (0,))
+        mass = jnp.sum(jnp.where(probs_t >= threshold, probs_t, 0.0), axis=0)
+        return mass < p
 
-        ranks = jnp.argsort(jnp.argsort(prob_row)[::-1])
-
-        mask = ranks <= cutoff_idx
-
-        masked_probs = jnp.where(mask, prob_row, 0.0)
-        return masked_probs / jnp.sum(masked_probs)
-
-    return jax.vmap(process_single_sample, in_axes=(0, 0))(probs, top_p_values)
+    threshold = float32_bsearch((probs.shape[0],), predicate)
+    masked_probs = jnp.where(probs >= threshold[:, None], probs, 0.0)
+    return masked_probs / jnp.sum(masked_probs, axis=-1, keepdims=True)
 
 
 def _sampling_from_prob(probs: jax.Array, threshold: jax.Array):

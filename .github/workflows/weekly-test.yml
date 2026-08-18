@@ -21,7 +21,7 @@ jobs:
 
   nightly-test-accuracy-text-models-1-tpu:
     if: github.repository == 'sgl-project/sglang-jax'
-    runs-on: arc-runner-v6e-1
+    runs-on: arc-runner-v6e-1-us-south1-ai1b
     strategy:
       fail-fast: false
       matrix:
@@ -86,7 +86,7 @@ jobs:
 
   nightly-test-accuracy-text-models-4-tpu:
     if: github.repository == 'sgl-project/sglang-jax'
-    runs-on: arc-runner-v6e-4
+    runs-on: arc-runner-v6e-4-us-south1-ai1b
     strategy:
       fail-fast: false
       matrix:
@@ -129,7 +129,7 @@ jobs:
 
   nightly-test-perf-text-models-1-tpu:
     if: github.repository == 'sgl-project/sglang-jax'
-    runs-on: arc-runner-v6e-1
+    runs-on: arc-runner-v6e-1-us-south1-ai1b
     env:
       TZ: Asia/Shanghai
       JAX_COMPILATION_CACHE_DIR: /xla-cache
@@ -173,7 +173,7 @@ jobs:
 
   nightly-test-perf-text-models-4-tpu-part1:
     if: github.repository == 'sgl-project/sglang-jax'
-    runs-on: arc-runner-v6e-4
+    runs-on: arc-runner-v6e-4-us-south1-ai1b
     env:
       TZ: Asia/Shanghai
       JAX_COMPILATION_CACHE_DIR: /xla-cache
@@ -239,7 +239,7 @@ jobs:
 
   nightly-test-perf-text-models-4-tpu-part2:
       if: github.repository == 'sgl-project/sglang-jax'
-      runs-on: arc-runner-v6e-4
+      runs-on: arc-runner-v6e-4-us-south1-ai1b
       env:
         TZ: Asia/Shanghai
         JAX_COMPILATION_CACHE_DIR: /xla-cache
@@ -283,7 +283,7 @@ jobs:
 
   nightly-test-perf-text-models-4-tpu-part3:
         if: github.repository == 'sgl-project/sglang-jax'
-        runs-on: arc-runner-v6e-4
+        runs-on: arc-runner-v6e-4-us-south1-ai1b
         env:
           TZ: Asia/Shanghai
           JAX_COMPILATION_CACHE_DIR: /xla-cache

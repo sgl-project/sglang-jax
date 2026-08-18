@@ -172,6 +172,12 @@ def _make_fake_layer(layer_id=_LAYER_ID, H=_H):
     return SimpleNamespace(layer_id=layer_id, num_heads=H, head_dim=_K)
 
 
+def _place_projection_outputs(mesh, *arrays):
+    """Mirror the Q/K/V layout produced by the model projections."""
+    sharding = NamedSharding(mesh, P("data", "tensor", None))
+    return tuple(jax.device_put(jnp.array(array), sharding) for array in arrays)
+
+
 # ===========================================================================
 # TestDPMetadata
 # ===========================================================================
@@ -201,6 +207,8 @@ class TestDPMetadata:
                 seq_lens=np.array([10, 20, 15, 25], dtype=np.int32),
                 recurrent_indices=np.array([1, 2, 1, 2], dtype=np.int32),  # LOCAL indices per rank
                 has_initial_state=np.ones(4, dtype=np.bool_),
+                recurrent_track_indices=None,
+                recurrent_track_mask=None,
                 dp_size=2,
                 per_dp_bs_size=2,
             )
@@ -271,6 +279,8 @@ class TestDPDecode:
                 seq_lens=np.ones(B, dtype=np.int32),
                 recurrent_indices=rec_indices,
                 has_initial_state=np.ones(B, dtype=np.bool_),
+                recurrent_track_indices=None,
+                recurrent_track_mask=None,
                 dp_size=1,
                 per_dp_bs_size=B,
             )
@@ -283,6 +293,7 @@ class TestDPDecode:
             q_tp4 = jnp.array(q_np).reshape(B, H, K)
             k_tp4 = jnp.array(k_np).reshape(B, H, K)
             v_tp4 = jnp.array(v_np).reshape(B, H, K)
+            q_tp4, k_tp4, v_tp4 = _place_projection_outputs(mesh_tp4, q_tp4, k_tp4, v_tp4)
 
             out_tp4, pu_tp4 = backend_tp4(
                 q_tp4, k_tp4, v_tp4, layer=layer, forward_batch=fb, recurrent_state_pool=pool_tp4
@@ -311,6 +322,8 @@ class TestDPDecode:
                 seq_lens=np.ones(B, dtype=np.int32),
                 recurrent_indices=batch_rec_indices,
                 has_initial_state=np.ones(B, dtype=np.bool_),
+                recurrent_track_indices=None,
+                recurrent_track_mask=None,
                 dp_size=2,
                 per_dp_bs_size=B // 2,
             )
@@ -320,6 +333,7 @@ class TestDPDecode:
             q_dp = jnp.array(q_np).reshape(B, H, K)
             k_dp = jnp.array(k_np).reshape(B, H, K)
             v_dp = jnp.array(v_np).reshape(B, H, K)
+            q_dp, k_dp, v_dp = _place_projection_outputs(mesh_dp, q_dp, k_dp, v_dp)
 
             out_dp, pu_dp = backend_dp(
                 q_dp, k_dp, v_dp, layer=layer, forward_batch=fb, recurrent_state_pool=pool_dp
@@ -386,6 +400,8 @@ class TestDPDecode:
                 seq_lens=np.ones(B, dtype=np.int32),
                 recurrent_indices=batch_rec_indices,
                 has_initial_state=np.ones(B, dtype=np.bool_),
+                recurrent_track_indices=None,
+                recurrent_track_mask=None,
                 dp_size=2,
                 per_dp_bs_size=B // 2,
             )
@@ -398,6 +414,7 @@ class TestDPDecode:
             q = jnp.array(q_np).reshape(B, H, K)
             k = jnp.array(k_np).reshape(B, H, K)
             v = jnp.array(v_np).reshape(B, H, K)
+            q, k, v = _place_projection_outputs(mesh_dp, q, k, v)
 
             out, pu = backend(q, k, v, layer=layer, forward_batch=fb, recurrent_state_pool=pool)
             state = _extract_state(pu, local_indices, dp_size=2)
@@ -459,6 +476,8 @@ class TestDPExtend:
                 input_ids=np.zeros(total_tokens, dtype=np.int32),
                 recurrent_indices=rec_indices,
                 has_initial_state=np.ones(B, dtype=np.bool_),
+                recurrent_track_indices=None,
+                recurrent_track_mask=None,
                 dp_size=1,
                 per_dp_bs_size=B,
             )
@@ -468,10 +487,11 @@ class TestDPExtend:
             layer = _make_fake_layer()
             fb = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
 
+            q_tp4, k_tp4, v_tp4 = _place_projection_outputs(mesh_tp4, q_packed, k_packed, v_packed)
             out_tp4, pu_tp4 = backend_tp4(
-                jnp.array(q_packed),
-                jnp.array(k_packed),
-                jnp.array(v_packed),
+                q_tp4,
+                k_tp4,
+                v_tp4,
                 layer=layer,
                 forward_batch=fb,
                 recurrent_state_pool=pool_tp4,
@@ -502,6 +522,8 @@ class TestDPExtend:
                 input_ids=np.zeros(total_tokens, dtype=np.int32),
                 recurrent_indices=batch_rec_indices,
                 has_initial_state=np.ones(B, dtype=np.bool_),
+                recurrent_track_indices=None,
+                recurrent_track_mask=None,
                 dp_size=2,
                 per_dp_bs_size=B // 2,
             )
@@ -539,14 +561,9 @@ class TestDPExtend:
                 seq_lens[0] :
             ]
 
-            # 使用 device_put 配合 P("data", "tensor", None) 自动切分
-            from jax.sharding import NamedSharding
-
-            sharding_spec = NamedSharding(mesh_dp, P("data", "tensor", None))
-
-            q_sharded = jax.device_put(jnp.array(q_global), sharding_spec)
-            k_sharded = jax.device_put(jnp.array(k_global), sharding_spec)
-            v_sharded = jax.device_put(jnp.array(v_global), sharding_spec)
+            q_sharded, k_sharded, v_sharded = _place_projection_outputs(
+                mesh_dp, q_global, k_global, v_global
+            )
 
             out_dp, pu_dp = backend_dp(
                 q_sharded,
@@ -631,6 +648,8 @@ class TestDPExtend:
                 input_ids=np.zeros(total_tokens, dtype=np.int32),
                 recurrent_indices=rec_indices,
                 has_initial_state=np.ones(B, dtype=np.bool_),
+                recurrent_track_indices=None,
+                recurrent_track_mask=None,
                 dp_size=2,
                 per_dp_bs_size=B // 2,
             )
@@ -640,10 +659,11 @@ class TestDPExtend:
             layer = _make_fake_layer()
             fb = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
 
+            q, k, v = _place_projection_outputs(mesh_dp, q_packed, k_packed, v_packed)
             out, pu = backend(
-                jnp.array(q_packed),
-                jnp.array(k_packed),
-                jnp.array(v_packed),
+                q,
+                k,
+                v,
                 layer=layer,
                 forward_batch=fb,
                 recurrent_state_pool=pool,
@@ -721,6 +741,8 @@ class TestDPEndToEnd:
                 input_ids=np.zeros(total_tokens, dtype=np.int32),
                 recurrent_indices=batch_rec_indices,
                 has_initial_state=np.ones(B, dtype=np.bool_),
+                recurrent_track_indices=None,
+                recurrent_track_mask=None,
                 dp_size=2,
                 per_dp_bs_size=B // 2,
             )
@@ -730,10 +752,13 @@ class TestDPEndToEnd:
             layer = _make_fake_layer()
             fb_ext = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
 
+            q_ext, k_ext, v_ext = _place_projection_outputs(
+                mesh_dp, q_ext_packed, k_ext_packed, v_ext_packed
+            )
             _, pu_ext = backend(
-                jnp.array(q_ext_packed),
-                jnp.array(k_ext_packed),
-                jnp.array(v_ext_packed),
+                q_ext,
+                k_ext,
+                v_ext,
                 layer=layer,
                 forward_batch=fb_ext,
                 recurrent_state_pool=pool,

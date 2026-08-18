@@ -361,6 +361,7 @@ class KimiDecoderLayer(nnx.Module):
                 topk_group=config.topk_group,
                 routed_scaling_factor=config.routed_scaling_factor,
                 layer_id=layer_idx,
+                mesh=mesh,
             )
 
             if self.use_fused:

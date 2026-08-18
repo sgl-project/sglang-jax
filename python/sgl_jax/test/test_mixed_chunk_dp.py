@@ -24,6 +24,9 @@ class _DummyRadixCache:
 
     disable = False
 
+    def recurrent_extra_buffer_active(self) -> bool:
+        return False
+
     def evictable_size(self, dp_rank: int = 0):
         return 0
 

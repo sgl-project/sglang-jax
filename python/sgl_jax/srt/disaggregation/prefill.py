@@ -13,10 +13,10 @@ from typing import TYPE_CHECKING
 import jax
 import jax.numpy as jnp
 
-from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
-from sgl_jax.srt.disaggregation.jax_transfer.conn import (
-    JaxTransferKVManager,
-    JaxTransferKVSender,
+from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll, KVSender
+from sgl_jax.srt.disaggregation.base.transfer import (
+    PrefillTransferContext,
+    TransferBackend,
 )
 
 if TYPE_CHECKING:
@@ -26,22 +26,77 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _batch_reqs(batch) -> tuple[Req, ...]:
+    if batch is None:
+        return ()
+    reqs_info = getattr(batch, "reqs_info", None)
+    if reqs_info is None:
+        return tuple(getattr(batch, "reqs", ()) or ())
+    return tuple(req for info in reqs_info for req in (info.reqs or ()))
+
+
 # Bucket page counts to bound XLA's per-shape compile pool.
-_KV_GATHER_PAGE_BUCKETS = (1, 2, 4, 8, 16, 32, 64)
+# Largest bucket (512 pages × 128 tokens/page) covers 64k-token prompts.
+_KV_GATHER_PAGE_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
 
 
 def _pad_to_page_bucket(num_pages: int) -> int:
     for b in _KV_GATHER_PAGE_BUCKETS:
         if b >= num_pages:
             return b
-    return _KV_GATHER_PAGE_BUCKETS[-1]
+    # Beyond the largest predefined bucket: round up to a multiple of it so we
+    # never truncate KV, while keeping the set of compiled shapes bounded.
+    largest = _KV_GATHER_PAGE_BUCKETS[-1]
+    return ((num_pages + largest - 1) // largest) * largest
+
+
+def _globalize_rank_local_page_ids(
+    page_ids,
+    *,
+    dp_rank: int,
+    dp_size: int,
+    total_pages: int,
+):
+    """Preserve each DP shard's padding page when indexing the global page axis."""
+
+    import numpy as np
+
+    ids = np.asarray(page_ids)
+    dp_rank = int(dp_rank)
+    dp_size = int(dp_size)
+    total_pages = int(total_pages)
+    if dp_size <= 0:
+        raise ValueError(f"dp_size must be positive, got {dp_size}")
+    if not 0 <= dp_rank < dp_size:
+        raise ValueError(f"dp_rank={dp_rank} is outside [0, {dp_size})")
+    if total_pages <= 0 or total_pages % dp_size:
+        raise ValueError(
+            f"global KV page count {total_pages} is not divisible by dp_size={dp_size}"
+        )
+    pages_per_rank = total_pages // dp_size
+    if np.any(ids < 0) or np.any(ids >= pages_per_rank):
+        raise ValueError(
+            f"rank-local KV page IDs must be in [0, {pages_per_rank}); got {ids.tolist()}"
+        )
+    return ids + dp_rank * pages_per_rank
 
 
 @partial(jax.jit, static_argnames=("out_sharding",))
-def _jit_gather_all_layers(buffers, page_indices, out_sharding):
-    """Gather ``page_indices`` from every per-layer KV buffer in one jit."""
+def _jit_gather_one_layer(buf, page_indices, out_sharding):
+    """Gather ``page_indices`` from a single per-layer KV buffer.
 
-    return [buf.at[page_indices].get(out_sharding=out_sharding) for buf in buffers]
+    Gathered per layer to cap the XLA compile-time HBM footprint (~1.2 GB
+    per layer regardless of layer count).
+    """
+    return buf.at[page_indices].get(out_sharding=out_sharding)
+
+
+def _jit_gather_all_layers(buffers, page_indices, out_sharding):
+    """Gather ``page_indices`` from every per-layer KV buffer.
+
+    Dispatches an independent per-layer jit call so each compiles separately.
+    """
+    return [_jit_gather_one_layer(buf, page_indices, out_sharding) for buf in buffers]
 
 
 def _global_to_local_shard(arr: jax.Array) -> jax.Array:
@@ -99,7 +154,7 @@ class PrefillBookkeeping:
     """Per-request prefill-side state tracked by the Mixin."""
 
     req_id: str
-    sender: JaxTransferKVSender
+    sender: KVSender
     # Optional callback the scheduler runs when this entry reaches a
     # terminal state — used to release ``req_to_token_pool`` and any
     # owned KV indices.
@@ -120,12 +175,12 @@ class PrefillBootstrapQueue:
     def add(
         self,
         req_id: str,
-        sender: JaxTransferKVSender,
+        sender: KVSender,
         on_terminal=None,
     ) -> None:
         with self._lock:
             if req_id in self._entries:
-                raise ValueError(f"PrefillBootstrapQueue already tracks " f"req_id={req_id!r}")
+                raise ValueError(f"PrefillBootstrapQueue already tracks req_id={req_id!r}")
             self._entries[req_id] = PrefillBookkeeping(
                 req_id=req_id, sender=sender, on_terminal=on_terminal
             )
@@ -150,11 +205,21 @@ class PrefillBootstrapQueue:
                     out.append(self._entries.pop(req_id))
         return out
 
+    def cancel_matching(self, rid_prefix: str, abort_all: bool) -> list[PrefillBookkeeping]:
+        """Return matching entries without releasing their owned KV pages."""
+
+        with self._lock:
+            return [
+                entry
+                for req_id, entry in self._entries.items()
+                if abort_all or req_id.startswith(rid_prefix)
+            ]
+
 
 class SchedulerDisaggregationPrefillMixin:
     """Mixin for PD prefill mode on Scheduler."""
 
-    disagg_kv_manager: JaxTransferKVManager
+    disagg_kv_manager: TransferBackend
     disagg_prefill_queue: PrefillBootstrapQueue
     disagg_use_d2h_staging: bool
 
@@ -177,6 +242,10 @@ class SchedulerDisaggregationPrefillMixin:
             self.cur_batch = batch
 
             if batch:
+                batch_reqs = _batch_reqs(batch)
+                for req in batch_reqs:
+                    if req.bootstrap_room is not None:
+                        self._pd_mark_time(req, "forward_start")
                 result = self.run_batch(batch)
                 self.process_prefill_chunk(batch, result)
             else:
@@ -188,72 +257,75 @@ class SchedulerDisaggregationPrefillMixin:
             self.send_kv_chunk()
             # PD reqs are finished and released inside process_prefill_chunk;
             # do not merge them into running_batch.
+            batch_reqs = _batch_reqs(batch)
             self.last_batch = (
-                None if batch and any(r.bootstrap_room is not None for r in batch.reqs) else batch
+                None if batch and any(r.bootstrap_room is not None for r in batch_reqs) else batch
             )
 
     def process_prefill_chunk(self: Scheduler, batch, result) -> None:
         """Extract KV for PD reqs and hand off to sender."""
 
-        pd_reqs = [req for req in batch.reqs if req.bootstrap_room is not None]
+        batch_reqs = _batch_reqs(batch)
+        pd_reqs = [req for req in batch_reqs if req.bootstrap_room is not None]
         if not pd_reqs:
             self.process_batch_result(batch, result)
             return
 
+        for req in pd_reqs:
+            self._pd_mark_time(req, "forward_done")
+
         self.set_next_batch_sampling_info_done(batch)
 
         chunked_now = tuple(r for r in getattr(self, "chunked_reqs", ()) if r is not None)
-        for req in batch.reqs:
+        ready_to_transfer = [
+            req
+            for req in pd_reqs
+            if not any(req is chunked_req for chunked_req in chunked_now)
+            and req.rid not in self.disagg_prefill_queue._entries
+        ]
+        if ready_to_transfer:
+            kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+            self.disagg_kv_manager.prepare_prefill_batch(kv_pool.kv_buffer)
+        for req in batch_reqs:
             if req.bootstrap_room is None:
                 continue
-            if any(req is cr for cr in chunked_now):
+            req_id = req.rid
+            is_mid_chunk = any(req is cr for cr in chunked_now)
+            if is_mid_chunk:
                 # Still mid-chunk: KV is incomplete, and releasing the
                 # req_pool_idx here would leak the slot the next chunk
-                # round re-allocates. Extract on the final chunk.
+                # round re-allocates. Both engines transfer only after the final
+                # chunk; transfer/forward overlap is intentionally out of scope.
+                assert req.is_chunked > 0
+                req.is_chunked -= 1
                 continue
-            req_id = req.rid
             if req_id in self.disagg_prefill_queue._entries:
                 continue
             try:
-                device_kv = self._extract_req_kv(req)
+                req.disagg_host_buffer_id = self.disagg_kv_manager.reserve_prefill_buffer(
+                    getattr(req, "disagg_host_buffer_id", None)
+                )
+                transfer = self.disagg_kv_manager.start_prefill(
+                    PrefillTransferContext(
+                        req_id=req_id,
+                        transfer_id=req.disagg_transfer_id or req_id,
+                        bootstrap_room=req.bootstrap_room,
+                        dp_rank=int(req.dp_rank),
+                        buffer_id=req.disagg_host_buffer_id,
+                        payload_factory=lambda req_obj=req: {"kv": self._extract_req_kv(req_obj)},
+                        block_ids_factory=lambda req_obj=req: self._extract_req_block_ids(req_obj),
+                        on_payload=lambda payload, req_obj=req: (
+                            self._maybe_log_prefill_extract_debug(
+                                req_obj,
+                                payload["kv"],
+                                use_d2h_staging=self.disagg_use_d2h_staging,
+                            )
+                        ),
+                        on_ready=lambda req_obj=req: self._pd_mark_time(req_obj, "transfer_start"),
+                    )
+                )
             except Exception as exc:
-                logger.exception(
-                    "failed to extract KV for req_id=%s; aborting",
-                    req_id,
-                )
-                self._abort_prefill_req(
-                    req,
-                    f"KV extraction failed for req_id={req_id!r}: {exc}",
-                    metric_reason="kv_extraction",
-                )
-                continue
-            sender = None
-            try:
-                self._maybe_log_prefill_extract_debug(
-                    req,
-                    device_kv,
-                    use_d2h_staging=self.disagg_use_d2h_staging,
-                )
-                sender = self.disagg_kv_manager.create_sender(req_id)
-                sender.init(
-                    kv_indices=None,
-                    transfer_id=req.disagg_transfer_id or req_id,
-                )
-                sender.attach_payload(
-                    {"kv": device_kv},
-                    use_d2h_staging=self.disagg_use_d2h_staging,
-                )
-                sender.send()
-            except Exception as exc:
-                logger.exception(
-                    "sender init/send failed for req_id=%s; aborting",
-                    req_id,
-                )
-                if sender is not None:
-                    with suppress(Exception):
-                        sender.abort()
-                    with suppress(Exception):
-                        sender.clear()
+                logger.exception("prefill transfer setup failed for req_id=%s", req_id)
                 self._abort_prefill_req(
                     req,
                     f"Prefill sender failed for req_id={req_id!r}: {exc}",
@@ -261,21 +333,13 @@ class SchedulerDisaggregationPrefillMixin:
                 )
                 continue
 
-            if jax.process_count() > 1:
-                # The gather output is a fresh buffer, so pool pages can be
-                # released here — the same SPMD point on every NP — keeping
-                # allocator state identical across NPs without a cross-host
-                # control-plane sync. Single-host keeps the original
-                # release-on-ack behaviour.
-                self._release_prefill_req_resources(req)
-                released = True
-            else:
-                released = False
+            if transfer.release_device_kv:
+                self._release_prefill_kv_pool(req)
 
-            def _on_terminal(req_obj=req, sender_obj=sender, _released=released):
-                self._on_prefill_transfer_terminal(req_obj, sender_obj, already_released=_released)
+            def _on_terminal(req_obj=req, sender_obj=transfer.sender):
+                self._on_prefill_transfer_terminal(req_obj, sender_obj)
 
-            self.disagg_prefill_queue.add(req_id, sender, on_terminal=_on_terminal)
+            self.disagg_prefill_queue.add(req_id, transfer.sender, on_terminal=_on_terminal)
 
     def send_kv_chunk(self: Scheduler) -> None:
         """Reap senders that reached SUCCESS / FAILED."""
@@ -297,10 +361,37 @@ class SchedulerDisaggregationPrefillMixin:
     # Overridable / test-friendly hooks
     # ------------------------------------------------------------------
 
+    def _pd_mark_time(self: Scheduler, req: Req, name: str) -> None:
+        """Record a PD lifecycle mark on ``req`` (no-op unless enabled)."""
+
+        if not getattr(self.server_args, "enable_request_time_stats_logging", False):
+            return
+        from sgl_jax.srt.disaggregation.req_time_stats import TimeStats
+
+        ts = req.pd_time_stats
+        if ts is None:
+            role = getattr(self.server_args, "disaggregation_mode", "prefill")
+            ts = TimeStats(role)
+            req.pd_time_stats = ts
+        ts.mark(name)
+
+    def _extract_req_block_ids(self: Scheduler, req: Req) -> list[int]:
+        from sgl_jax.srt.disaggregation.base.transfer import slots_to_page_ids
+
+        req_to_token = self.req_to_token_pool.req_to_token
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        page_size = kv_pool.page_size
+        seqlen = len(req.origin_input_ids)
+        slot_source = req_to_token[
+            req.req_pool_idx,
+            :seqlen,
+        ]
+        return list(slots_to_page_ids(slot_source, page_size, seqlen))
+
     def _extract_req_kv(self: Scheduler, req: Req):
         """Gather prefilled KV from the paged pool for ``req``.
 
-        Returns shape ``(layer_num, padded_pages, page_size, ...)``.
+        Returns a per-layer list of ``(padded_pages, page_size, ...)`` arrays.
         """
 
         req_to_token = self.req_to_token_pool.req_to_token
@@ -326,12 +417,6 @@ class SchedulerDisaggregationPrefillMixin:
             page_ids = _np.concatenate(
                 [page_ids, _np.zeros(padded_pages - num_pages, dtype=page_ids.dtype)]
             )
-        idx_sharding = _NamedSharding(kv_pool.mesh, _P(None))
-        page_indices = jax.device_put(page_ids, idx_sharding)
-        # out_sharding describes the gather output, not the pool.
-        pool_pspec = kv_pool.kv_sharding.spec
-        gather_pspec = _P(None, *pool_pspec[1:])
-        gather_out_sharding = _NamedSharding(kv_pool.mesh, gather_pspec)
         layer_buffers = [
             kv_pool.get_kv_buffer(layer_id)
             for layer_id in range(
@@ -339,23 +424,60 @@ class SchedulerDisaggregationPrefillMixin:
                 kv_pool.start_layer + kv_pool.layer_num,
             )
         ]
+        if not layer_buffers:
+            raise ValueError("cannot gather debug KV from an empty layer range")
+        page_ids = _globalize_rank_local_page_ids(
+            page_ids,
+            dp_rank=int(getattr(req, "dp_rank", 0) or 0),
+            dp_size=int(getattr(kv_pool, "dp_size", 1)),
+            total_pages=int(layer_buffers[0].shape[0]),
+        )
+        idx_sharding = _NamedSharding(kv_pool.mesh, _P(None))
+        page_indices = jax.device_put(page_ids, idx_sharding)
+        # Page indices are replicated; preserve pool sharding on the remaining axes.
+        pool_pspec = kv_pool.kv_sharding.spec
+        gather_pspec = _P(None, *pool_pspec[1:])
+        gather_out_sharding = _NamedSharding(kv_pool.mesh, gather_pspec)
         layer_kvs = _jit_gather_all_layers(layer_buffers, page_indices, gather_out_sharding)
-        stacked = jnp.stack(layer_kvs, axis=0)
         if jax.process_count() > 1:
-            # The gather output is TP-sharded across the global mesh. Expose
-            # only this host's shard as a fully-addressable local-mesh array;
-            # each P host registers its own 1/nproc slice and the matching D
-            # host (same jax_process_index) pulls exactly that slice.
+            # Multi-host: expose only this host's TP shard as a fully-addressable
+            # local-mesh array; each P host registers its 1/nproc slice and the
+            # matching D host (same jax_process_index) pulls exactly that slice.
+            stacked = jnp.stack(layer_kvs, axis=0)
             stacked.block_until_ready()
             return _global_to_local_shard(stacked)
-        return stacked
+        # Single-host: return the per-layer list. The D2H staging path
+        # (copy_from_device) consumes a ``list[jax.Array]``.
+        return layer_kvs
 
-    def _release_prefill_req_resources(self: Scheduler, req: Req) -> None:
-        """Release prefill-side KV and request-pool resources."""
+    def _release_prefill_kv_pool(self: Scheduler, req: Req) -> None:
+        """Release the prefill device KV cache + request-pool slot.
+
+        Idempotent: ``release_kv_cache`` no-ops once ``req.req_pool_idx`` is
+        cleared, so calling this both at staged D2H completion and again at the
+        terminal callback is safe.
+        """
 
         from sgl_jax.srt.mem_cache.common import release_kv_cache
 
         release_kv_cache(req, self.tree_cache)
+
+    def _release_prefill_req_resources(self: Scheduler, req: Req) -> None:
+        """Release prefill-side KV and request-pool resources."""
+
+        self._release_prefill_kv_pool(req)
+        self._release_prefill_host_buffer(req)
+
+    def _release_prefill_host_buffer(self: Scheduler, req: Req) -> None:
+        buffer_id = getattr(req, "disagg_host_buffer_id", None)
+        if buffer_id is None:
+            return
+        req.disagg_host_buffer_id = None
+        mgr = getattr(self, "disagg_kv_manager", None)
+        pool = mgr.host_pool if mgr is not None else None
+        if pool is not None:
+            with suppress(Exception):
+                pool.release(buffer_id)
 
     def _record_prefill_transfer_failure(self, reason: str) -> None:
         with suppress(Exception):
@@ -394,9 +516,7 @@ class SchedulerDisaggregationPrefillMixin:
     def _on_prefill_transfer_terminal(
         self: Scheduler,
         req: Req,
-        sender: JaxTransferKVSender,
-        *,
-        already_released: bool = False,
+        sender: KVSender,
     ) -> None:
         try:
             if sender.poll() == KVPoll.SUCCESS:
@@ -404,9 +524,16 @@ class SchedulerDisaggregationPrefillMixin:
             else:
                 self._finish_prefill_only_failure(req, sender)
         finally:
+            self._pd_mark_time(req, "transfer_done")
+            from sgl_jax.srt.disaggregation.req_time_stats import maybe_log_time_stats
+
+            maybe_log_time_stats(
+                req.pd_time_stats,
+                req_id=req.rid,
+                enabled=getattr(self.server_args, "enable_request_time_stats_logging", False),
+            )
             sender.clear()
-            if not already_released:
-                self._release_prefill_req_resources(req)
+            self._release_prefill_req_resources(req)
 
     def _finish_prefill_only_success(self: Scheduler, req: Req) -> None:
         from sgl_jax.srt.managers.schedule_batch import FINISH_LENGTH
@@ -416,14 +543,11 @@ class SchedulerDisaggregationPrefillMixin:
         req.finished_len = 0
         self._stream_prefill_req(req)
 
-    def _finish_prefill_only_failure(
-        self: Scheduler, req: Req, sender: JaxTransferKVSender
-    ) -> None:
+    def _finish_prefill_only_failure(self: Scheduler, req: Req, sender: KVSender) -> None:
         from sgl_jax.srt.managers.schedule_batch import FINISH_ABORT
 
         error_message = (
-            f"Prefill transfer failed for req_id={req.rid!r} "
-            f"bootstrap_room={req.bootstrap_room!r}"
+            f"Prefill transfer failed for req_id={req.rid!r} bootstrap_room={req.bootstrap_room!r}"
         )
         try:
             sender.failure_exception()

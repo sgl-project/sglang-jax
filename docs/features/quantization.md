@@ -20,7 +20,7 @@ The quantization system consists of two components:
 - `float8_e4m3fn` - 8-bit floating point (4 exponent bits, 3 mantissa bits, finite values + NaN)
 
 ### Quantization Strategy
-- **Weights**: Per-channel quantization (computed once at load time)
+- **Weights**: Per-channel or block-wise quantization (computed once at load time, or read from static checkpoints)
 - **Activations**: Dynamic per-token quantization (computed at runtime)
 
 ## Configuration
@@ -48,8 +48,14 @@ quantization:
 |-------------|---------|-------------|-------------|
 | `fp8.yaml` | FP8 | None | FP8 weight-only quantization |
 | `fp8_w8a8.yaml` | FP8 | FP8 | Full FP8 quantization |
+| `fp8_block_128_dynamic.yaml` | FP8 block-wise | FP8 | Block-wise dynamic quantization |
+| `fp8_deepseek_v3.yaml`, `fp8_grok.yaml`, `fp8_qwen3_30b_a3b.yaml`, `fp8_bailing.yaml` | FP8 | Varies | Model-specific FP8 configs |
 | `int8.yaml` | INT8 | None | INT8 weight-only quantization |
 | `int8_w8a8.yaml` | INT8 | INT8 | Full INT8 quantization |
+| `int8_block_128_dynamic.yaml` | INT8 block-wise | INT8 | Block-wise dynamic quantization |
+| `int8_moe_block_128_linear_channel_dynamic.yaml` | INT8 hybrid | INT8 | MoE block-wise plus linear per-channel quantization |
+
+Static checkpoint quantization can also be auto-detected from a Hugging Face `quantization_config` when the model metadata provides enough information. See [Quantization architecture](../architecture/11-quantization.md) for the exact config fields and model-loading flow.
 
 ## Usage Example
 

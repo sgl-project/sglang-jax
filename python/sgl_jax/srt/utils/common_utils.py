@@ -20,6 +20,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -181,6 +182,38 @@ def add_api_key_middleware(app, api_key: str):
         if request.headers.get("Authorization") != "Bearer " + api_key:
             return ORJSONResponse(content={"error": "Unauthorized"}, status_code=401)
         return await call_next(request)
+
+
+def set_prometheus_multiproc_dir():
+    # Set prometheus multiprocess directory before importing prometheus_client.
+    # Subprocesses inherit the env var and write their own mmap files there so
+    # the front-end /metrics endpoint can aggregate across processes.
+    global prometheus_multiproc_dir
+    if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
+        logger.debug(
+            "Reusing existing PROMETHEUS_MULTIPROC_DIR: %s",
+            os.environ["PROMETHEUS_MULTIPROC_DIR"],
+        )
+    else:
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory()
+        os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
+        logger.debug(
+            "PROMETHEUS_MULTIPROC_DIR: %s",
+            os.environ["PROMETHEUS_MULTIPROC_DIR"],
+        )
+
+
+def add_prometheus_middleware(app):
+    from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
+    from starlette.routing import Mount
+
+    registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry)
+
+    metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
+    # Workaround for 307 Redirect for /metrics.
+    metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
+    app.routes.append(metrics_route)
 
 
 def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):

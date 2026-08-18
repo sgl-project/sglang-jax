@@ -21,8 +21,14 @@ from sgl_jax.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
-from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+from sgl_jax.srt.mem_cache.common import release_kv_cache
+from sgl_jax.srt.mem_cache.memory_pool import (
+    HybridReqToTokenPool,
+    MHATokenToKVPool,
+    ReqToTokenPool,
+)
 from sgl_jax.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
 from sgl_jax.srt.mem_cache.unified_cache_components import ComponentType
 from sgl_jax.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
@@ -114,7 +120,7 @@ class TestUnifiedRadixCache(CustomTestCase):
 
         key = [1, 2, 3, 4, 5, 6, 7, 8]
         value = np.arange(100, 108, dtype=np.int32)
-        prefix_len = cache.insert(InsertParams(key=RadixKey(key), value=value))
+        prefix_len = cache.insert(InsertParams(key=RadixKey(key), value=value)).prefix_len
         self.assertEqual(prefix_len, 0)  # new inserted, no prefix
 
         # full hit returns all 8 indices
@@ -124,7 +130,7 @@ class TestUnifiedRadixCache(CustomTestCase):
         self.assertIs(match_result.best_match_node, match_result.last_device_node)
 
         # second insert of the same key matches the full prefix
-        prefix_len = cache.insert(InsertParams(key=RadixKey(key), value=value.copy()))
+        prefix_len = cache.insert(InsertParams(key=RadixKey(key), value=value.copy())).prefix_len
         self.assertEqual(prefix_len, 8)
         self.assertEqual(cache.total_size(), 8)
 
@@ -146,7 +152,7 @@ class TestUnifiedRadixCache(CustomTestCase):
 
         # inserting the diverging key reuses the 4-token shared prefix
         value2 = np.arange(200, 208, dtype=np.int32)
-        prefix_len = cache.insert(InsertParams(key=RadixKey(key2), value=value2))
+        prefix_len = cache.insert(InsertParams(key=RadixKey(key2), value=value2)).prefix_len
         self.assertEqual(prefix_len, 4)
         self.assertEqual(cache.total_size(), 12)
 
@@ -174,7 +180,7 @@ class TestUnifiedRadixCache(CustomTestCase):
         cache = self._create_unified_cache(req_pool, allocator, disable=True)
 
         key = [1, 2, 3, 4, 5]
-        insert_result = cache.insert(InsertParams(key=RadixKey(key)))
+        insert_result = cache.insert(InsertParams(key=RadixKey(key))).prefix_len
         self.assertEqual(insert_result, 0)
 
         match_result = cache.match_prefix(MatchPrefixParams(key=RadixKey(key)))
@@ -270,7 +276,9 @@ class TestUnifiedRadixCache(CustomTestCase):
             (key_c, value_c, 0),
         ):
             radix_prefix = radix.insert(InsertParams(key=RadixKey(key), value=value.copy()))
-            unified_prefix = unified.insert(InsertParams(key=RadixKey(key), value=value.copy()))
+            unified_prefix = unified.insert(
+                InsertParams(key=RadixKey(key), value=value.copy())
+            ).prefix_len
             self.assertEqual(radix_prefix, unified_prefix)
             self.assertEqual(radix_prefix, expected_prefix)
             self._assert_sizes_equal(radix, unified)
@@ -344,7 +352,9 @@ class TestUnifiedRadixCache(CustomTestCase):
         radix_prefix = radix.insert(
             InsertParams(key=RadixKey(key_a[:aligned_len]), value=value_a.copy())
         )
-        unified_prefix = unified.insert(InsertParams(key=RadixKey(key_a), value=value_a.copy()))
+        unified_prefix = unified.insert(
+            InsertParams(key=RadixKey(key_a), value=value_a.copy())
+        ).prefix_len
         self.assertEqual(radix_prefix, unified_prefix)
         self.assertEqual(radix_prefix, 0)
         self.assertEqual(unified.total_size(), 256)
@@ -365,7 +375,9 @@ class TestUnifiedRadixCache(CustomTestCase):
         radix_prefix = radix.insert(
             InsertParams(key=RadixKey(key_a[:aligned_len]), value=value_a.copy())
         )
-        unified_prefix = unified.insert(InsertParams(key=RadixKey(key_a), value=value_a.copy()))
+        unified_prefix = unified.insert(
+            InsertParams(key=RadixKey(key_a), value=value_a.copy())
+        ).prefix_len
         self.assertEqual(radix_prefix, unified_prefix)
         self.assertEqual(radix_prefix, 256)
         self._assert_sizes_equal(radix, unified)
@@ -376,7 +388,9 @@ class TestUnifiedRadixCache(CustomTestCase):
         radix_prefix = radix.insert(
             InsertParams(key=RadixKey(key_c[:aligned_len]), value=value_c.copy())
         )
-        unified_prefix = unified.insert(InsertParams(key=RadixKey(key_c), value=value_c.copy()))
+        unified_prefix = unified.insert(
+            InsertParams(key=RadixKey(key_c), value=value_c.copy())
+        ).prefix_len
         self.assertEqual(radix_prefix, unified_prefix)
         self.assertEqual(radix_prefix, 128)
         self.assertEqual(unified.total_size(), 384)
@@ -740,6 +754,1342 @@ class TestUnifiedRadixCacheWithRequests(CustomTestCase):
             disabled_cache.cache_unfinished_req(mock_req)
         except Exception as e:
             self.fail(f"cache_unfinished_req raised an exception: {e}")
+
+
+class TestUnifiedRadixCacheEffectiveCacheLen(CustomTestCase):
+    """A prepare_for_caching_req cap truncates the inserted key, or skips the insert when 0."""
+
+    def setUp(self):
+        self.kv_head_num = 8
+        self.head_dim = 64
+        self.layer_num = 2
+        self.max_seq_len = 2048
+        self.dtype = jnp.bfloat16
+        self.pool_size = 8192
+
+    def _create_stack(self):
+        req_pool = ReqToTokenPool(
+            size=1024,
+            max_context_len=self.max_seq_len,
+            dtype=np.int32,
+        )
+        kv_cache = MHATokenToKVPool(
+            size=self.pool_size,
+            page_size=1,
+            dtype=self.dtype,
+            head_num=self.kv_head_num,
+            head_dim=self.head_dim,
+            layer_num=self.layer_num,
+            mesh=mesh,
+        )
+        allocator = TokenToKVPoolAllocator(size=self.pool_size, kvcache=kv_cache)
+        cache = UnifiedRadixCache(
+            req_to_token_pool=req_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            disable=False,
+            kv_head_num=self.kv_head_num,
+            head_dim=self.head_dim,
+            layer_num=self.layer_num,
+            max_seq_len=self.max_seq_len,
+            dtype=self.dtype,
+        )
+        return req_pool, allocator, cache
+
+    @staticmethod
+    def _cap_to(cache, cl):
+        """Cap the effective cache length at ``cl``, standing in for a recurrent cap."""
+        full = cache.components[ComponentType.FULL]
+        full.prepare_for_caching_req = lambda req, insert_params, token_ids_len, is_finished: cl
+
+    def test_no_op_equivalence_unfinished_inserts_full_length(self):
+        pool, allocator, cache = self._create_stack()
+        token_ids = list(range(1, 13))
+        kv_indices = allocator.alloc(len(token_ids), dp_rank=0)
+        pool.write((0, slice(0, len(token_ids))), kv_indices)
+        req = MockRequest(
+            req_pool_idx=0,
+            origin_input_ids=list(token_ids),
+            output_ids=[],
+            fill_ids=list(token_ids),
+            prefix_indices=np.empty((0,), dtype=np.int32),
+            last_node=cache.root_node,
+        )
+        req.last_matched_prefix_len = 0
+
+        cache.cache_unfinished_req(req)
+
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids)))
+        self.assertEqual(len(match.device_indices), 12)
+        self.assertEqual(cache.total_size(), 12)
+
+    def test_no_op_equivalence_finished_inserts_full_length(self):
+        pool, allocator, cache = self._create_stack()
+        token_ids = list(range(1, 13))
+        kv_indices = allocator.alloc(len(token_ids), dp_rank=0)
+        pool.write((0, slice(0, len(token_ids))), kv_indices)
+        req = MockRequest(
+            req_pool_idx=0,
+            origin_input_ids=list(token_ids),
+            output_ids=[],
+            fill_ids=list(token_ids),
+            prefix_indices=np.empty((0,), dtype=np.int32),
+            last_node=cache.root_node,
+        )
+        req.last_matched_prefix_len = 0
+        req.kv_committed_len = len(token_ids)
+        req.kv_allocated_len = len(token_ids)
+
+        cache.cache_finished_req(req)
+
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids)))
+        self.assertEqual(len(match.device_indices), 12)
+        self.assertEqual(cache.total_size(), 12)
+
+    def test_truncation_caps_inserted_key_unfinished_keeps_tail(self):
+        pool, allocator, cache = self._create_stack()
+        token_ids = list(range(1, 13))
+        kv_indices = allocator.alloc(len(token_ids), dp_rank=0)
+        pool.write((0, slice(0, len(token_ids))), kv_indices)
+        req = MockRequest(
+            req_pool_idx=0,
+            origin_input_ids=list(token_ids),
+            output_ids=[],
+            fill_ids=list(token_ids),
+            prefix_indices=np.empty((0,), dtype=np.int32),
+            last_node=cache.root_node,
+        )
+        req.last_matched_prefix_len = 0
+
+        avail_before = allocator.available_size(0)
+        self._cap_to(cache, 8)
+        cache.cache_unfinished_req(req)
+
+        self.assertEqual(cache.total_size(), 8)
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids[:8])))
+        self.assertEqual(len(match.device_indices), 8)
+        full_match = cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids)))
+        self.assertEqual(len(full_match.device_indices), 8)
+        self.assertEqual(req.cache_protected_len, 8)
+        self.assertEqual(allocator.available_size(0), avail_before)
+        self.assertEqual(len(req.prefix_indices), 12)
+
+    def test_truncation_caps_inserted_key_and_frees_tail_finished(self):
+        pool, allocator, cache = self._create_stack()
+        token_ids = list(range(1, 13))
+        kv_indices = allocator.alloc(len(token_ids), dp_rank=0)
+        pool.write((0, slice(0, len(token_ids))), kv_indices)
+        req = MockRequest(
+            req_pool_idx=0,
+            origin_input_ids=list(token_ids),
+            output_ids=[],
+            fill_ids=list(token_ids),
+            prefix_indices=np.empty((0,), dtype=np.int32),
+            last_node=cache.root_node,
+        )
+        req.last_matched_prefix_len = 0
+        req.kv_committed_len = len(token_ids)
+        req.kv_allocated_len = len(token_ids)
+
+        avail_before = allocator.available_size(0)
+        self._cap_to(cache, 8)
+        cache.cache_finished_req(req)
+
+        self.assertEqual(cache.total_size(), 8)
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids[:8])))
+        self.assertEqual(len(match.device_indices), 8)
+        self.assertEqual(allocator.available_size(0), avail_before + 4)
+
+    def test_skip_insert_on_zero_unfinished(self):
+        pool, allocator, cache = self._create_stack()
+        token_ids = list(range(1, 13))
+        kv_indices = allocator.alloc(len(token_ids), dp_rank=0)
+        pool.write((0, slice(0, len(token_ids))), kv_indices)
+        req = MockRequest(
+            req_pool_idx=0,
+            origin_input_ids=list(token_ids),
+            output_ids=[],
+            fill_ids=list(token_ids),
+            prefix_indices=np.empty((0,), dtype=np.int32),
+            last_node=cache.root_node,
+        )
+        req.last_matched_prefix_len = 0
+        req.cache_protected_len = 0
+
+        cleanup_calls = []
+        full = cache.components[ComponentType.FULL]
+        orig_cleanup = full.cleanup_after_caching_req
+        full.cleanup_after_caching_req = lambda *a, **k: cleanup_calls.append(True) or orig_cleanup(
+            *a, **k
+        )
+
+        avail_before = allocator.available_size(0)
+        self._cap_to(cache, 0)
+        cache.cache_unfinished_req(req)
+
+        self.assertEqual(cache.total_size(), 0)
+        self.assertIs(req.last_node, cache.root_node)
+        self.assertTrue(cleanup_calls)
+        self.assertEqual(allocator.available_size(0), avail_before)
+        self.assertEqual(req.cache_protected_len, 0)
+        # Leak fix: prefix_indices advanced to the committed KV, not left stale.
+        np.testing.assert_array_equal(req.prefix_indices, kv_indices)
+        req.kv_committed_len = len(token_ids)
+        req.kv_allocated_len = len(token_ids)
+        self._cap_to(cache, 0)
+        cache.cache_finished_req(req)
+        self.assertEqual(allocator.available_size(0), avail_before + len(token_ids))
+
+    def test_skip_insert_on_zero_unfinished_preserves_protected_prefix(self):
+        pool, allocator, cache = self._create_stack()
+        token_ids = list(range(1, 13))
+        kv_indices = allocator.alloc(len(token_ids), dp_rank=0)
+        pool.write((0, slice(0, len(token_ids))), kv_indices)
+        req = MockRequest(
+            req_pool_idx=0,
+            origin_input_ids=list(token_ids),
+            output_ids=[],
+            fill_ids=list(token_ids),
+            prefix_indices=np.empty((0,), dtype=np.int32),
+            last_node=cache.root_node,
+        )
+        req.last_matched_prefix_len = 4
+        req.cache_protected_len = 4
+
+        avail_before = allocator.available_size(0)
+        self._cap_to(cache, 0)
+        cache.cache_unfinished_req(req)
+
+        self.assertEqual(cache.total_size(), 0)
+        self.assertEqual(allocator.available_size(0), avail_before)
+        self.assertEqual(req.cache_protected_len, 4)
+        np.testing.assert_array_equal(req.prefix_indices, kv_indices)
+        req.kv_committed_len = len(token_ids)
+        req.kv_allocated_len = len(token_ids)
+        self._cap_to(cache, 0)
+        cache.cache_finished_req(req)
+        self.assertEqual(allocator.available_size(0), avail_before + (len(token_ids) - 4))
+
+    def test_skip_insert_on_zero_finished(self):
+        pool, allocator, cache = self._create_stack()
+        token_ids = list(range(1, 13))
+        kv_indices = allocator.alloc(len(token_ids), dp_rank=0)
+        pool.write((0, slice(0, len(token_ids))), kv_indices)
+        req = MockRequest(
+            req_pool_idx=0,
+            origin_input_ids=list(token_ids),
+            output_ids=[],
+            fill_ids=list(token_ids),
+            prefix_indices=np.empty((0,), dtype=np.int32),
+            last_node=cache.root_node,
+        )
+        req.last_matched_prefix_len = 0
+        req.kv_committed_len = len(token_ids)
+        req.kv_allocated_len = len(token_ids)
+        req.cache_protected_len = 0
+
+        avail_before = allocator.available_size(0)
+        self._cap_to(cache, 0)
+        cache.cache_finished_req(req)
+
+        self.assertEqual(cache.total_size(), 0)
+        self.assertEqual(allocator.available_size(0), avail_before + 12)
+
+    def test_zero_cache_len_skip_then_continuation_extends_without_overlap(self):
+        # A stale prefix after an off-boundary skip would re-extend over round 1's
+        # pages and orphan them (round 2 continues without re-matching).
+        pool, allocator, cache = self._create_stack()
+        token_ids = list(range(1, 13))  # 12-token prompt, chunked 6 + 6
+        avail_start = allocator.available_size(0)
+
+        # --- round 1: off-boundary skip ---
+        chunk1 = allocator.alloc(6, dp_rank=0)
+        pool.write((0, slice(0, 6)), chunk1)
+        req = MockRequest(
+            req_pool_idx=0,
+            origin_input_ids=list(token_ids),
+            output_ids=[],
+            fill_ids=list(token_ids[:6]),
+            prefix_indices=np.empty((0,), dtype=np.int32),
+            last_node=cache.root_node,
+        )
+        req.last_matched_prefix_len = 0
+        req.cache_protected_len = 0
+
+        self._cap_to(cache, 0)
+        cache.cache_unfinished_req(req)
+
+        np.testing.assert_array_equal(req.prefix_indices, chunk1)
+
+        # --- round 2: continuation (mirrors prepare_for_extend) ---
+        offset = len(req.prefix_indices)
+        extend_len = len(token_ids) - offset
+        self.assertEqual(offset, 6)
+        self.assertEqual(extend_len, 6)
+        chunk2 = allocator.alloc(extend_len, dp_rank=0)
+        self.assertEqual(set(chunk1.tolist()) & set(chunk2.tolist()), set())
+        pool.write((0, slice(offset, offset + extend_len)), chunk2)
+        req.fill_ids = list(token_ids)
+
+        # --- finish ---
+        req.kv_committed_len = len(token_ids)
+        req.kv_allocated_len = len(token_ids)
+        self._cap_to(cache, 0)
+        cache.cache_finished_req(req)
+        self.assertEqual(allocator.available_size(0), avail_start)
+
+
+class _CowReq:
+    """Minimal Req surrogate for recurrent CoW match recording."""
+
+    def __init__(self, dp_rank=0):
+        self.dp_rank = dp_rank
+        self.recurrent_cow_src_index = None
+
+
+class _ReleaseReq:
+    """Req surrogate with a request-owned recurrent slot for release_kv_cache."""
+
+    def __init__(self, req_pool_idx, recurrent_pool_idx, origin_input_ids, dp_rank=0):
+        self.req_pool_idx = req_pool_idx
+        self.recurrent_pool_idx = recurrent_pool_idx
+        self.origin_input_ids = list(origin_input_ids)
+        self.output_ids = []
+        self.fill_ids = list(origin_input_ids)
+        self.dp_rank = dp_rank
+        self.extra_key = None
+        self.last_node = None
+        self.rid = "release-req"
+        self.kv_committed_len = len(origin_input_ids)
+        self.kv_allocated_len = self.kv_committed_len
+        self.cache_protected_len = 0
+        self.last_matched_prefix_len = 0
+        self.kv_committed_freed = False
+        self.kv_overallocated_freed = False
+
+    def pop_committed_kv_cache(self) -> int:
+        assert not self.kv_committed_freed
+        self.kv_committed_freed = True
+        return self.kv_committed_len
+
+    def pop_overallocated_kv_cache(self):
+        assert not self.kv_overallocated_freed
+        self.kv_overallocated_freed = True
+        return self.kv_committed_len, self.kv_allocated_len
+
+
+class _RunningRecurrentReq:
+    """Req surrogate for a running recurrent request mid chunked-prefill."""
+
+    def __init__(self, req_pool_idx, recurrent_pool_idx, fill_ids, dp_rank=0):
+        self.req_pool_idx = req_pool_idx
+        self.recurrent_pool_idx = recurrent_pool_idx
+        self.origin_input_ids = list(fill_ids)
+        self.output_ids = []
+        self.fill_ids = list(fill_ids)
+        self.dp_rank = dp_rank
+        self.extra_key = None
+        self.last_node = None
+        self.rid = "running-rec"
+        self.prefix_indices = np.empty((0,), dtype=np.int32)
+        self.cache_protected_len = 0
+        self.last_matched_prefix_len = 0
+        self.recurrent_cow_src_index = None
+        self.kv_committed_freed = False
+        self.kv_overallocated_freed = False
+
+
+class TestUnifiedRadixCacheRecurrent(CustomTestCase):
+    """Cache-level recurrent component behavior at page_size=1."""
+
+    def setUp(self):
+        self.kv_head_num = 8
+        self.head_dim = 64
+        self.layer_num = 2
+        self.max_seq_len = 2048
+        self.dtype = jnp.bfloat16
+        self.pool_size = 8192
+        self.recurrent_size = 8
+        self.rec_num_heads = 8
+        self.rec_head_dim = 16
+        self.conv_kernel_size = 4
+
+    def _create_recurrent_setup(self, dp_size: int = 1):
+        state_pool = RecurrentStatePool(
+            linear_recurrent_layer_ids=[0, 1],
+            size=self.recurrent_size,
+            num_heads=self.rec_num_heads,
+            head_dim=self.rec_head_dim,
+            conv_kernel_size=self.conv_kernel_size,
+            mesh=mesh,
+            dp_size=dp_size,
+        )
+        hybrid_pool = HybridReqToTokenPool(
+            size=64,
+            max_context_len=self.max_seq_len,
+            dtype=np.int32,
+            recurrent_state_pool=state_pool,
+            dp_size=dp_size,
+        )
+        kv_cache = MHATokenToKVPool(
+            size=self.pool_size,
+            page_size=1,
+            dtype=self.dtype,
+            head_num=self.kv_head_num,
+            head_dim=self.head_dim,
+            layer_num=self.layer_num,
+            mesh=mesh,
+            dp_size=dp_size,
+        )
+        allocator = TokenToKVPoolAllocator(size=self.pool_size, kvcache=kv_cache, dp_size=dp_size)
+        cache = UnifiedRadixCache(
+            req_to_token_pool=hybrid_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            disable=False,
+            kv_head_num=self.kv_head_num,
+            head_dim=self.head_dim,
+            layer_num=self.layer_num,
+            max_seq_len=self.max_seq_len,
+            dtype=self.dtype,
+            tree_components=(ComponentType.FULL, ComponentType.RECURRENT),
+        )
+        return state_pool, hybrid_pool, allocator, cache
+
+    def _commit(self, cache, pool, key, value):
+        """Donate a running slot to the tree via insert (mirrors cache_finished_req)."""
+        slot = pool.alloc_recurrent_slot(0)
+        params = InsertParams(
+            key=RadixKey(key, None, 0),
+            value=value,
+            recurrent_value=pool.recurrent_value_from_slot(slot),
+        )
+        result = cache.insert(params)
+        return slot, result
+
+    def _admit(self, cache, allocator, pool, key, dp_rank=0):
+        """Admit a running request the way prefill does, so release can free it."""
+        req = _ReleaseReq(
+            req_pool_idx=None, recurrent_pool_idx=None, origin_input_ids=key, dp_rank=dp_rank
+        )
+        pool.alloc([req])  # assigns req_pool_idx + a recurrent running slot
+        kv_indices = allocator.alloc(len(key), dp_rank=dp_rank)
+        self.assertIsNotNone(kv_indices)
+        pool.write((req.req_pool_idx, slice(0, len(key))), kv_indices)
+        req.last_node = cache.root_node
+        return req
+
+    def test_supports_recurrent(self):
+        _, _, _, cache = self._create_recurrent_setup()
+        self.assertTrue(cache.supports_recurrent())
+
+    def test_commit_match_cow_evict_ledger(self):
+        state_pool, pool, _, cache = self._create_recurrent_setup()
+        slots = pool.slots_per_rank
+
+        key = [1, 2, 3, 4]
+        value = np.arange(100, 104, dtype=np.int32)
+        slot, result = self._commit(cache, pool, key, value)
+
+        self.assertTrue(result.recurrent_committed)
+        self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 1)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0), 0)
+        self.assertEqual(pool.recurrent_available_size(0), slots - 1)
+
+        req = _CowReq(dp_rank=0)
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(key, None, 0), cow_recurrent=True, req=req)
+        )
+        self.assertTrue(np.array_equal(match.device_indices, value))
+        self.assertEqual(req.recurrent_cow_src_index, slot)
+
+        evict_result = cache.evict(EvictParams(recurrent_num=1, dp_rank=0))
+        self.assertEqual(evict_result.recurrent_num_evicted, 1)
+        self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 0)
+        self.assertEqual(pool.recurrent_available_size(0), slots)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0), 0)
+
+    def test_match_reaches_snapshot_past_snapshotless_interior_node(self):
+        """The device walk must skip interior nodes without a recurrent snapshot
+        (leaf-only invariant frees them) and match the deeper snapshot leaf."""
+        _, pool, _, cache = self._create_recurrent_setup()
+
+        key = [1, 2, 3, 4, 5, 6, 7, 8]
+        full_value = np.arange(100, 108, dtype=np.int32)
+        self._commit(cache, pool, key[:4], full_value[:4])
+        slot2, second = self._commit(cache, pool, key, full_value)
+        self.assertTrue(second.recurrent_committed)
+        # The first boundary node turned interior; its snapshot was freed.
+        self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 1)
+
+        # Cross-request share: same 8-token prefix, diverging tail.
+        req = _CowReq(dp_rank=0)
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(key + [99], None, 0), cow_recurrent=True, req=req)
+        )
+        self.assertTrue(np.array_equal(match.device_indices, full_value))
+        self.assertEqual(req.recurrent_cow_src_index, slot2)
+
+    def test_abort_and_retract_release_recurrent_slots(self):
+        """Abort and retract must return request-owned recurrent slots to the free list."""
+        state_pool, pool, allocator, cache = self._create_recurrent_setup()
+        slots = pool.slots_per_rank
+
+        # A committed leaf makes the aborted request's sequence a duplicate, so
+        # its running slot is freed rather than donated.
+        committed_key = [1, 2, 3, 4]
+        committed_val = np.arange(100, 104, dtype=np.int32)
+        _, commit_res = self._commit(cache, pool, committed_key, committed_val)
+        self.assertTrue(commit_res.recurrent_committed)
+        self.assertEqual(pool.recurrent_available_size(0), slots - 1)
+
+        abort_req = self._admit(cache, allocator, pool, committed_key)  # duplicate seq
+        retract_req = self._admit(cache, allocator, pool, [9, 10, 11])  # distinct seq
+        self.assertIsNotNone(abort_req.recurrent_pool_idx)
+        self.assertIsNotNone(retract_req.recurrent_pool_idx)
+        self.assertEqual(pool.recurrent_available_size(0), slots - 3)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0), 2)
+
+        release_kv_cache(abort_req, cache, is_insert=True)
+        self.assertIsNone(abort_req.recurrent_pool_idx)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0), 1)
+
+        release_kv_cache(retract_req, cache, is_insert=False)
+        self.assertIsNone(retract_req.recurrent_pool_idx)
+
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0), 0)
+        self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 1)
+        self.assertEqual(pool.recurrent_available_size(0), slots - 1)
+
+        evict_result = cache.evict(EvictParams(recurrent_num=1, dp_rank=0))
+        self.assertEqual(evict_result.recurrent_num_evicted, 1)
+        self.assertEqual(pool.recurrent_available_size(0), slots)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0), 0)
+
+    def test_continuation_match_hits_committed_leaf(self):
+        """A prompt extending a committed sequence stops on the leaf and records the CoW src."""
+        state_pool, pool, _, cache = self._create_recurrent_setup()
+        key = [1, 2, 3, 4, 5, 6, 7, 8]
+        value = np.arange(200, 208, dtype=np.int32)
+        slot, result = self._commit(cache, pool, key, value)
+        self.assertTrue(result.recurrent_committed)
+
+        req = _CowReq(dp_rank=0)
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(key + [9, 10], None, 0), cow_recurrent=True, req=req)
+        )
+        self.assertTrue(np.array_equal(match.device_indices, value))
+        self.assertEqual(req.recurrent_cow_src_index, slot)
+
+    def test_page1_running_recurrent_chunked_continuation_full_only_preserves_prefix(self):
+        """A running request's re-match must use full_only=True, else the leaf-only
+        recurrent validator collapses its cached FULL prefix to root."""
+        state_pool, pool, allocator, cache = self._create_recurrent_setup()
+
+        chunk1 = list(range(1, 9))
+        req = _RunningRecurrentReq(req_pool_idx=None, recurrent_pool_idx=None, fill_ids=chunk1)
+        pool.alloc([req])  # assigns req_pool_idx + a running recurrent slot
+        self.assertIsNotNone(req.recurrent_pool_idx)
+        running_slot = req.recurrent_pool_idx
+        # active=1 (this running req), tree_owned=0, free=slots-1.
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0, live_reqs=[req]), 1)
+
+        kv1 = allocator.alloc(len(chunk1), dp_rank=0)
+        self.assertIsNotNone(kv1)
+        pool.write((req.req_pool_idx, slice(0, len(chunk1))), kv1)
+        req.last_node = cache.root_node
+        cache.cache_unfinished_req(req)
+
+        # Unfinished caching donates nothing: the cached FULL nodes hold no
+        # recurrent value.
+        self.assertEqual(req.recurrent_pool_idx, running_slot)
+        self.assertEqual(req.cache_protected_len, len(chunk1))
+        self.assertEqual(len(req.prefix_indices), len(chunk1))
+        self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 0)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0, live_reqs=[req]), 1)
+
+        prefix_key = RadixKey(chunk1, None, 0)
+
+        # (a) fixed params preserve the FULL prefix
+        cow_probe = _CowReq(dp_rank=0)
+        fixed = cache.match_prefix(
+            MatchPrefixParams(key=prefix_key, full_only=True, cow_recurrent=False, req=cow_probe)
+        )
+        self.assertEqual(len(fixed.device_indices), len(chunk1))
+        self.assertTrue(np.array_equal(fixed.device_indices, np.asarray(req.prefix_indices)))
+        self.assertIsNone(cow_probe.recurrent_cow_src_index)
+
+        # (b) a fresh prefill's params collapse the match to root
+        wrong_probe = _CowReq(dp_rank=0)
+        wrong = cache.match_prefix(
+            MatchPrefixParams(key=prefix_key, full_only=False, cow_recurrent=True, req=wrong_probe)
+        )
+        self.assertEqual(len(wrong.device_indices), 0)
+        self.assertIsNone(wrong_probe.recurrent_cow_src_index)
+
+        # (c) second continuation
+        chunk2 = list(range(9, 13))
+        req.fill_ids = chunk1 + chunk2
+        kv2 = allocator.alloc(len(chunk2), dp_rank=0)
+        self.assertIsNotNone(kv2)
+        pool.write((req.req_pool_idx, slice(len(chunk1), len(chunk1) + len(chunk2))), kv2)
+        protected_before = req.cache_protected_len
+        cache.cache_unfinished_req(req)
+
+        self.assertEqual(req.cache_protected_len, len(chunk1) + len(chunk2))
+        self.assertGreater(req.cache_protected_len, protected_before)
+        self.assertEqual(len(req.prefix_indices), len(chunk1) + len(chunk2))
+        self.assertEqual(req.recurrent_pool_idx, running_slot)
+        self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 0)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0, live_reqs=[req]), 1)
+
+        full_key = RadixKey(chunk1 + chunk2, None, 0)
+        again = cache.match_prefix(MatchPrefixParams(key=full_key, full_only=True))
+        self.assertEqual(len(again.device_indices), len(chunk1) + len(chunk2))
+
+    def test_shorter_match_misses_recurrent_leaf(self):
+        """A match stopping one token short of the leaf (identical-prompt resubmit)
+        lands on a recurrent-less split parent and falls back to root."""
+        state_pool, pool, _, cache = self._create_recurrent_setup()
+        key = [1, 2, 3, 4, 5, 6, 7, 8]
+        value = np.arange(200, 208, dtype=np.int32)
+        slot, result = self._commit(cache, pool, key, value)
+        self.assertTrue(result.recurrent_committed)
+
+        req = _CowReq(dp_rank=0)
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(key[:-1], None, 0), cow_recurrent=True, req=req)
+        )
+        self.assertEqual(len(match.device_indices), 0)
+        self.assertIsNone(req.recurrent_cow_src_index)
+
+    def test_hicache_tombstone_blocks_recurrent_match(self):
+        """hicache x recurrent: a tombstone (FULL on host, recurrent state freed at
+        eviction) stops BOTH walks — no host hit, no CoW src — so the host tier
+        never serves a prefix whose recurrent state is gone."""
+        state_pool, pool, _, cache = self._create_recurrent_setup()
+        key = [1, 2, 3, 4]
+        value = np.arange(100, 104, dtype=np.int32)
+        slot, result = self._commit(cache, pool, key, value)
+        self.assertTrue(result.recurrent_committed)
+
+        probe = cache.match_prefix(MatchPrefixParams(key=RadixKey(key, None, 0)))
+        node = probe.last_device_node
+
+        # Minimal hicache wiring + the tombstone state _evict_device_leaf leaves
+        # behind after a D2H backup (host copy kept, device value + recurrent freed).
+        cache.hicache_enabled = True
+        cache.write_policy = "write_through"
+        node.component_data[ComponentType.FULL].host_value = np.arange(4, dtype=np.int32)
+        tracker = {ct: 0 for ct in cache.tree_components}
+        cache._evict_device_leaf(node, tracker)
+
+        self.assertIsNone(node.component_data[ComponentType.FULL].value)
+        self.assertIsNotNone(node.component_data[ComponentType.FULL].host_value)
+        self.assertIsNone(node.component_data[ComponentType.RECURRENT].value)
+        self.assertEqual(pool.recurrent_available_size(0), pool.slots_per_rank)
+
+        req = _CowReq(dp_rank=0)
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(key, None, 0), cow_recurrent=True, req=req)
+        )
+        self.assertEqual(len(match.device_indices), 0)
+        self.assertEqual(match.host_hit_length, 0)
+        self.assertIsNone(req.recurrent_cow_src_index)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0), 0)
+
+    def test_shorter_prefix_after_longer_skips_internal(self):
+        """Committing on an internal node is skipped (leaf-only); the caller frees the slot."""
+        state_pool, pool, _, cache = self._create_recurrent_setup()
+
+        long_key = [1, 2, 3, 4]
+        long_val = np.arange(10, 14, dtype=np.int32)
+        long_slot, long_res = self._commit(cache, pool, long_key, long_val)
+        self.assertTrue(long_res.recurrent_committed)
+
+        short_key = [1, 2]
+        short_val = np.arange(20, 22, dtype=np.int32)
+        short_slot, short_res = self._commit(cache, pool, short_key, short_val)
+
+        self.assertFalse(short_res.recurrent_committed)
+        self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 1)
+        pool.free_recurrent_slot(short_slot, 0)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0), 0)
+
+    def test_lock_protects_recurrent_leaf(self):
+        state_pool, pool, _, cache = self._create_recurrent_setup()
+        key = [7, 8, 9, 10]
+        value = np.arange(50, 54, dtype=np.int32)
+        slot, _ = self._commit(cache, pool, key, value)
+
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(key, None, 0)))
+        leaf = match.last_device_node
+        lock_result = cache.inc_lock_ref(leaf)
+
+        self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 0)
+        self.assertEqual(cache.component_protected_size_[ComponentType.RECURRENT][0], 1)
+
+        evict_result = cache.evict(EvictParams(recurrent_num=1, dp_rank=0))
+        self.assertEqual(evict_result.recurrent_num_evicted, 0)
+
+        cache.dec_lock_ref(leaf, lock_result.to_dec_params())
+        self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 1)
+        self.assertEqual(cache.component_protected_size_[ComponentType.RECURRENT][0], 0)
+        evict_result = cache.evict(EvictParams(recurrent_num=1, dp_rank=0))
+        self.assertEqual(evict_result.recurrent_num_evicted, 1)
+        self.assertEqual(pool.recurrent_available_size(0), pool.slots_per_rank)
+
+    def test_longer_prefix_after_shorter_frees_parent(self):
+        """A leaf turning internal drops its recurrent slot instead of stranding it."""
+        state_pool, pool, _, cache = self._create_recurrent_setup()
+        slots = pool.slots_per_rank
+
+        ab_slot, ab_res = self._commit(cache, pool, [1, 2], np.arange(10, 12, dtype=np.int32))
+        self.assertTrue(ab_res.recurrent_committed)
+        _, abcd_res = self._commit(cache, pool, [1, 2, 3, 4], np.arange(20, 24, dtype=np.int32))
+        self.assertTrue(abcd_res.recurrent_committed)
+
+        self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 1)
+        self.assertEqual(pool.recurrent_available_size(0), slots - 1)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0), 0)
+
+        evict_result = cache.evict(EvictParams(recurrent_num=1, dp_rank=0))
+        self.assertEqual(evict_result.recurrent_num_evicted, 1)
+        self.assertEqual(pool.recurrent_available_size(0), slots)
+
+    def test_internal_transition_while_locked_frees_on_unlock(self):
+        """A locked node turning internal defers the recurrent free to the final unlock."""
+        state_pool, pool, _, cache = self._create_recurrent_setup()
+        self._commit(cache, pool, [1, 2], np.arange(10, 12, dtype=np.int32))
+        ab = cache.match_prefix(MatchPrefixParams(key=RadixKey([1, 2], None, 0))).last_device_node
+
+        lock = cache.inc_lock_ref(ab)
+        self.assertEqual(cache.component_protected_size_[ComponentType.RECURRENT][0], 1)
+
+        self._commit(cache, pool, [1, 2, 3, 4], np.arange(20, 24, dtype=np.int32))
+        self.assertIsNotNone(ab.component_data[ComponentType.RECURRENT].value)
+        free_before = pool.recurrent_available_size(0)
+
+        cache.dec_lock_ref(ab, lock.to_dec_params())
+        self.assertIsNone(ab.component_data[ComponentType.RECURRENT].value)
+        self.assertEqual(pool.recurrent_available_size(0), free_before + 1)
+        self.assertEqual(cache.component_protected_size_[ComponentType.RECURRENT][0], 0)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0), 0)
+
+    def test_copy_slots_bitwise_clone_all_layers(self):
+        """copy_slots clones src->dst bitwise across all layers; src==0 rows are no-ops."""
+        state_pool, _, _, _ = self._create_recurrent_setup()
+        src, dst = 2, 5
+
+        # out_sharding is required because the test runs under an explicit mesh.
+        rec_spec = state_pool.recurrent_sharding.spec
+        conv_spec = state_pool.conv_sharding.spec
+        for layer in range(state_pool.num_linear_recurrent_layers):
+            state_pool.recurrent_buffers[layer] = (
+                state_pool.recurrent_buffers[layer]
+                .at[src]
+                .set(float(layer + 1), out_sharding=rec_spec)
+            )
+            state_pool.conv_buffers[layer][0] = (
+                state_pool.conv_buffers[layer][0]
+                .at[src]
+                .set(float(layer + 7), out_sharding=conv_spec)
+            )
+
+        # Mirror production: P("data")-sharded indices + jit, so shard_map in_specs match.
+        data_sh = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data"))
+        src_idx = jax.device_put(np.array([src], dtype=np.int32), data_sh)
+        dst_idx = jax.device_put(np.array([dst], dtype=np.int32), data_sh)
+        copy = jax.jit(state_pool.copy_slots)
+        new_rec, new_conv = copy(src_idx, dst_idx)
+
+        for layer in range(state_pool.num_linear_recurrent_layers):
+            rec = np.asarray(new_rec[layer])
+            conv = np.asarray(new_conv[layer][0])
+            src_rec = np.asarray(state_pool.recurrent_buffers[layer])[src]
+            src_conv = np.asarray(state_pool.conv_buffers[layer][0])[src]
+            np.testing.assert_array_equal(rec[dst], src_rec)
+            np.testing.assert_array_equal(conv[dst], src_conv)
+            np.testing.assert_array_equal(rec[src], src_rec)
+
+        zero_idx = jax.device_put(np.array([0], dtype=np.int32), data_sh)
+        noop_rec, _ = copy(zero_idx, dst_idx)
+        for layer in range(state_pool.num_linear_recurrent_layers):
+            dst_before = np.asarray(state_pool.recurrent_buffers[layer])[dst]
+            np.testing.assert_array_equal(np.asarray(noop_rec[layer])[dst], dst_before)
+
+    def test_copy_slots_multi_dp_locality(self):
+        """src/dst are per-rank-LOCAL indices; clones must not cross DP shards."""
+        dp_mesh = create_device_mesh(ici_parallelism=[2, -1], dcn_parallelism=[1, 1])
+        with jax.sharding.set_mesh(dp_mesh):
+            state_pool = RecurrentStatePool(
+                linear_recurrent_layer_ids=[0],
+                size=8,  # 4 slots/rank, total_slots=10 (rank0 rows 0-4, rank1 5-9)
+                num_heads=8,
+                head_dim=16,
+                conv_kernel_size=self.conv_kernel_size,
+                mesh=dp_mesh,
+                dp_size=2,
+            )
+            buf = state_pool.recurrent_buffers[0]
+            # Seed global row i = i so each rank's local slot has distinct data.
+            seed = np.broadcast_to(
+                np.arange(buf.shape[0], dtype=np.float32).reshape(-1, 1, 1, 1), buf.shape
+            )
+            state_pool.recurrent_buffers[0] = jax.device_put(
+                seed.astype(np.asarray(buf).dtype), state_pool.recurrent_sharding
+            )
+
+            data_sh = jax.sharding.NamedSharding(dp_mesh, jax.sharding.PartitionSpec("data"))
+            # Both ranks clone local 2 -> local 3 (global 2->3 on rank0, 7->8 on rank1).
+            src = jax.device_put(np.array([2, 2], dtype=np.int32), data_sh)
+            dst = jax.device_put(np.array([3, 3], dtype=np.int32), data_sh)
+            new_rec, _ = jax.jit(state_pool.copy_slots)(src, dst)
+            rec = np.asarray(new_rec[0])
+
+        # Cross-rank leakage would make global row 3 read 7.0 (or vice versa).
+        self.assertEqual(float(rec[3].reshape(-1)[0]), 2.0)
+        self.assertEqual(float(rec[8].reshape(-1)[0]), 7.0)
+
+
+class _ExtraBufferReq:
+    """Req surrogate carrying the extra-buffer ping-pong fields, enough to drive
+    RecurrentComponent.prepare/cleanup directly (extra-buffer page>=128 path)."""
+
+    def __init__(self, dp_rank=0):
+        self.dp_rank = dp_rank
+        self.req_pool_idx = None
+        self.recurrent_pool_idx = None
+        self.recurrent_ping_pong_track_buffer = None
+        self.recurrent_next_track_idx = None
+        self.recurrent_last_track_seqlen = None
+        self.recurrent_cow_src_index = None
+
+
+class _AllocReq:
+    """Minimal Req surrogate for ScheduleBatch.alloc_req_slots demand counting
+    (carries the fields HybridReqToTokenPool.alloc reads)."""
+
+    def __init__(self, dp_rank=0, recurrent_pool_idx=None):
+        self.dp_rank = dp_rank
+        self.recurrent_pool_idx = recurrent_pool_idx
+        self.req_pool_idx = None
+        self.is_chunked = 0
+        self.kv_committed_len = 0
+        self.recurrent_ping_pong_track_buffer = None
+        self.recurrent_next_track_idx = None
+        self.recurrent_last_track_seqlen = None
+
+
+class TestUnifiedRadixCacheRecurrentExtraBuffer(CustomTestCase):
+    """Extra-buffer (page>=128) recurrent commit/donation: prepare caps the key at
+    the materialized boundary; cleanup commits the KEEP ping-pong slot (finished)
+    or donates it with a secured replacement (unfinished). Ledger balanced after
+    every transition. Slot-shortfall eviction reclaims 3x the new reqs."""
+
+    def setUp(self):
+        self.max_seq_len = 2048
+        self.dtype = jnp.bfloat16
+        self.pool_size = 8192
+        self.kv_head_num = 8
+        self.head_dim = 64
+        self.layer_num = 2
+        self.recurrent_size = 24  # global recurrent slots (3 per req leaves room)
+        self.rec_num_heads = 8
+        self.rec_head_dim = 16
+        self.conv_kernel_size = 4
+        self.track_interval = 128
+
+    def _create_setup(self, dp_size=1, recurrent_size=None, ping_pong_slots=2):
+        recurrent_size = recurrent_size or self.recurrent_size
+        state_pool = RecurrentStatePool(
+            linear_recurrent_layer_ids=[0, 1],
+            size=recurrent_size,
+            num_heads=self.rec_num_heads,
+            head_dim=self.rec_head_dim,
+            conv_kernel_size=self.conv_kernel_size,
+            mesh=mesh,
+            dp_size=dp_size,
+        )
+        hybrid_pool = HybridReqToTokenPool(
+            size=64,
+            max_context_len=self.max_seq_len,
+            dtype=np.int32,
+            recurrent_state_pool=state_pool,
+            dp_size=dp_size,
+            enable_recurrent_extra_buffer=True,
+            ping_pong_slots=ping_pong_slots,
+        )
+        kv_cache = MHATokenToKVPool(
+            size=self.pool_size,
+            page_size=1,
+            dtype=self.dtype,
+            head_num=self.kv_head_num,
+            head_dim=self.head_dim,
+            layer_num=self.layer_num,
+            mesh=mesh,
+            dp_size=dp_size,
+        )
+        allocator = TokenToKVPoolAllocator(size=self.pool_size, kvcache=kv_cache, dp_size=dp_size)
+        cache = UnifiedRadixCache(
+            req_to_token_pool=hybrid_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            disable=False,
+            kv_head_num=self.kv_head_num,
+            head_dim=self.head_dim,
+            layer_num=self.layer_num,
+            max_seq_len=self.max_seq_len,
+            dtype=self.dtype,
+            tree_components=(ComponentType.FULL, ComponentType.RECURRENT),
+            enable_recurrent_extra_buffer=True,
+            recurrent_track_interval=self.track_interval,
+        )
+        return state_pool, hybrid_pool, allocator, cache
+
+    @staticmethod
+    def _admit(pool, dp_rank=0):
+        """Allocate a req (running + 2 track slots under extra-buffer)."""
+        req = _ExtraBufferReq(dp_rank=dp_rank)
+        pool.alloc([req])
+        return req
+
+    @staticmethod
+    def _simulate_boundary_scatter(pool, req, final_seq_len):
+        """Mirror _recurrent_track_entry: the scatter writes the slot at
+        next_track_idx, sets the watermark, then flips next_track_idx. The keep
+        slot afterward is the one just written."""
+        idx = req.recurrent_next_track_idx
+        req.recurrent_last_track_seqlen = final_seq_len
+        req.recurrent_next_track_idx = pool.get_recurrent_ping_pong_other_idx(idx)
+        return req.recurrent_ping_pong_track_buffer[idx]
+
+    def _component(self, cache):
+        return cache.components[ComponentType.RECURRENT]
+
+    # --- Case 1: prepare caps the key at the materialized boundary ---
+
+    def test_prepare_returns_watermark_caps_inserted_key(self):
+        _, pool, _, cache = self._create_setup()
+        comp = self._component(cache)
+        req = self._admit(pool)
+        self._simulate_boundary_scatter(pool, req, final_seq_len=256)
+
+        params = InsertParams()
+        cap = comp.prepare_for_caching_req(req, params, token_ids_len=300, is_finished=True)
+        self.assertEqual(cap, 256)
+        self.assertIsNotNone(params.recurrent_value)
+
+    def test_prepare_returns_zero_when_no_boundary(self):
+        _, pool, _, cache = self._create_setup()
+        comp = self._component(cache)
+        req = self._admit(pool)  # recurrent_last_track_seqlen stays None
+        self.assertIsNone(req.recurrent_last_track_seqlen)
+
+        params = InsertParams()
+        cap = comp.prepare_for_caching_req(req, params, token_ids_len=100, is_finished=True)
+        self.assertEqual(cap, 0)
+        self.assertIsNone(params.recurrent_value)
+
+    # --- Case 2: finished commit uses the KEEP slot; cleanup balances ---
+
+    def test_finished_commit_uses_keep_slot_then_frees_running_and_other(self):
+        _, pool, _, cache = self._create_setup()
+        comp = self._component(cache)
+        slots = pool.slots_per_rank
+        req = self._admit(pool)
+        running = req.recurrent_pool_idx
+        keep_slot = self._simulate_boundary_scatter(pool, req, final_seq_len=128)
+        # 3 request-owned slots (running + 2 track), no tree-owned yet.
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0, live_reqs=[req]), 3)
+
+        params = InsertParams(
+            key=RadixKey([1, 2, 3, 4], None, 0),
+            value=np.arange(10, 14, dtype=np.int32),
+        )
+        cap = comp.prepare_for_caching_req(req, params, token_ids_len=4, is_finished=True)
+        self.assertEqual(cap, 128)
+        # The donated value is the KEEP slot, NOT the running slot.
+        self.assertEqual(int(params.recurrent_value[0]), keep_slot)
+        self.assertNotEqual(int(params.recurrent_value[0]), running)
+
+        result = cache.insert(params)
+        self.assertTrue(result.recurrent_committed)
+        comp.cleanup_after_caching_req(
+            req, is_finished=True, insert_result=result, insert_params=params
+        )
+
+        # Tree owns the keep slot; running + other track slot freed. Net: 1 tree + 2 free.
+        self.assertIsNone(req.recurrent_pool_idx)
+        self.assertIsNone(req.recurrent_ping_pong_track_buffer)
+        self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 1)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0, live_reqs=[req]), 0)
+        self.assertEqual(pool.recurrent_available_size(0), slots - 1)
+
+    def test_finished_not_committed_frees_running_and_both_track(self):
+        _, pool, _, cache = self._create_setup()
+        comp = self._component(cache)
+        slots = pool.slots_per_rank
+        # Pre-commit a leaf so the same key is a duplicate (recurrent_exist).
+        seed = self._admit(pool)
+        self._simulate_boundary_scatter(pool, seed, final_seq_len=128)
+        seed_params = InsertParams(
+            key=RadixKey([1, 2, 3, 4], None, 0), value=np.arange(10, 14, dtype=np.int32)
+        )
+        comp.prepare_for_caching_req(seed, seed_params, token_ids_len=4, is_finished=True)
+        seed_res = cache.insert(seed_params)
+        comp.cleanup_after_caching_req(
+            seed, is_finished=True, insert_result=seed_res, insert_params=seed_params
+        )
+        self.assertEqual(pool.recurrent_available_size(0), slots - 1)
+
+        req = self._admit(pool)
+        self._simulate_boundary_scatter(pool, req, final_seq_len=128)
+        params = InsertParams(
+            key=RadixKey([1, 2, 3, 4], None, 0), value=np.arange(10, 14, dtype=np.int32)
+        )
+        comp.prepare_for_caching_req(req, params, token_ids_len=4, is_finished=True)
+        result = cache.insert(params)
+        # Duplicate of the existing leaf: not re-committed.
+        self.assertFalse(result.recurrent_committed)
+        comp.cleanup_after_caching_req(
+            req, is_finished=True, insert_result=result, insert_params=params
+        )
+
+        # All 3 request-owned slots freed; only the seed leaf remains tree-owned.
+        self.assertIsNone(req.recurrent_ping_pong_track_buffer)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0, live_reqs=[req]), 0)
+        self.assertEqual(pool.recurrent_available_size(0), slots - 1)
+
+    # --- Case 3: unfinished donation keeps running live, allocates replacement ---
+
+    def test_unfinished_donation_secures_replacement_and_clears_watermark(self):
+        _, pool, _, cache = self._create_setup()
+        comp = self._component(cache)
+        slots = pool.slots_per_rank
+        req = self._admit(pool)
+        running = req.recurrent_pool_idx
+        keep_slot = self._simulate_boundary_scatter(pool, req, final_seq_len=128)
+        other_slot = next(s for s in req.recurrent_ping_pong_track_buffer if s != keep_slot)
+        free_before = pool.recurrent_available_size(0)
+
+        params = InsertParams(
+            key=RadixKey([5, 6, 7, 8], None, 0), value=np.arange(20, 24, dtype=np.int32)
+        )
+        cap = comp.prepare_for_caching_req(req, params, token_ids_len=4, is_finished=False)
+        self.assertEqual(cap, 128)
+        # Donated value is the keep slot; a fresh replacement took its buffer place.
+        self.assertEqual(int(params.recurrent_value[0]), keep_slot)
+        self.assertNotIn(keep_slot, req.recurrent_ping_pong_track_buffer)
+        self.assertIn(other_slot, req.recurrent_ping_pong_track_buffer)
+        # Replacement consumed one free slot; running slot untouched.
+        self.assertEqual(pool.recurrent_available_size(0), free_before - 1)
+        self.assertEqual(req.recurrent_pool_idx, running)
+
+        result = cache.insert(params)
+        self.assertTrue(result.recurrent_committed)
+        comp.cleanup_after_caching_req(
+            req, is_finished=False, insert_result=result, insert_params=params
+        )
+
+        # Tree owns the donated slot; the request keeps running + 2 track slots.
+        self.assertIsNone(req.recurrent_last_track_seqlen)
+        self.assertEqual(req.recurrent_pool_idx, running)
+        self.assertEqual(len([s for s in req.recurrent_ping_pong_track_buffer if s]), 2)
+        self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 1)
+        # active = running(1) + 2 track = 3; tree_owned=1; free = slots - 4.
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0, live_reqs=[req]), 3)
+        self.assertEqual(pool.recurrent_available_size(0), slots - 4)
+
+    # --- Case 4: unfinished donation NOT committed → free orphan, clear watermark ---
+
+    def test_unfinished_donation_not_committed_frees_orphan(self):
+        _, pool, _, cache = self._create_setup()
+        comp = self._component(cache)
+        slots = pool.slots_per_rank
+        # Pre-commit a leaf so the unfinished re-donation of the same key is a dup.
+        seed = self._admit(pool)
+        self._simulate_boundary_scatter(pool, seed, final_seq_len=128)
+        seed_params = InsertParams(
+            key=RadixKey([5, 6, 7, 8], None, 0), value=np.arange(20, 24, dtype=np.int32)
+        )
+        comp.prepare_for_caching_req(seed, seed_params, token_ids_len=4, is_finished=True)
+        seed_res = cache.insert(seed_params)
+        comp.cleanup_after_caching_req(
+            seed, is_finished=True, insert_result=seed_res, insert_params=seed_params
+        )
+
+        req = self._admit(pool)
+        running = req.recurrent_pool_idx
+        keep_slot = self._simulate_boundary_scatter(pool, req, final_seq_len=128)
+        params = InsertParams(
+            key=RadixKey([5, 6, 7, 8], None, 0), value=np.arange(20, 24, dtype=np.int32)
+        )
+        cap = comp.prepare_for_caching_req(req, params, token_ids_len=4, is_finished=False)
+        self.assertEqual(cap, 128)
+        donated = int(params.recurrent_value[0])
+        self.assertEqual(donated, keep_slot)
+        result = cache.insert(params)
+        self.assertFalse(result.recurrent_committed)  # duplicate of the seed leaf
+        free_before = pool.recurrent_available_size(0)
+        comp.cleanup_after_caching_req(
+            req, is_finished=False, insert_result=result, insert_params=params
+        )
+
+        # The orphaned donated slot is freed; watermark cleared; request keeps
+        # running + 2 (replacement + other) track slots.
+        self.assertEqual(pool.recurrent_available_size(0), free_before + 1)
+        self.assertIn(donated, pool.recurrent_free_slots[0])
+        self.assertIsNone(req.recurrent_last_track_seqlen)
+        self.assertEqual(req.recurrent_pool_idx, running)
+        self.assertEqual(len([s for s in req.recurrent_ping_pong_track_buffer if s]), 2)
+        # active = running + 2 track = 3; only the seed leaf is tree-owned.
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0, live_reqs=[req]), 3)
+        _ = slots  # capacity sanity already covered by the ledger assertion
+
+    # --- Case 5: replacement alloc fails (all locked) → donation skipped ---
+
+    def test_unfinished_replacement_alloc_fails_skips_donation(self):
+        # Size 3: exactly one req's worth of slots, so after admission the free
+        # list is empty and there is no tree leaf to evict for a replacement.
+        _, pool, _, cache = self._create_setup(recurrent_size=3)
+        comp = self._component(cache)
+        req = self._admit(pool)
+        keep_slot = self._simulate_boundary_scatter(pool, req, final_seq_len=128)
+        self.assertEqual(pool.recurrent_available_size(0), 0)
+        buffer_before = list(req.recurrent_ping_pong_track_buffer)
+
+        params = InsertParams(
+            key=RadixKey([9, 10, 11, 12], None, 0), value=np.arange(30, 34, dtype=np.int32)
+        )
+        cap = comp.prepare_for_caching_req(req, params, token_ids_len=4, is_finished=False)
+        # Replacement unavailable → donation skipped: returns 0, buffer + watermark intact.
+        self.assertEqual(cap, 0)
+        self.assertIsNone(params.recurrent_value)
+        self.assertEqual(req.recurrent_ping_pong_track_buffer, buffer_before)
+        self.assertIn(keep_slot, req.recurrent_ping_pong_track_buffer)
+        self.assertEqual(req.recurrent_last_track_seqlen, 128)
+
+        # Cleanup with no commit + no donation: frees nothing, leaves req intact.
+        comp.cleanup_after_caching_req(
+            req, is_finished=False, insert_result=None, insert_params=params
+        )
+        self.assertEqual(req.recurrent_last_track_seqlen, 128)
+        self.assertEqual(req.recurrent_ping_pong_track_buffer, buffer_before)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0, live_reqs=[req]), 3)
+
+    # --- Case 6: alloc_req_slots evicts the exact 3x shortfall ---
+
+    def _seed_tree_leaves(self, comp, cache, pool, keys, dp_rank=0):
+        """Commit one finished extra-buffer req per key, leaving each as a
+        tree-owned leaf the eviction can reclaim."""
+        for i, key in enumerate(keys):
+            req = self._admit(pool, dp_rank=dp_rank)
+            self._simulate_boundary_scatter(pool, req, final_seq_len=128)
+            params = InsertParams(
+                key=RadixKey(list(key), None, dp_rank),
+                value=np.arange(100 + i * 10, 100 + i * 10 + len(key), dtype=np.int32),
+            )
+            comp.prepare_for_caching_req(req, params, token_ids_len=len(key), is_finished=True)
+            res = cache.insert(params)
+            comp.cleanup_after_caching_req(
+                req, is_finished=True, insert_result=res, insert_params=params
+            )
+
+    def _make_batch(self, cache, pool, allocator, reqs):
+        from sgl_jax.srt.managers.schedule_batch import ScheduleBatch
+
+        return ScheduleBatch(
+            reqs_info=[],
+            req_to_token_pool=pool,
+            token_to_kv_pool_allocator=allocator,
+            tree_cache=cache,
+            is_hybrid_recurrent=True,
+        )
+
+    def test_alloc_req_slots_evicts_exact_three_x_shortfall_dp1(self):
+        _, pool, allocator, cache = self._create_setup(recurrent_size=12)  # 12 slots/rank
+        comp = self._component(cache)
+        slots = pool.slots_per_rank
+        # Fill the free list with tree leaves: 4 leaves use 4 slots, leaving 8 free.
+        self._seed_tree_leaves(comp, cache, pool, [[1, 2], [3, 4], [5, 6], [7, 8]])
+        self.assertEqual(pool.recurrent_available_size(0), slots - 4)  # 8 free
+        self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 4)
+
+        # 3 new reqs → demand = 9 > 8 free → evict exactly 1 leaf.
+        batch = self._make_batch(cache, pool, allocator, None)
+        reqs = [_AllocReq(dp_rank=0) for _ in range(3)]
+        batch.alloc_req_slots(reqs)
+
+        # Exactly one leaf evicted; the 3 reqs each got running + 2 track (9 slots).
+        self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 3)
+        for r in reqs:
+            self.assertIsNotNone(r.recurrent_pool_idx)
+            self.assertEqual(len(r.recurrent_ping_pong_track_buffer), 2)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0, live_reqs=reqs), 9)
+
+    def test_alloc_req_slots_evicts_exact_three_x_shortfall_dp2(self):
+        _, pool, allocator, cache = self._create_setup(dp_size=2, recurrent_size=24)
+        comp = self._component(cache)
+        slots = pool.slots_per_rank  # 12 per rank
+        # Seed 4 leaves on rank 1 only (rank 0 stays empty).
+        self._seed_tree_leaves(comp, cache, pool, [[1, 2], [3, 4], [5, 6], [7, 8]], dp_rank=1)
+        self.assertEqual(pool.recurrent_available_size(1), slots - 4)
+        self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][1], 4)
+
+        batch = self._make_batch(cache, pool, allocator, None)
+        reqs = [_AllocReq(dp_rank=1) for _ in range(3)]  # demand 9 > 8 free → evict 1
+        batch.alloc_req_slots(reqs)
+
+        self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][1], 3)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(1, live_reqs=reqs), 9)
+        # Rank 0 untouched.
+        self.assertEqual(pool.recurrent_available_size(0), slots)
+
+    def test_alloc_req_slots_no_evict_when_enough_free(self):
+        _, pool, allocator, cache = self._create_setup(recurrent_size=12)
+        comp = self._component(cache)
+        self._seed_tree_leaves(comp, cache, pool, [[1, 2]])  # 1 leaf, 11 free
+        leaves_before = cache.component_evictable_size_[ComponentType.RECURRENT][0]
+
+        batch = self._make_batch(cache, pool, allocator, None)
+        reqs = [_AllocReq(dp_rank=0) for _ in range(3)]  # demand 9 <= 11 free
+        batch.alloc_req_slots(reqs)
+
+        # No eviction: enough free slots already.
+        self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], leaves_before)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0, live_reqs=reqs), 9)
+
+    def test_alloc_req_slots_recurrent_oom_reports_recurrent_pool(self):
+        # Pool too small with nothing evictable: the recurrent pre-check fails and
+        # the raise must name the recurrent pool (not the base req-pool size).
+        _, pool, allocator, cache = self._create_setup(recurrent_size=4)  # 4 slots, per_req 3
+        batch = self._make_batch(cache, pool, allocator, None)
+        reqs = [_AllocReq(dp_rank=0) for _ in range(2)]  # demand 6 > 4, nothing to evict
+        with self.assertRaises(RuntimeError) as cm:
+            batch.alloc_req_slots(reqs)
+        self.assertIn("recurrent_available", str(cm.exception))
+        self.assertIn("request_owned_slots", str(cm.exception))
+
+    # --- Single-slot ping-pong (overlap-off): donate/cleanup orchestration when
+    #     the keep slot IS the only track slot (keep == next == 0) ---
+
+    def test_single_slot_admit_owns_running_plus_one_track(self):
+        _, pool, _, cache = self._create_setup(ping_pong_slots=1)
+        req = self._admit(pool)
+        self.assertEqual(len(req.recurrent_ping_pong_track_buffer), 1)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0, live_reqs=[req]), 2)
+
+    def test_single_slot_finished_committed_tree_owns_sole_slot(self):
+        _, pool, _, cache = self._create_setup(ping_pong_slots=1)
+        comp = self._component(cache)
+        slots = pool.slots_per_rank
+        req = self._admit(pool)
+        keep_slot = self._simulate_boundary_scatter(pool, req, final_seq_len=128)
+        params = InsertParams(
+            key=RadixKey([1, 2, 3, 4], None, 0), value=np.arange(10, 14, dtype=np.int32)
+        )
+        cap = comp.prepare_for_caching_req(req, params, token_ids_len=4, is_finished=True)
+        self.assertEqual(cap, 128)
+        self.assertEqual(int(params.recurrent_value[0]), keep_slot)
+        result = cache.insert(params)
+        self.assertTrue(result.recurrent_committed)
+        comp.cleanup_after_caching_req(
+            req, is_finished=True, insert_result=result, insert_params=params
+        )
+        # Net of the 2 owned slots: 1 tree-owned + 1 freed.
+        self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 1)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0, live_reqs=[req]), 0)
+        self.assertEqual(pool.recurrent_available_size(0), slots - 1)
+
+    def test_single_slot_unfinished_committed_secures_replacement(self):
+        _, pool, _, cache = self._create_setup(ping_pong_slots=1)
+        comp = self._component(cache)
+        req = self._admit(pool)
+        running = req.recurrent_pool_idx
+        keep_slot = self._simulate_boundary_scatter(pool, req, final_seq_len=128)
+        free_before = pool.recurrent_available_size(0)
+        params = InsertParams(
+            key=RadixKey([5, 6, 7, 8], None, 0), value=np.arange(20, 24, dtype=np.int32)
+        )
+        cap = comp.prepare_for_caching_req(req, params, token_ids_len=4, is_finished=False)
+        self.assertEqual(cap, 128)
+        self.assertEqual(int(params.recurrent_value[0]), keep_slot)
+        # The donated slot left the buffer; a fresh replacement is the sole slot.
+        self.assertEqual(len(req.recurrent_ping_pong_track_buffer), 1)
+        self.assertNotIn(keep_slot, req.recurrent_ping_pong_track_buffer)
+        self.assertEqual(pool.recurrent_available_size(0), free_before - 1)
+        self.assertEqual(req.recurrent_pool_idx, running)
+        result = cache.insert(params)
+        self.assertTrue(result.recurrent_committed)
+        comp.cleanup_after_caching_req(
+            req, is_finished=False, insert_result=result, insert_params=params
+        )
+        self.assertIsNone(req.recurrent_last_track_seqlen)
+        self.assertEqual(req.recurrent_pool_idx, running)
+        # active = running + 1 track = 2; tree_owned = 1.
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0, live_reqs=[req]), 2)
+
+    def test_single_slot_unfinished_not_committed_frees_orphan(self):
+        _, pool, _, cache = self._create_setup(ping_pong_slots=1)
+        comp = self._component(cache)
+        # Seed a leaf so the same key is a duplicate (not re-committed).
+        seed = self._admit(pool)
+        self._simulate_boundary_scatter(pool, seed, final_seq_len=128)
+        seed_params = InsertParams(
+            key=RadixKey([5, 6, 7, 8], None, 0), value=np.arange(20, 24, dtype=np.int32)
+        )
+        comp.prepare_for_caching_req(seed, seed_params, token_ids_len=4, is_finished=True)
+        seed_res = cache.insert(seed_params)
+        comp.cleanup_after_caching_req(
+            seed, is_finished=True, insert_result=seed_res, insert_params=seed_params
+        )
+
+        req = self._admit(pool)
+        running = req.recurrent_pool_idx
+        keep_slot = self._simulate_boundary_scatter(pool, req, final_seq_len=128)
+        params = InsertParams(
+            key=RadixKey([5, 6, 7, 8], None, 0), value=np.arange(20, 24, dtype=np.int32)
+        )
+        comp.prepare_for_caching_req(req, params, token_ids_len=4, is_finished=False)
+        donated = int(params.recurrent_value[0])
+        self.assertEqual(donated, keep_slot)
+        result = cache.insert(params)
+        self.assertFalse(result.recurrent_committed)  # duplicate of the seed leaf
+        free_before = pool.recurrent_available_size(0)
+        comp.cleanup_after_caching_req(
+            req, is_finished=False, insert_result=result, insert_params=params
+        )
+        # Orphaned donated slot freed; watermark cleared; req keeps running + 1 track.
+        self.assertEqual(pool.recurrent_available_size(0), free_before + 1)
+        self.assertIn(donated, pool.recurrent_free_slots[0])
+        self.assertIsNone(req.recurrent_last_track_seqlen)
+        self.assertEqual(req.recurrent_pool_idx, running)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0, live_reqs=[req]), 2)
+
+    def test_single_slot_replacement_alloc_fails_skips_donation(self):
+        # Size 2: exactly one req's worth (running + 1 track), so no free slot and
+        # no evictable leaf for a replacement.
+        _, pool, _, cache = self._create_setup(recurrent_size=2, ping_pong_slots=1)
+        comp = self._component(cache)
+        req = self._admit(pool)
+        keep_slot = self._simulate_boundary_scatter(pool, req, final_seq_len=128)
+        self.assertEqual(pool.recurrent_available_size(0), 0)
+        buffer_before = list(req.recurrent_ping_pong_track_buffer)
+        params = InsertParams(
+            key=RadixKey([9, 10, 11, 12], None, 0), value=np.arange(30, 34, dtype=np.int32)
+        )
+        cap = comp.prepare_for_caching_req(req, params, token_ids_len=4, is_finished=False)
+        # Replacement unavailable → donation skipped: buffer + watermark intact.
+        self.assertEqual(cap, 0)
+        self.assertIsNone(params.recurrent_value)
+        self.assertEqual(req.recurrent_ping_pong_track_buffer, buffer_before)
+        self.assertIn(keep_slot, req.recurrent_ping_pong_track_buffer)
+        self.assertEqual(req.recurrent_last_track_seqlen, 128)
+        comp.cleanup_after_caching_req(
+            req, is_finished=False, insert_result=None, insert_params=params
+        )
+        self.assertEqual(req.recurrent_ping_pong_track_buffer, buffer_before)
 
 
 if __name__ == "__main__":

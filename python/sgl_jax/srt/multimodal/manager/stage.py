@@ -10,7 +10,6 @@ import psutil
 from sgl_jax.srt.managers.communication import QueueBackend
 from sgl_jax.srt.managers.scheduler import Scheduler as AutoRegressiveScheduler
 from sgl_jax.srt.models.qwen2 import Qwen2ForCausalLM
-from sgl_jax.srt.models.umt5 import UMT5EncoderModel
 from sgl_jax.srt.multimodal.manager.device_manager import DeviceManager
 from sgl_jax.srt.multimodal.manager.scheduler.audio_backbone_scheduler import (
     AudioBackboneScheduler,
@@ -26,6 +25,9 @@ from sgl_jax.srt.multimodal.manager.scheduler.vit_scheduler import VitScheduler
 from sgl_jax.srt.multimodal.models.dits.flux import FluxTransformer2DModel
 from sgl_jax.srt.multimodal.models.encoders.clip import CLIPTextModel
 from sgl_jax.srt.multimodal.models.encoders.t5 import T5EncoderModel
+from sgl_jax.srt.multimodal.models.encoders.t5 import (
+    UMT5EncoderModel as MultimodalUMT5EncoderModel,
+)
 from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_backbone import (
     MiMoAudioForCausalLM,
 )
@@ -239,7 +241,7 @@ def get_scheduler_class(name: str):
 def get_model_class(name: str) -> type | list[type]:
     model_classes = {
         "AutoencoderKLWan": AutoencoderKLWan,
-        "UMT5EncoderModel": UMT5EncoderModel,
+        "UMT5EncoderModel": MultimodalUMT5EncoderModel,
         "WanTransformer3DModel": WanTransformer3DModel,
         "WanDualTransformer3DModel": WanDualTransformer3DModel,
         "Qwen2_5_VL_Generation": Qwen2_5_VL_Generation,

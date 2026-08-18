@@ -59,15 +59,16 @@ Core files involved:
 | `NONE` | Speculative decoding disabled | `is_none()` |
 | `EAGLE` | EAGLE algorithm | `is_eagle()` |
 | `EAGLE3` | EAGLE3 algorithm | `is_eagle()`, `is_eagle3()` |
+| `NEXTN` | Fused MTP / NextN speculative path | `is_eagle()`, `is_nextn()` |
 | `STANDALONE` | Standalone draft model | `is_standalone()` |
 
-`from_string(name)` — Static factory method mapping a string to an enum member. It currently only recognizes `EAGLE` / `EAGLE3` / `STANDALONE` and `None`; the CLI `--speculative-algorithm` also accepts `NEXTN`, but that value is not registered in the enum, and parsing will only work after the MTP DraftWorker is fully wired up (see the pending items in §9.5 class hierarchy).
+`from_string(name)` — Static factory method mapping a string to an enum member. It recognizes `EAGLE` / `EAGLE3` / `NEXTN` / `STANDALONE` and `None`.
 
 ### Related ServerArgs Parameters
 
 | Parameter | Default | Description |
 |------|--------|------|
-| `speculative_algorithm` | `None` | Algorithm choice (`EAGLE` / `EAGLE3` / `STANDALONE`) |
+| `speculative_algorithm` | `None` | Algorithm choice (`EAGLE` / `EAGLE3` / `NEXTN` / `STANDALONE`) |
 | `speculative_draft_model_path` | `None` | Path to the draft model weights |
 | `speculative_num_steps` | `4` | Number of generation steps for the draft model |
 | `speculative_eagle_topk` | `5` | Top-K branch expansion per step |
@@ -451,7 +452,7 @@ for i, req in enumerate(batch.reqs):
 
 | Interface | Location | Description |
 |------|------|------|
-| `SpeculativeAlgorithm` | `speculative/spec_info.py` | Algorithm enum (`EAGLE`/`EAGLE3`/`STANDALONE`) |
+| `SpeculativeAlgorithm` | `speculative/spec_info.py` | Algorithm enum (`EAGLE`/`EAGLE3`/`NEXTN`/`STANDALONE`) |
 | `EAGLEWorker.__init__()` | `speculative/eagle_worker.py` | Construction: shared pools, embedding, LM head |
 | `EAGLEWorker.forward_batch_speculative_generation()` | `speculative/eagle_worker.py` | Main entrypoint (Extend / Decode dispatch) |
 | `EAGLEWorker.draft()` | `speculative/eagle_worker.py` | Multi-step draft + tree construction |

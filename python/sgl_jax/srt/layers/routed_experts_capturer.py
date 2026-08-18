@@ -31,6 +31,44 @@ def get_array_size_bytes(t: np.ndarray):
     return np.prod(t.shape) * t.dtype.itemsize
 
 
+# Routed-expert metadata field names vary across HF model families, and may live
+# on the root config or a nested text config. Total experts: ``num_experts``
+# (Qwen), ``n_routed_experts`` (GLM/DeepSeek/MiMo), ``num_local_experts``
+# (MiniMax/Grok). Routing top-k: ``num_experts_per_tok``, ``num_experts_per_token``
+# (Kimi), or ``top_k_experts`` (Gemma4). Plain ``top_k`` is sampling top-k, not
+# routing — never use it here.
+_TOTAL_EXPERT_FIELDS = ("num_experts", "n_routed_experts", "num_local_experts")
+_TOPK_EXPERT_FIELDS = ("num_experts_per_tok", "num_experts_per_token", "top_k_experts")
+
+
+def _first_present_attr(configs, names):
+    for cfg in configs:
+        if cfg is None:
+            continue
+        for name in names:
+            value = getattr(cfg, name, None)
+            if value is not None:
+                return value
+    return None
+
+
+def get_routed_expert_count(model_config):
+    """Total routed experts across name aliases and root/text config; ``None`` if
+    the model is router-less (dense)."""
+    return _first_present_attr(
+        (getattr(model_config, "hf_text_config", None), getattr(model_config, "hf_config", None)),
+        _TOTAL_EXPERT_FIELDS,
+    )
+
+
+def get_routed_experts_per_token(model_config):
+    """Routing top-k across name aliases and root/text config; ``None`` if router-less."""
+    return _first_present_attr(
+        (getattr(model_config, "hf_text_config", None), getattr(model_config, "hf_config", None)),
+        _TOPK_EXPERT_FIELDS,
+    )
+
+
 class RoutedExpertsCapturer(ABC):
     @staticmethod
     def create(
@@ -50,6 +88,16 @@ class RoutedExpertsCapturer(ABC):
         physical_expert_counts: int = 256,
     ):
         if enable or enable_balance_debug or enable_dist_recorder:
+            # Router-less (dense) models expose no expert-count field under any
+            # known alias; the real capturer would size buffers from a None
+            # top-k and crash. Fail clearly instead.
+            if get_routed_expert_count(model_config) is None:
+                raise ValueError(
+                    "Routed-experts capture flags (--enable-return-routed-experts / "
+                    "--enable-expert-balance-debug / --enable-expert-distribution-recorder) "
+                    "require a MoE model; this model is router-less (no num_experts / "
+                    "n_routed_experts / num_local_experts)."
+                )
             return _RoutedExpertsCapturerReal(
                 model_config,
                 mesh=mesh,
@@ -118,7 +166,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         self.mesh = mesh
         self.enable_host_buffer = enable_host_buffer
         self.num_hidden_layers = model_config.hf_text_config.num_hidden_layers
-        self.num_experts_per_tok = model_config.hf_text_config.num_experts_per_tok
+        self.num_experts_per_tok = get_routed_experts_per_token(model_config)
         self.num_tokens = num_tokens
         self.max_padding = max_padding
 

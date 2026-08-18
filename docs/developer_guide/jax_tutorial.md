@@ -1,8 +1,8 @@
-### Developer Guide: Why We Chose JAX and How to Learn It
+# Developer Guide: Why We Chose JAX and How to Learn It
 
 Welcome to the `sglang-jax` project! This document is designed to help new developers, especially those unfamiliar with JAX, understand the core reasons behind our technical choices and provide a clear learning path.
 
-#### Why We Chose JAX
+## Why We Chose JAX
 
 Among the many deep learning frameworks available (like PyTorch and TensorFlow), we choose JAX as our core backend for three key advantages that are crucial for building a high-performance inference system for large language models.
 
@@ -29,7 +29,7 @@ Among the many deep learning frameworks available (like PyTorch and TensorFlow),
 
 ---
 
-#### How to Learn JAX and Pallas
+## How to Learn JAX and Pallas
 
 We recommend following this path to systematically master JAX and Pallas.
 
@@ -39,14 +39,14 @@ For a beginner, the most important thing is to understand the JAX "way of thinki
 
 1. **Start with the Official Tutorials:**
 
-  - **Must-Read:** [JAX 101 Tutorial](https://jax.readthedocs.io/en/latest/jax-101/index.html). This is the best introductory material, bar none. Spend a few hours going through it completely and run every code example yourself.
+  - **Must-Read:** [JAX 101 Tutorial](https://docs.jax.dev/en/latest/jax-101/index.html). This is the best introductory material, bar none. Spend a few hours going through it completely and run every code example yourself.
   - **Core Concepts:** You need to focus on the differences between JAX and NumPy (especially immutability) and master JAX's three core function transformations:
     - `jax.jit()`: Understand how it compiles functions into high-performance code.
     - `jax.vmap()`: Grasp its magic of automatically converting a function that processes a single data point into one that handles a batch, saving you from writing manual loops.
     - `jax.grad()`: While not used directly for training in our inference project, understanding it is key to grasping the JAX ecosystem.
 2. **Learning Resources:**
 
-  - **Official Documentation:** The [JAX Documentation](https://jax.readthedocs.io/en/latest/) is your most reliable friend.
+  - **Official Documentation:** The [JAX Documentation](https://docs.jax.dev/en/latest/) is your most reliable friend.
   - **Code Examples:** Read through well-regarded open-source JAX projects like [Flax](https://github.com/google/flax) (a neural network library for JAX) to see how others structure their JAX code.
 
 **Phase 2: Learn Distributed Programming**
@@ -57,7 +57,7 @@ Once you have a handle on the basics of JAX, you can start learning how to manag
 2. **Master the Modern Distributed Approach: `jax.sharding`:**
   - This is the method we actually use in `sglang-jax` and is central to handling large models.
   - **Learning Path:**
-    1. Read the official guide on [Distributed arrays and automatic parallelization](https://jax.readthedocs.io/en/latest/notebooks/Distributed_arrays_and_automatic_parallelization.html).
+    1. Read the official guide on [Distributed arrays and automatic parallelization](https://docs.jax.dev/en/latest/notebooks/Distributed_arrays_and_automatic_parallelization.html).
     2. Understand the concepts of `Mesh`, `PartitionSpec`, and `NamedSharding`.
     3. Try to write code yourself that distributes a simple matrix multiplication across a 2x2 virtual device mesh.
 
@@ -74,7 +74,7 @@ Pallas is an advanced topic. We **do not recommend** diving into Pallas until yo
 
   - **When to start:** You should only consider Pallas when you've hit a performance bottleneck and are certain that standard JAX operators can no longer meet your needs.
   - **Resources:**
-    - Read the [Pallas Official Documentation](https://jax.readthedocs.io/en/latest/pallas/index.html).
+    - Read the [Pallas Official Documentation](https://docs.jax.dev/en/latest/pallas/index.html).
     - Study the Pallas tutorials and examples in the Google Cloud TPU documentation.
     - **Best Practice:** After you are fluent with JAX, the best way to learn is by reading the Pallas implementations within the `sglang-jax` project itself (e.g., the code in the `sgl_jax/srt/layers/attention/` directory). This is the best material for combining theory with practice.
 

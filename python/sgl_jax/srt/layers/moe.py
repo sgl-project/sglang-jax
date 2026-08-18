@@ -186,14 +186,12 @@ class EPMoE(nnx.Module):
                         f"Unsupported {scale_name} shape {scale.shape} for weight shape {weight.shape}. "
                         f"Expected k_blocks dimension to be 1 or {expected_k_blocks}."
                     )
-            # FIXME(jax-upgrade): incoming sharding is typically P("expert", None, None, None) —
-            # the EPMoE weight loader passes a 3-tuple ("expert", None, None) that JAX pads
-            # with None on the 4D array — which doesn't textually match the downstream
-            # shard_map in_specs P("expert", None, None, "tensor"). jax 0.8.1 accepts this
-            # because the "tensor" axis is size 1 (ep_size == world_size); jax 0.10.x checks
-            # strictly and will raise. Fix by reshard'ing here like the ndim==3 branches do,
-            # or fix the loader to emit a full 4-tuple.
-            return scale
+            final_scale_sharding = (
+                P("expert", None, None, None)
+                if scale_name == "wo_scale"
+                else P("expert", None, None, "tensor")
+            )
+            return jax.sharding.reshard(scale, final_scale_sharding)
 
         if scale.ndim == 2 and scale.shape == (num_experts, out_dim):
             return scale[:, None, None, :]
@@ -726,7 +724,11 @@ class EPMoE(nnx.Module):
                 padding = jnp.zeros((padding_size, intermediate.shape[1]), dtype=intermediate.dtype)
                 intermediate = jnp.concatenate([intermediate, padding], axis=0)
 
-        argsort_indices = jnp.argsort(sorted_selected_experts, stable=True)
+        argsort_indices = (
+            jnp.zeros(expected_tokens, dtype=jnp.int32)
+            .at[sorted_selected_experts]
+            .set(jnp.arange(expected_tokens, dtype=jnp.int32))
+        )
         unsort_intermediate = jnp.take(intermediate, indices=argsort_indices, axis=0)
 
         total_tokens = weights.shape[0] * weights.shape[1] // self.num_experts_per_tok

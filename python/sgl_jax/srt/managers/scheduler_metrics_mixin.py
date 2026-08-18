@@ -128,7 +128,12 @@ class SchedulerMetricsMixin:
             per_dp_running = [len(info.reqs) if info.reqs else 0 for info in batch.reqs_info]
             msg += f"#running-req per DP: {per_dp_running}, "
 
-        if running_batch.spec_algorithm is not None and not running_batch.spec_algorithm.is_none():
+        if (
+            self.spec_algorithm is not None
+            and not self.spec_algorithm.is_none()
+            and self.draft_token > 0
+            and self.spec_num_forward_ct > 0
+        ):
             accept_ratio = self.accept_token / self.draft_token
             accept_len = self.accept_token / self.spec_num_forward_ct
             self.accept_token = 0

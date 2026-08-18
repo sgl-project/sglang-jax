@@ -293,6 +293,8 @@ class MLAAttentionBackend(AttentionBackend):
         # the remaining dims (replicated stays replicated).
         new_kv_c = k if k.ndim == 2 else jnp.squeeze(k, axis=1)
         new_k_pe = k_rope if k_rope.ndim == 2 else jnp.squeeze(k_rope, axis=1)
+        dpa = self.attention_data_partition_axis
+        new_k_pe = jax.sharding.reshard(new_k_pe, P(dpa, None))
         ql_nope = q
         q_pe = q_rope
 
@@ -304,8 +306,6 @@ class MLAAttentionBackend(AttentionBackend):
         )
         sliding_window = layer.sliding_window_size if layer is not None else None
         soft_cap = layer.logit_cap if layer is not None else None
-
-        dpa = self.attention_data_partition_axis
 
         in_specs = (
             P(dpa, "tensor", None),  # ql_nope    [T, n_h/tp, lkv]

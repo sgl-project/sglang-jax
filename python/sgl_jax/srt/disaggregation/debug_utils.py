@@ -71,7 +71,12 @@ class KVDebugSnapshot:
 
 
 def build_kv_debug_snapshot(value) -> KVDebugSnapshot:
-    host = _host_array(value)
+    if isinstance(value, (list, tuple)):
+        host = np.stack([_host_array(v) for v in value], axis=0)
+        sharding_src = value[0] if value else value
+    else:
+        host = _host_array(value)
+        sharding_src = value
     if host.ndim < 2:
         raise ValueError(
             "build_kv_debug_snapshot expects an array with at least 2 " "dims (layer, page, ...)"
@@ -87,7 +92,7 @@ def build_kv_debug_snapshot(value) -> KVDebugSnapshot:
     return KVDebugSnapshot(
         shape=tuple(int(d) for d in host.shape),
         dtype=str(host.dtype),
-        sharding=safe_sharding_repr(value),
+        sharding=safe_sharding_repr(sharding_src),
         global_digest=_digest_bytes(host.tobytes()),
         page_digests=tuple(page_digests),
     )

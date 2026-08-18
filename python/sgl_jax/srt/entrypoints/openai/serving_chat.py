@@ -3,7 +3,7 @@ import json
 import logging
 import time
 import uuid
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from typing import Any
 
 import orjson
@@ -98,6 +98,12 @@ class OpenAIServingChat(OpenAIServingBase):
             stream=request.stream,
             extra_key=request.extra_key,
             rid=request.rid,
+            dp_rank=request.dp_rank,
+            bootstrap_host=request.bootstrap_host,
+            bootstrap_port=request.bootstrap_port,
+            bootstrap_room=request.bootstrap_room,
+            disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
+            disagg_transfer_id=request.disagg_transfer_id,
         )
 
         return adapted_request, request
@@ -253,7 +259,9 @@ Assistant: {% endif %}"""
                 **chat_template_kwargs,
             )
 
-        if isinstance(prompt_ids, dict) and "input_ids" in prompt_ids:
+        # BatchEncoding (returned by e.g. MiniMax-M2's apply_chat_template on
+        # transformers>=5) inherits UserDict, not dict — use Mapping to cover both.
+        if isinstance(prompt_ids, Mapping) and "input_ids" in prompt_ids:
             prompt_ids = prompt_ids["input_ids"]
 
         if assistant_prefix:

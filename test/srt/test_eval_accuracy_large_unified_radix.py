@@ -1,4 +1,4 @@
-"""MMLU sanity for --enable-unified-radix-tree (HiCache Stage 1, S1c / #1337).
+"""MMLU sanity for --enable-unified-radix-tree (#1337).
 
 Mirrors test_eval_accuracy_large.py with the unified-radix-tree flag on, to
 confirm the UnifiedRadixCache serving path does not regress accuracy.

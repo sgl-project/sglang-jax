@@ -1,5 +1,7 @@
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import numpy as np
 
 from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
@@ -44,6 +46,55 @@ def _make_server_args(**overrides):
     return args
 
 
+def _make_precompile_manager(
+    *,
+    page_size=128,
+    has_recurrent_state=False,
+    supports_recurrent_cow=False,
+    supports_recurrent_track=False,
+):
+    return CompilationManager(
+        server_args=_make_server_args(
+            precompile_token_paddings=[4, 8],
+            precompile_bs_paddings=[2, 4],
+        ),
+        max_padded_batch_size=4,
+        max_padded_num_tokens=8,
+        dp_size=1,
+        tp_size=1,
+        page_size=page_size,
+        max_req_len=8,
+        vocab_size=32,
+        has_recurrent_state=has_recurrent_state,
+        supports_recurrent_cow=supports_recurrent_cow,
+        supports_recurrent_track=supports_recurrent_track,
+    )
+
+
+def _collect_precompile_batches(cm, mode):
+    batches = []
+
+    def forward_fn(batch, **_kwargs):
+        batches.append(batch)
+
+    with (
+        patch(
+            "sgl_jax.srt.model_executor.forward_batch_info.ForwardBatch.init_new",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "sgl_jax.srt.sampling.sampling_batch_info.SamplingMetadata.from_model_worker_batch",
+            return_value=MagicMock(),
+        ),
+    ):
+        if mode == ForwardMode.EXTEND:
+            cm._precompile_extend(forward_fn, MagicMock(), MagicMock(), None, None)
+        else:
+            cm._precompile_decode(forward_fn, MagicMock(), MagicMock(), None, None)
+
+    return batches
+
+
 class TestBucketComputation(unittest.TestCase):
     def test_token_buckets_default(self):
         cm = CompilationManager(
@@ -76,18 +127,65 @@ class TestBucketComputation(unittest.TestCase):
             assert b % 4 == 0, f"bucket {b} not divisible by dp_size=4"
 
     def test_bs_buckets_fused_moe_minimum(self):
+        for backend in ("fused", "fused_v2"):
+            cm = CompilationManager(
+                server_args=_make_server_args(moe_backend=backend),
+                max_padded_batch_size=128,
+                max_padded_num_tokens=2048,
+                dp_size=1,
+                tp_size=4,
+                page_size=128,
+                max_req_len=4096,
+                vocab_size=32000,
+            )
+            for b in cm.bs_buckets:
+                assert b >= 8, f"bucket {b} < tp_size*2=8 for {backend}"
+
+    def test_bs_buckets_fused_v2_rejects_cap_below_ep_minimum(self):
+        with self.assertRaisesRegex(ValueError, "minimum 2 \\* mesh_ep_size=32"):
+            CompilationManager(
+                server_args=_make_server_args(moe_backend="fused_v2"),
+                max_padded_batch_size=8,
+                max_padded_num_tokens=2048,
+                dp_size=2,
+                tp_size=16,
+                page_size=128,
+                max_req_len=4096,
+                vocab_size=32000,
+            )
+
+    def test_bs_buckets_raw_epmoe_unfiltered(self):
+        """Raw server_args.moe_backend='epmoe' (GMM path, e.g. DeepSeek-V3)
+        pads internally and must NOT be forced to bs>=tp*2."""
         cm = CompilationManager(
-            server_args=_make_server_args(moe_backend="fused"),
+            server_args=_make_server_args(moe_backend="epmoe"),
             max_padded_batch_size=128,
             max_padded_num_tokens=2048,
             dp_size=1,
-            tp_size=4,
+            tp_size=16,
             page_size=128,
             max_req_len=4096,
             vocab_size=32000,
         )
-        for b in cm.bs_buckets:
-            assert b >= 8, f"bucket {b} < tp_size*2=8 for fused moe"
+        assert 1 in cm.bs_buckets, cm.bs_buckets
+
+    def test_bs_buckets_effective_fused_via_param(self):
+        """Architectures that hard-code FusedEPMoE (Qwen3.5) get moe_backend
+        resolved to 'fused' by ModelConfig and pass it explicitly, so the
+        fused_ep_moe alignment filter applies even when the raw server_args
+        string stays at the 'epmoe' default."""
+        cm = CompilationManager(
+            server_args=_make_server_args(moe_backend="epmoe"),
+            max_padded_batch_size=64,
+            max_padded_num_tokens=2048,
+            dp_size=1,
+            tp_size=16,
+            page_size=128,
+            max_req_len=4096,
+            vocab_size=32000,
+            moe_backend="fused",
+        )
+        assert cm.bs_buckets == [32, 64], cm.bs_buckets
 
     def test_bs_buckets_max_included(self):
         cm = CompilationManager(
@@ -174,6 +272,81 @@ class TestLazyCompilation(unittest.TestCase):
         assert cm.register_variant_if_new(key1) is True
         assert cm.register_variant_if_new(key2) is True
         assert cm.register_variant_if_new(key1) is False
+
+
+class TestRecurrentPrecompileStructure(unittest.TestCase):
+    @staticmethod
+    def _presence(batch):
+        return (
+            batch.recurrent_cow_src_indices is not None,
+            batch.recurrent_track_indices is not None,
+        )
+
+    def test_non_recurrent_preserves_original_structure(self):
+        cm = _make_precompile_manager()
+
+        extend_batches = _collect_precompile_batches(cm, ForwardMode.EXTEND)
+        decode_batches = _collect_precompile_batches(cm, ForwardMode.DECODE)
+
+        assert len(extend_batches) == len(cm.token_buckets)
+        assert len(decode_batches) == len(cm.bs_buckets)
+        assert all(self._presence(batch) == (False, False) for batch in extend_batches)
+        assert all(self._presence(batch) == (False, False) for batch in decode_batches)
+
+    def test_recurrent_without_capabilities_preserves_original_structure(self):
+        cm = _make_precompile_manager(has_recurrent_state=True)
+
+        extend_batches = _collect_precompile_batches(cm, ForwardMode.EXTEND)
+        decode_batches = _collect_precompile_batches(cm, ForwardMode.DECODE)
+
+        assert len(extend_batches) == len(cm.token_buckets)
+        assert len(decode_batches) == len(cm.bs_buckets)
+        assert all(self._presence(batch) == (False, False) for batch in extend_batches)
+        assert all(self._presence(batch) == (False, False) for batch in decode_batches)
+
+    def test_page_size_one_recurrent_uses_fixed_extend_cow_structure(self):
+        cm = _make_precompile_manager(
+            page_size=1,
+            has_recurrent_state=True,
+            supports_recurrent_cow=True,
+        )
+
+        extend_batches = _collect_precompile_batches(cm, ForwardMode.EXTEND)
+        decode_batches = _collect_precompile_batches(cm, ForwardMode.DECODE)
+
+        assert len(extend_batches) == len(cm.token_buckets)
+        assert len(decode_batches) == len(cm.bs_buckets)
+        assert all(self._presence(batch) == (True, False) for batch in extend_batches)
+        assert all(self._presence(batch) == (False, False) for batch in decode_batches)
+
+    def test_extra_buffer_uses_one_fixed_structure_per_mode(self):
+        cm = _make_precompile_manager(
+            has_recurrent_state=True,
+            supports_recurrent_cow=True,
+            supports_recurrent_track=True,
+        )
+
+        extend_batches = _collect_precompile_batches(cm, ForwardMode.EXTEND)
+        decode_batches = _collect_precompile_batches(cm, ForwardMode.DECODE)
+
+        assert len(extend_batches) == len(cm.token_buckets)
+        assert len(decode_batches) == len(cm.bs_buckets)
+        assert all(self._presence(batch) == (True, True) for batch in extend_batches)
+        assert all(self._presence(batch) == (False, True) for batch in decode_batches)
+
+        for batch in extend_batches + decode_batches:
+            for value in (
+                batch.recurrent_cow_src_indices,
+                batch.recurrent_track_indices,
+                batch.recurrent_track_mask,
+            ):
+                if value is not None:
+                    assert value.shape == (batch.real_bs,)
+                    assert value.dtype == np.int32
+            assert (batch.recurrent_track_indices is None) == (batch.recurrent_track_mask is None)
+
+        assert all(batch.recurrent_cow_src_indices is None for batch in decode_batches)
+        assert all(len(key) == 4 for key in cm._compiled_variants)
 
 
 class TestDummyBatch(unittest.TestCase):

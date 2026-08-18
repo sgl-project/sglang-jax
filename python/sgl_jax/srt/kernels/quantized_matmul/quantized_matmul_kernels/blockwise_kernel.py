@@ -69,6 +69,10 @@ def quantized_matmul_kernel(
             w_q_dtype=jnp.dtype(w_q.dtype).name,
         )
     batch_block_size = tuned_value.batch_block_size
+    # Mosaic requires last-2 block dim %8==0 or ==array dim. tuned batch_block_size
+    # can be 1; for n_batch in (2..7) that fails the check. Pad block to 8.
+    if orig_n_batch > 1 and batch_block_size % 8 != 0:
+        batch_block_size = next_multiple(batch_block_size, 8)
     out_block_size = tuned_value.out_block_size
     in_block_size = tuned_value.in_block_size
     n_lane_multiplier = tuned_value.n_lane_multiplier

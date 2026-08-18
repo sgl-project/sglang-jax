@@ -10,7 +10,7 @@ and cache layouts. Two execution paths are provided:
 * ``extend`` — variable-length packed prefill that consumes ``cu_seqlens`` to
   build a per-token sliding window mixing prior cache and in-sequence tokens.
 
-State convention follows vLLM / Mamba: cache has width ``K-1`` and stores the
+State convention follows vLLM: cache has width ``K-1`` and stores the
 prior ``K-1`` tokens (the current token is supplied via ``x`` at call time).
 """
 

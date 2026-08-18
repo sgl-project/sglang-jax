@@ -425,7 +425,6 @@ for num_tokens in token_candidates:
             w1_scale=w1_scale_s,
             w2_scale=w2_scale_s,
             w3_scale=w3_scale_s,
-            disable_all_reduce_metadata=False,
             use_jax_allreduce_metadata=True,
         )
 

@@ -23,7 +23,7 @@ from typing import Any
 
 from transformers.configuration_utils import PretrainedConfig
 
-__all__ = ["Qwen3_5HybridConfig", "get_qwen3_5_hybrid_config"]
+__all__ = ["Qwen3_5HybridConfig", "Qwen3_5DenseConfig", "get_qwen3_5_hybrid_config"]
 
 
 class _Qwen3_5TextConfig(PretrainedConfig):
@@ -64,11 +64,13 @@ class _Qwen3_5TextConfig(PretrainedConfig):
         linear_value_head_dim: int = 128,
         linear_num_key_heads: int = 16,
         linear_num_value_heads: int = 32,
-        # MoE fields.
-        moe_intermediate_size: int = 512,
-        shared_expert_intermediate_size: int = 512,
-        num_experts_per_tok: int = 8,
-        num_experts: int = 256,
+        # FFN: dense ships ``intermediate_size``; MoE ships the ``moe_*`` /
+        # ``num_experts*`` block. Both default to ``None`` so ``is_moe`` is unambiguous.
+        intermediate_size: int | None = None,
+        moe_intermediate_size: int | None = None,
+        shared_expert_intermediate_size: int | None = None,
+        num_experts_per_tok: int | None = None,
+        num_experts: int | None = None,
         router_aux_loss_coef: float = 0.001,
         mlp_only_layers: list[int] | None = None,
         # MTP (multi-token prediction) — not used by base inference but
@@ -131,7 +133,8 @@ class _Qwen3_5TextConfig(PretrainedConfig):
         self.linear_num_key_heads = linear_num_key_heads
         self.linear_num_value_heads = linear_num_value_heads
 
-        # MoE.
+        # FFN.
+        self.intermediate_size = intermediate_size
         self.moe_intermediate_size = moe_intermediate_size
         self.shared_expert_intermediate_size = shared_expert_intermediate_size
         self.num_experts_per_tok = num_experts_per_tok
@@ -148,6 +151,12 @@ class _Qwen3_5TextConfig(PretrainedConfig):
             eos_token_id=eos_token_id,
             **kwargs,
         )
+
+    @property
+    def is_moe(self) -> bool:
+        """Single dense/MoE discriminator. MoE configs always declare
+        ``num_experts``; dense configs omit it (defaults to ``None``)."""
+        return self.num_experts is not None
 
     @property
     def full_attention_layer_ids(self) -> list[int]:
@@ -231,12 +240,23 @@ class Qwen3_5HybridConfig(PretrainedConfig):
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
 
+class Qwen3_5DenseConfig(Qwen3_5HybridConfig):
+    """Dense Qwen3.5 (0.8B–27B): identical to ``Qwen3_5HybridConfig`` but for
+    ``model_type``. Dense/MoE share the backbone; only the FFN differs, keyed off
+    ``text_config.is_moe``. The text sub-config is reused as-is (its own
+    ``model_type`` string is never read).
+    """
+
+    model_type = "qwen3_5"
+
+
 def get_qwen3_5_hybrid_config(hf_config: Any) -> Qwen3_5HybridConfig | None:
     """Return the hf_config cast to ``Qwen3_5HybridConfig``, else ``None``.
 
     Mirrors ``get_kimi_linear_config`` / ``get_bailing_hybrid_config`` so
-    the runner can dispatch via duck-typing.
+    the runner can dispatch via duck-typing. Matches both the MoE
+    (``qwen3_5_moe``) and dense (``qwen3_5``) root model types.
     """
-    if getattr(hf_config, "model_type", None) == "qwen3_5_moe":
+    if getattr(hf_config, "model_type", None) in {"qwen3_5_moe", "qwen3_5"}:
         return hf_config
     return None

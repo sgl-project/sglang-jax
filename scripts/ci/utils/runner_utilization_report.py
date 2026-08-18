@@ -105,7 +105,7 @@ def get_jobs_for_run(repo, run_id):
     )
 
 
-_RUNNER_LABEL_MAP = {"cpu-runner": "arc-runner-cpu"}
+_RUNNER_LABEL_MAP = {"cpu-runner": "arc-runner-cpu-us-south1-b"}
 
 
 def _meaningful_labels(label_dicts):
@@ -130,7 +130,9 @@ def get_runners(repo, online_only=False):
                 inferred = (
                     m.group(1)
                     if m
-                    else ("arc-runner-cpu" if name.startswith("runnerdeploy-") else None)
+                    else (
+                        "arc-runner-cpu-us-south1-b" if name.startswith("runnerdeploy-") else None
+                    )
                 )
                 if inferred:
                     runner.setdefault("labels", []).append({"name": inferred})

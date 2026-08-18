@@ -1,37 +1,39 @@
-"""Qwen3.5-35B-A3B consolidated CPU test (RFC §4.2).
+"""Qwen3.5 (MoE 35B-A3B + dense 27B/2B) CPU component tests.
 
-Default fixture is the public HF Hub repo ``Qwen/Qwen3.5-35B-A3B`` — only
-``config.json`` and ``model.safetensors.index.json`` are downloaded (~190 KB,
-no weight blobs). Set ``QWEN3_5_FIXTURE`` to a local directory to override, or
-``QWEN3_5_REVISION`` to pin a commit; if the Hub is unreachable and no local
-fixture is set, the test skips instead of failing.
-CPU-only: validates config aliasing, layer schedule, module wiring/shapes,
-partial M-RoPE construction, and weight-mapping coverage against the real
-safetensors key set. Full numerical correctness is validated by the TPU smoke
-(``test/srt/test_qwen3_5_models.py``), not here — the fused MoE / GDN kernels
-do not run on CPU.
+Runs in the ``unit-test-cpu`` suite (``run_suite.py``). Hub-free, mirroring
+``test_mimo_v2_nextn`` / ``test_kimi_k25_weight_mapping``: configs are built
+in-process from the real ``config.json`` scalars + RoPE block, and weight-mapping
+coverage is checked against the checkpoint key set *reconstructed* from per-layer
+templates snapshotted from the real ``model.safetensors.index.json`` (no
+``from_pretrained`` / ``hf_hub_download``, so it never skips on an offline runner).
+Dims are shrunk to keep module construction cheap on CPU.
+
+The fused GDN/MoE kernels and numerical accuracy are gated separately by the TPU
+smoke (``test/srt/test_qwen3_5_models.py``) + the e2e MMLU-Pro / GPQA evals.
+
+Snapshots derive from Qwen3.5-{35B-A3B, 27B, 2B}; the per-layer block layout is
+identical across the family. Re-snapshot from the index if a future revision adds
+or renames tensors.
+
+Run:
+    python -m pytest python/sgl_jax/test/models/test_qwen3_5.py -q
 """
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import unittest
-from pathlib import Path
+from types import SimpleNamespace
+
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from huggingface_hub import hf_hub_download
-from transformers import AutoConfig
 
-import sgl_jax.srt.hf_transformers_utils  # noqa: F401  (registers Qwen3_5HybridConfig)
+from sgl_jax.srt.configs.qwen3_5 import Qwen3_5DenseConfig, Qwen3_5HybridConfig
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
-
-CKPT_FIXTURE = os.environ.get("QWEN3_5_FIXTURE", "Qwen/Qwen3.5-35B-A3B")
-# Pin a commit for reproducible / offline-cached CI runs (None = latest).
-CKPT_REVISION = os.environ.get("QWEN3_5_REVISION") or None
 
 _mesh = create_device_mesh(
     ici_parallelism=[1, 1], dcn_parallelism=[1, 1], devices=[jax.devices()[0]]
@@ -39,43 +41,144 @@ _mesh = create_device_mesh(
 jax.sharding.set_mesh(_mesh)
 
 
+# RoPE block as the real config.json ships it (nested ``rope_parameters``, HF 5.x);
+# values shrunk but structurally identical so the config class's flatten path runs.
+_ROPE_PARAMETERS = {
+    "rope_type": "default",
+    "mrope_section": [6, 5, 5],  # sums to rotary_dim // 2 = (head_dim * partial) // 2
+    "mrope_interleaved": True,
+    "rope_theta": 12345,
+    "partial_rotary_factor": 0.5,
+}
+
+
+def _make_config(*, num_layers: int, is_moe: bool, tie: bool = False):
+    """Build a Qwen3.5 config with the real layout but small dims.
+
+    ``full_attention_interval=4`` (real schedule) and ``num_layers`` drive the
+    weight-mapping coverage; the small head/expert dims keep module construction
+    cheap. MoE vs dense is keyed off ``num_experts`` (the ``is_moe`` discriminator).
+    """
+    text = dict(
+        vocab_size=256,
+        hidden_size=256,
+        num_hidden_layers=num_layers,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=64,
+        full_attention_interval=4,
+        rms_norm_eps=1e-6,
+        rope_parameters=dict(_ROPE_PARAMETERS),
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        linear_conv_kernel_dim=4,
+    )
+    if is_moe:
+        text.update(
+            num_experts=8,
+            num_experts_per_tok=2,
+            moe_intermediate_size=128,
+            shared_expert_intermediate_size=128,
+        )
+        return Qwen3_5HybridConfig(tie_word_embeddings=tie, text_config=text)
+    text.update(intermediate_size=128)
+    return Qwen3_5DenseConfig(tie_word_embeddings=tie, text_config=text)
+
+
+# Per-layer HF safetensors key suffixes, snapshotted from the real
+# model.safetensors.index.json (verified: the reconstruction below reproduces the
+# real text-key set exactly — 693 for 35B-A3B, 851 for 27B, 320 for 2B).
+_NORM_KEYS = ("input_layernorm.weight", "post_attention_layernorm.weight")
+_GDN_KEYS = (
+    "linear_attn.in_proj_qkv.weight",
+    "linear_attn.in_proj_z.weight",
+    "linear_attn.in_proj_b.weight",
+    "linear_attn.in_proj_a.weight",
+    "linear_attn.conv1d.weight",
+    "linear_attn.A_log",
+    "linear_attn.dt_bias",
+    "linear_attn.norm.weight",
+    "linear_attn.out_proj.weight",
+)
+_FULL_ATTN_KEYS = (
+    "self_attn.q_proj.weight",
+    "self_attn.k_proj.weight",
+    "self_attn.v_proj.weight",
+    "self_attn.o_proj.weight",
+    "self_attn.q_norm.weight",
+    "self_attn.k_norm.weight",
+)
+_DENSE_FFN_KEYS = ("mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight")
+_MOE_FFN_KEYS = (
+    "mlp.gate.weight",
+    "mlp.experts.gate_up_proj",
+    "mlp.experts.down_proj",
+    "mlp.shared_expert.gate_proj.weight",
+    "mlp.shared_expert.up_proj.weight",
+    "mlp.shared_expert.down_proj.weight",
+    "mlp.shared_expert_gate.weight",
+)
+
+
+def _expected_ckpt_keys(num_layers: int, is_moe: bool, tie: bool):
+    """Reconstruct the HF source-key set the checkpoint ships (= the keys the
+    weight mapping must cover). Independent of the production mapping code, so
+    comparing the two is a real bidirectional coverage check."""
+    keys = {
+        "model.language_model.embed_tokens.weight",
+        "model.language_model.norm.weight",
+    }
+    if not tie:  # tied variants reuse the embedding; no lm_head.weight on disk
+        keys.add("lm_head.weight")
+    ffn = _MOE_FFN_KEYS if is_moe else _DENSE_FFN_KEYS
+    for i in range(num_layers):
+        attn = _FULL_ATTN_KEYS if (i + 1) % 4 == 0 else _GDN_KEYS
+        for suffix in _NORM_KEYS + attn + ffn:
+            keys.add(f"model.language_model.layers.{i}.{suffix}")
+    return keys
+
+
 class TestQwen3_5(unittest.TestCase):
+    """MoE 35B-A3B backbone: config plumbing, module wiring/shapes, mapping coverage."""
+
     @classmethod
     def setUpClass(cls):
-        # Default fixture is a live HF Hub repo (config + index only). If it is
-        # unreachable (offline CI, no cache) and no local QWEN3_5_FIXTURE is set,
-        # skip rather than error -- matches the repo's skipTest idiom for
-        # unavailable resources. OSError is what transformers raises for an
-        # unreachable repo; a real config bug raises ValueError and still fails.
-        try:
-            cls.cfg = AutoConfig.from_pretrained(
-                CKPT_FIXTURE, revision=CKPT_REVISION, trust_remote_code=False
-            )
-        except OSError as e:
-            if os.path.isdir(CKPT_FIXTURE):
-                raise
-            raise unittest.SkipTest(f"Qwen3.5 fixture {CKPT_FIXTURE!r} unavailable: {e}") from e
         cls.mesh = _mesh
+        cls.cfg = _make_config(num_layers=4, is_moe=True)
 
-    # --- 1: config RoPE alias ---
-    def test_config_alias_surfaces_rope_fields(self):
+    # --- config: nested rope_parameters flattened to rope_scaling/theta/partial ---
+    def test_config_flattens_rope_parameters(self):
         tc = self.cfg.text_config
         self.assertEqual(type(self.cfg).__name__, "Qwen3_5HybridConfig")
         self.assertEqual(self.cfg.model_type, "qwen3_5_moe")
         # Subset-only: newer transformers versions inject extra fields
-        # (rope_theta, partial_rotary_factor) into rope_scaling. We only assert
-        # the fields the model actually consumes.
+        # (rope_theta, partial_rotary_factor) into rope_scaling. Assert just the
+        # fields the model actually consumes.
         keys = ("rope_type", "mrope_section", "mrope_interleaved")
         self.assertEqual(
             {k: tc.rope_scaling[k] for k in keys},
-            {"rope_type": "default", "mrope_section": [11, 11, 10], "mrope_interleaved": True},
+            {"rope_type": "default", "mrope_section": [6, 5, 5], "mrope_interleaved": True},
         )
-        self.assertEqual(tc.rope_theta, 10000000)
-        self.assertEqual(tc.partial_rotary_factor, 0.25)
+        self.assertEqual(tc.rope_theta, 12345)
+        self.assertEqual(tc.partial_rotary_factor, 0.5)
         self.assertFalse(self.cfg.tie_word_embeddings)
-        self.assertEqual(tc.head_dim, 256)
 
-    # --- 2: layer schedule ---
+    # --- config: is_moe discriminator + FFN field exclusivity ---
+    def test_is_moe_discriminator(self):
+        moe = _make_config(num_layers=4, is_moe=True).text_config
+        self.assertTrue(moe.is_moe)
+        self.assertIsNotNone(moe.num_experts)
+        self.assertIsNone(moe.intermediate_size)
+
+        dense = _make_config(num_layers=4, is_moe=False).text_config
+        self.assertFalse(dense.is_moe)
+        self.assertIsNone(dense.num_experts)
+        self.assertIsNone(dense.num_experts_per_tok)
+        self.assertIsNotNone(dense.intermediate_size)
+
+    # --- layer schedule derives from full_attention_interval ---
     def test_layer_types_matches_full_attention_interval(self):
         tc = self.cfg.text_config
         interval = int(tc.full_attention_interval)
@@ -85,12 +188,8 @@ class TestQwen3_5(unittest.TestCase):
         ]
         self.assertEqual(derived, list(tc.layer_types))
 
-    # --- 2b: decoder layer picks attention type from layer_types ---
+    # --- decoder layer picks full vs GDN attention from layer_types ---
     def test_decoder_layer_attention_type_from_layer_types(self):
-        """Qwen3_5DecoderLayer selects full vs GDN attention via
-        full_attention_layer_ids (layer_types), not a hard-coded interval.
-        Exercises the path the dropped runtime assert used to guard.
-        """
         from sgl_jax.srt.models.qwen3_5 import (
             Qwen3_5Attention,
             Qwen3_5DecoderLayer,
@@ -108,7 +207,7 @@ class TestQwen3_5(unittest.TestCase):
         self.assertFalse(gdn_layer.is_full_attn)
         self.assertIsInstance(gdn_layer.self_attn, Qwen3_5GatedDeltaNet)
 
-    # --- 3: full-attn output-gate layout ---
+    # --- full-attn output-gate layout: q_proj emits [q | gate] per head ---
     def test_q_proj_output_gate_layout(self):
         from sgl_jax.srt.models.qwen3_5 import Qwen3_5Attention
 
@@ -118,23 +217,23 @@ class TestQwen3_5(unittest.TestCase):
         x = jnp.zeros((T, self.cfg.text_config.hidden_size), dtype=jnp.bfloat16)
         q_raw, _ = attn.q_proj(x)
         self.assertEqual(q_raw.shape, (T, attn.num_heads * 2 * attn.head_dim))
-        # per-head [q | gate] split
         q_gate = q_raw.reshape(T, attn.num_heads, 2 * attn.head_dim)
         self.assertEqual(q_gate[..., : attn.head_dim].shape, (T, attn.num_heads, attn.head_dim))
         self.assertEqual(q_gate[..., attn.head_dim :].shape, (T, attn.num_heads, attn.head_dim))
 
-    # --- 4: partial M-RoPE wiring ---
+    # --- partial M-RoPE wiring: module reads mrope_section/rotary_dim from config ---
     def test_rope_wiring(self):
         from sgl_jax.srt.layers.embeddings import MRotaryEmbedding
         from sgl_jax.srt.models.qwen3_5 import Qwen3_5Attention
 
         attn = Qwen3_5Attention(self.cfg, self.mesh, layer_id=3)
+        tc = self.cfg.text_config
         self.assertIsInstance(attn.rotary_emb, MRotaryEmbedding)
-        self.assertEqual(list(attn.rotary_emb.mrope_section), [11, 11, 10])
-        self.assertEqual(attn.rotary_emb.rotary_dim, 64)
-        self.assertEqual(attn.rotary_emb.base, 10000000)
+        self.assertEqual(list(attn.rotary_emb.mrope_section), [6, 5, 5])
+        self.assertEqual(attn.rotary_emb.rotary_dim, int(tc.head_dim * tc.partial_rotary_factor))
+        self.assertEqual(attn.rotary_emb.base, tc.rope_theta)
 
-    # --- 5: GDN fused-projection shapes ---
+    # --- GDN fused-projection shapes ---
     def test_gdn_projection_shapes(self):
         from sgl_jax.srt.models.qwen3_5 import Qwen3_5GatedDeltaNet
 
@@ -154,12 +253,11 @@ class TestQwen3_5(unittest.TestCase):
         self.assertEqual(gdn.A_log.value.shape, (tc.linear_num_value_heads,))
         self.assertEqual(gdn.dt_bias.value.shape, (tc.linear_num_value_heads,))
 
-    # --- 5b: GDN output gate is norm-before-gate SILU (not sigmoid) ---
+    # --- GDN output gate is norm-before-gate SILU (not sigmoid) ---
     def test_gdn_output_norm_gate_is_silu(self):
         """GDN output gate is RMSNorm(core) * silu(z) — silu, NOT sigmoid.
 
-        Re-adds the deleted RmsGateTest; a silu->sigmoid swap passes shape tests
-        but tanks accuracy. CPU-safe (no fused kernel).
+        A silu->sigmoid swap passes shape tests but tanks accuracy. CPU-safe.
         """
         from sgl_jax.srt.models.qwen3_5 import Qwen3_5GatedDeltaNet
 
@@ -193,57 +291,12 @@ class TestQwen3_5(unittest.TestCase):
             )
         )
 
-    # --- 6: weight-mapping coverage vs the real safetensors index ---
-    def test_weight_mapping_covers_ckpt_keys(self):
-        from sgl_jax.srt.models.qwen3_5 import _create_qwen3_5_weight_mappings
-
-        # Resolve from local fixture dir if set; otherwise pull just the index
-        # file from the HF Hub repo (no weight blobs).
-        if os.path.isdir(CKPT_FIXTURE):
-            idx_path = Path(CKPT_FIXTURE) / "model.safetensors.index.json"
-        else:
-            idx_path = Path(
-                hf_hub_download(
-                    repo_id=CKPT_FIXTURE,
-                    filename="model.safetensors.index.json",
-                    revision=CKPT_REVISION,
-                )
-            )
-        with open(idx_path) as f:
-            ckpt_keys = set(json.load(f)["weight_map"].keys())
-
-        mapping, visual_skip, mtp_skip = _create_qwen3_5_weight_mappings(self.cfg)
-
-        text_keys = {k for k in ckpt_keys if k.startswith("model.language_model.")}
-        self.assertEqual(len(text_keys), 692)
-        for k in text_keys:
-            self.assertIn(k, mapping, f"unmapped text key: {k}")
-        self.assertIn("lm_head.weight", mapping)
-
-        visual_keys = {k for k in ckpt_keys if k.startswith("model.visual.")}
-        self.assertEqual(len(visual_keys), 333)
-        for k in visual_keys:
-            self.assertTrue(
-                any(re.match(p, k) for p in visual_skip), f"visual key not skipped: {k}"
-            )
-
-        mtp_keys = {k for k in ckpt_keys if k.startswith("mtp.")}
-        self.assertEqual(len(mtp_keys), 785)
-        for k in mtp_keys:
-            self.assertTrue(any(re.match(p, k) for p in mtp_skip), f"mtp key not skipped: {k}")
-
-        # No mapping key should reference a non-existent ckpt key (apart from the
-        # synthetic lm_head/embeds, which are real).
-        for src in mapping:
-            self.assertIn(src, ckpt_keys, f"mapping references missing ckpt key: {src}")
-
-    # --- 7: MoE block wiring + sigmoid-gated shared expert ---
+    # --- MoE block wiring + sigmoid-gated shared expert ---
     def test_moe_block_shared_expert_gate(self):
         from sgl_jax.srt.models.qwen3_5 import Qwen3_5MoeBlock
 
         tc = self.cfg.text_config
         block = Qwen3_5MoeBlock(self.cfg, self.mesh, layer_id=0)
-        # Routed expert param shapes (FusedEPMoE w1/w3 = [E, hidden, inter], w2 = [E, inter, hidden]).
         self.assertEqual(
             block.experts.w1.value.shape, (tc.num_experts, tc.hidden_size, tc.moe_intermediate_size)
         )
@@ -253,7 +306,6 @@ class TestQwen3_5(unittest.TestCase):
         self.assertEqual(
             block.experts.w2.value.shape, (tc.num_experts, tc.moe_intermediate_size, tc.hidden_size)
         )
-        # Shared path (plain matmuls — CPU-safe). sigmoid(gate)*shared_expert(x).
         T = 4
         x = jax.random.normal(jax.random.key(0), (T, tc.hidden_size), dtype=jnp.bfloat16)
         gate_logit, _ = block.shared_expert_gate(x)
@@ -262,6 +314,173 @@ class TestQwen3_5(unittest.TestCase):
         self.assertEqual(shared.shape, (T, tc.hidden_size))
         gated = jax.nn.sigmoid(gate_logit) * shared
         self.assertEqual(gated.shape, (T, tc.hidden_size))
+
+    # --- weight-mapping coverage vs the reconstructed 35B-A3B (MoE) key set ---
+    def test_weight_mapping_covers_moe_keys(self):
+        from sgl_jax.srt.models.qwen3_5 import _create_qwen3_5_weight_mappings
+
+        cfg = _make_config(num_layers=40, is_moe=True)  # 35B-A3B layer count
+        mapping, _, _ = _create_qwen3_5_weight_mappings(cfg)
+        expected = _expected_ckpt_keys(num_layers=40, is_moe=True, tie=False)
+        self.assertEqual(len(expected), 693)  # 692 text keys + lm_head.weight
+        self.assertEqual(set(mapping), expected)
+
+    # --- vision tower + MTP head are skipped by prefix, LM keys are not ---
+    def test_visual_and_mtp_keys_are_skipped(self):
+        from sgl_jax.srt.models.qwen3_5 import _create_qwen3_5_weight_mappings
+
+        _, visual_skip, mtp_skip = _create_qwen3_5_weight_mappings(self.cfg)
+        self.assertTrue(
+            any(re.match(p, "model.visual.blocks.0.attn.qkv.weight") for p in visual_skip)
+        )
+        self.assertTrue(any(re.match(p, "mtp.layers.0.input_layernorm.weight") for p in mtp_skip))
+        lm_key = "model.language_model.layers.0.input_layernorm.weight"
+        self.assertFalse(any(re.match(p, lm_key) for p in visual_skip + mtp_skip))
+
+    # --- expert capture builds the real capturer for MoE (counterpart to the
+    #     dense router-less guard in TestQwen3_5Dense) ---
+    def test_routed_experts_capturer_builds_for_moe(self):
+        from sgl_jax.srt.layers.routed_experts_capturer import (
+            RoutedExpertsCapturer,
+            _RoutedExpertsCapturerReal,
+        )
+
+        # Qwen3.5 MoE keeps num_experts / top-k under text_config (the nested-config
+        # path the helper must read). Enabling capture builds the real capturer and
+        # sizes the per-layer host buffer from the resolved top-k.
+        tc = self.cfg.text_config
+        moe_mc = SimpleNamespace(hf_config=self.cfg, hf_text_config=tc)
+        cap = RoutedExpertsCapturer.create(
+            mesh=self.mesh,
+            enable=True,
+            model_config=moe_mc,
+            num_tokens=1,
+            max_padding=1,
+            ep_size=1,
+        )
+        self.assertIsInstance(cap, _RoutedExpertsCapturerReal)
+        self.assertEqual(cap.num_experts_per_tok, tc.num_experts_per_tok)
+        self.assertEqual(cap.host_buffer.shape, (tc.num_hidden_layers, 1, tc.num_experts_per_tok))
+
+        # A MoE model that instead exposes the count on the ROOT config under an
+        # alias (n_routed_experts / num_local_experts) must still build the real
+        # capturer via the helper's root fallback, not trip the router-less guard.
+        # (Qwen3.5 itself uses text_config, above.)
+        for total_alias in ("n_routed_experts", "num_local_experts"):
+            root_mc = SimpleNamespace(
+                hf_text_config=SimpleNamespace(num_hidden_layers=2),
+                hf_config=SimpleNamespace(**{total_alias: 64, "num_experts_per_tok": 4}),
+            )
+            cap = RoutedExpertsCapturer.create(
+                mesh=self.mesh,
+                enable=True,
+                model_config=root_mc,
+                num_tokens=1,
+                max_padding=1,
+                ep_size=1,
+            )
+            self.assertIsInstance(cap, _RoutedExpertsCapturerReal)
+            self.assertEqual(cap.host_buffer.shape, (2, 1, 4))
+
+
+class TestQwen3_5Dense(unittest.TestCase):
+    """Dense 27B/2B: SwiGLU FFN dispatch, mapping coverage, tied-embedding variant."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mesh = _mesh
+        cls.cfg = _make_config(num_layers=4, is_moe=False)
+
+    # --- dense config: router-less, model_type/class, FFN field ---
+    def test_dense_config(self):
+        tc = self.cfg.text_config
+        self.assertEqual(type(self.cfg).__name__, "Qwen3_5DenseConfig")
+        self.assertEqual(self.cfg.model_type, "qwen3_5")
+        self.assertFalse(tc.is_moe)
+        self.assertIsNone(tc.num_experts)
+        self.assertIsNone(tc.num_experts_per_tok)
+        self.assertIsNotNone(tc.intermediate_size)
+        self.assertFalse(self.cfg.tie_word_embeddings)
+
+    # --- decoder layer dispatches the dense SwiGLU MLP ---
+    def test_decoder_dispatches_dense_mlp(self):
+        from sgl_jax.srt.models.qwen2_moe import Qwen2MoeMLP
+        from sgl_jax.srt.models.qwen3_5 import Qwen3_5DecoderLayer
+
+        layer = Qwen3_5DecoderLayer(self.cfg, self.mesh, layer_id=0)  # GDN layer
+        self.assertFalse(layer.is_moe)
+        self.assertIsInstance(layer.mlp, Qwen2MoeMLP)
+
+    # --- dense MLP forward (the only dense forward exercised on CPU) ---
+    def test_dense_mlp_shape(self):
+        from sgl_jax.srt.models.qwen2_moe import Qwen2MoeMLP
+
+        hidden, inter, T = 32, 64, 4
+        mlp = Qwen2MoeMLP(hidden_size=hidden, intermediate_size=inter, mesh=self.mesh)
+        x = jax.random.normal(jax.random.key(0), (T, hidden), dtype=jnp.bfloat16)
+        out = mlp(x)
+        self.assertEqual(out.shape, (T, hidden))
+
+    # --- weight mapping: reconstructed 27B (dense) key set; no expert keys ---
+    def test_weight_mapping_covers_dense_keys(self):
+        from sgl_jax.srt.models.qwen3_5 import _create_qwen3_5_weight_mappings
+
+        cfg = _make_config(num_layers=64, is_moe=False)  # 27B layer count
+        mapping, _, _ = _create_qwen3_5_weight_mappings(cfg)
+        expected = _expected_ckpt_keys(num_layers=64, is_moe=False, tie=False)
+        self.assertEqual(len(expected), 851)  # 850 text keys + lm_head.weight
+        self.assertEqual(set(mapping), expected)
+        self.assertIn("lm_head.weight", mapping)  # 27B is untied
+        self.assertFalse(
+            any("experts" in k or "shared_expert" in k for k in mapping),
+            "dense mapping must not reference MoE expert keys",
+        )
+
+    # --- tied variant (2B) omits the lm_head.weight mapping ---
+    def test_tied_variant_omits_lm_head_mapping(self):
+        from sgl_jax.srt.models.qwen3_5 import _create_qwen3_5_weight_mappings
+
+        cfg = _make_config(num_layers=24, is_moe=False, tie=True)  # 2B layer count
+        self.assertTrue(cfg.tie_word_embeddings)
+        mapping, _, _ = _create_qwen3_5_weight_mappings(cfg)
+        self.assertNotIn("lm_head.weight", mapping)
+        self.assertEqual(set(mapping), _expected_ckpt_keys(num_layers=24, is_moe=False, tie=True))
+
+    # --- router-less capturer guard (shared infra; dense regression scenario) ---
+    def test_dense_routed_experts_guard(self):
+        from sgl_jax.srt.layers.routed_experts_capturer import (
+            RoutedExpertsCapturer,
+            _RoutedExpertsCapturerNoop,
+        )
+
+        router_less = SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                num_experts=None, num_experts_per_tok=None, num_hidden_layers=4
+            )
+        )
+        # Flags off -> noop capturer, no allocation.
+        cap = RoutedExpertsCapturer.create(
+            mesh=self.mesh,
+            enable=False,
+            model_config=router_less,
+            num_tokens=1,
+            max_padding=1,
+            ep_size=1,
+        )
+        self.assertIsInstance(cap, _RoutedExpertsCapturerNoop)
+        # Any capture flag on -> clear error before NumPy shape allocation.
+        for flag in ("enable", "enable_balance_debug", "enable_dist_recorder"):
+            kwargs = dict(enable=False, enable_balance_debug=False, enable_dist_recorder=False)
+            kwargs[flag] = True
+            with self.assertRaises(ValueError):
+                RoutedExpertsCapturer.create(
+                    mesh=self.mesh,
+                    model_config=router_less,
+                    num_tokens=1,
+                    max_padding=1,
+                    ep_size=1,
+                    **kwargs,
+                )
 
 
 if __name__ == "__main__":

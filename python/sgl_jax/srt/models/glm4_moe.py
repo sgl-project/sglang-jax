@@ -271,6 +271,7 @@ class Glm4MoeDecoderLayer(nnx.Module):
                 topk_group=getattr(config, "topk_group", 1),
                 routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
                 layer_id=layer_id,
+                mesh=mesh,
             )
 
             if self.use_fused:

@@ -111,6 +111,7 @@ class MiMoV2Moe(nnx.Module):
         self.topk = TopK(
             topk=num_experts_per_tok,
             renormalize=getattr(config, "norm_topk_prob", True),
+            mesh=mesh,
         )
 
         if self.moe_backend == "fused_v2":
@@ -167,13 +168,18 @@ class MiMoV2Moe(nnx.Module):
     ):
         router_logits = self.moe_gate(hidden_states)
         correction_bias = self.correction_bias.value if self.correction_bias is not None else None
-        topk_weights, topk_ids = self.topk(router_logits, correction_bias=correction_bias)
+        topk_weights, topk_ids = self.topk(
+            router_logits,
+            correction_bias=correction_bias,
+            routing_sharding=out_sharding,
+        )
         if self.use_fused:
             token_valid_mask = forward_batch.get_token_valid_mask(
                 hidden_states.shape[0],
                 out_sharding=NamedSharding(self.mesh, P(out_sharding.spec[0])),
             )
-            topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
+            if token_valid_mask is not None:
+                topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
             mlp_output = self.experts(
                 hidden_states,
                 topk_weights,

@@ -4,7 +4,7 @@
       .layer-box { fill: #f0f8ff; stroke: #4a90e2; stroke-width: 2; }
       .component-box { fill: #ffffff; stroke: #333; stroke-width: 1.5; }
       .primary-box { fill: #e3f2fd; stroke: #2196f3; stroke-width: 2; }
-      .todo-box { fill: #fff3e0; stroke: #ff9800; stroke-width: 1.5; stroke-dasharray: 5,5; }
+      .future-box { fill: #fff3e0; stroke: #ff9800; stroke-width: 1.5; stroke-dasharray: 5,5; }
       .title { font-family: Arial, sans-serif; font-size: 14px; font-weight: bold; fill: #333; text-anchor: middle; }
       .subtitle { font-family: Arial, sans-serif; font-size: 11px; fill: #666; text-anchor: middle; }
       .layer-title { font-family: Arial, sans-serif; font-size: 16px; font-weight: bold; fill: #2c3e50; }
@@ -50,14 +50,14 @@
   <text class="title" x="215" y="358">llguidance</text>
   <text class="subtitle" x="215" y="375" style="fill: #2196f3; font-weight: bold;">(default)</text>
 
-  <!-- Outlines (TODO) -->
-  <rect class="todo-box" x="315" y="335" width="160" height="55" rx="3"/>
-  <text class="title" x="395" y="358">[TODO]</text>
+  <!-- Outlines (future backend) -->
+  <rect class="future-box" x="315" y="335" width="160" height="55" rx="3"/>
+  <text class="title" x="395" y="358">Future</text>
   <text class="subtitle" x="395" y="375">Outlines</text>
 
-  <!-- XGrammar (TODO) -->
-  <rect class="todo-box" x="495" y="335" width="160" height="55" rx="3"/>
-  <text class="title" x="575" y="358">[TODO]</text>
+  <!-- XGrammar (future backend) -->
+  <rect class="future-box" x="495" y="335" width="160" height="55" rx="3"/>
+  <text class="title" x="575" y="358">Future</text>
   <text class="subtitle" x="575" y="375">XGrammar</text>
 
   <!-- BaseGrammarBackend -->

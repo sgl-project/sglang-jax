@@ -4,6 +4,7 @@ import glob
 import os
 import re
 from typing import cast
+from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -11,6 +12,7 @@ import numpy as np
 from absl.testing import absltest, parameterized
 from jax import lax
 from jax._src import test_util as jtu
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.fused_moe.v1.kernel import (
@@ -18,6 +20,7 @@ from sgl_jax.srt.kernels.fused_moe.v1.kernel import (
     fused_ep_moe,
     ref_moe,
 )
+from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 from sgl_jax.srt.layers.moe import TopK, create_moe_weights_mapping
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 from sgl_jax.test.test_utils import create_device_mesh
@@ -245,23 +248,29 @@ class MoEKernelTest(jtu.JaxTestCase):
 
         topk_weights, topk_ids = topk_module(gating_output)
 
+        # Shard kernel inputs while keeping replicated originals for ref_moe.
+        ep = jax.sharding.NamedSharding(self.mesh, P(("data", "tensor")))
+
+        def shard(x):
+            return None if x is None else jax.device_put(x, ep)
+
         actual = fused_ep_moe(
             mesh=self.mesh,
-            tokens=a,
-            w1=w1,
-            w2=w2,
-            w3=w3,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
+            tokens=shard(a),
+            w1=shard(w1),
+            w2=shard(w2),
+            w3=shard(w3),
+            topk_weights=shard(topk_weights),
+            topk_ids=shard(topk_ids),
             top_k=top_k,
             act_fn=act_fn,
             quant_block_k=quant_block_k,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
-            w3_scale=w3_scale,
-            b1=b1,
-            b2=b2,
-            b3=b3,
+            w1_scale=shard(w1_scale),
+            w2_scale=shard(w2_scale),
+            w3_scale=shard(w3_scale),
+            b1=shard(b1),
+            b2=shard(b2),
+            b3=shard(b3),
             w1_shared=w1_shared,
             w2_shared=w2_shared,
             w3_shared=w3_shared,
@@ -316,6 +325,7 @@ class MoEKernelTest(jtu.JaxTestCase):
             x = lax.all_gather(x, axis_name="data", axis=0, tiled=True)
             return x
 
+        expected = jax.reshard(expected, ep)
         actual_host = np.asarray(jax.device_get(_replicate_tokens(actual)))
         expected_host = np.asarray(jax.device_get(_replicate_tokens(expected)))
         self.assertAllClose(actual_host, expected_host, atol=atol, rtol=rtol)
@@ -349,6 +359,54 @@ class MoEKernelTest(jtu.JaxTestCase):
             bd2c=256,
             bse=512,
         )
+
+    def test_layer_reshards_dp_inputs_for_fused_kernel(self):
+        dtype = jnp.bfloat16
+        top_k = 2
+        num_experts = self.mesh.size * 2
+        hidden_size = 8
+        intermediate_size = 8
+        num_tokens = 8
+        tokens = jnp.arange(num_tokens * hidden_size, dtype=dtype).reshape(num_tokens, hidden_size)
+        topk_weights = jnp.ones((num_tokens, top_k), dtype=dtype)
+        topk_ids = jnp.zeros((num_tokens, top_k), dtype=jnp.int32)
+        dp_sharding = NamedSharding(self.mesh, P("data", None))
+        kernel_sharding = NamedSharding(self.mesh, P(("data", "tensor"), None))
+        kernel_inputs = {}
+
+        def fake_fused_ep_moe(**kwargs):
+            kernel_inputs["tokens"] = kwargs["tokens"]
+            kernel_inputs["topk_weights"] = kwargs["topk_weights"]
+            kernel_inputs["topk_ids"] = kwargs["topk_ids"]
+            return kwargs["tokens"]
+
+        with jax.set_mesh(self.mesh):
+            layer = FusedEPMoE(
+                hidden_size=hidden_size,
+                num_experts=num_experts,
+                num_experts_per_tok=top_k,
+                ep_size=self.mesh.size,
+                mesh=self.mesh,
+                intermediate_dim=intermediate_size,
+                weight_dtype=dtype,
+                dtype=dtype,
+            )
+            with mock.patch(
+                "sgl_jax.srt.layers.fused_moe.fused_ep_moe",
+                side_effect=fake_fused_ep_moe,
+            ):
+                actual = layer(
+                    jax.device_put(tokens, dp_sharding),
+                    jax.device_put(topk_weights, dp_sharding),
+                    jax.device_put(topk_ids, dp_sharding),
+                    out_sharding=dp_sharding,
+                )
+
+        self.assertEqual(kernel_inputs["tokens"].sharding, kernel_sharding)
+        self.assertEqual(kernel_inputs["topk_weights"].sharding, kernel_sharding)
+        self.assertEqual(kernel_inputs["topk_ids"].sharding, kernel_sharding)
+        self.assertEqual(actual.sharding, dp_sharding)
+        self.assertAllClose(actual, tokens)
 
     def test_shared_expert(self):
         dtype = jnp.bfloat16

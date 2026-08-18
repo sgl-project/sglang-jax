@@ -262,6 +262,7 @@ class Qwen2MoeDecoderLayer(nnx.Module):
             topk=num_experts_per_tok,
             renormalize=getattr(config, "norm_topk_prob", True),
             layer_id=layer_id,
+            mesh=mesh,
         )
 
         if self.use_fused:

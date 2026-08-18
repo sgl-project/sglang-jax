@@ -374,6 +374,7 @@ class Gemma4DecoderLayer(nnx.Module):
                 topk=num_experts_per_tok,
                 renormalize=True,
                 layer_id=layer_id,
+                mesh=mesh,
             )
             self.experts = EPMoE(
                 hidden_size=config.hidden_size,

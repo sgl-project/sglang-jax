@@ -12,6 +12,8 @@ import numpy as np
 import psutil
 from flax import nnx
 from jax.experimental.multihost_utils import broadcast_one_to_all
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.constrained.bitmask_ops import allocate_token_bitmask
@@ -71,6 +73,10 @@ class ModelWorker:
         # Parse args
         self.tp_size = server_args.tp_size
         self.dp_size = server_args.dp_size
+        self._pd_fuse_sample = (
+            server_args.pd_disaggregation == "pathways"
+            and os.getenv("SGLANG_PD_FUSE_SAMPLE") == "1"
+        )
         from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
@@ -193,25 +199,40 @@ class ModelWorker:
                 dp_size,
             )
 
-        if server_args.moe_backend == "fused" and server_args.ep_size > 1:
+        # fused_ep_moe derives its EP group from the mesh (get_ep_size(mesh) =
+        # mesh['data'] * mesh['tensor']), not from --ep-size, so align against
+        # the actual mesh shape. Use the *resolved* backend from ModelConfig so
+        # architectures that hard-code FusedEPMoE (e.g. Qwen3.5 MoE) are
+        # covered even when the raw server_args string stays at "epmoe".
+        effective_moe_backend = self.model_runner.model_config.moe_backend.value
+        mesh_ep_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
+        if effective_moe_backend in ("fused", "fused_v2") and mesh_ep_size > 1:
             from sgl_jax.srt.utils.common_utils import align_bs_for_fused_ep
 
-            assert server_args.ep_size % dp_size == 0, (
-                f"fused MoE requires ep_size ({server_args.ep_size}) to be a multiple "
+            assert mesh_ep_size % dp_size == 0, (
+                f"fused MoE requires mesh_ep_size ({mesh_ep_size}) to be a multiple "
                 f"of dp_size ({dp_size}) so the ep-aligned cap stays dp-aligned"
             )
-            aligned = align_bs_for_fused_ep(self.max_running_requests, server_args.ep_size)
+            aligned = align_bs_for_fused_ep(self.max_running_requests, mesh_ep_size)
             if aligned != self.max_running_requests:
                 logger.warning(
                     "Adjusted max_running_requests from %s to %s for fused MoE "
-                    "(ep_size=%s, bt must be in {2,4,8k})",
+                    "(mesh_ep_size=%s, bt must be in {2,4,8k})",
                     self.max_running_requests,
                     aligned,
-                    server_args.ep_size,
+                    mesh_ep_size,
                 )
                 self.max_running_requests = aligned
 
         assert self.max_running_requests > 0, "max_running_request is zero"
+
+        # Same-shape dummy for callers without a real future map (precompile,
+        # non-overlap) so the fused jit variant matches the overlap-thread shape.
+        if self._pd_fuse_sample:
+            self._pd_dummy_future_map = jax.device_put(
+                jnp.zeros((self.max_running_requests * 5,), dtype=jnp.int32),
+                NamedSharding(self.mesh, P(None)),
+            )
 
         # A single request lives on one DP rank, so max_req_len is bounded
         # by per-rank pool size, not the global (dp-scaled) pool size.
@@ -239,6 +260,7 @@ class ModelWorker:
         # precompile
         from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
 
+        has_recurrent_state = self.model_runner.linear_recurrent_config is not None
         self.compilation_manager = CompilationManager(
             server_args=server_args,
             max_padded_batch_size=self.max_padded_batch_size,
@@ -248,8 +270,25 @@ class ModelWorker:
             page_size=self.page_size,
             max_req_len=self.max_req_len,
             vocab_size=self.model_config.vocab_size,
+            # cache_loc bucket cap under Pathways proxy backend (PD or colocated
+            # alike -- both do H2D over gRPC where the smaller bucket helps). On
+            # native TPU the smaller/odd bucket shape yields a slower Pallas
+            # ragged-attention kernel and native H2D is fast enough that the
+            # uncapped bucket is not on the critical path.
+            max_total_num_tokens=(
+                self.max_total_num_tokens if os.getenv("JAX_PLATFORMS") == "proxy" else 0
+            ),
             multimodal=server_args.multimodal,
-            has_recurrent_state=self.model_runner.linear_recurrent_config is not None,
+            has_recurrent_state=has_recurrent_state,
+            supports_recurrent_cow=(
+                has_recurrent_state
+                and server_args.enable_unified_radix_tree
+                and not server_args.disable_radix_cache
+            ),
+            supports_recurrent_track=(
+                has_recurrent_state and server_args.enable_recurrent_extra_buffer
+            ),
+            moe_backend=effective_moe_backend,
         )
 
         # Allocate the persistent cache_loc host buffer once (reused every step
@@ -279,15 +318,21 @@ class ModelWorker:
             layers_topk_ids, model_worker_batch = self.sync_queue.get()
             get_global_experts_capturer().on_forward_end(layers_topk_ids, model_worker_batch)
 
-    def run_precompile(self, future_token_ids_map=None):
+    def run_precompile(self, future_token_ids_map=None, only: str | None = None):
         prepare_lora = self.prepare_lora_batch if self.server_args.enable_lora else None
-        self.compilation_manager.precompile_all(
-            forward_fn=self.forward_batch_generation,
-            model_runner=self.model_runner,
-            mesh=self.mesh,
-            prepare_lora_fn=prepare_lora,
-            future_token_ids_map=future_token_ids_map,
+        args = (
+            self.forward_batch_generation,
+            self.model_runner,
+            self.mesh,
+            prepare_lora,
+            future_token_ids_map,
         )
+        if only == "extend":
+            self.compilation_manager._precompile_extend(*args)
+        elif only == "decode":
+            self.compilation_manager._precompile_decode(*args)
+        else:
+            self.compilation_manager.precompile_all(*args)
 
     def set_forward_metadata(self, model_worker_batch: ModelWorkerBatch):
         self.model_runner.attn_backend.forward_metadata = (
@@ -401,6 +446,25 @@ class ModelWorker:
             sampling_metadata.apply_vocab_mask = True
             sampling_metadata.vocab_mask = batch.sampling_info.vocab_mask
 
+    def _pd_fuse_for_batch(self, model_worker_batch: ModelWorkerBatch) -> bool:
+        """Batch-level fused-sample eligibility. The single source of truth
+        for every fused-vs-regular branch choice (worker AND overlap client):
+        the two paths return different tuple arities, so a caller keying on
+        the worker-level flag alone would mis-unpack whenever an ineligible
+        batch falls through to the regular path.
+
+        Decode-only: the fused jit exists to collapse a decode tick into one
+        Execute; the Pathways-PD prefill thread's EXTEND batches crash inside
+        its future-token resolve (and prefill was never the fusion target).
+        Logprob batches take the regular path -- the only one that computes/
+        materializes logprob fields."""
+        return (
+            self._pd_fuse_sample
+            and model_worker_batch.forward_mode.is_decode()
+            and not model_worker_batch.return_logprob
+            and not model_worker_batch.return_output_logprob_only
+        )
+
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
@@ -408,6 +472,8 @@ class ModelWorker:
         skip_sample: bool = False,
         sampling_metadata: SamplingMetadata = None,
         forward_metadata=None,
+        future_map=None,
+        future_slots=None,
     ) -> tuple[LogitsProcessorOutput, jax.Array | None, int]:
         # Prepare LoRA batch if LoRA is enabled
         if self.worker.server_args.enable_lora and self.need_prepare_lora_batch:
@@ -434,6 +500,33 @@ class ModelWorker:
 
         self.model_runner.attn_backend.forward_metadata = forward_metadata
         logits_metadata = LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh)
+
+        # Pathways-PD: fuse run_model+sampler+resolve/set into one jit so a
+        # decode tick is a single Execute through the ordered dispatch queue.
+        # Any logprob batch falls through to the unfused path below, which is
+        # the only one that computes/materializes logprob fields.
+        if self._pd_fuse_for_batch(model_worker_batch) and not skip_sample:
+            if model_worker_batch.sampling_info:
+                self._update_grammar_vocab_mask(model_worker_batch, sampling_metadata)
+            fmap = future_map if future_map is not None else self._pd_dummy_future_map
+            (
+                next_token_ids_device,
+                logits_output,
+                _,
+                cache_miss_count,
+                layers_topk_ids,
+                new_future_map,
+            ) = self.model_runner.forward_and_sample(
+                forward_batch, logits_metadata, sampling_metadata, fmap
+            )
+            self.dump_topk_ids(layers_topk_ids, model_worker_batch)
+            if launch_done is not None:
+                launch_done.set()
+            self.sync_queue.put((layers_topk_ids, model_worker_batch))
+            if future_map is not None:
+                return (logits_output, next_token_ids_device, cache_miss_count, new_future_map)
+            return (logits_output, next_token_ids_device, cache_miss_count)
+
         logits_output, cache_miss_count, layers_topk_ids = self.model_runner.forward(
             forward_batch,
             logits_metadata=logits_metadata,

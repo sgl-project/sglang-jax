@@ -1,5 +1,7 @@
 """ModelRunner runs the forward passes of the models."""
 
+import contextlib
+import dataclasses
 import logging
 from functools import partial
 
@@ -8,6 +10,8 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from jax._src import mesh as mesh_lib
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.configs.model_config import AttentionArch, MockModelConfig, ModelConfig
@@ -18,6 +22,7 @@ from sgl_jax.srt.eplb.expert_location import (
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.layers.routed_experts_capturer import (
     RoutedExpertsCapturer,
+    get_routed_expert_count,
     set_global_experts_capturer,
 )
 from sgl_jax.srt.layers.sampler import Sampler, compute_logprobs
@@ -28,6 +33,10 @@ from sgl_jax.srt.managers.schedule_batch import (
 )
 from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+from sgl_jax.srt.model_executor.aot_dispatch import (
+    AotDispatcher,
+    aot_dispatch_requested,
+)
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
@@ -43,6 +52,21 @@ from sgl_jax.srt.utils.common_utils import get_bool_env_var
 from sgl_jax.srt.utils.jax_utils import get_available_device_memory
 
 logger = logging.getLogger(__name__)
+
+
+def _maybe_apply_recurrent_cow(forward_batch, memory_pools):
+    """One-shot CoW: clone matched tree slots (src, 0 = skip) into running slots
+    before any recurrent read; no-op when nothing is pending."""
+    src = getattr(forward_batch, "recurrent_cow_src_indices", None)
+    if src is None or forward_batch.recurrent_indices is None:
+        return memory_pools
+    rsp = memory_pools.recurrent_state_pool
+    new_recurrent, new_conv = rsp.copy_slots(src, forward_batch.recurrent_indices)
+    _, aux = rsp.tree_flatten()
+    new_rsp = type(rsp).tree_unflatten(aux, (new_recurrent, new_conv))
+    pools = dict(memory_pools._pools)
+    pools["recurrent_state_pool"] = new_rsp
+    return type(memory_pools)(**pools)
 
 
 class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
@@ -179,7 +203,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 dist_recorder_buffer_size=self.server_args.expert_distribution_recorder_buffer_size,
                 dist_recorder_output_file=self.server_args.expert_distribution_recorder_output_file,
                 physical_expert_counts=self.server_args.ep_num_redundant_experts
-                + getattr(self.model_config.hf_config, "num_experts", 0),
+                + (get_routed_expert_count(self.model_config) or 0),
             )
         )
 
@@ -187,6 +211,34 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         model_def, model_state = nnx.split(self.model)
         # note export for external modification
         self.model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
+        # Static-quant checkpoints can leave jax.ShapeDtypeStruct placeholders
+        # in module state (e.g. the pre-quant weight slot of QuantizedLinear
+        # when the weight mapping targets .weight_q). jaxlib's ToPyArgSignature
+        # rejects ShapeDtypeStruct, so ComputeCallSignature fails and every
+        # jitted_run_model call falls back to the python dispatch path -- the
+        # per-decode-step cpp cache miss of #1452. The placeholders are dead
+        # on the forward path (a used leaf with a changed shape would fail to
+        # compile); swap them for zero-length arrays so the cpp fastpath can
+        # build a signature.
+        _sds_paths = []
+        _state_paths = None
+        for _i, _x in enumerate(self.model_state_leaves):
+            if isinstance(_x, jax.ShapeDtypeStruct):
+                if _state_paths is None:
+                    _state_paths = jax.tree_util.tree_flatten_with_path(model_state)[0]
+                _sds_paths.append(jax.tree_util.keystr(_state_paths[_i][0]))
+                self.model_state_leaves[_i] = jax.device_put(
+                    jnp.zeros((0,), dtype=_x.dtype), NamedSharding(self.mesh, P())
+                )
+        if _sds_paths:
+            logger.info(
+                "[model_runner] replaced %d ShapeDtypeStruct state placeholders "
+                "with empty arrays (pjit cpp fastpath, #1452); e.g. %s",
+                len(_sds_paths),
+                _sds_paths[:4],
+            )
+        self._model_def = model_def
+        self._model_state_def = model_state_def
         sampler_def, sampler_state = nnx.split(self.sampler)
         sampler_state_leaves, sampler_state_def = jax.tree_util.tree_flatten(sampler_state)
 
@@ -218,6 +270,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         ):
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
+            memory_pools = _maybe_apply_recurrent_cow(forward_batch, memory_pools)
             with LoraBatchContext.set_batch(forward_batch):
                 return model(forward_batch, memory_pools, logits_metadata)
 
@@ -225,6 +278,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         # fold_in(constant, dynamic_step) is computed inside JIT, avoiding
         # the eager jax.random.split that would serialize the host-device pipeline.
         base_rng_key = self._sampler_base_rng
+        _fused_mesh = self.mesh
 
         @partial(jax.jit, static_argnames=["sampler_state_def", "use_sort_for_toppk_minp"])
         def jitted_sampler(
@@ -247,27 +301,177 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         def jitted_compute_logprobs(mesh, logits, next_tokens):
             return compute_logprobs(mesh, logits, next_tokens)
 
-        def run_model_wrapper(forward_batch, logits_metadata):
-            return jitted_run_model(
+        # Opt-in (SGLANG_JAX_AOT_DISPATCH=auto|1): weights enter jit as
+        # ~thousands of flat args; AotDispatcher skips pjit's per-arg Python
+        # dispatch (O(n_args) checks + shard_args) by caching an AOT
+        # executable per batch-shape and pre-sharding the weight buffers
+        # once. See aot_dispatch.py. run_precompile drives the same wrapper,
+        # so precompiled deployments start fully warm. Off by default; the
+        # stock pjit path below is untouched. Speculative decoding always
+        # uses the stock path (interaction not yet supported).
+        use_aot_dispatch = aot_dispatch_requested()
+        if use_aot_dispatch and self.server_args.speculative_algorithm:
+            logger.warning(
+                "SGLANG_JAX_AOT_DISPATCH is set but speculative decoding is "
+                "enabled; falling back to the stock pjit dispatch path."
+            )
+            use_aot_dispatch = False
+
+        if use_aot_dispatch:
+            self._run_model_dispatcher = AotDispatcher(
+                jitted_run_model,
+                stable_call_args=(model_def, model_state_def, self.model_state_leaves),
+                stable_flat_args=(model_def, self.model_state_leaves),
+                name="run_model",
+            )
+
+            def run_model_wrapper(forward_batch, logits_metadata):
+                # LoRA weight loading rebinds self.model_state_leaves to a new
+                # list (tp_worker.prepare_lora_batch); the dispatcher must not
+                # keep executing with the buffers captured at construction.
+                self._run_model_dispatcher.ensure_stable_args(
+                    (model_def, model_state_def, self.model_state_leaves),
+                    (model_def, self.model_state_leaves),
+                )
+                return self._run_model_dispatcher(
+                    forward_batch,
+                    self.memory_pools,
+                    logits_metadata,
+                )
+
+            self.jitted_run_model = run_model_wrapper
+
+            self._sampler_dispatcher = AotDispatcher(
+                jitted_sampler,
+                stable_call_args=(
+                    sampler_def,
+                    sampler_state_def,
+                    sampler_state_leaves,
+                    self.use_sort_for_toppk_minp,
+                ),
+                stable_flat_args=(sampler_def, sampler_state_leaves),
+                name="sampler",
+            )
+
+            self.jitted_sampler = self._sampler_dispatcher
+        else:
+
+            def run_model_wrapper(forward_batch, logits_metadata):
+                return jitted_run_model(
+                    model_def,
+                    model_state_def,
+                    self.model_state_leaves,
+                    forward_batch,
+                    self.memory_pools,
+                    logits_metadata,
+                )
+
+            self.jitted_run_model = run_model_wrapper
+
+            self.jitted_sampler = partial(
+                jitted_sampler,
+                sampler_def,
+                sampler_state_def,
+                sampler_state_leaves,
+                self.use_sort_for_toppk_minp,
+            )
+
+        self.jitted_compute_logprobs = partial(jitted_compute_logprobs, self.mesh)
+
+        # Pathways-PD: fuse resolve_future_token_ids + run_model + sampler +
+        # async_gather + set_future_token_ids into one jit so a decode tick is
+        # a single Execute through the ordered dispatch queue.
+        @partial(
+            jax.jit,
+            donate_argnames=["memory_pools"],
+            static_argnames=["model_state_def", "sampler_state_def", "use_sort_for_toppk_minp"],
+            compiler_options=jit_compiler_options,
+        )
+        def jitted_run_and_sample(
+            model_def,
+            model_state_def,
+            model_state_leaves,
+            forward_batch,
+            memory_pools,
+            logits_metadata,
+            sampler_def,
+            sampler_state_def,
+            sampler_state_leaves,
+            use_sort_for_toppk_minp,
+            rng_step,
+            sampling_metadata,
+            future_token_ids_map,
+        ):
+            # resolve_future_token_ids inlined: negative ids are future placeholders.
+            ids = forward_batch.input_ids
+            ids_g = jax.lax.with_sharding_constraint(ids, NamedSharding(_fused_mesh, P()))
+            resolved = jnp.where(
+                ids_g < 0,
+                future_token_ids_map.at[jnp.clip(-ids_g, min=0)].get(
+                    out_sharding=NamedSharding(_fused_mesh, P())
+                ),
+                ids_g,
+            )
+            resolved = jax.lax.with_sharding_constraint(
+                resolved, NamedSharding(_fused_mesh, P("data"))
+            )
+            forward_batch = dataclasses.replace(forward_batch, input_ids=resolved)
+
+            model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
+            model = nnx.merge(model_def, model_state)
+            with LoraBatchContext.set_batch(forward_batch):
+                output, pool_updates, aux, layers_topk_ids = model(
+                    forward_batch, memory_pools, logits_metadata
+                )
+            s_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
+            sampler = nnx.merge(sampler_def, s_state)
+            rng_key = jax.random.fold_in(base_rng_key, rng_step)
+            next_ids, token_logprobs, _new_output = sampler(
+                output,
+                sampling_metadata,
+                use_sort_for_toppk_minp=use_sort_for_toppk_minp,
+                rng_override=rng_key,
+            )
+            # async_gather + set_future_token_ids inlined. Per-request slot
+            # scatter (req_pool_idx + 1); padding rows (seq_lens == 0) go out
+            # of bounds and are dropped. See managers/utils.set_future_token_ids.
+            next_ids = jax.lax.with_sharding_constraint(next_ids, NamedSharding(_fused_mesh, P()))
+            slot_ids = jnp.where(
+                forward_batch.seq_lens > 0,
+                forward_batch.req_pool_indices.astype(jnp.int32) + 1,
+                jnp.int32(future_token_ids_map.shape[0]),
+            )
+            slot_ids = jax.lax.with_sharding_constraint(slot_ids, NamedSharding(_fused_mesh, P()))
+            new_future_map = future_token_ids_map.at[slot_ids].set(next_ids, mode="drop")
+            return (
+                next_ids,
+                output,
+                pool_updates,
+                aux,
+                layers_topk_ids,
+                token_logprobs,
+                new_future_map,
+            )
+
+        def run_and_sample_wrapper(forward_batch, logits_metadata, sampling_metadata, future_map):
+            self._sampler_step += 1
+            return jitted_run_and_sample(
                 model_def,
                 model_state_def,
                 self.model_state_leaves,
                 forward_batch,
                 self.memory_pools,
                 logits_metadata,
+                sampler_def,
+                sampler_state_def,
+                sampler_state_leaves,
+                self.use_sort_for_toppk_minp,
+                self._sampler_step,
+                sampling_metadata,
+                future_map,
             )
 
-        self.jitted_run_model = run_model_wrapper
-
-        self.jitted_sampler = partial(
-            jitted_sampler,
-            sampler_def,
-            sampler_state_def,
-            sampler_state_leaves,
-            self.use_sort_for_toppk_minp,
-        )
-
-        self.jitted_compute_logprobs = partial(jitted_compute_logprobs, self.mesh)
+        self.jitted_run_and_sample = run_and_sample_wrapper
 
     def get_available_device_memory(self):
         distributed = jax.process_count() != 1
@@ -313,7 +517,13 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         # KV via kv_b_proj and run standard attention. Read by
         # DeepseekV3DecoderLayer to construct DeepseekV3Attention; harmless on
         # non-MLA models that ignore the attribute.
-        self.model_config.hf_config.use_absorbed_mla = self.server_args.attention_backend == "fa"
+        self.model_config.hf_config.use_absorbed_mla = self.server_args.attention_backend in (
+            "fa",
+            "dsa_sparse",
+        )
+        self.model_config.hf_config.use_dsa_sparse = (
+            self.server_args.attention_backend == "dsa_sparse"
+        )
         self.model_config.hf_config.enable_sequence_parallel = (
             self.server_args.enable_sequence_parallel
         )
@@ -379,6 +589,23 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 # if there is no aux layer, set to None
                 eagle_aux_hidden_state_layer_ids = None
             self.model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
+        elif self.server_args.speculative_algorithm == "DFLASH" and not self.is_draft_worker:
+            # The captured layers must match the draft checkpoint's projection input.
+            from sgl_jax.srt.speculative.dflash_util import parse_dflash_draft_config
+
+            try:
+                dflash_cfg = parse_dflash_draft_config(
+                    self.server_args.speculative_draft_model_path,
+                    self.server_args.speculative_draft_model_revision,
+                )
+                dflash_layer_ids = dflash_cfg.target_layer_ids
+            except Exception as e:
+                logger.warning("DFLASH: failed to parse draft config for aux layer capture: %s", e)
+                dflash_layer_ids = None
+            if hasattr(self.model, "set_dflash_layers_to_capture"):
+                self.model.set_dflash_layers_to_capture(dflash_layer_ids)
+            else:
+                self.model.set_eagle3_layers_to_capture(dflash_layer_ids)
 
     def adjust_layer_num(self):
         """For hybrid models, compute effective layer count accounting for
@@ -417,6 +644,17 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.attn_backend = self._get_attention_backend()
 
     def _get_attention_backend(self):
+        def _has_softmax_dtype(config) -> bool:
+            from sgl_jax.srt.configs.dtype_config import DtypeConfig
+
+            if isinstance(config, DtypeConfig):
+                return _has_softmax_dtype(config.config_dict)
+            if isinstance(config, dict):
+                if "softmax" in config and config["softmax"] is not None:
+                    return True
+                return any(_has_softmax_dtype(v) for v in config.values())
+            return False
+
         backend = self.server_args.attention_backend
         if self.server_args.device == "cpu" and backend in ("fa", "fa_mha"):
             logger.warning(
@@ -432,8 +670,40 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         elif backend == "fa" and self.use_mla_backend:
             from sgl_jax.srt.layers.attention.mla_backend import MLAAttentionBackend
 
+            if _has_softmax_dtype(self.model_config.dtype_config):
+                logger.warning(
+                    "Softmax dtype is not configurable for MLA backend through DtypeConfig."
+                )
             cfg = self.model_config.hf_text_config
             full_attn_backend = MLAAttentionBackend(
+                num_attn_heads=self.num_attn_heads,
+                kv_lora_rank=cfg.kv_lora_rank,
+                qk_nope_head_dim=cfg.qk_nope_head_dim,
+                qk_rope_head_dim=cfg.qk_rope_head_dim,
+                v_head_dim=cfg.v_head_dim,
+                page_size=self.page_size,
+                mesh=self.mesh,
+                attention_data_partition_axis="data",
+            )
+
+        elif backend == "dsa_sparse" and self.use_mla_backend:
+            from sgl_jax.srt.kernels.dsa.ref import build_index_share_map
+            from sgl_jax.srt.layers.attention.dsa_sparse_backend import (
+                DSASparseAttentionBackend,
+            )
+
+            cfg = self.model_config.hf_text_config
+            full_slot, _, _ = build_index_share_map(
+                getattr(cfg, "indexer_types", None),
+                getattr(cfg, "index_skip_topk_offset", 0),
+                cfg.num_hidden_layers,
+            )
+            full_attn_backend = DSASparseAttentionBackend(
+                index_topk=cfg.index_topk,
+                index_head_dim=cfg.index_head_dim,
+                index_n_heads=cfg.index_n_heads,
+                skip_offset=getattr(cfg, "index_skip_topk_offset", 0),
+                full_slot=full_slot,
                 num_attn_heads=self.num_attn_heads,
                 kv_lora_rank=cfg.kv_lora_rank,
                 qk_nope_head_dim=cfg.qk_nope_head_dim,
@@ -483,21 +753,56 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         cache_miss_count = 0
         import jax._src.test_util as jtu
 
-        with jtu.count_pjit_cpp_cache_miss() as count:
-            output, pool_updates, _, layers_topk_ids = self.jitted_run_model(
-                forward_batch, logits_metadata
-            )
-            cache_miss_count = count()
+        # _donate_lock (set by PD scheduler init) serializes the donate-dispatch
+        # → replace_all window against the main-thread scatter_from_dmesh which
+        # also donates the same kv_buffer list. IFRT marks the input deleted the
+        # instant kDonateInput dispatches, so a GIL switch in this window lets
+        # scatter read a deleted array.
+        _kv_lock = getattr(self.token_to_kv_pool, "_donate_lock", None)
+        with _kv_lock if _kv_lock is not None else contextlib.nullcontext():
+            with jtu.count_pjit_cpp_cache_miss() as count:
+                output, pool_updates, _, layers_topk_ids = self.jitted_run_model(
+                    forward_batch, logits_metadata
+                )
+                cache_miss_count = count()
 
-        # tp_size==1: sharding constraint is lost after JIT; re-place explicitly.
-        # See https://github.com/sgl-project/sglang-jax/issues/233
-        if self.tp_size == 1 and isinstance(pool_updates, list):
-            target_sharding = self.token_to_kv_pool.kv_sharding
-            pool_updates = [jax.device_put(kv, target_sharding) for kv in pool_updates]
-        self.memory_pools.replace_all(pool_updates)
+            # tp_size==1: sharding constraint is lost after JIT; re-place explicitly.
+            # See https://github.com/sgl-project/sglang-jax/issues/233
+            if self.tp_size == 1 and isinstance(pool_updates, list):
+                target_sharding = self.token_to_kv_pool.kv_sharding
+                pool_updates = [jax.device_put(kv, target_sharding) for kv in pool_updates]
+            self.memory_pools.replace_all(pool_updates)
 
         # layers_topk_ids required real_bs and original_input_len which could not be stored in ForwardBatch
         return output, cache_miss_count, layers_topk_ids
+
+    def forward_and_sample(self, forward_batch, logits_metadata, sampling_metadata, future_map):
+        import jax._src.test_util as jtu
+
+        self.forward_pass_id += 1
+        # NOTE: no use_mesh here (unlike _forward_raw): wrapping sampler in the
+        # Explicit mesh context makes binary_search.py:148 select fail on
+        # mismatched shardings. Model shard_maps carry mesh explicitly.
+        _kv_lock = getattr(self.token_to_kv_pool, "_donate_lock", None)
+        with _kv_lock if _kv_lock is not None else contextlib.nullcontext():
+            with jtu.count_pjit_cpp_cache_miss() as count:
+                (
+                    next_ids,
+                    output,
+                    pool_updates,
+                    _,
+                    layers_topk_ids,
+                    token_logprobs,
+                    new_future_map,
+                ) = self.jitted_run_and_sample(
+                    forward_batch, logits_metadata, sampling_metadata, future_map
+                )
+                cache_miss_count = count()
+            if self.tp_size == 1 and isinstance(pool_updates, list):
+                target_sharding = self.token_to_kv_pool.kv_sharding
+                pool_updates = [jax.device_put(kv, target_sharding) for kv in pool_updates]
+            self.memory_pools.replace_all(pool_updates)
+        return next_ids, output, token_logprobs, cache_miss_count, layers_topk_ids, new_future_map
 
     def forward_idle(
         self,

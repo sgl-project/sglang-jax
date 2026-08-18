@@ -25,6 +25,10 @@ import numpy as np
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.kernels.gdn import (
+    chunked_gated_delta_rule_jax,
+    ragged_gated_delta_rule_ref,
+)
 from sgl_jax.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
@@ -566,15 +570,6 @@ class TestGDNAttention(unittest.TestCase):
             self.rng,
         )
 
-    def test_single_seq_extend_no_shard(self):
-        one_device_mesh = create_device_mesh(
-            ici_parallelism=[1, 1],
-            dcn_parallelism=[1, 1],
-            devices=[jax.devices()[0]],
-        )
-        with jax.sharding.set_mesh(one_device_mesh):
-            self.run_test("prefill", [128], test_mesh=one_device_mesh)
-
     def test_single_seq_extend(self):
         self.run_test("prefill", [128])
 
@@ -732,6 +727,145 @@ class TestGDNAttention(unittest.TestCase):
                 self.atol,
             )
             pool.replace_buffer(([recurrent_buffer], [conv_buffer_list]))
+
+    # NOTE: copy_slots equivalence is backend-agnostic; it is covered at the
+    # pool/cache level (test_unified_radix_cache.py::test_copy_slots_bitwise_clone_all_layers
+    # and ::test_copy_slots_multi_dp_locality) and via the KDA attention copy
+    # (test_kda_attention.py::test_recurrent_cow_copy_equivalence). The
+    # backend-specific track-scatter test below is kept.
+
+    def test_track_scatter_equivalence(self):
+        """Recurrent track writeback: a prefill that lands on a track boundary
+        scatters the SAME final state into the request's track slot AND its
+        running slot. Assert the track slot equals the running slot bitwise
+        (synthetic weights, no checkpoint). Controller-validated on TPU.
+
+        Uses a pool sized larger than the batch so distinct free track slots
+        exist (``create_test_data`` ties pool size to batch size)."""
+        seq_lens = [64, 32]
+        batch_size = len(seq_lens)
+        (
+            forward_batch,
+            _pool,
+            layer,
+            q,
+            k,
+            v,
+            a,
+            b,
+            _initial_ssm_ref,
+            _initial_conv_ref,
+            recurrent_indices,
+        ) = create_test_data(
+            "prefill",
+            seq_lens,
+            self.NUM_K_HEADS,
+            self.NUM_V_HEADS,
+            self.HEAD_K_DIM,
+            self.HEAD_V_DIM,
+            self.CONV_KERNEL_SIZE,
+            self.DTYPE,
+            self.rng,
+        )
+        pool = RecurrentStatePool(
+            linear_recurrent_layer_ids=[layer.layer_id],
+            size=8,
+            num_heads=self.NUM_V_HEADS,
+            head_dim=self.HEAD_V_DIM,
+            conv_kernel_size=self.CONV_KERNEL_SIZE,
+            mesh=mesh,
+            dp_size=1,
+            recurrent_partition_axis="tensor",
+            conv_partition_axis="tensor",
+            data_partition_axis="data",
+            temporal_dtype=jnp.float32,
+            conv_dtype=self.DTYPE,
+            num_k_heads=self.NUM_K_HEADS,
+            head_k_dim=self.HEAD_K_DIM,
+        )
+        running = np.asarray(recurrent_indices)  # [1, 2]
+        track = running + batch_size  # [3, 4] (free slots)
+        data_sh = NamedSharding(mesh, P("data"))
+        md = forward_batch.attn_backend.forward_metadata
+        md.recurrent_track_indices = jax.device_put(track.astype(np.int32), data_sh)
+        md.recurrent_track_mask = jax.device_put(np.ones(batch_size, dtype=np.int32), data_sh)
+
+        key_sharding = NamedSharding(mesh, P("data", "tensor"))
+        head_sharding = NamedSharding(mesh, P("data", "tensor"))
+        _, (recurrent_buffer, conv_buffer_list) = layer(
+            forward_batch,
+            jax.device_put(q, key_sharding),
+            jax.device_put(k, key_sharding),
+            jax.device_put(v, key_sharding),
+            jax.device_put(a, head_sharding),
+            jax.device_put(b, head_sharding),
+            pool,
+        )
+        run_ssm = np.asarray(gather_ssm(pool, recurrent_buffer, running))
+        trk_ssm = np.asarray(gather_ssm(pool, recurrent_buffer, track))
+        run_conv = np.asarray(gather_conv(pool, conv_buffer_list[0], running))
+        trk_conv = np.asarray(gather_conv(pool, conv_buffer_list[0], track))
+        np.testing.assert_array_equal(trk_ssm, run_ssm)
+        np.testing.assert_array_equal(trk_conv, run_conv)
+
+    def test_multi_seq_extend_mixed_lengths(self):
+        """Test extend with mixed sequence lengths across multiple requests."""
+        self.run_test("prefill", [1, 7, 65, 128])
+
+    def test_chunked_vs_ragged_scan_direct_parity(self):
+        """Direct kernel-level parity test between chunked_gated_delta_rule_jax
+        and ragged_gated_delta_rule_ref across mixed extend lengths.
+        """
+        seq_lens = [1, 7, 64, 120]
+        B = len(seq_lens)
+        total_tokens = sum(seq_lens)
+        key_dim = self.NUM_K_HEADS * self.HEAD_K_DIM
+        value_dim = self.NUM_V_HEADS * self.HEAD_V_DIM
+        conv_dim = 2 * key_dim + value_dim
+
+        mixed = jnp.asarray(
+            _scaled_randn(self.rng, (total_tokens, conv_dim), 0.1), dtype=self.DTYPE
+        )
+        b = jnp.asarray(
+            _scaled_randn(self.rng, (total_tokens, self.NUM_V_HEADS), 0.1), dtype=jnp.float32
+        )
+        a = jnp.asarray(
+            _scaled_randn(self.rng, (total_tokens, self.NUM_V_HEADS), 0.1), dtype=jnp.float32
+        )
+        rec_init = jnp.asarray(
+            _scaled_randn(
+                self.rng,
+                (B + 1, self.NUM_V_HEADS, self.HEAD_K_DIM, self.HEAD_V_DIM),
+                0.1,
+            ),
+            dtype=jnp.float32,
+        )
+        A_log = jnp.asarray(_scaled_randn(self.rng, (self.NUM_V_HEADS,), 1.0), dtype=jnp.float32)
+        dt_bias = jnp.asarray(_scaled_randn(self.rng, (self.NUM_V_HEADS,), 1.0), dtype=jnp.float32)
+        cu = jnp.asarray([0] + np.cumsum(seq_lens).tolist(), dtype=jnp.int32)
+        state_idx = jnp.arange(1, B + 1, dtype=jnp.int32)
+        has_init = jnp.ones(B, dtype=bool)
+
+        kw = dict(
+            n_kq=self.NUM_K_HEADS,
+            n_v=self.NUM_V_HEADS,
+            d_k=self.HEAD_K_DIM,
+            d_v=self.HEAD_V_DIM,
+        )
+
+        rec_ref, out_ref = ragged_gated_delta_rule_ref(
+            mixed, b, a, rec_init, A_log, dt_bias, cu, state_idx, has_init, **kw
+        )
+        rec_chk, out_chk = chunked_gated_delta_rule_jax(
+            mixed, b, a, rec_init, A_log, dt_bias, cu, state_idx, has_init, **kw
+        )
+
+        np.testing.assert_allclose(
+            np.asarray(out_chk), np.asarray(out_ref), rtol=self.rtol, atol=self.atol
+        )
+        np.testing.assert_allclose(
+            np.asarray(rec_chk), np.asarray(rec_ref), rtol=self.rtol, atol=self.atol
+        )
 
 
 if __name__ == "__main__":

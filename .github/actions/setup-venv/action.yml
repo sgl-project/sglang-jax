@@ -2,7 +2,7 @@ name: 'Setup Python venv'
 description: 'Create Python 3.12 venv, install uv and project dependencies'
 inputs:
   install-target:
-    description: 'Project install target passed to `uv pip install -e` (e.g. "python[cpu]", "python[all]")'
+    description: 'Project install target passed to `uv pip install -e` (e.g. "python[cpu]", "python[all]"); empty skips project installation'
     required: false
     default: 'python[all]'
   extra-packages:
@@ -12,6 +12,11 @@ inputs:
 runs:
   using: "composite"
   steps:
+    - name: Install Python 3.12 and venv support
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y python3.12 python3.12-venv
     - name: Create venv and install dependencies
       shell: bash
       env:
@@ -21,7 +26,9 @@ runs:
         python3.12 -m venv .venv
         source .venv/bin/activate
         pip install uv
-        uv pip install -e "$INSTALL_TARGET"
+        if [ -n "$INSTALL_TARGET" ]; then
+          uv pip install -e "$INSTALL_TARGET"
+        fi
         if [ -n "$EXTRA_PACKAGES" ]; then
           set -f
           # shellcheck disable=SC2086

@@ -3,6 +3,7 @@ from __future__ import annotations
 import abc
 import logging
 import time
+from functools import partial
 from typing import TYPE_CHECKING
 
 import jax
@@ -22,6 +23,34 @@ from sgl_jax.srt.kernels.update_kv_cache.update_kv_cache import (
     kv_cache_update,
     kv_cache_update_impl,
 )
+
+# Module-level cache for jitted zero-allocators.
+# Keyed by (mesh_id, shape, dtype, sharding_spec, memory_kind).
+# Caches the FUNCTION (not the tensor) — each call returns fresh zeros.
+_KV_ZERO_ALLOCATOR_CACHE: dict = {}
+
+
+def _get_kv_zero_allocator(shape, dtype, sharding):
+    """Return a cached jax.jit(jnp.zeros) allocator for the given spec.
+
+    Avoids repeated JAX trace/compile overhead when _create_buffers()
+    allocates N identical layers. The allocator function is cached;
+    each call to the returned function still produces a fresh
+    zero-initialised tensor.
+    """
+    key = (
+        id(sharding.mesh),
+        tuple(shape),
+        str(jnp.dtype(dtype)),
+        repr(sharding.spec),
+        getattr(sharding, "memory_kind", None),
+    )
+    if key not in _KV_ZERO_ALLOCATOR_CACHE:
+        _KV_ZERO_ALLOCATOR_CACHE[key] = jax.jit(
+            partial(jnp.zeros, shape=tuple(shape), dtype=dtype),
+            out_shardings=sharding,
+        )
+    return _KV_ZERO_ALLOCATOR_CACHE[key]
 
 
 def merge_kv(k: jax.Array, v: jax.Array) -> jax.Array:
@@ -183,10 +212,18 @@ class HybridReqToTokenPool(ReqToTokenPool):
         dtype: np.dtype,
         recurrent_state_pool,
         dp_size: int = 1,
+        enable_recurrent_extra_buffer: bool = False,
+        ping_pong_slots: int = 2,
     ):
         super().__init__(size=size, max_context_len=max_context_len, dtype=dtype)
         self.recurrent_state_pool = recurrent_state_pool
         self.dp_size = dp_size
+        self.enable_recurrent_extra_buffer = enable_recurrent_extra_buffer
+        # Ping-pong track slots a req holds under extra-buffer: 2 with overlap
+        # scheduling (double-buffer across the overlap boundary), 1 without
+        # (--disable-overlap-schedule) -- the boundary state is committed before
+        # the next forward, so a single track slot suffices.
+        self.ping_pong_slots = ping_pong_slots
         # recurrent_state_pool.size is global (mirrors MHATokenToKVPool).
         # Divisibility is asserted inside RecurrentStatePool.__init__.
         self.slots_per_rank = recurrent_state_pool.size // dp_size
@@ -194,12 +231,25 @@ class HybridReqToTokenPool(ReqToTokenPool):
             list(range(1, self.slots_per_rank + 1)) for _ in range(dp_size)
         ]
         self.req_index_to_recurrent_index_mapping = np.zeros(size, dtype=np.int32)
+        # Extra-buffer ping-pong track slots: (req_pool_idx, ping_pong_slots),
+        # parallel to req_index_to_recurrent_index_mapping.
+        self.req_index_to_recurrent_ping_pong_track_buffer_mapping = np.zeros(
+            (size, ping_pong_slots), dtype=np.int32
+        )
+
+    @property
+    def request_owned_slots(self) -> int:
+        """Recurrent slots a running req actually consumes: 1 running plus the
+        ping-pong track slots under extra-buffer (1 otherwise). Distinct from the
+        sizing back-cap's reservation factor, whose surplus is snapshot headroom."""
+        return 1 + self.ping_pong_slots if self.enable_recurrent_extra_buffer else 1
 
     def alloc(self, reqs: list[Req]) -> list[int] | None:
         # dp_rank from reqs[0]: callers (prepare_for_extend/decode) iterate per-DP,
         # so all reqs in a single alloc() call share the same dp_rank.
         dp_rank = reqs[0].dp_rank if reqs and reqs[0].dp_rank is not None else 0
-        needed = sum(1 for r in reqs if r.recurrent_pool_idx is None)
+        per_req = self.request_owned_slots
+        needed = per_req * sum(1 for r in reqs if r.recurrent_pool_idx is None)
         if needed > len(self.recurrent_free_slots[dp_rank]):
             return None
 
@@ -207,28 +257,120 @@ class HybridReqToTokenPool(ReqToTokenPool):
         if result is None:
             return None
 
-        new_indices = []
         for r in reqs:
             if r.recurrent_pool_idx is None:
-                slot = self.recurrent_free_slots[dp_rank].pop(0)
+                slot = self.alloc_recurrent_slot(dp_rank)
                 r.recurrent_pool_idx = slot
                 self.req_index_to_recurrent_index_mapping[r.req_pool_idx] = slot
-                new_indices.append(slot)
+                if self.enable_recurrent_extra_buffer:
+                    self._alloc_ping_pong_buffer(r, dp_rank)
 
         return result
 
+    def alloc_recurrent_slot(self, dp_rank: int = 0) -> int | None:
+        slots = self.recurrent_free_slots[dp_rank]
+        if not slots:
+            return None
+        return slots.pop(0)
+
+    def free_recurrent_slot(self, slot: int, dp_rank: int = 0) -> None:
+        self.recurrent_free_slots[dp_rank].append(int(slot))
+
+    @staticmethod
+    def recurrent_value_from_slot(slot: int) -> np.ndarray:
+        return np.array([int(slot)], dtype=np.int32)
+
+    def _alloc_ping_pong_buffer(self, req: Req, dp_rank: int) -> list[int] | None:
+        """Pop ``ping_pong_slots`` free slots for a request's ping-pong track
+        buffer; store them in the req + mapping. Returns None (without partial
+        mutation) if fewer than ``ping_pong_slots`` free slots remain (caller
+        handles the shortfall)."""
+        slots = self.recurrent_free_slots[dp_rank]
+        n = self.ping_pong_slots
+        if len(slots) < n:
+            return None
+        buffer = [slots.pop(0) for _ in range(n)]
+        req.recurrent_ping_pong_track_buffer = buffer
+        req.recurrent_next_track_idx = 0
+        req.recurrent_last_track_seqlen = None
+        self.req_index_to_recurrent_ping_pong_track_buffer_mapping[req.req_pool_idx] = np.array(
+            buffer, dtype=np.int32
+        )
+        return buffer
+
+    def get_recurrent_ping_pong_other_idx(self, next_idx: int) -> int:
+        """The buffer index that is NOT the next-scatter target. With a single
+        track slot (overlap disabled) there is no other slot, so this returns 0
+        (keep == next == the sole slot)."""
+        return (next_idx + 1) % self.ping_pong_slots
+
+    def get_recurrent_ping_pong_keep_idx(self, req: Req) -> int:
+        """Buffer index holding the most-recently materialized boundary: the
+        slot the next scatter does NOT overwrite."""
+        return self.get_recurrent_ping_pong_other_idx(req.recurrent_next_track_idx)
+
+    def set_recurrent_ping_pong_slot(self, req: Req, idx: int, slot: int) -> None:
+        """Point buffer slot ``idx`` at ``slot`` in both the req and the mapping."""
+        req.recurrent_ping_pong_track_buffer[idx] = int(slot)
+        self.req_index_to_recurrent_ping_pong_track_buffer_mapping[req.req_pool_idx, idx] = int(
+            slot
+        )
+
+    def donate_recurrent_ping_pong_slot(self, req: Req, new_slot: int) -> np.ndarray:
+        """Donate the current KEEP slot to the tree: return its length-1 int32
+        tree value, then replace it in the buffer + mapping with ``new_slot``."""
+        keep_idx = self.get_recurrent_ping_pong_keep_idx(req)
+        keep_slot = req.recurrent_ping_pong_track_buffer[keep_idx]
+        value = self.recurrent_value_from_slot(keep_slot)
+        self.set_recurrent_ping_pong_slot(req, keep_idx, new_slot)
+        return value
+
+    def count_request_owned_recurrent_slots(self, live_reqs: list[Req], dp_rank: int = 0) -> int:
+        """Count request-owned recurrent slots (running + ping-pong track) held by
+        the live requests on ``dp_rank``. Lets the ledger check
+        ``owned + tree_owned + free == slots_per_rank`` catch a leaked slot."""
+        count = 0
+        for req in live_reqs:
+            req_rank = req.dp_rank if req.dp_rank is not None else 0
+            if req_rank != dp_rank:
+                continue
+            if req.recurrent_pool_idx is not None:
+                count += 1
+            track = getattr(req, "recurrent_ping_pong_track_buffer", None)
+            if track is not None:
+                count += sum(1 for s in track if s)
+        return count
+
+    def commit_to_tree(self, req: Req) -> None:
+        """Transfer running-slot ownership to the tree; the slot is not freed."""
+        if req.recurrent_pool_idx is None:
+            return
+        self.req_index_to_recurrent_index_mapping[req.req_pool_idx] = 0
+        req.recurrent_pool_idx = None
+
     def free(self, req: Req):
+        # No double-free: free_recurrent_cache no-ops on slots donated via
+        # commit_to_tree (the request handle was cleared).
         self.free_recurrent_cache(req)
         super().free(req)
 
     def free_recurrent_cache(self, req: Req):
         recurrent_idx = req.recurrent_pool_idx
-        if recurrent_idx is None:
-            return
         dp_rank = req.dp_rank if req.dp_rank is not None else 0
-        self.recurrent_free_slots[dp_rank].append(recurrent_idx)
-        self.req_index_to_recurrent_index_mapping[req.req_pool_idx] = 0
-        req.recurrent_pool_idx = None
+        if recurrent_idx is not None:
+            self.free_recurrent_slot(recurrent_idx, dp_rank)
+            self.req_index_to_recurrent_index_mapping[req.req_pool_idx] = 0
+            req.recurrent_pool_idx = None
+        # Return every request-owned track slot (slot 0/None are never owned).
+        track = getattr(req, "recurrent_ping_pong_track_buffer", None)
+        if track is not None:
+            for slot in track:
+                if slot:
+                    self.free_recurrent_slot(slot, dp_rank)
+            self.req_index_to_recurrent_ping_pong_track_buffer_mapping[req.req_pool_idx] = 0
+            req.recurrent_ping_pong_track_buffer = None
+            req.recurrent_next_track_idx = None
+            req.recurrent_last_track_seqlen = None
 
     def get_linear_recurrent_indices(self, req_pool_indices) -> np.ndarray:
         return self.req_index_to_recurrent_index_mapping[req_pool_indices]
@@ -242,6 +384,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         for rank in range(self.dp_size):
             self.recurrent_free_slots[rank] = list(range(1, self.slots_per_rank + 1))
         self.req_index_to_recurrent_index_mapping.fill(0)
+        self.req_index_to_recurrent_ping_pong_track_buffer_mapping.fill(0)
 
 
 @register_pytree_node_class
@@ -454,18 +597,11 @@ class MHATokenToKVPool(KVCache):
             total_memory_per_layer / GB,
             self.dtype,
         )
-        with self.mesh:
+        with jax.set_mesh(self.mesh):
             self.kv_buffer = []
+            allocate = _get_kv_zero_allocator(fused_buffer_shape, self.dtype, self.kv_sharding)
             for _ in range(self.layer_num):
-                kv_buf = jax.jit(
-                    lambda: jnp.zeros(
-                        shape=fused_buffer_shape,
-                        dtype=self.dtype,
-                    ),
-                    out_shardings=self.kv_sharding,
-                )()
-
-                self.kv_buffer.append(kv_buf)
+                self.kv_buffer.append(allocate())
 
         end_time = time.time()
         logger.info(
@@ -846,6 +982,63 @@ def _set_fused_kv_buffer(
     )
 
 
+@partial(
+    jax.jit,
+    static_argnames=(
+        "page_size",
+        "kv_partition_axis",
+        "attention_data_partition_axis",
+        "mesh",
+    ),
+    donate_argnames=("kv_cache",),
+)
+def write_kv_layer(
+    layer_kv,
+    loc,
+    kv_cache,
+    page_size,
+    kv_partition_axis,
+    attention_data_partition_axis,
+    mesh,
+):
+    """One-layer in-place KV write, wrapped in a module-level ``jax.jit``.
+
+    Shared by PD decode write-back and HiCache H2D load-back. ``layer_kv`` is
+    ``[total_tokens, *per_token_shape]``; ``loc`` is per-token absolute pool
+    slots (-1 marks padding, skipped). The write goes through the in-place
+    Pallas kernel (``_set_fused_kv_buffer`` -> ``update_fused_kv_cache_vectorized``
+    with ``input_output_aliases``), so the footprint scales with the tokens
+    written, not the whole pool. The stable module-level ``jax.jit`` makes the
+    trace cache hit on shape + static args so the kernel compiles once per write
+    shape and is reused thereafter.
+    """
+    total_tokens = loc.shape[0]
+    fused_sharding = NamedSharding(
+        mesh,
+        P(
+            attention_data_partition_axis,
+            None,
+            kv_partition_axis,
+            None,
+            None,
+        ),
+    )
+    fused = jax.lax.reshape(
+        layer_kv,
+        (total_tokens, 1) + tuple(layer_kv.shape[2:]),
+        out_sharding=fused_sharding,
+    )
+    return _set_fused_kv_buffer(
+        fused_kv=fused,
+        loc=loc,
+        kv_cache=kv_cache,
+        page_size=page_size,
+        kv_partition_axis=kv_partition_axis,
+        attention_data_partition_axis=attention_data_partition_axis,
+        mesh=mesh,
+    )
+
+
 def update_fused_kv_cache(
     fused_kv: jax.Array,  # [tokens, 1, heads*2//packing, packing, head_dim]
     loc: jax.Array,  # [total_tokens], -1 for padding
@@ -1038,6 +1231,8 @@ class MLATokenToKVPool(KVCache):
         dp_size: int = 1,
         start_layer: int | None = None,
         end_layer: int | None = None,
+        indexer_key_dim: int = 0,
+        num_indexer_layers: int = 0,
     ):
         super().__init__(size, page_size, dtype, layer_num, mesh, start_layer, end_layer)
         self.kv_lora_rank = kv_lora_rank
@@ -1050,6 +1245,8 @@ class MLATokenToKVPool(KVCache):
         self.nope_dim = align_to(kv_lora_rank, 128)
         self.rope_dim = align_to(qk_rope_head_dim, 128)
         self.kv_dim = self.nope_dim + self.rope_dim
+        self.indexer_key_dim = align_to(indexer_key_dim, 128) if indexer_key_dim else 0
+        self.num_indexer_layers = num_indexer_layers
 
         self._create_buffers()
         self._calculate_memory_usage()
@@ -1057,7 +1254,7 @@ class MLATokenToKVPool(KVCache):
     def tree_flatten(self):
         parent_children, parent_aux_data = super().tree_flatten()
 
-        children = (self.kv_buffer,) + parent_children
+        children = (self.kv_buffer, self.indexer_key_buffer) + parent_children
         aux_data = {
             **parent_aux_data,
             "kv_lora_rank": self.kv_lora_rank,
@@ -1068,13 +1265,16 @@ class MLATokenToKVPool(KVCache):
             "rope_dim": self.rope_dim,
             "kv_dim": self.kv_dim,
             "kv_sharding": self.kv_sharding,
+            "indexer_key_dim": self.indexer_key_dim,
+            "num_indexer_layers": self.num_indexer_layers,
         }
         return (children, aux_data)
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         kv_buffer = children[0]
-        parent_children = children[1:] if len(children) > 1 else ()
+        indexer_key_buffer = children[1]
+        parent_children = children[2:] if len(children) > 2 else ()
 
         obj = object.__new__(cls)
 
@@ -1099,8 +1299,11 @@ class MLATokenToKVPool(KVCache):
         obj.rope_dim = aux_data["rope_dim"]
         obj.kv_dim = aux_data["kv_dim"]
         obj.kv_sharding = aux_data["kv_sharding"]
+        obj.indexer_key_dim = aux_data.get("indexer_key_dim", 0)
+        obj.num_indexer_layers = aux_data.get("num_indexer_layers", 0)
 
         obj.kv_buffer = kv_buffer
+        obj.indexer_key_buffer = indexer_key_buffer
 
         return obj
 
@@ -1150,14 +1353,42 @@ class MLATokenToKVPool(KVCache):
             per_layer_bytes / GB,
         )
 
-        with self.mesh:
+        with jax.set_mesh(self.mesh):
             self.kv_buffer = []
+            allocate = _get_kv_zero_allocator(buffer_shape, self.dtype, self.kv_sharding)
             for _ in range(self.layer_num):
-                kv_buf = jax.jit(
-                    lambda: jnp.zeros(shape=buffer_shape, dtype=self.dtype),
-                    out_shardings=self.kv_sharding,
-                )()
-                self.kv_buffer.append(kv_buf)
+                self.kv_buffer.append(allocate())
+
+            self.indexer_key_buffer = []
+            if self.indexer_key_dim > 0 and self.num_indexer_layers > 0:
+                idx_shape = get_kv_cache_shape(
+                    total_num_pages=total_num_pages,
+                    page_size=self.page_size,
+                    kv_dim=self.indexer_key_dim,
+                    kv_dtype=self.dtype,
+                )
+                logger.info(
+                    "DSA indexer-key cache: %d slots × %s (%.2f GB total)",
+                    self.num_indexer_layers,
+                    idx_shape,
+                    self.num_indexer_layers
+                    * idx_shape[0]
+                    * idx_shape[1]
+                    * idx_shape[2]
+                    * idx_shape[3]
+                    * jnp.dtype(self.dtype).itemsize
+                    / GB,
+                )
+                for _ in range(self.num_indexer_layers):
+                    self.indexer_key_buffer.append(
+                        jax.jit(
+                            lambda: jnp.zeros(shape=idx_shape, dtype=self.dtype),
+                            out_shardings=self.kv_sharding,
+                        )()
+                    )
+
+    def get_indexer_key_buffer(self, slot_id: int) -> jax.Array:
+        return self.indexer_key_buffer[slot_id]
 
     def _calculate_memory_usage(self):
         """Calculate memory usage for the 4D paged MLA cache."""
@@ -1214,7 +1445,11 @@ class MLATokenToKVPool(KVCache):
             "the MLA v2 kernel writes the cache in-place via input_output_aliases."
         )
 
-    def replace_buffer(self, kv_buffer: list[jax.Array]) -> None:
+    def replace_buffer(self, kv_buffer) -> None:
+        if isinstance(kv_buffer, tuple):
+            kv_buffer, idx_buffer = kv_buffer
+            if idx_buffer:
+                self.indexer_key_buffer[: len(idx_buffer)] = idx_buffer
         self.kv_buffer[self.start_layer : self.start_layer + len(kv_buffer)] = kv_buffer
 
     def get_cpu_copy(self, indices):

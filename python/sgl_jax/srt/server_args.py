@@ -79,6 +79,7 @@ class ServerArgs:
     quantization_param_path: str | None = None
     quantization_config_path: str | None = None
     kv_cache_dtype: str = "auto"
+    dtype_config: str | dict | None = None
 
     # Memory and scheduling
     mem_fraction_static: float | None = None
@@ -93,11 +94,21 @@ class ServerArgs:
     swa_full_tokens_ratio: float = 0.8
     recurrent_state_memory_ratio: float = 0.9
     max_recurrent_state_size: int | None = None
+    recurrent_track_interval: int | None = None
     disable_hybrid_swa_memory: bool = False
 
     # Runtime options
     device: str | None = None
     device_indexes: list[int] | None = None
+    pd_disaggregation: str = ""
+    pd_prefill_mem_fraction: float = 0.85
+    pd_decode_mem_fraction: float = 0.85
+    pd_prefill_max_tokens: int = 20480
+    pd_decode_max_tokens: int = 25600
+    pd_num_prefill: int = 1
+    pd_num_decode: int = 1
+    pd_prefill_tp_size: int = 0
+    pd_prefill_ep_size: int = 0
     tp_size: int = 1
     ep_size: int = 1
     ep_num_redundant_experts: int = 0
@@ -115,7 +126,7 @@ class ServerArgs:
 
     # Data parallel
     dp_size: int = 1
-    dp_schedule_policy: str = "min_running_queue"
+    dp_schedule_policy: str | None = None
 
     # Logging
     log_level: str = "info"
@@ -124,6 +135,7 @@ class ServerArgs:
     log_requests_level: int = 0
     crash_dump_folder: str | None = None
     show_time_cost: bool = False
+    enable_metrics: bool = False
     bucket_time_to_first_token: list[float] | None = None
     bucket_inter_token_latency: list[float] | None = None
     bucket_e2e_request_latency: list[float] | None = None
@@ -151,6 +163,18 @@ class ServerArgs:
     # Optimization/debug options
     disable_radix_cache: bool = False
     enable_unified_radix_tree: bool = False
+
+    # HiCache (L1<->L2 KV cache offloading). hicache_storage: "disable" off,
+    # "none" enables L1+L2 (host pinned pool), "file" still not supported.
+    hicache_storage: str = "disable"
+    hicache_ratio: float = 2.0
+    hicache_write_through_threshold: int = 1
+    # Write policy:
+    #   write_through            backup on hit_count >= threshold (default)
+    #   write_through_selective  same path, just a higher threshold
+    #   write_back               no backup on hit; back up only at device eviction
+    hicache_write_policy: str = "write_through"
+    enable_recurrent_extra_buffer: bool = False
     allow_auto_truncate: bool = False
     enable_tokenizer_batch_encode: bool = False
     disable_overlap_schedule: bool = False
@@ -158,8 +182,10 @@ class ServerArgs:
 
     # Kernel backend
     attention_backend: str | None = "fa"
+    dsa_use_pallas: bool = True  # deprecated no-op; jnp-ref e2e path removed
     moe_backend: str = "epmoe"
     disable_jax_allreduce_metadata: bool = False
+    enable_topk_kernel: bool = True
 
     grammar_backend: str | None = None
 
@@ -224,12 +250,10 @@ class ServerArgs:
     # a host pool would fail every prefill request with
     # ``RuntimeError("use_d2h_staging=True requires a host_pool")``.
     disaggregation_enable_d2h: bool = False
+    disaggregation_use_raiden: bool = False
     disaggregation_side_channel_port: int = 9600
     disaggregation_d2h_pool_size: int = 64
     disaggregation_d2h_max_tokens: int | None = None
-    # Parallel ``jax_transfer`` channels per (P, D) pair. Four is the
-    # current validated default on v6e; set to 0/None to keep the
-    # wrapper's own default.
     disaggregation_channel_number: int = 4
     # Per-host IP this process publishes to the bootstrap server. If
     # None, resolve it during startup from HOSTNAME with a
@@ -247,6 +271,27 @@ class ServerArgs:
     # ``SGL_JAX_PD_SHARED_SECRET`` overrides this at process start.
     # ``None`` disables auth for backward compatibility.
     disaggregation_shared_secret: str | None = None
+    # Diagnostic: if > 0, a watchdog thread logs the stuck decode
+    # event-loop phase + backlog snapshot + main-thread traceback when a
+    # single loop tick exceeds this many seconds. 0 disables it. Opt-in
+    # for stress runs; off by default in production.
+    disaggregation_decode_watchdog_seconds: float = 0.0
+    # Decode-side admission headroom: per in-flight/running request, this
+    # many KV tokens are held back when admitting a queued PD request, so a
+    # running decode step can always alloc its next token even when every
+    # other request is mid-transfer (transfer-queue reqs cannot be
+    # retracted). Insufficient capacity defers admission (FIFO requeue),
+    # never aborts. Mirrors sglang's num_reserved_decode_tokens.
+    disaggregation_num_reserved_decode_tokens: int = 512
+    # Max concurrent in-flight KV transfers admitted on the decode side.
+    # Each in-flight pull allocates a destination buffer of the request's
+    # KV shape on decode HBM that lives until the buffer is scattered into
+    # the paged pool. The paged-pool budget gate does not account for these
+    # transient buffers, so without this cap a burst of concurrent requests
+    # allocates that many destination buffers at once and OOMs decode HBM.
+    # Excess requests stay in the prealloc queue and retry next tick
+    # (deferral, never abort). 0 disables the cap (unbounded).
+    disaggregation_max_inflight_transfers: int = 8
 
     def __post_init__(self):
         # Set missing default values
@@ -320,9 +365,93 @@ class ServerArgs:
         if self.grammar_backend is None:
             self.grammar_backend = "llguidance"
 
+        if isinstance(self.dtype_config, str):
+            if self.dtype_config.startswith("{"):
+                self.dtype_config = json.loads(self.dtype_config)
+            else:
+                with open(self.dtype_config) as f:
+                    self.dtype_config = json.load(f)
+
         # Normalize speculative_algorithm: treat empty string as None
         if isinstance(self.speculative_algorithm, str) and self.speculative_algorithm.strip() == "":
             self.speculative_algorithm = None
+
+        # Recurrent extra-buffer static validation + track-interval
+        # normalization. Gated on the flag so non-recurrent / base-path launches
+        # are untouched. Model-dependent checks (radix routing) live in
+        # _enforce_recurrent_state_server_constraints.
+        if self.enable_recurrent_extra_buffer:
+            if self.page_size <= 1:
+                raise ValueError(
+                    "--enable-recurrent-extra-buffer requires --page-size > 1 "
+                    f"(recurrent radix caching uses page-boundary track slots); "
+                    f"got page_size={self.page_size}."
+                )
+            # Default to chunked_prefill_size so snapshots land on existing
+            # chunk boundaries and add no extra prefill splits.
+            if self.recurrent_track_interval is None:
+                if self.chunked_prefill_size and self.chunked_prefill_size > 0:
+                    # check_server_args() asserts chunk page-alignment later; check
+                    # here so the error blames the chunk, not the derived interval.
+                    if self.chunked_prefill_size % self.page_size != 0:
+                        raise ValueError(
+                            f"--chunked-prefill-size ({self.chunked_prefill_size}) must be a "
+                            f"multiple of --page-size ({self.page_size}) when "
+                            "--enable-recurrent-extra-buffer is set (the recurrent track "
+                            "interval defaults to it)."
+                        )
+                    self.recurrent_track_interval = self.chunked_prefill_size
+                else:
+                    self.recurrent_track_interval = self.page_size
+            if self.recurrent_track_interval <= 0:
+                raise ValueError(
+                    "--recurrent-track-interval must be > 0 when "
+                    f"--enable-recurrent-extra-buffer is set; got {self.recurrent_track_interval}."
+                )
+            if self.recurrent_track_interval % self.page_size != 0:
+                raise ValueError(
+                    f"--recurrent-track-interval ({self.recurrent_track_interval}) must be a "
+                    f"multiple of --page-size ({self.page_size})."
+                )
+            if self.chunked_prefill_size and self.chunked_prefill_size > 0:
+                if self.recurrent_track_interval > self.chunked_prefill_size:
+                    # Coarser than the chunk: short prompts cache nothing but do
+                    # not stall. Warn, don't reject -- a memory-for-hit-rate trade.
+                    logger.warning(
+                        "--recurrent-track-interval (%d) > --chunked-prefill-size (%d): recurrent "
+                        "snapshots are published only at interval boundaries, so any prompt shorter "
+                        "than the interval caches nothing and cross-request reuse is limited to "
+                        "prompts that cross a boundary. The request still progresses (no stall); "
+                        "this only lowers the recurrent-cache hit rate. Prefer the default "
+                        "(= chunked_prefill_size) unless you are deliberately trading hit rate for "
+                        "coarser, cheaper snapshots.",
+                        self.recurrent_track_interval,
+                        self.chunked_prefill_size,
+                    )
+                elif self.recurrent_track_interval < self.chunked_prefill_size:
+                    logger.warning(
+                        "--recurrent-track-interval (%d) < --chunked-prefill-size (%d): this "
+                        "force-splits prefill into %d-token sub-chunks so each forward ends on a "
+                        "snapshot boundary. Chunked prefill is chunk-size-sensitive in the "
+                        "full-attention/MoE path, so finer snapshots trade accuracy (~3.5pp on "
+                        "GPQA at interval=128 vs chunk=512) for recurrent-cache granularity. "
+                        "Prefer the default (= chunked_prefill_size).",
+                        self.recurrent_track_interval,
+                        self.chunked_prefill_size,
+                        self.recurrent_track_interval,
+                    )
+            if self.speculative_algorithm is not None:
+                raise ValueError(
+                    "--enable-recurrent-extra-buffer does not support speculative "
+                    f"decoding yet; got --speculative-algorithm={self.speculative_algorithm}. "
+                    "Disable one of them."
+                )
+            if self.enable_mixed_chunk:
+                raise ValueError(
+                    "--enable-recurrent-extra-buffer does not support mixed chunked "
+                    "prefill yet (the track snapshot is scoped to pure extend / "
+                    "pure decode forwards). Disable --enable-mixed-chunk."
+                )
 
         os.environ["SGLANG_ENABLE_DETERMINISTIC_SAMPLING"] = (
             "1" if self.enable_deterministic_sampling else "0"
@@ -330,6 +459,32 @@ class ServerArgs:
 
         if os.getenv("SGLANG_JAX_ENABLE_UNIFIED_RADIX_TREE", "0") == "1":
             self.enable_unified_radix_tree = True
+
+        if self.hicache_storage != "disable":
+            if self.hicache_storage not in ("none", "file"):
+                raise ValueError(
+                    f"hicache_storage must be one of disable/none/file, got {self.hicache_storage}"
+                )
+            if self.hicache_storage == "file":
+                raise ValueError("hicache_storage='file' (L3) is not supported yet")
+            # HiCache rides on the component-based UnifiedRadixCache prefix tree.
+            self.enable_unified_radix_tree = True
+            self.disable_radix_cache = False
+            if self.hicache_ratio <= 0:
+                raise ValueError(f"hicache_ratio must be positive, got {self.hicache_ratio}")
+            if self.hicache_write_policy not in (
+                "write_through",
+                "write_through_selective",
+                "write_back",
+            ):
+                raise ValueError(
+                    "hicache_write_policy must be one of write_through/"
+                    f"write_through_selective/write_back, got {self.hicache_write_policy}"
+                )
+
+        if self.dp_schedule_policy is None:
+            use_no_radix_default = self.disable_radix_cache or bool(self.pd_disaggregation)
+            self.dp_schedule_policy = "min_running_queue" if use_no_radix_default else "cache_aware"
 
         if self.nnodes > 1 and self.device_indexes is not None:
             logger.warning("In a multi-machine scenario, device_indexes will be set to None.")
@@ -357,6 +512,11 @@ class ServerArgs:
             raise ValueError(
                 f"--disaggregation-mode must be one of {valid_modes}, "
                 f"got {self.disaggregation_mode!r}"
+            )
+        if self.pd_disaggregation and self.disaggregation_mode != "null":
+            raise ValueError(
+                "--pd-disaggregation (single-controller) and --disaggregation-mode "
+                "(multi-process) are mutually exclusive"
             )
         if self.disaggregation_mode != "null":
             if self.disaggregation_bootstrap_url is None:
@@ -401,6 +561,11 @@ class ServerArgs:
                     "disaggregation_enable_d2h",
                     self.disaggregation_enable_d2h,
                     ServerArgs.disaggregation_enable_d2h,
+                ),
+                (
+                    "disaggregation_use_raiden",
+                    self.disaggregation_use_raiden,
+                    ServerArgs.disaggregation_use_raiden,
                 ),
             ]
             non_default = [name for name, value, default in pd_overrides if value != default]
@@ -583,6 +748,12 @@ class ServerArgs:
             '* "float32" for FP32 precision.',
         )
         parser.add_argument(
+            "--dtype-config",
+            type=str,
+            default=ServerArgs.dtype_config,
+            help="Config in JSON format (or path to a JSON file) to set specific dtypes for different submodules.",
+        )
+        parser.add_argument(
             "--quantization",
             type=str,
             default=ServerArgs.quantization,
@@ -717,6 +888,16 @@ class ServerArgs:
             "Must be divisible by dp_size when set explicitly.",
         )
         parser.add_argument(
+            "--recurrent-track-interval",
+            type=int,
+            default=ServerArgs.recurrent_track_interval,
+            help="Recurrent radix cache: page-boundary interval at which a "
+            "recurrent track state is committed. Requires --enable-recurrent-extra-buffer "
+            "and must be a positive multiple of --page-size. Defaults to "
+            "--chunked-prefill-size when extra-buffer is enabled (falls back to "
+            "--page-size if chunked prefill is off).",
+        )
+        parser.add_argument(
             "--disable-hybrid-swa-memory",
             action="store_true",
             help="Disable the hybrid SWA memory.",
@@ -735,6 +916,70 @@ class ServerArgs:
             type=int,
             nargs="+",
             help="The device indexes to use build mesh. Defaults is all if not specified.",
+        )
+        parser.add_argument(
+            "--pd-disaggregation",
+            dest="pd_disaggregation",
+            nargs="?",
+            const="pathways",
+            default="",
+            choices=["", "pathways"],
+            help="In-process P/D split: 'pathways' = single-controller cross-slice "
+            "IFRT device_put (requires Pathways proxy backend + >=2 slices).",
+        )
+        parser.add_argument(
+            "--pd-prefill-mem-fraction",
+            dest="pd_prefill_mem_fraction",
+            type=float,
+            default=ServerArgs.pd_prefill_mem_fraction,
+        )
+        parser.add_argument(
+            "--pd-decode-mem-fraction",
+            dest="pd_decode_mem_fraction",
+            type=float,
+            default=ServerArgs.pd_decode_mem_fraction,
+        )
+        parser.add_argument(
+            "--pd-prefill-max-tokens",
+            dest="pd_prefill_max_tokens",
+            type=int,
+            default=ServerArgs.pd_prefill_max_tokens,
+        )
+        parser.add_argument(
+            "--pd-decode-max-tokens",
+            dest="pd_decode_max_tokens",
+            type=int,
+            default=ServerArgs.pd_decode_max_tokens,
+        )
+        parser.add_argument(
+            "--pd-num-prefill",
+            dest="pd_num_prefill",
+            type=int,
+            default=ServerArgs.pd_num_prefill,
+            help="Number of prefill slices for pathways PD (Stage 6 multi-P).",
+        )
+        parser.add_argument(
+            "--pd-num-decode",
+            dest="pd_num_decode",
+            type=int,
+            default=ServerArgs.pd_num_decode,
+            help="Number of decode slices for pathways PD (1P-ND fan-out).",
+        )
+        parser.add_argument(
+            "--pd-prefill-tp-size",
+            dest="pd_prefill_tp_size",
+            type=int,
+            default=ServerArgs.pd_prefill_tp_size,
+            help="Prefill-side tp_size for pathways PD hetero-TP (Stage 6 "
+            "P-D-different-tp). 0 = same as --tp-size (D side).",
+        )
+        parser.add_argument(
+            "--pd-prefill-ep-size",
+            dest="pd_prefill_ep_size",
+            type=int,
+            default=ServerArgs.pd_prefill_ep_size,
+            help="Prefill-side ep_size for pathways PD hetero-TP. "
+            "0 = scale ep_size by tp_p/tp_d.",
         )
 
         parser.add_argument(
@@ -961,9 +1206,20 @@ class ServerArgs:
         parser.add_argument(
             "--dp-schedule-policy",
             type=str,
-            choices=["round_robin", "min_running_queue"],
+            choices=["round_robin", "min_running_queue", "cache_aware", "shape_aware"],
             default=ServerArgs.dp_schedule_policy,
-            help="DP scheduling policy for assigning dp_rank to new requests.",
+            help=(
+                "DP scheduling policy for assigning dp_rank to new requests. "
+                "When unset, defaults to 'cache_aware' with radix cache enabled "
+                "and 'min_running_queue' with radix cache disabled or Pathways PD. "
+                "'cache_aware' routes by cache affinity with soft load balancing: "
+                "it balances on large load skew, else picks the least-loaded rank "
+                "among those holding a substantial cached prefix, so a hot prefix "
+                "spreads across its holders. Improves prefix reuse under DP. "
+                "'shape_aware' balances input (prefill) and output (decode) "
+                "token load jointly, routing to the replica whose bottleneck "
+                "dimension stays smallest: score = max(sum_input, sum_output)."
+            ),
         )
 
         # Multi-node distributed serving
@@ -1002,8 +1258,47 @@ class ServerArgs:
             "--enable-unified-radix-tree",
             action="store_true",
             help="Route non-hybrid (full-attention) models to UnifiedRadixCache "
-            "(component-agnostic prefix cache). Default off; hybrid models are "
-            "unaffected.",
+            "(component-agnostic prefix cache). Default off. Also required to route "
+            "hybrid recurrent models (e.g. Kimi-Linear) into UnifiedRadixCache.",
+        )
+        parser.add_argument(
+            "--hicache-storage",
+            type=str,
+            choices=["disable", "none", "file"],
+            default=ServerArgs.hicache_storage,
+            help="HiCache KV offloading: 'disable' off, 'none' enables L1+L2 "
+            "(host pinned pool), 'file' reserved for L3(not support yet). "
+            "Unsupported for linear-recurrent models under the unified radix "
+            "tree (rejected at init).",
+        )
+        parser.add_argument(
+            "--hicache-ratio",
+            type=float,
+            default=ServerArgs.hicache_ratio,
+            help="Host (L2) pool size as a multiple of the device KV pool size.",
+        )
+        parser.add_argument(
+            "--hicache-write-through-threshold",
+            type=int,
+            default=ServerArgs.hicache_write_through_threshold,
+            help="Min prefix hit_count before a node is backed up (D2H) to host.",
+        )
+        parser.add_argument(
+            "--hicache-write-policy",
+            type=str,
+            choices=["write_through", "write_through_selective", "write_back"],
+            default=ServerArgs.hicache_write_policy,
+            help="HiCache D2H backup policy: 'write_through' backs up on hit "
+            "(>= threshold); 'write_through_selective' is the same path with a "
+            "higher threshold; 'write_back' skips hit-time backup and only backs "
+            "up a node when its device KV is evicted (fewest D2H)",
+        )
+        parser.add_argument(
+            "--enable-recurrent-extra-buffer",
+            action="store_true",
+            help="Recurrent radix cache: use the page-aligned ping-pong track "
+            "buffer for page_size>=128. Off by default; the base path supports "
+            "page_size=1 only.",
         )
         parser.add_argument(
             "--allow-auto-truncate",
@@ -1091,6 +1386,7 @@ class ServerArgs:
                 "native",
                 "fa",
                 "fa_mha",
+                "dsa_sparse",
             ],
             default=ServerArgs.attention_backend,
             help=(
@@ -1098,8 +1394,16 @@ class ServerArgs:
                 "'fa' = FlashAttention for MHA models, MLA Pallas kernel (absorbed) for MLA models. "
                 "'fa_mha' = force the MHA FlashAttention path for MLA models too "
                 "(decompress latent KV per-forward via kv_b_proj; ~70x more KV cache than 'fa', "
-                "intended for kernel A/B on short contexts)."
+                "intended for kernel A/B on short contexts). "
+                "'dsa_sparse' = DeepSeek Sparse Attention (lightning-indexer top-k + sparse MLA) "
+                "with IndexShare cross-layer reuse; MLA models with index_* config only."
             ),
+        )
+        parser.add_argument(
+            "--dsa-use-pallas",
+            action="store_true",
+            default=ServerArgs.dsa_use_pallas,
+            help="Use Pallas kernels for the dsa_sparse backend (default: jnp reference).",
         )
         parser.add_argument(
             "--moe-backend",
@@ -1119,6 +1423,17 @@ class ServerArgs:
                 "Default uses JAX path (recommended)."
             ),
         )
+        parser.add_argument(
+            "--disable-topk-kernel",
+            dest="enable_topk_kernel",
+            action="store_false",
+            default=ServerArgs.enable_topk_kernel,
+            help=(
+                "Disable Pallas kernels for top-k routing, including grouped, biased, "
+                "and plain paths (TPU only), and use pure JAX instead. "
+                "The kernels are enabled by default."
+            ),
+        )
 
         parser.add_argument(
             "--enable-nan-detection",
@@ -1130,7 +1445,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "DFLASH"],
             help="Speculative algorithm.",
             default=ServerArgs.speculative_algorithm,
         )
@@ -1281,10 +1596,14 @@ class ServerArgs:
             action=argparse.BooleanOptionalAction,
             default=ServerArgs.disaggregation_enable_d2h,
             help="Enable D2H staging on the prefill side: KV is copied into "
-            "a pinned-host buffer before remote pull. The current "
-            "default remains OFF until QueueHostKVPool is wired "
-            "end-to-end; use --disaggregation-enable-d2h only after "
-            "path A is fully plumbed.",
+            "an unpinned host-memory buffer before remote pull, bounding "
+            "prefill HBM pressure via the host pool. Default OFF.",
+        )
+        parser.add_argument(
+            "--disaggregation-use-raiden",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.disaggregation_use_raiden,
+            help="Use tpu-raiden for direct block transfer into decode KV pages.",
         )
         parser.add_argument(
             "--disaggregation-side-channel-port",
@@ -1336,9 +1655,10 @@ class ServerArgs:
             "--disaggregation-d2h-max-tokens",
             type=int,
             default=ServerArgs.disaggregation_d2h_max_tokens,
-            help="Per-buffer token capacity for QueueHostKVPool. "
-            "Defaults to max_total_num_tokens / pool_size at engine "
-            "init time.",
+            help="Per-buffer token capacity for QueueHostKVPool (path A). "
+            "Each buffer is sized to hold one request's padded KV up to this "
+            "many tokens; must be >= your longest PD prompt. Defaults to "
+            "max_total_num_tokens at engine init time.",
         )
         parser.add_argument(
             "--disaggregation-host-ip",
@@ -1361,7 +1681,9 @@ class ServerArgs:
             default=ServerArgs.disaggregation_pull_timeout_seconds,
             help="Decode-side pull timeout in seconds. A receiver "
             "stuck in TRANSFERRING longer than this is reaped to "
-            "FAILED. <=0 to disable.",
+            "FAILED. With Raiden, this also bounds engine terminalization "
+            "after abort, so FINISH_ABORT may be delayed by up to this "
+            "interval. <=0 to disable.",
         )
         parser.add_argument(
             "--disaggregation-ack-timeout-seconds",
@@ -1379,6 +1701,35 @@ class ServerArgs:
             help="How often the background reaper scans for orphan " "senders/receivers.",
         )
         parser.add_argument(
+            "--disaggregation-decode-watchdog-seconds",
+            type=float,
+            default=ServerArgs.disaggregation_decode_watchdog_seconds,
+            help="Diagnostic: if > 0, a watchdog logs the stuck decode "
+            "event-loop phase + backlog snapshot + main-thread "
+            "traceback when one loop tick exceeds this many seconds. "
+            "0 disables it (default). Opt-in for stress debugging.",
+        )
+        parser.add_argument(
+            "--disaggregation-num-reserved-decode-tokens",
+            type=int,
+            default=ServerArgs.disaggregation_num_reserved_decode_tokens,
+            help="Decode-side admission headroom (KV tokens) held back per "
+            "in-flight/running request when admitting a queued PD request, "
+            "so running decode steps never OOM while others are mid-transfer. "
+            "Insufficient capacity defers admission (FIFO requeue), never aborts.",
+        )
+        parser.add_argument(
+            "--disaggregation-max-inflight-transfers",
+            type=int,
+            default=ServerArgs.disaggregation_max_inflight_transfers,
+            help="Max concurrent in-flight KV transfers admitted on the decode "
+            "side. Each in-flight pull allocates a destination KV buffer on "
+            "decode HBM until it is scattered into the paged pool; this cap "
+            "bounds that transient HBM so a burst of concurrent requests does "
+            "not OOM decode. Excess requests defer (FIFO requeue), never abort. "
+            "0 disables the cap (unbounded).",
+        )
+        parser.add_argument(
             "--disaggregation-shared-secret",
             type=str,
             default=ServerArgs.disaggregation_shared_secret,
@@ -1393,9 +1744,7 @@ class ServerArgs:
             "--disaggregation-channel-number",
             type=int,
             default=ServerArgs.disaggregation_channel_number,
-            help="Parallel jax_transfer channels per (P, D) pair. "
-            "Four is the validated default on v6e; increase for "
-            "higher-bandwidth interconnects.",
+            help="Parallel transfer channels per (P, D) pair.",
         )
 
     @classmethod
@@ -1428,7 +1777,10 @@ class ServerArgs:
         from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 
         MultimodalServerArgs.add_cli_args(parser)
-        return cls.from_cli_args(parser.parse_args(argv or sys.argv[1:]))
+        raw_argv = argv or sys.argv[1:]
+        server_args = cls.from_cli_args(parser.parse_args(raw_argv))
+        server_args._explicit_cli_args = set(raw_argv)
+        return server_args
 
     def url(self):
         if is_valid_ipv6_address(self.host):
@@ -1460,12 +1812,68 @@ class ServerArgs:
         # Check LoRA configuration
         self.check_lora_server_args()
 
-        # Disallow overlap scheduler when speculative decoding is enabled
+        # Speculative overlap uses the fused NEXTN path or DFlash's dedicated
+        # relay-backed draft/verify path.
         if self.speculative_algorithm is not None and not self.disable_overlap_schedule:
-            raise ValueError(
-                "Speculative decoding does not support overlap scheduler. "
-                "Please pass --disable-overlap-schedule when using --speculative-algorithm."
+            supports_nextn_overlap = (
+                self.speculative_algorithm == "NEXTN"
+                and self.speculative_eagle_topk == 1
+                and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
             )
+            supports_dflash_overlap = self.speculative_algorithm == "DFLASH"
+            if not (supports_nextn_overlap or supports_dflash_overlap):
+                raise ValueError(
+                    "Speculative overlap scheduler only supports DFLASH or NEXTN with "
+                    "--speculative-eagle-topk=1 and "
+                    "--speculative-num-draft-tokens == --speculative-num-steps + 1. "
+                    "Please pass --disable-overlap-schedule for other speculative configs."
+                )
+
+        # DFLASH: non-causal one-shot diffusion draft + linear-chain greedy verify.
+        if self.speculative_algorithm == "DFLASH":
+            if self.tp_size < 1:
+                raise ValueError("DFLASH requires --tp-size>=1.")
+            if self.speculative_eagle_topk != 1:
+                raise ValueError(
+                    "DFLASH requires --speculative-eagle-topk=1 (linear chain, no tree)."
+                )
+            if self.speculative_num_steps != 1:
+                raise ValueError("DFLASH (minimal) requires --speculative-num-steps=1.")
+            if self.speculative_draft_model_path is None:
+                raise ValueError(
+                    "DFLASH requires --speculative-draft-model-path (the diffusion draft)."
+                )
+            explicit_cli_args = getattr(self, "_explicit_cli_args", set())
+            explicit_draft_tokens = any(
+                str(arg) == "--speculative-num-draft-tokens"
+                or str(arg).startswith("--speculative-num-draft-tokens=")
+                for arg in explicit_cli_args
+            )
+            if (
+                not explicit_draft_tokens
+                and self.speculative_num_draft_tokens == ServerArgs.speculative_num_draft_tokens
+            ):
+                from sgl_jax.srt.speculative.dflash_util import (
+                    parse_dflash_draft_config,
+                )
+
+                draft_config = parse_dflash_draft_config(
+                    self.speculative_draft_model_path,
+                    revision=self.speculative_draft_model_revision,
+                    trust_remote_code=self.trust_remote_code,
+                )
+                if draft_config.block_size != self.speculative_num_draft_tokens:
+                    logger.info(
+                        "DFLASH: using draft config block_size=%d for "
+                        "--speculative-num-draft-tokens (default was %d).",
+                        draft_config.block_size,
+                        self.speculative_num_draft_tokens,
+                    )
+                    self.speculative_num_draft_tokens = draft_config.block_size
+            if self.enable_lora or self.enable_static_lora or self.lora_paths:
+                raise ValueError("DFLASH does not support LoRA.")
+            if self.grammar_backend not in (None, "none"):
+                raise ValueError("DFLASH does not support constrained decoding.")
 
     def check_lora_server_args(self):
         """Validate and normalize LoRA-related server arguments."""

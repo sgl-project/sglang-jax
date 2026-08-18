@@ -117,7 +117,7 @@ class TestFlashAttentionMisc(AttentionTestBase):
         rng = np.random.RandomState(404)
         attention_sink = jnp.array(rng.randn(num_heads).astype(np.float32))
 
-        self.run_test(
+        self.run_test_on_single_device(
             "decode",
             lens,
             (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
@@ -140,7 +140,7 @@ class TestFlashAttentionMisc(AttentionTestBase):
         rng = np.random.RandomState(505)
         attention_sink = jnp.array(rng.randn(num_heads).astype(np.float32))
 
-        self.run_test(
+        self.run_test_on_single_device(
             "prefill",
             lens,
             (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),

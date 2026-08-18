@@ -1,10 +1,13 @@
 import copy
 import dataclasses
 import glob
+import inspect
 import logging
 import os
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Generator
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import huggingface_hub
@@ -186,6 +189,55 @@ class JAXModelLoader(DefaultModelLoader):
         hf_folder = self._prepare_weights(source.model_or_path, source.revision)
         return hf_folder
 
+    @staticmethod
+    def _warmup_safetensors_cache(model_config: ModelConfig):
+        """Pre-read safetensors files to warm GCSFuse cache."""
+        model_path = model_config.model_path
+        try:
+            with open("/proc/mounts") as fp:
+                mounts = [line.split() for line in fp]
+            mount = max(
+                (
+                    mount
+                    for mount in mounts
+                    if model_path == mount[1] or model_path.startswith(mount[1].rstrip("/") + "/")
+                ),
+                key=lambda mount: len(mount[1]),
+            )
+            if "fuse" not in mount[2]:
+                logger.info("model_path on %s mount, skipping GCSFuse warm-up", mount[2])
+                return
+        except Exception:
+            logger.warning("Failed to detect model_path mount type; skipping GCSFuse warm-up")
+            return
+
+        st_files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
+        if not st_files:
+            return
+
+        total_size = sum(os.path.getsize(path) for path in st_files)
+        logger.info(
+            "Warming up GCSFuse cache: %d files, %.1f GB",
+            len(st_files),
+            total_size / 1024**3,
+        )
+
+        def _read_file(path):
+            buf = bytearray(4 * 1024 * 1024)
+            with open(path, "rb") as fp:
+                while fp.readinto(buf):
+                    pass
+
+        t0 = time.time()
+        with ThreadPoolExecutor(max_workers=min(8, len(st_files))) as executor:
+            list(executor.map(_read_file, st_files))
+        t1 = time.time()
+        logger.info(
+            "GCSFuse cache warm-up done: %.1fs (%.0f MB/s)",
+            t1 - t0,
+            total_size / 1024**2 / (t1 - t0) if t1 > t0 else 0,
+        )
+
     def load_model(
         self,
         model_config: ModelConfig,
@@ -199,6 +251,7 @@ class JAXModelLoader(DefaultModelLoader):
             model_config = copy.copy(model_config)
 
         model_config.model_path = hf_folder
+        self._warmup_safetensors_cache(model_config)
         # Initialize JAX model
         model = self._initialize_model(model_config)
 
@@ -231,10 +284,12 @@ class JAXModelLoader(DefaultModelLoader):
         else:
             config = model_config.hf_config
 
+        kwargs = {"dtype": model_config.dtype, "mesh": self.mesh}
+        if "dtype_config" in inspect.signature(model_class.__init__).parameters:
+            kwargs["dtype_config"] = getattr(model_config, "dtype_config", None)
+
         with jax.set_mesh(self.mesh):
-            model = nnx.eval_shape(
-                lambda: model_class(config, dtype=model_config.dtype, mesh=self.mesh)
-            )
+            model = nnx.eval_shape(lambda: model_class(config, **kwargs))
 
         # Quantization config is already unified in model_config
         # No need for any conversion logic here
@@ -295,12 +350,12 @@ class JAXDummyModelLoader(BaseModelLoader):
     ) -> Any:
         model_class = self._initialize_model(model_config)
 
+        kwargs = {"dtype": model_config.dtype, "mesh": self.mesh}
+        if "dtype_config" in inspect.signature(model_class.__init__).parameters:
+            kwargs["dtype_config"] = getattr(model_config, "dtype_config", None)
+
         with jax.set_mesh(self.mesh):
-            model = nnx.eval_shape(
-                lambda: model_class(
-                    model_config.hf_config, dtype=model_config.dtype, mesh=self.mesh
-                )
-            )
+            model = nnx.eval_shape(lambda: model_class(model_config.hf_config, **kwargs))
 
         # Use model's load_weights with dummy mode to ensure correct sharding
         # Set a marker in model_config to indicate dummy mode
