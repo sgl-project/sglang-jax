@@ -340,6 +340,15 @@ class ServerArgs:
         # Set chunked prefill size
         if self.chunked_prefill_size is None:
             self.chunked_prefill_size = 4096
+        if 0 < self.max_prefill_tokens < self.chunked_prefill_size:
+            logger.warning(
+                "chunked_prefill_size (%d) > max_prefill_tokens (%d); clamping "
+                "chunked_prefill_size to %d so prefill chunks fit the padding buckets.",
+                self.chunked_prefill_size,
+                self.max_prefill_tokens,
+                self.max_prefill_tokens,
+            )
+            self.chunked_prefill_size = self.max_prefill_tokens
 
         # GGUF
         if (self.load_format == "auto" or self.load_format == "gguf") and check_gguf_file(
