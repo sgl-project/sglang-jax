@@ -134,6 +134,20 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "Chunked request mismatch"):
             scheduler._prepare_chunked_reqs_to_exclude()
 
+    def test_failed_pd_chunk_clears_batch_owner_before_terminal_release(self):
+        req = self._make_req("failed", [1, 2, 3], [10, 11])
+        scheduler, _ = self._make_scheduler(req, active_reqs=req)
+        scheduler._pending_chunked_abort_reqs[0] = req
+
+        scheduler._retire_failed_chunk_producer(req)
+
+        self.assertEqual(scheduler.chunked_reqs, [None])
+        self.assertEqual(scheduler._pending_chunked_abort_reqs, [None])
+        self.assertIsNone(scheduler.last_batch.reqs_info[0].chunked_req)
+
+        scheduler._sync_chunked_req_owners()
+        self.assertEqual(scheduler.chunked_reqs, [None])
+
     def test_restoring_one_dp_rank_preserves_the_other_rank_owner(self):
         req0 = self._make_req("rank-0", [1, 2, 3], [10, 11], dp_rank=0)
         req1 = self._make_req("rank-1", [4, 5, 6], [12, 13], dp_rank=1)

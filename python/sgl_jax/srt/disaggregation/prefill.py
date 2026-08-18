@@ -555,6 +555,15 @@ class SchedulerDisaggregationPrefillMixin:
         dp_rank = int(req.dp_rank)
         if self.chunked_reqs[dp_rank] is req:
             self.chunked_reqs[dp_rank] = None
+        last_batch = getattr(self, "last_batch", None)
+        if last_batch is not None and last_batch.forward_mode.is_extend():
+            info = last_batch.reqs_info[dp_rank]
+            if info.chunked_req is req:
+                # The sender terminal callback can release the request slot and
+                # KV pages before the next scheduler tick. Drop the batch-side
+                # owner as well so _sync_chunked_req_owners cannot resurrect a
+                # producer whose allocations are already reusable.
+                info.chunked_req = None
         pending = getattr(self, "_pending_chunked_abort_reqs", None)
         if pending is not None and pending[dp_rank] is req:
             pending[dp_rank] = None
