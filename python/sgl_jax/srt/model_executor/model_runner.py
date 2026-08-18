@@ -3,6 +3,7 @@
 import contextlib
 import dataclasses
 import logging
+import os
 from functools import partial
 
 import jax
@@ -698,8 +699,68 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 getattr(cfg, "index_skip_topk_offset", 0),
                 cfg.num_hidden_layers,
             )
+            # Per-launch override of the indexer top-k budget (page count = ceil(
+            # index_topk / page_size) is a static kernel shape, so this is fixed at
+            # startup). Unset ⇒ use the model config's default. Lets us sweep the
+            # DSA budget across relaunches without editing the model config.json.
+            _dsa_topk_env = os.environ.get("DSA_INDEX_TOPK")
+            _index_topk = int(_dsa_topk_env) if _dsa_topk_env else cfg.index_topk
+            if _dsa_topk_env:
+                logger.info(
+                    "DSA index_topk overridden by DSA_INDEX_TOPK=%s (cfg default %s)",
+                    _index_topk,
+                    cfg.index_topk,
+                )
+            # ── PR1 scope guards: DSA sparse PREFILL (DSA_PREFILL_SPARSE=1) ──
+            # This is the INITIAL single-sequence, single-shot sparse-MLA prefill.
+            # It assumes a single-shot extend from position 0 and does NOT yet
+            # support: radix/prefix caching (a cache hit turns prefill into a
+            # partial extend the current-chunk page table can't represent),
+            # batching (max_running>1 ⇒ multi-seq ragged extend), or chunked
+            # prefill (a split prompt references pages outside the chunk). Fail
+            # fast with an actionable message instead of silently emitting
+            # garbage. Gated on the opt-in flag, so the dense-prefill/decode
+            # paths — and CI, which never sets DSA_PREFILL_SPARSE — are unaffected.
+            if os.environ.get("DSA_PREFILL_SPARSE", "0") == "1":
+                sa = self.server_args
+                ctx_len = sa.context_length or getattr(self.model_config, "context_len", None)
+                problems = []
+                if not sa.disable_radix_cache:
+                    problems.append(
+                        "radix/prefix cache is ENABLED — pass --disable-radix-cache "
+                        "(a cache hit makes prefill a partial extend the sparse page "
+                        "table cannot represent → garbage output)"
+                    )
+                if sa.max_running_requests != 1:
+                    problems.append(
+                        f"max_running_requests={sa.max_running_requests} — set "
+                        "--max-running-requests 1 (batching needs multi-seq ragged "
+                        "extend, not supported yet)"
+                    )
+                if sa.chunked_prefill_size is None or (
+                    ctx_len is not None and sa.chunked_prefill_size < ctx_len
+                ):
+                    problems.append(
+                        f"chunked_prefill_size={sa.chunked_prefill_size} < "
+                        f"context_length={ctx_len} — set --chunked-prefill-size >= "
+                        "context length so prompts prefill single-shot (no chunking)"
+                    )
+                if problems:
+                    raise ValueError(
+                        "DSA_PREFILL_SPARSE=1 (initial single-sequence sparse-prefill) "
+                        "is incompatible with the current server args:\n  - "
+                        + "\n  - ".join(problems)
+                        + "\nThis is an initial version; radix-cache, batching and "
+                        "chunking support are follow-ups."
+                    )
+                logger.warning(
+                    "DSA sparse PREFILL enabled (initial single-seq, single-shot "
+                    "scope): radix-cache OFF, max_running=1, single-shot prefill "
+                    "(chunk>=context). index_topk=%s.",
+                    _index_topk,
+                )
             full_attn_backend = DSASparseAttentionBackend(
-                index_topk=cfg.index_topk,
+                index_topk=_index_topk,
                 index_head_dim=cfg.index_head_dim,
                 index_n_heads=cfg.index_n_heads,
                 skip_offset=getattr(cfg, "index_skip_topk_offset", 0),
