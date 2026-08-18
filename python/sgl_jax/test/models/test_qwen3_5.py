@@ -159,7 +159,11 @@ class TestQwen3_5(unittest.TestCase):
         keys = ("rope_type", "mrope_section", "mrope_interleaved")
         self.assertEqual(
             {k: tc.rope_scaling[k] for k in keys},
-            {"rope_type": "default", "mrope_section": [6, 5, 5], "mrope_interleaved": True},
+            {
+                "rope_type": "default",
+                "mrope_section": [6, 5, 5],
+                "mrope_interleaved": True,
+            },
         )
         self.assertEqual(tc.rope_theta, 12345)
         self.assertEqual(tc.partial_rotary_factor, 0.5)
@@ -242,13 +246,16 @@ class TestQwen3_5(unittest.TestCase):
         key_dim = tc.linear_num_key_heads * tc.linear_key_head_dim
         value_dim = tc.linear_num_value_heads * tc.linear_value_head_dim
         self.assertEqual(
-            gdn.in_proj_qkvz.weight.value.shape, (tc.hidden_size, 2 * key_dim + 2 * value_dim)
+            gdn.in_proj_qkvz.weight.value.shape,
+            (tc.hidden_size, 2 * key_dim + 2 * value_dim),
         )
         self.assertEqual(
-            gdn.in_proj_ba.weight.value.shape, (tc.hidden_size, 2 * tc.linear_num_value_heads)
+            gdn.in_proj_ba.weight.value.shape,
+            (tc.hidden_size, 2 * tc.linear_num_value_heads),
         )
         self.assertEqual(
-            gdn.conv1d.weight.value.shape, (2 * key_dim + value_dim, tc.linear_conv_kernel_dim)
+            gdn.conv1d.weight.value.shape,
+            (2 * key_dim + value_dim, tc.linear_conv_kernel_dim),
         )
         self.assertEqual(gdn.A_log.value.shape, (tc.linear_num_value_heads,))
         self.assertEqual(gdn.dt_bias.value.shape, (tc.linear_num_value_heads,))
@@ -297,14 +304,18 @@ class TestQwen3_5(unittest.TestCase):
 
         tc = self.cfg.text_config
         block = Qwen3_5MoeBlock(self.cfg, self.mesh, layer_id=0)
+        self.assertIs(block.topk.mesh, self.mesh)
         self.assertEqual(
-            block.experts.w1.value.shape, (tc.num_experts, tc.hidden_size, tc.moe_intermediate_size)
+            block.experts.w1.value.shape,
+            (tc.num_experts, tc.hidden_size, tc.moe_intermediate_size),
         )
         self.assertEqual(
-            block.experts.w3.value.shape, (tc.num_experts, tc.hidden_size, tc.moe_intermediate_size)
+            block.experts.w3.value.shape,
+            (tc.num_experts, tc.hidden_size, tc.moe_intermediate_size),
         )
         self.assertEqual(
-            block.experts.w2.value.shape, (tc.num_experts, tc.moe_intermediate_size, tc.hidden_size)
+            block.experts.w2.value.shape,
+            (tc.num_experts, tc.moe_intermediate_size, tc.hidden_size),
         )
         T = 4
         x = jax.random.normal(jax.random.key(0), (T, tc.hidden_size), dtype=jnp.bfloat16)

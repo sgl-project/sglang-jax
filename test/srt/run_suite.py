@@ -153,7 +153,14 @@ def run_unittest_files(
                         ]
                     )
                     if reruns > 0:
-                        cmd.extend(["--reruns", str(reruns), "--reruns-delay", str(reruns_delay)])
+                        cmd.extend(
+                            [
+                                "--reruns",
+                                str(reruns),
+                                "--reruns-delay",
+                                str(reruns_delay),
+                            ]
+                        )
                         for pattern in only_rerun or []:
                             cmd.extend(["--only-rerun", pattern])
                 else:
@@ -336,10 +343,14 @@ suites = {
         TestFile("python/sgl_jax/test/models/test_dflash.py", 0.2, runner="pytest"),
         TestFile("python/sgl_jax/test/models/test_mimo_v2_nextn.py", 0.2, runner="pytest"),
         TestFile(
-            "python/sgl_jax/test/multimodal/test_kimi_k25_weight_mapping.py", 0.2, runner="pytest"
+            "python/sgl_jax/test/multimodal/test_kimi_k25_weight_mapping.py",
+            0.2,
+            runner="pytest",
         ),
         TestFile(
-            "python/sgl_jax/test/multimodal/test_stage_config_routing.py", 0.1, runner="pytest"
+            "python/sgl_jax/test/multimodal/test_stage_config_routing.py",
+            0.1,
+            runner="pytest",
         ),
         TestFile(
             "python/sgl_jax/test/multimodal/test_mimo_audio_tokenizer_model.py",
@@ -347,6 +358,26 @@ suites = {
             runner="pytest",
         ),
         TestFile("python/sgl_jax/test/models/test_qwen3_5.py", 2, runner="pytest"),
+        TestFile(
+            "python/sgl_jax/test/kernels/test_gdn_fused_chunk_parallel_provenance.py",
+            0.1,
+            runner="pytest",
+        ),
+        TestFile(
+            "python/sgl_jax/test/test_gdn_prefill_dispatch.py",
+            0.2,
+            runner="pytest",
+        ),
+        TestFile(
+            "python/sgl_jax/test/test_gdn_fused_chunk_parallel_state_contract.py",
+            0.5,
+            runner="pytest",
+        ),
+        TestFile(
+            "python/sgl_jax/test/test_gdn_fused_chunk_parallel_prefill.py",
+            3,
+            runner="pytest",
+        ),
         TestFile(
             "python/sgl_jax/test/test_moe_weight_loader_sharding.py",
             0.2,
@@ -361,13 +392,18 @@ suites = {
         TestFile("python/sgl_jax/test/mem_cache/test_unified_radix_tree_flag.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_paged_allocator_multi_dp.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_host_kv_pool.py", 1, runner="pytest"),
-        TestFile("python/sgl_jax/test/mem_cache/test_hicache_controller.py", 0.5, runner="pytest"),
+        TestFile(
+            "python/sgl_jax/test/mem_cache/test_hicache_controller.py",
+            0.5,
+            runner="pytest",
+        ),
         TestFile("python/sgl_jax/test/mem_cache/test_hicache_e2e.py", 5, runner="pytest"),
         TestFile("python/sgl_jax/test/test_kv_cache_builder.py", 0.1, runner="pytest"),
         TestFile("test/srt/test_dp_schedule_policy.py", 0.2, runner="pytest"),
         TestFile("test/srt/test_dp_schedule_shape_aware.py", 0.2, runner="pytest"),
         TestFile("test/srt/test_dp_rank_assignment.py", 0.2, runner="pytest"),
         TestFile("test/srt/test_bench_recurrent_reuse_sweep.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_bench_serving_prompt_types.py", 0.1, runner="pytest"),
         TestFile("python/sgl_jax/test/test_mixed_chunk_dp.py", 0.2),
         TestFile("test/srt/function_call/test_qwen3_coder_detector.py", 0.1),
         TestFile("test/srt/function_call/test_glm4_moe_detector.py", 0.1),
@@ -391,15 +427,28 @@ suites = {
     "unit-test-tpu-v6e-4": [
         TestFile("python/sgl_jax/test/test_mesh.py", 0.4),
         TestFile("python/sgl_jax/test/test_linear_tp.py", 0.3, runner="pytest"),
-        TestFile("python/sgl_jax/test/layers/test_lightning_backend_dp.py", 1, runner="pytest"),
+        TestFile(
+            "python/sgl_jax/test/layers/test_lightning_backend_dp.py",
+            1,
+            runner="pytest",
+        ),
         TestFile("python/sgl_jax/test/test_kda_attention.py", 6.5),
         TestFile("python/sgl_jax/test/test_kda_attention_dp.py", 6),
         TestFile("python/sgl_jax/test/test_gdn_attention.py", 6.5),
         TestFile("python/sgl_jax/test/test_gdn_attention_dp.py", 6),
+        TestFile(
+            "python/sgl_jax/test/test_gdn_fused_chunk_parallel_prefill_dp.py",
+            0.2,
+            runner="pytest",
+        ),
         TestFile("python/sgl_jax/test/layers/test_lightning_backend.py", 8, runner="pytest"),
         TestFile("test/srt/test_moe_block_quant_e2e.py", 1.5, runner="pytest"),
         TestFile("python/sgl_jax/test/mem_cache/test_host_kv_pool_tpu.py", 1, runner="pytest"),
-        TestFile("python/sgl_jax/test/mem_cache/test_host_kv_pool_tpu_dp.py", 1, runner="pytest"),
+        TestFile(
+            "python/sgl_jax/test/mem_cache/test_host_kv_pool_tpu_dp.py",
+            1,
+            runner="pytest",
+        ),
     ],
     "kernel-performance-test-tpu-v6e-1": [
         TestFile("benchmark/kernels/flash_attention/bench_flashattention.py", 5),

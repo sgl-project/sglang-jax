@@ -32,6 +32,30 @@ def _routing_partition_spec(routing_sharding: jax.sharding.Sharding | None) -> P
     return P(spec[0], None)
 
 
+def _manual_shard_map_for_pallas(
+    fn,
+    *,
+    mesh: jax.sharding.Mesh,
+    in_specs: tuple[P, ...],
+    out_specs: tuple[P, ...],
+):
+    """Enter a manual shard_map boundary from an explicit model mesh."""
+    fn = jax.shard_map(
+        fn,
+        mesh=None,
+        in_specs=in_specs,
+        out_specs=out_specs,
+        check_vma=False,
+    )
+    out_sharding = tuple(jax.sharding.NamedSharding(mesh, spec) for spec in out_specs)
+    fn = jax.sharding.auto_axes(
+        fn,
+        axes=mesh.axis_names,
+        out_sharding=out_sharding,
+    )
+    return fn
+
+
 class GateLogit(nnx.Module):
     def __init__(
         self,
@@ -157,12 +181,11 @@ class TopK(nnx.Module):
             topk=self.topk,
         )
         if self.mesh is not None:
-            fn = jax.shard_map(
+            fn = _manual_shard_map_for_pallas(
                 fn,
                 mesh=self.mesh,
                 in_specs=(routing_spec,),
                 out_specs=(routing_spec, routing_spec),
-                check_vma=False,
             )
         try:
             return fn(router_logits)
@@ -189,12 +212,11 @@ class TopK(nnx.Module):
         # Mosaic/Pallas kernels cannot be auto-partitioned by JAX's SPMD compiler;
         # wrap in shard_map so each device runs the kernel on its local token slice.
         if self.mesh is not None:
-            fn = jax.shard_map(
+            fn = _manual_shard_map_for_pallas(
                 fn,
                 mesh=self.mesh,
                 in_specs=(routing_spec, P(None)),
                 out_specs=(routing_spec, routing_spec),
-                check_vma=False,
             )
         try:
             return fn(router_logits, correction_bias)
@@ -266,12 +288,11 @@ class TopK(nnx.Module):
         # Mosaic/Pallas kernels cannot be auto-partitioned by JAX's SPMD compiler;
         # wrap in shard_map so each device runs the kernel on its local token slice.
         if self.mesh is not None:
-            fn = jax.shard_map(
+            fn = _manual_shard_map_for_pallas(
                 fn,
                 mesh=self.mesh,
                 in_specs=(routing_spec, P(None)),
                 out_specs=(routing_spec, routing_spec),
-                check_vma=False,
             )
         return fn(router_logits, correction_bias)
 

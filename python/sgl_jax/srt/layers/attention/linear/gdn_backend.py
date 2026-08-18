@@ -25,6 +25,8 @@ inference. Returns ``(core_attn_out, new_conv, new_rec)`` shaped for
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import jax
@@ -34,12 +36,18 @@ from jax.sharding import PartitionSpec as P
 from sgl_jax.srt.kernels.gdn import (
     chunked_gated_delta_rule_jax,
     decode_gated_delta_rule_ref,
+    fused_chunk_parallel_prefill,
     jax_causal_conv1d_prefill,
     jax_causal_conv1d_update,
+)
+from sgl_jax.srt.kernels.gdn.fused_chunk_parallel_adapter import (
+    validate_fused_chunk_parallel_capability,
 )
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     LinearRecurrentAttnBackend,
 )
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -74,6 +82,8 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
         head_v_dim: int,
         conv_kernel_size: int,
         mesh: jax.sharding.Mesh,
+        dtype: jnp.dtype | None = None,
+        prefill_impl: str = "fused_chunk_parallel",
     ):
         super().__init__(mesh=mesh)
         self.num_k_heads = num_k_heads
@@ -97,11 +107,11 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
         tp = _mesh_tp_size(mesh)
         if num_k_heads % tp != 0:
             raise ValueError(
-                f"GDNAttnBackend: num_k_heads={num_k_heads} must be divisible " f"by TP={tp}."
+                f"GDNAttnBackend: num_k_heads={num_k_heads} must be divisible by TP={tp}."
             )
         if num_v_heads % tp != 0:
             raise ValueError(
-                f"GDNAttnBackend: num_v_heads={num_v_heads} must be divisible " f"by TP={tp}."
+                f"GDNAttnBackend: num_v_heads={num_v_heads} must be divisible by TP={tp}."
             )
         if self.conv_dim % tp != 0:
             raise ValueError(
@@ -113,6 +123,28 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
                 f"GDNAttnBackend: num_v_heads={num_v_heads} must be a multiple "
                 f"of num_k_heads={num_k_heads} (GQA repeat factor)."
             )
+
+        self.prefill_impl = prefill_impl
+        if self.prefill_impl not in {"chunked_jax", "fused_chunk_parallel"}:
+            raise ValueError("gdn_prefill_impl must be 'chunked_jax' or 'fused_chunk_parallel'.")
+        self._decode_callable: Callable[..., tuple[jax.Array, jax.Array]] = (
+            decode_gated_delta_rule_ref
+        )
+        self._prefill_callable: Callable[..., tuple[jax.Array, jax.Array, jax.Array]]
+        if self.prefill_impl == "chunked_jax":
+            self._prefill_callable = GDNAttnBackend._forward_extend_chunked_jax
+        else:
+            validate_fused_chunk_parallel_capability(
+                mesh=mesh,
+                dtype=dtype,
+                num_k_heads=num_k_heads,
+                num_v_heads=num_v_heads,
+                head_k_dim=head_k_dim,
+                head_v_dim=head_v_dim,
+                conv_kernel_size=conv_kernel_size,
+            )
+            self._prefill_callable = fused_chunk_parallel_prefill
+        logger.info("GDN prefill implementation=%s", self.prefill_impl)
 
     # ------------------------------------------------------------------
     # Dispatch
@@ -183,6 +215,7 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
                 conv1d_weight,
                 A_log,
                 dt_bias,
+                seq_lens=forward_batch.seq_lens,
             )
         # Flatten head dim into channel dim to match KDA's contract
         # (model layer reshapes back to [T, n_v, d_v] before output norm).
@@ -241,7 +274,7 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
                 track_indices=track_indices_l,
                 track_mask=track_mask_l,
             )
-            new_rec, out = decode_gated_delta_rule_ref(
+            new_rec, out = self._decode_callable(
                 conv_out,
                 b_l,
                 a_l,
@@ -316,8 +349,36 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
         conv1d_weight: jax.Array,
         A_log: jax.Array,
         dt_bias: jax.Array,
+        seq_lens: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """Packed ragged batch through ``chunked_gated_delta_rule_jax``."""
+        """Run the prefill callable selected and frozen at initialization."""
+        return self._prefill_callable(
+            self,
+            mixed_qkv,
+            conv_state_in,
+            recurrent_state_in,
+            b,
+            a,
+            conv1d_weight,
+            A_log,
+            dt_bias,
+            seq_lens,
+        )
+
+    def _forward_extend_chunked_jax(
+        self,
+        mixed_qkv: jax.Array,
+        conv_state_in: jax.Array,
+        recurrent_state_in: jax.Array,
+        b: jax.Array,
+        a: jax.Array,
+        conv1d_weight: jax.Array,
+        A_log: jax.Array,
+        dt_bias: jax.Array,
+        seq_lens: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Process a packed ragged batch with the chunked JAX implementation."""
+        del seq_lens
         meta = self.forward_metadata
         cu_seqlens = meta.cu_q_lens
         state_indices = meta.recurrent_indices

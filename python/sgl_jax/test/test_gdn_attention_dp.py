@@ -35,6 +35,11 @@ from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.test.test_utils import CustomTestCase, GDNAttnBackendForTest
 
 
+def _chunked_jax_backend(**kwargs) -> GDNAttnBackend:
+    """Keep the native DP integration suite pinned to the route it validates."""
+    return GDNAttnBackend(prefill_impl="chunked_jax", **kwargs)
+
+
 def _scaled_randn(rng: np.random.Generator, shape, scale: float = 0.1) -> np.ndarray:
     # scale=0.1 is a test-only hack: it shrinks the recurrent state so bf16 noise
     # in the delta-rule update fits the global atol=1e-2 (shared with flashattn).
@@ -518,7 +523,7 @@ def create_test_data(
 
     real_bs_per_dp = [len(lens_per_rank.get(r, [])) for r in range(dp_size)]
     backend = GDNAttnBackendForTest(
-        GDNAttnBackend(
+        _chunked_jax_backend(
             num_k_heads=num_k_heads,
             num_v_heads=num_v_heads,
             head_k_dim=head_k_dim,

@@ -178,6 +178,32 @@ For deeper scheduler behavior, see [Scheduler](../architecture/03-scheduler.md) 
 
 For the compiled model path, see [Global JIT Compile](global_jit_compile.md). For backend selection, see [Attention Backend](attention_backend.md).
 
+### GDN Prefill Implementation
+
+`--gdn-prefill-impl` selects the Gated DeltaNet prefill implementation at
+server startup.
+
+| Value | Behavior |
+|---|---|
+| `chunked_jax` | Run the native JAX Conv1D path with chunkwise-parallel GDN recurrence. |
+| `fused_chunk_parallel` | Process chunks in parallel with fused Conv1D and GDN recurrence. This is the default. Decode is unchanged. |
+
+The default fused path requires a supported TPU/BF16 configuration. Unsupported
+configurations fail during backend initialization; they do not silently fall
+back to `chunked_jax`. The selected implementation is frozen at backend
+initialization and logged once.
+
+Example:
+
+```bash
+python3 -u -m sgl_jax.launch_server \
+  --model-path <QWEN3_5_MODEL_PATH> \
+  --device tpu \
+  --dtype bfloat16 \
+  --gdn-prefill-impl fused_chunk_parallel \
+  <OTHER_SERVE_ARGUMENTS>
+```
+
 ## Feature-Specific Flags
 
 | Area | Arguments |

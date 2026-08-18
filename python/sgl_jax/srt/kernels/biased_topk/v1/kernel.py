@@ -52,8 +52,10 @@ def _select_topk(
         0,
     )
     row_iota = jax.lax.broadcasted_iota(jnp.int32, (topk, block_tokens), 0)
-    ids_init = jnp.full((topk, block_tokens), -1, dtype=jnp.int32)
-    weights_init = jnp.zeros((topk, block_tokens), dtype=jnp.float32)
+    # Derive the loop carry from ``scores`` so explicit shard-map axis types
+    # are preserved across the fori_loop carry boundary on JAX 0.10+.
+    ids_init = jnp.full_like(scores[:topk], -1, dtype=jnp.int32)
+    weights_init = jnp.zeros_like(scores[:topk], dtype=jnp.float32)
 
     def select_one(k, carry):
         current_scores, ids, weights = carry

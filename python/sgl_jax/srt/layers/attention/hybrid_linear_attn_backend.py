@@ -282,6 +282,8 @@ def attn_backend_wrapper(
             head_v_dim=text_cfg.linear_value_head_dim,
             conv_kernel_size=text_cfg.linear_conv_kernel_dim,
             mesh=runner.mesh,
+            dtype=runner.model_config.dtype,
+            prefill_impl=runner.server_args.gdn_prefill_impl,
         )
     elif runner.lightning_config is not None:
         from sgl_jax.srt.layers.attention.linear.lightning_backend import (

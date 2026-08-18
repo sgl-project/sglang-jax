@@ -2107,13 +2107,19 @@ def calculate_metrics(
         max_output_tokens_per_s=max_output_tokens_per_s,
         max_concurrent_requests=max_concurrent_requests,
         total_cached_tokens=total_cached,
-        cache_hit_rate=total_cached / total_prompt_tokens if total_prompt_tokens > 0 else 0.0,
+        cache_hit_rate=(total_cached / total_prompt_tokens if total_prompt_tokens > 0 else 0.0),
     )
 
     return metrics, output_lens
 
 
 MULTI_TURN_BACKENDS = {"sglang-oai-chat", "vllm-chat", "lmdeploy-chat"}
+
+
+def _is_multi_turn_prompt(prompt: Any) -> bool:
+    return (
+        isinstance(prompt, list) and bool(prompt) and all(isinstance(turn, str) for turn in prompt)
+    )
 
 
 def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callable:
@@ -2176,7 +2182,7 @@ async def benchmark(
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
-    is_multi_turn = isinstance(input_requests[0].prompt, list)
+    is_multi_turn = _is_multi_turn_prompt(input_requests[0].prompt)
     if is_multi_turn:
         request_func = wrap_multi_turn_request_func(request_func, backend=backend)
 

@@ -7,7 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import Mesh, NamedSharding
+from jax.sharding import AxisType, Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 
@@ -364,7 +364,11 @@ def test_topk_kernel_preserves_router_token_sharding(monkeypatch, token_axis, mo
     monkeypatch.setenv("PALLAS_INTERPRET", "1")
     devices = np.asarray(jax.devices())
     mesh_shape = (len(devices), 1) if token_axis == "data" else (1, len(devices))
-    mesh = Mesh(devices.reshape(mesh_shape), ("data", "tensor"))
+    mesh = Mesh(
+        devices.reshape(mesh_shape),
+        ("data", "tensor"),
+        axis_types=(AxisType.Explicit, AxisType.Explicit),
+    )
     tokens = 256 * len(devices)
     experts = 256 if mode == "grouped" else 128
     routing_sharding = NamedSharding(mesh, P(token_axis, None))
@@ -422,6 +426,71 @@ def test_topk_kernel_preserves_router_token_sharding(monkeypatch, token_axis, mo
         np.asarray(expected_weights),
         rtol=0,
         atol=1e-6,
+    )
+
+
+def test_topk_pallas_boundary_manualizes_explicit_mesh_axes(monkeypatch):
+    from sgl_jax.srt.eplb.expert_location import (
+        get_global_server_args,
+        set_global_server_args,
+    )
+    from sgl_jax.srt.layers import gate
+
+    monkeypatch.setenv("PALLAS_INTERPRET", "1")
+    devices = np.asarray(jax.devices())
+    mesh = Mesh(
+        devices.reshape((len(devices), 1)),
+        ("data", "tensor"),
+        axis_types=(AxisType.Explicit, AxisType.Explicit),
+    )
+    routing_sharding = NamedSharding(mesh, P("data", None))
+    logits = jax.device_put(
+        jnp.ones((128 * len(devices), 128), dtype=jnp.float32),
+        routing_sharding,
+    )
+    shard_map_meshes = []
+    auto_axes_calls = []
+    original_shard_map = jax.shard_map
+    original_auto_axes = jax.sharding.auto_axes
+
+    def recording_shard_map(*args, **kwargs):
+        shard_map_meshes.append(kwargs.get("mesh"))
+        return original_shard_map(*args, **kwargs)
+
+    def recording_auto_axes(*args, **kwargs):
+        auto_axes_calls.append(kwargs)
+        return original_auto_axes(*args, **kwargs)
+
+    monkeypatch.setattr(jax, "shard_map", recording_shard_map)
+    monkeypatch.setattr(jax.sharding, "auto_axes", recording_auto_axes)
+    previous_server_args = get_global_server_args()
+    set_global_server_args(SimpleNamespace(enable_topk_kernel=True, device="tpu"))
+    try:
+
+        def run_topk(values):
+            return gate.TopK(
+                topk=8,
+                renormalize=False,
+                mesh=mesh,
+            )(values, routing_sharding=routing_sharding)
+
+        with jax.set_mesh(mesh):
+            weights, ids = jax.jit(
+                run_topk,
+                out_shardings=(routing_sharding, routing_sharding),
+            )(logits)
+            weights.block_until_ready()
+            ids.block_until_ready()
+    finally:
+        set_global_server_args(previous_server_args)
+
+    assert shard_map_meshes == [None]
+    assert len(auto_axes_calls) == 1
+    assert auto_axes_calls[0]["axes"] == mesh.axis_names
+    out_sharding = auto_axes_calls[0]["out_sharding"]
+    assert tuple(sharding.spec for sharding in out_sharding) == (
+        P("data", None),
+        P("data", None),
     )
 
 

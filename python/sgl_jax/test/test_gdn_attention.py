@@ -50,6 +50,11 @@ mesh = create_device_mesh(
 jax.sharding.set_mesh(mesh)
 
 
+def _chunked_jax_backend(**kwargs) -> GDNAttnBackend:
+    """Keep the native integration suite pinned to the route it validates."""
+    return GDNAttnBackend(prefill_impl="chunked_jax", **kwargs)
+
+
 def _scaled_randn(rng: np.random.Generator, shape, scale: float = 0.1) -> np.ndarray:
     # Same rationale as KDA test: shrink the recurrent state so bf16 noise in
     # the delta-rule update fits the global atol=1e-2.
@@ -406,7 +411,7 @@ def create_test_data(
     has_initial_state_np = np.asarray(has_initial_state_per_req, dtype=np.bool_)
 
     backend = GDNAttnBackendForTest(
-        GDNAttnBackend(
+        _chunked_jax_backend(
             num_k_heads=num_k_heads,
             num_v_heads=num_v_heads,
             head_k_dim=head_k_dim,

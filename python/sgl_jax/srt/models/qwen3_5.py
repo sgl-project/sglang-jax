@@ -313,7 +313,9 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         )
         core_out = self.norm(core_out)
         core_out = core_out.reshape(
-            T, self.value_dim, out_sharding=NamedSharding(self.mesh, P("data", "tensor"))
+            T,
+            self.value_dim,
+            out_sharding=NamedSharding(self.mesh, P("data", "tensor")),
         )
         return core_out * jax.nn.silu(z)
 
@@ -364,7 +366,12 @@ class Qwen3_5MoeBlock(nnx.Module):
             num_experts=self.num_experts,
             weight_dtype=dtype,
         )
-        self.topk = TopK(topk=self.top_k, renormalize=renorm, layer_id=layer_id)
+        self.topk = TopK(
+            topk=self.top_k,
+            renormalize=renorm,
+            layer_id=layer_id,
+            mesh=mesh,
+        )
         self.experts = FusedEPMoE(
             hidden_size=hidden,
             num_experts=self.num_experts,
@@ -828,10 +835,14 @@ def _create_qwen3_5_weight_mappings(hf_config):
 
         # GemmaRMSNorm -> .weight (both layer types)
         mappings[f"{src}.input_layernorm.weight"] = WeightMapping(
-            target_path=f"{dst}.input_layernorm.weight", sharding=(None,), transpose=False
+            target_path=f"{dst}.input_layernorm.weight",
+            sharding=(None,),
+            transpose=False,
         )
         mappings[f"{src}.post_attention_layernorm.weight"] = WeightMapping(
-            target_path=f"{dst}.post_attention_layernorm.weight", sharding=(None,), transpose=False
+            target_path=f"{dst}.post_attention_layernorm.weight",
+            sharding=(None,),
+            transpose=False,
         )
 
         if is_full:
@@ -858,24 +869,36 @@ def _create_qwen3_5_weight_mappings(hf_config):
                 transpose=True,
             )
             mappings[f"{src}.self_attn.q_norm.weight"] = WeightMapping(
-                target_path=f"{dst}.self_attn.q_norm.weight", sharding=(None,), transpose=False
+                target_path=f"{dst}.self_attn.q_norm.weight",
+                sharding=(None,),
+                transpose=False,
             )
             mappings[f"{src}.self_attn.k_norm.weight"] = WeightMapping(
-                target_path=f"{dst}.self_attn.k_norm.weight", sharding=(None,), transpose=False
+                target_path=f"{dst}.self_attn.k_norm.weight",
+                sharding=(None,),
+                transpose=False,
             )
         else:
             # GDN: 4 HF in-proj keys -> 2 fused JAX params via __FUSED_* sentinels.
             mappings[f"{src}.linear_attn.in_proj_qkv.weight"] = WeightMapping(
-                target_path=f"__FUSED_QKVZ_QKV_WEIGHT__{i}", sharding=(None, None), transpose=False
+                target_path=f"__FUSED_QKVZ_QKV_WEIGHT__{i}",
+                sharding=(None, None),
+                transpose=False,
             )
             mappings[f"{src}.linear_attn.in_proj_z.weight"] = WeightMapping(
-                target_path=f"__FUSED_QKVZ_Z_WEIGHT__{i}", sharding=(None, None), transpose=False
+                target_path=f"__FUSED_QKVZ_Z_WEIGHT__{i}",
+                sharding=(None, None),
+                transpose=False,
             )
             mappings[f"{src}.linear_attn.in_proj_b.weight"] = WeightMapping(
-                target_path=f"__FUSED_BA_B_WEIGHT__{i}", sharding=(None, None), transpose=False
+                target_path=f"__FUSED_BA_B_WEIGHT__{i}",
+                sharding=(None, None),
+                transpose=False,
             )
             mappings[f"{src}.linear_attn.in_proj_a.weight"] = WeightMapping(
-                target_path=f"__FUSED_BA_A_WEIGHT__{i}", sharding=(None, None), transpose=False
+                target_path=f"__FUSED_BA_A_WEIGHT__{i}",
+                sharding=(None, None),
+                transpose=False,
             )
             # conv1d HF shape [conv_dim, 1, K] -> [conv_dim, K]; loader stripes it.
             mappings[f"{src}.linear_attn.conv1d.weight"] = WeightMapping(
@@ -885,13 +908,19 @@ def _create_qwen3_5_weight_mappings(hf_config):
                 reshape=(conv_dim, conv_k),
             )
             mappings[f"{src}.linear_attn.A_log"] = WeightMapping(
-                target_path=f"{dst}.self_attn.A_log", sharding=("tensor",), transpose=False
+                target_path=f"{dst}.self_attn.A_log",
+                sharding=("tensor",),
+                transpose=False,
             )
             mappings[f"{src}.linear_attn.dt_bias"] = WeightMapping(
-                target_path=f"{dst}.self_attn.dt_bias", sharding=("tensor",), transpose=False
+                target_path=f"{dst}.self_attn.dt_bias",
+                sharding=("tensor",),
+                transpose=False,
             )
             mappings[f"{src}.linear_attn.norm.weight"] = WeightMapping(
-                target_path=f"{dst}.self_attn.norm.scale", sharding=(None,), transpose=False
+                target_path=f"{dst}.self_attn.norm.scale",
+                sharding=(None,),
+                transpose=False,
             )
             mappings[f"{src}.linear_attn.out_proj.weight"] = WeightMapping(
                 target_path=f"{dst}.self_attn.out_proj.weight",
@@ -921,7 +950,9 @@ def _create_qwen3_5_weight_mappings(hf_config):
 
         # MoE (all layers when is_moe). Experts are pre-fused on disk.
         mappings[f"{src}.mlp.gate.weight"] = WeightMapping(
-            target_path=f"{dst}.mlp.moe_gate.kernel", sharding=(None, None), transpose=True
+            target_path=f"{dst}.mlp.moe_gate.kernel",
+            sharding=(None, None),
+            transpose=True,
         )
         mappings[f"{src}.mlp.experts.gate_up_proj"] = WeightMapping(
             target_path=[f"{dst}.mlp.experts.w1", f"{dst}.mlp.experts.w3"],
