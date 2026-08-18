@@ -81,13 +81,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
 
 
 def get_disagg_transport_id(req: Any) -> str:
-    base = getattr(req, "disagg_transfer_id", None) or req.rid
-    attempt = int(getattr(req, "disagg_transfer_attempt", 0))
-    return base if attempt == 0 else f"{base}#r{attempt}"
-
-
-def advance_disagg_transfer_attempt(req: Any) -> None:
-    req.disagg_transfer_attempt = int(getattr(req, "disagg_transfer_attempt", 0)) + 1
+    return getattr(req, "disagg_transfer_id", None) or req.rid
 
 
 PADDING_BUCKETS = [1 << i for i in range(6, 21)]
@@ -237,14 +231,10 @@ class Req:
         self.bootstrap_room: int | None = None
         self.disagg_prefill_dp_rank: int | None = None
         self.disagg_transfer_id: str | None = None
-        # Retracted transfers must not reuse a transport UUID while the
-        # previous Raiden read may still be retiring asynchronously.
-        self.disagg_transfer_attempt: int = 0
         self.disagg_host_buffer_id: int | None = None
         self.disagg_peer_process_index: int = 0
         self.disagg_chunk_index: int = 0
         self.disagg_chunk_sender = None
-        self.disagg_retract_pending: bool = False
 
         # Memory pool info
         self.req_pool_idx: int | None = None
@@ -687,7 +677,6 @@ class Req:
         self.start_send_idx = 0
         self.disagg_chunk_index = 0
         self.disagg_chunk_sender = None
-        self.disagg_retract_pending = False
         self.cache_protected_len = 0
         self.recurrent_pool_idx = None
         self.recurrent_cow_src_index = None
@@ -698,9 +687,6 @@ class Req:
     @property
     def disagg_transport_id(self) -> str:
         return get_disagg_transport_id(self)
-
-    def advance_disagg_transfer_attempt(self) -> None:
-        advance_disagg_transfer_attempt(self)
 
     def set_finish_with_abort(self, error_msg: str):
         # set it to one token to skip the long prefill

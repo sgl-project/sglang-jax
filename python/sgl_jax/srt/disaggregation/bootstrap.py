@@ -16,6 +16,11 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from pydantic import Field as PydanticField
 
+from sgl_jax.srt.disaggregation.base.transfer import (
+    chunk_transfer_id,
+    parse_chunk_transfer_id,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -61,6 +66,7 @@ class PrefillInfo:
     protocol_version: int = PROTOCOL_VERSION
     page_size: int = 0
     kv_dtype: str = ""
+    chunk_prefill_transfer: bool = False
     transport_metadata: dict[str, object] = field(default_factory=lambda: {"engine": "jax"})
 
     def to_dict(self) -> dict[str, object]:
@@ -111,6 +117,7 @@ def check_prefill_compat(
     expected_transfer_engine: str | None = None,
     expected_dp_rank: int | None = None,
     expected_dp_size: int | None = None,
+    expected_chunk_prefill_transfer: bool | None = None,
 ) -> None:
     """Raise ``ValueError`` if the prefill peer's KV layout is incompatible.
 
@@ -155,6 +162,14 @@ def check_prefill_compat(
             f"PD topology mismatch: prefill dp_size={peer_dp_size}, "
             f"decode dp_size={expected_dp_size}"
         )
+    if expected_chunk_prefill_transfer is not None:
+        peer_chunk_prefill_transfer = bool(info.get("chunk_prefill_transfer", False))
+        if peer_chunk_prefill_transfer != expected_chunk_prefill_transfer:
+            raise ValueError(
+                "PD chunk prefill transfer mismatch: "
+                f"prefill={peer_chunk_prefill_transfer}, "
+                f"decode={expected_chunk_prefill_transfer}"
+            )
 
 
 class RegisterPrefillRequest(BaseModel):
@@ -170,6 +185,7 @@ class RegisterPrefillRequest(BaseModel):
     protocol_version: int = PROTOCOL_VERSION
     page_size: int = 0
     kv_dtype: str = ""
+    chunk_prefill_transfer: bool = False
     transport_metadata: dict[str, object] = PydanticField(default_factory=lambda: {"engine": "jax"})
 
 
@@ -184,6 +200,7 @@ class RegisterTransferRequest(BaseModel):
     # prefill publishes zero until the final descriptor fixes the total.
     num_chunks: int = 1
     chunk_page_offset: int = 0
+    expected_total_pages: int = 0
     transport_metadata: dict[str, object]
 
 
@@ -284,19 +301,28 @@ class _Registry:
             chunk_index = int(info.get("chunk_index", 0))
             num_chunks = int(info.get("num_chunks", 1))
             chunk_page_offset = int(info.get("chunk_page_offset", 0))
+            expected_total_pages = int(info.get("expected_total_pages", 0))
             if chunk_index < 0:
                 raise ValueError("chunk_index must be non-negative")
             if chunk_page_offset < 0:
                 raise ValueError("chunk_page_offset must be non-negative")
             if num_chunks < 0:
                 raise ValueError("num_chunks must be non-negative")
+            if expected_total_pages < 0:
+                raise ValueError("expected_total_pages must be non-negative")
             if num_chunks and num_chunks != chunk_index + 1:
                 raise ValueError("the final chunk must publish num_chunks == chunk_index + 1")
-            expected_transfer_id = (
-                base_transfer_id
-                if base_transfer_id == transfer_id
-                else f"{base_transfer_id}#c{chunk_index}"
-            )
+            if base_transfer_id == transfer_id:
+                expected_transfer_id = base_transfer_id
+            else:
+                parsed_base, parsed_index = parse_chunk_transfer_id(transfer_id)
+                if parsed_base != base_transfer_id or parsed_index != chunk_index:
+                    raise ValueError(
+                        "chunk transfer_id must match base_transfer_id and chunk_index: "
+                        f"base={base_transfer_id!r}, chunk_index={chunk_index}, "
+                        f"got={transfer_id!r}"
+                    )
+                expected_transfer_id = chunk_transfer_id(base_transfer_id, chunk_index)
             if transfer_id != expected_transfer_id:
                 raise ValueError(
                     "chunk transfer_id must match base_transfer_id and chunk_index: "
@@ -311,10 +337,13 @@ class _Registry:
                     )
                 bundle = None
             if bundle is None:
+                if base_transfer_id != transfer_id and chunk_index != 0:
+                    raise ValueError("a chunk transfer bundle must be created from chunk zero")
                 bundle = {
                     "base_transfer_id": base_transfer_id,
                     "chunks": {},
                     "num_chunks": 0,
+                    "expected_total_pages": expected_total_pages,
                 }
                 self.transfers[key] = bundle
             chunks = bundle["chunks"]
@@ -331,9 +360,17 @@ class _Registry:
                 raise ValueError(
                     f"conflicting num_chunks: existing={known_total}, new={num_chunks}"
                 )
+            known_total_pages = int(bundle.get("expected_total_pages", 0))
+            if expected_total_pages and known_total_pages not in (0, expected_total_pages):
+                raise ValueError(
+                    "conflicting expected_total_pages: "
+                    f"existing={known_total_pages}, new={expected_total_pages}"
+                )
             chunks[chunk_index] = dict(info)
             if num_chunks:
                 bundle["num_chunks"] = num_chunks
+            if expected_total_pages:
+                bundle["expected_total_pages"] = expected_total_pages
             self.transfer_last_seen[key] = self.now()
 
     def get_transfer(
@@ -662,6 +699,7 @@ class BootstrapClient:
         protocol_version: int = PROTOCOL_VERSION,
         page_size: int = 0,
         kv_dtype: str = "",
+        chunk_prefill_transfer: bool = False,
         transport_metadata: dict[str, object] | None = None,
     ) -> None:
         payload = {
@@ -677,6 +715,7 @@ class BootstrapClient:
             "protocol_version": protocol_version,
             "page_size": page_size,
             "kv_dtype": kv_dtype,
+            "chunk_prefill_transfer": bool(chunk_prefill_transfer),
             "transport_metadata": transport_metadata or {"engine": "jax"},
         }
         last_err: Exception | None = None
@@ -756,6 +795,7 @@ class BootstrapClient:
         chunk_index: int = 0,
         num_chunks: int = 1,
         chunk_page_offset: int = 0,
+        expected_total_pages: int = 0,
         transport_metadata: dict[str, object],
     ) -> None:
         payload = {
@@ -767,6 +807,7 @@ class BootstrapClient:
             "chunk_index": chunk_index,
             "num_chunks": num_chunks,
             "chunk_page_offset": chunk_page_offset,
+            "expected_total_pages": expected_total_pages,
             "transport_metadata": transport_metadata,
         }
         r = self._client.post(

@@ -495,23 +495,25 @@ def _chunk_transfer_info(
         "chunk_index": chunk_index,
         "num_chunks": num_chunks,
         "chunk_page_offset": (chunk_index * 2 if chunk_page_offset is None else chunk_page_offset),
+        "expected_total_pages": 3,
         "transport_metadata": {"remote_block_ids": [10 + chunk_index]},
     }
 
 
-def test_chunk_transfer_registry_accumulates_and_finalizes_out_of_order():
+def test_chunk_transfer_registry_accumulates_and_finalizes_after_chunk_zero():
     registry = _Registry()
     final = _chunk_transfer_info("wire", 2, num_chunks=3)
     first = _chunk_transfer_info("wire", 0)
     middle = _chunk_transfer_info("wire", 1)
 
-    registry.register_transfer(final)
     registry.register_transfer(first)
+    registry.register_transfer(final)
     registry.register_transfer(middle)
 
     bundle = registry.get_transfer(17, 2, 3)
     assert bundle["base_transfer_id"] == "wire"
     assert bundle["num_chunks"] == 3
+    assert bundle["expected_total_pages"] == 3
     assert sorted(bundle["chunks"]) == [0, 1, 2]
     assert bundle["chunks"][2]["chunk_page_offset"] == 4
 
@@ -542,6 +544,23 @@ def test_chunk_zero_replaces_stale_room_but_later_chunk_cannot():
     bundle = registry.get_transfer(17, 2, 3)
     assert bundle["base_transfer_id"] == "new"
     assert bundle["chunks"][0]["transfer_id"] == "new#c0"
+
+
+def test_chunk_registry_rejects_orphan_nonzero_chunk():
+    registry = _Registry()
+
+    with pytest.raises(ValueError, match="created from chunk zero"):
+        registry.register_transfer(_chunk_transfer_info("wire", 1))
+
+
+def test_chunk_registry_rejects_conflicting_expected_total_pages():
+    registry = _Registry()
+    registry.register_transfer(_chunk_transfer_info("wire", 0))
+    second = _chunk_transfer_info("wire", 1)
+    second["expected_total_pages"] = 4
+
+    with pytest.raises(ValueError, match="conflicting expected_total_pages"):
+        registry.register_transfer(second)
 
 
 def test_prefill_decode_transfer_engines_must_match():
@@ -592,6 +611,19 @@ def test_prefill_decode_dp_topology_must_match():
             local_page_size=128,
             local_kv_dtype="bfloat16",
             expected_dp_size=2,
+        )
+
+
+@pytest.mark.parametrize(("prefill_enabled", "decode_enabled"), [(True, False), (False, True)])
+def test_prefill_decode_chunk_transfer_flag_must_match(prefill_enabled, decode_enabled):
+    info = {"chunk_prefill_transfer": prefill_enabled}
+
+    with pytest.raises(ValueError, match="chunk prefill transfer mismatch"):
+        check_prefill_compat(
+            info,
+            local_page_size=128,
+            local_kv_dtype="bfloat16",
+            expected_chunk_prefill_transfer=decode_enabled,
         )
 
 

@@ -206,7 +206,7 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
         scheduler.pd = "prefill"
         scheduler.server_args = SimpleNamespace(enable_request_time_stats_logging=False)
         scheduler.disagg_prefill_queue = SimpleNamespace(
-            cancel_matching=lambda *_args: [SimpleNamespace(req_id=req.rid, sender=sender)]
+            cancel_matching=lambda *_args: [SimpleNamespace(req_id=req.rid, sender=sender, req=req)]
         )
 
         with patch(
@@ -216,6 +216,7 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
             consumed = scheduler._process_pending_chunked_aborts()
 
         sender.abort.assert_called_once_with()
+        self.assertIsNotNone(req.to_finish)
         release.assert_not_called()
         scheduler._release_prefill_host_buffer.assert_not_called()
         self.assertEqual(consumed, {0: req})
@@ -266,7 +267,7 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
         self.assertIsNone(scheduler.last_batch.reqs_info[0].chunked_req)
         self.assertEqual(scheduler.send_to_tokenizer.send_pyobj.call_count, 1)
 
-    def test_retract_marks_both_pd_transfer_queues(self):
+    def test_retract_leaves_active_pd_transfer_queues_draining(self):
         req = self._make_req("pd-retract", [1, 2], [10, 11])
         scheduler, _ = self._make_scheduler(req)
         scheduler.disagg_prefill_queue = Mock()
@@ -275,8 +276,8 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
         with patch("sgl_jax.srt.managers.scheduler.release_kv_cache"):
             scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
-        scheduler.disagg_prefill_queue.retract_all.assert_called_once_with()
-        scheduler.disagg_transfer_queue.retract_all.assert_called_once_with()
+        scheduler.disagg_prefill_queue.retract_all.assert_not_called()
+        scheduler.disagg_transfer_queue.retract_all.assert_not_called()
 
     def test_pending_abort_chunk_is_not_rescheduled(self):
         req = self._make_req("inflight", [1, 2], [10, 11])
@@ -444,6 +445,7 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
 
             def send_chunk(self, *args, **kwargs):
                 self.calls.append((args, kwargs))
+                kwargs["on_ready"]()
                 self.has_started_chunks = True
 
             def poll(self):
@@ -493,6 +495,7 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
         self.assertEqual(sender.transfer_id, "wire-pd-chunks")
         self.assertEqual(sender.calls[0][0], (0, [4, 10]))
         self.assertEqual(sender.calls[0][1]["chunk_page_offset"], 0)
+        self.assertEqual(sender.calls[0][1]["expected_total_pages"], 3)
         self.assertFalse(sender.calls[0][1]["is_final"])
         self.assertEqual(req.start_send_idx, 4)
         self.assertEqual(req.is_chunked, 0)
@@ -505,6 +508,7 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
 
         self.assertEqual(sender.calls[1][0], (1, [15]))
         self.assertEqual(sender.calls[1][1]["chunk_page_offset"], 2)
+        self.assertEqual(sender.calls[1][1]["expected_total_pages"], 3)
         self.assertTrue(sender.calls[1][1]["is_final"])
         self.assertEqual(req.start_send_idx, 6)
         self.assertEqual(req.disagg_chunk_index, 2)
@@ -530,7 +534,7 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
         self.assertEqual(scheduler.chunked_reqs, [None])
         self.assertEqual(scheduler._pending_chunked_abort_reqs, [None])
 
-    def test_retract_waits_for_pd_chunk_sender_before_reset_and_requeue(self):
+    def test_retract_preserves_active_pd_chunk_sender_and_wire_id(self):
         req = self._make_req("pd-retract", [1, 2], [10, 11])
         req.disagg_transfer_id = "wire-pd-retract"
         sender = SimpleNamespace(
@@ -542,28 +546,17 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
         scheduler, _ = self._make_scheduler(req, active_reqs=req)
         scheduler.pd = "prefill"
         scheduler.server_args = SimpleNamespace(enable_request_time_stats_logging=False)
-        scheduler._release_prefill_req_resources = Mock()
 
         with patch("sgl_jax.srt.managers.scheduler.release_kv_cache") as release:
             scheduler._retract_parked_chunked_reqs([])
 
-        sender.abort.assert_called_once_with()
+        sender.abort.assert_not_called()
         release.assert_not_called()
-        self.assertTrue(req.disagg_retract_pending)
         self.assertFalse(req.is_retracted)
         self.assertEqual(scheduler.waiting_queue, [])
-        self.assertEqual(scheduler.chunked_reqs, [None])
-
-        scheduler._on_prefill_transfer_terminal(req, sender)
-
-        sender.clear.assert_called_once_with()
-        scheduler._release_prefill_req_resources.assert_called_once_with(req)
-        self.assertIsNone(req.disagg_chunk_sender)
-        self.assertFalse(req.disagg_retract_pending)
-        self.assertTrue(req.is_retracted)
-        self.assertEqual(req.disagg_transfer_attempt, 1)
-        self.assertEqual(req.disagg_transport_id, "wire-pd-retract#r1")
-        self.assertEqual(scheduler.waiting_queue, [req])
+        self.assertEqual(scheduler.chunked_reqs, [req])
+        self.assertEqual(req.disagg_transport_id, "wire-pd-retract")
+        sender.clear.assert_not_called()
         scheduler.stream_output.assert_not_called()
 
     def test_retract_does_not_release_batch_owned_chunk_twice(self):

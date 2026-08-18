@@ -7,6 +7,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
@@ -24,6 +25,7 @@ from sgl_jax.srt.disaggregation.base.transfer import (
     DecodeTransferContext,
     PrefillTransfer,
     PrefillTransferContext,
+    chunk_transfer_id,
     slots_to_page_ids,
 )
 from sgl_jax.srt.disaggregation.common.capacity import CHUNK_TRANSFER_WINDOW
@@ -35,6 +37,14 @@ from sgl_jax.srt.disaggregation.common.metrics import (
 from sgl_jax.srt.disaggregation.raiden_transfer.wrapper import RaidenTransferWrapper
 
 logger = logging.getLogger(__name__)
+
+_CHUNK_METADATA_EXECUTOR = ThreadPoolExecutor(
+    max_workers=8,
+    thread_name_prefix="RaidenChunkMetadata",
+)
+_CHUNK_METADATA_MIN_POLL_SECONDS = 0.01
+_CHUNK_METADATA_MAX_POLL_SECONDS = 0.05
+_CHUNK_PRODUCER_TIMEOUT_SECONDS = 300.0
 
 
 def _uuid_to_int(value: str) -> int:
@@ -153,6 +163,7 @@ class RaidenChunkedMetadata:
     decode_dp_rank: int
     initial_chunks: Mapping[int, Mapping[str, object]]
     known_num_chunks: int = 0
+    expected_total_pages: int = 0
     direct_commit: Callable[[Mapping[str, object] | None], None] | None = None
 
 
@@ -164,16 +175,18 @@ class _PendingSenderChunk:
     chunk_page_offset: int
     is_final: bool
     dp_rank: int
+    expected_total_pages: int
+    on_ready: Callable[[], None] | None = None
 
 
 def _normalize_transfer_bundle(
     info: Mapping[str, object],
-) -> tuple[dict[int, Mapping[str, object]], int]:
+) -> tuple[dict[int, Mapping[str, object]], int, int]:
     """Normalize v5 metadata and the pre-v5 flat shape used by test doubles."""
 
     raw_chunks = info.get("chunks")
     if raw_chunks is None:
-        return {0: info}, 1
+        return {0: info}, 1, 0
     if not isinstance(raw_chunks, Mapping):
         raise TypeError("Raiden transfer chunks must be a mapping")
     chunks: dict[int, Mapping[str, object]] = {}
@@ -184,7 +197,10 @@ def _normalize_transfer_bundle(
     num_chunks = int(info.get("num_chunks", 0) or 0)
     if num_chunks < 0:
         raise ValueError("Raiden num_chunks must be non-negative")
-    return chunks, num_chunks
+    expected_total_pages = int(info.get("expected_total_pages", 0) or 0)
+    if expected_total_pages < 0:
+        raise ValueError("Raiden expected_total_pages must be non-negative")
+    return chunks, num_chunks, expected_total_pages
 
 
 class RaidenTransferKVManager(CommonKVManager):
@@ -294,7 +310,7 @@ class RaidenTransferKVManager(CommonKVManager):
 
         receiver: RaidenTransferKVReceiver | None = None
         try:
-            chunks, known_num_chunks = _normalize_transfer_bundle(info)
+            chunks, known_num_chunks, expected_total_pages = _normalize_transfer_bundle(info)
             if not chunks:
                 return DecodeAdmission.deferred("metadata_pending")
             first_chunk = chunks.get(0)
@@ -302,7 +318,7 @@ class RaidenTransferKVManager(CommonKVManager):
                 return DecodeAdmission.deferred("chunk_zero_pending")
 
             expected_first_id = (
-                f"{context.transfer_id}#c0"
+                chunk_transfer_id(context.transfer_id, 0)
                 if self.enable_chunk_prefill_transfer
                 else context.transfer_id
             )
@@ -360,6 +376,13 @@ class RaidenTransferKVManager(CommonKVManager):
 
             receiver = self.create_receiver(context.req_id)
             if self.enable_chunk_prefill_transfer:
+                if expected_total_pages <= 0:
+                    raise ValueError("Raiden chunk metadata is missing expected_total_pages")
+                if expected_total_pages != len(local_block_ids):
+                    raise ValueError(
+                        "Raiden chunk total block count mismatch: "
+                        f"expected={len(local_block_ids)}, remote={expected_total_pages}"
+                    )
                 receiver.init(
                     RaidenChunkedMetadata(
                         base_uuid=context.transfer_id,
@@ -371,6 +394,7 @@ class RaidenTransferKVManager(CommonKVManager):
                         decode_dp_rank=context.decode_dp_rank,
                         initial_chunks=chunks,
                         known_num_chunks=known_num_chunks,
+                        expected_total_pages=expected_total_pages,
                         direct_commit=context.direct_commit,
                     )
                 )
@@ -449,6 +473,7 @@ class RaidenTransferKVManager(CommonKVManager):
         chunk_index: int = 0,
         num_chunks: int = 1,
         chunk_page_offset: int = 0,
+        expected_total_pages: int = 0,
     ) -> None:
         if bootstrap_room is None:
             return
@@ -464,6 +489,7 @@ class RaidenTransferKVManager(CommonKVManager):
             chunk_index=chunk_index,
             num_chunks=num_chunks,
             chunk_page_offset=chunk_page_offset,
+            expected_total_pages=expected_total_pages,
             transport_metadata=transport_metadata,
         )
 
@@ -519,11 +545,15 @@ class RaidenTransferKVManager(CommonKVManager):
                 receivers = list(self._receivers.items())
             for req_id, receiver in receivers:
                 started = getattr(receiver, "transfer_started_at", None)
-                if (
-                    started is not None
-                    and now - started >= self._pull_timeout_s
-                    and receiver.request_abort("timeout")
-                ):
+                producer_wait_started = getattr(receiver, "producer_wait_started_at", None)
+                pull_timed_out = started is not None and now - started >= self._pull_timeout_s
+                producer_timed_out = (
+                    started is None
+                    and producer_wait_started is not None
+                    and now - producer_wait_started >= _CHUNK_PRODUCER_TIMEOUT_SECONDS
+                )
+                reason = "timeout" if pull_timed_out else "producer_timeout"
+                if (pull_timed_out or producer_timed_out) and receiver.request_abort(reason):
                     timed_out_receivers.append(req_id)
         return timed_out_senders, timed_out_receivers
 
@@ -575,6 +605,7 @@ class RaidenTransferKVSender(KVSender, StateHolder):
         self._started_chunks: set[int] = set()
         self._pending_chunks: dict[int, _PendingSenderChunk] = {}
         self._num_chunks: int | None = None
+        self._expected_total_pages: int | None = None
 
     @property
     def uuid(self) -> str:
@@ -624,6 +655,8 @@ class RaidenTransferKVSender(KVSender, StateHolder):
         chunk_page_offset: int,
         is_final: bool,
         dp_rank: int = 0,
+        expected_total_pages: int = 0,
+        on_ready: Callable[[], None] | None = None,
     ) -> None:
         """Queue one newly-computed chunk and fill available Raiden slots."""
 
@@ -641,7 +674,11 @@ class RaidenTransferKVSender(KVSender, StateHolder):
             chunk_page_offset=int(chunk_page_offset),
             is_final=bool(is_final),
             dp_rank=int(dp_rank),
+            expected_total_pages=int(expected_total_pages),
+            on_ready=on_ready,
         )
+        if pending.expected_total_pages <= 0:
+            raise ValueError("expected_total_pages must be positive")
         with self._pump_lock:
             with self._state_lock:
                 if self.state not in (KVPoll.WAITING_FOR_INPUT, KVPoll.TRANSFERRING):
@@ -652,6 +689,13 @@ class RaidenTransferKVSender(KVSender, StateHolder):
                     raise RuntimeError(f"chunk_index={chunk_index} was already registered")
                 if self._num_chunks is not None:
                     raise RuntimeError("cannot register a chunk after the final chunk")
+                if self._expected_total_pages not in (None, pending.expected_total_pages):
+                    raise ValueError(
+                        "expected_total_pages changed within one chunk transfer: "
+                        f"existing={self._expected_total_pages}, "
+                        f"new={pending.expected_total_pages}"
+                    )
+                self._expected_total_pages = pending.expected_total_pages
                 self._chunk_mode = True
                 self._bootstrap_room = pending.bootstrap_room
                 self._dp_rank = pending.dp_rank
@@ -674,7 +718,7 @@ class RaidenTransferKVSender(KVSender, StateHolder):
                     pending = next(iter(self._pending_chunks.values()))
 
                 active = sum(
-                    not self._manager.sender_done(f"{self.uuid}#c{index}")
+                    not self._manager.sender_done(chunk_transfer_id(self.uuid, index))
                     for index in started_chunks
                 )
                 if active >= CHUNK_TRANSFER_WINDOW:
@@ -694,7 +738,9 @@ class RaidenTransferKVSender(KVSender, StateHolder):
                     return
 
     def _start_pending_chunk(self, pending: _PendingSenderChunk) -> None:
-        child_id = f"{self.uuid}#c{pending.chunk_index}"
+        child_id = chunk_transfer_id(self.uuid, pending.chunk_index)
+        if pending.on_ready is not None:
+            pending.on_ready()
         needed = self._manager.register_read(
             child_id,
             child_id,
@@ -717,12 +763,13 @@ class RaidenTransferKVSender(KVSender, StateHolder):
             child_id,
             list(pending.block_ids),
             pending.bootstrap_room,
-            None,
+            self._debug_metadata if pending.is_final else None,
             dp_rank=pending.dp_rank,
             base_transfer_id=self.uuid,
             chunk_index=pending.chunk_index,
             num_chunks=(pending.chunk_index + 1 if pending.is_final else 0),
             chunk_page_offset=pending.chunk_page_offset,
+            expected_total_pages=pending.expected_total_pages,
         )
 
     def send(self) -> None:
@@ -776,7 +823,7 @@ class RaidenTransferKVSender(KVSender, StateHolder):
                 pending_chunks = bool(self._pending_chunks)
                 num_chunks = self._num_chunks
                 pending_failure = self._pending_failure_reason
-            child_ids = [f"{self.uuid}#c{k}" for k in started_chunks]
+            child_ids = [chunk_transfer_id(self.uuid, k) for k in started_chunks]
             if not all(self._manager.sender_done(child_id) for child_id in child_ids):
                 return KVPoll.TRANSFERRING
             if pending_failure is not None:
@@ -843,7 +890,7 @@ class RaidenTransferKVSender(KVSender, StateHolder):
                 reason=reason,
             )
             forget_ids = (
-                [f"{self.uuid}#c{k}" for k in self._started_chunks]
+                [chunk_transfer_id(self.uuid, k) for k in self._started_chunks]
                 if self._chunk_mode
                 else [self.uuid]
             )
@@ -881,11 +928,19 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
         self._known_num_chunks: int | None = None
         self._timer: object | None = None
         self._transfer_started_at: float | None = None
+        self._producer_wait_started_at: float | None = None
         self._pending_failure_reason: str | None = None
+        self._metadata_future: Future | None = None
+        self._next_metadata_poll_at = 0.0
+        self._metadata_poll_interval = _CHUNK_METADATA_MIN_POLL_SECONDS
 
     @property
     def transfer_started_at(self) -> float | None:
         return self._transfer_started_at
+
+    @property
+    def producer_wait_started_at(self) -> float | None:
+        return self._producer_wait_started_at
 
     def init(self, p_metadata) -> None:
         if not isinstance(p_metadata, (RaidenMetadata, RaidenChunkedMetadata)):
@@ -981,18 +1036,26 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
             pending_failure = self._pending_failure_reason
 
         states = {
-            chunk_index: self._manager.receiver_state(f"{metadata.base_uuid}#c{chunk_index}")
+            chunk_index: self._manager.receiver_state(
+                chunk_transfer_id(metadata.base_uuid, chunk_index)
+            )
             for chunk_index in started_chunks
         }
         if any(value == "failed" for value in states.values()):
             self.request_abort("raiden_failed_receiving")
             pending_failure = self._pending_failure_reason
         all_started_terminal = all(value in ("done", "failed") for value in states.values())
+        transfer_complete = num_chunks is not None and started_chunks == tuple(range(num_chunks))
+        if all_started_terminal and not transfer_complete:
+            with self._state_lock:
+                self._transfer_started_at = None
+                if self._producer_wait_started_at is None:
+                    self._producer_wait_started_at = time.monotonic()
         if pending_failure is not None:
             if all_started_terminal:
                 return self._finish(KVPoll.FAILED, pending_failure)
             return KVPoll.TRANSFERRING
-        if num_chunks is None or started_chunks != tuple(range(num_chunks)):
+        if not transfer_complete:
             return KVPoll.TRANSFERRING
         if not all(value == "done" for value in states.values()):
             return KVPoll.TRANSFERRING
@@ -1005,37 +1068,44 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
         return self._finish(KVPoll.SUCCESS, "raiden_chunks_done_receiving")
 
     def _discover_and_start_chunks(self, metadata: RaidenChunkedMetadata) -> None:
+        """Start locally-known chunks and poll bootstrap metadata off-thread."""
+
         with self._state_lock:
             if self.state != KVPoll.TRANSFERRING or self._pending_failure_reason is not None:
                 return
-            complete = self._known_num_chunks is not None and self._started_chunks == set(
-                range(self._known_num_chunks)
-            )
-        if complete:
-            return
+            future = self._metadata_future
 
-        try:
-            info = self._manager.bootstrap_client.get_transfer_info(
-                metadata.bootstrap_room,
-                jax_process_index=metadata.jax_process_index,
-                prefill_dp_rank=metadata.prefill_dp_rank,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Raiden chunk metadata lookup failed for room=%s: %s",
-                metadata.bootstrap_room,
-                exc,
-            )
-            return
+        info = None
+        if future is not None and future.done():
+            try:
+                info = future.result()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Raiden chunk metadata lookup failed for room=%s: %s",
+                    metadata.bootstrap_room,
+                    exc,
+                )
+            finally:
+                with self._state_lock:
+                    if self._metadata_future is future:
+                        self._metadata_future = None
+
+        metadata_changed = False
         if info is not None:
-            chunks, known_num_chunks = _normalize_transfer_bundle(info)
+            chunks, known_num_chunks, expected_total_pages = _normalize_transfer_bundle(info)
             conflict_reason: str | None = None
             with self._state_lock:
+                if expected_total_pages not in (0, metadata.expected_total_pages):
+                    conflict_reason = "chunk_total_pages_conflict"
                 for chunk_index, record in chunks.items():
+                    if conflict_reason is not None:
+                        break
                     existing = self._chunk_records.get(chunk_index)
                     if existing is not None and existing != record:
                         conflict_reason = "chunk_metadata_conflict"
                         break
+                    if existing is None:
+                        metadata_changed = True
                     self._chunk_records[chunk_index] = record
                 if conflict_reason is None and known_num_chunks:
                     if self._known_num_chunks not in (None, known_num_chunks):
@@ -1043,7 +1113,16 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
                     elif any(index >= known_num_chunks for index in self._chunk_records):
                         conflict_reason = "chunk_index_out_of_range"
                     else:
+                        metadata_changed |= self._known_num_chunks != known_num_chunks
                         self._known_num_chunks = known_num_chunks
+                if metadata_changed:
+                    self._metadata_poll_interval = _CHUNK_METADATA_MIN_POLL_SECONDS
+                else:
+                    self._metadata_poll_interval = min(
+                        self._metadata_poll_interval * 2,
+                        _CHUNK_METADATA_MAX_POLL_SECONDS,
+                    )
+                self._next_metadata_poll_at = time.monotonic() + self._metadata_poll_interval
             if conflict_reason is not None:
                 self.request_abort(conflict_reason)
                 return
@@ -1052,12 +1131,14 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
             with self._state_lock:
                 started_chunks = tuple(self._started_chunks)
                 candidates = sorted(set(self._chunk_records) - self._started_chunks)
-                if not candidates or self._pending_failure_reason is not None:
+                if self._pending_failure_reason is not None:
                     return
+                if not candidates:
+                    break
                 chunk_index = candidates[0]
                 record = self._chunk_records[chunk_index]
             started_states = [
-                self._manager.receiver_state(f"{metadata.base_uuid}#c{index}")
+                self._manager.receiver_state(chunk_transfer_id(metadata.base_uuid, index))
                 for index in started_chunks
             ]
             if any(state == "failed" for state in started_states):
@@ -1065,9 +1146,9 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
                 return
             active_pulls = sum(state is None for state in started_states)
             if active_pulls >= CHUNK_TRANSFER_WINDOW:
-                return
+                break
             try:
-                expected_id = f"{metadata.base_uuid}#c{chunk_index}"
+                expected_id = chunk_transfer_id(metadata.base_uuid, chunk_index)
                 if str(record.get("transfer_id", "")) != expected_id:
                     raise ValueError(
                         f"chunk transfer ID mismatch: expected={expected_id!r}, "
@@ -1112,10 +1193,29 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
                 return
             with self._state_lock:
                 self._started_chunks.add(chunk_index)
-                # Bound time since the latest started pull, not total prompt
-                # duration. The reaper still catches a producer that stops
-                # publishing after this chunk.
+                self._producer_wait_started_at = None
+                # Pull timeout covers only an active Raiden read. Producer
+                # compute gaps use the separate progress watchdog below.
                 self._transfer_started_at = time.monotonic()
+
+        now = time.monotonic()
+        with self._state_lock:
+            metadata_complete = self._known_num_chunks is not None and set(
+                range(self._known_num_chunks)
+            ).issubset(self._chunk_records)
+            if (
+                not metadata_complete
+                and self._metadata_future is None
+                and now >= self._next_metadata_poll_at
+                and self._pending_failure_reason is None
+            ):
+                self._metadata_future = _CHUNK_METADATA_EXECUTOR.submit(
+                    self._manager.bootstrap_client.get_transfer_info,
+                    metadata.bootstrap_room,
+                    jax_process_index=metadata.jax_process_index,
+                    prefill_dp_rank=metadata.prefill_dp_rank,
+                )
+                self._next_metadata_poll_at = now + self._metadata_poll_interval
 
     def _validate_chunk_ranges(self, chunk_index: int, page_offset: int, num_pages: int) -> None:
         if page_offset < 0:
@@ -1143,6 +1243,12 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
         metadata: RaidenChunkedMetadata,
         num_chunks: int,
     ) -> None:
+        if metadata.expected_total_pages != len(metadata.local_block_ids):
+            raise ValueError(
+                "Raiden expected_total_pages does not match decode allocation: "
+                f"metadata={metadata.expected_total_pages}, "
+                f"local={len(metadata.local_block_ids)}"
+            )
         expected_page_offset = 0
         seen_remote_blocks: set[int] = set()
         for chunk_index in range(num_chunks):
@@ -1180,11 +1286,19 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
             raise RuntimeError("cannot commit an incomplete Raiden receive")
         assert self._metadata is not None
         if self._metadata.direct_commit is not None:
-            expected_debug = (
-                self._metadata.expected_debug
-                if isinstance(self._metadata, RaidenMetadata)
-                else None
-            )
+            expected_debug = None
+            if isinstance(self._metadata, RaidenMetadata):
+                expected_debug = self._metadata.expected_debug
+            else:
+                for chunk_index in sorted(self._chunk_records, reverse=True):
+                    record = self._chunk_records[chunk_index]
+                    transport = record.get("transport_metadata", record)
+                    if not isinstance(transport, Mapping):
+                        continue
+                    candidate = transport.get("kv_debug")
+                    if isinstance(candidate, Mapping):
+                        expected_debug = candidate
+                        break
             self._metadata.direct_commit(expected_debug)
 
     def clear(self) -> None:
@@ -1222,6 +1336,9 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
             self._transition_to(state)
             self._finish_timer()
             self._transfer_started_at = None
+            self._producer_wait_started_at = None
+            metadata_future = self._metadata_future
+            self._metadata_future = None
             metadata = self._metadata
             transfer_id = (
                 metadata.uuid
@@ -1240,10 +1357,12 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
                 reason=reason,
             )
             forget_ids = (
-                [f"{metadata.base_uuid}#c{k}" for k in self._started_chunks]
+                [chunk_transfer_id(metadata.base_uuid, k) for k in self._started_chunks]
                 if isinstance(metadata, RaidenChunkedMetadata)
                 else [transfer_id]
             )
+        if metadata_future is not None:
+            metadata_future.cancel()
         for child_id in forget_ids:
             self._manager.forget(child_id)
         self._manager.cleanup_transfer(

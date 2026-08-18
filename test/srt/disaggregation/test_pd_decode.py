@@ -715,29 +715,6 @@ def test_cancel_matching_retains_inflight_entry_until_terminal():
     assert len(queue) == 1
 
 
-def test_retract_all_aborts_live_receivers_but_skips_cancelled_entries():
-    queue = DecodeTransferQueue()
-    live_receiver = mock.Mock()
-    cancelled_receiver = mock.Mock()
-    live = DecodeBookkeeping(req_id="live", req=_AdmReq("live", 4), receiver=live_receiver)
-    cancelled = DecodeBookkeeping(
-        req_id="cancelled",
-        req=_AdmReq("cancelled", 4),
-        receiver=cancelled_receiver,
-        cancelled=True,
-    )
-    queue.add(live)
-    queue.add(cancelled)
-
-    retracted = queue.retract_all()
-
-    assert retracted == [live]
-    assert live.retracted is True
-    assert cancelled.retracted is False
-    live_receiver.abort.assert_called_once_with()
-    cancelled_receiver.abort.assert_not_called()
-
-
 def test_cancelled_terminal_transfer_releases_decode_rank_pages():
     class _CancelledDrainScheduler:
         process_decode_queue = SchedulerDisaggregationDecodeMixin.process_decode_queue
@@ -773,44 +750,6 @@ def test_cancelled_terminal_transfer_releases_decode_rank_pages():
     sched.process_decode_queue()
 
     assert sched.released == [([12, 13, 14, 15], 3)]
-
-
-def test_retracted_terminal_transfer_releases_pages_and_retries_bootstrap():
-    class _RetractedDrainScheduler:
-        _drain_decode_transfer_terminals = (
-            SchedulerDisaggregationDecodeMixin._drain_decode_transfer_terminals
-        )
-
-        def __init__(self, entry):
-            self.entry = entry
-            self.released = []
-            self._pd_pending_bootstrap = []
-
-        def _drain_transfer_queue_synced(self):
-            return [self.entry]
-
-        def _release_decode_kv_indices(self, kv_indices, dp_rank):
-            self.released.append((kv_indices, dp_rank))
-
-    req = _AdmReq("retracted", 4)
-    req.dp_rank = 2
-    req.reset_for_retract = mock.Mock()
-    entry = DecodeBookkeeping(
-        req_id=req.rid,
-        req=req,
-        receiver=object(),
-        kv_indices=[20, 21],
-        synced_state=KVPoll.FAILED,
-        retracted=True,
-    )
-    sched = _RetractedDrainScheduler(entry)
-
-    sched._drain_decode_transfer_terminals()
-
-    assert sched.released == [([20, 21], 2)]
-    req.reset_for_retract.assert_called_once_with()
-    assert req.disagg_transfer_attempt == 1
-    assert sched._pd_pending_bootstrap == [req]
 
 
 def test_inflight_cap_is_partitioned_per_rank_without_cross_rank_head_of_line():

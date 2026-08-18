@@ -1904,10 +1904,9 @@ class Scheduler(
                 continue
             sender = getattr(req, "disagg_chunk_sender", None)
             if sender is not None:
-                assert self._pending_chunked_abort_reqs[dp_rank] is None
-                req.disagg_retract_pending = True
-                sender.abort()
-                self.chunked_reqs[dp_rank] = None
+                # A peer may still be pulling this transport ID. Keep the
+                # producer and its pages owned while scheduling is paused, then
+                # resume the same chunk stream after continue_generation.
                 continue
             if id(req) in retracted_request_ids:
                 assert self._pending_chunked_abort_reqs[dp_rank] is None
@@ -2751,6 +2750,8 @@ class Scheduler(
         if prefill_q is not None:
             for entry in prefill_q.cancel_matching(recv_req.rid, recv_req.abort_all):
                 logger.debug("Abort prefill queue request. rid=%s", entry.req_id)
+                if entry.req is not None:
+                    entry.req.to_finish = FINISH_ABORT()
                 entry.sender.abort()
 
         prealloc_q = self.disagg_prealloc_queue
@@ -2826,10 +2827,9 @@ class Scheduler(
             self._pd_quiesce()
 
         if recv_req.mode == "retract":
-            if self.disagg_prefill_queue is not None:
-                self.disagg_prefill_queue.retract_all()
-            if self.disagg_transfer_queue is not None:
-                self.disagg_transfer_queue.retract_all()
+            # An in-flight P/D transport cannot be retracted process-locally:
+            # the peer would keep using the original wire ID. Let transfer
+            # queues drain to a stable ownership boundary during the pause.
             self.running_batch.filter_batch()
             all_reqs = [
                 req for info in self.running_batch.reqs_info for req in info.reqs if info.reqs

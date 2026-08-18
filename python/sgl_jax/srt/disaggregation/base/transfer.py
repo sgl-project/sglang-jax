@@ -12,6 +12,32 @@ import numpy as np
 from sgl_jax.srt.disaggregation.base.kv_manager import KVReceiver, KVSender
 
 
+def chunk_transfer_id(base_transfer_id: str, chunk_index: int) -> str:
+    """Return the v5 wire ID for one chunk of a logical PD transfer."""
+
+    if not base_transfer_id:
+        raise ValueError("base_transfer_id must be non-empty")
+    chunk_index = int(chunk_index)
+    if chunk_index < 0:
+        raise ValueError("chunk_index must be non-negative")
+    return f"{base_transfer_id}#c{chunk_index}"
+
+
+def parse_chunk_transfer_id(transfer_id: str) -> tuple[str, int]:
+    """Parse a v5 chunk wire ID into ``(base_transfer_id, chunk_index)``."""
+
+    base_transfer_id, separator, raw_index = str(transfer_id).rpartition("#c")
+    if not separator or not base_transfer_id or not raw_index:
+        raise ValueError(f"invalid chunk transfer_id={transfer_id!r}")
+    try:
+        chunk_index = int(raw_index)
+    except ValueError as exc:
+        raise ValueError(f"invalid chunk transfer_id={transfer_id!r}") from exc
+    if chunk_index < 0:
+        raise ValueError(f"invalid chunk transfer_id={transfer_id!r}")
+    return base_transfer_id, chunk_index
+
+
 def slots_to_page_ids(slots: Any, page_size: int, token_count: int) -> tuple[int, ...]:
     """Validate page-backed token slots and return their ordered page IDs."""
 

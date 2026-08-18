@@ -18,10 +18,7 @@ from sgl_jax.srt.disaggregation.base.transfer import (
     PrefillTransferContext,
     TransferBackend,
 )
-from sgl_jax.srt.managers.schedule_batch import (
-    advance_disagg_transfer_attempt,
-    get_disagg_transport_id,
-)
+from sgl_jax.srt.managers.schedule_batch import get_disagg_transport_id
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import Req
@@ -226,20 +223,6 @@ class PrefillBootstrapQueue:
                     out.append(entry)
             return out
 
-    def retract_all(self) -> list[PrefillBookkeeping]:
-        """Mark live, non-cancelled transfers for retry after terminal drain."""
-
-        with self._lock:
-            entries = [
-                entry
-                for entry in self._entries.values()
-                if not entry.cancelled and entry.req is not None
-            ]
-        for entry in entries:
-            entry.req.disagg_retract_pending = True
-            entry.sender.abort()
-        return entries
-
 
 class SchedulerDisaggregationPrefillMixin:
     """Mixin for PD prefill mode on Scheduler."""
@@ -313,16 +296,13 @@ class SchedulerDisaggregationPrefillMixin:
                 False,
             )
         )
-        ready_to_transfer = (
-            list(pd_reqs)
-            if chunk_transfer_enabled
-            else [
-                req
-                for req in pd_reqs
-                if not any(req is chunked_req for chunked_req in chunked_now)
-                and req.rid not in self.disagg_prefill_queue._entries
-            ]
-        )
+        ready_to_transfer = [
+            req
+            for req in pd_reqs
+            if not chunk_transfer_enabled
+            and not any(req is chunked_req for chunked_req in chunked_now)
+            and req.rid not in self.disagg_prefill_queue._entries
+        ]
         if ready_to_transfer:
             kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
             self.disagg_kv_manager.prepare_prefill_batch(kv_pool.kv_buffer)
@@ -491,12 +471,30 @@ class SchedulerDisaggregationPrefillMixin:
             created_sender = True
 
         try:
-            page_size = self.token_to_kv_pool_allocator.get_kvcache().page_size
+            kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+            page_size = kv_pool.page_size
             if not is_final and end % page_size:
                 raise ValueError(
                     f"middle chunk ends at unaligned token {end} for page_size={page_size}"
                 )
             block_ids = self._extract_req_block_ids_range(req, start, end)
+            expected_total_pages = (len(req.origin_input_ids) + page_size - 1) // page_size
+            if is_final:
+                from sgl_jax.srt.disaggregation.debug_utils import kv_debug_enabled
+
+                if kv_debug_enabled(req_id):
+                    from sgl_jax.srt.disaggregation.raiden_transfer.conn import (
+                        _debug_metadata,
+                    )
+
+                    payload = {"kv": self._extract_req_kv(req)}
+                    self._maybe_log_prefill_extract_debug(
+                        req,
+                        payload["kv"],
+                        use_d2h_staging=False,
+                        chunk_transfer=True,
+                    )
+                    sender.attach_debug_metadata(_debug_metadata(payload, expected_total_pages))
             sender.send_chunk(
                 req.disagg_chunk_index,
                 block_ids,
@@ -504,6 +502,10 @@ class SchedulerDisaggregationPrefillMixin:
                 chunk_page_offset=start // page_size,
                 is_final=is_final,
                 dp_rank=int(req.dp_rank),
+                expected_total_pages=expected_total_pages,
+                on_ready=lambda buffers=kv_pool.kv_buffer: (
+                    self.disagg_kv_manager.prepare_prefill_batch(buffers)
+                ),
             )
         except Exception as exc:
             logger.exception(
@@ -694,12 +696,9 @@ class SchedulerDisaggregationPrefillMixin:
             sender.clear()
             return
 
-        retract_pending = bool(getattr(req, "disagg_retract_pending", False))
         try:
             state = sender.poll()
-            if retract_pending:
-                pass
-            elif req.to_finish is not None:
+            if req.to_finish is not None:
                 req.check_finished()
                 req.output_ids = []
                 self._stream_prefill_req(req)
@@ -720,11 +719,6 @@ class SchedulerDisaggregationPrefillMixin:
             self._release_prefill_req_resources(req)
             if req.disagg_chunk_sender is sender:
                 req.disagg_chunk_sender = None
-
-        if retract_pending:
-            advance_disagg_transfer_attempt(req)
-            req.reset_for_retract()
-            self._add_request_to_queue(req)
 
     def _finish_prefill_only_success(self: Scheduler, req: Req) -> None:
         from sgl_jax.srt.managers.schedule_batch import FINISH_LENGTH
