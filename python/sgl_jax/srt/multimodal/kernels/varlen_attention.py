@@ -179,36 +179,6 @@ def static_validate_inputs(
     del sm_scale, mask_value, k_scale, v_scale
 
 
-def dynamic_validate_metadata(
-    q: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
-    cu_seqlens: jax.Array,
-    num_seqs: jax.Array,
-) -> None:
-    """Eager host-side validation of packed metadata; not for use under jit."""
-    static_validate_inputs(q, k, v, cu_seqlens, num_seqs)
-    nseq = int(num_seqs[0])
-    max_num_seqs = cu_seqlens.shape[0] - 1
-    if not 1 <= nseq <= max_num_seqs:
-        raise ValueError(f"num_seqs={nseq} is outside [1, {max_num_seqs}]")
-    if int(cu_seqlens[0]) != 0:
-        raise ValueError("cu_seqlens[0] must be zero")
-
-    valid_tokens = int(cu_seqlens[nseq])
-    if valid_tokens > q.shape[0]:
-        raise ValueError("valid tokens exceed q capacity")
-    if valid_tokens > k.shape[0]:
-        raise ValueError("valid tokens exceed k/v capacity")
-
-    for seq_idx in range(nseq):
-        seq_start = int(cu_seqlens[seq_idx])
-        seq_end = int(cu_seqlens[seq_idx + 1])
-        seq_len = seq_end - seq_start
-        if seq_len <= 0:
-            raise ValueError(f"sequence {seq_idx}: seq_len={seq_len} must be positive")
-
-
 # --------------------------------------------------------------------------- #
 # Correctness reference
 # --------------------------------------------------------------------------- #
@@ -1601,7 +1571,6 @@ __all__ = [
     "DEFAULT_MASK_VALUE",
     "DEFAULT_Q_BLOCK",
     "DEFAULT_VMEM_LIMIT_BYTES",
-    "dynamic_validate_metadata",
     "ref_varlen_attention",
     "static_validate_inputs",
     "varlen_attention",
