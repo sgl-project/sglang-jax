@@ -78,6 +78,7 @@ class _CellSizeRunner(ModelRunnerKVCacheMixin):
         for i in (0, 1, 2, *range(6, num_layers, 4)):
             indexer_types[i] = "full"
         self.model_config = types.SimpleNamespace(
+            hf_config=types.SimpleNamespace(),
             hf_text_config=types.SimpleNamespace(
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
@@ -85,7 +86,7 @@ class _CellSizeRunner(ModelRunnerKVCacheMixin):
                 index_head_dim=index_head_dim,
                 index_skip_topk_offset=3,
                 indexer_types=indexer_types,
-            )
+            ),
         )
 
     def _kv_pool_layer_count(self):
@@ -155,3 +156,101 @@ def test_dsa_indexer_params_report_the_full_layer_count():
     """21 of GLM-5.2's 78 layers are "full" and each gets an indexer buffer."""
     assert _CellSizeRunner("dsa_sparse")._dsa_indexer_cache_params() == (128, 21)
     assert _CellSizeRunner("fa")._dsa_indexer_cache_params() == (0, 0)
+
+
+def _single_device_mesh():
+    import jax
+
+    return jax.make_mesh((1,), ("data",))
+
+
+def _build_pool(runner, size, mesh, dp_size=1):
+    """Build the real pool this runner's config would allocate at `size` tokens."""
+    import jax.numpy as jnp
+
+    from sgl_jax.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+    cfg = runner.model_config.hf_text_config
+    indexer_key_dim, num_indexer_layers = runner._dsa_indexer_cache_params()
+    return MLATokenToKVPool(
+        size=size,
+        page_size=runner.page_size,
+        dtype=jnp.bfloat16,
+        kv_lora_rank=cfg.kv_lora_rank,
+        qk_rope_head_dim=cfg.qk_rope_head_dim,
+        layer_num=runner._kv_pool_layer_count(),
+        mesh=mesh,
+        dp_size=dp_size,
+        indexer_key_dim=indexer_key_dim,
+        num_indexer_layers=num_indexer_layers,
+    )
+
+
+def _resident_bytes(pool):
+    """Bytes actually held by the pool's live buffers, measured not derived."""
+    return sum(b.nbytes for b in pool.kv_buffer) + sum(b.nbytes for b in pool.indexer_key_buffer)
+
+
+def test_allocated_bytes_match_the_budget_and_the_report():
+    """Budget, report, and allocation must agree on one live pool.
+
+    The other tests compare the budget against `get_kv_cache_shape`; this one
+    compares it against the bytes of the arrays that actually got allocated,
+    which is the invariant the DSA indexer buffer broke.
+
+    The pool allocates `size + page_size * dp_size` tokens' worth of pages —
+    one spare page per DP rank, per layer — which `_compute_cell_size` has
+    never counted. That slack is pre-existing and independent of DSA; expressing
+    it as `cell * page_size * dp_size` keeps it visible instead of absorbed.
+    """
+    runner = _CellSizeRunner("dsa_sparse", num_layers=8)
+    assert runner._dsa_indexer_cache_params()[1] > 0, "test needs a DSA indexer buffer"
+
+    size = 256
+    pool = _build_pool(runner, size, _single_device_mesh())
+    resident = _resident_bytes(pool)
+
+    # Reporting: what the scheduler's `kvcache` gauge and the startup log show.
+    assert pool.get_kv_size_bytes() == resident
+
+    # Budgeting: what the profiler sizes the pool against.
+    cell = runner._compute_cell_size()
+    assert resident == cell * (size + runner.page_size * 1)
+
+
+def test_latent_only_budget_overshoots_the_available_memory():
+    """Reproduce the production over-provisioning without a TPU.
+
+    Sizing a DSA pool with the pre-fix, latent-only budget (what a non-DSA
+    config is charged) makes it allocate more than the profiler said was
+    available — the excess coming out of the activation reserve. The fixed
+    budget fits.
+    """
+    runner = _CellSizeRunner("dsa_sparse", num_layers=8)
+    available = 16 * 1024 * 1024
+    runner.get_available_device_memory = lambda: available
+    runner.mem_fraction_static = 1.0
+
+    budget = runner._profile_available_bytes(total_device_memory=0)
+    assert budget == available
+
+    mesh = _single_device_mesh()
+    page = runner.page_size
+
+    def pages_for(cell_size):
+        return (budget // cell_size) // page * page
+
+    # Every pool carries one unbudgeted spare page per DP rank per layer
+    # (`_create_buffers` allocates `size + page_size * dp_size` tokens). That
+    # slack predates DSA and bounds how far a correctly budgeted pool may
+    # exceed the profiled budget.
+    slack = runner._compute_cell_size() * page
+
+    # Pre-fix: the latent-only cell size, i.e. what a non-DSA config is charged.
+    latent_only_cell = _CellSizeRunner("fa", num_layers=8)._compute_cell_size()
+    over = _resident_bytes(_build_pool(runner, pages_for(latent_only_cell), mesh))
+    assert over - budget > slack
+
+    # Post-fix: sized with the indexer counted, only the spare page is left over.
+    fitted = _resident_bytes(_build_pool(runner, pages_for(runner._compute_cell_size()), mesh))
+    assert 0 < fitted <= budget + slack
