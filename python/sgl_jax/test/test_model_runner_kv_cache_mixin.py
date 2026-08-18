@@ -133,10 +133,13 @@ def test_cell_size_includes_dsa_indexer_cache():
     assert cell > _MLA_BYTES_PER_TOKEN
 
 
-@pytest.mark.parametrize("page_size", [1, 64, 128])
+@pytest.mark.parametrize("page_size", [1, 128])
 def test_cell_size_pads_page_size_to_the_kv_packing_boundary(page_size):
     """With bf16 (packing=2) and page_size=1 a page holds 2 slots for 1 token,
-    so the per-token cost is double the naive width. Both terms pay it."""
+    so the per-token cost is double the naive width. Both terms pay it.
+
+    Only page_size=1 exercises the pad; 128 is the production value and stands
+    in for every even page size (they all leave `aligned_ps == page_size`)."""
     cell = _CellSizeRunner("dsa_sparse", page_size=page_size)._compute_cell_size()
     assert cell == _allocated_bytes_per_token(640, page_size) * 78 + (
         _allocated_bytes_per_token(128, page_size) * 21
@@ -150,12 +153,6 @@ def test_cell_size_pads_latent_segments_independently():
     GLM/DeepSeek shape (512/64) does not, since both give 640."""
     cell = _CellSizeRunner("fa", kv_lora_rank=192, qk_rope_head_dim=64)._compute_cell_size()
     assert cell == _allocated_bytes_per_token(256 + 128) * 78
-
-
-def test_dsa_indexer_params_report_the_full_layer_count():
-    """21 of GLM-5.2's 78 layers are "full" and each gets an indexer buffer."""
-    assert _CellSizeRunner("dsa_sparse")._dsa_indexer_cache_params() == (128, 21)
-    assert _CellSizeRunner("fa")._dsa_indexer_cache_params() == (0, 0)
 
 
 def _single_device_mesh():
