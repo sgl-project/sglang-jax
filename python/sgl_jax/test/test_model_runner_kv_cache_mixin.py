@@ -147,9 +147,7 @@ def test_cell_size_pads_latent_segments_independently():
     align(lora + rope, 128) — the kernel slices nope and rope as adjacent
     buffers. lora=192/rope=64 separates the two formulas (384 vs 256); the
     GLM/DeepSeek shape (512/64) does not, since both give 640."""
-    cell = _CellSizeRunner(
-        "fa", kv_lora_rank=192, qk_rope_head_dim=64
-    )._compute_cell_size()
+    cell = _CellSizeRunner("fa", kv_lora_rank=192, qk_rope_head_dim=64)._compute_cell_size()
     assert cell == _allocated_bytes_per_token(256 + 128) * 78
 
 
