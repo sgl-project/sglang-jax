@@ -55,24 +55,15 @@ def test_recurrent_admission_cap_already_aligned_unchanged():
     assert cap == 8
 
 
-def test_profile_available_bytes_reserves_only_static_fraction():
+@pytest.mark.parametrize(("embedding_pool_bytes", "expected"), [(0, 700), (100, 600)])
+def test_profile_available_bytes_reserves_static_and_embedding_pool(embedding_pool_bytes, expected):
     runner = types.SimpleNamespace(
         get_available_device_memory=lambda: 900,
         mem_fraction_static=0.8,
-        embedding_pool_bytes=0,
+        embedding_pool_bytes=embedding_pool_bytes,
         linear_recurrent_config=None,
     )
-    assert ModelRunnerKVCacheMixin._profile_available_bytes(runner, 1000) == 700
-
-
-def test_embedding_pool_bytes_reserved_from_kv_budget():
-    runner = types.SimpleNamespace(
-        get_available_device_memory=lambda: 900,
-        mem_fraction_static=0.8,
-        embedding_pool_bytes=100,
-        linear_recurrent_config=None,
-    )
-    assert ModelRunnerKVCacheMixin._profile_available_bytes(runner, 1000) == 600
+    assert ModelRunnerKVCacheMixin._profile_available_bytes(runner, 1000) == expected
 
 
 def test_embedding_pool_bytes_only_for_in_model_prefill():

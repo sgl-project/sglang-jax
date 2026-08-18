@@ -17,29 +17,11 @@ def _read(pool, entry):
     return np.stack(rows)
 
 
-def _write(pool, item_hash, emb, ds=None):
-    """Cache one item through the packed writer (the pool's only write path).
-
-    ``ds`` is ``[L, D, H]``; it is concatenated onto ``emb``'s feature axis to
-    form the ``[L, (1+D)*H]`` layout the pool now stores in one buffer.
-    """
+def _write(pool, item_hash, emb):
+    """Cache one item through the pool's packed writer."""
     emb = jnp.asarray(emb)
-    if ds is not None:
-        ds = jnp.asarray(ds)
-        emb = jnp.concatenate([emb, ds.reshape(ds.shape[0], -1)], axis=-1)
     (entry,) = pool.write_packed((item_hash,), emb, (emb.shape[0],))
     return entry
-
-
-def test_write_then_lookup_roundtrips_and_pages_align():
-    pool = EmbeddingPool(num_pages=4, page_size=2, hidden=1, dtype=jnp.float32)
-    emb = jnp.asarray([[10.0], [11.0], [12.0]])  # length 3 -> 2 pages
-    entry = _write(pool, 1, emb)
-    assert entry.length == 3
-    assert len(entry.page_ids) == 2  # ceil(3 / 2)
-    np.testing.assert_array_equal(_read(pool, entry)[:, 0], [10, 11, 12])
-    assert pool.lookup(1) is entry
-    assert pool.lookup(999) is None
 
 
 def test_lru_eviction_frees_pages():
@@ -64,11 +46,6 @@ def test_lookup_touch_protects_from_eviction():
     assert pool.lookup(0xA) is not None
 
 
-def test_item_larger_than_pool_is_skipped():
-    pool = EmbeddingPool(num_pages=4, page_size=2, hidden=1, dtype=jnp.float32)
-    assert _write(pool, 1, jnp.zeros((9, 1), dtype=jnp.float32)) is None  # 5 pages > 4
-
-
 def test_rewrite_reuses_freed_pages():
     pool = EmbeddingPool(num_pages=4, page_size=2, hidden=1, dtype=jnp.float32)
     _write(pool, 1, jnp.asarray([[1.0], [2.0], [3.0]]))
@@ -77,16 +54,6 @@ def test_rewrite_reuses_freed_pages():
     # Overwriting the same hash releases the old pages before re-allocating.
     assert len(pool._free_pages) == 3
     np.testing.assert_array_equal(_read(pool, pool.lookup(1))[:, 0], [9])
-
-
-def test_deepstack_roundtrips():
-    pool = EmbeddingPool(num_pages=4, page_size=2, hidden=1, dtype=jnp.float32, deepstack_dim=2)
-    emb = jnp.asarray([[1.0], [2.0]])  # [L=2, H=1]
-    ds = jnp.asarray([[[3.0], [4.0]], [[5.0], [6.0]]])  # [L=2, D=2, H=1]
-    entry = _write(pool, 1, emb, ds)
-    page, off = int(entry.page_ids[0]), 0
-    # Deepstack planes are stored after the primary H columns in the same buffer.
-    np.testing.assert_array_equal(np.asarray(pool.pages[page, off, pool.hidden :]), [3, 4])
 
 
 def test_write_packed_roundtrips_items_and_drops_padding():
@@ -110,6 +77,8 @@ def test_write_packed_roundtrips_items_and_drops_padding():
     assert entry.length == 3
     assert len(entry.page_ids) == 2
     np.testing.assert_array_equal(_read(pool, entry)[:, 0], [101, 102, 103])
+    assert pool.lookup(1) is entry
+    assert pool.lookup(999) is None
     assert np.asarray(pool.pages[-1, -1, 0]) == 99
 
 

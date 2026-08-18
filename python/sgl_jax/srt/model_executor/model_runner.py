@@ -952,7 +952,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             input_embedding, deepstack = embed_multimodal_inputs(
                 multimodal_batch=forward_batch.multimodal_batch,
                 input_ids=forward_batch.input_ids,
-                input_embedding=self.model.get_input_embeddings(),
                 multimodal_model=self.model,
                 embedding_pool=self.embedding_pool,
             )

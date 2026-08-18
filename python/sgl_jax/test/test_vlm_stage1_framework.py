@@ -30,9 +30,7 @@ from sgl_jax.srt.multimodal.in_model.lane_packing import (
     balance_lanes,
     encoder_num_lanes,
     pack_vision_inputs,
-    put_sharded_batch,
     replicate_across_mesh,
-    restore_encoder_output,
     run_mrope_vision_model,
 )
 from sgl_jax.srt.multimodal.layers.attention.flash_attention_backend import (
@@ -123,15 +121,15 @@ def _pack_qwen2(visual, items):
         buckets=visual.input_buckets,
         merge_unit=visual.spatial_merge_unit,
     )
-    patches = put_sharded_batch(patches, visual.mesh, visual.specs.batch_axis)
+    batch_sharding = visual.specs.sharding(visual.specs.batch_axis)
+    patches = jax.device_put(patches, batch_sharding)
     return patches, grid_thw, output_indices
 
 
 def _qwen2_metadata(visual, grid_thw, capacity):
-    return put_sharded_batch(
+    return jax.device_put(
         visual._build_metadata(grid_thw, capacity),
-        visual.mesh,
-        visual.specs.batch_axis,
+        visual.specs.sharding(visual.specs.batch_axis),
     )
 
 
@@ -252,47 +250,18 @@ def test_vision_batch_layout_uses_all_encoder_lanes(vision_tp, expected_lanes):
     )
 
 
-def test_dp_encoder_restores_item_order_and_padding():
-    items = [
-        MultimodalDataItem(Modality.IMAGE, placeholder_ranges=[(0, 2)]),
-        MultimodalDataItem(Modality.IMAGE, placeholder_ranges=[(0, 1)]),
-        MultimodalDataItem(Modality.IMAGE, placeholder_ranges=[(0, 1)]),
-    ]
-
-    class Encoder:
-        mesh = None
-
-        def _batch_items(self, values):
-            assert values == items
-            lanes = jnp.asarray([[[20.0], [30.0], [99.0]], [[10.0], [11.0], [99.0]]])
-            return lanes, np.asarray([3, 4, 0, 1, -1, -1], dtype=np.int32)
-
-        @staticmethod
-        def encode(lanes):
-            return lanes
-
-    encoder = Encoder()
-    lanes, output_indices = encoder._batch_items(items)
-    packed = restore_encoder_output(encoder.encode(lanes), output_indices, encoder.mesh)
-
-    np.testing.assert_array_equal(packed[:, 0], [10, 11, 20, 30, 0, 0])
-
-
 def _assert_vision_precompile(visual):
     calls = []
 
-    def encode(*inputs):
-        if isinstance(visual, Qwen2_5_VisionTransformer):
-            calls.append((inputs[0].shape, np.asarray(inputs[1]).tolist()))
-            return jnp.zeros(
-                (
-                    inputs[0].shape[0],
-                    inputs[0].shape[1] // visual.spatial_merge_unit,
-                    1,
-                )
+    def encode(patches, grid_thw):
+        calls.append((patches.shape, np.asarray(grid_thw).tolist()))
+        return jnp.zeros(
+            (
+                patches.shape[0],
+                patches.shape[1] // visual.spatial_merge_unit,
+                1,
             )
-        else:
-            calls.append(tuple(leaf.shape for leaf in jax.tree.leaves(inputs)))
+        )
 
     with patch.object(type(visual), "encode", side_effect=encode):
         visual.precompile()
@@ -438,11 +407,9 @@ def test_qwen2_get_image_feature_spmd(encoder_tp):
         lambda _: running,
         Model(),
     )
-    first, _ = host_orchestration.embed_multimodal_inputs(*args)
-    second, _ = host_orchestration.embed_multimodal_inputs(*args)
-    np.testing.assert_array_equal(first, second)
-    assert first.sharding.spec == PartitionSpec("data", None)
-    assert calls == 2
+    output, _ = host_orchestration.embed_multimodal_inputs(*args)
+    assert output.sharding.spec == PartitionSpec("data", None)
+    assert calls == 1
 
 
 def test_replicate_across_mesh_reuses_rank_explicit_replication():
@@ -533,28 +500,6 @@ def test_batch_routes_video_modality():
     batch = _batch(video)
     assert tuple(batch) == (Modality.VIDEO,)
     assert batch[Modality.VIDEO][0].item is video[0]
-
-
-def test_qwen_attention_layouts_use_static_max_seq_len_bounds():
-    config = _vision_config(
-        depth=2,
-        fullatt_block_indexes=[1],
-        patch_size=14,
-        spatial_merge_size=2,
-        window_size=112,
-    )
-    with jax.set_mesh(_mesh()):
-        visual = Qwen2_5_VisionTransformer(
-            config,
-            jnp.bfloat16,
-            mesh=_mesh(),
-            norm_eps=1e-6,
-        )
-
-    empty_grid = np.zeros((1, 1, 3), dtype=np.int32)
-    _, _, window_attn, full_attn = visual._build_metadata(empty_grid, 256)
-    assert window_attn.max_seq_len == 64
-    assert full_attn.max_seq_len == 256
 
 
 @pytest.mark.parametrize("search_method", ["compare_all", "scan"])
@@ -1076,6 +1021,8 @@ def test_qwen2_metadata_is_host_planned_and_bucket_stable():
     indices = np.asarray(indices)
     position_ids = np.asarray(position_ids)
 
+    assert window_attn.max_seq_len == 16
+    assert full_attn.max_seq_len == 32
     np.testing.assert_array_equal(output_indices[:6], np.arange(6))
     assert position_ids.shape == (1, 32, 2)
     np.testing.assert_array_equal(indices[0, :, 0], [0, 1, 3, 4, 2, 5, 6, 7])

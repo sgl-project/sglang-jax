@@ -6,7 +6,7 @@ import functools
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
@@ -44,15 +44,7 @@ def _validate_vision_items(items: list[MultimodalDataItem], merge_unit: int) -> 
             )
 
 
-def put_sharded_batch(value: Any, mesh: Mesh | None, batch_axis: Any):
-    if mesh is None:
-        return jax.tree.map(jnp.asarray, value)
-    return jax.device_put(value, NamedSharding(mesh, PartitionSpec(batch_axis)))
-
-
-def encoder_num_lanes(mesh: Mesh | None, tensor_parallel: bool) -> int:
-    if mesh is None:
-        return 1
+def encoder_num_lanes(mesh: Mesh, tensor_parallel: bool) -> int:
     data_size = int(mesh.shape.get("data", 1))
     tensor_size = int(mesh.shape.get("tensor", 1))
     return data_size * (1 if tensor_parallel else tensor_size)
@@ -94,7 +86,6 @@ def balance_lanes(item_lengths: list[int] | tuple[int, ...], num_lanes: int) -> 
 @dataclass(frozen=True)
 class PackedLanes:
     features: np.ndarray  # [num_lanes, cap, *feature_shape]
-    valid: np.ndarray  # [num_lanes], filled input length per lane
     output_indices: np.ndarray
     lanes: list[list[int]]
     cap: int
@@ -122,7 +113,6 @@ def pack_lanes(
     lane_loads = [sum(lengths[index] for index in lane) for lane in lanes]
     cap = _bucket_capacity(max(lane_loads), buckets, merge_unit)
     features = np.zeros((num_lanes, cap, *features_np[0].shape[1:]), dtype=dtype)
-    valid = np.zeros(num_lanes, dtype=np.int32)
     output_cap = cap // merge_unit
     output_starts = np.zeros(len(items), dtype=np.int32)
 
@@ -137,7 +127,6 @@ def pack_lanes(
             output_starts[item_index] = lane_index * output_cap + output_offset
             input_offset = end
             output_offset += out_len
-        valid[lane_index] = input_offset
 
     output_indices = np.full(num_lanes * output_cap, -1, dtype=np.int32)
     cursor = 0
@@ -147,7 +136,12 @@ def pack_lanes(
             output_len, dtype=np.int32
         )
         cursor += output_len
-    return PackedLanes(features, valid, output_indices, lanes, cap)
+    return PackedLanes(
+        features=features,
+        output_indices=output_indices,
+        lanes=lanes,
+        cap=cap,
+    )
 
 
 def pack_vision_inputs(
@@ -243,48 +237,38 @@ def _restore_input_order(
     indices: jax.Array,
     mask: jax.Array,
     *,
-    out_sharding: NamedSharding | None = None,
+    out_sharding: NamedSharding,
 ) -> jax.Array:
     output = output.reshape(-1, output.shape[-1])
-    output = (
-        output[indices]
-        if out_sharding is None
-        else output.at[indices].get(out_sharding=out_sharding)
-    )
+    output = output.at[indices].get(out_sharding=out_sharding)
     return jnp.where(mask[:, None], output, jnp.zeros((), output.dtype))
 
 
-_restore_input_order_jit = jax.jit(_restore_input_order)
-
-
-@functools.cache
-def _restore_input_order_mesh_jit(mesh: Mesh):
-    out_sharding = NamedSharding(mesh, PartitionSpec())
-    return jax.jit(
-        functools.partial(_restore_input_order, out_sharding=out_sharding),
-        out_shardings=out_sharding,
-    )
+_restore_input_order_jit = jax.jit(_restore_input_order, static_argnames=("out_sharding",))
 
 
 def restore_encoder_output(
     output: jax.Array,
     output_indices: np.ndarray,
-    mesh: Mesh | None,
+    mesh: Mesh,
 ) -> jax.Array:
     output_indices = np.asarray(output_indices, dtype=np.int32)
     mask = output_indices >= 0
     indices = np.maximum(output_indices, 0)
-
-    if mesh is None:
-        return _restore_input_order_jit(output, indices, mask)
-    return _restore_input_order_mesh_jit(mesh)(output, indices, mask)
+    out_sharding = NamedSharding(mesh, PartitionSpec())
+    return _restore_input_order_jit(
+        output,
+        indices,
+        mask,
+        out_sharding=out_sharding,
+    )
 
 
 def run_mrope_vision_model(
     vision_model: Callable[..., jax.Array],
     items: list[MultimodalDataItem],
     *,
-    mesh: Mesh | None,
+    mesh: Mesh,
     num_lanes: int,
     buckets: tuple[int, ...],
     merge_unit: int,
@@ -310,8 +294,6 @@ def run_mrope_vision_model(
     else:
         raise ValueError(f"Unsupported vision RoPE type: {rope_type}")
 
-    if mesh is None:
-        return restore_encoder_output(output, output_indices, None)
     with jax.set_mesh(mesh):
         return restore_encoder_output(output, output_indices, mesh)
 
@@ -319,7 +301,7 @@ def run_mrope_vision_model(
 def precompile_mrope_vision_model(
     vision_model: Callable[..., jax.Array],
     *,
-    mesh: Mesh | None,
+    mesh: Mesh,
     num_lanes: int,
     buckets: tuple[int, ...],
     patch_dim: int,

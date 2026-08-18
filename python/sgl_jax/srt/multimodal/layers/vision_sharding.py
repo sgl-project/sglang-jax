@@ -11,8 +11,8 @@ def apply_data_sharding(x: jax.Array, mesh: Mesh, spec: PartitionSpec) -> jax.Ar
     return jax.lax.with_sharding_constraint(x, sharding)
 
 
-def resolve_encoder_tp(mesh: Mesh | None, mode: str) -> bool:
-    if mode != "tp" or mesh is None:
+def resolve_encoder_tp(mesh: Mesh, mode: str) -> bool:
+    if mode != "tp":
         return False
     return "tensor" in mesh.shape and int(mesh.shape["tensor"]) > 1
 
@@ -29,14 +29,14 @@ class VisionShardSpecs:
     ``sharding(batch_axis)`` regardless of ndim.
     """
 
-    mesh: Mesh | None
+    mesh: Mesh
     tp: bool
 
     @property
     def batch_axis(self) -> str | tuple[str, str]:
         if self.tp:
             return "data"
-        if self.mesh is not None and "tensor" in self.mesh.axis_names:
+        if "tensor" in self.mesh.axis_names:
             return ("data", "tensor")
         return "data"
 
@@ -52,7 +52,5 @@ class VisionShardSpecs:
     def row_kernel_axes(self) -> tuple[str | None, None]:
         return (self.tensor_axis, None)
 
-    def sharding(self, *spec: str | tuple[str, ...] | None) -> NamedSharding | None:
-        if self.mesh is None:
-            return None
+    def sharding(self, *spec: str | tuple[str, ...] | None) -> NamedSharding:
         return NamedSharding(self.mesh, PartitionSpec(*spec))

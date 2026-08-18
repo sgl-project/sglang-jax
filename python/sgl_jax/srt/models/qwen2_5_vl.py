@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from jax.typing import ArrayLike
 from transformers import modeling_flax_utils
 
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -27,7 +28,6 @@ from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
 from sgl_jax.srt.multimodal.in_model.lane_packing import (
     encoder_num_lanes,
     precompile_mrope_vision_model,
-    put_sharded_batch,
     run_mrope_vision_model,
 )
 from sgl_jax.srt.multimodal.layers.attention.flash_attention_backend import (
@@ -67,13 +67,13 @@ class Qwen2_5_VisionPatchEmbed(nnx.Module):
 
     def __init__(
         self,
+        mesh: Mesh,
         rngs: nnx.Rngs = None,
         patch_size: int = 14,
         temporal_patch_size: int = 2,
         in_channels: int = 3,
         hidden_size: int = 1152,
         dtype: jnp.dtype = jnp.bfloat16,
-        mesh: Mesh = None,
         vision_tp: bool = False,
     ) -> None:
         self.patch_size = patch_size
@@ -97,14 +97,13 @@ class Qwen2_5_VisionPatchEmbed(nnx.Module):
         B, S, D = x.shape
         C = D // (self.temporal_patch_size * self.patch_size * self.patch_size)
         x = x.reshape(B, S, C, self.temporal_patch_size, self.patch_size, self.patch_size)
-        if self.mesh is not None:
-            x = apply_data_sharding(x, self.mesh, PartitionSpec(self.specs.batch_axis))
+        x = apply_data_sharding(x, self.mesh, PartitionSpec(self.specs.batch_axis))
 
         # [B, S, C, T, H, W] → [B, S, T, H, W, C]
         x = jnp.transpose(x, (0, 1, 3, 4, 5, 2))
 
         sh = None
-        if self.mesh is not None and "data" in self.mesh.abstract_mesh.explicit_axes:
+        if "data" in self.mesh.abstract_mesh.explicit_axes:
             sh = self.specs.sharding(self.specs.batch_axis)
 
         x = x.reshape(
@@ -127,8 +126,8 @@ class Qwen2_5_VLMLP(nnx.Module):
         self,
         config: QwenVLModelVitConfig,
         dtype: jnp.dtype,
+        mesh: Mesh,
         rngs: nnx.Rngs = None,
-        mesh: Mesh = None,
         vision_tp: bool = False,
     ):
         self.specs = VisionShardSpecs(mesh, vision_tp)
@@ -176,8 +175,8 @@ class Qwen2_5_VisionAttention(nnx.Module):
         self,
         config: QwenVLModelVitConfig,
         dtype: jnp.dtype,
+        mesh: Mesh,
         rngs: nnx.Rngs = None,
-        mesh: Mesh = None,
         vision_tp: bool = False,
     ):
         self.hidden_size = config.hidden_size
@@ -187,7 +186,7 @@ class Qwen2_5_VisionAttention(nnx.Module):
         self.specs = VisionShardSpecs(mesh, vision_tp)
 
         if self.specs.tp:
-            tp_size = int(mesh.shape["tensor"]) if mesh is not None else 1
+            tp_size = int(mesh.shape["tensor"])
             assert (
                 self.num_heads % tp_size == 0
             ), f"vision num_heads={self.num_heads} must be divisible by tp={tp_size}"
@@ -225,16 +224,13 @@ class Qwen2_5_VisionAttention(nnx.Module):
             params_dtype=dtype,
         )
 
-        if mesh is not None:
-            self.attn_backend = make_vision_attention_backend(
-                mesh,
-                sm_scale=1.0 / math.sqrt(self.head_dim),
-                causal=False,
-                head_tp=self.specs.tp,
-                use_varlen=True,
-            )
-        else:
-            self.attn_backend = None
+        self.attn_backend = make_vision_attention_backend(
+            mesh,
+            sm_scale=1.0 / math.sqrt(self.head_dim),
+            causal=False,
+            head_tp=self.specs.tp,
+            use_varlen=True,
+        )
 
     def __call__(
         self,
@@ -273,8 +269,8 @@ class Qwen2_5_VisionBlock(nnx.Module):
         self,
         config: QwenVLModelVitConfig,
         dtype: jnp.dtype,
+        mesh: Mesh,
         rngs: nnx.Rngs = None,
-        mesh: Mesh = None,
         norm_eps: float = 1e-6,
         vision_tp: bool = False,
     ):
@@ -316,8 +312,8 @@ class Qwen2_5_VisionPatchMerger(nnx.Module):
         norm_layer: Callable,
         spatial_merge_size: int,
         dtype: jnp.dtype,
+        mesh: Mesh,
         rngs: nnx.Rngs = None,
-        mesh: Mesh = None,
         vision_tp: bool = False,
     ):
         self.hidden_size = context_dim * (spatial_merge_size**2)
@@ -370,8 +366,8 @@ class Qwen2_5_VisionTransformer(nnx.Module):
         self,
         config: QwenVLModelVitConfig,
         dtype: jnp.dtype,
+        mesh: Mesh,
         rngs: nnx.Rngs = None,
-        mesh: Mesh = None,
         norm_eps: float = 1e-6,
         vision_tp: bool = False,
         input_buckets: tuple[int, ...] | None = None,
@@ -431,7 +427,7 @@ class Qwen2_5_VisionTransformer(nnx.Module):
 
     def __call__(
         self,
-        patches: jax.Array,
+        patches: ArrayLike,
         grid_thw: np.ndarray,
     ) -> jax.Array:
         return self.encode(patches, grid_thw)
@@ -476,14 +472,13 @@ class Qwen2_5_VisionTransformer(nnx.Module):
 
     def encode(
         self,
-        patches: jax.Array,
+        patches: ArrayLike,
         grid_thw: np.ndarray,
     ) -> jax.Array:
-        patches = put_sharded_batch(patches, self.mesh, self.specs.batch_axis)
+        batch_sharding = self.specs.sharding(self.specs.batch_axis)
+        patches = jax.device_put(patches, batch_sharding)
         metadata = self._build_metadata(grid_thw, patches.shape[1])
-        metadata = put_sharded_batch(metadata, self.mesh, self.specs.batch_axis)
-        if self.mesh is None:
-            return self._encode_jit(patches, *metadata)
+        metadata = jax.device_put(metadata, batch_sharding)
         with jax.set_mesh(self.mesh):
             return self._encode_jit(patches, *metadata)
 
@@ -589,8 +584,6 @@ class Qwen2_5_VisionTransformer(nnx.Module):
         full_attn: VisionAttentionMetadata,
     ) -> jax.Array:
         features = self._forward(patches, indices, position_ids, window_attn, full_attn)
-        if self.mesh is None:
-            return features
         # Keep the DP lane-to-replicated transition inside the compiled encode.
         # An eager reshard of a multi-device result can otherwise stage through
         # the host when no source device owns the complete array.
@@ -714,10 +707,7 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
             model=self, model_config=model_config, mesh=self.mesh, dtype=self.dtype
         )
         mappings = self._vision_weight_mappings()
-        if self.mesh is not None:
-            with self.mesh:
-                loader.load_weights_from_safetensors(mappings)
-        else:
+        with self.mesh:
             loader.load_weights_from_safetensors(mappings)
         logger.info("Qwen2.5-VL ViT weights loaded.")
 
