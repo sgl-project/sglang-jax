@@ -16,6 +16,8 @@ Architecture (from the released config.json): 93 layers, ``kda_layers`` lists 69
 
 from __future__ import annotations
 
+import os
+
 import logging
 
 import jax
@@ -28,6 +30,7 @@ from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.moe import EPMoE
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from jax.sharding import PartitionSpec as _P
 from sgl_jax.srt.kernels.gmm.megablox_fp4.gmm_v2 import gmm_v2 as fp4_gmm_v2
 from sgl_jax.srt.layers.quantization.mxfp4 import MXFP4_GROUP_SIZE
 from sgl_jax.srt.models.kimi_k3_layers import (
@@ -276,6 +279,35 @@ class KimiK3EPMoE(EPMoE):
             # [block_n, block_k], and only block_k is consumed.
             self.weight_block_size = [1, MXFP4_GROUP_SIZE]
 
+            # Declared HERE, not filled in by the loader: EPMoE sets `self.wi_0_scale = None` in
+            # __init__, which makes it a STATIC attribute, and nnx then refuses to have a Param
+            # assigned over it ("Cannot assign data value ... to static attribute"). Declaring
+            # them up front also pins the shapes, so a checkpoint whose group count disagrees
+            # fails at assignment instead of reaching the kernel.
+            #
+            # K = the contracting dim of each weight: hidden (3584) for wi_*, intermediate (3072)
+            # for wo -- which is why the two block counts differ (112 vs 96).
+            k_blocks_wi = self.hidden_size // MXFP4_GROUP_SIZE
+            k_blocks_wo = self.intermediate_dim // MXFP4_GROUP_SIZE
+            wi_spec = _P("expert", None, None, "tensor")
+            wo_spec = _P("expert", None, None, None)
+            # Under EPMoE's OWN abstract mesh: the "expert" axis exists only there. The model mesh
+            # is ("data", "tensor"), so creating these outside the context raises
+            #   ValueError: Resource axis: expert ... is not found in mesh: ('data', 'tensor')
+            with jax.sharding.use_abstract_mesh(self.updated_mesh):
+                for name, blocks, out_dim, spec in (
+                    ("wi_0_scale", k_blocks_wi, self.intermediate_dim, wi_spec),
+                    ("wi_1_scale", k_blocks_wi, self.intermediate_dim, wi_spec),
+                    ("wo_scale", k_blocks_wo, self.hidden_size, wo_spec),
+                ):
+                    # nnx.data is required: EPMoE.__init__ has already set these to None, which
+                    # marks them STATIC on the pytree, and nnx then refuses a Param over them.
+                    setattr(self, name, nnx.data(nnx.Param(
+                        jnp.zeros((self.num_experts, blocks, 1, out_dim),
+                                  dtype=jnp.float32, out_sharding=spec),
+                        out_sharding=spec,
+                    )))
+
     def _apply_activation(self, layer_w0, layer_w1):
         if self.situ_beta is None:
             return super()._apply_activation(layer_w0, layer_w1)
@@ -412,7 +444,9 @@ class KimiK3DecoderLayer(nnx.Module):
                 situ_beta=(getattr(config, "activation_situ_beta", None)
                            if getattr(config, "hidden_act", "silu") == "situ" else None),
                 situ_linear_beta=getattr(config, "activation_situ_linear_beta", None),
-                fp4=True,
+                # fp4 is the default; KIMI_K3_MOE_FP4=0 falls back to bf16 experts, which is how
+                # the two paths are A/B'd and an escape hatch if the fp4 kernel misbehaves.
+                fp4=os.environ.get("KIMI_K3_MOE_FP4", "1") != "0",
                 hidden_size=expert_hidden_size,
                 num_experts=config.num_experts,
                 num_experts_per_tok=config.num_experts_per_token,
@@ -756,11 +790,13 @@ class KimiK3ForCausalLM(nnx.Module):
                     # The scale is NOT optional in fp4: the kernel multiplies by it, so a missing
                     # or zero scale produces finite, plausible, wrong numbers rather than an error.
                     if use_fp4:
-                        scale_param = getattr(moe, f"{target}_scale", None)
+                        scale_param = getattr(moe, f"{target}_scale")
                         scale_arr = jnp.stack(scale_stack, axis=0)
-                        if scale_param is None:
-                            setattr(moe, f"{target}_scale", nnx.Param(scale_arr))
-                            scale_param = getattr(moe, f"{target}_scale")
+                        if scale_arr.shape != scale_param.value.shape:
+                            raise ValueError(
+                                f"layer {li} {target}_scale: checkpoint gives {scale_arr.shape}, "
+                                f"module declares {scale_param.value.shape} -- group size mismatch"
+                            )
                         sspec = getattr(getattr(scale_param.value, "sharding", None), "spec", None)
                         if sspec is not None:
                             scale_arr = jax.device_put(
