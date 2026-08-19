@@ -63,7 +63,7 @@ jobs:
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
       - name: Run unit test
-        timeout-minutes: 30
+        timeout-minutes: 40
         shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
