@@ -1932,9 +1932,8 @@ class Scheduler(
         self._process_pending_chunked_aborts()
 
         force_eagle3_bootstrap_decode = False
-        if (
-            self._eagle3_overlap_parked_batch is not None
-            and not (self.last_batch and self.last_batch.forward_mode.is_extend())
+        if self._eagle3_overlap_parked_batch is not None and not (
+            self.last_batch and self.last_batch.forward_mode.is_extend()
         ):
             # The isolated bootstrap decode has now published relay state.
             # Restore the older running requests first so request/spec state

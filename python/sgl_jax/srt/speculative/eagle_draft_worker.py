@@ -392,9 +392,9 @@ class EagleDraftWorker(BaseDraftWorker):
             ):
                 r = int(seq_idx) // per_dp_bs
                 base = r * per_dp_cache_len + intra_rank_off[r]
-                assert base + aligned_len <= (r + 1) * per_dp_cache_len, (
-                    f"rank {r} cache_loc overflow: {intra_rank_off[r] + aligned_len} > {per_dp_cache_len}"
-                )
+                assert (
+                    base + aligned_len <= (r + 1) * per_dp_cache_len
+                ), f"rank {r} cache_loc overflow: {intra_rank_off[r] + aligned_len} > {per_dp_cache_len}"
                 if legacy_non_overlap:
                     cache_loc_cpu[base : base + allocate_len] = token_indices_with_all_reqs[
                         seq_idx, :allocate_len

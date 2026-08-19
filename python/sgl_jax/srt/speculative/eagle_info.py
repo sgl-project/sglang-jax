@@ -179,9 +179,9 @@ class EagleDraftInput:
 
     def prepare_for_extend_after_target_prefill(self, model_worker_batch: ModelWorkerBatch):
         # Prefill only generate 1 token.
-        assert self.verified_id.shape[0] == model_worker_batch.real_bs, (
-            f"{self.verified_id.shape=} {model_worker_batch.real_bs=}"
-        )
+        assert (
+            self.verified_id.shape[0] == model_worker_batch.real_bs
+        ), f"{self.verified_id.shape=} {model_worker_batch.real_bs=}"
 
         # Walk the DP-padded layout in (rank, slot) order so token offsets line
         # up with mwb.input_ids' token-major DP layout. Iterating real_bs and
@@ -256,9 +256,8 @@ class EagleDraftInput:
             batch_output.next_draft_input.hidden_states
         )
         if (
-            (legacy_non_overlap and not use_device_metadata)
-            or model_worker_batch.spec_info_padded.accept_length is None
-        ):
+            legacy_non_overlap and not use_device_metadata
+        ) or model_worker_batch.spec_info_padded.accept_length is None:
             model_worker_batch.spec_info_padded.accept_length = batch_output.accept_lens
         model_worker_batch.input_ids = batch_output.next_draft_input.verified_id
         if use_device_metadata:
@@ -332,9 +331,9 @@ class EagleDraftInput:
         # back to global-flat. (#1053 P1-5b — was dp_rank=0 for all, so rank>0
         # reqs allocated from rank 0's pool / updated swa_mapping[0].)
         bs = schedule_batch.batch_size()
-        assert self.allocate_lens.shape[0] == bs, (
-            f" {self.allocate_lens.shape[0]=} but batch_size is {bs} "
-        )
+        assert (
+            self.allocate_lens.shape[0] == bs
+        ), f" {self.allocate_lens.shape[0]=} but batch_size is {bs} "
         page_size = schedule_batch.token_to_kv_pool_allocator.page_size
         new_alloc_chunks = []
         flat_off = 0
@@ -725,9 +724,9 @@ class EagleVerifyInput:
         if SIMULATED_ACCEPTANCE_CONFIG.enabled:
             target_predict = None
             if SIMULATED_ACCEPTANCE_CONFIG.token_mode == "real-draft-token":
-                target_predict = jnp.argmax(
-                    logits_output.next_token_logits, axis=-1
-                ).reshape(bs, self.draft_token_num)
+                target_predict = jnp.argmax(logits_output.next_token_logits, axis=-1).reshape(
+                    bs, self.draft_token_num
+                )
             simulation_rng = jax.random.split(rng.params())[1]
             accept_index, predict, accept_length = apply_simulated_acceptance(
                 accept_index=accept_index,

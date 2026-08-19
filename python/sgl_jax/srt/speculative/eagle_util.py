@@ -288,9 +288,9 @@ def assign_req_to_token_pool(
     repeats = out_cache_lens
     total_elements = np.sum(repeats)
 
-    assert total_elements == out_cache_loc.shape[0], (
-        f"not all allocate cache loc is assigned to req_token_pool, it's may lead to mem leak, assigned {total_elements}, allocate {out_cache_loc.shape[0]}"
-    )
+    assert (
+        total_elements == out_cache_loc.shape[0]
+    ), f"not all allocate cache loc is assigned to req_token_pool, it's may lead to mem leak, assigned {total_elements}, allocate {out_cache_loc.shape[0]}"
 
     if total_elements == 0:
         return

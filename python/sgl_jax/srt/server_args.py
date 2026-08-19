@@ -1827,9 +1827,7 @@ class ServerArgs:
                 and self.attention_backend == "fa"
             )
             supports_dflash_overlap = self.speculative_algorithm == "DFLASH"
-            if not (
-                supports_nextn_overlap or supports_eagle3_overlap or supports_dflash_overlap
-            ):
+            if not (supports_nextn_overlap or supports_eagle3_overlap or supports_dflash_overlap):
                 raise ValueError(
                     "Speculative overlap scheduler only supports DFLASH, EAGLE3+FA, "
                     "or NEXTN with --speculative-eagle-topk=1 and "

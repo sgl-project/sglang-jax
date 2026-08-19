@@ -405,12 +405,10 @@ class TestVerifyTree(CustomTestCase):
         )
 
         with jax.set_mesh(mesh):
-            topk_index, hidden_states, verified_id, new_seq_lens = (
-                gather_spec_relay_buffers(
-                    buffers,
-                    future_indices,
-                    dp_size=1,
-                )
+            topk_index, hidden_states, verified_id, new_seq_lens = gather_spec_relay_buffers(
+                buffers,
+                future_indices,
+                dp_size=1,
             )
 
         self.assertEqual(topk_index.sharding.spec, P("data", None))
@@ -467,15 +465,11 @@ class TestVerifyTree(CustomTestCase):
             speculative_num_steps=3,
             speculative_num_draft_tokens=4,
             model_config=SimpleNamespace(hidden_size=8),
-            padding_for_decode=lambda _batch, *, map_hot_token_ids: calls.append(
-                map_hot_token_ids
-            ),
+            padding_for_decode=lambda _batch, *, map_hot_token_ids: calls.append(map_hot_token_ids),
         )
         batch = SimpleNamespace(
             seq_lens=np.array([10, 20], dtype=np.int32),
-            spec_info_padded=EagleDraftInput(
-                future_indices=np.array([3, 5], dtype=np.int32)
-            ),
+            spec_info_padded=EagleDraftInput(future_indices=np.array([3, 5], dtype=np.int32)),
         )
 
         _prepare_verify(worker, batch)
@@ -489,9 +483,7 @@ class TestVerifyTree(CustomTestCase):
             CaptureHiddenMode,
             ForwardMode,
         )
-        from sgl_jax.srt.speculative.draft_extend_fused import (
-            _prepare_logits_metadata,
-        )
+        from sgl_jax.srt.speculative.draft_extend_fused import _prepare_logits_metadata
 
         metadata = _prepare_logits_metadata(
             SimpleNamespace(

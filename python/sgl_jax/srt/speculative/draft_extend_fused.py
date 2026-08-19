@@ -788,9 +788,7 @@ def _make_draft_extend_metadata(
     # Fused EAGLE3 passes device query lengths so this cumsum remains in the
     # parent JIT. Other callers can retain the host-prepared value.
     cu_q_lens = (
-        old_metadata.cu_q_lens
-        if query_lens is None
-        else _per_dp_cumsum_device(query_lens, dp_size)
+        old_metadata.cu_q_lens if query_lens is None else _per_dp_cumsum_device(query_lens, dp_size)
     )
     aligned_seq_lens = ((draft_seq_lens + page_size - 1) // page_size) * page_size
     cu_kv_lens = _per_dp_cumsum_device(aligned_seq_lens, dp_size)
@@ -1555,12 +1553,8 @@ def _prepare_verify(
             draft_token=jax.device_put(np.zeros((flat,), dtype=np.int32), data_sharding),
             custom_mask=None,
             positions=jax.device_put(np.zeros((flat,), dtype=np.int32), data_sharding),
-            retrive_index=jax.device_put(
-                np.zeros((bs, n), dtype=np.int32), data_2d_sharding
-            ),
-            retrive_next_token=jax.device_put(
-                np.zeros((bs, n), dtype=np.int32), data_2d_sharding
-            ),
+            retrive_index=jax.device_put(np.zeros((bs, n), dtype=np.int32), data_2d_sharding),
+            retrive_next_token=jax.device_put(np.zeros((bs, n), dtype=np.int32), data_2d_sharding),
             retrive_next_sibling=jax.device_put(
                 np.zeros((bs, n), dtype=np.int32), data_2d_sharding
             ),
@@ -2066,28 +2060,26 @@ def launch_eagle3_recurrent_draft_extend_for_decode(
             topk_index_stacked,
             pool_updates,
             updated_relay_buffers,
-        ) = (
-            draft_worker._fused_eagle3_recurrent_draft_extend_jit_fn(
-                runner._model_def,
-                runner._model_state_def,
-                tuple(runner.model_state_leaves),
-                forward_batch,
-                runner.memory_pools,
-                logits_metadata,
-                target_hidden,
-                draft_logits_indices,
-                draft_verify_seq_lens,
-                draft_allocate_lens,
-                next_verified_id,
-                next_new_seq_lens,
-                draft_worker.hot_token_ids,
-                relay_buffers,
-                relay_future_indices,
-                relay_valid_mask,
-                num_steps=draft_worker.speculative_num_steps,
-                update_relay=update_relay,
-                dp_size=model_worker_batch.dp_size,
-            )
+        ) = draft_worker._fused_eagle3_recurrent_draft_extend_jit_fn(
+            runner._model_def,
+            runner._model_state_def,
+            tuple(runner.model_state_leaves),
+            forward_batch,
+            runner.memory_pools,
+            logits_metadata,
+            target_hidden,
+            draft_logits_indices,
+            draft_verify_seq_lens,
+            draft_allocate_lens,
+            next_verified_id,
+            next_new_seq_lens,
+            draft_worker.hot_token_ids,
+            relay_buffers,
+            relay_future_indices,
+            relay_valid_mask,
+            num_steps=draft_worker.speculative_num_steps,
+            update_relay=update_relay,
+            dp_size=model_worker_batch.dp_size,
         )
 
     runner.memory_pools.replace_all(pool_updates)
@@ -2349,20 +2341,18 @@ def spec_decode_verify(
         # rebuilds dynamic FA metadata inside fused_verify.  Upload only the
         # allocated page ids here; constructing the full host metadata would
         # enqueue several H2Ds whose values are immediately overwritten.
-        target_mr.attn_backend.forward_metadata = (
-            target_mr.attn_backend.get_eagle_base_metadata(model_worker_batch)
+        target_mr.attn_backend.forward_metadata = target_mr.attn_backend.get_eagle_base_metadata(
+            model_worker_batch
         )
     else:
-        target_mr.attn_backend.forward_metadata = (
-            target_mr.attn_backend.get_eagle_forward_metadata(model_worker_batch)
+        target_mr.attn_backend.forward_metadata = target_mr.attn_backend.get_eagle_forward_metadata(
+            model_worker_batch
         )
     if use_relay_state and target_mr.attn_backend.forward_metadata.custom_mask is not None:
         raise NotImplementedError("Spec decode overlap relay path does not support custom_mask.")
     target_forward_batch = _make_forward_batch(model_worker_batch, target_mr)
     if rebuild_verify_metadata:
-        target_forward_batch.attn_backend.forward_metadata.seq_lens = (
-            target_forward_batch.seq_lens
-        )
+        target_forward_batch.attn_backend.forward_metadata.seq_lens = target_forward_batch.seq_lens
     target_forward_batch.bid = model_worker_batch.bid
     target_logits_metadata = _prepare_logits_metadata(model_worker_batch, spec_worker.mesh)
     data_sharding = NamedSharding(spec_worker.mesh, P("data"))
@@ -2408,9 +2398,7 @@ def spec_decode_verify(
         if sampling_inputs is None:
             sampling_inputs = (
                 _prepare_device_array(np.ones((_sv_tbs, 1), np.float32), data_sharding),
-                _prepare_device_array(
-                    np.full((_sv_tbs,), TOP_K_ALL, np.int32), data_sharding
-                ),
+                _prepare_device_array(np.full((_sv_tbs,), TOP_K_ALL, np.int32), data_sharding),
                 _prepare_device_array(np.ones((_sv_tbs,), np.float32), data_sharding),
             )
             constant_cache[sampling_key] = sampling_inputs
@@ -2564,9 +2552,7 @@ def spec_decode_eagle3_overlap(spec_worker, model_worker_batch, cur_allocate_len
     else:
         # The first decode after prefill still carries the width-1 bootstrap
         # seed. Complete its recurrent chain before entering relay steady state.
-        draft_to_target_token_ids = draft_worker.prepare_for_fused_verify(
-            model_worker_batch
-        )
+        draft_to_target_token_ids = draft_worker.prepare_for_fused_verify(model_worker_batch)
         draft_padding_prepared = True
 
     batch_output = spec_decode_verify(
