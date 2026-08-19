@@ -579,6 +579,9 @@ class KimiK3ForCausalLM(nnx.Module):
     def load_weights(self, model_config):
         from sgl_jax.srt.utils.weight_utils import WeightLoader
 
+        # must run BEFORE the mappings are built -- every key in them is prefixed
+        self._detect_text_prefix(model_config)
+
         loader = WeightLoader(model=self, model_config=model_config,
                               mesh=self.mesh, dtype=self.dtype)
         loader.load_weights_from_safetensors(self._create_weight_mappings())
@@ -790,10 +793,43 @@ class KimiK3ForCausalLM(nnx.Module):
             raise KeyError(f"A_log missing for {len(wanted)} KDA layers: {list(wanted)[:3]}")
         logger.info("A_log fixup: loaded %d KDA layers, narrowed to %d heads", found, num_heads)
 
-    # K3 checkpoints prefix every text parameter with `language_model.` because the release is
-    # multimodal (the same checkpoint also carries `mm_projector.*` and a vision tower). Kimi-Linear
-    # is text-only and emits bare `model.*` keys, so every inherited mapping is re-prefixed.
+    # K3's RELEASE prefixes every text parameter with `language_model.` because it is multimodal
+    # (the same checkpoint carries `mm_projector.*` and a vision tower). That is a property of the
+    # checkpoint, not of the architecture -- a text-only export, or Kimi-Linear weights run through
+    # this class, emit bare `model.*` keys. Assuming the prefix costs a KeyError naming every layer
+    # at once, which reads like a missing-weights bug rather than a naming one.
+    #
+    # So: default to the release's layout, but let _detect_text_prefix() correct it from the
+    # checkpoint's own keys before any mapping is built.
     TEXT_PREFIX = "language_model."
+
+    def _detect_text_prefix(self, model_config) -> None:
+        """Set TEXT_PREFIX from what the checkpoint actually contains.
+
+        Cheap: reads key NAMES from one shard's header, never a tensor. Silent no-op if the
+        checkpoint cannot be located -- the declared default still applies.
+        """
+        import glob
+        import os
+
+        from safetensors import safe_open
+
+        path = getattr(model_config, "model_path", None) or getattr(
+            self.config, "_name_or_path", None
+        )
+        files = sorted(glob.glob(os.path.join(path, "*.safetensors"))) if path else []
+        if not files:
+            return
+        with safe_open(files[0], "numpy") as handle:
+            keys = list(handle.keys())
+        prefix = "language_model." if any(k.startswith("language_model.") for k in keys) else ""
+        if prefix != type(self).TEXT_PREFIX:
+            logger.info(
+                "text prefix: %r (checkpoint keys start with %r)",
+                prefix,
+                keys[0].split(".")[0] if keys else "",
+            )
+        self.TEXT_PREFIX = prefix
 
     # Borrow Kimi-Linear's per-layer mapping builder WITHOUT inheriting from it. The parent's
     # _create_weight_mappings calls self._create_layer_mappings(...), so an unbound delegation
