@@ -29,6 +29,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from sgl_jax.srt.layers.quantization.mxfp4 import (
+    e8m0_to_fp32,
     MXFP4_GROUP_SIZE,
     dequantize_tensor_from_mxfp4_packed,
 )
@@ -98,4 +99,86 @@ def build_epmoe_weights(
             per_expert[e] = dequant_expert_weight(tensors[pk], tensors[sk], out_dtype)
         if per_expert:
             out[target] = stack_experts(per_expert, num_experts)
+    return out
+
+
+# ==============================================================================================
+# fp4-NATIVE path -- what the full 93-layer model needs
+# ==============================================================================================
+# Dequantizing to bf16 (above) is fine for a truncated bring-up and impossible at full depth:
+# K3's 2.723 T routed-expert params cost 5,072 GiB as bf16 versus 1,347 GiB kept as fp4 --
+# 26.8 chips of weights instead of 7.1, at v7x's measured 189.5 GiB/chip.
+#
+# The functions below keep the weights fp4 all the way into the kernel, matching what the
+# vllm-torchtpu lane already does to serve K3 (`layers/common/fused_moe_gmm.py`). They pair with
+# the vendored fp4 GMM in `sgl_jax/srt/kernels/gmm/megablox_fp4/`.
+
+
+def unpack_fp4_to_e2m1(packed: jax.Array) -> jax.Array:
+    """``[..., N, K/2]`` uint8 -> native ``float4_e2m1fn`` ``[..., K, N]`` (K-major).
+
+    Two transforms in one, both done ONCE at load so the forward hands native fp4 straight to the
+    kernel with no per-forward unpack or transpose:
+
+    * ``bitcast_convert_type`` to a 4-bit type appends a trailing axis of 2 (the two values per
+      byte); folding it into the last dim restores ``[..., N, K]``.
+    * ``swapaxes`` puts the contracting axis first, because gmm_v2 wants
+      ``[size_group, size_k, size_n]``.
+
+    The result stays 4 bits per value -- there is no widening anywhere in here, which is the whole
+    point. Ported from ``vllm_torchtpu.layers.common.fused_moe_gmm.unpack_fp4_to_e2m1``.
+    """
+    if packed.dtype != jnp.uint8:
+        raise TypeError(f"expected uint8 packed weight, got {packed.dtype}")
+    fp4 = jax.lax.bitcast_convert_type(packed, jnp.float4_e2m1fn)
+    fp4 = fp4.reshape(*packed.shape[:-1], -1)  # [..., N, K]
+    return jnp.swapaxes(fp4, -1, -2)  # [..., K, N]
+
+
+def e8m0_scale_to_kernel_layout(scale: jax.Array) -> jax.Array:
+    """e8m0 uint8 ``[..., N, num_blocks]`` -> fp32 ``[..., num_blocks, 1, N]``.
+
+    gmm_v2 reads block scales as ``(size_group, num_k_blocks, 1, size_n)`` and validates that
+    shape, so the moved axis is not cosmetic. The e8m0 decode must be exponent arithmetic
+    (``ldexp``), never a cast -- see :func:`e8m0_to_fp32`.
+    """
+    fp32 = e8m0_to_fp32(scale)
+    return jnp.expand_dims(jnp.moveaxis(fp32, -1, -2), axis=-2)
+
+
+def build_fp4_expert_weights(
+    tensors: dict[str, jax.Array],
+    layer_idx: int,
+    num_experts: int,
+    prefix: str = "language_model.model.layers",
+) -> dict[str, tuple[jax.Array, jax.Array]]:
+    """Build ``{wi_0|wi_1|wo: (fp4_kmajor [E, K, N], fp32_scale [E, blocks, 1, N])}``.
+
+    Same expert-completeness guarantee as :func:`build_epmoe_weights` -- a missing expert raises
+    rather than stacking short, which would load cleanly and route tokens to the wrong weights.
+    """
+    out: dict[str, tuple[jax.Array, jax.Array]] = {}
+    for proj, target in EXPERT_PROJ_TO_EPMOE.items():
+        w_per_expert, s_per_expert = {}, {}
+        for e in range(num_experts):
+            base = f"{prefix}.{layer_idx}.block_sparse_moe.experts.{e}.{proj}"
+            pk, sk = f"{base}.weight_packed", f"{base}.weight_scale"
+            if pk not in tensors:
+                continue
+            if sk not in tensors:
+                raise KeyError(f"{pk} present but {sk} missing -- the kernel would mis-scale")
+            packed, scale = tensors[pk], tensors[sk]
+            expected_groups = (packed.shape[-1] * 2) // MXFP4_GROUP_SIZE
+            if scale.shape[-1] != expected_groups:
+                raise ValueError(
+                    f"scale groups {scale.shape[-1]} != expected {expected_groups} "
+                    f"for packed {packed.shape} at group_size {MXFP4_GROUP_SIZE}"
+                )
+            w_per_expert[e] = unpack_fp4_to_e2m1(packed)
+            s_per_expert[e] = e8m0_scale_to_kernel_layout(scale)
+        if w_per_expert:
+            out[target] = (
+                stack_experts(w_per_expert, num_experts),
+                stack_experts(s_per_expert, num_experts),
+            )
     return out
