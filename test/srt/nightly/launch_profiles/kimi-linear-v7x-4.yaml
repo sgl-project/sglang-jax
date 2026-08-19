@@ -1,0 +1,46 @@
+# Kimi-Linear on v7x (tpu7x), 4 chips / TP=4.
+#
+# Derived from kimi-linear-v6e-4.yaml. sglang-jax already supports v7x -- device_kind "TPU7x"
+# normalizes to "TPU v7", which is the key its tuned-block-size tables use for grouped_topk,
+# biased_topk, fused_moe and ragged_paged_attention. What was missing was only a launch profile.
+#
+# Environment note that is NOT optional: the image must carry flax==0.12.4 as pinned in
+# pyproject.toml. With flax 0.12.0 every flax.nnx import dies on
+#   ImportError: cannot import name 'mutable_array' from 'jax._src.core'
+# which fails before any model code runs.
+#
+# tp_size is 8, NOT 4 as on v6e. v7x has TWO cores per chip, so a 4-chip node exposes 8 JAX
+# devices, and TP must equal the DEVICE count. Copying the v6e profile's tp_size: 4 fails at
+# startup with:
+#   ValueError: Number of devices 8 must equal the product of mesh_shape (1, 4)
+#
+# --trust-remote-code is required: Kimi-Linear ships custom modeling code and the tokenizer load
+# hard-fails without it. The v6e profile omits it (their harness must set it elsewhere).
+#
+# --download-dir /dev/shm/ is deliberate: a tpu7x-standard-4t node has ~944 GB RAM and only ~69 GB
+# free on the container overlay, so the ~96 GB bf16 checkpoint only fits in the RAM-backed tmpfs.
+name: kimi_linear-hybrid_linear-tp4-v7x
+target: v7x-4
+model_path: moonshotai/Kimi-Linear-48B-A3B-Instruct
+tp_size: 8
+dp_size: 1
+port: 30040
+server_args:
+  - --skip-server-warmup
+  - --random-seed
+  - "3"
+  - --mem-fraction-static
+  - "0.85"
+  - --max-prefill-tokens
+  - "4096"
+  - --download-dir
+  - /dev/shm/
+  - --dtype
+  - bfloat16
+  - --attention-backend
+  - fa
+  - --page-size
+  - "256"
+  - --max-running-requests
+  - "64"
+  - --disable-radix-cache
