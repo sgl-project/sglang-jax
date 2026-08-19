@@ -816,6 +816,16 @@ def _make_draft_extend_metadata(
         axis=1,
     ).reshape((dp_size * 3,))
 
+    data_sharding = jax.typeof(draft_seq_lens).sharding
+    if isinstance(data_sharding, NamedSharding) and not data_sharding.mesh.empty:
+        cu_q_lens = jax.sharding.reshard(cu_q_lens, data_sharding)
+        cu_kv_lens = jax.sharding.reshard(cu_kv_lens, data_sharding)
+        page_indices = jax.sharding.reshard(page_indices, data_sharding)
+        draft_seq_lens = jax.sharding.reshard(draft_seq_lens, data_sharding)
+        distribution = jax.sharding.reshard(distribution, data_sharding)
+        if swa_page_indices is not None:
+            swa_page_indices = jax.sharding.reshard(swa_page_indices, data_sharding)
+
     return FlashAttentionMetadata(
         cu_q_lens=cu_q_lens,
         cu_kv_lens=cu_kv_lens,
