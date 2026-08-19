@@ -386,4 +386,24 @@ class KimiK3ForCausalLM(nnx.Module):
 
         return mappings
 
-EntryClass = [KimiK3ForCausalLM]
+class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
+    """Registry entry for K3's declared architecture.
+
+    The registry keys by ``cls.__name__`` and the released config's top-level
+    ``architectures`` is ``["KimiK3ForConditionalGeneration"]``, so the class must carry exactly
+    that name to be selected.
+
+    > [!warning] Why this class must exist, and must not be skipped
+    > K3's ``text_config`` declares ``model_type: "kimi_linear"`` and
+    > ``architectures: ["KimiLinearForCausalLM"]``. Anything that routes on the TEXT config
+    > therefore lands on Kimi-Linear, which has no AttnRes and no SITU -- and would load K3's
+    > weights, run, and emit fluent text with two architectural components silently missing.
+    > Routing must come from the TOP-LEVEL architectures, which is what this name pins.
+
+    Text-only for now: the released checkpoint also carries a vision tower and ``mm_projector.*``,
+    which this class does not construct (the vLLM lane serves K3 text-only via
+    ``--language-model-only``).
+    """
+
+
+EntryClass = [KimiK3ForCausalLM, KimiK3ForConditionalGeneration]
