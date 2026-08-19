@@ -16,6 +16,8 @@ Architecture (from the released config.json): 93 layers, ``kda_layers`` lists 69
 
 from __future__ import annotations
 
+import logging
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
@@ -30,6 +32,8 @@ from sgl_jax.srt.models.kimi_k3_layers import AttentionResidual, situ_and_mul
 from sgl_jax.srt.models.kimi_k3_residual import initial_block_residuals
 from sgl_jax.srt.models.kimi_linear import KimiDeltaAttention
 from sgl_jax.srt.models.deepseek_v3 import DeepseekV3Attention as KimiMLAAttention
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -57,6 +61,147 @@ def cfg_is_kda_layer(config, layer_idx: int) -> bool:
 
 def cfg_uses_attn_res(config) -> bool:
     return getattr(config, "attn_res_block_size", None) is not None
+
+
+class KimiK3DeltaAttention(KimiDeltaAttention):
+    """KDA with K3's FULL-RANK output gate.
+
+    Kimi-Linear factors the output gate through a rank-128 bottleneck
+    (``g_b_proj(g_a_proj(h))``). K3 sets ``linear_attn_config.use_full_rank_gate: True`` and ships
+    a single ``g_proj.weight`` of ``[12288, 7168]`` -- no ``g_a_proj``/``g_b_proj`` at all, so the
+    inherited mapping asks for tensors that do not exist and the projections stay empty
+    (``dot_general ... got (7168,) and (0,)``).
+
+    Only the OUTPUT gate changes. The FORGET gate stays low-rank in K3 too
+    (``f_a_proj [128, 7168]`` -> ``f_b_proj [12288, 128]``), so it is inherited unchanged.
+    """
+
+    def __init__(self, config, mesh, dtype=jnp.bfloat16, layer_idx: int = 0):
+        super().__init__(config=config, mesh=mesh, dtype=dtype, layer_idx=layer_idx)
+        la = getattr(config, "linear_attn_config", None) or {}
+        self.use_full_rank_gate = bool(la.get("use_full_rank_gate", False))
+        if self.use_full_rank_gate:
+            self.g_proj = LinearBase(
+                input_size=config.hidden_size,
+                output_size=self.projection_size,
+                kernel_axes=(None, "tensor"),
+                use_bias=False,
+                params_dtype=dtype,
+                mesh=mesh,
+                scope_name="g_proj",
+            )
+            # drop the unused low-rank pair so no empty params survive into the forward
+            self.g_a_proj = None
+            self.g_b_proj = None
+
+    def _output_gate(self, hidden_states):
+        if self.use_full_rank_gate:
+            gate, _ = self.g_proj(hidden_states)
+            return gate
+        g_a, _ = self.g_a_proj(hidden_states)
+        gate, _ = self.g_b_proj(g_a)
+        return gate
+
+    def __call__(self, positions, hidden_states, forward_batch, recurrent_state_pool):
+        """Mirrors KimiDeltaAttention.__call__ with the output gate swapped."""
+        del positions
+
+        q, _ = self.q_proj(hidden_states)
+        k, _ = self.k_proj(hidden_states)
+        v, _ = self.v_proj(hidden_states)
+
+        raw_gate, _ = self.f_b_proj(self.f_a_proj(hidden_states)[0])
+        raw_gate = raw_gate.reshape(hidden_states.shape[0], self.num_heads, self.head_dim)
+        beta = jax.nn.sigmoid(self.b_proj(hidden_states)[0].astype(jnp.float32))
+
+        o, recurrent_state_pool = self.attn(
+            forward_batch, q, k, v, raw_gate, beta, recurrent_state_pool
+        )
+        o = o.reshape(hidden_states.shape[0], self.num_heads, self.head_dim)
+
+        output_gate = self._output_gate(hidden_states).reshape(
+            hidden_states.shape[0], self.num_heads, self.head_dim
+        )
+        o = self.o_norm(o, output_gate).reshape(hidden_states.shape[0], self.projection_size)
+        o, _ = self.o_proj(o)
+        return o, recurrent_state_pool
+
+
+class KimiK3MLAAttention(KimiMLAAttention):
+    """MLA with K3's optional output gate (``mla_use_output_gate``).
+
+    Kimi-Linear's MLA has no gate. K3 ships ``self_attn.g_proj.weight`` ``[12288, 7168]`` on every
+    MLA layer -- ``num_attention_heads * v_head_dim`` -- and the reference applies it to the
+    attention output BEFORE ``o_proj``
+    (``layers/vllm/custom_ops/mla_attention_op.py:601``)::
+
+        attn_out *= self.g_proj(hidden_states)[0].sigmoid()
+        return self.o_proj(attn_out)[0]
+
+    ``o_proj`` is linear but the gate is elementwise on its INPUT, so there is no algebraically
+    equivalent place to apply it afterwards -- the forward has to be re-entered at that point,
+    which is why the shared front-half below is duplicated rather than delegated.
+    """
+
+    def __init__(self, *args, use_output_gate: bool = False, **kwargs):
+        hidden_size = kwargs.get("hidden_size", args[0] if args else None)
+        dtype = kwargs.get("dtype", jnp.bfloat16)
+        super().__init__(*args, **kwargs)
+        self.use_output_gate = bool(use_output_gate)
+        if self.use_output_gate:
+            # [hidden -> num_heads * v_head_dim]; shapes are GLOBAL here (sglang-jax annotates
+            # sharding rather than slicing per device), so this is 7168 -> 96*128 = 12288,
+            # matching the checkpoint's g_proj.weight [12288, 7168] exactly.
+            self.g_proj = LinearBase(
+                input_size=hidden_size,
+                output_size=self.num_heads * self.v_head_dim,
+                kernel_axes=(None, "tensor"),
+                use_bias=False,
+                params_dtype=dtype,
+                mesh=self.mesh,
+                scope_name="g_proj",
+            )
+
+    def __call__(self, positions, hidden_states, forward_batch, token_to_kv_pool):
+        """Mirrors DeepseekV3Attention.__call__, gating attn_output before o_proj."""
+        if not self.use_output_gate:
+            return super().__call__(positions, hidden_states, forward_batch, token_to_kv_pool)
+
+        if self.q_lora_rank is None:
+            q, _ = self.q_proj(hidden_states)
+        else:
+            q_compressed, _ = self.q_a_proj(hidden_states)
+            q_compressed = self.q_a_layernorm(q_compressed)
+            q, _ = self.q_b_proj(q_compressed)
+        q = q.reshape(-1, self.num_heads, self.qk_head_dim)
+        q_nope = q[:, :, : self.qk_nope_head_dim]
+        q_rope = q[:, :, self.qk_nope_head_dim :]
+
+        kv_a_out, _ = self.kv_a_proj(hidden_states)
+        compressed = kv_a_out[:, : self.kv_lora_rank]
+        k_rope_raw = kv_a_out[:, self.kv_lora_rank :]
+        compressed = self.kv_a_layernorm(compressed)
+
+        k_rope = k_rope_raw.reshape(-1, 1, self.qk_rope_head_dim)
+        if self.rotary_emb is not None:
+            q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
+
+        if self.use_absorbed:
+            attn_output, kv_fused = self._forward_mqa(
+                q_nope, q_rope, compressed, k_rope, forward_batch, token_to_kv_pool
+            )
+        else:
+            attn_output, kv_fused = self._forward_mha(
+                q_nope, q_rope, compressed, k_rope, forward_batch, token_to_kv_pool
+            )
+
+        gate, _ = self.g_proj(hidden_states)
+        attn_output = attn_output * jax.nn.sigmoid(gate.astype(jnp.float32)).astype(
+            attn_output.dtype
+        )
+
+        output, _ = self.o_proj(attn_output)
+        return output, kv_fused
 
 
 class KimiK3MLP(nnx.Module):
@@ -117,11 +262,11 @@ class KimiK3DecoderLayer(nnx.Module):
         self.attn_res_block_size = getattr(config, 'attn_res_block_size', None)
 
         if self.is_kda:
-            self.self_attn = KimiDeltaAttention(
+            self.self_attn = KimiK3DeltaAttention(
                 config=config, mesh=mesh, dtype=dtype, layer_idx=layer_idx
             )
         else:
-            self.self_attn = KimiMLAAttention(
+            self.self_attn = KimiK3MLAAttention(
                 hidden_size=config.hidden_size,
                 num_heads=config.num_attention_heads,
                 q_lora_rank=config.q_lora_rank,
@@ -134,6 +279,7 @@ class KimiK3DecoderLayer(nnx.Module):
                 dtype=dtype,
                 use_absorbed=getattr(config, "use_absorbed_mla", True),
                 skip_rope=config.mla_use_nope,
+                use_output_gate=getattr(config, "mla_use_output_gate", False),
             )
 
         is_moe = (
@@ -167,8 +313,52 @@ class KimiK3DecoderLayer(nnx.Module):
                 layer_id=layer_idx,
                 mesh=mesh,
             )
+            # --- LatentMoE ------------------------------------------------------------
+            # K3's routed experts do NOT operate on the residual stream. They live in a
+            # `routed_expert_hidden_size` (3584) LATENT, half the 7168 hidden. The checkpoint is
+            # unambiguous: expert `w1.weight_packed` is [3072, 1792] -> unpacked [3072, 3584],
+            # and `routed_expert_{down,up}_proj.weight` are [3584, 7168] / [7168, 3584].
+            #
+            # Feeding the experts the full hidden is not a silent error -- gmm_v2's
+            # `validate_inputs` asserts `lhs.shape == (size_m, size_k)` -- but it IS the reason
+            # a plain Kimi-Linear MoE cannot load K3.
+            #
+            # Both projections are ReplicatedLinear in the reference (no TP), and their I/O is
+            # replicated on both sides here too (residual stream in, EPMoE's P(None) x out).
+            self.routed_expert_hidden_size = getattr(
+                config, "routed_expert_hidden_size", None)
+            expert_hidden_size = self.routed_expert_hidden_size or config.hidden_size
+            if self.routed_expert_hidden_size is not None:
+                self.routed_expert_down_proj = LinearBase(
+                    input_size=config.hidden_size,
+                    output_size=expert_hidden_size,
+                    kernel_axes=(None, None),
+                    use_bias=False,
+                    params_dtype=dtype,
+                    mesh=mesh,
+                    scope_name="routed_expert_down_proj",
+                )
+                self.routed_expert_up_proj = LinearBase(
+                    input_size=expert_hidden_size,
+                    output_size=config.hidden_size,
+                    kernel_axes=(None, None),
+                    use_bias=False,
+                    params_dtype=dtype,
+                    mesh=mesh,
+                    scope_name="routed_expert_up_proj",
+                )
+                self.routed_expert_norm = (
+                    RMSNorm(expert_hidden_size, epsilon=config.rms_norm_eps,
+                            param_dtype=dtype, scope_name="routed_expert_norm")
+                    if getattr(config, "latent_moe_use_norm", False) else None
+                )
+            else:
+                self.routed_expert_down_proj = None
+                self.routed_expert_up_proj = None
+                self.routed_expert_norm = None
+
             self.block_sparse_moe = EPMoE(
-                hidden_size=config.hidden_size,
+                hidden_size=expert_hidden_size,
                 num_experts=config.num_experts,
                 num_experts_per_tok=config.num_experts_per_token,
                 intermediate_dim=config.moe_intermediate_size,
@@ -205,11 +395,26 @@ class KimiK3DecoderLayer(nnx.Module):
     def _ffn(self, hidden_states, forward_batch, dispatch_info):
         if not self.is_moe_layer:
             return self.mlp(hidden_states), None
+        # Shared experts and the router both read the FULL hidden state (gate.weight is
+        # [896, 7168], shared_experts.gate_proj is [6144, 7168]); only the ROUTED path goes
+        # through the latent. Getting that split wrong type-checks but computes a different model.
         shared = self.shared_experts(hidden_states) if self.shared_experts is not None else None
         router_logits = self.moe_gate(hidden_states)
         bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
         topk_w, topk_ids = self.topk(router_logits, bias, dispatch_info=dispatch_info)
-        out = self.block_sparse_moe(hidden_states, topk_w, topk_ids)
+
+        routed_in = hidden_states
+        if self.routed_expert_down_proj is not None:
+            routed_in, _ = self.routed_expert_down_proj(hidden_states)
+
+        out = self.block_sparse_moe(routed_in, topk_w, topk_ids)
+
+        # KimiRoutedOutputTransform: norm THEN up_proj (norm is on the latent, 3584-wide).
+        if self.routed_expert_norm is not None:
+            out = self.routed_expert_norm(out)
+        if self.routed_expert_up_proj is not None:
+            out, _ = self.routed_expert_up_proj(out)
+
         if shared is not None:
             out = out + shared
         return out, topk_ids
@@ -375,9 +580,213 @@ class KimiK3ForCausalLM(nnx.Module):
         loader = WeightLoader(model=self, model_config=model_config,
                               mesh=self.mesh, dtype=self.dtype)
         loader.load_weights_from_safetensors(self._create_weight_mappings())
+        self._fixup_kda_a_log(model_config)
+        self._fixup_moe_mxfp4(model_config)
         for layer in self.model.layers:
             if not layer.is_kda:
                 layer.self_attn.post_load_weights()
+
+    def _fixup_moe_mxfp4(self, model_config):
+        """Load the MXFP4 MoE experts, which the inherited mapping cannot see.
+
+        Kimi-Linear's expert mapping asks for ``...experts.<e>.w{1,2,3}.weight``. K3 ships
+        ``.weight_packed`` (uint8, fp4 pairs) plus ``.weight_scale`` (uint8, e8m0 per 32), so
+        those keys simply do not exist and every expert param stays at its zero-size placeholder
+        -- surfacing later as ``dot_general ... got (7168,) and (0,)``.
+
+        DeepSeek-V3 solves the analogous FP8 case by registering a parallel scale group
+        (``.weight`` -> ``.weight_scale_inv``) and converting after stacking. MXFP4 needs a
+        different conversion (unpack fp4 pairs, decode e8m0, apply per-32 scale, transpose), so
+        this loads and dequantizes directly.
+
+        Sharding is taken from the EXISTING parameter rather than reconstructed, so it is correct
+        by construction regardless of the EP/TP mesh layout.
+        """
+        import glob
+        import os
+
+        from safetensors import safe_open
+
+        from sgl_jax.srt.layers.quantization.mxfp4_moe import (
+            EXPERT_PROJ_TO_EPMOE,
+            dequant_expert_weight,
+        )
+
+        cfg = self.config
+        num_experts = int(getattr(cfg, "num_experts", 0) or 0)
+        if not num_experts:
+            return
+        path = getattr(model_config, "model_path", None) or getattr(cfg, "_name_or_path", None)
+        files = sorted(glob.glob(os.path.join(path, "*.safetensors"))) if path else []
+        if not files:
+            logger.warning("MoE MXFP4 fixup skipped: no safetensors under %r", path)
+            return
+
+        # locate every packed expert tensor once
+        loc: dict[str, str] = {}
+        for f in files:
+            with safe_open(f, framework="np") as h:
+                for k in h.keys():
+                    if ".block_sparse_moe.experts." in k and k.endswith(
+                        ("weight_packed", "weight_scale")
+                    ):
+                        loc[k] = f
+        if not loc:
+            logger.info("MoE MXFP4 fixup: no packed expert tensors found; nothing to do")
+            return
+
+        handles = {f: safe_open(f, framework="np") for f in set(loc.values())}
+        try:
+            n_done = 0
+            for li, layer in enumerate(self.model.layers):
+                if not getattr(layer, "is_moe_layer", False):
+                    continue
+                moe = layer.block_sparse_moe
+                for proj, target in EXPERT_PROJ_TO_EPMOE.items():
+                    param = getattr(moe, target, None)
+                    if param is None:
+                        continue
+                    stack = []
+                    for e in range(num_experts):
+                        base = (
+                            f"{self.TEXT_PREFIX}model.layers.{li}"
+                            f".block_sparse_moe.experts.{e}.{proj}"
+                        )
+                        pk, sk = f"{base}.weight_packed", f"{base}.weight_scale"
+                        if pk not in loc:
+                            break
+                        if sk not in loc:
+                            raise KeyError(f"{pk} present but {sk} missing")
+                        w = handles[loc[pk]].get_tensor(pk)
+                        sc = handles[loc[sk]].get_tensor(sk)
+                        stack.append(
+                            dequant_expert_weight(jnp.asarray(w), jnp.asarray(sc), jnp.bfloat16)
+                        )
+                    if len(stack) != num_experts:
+                        logger.warning(
+                            "layer %d %s: found %d/%d experts; leaving as-is",
+                            li, target, len(stack), num_experts)
+                        continue
+                    arr = jnp.stack(stack, axis=0)
+                    # Take only the SPEC from the existing param and rebind it to the concrete
+                    # mesh. The param's own sharding carries an AbstractMesh during load, and
+                    # device_put on that raises
+                    #   ValueError: is_fully_addressable is not implemented for AbstractMesh
+                    from jax.sharding import NamedSharding
+
+                    # Place on EPMoE's OWN mesh, not the model mesh. EPMoE builds
+                    # `moe_mesh` with axis_names ("expert", "tensor") (moe.py:84-88) and creates
+                    # its params under that; the model mesh is ("data", "tensor"), so binding the
+                    # spec to it raises
+                    #   ValueError: Resource axis: expert ... is not found in mesh
+                    spec = getattr(getattr(param.value, "sharding", None), "spec", None)
+                    target_mesh = getattr(moe, "moe_mesh", None) or self.mesh
+                    if spec is not None:
+                        arr = jax.device_put(arr, NamedSharding(target_mesh, spec))
+                    param.value = arr
+                    n_done += 1
+                    del stack
+            logger.info("MoE MXFP4 fixup: dequantized %d expert groups", n_done)
+        finally:
+            for h in handles.values():
+                h.__exit__(None, None, None)
+
+    def _fixup_kda_a_log(self, model_config):
+        """Load KDA ``A_log``, narrowing the padded checkpoint tensor to ``num_heads``.
+
+        K3 ships ``A_log`` with **128** entries while the KDA has **96** heads. The other tensors
+        pin the geometry unambiguously: ``o_norm.weight`` is ``[128]`` (the kernel validates it
+        equals ``head_dim``), ``b_proj.weight`` is ``[96, 7168]`` (beta is per-head), and
+        ``q/k/v_proj`` are ``[12288, ...]`` = 96*128. So ``A_log`` is stored padded to
+        ``head_dim`` and only its first ``num_heads`` entries are meaningful.
+
+        This mirrors the torch/GPU reference exactly
+        (``vllm_torchtpu/.../kimi_k3/attention.py::_load_a_log``)::
+
+            shard_size = parameter.shape[0]                       # num_heads // tp
+            loaded_weight.narrow(0, rank * shard_size, shard_size)
+
+        i.e. take the FIRST ``num_heads`` entries and shard them across TP. The kernel then
+        indexes it per head -- ``A_log.reshape(H,1,1,1,1)``, ``-exp(A)[:,None,None] * softplus(g)``
+        (chunk_kda.py:716,303) -- so a wrong length here would silently mis-gate every head
+        rather than fail.
+
+        The old ``[1, 1, H, 1]`` layout is also accepted, matching the reference's own comment
+        ("Load either the old [1,1,H,1] or current [H] layout").
+        """
+        import glob
+        import os
+
+        import numpy as np
+
+        from safetensors import safe_open
+
+        cfg = self.config
+        la = getattr(cfg, "linear_attn_config", None) or {}
+        num_heads = int(la.get("num_heads", 0))
+        if not num_heads:
+            return
+
+        path = getattr(model_config, "model_path", None) or getattr(cfg, "_name_or_path", None)
+        files = sorted(glob.glob(os.path.join(path, "*.safetensors"))) if path else []
+        if not files:
+            logger.warning("A_log fixup skipped: no safetensors under %r", path)
+            return
+
+        wanted = {
+            f"{self.TEXT_PREFIX}model.layers.{i}.self_attn.A_log": i
+            for i in range(cfg.num_hidden_layers)
+            if cfg_is_kda_layer(cfg, i)
+        }
+        found = 0
+        for f in files:
+            with safe_open(f, framework="np") as h:
+                keys = set(h.keys())
+                for key, layer_idx in list(wanted.items()):
+                    if key not in keys:
+                        continue
+                    raw = h.get_tensor(key)
+                    if raw.ndim == 4:            # old [1, 1, H, 1] layout
+                        raw = raw.reshape(-1)
+                    if raw.shape[0] < num_heads:
+                        raise ValueError(
+                            f"{key}: A_log has {raw.shape[0]} entries, fewer than "
+                            f"num_heads={num_heads}"
+                        )
+                    # Place with the SAME sharding the param was declared with
+                    # (kimi_linear.py: out_sharding=P(None, None, "tensor", None)). Assigning a
+                    # plain unsharded array leaves the per-rank view empty, and the backend then
+                    # fails on `layer.A_log.value.reshape(H)` with shape (0,) -- H there is the
+                    # PER-RANK head count (q.shape[-2]), not the global 96.
+                    from jax.sharding import NamedSharding
+                    from jax.sharding import PartitionSpec as _P
+
+                    a = jnp.asarray(raw[:num_heads], dtype=jnp.float32).reshape(
+                        1, 1, num_heads, 1
+                    )
+                    a = jax.device_put(
+                        a, NamedSharding(self.mesh, _P(None, None, "tensor", None))
+                    )
+                    attn = self.model.layers[layer_idx].self_attn
+                    before = getattr(getattr(attn, "A_log", None), "value", None)
+                    # Mutate the EXISTING Param in place. RadixLinearAttention captures a
+                    # reference to A_log at construction, so replacing the Param object leaves
+                    # the backend holding the old one.
+                    if getattr(attn, "A_log", None) is not None:
+                        attn.A_log.value = a
+                    else:
+                        attn.A_log = nnx.Param(a)
+                    logger.info(
+                        "A_log L%d: raw%s -> %s (was %s), nonzero=%d",
+                        layer_idx, tuple(raw.shape), tuple(a.shape),
+                        tuple(before.shape) if before is not None else None,
+                        int((np.asarray(jax.device_get(a)) != 0).sum()),
+                    )
+                    del wanted[key]
+                    found += 1
+        if wanted:
+            raise KeyError(f"A_log missing for {len(wanted)} KDA layers: {list(wanted)[:3]}")
+        logger.info("A_log fixup: loaded %d KDA layers, narrowed to %d heads", found, num_heads)
 
     # K3 checkpoints prefix every text parameter with `language_model.` because the release is
     # multimodal (the same checkpoint also carries `mm_projector.*` and a vision tower). Kimi-Linear
@@ -436,7 +845,99 @@ class KimiK3ForCausalLM(nnx.Module):
             _pair(f"model.layers.{i}.mlp_res", f"model.layers.{i}.mlp_res")
         _pair("model.output_attn_res", "model.output_attn_res")
 
-        # --- KDA A_log layout migration -----------------------------------------------------
+        # --- KDA full-rank output gate ------------------------------------------------------
+        # K3 has g_proj [12288, 7168]; Kimi-Linear has g_a_proj/g_b_proj. Drop the low-rank keys
+        # (absent from the checkpoint) and map the full-rank one.
+        la = getattr(self.config, "linear_attn_config", None) or {}
+        if la.get("use_full_rank_gate"):
+            for i in range(self.config.num_hidden_layers):
+                if not cfg_is_kda_layer(self.config, i):
+                    continue
+                for gone in ("g_a_proj", "g_b_proj"):
+                    mappings.pop(f"{self.TEXT_PREFIX}model.layers.{i}.self_attn.{gone}.weight", None)
+                mappings[f"{self.TEXT_PREFIX}model.layers.{i}.self_attn.g_proj.weight"] = (
+                    WeightMapping(
+                        target_path=f"model.layers.{i}.self_attn.g_proj.weight",
+                        sharding=(None, "tensor"),
+                        transpose=True,
+                    )
+                )
+
+        # --- MLA: q-LoRA + output gate ------------------------------------------------------
+        # Kimi-Linear's MLA projects Q in one shot (`q_proj`) because its q_lora_rank is None.
+        # K3's is LoRA-factored -- q_a_proj [1536, 7168] -> q_a_layernorm [1536] -> q_b_proj
+        # [18432, 1536] -- so the inherited `q_proj` key does not exist in the checkpoint and the
+        # param stays empty (`dot_general ... got (7168,) and (0,)`).
+        if getattr(self.config, "q_lora_rank", None) is not None:
+            for i in range(self.config.num_hidden_layers):
+                if cfg_is_kda_layer(self.config, i):
+                    continue
+                stem = f"{self.TEXT_PREFIX}model.layers.{i}.self_attn"
+                tgt = f"model.layers.{i}.self_attn"
+                mappings.pop(f"{stem}.q_proj.weight", None)
+                mappings[f"{stem}.q_a_proj.weight"] = WeightMapping(
+                    target_path=f"{tgt}.q_a_proj.weight",
+                    sharding=(None, None),
+                    transpose=True,
+                )
+                mappings[f"{stem}.q_a_layernorm.weight"] = WeightMapping(
+                    target_path=f"{tgt}.q_a_layernorm.scale",
+                    sharding=(None,),
+                    transpose=False,
+                )
+                mappings[f"{stem}.q_b_proj.weight"] = WeightMapping(
+                    target_path=f"{tgt}.q_b_proj.weight",
+                    sharding=(None, "tensor"),
+                    transpose=True,
+                )
+
+        if getattr(self.config, "mla_use_output_gate", False):
+            for i in range(self.config.num_hidden_layers):
+                if cfg_is_kda_layer(self.config, i):
+                    continue
+                mappings[f"{self.TEXT_PREFIX}model.layers.{i}.self_attn.g_proj.weight"] = (
+                    WeightMapping(
+                        target_path=f"model.layers.{i}.self_attn.g_proj.weight",
+                        sharding=(None, "tensor"),
+                        transpose=True,
+                    )
+                )
+
+        # --- LatentMoE down/norm/up ---------------------------------------------------------
+        if getattr(self.config, "routed_expert_hidden_size", None) is not None:
+            for i in range(self.config.num_hidden_layers):
+                stem = f"{self.TEXT_PREFIX}model.layers.{i}.block_sparse_moe"
+                # checkpoint nests these under `block_sparse_moe.`; the JAX modules hang off the
+                # DECODER LAYER (next to block_sparse_moe), so the target stem is one level up.
+                tgt = f"model.layers.{i}"
+                for proj in ("routed_expert_down_proj", "routed_expert_up_proj"):
+                    mappings[f"{stem}.{proj}.weight"] = WeightMapping(
+                        target_path=f"{tgt}.{proj}.weight",
+                        sharding=(None, None),
+                        transpose=True,
+                    )
+                if getattr(self.config, "latent_moe_use_norm", False):
+                    mappings[f"{stem}.routed_expert_norm.weight"] = WeightMapping(
+                        target_path=f"{tgt}.routed_expert_norm.scale",
+                        sharding=(None,),
+                        transpose=False,
+                    )
+
+        # --- KDA A_log: EXCLUDED from the mapping, see _fixup_kda_a_log ---------------------
+        # A_log needs a narrow (slice) that WeightMapping cannot express, so it is dropped here
+        # and loaded by hand after the main pass.
+        for i in range(self.config.num_hidden_layers):
+            if cfg_is_kda_layer(self.config, i):
+                mappings.pop(f"{self.TEXT_PREFIX}model.layers.{i}.self_attn.A_log", None)
+
+        return mappings
+
+    # ------------------------------------------------------------------------------------
+    # (retained for reference; superseded by _fixup_kda_a_log)
+    # ------------------------------------------------------------------------------------
+    def _unused_a_log_reshape_mapping(self):
+        """
+
         # sglang-jax's KimiDeltaAttention still declares A_log as (1, 1, H, 1) with
         # P(None, None, "tensor", None) -- the OLD layout. K3's released checkpoint ships the
         # CURRENT layout, a flat [H]. The PyTorch reference documents exactly this and accepts
@@ -454,8 +955,8 @@ class KimiK3ForCausalLM(nnx.Module):
                 transpose=False,
                 reshape=(1, 1, -1, 1),
             )
-
-        return mappings
+        """
+        return {}
 
 class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
     """Registry entry for K3's declared architecture.
