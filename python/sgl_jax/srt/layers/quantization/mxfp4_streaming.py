@@ -265,6 +265,10 @@ class LocalSource:
     def has(self, key: str) -> bool:
         return key in self._where
 
+    def prefetch(self, keys: "list[str]") -> None:
+        """No-op: local reads are mmap'd, so there is no round trip to hide."""
+        return None
+
     def get(self, key: str) -> np.ndarray:
         return self._handles[self._where[key]].get_tensor(key)
 
@@ -279,33 +283,78 @@ class LocalSource:
 class GcsSource:
     """safetensors shards in GCS, read by byte range and never staged.
 
-    Building this reads one header per shard (96 small GETs for the K3 release), after which
-    every tensor is addressable. No shard is downloaded whole at any point.
+    Building this reads one header per shard (96 small GETs for the K3 release), after which every
+    tensor is addressable. No shard is downloaded whole at any point.
+
+    **Requests are the cost, not bytes.** K3 has 896 experts x 3 projections x 2 tensors per MoE
+    layer, so one GET per tensor is ~5.4k requests for a 4-layer truncation and ~165k for the full
+    93 -- at even 20 ms of round-trip each that is most of an hour of pure latency. Two fixes, both
+    of which the vllm-torchtpu lane also applies:
+
+    * **prefetch in parallel** -- a small thread pool hides round-trip latency; GCS is happy with
+      concurrent ranged reads and the bottleneck becomes bandwidth rather than RTT;
+    * **read ahead in shard order** -- callers ask for tensors grouped by (layer, projection),
+      which is close to byte order within a shard, so prefetching the plan in offset order keeps
+      the access pattern sequential.
     """
 
-    def __init__(self, uri: str, keep: "callable | None" = None, client=None):
+    def __init__(self, uri: str, keep: "callable | None" = None, client=None, workers: int = 16):
+        from concurrent.futures import ThreadPoolExecutor
+
         from google.cloud import storage
 
         client = client or storage.Client()
         bucket, prefix = parse_gs_uri(uri)
+        self._workers = workers
         self._readers: dict[str, ShardReader] = {}
         self._where: dict[str, ShardReader] = {}
-        for name in list_shards(bucket, prefix, client=client):
-            reader = ShardReader(bucket, name, client=client)
-            self._readers[name] = reader
+
+        shards = list_shards(bucket, prefix, client=client)
+        readers = [ShardReader(bucket, name, client=client) for name in shards]
+        # header reads are independent; doing 96 of them serially is ~96 round trips of nothing
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(lambda r: r.spans, readers))
+        for reader in readers:
+            self._readers[reader.name] = reader
             for key in reader.spans:
                 if keep is None or keep(key):
                     self._where[key] = reader
+        self._cache: dict[str, np.ndarray] = {}
 
     def has(self, key: str) -> bool:
         return key in self._where
 
+    def prefetch(self, keys: "list[str]") -> None:
+        """Fetch these tensors concurrently, in byte order, into the cache.
+
+        Call with one group at a time (e.g. all experts of one layer+projection). Fetching the
+        whole model here would defeat the point -- the cache would become the local copy this
+        class exists to avoid.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        pending = [k for k in keys if k in self._where and k not in self._cache]
+        if not pending:
+            return
+        pending.sort(key=lambda k: (self._where[k].name, self._where[k].spans[k].start))
+
+        def _read(key: str):
+            reader = self._where[key]
+            return key, reader.read(reader.spans[key])
+
+        with ThreadPoolExecutor(max_workers=self._workers) as pool:
+            for key, arr in pool.map(_read, pending):
+                self._cache[key] = arr
+
     def get(self, key: str) -> np.ndarray:
+        cached = self._cache.pop(key, None)  # pop: single-use, so the cache cannot grow into a copy
+        if cached is not None:
+            return cached
         reader = self._where[key]
         return reader.read(reader.spans[key])
 
     def close(self) -> None:
-        return None
+        self._cache.clear()
 
 
 def open_source(path: str, keep: "callable | None" = None):
