@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -124,6 +125,21 @@ TEST_RETRACT_INTERVAL = int(os.environ.get("SGLANG_TEST_RETRACT_INTERVAL", "3"))
 TEST_RETRACT_NO_PREFILL_BS = int(os.environ.get("SGLANG_TEST_RETRACT_NO_PREFILL_BS", str(2**31)))
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
+
+
+def _clear_embedding_pools(
+    workers: Iterable[ModelWorker | ModelWorkerClient | None],
+) -> None:
+    seen: set[int] = set()
+    for worker in workers:
+        if worker is None:
+            continue
+        runner = worker.get_model_runner()
+        if id(runner) in seen:
+            continue
+        seen.add(id(runner))
+        if getattr(runner, "embedding_pool", None) is not None:
+            runner.embedding_pool.clear()
 
 
 class SyncError(Exception):
@@ -827,7 +843,7 @@ class Scheduler(
         return input_token_len + est_output_tokens
 
     def _get_dp_load_snapshot(self) -> tuple[list[int], list[int]]:
-        """Return per-DP (request_count, token_count) for in-flight scheduled work."""
+        """Return per-DP (request_count, token_count) for assigned work."""
         req_counts = [0] * self.dp_size
         token_counts = [0] * self.dp_size
 
@@ -859,6 +875,12 @@ class Scheduler(
                     req_counts[dp_rank] += 1
                     token_counts[dp_rank] += self._estimate_req_tokens(info.chunked_req)
 
+        for req in self.waiting_queue:
+            if req.dp_rank is None:
+                continue
+            req_counts[req.dp_rank] += 1
+            token_counts[req.dp_rank] += self._estimate_req_tokens(req)
+
         return req_counts, token_counts
 
     def _dp_load_and_eligible(
@@ -866,8 +888,9 @@ class Scheduler(
     ) -> tuple[list[int], list[int], list[int]]:
         """Per-DP (running + pending) load and the ranks that can accept a request.
 
-        A rank is eligible when its batch is not full and it is under the
-        per-rank running cap. Returns ``(eligible_ranks, counts, token_counts)``.
+        A rank is eligible while its total assigned work is under the per-rank
+        cap. ``batch_is_full`` only gates immediate admission; using that
+        transient state for sticky routing creates permanent DP imbalance.
         """
         running_counts, running_token_counts = self._get_dp_load_snapshot()
         counts = [running_counts[i] + extra_counts[i] for i in range(self.dp_size)]
@@ -877,8 +900,7 @@ class Scheduler(
         eligible = [
             dp_rank
             for dp_rank in range(self.dp_size)
-            if not self.running_batch.reqs_info[dp_rank].batch_is_full
-            and counts[dp_rank] < self.per_dp_max_running_requests
+            if counts[dp_rank] < self.per_dp_max_running_requests
         ]
         return eligible, counts, token_counts
 
@@ -971,7 +993,7 @@ class Scheduler(
         )
 
     def _get_dp_io_snapshot(self) -> tuple[list[int], list[int]]:
-        """Return per-DP (input_tokens, output_tokens) for in-flight scheduled work.
+        """Return per-DP (input_tokens, output_tokens) for assigned work.
 
         Mirrors ``_get_dp_load_snapshot`` but keeps prefill (input) and decode
         (output) token loads separate, for the ``shape_aware`` policy.
@@ -1006,6 +1028,10 @@ class Scheduler(
                     add(req, dp_rank)
                 if info.chunked_req is not None and info.chunked_req.rid not in running_ids:
                     add(info.chunked_req, dp_rank)
+
+        for req in self.waiting_queue:
+            if req.dp_rank is not None:
+                add(req, req.dp_rank)
 
         return input_counts, output_counts
 
@@ -1706,6 +1732,9 @@ class Scheduler(
             self.token_to_kv_pool_allocator.clear()
         if self.grammar_backend is not None:
             self.grammar_backend.reset()
+        _clear_embedding_pools(
+            (self.tp_worker, self.tp_worker_p, *getattr(self, "tp_workers_p", ()))
+        )
 
         self.num_generated_tokens = 0
         self.forward_ct_decode = 0

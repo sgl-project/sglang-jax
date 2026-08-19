@@ -31,7 +31,14 @@ def jit_flash_attention(q, k, v):
         )
     if seg_q is not None and seg_kv is not None:
         segment_ids = SegmentIds(q=seg_q, kv=seg_kv)
-    output = flash_attention(q, k, v, segment_ids=segment_ids, causal=False)
+    output = flash_attention(
+        q,
+        k,
+        v,
+        segment_ids=segment_ids,
+        causal=False,
+        interpret=jax.default_backend() == "cpu",
+    )
     output = output[:, :, :q_len, :]
     return output
 

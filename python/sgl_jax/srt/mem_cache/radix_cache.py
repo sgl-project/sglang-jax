@@ -57,12 +57,18 @@ class RadixKey:
         return f"RadixKey(extra_key={self.extra_key!r}, dp_rank={self.dp_rank!r}, token_ids={preview}{'...' if len(self.token_ids) > 10 else ''})"
 
 
-def request_cache_key_ids(req: Req, token_ids: list[int]) -> list[int]:
+def build_radix_key(req: Req, key_len: int) -> RadixKey:
+    """Build a request key from text tokens and multimodal identities."""
     cache_input_ids = getattr(req, "cache_input_ids", None)
-    if cache_input_ids is None:
-        return token_ids
-    cache_key_ids = cache_input_ids + req.output_ids if req.output_ids else cache_input_ids
-    return cache_key_ids[: len(token_ids)]
+    if cache_input_ids is not None:
+        key_sequence = cache_input_ids + req.output_ids if req.output_ids else cache_input_ids
+    else:
+        key_sequence = req.fill_ids
+        if len(key_sequence) < key_len:
+            key_sequence = (
+                req.origin_input_ids + req.output_ids if req.output_ids else req.origin_input_ids
+            )
+    return RadixKey(key_sequence[:key_len], req.extra_key, req.dp_rank)
 
 
 class TreeNode:
@@ -306,8 +312,7 @@ class RadixCache(BasePrefixCache):
             self.token_to_kv_pool_allocator.free(kv_indices, dp_rank=dp_rank)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:committed_kv_len]
-        token_ids = request_cache_key_ids(req, token_ids)
+        radix_key = build_radix_key(req, committed_kv_len)
         # For EAGLE radix cache, we will convert the key to bigram key, e.g. [1,2,3,4] -> [(1,2), (2,3), (3,4)], the length will -1. ((len([(1,2), (2,3), (3,4)]) = len([1,2,3,4]) - 1))
         # So for the corresponding kv length should also -1. Then we get the actual_kv_len, and use it to do later calculation and slicing.
         actual_kv_len = committed_kv_len - 1 if self.is_eagle else committed_kv_len
@@ -335,7 +340,7 @@ class RadixCache(BasePrefixCache):
             # Radix Cache takes over one reference from memory pool
             new_prefix_len = self.insert(
                 InsertParams(
-                    key=RadixKey(token_ids[:page_aligned_token_len], req.extra_key, req.dp_rank),
+                    key=radix_key[:page_aligned_token_len],
                     value=page_aligned_kv_indices,
                 )
             )
@@ -371,7 +376,7 @@ class RadixCache(BasePrefixCache):
         # For EAGLE, the page_aligned_len is for the bigram key, the normal key len should +1
         page_aligned_token_len = page_aligned_len + 1 if self.is_eagle else page_aligned_len
         # Real fill_ids drive kv slicing above; the KEY uses the hash-substituted ids.
-        page_aligned_token_ids = request_cache_key_ids(req, req.fill_ids[:page_aligned_token_len])
+        radix_key = build_radix_key(req, page_aligned_token_len)
 
         # cache_protected_len, not len(prefix_indices): see cache_finished_req above.
         old_prefix_len = req.cache_protected_len
@@ -381,7 +386,6 @@ class RadixCache(BasePrefixCache):
             old_prefix_len -= 1
 
         # Radix Cache takes over one reference from memory pool
-        radix_key = RadixKey(page_aligned_token_ids, req.extra_key, req.dp_rank)
         new_prefix_len = self.insert(InsertParams(key=radix_key, value=page_aligned_kv_indices))
         self.token_to_kv_pool_allocator.free(
             kv_indices[old_prefix_len:new_prefix_len], dp_rank=dp_rank

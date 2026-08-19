@@ -528,9 +528,27 @@ class MiMoV2Model(nnx.Module):
             param_dtype=dtype,
         )
 
+    def get_input_embeddings(self):
+        """Token-embedding module (callable on ``input_ids``).
+
+        Backbone contract used by ``embed_multimodal_inputs`` to seed the
+        running text embeddings before the vision/audio merge.
+        """
+        return self.embed_tokens
+
     def __call__(self, forward_batch: ForwardBatch, token_to_kv_pool: KVCache):
         residual = None
-        hidden_states = self.embed_tokens(forward_batch.input_ids)
+        # Multimodal path seeds merged token + vision/audio embeddings via
+        # ``forward_batch.input_embedding`` (set by ``embed_multimodal_inputs``
+        # during extend); text-only batches leave it None and embed input_ids.
+        input_embeds = (
+            forward_batch.input_embedding
+            if forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            else None
+        )
+        hidden_states = (
+            self.embed_tokens(forward_batch.input_ids) if input_embeds is None else input_embeds
+        )
 
         layers_kv_fused = []
         layers_topk_ids = []

@@ -347,8 +347,11 @@ class ModelRunnerKVCacheMixin:
 
     def _profile_available_bytes(self: ModelRunner, total_device_memory: int) -> int:
         """Profile available bytes for KV cache (+ recurrent state)."""
-        available_device_memory = self.get_available_device_memory()
-        rest_memory = available_device_memory - total_device_memory * (1 - self.mem_fraction_static)
+        rest_memory = (
+            self.get_available_device_memory()
+            - total_device_memory * (1 - self.mem_fraction_static)
+            - self.embedding_pool_bytes
+        )
         if rest_memory <= 0:
             raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
 
@@ -445,6 +448,10 @@ class ModelRunnerKVCacheMixin:
             self.kv_cache_dtype = self.dtype
         elif self.server_args.kv_cache_dtype == "bf16":
             self.kv_cache_dtype = jnp.bfloat16
+        elif self.server_args.kv_cache_dtype == "fp8_e4m3":
+            self.kv_cache_dtype = jnp.float8_e4m3fn
+        elif self.server_args.kv_cache_dtype == "fp8_e5m2":
+            self.kv_cache_dtype = jnp.float8_e5m2
         else:
             raise ValueError(f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}.")
         logger.info("ModelRunner kv_cache_dtype: %s", self.kv_cache_dtype)

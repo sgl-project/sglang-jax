@@ -9,14 +9,18 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from sgl_jax.srt.managers.schedule_batch import Req, ScheduleBatch
+from sgl_jax.srt.managers.schedule_batch import (
+    Req,
+    ScheduleBatch,
+    swa_eviction_peak_tokens,
+)
 from sgl_jax.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     InsertParams,
     MatchPrefixParams,
 )
-from sgl_jax.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sgl_jax.srt.mem_cache.radix_cache import RadixCache, TreeNode
 
 if TYPE_CHECKING:
     from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -148,14 +152,9 @@ class SchedulePolicy:
         self.waiting_queue_radix_tree.reset()
 
         for r in waiting_queue:
-            prefix_ids = r.match_key_ids()
-            extra_key = r.extra_key
+            match_key = r.match_key()
             # NOTE: the prefix_indices must always be aligned with last_node
-            match_result = self.tree_cache.match_prefix(
-                MatchPrefixParams(
-                    key=RadixKey(token_ids=prefix_ids, extra_key=extra_key, dp_rank=r.dp_rank)
-                )
-            )
+            match_result = self.tree_cache.match_prefix(MatchPrefixParams(key=match_key))
             r.prefix_indices = match_result.device_indices
             r.last_node = match_result.last_device_node
             r.last_host_node = match_result.last_host_node
@@ -170,9 +169,7 @@ class SchedulePolicy:
             # It is kind of common when the engine is long running (e.g., imagine the prefix "the").
             if len(r.prefix_indices) <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
                 in_batch_match = self.waiting_queue_radix_tree.match_prefix(
-                    MatchPrefixParams(
-                        key=RadixKey(token_ids=prefix_ids, extra_key=extra_key, dp_rank=r.dp_rank)
-                    )
+                    MatchPrefixParams(key=match_key)
                 )
                 in_batch_matching_prefixes = in_batch_match.device_indices
                 if (
@@ -184,10 +181,8 @@ class SchedulePolicy:
                     # Insert with a dummy key
                     self.waiting_queue_radix_tree.insert(
                         InsertParams(
-                            key=RadixKey(
-                                token_ids=prefix_ids, extra_key=extra_key, dp_rank=r.dp_rank
-                            ),
-                            value=np.empty(len(prefix_ids), dtype=np.bool_),
+                            key=match_key,
+                            value=np.empty(len(match_key), dtype=np.bool_),
                         )
                     )
         return temporary_deprioritized
@@ -316,18 +311,21 @@ class PrefillAdder:
                 info = running_batch.reqs_info[dp_rank]
                 if info.reqs:
                     self.rem_total_token_offset[dp_rank] += sum(
-                        [
-                            min(
-                                (r.sampling_params.max_new_tokens - len(r.output_ids)),
-                                CLIP_MAX_NEW_TOKENS_ESTIMATION,
-                            )
-                            * self.new_token_ratio
-                            for r in info.reqs
-                        ]
+                        min(
+                            (r.sampling_params.max_new_tokens - len(r.output_ids)),
+                            CLIP_MAX_NEW_TOKENS_ESTIMATION,
+                        )
+                        * (1.0 if r.sampling_params.ignore_eos else self.new_token_ratio)
+                        for r in info.reqs
                     )
 
         self.is_hybrid = isinstance(self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
         self.rem_swa_token_offset = [0] * dp_size
+        if self.is_hybrid and running_batch is not None:
+            for dp_rank, info in enumerate(running_batch.reqs_info):
+                self.rem_swa_token_offset[dp_rank] = sum(
+                    self._swa_headroom_for_running_req(req) for req in (info.reqs or [])
+                )
 
     def rem_total_tokens_for_dp(self, dp_rank: int) -> int:
         """Calculate remaining total tokens for a specific DP rank.
@@ -374,17 +372,27 @@ class PrefillAdder:
     def _swa_budget_for_req(self, extend_input_len: int, dp_rank: int) -> int:
         """SWA pool budget per request.
 
-        With chunked prefill + overlap, peak SWA occupancy per request is
-        one chunk plus the sliding window. Floor at sliding_window_size
-        to reserve room for decode phase.
+        Eviction protects one extra page, rounds its boundary down, and the
+        live allocation up. The shared peak formula includes both page margins
+        plus the allocations made between eviction ticks.
         """
         rem_chunk = (
             self.rem_chunk_tokens_list[dp_rank] if self.rem_chunk_tokens_list is not None else None
         )
         alloc = min(extend_input_len, rem_chunk) if rem_chunk is not None else extend_input_len
-        return (
-            self.ceil_paged_tokens(max(alloc, self.tree_cache.sliding_window_size)) + self.page_size
+        return self.ceil_paged_tokens(max(alloc, self._swa_decode_peak_tokens()))
+
+    def _swa_decode_peak_tokens(self) -> int:
+        return self.ceil_paged_tokens(
+            swa_eviction_peak_tokens(self.tree_cache.sliding_window_size, self.page_size)
         )
+
+    def _swa_headroom_for_running_req(self, req: Req) -> int:
+        live_tokens = max(
+            0,
+            self.ceil_paged_tokens(req.kv_allocated_len) - req.swa_evicted_seqlen,
+        )
+        return max(0, self._swa_decode_peak_tokens() - live_tokens)
 
     @property
     def rem_total_tokens(self):
@@ -561,19 +569,18 @@ class PrefillAdder:
         else:
             add_req_state(req, insert_sort=True)
 
-        if not self.is_hybrid:
-            cur_rem_tokens = self.cur_rem_tokens_for_dp(dp_rank) - self.ceil_paged_tokens(
-                req.extend_input_len
-            )
-            tokens_freed = 0
-            for i, (tokens_left, tokens_occupied) in enumerate(self.req_states[dp_rank]):
-                # tokens_left gives a reservative calculation as the last token is not stored
-                bs = len(self.req_states[dp_rank]) - i
-                min_free_tokens = cur_rem_tokens + tokens_freed - tokens_left * bs
-                # reserve tokens for corner cases
-                if min_free_tokens <= IGNORE_EOS_RESERVE_TOKENS * bs:
-                    return AddReqResult.NO_TOKEN
-                tokens_freed += tokens_occupied
+        cur_rem_tokens = self.cur_rem_tokens_for_dp(dp_rank) - self.ceil_paged_tokens(
+            req.extend_input_len
+        )
+        tokens_freed = 0
+        for i, (tokens_left, tokens_occupied) in enumerate(self.req_states[dp_rank]):
+            # tokens_left gives a reservative calculation as the last token is not stored
+            bs = len(self.req_states[dp_rank]) - i
+            min_free_tokens = cur_rem_tokens + tokens_freed - tokens_left * bs
+            # reserve tokens for corner cases
+            if min_free_tokens <= IGNORE_EOS_RESERVE_TOKENS * bs:
+                return AddReqResult.NO_TOKEN
+            tokens_freed += tokens_occupied
 
         if (
             self.rem_chunk_tokens_list is None  # chunked prefill is disabled

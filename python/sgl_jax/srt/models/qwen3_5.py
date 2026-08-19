@@ -26,6 +26,8 @@ Key conventions confirmed against the upstream torch reference
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -48,7 +50,19 @@ from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
 from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.qwen2_moe import Qwen2MoeMLP
-from sgl_jax.srt.utils.weight_utils import WeightMapping
+from sgl_jax.srt.models.qwen3_vl import (
+    Qwen3VLForConditionalGeneration,
+    Qwen3VLVisionModel,
+)
+from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
+from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
+from sgl_jax.srt.multimodal.in_model.lane_packing import (
+    encoder_num_lanes,
+    run_mrope_vision_model,
+)
+from sgl_jax.srt.multimodal.layers.vision_sharding import resolve_encoder_tp
+from sgl_jax.srt.utils.common_utils import resolve_vision_patch_buckets
+from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
@@ -520,8 +534,20 @@ class Qwen3_5MoeModel(nnx.Module):
         )
         self.norm = GemmaRMSNorm(text_cfg.hidden_size, epsilon=text_cfg.rms_norm_eps)
 
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
     def __call__(self, forward_batch: ForwardBatch, memory_pools):
-        hidden_states = self.embed_tokens(forward_batch.input_ids)
+        hidden_states = (
+            self.embed_tokens(forward_batch.input_ids)
+            if forward_batch.input_embedding is None
+            else forward_batch.input_embedding
+        )
+        rope_positions = (
+            forward_batch.positions
+            if forward_batch.mrope_positions is None
+            else forward_batch.mrope_positions
+        )
         residual = None
         layers_kv_fused = []
         layers_rec_buffers = []
@@ -529,7 +555,7 @@ class Qwen3_5MoeModel(nnx.Module):
         layers_topk_ids = []
         for layer in self.layers:
             hidden_states, residual, attn_state, topk_ids = layer(
-                forward_batch.positions,
+                rope_positions,
                 hidden_states,
                 forward_batch,
                 memory_pools,
@@ -571,7 +597,9 @@ class Qwen3_5MoeForCausalLM(nnx.Module):
         return self.model(forward_batch, memory_pools)
 
 
-class Qwen3_5MoeForConditionalGeneration(nnx.Module):
+class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
+    mrope_position_axes = 3
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -582,9 +610,30 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module):
         self.mesh = mesh
         self.dtype = dtype
 
-        # Hidden-state-only language model (RFC §3.3). M2 replaces self.visual.
         self.language_model = Qwen3_5MoeForCausalLM(config, mesh, dtype=dtype)
-        self.visual = None
+        vision_config = getattr(config, "vision_config", None)
+        if vision_config is None:
+            self.visual = None
+        else:
+            from sgl_jax.srt.managers.schedule_batch import global_server_args_dict
+
+            encoder_tp = resolve_encoder_tp(
+                mesh, global_server_args_dict.get("vision_encoder_parallel", "dp")
+            )
+            self.visual = Qwen3VLVisionModel(
+                vision_config,
+                dtype,
+                mesh=mesh,
+                tp=encoder_tp,
+                input_buckets=tuple(
+                    resolve_vision_patch_buckets(
+                        global_server_args_dict.get("precompile_vision_patch_paddings")
+                    )
+                ),
+            )
+        self.deepstack_visual_layers = (
+            len(self.visual.deepstack_indexes) if self.visual is not None else 0
+        )
 
         text_cfg = config.text_config
         self.tie_word_embeddings = bool(getattr(config, "tie_word_embeddings", False))
@@ -599,14 +648,53 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module):
             )
         self.logits_processor = LogitsProcessor(text_cfg.vocab_size, mesh=mesh)
 
+    def get_input_embeddings(self) -> Callable[[jax.Array], jax.Array]:
+        return self.language_model.model.get_input_embeddings()
+
+    def precompile_multimodal(self) -> None:
+        if self.visual is not None:
+            self.visual.precompile()
+
+    def get_multimodal_embedding_packed_capacities(self) -> tuple[int, ...]:
+        if self.visual is None:
+            return ()
+        rows = encoder_num_lanes(self.mesh, self.visual.vision_tp)
+        unit = self.visual.spatial_merge_unit
+        return tuple(rows * bucket // unit for bucket in self.visual.input_buckets)
+
+    def get_image_feature(self, items: list[MultimodalDataItem]) -> jax.Array:
+        return self._get_visual_feature(items)
+
+    def get_video_feature(self, items: list[MultimodalDataItem]) -> jax.Array:
+        return self._get_visual_feature(items)
+
+    def _get_visual_feature(self, items: list[MultimodalDataItem]) -> jax.Array:
+        num_lanes = encoder_num_lanes(self.mesh, self.visual.vision_tp)
+        return run_mrope_vision_model(
+            self.visual,
+            items,
+            mesh=self.mesh,
+            num_lanes=num_lanes,
+            buckets=self.visual.input_buckets,
+            merge_unit=self.visual.spatial_merge_unit,
+            rope_type="rope_3d",
+        )
+
+    def get_multimodal_encode_funcs(self):
+        if self.visual is None:
+            return {}
+        return {
+            Modality.IMAGE: self.get_image_feature,
+            Modality.MULTI_IMAGES: self.get_image_feature,
+            Modality.VIDEO: self.get_video_feature,
+        }
+
     def __call__(
         self,
         forward_batch: ForwardBatch,
         memory_pools: MemoryPools,
         logits_metadata: LogitsMetadata,
-        pixel_values=None,
     ):
-        assert pixel_values is None, "Qwen3.5 M1 is text-only; multimodal lands in M2"
         hidden_states, layers_kv_fused, layers_rec_state, layers_topk_ids = self.language_model(
             forward_batch, memory_pools
         )
@@ -705,10 +793,7 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module):
         block.experts.w3.value = self._put(w3, (("data", "tensor"), None, None))
 
     def load_weights(self, model_config: ModelConfig):
-        from sgl_jax.srt.utils.weight_utils import (
-            SequentialSafetensorManager,
-            WeightLoader,
-        )
+        from sgl_jax.srt.utils.weight_utils import SequentialSafetensorManager
 
         hf_config = model_config.hf_config
         tc = hf_config.text_config
@@ -751,6 +836,22 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module):
             if is_moe:
                 for i in range(num_layers):
                     self._load_moe_gate_up(fm, weight_info, i)
+
+        if self.visual is not None:
+            vision_config = SimpleNamespace(
+                model_path=model_config.model_path,
+                num_attention_heads=hf_config.vision_config.num_heads,
+                hidden_size=hf_config.vision_config.hidden_size,
+                get_total_num_kv_heads=lambda: hf_config.vision_config.num_heads,
+            )
+            vision_mappings = Qwen3VLForConditionalGeneration.create_vision_weight_mappings(
+                hf_config, self.visual
+            )
+            WeightLoader(self, vision_config, self.mesh, self.dtype).load_weights_from_safetensors(
+                vision_mappings
+            )
+            mappings.update(vision_mappings)
+            visual_skip = []
 
         self._log_load_summary(mappings, weight_info, visual_skip, mtp_skip)
 

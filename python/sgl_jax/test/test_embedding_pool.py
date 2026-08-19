@@ -1,0 +1,193 @@
+from unittest.mock import patch
+
+import jax.numpy as jnp
+import numpy as np
+
+from sgl_jax.srt.multimodal.in_model import embedding_pool as embedding_pool_module
+from sgl_jax.srt.multimodal.in_model.embedding_pool import EmbeddingPool
+
+
+def _read(pool, entry):
+    """Reconstruct an entry's stored rows from the paged buffer."""
+    rows = []
+    for k in range(entry.length):
+        page = int(entry.page_ids[k // pool.page_size])
+        off = k % pool.page_size
+        rows.append(np.asarray(pool.pages[page, off]))
+    return np.stack(rows)
+
+
+def _write(pool, item_hash, emb):
+    """Cache one item through the pool's packed writer."""
+    emb = jnp.asarray(emb)
+    (entry,) = pool.write_packed((item_hash,), emb, (emb.shape[0],))
+    return entry
+
+
+def test_lru_eviction_frees_pages():
+    pool = EmbeddingPool(num_pages=4, page_size=2, hidden=1, dtype=jnp.float32)
+    _write(pool, 0xA, jnp.asarray([[1.0], [2.0], [3.0]]))  # pages 0,1
+    _write(pool, 0xB, jnp.asarray([[4.0], [5.0], [6.0]]))  # pages 2,3 -> full
+    # No free pages left; writing C must evict the LRU entry (A).
+    entry_c = _write(pool, 0xC, jnp.asarray([[7.0]]))
+    assert entry_c is not None
+    assert pool.lookup(0xA) is None  # evicted
+    assert pool.lookup(0xB) is not None  # survived
+    np.testing.assert_array_equal(_read(pool, pool.lookup(0xC))[:, 0], [7])
+
+
+def test_lookup_touch_protects_from_eviction():
+    pool = EmbeddingPool(num_pages=4, page_size=2, hidden=1, dtype=jnp.float32)
+    _write(pool, 0xA, jnp.asarray([[1.0], [2.0], [3.0]]))
+    _write(pool, 0xB, jnp.asarray([[4.0], [5.0], [6.0]]))
+    pool.lookup(0xA)  # A becomes MRU, so B is now the eviction victim
+    _write(pool, 0xC, jnp.asarray([[7.0]]))
+    assert pool.lookup(0xB) is None
+    assert pool.lookup(0xA) is not None
+
+
+def test_rewrite_reuses_freed_pages():
+    pool = EmbeddingPool(num_pages=4, page_size=2, hidden=1, dtype=jnp.float32)
+    _write(pool, 1, jnp.asarray([[1.0], [2.0], [3.0]]))
+    second = _write(pool, 1, jnp.asarray([[9.0]]))
+    assert second.length == 1
+    # Overwriting the same hash releases the old pages before re-allocating.
+    assert len(pool._free_pages) == 3
+    np.testing.assert_array_equal(_read(pool, pool.lookup(1))[:, 0], [9])
+
+
+def test_write_packed_roundtrips_items_and_drops_padding():
+    pool = EmbeddingPool(num_pages=4, page_size=2, hidden=1, dtype=jnp.float32)
+    pool._pages = pool.pages.at[-1, -1, 0].set(99)
+    packed = jnp.asarray(
+        [
+            [101.0],
+            [102.0],
+            [103.0],
+            [200.0],
+            [201.0],
+            [202.0],
+            [203.0],
+        ]
+    )
+
+    (entry,) = pool.write_packed((1,), packed, (3,))
+
+    assert entry is not None
+    assert entry.length == 3
+    assert len(entry.page_ids) == 2
+    np.testing.assert_array_equal(_read(pool, entry)[:, 0], [101, 102, 103])
+    assert pool.lookup(1) is entry
+    assert pool.lookup(999) is None
+    assert np.asarray(pool.pages[-1, -1, 0]) == 99
+
+
+def test_write_packed_keeps_writer_shape_fixed_across_true_lengths():
+    pool = EmbeddingPool(num_pages=8, page_size=2, hidden=1, dtype=jnp.float32)
+    packed = jnp.arange(8, dtype=jnp.float32).reshape(8, 1)
+
+    with patch.object(
+        embedding_pool_module,
+        "_scatter_rows",
+        wraps=embedding_pool_module._scatter_rows,
+    ) as scatter:
+        pool.write_packed((1, 2), packed, (1, 3))
+        pool.write_packed((3,), packed, (2,))
+
+    assert [call.args[1].shape for call in scatter.call_args_list] == [(8,), (8,)]
+    assert [call.args[2].shape for call in scatter.call_args_list] == [
+        (8, 1),
+        (8, 1),
+    ]
+
+
+def test_write_packed_preserves_wide_feature_rows():
+    pool = EmbeddingPool(
+        num_pages=4,
+        page_size=2,
+        hidden=3,
+        dtype=jnp.float32,
+    )
+    packed = jnp.asarray(
+        [
+            [2.0, 20.0, 21.0],
+            [3.0, 30.0, 31.0],
+            [4.0, 40.0, 41.0],
+            [0.0, 0.0, 0.0],
+        ]
+    )
+
+    (entry,) = pool.write_packed((1,), packed, (2,))
+
+    assert entry is not None
+    np.testing.assert_array_equal(
+        _read(pool, entry),
+        [[2, 20, 21], [3, 30, 31]],
+    )
+
+
+def test_write_packed_scatter_once_and_skips_entries_evicted_during_planning():
+    pool = EmbeddingPool(num_pages=2, page_size=1, hidden=1, dtype=jnp.float32)
+    packed = jnp.asarray([[10.0], [20.0], [30.0]])
+
+    with patch.object(
+        embedding_pool_module,
+        "_scatter_rows",
+        wraps=embedding_pool_module._scatter_rows,
+    ) as scatter:
+        entries = pool.write_packed(
+            (1, 2, 3),
+            packed,
+            (1, 1, 1),
+        )
+
+    scatter.assert_called_once()
+    assert entries[0] is None
+    assert entries[1] is not None
+    assert entries[2] is not None
+    assert pool.lookup(1) is None
+    np.testing.assert_array_equal(_read(pool, pool.lookup(2))[:, 0], [20])
+    np.testing.assert_array_equal(_read(pool, pool.lookup(3))[:, 0], [30])
+
+
+def test_write_packed_duplicate_hash_keeps_only_last_placement():
+    pool = EmbeddingPool(num_pages=2, page_size=1, hidden=1, dtype=jnp.float32)
+    packed = jnp.asarray([[10.0], [20.0]])
+
+    first, last = pool.write_packed(
+        (1, 1),
+        packed,
+        (1, 1),
+    )
+
+    assert first is None
+    assert last is pool.lookup(1)
+    np.testing.assert_array_equal(_read(pool, last)[:, 0], [20])
+    assert len(pool._free_pages) == 1
+
+
+def test_write_packed_oversized_item_does_not_disturb_other_entries():
+    pool = EmbeddingPool(num_pages=2, page_size=1, hidden=1, dtype=jnp.float32)
+    existing = _write(pool, 1, jnp.asarray([[5.0]]))
+    packed = jnp.asarray([[10.0], [11.0], [12.0], [20.0]])
+
+    oversized, normal = pool.write_packed(
+        (1, 2),
+        packed,
+        (3, 1),
+    )
+
+    assert oversized is None
+    assert pool.lookup(1) is existing
+    assert normal is pool.lookup(2)
+    np.testing.assert_array_equal(_read(pool, existing)[:, 0], [5])
+    np.testing.assert_array_equal(_read(pool, normal)[:, 0], [20])
+    assert len(pool._free_pages) == 0
+
+
+def test_clear_resets_free_list():
+    pool = EmbeddingPool(num_pages=4, page_size=2, hidden=1, dtype=jnp.float32)
+    _write(pool, 1, jnp.asarray([[1.0], [2.0], [3.0]]))
+    pool.clear()
+    assert pool.lookup(1) is None
+    assert len(pool._free_pages) == 4

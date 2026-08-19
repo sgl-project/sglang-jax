@@ -596,6 +596,13 @@ class FlashAttention(AttentionBackend):
             )
         else:
             kv_cache_fused = jnp.zeros((0, self.num_kv_heads * 2, self.head_dim), dtype=q.dtype)
+
+        # RPA updates the fused cache in-kernel and requires the new K/V values
+        # to use the cache storage dtype. This is a no-op for the default BF16
+        # cache and performs the storage cast for FP8 KV cache configurations.
+        if k.dtype != kv_cache_fused.dtype:
+            k = k.astype(kv_cache_fused.dtype)
+            v = v.astype(kv_cache_fused.dtype)
         scale = (
             1.0 / jnp.sqrt(layer.head_dim)
             if (layer is None or layer.scaling is None)
