@@ -28,6 +28,8 @@ from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.moe import EPMoE
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.kernels.gmm.megablox_fp4.gmm_v2 import gmm_v2 as fp4_gmm_v2
+from sgl_jax.srt.layers.quantization.mxfp4 import MXFP4_GROUP_SIZE
 from sgl_jax.srt.models.kimi_k3_layers import (
     AttentionResidual,
     mla_output_gate,
@@ -247,6 +249,53 @@ class KimiK3MLP(nnx.Module):
         return out
 
 
+class KimiK3EPMoE(EPMoE):
+    """K3's routed experts: SITU activation, and weights that stay fp4 in HBM.
+
+    Two corrections over the stock EPMoE, both of which are silent if missed:
+
+    **SITU.** The reference's ``KimiBlockSparseMLP`` uses ``SituAndMul`` when
+    ``hidden_act == "situ"`` -- and SITU is not ``f(gate) * up`` for any elementwise ``f``, so it
+    cannot be expressed through the stock silu/gelu branch. Leaving the default (``silu``) loads
+    cleanly, runs, and computes a different model.
+
+    **fp4.** Dequantizing the experts to bf16 is 5,072 GiB at full depth versus 1,347 GiB kept as
+    fp4 (measured 0.535 B/value on v7x). sglang-jax's own GMM has no sub-byte path, so the
+    forward is routed to the fp4-capable megablox kernel vendored from vllm-torchtpu -- the lane
+    already serving this model.
+    """
+
+    def __init__(self, *args, situ_beta=None, situ_linear_beta=None, fp4: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.situ_beta = situ_beta
+        self.situ_linear_beta = situ_linear_beta
+        self.fp4 = bool(fp4)
+        if self.fp4:
+            # gmm_v2 reads block scales as [E, k_blocks, 1, N] and checks them against
+            # weight_block_size; MXFP4 groups 32 values along K. HF convention is
+            # [block_n, block_k], and only block_k is consumed.
+            self.weight_block_size = [1, MXFP4_GROUP_SIZE]
+
+    def _apply_activation(self, layer_w0, layer_w1):
+        if self.situ_beta is None:
+            return super()._apply_activation(layer_w0, layer_w1)
+        # SituAndMul consumes cat([gate, up]) and splits it internally, matching the reference's
+        # `torch.cat([w1(x), w3(x)], dim=-1)` exactly.
+        return situ_and_mul(
+            jnp.concatenate([layer_w0, layer_w1], axis=-1),
+            self.situ_beta,
+            self.situ_linear_beta,
+        )
+
+    def _call_gmm(self, **kwargs):
+        if not self.fp4:
+            return super()._call_gmm(**kwargs)
+        # The vendored kernel takes the same core arguments; `activation_quantized_dtype` and
+        # `tiling`/`v2_tile_info` are backend-wrapper concerns that it does not have.
+        kwargs.pop("activation_quantized_dtype", None)
+        return fp4_gmm_v2(**kwargs)
+
+
 class KimiK3DecoderLayer(nnx.Module):
     """One K3 decoder layer: KDA-or-MLA attention, two AttnRes mixers, MoE-or-dense FFN."""
 
@@ -359,7 +408,11 @@ class KimiK3DecoderLayer(nnx.Module):
                 self.routed_expert_up_proj = None
                 self.routed_expert_norm = None
 
-            self.block_sparse_moe = EPMoE(
+            self.block_sparse_moe = KimiK3EPMoE(
+                situ_beta=(getattr(config, "activation_situ_beta", None)
+                           if getattr(config, "hidden_act", "silu") == "situ" else None),
+                situ_linear_beta=getattr(config, "activation_situ_linear_beta", None),
+                fp4=True,
                 hidden_size=expert_hidden_size,
                 num_experts=config.num_experts,
                 num_experts_per_tok=config.num_experts_per_token,
@@ -615,6 +668,8 @@ class KimiK3ForCausalLM(nnx.Module):
         from sgl_jax.srt.layers.quantization.mxfp4_moe import (
             EXPERT_PROJ_TO_EPMOE,
             dequant_expert_weight,
+            e8m0_scale_to_kernel_layout,
+            unpack_fp4_to_e2m1,
         )
 
         cfg = self.config
@@ -647,11 +702,13 @@ class KimiK3ForCausalLM(nnx.Module):
                 if not getattr(layer, "is_moe_layer", False):
                     continue
                 moe = layer.block_sparse_moe
+                # the MoE module decides; the loader does not second-guess it
+                use_fp4 = bool(getattr(moe, "fp4", False))
                 for proj, target in EXPERT_PROJ_TO_EPMOE.items():
                     param = getattr(moe, target, None)
                     if param is None:
                         continue
-                    stack = []
+                    stack, scale_stack = [], []
                     for e in range(num_experts):
                         base = (
                             f"{self.TEXT_PREFIX}model.layers.{li}"
@@ -664,9 +721,15 @@ class KimiK3ForCausalLM(nnx.Module):
                             raise KeyError(f"{pk} present but {sk} missing")
                         w = handles[loc[pk]].get_tensor(pk)
                         sc = handles[loc[sk]].get_tensor(sk)
-                        stack.append(
-                            dequant_expert_weight(jnp.asarray(w), jnp.asarray(sc), jnp.bfloat16)
-                        )
+                        if use_fp4:
+                            # native fp4, K-major, plus the kernel's [blocks, 1, N] fp32 scale.
+                            # No widening: the values stay 4 bits all the way into the GMM.
+                            stack.append(unpack_fp4_to_e2m1(jnp.asarray(w)))
+                            scale_stack.append(e8m0_scale_to_kernel_layout(jnp.asarray(sc)))
+                        else:
+                            stack.append(
+                                dequant_expert_weight(jnp.asarray(w), jnp.asarray(sc), jnp.bfloat16)
+                            )
                     if len(stack) != num_experts:
                         logger.warning(
                             "layer %d %s: found %d/%d experts; leaving as-is",
@@ -689,9 +752,27 @@ class KimiK3ForCausalLM(nnx.Module):
                     if spec is not None:
                         arr = jax.device_put(arr, NamedSharding(target_mesh, spec))
                     param.value = arr
+
+                    # The scale is NOT optional in fp4: the kernel multiplies by it, so a missing
+                    # or zero scale produces finite, plausible, wrong numbers rather than an error.
+                    if use_fp4:
+                        scale_param = getattr(moe, f"{target}_scale", None)
+                        scale_arr = jnp.stack(scale_stack, axis=0)
+                        if scale_param is None:
+                            setattr(moe, f"{target}_scale", nnx.Param(scale_arr))
+                            scale_param = getattr(moe, f"{target}_scale")
+                        sspec = getattr(getattr(scale_param.value, "sharding", None), "spec", None)
+                        if sspec is not None:
+                            scale_arr = jax.device_put(
+                                scale_arr, NamedSharding(target_mesh, sspec))
+                        scale_param.value = scale_arr
+                        del scale_stack
+
                     n_done += 1
                     del stack
-            logger.info("MoE MXFP4 fixup: dequantized %d expert groups", n_done)
+            logger.info(
+                "MoE MXFP4 fixup: loaded %d expert groups as %s",
+                n_done, "native fp4 + block scales" if use_fp4 else "bf16")
         finally:
             for h in handles.values():
                 h.__exit__(None, None, None)
