@@ -1275,9 +1275,9 @@ def _build_verify(topk: int):
             _extend_lens_2d = jax.sharding.reshard(
                 _extend_lens_2d, NamedSharding(_ext_sh.mesh, P())
             )
-        prepared_logits_indices = (
-            jnp.cumsum(_extend_lens_2d, axis=1).reshape(-1) - 1
-        ).astype(jnp.int32)
+        prepared_logits_indices = (jnp.cumsum(_extend_lens_2d, axis=1).reshape(-1) - 1).astype(
+            jnp.int32
+        )
         prepared_sel_pos = prepared.sel_pos
         prepared_sel_pos_data = prepared.sel_pos
         prepared_predict = prepared.predict
