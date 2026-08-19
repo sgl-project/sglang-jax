@@ -58,10 +58,16 @@ from sgl_jax.srt.utils.jax_utils import get_available_device_memory
 logger = logging.getLogger(__name__)
 
 
+def _packed_embedding_hidden(model_config, multimodal_model=None) -> int:
+    deepstack_dim = int(getattr(multimodal_model, "deepstack_visual_layers", 0))
+    return int(model_config.hidden_size) * (1 + deepstack_dim)
+
+
 def _embedding_pool_bytes(
     model_config: ModelConfig | MockModelConfig,
     server_args: ServerArgs,
     is_draft_worker: bool = False,
+    multimodal_model=None,
 ) -> int:
     """Per-device byte budget reserved for the multimodal embedding pool."""
     enabled = (
@@ -78,7 +84,8 @@ def _embedding_pool_bytes(
         return server_args.mm_embedding_cache_size_mb * 1024**2
     page_size = server_args.mm_embedding_page_size
     capacity = -(-server_args.max_prefill_tokens // page_size) * page_size
-    return capacity * int(model_config.hidden_size) * jnp.dtype(model_config.dtype).itemsize
+    packed_hidden = _packed_embedding_hidden(model_config, multimodal_model)
+    return capacity * packed_hidden * jnp.dtype(model_config.dtype).itemsize
 
 
 def _maybe_apply_recurrent_cow(forward_batch, memory_pools):
@@ -223,6 +230,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             self.model_config,
             self.server_args,
             getattr(self, "is_draft_worker", False),
+            getattr(self, "model", None),
         )
 
     def _build_embedding_pool(self):
@@ -235,15 +243,15 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         if not self.embedding_pool_bytes:
             return
         page_size = self.server_args.mm_embedding_page_size
-        hidden = int(self.model_config.hidden_size)
-        per_page = page_size * hidden * jnp.dtype(self.dtype).itemsize
+        packed_hidden = _packed_embedding_hidden(self.model_config, self.model)
+        per_page = page_size * packed_hidden * jnp.dtype(self.dtype).itemsize
         num_pages = int(self.embedding_pool_bytes // per_page)
         if num_pages <= 0:
             return
         self.embedding_pool = EmbeddingPool(
             num_pages=num_pages,
             page_size=page_size,
-            hidden=hidden,
+            hidden=packed_hidden,
             dtype=self.dtype,
             mesh=self.mesh,
         )

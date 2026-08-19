@@ -66,6 +66,7 @@ class CompilationManager:
         self.bs_buckets = self._compute_bs_buckets(server_args.precompile_bs_paddings)
         self.cache_loc_buckets = self._compute_cache_loc_buckets()
         self._compiled_variants: set[tuple] = set()
+        self._compiled_multimodal_extend_shapes: set[tuple[int, int]] = set()
 
     def _compute_token_buckets(self, user_paddings: list[int] | None) -> list[int]:
         dp_size = self.dp_size
@@ -165,19 +166,19 @@ class CompilationManager:
 
         start_time = time.perf_counter()
         bs = self.max_padded_batch_size
-        variant_names = ("text", "multimodal") if self.precompile_in_model_multimodal else ("text",)
+        multimodal_options = (False, True) if self.precompile_in_model_multimodal else (False,)
         logger.info(
-            "[EXTEND] Begin to precompile variants=%s bs_paddings=%s token_paddings=%s",
-            variant_names,
+            "[EXTEND] Begin to precompile bs_paddings=%s token_paddings=%s multimodal=%s",
             [bs],
             self.token_buckets,
+            self.precompile_in_model_multimodal,
         )
 
-        pairs = list(itertools.product(variant_names, [bs], self.token_buckets))
+        pairs = list(itertools.product(multimodal_options, [bs], self.token_buckets))
         with tqdm(pairs, desc="[EXTEND] PRECOMPILE", leave=False) as pbar:
             for pair in pbar:
-                variant_name, bs_val, num_tokens = pair
-                pbar.set_postfix(variant=variant_name, bs=bs_val, tokens=num_tokens)
+                use_multimodal_input, bs_val, num_tokens = pair
+                pbar.set_postfix(multimodal=use_multimodal_input, bs=bs_val, tokens=num_tokens)
                 if bs_val > num_tokens:
                     logger.warning("bs=%s > num_tokens=%s, skip this pair", bs_val, num_tokens)
                     continue
@@ -195,7 +196,7 @@ class CompilationManager:
                     batch, 0, mesh, self.vocab_size
                 )
                 batch.forward_batch = ForwardBatch.init_new(batch, model_runner)
-                if variant_name == "multimodal":
+                if use_multimodal_input:
                     from sgl_jax.srt.multimodal.in_model.host_orchestration import (
                         precompile_multimodal_inputs,
                     )
@@ -217,14 +218,13 @@ class CompilationManager:
                 forward_fn(
                     batch,
                     launch_done=None,
-                    skip_sample=variant_name == "multimodal",
+                    skip_sample=use_multimodal_input,
                     sampling_metadata=sampling_metadata,
                 )
-                if variant_name == "text":
-                    variant_key = (ForwardMode.EXTEND, num_tokens, bs_val, False)
+                if use_multimodal_input:
+                    self._compiled_multimodal_extend_shapes.add((num_tokens, bs_val))
                 else:
-                    variant_key = ("VLM_EXTEND", num_tokens, bs_val)
-                self._compiled_variants.add(variant_key)
+                    self._compiled_variants.add((ForwardMode.EXTEND, num_tokens, bs_val, False))
 
         end_time = time.perf_counter()
         logger.info("[EXTEND] Precompile finished in %.0f secs", end_time - start_time)

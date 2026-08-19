@@ -506,6 +506,8 @@ class TestDummyBatch(unittest.TestCase):
             (None, None, False, False),
             (input_embedding, deepstack, True, True),
         ]
+        assert cm._compiled_variants == {(ForwardMode.EXTEND, 4, 2, False)}
+        assert cm._compiled_multimodal_extend_shapes == {(4, 2)}
         precompile_multimodal_inputs.assert_called_once_with(
             forward_batch.input_ids,
             model_runner.model,

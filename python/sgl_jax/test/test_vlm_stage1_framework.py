@@ -44,8 +44,13 @@ ARCH = "Qwen2_5_VLForConditionalGeneration"
 
 
 class _TestInModelModel(InModelMultimodalContract):
+    def __init__(self, input_embeddings=None):
+        self.input_embeddings = input_embeddings
+
     def get_input_embeddings(self):
-        return lambda input_ids: input_ids
+        if self.input_embeddings is None:
+            return lambda input_ids: input_ids
+        return lambda _: self.input_embeddings
 
 
 def _vision_config(**overrides):
@@ -404,8 +409,7 @@ def test_qwen2_get_image_feature_spmd(encoder_tp):
     args = (
         _batch_dp(([runtime_items[0]], [runtime_items[1]]), per_dp_token=4),
         jnp.zeros(8, dtype=jnp.int32),
-        lambda _: running,
-        Model(),
+        Model(running),
     )
     output, _ = host_orchestration.embed_multimodal_inputs(*args)
     assert output.sharding.spec == PartitionSpec("data", None)
@@ -561,8 +565,7 @@ def test_merge_preserves_unmasked_tokens():
     output, _ = host_orchestration.embed_multimodal_inputs(
         batch,
         jnp.zeros(3, dtype=jnp.int32),
-        lambda _: running,
-        Model(),
+        Model(running),
     )
     np.testing.assert_array_equal(output, [[10, 11], [3, 4], [20, 21]])
 
@@ -601,7 +604,7 @@ def test_packed_gather_merge_preserves_data_sharding():
     Model.mesh = mesh
     running = jax.device_put(jnp.zeros((4, 1)), NamedSharding(mesh, PartitionSpec("data", None)))
     out, ds = host_orchestration.embed_multimodal_inputs(
-        batch, jnp.zeros(4, dtype=jnp.int32), lambda _: running, Model()
+        batch, jnp.zeros(4, dtype=jnp.int32), Model(running)
     )
     np.testing.assert_array_equal(out[:, 0], [10, 11, 20, 21])
     np.testing.assert_array_equal(ds[0, :, 0], [30, 31, 40, 41])
@@ -704,7 +707,7 @@ def test_packed_gather_merge_handles_chunk_split():
 
     running = jnp.zeros((3, 1))
     out, _ = host_orchestration.embed_multimodal_inputs(
-        batch, jnp.zeros(3, dtype=jnp.int32), lambda _: running, Model()
+        batch, jnp.zeros(3, dtype=jnp.int32), Model(running)
     )
     np.testing.assert_array_equal(out[:, 0], [11, 12, 13])
 
@@ -729,8 +732,7 @@ def test_embedding_pool_skips_write_after_final_merge():
     args = (
         _batch([item]),
         jnp.zeros(2, dtype=jnp.int32),
-        lambda _: jnp.zeros((2, 1), dtype=jnp.float32),
-        Model(),
+        Model(jnp.zeros((2, 1), dtype=jnp.float32)),
         pool,
     )
     first, _ = host_orchestration.embed_multimodal_inputs(*args)
@@ -754,18 +756,16 @@ def test_embedding_pool_hit_matches_miss_with_deepstack():
             return {Modality.IMAGE: lambda items: output}
 
     pool = EmbeddingPool(num_pages=4, page_size=2, hidden=2, dtype=jnp.float32)
-    model = Model()
+    model = Model(jnp.zeros((1, 1), dtype=jnp.float32))
     first, first_ds = host_orchestration.embed_multimodal_inputs(
         _batch([item], extend=1, per_dp_token=1),
         jnp.zeros(1, dtype=jnp.int32),
-        lambda _: jnp.zeros((1, 1), dtype=jnp.float32),
         model,
         pool,
     )
     second, second_ds = host_orchestration.embed_multimodal_inputs(
         _batch([item], prefix=1, extend=1, per_dp_token=1),
         jnp.zeros(1, dtype=jnp.int32),
-        lambda _: jnp.zeros((1, 1), dtype=jnp.float32),
         model,
         pool,
     )
@@ -799,8 +799,7 @@ def test_embedding_pool_reads_hit_before_miss_can_evict_it():
     out, _ = host_orchestration.embed_multimodal_inputs(
         _batch([hit, miss, partial_miss], extend=3, per_dp_token=3),
         jnp.zeros(3, dtype=jnp.int32),
-        lambda _: jnp.zeros((3, 1), dtype=jnp.float32),
-        Model(),
+        Model(jnp.zeros((3, 1), dtype=jnp.float32)),
         pool,
     )
 
@@ -833,18 +832,16 @@ def test_embedding_pool_reuses_full_item_across_chunks():
             return {Modality.IMAGE: encode}
 
     pool = EmbeddingPool(num_pages=4, page_size=2, hidden=1, dtype=jnp.float32)
-    model = Model()
+    model = Model(jnp.zeros((2, 1), dtype=jnp.float32))
     first, _ = host_orchestration.embed_multimodal_inputs(
         _batch([item], prefix=0, extend=2, per_dp_token=2),
         jnp.zeros(2, dtype=jnp.int32),
-        lambda _: jnp.zeros((2, 1), dtype=jnp.float32),
         model,
         pool,
     )
     second, _ = host_orchestration.embed_multimodal_inputs(
         _batch([item], prefix=2, extend=2, per_dp_token=2),
         jnp.zeros(2, dtype=jnp.int32),
-        lambda _: jnp.zeros((2, 1), dtype=jnp.float32),
         model,
         pool,
     )
@@ -873,6 +870,54 @@ def test_multimodal_defaults_follow_capabilities(arch, chunked, radix, mixed_chu
     assert args.disable_overlap_schedule is False
     assert args.enable_mixed_chunk is mixed_chunk
     assert args.limit_mm_data_per_request == {"image": 16}
+
+
+def test_model_runner_forward_embeds_multimodal_inputs():
+    from sgl_jax.srt.model_executor.model_runner import ModelRunner
+
+    input_ids = jnp.asarray([1], dtype=jnp.int32)
+    multimodal_batch = {Modality.IMAGE: ()}
+    model = object()
+    embedding_pool = object()
+    forward_batch = SimpleNamespace(
+        bid=1,
+        input_ids=input_ids,
+        multimodal_batch=multimodal_batch,
+        input_embedding=None,
+        deepstack_visual_embedding=None,
+        apply_for_deepstack=False,
+    )
+    expected = ("forwarded", 0)
+    runner = SimpleNamespace(
+        forward_pass_id=0,
+        model=model,
+        embedding_pool=embedding_pool,
+        _forward_raw=lambda batch, metadata: expected,
+    )
+
+    with (
+        patch(
+            "sgl_jax.srt.model_executor.model_runner.embed_multimodal_inputs",
+            autospec=True,
+            return_value=("embedded", "deepstack"),
+        ) as embed,
+        patch("sgl_jax.srt.model_executor.model_runner.precision_tracer.start_batch_trace"),
+        patch(
+            "sgl_jax.srt.model_executor.model_runner.precision_tracer.set_current_forward_pass_id"
+        ),
+    ):
+        result = ModelRunner.forward(runner, forward_batch, object())
+
+    embed.assert_called_once()
+    assert embed.call_args.args == ()
+    assert embed.call_args.kwargs["multimodal_batch"] is multimodal_batch
+    assert embed.call_args.kwargs["input_ids"] is input_ids
+    assert embed.call_args.kwargs["multimodal_model"] is model
+    assert embed.call_args.kwargs["embedding_pool"] is embedding_pool
+    assert forward_batch.input_embedding == "embedded"
+    assert forward_batch.deepstack_visual_embedding == "deepstack"
+    assert forward_batch.apply_for_deepstack is True
+    assert result == expected
 
 
 def test_forward_batch_shards_input_embeddings():

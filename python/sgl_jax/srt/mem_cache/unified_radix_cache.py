@@ -36,8 +36,8 @@ from sgl_jax.srt.mem_cache.radix_cache import (
     _convert_to_bigram_key,
     _key_match_page_size1,
     _key_match_paged,
+    build_radix_key,
     get_child_key,
-    request_cache_key_ids,
 )
 from sgl_jax.srt.mem_cache.unified_cache_components import (
     _NUM_COMPONENT_TYPES,
@@ -335,8 +335,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:committed_kv_len]
-        token_ids = request_cache_key_ids(req, token_ids)
+        radix_key = build_radix_key(req, committed_kv_len)
         # For the EAGLE bigram key the key length is one less than the token
         # length, so the corresponding kv length is reduced by one as well.
         actual_kv_len = committed_kv_len - 1 if self.is_eagle else committed_kv_len
@@ -352,11 +351,11 @@ class UnifiedRadixCache(BasePrefixCache):
             old_prefix_len -= 1
 
         insert_params = InsertParams() if is_insert else None
-        effective_cache_len = len(token_ids)
+        effective_cache_len = len(radix_key)
         if is_insert:
             for component in self._components_tuple:
                 cl = component.prepare_for_caching_req(
-                    req, insert_params, len(token_ids), is_finished=True
+                    req, insert_params, len(radix_key), is_finished=True
                 )
                 if cl is not None:
                     effective_cache_len = min(effective_cache_len, cl)
@@ -382,9 +381,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         insert_result = None
         if is_insert and effective_cache_len > 0:
-            insert_params.key = RadixKey(
-                token_ids[:page_aligned_token_len], req.extra_key, req.dp_rank
-            )
+            insert_params.key = radix_key[:page_aligned_token_len]
             insert_params.value = page_aligned_kv_indices
             # Radix cache takes over one reference from the memory pool.
             insert_result = self.insert(insert_params)
@@ -414,8 +411,8 @@ class UnifiedRadixCache(BasePrefixCache):
             return
 
         dp_rank = req.dp_rank if req.dp_rank is not None else 0
-        token_ids = request_cache_key_ids(req, req.fill_ids)
-        all_token_len = len(token_ids)
+        radix_key = build_radix_key(req, len(req.fill_ids))
+        all_token_len = len(radix_key)
         actual_kv_len = all_token_len - 1 if self.is_eagle else all_token_len
         kv_indices = self.req_to_token_pool.read(req.req_pool_idx, all_token_len)
 
@@ -454,10 +451,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # For EAGLE, page_aligned_len is for the bigram key; the token len is +1.
         page_aligned_token_len = page_aligned_len + 1 if self.is_eagle else page_aligned_len
-        page_aligned_token_ids = token_ids[:page_aligned_token_len]
+        page_aligned_key = radix_key[:page_aligned_token_len]
 
-        radix_key = RadixKey(page_aligned_token_ids, req.extra_key, req.dp_rank)
-        insert_params.key = radix_key
+        insert_params.key = page_aligned_key
         insert_params.value = page_aligned_kv_indices
         # Radix cache takes over one reference from the memory pool.
         insert_result = self.insert(insert_params)
@@ -467,7 +463,9 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
         # Prefix indices may have been updated, reuse them.
-        new_match_result = self.match_prefix(MatchPrefixParams(key=radix_key, full_only=True))
+        new_match_result = self.match_prefix(
+            MatchPrefixParams(key=page_aligned_key, full_only=True)
+        )
         new_indices = new_match_result.device_indices
         new_last_node = new_match_result.last_device_node
 

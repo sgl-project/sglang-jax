@@ -48,7 +48,7 @@ from sgl_jax.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sgl_jax.srt.mem_cache.radix_cache import RadixKey, request_cache_key_ids
+from sgl_jax.srt.mem_cache.radix_cache import RadixKey, build_radix_key
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.multimodal.common.modality_enum import MultimodalInputs
@@ -482,7 +482,7 @@ class Req:
                 )
                 match_result = tree_cache.match_prefix(
                     MatchPrefixParams(
-                        key=RadixKey(self.match_key_ids(), self.extra_key, self.dp_rank),
+                        key=self.match_key(),
                         cow_recurrent=(
                             tree_cache.supports_recurrent() and not is_running_recurrent
                         ),
@@ -517,9 +517,9 @@ class Req:
         max_prefix_len = max(max_prefix_len, 0)
         return self.fill_ids[:max_prefix_len]
 
-    def match_key_ids(self) -> list[int]:
+    def match_key(self) -> RadixKey:
         real_prefix = self.adjust_max_prefix_ids()
-        return request_cache_key_ids(self, real_prefix)
+        return build_radix_key(self, len(real_prefix))
 
     def pop_committed_kv_cache(self) -> int:
         # Idempotent: the PD prefill abort path can run release a second time

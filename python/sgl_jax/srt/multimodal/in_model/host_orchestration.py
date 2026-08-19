@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
@@ -76,6 +76,8 @@ def build_multimodal_batch(
     per_dp_token: int,
 ) -> _MultimodalBatch | None:
     """Build tasks for placeholders visible in this prefill chunk."""
+    if not ModelRegistry.is_in_model_multimodal(model_config.hf_config.architectures):
+        return None
 
     grouped: dict[Modality, list[ItemTask]] = {}
     for dp_rank, info in enumerate((reqs_info or ())[:dp_size]):
@@ -104,8 +106,6 @@ def build_multimodal_batch(
             request_base += extend_len
 
     if not grouped:
-        return None
-    if not ModelRegistry.is_in_model_multimodal(model_config.hf_config.architectures):
         return None
     return {modality: tuple(tasks) for modality, tasks in grouped.items()}
 
@@ -323,14 +323,13 @@ def precompile_multimodal_components(
 def embed_multimodal_inputs(
     multimodal_batch: _MultimodalBatch,
     input_ids: jax.Array,
-    input_embedding: Callable[[jax.Array], jax.Array],
     multimodal_model: InModelMultimodalContract,
     embedding_pool: EmbeddingPool | None = None,
 ) -> tuple[jax.Array, jax.Array | None]:
     """Merge padded, item-ordered encoder outputs into the token stream."""
     mesh = multimodal_model.mesh
     with jax.set_mesh(mesh) if mesh is not None else nullcontext():
-        running = input_embedding(input_ids)
+        running = multimodal_model.get_input_embeddings()(input_ids)
         hidden = running.shape[-1]
         deepstack_dim = multimodal_model.deepstack_visual_layers
         if deepstack_dim:
