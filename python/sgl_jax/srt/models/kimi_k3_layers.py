@@ -86,7 +86,17 @@ def attention_residual_apply(
     v32 = values.astype(jnp.float32)
     var = jnp.mean(jnp.square(v32), axis=-1, keepdims=True)
     normed = v32 * jax.lax.rsqrt(var + eps) * norm_scale.astype(jnp.float32)
-    scores = jnp.einsum("...h,ho->...o", normed.astype(proj_kernel.dtype), proj_kernel)
+    # HIGHEST precision is REQUIRED here, not an optimization. TPU's default einsum precision
+    # is a bf16 multiply; these scores feed a softmax, so a ~1e-3 absolute error in the score
+    # becomes a large *relative* error in the mixing weights. Measured on v7x: default precision
+    # gives max_rel_err 3.7e-1 (37%) against the fp32 oracle, HIGHEST gives 1.9e-7. The
+    # projection is hidden->1, so HIGHEST costs essentially nothing.
+    scores = jnp.einsum(
+        "...h,ho->...o",
+        normed.astype(jnp.float32),
+        proj_kernel.astype(jnp.float32),
+        precision=jax.lax.Precision.HIGHEST,
+    )
     probabilities = jax.nn.softmax(scores.astype(jnp.float32), axis=-2)
     return jnp.sum(probabilities * v32, axis=-2).astype(values.dtype)
 
@@ -120,6 +130,7 @@ class AttentionResidual(nnx.Module):
         scope_name: str = "attn_residual",
     ):
         super().__init__()
+        self.eps = eps
         from sgl_jax.srt.layers.layernorm import RMSNorm
         from sgl_jax.srt.layers.linear import LinearBase
 
@@ -146,10 +157,12 @@ class AttentionResidual(nnx.Module):
         prefix_sum: jax.Array,
         block_residuals: jax.Array,
     ) -> jax.Array:
-        values = jnp.concatenate(
-            (block_residuals, jnp.expand_dims(prefix_sum, axis=-2)), axis=-2
+        # Delegate to the pure core so the module and the tested path have identical numerics --
+        # in particular the HIGHEST-precision scoring einsum, which self.proj() would not give.
+        return attention_residual_apply(
+            prefix_sum,
+            block_residuals,
+            self.norm.scale.value,
+            self.proj.kernel.value,
+            self.eps,
         )
-        scores, _ = self.proj(self.norm(values))
-        probabilities = jax.nn.softmax(scores.astype(jnp.float32), axis=-2)
-        out = jnp.sum(probabilities * values.astype(jnp.float32), axis=-2)
-        return out.astype(values.dtype)

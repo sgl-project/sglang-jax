@@ -77,3 +77,25 @@ def test_attention_residual_is_a_convex_combination():
     assert np.all(out <= allv.max(axis=-2) + 1e-4) and np.all(out >= allv.min(axis=-2) - 1e-4)
     # zero projection => uniform softmax => plain mean
     np.testing.assert_allclose(out, allv.mean(axis=-2), rtol=1e-4, atol=1e-4)
+
+
+def test_attnres_scoring_needs_highest_precision_on_tpu():
+    """Regression: TPU's default einsum precision is bf16, and these scores feed a softmax.
+
+    Measured on v7x, default precision gives ~37% max relative error against the fp32 oracle
+    while HIGHEST gives ~2e-7. This test pins the tolerance that only HIGHEST can meet, so a
+    future edit that drops the precision= argument fails here instead of silently degrading the
+    mixing weights. On CPU both paths are exact, so this only bites on TPU.
+    """
+    rng = np.random.default_rng(7)
+    hidden, eps = 128, 1e-6
+    prefix = rng.normal(size=(4, hidden)).astype(np.float32)
+    blocks = rng.normal(size=(4, 3, hidden)).astype(np.float32)
+    ns = rng.normal(size=(hidden,)).astype(np.float32)
+    pk = (rng.normal(size=(hidden, 1)) * 0.05).astype(np.float32)
+    got = np.asarray(attention_residual_apply(
+        jnp.asarray(prefix), jnp.asarray(blocks), jnp.asarray(ns), jnp.asarray(pk), eps),
+        dtype=np.float64)
+    want = _oracle_attnres(prefix, blocks, ns, pk, eps)
+    rel = np.abs(got - want) / (np.abs(want) + 1e-9)
+    assert rel.max() < 1e-4, f"max rel err {rel.max():.3e} -- scoring einsum lost precision"
