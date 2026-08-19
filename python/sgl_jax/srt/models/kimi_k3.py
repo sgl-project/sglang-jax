@@ -32,6 +32,33 @@ from sgl_jax.srt.models.kimi_linear import KimiDeltaAttention
 from sgl_jax.srt.models.deepseek_v3 import DeepseekV3Attention as KimiMLAAttention
 
 
+# ---------------------------------------------------------------------------------------------
+# Field-based config accessors.
+#
+# The model must NOT depend on the config CLASS. K3's checkpoint ships its own
+# `configuration_kimi_k3.py` whose class is ALSO called KimiK3Config, and with
+# --trust-remote-code that one is what HF constructs -- shadowing ours and lacking our helper
+# methods (observed: "'KimiK3Config' object has no attribute 'is_kda_layer'"). Reading fields
+# works for both, and for a plain PretrainedConfig.
+# ---------------------------------------------------------------------------------------------
+
+def cfg_is_kda_layer(config, layer_idx: int) -> bool:
+    """kda_layers is 1-BASED in the checkpoint, hence the +1.
+
+    Reads the FIELD unconditionally and never prefers a ``config.is_kda_layer`` method. Both
+    config classes derive the answer from ``linear_attn_config``, so this is equivalent -- and
+    preferring the method caused infinite recursion once a shim delegating back here was
+    installed on the config (RecursionError at load).
+    """
+    la = getattr(config, "linear_attn_config", None) or {}
+    kl = la.get("kda_layers")
+    return bool(kl) and (layer_idx + 1) in kl
+
+
+def cfg_uses_attn_res(config) -> bool:
+    return getattr(config, "attn_res_block_size", None) is not None
+
+
 class KimiK3MLP(nnx.Module):
     """Dense MLP with K3's SITU gate.
 
@@ -86,8 +113,8 @@ class KimiK3DecoderLayer(nnx.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
-        self.is_kda = config.is_kda_layer(layer_idx)
-        self.attn_res_block_size = config.attn_res_block_size
+        self.is_kda = cfg_is_kda_layer(config, layer_idx)
+        self.attn_res_block_size = getattr(config, 'attn_res_block_size', None)
 
         if self.is_kda:
             self.self_attn = KimiDeltaAttention(
@@ -111,15 +138,15 @@ class KimiK3DecoderLayer(nnx.Module):
 
         is_moe = (
             getattr(config, "num_experts", None)
-            and layer_idx >= config.first_k_dense_replace
-            and layer_idx % config.moe_layer_freq == 0
+            and layer_idx >= getattr(config, 'first_k_dense_replace', 0)
+            and layer_idx % getattr(config, 'moe_layer_freq', 1) == 0
         )
         self.is_moe_layer = bool(is_moe)
 
         if not self.is_moe_layer:
             self.mlp = KimiK3MLP(
                 config.hidden_size, config.intermediate_size, mesh,
-                config.activation_situ_beta, config.activation_situ_linear_beta, dtype)
+                getattr(config, 'activation_situ_beta', None), getattr(config, 'activation_situ_linear_beta', None), dtype)
             self.moe_gate = None
             self.shared_experts = None
         else:
@@ -129,14 +156,14 @@ class KimiK3DecoderLayer(nnx.Module):
                 num_experts=config.num_experts,
                 enable_expert_bias=True,
                 weight_dtype=dtype,
-                score_func=config.moe_router_activation_func,
+                score_func=getattr(config, 'moe_router_activation_func', "sigmoid"),
             )
             self.topk = TopK(
                 topk=config.num_experts_per_token,
-                renormalize=config.moe_renormalize,
-                num_expert_group=config.num_expert_group,
-                topk_group=config.topk_group,
-                routed_scaling_factor=config.routed_scaling_factor,
+                renormalize=getattr(config, 'moe_renormalize', True),
+                num_expert_group=getattr(config, 'num_expert_group', 1),
+                topk_group=getattr(config, 'topk_group', 1),
+                routed_scaling_factor=getattr(config, 'routed_scaling_factor', 1.0),
                 layer_id=layer_idx,
                 mesh=mesh,
             )
@@ -154,9 +181,9 @@ class KimiK3DecoderLayer(nnx.Module):
             self.shared_experts = (
                 KimiK3MLP(
                     config.hidden_size,
-                    config.moe_intermediate_size * config.num_shared_experts,
-                    mesh, config.activation_situ_beta, config.activation_situ_linear_beta, dtype)
-                if config.num_shared_experts > 0 else None
+                    config.moe_intermediate_size * getattr(config, 'num_shared_experts', 0),
+                    mesh, getattr(config, 'activation_situ_beta', None), getattr(config, 'activation_situ_linear_beta', None), dtype)
+                if getattr(config, 'num_shared_experts', 0) > 0 else None
             )
 
         self.input_layernorm = RMSNorm(
@@ -166,7 +193,7 @@ class KimiK3DecoderLayer(nnx.Module):
             config.hidden_size, epsilon=config.rms_norm_eps, param_dtype=dtype,
             scope_name="post_attention_layernorm")
 
-        if config.uses_attn_res:
+        if cfg_uses_attn_res(config):
             self.self_attention_res = AttentionResidual(
                 config.hidden_size, config.rms_norm_eps, mesh, dtype, "self_attention_res")
             self.mlp_res = AttentionResidual(
@@ -259,7 +286,7 @@ class KimiK3Model(nnx.Module):
 
         self.config = config
         self.vocab_size = config.vocab_size
-        self.attn_res_block_size = config.attn_res_block_size
+        self.attn_res_block_size = getattr(config, 'attn_res_block_size', None)
         self.embed_tokens = Embed(
             num_embeddings=config.vocab_size, features=config.hidden_size,
             dtype=dtype, param_dtype=dtype, kernel_axes=("tensor", None), mesh=mesh)
@@ -273,14 +300,18 @@ class KimiK3Model(nnx.Module):
         self.output_attn_res = (
             AttentionResidual(config.hidden_size, config.rms_norm_eps, mesh, dtype,
                               "output_attn_res")
-            if config.uses_attn_res else None)
+            if cfg_uses_attn_res(config) else None)
 
     def __call__(self, forward_batch: ForwardBatch, memory_pools):
         hidden_states = self.embed_tokens(forward_batch.input_ids)
 
+        # Derive the empty candidate set FROM hidden_states rather than building a fresh
+        # jnp.zeros: a fresh array is unsharded (P(None,None,None)) while hidden_states carries
+        # P('data',None,None), and jnp.concatenate rejects mismatched shardings --
+        #   ShardingTypeError: All operands should have the same sharding
+        # Slicing to zero width inherits both the sharding and the dtype.
         block_residuals = (
-            initial_block_residuals(hidden_states.shape[0], hidden_states.shape[-1],
-                                    hidden_states.dtype)
+            hidden_states[:, None, :][:, :0, :]
             if self.attn_res_block_size is not None else None)
 
         kv_fused_list, rec_bufs, conv_bufs, topk_list = [], [], [], []
@@ -353,6 +384,18 @@ class KimiK3ForCausalLM(nnx.Module):
     # is text-only and emits bare `model.*` keys, so every inherited mapping is re-prefixed.
     TEXT_PREFIX = "language_model."
 
+    # Borrow Kimi-Linear's per-layer mapping builder WITHOUT inheriting from it. The parent's
+    # _create_weight_mappings calls self._create_layer_mappings(...), so an unbound delegation
+    # needs the helper present on this class too. Inheriting instead would make K3 a
+    # KimiLinearForCausalLM subclass, which is exactly the substitution the registry test forbids
+    # (K3's text_config points at Kimi-Linear; nothing must be able to satisfy it by inheritance).
+    from sgl_jax.srt.models.kimi_linear import (  # noqa: E402
+        KimiLinearForCausalLM as _KL,
+    )
+
+    _create_layer_mappings = _KL._create_layer_mappings
+    del _KL
+
     def _create_weight_mappings(self) -> dict:
         """Kimi-Linear's mappings, re-prefixed, plus K3's AttnRes parameters.
 
@@ -364,10 +407,19 @@ class KimiK3ForCausalLM(nnx.Module):
         from sgl_jax.srt.models.kimi_linear import KimiLinearForCausalLM
         from sgl_jax.srt.utils.weight_utils import WeightMapping
 
+        # Kimi-Linear's mapping builder calls self.config.is_kda_layer(i) directly
+        # (kimi_linear.py:665). With --trust-remote-code the config is the CHECKPOINT's
+        # KimiK3Config, which has no such method, so install a field-reading shim before
+        # delegating. Shimming beats duplicating the whole mapping builder, which would then
+        # drift from upstream.
+        if not callable(getattr(self.config, "is_kda_layer", None)):
+            cfg = self.config
+            cfg.is_kda_layer = lambda i, _c=cfg: cfg_is_kda_layer(_c, i)
+
         base = KimiLinearForCausalLM._create_weight_mappings(self)
         mappings = {self.TEXT_PREFIX + k: v for k, v in base.items()}
 
-        if not self.config.uses_attn_res:
+        if not cfg_uses_attn_res(self.config):
             return mappings
 
         def _pair(ckpt_stem: str, target_stem: str):
@@ -383,6 +435,25 @@ class KimiK3ForCausalLM(nnx.Module):
                   f"model.layers.{i}.self_attention_res")
             _pair(f"model.layers.{i}.mlp_res", f"model.layers.{i}.mlp_res")
         _pair("model.output_attn_res", "model.output_attn_res")
+
+        # --- KDA A_log layout migration -----------------------------------------------------
+        # sglang-jax's KimiDeltaAttention still declares A_log as (1, 1, H, 1) with
+        # P(None, None, "tensor", None) -- the OLD layout. K3's released checkpoint ships the
+        # CURRENT layout, a flat [H]. The PyTorch reference documents exactly this and accepts
+        # both (`_load_a_log`: "Load either the old [1,1,H,1] or current [H] layout").
+        #
+        # Without a reshape the loader asserts on a rank-1 tensor against a rank-4 spec:
+        #   AssertionError: (1, P(None, None, 'tensor', None))
+        # which is at least loud. The dangerous variant would be a silent broadcast.
+        for i in range(self.config.num_hidden_layers):
+            if not cfg_is_kda_layer(self.config, i):
+                continue
+            mappings[f"{self.TEXT_PREFIX}model.layers.{i}.self_attn.A_log"] = WeightMapping(
+                target_path=f"model.layers.{i}.self_attn.A_log",
+                sharding=(None, None, "tensor", None),
+                transpose=False,
+                reshape=(1, 1, -1, 1),
+            )
 
         return mappings
 
