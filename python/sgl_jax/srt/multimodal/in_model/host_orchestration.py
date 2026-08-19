@@ -230,7 +230,7 @@ def _gather_from_pool(
     pos_idx, mask = _build_pool_gather_indices(tasks, entries, pool.page_size, running.shape[0])
     return _apply_gather(
         running,
-        pool.pages.reshape(-1, pool.feature_width),
+        pool.pages.reshape(-1, pool.hidden),
         pos_idx,
         mask,
         mesh,

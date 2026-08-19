@@ -2,7 +2,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import jax.numpy as jnp
 import numpy as np
 
 from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
@@ -460,35 +459,34 @@ class TestDummyBatch(unittest.TestCase):
             precompile_in_model_multimodal=True,
         )
         model_runner = MagicMock()
+        input_embedding = object()
+        deepstack = object()
         calls = []
 
         def forward_fn(batch, **kwargs):
+            forward_batch = batch.forward_batch
             calls.append(
-                {
-                    "input_embedding": batch.forward_batch.input_embedding,
-                    "deepstack": batch.forward_batch.deepstack_visual_embedding,
-                    "apply_deepstack": batch.forward_batch.apply_for_deepstack,
-                    "skip_sample": kwargs["skip_sample"],
-                }
+                (
+                    forward_batch.input_embedding,
+                    forward_batch.deepstack_visual_embedding,
+                    forward_batch.apply_for_deepstack,
+                    kwargs["skip_sample"],
+                )
             )
 
-        def init_forward_batch(batch, _model_runner):
-            return SimpleNamespace(
-                input_ids=batch.input_ids,
-                input_embedding=None,
-                deepstack_visual_embedding=None,
-                apply_for_deepstack=False,
-            )
+        forward_batch = SimpleNamespace(
+            input_ids=object(),
+            input_embedding=None,
+            deepstack_visual_embedding=None,
+            apply_for_deepstack=False,
+        )
 
         with (
-            patch.object(ForwardBatch, "init_new", side_effect=init_forward_batch),
+            patch.object(ForwardBatch, "init_new", return_value=forward_batch),
             patch.object(
                 host_orchestration,
                 "precompile_multimodal_inputs",
-                return_value=(
-                    jnp.zeros((4, 8), jnp.bfloat16),
-                    jnp.zeros((2, 4, 8), jnp.bfloat16),
-                ),
+                return_value=(input_embedding, deepstack),
             ) as precompile_multimodal_inputs,
             patch.object(
                 SamplingMetadata,
@@ -504,18 +502,15 @@ class TestDummyBatch(unittest.TestCase):
                 future_token_ids_map=None,
             )
 
-        assert len(calls) == 2
-        assert calls[0] == {
-            "input_embedding": None,
-            "deepstack": None,
-            "apply_deepstack": False,
-            "skip_sample": False,
-        }
-        assert calls[1]["input_embedding"].shape == (4, 8)
-        assert calls[1]["deepstack"].shape == (2, 4, 8)
-        assert calls[1]["apply_deepstack"] is True
-        assert calls[1]["skip_sample"] is True
-        precompile_multimodal_inputs.assert_called_once()
+        assert calls == [
+            (None, None, False, False),
+            (input_embedding, deepstack, True, True),
+        ]
+        precompile_multimodal_inputs.assert_called_once_with(
+            forward_batch.input_ids,
+            model_runner.model,
+            model_runner.embedding_pool,
+        )
 
     def test_precompile_all_warms_multimodal_encoder_between_model_modes(self):
         cm = CompilationManager(

@@ -8,8 +8,9 @@ addressed* -- an entry is keyed by ``MultimodalDataItem.hash`` (the whole
 image / audio clip), not by token ids -- because multimodal embeddings share no
 token-level prefix.
 
-``pages`` stores the primary embedding and any deepstack planes contiguously as
-``[num_pages, page_size, (1 + deepstack_dim) * H]``.
+``pages`` stores opaque encoder output rows as
+``[num_pages, page_size, hidden]``. Any model-specific feature packing is
+already reflected in ``hidden``.
 
 Writes are performed by a ``jit``+``donate`` scatter so the large device buffer
 is updated in place (eager ``.at[].set`` would copy the whole pool per write).
@@ -76,7 +77,6 @@ class EmbeddingPool:
         hidden: int,
         dtype: jnp.dtype,
         *,
-        deepstack_dim: int = 0,
         mesh: Mesh | None = None,
     ) -> None:
         if num_pages <= 0 or page_size <= 0:
@@ -84,14 +84,12 @@ class EmbeddingPool:
         self.num_pages = num_pages
         self.page_size = page_size
         self.hidden = hidden
-        self.deepstack_dim = deepstack_dim
-        self.feature_width = hidden * (1 + deepstack_dim)
         self.mesh = mesh
 
         self._free_pages = np.arange(num_pages, dtype=np.int32)
         self._entries: OrderedDict[int, EmbeddingPoolEntry] = OrderedDict()
 
-        self._pages = self._zeros((num_pages, page_size, self.feature_width), dtype)
+        self._pages = self._zeros((num_pages, page_size, hidden), dtype)
 
     # -- buffers -----------------------------------------------------------
     @property
@@ -171,10 +169,10 @@ class EmbeddingPool:
             raise ValueError(f"mask/length count mismatch: {len(write_mask)} != {len(lengths)}")
 
         packed_embeddings = self._replicate(packed_embeddings)
-        if packed_embeddings.ndim != 2 or packed_embeddings.shape[1] != self.feature_width:
+        if packed_embeddings.ndim != 2 or packed_embeddings.shape[1] != self.hidden:
             raise ValueError(
                 "packed embeddings must have shape "
-                f"[capacity, {self.feature_width}], got {packed_embeddings.shape}"
+                f"[capacity, {self.hidden}], got {packed_embeddings.shape}"
             )
         capacity = int(packed_embeddings.shape[0])
         if any(length < 0 for length in lengths) or sum(lengths) > capacity:
@@ -216,7 +214,7 @@ class EmbeddingPool:
             raise ValueError("packed writer capacity must be positive")
         with jax.set_mesh(self.mesh) if self.mesh is not None else nullcontext():
             slots = self._replicate(np.full(capacity, -1, dtype=np.int32))
-            rows = self._zeros((capacity, self.feature_width), self._pages.dtype)
+            rows = self._zeros((capacity, self.hidden), self._pages.dtype)
             self._pages = _scatter_rows(self._pages, slots, rows)
             jax.block_until_ready(self._pages)
 

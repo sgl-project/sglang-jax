@@ -101,15 +101,13 @@ def test_write_packed_keeps_writer_shape_fixed_across_true_lengths():
     ]
 
 
-def test_write_packed_deepstack_uses_same_placement():
+def test_write_packed_preserves_wide_feature_rows():
     pool = EmbeddingPool(
         num_pages=4,
         page_size=2,
-        hidden=1,
+        hidden=3,
         dtype=jnp.float32,
-        deepstack_dim=2,
     )
-    # [cap=4, (1+D)*H=3]: primary col 0, deepstack planes cols 1..2.
     packed = jnp.asarray(
         [
             [2.0, 20.0, 21.0],
@@ -122,11 +120,9 @@ def test_write_packed_deepstack_uses_same_placement():
     (entry,) = pool.write_packed((1,), packed, (2,))
 
     assert entry is not None
-    np.testing.assert_array_equal(_read(pool, entry)[:, 0], [2, 3])
-    page0 = int(entry.page_ids[0])
     np.testing.assert_array_equal(
-        np.asarray(pool.pages[page0, :2, pool.hidden :]),
-        [[20, 21], [30, 31]],
+        _read(pool, entry),
+        [[2, 20, 21], [3, 30, 31]],
     )
 
 

@@ -753,7 +753,7 @@ def test_embedding_pool_hit_matches_miss_with_deepstack():
         def get_multimodal_encode_funcs(self):
             return {Modality.IMAGE: lambda items: output}
 
-    pool = EmbeddingPool(num_pages=4, page_size=2, hidden=1, dtype=jnp.float32, deepstack_dim=1)
+    pool = EmbeddingPool(num_pages=4, page_size=2, hidden=2, dtype=jnp.float32)
     model = Model()
     first, first_ds = host_orchestration.embed_multimodal_inputs(
         _batch([item], extend=1, per_dp_token=1),
