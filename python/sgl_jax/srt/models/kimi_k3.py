@@ -348,15 +348,42 @@ class KimiK3ForCausalLM(nnx.Module):
             if not layer.is_kda:
                 layer.self_attn.post_load_weights()
 
-    def _create_weight_mappings(self) -> dict:
-        """Reuse Kimi-Linear's mapping, then add the K3-only parameters.
+    # K3 checkpoints prefix every text parameter with `language_model.` because the release is
+    # multimodal (the same checkpoint also carries `mm_projector.*` and a vision tower). Kimi-Linear
+    # is text-only and emits bare `model.*` keys, so every inherited mapping is re-prefixed.
+    TEXT_PREFIX = "language_model."
 
-        K3 adds three AttnRes projections that Kimi-Linear has no equivalent for: two per layer
-        plus the model-level output one.
+    def _create_weight_mappings(self) -> dict:
+        """Kimi-Linear's mappings, re-prefixed, plus K3's AttnRes parameters.
+
+        Verified against the released checkpoint's index rather than inferred: the AttnRes norm and
+        proj are SIBLINGS with `_norm` / `_proj` suffixes
+        (`...layers.N.self_attention_res_norm.weight`), not a nested module, and there is a
+        model-level pair (`model.output_attn_res_{norm,proj}.weight`) on top of the two per layer.
         """
         from sgl_jax.srt.models.kimi_linear import KimiLinearForCausalLM
+        from sgl_jax.srt.utils.weight_utils import WeightMapping
 
-        mappings = KimiLinearForCausalLM._create_weight_mappings(self)
+        base = KimiLinearForCausalLM._create_weight_mappings(self)
+        mappings = {self.TEXT_PREFIX + k: v for k, v in base.items()}
+
+        if not self.config.uses_attn_res:
+            return mappings
+
+        def _pair(ckpt_stem: str, target_stem: str):
+            # norm: [hidden] RMSNorm scale, replicated. proj: [hidden, 1] scorer, replicated --
+            # sharding it would need an all-reduce to produce a single scalar per candidate.
+            mappings[f"{self.TEXT_PREFIX}{ckpt_stem}_norm.weight"] = WeightMapping(
+                target_path=f"{target_stem}.norm.scale", sharding=(None,), transpose=False)
+            mappings[f"{self.TEXT_PREFIX}{ckpt_stem}_proj.weight"] = WeightMapping(
+                target_path=f"{target_stem}.proj.weight", sharding=(None, None), transpose=True)
+
+        for i in range(self.config.num_hidden_layers):
+            _pair(f"model.layers.{i}.self_attention_res",
+                  f"model.layers.{i}.self_attention_res")
+            _pair(f"model.layers.{i}.mlp_res", f"model.layers.{i}.mlp_res")
+        _pair("model.output_attn_res", "model.output_attn_res")
+
         return mappings
 
 EntryClass = [KimiK3ForCausalLM]
