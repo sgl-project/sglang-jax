@@ -9,7 +9,18 @@ import json, pathlib, pytest
 from sgl_jax.srt.models.registry import ModelRegistry
 from sgl_jax.srt.models.kimi_k3 import KimiK3ForCausalLM, KimiK3ForConditionalGeneration
 
-CFG = pathlib.Path("/tmp/k3_config.json")
+def _resolve_config() -> pathlib.Path:
+    """The released config, from wherever the checkpoint is staged."""
+    import os
+
+    model_dir = os.environ.get("KIMI_K3_MODEL_DIR", "/dev/shm/k3_4l")
+    for candidate in (os.path.join(model_dir, "config.json"), "/tmp/k3_config.json"):
+        if pathlib.Path(candidate).exists():
+            return pathlib.Path(candidate)
+    return pathlib.Path("/nonexistent")
+
+
+CFG = _resolve_config()
 
 
 def test_top_level_arch_resolves_to_k3():
