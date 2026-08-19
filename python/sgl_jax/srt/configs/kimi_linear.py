@@ -149,11 +149,33 @@ class KimiLinearConfig(PretrainedConfig):
         return [i for i in range(self.num_hidden_layers) if not self.is_kda_layer(i)]
 
 
+def _kimi_linear_inner_config(hf_config: Any) -> Any:
+    """Return the config carrying `linear_attn_config`, looking through a text_config.
+
+    Kimi-K3 is a multimodal wrapper: its TOP-LEVEL config is model_type "kimi_k3" with
+    architectures ["KimiK3ForConditionalGeneration"], and the Kimi-Linear-family fields
+    (linear_attn_config, kda_layers, ...) live under `text_config`. The recurrent-state pool is
+    selected from the top-level config, so without looking through it K3 is not detected as a
+    hybrid recurrent model and no RecurrentStatePool is allocated -- the KDA layers then fail at
+    forward with "MemoryPools has no pool 'recurrent_state_pool'".
+    """
+    if getattr(hf_config, "linear_attn_config", None) is not None:
+        return hf_config
+    inner = getattr(hf_config, "text_config", None)
+    if inner is not None and getattr(inner, "linear_attn_config", None) is not None:
+        return inner
+    return hf_config
+
+
 def _is_kimi_linear_config(hf_config: Any) -> bool:
-    if getattr(hf_config, "model_type", None) == "kimi_linear":
-        return True
-    architectures = getattr(hf_config, "architectures", None) or []
-    return any(str(arch).startswith("KimiLinear") for arch in architectures)
+    cfg = _kimi_linear_inner_config(hf_config)
+    for c in {id(hf_config): hf_config, id(cfg): cfg}.values():
+        if getattr(c, "model_type", None) in ("kimi_linear", "kimi_k3"):
+            return True
+        for arch in getattr(c, "architectures", None) or []:
+            if str(arch).startswith(("KimiLinear", "KimiK3")):
+                return True
+    return False
 
 
 def get_kimi_linear_config(hf_config: Any) -> KimiLinearConfig | None:
@@ -165,6 +187,7 @@ def get_kimi_linear_config(hf_config: Any) -> KimiLinearConfig | None:
     """
     if not _is_kimi_linear_config(hf_config):
         return None
+    hf_config = _kimi_linear_inner_config(hf_config)
     if getattr(hf_config, "linear_attn_config", None) is None:
         return None
     if isinstance(hf_config, KimiLinearConfig):
