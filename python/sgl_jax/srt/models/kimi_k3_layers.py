@@ -163,6 +163,6 @@ class AttentionResidual(nnx.Module):
             prefix_sum,
             block_residuals,
             self.norm.scale.value,
-            self.proj.kernel.value,
+            self.proj.weight.value,   # LinearBase names its param `weight`, not `kernel`
             self.eps,
         )
