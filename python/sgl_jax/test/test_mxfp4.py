@@ -4,6 +4,8 @@ Synthetic round-trips can miss layout errors (pair order inside a byte, e8m0 bia
 group spans). The real-weight test pulls one shard of the released K3 checkpoint and checks the
 unpacked shapes and value range are consistent with the declared config.
 """
+import os
+
 import jax, jax.numpy as jnp, numpy as np, pytest
 from sgl_jax.srt.layers.quantization.mxfp4 import (
     u8_unpack_e2m1, e8m0_to_fp32, dequantize_tensor_from_mxfp4_packed,
@@ -64,16 +66,39 @@ def test_recognizes_k3_config_group_nesting():
     assert not is_mxfp4_packed_config(None)
 
 
-REAL = pytest.mark.skipif(
-    not __import__("os").path.exists("/dev/shm/k3_probe.safetensors"),
-    reason="real K3 shard not staged")
+_MODEL_DIR = os.environ.get("KIMI_K3_MODEL_DIR", "/dev/shm/k3_4l")
+
+
+def _real_shard() -> str:
+    """A staged checkpoint shard that actually contains packed MXFP4 tensors.
+
+    K3 quantizes only ``Linear`` targets, so the early shards (attention, dense MLP, shared
+    experts, lm_head) have none -- picking shard 1 would skip this test for the wrong reason.
+    Honours KIMI_K3_MODEL_DIR, falling back to the older single-shard probe path.
+    """
+    import glob as _glob
+
+    from safetensors import safe_open as _open
+
+    candidates = sorted(_glob.glob(os.path.join(_MODEL_DIR, "*.safetensors")))
+    candidates.append("/dev/shm/k3_probe.safetensors")
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
+        with _open(path, framework="np") as handle:
+            if any(k.endswith("weight_packed") for k in handle.keys()):
+                return path
+    return ""
+
+
+REAL = pytest.mark.skipif(not _real_shard(), reason="no staged K3 shard with packed tensors")
 
 
 @REAL
 def test_real_k3_shard_unpacks_consistently():
     """Unpack real K3 tensors; shapes and value range must match the declared config."""
     from safetensors import safe_open
-    f = safe_open("/dev/shm/k3_probe.safetensors", framework="np")
+    f = safe_open(_real_shard(), framework="np")
     keys = list(f.keys())
     packed = [k for k in keys if k.endswith("weight_packed")]
     # NOTE: shard 1 has NO packed tensors -- K3 leaves attention (A_log, dt_bias, q_conv1d),

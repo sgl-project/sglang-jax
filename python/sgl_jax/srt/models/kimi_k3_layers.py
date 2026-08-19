@@ -68,6 +68,24 @@ class SituAndMul(nnx.Module):
         return situ_and_mul(x, self.beta, self.linear_beta)
 
 
+def mla_output_gate(attn_output: jax.Array, gate: jax.Array) -> jax.Array:
+    """K3's MLA output gate, applied to the attention output BEFORE ``o_proj``.
+
+    Reference (``modeling_kimi_linear.py``, ``KimiMLAAttention.forward``)::
+
+        g = self.g_proj(hidden_states).sigmoid()
+        attn_output = attn_output * g
+
+    ``o_proj`` is linear, but the gate is elementwise on its INPUT, so there is no equivalent
+    place to apply it afterwards -- ordering here is load-bearing, not stylistic.
+
+    The sigmoid is taken in fp32: it saturates, and a bf16 argument near the tails rounds to
+    exactly 0 or 1, which silently drops or passes a whole head's contribution.
+    """
+    g = jax.nn.sigmoid(gate.astype(jnp.float32))
+    return (attn_output.astype(jnp.float32) * g).astype(attn_output.dtype)
+
+
 def attention_residual_apply(
     prefix_sum: jax.Array,
     block_residuals: jax.Array,

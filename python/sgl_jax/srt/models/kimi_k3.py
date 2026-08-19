@@ -28,7 +28,11 @@ from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.moe import EPMoE
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.models.kimi_k3_layers import AttentionResidual, situ_and_mul
+from sgl_jax.srt.models.kimi_k3_layers import (
+    AttentionResidual,
+    mla_output_gate,
+    situ_and_mul,
+)
 from sgl_jax.srt.models.kimi_k3_residual import initial_block_residuals
 from sgl_jax.srt.models.kimi_linear import KimiDeltaAttention
 from sgl_jax.srt.models.deepseek_v3 import DeepseekV3Attention as KimiMLAAttention
@@ -196,9 +200,7 @@ class KimiK3MLAAttention(KimiMLAAttention):
             )
 
         gate, _ = self.g_proj(hidden_states)
-        attn_output = attn_output * jax.nn.sigmoid(gate.astype(jnp.float32)).astype(
-            attn_output.dtype
-        )
+        attn_output = mla_output_gate(attn_output, gate)
 
         output, _ = self.o_proj(attn_output)
         return output, kv_fused
