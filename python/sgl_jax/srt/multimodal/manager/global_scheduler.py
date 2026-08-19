@@ -362,16 +362,10 @@ class GlobalScheduler:
                     )
             req.video_grid_thw = video_grid_thw
 
-            im_token_id = input.mm_inputs.get("im_token_id")
-            video_token_id = input.mm_inputs.get("video_token_id")
-            audio_token_id = input.mm_inputs.get("audio_token_id")
             if req.input_ids:
                 req.cache_input_ids = pad_input_tokens(
                     input_ids=list(req.input_ids),
                     mm_items=all_mm_items,
-                    im_token_id=im_token_id,
-                    video_token_id=video_token_id,
-                    audio_token_id=audio_token_id,
                 )
         if input.sampling_params is not None:
             req.extra["sampling_params"] = input.sampling_params

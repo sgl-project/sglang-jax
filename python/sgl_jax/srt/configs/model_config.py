@@ -537,11 +537,13 @@ class ModelConfig:
         Import is lazy because model modules import ModelConfig back.
         """
         from sgl_jax.srt.models.registry import ModelRegistry
+        from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
 
         try:
             model_cls, _ = ModelRegistry.resolve_model_cls(self.hf_config.architectures)
         except ValueError:
             return
+        self.is_multimodal |= issubclass(model_cls, InModelMultimodalContract)
         patch = getattr(model_cls, "patch_model_config", None)
         if patch is not None:
             patch(self)
@@ -957,6 +959,8 @@ multimodal_model_archs = [
     "LlavaQwenForCausalLM",
     "LlavaForConditionalGeneration",
     "LlavaVidForCausalLM",
+    "MiMoV2ForConditionalGeneration",
+    "MiMoV2FlashForConditionalGeneration",
     "MiniCPMO",
     "MiniCPMV",
     "Mistral3ForConditionalGeneration",
@@ -965,6 +969,9 @@ multimodal_model_archs = [
     "Qwen2AudioForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",
+    "Qwen3VLForConditionalGeneration",
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForConditionalGeneration",
     "KimiVLForConditionalGeneration",
     "InternVLChatModel",
     "Phi4MMForCausalLM",

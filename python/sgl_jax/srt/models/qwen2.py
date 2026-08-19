@@ -400,7 +400,7 @@ class Qwen2Model(nnx.Module):
         """Return the token-embedding module (callable on ``input_ids``).
 
         Upstream (HF/sglang) backbone contract; used by
-        ``general_mm_embed_routine`` to seed ``running`` once before the vision
+        ``embed_multimodal_inputs`` to seed ``running`` once before the vision
         merge. sglang-jax's ``get_embed_and_head`` returns weight ARRAYS (for
         spec-decode tie-weights), NOT a callable module, so this backbone-level
         getter provides the embed module the routine needs.
