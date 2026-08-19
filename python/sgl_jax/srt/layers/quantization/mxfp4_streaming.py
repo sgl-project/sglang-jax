@@ -1,0 +1,246 @@
+"""Stream K3's MXFP4 experts from GCS, fetching only the bytes this rank needs.
+
+Kimi-K3 is 1.42 TiB across 96 shards. sglang-jax's loader wants every shard present on local
+disk, and a ``tpu7x-standard-4t`` node has ~919 GB of tmpfs -- so the released checkpoint does not
+fit on a host *before* any sharding. That is the blocker for the full 93-layer model; HBM is not
+(experts kept in fp4 are 1,357 GiB, which fits 16 chips).
+
+Two reductions, the same two the vllm-torchtpu lane uses to serve this model today
+(``model_loader_patches.py::_sharded_runai_weights_iterator``):
+
+**Stream.** safetensors is a header plus a flat data block, and every tensor's byte range is in
+that header. So the shard never has to land on disk: read the header, then issue ranged GETs for
+exactly the tensors wanted. Peak local footprint is one tensor, not one shard and not the model.
+
+**Filter.** Under expert parallelism a rank owns ``num_experts / ep_size`` experts -- 28 of 896 at
+``ep_size=32``. The other 868 experts' ``weight_packed``/``weight_scale`` are never requested, so
+the saving is in bytes *moved*, not merely bytes retained. Everything that is not a per-expert
+tensor (dense layers, shared experts, the router, norms) is read by every rank.
+
+The vllm lane's filter and its FusedMoE expert map are derived from the same computation so they
+cannot disagree; :func:`local_expert_ids` here plays that role, and the caller is expected to use
+it for both the fetch plan and the device placement.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import struct
+from collections.abc import Iterator
+from typing import NamedTuple
+
+import numpy as np
+
+# safetensors dtype string -> numpy. Only what K3 actually ships is listed; an unknown dtype
+# should fail loudly rather than be guessed at, since a wrong width silently misreads every
+# following tensor in the range.
+_DTYPES = {
+    "U8": np.uint8,
+    "I8": np.int8,
+    "BF16": None,  # handled specially: numpy has no bfloat16
+    "F16": np.float16,
+    "F32": np.float32,
+    "I32": np.int32,
+    "I64": np.int64,
+    "BOOL": np.bool_,
+}
+
+_EXPERT_RE = re.compile(r"\.experts\.(\d+)\.")
+
+# Suffixes of PER-EXPERT tensors that may be skipped for non-local experts. Anything else --
+# dense layers, shared experts, the gate, norms -- is needed by every rank. Mirrors
+# vllm_torchtpu's _EXPERT_WEIGHT_SUFFIXES; widening this list silently drops shared state.
+EXPERT_SUFFIXES = (".weight", ".weight_packed", ".weight_scale")
+
+
+class TensorSpan(NamedTuple):
+    """Where one tensor lives inside a shard, and how to interpret it."""
+
+    name: str
+    dtype: str
+    shape: tuple[int, ...]
+    start: int  # absolute byte offset in the file
+    end: int
+
+    @property
+    def nbytes(self) -> int:
+        return self.end - self.start
+
+
+def parse_expert_id(name: str) -> int | None:
+    """The expert index in a tensor name, or None if it is not per-expert."""
+    m = _EXPERT_RE.search(name)
+    return int(m.group(1)) if m else None
+
+
+def local_expert_ids(num_experts: int, ep_size: int, ep_rank: int) -> set[int]:
+    """Contiguous-block expert assignment: rank r owns ``[r*n/ep, (r+1)*n/ep)``.
+
+    Must match whatever the model uses to place experts on devices. If the two disagree a rank
+    fetches experts it will not use and lacks ones it will -- and the resulting model still loads,
+    because the missing slots are simply zeros.
+    """
+    if num_experts % ep_size:
+        raise ValueError(f"num_experts {num_experts} not divisible by ep_size {ep_size}")
+    per = num_experts // ep_size
+    return set(range(ep_rank * per, (ep_rank + 1) * per))
+
+
+def should_skip(name: str, local_ids: set[int] | None) -> bool:
+    """True when this tensor belongs to an expert this rank does not own."""
+    if local_ids is None:
+        return False
+    expert_id = parse_expert_id(name)
+    if expert_id is None:
+        return False
+    if not name.endswith(EXPERT_SUFFIXES):
+        return False
+    return expert_id not in local_ids
+
+
+# ----------------------------------------------------------------------------------------------
+# GCS-backed shard reading
+# ----------------------------------------------------------------------------------------------
+class ShardReader:
+    """Ranged reads against one safetensors shard in GCS.
+
+    The header carries every tensor's byte range, so after one small read the shard is fully
+    addressable without downloading it.
+    """
+
+    def __init__(self, bucket: str, name: str, client=None):
+        from google.cloud import storage
+
+        self._blob = (client or storage.Client()).bucket(bucket).blob(name)
+        self.name = name
+        self._spans: dict[str, TensorSpan] | None = None
+
+    @property
+    def spans(self) -> dict[str, TensorSpan]:
+        if self._spans is None:
+            self._spans = self._read_header()
+        return self._spans
+
+    def _read_header(self) -> dict[str, TensorSpan]:
+        # 8-byte little-endian header length, then that many bytes of JSON, then the data block.
+        raw_len = self._blob.download_as_bytes(start=0, end=7)
+        (header_len,) = struct.unpack("<Q", raw_len)
+        header = json.loads(self._blob.download_as_bytes(start=8, end=8 + header_len - 1))
+        data_start = 8 + header_len
+
+        spans: dict[str, TensorSpan] = {}
+        for key, meta in header.items():
+            if key == "__metadata__":
+                continue
+            lo, hi = meta["data_offsets"]
+            spans[key] = TensorSpan(
+                name=key,
+                dtype=meta["dtype"],
+                shape=tuple(meta["shape"]),
+                start=data_start + lo,
+                end=data_start + hi,
+            )
+        return spans
+
+    def read(self, span: TensorSpan) -> np.ndarray:
+        """Fetch exactly one tensor's bytes and view them as its declared dtype/shape."""
+        if span.nbytes == 0:
+            return np.zeros(span.shape, dtype=_np_dtype(span.dtype))
+        raw = self._blob.download_as_bytes(start=span.start, end=span.end - 1)
+        return _view(raw, span)
+
+
+def _np_dtype(dtype: str):
+    if dtype not in _DTYPES:
+        raise ValueError(f"unhandled safetensors dtype {dtype!r}")
+    if dtype == "BF16":
+        # numpy has no bfloat16; keep the raw pair-of-bytes and let the caller reinterpret via
+        # jnp/ml_dtypes. Returning float32 here would silently double every value's width.
+        return np.uint16
+    return _DTYPES[dtype]
+
+
+def _view(raw: bytes, span: TensorSpan) -> np.ndarray:
+    arr = np.frombuffer(raw, dtype=_np_dtype(span.dtype))
+    return arr.reshape(span.shape)
+
+
+# ----------------------------------------------------------------------------------------------
+# Fetch planning
+# ----------------------------------------------------------------------------------------------
+class FetchPlan(NamedTuple):
+    """What a rank will read, and what it will not."""
+
+    spans: list[TensorSpan]
+    kept_bytes: int
+    skipped_tensors: int
+    skipped_bytes: int
+
+    def summary(self) -> str:
+        total = self.kept_bytes + self.skipped_bytes
+        pct = (100.0 * self.kept_bytes / total) if total else 100.0
+        return (
+            f"{len(self.spans)} tensors / {self.kept_bytes / 1e9:.1f} GB kept; "
+            f"{self.skipped_tensors} tensors / {self.skipped_bytes / 1e9:.1f} GB skipped "
+            f"({pct:.1f}% of shard bytes fetched)"
+        )
+
+
+def plan_fetch(
+    reader: ShardReader,
+    local_ids: set[int] | None = None,
+    want: "callable | None" = None,
+) -> FetchPlan:
+    """Decide which of a shard's tensors this rank reads.
+
+    ``want`` is an optional extra predicate on the tensor name, so a caller that only needs, say,
+    the MoE experts does not pay for the rest of the shard either.
+    """
+    spans, kept_bytes, skipped_n, skipped_bytes = [], 0, 0, 0
+    for span in reader.spans.values():
+        if should_skip(span.name, local_ids) or (want is not None and not want(span.name)):
+            skipped_n += 1
+            skipped_bytes += span.nbytes
+            continue
+        spans.append(span)
+        kept_bytes += span.nbytes
+    spans.sort(key=lambda s: s.start)  # sequential order: friendlier to object storage
+    return FetchPlan(spans, kept_bytes, skipped_n, skipped_bytes)
+
+
+def stream_shard(
+    reader: ShardReader,
+    local_ids: set[int] | None = None,
+    want: "callable | None" = None,
+) -> Iterator[tuple[str, np.ndarray]]:
+    """Yield ``(name, array)`` for the tensors this rank keeps, one at a time.
+
+    One tensor is resident at a time, so peak local footprint is a single tensor (~16 MB for a K3
+    expert projection) rather than a shard (~15 GB) or the model (1.42 TiB). The caller is
+    expected to move each array onto a device and drop it before requesting the next.
+    """
+    plan = plan_fetch(reader, local_ids, want)
+    for span in plan.spans:
+        yield span.name, reader.read(span)
+
+
+def parse_gs_uri(uri: str) -> tuple[str, str]:
+    """``gs://bucket/prefix`` -> ``(bucket, prefix)``; prefix has no leading or trailing slash."""
+    if not uri.startswith("gs://"):
+        raise ValueError(f"not a gs:// URI: {uri!r}")
+    bucket, _, prefix = uri[len("gs://"):].partition("/")
+    return bucket, prefix.strip("/")
+
+
+def list_shards(bucket: str, prefix: str, client=None) -> list[str]:
+    """Every ``*.safetensors`` object under a prefix, in name order."""
+    from google.cloud import storage
+
+    client = client or storage.Client()
+    names = [
+        b.name
+        for b in client.list_blobs(bucket, prefix=f"{prefix}/")
+        if b.name.endswith(".safetensors")
+    ]
+    return sorted(names)
