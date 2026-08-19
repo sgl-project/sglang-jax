@@ -21,6 +21,7 @@ import os
 import logging
 
 import jax
+import numpy as np
 import jax.numpy as jnp
 from flax import nnx
 
@@ -250,6 +251,36 @@ class KimiK3MLP(nnx.Module):
             act = jax.nn.silu(gate) * up
         out, _ = self.down_proj(act)
         return out
+
+
+def _local_expert_range(moe, num_experts: int) -> range:
+    """Experts this PROCESS must read, from the MoE's own expert-axis sharding.
+
+    Derived from the mesh rather than recomputed, so the fetch plan and the device placement
+    cannot drift apart -- a mismatch loads cleanly and leaves the missing experts as zeros, which
+    is a wrong model that runs.
+    """
+    mesh = getattr(moe, "moe_mesh", None)
+    ep_size = int(getattr(moe, "ep_size", 1) or 1)
+    if mesh is None or ep_size <= 1:
+        return range(num_experts)
+
+    try:
+        axis = mesh.axis_names.index("expert")
+    except (AttributeError, ValueError):
+        return range(num_experts)
+
+    # which positions along the expert axis have a device in THIS process
+    local = {
+        int(idx[axis])
+        for idx, device in np.ndenumerate(mesh.devices)
+        if device in mesh.devices.flat and device.process_index == jax.process_index()
+    }
+    if not local:
+        return range(num_experts)
+    per = num_experts // ep_size
+    lo, hi = min(local) * per, (max(local) + 1) * per
+    return range(lo, hi)
 
 
 class KimiK3EPMoE(EPMoE):
@@ -745,6 +776,26 @@ class KimiK3ForCausalLM(nnx.Module):
                     if param is None:
                         continue
                     stack, scale_stack = [], []
+                    base_fmt = (
+                        f"{self.TEXT_PREFIX}model.layers.{li}.block_sparse_moe.experts.{{e}}.{proj}"
+                    )
+
+                    # Only the experts some LOCAL device owns. On a single-process pod that is
+                    # all of them -- every device is addressable here, so nothing is saved. The
+                    # reduction is realized across hosts: at ep_size=32 over 4 hosts, each
+                    # process owns 8 of 32 expert groups, i.e. 224 of 896 experts, and never
+                    # requests the other 672.
+                    wanted_experts = _local_expert_range(moe, num_experts)
+
+                    # One round trip per tensor is ~5.4k requests at 4 layers and ~165k at 93, so
+                    # prefetch each (layer, projection) group concurrently and let the latency
+                    # overlap. Grouped, not global: prefetching everything would rebuild the
+                    # local copy that streaming exists to avoid.
+                    source.prefetch(
+                        [f"{base_fmt.format(e=e)}.{suffix}"
+                         for e in wanted_experts
+                         for suffix in ("weight_packed", "weight_scale")]
+                    )
                     for e in range(num_experts):
                         base = (
                             f"{self.TEXT_PREFIX}model.layers.{li}"
