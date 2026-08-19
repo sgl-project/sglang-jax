@@ -1269,12 +1269,14 @@ def _build_verify(topk: int):
             jnp.full_like(target_forward_batch.seq_lens, speculative_num_draft_tokens),
             jnp.zeros_like(target_forward_batch.seq_lens),
         ).astype(jnp.int32)
+        _extend_lens_2d = prepared_extend_seq_lens.reshape(dp_size, target_bs // dp_size)
+        _ext_sh = jax.typeof(_extend_lens_2d).sharding
+        if isinstance(_ext_sh, NamedSharding) and not _ext_sh.mesh.empty:
+            _extend_lens_2d = jax.sharding.reshard(
+                _extend_lens_2d, NamedSharding(_ext_sh.mesh, P())
+            )
         prepared_logits_indices = (
-            jnp.cumsum(
-                prepared_extend_seq_lens.reshape(dp_size, target_bs // dp_size),
-                axis=1,
-            ).reshape(-1)
-            - 1
+            jnp.cumsum(_extend_lens_2d, axis=1).reshape(-1) - 1
         ).astype(jnp.int32)
         prepared_sel_pos = prepared.sel_pos
         prepared_sel_pos_data = prepared.sel_pos
