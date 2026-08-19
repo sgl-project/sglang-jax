@@ -107,6 +107,15 @@ class DecodeTransferContext:
     direct_commit: Callable[[Mapping[str, object] | None], None] | None = None
 
 
+@dataclass(frozen=True)
+class DecodeMetadataContext:
+    req_id: str
+    transfer_id: str
+    bootstrap_room: int | None
+    prefill_dp_rank: int
+    peer_info: Mapping[str, object]
+
+
 class AdmissionState(enum.Enum):
     ADMITTED = "admitted"
     DEFERRED = "deferred"
@@ -137,6 +146,8 @@ class TransferBackend(Protocol):
     def prepare_prefill_batch(self, kv_buffers: Any) -> None: ...
 
     def start_prefill(self, context: PrefillTransferContext) -> PrefillTransfer: ...
+
+    def poll_decode_metadata(self, context: DecodeMetadataContext) -> bool: ...
 
     def try_start_decode(self, context: DecodeTransferContext) -> DecodeAdmission: ...
 

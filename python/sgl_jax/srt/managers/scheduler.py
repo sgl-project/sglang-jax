@@ -1906,7 +1906,9 @@ class Scheduler(
             if sender is not None:
                 # A peer may still be pulling this transport ID. Keep the
                 # producer and its pages owned while scheduling is paused, then
-                # resume the same chunk stream after continue_generation.
+                # resume the same chunk stream after continue_generation. The
+                # transfer reaper still bounds this drain by its ack/producer
+                # watchdogs, so an unusually long pause can finish as FAILED.
                 continue
             if id(req) in retracted_request_ids:
                 assert self._pending_chunked_abort_reqs[dp_rank] is None

@@ -20,6 +20,7 @@ from sgl_jax.raiden import raiden_requested
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
 from sgl_jax.srt.disaggregation.base.transfer import (
     AdmissionState,
+    DecodeMetadataContext,
     DecodeTransferContext,
     chunk_transfer_id,
     parse_chunk_transfer_id,
@@ -66,6 +67,27 @@ class _FakeBootstrap:
     def get_transfer_info(self, _room: int, **_kwargs):
         self.get_calls += 1
         return self.transfer_info
+
+
+def _prepare_decode_metadata(manager, context, timeout=1.0):
+    metadata_context = DecodeMetadataContext(
+        req_id=context.req_id,
+        transfer_id=context.transfer_id,
+        bootstrap_room=context.bootstrap_room,
+        prefill_dp_rank=context.prefill_dp_rank,
+        peer_info=context.peer_info,
+    )
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if manager.poll_decode_metadata(metadata_context):
+            return
+        time.sleep(0.001)
+    raise AssertionError("decode metadata did not become ready")
+
+
+def _start_decode(manager, context):
+    _prepare_decode_metadata(manager, context)
+    return manager.try_start_decode(context)
 
 
 class _FakeRaiden:
@@ -520,6 +542,134 @@ def test_raiden_chunk_metadata_lookup_never_blocks_receiver_poll():
         assert bootstrap.lookup_started.wait(timeout=1.0)
     finally:
         bootstrap.release_lookup.set()
+
+
+def test_raiden_decode_admission_metadata_lookup_never_blocks_scheduler():
+    class _BlockingBootstrap(_FakeBootstrap):
+        def __init__(self):
+            super().__init__()
+            self.lookup_started = threading.Event()
+            self.release_lookup = threading.Event()
+
+        def get_transfer_info(self, _room: int, **_kwargs):
+            self.get_calls += 1
+            self.lookup_started.set()
+            assert self.release_lookup.wait(timeout=1.0)
+            return self.transfer_info
+
+    bootstrap = _BlockingBootstrap()
+    bootstrap.transfer_info = {
+        "transfer_id": "wire-admission-nonblocking",
+        "transport_metadata": {"remote_block_ids": [1]},
+    }
+    manager = _manager(_FakeRaiden(), bootstrap)
+    context = DecodeMetadataContext(
+        req_id="req-admission-nonblocking",
+        transfer_id="wire-admission-nonblocking",
+        bootstrap_room=92,
+        prefill_dp_rank=0,
+        peer_info={},
+    )
+
+    try:
+        started_at = time.monotonic()
+        ready = manager.poll_decode_metadata(context)
+        elapsed = time.monotonic() - started_at
+
+        assert not ready
+        assert elapsed < 0.1
+        assert bootstrap.lookup_started.wait(timeout=1.0)
+    finally:
+        bootstrap.release_lookup.set()
+
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        if manager.poll_decode_metadata(context):
+            break
+        time.sleep(0.001)
+    else:
+        raise AssertionError("admission metadata lookup did not finish")
+    assert bootstrap.get_calls == 1
+
+
+@pytest.mark.parametrize("raise_lookup", [False, True])
+def test_raiden_decode_admission_metadata_failures_back_off(raise_lookup):
+    class _RetryBootstrap(_FakeBootstrap):
+        def get_transfer_info(self, _room: int, **_kwargs):
+            self.get_calls += 1
+            if raise_lookup:
+                raise RuntimeError("bootstrap unavailable")
+            return None
+
+    bootstrap = _RetryBootstrap()
+    manager = _manager(_FakeRaiden(), bootstrap)
+    context = DecodeMetadataContext(
+        req_id="req-admission-backoff",
+        transfer_id="wire-admission-backoff",
+        bootstrap_room=93,
+        prefill_dp_rank=0,
+        peer_info={},
+    )
+    key = manager._decode_metadata_key(93, 0, 0, "wire-admission-backoff")
+
+    assert not manager.poll_decode_metadata(context)
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        manager.poll_decode_metadata(context)
+        with manager._decode_metadata_lock:
+            lookup = manager._decode_metadata[key]
+            completed = lookup.future is None and lookup.next_poll_at > time.monotonic()
+        if completed:
+            break
+        time.sleep(0.001)
+    else:
+        raise AssertionError("failed metadata lookup was not processed")
+
+    for _ in range(10):
+        assert not manager.poll_decode_metadata(context)
+    assert bootstrap.get_calls == 1
+    assert lookup.poll_interval >= 2 * 0.01
+
+
+@pytest.mark.parametrize("raise_lookup", [False, True])
+def test_raiden_chunk_receiver_metadata_failures_back_off(raise_lookup):
+    class _RetryBootstrap(_FakeBootstrap):
+        def get_transfer_info(self, _room: int, **_kwargs):
+            self.get_calls += 1
+            if raise_lookup:
+                raise RuntimeError("bootstrap unavailable")
+            return None
+
+    bootstrap = _RetryBootstrap()
+    first = _chunk_record("wire-receiver-backoff", 0, [1], page_offset=0)
+    receiver = _chunk_manager(_FakeRaiden(), bootstrap).create_receiver("req-receiver-backoff")
+    receiver.init(
+        RaidenChunkedMetadata(
+            base_uuid="wire-receiver-backoff",
+            remote_endpoint="10.0.0.1:7777",
+            local_block_ids=(9, 10),
+            bootstrap_room=94,
+            jax_process_index=0,
+            prefill_dp_rank=0,
+            decode_dp_rank=0,
+            initial_chunks={0: first},
+            expected_total_pages=2,
+        )
+    )
+
+    assert receiver.poll() == KVPoll.TRANSFERRING
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        receiver.poll()
+        if receiver._metadata_future is None and receiver._metadata_poll_interval > 0.01:
+            break
+        time.sleep(0.001)
+    else:
+        raise AssertionError("failed receiver metadata lookup was not processed")
+
+    for _ in range(10):
+        assert receiver.poll() == KVPoll.TRANSFERRING
+    assert bootstrap.get_calls == 1
 
 
 def test_raiden_chunk_receiver_skips_lookup_when_all_metadata_is_known():
@@ -979,7 +1129,7 @@ def test_raiden_manager_owns_decode_admission_and_endpoint_mapping():
         spec_factory=lambda: None,
     )
 
-    admission = manager.try_start_decode(context)
+    admission = _start_decode(manager, context)
 
     assert admission.state == AdmissionState.ADMITTED
     assert admission.receiver is not None
@@ -1019,7 +1169,7 @@ def test_raiden_chunk_decode_admission_starts_from_chunk_zero_metadata():
         spec_factory=lambda: None,
     )
 
-    admission = manager.try_start_decode(context)
+    admission = _start_decode(manager, context)
 
     assert admission.state == AdmissionState.ADMITTED
     assert admission.receiver.poll() == KVPoll.TRANSFERRING
@@ -1054,6 +1204,7 @@ def test_raiden_chunk_decode_admission_rejects_total_page_mismatch():
         spec_factory=lambda: None,
     )
 
+    _prepare_decode_metadata(manager, context)
     with pytest.raises(ValueError, match="total block count mismatch"):
         manager.try_start_decode(context)
 
@@ -1075,7 +1226,8 @@ def test_raiden_manager_routes_all_dp4_prefill_decode_pairs(prefill_dp_rank, dec
     manager = _manager(raiden, bootstrap)
     prefill_endpoints = raiden.endpoints_by_dp_rank[prefill_dp_rank]
 
-    admission = manager.try_start_decode(
+    admission = _start_decode(
+        manager,
         DecodeTransferContext(
             req_id="req-cross",
             transfer_id="wire-cross",
@@ -1096,7 +1248,7 @@ def test_raiden_manager_routes_all_dp4_prefill_decode_pairs(prefill_dp_rank, dec
             page_size=2,
             prompt_tokens=2,
             spec_factory=lambda: None,
-        )
+        ),
     )
 
     assert admission.state == AdmissionState.ADMITTED
@@ -1118,24 +1270,24 @@ def test_raiden_manager_rejects_peer_without_endpoint_descriptors():
     }
     manager = _manager(raiden, bootstrap)
 
+    context = DecodeTransferContext(
+        req_id="req-legacy",
+        transfer_id="wire-legacy",
+        bootstrap_room=47,
+        decode_dp_rank=0,
+        prefill_dp_rank=0,
+        peer_info={
+            "host": "10.0.0.1",
+            "local_control_port": 7777,
+        },
+        kv_indices=[18, 19],
+        page_size=2,
+        prompt_tokens=2,
+        spec_factory=lambda: None,
+    )
+    _prepare_decode_metadata(manager, context)
     with pytest.raises(ValueError, match="endpoint descriptors"):
-        manager.try_start_decode(
-            DecodeTransferContext(
-                req_id="req-legacy",
-                transfer_id="wire-legacy",
-                bootstrap_room=47,
-                decode_dp_rank=0,
-                prefill_dp_rank=0,
-                peer_info={
-                    "host": "10.0.0.1",
-                    "local_control_port": 7777,
-                },
-                kv_indices=[18, 19],
-                page_size=2,
-                prompt_tokens=2,
-                spec_factory=lambda: None,
-            )
-        )
+        manager.try_start_decode(context)
 
 
 def test_raiden_preserves_published_shard_endpoints():
@@ -1155,7 +1307,8 @@ def test_raiden_preserves_published_shard_endpoints():
         {"endpoint": "10.0.0.1:7013", "shards": [1, 3]},
     ]
 
-    admission = manager.try_start_decode(
+    admission = _start_decode(
+        manager,
         DecodeTransferContext(
             req_id="req-shards",
             transfer_id="wire-shards",
@@ -1170,7 +1323,7 @@ def test_raiden_preserves_published_shard_endpoints():
             page_size=2,
             prompt_tokens=2,
             spec_factory=lambda: None,
-        )
+        ),
     )
 
     assert admission.receiver is not None
@@ -1194,7 +1347,8 @@ def test_raiden_manager_preserves_each_published_endpoint_port_and_shards():
         "transport_metadata": {"remote_block_ids": [1]},
     }
     manager = _manager(raiden, bootstrap)
-    admission = manager.try_start_decode(
+    admission = _start_decode(
+        manager,
         DecodeTransferContext(
             req_id="req-endpoints",
             transfer_id="wire-endpoints",
@@ -1214,7 +1368,7 @@ def test_raiden_manager_preserves_each_published_endpoint_port_and_shards():
             page_size=2,
             prompt_tokens=2,
             spec_factory=lambda: None,
-        )
+        ),
     )
     assert admission.receiver.poll() == KVPoll.TRANSFERRING
     remote = raiden.started[-1][0][2]

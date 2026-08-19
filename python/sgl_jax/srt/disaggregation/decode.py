@@ -17,6 +17,7 @@ from jax.sharding import NamedSharding, PartitionSpec
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll, KVReceiver
 from sgl_jax.srt.disaggregation.base.transfer import (
     AdmissionState,
+    DecodeMetadataContext,
     DecodeTransferContext,
     TransferBackend,
 )
@@ -570,6 +571,19 @@ class SchedulerDisaggregationDecodeMixin:
                 capacity_blocked_ranks.add(decode_dp_rank)
                 continue
 
+            metadata_ready = self.disagg_kv_manager.poll_decode_metadata(
+                DecodeMetadataContext(
+                    req_id=entry.req.rid,
+                    transfer_id=get_disagg_transport_id(entry.req),
+                    bootstrap_room=entry.req.bootstrap_room,
+                    prefill_dp_rank=prefill_dp_rank,
+                    peer_info=entry.p_info or {},
+                )
+            )
+            if not metadata_ready:
+                self._expire_decode_prealloc(entry)
+                continue
+
             kv_indices = allocator.alloc(page_aligned, dp_rank=decode_dp_rank)
             if kv_indices is None:
                 capacity_blocked_ranks.add(decode_dp_rank)
@@ -606,11 +620,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             if admission.state == AdmissionState.DEFERRED:
                 self._release_decode_kv_indices(kv_indices, decode_dp_rank)
-                timeout_s = self.server_args.disaggregation_pull_timeout_seconds
-                if timeout_s > 0 and time.monotonic() - entry.created_at >= timeout_s:
-                    self.disagg_prealloc_queue.remove(entry.req_id)
-                    self._record_decode_transfer_failure("metadata_timeout")
-                    self._abort_decode_request(entry.req, "metadata_timeout")
+                self._expire_decode_prealloc(entry)
                 continue
 
             receiver = admission.receiver
@@ -625,6 +635,14 @@ class SchedulerDisaggregationDecodeMixin:
             self.disagg_transfer_queue.add(entry)
             admitted += 1
             admitted_per_dp[decode_dp_rank] += 1
+
+    def _expire_decode_prealloc(self: Scheduler, entry: DecodeBookkeeping) -> None:
+        timeout_s = self.server_args.disaggregation_pull_timeout_seconds
+        if timeout_s <= 0 or time.monotonic() - entry.created_at < timeout_s:
+            return
+        self.disagg_prealloc_queue.remove(entry.req_id)
+        self._record_decode_transfer_failure("metadata_timeout")
+        self._abort_decode_request(entry.req, "metadata_timeout")
 
     # ------------------------------------------------------------------
     # Overridable / test-friendly hooks

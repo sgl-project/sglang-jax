@@ -440,7 +440,7 @@ class SchedulerDisaggregationPrefillMixin:
         req_id = req.rid
         sender = req.disagg_chunk_sender
         if sender is not None and sender.has_pending_failure:
-            self._retire_failed_chunk_producer(req)
+            self._retire_chunk_producer_ownership(req)
             return
 
         end = len(req.fill_ids)
@@ -460,7 +460,7 @@ class SchedulerDisaggregationPrefillMixin:
                 )
             else:
                 sender.fail(reason="chunk_cursor")
-            self._retire_failed_chunk_producer(req)
+            self._retire_chunk_producer_ownership(req)
             return
 
         created_sender = False
@@ -516,7 +516,7 @@ class SchedulerDisaggregationPrefillMixin:
             if sender.has_started_chunks:
                 sender.fail(reason="chunk_handoff")
                 self._ensure_chunk_sender_queued(req, sender)
-                self._retire_failed_chunk_producer(req)
+                self._retire_chunk_producer_ownership(req)
             else:
                 with suppress(Exception):
                     sender.abort()
@@ -528,7 +528,7 @@ class SchedulerDisaggregationPrefillMixin:
                     f"Prefill chunk handoff failed for req_id={req_id!r}: {exc}",
                     metric_reason="sender_init",
                 )
-                self._retire_failed_chunk_producer(req)
+                self._retire_chunk_producer_ownership(req)
             return
 
         req.start_send_idx = end
@@ -551,7 +551,7 @@ class SchedulerDisaggregationPrefillMixin:
             req=req,
         )
 
-    def _retire_failed_chunk_producer(self: Scheduler, req: Req) -> None:
+    def _retire_chunk_producer_ownership(self: Scheduler, req: Req) -> None:
         dp_rank = int(req.dp_rank)
         if self.chunked_reqs[dp_rank] is req:
             self.chunked_reqs[dp_rank] = None
@@ -704,6 +704,12 @@ class SchedulerDisaggregationPrefillMixin:
             logger.warning("Ignoring stale prefill sender callback for req_id=%s", req.rid)
             sender.clear()
             return
+
+        if req.disagg_chunk_sender is sender:
+            # The terminal callback is the single resource-release choke point
+            # for asynchronous read failures. Retire every scheduler owner
+            # before the request slot and KV pages become reusable.
+            self._retire_chunk_producer_ownership(req)
 
         try:
             state = sender.poll()

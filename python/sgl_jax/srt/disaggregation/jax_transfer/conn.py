@@ -32,6 +32,7 @@ from sgl_jax.srt.disaggregation.base.kv_manager import (
 )
 from sgl_jax.srt.disaggregation.base.transfer import (
     DecodeAdmission,
+    DecodeMetadataContext,
     DecodeTransferContext,
     PrefillTransfer,
     PrefillTransferContext,
@@ -250,6 +251,10 @@ class JaxTransferKVManager(CommonKVManager):
                 receiver.fail(reason="receiver_init")
             raise
         return DecodeAdmission.admitted(receiver)
+
+    def poll_decode_metadata(self, context: DecodeMetadataContext) -> bool:
+        del context
+        return True
 
     def cleanup_transfer(
         self,

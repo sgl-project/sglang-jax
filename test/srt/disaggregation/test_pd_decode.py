@@ -417,6 +417,12 @@ class _KVManager:
     def __init__(self, raise_on_init=False):
         self._raise = raise_on_init
         self.created = []
+        self.metadata_ready = True
+        self.metadata_polls = []
+
+    def poll_decode_metadata(self, context):
+        self.metadata_polls.append(context)
+        return self.metadata_ready
 
     def create_receiver(self, rid):
         r = _Receiver(raise_on_init=self._raise)
@@ -433,6 +439,7 @@ class _AdmServerArgs:
     def __init__(self, reserved, max_inflight=0):
         self.disaggregation_num_reserved_decode_tokens = reserved
         self.disaggregation_max_inflight_transfers = max_inflight
+        self.disaggregation_pull_timeout_seconds = 30.0
         self.enable_request_time_stats_logging = False
 
 
@@ -453,6 +460,7 @@ class _Batch:
 
 class _AdmScheduler:
     _admit_decode_prealloc = SchedulerDisaggregationDecodeMixin._admit_decode_prealloc
+    _expire_decode_prealloc = SchedulerDisaggregationDecodeMixin._expire_decode_prealloc
 
     def __init__(
         self,
@@ -537,6 +545,19 @@ def test_admit_when_capacity_sufficient():
     assert len(sched.disagg_prealloc_queue) == 0
     assert len(sched.disagg_transfer_queue) == 2
     assert sched.aborted == []
+
+
+def test_metadata_pending_does_not_allocate_decode_kv():
+    sched = _AdmScheduler(capacity=100, reserved=0)
+    sched.disagg_kv_manager.metadata_ready = False
+    _enqueue(sched, "pending", seqlen=4)
+
+    sched._admit_decode_prealloc()
+
+    assert len(sched.disagg_prealloc_queue) == 1
+    assert len(sched.disagg_transfer_queue) == 0
+    assert sched.token_to_kv_pool_allocator.alloc_ranks == []
+    assert len(sched.disagg_kv_manager.metadata_polls) == 1
 
 
 def test_admission_routes_allocator_and_transfer_to_decode_and_prefill_ranks():
@@ -750,6 +771,58 @@ def test_cancelled_terminal_transfer_releases_decode_rank_pages():
     sched.process_decode_queue()
 
     assert sched.released == [([12, 13, 14, 15], 3)]
+
+
+def test_paused_decode_drains_inflight_transfer_to_completion():
+    class _Receiver:
+        def commit(self, install):
+            install("received-kv")
+
+    class _PausedDrainScheduler:
+        _drain_decode_transfer_terminals = (
+            SchedulerDisaggregationDecodeMixin._drain_decode_transfer_terminals
+        )
+
+        def __init__(self, entry):
+            self._engine_paused = True
+            self.entry = entry
+            self.installed = []
+            self.bookkept = []
+            self.enqueued = []
+            self.server_args = SimpleNamespace(enable_request_time_stats_logging=False)
+
+        def _drain_transfer_queue_synced(self):
+            return [self.entry]
+
+        def _install_received_kv(self, req, kv_indices, kv):
+            self.installed.append((req, kv_indices, kv))
+
+        def _set_decode_bookkeeping(self, req, kv_indices):
+            self.bookkept.append((req, kv_indices))
+
+        def _enqueue_for_decode(self, req):
+            self.enqueued.append(req)
+
+        def _pd_mark_time(self, req, name):
+            pass
+
+    req = _AdmReq("paused-drain", 4)
+    req.pd_time_stats = None
+    entry = DecodeBookkeeping(
+        req_id=req.rid,
+        req=req,
+        receiver=_Receiver(),
+        kv_indices=[4, 5, 6, 7],
+        synced_state=KVPoll.SUCCESS,
+    )
+    sched = _PausedDrainScheduler(entry)
+
+    sched._drain_decode_transfer_terminals()
+
+    assert sched._engine_paused is True
+    assert sched.installed == [(req, [4, 5, 6, 7], "received-kv")]
+    assert sched.bookkept == [(req, [4, 5, 6, 7])]
+    assert sched.enqueued == [req]
 
 
 def test_inflight_cap_is_partitioned_per_rank_without_cross_rank_head_of_line():

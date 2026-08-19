@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
+from sgl_jax.srt.disaggregation.prefill import PrefillBootstrapQueue
 from sgl_jax.srt.managers.io_struct import AbortReq, PauseGenerationReqInput
 from sgl_jax.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sgl_jax.srt.managers.scheduler import GenerationBatchResult, Scheduler
@@ -139,7 +140,7 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
         scheduler, _ = self._make_scheduler(req, active_reqs=req)
         scheduler._pending_chunked_abort_reqs[0] = req
 
-        scheduler._retire_failed_chunk_producer(req)
+        scheduler._retire_chunk_producer_ownership(req)
 
         self.assertEqual(scheduler.chunked_reqs, [None])
         self.assertEqual(scheduler._pending_chunked_abort_reqs, [None])
@@ -147,6 +148,37 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
 
         scheduler._sync_chunked_req_owners()
         self.assertEqual(scheduler.chunked_reqs, [None])
+
+    def test_terminal_chunk_failure_retires_owner_before_resource_release(self):
+        req = self._make_req("failed-read", [1, 2, 3], [10, 11])
+        req.bootstrap_room = 91
+        sender = SimpleNamespace(
+            poll=Mock(return_value=KVPoll.FAILED),
+            clear=Mock(),
+            failure_exception=Mock(),
+        )
+        req.disagg_chunk_sender = sender
+        scheduler, cached = self._make_scheduler(req, active_reqs=req)
+        scheduler.pd = "prefill"
+        scheduler.server_args = SimpleNamespace(enable_request_time_stats_logging=False)
+        scheduler._pending_chunked_abort_reqs[0] = req
+
+        def assert_ownership_retired(released_req):
+            self.assertIs(released_req, req)
+            self.assertIsNone(scheduler.chunked_reqs[0])
+            self.assertIsNone(scheduler._pending_chunked_abort_reqs[0])
+            self.assertIsNone(scheduler.last_batch.reqs_info[0].chunked_req)
+
+        scheduler._release_prefill_req_resources = Mock(side_effect=assert_ownership_retired)
+
+        scheduler._on_prefill_transfer_terminal(req, sender)
+
+        scheduler._sync_chunked_req_owners()
+        self.assertEqual(scheduler._prepare_chunked_reqs_to_exclude(), {})
+        self.assertEqual(cached, [])
+        scheduler._release_prefill_req_resources.assert_called_once_with(req)
+        sender.clear.assert_called_once_with()
+        self.assertIsNone(req.disagg_chunk_sender)
 
     def test_restoring_one_dp_rank_preserves_the_other_rank_owner(self):
         req0 = self._make_req("rank-0", [1, 2, 3], [10, 11], dp_rank=0)
@@ -292,6 +324,53 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
 
         scheduler.disagg_prefill_queue.retract_all.assert_not_called()
         scheduler.disagg_transfer_queue.retract_all.assert_not_called()
+
+    def test_retract_keeps_prefill_chunk_draining_to_terminal(self):
+        req = self._make_req("pd-retract-drain", [1, 2, 3], [10, 11])
+        req.bootstrap_room = 92
+        req.disagg_transfer_id = "wire-pd-retract-drain"
+
+        class _Sender:
+            def __init__(self):
+                self.state = KVPoll.TRANSFERRING
+                self.clear = Mock()
+
+            def poll(self):
+                return self.state
+
+        sender = _Sender()
+        req.disagg_chunk_sender = sender
+        scheduler, _ = self._make_scheduler(req, active_reqs=req)
+        scheduler.pd = "prefill"
+        scheduler.server_args = SimpleNamespace(enable_request_time_stats_logging=False)
+        scheduler.disagg_prefill_queue = PrefillBootstrapQueue()
+        scheduler._release_prefill_req_resources = Mock()
+        scheduler.disagg_prefill_queue.add(
+            req.rid,
+            sender,
+            req=req,
+            on_terminal=lambda: scheduler._on_prefill_transfer_terminal(req, sender),
+        )
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+        self.assertTrue(scheduler._engine_paused)
+        self.assertEqual(len(scheduler.disagg_prefill_queue), 1)
+        self.assertEqual(req.disagg_transport_id, "wire-pd-retract-drain")
+
+        scheduler.send_kv_chunk()
+        scheduler._release_prefill_req_resources.assert_not_called()
+
+        sender.state = KVPoll.SUCCESS
+        scheduler.send_kv_chunk()
+
+        self.assertEqual(len(scheduler.disagg_prefill_queue), 0)
+        scheduler._release_prefill_req_resources.assert_called_once_with(req)
+        self.assertIsNone(req.disagg_chunk_sender)
+        self.assertIsNone(scheduler.chunked_reqs[0])
+        self.assertEqual(req.disagg_transport_id, "wire-pd-retract-drain")
+
+        scheduler.continue_generation(SimpleNamespace())
+        self.assertFalse(scheduler._engine_paused)
 
     def test_pending_abort_chunk_is_not_rescheduled(self):
         req = self._make_req("inflight", [1, 2], [10, 11])

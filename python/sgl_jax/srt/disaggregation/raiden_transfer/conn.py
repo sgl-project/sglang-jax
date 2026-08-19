@@ -22,6 +22,7 @@ from sgl_jax.srt.disaggregation.base.kv_manager import (
 )
 from sgl_jax.srt.disaggregation.base.transfer import (
     DecodeAdmission,
+    DecodeMetadataContext,
     DecodeTransferContext,
     PrefillTransfer,
     PrefillTransferContext,
@@ -38,12 +39,12 @@ from sgl_jax.srt.disaggregation.raiden_transfer.wrapper import RaidenTransferWra
 
 logger = logging.getLogger(__name__)
 
-_CHUNK_METADATA_EXECUTOR = ThreadPoolExecutor(
+_METADATA_EXECUTOR = ThreadPoolExecutor(
     max_workers=8,
-    thread_name_prefix="RaidenChunkMetadata",
+    thread_name_prefix="RaidenMetadata",
 )
-_CHUNK_METADATA_MIN_POLL_SECONDS = 0.01
-_CHUNK_METADATA_MAX_POLL_SECONDS = 0.05
+_METADATA_MIN_POLL_SECONDS = 0.01
+_METADATA_MAX_POLL_SECONDS = 0.05
 _CHUNK_PRODUCER_TIMEOUT_SECONDS = 300.0
 
 
@@ -179,6 +180,14 @@ class _PendingSenderChunk:
     on_ready: Callable[[], None] | None = None
 
 
+@dataclass
+class _DecodeMetadataLookup:
+    future: Future | None = None
+    info: object | None = None
+    next_poll_at: float = 0.0
+    poll_interval: float = _METADATA_MIN_POLL_SECONDS
+
+
 def _normalize_transfer_bundle(
     info: Mapping[str, object],
 ) -> tuple[dict[int, Mapping[str, object]], int, int]:
@@ -230,6 +239,8 @@ class RaidenTransferKVManager(CommonKVManager):
         self._done_sending: set[str] = set()
         self._done_receiving: set[str] = set()
         self._failed_receiving: set[str] = set()
+        self._decode_metadata_lock = threading.Lock()
+        self._decode_metadata: dict[tuple[int, int, int, str], _DecodeMetadataLookup] = {}
 
     def reserve_prefill_buffer(self, existing: int | None) -> int | None:
         return existing
@@ -288,25 +299,103 @@ class RaidenTransferKVManager(CommonKVManager):
             raise
         return PrefillTransfer(sender=sender)
 
-    def try_start_decode(self, context: DecodeTransferContext) -> DecodeAdmission:
-        if context.bootstrap_room is None:
+    @staticmethod
+    def _decode_metadata_key(
+        bootstrap_room: int | None,
+        peer_process_index: int,
+        prefill_dp_rank: int,
+        transfer_id: str,
+    ) -> tuple[int, int, int, str]:
+        if bootstrap_room is None:
             raise ValueError("Raiden decode requires bootstrap_room")
+        return (
+            int(bootstrap_room),
+            int(peer_process_index),
+            int(prefill_dp_rank),
+            str(transfer_id),
+        )
+
+    def poll_decode_metadata(self, context: DecodeMetadataContext) -> bool:
+        """Return metadata readiness without blocking the scheduler thread."""
+
         peer_process_index = int(context.peer_info.get("jax_process_index", 0))
+        key = self._decode_metadata_key(
+            context.bootstrap_room,
+            peer_process_index,
+            context.prefill_dp_rank,
+            context.transfer_id,
+        )
+        now = time.monotonic()
+        with self._decode_metadata_lock:
+            lookup = self._decode_metadata.setdefault(key, _DecodeMetadataLookup())
+            if lookup.info is not None:
+                return True
+            future = lookup.future
+            if future is None:
+                if now < lookup.next_poll_at:
+                    return False
+                lookup.future = _METADATA_EXECUTOR.submit(
+                    self.bootstrap_client.get_transfer_info,
+                    context.bootstrap_room,
+                    jax_process_index=peer_process_index,
+                    prefill_dp_rank=context.prefill_dp_rank,
+                )
+                return False
+            if not future.done():
+                return False
+            lookup.future = None
+
+        info = None
         try:
-            info = self.bootstrap_client.get_transfer_info(
-                context.bootstrap_room,
-                jax_process_index=peer_process_index,
-                prefill_dp_rank=context.prefill_dp_rank,
-            )
-        except Exception as exc:  # transient bootstrap failure
+            info = future.result()
+        except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "Raiden metadata lookup failed for room=%s: %s",
                 context.bootstrap_room,
                 exc,
             )
-            return DecodeAdmission.deferred("metadata_lookup")
+
+        if info is not None and self.enable_chunk_prefill_transfer and isinstance(info, Mapping):
+            try:
+                chunks, _, _ = _normalize_transfer_bundle(info)
+            except (TypeError, ValueError):
+                # Preserve malformed metadata for try_start_decode to report as
+                # a permanent receiver-init error instead of retrying forever.
+                pass
+            else:
+                if 0 not in chunks:
+                    info = None
+
+        with self._decode_metadata_lock:
+            if self._decode_metadata.get(key) is not lookup:
+                return False
+            if info is not None:
+                lookup.info = info
+                return True
+            lookup.poll_interval = min(
+                lookup.poll_interval * 2,
+                _METADATA_MAX_POLL_SECONDS,
+            )
+            lookup.next_poll_at = time.monotonic() + lookup.poll_interval
+        return False
+
+    def try_start_decode(self, context: DecodeTransferContext) -> DecodeAdmission:
+        if context.bootstrap_room is None:
+            raise ValueError("Raiden decode requires bootstrap_room")
+        peer_process_index = int(context.peer_info.get("jax_process_index", 0))
+        metadata_key = self._decode_metadata_key(
+            context.bootstrap_room,
+            peer_process_index,
+            context.prefill_dp_rank,
+            context.transfer_id,
+        )
+        with self._decode_metadata_lock:
+            lookup = self._decode_metadata.get(metadata_key)
+            info = None if lookup is None else lookup.info
         if info is None:
             return DecodeAdmission.deferred("metadata_pending")
+        if not isinstance(info, Mapping):
+            raise TypeError("Raiden transfer metadata must be a mapping")
 
         receiver: RaidenTransferKVReceiver | None = None
         try:
@@ -438,6 +527,8 @@ class RaidenTransferKVManager(CommonKVManager):
                         ),
                     )
                 )
+            with self._decode_metadata_lock:
+                self._decode_metadata.pop(metadata_key, None)
             return DecodeAdmission.admitted(receiver)
         except Exception:
             if receiver is not None:
@@ -505,6 +596,17 @@ class RaidenTransferKVManager(CommonKVManager):
             return
         if jax_process_index is None:
             jax_process_index = jax.process_index()
+        with self._decode_metadata_lock:
+            matching_keys = [
+                key
+                for key in self._decode_metadata
+                if key[:3] == (int(bootstrap_room), int(jax_process_index), int(prefill_dp_rank))
+                and (expected_transfer_id is None or key[3] == str(expected_transfer_id))
+            ]
+            lookups = [self._decode_metadata.pop(key) for key in matching_keys]
+        for lookup in lookups:
+            if lookup.future is not None:
+                lookup.future.cancel()
         with suppress(Exception):
             self.bootstrap_client.pop_transfer(
                 bootstrap_room,
@@ -932,7 +1034,7 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
         self._pending_failure_reason: str | None = None
         self._metadata_future: Future | None = None
         self._next_metadata_poll_at = 0.0
-        self._metadata_poll_interval = _CHUNK_METADATA_MIN_POLL_SECONDS
+        self._metadata_poll_interval = _METADATA_MIN_POLL_SECONDS
 
     @property
     def transfer_started_at(self) -> float | None:
@@ -1076,7 +1178,9 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
             future = self._metadata_future
 
         info = None
+        lookup_completed = False
         if future is not None and future.done():
+            lookup_completed = True
             try:
                 info = future.result()
             except Exception as exc:  # noqa: BLE001
@@ -1116,16 +1220,23 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
                         metadata_changed |= self._known_num_chunks != known_num_chunks
                         self._known_num_chunks = known_num_chunks
                 if metadata_changed:
-                    self._metadata_poll_interval = _CHUNK_METADATA_MIN_POLL_SECONDS
+                    self._metadata_poll_interval = _METADATA_MIN_POLL_SECONDS
                 else:
                     self._metadata_poll_interval = min(
                         self._metadata_poll_interval * 2,
-                        _CHUNK_METADATA_MAX_POLL_SECONDS,
+                        _METADATA_MAX_POLL_SECONDS,
                     )
                 self._next_metadata_poll_at = time.monotonic() + self._metadata_poll_interval
             if conflict_reason is not None:
                 self.request_abort(conflict_reason)
                 return
+        elif lookup_completed:
+            with self._state_lock:
+                self._metadata_poll_interval = min(
+                    self._metadata_poll_interval * 2,
+                    _METADATA_MAX_POLL_SECONDS,
+                )
+                self._next_metadata_poll_at = time.monotonic() + self._metadata_poll_interval
 
         while True:
             with self._state_lock:
@@ -1209,7 +1320,7 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
                 and now >= self._next_metadata_poll_at
                 and self._pending_failure_reason is None
             ):
-                self._metadata_future = _CHUNK_METADATA_EXECUTOR.submit(
+                self._metadata_future = _METADATA_EXECUTOR.submit(
                     self._manager.bootstrap_client.get_transfer_info,
                     metadata.bootstrap_room,
                     jax_process_index=metadata.jax_process_index,
