@@ -4,10 +4,29 @@ An unmapped tensor is silently dropped by the loader, which yields a model that 
 computes wrong -- the same silent-failure class as the other bugs on this port. So this test
 diffs the mapping keys against the shipped index rather than asserting a hand-written list.
 """
-import json, pathlib, re, pytest
+import json, os, pathlib, re, pytest
 
-IDX = pathlib.Path("/tmp/k3_index.json")
-pytestmark = pytest.mark.skipif(not IDX.exists(), reason="K3 index not staged")
+
+def _resolve_index() -> pathlib.Path:
+    """The FULL released index -- all 93 layers, not the truncation's subset.
+
+    This test asks whether the mappings cover every text tensor the RELEASE ships, so a filtered
+    index would make it vacuously pass on whatever happens to be staged. `stage_k3_truncated.py`
+    keeps the full index under a name the safetensors loader does not glob, for exactly this.
+    """
+    model_dir = os.environ.get("KIMI_K3_MODEL_DIR", "/dev/shm/k3_4l")
+    for candidate in (
+        os.environ.get("KIMI_K3_INDEX"),
+        os.path.join(model_dir, "model.safetensors.index.full.json"),
+        "/tmp/k3_index.json",
+    ):
+        if candidate and pathlib.Path(candidate).exists():
+            return pathlib.Path(candidate)
+    return pathlib.Path("/nonexistent")
+
+
+IDX = _resolve_index()
+pytestmark = pytest.mark.skipif(not IDX.exists(), reason="full K3 index not staged")
 
 
 def _index_text_params():
