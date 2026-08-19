@@ -694,42 +694,44 @@ class KimiK3ForCausalLM(nnx.Module):
         Sharding is taken from the EXISTING parameter rather than reconstructed, so it is correct
         by construction regardless of the EP/TP mesh layout.
         """
-        import glob
-        import os
-
-        from safetensors import safe_open
-
         from sgl_jax.srt.layers.quantization.mxfp4_moe import (
             EXPERT_PROJ_TO_EPMOE,
             dequant_expert_weight,
             e8m0_scale_to_kernel_layout,
             unpack_fp4_to_e2m1,
         )
+        from sgl_jax.srt.layers.quantization.mxfp4_streaming import open_source
 
         cfg = self.config
         num_experts = int(getattr(cfg, "num_experts", 0) or 0)
         if not num_experts:
             return
-        path = getattr(model_config, "model_path", None) or getattr(cfg, "_name_or_path", None)
-        files = sorted(glob.glob(os.path.join(path, "*.safetensors"))) if path else []
-        if not files:
-            logger.warning("MoE MXFP4 fixup skipped: no safetensors under %r", path)
+        # KIMI_K3_WEIGHTS_URI points the EXPERT load at GCS while --model-path stays a local dir
+        # holding the config and tokenizer. The two are separable because experts are ~93% of the
+        # checkpoint's bytes (2.723 T of 2.78 T params) and are loaded here, not by the generic
+        # WeightLoader -- so streaming them is what turns 1.42 TiB of local staging into ~106 GiB.
+        path = (
+            os.environ.get("KIMI_K3_WEIGHTS_URI")
+            or getattr(model_config, "model_path", None)
+            or getattr(cfg, "_name_or_path", None)
+        )
+        if not path:
+            logger.warning("MoE MXFP4 fixup skipped: no model path")
             return
 
-        # locate every packed expert tensor once
-        loc: dict[str, str] = {}
-        for f in files:
-            with safe_open(f, framework="np") as h:
-                for k in h.keys():
-                    if ".block_sparse_moe.experts." in k and k.endswith(
-                        ("weight_packed", "weight_scale")
-                    ):
-                        loc[k] = f
-        if not loc:
-            logger.info("MoE MXFP4 fixup: no packed expert tensors found; nothing to do")
-            return
+        # A gs:// path is read by RANGE and never staged: the full release is 1.42 TiB against a
+        # node's ~919 GB of tmpfs, so "download it first" is not an option at full depth. A local
+        # directory keeps the original safetensors path.
+        def _wanted(key: str) -> bool:
+            return ".block_sparse_moe.experts." in key and key.endswith(
+                ("weight_packed", "weight_scale")
+            )
 
-        handles = {f: safe_open(f, framework="np") for f in set(loc.values())}
+        source = open_source(path, keep=_wanted)
+        logger.info(
+            "MoE MXFP4 fixup: reading experts from %s (%s)",
+            path, "streamed byte ranges" if str(path).startswith("gs://") else "local files",
+        )
         try:
             n_done = 0
             for li, layer in enumerate(self.model.layers):
@@ -749,12 +751,12 @@ class KimiK3ForCausalLM(nnx.Module):
                             f".block_sparse_moe.experts.{e}.{proj}"
                         )
                         pk, sk = f"{base}.weight_packed", f"{base}.weight_scale"
-                        if pk not in loc:
+                        if not source.has(pk):
                             break
-                        if sk not in loc:
+                        if not source.has(sk):
                             raise KeyError(f"{pk} present but {sk} missing")
-                        w = handles[loc[pk]].get_tensor(pk)
-                        sc = handles[loc[sk]].get_tensor(sk)
+                        w = source.get(pk)
+                        sc = source.get(sk)
                         if use_fp4:
                             # native fp4, K-major, plus the kernel's [blocks, 1, N] fp32 scale.
                             # No widening: the values stay 4 bits all the way into the GMM.
@@ -810,8 +812,7 @@ class KimiK3ForCausalLM(nnx.Module):
                 "MoE MXFP4 fixup: loaded %d expert groups as %s",
                 n_done, "native fp4 + block scales" if use_fp4 else "bf16")
         finally:
-            for h in handles.values():
-                h.__exit__(None, None, None)
+            source.close()
 
     def _fixup_kda_a_log(self, model_config):
         """Load KDA ``A_log``, narrowing the padded checkpoint tensor to ``num_heads``.

@@ -244,3 +244,109 @@ def list_shards(bucket: str, prefix: str, client=None) -> list[str]:
         if b.name.endswith(".safetensors")
     ]
     return sorted(names)
+
+
+# ----------------------------------------------------------------------------------------------
+# Tensor sources -- one interface over a local directory and a gs:// prefix
+# ----------------------------------------------------------------------------------------------
+class LocalSource:
+    """safetensors files already on disk."""
+
+    def __init__(self, files: list[str], keep: "callable | None" = None):
+        from safetensors import safe_open
+
+        self._handles = {f: safe_open(f, framework="np") for f in files}
+        self._where: dict[str, str] = {}
+        for path, handle in self._handles.items():
+            for key in handle.keys():
+                if keep is None or keep(key):
+                    self._where[key] = path
+
+    def has(self, key: str) -> bool:
+        return key in self._where
+
+    def get(self, key: str) -> np.ndarray:
+        return self._handles[self._where[key]].get_tensor(key)
+
+    def close(self) -> None:
+        for handle in self._handles.values():
+            try:
+                handle.__exit__(None, None, None)
+            except Exception:  # noqa: BLE001 - closing is best-effort
+                pass
+
+
+class GcsSource:
+    """safetensors shards in GCS, read by byte range and never staged.
+
+    Building this reads one header per shard (96 small GETs for the K3 release), after which
+    every tensor is addressable. No shard is downloaded whole at any point.
+    """
+
+    def __init__(self, uri: str, keep: "callable | None" = None, client=None):
+        from google.cloud import storage
+
+        client = client or storage.Client()
+        bucket, prefix = parse_gs_uri(uri)
+        self._readers: dict[str, ShardReader] = {}
+        self._where: dict[str, ShardReader] = {}
+        for name in list_shards(bucket, prefix, client=client):
+            reader = ShardReader(bucket, name, client=client)
+            self._readers[name] = reader
+            for key in reader.spans:
+                if keep is None or keep(key):
+                    self._where[key] = reader
+
+    def has(self, key: str) -> bool:
+        return key in self._where
+
+    def get(self, key: str) -> np.ndarray:
+        reader = self._where[key]
+        return reader.read(reader.spans[key])
+
+    def close(self) -> None:
+        return None
+
+
+def open_source(path: str, keep: "callable | None" = None):
+    """A LocalSource or GcsSource depending on what ``path`` is."""
+    if str(path).startswith("gs://"):
+        return GcsSource(path, keep=keep)
+    import glob as _glob
+    import os as _os
+
+    files = sorted(_glob.glob(_os.path.join(path, "*.safetensors")))
+    return LocalSource(files, keep=keep)
+
+
+# ----------------------------------------------------------------------------------------------
+# Per-device assembly -- what makes the fetch filter reduce HOST work too
+# ----------------------------------------------------------------------------------------------
+def build_sharded_expert_param(global_shape, sharding, fetch_expert):
+    """Assemble a globally-sharded ``[E, ...]`` array without materializing it on the host.
+
+    ``jax.device_put(global_array, sharding)`` requires the whole array on the host first, which
+    for K3 is the entire expert tensor set -- the thing the EP filter exists to avoid. Building
+    each device's slice and handing them to ``make_array_from_single_device_arrays`` bounds host
+    residency to ONE device's experts, and lets ``fetch_expert`` skip the rest entirely.
+
+    ``fetch_expert(e)`` returns expert ``e``'s array; it is called only for experts some local
+    device owns, so it is where the fetch saving is realized.
+    """
+    import jax
+    import numpy as _np
+
+    index_map = sharding.addressable_devices_indices_map(tuple(global_shape))
+    shards = []
+    for device, index in index_map.items():
+        expert_slice = index[0] if isinstance(index, tuple) else index
+        expert_ids = range(*expert_slice.indices(global_shape[0])) if isinstance(
+            expert_slice, slice
+        ) else [int(expert_slice)]
+        local = _np.stack([_np.asarray(fetch_expert(e)) for e in expert_ids], axis=0)
+        # honour any non-expert slicing this device also carries (e.g. a tensor-parallel split)
+        rest = index[1:] if isinstance(index, tuple) else ()
+        if rest:
+            local = local[(slice(None), *rest)]
+        shards.append(jax.device_put(local, device))
+    return jax.make_array_from_single_device_arrays(tuple(global_shape), sharding, shards)
