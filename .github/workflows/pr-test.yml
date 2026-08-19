@@ -1,10 +1,6 @@
 name: PR Test
 
 on:
-  push:
-    branches:
-      - main
-      - "epic/*"
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, labeled]
     branches:
