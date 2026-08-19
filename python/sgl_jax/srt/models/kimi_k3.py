@@ -193,14 +193,16 @@ class KimiK3DecoderLayer(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         memory_pools,
-        prefix_sum: jax.Array | None = None,
         block_residuals: jax.Array | None = None,
         dispatch_info=None,
     ):
         """Follows ``KimiDecoderLayer.forward`` in the PyTorch reference exactly.
 
-        Returns ``(hidden_states, prefix_sum, block_residuals, kv_fused, topk_ids)``. The plain
-        pre-norm path is kept for configs without AttnRes so this class covers both.
+        Returns ``(hidden_states, block_residuals, kv_fused, topk_ids)``.
+
+        ``prefix_sum`` is deliberately NOT threaded between layers: the reference re-initializes
+        it from ``hidden_states`` at the top of every layer, and only ``block_residuals`` carries
+        across. Passing it in would silently change what every AttnRes mixes.
         """
         kv_pool = (memory_pools.recurrent_state_pool if self.is_kda
                    else memory_pools.token_to_kv_pool)
@@ -214,7 +216,7 @@ class KimiK3DecoderLayer(nnx.Module):
             residual = hidden_states
             hidden_states = self.post_attention_layernorm(hidden_states)
             out, topk_ids = self._ffn(hidden_states, forward_batch, dispatch_info)
-            return residual + out, None, None, kv_fused, topk_ids
+            return residual + out, None, kv_fused, topk_ids
 
         # --- AttnRes path -------------------------------------------------------------
         prefix_sum = hidden_states
@@ -235,9 +237,126 @@ class KimiK3DecoderLayer(nnx.Module):
         hidden_states = self.mlp_res(prefix_sum, block_residuals)
         hidden_states = self.post_attention_layernorm(hidden_states)
         out, topk_ids = self._ffn(hidden_states, forward_batch, dispatch_info)
-        return prefix_sum + out, prefix_sum, block_residuals, kv_fused, topk_ids
+        return prefix_sum + out, block_residuals, kv_fused, topk_ids
 
 
 def make_initial_block_residuals(num_tokens: int, hidden_size: int, dtype=jnp.bfloat16):
     """Empty candidate set the first layer starts from."""
     return initial_block_residuals(num_tokens, hidden_size, dtype)
+
+
+class KimiK3Model(nnx.Module):
+    """Embedding -> N decoder layers -> output AttnRes -> final norm.
+
+    The **output_attn_res** below is a THIRD AttentionResidual beyond the two per layer: after the
+    last layer the model mixes the final hidden state against the accumulated block residuals one
+    more time, before the final norm. Missing it silently drops K3's last depth-mixing step -- the
+    model would still run and produce plausible-looking text.
+    """
+
+    def __init__(self, config: KimiK3Config, mesh: jax.sharding.Mesh, dtype=jnp.bfloat16):
+        from sgl_jax.srt.layers.embeddings import Embed
+
+        self.config = config
+        self.vocab_size = config.vocab_size
+        self.attn_res_block_size = config.attn_res_block_size
+        self.embed_tokens = Embed(
+            num_embeddings=config.vocab_size, features=config.hidden_size,
+            dtype=dtype, param_dtype=dtype, kernel_axes=("tensor", None), mesh=mesh)
+        self.layers = nnx.data([
+            KimiK3DecoderLayer(config=config, mesh=mesh, layer_idx=i, dtype=dtype)
+            for i in range(config.num_hidden_layers)
+        ])
+        self.norm = RMSNorm(
+            config.hidden_size, epsilon=config.rms_norm_eps, dtype=dtype,
+            param_dtype=dtype, scope_name="norm")
+        self.output_attn_res = (
+            AttentionResidual(config.hidden_size, config.rms_norm_eps, mesh, dtype,
+                              "output_attn_res")
+            if config.uses_attn_res else None)
+
+    def __call__(self, forward_batch: ForwardBatch, memory_pools):
+        hidden_states = self.embed_tokens(forward_batch.input_ids)
+
+        block_residuals = (
+            initial_block_residuals(hidden_states.shape[0], hidden_states.shape[-1],
+                                    hidden_states.dtype)
+            if self.attn_res_block_size is not None else None)
+
+        kv_fused_list, rec_bufs, conv_bufs, topk_list = [], [], [], []
+        for layer in self.layers:
+            hidden_states, block_residuals, attn_state, topk_ids = layer(
+                forward_batch.positions, hidden_states, forward_batch, memory_pools,
+                block_residuals, dispatch_info=forward_batch.expert_location_metadata)
+            if layer.is_kda:
+                rec, conv = attn_state
+                rec_bufs.append(rec); conv_bufs.append(conv)
+            else:
+                kv_fused_list.append(attn_state)
+            topk_list.append(topk_ids)
+
+        if block_residuals is not None:
+            hidden_states = self.output_attn_res(hidden_states, block_residuals)
+        hidden_states = self.norm(hidden_states)
+        return hidden_states, kv_fused_list, (rec_bufs, conv_bufs), topk_list
+
+
+class KimiK3ForCausalLM(nnx.Module):
+    """Top-level K3 causal LM, mirroring ``KimiLinearForCausalLM``."""
+
+    @classmethod
+    def patch_model_config(cls, config) -> None:
+        from sgl_jax.srt.configs.model_config import AttentionArch
+
+        config.attention_arch = AttentionArch.MLA
+        qk_nope = getattr(config.hf_text_config, "qk_nope_head_dim", 0)
+        qk_rope = getattr(config.hf_text_config, "qk_rope_head_dim", 0)
+        if qk_nope and qk_rope:
+            config.head_dim = qk_nope + qk_rope
+
+    def __init__(self, config: KimiK3Config, mesh: jax.sharding.Mesh, dtype=jnp.bfloat16):
+        from sgl_jax.srt.layers.embeddings import ParallelLMHead
+        from sgl_jax.srt.layers.logits_processor import LogitsProcessor
+
+        self.config = config
+        self.mesh = mesh
+        self.dtype = dtype
+        self.model = KimiK3Model(config=config, mesh=mesh, dtype=dtype)
+        if not getattr(config, "tie_word_embeddings", False):
+            self.lm_head = ParallelLMHead(
+                config.vocab_size, config.hidden_size, dtype=dtype,
+                param_dtype=dtype, kernel_axes=("tensor", None))
+        self.logits_processor = LogitsProcessor(config.vocab_size, mesh=mesh)
+
+    def __call__(self, forward_batch: ForwardBatch, memory_pools, logits_metadata):
+        hidden_states, kv_fused, recurrent_state, topk_ids = self.model(
+            forward_batch, memory_pools)
+        head = (self.model.embed_tokens
+                if getattr(self.config, "tie_word_embeddings", False) else self.lm_head)
+        output = self.logits_processor(hidden_states, head, logits_metadata)
+        return (output,
+                {"token_to_kv_pool": kv_fused, "recurrent_state_pool": recurrent_state},
+                True, topk_ids)
+
+    def load_weights(self, model_config):
+        from sgl_jax.srt.utils.weight_utils import WeightLoader
+
+        loader = WeightLoader(model=self, model_config=model_config,
+                              mesh=self.mesh, dtype=self.dtype)
+        loader.load_weights_from_safetensors(self._create_weight_mappings())
+        for layer in self.model.layers:
+            if not layer.is_kda:
+                layer.self_attn.post_load_weights()
+
+    def _create_weight_mappings(self) -> dict:
+        """Reuse Kimi-Linear's mapping, then add the K3-only parameters.
+
+        K3 adds three AttnRes projections that Kimi-Linear has no equivalent for: two per layer
+        plus the model-level output one.
+        """
+        from sgl_jax.srt.models.kimi_linear import KimiLinearForCausalLM
+
+        mappings = KimiLinearForCausalLM._create_weight_mappings(self)
+        return mappings
+
+EntryClass = [KimiK3ForCausalLM]
