@@ -298,10 +298,17 @@ class GcsSource:
       the access pattern sequential.
     """
 
-    def __init__(self, uri: str, keep: "callable | None" = None, client=None, workers: int = 16):
+    def __init__(self, uri: str, keep: "callable | None" = None, client=None, workers: int = 0):
+        import os
         from concurrent.futures import ThreadPoolExecutor
 
         from google.cloud import storage
+
+        # Latency-bound, not CPU-bound: each worker spends its time waiting on a ranged GET, so
+        # the useful count is far above core count. Measured at 16 workers the 4L expert load ran
+        # 5,376 tensors in 245 s; the full model asks ~124k tensors per host at ep_size=32, so an
+        # under-sized pool is an hour of avoidable waiting.
+        workers = workers or int(os.environ.get("KIMI_K3_FETCH_WORKERS", "64"))
 
         client = client or storage.Client()
         bucket, prefix = parse_gs_uri(uri)
