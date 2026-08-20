@@ -804,11 +804,23 @@ class KimiK3ForCausalLM(nnx.Module):
                     if not source.has(f"{base_fmt.format(e=0)}.weight_packed"):
                         continue
 
-                    def _expert(e, _fmt=base_fmt, _fp4=use_fp4):
+                    # MEASURED: GcsSource.get() pops the cache (single-use, so the cache cannot
+                    # grow into the local copy streaming exists to avoid). But _expert(e) is
+                    # called twice per projection -- once building the weight, once the scale --
+                    # and the second pass finds an empty cache and re-reads every tensor as an
+                    # individual, UN-coalesced GET. Measured on one projection: 7.0 s coalesced
+                    # vs 43.1 s individual, a 6.2x penalty paid 276 times.
+                    _expert_cache: dict = {}
+
+                    def _expert(e, _fmt=base_fmt, _fp4=use_fp4, _cache=_expert_cache):
                         pk, sk = f"{_fmt.format(e=e)}.weight_packed", f"{_fmt.format(e=e)}.weight_scale"
                         if not source.has(sk):
                             raise KeyError(f"{pk} present but {sk} missing")
-                        w, sc = source.get(pk), source.get(sk)
+                        if e in _cache:
+                            w, sc = _cache[e]
+                        else:
+                            w, sc = source.get(pk), source.get(sk)
+                            _cache[e] = (w, sc)
                         if _fp4:
                             return unpack_fp4_to_e2m1(jnp.asarray(w)), e8m0_scale_to_kernel_layout(
                                 jnp.asarray(sc)
@@ -865,6 +877,7 @@ class KimiK3ForCausalLM(nnx.Module):
                         if scale_built is not None:
                             scale_param.value = scale_built
 
+                    _expert_cache.clear()   # bounded to one projection, never the model
                     n_done += 1
                     if n_done % 12 == 0 or li <= 1:
                         # 92 MoE layers x 3 projections = 276 groups and one line at the end:
