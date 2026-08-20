@@ -150,21 +150,19 @@ fi
 
 MOE_BACKEND="${GLM52_MOE_BACKEND:-fused_v2}"
 case "$MOE_BACKEND" in
-  fused_v2)
-    SERVE_SCRIPT="benchmark/glm52/delivery/serve/${GLM52_QUANTIZATION}_${GLM52_PHYSICAL_CHIPS}chip.sh"
-    ;;
+  fused_v2) ;;
   fused_rs)
     if [[ "$GLM52_QUANTIZATION" != "channelwise" || "$GLM52_PHYSICAL_CHIPS" != "16" ]]; then
       printf 'fused_rs delivery is only validated for channelwise 16-chip GLM-5.2\n' >&2
       exit 2
     fi
-    SERVE_SCRIPT="benchmark/glm52/delivery/serve/channelwise_16chip_hybrid_rs.sh"
     ;;
   *)
     printf 'unsupported GLM52_MOE_BACKEND=%s\n' "$MOE_BACKEND" >&2
     exit 2
     ;;
 esac
+SERVE_SCRIPT="benchmark/glm52/delivery/serve/${GLM52_QUANTIZATION}_${GLM52_PHYSICAL_CHIPS}chip.sh"
 SERVE_EXTRA_ARGS=()
 if [[ "$RUN_MODE" == "agent_eval" ]]; then
   SERVE_EXTRA_ARGS+=(

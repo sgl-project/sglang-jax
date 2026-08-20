@@ -106,9 +106,7 @@ role_to_task_spec:
 
       python3 -m benchmark.moe.bench_fused_rs_moe \
         --ep-size 32 \
-        --replicas 1 \
         --tokens 65536 \
-        --routing-mode random \
         --routing-seed 42 \
         --rs-configs default \
         --warmup 2 \
@@ -118,9 +116,7 @@ role_to_task_spec:
 
       python3 -m benchmark.moe.bench_fused_rs_moe \
         --ep-size 32 \
-        --replicas 1 \
         --tokens 65536 \
-        --routing-mode random \
         --routing-seed 42 \
         --rs-configs default \
         --layer-scope \

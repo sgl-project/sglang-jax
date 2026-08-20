@@ -96,17 +96,8 @@ def _config_label(config: FusedRsBlockConfig | None) -> str:
     return "default" if config is None else "-".join(map(str, config))
 
 
-def _build_mesh(ep_size: int, replicas: int):
-    if replicas == 1:
-        return jax.make_mesh((1, ep_size), ("data", "tensor"))
-    # A larger physical slice can pre-screen one RS candidate on multiple
-    # independent EP groups. The unused ``replica`` axis replicates the same
-    # synthetic tensors and routed workload across those groups; it is not an
-    # alternative to the exact single-group topology comparison.
-    return jax.make_mesh(
-        (replicas, 1, ep_size),
-        ("replica", "data", "tensor"),
-    )
+def _build_mesh(ep_size: int):
+    return jax.make_mesh((1, ep_size), ("data", "tensor"))
 
 
 def _make_array(shape, dtype, sharding, fill_value):
@@ -199,7 +190,6 @@ def _make_inputs(
     num_tokens: int,
     ep_size: int,
     *,
-    routing_mode: str,
     routing_seed: int,
     layer_scope: bool,
     input_profile: str = "uniform",
@@ -370,32 +360,16 @@ def _make_inputs(
     # ``device_put`` cannot address the non-local devices in the 16-chip,
     # four-process v7x-32 run.
     def make_routing():
-        if routing_mode == "balanced":
-            token_ids = jnp.arange(num_tokens, dtype=jnp.int32)[:, None]
-            slots = jnp.arange(GLM52_TOP_K, dtype=jnp.int32)[None, :]
-            topk_ids = (
-                (token_ids * GLM52_TOP_K + slots) % GLM52_NUM_EXPERTS
-            ).astype(jnp.int32)
-            topk_weights = jnp.full(
-                (num_tokens, GLM52_TOP_K),
-                1.0 / GLM52_TOP_K,
-                dtype=jnp.float32,
-            )
-            return topk_ids, topk_weights
-
-        if routing_mode == "random":
-            # Match fused-v2's seeded synthetic route: Gaussian router logits,
-            # unique TopK expert ids, then softmax over the selected logits.
-            gating = jax.random.normal(
-                jax.random.key(routing_seed),
-                (num_tokens, GLM52_NUM_EXPERTS),
-                dtype=jnp.float32,
-            )
-            topk_logits, topk_ids = jax.lax.top_k(gating, GLM52_TOP_K)
-            topk_weights = jax.nn.softmax(topk_logits, axis=-1)
-            return topk_ids.astype(jnp.int32), topk_weights.astype(jnp.float32)
-
-        raise ValueError(f"Unsupported routing_mode={routing_mode!r}")
+        # Match fused-v2's seeded synthetic route: Gaussian router logits,
+        # unique TopK expert ids, then softmax over the selected logits.
+        gating = jax.random.normal(
+            jax.random.key(routing_seed),
+            (num_tokens, GLM52_NUM_EXPERTS),
+            dtype=jnp.float32,
+        )
+        topk_logits, topk_ids = jax.lax.top_k(gating, GLM52_TOP_K)
+        topk_weights = jax.nn.softmax(topk_logits, axis=-1)
+        return topk_ids.astype(jnp.int32), topk_weights.astype(jnp.float32)
 
     topk_ids, topk_weights = jax.jit(
         make_routing,
@@ -640,21 +614,9 @@ def main() -> None:
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--tokens", default=",".join(map(str, DEFAULT_TOKENS)))
-    parser.add_argument("--ep-size", type=int, default=16)
-    parser.add_argument(
-        "--replicas",
-        type=int,
-        default=1,
-        help="Independent replicated EP groups used only for topology pre-screening.",
-    )
+    parser.add_argument("--ep-size", type=int, default=32)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iters", type=int, default=5)
-    parser.add_argument(
-        "--routing-mode",
-        choices=("balanced", "random"),
-        default="balanced",
-        help="Synthetic routing shared exactly by fused_v2 and fused_rs.",
-    )
     parser.add_argument("--routing-seed", type=int, default=42)
     parser.add_argument("--trace-root", default="/tmp/sglang_jax_fused_rs_trace")
     parser.add_argument("--jsonl", type=Path)
@@ -691,20 +653,14 @@ def main() -> None:
 
     if args.ep_size != 32:
         raise ValueError("This GLM-5.2 comparison is intentionally fixed to ep_size=32")
-    if args.replicas > 1 and not args.rs_only:
-        raise ValueError(
-            "--replicas > 1 is an RS-only topology pre-screen: private fused_v2 "
-            "requires a two-axis device mesh. Use the exact EP32 manifest for "
-            "the V2/RS comparison."
-        )
-    expected_devices = args.ep_size * args.replicas
+    expected_devices = args.ep_size
     if len(jax.devices()) != expected_devices:
         raise ValueError(
-            f"Expected exactly {expected_devices} devices "
-            f"({args.replicas} replicas x EP{args.ep_size}), found {len(jax.devices())}"
+            f"Expected exactly {expected_devices} devices for EP{args.ep_size}, "
+            f"found {len(jax.devices())}"
         )
 
-    mesh = _build_mesh(args.ep_size, args.replicas)
+    mesh = _build_mesh(args.ep_size)
     rs_configs = _parse_rs_configs(args.rs_configs)
     if (
         args.jsonl is not None
@@ -720,7 +676,6 @@ def main() -> None:
                 mesh,
                 num_tokens,
                 args.ep_size,
-                routing_mode=args.routing_mode,
                 routing_seed=args.routing_seed,
                 layer_scope=args.layer_scope,
             )
@@ -812,7 +767,7 @@ def main() -> None:
                         "intermediate_size": GLM52_INTERMEDIATE_SIZE,
                         "quant_mode": "per_channel",
                         "quant_block_k": GLM52_QUANT_BLOCK_K,
-                        "routing_mode": args.routing_mode,
+                        "routing_mode": "random",
                         "routing_seed": args.routing_seed,
                         **routing_stats,
                         "rs_block_config": config_label,
@@ -852,7 +807,7 @@ def main() -> None:
                         "ep_size": args.ep_size,
                         "num_tokens": num_tokens,
                         "routed_rows": num_tokens * GLM52_TOP_K,
-                        "routing_mode": args.routing_mode,
+                        "routing_mode": "random",
                         "routing_seed": args.routing_seed,
                         **routing_stats,
                         "rs_block_config": config_label,

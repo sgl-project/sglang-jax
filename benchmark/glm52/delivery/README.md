@@ -143,14 +143,14 @@ MODEL_PATH=/models/GLM5.2-fp8-channel-wise \
   benchmark/glm52/delivery/serve/channelwise_16chip.sh
 ```
 
-For the stage-aware migrated backend, use the same channel-wise checkpoint and
-topology with the hybrid entry point. It selects fused-RS for prefill-family
+For the stage-aware migrated backend, select `fused_rs` with the same
+channel-wise checkpoint and launcher. It uses fused-RS for prefill-family
 forward modes and keeps fused-v2 for decode and target verification:
 
 ```bash
-WORLD=4 RANK=0 MASTER_ADDR=<rank-0-host> \
+GLM52_MOE_BACKEND=fused_rs WORLD=4 RANK=0 MASTER_ADDR=<rank-0-host> \
 MODEL_PATH=/models/GLM5.2-fp8-channel-wise \
-  benchmark/glm52/delivery/serve/channelwise_16chip_hybrid_rs.sh
+  benchmark/glm52/delivery/serve/channelwise_16chip.sh
 ```
 
 For the block-wise checkpoint, select the matching `blockwise_*.sh` entry

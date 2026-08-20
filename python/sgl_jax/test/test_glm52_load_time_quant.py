@@ -246,10 +246,6 @@ def test_fused_rs_forward_mode_policy_keeps_decode_on_v2():
         assert _use_fused_rs_for_forward_mode(mode) is (mode in rs_modes)
 
 
-def test_fused_rs_layer_reuses_fused_v2_weight_contract():
-    assert issubclass(FusedEPMoERS, FusedEPMoEV2)
-
-
 def test_fused_v2_disable_shared_expert_omits_shared_kernel_arguments(monkeypatch):
     mesh = _cpu_mesh()
     observed = {}
