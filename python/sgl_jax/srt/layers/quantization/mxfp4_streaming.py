@@ -143,6 +143,10 @@ class ShardReader:
             )
         return spans
 
+    def read_range(self, lo: int, hi: int) -> bytes:
+        """One ranged GET covering ``[lo, hi)`` -- the unit a coalesced run fetches."""
+        return self._blob.download_as_bytes(start=lo, end=hi - 1)
+
     def read(self, span: TensorSpan) -> np.ndarray:
         """Fetch exactly one tensor's bytes and view them as its declared dtype/shape."""
         if span.nbytes == 0:
@@ -280,6 +284,26 @@ class LocalSource:
                 pass
 
 
+def _size_http_pool(client, workers: int) -> None:
+    """Widen the storage client's connection pool to match the fetch-thread count.
+
+    Silent no-op if the client does not expose a mountable session -- a smaller pool is a
+    performance problem, not a correctness one, and is not worth failing the load over.
+    """
+    try:
+        import requests
+
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=max(workers, 16),
+            pool_maxsize=max(workers, 16),
+            max_retries=3,
+        )
+        client._http.mount("https://", adapter)
+        client._http.mount("http://", adapter)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 class GcsSource:
     """safetensors shards in GCS, read by byte range and never staged.
 
@@ -311,6 +335,11 @@ class GcsSource:
         workers = workers or int(os.environ.get("KIMI_K3_FETCH_WORKERS", "64"))
 
         client = client or storage.Client()
+        # The client's default HTTP pool holds 10 connections. Running 64 fetch threads against
+        # it makes urllib3 discard and re-establish constantly ("Connection pool is full,
+        # discarding connection: storage.googleapis.com"), which is both slow and destabilising --
+        # a 4-host run died silently right after starting the fetch. Size the pool to the fleet.
+        _size_http_pool(client, workers)
         bucket, prefix = parse_gs_uri(uri)
         self._workers = workers
         self._readers: dict[str, ShardReader] = {}
@@ -331,27 +360,67 @@ class GcsSource:
     def has(self, key: str) -> bool:
         return key in self._where
 
-    def prefetch(self, keys: "list[str]") -> None:
-        """Fetch these tensors concurrently, in byte order, into the cache.
+    # Bridge gaps up to this size rather than splitting a run: re-fetching a few unwanted MB in
+    # one sequential read is far cheaper than the round trip a split costs.
+    COALESCE_GAP = 8 << 20
 
-        Call with one group at a time (e.g. all experts of one layer+projection). Fetching the
-        whole model here would defeat the point -- the cache would become the local copy this
-        class exists to avoid.
+    def prefetch(self, keys: "list[str]") -> None:
+        """Fetch these tensors into the cache, coalescing adjacent ranges into single GETs.
+
+        Requests dominate: K3 asks 1,792 tensors per (layer, projection) group, and one GET each
+        measured **46 s per group** on a 4-host run -- about 3.5 h for the model. But a shard lays
+        consecutive experts out contiguously, so those thousands of small ranges collapse into a
+        handful of large sequential reads. This is what the vllm-torchtpu lane does with the
+        Run:AI streamer's ``FileChunks`` runs.
+
+        Call with one group at a time. Fetching the whole model here would defeat the point --
+        the cache would become the local copy this class exists to avoid.
         """
         from concurrent.futures import ThreadPoolExecutor
 
         pending = [k for k in keys if k in self._where and k not in self._cache]
         if not pending:
             return
-        pending.sort(key=lambda k: (self._where[k].name, self._where[k].spans[k].start))
 
-        def _read(key: str):
-            reader = self._where[key]
-            return key, reader.read(reader.spans[key])
+        # group by shard, then build runs of near-adjacent spans in byte order
+        by_shard: dict[str, list[str]] = {}
+        for key in pending:
+            by_shard.setdefault(self._where[key].name, []).append(key)
+
+        runs: list[tuple[ShardReader, list[str]]] = []
+        for shard, shard_keys in by_shard.items():
+            reader = self._where[shard_keys[0]]
+            shard_keys.sort(key=lambda k: reader.spans[k].start)
+            current: list[str] = []
+            end = None
+            for key in shard_keys:
+                span = reader.spans[key]
+                if current and span.start - end <= self.COALESCE_GAP:
+                    current.append(key)
+                else:
+                    if current:
+                        runs.append((reader, current))
+                    current = [key]
+                end = span.end
+                end = max(end, span.end)
+            if current:
+                runs.append((reader, current))
+
+        def _read_run(item):
+            reader, run_keys = item
+            lo = min(reader.spans[k].start for k in run_keys)
+            hi = max(reader.spans[k].end for k in run_keys)
+            blob = reader.read_range(lo, hi)
+            out = []
+            for key in run_keys:
+                span = reader.spans[key]
+                out.append((key, _view(blob[span.start - lo : span.end - lo], span)))
+            return out
 
         with ThreadPoolExecutor(max_workers=self._workers) as pool:
-            for key, arr in pool.map(_read, pending):
-                self._cache[key] = arr
+            for chunk in pool.map(_read_run, runs):
+                for key, arr in chunk:
+                    self._cache[key] = arr
 
     def get(self, key: str) -> np.ndarray:
         cached = self._cache.pop(key, None)  # pop: single-use, so the cache cannot grow into a copy
