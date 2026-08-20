@@ -1,10 +1,10 @@
-name: operator-profile-glm52-fused-rs-ep32-64k-hybrid-r6-20260820
+name: operator-profile-glm52-fused-rs-ep32-64k-contract-tuning-r1-20260820
 exp_type: PROFILING
 artifact_type: operator-profile
 cluster_name: tpu-training-antgroup
 profile: true
-tags: [profile, operator-optimization, fused-moe, glm52, ep32, per-channel, exact-16chips, random-routing, hybrid-layer]
-model_version: glm-5.2-fused-rs-prefill-v2-decode
+tags: [profile, operator-optimization, fused-moe, glm52, ep32, per-channel, exact-16chips, random-routing, contract-tuning]
+model_version: glm-5.2-fused-rs-contract-tuning
 role_to_task_spec:
   worker:
     replica: 4
@@ -21,13 +21,15 @@ role_to_task_spec:
       export JAX_COMPILATION_CACHE_DIR=/tmp/tpu_logs/jax-cache
       mkdir -p "$TMPDIR" "$PIP_CACHE_DIR" "$UV_CACHE_DIR" "$JAX_COMPILATION_CACHE_DIR"
 
-      FALCON_OPERATOR_RANK="${FALCON_JAX_PROCESS_ID:-${JOB_COMPLETION_INDEX:-0}}"
+      export FALCON_OPERATOR_RANK="${FALCON_JAX_PROCESS_ID:-${JOB_COMPLETION_INDEX:-0}}"
       ROOT="${ARTIFACT_LOCAL_DIR:-/tmp/operator-artifact}"
       OUT="$ROOT/rank-$FALCON_OPERATOR_RANK"
       mkdir -p "$OUT/benchmark" "$OUT/profiling/xprof" "$OUT/compiler/llo"
+      LIBTPU_PROFILE_ARGS="--xla_enable_custom_call_region_trace=true --xla_xprof_register_llo_debug_info=true --xla_mosaic_dump_to=$OUT/compiler/llo"
+      export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:+$LIBTPU_INIT_ARGS }$LIBTPU_PROFILE_ARGS"
 
-      source_tar=/tmp/glm52-fused-rs-hybrid-source.tar.gz.part
-      source_ready=/tmp/glm52-fused-rs-hybrid-source.ready
+      source_tar=/tmp/glm52-fused-rs-tuning-source-r1.tar.gz.part
+      source_ready=/tmp/glm52-fused-rs-tuning-source-r1.ready
       attempt=0
       while [ ! -f "$source_ready" ]; do
         attempt=$((attempt + 1))
@@ -38,7 +40,7 @@ role_to_task_spec:
         sleep 5
       done
       test -f "$source_tar"
-      echo 'bf042ebfa7faf83376448f97978994620e30d352a02ce9f97d3eb248e6551fd1  /tmp/glm52-fused-rs-hybrid-source.tar.gz.part' | sha256sum -c -
+      echo '__SOURCE_SHA256__  /tmp/glm52-fused-rs-tuning-source-r1.tar.gz.part' | sha256sum -c -
 
       mkdir -p /workspace/sglang-jax
       tar -xzf "$source_tar" -C /workspace/sglang-jax
@@ -58,7 +60,7 @@ role_to_task_spec:
           "schema_version": 1,
           "workflow": "operator-optimization",
           "operator_family": "fused_moe",
-          "operator_name": "sglang_jax_glm52_fused_rs_hybrid",
+          "operator_name": "sglang_jax_glm52_fused_rs_contract_tuning",
           "hardware": {
               "device_type": "v7x",
               "chips": 16,
@@ -80,24 +82,35 @@ role_to_task_spec:
               "quant_mode": "per_channel_w8a8",
               "routing_mode": "seeded_random_gaussian_topk",
               "routing_seed": 42,
-              "scopes": ["routed_backend", "glm52_moe_layer"],
+              "input_profile": "expert_distinct",
+              "padding_active_tokens_per_device": 64,
+              "tile_m_candidates": [128, 256, 384],
+              "candidate_families": [
+                  "full_n",
+                  "split_gmm1_n",
+                  "split_gmm2_n",
+                  "split_both_n",
+              ],
+              "scope": "routed_backend",
           },
           "source": {
               "repository": "primatrix-glm/sglang-jax-private",
               "branch": "epic/glm_5_2",
               "base_commit": "e27fac67abadd7fff8f139cf6a7b069022ae9028",
               "migration_branch": "dev/glm52-rs-ep32-64k",
+              "source_commit": "__SOURCE_COMMIT__",
               "delivery": "falcon-exp-cp-all-ranks",
-              "source_sha256": "bf042ebfa7faf83376448f97978994620e30d352a02ce9f97d3eb248e6551fd1",
+              "source_sha256": "__SOURCE_SHA256__",
           },
-          "phase_policy": {
-              "rs": ["EXTEND", "MIXED", "DRAFT_EXTEND"],
-              "fused_v2": ["DECODE", "TARGET_VERIFY", "IDLE"],
+          "correctness": {
+              "reference": "canonical_full_n_rs",
+              "rel_l2_threshold": 0.01,
+              "invalid_padding_max_abs": 0.0,
+              "v2_is_not_a_numerical_gate": True,
           },
           "timing": {
               "kernel": "per-iteration maximum strict Pallas device_duration_ps across all 32 devices",
               "backend": "per-iteration maximum blocking host wall time across all four processes",
-              "layer_scope": "routed backend plus shared expert and final P(data,None) reshard",
           },
       }
       (root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
@@ -108,22 +121,14 @@ role_to_task_spec:
         --ep-size 32 \
         --tokens 65536 \
         --routing-seed 42 \
-        --rs-configs default \
+        --tune-rs \
+        --tune-tile-ms 128,256,384 \
+        --input-profile expert_distinct \
+        --padding-active-tokens-per-device 64 \
+        --correctness-rel-l2-threshold 0.01 \
         --warmup 2 \
-        --iters 5 \
-        --trace-root "$OUT/profiling/xprof/routed" \
-        --jsonl "$OUT/benchmark/metrics.jsonl"
-
-      python3 -m benchmark.moe.bench_fused_rs_moe \
-        --ep-size 32 \
-        --tokens 65536 \
-        --routing-seed 42 \
-        --rs-configs default \
-        --layer-scope \
-        --append-jsonl \
-        --warmup 2 \
-        --iters 5 \
-        --trace-root "$OUT/profiling/xprof/layer" \
+        --iters 3 \
+        --trace-root "$OUT/profiling/xprof/tuning" \
         --jsonl "$OUT/benchmark/metrics.jsonl"
 
       if [ "$FALCON_OPERATOR_RANK" = "0" ]; then

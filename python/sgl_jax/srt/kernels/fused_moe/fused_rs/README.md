@@ -62,10 +62,13 @@ one routing-index tile at a time from HBM through double-buffered VMEM. The
 per-channel path folds the whole-K weight scale outside the activation-block
 loop to avoid repeated VPU scale multiplies.
 
-Reproduce the routed EP32 comparison with
-`benchmark/moe/bench_fused_rs_moe.py` and the adjacent Falcon manifest. The
-benchmark reports both Pallas kernel device duration and backend host wall
-time, including the upstream all-gather, plus the effective RS config so a
-missed lookup cannot be mistaken for a tuned run. Shared-expert execution and
-the final caller-layout reshard belong to the model-layer boundary and must be
-included in a separate full-layer or end-to-end prefill measurement.
+Reproduce the routed EP32 tuning sweep with `benchmark/moe/bench_fused_rs_moe.py`
+and `benchmark/moe/falcon_glm52_fused_rs_ep32_64k_tuning.yaml`. The tuning mode
+checks the upstream weight-cache contract (`buffers >= weight steps`), uses
+expert/channel-distinct FP8 weights and scales, compares candidates with a
+canonical full-N RS result, and verifies same-backend active-prefix/padding
+fidelity before timing. V2 output is not a numerical gate. The benchmark reports
+strict 32-device Pallas critical-path samples, backend wall samples, effective
+config, compile status, and correctness metrics. Shared-expert execution and the
+final caller-layout reshard belong to the model-layer boundary and must be
+measured separately after selecting the routed-kernel config.

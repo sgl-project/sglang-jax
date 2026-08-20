@@ -31,6 +31,11 @@ from jax.experimental import multihost_utils
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from benchmark.moe.fused_rs_tuning import (
+    GLM52_RS_REFERENCE_CONFIG,
+    analyze_rs_config,
+    generate_rs_tuning_configs,
+)
 from benchmark.utils import multiple_iteration_device_timeit_from_trace
 from sgl_jax.srt.kernels.fused_moe.fused_rs import fused_moe_func_rs
 from sgl_jax.srt.kernels.fused_moe.fused_rs.gmm_fused_rs_nodedup import (
@@ -47,6 +52,7 @@ GLM52_HIDDEN_SIZE = 6144
 GLM52_INTERMEDIATE_SIZE = 2048
 GLM52_QUANT_BLOCK_K = None
 DEFAULT_TOKENS = (65536,)
+DEFAULT_TUNE_TILE_MS = (128, 256, 384)
 
 # Production GLM-5.2 v7x EP32 W8A8 per-channel config from
 # v2/tuned_block_configs.py in the private epic/glm_5_2 baseline. Keeping
@@ -380,6 +386,77 @@ def _make_inputs(
     )
 
 
+def _make_padded_inputs(inputs, *, num_tokens: int, ep_size: int, active_per_device: int):
+    """Mask every device-local token shard to an active prefix.
+
+    The physical shape stays at 64K so the same compiled executable is reused.
+    Invalid rows use the production ``topk_id=-1`` sentinel and zero routing
+    weights.  This catches padding-sensitive routing/scatter failures without
+    changing the tuning workload's all-active performance shape.
+    """
+    local_tokens = num_tokens // ep_size
+    if not 0 < active_per_device <= local_tokens:
+        raise ValueError(
+            "active_per_device must be in [1, num_tokens / ep_size]; "
+            f"got active_per_device={active_per_device}, local_tokens={local_tokens}"
+        )
+
+    route_sharding = inputs[8].sharding
+    valid_sharding = NamedSharding(route_sharding.mesh, P(route_sharding.spec[0]))
+
+    def mask_routes(topk_weights, topk_ids):
+        valid = (jnp.arange(num_tokens, dtype=jnp.int32) % local_tokens) < active_per_device
+        return (
+            jnp.where(valid[:, None], topk_weights, 0.0),
+            jnp.where(valid[:, None], topk_ids, -1),
+            valid,
+        )
+
+    topk_weights, topk_ids, valid_mask = jax.jit(
+        mask_routes,
+        out_shardings=(route_sharding, route_sharding, valid_sharding),
+    )(inputs[7], inputs[8])
+    padded_inputs = (*inputs[:7], topk_weights, topk_ids, *inputs[9:])
+    return padded_inputs, valid_mask
+
+
+def _comparison_metrics(reference, candidate, *, valid_mask=None) -> dict[str, float | bool]:
+    reference_f32 = reference.astype(jnp.float32)
+    candidate_f32 = candidate.astype(jnp.float32)
+    if valid_mask is not None:
+        mask = valid_mask[:, None].astype(jnp.float32)
+        reference_f32 = reference_f32 * mask
+        candidate_f32 = candidate_f32 * mask
+
+    diff = candidate_f32 - reference_f32
+    reference_norm = jnp.linalg.norm(reference_f32.reshape(-1))
+    candidate_norm = jnp.linalg.norm(candidate_f32.reshape(-1))
+    rel_l2 = jnp.linalg.norm(diff.reshape(-1)) / jnp.maximum(reference_norm, 1e-12)
+    cosine = jnp.vdot(reference_f32.reshape(-1), candidate_f32.reshape(-1)) / jnp.maximum(
+        reference_norm * candidate_norm,
+        1e-12,
+    )
+    values = jax.device_get(
+        (
+            rel_l2,
+            jnp.max(jnp.abs(diff)),
+            cosine,
+            jnp.all(jnp.isfinite(candidate_f32)),
+        )
+    )
+    return {
+        "rel_l2": float(values[0]),
+        "max_abs": float(values[1]),
+        "cosine": float(values[2]),
+        "all_finite": bool(values[3]),
+    }
+
+
+def _invalid_padding_max_abs(output, valid_mask) -> float:
+    invalid = (~valid_mask)[:, None].astype(jnp.float32)
+    return float(jax.device_get(jnp.max(jnp.abs(output.astype(jnp.float32)) * invalid)))
+
+
 def _v2_runner(mesh, num_tokens: int, *, layer_scope: bool) -> Callable:
     try:
         bt, bf, btc, bse, bts = GLM52_V2_BLOCK_CONFIGS[num_tokens]
@@ -609,6 +686,43 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--tune-rs",
+        action="store_true",
+        help=(
+            "Generate the contract-valid GLM-5.2 full-N/split-N candidate matrix, "
+            "gate every candidate against a canonical full-N RS result and padded "
+            "same-backend fidelity, then rank correct candidates by kernel time."
+        ),
+    )
+    parser.add_argument(
+        "--tune-tile-ms",
+        default=",".join(map(str, DEFAULT_TUNE_TILE_MS)),
+        help="Comma-separated tile_m values used by --tune-rs.",
+    )
+    parser.add_argument(
+        "--input-profile",
+        choices=("uniform", "expert_distinct"),
+        help=(
+            "Synthetic tensor pattern. --tune-rs defaults to expert_distinct; "
+            "regular comparisons retain the legacy uniform default."
+        ),
+    )
+    parser.add_argument(
+        "--padding-active-tokens-per-device",
+        type=int,
+        default=64,
+        help=(
+            "With --tune-rs, keep this many active tokens at the start of every "
+            "device-local shard for the same-backend padding fidelity gate."
+        ),
+    )
+    parser.add_argument(
+        "--correctness-rel-l2-threshold",
+        type=float,
+        default=0.01,
+        help="Maximum candidate-vs-canonical-RS and padded-fidelity rel_l2.",
+    )
+    parser.add_argument(
         "--rs-only",
         action="store_true",
         help="Skip fused_v2 timing. Intended for multi-candidate tuning sweeps.",
@@ -620,6 +734,13 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.tune_rs and args.rs_configs is not None:
+        raise ValueError("Use either --tune-rs or --rs-configs, not both")
+    if args.tune_rs and args.layer_scope:
+        raise ValueError("Tune the routed RS kernel first; --tune-rs does not use --layer-scope")
+    if args.correctness_rel_l2_threshold <= 0:
+        raise ValueError("--correctness-rel-l2-threshold must be positive")
+
     if args.ep_size != 32:
         raise ValueError("This GLM-5.2 comparison is intentionally fixed to ep_size=32")
     expected_devices = args.ep_size
@@ -630,10 +751,25 @@ def main() -> None:
         )
 
     mesh = _build_mesh(args.ep_size)
-    rs_configs = _parse_rs_configs(args.rs_configs)
+    if args.tune_rs:
+        rs_configs = generate_rs_tuning_configs(_parse_csv_ints(args.tune_tile_ms))
+        args.rs_only = True
+        args.continue_on_error = True
+        input_profile = args.input_profile or "expert_distinct"
+    else:
+        rs_configs = _parse_rs_configs(args.rs_configs)
+        input_profile = args.input_profile or "uniform"
     if args.jsonl is not None and not args.append_jsonl and jax.process_index() == 0:
         args.jsonl.parent.mkdir(parents=True, exist_ok=True)
         args.jsonl.write_text("", encoding="utf-8")
+
+    def emit_row(row: dict) -> None:
+        encoded = json.dumps(row, sort_keys=True)
+        if jax.process_index() == 0:
+            print(encoded, flush=True)
+        if args.jsonl is not None and jax.process_index() == 0:
+            with args.jsonl.open("a", encoding="utf-8") as output_file:
+                output_file.write(encoded + "\n")
 
     with jax.set_mesh(mesh):
         for num_tokens in _parse_csv_ints(args.tokens):
@@ -643,56 +779,190 @@ def main() -> None:
                 args.ep_size,
                 routing_seed=args.routing_seed,
                 layer_scope=args.layer_scope,
+                input_profile=input_profile,
             )
             routing_stats = _routing_stats(inputs[8])
-            v2_run = _v2_runner(mesh, num_tokens, layer_scope=args.layer_scope)
+            tuning_rows: list[dict] = []
+
+            reference_run = None
+            reference_out = None
+            reference_compile_time_s = None
+            padded_inputs = None
+            valid_mask = None
+            if args.tune_rs:
+                padded_inputs, valid_mask = _make_padded_inputs(
+                    inputs,
+                    num_tokens=num_tokens,
+                    ep_size=args.ep_size,
+                    active_per_device=args.padding_active_tokens_per_device,
+                )
+                set_fused_rs_block_sizes_override(GLM52_RS_REFERENCE_CONFIG)
+                jax.clear_caches()
+                reference_run = _rs_runner(mesh, layer_scope=False)
+                compile_start = time.perf_counter()
+                reference_out = reference_run(inputs)
+                jax.block_until_ready(reference_out)
+                reference_compile_time_s = time.perf_counter() - compile_start
+
             v2_out = None
             v2_ms = None
             v2_wall_ms = None
             v2_kernel_samples = None
             v2_wall_samples = None
             v2_local_device_count = None
-            if not args.no_check:
-                v2_out = v2_run(inputs)
-                jax.block_until_ready(v2_out)
-            if not args.rs_only:
-                samples, wall_samples, local_device_count = _measure(
-                    v2_run,
-                    inputs,
-                    task=r"fused-moe-v2-k_.*",
-                    warmup=args.warmup,
-                    iters=args.iters,
-                    trace_root=str(Path(args.trace_root) / str(num_tokens) / "fused_v2"),
-                )
-                v2_ms = statistics.median(samples)
-                v2_wall_ms = statistics.median(wall_samples)
-                v2_kernel_samples = samples
-                v2_wall_samples = wall_samples
-                v2_local_device_count = local_device_count
+            if not args.tune_rs:
+                v2_run = _v2_runner(mesh, num_tokens, layer_scope=args.layer_scope)
+                if not args.no_check:
+                    v2_out = v2_run(inputs)
+                    jax.block_until_ready(v2_out)
+                if not args.rs_only:
+                    samples, wall_samples, local_device_count = _measure(
+                        v2_run,
+                        inputs,
+                        task=r"fused-moe-v2-k_.*",
+                        warmup=args.warmup,
+                        iters=args.iters,
+                        trace_root=str(Path(args.trace_root) / str(num_tokens) / "fused_v2"),
+                    )
+                    v2_ms = statistics.median(samples)
+                    v2_wall_ms = statistics.median(wall_samples)
+                    v2_kernel_samples = samples
+                    v2_wall_samples = wall_samples
+                    v2_local_device_count = local_device_count
 
             for config in rs_configs:
                 config_label = _config_label(config)
+                contract = analyze_rs_config(config) if config is not None else {}
+                row_base = {
+                    "record_type": "candidate",
+                    "model": "glm-5.2",
+                    "measurement_scope": (
+                        "glm52_moe_layer" if args.layer_scope else "routed_backend"
+                    ),
+                    "includes_shared_expert": args.layer_scope,
+                    "includes_output_reshard": args.layer_scope,
+                    "process_count": jax.process_count(),
+                    "ep_size": args.ep_size,
+                    "num_tokens": num_tokens,
+                    "routed_rows": num_tokens * GLM52_TOP_K,
+                    "num_experts": GLM52_NUM_EXPERTS,
+                    "top_k": GLM52_TOP_K,
+                    "hidden_size": GLM52_HIDDEN_SIZE,
+                    "intermediate_size": GLM52_INTERMEDIATE_SIZE,
+                    "quant_mode": "per_channel",
+                    "quant_block_k": GLM52_QUANT_BLOCK_K,
+                    "routing_mode": "seeded_random_gaussian_topk",
+                    "routing_seed": args.routing_seed,
+                    "input_profile": input_profile,
+                    **routing_stats,
+                    "rs_block_config": config_label,
+                    "rs_reference_config": (
+                        list(GLM52_RS_REFERENCE_CONFIG) if args.tune_rs else None
+                    ),
+                    "correctness_rel_l2_threshold": (
+                        args.correctness_rel_l2_threshold if args.tune_rs else None
+                    ),
+                    **contract,
+                }
+
+                if contract and not contract["buffer_contract_valid"]:
+                    row = {
+                        **row_base,
+                        "status": "rejected",
+                        "validation_stage": "weight_cache_contract",
+                        "error_type": "InvalidTuningContract",
+                        "error": "num_w1_bufs/num_w2_bufs must cover every W1/W2 weight step",
+                    }
+                    emit_row(row)
+                    tuning_rows.append(row)
+                    continue
+
                 set_fused_rs_block_sizes_override(config)
-                # The override is consumed during tracing. Clear cached traces so
-                # every candidate produces an executable with its own tile shapes.
-                jax.clear_caches()
-                rs_run = _rs_runner(mesh, layer_scope=args.layer_scope)
+                if args.tune_rs and config == GLM52_RS_REFERENCE_CONFIG:
+                    rs_run = reference_run
+                    rs_out = reference_out
+                    compile_time_s = reference_compile_time_s
+                else:
+                    # The override is consumed during tracing. Clear cached traces so
+                    # every candidate produces an executable with its own tile shapes.
+                    jax.clear_caches()
+                    rs_run = _rs_runner(mesh, layer_scope=args.layer_scope)
+                    rs_out = None
+                    compile_time_s = None
+
+                validation_stage = "compile"
+                compile_status = (
+                    "ok" if rs_out is not None else ("pending" if args.tune_rs else None)
+                )
                 try:
-                    rel_l2 = None
-                    if v2_out is not None:
-                        rs_out = rs_run(inputs)
-                        jax.block_until_ready(rs_out)
-                        diff = (v2_out.astype(jnp.float32) - rs_out.astype(jnp.float32)).reshape(-1)
-                        rel_l2 = float(
-                            jnp.linalg.norm(diff)
-                            / jnp.maximum(jnp.linalg.norm(v2_out.astype(jnp.float32)), 1e-6)
-                        )
-                        if rel_l2 > 0.2:
+                    rel_l2_vs_v2 = None
+                    rs_reference_metrics = None
+                    padding_fidelity_metrics = None
+                    padding_invalid_max_abs = None
+                    if args.tune_rs:
+                        if rs_out is None:
+                            compile_start = time.perf_counter()
+                            rs_out = rs_run(inputs)
+                            jax.block_until_ready(rs_out)
+                            compile_time_s = time.perf_counter() - compile_start
+                            compile_status = "ok"
+                        validation_stage = "canonical_rs_correctness"
+                        rs_reference_metrics = _comparison_metrics(reference_out, rs_out)
+                        if not rs_reference_metrics["all_finite"]:
+                            raise AssertionError("candidate produced non-finite all-active output")
+                        if (
+                            rs_reference_metrics["rel_l2"]
+                            > args.correctness_rel_l2_threshold
+                        ):
                             raise AssertionError(
-                                "fused_rs differs from fused_v2 at "
-                                f"tokens={num_tokens}, config={config_label}: rel_l2={rel_l2}"
+                                "candidate differs from canonical full-N RS: "
+                                f"rel_l2={rs_reference_metrics['rel_l2']}"
                             )
 
+                        validation_stage = "padding_fidelity"
+                        padded_out = rs_run(padded_inputs)
+                        jax.block_until_ready(padded_out)
+                        padding_fidelity_metrics = _comparison_metrics(
+                            rs_out,
+                            padded_out,
+                            valid_mask=valid_mask,
+                        )
+                        padding_invalid_max_abs = _invalid_padding_max_abs(
+                            padded_out,
+                            valid_mask,
+                        )
+                        if not padding_fidelity_metrics["all_finite"]:
+                            raise AssertionError("candidate produced non-finite padded output")
+                        if (
+                            padding_fidelity_metrics["rel_l2"]
+                            > args.correctness_rel_l2_threshold
+                        ):
+                            raise AssertionError(
+                                "candidate is padding-sensitive: "
+                                f"rel_l2={padding_fidelity_metrics['rel_l2']}"
+                            )
+                        if padding_invalid_max_abs != 0.0:
+                            raise AssertionError(
+                                "candidate wrote non-zero invalid padding rows: "
+                                f"max_abs={padding_invalid_max_abs}"
+                            )
+                    elif v2_out is not None:
+                        validation_stage = "informational_v2_comparison"
+                        compile_start = time.perf_counter()
+                        rs_out = rs_run(inputs)
+                        jax.block_until_ready(rs_out)
+                        compile_time_s = time.perf_counter() - compile_start
+                        compile_status = "ok"
+                        v2_metrics = _comparison_metrics(v2_out, rs_out)
+                        rel_l2_vs_v2 = v2_metrics["rel_l2"]
+                        if rel_l2_vs_v2 > 0.2:
+                            raise AssertionError(
+                                "fused_rs differs from fused_v2 at "
+                                f"tokens={num_tokens}, config={config_label}: "
+                                f"rel_l2={rel_l2_vs_v2}"
+                            )
+
+                    validation_stage = "measurement"
                     samples, wall_samples, local_device_count = _measure(
                         rs_run,
                         inputs,
@@ -707,32 +977,18 @@ def main() -> None:
                     rs_wall_ms = statistics.median(wall_samples)
                     effective_config = get_last_fused_rs_block_sizes()
                     row = {
+                        **row_base,
                         "status": "ok",
-                        "model": "glm-5.2",
-                        "measurement_scope": (
-                            "glm52_moe_layer" if args.layer_scope else "routed_backend"
-                        ),
-                        "includes_shared_expert": args.layer_scope,
-                        "includes_output_reshard": args.layer_scope,
-                        "process_count": jax.process_count(),
+                        "validation_stage": "measured",
+                        "compile_status": compile_status,
+                        "correctness_status": "passed" if args.tune_rs else None,
+                        "eligible_for_tuning": True,
                         "local_device_count": local_device_count,
                         "v2_local_device_count": v2_local_device_count,
-                        "ep_size": args.ep_size,
-                        "num_tokens": num_tokens,
-                        "routed_rows": num_tokens * GLM52_TOP_K,
-                        "num_experts": GLM52_NUM_EXPERTS,
-                        "top_k": GLM52_TOP_K,
-                        "hidden_size": GLM52_HIDDEN_SIZE,
-                        "intermediate_size": GLM52_INTERMEDIATE_SIZE,
-                        "quant_mode": "per_channel",
-                        "quant_block_k": GLM52_QUANT_BLOCK_K,
-                        "routing_mode": "random",
-                        "routing_seed": args.routing_seed,
-                        **routing_stats,
-                        "rs_block_config": config_label,
                         "effective_rs_block_config": (
                             list(effective_config) if effective_config is not None else None
                         ),
+                        "compile_time_s": compile_time_s,
                         "fused_v2_ms": v2_ms,
                         "fused_rs_ms": rs_ms,
                         "fused_v2_kernel_ms": v2_ms,
@@ -747,34 +1003,100 @@ def main() -> None:
                         "fused_rs_backend_speedup_vs_v2": (
                             v2_wall_ms / rs_wall_ms if v2_wall_ms is not None else None
                         ),
-                        "rel_l2_vs_v2": rel_l2,
+                        "rel_l2_vs_v2": rel_l2_vs_v2,
+                        "rs_reference_rel_l2": (
+                            rs_reference_metrics["rel_l2"] if rs_reference_metrics else None
+                        ),
+                        "rs_reference_max_abs": (
+                            rs_reference_metrics["max_abs"] if rs_reference_metrics else None
+                        ),
+                        "rs_reference_cosine": (
+                            rs_reference_metrics["cosine"] if rs_reference_metrics else None
+                        ),
+                        "padding_fidelity_rel_l2": (
+                            padding_fidelity_metrics["rel_l2"]
+                            if padding_fidelity_metrics
+                            else None
+                        ),
+                        "padding_fidelity_max_abs": (
+                            padding_fidelity_metrics["max_abs"]
+                            if padding_fidelity_metrics
+                            else None
+                        ),
+                        "padding_fidelity_cosine": (
+                            padding_fidelity_metrics["cosine"]
+                            if padding_fidelity_metrics
+                            else None
+                        ),
+                        "padding_invalid_max_abs": padding_invalid_max_abs,
+                        "padding_active_tokens_per_device": (
+                            args.padding_active_tokens_per_device if args.tune_rs else None
+                        ),
                     }
                 except Exception as exc:
                     if not args.continue_on_error:
                         raise
                     row = {
+                        **row_base,
                         "status": "error",
-                        "model": "glm-5.2",
-                        "measurement_scope": (
-                            "glm52_moe_layer" if args.layer_scope else "routed_backend"
+                        "eligible_for_tuning": False,
+                        "validation_stage": validation_stage,
+                        "compile_status": (
+                            "error" if validation_stage == "compile" else compile_status
                         ),
-                        "process_count": jax.process_count(),
-                        "ep_size": args.ep_size,
-                        "num_tokens": num_tokens,
-                        "routed_rows": num_tokens * GLM52_TOP_K,
-                        "routing_mode": "random",
-                        "routing_seed": args.routing_seed,
-                        **routing_stats,
-                        "rs_block_config": config_label,
+                        "correctness_status": (
+                            "failed"
+                            if validation_stage
+                            in ("canonical_rs_correctness", "padding_fidelity")
+                            else None
+                        ),
+                        "compile_time_s": compile_time_s,
                         "error_type": type(exc).__name__,
                         "error": str(exc),
                     }
-                encoded = json.dumps(row, sort_keys=True)
-                if jax.process_index() == 0:
-                    print(encoded, flush=True)
-                if args.jsonl is not None and jax.process_index() == 0:
-                    with args.jsonl.open("a", encoding="utf-8") as output_file:
-                        output_file.write(encoded + "\n")
+                emit_row(row)
+                tuning_rows.append(row)
+
+            if args.tune_rs:
+                eligible = [row for row in tuning_rows if row.get("status") == "ok"]
+                eligible.sort(key=lambda row: row["fused_rs_kernel_ms"])
+                summary = {
+                    "record_type": "tuning_summary",
+                    "status": "ok" if eligible else "error",
+                    "model": "glm-5.2",
+                    "measurement_scope": "routed_backend",
+                    "process_count": jax.process_count(),
+                    "ep_size": args.ep_size,
+                    "num_tokens": num_tokens,
+                    "routed_rows": num_tokens * GLM52_TOP_K,
+                    "input_profile": input_profile,
+                    "routing_mode": "seeded_random_gaussian_topk",
+                    "routing_seed": args.routing_seed,
+                    "candidate_count": len(tuning_rows),
+                    "eligible_candidate_count": len(eligible),
+                    "rs_reference_config": list(GLM52_RS_REFERENCE_CONFIG),
+                    "winner_rs_block_config": (
+                        eligible[0]["rs_block_config"] if eligible else None
+                    ),
+                    "winner_fused_rs_kernel_ms": (
+                        eligible[0]["fused_rs_kernel_ms"] if eligible else None
+                    ),
+                    "winner_fused_rs_backend_wall_ms": (
+                        eligible[0]["fused_rs_backend_wall_ms"] if eligible else None
+                    ),
+                    "ranked_rs_block_configs": [
+                        {
+                            "rank": rank,
+                            "rs_block_config": row["rs_block_config"],
+                            "kernel_ms": row["fused_rs_kernel_ms"],
+                            "backend_wall_ms": row["fused_rs_backend_wall_ms"],
+                        }
+                        for rank, row in enumerate(eligible, start=1)
+                    ],
+                }
+                emit_row(summary)
+                if not eligible:
+                    raise RuntimeError("No fused-RS tuning candidate passed correctness and timing")
 
     set_fused_rs_block_sizes_override(None)
 
