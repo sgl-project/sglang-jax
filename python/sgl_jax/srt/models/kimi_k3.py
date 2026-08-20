@@ -31,6 +31,7 @@ from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.moe import EPMoE
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as _P
 from sgl_jax.srt.kernels.gmm.megablox_fp4.gmm_v2 import gmm_v2 as fp4_gmm_v2
 from sgl_jax.srt.layers.quantization.mxfp4 import MXFP4_GROUP_SIZE
@@ -771,94 +772,106 @@ class KimiK3ForCausalLM(nnx.Module):
                 moe = layer.block_sparse_moe
                 # the MoE module decides; the loader does not second-guess it
                 use_fp4 = bool(getattr(moe, "fp4", False))
+
+                # Only the experts some LOCAL device owns. On a single-process pod that is all of
+                # them -- every device is addressable, so nothing is saved there. Across hosts at
+                # ep_size=32 a process owns 8 of 32 expert groups (224 of 896) and never requests
+                # the other 672.
+                wanted_experts = _local_expert_range(moe, num_experts)
+
+                # Prefetch the WHOLE LAYER -- all three projections at once. A shard stores each
+                # expert's w1/w2/w3 together, so asking for one projection leaves ~33 MB of the
+                # other two between consecutive wanted ranges and the coalescer cannot bridge it.
+                # Measured on this fleet: one GET per tensor = 46 s/group (~3.5 h for the model);
+                # per-projection coalescing = 25 s; whole-layer = 15.4 s for 3.9 GB (~24 min).
+                stem = f"{self.TEXT_PREFIX}model.layers.{li}.block_sparse_moe.experts"
+                source.prefetch([
+                    f"{stem}.{e}.{proj}.{suffix}"
+                    for e in wanted_experts
+                    for proj in EXPERT_PROJ_TO_EPMOE
+                    for suffix in ("weight_packed", "weight_scale")
+                ])
+
                 for proj, target in EXPERT_PROJ_TO_EPMOE.items():
                     param = getattr(moe, target, None)
                     if param is None:
                         continue
-                    stack, scale_stack = [], []
+                    scale_param = getattr(moe, f"{target}_scale", None) if use_fp4 else None
+
                     base_fmt = (
                         f"{self.TEXT_PREFIX}model.layers.{li}.block_sparse_moe.experts.{{e}}.{proj}"
                     )
+                    if not source.has(f"{base_fmt.format(e=0)}.weight_packed"):
+                        continue
 
-                    # Only the experts some LOCAL device owns. On a single-process pod that is
-                    # all of them -- every device is addressable here, so nothing is saved. The
-                    # reduction is realized across hosts: at ep_size=32 over 4 hosts, each
-                    # process owns 8 of 32 expert groups, i.e. 224 of 896 experts, and never
-                    # requests the other 672.
-                    wanted_experts = _local_expert_range(moe, num_experts)
-
-                    # One round trip per tensor is ~5.4k requests at 4 layers and ~165k at 93, so
-                    # prefetch each (layer, projection) group concurrently and let the latency
-                    # overlap. Grouped, not global: prefetching everything would rebuild the
-                    # local copy that streaming exists to avoid.
-                    source.prefetch(
-                        [f"{base_fmt.format(e=e)}.{suffix}"
-                         for e in wanted_experts
-                         for suffix in ("weight_packed", "weight_scale")]
-                    )
-                    for e in range(num_experts):
-                        base = (
-                            f"{self.TEXT_PREFIX}model.layers.{li}"
-                            f".block_sparse_moe.experts.{e}.{proj}"
-                        )
-                        pk, sk = f"{base}.weight_packed", f"{base}.weight_scale"
-                        if not source.has(pk):
-                            break
+                    def _expert(e, _fmt=base_fmt, _fp4=use_fp4):
+                        pk, sk = f"{_fmt.format(e=e)}.weight_packed", f"{_fmt.format(e=e)}.weight_scale"
                         if not source.has(sk):
                             raise KeyError(f"{pk} present but {sk} missing")
-                        w = source.get(pk)
-                        sc = source.get(sk)
-                        if use_fp4:
-                            # native fp4, K-major, plus the kernel's [blocks, 1, N] fp32 scale.
-                            # No widening: the values stay 4 bits all the way into the GMM.
-                            stack.append(unpack_fp4_to_e2m1(jnp.asarray(w)))
-                            scale_stack.append(e8m0_scale_to_kernel_layout(jnp.asarray(sc)))
-                        else:
-                            stack.append(
-                                dequant_expert_weight(jnp.asarray(w), jnp.asarray(sc), jnp.bfloat16)
+                        w, sc = source.get(pk), source.get(sk)
+                        if _fp4:
+                            return unpack_fp4_to_e2m1(jnp.asarray(w)), e8m0_scale_to_kernel_layout(
+                                jnp.asarray(sc)
                             )
-                    if len(stack) != num_experts:
-                        logger.warning(
-                            "layer %d %s: found %d/%d experts; leaving as-is",
-                            li, target, len(stack), num_experts)
-                        continue
-                    arr = jnp.stack(stack, axis=0)
-                    # Take only the SPEC from the existing param and rebind it to the concrete
-                    # mesh. The param's own sharding carries an AbstractMesh during load, and
-                    # device_put on that raises
-                    #   ValueError: is_fully_addressable is not implemented for AbstractMesh
-                    from jax.sharding import NamedSharding
+                        return dequant_expert_weight(jnp.asarray(w), jnp.asarray(sc), jnp.bfloat16), None
 
-                    # Place on EPMoE's OWN mesh, not the model mesh. EPMoE builds
-                    # `moe_mesh` with axis_names ("expert", "tensor") (moe.py:84-88) and creates
-                    # its params under that; the model mesh is ("data", "tensor"), so binding the
-                    # spec to it raises
+                    # EPMoE's OWN mesh: it builds `moe_mesh` with axis_names ("expert", "tensor")
+                    # (moe.py:84-88) and creates its params under that. The model mesh is
+                    # ("data", "tensor"), so binding the spec to it raises
                     #   ValueError: Resource axis: expert ... is not found in mesh
-                    spec = getattr(getattr(param.value, "sharding", None), "spec", None)
                     target_mesh = getattr(moe, "moe_mesh", None) or self.mesh
-                    if spec is not None:
-                        arr = jax.device_put(arr, NamedSharding(target_mesh, spec))
-                    param.value = arr
+
+                    def _build(param_obj, pick):
+                        """Assemble one sharded param, fetching ONLY this host's slices.
+
+                        make_array_from_callback is what the shared loader uses for exactly this
+                        (weight_utils.py:1253). Building the global array host-side and then
+                        device_put'ing it -- what this did before -- works on one host and fails
+                        on four with
+                          RuntimeError: Fetching value for `jax.Array` that spans non-addressable
+                          (non process local) devices
+                        because the global array is not process-local. The callback form is also
+                        where EP filtering becomes real: it is invoked only for slices this
+                        process owns, so the other ranks' experts are never fetched.
+                        """
+                        spec = getattr(getattr(param_obj.value, "sharding", None), "spec", None)
+                        global_shape = tuple(param_obj.value.shape)
+                        if spec is None:
+                            return None
+                        sharding = NamedSharding(target_mesh, spec)
+
+                        def _slice(index):
+                            expert_idx = index[0]
+                            ids = (
+                                range(*expert_idx.indices(global_shape[0]))
+                                if isinstance(expert_idx, slice)
+                                else [int(expert_idx)]
+                            )
+                            local = np.stack([np.asarray(pick(_expert(e))) for e in ids], axis=0)
+                            rest = tuple(index[1:])
+                            return local[(slice(None), *rest)] if rest else local
+
+                        return jax.make_array_from_callback(global_shape, sharding, _slice)
+
+                    built = _build(param, lambda t: t[0])
+                    if built is None:
+                        continue
+                    param.value = built
 
                     # The scale is NOT optional in fp4: the kernel multiplies by it, so a missing
                     # or zero scale produces finite, plausible, wrong numbers rather than an error.
-                    if use_fp4:
-                        scale_param = getattr(moe, f"{target}_scale")
-                        scale_arr = jnp.stack(scale_stack, axis=0)
-                        if scale_arr.shape != scale_param.value.shape:
-                            raise ValueError(
-                                f"layer {li} {target}_scale: checkpoint gives {scale_arr.shape}, "
-                                f"module declares {scale_param.value.shape} -- group size mismatch"
-                            )
-                        sspec = getattr(getattr(scale_param.value, "sharding", None), "spec", None)
-                        if sspec is not None:
-                            scale_arr = jax.device_put(
-                                scale_arr, NamedSharding(target_mesh, sspec))
-                        scale_param.value = scale_arr
-                        del scale_stack
+                    if use_fp4 and scale_param is not None:
+                        scale_built = _build(scale_param, lambda t: t[1])
+                        if scale_built is not None:
+                            scale_param.value = scale_built
 
                     n_done += 1
-                    del stack
+                    if n_done % 12 == 0 or li <= 1:
+                        # 92 MoE layers x 3 projections = 276 groups and one line at the end:
+                        # without progress a stall and a silent death look identical from outside.
+                        logger.info(
+                            "MoE MXFP4 fixup: %d groups done (layer %d/%d, %s)",
+                            n_done, li, len(self.model.layers), target)
             logger.info(
                 "MoE MXFP4 fixup: loaded %d expert groups as %s",
                 n_done, "native fp4 + block scales" if use_fp4 else "bf16")
@@ -938,6 +951,11 @@ class KimiK3ForCausalLM(nnx.Module):
                     a = jnp.asarray(raw[:num_heads], dtype=jnp.float32).reshape(
                         1, 1, num_heads, 1
                     )
+                    # count on the HOST copy, before placement: reading it back afterwards is a
+                    # cross-process fetch ("Fetching value for `jax.Array` that spans
+                    # non-addressable devices") because the tensor axis is sharded. A debug log
+                    # line is not worth an all-gather, and on 4 hosts it is fatal rather than slow.
+                    nonzero = int((np.asarray(a) != 0).sum())
                     a = jax.device_put(
                         a, NamedSharding(self.mesh, _P(None, None, "tensor", None))
                     )
@@ -954,7 +972,7 @@ class KimiK3ForCausalLM(nnx.Module):
                         "A_log L%d: raw%s -> %s (was %s), nonzero=%d",
                         layer_idx, tuple(raw.shape), tuple(a.shape),
                         tuple(before.shape) if before is not None else None,
-                        int((np.asarray(jax.device_get(a)) != 0).sum()),
+                        nonzero,
                     )
                     del wanted[key]
                     found += 1
