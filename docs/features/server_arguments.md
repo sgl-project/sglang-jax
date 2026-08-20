@@ -172,7 +172,7 @@ For deeper scheduler behavior, see [Scheduler](../architecture/03-scheduler.md) 
 | `--precompile-bs-paddings` | Batch-size buckets used for decode JIT precompile. |
 | `--disable-precompile` | Skip startup precompilation. Runtime JIT can still happen on first unseen shape. |
 | `--attention-backend` | Attention backend: `fa`, `fa_mha`, or `native`. |
-| `--moe-backend` | MoE backend: `epmoe`, `fused`, `fused_v2`, or `auto`. |
+| `--moe-backend` | MoE backend: `epmoe`, `fused`, `fused_v2`, `fused_rs`, or `auto`. `fused_rs` is currently GLM-5.2-only and selects RS for prefill-family forwards while retaining fused-v2 for decode-family forwards. |
 | `--disable-jax-allreduce-metadata` | Use the Pallas DMA allgather fallback for fused EP-MoE metadata. |
 | `--enable-nan-detection` | Enable NaN detection for debugging. |
 

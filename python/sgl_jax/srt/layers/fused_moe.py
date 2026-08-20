@@ -4,6 +4,7 @@ import jax
 from flax import nnx
 from jax import numpy as jnp
 from jax.sharding import Mesh
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
@@ -470,15 +471,28 @@ class FusedEPMoE(nnx.Module):
         """Forward pass through the fused MoE layer."""
         assert hidden_states.ndim == 2
 
-        w1_shared_val = self.w1_shared.value if self.w1_shared is not None else None
-        w3_shared_val = self.w3_shared.value if self.w3_shared is not None else None
-        w2_shared_val = self.w2_shared.value if self.w2_shared is not None else None
+        use_shared_expert = self.w1_shared is not None and not self.disable_shared_expert
+        w1_shared_val = self.w1_shared.value if use_shared_expert else None
+        w3_shared_val = self.w3_shared.value if use_shared_expert else None
+        w2_shared_val = self.w2_shared.value if use_shared_expert else None
         w1_scale = self.w1_scale.value if self.w1_scale is not None else None
         w3_scale = self.w3_scale.value if self.w3_scale is not None else None
         w2_scale = self.w2_scale.value if self.w2_scale is not None else None
-        w1_shared_scale = self.w1_shared_scale.value if self.w1_shared_scale is not None else None
-        w3_shared_scale = self.w3_shared_scale.value if self.w3_shared_scale is not None else None
-        w2_shared_scale = self.w2_shared_scale.value if self.w2_shared_scale is not None else None
+        w1_shared_scale = (
+            self.w1_shared_scale.value
+            if use_shared_expert and self.w1_shared_scale is not None
+            else None
+        )
+        w3_shared_scale = (
+            self.w3_shared_scale.value
+            if use_shared_expert and self.w3_shared_scale is not None
+            else None
+        )
+        w2_shared_scale = (
+            self.w2_shared_scale.value
+            if use_shared_expert and self.w2_shared_scale is not None
+            else None
+        )
 
         quant_block_k = self.quant_block_k if self.quant_block_k is not None else None
 
@@ -566,21 +580,28 @@ class FusedEPMoEV2(FusedEPMoE):
         w3_scale = self.w3_scale.value if self.w3_scale is not None else None
         w2_scale = self.w2_scale.value if self.w2_scale is not None else None
 
-        w1_shared_val = self.w1_shared.value if self.w1_shared is not None else None
-        w3_shared_val = self.w3_shared.value if self.w3_shared is not None else None
-        w2_shared_val = self.w2_shared.value if self.w2_shared is not None else None
+        use_shared_expert = self.w1_shared is not None and not self.disable_shared_expert
+        w1_shared_val = self.w1_shared.value if use_shared_expert else None
+        w3_shared_val = self.w3_shared.value if use_shared_expert else None
+        w2_shared_val = self.w2_shared.value if use_shared_expert else None
 
         # SE per-channel scales are stored 3D (1, 1, out); the v2 kernel reads them
         # 2D (1, out). Squeeze here (not in quantize_weights, which the v1 path and
         # the weight mapping consume in 3D form). None for bf16 SE weights (Mode 3).
         w1_shared_scale = (
-            self.w1_shared_scale.value[:, 0, :] if self.w1_shared_scale is not None else None
+            self.w1_shared_scale.value[:, 0, :]
+            if use_shared_expert and self.w1_shared_scale is not None
+            else None
         )
         w3_shared_scale = (
-            self.w3_shared_scale.value[:, 0, :] if self.w3_shared_scale is not None else None
+            self.w3_shared_scale.value[:, 0, :]
+            if use_shared_expert and self.w3_shared_scale is not None
+            else None
         )
         w2_shared_scale = (
-            self.w2_shared_scale.value[:, 0, :] if self.w2_shared_scale is not None else None
+            self.w2_shared_scale.value[:, 0, :]
+            if use_shared_expert and self.w2_shared_scale is not None
+            else None
         )
         # In-kernel act-quant (fp8 token, Mode 1) needs both a quant-config
         # activation dtype and fp8 weights. Weight-only fp8 checkpoints stay in
@@ -605,7 +626,7 @@ class FusedEPMoEV2(FusedEPMoE):
                 dtype=hidden_states.dtype,
                 weight_dtype=self.w1.value.dtype,
                 ep_size=self.ep_size,
-                use_shared_expert=self.w1_shared is not None,
+                use_shared_expert=use_shared_expert,
                 use_grouped_topk=self.use_grouped_topk,
                 enable_act_quant=enable_act_quant,
                 quant_mode=quant_mode,
@@ -658,3 +679,269 @@ class FusedEPMoEV2(FusedEPMoE):
                 output, jax.sharding.NamedSharding(self.mesh, P("data", None))
             )
         return output
+
+
+def fused_rs_shared_expert(
+    hidden_states: jax.Array,
+    w1: jax.Array,
+    w3: jax.Array,
+    w2: jax.Array,
+    *,
+    w1_scale: jax.Array | None,
+    w3_scale: jax.Array | None,
+    w2_scale: jax.Array | None,
+    activation_quantized_dtype: jnp.dtype | None,
+    mesh: Mesh,
+    v2_shared_block_size: int = 1024,
+) -> jax.Array:
+    """Run GLM's replicated shared expert beside the routed RS path."""
+    from sgl_jax.srt.kernels.fused_moe.fused_rs.fused_moe_rs import (
+        get_moe_expert_axis,
+    )
+
+    expert_axis = get_moe_expert_axis(mesh)
+    token_spec = P(expert_axis, None)
+    hidden_states = jax.sharding.reshard(
+        hidden_states, NamedSharding(mesh, token_spec)
+    )
+
+    def _local_linear(
+        x,
+        weight,
+        scale,
+        *,
+        reserve_v2_fp8_scale_slots=False,
+    ):
+        if scale is None:
+            return jax.lax.dot_general(
+                x.astype(jnp.float32),
+                weight.astype(jnp.float32),
+                (((1,), (0,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+
+        scale_f32 = jnp.reshape(scale, (1, -1)).astype(jnp.float32)
+        if activation_quantized_dtype is None:
+            return jax.lax.dot_general(
+                x.astype(jnp.float32),
+                weight.astype(jnp.float32) * scale_f32,
+                (((1,), (0,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+
+        # V2 explicitly promotes the bf16 source to f32 before amax/scale.
+        # quantize_tensor_simple computes those reductions in the source dtype,
+        # so using it here rounds the token scale to bf16 before both FFNs.
+        x_f32 = x.astype(jnp.float32)
+        dtype_max = jnp.float32(jnp.finfo(activation_quantized_dtype).max)
+        x_amax = jnp.max(jnp.abs(x_f32), axis=-1, keepdims=True)
+        x_scale = jnp.maximum(x_amax / dtype_max, jnp.float32(1e-12))
+        x_q = (x_f32 / x_scale).astype(activation_quantized_dtype)
+        if reserve_v2_fp8_scale_slots:
+            if x_q.shape[-1] % 4:
+                raise ValueError(
+                    "V2 FP8 scale-slot compatibility requires four packed lanes"
+                )
+            lane_width = x_q.shape[-1] // 4
+            channel = jnp.arange(x_q.shape[-1], dtype=jnp.int32)
+            reserved = (channel % lane_width) == (lane_width - 1)
+            x_q = jnp.where(reserved[None, :], jnp.zeros_like(x_q), x_q)
+            # V2's shared FFN1 executes four independent packed-lane MXU
+            # dots, accumulating each f32 result in lane order before scale
+            # application.  A single 6144-wide dot changes the accumulation
+            # order before SiLU and amplifies into a material shared-output
+            # difference, even though the routed output remains close.
+            acc = jnp.zeros((x_q.shape[0], weight.shape[1]), dtype=jnp.float32)
+            for lane in range(4):
+                start = lane * lane_width
+                end = start + lane_width
+                acc += jax.lax.dot_general(
+                    x_q[:, start:end],
+                    weight[start:end, :],
+                    (((1,), (0,)), ((), ())),
+                    preferred_element_type=jnp.float32,
+                )
+        else:
+            acc = jax.lax.dot_general(
+                x_q,
+                weight,
+                (((1,), (0,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+        # Match V2's f32 operation order exactly.  The product of activation
+        # and per-channel weight scales is formed before it scales the dot;
+        # reassociating these multiplies changes the input to SiLU/FFN2.
+        combined_scale = x_scale.astype(jnp.float32) * scale_f32
+        return acc.astype(jnp.float32) * combined_scale
+
+    def _run(x, w1_local, w3_local, w2_local, s1, s3, s2):
+        gate = _local_linear(
+            x,
+            w1_local,
+            s1,
+            reserve_v2_fp8_scale_slots=True,
+        )
+        up = _local_linear(
+            x,
+            w3_local,
+            s3,
+            reserve_v2_fp8_scale_slots=True,
+        )
+        intermediate = jax.nn.silu(gate) * up
+        if v2_shared_block_size <= 0:
+            raise ValueError(
+                f"v2_shared_block_size must be positive, got {v2_shared_block_size}"
+            )
+
+        # V2's EP32/64K config uses bse=1024.  It quantizes every shared FFN2
+        # input block independently and rounds each accumulated partial back to
+        # the bf16 output buffer.  A single full-intermediate quantization has a
+        # different scale and produces ~3% layer drift on the real checkpoint.
+        block_size = min(v2_shared_block_size, intermediate.shape[1])
+        output = None
+        for start in range(0, intermediate.shape[1], block_size):
+            end = min(start + block_size, intermediate.shape[1])
+            partial = _local_linear(
+                intermediate[:, start:end],
+                w2_local[start:end, :],
+                s2,
+            )
+            if output is None:
+                output = partial.astype(x.dtype)
+            else:
+                output = (
+                    output.astype(jnp.float32) + partial.astype(jnp.float32)
+                ).astype(x.dtype)
+        return output
+
+    return jax.shard_map(
+        _run,
+        mesh=mesh,
+        in_specs=(
+            token_spec,
+            P(),
+            P(),
+            P(),
+            None if w1_scale is None else P(),
+            None if w3_scale is None else P(),
+            None if w2_scale is None else P(),
+        ),
+        out_specs=token_spec,
+        check_vma=False,
+    )(
+        hidden_states,
+        w1,
+        w3,
+        w2,
+        w1_scale,
+        w3_scale,
+        w2_scale,
+    )
+
+
+class FusedEPMoERS(FusedEPMoEV2):
+    """Stage-aware GLM MoE: fused-RS prefill and fused-v2 decode.
+
+    Both paths consume the same ``w1``/``w3``/``w2`` parameters. The RS kernel
+    receives gate/up separately and joins only the current VMEM tile, avoiding a
+    full HBM ``concatenate`` or a duplicated merged checkpoint parameter.
+    """
+
+    def _shared_expert_for_rs(
+        self,
+        hidden_states: jax.Array,
+        *,
+        enable_act_quant: bool,
+        v2_shared_block_size: int = 1024,
+    ) -> jax.Array:
+        w1_scale = self.w1_shared_scale.value if self.w1_shared_scale is not None else None
+        w3_scale = self.w3_shared_scale.value if self.w3_shared_scale is not None else None
+        w2_scale = self.w2_shared_scale.value if self.w2_shared_scale is not None else None
+        return fused_rs_shared_expert(
+            hidden_states,
+            self.w1_shared.value,
+            self.w3_shared.value,
+            self.w2_shared.value,
+            w1_scale=w1_scale,
+            w3_scale=w3_scale,
+            w2_scale=w2_scale,
+            activation_quantized_dtype=(
+                self.activation_quantized_dtype if enable_act_quant else None
+            ),
+            mesh=self.mesh,
+            v2_shared_block_size=v2_shared_block_size,
+        )
+
+    def __call__(
+        self,
+        hidden_states: jax.Array,
+        topk_weights: jax.Array,
+        topk_ids: jax.Array,
+        *,
+        use_rs: bool,
+        block_config=None,
+        out_sharding: jax.sharding.Sharding | None = None,
+        swiglu_limit: float | None = None,
+        shared_swiglu_limit: float | None = None,
+    ) -> jax.Array:
+        if not use_rs:
+            return super().__call__(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                block_config=block_config,
+                out_sharding=out_sharding,
+                swiglu_limit=swiglu_limit,
+                shared_swiglu_limit=shared_swiglu_limit,
+            )
+
+        if swiglu_limit is not None or shared_swiglu_limit is not None:
+            raise ValueError("fused_rs currently supports GLM SiLU without SwiGLU limits")
+
+        from sgl_jax.srt.kernels.fused_moe.fused_rs import fused_moe_func_rs
+
+        w1_scale = self.w1_scale.value if self.w1_scale is not None else None
+        w3_scale = self.w3_scale.value if self.w3_scale is not None else None
+        w2_scale = self.w2_scale.value if self.w2_scale is not None else None
+        expert_axis = ("data", "tensor")
+        rs_input_sharding = NamedSharding(self.mesh, P(expert_axis, None))
+        rs_hidden_states = jax.sharding.reshard(hidden_states, rs_input_sharding)
+        rs_topk_weights = jax.sharding.reshard(topk_weights, rs_input_sharding)
+        rs_topk_ids = jax.sharding.reshard(topk_ids, rs_input_sharding)
+
+        routed_output = fused_moe_func_rs(
+            hidden_states=rs_hidden_states,
+            w1=self.w1.value,
+            w3=self.w3.value,
+            w2=self.w2.value,
+            w1_scale=w1_scale,
+            w3_scale=w3_scale,
+            w2_scale=w2_scale,
+            w1_bias=None,
+            w2_bias=None,
+            gating_output=None,
+            topk=self.num_experts_per_tok,
+            renormalize=False,
+            mesh=self.mesh,
+            activation=self.activation,
+            scoring_fn="softmax",
+            topk_weights=rs_topk_weights,
+            topk_indices=rs_topk_ids,
+        )
+
+        if self.w1_shared is not None and not self.disable_shared_expert:
+            enable_act_quant = (
+                self.activation_quantized_dtype is not None
+                and self.enable_act_quant_cfg is not False
+                and self.w1_shared_scale is not None
+            )
+            shared_output = self._shared_expert_for_rs(
+                rs_hidden_states,
+                enable_act_quant=enable_act_quant,
+            )
+            routed_output = (
+                routed_output.astype(jnp.float32) + shared_output.astype(jnp.float32)
+            ).astype(hidden_states.dtype)
+
+        target = out_sharding or jax.sharding.NamedSharding(self.mesh, P("data", None))
+        return jax.sharding.reshard(routed_output, target)

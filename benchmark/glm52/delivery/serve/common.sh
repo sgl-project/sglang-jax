@@ -36,6 +36,15 @@ esac
 CONTEXT_LENGTH="${GLM52_CONTEXT_LENGTH:-135168}"
 CONCURRENCY="${GLM52_MAX_RUNNING_REQUESTS:-$CONCURRENCY}"
 PRECOMPILE_BS_PADDING="${GLM52_PRECOMPILE_BS_PADDING:-$CONCURRENCY}"
+MOE_BACKEND="${GLM52_MOE_BACKEND:-fused_v2}"
+case "$MOE_BACKEND" in
+  fused_v2|fused_rs) ;;
+  *)
+    printf 'unsupported GLM52_MOE_BACKEND: %s (expected fused_v2 or fused_rs)\n' \
+      "$MOE_BACKEND" >&2
+    exit 2
+    ;;
+esac
 for value_name in CONTEXT_LENGTH CONCURRENCY PRECOMPILE_BS_PADDING; do
   value="${!value_name}"
   if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
@@ -112,9 +121,9 @@ if [[ -n "$SERVER_LOG" ]]; then
   fi
 fi
 
-printf 'GLM52_DELIVERY_SERVER quantization=%s physical_chips=%s jax_devices=%s rank=%s world=%s model=%s log=%s\n' \
+printf 'GLM52_DELIVERY_SERVER quantization=%s physical_chips=%s jax_devices=%s rank=%s world=%s model=%s moe_backend=%s log=%s\n' \
   "$GLM52_QUANTIZATION" "$GLM52_PHYSICAL_CHIPS" "$PARALLEL_SIZE" \
-  "$RANK" "$WORLD" "$MODEL_PATH" "${SERVER_LOG:-stdout-only}"
+  "$RANK" "$WORLD" "$MODEL_PATH" "$MOE_BACKEND" "${SERVER_LOG:-stdout-only}"
 
 LAUNCH_ARGS=(
   -m sgl_jax.launch_server
@@ -135,7 +144,7 @@ LAUNCH_ARGS=(
   --dp-size "$PARALLEL_SIZE" \
   --dp-schedule-policy round_robin \
   --ep-size "$PARALLEL_SIZE" \
-  --moe-backend fused_v2 \
+  --moe-backend "$MOE_BACKEND" \
   --mem-fraction-static "$MEM_FRACTION_STATIC" \
   --max-running-requests "$CONCURRENCY" \
   --precompile-bs-paddings "$PRECOMPILE_BS_PADDING" \

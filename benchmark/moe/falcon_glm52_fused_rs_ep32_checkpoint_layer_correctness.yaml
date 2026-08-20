@@ -1,0 +1,157 @@
+name: glm52-fused-rs-ep32-checkpoint-layer-correctness-20260820-r13
+exp_type: TRAINING
+artifact_type: metrics
+cluster_name: tpu-training-antgroup
+priority: 0
+tags: [glm52, fused-rs, fused-v2, checkpoint-layer, correctness, channelwise, ep32, 16chip]
+config: '{"model":"glm-5.2","scope":"first_real_moe_layer","physical_chips":16,"visible_devices":32,"process_count":4,"physical_topology":"2x2x4","logical_mesh":"data1-tensor32","ep_size":32,"physical_tokens":65536,"active_tokens_per_shard":64,"active_tokens":2048,"routing":"real_checkpoint_gate_seed42_gaussian_hidden_padding_sentinel","quantization":"per_channel_moe_w8a8_linear_w8a16","comparisons":["v2_vs_rs_routed_only_active","v2_vs_rs_routed_plus_shared_active","routed_first_slot_only","shared_delta_boundary_estimate","routed_padding_zero"],"source_sha256":"c6ae094b9d8fdeca6b240cffb24b9bfddf241d9081d56137747dbad3c9ef7c54"}'
+role_to_task_spec:
+  worker:
+    command: |
+      bash <<'BASH'
+      set -euo pipefail
+      ulimit -c 0
+
+      export TMPDIR="${TMPDIR:-/tmp/tpu_logs/tmp}"
+      export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/tmp/tpu_logs/pip-cache}"
+      export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/tpu_logs/uv-cache}"
+      export JAX_COMPILATION_CACHE_DIR="${JAX_COMPILATION_CACHE_DIR:-/tmp/tpu_logs/jax-compilation-cache}"
+      mkdir -p "$TMPDIR" "$PIP_CACHE_DIR" "$UV_CACHE_DIR" "$JAX_COMPILATION_CACHE_DIR"
+
+      RANK="${FALCON_JAX_PROCESS_ID:-${JOB_COMPLETION_INDEX:-0}}"
+      ROOT="${ARTIFACT_LOCAL_DIR:-/tmp/glm52-rs-checkpoint-layer-artifact}"
+      RANK_OUT="$ROOT/rank-$RANK"
+      mkdir -p "$RANK_OUT/benchmark"
+
+      source_tar=/tmp/glm52-fused-rs-checkpoint-layer-source-r13.tar.gz.part
+      source_ready=/tmp/glm52-fused-rs-checkpoint-layer-source-r13.ready
+      attempt=0
+      while [ ! -f "$source_ready" ]; do
+        attempt=$((attempt + 1))
+        if [ "$attempt" -ge 360 ]; then
+          echo "timed out waiting for $source_ready" >&2
+          exit 1
+        fi
+        sleep 5
+      done
+      test -f "$source_tar"
+      echo "$SOURCE_SHA256  $source_tar" | sha256sum -c -
+
+      mkdir -p /workspace/sglang-jax
+      tar -xzf "$source_tar" -C /workspace/sglang-jax
+      cd /workspace/sglang-jax
+      python3 -m pip install -q -e './python[tpu]'
+      export PYTHONPATH="/workspace/sglang-jax/python:/workspace/sglang-jax${PYTHONPATH:+:$PYTHONPATH}"
+
+      python3 - <<'PY' > "$RANK_OUT/runtime-versions.txt"
+      import importlib.metadata as md
+      for package in ("jax", "jaxlib", "libtpu", "sglang-jax"):
+          try:
+              print(f"{package}={md.version(package)}")
+          except md.PackageNotFoundError:
+              print(f"{package}=MISSING")
+      PY
+
+      if [ "$RANK" = "0" ]; then
+        python3 - <<'PY'
+      import json
+      import os
+      from pathlib import Path
+
+      root = Path(os.environ.get("ARTIFACT_LOCAL_DIR", "/tmp/glm52-rs-checkpoint-layer-artifact"))
+      manifest = {
+          "schema_version": 1,
+          "workflow": "glm52-first-checkpoint-moe-layer-correctness",
+          "operator_family": "fused_moe",
+          "operator_name": "sglang_jax_glm52_fused_rs",
+          "hardware": {
+              "cluster": "tpu-training-antgroup",
+              "device_type": "v7x",
+              "chips": 16,
+              "visible_devices": 32,
+              "process_count": 4,
+              "local_devices_per_process": 8,
+              "physical_topology": "2x2x4",
+              "logical_mesh": "data1-tensor32",
+          },
+          "checkpoint": {
+              "path": "/models/GLM5.2-fp8-channel-wise",
+              "quant_config": "fp8_glm52_static_per_channel_moe_w8a8_linear_w8a16.yaml",
+              "moe_weight_quantization": "per_channel_w8a8",
+          },
+          "dimensions": {
+              "model": "glm-5.2",
+              "ep_size": 32,
+              "physical_tokens": 65536,
+              "tokens_per_shard": 2048,
+              "active_tokens_per_shard": 64,
+              "active_tokens": 2048,
+              "padding_tokens": 63488,
+              "seed": 42,
+              "routing_mode": "real_checkpoint_gate_gaussian_hidden_padding_sentinel",
+              "comparisons": [
+                  "v2_vs_rs_routed_only_active_rows",
+                  "v2_vs_rs_routed_plus_shared_active_rows",
+                  "v2_vs_rs_routed_first_slot_only",
+                  "v2_vs_rs_shared_delta_boundary_estimate",
+                  "v2_and_rs_routed_padding_zero",
+              ],
+          },
+          "source": {
+              "repository": "primatrix-glm/sglang-jax-private",
+              "base_commit": "e27fac67abadd7fff8f139cf6a7b069022ae9028",
+              "migration_branch": "dev/glm52-rs-ep32-64k",
+              "source_sha256": os.environ["SOURCE_SHA256"],
+          },
+          "acceptance": {
+              "all_finite": True,
+              "routed_padding_max_abs": 0.0,
+              "max_rel_l2": 0.01,
+              "timing_claim": False,
+              "gsm8k_authorization": False,
+          },
+      }
+      (root / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+      PY
+      fi
+
+      python3 -m benchmark.moe.check_glm52_fused_rs_checkpoint_layer \
+        --model-path /models/GLM5.2-fp8-channel-wise \
+        --quant-config python/sgl_jax/srt/utils/quantization/configs/fp8_glm52_static_per_channel_moe_w8a8_linear_w8a16.yaml \
+        --tokens 65536 \
+        --active-tokens-per-shard 64 \
+        --ep-size 32 \
+        --seed 42 \
+        --max-rel-l2 0.01 \
+        --jsonl "$RANK_OUT/benchmark/metrics.jsonl"
+      BASH
+    replica: 4
+    image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x4
+    envs:
+      SOURCE_SHA256: c6ae094b9d8fdeca6b240cffb24b9bfddf241d9081d56137747dbad3c9ef7c54
+      PYTHONUNBUFFERED: "1"
+      TMPDIR: /tmp/tpu_logs/tmp
+      PIP_CACHE_DIR: /tmp/tpu_logs/pip-cache
+      UV_CACHE_DIR: /tmp/tpu_logs/uv-cache
+      JAX_COMPILATION_CACHE_DIR: /tmp/tpu_logs/jax-compilation-cache
+    mounts:
+      - name: glm52-channelwise-model
+        type: gcs
+        bucket: inference-model-storage-poc-tpu-hns
+        prefix: GLM5.2-fp8-channel-wise
+        mount_path: /models/GLM5.2-fp8-channel-wise
+        read_only: true
+        mount_options:
+          - implicit-dirs
+          - metadata-cache:ttl-secs:-1
+          - metadata-cache:stat-cache-max-size-mb:-1
+          - metadata-cache:type-cache-max-size-mb:-1
+          - file-system:kernel-list-cache-ttl-secs:-1
+          - read:enable-buffered-read:true
+          - read:block-size-mb:32
+          - read:max-blocks-per-handle:64
+          - read:global-max-blocks:2048
+          - read_ahead_kb=1024

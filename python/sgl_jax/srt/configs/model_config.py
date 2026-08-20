@@ -39,6 +39,7 @@ class MoEBackend(str, Enum):
     EPMOE = "epmoe"  # Native Expert Parallel MoE (default)
     FUSED = "fused"  # Fused Kernel (TPU-optimized)
     FUSED_V2 = "fused_v2"  # Fused Kernel V2 (Strix-style double-buffer)
+    FUSED_RS = "fused_rs"  # GLM prefill RS + decode V2 hybrid
     AUTO = "auto"  # Automatically select based on ep_size
 
 
@@ -65,6 +66,16 @@ def _assert_fused_moe_v2_supported(moe_backend: MoEBackend, architectures: list[
     assert any(arch in _FUSED_MOE_V2_SUPPORTED_ARCHITECTURES for arch in architectures), (
         "moe_backend='fused_v2' only supports Bailing/MiMo/GLM model architectures for now; "
         f"got architectures={architectures}"
+    )
+
+
+def _assert_fused_moe_rs_supported(moe_backend: MoEBackend, architectures: list[str]) -> None:
+    if moe_backend != MoEBackend.FUSED_RS:
+        return
+
+    assert "GlmMoeDsaForCausalLM" in architectures, (
+        "moe_backend='fused_rs' currently supports GLM-5.2 "
+        f"(GlmMoeDsaForCausalLM) only; got architectures={architectures}"
     )
 
 
@@ -143,6 +154,7 @@ class ModelConfig:
                 "Check that the model path points to a valid Hugging Face model directory."
             )
         _assert_fused_moe_v2_supported(self.moe_backend, self.hf_config.architectures)
+        _assert_fused_moe_rs_supported(self.moe_backend, self.hf_config.architectures)
 
         # Models whose MoE block hard-codes FusedEPMoE (fused_ep_moe v1 kernel)
         # instead of dispatching on --moe-backend. Resolve the effective backend

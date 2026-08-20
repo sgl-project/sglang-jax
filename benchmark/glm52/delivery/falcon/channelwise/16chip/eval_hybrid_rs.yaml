@@ -1,0 +1,68 @@
+name: glm52-delivery-channelwise-16chip-hybrid-rs-gsm8k-quick-r4
+exp_type: TRAINING
+artifact_type: metrics
+cluster_name: tpu-training-antgroup
+priority: 0
+tags: [glm52, delivery, eval, gsm8k, quick-200, channelwise, fused-rs-prefill, fused-v2-decode, 16chip]
+config: '{"scenario":"eval","model":"GLM5.2-fp8-channel-wise","quantization":"per-channel-weight-moe-w8a8-linear-w8a16","physical_chips":16,"jax_devices":32,"hosts":4,"devices_per_host":8,"tp":32,"dp":32,"ep":32,"moe_backend":"fused_rs_prefill_fused_v2_decode","dataset":"gsm8k","eval_scope":"quick","num_examples":200,"min_score":0.90,"temperature":0.0,"top_p":1.0,"seed":3,"max_tokens":4096,"source_sha256":"30826c2f0859b0bbe1c099a66ba3647a621b43307da575fad4cb204fde5d8e79"}'
+role_to_task_spec:
+  worker:
+    command: |
+      set -eu
+      ulimit -c 0
+      source_tar=/tmp/glm52-fused-rs-hybrid-source.tar.gz.part
+      source_ready=/tmp/glm52-fused-rs-hybrid-source.ready
+      attempt=0
+      while [ ! -f "$source_ready" ]; do
+        attempt=$((attempt + 1))
+        if [ "$attempt" -ge 360 ]; then
+          echo "timed out waiting for $source_ready" >&2
+          exit 1
+        fi
+        sleep 5
+      done
+      test -f "$source_tar"
+      echo '30826c2f0859b0bbe1c099a66ba3647a621b43307da575fad4cb204fde5d8e79  /tmp/glm52-fused-rs-hybrid-source.tar.gz.part' | sha256sum -c -
+      mkdir -p /workspace/sglang-jax
+      tar -xzf "$source_tar" -C /workspace/sglang-jax
+      cd /workspace/sglang-jax
+      exec bash benchmark/glm52/delivery/falcon/runner.sh
+    replica: 4
+    image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x4
+    envs:
+      SOURCE_SHA256: 30826c2f0859b0bbe1c099a66ba3647a621b43307da575fad4cb204fde5d8e79
+      GLM52_PHYSICAL_CHIPS: "16"
+      GLM52_QUANTIZATION: channelwise
+      GLM52_MOE_BACKEND: fused_rs
+      MODEL_PATH: /models/GLM5.2-fp8-channel-wise
+      RUN_MODE: eval
+      EVAL_DATASET: gsm8k
+      EVAL_SCOPE: quick
+      MIN_SCORE: "0.90"
+      SGL_EVAL_COMMIT: 32fa49229575e433629c37379821b5a589a2e422
+      PYTHONUNBUFFERED: "1"
+      TMPDIR: /tmp/tpu_logs/tmp
+      PIP_CACHE_DIR: /tmp/tpu_logs/pip-cache
+      UV_CACHE_DIR: /tmp/tpu_logs/uv-cache
+      JAX_COMPILATION_CACHE_DIR: /tmp/tpu_logs/jax-compilation-cache
+    mounts:
+      - name: glm52-channelwise-model
+        type: gcs
+        bucket: inference-model-storage-poc-tpu-hns
+        prefix: GLM5.2-fp8-channel-wise
+        mount_path: /models/GLM5.2-fp8-channel-wise
+        read_only: true
+        mount_options:
+          - implicit-dirs
+          - metadata-cache:ttl-secs:-1
+          - metadata-cache:stat-cache-max-size-mb:-1
+          - metadata-cache:type-cache-max-size-mb:-1
+          - file-system:kernel-list-cache-ttl-secs:-1
+          - read:enable-buffered-read:true
+          - read:block-size-mb:32
+          - read:max-blocks-per-handle:64
+          - read:global-max-blocks:2048
+          - read_ahead_kb=1024

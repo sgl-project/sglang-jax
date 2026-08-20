@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/../../../.." && pwd)"
+
 if [[ $# -ne 1 ]]; then
   printf 'usage: %s {gsm8k|aime26}\n' "$0" >&2
   exit 2
@@ -62,7 +65,7 @@ mkdir -p "$OUT_DIR"
 printf 'GLM52_DELIVERY_EVAL dataset=%s scope=%s examples=%s threads=%s model=%s output=%s\n' \
   "$DATASET" "$EVAL_SCOPE" "$NUM_EXAMPLES" "$NUM_THREADS" "$MODEL_PATH" "$OUT_DIR"
 
-exec sgl-eval run "$DATASET" \
+EVAL_CMD=(sgl-eval run "$DATASET" \
   --base-url "$BASE_URL" \
   --model "$MODEL_PATH" \
   --num-examples "$NUM_EXAMPLES" \
@@ -74,4 +77,14 @@ exec sgl-eval run "$DATASET" \
   --max-tokens "$MAX_TOKENS" \
   --thinking \
   --chat-template-kwarg enable_thinking=true \
-  --out-dir "$OUT_DIR"
+  --out-dir "$OUT_DIR")
+
+if [[ -z "${MIN_SCORE:-}" ]]; then
+  exec "${EVAL_CMD[@]}"
+fi
+
+"${EVAL_CMD[@]}"
+python3 "$REPO_ROOT/benchmark/glm52/delivery/validation/validate_accuracy_metrics.py" \
+  --root "$OUT_DIR" \
+  --min-score "$MIN_SCORE" \
+  --expected-examples "$NUM_EXAMPLES"

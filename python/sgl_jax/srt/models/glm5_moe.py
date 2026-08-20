@@ -30,6 +30,7 @@ from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import (
     EPMoE,
     FusedEPMoE,
+    FusedEPMoERS,
     FusedEPMoEV2,
     GateLogit,
     TopK,
@@ -48,6 +49,11 @@ from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 logger = logging.getLogger(__name__)
 
 _GLM5_BF16_LINEAR_SPECS = [("self_attn.o_proj", None)]
+
+
+def _use_fused_rs_for_forward_mode(forward_mode) -> bool:
+    """RS is a prefill backend; decode-family compilations stay on fused-v2."""
+    return forward_mode.is_extend_or_draft_extend_or_mixed()
 
 
 def _dequantize_glm5_latency_sensitive_linears(loader: WeightLoader, layers: list) -> None:
@@ -1011,9 +1017,16 @@ class Glm5DecoderLayer(nnx.Module):
             )
 
             self.moe_backend = getattr(config, "moe_backend", MoEBackend.EPMOE)
-            self.use_fused = self.moe_backend in (MoEBackend.FUSED, MoEBackend.FUSED_V2)
+            self.use_fused = self.moe_backend in (
+                MoEBackend.FUSED,
+                MoEBackend.FUSED_V2,
+                MoEBackend.FUSED_RS,
+            )
             num_shared_experts = getattr(config, "n_shared_experts", 0)
-            use_inkernel_se = self.moe_backend == MoEBackend.FUSED_V2 and num_shared_experts > 0
+            use_inkernel_se = self.moe_backend in (
+                MoEBackend.FUSED_V2,
+                MoEBackend.FUSED_RS,
+            ) and num_shared_experts > 0
 
             self.topk = TopK(
                 topk=config.num_experts_per_tok,
@@ -1025,8 +1038,13 @@ class Glm5DecoderLayer(nnx.Module):
                 mesh=mesh,
             )
 
-            if self.moe_backend == MoEBackend.FUSED_V2:
-                self.mlp = FusedEPMoEV2(
+            if self.moe_backend in (MoEBackend.FUSED_V2, MoEBackend.FUSED_RS):
+                fused_cls = (
+                    FusedEPMoERS
+                    if self.moe_backend == MoEBackend.FUSED_RS
+                    else FusedEPMoEV2
+                )
+                self.mlp = fused_cls(
                     hidden_size=config.hidden_size,
                     num_experts=config.n_routed_experts,
                     num_experts_per_tok=config.num_experts_per_tok,
@@ -1203,7 +1221,22 @@ class Glm5DecoderLayer(nnx.Module):
                         dispatch_info=dispatch_info,
                     )
 
-                hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
+                if self.use_fused:
+                    token_valid_mask = forward_batch.get_token_valid_mask(
+                        hidden_states.shape[0]
+                    )
+                    if token_valid_mask is not None:
+                        topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
+
+                if self.moe_backend == MoEBackend.FUSED_RS:
+                    hidden_states = self.mlp(
+                        hidden_states,
+                        topk_weights,
+                        topk_ids,
+                        use_rs=_use_fused_rs_for_forward_mode(forward_batch.forward_mode),
+                    )
+                else:
+                    hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
 
                 if shared_output is not None:
                     hidden_states = hidden_states + shared_output
@@ -1542,7 +1575,7 @@ class Glm5ForCausalLM(nnx.Module):
 
             if is_static_quant:
                 new_moe_mappings = {}
-                use_model_mesh_for_scale = moe_backend in ("fused", "fused_v2")
+                use_model_mesh_for_scale = moe_backend in ("fused", "fused_v2", "fused_rs")
 
                 for key, mapping in moe_mappings.items():
                     target_param = mapping.target_path[0]
@@ -1596,7 +1629,7 @@ class Glm5ForCausalLM(nnx.Module):
             num_shared = getattr(self.config, "n_shared_experts", 0)
             if num_shared > 0:
                 sp = f"{prefix}.mlp.shared_experts"
-                if moe_backend == "fused_v2":
+                if moe_backend in ("fused_v2", "fused_rs"):
                     for hf_name, target_name in (
                         ("gate_proj", "w1_shared"),
                         ("up_proj", "w3_shared"),

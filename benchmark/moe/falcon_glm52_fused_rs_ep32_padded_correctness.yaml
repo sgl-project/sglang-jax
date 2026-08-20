@@ -1,0 +1,137 @@
+name: glm52-fused-rs-ep32-padded-backend-correctness-20260820-r4
+exp_type: TRAINING
+artifact_type: metrics
+cluster_name: tpu-training-antgroup
+priority: 0
+tags: [glm52, fused-rs, correctness, padded-extend, backend-only, ep32, exact-16chips]
+config: '{"model":"glm-5.2","scope":"standalone_moe_backend_padded_extend","physical_chips":16,"visible_devices":32,"process_count":4,"physical_topology":"2x2x4","logical_mesh":"data1-tensor32","ep_size":32,"physical_tokens":65536,"active_tokens_per_shard":64,"active_tokens":2048,"num_experts":256,"top_k":8,"routing":"seed42_gaussian_random_topk_active_with_padding_sentinel","quantization":"per_channel_w8a8","input_profile":"expert_distinct_positive","comparisons":["v2_vs_rs_routed_only_active_rows","v2_vs_rs_routed_plus_shared_active_rows","same_backend_active_padding_fidelity","routed_padding_zero"],"source_sha256":"fc1e74fdf6d4871be21335a57fc77a77bf1c1ae2f5a33f645747f4b843f6d4f0"}'
+role_to_task_spec:
+  worker:
+    replica: 4
+    image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x4
+    envs:
+      PYTHONUNBUFFERED: "1"
+      TMPDIR: /tmp/tpu_logs/tmp
+      PIP_CACHE_DIR: /tmp/tpu_logs/pip-cache
+      UV_CACHE_DIR: /tmp/tpu_logs/uv-cache
+      JAX_COMPILATION_CACHE_DIR: /tmp/tpu_logs/jax-compilation-cache
+      SOURCE_SHA256: fc1e74fdf6d4871be21335a57fc77a77bf1c1ae2f5a33f645747f4b843f6d4f0
+    command: |
+      bash <<'BASH'
+      set -euo pipefail
+      ulimit -c 0
+
+      export TMPDIR="${TMPDIR:-/tmp/tpu_logs/tmp}"
+      export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/tmp/tpu_logs/pip-cache}"
+      export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/tpu_logs/uv-cache}"
+      export JAX_COMPILATION_CACHE_DIR="${JAX_COMPILATION_CACHE_DIR:-/tmp/tpu_logs/jax-compilation-cache}"
+      mkdir -p "$TMPDIR" "$PIP_CACHE_DIR" "$UV_CACHE_DIR" "$JAX_COMPILATION_CACHE_DIR"
+
+      RANK="${FALCON_JAX_PROCESS_ID:-${JOB_COMPLETION_INDEX:-0}}"
+      ROOT="${ARTIFACT_LOCAL_DIR:-/tmp/glm52-rs-padded-correctness-artifact}"
+      RANK_OUT="$ROOT/rank-$RANK"
+      mkdir -p "$RANK_OUT/benchmark"
+
+      source_tar=/tmp/glm52-fused-rs-padded-source-r4.tar.gz.part
+      source_ready=/tmp/glm52-fused-rs-padded-source-r4.ready
+      attempt=0
+      while [ ! -f "$source_ready" ]; do
+        attempt=$((attempt + 1))
+        if [ "$attempt" -ge 360 ]; then
+          echo "timed out waiting for $source_ready" >&2
+          exit 1
+        fi
+        sleep 5
+      done
+      test -f "$source_tar"
+      echo "$SOURCE_SHA256  $source_tar" | sha256sum -c -
+
+      mkdir -p /workspace/sglang-jax
+      tar -xzf "$source_tar" -C /workspace/sglang-jax
+      cd /workspace/sglang-jax
+      python3 -m pip install -q -e './python[tpu]'
+      export PYTHONPATH="/workspace/sglang-jax/python:/workspace/sglang-jax${PYTHONPATH:+:$PYTHONPATH}"
+
+      python3 - <<'PY' > "$RANK_OUT/runtime-versions.txt"
+      import importlib.metadata as md
+      for package in ("jax", "jaxlib", "libtpu", "sglang-jax"):
+          try:
+              print(f"{package}={md.version(package)}")
+          except md.PackageNotFoundError:
+              print(f"{package}=MISSING")
+      PY
+
+      if [ "$RANK" = "0" ]; then
+        python3 - <<'PY'
+      import json
+      import os
+      from pathlib import Path
+
+      root = Path(os.environ.get("ARTIFACT_LOCAL_DIR", "/tmp/glm52-rs-padded-correctness-artifact"))
+      manifest = {
+          "schema_version": 1,
+          "workflow": "moe-backend-padded-extend-correctness",
+          "operator_family": "fused_moe",
+          "operator_name": "sglang_jax_glm52_fused_rs",
+          "hardware": {
+              "cluster": "tpu-training-antgroup",
+              "device_type": "v7x",
+              "chips": 16,
+              "visible_devices": 32,
+              "process_count": 4,
+              "local_devices_per_process": 8,
+              "physical_topology": "2x2x4",
+              "logical_mesh": "data1-tensor32",
+          },
+          "dimensions": {
+              "model": "glm-5.2",
+              "ep_size": 32,
+              "physical_tokens": 65536,
+              "tokens_per_shard": 2048,
+              "active_tokens_per_shard": 64,
+              "active_tokens": 2048,
+              "padding_tokens": 63488,
+              "num_experts": 256,
+              "top_k": 8,
+              "hidden_size": 6144,
+              "intermediate_size": 2048,
+              "quant_mode": "per_channel_w8a8",
+              "routing_mode": "seed42_gaussian_topk8_active_padding_sentinel",
+              "input_profile": "expert_distinct_positive",
+              "comparisons": [
+                  "v2_vs_rs_routed_only_active_rows",
+                  "v2_vs_rs_routed_plus_shared_active_rows",
+                  "v2_and_rs_same_backend_active_padding_fidelity",
+                  "v2_and_rs_invalid_routed_rows_zero",
+              ],
+          },
+          "source": {
+              "repository": "primatrix-glm/sglang-jax-private",
+              "base_commit": "e27fac67abadd7fff8f139cf6a7b069022ae9028",
+              "migration_branch": "dev/glm52-rs-ep32-64k",
+              "source_sha256": os.environ["SOURCE_SHA256"],
+          },
+          "acceptance": {
+              "all_finite": True,
+              "invalid_routed_padding_max_abs": 0.0,
+              "max_rel_l2": 0.10,
+              "timing_claim": False,
+              "gsm8k_authorization": False,
+          },
+      }
+      (root / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+      PY
+      fi
+
+      python3 -m benchmark.moe.check_fused_rs_moe_accuracy \
+        --tokens 64 \
+        --ep-size 32 \
+        --routing-seed 42 \
+        --max-rel-l2 0.10 \
+        --padded-total-tokens 65536 \
+        --padded-active-tokens-per-shard 64 \
+        --jsonl "$RANK_OUT/benchmark/metrics.jsonl"
+      BASH

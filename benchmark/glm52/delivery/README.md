@@ -143,6 +143,16 @@ MODEL_PATH=/models/GLM5.2-fp8-channel-wise \
   benchmark/glm52/delivery/serve/channelwise_16chip.sh
 ```
 
+For the stage-aware migrated backend, use the same channel-wise checkpoint and
+topology with the hybrid entry point. It selects fused-RS for prefill-family
+forward modes and keeps fused-v2 for decode and target verification:
+
+```bash
+WORLD=4 RANK=0 MASTER_ADDR=<rank-0-host> \
+MODEL_PATH=/models/GLM5.2-fp8-channel-wise \
+  benchmark/glm52/delivery/serve/channelwise_16chip_hybrid_rs.sh
+```
+
 For the block-wise checkpoint, select the matching `blockwise_*.sh` entry
 point and set `MODEL_PATH=/models/GLM-5.2-FP8`.
 
@@ -200,6 +210,15 @@ python3 -m pip install \
 GSM8K defaults to a quick deterministic 200-example smoke evaluation:
 
 ```bash
+MODEL_PATH=/models/GLM5.2-fp8-channel-wise \
+  benchmark/glm52/delivery/eval/run.sh gsm8k
+```
+
+Set `MIN_SCORE` to turn the deterministic run into a CI/PR gate. The gate also
+requires the requested number of examples to complete and rejects partial runs:
+
+```bash
+MIN_SCORE=0.90 \
 MODEL_PATH=/models/GLM5.2-fp8-channel-wise \
   benchmark/glm52/delivery/eval/run.sh gsm8k
 ```

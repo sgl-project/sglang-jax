@@ -2,7 +2,10 @@
 set -euo pipefail
 ulimit -c 0
 
-: "${SOURCE_COMMIT:?Falcon manifest must pin SOURCE_COMMIT}"
+if [[ -z "${SOURCE_COMMIT:-}" && -z "${SOURCE_SHA256:-}" ]]; then
+  printf 'Falcon manifest must pin SOURCE_COMMIT or SOURCE_SHA256\n' >&2
+  exit 2
+fi
 : "${GLM52_PHYSICAL_CHIPS:?expected 8 or 16}"
 : "${GLM52_QUANTIZATION:?expected blockwise or channelwise}"
 RUN_MODE="${RUN_MODE:-benchmark}"
@@ -54,8 +57,14 @@ if [[ "$RANK" == "0" ]]; then
 fi
 
 cd /workspace/sglang-jax
-test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
-git rev-parse HEAD > "$RANK_OUT/source-revision.txt"
+if [[ -n "${SOURCE_COMMIT:-}" ]]; then
+  test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+  git rev-parse HEAD > "$RANK_OUT/source-revision.txt"
+  SOURCE_ID="$SOURCE_COMMIT"
+else
+  printf 'sha256:%s\n' "$SOURCE_SHA256" > "$RANK_OUT/source-revision.txt"
+  SOURCE_ID="sha256:$SOURCE_SHA256"
+fi
 if [[ "$RUN_MODE" == "agent_eval" ]]; then
   : "${EVALSCOPE_COMMIT:?Falcon manifest must pin EVALSCOPE_COMMIT for agent_eval}"
   EVALSCOPE_GITLINK="$(git ls-tree HEAD third_party/evalscope | awk '{print $3}')"
@@ -139,7 +148,23 @@ if [[ "$RUN_MODE" == "profile" ]]; then
   export SGLANG_PROFILE_NUM_SPARSE_CORE_TILES_TO_TRACE=1
 fi
 
-SERVE_SCRIPT="benchmark/glm52/delivery/serve/${GLM52_QUANTIZATION}_${GLM52_PHYSICAL_CHIPS}chip.sh"
+MOE_BACKEND="${GLM52_MOE_BACKEND:-fused_v2}"
+case "$MOE_BACKEND" in
+  fused_v2)
+    SERVE_SCRIPT="benchmark/glm52/delivery/serve/${GLM52_QUANTIZATION}_${GLM52_PHYSICAL_CHIPS}chip.sh"
+    ;;
+  fused_rs)
+    if [[ "$GLM52_QUANTIZATION" != "channelwise" || "$GLM52_PHYSICAL_CHIPS" != "16" ]]; then
+      printf 'fused_rs delivery is only validated for channelwise 16-chip GLM-5.2\n' >&2
+      exit 2
+    fi
+    SERVE_SCRIPT="benchmark/glm52/delivery/serve/channelwise_16chip_hybrid_rs.sh"
+    ;;
+  *)
+    printf 'unsupported GLM52_MOE_BACKEND=%s\n' "$MOE_BACKEND" >&2
+    exit 2
+    ;;
+esac
 SERVE_EXTRA_ARGS=()
 if [[ "$RUN_MODE" == "agent_eval" ]]; then
   SERVE_EXTRA_ARGS+=(
@@ -149,9 +174,11 @@ if [[ "$RUN_MODE" == "agent_eval" ]]; then
     --reasoning-parser "${GLM52_REASONING_PARSER:-glm45}"
   )
 fi
-printf 'GLM52_FALCON_DELIVERY_START quantization=%s physical_chips=%s mode=%s rank=%s world=%s commit=%s\n' \
-  "$GLM52_QUANTIZATION" "$GLM52_PHYSICAL_CHIPS" "$RUN_MODE" "$RANK" "$WORLD" "$SOURCE_COMMIT"
+printf 'GLM52_FALCON_DELIVERY_START quantization=%s physical_chips=%s mode=%s rank=%s world=%s source=%s moe_backend=%s serve_script=%s\n' \
+  "$GLM52_QUANTIZATION" "$GLM52_PHYSICAL_CHIPS" "$RUN_MODE" "$RANK" "$WORLD" \
+  "$SOURCE_ID" "$MOE_BACKEND" "$SERVE_SCRIPT"
 GLM52_SERVER_LOG=/dev/stdout \
+GLM52_MOE_BACKEND="$MOE_BACKEND" \
 WORLD="$WORLD" RANK="$RANK" MASTER_ADDR="$MASTER_ADDR" MODEL_PATH="$MODEL_PATH" \
   "$SERVE_SCRIPT" "${SERVE_EXTRA_ARGS[@]}" > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!

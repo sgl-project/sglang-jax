@@ -352,13 +352,14 @@ class Scheduler(
                 device_indexes=server_args.device_indexes,
             )
 
-        if server_args.moe_backend in ("fused", "fused_v2"):
+        if server_args.moe_backend in ("fused", "fused_v2", "fused_rs"):
             mesh_ep_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
             if server_args.ep_size != mesh_ep_size:
                 logger.warning(
-                    "moe_backend='fused' uses EP size = mesh(data*tensor)=%d, but --ep-size=%d. "
+                    "moe_backend=%r uses EP size = mesh(data*tensor)=%d, but --ep-size=%d. "
                     "If you expected separate EP and TP (e.g. ep_size=%d, tp_size=%d), note that the "
                     "fused MoE kernel currently treats the full 2D mesh as its EP group.",
+                    server_args.moe_backend,
                     mesh_ep_size,
                     server_args.ep_size,
                     server_args.ep_size,

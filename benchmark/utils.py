@@ -91,6 +91,70 @@ def _extract_marker_durations_ms(trace: dict[str, Any], task: str | None = None)
     return max(sorted(durations_by_pid.items()), key=lambda kv: len(kv[1]))[1]
 
 
+def _extract_device_durations_by_pid_ms(
+    trace: dict[str, Any], task: str
+) -> dict[int, list[float]]:
+    """Return strict device durations for every PID matching ``task``.
+
+    Unlike :func:`_extract_marker_durations_ms`, this helper deliberately does
+    not fall back to host ``dur`` events and does not select one PID.  Distributed
+    benchmarks can therefore compute a per-iteration critical path across all
+    locally addressable TPU devices before aggregating across processes.
+    """
+    event_matcher = re.compile(task)
+    marker_events: list[dict[str, Any]] = []
+    task_events: list[dict[str, Any]] = []
+    for event in trace.get("traceEvents", []):
+        name = event.get("name")
+        args = event.get("args", {})
+        tf_op = args.get("tf_op", "")
+        if isinstance(tf_op, str) and MARKER in tf_op:
+            marker_events.append(event)
+        elif isinstance(name, str) and event_matcher.match(name):
+            task_events.append(event)
+
+    # JAX emits the named-scope device interval as a ``call-done`` event on
+    # current TPU profiler versions.  Keep the generic marker fallback for
+    # older versions, but never mix host StepTraceAnnotation events into the
+    # strict device sample set.
+    marker_device_events = [
+        event
+        for event in marker_events
+        if event.get("args", {}).get("device_duration_ps")
+    ]
+    marker_call_done_events = [
+        event
+        for event in marker_device_events
+        if event.get("name", "").endswith("call-done")
+    ]
+    task_device_events = [
+        event
+        for event in task_events
+        if event.get("args", {}).get("device_duration_ps")
+    ]
+    candidate_events = (
+        marker_call_done_events or marker_device_events or task_device_events
+    )
+
+    by_pid: dict[int, list[dict[str, Any]]] = {}
+    for event in candidate_events:
+        pid = event.get("pid")
+        args = event.get("args", {})
+        if (
+            isinstance(pid, int)
+            and args.get("device_duration_ps")
+        ):
+            by_pid.setdefault(pid, []).append(event)
+
+    durations: dict[int, list[float]] = {}
+    for pid, events in by_pid.items():
+        events.sort(key=lambda event: float(event.get("ts", 0.0)))
+        durations[pid] = [
+            float(event["args"]["device_duration_ps"]) / 1e9 for event in events
+        ]
+    return durations
+
+
 def _load_trace(trace_root: str) -> dict[str, Any]:
     trace_dir = pathlib.Path(trace_root) / "plugins" / "profile"
     if not trace_dir.exists():
@@ -146,3 +210,36 @@ def multiple_iteration_timeit_from_trace(
 
     trace = _load_trace(trace_dir)
     return _extract_marker_durations_ms(trace, task=task)
+
+
+def multiple_iteration_device_timeit_from_trace(
+    compute_func,
+    data_generator,
+    task: str,
+    tries: int = 5,
+    warmup: int = 0,
+    trace_root: str = "/tmp/sglang_jax_moe_trace",
+) -> dict[int, list[float]]:
+    """Profile calls and return device durations for every matching PID."""
+    trace_name = f"{task}_all_devices_" + "".join(
+        random.choices(string.ascii_uppercase + string.digits, k=6)
+    )
+    trace_dir = os.path.join(trace_root, trace_name)
+    os.makedirs(trace_dir, exist_ok=True)
+
+    start = time.perf_counter()
+    for _ in range(max(0, int(warmup))):
+        data_args = data_generator()
+        out = compute_func(*data_args)
+        jax.block_until_ready(out)
+    print(f"warmed up in {(time.perf_counter() - start) * 1000} ms")
+
+    with jax.profiler.trace(trace_dir):
+        for i in range(tries):
+            data_args = data_generator()
+            with jax.profiler.StepTraceAnnotation(task, step_num=i):
+                out = compute_func(*data_args)
+                jax.block_until_ready(out)
+
+    trace = _load_trace(trace_dir)
+    return _extract_device_durations_by_pid_ms(trace, task)

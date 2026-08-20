@@ -127,7 +127,7 @@ class TestBucketComputation(unittest.TestCase):
             assert b % 4 == 0, f"bucket {b} not divisible by dp_size=4"
 
     def test_bs_buckets_fused_moe_minimum(self):
-        for backend in ("fused", "fused_v2"):
+        for backend in ("fused", "fused_v2", "fused_rs"):
             cm = CompilationManager(
                 server_args=_make_server_args(moe_backend=backend),
                 max_padded_batch_size=128,
