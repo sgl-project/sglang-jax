@@ -1392,30 +1392,45 @@ class MLATokenToKVPool(KVCache):
 
     def _calculate_memory_usage(self):
         """Calculate memory usage for the 4D paged MLA cache."""
-        total_bytes = self._buffer_bytes() * self.layer_num
-        self.mem_usage = total_bytes / GB
+        latent_bytes = self._buffer_bytes() * self.layer_num
+        indexer_bytes = self._indexer_buffer_bytes() * self.num_indexer_layers
+        self.mem_usage = (latent_bytes + indexer_bytes) / GB
 
+        breakdown = (
+            f" (latent {latent_bytes / GB:.2f} GB + DSA indexer {indexer_bytes / GB:.2f} GB)"
+            if indexer_bytes
+            else ""
+        )
         logger.info(
-            "JAX MLA KV Cache allocated. #tokens: %s, KV size: %.2f GB",
+            "JAX MLA KV Cache allocated. #tokens: %s, KV size: %.2f GB%s",
             self.size,
-            total_bytes / GB,
+            self.mem_usage,
+            breakdown,
         )
 
-    def _buffer_bytes(self) -> int:
+    def _buffer_bytes(self, kv_dim: int | None = None) -> int:
+        """Bytes for ONE paged buffer of ``kv_dim`` feature width (default: latent)."""
         total_num_pages = (self.size + self.page_size * self.dp_size) // self.page_size
         from sgl_jax.srt.kernels.mla.v2.kernel import get_kv_cache_shape
 
         shape = get_kv_cache_shape(
             total_num_pages=total_num_pages,
             page_size=self.page_size,
-            kv_dim=self.kv_dim,
+            kv_dim=self.kv_dim if kv_dim is None else kv_dim,
             kv_dtype=self.dtype,
         )
         return shape[0] * shape[1] * shape[2] * shape[3] * jnp.dtype(self.dtype).itemsize
 
+    def _indexer_buffer_bytes(self) -> int:
+        """Bytes for ONE DSA indexer key buffer; 0 when none is allocated."""
+        if not (self.indexer_key_dim and self.num_indexer_layers):
+            return 0
+        return self._buffer_bytes(kv_dim=self.indexer_key_dim)
+
     def get_kv_size_bytes(self):
-        """Calculate KV cache size in bytes."""
-        return self._buffer_bytes() * self.layer_num
+        """Resident bytes for this pool, including the DSA indexer key buffers."""
+        latent = self._buffer_bytes() * self.layer_num
+        return latent + self._indexer_buffer_bytes() * self.num_indexer_layers
 
     def get_fused_kv_buffer(self, layer_id: int) -> jax.Array:
         """Return the 4D paged buffer; consumed directly by the MLA v2 kernel."""
