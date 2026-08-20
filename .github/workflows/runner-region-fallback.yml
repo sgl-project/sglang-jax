@@ -1,0 +1,128 @@
+name: Runner Region Fallback
+
+# Managed workflows use us-east5 on attempt 1 and us-south1 on later attempts.
+# This watchdog supplies the queue timeout that GitHub Actions does not provide.
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: runner-region-fallback
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  fallback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Re-run workflows stuck waiting for us-east5 runners
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const queueTimeoutMs = 10 * 60 * 1000;
+            const eastRunnerLabel = /-us-east5-a$/;
+            const managedWorkflowPaths = new Set([
+              ".github/workflows/lint.yml",
+              ".github/workflows/nightly-test-daily.yml",
+              ".github/workflows/nightly-test-summize.yml",
+              ".github/workflows/pr-test.yml",
+              ".github/workflows/weekly-test.yml",
+            ]);
+
+            const candidateRuns = new Map();
+            for (const status of ["queued", "in_progress"]) {
+              const runs = await github.paginate(
+                github.rest.actions.listWorkflowRunsForRepo,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  status,
+                  per_page: 100,
+                },
+              );
+              for (const run of runs) {
+                if (
+                  Number(run.run_attempt) === 1 &&
+                  managedWorkflowPaths.has(run.path)
+                ) {
+                  candidateRuns.set(run.id, run);
+                }
+              }
+            }
+
+            const now = Date.now();
+            for (const run of candidateRuns.values()) {
+              const jobs = await github.paginate(
+                github.rest.actions.listJobsForWorkflowRun,
+                {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  run_id: run.id,
+                  filter: "latest",
+                  per_page: 100,
+                },
+              );
+
+              const staleJobs = jobs.filter((job) => {
+                if (job.status !== "queued" || !job.started_at) {
+                  return false;
+                }
+                if (!job.labels.some((label) => eastRunnerLabel.test(label))) {
+                  return false;
+                }
+                return now - Date.parse(job.started_at) >= queueTimeoutMs;
+              });
+
+              if (staleJobs.length === 0) {
+                continue;
+              }
+
+              core.warning(
+                `Run ${run.id} has ${staleJobs.length} job(s) waiting for ` +
+                  `us-east5 runners for at least 10 minutes; switching the ` +
+                  `whole workflow to us-south1.`,
+              );
+
+              await github.rest.actions.cancelWorkflowRun({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: run.id,
+              });
+
+              let cancelled = false;
+              for (let attempt = 0; attempt < 24; attempt += 1) {
+                await new Promise((resolve) => setTimeout(resolve, 5000));
+                const { data: currentRun } =
+                  await github.rest.actions.getWorkflowRun({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    run_id: run.id,
+                  });
+                if (currentRun.status === "completed") {
+                  cancelled = true;
+                  break;
+                }
+              }
+
+              if (!cancelled) {
+                core.warning(
+                  `Run ${run.id} did not finish cancelling within two minutes; ` +
+                    `the next watchdog run will retry it.`,
+                );
+                continue;
+              }
+
+              await github.rest.actions.reRunWorkflow({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: run.id,
+              });
+              core.notice(
+                `Re-ran ${run.html_url}; attempt 2 will use us-south1 runners.`,
+              );
+            }
