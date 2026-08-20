@@ -392,7 +392,7 @@ def test_fused_rs_quantized_shared_expert_matches_per_channel_reference_on_cpu()
         layer.w3_shared_scale.value = s3
         layer.w2_shared_scale.value = s2
 
-        def qlinear(value, weight, scale, *, reserve_v2_scale_slots=False):
+        def qlinear(value, weight, scale):
             value_f32 = value.astype(jnp.float32)
             value_amax = jnp.max(jnp.abs(value_f32), axis=-1, keepdims=True)
             value_scale = jnp.maximum(
@@ -400,31 +400,16 @@ def test_fused_rs_quantized_shared_expert_matches_per_channel_reference_on_cpu()
                 jnp.float32(1e-12),
             )
             value_q = (value_f32 / value_scale).astype(jnp.float8_e4m3fn)
-            if reserve_v2_scale_slots:
-                lane_width = value_q.shape[-1] // 4
-                channel = jnp.arange(value_q.shape[-1], dtype=jnp.int32)
-                reserved = (channel % lane_width) == (lane_width - 1)
-                value_q = jnp.where(reserved[None, :], jnp.zeros_like(value_q), value_q)
-                acc = jnp.zeros((value_q.shape[0], weight.shape[1]), dtype=jnp.float32)
-                for lane in range(4):
-                    start = lane * lane_width
-                    acc += jax.lax.dot_general(
-                        value_q[:, start : start + lane_width],
-                        weight[start : start + lane_width, :],
-                        (((1,), (0,)), ((), ())),
-                        preferred_element_type=jnp.float32,
-                    )
-            else:
-                acc = jax.lax.dot_general(
-                    value_q,
-                    weight,
-                    (((1,), (0,)), ((), ())),
-                    preferred_element_type=jnp.float32,
-                )
+            acc = jax.lax.dot_general(
+                value_q,
+                weight,
+                (((1,), (0,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
             return acc * (value_scale.astype(jnp.float32) * scale.reshape(1, -1))
 
-        gate = qlinear(x, w1, s1, reserve_v2_scale_slots=True)
-        up = qlinear(x, w3, s3, reserve_v2_scale_slots=True)
+        gate = qlinear(x, w1, s1)
+        up = qlinear(x, w3, s3)
         intermediate = jax.nn.silu(gate) * up
         expected = None
         for start in range(0, intermediate.shape[1], 2):

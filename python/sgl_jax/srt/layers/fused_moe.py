@@ -704,8 +704,6 @@ def fused_rs_shared_expert(
         x,
         weight,
         scale,
-        *,
-        reserve_v2_fp8_scale_slots=False,
     ):
         if scale is None:
             return jax.lax.dot_general(
@@ -732,54 +730,21 @@ def fused_rs_shared_expert(
         x_amax = jnp.max(jnp.abs(x_f32), axis=-1, keepdims=True)
         x_scale = jnp.maximum(x_amax / dtype_max, jnp.float32(1e-12))
         x_q = (x_f32 / x_scale).astype(activation_quantized_dtype)
-        if reserve_v2_fp8_scale_slots:
-            if x_q.shape[-1] % 4:
-                raise ValueError("V2 FP8 scale-slot compatibility requires four packed lanes")
-            lane_width = x_q.shape[-1] // 4
-            channel = jnp.arange(x_q.shape[-1], dtype=jnp.int32)
-            reserved = (channel % lane_width) == (lane_width - 1)
-            x_q = jnp.where(reserved[None, :], jnp.zeros_like(x_q), x_q)
-            # V2's shared FFN1 executes four independent packed-lane MXU
-            # dots, accumulating each f32 result in lane order before scale
-            # application.  A single 6144-wide dot changes the accumulation
-            # order before SiLU and amplifies into a material shared-output
-            # difference, even though the routed output remains close.
-            acc = jnp.zeros((x_q.shape[0], weight.shape[1]), dtype=jnp.float32)
-            for lane in range(4):
-                start = lane * lane_width
-                end = start + lane_width
-                acc += jax.lax.dot_general(
-                    x_q[:, start:end],
-                    weight[start:end, :],
-                    (((1,), (0,)), ((), ())),
-                    preferred_element_type=jnp.float32,
-                )
-        else:
-            acc = jax.lax.dot_general(
-                x_q,
-                weight,
-                (((1,), (0,)), ((), ())),
-                preferred_element_type=jnp.float32,
-            )
-        # Match V2's f32 operation order exactly.  The product of activation
-        # and per-channel weight scales is formed before it scales the dot;
-        # reassociating these multiplies changes the input to SiLU/FFN2.
+        acc = jax.lax.dot_general(
+            x_q,
+            weight,
+            (((1,), (0,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )
+        # Keep the stable f32 scale operation order without reproducing V2's
+        # lossy in-band scale encoding, which overwrites four FP8 activation
+        # channels before FFN1.
         combined_scale = x_scale.astype(jnp.float32) * scale_f32
         return acc.astype(jnp.float32) * combined_scale
 
     def _run(x, w1_local, w3_local, w2_local, s1, s3, s2):
-        gate = _local_linear(
-            x,
-            w1_local,
-            s1,
-            reserve_v2_fp8_scale_slots=True,
-        )
-        up = _local_linear(
-            x,
-            w3_local,
-            s3,
-            reserve_v2_fp8_scale_slots=True,
-        )
+        gate = _local_linear(x, w1_local, s1)
+        up = _local_linear(x, w3_local, s3)
         intermediate = jax.nn.silu(gate) * up
         if v2_shared_block_size <= 0:
             raise ValueError(f"v2_shared_block_size must be positive, got {v2_shared_block_size}")

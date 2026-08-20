@@ -177,7 +177,6 @@ class InputConfigs:
     has_scale: bool = False
     packing: int = 1
     num_quant_blocks: int = 1
-    reserve_v2_fp8_scale_slots: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -523,28 +522,6 @@ def inner_kernel(
                         block_rhs_for_matmul,
                         preferred_element_type=jnp.float32,
                     ).astype(acc_ref.dtype)
-
-                    if cfgs.lhs_cfgs.reserve_v2_fp8_scale_slots:
-                        # fused-v2 stores one f32 token scale in four FP8
-                        # bytes, then zeros the final logical column of every
-                        # packed lane before FFN1.  Mosaic cannot lower a
-                        # whole-tile boolean mask or dynamic_update_slice in a
-                        # Pallas kernel, so subtract those four raw dot terms
-                        # before applying activation/weight scales instead.
-                        # The compatibility mode is restricted by the caller
-                        # to GLM-5.2's whole-K per-channel FFN1 tile.
-                        if block_lhs_for_matmul.shape[1] % 4:
-                            raise ValueError(
-                                "V2 FP8 scale-slot compatibility requires "
-                                "a whole-K activation divisible into four "
-                                "packed lanes"
-                            )
-                        lane_width = block_lhs_for_matmul.shape[1] // 4
-                        for lane in range(4):
-                            slot = (lane + 1) * lane_width - 1
-                            block_acc -= block_lhs_for_matmul[:, slot : slot + 1].astype(
-                                acc_ref.dtype
-                            ) * block_rhs_for_matmul[slot : slot + 1, :].astype(acc_ref.dtype)
 
                     if fp8_activation_quant:
                         block_acc *= lhs_scale.astype(acc_ref.dtype)

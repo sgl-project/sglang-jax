@@ -1851,20 +1851,6 @@ def gmm_v2_fused_rs(
         if rhs2_quant_block_size == size_k2
         else min(256 if rhs2_quant_block_size < 512 else 512, size_k2)
     )
-    v2_fp8_scale_slot_compat = (
-        ep_size == 32
-        and separate_gate_up
-        and size_k1 == 6144
-        and intermediate_size == 2048
-        and rhs1_quant_block_size == size_k1
-        and w1.dtype == jnp.float8_e4m3fn
-    )
-    if v2_fp8_scale_slot_compat and tile_k1 != size_k1:
-        raise ValueError(
-            "V2 FP8 scale-slot compatibility requires whole-K FFN1 tiles; "
-            f"got tile_k1={tile_k1}, size_k1={size_k1}"
-        )
-
     cfgs1 = GmmConfigs(
         dims=Dimensions(
             size_m=size_m,
@@ -1884,7 +1870,6 @@ def gmm_v2_fused_rs(
             ),
             quant_block_size=lhs1_quant_block_size,
             dtype=out_dtype,
-            reserve_v2_fp8_scale_slots=v2_fp8_scale_slot_compat,
         ),
         rhs_cfgs=InputConfigs(
             quant_dtype=w1.dtype if is_quantized else None,
