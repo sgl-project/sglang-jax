@@ -40,7 +40,7 @@ role_to_task_spec:
         sleep 5
       done
       test -f "$source_tar"
-      echo '__SOURCE_SHA256__  /tmp/glm52-fused-rs-tuning-source-r1.tar.gz.part' | sha256sum -c -
+      echo 'e1d55f4241f70938af9a627bc07c280e02e06912e1dd96da1bc66744a959bab7  /tmp/glm52-fused-rs-tuning-source-r1.tar.gz.part' | sha256sum -c -
 
       mkdir -p /workspace/sglang-jax
       tar -xzf "$source_tar" -C /workspace/sglang-jax
@@ -98,9 +98,9 @@ role_to_task_spec:
               "branch": "epic/glm_5_2",
               "base_commit": "e27fac67abadd7fff8f139cf6a7b069022ae9028",
               "migration_branch": "dev/glm52-rs-ep32-64k",
-              "source_commit": "__SOURCE_COMMIT__",
+              "source_commit": "23ca0c4d5d23d0651ac798f55b77b53d7fc41f55",
               "delivery": "falcon-exp-cp-all-ranks",
-              "source_sha256": "__SOURCE_SHA256__",
+              "source_sha256": "e1d55f4241f70938af9a627bc07c280e02e06912e1dd96da1bc66744a959bab7",
           },
           "correctness": {
               "reference": "canonical_full_n_rs",
