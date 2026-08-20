@@ -1863,6 +1863,17 @@ class Scheduler(
             if req.is_chunked > 0:
                 continue
 
+            # A chunk sender may still be reading these source KV pages. Hand
+            # finalization to its terminal callback; clearing scheduler
+            # ownership here prevents the request from being rescheduled while
+            # keeping the allocation alive until Raiden reports every child
+            # transfer done.
+            if getattr(req, "disagg_chunk_sender", None) is not None:
+                self.chunked_reqs[dp_rank] = None
+                self._pending_chunked_abort_reqs[dp_rank] = None
+                consumed[dp_rank] = req
+                continue
+
             self._finalize_chunked_abort(req, dp_rank)
             abort_out = AbortReq(rid=req.rid)
             if self._comm_backend is not None:
@@ -1890,6 +1901,14 @@ class Scheduler(
         retracted_request_ids = {id(req) for req in retracted_reqs}
         for dp_rank, req in enumerate(self.chunked_reqs):
             if req is None:
+                continue
+            sender = getattr(req, "disagg_chunk_sender", None)
+            if sender is not None:
+                # A peer may still be pulling this transport ID. Keep the
+                # producer and its pages owned while scheduling is paused, then
+                # resume the same chunk stream after continue_generation. The
+                # transfer reaper still bounds this drain by its ack/producer
+                # watchdogs, so an unusually long pause can finish as FAILED.
                 continue
             if id(req) in retracted_request_ids:
                 assert self._pending_chunked_abort_reqs[dp_rank] is None
@@ -2733,6 +2752,8 @@ class Scheduler(
         if prefill_q is not None:
             for entry in prefill_q.cancel_matching(recv_req.rid, recv_req.abort_all):
                 logger.debug("Abort prefill queue request. rid=%s", entry.req_id)
+                if entry.req is not None:
+                    entry.req.to_finish = FINISH_ABORT()
                 entry.sender.abort()
 
         prealloc_q = self.disagg_prealloc_queue
@@ -2808,6 +2829,9 @@ class Scheduler(
             self._pd_quiesce()
 
         if recv_req.mode == "retract":
+            # An in-flight P/D transport cannot be retracted process-locally:
+            # the peer would keep using the original wire ID. Let transfer
+            # queues drain to a stable ownership boundary during the pause.
             self.running_batch.filter_batch()
             all_reqs = [
                 req for info in self.running_batch.reqs_info for req in info.reqs if info.reqs

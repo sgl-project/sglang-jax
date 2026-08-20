@@ -17,11 +17,13 @@ from jax.sharding import NamedSharding, PartitionSpec
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll, KVReceiver
 from sgl_jax.srt.disaggregation.base.transfer import (
     AdmissionState,
+    DecodeMetadataContext,
     DecodeTransferContext,
     TransferBackend,
 )
 from sgl_jax.srt.disaggregation.bootstrap import BootstrapClient, PrefillInfoCache
 from sgl_jax.srt.disaggregation.common.capacity import per_rank_inflight_limit
+from sgl_jax.srt.managers.schedule_batch import get_disagg_transport_id
 from sgl_jax.srt.mem_cache.memory_pool import write_kv_layer
 
 if TYPE_CHECKING:
@@ -217,6 +219,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_input_requests_disagg_decode(recv_reqs)
 
             if self._engine_paused:
+                self._drain_decode_transfer_terminals()
                 continue
 
             wd.beat("process_decode_queue")
@@ -342,6 +345,13 @@ class SchedulerDisaggregationDecodeMixin:
                     expected_transfer_engine=(None if manager is None else manager.engine_name),
                     expected_dp_rank=prefill_dp_rank,
                     expected_dp_size=self.dp_size,
+                    expected_chunk_prefill_transfer=bool(
+                        getattr(
+                            self.server_args,
+                            "disaggregation_enable_chunk_prefill_transfer",
+                            False,
+                        )
+                    ),
                 )
             except ValueError as exc:
                 logger.error(
@@ -384,6 +394,10 @@ class SchedulerDisaggregationDecodeMixin:
         """Drive prealloc -> transfer -> ready transitions."""
 
         self._admit_decode_prealloc()
+        self._drain_decode_transfer_terminals()
+
+    def _drain_decode_transfer_terminals(self: Scheduler) -> None:
+        """Finalize terminal receivers without admitting new work."""
 
         for entry in self._drain_transfer_queue_synced():
             assert entry.receiver is not None
@@ -557,6 +571,19 @@ class SchedulerDisaggregationDecodeMixin:
                 capacity_blocked_ranks.add(decode_dp_rank)
                 continue
 
+            metadata_ready = self.disagg_kv_manager.poll_decode_metadata(
+                DecodeMetadataContext(
+                    req_id=entry.req.rid,
+                    transfer_id=get_disagg_transport_id(entry.req),
+                    bootstrap_room=entry.req.bootstrap_room,
+                    prefill_dp_rank=prefill_dp_rank,
+                    peer_info=entry.p_info or {},
+                )
+            )
+            if not metadata_ready:
+                self._expire_decode_prealloc(entry)
+                continue
+
             kv_indices = allocator.alloc(page_aligned, dp_rank=decode_dp_rank)
             if kv_indices is None:
                 capacity_blocked_ranks.add(decode_dp_rank)
@@ -566,7 +593,7 @@ class SchedulerDisaggregationDecodeMixin:
                 admission = self.disagg_kv_manager.try_start_decode(
                     DecodeTransferContext(
                         req_id=entry.req.rid,
-                        transfer_id=entry.req.disagg_transfer_id or entry.req.rid,
+                        transfer_id=get_disagg_transport_id(entry.req),
                         bootstrap_room=entry.req.bootstrap_room,
                         decode_dp_rank=decode_dp_rank,
                         prefill_dp_rank=prefill_dp_rank,
@@ -593,11 +620,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             if admission.state == AdmissionState.DEFERRED:
                 self._release_decode_kv_indices(kv_indices, decode_dp_rank)
-                timeout_s = self.server_args.disaggregation_pull_timeout_seconds
-                if timeout_s > 0 and time.monotonic() - entry.created_at >= timeout_s:
-                    self.disagg_prealloc_queue.remove(entry.req_id)
-                    self._record_decode_transfer_failure("metadata_timeout")
-                    self._abort_decode_request(entry.req, "metadata_timeout")
+                self._expire_decode_prealloc(entry)
                 continue
 
             receiver = admission.receiver
@@ -612,6 +635,14 @@ class SchedulerDisaggregationDecodeMixin:
             self.disagg_transfer_queue.add(entry)
             admitted += 1
             admitted_per_dp[decode_dp_rank] += 1
+
+    def _expire_decode_prealloc(self: Scheduler, entry: DecodeBookkeeping) -> None:
+        timeout_s = self.server_args.disaggregation_pull_timeout_seconds
+        if timeout_s <= 0 or time.monotonic() - entry.created_at < timeout_s:
+            return
+        self.disagg_prealloc_queue.remove(entry.req_id)
+        self._record_decode_transfer_failure("metadata_timeout")
+        self._abort_decode_request(entry.req, "metadata_timeout")
 
     # ------------------------------------------------------------------
     # Overridable / test-friendly hooks
@@ -833,6 +864,7 @@ class SchedulerDisaggregationDecodeMixin:
                         room,
                         jax_process_index=getattr(req, "disagg_peer_process_index", None),
                         prefill_dp_rank=prefill_dp_rank,
+                        expected_transfer_id=get_disagg_transport_id(req),
                     )
                 except Exception:
                     logger.warning(

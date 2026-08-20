@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import threading
 import time
@@ -15,6 +16,11 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from pydantic import Field as PydanticField
 
+from sgl_jax.srt.disaggregation.base.transfer import (
+    chunk_transfer_id,
+    parse_chunk_transfer_id,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -22,12 +28,14 @@ HEARTBEAT_TTL_SECONDS = 30.0
 # Beat at ~TTL/3 so a single missed beat doesn't evict the entry.
 HEARTBEAT_INTERVAL_SECONDS = HEARTBEAT_TTL_SECONDS / 3.0
 TRANSFER_METADATA_TTL_SECONDS = 300.0
-BOOTSTRAP_CAPABILITIES = ("transfer_metadata",)
+BOOTSTRAP_CAPABILITIES = ("transfer_metadata", "chunk_transfer_metadata")
 
 # PD wire protocol version. Bump when ``PrefillInfo``
 # or any of the 4 endpoint payloads change shape.
-PROTOCOL_VERSION: int = 4
-MIN_COMPATIBLE_VERSION: int = 1
+PROTOCOL_VERSION: int = 5
+# v5 changes request transfer metadata from a single descriptor into a
+# per-chunk envelope. Mixed v4/v5 P/D peers are therefore unsupported.
+MIN_COMPATIBLE_VERSION: int = PROTOCOL_VERSION
 
 
 def _set_registry_size(n: int) -> None:
@@ -58,6 +66,7 @@ class PrefillInfo:
     protocol_version: int = PROTOCOL_VERSION
     page_size: int = 0
     kv_dtype: str = ""
+    chunk_prefill_transfer: bool = False
     transport_metadata: dict[str, object] = field(default_factory=lambda: {"engine": "jax"})
 
     def to_dict(self) -> dict[str, object]:
@@ -108,6 +117,7 @@ def check_prefill_compat(
     expected_transfer_engine: str | None = None,
     expected_dp_rank: int | None = None,
     expected_dp_size: int | None = None,
+    expected_chunk_prefill_transfer: bool | None = None,
 ) -> None:
     """Raise ``ValueError`` if the prefill peer's KV layout is incompatible.
 
@@ -152,6 +162,14 @@ def check_prefill_compat(
             f"PD topology mismatch: prefill dp_size={peer_dp_size}, "
             f"decode dp_size={expected_dp_size}"
         )
+    if expected_chunk_prefill_transfer is not None:
+        peer_chunk_prefill_transfer = bool(info.get("chunk_prefill_transfer", False))
+        if peer_chunk_prefill_transfer != expected_chunk_prefill_transfer:
+            raise ValueError(
+                "PD chunk prefill transfer mismatch: "
+                f"prefill={peer_chunk_prefill_transfer}, "
+                f"decode={expected_chunk_prefill_transfer}"
+            )
 
 
 class RegisterPrefillRequest(BaseModel):
@@ -167,14 +185,22 @@ class RegisterPrefillRequest(BaseModel):
     protocol_version: int = PROTOCOL_VERSION
     page_size: int = 0
     kv_dtype: str = ""
+    chunk_prefill_transfer: bool = False
     transport_metadata: dict[str, object] = PydanticField(default_factory=lambda: {"engine": "jax"})
 
 
 class RegisterTransferRequest(BaseModel):
     bootstrap_room: int
     transfer_id: str
+    base_transfer_id: str | None = None
     jax_process_index: int = 0
     prefill_dp_rank: int = 0
+    chunk_index: int = 0
+    # Request-level transfer is represented as one final chunk. Chunked
+    # prefill publishes zero until the final descriptor fixes the total.
+    num_chunks: int = 1
+    chunk_page_offset: int = 0
+    expected_total_pages: int = 0
     transport_metadata: dict[str, object]
 
 
@@ -270,8 +296,81 @@ class _Registry:
             prefill_dp_rank = int(info.get("prefill_dp_rank", 0))
             if not str(info.get("transfer_id", "")):
                 raise ValueError("transfer_id must be non-empty")
+            transfer_id = str(info["transfer_id"])
+            base_transfer_id = str(info.get("base_transfer_id") or transfer_id)
+            chunk_index = int(info.get("chunk_index", 0))
+            num_chunks = int(info.get("num_chunks", 1))
+            chunk_page_offset = int(info.get("chunk_page_offset", 0))
+            expected_total_pages = int(info.get("expected_total_pages", 0))
+            if chunk_index < 0:
+                raise ValueError("chunk_index must be non-negative")
+            if chunk_page_offset < 0:
+                raise ValueError("chunk_page_offset must be non-negative")
+            if num_chunks < 0:
+                raise ValueError("num_chunks must be non-negative")
+            if expected_total_pages < 0:
+                raise ValueError("expected_total_pages must be non-negative")
+            if num_chunks and num_chunks != chunk_index + 1:
+                raise ValueError("the final chunk must publish num_chunks == chunk_index + 1")
+            if base_transfer_id == transfer_id:
+                expected_transfer_id = base_transfer_id
+            else:
+                parsed_base, parsed_index = parse_chunk_transfer_id(transfer_id)
+                if parsed_base != base_transfer_id or parsed_index != chunk_index:
+                    raise ValueError(
+                        "chunk transfer_id must match base_transfer_id and chunk_index: "
+                        f"base={base_transfer_id!r}, chunk_index={chunk_index}, "
+                        f"got={transfer_id!r}"
+                    )
+                expected_transfer_id = chunk_transfer_id(base_transfer_id, chunk_index)
+            if transfer_id != expected_transfer_id:
+                raise ValueError(
+                    "chunk transfer_id must match base_transfer_id and chunk_index: "
+                    f"expected={expected_transfer_id!r}, got={transfer_id!r}"
+                )
             key = (room, process_index, prefill_dp_rank)
-            self.transfers[key] = info
+            bundle = self.transfers.get(key)
+            if bundle is not None and bundle.get("base_transfer_id") != base_transfer_id:
+                if chunk_index != 0:
+                    raise ValueError(
+                        "a new transfer may replace room metadata only from chunk zero"
+                    )
+                bundle = None
+            if bundle is None:
+                if base_transfer_id != transfer_id and chunk_index != 0:
+                    raise ValueError("a chunk transfer bundle must be created from chunk zero")
+                bundle = {
+                    "base_transfer_id": base_transfer_id,
+                    "chunks": {},
+                    "num_chunks": 0,
+                    "expected_total_pages": expected_total_pages,
+                }
+                self.transfers[key] = bundle
+            chunks = bundle["chunks"]
+            assert isinstance(chunks, dict)
+            existing = chunks.get(chunk_index)
+            if existing is not None and existing != info:
+                raise ValueError(f"conflicting transfer metadata for chunk_index={chunk_index}")
+            known_total = int(bundle.get("num_chunks", 0))
+            if known_total and chunk_index >= known_total:
+                raise ValueError(
+                    f"chunk_index={chunk_index} is outside finalized num_chunks={known_total}"
+                )
+            if num_chunks and known_total not in (0, num_chunks):
+                raise ValueError(
+                    f"conflicting num_chunks: existing={known_total}, new={num_chunks}"
+                )
+            known_total_pages = int(bundle.get("expected_total_pages", 0))
+            if expected_total_pages and known_total_pages not in (0, expected_total_pages):
+                raise ValueError(
+                    "conflicting expected_total_pages: "
+                    f"existing={known_total_pages}, new={expected_total_pages}"
+                )
+            chunks[chunk_index] = dict(info)
+            if num_chunks:
+                bundle["num_chunks"] = num_chunks
+            if expected_total_pages:
+                bundle["expected_total_pages"] = expected_total_pages
             self.transfer_last_seen[key] = self.now()
 
     def get_transfer(
@@ -285,18 +384,27 @@ class _Registry:
             info = self.transfers.get(
                 (int(bootstrap_room), int(jax_process_index), int(prefill_dp_rank))
             )
-            return dict(info) if info is not None else None
+            return copy.deepcopy(info) if info is not None else None
 
     def pop_room(
         self,
         bootstrap_room: int,
         jax_process_index: int = 0,
         prefill_dp_rank: int = 0,
-    ) -> None:
+        expected_transfer_id: str | None = None,
+    ) -> bool:
         with self.lock:
             key = (int(bootstrap_room), int(jax_process_index), int(prefill_dp_rank))
+            bundle = self.transfers.get(key)
+            if (
+                expected_transfer_id is not None
+                and bundle is not None
+                and bundle.get("base_transfer_id") != expected_transfer_id
+            ):
+                return False
             self.transfers.pop(key, None)
             self.transfer_last_seen.pop(key, None)
+            return bundle is not None
 
 
 def build_app(
@@ -411,8 +519,14 @@ def build_app(
         bootstrap_room: int,
         jax_process_index: int = 0,
         prefill_dp_rank: int = 0,
+        expected_transfer_id: str | None = None,
     ) -> dict[str, str]:
-        registry.pop_room(bootstrap_room, jax_process_index, prefill_dp_rank)
+        registry.pop_room(
+            bootstrap_room,
+            jax_process_index,
+            prefill_dp_rank,
+            expected_transfer_id,
+        )
         return {"status": "popped"}
 
     # Bootstrap runs as a standalone single process and does NOT inherit
@@ -585,6 +699,7 @@ class BootstrapClient:
         protocol_version: int = PROTOCOL_VERSION,
         page_size: int = 0,
         kv_dtype: str = "",
+        chunk_prefill_transfer: bool = False,
         transport_metadata: dict[str, object] | None = None,
     ) -> None:
         payload = {
@@ -600,6 +715,7 @@ class BootstrapClient:
             "protocol_version": protocol_version,
             "page_size": page_size,
             "kv_dtype": kv_dtype,
+            "chunk_prefill_transfer": bool(chunk_prefill_transfer),
             "transport_metadata": transport_metadata or {"engine": "jax"},
         }
         last_err: Exception | None = None
@@ -673,15 +789,25 @@ class BootstrapClient:
         bootstrap_room: int,
         transfer_id: str,
         *,
+        base_transfer_id: str | None = None,
         jax_process_index: int = 0,
         prefill_dp_rank: int = 0,
+        chunk_index: int = 0,
+        num_chunks: int = 1,
+        chunk_page_offset: int = 0,
+        expected_total_pages: int = 0,
         transport_metadata: dict[str, object],
     ) -> None:
         payload = {
             "bootstrap_room": bootstrap_room,
             "transfer_id": transfer_id,
+            "base_transfer_id": base_transfer_id or transfer_id,
             "jax_process_index": jax_process_index,
             "prefill_dp_rank": prefill_dp_rank,
+            "chunk_index": chunk_index,
+            "num_chunks": num_chunks,
+            "chunk_page_offset": chunk_page_offset,
+            "expected_total_pages": expected_total_pages,
             "transport_metadata": transport_metadata,
         }
         r = self._client.post(
@@ -720,14 +846,18 @@ class BootstrapClient:
         *,
         jax_process_index: int = 0,
         prefill_dp_rank: int = 0,
+        expected_transfer_id: str | None = None,
     ) -> None:
+        params: dict[str, object] = {
+            "bootstrap_room": bootstrap_room,
+            "jax_process_index": jax_process_index,
+            "prefill_dp_rank": prefill_dp_rank,
+        }
+        if expected_transfer_id is not None:
+            params["expected_transfer_id"] = expected_transfer_id
         r = self._client.post(
             f"{self._base_url}/pop_transfer",
-            params={
-                "bootstrap_room": bootstrap_room,
-                "jax_process_index": jax_process_index,
-                "prefill_dp_rank": prefill_dp_rank,
-            },
+            params=params,
             timeout=self._timeout_s,
             headers=self._headers(),
         )

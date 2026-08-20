@@ -115,6 +115,9 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
                 jax_process_count=jax.process_count(),
                 page_size=server_args.page_size,
                 kv_dtype=kv_dtype_name,
+                chunk_prefill_transfer=bool(
+                    server_args.disaggregation_enable_chunk_prefill_transfer
+                ),
                 transport_metadata=(
                     scheduler.disagg_kv_manager.prefill_transport_metadata(dp_rank)
                 ),

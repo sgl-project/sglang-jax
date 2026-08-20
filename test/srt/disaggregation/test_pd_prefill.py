@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest import mock
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -13,6 +16,7 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
 from sgl_jax.srt.disaggregation.bootstrap import (
+    PROTOCOL_VERSION,
     PrefillInfo,
     PrefillInfoCache,
     build_app,
@@ -109,6 +113,7 @@ def test_cancel_matching_retains_prefill_entry_until_sender_terminal():
     cancelled = queue.cancel_matching("req-a", abort_all=False)
 
     assert [entry.req_id for entry in cancelled] == ["req-a"]
+    assert cancelled[0].cancelled is True
     assert len(queue) == 1
 
 
@@ -235,7 +240,7 @@ def _pf(key, **kw):
         "host": "h",
         "transfer_port": 1,
         "side_channel_port": 2,
-        "protocol_version": 1,
+        "protocol_version": PROTOCOL_VERSION,
     }
     d.update(kw)
     return d

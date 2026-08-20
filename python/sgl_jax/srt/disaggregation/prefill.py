@@ -18,6 +18,7 @@ from sgl_jax.srt.disaggregation.base.transfer import (
     PrefillTransferContext,
     TransferBackend,
 )
+from sgl_jax.srt.managers.schedule_batch import get_disagg_transport_id
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import Req
@@ -155,10 +156,12 @@ class PrefillBookkeeping:
 
     req_id: str
     sender: KVSender
+    req: Req | None = None
     # Optional callback the scheduler runs when this entry reaches a
     # terminal state — used to release ``req_to_token_pool`` and any
     # owned KV indices.
     on_terminal: object | None = None
+    cancelled: bool = False
 
 
 class PrefillBootstrapQueue:
@@ -177,12 +180,16 @@ class PrefillBootstrapQueue:
         req_id: str,
         sender: KVSender,
         on_terminal=None,
+        req: Req | None = None,
     ) -> None:
         with self._lock:
             if req_id in self._entries:
                 raise ValueError(f"PrefillBootstrapQueue already tracks req_id={req_id!r}")
             self._entries[req_id] = PrefillBookkeeping(
-                req_id=req_id, sender=sender, on_terminal=on_terminal
+                req_id=req_id,
+                sender=sender,
+                req=req,
+                on_terminal=on_terminal,
             )
 
     def drain_terminal(self) -> list[PrefillBookkeeping]:
@@ -209,11 +216,12 @@ class PrefillBootstrapQueue:
         """Return matching entries without releasing their owned KV pages."""
 
         with self._lock:
-            return [
-                entry
-                for req_id, entry in self._entries.items()
-                if abort_all or req_id.startswith(rid_prefix)
-            ]
+            out = []
+            for req_id, entry in self._entries.items():
+                if abort_all or req_id.startswith(rid_prefix):
+                    entry.cancelled = True
+                    out.append(entry)
+            return out
 
 
 class SchedulerDisaggregationPrefillMixin:
@@ -236,6 +244,10 @@ class SchedulerDisaggregationPrefillMixin:
             self.process_input_requests(recv_reqs)
 
             if self._engine_paused:
+                # Cancellation/retract keeps Raiden-owned source pages alive
+                # until the sender becomes terminal. Continue draining those
+                # senders while scheduling itself is paused.
+                self.send_kv_chunk()
                 continue
 
             batch = self.get_next_batch_to_run()
@@ -277,10 +289,18 @@ class SchedulerDisaggregationPrefillMixin:
         self.set_next_batch_sampling_info_done(batch)
 
         chunked_now = tuple(r for r in getattr(self, "chunked_reqs", ()) if r is not None)
+        chunk_transfer_enabled = bool(
+            getattr(
+                self.server_args,
+                "disaggregation_enable_chunk_prefill_transfer",
+                False,
+            )
+        )
         ready_to_transfer = [
             req
             for req in pd_reqs
-            if not any(req is chunked_req for chunked_req in chunked_now)
+            if not chunk_transfer_enabled
+            and not any(req is chunked_req for chunked_req in chunked_now)
             and req.rid not in self.disagg_prefill_queue._entries
         ]
         if ready_to_transfer:
@@ -291,6 +311,11 @@ class SchedulerDisaggregationPrefillMixin:
                 continue
             req_id = req.rid
             is_mid_chunk = any(req is cr for cr in chunked_now)
+            if chunk_transfer_enabled:
+                self._raiden_handoff_chunk(req, is_final=not is_mid_chunk)
+                if is_mid_chunk and req.is_chunked > 0:
+                    req.is_chunked -= 1
+                continue
             if is_mid_chunk:
                 # Still mid-chunk: KV is incomplete, and releasing the
                 # req_pool_idx here would leak the slot the next chunk
@@ -308,7 +333,7 @@ class SchedulerDisaggregationPrefillMixin:
                 transfer = self.disagg_kv_manager.start_prefill(
                     PrefillTransferContext(
                         req_id=req_id,
-                        transfer_id=req.disagg_transfer_id or req_id,
+                        transfer_id=get_disagg_transport_id(req),
                         bootstrap_room=req.bootstrap_room,
                         dp_rank=int(req.dp_rank),
                         buffer_id=req.disagg_host_buffer_id,
@@ -339,7 +364,12 @@ class SchedulerDisaggregationPrefillMixin:
             def _on_terminal(req_obj=req, sender_obj=transfer.sender):
                 self._on_prefill_transfer_terminal(req_obj, sender_obj)
 
-            self.disagg_prefill_queue.add(req_id, transfer.sender, on_terminal=_on_terminal)
+            self.disagg_prefill_queue.add(
+                req_id,
+                transfer.sender,
+                on_terminal=_on_terminal,
+                req=req,
+            )
 
     def send_kv_chunk(self: Scheduler) -> None:
         """Reap senders that reached SUCCESS / FAILED."""
@@ -376,17 +406,167 @@ class SchedulerDisaggregationPrefillMixin:
         ts.mark(name)
 
     def _extract_req_block_ids(self: Scheduler, req: Req) -> list[int]:
+        return self._extract_req_block_ids_range(req, 0, len(req.origin_input_ids))
+
+    def _extract_req_block_ids_range(
+        self: Scheduler,
+        req: Req,
+        start: int,
+        end: int,
+    ) -> list[int]:
         from sgl_jax.srt.disaggregation.base.transfer import slots_to_page_ids
 
         req_to_token = self.req_to_token_pool.req_to_token
         kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
         page_size = kv_pool.page_size
-        seqlen = len(req.origin_input_ids)
+        if not 0 <= start < end <= len(req.origin_input_ids):
+            raise ValueError(
+                f"invalid prefill chunk token range [{start}, {end}) for "
+                f"prompt length {len(req.origin_input_ids)}"
+            )
+        if start % page_size:
+            raise ValueError(
+                f"prefill chunk starts at unaligned token {start} for page_size={page_size}"
+            )
         slot_source = req_to_token[
             req.req_pool_idx,
-            :seqlen,
+            start:end,
         ]
-        return list(slots_to_page_ids(slot_source, page_size, seqlen))
+        return list(slots_to_page_ids(slot_source, page_size, end - start))
+
+    def _raiden_handoff_chunk(self: Scheduler, req: Req, *, is_final: bool) -> None:
+        """Register exactly the KV pages produced by the current prefill round."""
+
+        req_id = req.rid
+        sender = req.disagg_chunk_sender
+        if sender is not None and sender.has_pending_failure:
+            self._retire_chunk_producer_ownership(req)
+            return
+
+        end = len(req.fill_ids)
+        scheduled_start = end - req.extend_input_len
+        start = int(req.start_send_idx)
+        if start != scheduled_start:
+            error = RuntimeError(
+                "chunk transfer cursor diverged from the scheduled prefix: "
+                f"cursor={start}, scheduled_start={scheduled_start}, end={end}"
+            )
+            logger.error("%s req_id=%s", error, req_id)
+            if sender is None or not sender.has_started_chunks:
+                self._abort_prefill_req(
+                    req,
+                    f"Prefill chunk handoff failed for req_id={req_id!r}: {error}",
+                    metric_reason="chunk_cursor",
+                )
+            else:
+                sender.fail(reason="chunk_cursor")
+            self._retire_chunk_producer_ownership(req)
+            return
+
+        created_sender = False
+        if sender is None:
+            sender = self.disagg_kv_manager.create_sender(req_id)
+            sender.init(None, transfer_id=get_disagg_transport_id(req))
+            req.disagg_chunk_sender = sender
+            created_sender = True
+
+        try:
+            kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+            page_size = kv_pool.page_size
+            if not is_final and end % page_size:
+                raise ValueError(
+                    f"middle chunk ends at unaligned token {end} for page_size={page_size}"
+                )
+            block_ids = self._extract_req_block_ids_range(req, start, end)
+            expected_total_pages = (len(req.origin_input_ids) + page_size - 1) // page_size
+            if is_final:
+                from sgl_jax.srt.disaggregation.debug_utils import kv_debug_enabled
+
+                if kv_debug_enabled(req_id):
+                    from sgl_jax.srt.disaggregation.raiden_transfer.conn import (
+                        _debug_metadata,
+                    )
+
+                    payload = {"kv": self._extract_req_kv(req)}
+                    self._maybe_log_prefill_extract_debug(
+                        req,
+                        payload["kv"],
+                        use_d2h_staging=False,
+                        chunk_transfer=True,
+                    )
+                    sender.attach_debug_metadata(_debug_metadata(payload, expected_total_pages))
+            sender.send_chunk(
+                req.disagg_chunk_index,
+                block_ids,
+                bootstrap_room=int(req.bootstrap_room),
+                chunk_page_offset=start // page_size,
+                is_final=is_final,
+                dp_rank=int(req.dp_rank),
+                expected_total_pages=expected_total_pages,
+                on_ready=lambda buffers=kv_pool.kv_buffer: (
+                    self.disagg_kv_manager.prepare_prefill_batch(buffers)
+                ),
+            )
+        except Exception as exc:
+            logger.exception(
+                "Raiden chunk handoff failed for req_id=%s chunk=%d",
+                req_id,
+                req.disagg_chunk_index,
+            )
+            if sender.has_started_chunks:
+                sender.fail(reason="chunk_handoff")
+                self._ensure_chunk_sender_queued(req, sender)
+                self._retire_chunk_producer_ownership(req)
+            else:
+                with suppress(Exception):
+                    sender.abort()
+                with suppress(Exception):
+                    sender.clear()
+                req.disagg_chunk_sender = None
+                self._abort_prefill_req(
+                    req,
+                    f"Prefill chunk handoff failed for req_id={req_id!r}: {exc}",
+                    metric_reason="sender_init",
+                )
+                self._retire_chunk_producer_ownership(req)
+            return
+
+        req.start_send_idx = end
+        req.disagg_chunk_index += 1
+        if created_sender:
+            self._pd_mark_time(req, "transfer_start")
+        self._ensure_chunk_sender_queued(req, sender)
+
+    def _ensure_chunk_sender_queued(self: Scheduler, req: Req, sender: KVSender) -> None:
+        if req.rid in self.disagg_prefill_queue._entries:
+            return
+
+        def _on_terminal(req_obj=req, sender_obj=sender):
+            self._on_prefill_transfer_terminal(req_obj, sender_obj)
+
+        self.disagg_prefill_queue.add(
+            req.rid,
+            sender,
+            on_terminal=_on_terminal,
+            req=req,
+        )
+
+    def _retire_chunk_producer_ownership(self: Scheduler, req: Req) -> None:
+        dp_rank = int(req.dp_rank)
+        if self.chunked_reqs[dp_rank] is req:
+            self.chunked_reqs[dp_rank] = None
+        last_batch = getattr(self, "last_batch", None)
+        if last_batch is not None and last_batch.forward_mode.is_extend():
+            info = last_batch.reqs_info[dp_rank]
+            if info.chunked_req is req:
+                # The sender terminal callback can release the request slot and
+                # KV pages before the next scheduler tick. Drop the batch-side
+                # owner as well so _sync_chunked_req_owners cannot resurrect a
+                # producer whose allocations are already reusable.
+                info.chunked_req = None
+        pending = getattr(self, "_pending_chunked_abort_reqs", None)
+        if pending is not None and pending[dp_rank] is req:
+            pending[dp_rank] = None
 
     def _extract_req_kv(self: Scheduler, req: Req):
         """Gather prefilled KV from the paged pool for ``req``.
@@ -518,8 +698,26 @@ class SchedulerDisaggregationPrefillMixin:
         req: Req,
         sender: KVSender,
     ) -> None:
+        if req.disagg_chunk_sender is not None and req.disagg_chunk_sender is not sender:
+            # A callback from an older transfer attempt must never finish or
+            # release allocations belonging to a re-admitted request.
+            logger.warning("Ignoring stale prefill sender callback for req_id=%s", req.rid)
+            sender.clear()
+            return
+
+        if req.disagg_chunk_sender is sender:
+            # The terminal callback is the single resource-release choke point
+            # for asynchronous read failures. Retire every scheduler owner
+            # before the request slot and KV pages become reusable.
+            self._retire_chunk_producer_ownership(req)
+
         try:
-            if sender.poll() == KVPoll.SUCCESS:
+            state = sender.poll()
+            if req.to_finish is not None:
+                req.check_finished()
+                req.output_ids = []
+                self._stream_prefill_req(req)
+            elif state == KVPoll.SUCCESS:
                 self._finish_prefill_only_success(req)
             else:
                 self._finish_prefill_only_failure(req, sender)
@@ -534,6 +732,8 @@ class SchedulerDisaggregationPrefillMixin:
             )
             sender.clear()
             self._release_prefill_req_resources(req)
+            if req.disagg_chunk_sender is sender:
+                req.disagg_chunk_sender = None
 
     def _finish_prefill_only_success(self: Scheduler, req: Req) -> None:
         from sgl_jax.srt.managers.schedule_batch import FINISH_LENGTH
