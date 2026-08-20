@@ -7,24 +7,18 @@ import pytest
 from flax import nnx
 
 from sgl_jax.srt.configs.quantization_config import QuantizationConfig
-from sgl_jax.srt.layers.fused_moe import FusedEPMoERS, FusedEPMoEV2
-from sgl_jax.srt.layers.linear import QuantizedLinear
-from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
-from sgl_jax.srt.models.glm5_moe import (
-    Glm5ForCausalLM,
-    _use_fused_rs_for_forward_mode,
-)
-from sgl_jax.srt.utils.weight_utils import WeightLoader
-from sgl_jax.srt.kernels.fused_moe.fused_rs import (
-    fused_moe_rs,
-    gmm_fused_rs_nodedup,
-)
+from sgl_jax.srt.kernels.fused_moe.fused_rs import fused_moe_rs, gmm_fused_rs_nodedup
+from sgl_jax.srt.kernels.fused_moe.fused_rs.fused_moe_rs import _compute_rs_routing
 from sgl_jax.srt.kernels.fused_moe.fused_rs.gmm_fused_rs_nodedup import (
     _build_packed_index_tile_table,
 )
-from sgl_jax.srt.kernels.fused_moe.fused_rs.fused_moe_rs import (
-    _compute_rs_routing,
-)
+from sgl_jax.srt.layers.fused_moe import FusedEPMoERS, FusedEPMoEV2
+from sgl_jax.srt.layers.linear import QuantizedLinear
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+from sgl_jax.srt.models.glm5_moe import Glm5ForCausalLM, _use_fused_rs_for_forward_mode
+from sgl_jax.srt.utils.weight_utils import WeightLoader
+
+
 def _cpu_mesh():
     return jax.sharding.Mesh(
         np.asarray(jax.devices()[:1]).reshape(1, 1),
@@ -309,13 +303,16 @@ def test_fused_rs_ep32_64k_per_channel_tuning_is_narrow(monkeypatch):
         fp8_direct_write=False,
     )
 
-    assert gmm_fused_rs_nodedup.get_fused_rs_tuned_block_sizes(
-        65536 * 8, **common
-    ) == (128, 6144, 2048, 2048, 6144, 1, 1)
-    assert (
-        gmm_fused_rs_nodedup.get_fused_rs_tuned_block_sizes(32768 * 8, **common)
-        == default
+    assert gmm_fused_rs_nodedup.get_fused_rs_tuned_block_sizes(65536 * 8, **common) == (
+        128,
+        6144,
+        2048,
+        2048,
+        6144,
+        1,
+        1,
     )
+    assert gmm_fused_rs_nodedup.get_fused_rs_tuned_block_sizes(32768 * 8, **common) == default
 
 
 def test_fused_rs_shared_expert_matches_reference_on_cpu():
@@ -342,10 +339,10 @@ def test_fused_rs_shared_expert_matches_reference_on_cpu():
         layer.w2_shared.value = w2
 
         actual = layer._shared_expert_for_rs(x, enable_act_quant=False)
-        expected = (jax.nn.silu(x.astype(jnp.float32) @ w1.astype(jnp.float32))
-                    * (x.astype(jnp.float32) @ w3.astype(jnp.float32))) @ w2.astype(
-                        jnp.float32
-                    )
+        expected = (
+            jax.nn.silu(x.astype(jnp.float32) @ w1.astype(jnp.float32))
+            * (x.astype(jnp.float32) @ w3.astype(jnp.float32))
+        ) @ w2.astype(jnp.float32)
 
     np.testing.assert_allclose(
         np.asarray(actual, dtype=np.float32),
@@ -371,6 +368,7 @@ def test_fused_rs_quantized_shared_expert_matches_per_channel_reference_on_cpu()
             dtype=jnp.bfloat16,
             quantization_config=_MoEQuantConfig(),
         )
+        layer.quantize_weights(is_static=True)
         x = jnp.asarray(
             [
                 [0.25, -0.5, 0.75, 1.0, -0.25, 0.5, -0.75, -1.0],
@@ -378,15 +376,9 @@ def test_fused_rs_quantized_shared_expert_matches_per_channel_reference_on_cpu()
             ],
             dtype=jnp.bfloat16,
         )
-        w1 = (jnp.arange(32, dtype=jnp.float32).reshape(8, 4) - 15).astype(
-            jnp.float8_e4m3fn
-        )
-        w3 = (17 - jnp.arange(32, dtype=jnp.float32).reshape(8, 4)).astype(
-            jnp.float8_e4m3fn
-        )
-        w2 = (jnp.arange(32, dtype=jnp.float32).reshape(4, 8) % 7 - 3).astype(
-            jnp.float8_e4m3fn
-        )
+        w1 = (jnp.arange(32, dtype=jnp.float32).reshape(8, 4) - 15).astype(jnp.float8_e4m3fn)
+        w3 = (17 - jnp.arange(32, dtype=jnp.float32).reshape(8, 4)).astype(jnp.float8_e4m3fn)
+        w2 = (jnp.arange(32, dtype=jnp.float32).reshape(4, 8) % 7 - 3).astype(jnp.float8_e4m3fn)
         s1 = jnp.asarray([[[0.01, 0.02, 0.03, 0.025]]], dtype=jnp.float32)
         s3 = jnp.asarray([[[0.04, 0.015, 0.025, 0.035]]], dtype=jnp.float32)
         s2 = jnp.asarray(
@@ -412,27 +404,24 @@ def test_fused_rs_quantized_shared_expert_matches_per_channel_reference_on_cpu()
                 lane_width = value_q.shape[-1] // 4
                 channel = jnp.arange(value_q.shape[-1], dtype=jnp.int32)
                 reserved = (channel % lane_width) == (lane_width - 1)
-                value_q = jnp.where(
-                    reserved[None, :], jnp.zeros_like(value_q), value_q
-                )
-                acc = jnp.zeros(
-                    (value_q.shape[0], weight.shape[1]), dtype=jnp.float32
-                )
+                value_q = jnp.where(reserved[None, :], jnp.zeros_like(value_q), value_q)
+                acc = jnp.zeros((value_q.shape[0], weight.shape[1]), dtype=jnp.float32)
                 for lane in range(4):
                     start = lane * lane_width
-                    acc += (
-                        value_q[:, start : start + lane_width]
-                        @ weight[start : start + lane_width, :]
-                    ).astype(jnp.float32)
+                    acc += jax.lax.dot_general(
+                        value_q[:, start : start + lane_width],
+                        weight[start : start + lane_width, :],
+                        (((1,), (0,)), ((), ())),
+                        preferred_element_type=jnp.float32,
+                    )
             else:
-                acc = (value_q @ weight).astype(jnp.float32)
-            return (
-                acc
-                * (
-                    value_scale.astype(jnp.float32)
-                    * scale.reshape(1, -1)
+                acc = jax.lax.dot_general(
+                    value_q,
+                    weight,
+                    (((1,), (0,)), ((), ())),
+                    preferred_element_type=jnp.float32,
                 )
-            )
+            return acc * (value_scale.astype(jnp.float32) * scale.reshape(1, -1))
 
         gate = qlinear(x, w1, s1, reserve_v2_scale_slots=True)
         up = qlinear(x, w3, s3, reserve_v2_scale_slots=True)
@@ -525,21 +514,11 @@ def test_fused_rs_precomputed_routes_support_explicit_mesh(monkeypatch):
         mesh, jax.sharding.PartitionSpec(("data", "tensor"), None, None)
     )
 
-    hidden_states = jax.device_put(
-        jnp.ones((16, 4), dtype=jnp.bfloat16), token_sharding
-    )
-    w1 = jax.device_put(
-        jnp.ones((1, 4, 4), dtype=jnp.bfloat16), weight_sharding
-    )
-    w2 = jax.device_put(
-        jnp.ones((1, 4, 4), dtype=jnp.bfloat16), weight_sharding
-    )
-    topk_weights = jax.device_put(
-        jnp.ones((16, 1), dtype=jnp.float32), token_sharding
-    )
-    topk_indices = jax.device_put(
-        jnp.zeros((16, 1), dtype=jnp.int32), token_sharding
-    )
+    hidden_states = jax.device_put(jnp.ones((16, 4), dtype=jnp.bfloat16), token_sharding)
+    w1 = jax.device_put(jnp.ones((1, 4, 4), dtype=jnp.bfloat16), weight_sharding)
+    w2 = jax.device_put(jnp.ones((1, 4, 4), dtype=jnp.bfloat16), weight_sharding)
+    topk_weights = jax.device_put(jnp.ones((16, 1), dtype=jnp.float32), token_sharding)
+    topk_indices = jax.device_put(jnp.zeros((16, 1), dtype=jnp.int32), token_sharding)
 
     def fake_expert_parallel_gmm_rs(
         hidden_states,
@@ -615,9 +594,7 @@ def test_fused_rs_high_m_index_tile_table_preserves_local_routed_rows():
             expected_rows.append(np.asarray(packed)[row_ids])
             first_capacity = tile_m - (group_start % sublane)
             tile_start = (
-                group_start + first_capacity
-                if tile_start == group_start
-                else tile_start + tile_m
+                group_start + first_capacity if tile_start == group_start else tile_start + tile_m
             )
 
     actual = _build_packed_index_tile_table(

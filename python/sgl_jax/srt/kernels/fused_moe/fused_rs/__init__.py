@@ -17,7 +17,11 @@ Exposes ``fused_moe_func_rs``: EP MoE with ICI reduce-scatter fused into a
 single ``gmm_fused_rs`` Pallas kernel (gather -> GMM1 -> act -> GMM2 -> RS).
 """
 
-from .fused_moe_rs import expert_parallel_gmm_rs, fused_moe_func_rs, moe_gmm_local_rs_nodedup
+from .fused_moe_rs import (
+    expert_parallel_gmm_rs,
+    fused_moe_func_rs,
+    moe_gmm_local_rs_nodedup,
+)
 
 __all__ = [
     "fused_moe_func_rs",

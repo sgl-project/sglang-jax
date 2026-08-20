@@ -97,9 +97,7 @@ def _routing_and_topk(
     # Model-loaded arrays use Explicit mesh axes.  A sharding constraint may
     # only name Auto axes, whereas ``reshard`` supports both Explicit and Auto
     # meshes and states the actual data-movement contract we need here.
-    scores = jax.sharding.reshard(
-        scores, NamedSharding(mesh, P(expert_axis, None))
-    )
+    scores = jax.sharding.reshard(scores, NamedSharding(mesh, P(expert_axis, None)))
 
     if expert_bias is not None:
         # Bias shifts selection but not the final weights.
@@ -326,8 +324,7 @@ def moe_gmm_local_rs_nodedup(
     # Match fused-v2: routing weights and top-k accumulation stay f32, while
     # the backend boundary returns the token dtype.
     token_hidden = jnp.sum(
-        out_3d.astype(jnp.float32)
-        * local_topk_weights.astype(jnp.float32)[:, :, None],
+        out_3d.astype(jnp.float32) * local_topk_weights.astype(jnp.float32)[:, :, None],
         axis=1,
     ).astype(out_3d.dtype)
 
@@ -535,12 +532,8 @@ def fused_moe_func_rs(
     if topk_weights is not None and topk_indices is not None:
         # Honor pre-computed routing; do not recompute from gating_output.
         topk_weights = topk_weights.astype(jnp.float32)
-        topk_weights = jax.sharding.reshard(
-            topk_weights, NamedSharding(mesh, P(expert_axis, None))
-        )
-        topk_indices = jax.sharding.reshard(
-            topk_indices, NamedSharding(mesh, P(expert_axis, None))
-        )
+        topk_weights = jax.sharding.reshard(topk_weights, NamedSharding(mesh, P(expert_axis, None)))
+        topk_indices = jax.sharding.reshard(topk_indices, NamedSharding(mesh, P(expert_axis, None)))
     else:
         assert gating_output is not None, (
             "fused_moe_func_rs: either pre-computed topk_weights+topk_indices "

@@ -79,7 +79,7 @@ def test_extract_device_durations_accepts_legacy_task_device_events():
                 "pid": 11,
                 "ts": 1,
                 "args": {"device_duration_ps": "4250000000"},
-            }
+            },
         ]
     }
 

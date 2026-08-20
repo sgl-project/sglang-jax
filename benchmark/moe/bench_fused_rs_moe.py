@@ -30,19 +30,16 @@ import numpy as np
 from jax.experimental import multihost_utils
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
+
+from benchmark.utils import multiple_iteration_device_timeit_from_trace
 from sgl_jax.srt.kernels.fused_moe.fused_rs import fused_moe_func_rs
 from sgl_jax.srt.kernels.fused_moe.fused_rs.gmm_fused_rs_nodedup import (
     FusedRsBlockConfig,
     get_last_fused_rs_block_sizes,
     set_fused_rs_block_sizes_override,
 )
-from sgl_jax.srt.kernels.fused_moe.v2.kernel import (
-    FusedMoEBlockConfig,
-    fused_ep_moe_v2,
-)
+from sgl_jax.srt.kernels.fused_moe.v2.kernel import FusedMoEBlockConfig, fused_ep_moe_v2
 from sgl_jax.srt.layers.fused_moe import fused_rs_shared_expert
-
-from benchmark.utils import multiple_iteration_device_timeit_from_trace
 
 GLM52_NUM_EXPERTS = 256
 GLM52_TOP_K = 8
@@ -124,9 +121,7 @@ def _make_patterned_array(shape, dtype, sharding, *, kind: str):
             # near-zero values, while still distinguishing token and hidden
             # coordinates.  The earlier signed pattern made ordinary FP8/BF16
             # rounding dominate rel_l2 and obscured routing errors.
-            value = 0.015 + ((token * 7 + hidden * 3) % 17).astype(
-                jnp.float32
-            ) * 0.00025
+            value = 0.015 + ((token * 7 + hidden * 3) % 17).astype(jnp.float32) * 0.00025
             value += (token % 5).astype(jnp.float32) * 0.001
             return value.astype(dtype)
 
@@ -139,12 +134,7 @@ def _make_patterned_array(shape, dtype, sharding, *, kind: str):
             output = jnp.arange(shape[2], dtype=jnp.int32)[None, None, :]
             expert_term = (expert % expert_period[kind]).astype(jnp.float32) * 0.125
             channel_term = (
-                (
-                    reduction * (5 + offsets[kind])
-                    + output * (7 + offsets[kind])
-                    + offsets[kind]
-                )
-                % 3
+                (reduction * (5 + offsets[kind]) + output * (7 + offsets[kind]) + offsets[kind]) % 3
             ).astype(jnp.float32) * 0.125
             return (base[kind] + expert_term + channel_term).astype(dtype)
 
@@ -152,20 +142,23 @@ def _make_patterned_array(shape, dtype, sharding, *, kind: str):
             offsets = {"w1_scale": 2, "w3_scale": 5, "w2_scale": 9}
             expert = jnp.arange(shape[0], dtype=jnp.int32)[:, None, None, None]
             output = jnp.arange(shape[3], dtype=jnp.int32)[None, None, None, :]
-            value = 0.0015 + (expert % 5).astype(jnp.float32) * 0.0002 + (
-                (expert * 3 + output * 5 + offsets[kind]) % 11
-            ).astype(jnp.float32) * 0.00005
+            value = (
+                0.0015
+                + (expert % 5).astype(jnp.float32) * 0.0002
+                + ((expert * 3 + output * 5 + offsets[kind]) % 11).astype(jnp.float32) * 0.00005
+            )
             return jnp.broadcast_to(value, shape).astype(dtype)
 
         if kind in ("w1_shared", "w3_shared", "w2_shared"):
             offsets = {"w1_shared": 2, "w3_shared": 6, "w2_shared": 10}
             reduction = jnp.arange(shape[0], dtype=jnp.int32)[:, None]
             output = jnp.arange(shape[1], dtype=jnp.int32)[None, :]
-            value = 0.25 + (
-                reduction * (3 + offsets[kind])
-                + output * (5 + offsets[kind])
-                + offsets[kind]
-            ) % 4 * 0.125
+            value = (
+                0.25
+                + (reduction * (3 + offsets[kind]) + output * (5 + offsets[kind]) + offsets[kind])
+                % 4
+                * 0.125
+            )
             return value.astype(dtype)
 
         if kind in ("w1_shared_scale", "w3_shared_scale", "w2_shared_scale"):
@@ -175,9 +168,7 @@ def _make_patterned_array(shape, dtype, sharding, *, kind: str):
                 "w2_shared_scale": 8,
             }
             output = jnp.arange(shape[-1], dtype=jnp.int32)[None, None, :]
-            value = 0.0015 + ((output * 7 + offsets[kind]) % 11).astype(
-                jnp.float32
-            ) * 0.00005
+            value = 0.0015 + ((output * 7 + offsets[kind]) % 11).astype(jnp.float32) * 0.00005
             return jnp.broadcast_to(value, shape).astype(dtype)
 
         raise ValueError(f"Unsupported patterned array kind={kind!r}")
@@ -195,9 +186,7 @@ def _make_inputs(
     input_profile: str = "uniform",
 ):
     if num_tokens % ep_size:
-        raise ValueError(
-            f"num_tokens={num_tokens} must be divisible by ep_size={ep_size}"
-        )
+        raise ValueError(f"num_tokens={num_tokens} must be divisible by ep_size={ep_size}")
 
     expert_axis = ("data", "tensor")
     token_sharding = NamedSharding(mesh, P(expert_axis, None))
@@ -205,9 +194,7 @@ def _make_inputs(
     scale_sharding = NamedSharding(mesh, P(expert_axis, None, None, None))
 
     if input_profile == "uniform":
-        tokens = _make_array(
-            (num_tokens, GLM52_HIDDEN_SIZE), jnp.bfloat16, token_sharding, 0.01
-        )
+        tokens = _make_array((num_tokens, GLM52_HIDDEN_SIZE), jnp.bfloat16, token_sharding, 0.01)
         w1 = _make_array(
             (GLM52_NUM_EXPERTS, GLM52_HIDDEN_SIZE, GLM52_INTERMEDIATE_SIZE),
             jnp.float8_e4m3fn,
@@ -312,9 +299,7 @@ def _make_inputs(
             w3_shared_scale = _make_array(
                 (1, 1, GLM52_INTERMEDIATE_SIZE), jnp.float32, replicated, 0.01
             )
-            w2_shared_scale = _make_array(
-                (1, 1, GLM52_HIDDEN_SIZE), jnp.float32, replicated, 0.01
-            )
+            w2_shared_scale = _make_array((1, 1, GLM52_HIDDEN_SIZE), jnp.float32, replicated, 0.01)
         else:
             w1_shared = _make_patterned_array(
                 (GLM52_HIDDEN_SIZE, GLM52_INTERMEDIATE_SIZE),
@@ -399,9 +384,7 @@ def _v2_runner(mesh, num_tokens: int, *, layer_scope: bool) -> Callable:
     try:
         bt, bf, btc, bse, bts = GLM52_V2_BLOCK_CONFIGS[num_tokens]
     except KeyError as exc:
-        raise ValueError(
-            f"No GLM-5.2 fused_v2 block config for tokens={num_tokens}"
-        ) from exc
+        raise ValueError(f"No GLM-5.2 fused_v2 block config for tokens={num_tokens}") from exc
     block_config = FusedMoEBlockConfig(bt=bt, bf=bf, btc=btc, bse=bse, bts=bts)
 
     def run(inputs):
@@ -443,25 +426,17 @@ def _v2_runner(mesh, num_tokens: int, *, layer_scope: bool) -> Callable:
             w3_shared=w3_shared if layer_scope else None,
             w2_shared=w2_shared if layer_scope else None,
             w1_shared_scale=(
-                w1_shared_scale[:, 0, :]
-                if layer_scope and w1_shared_scale is not None
-                else None
+                w1_shared_scale[:, 0, :] if layer_scope and w1_shared_scale is not None else None
             ),
             w3_shared_scale=(
-                w3_shared_scale[:, 0, :]
-                if layer_scope and w3_shared_scale is not None
-                else None
+                w3_shared_scale[:, 0, :] if layer_scope and w3_shared_scale is not None else None
             ),
             w2_shared_scale=(
-                w2_shared_scale[:, 0, :]
-                if layer_scope and w2_shared_scale is not None
-                else None
+                w2_shared_scale[:, 0, :] if layer_scope and w2_shared_scale is not None else None
             ),
         )
         if layer_scope:
-            output = jax.sharding.reshard(
-                output, NamedSharding(mesh, P("data", None))
-            )
+            output = jax.sharding.reshard(output, NamedSharding(mesh, P("data", None)))
         return output
 
     # Match the serving layer boundary: keep shared-expert/add/reshard in the
@@ -519,20 +494,16 @@ def _rs_runner(mesh, *, layer_scope: bool) -> Callable:
                 activation_quantized_dtype=jnp.float8_e4m3fn,
                 mesh=mesh,
             )
-            output = (
-                output.astype(jnp.float32) + shared_output.astype(jnp.float32)
-            ).astype(tokens.dtype)
-            output = jax.sharding.reshard(
-                output, NamedSharding(mesh, P("data", None))
+            output = (output.astype(jnp.float32) + shared_output.astype(jnp.float32)).astype(
+                tokens.dtype
             )
+            output = jax.sharding.reshard(output, NamedSharding(mesh, P("data", None)))
         return output
 
     return jax.jit(run)
 
 
-def _local_critical_samples(
-    samples_by_pid: dict[int, list[float]], *, iters: int
-) -> list[float]:
+def _local_critical_samples(samples_by_pid: dict[int, list[float]], *, iters: int) -> list[float]:
     if not samples_by_pid:
         raise RuntimeError("No strict device_duration_ps samples found")
     invalid = {
@@ -566,9 +537,7 @@ def _routing_stats(topk_ids) -> dict[str, float | int]:
             np.asarray(shard.data).reshape(-1),
             minlength=GLM52_NUM_EXPERTS,
         )
-    gathered = np.asarray(
-        multihost_utils.process_allgather(local_counts.astype(np.int32))
-    )
+    gathered = np.asarray(multihost_utils.process_allgather(local_counts.astype(np.int32)))
     counts = gathered.reshape(-1, GLM52_NUM_EXPERTS).astype(np.int64).sum(axis=0)
     return {
         "routing_observed_rows": int(counts.sum()),
@@ -662,11 +631,7 @@ def main() -> None:
 
     mesh = _build_mesh(args.ep_size)
     rs_configs = _parse_rs_configs(args.rs_configs)
-    if (
-        args.jsonl is not None
-        and not args.append_jsonl
-        and jax.process_index() == 0
-    ):
+    if args.jsonl is not None and not args.append_jsonl and jax.process_index() == 0:
         args.jsonl.parent.mkdir(parents=True, exist_ok=True)
         args.jsonl.write_text("", encoding="utf-8")
 
@@ -717,14 +682,10 @@ def main() -> None:
                     if v2_out is not None:
                         rs_out = rs_run(inputs)
                         jax.block_until_ready(rs_out)
-                        diff = (
-                            v2_out.astype(jnp.float32) - rs_out.astype(jnp.float32)
-                        ).reshape(-1)
+                        diff = (v2_out.astype(jnp.float32) - rs_out.astype(jnp.float32)).reshape(-1)
                         rel_l2 = float(
                             jnp.linalg.norm(diff)
-                            / jnp.maximum(
-                                jnp.linalg.norm(v2_out.astype(jnp.float32)), 1e-6
-                            )
+                            / jnp.maximum(jnp.linalg.norm(v2_out.astype(jnp.float32)), 1e-6)
                         )
                         if rel_l2 > 0.2:
                             raise AssertionError(
@@ -739,9 +700,7 @@ def main() -> None:
                         warmup=args.warmup,
                         iters=args.iters,
                         trace_root=str(
-                            Path(args.trace_root)
-                            / str(num_tokens)
-                            / f"fused_rs_{config_label}"
+                            Path(args.trace_root) / str(num_tokens) / f"fused_rs_{config_label}"
                         ),
                     )
                     rs_ms = statistics.median(samples)
@@ -784,13 +743,9 @@ def main() -> None:
                         "fused_rs_kernel_global_critical_samples_ms": samples,
                         "fused_v2_backend_wall_global_critical_samples_ms": v2_wall_samples,
                         "fused_rs_backend_wall_global_critical_samples_ms": wall_samples,
-                        "fused_rs_speedup_vs_v2": (
-                            v2_ms / rs_ms if v2_ms is not None else None
-                        ),
+                        "fused_rs_speedup_vs_v2": (v2_ms / rs_ms if v2_ms is not None else None),
                         "fused_rs_backend_speedup_vs_v2": (
-                            v2_wall_ms / rs_wall_ms
-                            if v2_wall_ms is not None
-                            else None
+                            v2_wall_ms / rs_wall_ms if v2_wall_ms is not None else None
                         ),
                         "rel_l2_vs_v2": rel_l2,
                     }

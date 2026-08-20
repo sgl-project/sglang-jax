@@ -1023,10 +1023,14 @@ class Glm5DecoderLayer(nnx.Module):
                 MoEBackend.FUSED_RS,
             )
             num_shared_experts = getattr(config, "n_shared_experts", 0)
-            use_inkernel_se = self.moe_backend in (
-                MoEBackend.FUSED_V2,
-                MoEBackend.FUSED_RS,
-            ) and num_shared_experts > 0
+            use_inkernel_se = (
+                self.moe_backend
+                in (
+                    MoEBackend.FUSED_V2,
+                    MoEBackend.FUSED_RS,
+                )
+                and num_shared_experts > 0
+            )
 
             self.topk = TopK(
                 topk=config.num_experts_per_tok,
@@ -1040,9 +1044,7 @@ class Glm5DecoderLayer(nnx.Module):
 
             if self.moe_backend in (MoEBackend.FUSED_V2, MoEBackend.FUSED_RS):
                 fused_cls = (
-                    FusedEPMoERS
-                    if self.moe_backend == MoEBackend.FUSED_RS
-                    else FusedEPMoEV2
+                    FusedEPMoERS if self.moe_backend == MoEBackend.FUSED_RS else FusedEPMoEV2
                 )
                 self.mlp = fused_cls(
                     hidden_size=config.hidden_size,
@@ -1222,9 +1224,7 @@ class Glm5DecoderLayer(nnx.Module):
                     )
 
                 if self.use_fused:
-                    token_valid_mask = forward_batch.get_token_valid_mask(
-                        hidden_states.shape[0]
-                    )
+                    token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
                     if token_valid_mask is not None:
                         topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
 

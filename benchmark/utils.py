@@ -91,9 +91,7 @@ def _extract_marker_durations_ms(trace: dict[str, Any], task: str | None = None)
     return max(sorted(durations_by_pid.items()), key=lambda kv: len(kv[1]))[1]
 
 
-def _extract_device_durations_by_pid_ms(
-    trace: dict[str, Any], task: str
-) -> dict[int, list[float]]:
+def _extract_device_durations_by_pid_ms(trace: dict[str, Any], task: str) -> dict[int, list[float]]:
     """Return strict device durations for every PID matching ``task``.
 
     Unlike :func:`_extract_marker_durations_ms`, this helper deliberately does
@@ -118,40 +116,27 @@ def _extract_device_durations_by_pid_ms(
     # older versions, but never mix host StepTraceAnnotation events into the
     # strict device sample set.
     marker_device_events = [
-        event
-        for event in marker_events
-        if event.get("args", {}).get("device_duration_ps")
+        event for event in marker_events if event.get("args", {}).get("device_duration_ps")
     ]
     marker_call_done_events = [
-        event
-        for event in marker_device_events
-        if event.get("name", "").endswith("call-done")
+        event for event in marker_device_events if event.get("name", "").endswith("call-done")
     ]
     task_device_events = [
-        event
-        for event in task_events
-        if event.get("args", {}).get("device_duration_ps")
+        event for event in task_events if event.get("args", {}).get("device_duration_ps")
     ]
-    candidate_events = (
-        marker_call_done_events or marker_device_events or task_device_events
-    )
+    candidate_events = marker_call_done_events or marker_device_events or task_device_events
 
     by_pid: dict[int, list[dict[str, Any]]] = {}
     for event in candidate_events:
         pid = event.get("pid")
         args = event.get("args", {})
-        if (
-            isinstance(pid, int)
-            and args.get("device_duration_ps")
-        ):
+        if isinstance(pid, int) and args.get("device_duration_ps"):
             by_pid.setdefault(pid, []).append(event)
 
     durations: dict[int, list[float]] = {}
     for pid, events in by_pid.items():
         events.sort(key=lambda event: float(event.get("ts", 0.0)))
-        durations[pid] = [
-            float(event["args"]["device_duration_ps"]) / 1e9 for event in events
-        ]
+        durations[pid] = [float(event["args"]["device_duration_ps"]) / 1e9 for event in events]
     return durations
 
 

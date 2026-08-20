@@ -3,8 +3,7 @@
 import jax
 from flax import nnx
 from jax import numpy as jnp
-from jax.sharding import Mesh
-from jax.sharding import NamedSharding
+from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
@@ -695,15 +694,11 @@ def fused_rs_shared_expert(
     v2_shared_block_size: int = 1024,
 ) -> jax.Array:
     """Run GLM's replicated shared expert beside the routed RS path."""
-    from sgl_jax.srt.kernels.fused_moe.fused_rs.fused_moe_rs import (
-        get_moe_expert_axis,
-    )
+    from sgl_jax.srt.kernels.fused_moe.fused_rs.fused_moe_rs import get_moe_expert_axis
 
     expert_axis = get_moe_expert_axis(mesh)
     token_spec = P(expert_axis, None)
-    hidden_states = jax.sharding.reshard(
-        hidden_states, NamedSharding(mesh, token_spec)
-    )
+    hidden_states = jax.sharding.reshard(hidden_states, NamedSharding(mesh, token_spec))
 
     def _local_linear(
         x,
@@ -739,9 +734,7 @@ def fused_rs_shared_expert(
         x_q = (x_f32 / x_scale).astype(activation_quantized_dtype)
         if reserve_v2_fp8_scale_slots:
             if x_q.shape[-1] % 4:
-                raise ValueError(
-                    "V2 FP8 scale-slot compatibility requires four packed lanes"
-                )
+                raise ValueError("V2 FP8 scale-slot compatibility requires four packed lanes")
             lane_width = x_q.shape[-1] // 4
             channel = jnp.arange(x_q.shape[-1], dtype=jnp.int32)
             reserved = (channel % lane_width) == (lane_width - 1)
@@ -789,9 +782,7 @@ def fused_rs_shared_expert(
         )
         intermediate = jax.nn.silu(gate) * up
         if v2_shared_block_size <= 0:
-            raise ValueError(
-                f"v2_shared_block_size must be positive, got {v2_shared_block_size}"
-            )
+            raise ValueError(f"v2_shared_block_size must be positive, got {v2_shared_block_size}")
 
         # V2's EP32/64K config uses bse=1024.  It quantizes every shared FFN2
         # input block independently and rounds each accumulated partial back to
@@ -809,9 +800,7 @@ def fused_rs_shared_expert(
             if output is None:
                 output = partial.astype(x.dtype)
             else:
-                output = (
-                    output.astype(jnp.float32) + partial.astype(jnp.float32)
-                ).astype(x.dtype)
+                output = (output.astype(jnp.float32) + partial.astype(jnp.float32)).astype(x.dtype)
         return output
 
     return jax.shard_map(
