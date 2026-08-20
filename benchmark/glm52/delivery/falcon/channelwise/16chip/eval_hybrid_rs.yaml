@@ -1,17 +1,17 @@
-name: glm52-delivery-channelwise-16chip-hybrid-rs-gsm8k-quick-pr27-final
+name: glm52-delivery-channelwise-16chip-hybrid-rs-gsm8k-quick-pr27-full-channels-r1
 exp_type: TRAINING
 artifact_type: metrics
 cluster_name: tpu-training-antgroup
 priority: 0
 tags: [glm52, delivery, eval, gsm8k, quick-200, channelwise, fused-rs-prefill, fused-v2-decode, 16chip]
-config: '{"scenario":"eval","model":"GLM5.2-fp8-channel-wise","quantization":"per-channel-weight-moe-w8a8-linear-w8a16","physical_chips":16,"jax_devices":32,"hosts":4,"devices_per_host":8,"tp":32,"dp":32,"ep":32,"moe_backend":"fused_rs_prefill_fused_v2_decode","dataset":"gsm8k","eval_scope":"quick","num_examples":200,"min_score":0.90,"temperature":0.0,"top_p":1.0,"seed":3,"max_tokens":4096,"source_commit":"037c266ad784501a7f4f257155cb8a11dbff1787","source_sha256":"49873b840997200e10c584c347e582e028d99ad2a6bdb0fc95655ff02aabb8e3"}'
+config: '{"scenario":"eval","model":"GLM5.2-fp8-channel-wise","quantization":"per-channel-weight-moe-w8a8-linear-w8a16","physical_chips":16,"jax_devices":32,"hosts":4,"devices_per_host":8,"tp":32,"dp":32,"ep":32,"moe_backend":"fused_rs_prefill_fused_v2_decode","rs_fp8_activation_channels":"full","dataset":"gsm8k","eval_scope":"quick","num_examples":200,"min_score":0.90,"temperature":0.0,"top_p":1.0,"seed":3,"max_tokens":4096,"source_commit":"623a8d152fa90b91aeb6800209ce7b506f8c8b27","source_sha256":"19a6698f195f858dfa37c421004a1bae417036ca21656c2c57fe24285d3569f9"}'
 role_to_task_spec:
   worker:
     command: |
       set -eu
       ulimit -c 0
-      source_tar=/tmp/glm52-fused-rs-hybrid-source-pr27-final.tar.gz.part
-      source_ready=/tmp/glm52-fused-rs-hybrid-source-pr27-final.ready
+      source_tar=/tmp/glm52-fused-rs-full-channels-r1.tar.gz.part
+      source_ready=/tmp/glm52-fused-rs-full-channels-r1.ready
       attempt=0
       while [ ! -f "$source_ready" ]; do
         attempt=$((attempt + 1))
@@ -22,7 +22,7 @@ role_to_task_spec:
         sleep 5
       done
       test -f "$source_tar"
-      echo '49873b840997200e10c584c347e582e028d99ad2a6bdb0fc95655ff02aabb8e3  /tmp/glm52-fused-rs-hybrid-source-pr27-final.tar.gz.part' | sha256sum -c -
+      echo '19a6698f195f858dfa37c421004a1bae417036ca21656c2c57fe24285d3569f9  /tmp/glm52-fused-rs-full-channels-r1.tar.gz.part' | sha256sum -c -
       mkdir -p /workspace/sglang-jax
       tar -xzf "$source_tar" -C /workspace/sglang-jax
       cd /workspace/sglang-jax
@@ -33,7 +33,7 @@ role_to_task_spec:
     device_type: v7x
     device_topo: 2x2x4
     envs:
-      SOURCE_SHA256: 49873b840997200e10c584c347e582e028d99ad2a6bdb0fc95655ff02aabb8e3
+      SOURCE_SHA256: 19a6698f195f858dfa37c421004a1bae417036ca21656c2c57fe24285d3569f9
       GLM52_PHYSICAL_CHIPS: "16"
       GLM52_QUANTIZATION: channelwise
       GLM52_MOE_BACKEND: fused_rs
