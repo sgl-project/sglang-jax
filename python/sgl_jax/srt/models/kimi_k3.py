@@ -16,7 +16,6 @@ Architecture (from the released config.json): 93 layers, ``kda_layers`` lists 69
 
 from __future__ import annotations
 
-import functools
 import os
 
 import logging
@@ -253,31 +252,6 @@ class KimiK3MLP(nnx.Module):
             act = jax.nn.silu(gate) * up
         out, _ = self.down_proj(act)
         return out
-
-
-@functools.partial(jax.jit, static_argnums=(1, 2))
-def _unpack_fp4_kmajor(packed, size_k: int, size_n: int):
-    """``[E, N, K/2]`` uint8 -> native fp4 ``[E, K, N]``, as ONE device op for the whole stack.
-
-    This is the ordering the vllm-torchtpu lane uses (stack first, unpack once through a Pallas
-    op) rather than unpacking per expert. Same arithmetic, ~450x fewer dispatches.
-    """
-    fp4 = jax.lax.bitcast_convert_type(packed, jnp.float4_e2m1fn)
-    fp4 = fp4.reshape(packed.shape[0], size_n, size_k)
-    return jnp.swapaxes(fp4, -1, -2)
-
-
-@jax.jit
-def _decode_e8m0_kernel_layout(scale_u8):
-    """``[E, N, blocks]`` e8m0 uint8 -> fp32 ``[E, blocks, 1, N]``, gmm_v2's declared scale layout.
-
-    e8m0 is a bare exponent, so this is ldexp arithmetic; a cast would be wrong by orders of
-    magnitude.
-    """
-    minexp = jnp.finfo(jnp.float8_e8m0fnu).minexp
-    exponents = scale_u8.astype(jnp.int32) + minexp
-    fp32 = jnp.ldexp(jnp.ones_like(scale_u8, dtype=jnp.float32), exponents)
-    return jnp.expand_dims(jnp.moveaxis(fp32, -1, -2), axis=-2)
 
 
 def _local_expert_range(moe, num_experts: int) -> range:
@@ -830,26 +804,42 @@ class KimiK3ForCausalLM(nnx.Module):
                     if not source.has(f"{base_fmt.format(e=0)}.weight_packed"):
                         continue
 
-                    def _packed(e, _fmt=base_fmt):
-                        """Raw checkpoint bytes for one expert -- numpy only, NO jax op.
-
-                        The whole point of this path: the per-expert step must stay on the host
-                        and untyped. Doing the fp4 unpack here (a JAX op per expert) is what made
-                        loading 124k device round trips and 83% of a 139-minute load.
-                        """
-                        pk = f"{_fmt.format(e=e)}.weight_packed"
-                        sk = f"{_fmt.format(e=e)}.weight_scale"
+                    def _expert(e, _fmt=base_fmt, _fp4=use_fp4):
+                        pk, sk = f"{_fmt.format(e=e)}.weight_packed", f"{_fmt.format(e=e)}.weight_scale"
                         if not source.has(sk):
                             raise KeyError(f"{pk} present but {sk} missing")
-                        return np.asarray(source.get(pk)), np.asarray(source.get(sk))
+                        w, sc = source.get(pk), source.get(sk)
+                        if _fp4:
+                            return unpack_fp4_to_e2m1(jnp.asarray(w)), e8m0_scale_to_kernel_layout(
+                                jnp.asarray(sc)
+                            )
+                        return dequant_expert_weight(jnp.asarray(w), jnp.asarray(sc), jnp.bfloat16), None
 
-                    def _build_packed(global_shape, spec, pick):
-                        """Assemble the PACKED uint8 array, sharded, without any device op.
+                    # EPMoE's OWN mesh: it builds `moe_mesh` with axis_names ("expert", "tensor")
+                    # (moe.py:84-88) and creates its params under that. The model mesh is
+                    # ("data", "tensor"), so binding the spec to it raises
+                    #   ValueError: Resource axis: expert ... is not found in mesh
+                    target_mesh = getattr(moe, "moe_mesh", None) or self.mesh
 
-                        Host layout is ``[E, N, K/2]`` (weights) or ``[E, N, blocks]`` (scales) --
-                        i.e. what the checkpoint stores. The callback is invoked only for slices
-                        this process owns, so the EP filter still holds.
+                    def _build(param_obj, pick):
+                        """Assemble one sharded param, fetching ONLY this host's slices.
+
+                        make_array_from_callback is what the shared loader uses for exactly this
+                        (weight_utils.py:1253). Building the global array host-side and then
+                        device_put'ing it -- what this did before -- works on one host and fails
+                        on four with
+                          RuntimeError: Fetching value for `jax.Array` that spans non-addressable
+                          (non process local) devices
+                        because the global array is not process-local. The callback form is also
+                        where EP filtering becomes real: it is invoked only for slices this
+                        process owns, so the other ranks' experts are never fetched.
                         """
+                        spec = getattr(getattr(param_obj.value, "sharding", None), "spec", None)
+                        global_shape = tuple(param_obj.value.shape)
+                        if spec is None:
+                            return None
+                        sharding = NamedSharding(target_mesh, spec)
+
                         def _slice(index):
                             expert_idx = index[0]
                             ids = (
@@ -857,63 +847,23 @@ class KimiK3ForCausalLM(nnx.Module):
                                 if isinstance(expert_idx, slice)
                                 else [int(expert_idx)]
                             )
-                            local = np.stack([pick(_packed(e)) for e in ids], axis=0)
+                            local = np.stack([np.asarray(pick(_expert(e))) for e in ids], axis=0)
                             rest = tuple(index[1:])
                             return local[(slice(None), *rest)] if rest else local
 
-                        return jax.make_array_from_callback(
-                            global_shape, NamedSharding(target_mesh, spec), _slice
-                        )
+                        return jax.make_array_from_callback(global_shape, sharding, _slice)
 
-                    # EPMoE's OWN mesh: it builds `moe_mesh` with axis_names ("expert","tensor")
-                    # and creates its params under that; the model mesh is ("data","tensor"), so
-                    # binding the spec to it raises "Resource axis: expert ... not found in mesh".
-                    target_mesh = getattr(moe, "moe_mesh", None) or self.mesh
-
-                    w_spec = getattr(getattr(param.value, "sharding", None), "spec", None)
-                    if w_spec is None:
+                    built = _build(param, lambda t: t[0])
+                    if built is None:
                         continue
-                    n_experts_g, size_k, size_n = param.value.shape
+                    param.value = built
 
-                    if use_fp4:
-                        # ---- weights: [E, N, K/2] u8 on host -> ONE device op -> [E, K, N] fp4 --
-                        packed = _build_packed(
-                            (n_experts_g, size_n, size_k // 2),
-                            _P(w_spec[0], w_spec[2], None),   # N carries the tensor axis
-                            lambda t: t[0],
-                        )
-                        param.value = _unpack_fp4_kmajor(packed, size_k, size_n)
-
-                        # ---- scales: [E, N, blocks] u8 -> [E, blocks, 1, N] fp32 --------------
-                        if scale_param is not None:
-                            s_spec = getattr(
-                                getattr(scale_param.value, "sharding", None), "spec", None)
-                            blocks = scale_param.value.shape[1]
-                            packed_s = _build_packed(
-                                (n_experts_g, size_n, blocks),
-                                _P(s_spec[0], s_spec[3], None),
-                                lambda t: t[1],
-                            )
-                            scale_param.value = _decode_e8m0_kernel_layout(packed_s)
-                    else:
-                        def _bf16_slice(index, _shape=(n_experts_g, size_k, size_n)):
-                            expert_idx = index[0]
-                            ids = (
-                                range(*expert_idx.indices(_shape[0]))
-                                if isinstance(expert_idx, slice) else [int(expert_idx)]
-                            )
-                            local = np.stack(
-                                [np.asarray(dequant_expert_weight(
-                                    jnp.asarray(w), jnp.asarray(sc), jnp.bfloat16))
-                                 for w, sc in (_packed(e) for e in ids)], axis=0)
-                            rest = tuple(index[1:])
-                            return local[(slice(None), *rest)] if rest else local
-
-                        param.value = jax.make_array_from_callback(
-                            (n_experts_g, size_k, size_n),
-                            NamedSharding(target_mesh, w_spec),
-                            _bf16_slice,
-                        )
+                    # The scale is NOT optional in fp4: the kernel multiplies by it, so a missing
+                    # or zero scale produces finite, plausible, wrong numbers rather than an error.
+                    if use_fp4 and scale_param is not None:
+                        scale_built = _build(scale_param, lambda t: t[1])
+                        if scale_built is not None:
+                            scale_param.value = scale_built
 
                     n_done += 1
                     if n_done % 12 == 0 or li <= 1:
