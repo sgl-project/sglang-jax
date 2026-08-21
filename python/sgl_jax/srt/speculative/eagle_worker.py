@@ -9,18 +9,13 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from tqdm import tqdm
 
-from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
-from sgl_jax.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
-from sgl_jax.srt.managers.schedule_batch import ScheduleBatch
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.speculative.base_worker import BaseSpecWorker
 from sgl_jax.srt.speculative.eagle_draft_worker import EagleDraftWorker
-from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyOutput
-from sgl_jax.srt.utils.common_utils import get_bool_env_var
+from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
 
 logger = logging.getLogger(__name__)
-RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
 
 
 class EAGLEWorker(BaseSpecWorker):
@@ -40,76 +35,6 @@ class EAGLEWorker(BaseSpecWorker):
 
     # -- BaseSpecWorker provides target_worker/draft_worker/verify/
     #    forward_target_extend/forward_batch_speculative_generation --
-
-    # -- Logprob post-processing --
-
-    def add_logprob_values(
-        self,
-        batch: ScheduleBatch,
-        res: EagleVerifyOutput,
-        logits_output: LogitsProcessorOutput,
-    ):
-        logits_output = res.logits_output
-        top_logprobs_nums = batch.top_logprobs_nums
-        token_ids_logprobs = batch.token_ids_logprobs
-        accepted_indices = res.accepted_indices
-        assert len(accepted_indices) == len(logits_output.next_token_logits)
-
-        temperatures = batch.sampling_info.temperatures
-        num_draft_tokens = batch.reqs_info[0].spec_info.draft_token_num
-        temperatures = temperatures[accepted_indices // num_draft_tokens]
-        if RETURN_ORIGINAL_LOGPROB:
-            logprobs = jax.nn.log_softmax(logits_output.next_token_logits, axis=-1)
-        else:
-            logprobs = jax.nn.log_softmax(logits_output.next_token_logits / temperatures, axis=-1)
-        batch_next_token_ids = res.verified_id
-        num_tokens_per_req = [accept + 1 for accept in res.accept_length_per_req_cpu]
-
-        top_logprobs_nums_repeat_interleaved = []
-        token_ids_logprobs_repeat_interleaved = []
-        for num, num_tokens in zip(top_logprobs_nums, num_tokens_per_req):
-            top_logprobs_nums_repeat_interleaved.extend([num] * num_tokens)
-        for token_ids, num_tokens in zip(token_ids_logprobs, num_tokens_per_req):
-            token_ids_logprobs_repeat_interleaved.extend([token_ids] * num_tokens)
-
-        if any(x > 0 for x in top_logprobs_nums):
-            (
-                logits_output.next_token_top_logprobs_val,
-                logits_output.next_token_top_logprobs_idx,
-            ) = get_top_logprobs(
-                logprobs,
-                top_logprobs_nums_repeat_interleaved,
-            )
-
-        if any(x is not None for x in token_ids_logprobs):
-            logits_output.next_token_token_ids_logprobs_val = get_token_ids_logprobs(
-                logprobs,
-                token_ids_logprobs_repeat_interleaved,
-                None,
-            )
-            logits_output.next_token_token_ids_logprobs_idx = None
-
-        logits_output.next_token_logprobs = logprobs[
-            jnp.arange(len(batch_next_token_ids), device=batch.sampling_info.device),
-            batch_next_token_ids,
-        ]
-
-        pt = 0
-        next_token_logprobs = logits_output.next_token_logprobs.tolist()
-        verified_ids = batch_next_token_ids.tolist()
-        for req, num_tokens in zip(batch.reqs, num_tokens_per_req, strict=True):
-            for _ in range(num_tokens):
-                if req.return_logprob:
-                    req.output_token_logprobs_val.append(next_token_logprobs[pt])
-                    req.output_token_logprobs_idx.append(verified_ids[pt])
-                    if req.top_logprobs_num > 0:
-                        req.output_top_logprobs_val.append(
-                            res.logits_output.next_token_top_logprobs_val[pt]
-                        )
-                        req.output_top_logprobs_idx.append(
-                            res.logits_output.next_token_top_logprobs_idx[pt]
-                        )
-                pt += 1
 
     # -- Precompilation --
 

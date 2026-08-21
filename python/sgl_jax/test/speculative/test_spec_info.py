@@ -1,54 +1,103 @@
-"""SpecInput protocol conformance for EagleDraftInput / EagleVerifyInput."""
-
+import jax
 import numpy as np
+import pytest
 
-from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
-from sgl_jax.srt.speculative.spec_info import SpecInput
+from sgl_jax.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 
 
-def test_eagle_draft_input_is_spec_input():
-    di = EagleDraftInput(
-        accept_length_cpu=np.array([2, 3, 1], dtype=np.int32),
-        allocate_lens=np.array([10, 12, 8], dtype=np.int32),
+def test_eagle_draft_input_pytree_round_trip():
+    draft_input = EagleDraftInput(
+        topk_p=np.ones((2, 1), dtype=np.float32),
+        topk_index=np.array([[3], [5]], dtype=np.int32),
+        hidden_states=np.ones((2, 4), dtype=np.float32),
+        verified_id=np.array([3, 5], dtype=np.int32),
+        accept_length=np.array([1, 2], dtype=np.int32),
+        accept_length_cpu=np.array([1, 2], dtype=np.int32),
+        kv_indices=np.array([7, 11], dtype=np.int32),
+        future_indices=np.array([0, 1], dtype=np.int32),
+        num_tokens_per_batch=1,
+        num_tokens_for_logprob_per_batch=1,
     )
-    assert isinstance(di, SpecInput)
-    assert di.is_draft_input() and not di.is_verify_input()
-    assert (di.get_logical_token_num(bs=3) == np.array([2, 3, 1])).all()
-    assert di.get_verify_token_num(bs=3) == 0
-    assert (di.get_allocated_token_num() == np.array([10, 12, 8])).all()
-    assert di.get_spec_adjust_token_coefficient() >= 1
+
+    leaves, tree = jax.tree_util.tree_flatten(draft_input)
+    restored = jax.tree_util.tree_unflatten(tree, leaves)
+
+    np.testing.assert_array_equal(restored.topk_index, draft_input.topk_index)
+    np.testing.assert_array_equal(restored.verified_id, draft_input.verified_id)
+    np.testing.assert_array_equal(restored.kv_indices, draft_input.kv_indices)
+    np.testing.assert_array_equal(restored.future_indices, draft_input.future_indices)
 
 
-def test_eagle_verify_input_is_spec_input():
-    vi = EagleVerifyInput(
-        draft_token=np.zeros(8, dtype=np.int32),
-        custom_mask=np.zeros(1, dtype=np.int32),
-        positions=np.zeros(8, dtype=np.int32),
-        retrive_index=np.zeros(8, dtype=np.int32),
-        retrive_next_token=np.zeros(8, dtype=np.int32),
-        retrive_next_sibling=np.zeros(8, dtype=np.int32),
-        retrive_cum_len=np.zeros(3, dtype=np.int32),
-        seq_lens_cpu=np.array([5, 7], dtype=np.int32),
+def test_eagle_draft_input_merge_downgrades_recurrent_chain_for_prefill_seed():
+    running = EagleDraftInput(
+        topk_p=np.ones((1, 3), dtype=np.float32),
+        topk_index=np.array([[11, 12, 13]], dtype=np.int32),
+        hidden_states=np.ones((1, 4), dtype=np.float32),
+        verified_id=np.array([10], dtype=np.int32),
+        allocate_lens=np.array([32], dtype=np.int32),
+    )
+    prefetched = EagleDraftInput(
+        topk_p=np.ones((1, 1), dtype=np.float32),
+        topk_index=np.array([[21]], dtype=np.int32),
+        hidden_states=np.full((1, 4), 2, dtype=np.float32),
+        verified_id=np.array([20], dtype=np.int32),
+        allocate_lens=np.array([48], dtype=np.int32),
+    )
+
+    running.merge_batch(prefetched)
+
+    assert running.topk_p.shape == (2, 1)
+    np.testing.assert_array_equal(running.topk_index, np.array([[11], [21]], dtype=np.int32))
+    np.testing.assert_array_equal(running.verified_id, np.array([10, 20], dtype=np.int32))
+    np.testing.assert_array_equal(running.allocate_lens, np.array([32, 48], dtype=np.int32))
+
+
+def test_eagle_draft_input_relay_merge_and_filter_preserve_request_indices():
+    running = EagleDraftInput(
+        future_indices=np.array([3, 5], dtype=np.int32),
+        allocate_lens=np.array([32, 48], dtype=np.int32),
+    )
+    joined = EagleDraftInput(
+        future_indices=np.array([7], dtype=np.int32),
+        allocate_lens=np.array([64], dtype=np.int32),
+    )
+
+    running.merge_batch(joined)
+    running.filter_batch(np.array([2, 0], dtype=np.int32), has_been_filtered=False)
+
+    np.testing.assert_array_equal(running.future_indices, np.array([7, 3], dtype=np.int32))
+    np.testing.assert_array_equal(running.allocate_lens, np.array([64, 32], dtype=np.int32))
+
+
+def test_eagle_draft_input_rejects_bootstrap_relay_merge():
+    relay = EagleDraftInput(future_indices=np.array([3], dtype=np.int32))
+    bootstrap = EagleDraftInput(
+        topk_p=np.ones((1, 1), dtype=np.float32),
+        topk_index=np.array([[11]], dtype=np.int32),
+        hidden_states=np.ones((1, 4), dtype=np.float32),
+        verified_id=np.array([10], dtype=np.int32),
+    )
+
+    with pytest.raises(AssertionError, match="future_indices"):
+        relay.merge_batch(bootstrap)
+
+
+def test_eagle_verify_input_pytree_round_trip():
+    verify_input = EagleVerifyInput(
+        draft_token=np.arange(8, dtype=np.int32),
+        custom_mask=None,
+        positions=np.arange(8, dtype=np.int32),
+        retrive_index=np.arange(8, dtype=np.int32).reshape(2, 4),
+        retrive_next_token=np.full((2, 4), -1, dtype=np.int32),
+        retrive_next_sibling=np.full((2, 4), -1, dtype=np.int32),
         spec_steps=3,
-        topk=1,
         draft_token_num=4,
-        seq_lens_sum=12,
-        capture_hidden_mode=CaptureHiddenMode.FULL,
     )
-    assert isinstance(vi, SpecInput)
-    assert vi.is_verify_input() and not vi.is_draft_input()
-    assert vi.get_verify_token_num(bs=2) == 8
-    assert vi.get_spec_adjust_token_coefficient() == 4
-    assert vi.get_allocated_token_num() is None
 
+    leaves, tree = jax.tree_util.tree_flatten(verify_input)
+    restored = jax.tree_util.tree_unflatten(tree, leaves)
 
-def test_three_token_counts_are_distinct():
-    """RFC #1053: logical / allocated / verify must be exposed independently."""
-    di = EagleDraftInput(
-        accept_length_cpu=np.array([2, 2], dtype=np.int32),
-        allocate_lens=np.array([100, 100], dtype=np.int32),
-    )
-    assert int(di.get_logical_token_num(bs=2).sum()) == 4
-    assert int(di.get_allocated_token_num().sum()) == 200
-    assert di.get_verify_token_num(bs=2) == 0
+    assert restored.spec_steps == 3
+    assert restored.draft_token_num == 4
+    np.testing.assert_array_equal(restored.draft_token, verify_input.draft_token)
+    np.testing.assert_array_equal(restored.retrive_index, verify_input.retrive_index)

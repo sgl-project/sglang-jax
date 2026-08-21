@@ -41,7 +41,7 @@ if TYPE_CHECKING:
     from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
     from sgl_jax.srt.model_executor.model_runner import ModelRunner
-    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
+    from sgl_jax.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 
 
 class ForwardMode(IntEnum):

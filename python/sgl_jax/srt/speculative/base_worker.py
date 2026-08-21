@@ -84,11 +84,19 @@ class BaseSpecWorker:
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
-        self._can_use_fused_spec_decode = (
-            self.speculative_algorithm.is_nextn()
-            and self.topk == 1
+        can_use_linear_fused_verify = (
+            self.topk == 1
             and self.speculative_num_steps > 1
             and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
+        )
+        self._can_use_fused_spec_decode = (
+            self.speculative_algorithm.is_nextn() and can_use_linear_fused_verify
+        )
+        self._can_use_fused_eagle3_verify = (
+            self.speculative_algorithm.is_eagle3()
+            and can_use_linear_fused_verify
+            and server_args.attention_backend == "fa"
+            and os.getenv("SGL_JAX_DISABLE_FUSED_EAGLE3_RECURRENT_DRAFT") != "1"
         )
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = target_worker.get_memory_pool()
@@ -162,16 +170,25 @@ class BaseSpecWorker:
                 "Spec decode-overlap entry only supports decode batches; "
                 "prefill overlap uses forward_batch_speculative_generation()."
             )
-        if not self._can_use_fused_spec_decode:
-            raise NotImplementedError("Spec overlap entry only supports fused NEXTN topk=1 decode.")
+        if not (self._can_use_fused_spec_decode or self._can_use_fused_eagle3_verify):
+            raise NotImplementedError(
+                "Spec overlap entry only supports fused linear NEXTN or EAGLE3 decode."
+            )
 
         self.init_spec_relay_buffers()
         self._prepare_overlap_sampling_info(model_worker_batch)
         cur_allocate_lens = self._get_cur_allocate_lens(model_worker_batch)
 
-        from sgl_jax.srt.speculative.draft_extend_fused import spec_decode_overlap
+        if self._can_use_fused_eagle3_verify:
+            from sgl_jax.srt.speculative.draft_extend_fused import (
+                spec_decode_eagle3_overlap,
+            )
 
-        result = spec_decode_overlap(self, model_worker_batch, cur_allocate_lens)
+            result = spec_decode_eagle3_overlap(self, model_worker_batch, cur_allocate_lens)
+        else:
+            from sgl_jax.srt.speculative.draft_extend_fused import spec_decode_overlap
+
+            result = spec_decode_overlap(self, model_worker_batch, cur_allocate_lens)
         launch_done = getattr(model_worker_batch, "launch_done", None)
         if launch_done is not None:
             launch_done.set()
@@ -253,6 +270,14 @@ class BaseSpecWorker:
             self.draft_worker.draft_extend_for_prefill(
                 model_worker_batch, logits_output.hidden_states, next_token_ids
             )
+            # The generic overlap loop waits for the *current* batch to finish
+            # enqueueing before it resolves the previous batch.  Fused prefill
+            # publishes this event inside spec_prefill(); the recurrent EAGLE
+            # prefill path above must do the same, otherwise two consecutive
+            # prefills wait on an event that nobody sets.
+            batch_launch_done = getattr(model_worker_batch, "launch_done", None)
+            if batch_launch_done is not None:
+                batch_launch_done.set()
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
@@ -272,6 +297,35 @@ class BaseSpecWorker:
             from sgl_jax.srt.speculative.draft_extend_fused import spec_decode
 
             batch_output = spec_decode(self, model_worker_batch, cur_allocate_lens)
+            launch_done = getattr(model_worker_batch, "launch_done", None)
+            if launch_done is not None:
+                launch_done.set()
+            return batch_output
+        if self._can_use_fused_eagle3_verify and model_worker_batch.sampling_info.is_all_greedy:
+            from sgl_jax.srt.speculative.draft_extend_fused import (
+                eagle3_recurrent_draft_extend_for_decode,
+                spec_decode_verify,
+            )
+
+            # The first decode after prefill bootstraps the token chain with the
+            # legacy recurrent draft loop. Steady-state rounds consume the chain
+            # produced by the previous fused recurrent draft-extend without
+            # launching more draft forwards here.
+            draft_to_target_token_ids = self.draft_worker.prepare_for_fused_verify(
+                model_worker_batch
+            )
+            batch_output = spec_decode_verify(
+                self,
+                model_worker_batch,
+                cur_allocate_lens,
+                draft_to_target_token_ids=draft_to_target_token_ids,
+                draft_padding_prepared=True,
+            )
+            eagle3_recurrent_draft_extend_for_decode(
+                self.draft_worker,
+                model_worker_batch,
+                batch_output,
+            )
             launch_done = getattr(model_worker_batch, "launch_done", None)
             if launch_done is not None:
                 launch_done.set()
@@ -310,11 +364,11 @@ class BaseSpecWorker:
 
     def verify(self, model_worker_batch: ModelWorkerBatch, cur_allocate_lens: jax.Array):
         from sgl_jax.srt.managers.scheduler import GenerationBatchResult
-        from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
+        from sgl_jax.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 
         spec_info: EagleVerifyInput = model_worker_batch.spec_info_padded
         spec_info.allocate_lens = cur_allocate_lens
-        spec_info.prepare_for_verify(model_worker_batch, self.page_size, self.target_worker)
+        spec_info.prepare_for_verify(model_worker_batch)
         forward_metadata = self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
         )

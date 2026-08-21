@@ -62,7 +62,7 @@ from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
 from sgl_jax.srt.utils.common_utils import get_bool_env_var, pad_to_bucket
 
 if TYPE_CHECKING:
-    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
+    from sgl_jax.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
     from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
@@ -1708,8 +1708,6 @@ class ScheduleBatch:
                 ):
                     info.spec_info.trim_to_length(len(info.reqs))
             flat_spec = self._concat_spec_info_per_rank([info.spec_info for info in self.reqs_info])
-            if getattr(flat_spec, "pending_draft_extend_result", None) is not None:
-                flat_spec.resolve_pending_draft_extend_result()
             flat_spec.prepare_for_decode(self)
             real_bs_per_dp = [len(info.reqs) if info.reqs else 0 for info in self.reqs_info]
             per_rank_spec = self._split_spec_info_per_rank(flat_spec, real_bs_per_dp)
@@ -2615,8 +2613,6 @@ class ScheduleBatch:
         # aligns with seq_lens[i]. Returns a new object — does not mutate
         # the per-rank cross-round state on reqs_info[r].spec_info.
         flat_spec = self._concat_spec_info_per_rank([info.spec_info for info in self.reqs_info])
-        if getattr(flat_spec, "pending_draft_extend_result", None) is not None:
-            flat_spec.resolve_pending_draft_extend_result()
         legacy_eagle3_non_overlap = use_legacy_eagle3_non_overlap(
             self.enable_overlap, self.spec_algorithm
         )
@@ -2866,8 +2862,6 @@ class ScheduleBatch:
             return out
 
         has_future_indices = getattr(flat, "future_indices", None) is not None
-        if getattr(flat, "pending_draft_extend_result", None) is not None:
-            flat.resolve_pending_draft_extend_result()
         if not has_future_indices:
             flat._ensure_host()
             required_fields = ("topk_p", "topk_index", "hidden_states", "verified_id")
@@ -2898,7 +2892,7 @@ class ScheduleBatch:
                 }
                 raise RuntimeError(
                     "_split_spec_info_per_rank got incomplete EagleDraftInput "
-                    f"without pending_draft_extend_result; missing={missing}, "
+                    f"missing={missing}, "
                     f"field_states={field_states}, real_bs_per_dp={real_bs_per_dp}"
                 )
 
@@ -2975,9 +2969,6 @@ class ScheduleBatch:
                     "_concat_spec_info_per_rank requires every nonempty rank to carry "
                     "future_indices on the relay-buffer path"
                 )
-            else:
-                for spec_info in nonempty:
-                    spec_info.resolve_pending_draft_extend_result()
 
             per_req_fields = (
                 "topk_p",

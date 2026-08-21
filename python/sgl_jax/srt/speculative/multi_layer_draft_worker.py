@@ -37,7 +37,7 @@ from sgl_jax.srt.speculative.eagle_draft_worker import (
     topk_probs_from_logits,
     update_eagle_lists,
 )
-from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
 
 logger = logging.getLogger(__name__)
 

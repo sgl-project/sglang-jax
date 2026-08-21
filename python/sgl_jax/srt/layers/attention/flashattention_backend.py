@@ -20,7 +20,7 @@ from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
 from sgl_jax.srt.utils import cdiv
 from sgl_jax.srt.utils.jax_utils import device_array
 from sgl_jax.srt.utils.profiling_utils import named_scope
@@ -238,6 +238,37 @@ class FlashAttention(AttentionBackend):
 
     # TODO: Make this a common speculative metadata builder in the next PR;
     # DFlash and EAGLE already share this path.
+    def get_eagle_base_metadata(self, batch: ModelWorkerBatch):
+        """Upload only allocated page ids; fused JITs rebuild dynamic metadata."""
+        metadata = FlashAttentionMetadata()
+        page_indices = (
+            np.asarray(batch.cache_loc[:: self.page_size], dtype=np.int32) // self.page_size
+        )
+        max_num_seqs = batch.dp_size * batch.per_dp_bs_size
+        page_indices = _pad_page_indices(page_indices, max_num_seqs)
+        data_sharding = NamedSharding(self.mesh, P("data"))
+        metadata.page_indices = device_array(page_indices, sharding=data_sharding)
+
+        if batch.forward_mode == ForwardMode.TARGET_VERIFY:
+            metadata.custom_mask = batch.spec_info_padded.custom_mask
+
+        swa_mapping = getattr(self, "swa_index_mapping", None)
+        if swa_mapping is not None:
+            full_loc = (page_indices.astype(np.int64) * self.page_size).astype(np.int32)
+            if isinstance(swa_mapping, list):
+                full_2d = full_loc.reshape(batch.dp_size, -1)
+                swa_2d = np.empty_like(full_2d)
+                for r in range(batch.dp_size):
+                    swa_2d[r] = np.asarray(swa_mapping[r])[full_2d[r]]
+                swa_loc = swa_2d.ravel()
+            else:
+                swa_loc = np.asarray(swa_mapping)[full_loc]
+            metadata.swa_page_indices = device_array(
+                (swa_loc // self.page_size).astype(np.int32),
+                sharding=data_sharding,
+            )
+        return metadata
+
     def get_eagle_forward_metadata(
         self,
         batch: ModelWorkerBatch,

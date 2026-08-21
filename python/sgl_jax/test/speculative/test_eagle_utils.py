@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import Mock
 
 import jax
 import jax.numpy as jnp
@@ -14,11 +15,46 @@ from sgl_jax.test.test_utils import CustomTestCase
 
 
 class TestVerifyTree(CustomTestCase):
-    def test_as_int32_array_keeps_host_metadata_on_host(self):
-        from sgl_jax.srt.speculative import eagle_util
+    def test_eagle3_overlap_server_args_allow_linear_fa(self):
+        from sgl_jax.srt.server_args import ServerArgs
 
-        original_jnp_asarray = eagle_util.jnp.asarray
-        original_jnp_empty = eagle_util.jnp.empty
+        args = ServerArgs(
+            model_path="target",
+            speculative_algorithm="EAGLE3",
+            speculative_draft_model_path="draft",
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            speculative_eagle_topk=1,
+            attention_backend="fa",
+            disable_overlap_schedule=False,
+            grammar_backend="none",
+        )
+
+        args.check_server_args()
+
+    def test_eagle3_overlap_server_args_reject_non_fa(self):
+        from sgl_jax.srt.server_args import ServerArgs
+
+        args = ServerArgs(
+            model_path="target",
+            speculative_algorithm="EAGLE3",
+            speculative_draft_model_path="draft",
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            speculative_eagle_topk=1,
+            attention_backend="native",
+            disable_overlap_schedule=False,
+            grammar_backend="none",
+        )
+
+        with self.assertRaisesRegex(ValueError, "EAGLE3\\+FA"):
+            args.check_server_args()
+
+    def test_as_int32_array_keeps_host_metadata_on_host(self):
+        from sgl_jax.srt.speculative import eagle_info
+
+        original_jnp_asarray = eagle_info.jnp.asarray
+        original_jnp_empty = eagle_info.jnp.empty
 
         def fail_jnp_asarray(*args, **kwargs):
             raise AssertionError("host metadata conversion must not call jnp.asarray")
@@ -27,15 +63,15 @@ class TestVerifyTree(CustomTestCase):
             raise AssertionError("host metadata placeholder must not call jnp.empty")
 
         try:
-            eagle_util.jnp.asarray = fail_jnp_asarray
-            eagle_util.jnp.empty = fail_jnp_empty
-            arr = eagle_util._as_int32_array(np.array([1, 2], dtype=np.int64))
-            scalar = eagle_util._as_int32_array(3)
-            listed = eagle_util._as_int32_array([4, 5])
-            children, _ = eagle_util.EagleDraftInput().tree_flatten()
+            eagle_info.jnp.asarray = fail_jnp_asarray
+            eagle_info.jnp.empty = fail_jnp_empty
+            arr = eagle_info._as_int32_array(np.array([1, 2], dtype=np.int64))
+            scalar = eagle_info._as_int32_array(3)
+            listed = eagle_info._as_int32_array([4, 5])
+            children, _ = eagle_info.EagleDraftInput().tree_flatten()
         finally:
-            eagle_util.jnp.asarray = original_jnp_asarray
-            eagle_util.jnp.empty = original_jnp_empty
+            eagle_info.jnp.asarray = original_jnp_asarray
+            eagle_info.jnp.empty = original_jnp_empty
 
         self.assertIsInstance(arr, np.ndarray)
         self.assertEqual(arr.dtype, np.int32)
@@ -43,13 +79,13 @@ class TestVerifyTree(CustomTestCase):
         self.assertIsInstance(scalar, np.ndarray)
         self.assertEqual(scalar.dtype, np.int32)
         np.testing.assert_array_equal(listed, np.array([4, 5], dtype=np.int32))
-        self.assertIsNone(children[9])
-        self.assertIsInstance(children[10], np.ndarray)
-        self.assertEqual(children[10].dtype, np.int32)
-        self.assertEqual(children[10].shape, (0,))
+        self.assertIsNone(children[6])
+        self.assertIsInstance(children[7], np.ndarray)
+        self.assertEqual(children[7].dtype, np.int32)
+        self.assertEqual(children[7].shape, (0,))
 
         device_arr = jnp.array([6], dtype=jnp.int32)
-        self.assertIs(eagle_util._as_int32_array(device_arr), device_arr)
+        self.assertIs(eagle_info._as_int32_array(device_arr), device_arr)
 
     def test_build_chain_verify_inputs_device_matches_linear_chain_layout(self):
         from sgl_jax.srt.speculative.eagle_util import build_chain_verify_inputs_device
@@ -173,6 +209,444 @@ class TestVerifyTree(CustomTestCase):
         np.testing.assert_array_equal(np.asarray(out.accept_lens), np.array([0, 3]))
         np.testing.assert_array_equal(np.asarray(out.new_seq_lens), np.array([1, 14]))
         np.testing.assert_array_equal(np.asarray(out.sel_pos), np.array([0, 2]))
+
+    def test_recurrent_eagle3_chain_skips_draft_model_forward(self):
+        from types import SimpleNamespace
+
+        from sgl_jax.srt.speculative.eagle_draft_worker import EagleDraftWorker
+        from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        worker = object.__new__(EagleDraftWorker)
+        worker.speculative_algorithm = SpeculativeAlgorithm.EAGLE3
+        worker.speculative_num_steps = 3
+        worker.topk = 1
+        token_chain = jnp.array([[11, 12, 13], [21, 22, 23]], dtype=jnp.int32)
+        batch = SimpleNamespace(
+            spec_info_padded=SimpleNamespace(
+                topk_p=jnp.ones_like(token_chain, dtype=jnp.float32),
+                topk_index=token_chain,
+                hidden_states=jnp.zeros((2, 4), dtype=jnp.float32),
+            )
+        )
+
+        scores, tokens, parents = worker.draft_forward(batch)
+
+        self.assertIsNone(scores)
+        self.assertIsNone(parents)
+        np.testing.assert_array_equal(np.asarray(tokens), np.asarray(token_chain))
+
+    def test_fused_verify_preparation_keeps_recurrent_chain_raw(self):
+        from types import SimpleNamespace
+
+        from sgl_jax.srt.speculative.eagle_draft_worker import EagleDraftWorker
+        from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        worker = object.__new__(EagleDraftWorker)
+        worker.speculative_algorithm = SpeculativeAlgorithm.EAGLE3
+        worker.speculative_num_steps = 3
+        worker.topk = 1
+        worker.hot_token_ids = object()
+        worker.padding_for_decode = Mock()
+        token_chain = jnp.array([[11, 12, 13], [21, 22, 23]], dtype=jnp.int32)
+        worker.draft_forward = Mock(return_value=(None, token_chain, None))
+        batch = SimpleNamespace(
+            spec_info_padded=SimpleNamespace(topk_index=token_chain),
+        )
+
+        mapping = worker.prepare_for_fused_verify(batch)
+
+        self.assertIs(mapping, worker.hot_token_ids)
+        self.assertIs(batch.spec_info_padded.topk_index, token_chain)
+        worker.padding_for_decode.assert_called_once_with(
+            batch,
+            map_hot_token_ids=False,
+        )
+
+    def test_fused_verify_bootstrap_chain_is_already_mapped(self):
+        from types import SimpleNamespace
+
+        from sgl_jax.srt.speculative.eagle_draft_worker import EagleDraftWorker
+        from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        worker = object.__new__(EagleDraftWorker)
+        worker.speculative_algorithm = SpeculativeAlgorithm.EAGLE3
+        worker.speculative_num_steps = 3
+        worker.topk = 1
+        worker.hot_token_ids = object()
+        worker.padding_for_decode = Mock()
+        seed = jnp.array([[11], [21]], dtype=jnp.int32)
+        mapped_chain = jnp.array([[101, 102, 103], [201, 202, 203]], dtype=jnp.int32)
+        worker.draft_forward = Mock(return_value=(None, mapped_chain, None))
+        batch = SimpleNamespace(
+            spec_info_padded=SimpleNamespace(topk_index=seed),
+        )
+
+        mapping = worker.prepare_for_fused_verify(batch)
+
+        self.assertIsNone(mapping)
+        self.assertIs(batch.spec_info_padded.topk_index, mapped_chain)
+        worker.padding_for_decode.assert_called_once_with(
+            batch,
+            map_hot_token_ids=True,
+        )
+
+    def test_fused_verify_maps_and_builds_recurrent_chain_in_one_jit(self):
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _build_chain_verify_arrays,
+            _map_eagle3_token_ids,
+        )
+
+        @jax.jit
+        def prepare_chain(verified_id, raw_chain, seq_lens, hot_token_ids):
+            mapped_chain = _map_eagle3_token_ids(raw_chain, hot_token_ids)
+            return _build_chain_verify_arrays(
+                verified_id=verified_id,
+                token_list=mapped_chain,
+                seq_lens=seq_lens,
+                num_verify_tokens=4,
+                batch_size=2,
+            )
+
+        packed = prepare_chain(
+            jnp.array([7, 8], dtype=jnp.int32),
+            jnp.array([[1, 2, 3], [4, 5, 6]], dtype=jnp.int32),
+            jnp.array([10, 20], dtype=jnp.int32),
+            jnp.arange(100, 200, dtype=jnp.int32),
+        )
+
+        np.testing.assert_array_equal(
+            np.asarray(packed[0]),
+            np.array([7, 101, 102, 103, 8, 104, 105, 106], dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(packed[1]),
+            np.array([10, 11, 12, 13, 20, 21, 22, 23], dtype=np.int32),
+        )
+
+    def test_fused_chain_builder_aligns_replicated_bootstrap_to_data(self):
+        from jax.sharding import Mesh, NamedSharding
+        from jax.sharding import PartitionSpec as P
+
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _build_chain_verify_arrays,
+        )
+
+        mesh = Mesh(
+            np.asarray(jax.devices()),
+            ("data",),
+            axis_types=(jax.sharding.AxisType.Explicit,),
+        )
+        verified_id = jax.device_put(
+            jnp.array([7, 8], dtype=jnp.int32),
+            NamedSharding(mesh, P("data")),
+        )
+        token_list = jax.device_put(
+            jnp.array([[11, 12, 13], [21, 22, 23]], dtype=jnp.int32),
+            NamedSharding(mesh, P(None, None)),
+        )
+        seq_lens = jax.device_put(
+            jnp.array([10, 20], dtype=jnp.int32),
+            NamedSharding(mesh, P("data")),
+        )
+
+        build = jax.jit(
+            lambda verified, tokens, lengths: _build_chain_verify_arrays(
+                verified_id=verified,
+                token_list=tokens,
+                seq_lens=lengths,
+                num_verify_tokens=4,
+                batch_size=2,
+            )
+        )
+        draft_tokens, *_ = build(verified_id, token_list, seq_lens)
+
+        np.testing.assert_array_equal(
+            np.asarray(draft_tokens),
+            np.array([7, 11, 12, 13, 8, 21, 22, 23], dtype=np.int32),
+        )
+
+    def test_spec_relay_gather_restores_flat_data_sharding(self):
+        from jax.sharding import Mesh, NamedSharding
+        from jax.sharding import PartitionSpec as P
+
+        from sgl_jax.srt.speculative.relay_buffer import (
+            SpecRelayBuffers,
+            gather_spec_relay_buffers,
+        )
+
+        mesh = Mesh(
+            np.asarray(jax.devices()),
+            ("data",),
+            axis_types=(jax.sharding.AxisType.Explicit,),
+        )
+        state_sharding = NamedSharding(mesh, P("data", None, None))
+        id_sharding = NamedSharding(mesh, P("data", None))
+        buffers = SpecRelayBuffers(
+            topk_index=jax.device_put(
+                jnp.arange(12, dtype=jnp.int32).reshape(1, 4, 3),
+                state_sharding,
+            ),
+            hidden_states=jax.device_put(
+                jnp.arange(8, dtype=jnp.float32).reshape(1, 4, 2),
+                state_sharding,
+            ),
+            verified_id=jax.device_put(
+                jnp.array([[10, 11, 12, 13]], dtype=jnp.int32),
+                id_sharding,
+            ),
+            new_seq_lens=jax.device_put(
+                jnp.array([[20, 21, 22, 23]], dtype=jnp.int32),
+                id_sharding,
+            ),
+        )
+        future_indices = jax.device_put(
+            jnp.array([1, 3], dtype=jnp.int32),
+            NamedSharding(mesh, P("data")),
+        )
+
+        with jax.set_mesh(mesh):
+            topk_index, hidden_states, verified_id, new_seq_lens = gather_spec_relay_buffers(
+                buffers,
+                future_indices,
+                dp_size=1,
+            )
+
+        self.assertEqual(topk_index.sharding.spec, P("data", None))
+        self.assertEqual(hidden_states.sharding.spec, P("data", None))
+        self.assertEqual(verified_id.sharding.spec, P("data"))
+        self.assertEqual(new_seq_lens.sharding.spec, P("data"))
+        np.testing.assert_array_equal(np.asarray(verified_id), np.array([11, 13]))
+        np.testing.assert_array_equal(np.asarray(new_seq_lens), np.array([21, 23]))
+
+    def test_fused_verify_reuses_device_placeholders(self):
+        from types import SimpleNamespace
+
+        from jax.sharding import Mesh
+
+        from sgl_jax.srt.speculative.draft_extend_fused import _prepare_verify
+        from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
+
+        mesh = Mesh(np.asarray(jax.devices()), ("data",))
+        worker = SimpleNamespace(
+            mesh=mesh,
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+        )
+
+        def make_draft_input():
+            return EagleDraftInput(
+                verified_id=np.array([7, 8], dtype=np.int32),
+                topk_index=np.array([[1, 2, 3], [4, 5, 6]], dtype=np.int32),
+            )
+
+        batch = SimpleNamespace(
+            seq_lens=np.array([10, 20], dtype=np.int32),
+            spec_info_padded=make_draft_input(),
+        )
+        _prepare_verify(worker, batch, draft_padding_prepared=True)
+        first = batch.spec_info_padded
+
+        batch.spec_info_padded = make_draft_input()
+        _prepare_verify(worker, batch, draft_padding_prepared=True)
+
+        self.assertIs(batch.spec_info_padded, first)
+
+    def test_fused_verify_relay_skips_eager_hot_token_mapping(self):
+        from types import SimpleNamespace
+
+        from jax.sharding import Mesh
+
+        from sgl_jax.srt.speculative.draft_extend_fused import _prepare_verify
+        from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
+
+        calls = []
+        worker = SimpleNamespace(
+            mesh=Mesh(np.asarray(jax.devices()), ("data",)),
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            model_config=SimpleNamespace(hidden_size=8),
+            padding_for_decode=lambda _batch, *, map_hot_token_ids: calls.append(map_hot_token_ids),
+        )
+        batch = SimpleNamespace(
+            seq_lens=np.array([10, 20], dtype=np.int32),
+            spec_info_padded=EagleDraftInput(future_indices=np.array([3, 5], dtype=np.int32)),
+        )
+
+        _prepare_verify(worker, batch)
+
+        self.assertEqual(calls, [False])
+
+    def test_target_verify_logits_metadata_has_no_unused_device_inputs(self):
+        from types import SimpleNamespace
+
+        from sgl_jax.srt.model_executor.forward_batch_info import (
+            CaptureHiddenMode,
+            ForwardMode,
+        )
+        from sgl_jax.srt.speculative.draft_extend_fused import _prepare_logits_metadata
+
+        metadata = _prepare_logits_metadata(
+            SimpleNamespace(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            ),
+            mesh=None,
+        )
+
+        self.assertIsNone(metadata.extend_seq_lens)
+        self.assertIsNone(metadata.logits_indices)
+        self.assertIsNone(metadata.accept_lens)
+
+    def test_eagle_base_metadata_uploads_only_page_ids(self):
+        from types import SimpleNamespace
+
+        from jax.sharding import Mesh
+
+        from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
+        from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+
+        backend = SimpleNamespace(
+            page_size=2,
+            mesh=Mesh(np.asarray(jax.devices()), ("data",)),
+            swa_index_mapping=None,
+        )
+        batch = SimpleNamespace(
+            cache_loc=np.array([0, 0, 4, 0, 8, 0, 12, 0], dtype=np.int32),
+            dp_size=1,
+            per_dp_bs_size=2,
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            spec_info_padded=SimpleNamespace(custom_mask=None),
+        )
+
+        metadata = FlashAttention.get_eagle_base_metadata(backend, batch)
+
+        np.testing.assert_array_equal(
+            np.asarray(metadata.page_indices)[:4],
+            np.array([0, 2, 4, 6], dtype=np.int32),
+        )
+        self.assertIsNone(metadata.cu_q_lens)
+        self.assertIsNone(metadata.cu_kv_lens)
+        self.assertIsNone(metadata.seq_lens)
+        self.assertIsNone(metadata.distribution)
+
+    def test_no_overlap_reuses_cache_loc_buffer_without_clearing(self):
+        from types import SimpleNamespace
+
+        from sgl_jax.srt.speculative.eagle_draft_worker import EagleDraftWorker
+
+        worker = object.__new__(EagleDraftWorker)
+        worker.server_args = SimpleNamespace(disable_overlap_schedule=True)
+        first = worker._get_decode_cache_loc_buffer(16)
+        first[3] = 99
+
+        second = worker._get_decode_cache_loc_buffer(16)
+
+        self.assertIs(second, first)
+        self.assertEqual(second[3], 99)
+
+    def test_no_overlap_only_copies_padding_inputs_to_host(self):
+        from types import SimpleNamespace
+
+        from sgl_jax.srt.speculative.eagle_draft_worker import EagleDraftWorker
+
+        worker = object.__new__(EagleDraftWorker)
+        worker.server_args = SimpleNamespace(disable_overlap_schedule=True)
+        untouched = jnp.arange(4, dtype=jnp.int32)
+        batch = SimpleNamespace(
+            input_ids=untouched,
+            seq_lens=jnp.array([8], dtype=jnp.int32),
+            out_cache_loc=untouched,
+            positions=untouched,
+            req_pool_indices=jnp.array([3], dtype=jnp.int32),
+            cache_loc=untouched,
+            extend_prefix_lens=untouched,
+            extend_seq_lens=untouched,
+        )
+
+        worker.copy_model_worker_batch_to_cpu(batch)
+
+        self.assertIsInstance(batch.seq_lens, np.ndarray)
+        self.assertIsInstance(batch.req_pool_indices, np.ndarray)
+        self.assertIs(batch.input_ids, untouched)
+        self.assertIs(batch.cache_loc, untouched)
+        self.assertIs(batch.extend_seq_lens, untouched)
+
+    def test_eagle3_decode_metadata_uses_one_query_per_slot(self):
+        from sgl_jax.srt.layers.attention.flashattention_backend import (
+            FlashAttentionMetadata,
+        )
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _make_eagle3_decode_metadata,
+        )
+
+        old_metadata = FlashAttentionMetadata(
+            cu_q_lens=jnp.array([0, 1, 2], dtype=jnp.int32),
+            cu_kv_lens=jnp.array([0, 8, 16], dtype=jnp.int32),
+            page_indices=jnp.arange(16, dtype=jnp.int32),
+            swa_page_indices=None,
+            seq_lens=jnp.array([4, 0], dtype=jnp.int32),
+            distribution=jnp.array([0, 0, 1], dtype=jnp.int32),
+            custom_mask=None,
+        )
+
+        metadata = _make_eagle3_decode_metadata(
+            old_metadata,
+            seq_lens=jnp.array([5, 0], dtype=jnp.int32),
+            allocated_lens=jnp.array([8, 8], dtype=jnp.int32),
+            page_size=1,
+            dp_size=1,
+        )
+
+        np.testing.assert_array_equal(np.asarray(metadata.cu_q_lens), np.array([0, 1, 2]))
+        np.testing.assert_array_equal(np.asarray(metadata.cu_kv_lens), np.array([0, 5, 5]))
+        np.testing.assert_array_equal(np.asarray(metadata.distribution), np.array([0, 0, 1]))
+        np.testing.assert_array_equal(np.asarray(metadata.seq_lens), np.array([5, 0]))
+
+    def test_target_verify_metadata_accepts_page_only_base_metadata(self):
+        from sgl_jax.srt.layers.attention.flashattention_backend import (
+            FlashAttentionMetadata,
+        )
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _make_target_verify_metadata,
+        )
+
+        metadata = _make_target_verify_metadata(
+            FlashAttentionMetadata(
+                page_indices=jnp.arange(16, dtype=jnp.int32),
+                swa_page_indices=None,
+                seq_lens=None,
+                custom_mask=None,
+            ),
+            verify_seq_lens=jnp.array([4, 0], dtype=jnp.int32),
+            allocated_lens=jnp.array([8, 8], dtype=jnp.int32),
+            speculative_num_draft_tokens=4,
+            page_size=1,
+            dp_size=1,
+        )
+
+        np.testing.assert_array_equal(np.asarray(metadata.cu_q_lens), np.array([0, 4, 4]))
+        np.testing.assert_array_equal(np.asarray(metadata.cu_kv_lens), np.array([0, 8, 8]))
+        np.testing.assert_array_equal(np.asarray(metadata.seq_lens), np.array([8, 0]))
+        np.testing.assert_array_equal(np.asarray(metadata.distribution), np.array([0, 1, 1]))
+
+    def test_eagle3_recurrent_token_keeps_raw_id_for_cross_round_state(self):
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _eagle3_raw_and_mapped_token_from_logits,
+        )
+
+        logits = jnp.array(
+            [
+                [0.0, 1.0, 5.0, 2.0],
+                [4.0, 1.0, 0.0, 2.0],
+            ],
+            dtype=jnp.float32,
+        )
+        hot_token_ids = jnp.array([100, 101, 102, 103], dtype=jnp.int32)
+
+        raw, mapped = _eagle3_raw_and_mapped_token_from_logits(logits, hot_token_ids)
+
+        np.testing.assert_array_equal(np.asarray(raw), np.array([2, 0], dtype=np.int32))
+        np.testing.assert_array_equal(np.asarray(mapped), np.array([102, 100], dtype=np.int32))
 
     def test_greedy_prepare_uses_original_seq_lens_for_new_seq_lens(self):
         from sgl_jax.srt.speculative.draft_extend_fused import _prepare_draft_inputs

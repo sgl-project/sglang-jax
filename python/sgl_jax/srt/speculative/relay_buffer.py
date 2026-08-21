@@ -170,21 +170,34 @@ def gather_spec_relay_buffers(
     per_dp_bs = future_indices.shape[0] // dp_size
     indices = future_indices.reshape((dp_size, per_dp_bs))
     dp_indices = jnp.arange(dp_size, dtype=jnp.int32)[:, None]
-
-    return (
+    topk_index = (
         buffers.topk_index.at[dp_indices, indices]
         .get(out_sharding=RELAY_STATE_SPEC)
-        .reshape(future_indices.shape + buffers.topk_index.shape[2:]),
+        .reshape(future_indices.shape + buffers.topk_index.shape[2:])
+    )
+    hidden_states = (
         buffers.hidden_states.at[dp_indices, indices]
         .get(out_sharding=RELAY_STATE_SPEC)
-        .reshape(future_indices.shape + buffers.hidden_states.shape[2:]),
+        .reshape(future_indices.shape + buffers.hidden_states.shape[2:])
+    )
+    verified_id = (
         buffers.verified_id.at[dp_indices, indices]
         .get(out_sharding=RELAY_ID_SPEC)
-        .reshape(future_indices.shape),
+        .reshape(future_indices.shape)
+    )
+    new_seq_lens = (
         buffers.new_seq_lens.at[dp_indices, indices]
         .get(out_sharding=RELAY_ID_SPEC)
-        .reshape(future_indices.shape),
+        .reshape(future_indices.shape)
     )
+    flat_sharding = jax.typeof(future_indices).sharding
+    if isinstance(flat_sharding, NamedSharding) and not flat_sharding.mesh.empty:
+        state_sharding = NamedSharding(flat_sharding.mesh, P("data", None))
+        topk_index = jax.sharding.reshard(topk_index, state_sharding)
+        hidden_states = jax.sharding.reshard(hidden_states, state_sharding)
+        verified_id = jax.sharding.reshard(verified_id, flat_sharding)
+        new_seq_lens = jax.sharding.reshard(new_seq_lens, flat_sharding)
+    return topk_index, hidden_states, verified_id, new_seq_lens
 
 
 def gather_dflash_relay_buffers(

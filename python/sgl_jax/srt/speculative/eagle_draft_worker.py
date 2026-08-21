@@ -1,5 +1,4 @@
 import functools
-import logging
 
 import jax
 import jax.numpy as jnp
@@ -17,9 +16,8 @@ from sgl_jax.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sgl_jax.srt.speculative.base_worker import BaseDraftWorker, replicate_to_mesh
+from sgl_jax.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sgl_jax.srt.speculative.eagle_util import (
-    EagleDraftInput,
-    EagleVerifyInput,
     build_chain_verify_inputs,
     build_chain_verify_inputs_device,
     build_tree_kernel_efficient,
@@ -27,11 +25,7 @@ from sgl_jax.srt.speculative.eagle_util import (
 )
 from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
-from sgl_jax.srt.utils.common_utils import get_bool_env_var
 from sgl_jax.srt.utils.jax_utils import device_array
-
-logger = logging.getLogger(__name__)
-RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
 
 
 class EagleDraftWorker(BaseDraftWorker):
@@ -100,14 +94,6 @@ class EagleDraftWorker(BaseDraftWorker):
                     sharding=(NamedSharding(self._worker.mesh, P())),
                 )
         else:
-            if self.hot_token_ids is not None:
-                head = head.clone()
-                self.hot_token_ids = device_array(
-                    self.draft_model_runner.model.hot_token_ids,
-                    sharding=(NamedSharding(self._worker.mesh, P())),
-                )
-                head.data = head.data[self.hot_token_ids]
-
             self.draft_model_runner.model.set_embed_and_head(embed, head)
 
     @property
@@ -207,14 +193,21 @@ class EagleDraftWorker(BaseDraftWorker):
             retrive_index=retrive_index,
             retrive_next_token=retrive_next_token,
             retrive_next_sibling=retrive_next_sibling,
-            retrive_cum_len=None,
             spec_steps=self.speculative_num_steps,
-            topk=self.topk,
             draft_token_num=self.speculative_num_draft_tokens,
-            capture_hidden_mode=CaptureHiddenMode.LAST,
-            seq_lens_sum=model_worker_batch.seq_lens_sum,
-            seq_lens_cpu=model_worker_batch.seq_lens,
         )
+
+    def prepare_for_fused_verify(self, model_worker_batch: ModelWorkerBatch):
+        """Prepare only the token chain; fused verify builds tree inputs in-JIT."""
+        topk_index = model_worker_batch.spec_info_padded.topk_index
+        has_raw_recurrent_chain = self._has_precomputed_recurrent_chain(topk_index)
+        self.padding_for_decode(
+            model_worker_batch,
+            map_hot_token_ids=not has_raw_recurrent_chain,
+        )
+        _, token_list, _ = self.draft_forward(model_worker_batch)
+        model_worker_batch.spec_info_padded.topk_index = token_list
+        return self.hot_token_ids if has_raw_recurrent_chain else None
 
     def draft_extend_for_prefill(
         self,
@@ -345,18 +338,20 @@ class EagleDraftWorker(BaseDraftWorker):
         draft_input.topk_index = topk_index
         draft_input.hidden_states = hidden
 
-    def padding_for_decode(self, model_worker_batch: ModelWorkerBatch):
+    def padding_for_decode(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        *,
+        map_hot_token_ids: bool = True,
+    ):
         # At dp>1 the incoming mwb is already DP-padded to total_bs (== a bucket
         # value, see _get_spec_decode_mwb_dp); use the larger of real_bs and the
         # incoming seq_lens length so we don't shrink below the DP layout.
-        _, padding_bs_index = self.get_padding_bs(
+        padding_bs_index = self._get_padding_bs_index(
             max(model_worker_batch.real_bs, len(model_worker_batch.seq_lens))
         )
         self.copy_model_worker_batch_to_cpu(model_worker_batch)
-        model_worker_batch.spec_info_padded.prepare_for_draft_decode(
-            model_worker_batch, self.topk, self.speculative_num_steps
-        )
-        model_worker_batch.seq_lens = model_worker_batch.seq_lens
+        model_worker_batch.spec_info_padded.prepare_for_draft_decode(model_worker_batch, self.topk)
         seq_lens_cpu = model_worker_batch.seq_lens
         page_size = self.page_size
         req_to_token_pool, _ = self.target_worker_ref.get_memory_pool()
@@ -385,7 +380,7 @@ class EagleDraftWorker(BaseDraftWorker):
         per_dp_bs = model_worker_batch.per_dp_bs_size if dp_size > 1 else len(seq_lens_cpu)
         assert total_cache_loc_size % dp_size == 0
         per_dp_cache_len = total_cache_loc_size // dp_size
-        cache_loc_cpu = np.zeros(total_cache_loc_size, dtype=np.int32)
+        cache_loc_cpu = self._get_decode_cache_loc_buffer(total_cache_loc_size)
         valid_mask = seq_lens_cpu > 0
         if np.any(valid_mask):
             valid_indices = np.where(valid_mask)[0]
@@ -399,7 +394,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 base = r * per_dp_cache_len + intra_rank_off[r]
                 assert (
                     base + aligned_len <= (r + 1) * per_dp_cache_len
-                ), f"rank {r} cache_loc overflow: {intra_rank_off[r]+aligned_len} > {per_dp_cache_len}"
+                ), f"rank {r} cache_loc overflow: {intra_rank_off[r] + aligned_len} > {per_dp_cache_len}"
                 if legacy_non_overlap:
                     cache_loc_cpu[base : base + allocate_len] = token_indices_with_all_reqs[
                         seq_idx, :allocate_len
@@ -415,7 +410,7 @@ class EagleDraftWorker(BaseDraftWorker):
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
 
         topk_index = spec_info.topk_index
-        if self.hot_token_ids is not None:
+        if map_hot_token_ids and self.hot_token_ids is not None:
             model_worker_batch.spec_info_padded.topk_index = self._map_hot_token_ids(topk_index)
         if self.topk > 1:
             self.draft_model_runner.attn_backend.forward_metadata.custom_mask = (
@@ -471,6 +466,12 @@ class EagleDraftWorker(BaseDraftWorker):
             model_worker_batch.spec_info_padded.topk_index,
             model_worker_batch.spec_info_padded.hidden_states,
         )
+        if self._has_precomputed_recurrent_chain(topk_index):
+            # The fused recurrent draft-extend already ran every EAGLE3 step in
+            # the previous round. Keep the raw draft-vocabulary ids unchanged;
+            # fused verify maps and packs the chain inside its own JIT.
+            return None, topk_index, None
+
         bs = model_worker_batch.seq_lens.shape[0]
         step_min_1 = self.speculative_num_steps - 1
         score_list: jax.Array = jnp.empty((bs, 1 + step_min_1 * self.topk, self.topk))
@@ -483,7 +484,6 @@ class EagleDraftWorker(BaseDraftWorker):
             np.repeat(model_worker_batch.seq_lens, self.topk),
             sharding=(NamedSharding(self.mesh, P())),
         )
-        logits_metadata = None
         metadata_per_step = self.draft_model_runner.attn_backend.get_eagle_multi_step_metadata(
             model_worker_batch,
         )
@@ -497,7 +497,6 @@ class EagleDraftWorker(BaseDraftWorker):
         forward_batch.spec_info = EagleDraftInput()
         forward_batch.spec_info.hidden_states = jnp.empty((bs * self.topk, hidden_states.shape[1]))
         for i in range(self.speculative_num_steps):
-
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
@@ -526,6 +525,15 @@ class EagleDraftWorker(BaseDraftWorker):
 
         return score_list, token_list, parents_list
 
+    def _has_precomputed_recurrent_chain(self, topk_index) -> bool:
+        return (
+            self.speculative_algorithm.is_eagle3()
+            and self.topk == 1
+            and topk_index is not None
+            and len(topk_index.shape) == 2
+            and topk_index.shape[1] == self.speculative_num_steps
+        )
+
     def _map_hot_token_ids(self, topk_index):
         out_sharding = jax.typeof(topk_index).sharding
         return self.hot_token_ids.at[topk_index].get(out_sharding=out_sharding)
@@ -536,17 +544,36 @@ class EagleDraftWorker(BaseDraftWorker):
         max_seq_len = max(int(max_seq_len), 1)
         return 1 << (max_seq_len - 1).bit_length()
 
+    def _get_decode_cache_loc_buffer(self, total_cache_loc_size: int):
+        if not self.server_args.disable_overlap_schedule:
+            return np.zeros(total_cache_loc_size, dtype=np.int32)
+        cache_loc_buffers = getattr(self, "_decode_cache_loc_buffers", None)
+        if cache_loc_buffers is None:
+            cache_loc_buffers = self._decode_cache_loc_buffers = {}
+        cache_loc_cpu = cache_loc_buffers.get(total_cache_loc_size)
+        if cache_loc_cpu is None:
+            cache_loc_cpu = np.zeros(total_cache_loc_size, dtype=np.int32)
+            cache_loc_buffers[total_cache_loc_size] = cache_loc_cpu
+        return cache_loc_cpu
+
     def copy_model_worker_batch_to_cpu(self, model_worker_batch: ModelWorkerBatch):
         mwb = model_worker_batch
-        fields = [
-            "input_ids",
-            "seq_lens",
-            "out_cache_loc",
-            "positions",
-            "req_pool_indices",
-            "cache_loc",
-        ]
-        optional = ["extend_prefix_lens", "extend_seq_lens"]
+        if self.server_args.disable_overlap_schedule:
+            # padding_for_decode only consumes these two host arrays. The other
+            # fields are replaced before the next forward, so copying them here
+            # duplicates device-to-host traffic in the no-overlap path.
+            fields = ["seq_lens", "req_pool_indices"]
+            optional = []
+        else:
+            fields = [
+                "input_ids",
+                "seq_lens",
+                "out_cache_loc",
+                "positions",
+                "req_pool_indices",
+                "cache_loc",
+            ]
+            optional = ["extend_prefix_lens", "extend_seq_lens"]
 
         for name in fields:
             arr = getattr(mwb, name)
@@ -565,18 +592,16 @@ class EagleDraftWorker(BaseDraftWorker):
             if arr is not None:
                 setattr(mwb, name, np.asarray(arr))
 
-    def get_padding_bs(self, real_bs: int) -> int:
+    def _get_padding_bs_index(self, real_bs: int) -> int:
         self.precompile_bs_paddings.sort()
         select_bs_index = -1
-        bs_padding_size = 0
         for i, size in enumerate(self.precompile_bs_paddings):
             if size >= real_bs:
-                bs_padding_size = size - real_bs
                 select_bs_index = i
                 break
         if select_bs_index < 0:
             raise RuntimeError("did not get comperate padding bs, it should not happened")
-        return bs_padding_size, select_bs_index
+        return select_bs_index
 
 
 # ---------------------------------------------------------------------------
@@ -585,36 +610,17 @@ class EagleDraftWorker(BaseDraftWorker):
 
 
 @functools.partial(jax.jit, static_argnames=["topk"])
-def topk_probs_from_logits(
-    logits: jax.Array, topk: int, axis: int = -1
-) -> tuple[jax.Array, jax.Array]:
+def topk_probs_from_logits(logits: jax.Array, topk: int) -> tuple[jax.Array, jax.Array]:
     """Return top-k probabilities without materializing the full softmax tensor."""
-    working_logits = jnp.moveaxis(logits, axis, -1) if axis != -1 else logits
     # TODO(#1053 Phase 2): replace this all-gather with a sharded top-k +
     # logsumexp over the vocab axis for DP/TP scalability.
-    sh = jax.typeof(working_logits).sharding
+    sh = jax.typeof(logits).sharding
     if isinstance(sh, NamedSharding):
-        working_logits = jax.sharding.reshard(working_logits, NamedSharding(sh.mesh, P()))
-    topk_logits, topk_index = jax.lax.top_k(working_logits, topk)
-    logsumexp = jax.nn.logsumexp(working_logits, axis=-1, keepdims=True)
+        logits = jax.sharding.reshard(logits, NamedSharding(sh.mesh, P()))
+    topk_logits, topk_index = jax.lax.top_k(logits, topk)
+    logsumexp = jax.nn.logsumexp(logits, axis=-1, keepdims=True)
     topk_probs = jnp.exp(topk_logits - logsumexp)
-
-    if axis != -1:
-        topk_probs = jnp.moveaxis(topk_probs, -1, axis)
-        topk_index = jnp.moveaxis(topk_index, -1, axis)
-
     return topk_probs, topk_index
-
-
-def fast_topk(values, topk, axis=-1):
-    working_values = jnp.moveaxis(values, axis, -1) if axis != -1 else values
-    result_vals, result_indices = jax.lax.top_k(working_values, topk)
-
-    if axis != -1:
-        result_vals = jnp.moveaxis(result_vals, -1, axis)
-        result_indices = jnp.moveaxis(result_indices, -1, axis)
-
-    return result_vals, result_indices
 
 
 @functools.partial(jax.jit, static_argnames=["i", "topk"])
@@ -679,7 +685,7 @@ def select_top_k_tokens(
     topk: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     if i == 0:
-        return select_top_k_tokens_step_0(topk_p, topk_index, hidden_states, scores, topk)
+        return select_top_k_tokens_step_0(topk_p, topk_index, hidden_states, topk)
     else:
         return select_top_k_tokens_step_greater_0(
             jnp.asarray(i), topk_p, topk_index, hidden_states, scores, topk
@@ -691,7 +697,6 @@ def select_top_k_tokens_step_0(
     topk_p: jax.Array,
     topk_index: jax.Array,
     hidden_states: jax.Array,
-    scores: jax.Array,
     topk: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     input_ids = topk_index.flatten()
@@ -722,8 +727,8 @@ def select_top_k_tokens_step_greater_0(
     # V2 Flash), so promote before lax.mul which requires matching dtypes.
     scores = scores.astype(topk_p.dtype)
     expand_scores = jax.lax.mul(jnp.expand_dims(scores, axis=2), topk_p.reshape(-1, topk, topk))
-    topk_cs_p, topk_cs_index = fast_topk(
-        expand_scores.reshape(expand_scores.shape[0], -1), topk, axis=-1
+    topk_cs_p, topk_cs_index = jax.lax.top_k(
+        expand_scores.reshape(expand_scores.shape[0], -1), topk
     )
     scores = topk_cs_p
     topk_index = topk_index.reshape(-1, topk**2)

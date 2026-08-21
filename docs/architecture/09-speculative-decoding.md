@@ -12,7 +12,8 @@ Core files involved:
 - `speculative/eagle_worker.py` — `EAGLEWorker(BaseSpecWorker)`, manages the full Draft-Verify loop (verify + invokes the draft worker)
 - `speculative/eagle_draft_worker.py` — `EagleDraftWorker(BaseDraftWorker)`, encapsulates multi-step generation of the draft model
 - `speculative/spec_info.py` — `SpeculativeAlgorithm` enum, `SpecInput` Protocol, NaN detection utilities
-- `speculative/eagle_util.py` — `EagleDraftInput`, `EagleVerifyInput`, `EagleVerifyOutput` data structures, tree construction, sampling, verification logic
+- `speculative/eagle_info.py` — `EagleDraftInput`, `EagleVerifyInput`, batch-state transitions, sampling, verification logic
+- `speculative/eagle_util.py` — tree construction and shared KV mapping helpers
 - `kernels/speculative/` — Tree construction / sampling / verification Pallas kernels
 - `models/llama_eagle3.py` — EAGLE3 draft model implementation
 - `models/mimo_mtp.py` — MiMo V1 MTP draft model
@@ -80,7 +81,7 @@ Core files involved:
 
 ## 9.3 Data Structures
 
-The following three data structures are referenced frequently in later sections, so they are defined here for ease of reading. All spec input data structures implement the `SpecInput` Protocol (see §9.4).
+The following two data structures are referenced frequently in later sections, so they are defined here for ease of reading.
 
 ### 9.3.1 EagleDraftInput
 
@@ -100,7 +101,7 @@ A `@register_pytree_node_class` dataclass — the input state of the Draft model
 | `allocate_lens` | `(bs,)` | Currently allocated KV cache length |
 | `new_seq_lens` | `(bs,)` | New sequence length after verify |
 
-**Pytree registration**: 12 array sub-nodes go into Children, `capture_hidden_mode` goes into `aux_data`. `allocate_lens` and `new_seq_lens` are not included in the pytree (not propagated through JAX transforms).
+**Pytree registration**: 10 array sub-nodes go into Children, `capture_hidden_mode` goes into `aux_data`. `allocate_lens` and `new_seq_lens` are not included in the pytree (not propagated through JAX transforms).
 
 **Key methods**:
 
@@ -111,7 +112,6 @@ A `@register_pytree_node_class` dataclass — the input state of the Draft model
 | `prepare_for_decode()` | Pre-allocate KV cache slots (`seq_lens + ALLOC_LEN_PER_DECODE - 1`) |
 | `filter_batch(new_indices)` | Filter batch by indices |
 | `merge_batch(spec_info)` | Merge along the batch dimension |
-| `create_idle_input()` | Create an idle draft input |
 
 ### 9.3.2 EagleVerifyInput
 
@@ -128,7 +128,7 @@ A `@register_pytree_node_class` dataclass — the input for Target model verific
 | `retrive_next_token` | `(bs, draft_token_num)` | First-child pointer |
 | `retrive_next_sibling` | `(bs, draft_token_num)` | Next-sibling pointer |
 
-**Pytree**: 9 array Children, 4 aux_data fields (`spec_steps`, `topk`, `draft_token_num`, `capture_hidden_mode`).
+**Pytree**: 6 array Children and 2 aux_data fields (`spec_steps`, `draft_token_num`).
 
 **Key methods**:
 
@@ -136,30 +136,6 @@ A `@register_pytree_node_class` dataclass — the input for Target model verific
 |------|------|
 | `prepare_for_verify()` | Set `TARGET_VERIFY` mode, inject draft tokens and tree mask |
 | `sample()` | Verification entrypoint. Dispatches Greedy (all temp=0) or Stochastic (any temp>0) |
-
-### 9.3.3 EagleVerifyOutput
-
-Plain `@dataclass` (not a pytree):
-
-| Field | Description |
-|------|------|
-| `draft_input` | `EagleDraftInput` for the next round |
-| `logits_output` | Target logits (only accepted entries) |
-| `verified_id` | Accepted token IDs (including bonus token) |
-| `accept_length_per_req_cpu` | Accept length per request (CPU) |
-| `accepted_indices` | Indices of accepted tokens within logits |
-
----
-
-## 9.4 SpecInput Data Contract
-
-`SpecInput` (`speculative/spec_info.py`) is a `runtime_checkable` Protocol that fixes the public interface for Draft / Verify inputs:
-
-- Three token counts are strictly distinguished: **logical** (the request's semantic token count), **allocated** (the number of KV slots already allocated), and **verify** (tokens consumed by the current verify step); allocation/reclaim logic must be based on allocated, while length checks are based on logical
-- Behavior methods: `is_draft_input()` / `is_verify_input()`, `get_spec_adjust_token_coefficient()`, `filter_batch()`, `merge_batch()`
-- The data contract docstring anchors the **host / device boundary** and **DP-padded layout (Route 1)** semantics; device-side fields are typed as `jax.Array | None`, while host-side fields keep Python list / `np.ndarray`
-
-Both `EagleDraftInput` and `EagleVerifyInput` implement this Protocol. `EagleVerifyInput` is single-round — its `filter_batch` / `merge_batch` raise directly. `SpecInput` exists so that subsequent draft algorithms (EAGLE / EAGLE3 / Standalone / MTP) can share the same Worker interface.
 
 ---
 
@@ -402,7 +378,7 @@ Verify:    TARGET_VERIFY (FULL capture)
 
 **Page-aware allocation** (`page_size > 1`):
 
-- `get_last_loc_large_page_size_large_top_k()` computes page-aligned lengths
+- `get_last_loc()` finds the last mapped cache location
 - `alloc_paged_token_slots_extend()` allocates page-granular cache slots
 - `assign_req_to_token_pool()` performs batched updates to the `req_to_token` mapping
 
@@ -458,10 +434,9 @@ for i, req in enumerate(batch.reqs):
 | `EAGLEWorker.draft()` | `speculative/eagle_worker.py` | Multi-step draft + tree construction |
 | `EAGLEWorker.verify()` | `speculative/eagle_worker.py` | Target verification + token acceptance |
 | `EAGLEWorker.draft_extend_after_verify()` | `speculative/eagle_worker.py` | Post-verify draft state update |
-| `EagleDraftInput` | `speculative/eagle_util.py` | Draft input (pytree-registered) |
-| `EagleVerifyInput` | `speculative/eagle_util.py` | Verify input (tree mask + LCRS pointers) |
-| `EagleVerifyInput.sample()` | `speculative/eagle_util.py` | Verification dispatch (Greedy / Stochastic) |
-| `EagleVerifyOutput` | `speculative/eagle_util.py` | Verify output (accepted tokens, cache positions, etc.) |
+| `EagleDraftInput` | `speculative/eagle_info.py` | Draft input (pytree-registered) |
+| `EagleVerifyInput` | `speculative/eagle_info.py` | Verify input (tree mask + LCRS pointers) |
+| `EagleVerifyInput.sample()` | `speculative/eagle_info.py` | Verification dispatch (Greedy / Stochastic) |
 | `build_tree_kernel_efficient()` | `speculative/eagle_util.py` | Two-stage tree construction |
 | `topk_probs_from_logits()` | `speculative/eagle_util.py` | Efficient Top-K probability extraction (JIT) |
 | `build_eagle_tree_structure()` | `kernels/speculative/` | Pallas tree-structure kernel |

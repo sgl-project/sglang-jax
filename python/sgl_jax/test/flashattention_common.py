@@ -17,7 +17,7 @@ from sgl_jax.srt.mem_cache.memory_pool import (
     merge_kv,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sgl_jax.srt.speculative.eagle_util import EagleVerifyInput
+from sgl_jax.srt.speculative.eagle_info import EagleVerifyInput
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.test.test_utils import CustomTestCase
 
@@ -288,13 +288,8 @@ def create_test_data(
             retrive_index=None,
             retrive_next_token=None,
             retrive_next_sibling=None,
-            retrive_cum_len=None,
-            seq_lens_cpu=None,
             spec_steps=None,
-            topk=None,
             draft_token_num=None,
-            seq_lens_sum=None,
-            capture_hidden_mode=None,
         )
     else:
         forward_mode = ForwardMode.EXTEND if mode == "prefill" else ForwardMode.DECODE
