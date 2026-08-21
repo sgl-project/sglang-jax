@@ -254,6 +254,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 "Enabling TPU log recorder for JIT compilation "
                 "(compiler_options: xla_tpu_enable_log_recorder=true)."
             )
+        backend_compiler_options = getattr(self.attn_backend, "compiler_options", None)
+        if backend_compiler_options:
+            jit_compiler_options = {
+                **backend_compiler_options,
+                **(jit_compiler_options or {}),
+            }
 
         @partial(
             jax.jit,
@@ -269,6 +275,11 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             memory_pools,
             logits_metadata,
         ):
+            prepare_model_state = getattr(
+                self.attn_backend, "prepare_model_state", None
+            )
+            if prepare_model_state is not None:
+                model_state_leaves = prepare_model_state(model_state_leaves)
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
             memory_pools = _maybe_apply_recurrent_cow(forward_batch, memory_pools)
@@ -301,6 +312,10 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         @partial(jax.jit, static_argnames=["mesh"])
         def jitted_compute_logprobs(mesh, logits, next_tokens):
             return compute_logprobs(mesh, logits, next_tokens)
+
+        @jax.jit
+        def jitted_greedy_sampler(logits_output):
+            return jnp.argmax(logits_output.next_token_logits, axis=-1).flatten()
 
         # Opt-in (SGLANG_JAX_AOT_DISPATCH=auto|1): weights enter jit as
         # ~thousands of flat args; AotDispatcher skips pjit's per-arg Python
@@ -473,6 +488,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             )
 
         self.jitted_run_and_sample = run_and_sample_wrapper
+        self.jitted_greedy_sampler = jitted_greedy_sampler
 
     def get_available_device_memory(self):
         distributed = jax.process_count() != 1
@@ -796,6 +812,17 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 mesh=self.mesh,
             )
 
+        elif backend == "tt":
+            from sgl_jax.srt.layers.attention.tt_backend import TTAttention
+
+            full_attn_backend = TTAttention(
+                self.num_attn_heads,
+                self.num_kv_heads,
+                self.model_config.head_dim,
+                page_size=self.page_size,
+                mesh=self.mesh,
+            )
+
         else:
             raise ValueError(f"Unsupported attention backend: {self.server_args.attention_backend}")
 
@@ -912,6 +939,8 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self,
         logits_output: LogitsProcessorOutput,
         sampling_metadata: SamplingMetadata,
+        *,
+        allow_fast_greedy: bool = True,
     ) -> jax.Array:
         """Sample and compute logprobs and update logits_output.
 
@@ -922,6 +951,15 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         Returns:
             A list of next_token_ids
         """
+        if (
+            allow_fast_greedy
+            and getattr(self.attn_backend, "use_fast_greedy_sampler", False)
+            and sampling_metadata.is_all_greedy
+            and not sampling_metadata.do_penalties
+            and not sampling_metadata.apply_vocab_mask
+        ):
+            return self.jitted_greedy_sampler(logits_output), None, None
+
         # Advance step counter (pure Python, zero device overhead).
         # fold_in(base_key, step) inside JIT produces a unique RNG per step.
         self._sampler_step += 1
