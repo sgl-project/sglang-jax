@@ -2,60 +2,79 @@ import unittest
 
 from benchmark.moe.fused_rs_tuning import (
     GLM52_RS_REFERENCE_CONFIG,
+    GLM52_RS_VMEM_LIMIT_BYTES,
     analyze_rs_config,
     generate_rs_tuning_configs,
 )
 
 
 class FusedRsTuningTest(unittest.TestCase):
-    def test_candidates_follow_author_weight_cache_contract(self):
+    def test_candidates_follow_full_k_pipeline_and_vmem_contract(self):
         configs = generate_rs_tuning_configs((128, 256, 384))
 
-        self.assertEqual(len(configs), 12)
+        self.assertEqual(len(configs), 8)
         self.assertEqual(len(set(configs)), len(configs))
         self.assertIn(GLM52_RS_REFERENCE_CONFIG, configs)
-        self.assertIn((384, 6144, 1024, 2048, 3072, 2, 2), configs)
+        self.assertIn((256, 6144, 1024, 2048, 1024, 2, 2), configs)
+        self.assertIn((256, 6144, 512, 2048, 6144, 2, 1), configs)
+        self.assertIn((256, 6144, 512, 2048, 2048, 2, 2), configs)
+        self.assertIn((384, 6144, 512, 2048, 1024, 2, 2), configs)
         self.assertNotIn((384, 6144, 1024, 2048, 3072, 1, 1), configs)
 
         for config in configs:
             contract = analyze_rs_config(config)
-            self.assertTrue(contract["buffer_contract_valid"])
-            self.assertGreaterEqual(contract["num_w1_bufs"], contract["w1_steps"])
-            self.assertGreaterEqual(contract["num_w2_bufs"], contract["w2_steps"])
+            self.assertTrue(contract["full_k"])
+            self.assertTrue(contract["pipeline_contract_valid"])
+            self.assertTrue(contract["vmem_contract_valid"])
+            self.assertTrue(contract["eligible_for_tuning"])
+            self.assertLessEqual(
+                contract["estimated_vmem_with_headroom_bytes"],
+                GLM52_RS_VMEM_LIMIT_BYTES,
+            )
 
     def test_contract_rejects_multi_step_single_buffer_config(self):
         contract = analyze_rs_config((384, 6144, 1024, 2048, 3072, 1, 1))
 
-        self.assertEqual(
-            contract,
-            {
-                "tile_m": 384,
-                "tile_k1": 6144,
-                "tile_n1": 1024,
-                "tile_k2": 2048,
-                "tile_n2": 3072,
-                "num_w1_bufs": 1,
-                "num_w2_bufs": 1,
-                "w1_steps": 2,
-                "w2_steps": 2,
-                "can_cache_w1": False,
-                "can_cache_w2": False,
-                "buffer_contract_valid": False,
-            },
-        )
+        self.assertFalse(contract["pipeline_contract_valid"])
+        self.assertFalse(contract["eligible_for_tuning"])
+        self.assertEqual(contract["w1_buffer_mode"], "invalid")
+        self.assertEqual(contract["w2_buffer_mode"], "invalid")
 
-    def test_candidates_include_independent_split_n_probes(self):
+    def test_candidates_cover_cache_tradeoffs_at_m256(self):
         configs = set(generate_rs_tuning_configs((256,)))
 
         self.assertEqual(
             configs,
             {
-                (256, 6144, 2048, 2048, 6144, 1, 1),
-                (256, 6144, 1024, 2048, 6144, 2, 1),
-                (256, 6144, 2048, 2048, 3072, 1, 2),
-                (256, 6144, 1024, 2048, 3072, 2, 2),
+                (256, 6144, 1024, 2048, 1024, 2, 2),
+                (256, 6144, 512, 2048, 6144, 2, 1),
+                (256, 6144, 512, 2048, 2048, 2, 2),
             },
         )
+
+        modes = {
+            (
+                analyze_rs_config(config)["can_cache_w1"],
+                analyze_rs_config(config)["can_cache_w2"],
+            )
+            for config in configs
+        }
+        self.assertEqual(modes, {(True, False), (False, True), (False, False)})
+
+    def test_full_resident_m256_is_pruned_by_declared_vmem(self):
+        contract = analyze_rs_config((256, 6144, 256, 2048, 256, 8, 24))
+
+        self.assertTrue(contract["pipeline_contract_valid"])
+        self.assertTrue(contract["can_cache_w1"])
+        self.assertTrue(contract["can_cache_w2"])
+        self.assertFalse(contract["vmem_contract_valid"])
+        self.assertFalse(contract["eligible_for_tuning"])
+
+    def test_rejects_k_splitting_even_when_shapes_divide(self):
+        contract = analyze_rs_config((128, 3072, 1024, 1024, 3072, 4, 4))
+
+        self.assertFalse(contract["full_k"])
+        self.assertFalse(contract["eligible_for_tuning"])
 
 
 if __name__ == "__main__":

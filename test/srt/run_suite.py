@@ -263,6 +263,7 @@ suites = {
         TestFile("python/sgl_jax/test/test_moe_topk.py", 0.3),
         TestFile("python/sgl_jax/test/kernels/fused_moe_v1_test.py", 9),
         TestFile("python/sgl_jax/test/kernels/fused_moe_v2_test.py", 3),
+        TestFile("python/sgl_jax/test/kernels/fused_moe_rs_test.py", 4),
         TestFile("python/sgl_jax/test/kernels/biased_topk_test.py", 1, runner="pytest"),
         TestFile("python/sgl_jax/test/kernels/grouped_topk_test.py", 1, runner="pytest"),
         TestFile("python/sgl_jax/test/test_sampler.py", 0.2),
