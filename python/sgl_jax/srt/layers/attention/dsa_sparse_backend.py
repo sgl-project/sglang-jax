@@ -184,11 +184,20 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         md = self.forward_metadata
 
         # ── dense short-circuit ────────────────────────────────────────────
-        # skip_offset layers, or layers with no indexer projections wired in,
-        # fall back to plain absorbed-MLA. The kv cache write still happens
-        # inside the dense kernel via input_output_aliases.
+        # Only a "full" layer with no indexer projections wired (q_idx is None)
+        # falls back to plain absorbed-MLA. Every full layer that HAS an indexer
+        # runs its own top-k + sparse attention, matching config.indexer_types
+        # (for GLM-5.2 layers 0..skip_offset-1 are declared "full" ⇒ sparse, not
+        # dense). We intentionally do NOT gate on `layer_id < self.skip_offset`
+        # here: index_skip_topk_offset selects which leading layers own their
+        # indexer vs share one (IndexShare), not which layers skip sparsity.
+        # Routing those full layers dense (a) diverged from the reference and
+        # (b) cascaded in sparse prefill — their shared followers then had no
+        # pages to reuse and fell to dense too (a 6-layer dense O(T²) block).
+        # The kv cache write still happens inside the dense kernel via
+        # input_output_aliases in the remaining (no-indexer) dense case.
         is_decode = forward_batch.forward_mode.is_decode()
-        if layer_id < self.skip_offset or (is_full and q_idx is None):
+        if is_full and q_idx is None:
             o, kv_cache = self._run_dense(
                 q, q_rope, new_kv_c, new_k_pe, kv_cache, sm_scale, layer, dpa, md
             )
