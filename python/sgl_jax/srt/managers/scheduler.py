@@ -852,6 +852,12 @@ class Scheduler(
                     req_counts[dp_rank] += 1
                     token_counts[dp_rank] += self._estimate_req_tokens(info.chunked_req)
 
+        for req in self.waiting_queue:
+            if req.dp_rank is None:
+                continue
+            req_counts[req.dp_rank] += 1
+            token_counts[req.dp_rank] += self._estimate_req_tokens(req)
+
         return req_counts, token_counts
 
     def _dp_load_and_eligible(
@@ -998,6 +1004,10 @@ class Scheduler(
                     add(req, dp_rank)
                 if info.chunked_req is not None and info.chunked_req.rid not in running_ids:
                     add(info.chunked_req, dp_rank)
+
+        for req in self.waiting_queue:
+            if req.dp_rank is not None:
+                add(req, req.dp_rank)
 
         return input_counts, output_counts
 
