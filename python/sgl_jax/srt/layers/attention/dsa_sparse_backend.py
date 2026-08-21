@@ -24,7 +24,7 @@ from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.kernels.dsa.ref import streamindex_page_topk_ref, streamindex_topk_ref
 from sgl_jax.srt.kernels.dsa.sparse_mla import compute_topk_pages, sparse_mla_page_level
-from sgl_jax.srt.kernels.dsa.sparse_mla_prefill import prefill_write_and_attend
+from sgl_jax.srt.kernels.dsa.sparse_mla_prefill import prefill_write_and_attend_ragged
 from sgl_jax.srt.kernels.dsa.streamindex_topk import streamindex_topk
 from sgl_jax.srt.kernels.mla.v2.kernel import mla_ragged_paged_attention
 from sgl_jax.srt.layers.attention.mla_backend import MLAAttentionBackend
@@ -57,8 +57,12 @@ _INDEXER_KERNEL_KV_PAGES_PER_BLOCK = 64
 # (``sparse_mla_prefill.sparse_mla_attention``) at page granularity instead of the
 # dense fallback. Default OFF ⇒ prefill behaviour is unchanged. Page-level
 # selection (read_block == page_size) consumes the indexer's page-topk directly.
-# Scope: single-sequence extend (the padded-bucket TTFT case); multi-seq ragged
-# extend still needs per-token page tables (follow-up) — leave the flag off there.
+# Scope: packed-ragged extend — supports the full serving surface via the same
+# ragged metadata the dense path uses: multi-request batching (max_running>1),
+# radix/prefix caching (a cache hit is an extend with a non-zero prefix), and
+# chunked prefill (each chunk is an extend over the growing prefix). All three
+# reduce to the same per-query-token kernel contract and are validated by the
+# A1/A2 parity gates in test/srt/kernels/dsa/test_sparse_mla_prefill_parity.py.
 _PREFILL_SPARSE = int(os.environ.get("DSA_PREFILL_SPARSE", "0"))
 
 
@@ -184,11 +188,20 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         md = self.forward_metadata
 
         # ── dense short-circuit ────────────────────────────────────────────
-        # skip_offset layers, or layers with no indexer projections wired in,
-        # fall back to plain absorbed-MLA. The kv cache write still happens
-        # inside the dense kernel via input_output_aliases.
+        # Only a "full" layer with no indexer projections wired (q_idx is None)
+        # falls back to plain absorbed-MLA. Every full layer that HAS an indexer
+        # runs its own top-k + sparse attention, matching config.indexer_types
+        # (for GLM-5.2 layers 0..skip_offset-1 are declared "full" ⇒ sparse, not
+        # dense). We intentionally do NOT gate on `layer_id < self.skip_offset`
+        # here: index_skip_topk_offset selects which leading layers own their
+        # indexer vs share one (IndexShare), not which layers skip sparsity.
+        # Routing those full layers dense (a) diverged from the reference and
+        # (b) cascaded in sparse prefill — their shared followers then had no
+        # pages to reuse and fell to dense too (a 6-layer dense O(T²) block).
+        # The kv cache write still happens inside the dense kernel via
+        # input_output_aliases in the remaining (no-indexer) dense case.
         is_decode = forward_batch.forward_mode.is_decode()
-        if layer_id < self.skip_offset or (is_full and q_idx is None):
+        if is_full and q_idx is None:
             o, kv_cache = self._run_dense(
                 q, q_rope, new_kv_c, new_k_pe, kv_cache, sm_scale, layer, dpa, md
             )
@@ -210,6 +223,10 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         # writes the idx cache so later decode steps get valid topk).
         # Opt-in (DSA_PREFILL_SPARSE): run the fused sparse-MLA *prefill* kernel
         # over the indexer's page-topk — this is the EXTEND-sparsity gap PR.
+        # MIXED (chunked-prefill continuous batching: extend chunks + decodes in one
+        # batch) is is_decode()==False, so it flows here too; the packed-ragged path
+        # treats each decode request as a 1-query extend (extend_seq_lens==1), which
+        # the per-query-token kernel handles uniformly.
         if not is_decode:
             if _PREFILL_SPARSE:
                 idx_cache, topk_pages = self._maybe_index_prefill_pages(
@@ -542,8 +559,13 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         self, ql, qpe, kvc, kpe, cache, topk_pages, sm_scale, dpa, md, forward_batch
     ):
         """Fused sparse-MLA prefill: self-write the current chunk's latent into the
-        paged fused cache, then attend only the page-topk pages. Single-sequence
-        extend scope (see ``_PREFILL_SPARSE``). Returns ``(o_latent, updated_cache)``.
+        paged fused cache, then attend only the page-topk pages.
+
+        Packed-ragged: threads the same ragged metadata the dense/indexer paths use
+        (``seq_lens``/``cu_q_lens``/``cu_kv_lens``/``page_indices``) so a batch of
+        multiple requests (``max_running>1``) prefills in one call. With a single
+        request this reduces to the previous single-shot behaviour. Returns
+        ``(o_latent, updated_cache)``.
         """
         loc = forward_batch.out_cache_loc.astype(jnp.int32)
         positions = forward_batch.positions.astype(jnp.int32)
@@ -560,11 +582,15 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             P(dpa, None),  # topk_pages [T, K]
             P(dpa),  # positions [T]
             P(dpa),  # loc [T]
+            P(dpa),  # seq_lens [S]
+            P(dpa),  # cu_q_lens [S+1]
+            P(dpa),  # cu_kv_lens [S+1]
+            P(dpa),  # page_indices [total_pages]
         )
         out_specs = (P(dpa, "tensor", None), P(dpa, None, None, None))
 
-        def _run(ql_, qpe_, kvc_, kpe_, cache_, tp_, pos_, loc_):
-            o, cache_new = prefill_write_and_attend(
+        def _run(ql_, qpe_, kvc_, kpe_, cache_, tp_, pos_, loc_, sl_, cuq_, cukv_, pi_):
+            o, cache_new = prefill_write_and_attend_ragged(
                 ql_,
                 qpe_,
                 kvc_,
@@ -573,6 +599,10 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 tp_,
                 pos_,
                 loc_,
+                sl_,
+                cuq_,
+                cukv_,
+                pi_,
                 kv_lora_rank=kv_lora_rank,
                 page_size=page_size,
                 sm_scale=sm,
@@ -580,7 +610,18 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             return o.astype(ql_.dtype), cache_new
 
         return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(
-            ql, qpe, kvc, kpe, cache, topk_pages, positions, loc
+            ql,
+            qpe,
+            kvc,
+            kpe,
+            cache,
+            topk_pages,
+            positions,
+            loc,
+            md.seq_lens,
+            md.cu_q_lens,
+            md.cu_kv_lens,
+            md.page_indices,
         )
 
     def _run_dense(self, ql, qpe, kvc, kpe, cache, sm_scale, layer, dpa, md):
