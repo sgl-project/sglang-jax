@@ -289,6 +289,7 @@ class ModelWorker:
                 has_recurrent_state and server_args.enable_recurrent_extra_buffer
             ),
             moe_backend=effective_moe_backend,
+            msa_ctx_page_buckets=getattr(self.model_runner, "msa_ctx_page_buckets", None),
         )
 
         # Allocate the persistent cache_loc host buffer once (reused every step
