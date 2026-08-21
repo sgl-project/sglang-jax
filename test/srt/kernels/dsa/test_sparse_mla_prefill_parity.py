@@ -40,6 +40,7 @@ sparse_mla_attention = smp.sparse_mla_attention
 units_to_token_ids = smp.units_to_token_ids
 flat_to_paged_cache = smp.flat_to_paged_cache
 prefill_write_and_attend = smp.prefill_write_and_attend
+prefill_write_and_attend_ragged = smp.prefill_write_and_attend_ragged
 
 
 def _reference(q, kv, indices, positions, *, read_block, kv_lora_rank, sm_scale):
@@ -310,6 +311,449 @@ def _run_write_attend_canary(seed=0):
     print(f"[write+attend canary] final-slot canary preserved; self-write max|err|={w_err:.3e}")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Packed-ragged (A3 batching) harness + invariant gates G0–G6.
+#
+# Models the static-shape serving batch: ``num_seqs`` requests packed along the
+# token axis, each request's query block padded to a uniform ``S_pad`` tokens and
+# its KV padded to a uniform ``pages_per_seq`` pages (so ``cu_kv_lens[i]//ps ==
+# i*pages_per_seq`` and ``page_indices`` has ``num_seqs*pages_per_seq`` slots —
+# exactly what ``streamindex_page_topk_ref`` / ``sparse_mla_ref`` / ``_scatter_paged``
+# assume). Physical pages are a *permutation* so the per-request ``base`` and the
+# self-write ``loc`` are genuinely exercised (identity would hide base bugs).
+# ─────────────────────────────────────────────────────────────────────────────
+
+_H = 8
+_KV_LORA = 512
+_ROPE = 64
+_DK_PAD = 640
+_PS = 128
+_SCALE = 1.0 / ((_KV_LORA + _ROPE) ** 0.5)
+
+
+def _seq_inputs(rng, L, K):
+    """Self-contained inputs for ONE request of length ``L`` (single-shot, prefix 0):
+    query, latent to write, and seq-local causal page-topk. Independent of packing
+    position — the atom for the cross-run identity gates (G1/G2/G3)."""
+    ql = np.asarray(rng.standard_normal((L, _H, _KV_LORA)) * 0.1, np.float32)
+    qpe = np.asarray(rng.standard_normal((L, _H, _ROPE)) * 0.1, np.float32)
+    kvc = np.asarray(rng.standard_normal((L, _KV_LORA)) * 0.1, np.float32)
+    kpe = np.asarray(rng.standard_normal((L, _ROPE)) * 0.1, np.float32)
+    tp = np.full((L, K), -1, np.int32)
+    for j in range(L):
+        hi = j // _PS + 1  # causally-reachable seq-local pages
+        n = min(K, hi)
+        ch = rng.choice(hi, size=n, replace=False)
+        if 0 not in ch:
+            ch[0] = 0
+        tp[j, :n] = ch
+    return dict(ql=ql, qpe=qpe, kvc=kvc, kpe=kpe, tp=tp, L=int(L))
+
+
+def _assemble(seqs, seed_pages=0, page_perm=True):
+    """Pack a list of per-request ``_seq_inputs`` into the static-shape batch:
+    uniform ``S_pad`` query block and ``pages_per_seq`` KV pages per request,
+    physical pages a (optional) permutation. Returns a case dict."""
+    num_seqs = len(seqs)
+    K = seqs[0]["tp"].shape[1]
+    pages_per_seq = int(np.ceil(max(s["L"] for s in seqs) / _PS))
+    S_pad = pages_per_seq * _PS
+    total = num_seqs * S_pad
+    num_pages = num_seqs * pages_per_seq
+
+    prng = np.random.default_rng(seed_pages)
+    perm = prng.permutation(num_pages) if page_perm else np.arange(num_pages)
+    phys = perm.reshape(num_seqs, pages_per_seq).astype(np.int32)
+
+    ql = np.zeros((total, _H, _KV_LORA), np.float32)
+    qpe = np.zeros((total, _H, _ROPE), np.float32)
+    kvc = np.zeros((total, _KV_LORA), np.float32)
+    kpe = np.zeros((total, _ROPE), np.float32)
+    positions = np.zeros(total, np.int32)
+    loc = np.full(total, -1, np.int32)
+    tp = np.full((total, K), -1, np.int32)
+    real = np.zeros(total, bool)
+    for i, s in enumerate(seqs):
+        L = s["L"]
+        base = i * S_pad
+        ql[base : base + L] = s["ql"]
+        qpe[base : base + L] = s["qpe"]
+        kvc[base : base + L] = s["kvc"]
+        kpe[base : base + L] = s["kpe"]
+        tp[base : base + L] = s["tp"]
+        for j in range(L):
+            t = base + j
+            real[t] = True
+            positions[t] = j
+            loc[t] = phys[i, j // _PS] * _PS + (j % _PS)
+
+    cache = np.zeros((num_pages, _PS, 1, _DK_PAD), np.float32)
+    seq_lens = np.asarray([s["L"] for s in seqs], np.int32)
+    cu_q_lens = np.arange(num_seqs + 1, dtype=np.int32) * S_pad
+    cu_kv_lens = np.arange(num_seqs + 1, dtype=np.int32) * (pages_per_seq * _PS)
+    page_indices = phys.reshape(-1)
+
+    # G6 metadata invariants (host-side, fail fast before the kernel).
+    assert cu_q_lens[-1] == total == len(loc)
+    assert page_indices.shape[0] == num_seqs * pages_per_seq
+    assert ((tp >= -1) & (tp < pages_per_seq)).all(), "topk page id out of [-1, pages_per_seq)"
+
+    return dict(
+        ql=jnp.asarray(ql),
+        qpe=jnp.asarray(qpe),
+        kvc=jnp.asarray(kvc),
+        kpe=jnp.asarray(kpe),
+        cache=jnp.asarray(cache),
+        topk_pages=jnp.asarray(tp),
+        positions=jnp.asarray(positions),
+        loc=jnp.asarray(loc),
+        seq_lens=jnp.asarray(seq_lens),
+        cu_q_lens=jnp.asarray(cu_q_lens),
+        cu_kv_lens=jnp.asarray(cu_kv_lens),
+        page_indices=jnp.asarray(page_indices),
+        seq_lens_list=[s["L"] for s in seqs],
+        S_pad=S_pad,
+        pages_per_seq=pages_per_seq,
+        real=real,
+        _kvc=kvc,
+        _kpe=kpe,
+        _ql=ql,
+        _qpe=qpe,
+        _tp=tp,
+    )
+
+
+def _make_ragged_batch(seq_lens_list, K, seed=0, page_perm=True):
+    rng = np.random.default_rng(seed)
+    seqs = [_seq_inputs(rng, L, K) for L in seq_lens_list]
+    return _assemble(seqs, seed_pages=seed, page_perm=page_perm)
+
+
+def _ragged_reference(c):
+    """Masked-softmax oracle: each request is an independent single-shot prefill
+    over its own written latent (seq-local page ids => seq-local token ids)."""
+    S_pad = c["S_pad"]
+    total = c["_ql"].shape[0]
+    out = np.zeros((total, _H, _KV_LORA), np.float32)
+    latent = np.concatenate([c["_kvc"], c["_kpe"]], axis=-1)  # [total, 576]
+    q_full = np.concatenate([c["_ql"], c["_qpe"]], axis=-1)  # [total, H, 576]
+    tok = np.asarray(units_to_token_ids(jnp.asarray(c["_tp"]), _PS)).reshape(
+        total, -1
+    )  # [total, K*ps]
+    for i, L in enumerate(c["seq_lens_list"]):
+        base = i * S_pad
+        for j in range(L):
+            t = base + j
+            ids = tok[t]  # seq-local token ids
+            valid = (ids >= 0) & (ids <= j) & (ids < L)
+            ids_safe = np.where(valid, base + ids, base)  # into global latent
+            k_sel = latent[ids_safe]
+            logits = (q_full[t] @ k_sel.T) * _SCALE
+            logits = np.where(valid[None, :], logits, -np.inf)
+            m = logits.max(-1, keepdims=True)
+            m = np.where(np.isneginf(m), 0.0, m)
+            p = np.exp(logits - m)
+            p = np.where(valid[None, :], p, 0.0)
+            denom = p.sum(-1, keepdims=True)
+            out[t] = (p / np.where(denom == 0.0, 1.0, denom)) @ k_sel[:, :_KV_LORA]
+    return out
+
+
+def _run_case(c):
+    o, cache_new = prefill_write_and_attend_ragged(
+        c["ql"],
+        c["qpe"],
+        c["kvc"],
+        c["kpe"],
+        c["cache"],
+        c["topk_pages"],
+        c["positions"],
+        c["loc"],
+        c["seq_lens"],
+        c["cu_q_lens"],
+        c["cu_kv_lens"],
+        c["page_indices"],
+        kv_lora_rank=_KV_LORA,
+        page_size=_PS,
+        sm_scale=_SCALE,
+        interpret=True,
+    )
+    return np.asarray(o), np.asarray(cache_new)
+
+
+def _run_ragged(seq_lens_list, K, seed=0, page_perm=True):
+    c = _make_ragged_batch(seq_lens_list, K, seed=seed, page_perm=page_perm)
+    o, cache_new = _run_case(c)
+    return o, cache_new, c
+
+
+def _seq_slice(c, i):
+    """Global token indices of request i's REAL tokens."""
+    base = i * c["S_pad"]
+    L = c["seq_lens_list"][i]
+    return np.arange(base, base + L)
+
+
+def test_ragged_parity_varlen():
+    """Ragged multi-request prefill vs masked-softmax oracle (varying seq_lens).
+
+    Lengths span the boundary corners as well as multi-page requests:
+    ``1`` = a decode step packed as a single-query extend (MIXED mode) — the
+    minimal per-request block, exercising the base-offset / causal-bound math;
+    ``128`` = exactly one full page (== page_size), no partial remainder; plus
+    partial (200, 129) and multi-page-exact (384, 512) requests.
+    """
+    o, _, c = _run_ragged([384, 200, 512, 129, 1, 128], K=4, seed=1)
+    ref = _ragged_reference(c)
+    real = c["real"]
+    err = np.abs(o[real] - ref[real])
+    print(f"[ragged varlen] max|err|={err.max():.3e}  seqs={c['seq_lens_list']}  shape={o.shape}")
+    assert err.max() < 2e-3, f"ragged parity failed: {err.max()}"
+
+
+def test_ragged_self_write_and_canary():
+    """G5: self-write landed for real tokens; padded (-1 loc) tokens touch nothing."""
+    o, cache_new, c = _run_ragged([300, 128, 400], K=4, seed=2)
+    flat = cache_new.reshape(-1, _DK_PAD)
+    loc = np.asarray(c["loc"])
+    kvc = c["_kvc"]
+    real = c["real"]
+    # every real token's latent landed at its physical slot
+    w_err = np.abs(flat[loc[real], :_KV_LORA] - kvc[real]).max()
+    assert w_err < 1e-6, f"ragged self-write failed: {w_err}"
+    # no physical slot outside the union of real locs was written (canary: all
+    # such slots must remain zero — the initial cache).
+    written = set(loc[real].tolist())
+    all_slots = set(range(flat.shape[0]))
+    untouched = np.array(sorted(all_slots - written), dtype=np.int64)
+    assert np.abs(flat[untouched]).max() < 1e-6, "padded/-1 write leaked into an unused slot"
+    print(f"[ragged self-write] max|err|={w_err:.3e}  untouched_slots={len(untouched)}")
+
+
+def test_gate_G0_single_seq_equivalence():
+    """G0: the ragged path with num_seqs==1 matches both the oracle and the
+    existing single-sequence prefill_write_and_attend on identical inputs."""
+    L, K = 512, 3
+    o_r, _, c = _run_ragged([L], K=K, seed=3, page_perm=False)  # identity pages
+    ref = _ragged_reference(c)
+    real = c["real"]
+    assert np.abs(o_r[real] - ref[real]).max() < 2e-3
+
+    # same inputs through the single-seq wrapper (contiguous loc, pages 0..P-1).
+    o_s, _ = prefill_write_and_attend(
+        c["ql"][:L],
+        c["qpe"][:L],
+        c["kvc"][:L],
+        c["kpe"][:L],
+        jnp.zeros((c["pages_per_seq"], _PS, 1, _DK_PAD), jnp.float32),
+        c["topk_pages"][:L],
+        c["positions"][:L],
+        jnp.arange(L, dtype=jnp.int32),
+        kv_lora_rank=_KV_LORA,
+        page_size=_PS,
+        sm_scale=_SCALE,
+        interpret=True,
+    )
+    d = np.abs(o_r[:L] - np.asarray(o_s)).max()
+    print(f"[G0 single-seq] ragged-vs-oracle & ragged-vs-single|err|={d:.3e}")
+    assert d < 2e-3, f"G0: ragged(num_seqs==1) != single-seq path: {d}"
+
+
+def test_gate_G1_batch_of_identical():
+    """G1: N *identical* requests → each request's output block is bit-for-bit the
+    same (same inputs, only the physical page numbering differs per slot, so this
+    also checks the per-request base indexing)."""
+    L, K = 384, 4
+    rng = np.random.default_rng(7)
+    a = _seq_inputs(rng, L, K)
+    c = _assemble([a, a, a], seed_pages=7, page_perm=True)
+    o, _ = _run_case(c)
+    b0, b1, b2 = (o[_seq_slice(c, i)] for i in range(3))
+    d = max(np.abs(b1 - b0).max(), np.abs(b2 - b0).max())
+    print(f"[G1] batch-of-identical inter-block max|err|={d:.3e}")
+    assert d < 1e-5, f"G1: identical requests produced different outputs: {d}"
+
+
+def test_gate_G2_cross_seq_no_bleed():
+    """G2: request A's output is identical whether run alone or batched beside an
+    unrelated request B (strongest catch for a wrong per-request page base /
+    causal frame — one sequence reading another's KV)."""
+    K = 4
+    a = _seq_inputs(np.random.default_rng(11), 300, K)  # fixed inputs for A
+    b = _seq_inputs(np.random.default_rng(22), 220, K)  # unrelated B
+    o_pair, _ = _run_case(_assemble([a, b], seed_pages=1, page_perm=True))
+    c_alone = _assemble([a], seed_pages=99, page_perm=False)
+    o_alone, _ = _run_case(c_alone)
+    LA = a["L"]
+    d = np.abs(o_pair[:LA] - o_alone[:LA]).max()
+    print(f"[G2] no-bleed A alone-vs-paired max|err|={d:.3e}")
+    assert d < 2e-3, f"G2: batching an unrelated seq changed A: {d}"
+
+
+def test_gate_G3_permutation_invariance():
+    """G3: permuting request order permutes the output blocks correspondingly —
+    A's output is the same in [A,B] and [B,A]."""
+    K = 4
+    a = _seq_inputs(np.random.default_rng(31), 256, K)
+    b = _seq_inputs(np.random.default_rng(41), 384, K)
+    o_ab, _ = _run_case(_assemble([a, b], seed_pages=3, page_perm=True))
+    c_ba = _assemble([b, a], seed_pages=5, page_perm=True)
+    o_ba, _ = _run_case(c_ba)
+    LA, LB = a["L"], b["L"]
+    S_pad = c_ba["S_pad"]
+    a_in_ab = o_ab[:LA]
+    a_in_ba = o_ba[S_pad : S_pad + LA]  # A is the 2nd request in [B, A]
+    b_in_ab = o_ab[S_pad : S_pad + LB]
+    b_in_ba = o_ba[:LB]
+    da = np.abs(a_in_ab - a_in_ba).max()
+    db = np.abs(b_in_ab - b_in_ba).max()
+    print(f"[G3] permutation invariance A|err|={da:.3e} B|err|={db:.3e}")
+    assert max(da, db) < 2e-3, f"G3: output depends on packing position: A={da} B={db}"
+
+
+def test_gate_G4_dense_equals_sparse_superset():
+    """G4: when K >= pages_per_seq (every reachable page selected), the sparse
+    output equals full causal MLA over each request's written latent."""
+    seq_lens = [384, 200, 512]
+    pages_per_seq = int(np.ceil(max(seq_lens) / _PS))
+    o, _, c = _run_ragged(seq_lens, K=pages_per_seq, seed=5)
+    # full (dense) reference: attend ALL causal tokens (not just selected pages).
+    latent = np.concatenate([c["_kvc"], c["_kpe"]], axis=-1)
+    q_full = np.concatenate([c["_ql"], c["_qpe"]], axis=-1)
+    S_pad = c["S_pad"]
+    dense = np.zeros_like(o)
+    for i, L in enumerate(seq_lens):
+        base = i * S_pad
+        lat = latent[base : base + L]
+        for j in range(L):
+            t = base + j
+            k_sel = lat[: j + 1]  # all causal tokens
+            logits = (q_full[t] @ k_sel.T) * _SCALE
+            p = np.exp(logits - logits.max(-1, keepdims=True))
+            p = p / p.sum(-1, keepdims=True)
+            dense[t] = p @ k_sel[:, :_KV_LORA]
+    real = c["real"]
+    d = np.abs(o[real] - dense[real]).max()
+    print(f"[G4] sparse(all pages) vs dense causal max|err|={d:.3e}")
+    assert d < 2e-3, f"G4: full-selection sparse != dense: {d}"
+
+
+def test_gate_G6_metadata_invariants():
+    """G6: the host-side packing-metadata contract the kernel relies on holds for
+    every batch shape — ``cu_q_lens`` covers all packed tokens (== ``len(loc)`` ==
+    num_seqs*S_pad), the flat page table has exactly ``num_seqs*pages_per_seq``
+    slots, and every seq-local top-k page id is in ``[-1, pages_per_seq)``. These
+    are asserted fail-fast inside ``_assemble`` (so G0–G5/A1/A2 already exercise
+    them); this is the standalone, CI-collected gate so the advertised G0–G6 list
+    matches what actually runs."""
+    for shape in ([512], [384, 200, 512, 129, 1, 128], [300, 128, 400]):
+        c = _make_ragged_batch(shape, K=4, seed=13)
+        loc = np.asarray(c["loc"])
+        cu_q = np.asarray(c["cu_q_lens"])
+        pidx = np.asarray(c["page_indices"])
+        tp = np.asarray(c["topk_pages"])
+        num_seqs = len(shape)
+        pps = c["pages_per_seq"]
+        assert (
+            cu_q[-1] == loc.shape[0] == num_seqs * c["S_pad"]
+        ), f"G6 cu_q_lens/total mismatch: seqs={shape}"
+        assert pidx.shape[0] == num_seqs * pps, f"G6 page-table width mismatch: seqs={shape}"
+        assert ((tp >= -1) & (tp < pps)).all(), f"G6 topk page id out of [-1,{pps}): seqs={shape}"
+        print(f"[G6 metadata] ok  seqs={shape}  pps={pps}  ptw={pidx.shape[0]}")
+
+
+def test_gate_A1_prefix_equivalence():
+    """A1 (radix/prefix caching): a prompt prefilled single-shot must produce the
+    same suffix outputs as prefilling it as [cached prefix] + [extend suffix].
+
+    Prefix path: pre-write the prefix latent into the cache, then run the ragged
+    wrapper over ONLY the suffix query tokens with *absolute* positions and the full
+    ``seq_lens`` causal bound. The extend tokens must match the single-shot run
+    exactly (the kernel already threads prefix pages via page_indices + seq_lens)."""
+    Lfull, K = 512, 4
+    Lp = 256  # cached prefix length
+    Le = Lfull - Lp
+    pps = int(np.ceil(Lfull / _PS))
+
+    rng = np.random.default_rng(23)
+    seq = _seq_inputs(rng, Lfull, K)  # ql/qpe/kvc/kpe/tp for the full prompt
+    # single-shot reference (identity pages ⇒ physical slot == token id)
+    c_full = _assemble([seq], seed_pages=0, page_perm=False)
+    o_full, _ = _run_case(c_full)
+
+    # prefix cache: write tokens 0..Lp-1 at their physical slots (== token id)
+    latent = np.concatenate([seq["kvc"], seq["kpe"]], axis=-1)  # [Lfull, 576]
+    cache_prefix = np.zeros((pps * _PS, _DK_PAD), np.float32)
+    cache_prefix[:Lp, : _KV_LORA + _ROPE] = latent[:Lp]
+    cache_prefix = jnp.asarray(cache_prefix.reshape(pps, _PS, 1, _DK_PAD))
+
+    o_suf, _ = prefill_write_and_attend_ragged(
+        jnp.asarray(seq["ql"][Lp:]),
+        jnp.asarray(seq["qpe"][Lp:]),
+        jnp.asarray(seq["kvc"][Lp:]),
+        jnp.asarray(seq["kpe"][Lp:]),
+        cache_prefix,
+        jnp.asarray(seq["tp"][Lp:]),  # seq-local page ids over the FULL kv
+        jnp.arange(Lp, Lfull, dtype=jnp.int32),  # ABSOLUTE positions
+        jnp.arange(Lp, Lfull, dtype=jnp.int32),  # physical slots for the suffix
+        jnp.asarray([Lfull], jnp.int32),  # full causal bound (prefix+extend)
+        jnp.asarray([0, Le], jnp.int32),  # cu_q_lens over the extend tokens
+        jnp.asarray([0, pps * _PS], jnp.int32),
+        jnp.arange(pps, dtype=jnp.int32),
+        kv_lora_rank=_KV_LORA,
+        page_size=_PS,
+        sm_scale=_SCALE,
+        interpret=True,
+    )
+    o_suf = np.asarray(o_suf)
+    d = np.abs(o_suf - o_full[Lp:Lfull]).max()
+    print(f"[A1 prefix-equiv] suffix single-shot-vs-cached max|err|={d:.3e} (Lp={Lp} Le={Le})")
+    assert d < 2e-3, f"A1: cached-prefix+extend != single-shot on the suffix: {d}"
+
+
+def test_gate_A2_chunked_equivalence():
+    """A2 (chunked prefill): prefilling a prompt in N sequential chunks must give
+    the same per-token outputs as a single-shot prefill. Each chunk is an extend
+    with the growing prefix as its cache — the same kernel machinery A1 validates,
+    applied repeatedly against a persistent cache (the IndexShare carry is intra-
+    pass, so no cross-chunk state is needed; full layers rescore the full kv)."""
+    Lfull, K = 512, 4
+    chunks = [(0, 160), (160, 320), (320, 512)]  # ragged chunk sizes
+    pps = int(np.ceil(Lfull / _PS))
+
+    rng = np.random.default_rng(29)
+    seq = _seq_inputs(rng, Lfull, K)
+    o_full, _ = _run_case(_assemble([seq], seed_pages=0, page_perm=False))
+
+    latent = np.concatenate([seq["kvc"], seq["kpe"]], axis=-1)
+    cache = jnp.zeros((pps, _PS, 1, _DK_PAD), jnp.float32)
+    worst = 0.0
+    for a, b in chunks:
+        Lc = b - a
+        o_c, cache = prefill_write_and_attend_ragged(
+            jnp.asarray(seq["ql"][a:b]),
+            jnp.asarray(seq["qpe"][a:b]),
+            jnp.asarray(seq["kvc"][a:b]),
+            jnp.asarray(seq["kpe"][a:b]),
+            cache,
+            jnp.asarray(seq["tp"][a:b]),
+            jnp.arange(a, b, dtype=jnp.int32),  # absolute positions
+            jnp.arange(a, b, dtype=jnp.int32),  # physical slots (== token id)
+            jnp.asarray([b], jnp.int32),  # causal bound = kv seen so far
+            jnp.asarray([0, Lc], jnp.int32),
+            jnp.asarray([0, pps * _PS], jnp.int32),
+            jnp.arange(pps, dtype=jnp.int32),
+            kv_lora_rank=_KV_LORA,
+            page_size=_PS,
+            sm_scale=_SCALE,
+            interpret=True,
+        )
+        d = np.abs(np.asarray(o_c) - o_full[a:b]).max()
+        worst = max(worst, float(d))
+    print(f"[A2 chunked-equiv] worst chunk-vs-single-shot max|err|={worst:.3e} chunks={chunks}")
+    assert worst < 2e-3, f"A2: N-chunk prefill != single-shot: {worst}"
+
+
 def test_parity_flat():
     _run("flat")
 
@@ -333,4 +777,15 @@ if __name__ == "__main__":
     for seed in range(3):
         _run_write_attend(seed)
     _run_write_attend_canary()
+    # packed-ragged (A3) parity + invariant gates
+    test_ragged_parity_varlen()
+    test_ragged_self_write_and_canary()
+    test_gate_G0_single_seq_equivalence()
+    test_gate_G1_batch_of_identical()
+    test_gate_G2_cross_seq_no_bleed()
+    test_gate_G3_permutation_invariance()
+    test_gate_G4_dense_equals_sparse_superset()
+    test_gate_G6_metadata_invariants()
+    test_gate_A1_prefix_equivalence()
+    test_gate_A2_chunked_equivalence()
     print("PARITY OK")
