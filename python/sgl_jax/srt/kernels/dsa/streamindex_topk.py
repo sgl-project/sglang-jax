@@ -918,7 +918,7 @@ def streamindex_page_topk(
     k_pages: int,
     compression_ratio: int = 1,
     num_kv_pages_per_block: int = 128,
-    num_queries_per_block: int = 128,
+    num_queries_per_block: int = 512,
     vmem_limit_bytes: int | None = 64 * 1024 * 1024,
 ) -> jax.Array:
     """Page-level lightning-indexer top-k (prefill/extend form).
