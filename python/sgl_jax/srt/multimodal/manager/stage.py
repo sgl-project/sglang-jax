@@ -34,10 +34,6 @@ from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_backbone import (
 from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_tokenizer import (
     MiMoAudioTokenizer,
 )
-from sgl_jax.srt.multimodal.models.qwen2_5VL.qwen2_5_vit import Qwen2_5_VL_VisionModel
-from sgl_jax.srt.multimodal.models.qwen2_5VL.qwen2_5_vl_generation import (
-    Qwen2_5_VL_Generation,
-)
 from sgl_jax.srt.multimodal.models.qwen3_omni_moe.qwen3_omni_thinker import (
     Qwen3OmniMoeThinkerTextForConditionalGeneration,
 )
@@ -244,8 +240,6 @@ def get_model_class(name: str) -> type | list[type]:
         "UMT5EncoderModel": MultimodalUMT5EncoderModel,
         "WanTransformer3DModel": WanTransformer3DModel,
         "WanDualTransformer3DModel": WanDualTransformer3DModel,
-        "Qwen2_5_VL_Generation": Qwen2_5_VL_Generation,
-        "Qwen2_5_VL_VisionModel": Qwen2_5_VL_VisionModel,
         "Qwen2ForCausalLM": Qwen2ForCausalLM,
         "Qwen3OmniMoeThinkerEmbedding": Qwen3OmniMoeThinkerEmbedding,
         "Qwen3OmniMoeThinkerTextForConditionalGeneration": (

@@ -45,6 +45,9 @@ from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     _build_non_hybrid_memory_pools,
 )
 from sgl_jax.srt.model_loader.loader import get_model_loader
+from sgl_jax.srt.models.registry import ModelRegistry
+from sgl_jax.srt.multimodal.in_model.embedding_pool import EmbeddingPool
+from sgl_jax.srt.multimodal.in_model.host_orchestration import embed_multimodal_inputs
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
@@ -53,6 +56,36 @@ from sgl_jax.srt.utils.common_utils import get_bool_env_var
 from sgl_jax.srt.utils.jax_utils import get_available_device_memory
 
 logger = logging.getLogger(__name__)
+
+
+def _packed_embedding_hidden(model_config, multimodal_model=None) -> int:
+    deepstack_dim = int(getattr(multimodal_model, "deepstack_visual_layers", 0))
+    return int(model_config.hidden_size) * (1 + deepstack_dim)
+
+
+def _embedding_pool_bytes(
+    model_config: ModelConfig | MockModelConfig,
+    server_args: ServerArgs,
+    is_draft_worker: bool = False,
+    multimodal_model=None,
+) -> int:
+    """Per-device byte budget reserved for the multimodal embedding pool."""
+    enabled = (
+        getattr(model_config, "is_multimodal", False)
+        and ModelRegistry.is_in_model_multimodal(model_config.hf_config.architectures)
+        and not is_draft_worker
+        and not server_args.multimodal
+        and not server_args.enable_lora
+        and server_args.disaggregation_mode != "decode"
+    )
+    if not enabled or server_args.mm_embedding_cache_size_mb == 0:
+        return 0
+    if server_args.mm_embedding_cache_size_mb is not None:
+        return server_args.mm_embedding_cache_size_mb * 1024**2
+    page_size = server_args.mm_embedding_page_size
+    capacity = -(-server_args.max_prefill_tokens // page_size) * page_size
+    packed_hidden = _packed_embedding_hidden(model_config, multimodal_model)
+    return capacity * packed_hidden * jnp.dtype(model_config.dtype).itemsize
 
 
 def _maybe_apply_recurrent_cow(forward_batch, memory_pools):
@@ -106,6 +139,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         )
         self.ep_size = server_args.ep_size
         self.server_args = server_args
+        self.embedding_pool: EmbeddingPool | None = None
         self.is_generation = model_config.is_generation
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
@@ -184,9 +218,43 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             total_device_memory,
             dp_size=server_args.dp_size,
         )
+        self._build_embedding_pool()
 
         # Init routed experts capturer
         self.init_routed_experts_capturer()
+
+    @property
+    def embedding_pool_bytes(self) -> int:
+        """Per-device bytes reserved for the multimodal embedding pool (derived)."""
+        return _embedding_pool_bytes(
+            self.model_config,
+            self.server_args,
+            getattr(self, "is_draft_worker", False),
+            getattr(self, "model", None),
+        )
+
+    def _build_embedding_pool(self):
+        """Allocate the paged multimodal embedding pool from the reserved bytes.
+
+        Sized after the model is loaded (hidden size / deepstack depth / dtype
+        are known); its byte budget was already withheld from the KV cache in
+        :meth:`_profile_available_bytes`.
+        """
+        if not self.embedding_pool_bytes:
+            return
+        page_size = self.server_args.mm_embedding_page_size
+        packed_hidden = _packed_embedding_hidden(self.model_config, self.model)
+        per_page = page_size * packed_hidden * jnp.dtype(self.dtype).itemsize
+        num_pages = int(self.embedding_pool_bytes // per_page)
+        if num_pages <= 0:
+            return
+        self.embedding_pool = EmbeddingPool(
+            num_pages=num_pages,
+            page_size=page_size,
+            hidden=packed_hidden,
+            dtype=self.dtype,
+            mesh=self.mesh,
+        )
 
     def init_routed_experts_capturer(self):
         set_global_experts_capturer(
@@ -290,7 +358,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             rng_step,
             *args,
         ):
-
             model_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
             sampler = nnx.merge(sampler_def, model_state)
             rng_key = jax.random.fold_in(base_rng_key, rng_step)
@@ -880,6 +947,16 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.forward_pass_id += 1
         precision_tracer.start_batch_trace(forward_batch.bid)
         precision_tracer.set_current_forward_pass_id(self.forward_pass_id)
+        if forward_batch.multimodal_batch is not None:
+            input_embedding, deepstack = embed_multimodal_inputs(
+                multimodal_batch=forward_batch.multimodal_batch,
+                input_ids=forward_batch.input_ids,
+                multimodal_model=self.model,
+                embedding_pool=self.embedding_pool,
+            )
+            forward_batch.input_embedding = input_embedding
+            forward_batch.deepstack_visual_embedding = deepstack
+            forward_batch.apply_for_deepstack = deepstack is not None
         with jax.profiler.TraceAnnotation("_forward_raw"):
             ret = self._forward_raw(forward_batch, logits_metadata)
         return ret
@@ -1051,6 +1128,7 @@ class MockModelRunner(ModelRunner):
         server_args: ServerArgs = None,
     ):
         self.server_args = server_args
+        self.embedding_pool: EmbeddingPool | None = None
         self.tp_size = server_args.tp_size
         self.dp_size = server_args.dp_size
         self.attention_tp_size = self.tp_size // self.dp_size

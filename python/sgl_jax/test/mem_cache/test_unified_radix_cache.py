@@ -646,6 +646,7 @@ class TestUnifiedRadixCacheWithRequests(CustomTestCase):
 
         # --- chunked prefill: cache_unfinished_req ---
         prefill_ids = list(range(1, 13))  # 12 tokens
+        cache_prefill_ids = list(range(-101, -113, -1))
         reqs = []
         for cache, pool, alloc in stacks:
             kv_indices = alloc.alloc(len(prefill_ids), dp_rank=0)
@@ -659,6 +660,7 @@ class TestUnifiedRadixCacheWithRequests(CustomTestCase):
                 prefix_indices=np.empty((0,), dtype=np.int32),
                 last_node=cache.root_node,
             )
+            req.cache_input_ids = list(cache_prefill_ids)
             req.last_matched_prefix_len = 0
             cache.cache_unfinished_req(req)
             reqs.append(req)
@@ -679,6 +681,21 @@ class TestUnifiedRadixCacheWithRequests(CustomTestCase):
         self.assertEqual(unified.total_size(), 12)
         # The unified req now points at the locked path, not root.
         self.assertIsNot(unified_req.last_node, unified.root_node)
+        for cache, _, _ in stacks:
+            self.assertEqual(
+                len(
+                    cache.match_prefix(MatchPrefixParams(key=RadixKey(prefill_ids))).device_indices
+                ),
+                0,
+            )
+            self.assertEqual(
+                len(
+                    cache.match_prefix(
+                        MatchPrefixParams(key=RadixKey(cache_prefill_ids))
+                    ).device_indices
+                ),
+                12,
+            )
 
         # --- completion: cache_finished_req on the same req objects ---
         # Production flow: cache_unfinished during chunked prefill, then
@@ -707,7 +724,7 @@ class TestUnifiedRadixCacheWithRequests(CustomTestCase):
         self.assertEqual(unified.evictable_size(0), 16)
         self.assertEqual(unified.total_size(), 16)
 
-        full_sequence = prefill_ids + output_ids
+        full_sequence = cache_prefill_ids + output_ids
         radix_match = radix.match_prefix(MatchPrefixParams(key=RadixKey(full_sequence)))
         unified_match = unified.match_prefix(MatchPrefixParams(key=RadixKey(full_sequence)))
         self.assertEqual(len(radix_match.device_indices), len(unified_match.device_indices))

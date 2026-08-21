@@ -48,9 +48,11 @@ from sgl_jax.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sgl_jax.srt.mem_cache.radix_cache import RadixKey
+from sgl_jax.srt.mem_cache.radix_cache import RadixKey, build_radix_key
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sgl_jax.srt.multimodal.common.modality_enum import MultimodalInputs
+from sgl_jax.srt.multimodal.in_model.host_orchestration import build_multimodal_batch
 from sgl_jax.srt.precision_tracer import (
     PrecisionTracerRequestMetadata,
     precision_tracer,
@@ -77,6 +79,8 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "speculative_accept_threshold_acc",
     "enable_deterministic_sampling",
     "pd_disaggregation",
+    "precompile_vision_patch_paddings",
+    "vision_encoder_parallel",
 ]
 
 
@@ -205,8 +209,8 @@ class Req:
         # Used for radix cache matching to differentiate different images/videos
         # If None, origin_input_ids is used for cache matching
         self.cache_input_ids: list[int] | None = None
-        # Multimodal inputs (e.g., mrope positions) from tokenizer
-        self.mm_inputs: dict | None = None
+        # Multimodal inputs (e.g., image items and mrope positions) from tokenizer.
+        self.mm_inputs: MultimodalInputs | dict | None = None
 
         # Each decode stage's output ids
         self.output_ids = []
@@ -489,7 +493,7 @@ class Req:
                 )
                 match_result = tree_cache.match_prefix(
                     MatchPrefixParams(
-                        key=RadixKey(self.adjust_max_prefix_ids(), self.extra_key, self.dp_rank),
+                        key=self.match_key(),
                         cow_recurrent=(
                             tree_cache.supports_recurrent() and not is_running_recurrent
                         ),
@@ -523,6 +527,10 @@ class Req:
 
         max_prefix_len = max(max_prefix_len, 0)
         return self.fill_ids[:max_prefix_len]
+
+    def match_key(self) -> RadixKey:
+        real_prefix = self.adjust_max_prefix_ids()
+        return build_radix_key(self, len(real_prefix))
 
     def pop_committed_kv_cache(self) -> int:
         # Idempotent: the PD prefill abort path can run release a second time
@@ -2152,9 +2160,8 @@ class ScheduleBatch:
         is_decode = self.forward_mode.is_decode()
 
         has_mrope = any(
-            _extract_mm_value(getattr(req, "mm_inputs", None), "mrope_positions") is not None
-            or _extract_mm_value(getattr(req, "mm_inputs", None), "mrope_position_delta")
-            is not None
+            _extract_mm_value(req.mm_inputs, "mrope_positions") is not None
+            or _extract_mm_value(req.mm_inputs, "mrope_position_delta") is not None
             for info in self.reqs_info
             if info.reqs
             for req in info.reqs
@@ -2187,9 +2194,7 @@ class ScheduleBatch:
                 if mrope is not None:
                     for req, seq_len in zip(info.reqs, info.seq_lens):
                         base_pos = int(seq_len) - 1
-                        delta = _extract_mm_value(
-                            getattr(req, "mm_inputs", None), "mrope_position_delta"
-                        )
+                        delta = _extract_mm_value(req.mm_inputs, "mrope_position_delta")
                         if delta is not None:
                             base_pos += _as_int_scalar(delta)
                         mrope[:, offset + local] = base_pos
@@ -2216,9 +2221,7 @@ class ScheduleBatch:
 
                 # mrope_positions: 3-D positions, slice with fallback.
                 if mrope is not None:
-                    mm_positions = _extract_mm_value(
-                        getattr(req, "mm_inputs", None), "mrope_positions"
-                    )
+                    mm_positions = _extract_mm_value(req.mm_inputs, "mrope_positions")
                     if mm_positions is None:
                         # Text-only req in a mixed mrope batch: 1-D positions
                         # broadcast to 3 rows (T==H==W), matching the model's
@@ -2226,15 +2229,27 @@ class ScheduleBatch:
                         base = np.arange(start, start + ext_len, dtype=np.int32)
                         mchunk = np.broadcast_to(base.reshape(1, -1), (3, ext_len))
                     else:
-                        mchunk = np.asarray(mm_positions)[:, start : start + ext_len]
-                        if mchunk.size == 0:
-                            delta = _extract_mm_value(
-                                getattr(req, "mm_inputs", None), "mrope_position_delta"
-                            )
-                            base = np.arange(start, start + ext_len, dtype=np.int32)
+                        mm_positions = np.asarray(mm_positions)
+                        positions_len = mm_positions.shape[1]
+                        known_end = min(end, positions_len)
+                        known_len = max(known_end - start, 0)
+                        mchunk = np.empty((3, ext_len), dtype=np.int32)
+                        if known_len:
+                            mchunk[:, :known_len] = mm_positions[:, start:known_end]
+
+                        # mRoPE positions only cover the original multimodal
+                        # prompt.  A retracted decode request is re-prefilled
+                        # with ``origin_input_ids + output_ids``, so its extend
+                        # window can straddle the end of that array.  Continue
+                        # generated-token positions exactly like decode mode
+                        # instead of assigning a short slice into ``ext_len``.
+                        if known_len < ext_len:
+                            delta = _extract_mm_value(req.mm_inputs, "mrope_position_delta")
+                            tail_start = start + known_len
+                            base = np.arange(tail_start, end, dtype=np.int32)
                             if delta is not None:
                                 base = base + _as_int_scalar(delta)
-                            mchunk = np.broadcast_to(base.reshape(1, -1), (3, ext_len))
+                            mchunk[:, known_len:] = base
                     mrope[:, offset + local : offset + local + ext_len] = mchunk
 
                 # deepstack: densify sparse visual rows into batched layout,
@@ -3178,6 +3193,16 @@ class ScheduleBatch:
         mrope_positions = _mm["mrope_positions"]
         apply_for_deepstack = _mm["apply_for_deepstack"]
         deepstack_visual_embedding = _mm["deepstack_visual_embedding"]
+        # Keep items whose placeholder rows intersect the current prefill window.
+        if self.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
+            multimodal_batch = build_multimodal_batch(
+                self.reqs_info,
+                self.dp_size,
+                self.model_config,
+                per_dp_token_padding,
+            )
+        else:
+            multimodal_batch = None
 
         # Merge per-DP top_logprobs_nums / token_ids_logprobs with the same
         # offset_bs += per_dp_bs_padding padding scheme used in _merge_batch_metadata.
@@ -3282,6 +3307,7 @@ class ScheduleBatch:
             per_dp_bs_size=per_dp_bs_padding,
             launch_done=self.launch_done,
             input_embedding=input_embedding,
+            multimodal_batch=multimodal_batch,
             apply_for_deepstack=apply_for_deepstack,
             deepstack_visual_embedding=deepstack_visual_embedding,
             recurrent_indices=recurrent_indices_cpu,
@@ -3734,6 +3760,8 @@ class ModelWorkerBatch:
     tree_cache: BasePrefixCache = None
 
     input_embedding: np.ndarray | None = None
+
+    multimodal_batch: object | None = None
     apply_for_deepstack: bool = False
     deepstack_visual_embedding: np.ndarray | None = None
 
