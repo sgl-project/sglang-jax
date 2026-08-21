@@ -396,6 +396,7 @@ suites = {
         TestFile("python/sgl_jax/test/mem_cache/test_unified_radix_cache.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_unified_radix_tree_flag.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_paged_allocator_multi_dp.py", 1),
+        TestFile("python/sgl_jax/test/mem_cache/test_recurrent_h0_clone.py", 0.5, runner="pytest"),
         TestFile("python/sgl_jax/test/mem_cache/test_host_kv_pool.py", 1, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/mem_cache/test_hicache_controller.py",
