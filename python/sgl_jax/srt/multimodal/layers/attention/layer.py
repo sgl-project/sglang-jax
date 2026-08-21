@@ -15,7 +15,7 @@ def align_to(x, a):
     return pl.cdiv(x, a) * a
 
 
-def simple_attention(query, key, value, scale=None, causal=False):
+def simple_attention(query, key, value, scale=None, causal=False, attn_mask=None):
     """Simple dot-product attention for diffusion models (no KV cache).
 
     Args:
@@ -24,6 +24,9 @@ def simple_attention(query, key, value, scale=None, causal=False):
         value: [B, S, H, D]
         scale: softmax scale, default 1/sqrt(D)
         causal: whether to apply causal mask
+        attn_mask: optional additive mask broadcastable to [B, H, S, S]
+            (0 where attention is allowed, large negative where masked). Used
+            for block-diagonal attention (e.g. per-window audio encoding).
     Returns:
         output: [B, S, H, D]
     """
@@ -37,6 +40,9 @@ def simple_attention(query, key, value, scale=None, causal=False):
 
     # [B, H, S, S]
     attn_weights = jnp.einsum("bhsd,bhtd->bhst", q, k) * scale
+
+    if attn_mask is not None:
+        attn_weights = attn_weights + attn_mask.astype(attn_weights.dtype)
 
     if causal:
         seq_len = query.shape[1]
