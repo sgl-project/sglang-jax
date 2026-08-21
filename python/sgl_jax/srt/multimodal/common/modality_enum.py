@@ -126,9 +126,6 @@ class MultimodalDataItem:
 
     # Raw features returned by processor, e.g. pixel_values or audio_features
     feature: jax.Array | np.ndarray | None = None
-    # Precomputed embeddings passed as final encoder embeddings
-    # Only one of feature and precomputed_embeddings is non-empty
-    precomputed_embeddings: jax.Array | np.ndarray | None = None
 
     # Model-specific data stored in dictionary
     model_specific_data: dict[str, Any] = dataclasses.field(default_factory=dict)
@@ -159,21 +156,24 @@ class MultimodalDataItem:
             return True
         return len([item for item in flatten_nested_list(lst) if item is not None]) == 0
 
-    def set_pad_value(self):
-        """
-        Set padding value after hashing the data first
-        """
+    def set_pad_value(self) -> None:
         if self.hash is None:
-            if self.feature is not None:
-                hashed_feature = self.feature
-            else:
-                hashed_feature = self.precomputed_embeddings
-            self.hash = hash_feature(hashed_feature)
+            feature = self.feature
+            layout = (
+                (tuple(feature.shape), str(feature.dtype))
+                if isinstance(feature, (jax.Array, np.ndarray))
+                else None
+            )
+            self.hash = hash_feature(
+                (
+                    self.modality,
+                    hash_feature(feature),
+                    layout,
+                    hash_feature(self.model_specific_data),
+                )
+            )
         assert self.hash is not None
-        # Use a smaller modulo to keep pad_value in a reasonable range
-        # The pad_value is used for radix cache differentiation, not for embedding lookup
-        # We use a 24-bit range which gives ~16M unique values, sufficient for cache keys
-        self.pad_value = self.hash % (1 << 24)
+        self.pad_value = -(self.hash & ((1 << 63) - 1)) - 1
 
     def is_modality(self, modality: Modality) -> bool:
         return self.modality == modality

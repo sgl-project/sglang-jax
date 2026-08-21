@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -124,6 +125,21 @@ TEST_RETRACT_INTERVAL = int(os.environ.get("SGLANG_TEST_RETRACT_INTERVAL", "3"))
 TEST_RETRACT_NO_PREFILL_BS = int(os.environ.get("SGLANG_TEST_RETRACT_NO_PREFILL_BS", str(2**31)))
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
+
+
+def _clear_embedding_pools(
+    workers: Iterable[ModelWorker | ModelWorkerClient | None],
+) -> None:
+    seen: set[int] = set()
+    for worker in workers:
+        if worker is None:
+            continue
+        runner = worker.get_model_runner()
+        if id(runner) in seen:
+            continue
+        seen.add(id(runner))
+        if getattr(runner, "embedding_pool", None) is not None:
+            runner.embedding_pool.clear()
 
 
 class SyncError(Exception):
@@ -1721,6 +1737,9 @@ class Scheduler(
             self.token_to_kv_pool_allocator.clear()
         if self.grammar_backend is not None:
             self.grammar_backend.reset()
+        _clear_embedding_pools(
+            (self.tp_worker, self.tp_worker_p, *getattr(self, "tp_workers_p", ()))
+        )
 
         self.num_generated_tokens = 0
         self.forward_ct_decode = 0

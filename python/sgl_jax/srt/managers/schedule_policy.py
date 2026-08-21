@@ -20,7 +20,7 @@ from sgl_jax.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
-from sgl_jax.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sgl_jax.srt.mem_cache.radix_cache import RadixCache, TreeNode
 
 if TYPE_CHECKING:
     from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -152,14 +152,9 @@ class SchedulePolicy:
         self.waiting_queue_radix_tree.reset()
 
         for r in waiting_queue:
-            prefix_ids = r.match_key_ids()
-            extra_key = r.extra_key
+            match_key = r.match_key()
             # NOTE: the prefix_indices must always be aligned with last_node
-            match_result = self.tree_cache.match_prefix(
-                MatchPrefixParams(
-                    key=RadixKey(token_ids=prefix_ids, extra_key=extra_key, dp_rank=r.dp_rank)
-                )
-            )
+            match_result = self.tree_cache.match_prefix(MatchPrefixParams(key=match_key))
             r.prefix_indices = match_result.device_indices
             r.last_node = match_result.last_device_node
             r.last_host_node = match_result.last_host_node
@@ -174,9 +169,7 @@ class SchedulePolicy:
             # It is kind of common when the engine is long running (e.g., imagine the prefix "the").
             if len(r.prefix_indices) <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
                 in_batch_match = self.waiting_queue_radix_tree.match_prefix(
-                    MatchPrefixParams(
-                        key=RadixKey(token_ids=prefix_ids, extra_key=extra_key, dp_rank=r.dp_rank)
-                    )
+                    MatchPrefixParams(key=match_key)
                 )
                 in_batch_matching_prefixes = in_batch_match.device_indices
                 if (
@@ -188,10 +181,8 @@ class SchedulePolicy:
                     # Insert with a dummy key
                     self.waiting_queue_radix_tree.insert(
                         InsertParams(
-                            key=RadixKey(
-                                token_ids=prefix_ids, extra_key=extra_key, dp_rank=r.dp_rank
-                            ),
-                            value=np.empty(len(prefix_ids), dtype=np.bool_),
+                            key=match_key,
+                            value=np.empty(len(match_key), dtype=np.bool_),
                         )
                     )
         return temporary_deprioritized

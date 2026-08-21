@@ -31,7 +31,6 @@ from jax._src import mesh as mesh_lib
 
 from sgl_jax.global_config import global_config
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.managers.mm_utils import build_mm_embed_plan
 from sgl_jax.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
@@ -49,11 +48,11 @@ from sgl_jax.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sgl_jax.srt.mem_cache.radix_cache import RadixKey
+from sgl_jax.srt.mem_cache.radix_cache import RadixKey, build_radix_key
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
-from sgl_jax.srt.multimodal.common.mm_plan import MultimodalEmbedPlan
 from sgl_jax.srt.multimodal.common.modality_enum import MultimodalInputs
+from sgl_jax.srt.multimodal.in_model.host_orchestration import build_multimodal_batch
 from sgl_jax.srt.precision_tracer import (
     PrecisionTracerRequestMetadata,
     precision_tracer,
@@ -80,6 +79,8 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "speculative_accept_threshold_acc",
     "enable_deterministic_sampling",
     "pd_disaggregation",
+    "precompile_vision_patch_paddings",
+    "vision_encoder_parallel",
 ]
 
 
@@ -492,7 +493,7 @@ class Req:
                 )
                 match_result = tree_cache.match_prefix(
                     MatchPrefixParams(
-                        key=RadixKey(self.match_key_ids(), self.extra_key, self.dp_rank),
+                        key=self.match_key(),
                         cow_recurrent=(
                             tree_cache.supports_recurrent() and not is_running_recurrent
                         ),
@@ -527,19 +528,9 @@ class Req:
         max_prefix_len = max(max_prefix_len, 0)
         return self.fill_ids[:max_prefix_len]
 
-    def match_key_ids(self):
-        """Prefix ids for the radix key. Uses hash-substituted ``cache_input_ids``
-        when set (to distinguish multimodal content) but keeps ``fill_ids`` as the
-        real model input; length is identical to ``adjust_max_prefix_ids`` so
-        ``extend_input_len`` math is unchanged.
-        """
+    def match_key(self) -> RadixKey:
         real_prefix = self.adjust_max_prefix_ids()
-        if self.cache_input_ids is None:
-            return real_prefix
-        key_fill = (
-            self.cache_input_ids + self.output_ids if self.output_ids else self.cache_input_ids
-        )
-        return key_fill[: len(real_prefix)]
+        return build_radix_key(self, len(real_prefix))
 
     def pop_committed_kv_cache(self) -> int:
         # Idempotent: the PD prefill abort path can run release a second time
@@ -1018,19 +1009,6 @@ class ScheduleBatch:
     @property
     def batch_is_full(self) -> bool:
         return all(info.batch_is_full for info in self.reqs_info)
-
-    def contains_mm_inputs(self) -> bool:
-        """Whether any request in this batch carries multimodal inputs.
-
-        Mirrors the per-req mm detection used by ``_merge_multimodal`` /
-        ``build_mm_embed_plan`` so pure-text batches skip all multimodal work.
-        """
-        return any(
-            getattr(req, "mm_inputs", None) is not None
-            for info in self.reqs_info
-            if info.reqs
-            for req in info.reqs
-        )
 
     def batch_size(self) -> int:
         """Get total number of requests across all DP ranks."""
@@ -2227,13 +2205,27 @@ class ScheduleBatch:
                         base = np.arange(start, start + ext_len, dtype=np.int32)
                         mchunk = np.broadcast_to(base.reshape(1, -1), (3, ext_len))
                     else:
-                        mchunk = np.asarray(mm_positions)[:, start : start + ext_len]
-                        if mchunk.size == 0:
+                        mm_positions = np.asarray(mm_positions)
+                        positions_len = mm_positions.shape[1]
+                        known_end = min(end, positions_len)
+                        known_len = max(known_end - start, 0)
+                        mchunk = np.empty((3, ext_len), dtype=np.int32)
+                        if known_len:
+                            mchunk[:, :known_len] = mm_positions[:, start:known_end]
+
+                        # mRoPE positions only cover the original multimodal
+                        # prompt.  A retracted decode request is re-prefilled
+                        # with ``origin_input_ids + output_ids``, so its extend
+                        # window can straddle the end of that array.  Continue
+                        # generated-token positions exactly like decode mode
+                        # instead of assigning a short slice into ``ext_len``.
+                        if known_len < ext_len:
                             delta = _extract_mm_value(req.mm_inputs, "mrope_position_delta")
-                            base = np.arange(start, start + ext_len, dtype=np.int32)
+                            tail_start = start + known_len
+                            base = np.arange(tail_start, end, dtype=np.int32)
                             if delta is not None:
                                 base = base + _as_int_scalar(delta)
-                            mchunk = np.broadcast_to(base.reshape(1, -1), (3, ext_len))
+                            mchunk[:, known_len:] = base
                     mrope[:, offset + local : offset + local + ext_len] = mchunk
 
                 # deepstack: densify sparse visual rows into batched layout,
@@ -3177,18 +3169,16 @@ class ScheduleBatch:
         mrope_positions = _mm["mrope_positions"]
         apply_for_deepstack = _mm["apply_for_deepstack"]
         deepstack_visual_embedding = _mm["deepstack_visual_embedding"]
-        # Build the vision encode/merge plan only for ordinary prefill. Other
-        # forward modes leave the plan unset, and the runner treats a non-None
-        # plan as the sole vision-forward signal.
-        if self.contains_mm_inputs() and self.forward_mode == ForwardMode.EXTEND:
-            mm_embed_plan = build_mm_embed_plan(
+        # Keep items whose placeholder rows intersect the current prefill window.
+        if self.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
+            multimodal_batch = build_multimodal_batch(
                 self.reqs_info,
                 self.dp_size,
                 self.model_config,
                 per_dp_token_padding,
             )
         else:
-            mm_embed_plan = None
+            multimodal_batch = None
 
         # Merge per-DP top_logprobs_nums / token_ids_logprobs with the same
         # offset_bs += per_dp_bs_padding padding scheme used in _merge_batch_metadata.
@@ -3293,7 +3283,7 @@ class ScheduleBatch:
             per_dp_bs_size=per_dp_bs_padding,
             launch_done=self.launch_done,
             input_embedding=input_embedding,
-            mm_embed_plan=mm_embed_plan,
+            multimodal_batch=multimodal_batch,
             apply_for_deepstack=apply_for_deepstack,
             deepstack_visual_embedding=deepstack_visual_embedding,
             recurrent_indices=recurrent_indices_cpu,
@@ -3721,9 +3711,8 @@ class ModelWorkerBatch:
     tree_cache: BasePrefixCache = None
 
     input_embedding: np.ndarray | None = None
-    # In-model VLM owning-rank DP embed plan (host-side). Array leaves get
-    # device_put in ForwardBatch.init_new; never a backbone-JIT pytree child.
-    mm_embed_plan: MultimodalEmbedPlan | None = None
+
+    multimodal_batch: object | None = None
     apply_for_deepstack: bool = False
     deepstack_visual_embedding: np.ndarray | None = None
 

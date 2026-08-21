@@ -29,30 +29,29 @@ logger = logging.getLogger(__name__)
 
 GRAMMAR_BACKEND_CHOICES = ["llguidance", "none"]
 _REJECTED_PD_HOST_ALIASES = frozenset({"localhost"})
-_MULTIMODAL_CHUNKED_PREFILL_ARCHITECTURES = frozenset({"Qwen2_5_VLForConditionalGeneration"})
-_MULTIMODAL_RADIX_CACHE_ARCHITECTURES = frozenset({"Qwen2_5_VLForConditionalGeneration"})
 
 
 def apply_multimodal_model_defaults(server_args, model_config) -> None:
     if not model_config.is_multimodal:
         return
 
-    hf_config = getattr(model_config, "hf_config", None)
-    architectures = set(getattr(hf_config, "architectures", None) or [])
+    from sgl_jax.srt.models.registry import ModelRegistry
 
-    supports_radix_cache = bool(architectures & _MULTIMODAL_RADIX_CACHE_ARCHITECTURES)
-    if not supports_radix_cache and not server_args.disable_radix_cache:
+    hf_config = getattr(model_config, "hf_config", None)
+    architectures = list(getattr(hf_config, "architectures", None) or [])
+    in_model = ModelRegistry.is_in_model_multimodal(architectures)
+
+    if not in_model and not server_args.disable_radix_cache:
         logger.info("Multimodal model detected, disabling radix cache")
         server_args.disable_radix_cache = True
 
-    supports_chunked_prefill = bool(architectures & _MULTIMODAL_CHUNKED_PREFILL_ARCHITECTURES)
-    if not supports_chunked_prefill and (
+    if not in_model and (
         server_args.chunked_prefill_size is None or server_args.chunked_prefill_size > 0
     ):
         logger.info("Multimodal model detected, disabling chunked prefill")
         server_args.chunked_prefill_size = -1
-    if server_args.enable_mixed_chunk:
-        logger.info("Multimodal model detected, disabling mixed chunk")
+    if server_args.enable_mixed_chunk and not in_model:
+        logger.info("Multimodal model does not support mixed chunk; disabling it")
         server_args.enable_mixed_chunk = False
     if server_args.limit_mm_data_per_request is None:
         server_args.limit_mm_data_per_request = {"image": 16}
@@ -61,8 +60,7 @@ def apply_multimodal_model_defaults(server_args, model_config) -> None:
 def _validate_disaggregation_host_ip(host_ip: str) -> str:
     if host_ip in _REJECTED_PD_HOST_ALIASES:
         raise ValueError(
-            "--disaggregation-host-ip must be a routable address; "
-            f"got loopback alias {host_ip!r}"
+            f"--disaggregation-host-ip must be a routable address; got loopback alias {host_ip!r}"
         )
     try:
         addr = ipaddress.ip_address(host_ip)
@@ -71,8 +69,7 @@ def _validate_disaggregation_host_ip(host_ip: str) -> str:
     if addr.is_loopback or addr.is_unspecified:
         kind = "loopback" if addr.is_loopback else "bind/unspecified"
         raise ValueError(
-            "--disaggregation-host-ip must be a routable address; "
-            f"got {kind} address {host_ip!r}"
+            f"--disaggregation-host-ip must be a routable address; got {kind} address {host_ip!r}"
         )
     return host_ip
 
@@ -221,6 +218,11 @@ class ServerArgs:
 
     precompile_token_paddings: list[int] | None = None
     precompile_bs_paddings: list[int] | None = None
+    precompile_vision_patch_paddings: list[int] | None = None
+
+    # "dp" load-balances images over all mesh devices; "tp" shards ViT weights
+    # over the tensor axis and load-balances images over data-parallel groups.
+    vision_encoder_parallel: str = "dp"
 
     disable_precompile: bool = False
 
@@ -259,6 +261,8 @@ class ServerArgs:
     # Multimodal
     multimodal: bool = False
     limit_mm_data_per_request: dict[str, int] | None = None
+    mm_embedding_cache_size_mb: int | None = None
+    mm_embedding_page_size: int = 64
 
     enable_return_routed_experts: bool = False
     enable_expert_balance_debug: bool = False
@@ -525,6 +529,10 @@ class ServerArgs:
             self.model_path = download_from_hf(self.model_path, allow_patterns=None)
             if self.limit_mm_data_per_request is None:
                 self.limit_mm_data_per_request = {"image": 16}
+        if self.mm_embedding_cache_size_mb is not None and self.mm_embedding_cache_size_mb < 0:
+            raise ValueError("--mm-embedding-cache-size-mb must be non-negative")
+        if self.mm_embedding_page_size <= 0:
+            raise ValueError("--mm-embedding-page-size must be positive")
 
         if self.ep_num_redundant_experts < 0:
             raise ValueError("ep_num_redundant_experts must be non-negative")
@@ -1434,6 +1442,22 @@ class ServerArgs:
             help="Set the list of batch sizes buckets for jax jit",
         )
         parser.add_argument(
+            "--precompile-vision-patch-paddings",
+            type=int,
+            nargs="+",
+            default=ServerArgs.precompile_vision_patch_paddings,
+            help="JIT buckets for the vision encoder patch dimension.",
+        )
+        parser.add_argument(
+            "--vision-encoder-parallel",
+            type=str,
+            choices=["dp", "tp"],
+            default=ServerArgs.vision_encoder_parallel,
+            help="'dp' (default) load-balances images over all mesh devices; 'tp' "
+            "shards ViT weights over the tensor axis and load-balances images over "
+            "data-parallel groups (requires tp_size > 1).",
+        )
+        parser.add_argument(
             "--disable-precompile",
             action="store_true",
             help="whether disable precompile",
@@ -1598,6 +1622,19 @@ class ServerArgs:
             default=ServerArgs.limit_mm_data_per_request,
             help="JSON object that limits the number of multimodal items per request, e.g. '{\"image\": 16}'.",
         )
+        parser.add_argument(
+            "--mm-embedding-cache-size-mb",
+            type=int,
+            default=ServerArgs.mm_embedding_cache_size_mb,
+            help="Per-device multimodal embedding cache budget in MiB. By default, "
+            "it holds max-prefill-tokens embeddings; 0 disables it.",
+        )
+        parser.add_argument(
+            "--mm-embedding-page-size",
+            type=int,
+            default=ServerArgs.mm_embedding_page_size,
+            help="Token-block (page) size for the multimodal embedding pool.",
+        )
 
         # LoRA
         parser.add_argument(
@@ -1759,7 +1796,7 @@ class ServerArgs:
             "--disaggregation-bootstrap-timeout-seconds",
             type=float,
             default=ServerArgs.disaggregation_bootstrap_timeout_seconds,
-            help="Bootstrap-server query timeout in seconds. <=0 to " "disable.",
+            help="Bootstrap-server query timeout in seconds. <=0 to disable.",
         )
         parser.add_argument(
             "--disaggregation-pull-timeout-seconds",
@@ -1784,7 +1821,7 @@ class ServerArgs:
             "--disaggregation-orphan-reaper-interval-seconds",
             type=float,
             default=ServerArgs.disaggregation_orphan_reaper_interval_seconds,
-            help="How often the background reaper scans for orphan " "senders/receivers.",
+            help="How often the background reaper scans for orphan senders/receivers.",
         )
         parser.add_argument(
             "--disaggregation-decode-watchdog-seconds",

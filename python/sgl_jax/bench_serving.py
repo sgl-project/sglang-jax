@@ -801,6 +801,7 @@ def get_dataset(args, tokenizer, model_id=None):
             dataset_path=args.dataset_path,
             random_sample=args.dataset_name == "random",
             return_text=not tokenize_prompt,
+            max_retry=adjust_prompt_max_retry,
         )
     elif args.dataset_name == "image":
         processor = get_processor(model_id)
@@ -816,7 +817,6 @@ def get_dataset(args, tokenizer, model_id=None):
             image_resolution=args.image_resolution,
             backend=args.backend,
             random_image_count=args.random_image_count,
-            max_retry=adjust_prompt_max_retry,
         )
     elif args.dataset_name == "generated-shared-prefix":
         assert not tokenize_prompt
@@ -1601,16 +1601,28 @@ def create_mm_data_row(text_prompt, images: list, images_base64, output_len, pro
     # Vision tokens = total tokens - text tokens
     vision_prompt_len = prompt_len - text_prompt_len
 
-    use_raw_prompt = backend in [
+    supported_backends = (
         "sglang",
         "sgl-jax",
+        "sglang-native",
         "sglang-oai",
         "sglang-oai-chat",
         "vllm",
         "vllm-chat",
         "lmdeploy",
         "lmdeploy-chat",
-    ]
+    )
+    if backend not in supported_backends:
+        raise ValueError(
+            f"Image dataset only supports backends: {supported_backends}, got {backend!r}."
+        )
+
+    # Chat-completions backends receive structured image_url content and apply
+    # their own chat template, so they need the raw user text. Native /generate
+    # and completions backends receive image_data out of band and do not apply a
+    # chat template, so they need the processor-generated prompt containing
+    # image placeholder tokens.
+    use_raw_prompt = backend in ("sglang-oai-chat", "vllm-chat", "lmdeploy-chat")
     return DatasetRow(
         prompt=text_prompt if use_raw_prompt else prompt_str,
         prompt_len=prompt_len,
