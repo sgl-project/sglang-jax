@@ -75,9 +75,9 @@ def run_benchmark_for_case(
     from sgl_jax.bench_serving import run_benchmark
     from sgl_jax.test.test_utils import get_benchmark_args
 
-    args = get_benchmark_args(
+    benchmark_kwargs = dict(
         base_url=base_url,
-        dataset_name="random",
+        dataset_name=case.workload,
         device="tpu",
         tokenizer=tokenizer,
         num_prompts=case.num_prompts,
@@ -89,6 +89,16 @@ def run_benchmark_for_case(
         seed=case.seed,
         warmup_requests=0,
     )
+    if case.gsp_params is not None:
+        benchmark_kwargs.update(
+            gsp_num_groups=case.gsp_params.num_groups,
+            gsp_prompts_per_group=case.gsp_params.prompts_per_group,
+            gsp_system_prompt_len=case.gsp_params.shared_prefix_len,
+            gsp_question_len=case.gsp_params.question_len,
+            gsp_output_len=case.output_len,
+            gsp_range_ratio=case.gsp_params.range_ratio,
+        )
+    args = get_benchmark_args(**benchmark_kwargs)
     args.output_file = "/dev/null"
     args.flush_cache = case.flush_cache
     args.profile = True if profile else None
