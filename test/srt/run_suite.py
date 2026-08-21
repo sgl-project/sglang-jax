@@ -431,6 +431,11 @@ suites = {
     ],
     "unit-test-tpu-v6e-4": [
         TestFile("python/sgl_jax/test/test_mesh.py", 0.4),
+        TestFile(
+            "python/sgl_jax/test/layers/test_sequence_parallel.py",
+            1,
+            runner="pytest",
+        ),
         TestFile("python/sgl_jax/test/test_linear_tp.py", 0.3, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/layers/test_lightning_backend_dp.py",
