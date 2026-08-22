@@ -34,7 +34,7 @@ _TOP_K = 8
 
 
 def _pattern(shape: tuple[int, ...], *, offset: int) -> jax.Array:
-    """Return signed, non-uniform values that distinguish every tensor axis."""
+    """Return positive, non-uniform values that distinguish every tensor axis."""
     value = jnp.zeros(shape, dtype=jnp.int32)
     for axis, size in enumerate(shape):
         axis_value = jnp.arange(size, dtype=jnp.int32)
@@ -45,7 +45,9 @@ def _pattern(shape: tuple[int, ...], *, offset: int) -> jax.Array:
     code = (value + offset) % 16
     sign = jnp.where(code < 8, -1.0, 1.0)
     magnitude = 0.25 + (code % 4).astype(jnp.float32) * 0.25
-    return sign * magnitude
+    # The positive offset prevents the small explicit-oracle shapes from
+    # degenerating to an almost-zero output through symmetric cancellation.
+    return 0.5 + sign * magnitude * 0.25
 
 
 def _make_inputs(mesh: jax.sharding.Mesh, *, quantized: bool, num_tokens: int):
@@ -174,6 +176,12 @@ def _explicit_reference(inputs, *, quantized: bool):
     return output.astype(tokens.dtype)
 
 
+def _relative_l2(actual: np.ndarray, expected: np.ndarray) -> float:
+    numerator = np.linalg.norm(actual.astype(np.float64) - expected.astype(np.float64))
+    denominator = max(np.linalg.norm(expected.astype(np.float64)), 1e-12)
+    return float(numerator / denominator)
+
+
 @jtu.with_config(jax_numpy_dtype_promotion="standard")
 class MoERSKernelTest(jtu.JaxTestCase):
     def setUp(self):
@@ -223,12 +231,124 @@ class MoERSKernelTest(jtu.JaxTestCase):
 
         expected_host = np.asarray(jax.device_get(expected), dtype=np.float32)
         actual_host = np.asarray(jax.device_get(actual), dtype=np.float32)
+        self.assertGreater(np.linalg.norm(expected_host), 1e-3)
         self.assertTrue(np.isfinite(actual_host).all())
         self.assertAllClose(
             actual_host,
             expected_host,
             atol=5e-2 if quantized else 2e-2,
             rtol=5e-2 if quantized else 2e-2,
+        )
+
+    def _test_padding_contract(
+        self,
+        config,
+        *,
+        num_tokens: int,
+        active_tokens_per_device: int,
+    ):
+        reference_inputs, kernel_inputs, token_sharding = _make_inputs(
+            self.mesh,
+            quantized=True,
+            num_tokens=num_tokens,
+        )
+        tokens, w1, w3, w2, s1, s3, s2, topk_weights, topk_ids = kernel_inputs
+
+        self.assertEqual(num_tokens % self.mesh.size, 0)
+        local_tokens = num_tokens // self.mesh.size
+        self.assertLess(active_tokens_per_device, local_tokens)
+        valid_mask = (
+            np.arange(num_tokens, dtype=np.int32) % local_tokens
+        ) < active_tokens_per_device
+
+        reference_topk_weights = reference_inputs[-2]
+        reference_topk_ids = reference_inputs[-1]
+        valid_mask_device = jnp.asarray(valid_mask)[:, None]
+        padded_topk_weights = jnp.where(
+            valid_mask_device,
+            reference_topk_weights,
+            jnp.asarray(0.0, dtype=reference_topk_weights.dtype),
+        )
+        padded_topk_ids = jnp.where(
+            valid_mask_device,
+            reference_topk_ids,
+            jnp.asarray(-1, dtype=reference_topk_ids.dtype),
+        )
+        padded_reference_inputs = (
+            *reference_inputs[:-2],
+            padded_topk_weights,
+            padded_topk_ids,
+        )
+        padded_topk_weights = jax.sharding.reshard(
+            padded_topk_weights, token_sharding
+        )
+        padded_topk_ids = jax.sharding.reshard(padded_topk_ids, token_sharding)
+
+        expected_padded = jax.jit(
+            _explicit_reference,
+            static_argnames=("quantized",),
+            out_shardings=token_sharding,
+        )(padded_reference_inputs, quantized=True)
+
+        set_fused_rs_block_sizes_override(config)
+
+        def run(weights, indices):
+            return fused_moe_func_rs(
+                hidden_states=tokens,
+                w1=w1,
+                w3=w3,
+                w2=w2,
+                w1_scale=s1,
+                w3_scale=s3,
+                w2_scale=s2,
+                w1_bias=None,
+                w2_bias=None,
+                gating_output=None,
+                topk=_TOP_K,
+                renormalize=False,
+                mesh=self.mesh,
+                activation="silu",
+                scoring_fn="softmax",
+                topk_weights=weights,
+                topk_indices=indices,
+            )
+
+        all_active = run(topk_weights, topk_ids)
+        padded = run(padded_topk_weights, padded_topk_ids)
+        jax.block_until_ready((expected_padded, all_active, padded))
+
+        expected_padded_host = np.asarray(
+            jax.device_get(expected_padded), dtype=np.float32
+        )
+        all_active_host = np.asarray(jax.device_get(all_active), dtype=np.float32)
+        padded_host = np.asarray(jax.device_get(padded), dtype=np.float32)
+        self.assertGreater(np.linalg.norm(expected_padded_host[valid_mask]), 1e-3)
+        self.assertTrue(np.isfinite(padded_host).all())
+        self.assertAllClose(
+            padded_host,
+            expected_padded_host,
+            atol=5e-2,
+            rtol=5e-2,
+        )
+
+        valid_rel_l2 = _relative_l2(
+            padded_host[valid_mask], all_active_host[valid_mask]
+        )
+        oracle_rel_l2 = _relative_l2(padded_host, expected_padded_host)
+        invalid_max_abs = float(np.max(np.abs(padded_host[~valid_mask])))
+        self.assertLessEqual(
+            valid_rel_l2,
+            0.01,
+            msg=(
+                "valid output changed after padding: "
+                f"rel_l2={valid_rel_l2}, oracle_rel_l2={oracle_rel_l2}, "
+                f"invalid_max_abs={invalid_max_abs}"
+            ),
+        )
+        self.assertEqual(
+            invalid_max_abs,
+            0.0,
+            msg=f"invalid padded output was not zero: max_abs={invalid_max_abs}",
         )
 
     def test_bf16_full_resident_matches_explicit_reference(self):
@@ -240,15 +360,30 @@ class MoERSKernelTest(jtu.JaxTestCase):
 
     @parameterized.named_parameters(
         ("m128_full_resident", (128, 512, 512, 512, 512, 1, 1), 48),
-        ("m256_cache_w1", (256, 512, 256, 512, 128, 2, 2), 64),
-        ("m256_cache_w2", (256, 512, 128, 512, 512, 2, 1), 80),
-        ("m256_stream_both", (256, 512, 128, 512, 128, 2, 2), 96),
-        ("m384_stream_both", (384, 512, 128, 512, 128, 2, 2), 144),
+        ("m256_full_resident", (256, 512, 512, 512, 512, 1, 1), 72),
+        ("m384_full_resident", (384, 512, 512, 512, 512, 1, 1), 136),
     )
     def test_fp8_per_channel_config_matches_explicit_reference(
         self, config, num_tokens
     ):
         self._test_config(config, quantized=True, num_tokens=num_tokens)
+
+    @parameterized.named_parameters(
+        ("m128_full_resident", (128, 512, 512, 512, 512, 1, 1), 48, 3),
+        ("m256_full_resident", (256, 512, 512, 512, 512, 1, 1), 72, 5),
+        ("m384_full_resident", (384, 512, 512, 512, 512, 1, 1), 136, 8),
+    )
+    def test_fp8_per_channel_padding_contract(
+        self,
+        config,
+        num_tokens,
+        active_tokens_per_device,
+    ):
+        self._test_padding_contract(
+            config,
+            num_tokens=num_tokens,
+            active_tokens_per_device=active_tokens_per_device,
+        )
 
 
 if __name__ == "__main__":

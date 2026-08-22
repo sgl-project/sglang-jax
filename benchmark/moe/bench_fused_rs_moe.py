@@ -910,8 +910,9 @@ def main() -> None:
                         "validation_stage": "tuning_contract",
                         "error_type": "InvalidTuningContract",
                         "error": (
-                            "config must keep K whole, use an aligned legal weight "
-                            "pipeline mode, and fit the declared VMEM budget"
+                            "config must keep K whole, keep both weight stages "
+                            "padding-safe and resident, use aligned tiles, and fit "
+                            "the declared VMEM budget"
                         ),
                     }
                     emit_row(row)

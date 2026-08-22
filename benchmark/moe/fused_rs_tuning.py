@@ -7,7 +7,8 @@ pipeline modes instead:
 
 * ``full_resident`` keeps every N step for an expert in VMEM;
 * ``streaming`` uses the kernel's two-buffer rotation and reloads weights for
-  each grouped-M tile;
+  each grouped-M tile, but is excluded from production tuning because the
+  current path is not invariant to invalid padded routes;
 * multi-step single-buffer configs are outside the pipeline contract.
 
 This module deliberately has no JAX imports.  Candidate legality and the
@@ -129,6 +130,11 @@ def analyze_rs_config(config: FusedRsBlockConfig) -> dict[str, ContractValue]:
     can_cache_w1 = w1_buffer_mode in {"single_step", "full_resident"}
     can_cache_w2 = w2_buffer_mode in {"single_step", "full_resident"}
     pipeline_contract_valid = "invalid" not in {w1_buffer_mode, w2_buffer_mode}
+    # Production prefill pads every device-local token shard with topk_id=-1
+    # and routing weight 0.  Target-v7x oracle tests show that the current
+    # two-buffer streaming path changes valid outputs under that padding,
+    # while single-step/full-resident weight paths preserve them.
+    padding_contract_valid = can_cache_w1 and can_cache_w2
     full_k = tile_k1 == GLM52_RS_K1 and tile_k2 == GLM52_RS_K2
     matrix_tile_aligned = (
         tile_m % _M_ALIGNMENT == 0
@@ -159,6 +165,7 @@ def analyze_rs_config(config: FusedRsBlockConfig) -> dict[str, ContractValue]:
         full_k
         and matrix_tile_aligned
         and pipeline_contract_valid
+        and padding_contract_valid
         and vmem_contract_valid
     )
     return {
@@ -176,6 +183,7 @@ def analyze_rs_config(config: FusedRsBlockConfig) -> dict[str, ContractValue]:
         "can_cache_w1": can_cache_w1,
         "can_cache_w2": can_cache_w2,
         "pipeline_contract_valid": pipeline_contract_valid,
+        "padding_contract_valid": padding_contract_valid,
         "full_k": full_k,
         "matrix_tile_aligned": matrix_tile_aligned,
         "estimated_vmem_bytes": estimated_vmem_bytes,
