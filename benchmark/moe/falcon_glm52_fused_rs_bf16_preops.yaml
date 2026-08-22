@@ -44,7 +44,7 @@ role_to_task_spec:
         sleep 5
       done
       test -f "$source_tar"
-      echo '__SOURCE_SHA256__  /tmp/glm52-fused-rs-bf16-preops-r1.tar.gz.part' | sha256sum -c -
+      echo 'e69f272decd933aca6dde4c5c9a8a14d8e0c6317de24749ff84cca5ea719e825  /tmp/glm52-fused-rs-bf16-preops-r1.tar.gz.part' | sha256sum -c -
 
       mkdir -p /workspace/sglang-jax
       tar -xzf "$source_tar" -C /workspace/sglang-jax
@@ -91,8 +91,8 @@ role_to_task_spec:
           },
           "source": {
               "branch": "dev/glm52-rs-bf16-allgather",
-              "source_commit": "__SOURCE_COMMIT__",
-              "source_sha256": "__SOURCE_SHA256__",
+              "source_commit": "ac48ac9ebacf8e4e2c1c123b51bc98317eb9a791",
+              "source_sha256": "e69f272decd933aca6dde4c5c9a8a14d8e0c6317de24749ff84cca5ea719e825",
           },
           "timing": {
               "method": "benchmark.utils.multiple_iteration_profile_from_trace",
