@@ -413,10 +413,23 @@ def expert_parallel_gmm_rs(
         topk_indices_local,
         post_norm_weight_local,
     ):
-        hidden_global = jax.lax.all_gather(hidden_local, axis_name=expert_axis, axis=0, tiled=True)
-        topk_indices_global = jax.lax.all_gather(
-            topk_indices_local, axis_name=expert_axis, axis=0, tiled=True
-        )
+        # Keep the two upstream collectives separately identifiable in a real
+        # fused-RS trace.  These scopes are diagnostic metadata only: the
+        # collective implementation and sharding contract remain unchanged.
+        with jax.named_scope("fused_rs_hidden_all_gather"):
+            hidden_global = jax.lax.all_gather(
+                hidden_local,
+                axis_name=expert_axis,
+                axis=0,
+                tiled=True,
+            )
+        with jax.named_scope("fused_rs_topk_ids_all_gather"):
+            topk_indices_global = jax.lax.all_gather(
+                topk_indices_local,
+                axis_name=expert_axis,
+                axis=0,
+                tiled=True,
+            )
         return moe_gmm_local_rs_nodedup(
             hidden_global,
             w1_local,

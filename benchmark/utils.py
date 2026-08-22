@@ -8,6 +8,7 @@ import random
 import re
 import string
 import time
+from collections.abc import Mapping
 from typing import Any
 
 import jax
@@ -91,6 +92,85 @@ def _extract_marker_durations_ms(trace: dict[str, Any], task: str | None = None)
     return max(sorted(durations_by_pid.items()), key=lambda kv: len(kv[1]))[1]
 
 
+def _event_search_text(event: dict[str, Any]) -> str:
+    """Return the trace fields that can carry an XLA named-scope path."""
+    values = [event.get("name", "")]
+    values.extend(value for value in event.get("args", {}).values() if isinstance(value, str))
+    return "\n".join(values)
+
+
+def _extract_device_event_durations_ms(
+    trace: dict[str, Any],
+    *,
+    event_pattern: str,
+    hlo_category: str | None = None,
+) -> list[float]:
+    """Extract matching device durations with existing representative-PID semantics.
+
+    This intentionally mirrors ``_extract_marker_durations_ms``: it selects the
+    PID with the most matching device events instead of imposing a new
+    cross-device aggregation contract.  Callers should verify that the number
+    of returned events equals the requested iteration count before treating a
+    per-stage median as complete.
+    """
+    matcher = re.compile(event_pattern)
+    matched: list[dict[str, Any]] = []
+    for event in trace.get("traceEvents", []):
+        args = event.get("args", {})
+        if hlo_category is not None and args.get("hlo_category") != hlo_category:
+            continue
+        if matcher.search(_event_search_text(event)):
+            matched.append(event)
+
+    by_pid: dict[int, list[dict[str, Any]]] = {}
+    for event in matched:
+        pid = event.get("pid")
+        if isinstance(pid, int):
+            by_pid.setdefault(pid, []).append(event)
+
+    durations_by_pid: dict[int, list[float]] = {}
+    for pid, events in by_pid.items():
+        events.sort(key=lambda event: float(event.get("ts", 0.0)))
+        durations: list[float] = []
+        for event in events:
+            duration_ps = event.get("args", {}).get("device_duration_ps")
+            if duration_ps:
+                durations.append(float(duration_ps) / 1e9)
+        if durations:
+            durations_by_pid[pid] = durations
+
+    if not durations_by_pid:
+        return []
+    return max(sorted(durations_by_pid.items()), key=lambda item: len(item[1]))[1]
+
+
+def _extract_trace_measurements(
+    trace: dict[str, Any],
+    *,
+    task: str,
+    stage_scopes: Mapping[str, tuple[str, str | None]],
+) -> dict[str, Any]:
+    """Extract call, task, and named-scope samples from one real graph trace."""
+    return {
+        # Do not silently substitute the task event when the call marker is
+        # absent: the diagnostic must distinguish a missing total span from a
+        # successfully captured Pallas event.
+        "call_samples_ms": _extract_marker_durations_ms(trace),
+        "task_samples_ms": _extract_device_event_durations_ms(
+            trace,
+            event_pattern=task,
+        ),
+        "stage_samples_ms": {
+            stage_name: _extract_device_event_durations_ms(
+                trace,
+                event_pattern=scope_pattern,
+                hlo_category=hlo_category,
+            )
+            for stage_name, (scope_pattern, hlo_category) in stage_scopes.items()
+        },
+    }
+
+
 def _load_trace(trace_root: str) -> dict[str, Any]:
     trace_dir = pathlib.Path(trace_root) / "plugins" / "profile"
     if not trace_dir.exists():
@@ -146,3 +226,48 @@ def multiple_iteration_timeit_from_trace(
 
     trace = _load_trace(trace_dir)
     return _extract_marker_durations_ms(trace, task=task)
+
+
+def multiple_iteration_profile_from_trace(
+    compute_func,
+    data_generator,
+    task: str,
+    *,
+    stage_scopes: Mapping[str, tuple[str, str | None]],
+    tries: int = 5,
+    warmup: int = 0,
+    trace_root: str = "/tmp/sglang_jax_moe_trace",
+) -> dict[str, Any]:
+    """Profile one real graph and return its total, task, and stage samples.
+
+    ``stage_scopes`` maps an output name to ``(scope_regex, hlo_category)``.
+    A ``None`` HLO category matches any device event.  The function deliberately
+    preserves the existing benchmark's representative-PID behavior.
+    """
+    trace_name = f"{task}_" + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    trace_dir = os.path.join(trace_root, trace_name)
+    os.makedirs(trace_dir, exist_ok=True)
+
+    start = time.perf_counter()
+    for _ in range(max(0, int(warmup))):
+        data_args = data_generator()
+        out = compute_func(*data_args)
+        jax.block_until_ready(out)
+    print(f"warmed up in {(time.perf_counter() - start) * 1000} ms")
+
+    with jax.profiler.trace(trace_dir):
+        for i in range(tries):
+            data_args = data_generator()
+            with jax.profiler.StepTraceAnnotation(task, step_num=i):
+                with jax.named_scope(f"{MARKER}_{i}"):
+                    out = compute_func(*data_args)
+                    jax.block_until_ready(out)
+
+    trace = _load_trace(trace_dir)
+    measurements = _extract_trace_measurements(
+        trace,
+        task=task,
+        stage_scopes=stage_scopes,
+    )
+    measurements["trace_dir"] = trace_dir
+    return measurements

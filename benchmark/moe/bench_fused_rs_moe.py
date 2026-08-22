@@ -41,7 +41,10 @@ from benchmark.moe.fused_rs_tuning import (
     analyze_rs_config,
     generate_rs_tuning_configs,
 )
-from benchmark.utils import multiple_iteration_timeit_from_trace
+from benchmark.utils import (
+    multiple_iteration_profile_from_trace,
+    multiple_iteration_timeit_from_trace,
+)
 
 GLM52_NUM_EXPERTS = 256
 GLM52_TOP_K = 8
@@ -679,6 +682,32 @@ def _measure(run, inputs, *, task: str, warmup: int, iters: int, trace_root: str
     )
 
 
+def _measure_rs_breakdown(
+    run,
+    inputs,
+    *,
+    task: str,
+    warmup: int,
+    iters: int,
+    trace_root: str,
+):
+    return multiple_iteration_profile_from_trace(
+        lambda current_inputs: run(current_inputs),
+        lambda: (inputs,),
+        task=task,
+        stage_scopes={
+            "hidden_all_gather": ("fused_rs_hidden_all_gather", "all-gather"),
+            "topk_ids_all_gather": (
+                "fused_rs_topk_ids_all_gather",
+                "all-gather",
+            ),
+        },
+        tries=iters,
+        warmup=warmup,
+        trace_root=trace_root,
+    )
+
+
 def main() -> None:
     # Falcon's multi-host TPU environment supplies the coordinator metadata.
     # Calling initialize before the first backend query makes all 32 devices
@@ -704,6 +733,15 @@ def main() -> None:
         "--layer-scope",
         action="store_true",
         help="Include GLM shared expert and final P('data', None) output reshard.",
+    )
+    parser.add_argument(
+        "--profile-breakdown",
+        action="store_true",
+        help=(
+            "From the same real fused-RS trace, record the existing call span, "
+            "the Pallas task event, and the separately scoped BF16 hidden/topk-id "
+            "AllGather device durations. This does not alter collective semantics."
+        ),
     )
     parser.add_argument(
         "--rs-configs",
@@ -871,6 +909,8 @@ def main() -> None:
                     "measurement_scope": (
                         "glm52_moe_layer" if args.layer_scope else "routed_backend"
                     ),
+                    "routing_is_precomputed": True,
+                    "includes_gate_topk": False,
                     "includes_shared_expert": args.layer_scope,
                     "includes_output_reshard": args.layer_scope,
                     "process_count": jax.process_count(),
@@ -881,6 +921,23 @@ def main() -> None:
                     "top_k": GLM52_TOP_K,
                     "hidden_size": GLM52_HIDDEN_SIZE,
                     "intermediate_size": GLM52_INTERMEDIATE_SIZE,
+                    "hidden_all_gather_local_payload_bytes": (
+                        num_tokens
+                        // args.ep_size
+                        * GLM52_HIDDEN_SIZE
+                        * jnp.dtype(jnp.bfloat16).itemsize
+                    ),
+                    "hidden_all_gather_logical_output_bytes_per_device": (
+                        num_tokens
+                        * GLM52_HIDDEN_SIZE
+                        * jnp.dtype(jnp.bfloat16).itemsize
+                    ),
+                    "topk_ids_all_gather_local_payload_bytes": (
+                        num_tokens
+                        // args.ep_size
+                        * GLM52_TOP_K
+                        * jnp.dtype(jnp.int32).itemsize
+                    ),
                     "quant_mode": "per_channel",
                     "quant_block_k": GLM52_QUANT_BLOCK_K,
                     "routing_mode": "seeded_random_gaussian_topk",
@@ -1005,19 +1062,65 @@ def main() -> None:
                             )
 
                     validation_stage = "measurement"
-                    samples = _measure(
-                        rs_run,
-                        inputs,
-                        task=r"gmm_v2_fused_rs.*",
-                        warmup=args.warmup,
-                        iters=args.iters,
-                        trace_root=str(
-                            Path(args.trace_root)
-                            / str(num_tokens)
-                            / f"fused_rs_{config_label}"
-                        ),
+                    rs_trace_root = str(
+                        Path(args.trace_root)
+                        / str(num_tokens)
+                        / f"fused_rs_{config_label}"
                     )
+                    breakdown = None
+                    if args.profile_breakdown:
+                        breakdown = _measure_rs_breakdown(
+                            rs_run,
+                            inputs,
+                            task=r"gmm_v2_fused_rs.*",
+                            warmup=args.warmup,
+                            iters=args.iters,
+                            trace_root=rs_trace_root,
+                        )
+                        call_samples = breakdown["call_samples_ms"]
+                        pallas_samples = breakdown["task_samples_ms"]
+                        # Preserve the legacy output field without hiding a
+                        # missing call marker.  The explicit call/Pallas fields
+                        # below remain authoritative for the breakdown.
+                        samples = call_samples or pallas_samples
+                        legacy_sample_source = (
+                            "call_marker" if call_samples else "pallas_task_fallback"
+                        )
+                    else:
+                        samples = _measure(
+                            rs_run,
+                            inputs,
+                            task=r"gmm_v2_fused_rs.*",
+                            warmup=args.warmup,
+                            iters=args.iters,
+                            trace_root=rs_trace_root,
+                        )
+                        call_samples = None
+                        pallas_samples = None
+                        legacy_sample_source = "call_marker_or_task_fallback"
                     rs_ms = statistics.median(samples)
+                    hidden_all_gather_samples = (
+                        breakdown["stage_samples_ms"]["hidden_all_gather"]
+                        if breakdown
+                        else None
+                    )
+                    topk_ids_all_gather_samples = (
+                        breakdown["stage_samples_ms"]["topk_ids_all_gather"]
+                        if breakdown
+                        else None
+                    )
+                    breakdown_complete = (
+                        breakdown is not None
+                        and all(
+                            len(stage_samples) == args.iters
+                            for stage_samples in (
+                                call_samples,
+                                pallas_samples,
+                                hidden_all_gather_samples,
+                                topk_ids_all_gather_samples,
+                            )
+                        )
+                    )
                     effective_config = get_last_fused_rs_block_sizes()
                     row = {
                         **row_base,
@@ -1039,6 +1142,36 @@ def main() -> None:
                         "fused_rs_kernel_ms": rs_ms,
                         "fused_v2_kernel_samples_ms": v2_kernel_samples,
                         "fused_rs_kernel_samples_ms": samples,
+                        "fused_rs_legacy_kernel_field_source": legacy_sample_source,
+                        "fused_rs_call_ms": (
+                            statistics.median(call_samples) if call_samples else None
+                        ),
+                        "fused_rs_call_samples_ms": call_samples,
+                        "fused_rs_pallas_ms": (
+                            statistics.median(pallas_samples)
+                            if pallas_samples
+                            else None
+                        ),
+                        "fused_rs_pallas_samples_ms": pallas_samples,
+                        "fused_rs_hidden_all_gather_ms": (
+                            statistics.median(hidden_all_gather_samples)
+                            if hidden_all_gather_samples
+                            else None
+                        ),
+                        "fused_rs_hidden_all_gather_samples_ms": hidden_all_gather_samples,
+                        "fused_rs_topk_ids_all_gather_ms": (
+                            statistics.median(topk_ids_all_gather_samples)
+                            if topk_ids_all_gather_samples
+                            else None
+                        ),
+                        "fused_rs_topk_ids_all_gather_samples_ms": (
+                            topk_ids_all_gather_samples
+                        ),
+                        "profile_breakdown_requested": args.profile_breakdown,
+                        "profile_breakdown_complete": breakdown_complete,
+                        "profile_breakdown_trace_dir": (
+                            breakdown["trace_dir"] if breakdown else None
+                        ),
                         "fused_rs_speedup_vs_v2": (
                             v2_ms / rs_ms if v2_ms is not None else None
                         ),
