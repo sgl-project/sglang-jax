@@ -429,20 +429,16 @@ class ModelRunnerKVCacheMixin:
 
         cell_size = self._compute_cell_size()
         
-        # Accommodate Draft KV Cache Memory Footprint
+        # Accommodate Draft KV Cache Memory Footprint + Spec Headroom
         if (
             not self.is_draft_worker
             and self.spec_algorithm is not None
             and not self.spec_algorithm.is_none()
         ):
-            draft_layer_count = 1
-            if hasattr(self.server_args, "speculative_draft_model_path") and self.server_args.speculative_draft_model_path:
-                draft_layer_count = max(1, self._kv_pool_layer_count() // 5)
-            
-            target_layers = max(1, self._kv_pool_layer_count())
-            draft_cell_size = (cell_size // target_layers) * draft_layer_count
-            logger.info(f"Adding draft KV cache footprint overhead: {draft_cell_size} bytes per token")
-            cell_size += draft_cell_size
+            # Reserve 2 GB entirely for the Draft Worker's KV buffer and XLA fragmentation.
+            overhead_bytes = 2 * 1024 * 1024 * 1024
+            logger.info(f"Deducting {overhead_bytes} bytes from available KV cache for draft memory overhead")
+            available_kv_cache_bytes -= overhead_bytes
 
         max_tokens = max(1, int(available_kv_cache_bytes // cell_size))
 
