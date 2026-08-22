@@ -436,7 +436,7 @@ class ModelRunnerKVCacheMixin:
             and not self.spec_algorithm.is_none()
         ):
             # Reserve 2 GB entirely for the Draft Worker's KV buffer and XLA fragmentation.
-            overhead_bytes = 2 * 1024 * 1024 * 1024
+            overhead_bytes = 8 * 1024 * 1024 * 1024
             logger.info(f"Deducting {overhead_bytes} bytes from available KV cache for draft memory overhead")
             available_kv_cache_bytes -= overhead_bytes
 
