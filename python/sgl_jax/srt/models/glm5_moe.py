@@ -738,7 +738,7 @@ class Glm5DecoderLayer(nnx.Module):
         # layer's top-k and ship no indexer weights. Dense MLA discards indexer
         # output anyway, so just skip building the module on shared layers.
         indexer_types = getattr(config, "indexer_types", None)
-        indexer_type = "full" if indexer_types is None else indexer_types[layer_id]
+        indexer_type = "full" if (indexer_types is None or layer_id >= len(indexer_types)) else indexer_types[layer_id]
         has_indexer = indexer_type == "full"
         use_dsa_sparse = getattr(config, "use_dsa_sparse", False)
 
@@ -1387,4 +1387,145 @@ class GlmMoeDsaForCausalLM(Glm5ForCausalLM):
         mc.hf_config._sgl_use_fused_mlp = mc.quantization_config is None
 
 
-EntryClass = [Glm5ForCausalLM, GlmMoeDsaForCausalLM]
+
+class GlmMoeDsaForCausalLMNextN(nnx.Module):
+    load_lm_head_from_target = True
+
+    @classmethod
+    def patch_model_config(cls, mc: ModelConfig) -> None:
+        return GlmMoeDsaForCausalLM.patch_model_config(mc)
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        mesh: jax.sharding.Mesh | None = None,
+        dtype: jnp.dtype = jnp.bfloat16,
+    ):
+        self.config = config
+        self.mesh = mesh
+        self.dtype = dtype
+        self.mtp_layer_idx = getattr(config, "num_hidden_layers", 78)
+
+        self.embed_tokens = Embed(
+            num_embeddings=config.vocab_size,
+            features=config.hidden_size,
+            dtype=dtype,
+            kernel_axes=("tensor", None),
+            param_dtype=dtype,
+            mesh=mesh,
+        )
+        self.enorm = RMSNorm(
+            config.hidden_size, epsilon=config.rms_norm_eps, param_dtype=dtype, scope_name="enorm"
+        )
+        self.hnorm = RMSNorm(
+            config.hidden_size, epsilon=config.rms_norm_eps, param_dtype=dtype, scope_name="hnorm"
+        )
+        self.eh_proj = LinearBase(
+            input_size=2 * config.hidden_size,
+            output_size=config.hidden_size,
+            use_bias=False,
+            kernel_axes=(None, None),
+            params_dtype=dtype,
+            mesh=mesh,
+        )
+        self.mtp_block = Glm5DecoderLayer(config, layer_id=self.mtp_layer_idx, dtype=dtype, mesh=mesh)
+        self.shared_head = nnx.Module()
+        self.shared_head.norm = RMSNorm(
+            config.hidden_size, epsilon=config.rms_norm_eps, param_dtype=dtype, scope_name="norm"
+        )
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            dtype=dtype,
+            param_dtype=dtype,
+            kernel_axes=("tensor", None),
+        )
+        self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
+        self.hot_token_ids = None
+
+    def __call__(
+        self,
+        forward_batch: ForwardBatch,
+        memory_pools,
+        logits_metadata: LogitsMetadata,
+    ):
+        from sgl_jax.srt.layers.attention.dsa_sparse_backend import DSAFusedCache
+
+        embed = self.embed_tokens(forward_batch.input_ids)
+        hidden_in = forward_batch.spec_info.hidden_states
+        emb_sh = jax.typeof(embed).sharding
+        if isinstance(emb_sh, jax.sharding.NamedSharding):
+            hidden_in = jax.sharding.reshard(hidden_in, emb_sh)
+
+        concat_in = jnp.concatenate((self.enorm(embed), self.hnorm(hidden_in)), axis=-1)
+        hidden_states, _ = self.eh_proj(concat_in)
+
+        token_to_kv_pool = memory_pools.token_to_kv_pool if hasattr(memory_pools, "token_to_kv_pool") else memory_pools
+        hidden_states, residual, kv_fused, _ = self.mtp_block(
+            forward_batch.positions, hidden_states, forward_batch, token_to_kv_pool, None,
+            dispatch_info=forward_batch.expert_location_metadata,
+            dsa_topk_in=None,
+            dsa_topk_pages_in=None
+        )
+        
+        if residual is not None:
+            hidden_states = hidden_states + residual
+            
+        hidden_states = self.shared_head.norm(hidden_states)
+        output = self.logits_processor(
+            hidden_states, self.lm_head, logits_metadata, aux_hidden_states=None
+        )
+        
+        kv_cache_list = [kv_fused.kv] if isinstance(kv_fused, DSAFusedCache) else [kv_fused]
+        return output, kv_cache_list, True, None
+
+    def load_weights(self, model_config: ModelConfig):
+        self.loader = WeightLoader(model=self, model_config=model_config, mesh=self.mesh, dtype=self.dtype)
+        mappings = self._create_weight_mappings(model_config)
+        self.loader.load_weights_from_safetensors(mappings)
+
+    @classmethod
+    def _create_weight_mappings(cls, model_config: ModelConfig) -> dict[str, WeightMapping]:
+        mappings = {}
+        idx = getattr(model_config.hf_config, "num_hidden_layers", 78)
+        prefix = f"model.layers.{idx}"
+        
+        mappings[f"{prefix}.enorm.weight"] = WeightMapping(target_path="enorm.scale", sharding=(None,), transpose=False)
+        mappings[f"{prefix}.hnorm.weight"] = WeightMapping(target_path="hnorm.scale", sharding=(None,), transpose=False)
+        mappings[f"{prefix}.eh_proj.weight"] = WeightMapping(target_path="eh_proj.weight", sharding=(None, None), transpose=True)
+        mappings[f"{prefix}.shared_head.norm.weight"] = WeightMapping(target_path="shared_head.norm.scale", sharding=(None,), transpose=False)
+        
+        class MockConfig:
+            pass
+        mock_self = MockConfig()
+        mock_self.config = model_config.hf_config
+        is_static_quant = getattr(model_config, "quantization_config", None) is not None
+        
+        decoder_mappings = Glm5ForCausalLM._create_moe_layer_mappings(
+            mock_self,
+            layer_idx=idx, 
+            target_idx=idx, 
+            is_mlp_layer=False, 
+            is_static_quant=is_static_quant,
+            has_indexer=True
+        )
+        for k, v in decoder_mappings.items():    
+            if isinstance(v.target_path, str):
+                v.target_path = v.target_path.replace(f"model.layers.{idx}", "mtp_block")
+            elif isinstance(v.target_path, list):
+                v.target_path = [p.replace(f"model.layers.{idx}", "mtp_block") for p in v.target_path]
+            mappings[k] = v
+        
+        return mappings
+
+    def get_embed_and_head(self):
+        return self.embed_tokens.embedding.value, self.lm_head.embedding.value
+
+    def set_embed_and_head(self, embed: jax.Array, head: jax.Array) -> None:
+        self.embed_tokens.embedding.value = embed
+        self.lm_head.embedding.value = head
+
+    def set_embed(self, embed: jax.Array) -> None:
+        self.embed_tokens.embedding.value = embed
+
+EntryClass = [Glm5ForCausalLM, GlmMoeDsaForCausalLM, GlmMoeDsaForCausalLMNextN]
