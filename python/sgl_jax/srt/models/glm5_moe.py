@@ -1106,6 +1106,17 @@ class Glm5ForCausalLM(nnx.Module):
         kv_update = (layers_kv_fused, layers_idx_fused) if layers_idx_fused else layers_kv_fused
         return output, {"token_to_kv_pool": kv_update}, True, layers_topk_ids
 
+
+    def get_embed_and_head(self):
+        return self.embed_tokens.embedding.value, self.lm_head.embedding.value
+
+    def set_embed_and_head(self, embed, head) -> None:
+        self.embed_tokens.embedding.value = embed
+        self.lm_head.embedding.value = head
+
+    def set_embed(self, embed) -> None:
+        self.embed_tokens.embedding.value = embed
+
     def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(
             model=self,
