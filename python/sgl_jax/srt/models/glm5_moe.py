@@ -1498,6 +1498,13 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
         mappings = self._create_weight_mappings(model_config)
         self.loader.load_weights_from_safetensors(mappings)
 
+        # Apply post_load_weights logic for Draft
+        self.mtp_block.self_attn.post_load_weights()
+        if hasattr(self.mtp_block, "mlp") and hasattr(self.mtp_block.mlp, "post_load_weights"):
+            self.mtp_block.mlp.post_load_weights()
+        if hasattr(self.mtp_block, "shared_experts") and self.mtp_block.shared_experts is not None and hasattr(self.mtp_block.shared_experts, "post_load_weights"):
+            self.mtp_block.shared_experts.post_load_weights()
+
     @classmethod
     def _create_weight_mappings(cls, model_config: ModelConfig) -> dict[str, WeightMapping]:
         mappings = {}
