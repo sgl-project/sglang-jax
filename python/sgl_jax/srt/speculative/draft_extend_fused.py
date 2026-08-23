@@ -457,6 +457,7 @@ def _rotate_prefill_input_ids(input_ids, extend_seq_lens, verified_id, dp_size, 
         # We can implement a cumsum as a matrix multiplication!
         # A lower triangular matrix of ones multiplied by ext_rank gives the cumsum!
         import jax.numpy as jnp
+        import jax
         
         N = ext_rank.shape[0]
         idx = jnp.arange(N)
@@ -470,9 +471,13 @@ def _rotate_prefill_input_ids(input_ids, extend_seq_lens, verified_id, dp_size, 
         in_req = (tok[None, :] >= starts[:, None]) & (tok[None, :] < ends[:, None])
         has_req = jnp.any(in_req, axis=0)
         slot = jnp.argmax(in_req.astype(jnp.int32), axis=0)
-        req_starts = starts.at[slot].get()
-        req_lens = ext_rank.at[slot].get()
-        req_verified = verified_rank.at[slot].get()
+        
+        # Matrix multiply bypassing JAX gather layout check
+        one_hot_slot = jax.nn.one_hot(slot, N, dtype=starts.dtype)
+        req_starts = jnp.dot(one_hot_slot, starts)
+        req_lens = jnp.dot(one_hot_slot, ext_rank)
+        req_verified = jnp.dot(one_hot_slot, verified_rank)
+        
         shifted_index = jnp.minimum(tok + 1, per_dp_tokens - 1)
         shifted = ids_rank.at[shifted_index].get()
         is_last = has_req & ((tok - req_starts) == (req_lens - 1))
