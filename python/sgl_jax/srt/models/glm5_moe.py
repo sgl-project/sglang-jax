@@ -1527,7 +1527,9 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
             if isinstance(v.target_path, str):
                 v.target_path = v.target_path.replace(f"model.layers.{idx}", "mtp_block")
             elif isinstance(v.target_path, list):
-                v.target_path = [p.replace(f"model.layers.{idx}", "mtp_block") for p in v.target_path]
+                new_path = [v.target_path[0].replace(f"model.layers.{idx}", "mtp_block")]
+                new_path.extend(v.target_path[1:])
+                v.target_path = new_path
             mappings[k] = v
         
         return mappings
