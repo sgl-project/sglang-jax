@@ -501,15 +501,13 @@ def inner_kernel(
 
                     if fp8_activation_quant:
                         if cfgs.lhs_cfgs.prequantized:
-                            # The FP8 payload arrives through an irregular HBM ->
-                            # VMEM DMA gather.  Feeding that VMEM ref directly to
-                            # MXU is numerically wrong on TPU v7x even when every
-                            # row uses the same scale.  Normalize the gathered
-                            # values through registers and requantize per row;
-                            # compose the local requant scale with the wire
-                            # scale.  This keeps the communicated tensor FP8 and
-                            # avoids materializing the full gathered tensor as
-                            # BF16 in HBM.
+                            # The outer fused-RS pipeline gathers prequantized
+                            # FP8 rows into a row-zero-aligned local tile. Convert
+                            # through registers and requantize per row, composing
+                            # the local requant scale with the wire scale. This
+                            # keeps the communicated tensor FP8 and avoids
+                            # materializing the full gathered tensor as BF16 in
+                            # HBM.
                             block_lhs_for_matmul, local_lhs_scale = _online_quantize(
                                 block_lhs.astype(jnp.bfloat16),
                                 axis=1,

@@ -1180,6 +1180,24 @@ def kernel_main_fused_rs(
             _n_id=n_id,
         )
 
+    def align_prequantized_gather_meta(gather_meta):
+        if not cfgs1.lhs_cfgs.prequantized:
+            return gather_meta
+        # FP8 MXU consumption is only valid when the gathered tile starts at
+        # local sublane row zero. Keep the global group metadata unchanged for
+        # routing, but use a sublane-aligned local coordinate for gather and
+        # both GMM stages. The direct-write loop below maps row zero back to
+        # the original global rows via scatter_meta.
+        aligned_m_start = (
+            gather_meta.m_start
+            - gather_meta.m_start % dims.size_lhs_sublane
+        )
+        return dataclasses.replace(
+            gather_meta,
+            m_start=aligned_m_start,
+            m_end=aligned_m_start + gather_meta.num_rows,
+        )
+
     # Initialize per-slot DMA counts to 0.
     for _s in range(3):
         gm_id_ref[1 + _s] = jnp.int32(0)  # send counts
@@ -1321,6 +1339,16 @@ def kernel_main_fused_rs(
                 gather_divisor=_gather_divisor,
                 indices_are_tile_local=indices_in_hbm,
             )
+            current_gather_meta = align_prequantized_gather_meta(
+                current_gather_meta
+            )
+            if cfgs1.lhs_cfgs.prequantized:
+                fused_metadata_ref.gm_id_to_m_offset[0] = (
+                    current_gather_meta.m_start
+                )
+                fused_metadata_ref.gm_id_to_m_offset[1] = (
+                    current_gather_meta.m_end
+                )
 
             @jax.named_scope("dma_gather_start")
             @pl.when(gm_id == 0)
@@ -1351,6 +1379,9 @@ def kernel_main_fused_rs(
                     gather_divisor=_gather_divisor,
                     indices_are_tile_local=indices_in_hbm,
                 )
+                next_gather_meta = align_prequantized_gather_meta(
+                    next_gather_meta
+                )
                 dma_gather_gm_start(
                     hidden_states_ref,
                     gathered_lhs_2x_ref.at[1 - sem_id],
@@ -1362,7 +1393,7 @@ def kernel_main_fused_rs(
             dma_gather_gm_wait(
                 gathered_lhs_2x_ref.at[sem_id],
                 gather_sem_ref.at[sem_id],
-                scatter_meta,
+                current_gather_meta,
             )
 
             tiled_lhs_scale = None
@@ -1468,7 +1499,11 @@ def kernel_main_fused_rs(
 
             m_st = scatter_meta.m_start
             _sls = pltpu.get_tpu_info().get_sublane_tiling(out_dtype)
-            _ml = m_st % _sls
+            _ml = (
+                jnp.int32(0)
+                if cfgs1.lhs_cfgs.prequantized
+                else m_st % _sls
+            )
 
             with jax.named_scope("reshape_gmm2_output"):
                 scatter_staging_3x_ref[stg_id] = tiled_out_2x_ref[sem_id][...].reshape(
