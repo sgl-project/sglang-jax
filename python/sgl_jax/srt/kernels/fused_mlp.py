@@ -128,11 +128,11 @@ def apply_fused_mlp_sharded(
     b_inter: int = 128,
 ) -> jax.Array:
     in_specs = (
-        P(None, None),  # x
+        x.sharding.spec if hasattr(x, "sharding") else P(None, None),  # dynamically infer x sharding
         P(None, "tensor"),  # w_gu (combined gate/up weight, sharded along tensor axis)
         P("tensor", None),  # wd (down weight, sharded along tensor axis)
     )
-    out_specs = P(None, None)
+    out_specs = x.sharding.spec if hasattr(x, "sharding") else P(None, None)
 
     @functools.partial(
         shard_map,
