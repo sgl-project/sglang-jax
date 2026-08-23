@@ -342,11 +342,24 @@ def _packed_index_tile_table_kernel(
                     staging_ref[pl.ds(block_start + vector_rows, vector_rows)],
                 )
             )
-            values = jax.lax.dynamic_slice_in_dim(
-                aligned_pair,
-                row_offset,
-                vector_rows,
-            )
+            # TPU Pallas does not lower dynamic_slice on register vectors.
+            # Implement the same operation as a seven-stage barrel shift:
+            # each stage conditionally applies one static power-of-two shift.
+            # The first 128 lanes remain valid for every row_offset in [0, 127].
+            shifted_pair = aligned_pair
+            for shift in (64, 32, 16, 8, 4, 2, 1):
+                static_shift = jnp.concatenate(
+                    (
+                        shifted_pair[shift:],
+                        jnp.zeros((shift,), dtype=shifted_pair.dtype),
+                    )
+                )
+                shifted_pair = jnp.where(
+                    (row_offset & shift) != 0,
+                    static_shift,
+                    shifted_pair,
+                )
+            values = shifted_pair[:vector_rows]
             row_ids = block_start + jnp.arange(vector_rows, dtype=jnp.int32)
             out_ref[local_row, 0, pl.ds(block_start, vector_rows)] = jnp.where(
                 row_ids < num_rows,
