@@ -915,7 +915,6 @@ def _build_verify(topk: int):
             b = relay_new_seq_lens - 1
             
             if hasattr(jax.lax, "with_sharding_constraint"):
-                import jax.sharding
                 zeros = jax.lax.with_sharding_constraint(zeros, jax.sharding.PartitionSpec("data"))
                 b = jax.lax.with_sharding_constraint(b, jax.sharding.PartitionSpec("data"))
                 valid_seq_lens = jax.lax.with_sharding_constraint(valid_seq_lens, jax.sharding.PartitionSpec("data"))
