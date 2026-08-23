@@ -312,7 +312,7 @@ def _packed_index_tile_table_kernel(
 ):
     """Materialize one routing-table row without an irregular HBM gather."""
     first_gm_id = pl.program_id(0) * rows_per_program
-    row_ids = jnp.arange(tile_m, dtype=jnp.int32)
+    vector_rows = 128
     for local_row in range(rows_per_program):
         gm_id = first_gm_id + local_row
         tile_start = tile_starts_ref[gm_id]
@@ -328,14 +328,31 @@ def _packed_index_tile_table_kernel(
         copy.wait()
 
         num_rows = num_rows_ref[gm_id]
-        values = staging_ref[pl.ds(row_offset, tile_m)]
         last_row = row_offset + jnp.maximum(num_rows - 1, 0)
         last_value = staging_ref[last_row]
-        out_ref[local_row, 0, :] = jnp.where(
-            row_ids < num_rows,
-            values,
-            last_value,
-        )
+        for block_id in range(tile_m // vector_rows):
+            block_start = block_id * vector_rows
+            # Mosaic vector loads must start on a statically provable 128-row
+            # boundary.  Load two aligned VMEM blocks into registers, then do
+            # the irregular row_offset shift there instead of issuing an
+            # unaligned VMEM vector load.
+            aligned_pair = jnp.concatenate(
+                (
+                    staging_ref[pl.ds(block_start, vector_rows)],
+                    staging_ref[pl.ds(block_start + vector_rows, vector_rows)],
+                )
+            )
+            values = jax.lax.dynamic_slice_in_dim(
+                aligned_pair,
+                row_offset,
+                vector_rows,
+            )
+            row_ids = block_start + jnp.arange(vector_rows, dtype=jnp.int32)
+            out_ref[local_row, 0, pl.ds(block_start, vector_rows)] = jnp.where(
+                row_ids < num_rows,
+                values,
+                last_value,
+            )
 
 
 def _build_packed_index_tile_table_pallas(
