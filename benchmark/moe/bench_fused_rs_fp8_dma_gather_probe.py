@@ -51,7 +51,11 @@ def _dma_gather_probe_kernel(
     *,
     m_start: int,
 ):
-    is_valid = jnp.arange(_TILE_M, dtype=jnp.int32) < _NUM_ROWS
+    # Match production GatherMetadata exactly: Mosaic cannot lower a bool
+    # vector element to the scalar DMA length expected by pl.ds.
+    is_valid = (
+        jnp.arange(_TILE_M, dtype=jnp.int32) < _NUM_ROWS
+    ).astype(jnp.int32)
     metadata = GatherMetadata(
         m_start=jnp.int32(m_start),
         m_end=jnp.int32(m_start + _NUM_ROWS),
