@@ -479,7 +479,8 @@ def _rotate_prefill_input_ids(input_ids, extend_seq_lens, verified_id, dp_size, 
         req_verified = jnp.dot(one_hot_slot, verified_rank)
         
         shifted_index = jnp.minimum(tok + 1, per_dp_tokens - 1)
-        shifted = ids_rank.at[shifted_index].get()
+        one_hot_shifted = jax.nn.one_hot(shifted_index, per_dp_tokens, dtype=starts.dtype)
+        shifted = jnp.dot(one_hot_shifted, ids_rank)
         is_last = has_req & ((tok - req_starts) == (req_lens - 1))
         rotated = jnp.where(is_last, req_verified, shifted)
         return jnp.where(has_req, rotated, ids_rank)
