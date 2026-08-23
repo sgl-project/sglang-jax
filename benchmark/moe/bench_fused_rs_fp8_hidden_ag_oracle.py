@@ -65,7 +65,14 @@ def _padded_inputs(reference_inputs, *, ep_size: int, active_per_device: int):
     return (*reference_inputs[:-2], topk_weights, topk_ids), valid_mask
 
 
-def _run_kernel(mesh, kernel_inputs, *, topk_weights, topk_ids):
+def _run_kernel(
+    mesh,
+    kernel_inputs,
+    *,
+    topk_weights,
+    topk_ids,
+    direct_prequantized: bool,
+):
     tokens, w1, w3, w2, s1, s3, s2, _, _ = kernel_inputs
     return fused_moe_func_rs(
         hidden_states=tokens,
@@ -86,6 +93,7 @@ def _run_kernel(mesh, kernel_inputs, *, topk_weights, topk_ids):
         topk_weights=topk_weights,
         topk_indices=topk_ids,
         fp8_hidden_all_gather=True,
+        _fp8_hidden_direct_prequantized=direct_prequantized,
     )
 
 
@@ -191,6 +199,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--jsonl", type=Path, required=True)
     parser.add_argument("--kernel-rel-l2-threshold", type=float, default=0.01)
+    parser.add_argument("--direct-prequantized", action="store_true")
     args = parser.parse_args()
     args.jsonl.parent.mkdir(parents=True, exist_ok=True)
     args.jsonl.write_text("", encoding="utf-8")
@@ -262,12 +271,14 @@ def main() -> None:
                 kernel_inputs,
                 topk_weights=kernel_inputs[-2],
                 topk_ids=kernel_inputs[-1],
+                direct_prequantized=args.direct_prequantized,
             )
             padded_actual = _run_kernel(
                 mesh,
                 kernel_inputs,
                 topk_weights=padded_weights,
                 topk_ids=padded_ids,
+                direct_prequantized=args.direct_prequantized,
             )
             jax.block_until_ready(
                 (
@@ -321,6 +332,7 @@ def main() -> None:
                 "num_tokens": num_tokens,
                 "active_tokens_per_device": active_per_device,
                 "distinct_shard_scales": distinct_shard_scales,
+                "direct_prequantized": args.direct_prequantized,
                 "rs_block_config": list(config),
                 "kernel_rel_l2_threshold": args.kernel_rel_l2_threshold,
                 "collective": _collective_diagnostics(mesh, kernel_inputs),

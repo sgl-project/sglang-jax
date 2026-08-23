@@ -402,6 +402,7 @@ def expert_parallel_gmm_rs(
     w2_global_scale: jax.Array | None = None,
     fp8_post_gather: bool = False,
     fp8_hidden_all_gather: bool = False,
+    _fp8_hidden_direct_prequantized: bool = False,
 ) -> jax.Array:
     """Run fused-RS with sglang-jax's token-sharded model mesh.
 
@@ -412,6 +413,10 @@ def expert_parallel_gmm_rs(
     kernel's direct writes form the matching reduce-scatter on exit.
     """
     del fp8_post_gather
+    if _fp8_hidden_direct_prequantized and not fp8_hidden_all_gather:
+        raise ValueError(
+            "direct prequantized FP8 consumer requires FP8 Hidden AllGather"
+        )
     if fp8_hidden_all_gather:
         if (
             w1_scale is None
@@ -494,21 +499,28 @@ def expert_parallel_gmm_rs(
                     axis=0,
                     tiled=True,
                 )
-            with jax.named_scope("fused_rs_hidden_dequantize"):
-                # Target-TPU explicit oracles prove the collective payload and
-                # scales are exact, but the direct prequantized Pallas input is
-                # not: even a uniform rank scale remains wrong.  Materialize
-                # BF16 locally after the FP8 collective, then reuse the mature
-                # per-row W8A8 GMM1 path.  This preserves the 2x ICI payload
-                # reduction while keeping the broken direct-FP8 path out of the
-                # production opt-in until its VMEM/MXU layout is independently
-                # fixed.
-                hidden_global = _dequantize_hidden_per_rank(
-                    hidden_global,
-                    hidden_scale_by_rank,
-                    rows_per_rank=hidden_global.shape[0] // ep_size,
-                    out_dtype=hidden_local.dtype,
-                )
+            if _fp8_hidden_direct_prequantized:
+                with jax.named_scope("fused_rs_hidden_scale_expand"):
+                    hidden_scale_global = jnp.repeat(
+                        hidden_scale_by_rank,
+                        hidden_global.shape[0] // ep_size,
+                    )
+            else:
+                with jax.named_scope("fused_rs_hidden_dequantize"):
+                    # Target-TPU explicit oracles prove the collective payload
+                    # and scales are exact, but the direct prequantized Pallas
+                    # input is not: even a uniform rank scale remains wrong.
+                    # Materialize BF16 locally after the FP8 collective, then
+                    # reuse the mature per-row W8A8 GMM1 path.  This preserves
+                    # the 2x ICI payload reduction while keeping the broken
+                    # direct-FP8 path out of the production opt-in until its
+                    # VMEM/MXU layout is independently fixed.
+                    hidden_global = _dequantize_hidden_per_rank(
+                        hidden_global,
+                        hidden_scale_by_rank,
+                        rows_per_rank=hidden_global.shape[0] // ep_size,
+                        out_dtype=hidden_local.dtype,
+                    )
         else:
             with jax.named_scope("fused_rs_hidden_all_gather"):
                 hidden_global = jax.lax.all_gather(
@@ -612,6 +624,7 @@ def _fused_moe_func_rs_impl(
     topk_indices: jax.Array | None = None,
     fp8_post_gather: bool = False,
     fp8_hidden_all_gather: bool = False,
+    _fp8_hidden_direct_prequantized: bool = False,
     w3: jax.Array | None = None,
     w3_scale: jax.Array | None = None,
 ) -> jax.Array:
@@ -664,6 +677,7 @@ def _fused_moe_func_rs_impl(
         post_expert_norm_weight=post_expert_norm_weight,
         fp8_post_gather=fp8_post_gather,
         fp8_hidden_all_gather=fp8_hidden_all_gather,
+        _fp8_hidden_direct_prequantized=_fp8_hidden_direct_prequantized,
     )
 
     return result[:num_tokens, :hidden_size]
@@ -677,6 +691,7 @@ _FUSED_MOE_RS_STATIC_ARGNAMES = (
     "scoring_fn",
     "fp8_post_gather",
     "fp8_hidden_all_gather",
+    "_fp8_hidden_direct_prequantized",
 )
 
 fused_moe_func_rs = jax.jit(
