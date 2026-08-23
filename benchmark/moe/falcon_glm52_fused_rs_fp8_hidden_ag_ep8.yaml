@@ -1,4 +1,4 @@
-name: operator-profile-glm52-fused-rs-fp8-hidden-ag-ep8-r2-20260824
+name: operator-profile-glm52-fused-rs-fp8-hidden-ag-ep8-r3-20260824
 exp_type: PROFILING
 artifact_type: operator-profile
 cluster_name: tpu-training-antgroup
@@ -32,8 +32,8 @@ role_to_task_spec:
       XLA_DUMP_FLAGS="--xla_dump_to=$OUT/compiler/hlo --xla_dump_hlo_as_text"
       export XLA_FLAGS="${XLA_FLAGS:+$XLA_FLAGS }$XLA_DUMP_FLAGS"
 
-      source_tar=/tmp/glm52-fused-rs-fp8-hidden-ag-ep8-r2.tar.gz.part
-      source_ready=/tmp/glm52-fused-rs-fp8-hidden-ag-ep8-r2.ready
+      source_tar=/tmp/glm52-fused-rs-fp8-hidden-ag-ep8-r3.tar.gz.part
+      source_ready=/tmp/glm52-fused-rs-fp8-hidden-ag-ep8-r3.ready
       attempt=0
       while [ ! -f "$source_ready" ]; do
         attempt=$((attempt + 1))
@@ -44,7 +44,7 @@ role_to_task_spec:
         sleep 5
       done
       test -f "$source_tar"
-      echo '25e40093db57bdd1fd23457dc0da942236a5511818b7a8d6bfbf9f23593a48e9  /tmp/glm52-fused-rs-fp8-hidden-ag-ep8-r2.tar.gz.part' | sha256sum -c -
+      echo '57ccb809a220f15ecb140e8e780e10a8e6425c43fc2dcdc4d60c1aebf8c213ac  /tmp/glm52-fused-rs-fp8-hidden-ag-ep8-r3.tar.gz.part' | sha256sum -c -
 
       mkdir -p /workspace/sglang-jax
       tar -xzf "$source_tar" -C /workspace/sglang-jax
@@ -89,8 +89,8 @@ role_to_task_spec:
           },
           "source": {
               "branch": "dev/glm52-rs-bf16-allgather",
-              "source_commit": "75e855d6d9ad3c38b186fbbcee07fcf662c3b6dc",
-              "source_sha256": "25e40093db57bdd1fd23457dc0da942236a5511818b7a8d6bfbf9f23593a48e9",
+              "source_commit": "a1df4b04881b11350496637b072dd675a13a2697",
+              "source_sha256": "57ccb809a220f15ecb140e8e780e10a8e6425c43fc2dcdc4d60c1aebf8c213ac",
           },
           "correctness": {
               "reference_variant": "bf16-hidden-ag",
