@@ -1,4 +1,4 @@
-name: operator-profile-glm52-fused-rs-fp8-hidden-ag-ep8-r3-20260824
+name: operator-profile-glm52-fused-rs-fp8-hidden-ag-ep8-r4-dequant-20260824
 exp_type: PROFILING
 artifact_type: operator-profile
 cluster_name: tpu-training-antgroup
@@ -32,8 +32,8 @@ role_to_task_spec:
       XLA_DUMP_FLAGS="--xla_dump_to=$OUT/compiler/hlo --xla_dump_hlo_as_text"
       export XLA_FLAGS="${XLA_FLAGS:+$XLA_FLAGS }$XLA_DUMP_FLAGS"
 
-      source_tar=/tmp/glm52-fused-rs-fp8-hidden-ag-ep8-r3.tar.gz.part
-      source_ready=/tmp/glm52-fused-rs-fp8-hidden-ag-ep8-r3.ready
+      source_tar=/tmp/glm52-fused-rs-fp8-hidden-ag-ep8-r4.tar.gz.part
+      source_ready=/tmp/glm52-fused-rs-fp8-hidden-ag-ep8-r4.ready
       attempt=0
       while [ ! -f "$source_ready" ]; do
         attempt=$((attempt + 1))
@@ -44,7 +44,7 @@ role_to_task_spec:
         sleep 5
       done
       test -f "$source_tar"
-      echo '57ccb809a220f15ecb140e8e780e10a8e6425c43fc2dcdc4d60c1aebf8c213ac  /tmp/glm52-fused-rs-fp8-hidden-ag-ep8-r3.tar.gz.part' | sha256sum -c -
+      echo '38f5e52369222fc5c1abafd7fafb2f382b55f88b6fa42b692dedc127d54c4252  /tmp/glm52-fused-rs-fp8-hidden-ag-ep8-r4.tar.gz.part' | sha256sum -c -
 
       mkdir -p /workspace/sglang-jax
       tar -xzf "$source_tar" -C /workspace/sglang-jax
@@ -84,13 +84,14 @@ role_to_task_spec:
               "compute_dtype": "bf16",
               "wire_dtypes": ["bf16", "fp8_e4m3fn"],
               "activation_scale": "one_fp32_per_ep_rank_physical_hidden_shard",
+              "fp8_consumer": "local_bf16_materialization_then_per_row_w8a8",
               "rs_config": [256, 6144, 1024, 2048, 1024, 2, 2],
               "variants": ["bf16-hidden-ag", "fp8-per-tensor-hidden-ag"],
           },
           "source": {
               "branch": "dev/glm52-rs-bf16-allgather",
-              "source_commit": "a1df4b04881b11350496637b072dd675a13a2697",
-              "source_sha256": "57ccb809a220f15ecb140e8e780e10a8e6425c43fc2dcdc4d60c1aebf8c213ac",
+              "source_commit": "56e0b7f4069529fca4aa172ed42813652ccb0fdd",
+              "source_sha256": "38f5e52369222fc5c1abafd7fafb2f382b55f88b6fa42b692dedc127d54c4252",
           },
           "correctness": {
               "reference_variant": "bf16-hidden-ag",
