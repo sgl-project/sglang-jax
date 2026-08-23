@@ -1,10 +1,10 @@
-name: glm52-fused-rs-fp8-gather-mxu-probe-r3-20260824
+name: glm52-fused-rs-fp8-gather-mxu-probe-r4-20260824
 exp_type: TRAINING
 artifact_type: GCS
 cluster_name: tpu-training-antgroup
 priority: 0
 tags: [correctness, fused-moe, fused-rs, glm52, fp8-hidden-ag, mxu-probe]
-config: '{"device_type":"v7x","physical_chips":4,"visible_devices":8,"probe":"gathered_scratch_unscaled_mxu","source_commit":"08b0a989d756f01994402db88ca093ffe0b4ba29","source_sha256":"7b403b99fdf44ac8cc38a905569cb87d22de83a1f83d0bfc04b18cfbad5f2ccf"}'
+config: '{"device_type":"v7x","physical_chips":4,"visible_devices":8,"probe":"gathered_scratch_unscaled_mxu_row_realign","source_commit":"3f3d746e0dfa9c9a5adcb903a79fbd3ea301f773","source_sha256":"beb6a2208b6ec0064c720ecd59041c5a5d6964bd7119094e7392871811c10fb4"}'
 role_to_task_spec:
   worker:
     replica: 1
@@ -26,8 +26,8 @@ role_to_task_spec:
       export JAX_COMPILATION_CACHE_DIR=/tmp/tpu_logs/jax-cache
       mkdir -p "$TMPDIR" "$PIP_CACHE_DIR" "$UV_CACHE_DIR" "$JAX_COMPILATION_CACHE_DIR"
 
-      source_tar=/tmp/glm52-fused-rs-fp8-gather-mxu-probe-r3.tar.gz.part
-      source_ready=/tmp/glm52-fused-rs-fp8-gather-mxu-probe-r3.ready
+      source_tar=/tmp/glm52-fused-rs-fp8-gather-mxu-probe-r4.tar.gz.part
+      source_ready=/tmp/glm52-fused-rs-fp8-gather-mxu-probe-r4.ready
       attempt=0
       while [ ! -f "$source_ready" ]; do
         attempt=$((attempt + 1))
@@ -38,7 +38,7 @@ role_to_task_spec:
         sleep 5
       done
       test -f "$source_tar"
-      echo '7b403b99fdf44ac8cc38a905569cb87d22de83a1f83d0bfc04b18cfbad5f2ccf  /tmp/glm52-fused-rs-fp8-gather-mxu-probe-r3.tar.gz.part' | sha256sum -c -
+      echo 'beb6a2208b6ec0064c720ecd59041c5a5d6964bd7119094e7392871811c10fb4  /tmp/glm52-fused-rs-fp8-gather-mxu-probe-r4.tar.gz.part' | sha256sum -c -
 
       mkdir -p /workspace/sglang-jax
       tar -xzf "$source_tar" -C /workspace/sglang-jax
@@ -49,4 +49,4 @@ role_to_task_spec:
       python3 -m benchmark.moe.bench_fused_rs_fp8_gather_mxu_probe \
         --jsonl "$OUT/benchmark/metrics.jsonl"
 
-      test "$(wc -l < "$OUT/benchmark/metrics.jsonl")" -eq 5
+      test "$(wc -l < "$OUT/benchmark/metrics.jsonl")" -eq 4
