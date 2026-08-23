@@ -73,10 +73,10 @@ def _gather_mxu_kernel(
     dma_gather_gm_wait(gathered_ref, gather_sem_ref, metadata)
     rhs_copy.wait()
 
-    # Match the fused-RS consumer exactly: retain the size_lhs_sublane axis
-    # while collapsing the physical K tiles.  Reshaping directly to
-    # [tile_m, K] changes the minormost VMEM tiling and Mosaic rejects it.
-    lhs = gathered_ref.reshape(-1, _TILE_M, _K)[...]
+    # Match the fused-RS consumer exactly: load the VMEM ref before
+    # reshaping the register array and retain the size_lhs_sublane axis.
+    # Reshaping the ref itself emits an unsupported tpu.memref_reshape.
+    lhs = gathered_ref[...].reshape(-1, _TILE_M, _K)
     rhs = rhs_scratch_ref[...]
     acc_scratch_ref[...] = jnp.matmul(
         lhs,
