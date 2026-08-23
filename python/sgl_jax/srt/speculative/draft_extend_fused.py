@@ -746,7 +746,7 @@ def _make_target_verify_metadata(
         dp_size=dp_size,
     )
     swa_page_indices = None
-    if old_metadata.swa_page_indices is not None:
+    if getattr(old_metadata, 'swa_page_indices', None) is not None:
         swa_page_indices = _repack_page_indices(
             old_metadata.swa_page_indices,
             allocated_lens,
@@ -772,15 +772,18 @@ def _make_target_verify_metadata(
         if swa_page_indices is not None:
             swa_page_indices = jax.sharding.reshard(swa_page_indices, data_sharding)
 
-    return FlashAttentionMetadata(
-        cu_q_lens=cu_q_lens,
-        cu_kv_lens=cu_kv_lens,
-        page_indices=page_indices,
-        swa_page_indices=swa_page_indices,
-        seq_lens=metadata_seq_lens,
-        distribution=distribution,
-        custom_mask=old_metadata.custom_mask,
-    )
+    kwargs = {
+        "cu_q_lens": cu_q_lens,
+        "cu_kv_lens": cu_kv_lens,
+        "page_indices": page_indices,
+        "seq_lens": metadata_seq_lens,
+        "distribution": distribution,
+    }
+    if hasattr(old_metadata, "swa_page_indices"):
+        kwargs["swa_page_indices"] = swa_page_indices
+    if hasattr(old_metadata, "custom_mask"):
+        kwargs["custom_mask"] = old_metadata.custom_mask
+    return type(old_metadata)(**kwargs)
 
 
 def _make_draft_extend_metadata(
@@ -810,7 +813,7 @@ def _make_draft_extend_metadata(
         dp_size=dp_size,
     )
     swa_page_indices = None
-    if old_metadata.swa_page_indices is not None:
+    if getattr(old_metadata, 'swa_page_indices', None) is not None:
         swa_page_indices = _repack_page_indices(
             old_metadata.swa_page_indices,
             allocated_lens,
@@ -826,15 +829,18 @@ def _make_draft_extend_metadata(
         axis=1,
     ).reshape((dp_size * 3,))
 
-    return FlashAttentionMetadata(
-        cu_q_lens=cu_q_lens,
-        cu_kv_lens=cu_kv_lens,
-        page_indices=page_indices,
-        swa_page_indices=swa_page_indices,
-        seq_lens=draft_seq_lens,
-        distribution=distribution,
-        custom_mask=old_metadata.custom_mask,
-    )
+    kwargs = {
+        "cu_q_lens": cu_q_lens,
+        "cu_kv_lens": cu_kv_lens,
+        "page_indices": page_indices,
+        "seq_lens": draft_seq_lens,
+        "distribution": distribution,
+    }
+    if hasattr(old_metadata, "swa_page_indices"):
+        kwargs["swa_page_indices"] = swa_page_indices
+    if hasattr(old_metadata, "custom_mask"):
+        kwargs["custom_mask"] = old_metadata.custom_mask
+    return type(old_metadata)(**kwargs)
 
 
 def _build_verify(topk: int):
