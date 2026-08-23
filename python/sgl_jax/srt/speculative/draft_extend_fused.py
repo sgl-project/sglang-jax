@@ -910,10 +910,13 @@ def _build_verify(topk: int):
                 dp_size=dp_size,
             )
             valid_seq_lens = target_forward_batch.seq_lens > 0
+            zeros = target_forward_batch.seq_lens * 0
+            b = relay_new_seq_lens - 1
+            
             target_forward_batch.seq_lens = jnp.where(
                 valid_seq_lens,
-                relay_new_seq_lens - 1,
-                jnp.zeros_like(target_forward_batch.seq_lens),
+                b,
+                zeros,
             )
             target_forward_batch.attn_backend.forward_metadata = _make_target_verify_metadata(
                 target_forward_batch.attn_backend.forward_metadata,
