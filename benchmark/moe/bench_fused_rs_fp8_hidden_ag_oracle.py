@@ -13,7 +13,9 @@ effects out of the first diagnosis.  Production M256 remains a separate A/B.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
+import sys
 from pathlib import Path
 
 import jax
@@ -24,16 +26,11 @@ from sgl_jax.srt.kernels.fused_moe.fused_rs import fused_moe_func_rs
 from sgl_jax.srt.kernels.fused_moe.fused_rs.gmm_fused_rs_nodedup import (
     set_fused_rs_block_sizes_override,
 )
-from sgl_jax.test.kernels.fused_moe_rs_test import (
-    FP8,
-    _TOP_K,
-    _explicit_reference,
-    _make_inputs,
-    _relative_l2,
-)
 from sgl_jax.test.test_utils import create_device_mesh
 
 
+FP8 = jnp.float8_e4m3fn
+_TOP_K = 8
 _CASES = (
     ("m128_full_resident", (128, 512, 512, 512, 512, 1, 1), 48, 3),
     ("m256_full_resident", (256, 512, 512, 512, 512, 1, 1), 72, 5),
@@ -43,8 +40,9 @@ _CASES = (
 
 def _comparison(expected: np.ndarray, actual: np.ndarray) -> dict[str, float]:
     delta = actual.astype(np.float64) - expected.astype(np.float64)
+    denominator = max(np.linalg.norm(expected.astype(np.float64)), 1e-12)
     return {
-        "rel_l2": _relative_l2(actual, expected),
+        "rel_l2": float(np.linalg.norm(delta) / denominator),
         "max_abs": float(np.max(np.abs(delta))),
         "expected_l2": float(np.linalg.norm(expected.astype(np.float64))),
     }
@@ -107,9 +105,15 @@ def _quantization_diagnostics(tokens: jax.Array, *, ep_size: int) -> dict:
     }
 
 
-def _reference(reference_inputs, token_sharding, *, fp8_hidden_all_gather: bool):
+def _reference(
+    reference_inputs,
+    token_sharding,
+    explicit_reference,
+    *,
+    fp8_hidden_all_gather: bool,
+):
     return jax.jit(
-        _explicit_reference,
+        explicit_reference,
         static_argnames=("quantized", "fp8_hidden_all_gather", "ep_size"),
         out_shardings=token_sharding,
     )(
@@ -128,10 +132,19 @@ def main() -> None:
     args.jsonl.parent.mkdir(parents=True, exist_ok=True)
     args.jsonl.write_text("", encoding="utf-8")
 
+    # The unit-test module registers absl/JAX flags at import time.  Keep this
+    # benchmark's argparse flags out of that private helper import.
+    original_argv = sys.argv
+    try:
+        sys.argv = [sys.argv[0]]
+        oracle = importlib.import_module("sgl_jax.test.kernels.fused_moe_rs_test")
+    finally:
+        sys.argv = original_argv
+
     mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
     with jax.set_mesh(mesh):
         for name, config, num_tokens, active_per_device in _CASES:
-            reference_inputs, kernel_inputs, token_sharding = _make_inputs(
+            reference_inputs, kernel_inputs, token_sharding = oracle._make_inputs(
                 mesh,
                 quantized=True,
                 num_tokens=num_tokens,
@@ -150,19 +163,27 @@ def main() -> None:
             )
 
             per_row_reference = _reference(
-                reference_inputs, token_sharding, fp8_hidden_all_gather=False
+                reference_inputs,
+                token_sharding,
+                oracle._explicit_reference,
+                fp8_hidden_all_gather=False,
             )
             fp8_reference = _reference(
-                reference_inputs, token_sharding, fp8_hidden_all_gather=True
+                reference_inputs,
+                token_sharding,
+                oracle._explicit_reference,
+                fp8_hidden_all_gather=True,
             )
             padded_per_row_reference = _reference(
                 padded_reference_inputs,
                 token_sharding,
+                oracle._explicit_reference,
                 fp8_hidden_all_gather=False,
             )
             padded_fp8_reference = _reference(
                 padded_reference_inputs,
                 token_sharding,
+                oracle._explicit_reference,
                 fp8_hidden_all_gather=True,
             )
 
