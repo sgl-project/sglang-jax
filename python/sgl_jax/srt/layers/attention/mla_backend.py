@@ -423,7 +423,15 @@ class MLAAttentionBackend(AttentionBackend):
         
         seq_lens_2d = batch.seq_lens.reshape(batch.dp_size, per_dp_bs)
         metadata.seq_lens = seq_lens_2d.ravel()
-        metadata.distribution = self.forward_metadata.distribution
+        
+        local_num_seqs = np.sum(seq_lens_2d > 0, axis=1, dtype=np.int32)
+        if batch.forward_mode == ForwardMode.DECODE:
+            distribution = np.repeat(local_num_seqs, 3)
+        else:
+            distribution = np.column_stack(
+                [np.zeros_like(local_num_seqs), np.zeros_like(local_num_seqs), local_num_seqs]
+            ).ravel()
+        metadata.distribution = distribution
         
         from sgl_jax.srt.utils.jax_utils import device_array
         from jax.sharding import NamedSharding, PartitionSpec as P
@@ -433,8 +441,9 @@ class MLAAttentionBackend(AttentionBackend):
             metadata.cu_kv_lens,
             metadata.page_indices,
             metadata.seq_lens,
+            metadata.distribution,
         ) = device_array(
-            (metadata.cu_q_lens, metadata.cu_kv_lens, metadata.page_indices, metadata.seq_lens),
+            (metadata.cu_q_lens, metadata.cu_kv_lens, metadata.page_indices, metadata.seq_lens, metadata.distribution),
             sharding=(NamedSharding(self.mesh, P(self.attention_data_partition_axis))),
         )
         
