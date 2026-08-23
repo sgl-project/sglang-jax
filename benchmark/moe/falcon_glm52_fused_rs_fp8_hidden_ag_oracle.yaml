@@ -4,14 +4,14 @@ artifact_type: GCS
 cluster_name: tpu-training-antgroup
 priority: 0
 tags: [correctness, fused-moe, fused-rs, glm52, fp8-hidden-ag, oracle]
-config: '{"device_type":"v7x","visible_devices":8,"ep_size":8,"cases":["m128_full_resident","m256_full_resident","m384_full_resident"],"source_commit":"f9068e2ab4535792b3f6901646efe59f7b90ac46","source_sha256":"44ed9ebcd9a30e1595311cd73663845238fd56f3adafee095f0de63a5892349a"}'
+config: '{"device_type":"v7x","physical_chips":4,"visible_devices":8,"ep_size":8,"cases":["m128_full_resident","m256_full_resident","m384_full_resident"],"source_commit":"f9068e2ab4535792b3f6901646efe59f7b90ac46","source_sha256":"44ed9ebcd9a30e1595311cd73663845238fd56f3adafee095f0de63a5892349a"}'
 role_to_task_spec:
   worker:
     replica: 1
     image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
     device_count: 8
     device_type: v7x
-    device_topo: 2x2x2
+    device_topo: 2x2x1
     command: |
       set -eu
       ulimit -c 0
