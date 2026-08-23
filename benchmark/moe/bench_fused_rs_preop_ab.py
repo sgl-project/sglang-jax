@@ -54,9 +54,9 @@ def main() -> None:
     parser.add_argument("--correctness-rel-l2-threshold", type=float, default=1e-6)
     args = parser.parse_args()
 
-    if args.ep_size != 32 or len(jax.devices()) != 32:
+    if args.ep_size not in (16, 32) or len(jax.devices()) != args.ep_size:
         raise ValueError(
-            "This A/B requires exactly EP32 on 32 visible devices; "
+            "This A/B requires EP16 or EP32 with one visible device per EP rank; "
             f"got ep_size={args.ep_size}, devices={len(jax.devices())}"
         )
     if args.tokens != 65536:
