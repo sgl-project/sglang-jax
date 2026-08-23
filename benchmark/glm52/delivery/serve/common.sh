@@ -162,4 +162,7 @@ LAUNCH_ARGS=(
 if [[ -n "$QUANT_CONFIG" ]]; then
   LAUNCH_ARGS+=(--quantization-config-path "$QUANT_CONFIG")
 fi
+if [[ "${GLM52_FUSED_RS_FP8_HIDDEN_ALL_GATHER:-0}" == "1" ]]; then
+  LAUNCH_ARGS+=(--fused-rs-fp8-hidden-all-gather)
+fi
 exec python3 "${LAUNCH_ARGS[@]}" "$@"
