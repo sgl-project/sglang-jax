@@ -328,8 +328,9 @@ def _packed_index_tile_table_kernel(
         copy.wait()
 
         num_rows = num_rows_ref[gm_id]
-        last_row = row_offset + jnp.maximum(num_rows - 1, 0)
-        last_value = staging_ref[last_row]
+        last_row_id = jnp.maximum(num_rows - 1, 0)
+        block_values = []
+        last_value = jnp.asarray(0, dtype=jnp.int32)
         for block_id in range(tile_m // vector_rows):
             block_start = block_id * vector_rows
             # Mosaic vector loads must start on a statically provable 128-row
@@ -361,6 +362,16 @@ def _packed_index_tile_table_kernel(
                 )
             values = shifted_pair[:vector_rows]
             row_ids = block_start + jnp.arange(vector_rows, dtype=jnp.int32)
+            # Select the final valid row with a vector reduction.  Reading the
+            # scalar directly from staging_ref[last_row] would still generate
+            # an unaligned dynamic VMEM load on TPU.
+            last_value += jnp.sum(
+                jnp.where(row_ids == last_row_id, values, 0),
+                dtype=jnp.int32,
+            )
+            block_values.append((block_start, row_ids, values))
+
+        for block_start, row_ids, values in block_values:
             out_ref[local_row, 0, pl.ds(block_start, vector_rows)] = jnp.where(
                 row_ids < num_rows,
                 values,
