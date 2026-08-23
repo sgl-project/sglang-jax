@@ -259,15 +259,38 @@ class MoERSKernelTest(jtu.JaxTestCase):
         self.assertEqual(quantized.dtype, FP8)
         self.assertEqual(scale.shape, ())
         self.assertAlmostEqual(scale_host, 8.0 / float(jnp.finfo(FP8).max))
-        self.assertAllClose(quantized_host[2], np.zeros((4,), np.float32))
-
         dequantized = quantized.astype(jnp.float32) * scale
-        expected = jnp.where(
-            jnp.any(topk_ids >= 0, axis=-1, keepdims=True),
+        self.assertAllClose(
+            dequantized,
             hidden.astype(jnp.float32),
-            0.0,
+            atol=scale_host,
+            rtol=0.05,
         )
-        self.assertAllClose(dequantized, expected, atol=scale_host, rtol=0.0)
+
+    def test_fp8_hidden_quantization_is_invariant_to_routing_padding(self):
+        hidden = jnp.asarray(
+            [
+                [1.0, -2.0, 0.5, -0.25],
+                [4.0, -1.0, 2.0, -3.0],
+                [8.0, -8.0, 4.0, -4.0],
+            ],
+            dtype=jnp.bfloat16,
+        )
+        all_active_ids = jnp.asarray(
+            [[0, 1], [1, 0], [0, 1]],
+            dtype=jnp.int32,
+        )
+        padded_ids = all_active_ids.at[2].set(-1)
+
+        all_active_payload, all_active_scale = _quantize_hidden_per_tensor(
+            hidden, all_active_ids
+        )
+        padded_payload, padded_scale = _quantize_hidden_per_tensor(
+            hidden, padded_ids
+        )
+
+        self.assertAllClose(padded_scale, all_active_scale, atol=0.0, rtol=0.0)
+        self.assertArraysEqual(padded_payload, all_active_payload)
 
     def _test_config(
         self,

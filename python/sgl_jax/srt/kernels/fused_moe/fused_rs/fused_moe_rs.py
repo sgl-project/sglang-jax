@@ -131,19 +131,18 @@ def _quantize_hidden_per_tensor(
 ) -> tuple[jax.Array, jax.Array]:
     """Quantize one EP rank's physical hidden shard with one FP32 scale.
 
-    The scale covers the complete physical shard, so changing only its routing
-    padding does not change active-token quantization. Invalid rows are encoded
-    as zero because the fused kernel never consumes them.
+    Both the scale and payload cover the complete physical shard.  Consequently,
+    changing only routing padding cannot change the communicated activation.
+    Routing sentinels, rather than payload mutation, suppress invalid outputs.
     """
+    del topk_indices_local
     hidden_f32 = hidden_local.astype(jnp.float32)
-    valid_tokens = jnp.any(topk_indices_local >= 0, axis=-1, keepdims=True)
     fp8_max = jnp.asarray(jnp.finfo(jnp.float8_e4m3fn).max, dtype=jnp.float32)
     amax = jnp.max(jnp.abs(hidden_f32))
     scale = jnp.maximum(amax, jnp.asarray(1e-12, dtype=jnp.float32)) / fp8_max
     quantized = jnp.clip(hidden_f32 / scale, -fp8_max, fp8_max).astype(
         jnp.float8_e4m3fn
     )
-    quantized = jnp.where(valid_tokens, quantized, jnp.zeros_like(quantized))
     return quantized, scale
 
 
