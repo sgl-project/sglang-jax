@@ -740,7 +740,7 @@ def kernel_main_fused_rs(
     w1_gs_gate_ref,  # (E,) GMM1 gate global_scale
     w1_gs_up_ref,  # (E,) GMM1 up global_scale
     w2_gs_ref,  # (E,) GMM2 global_scale
-    hidden_states_scale_ref,  # (EP,) per-source-rank activation scale
+    hidden_states_scale_ref,  # (num_tokens,) row-aligned per-rank activation scale
     # In (10)
     lhs_indices_hbm_ref,
     hidden_states_ref,
@@ -1369,11 +1369,11 @@ def kernel_main_fused_rs(
             if cfgs1.lhs_cfgs.prequantized:
                 source_scales = []
                 for src_row in current_gather_meta.src_rows:
-                    src_rank = src_row // chunk_size
                     # Scalar prefetch refs live in SMEM, whose dynamic scalar
-                    # indexing is supported.  Avoid expanding tile_m * EP
-                    # select chains in the Pallas program.
-                    source_scales.append(hidden_states_scale_ref[src_rank])
+                    # indexing is supported.  The caller expands the per-rank
+                    # scales into Hidden AllGather row order, so the payload
+                    # DMA and its scale use the identical source-row address.
+                    source_scales.append(hidden_states_scale_ref[src_row])
                 aligned_scales = jnp.stack(source_scales)
                 row_offset = current_gather_meta.m_start % dims.size_lhs_sublane
                 # The hidden DMA places its first valid row at row_offset.
@@ -1868,6 +1868,12 @@ def gmm_v2_fused_rs(
             "prequantized fused-RS input must use float8_e4m3fn; "
             f"got {hidden_states.dtype}"
         )
+    if prequantized_lhs and hidden_states_scale.shape != (hidden_states.shape[0],):
+        raise ValueError(
+            "prequantized fused-RS scale must be expanded into hidden row order; "
+            f"got scale shape {hidden_states_scale.shape} for hidden shape "
+            f"{hidden_states.shape}"
+        )
     if is_quantized:
         assert w2_scale is not None
         if separate_gate_up:
@@ -2282,7 +2288,7 @@ def gmm_v2_fused_rs(
     hidden_states_scale_input = (
         hidden_states_scale.astype(jnp.float32)
         if prequantized_lhs
-        else jnp.ones((ep_size,), dtype=jnp.float32)
+        else jnp.ones((1,), dtype=jnp.float32)
     )
 
     # Output buffer — also serves as ICI DMA target. In the FP8 direct-write

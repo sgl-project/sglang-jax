@@ -471,11 +471,22 @@ def expert_parallel_gmm_rs(
                     tiled=True,
                 )
             with jax.named_scope("fused_rs_hidden_scale_all_gather"):
-                hidden_scale_global = jax.lax.all_gather(
+                hidden_scale_by_rank = jax.lax.all_gather(
                     hidden_scale_local[None],
                     axis_name=expert_axis,
                     axis=0,
                     tiled=True,
+                )
+            with jax.named_scope("fused_rs_hidden_scale_expand"):
+                # Expand the tiny per-rank scale vector into the exact physical
+                # row order produced by the Hidden AllGather.  This stays local
+                # (64K FP32 values == 256 KiB at EP32) and lets Pallas index the
+                # scale with the same src_row used for the payload DMA.  Keeping
+                # decoding the rank separately inside Pallas duplicated this
+                # address mapping and was padding-sensitive at production M.
+                hidden_scale_global = jnp.repeat(
+                    hidden_scale_by_rank,
+                    hidden_global.shape[0] // ep_size,
                 )
         else:
             with jax.named_scope("fused_rs_hidden_all_gather"):

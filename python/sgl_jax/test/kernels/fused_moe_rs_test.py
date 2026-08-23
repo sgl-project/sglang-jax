@@ -53,7 +53,13 @@ def _pattern(shape: tuple[int, ...], *, offset: int) -> jax.Array:
     return 0.5 + sign * magnitude * 0.25
 
 
-def _make_inputs(mesh: jax.sharding.Mesh, *, quantized: bool, num_tokens: int):
+def _make_inputs(
+    mesh: jax.sharding.Mesh,
+    *,
+    quantized: bool,
+    num_tokens: int,
+    distinct_shard_scales: bool = False,
+):
     expert_axis = ("data", "tensor")
     token_sharding = NamedSharding(mesh, P(expert_axis, None))
     weight_sharding = NamedSharding(mesh, P(expert_axis, None, None))
@@ -62,6 +68,11 @@ def _make_inputs(mesh: jax.sharding.Mesh, *, quantized: bool, num_tokens: int):
 
     def make_replicated():
         tokens = _pattern((num_tokens, _HIDDEN), offset=1).astype(jnp.bfloat16)
+        if distinct_shard_scales:
+            local_tokens = num_tokens // mesh.size
+            shard_id = jnp.arange(num_tokens, dtype=jnp.int32) // local_tokens
+            shard_factor = (1.0 + shard_id.astype(jnp.float32) * 0.25)[:, None]
+            tokens = (tokens.astype(jnp.float32) * shard_factor).astype(jnp.bfloat16)
         weight_dtype = FP8 if quantized else jnp.bfloat16
         w1 = _pattern((_NUM_EXPERTS, _HIDDEN, _INTERMEDIATE), offset=3).astype(
             weight_dtype
@@ -270,6 +281,7 @@ class MoERSKernelTest(jtu.JaxTestCase):
             self.mesh,
             quantized=quantized,
             num_tokens=num_tokens,
+            distinct_shard_scales=fp8_hidden_all_gather,
         )
         tokens, w1, w3, w2, s1, s3, s2, topk_weights, topk_ids = kernel_inputs
 
@@ -330,6 +342,7 @@ class MoERSKernelTest(jtu.JaxTestCase):
             self.mesh,
             quantized=True,
             num_tokens=num_tokens,
+            distinct_shard_scales=fp8_hidden_all_gather,
         )
         tokens, w1, w3, w2, s1, s3, s2, topk_weights, topk_ids = kernel_inputs
 

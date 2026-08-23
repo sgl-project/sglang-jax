@@ -71,17 +71,16 @@ def main() -> None:
             "FP8 Hidden AG A/B requires EP32/64K on 32 devices or EP8/32K "
             f"on 16 devices; got EP{args.ep_size}/{args.tokens}/{visible_devices}"
         )
-    if args.jsonl is not None and jax.process_index() == 0:
+    if args.jsonl is not None:
         args.jsonl.parent.mkdir(parents=True, exist_ok=True)
         args.jsonl.write_text("", encoding="utf-8")
 
     def emit(row: dict) -> None:
         encoded = json.dumps(row, sort_keys=True)
-        if jax.process_index() == 0:
-            print(encoded, flush=True)
-            if args.jsonl is not None:
-                with args.jsonl.open("a", encoding="utf-8") as output_file:
-                    output_file.write(encoded + "\n")
+        print(encoded, flush=True)
+        if args.jsonl is not None:
+            with args.jsonl.open("a", encoding="utf-8") as output_file:
+                output_file.write(encoded + "\n")
 
     mesh = _build_mesh(args.ep_size)
     baseline_out = None
@@ -178,6 +177,7 @@ def main() -> None:
                         else None
                     ),
                     "process_count": jax.process_count(),
+                    "process_index": jax.process_index(),
                     "visible_devices": visible_devices,
                     "ep_size": args.ep_size,
                     "num_tokens": args.tokens,
@@ -211,6 +211,12 @@ def main() -> None:
                     ],
                     "hidden_scale_all_gather_median_ms": _median(
                         stages["hidden_scale_all_gather"]
+                    ),
+                    "hidden_scale_expand_samples_ms": stages[
+                        "hidden_scale_expand"
+                    ],
+                    "hidden_scale_expand_median_ms": _median(
+                        stages["hidden_scale_expand"]
                     ),
                     "topk_ids_all_gather_samples_ms": stages["topk_ids_all_gather"],
                     "topk_ids_all_gather_median_ms": _median(
