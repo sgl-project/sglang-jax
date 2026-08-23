@@ -209,6 +209,8 @@ def test_allocated_bytes_match_the_budget_and_the_report():
 
     # Reporting: what the scheduler's `kvcache` gauge and the startup log show.
     assert pool.get_kv_size_bytes() == resident
+    # `mem_usage` (the startup log) is the same total, not a parallel sum.
+    assert pool.mem_usage == pytest.approx(resident / 1024**3)
 
     # Budgeting: what the profiler sizes the pool against.
     cell = runner._compute_cell_size()

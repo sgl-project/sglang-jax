@@ -1392,9 +1392,11 @@ class MLATokenToKVPool(KVCache):
 
     def _calculate_memory_usage(self):
         """Calculate memory usage for the 4D paged MLA cache."""
+        # `get_kv_size_bytes` is the authoritative total (it also feeds the
+        # scheduler gauge); the components below only split it for the log.
+        self.mem_usage = self.get_kv_size_bytes() / GB
         latent_bytes = self._buffer_bytes() * self.layer_num
         indexer_bytes = self._indexer_buffer_bytes() * self.num_indexer_layers
-        self.mem_usage = (latent_bytes + indexer_bytes) / GB
 
         breakdown = (
             f" (latent {latent_bytes / GB:.2f} GB + DSA indexer {indexer_bytes / GB:.2f} GB)"
