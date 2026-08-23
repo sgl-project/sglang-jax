@@ -1415,7 +1415,9 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
         self.config = config
         self.mesh = mesh
         self.dtype = dtype
-        self.mtp_layer_idx = getattr(config, "num_hidden_layers", 78)
+        # The Draft Worker only passes its own isolated memory pool (which inherits model_config.num_hidden_layers length)
+        # We must index layer_id=0 so it does not exceed the KV buffer array bounds!
+        self.mtp_layer_idx = 0
 
         self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
