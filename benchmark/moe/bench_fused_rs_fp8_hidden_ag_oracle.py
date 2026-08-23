@@ -21,8 +21,12 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.fused_moe.fused_rs import fused_moe_func_rs
+from sgl_jax.srt.kernels.fused_moe.fused_rs.fused_moe_rs import (
+    _quantize_hidden_per_tensor,
+)
 from sgl_jax.srt.kernels.fused_moe.fused_rs.gmm_fused_rs_nodedup import (
     set_fused_rs_block_sizes_override,
 )
@@ -32,9 +36,10 @@ from sgl_jax.test.test_utils import create_device_mesh
 FP8 = jnp.float8_e4m3fn
 _TOP_K = 8
 _CASES = (
-    ("m128_full_resident", (128, 512, 512, 512, 512, 1, 1), 48, 3),
-    ("m256_full_resident", (256, 512, 512, 512, 512, 1, 1), 72, 5),
-    ("m384_full_resident", (384, 512, 512, 512, 512, 1, 1), 136, 8),
+    ("m128_rank_distinct", (128, 512, 512, 512, 512, 1, 1), 48, 3, True),
+    ("m256_rank_distinct", (256, 512, 512, 512, 512, 1, 1), 72, 5, True),
+    ("m384_rank_distinct", (384, 512, 512, 512, 512, 1, 1), 136, 8, True),
+    ("m128_uniform_rank_scale", (128, 512, 512, 512, 512, 1, 1), 48, 3, False),
 )
 
 
@@ -105,6 +110,64 @@ def _quantization_diagnostics(tokens: jax.Array, *, ep_size: int) -> dict:
     }
 
 
+def _collective_diagnostics(mesh, kernel_inputs) -> dict:
+    expert_axis = ("data", "tensor")
+
+    def run(hidden_local, topk_ids_local):
+        payload_local, scale_local = _quantize_hidden_per_tensor(
+            hidden_local, topk_ids_local
+        )
+        payload = jax.lax.all_gather(
+            payload_local,
+            axis_name=expert_axis,
+            axis=0,
+            tiled=True,
+        )
+        scales = jax.lax.all_gather(
+            scale_local[None],
+            axis_name=expert_axis,
+            axis=0,
+            tiled=True,
+        )
+        return payload, scales
+
+    probe = jax.shard_map(
+        run,
+        mesh=mesh,
+        in_specs=(P(expert_axis, None), P(expert_axis, None)),
+        out_specs=(P(), P()),
+        check_vma=False,
+    )
+    payload, scales = probe(kernel_inputs[0], kernel_inputs[-1])
+
+    tokens = kernel_inputs[0].astype(jnp.float32)
+    local_tokens = tokens.shape[0] // mesh.size
+    shards = tokens.reshape(mesh.size, local_tokens, tokens.shape[-1])
+    expected_amax = jnp.max(jnp.abs(shards), axis=(1, 2))
+    fp8_max = jnp.asarray(jnp.finfo(FP8).max, dtype=jnp.float32)
+    expected_scales = jnp.maximum(expected_amax, 1e-12) / fp8_max
+    expected_payload = jnp.clip(
+        shards / expected_scales[:, None, None], -fp8_max, fp8_max
+    ).astype(FP8)
+    expected_payload = expected_payload.reshape(tokens.shape)
+    jax.block_until_ready((payload, scales, expected_payload, expected_scales))
+
+    payload_host = np.asarray(jax.device_get(payload), dtype=np.float32)
+    expected_payload_host = np.asarray(
+        jax.device_get(expected_payload), dtype=np.float32
+    )
+    scales_host = np.asarray(jax.device_get(scales), dtype=np.float32)
+    expected_scales_host = np.asarray(
+        jax.device_get(expected_scales), dtype=np.float32
+    )
+    return {
+        "payload": _comparison(expected_payload_host, payload_host),
+        "scale": _comparison(expected_scales_host, scales_host),
+        "payload_exact": bool(np.array_equal(expected_payload_host, payload_host)),
+        "scale_exact": bool(np.array_equal(expected_scales_host, scales_host)),
+    }
+
+
 def _reference(
     reference_inputs,
     token_sharding,
@@ -143,12 +206,18 @@ def main() -> None:
 
     mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
     with jax.set_mesh(mesh):
-        for name, config, num_tokens, active_per_device in _CASES:
+        for (
+            name,
+            config,
+            num_tokens,
+            active_per_device,
+            distinct_shard_scales,
+        ) in _CASES:
             reference_inputs, kernel_inputs, token_sharding = oracle._make_inputs(
                 mesh,
                 quantized=True,
                 num_tokens=num_tokens,
-                distinct_shard_scales=True,
+                distinct_shard_scales=distinct_shard_scales,
             )
             padded_reference_inputs, valid_mask = _padded_inputs(
                 reference_inputs,
@@ -251,8 +320,10 @@ def main() -> None:
                 "ep_size": mesh.size,
                 "num_tokens": num_tokens,
                 "active_tokens_per_device": active_per_device,
+                "distinct_shard_scales": distinct_shard_scales,
                 "rs_block_config": list(config),
                 "kernel_rel_l2_threshold": args.kernel_rel_l2_threshold,
+                "collective": _collective_diagnostics(mesh, kernel_inputs),
                 "quantization": _quantization_diagnostics(
                     reference_inputs[0], ep_size=mesh.size
                 ),
