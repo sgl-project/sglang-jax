@@ -689,6 +689,51 @@ def _rs_runner(
     return jax.jit(run, compiler_options=compiler_options)
 
 
+def _hidden_all_gather_probe_runner(
+    mesh,
+    *,
+    hidden_all_gather_backend: str,
+) -> Callable:
+    """Materialize the fused-RS input AllGather for a semantics-only check.
+
+    This isolated executable is not a performance measurement.  It reproduces
+    the shard-map collective boundary so the A/B can distinguish an incorrect
+    collective payload from downstream low-precision layout/reduction drift.
+    """
+    expert_axis = get_moe_expert_axis(mesh)
+    compiler_options = (
+        {
+            "xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes": str(
+                1 << 30
+            )
+        }
+        if hidden_all_gather_backend == "tensorcore"
+        else None
+    )
+
+    def run(hidden_states):
+        def gather_local(hidden_local):
+            with jax.named_scope("fused_rs_hidden_all_gather_probe"):
+                return jax.lax.all_gather(
+                    hidden_local,
+                    axis_name=expert_axis,
+                    axis=0,
+                    tiled=True,
+                )
+
+        return jax.shard_map(
+            gather_local,
+            mesh=mesh,
+            in_specs=P(expert_axis, None),
+            out_specs=P(),
+            check_vma=False,
+        )(hidden_states)
+
+    if compiler_options is None:
+        return jax.jit(run)
+    return jax.jit(run, compiler_options=compiler_options)
+
+
 def _routing_stats(topk_ids) -> dict[str, float | int]:
     """Count the routed rows exactly once across all four EP32 processes."""
     local_counts = np.zeros(GLM52_NUM_EXPERTS, dtype=np.int64)

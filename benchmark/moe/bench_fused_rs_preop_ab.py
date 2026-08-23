@@ -19,12 +19,17 @@ from benchmark.moe.bench_fused_rs_moe import (
     GLM52_TOP_K,
     _build_mesh,
     _comparison_metrics,
+    _hidden_all_gather_probe_runner,
     _invalid_padding_max_abs,
     _make_inputs,
     _make_padded_inputs,
     _measure_rs_breakdown,
     _routing_stats,
     _rs_runner,
+)
+from benchmark.moe.fused_rs_preop_contract import (
+    DEFAULT_FINAL_REL_L2_THRESHOLD,
+    evaluate_preop_variant_contract,
 )
 
 PRODUCTION_RS_CONFIG = (256, 6144, 1024, 2048, 1024, 2, 2)
@@ -51,7 +56,11 @@ def main() -> None:
     parser.add_argument("--iters", type=int, default=5)
     parser.add_argument("--trace-root", default="/tmp/sglang_jax_fused_rs_preop_ab")
     parser.add_argument("--jsonl", type=Path)
-    parser.add_argument("--correctness-rel-l2-threshold", type=float, default=1e-6)
+    parser.add_argument(
+        "--correctness-rel-l2-threshold",
+        type=float,
+        default=DEFAULT_FINAL_REL_L2_THRESHOLD,
+    )
     args = parser.parse_args()
 
     visible_devices = len(jax.devices())
@@ -83,6 +92,7 @@ def main() -> None:
     mesh = _build_mesh(args.ep_size)
     baseline_out = None
     baseline_padded_out = None
+    baseline_hidden_gather = None
     with jax.set_mesh(mesh):
         inputs = _make_inputs(
             mesh,
@@ -109,6 +119,17 @@ def main() -> None:
                 layer_scope=False,
                 hidden_all_gather_backend=hidden_backend,
             )
+            hidden_probe = _hidden_all_gather_probe_runner(
+                mesh,
+                hidden_all_gather_backend=hidden_backend,
+            )
+
+            hidden_probe_compile_start = time.perf_counter()
+            hidden_gather = hidden_probe(inputs[0])
+            jax.block_until_ready(hidden_gather)
+            hidden_probe_compile_time_s = (
+                time.perf_counter() - hidden_probe_compile_start
+            )
 
             compile_start = time.perf_counter()
             output = run(inputs)
@@ -120,6 +141,11 @@ def main() -> None:
             if baseline_out is None:
                 baseline_out = output
                 baseline_padded_out = padded_output
+                baseline_hidden_gather = hidden_gather
+            hidden_gather_metrics = _comparison_metrics(
+                baseline_hidden_gather,
+                hidden_gather,
+            )
             full_metrics = _comparison_metrics(baseline_out, output)
             padded_metrics = _comparison_metrics(
                 baseline_padded_out,
@@ -135,20 +161,16 @@ def main() -> None:
                 padded_output,
                 valid_mask,
             )
-            correctness_ok = (
-                full_metrics["all_finite"]
-                and padded_metrics["all_finite"]
-                and full_metrics["rel_l2"] <= args.correctness_rel_l2_threshold
-                and padded_metrics["rel_l2"] <= args.correctness_rel_l2_threshold
-                and invalid_padding_max_abs == 0.0
+            correctness_contract = evaluate_preop_variant_contract(
+                hidden_gather_all_finite=hidden_gather_metrics["all_finite"],
+                hidden_gather_max_abs=hidden_gather_metrics["max_abs"],
+                full_all_finite=full_metrics["all_finite"],
+                full_rel_l2=full_metrics["rel_l2"],
+                padded_all_finite=padded_metrics["all_finite"],
+                padded_rel_l2=padded_metrics["rel_l2"],
+                invalid_padding_max_abs=invalid_padding_max_abs,
+                final_rel_l2_threshold=args.correctness_rel_l2_threshold,
             )
-            if not correctness_ok:
-                raise AssertionError(
-                    f"{variant_name} changed fused-RS semantics vs auto-jax: "
-                    f"full_rel_l2={full_metrics['rel_l2']}, "
-                    f"padded_rel_l2={padded_metrics['rel_l2']}, "
-                    f"invalid_padding_max_abs={invalid_padding_max_abs}"
-                )
 
             breakdown = _measure_rs_breakdown(
                 run,
@@ -167,7 +189,11 @@ def main() -> None:
             emit(
                 {
                     "record_type": "fused_rs_preop_ab",
-                    "status": "ok",
+                    "status": (
+                        "ok"
+                        if correctness_contract["contract_ok"]
+                        else "correctness_failed"
+                    ),
                     "variant": variant_name,
                     "hidden_all_gather_backend": hidden_backend,
                     "routing_table_impl": routing_impl,
@@ -179,6 +205,23 @@ def main() -> None:
                     "top_k": GLM52_TOP_K,
                     "rs_block_config": list(PRODUCTION_RS_CONFIG),
                     "compile_time_s": compile_time_s,
+                    "hidden_all_gather_probe_compile_time_s": (
+                        hidden_probe_compile_time_s
+                    ),
+                    "hidden_all_gather_exact": correctness_contract[
+                        "hidden_gather_exact"
+                    ],
+                    "hidden_all_gather_vs_auto_rel_l2": hidden_gather_metrics[
+                        "rel_l2"
+                    ],
+                    "hidden_all_gather_vs_auto_max_abs": hidden_gather_metrics[
+                        "max_abs"
+                    ],
+                    "final_output_ok": correctness_contract["final_output_ok"],
+                    "correctness_contract_ok": correctness_contract["contract_ok"],
+                    "correctness_rel_l2_threshold": (
+                        args.correctness_rel_l2_threshold
+                    ),
                     "correctness_vs_auto_jax_rel_l2": full_metrics["rel_l2"],
                     "padded_correctness_vs_auto_jax_rel_l2": padded_metrics["rel_l2"],
                     "same_config_padding_invariance_rel_l2_diagnostic": (
