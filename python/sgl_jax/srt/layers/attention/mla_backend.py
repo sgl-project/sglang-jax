@@ -425,4 +425,17 @@ class MLAAttentionBackend(AttentionBackend):
         metadata.seq_lens = seq_lens_2d.ravel()
         metadata.distribution = self.forward_metadata.distribution
         
+        from sgl_jax.srt.utils.jax_utils import device_array
+        from jax.sharding import NamedSharding, PartitionSpec as P
+        
+        (
+            metadata.cu_q_lens,
+            metadata.cu_kv_lens,
+            metadata.page_indices,
+            metadata.seq_lens,
+        ) = device_array(
+            (metadata.cu_q_lens, metadata.cu_kv_lens, metadata.page_indices, metadata.seq_lens),
+            sharding=(NamedSharding(self.mesh, P(self.attention_data_partition_axis))),
+        )
+        
         return metadata
