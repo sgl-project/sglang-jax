@@ -481,9 +481,15 @@ def _rotate_prefill_input_ids(input_ids, extend_seq_lens, verified_id, dp_size, 
         shifted_index = jnp.minimum(tok + 1, per_dp_tokens - 1)
         one_hot_shifted = jax.nn.one_hot(shifted_index, per_dp_tokens, dtype=starts.dtype)
         shifted = jnp.dot(one_hot_shifted, ids_rank)
+        
+        # Bypass jnp.where ShardingTypeError by using algebraic boolean masks!
+        # Multiplication automatically promotes sharding constraints!
         is_last = has_req & ((tok - req_starts) == (req_lens - 1))
-        rotated = jnp.where(is_last, req_verified, shifted)
-        return jnp.where(has_req, rotated, ids_rank)
+        is_last_int = is_last.astype(jnp.int32)
+        rotated = is_last_int * req_verified + (1 - is_last_int) * shifted
+        
+        has_req_int = has_req.astype(jnp.int32)
+        return has_req_int * rotated + (1 - has_req_int) * ids_rank
 
     return jax.vmap(rotate_rank)(ids, ext, verified).reshape(input_ids.shape)
 
