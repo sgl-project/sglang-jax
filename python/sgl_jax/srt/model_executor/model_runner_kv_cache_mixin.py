@@ -634,6 +634,16 @@ class ModelRunnerKVCacheMixin:
         if self.linear_recurrent_config is not None:
             from sgl_jax.srt.mem_cache.memory_pool import HybridLinearKVPool
 
+            # The DSA indexer slot space is built by `build_index_share_map`
+            # over every layer; the hybrid pool indexes full-ATTENTION layers
+            # only. Nothing reconciles the two, and `HybridLinearKVPool` does
+            # not expose `get_indexer_key_buffer` at all, so such a config
+            # would allocate and budget indexer buffers and then die on the
+            # first full-indexer forward. Fail here with the reason instead.
+            assert not kvcache_kwargs.get(
+                "num_indexer_layers"
+            ), "hybrid-recurrent models do not support --attention-backend dsa_sparse"
+
             return HybridLinearKVPool(
                 size=self.max_total_num_tokens,
                 page_size=self.page_size,

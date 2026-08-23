@@ -254,3 +254,40 @@ def test_latent_only_budget_overshoots_the_available_memory():
     # Post-fix: sized with the indexer counted, only the spare page is left over.
     fitted = _resident_bytes(_build_pool(runner, pool_size_for(runner._compute_cell_size()), mesh))
     assert 0 < fitted <= budget + slack
+
+
+class _HybridDSARunner(_CellSizeRunner):
+    """A DSA runner that also reports as hybrid-recurrent.
+
+    `linear_recurrent_config` is a read-only property derived from `hf_config`;
+    overriding it here keeps the test off the per-architecture config sniffing.
+    """
+
+    @property
+    def linear_recurrent_config(self):
+        return types.SimpleNamespace(full_attention_layer_ids=[0, 4])
+
+
+def test_hybrid_pool_rejects_a_dsa_indexer_cache():
+    """The DSA indexer slot space spans every layer; the hybrid pool indexes
+    full-attention layers only, and never exposes `get_indexer_key_buffer`.
+    Such a config would allocate and budget the indexer buffers, then die on
+    the first full-indexer forward — so refuse it at startup instead."""
+    runner = _HybridDSARunner("dsa_sparse", num_layers=8)
+    runner.max_total_num_tokens = 256
+    runner.mesh = None  # never reached: the assert fires before allocation
+
+    indexer_key_dim, num_indexer_layers = runner._dsa_indexer_cache_params()
+    assert num_indexer_layers > 0, "test needs a DSA indexer buffer to reject"
+
+    from sgl_jax.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+    with pytest.raises(AssertionError, match="dsa_sparse"):
+        runner._maybe_wrap_hybrid_kv_pool(
+            MLATokenToKVPool,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            dp_size=1,
+            indexer_key_dim=indexer_key_dim,
+            num_indexer_layers=num_indexer_layers,
+        )
