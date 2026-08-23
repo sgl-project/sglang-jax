@@ -454,15 +454,24 @@ def _rotate_prefill_input_ids(input_ids, extend_seq_lens, verified_id, dp_size, 
     tok = jnp.arange(per_dp_tokens, dtype=jnp.int32)
 
     def rotate_rank(ids_rank, ext_rank, verified_rank):
-        import jax
-        ext_rank_replicated = jax.lax.with_sharding_constraint(ext_rank, jax.sharding.PartitionSpec(None))
-        starts = jnp.cumsum(ext_rank_replicated, axis=0) - ext_rank_replicated
-        ends = starts + ext_rank_replicated
+        # We can implement a cumsum as a matrix multiplication!
+        # A lower triangular matrix of ones multiplied by ext_rank gives the cumsum!
+        import jax.numpy as jnp
+        
+        N = ext_rank.shape[0]
+        idx = jnp.arange(N)
+        mask = (idx[:, None] >= idx[None, :]).astype(jnp.int32)
+        
+        # This is exactly the inclusive cumsum!
+        ext_rank_cumsum = jnp.dot(mask, ext_rank)
+        
+        starts = ext_rank_cumsum - ext_rank
+        ends = starts + ext_rank
         in_req = (tok[None, :] >= starts[:, None]) & (tok[None, :] < ends[:, None])
         has_req = jnp.any(in_req, axis=0)
         slot = jnp.argmax(in_req.astype(jnp.int32), axis=0)
         req_starts = starts.at[slot].get()
-        req_lens = ext_rank_replicated.at[slot].get()
+        req_lens = ext_rank.at[slot].get()
         req_verified = verified_rank.at[slot].get()
         shifted_index = jnp.minimum(tok + 1, per_dp_tokens - 1)
         shifted = ids_rank.at[shifted_index].get()
