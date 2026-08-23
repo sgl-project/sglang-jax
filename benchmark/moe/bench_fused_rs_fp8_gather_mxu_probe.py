@@ -73,9 +73,10 @@ def _gather_mxu_kernel(
     dma_gather_gm_wait(gathered_ref, gather_sem_ref, metadata)
     rhs_copy.wait()
 
-    # Match the fused-RS consumer: collapse the physical VMEM tile into
-    # [tile_m, K] immediately before feeding it to MXU.
-    lhs = gathered_ref.reshape(-1, _K)[...]
+    # Match the fused-RS consumer exactly: retain the size_lhs_sublane axis
+    # while collapsing the physical K tiles.  Reshaping directly to
+    # [tile_m, K] changes the minormost VMEM tiling and Mosaic rejects it.
+    lhs = gathered_ref.reshape(-1, _TILE_M, _K)[...]
     rhs = rhs_scratch_ref[...]
     acc_scratch_ref[...] = jnp.matmul(
         lhs,
@@ -99,7 +100,7 @@ def _run_probe(
 ):
     kernel = pl.pallas_call(
         functools.partial(_gather_mxu_kernel, m_start=m_start),
-        out_shape=jax.ShapeDtypeStruct((_TILE_M, _N), jnp.float32),
+        out_shape=jax.ShapeDtypeStruct((1, _TILE_M, _N), jnp.float32),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
             grid=(1,),
@@ -111,7 +112,7 @@ def _run_probe(
             scratch_shapes=(
                 pltpu.VMEM((_TILE_M, _K_TILES, _NUM_LANES), payload.dtype),
                 pltpu.VMEM((_K, _N), rhs.dtype),
-                pltpu.VMEM((_TILE_M, _N), jnp.float32),
+                pltpu.VMEM((1, _TILE_M, _N), jnp.float32),
                 pltpu.SemaphoreType.DMA,
                 pltpu.SemaphoreType.DMA,
             ),
@@ -196,7 +197,9 @@ def main() -> None:
 
         comparison = _compare_at_best_offset(
             np.asarray(jax.device_get(expected), dtype=np.float32),
-            np.asarray(jax.device_get(output), dtype=np.float32),
+            np.asarray(jax.device_get(output), dtype=np.float32).reshape(
+                _TILE_M, _N
+            ),
         )
         contract_ok = (
             comparison["all_finite"]
