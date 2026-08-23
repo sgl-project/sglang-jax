@@ -1423,8 +1423,6 @@ class MLATokenToKVPool(KVCache):
 
     def _indexer_buffer_bytes(self) -> int:
         """Bytes for ONE DSA indexer key buffer; 0 when none is allocated."""
-        if not (self.indexer_key_dim and self.num_indexer_layers):
-            return 0
         return self._buffer_bytes(kv_dim=self.indexer_key_dim)
 
     def get_kv_size_bytes(self):
