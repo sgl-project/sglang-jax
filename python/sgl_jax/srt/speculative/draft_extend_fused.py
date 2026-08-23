@@ -562,13 +562,15 @@ def _build_draft_extend(num_layers: int, topk: int):
             )
 
         for i in range(num_layers):
-            state = jax.tree_util.tree_unflatten(model_state_def, all_leaves[i])
+            leaf_idx = i if i < len(all_leaves) else -1
+            pool_idx = i if i < len(all_memory_pools) else -1
+            state = jax.tree_util.tree_unflatten(model_state_def, all_leaves[leaf_idx])
             model = nnx.merge(model_def, state)
 
             forward_batch.spec_info.hidden_states = target_hidden
             forward_batch.input_ids = input_ids
 
-            output, pool_updates, _, _ = model(forward_batch, all_memory_pools[i], logits_metadata)
+            output, pool_updates, _, _ = model(forward_batch, all_memory_pools[pool_idx], logits_metadata)
             all_pool_updates.append(pool_updates)
 
             sh = jax.typeof(output.next_token_logits).sharding
@@ -1164,13 +1166,15 @@ def _build_prefill(num_layers: int, topk: int):
 
         draft_forward_batch.spec_info.hidden_states = target_hidden
         for i in range(num_layers):
-            state = jax.tree_util.tree_unflatten(draft_model_state_def, draft_all_leaves[i])
+            leaf_idx = i if i < len(draft_all_leaves) else -1
+            pool_idx = i if i < len(all_memory_pools) else -1
+            state = jax.tree_util.tree_unflatten(draft_model_state_def, draft_all_leaves[leaf_idx])
             model = nnx.merge(draft_model_def, state)
 
             draft_forward_batch.input_ids = input_ids
             draft_forward_batch.spec_info.hidden_states = target_hidden
             output, pool_updates, _, _ = model(
-                draft_forward_batch, all_memory_pools[i], draft_logits_metadata
+                draft_forward_batch, all_memory_pools[pool_idx], draft_logits_metadata
             )
             all_pool_updates.append(pool_updates)
 
