@@ -789,6 +789,7 @@ def _measure_rs_breakdown(
                 "all-gather",
             ),
             "hidden_scale_expand": ("fused_rs_hidden_scale_expand", None),
+            "hidden_dequantize": ("fused_rs_hidden_dequantize", None),
             "topk_ids_all_gather": (
                 "fused_rs_topk_ids_all_gather",
                 "all-gather",

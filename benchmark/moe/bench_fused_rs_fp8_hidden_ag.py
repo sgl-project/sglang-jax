@@ -218,6 +218,10 @@ def main() -> None:
                     "hidden_scale_expand_median_ms": _median(
                         stages["hidden_scale_expand"]
                     ),
+                    "hidden_dequantize_samples_ms": stages["hidden_dequantize"],
+                    "hidden_dequantize_median_ms": _median(
+                        stages["hidden_dequantize"]
+                    ),
                     "topk_ids_all_gather_samples_ms": stages["topk_ids_all_gather"],
                     "topk_ids_all_gather_median_ms": _median(
                         stages["topk_ids_all_gather"]

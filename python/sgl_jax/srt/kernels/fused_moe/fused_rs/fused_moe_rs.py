@@ -146,6 +146,24 @@ def _quantize_hidden_per_tensor(
     return quantized, scale
 
 
+def _dequantize_hidden_per_rank(
+    payload: jax.Array,
+    rank_scales: jax.Array,
+    *,
+    rows_per_rank: int,
+    out_dtype: jnp.dtype,
+) -> jax.Array:
+    """Materialize an FP8 AllGather payload using its source-rank scales.
+
+    The communication payload remains FP8.  Dequantizing after the collective
+    gives the established BF16 fused-RS path a conventional row-major input,
+    avoiding the target-TPU layout bug in the experimental direct-FP8 Pallas
+    input while retaining the ICI bandwidth reduction.
+    """
+    row_scales = jnp.repeat(rank_scales.astype(jnp.float32), rows_per_rank)
+    return (payload.astype(jnp.float32) * row_scales[:, None]).astype(out_dtype)
+
+
 def _all_gather_token_hidden(
     token_hidden: jax.Array,
     *,
@@ -476,16 +494,20 @@ def expert_parallel_gmm_rs(
                     axis=0,
                     tiled=True,
                 )
-            with jax.named_scope("fused_rs_hidden_scale_expand"):
-                # Expand the tiny per-rank scale vector into the exact physical
-                # row order produced by the Hidden AllGather.  This stays local
-                # (64K FP32 values == 256 KiB at EP32) and lets Pallas index the
-                # scale with the same src_row used for the payload DMA.  Keeping
-                # decoding the rank separately inside Pallas duplicated this
-                # address mapping and was padding-sensitive at production M.
-                hidden_scale_global = jnp.repeat(
+            with jax.named_scope("fused_rs_hidden_dequantize"):
+                # Target-TPU explicit oracles prove the collective payload and
+                # scales are exact, but the direct prequantized Pallas input is
+                # not: even a uniform rank scale remains wrong.  Materialize
+                # BF16 locally after the FP8 collective, then reuse the mature
+                # per-row W8A8 GMM1 path.  This preserves the 2x ICI payload
+                # reduction while keeping the broken direct-FP8 path out of the
+                # production opt-in until its VMEM/MXU layout is independently
+                # fixed.
+                hidden_global = _dequantize_hidden_per_rank(
+                    hidden_global,
                     hidden_scale_by_rank,
-                    hidden_global.shape[0] // ep_size,
+                    rows_per_rank=hidden_global.shape[0] // ep_size,
+                    out_dtype=hidden_local.dtype,
                 )
         else:
             with jax.named_scope("fused_rs_hidden_all_gather"):

@@ -20,6 +20,7 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.fused_moe.fused_rs import fused_moe_func_rs
 from sgl_jax.srt.kernels.fused_moe.fused_rs.fused_moe_rs import (
+    _dequantize_hidden_per_rank,
     _quantize_hidden_per_tensor,
 )
 from sgl_jax.srt.kernels.fused_moe.fused_rs.gmm_fused_rs_nodedup import (
@@ -157,21 +158,27 @@ def _explicit_reference(
                 keepdims=True,
             )
             shard_scale = jnp.maximum(shard_amax, 1e-12) / fp8_max
-            gmm1_lhs = jnp.clip(
+            communicated_lhs = jnp.clip(
                 token_shards / shard_scale,
                 -fp8_max,
                 fp8_max,
             ).astype(FP8)
-            token_scale = jnp.broadcast_to(
-                shard_scale,
-                (ep_size, local_tokens, 1),
-            ).reshape(tokens.shape[0], 1)
-            valid_tokens = jnp.any(topk_ids >= 0, axis=-1, keepdims=True)
-            gmm1_lhs = jnp.where(
-                valid_tokens,
-                gmm1_lhs.reshape(tokens.shape),
-                jnp.zeros(tokens.shape, dtype=FP8),
+            # The FP8 collective is dequantized locally to BF16 before the
+            # established fused-RS W8A8 path performs its normal per-row GMM1
+            # activation quantization.
+            communicated_lhs = (
+                communicated_lhs.astype(jnp.float32) * shard_scale
+            ).astype(tokens.dtype)
+            communicated_f32 = communicated_lhs.reshape(tokens.shape).astype(
+                jnp.float32
             )
+            token_amax = jnp.max(
+                jnp.abs(communicated_f32), axis=-1, keepdims=True
+            )
+            token_scale = jnp.maximum(token_amax, 1e-12) / fp8_max
+            gmm1_lhs = jnp.clip(
+                communicated_f32 / token_scale, -fp8_max, fp8_max
+            ).astype(FP8)
         else:
             token_amax = jnp.max(jnp.abs(tokens_f32), axis=-1, keepdims=True)
             token_scale = jnp.maximum(token_amax, 1e-12) / fp8_max
@@ -291,6 +298,36 @@ class MoERSKernelTest(jtu.JaxTestCase):
 
         self.assertAllClose(padded_scale, all_active_scale, atol=0.0, rtol=0.0)
         self.assertArraysEqual(padded_payload, all_active_payload)
+
+    def test_fp8_hidden_dequantization_materializes_rank_scales_in_row_order(self):
+        payload = jnp.asarray(
+            [
+                [1.0, -2.0],
+                [3.0, -4.0],
+                [5.0, -6.0],
+                [7.0, -8.0],
+            ],
+            dtype=FP8,
+        )
+        rank_scales = jnp.asarray([0.25, 0.5], dtype=jnp.float32)
+
+        actual = _dequantize_hidden_per_rank(
+            payload,
+            rank_scales,
+            rows_per_rank=2,
+            out_dtype=jnp.bfloat16,
+        )
+        expected = jnp.asarray(
+            [
+                [0.25, -0.5],
+                [0.75, -1.0],
+                [2.5, -3.0],
+                [3.5, -4.0],
+            ],
+            dtype=jnp.bfloat16,
+        )
+
+        self.assertArraysEqual(actual, expected)
 
     def _test_config(
         self,
