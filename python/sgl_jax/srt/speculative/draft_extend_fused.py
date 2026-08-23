@@ -1500,14 +1500,14 @@ def launch_fused_draft_extend_for_decode(
     else:
         sel_pos = jnp.clip(batch_output.accept_lens - 1, 0, None).astype(jnp.int32)
 
-    mr0 = draft_worker._workers[0].model_runner
+    mr0 = draft_worker._worker.model_runner
     mwb.spec_info_padded.hidden_states = target_hidden
     shared_fb = _make_forward_batch(mwb, mr0)
     shared_fb.bid = model_worker_batch.bid
 
     all_memory_pools = []
     all_leaves = []
-    for w in draft_worker._workers:
+    for w in [draft_worker._worker]:
         mr = w.model_runner
         all_memory_pools.append(mr.memory_pools)
         all_leaves.append(tuple(mr.model_state_leaves))
@@ -1580,7 +1580,7 @@ def launch_fused_draft_extend_for_decode(
             dp_size=model_worker_batch.dp_size,
         )
 
-    for i, w in enumerate(draft_worker._workers):
+    for i, w in enumerate([draft_worker._worker]):
         w.model_runner.memory_pools.replace_all(all_pool_updates[i])
 
     return FusedDraftExtendPendingResult(
@@ -1671,7 +1671,7 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
     model_worker_batch.spec_info_padded.capture_hidden_mode = CaptureHiddenMode.FULL
     model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
 
-    draft_mr0 = draft_worker._workers[0].model_runner
+    draft_mr0 = draft_worker._worker.model_runner
     draft_mr0.attn_backend.forward_metadata = draft_mr0.attn_backend.get_eagle_forward_metadata(
         model_worker_batch
     )
@@ -1687,7 +1687,7 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
 
     all_memory_pools = []
     all_leaves = []
-    for w in draft_worker._workers:
+    for w in [draft_worker._worker]:
         mr = w.model_runner
         all_memory_pools.append(mr.memory_pools)
         all_leaves.append(tuple(mr.model_state_leaves))
@@ -1760,7 +1760,7 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
         launch_done.set()
 
     target_mr.memory_pools.replace_all(target_pool_updates)
-    for i, w in enumerate(draft_worker._workers):
+    for i, w in enumerate([draft_worker._worker]):
         w.model_runner.memory_pools.replace_all(all_pool_updates[i])
     if update_relay:
         spec_worker.spec_relay_buffers = updated_relay_buffers
