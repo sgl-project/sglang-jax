@@ -1,10 +1,10 @@
-name: glm52-fused-rs-fp8-gather-mxu-probe-r1-20260824
+name: glm52-fused-rs-fp8-gather-mxu-probe-r2-20260824
 exp_type: TRAINING
 artifact_type: GCS
 cluster_name: tpu-training-antgroup
 priority: 0
 tags: [correctness, fused-moe, fused-rs, glm52, fp8-hidden-ag, mxu-probe]
-config: '{"device_type":"v7x","physical_chips":4,"visible_devices":8,"probe":"gathered_scratch_unscaled_mxu","source_commit":"fc6f55874e72475ba285b9efeba187ccda6b8534","source_sha256":"d0011fcd7cc51580d0191514be93ecdfea15baff187891b69584865609b7e867"}'
+config: '{"device_type":"v7x","physical_chips":4,"visible_devices":8,"probe":"gathered_scratch_unscaled_mxu","source_commit":"b8b32faa41a13c632df97160053abb82d0c52472","source_sha256":"ee1338228bd453671f66f899155b14bc9acb15dae99e8d858200820d58d01e7c"}'
 role_to_task_spec:
   worker:
     replica: 1
@@ -26,8 +26,8 @@ role_to_task_spec:
       export JAX_COMPILATION_CACHE_DIR=/tmp/tpu_logs/jax-cache
       mkdir -p "$TMPDIR" "$PIP_CACHE_DIR" "$UV_CACHE_DIR" "$JAX_COMPILATION_CACHE_DIR"
 
-      source_tar=/tmp/glm52-fused-rs-fp8-gather-mxu-probe-r1.tar.gz.part
-      source_ready=/tmp/glm52-fused-rs-fp8-gather-mxu-probe-r1.ready
+      source_tar=/tmp/glm52-fused-rs-fp8-gather-mxu-probe-r2.tar.gz.part
+      source_ready=/tmp/glm52-fused-rs-fp8-gather-mxu-probe-r2.ready
       attempt=0
       while [ ! -f "$source_ready" ]; do
         attempt=$((attempt + 1))
@@ -38,7 +38,7 @@ role_to_task_spec:
         sleep 5
       done
       test -f "$source_tar"
-      echo 'd0011fcd7cc51580d0191514be93ecdfea15baff187891b69584865609b7e867  /tmp/glm52-fused-rs-fp8-gather-mxu-probe-r1.tar.gz.part' | sha256sum -c -
+      echo 'ee1338228bd453671f66f899155b14bc9acb15dae99e8d858200820d58d01e7c  /tmp/glm52-fused-rs-fp8-gather-mxu-probe-r2.tar.gz.part' | sha256sum -c -
 
       mkdir -p /workspace/sglang-jax
       tar -xzf "$source_tar" -C /workspace/sglang-jax
