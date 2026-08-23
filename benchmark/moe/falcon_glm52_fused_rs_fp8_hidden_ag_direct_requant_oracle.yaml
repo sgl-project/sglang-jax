@@ -1,0 +1,53 @@
+name: glm52-fused-rs-fp8-hidden-ag-direct-requant-oracle-r1-20260824
+exp_type: TRAINING
+artifact_type: GCS
+cluster_name: tpu-training-antgroup
+priority: 0
+tags: [correctness, fused-moe, fused-rs, glm52, fp8-hidden-ag, oracle]
+config: '{"device_type":"v7x","physical_chips":4,"visible_devices":8,"ep_size":8,"cases":["m128_rank_distinct","m256_rank_distinct","m384_rank_distinct","m128_uniform_rank_scale"],"consumer":"direct_tile_requant","source_commit":"3b447f30e94ba821492de72c6975daed7050340d","source_sha256":"760ba33269d7eb39b4d6af5f547c61a5bd770afd9e0fafde2dc2b6cc9b1b8f00"}'
+role_to_task_spec:
+  worker:
+    replica: 1
+    image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x1
+    command: |
+      set -eu
+      ulimit -c 0
+
+      ROOT="${ARTIFACT_LOCAL_DIR:-/tmp/oracle-artifact}"
+      OUT="$ROOT/rank-0"
+      mkdir -p "$OUT/benchmark"
+
+      export TMPDIR=/tmp/tpu_logs/tmp
+      export PIP_CACHE_DIR=/tmp/tpu_logs/pip-cache
+      export UV_CACHE_DIR=/tmp/tpu_logs/uv-cache
+      export JAX_COMPILATION_CACHE_DIR=/tmp/tpu_logs/jax-cache
+      mkdir -p "$TMPDIR" "$PIP_CACHE_DIR" "$UV_CACHE_DIR" "$JAX_COMPILATION_CACHE_DIR"
+
+      source_tar=/tmp/glm52-fused-rs-fp8-hidden-ag-direct-requant-r1.tar.gz.part
+      source_ready=/tmp/glm52-fused-rs-fp8-hidden-ag-direct-requant-r1.ready
+      attempt=0
+      while [ ! -f "$source_ready" ]; do
+        attempt=$((attempt + 1))
+        if [ "$attempt" -ge 360 ]; then
+          echo "timed out waiting for $source_ready" >&2
+          exit 1
+        fi
+        sleep 5
+      done
+      test -f "$source_tar"
+      echo '760ba33269d7eb39b4d6af5f547c61a5bd770afd9e0fafde2dc2b6cc9b1b8f00  /tmp/glm52-fused-rs-fp8-hidden-ag-direct-requant-r1.tar.gz.part' | sha256sum -c -
+
+      mkdir -p /workspace/sglang-jax
+      tar -xzf "$source_tar" -C /workspace/sglang-jax
+      cd /workspace/sglang-jax
+      python3 -m pip install -q -e './python[tpu]'
+      export PYTHONPATH="/workspace/sglang-jax/python:/workspace/sglang-jax${PYTHONPATH:+:$PYTHONPATH}"
+
+      python3 -m benchmark.moe.bench_fused_rs_fp8_hidden_ag_oracle \
+        --direct-prequantized \
+        --jsonl "$OUT/benchmark/metrics.jsonl"
+
+      test "$(wc -l < "$OUT/benchmark/metrics.jsonl")" -eq 4
