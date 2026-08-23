@@ -137,8 +137,6 @@ def apply_fused_mlp_sharded(
     @functools.partial(
         shard_map,
         mesh=mesh,
-        in_specs=in_specs,
-        out_specs=out_specs,
     )
     def local_fused_mlp(x_loc, w_gu_loc, wd_loc):
         seq_len, hidden_size = x_loc.shape
