@@ -721,6 +721,7 @@ class Glm5DecoderLayer(nnx.Module):
         mesh: jax.sharding.Mesh,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
+        force_moe: bool = False,
     ):
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
@@ -766,7 +767,7 @@ class Glm5DecoderLayer(nnx.Module):
         first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
         use_fused_mlp = getattr(config, "_sgl_use_fused_mlp", True)
 
-        if layer_id < first_k_dense_replace:
+        if layer_id < first_k_dense_replace and not force_moe:
             self.mlp = Glm5MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -1441,7 +1442,7 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
             params_dtype=dtype,
             mesh=mesh,
         )
-        self.mtp_block = Glm5DecoderLayer(config, layer_id=self.mtp_layer_idx, dtype=dtype, mesh=mesh)
+        self.mtp_block = Glm5DecoderLayer(config, layer_id=self.mtp_layer_idx, dtype=dtype, mesh=mesh, force_moe=True)
         self.shared_head = nnx.Module()
         self.shared_head.norm = RMSNorm(
             config.hidden_size, epsilon=config.rms_norm_eps, param_dtype=dtype, scope_name="norm"
