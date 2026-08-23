@@ -304,13 +304,13 @@ def test_fused_rs_ep32_64k_per_channel_tuning_is_narrow(monkeypatch):
     )
 
     assert gmm_fused_rs_nodedup.get_fused_rs_tuned_block_sizes(65536 * 8, **common) == (
-        128,
+        256,
         6144,
+        1024,
         2048,
-        2048,
-        6144,
-        1,
-        1,
+        1024,
+        2,
+        2,
     )
     assert gmm_fused_rs_nodedup.get_fused_rs_tuned_block_sizes(32768 * 8, **common) == default
 

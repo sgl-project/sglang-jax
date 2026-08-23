@@ -85,14 +85,9 @@ _GLM52_V7X_EP16_FP8_BLOCK_SIZES: dict[int, FusedRsBlockConfig] = {
 # other prefill buckets use the deterministic calculated fallback until they
 # have their own same-topology measurement.
 _GLM52_V7X_EP32_PER_CHANNEL_FP8_BLOCK_SIZES: dict[int, FusedRsBlockConfig] = {
-    # Keep one full-width step per FFN while using a single weight buffer.
-    # The previously measured (384, ..., 1024, ..., 3072, 1, 1) candidate has
-    # two FFN1 and two FFN2 weight steps.  The pipeline starts the next weight
-    # DMA before consuming the current tile, so reusing one VMEM buffer races
-    # its reader.  Constant-weight tuning inputs hid the overwrite because the
-    # two tiles were identical; expert/channel-distinct correctness inputs do
-    # not.  Re-tune only among candidates that satisfy the buffer contract.
-    524288: (128, 6144, 2048, 2048, 6144, 1, 1),
+    # Exact production-shape selection validated by a 200-example GSM8K run.
+    # Keep the entry narrow: it does not validate other streaming geometries.
+    524288: (256, 6144, 1024, 2048, 1024, 2, 2),
 }
 
 
