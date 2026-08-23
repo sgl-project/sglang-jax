@@ -61,6 +61,7 @@ _FUSED_RS_SMEM_INDEX_LIMIT_ROWS = 240_000
 # leave it as ``None`` and use the shape-specific table below.
 _FUSED_RS_BLOCK_SIZES_OVERRIDE: FusedRsBlockConfig | None = None
 _FUSED_RS_LAST_SELECTED_BLOCK_SIZES: FusedRsBlockConfig | None = None
+_FUSED_RS_ROUTING_TABLE_IMPL = "jax"
 
 # Keys are the expanded routed-row count (tokens * top-k) because that is the M
 # dimension seen by the fused kernel. Tuned on 16 TPU v7x devices with balanced
@@ -125,6 +126,19 @@ def set_fused_rs_block_sizes_override(
 def get_last_fused_rs_block_sizes() -> FusedRsBlockConfig | None:
     """Return the effective sizes chosen during the most recent JAX trace."""
     return _FUSED_RS_LAST_SELECTED_BLOCK_SIZES
+
+
+def set_fused_rs_routing_table_impl(impl: str) -> None:
+    """Select the high-M routing-table materializer for one traced benchmark."""
+    if impl not in ("jax", "pallas"):
+        raise ValueError(f"routing table impl must be 'jax' or 'pallas'; got {impl!r}")
+    global _FUSED_RS_ROUTING_TABLE_IMPL
+    _FUSED_RS_ROUTING_TABLE_IMPL = impl
+
+
+def get_fused_rs_routing_table_impl() -> str:
+    """Return the materializer selected for the next high-M JAX trace."""
+    return _FUSED_RS_ROUTING_TABLE_IMPL
 
 
 def get_fused_rs_tuned_block_sizes(
@@ -204,8 +218,7 @@ def compute_num_gm(group_sizes, tile_m, size_lhs_sublane):
     return total_gm
 
 
-def _build_packed_index_tile_table(
-    packed_indices,
+def _build_packed_index_tile_metadata(
     group_sizes,
     group_offset,
     *,
@@ -214,14 +227,7 @@ def _build_packed_index_tile_table(
     size_lhs_sublane: int,
     max_num_gm: int,
 ):
-    """Materialize one aligned packed-index row per local GMM tile.
-
-    TPU HBM/VMEM int32 refs are tiled in 128-row vectors, so a scalar lookup
-    from a flat, dynamically shifted window is not legal when an expert starts
-    at an arbitrary row.  This table moves that irregular addressing to JAX:
-    the Pallas kernel DMA-loads one fixed ``[1, tile_m]`` row by ``gm_id`` and
-    then performs only statically aligned scalar reads within the row.
-    """
+    """Return the packed-index start and valid-row count for each local tile."""
     group_ends = jnp.cumsum(group_sizes, dtype=jnp.int32)
     group_starts = group_ends - group_sizes
     group_ids = jnp.arange(group_sizes.shape[0], dtype=jnp.int32)
@@ -256,6 +262,32 @@ def _build_packed_index_tile_table(
         min=0,
         max=tile_m,
     )
+    return tile_start, num_rows
+
+
+def _build_packed_index_tile_table(
+    packed_indices,
+    group_sizes,
+    group_offset,
+    *,
+    num_local_groups: int,
+    tile_m: int,
+    size_lhs_sublane: int,
+    max_num_gm: int,
+):
+    """Materialize one aligned packed-index row per local GMM tile with JAX.
+
+    This is the reference/fallback implementation.  Its final dynamic gather
+    can be offloaded to SparseCore for production-sized routing arrays.
+    """
+    tile_start, num_rows = _build_packed_index_tile_metadata(
+        group_sizes,
+        group_offset,
+        num_local_groups=num_local_groups,
+        tile_m=tile_m,
+        size_lhs_sublane=size_lhs_sublane,
+        max_num_gm=max_num_gm,
+    )
     row_in_tile = jnp.arange(tile_m, dtype=jnp.int32)[None, :]
     row_in_tile = jnp.minimum(row_in_tile, jnp.maximum(num_rows[:, None] - 1, 0))
     flat_rows = jnp.clip(
@@ -264,6 +296,115 @@ def _build_packed_index_tile_table(
         max=packed_indices.shape[0] - 1,
     )
     return packed_indices[flat_rows][:, None, :]
+
+
+def _packed_index_tile_table_kernel(
+    tile_starts_ref,
+    num_rows_ref,
+    packed_indices_hbm_ref,
+    out_ref,
+    staging_ref,
+    dma_sem_ref,
+    *,
+    tile_m: int,
+    load_rows: int,
+    rows_per_program: int,
+):
+    """Materialize one routing-table row without an irregular HBM gather."""
+    first_gm_id = pl.program_id(0) * rows_per_program
+    row_ids = jnp.arange(tile_m, dtype=jnp.int32)
+    for local_row in range(rows_per_program):
+        gm_id = first_gm_id + local_row
+        tile_start = tile_starts_ref[gm_id]
+        aligned_start = pl.multiple_of((tile_start // 128) * 128, 128)
+        row_offset = tile_start - aligned_start
+
+        copy = pltpu.make_async_copy(
+            packed_indices_hbm_ref.at[pl.ds(aligned_start, load_rows)],
+            staging_ref,
+            dma_sem_ref.at[0],
+        )
+        copy.start()
+        copy.wait()
+
+        num_rows = num_rows_ref[gm_id]
+        values = staging_ref[pl.ds(row_offset, tile_m)]
+        last_row = row_offset + jnp.maximum(num_rows - 1, 0)
+        last_value = staging_ref[last_row]
+        out_ref[local_row, 0, :] = jnp.where(
+            row_ids < num_rows,
+            values,
+            last_value,
+        )
+
+
+def _build_packed_index_tile_table_pallas(
+    packed_indices,
+    group_sizes,
+    group_offset,
+    *,
+    num_local_groups: int,
+    tile_m: int,
+    size_lhs_sublane: int,
+    max_num_gm: int,
+    interpret: bool = False,
+):
+    """Materialize the routing table using aligned Pallas HBM/VMEM DMAs."""
+    if tile_m % 128 != 0:
+        raise ValueError(f"Pallas routing table requires tile_m % 128 == 0; got {tile_m}")
+
+    tile_starts, num_rows = _build_packed_index_tile_metadata(
+        group_sizes,
+        group_offset,
+        num_local_groups=num_local_groups,
+        tile_m=tile_m,
+        size_lhs_sublane=size_lhs_sublane,
+        max_num_gm=max_num_gm,
+    )
+    # Inactive gm slots still launch a program.  Clamp them to a legal source
+    # row; num_rows=0 makes the output irrelevant to the consumer.
+    tile_starts = jnp.clip(tile_starts, 0, packed_indices.shape[0] - 1)
+    load_rows = tile_m + 128
+    rows_per_program = 8
+    padded_num_gm = align_to(max_num_gm, rows_per_program)
+    metadata_pad = padded_num_gm - max_num_gm
+    tile_starts = jnp.pad(tile_starts, (0, metadata_pad))
+    num_rows = jnp.pad(num_rows, (0, metadata_pad))
+    padded_rows = align_to(packed_indices.shape[0], 128) + load_rows
+    packed_padded = jnp.pad(
+        packed_indices,
+        (0, padded_rows - packed_indices.shape[0]),
+        mode="edge",
+    )
+
+    return pl.pallas_call(
+        functools.partial(
+            _packed_index_tile_table_kernel,
+            tile_m=tile_m,
+            load_rows=load_rows,
+            rows_per_program=rows_per_program,
+        ),
+        out_shape=jax.ShapeDtypeStruct((padded_num_gm, 1, tile_m), jnp.int32),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            grid=(padded_num_gm // rows_per_program,),
+            in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)],
+            out_specs=pl.BlockSpec(
+                (rows_per_program, 1, tile_m),
+                lambda program_id, *_: (program_id, 0, 0),
+            ),
+            scratch_shapes=[
+                pltpu.VMEM((load_rows,), jnp.int32),
+                pltpu.SemaphoreType.DMA((1,)),
+            ],
+        ),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",),
+            disable_bounds_checks=True,
+        ),
+        interpret=interpret,
+        name=f"fused-rs-routing-table-M_{tile_m}",
+    )(tile_starts, num_rows, packed_padded)[:max_num_gm]
 
 
 def compute_send_routing(output_indices, chunk_size):
@@ -2072,7 +2213,12 @@ def gmm_v2_fused_rs(
         packed_indices = lhs_indices.astype(jnp.int32) * top_k + topk_indices.astype(jnp.int32)
         if indices_in_hbm:
             primary_idx_ref = jnp.zeros((1,), dtype=jnp.int32)
-            primary_idx_hbm_ref = _build_packed_index_tile_table(
+            table_builder = (
+                _build_packed_index_tile_table_pallas
+                if _FUSED_RS_ROUTING_TABLE_IMPL == "pallas"
+                else _build_packed_index_tile_table
+            )
+            primary_idx_hbm_ref = table_builder(
                 packed_indices,
                 group_sizes,
                 group_offset,

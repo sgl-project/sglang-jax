@@ -10,6 +10,7 @@ from sgl_jax.srt.configs.quantization_config import QuantizationConfig
 from sgl_jax.srt.kernels.fused_moe.fused_rs import fused_moe_rs, gmm_fused_rs_nodedup
 from sgl_jax.srt.kernels.fused_moe.fused_rs.fused_moe_rs import _compute_rs_routing
 from sgl_jax.srt.kernels.fused_moe.fused_rs.gmm_fused_rs_nodedup import (
+    _build_packed_index_tile_metadata,
     _build_packed_index_tile_table,
 )
 from sgl_jax.srt.layers.fused_moe import FusedEPMoERS, FusedEPMoEV2
@@ -565,6 +566,8 @@ def test_fused_rs_high_m_index_tile_table_preserves_local_routed_rows():
     tile_m = 4
     sublane = 2
     expected_rows = []
+    expected_starts = []
+    expected_counts = []
     for expert_id in range(
         first_local_expert,
         first_local_expert + num_local_experts,
@@ -574,6 +577,8 @@ def test_fused_rs_high_m_index_tile_table_preserves_local_routed_rows():
         tile_start = group_start
         while tile_start < group_end:
             row_count = min(tile_m, group_end - tile_start)
+            expected_starts.append(tile_start)
+            expected_counts.append(row_count)
             row_ids = list(range(tile_start, tile_start + row_count))
             row_ids.extend([row_ids[-1]] * (tile_m - row_count))
             expected_rows.append(np.asarray(packed)[row_ids])
@@ -581,6 +586,17 @@ def test_fused_rs_high_m_index_tile_table_preserves_local_routed_rows():
             tile_start = (
                 group_start + first_capacity if tile_start == group_start else tile_start + tile_m
             )
+
+    tile_starts, num_rows = _build_packed_index_tile_metadata(
+        group_sizes,
+        jnp.asarray([first_local_expert], dtype=jnp.int32),
+        num_local_groups=num_local_experts,
+        tile_m=tile_m,
+        size_lhs_sublane=sublane,
+        max_num_gm=len(expected_rows),
+    )
+    np.testing.assert_array_equal(np.asarray(tile_starts), expected_starts)
+    np.testing.assert_array_equal(np.asarray(num_rows), expected_counts)
 
     actual = _build_packed_index_tile_table(
         packed,

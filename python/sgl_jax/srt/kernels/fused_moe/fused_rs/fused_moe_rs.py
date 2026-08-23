@@ -17,7 +17,6 @@ A single Pallas call performs: gather -> GMM1 -> activation -> GMM2 -> ICI
 reduce-scatter. Only the nodedup path is provided.
 """
 
-import functools
 import math
 
 import jax
@@ -498,18 +497,7 @@ def expert_parallel_gmm_rs(
     return result
 
 
-@functools.partial(
-    jax.jit,
-    static_argnames=(
-        "topk",
-        "renormalize",
-        "mesh",
-        "activation",
-        "scoring_fn",
-        "fp8_post_gather",
-    ),
-)
-def fused_moe_func_rs(
+def _fused_moe_func_rs_impl(
     hidden_states: jax.Array,
     w1: jax.Array,
     w2: jax.Array,
@@ -583,8 +571,38 @@ def fused_moe_func_rs(
     return result[:num_tokens, :hidden_size]
 
 
+_FUSED_MOE_RS_STATIC_ARGNAMES = (
+    "topk",
+    "renormalize",
+    "mesh",
+    "activation",
+    "scoring_fn",
+    "fp8_post_gather",
+)
+
+fused_moe_func_rs = jax.jit(
+    _fused_moe_func_rs_impl,
+    static_argnames=_FUSED_MOE_RS_STATIC_ARGNAMES,
+)
+
+# The strict EP32 trace showed that XLA placed both the 768 MiB BF16 Hidden
+# AllGather and the routing gather on SparseCore.  The latter was launched
+# asynchronously but could not execute until the former completed.  This
+# benchmarkable variant keeps sub-1 GiB AllGathers on TensorCore so the routing
+# SparseCore work can run concurrently.  It remains separate from the default
+# until target-TPU A/B evidence proves the end-to-end win.
+fused_moe_func_rs_tc_hidden_all_gather = jax.jit(
+    _fused_moe_func_rs_impl,
+    static_argnames=_FUSED_MOE_RS_STATIC_ARGNAMES,
+    compiler_options={
+        "xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes": str(1 << 30),
+    },
+)
+
+
 __all__ = [
     "fused_moe_func_rs",
+    "fused_moe_func_rs_tc_hidden_all_gather",
     "expert_parallel_gmm_rs",
     "moe_gmm_local_rs_nodedup",
     "_compute_rs_routing",

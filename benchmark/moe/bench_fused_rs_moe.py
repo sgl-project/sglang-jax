@@ -27,11 +27,15 @@ import numpy as np
 from jax.experimental import multihost_utils
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
-from sgl_jax.srt.kernels.fused_moe.fused_rs import fused_moe_func_rs
+from sgl_jax.srt.kernels.fused_moe.fused_rs import (
+    fused_moe_func_rs,
+    fused_moe_func_rs_tc_hidden_all_gather,
+)
 from sgl_jax.srt.kernels.fused_moe.fused_rs.gmm_fused_rs_nodedup import (
     FusedRsBlockConfig,
     get_last_fused_rs_block_sizes,
     set_fused_rs_block_sizes_override,
+    set_fused_rs_routing_table_impl,
 )
 from sgl_jax.srt.kernels.fused_moe.v2.kernel import FusedMoEBlockConfig, fused_ep_moe_v2
 from sgl_jax.srt.layers.fused_moe import fused_rs_shared_expert
@@ -591,7 +595,18 @@ def _v2_runner(mesh, num_tokens: int, *, layer_scope: bool) -> Callable:
     return jax.jit(run)
 
 
-def _rs_runner(mesh, *, layer_scope: bool) -> Callable:
+def _rs_runner(
+    mesh,
+    *,
+    layer_scope: bool,
+    hidden_all_gather_backend: str = "auto",
+) -> Callable:
+    rs_func = (
+        fused_moe_func_rs_tc_hidden_all_gather
+        if hidden_all_gather_backend == "tensorcore"
+        else fused_moe_func_rs
+    )
+
     def run(inputs):
         (
             tokens,
@@ -610,7 +625,7 @@ def _rs_runner(mesh, *, layer_scope: bool) -> Callable:
             w3_shared_scale,
             w2_shared_scale,
         ) = inputs
-        output = fused_moe_func_rs(
+        output = rs_func(
             hidden_states=tokens,
             w1=w1,
             w3=w3,
@@ -701,6 +716,10 @@ def _measure_rs_breakdown(
                 "fused_rs_topk_ids_all_gather",
                 "all-gather",
             ),
+            "routing_table_materialization": (
+                "fused-rs-routing-table-M_|gather_offload_custom_fusion",
+                None,
+            ),
         },
         tries=iters,
         warmup=warmup,
@@ -742,6 +761,21 @@ def main() -> None:
             "the Pallas task event, and the separately scoped BF16 hidden/topk-id "
             "AllGather device durations. This does not alter collective semantics."
         ),
+    )
+    parser.add_argument(
+        "--hidden-all-gather-backend",
+        choices=("auto", "tensorcore"),
+        default="auto",
+        help=(
+            "Use XLA's default Hidden AllGather placement, or keep sub-1 GiB "
+            "AllGathers on TensorCore to expose SparseCore routing overlap."
+        ),
+    )
+    parser.add_argument(
+        "--routing-table-impl",
+        choices=("jax", "pallas"),
+        default="jax",
+        help="Materialize the high-M packed routing table with JAX or Pallas.",
     )
     parser.add_argument(
         "--rs-configs",
@@ -811,6 +845,7 @@ def main() -> None:
         )
     if args.correctness_rel_l2_threshold <= 0:
         raise ValueError("--correctness-rel-l2-threshold must be positive")
+    set_fused_rs_routing_table_impl(args.routing_table_impl)
 
     if args.ep_size != 32:
         raise ValueError("This GLM-5.2 comparison is intentionally fixed to ep_size=32")
@@ -872,7 +907,11 @@ def main() -> None:
                 )
                 set_fused_rs_block_sizes_override(GLM52_RS_REFERENCE_CONFIG)
                 jax.clear_caches()
-                reference_run = _rs_runner(mesh, layer_scope=False)
+                reference_run = _rs_runner(
+                    mesh,
+                    layer_scope=False,
+                    hidden_all_gather_backend=args.hidden_all_gather_backend,
+                )
                 compile_start = time.perf_counter()
                 reference_out = reference_run(inputs)
                 jax.block_until_ready(reference_out)
@@ -910,6 +949,8 @@ def main() -> None:
                         "glm52_moe_layer" if args.layer_scope else "routed_backend"
                     ),
                     "routing_is_precomputed": True,
+                    "hidden_all_gather_backend": args.hidden_all_gather_backend,
+                    "routing_table_impl": args.routing_table_impl,
                     "includes_gate_topk": False,
                     "includes_shared_expert": args.layer_scope,
                     "includes_output_reshard": args.layer_scope,
@@ -985,7 +1026,11 @@ def main() -> None:
                     # The override is consumed during tracing. Clear cached traces so
                     # every candidate produces an executable with its own tile shapes.
                     jax.clear_caches()
-                    rs_run = _rs_runner(mesh, layer_scope=args.layer_scope)
+                    rs_run = _rs_runner(
+                        mesh,
+                        layer_scope=args.layer_scope,
+                        hidden_all_gather_backend=args.hidden_all_gather_backend,
+                    )
                     rs_out = None
                     compile_time_s = None
 
