@@ -1,10 +1,10 @@
-name: glm52-fused-rs-fp8-hidden-ag-explicit-oracle-r1-20260824
+name: glm52-fused-rs-fp8-hidden-ag-explicit-oracle-r2-20260824
 exp_type: TRAINING
 artifact_type: GCS
 cluster_name: tpu-training-antgroup
 priority: 0
 tags: [correctness, fused-moe, fused-rs, glm52, fp8-hidden-ag, oracle]
-config: '{"device_type":"v7x","physical_chips":4,"visible_devices":8,"ep_size":8,"cases":["m128_full_resident","m256_full_resident","m384_full_resident"],"source_commit":"f9068e2ab4535792b3f6901646efe59f7b90ac46","source_sha256":"44ed9ebcd9a30e1595311cd73663845238fd56f3adafee095f0de63a5892349a"}'
+config: '{"device_type":"v7x","physical_chips":4,"visible_devices":8,"ep_size":8,"cases":["m128_rank_distinct","m256_rank_distinct","m384_rank_distinct","m128_uniform_rank_scale"],"source_commit":"1d8734127d87771e0b906dec46918783d41af794","source_sha256":"96b66bdcacd73228c931ce9a15c5b5bb1e1d2534ae481110f0dc1ec23a60df0d"}'
 role_to_task_spec:
   worker:
     replica: 1
@@ -26,8 +26,8 @@ role_to_task_spec:
       export JAX_COMPILATION_CACHE_DIR=/tmp/tpu_logs/jax-cache
       mkdir -p "$TMPDIR" "$PIP_CACHE_DIR" "$UV_CACHE_DIR" "$JAX_COMPILATION_CACHE_DIR"
 
-      source_tar=/tmp/glm52-fused-rs-fp8-hidden-ag-oracle-r1.tar.gz.part
-      source_ready=/tmp/glm52-fused-rs-fp8-hidden-ag-oracle-r1.ready
+      source_tar=/tmp/glm52-fused-rs-fp8-hidden-ag-oracle-r2.tar.gz.part
+      source_ready=/tmp/glm52-fused-rs-fp8-hidden-ag-oracle-r2.ready
       attempt=0
       while [ ! -f "$source_ready" ]; do
         attempt=$((attempt + 1))
@@ -38,7 +38,7 @@ role_to_task_spec:
         sleep 5
       done
       test -f "$source_tar"
-      echo '44ed9ebcd9a30e1595311cd73663845238fd56f3adafee095f0de63a5892349a  /tmp/glm52-fused-rs-fp8-hidden-ag-oracle-r1.tar.gz.part' | sha256sum -c -
+      echo '96b66bdcacd73228c931ce9a15c5b5bb1e1d2534ae481110f0dc1ec23a60df0d  /tmp/glm52-fused-rs-fp8-hidden-ag-oracle-r2.tar.gz.part' | sha256sum -c -
 
       mkdir -p /workspace/sglang-jax
       tar -xzf "$source_tar" -C /workspace/sglang-jax
@@ -49,4 +49,4 @@ role_to_task_spec:
       python3 -m benchmark.moe.bench_fused_rs_fp8_hidden_ag_oracle \
         --jsonl "$OUT/benchmark/metrics.jsonl"
 
-      test "$(wc -l < "$OUT/benchmark/metrics.jsonl")" -eq 3
+      test "$(wc -l < "$OUT/benchmark/metrics.jsonl")" -eq 4
