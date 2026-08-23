@@ -1108,14 +1108,14 @@ class Glm5ForCausalLM(nnx.Module):
 
 
     def get_embed_and_head(self):
-        return self.embed_tokens.embedding.value, self.lm_head.embedding.value
+        return self.model.embed_tokens.embedding.value, self.lm_head.embedding.value
 
     def set_embed_and_head(self, embed, head) -> None:
-        self.embed_tokens.embedding.value = embed
+        self.model.embed_tokens.embedding.value = embed
         self.lm_head.embedding.value = head
 
     def set_embed(self, embed) -> None:
-        self.embed_tokens.embedding.value = embed
+        self.model.embed_tokens.embedding.value = embed
 
     def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(
