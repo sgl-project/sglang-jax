@@ -132,11 +132,18 @@ def apply_fused_mlp_sharded(
         P(None, "tensor"),  # w_gu (combined gate/up weight, sharded along tensor axis)
         P("tensor", None),  # wd (down weight, sharded along tensor axis)
     )
-    out_specs = x.sharding.spec if hasattr(x, "sharding") else P(None, None)
+    in_specs = (
+        jax.sharding.PartitionSpec("data", None),  # x
+        jax.sharding.PartitionSpec(None, "tensor"),  # w_gu (combined gate/up weight, sharded along tensor axis)
+        jax.sharding.PartitionSpec("tensor", None),  # wd (down weight, sharded along tensor axis)
+    )
+    out_specs = jax.sharding.PartitionSpec("data", None)
 
     @functools.partial(
         shard_map,
         mesh=mesh,
+        in_specs=in_specs,
+        out_specs=out_specs,
     )
     def local_fused_mlp(x_loc, w_gu_loc, wd_loc):
         seq_len, hidden_size = x_loc.shape
