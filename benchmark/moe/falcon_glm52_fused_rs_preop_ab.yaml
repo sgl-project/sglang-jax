@@ -124,6 +124,7 @@ role_to_task_spec:
         --iters 5 \
         --trace-root "$OUT/profiling/xprof/raw" \
         --jsonl "$OUT/benchmark/preop_ab.jsonl"
+      cp "$OUT/benchmark/preop_ab.jsonl" "$OUT/benchmark/metrics.jsonl"
 
       trace_index=0
       for trace_file in $(find "$OUT/profiling/xprof/raw" -type f -name '*.xplane.pb'); do
