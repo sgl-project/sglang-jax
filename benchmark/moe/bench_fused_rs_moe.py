@@ -614,6 +614,7 @@ def _rs_runner(
     *,
     layer_scope: bool,
     hidden_all_gather_backend: str = "auto",
+    fp8_hidden_all_gather: bool = False,
 ) -> Callable:
     compiler_options = (
         {
@@ -661,6 +662,7 @@ def _rs_runner(
             scoring_fn="softmax",
             topk_weights=topk_weights,
             topk_indices=topk_ids,
+            fp8_hidden_all_gather=fp8_hidden_all_gather,
         )
         if layer_scope:
             shared_output = fused_rs_shared_expert(
@@ -780,7 +782,12 @@ def _measure_rs_breakdown(
         lambda: (inputs,),
         task=task,
         stage_scopes={
+            "hidden_quantize": ("fused_rs_hidden_quantize", None),
             "hidden_all_gather": ("fused_rs_hidden_all_gather", "all-gather"),
+            "hidden_scale_all_gather": (
+                "fused_rs_hidden_scale_all_gather",
+                "all-gather",
+            ),
             "topk_ids_all_gather": (
                 "fused_rs_topk_ids_all_gather",
                 "all-gather",

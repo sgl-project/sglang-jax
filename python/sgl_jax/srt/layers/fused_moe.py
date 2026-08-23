@@ -801,6 +801,15 @@ class FusedEPMoERS(FusedEPMoEV2):
     full HBM ``concatenate`` or a duplicated merged checkpoint parameter.
     """
 
+    def __init__(
+        self,
+        *args,
+        fp8_hidden_all_gather: bool = False,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.fp8_hidden_all_gather = fp8_hidden_all_gather
+
     def _shared_expert_for_rs(
         self,
         hidden_states: jax.Array,
@@ -881,6 +890,7 @@ class FusedEPMoERS(FusedEPMoEV2):
             scoring_fn="softmax",
             topk_weights=rs_topk_weights,
             topk_indices=rs_topk_ids,
+            fp8_hidden_all_gather=self.fp8_hidden_all_gather,
         )
 
         if self.w1_shared is not None and not self.disable_shared_expert:

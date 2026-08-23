@@ -125,6 +125,28 @@ def _assert_fused_rs_smem_safe(size_m: int) -> None:
     assert size_m > 0, f"gmm_v2_fused_rs requires positive size_m, got {size_m}"
 
 
+def _quantize_hidden_per_tensor(
+    hidden_local: jax.Array,
+    topk_indices_local: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Quantize one EP rank's physical hidden shard with one FP32 scale.
+
+    The scale covers the complete physical shard, so changing only its routing
+    padding does not change active-token quantization. Invalid rows are encoded
+    as zero because the fused kernel never consumes them.
+    """
+    hidden_f32 = hidden_local.astype(jnp.float32)
+    valid_tokens = jnp.any(topk_indices_local >= 0, axis=-1, keepdims=True)
+    fp8_max = jnp.asarray(jnp.finfo(jnp.float8_e4m3fn).max, dtype=jnp.float32)
+    amax = jnp.max(jnp.abs(hidden_f32))
+    scale = jnp.maximum(amax, jnp.asarray(1e-12, dtype=jnp.float32)) / fp8_max
+    quantized = jnp.clip(hidden_f32 / scale, -fp8_max, fp8_max).astype(
+        jnp.float8_e4m3fn
+    )
+    quantized = jnp.where(valid_tokens, quantized, jnp.zeros_like(quantized))
+    return quantized, scale
+
+
 def _all_gather_token_hidden(
     token_hidden: jax.Array,
     *,
@@ -194,6 +216,7 @@ def moe_gmm_local_rs_nodedup(
     topk_indices: jax.Array,
     post_expert_norm_weight_input: jax.Array | None = None,
     *,
+    hidden_states_scale: jax.Array | None = None,
     w3: jax.Array | None = None,
     w3_scale: jax.Array | None = None,
     activation: str,
@@ -255,7 +278,9 @@ def moe_gmm_local_rs_nodedup(
         size_group=num_local_experts,
         size_lhs_group=group_sizes.shape[0],
         ep_size=ep_size,
-        out_dtype=hidden_states_local.dtype,
+        out_dtype=(
+            jnp.bfloat16 if hidden_states_scale is not None else hidden_states_local.dtype
+        ),
         w1_dtype=w1.dtype,
         w2_dtype=w2.dtype,
         is_quantized=w1_scale is not None,
@@ -277,6 +302,7 @@ def moe_gmm_local_rs_nodedup(
         group_sizes,
         lhs_indices,
         output_indices,
+        hidden_states_scale=hidden_states_scale,
         w3=w3,
         w1_scale=w1_scale,
         w3_scale=w3_scale,
@@ -358,6 +384,7 @@ def expert_parallel_gmm_rs(
     w1_global_scale: jax.Array | None = None,
     w2_global_scale: jax.Array | None = None,
     fp8_post_gather: bool = False,
+    fp8_hidden_all_gather: bool = False,
 ) -> jax.Array:
     """Run fused-RS with sglang-jax's token-sharded model mesh.
 
@@ -368,6 +395,20 @@ def expert_parallel_gmm_rs(
     kernel's direct writes form the matching reduce-scatter on exit.
     """
     del fp8_post_gather
+    if fp8_hidden_all_gather:
+        if (
+            w1_scale is None
+            or w2_scale is None
+            or (w3 is not None and w3_scale is None)
+        ):
+            raise ValueError(
+                "FP8 Hidden AllGather currently requires the fused-RS W8A8 "
+                "weight-scale path"
+            )
+        if w1.dtype != jnp.float8_e4m3fn or w2.dtype != jnp.float8_e4m3fn:
+            raise ValueError(
+                "FP8 Hidden AllGather currently requires float8_e4m3fn expert weights"
+            )
     expert_axis = get_moe_expert_axis(mesh)
     ep_size = get_mesh_shape_product(mesh, expert_axis)
     ep_p_spec = P(expert_axis)
@@ -415,13 +456,35 @@ def expert_parallel_gmm_rs(
         # Keep the two upstream collectives separately identifiable in a real
         # fused-RS trace.  These scopes are diagnostic metadata only: the
         # collective implementation and sharding contract remain unchanged.
-        with jax.named_scope("fused_rs_hidden_all_gather"):
-            hidden_global = jax.lax.all_gather(
-                hidden_local,
-                axis_name=expert_axis,
-                axis=0,
-                tiled=True,
-            )
+        hidden_scale_global = None
+        if fp8_hidden_all_gather:
+            with jax.named_scope("fused_rs_hidden_quantize"):
+                hidden_payload_local, hidden_scale_local = _quantize_hidden_per_tensor(
+                    hidden_local,
+                    topk_indices_local,
+                )
+            with jax.named_scope("fused_rs_hidden_all_gather"):
+                hidden_global = jax.lax.all_gather(
+                    hidden_payload_local,
+                    axis_name=expert_axis,
+                    axis=0,
+                    tiled=True,
+                )
+            with jax.named_scope("fused_rs_hidden_scale_all_gather"):
+                hidden_scale_global = jax.lax.all_gather(
+                    hidden_scale_local[None],
+                    axis_name=expert_axis,
+                    axis=0,
+                    tiled=True,
+                )
+        else:
+            with jax.named_scope("fused_rs_hidden_all_gather"):
+                hidden_global = jax.lax.all_gather(
+                    hidden_local,
+                    axis_name=expert_axis,
+                    axis=0,
+                    tiled=True,
+                )
         with jax.named_scope("fused_rs_topk_ids_all_gather"):
             topk_indices_global = jax.lax.all_gather(
                 topk_indices_local,
@@ -443,6 +506,7 @@ def expert_parallel_gmm_rs(
             topk_weights_local,
             topk_indices_global,
             post_norm_weight_local,
+            hidden_states_scale=hidden_scale_global,
             w3=w3_local,
             w3_scale=w3_scale_local,
             activation=activation,
@@ -515,6 +579,7 @@ def _fused_moe_func_rs_impl(
     topk_weights: jax.Array | None = None,
     topk_indices: jax.Array | None = None,
     fp8_post_gather: bool = False,
+    fp8_hidden_all_gather: bool = False,
     w3: jax.Array | None = None,
     w3_scale: jax.Array | None = None,
 ) -> jax.Array:
@@ -566,6 +631,7 @@ def _fused_moe_func_rs_impl(
         mesh=mesh,
         post_expert_norm_weight=post_expert_norm_weight,
         fp8_post_gather=fp8_post_gather,
+        fp8_hidden_all_gather=fp8_hidden_all_gather,
     )
 
     return result[:num_tokens, :hidden_size]
@@ -578,6 +644,7 @@ _FUSED_MOE_RS_STATIC_ARGNAMES = (
     "activation",
     "scoring_fn",
     "fp8_post_gather",
+    "fp8_hidden_all_gather",
 )
 
 fused_moe_func_rs = jax.jit(
@@ -608,4 +675,5 @@ __all__ = [
     "_compute_rs_routing",
     "_FUSED_RS_MAX_SAFE_SIZE_M",
     "_assert_fused_rs_smem_safe",
+    "_quantize_hidden_per_tensor",
 ]

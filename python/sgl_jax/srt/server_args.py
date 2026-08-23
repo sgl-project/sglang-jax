@@ -187,6 +187,7 @@ class ServerArgs:
     dsa_topk_impl: str = "approx"
     moe_backend: str = "epmoe"
     disable_jax_allreduce_metadata: bool = False
+    fused_rs_fp8_hidden_all_gather: bool = False
     enable_topk_kernel: bool = True
 
     grammar_backend: str | None = None
@@ -1441,6 +1442,17 @@ class ServerArgs:
                 "Disable the pure JAX allreduce metadata path for fused EP-MoE; "
                 "fall back to the Pallas DMA-based allgather. "
                 "Default uses JAX path (recommended)."
+            ),
+        )
+        parser.add_argument(
+            "--fused-rs-fp8-hidden-all-gather",
+            action="store_true",
+            default=ServerArgs.fused_rs_fp8_hidden_all_gather,
+            help=(
+                "Quantize each EP rank's physical fused-RS hidden shard with "
+                "one FP8 E4M3FN scale before the input AllGather; invalid "
+                "payload rows are zeroed. Experimental; the BF16 path remains "
+                "the default."
             ),
         )
         parser.add_argument(

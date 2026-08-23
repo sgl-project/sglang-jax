@@ -1064,6 +1064,11 @@ class Glm5DecoderLayer(nnx.Module):
                     num_shared_experts=num_shared_experts if use_inkernel_se else 0,
                     moe_shared_expert_intermediate_size=config.moe_intermediate_size,
                     quantization_config=getattr(config, "quantization_config", None),
+                    fp8_hidden_all_gather=getattr(
+                        config,
+                        "fused_rs_fp8_hidden_all_gather",
+                        False,
+                    ),
                 )
 
                 quant_config = getattr(config, "quantization_config", None)

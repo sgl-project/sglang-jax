@@ -509,6 +509,9 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.model_config.hf_config.use_jax_allreduce_metadata = (
             not self.server_args.disable_jax_allreduce_metadata
         )
+        self.model_config.hf_config.fused_rs_fp8_hidden_all_gather = (
+            self.server_args.fused_rs_fp8_hidden_all_gather
+        )
         # Pick MLA forward path at server start. Only `fa` selects absorbed
         # (the MLA Pallas kernel); `fa_mha` and `native` both decompress latent
         # KV via kv_b_proj and run standard attention. Read by

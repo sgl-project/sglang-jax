@@ -173,6 +173,7 @@ class InputConfigs:
     quant_dtype: jnp.dtype | None
     quant_block_size: int | None
     dtype: jnp.dtype
+    prequantized: bool = False
     has_bias: bool = False
     has_scale: bool = False
     packing: int = 1
@@ -329,6 +330,7 @@ def inner_kernel(
     metadata_ref: MetadataRef,
     *,
     cfgs: GmmConfigs,
+    tiled_lhs_scale: jax.Array | None = None,
     gs_gate_ref=None,
     gs_up_ref=None,
     scatter_mode: bool = False,
@@ -444,6 +446,8 @@ def inner_kernel(
             # blocks use amax_safe=1 and scale=0.
             q_block_size: int | None = cfgs.lhs_cfgs.quant_block_size
             fp8_activation_quant = cfgs.lhs_cfgs.quant_dtype is not None
+            if cfgs.lhs_cfgs.prequantized and tiled_lhs_scale is None:
+                raise ValueError("prequantized LHS requires a row-wise activation scale")
             rhs_qbs = cfgs.rhs_cfgs.quant_block_size
             rhs_scale_matches_lhs_block = rhs_qbs >= q_block_size and rhs_qbs % q_block_size == 0
             apply_rhs_scale_after_matmul = cfgs.rhs_cfgs.has_scale and (rhs_scale_matches_lhs_block)
@@ -496,11 +500,15 @@ def inner_kernel(
                         block_rhs_for_quant = block_rhs.astype(jnp.bfloat16)
 
                     if fp8_activation_quant:
-                        block_lhs_for_matmul, lhs_scale = _online_quantize(
-                            block_lhs,
-                            axis=1,
-                            quant_dtype=cfgs.lhs_cfgs.quant_dtype,
-                        )
+                        if cfgs.lhs_cfgs.prequantized:
+                            block_lhs_for_matmul = block_lhs
+                            lhs_scale = tiled_lhs_scale
+                        else:
+                            block_lhs_for_matmul, lhs_scale = _online_quantize(
+                                block_lhs,
+                                axis=1,
+                                quant_dtype=cfgs.lhs_cfgs.quant_dtype,
+                            )
                         if cfgs.rhs_cfgs.has_scale and not apply_rhs_scale_after_matmul:
                             # Fold small RHS scale blocks into RHS first, then
                             # requantize to the activation quant dtype so

@@ -19,6 +19,9 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.fused_moe.fused_rs import fused_moe_func_rs
+from sgl_jax.srt.kernels.fused_moe.fused_rs.fused_moe_rs import (
+    _quantize_hidden_per_tensor,
+)
 from sgl_jax.srt.kernels.fused_moe.fused_rs.gmm_fused_rs_nodedup import (
     set_fused_rs_block_sizes_override,
 )
@@ -120,7 +123,13 @@ def _make_inputs(mesh: jax.sharding.Mesh, *, quantized: bool, num_tokens: int):
     return replicated_inputs, kernel_inputs, token_sharding
 
 
-def _explicit_reference(inputs, *, quantized: bool):
+def _explicit_reference(
+    inputs,
+    *,
+    quantized: bool,
+    fp8_hidden_all_gather: bool = False,
+    ep_size: int = 1,
+):
     """Compute the routed MoE result without the fused RS kernel."""
     tokens, w1, w3, w2, s1, s3, s2, topk_weights, topk_ids = inputs
     tokens_f32 = tokens.astype(jnp.float32)
@@ -128,9 +137,34 @@ def _explicit_reference(inputs, *, quantized: bool):
     fp8_max = jnp.asarray(jnp.finfo(FP8).max, dtype=jnp.float32)
 
     if quantized:
-        token_amax = jnp.max(jnp.abs(tokens_f32), axis=-1, keepdims=True)
-        token_scale = jnp.maximum(token_amax, 1e-12) / fp8_max
-        gmm1_lhs = jnp.clip(tokens_f32 / token_scale, -fp8_max, fp8_max).astype(FP8)
+        if fp8_hidden_all_gather:
+            local_tokens = tokens.shape[0] // ep_size
+            token_shards = tokens_f32.reshape(ep_size, local_tokens, tokens.shape[-1])
+            shard_amax = jnp.max(
+                jnp.abs(token_shards),
+                axis=(1, 2),
+                keepdims=True,
+            )
+            shard_scale = jnp.maximum(shard_amax, 1e-12) / fp8_max
+            gmm1_lhs = jnp.clip(
+                token_shards / shard_scale,
+                -fp8_max,
+                fp8_max,
+            ).astype(FP8)
+            token_scale = jnp.broadcast_to(
+                shard_scale,
+                (ep_size, local_tokens, 1),
+            ).reshape(tokens.shape[0], 1)
+            valid_tokens = jnp.any(topk_ids >= 0, axis=-1, keepdims=True)
+            gmm1_lhs = jnp.where(
+                valid_tokens,
+                gmm1_lhs.reshape(tokens.shape),
+                jnp.zeros(tokens.shape, dtype=FP8),
+            )
+        else:
+            token_amax = jnp.max(jnp.abs(tokens_f32), axis=-1, keepdims=True)
+            token_scale = jnp.maximum(token_amax, 1e-12) / fp8_max
+            gmm1_lhs = jnp.clip(tokens_f32 / token_scale, -fp8_max, fp8_max).astype(FP8)
     else:
         token_scale = jnp.ones(tokens_f32.shape[:-1] + (1,), dtype=jnp.float32)
         gmm1_lhs = tokens
@@ -193,7 +227,45 @@ class MoERSKernelTest(jtu.JaxTestCase):
         set_fused_rs_block_sizes_override(None)
         super().tearDown()
 
-    def _test_config(self, config, *, quantized: bool, num_tokens: int):
+    def test_fp8_hidden_quantization_uses_one_physical_shard_scale(self):
+        hidden = jnp.asarray(
+            [
+                [1.0, -2.0, 0.5, -0.25],
+                [4.0, -1.0, 2.0, -3.0],
+                [8.0, -8.0, 4.0, -4.0],
+            ],
+            dtype=jnp.bfloat16,
+        )
+        topk_ids = jnp.asarray(
+            [[0, 1], [1, 0], [-1, -1]],
+            dtype=jnp.int32,
+        )
+
+        quantized, scale = _quantize_hidden_per_tensor(hidden, topk_ids)
+        quantized_host = np.asarray(quantized, dtype=np.float32)
+        scale_host = float(np.asarray(scale))
+
+        self.assertEqual(quantized.dtype, FP8)
+        self.assertEqual(scale.shape, ())
+        self.assertAlmostEqual(scale_host, 8.0 / float(jnp.finfo(FP8).max))
+        self.assertAllClose(quantized_host[2], np.zeros((4,), np.float32))
+
+        dequantized = quantized.astype(jnp.float32) * scale
+        expected = jnp.where(
+            jnp.any(topk_ids >= 0, axis=-1, keepdims=True),
+            hidden.astype(jnp.float32),
+            0.0,
+        )
+        self.assertAllClose(dequantized, expected, atol=scale_host, rtol=0.0)
+
+    def _test_config(
+        self,
+        config,
+        *,
+        quantized: bool,
+        num_tokens: int,
+        fp8_hidden_all_gather: bool = False,
+    ):
         reference_inputs, kernel_inputs, token_sharding = _make_inputs(
             self.mesh,
             quantized=quantized,
@@ -203,9 +275,14 @@ class MoERSKernelTest(jtu.JaxTestCase):
 
         expected = jax.jit(
             _explicit_reference,
-            static_argnames=("quantized",),
+            static_argnames=("quantized", "fp8_hidden_all_gather", "ep_size"),
             out_shardings=token_sharding,
-        )(reference_inputs, quantized=quantized)
+        )(
+            reference_inputs,
+            quantized=quantized,
+            fp8_hidden_all_gather=fp8_hidden_all_gather,
+            ep_size=self.mesh.size,
+        )
 
         set_fused_rs_block_sizes_override(config)
         actual = fused_moe_func_rs(
@@ -226,6 +303,7 @@ class MoERSKernelTest(jtu.JaxTestCase):
             scoring_fn="softmax",
             topk_weights=topk_weights,
             topk_indices=topk_ids,
+            fp8_hidden_all_gather=fp8_hidden_all_gather,
         )
         jax.block_until_ready((expected, actual))
 
@@ -246,6 +324,7 @@ class MoERSKernelTest(jtu.JaxTestCase):
         *,
         num_tokens: int,
         active_tokens_per_device: int,
+        fp8_hidden_all_gather: bool = False,
     ):
         reference_inputs, kernel_inputs, token_sharding = _make_inputs(
             self.mesh,
@@ -286,9 +365,14 @@ class MoERSKernelTest(jtu.JaxTestCase):
 
         expected_padded = jax.jit(
             _explicit_reference,
-            static_argnames=("quantized",),
+            static_argnames=("quantized", "fp8_hidden_all_gather", "ep_size"),
             out_shardings=token_sharding,
-        )(padded_reference_inputs, quantized=True)
+        )(
+            padded_reference_inputs,
+            quantized=True,
+            fp8_hidden_all_gather=fp8_hidden_all_gather,
+            ep_size=self.mesh.size,
+        )
 
         set_fused_rs_block_sizes_override(config)
 
@@ -311,6 +395,7 @@ class MoERSKernelTest(jtu.JaxTestCase):
                 scoring_fn="softmax",
                 topk_weights=weights,
                 topk_indices=indices,
+                fp8_hidden_all_gather=fp8_hidden_all_gather,
             )
 
         all_active = run(topk_weights, topk_ids)
@@ -369,6 +454,21 @@ class MoERSKernelTest(jtu.JaxTestCase):
         self._test_config(config, quantized=True, num_tokens=num_tokens)
 
     @parameterized.named_parameters(
+        ("m128_full_resident", (128, 512, 512, 512, 512, 1, 1), 48),
+        ("m256_full_resident", (256, 512, 512, 512, 512, 1, 1), 72),
+        ("m384_full_resident", (384, 512, 512, 512, 512, 1, 1), 136),
+    )
+    def test_fp8_hidden_all_gather_matches_per_tensor_reference(
+        self, config, num_tokens
+    ):
+        self._test_config(
+            config,
+            quantized=True,
+            num_tokens=num_tokens,
+            fp8_hidden_all_gather=True,
+        )
+
+    @parameterized.named_parameters(
         ("m128_full_resident", (128, 512, 512, 512, 512, 1, 1), 48, 3),
         ("m256_full_resident", (256, 512, 512, 512, 512, 1, 1), 72, 5),
         ("m384_full_resident", (384, 512, 512, 512, 512, 1, 1), 136, 8),
@@ -383,6 +483,24 @@ class MoERSKernelTest(jtu.JaxTestCase):
             config,
             num_tokens=num_tokens,
             active_tokens_per_device=active_tokens_per_device,
+        )
+
+    @parameterized.named_parameters(
+        ("m128_full_resident", (128, 512, 512, 512, 512, 1, 1), 48, 3),
+        ("m256_full_resident", (256, 512, 512, 512, 512, 1, 1), 72, 5),
+        ("m384_full_resident", (384, 512, 512, 512, 512, 1, 1), 136, 8),
+    )
+    def test_fp8_hidden_all_gather_padding_contract(
+        self,
+        config,
+        num_tokens,
+        active_tokens_per_device,
+    ):
+        self._test_padding_contract(
+            config,
+            num_tokens=num_tokens,
+            active_tokens_per_device=active_tokens_per_device,
+            fp8_hidden_all_gather=True,
         )
 
 

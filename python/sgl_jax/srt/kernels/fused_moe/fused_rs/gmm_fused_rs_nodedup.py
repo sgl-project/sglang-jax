@@ -724,7 +724,7 @@ def _select_fused_rs_block_sizes(
 
 
 def kernel_main_fused_rs(
-    # Scalar prefetch (9) — `output_indices` was dropped (== lhs_indices for EP).
+    # Scalar prefetch (10) — `output_indices` was dropped (== lhs_indices for EP).
     # `topk_indices_ref` is included but conditionally used:
     #   - pack_indices=False: lhs_indices_ref holds raw lhs_idx values, and
     #     topk_indices_ref holds raw topk_slot values (both size_m).
@@ -740,6 +740,7 @@ def kernel_main_fused_rs(
     w1_gs_gate_ref,  # (E,) GMM1 gate global_scale
     w1_gs_up_ref,  # (E,) GMM1 up global_scale
     w2_gs_ref,  # (E,) GMM2 global_scale
+    hidden_states_scale_ref,  # (EP,) per-source-rank activation scale
     # In (10)
     lhs_indices_hbm_ref,
     hidden_states_ref,
@@ -1115,7 +1116,7 @@ def kernel_main_fused_rs(
 
     # --- GMM compute helpers ---
     @jax.named_scope("compute_gmm1_tile")
-    def compute_gmm1_tile(buf_id, n_id, k_id, gm_id):
+    def compute_gmm1_tile(buf_id, n_id, k_id, gm_id, tiled_lhs_scale):
         sem_id = gm_id % 2
         k_cols = tile_k1 // num_lanes
         k_offset = k_id * k_cols
@@ -1146,6 +1147,7 @@ def kernel_main_fused_rs(
             shared_acc_ref.at[:, pl.ds(0, tile_n1 * 2 if act_fn else tile_n1)],
             fused_metadata_ref,
             cfgs=cfgs1,
+            tiled_lhs_scale=tiled_lhs_scale,
             gs_gate_ref=w1_gs_gate_ref,
             gs_up_ref=w1_gs_up_ref,
             scatter_mode=True,
@@ -1309,25 +1311,25 @@ def kernel_main_fused_rs(
 
             # --- DMA gather (issued after weight DMAs are in flight) ---
             _gather_divisor = top_k if pack_indices else 1
+            current_gather_meta = prepare_gather_tile_metadata(
+                gm_id,
+                metadata_ref,
+                tile_m=tile_m,
+                size_m=fused_dims.size_m,
+                lhs_indices_ref=current_lhs_indices_ref,
+                pack_indices=pack_indices,
+                gather_divisor=_gather_divisor,
+                indices_are_tile_local=indices_in_hbm,
+            )
 
             @jax.named_scope("dma_gather_start")
             @pl.when(gm_id == 0)
             def _():
-                gather_meta_0 = prepare_gather_tile_metadata(
-                    0,
-                    metadata_ref,
-                    tile_m=tile_m,
-                    size_m=fused_dims.size_m,
-                    lhs_indices_ref=current_lhs_indices_ref,
-                    pack_indices=pack_indices,
-                    gather_divisor=_gather_divisor,
-                    indices_are_tile_local=indices_in_hbm,
-                )
                 dma_gather_gm_start(
                     hidden_states_ref,
                     gathered_lhs_2x_ref.at[sem_id],
                     gather_sem_ref.at[sem_id],
-                    gather_meta_0,
+                    current_gather_meta,
                 )
 
             @jax.named_scope("dma_gather_prefetch")
@@ -1363,6 +1365,35 @@ def kernel_main_fused_rs(
                 scatter_meta,
             )
 
+            tiled_lhs_scale = None
+            if cfgs1.lhs_cfgs.prequantized:
+                source_scales = []
+                for src_row in current_gather_meta.src_rows:
+                    src_rank = src_row // chunk_size
+                    # Scalar prefetch refs live in SMEM, whose dynamic scalar
+                    # indexing is supported.  Avoid expanding tile_m * EP
+                    # select chains in the Pallas program.
+                    source_scales.append(hidden_states_scale_ref[src_rank])
+                aligned_scales = jnp.stack(source_scales)
+                row_offset = current_gather_meta.m_start % dims.size_lhs_sublane
+                # The hidden DMA places its first valid row at row_offset.
+                # Keep scale rows aligned without a TPU-unsupported dynamic
+                # register-vector slice.
+                for shift in (64, 32, 16, 8, 4, 2, 1):
+                    if shift < tile_m:
+                        shifted = jnp.concatenate(
+                            (
+                                jnp.zeros((shift,), dtype=aligned_scales.dtype),
+                                aligned_scales[:-shift],
+                            )
+                        )
+                        aligned_scales = jnp.where(
+                            (row_offset & shift) != 0,
+                            shifted,
+                            aligned_scales,
+                        )
+                tiled_lhs_scale = aligned_scales[:, None]
+
             # GMM1 loop.
             for step in range(total_w1_steps):
                 _n1 = step // num_k1
@@ -1378,7 +1409,7 @@ def kernel_main_fused_rs(
                 if step + num_w1_bufs < total_w1_steps:
                     ns = step + num_w1_bufs
                     start_w1_dma(ns % num_w1_bufs, expert_id, ns // num_k1, ns % num_k1)
-                compute_gmm1_tile(buf_id, _n1, _k1, gm_id)
+                compute_gmm1_tile(buf_id, _n1, _k1, gm_id, tiled_lhs_scale)
                 if step == 0:
 
                     @pl.when(gm_id + 1 < local_num_gm)
@@ -1787,6 +1818,7 @@ def gmm_v2_fused_rs(
     lhs_indices: jax.Array,
     output_indices: jax.Array,
     *,
+    hidden_states_scale: jax.Array | None = None,
     w3: jax.Array | None = None,
     w1_scale: jax.Array | None = None,
     w3_scale: jax.Array | None = None,
@@ -1813,6 +1845,7 @@ def gmm_v2_fused_rs(
     Post-kernel reduction applies topk_weights and sums over top_k dim.
     """
     size_group, size_k1, gate_n1 = w1.shape
+    prequantized_lhs = hidden_states_scale is not None
     separate_gate_up = w3 is not None
     if separate_gate_up:
         if not act_fn:
@@ -1828,6 +1861,13 @@ def gmm_v2_fused_rs(
     chunk_size = output_size // ep_size
 
     is_quantized = w1_scale is not None
+    if prequantized_lhs and not is_quantized:
+        raise ValueError("FP8 Hidden AllGather requires quantized expert weights")
+    if prequantized_lhs and hidden_states.dtype != jnp.float8_e4m3fn:
+        raise ValueError(
+            "prequantized fused-RS input must use float8_e4m3fn; "
+            f"got {hidden_states.dtype}"
+        )
     if is_quantized:
         assert w2_scale is not None
         if separate_gate_up:
@@ -1835,6 +1875,13 @@ def gmm_v2_fused_rs(
             assert w3_scale.shape == w1_scale.shape
         rhs1_quant_block_size = _recover_quant_block_size(size_k1, w1_scale.shape[1])
         rhs2_quant_block_size = _recover_quant_block_size(size_k2, w2_scale.shape[1])
+        if prequantized_lhs and (
+            rhs1_quant_block_size != size_k1 or rhs2_quant_block_size != size_k2
+        ):
+            raise ValueError(
+                "FP8 Hidden AllGather currently supports only per-channel "
+                "W8A8 expert scales"
+            )
         quant_block_size = rhs1_quant_block_size
         w1_scale = w1_scale.astype(jnp.float32)
         if separate_gate_up:
@@ -1868,7 +1915,7 @@ def gmm_v2_fused_rs(
 
     num_lanes = pltpu.get_tpu_info().num_lanes
     sls = pltpu.get_tpu_info().get_sublane_tiling(hidden_states.dtype)
-    out_dtype = hidden_states.dtype
+    out_dtype = jnp.bfloat16 if prequantized_lhs else hidden_states.dtype
     size_lhs_sublane = min(sls, size_m)
     intermediate_size = size_n1 // 2
 
@@ -2046,7 +2093,8 @@ def gmm_v2_fused_rs(
                 else None
             ),
             quant_block_size=lhs1_quant_block_size,
-            dtype=out_dtype,
+            dtype=hidden_states.dtype,
+            prequantized=prequantized_lhs,
         ),
         rhs_cfgs=InputConfigs(
             quant_dtype=w1.dtype if is_quantized else None,
@@ -2118,7 +2166,10 @@ def gmm_v2_fused_rs(
             gm_id_to_m_offset=pltpu.SMEM((2,), jnp.int32),
         ),
         # gathered_lhs_2x_ref
-        pltpu.VMEM((2, tile_m, padded_k1 // num_lanes, num_lanes), out_dtype),
+        pltpu.VMEM(
+            (2, tile_m, padded_k1 // num_lanes, num_lanes),
+            hidden_states.dtype,
+        ),
         # High-M routing path: HBM -> VMEM DMA, then VMEM -> scalar-addressable
         # SMEM. Keeping only two tile rows in SMEM avoids the original >1 MiB
         # scalar-prefetch failure at 64K tokens.
@@ -2228,6 +2279,11 @@ def gmm_v2_fused_rs(
     w1_bias_input = w1_bias if has_bias else jnp.zeros((1, 1, 1), jnp.float32)
     w2_bias_input = w2_bias if has_bias else jnp.zeros((1, 1, 1), jnp.float32)
     max_num_gm_arr = jnp.array([max_num_gm], dtype=jnp.int32)
+    hidden_states_scale_input = (
+        hidden_states_scale.astype(jnp.float32)
+        if prequantized_lhs
+        else jnp.ones((ep_size,), dtype=jnp.float32)
+    )
 
     # Output buffer — also serves as ICI DMA target. In the FP8 direct-write
     # path this stores quantized payload rows; row scales are returned as a
@@ -2287,6 +2343,7 @@ def gmm_v2_fused_rs(
         _w1_gs_gate,
         _w1_gs_up,
         _w2_gs,
+        hidden_states_scale_input,
         primary_idx_hbm_ref,
         hidden_3d,
         w1,
@@ -2304,6 +2361,7 @@ def gmm_v2_fused_rs(
         f"-EP_{ep_size}-TK_{top_k}"
         f"{'-split-gu' if separate_gate_up else ''}"
         f"{'-packed' if pack_indices else ''}"
+        f"{'-fp8-hidden-input' if prequantized_lhs else ''}"
     )
     kernel_kwargs = dict(
         fused_dims=fused_dims,
@@ -2351,7 +2409,7 @@ def gmm_v2_fused_rs(
             functools.partial(kernel_main_fused_rs_fp8, **kernel_kwargs),
             out_shape=(out_buf_init, out_scale_init),
             grid_spec=pltpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=9,
+                num_scalar_prefetch=10,
                 in_specs=in_specs,
                 out_specs=[
                     pl.BlockSpec(memory_space=pltpu.HBM),
@@ -2369,7 +2427,7 @@ def gmm_v2_fused_rs(
         functools.partial(kernel_main_fused_rs, **kernel_kwargs),
         out_shape=out_buf_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=9,
+            num_scalar_prefetch=10,
             in_specs=in_specs,
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
             scratch_shapes=scratch_shapes,
