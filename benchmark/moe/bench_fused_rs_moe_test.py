@@ -1,4 +1,6 @@
+import ast
 import unittest
+from pathlib import Path
 
 from benchmark.moe.fused_rs_tuning import (
     GLM52_RS_REFERENCE_CONFIG,
@@ -9,6 +11,41 @@ from benchmark.moe.fused_rs_tuning import (
 
 
 class FusedRsTuningTest(unittest.TestCase):
+    def test_tensorcore_compiler_options_are_on_outer_runner_jit(self):
+        source = (
+            Path(__file__).with_name("bench_fused_rs_moe.py").read_text(encoding="utf-8")
+        )
+        tree = ast.parse(source)
+        runner = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_rs_runner"
+        )
+
+        called_names = {
+            node.func.id
+            for node in ast.walk(runner)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        self.assertNotIn("fused_moe_func_rs", called_names)
+        self.assertNotIn("fused_moe_func_rs_tc_hidden_all_gather", called_names)
+
+        jax_jit_calls = [
+            node
+            for node in ast.walk(runner)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "jax"
+            and node.func.attr == "jit"
+        ]
+        self.assertTrue(
+            any(
+                any(keyword.arg == "compiler_options" for keyword in call.keywords)
+                for call in jax_jit_calls
+            )
+        )
+
     def test_candidates_follow_full_k_pipeline_and_vmem_contract(self):
         configs = generate_rs_tuning_configs((128, 256, 384))
 

@@ -27,11 +27,8 @@ import numpy as np
 from jax.experimental import multihost_utils
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
-from sgl_jax.srt.kernels.fused_moe.fused_rs import (
-    fused_moe_func_rs,
-    fused_moe_func_rs_tc_hidden_all_gather,
-)
 from sgl_jax.srt.kernels.fused_moe.fused_rs.fused_moe_rs import (
+    _fused_moe_func_rs_impl,
     get_moe_expert_axis,
 )
 from sgl_jax.srt.kernels.fused_moe.fused_rs.gmm_fused_rs_nodedup import (
@@ -618,10 +615,14 @@ def _rs_runner(
     layer_scope: bool,
     hidden_all_gather_backend: str = "auto",
 ) -> Callable:
-    rs_func = (
-        fused_moe_func_rs_tc_hidden_all_gather
+    compiler_options = (
+        {
+            "xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes": str(
+                1 << 30
+            )
+        }
         if hidden_all_gather_backend == "tensorcore"
-        else fused_moe_func_rs
+        else None
     )
 
     def run(inputs):
@@ -642,7 +643,7 @@ def _rs_runner(
             w3_shared_scale,
             w2_shared_scale,
         ) = inputs
-        output = rs_func(
+        output = _fused_moe_func_rs_impl(
             hidden_states=tokens,
             w1=w1,
             w3=w3,
@@ -679,7 +680,13 @@ def _rs_runner(
             output = jax.sharding.reshard(output, NamedSharding(mesh, P("data", None)))
         return output
 
-    return jax.jit(run)
+    # ``compiler_options`` are legal only on the outermost JIT. Calling the
+    # pre-jitted tensorcore variant from this jitted runner makes JAX 0.9 reject
+    # the nested option before lowering. Keep one top-level compilation while
+    # preserving the exact same fused-RS implementation and option value.
+    if compiler_options is None:
+        return jax.jit(run)
+    return jax.jit(run, compiler_options=compiler_options)
 
 
 def _routing_stats(topk_ids) -> dict[str, float | int]:
