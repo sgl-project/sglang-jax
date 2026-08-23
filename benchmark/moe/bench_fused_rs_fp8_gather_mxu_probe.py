@@ -35,11 +35,22 @@ _N = 128
 _NUM_LANES = 128
 _K_TILES = _K // _NUM_LANES
 _CASES = (
-    ("bf16_contiguous_offset0", jnp.bfloat16, "contiguous", 0),
-    ("bf16_irregular_offset37", jnp.bfloat16, "irregular", 37),
-    ("fp8_contiguous_offset0", jnp.float8_e4m3fn, "contiguous", 0),
-    ("fp8_irregular_offset0", jnp.float8_e4m3fn, "irregular", 0),
-    ("fp8_irregular_offset37", jnp.float8_e4m3fn, "irregular", 37),
+    ("bf16_irregular_offset37_native", jnp.bfloat16, "irregular", 37, False),
+    (
+        "fp8_irregular_offset37_native",
+        jnp.float8_e4m3fn,
+        "irregular",
+        37,
+        False,
+    ),
+    ("bf16_irregular_offset37_realign", jnp.bfloat16, "irregular", 37, True),
+    (
+        "fp8_irregular_offset37_realign",
+        jnp.float8_e4m3fn,
+        "irregular",
+        37,
+        True,
+    ),
 )
 
 
@@ -55,6 +66,7 @@ def _gather_mxu_kernel(
     rhs_sem_ref,
     *,
     m_start: int,
+    realign: bool,
 ):
     is_valid = (
         jnp.arange(_TILE_M, dtype=jnp.int32) < _NUM_ROWS
@@ -76,7 +88,14 @@ def _gather_mxu_kernel(
     # Match the fused-RS consumer exactly: load the VMEM ref before
     # reshaping the register array and retain the size_lhs_sublane axis.
     # Reshaping the ref itself emits an unsupported tpu.memref_reshape.
-    lhs = gathered_ref[...].reshape(-1, _TILE_M, _K)
+    lhs = gathered_ref[...]
+    if realign:
+        sublane = pltpu.get_tpu_info().get_sublane_tiling(lhs.dtype)
+        row_offset = m_start % sublane
+        lhs = jnp.concatenate(
+            (lhs[row_offset:], jnp.zeros_like(lhs[:row_offset])), axis=0
+        )
+    lhs = lhs.reshape(-1, _TILE_M, _K)
     rhs = rhs_scratch_ref[...]
     acc_scratch_ref[...] = jnp.matmul(
         lhs,
@@ -97,9 +116,12 @@ def _run_probe(
     indices: jax.Array,
     *,
     m_start: int,
+    realign: bool,
 ):
     kernel = pl.pallas_call(
-        functools.partial(_gather_mxu_kernel, m_start=m_start),
+        functools.partial(
+            _gather_mxu_kernel, m_start=m_start, realign=realign
+        ),
         out_shape=jax.ShapeDtypeStruct((1, _TILE_M, _N), jnp.float32),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
@@ -121,7 +143,10 @@ def _run_probe(
             dimension_semantics=("parallel",),
             disable_bounds_checks=True,
         ),
-        name=f"fused-rs-gather-mxu-{payload.dtype.name}-offset{m_start}",
+        name=(
+            f"fused-rs-gather-mxu-{payload.dtype.name}-offset{m_start}"
+            f"-realign{int(realign)}"
+        ),
     )
     return kernel(indices, payload, rhs)
 
@@ -183,11 +208,13 @@ def main() -> None:
     args.jsonl.parent.mkdir(parents=True, exist_ok=True)
     args.jsonl.write_text("", encoding="utf-8")
 
-    for case, dtype, index_mode, m_start in _CASES:
+    for case, dtype, index_mode, m_start, realign in _CASES:
         payload = _payload(dtype)
         rhs = _rhs(dtype)
         indices = _indices(index_mode)
-        output = _run_probe(payload, rhs, indices, m_start=m_start)
+        output = _run_probe(
+            payload, rhs, indices, m_start=m_start, realign=realign
+        )
         expected = jnp.matmul(
             payload.reshape(_SIZE_M, _K)[indices[:_NUM_ROWS]],
             rhs,
@@ -218,6 +245,7 @@ def main() -> None:
             "k": _K,
             "n": _N,
             "m_start": m_start,
+            "realign": realign,
             "rel_l2_threshold": args.rel_l2_threshold,
             "comparison": comparison,
         }
