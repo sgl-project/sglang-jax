@@ -1,4 +1,4 @@
-"""Strict EP32 A/B for Hidden AllGather placement and routing-table materialization."""
+"""Fixed-shape A/B for Hidden AllGather placement and routing materialization."""
 
 from __future__ import annotations
 
@@ -54,13 +54,18 @@ def main() -> None:
     parser.add_argument("--correctness-rel-l2-threshold", type=float, default=1e-6)
     args = parser.parse_args()
 
-    if args.ep_size not in (16, 32) or len(jax.devices()) != args.ep_size:
+    visible_devices = len(jax.devices())
+    contract = (args.ep_size, args.tokens, visible_devices)
+    supported_contracts = {
+        (32, 65536, 32),  # strict production-shape measurement
+        (8, 32768, 16),  # two replicated EP8 groups on an 8-chip slice
+    }
+    if contract not in supported_contracts:
         raise ValueError(
-            "This A/B requires EP16 or EP32 with one visible device per EP rank; "
-            f"got ep_size={args.ep_size}, devices={len(jax.devices())}"
+            "This A/B is fixed to EP32/64K on 32 devices or EP8/32K on "
+            "16 devices; got "
+            f"ep_size={args.ep_size}, tokens={args.tokens}, devices={visible_devices}"
         )
-    if args.tokens != 65536:
-        raise ValueError(f"This A/B is fixed to 65536 tokens; got {args.tokens}")
     if args.correctness_rel_l2_threshold <= 0:
         raise ValueError("--correctness-rel-l2-threshold must be positive")
     if args.jsonl is not None and jax.process_index() == 0:

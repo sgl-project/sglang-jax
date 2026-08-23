@@ -31,6 +31,9 @@ from sgl_jax.srt.kernels.fused_moe.fused_rs import (
     fused_moe_func_rs,
     fused_moe_func_rs_tc_hidden_all_gather,
 )
+from sgl_jax.srt.kernels.fused_moe.fused_rs.fused_moe_rs import (
+    get_moe_expert_axis,
+)
 from sgl_jax.srt.kernels.fused_moe.fused_rs.gmm_fused_rs_nodedup import (
     FusedRsBlockConfig,
     get_last_fused_rs_block_sizes,
@@ -119,7 +122,21 @@ def _config_label(config: FusedRsBlockConfig | None) -> str:
 
 
 def _build_mesh(ep_size: int):
-    return jax.make_mesh((1, ep_size), ("data", "tensor"))
+    visible_devices = len(jax.devices())
+    if visible_devices % ep_size:
+        raise ValueError(
+            f"visible_devices={visible_devices} must be divisible by ep_size={ep_size}"
+        )
+    replica_count = visible_devices // ep_size
+    # The production EP32 case keeps the model's joint data+tensor expert axis.
+    # For the smaller EP8 diagnostic, name the outer axis ``replica`` so the
+    # fused-RS kernel forms two independent tensor8 EP groups rather than one
+    # accidental data2*tensor8 EP16 group.
+    replica_axis = "data" if replica_count == 1 else "replica"
+    return jax.make_mesh(
+        (replica_count, ep_size),
+        (replica_axis, "tensor"),
+    )
 
 
 def _make_array(shape, dtype, sharding, fill_value):
@@ -230,7 +247,7 @@ def _make_inputs(
             f"num_tokens={num_tokens} must be divisible by ep_size={ep_size}"
         )
 
-    expert_axis = ("data", "tensor")
+    expert_axis = get_moe_expert_axis(mesh)
     token_sharding = NamedSharding(mesh, P(expert_axis, None))
     weight_sharding = NamedSharding(mesh, P(expert_axis, None, None))
     scale_sharding = NamedSharding(mesh, P(expert_axis, None, None, None))
