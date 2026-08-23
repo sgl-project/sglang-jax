@@ -1,4 +1,4 @@
-name: operator-profile-glm52-fused-rs-preop-ab-ep8-r3-20260823
+name: operator-profile-glm52-fused-rs-preop-ab-ep8-r4-20260823
 exp_type: PROFILING
 artifact_type: operator-profile
 cluster_name: tpu-training-antgroup
@@ -32,8 +32,8 @@ role_to_task_spec:
       XLA_DUMP_FLAGS="--xla_dump_to=$OUT/compiler/hlo --xla_dump_hlo_as_text"
       export XLA_FLAGS="${XLA_FLAGS:+$XLA_FLAGS }$XLA_DUMP_FLAGS"
 
-      source_tar=/tmp/glm52-fused-rs-preop-ab-ep8-r3.tar.gz.part
-      source_ready=/tmp/glm52-fused-rs-preop-ab-ep8-r3.ready
+      source_tar=/tmp/glm52-fused-rs-preop-ab-ep8-r4.tar.gz.part
+      source_ready=/tmp/glm52-fused-rs-preop-ab-ep8-r4.ready
       attempt=0
       while [ ! -f "$source_ready" ]; do
         attempt=$((attempt + 1))
@@ -44,7 +44,7 @@ role_to_task_spec:
         sleep 5
       done
       test -f "$source_tar"
-      echo 'c2e5272f768d8ad1ee805471fcc1a136320fa43e69ea9f4de4c7068985148ffc  /tmp/glm52-fused-rs-preop-ab-ep8-r3.tar.gz.part' | sha256sum -c -
+      echo 'aef7fef904fa0e2c3879ca2c1631920b0a2b731d193018d2bbe7e878dae835f4  /tmp/glm52-fused-rs-preop-ab-ep8-r4.tar.gz.part' | sha256sum -c -
 
       mkdir -p /workspace/sglang-jax
       tar -xzf "$source_tar" -C /workspace/sglang-jax
@@ -92,8 +92,8 @@ role_to_task_spec:
           },
           "source": {
               "branch": "dev/glm52-rs-bf16-allgather",
-              "source_commit": "912ddbcb3808751cd4e03b0755032e145b1fc2b4",
-              "source_sha256": "c2e5272f768d8ad1ee805471fcc1a136320fa43e69ea9f4de4c7068985148ffc",
+              "source_commit": "83f253ac088ddc4ff0f0a23fc2d5a3d4f6510eef",
+              "source_sha256": "aef7fef904fa0e2c3879ca2c1631920b0a2b731d193018d2bbe7e878dae835f4",
           },
           "correctness": {
               "reference_variant": "auto-jax",
