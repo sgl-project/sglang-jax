@@ -232,7 +232,7 @@ class EAGLEWorker(BaseSpecWorker):
                     MultiLayerDraftWorker,
                 )
 
-                is_multi_layer = isinstance(self.draft_worker, MultiLayerDraftWorker)
+                is_multi_layer = isinstance(self.draft_worker, MultiLayerDraftWorker) or self.server_args.speculative_algorithm == "NEXTN"
                 if is_multi_layer and self.topk == 1:
                     topk_shape = (bs, num_steps)
                 else:
