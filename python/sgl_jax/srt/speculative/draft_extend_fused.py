@@ -2409,7 +2409,7 @@ def spec_decode_verify(
         target_mr.attn_backend.forward_metadata = target_mr.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
         )
-    if use_relay_state and target_mr.attn_backend.forward_metadata.custom_mask is not None:
+    if use_relay_state and getattr(target_mr.attn_backend.forward_metadata, "custom_mask", None) is not None:
         raise NotImplementedError("Spec decode overlap relay path does not support custom_mask.")
     target_forward_batch = _make_forward_batch(model_worker_batch, target_mr)
     if rebuild_verify_metadata:
