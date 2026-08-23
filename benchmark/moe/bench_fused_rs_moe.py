@@ -615,6 +615,7 @@ def _rs_runner(
     layer_scope: bool,
     hidden_all_gather_backend: str = "auto",
     fp8_hidden_all_gather: bool = False,
+    _fp8_hidden_direct_prequantized: bool = False,
 ) -> Callable:
     compiler_options = (
         {
@@ -663,6 +664,7 @@ def _rs_runner(
             topk_weights=topk_weights,
             topk_indices=topk_ids,
             fp8_hidden_all_gather=fp8_hidden_all_gather,
+            _fp8_hidden_direct_prequantized=_fp8_hidden_direct_prequantized,
         )
         if layer_scope:
             shared_output = fused_rs_shared_expert(

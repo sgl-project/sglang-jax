@@ -55,6 +55,14 @@ def main() -> None:
     parser.add_argument("--trace-root", default="/tmp/sglang_jax_fused_rs_fp8_hidden_ag")
     parser.add_argument("--jsonl", type=Path)
     parser.add_argument(
+        "--direct-prequantized",
+        action="store_true",
+        help=(
+            "diagnose the target-TPU-validated direct FP8 consumer instead of "
+            "materializing BF16 after the collective"
+        ),
+    )
+    parser.add_argument(
         "--correctness-rel-l2-threshold",
         type=float,
         default=DEFAULT_REL_L2_THRESHOLD,
@@ -103,6 +111,8 @@ def main() -> None:
         routing_stats = _routing_stats(inputs[8])
 
         for variant, fp8_hidden_all_gather in VARIANTS:
+            direct_prequantized = args.direct_prequantized and fp8_hidden_all_gather
+            trace_variant = f"{variant}-direct" if direct_prequantized else variant
             set_fused_rs_block_sizes_override(PRODUCTION_RS_CONFIG)
             set_fused_rs_routing_table_impl("pallas")
             jax.clear_caches()
@@ -110,6 +120,7 @@ def main() -> None:
                 mesh,
                 layer_scope=False,
                 fp8_hidden_all_gather=fp8_hidden_all_gather,
+                _fp8_hidden_direct_prequantized=direct_prequantized,
             )
 
             compile_start = time.perf_counter()
@@ -152,7 +163,7 @@ def main() -> None:
                 task=r"gmm_v2_fused_rs.*",
                 warmup=args.warmup,
                 iters=args.iters,
-                trace_root=str(Path(args.trace_root) / variant / "standard"),
+                trace_root=str(Path(args.trace_root) / trace_variant / "standard"),
             )
             breakdown = _measure_rs_breakdown(
                 run,
@@ -160,7 +171,7 @@ def main() -> None:
                 task=r"gmm_v2_fused_rs.*",
                 warmup=args.warmup,
                 iters=args.iters,
-                trace_root=str(Path(args.trace_root) / variant / "breakdown"),
+                trace_root=str(Path(args.trace_root) / trace_variant / "breakdown"),
             )
             stages = breakdown["stage_samples_ms"]
             local_tokens = args.tokens // args.ep_size
@@ -171,6 +182,7 @@ def main() -> None:
                     "status": "ok" if contract["contract_ok"] else "correctness_failed",
                     "variant": variant,
                     "fp8_hidden_all_gather": fp8_hidden_all_gather,
+                    "fp8_hidden_direct_prequantized": direct_prequantized,
                     "scale_semantics": (
                         "one_fp32_scale_per_ep_rank_physical_hidden_shard"
                         if fp8_hidden_all_gather

@@ -13,7 +13,9 @@ from benchmark.moe.fused_rs_tuning import (
 class FusedRsTuningTest(unittest.TestCase):
     def test_tensorcore_compiler_options_are_on_outer_runner_jit(self):
         source = (
-            Path(__file__).with_name("bench_fused_rs_moe.py").read_text(encoding="utf-8")
+            Path(__file__)
+            .with_name("bench_fused_rs_moe.py")
+            .read_text(encoding="utf-8")
         )
         tree = ast.parse(source)
         runner = next(
@@ -45,6 +47,31 @@ class FusedRsTuningTest(unittest.TestCase):
                 for call in jax_jit_calls
             )
         )
+
+    def test_runner_forwards_direct_prequantized_diagnostic_flag(self):
+        source = (
+            Path(__file__).with_name("bench_fused_rs_moe.py").read_text(encoding="utf-8")
+        )
+        tree = ast.parse(source)
+        runner = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_rs_runner"
+        )
+        fused_call = next(
+            node
+            for node in ast.walk(runner)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_fused_moe_func_rs_impl"
+        )
+        forwarded = next(
+            keyword
+            for keyword in fused_call.keywords
+            if keyword.arg == "_fp8_hidden_direct_prequantized"
+        )
+        self.assertIsInstance(forwarded.value, ast.Name)
+        self.assertEqual(forwarded.value.id, "_fp8_hidden_direct_prequantized")
 
     def test_candidates_follow_full_k_pipeline_and_vmem_contract(self):
         configs = generate_rs_tuning_configs((128, 256, 384))
