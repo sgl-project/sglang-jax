@@ -234,7 +234,8 @@ def test_latent_only_budget_overshoots_the_available_memory():
     mesh = _single_device_mesh()
     page = runner.page_size
 
-    def pages_for(cell_size):
+    def pool_size_for(cell_size):
+        """Page-aligned token count that fits the budget at this per-token cost."""
         return (budget // cell_size) // page * page
 
     # Every pool carries one unbudgeted spare page per DP rank per layer
@@ -245,9 +246,9 @@ def test_latent_only_budget_overshoots_the_available_memory():
 
     # Pre-fix: the latent-only cell size, i.e. what a non-DSA config is charged.
     latent_only_cell = _CellSizeRunner("fa", num_layers=8)._compute_cell_size()
-    over = _resident_bytes(_build_pool(runner, pages_for(latent_only_cell), mesh))
+    over = _resident_bytes(_build_pool(runner, pool_size_for(latent_only_cell), mesh))
     assert over - budget > slack
 
     # Post-fix: sized with the indexer counted, only the spare page is left over.
-    fitted = _resident_bytes(_build_pool(runner, pages_for(runner._compute_cell_size()), mesh))
+    fitted = _resident_bytes(_build_pool(runner, pool_size_for(runner._compute_cell_size()), mesh))
     assert 0 < fitted <= budget + slack
