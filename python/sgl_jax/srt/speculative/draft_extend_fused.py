@@ -1018,13 +1018,15 @@ def _build_verify(topk: int):
             jnp.full_like(target_forward_batch.seq_lens, speculative_num_draft_tokens),
             jnp.zeros_like(target_forward_batch.seq_lens),
         ).astype(jnp.int32)
+        
+        prepared_extend_seq_lens_reshaped = _reshape_per_dp_rows(prepared_extend_seq_lens, dp_size)
         prepared_logits_indices = (
-            jnp.cumsum(
-                prepared_extend_seq_lens.reshape(dp_size, target_bs // dp_size),
-                axis=1,
-            ).reshape(-1)
-            - 1
+            jnp.cumsum(prepared_extend_seq_lens_reshaped, axis=1).reshape(-1) - 1
         ).astype(jnp.int32)
+        
+        sharding = jax.typeof(prepared_extend_seq_lens).sharding
+        if isinstance(sharding, NamedSharding) and not sharding.mesh.empty:
+            prepared_logits_indices = jax.sharding.reshard(prepared_logits_indices, sharding)
         prepared_sel_pos = prepared.sel_pos
         prepared_sel_pos_data = prepared.sel_pos
         prepared_predict = prepared.predict
