@@ -912,12 +912,7 @@ def _build_verify(topk: int):
             # Force explicit P("data") without mesh using PartitionSpec
             valid_seq_lens = target_forward_batch.seq_lens > 0
             zeros = jnp.zeros_like(target_forward_batch.seq_lens)
-            b = relay_new_seq_lens - 1
-            
-            if hasattr(jax.lax, "with_sharding_constraint"):
-                zeros = jax.lax.with_sharding_constraint(zeros, jax.sharding.PartitionSpec("data"))
-                b = jax.lax.with_sharding_constraint(b, jax.sharding.PartitionSpec("data"))
-                valid_seq_lens = jax.lax.with_sharding_constraint(valid_seq_lens, jax.sharding.PartitionSpec("data"))
+            b = relay_new_seq_lens - 1 + zeros
             
             target_forward_batch.seq_lens = jnp.where(
                 valid_seq_lens,
