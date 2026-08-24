@@ -1,0 +1,178 @@
+name: operator-profile-glm52-ep32-prefill-backend-ab-p7-r1-20260824
+exp_type: PROFILING
+artifact_type: operator-profile
+cluster_name: tpu-training-antgroup
+profile: true
+priority: 0
+tags: [profile, operator-optimization, fused-moe, glm52, ep32, prefill, backend-ab, dvfs-p7]
+model_version: glm-5.2-ep32-prefill-backend-ab-p7
+config: '{"model":"glm-5.2","scope":"moe-layer","tokens":[16384,32768,65536],"ep_size":32,"physical_chips":16,"jax_devices":32,"backends":["fused_v2","fused_rs"],"timings":["pallas","compiled_call","global_blocking_wall"],"routing":"precomputed-identical","includes_gate_topk":false,"includes_shared_expert":true,"includes_output_reshard":true,"dvfs_p_state":7,"source_commit":"ea473403526c018fb53860600bc34332a2512cda"}'
+role_to_task_spec:
+  worker:
+    replica: 4
+    image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x4
+    command: |
+      set -euo pipefail
+      ulimit -c 0
+
+      export FALCON_OPERATOR_RANK="${FALCON_JAX_PROCESS_ID:-${JOB_COMPLETION_INDEX:-0}}"
+      ROOT="${ARTIFACT_LOCAL_DIR:-/tmp/operator-artifact}"
+      OUT="$ROOT/rank-$FALCON_OPERATOR_RANK"
+      mkdir -p "$OUT/benchmark" "$OUT/profiling/xprof/raw" "$OUT/compiler/llo" "$OUT/compiler/hlo"
+
+      export TMPDIR=/tmp/tpu_logs/tmp
+      export PIP_CACHE_DIR=/tmp/tpu_logs/pip-cache
+      export UV_CACHE_DIR=/tmp/tpu_logs/uv-cache
+      export JAX_COMPILATION_CACHE_DIR=/tmp/tpu_logs/jax-cache
+      mkdir -p "$TMPDIR" "$PIP_CACHE_DIR" "$UV_CACHE_DIR" "$JAX_COMPILATION_CACHE_DIR"
+
+      LIBTPU_PROFILE_ARGS="--xla_tpu_dvfs_p_state=7 --xla_enable_custom_call_region_trace=true --xla_xprof_register_llo_debug_info=true --xla_mosaic_dump_to=$OUT/compiler/llo"
+      export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:+$LIBTPU_INIT_ARGS }$LIBTPU_PROFILE_ARGS"
+      XLA_DUMP_FLAGS="--xla_dump_to=$OUT/compiler/hlo --xla_dump_hlo_as_text"
+      export XLA_FLAGS="${XLA_FLAGS:+$XLA_FLAGS }$XLA_DUMP_FLAGS"
+
+      cd /workspace/sglang-jax
+      expected_commit=ea473403526c018fb53860600bc34332a2512cda
+      actual_commit=$(git rev-parse HEAD)
+      test "$actual_commit" = "$expected_commit"
+      echo "source checkout commit exact: $actual_commit"
+      echo "effective LIBTPU_INIT_ARGS: $LIBTPU_INIT_ARGS"
+
+      python3 -m pip install -q -e './python[tpu]'
+      export PYTHONPATH="/workspace/sglang-jax/python:/workspace/sglang-jax${PYTHONPATH:+:$PYTHONPATH}"
+
+      if [ "$FALCON_OPERATOR_RANK" = "0" ]; then
+        python3 - <<'PY'
+      import json
+      import os
+      from pathlib import Path
+
+      root = Path(os.environ.get("ARTIFACT_LOCAL_DIR", "/tmp/operator-artifact"))
+      manifest = {
+          "schema_version": 1,
+          "workflow": "operator-optimization",
+          "operator_family": "fused_moe",
+          "operator_name": "sglang_jax_glm52_ep32_prefill_backend_ab",
+          "hardware": {
+              "device_type": "v7x",
+              "dvfs_p_state": 7,
+              "chips": 16,
+              "visible_devices": 32,
+              "process_count": 4,
+              "local_devices_per_process": 8,
+              "physical_topology": "2x2x4",
+              "logical_mesh": "data1-tensor32",
+          },
+          "dimensions": {
+              "model": "glm-5.2",
+              "ep_size": 32,
+              "num_tokens": [16384, 32768, 65536],
+              "hidden_size": 6144,
+              "intermediate_size": 2048,
+              "num_experts": 256,
+              "top_k": 8,
+              "hidden_dtype": "bf16",
+              "weight_dtype": "fp8_e4m3fn_per_channel",
+          },
+          "scope": {
+              "name": "glm52_moe_layer",
+              "routing_is_precomputed_identically": True,
+              "includes_gate_topk": False,
+              "includes_shared_expert": True,
+              "includes_output_reshard": True,
+          },
+          "timing": {
+              "device_trace_method": "benchmark.utils.multiple_iteration_profile_from_trace",
+              "pallas_task": "device_duration_ps task event",
+              "compiled_call": "same-trace named call marker",
+              "blocking_wall": "max process local jit call plus block_until_ready",
+              "call_minus_pallas_is_non_additive_overlap_envelope": True,
+              "warmup": 2,
+              "iterations": 5,
+          },
+          "source": {
+              "repo": "primatrix-glm/sglang-jax-private",
+              "branch": "dev/glm52-rs-ep32-64k",
+              "commit": "ea473403526c018fb53860600bc34332a2512cda",
+              "delivery": "falcon-native-git-source",
+          },
+      }
+      (root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+      PY
+      fi
+
+      python3 -m benchmark.moe.bench_fused_rs_moe \
+        --ep-size 32 \
+        --tokens 16384,32768,65536 \
+        --routing-seed 42 \
+        --layer-scope \
+        --input-profile expert_distinct \
+        --profile-breakdown \
+        --warmup 2 \
+        --iters 5 \
+        --trace-root "$OUT/profiling/xprof/raw" \
+        --jsonl "$OUT/benchmark/metrics.jsonl"
+
+      trace_index=0
+      while IFS= read -r trace_file; do
+        cp "$trace_file" "$OUT/profiling/xprof/rank-${FALCON_OPERATOR_RANK}-${trace_index}.xplane.pb"
+        trace_index=$((trace_index + 1))
+      done < <(find "$OUT/profiling/xprof/raw" -type f -name '*.xplane.pb' | sort)
+      if [ "$trace_index" -lt 1 ]; then
+        echo "no xplane.pb captured for rank $FALCON_OPERATOR_RANK" >&2
+        exit 1
+      fi
+
+      env | sort | grep -E '^(LIBTPU_INIT_ARGS|XLA_FLAGS|JAX_|TF_XLA_FLAGS|SGLANG_JAX_|FALCON_OPERATOR_)=' > "$OUT/runtime-env.txt" || true
+      git rev-parse HEAD > "$OUT/source-commit.txt"
+
+      if [ "$FALCON_OPERATOR_RANK" = "0" ]; then
+        python3 - "$OUT/benchmark/metrics.jsonl" <<'PY'
+      import json
+      import math
+      import sys
+      from pathlib import Path
+
+      rows = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines() if line]
+      candidates = [row for row in rows if row.get("record_type") == "candidate"]
+      assert [row["num_tokens"] for row in candidates] == [16384, 32768, 65536]
+      for row in candidates:
+          assert row["status"] == "ok", row
+          assert row["measurement_scope"] == "glm52_moe_layer", row
+          assert row["profile_breakdown_complete"] is True, row
+          assert row["rel_l2_vs_v2"] <= 0.01, row
+          for field in (
+              "fused_v2_kernel_samples_ms",
+              "fused_v2_call_samples_ms",
+              "fused_v2_blocking_wall_samples_ms",
+              "fused_rs_kernel_samples_ms",
+              "fused_rs_call_samples_ms",
+              "fused_rs_blocking_wall_samples_ms",
+              "fused_rs_hidden_all_gather_samples_ms",
+              "fused_rs_topk_ids_all_gather_samples_ms",
+          ):
+              samples = row[field]
+              assert len(samples) == 5, (field, samples)
+              assert all(math.isfinite(value) and value >= 0 for value in samples)
+      print("validated 3 EP32 backend A/B rows with complete 5-sample timing scopes")
+      PY
+      fi
+      echo "GLM52_EP32_PREFILL_BACKEND_AB_COMPLETE rank=$FALCON_OPERATOR_RANK"
+    envs:
+      JAX_COMPILATION_CACHE_DIR: /tmp/tpu_logs/jax-cache
+      PIP_CACHE_DIR: /tmp/tpu_logs/pip-cache
+      PYTHONUNBUFFERED: "1"
+      TMPDIR: /tmp/tpu_logs/tmp
+      UV_CACHE_DIR: /tmp/tpu_logs/uv-cache
+    sources:
+      - name: sglang-jax
+        type: git
+        repo: git@github.com:primatrix-glm/sglang-jax-private.git
+        ref: dev/glm52-rs-ep32-64k
+        commit: ea473403526c018fb53860600bc34332a2512cda
+        path: /workspace/sglang-jax
+        auth:
+          cred: github-primatrix-glm-sglang-jax-private-ssh-codex
