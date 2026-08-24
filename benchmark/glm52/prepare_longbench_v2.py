@@ -252,11 +252,14 @@ def _download_source(dataset_id: str, revision: str, cache_dir: Path) -> Path:
 
 def _load_tokenizer(tokenizer_path: str) -> Any:
     try:
-        from transformers import AutoTokenizer
+        from sgl_jax.srt.hf_transformers_utils import get_tokenizer
     except ImportError as error:
-        raise RuntimeError("transformers is required to load the GLM-5.2 tokenizer") from error
+        raise RuntimeError(
+            "sglang-jax and its tokenizer dependencies are required to load "
+            "the GLM-5.2 tokenizer"
+        ) from error
 
-    return AutoTokenizer.from_pretrained(
+    return get_tokenizer(
         tokenizer_path,
         trust_remote_code=True,
         use_fast=True,

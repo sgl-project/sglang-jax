@@ -1,5 +1,8 @@
 import array
+import sys
+import types
 import unittest
+from unittest.mock import patch
 
 from benchmark.glm52.prepare_longbench_v2 import (
     CODE_REPO_QA,
@@ -8,6 +11,7 @@ from benchmark.glm52.prepare_longbench_v2 import (
     Candidate,
     _candidate_windows,
     _format_suffix,
+    _load_tokenizer,
     _select_candidates,
 )
 
@@ -61,6 +65,38 @@ def _candidate(sub_domain, priority, source_id):
 
 
 class PrepareLongBenchV2Test(unittest.TestCase):
+    def test_load_tokenizer_uses_sgl_jax_runtime_loader(self):
+        calls = []
+        expected_tokenizer = object()
+
+        def fake_get_tokenizer(tokenizer_path, **kwargs):
+            calls.append((tokenizer_path, kwargs))
+            return expected_tokenizer
+
+        fake_module = types.ModuleType("sgl_jax.srt.hf_transformers_utils")
+        fake_module.get_tokenizer = fake_get_tokenizer
+
+        with patch.dict(
+            sys.modules,
+            {"sgl_jax.srt.hf_transformers_utils": fake_module},
+        ):
+            tokenizer = _load_tokenizer("/models/GLM5.2-fp8-channel-wise")
+
+        self.assertIs(tokenizer, expected_tokenizer)
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "/models/GLM5.2-fp8-channel-wise",
+                    {
+                        "trust_remote_code": True,
+                        "use_fast": True,
+                        "local_files_only": True,
+                    },
+                )
+            ],
+        )
+
     def test_suffix_contains_question_choices_and_answer_marker(self):
         suffix = _format_suffix(_row())
         self.assertIn("Question: What is the answer?", suffix)
