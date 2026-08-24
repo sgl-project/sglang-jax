@@ -1,7 +1,7 @@
 name: glm52-longbench-v2-code-financial-c64-data-prep-20260824-r1
 exp_type: TRAINING
 artifact_type: GCS
-cluster_name: tpu-training-antgroup
+cluster_name: tpu-service
 priority: 0
 tags: [dataset, longbench-v2, glm52, cpu, long-context, code-repo-qa, financial]
 model_version: glm-5.2-longbench-v2-code-financial-c64-v1
@@ -11,12 +11,11 @@ role_to_task_spec:
     replica: 1
     image: python:3.12
     device_type: cpu
-    machine_type: n2-highmem-32
     resources:
-      cpu_request: "16"
-      cpu_limit: "16"
-      memory_request: 64Gi
-      memory_limit: 64Gi
+      cpu_request: "1"
+      cpu_limit: "1"
+      memory_request: 8Gi
+      memory_limit: 8Gi
     command: |
       exec bash <<'BASH'
       set -euo pipefail
