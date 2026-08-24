@@ -1,32 +1,32 @@
-name: glm52-longbench-v2-code-financial-c64-data-prep-20260824-r2
+name: glm52-longbench-v2-code-financial-c64-data-prep-20260824-r3-flex
 exp_type: TRAINING
 artifact_type: GCS
-cluster_name: tpu-training-antgroup-v2
+cluster_name: tpu-service
 priority: 0
 tags: [dataset, longbench-v2, glm52, cpu, long-context, code-repo-qa, financial]
 model_version: glm-5.2-longbench-v2-code-financial-c64-v1
-config: '{"dataset":"zai-org/LongBench-v2","dataset_revision":"2b48e494f2c7a2f0af81aae178e05c7e1dde0fe9","sub_domains":{"Code repo QA":32,"Financial":32},"tokenizer":"/models/GLM5.2-fp8-channel-wise","quantization":"static per-channel FP8 weight; MoE dynamic per-token W8A8; other Linear W8A16","prefix_tokens":131072,"extend_tokens":1024,"output_tokens":1024,"concurrency":64,"output_uri":"gs://inference-model-storage-poc-tpu-hns/benchmark-datasets/LongBench-v2/glm52-code-financial-128k-prefix-1k-extend-c64-v1/","source_commit":"565a3d2cd46134daa10c93e04a953e7f17f45a60"}'
+config: '{"dataset":"zai-org/LongBench-v2","dataset_revision":"2b48e494f2c7a2f0af81aae178e05c7e1dde0fe9","sub_domains":{"Code repo QA":32,"Financial":32},"tokenizer":"/models/GLM5.2-fp8-channel-wise","quantization":"static per-channel FP8 weight; MoE dynamic per-token W8A8; other Linear W8A16","prefix_tokens":131072,"extend_tokens":1024,"output_tokens":1024,"concurrency":64,"output_uri":"gs://inference-model-storage-poc-tpu-hns/benchmark-datasets/LongBench-v2/glm52-code-financial-128k-prefix-1k-extend-c64-v1/","source_commit":"645ada5aa510fffc4c6230ee8b1eadcb31e394ed"}'
 role_to_task_spec:
   worker:
     replica: 1
     image: python:3.12
     device_type: cpu
+    supply_mode: flex-start
     resources:
-      # antgroup-v2 e2-medium workers expose 940m allocatable CPU and about
-      # 2.7 GiB memory per node.  This builder streams the source JSON and
-      # retains only the selected 64 token windows, so a sub-core worker is
-      # sufficient and, unlike a 1-core request, is schedulable on this pool.
-      cpu_request: "750m"
-      cpu_limit: "900m"
-      memory_request: 1800Mi
-      memory_limit: 2500Mi
+      # tpu-service's historically verified cpu-np is an n2-standard-64
+      # flex-start pool. Token windows are packed uint32 buffers, but leave
+      # enough headroom for the GLM tokenizer and streaming JSON parser.
+      cpu_request: "1"
+      cpu_limit: "2"
+      memory_request: 4Gi
+      memory_limit: 8Gi
     command: |
       exec bash <<'BASH'
       set -euo pipefail
       ulimit -c 0
 
       SOURCE_ROOT=/workspace/sglang-jax
-      EXPECTED_COMMIT=565a3d2cd46134daa10c93e04a953e7f17f45a60
+      EXPECTED_COMMIT=645ada5aa510fffc4c6230ee8b1eadcb31e394ed
       MODEL_PATH=/models/GLM5.2-fp8-channel-wise
       PERSIST_ROOT=/models/benchmark-datasets/LongBench-v2
       PERSIST_DIR="$PERSIST_ROOT/glm52-code-financial-128k-prefix-1k-extend-c64-v1"
@@ -138,7 +138,7 @@ role_to_task_spec:
         type: git
         repo: https://github.com/primatrix/sglang-jax.git
         ref: dev/glm52-longbench-v2-dataset
-        commit: 565a3d2cd46134daa10c93e04a953e7f17f45a60
+        commit: 645ada5aa510fffc4c6230ee8b1eadcb31e394ed
         path: /workspace/sglang-jax
         auth:
           cred: sglang-jax-codex-dev-20260708
