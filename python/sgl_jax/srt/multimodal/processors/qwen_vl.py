@@ -266,7 +266,10 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         image_sources = self.normalize_data(image_data)
         video_data = self.normalize_data(getattr(request_obj, "video_data", None))
         video_config = self._build_video_config(request_obj)
-        videos = await self._load_videos_async(video_data, video_config)
+        images, videos = await asyncio.gather(
+            self.load_images_async(image_sources),
+            self._load_videos_async(video_data, video_config),
+        )
         processor_kwargs = {}
         if videos:
             processor_kwargs["videos_kwargs"] = {
@@ -277,13 +280,24 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         if uses_qwen3vl_processor:
             processor_kwargs["return_mm_token_type_ids"] = True
 
-        processor_output = await self._run_hf_processor_async(
+        return await self.process_and_combine_mm_data_async(
             input_text,
-            image_sources,
-            videos,
-            processor_kwargs,
+            images=images,
+            videos=videos,
+            **processor_kwargs,
         )
 
+    def collect_mm_items_from_processor_output(
+        self,
+        processor_output,
+        images: list | None = None,
+        videos: list | None = None,
+        **kwargs,
+    ) -> MultimodalInputs:
+        del kwargs
+        image_count = len(images or [])
+        video_count = len(videos or [])
+        uses_qwen3vl_processor = not _QWEN3VL_ARCHITECTURES.isdisjoint(self.hf_config.architectures)
         input_ids_array = self._to_numpy(processor_output.get("input_ids"))
         if input_ids_array is None:
             raise ValueError("HF multimodal processor did not return input_ids.")
@@ -293,12 +307,12 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         image_grid_thw = self._to_grid_list(processor_output.get("image_grid_thw"))
         video_grid_thw = self._to_grid_list(processor_output.get("video_grid_thw"))
         mm_token_type_ids = self._to_numpy(processor_output.get("mm_token_type_ids"))
-        if image_sources or videos:
+        if image_count or video_count:
             logger.info(
                 "Qwen-VL processor output: images=%s, videos=%s, image_grid_thw=%s, "
                 "video_grid_thw=%s, pixel_values_shape=%s, pixel_values_videos_shape=%s",
-                len(image_sources),
-                len(videos),
+                image_count,
+                video_count,
                 image_grid_thw,
                 video_grid_thw,
                 None if pixel_values is None else pixel_values.shape,
@@ -524,14 +538,6 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         if nframes is not None and "fps" not in video_config:
             video_config["nframes"] = nframes
         return video_config
-
-    @staticmethod
-    def _to_numpy(value):
-        if value is None:
-            return None
-        if hasattr(value, "detach"):
-            value = value.detach().cpu().numpy()
-        return np.asarray(value)
 
     @classmethod
     def _to_grid_list(cls, value):

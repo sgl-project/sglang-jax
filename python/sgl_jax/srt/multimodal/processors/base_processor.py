@@ -160,28 +160,112 @@ class BaseMultimodalProcessor(ABC):
     async def load_image_async(self, source) -> Image.Image:
         return await self._run_io_async(self.load_image, source)
 
-    async def _run_hf_processor_async(
+    async def load_images_async(self, image_sources: list) -> list[Image.Image]:
+        return await asyncio.gather(*(self.load_image_async(source) for source in image_sources))
+
+    @staticmethod
+    def _to_numpy(value):
+        if value is None:
+            return None
+        if hasattr(value, "detach"):
+            value = value.detach().cpu()
+            # NumPy has no portable bfloat16 representation. Multimodal
+            # features are host-side inputs, so use float32 for interchange.
+            if str(getattr(value, "dtype", "")) == "torch.bfloat16":
+                value = value.float()
+            value = value.numpy()
+        return np.asarray(value)
+
+    def process_mm_data(
         self,
         input_text: str,
-        image_sources: list,
-        videos: list | None,
-        processor_kwargs: dict,
+        images: list | None = None,
+        videos: list | None = None,
+        audios: list | None = None,
+        *,
+        processor,
+        **kwargs,
     ):
-        images = await asyncio.gather(*(self.load_image_async(source) for source in image_sources))
+        """Run the Hugging Face processor synchronously.
 
-        def run_hf_processor(*, processor):
-            kwargs = {
-                "text": [input_text],
-                "images": images or None,
-                "padding": True,
-                "return_tensors": "pt",
-                **processor_kwargs,
-            }
-            if videos is not None:
-                kwargs["videos"] = videos or None
-            return processor(**kwargs)
+        This mirrors upstream SGLang's processor layering. Callers should use
+        ``process_and_combine_mm_data_async`` so this CPU work runs in the
+        isolated multimodal processor executor.
+        """
+        processor_inputs = {
+            "text": [input_text],
+            "images": images or None,
+            "padding": True,
+            "return_tensors": "pt",
+            **kwargs,
+        }
+        if videos is not None:
+            processor_inputs["videos"] = videos or None
+        if audios is not None:
+            processor_inputs["audios"] = audios or None
+        return processor(**processor_inputs)
 
-        return await self.mm_processor_executor.run(run_hf_processor)
+    def collect_mm_items_from_processor_output(
+        self,
+        processor_output,
+        images: list | None = None,
+        videos: list | None = None,
+        audios: list | None = None,
+        **kwargs,
+    ) -> MultimodalInputs:
+        """Convert one HF processor output into the runtime MM contract.
+
+        Model adapters override this hook when their feature layout or token
+        metadata is model-specific. The default handles text-only output.
+        """
+        del images, videos, audios, kwargs
+        input_ids = self._to_numpy(processor_output.get("input_ids"))
+        if input_ids is None:
+            raise ValueError("HF multimodal processor did not return input_ids.")
+        return MultimodalInputs(mm_items=[], input_ids=input_ids.reshape(-1).tolist())
+
+    def process_and_combine_mm_data(
+        self,
+        input_text: str,
+        images: list | None = None,
+        videos: list | None = None,
+        audios: list | None = None,
+        *,
+        processor,
+        **processor_kwargs,
+    ) -> MultimodalInputs:
+        processor_output = self.process_mm_data(
+            input_text,
+            images=images,
+            videos=videos,
+            audios=audios,
+            processor=processor,
+            **processor_kwargs,
+        )
+        return self.collect_mm_items_from_processor_output(
+            processor_output,
+            images=images,
+            videos=videos,
+            audios=audios,
+        )
+
+    async def process_and_combine_mm_data_async(
+        self,
+        input_text: str,
+        images: list | None = None,
+        videos: list | None = None,
+        audios: list | None = None,
+        **processor_kwargs,
+    ) -> MultimodalInputs:
+        """Run HF processing and output collection outside the event loop."""
+        return await self.mm_processor_executor.run(
+            self.process_and_combine_mm_data,
+            input_text,
+            images,
+            videos,
+            audios,
+            **processor_kwargs,
+        )
 
     def shutdown(self) -> None:
         if self._shutdown:
