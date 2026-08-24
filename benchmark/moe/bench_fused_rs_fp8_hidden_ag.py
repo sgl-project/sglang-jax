@@ -63,11 +63,19 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--scale-granularity",
+        choices=("tensor", "row"),
+        default="tensor",
+        help="private diagnostic scale granularity for direct FP8 consumption",
+    )
+    parser.add_argument(
         "--correctness-rel-l2-threshold",
         type=float,
         default=DEFAULT_REL_L2_THRESHOLD,
     )
     args = parser.parse_args()
+    if args.scale_granularity == "row" and not args.direct_prequantized:
+        raise ValueError("row scale requires --direct-prequantized")
 
     visible_devices = len(jax.devices())
     supported_contracts = {
@@ -121,6 +129,9 @@ def main() -> None:
                 layer_scope=False,
                 fp8_hidden_all_gather=fp8_hidden_all_gather,
                 _fp8_hidden_direct_prequantized=direct_prequantized,
+                _fp8_hidden_scale_granularity=(
+                    args.scale_granularity if direct_prequantized else "tensor"
+                ),
             )
 
             compile_start = time.perf_counter()
@@ -183,8 +194,15 @@ def main() -> None:
                     "variant": variant,
                     "fp8_hidden_all_gather": fp8_hidden_all_gather,
                     "fp8_hidden_direct_prequantized": direct_prequantized,
+                    "fp8_hidden_scale_granularity": (
+                        args.scale_granularity if fp8_hidden_all_gather else None
+                    ),
                     "scale_semantics": (
-                        "one_fp32_scale_per_ep_rank_physical_hidden_shard"
+                        (
+                            "one_fp32_scale_per_physical_hidden_row"
+                            if args.scale_granularity == "row"
+                            else "one_fp32_scale_per_ep_rank_physical_hidden_shard"
+                        )
                         if fp8_hidden_all_gather
                         else None
                     ),
@@ -251,7 +269,13 @@ def main() -> None:
                         args.tokens * GLM52_HIDDEN_SIZE * hidden_payload_item_bytes
                     ),
                     "hidden_scale_all_gather_logical_output_bytes_per_device": (
-                        args.ep_size * 4 if fp8_hidden_all_gather else 0
+                        (
+                            args.tokens * 4
+                            if args.scale_granularity == "row"
+                            else args.ep_size * 4
+                        )
+                        if fp8_hidden_all_gather
+                        else 0
                     ),
                     "requested_iterations": args.iters,
                     "representative_pid_semantics": True,
