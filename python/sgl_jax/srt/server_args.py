@@ -263,6 +263,8 @@ class ServerArgs:
     limit_mm_data_per_request: dict[str, int] | None = None
     mm_embedding_cache_size_mb: int | None = None
     mm_embedding_page_size: int = 64
+    mm_io_worker_num: int = 0
+    mm_processor_worker_num: int = 0
 
     enable_return_routed_experts: bool = False
     enable_expert_balance_debug: bool = False
@@ -530,6 +532,10 @@ class ServerArgs:
             raise ValueError("--mm-embedding-cache-size-mb must be non-negative")
         if self.mm_embedding_page_size <= 0:
             raise ValueError("--mm-embedding-page-size must be positive")
+        if self.mm_io_worker_num < 0:
+            raise ValueError("--mm-io-worker-num must be non-negative")
+        if self.mm_processor_worker_num < 0:
+            raise ValueError("--mm-processor-worker-num must be non-negative")
 
         if self.ep_num_redundant_experts < 0:
             raise ValueError("ep_num_redundant_experts must be non-negative")
@@ -1605,6 +1611,18 @@ class ServerArgs:
             type=int,
             default=ServerArgs.mm_embedding_page_size,
             help="Token-block (page) size for the multimodal embedding pool.",
+        )
+        parser.add_argument(
+            "--mm-io-worker-num",
+            type=int,
+            default=ServerArgs.mm_io_worker_num,
+            help="Number of multimodal data loading workers. 0 uses the model default.",
+        )
+        parser.add_argument(
+            "--mm-processor-worker-num",
+            type=int,
+            default=ServerArgs.mm_processor_worker_num,
+            help="Number of multimodal processor workers. 0 uses the model default.",
         )
 
         # LoRA
