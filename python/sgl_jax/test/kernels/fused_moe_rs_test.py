@@ -299,6 +299,19 @@ class MoERSKernelTest(jtu.JaxTestCase):
         self.assertAllClose(padded_scale, all_active_scale, atol=0.0, rtol=0.0)
         self.assertArraysEqual(padded_payload, all_active_payload)
 
+    def test_fp8_hidden_quantization_applies_scale_multiplier(self):
+        hidden = jnp.asarray([[1.0, 2.0], [4.0, 8.0]], dtype=jnp.bfloat16)
+        topk_ids = jnp.asarray([[0, 1], [1, 0]], dtype=jnp.int32)
+
+        _, base_scale = _quantize_hidden_per_tensor(hidden, topk_ids)
+        _, calibrated_scale = _quantize_hidden_per_tensor(
+            hidden,
+            topk_ids,
+            scale_multiplier=0.96,
+        )
+
+        self.assertAllClose(calibrated_scale, base_scale * 0.96)
+
     def test_fp8_hidden_dequantization_materializes_rank_scales_in_row_order(self):
         payload = jnp.asarray(
             [

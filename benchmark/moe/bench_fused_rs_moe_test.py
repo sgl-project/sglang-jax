@@ -48,7 +48,7 @@ class FusedRsTuningTest(unittest.TestCase):
             )
         )
 
-    def test_runner_forwards_direct_prequantized_diagnostic_flag(self):
+    def test_runner_forwards_fp8_hidden_diagnostic_flags(self):
         source = (
             Path(__file__).with_name("bench_fused_rs_moe.py").read_text(encoding="utf-8")
         )
@@ -65,13 +65,17 @@ class FusedRsTuningTest(unittest.TestCase):
             and isinstance(node.func, ast.Name)
             and node.func.id == "_fused_moe_func_rs_impl"
         )
-        forwarded = next(
-            keyword
-            for keyword in fused_call.keywords
-            if keyword.arg == "_fp8_hidden_direct_prequantized"
-        )
-        self.assertIsInstance(forwarded.value, ast.Name)
-        self.assertEqual(forwarded.value.id, "_fp8_hidden_direct_prequantized")
+        for argument in (
+            "_fp8_hidden_direct_prequantized",
+            "_fp8_hidden_scale_multiplier",
+        ):
+            forwarded = next(
+                keyword
+                for keyword in fused_call.keywords
+                if keyword.arg == argument
+            )
+            self.assertIsInstance(forwarded.value, ast.Name)
+            self.assertEqual(forwarded.value.id, argument)
 
     def test_candidates_follow_full_k_pipeline_and_vmem_contract(self):
         configs = generate_rs_tuning_configs((128, 256, 384))

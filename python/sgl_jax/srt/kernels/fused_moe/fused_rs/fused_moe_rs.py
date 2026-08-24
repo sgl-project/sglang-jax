@@ -128,6 +128,8 @@ def _assert_fused_rs_smem_safe(size_m: int) -> None:
 def _quantize_hidden_per_tensor(
     hidden_local: jax.Array,
     topk_indices_local: jax.Array,
+    *,
+    scale_multiplier: float = 1.0,
 ) -> tuple[jax.Array, jax.Array]:
     """Quantize one EP rank's physical hidden shard with one FP32 scale.
 
@@ -139,7 +141,11 @@ def _quantize_hidden_per_tensor(
     hidden_f32 = hidden_local.astype(jnp.float32)
     fp8_max = jnp.asarray(jnp.finfo(jnp.float8_e4m3fn).max, dtype=jnp.float32)
     amax = jnp.max(jnp.abs(hidden_f32))
-    scale = jnp.maximum(amax, jnp.asarray(1e-12, dtype=jnp.float32)) / fp8_max
+    scale = (
+        jnp.maximum(amax, jnp.asarray(1e-12, dtype=jnp.float32))
+        / fp8_max
+        * scale_multiplier
+    )
     quantized = jnp.clip(hidden_f32 / scale, -fp8_max, fp8_max).astype(
         jnp.float8_e4m3fn
     )
@@ -403,6 +409,7 @@ def expert_parallel_gmm_rs(
     fp8_post_gather: bool = False,
     fp8_hidden_all_gather: bool = False,
     _fp8_hidden_direct_prequantized: bool = False,
+    _fp8_hidden_scale_multiplier: float = 1.0,
 ) -> jax.Array:
     """Run fused-RS with sglang-jax's token-sharded model mesh.
 
@@ -416,6 +423,12 @@ def expert_parallel_gmm_rs(
     if _fp8_hidden_direct_prequantized and not fp8_hidden_all_gather:
         raise ValueError(
             "direct prequantized FP8 consumer requires FP8 Hidden AllGather"
+        )
+    if _fp8_hidden_scale_multiplier <= 0:
+        raise ValueError("FP8 Hidden AllGather scale multiplier must be positive")
+    if _fp8_hidden_scale_multiplier != 1.0 and not fp8_hidden_all_gather:
+        raise ValueError(
+            "FP8 Hidden AllGather scale multiplier requires FP8 Hidden AllGather"
         )
     if fp8_hidden_all_gather:
         if (
@@ -484,6 +497,7 @@ def expert_parallel_gmm_rs(
                 hidden_payload_local, hidden_scale_local = _quantize_hidden_per_tensor(
                     hidden_local,
                     topk_indices_local,
+                    scale_multiplier=_fp8_hidden_scale_multiplier,
                 )
             with jax.named_scope("fused_rs_hidden_all_gather"):
                 hidden_global = jax.lax.all_gather(
@@ -625,6 +639,7 @@ def _fused_moe_func_rs_impl(
     fp8_post_gather: bool = False,
     fp8_hidden_all_gather: bool = False,
     _fp8_hidden_direct_prequantized: bool = False,
+    _fp8_hidden_scale_multiplier: float = 1.0,
     w3: jax.Array | None = None,
     w3_scale: jax.Array | None = None,
 ) -> jax.Array:
@@ -678,6 +693,7 @@ def _fused_moe_func_rs_impl(
         fp8_post_gather=fp8_post_gather,
         fp8_hidden_all_gather=fp8_hidden_all_gather,
         _fp8_hidden_direct_prequantized=_fp8_hidden_direct_prequantized,
+        _fp8_hidden_scale_multiplier=_fp8_hidden_scale_multiplier,
     )
 
     return result[:num_tokens, :hidden_size]
@@ -692,6 +708,7 @@ _FUSED_MOE_RS_STATIC_ARGNAMES = (
     "fp8_post_gather",
     "fp8_hidden_all_gather",
     "_fp8_hidden_direct_prequantized",
+    "_fp8_hidden_scale_multiplier",
 )
 
 fused_moe_func_rs = jax.jit(
