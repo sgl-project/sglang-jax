@@ -4,6 +4,39 @@
 > points, start with [`delivery/README.md`](delivery/README.md). The dated files
 > in this directory are retained as historical experiment records.
 
+## Natural 128K + 1K workload data
+
+`prepare_longbench_v2.py` builds the natural-text/code input used by the 64-way
+long-context serving comparison. It pins LongBench v2 revision
+`2b48e494f2c7a2f0af81aae178e05c7e1dde0fe9`, keeps only the `Code repo QA` and
+`Financial` sub-domains, and uses the serving model's tokenizer rather than a
+character or word-count estimate.
+
+The default output contains 32 requests from each sub-domain. Every request has
+an exact 131,072-token prefix and 1,024-token extension; the question, all four
+choices, and the answer marker fit in that final extension. The output length is
+recorded as 1,024 tokens for the serving client. Long source records are split
+into deterministic non-overlapping windows, with first windows preferred before
+later windows to maximize source diversity.
+
+The Falcon CPU preparation job persists the pinned raw source, exact input IDs,
+checksums, tokenizer identity, and selection audit under:
+
+```text
+gs://inference-model-storage-poc-tpu-hns/benchmark-datasets/LongBench-v2/glm52-code-financial-128k-prefix-1k-extend-c64-v1/
+```
+
+The corresponding serving mount is:
+
+```text
+/models/benchmark-datasets/LongBench-v2/glm52-code-financial-128k-prefix-1k-extend-c64-v1/
+```
+
+`requests.jsonl.gz` is directly consumable: each row contains exact
+`input_ids`, source/window provenance, SHA-256 hashes, and the runtime output
+length. `_SUCCESS.json` is written last so a partial GCSFuse copy cannot be
+mistaken for a completed dataset.
+
 This directory contains the correctness-first GLM-5.2 exact DSA serving checks
 for the global `TP16 / DP16 / EP16` topology. Sequence parallelism is disabled:
 `--tp-size 16` is the global/sum TP size, so the tensor size inside each DP rank
