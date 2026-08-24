@@ -10,9 +10,9 @@ client rather than fabricated in the input data.
 Long sources may contribute more than one non-overlapping window.  Selection
 prefers the first window from distinct sources before later windows and is then
 stable-hashed, so rebuilding from the pinned dataset revision is deterministic.
-Only a bounded character prefix is tokenized from exceptionally large sources:
-the cap is deliberately larger than the required token window and grows when
-needed, avoiding multi-GiB tokenizer working sets for million-token documents.
+Exceptionally large sources are tokenized as bounded character chunks.  Token
+windows never cross a chunk boundary, avoiding multi-GiB tokenizer working sets
+for million-token documents while still using the whole real source corpus.
 """
 
 from __future__ import annotations
@@ -72,6 +72,8 @@ class Candidate:
     choices: dict[str, str]
     answer: str
     window_index: int
+    context_char_start: int
+    context_char_end: int
     context_token_start: int
     context_token_end: int
     source_context_chars: int
@@ -152,56 +154,63 @@ def _candidate_windows(
 
     context_budget = config.total_input_len - len(suffix_ids)
     context = str(row["context"])
-    tokenized_context_chars = min(len(context), config.context_char_cap)
-    context_ids = _encode(tokenizer, context[:tokenized_context_chars])
-    # A character cap is intentionally a soft bound.  Grow it only when the
-    # first prefix did not yield one complete token window.  This preserves the
-    # exact tokenizer output for the selected prefix while avoiding the former
-    # behaviour of encoding a 1M+ token source just to retain its first 132K.
-    while len(context_ids) < context_budget and tokenized_context_chars < len(context):
-        tokenized_context_chars = min(
-            len(context), tokenized_context_chars + config.context_char_cap
-        )
-        context_ids = _encode(tokenizer, context[:tokenized_context_chars])
-    if len(context_ids) < context_budget:
-        return [], "context_too_short"
-
     source_id = str(row["_id"])
     source_context_sha256 = hashlib.sha256(context.encode("utf-8")).hexdigest()
     choices = {
         label: str(row[f"choice_{label}"]) for label in ("A", "B", "C", "D")
     }
     candidates = []
-    for window_index, start in enumerate(
-        range(0, len(context_ids) - context_budget + 1, context_budget)
-    ):
-        end = start + context_budget
-        input_ids = array.array("I", context_ids[start:end])
-        input_ids.extend(suffix_ids)
-        if len(input_ids) != config.total_input_len:
-            raise AssertionError((len(input_ids), config.total_input_len))
-        candidates.append(
-            Candidate(
-                priority=_priority(config.selection_seed, source_id, window_index),
-                source_id=source_id,
-                domain=str(row.get("domain", "")),
-                sub_domain=sub_domain,
-                difficulty=str(row.get("difficulty", "")),
-                length_bucket=str(row.get("length", "")),
-                question=str(row["question"]),
-                choices=choices,
-                answer=str(row["answer"]),
-                window_index=window_index,
-                context_token_start=start,
-                context_token_end=end,
-                source_context_chars=len(context),
-                tokenized_context_chars=tokenized_context_chars,
-                tokenized_context_tokens=len(context_ids),
-                suffix_tokens=len(suffix_ids),
-                source_context_sha256=source_context_sha256,
-                input_ids=input_ids,
-            )
+    window_index = 0
+    tokenized_tokens_before_chunk = 0
+    for context_char_start in range(0, len(context), config.context_char_cap):
+        context_char_end = min(
+            len(context), context_char_start + config.context_char_cap
         )
+        context_ids = _encode(
+            tokenizer, context[context_char_start:context_char_end]
+        )
+        for chunk_token_start in range(
+            0, len(context_ids) - context_budget + 1, context_budget
+        ):
+            chunk_token_end = chunk_token_start + context_budget
+            input_ids = array.array(
+                "I", context_ids[chunk_token_start:chunk_token_end]
+            )
+            input_ids.extend(suffix_ids)
+            if len(input_ids) != config.total_input_len:
+                raise AssertionError((len(input_ids), config.total_input_len))
+            candidates.append(
+                Candidate(
+                    priority=_priority(config.selection_seed, source_id, window_index),
+                    source_id=source_id,
+                    domain=str(row.get("domain", "")),
+                    sub_domain=sub_domain,
+                    difficulty=str(row.get("difficulty", "")),
+                    length_bucket=str(row.get("length", "")),
+                    question=str(row["question"]),
+                    choices=choices,
+                    answer=str(row["answer"]),
+                    window_index=window_index,
+                    context_char_start=context_char_start,
+                    context_char_end=context_char_end,
+                    context_token_start=(
+                        tokenized_tokens_before_chunk + chunk_token_start
+                    ),
+                    context_token_end=(
+                        tokenized_tokens_before_chunk + chunk_token_end
+                    ),
+                    source_context_chars=len(context),
+                    tokenized_context_chars=context_char_end - context_char_start,
+                    tokenized_context_tokens=len(context_ids),
+                    suffix_tokens=len(suffix_ids),
+                    source_context_sha256=source_context_sha256,
+                    input_ids=input_ids,
+                )
+            )
+            window_index += 1
+        tokenized_tokens_before_chunk += len(context_ids)
+    if not candidates:
+        return [], "context_too_short"
     return candidates, None
 
 
@@ -322,6 +331,8 @@ def _write_requests(
                     "choices": candidate.choices,
                     "answer": candidate.answer,
                     "window_index": candidate.window_index,
+                    "context_char_start": candidate.context_char_start,
+                    "context_char_end": candidate.context_char_end,
                     "context_token_start": candidate.context_token_start,
                     "context_token_end": candidate.context_token_end,
                     "source_context_chars": candidate.source_context_chars,
@@ -425,6 +436,10 @@ def _build(
             "quotas": config.quotas,
             "selection_seed": config.selection_seed,
             "context_char_cap": config.context_char_cap,
+            "context_tokenization": (
+                "independent fixed-size character chunks; non-overlapping "
+                "token windows do not cross chunk boundaries"
+            ),
             "selection_order": "window_index_then_sha256(seed,source_id,window_index)",
             "window_stride": "non-overlapping context budget",
             "suffix_contract": "question, choices, and Answer marker fit in final 1024 tokens",

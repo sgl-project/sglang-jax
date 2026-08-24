@@ -55,6 +55,8 @@ def _candidate(sub_domain, priority, source_id):
         choices={"A": "a", "B": "b", "C": "c", "D": "d"},
         answer="A",
         window_index=0,
+        context_char_start=0,
+        context_char_end=8,
         context_token_start=0,
         context_token_end=4,
         source_context_chars=8,
@@ -161,9 +163,12 @@ class PrepareLongBenchV2Test(unittest.TestCase):
 
         self.assertIsNone(reason)
         self.assertGreaterEqual(len(candidates), 1)
-        self.assertTrue(all(candidate.tokenized_context_chars == 512 for candidate in candidates))
+        self.assertTrue(all(candidate.tokenized_context_chars <= 512 for candidate in candidates))
         self.assertTrue(
             all(candidate.tokenized_context_chars < candidate.source_context_chars for candidate in candidates)
+        )
+        self.assertGreater(
+            len({candidate.context_char_start for candidate in candidates}), 1
         )
 
     def test_selection_is_balanced_and_uses_lowest_priority(self):
