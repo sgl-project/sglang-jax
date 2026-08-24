@@ -12,6 +12,11 @@ role_to_task_spec:
     image: python:3.12
     device_type: cpu
     machine_type: n2-highmem-32
+    resources:
+      cpu_request: "16"
+      cpu_limit: "16"
+      memory_request: 64Gi
+      memory_limit: 64Gi
     command: |
       exec bash <<'BASH'
       set -euo pipefail
