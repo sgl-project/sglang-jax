@@ -178,6 +178,17 @@ def _extract_trace_measurements(
     }
 
 
+def _representative_task_duration_ms(samples: list[float]) -> float | None:
+    """Select the real task event when one trace has multiple direct matches.
+
+    Mosaic may emit both a tiny wrapper custom call and the actual Pallas task
+    with the same direct event name. A profiler session contains one benchmark
+    invocation, so the longest direct-name match is the device task duration
+    that represents that invocation. Preserve an empty capture as missing.
+    """
+    return max(samples) if samples else None
+
+
 def _load_trace(trace_root: str) -> dict[str, Any]:
     trace_dir = pathlib.Path(trace_root) / "plugins" / "profile"
     if not trace_dir.exists():

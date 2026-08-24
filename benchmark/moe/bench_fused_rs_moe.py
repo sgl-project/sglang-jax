@@ -45,6 +45,7 @@ from benchmark.moe.fused_rs_tuning import (
     generate_rs_tuning_configs,
 )
 from benchmark.utils import (
+    _representative_task_duration_ms,
     multiple_iteration_profile_from_trace,
     multiple_iteration_timeit_from_trace,
 )
@@ -714,6 +715,8 @@ def _measure_breakdown(
     combined = {
         "call_samples_ms": [],
         "task_samples_ms": [],
+        "task_raw_matches_by_trace_ms": [],
+        "task_sample_selection": "largest_direct_name_match_per_trace",
         "stage_samples_ms": {name: [] for name in stage_scopes},
         "trace_dir": trace_root,
         "trace_dirs": [],
@@ -733,7 +736,13 @@ def _measure_breakdown(
             trace_root=str(Path(trace_root) / f"sample-{iteration}"),
         )
         combined["call_samples_ms"].extend(current["call_samples_ms"])
-        combined["task_samples_ms"].extend(current["task_samples_ms"])
+        raw_task_samples = current["task_samples_ms"]
+        combined["task_raw_matches_by_trace_ms"].append(raw_task_samples)
+        representative_task_sample = _representative_task_duration_ms(
+            raw_task_samples
+        )
+        if representative_task_sample is not None:
+            combined["task_samples_ms"].append(representative_task_sample)
         for stage_name in stage_scopes:
             combined["stage_samples_ms"][stage_name].extend(
                 current["stage_samples_ms"][stage_name]
@@ -795,6 +804,14 @@ def main() -> None:
         "--append-jsonl",
         action="store_true",
         help="Append to --jsonl instead of truncating it before this scope.",
+    )
+    parser.add_argument(
+        "--jsonl-all-processes",
+        action="store_true",
+        help=(
+            "Write each process's local timing row to its own --jsonl path. "
+            "The caller must provide a process-scoped path."
+        ),
     )
     parser.add_argument("--no-check", action="store_true")
     parser.add_argument(
@@ -902,7 +919,8 @@ def main() -> None:
         input_profile = args.input_profile or "expert_distinct"
     else:
         input_profile = args.input_profile or "uniform"
-    if args.jsonl is not None and not args.append_jsonl and jax.process_index() == 0:
+    writes_jsonl = args.jsonl_all_processes or jax.process_index() == 0
+    if args.jsonl is not None and not args.append_jsonl and writes_jsonl:
         args.jsonl.parent.mkdir(parents=True, exist_ok=True)
         args.jsonl.write_text("", encoding="utf-8")
 
@@ -910,7 +928,7 @@ def main() -> None:
         encoded = json.dumps(row, sort_keys=True)
         if jax.process_index() == 0:
             print(encoded, flush=True)
-        if args.jsonl is not None and jax.process_index() == 0:
+        if args.jsonl is not None and writes_jsonl:
             with args.jsonl.open("a", encoding="utf-8") as output_file:
                 output_file.write(encoded + "\n")
 
@@ -1290,6 +1308,11 @@ def main() -> None:
                         "fused_v2_call_samples_ms": v2_call_samples,
                         "fused_v2_pallas_ms": v2_pallas_ms,
                         "fused_v2_pallas_samples_ms": v2_pallas_samples,
+                        "fused_v2_pallas_raw_matches_by_trace_ms": (
+                            v2_breakdown["task_raw_matches_by_trace_ms"]
+                            if v2_breakdown
+                            else None
+                        ),
                         "fused_v2_blocking_wall_ms": v2_wall_ms,
                         "fused_v2_blocking_wall_samples_ms": v2_wall_samples,
                         "fused_rs_call_ms": (
@@ -1302,6 +1325,16 @@ def main() -> None:
                             else None
                         ),
                         "fused_rs_pallas_samples_ms": pallas_samples,
+                        "fused_rs_pallas_raw_matches_by_trace_ms": (
+                            breakdown["task_raw_matches_by_trace_ms"]
+                            if breakdown
+                            else None
+                        ),
+                        "pallas_task_sample_selection": (
+                            "largest_direct_name_match_per_trace"
+                            if args.profile_breakdown
+                            else None
+                        ),
                         "fused_rs_blocking_wall_ms": rs_wall_ms,
                         "fused_rs_blocking_wall_samples_ms": rs_wall_samples,
                         "fused_rs_hidden_all_gather_ms": (

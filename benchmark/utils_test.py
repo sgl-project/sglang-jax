@@ -9,7 +9,10 @@ if importlib.util.find_spec("jax") is None:
     # local environment without pretending to exercise profiler integration.
     sys.modules["jax"] = types.ModuleType("jax")
 
-from benchmark.utils import _extract_trace_measurements
+from benchmark.utils import (
+    _extract_trace_measurements,
+    _representative_task_duration_ms,
+)
 
 
 def _event(
@@ -31,6 +34,13 @@ def _event(
 
 
 class TraceMeasurementTest(unittest.TestCase):
+    def test_representative_task_duration_uses_largest_direct_match(self):
+        self.assertEqual(
+            _representative_task_duration_ms([0.0005, 1.4]),
+            1.4,
+        )
+        self.assertIsNone(_representative_task_duration_ms([]))
+
     def test_extracts_call_task_and_scoped_collectives_from_same_pid(self):
         events = []
         for iteration in range(2):
