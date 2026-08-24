@@ -34,6 +34,9 @@ from sgl_jax.srt.kernels.fused_moe.fused_rs.gmm_fused_rs_nodedup import (
     set_fused_rs_block_sizes_override,
 )
 from sgl_jax.srt.kernels.fused_moe.v2.kernel import FusedMoEBlockConfig, fused_ep_moe_v2
+from sgl_jax.srt.kernels.fused_moe.v2.tuned_block_configs import (
+    get_tuned_fused_moe_v2_block_config,
+)
 from sgl_jax.srt.layers.fused_moe import fused_rs_shared_expert
 
 from benchmark.moe.fused_rs_tuning import (
@@ -53,19 +56,6 @@ GLM52_INTERMEDIATE_SIZE = 2048
 GLM52_QUANT_BLOCK_K = None
 DEFAULT_TOKENS = (65536,)
 DEFAULT_TUNE_TILE_MS = (128, 256, 384)
-
-# Production GLM-5.2 v7x EP32 W8A8 per-channel config from
-# v2/tuned_block_configs.py in the private epic/glm_5_2 baseline. Keeping
-# the fixed-shape benchmark self-contained avoids importing the serving utility
-# package (and its unrelated HTTP/ZMQ dependencies) in a minimal TPU image.
-GLM52_V2_BLOCK_CONFIGS = {
-    # Existing EP32 direct-scaled-dot config from v2/bench_compare.py.  This
-    # small case is a correctness discriminator for the scalar-prefetch route;
-    # it is not a new tuning result.
-    64: (8, 512, 8, 256, 8),
-    65536: (64, 1024, 128, 1024, 128),
-}
-
 
 def _parse_csv_ints(value: str) -> tuple[int, ...]:
     return tuple(int(item.strip()) for item in value.split(",") if item.strip())
@@ -519,14 +509,38 @@ def _invalid_padding_max_abs(output, valid_mask) -> float:
     return float(jax.device_get(jnp.max(jnp.abs(output.astype(jnp.float32)) * invalid)))
 
 
-def _v2_runner(mesh, num_tokens: int, *, layer_scope: bool) -> Callable:
-    try:
-        bt, bf, btc, bse, bts = GLM52_V2_BLOCK_CONFIGS[num_tokens]
-    except KeyError as exc:
-        raise ValueError(
-            f"No GLM-5.2 fused_v2 block config for tokens={num_tokens}"
-        ) from exc
-    block_config = FusedMoEBlockConfig(bt=bt, bf=bf, btc=btc, bse=bse, bts=bts)
+def _v2_block_config(
+    num_tokens: int, ep_size: int, *, layer_scope: bool
+) -> FusedMoEBlockConfig:
+    """Select exactly the block config used by the current serving code."""
+    return get_tuned_fused_moe_v2_block_config(
+        num_tokens=num_tokens,
+        num_experts=GLM52_NUM_EXPERTS,
+        top_k=GLM52_TOP_K,
+        hidden_size=GLM52_HIDDEN_SIZE,
+        intermediate_size=GLM52_INTERMEDIATE_SIZE,
+        dtype=jnp.bfloat16,
+        weight_dtype=jnp.float8_e4m3fn,
+        ep_size=ep_size,
+        use_shared_expert=layer_scope,
+        use_grouped_topk=False,
+        enable_act_quant=True,
+        quant_mode="per_channel",
+    )
+
+
+def _block_config_values(config: FusedMoEBlockConfig) -> list[int | None]:
+    return [config.bt, config.bf, config.btc, config.bse, config.bts]
+
+
+def _v2_runner(
+    mesh, num_tokens: int, ep_size: int, *, layer_scope: bool
+) -> tuple[Callable, FusedMoEBlockConfig]:
+    block_config = _v2_block_config(
+        num_tokens,
+        ep_size,
+        layer_scope=layer_scope,
+    )
 
     def run(inputs):
         (
@@ -588,7 +602,7 @@ def _v2_runner(mesh, num_tokens: int, *, layer_scope: bool) -> Callable:
 
     # Match the serving layer boundary: keep shared-expert/add/reshard in the
     # same compiled graph instead of measuring a Python sequence of dispatches.
-    return jax.jit(run)
+    return jax.jit(run), block_config
 
 
 def _rs_runner(mesh, *, layer_scope: bool) -> Callable:
@@ -682,11 +696,12 @@ def _measure(run, inputs, *, task: str, warmup: int, iters: int, trace_root: str
     )
 
 
-def _measure_rs_breakdown(
+def _measure_breakdown(
     run,
     inputs,
     *,
     task: str,
+    stage_scopes: dict[str, tuple[str, str | None]],
     warmup: int,
     iters: int,
     trace_root: str,
@@ -695,17 +710,36 @@ def _measure_rs_breakdown(
         lambda current_inputs: run(current_inputs),
         lambda: (inputs,),
         task=task,
-        stage_scopes={
-            "hidden_all_gather": ("fused_rs_hidden_all_gather", "all-gather"),
-            "topk_ids_all_gather": (
-                "fused_rs_topk_ids_all_gather",
-                "all-gather",
-            ),
-        },
+        stage_scopes=stage_scopes,
         tries=iters,
         warmup=warmup,
         trace_root=trace_root,
     )
+
+
+def _measure_global_blocking_wall(
+    run,
+    inputs,
+    *,
+    iters: int,
+) -> list[float]:
+    """Return the per-iteration max blocking host wall time across processes.
+
+    The timer starts immediately before the already-compiled JIT call and ends
+    after its output is ready.  The following process all-gather is outside the
+    timed region and only selects the global critical process for that sample.
+    """
+    samples: list[float] = []
+    for _ in range(iters):
+        start = time.perf_counter()
+        output = run(inputs)
+        jax.block_until_ready(output)
+        local_ms = (time.perf_counter() - start) * 1000.0
+        gathered = np.asarray(
+            multihost_utils.process_allgather(np.asarray([local_ms], dtype=np.float64))
+        )
+        samples.append(float(np.max(gathered)))
+    return samples
 
 
 def main() -> None:
@@ -738,9 +772,10 @@ def main() -> None:
         "--profile-breakdown",
         action="store_true",
         help=(
-            "From the same real fused-RS trace, record the existing call span, "
-            "the Pallas task event, and the separately scoped BF16 hidden/topk-id "
-            "AllGather device durations. This does not alter collective semantics."
+            "From the same real trace, record the whole compiled-call span and "
+            "Pallas task for both backends, plus the separately scoped fused-RS "
+            "BF16 hidden/topk-id AllGather device durations. This does not alter "
+            "collective semantics."
         ),
     )
     parser.add_argument(
@@ -881,24 +916,79 @@ def main() -> None:
             v2_out = None
             v2_ms = None
             v2_kernel_samples = None
+            v2_call_ms = None
+            v2_call_samples = None
+            v2_pallas_ms = None
+            v2_pallas_samples = None
+            v2_wall_ms = None
+            v2_wall_samples = None
+            v2_breakdown = None
+            v2_breakdown_complete = False
+            v2_legacy_sample_source = None
+            v2_block_config = None
             if not args.tune_rs:
-                v2_run = _v2_runner(mesh, num_tokens, layer_scope=args.layer_scope)
+                v2_run, v2_block_config = _v2_runner(
+                    mesh,
+                    num_tokens,
+                    args.ep_size,
+                    layer_scope=args.layer_scope,
+                )
                 if not args.no_check:
                     v2_out = v2_run(inputs)
                     jax.block_until_ready(v2_out)
                 if not args.rs_only:
-                    samples = _measure(
-                        v2_run,
-                        inputs,
-                        task=r"fused-moe-v2-k_.*",
-                        warmup=args.warmup,
-                        iters=args.iters,
-                        trace_root=str(
-                            Path(args.trace_root) / str(num_tokens) / "fused_v2"
-                        ),
+                    v2_trace_root = str(
+                        Path(args.trace_root) / str(num_tokens) / "fused_v2"
                     )
-                    v2_ms = statistics.median(samples)
-                    v2_kernel_samples = samples
+                    if args.profile_breakdown:
+                        v2_breakdown = _measure_breakdown(
+                            v2_run,
+                            inputs,
+                            task=r"fused-moe-v2-k_.*",
+                            stage_scopes={},
+                            warmup=args.warmup,
+                            iters=args.iters,
+                            trace_root=v2_trace_root,
+                        )
+                        v2_call_samples = v2_breakdown["call_samples_ms"]
+                        v2_pallas_samples = v2_breakdown["task_samples_ms"]
+                        v2_kernel_samples = v2_pallas_samples
+                        v2_legacy_sample_source = "pallas_task"
+                        v2_breakdown_complete = all(
+                            len(current_samples) == args.iters
+                            for current_samples in (
+                                v2_call_samples,
+                                v2_pallas_samples,
+                            )
+                        )
+                    else:
+                        v2_kernel_samples = _measure(
+                            v2_run,
+                            inputs,
+                            task=r"fused-moe-v2-k_.*",
+                            warmup=args.warmup,
+                            iters=args.iters,
+                            trace_root=v2_trace_root,
+                        )
+                        v2_legacy_sample_source = "call_marker_or_task_fallback"
+                    v2_ms = statistics.median(v2_kernel_samples)
+                    v2_call_ms = (
+                        statistics.median(v2_call_samples)
+                        if v2_call_samples
+                        else None
+                    )
+                    v2_pallas_ms = (
+                        statistics.median(v2_pallas_samples)
+                        if v2_pallas_samples
+                        else None
+                    )
+                    if args.profile_breakdown:
+                        v2_wall_samples = _measure_global_blocking_wall(
+                            v2_run,
+                            inputs,
+                            iters=args.iters,
+                        )
+                        v2_wall_ms = statistics.median(v2_wall_samples)
 
             for config in rs_configs:
                 config_label = _config_label(config)
@@ -944,6 +1034,11 @@ def main() -> None:
                     "routing_seed": args.routing_seed,
                     "input_profile": input_profile,
                     **routing_stats,
+                    "effective_fused_v2_block_config": (
+                        _block_config_values(v2_block_config)
+                        if v2_block_config is not None
+                        else None
+                    ),
                     "rs_block_config": config_label,
                     "rs_reference_config": (
                         list(GLM52_RS_REFERENCE_CONFIG) if args.tune_rs else None
@@ -1069,23 +1164,28 @@ def main() -> None:
                     )
                     breakdown = None
                     if args.profile_breakdown:
-                        breakdown = _measure_rs_breakdown(
+                        breakdown = _measure_breakdown(
                             rs_run,
                             inputs,
                             task=r"gmm_v2_fused_rs.*",
+                            stage_scopes={
+                                "hidden_all_gather": (
+                                    "fused_rs_hidden_all_gather",
+                                    "all-gather",
+                                ),
+                                "topk_ids_all_gather": (
+                                    "fused_rs_topk_ids_all_gather",
+                                    "all-gather",
+                                ),
+                            },
                             warmup=args.warmup,
                             iters=args.iters,
                             trace_root=rs_trace_root,
                         )
                         call_samples = breakdown["call_samples_ms"]
                         pallas_samples = breakdown["task_samples_ms"]
-                        # Preserve the legacy output field without hiding a
-                        # missing call marker.  The explicit call/Pallas fields
-                        # below remain authoritative for the breakdown.
-                        samples = call_samples or pallas_samples
-                        legacy_sample_source = (
-                            "call_marker" if call_samples else "pallas_task_fallback"
-                        )
+                        samples = pallas_samples
+                        legacy_sample_source = "pallas_task"
                     else:
                         samples = _measure(
                             rs_run,
@@ -1099,6 +1199,15 @@ def main() -> None:
                         pallas_samples = None
                         legacy_sample_source = "call_marker_or_task_fallback"
                     rs_ms = statistics.median(samples)
+                    rs_wall_samples = None
+                    rs_wall_ms = None
+                    if args.profile_breakdown:
+                        rs_wall_samples = _measure_global_blocking_wall(
+                            rs_run,
+                            inputs,
+                            iters=args.iters,
+                        )
+                        rs_wall_ms = statistics.median(rs_wall_samples)
                     hidden_all_gather_samples = (
                         breakdown["stage_samples_ms"]["hidden_all_gather"]
                         if breakdown
@@ -1109,7 +1218,7 @@ def main() -> None:
                         if breakdown
                         else None
                     )
-                    breakdown_complete = (
+                    rs_breakdown_complete = (
                         breakdown is not None
                         and all(
                             len(stage_samples) == args.iters
@@ -1142,7 +1251,16 @@ def main() -> None:
                         "fused_rs_kernel_ms": rs_ms,
                         "fused_v2_kernel_samples_ms": v2_kernel_samples,
                         "fused_rs_kernel_samples_ms": samples,
+                        "fused_v2_legacy_kernel_field_source": (
+                            v2_legacy_sample_source
+                        ),
                         "fused_rs_legacy_kernel_field_source": legacy_sample_source,
+                        "fused_v2_call_ms": v2_call_ms,
+                        "fused_v2_call_samples_ms": v2_call_samples,
+                        "fused_v2_pallas_ms": v2_pallas_ms,
+                        "fused_v2_pallas_samples_ms": v2_pallas_samples,
+                        "fused_v2_blocking_wall_ms": v2_wall_ms,
+                        "fused_v2_blocking_wall_samples_ms": v2_wall_samples,
                         "fused_rs_call_ms": (
                             statistics.median(call_samples) if call_samples else None
                         ),
@@ -1153,12 +1271,16 @@ def main() -> None:
                             else None
                         ),
                         "fused_rs_pallas_samples_ms": pallas_samples,
+                        "fused_rs_blocking_wall_ms": rs_wall_ms,
+                        "fused_rs_blocking_wall_samples_ms": rs_wall_samples,
                         "fused_rs_hidden_all_gather_ms": (
                             statistics.median(hidden_all_gather_samples)
                             if hidden_all_gather_samples
                             else None
                         ),
-                        "fused_rs_hidden_all_gather_samples_ms": hidden_all_gather_samples,
+                        "fused_rs_hidden_all_gather_samples_ms": (
+                            hidden_all_gather_samples
+                        ),
                         "fused_rs_topk_ids_all_gather_ms": (
                             statistics.median(topk_ids_all_gather_samples)
                             if topk_ids_all_gather_samples
@@ -1168,9 +1290,51 @@ def main() -> None:
                             topk_ids_all_gather_samples
                         ),
                         "profile_breakdown_requested": args.profile_breakdown,
-                        "profile_breakdown_complete": breakdown_complete,
-                        "profile_breakdown_trace_dir": (
+                        "fused_v2_profile_breakdown_complete": (
+                            v2_breakdown_complete
+                        ),
+                        "fused_rs_profile_breakdown_complete": (
+                            rs_breakdown_complete
+                        ),
+                        "profile_breakdown_complete": (
+                            v2_breakdown_complete and rs_breakdown_complete
+                        ),
+                        "fused_v2_profile_breakdown_trace_dir": (
+                            v2_breakdown["trace_dir"] if v2_breakdown else None
+                        ),
+                        "fused_rs_profile_breakdown_trace_dir": (
                             breakdown["trace_dir"] if breakdown else None
+                        ),
+                        "fused_rs_pallas_speedup_vs_v2": (
+                            v2_ms / rs_ms if v2_ms is not None else None
+                        ),
+                        "fused_rs_call_speedup_vs_v2": (
+                            v2_call_ms / statistics.median(call_samples)
+                            if v2_call_ms is not None and call_samples
+                            else None
+                        ),
+                        "fused_rs_blocking_wall_speedup_vs_v2": (
+                            v2_wall_ms / rs_wall_ms
+                            if v2_wall_ms is not None
+                            else None
+                        ),
+                        "fused_v2_call_minus_pallas_ms": (
+                            v2_call_ms - v2_pallas_ms
+                            if v2_call_ms is not None and v2_pallas_ms is not None
+                            else None
+                        ),
+                        "fused_rs_call_minus_pallas_ms": (
+                            statistics.median(call_samples)
+                            - statistics.median(pallas_samples)
+                            if call_samples and pallas_samples
+                            else None
+                        ),
+                        "call_minus_pallas_is_non_additive_overlap_envelope": True,
+                        "blocking_wall_contract": (
+                            "max_across_processes_of_local_jit_call_plus_"
+                            "block_until_ready"
+                            if args.profile_breakdown
+                            else None
                         ),
                         "fused_rs_speedup_vs_v2": (
                             v2_ms / rs_ms if v2_ms is not None else None
