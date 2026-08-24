@@ -94,8 +94,8 @@ role_to_task_spec:
               "iterations": 5,
           },
           "source": {
-              "repo": "primatrix-glm/sglang-jax-private",
-              "branch": "dev/glm52-rs-ep32-64k",
+              "repo": "primatrix/sglang-jax",
+              "branch": "dev/glm52-rs-ep32-prefill-ab",
               "commit": "ea473403526c018fb53860600bc34332a2512cda",
               "delivery": "falcon-native-git-source",
           },
@@ -170,9 +170,9 @@ role_to_task_spec:
     sources:
       - name: sglang-jax
         type: git
-        repo: git@github.com:primatrix-glm/sglang-jax-private.git
-        ref: dev/glm52-rs-ep32-64k
+        repo: https://github.com/primatrix/sglang-jax.git
+        ref: dev/glm52-rs-ep32-prefill-ab
         commit: ea473403526c018fb53860600bc34332a2512cda
         path: /workspace/sglang-jax
         auth:
-          cred: github-primatrix-glm-sglang-jax-private-ssh-codex
+          cred: sglang-jax-codex-dev-20260708
