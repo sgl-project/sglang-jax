@@ -124,6 +124,44 @@ class TraceMeasurementTest(unittest.TestCase):
         self.assertEqual(measurements["call_samples_ms"], [])
         self.assertEqual(measurements["task_samples_ms"], [4.0])
 
+    def test_task_match_does_not_absorb_children_named_by_tf_op_scope(self):
+        measurements = _extract_trace_measurements(
+            {
+                "traceEvents": [
+                    _event(
+                        name="gmm_v2_fused_rs-test",
+                        pid=7,
+                        ts=0,
+                        duration_ms=4.0,
+                        hlo_category="custom-call",
+                    ),
+                    _event(
+                        name="all-gather.1",
+                        pid=7,
+                        ts=1,
+                        duration_ms=1.0,
+                        tf_op="gmm_v2_fused_rs-test/fused_rs_hidden_all_gather",
+                        hlo_category="all-gather",
+                    ),
+                    _event(
+                        name="copy.1",
+                        pid=7,
+                        ts=2,
+                        duration_ms=0.5,
+                        tf_op="gmm_v2_fused_rs-test/copy",
+                        hlo_category="data-movement",
+                    ),
+                ]
+            },
+            task=r"gmm_v2_fused_rs.*",
+            stage_scopes={
+                "hidden": ("fused_rs_hidden_all_gather", "all-gather"),
+            },
+        )
+
+        self.assertEqual(measurements["task_samples_ms"], [4.0])
+        self.assertEqual(measurements["stage_samples_ms"]["hidden"], [1.0])
+
 
 if __name__ == "__main__":
     unittest.main()

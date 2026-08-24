@@ -104,6 +104,7 @@ def _extract_device_event_durations_ms(
     *,
     event_pattern: str,
     hlo_category: str | None = None,
+    match_name_only: bool = False,
 ) -> list[float]:
     """Extract matching device durations with existing representative-PID semantics.
 
@@ -119,7 +120,12 @@ def _extract_device_event_durations_ms(
         args = event.get("args", {})
         if hlo_category is not None and args.get("hlo_category") != hlo_category:
             continue
-        if matcher.search(_event_search_text(event)):
+        search_text = (
+            event.get("name", "")
+            if match_name_only
+            else _event_search_text(event)
+        )
+        if matcher.search(search_text):
             matched.append(event)
 
     by_pid: dict[int, list[dict[str, Any]]] = {}
@@ -159,6 +165,7 @@ def _extract_trace_measurements(
         "task_samples_ms": _extract_device_event_durations_ms(
             trace,
             event_pattern=task,
+            match_name_only=True,
         ),
         "stage_samples_ms": {
             stage_name: _extract_device_event_durations_ms(

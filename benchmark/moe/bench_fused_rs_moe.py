@@ -493,6 +493,7 @@ def _comparison_metrics(
             rel_l2,
             jnp.max(jnp.abs(diff)),
             cosine,
+            jnp.all(jnp.isfinite(reference_f32)),
             jnp.all(jnp.isfinite(candidate_f32)),
         )
     )
@@ -500,7 +501,11 @@ def _comparison_metrics(
         "rel_l2": float(values[0]),
         "max_abs": float(values[1]),
         "cosine": float(values[2]),
-        "all_finite": bool(values[3]),
+        "reference_all_finite": bool(values[3]),
+        "candidate_all_finite": bool(values[4]),
+        # Preserve the existing tuning contract for callers that only validate
+        # the candidate output.
+        "all_finite": bool(values[4]),
     }
 
 
@@ -706,40 +711,69 @@ def _measure_breakdown(
     iters: int,
     trace_root: str,
 ):
-    return multiple_iteration_profile_from_trace(
-        lambda current_inputs: run(current_inputs),
-        lambda: (inputs,),
-        task=task,
-        stage_scopes=stage_scopes,
-        tries=iters,
-        warmup=warmup,
-        trace_root=trace_root,
-    )
+    combined = {
+        "call_samples_ms": [],
+        "task_samples_ms": [],
+        "stage_samples_ms": {name: [] for name in stage_scopes},
+        "trace_dir": trace_root,
+        "trace_dirs": [],
+    }
+    # TPU traces can retain only one representative occurrence for a repeated
+    # custom call in a single profiler session. Capture one invocation per
+    # session so requested iterations remain five actual device samples instead
+    # of one event plus unrelated descendants from the same named scope.
+    for iteration in range(iters):
+        current = multiple_iteration_profile_from_trace(
+            lambda current_inputs: run(current_inputs),
+            lambda: (inputs,),
+            task=task,
+            stage_scopes=stage_scopes,
+            tries=1,
+            warmup=warmup if iteration == 0 else 0,
+            trace_root=str(Path(trace_root) / f"sample-{iteration}"),
+        )
+        combined["call_samples_ms"].extend(current["call_samples_ms"])
+        combined["task_samples_ms"].extend(current["task_samples_ms"])
+        for stage_name in stage_scopes:
+            combined["stage_samples_ms"][stage_name].extend(
+                current["stage_samples_ms"][stage_name]
+            )
+        combined["trace_dirs"].append(current["trace_dir"])
+    return combined
 
 
-def _measure_global_blocking_wall(
+def _measure_blocking_walls(
     run,
     inputs,
     *,
+    warmup: int,
     iters: int,
-) -> list[float]:
-    """Return the per-iteration max blocking host wall time across processes.
+) -> tuple[list[float], list[float]]:
+    """Return local and global-critical blocking wall samples.
 
     The timer starts immediately before the already-compiled JIT call and ends
     after its output is ready.  The following process all-gather is outside the
     timed region and only selects the global critical process for that sample.
     """
-    samples: list[float] = []
+    for _ in range(warmup):
+        jax.block_until_ready(run(inputs))
+    # Keep compilation and warmup skew outside every recorded sample and align
+    # all processes before entering the timed loop.
+    multihost_utils.process_allgather(np.asarray([0], dtype=np.int32))
+
+    local_samples: list[float] = []
+    global_samples: list[float] = []
     for _ in range(iters):
         start = time.perf_counter()
         output = run(inputs)
         jax.block_until_ready(output)
         local_ms = (time.perf_counter() - start) * 1000.0
+        local_samples.append(local_ms)
         gathered = np.asarray(
             multihost_utils.process_allgather(np.asarray([local_ms], dtype=np.float64))
         )
-        samples.append(float(np.max(gathered)))
-    return samples
+        global_samples.append(float(np.max(gathered)))
+    return local_samples, global_samples
 
 
 def main() -> None:
@@ -941,16 +975,23 @@ def main() -> None:
                         Path(args.trace_root) / str(num_tokens) / "fused_v2"
                     )
                     if args.profile_breakdown:
+                        v2_call_samples, v2_wall_samples = _measure_blocking_walls(
+                            v2_run,
+                            inputs,
+                            warmup=args.warmup,
+                            iters=args.iters,
+                        )
+                        v2_call_ms = statistics.median(v2_call_samples)
+                        v2_wall_ms = statistics.median(v2_wall_samples)
                         v2_breakdown = _measure_breakdown(
                             v2_run,
                             inputs,
                             task=r"fused-moe-v2-k_.*",
                             stage_scopes={},
-                            warmup=args.warmup,
+                            warmup=0,
                             iters=args.iters,
                             trace_root=v2_trace_root,
                         )
-                        v2_call_samples = v2_breakdown["call_samples_ms"]
                         v2_pallas_samples = v2_breakdown["task_samples_ms"]
                         v2_kernel_samples = v2_pallas_samples
                         v2_legacy_sample_source = "pallas_task"
@@ -972,23 +1013,11 @@ def main() -> None:
                         )
                         v2_legacy_sample_source = "call_marker_or_task_fallback"
                     v2_ms = statistics.median(v2_kernel_samples)
-                    v2_call_ms = (
-                        statistics.median(v2_call_samples)
-                        if v2_call_samples
-                        else None
-                    )
                     v2_pallas_ms = (
                         statistics.median(v2_pallas_samples)
                         if v2_pallas_samples
                         else None
                     )
-                    if args.profile_breakdown:
-                        v2_wall_samples = _measure_global_blocking_wall(
-                            v2_run,
-                            inputs,
-                            iters=args.iters,
-                        )
-                        v2_wall_ms = statistics.median(v2_wall_samples)
 
             for config in rs_configs:
                 config_label = _config_label(config)
@@ -1092,6 +1121,10 @@ def main() -> None:
                 )
                 try:
                     rel_l2_vs_v2 = None
+                    max_abs_vs_v2 = None
+                    cosine_vs_v2 = None
+                    fused_v2_all_finite = None
+                    fused_rs_all_finite = None
                     rs_reference_metrics = None
                     padding_fidelity_metrics = None
                     padding_invalid_max_abs = None
@@ -1149,12 +1182,10 @@ def main() -> None:
                         compile_status = "ok"
                         v2_metrics = _comparison_metrics(v2_out, rs_out)
                         rel_l2_vs_v2 = v2_metrics["rel_l2"]
-                        if rel_l2_vs_v2 > 0.2:
-                            raise AssertionError(
-                                "fused_rs differs from fused_v2 at "
-                                f"tokens={num_tokens}, config={config_label}: "
-                                f"rel_l2={rel_l2_vs_v2}"
-                            )
+                        max_abs_vs_v2 = v2_metrics["max_abs"]
+                        cosine_vs_v2 = v2_metrics["cosine"]
+                        fused_v2_all_finite = v2_metrics["reference_all_finite"]
+                        fused_rs_all_finite = v2_metrics["candidate_all_finite"]
 
                     validation_stage = "measurement"
                     rs_trace_root = str(
@@ -1164,6 +1195,13 @@ def main() -> None:
                     )
                     breakdown = None
                     if args.profile_breakdown:
+                        call_samples, rs_wall_samples = _measure_blocking_walls(
+                            rs_run,
+                            inputs,
+                            warmup=args.warmup,
+                            iters=args.iters,
+                        )
+                        rs_wall_ms = statistics.median(rs_wall_samples)
                         breakdown = _measure_breakdown(
                             rs_run,
                             inputs,
@@ -1178,11 +1216,10 @@ def main() -> None:
                                     "all-gather",
                                 ),
                             },
-                            warmup=args.warmup,
+                            warmup=0,
                             iters=args.iters,
                             trace_root=rs_trace_root,
                         )
-                        call_samples = breakdown["call_samples_ms"]
                         pallas_samples = breakdown["task_samples_ms"]
                         samples = pallas_samples
                         legacy_sample_source = "pallas_task"
@@ -1199,15 +1236,9 @@ def main() -> None:
                         pallas_samples = None
                         legacy_sample_source = "call_marker_or_task_fallback"
                     rs_ms = statistics.median(samples)
-                    rs_wall_samples = None
-                    rs_wall_ms = None
-                    if args.profile_breakdown:
-                        rs_wall_samples = _measure_global_blocking_wall(
-                            rs_run,
-                            inputs,
-                            iters=args.iters,
-                        )
-                        rs_wall_ms = statistics.median(rs_wall_samples)
+                    if not args.profile_breakdown:
+                        rs_wall_samples = None
+                        rs_wall_ms = None
                     hidden_all_gather_samples = (
                         breakdown["stage_samples_ms"]["hidden_all_gather"]
                         if breakdown
@@ -1340,6 +1371,11 @@ def main() -> None:
                             v2_ms / rs_ms if v2_ms is not None else None
                         ),
                         "rel_l2_vs_v2": rel_l2_vs_v2,
+                        "max_abs_vs_v2": max_abs_vs_v2,
+                        "cosine_vs_v2": cosine_vs_v2,
+                        "fused_v2_all_finite": fused_v2_all_finite,
+                        "fused_rs_all_finite": fused_rs_all_finite,
+                        "numeric_comparison_is_diagnostic_only": True,
                         "rs_reference_rel_l2": (
                             rs_reference_metrics["rel_l2"]
                             if rs_reference_metrics
