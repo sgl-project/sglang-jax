@@ -1,24 +1,21 @@
-name: glm52-longbench-v2-code-c64-data-prep-20260825-r13-antgroup
+name: glm52-longbench-v2-code-c64-data-prep-20260825-r14-antgroup-v7x4-host
 exp_type: TRAINING
 artifact_type: GCS
 cluster_name: tpu-training-antgroup
 priority: 0
-tags: [dataset, longbench-v2, glm52, cpu, long-context, code-repo-qa, code-only, c64]
+tags: [dataset, longbench-v2, glm52, cpu-on-tpu-host, v7x, long-context, code-repo-qa, code-only, c64]
 model_version: glm-5.2-longbench-v2-code-c64-v1
 config: '{"dataset":"zai-org/LongBench-v2","dataset_revision":"2b48e494f2c7a2f0af81aae178e05c7e1dde0fe9","sub_domains":{"Code repo QA":64,"Financial":0},"tokenizer":"/models/GLM5.2-fp8-channel-wise","quantization":"static per-channel FP8 weight; MoE dynamic per-token W8A8; other Linear W8A16","prefix_tokens":131072,"extend_tokens":1024,"output_tokens":1024,"concurrency":64,"output_uri":"gs://inference-model-storage-poc-tpu-hns/benchmark-datasets/LongBench-v2/glm52-code-128k-prefix-1k-extend-c64-v1/","source_commit":"1ae77d9c36fb714eb28dee0fa4d0b3ca2ac25732"}'
 role_to_task_spec:
   worker:
     replica: 1
     image: python:3.12
-    device_type: cpu
-    resources:
-      # AntGroup has a 128-core Falcon CPU quota.  Its Falcon shared CPU pool
-      # currently has one 3.92-core node with a resident job, so request two
-      # cores to fit the remaining capacity while still accelerating tokenization.
-      cpu_request: "2"
-      cpu_limit: "2800m"
-      memory_request: 4Gi
-      memory_limit: 12Gi
+    device_count: 4
+    device_type: v7x
+    device_topo: 2x2x1
+    supply_mode: reservation
+    envs:
+      LIBTPU_INIT_ARGS: --xla_tpu_dvfs_p_state=7
     command: |
       exec bash <<'BASH'
       set -euo pipefail
