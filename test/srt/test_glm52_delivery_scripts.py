@@ -254,6 +254,45 @@ def test_serve_wrapper_enables_fp8_hidden_row_scale_only_when_requested(
     assert "--fused-rs-fp8-hidden-row-scale" in args
 
 
+def test_hidden_ag_ab_runner_isolates_and_orders_variants(tmp_path: Path) -> None:
+    falcon_dir = tmp_path / "falcon"
+    falcon_dir.mkdir()
+    ab_runner = falcon_dir / "run_hidden_ag_ab.sh"
+    ab_runner.write_text(
+        (DELIVERY / "falcon/run_hidden_ag_ab.sh").read_text()
+    )
+    fake_runner = falcon_dir / "runner.sh"
+    fake_runner.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "printf '%s|%s|%s|%s\\n' "
+        '"$GLM52_DELIVERY_RUN_TAG" "$ARTIFACT_LOCAL_DIR" '
+        '"${GLM52_FUSED_RS_FP8_HIDDEN_ALL_GATHER:-0}" '
+        '"${GLM52_FUSED_RS_FP8_HIDDEN_ROW_SCALE:-0}" '
+        '>> "$AB_CAPTURE"\n'
+    )
+    ab_runner.chmod(0o755)
+    fake_runner.chmod(0o755)
+
+    artifact_dir = tmp_path / "artifact"
+    capture = tmp_path / "variants.txt"
+    env = os.environ.copy()
+    env.update(
+        {
+            "ARTIFACT_LOCAL_DIR": str(artifact_dir),
+            "AB_CAPTURE": str(capture),
+            "GLM52_FUSED_RS_FP8_HIDDEN_ALL_GATHER": "1",
+            "GLM52_FUSED_RS_FP8_HIDDEN_ROW_SCALE": "1",
+        }
+    )
+    subprocess.run([str(ab_runner)], env=env, check=True)
+
+    assert capture.read_text().splitlines() == [
+        f"bf16|{artifact_dir}/bf16|0|0",
+        f"fp8-row-scale|{artifact_dir}/fp8-row-scale|1|1",
+    ]
+
+
 def test_serve_wrapper_rejects_max_running_below_fused_moe_minimum(
     tmp_path: Path,
 ) -> None:

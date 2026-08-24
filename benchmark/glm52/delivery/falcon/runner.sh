@@ -33,6 +33,13 @@ MASTER_ADDR="$JOB_BASE-0.$JOB_BASE"
 OUT="${ARTIFACT_LOCAL_DIR:-/tmp/glm52-delivery-artifact}"
 RANK_OUT="$OUT/rank-$RANK"
 LOCAL_ROOT="/tmp/tpu_logs/glm52-${GLM52_QUANTIZATION}-${GLM52_PHYSICAL_CHIPS}chip-${RUN_MODE}-rank$RANK"
+if [[ -n "${GLM52_DELIVERY_RUN_TAG:-}" ]]; then
+  if [[ ! "$GLM52_DELIVERY_RUN_TAG" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+    printf 'invalid GLM52_DELIVERY_RUN_TAG=%s\n' "$GLM52_DELIVERY_RUN_TAG" >&2
+    exit 2
+  fi
+  LOCAL_ROOT="${LOCAL_ROOT%-rank$RANK}-${GLM52_DELIVERY_RUN_TAG}-rank$RANK"
+fi
 SERVER_LOG="$LOCAL_ROOT/server.log"
 SERVER_PID=0
 TAIL_PID=0
