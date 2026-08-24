@@ -200,6 +200,7 @@ class TokenizerManager:
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
+                    use_fast=True,
                 )
                 self.mm_processor = mm_processor_cls(
                     self.model_config.hf_config, server_args, self.processor
@@ -227,6 +228,7 @@ class TokenizerManager:
         self.rid_to_state: dict[str, ReqState] = {}
         self.health_check_failed = False
         self.gracefully_exit = False
+        self._shutdown = False
         self.last_receive_tstamp = 0
         self.dump_requests_folder = ""  # By default do not dump
         self.dump_requests_threshold = 1000
@@ -292,6 +294,13 @@ class TokenizerManager:
             ]
         )
         self.wait_timeout = int(os.environ.get("SGLANG_WAIT_TIMEOUT", "4"))
+
+    def shutdown(self):
+        if self._shutdown:
+            return
+        self._shutdown = True
+        if self.mm_processor is not None:
+            self.mm_processor.shutdown()
 
     async def generate_request(
         self,
@@ -1110,6 +1119,7 @@ class TokenizerManager:
                 self.dump_requests_before_crash()
                 break
 
+        self.shutdown()
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(0)
 
