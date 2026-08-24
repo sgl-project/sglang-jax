@@ -37,15 +37,19 @@ class PerChannelTunedEntry(NamedTuple):
     tuned_value: PerChannelTunedValue
 
 
-# Entries are added only after correctness, same-boundary DOT comparison, and
-# repeat validation on the exact local shape. In particular, this table is not
-# seeded from the shared block-wise tuning table and has no nearest/default
-# fallback. W8A8 intentionally remains empty until it is tuned.
+# Entries are added only after correctness and same-boundary DOT comparison on
+# the exact local shape. Production promotion additionally requires repeat and
+# whole-model validation. This table is not seeded from the shared block-wise
+# tuning table and has no nearest/default fallback. W8A8 entries are kept
+# separate from W8A16 by ``x_q_dtype``.
 #
 # The TPU7 W8A16 entries below were selected by exact-shape searches on
 # GLM-5.2 TP=1 local workloads. The M=2048 entries and the two M=2 Full
 # Indexer additions come from a constrained Cartesian ring-16/XProf sweep;
-# end-to-end serving validation is tracked separately.
+# end-to-end serving validation is tracked separately. The TPU7 W8A8 entries
+# cover the exact M=2/2048 GLM-5.2 workloads selected by the corrected-numerics
+# E1 screen plus the E3/E5 three-seed repeats. The dense_gate_up M=2048 entry
+# deliberately uses the VMEM-safe runner-up instead of the isolated-op winner.
 # Backend selection is global and lives in QuantizationConfig. The registry
 # only maps exact workloads to validated Pallas tiles.
 PER_CHANNEL_TUNED_ENTRIES: dict[PerChannelTunedKey, PerChannelTunedEntry] = {
@@ -160,6 +164,57 @@ PER_CHANNEL_TUNED_ENTRIES: dict[PerChannelTunedKey, PerChannelTunedEntry] = {
     ),
     PerChannelTunedKey(7, 2048, 128, 6144, "bfloat16", "bfloat16", "float8_e4m3fn"): (
         PerChannelTunedEntry(PerChannelTunedValue(512, 128, 6144))
+    ),
+    # M=2 W8A8 workloads. q_a/q_b use the E3 repeat winners; the remaining
+    # entries are corrected-numerics E1 candidates for whole-model validation.
+    PerChannelTunedKey(7, 2, 2048, 6144, "bfloat16", "float8_e4m3fn", "float8_e4m3fn"): (
+        PerChannelTunedEntry(PerChannelTunedValue(2, 2048, 3072))
+    ),
+    PerChannelTunedKey(7, 2, 16384, 2048, "bfloat16", "float8_e4m3fn", "float8_e4m3fn"): (
+        PerChannelTunedEntry(PerChannelTunedValue(8, 4096, 2048))
+    ),
+    PerChannelTunedKey(7, 2, 576, 6144, "bfloat16", "float8_e4m3fn", "float8_e4m3fn"): (
+        PerChannelTunedEntry(PerChannelTunedValue(2, 576, 6144))
+    ),
+    PerChannelTunedKey(7, 2, 6144, 16384, "bfloat16", "float8_e4m3fn", "float8_e4m3fn"): (
+        PerChannelTunedEntry(PerChannelTunedValue(2, 1536, 8192))
+    ),
+    PerChannelTunedKey(7, 2, 12288, 6144, "bfloat16", "float8_e4m3fn", "float8_e4m3fn"): (
+        PerChannelTunedEntry(PerChannelTunedValue(8, 2048, 6144))
+    ),
+    PerChannelTunedKey(7, 2, 6144, 12288, "bfloat16", "float8_e4m3fn", "float8_e4m3fn"): (
+        PerChannelTunedEntry(PerChannelTunedValue(2, 2048, 6144))
+    ),
+    PerChannelTunedKey(7, 2, 4096, 2048, "bfloat16", "float8_e4m3fn", "float8_e4m3fn"): (
+        PerChannelTunedEntry(PerChannelTunedValue(8, 2048, 2048))
+    ),
+    PerChannelTunedKey(7, 2, 128, 6144, "bfloat16", "float8_e4m3fn", "float8_e4m3fn"): (
+        PerChannelTunedEntry(PerChannelTunedValue(4, 128, 6144))
+    ),
+    # M=2048 W8A8 workloads. o_proj/dense_down use the E5 repeat winners.
+    PerChannelTunedKey(7, 2048, 2048, 6144, "bfloat16", "float8_e4m3fn", "float8_e4m3fn"): (
+        PerChannelTunedEntry(PerChannelTunedValue(512, 2048, 6144))
+    ),
+    PerChannelTunedKey(7, 2048, 16384, 2048, "bfloat16", "float8_e4m3fn", "float8_e4m3fn"): (
+        PerChannelTunedEntry(PerChannelTunedValue(1024, 4096, 2048))
+    ),
+    PerChannelTunedKey(7, 2048, 576, 6144, "bfloat16", "float8_e4m3fn", "float8_e4m3fn"): (
+        PerChannelTunedEntry(PerChannelTunedValue(1024, 576, 6144))
+    ),
+    PerChannelTunedKey(7, 2048, 6144, 16384, "bfloat16", "float8_e4m3fn", "float8_e4m3fn"): (
+        PerChannelTunedEntry(PerChannelTunedValue(1024, 1536, 4096))
+    ),
+    PerChannelTunedKey(7, 2048, 12288, 6144, "bfloat16", "float8_e4m3fn", "float8_e4m3fn"): (
+        PerChannelTunedEntry(PerChannelTunedValue(1024, 2048, 3072))
+    ),
+    PerChannelTunedKey(7, 2048, 6144, 12288, "bfloat16", "float8_e4m3fn", "float8_e4m3fn"): (
+        PerChannelTunedEntry(PerChannelTunedValue(512, 3072, 4096))
+    ),
+    PerChannelTunedKey(7, 2048, 4096, 2048, "bfloat16", "float8_e4m3fn", "float8_e4m3fn"): (
+        PerChannelTunedEntry(PerChannelTunedValue(1024, 2048, 2048))
+    ),
+    PerChannelTunedKey(7, 2048, 128, 6144, "bfloat16", "float8_e4m3fn", "float8_e4m3fn"): (
+        PerChannelTunedEntry(PerChannelTunedValue(2048, 128, 3072))
     ),
 }
 
