@@ -120,7 +120,16 @@ def main() -> None:
 
         for variant, fp8_hidden_all_gather in VARIANTS:
             direct_prequantized = args.direct_prequantized and fp8_hidden_all_gather
-            trace_variant = f"{variant}-direct" if direct_prequantized else variant
+            reported_variant = (
+                "fp8-per-row-hidden-ag"
+                if fp8_hidden_all_gather and args.scale_granularity == "row"
+                else variant
+            )
+            trace_variant = (
+                f"{reported_variant}-direct"
+                if direct_prequantized
+                else reported_variant
+            )
             set_fused_rs_block_sizes_override(PRODUCTION_RS_CONFIG)
             set_fused_rs_routing_table_impl("pallas")
             jax.clear_caches()
@@ -191,7 +200,7 @@ def main() -> None:
                 {
                     "record_type": "fused_rs_fp8_hidden_ag",
                     "status": "ok" if contract["contract_ok"] else "correctness_failed",
-                    "variant": variant,
+                    "variant": reported_variant,
                     "fp8_hidden_all_gather": fp8_hidden_all_gather,
                     "fp8_hidden_direct_prequantized": direct_prequantized,
                     "fp8_hidden_scale_granularity": (
