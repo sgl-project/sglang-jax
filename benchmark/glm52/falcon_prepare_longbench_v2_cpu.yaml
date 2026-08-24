@@ -1,7 +1,7 @@
-name: glm52-longbench-v2-code-financial-c64-data-prep-20260824-r6-antgroup-v2-100m
+name: glm52-longbench-v2-code-financial-c64-data-prep-20260824-r7-antgroup-flex-e2std8
 exp_type: TRAINING
 artifact_type: GCS
-cluster_name: tpu-training-antgroup-v2
+cluster_name: tpu-training-antgroup
 priority: 0
 tags: [dataset, longbench-v2, glm52, cpu, long-context, code-repo-qa, financial]
 model_version: glm-5.2-longbench-v2-code-financial-c64-v1
@@ -11,6 +11,8 @@ role_to_task_spec:
     replica: 1
     image: python:3.12
     device_type: cpu
+    machine_type: e2-standard-8
+    supply_mode: flex-start
     resources:
       # Historical successful Ant CPU smoke exp-yojrwsrqgf used a 100m
       # request on cpu-private-test. Keep the request small enough to fit a
