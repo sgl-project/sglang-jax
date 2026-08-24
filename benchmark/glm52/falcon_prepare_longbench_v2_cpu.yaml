@@ -127,9 +127,9 @@ role_to_task_spec:
     sources:
       - name: sglang-jax
         type: git
-        repo: https://github.com/primatrix-glm/sglang-jax-private.git
+        repo: https://github.com/primatrix/sglang-jax.git
         ref: dev/glm52-longbench-v2-dataset
         commit: 565a3d2cd46134daa10c93e04a953e7f17f45a60
         path: /workspace/sglang-jax
         auth:
-          cred: github-cjx0709-sglang-jax-codex
+          cred: sglang-jax-codex-dev-20260708
