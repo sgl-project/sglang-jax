@@ -1,4 +1,4 @@
-name: glm52-longbench-v2-code-c64-data-prep-20260825-r14-antgroup-v7x4-host
+name: glm52-longbench-v2-code-c64-data-prep-20260825-r15-antgroup-v7x4-flex-host
 exp_type: TRAINING
 artifact_type: GCS
 cluster_name: tpu-training-antgroup
@@ -13,7 +13,7 @@ role_to_task_spec:
     device_count: 4
     device_type: v7x
     device_topo: 2x2x1
-    supply_mode: reservation
+    supply_mode: flex-start
     envs:
       LIBTPU_INIT_ARGS: --xla_tpu_dvfs_p_state=7
     command: |
