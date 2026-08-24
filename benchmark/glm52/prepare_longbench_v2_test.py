@@ -57,7 +57,9 @@ def _candidate(sub_domain, priority, source_id):
         window_index=0,
         context_token_start=0,
         context_token_end=4,
-        source_context_tokens=4,
+        source_context_chars=8,
+        tokenized_context_chars=8,
+        tokenized_context_tokens=4,
         suffix_tokens=2,
         source_context_sha256="0" * 64,
         input_ids=(1, 2, 3, 4, 5, 6),
@@ -143,6 +145,26 @@ class PrepareLongBenchV2Test(unittest.TestCase):
         )
         self.assertEqual(candidates, [])
         self.assertEqual(reason, "context_too_short")
+
+    def test_context_char_cap_bounds_exceptionally_long_source(self):
+        row = _row()
+        row["context"] = " ".join(f"token-{index}" for index in range(10_000))
+        config = BuildConfig(
+            prefix_len=16,
+            extend_len=16,
+            code_quota=1,
+            financial_quota=1,
+            context_char_cap=512,
+        )
+
+        candidates, reason = _candidate_windows(row, _WhitespaceTokenizer(), config)
+
+        self.assertIsNone(reason)
+        self.assertGreaterEqual(len(candidates), 1)
+        self.assertTrue(all(candidate.tokenized_context_chars == 512 for candidate in candidates))
+        self.assertTrue(
+            all(candidate.tokenized_context_chars < candidate.source_context_chars for candidate in candidates)
+        )
 
     def test_selection_is_balanced_and_uses_lowest_priority(self):
         candidates = [

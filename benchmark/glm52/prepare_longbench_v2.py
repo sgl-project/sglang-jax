@@ -10,6 +10,9 @@ client rather than fabricated in the input data.
 Long sources may contribute more than one non-overlapping window.  Selection
 prefers the first window from distinct sources before later windows and is then
 stable-hashed, so rebuilding from the pinned dataset revision is deterministic.
+Only a bounded character prefix is tokenized from exceptionally large sources:
+the cap is deliberately larger than the required token window and grows when
+needed, avoiding multi-GiB tokenizer working sets for million-token documents.
 """
 
 from __future__ import annotations
@@ -45,6 +48,7 @@ class BuildConfig:
     output_len: int = 1_024
     code_quota: int = 32
     financial_quota: int = 32
+    context_char_cap: int = 800_000
     selection_seed: str = "glm52-longbench-v2-code-financial-v1"
 
     @property
@@ -70,7 +74,9 @@ class Candidate:
     window_index: int
     context_token_start: int
     context_token_end: int
-    source_context_tokens: int
+    source_context_chars: int
+    tokenized_context_chars: int
+    tokenized_context_tokens: int
     suffix_tokens: int
     source_context_sha256: str
     # Keep selected 132K-token windows in a packed uint32 buffer. A Python
@@ -144,9 +150,19 @@ def _candidate_windows(
     if len(suffix_ids) > config.extend_len:
         return [], "suffix_exceeds_extend"
 
-    context = str(row["context"])
-    context_ids = _encode(tokenizer, context)
     context_budget = config.total_input_len - len(suffix_ids)
+    context = str(row["context"])
+    tokenized_context_chars = min(len(context), config.context_char_cap)
+    context_ids = _encode(tokenizer, context[:tokenized_context_chars])
+    # A character cap is intentionally a soft bound.  Grow it only when the
+    # first prefix did not yield one complete token window.  This preserves the
+    # exact tokenizer output for the selected prefix while avoiding the former
+    # behaviour of encoding a 1M+ token source just to retain its first 132K.
+    while len(context_ids) < context_budget and tokenized_context_chars < len(context):
+        tokenized_context_chars = min(
+            len(context), tokenized_context_chars + config.context_char_cap
+        )
+        context_ids = _encode(tokenizer, context[:tokenized_context_chars])
     if len(context_ids) < context_budget:
         return [], "context_too_short"
 
@@ -178,7 +194,9 @@ def _candidate_windows(
                 window_index=window_index,
                 context_token_start=start,
                 context_token_end=end,
-                source_context_tokens=len(context_ids),
+                source_context_chars=len(context),
+                tokenized_context_chars=tokenized_context_chars,
+                tokenized_context_tokens=len(context_ids),
                 suffix_tokens=len(suffix_ids),
                 source_context_sha256=source_context_sha256,
                 input_ids=input_ids,
@@ -306,7 +324,9 @@ def _write_requests(
                     "window_index": candidate.window_index,
                     "context_token_start": candidate.context_token_start,
                     "context_token_end": candidate.context_token_end,
-                    "source_context_tokens": candidate.source_context_tokens,
+                    "source_context_chars": candidate.source_context_chars,
+                    "tokenized_context_chars": candidate.tokenized_context_chars,
+                    "tokenized_context_tokens": candidate.tokenized_context_tokens,
                     "suffix_tokens": candidate.suffix_tokens,
                     "prefix_len": config.prefix_len,
                     "extend_len": config.extend_len,
@@ -404,6 +424,7 @@ def _build(
             "concurrency": sum(config.quotas.values()),
             "quotas": config.quotas,
             "selection_seed": config.selection_seed,
+            "context_char_cap": config.context_char_cap,
             "selection_order": "window_index_then_sha256(seed,source_id,window_index)",
             "window_stride": "non-overlapping context budget",
             "suffix_contract": "question, choices, and Answer marker fit in final 1024 tokens",
@@ -461,6 +482,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output-len", type=int, default=1_024)
     parser.add_argument("--code-quota", type=int, default=32)
     parser.add_argument("--financial-quota", type=int, default=32)
+    parser.add_argument("--context-char-cap", type=int, default=800_000)
     parser.add_argument(
         "--selection-seed", default="glm52-longbench-v2-code-financial-v1"
     )
@@ -480,6 +502,7 @@ def main() -> None:
         output_len=args.output_len,
         code_quota=args.code_quota,
         financial_quota=args.financial_quota,
+        context_char_cap=args.context_char_cap,
         selection_seed=args.selection_seed,
     )
     if min(
@@ -488,6 +511,7 @@ def main() -> None:
         config.output_len,
         config.code_quota,
         config.financial_quota,
+        config.context_char_cap,
     ) <= 0:
         raise ValueError("token lengths and quotas must all be positive")
 
