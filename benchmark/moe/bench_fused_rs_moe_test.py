@@ -68,6 +68,7 @@ class FusedRsTuningTest(unittest.TestCase):
         for argument in (
             "_fp8_hidden_direct_prequantized",
             "_fp8_hidden_scale_multiplier",
+            "_fp8_hidden_scale_granularity",
         ):
             forwarded = next(
                 keyword

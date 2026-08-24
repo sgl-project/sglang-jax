@@ -617,6 +617,7 @@ def _rs_runner(
     fp8_hidden_all_gather: bool = False,
     _fp8_hidden_direct_prequantized: bool = False,
     _fp8_hidden_scale_multiplier: float = 1.0,
+    _fp8_hidden_scale_granularity: str = "tensor",
 ) -> Callable:
     compiler_options = (
         {
@@ -667,6 +668,7 @@ def _rs_runner(
             fp8_hidden_all_gather=fp8_hidden_all_gather,
             _fp8_hidden_direct_prequantized=_fp8_hidden_direct_prequantized,
             _fp8_hidden_scale_multiplier=_fp8_hidden_scale_multiplier,
+            _fp8_hidden_scale_granularity=_fp8_hidden_scale_granularity,
         )
         if layer_scope:
             shared_output = fused_rs_shared_expert(

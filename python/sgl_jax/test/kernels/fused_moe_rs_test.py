@@ -21,6 +21,7 @@ from jax.sharding import PartitionSpec as P
 from sgl_jax.srt.kernels.fused_moe.fused_rs import fused_moe_func_rs
 from sgl_jax.srt.kernels.fused_moe.fused_rs.fused_moe_rs import (
     _dequantize_hidden_per_rank,
+    _quantize_hidden_per_row,
     _quantize_hidden_per_tensor,
 )
 from sgl_jax.srt.kernels.fused_moe.fused_rs.gmm_fused_rs_nodedup import (
@@ -311,6 +312,16 @@ class MoERSKernelTest(jtu.JaxTestCase):
         )
 
         self.assertAllClose(calibrated_scale, base_scale * 0.96)
+
+    def test_fp8_hidden_per_row_quantization_uses_one_scale_per_row(self):
+        hidden = jnp.asarray([[1.0, 2.0], [4.0, 8.0]], dtype=jnp.bfloat16)
+        topk_ids = jnp.asarray([[0, 1], [-1, -1]], dtype=jnp.int32)
+
+        payload, scales = _quantize_hidden_per_row(hidden, topk_ids)
+        dequantized = payload.astype(jnp.float32) * scales[:, None]
+
+        self.assertEqual(scales.shape, (2,))
+        self.assertAllClose(dequantized, hidden.astype(jnp.float32), rtol=0.05)
 
     def test_fp8_hidden_dequantization_materializes_rank_scales_in_row_order(self):
         payload = jnp.asarray(

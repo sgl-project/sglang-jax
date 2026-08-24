@@ -152,6 +152,33 @@ def _quantize_hidden_per_tensor(
     return quantized, scale
 
 
+def _quantize_hidden_per_row(
+    hidden_local: jax.Array,
+    topk_indices_local: jax.Array,
+    *,
+    scale_multiplier: float = 1.0,
+) -> tuple[jax.Array, jax.Array]:
+    """Quantize each physical hidden row with one FP32 scale.
+
+    This is a diagnostic precision fallback for FP8 Hidden AllGather.  The
+    payload remains FP8; only one FP32 scale per communicated row is added.
+    As with the tensor-scale path, routing padding never mutates the payload.
+    """
+    del topk_indices_local
+    hidden_f32 = hidden_local.astype(jnp.float32)
+    fp8_max = jnp.asarray(jnp.finfo(jnp.float8_e4m3fn).max, dtype=jnp.float32)
+    amax = jnp.max(jnp.abs(hidden_f32), axis=1)
+    scale = (
+        jnp.maximum(amax, jnp.asarray(1e-12, dtype=jnp.float32))
+        / fp8_max
+        * scale_multiplier
+    )
+    quantized = jnp.clip(
+        hidden_f32 / scale[:, None], -fp8_max, fp8_max
+    ).astype(jnp.float8_e4m3fn)
+    return quantized, scale
+
+
 def _dequantize_hidden_per_rank(
     payload: jax.Array,
     rank_scales: jax.Array,
@@ -410,6 +437,7 @@ def expert_parallel_gmm_rs(
     fp8_hidden_all_gather: bool = False,
     _fp8_hidden_direct_prequantized: bool = False,
     _fp8_hidden_scale_multiplier: float = 1.0,
+    _fp8_hidden_scale_granularity: str = "tensor",
 ) -> jax.Array:
     """Run fused-RS with sglang-jax's token-sharded model mesh.
 
@@ -429,6 +457,17 @@ def expert_parallel_gmm_rs(
     if _fp8_hidden_scale_multiplier != 1.0 and not fp8_hidden_all_gather:
         raise ValueError(
             "FP8 Hidden AllGather scale multiplier requires FP8 Hidden AllGather"
+        )
+    if _fp8_hidden_scale_granularity not in ("tensor", "row"):
+        raise ValueError(
+            "FP8 Hidden AllGather scale granularity must be 'tensor' or 'row'"
+        )
+    if _fp8_hidden_scale_granularity == "row" and not (
+        fp8_hidden_all_gather and _fp8_hidden_direct_prequantized
+    ):
+        raise ValueError(
+            "per-row FP8 Hidden AllGather scale currently requires the direct "
+            "prequantized diagnostic path"
         )
     if fp8_hidden_all_gather:
         if (
@@ -494,7 +533,12 @@ def expert_parallel_gmm_rs(
         hidden_scale_global = None
         if fp8_hidden_all_gather:
             with jax.named_scope("fused_rs_hidden_quantize"):
-                hidden_payload_local, hidden_scale_local = _quantize_hidden_per_tensor(
+                quantize_hidden = (
+                    _quantize_hidden_per_row
+                    if _fp8_hidden_scale_granularity == "row"
+                    else _quantize_hidden_per_tensor
+                )
+                hidden_payload_local, hidden_scale_local = quantize_hidden(
                     hidden_local,
                     topk_indices_local,
                     scale_multiplier=_fp8_hidden_scale_multiplier,
@@ -507,17 +551,26 @@ def expert_parallel_gmm_rs(
                     tiled=True,
                 )
             with jax.named_scope("fused_rs_hidden_scale_all_gather"):
+                hidden_scale_payload = (
+                    hidden_scale_local
+                    if _fp8_hidden_scale_granularity == "row"
+                    else hidden_scale_local[None]
+                )
                 hidden_scale_by_rank = jax.lax.all_gather(
-                    hidden_scale_local[None],
+                    hidden_scale_payload,
                     axis_name=expert_axis,
                     axis=0,
                     tiled=True,
                 )
             if _fp8_hidden_direct_prequantized:
                 with jax.named_scope("fused_rs_hidden_scale_expand"):
-                    hidden_scale_global = jnp.repeat(
-                        hidden_scale_by_rank,
-                        hidden_global.shape[0] // ep_size,
+                    hidden_scale_global = (
+                        hidden_scale_by_rank
+                        if _fp8_hidden_scale_granularity == "row"
+                        else jnp.repeat(
+                            hidden_scale_by_rank,
+                            hidden_global.shape[0] // ep_size,
+                        )
                     )
             else:
                 with jax.named_scope("fused_rs_hidden_dequantize"):
@@ -640,6 +693,7 @@ def _fused_moe_func_rs_impl(
     fp8_hidden_all_gather: bool = False,
     _fp8_hidden_direct_prequantized: bool = False,
     _fp8_hidden_scale_multiplier: float = 1.0,
+    _fp8_hidden_scale_granularity: str = "tensor",
     w3: jax.Array | None = None,
     w3_scale: jax.Array | None = None,
 ) -> jax.Array:
@@ -694,6 +748,7 @@ def _fused_moe_func_rs_impl(
         fp8_hidden_all_gather=fp8_hidden_all_gather,
         _fp8_hidden_direct_prequantized=_fp8_hidden_direct_prequantized,
         _fp8_hidden_scale_multiplier=_fp8_hidden_scale_multiplier,
+        _fp8_hidden_scale_granularity=_fp8_hidden_scale_granularity,
     )
 
     return result[:num_tokens, :hidden_size]
@@ -709,6 +764,7 @@ _FUSED_MOE_RS_STATIC_ARGNAMES = (
     "fp8_hidden_all_gather",
     "_fp8_hidden_direct_prequantized",
     "_fp8_hidden_scale_multiplier",
+    "_fp8_hidden_scale_granularity",
 )
 
 fused_moe_func_rs = jax.jit(
@@ -740,4 +796,5 @@ __all__ = [
     "_FUSED_RS_MAX_SAFE_SIZE_M",
     "_assert_fused_rs_smem_safe",
     "_quantize_hidden_per_tensor",
+    "_quantize_hidden_per_row",
 ]

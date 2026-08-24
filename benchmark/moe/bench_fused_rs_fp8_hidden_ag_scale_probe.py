@@ -37,11 +37,21 @@ def _parse_multipliers(value: str) -> tuple[float, ...]:
     return multipliers
 
 
+def _parse_granularities(value: str) -> tuple[str, ...]:
+    granularities = tuple(item.strip() for item in value.split(","))
+    if not granularities or any(
+        granularity not in ("tensor", "row") for granularity in granularities
+    ):
+        raise ValueError("scale granularities must contain only tensor or row")
+    return granularities
+
+
 def _weighted_input_quantization_metrics(
     multiplier: float,
     *,
     num_tokens: int,
     ep_size: int,
+    granularity: str = "tensor",
 ) -> dict:
     """Evaluate the exact benchmark token pattern without materializing 32Kx6K."""
     token_residue = np.arange(_TOKEN_PATTERN_PERIOD, dtype=np.int32)[:, None]
@@ -76,8 +86,12 @@ def _weighted_input_quantization_metrics(
             minlength=_TOKEN_PATTERN_PERIOD,
         )
         weights = token_counts[:, None] * hidden_counts[None, :]
-        amax = float(np.max(np.abs(pattern[weights != 0])))
-        scale = max(amax, 1e-12) / fp8_max * multiplier
+        if granularity == "row":
+            amax = np.max(np.abs(pattern), axis=1, keepdims=True)
+            scale = np.maximum(amax, 1e-12) / fp8_max * multiplier
+        else:
+            amax = float(np.max(np.abs(pattern[weights != 0])))
+            scale = max(amax, 1e-12) / fp8_max * multiplier
         normalized = pattern / scale
         clipped_count += int(np.sum(weights[np.abs(normalized) > fp8_max]))
         element_count += int(np.sum(weights))
@@ -89,7 +103,12 @@ def _weighted_input_quantization_metrics(
         squared_reference = float(np.sum(weights * np.square(pattern)))
         numerator += squared_delta
         denominator += squared_reference
-        rank_scales.append(scale)
+        if granularity == "row":
+            rank_scales.append(
+                {"min": float(np.min(scale)), "max": float(np.max(scale))}
+            )
+        else:
+            rank_scales.append(scale)
         rank_rel_l2.append((squared_delta / squared_reference) ** 0.5)
     return {
         "rel_l2": (numerator / denominator) ** 0.5,
@@ -109,9 +128,11 @@ def main() -> None:
         "--scale-multipliers",
         default="0.95,0.96,0.97,0.98,0.99,1.0",
     )
+    parser.add_argument("--scale-granularities", default="tensor")
     parser.add_argument("--jsonl", type=Path)
     args = parser.parse_args()
     multipliers = _parse_multipliers(args.scale_multipliers)
+    granularities = _parse_granularities(args.scale_granularities)
 
     visible_devices = len(jax.devices())
     if (args.ep_size, args.tokens, visible_devices) != (8, 32768, 8):
@@ -146,38 +167,42 @@ def main() -> None:
         baseline = baseline_run(inputs)
         jax.block_until_ready(baseline)
 
-        for multiplier in multipliers:
-            jax.clear_caches()
-            run = _rs_runner(
-                mesh,
-                layer_scope=False,
-                fp8_hidden_all_gather=True,
-                _fp8_hidden_direct_prequantized=True,
-                _fp8_hidden_scale_multiplier=multiplier,
-            )
-            compile_start = time.perf_counter()
-            output = run(inputs)
-            jax.block_until_ready(output)
-            compile_time_s = time.perf_counter() - compile_start
-            output_metrics = _comparison_metrics(baseline, output)
-            emit(
-                {
-                    "record_type": "fused_rs_fp8_hidden_ag_scale_probe",
-                    "status": "ok",
-                    "ep_size": args.ep_size,
-                    "num_tokens": args.tokens,
-                    "visible_devices": visible_devices,
-                    "scale_multiplier": multiplier,
-                    "input_quantization": _weighted_input_quantization_metrics(
-                        multiplier,
-                        num_tokens=args.tokens,
-                        ep_size=args.ep_size,
-                    ),
-                    "final_vs_bf16": output_metrics,
-                    "compile_time_s": compile_time_s,
-                    "rs_block_config": list(PRODUCTION_RS_CONFIG),
-                }
-            )
+        for granularity in granularities:
+            for multiplier in multipliers:
+                jax.clear_caches()
+                run = _rs_runner(
+                    mesh,
+                    layer_scope=False,
+                    fp8_hidden_all_gather=True,
+                    _fp8_hidden_direct_prequantized=True,
+                    _fp8_hidden_scale_multiplier=multiplier,
+                    _fp8_hidden_scale_granularity=granularity,
+                )
+                compile_start = time.perf_counter()
+                output = run(inputs)
+                jax.block_until_ready(output)
+                compile_time_s = time.perf_counter() - compile_start
+                output_metrics = _comparison_metrics(baseline, output)
+                emit(
+                    {
+                        "record_type": "fused_rs_fp8_hidden_ag_scale_probe",
+                        "status": "ok",
+                        "ep_size": args.ep_size,
+                        "num_tokens": args.tokens,
+                        "visible_devices": visible_devices,
+                        "scale_multiplier": multiplier,
+                        "scale_granularity": granularity,
+                        "input_quantization": _weighted_input_quantization_metrics(
+                            multiplier,
+                            num_tokens=args.tokens,
+                            ep_size=args.ep_size,
+                            granularity=granularity,
+                        ),
+                        "final_vs_bf16": output_metrics,
+                        "compile_time_s": compile_time_s,
+                        "rs_block_config": list(PRODUCTION_RS_CONFIG),
+                    }
+                )
 
     set_fused_rs_block_sizes_override(None)
     set_fused_rs_routing_table_impl("jax")
