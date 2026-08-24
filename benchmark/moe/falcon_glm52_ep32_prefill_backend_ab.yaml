@@ -15,6 +15,7 @@ role_to_task_spec:
     device_type: v7x
     device_topo: 2x2x4
     command: |
+      exec bash <<'BASH'
       set -euo pipefail
       ulimit -c 0
 
@@ -161,6 +162,7 @@ role_to_task_spec:
       PY
       fi
       echo "GLM52_EP32_PREFILL_BACKEND_AB_COMPLETE rank=$FALCON_OPERATOR_RANK"
+      BASH
     envs:
       JAX_COMPILATION_CACHE_DIR: /tmp/tpu_logs/jax-cache
       PIP_CACHE_DIR: /tmp/tpu_logs/pip-cache
