@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 
@@ -57,7 +58,7 @@ def _weighted_input_quantization_metrics(
         minlength=_HIDDEN_PATTERN_PERIOD,
     )
     local_tokens = num_tokens // ep_size
-    fp8_max = float(np.finfo(ml_dtypes.float8_e4m3fn).max)
+    fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
     numerator = 0.0
     denominator = 0.0
     clipped_count = 0
