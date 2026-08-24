@@ -1,0 +1,135 @@
+name: glm52-longbench-v2-code-financial-c64-data-prep-20260824-r1
+exp_type: TRAINING
+artifact_type: GCS
+cluster_name: tpu-training-antgroup
+priority: 0
+tags: [dataset, longbench-v2, glm52, cpu, long-context, code-repo-qa, financial]
+model_version: glm-5.2-longbench-v2-code-financial-c64-v1
+config: '{"dataset":"zai-org/LongBench-v2","dataset_revision":"2b48e494f2c7a2f0af81aae178e05c7e1dde0fe9","sub_domains":{"Code repo QA":32,"Financial":32},"tokenizer":"/models/GLM-5.2-FP8","prefix_tokens":131072,"extend_tokens":1024,"output_tokens":1024,"concurrency":64,"output_uri":"gs://inference-model-storage-poc-tpu-hns/benchmark-datasets/LongBench-v2/glm52-code-financial-128k-prefix-1k-extend-c64-v1/","source_commit":"565a3d2cd46134daa10c93e04a953e7f17f45a60"}'
+role_to_task_spec:
+  worker:
+    replica: 1
+    image: python:3.12
+    device_type: cpu
+    command: |
+      exec bash <<'BASH'
+      set -euo pipefail
+      ulimit -c 0
+
+      SOURCE_ROOT=/workspace/sglang-jax
+      EXPECTED_COMMIT=565a3d2cd46134daa10c93e04a953e7f17f45a60
+      MODEL_PATH=/models/GLM-5.2-FP8
+      PERSIST_ROOT=/models/benchmark-datasets/LongBench-v2
+      PERSIST_DIR="$PERSIST_ROOT/glm52-code-financial-128k-prefix-1k-extend-c64-v1"
+      LOCAL_ROOT=/tmp/longbench-v2-data-prep
+      LOCAL_BUILD="$LOCAL_ROOT/build"
+      ARTIFACT_ROOT="${ARTIFACT_LOCAL_DIR:-/tmp/longbench-v2-artifact}"
+
+      export HF_HOME="$LOCAL_ROOT/hf-cache"
+      export HF_HUB_DOWNLOAD_TIMEOUT=1800
+      export HF_HUB_ETAG_TIMEOUT=120
+      export PIP_CACHE_DIR="$LOCAL_ROOT/pip-cache"
+      export PYTHONUNBUFFERED=1
+      export TMPDIR="$LOCAL_ROOT/tmp"
+      mkdir -p "$HF_HOME" "$PIP_CACHE_DIR" "$TMPDIR" "$ARTIFACT_ROOT"
+
+      cd "$SOURCE_ROOT"
+      ACTUAL_COMMIT="$(git rev-parse HEAD)"
+      test "$ACTUAL_COMMIT" = "$EXPECTED_COMMIT"
+      printf 'source checkout commit exact: %s\n' "$ACTUAL_COMMIT"
+      test -f "$MODEL_PATH/tokenizer_config.json"
+      mkdir -p "$PERSIST_ROOT"
+
+      if test -e "$PERSIST_DIR/_SUCCESS.json"; then
+        echo "refusing to overwrite an already completed dataset: $PERSIST_DIR" >&2
+        exit 1
+      fi
+      if test -d "$PERSIST_DIR" && test -n "$(find "$PERSIST_DIR" -mindepth 1 -maxdepth 1 -print -quit)"; then
+        echo "refusing to overwrite a partial dataset: $PERSIST_DIR" >&2
+        exit 1
+      fi
+
+      python3 -m pip install --no-cache-dir -q \
+        'huggingface-hub~=0.34.3' \
+        'transformers~=4.57.1' \
+        'ijson~=3.4' \
+        hf-xet \
+        sentencepiece \
+        tiktoken
+
+      python3 benchmark/glm52/prepare_longbench_v2.py \
+        --dataset-id zai-org/LongBench-v2 \
+        --dataset-revision 2b48e494f2c7a2f0af81aae178e05c7e1dde0fe9 \
+        --builder-source-commit "$EXPECTED_COMMIT" \
+        --tokenizer-path "$MODEL_PATH" \
+        --prefix-len 131072 \
+        --extend-len 1024 \
+        --output-len 1024 \
+        --code-quota 32 \
+        --financial-quota 32 \
+        --output-dir "$LOCAL_BUILD" \
+        | tee "$ARTIFACT_ROOT/build-stdout.json"
+
+      test -f "$LOCAL_BUILD/_SUCCESS.json"
+      test -f "$LOCAL_BUILD/manifest.json"
+      test -f "$LOCAL_BUILD/requests.jsonl.gz"
+      test -f "$LOCAL_BUILD/source/data.json"
+
+      mkdir "$PERSIST_DIR"
+      cp "$LOCAL_BUILD/manifest.json" "$PERSIST_DIR/manifest.json"
+      cp "$LOCAL_BUILD/requests.jsonl.gz" "$PERSIST_DIR/requests.jsonl.gz"
+      cp -R "$LOCAL_BUILD/source" "$PERSIST_DIR/source"
+      # The success marker is deliberately published last.
+      cp "$LOCAL_BUILD/_SUCCESS.json" "$PERSIST_DIR/_SUCCESS.json"
+
+      for relative_path in manifest.json requests.jsonl.gz source/data.json _SUCCESS.json; do
+        test "$(sha256sum "$LOCAL_BUILD/$relative_path" | awk '{print $1}')" = \
+             "$(sha256sum "$PERSIST_DIR/$relative_path" | awk '{print $1}')"
+      done
+
+      cp "$LOCAL_BUILD/manifest.json" "$ARTIFACT_ROOT/manifest.json"
+      cp "$LOCAL_BUILD/_SUCCESS.json" "$ARTIFACT_ROOT/_SUCCESS.json"
+      {
+        echo "persist_path=$PERSIST_DIR"
+        echo "persist_uri=gs://inference-model-storage-poc-tpu-hns/benchmark-datasets/LongBench-v2/glm52-code-financial-128k-prefix-1k-extend-c64-v1/"
+        echo "source_commit=$ACTUAL_COMMIT"
+        echo "completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        df -h "$MODEL_PATH" "$PERSIST_ROOT"
+      } | tee "$ARTIFACT_ROOT/run-summary.txt"
+      echo GLM52_LONGBENCH_V2_DATA_PREP_COMPLETE
+      BASH
+    mounts:
+      - name: glm52-model
+        type: gcs
+        bucket: inference-model-storage-poc-tpu-hns
+        prefix: GLM-5.2-FP8
+        mount_path: /models/GLM-5.2-FP8
+        read_only: true
+        mount_options:
+          - implicit-dirs
+          - metadata-cache:ttl-secs:-1
+          - metadata-cache:stat-cache-max-size-mb:-1
+          - metadata-cache:type-cache-max-size-mb:-1
+          - file-system:kernel-list-cache-ttl-secs:-1
+          - read:enable-buffered-read:true
+          - read:block-size-mb:32
+          - read:max-blocks-per-handle:64
+          - read:global-max-blocks:2048
+          - read_ahead_kb=1024
+      - name: longbench-datasets
+        type: gcs
+        bucket: inference-model-storage-poc-tpu-hns
+        prefix: benchmark-datasets/LongBench-v2
+        mount_path: /models/benchmark-datasets/LongBench-v2
+        read_only: false
+        mount_options:
+          - implicit-dirs
+    sources:
+      - name: sglang-jax
+        type: git
+        repo: https://github.com/primatrix-glm/sglang-jax-private.git
+        ref: dev/glm52-longbench-v2-dataset
+        commit: 565a3d2cd46134daa10c93e04a953e7f17f45a60
+        path: /workspace/sglang-jax
+        auth:
+          cred: github-cjx0709-sglang-jax-codex
