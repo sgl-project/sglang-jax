@@ -1,4 +1,4 @@
-name: operator-profile-glm52-fused-rs-fp8-hidden-ag-ep8-r5-direct-row0-20260824
+name: operator-profile-glm52-fused-rs-fp8-hidden-ag-ep8-r6-row-scale-20260824
 exp_type: PROFILING
 artifact_type: operator-profile
 cluster_name: tpu-training-antgroup
@@ -32,8 +32,8 @@ role_to_task_spec:
       XLA_DUMP_FLAGS="--xla_dump_to=$OUT/compiler/hlo --xla_dump_hlo_as_text"
       export XLA_FLAGS="${XLA_FLAGS:+$XLA_FLAGS }$XLA_DUMP_FLAGS"
 
-      source_tar=/tmp/glm52-fused-rs-fp8-hidden-ag-ep8-r5-direct.tar.gz.part
-      source_ready=/tmp/glm52-fused-rs-fp8-hidden-ag-ep8-r5-direct.ready
+      source_tar=/tmp/glm52-fused-rs-fp8-hidden-ag-ep8-r6-row-scale.tar.gz.part
+      source_ready=/tmp/glm52-fused-rs-fp8-hidden-ag-ep8-r6-row-scale.ready
       attempt=0
       while [ ! -f "$source_ready" ]; do
         attempt=$((attempt + 1))
@@ -44,7 +44,7 @@ role_to_task_spec:
         sleep 5
       done
       test -f "$source_tar"
-      echo 'd466f40be13ea80686e34143b1ce0768a71318b4f7e67508c0f1fa48da45b6d5  /tmp/glm52-fused-rs-fp8-hidden-ag-ep8-r5-direct.tar.gz.part' | sha256sum -c -
+      echo 'dc330667aa8f0064d8fce015577bd8c356998b24f0ed601f3971f6c6ec787a37  /tmp/glm52-fused-rs-fp8-hidden-ag-ep8-r6-row-scale.tar.gz.part' | sha256sum -c -
 
       mkdir -p /workspace/sglang-jax
       tar -xzf "$source_tar" -C /workspace/sglang-jax
@@ -83,15 +83,15 @@ role_to_task_spec:
               "top_k": 8,
               "compute_dtype": "bf16",
               "wire_dtypes": ["bf16", "fp8_e4m3fn"],
-              "activation_scale": "one_fp32_per_ep_rank_physical_hidden_shard",
+              "activation_scale": "one_fp32_per_physical_hidden_row",
               "fp8_consumer": "direct_prequantized_fp8_row0_aligned",
               "rs_config": [256, 6144, 1024, 2048, 1024, 2, 2],
-              "variants": ["bf16-hidden-ag", "fp8-per-tensor-hidden-ag"],
+              "variants": ["bf16-hidden-ag", "fp8-per-row-hidden-ag"],
           },
           "source": {
               "branch": "dev/glm52-rs-bf16-allgather",
-              "source_commit": "4b5de71c0bb83e19f0391ff671d568ee1382a057",
-              "source_sha256": "d466f40be13ea80686e34143b1ce0768a71318b4f7e67508c0f1fa48da45b6d5",
+              "source_commit": "47b22c08fff7da75ba6add8769672aeaa95cc537",
+              "source_sha256": "dc330667aa8f0064d8fce015577bd8c356998b24f0ed601f3971f6c6ec787a37",
           },
           "correctness": {
               "reference_variant": "bf16-hidden-ag",
@@ -115,6 +115,7 @@ role_to_task_spec:
 
       python3 -m benchmark.moe.bench_fused_rs_fp8_hidden_ag \
         --direct-prequantized \
+        --scale-granularity row \
         --ep-size 8 \
         --tokens 32768 \
         --routing-seed 42 \
