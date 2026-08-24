@@ -175,6 +175,17 @@ fi
 printf 'GLM52_FALCON_DELIVERY_START quantization=%s physical_chips=%s mode=%s rank=%s world=%s source=%s moe_backend=%s serve_script=%s\n' \
   "$GLM52_QUANTIZATION" "$GLM52_PHYSICAL_CHIPS" "$RUN_MODE" "$RANK" "$WORLD" \
   "$SOURCE_ID" "$MOE_BACKEND" "$SERVE_SCRIPT"
+if [[ -n "${GLM52_REQUESTS_JSONL_GZ:-}" ]]; then
+  if [[ ! -s "$GLM52_REQUESTS_JSONL_GZ" ]]; then
+    printf 'GLM52_REQUESTS_JSONL_GZ is missing or empty: %s\n' \
+      "$GLM52_REQUESTS_JSONL_GZ" >&2
+    exit 2
+  fi
+  sha256sum "$GLM52_REQUESTS_JSONL_GZ" > "$RANK_OUT/requests-jsonl-gz.sha256"
+  printf 'GLM52_FALCON_DATASET path=%s sha256=%s\n' \
+    "$GLM52_REQUESTS_JSONL_GZ" \
+    "$(awk '{print $1}' "$RANK_OUT/requests-jsonl-gz.sha256")"
+fi
 GLM52_SERVER_LOG=/dev/stdout \
 GLM52_MOE_BACKEND="$MOE_BACKEND" \
 WORLD="$WORLD" RANK="$RANK" MASTER_ADDR="$MASTER_ADDR" MODEL_PATH="$MODEL_PATH" \

@@ -18,11 +18,13 @@ import argparse
 import array
 import ast
 import concurrent.futures
+import gzip
 import hashlib
 import json
 import random
 import re
 import statistics
+import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -43,6 +45,161 @@ PREFIX_MODE_ALIASES = {
     "unique": "unique",
     "unique-prefix": "unique",
 }
+
+
+def _token_ids_sha256_u32le(token_ids: list[int]) -> str:
+    values = array.array("I", token_ids)
+    if values.itemsize != 4:
+        raise RuntimeError(f"unexpected unsigned-int width: {values.itemsize}")
+    if sys.byteorder != "little":
+        values.byteswap()
+    return hashlib.sha256(values.tobytes()).hexdigest()
+
+
+def _load_inputs_jsonl_gz(
+    path: Path,
+    *,
+    concurrency: int,
+    prefix_len: int,
+    extend_len: int,
+    output_len: int,
+) -> tuple[list[list[int]], list[list[int]], dict]:
+    """Load and validate tokenizer-exact benchmark inputs without re-tokenizing."""
+    if not path.is_file():
+        raise FileNotFoundError(f"requests JSONL gzip does not exist: {path}")
+
+    rows = []
+    with gzip.open(path, "rt", encoding="utf-8") as source:
+        for line_number, line in enumerate(source, start=1):
+            if not line.strip():
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"invalid requests JSONL at {path}:{line_number}: {error}"
+                ) from error
+
+    if len(rows) != concurrency:
+        raise ValueError(
+            f"requests row count ({len(rows)}) must equal concurrency ({concurrency})"
+        )
+
+    expected_input_len = prefix_len + extend_len
+    prefixes: list[list[int]] = []
+    extended: list[list[int]] = []
+    request_ids: list[str] = []
+    domains: dict[str, int] = {}
+    for index, row in enumerate(rows):
+        request_id = str(row.get("request_id", index))
+        request_ids.append(request_id)
+        for field, expected in (
+            ("prefix_len", prefix_len),
+            ("extend_len", extend_len),
+            ("output_len", output_len),
+        ):
+            if int(row.get(field, -1)) != expected:
+                raise ValueError(
+                    f"request {request_id} has {field}={row.get(field)!r}; "
+                    f"expected {expected}"
+                )
+
+        token_ids = row.get("input_ids")
+        if not isinstance(token_ids, list) or len(token_ids) != expected_input_len:
+            observed = len(token_ids) if isinstance(token_ids, list) else None
+            raise ValueError(
+                f"request {request_id} input length is {observed}; "
+                f"expected {expected_input_len}"
+            )
+        if any(
+            isinstance(token_id, bool)
+            or not isinstance(token_id, int)
+            or token_id < 0
+            or token_id > 0xFFFFFFFF
+            for token_id in token_ids
+        ):
+            raise ValueError(f"request {request_id} contains an invalid token ID")
+
+        observed_input_sha = _token_ids_sha256_u32le(token_ids)
+        declared_input_sha = row.get("input_ids_sha256_u32le")
+        if declared_input_sha and declared_input_sha != observed_input_sha:
+            raise ValueError(
+                f"request {request_id} input SHA mismatch: "
+                f"declared={declared_input_sha}, observed={observed_input_sha}"
+            )
+        prefix = token_ids[:prefix_len]
+        observed_prefix_sha = _token_ids_sha256_u32le(prefix)
+        declared_prefix_sha = row.get("prefix_sha256_u32le")
+        if declared_prefix_sha and declared_prefix_sha != observed_prefix_sha:
+            raise ValueError(
+                f"request {request_id} prefix SHA mismatch: "
+                f"declared={declared_prefix_sha}, observed={observed_prefix_sha}"
+            )
+
+        domain = str(row.get("domain", "unknown"))
+        domains[domain] = domains.get(domain, 0) + 1
+        prefixes.append(prefix)
+        extended.append(token_ids)
+
+    if len(set(request_ids)) != len(request_ids):
+        raise ValueError("requests JSONL contains duplicate request_id values")
+
+    return prefixes, extended, {
+        "path": str(path),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "request_count": len(rows),
+        "request_ids_sha256": hashlib.sha256(
+            "\n".join(request_ids).encode()
+        ).hexdigest(),
+        "domains": domains,
+        "total_input_len": expected_input_len,
+        "tokenizer_exact_input_ids": True,
+    }
+
+
+def _validate_round_robin_prefix_separation(
+    prefixes: list[list[int]], *, dp_size: int
+) -> dict:
+    """Require repeated prefixes to land on different round-robin DP ranks."""
+    if dp_size <= 0:
+        raise ValueError("dp_size must be positive")
+    digest_to_ranks: dict[str, set[int]] = {}
+    conflicts = []
+    for request_index, prefix in enumerate(prefixes):
+        digest = _token_ids_sha256_u32le(prefix)
+        dp_rank = request_index % dp_size
+        ranks = digest_to_ranks.setdefault(digest, set())
+        if dp_rank in ranks:
+            conflicts.append(
+                {
+                    "prefix_sha256": digest,
+                    "request_index": request_index,
+                    "dp_rank": dp_rank,
+                }
+            )
+        ranks.add(dp_rank)
+    if conflicts:
+        raise ValueError(
+            "repeated prefixes collide on a round-robin DP rank: "
+            + json.dumps(conflicts, sort_keys=True)
+        )
+    return {
+        "dp_size": dp_size,
+        "same_dp_rank_prefix_conflicts": 0,
+        "unique_prefixes": len(digest_to_ranks),
+    }
+
+
+def _choose_warm_branch_token(
+    extended: list[list[int]], *, prefix_len: int, preferred: int
+) -> int:
+    measured_branch_tokens = {value[prefix_len] for value in extended}
+    if preferred not in measured_branch_tokens:
+        return preferred
+    for candidate in range(preferred - 1, -1, -1):
+        if candidate not in measured_branch_tokens:
+            return candidate
+    raise ValueError("could not find a non-colliding warm branch token")
 
 
 def _normalize_prefix_mode(prefix_mode: str) -> str:
@@ -934,6 +1091,15 @@ def main() -> None:
     parser.add_argument("--random-token-min", type=int, default=1000)
     parser.add_argument("--random-token-max", type=int, default=32000)
     parser.add_argument(
+        "--requests-jsonl-gz",
+        type=Path,
+        help=(
+            "Load tokenizer-exact input_ids from a gzip JSONL dataset. The file "
+            "must contain exactly --concurrency rows and matching prefix/extend/"
+            "output length metadata. Random generation is used when omitted."
+        ),
+    )
+    parser.add_argument(
         "--variant",
         default="exact_dsa_exact_lax_topk",
         help="Label recorded in the output metrics for the serving variant.",
@@ -1026,17 +1192,39 @@ def main() -> None:
     args = parser.parse_args()
 
     base_url = args.base_url.rstrip("/")
-    prefixes, extended = _make_inputs(
-        args.concurrency,
-        args.prefix_len,
-        args.extend_len,
-        prefix_mode=args.prefix_mode,
-        prefix_group_count=args.prefix_group_count,
-        random_seed=args.random_seed,
-        random_token_min=args.random_token_min,
-        random_token_max=args.random_token_max,
+    dataset_evidence = None
+    if args.requests_jsonl_gz is None:
+        prefixes, extended = _make_inputs(
+            args.concurrency,
+            args.prefix_len,
+            args.extend_len,
+            prefix_mode=args.prefix_mode,
+            prefix_group_count=args.prefix_group_count,
+            random_seed=args.random_seed,
+            random_token_min=args.random_token_min,
+            random_token_max=args.random_token_max,
+        )
+    else:
+        prefixes, extended, dataset_evidence = _load_inputs_jsonl_gz(
+            args.requests_jsonl_gz,
+            concurrency=args.concurrency,
+            prefix_len=args.prefix_len,
+            extend_len=args.extend_len,
+            output_len=args.output_len,
+        )
+        dataset_evidence["round_robin_prefix_separation"] = (
+            _validate_round_robin_prefix_separation(prefixes, dp_size=args.dp_size)
+        )
+        print(
+            "GLM52_CACHE_BENCH_DATASET "
+            + json.dumps(dataset_evidence, sort_keys=True),
+            flush=True,
+        )
+    warm_branch_token = _choose_warm_branch_token(
+        extended,
+        prefix_len=args.prefix_len,
+        preferred=args.random_token_max - 1,
     )
-    warm_branch_token = args.random_token_max - 1
     warm_inputs = _make_warm_inputs(
         prefixes,
         extended,
@@ -1226,6 +1414,7 @@ def main() -> None:
         "random_seed": args.random_seed,
         "random_token_min": args.random_token_min,
         "random_token_max": args.random_token_max,
+        "dataset_evidence": dataset_evidence,
         "profile_output_dir": (
             str(args.profile_output_dir)
             if args.profile_output_dir is not None

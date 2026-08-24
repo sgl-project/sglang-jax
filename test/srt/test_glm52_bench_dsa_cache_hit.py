@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import gzip
 import importlib.util
+import json
 import threading
 from pathlib import Path
 from unittest import mock
@@ -196,6 +198,87 @@ def test_random_inputs_are_reproducible_by_seed() -> None:
 
     assert first == repeated
     assert first != different
+
+
+def test_load_tokenizer_exact_inputs_and_preserve_order(tmp_path: Path) -> None:
+    path = tmp_path / "requests.jsonl.gz"
+    rows = []
+    for request_index in range(4):
+        input_ids = [100 + request_index, 200, 300, 400, 500, 600]
+        prefix = input_ids[:4]
+        rows.append(
+            {
+                "request_id": f"request-{request_index}",
+                "domain": "Code Repository Understanding",
+                "prefix_len": 4,
+                "extend_len": 2,
+                "output_len": 3,
+                "input_ids": input_ids,
+                "input_ids_sha256_u32le": BENCHMARK._token_ids_sha256_u32le(
+                    input_ids
+                ),
+                "prefix_sha256_u32le": BENCHMARK._token_ids_sha256_u32le(prefix),
+            }
+        )
+    with gzip.open(path, "wt", encoding="utf-8") as output:
+        for row in rows:
+            output.write(json.dumps(row) + "\n")
+
+    prefixes, extended, evidence = BENCHMARK._load_inputs_jsonl_gz(
+        path,
+        concurrency=4,
+        prefix_len=4,
+        extend_len=2,
+        output_len=3,
+    )
+
+    assert extended == [row["input_ids"] for row in rows]
+    assert prefixes == [row["input_ids"][:4] for row in rows]
+    assert evidence["request_count"] == 4
+    assert evidence["domains"] == {"Code Repository Understanding": 4}
+    assert evidence["tokenizer_exact_input_ids"] is True
+
+
+def test_load_tokenizer_exact_inputs_rejects_sha_mismatch(tmp_path: Path) -> None:
+    path = tmp_path / "requests.jsonl.gz"
+    with gzip.open(path, "wt", encoding="utf-8") as output:
+        output.write(
+            json.dumps(
+                {
+                    "request_id": "bad-sha",
+                    "prefix_len": 2,
+                    "extend_len": 1,
+                    "output_len": 1,
+                    "input_ids": [1, 2, 3],
+                    "input_ids_sha256_u32le": "0" * 64,
+                }
+            )
+            + "\n"
+        )
+
+    with pytest.raises(ValueError, match="input SHA mismatch"):
+        BENCHMARK._load_inputs_jsonl_gz(
+            path,
+            concurrency=1,
+            prefix_len=2,
+            extend_len=1,
+            output_len=1,
+        )
+
+
+def test_round_robin_prefix_separation_rejects_same_rank_duplicate() -> None:
+    prefixes = [[1, 2], [3, 4], [1, 2], [5, 6]]
+
+    with pytest.raises(ValueError, match="round-robin DP rank"):
+        BENCHMARK._validate_round_robin_prefix_separation(prefixes, dp_size=2)
+
+
+def test_choose_warm_branch_token_avoids_dataset_extension() -> None:
+    extended = [[1, 2, 9], [3, 4, 8]]
+
+    assert BENCHMARK._choose_warm_branch_token(
+        extended, prefix_len=2, preferred=9
+    ) == 7
 
 
 def test_throughput_metrics_keep_e2e_and_decode_scopes_separate() -> None:

@@ -49,6 +49,14 @@ BENCH_ARGS=(
   --variant "${QUANTIZATION:-channelwise}_${GLM52_PHYSICAL_CHIPS}chip_c${CONCURRENCY}_${PREFIX_MODE}_128k_1k_1k" \
   --cache-hit-tolerance 64
 )
+if [[ -n "${GLM52_REQUESTS_JSONL_GZ:-}" ]]; then
+  if [[ ! -s "$GLM52_REQUESTS_JSONL_GZ" ]]; then
+    printf 'GLM52_REQUESTS_JSONL_GZ is missing or empty: %s\n' \
+      "$GLM52_REQUESTS_JSONL_GZ" >&2
+    exit 2
+  fi
+  BENCH_ARGS+=(--requests-jsonl-gz "$GLM52_REQUESTS_JSONL_GZ")
+fi
 if [[ -n "${PROFILE_OUTPUT_DIR:-}" ]]; then
   BENCH_ARGS+=(
     --profile-output-dir "$PROFILE_OUTPUT_DIR"
