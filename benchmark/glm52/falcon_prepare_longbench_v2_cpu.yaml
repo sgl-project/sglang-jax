@@ -1,7 +1,7 @@
-name: glm52-longbench-v2-code-c64-data-prep-20260825-r11-antgroup-v2-race
+name: glm52-longbench-v2-code-c64-data-prep-20260825-r12-antgroup
 exp_type: TRAINING
 artifact_type: GCS
-cluster_name: tpu-training-antgroup-v2
+cluster_name: tpu-training-antgroup
 priority: 0
 tags: [dataset, longbench-v2, glm52, cpu, long-context, code-repo-qa, code-only, c64]
 model_version: glm-5.2-longbench-v2-code-c64-v1
@@ -12,13 +12,13 @@ role_to_task_spec:
     image: python:3.12
     device_type: cpu
     resources:
-      # The bounded-chunk builder stays well below 1 GiB RSS.  A low request
-      # lets the shared Ant v2 CPU pool schedule it, while the 3 GiB limit
-      # protects against tokenizer transients.
-      cpu_request: "100m"
-      cpu_limit: "900m"
-      memory_request: 512Mi
-      memory_limit: 3Gi
+      # AntGroup has a 128-core Falcon CPU quota.  Keep this below the
+      # 3.92-core allocatable capacity of its shared CPU node while giving the
+      # Rust tokenizer enough parallel CPU to finish the Code-only build fast.
+      cpu_request: "3"
+      cpu_limit: "3800m"
+      memory_request: 4Gi
+      memory_limit: 12Gi
     command: |
       exec bash <<'BASH'
       set -euo pipefail
