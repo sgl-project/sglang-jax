@@ -1,4 +1,4 @@
-name: glm52-longbench-v2-code-financial-c64-data-prep-20260825-r8-antgroup-v2-sgljax
+name: glm52-longbench-v2-code-financial-c64-data-prep-20260825-r9-antgroup-v2-sgljax-2gi
 exp_type: TRAINING
 artifact_type: GCS
 cluster_name: tpu-training-antgroup-v2
@@ -12,13 +12,13 @@ role_to_task_spec:
     image: python:3.12
     device_type: cpu
     resources:
-      # Historical successful Ant CPU smoke exp-yojrwsrqgf used a 100m
-      # request on cpu-private-test. Keep the request small enough to fit a
-      # busy shared node while allowing the streaming builder to burst.
+      # The tokenizer-exact builder reached ~1.67 GiB RSS in exp-k3ndo8ydoq.
+      # Request its real working set so Kubernetes does not place it on a
+      # memory-starved shared node and evict it under node pressure.
       cpu_request: "100m"
       cpu_limit: "900m"
-      memory_request: 512Mi
-      memory_limit: 2500Mi
+      memory_request: 2Gi
+      memory_limit: 3Gi
     command: |
       exec bash <<'BASH'
       set -euo pipefail
