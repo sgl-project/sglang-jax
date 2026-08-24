@@ -1,0 +1,71 @@
+name: glm52-delivery-channelwise-16chip-hybrid-rs-gsm8k-quick-fp8-hidden-ag-row-scale-r1
+exp_type: TRAINING
+artifact_type: metrics
+cluster_name: tpu-training-antgroup
+priority: 0
+tags: [glm52, delivery, eval, gsm8k, quick-200, channelwise, fused-rs-prefill, fused-v2-decode, fp8-hidden-ag, row-scale, 16chip]
+config: '{"scenario":"eval","ab_variant":"fp8-per-row-hidden-ag","model":"GLM5.2-fp8-channel-wise","quantization":"per-channel-weight-moe-w8a8-linear-w8a16","physical_chips":16,"jax_devices":32,"hosts":4,"devices_per_host":8,"tp":32,"dp":32,"ep":32,"moe_backend":"fused_rs_prefill_fused_v2_decode","activation_wire_dtype":"fp8_e4m3fn","activation_scale":"one_fp32_per_physical_hidden_row","fp8_consumer":"direct_prequantized_fp8_row0_aligned","dataset":"gsm8k","eval_scope":"quick","num_examples":200,"min_score":0.90,"temperature":0.0,"top_p":1.0,"seed":3,"max_tokens":4096,"source_commit":"83343879d1e4306efd7ce3fae480f344bf42d11d","source_sha256":"f46451d1486d4d8174bbe22f0f30a1bc66a2e0cb68512cecadef74f00955b512"}'
+role_to_task_spec:
+  worker:
+    command: |
+      set -eu
+      ulimit -c 0
+      source_tar=/tmp/glm52-fused-rs-fp8-hidden-ag-gsm8k-row-scale-r1.tar.gz.part
+      source_ready=/tmp/glm52-fused-rs-fp8-hidden-ag-gsm8k-row-scale-r1.ready
+      attempt=0
+      while [ ! -f "$source_ready" ]; do
+        attempt=$((attempt + 1))
+        if [ "$attempt" -ge 360 ]; then
+          echo "timed out waiting for $source_ready" >&2
+          exit 1
+        fi
+        sleep 5
+      done
+      test -f "$source_tar"
+      echo 'f46451d1486d4d8174bbe22f0f30a1bc66a2e0cb68512cecadef74f00955b512  /tmp/glm52-fused-rs-fp8-hidden-ag-gsm8k-row-scale-r1.tar.gz.part' | sha256sum -c -
+      mkdir -p /workspace/sglang-jax
+      tar -xzf "$source_tar" -C /workspace/sglang-jax
+      cd /workspace/sglang-jax
+      exec bash benchmark/glm52/delivery/falcon/runner.sh
+    replica: 4
+    image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+    device_count: 8
+    device_type: v7x
+    device_topo: 2x2x4
+    envs:
+      SOURCE_SHA256: f46451d1486d4d8174bbe22f0f30a1bc66a2e0cb68512cecadef74f00955b512
+      GLM52_PHYSICAL_CHIPS: "16"
+      GLM52_QUANTIZATION: channelwise
+      GLM52_MOE_BACKEND: fused_rs
+      GLM52_FUSED_RS_FP8_HIDDEN_ALL_GATHER: "1"
+      GLM52_FUSED_RS_FP8_HIDDEN_ROW_SCALE: "1"
+      MODEL_PATH: /models/GLM5.2-fp8-channel-wise
+      RUN_MODE: eval
+      EVAL_DATASET: gsm8k
+      EVAL_SCOPE: quick
+      NUM_EXAMPLES: "200"
+      MIN_SCORE: "0.90"
+      SGL_EVAL_COMMIT: 32fa49229575e433629c37379821b5a589a2e422
+      PYTHONUNBUFFERED: "1"
+      TMPDIR: /tmp/tpu_logs/tmp
+      PIP_CACHE_DIR: /tmp/tpu_logs/pip-cache
+      UV_CACHE_DIR: /tmp/tpu_logs/uv-cache
+      JAX_COMPILATION_CACHE_DIR: /tmp/tpu_logs/jax-compilation-cache
+    mounts:
+      - name: glm52-channelwise-model
+        type: gcs
+        bucket: inference-model-storage-poc-tpu-hns
+        prefix: GLM5.2-fp8-channel-wise
+        mount_path: /models/GLM5.2-fp8-channel-wise
+        read_only: true
+        mount_options:
+          - implicit-dirs
+          - metadata-cache:ttl-secs:-1
+          - metadata-cache:stat-cache-max-size-mb:-1
+          - metadata-cache:type-cache-max-size-mb:-1
+          - file-system:kernel-list-cache-ttl-secs:-1
+          - read:enable-buffered-read:true
+          - read:block-size-mb:32
+          - read:max-blocks-per-handle:64
+          - read:global-max-blocks:2048
+          - read_ahead_kb=1024
