@@ -325,6 +325,7 @@ def _build(
     output_dir: Path,
     dataset_id: str,
     dataset_revision: str,
+    builder_source_commit: str,
     config: BuildConfig,
     keep_source_json: bool,
 ) -> dict[str, Any]:
@@ -379,6 +380,7 @@ def _build(
     manifest = {
         "schema_version": 1,
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "builder": {"source_commit": builder_source_commit},
         "dataset": {
             "id": dataset_id,
             "revision": dataset_revision,
@@ -442,6 +444,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-id", default=DATASET_ID)
     parser.add_argument("--dataset-revision", default=DATASET_REVISION)
+    parser.add_argument("--builder-source-commit", default="unknown")
     parser.add_argument("--source-json", type=Path)
     parser.add_argument("--download-cache", type=Path, default=Path("/tmp/hf-cache"))
     parser.add_argument("--tokenizer-path", required=True)
@@ -492,6 +495,7 @@ def main() -> None:
         output_dir=args.output_dir,
         dataset_id=args.dataset_id,
         dataset_revision=args.dataset_revision,
+        builder_source_commit=args.builder_source_commit,
         config=config,
         keep_source_json=not args.omit_source_json,
     )
