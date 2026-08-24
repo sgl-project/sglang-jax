@@ -73,7 +73,10 @@ class Candidate:
     source_context_tokens: int
     suffix_tokens: int
     source_context_sha256: str
-    input_ids: tuple[int, ...]
+    # Keep selected 132K-token windows in a packed uint32 buffer. A Python
+    # tuple would retain millions of boxed ints across 64 requests and need
+    # several hundred MiB before serialization.
+    input_ids: Sequence[int]
 
 
 def _sha256_file(path: Path) -> str:
@@ -157,7 +160,8 @@ def _candidate_windows(
         range(0, len(context_ids) - context_budget + 1, context_budget)
     ):
         end = start + context_budget
-        input_ids = tuple(context_ids[start:end] + suffix_ids)
+        input_ids = array.array("I", context_ids[start:end])
+        input_ids.extend(suffix_ids)
         if len(input_ids) != config.total_input_len:
             raise AssertionError((len(input_ids), config.total_input_len))
         candidates.append(

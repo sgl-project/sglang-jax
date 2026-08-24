@@ -1,3 +1,4 @@
+import array
 import unittest
 
 from benchmark.glm52.prepare_longbench_v2 import (
@@ -81,6 +82,13 @@ class PrepareLongBenchV2Test(unittest.TestCase):
         self.assertGreaterEqual(len(candidates), 2)
         self.assertTrue(
             all(len(candidate.input_ids) == config.total_input_len for candidate in candidates)
+        )
+        self.assertTrue(
+            all(
+                isinstance(candidate.input_ids, array.array)
+                and candidate.input_ids.typecode == "I"
+                for candidate in candidates
+            )
         )
         self.assertTrue(all(candidate.suffix_tokens <= config.extend_len for candidate in candidates))
         self.assertEqual(candidates[0].context_token_start, 0)
