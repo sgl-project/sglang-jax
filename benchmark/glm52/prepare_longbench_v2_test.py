@@ -13,6 +13,7 @@ from benchmark.glm52.prepare_longbench_v2 import (
     _format_suffix,
     _load_tokenizer,
     _select_candidates,
+    _validate_config,
 )
 
 
@@ -69,6 +70,13 @@ def _candidate(sub_domain, priority, source_id):
 
 
 class PrepareLongBenchV2Test(unittest.TestCase):
+    def test_config_allows_code_only_quota(self):
+        _validate_config(BuildConfig(code_quota=64, financial_quota=0))
+
+    def test_config_rejects_empty_total_quota(self):
+        with self.assertRaisesRegex(ValueError, "positive total"):
+            _validate_config(BuildConfig(code_quota=0, financial_quota=0))
+
     def test_load_tokenizer_uses_sgl_jax_runtime_loader(self):
         calls = []
         expected_tokenizer = object()

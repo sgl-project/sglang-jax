@@ -509,6 +509,19 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _validate_config(config: BuildConfig) -> None:
+    if min(
+        config.prefix_len,
+        config.extend_len,
+        config.output_len,
+        config.context_char_cap,
+    ) <= 0:
+        raise ValueError("token lengths and context-char cap must all be positive")
+    quotas = (config.code_quota, config.financial_quota)
+    if min(quotas) < 0 or sum(quotas) <= 0:
+        raise ValueError("quotas must be non-negative with a positive total")
+
+
 def main() -> None:
     args = _parse_args()
     config = BuildConfig(
@@ -520,15 +533,7 @@ def main() -> None:
         context_char_cap=args.context_char_cap,
         selection_seed=args.selection_seed,
     )
-    if min(
-        config.prefix_len,
-        config.extend_len,
-        config.output_len,
-        config.code_quota,
-        config.financial_quota,
-        config.context_char_cap,
-    ) <= 0:
-        raise ValueError("token lengths and quotas must all be positive")
+    _validate_config(config)
 
     source_json = args.source_json or _download_source(
         args.dataset_id, args.dataset_revision, args.download_cache
