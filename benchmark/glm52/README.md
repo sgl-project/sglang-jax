@@ -12,6 +12,12 @@ long-context serving comparison. It pins LongBench v2 revision
 `Financial` sub-domains, and uses the serving model's tokenizer rather than a
 character or word-count estimate.
 
+The tokenizer is loaded from the documented final-test model at
+`/models/GLM5.2-fp8-channel-wise` (static per-channel FP8 weights, dynamic
+per-token W8A8 MoE, and W8A16 for the other Linear layers). TPU serving and
+performance jobs consuming this dataset must also set
+`--xla_tpu_dvfs_p_state=7`; the CPU-only data builder has no TPU DVFS setting.
+
 The default output contains 32 requests from each sub-domain. Every request has
 an exact 131,072-token prefix and 1,024-token extension; the question, all four
 choices, and the answer marker fit in that final extension. The output length is

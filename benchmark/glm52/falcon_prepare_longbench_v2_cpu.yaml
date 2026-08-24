@@ -5,7 +5,7 @@ cluster_name: tpu-service
 priority: 0
 tags: [dataset, longbench-v2, glm52, cpu, long-context, code-repo-qa, financial]
 model_version: glm-5.2-longbench-v2-code-financial-c64-v1
-config: '{"dataset":"zai-org/LongBench-v2","dataset_revision":"2b48e494f2c7a2f0af81aae178e05c7e1dde0fe9","sub_domains":{"Code repo QA":32,"Financial":32},"tokenizer":"/models/GLM-5.2-FP8","prefix_tokens":131072,"extend_tokens":1024,"output_tokens":1024,"concurrency":64,"output_uri":"gs://inference-model-storage-poc-tpu-hns/benchmark-datasets/LongBench-v2/glm52-code-financial-128k-prefix-1k-extend-c64-v1/","source_commit":"565a3d2cd46134daa10c93e04a953e7f17f45a60"}'
+config: '{"dataset":"zai-org/LongBench-v2","dataset_revision":"2b48e494f2c7a2f0af81aae178e05c7e1dde0fe9","sub_domains":{"Code repo QA":32,"Financial":32},"tokenizer":"/models/GLM5.2-fp8-channel-wise","quantization":"static per-channel FP8 weight; MoE dynamic per-token W8A8; other Linear W8A16","prefix_tokens":131072,"extend_tokens":1024,"output_tokens":1024,"concurrency":64,"output_uri":"gs://inference-model-storage-poc-tpu-hns/benchmark-datasets/LongBench-v2/glm52-code-financial-128k-prefix-1k-extend-c64-v1/","source_commit":"565a3d2cd46134daa10c93e04a953e7f17f45a60"}'
 role_to_task_spec:
   worker:
     replica: 1
@@ -23,7 +23,7 @@ role_to_task_spec:
 
       SOURCE_ROOT=/workspace/sglang-jax
       EXPECTED_COMMIT=565a3d2cd46134daa10c93e04a953e7f17f45a60
-      MODEL_PATH=/models/GLM-5.2-FP8
+      MODEL_PATH=/models/GLM5.2-fp8-channel-wise
       PERSIST_ROOT=/models/benchmark-datasets/LongBench-v2
       PERSIST_DIR="$PERSIST_ROOT/glm52-code-financial-128k-prefix-1k-extend-c64-v1"
       LOCAL_ROOT=/tmp/longbench-v2-data-prep
@@ -107,8 +107,8 @@ role_to_task_spec:
       - name: glm52-model
         type: gcs
         bucket: inference-model-storage-poc-tpu-hns
-        prefix: GLM-5.2-FP8
-        mount_path: /models/GLM-5.2-FP8
+        prefix: GLM5.2-fp8-channel-wise
+        mount_path: /models/GLM5.2-fp8-channel-wise
         read_only: true
         mount_options:
           - implicit-dirs
