@@ -11,6 +11,7 @@ role_to_task_spec:
     replica: 1
     image: python:3.12
     device_type: cpu
+    machine_type: n2-highmem-32
     command: |
       exec bash <<'BASH'
       set -euo pipefail
