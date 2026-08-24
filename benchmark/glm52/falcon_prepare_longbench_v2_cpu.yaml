@@ -1,18 +1,16 @@
-name: glm52-longbench-v2-code-financial-c64-data-prep-20260824-r7-antgroup-flex-e2std8
+name: glm52-longbench-v2-code-financial-c64-data-prep-20260825-r8-antgroup-v2-sgljax
 exp_type: TRAINING
 artifact_type: GCS
-cluster_name: tpu-training-antgroup
+cluster_name: tpu-training-antgroup-v2
 priority: 0
 tags: [dataset, longbench-v2, glm52, cpu, long-context, code-repo-qa, financial]
 model_version: glm-5.2-longbench-v2-code-financial-c64-v1
-config: '{"dataset":"zai-org/LongBench-v2","dataset_revision":"2b48e494f2c7a2f0af81aae178e05c7e1dde0fe9","sub_domains":{"Code repo QA":32,"Financial":32},"tokenizer":"/models/GLM5.2-fp8-channel-wise","quantization":"static per-channel FP8 weight; MoE dynamic per-token W8A8; other Linear W8A16","prefix_tokens":131072,"extend_tokens":1024,"output_tokens":1024,"concurrency":64,"output_uri":"gs://inference-model-storage-poc-tpu-hns/benchmark-datasets/LongBench-v2/glm52-code-financial-128k-prefix-1k-extend-c64-v1/","source_commit":"645ada5aa510fffc4c6230ee8b1eadcb31e394ed"}'
+config: '{"dataset":"zai-org/LongBench-v2","dataset_revision":"2b48e494f2c7a2f0af81aae178e05c7e1dde0fe9","sub_domains":{"Code repo QA":32,"Financial":32},"tokenizer":"/models/GLM5.2-fp8-channel-wise","quantization":"static per-channel FP8 weight; MoE dynamic per-token W8A8; other Linear W8A16","prefix_tokens":131072,"extend_tokens":1024,"output_tokens":1024,"concurrency":64,"output_uri":"gs://inference-model-storage-poc-tpu-hns/benchmark-datasets/LongBench-v2/glm52-code-financial-128k-prefix-1k-extend-c64-v1/","source_commit":"65919c8b5281c37a7369fe70c609a6f222239314"}'
 role_to_task_spec:
   worker:
     replica: 1
     image: python:3.12
     device_type: cpu
-    machine_type: e2-standard-8
-    supply_mode: flex-start
     resources:
       # Historical successful Ant CPU smoke exp-yojrwsrqgf used a 100m
       # request on cpu-private-test. Keep the request small enough to fit a
@@ -27,7 +25,7 @@ role_to_task_spec:
       ulimit -c 0
 
       SOURCE_ROOT=/workspace/sglang-jax
-      EXPECTED_COMMIT=645ada5aa510fffc4c6230ee8b1eadcb31e394ed
+      EXPECTED_COMMIT=65919c8b5281c37a7369fe70c609a6f222239314
       MODEL_PATH=/models/GLM5.2-fp8-channel-wise
       PERSIST_ROOT=/models/benchmark-datasets/LongBench-v2
       PERSIST_DIR="$PERSIST_ROOT/glm52-code-financial-128k-prefix-1k-extend-c64-v1"
@@ -59,13 +57,17 @@ role_to_task_spec:
         exit 1
       fi
 
-      python3 -m pip install --no-cache-dir -q \
-        'huggingface-hub~=0.34.3' \
-        'transformers~=4.57.1' \
-        'ijson~=3.4' \
-        hf-xet \
-        sentencepiece \
-        tiktoken
+      python3 -m pip install --no-cache-dir -q --upgrade pip uv
+      uv venv --python 3.12 --seed "$LOCAL_ROOT/venv"
+      . "$LOCAL_ROOT/venv/bin/activate"
+      uv pip install -q -e 'python[cpu]' 'ijson~=3.4' hf-xet sentencepiece
+
+      python3 - <<'PY' | tee "$ARTIFACT_ROOT/runtime-versions.txt"
+      import importlib.metadata as metadata
+
+      for package in ("sglang-jax", "transformers", "tokenizers", "jax", "jaxlib"):
+          print(f"{package}={metadata.version(package)}")
+      PY
 
       python3 benchmark/glm52/prepare_longbench_v2.py \
         --dataset-id zai-org/LongBench-v2 \
@@ -139,7 +141,7 @@ role_to_task_spec:
         type: git
         repo: https://github.com/primatrix/sglang-jax.git
         ref: dev/glm52-longbench-v2-dataset
-        commit: 645ada5aa510fffc4c6230ee8b1eadcb31e394ed
+        commit: 65919c8b5281c37a7369fe70c609a6f222239314
         path: /workspace/sglang-jax
         auth:
           cred: sglang-jax-codex-dev-20260708
