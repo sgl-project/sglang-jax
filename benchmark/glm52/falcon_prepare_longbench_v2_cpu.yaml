@@ -1,25 +1,23 @@
-name: glm52-longbench-v2-code-financial-c64-data-prep-20260825-r10-antgroup-flex-sgljax-2gi
+name: glm52-longbench-v2-code-c64-data-prep-20260825-r11-antgroup-v2-race
 exp_type: TRAINING
 artifact_type: GCS
-cluster_name: tpu-training-antgroup
+cluster_name: tpu-training-antgroup-v2
 priority: 0
-tags: [dataset, longbench-v2, glm52, cpu, long-context, code-repo-qa, financial]
-model_version: glm-5.2-longbench-v2-code-financial-c64-v1
-config: '{"dataset":"zai-org/LongBench-v2","dataset_revision":"2b48e494f2c7a2f0af81aae178e05c7e1dde0fe9","sub_domains":{"Code repo QA":32,"Financial":32},"tokenizer":"/models/GLM5.2-fp8-channel-wise","quantization":"static per-channel FP8 weight; MoE dynamic per-token W8A8; other Linear W8A16","prefix_tokens":131072,"extend_tokens":1024,"output_tokens":1024,"concurrency":64,"output_uri":"gs://inference-model-storage-poc-tpu-hns/benchmark-datasets/LongBench-v2/glm52-code-financial-128k-prefix-1k-extend-c64-v1/","source_commit":"65919c8b5281c37a7369fe70c609a6f222239314"}'
+tags: [dataset, longbench-v2, glm52, cpu, long-context, code-repo-qa, code-only, c64]
+model_version: glm-5.2-longbench-v2-code-c64-v1
+config: '{"dataset":"zai-org/LongBench-v2","dataset_revision":"2b48e494f2c7a2f0af81aae178e05c7e1dde0fe9","sub_domains":{"Code repo QA":64,"Financial":0},"tokenizer":"/models/GLM5.2-fp8-channel-wise","quantization":"static per-channel FP8 weight; MoE dynamic per-token W8A8; other Linear W8A16","prefix_tokens":131072,"extend_tokens":1024,"output_tokens":1024,"concurrency":64,"output_uri":"gs://inference-model-storage-poc-tpu-hns/benchmark-datasets/LongBench-v2/glm52-code-128k-prefix-1k-extend-c64-v1/","source_commit":"9688674b0722c217486cb6acffde18845ad44649"}'
 role_to_task_spec:
   worker:
     replica: 1
     image: python:3.12
     device_type: cpu
-    machine_type: e2-standard-8
-    supply_mode: flex-start
     resources:
-      # The tokenizer-exact builder reached ~1.67 GiB RSS in exp-k3ndo8ydoq.
-      # Request its real working set so Kubernetes does not place it on a
-      # memory-starved shared node and evict it under node pressure.
+      # The bounded-chunk builder stays well below 1 GiB RSS.  A low request
+      # lets the shared Ant v2 CPU pool schedule it, while the 3 GiB limit
+      # protects against tokenizer transients.
       cpu_request: "100m"
       cpu_limit: "900m"
-      memory_request: 2Gi
+      memory_request: 512Mi
       memory_limit: 3Gi
     command: |
       exec bash <<'BASH'
@@ -27,10 +25,10 @@ role_to_task_spec:
       ulimit -c 0
 
       SOURCE_ROOT=/workspace/sglang-jax
-      EXPECTED_COMMIT=65919c8b5281c37a7369fe70c609a6f222239314
+      EXPECTED_COMMIT=9688674b0722c217486cb6acffde18845ad44649
       MODEL_PATH=/models/GLM5.2-fp8-channel-wise
       PERSIST_ROOT=/models/benchmark-datasets/LongBench-v2
-      PERSIST_DIR="$PERSIST_ROOT/glm52-code-financial-128k-prefix-1k-extend-c64-v1"
+      PERSIST_DIR="$PERSIST_ROOT/glm52-code-128k-prefix-1k-extend-c64-v1"
       LOCAL_ROOT=/tmp/longbench-v2-data-prep
       LOCAL_BUILD="$LOCAL_ROOT/build"
       ARTIFACT_ROOT="${ARTIFACT_LOCAL_DIR:-/tmp/longbench-v2-artifact}"
@@ -79,8 +77,9 @@ role_to_task_spec:
         --prefix-len 131072 \
         --extend-len 1024 \
         --output-len 1024 \
-        --code-quota 32 \
-        --financial-quota 32 \
+        --code-quota 64 \
+        --financial-quota 0 \
+        --context-char-cap 800000 \
         --output-dir "$LOCAL_BUILD" \
         | tee "$ARTIFACT_ROOT/build-stdout.json"
 
@@ -105,7 +104,7 @@ role_to_task_spec:
       cp "$LOCAL_BUILD/_SUCCESS.json" "$ARTIFACT_ROOT/_SUCCESS.json"
       {
         echo "persist_path=$PERSIST_DIR"
-        echo "persist_uri=gs://inference-model-storage-poc-tpu-hns/benchmark-datasets/LongBench-v2/glm52-code-financial-128k-prefix-1k-extend-c64-v1/"
+        echo "persist_uri=gs://inference-model-storage-poc-tpu-hns/benchmark-datasets/LongBench-v2/glm52-code-128k-prefix-1k-extend-c64-v1/"
         echo "source_commit=$ACTUAL_COMMIT"
         echo "completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         df -h "$MODEL_PATH" "$PERSIST_ROOT"
@@ -143,7 +142,7 @@ role_to_task_spec:
         type: git
         repo: https://github.com/primatrix/sglang-jax.git
         ref: dev/glm52-longbench-v2-dataset
-        commit: 65919c8b5281c37a7369fe70c609a6f222239314
+        commit: 9688674b0722c217486cb6acffde18845ad44649
         path: /workspace/sglang-jax
         auth:
           cred: sglang-jax-codex-dev-20260708
