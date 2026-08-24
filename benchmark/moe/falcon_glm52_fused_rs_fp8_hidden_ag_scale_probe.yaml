@@ -1,10 +1,10 @@
-name: glm52-fused-rs-fp8-hidden-ag-scale-probe-r1-20260824
+name: glm52-fused-rs-fp8-hidden-ag-scale-probe-r2-20260824
 exp_type: TRAINING
 artifact_type: GCS
 cluster_name: tpu-training-antgroup
 priority: 0
 tags: [correctness, fused-moe, fused-rs, glm52, fp8-hidden-ag, scale-probe]
-config: '{"device_type":"v7x","physical_chips":4,"visible_devices":8,"ep_size":8,"num_tokens":32768,"scale_multipliers":[0.95,0.96,0.97,0.98,0.99,1.0],"consumer":"direct_prequantized_fp8_row0_aligned","source_commit":"bb88aca12c412cf2dd16bab584d3477dfe7d1f14","source_sha256":"2d54284802cc674060e5998a1f17e62924fd9565a9767a5348caac545ee33811"}'
+config: '{"device_type":"v7x","physical_chips":4,"visible_devices":8,"ep_size":8,"num_tokens":32768,"scale_multipliers":[0.95,0.96,0.97,0.98,0.99,1.0],"consumer":"direct_prequantized_fp8_row0_aligned","source_commit":"d0d3a2c075b7e9a3c219f384ffdab83cf00357bd","source_sha256":"b2eec890f0c63622a0a2c8e6fccd985cadb9285e2a5fb38d207db7137764190d"}'
 role_to_task_spec:
   worker:
     replica: 1
@@ -26,8 +26,8 @@ role_to_task_spec:
       export JAX_COMPILATION_CACHE_DIR=/tmp/tpu_logs/jax-cache
       mkdir -p "$TMPDIR" "$PIP_CACHE_DIR" "$UV_CACHE_DIR" "$JAX_COMPILATION_CACHE_DIR"
 
-      source_tar=/tmp/glm52-fused-rs-fp8-hidden-ag-scale-probe-r1.tar.gz.part
-      source_ready=/tmp/glm52-fused-rs-fp8-hidden-ag-scale-probe-r1.ready
+      source_tar=/tmp/glm52-fused-rs-fp8-hidden-ag-scale-probe-r2.tar.gz.part
+      source_ready=/tmp/glm52-fused-rs-fp8-hidden-ag-scale-probe-r2.ready
       attempt=0
       while [ ! -f "$source_ready" ]; do
         attempt=$((attempt + 1))
@@ -38,7 +38,7 @@ role_to_task_spec:
         sleep 5
       done
       test -f "$source_tar"
-      echo '2d54284802cc674060e5998a1f17e62924fd9565a9767a5348caac545ee33811  /tmp/glm52-fused-rs-fp8-hidden-ag-scale-probe-r1.tar.gz.part' | sha256sum -c -
+      echo 'b2eec890f0c63622a0a2c8e6fccd985cadb9285e2a5fb38d207db7137764190d  /tmp/glm52-fused-rs-fp8-hidden-ag-scale-probe-r2.tar.gz.part' | sha256sum -c -
 
       mkdir -p /workspace/sglang-jax
       tar -xzf "$source_tar" -C /workspace/sglang-jax
