@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import time
 from collections.abc import Callable
@@ -1051,6 +1052,10 @@ def main() -> None:
                     "includes_shared_expert": args.layer_scope,
                     "includes_output_reshard": args.layer_scope,
                     "process_count": jax.process_count(),
+                    "jax_process_index": jax.process_index(),
+                    "falcon_operator_rank": os.environ.get(
+                        "FALCON_OPERATOR_RANK"
+                    ),
                     "ep_size": args.ep_size,
                     "num_tokens": num_tokens,
                     "routed_rows": num_tokens * GLM52_TOP_K,
