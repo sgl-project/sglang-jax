@@ -16,6 +16,14 @@ from sgl_jax.srt.multimodal.processors.qwen_vl import QwenVLProcessor
 IMAGE_TOKEN = 151655
 
 
+def _make_qwen_processor():
+    hf_config = SimpleNamespace(
+        architectures=["Qwen2_5_VLForConditionalGeneration"],
+        vision_config=SimpleNamespace(patch_size=14, spatial_merge_size=2),
+    )
+    return QwenVLProcessor(hf_config, SimpleNamespace(), object())
+
+
 def test_build_cache_input_ids_uses_item_hash():
     input_ids = [1, IMAGE_TOKEN, IMAGE_TOKEN, 2]
     item = MultimodalDataItem(
@@ -41,38 +49,69 @@ def test_qwen_vl_rejects_audio_inputs():
         asyncio.run(processor.process_mm_data_async(None, "prompt", request))
 
 
-def test_hf_processor_runs_outside_event_loop_thread():
+def test_qwen_process_and_combine_runs_in_hf_processor_worker():
     worker_thread_id = None
+    processor = _make_qwen_processor()
 
-    def hf_processor(**kwargs):
+    def process_and_combine(*_, processor, **__):
         nonlocal worker_thread_id
         worker_thread_id = threading.get_ident()
-        return kwargs
+        return MultimodalInputs(mm_items=[], input_ids=[10, 11])
 
-    processor = QwenVLProcessor(SimpleNamespace(), SimpleNamespace(), hf_processor)
+    processor.process_and_combine_mm_data = process_and_combine
 
     async def run_processor():
         event_loop_thread_id = threading.get_ident()
-        output = await processor._run_hf_processor_async(
-            "prompt",
-            image_sources=[],
-            videos=[],
-            processor_kwargs={"return_mm_token_type_ids": True},
-        )
+        output = await processor.process_and_combine_mm_data_async("prompt")
         return event_loop_thread_id, output
 
-    event_loop_thread_id, output = asyncio.run(run_processor())
+    try:
+        event_loop_thread_id, output = asyncio.run(run_processor())
+    finally:
+        processor.shutdown()
 
-    assert worker_thread_id is not None
-    assert worker_thread_id != event_loop_thread_id
-    assert output == {
-        "text": ["prompt"],
-        "images": None,
-        "videos": None,
-        "padding": True,
-        "return_tensors": "pt",
-        "return_mm_token_type_ids": True,
-    }
+    assert worker_thread_id is not None and worker_thread_id != event_loop_thread_id
+    assert output.input_ids == [10, 11]
+
+
+def test_qwen_loads_images_and_videos_concurrently():
+    processor = _make_qwen_processor()
+
+    async def run_processor():
+        loaders_ready = asyncio.Barrier(2)
+
+        async def load(sources, expected_source, result):
+            assert sources == [expected_source]
+            await loaders_ready.wait()
+            return [result]
+
+        async def combine(input_text, images=None, videos=None, **kwargs):
+            assert input_text == "prompt"
+            assert images == ["loaded-image"]
+            assert videos == ["loaded-video"]
+            return MultimodalInputs(mm_items=[], input_ids=[10, 11])
+
+        processor.load_images_async = lambda sources: load(sources, "image-source", "loaded-image")
+        processor._load_videos_async = lambda sources, _: load(
+            sources, "video-source", "loaded-video"
+        )
+        processor.process_and_combine_mm_data_async = combine
+
+        return await asyncio.wait_for(
+            processor.process_mm_data_async(
+                "image-source",
+                "prompt",
+                SimpleNamespace(audio_data=None, video_data="video-source"),
+            ),
+            timeout=1,
+        )
+
+    try:
+        output = asyncio.run(run_processor())
+    finally:
+        processor.shutdown()
+
+    assert output.input_ids == [10, 11]
 
 
 def test_placeholder_ranges_are_half_open():
