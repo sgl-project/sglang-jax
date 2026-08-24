@@ -5,7 +5,7 @@ cluster_name: tpu-training-antgroup-v2
 priority: 0
 tags: [dataset, longbench-v2, glm52, cpu, long-context, code-repo-qa, code-only, c64]
 model_version: glm-5.2-longbench-v2-code-c64-v1
-config: '{"dataset":"zai-org/LongBench-v2","dataset_revision":"2b48e494f2c7a2f0af81aae178e05c7e1dde0fe9","sub_domains":{"Code repo QA":64,"Financial":0},"tokenizer":"/models/GLM5.2-fp8-channel-wise","quantization":"static per-channel FP8 weight; MoE dynamic per-token W8A8; other Linear W8A16","prefix_tokens":131072,"extend_tokens":1024,"output_tokens":1024,"concurrency":64,"output_uri":"gs://inference-model-storage-poc-tpu-hns/benchmark-datasets/LongBench-v2/glm52-code-128k-prefix-1k-extend-c64-v1/","source_commit":"9688674b0722c217486cb6acffde18845ad44649"}'
+config: '{"dataset":"zai-org/LongBench-v2","dataset_revision":"2b48e494f2c7a2f0af81aae178e05c7e1dde0fe9","sub_domains":{"Code repo QA":64,"Financial":0},"tokenizer":"/models/GLM5.2-fp8-channel-wise","quantization":"static per-channel FP8 weight; MoE dynamic per-token W8A8; other Linear W8A16","prefix_tokens":131072,"extend_tokens":1024,"output_tokens":1024,"concurrency":64,"output_uri":"gs://inference-model-storage-poc-tpu-hns/benchmark-datasets/LongBench-v2/glm52-code-128k-prefix-1k-extend-c64-v1/","source_commit":"1ae77d9c36fb714eb28dee0fa4d0b3ca2ac25732"}'
 role_to_task_spec:
   worker:
     replica: 1
@@ -25,7 +25,7 @@ role_to_task_spec:
       ulimit -c 0
 
       SOURCE_ROOT=/workspace/sglang-jax
-      EXPECTED_COMMIT=9688674b0722c217486cb6acffde18845ad44649
+      EXPECTED_COMMIT=1ae77d9c36fb714eb28dee0fa4d0b3ca2ac25732
       MODEL_PATH=/models/GLM5.2-fp8-channel-wise
       PERSIST_ROOT=/models/benchmark-datasets/LongBench-v2
       PERSIST_DIR="$PERSIST_ROOT/glm52-code-128k-prefix-1k-extend-c64-v1"
@@ -142,7 +142,7 @@ role_to_task_spec:
         type: git
         repo: https://github.com/primatrix/sglang-jax.git
         ref: dev/glm52-longbench-v2-dataset
-        commit: 9688674b0722c217486cb6acffde18845ad44649
+        commit: 1ae77d9c36fb714eb28dee0fa4d0b3ca2ac25732
         path: /workspace/sglang-jax
         auth:
           cred: sglang-jax-codex-dev-20260708
