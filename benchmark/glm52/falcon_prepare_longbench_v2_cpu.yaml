@@ -1,4 +1,4 @@
-name: glm52-longbench-v2-code-c64-data-prep-20260825-r12-antgroup
+name: glm52-longbench-v2-code-c64-data-prep-20260825-r13-antgroup
 exp_type: TRAINING
 artifact_type: GCS
 cluster_name: tpu-training-antgroup
@@ -12,11 +12,11 @@ role_to_task_spec:
     image: python:3.12
     device_type: cpu
     resources:
-      # AntGroup has a 128-core Falcon CPU quota.  Keep this below the
-      # 3.92-core allocatable capacity of its shared CPU node while giving the
-      # Rust tokenizer enough parallel CPU to finish the Code-only build fast.
-      cpu_request: "3"
-      cpu_limit: "3800m"
+      # AntGroup has a 128-core Falcon CPU quota.  Its Falcon shared CPU pool
+      # currently has one 3.92-core node with a resident job, so request two
+      # cores to fit the remaining capacity while still accelerating tokenization.
+      cpu_request: "2"
+      cpu_limit: "2800m"
       memory_request: 4Gi
       memory_limit: 12Gi
     command: |
