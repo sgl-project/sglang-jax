@@ -1,10 +1,10 @@
-name: glm52-fused-rs-fp8-hidden-ag-scale-probe-r2-20260824
+name: glm52-fused-rs-fp8-hidden-ag-scale-granularity-probe-r3-20260824
 exp_type: TRAINING
 artifact_type: GCS
 cluster_name: tpu-training-antgroup
 priority: 0
 tags: [correctness, fused-moe, fused-rs, glm52, fp8-hidden-ag, scale-probe]
-config: '{"device_type":"v7x","physical_chips":4,"visible_devices":8,"ep_size":8,"num_tokens":32768,"scale_multipliers":[0.95,0.96,0.97,0.98,0.99,1.0],"consumer":"direct_prequantized_fp8_row0_aligned","source_commit":"d0d3a2c075b7e9a3c219f384ffdab83cf00357bd","source_sha256":"b2eec890f0c63622a0a2c8e6fccd985cadb9285e2a5fb38d207db7137764190d"}'
+config: '{"device_type":"v7x","physical_chips":4,"visible_devices":8,"ep_size":8,"num_tokens":32768,"scale_multipliers":[1.0],"scale_granularities":["tensor","row"],"consumer":"direct_prequantized_fp8_row0_aligned","source_commit":"7de190fc2ca2d4ef218f8ac9d59436640a6786e9","source_sha256":"f757ce940b40ae6acdd204b8b8d331254828528fe08b2e685ce07f566e374f21"}'
 role_to_task_spec:
   worker:
     replica: 1
@@ -26,8 +26,8 @@ role_to_task_spec:
       export JAX_COMPILATION_CACHE_DIR=/tmp/tpu_logs/jax-cache
       mkdir -p "$TMPDIR" "$PIP_CACHE_DIR" "$UV_CACHE_DIR" "$JAX_COMPILATION_CACHE_DIR"
 
-      source_tar=/tmp/glm52-fused-rs-fp8-hidden-ag-scale-probe-r2.tar.gz.part
-      source_ready=/tmp/glm52-fused-rs-fp8-hidden-ag-scale-probe-r2.ready
+      source_tar=/tmp/glm52-fused-rs-fp8-hidden-ag-scale-probe-r3.tar.gz.part
+      source_ready=/tmp/glm52-fused-rs-fp8-hidden-ag-scale-probe-r3.ready
       attempt=0
       while [ ! -f "$source_ready" ]; do
         attempt=$((attempt + 1))
@@ -38,7 +38,7 @@ role_to_task_spec:
         sleep 5
       done
       test -f "$source_tar"
-      echo 'b2eec890f0c63622a0a2c8e6fccd985cadb9285e2a5fb38d207db7137764190d  /tmp/glm52-fused-rs-fp8-hidden-ag-scale-probe-r2.tar.gz.part' | sha256sum -c -
+      echo 'f757ce940b40ae6acdd204b8b8d331254828528fe08b2e685ce07f566e374f21  /tmp/glm52-fused-rs-fp8-hidden-ag-scale-probe-r3.tar.gz.part' | sha256sum -c -
 
       mkdir -p /workspace/sglang-jax
       tar -xzf "$source_tar" -C /workspace/sglang-jax
@@ -50,7 +50,8 @@ role_to_task_spec:
         --ep-size 8 \
         --tokens 32768 \
         --routing-seed 42 \
-        --scale-multipliers 0.95,0.96,0.97,0.98,0.99,1.0 \
+        --scale-multipliers 1.0 \
+        --scale-granularities tensor,row \
         --jsonl "$OUT/benchmark/metrics.jsonl"
 
-      test "$(wc -l < "$OUT/benchmark/metrics.jsonl")" -eq 6
+      test "$(wc -l < "$OUT/benchmark/metrics.jsonl")" -eq 2
