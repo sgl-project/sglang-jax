@@ -1,7 +1,7 @@
-name: glm52-longbench-v2-code-financial-c64-data-prep-20260825-r9-antgroup-v2-sgljax-2gi
+name: glm52-longbench-v2-code-financial-c64-data-prep-20260825-r10-antgroup-flex-sgljax-2gi
 exp_type: TRAINING
 artifact_type: GCS
-cluster_name: tpu-training-antgroup-v2
+cluster_name: tpu-training-antgroup
 priority: 0
 tags: [dataset, longbench-v2, glm52, cpu, long-context, code-repo-qa, financial]
 model_version: glm-5.2-longbench-v2-code-financial-c64-v1
@@ -11,6 +11,8 @@ role_to_task_spec:
     replica: 1
     image: python:3.12
     device_type: cpu
+    machine_type: e2-standard-8
+    supply_mode: flex-start
     resources:
       # The tokenizer-exact builder reached ~1.67 GiB RSS in exp-k3ndo8ydoq.
       # Request its real working set so Kubernetes does not place it on a
