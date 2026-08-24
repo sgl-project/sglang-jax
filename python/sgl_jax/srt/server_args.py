@@ -188,6 +188,7 @@ class ServerArgs:
     moe_backend: str = "epmoe"
     disable_jax_allreduce_metadata: bool = False
     fused_rs_fp8_hidden_all_gather: bool = False
+    fused_rs_fp8_hidden_row_scale: bool = False
     enable_topk_kernel: bool = True
 
     grammar_backend: str | None = None
@@ -300,6 +301,15 @@ class ServerArgs:
         # Set missing default values
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
+
+        if (
+            self.fused_rs_fp8_hidden_row_scale
+            and not self.fused_rs_fp8_hidden_all_gather
+        ):
+            raise ValueError(
+                "fused-RS FP8 Hidden AllGather row scale requires "
+                "--fused-rs-fp8-hidden-all-gather"
+            )
 
         from sgl_jax.srt.disaggregation.pd_auth import resolve_secret
 
@@ -1449,10 +1459,22 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.fused_rs_fp8_hidden_all_gather,
             help=(
-                "Quantize each EP rank's physical fused-RS hidden shard with "
-                "one FP8 E4M3FN scale before the input AllGather; invalid "
-                "payload rows are zeroed. Experimental; the BF16 path remains "
-                "the default."
+                "Quantize the complete physical fused-RS hidden shard to FP8 "
+                "E4M3FN before the input AllGather. The compatibility path "
+                "uses one scale per EP rank; combine with "
+                "--fused-rs-fp8-hidden-row-scale for the direct row-scale "
+                "consumer. Experimental; BF16 remains the default."
+            ),
+        )
+        parser.add_argument(
+            "--fused-rs-fp8-hidden-row-scale",
+            action="store_true",
+            default=ServerArgs.fused_rs_fp8_hidden_row_scale,
+            help=(
+                "Use one FP32 scale per physical hidden row and consume the "
+                "row-zero-aligned FP8 payload directly in fused-RS. Requires "
+                "--fused-rs-fp8-hidden-all-gather. Experimental; disabled by "
+                "default."
             ),
         )
         parser.add_argument(

@@ -165,4 +165,7 @@ fi
 if [[ "${GLM52_FUSED_RS_FP8_HIDDEN_ALL_GATHER:-0}" == "1" ]]; then
   LAUNCH_ARGS+=(--fused-rs-fp8-hidden-all-gather)
 fi
+if [[ "${GLM52_FUSED_RS_FP8_HIDDEN_ROW_SCALE:-0}" == "1" ]]; then
+  LAUNCH_ARGS+=(--fused-rs-fp8-hidden-row-scale)
+fi
 exec python3 "${LAUNCH_ARGS[@]}" "$@"

@@ -805,10 +805,12 @@ class FusedEPMoERS(FusedEPMoEV2):
         self,
         *args,
         fp8_hidden_all_gather: bool = False,
+        fp8_hidden_row_scale: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.fp8_hidden_all_gather = fp8_hidden_all_gather
+        self.fp8_hidden_row_scale = fp8_hidden_row_scale
 
     def _shared_expert_for_rs(
         self,
@@ -891,6 +893,10 @@ class FusedEPMoERS(FusedEPMoEV2):
             topk_weights=rs_topk_weights,
             topk_indices=rs_topk_ids,
             fp8_hidden_all_gather=self.fp8_hidden_all_gather,
+            _fp8_hidden_direct_prequantized=self.fp8_hidden_row_scale,
+            _fp8_hidden_scale_granularity=(
+                "row" if self.fp8_hidden_row_scale else "tensor"
+            ),
         )
 
         if self.w1_shared is not None and not self.disable_shared_expert:

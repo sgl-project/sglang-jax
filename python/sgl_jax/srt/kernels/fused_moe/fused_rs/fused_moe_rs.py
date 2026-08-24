@@ -467,7 +467,7 @@ def expert_parallel_gmm_rs(
     ):
         raise ValueError(
             "per-row FP8 Hidden AllGather scale currently requires the direct "
-            "prequantized diagnostic path"
+            "prequantized path"
         )
     if fp8_hidden_all_gather:
         if (
@@ -574,14 +574,10 @@ def expert_parallel_gmm_rs(
                     )
             else:
                 with jax.named_scope("fused_rs_hidden_dequantize"):
-                    # Target-TPU explicit oracles prove the collective payload
-                    # and scales are exact, but the direct prequantized Pallas
-                    # input is not: even a uniform rank scale remains wrong.
-                    # Materialize BF16 locally after the FP8 collective, then
-                    # reuse the mature per-row W8A8 GMM1 path.  This preserves
-                    # the 2x ICI payload reduction while keeping the broken
-                    # direct-FP8 path out of the production opt-in until its
-                    # VMEM/MXU layout is independently fixed.
+                    # Compatibility mode materializes BF16 locally after the
+                    # FP8 collective and reuses the mature per-row W8A8 GMM1
+                    # path. The separately gated row-scale mode consumes the
+                    # row-zero-aligned FP8 payload directly.
                     hidden_global = _dequantize_hidden_per_rank(
                         hidden_global,
                         hidden_scale_by_rank,

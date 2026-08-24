@@ -10,6 +10,8 @@ from __future__ import annotations
 import argparse
 from types import SimpleNamespace
 
+import pytest
+
 from sgl_jax.srt.managers.dp_schedule_policy import pick_cache_aware_dp as pick
 from sgl_jax.srt.managers.dp_schedule_policy import req_prefix_match_key as match_key
 from sgl_jax.srt.server_args import ServerArgs
@@ -250,6 +252,20 @@ def test_cli_default_keeps_unset_policy_distinct_from_explicit_min_running_queue
 
     assert unset.dp_schedule_policy is None
     assert explicit.dp_schedule_policy == "min_running_queue"
+
+
+def test_fused_rs_fp8_row_scale_requires_hidden_all_gather():
+    with pytest.raises(
+        ValueError,
+        match="row scale requires --fused-rs-fp8-hidden-all-gather",
+    ):
+        _server_args(fused_rs_fp8_hidden_row_scale=True)
+
+    args = _server_args(
+        fused_rs_fp8_hidden_all_gather=True,
+        fused_rs_fp8_hidden_row_scale=True,
+    )
+    assert args.fused_rs_fp8_hidden_row_scale is True
 
 
 if __name__ == "__main__":

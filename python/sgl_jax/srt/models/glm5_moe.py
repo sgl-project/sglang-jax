@@ -1069,6 +1069,11 @@ class Glm5DecoderLayer(nnx.Module):
                         "fused_rs_fp8_hidden_all_gather",
                         False,
                     ),
+                    fp8_hidden_row_scale=getattr(
+                        config,
+                        "fused_rs_fp8_hidden_row_scale",
+                        False,
+                    ),
                 )
 
                 quant_config = getattr(config, "quantization_config", None)

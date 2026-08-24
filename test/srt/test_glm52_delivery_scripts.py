@@ -218,7 +218,7 @@ def test_serve_wrapper_accepts_agent_eval_capacity_overrides(tmp_path: Path) -> 
     assert args[args.index("--mem-fraction-static") + 1] == "0.89"
 
 
-def test_serve_wrapper_enables_fp8_hidden_all_gather_only_when_requested(
+def test_serve_wrapper_enables_fp8_hidden_row_scale_only_when_requested(
     tmp_path: Path,
 ) -> None:
     env, argv_path = _base_env(tmp_path)
@@ -238,6 +238,7 @@ def test_serve_wrapper_enables_fp8_hidden_all_gather_only_when_requested(
             "GLM52_DVFS_P_STATE": "off",
             "GLM52_MOE_BACKEND": "fused_rs",
             "GLM52_FUSED_RS_FP8_HIDDEN_ALL_GATHER": "1",
+            "GLM52_FUSED_RS_FP8_HIDDEN_ROW_SCALE": "1",
         }
     )
 
@@ -250,6 +251,7 @@ def test_serve_wrapper_enables_fp8_hidden_all_gather_only_when_requested(
 
     args = argv_path.read_text().splitlines()
     assert "--fused-rs-fp8-hidden-all-gather" in args
+    assert "--fused-rs-fp8-hidden-row-scale" in args
 
 
 def test_serve_wrapper_rejects_max_running_below_fused_moe_minimum(
