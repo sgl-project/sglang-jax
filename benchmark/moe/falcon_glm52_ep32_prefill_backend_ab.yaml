@@ -1,4 +1,4 @@
-name: operator-profile-glm52-ep32-prefill-backend-ab-p7-r2-20260824
+name: operator-profile-glm52-ep32-prefill-backend-ab-p7-r3-20260824
 exp_type: PROFILING
 artifact_type: operator-profile
 cluster_name: tpu-training-antgroup
@@ -6,7 +6,7 @@ profile: true
 priority: 0
 tags: [profile, operator-optimization, fused-moe, glm52, ep32, prefill, backend-ab, dvfs-p7]
 model_version: glm-5.2-ep32-prefill-backend-ab-p7
-config: '{"model":"glm-5.2","scope":"moe-layer","tokens":[16384,32768,65536],"ep_size":32,"physical_chips":16,"jax_devices":32,"backends":["fused_v2","fused_rs"],"timings":["pallas","compiled_call","global_blocking_wall"],"routing":"precomputed-identical","includes_gate_topk":false,"includes_shared_expert":true,"includes_output_reshard":true,"numeric_comparison":"diagnostic-only-no-gate","dvfs_p_state":7,"source_commit":"26b3181601d4d3bea63084b1abd2975924e5a98e"}'
+config: '{"model":"glm-5.2","scope":"moe-layer","tokens":[16384,32768,65536],"ep_size":32,"physical_chips":16,"jax_devices":32,"backends":["fused_v2","fused_rs"],"timings":["pallas","compiled_call","global_blocking_wall"],"routing":"precomputed-identical","includes_gate_topk":false,"includes_shared_expert":true,"includes_output_reshard":true,"pallas_task_selection":"largest_direct_name_match_per_trace","numeric_comparison":"diagnostic-only-no-gate","dvfs_p_state":7,"source_commit":"a6fc01e803a5225a0be2dfa852ee199f771cedbd"}'
 role_to_task_spec:
   worker:
     replica: 4
@@ -36,7 +36,7 @@ role_to_task_spec:
       export XLA_FLAGS="${XLA_FLAGS:+$XLA_FLAGS }$XLA_DUMP_FLAGS"
 
       cd /workspace/sglang-jax
-      expected_commit=26b3181601d4d3bea63084b1abd2975924e5a98e
+      expected_commit=a6fc01e803a5225a0be2dfa852ee199f771cedbd
       actual_commit=$(git rev-parse HEAD)
       test "$actual_commit" = "$expected_commit"
       echo "source checkout commit exact: $actual_commit"
@@ -91,6 +91,7 @@ role_to_task_spec:
               "compiled_call": "per-process jit call plus block_until_ready",
               "blocking_wall": "max process local jit call plus block_until_ready",
               "trace_capture": "one invocation per profiler session",
+              "pallas_task_selection": "largest direct-name match per trace",
               "call_minus_pallas_is_non_additive_overlap_envelope": True,
               "warmup": 2,
               "iterations": 5,
@@ -98,7 +99,7 @@ role_to_task_spec:
           "source": {
               "repo": "primatrix/sglang-jax",
               "branch": "dev/glm52-rs-ep32-prefill-ab",
-              "commit": "26b3181601d4d3bea63084b1abd2975924e5a98e",
+              "commit": "a6fc01e803a5225a0be2dfa852ee199f771cedbd",
               "delivery": "falcon-native-git-source",
           },
       }
@@ -113,6 +114,7 @@ role_to_task_spec:
         --layer-scope \
         --input-profile expert_distinct \
         --profile-breakdown \
+        --jsonl-all-processes \
         --warmup 2 \
         --iters 5 \
         --trace-root "$OUT/profiling/xprof/raw" \
@@ -131,8 +133,7 @@ role_to_task_spec:
       env | sort | grep -E '^(LIBTPU_INIT_ARGS|XLA_FLAGS|JAX_|TF_XLA_FLAGS|SGLANG_JAX_|FALCON_OPERATOR_)=' > "$OUT/runtime-env.txt" || true
       git rev-parse HEAD > "$OUT/source-commit.txt"
 
-      if [ "$FALCON_OPERATOR_RANK" = "0" ]; then
-        python3 - "$OUT/benchmark/metrics.jsonl" <<'PY'
+      python3 - "$OUT/benchmark/metrics.jsonl" <<'PY'
       import json
       import math
       import sys
@@ -146,6 +147,7 @@ role_to_task_spec:
           assert row["measurement_scope"] == "glm52_moe_layer", row
           assert row["profile_breakdown_complete"] is True, row
           assert row["numeric_comparison_is_diagnostic_only"] is True, row
+          assert row["pallas_task_sample_selection"] == "largest_direct_name_match_per_trace", row
           for field in (
               "fused_v2_kernel_samples_ms",
               "fused_v2_call_samples_ms",
@@ -161,7 +163,6 @@ role_to_task_spec:
               assert all(math.isfinite(value) and value >= 0 for value in samples)
       print("validated 3 EP32 backend A/B rows with complete timing scopes; numerics diagnostic only")
       PY
-      fi
       echo "GLM52_EP32_PREFILL_BACKEND_AB_COMPLETE rank=$FALCON_OPERATOR_RANK"
       BASH
     envs:
@@ -175,7 +176,7 @@ role_to_task_spec:
         type: git
         repo: https://github.com/primatrix/sglang-jax.git
         ref: dev/glm52-rs-ep32-prefill-ab
-        commit: 26b3181601d4d3bea63084b1abd2975924e5a98e
+        commit: a6fc01e803a5225a0be2dfa852ee199f771cedbd
         path: /workspace/sglang-jax
         auth:
           cred: sglang-jax-codex-dev-20260708
