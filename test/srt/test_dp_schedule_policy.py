@@ -148,9 +148,17 @@ def test_all_full_returns_none():
     assert _pick([], [0, 0], [0, 0], {}, prompt_len=4) is None
 
 
-def _req(input_ids, extra_key=None, lora_id=None, return_logprob=False, logprob_start_len=-1):
+def _req(
+    input_ids,
+    extra_key=None,
+    lora_id=None,
+    return_logprob=False,
+    logprob_start_len=-1,
+    radix_input_ids=None,
+):
     return SimpleNamespace(
         input_ids=input_ids,
+        radix_input_ids=input_ids if radix_input_ids is None else radix_input_ids,
         extra_key=extra_key,
         lora_id=lora_id,
         return_logprob=return_logprob,
@@ -164,9 +172,9 @@ def test_match_key_uses_reusable_prefix_not_full():
     assert match_key(_req([1, 2, 3, 4], extra_key="lora-a")) == ([1, 2, 3], "lora-a")
 
 
-def test_match_key_prefers_multimodal_cache_input_ids():
-    req = _req([1, 99, 99, 4])
-    assert match_key(req, [1, 123456, 123456, 4]) == (
+def test_match_key_uses_canonical_multimodal_radix_input_ids():
+    req = _req([1, 99, 99, 4], radix_input_ids=[1, 123456, 123456, 4])
+    assert match_key(req) == (
         [1, 123456, 123456],
         None,
     )

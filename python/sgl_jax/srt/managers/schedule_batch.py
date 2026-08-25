@@ -190,6 +190,7 @@ class Req:
         multimodal_embedding: list[list[float]] | None = None,
         deepstack_visual_embedding: list[list[float]] | None = None,
         deepstack_visual_pos_mask: list[int] | None = None,
+        radix_input_ids: list[int] | None = None,
     ):
         # Input and output info
         self.rid = rid
@@ -201,11 +202,10 @@ class Req:
             else origin_input_ids  # Before image padding
         )
         self.origin_input_ids = origin_input_ids
-
-        # Cache input IDs with hash-based values for multimodal placeholder tokens
-        # Used for radix cache matching to differentiate different images/videos
-        # If None, origin_input_ids is used for cache matching
-        self.cache_input_ids: list[int] | None = None
+        self.radix_input_ids = (
+            radix_input_ids if radix_input_ids is not None else list(origin_input_ids)
+        )
+        assert len(self.origin_input_ids) == len(self.radix_input_ids)
         # Multimodal inputs (e.g., image items and mrope positions) from tokenizer.
         self.mm_inputs: MultimodalInputs | dict | None = None
 
@@ -696,6 +696,7 @@ class Req:
     def set_finish_with_abort(self, error_msg: str):
         # set it to one token to skip the long prefill
         self.origin_input_ids = [0]
+        self.radix_input_ids = [0]
         self.grammar = None
         self.return_logprob = False
         self.to_finish = FINISH_ABORT(error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError")

@@ -87,7 +87,6 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     recurrent_admission_blocked,
 )
-from sgl_jax.srt.multimodal.common.modality_enum import build_cache_input_ids
 from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
@@ -946,8 +945,7 @@ class Scheduler(
         if not eligible:
             return None
 
-        cache_input_ids = build_cache_input_ids(req.input_ids, req.mm_inputs)
-        token_ids, extra_key = req_prefix_match_key(req, cache_input_ids)
+        token_ids, extra_key = req_prefix_match_key(req)
         matches: dict[int, int] = {}
         prompt_len = len(token_ids) if token_ids else 0
         if token_ids:
@@ -1313,6 +1311,7 @@ class Scheduler(
             recv_req.text,
             recv_req.input_ids,
             recv_req.sampling_params,
+            radix_input_ids=recv_req.radix_input_ids,
             return_logprob=recv_req.return_logprob,
             return_output_logprob_only=recv_req.return_output_logprob_only,
             top_logprobs_num=recv_req.top_logprobs_num,
@@ -1348,7 +1347,6 @@ class Scheduler(
                 req.deepstack_visual_embedding = _extract_mm_value(
                     recv_req.mm_inputs, "deepstack_visual_embedding"
                 )
-            req.cache_input_ids = build_cache_input_ids(req.origin_input_ids, req.mm_inputs)
         # Validate prompt length
         error_msg = validate_input_length(
             req,

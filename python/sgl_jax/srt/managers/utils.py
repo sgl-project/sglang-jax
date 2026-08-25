@@ -23,6 +23,7 @@ def validate_input_length(
     Returns:
         Error message if validation fails, None if successful
     """
+    assert len(req.origin_input_ids) == len(req.radix_input_ids)
     if len(req.origin_input_ids) >= max_req_input_len:
         if allow_auto_truncate:
             logger.warning(
@@ -31,6 +32,8 @@ def validate_input_length(
                 max_req_input_len,
             )
             req.origin_input_ids = req.origin_input_ids[:max_req_input_len]
+            req.radix_input_ids = req.radix_input_ids[:max_req_input_len]
+            assert len(req.origin_input_ids) == len(req.radix_input_ids)
             return None
         else:
             error_msg = (

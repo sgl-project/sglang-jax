@@ -569,6 +569,7 @@ class MockRequest:
     ):
         self.req_pool_idx = req_pool_idx
         self.origin_input_ids = origin_input_ids
+        self.radix_input_ids = list(origin_input_ids)
         self.output_ids = output_ids
         self.fill_ids = fill_ids
         self.prefix_indices = prefix_indices

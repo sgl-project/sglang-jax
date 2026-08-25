@@ -409,3 +409,14 @@ def build_cache_input_ids(
         return None
     padded_ids = pad_input_tokens(input_ids, mm_inputs.mm_items)
     return padded_ids if padded_ids != input_ids else None
+
+
+def build_radix_input_ids(
+    input_ids: list[int],
+    mm_inputs: MultimodalInputs | dict | None,
+) -> list[int]:
+    """Build the canonical token identity used by every radix-cache operation."""
+    cache_input_ids = build_cache_input_ids(input_ids, mm_inputs)
+    radix_input_ids = cache_input_ids if cache_input_ids is not None else list(input_ids)
+    assert len(radix_input_ids) == len(input_ids)
+    return radix_input_ids

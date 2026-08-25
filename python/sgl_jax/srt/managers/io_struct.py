@@ -10,6 +10,7 @@ import numpy as np
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason
 from sgl_jax.srt.multimodal.common.modality_enum import (
     MultimodalInputs,
+    build_radix_input_ids,
     flatten_nested_list,
 )
 
@@ -143,6 +144,9 @@ class TokenizedGenerateReqInput:
     text: list[str] | str | None = None
     # The token ids for text; one can specify either text or input_ids
     input_ids: list[list[int]] | list[int] | None = None
+    # Canonical radix-cache identity. This equals input_ids for text requests
+    # and contains hash-substituted multimodal placeholder IDs otherwise.
+    radix_input_ids: list[list[int]] | list[int] = field(default_factory=list)
     # The sampling_params. See descriptions below.
     sampling_params: list[dict] | dict | None = None
     # Whether to return logprobs.
@@ -180,6 +184,23 @@ class TokenizedGenerateReqInput:
     # to ``rid``; callers that may reuse ``rid`` across retries should
     # provide a per-attempt value to isolate late acks.
     disagg_transfer_id: str | None = None
+
+    def __post_init__(self):
+        if not self.radix_input_ids and self.input_ids:
+            if isinstance(self.input_ids[0], int):
+                self.radix_input_ids = build_radix_input_ids(self.input_ids, self.mm_inputs)
+            else:
+                # Batched requests are expanded before scheduling. Preserve a
+                # canonical copy until then rather than aliasing model IDs.
+                self.radix_input_ids = copy.deepcopy(self.input_ids)
+
+        if (
+            self.input_ids
+            and isinstance(self.input_ids[0], int)
+            and self.radix_input_ids
+            and isinstance(self.radix_input_ids[0], int)
+        ):
+            assert len(self.input_ids) == len(self.radix_input_ids)
 
 
 @dataclass

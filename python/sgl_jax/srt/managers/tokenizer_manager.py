@@ -66,6 +66,7 @@ from sgl_jax.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
+from sgl_jax.srt.multimodal.common.modality_enum import build_radix_input_ids
 from sgl_jax.srt.multimodal.manager.multimodal_processor import (
     get_mm_processor_cls,
     import_processors,
@@ -433,6 +434,7 @@ class TokenizerManager:
             rid=obj.rid,
             text=input_text,
             input_ids=input_ids,
+            radix_input_ids=build_radix_input_ids(input_ids, mm_inputs),
             sampling_params=sampling_params,
             return_logprob=obj.return_logprob,
             return_output_logprob_only=obj.return_output_logprob_only,

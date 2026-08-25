@@ -8,14 +8,14 @@ from sgl_jax.srt.multimodal.common.modality_enum import (
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
-    build_cache_input_ids,
+    build_radix_input_ids,
 )
 from sgl_jax.srt.multimodal.processors.qwen_vl import QwenVLProcessor
 
 IMAGE_TOKEN = 151655
 
 
-def test_build_cache_input_ids_uses_item_hash():
+def test_build_radix_input_ids():
     input_ids = [1, IMAGE_TOKEN, IMAGE_TOKEN, 2]
     item = MultimodalDataItem(
         modality=Modality.IMAGE,
@@ -23,13 +23,14 @@ def test_build_cache_input_ids_uses_item_hash():
         placeholder_ranges=[(1, 3)],
     )
 
-    assert build_cache_input_ids(input_ids, MultimodalInputs([item])) == [
+    assert build_radix_input_ids(input_ids, MultimodalInputs([item])) == [
         1,
         123456,
         123456,
         2,
     ]
     assert input_ids == [1, IMAGE_TOKEN, IMAGE_TOKEN, 2]
+    assert build_radix_input_ids([1, 2], None) == [1, 2]
 
 
 def test_qwen_vl_rejects_audio_inputs():

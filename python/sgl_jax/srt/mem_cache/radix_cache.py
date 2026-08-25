@@ -58,16 +58,9 @@ class RadixKey:
 
 
 def build_radix_key(req: Req, key_len: int) -> RadixKey:
-    """Build a request key from text tokens and multimodal identities."""
-    cache_input_ids = getattr(req, "cache_input_ids", None)
-    if cache_input_ids is not None:
-        key_sequence = cache_input_ids + req.output_ids if req.output_ids else cache_input_ids
-    else:
-        key_sequence = req.fill_ids
-        if len(key_sequence) < key_len:
-            key_sequence = (
-                req.origin_input_ids + req.output_ids if req.output_ids else req.origin_input_ids
-            )
+    """Build a request key from its canonical radix-cache identity."""
+    assert len(req.radix_input_ids) == len(req.origin_input_ids)
+    key_sequence = req.radix_input_ids + req.output_ids if req.output_ids else req.radix_input_ids
     return RadixKey(key_sequence[:key_len], req.extra_key, req.dp_rank)
 
 

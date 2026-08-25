@@ -175,20 +175,9 @@ def _write_temp_video(payload: bytes) -> str:
         return tmp.name
 
 
-def _unwrap_source(source):
-    if isinstance(source, dict) and "url" in source:
-        return source["url"]
-    if hasattr(source, "url"):
-        return source.url
-    return source
-
-
 def preprocess_video(source, video_config: dict) -> np.ndarray:
     if isinstance(source, np.ndarray):
         return _resize_video_frames(source, video_config)
-
-    source = _unwrap_source(source)
-
     from decord import VideoReader, cpu
 
     tmp_path = None
@@ -509,7 +498,7 @@ class QwenVLProcessor(BaseMultimodalProcessor):
     async def _load_videos_async(self, video_data, video_config):
         return await asyncio.gather(
             *(
-                asyncio.to_thread(preprocess_video, item, video_config)
+                asyncio.to_thread(preprocess_video, self.unwrap_source(item), video_config)
                 for item in self.normalize_data(video_data)
             )
         )

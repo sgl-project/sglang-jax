@@ -1231,7 +1231,7 @@ class TestSWARadixCache(CustomTestCase):
 
         self._verify_size_consistency_for(cache, "after simulated cache_unfinished_req")
 
-    def test_request_cache_paths_use_cache_input_ids_with_pages(self):
+    def test_request_cache_paths_use_radix_input_ids_with_pages(self):
         token_ids = list(range(1, 9))
         for finished, req_pool_idx in ((False, 0), (True, 1)):
             cache = SWARadixCache(
@@ -1241,7 +1241,7 @@ class TestSWARadixCache(CustomTestCase):
                 page_size=4,
                 disable=False,
             )
-            cache_input_ids = list(
+            radix_input_ids = list(
                 range(
                     -301 - req_pool_idx * len(token_ids), -309 - req_pool_idx * len(token_ids), -1
                 )
@@ -1251,9 +1251,9 @@ class TestSWARadixCache(CustomTestCase):
             req = SimpleNamespace(
                 req_pool_idx=req_pool_idx,
                 origin_input_ids=token_ids,
+                radix_input_ids=radix_input_ids,
                 output_ids=[],
                 fill_ids=token_ids,
-                cache_input_ids=cache_input_ids,
                 prefix_indices=np.empty((0,), dtype=np.int32),
                 last_node=cache.root_node,
                 extra_key=None,
@@ -1273,7 +1273,7 @@ class TestSWARadixCache(CustomTestCase):
             self.assertEqual(
                 len(
                     cache.match_prefix(
-                        MatchPrefixParams(key=RadixKey(cache_input_ids))
+                        MatchPrefixParams(key=RadixKey(radix_input_ids))
                     ).device_indices
                 ),
                 len(token_ids),
