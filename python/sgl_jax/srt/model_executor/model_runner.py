@@ -76,13 +76,10 @@ def _embedding_pool_bytes(
         and not is_draft_worker
         and not server_args.multimodal
         and not server_args.enable_lora
-        and server_args.disaggregation_mode != "decode"
     )
-    if not enabled or server_args.mm_embedding_cache_size_mb == 0:
+    if not enabled:
         return 0
-    if server_args.mm_embedding_cache_size_mb is not None:
-        return server_args.mm_embedding_cache_size_mb * 1024**2
-    page_size = server_args.mm_embedding_page_size
+    page_size = server_args.page_size
     capacity = -(-server_args.max_prefill_tokens // page_size) * page_size
     packed_hidden = _packed_embedding_hidden(model_config, multimodal_model)
     return capacity * packed_hidden * jnp.dtype(model_config.dtype).itemsize
@@ -242,7 +239,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         """
         if not self.embedding_pool_bytes:
             return
-        page_size = self.server_args.mm_embedding_page_size
+        page_size = self.server_args.page_size
         packed_hidden = _packed_embedding_hidden(self.model_config, self.model)
         per_page = page_size * packed_hidden * jnp.dtype(self.dtype).itemsize
         num_pages = int(self.embedding_pool_bytes // per_page)

@@ -261,8 +261,8 @@ class ServerArgs:
     # Multimodal
     multimodal: bool = False
     limit_mm_data_per_request: dict[str, int] | None = None
-    mm_embedding_cache_size_mb: int | None = None
-    mm_embedding_page_size: int = 64
+    mm_io_worker_num: int = 0
+    mm_processor_worker_num: int = 0
 
     enable_return_routed_experts: bool = False
     enable_expert_balance_debug: bool = False
@@ -547,10 +547,10 @@ class ServerArgs:
             self.model_path = download_from_hf(self.model_path, allow_patterns=None)
             if self.limit_mm_data_per_request is None:
                 self.limit_mm_data_per_request = {"image": 16}
-        if self.mm_embedding_cache_size_mb is not None and self.mm_embedding_cache_size_mb < 0:
-            raise ValueError("--mm-embedding-cache-size-mb must be non-negative")
-        if self.mm_embedding_page_size <= 0:
-            raise ValueError("--mm-embedding-page-size must be positive")
+        if self.mm_io_worker_num < 0:
+            raise ValueError("--mm-io-worker-num must be non-negative")
+        if self.mm_processor_worker_num < 0:
+            raise ValueError("--mm-processor-worker-num must be non-negative")
 
         if self.ep_num_redundant_experts < 0:
             raise ValueError("ep_num_redundant_experts must be non-negative")
@@ -1641,17 +1641,16 @@ class ServerArgs:
             help="JSON object that limits the number of multimodal items per request, e.g. '{\"image\": 16}'.",
         )
         parser.add_argument(
-            "--mm-embedding-cache-size-mb",
+            "--mm-io-worker-num",
             type=int,
-            default=ServerArgs.mm_embedding_cache_size_mb,
-            help="Per-device multimodal embedding cache budget in MiB. By default, "
-            "it holds max-prefill-tokens embeddings; 0 disables it.",
+            default=ServerArgs.mm_io_worker_num,
+            help="Number of multimodal data loading workers. 0 uses the model default.",
         )
         parser.add_argument(
-            "--mm-embedding-page-size",
+            "--mm-processor-worker-num",
             type=int,
-            default=ServerArgs.mm_embedding_page_size,
-            help="Token-block (page) size for the multimodal embedding pool.",
+            default=ServerArgs.mm_processor_worker_num,
+            help="Number of multimodal processor workers. 0 uses the model default.",
         )
 
         # LoRA
