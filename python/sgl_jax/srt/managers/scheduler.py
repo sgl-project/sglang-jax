@@ -58,6 +58,7 @@ from sgl_jax.srt.managers.schedule_batch import (
     FINISH_ABORT,
     Req,
     ScheduleBatch,
+    _extract_mm_value,
     acc_global_bid,
     global_server_args_dict,
 )
@@ -86,6 +87,7 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     recurrent_admission_blocked,
 )
+from sgl_jax.srt.multimodal.common.modality_enum import build_cache_input_ids
 from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
@@ -944,7 +946,8 @@ class Scheduler(
         if not eligible:
             return None
 
-        token_ids, extra_key = req_prefix_match_key(req)
+        cache_input_ids = build_cache_input_ids(req.input_ids, req.mm_inputs)
+        token_ids, extra_key = req_prefix_match_key(req, cache_input_ids)
         matches: dict[int, int] = {}
         prompt_len = len(token_ids) if token_ids else 0
         if token_ids:
@@ -1332,17 +1335,20 @@ class Scheduler(
         req.disagg_transfer_id = recv_req.disagg_transfer_id or req.rid
         if hasattr(recv_req, "mm_inputs") and recv_req.mm_inputs:
             req.mm_inputs = recv_req.mm_inputs
-            multimodal_embedding = recv_req.mm_inputs.get("multimodal_embedding")
+            multimodal_embedding = _extract_mm_value(recv_req.mm_inputs, "multimodal_embedding")
             req.multimodal_embedding = multimodal_embedding
             if (
-                recv_req.mm_inputs.get("deepstack_visual_pos_mask") is not None
-                and recv_req.mm_inputs.get("deepstack_visual_embedding") is not None
+                _extract_mm_value(recv_req.mm_inputs, "deepstack_visual_pos_mask") is not None
+                and _extract_mm_value(recv_req.mm_inputs, "deepstack_visual_embedding") is not None
             ):
                 req.apply_for_deepstack = True
-                req.deepstack_visual_pos_mask = recv_req.mm_inputs.get("deepstack_visual_pos_mask")
-                req.deepstack_visual_embedding = recv_req.mm_inputs.get(
-                    "deepstack_visual_embedding"
+                req.deepstack_visual_pos_mask = _extract_mm_value(
+                    recv_req.mm_inputs, "deepstack_visual_pos_mask"
                 )
+                req.deepstack_visual_embedding = _extract_mm_value(
+                    recv_req.mm_inputs, "deepstack_visual_embedding"
+                )
+            req.cache_input_ids = build_cache_input_ids(req.origin_input_ids, req.mm_inputs)
         # Validate prompt length
         error_msg = validate_input_length(
             req,

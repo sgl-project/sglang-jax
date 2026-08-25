@@ -231,6 +231,7 @@ class ServerArgs:
 
     # Multimodal
     multimodal: bool = False
+    limit_mm_data_per_request: dict[str, int] | None = None
 
     enable_return_routed_experts: bool = False
     enable_expert_balance_debug: bool = False
@@ -1561,6 +1562,13 @@ class ServerArgs:
             "--multimodal",
             action="store_true",
             help="Enable multimodal HTTP server.",
+        )
+        parser.add_argument(
+            "--limit-mm-data-per-request",
+            type=json.loads,
+            default=ServerArgs.limit_mm_data_per_request,
+            help="JSON object that limits multimodal items per request, "
+            "for example '{\"image\": 16}'.",
         )
 
         # LoRA
