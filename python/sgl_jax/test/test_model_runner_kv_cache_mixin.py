@@ -76,16 +76,12 @@ def test_embedding_pool_bytes_only_for_in_model_prefill():
         hf_config=types.SimpleNamespace(architectures=["Qwen2_5_VLForConditionalGeneration"]),
     )
     args = types.SimpleNamespace(
-        mm_embedding_cache_size_mb=None,
-        mm_embedding_page_size=64,
+        page_size=64,
         max_prefill_tokens=100,
         multimodal=False,
         enable_lora=False,
-        disaggregation_mode="null",
     )
     assert _embedding_pool_bytes(config, args) == 128 * 8 * 2
-    args.mm_embedding_cache_size_mb = 128
-    assert _embedding_pool_bytes(config, args) == 128 * 1024**2
     args.multimodal = True
     assert _embedding_pool_bytes(config, args) == 0
 
@@ -103,12 +99,10 @@ def test_deepstack_embedding_pool_uses_packed_feature_width():
         hf_config=types.SimpleNamespace(architectures=["Qwen2_5_VLForConditionalGeneration"]),
     )
     args = types.SimpleNamespace(
-        mm_embedding_cache_size_mb=None,
-        mm_embedding_page_size=64,
+        page_size=64,
         max_prefill_tokens=100,
         multimodal=False,
         enable_lora=False,
-        disaggregation_mode="null",
     )
     model = types.SimpleNamespace(deepstack_visual_layers=3)
     budget = _embedding_pool_bytes(config, args, multimodal_model=model)
@@ -130,7 +124,7 @@ def test_deepstack_embedding_pool_uses_packed_feature_width():
     assert runner.embedding_pool.pages.shape == (2, 64, 32)
 
 
-def test_explicit_embedding_pool_budget_stays_fixed_for_deepstack():
+def test_embedding_pool_capacity_and_pages_follow_lm_limits():
     from sgl_jax.srt.model_executor.model_runner import (
         ModelRunner,
         _embedding_pool_bytes,
@@ -143,16 +137,14 @@ def test_explicit_embedding_pool_budget_stays_fixed_for_deepstack():
         hf_config=types.SimpleNamespace(architectures=["Qwen2_5_VLForConditionalGeneration"]),
     )
     args = types.SimpleNamespace(
-        mm_embedding_cache_size_mb=1,
-        mm_embedding_page_size=64,
-        max_prefill_tokens=100,
+        page_size=128,
+        max_prefill_tokens=129,
         multimodal=False,
         enable_lora=False,
-        disaggregation_mode="null",
     )
     model = types.SimpleNamespace(deepstack_visual_layers=3)
     budget = _embedding_pool_bytes(config, args, multimodal_model=model)
-    assert budget == 1024**2
+    assert budget == 256 * 32 * 2
 
     runner = types.SimpleNamespace(
         embedding_pool_bytes=budget,
@@ -166,4 +158,5 @@ def test_explicit_embedding_pool_budget_stays_fixed_for_deepstack():
     ModelRunner._build_embedding_pool(runner)
 
     assert runner.embedding_pool.hidden == 32
-    assert runner.embedding_pool.num_pages == 256
+    assert runner.embedding_pool.page_size == 128
+    assert runner.embedding_pool.num_pages == 2

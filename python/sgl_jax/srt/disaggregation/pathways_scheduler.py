@@ -124,7 +124,6 @@ class PathwaysPDSchedulerMixin:
         d_args = copy.deepcopy(server_args)
         d_args.mem_fraction_static = server_args.pd_decode_mem_fraction
         d_args.disable_radix_cache = True
-        d_args.mm_embedding_cache_size_mb = 0
 
         n_p = self._pd_n_prefill
         p_meshes = self.p_meshes

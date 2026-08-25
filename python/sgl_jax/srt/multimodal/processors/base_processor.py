@@ -2,6 +2,7 @@ import asyncio
 import base64
 import concurrent.futures
 import io
+import logging
 import os
 from abc import ABC, abstractmethod
 from urllib.parse import unquote, urlparse
@@ -11,16 +12,14 @@ import requests
 from PIL import Image
 
 from sgl_jax.srt.multimodal.common.modality_enum import MultimodalInputs
+from sgl_jax.srt.multimodal.processors.executor import MultimodalProcessorExecutor
+
+logger = logging.getLogger(__name__)
 
 # Safety limits for fetching remote multimodal payloads. These are intentionally
 # conservative and should become configurable via ServerArgs.
 DEFAULT_HTTP_TIMEOUT_SECS = 30
 MAX_REMOTE_BYTES = 64 * 1024 * 1024  # 64 MiB hard cap per asset
-
-IMAGE_IO_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=8,
-    thread_name_prefix="image-data-executor",
-)
 
 
 def fetch_remote_bytes(url: str) -> bytes:
@@ -65,11 +64,53 @@ def _normalize_image_source(source) -> bytes | str:
 
 class BaseMultimodalProcessor(ABC):
     models: tuple[str, ...] = ()
+    auto_mm_io_worker_num = 4
+    auto_mm_processor_worker_num = 1
+    supports_mm_processor_concurrency = False
 
     def __init__(self, hf_config, server_args, processor):
         self.hf_config = hf_config
         self.server_args = server_args
         self.processor = processor
+        self._shutdown = False
+
+        requested_io_workers = getattr(server_args, "mm_io_worker_num", 0)
+        env_io_workers = os.environ.get("SGLANG_IO_WORKERS")
+        self.mm_io_worker_num = (
+            requested_io_workers
+            or (int(env_io_workers) if env_io_workers is not None else 0)
+            or self.auto_mm_io_worker_num
+        )
+        if self.mm_io_worker_num <= 0:
+            raise ValueError("Multimodal I/O worker count must be positive.")
+        self.io_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.mm_io_worker_num,
+            thread_name_prefix="sgl-jax-mm-io",
+        )
+
+        self.mm_processor_worker_num = (
+            getattr(server_args, "mm_processor_worker_num", 0) or self.auto_mm_processor_worker_num
+        )
+        if self.mm_processor_worker_num <= 0:
+            raise ValueError("Multimodal processor worker count must be positive.")
+        if self.mm_processor_worker_num > 1 and not self.supports_mm_processor_concurrency:
+            logger.warning(
+                "%s does not support concurrent multimodal processing; using one worker.",
+                type(self).__name__,
+            )
+            self.mm_processor_worker_num = 1
+        try:
+            self.mm_processor_executor = MultimodalProcessorExecutor(
+                processor, self.mm_processor_worker_num
+            )
+        except Exception:
+            logger.warning(
+                "Unable to clone %s processor; using one worker.",
+                type(self).__name__,
+                exc_info=True,
+            )
+            self.mm_processor_worker_num = 1
+            self.mm_processor_executor = MultimodalProcessorExecutor(processor, 1)
 
     def apply_chat_template(self, *args, **kwargs):
         return self.processor.apply_chat_template(*args, **kwargs)
@@ -112,7 +153,123 @@ class BaseMultimodalProcessor(ABC):
             return Image.open(io.BytesIO(payload)).convert("RGB")
         return Image.open(payload).convert("RGB")
 
-    @classmethod
-    async def load_image_async(cls, source) -> Image.Image:
-        future = IMAGE_IO_EXECUTOR.submit(cls.load_image, source)
-        return await asyncio.wrap_future(future)
+    async def _run_io_async(self, function, *args):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self.io_executor, function, *args)
+
+    async def load_image_async(self, source) -> Image.Image:
+        return await self._run_io_async(self.load_image, source)
+
+    async def load_images_async(self, image_sources: list) -> list[Image.Image]:
+        return await asyncio.gather(*(self.load_image_async(source) for source in image_sources))
+
+    @staticmethod
+    def _to_numpy(value):
+        if value is None:
+            return None
+        if hasattr(value, "detach"):
+            value = value.detach().cpu()
+            # NumPy has no portable bfloat16 representation. Multimodal
+            # features are host-side inputs, so use float32 for interchange.
+            if str(getattr(value, "dtype", "")) == "torch.bfloat16":
+                value = value.float()
+            value = value.numpy()
+        return np.asarray(value)
+
+    def process_mm_data(
+        self,
+        input_text: str,
+        images: list | None = None,
+        videos: list | None = None,
+        audios: list | None = None,
+        *,
+        processor,
+        **kwargs,
+    ):
+        """Run the Hugging Face processor synchronously.
+
+        This mirrors upstream SGLang's processor layering. Callers should use
+        ``process_and_combine_mm_data_async`` so this CPU work runs in the
+        isolated multimodal processor executor.
+        """
+        processor_inputs = {
+            "text": [input_text],
+            "images": images or None,
+            "padding": True,
+            "return_tensors": "pt",
+            **kwargs,
+        }
+        if videos is not None:
+            processor_inputs["videos"] = videos or None
+        if audios is not None:
+            processor_inputs["audios"] = audios or None
+        return processor(**processor_inputs)
+
+    def collect_mm_items_from_processor_output(
+        self,
+        processor_output,
+        images: list | None = None,
+        videos: list | None = None,
+        audios: list | None = None,
+        **kwargs,
+    ) -> MultimodalInputs:
+        """Convert one HF processor output into the runtime MM contract.
+
+        Model adapters override this hook when their feature layout or token
+        metadata is model-specific. The default handles text-only output.
+        """
+        del images, videos, audios, kwargs
+        input_ids = self._to_numpy(processor_output.get("input_ids"))
+        if input_ids is None:
+            raise ValueError("HF multimodal processor did not return input_ids.")
+        return MultimodalInputs(mm_items=[], input_ids=input_ids.reshape(-1).tolist())
+
+    def process_and_combine_mm_data(
+        self,
+        input_text: str,
+        images: list | None = None,
+        videos: list | None = None,
+        audios: list | None = None,
+        *,
+        processor,
+        **processor_kwargs,
+    ) -> MultimodalInputs:
+        processor_output = self.process_mm_data(
+            input_text,
+            images=images,
+            videos=videos,
+            audios=audios,
+            processor=processor,
+            **processor_kwargs,
+        )
+        return self.collect_mm_items_from_processor_output(
+            processor_output,
+            images=images,
+            videos=videos,
+            audios=audios,
+        )
+
+    async def process_and_combine_mm_data_async(
+        self,
+        input_text: str,
+        images: list | None = None,
+        videos: list | None = None,
+        audios: list | None = None,
+        **processor_kwargs,
+    ) -> MultimodalInputs:
+        """Run HF processing and output collection outside the event loop."""
+        return await self.mm_processor_executor.run(
+            self.process_and_combine_mm_data,
+            input_text,
+            images,
+            videos,
+            audios,
+            **processor_kwargs,
+        )
+
+    def shutdown(self) -> None:
+        if self._shutdown:
+            return
+        self._shutdown = True
+        self.io_executor.shutdown(wait=False, cancel_futures=True)
+        self.mm_processor_executor.shutdown()
