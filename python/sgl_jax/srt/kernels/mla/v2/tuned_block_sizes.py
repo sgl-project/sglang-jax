@@ -139,6 +139,26 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 512): (8, 128),
         ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 1024): (8, 128),
         ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 2048): (8, 128),
+        # ===== GLM-5.2 (tp16: 4 q-heads/shard, kv_lora=512, page=128) =====
+        # decode from the DSv3 page-128 family; mixed uses 16-row blocks (bf16
+        # tiling needs 16-row alignment at 4 heads/shard; 8-row blocks and the
+        # hardcoded fallback both fail Mosaic window setup at mnt>=256).
+        # Full mnt bucket coverage pending a tuner sweep.
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 1): (16, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 8): (16, 1, 2),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 1): (16, 64),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 2): (16, 64),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 4): (16, 64),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 8): (16, 64),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 16): (16, 64),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 32): (16, 64),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 64): (16, 64),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 128): (16, 64),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 256): (16, 128),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 512): (16, 128),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 1024): (16, 128),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 2048): (16, 128),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 4096): (16, 128),
         # ===== GLM-5.1 (TP=32) configurations on TPU v7 =====
         # Decode & Mixed tuned for q_head_num=2 (TP=32 sharding)
         ("decode", "bfloat16", "bfloat16", 2, 512, 64, 64, 1): (16, 1, 4),

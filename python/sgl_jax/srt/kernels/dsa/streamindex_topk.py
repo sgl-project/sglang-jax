@@ -508,9 +508,13 @@ def _scores_kernel(
 
             assert bkv_p == 128, "page mode requires bkv_p == 128 (one lane row per block)"
 
-            # Acquire the output buffer up-front: each bkv block stores its
-            # pooled lane-row [rows, 128] at sublane index bkv_idx; untouched
-            # trailing blocks stay -inf.
+            # Acquire the output buffer up-front: wait_send_scores waits on the
+            # DMA issued for this buffer TWO bq iterations ago (buffers
+            # alternate), so the -inf fill below can never race an in-flight
+            # read. Each bkv block then stores its pooled lane-row [rows, 128]
+            # at sublane index bkv_idx; untouched trailing blocks (dynamic
+            # num_bkv < num_bkv_max, which only sizes the output layout) stay
+            # -inf and are masked to -1 after top_k.
             bo_sem_idx = sem_ids_ref[2]
             wait_send_scores(bo_sem_idx)
             scores_block_x2_ref[bo_sem_idx, ...] = jnp.full(
@@ -962,7 +966,12 @@ def streamindex_page_topk(
     _, page_size_per_kv_packing, kv_packing, _ = cache_kv.shape
     page_size = page_size_per_kv_packing * kv_packing
     pages_per_seq = page_indices.shape[0] // max_num_seqs
-    assert page_size % compression_ratio == 0
+    if compression_ratio != 1:
+        raise NotImplementedError(
+            "page mode is validated for compression_ratio=1 only (GLM); the"
+            " compressed causal bound interacts with page pooling and needs its"
+            " own parity gate before enabling."
+        )
 
     bkv_p = num_kv_pages_per_block
     if bkv_p != 128:

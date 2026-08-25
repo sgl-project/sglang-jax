@@ -535,6 +535,11 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             cache3d = cache_.reshape(cache_.shape[0], page_size, idx_dim)
             cache3d = _scatter_paged(cache3d, k_, seq_lens_, pi_, cuq_, cukv_, pages_per_seq)
             if _INDEXER_KERNEL_PREFILL:
+                # dist_[2] == number of real (seq_len > 0) sequences in this
+                # EXTEND batch: mla_backend builds distribution = [0, 0, N] for
+                # ForwardMode.EXTEND (decode runs as a separate forward), so the
+                # kernel's per-seq grid over [0, N) matches the ref's masked
+                # full-batch loop exactly; padded seqs stay -1 on both paths.
                 topk_pages = streamindex_page_topk(
                     q_,
                     w_,
