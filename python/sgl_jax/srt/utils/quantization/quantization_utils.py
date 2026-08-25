@@ -96,18 +96,12 @@ def apply_linear_quantization(
     from sgl_jax.srt.layers.linear import LinearBase, QuantizedLinear
 
     quant_config = model_config.quantization_config
-    if quant_config is None:
-        raise ValueError(
-            "apply_linear_quantization called but model_config.quantization_config is None. "
-            "Ensure --quantization-config-path is set."
-        )
+    if quant_config is None or not quant_config.has_linear_quantization():
+        return model
 
     linear_rules = quant_config.get_linear_rules()
     if not linear_rules:
-        raise ValueError(
-            "No linear rules found in quantization config. "
-            "Check your quantization config YAML file."
-        )
+        return model
 
     # Compile regex patterns from rules
     compiled_rules = []
@@ -173,9 +167,14 @@ def apply_linear_quantization(
                 if isinstance(attr_value, LinearBase):
                     # Check if this path matches any rule
                     dot_path = child_path.replace("/", ".")
+                    path_parts = dot_path.replace("[", ".").replace("]", "").split(".")
                     if any(
-                        dot_path == ignored or dot_path.endswith(f".{ignored}")
-                        for ignored in ignored_layers
+                        ig in path_parts
+                        or dot_path == ig
+                        or dot_path.endswith(f".{ig}")
+                        or f".{ig}." in dot_path
+                        or dot_path.startswith(f"{ig}.")
+                        for ig in ignored_layers
                     ):
                         logger.info("Skipping %s - in ignored_layers", dot_path)
                         continue
@@ -273,6 +272,10 @@ def apply_moe_quantization(
                 logger.info("Skipping MoE quantization for %s (matched ignored_layers)", log_path)
                 return
             logger.debug("Quantizing MoE weights path=%s", log_path)
+            if hasattr(obj, "quantized_dtype") and obj.quantized_dtype is None:
+                obj.quantized_dtype = quant_config.get_moe_weight_dtype()
+                obj.activation_quantized_dtype = quant_config.get_moe_activation_dtype()
+                obj.weight_block_size = getattr(quant_config, "weight_block_size", None)
             obj.quantize_weights(is_static=is_static_input)
             return
 

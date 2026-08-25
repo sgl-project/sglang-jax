@@ -15,6 +15,8 @@ import yaml
 # Map string dtype names to JAX numpy dtypes
 DTYPE_MAP = {
     "int8": jnp.int8,
+    "int4": getattr(jnp, "int4", None),
+    "uint4": getattr(jnp, "uint4", None),
     "float8_e4m3fn": jnp.float8_e4m3fn,
     "float8_e5m2": jnp.float8_e5m2,
     "bfloat16": jnp.bfloat16,

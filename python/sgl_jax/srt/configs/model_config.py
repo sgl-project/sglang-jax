@@ -537,6 +537,34 @@ class ModelConfig:
                         weight_block_size=weight_block_size,
                     )
                     return quant_config
+                elif format_type == "pack-quantized":
+                    logger.info(
+                        "Auto-detected compressed-tensors INT4 pack-quantized model. "
+                        "Creating QuantizationConfig for static int4."
+                    )
+                    weight_block_size = None
+                    if "config_groups" in hf_quant_config and isinstance(
+                        hf_quant_config["config_groups"], dict
+                    ):
+                        for group in hf_quant_config["config_groups"].values():
+                            weights_cfg = group.get("weights") if isinstance(group, dict) else None
+                            if not weights_cfg:
+                                continue
+                            group_size = weights_cfg.get("group_size")
+                            if group_size is not None:
+                                weight_block_size = (int(group_size), int(group_size))
+                            break
+
+                    ignored_layers = hf_quant_config.get("ignore") or []
+                    quant_config = QuantizationConfig(
+                        is_static_checkpoint=True,
+                        linear_rules=[],
+                        moe_weight_dtype=getattr(jnp, "int4", None),
+                        moe_activation_dtype=None,
+                        ignored_layers=list(ignored_layers),
+                        weight_block_size=weight_block_size,
+                    )
+                    return quant_config
                 else:
                     logger.warning(
                         "compressed-tensors format '%s' is not yet supported. "
