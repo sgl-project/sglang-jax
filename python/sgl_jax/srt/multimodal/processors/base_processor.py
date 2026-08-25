@@ -23,7 +23,7 @@ IMAGE_IO_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
 )
 
 
-def _fetch_url(url: str) -> bytes:
+def fetch_remote_bytes(url: str) -> bytes:
     with requests.get(url, timeout=DEFAULT_HTTP_TIMEOUT_SECS, stream=True) as response:
         response.raise_for_status()
         content_length = response.headers.get("Content-Length")
@@ -53,7 +53,7 @@ def _normalize_image_source(source) -> bytes | str:
     if not isinstance(source, str):
         raise ValueError(f"Unsupported image source: {type(source)}")
     if source.startswith(("http://", "https://")):
-        return _fetch_url(source)
+        return fetch_remote_bytes(source)
     if source.startswith("file://"):
         return unquote(urlparse(source).path)
     if source.startswith("data:"):

@@ -419,6 +419,12 @@ class GenerateReqInput:
                 self.input_ids = [self.input_ids]
             if self.input_embeds is not None:
                 self.input_embeds = [self.input_embeds]
+            if self.image_data is not None:
+                self.image_data = [self.image_data]
+            if self.video_data is not None:
+                self.video_data = [self.video_data]
+            if self.audio_data is not None:
+                self.audio_data = [self.audio_data]
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""

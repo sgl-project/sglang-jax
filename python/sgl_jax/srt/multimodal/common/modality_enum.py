@@ -76,17 +76,45 @@ def tensor_hash(tensor_list: Any) -> int:
 def pad_input_tokens(
     input_ids: list[int],
     mm_items: list["MultimodalDataItem"],
+    im_token_id: int | None = None,
+    video_token_id: int | None = None,
+    audio_token_id: int | None = None,
 ) -> list[int]:
-    """Replace placeholder ranges with per-item Radix identity tokens."""
+    """Replace multimodal placeholders with per-item Radix identity tokens.
+
+    New processors provide exact placeholder ranges. Legacy processors only
+    provide one token ID per modality, so retain token-based replacement as a
+    fallback for items without ranges.
+    """
     if not input_ids or not mm_items:
         return input_ids
+
     padded_ids = list(input_ids)
+    fallback_pad_values: dict[int, int] = {}
     for item in mm_items:
         if item.pad_value is None:
             item.set_pad_value()
         if item.placeholder_ranges is not None:
             for start, end in item.placeholder_ranges:
                 padded_ids[start:end] = [item.pad_value] * (end - start)  # type: ignore[list-item]
+            continue
+
+        token_id = None
+        if item.is_image():
+            token_id = im_token_id
+        elif item.is_video():
+            token_id = video_token_id
+        elif item.is_audio():
+            token_id = audio_token_id
+        if token_id is not None and item.pad_value is not None:
+            # Match the legacy behavior: one multimodal item may contain all
+            # payloads of a modality, so its identity covers every matching
+            # placeholder token.
+            fallback_pad_values.setdefault(token_id, item.pad_value)
+
+    for index, token_id in enumerate(padded_ids):
+        if token_id in fallback_pad_values:
+            padded_ids[index] = fallback_pad_values[token_id]
     return padded_ids
 
 

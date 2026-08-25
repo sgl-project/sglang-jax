@@ -6,7 +6,6 @@ import os
 import tempfile
 
 import numpy as np
-import requests
 from PIL import Image
 
 from sgl_jax.srt.multimodal.common.modality_enum import (
@@ -19,7 +18,10 @@ from sgl_jax.srt.multimodal.manager.mrope_utils import (
     compute_qwen3vl_mrope_positions,
     contiguous_runs,
 )
-from sgl_jax.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+from sgl_jax.srt.multimodal.processors.base_processor import (
+    BaseMultimodalProcessor,
+    fetch_remote_bytes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,8 +41,6 @@ FPS_MAX_FRAMES = 768
 _QWEN3VL_ARCHITECTURES = frozenset(
     {
         "Qwen3VLForConditionalGeneration",
-        "Qwen3_5ForConditionalGeneration",
-        "Qwen3_5MoeForConditionalGeneration",
     }
 )
 
@@ -201,9 +201,7 @@ def preprocess_video(source, video_config: dict) -> np.ndarray:
             if os.path.exists(source):
                 vr = VideoReader(source, ctx=ctx)
             elif source.startswith(("http://", "https://")):
-                response = requests.get(source, timeout=10)
-                response.raise_for_status()
-                tmp_path = _write_temp_video(response.content)
+                tmp_path = _write_temp_video(fetch_remote_bytes(source))
                 vr = VideoReader(tmp_path, ctx=ctx)
             elif source.startswith("data:") and "base64," in source:
                 payload = source.split("base64,", 1)[1]
@@ -240,8 +238,6 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         "Qwen2VLForConditionalGeneration",
         "Qwen2_5_VLForConditionalGeneration",
         "Qwen3VLForConditionalGeneration",
-        "Qwen3_5ForConditionalGeneration",
-        "Qwen3_5MoeForConditionalGeneration",
     )
 
     async def process_mm_data_async(
