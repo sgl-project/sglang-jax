@@ -293,9 +293,10 @@ class MultimodalInputs:
     audio_start_id: int | None = None
     audio_end_id: int | None = None
 
-    # QWen2-VL related
-    mrope_positions: jax.Array | None = None
-    mrope_position_delta: jax.Array | None = None
+    # QWen2-VL related. Keep request/scheduler metadata on host; conversion to
+    # jax.Array happens only when ForwardBatch is built for model execution.
+    mrope_positions: np.ndarray | None = None
+    mrope_position_delta: np.ndarray | None = None
 
     @staticmethod
     def from_dict(obj: dict):
@@ -332,10 +333,9 @@ class MultimodalInputs:
         for arg in optional_args:
             if arg in obj:
                 value = obj[arg]
-                if isinstance(value, (np.ndarray, jax.Array)):
-                    setattr(ret, arg, jax.device_put(value))
-                else:
-                    setattr(ret, arg, value)
+                if arg in ("mrope_positions", "mrope_position_delta"):
+                    value = None if value is None else np.asarray(value, dtype=np.int32)
+                setattr(ret, arg, value)
 
         return ret
 
@@ -362,19 +362,19 @@ class MultimodalInputs:
         # Merge mm_items
         self.mm_items += other.mm_items
 
-        # Merge mrope_positions (JAX array handling)
+        # Merge host-side mrope_positions.
         if self.mrope_positions is not None:
             if other.mrope_positions is not None:
-                self.mrope_positions = jnp.concatenate(
+                self.mrope_positions = np.concatenate(
                     [self.mrope_positions, other.mrope_positions], axis=1
                 )
         else:
             self.mrope_positions = other.mrope_positions
 
-        # Merge mrope_position_delta (JAX array handling)
+        # Merge host-side mrope_position_delta.
         if self.mrope_position_delta is not None:
             if other.mrope_position_delta is not None:
-                self.mrope_position_delta = jnp.concatenate(
+                self.mrope_position_delta = np.concatenate(
                     [self.mrope_position_delta, other.mrope_position_delta], axis=0
                 )
         else:
