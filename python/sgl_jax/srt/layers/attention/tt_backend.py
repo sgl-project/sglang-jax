@@ -105,13 +105,23 @@ def _decode_page_table(
     dp_size: int,
     batch_size_per_dp: int,
 ) -> np.ndarray:
+    locations_per_dp = len(cache_locations) // dp_size
+    if locations_per_dp % block_size:
+        raise ValueError("TT cache-location capacity must be page-aligned")
+
     aligned_lengths = cdiv(sequence_lengths, block_size) * block_size
     page_counts = cdiv(sequence_lengths, block_size)
+    page_capacity = max(locations_per_dp // block_size, 1)
+    if np.any(page_counts > page_capacity):
+        raise ValueError("TT sequence exceeds the cache-location page capacity")
+
+    # cache_locations is scheduler-bucketed, so its per-DP size is stable while
+    # sequences grow. Use that capacity for the page table instead of its live
+    # width to keep decode's JAX input shape fixed.
     table = np.zeros(
-        (len(sequence_lengths), max(int(page_counts.max(initial=0)), 1)),
+        (len(sequence_lengths), page_capacity),
         dtype=np.int32,
     )
-    locations_per_dp = len(cache_locations) // dp_size
 
     for dp_rank in range(dp_size):
         row_base = dp_rank * batch_size_per_dp
