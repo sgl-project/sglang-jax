@@ -200,20 +200,42 @@ def _scores_kernel(
             page_indices_offset = (seq_idx + batch_idx) * pages_per_seq + kv_p_start
 
             if not wait:
-                for i in range(bkv_p):
-                    sz_per_kv_packing = page_size_per_kv_packing
+
+                def _start_fetch_page(
+                    i,
+                    carry,
+                    page_indices_offset=page_indices_offset,
+                    bkv_vmem_ref=bkv_vmem_ref,
+                    sem=sem,
+                ):
                     page_idx = jnp.minimum(page_indices_offset + i, num_page_indices - 1)
                     safe_page_offset = jnp.minimum(
                         page_indices_ref[page_idx] * page_size_per_kv_packing,
                         jnp.maximum(0, max_hbm_pages - page_size_per_kv_packing),
                     )
-
                     _async_copy(
-                        reshaped_cache_hbm_ref.at[pl.ds(safe_page_offset, sz_per_kv_packing)],
-                        bkv_vmem_ref.at[pl.ds(i * page_size_per_kv_packing, sz_per_kv_packing)],
+                        reshaped_cache_hbm_ref.at[
+                            pl.ds(safe_page_offset, page_size_per_kv_packing)
+                        ],
+                        bkv_vmem_ref.at[
+                            pl.ds(i * page_size_per_kv_packing, page_size_per_kv_packing)
+                        ],
                         sem,
                         wait=False,
                     )
+                    return carry
+
+                if bkv_p > 64:
+                    # Large page blocks (page mode, bkv_p=128): a python-unrolled
+                    # per-page DMA loop bloats the Mosaic program and costs ~40s
+                    # of compile per kernel instance (measured v7x, T=8192); a
+                    # fori_loop compiles in <1s with identical steady-state
+                    # performance (DMA issue rate is not the bottleneck).
+                    lax.fori_loop(0, bkv_p, _start_fetch_page, None, unroll=False)
+                else:
+                    # Keep the merged decode path (bkv_p<=64) byte-identical.
+                    for i in range(bkv_p):
+                        _start_fetch_page(i, None)
             else:
                 dma_bkv_sz = bkv_p * page_size_per_kv_packing
                 dst_kv = bkv_vmem_ref.at[pl.ds(0, dma_bkv_sz)]
