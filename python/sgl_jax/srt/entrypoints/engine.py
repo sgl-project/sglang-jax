@@ -302,8 +302,14 @@ class Engine(EngineBase):
 
     def shutdown(self):
         """Shutdown the engine"""
+        tokenizer_manager = getattr(self, "tokenizer_manager", None)
+        if tokenizer_manager is not None:
+            tokenizer_manager.shutdown()
         kill_process_tree(os.getpid(), include_parent=False)
-        if self.server_args.enable_single_process:
+        if (
+            getattr(self, "server_args", None) is not None
+            and self.server_args.enable_single_process
+        ):
             self.send_to_rpc.close()
 
     def __enter__(self):
