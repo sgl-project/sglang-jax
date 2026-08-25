@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec
 from jax.tree_util import register_pytree_node_class
 
@@ -192,7 +193,7 @@ class ForwardBatch:
     # Encoder-Decoder specific fields
     attention_mask: jax.Array | None = None
     deterministic: bool = True
-    # Multimodal cached vision embeddings (prefill only)
+    # Fused multimodal token embeddings (prefill only)
     input_embedding: jax.Array | None = None
     # MRoPE positions [3, total_tokens] for Qwen2.5-VL
     mrope_positions: jax.Array | None = None
@@ -210,6 +211,9 @@ class ForwardBatch:
     # otherwise.
     recurrent_track_indices: jax.Array | None = None
     recurrent_track_mask: jax.Array | None = None
+
+    # Host-only multimodal batch consumed before the backbone JIT.
+    multimodal_batch: object | None = None
 
     def tree_flatten(self):
         children = (
@@ -287,6 +291,10 @@ class ForwardBatch:
         obj.recurrent_cow_src_indices = children[20]
         obj.recurrent_track_indices = children[21]
         obj.recurrent_track_mask = children[22]
+        # Host-only attribute, never a pytree child; reset so attribute access on
+        # an unflattened ForwardBatch never raises (the routine that consumes it
+        # runs on the original, pre-jit ForwardBatch).
+        obj.multimodal_batch = None
         return obj
 
     def __repr__(self) -> str:
@@ -370,19 +378,33 @@ class ForwardBatch:
                 batch.extend_prefix_lens,
                 batch.extend_seq_lens,
             ),
-            sharding=(NamedSharding(model_runner.mesh, PartitionSpec("data"))),
+            sharding=NamedSharding(model_runner.mesh, PartitionSpec("data")),
         )
-        mrope_positions = None
-        if batch.mrope_positions is not None:
+        mrope_positions = batch.mrope_positions
+        mrope_position_axes = getattr(
+            getattr(model_runner, "model", None),
+            "mrope_position_axes",
+            0,
+        )
+        if (
+            mrope_positions is None
+            and isinstance(mrope_position_axes, int)
+            and mrope_position_axes > 0
+        ):
+            mrope_positions = np.broadcast_to(
+                batch.positions,
+                (mrope_position_axes, len(batch.positions)),
+            ).copy()
+        if mrope_positions is not None:
             (mrope_positions,) = device_array(
-                (batch.mrope_positions,),
-                sharding=(NamedSharding(model_runner.mesh, PartitionSpec(None, None))),
+                (mrope_positions,),
+                sharding=NamedSharding(model_runner.mesh, PartitionSpec(None, "data")),
             )
         input_embedding = None
         if batch.input_embedding is not None:
             (input_embedding,) = device_array(
                 (batch.input_embedding,),
-                sharding=(NamedSharding(model_runner.mesh, PartitionSpec(None, None))),
+                sharding=NamedSharding(model_runner.mesh, PartitionSpec("data", None)),
             )
         if input_embedding is not None:
             input_embedding = input_embedding.astype(jnp.bfloat16)
@@ -398,10 +420,10 @@ class ForwardBatch:
                     batch.lora_token_indices,
                     batch.lora_ranks,
                 ),
-                sharding=(NamedSharding(model_runner.mesh, PartitionSpec("data"))),
+                sharding=NamedSharding(model_runner.mesh, PartitionSpec("data")),
             )
         else:
-            (lora_scalings, lora_token_indices, lora_ranks) = (
+            lora_scalings, lora_token_indices, lora_ranks = (
                 batch.lora_scalings,
                 batch.lora_token_indices,
                 batch.lora_ranks,
@@ -411,7 +433,10 @@ class ForwardBatch:
         if batch.apply_for_deepstack:
             (deepstack_visual_embedding,) = device_array(
                 (batch.deepstack_visual_embedding,),
-                sharding=(NamedSharding(model_runner.mesh, PartitionSpec(None, None))),
+                sharding=NamedSharding(
+                    model_runner.mesh,
+                    PartitionSpec(None, "data", None),
+                ),
             )
         if deepstack_visual_embedding is not None:
             deepstack_visual_embedding = deepstack_visual_embedding.astype(jnp.bfloat16)
@@ -422,29 +447,31 @@ class ForwardBatch:
         if batch.recurrent_indices is not None:
             (recurrent_indices,) = device_array(
                 (batch.recurrent_indices,),
-                sharding=(NamedSharding(model_runner.mesh, PartitionSpec("data"))),
+                sharding=NamedSharding(model_runner.mesh, PartitionSpec("data")),
             )
 
         recurrent_cow_src_indices = None
         if batch.recurrent_cow_src_indices is not None:
             (recurrent_cow_src_indices,) = device_array(
                 (batch.recurrent_cow_src_indices,),
-                sharding=(NamedSharding(model_runner.mesh, PartitionSpec("data"))),
+                sharding=NamedSharding(model_runner.mesh, PartitionSpec("data")),
             )
 
         recurrent_track_indices = None
         if batch.recurrent_track_indices is not None:
             (recurrent_track_indices,) = device_array(
                 (batch.recurrent_track_indices,),
-                sharding=(NamedSharding(model_runner.mesh, PartitionSpec("data"))),
+                sharding=NamedSharding(model_runner.mesh, PartitionSpec("data")),
             )
 
         recurrent_track_mask = None
         if batch.recurrent_track_mask is not None:
             (recurrent_track_mask,) = device_array(
                 (batch.recurrent_track_mask,),
-                sharding=(NamedSharding(model_runner.mesh, PartitionSpec("data"))),
+                sharding=NamedSharding(model_runner.mesh, PartitionSpec("data")),
             )
+
+        multimodal_batch = getattr(batch, "multimodal_batch", None)
 
         obj = cls(
             bid=batch.bid,
@@ -476,6 +503,7 @@ class ForwardBatch:
             recurrent_track_indices=recurrent_track_indices,
             recurrent_track_mask=recurrent_track_mask,
         )
+        obj.multimodal_batch = multimodal_batch
 
         # Auto-generate attention mask for Encoder-only models (e.g. UMT5Encoder, BERT)
         is_embedding = getattr(model_runner.model_config, "is_embedding", False)

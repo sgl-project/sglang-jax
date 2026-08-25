@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -89,7 +90,11 @@ from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
 )
 from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.precision_tracer import precision_tracer
-from sgl_jax.srt.server_args import PortArgs, ServerArgs
+from sgl_jax.srt.server_args import (
+    PortArgs,
+    ServerArgs,
+    apply_multimodal_model_defaults,
+)
 from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput
 from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
 from sgl_jax.srt.speculative.overlap_utils import (
@@ -119,6 +124,21 @@ TEST_RETRACT_INTERVAL = int(os.environ.get("SGLANG_TEST_RETRACT_INTERVAL", "3"))
 TEST_RETRACT_NO_PREFILL_BS = int(os.environ.get("SGLANG_TEST_RETRACT_NO_PREFILL_BS", str(2**31)))
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
+
+
+def _clear_embedding_pools(
+    workers: Iterable[ModelWorker | ModelWorkerClient | None],
+) -> None:
+    seen: set[int] = set()
+    for worker in workers:
+        if worker is None:
+            continue
+        runner = worker.get_model_runner()
+        if id(runner) in seen:
+            continue
+        seen.add(id(runner))
+        if getattr(runner, "embedding_pool", None) is not None:
+            runner.embedding_pool.clear()
 
 
 class SyncError(Exception):
@@ -224,13 +244,6 @@ class Scheduler(
         self.stream_interval = server_args.stream_interval
         self.max_seq_len = server_args.max_seq_len
         self.page_size = server_args.page_size
-        self.enable_overlap = not server_args.disable_overlap_schedule
-        if server_args.multimodal:
-            logger.info("Multimodal mode enabled, disabling overlap schedule")
-            self.enable_overlap = False
-        if server_args.disaggregation_mode != "null":
-            logger.info("PD disaggregation mode enabled, disabling overlap schedule")
-            self.enable_overlap = False
         self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
 
         # PD disaggregation runtime attributes. They are populated by
@@ -309,6 +322,18 @@ class Scheduler(
 
         # Init tokenizer
         self.init_tokenizer()
+
+        self.enable_overlap = not server_args.disable_overlap_schedule
+        # The standalone multimodal stage pipeline has its own schedulers and
+        # does not support the autoregressive overlap loop yet. In-model
+        # multimodal models use the regular worker protocol and can follow the
+        # generic overlap flag without an architecture allowlist.
+        if server_args.multimodal:
+            self.enable_overlap = False
+            logger.info("Overlap scheduler is disabled for the multimodal stage pipeline.")
+        if server_args.disaggregation_mode != "null":
+            logger.info("PD disaggregation mode enabled, disabling overlap schedule")
+            self.enable_overlap = False
 
         # Init grammar backend for structured output
         self.grammar_backend = None
@@ -679,6 +704,7 @@ class Scheduler(
     def init_tokenizer(self):
         server_args = self.server_args
         self.model_config = ModelConfig.from_server_args(server_args)
+        apply_multimodal_model_defaults(server_args, self.model_config)
         self.is_generation = self.model_config.is_generation
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
@@ -1709,6 +1735,9 @@ class Scheduler(
             self.token_to_kv_pool_allocator.clear()
         if self.grammar_backend is not None:
             self.grammar_backend.reset()
+        _clear_embedding_pools(
+            (self.tp_worker, self.tp_worker_p, *getattr(self, "tp_workers_p", ()))
+        )
 
         self.num_generated_tokens = 0
         self.forward_ct_decode = 0
