@@ -314,7 +314,7 @@ def _full_naive_reference(
     return jnp.concatenate(outputs, axis=1), jnp.stack(final_states, axis=0)
 
 
-def _run_full_32k_case(*, include_zero_length: bool):
+def _run_full_32k_case(*, include_zero_length: bool, lower_bound: float | None = None):
     (
         seq_lens,
         cu_seqlens,
@@ -327,6 +327,11 @@ def _run_full_32k_case(*, include_zero_length: bool):
         dt_bias,
         initial_state,
     ) = _make_full_32k_case(include_zero_length=include_zero_length)
+    if lower_bound is not None:
+        # Drive the bounded gate over its full range: exp(A_log)*(raw_g+dt_bias)
+        # spanning +-20 puts the activated gate at ~0, lower_bound/2 and
+        # ~lower_bound, which is what stresses the strip-GEMM fast path.
+        raw_g = (8.0 * raw_g.astype(jnp.float32)).astype(raw_g.dtype)
 
     scale = _K**-0.5
     optimized_output, optimized_final_state, *_ = chunk_kda(
@@ -343,14 +348,25 @@ def _run_full_32k_case(*, include_zero_length: bool):
         use_gate_in_kernel=True,
         A_log=A_log,
         dt_bias=dt_bias,
+        safe_gate=lower_bound is not None,
+        lower_bound=lower_bound,
     )
     # Materialize the optimized pipeline first so a baseline failure is
     # unambiguously Stage 1 VMEM, not naive-reference compile or host memory.
     jax.block_until_ready((optimized_output, optimized_final_state))
 
-    activated_g = -jnp.exp(A_log.astype(jnp.float32))[None, None, :, None] * (
-        jax.nn.softplus(raw_g.astype(jnp.float32) + dt_bias.astype(jnp.float32)[None, None, :, :])
-    )
+    if lower_bound is None:
+        activated_g = -jnp.exp(A_log.astype(jnp.float32))[None, None, :, None] * (
+            jax.nn.softplus(
+                raw_g.astype(jnp.float32) + dt_bias.astype(jnp.float32)[None, None, :, :]
+            )
+        )
+    else:
+        # Mirrors kda_gate_chunk_cumsum's lower_bound path (and FLA gate.py).
+        activated_g = lower_bound * jax.nn.sigmoid(
+            jnp.exp(A_log.astype(jnp.float32))[None, None, :, None]
+            * (raw_g.astype(jnp.float32) + dt_bias.astype(jnp.float32)[None, None, :, :])
+        )
     reference_output, reference_final_state = _full_naive_reference(
         seq_lens,
         cu_seqlens,
@@ -422,6 +438,45 @@ def test_chunk_kda_32k_no_zero_length_output_and_final_state_match_naive_recurre
     """No-zero full path: logical/aligned/allocated T = 32768/34816/34880."""
     seq_lens, optimized_final_state, reference_final_state = _run_full_32k_case(
         include_zero_length=False
+    )
+
+    nonempty_mask = np.asarray(seq_lens, dtype=np.int32) > 0
+    assert nonempty_mask.shape == (32,)
+    assert nonempty_mask.all()
+    np.testing.assert_allclose(
+        np.asarray(optimized_final_state),
+        np.asarray(reference_final_state),
+        rtol=2e-2,
+        atol=1e-2,
+    )
+
+
+def test_chunk_kda_32k_varlen_lower_bound_matches_naive_recurrent_kda():
+    """Bounded gate (Kimi-K3: lower_bound=-5) through the strip-GEMM intra path.
+
+    Same 33-request varlen fixture as the softplus node, with raw_g widened so
+    the activated gate covers ~0, -2.5 and ~-5 -- the range that distinguishes
+    the safe_gate fast path from the generic decay-tensor path.
+    """
+    seq_lens, optimized_final_state, reference_final_state = _run_full_32k_case(
+        include_zero_length=True, lower_bound=-5.0
+    )
+
+    nonempty_mask = np.asarray(seq_lens, dtype=np.int32) > 0
+    assert nonempty_mask.shape == (33,)
+    assert np.count_nonzero(nonempty_mask) == 32
+    np.testing.assert_allclose(
+        np.asarray(optimized_final_state)[nonempty_mask],
+        np.asarray(reference_final_state)[nonempty_mask],
+        rtol=2e-2,
+        atol=1e-2,
+    )
+
+
+def test_chunk_kda_32k_no_zero_length_lower_bound_matches_naive_recurrent_kda():
+    """Bounded-gate variant of the no-zero-length full path."""
+    seq_lens, optimized_final_state, reference_final_state = _run_full_32k_case(
+        include_zero_length=False, lower_bound=-5.0
     )
 
     nonempty_mask = np.asarray(seq_lens, dtype=np.int32) > 0
