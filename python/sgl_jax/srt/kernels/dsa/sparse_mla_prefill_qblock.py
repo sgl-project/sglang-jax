@@ -137,10 +137,19 @@ def _qblock_kernel(
         u = units_ref[0, 0, 0, j]  # scalar unit id (>= 0 for j < cnt)
         pltpu.make_async_copy(kv_hbm.at[b, pl.ds(u * RB, RBF), :], kv_scratch.at[...], sem).start()
 
-        # membership row for this unit: dynamic sublane read -> [QBHp] lanes
-        mem_row = mem_ref[0, 0, j, :]
+        # membership row for this unit. A direct mem_ref[0, 0, j, :] is not
+        # Mosaic-lowerable (int8 tile is (32, 128): a dynamic sublane index
+        # must be provably %32), so read the aligned 32-row window containing
+        # j — (j // 32) * 32 is provably aligned, the same idiom as the paged
+        # r8*8 trick — and select row j within it via an iota compare + max.
+        j32 = (j // 32) * 32
+        mem_win = mem_ref[0, 0, pl.ds(j32, 32), :]  # [32, QBHp] int8
+        rowsel = jax.lax.broadcasted_iota(jnp.int32, (32, 1), 0) == (j - j32)
+        mem_row = jnp.max(
+            jnp.where(rowsel, mem_win.astype(jnp.int32), 0), axis=0, keepdims=True
+        )  # [1, QBHp]
         kp = u * RB + rows  # [RBF, 1] key positions
-        valid = (mem_row[None, :] > 0) & (kp <= qpos_row)  # [RBF, QBHp]
+        valid = (mem_row > 0) & (kp <= qpos_row)  # [RBF, QBHp]
         if RBF > RB:
             valid &= rows < RB  # drop sublane over-fetch rows
         bias = jnp.where(valid, 0.0, -jnp.inf)  # [RBF, QBHp] fp32
