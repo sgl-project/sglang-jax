@@ -50,7 +50,7 @@ uv run python -u -m sgl_jax.launch_server \
   --lora-paths adapter1=/path/to/adapter1 adapter2=/path/to/adapter2
 ```
 
-Adapters can also be specified as a JSON dict `{"adapter1": "/path/to/adapter1", ...}`.
+When constructing `ServerArgs` programmatically, adapters can also be specified as a dict `{"adapter1": "/path/to/adapter1", ...}` (the CLI `--lora-paths` only accepts `name=path` / `path` forms).
 
 ### Sending requests with a specific adapter
 
@@ -68,8 +68,10 @@ curl http://localhost:30000/v1/completions \
   }'
 ```
 
-The same field is used in the OpenAI chat completions protocol and in the Python engine API
-(`Engine.generate(..., lora_path="adapter1")`).
+The same field is used in the Python engine API
+(`Engine.generate(..., lora_path="adapter1")`). Chat completions does not yet
+forward `lora_path` to the generation request, so the adapter would be ignored
+there.
 
 ### Server arguments
 
@@ -77,11 +79,10 @@ The same field is used in the OpenAI chat completions protocol and in the Python
 |----------|---------|-------------|
 | `--enable-lora` | `None` | Enable dynamic LoRA (auto-enabled when `--lora-paths` is set). |
 | `--lora-paths` | `None` | Adapters to preload; `name=path` / `path` / dict format. |
-| `--max-loras-per-batch` | `8` | Maximum number of different adapters per batch. |
+| `--max-loras-per-batch` | `8` | Maximum number of different adapters per batch. Preloaded adapters are pinned, so at most `max_loras_per_batch - 1` (7 with the default) can be preloaded. |
 | `--max-lora-rank` | `None` | Maximum LoRA rank; auto-inferred from the loaded adapters when unset. |
 | `--lora-target-modules` | `None` | Modules to apply LoRA to (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`, or `all`); auto-inferred from the adapters when unset. |
-| `--max-loaded-loras` | `None` | Maximum adapters kept loaded in memory. |
-| `--lora-eviction-policy` | `lru` | Eviction policy (reserved; no runtime eviction is triggered in the current version). |
+
 
 `qkv` and `gate_up` projections are automatically handled by merging the corresponding per-module
 LoRA weights, and adapters with different ranks are padded to `max_lora_rank`.
@@ -91,7 +92,7 @@ LoRA weights, and adapters with different ranks are padded to `max_lora_rank`.
 Static LoRA is intended for RL scenarios where only a single adapter is used and requests never
 switch adapters at runtime. It is mutually exclusive with `--enable-lora`:
 
-- Supports exactly one adapter (weights are merged into the base model; BGMV is not used)
+- Supports exactly one adapter via fixed `A`/`B` buffers updated externally between RL steps (weights are not merged into the base model; BGMV is not used)
 - Requires explicit `--lora-scaling` (`alpha / rank`)
 - Does not accept `--lora-paths` and requires `--max-loras-per-batch 1`
 
@@ -110,7 +111,10 @@ uv run python -u -m sgl_jax.launch_server \
   --dtype=bfloat16 \
   --skip-server-warmup \
   --enable-static-lora \
-  --lora-scaling 1.0
+  --lora-scaling 1.0 \
+  --max-lora-rank 8 \
+  --lora-target-modules q_proj \
+  --max-loras-per-batch 1
 ```
 
 ## Limitations
