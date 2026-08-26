@@ -36,9 +36,10 @@ def req_prefix_match_key(req) -> tuple[list[int] | None, str | None]:
     prefix (an unexpanded batch, an empty/one-token prompt, or a request whose
     reusable prefix clamps to zero), so the caller falls back to load balancing.
     """
-    input_ids = req.input_ids
+    input_ids = req.radix_input_ids
     if not isinstance(input_ids, list) or not input_ids or not isinstance(input_ids[0], int):
         return None, None
+    assert len(input_ids) == len(req.input_ids)
 
     extra_key = req.extra_key
     lora_id = getattr(req, "lora_id", None)

@@ -556,6 +556,7 @@ class MockRequest:
     ):
         self.req_pool_idx = req_pool_idx
         self.origin_input_ids = origin_input_ids
+        self.radix_input_ids = list(origin_input_ids)
         self.output_ids = output_ids
         self.fill_ids = fill_ids
         self.prefix_indices = prefix_indices
@@ -646,6 +647,7 @@ class TestUnifiedRadixCacheWithRequests(CustomTestCase):
 
         # --- chunked prefill: cache_unfinished_req ---
         prefill_ids = list(range(1, 13))  # 12 tokens
+        cache_prefill_ids = list(range(-101, -113, -1))
         reqs = []
         for cache, pool, alloc in stacks:
             kv_indices = alloc.alloc(len(prefill_ids), dp_rank=0)
@@ -659,6 +661,7 @@ class TestUnifiedRadixCacheWithRequests(CustomTestCase):
                 prefix_indices=np.empty((0,), dtype=np.int32),
                 last_node=cache.root_node,
             )
+            req.radix_input_ids = list(cache_prefill_ids)
             req.last_matched_prefix_len = 0
             cache.cache_unfinished_req(req)
             reqs.append(req)
@@ -679,6 +682,21 @@ class TestUnifiedRadixCacheWithRequests(CustomTestCase):
         self.assertEqual(unified.total_size(), 12)
         # The unified req now points at the locked path, not root.
         self.assertIsNot(unified_req.last_node, unified.root_node)
+        for cache, _, _ in stacks:
+            self.assertEqual(
+                len(
+                    cache.match_prefix(MatchPrefixParams(key=RadixKey(prefill_ids))).device_indices
+                ),
+                0,
+            )
+            self.assertEqual(
+                len(
+                    cache.match_prefix(
+                        MatchPrefixParams(key=RadixKey(cache_prefill_ids))
+                    ).device_indices
+                ),
+                12,
+            )
 
         # --- completion: cache_finished_req on the same req objects ---
         # Production flow: cache_unfinished during chunked prefill, then
@@ -707,7 +725,7 @@ class TestUnifiedRadixCacheWithRequests(CustomTestCase):
         self.assertEqual(unified.evictable_size(0), 16)
         self.assertEqual(unified.total_size(), 16)
 
-        full_sequence = prefill_ids + output_ids
+        full_sequence = cache_prefill_ids + output_ids
         radix_match = radix.match_prefix(MatchPrefixParams(key=RadixKey(full_sequence)))
         unified_match = unified.match_prefix(MatchPrefixParams(key=RadixKey(full_sequence)))
         self.assertEqual(len(radix_match.device_indices), len(unified_match.device_indices))
@@ -1054,6 +1072,7 @@ class _ReleaseReq:
         self.req_pool_idx = req_pool_idx
         self.recurrent_pool_idx = recurrent_pool_idx
         self.origin_input_ids = list(origin_input_ids)
+        self.radix_input_ids = list(origin_input_ids)
         self.output_ids = []
         self.fill_ids = list(origin_input_ids)
         self.dp_rank = dp_rank
@@ -1085,6 +1104,7 @@ class _RunningRecurrentReq:
         self.req_pool_idx = req_pool_idx
         self.recurrent_pool_idx = recurrent_pool_idx
         self.origin_input_ids = list(fill_ids)
+        self.radix_input_ids = list(fill_ids)
         self.output_ids = []
         self.fill_ids = list(fill_ids)
         self.dp_rank = dp_rank
@@ -1286,8 +1306,12 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
         recurrent validator collapses its cached FULL prefix to root."""
         state_pool, pool, allocator, cache = self._create_recurrent_setup()
 
-        chunk1 = list(range(1, 9))
+        full_prompt = list(range(1, 13))
+        chunk1 = full_prompt[:8]
+        chunk2 = full_prompt[8:]
         req = _RunningRecurrentReq(req_pool_idx=None, recurrent_pool_idx=None, fill_ids=chunk1)
+        req.origin_input_ids = full_prompt
+        req.radix_input_ids = list(full_prompt)
         pool.alloc([req])  # assigns req_pool_idx + a running recurrent slot
         self.assertIsNotNone(req.recurrent_pool_idx)
         running_slot = req.recurrent_pool_idx
@@ -1328,7 +1352,6 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
         self.assertIsNone(wrong_probe.recurrent_cow_src_index)
 
         # (c) second continuation
-        chunk2 = list(range(9, 13))
         req.fill_ids = chunk1 + chunk2
         kv2 = allocator.alloc(len(chunk2), dp_rank=0)
         self.assertIsNotNone(kv2)

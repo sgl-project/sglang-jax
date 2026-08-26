@@ -76,75 +76,45 @@ def tensor_hash(tensor_list: Any) -> int:
 def pad_input_tokens(
     input_ids: list[int],
     mm_items: list["MultimodalDataItem"],
-    im_token_id: int = None,
-    video_token_id: int = None,
-    audio_token_id: int = None,
+    im_token_id: int | None = None,
+    video_token_id: int | None = None,
+    audio_token_id: int | None = None,
 ) -> list[int]:
-    """
-    Replace multimodal placeholder tokens in input_ids with corresponding pad_values from mm_items.
-    This is critical for radix cache to differentiate between different images/videos.
-    Different images/videos will have different pad_values (hash-based), so the cache
-    will correctly identify them as different prefixes.
-    Args:
-        input_ids: The input token IDs containing placeholder tokens
-        mm_items: List of multimodal data items with pad_value set
-        im_token_id: Token ID used for image placeholders
-        video_token_id: Token ID used for video placeholders
-        audio_token_id: Token ID used for audio placeholders
-    Returns:
-        Modified input_ids with placeholder tokens replaced by pad_values
+    """Replace multimodal placeholders with per-item Radix identity tokens.
+
+    New processors provide exact placeholder ranges. Legacy processors only
+    provide one token ID per modality, so retain token-based replacement as a
+    fallback for items without ranges.
     """
     if not input_ids or not mm_items:
         return input_ids
 
-    # Build mapping from token_id to list of pad_values for each modality
-    # We need to handle multiple items of the same modality
-    image_pad_values = []
-    video_pad_values = []
-    audio_pad_values = []
-
+    padded_ids = list(input_ids)
+    fallback_pad_values: dict[int, int] = {}
     for item in mm_items:
         if item.pad_value is None:
             item.set_pad_value()
+        if item.placeholder_ranges is not None:
+            for start, end in item.placeholder_ranges:
+                padded_ids[start:end] = [item.pad_value] * (end - start)  # type: ignore[list-item]
+            continue
 
-        if item.is_image() and im_token_id is not None:
-            image_pad_values.append(item.pad_value)
-        elif item.is_video() and video_token_id is not None:
-            video_pad_values.append(item.pad_value)
-        elif item.is_audio() and audio_token_id is not None:
-            audio_pad_values.append(item.pad_value)
+        token_id = None
+        if item.is_image():
+            token_id = im_token_id
+        elif item.is_video():
+            token_id = video_token_id
+        elif item.is_audio():
+            token_id = audio_token_id
+        if token_id is not None and item.pad_value is not None:
+            # Match the legacy behavior: one multimodal item may contain all
+            # payloads of a modality, so its identity covers every matching
+            # placeholder token.
+            fallback_pad_values.setdefault(token_id, item.pad_value)
 
-    # Create a mutable copy of input_ids
-    padded_ids = list(input_ids)
-
-    # Replace image tokens
-    if im_token_id is not None and image_pad_values:
-        image_idx = 0
-        for i, token_id in enumerate(padded_ids):
-            if token_id == im_token_id:
-                # Use the pad_value for current image, cycling through if needed
-                pad_value = image_pad_values[min(image_idx, len(image_pad_values) - 1)]
-                padded_ids[i] = pad_value
-                # Don't increment image_idx for each token, only when we hit a boundary
-                # Actually, for simple replacement, use same pad_value for all tokens of an image
-
-    # Replace video tokens
-    if video_token_id is not None and video_pad_values:
-        video_idx = 0
-        for i, token_id in enumerate(padded_ids):
-            if token_id == video_token_id:
-                # Use the pad_value for current video
-                pad_value = video_pad_values[min(video_idx, len(video_pad_values) - 1)]
-                padded_ids[i] = pad_value
-
-    # Replace audio tokens
-    if audio_token_id is not None and audio_pad_values:
-        audio_idx = 0
-        for i, token_id in enumerate(padded_ids):
-            if token_id == audio_token_id:
-                pad_value = audio_pad_values[min(audio_idx, len(audio_pad_values) - 1)]
-                padded_ids[i] = pad_value
-
+    for index, token_id in enumerate(padded_ids):
+        if token_id in fallback_pad_values:
+            padded_ids[index] = fallback_pad_values[token_id]
     return padded_ids
 
 
@@ -179,13 +149,11 @@ class MultimodalDataItem:
     modality: Modality
     hash: int | None = None
     pad_value: int | None = None
-    offsets: list | None = None
+    # Half-open token-index ranges [start, end) of multimodal placeholders in input_ids (per request).
+    placeholder_ranges: list[tuple[int, int]] | None = None
 
     # Raw features returned by processor, e.g. pixel_values or audio_features
     feature: jax.Array | np.ndarray | None = None
-    # Precomputed embeddings passed as final encoder embeddings
-    # Only one of feature and precomputed_embeddings is non-empty
-    precomputed_embeddings: jax.Array | np.ndarray | None = None
 
     # Model-specific data stored in dictionary
     model_specific_data: dict[str, Any] = dataclasses.field(default_factory=dict)
@@ -205,27 +173,35 @@ class MultimodalDataItem:
     def set(self, key: str, value: Any):
         self.__setitem__(key, value)
 
+    def get(self, key: str, default: Any = None) -> Any:
+        if key in self.__dataclass_fields__ and key != "model_specific_data":
+            return getattr(self, key)
+        return self.model_specific_data.get(key, default)
+
     @staticmethod
     def is_empty_list(lst):
         if lst is None:
             return True
         return len([item for item in flatten_nested_list(lst) if item is not None]) == 0
 
-    def set_pad_value(self):
-        """
-        Set padding value after hashing the data first
-        """
+    def set_pad_value(self) -> None:
         if self.hash is None:
-            if self.feature is not None:
-                hashed_feature = self.feature
-            else:
-                hashed_feature = self.precomputed_embeddings
-            self.hash = hash_feature(hashed_feature)
+            feature = self.feature
+            layout = (
+                (tuple(feature.shape), str(feature.dtype))
+                if isinstance(feature, (jax.Array, np.ndarray))
+                else None
+            )
+            self.hash = hash_feature(
+                (
+                    self.modality,
+                    hash_feature(feature),
+                    layout,
+                    hash_feature(self.model_specific_data),
+                )
+            )
         assert self.hash is not None
-        # Use a smaller modulo to keep pad_value in a reasonable range
-        # The pad_value is used for radix cache differentiation, not for embedding lookup
-        # We use a 24-bit range which gives ~16M unique values, sufficient for cache keys
-        self.pad_value = self.hash % (1 << 24)
+        self.pad_value = -(self.hash & ((1 << 63) - 1)) - 1
 
     def is_modality(self, modality: Modality) -> bool:
         return self.modality == modality
@@ -251,8 +227,22 @@ class MultimodalDataItem:
         kwargs = dict(obj)
         modality = kwargs.pop("modality")
         if isinstance(modality, str):
-            modality = Modality[modality]
-        ret = MultimodalDataItem(modality=modality, **kwargs)
+            modality = Modality.from_str(modality)
+
+        field_names = set(MultimodalDataItem.__dataclass_fields__)
+        model_specific_data = dict(kwargs.pop("model_specific_data", {}) or {})
+        item_kwargs = {}
+        for key, value in kwargs.items():
+            if key in field_names and key != "model_specific_data":
+                item_kwargs[key] = value
+            else:
+                model_specific_data[key] = value
+
+        ret = MultimodalDataItem(
+            modality=modality,
+            model_specific_data=model_specific_data,
+            **item_kwargs,
+        )
         ret.validate()
         return ret
 
@@ -269,9 +259,9 @@ class MultimodalDataItem:
                     [jax.device_put(self.feature), jax.device_put(other.feature)], axis=0
                 )
 
-        # Merge offsets
-        if self.offsets is not None and other.offsets is not None:
-            self.offsets += other.offsets
+        # Merge placeholder ranges
+        if self.placeholder_ranges is not None and other.placeholder_ranges is not None:
+            self.placeholder_ranges += other.placeholder_ranges
 
         # Update hash
         self.hash = hash((self.hash, other.hash))
@@ -284,6 +274,7 @@ class MultimodalInputs:
 
     # List of data items
     mm_items: list[MultimodalDataItem]
+    input_ids: list[int] | None = None
     image_pad_len: list | None = None
     num_image_tokens: int | None = None
 
@@ -302,9 +293,10 @@ class MultimodalInputs:
     audio_start_id: int | None = None
     audio_end_id: int | None = None
 
-    # QWen2-VL related
-    mrope_positions: jax.Array | None = None
-    mrope_position_delta: jax.Array | None = None
+    # QWen2-VL related. Keep request/scheduler metadata on host; conversion to
+    # jax.Array happens only when ForwardBatch is built for model execution.
+    mrope_positions: np.ndarray | None = None
+    mrope_position_delta: np.ndarray | None = None
 
     @staticmethod
     def from_dict(obj: dict):
@@ -341,10 +333,9 @@ class MultimodalInputs:
         for arg in optional_args:
             if arg in obj:
                 value = obj[arg]
-                if isinstance(value, (np.ndarray, jax.Array)):
-                    setattr(ret, arg, jax.device_put(value))
-                else:
-                    setattr(ret, arg, value)
+                if arg in ("mrope_positions", "mrope_position_delta"):
+                    value = None if value is None else np.asarray(value, dtype=np.int32)
+                setattr(ret, arg, value)
 
         return ret
 
@@ -371,19 +362,19 @@ class MultimodalInputs:
         # Merge mm_items
         self.mm_items += other.mm_items
 
-        # Merge mrope_positions (JAX array handling)
+        # Merge host-side mrope_positions.
         if self.mrope_positions is not None:
             if other.mrope_positions is not None:
-                self.mrope_positions = jnp.concatenate(
+                self.mrope_positions = np.concatenate(
                     [self.mrope_positions, other.mrope_positions], axis=1
                 )
         else:
             self.mrope_positions = other.mrope_positions
 
-        # Merge mrope_position_delta (JAX array handling)
+        # Merge host-side mrope_position_delta.
         if self.mrope_position_delta is not None:
             if other.mrope_position_delta is not None:
-                self.mrope_position_delta = jnp.concatenate(
+                self.mrope_position_delta = np.concatenate(
                     [self.mrope_position_delta, other.mrope_position_delta], axis=0
                 )
         else:
@@ -402,3 +393,30 @@ class MultimodalInputs:
             self.num_image_tokens += other.num_image_tokens
         elif self.num_image_tokens is None:
             self.num_image_tokens = other.num_image_tokens
+
+
+def build_cache_input_ids(
+    input_ids: list[int] | None,
+    mm_inputs: MultimodalInputs | dict | None,
+) -> list[int] | None:
+    """Build hash-substituted IDs used only for multimodal cache keys."""
+    if (
+        not isinstance(mm_inputs, MultimodalInputs)
+        or not mm_inputs.mm_items
+        or not input_ids
+        or not isinstance(input_ids[0], int)
+    ):
+        return None
+    padded_ids = pad_input_tokens(input_ids, mm_inputs.mm_items)
+    return padded_ids if padded_ids != input_ids else None
+
+
+def build_radix_input_ids(
+    input_ids: list[int],
+    mm_inputs: MultimodalInputs | dict | None,
+) -> list[int]:
+    """Build the canonical token identity used by every radix-cache operation."""
+    cache_input_ids = build_cache_input_ids(input_ids, mm_inputs)
+    radix_input_ids = cache_input_ids if cache_input_ids is not None else list(input_ids)
+    assert len(radix_input_ids) == len(input_ids)
+    return radix_input_ids

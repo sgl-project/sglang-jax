@@ -48,9 +48,10 @@ from sgl_jax.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sgl_jax.srt.mem_cache.radix_cache import RadixKey
+from sgl_jax.srt.mem_cache.radix_cache import RadixKey, build_radix_key
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sgl_jax.srt.multimodal.common.modality_enum import MultimodalInputs
 from sgl_jax.srt.precision_tracer import (
     PrecisionTracerRequestMetadata,
     precision_tracer,
@@ -189,6 +190,7 @@ class Req:
         multimodal_embedding: list[list[float]] | None = None,
         deepstack_visual_embedding: list[list[float]] | None = None,
         deepstack_visual_pos_mask: list[int] | None = None,
+        radix_input_ids: list[int] | None = None,
     ):
         # Input and output info
         self.rid = rid
@@ -200,13 +202,12 @@ class Req:
             else origin_input_ids  # Before image padding
         )
         self.origin_input_ids = origin_input_ids
-
-        # Cache input IDs with hash-based values for multimodal placeholder tokens
-        # Used for radix cache matching to differentiate different images/videos
-        # If None, origin_input_ids is used for cache matching
-        self.cache_input_ids: list[int] | None = None
-        # Multimodal inputs (e.g., mrope positions) from tokenizer
-        self.mm_inputs: dict | None = None
+        self.radix_input_ids = (
+            radix_input_ids if radix_input_ids is not None else list(origin_input_ids)
+        )
+        assert len(self.origin_input_ids) == len(self.radix_input_ids)
+        # Multimodal inputs (e.g., image items and mrope positions) from tokenizer.
+        self.mm_inputs: MultimodalInputs | dict | None = None
 
         # Each decode stage's output ids
         self.output_ids = []
@@ -489,7 +490,7 @@ class Req:
                 )
                 match_result = tree_cache.match_prefix(
                     MatchPrefixParams(
-                        key=RadixKey(self.adjust_max_prefix_ids(), self.extra_key, self.dp_rank),
+                        key=self.match_key(),
                         cow_recurrent=(
                             tree_cache.supports_recurrent() and not is_running_recurrent
                         ),
@@ -523,6 +524,10 @@ class Req:
 
         max_prefix_len = max(max_prefix_len, 0)
         return self.fill_ids[:max_prefix_len]
+
+    def match_key(self) -> RadixKey:
+        real_prefix = self.adjust_max_prefix_ids()
+        return build_radix_key(self, len(real_prefix))
 
     def pop_committed_kv_cache(self) -> int:
         # Idempotent: the PD prefill abort path can run release a second time
@@ -691,6 +696,7 @@ class Req:
     def set_finish_with_abort(self, error_msg: str):
         # set it to one token to skip the long prefill
         self.origin_input_ids = [0]
+        self.radix_input_ids = [0]
         self.grammar = None
         self.return_logprob = False
         self.to_finish = FINISH_ABORT(error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError")
