@@ -5,16 +5,14 @@ The preprocessing turns per-query page selections ``topk_units [T, K]`` into
 per-query-block tables:
 
 * ``blk_units  [nQB, U_max]``  — sorted union of the block's selected units, -1 pad
-* ``blk_member [nQB, QB, num_units]`` int8 — query-to-unit-id membership bitmap
-  (indexed **by unit id**, not by union slot)
-* ``blk_counts [nQB]``        — TRUE unique count (uncapped; > U_max ⇒ the units
-  list is truncated and the caller must gate on it)
+* ``blk_member [nQB, QB, U_max]`` int8 — query-to-union-slot membership bitmap
+* ``blk_counts [nQB]``        — TRUE unique count (uncapped; > U_max ⇒ overflow,
+  the caller must gate on it before trusting the tables)
 
-Parity contract (vs the per-query kernel semantics): for every query ``t``,
-``{ p : blk_member[b, t - b*QB, p] == 1 }`` must equal
-``{ x in topk_units[t] : x >= 0 }`` — i.e. the -inf membership bias in the
-blocked kernel reproduces the per-query selection exactly — and ``blk_units``
-must list each block's union (sorted, -1 padded).
+Parity contract (vs the per-query kernel semantics): for every query ``t`` whose
+block did not overflow, ``{ blk_units[b, u] : blk_member[b, t - b*QB, u] == 1 }``
+must equal ``{ x in topk_units[t] : x >= 0 }`` — i.e. the -inf membership bias in
+the blocked kernel reproduces the per-query selection exactly.
 
 Pure jnp — runs on CPU; TPU shape/e2e checks live with the kernel tests.
 """
@@ -27,41 +25,44 @@ import pytest
 from sgl_jax.srt.kernels.dsa.sparse_mla_prefill_qblock import build_block_unit_tables
 
 
-def _oracle(topk: np.ndarray, qb: int, num_units: int, u_max: int):
+def _oracle(topk: np.ndarray, qb: int, u_max: int):
     """Reference in plain python sets."""
     T, K = topk.shape
     n_blk = -(-T // qb)
     pad = n_blk * qb - T
     tk = np.pad(topk, ((0, pad), (0, 0)), constant_values=-1).reshape(n_blk, qb, K)
     units = np.full((n_blk, u_max), -1, np.int32)
-    member = np.zeros((n_blk, qb, num_units), np.int8)
+    member = np.zeros((n_blk, qb, u_max), np.int8)
     counts = np.zeros((n_blk,), np.int32)
     for b in range(n_blk):
         uniq = sorted({int(x) for x in tk[b].ravel() if x >= 0})
         counts[b] = len(uniq)
         keep = uniq[:u_max]
         units[b, : len(keep)] = keep
+        col = {u: j for j, u in enumerate(keep)}
         for q in range(qb):
             for x in tk[b, q]:
-                if int(x) >= 0:
-                    member[b, q, int(x)] = 1
+                if int(x) in col:
+                    member[b, q, col[int(x)]] = 1
     return units, member, counts
 
 
-def _check(topk: np.ndarray, qb: int, num_units: int, u_max: int):
+def _check(topk: np.ndarray, qb: int, u_max: int):
     units, member, counts = jax.jit(
-        build_block_unit_tables, static_argnames=("query_block", "num_units", "u_max")
-    )(jnp.asarray(topk, jnp.int32), query_block=qb, num_units=num_units, u_max=u_max)
-    ounits, omember, ocounts = _oracle(topk, qb, num_units, u_max)
+        build_block_unit_tables, static_argnames=("query_block", "u_max")
+    )(jnp.asarray(topk, jnp.int32), query_block=qb, u_max=u_max)
+    ounits, omember, ocounts = _oracle(topk, qb, u_max)
     np.testing.assert_array_equal(np.asarray(counts), ocounts)
     np.testing.assert_array_equal(np.asarray(units), ounits)
     np.testing.assert_array_equal(np.asarray(member), omember)
     # per-query set reconstruction (the actual kernel-facing contract)
     T = topk.shape[0]
-    m_np = np.asarray(member)
+    u_np, m_np = np.asarray(units), np.asarray(member)
     for t in range(T):
         b, q = divmod(t, qb)
-        got = set(np.nonzero(m_np[b, q])[0].tolist())
+        if ocounts[b] > u_max:
+            continue  # overflowed block: caller must gate, no contract
+        got = {int(u_np[b, j]) for j in np.nonzero(m_np[b, q])[0]}
         want = {int(x) for x in topk[t] if x >= 0}
         assert got == want, f"query {t}: {got} != {want}"
 
@@ -79,21 +80,21 @@ def test_parity_110k_shape():
     # 110k deployment shape: 8192-query chunk, K=32 pages, 880-page pool.
     rng = np.random.default_rng(0)
     tk = _local_topk(rng, T=8192, K=32, num_units=880, spread=40)
-    _check(tk, qb=64, num_units=880, u_max=880)
+    _check(tk, qb=64, u_max=880)
 
 
 def test_parity_uniform_random():
     # no locality at all — worst-case unions
     rng = np.random.default_rng(1)
     tk = rng.integers(0, 96, size=(256, 8)).astype(np.int32)
-    _check(tk, qb=32, num_units=96, u_max=96)
+    _check(tk, qb=32, u_max=96)
 
 
 @pytest.mark.parametrize("T", [1, 63, 64, 65, 130])
 def test_block_boundaries(T):
     rng = np.random.default_rng(2)
     tk = rng.integers(0, 40, size=(T, 4)).astype(np.int32)
-    _check(tk, qb=64, num_units=40, u_max=40)
+    _check(tk, qb=64, u_max=40)
 
 
 def test_padded_and_empty_rows():
@@ -102,31 +103,22 @@ def test_padded_and_empty_rows():
     tk[10] = -1  # fully padded query (e.g. beyond seq end)
     tk[20, 2:] = -1  # partially padded topk row
     tk[64:] = -1  # whole second block empty
-    _check(tk, qb=64, num_units=40, u_max=40)
+    _check(tk, qb=64, u_max=40)
 
 
 def test_duplicates_within_query():
     tk = np.array([[3, 3, 7, 7], [7, 3, 3, 3], [-1, 5, 5, -1]], np.int32)
-    _check(tk, qb=2, num_units=8, u_max=8)
-
-
-def test_u_max_exceeds_num_units():
-    # u_max wider than the id space: units tail must stay -1 padded
-    tk = np.array([[0, 3], [3, 1]], np.int32)
-    _check(tk, qb=2, num_units=4, u_max=8)
+    _check(tk, qb=2, u_max=8)
 
 
 def test_overflow_reported_uncapped():
     # true union (16) exceeds u_max (8): counts must report the TRUE size so the
-    # caller can gate; retained prefix = first u_max sorted uniques; the by-id
-    # membership is unaffected by the truncation.
+    # caller can gate; retained prefix = first u_max sorted uniques.
     tk = np.arange(16, dtype=np.int32).reshape(4, 4)  # one block, 16 uniques
-    units, member, counts = build_block_unit_tables(
-        jnp.asarray(tk), query_block=4, num_units=16, u_max=8
-    )
+    units, member, counts = build_block_unit_tables(jnp.asarray(tk), query_block=4, u_max=8)
     assert int(counts[0]) == 16
     np.testing.assert_array_equal(np.asarray(units[0]), np.arange(8))
-    _, omember, _ = _oracle(tk, 4, 16, 8)
+    ounits, omember, _ = _oracle(tk, 4, 8)
     np.testing.assert_array_equal(np.asarray(member), omember)
 
 
@@ -145,5 +137,4 @@ def test_packed_multirequest_global_keys(num_seqs):
         tk[tk % 5 == 0] = -1  # sprinkle padding
         rows.append(np.where(tk >= 0, tk + base, -1))
     tk_packed = np.concatenate(rows, axis=0)
-    nu = num_seqs * pages_per_seq
-    _check(tk_packed, qb=64, num_units=nu, u_max=nu)
+    _check(tk_packed, qb=64, u_max=num_seqs * pages_per_seq)

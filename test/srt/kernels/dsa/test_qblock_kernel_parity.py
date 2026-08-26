@@ -213,3 +213,105 @@ if __name__ == "__main__":
     test_empty_and_padded_queries()
     test_small_u_max_padding()
     print("QBLOCK PARITY OK")
+
+
+# ── packed-ragged parity: qblock ragged vs the deployed ragged wrapper ──────
+
+prefill_write_and_attend_ragged = smp.prefill_write_and_attend_ragged
+prefill_write_and_attend_ragged_qblock = qb_mod.prefill_write_and_attend_ragged_qblock
+
+_PS = 128
+_KV_LORA, _ROPE = 512, 64
+_DK_PAD = 640
+_H8 = 8
+_SC = 1.0 / (192.0**0.5)
+
+
+def _ragged_case(seq_lens_list, K, seed=0):
+    """Static-shape packed batch: per-request query block padded to S_pad,
+    physical pages a permutation (so bases/loc are genuinely exercised)."""
+    rng = np.random.default_rng(seed)
+    num_seqs = len(seq_lens_list)
+    pages_per_seq = int(np.ceil(max(seq_lens_list) / _PS))
+    S_pad = pages_per_seq * _PS
+    total = num_seqs * S_pad
+    num_pages = num_seqs * pages_per_seq
+    phys = rng.permutation(num_pages).reshape(num_seqs, pages_per_seq).astype(np.int32)
+
+    ql = np.zeros((total, _H8, _KV_LORA), np.float32)
+    qpe = np.zeros((total, _H8, _ROPE), np.float32)
+    kvc = np.zeros((total, _KV_LORA), np.float32)
+    kpe = np.zeros((total, _ROPE), np.float32)
+    positions = np.zeros(total, np.int32)
+    loc = np.full(total, -1, np.int32)
+    tp = np.full((total, K), -1, np.int32)
+    real = np.zeros(total, bool)
+    for i, L in enumerate(seq_lens_list):
+        base = i * S_pad
+        ql[base : base + L] = rng.standard_normal((L, _H8, _KV_LORA)) * 0.1
+        qpe[base : base + L] = rng.standard_normal((L, _H8, _ROPE)) * 0.1
+        kvc[base : base + L] = rng.standard_normal((L, _KV_LORA)) * 0.1
+        kpe[base : base + L] = rng.standard_normal((L, _ROPE)) * 0.1
+        for j in range(L):
+            t = base + j
+            real[t] = True
+            positions[t] = j
+            loc[t] = phys[i, j // _PS] * _PS + (j % _PS)
+            hi = j // _PS + 1
+            n = min(K, hi)
+            ch = rng.choice(hi, size=n, replace=False)
+            if 0 not in ch:
+                ch[0] = 0
+            tp[t, :n] = ch
+    return dict(
+        ql=jnp.asarray(ql),
+        qpe=jnp.asarray(qpe),
+        kvc=jnp.asarray(kvc),
+        kpe=jnp.asarray(kpe),
+        cache=jnp.zeros((num_pages, _PS, 1, _DK_PAD), jnp.float32),
+        topk_pages=jnp.asarray(tp),
+        positions=jnp.asarray(positions),
+        loc=jnp.asarray(loc),
+        seq_lens=jnp.asarray(seq_lens_list, jnp.int32),
+        cu_q_lens=jnp.asarray(np.arange(num_seqs + 1) * S_pad, jnp.int32),
+        cu_kv_lens=jnp.asarray(np.arange(num_seqs + 1) * pages_per_seq * _PS, jnp.int32),
+        page_indices=jnp.asarray(phys.reshape(-1)),
+        real=real,
+    )
+
+
+@pytest.mark.parametrize(
+    "seq_lens_list, qb",
+    [
+        # varlen incl. a 1-token (decode-like) row; QB=48 does not divide the
+        # 256-token per-request padding => blocks straddle request boundaries
+        ([200, 512, 1, 129], 48),
+        # uniform blocks aligned to requests
+        ([256, 256], 64),
+    ],
+)
+def test_ragged_qblock_vs_deployed(seq_lens_list, qb):
+    c = _ragged_case(seq_lens_list, K=4, seed=11)
+    args = (
+        c["ql"],
+        c["qpe"],
+        c["kvc"],
+        c["kpe"],
+        c["cache"],
+        c["topk_pages"],
+        c["positions"],
+        c["loc"],
+        c["seq_lens"],
+        c["cu_q_lens"],
+        c["cu_kv_lens"],
+        c["page_indices"],
+    )
+    kw = dict(kv_lora_rank=_KV_LORA, page_size=_PS, sm_scale=_SC, interpret=True)
+    o_cur, cache_cur = prefill_write_and_attend_ragged(*args, **kw)
+    o_qb, cache_qb = prefill_write_and_attend_ragged_qblock(*args, query_block=qb, **kw)
+    real = c["real"]
+    d_o = np.abs(np.asarray(o_qb)[real] - np.asarray(o_cur)[real]).max()
+    d_c = np.abs(np.asarray(cache_qb) - np.asarray(cache_cur)).max()
+    print(f"[ragged qblock qb={qb}] |o_qb-o_cur|={d_o:.3e} |cache diff|={d_c:.3e}")
+    assert d_c == 0.0, "self-write must be identical"
+    assert d_o < 2e-3, f"ragged qblock vs deployed ragged drifted: {d_o}"
