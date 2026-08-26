@@ -30,6 +30,8 @@ import zmq.asyncio
 from fastapi import BackgroundTasks
 
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.disaggregation.encoder.bootstrap import EncoderBootstrapServer
+from sgl_jax.srt.disaggregation.encoder.client import dispatch_encoder_request
 from sgl_jax.srt.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -240,6 +242,17 @@ class TokenizerManager:
         self.max_req_input_len = None
         self.asyncio_tasks = set()
 
+        # The local bootstrap and the request path share this list by reference.
+        # Static URLs remain available and dynamic registrations are added in place.
+        self.encoder_urls = list(server_args.encoder_urls)
+        self.encoder_bootstrap_server: EncoderBootstrapServer | None = None
+        if server_args.encoder_bootstrap_port is not None:
+            self.encoder_bootstrap_server = EncoderBootstrapServer(
+                host=server_args.host,
+                port=server_args.encoder_bootstrap_port,
+                urls=self.encoder_urls,
+            )
+
         # For load balancing
         self.current_load = 0
         self.current_load_lock = asyncio.Lock()
@@ -316,6 +329,14 @@ class TokenizerManager:
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
 
+        if (
+            isinstance(obj, GenerateReqInput)
+            and self._encoder_disaggregation_enabled()
+            and obj.contains_mm_input()
+            and getattr(obj, "parallel_sample_num", 1) > 1
+        ):
+            raise ValueError("encoder disaggregation does not support parallel sampling yet")
+
         # Acquire LoRA ID if lora_path is provided
         if isinstance(obj, GenerateReqInput) and self.server_args.enable_lora and obj.lora_path:
             obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
@@ -376,7 +397,40 @@ class TokenizerManager:
             input_ids = encoded["input_ids"]
 
         self._validate_one_request(obj, input_ids)
-        return self._create_tokenized_object(obj, input_text, input_ids, mm_inputs)
+        tokenized_obj = self._create_tokenized_object(obj, input_text, input_ids, mm_inputs)
+
+        if (
+            isinstance(obj, GenerateReqInput)
+            and self._encoder_disaggregation_enabled()
+            and obj.contains_mm_input()
+        ):
+            encoder_urls = await self._get_encoder_urls()
+            timeout = self.server_args.encoder_control_timeout_seconds
+            assignments, dispatch_task = dispatch_encoder_request(
+                obj,
+                encoder_urls,
+                None if timeout <= 0 else timeout,
+            )
+            self.asyncio_tasks.add(dispatch_task)
+            dispatch_task.add_done_callback(self.asyncio_tasks.discard)
+            tokenized_obj.num_items_assigned = assignments
+            tokenized_obj.encoder_urls = encoder_urls
+            tokenized_obj.need_wait_for_mm_inputs = True
+
+        return tokenized_obj
+
+    def _encoder_disaggregation_enabled(self) -> bool:
+        return bool(self.encoder_urls or self.encoder_bootstrap_server is not None)
+
+    async def _get_encoder_urls(self) -> list[str]:
+        encoder_urls = (
+            self.encoder_bootstrap_server.list_urls()
+            if self.encoder_bootstrap_server is not None
+            else list(self.encoder_urls)
+        )
+        if not encoder_urls:
+            raise RuntimeError("no Encoder workers are registered")
+        return encoder_urls
 
     def _validate_one_request(
         self, obj: GenerateReqInput | EmbeddingReqInput, input_ids: list[int]
@@ -1122,6 +1176,8 @@ class TokenizerManager:
                 break
 
         self.shutdown()
+        if self.encoder_bootstrap_server is not None:
+            self.encoder_bootstrap_server.close()
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(0)
 

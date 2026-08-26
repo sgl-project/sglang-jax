@@ -10,13 +10,32 @@ _RAIDEN_EXTENSION = "tpu_raiden.frameworks.jax._tpu_raiden_jax"
 
 
 def raiden_requested(argv: Sequence[str] | None = None) -> bool:
-    requested = False
-    for arg in sys.argv[1:] if argv is None else argv:
+    args = list(sys.argv[1:] if argv is None else argv)
+    pd_requested = False
+    encoder_requested = False
+    for index, arg in enumerate(args):
         if arg == "--disaggregation-use-raiden":
-            requested = True
+            pd_requested = True
         elif arg == "--no-disaggregation-use-raiden":
-            requested = False
-    return requested
+            pd_requested = False
+        elif arg == "--encoder-transfer-backend":
+            encoder_requested = index + 1 < len(args) and args[index + 1] == "raiden"
+        elif arg.startswith("--encoder-transfer-backend="):
+            encoder_requested = arg.split("=", 1)[1] == "raiden"
+        elif arg in (
+            "--encoder-urls",
+            "--encoder-bootstrap-port",
+            "--encoder-register-urls",
+        ) or any(
+            arg.startswith(f"{option}=")
+            for option in (
+                "--encoder-urls",
+                "--encoder-bootstrap-port",
+                "--encoder-register-urls",
+            )
+        ):
+            encoder_requested = True
+    return pd_requested or encoder_requested
 
 
 def preload_raiden() -> None:

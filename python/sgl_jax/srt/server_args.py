@@ -264,6 +264,14 @@ class ServerArgs:
     mm_io_worker_num: int = 0
     mm_processor_worker_num: int = 0
 
+    # Encoder disaggregation
+    encoder_urls: list[str] | None = None
+    encoder_bootstrap_port: int | None = None
+    encoder_register_urls: list[str] | None = None
+    encoder_transfer_backend: str = "raiden"
+    encoder_control_timeout_seconds: float = 300.0
+    encoder_request_timeout_seconds: float = 300.0
+
     enable_return_routed_experts: bool = False
     enable_expert_balance_debug: bool = False
     expert_balance_segment_counter: int = 100
@@ -333,6 +341,8 @@ class ServerArgs:
         # Set missing default values
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
+        self.encoder_urls = list(self.encoder_urls or ())
+        self.encoder_register_urls = list(self.encoder_register_urls or ())
 
         from sgl_jax.srt.disaggregation.pd_auth import resolve_secret
 
@@ -554,6 +564,23 @@ class ServerArgs:
             raise ValueError(
                 f"--disaggregation-mode must be one of {valid_modes}, "
                 f"got {self.disaggregation_mode!r}"
+            )
+        # TODO: Unify it to use a language-only flag for determination.
+        encoder_disaggregation = bool(self.encoder_urls or self.encoder_bootstrap_port is not None)
+        if encoder_disaggregation and self.disaggregation_mode == "decode":
+            raise ValueError("Encoder disaggregation is not used by a decode-only server")
+        if self.encoder_bootstrap_port is not None and not (
+            1 <= self.encoder_bootstrap_port <= 65535
+        ):
+            raise ValueError("--encoder-bootstrap-port must be in [1, 65535]")
+        if self.encoder_transfer_backend != "raiden":
+            raise ValueError(
+                "--encoder-transfer-backend only supports 'raiden', "
+                f"got {self.encoder_transfer_backend!r}"
+            )
+        if encoder_disaggregation and self.encoder_request_timeout_seconds <= 0:
+            raise ValueError(
+                "Raiden encoder transfer requires a positive " "--encoder-request-timeout-seconds"
             )
         if self.pd_disaggregation and self.disaggregation_mode != "null":
             raise ValueError(
@@ -1633,6 +1660,46 @@ class ServerArgs:
             type=int,
             default=ServerArgs.mm_processor_worker_num,
             help="Number of multimodal processor workers. 0 uses the model default.",
+        )
+        parser.add_argument(
+            "--encoder-urls",
+            type=str,
+            nargs="+",
+            default=None,
+            help="Static HTTP base URLs of external multimodal encoders.",
+        )
+        parser.add_argument(
+            "--encoder-bootstrap-port",
+            type=int,
+            default=ServerArgs.encoder_bootstrap_port,
+            help="Port for the local Encoder bootstrap server. Setting this enables "
+            "dynamic Encoder registration; 8997 is recommended.",
+        )
+        parser.add_argument(
+            "--encoder-register-urls",
+            type=str,
+            nargs="+",
+            default=None,
+            help="Language-server Encoder bootstrap URLs to register with.",
+        )
+        parser.add_argument(
+            "--encoder-transfer-backend",
+            type=str,
+            choices=["raiden"],
+            default=ServerArgs.encoder_transfer_backend,
+            help="Encoder embedding transfer backend. Only Raiden is supported.",
+        )
+        parser.add_argument(
+            "--encoder-control-timeout-seconds",
+            type=float,
+            default=ServerArgs.encoder_control_timeout_seconds,
+            help="Timeout for encoder control requests. <=0 disables it.",
+        )
+        parser.add_argument(
+            "--encoder-request-timeout-seconds",
+            type=float,
+            default=ServerArgs.encoder_request_timeout_seconds,
+            help="Timeout for completing an encoder request. <=0 disables it.",
         )
 
         # LoRA

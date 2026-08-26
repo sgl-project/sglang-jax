@@ -9,6 +9,7 @@ import numpy as np
 
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason
 from sgl_jax.srt.multimodal.common.modality_enum import (
+    Modality,
     MultimodalInputs,
     build_radix_input_ids,
     flatten_nested_list,
@@ -172,6 +173,9 @@ class TokenizedGenerateReqInput:
     return_hidden_states: bool = False
     # multimodal inputs (e.g., mrope positions, embeddings)
     mm_inputs: MultimodalInputs | dict | None = None
+    need_wait_for_mm_inputs: bool = False
+    num_items_assigned: dict[Modality, list[int]] | None = None
+    encoder_urls: list[str] | None = None
     # Decode DP rank selected by request routing.
     dp_rank: int | None = None
     # PD disaggregation routing keys.
@@ -582,9 +586,15 @@ class GenerateReqInput:
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
             input_embeds=self.input_embeds[i] if self.input_embeds is not None else None,
-            image_data=self.image_data[i] if self.image_data is not None else None,
-            video_data=self.video_data[i] if self.video_data is not None else None,
-            audio_data=self.audio_data[i] if self.audio_data is not None else None,
+            image_data=(
+                self.image_data[i] if isinstance(self.image_data, list) else self.image_data
+            ),
+            video_data=(
+                self.video_data[i] if isinstance(self.video_data, list) else self.video_data
+            ),
+            audio_data=(
+                self.audio_data[i] if isinstance(self.audio_data, list) else self.audio_data
+            ),
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
             return_logprob=self.return_logprob[i],

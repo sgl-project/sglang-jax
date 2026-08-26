@@ -30,6 +30,11 @@ from sgl_jax.srt.constrained.base_grammar_backend import (
     create_grammar_backend,
 )
 from sgl_jax.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
+from sgl_jax.srt.disaggregation.encoder.client import (
+    EncoderClient,
+    PendingEncoderRequest,
+    create_encoder_client,
+)
 from sgl_jax.srt.disaggregation.pathways_scheduler import PathwaysPDSchedulerMixin
 from sgl_jax.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sgl_jax.srt.disaggregation.runtime import install_disaggregation_wiring
@@ -263,6 +268,9 @@ class Scheduler(
         # resolution) + reqs deferred because no prefill was registered yet.
         self.disagg_prefill_info_cache = None
         self._pd_pending_bootstrap = []
+
+        self.encoder_client: EncoderClient | None = None
+        self.encoder_waiting: dict[str, PendingEncoderRequest] = {}
 
         # LoRA configurations
         self.lora_paths = server_args.lora_paths
@@ -576,6 +584,9 @@ class Scheduler(
                 (ContinueGenerationReqInput, self.continue_generation),
             ]
         )
+
+        if server_args.encoder_urls or server_args.encoder_bootstrap_port is not None:
+            self.init_encoder_disaggregation()
 
         if not server_args.disable_precompile and not self.pd:
             if self.spec_algorithm is None or self.spec_algorithm.is_none():
@@ -1319,9 +1330,94 @@ class Scheduler(
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: list):
+        if self.encoder_client is not None:
+            recv_reqs = self.process_encoder_requests(recv_reqs)
+
         for recv_req in recv_reqs:
             output = self._request_dispatcher(recv_req)
             if output is not None:
+                if self._comm_backend is not None:
+                    self._comm_backend.send_pyobj(output)
+                else:
+                    self.send_to_tokenizer.send_pyobj(output)
+
+    def init_encoder_disaggregation(self) -> None:
+        if self.nnodes > 1:
+            raise RuntimeError("encoder disaggregation does not support multi-host schedulers yet")
+        self.encoder_client = create_encoder_client(self.server_args, self.mesh)
+
+    def process_encoder_requests(self, recv_reqs: list) -> list:
+        ready = []
+        now = time.monotonic()
+
+        for recv_req in recv_reqs:
+            if not self._needs_encoder(recv_req):
+                ready.append(recv_req)
+                continue
+            if recv_req.rid in self.encoder_waiting:
+                continue
+
+            try:
+                pending = self.encoder_client.receive(recv_req)
+            except Exception as exc:
+                self._abort_encoder_request(recv_req, str(exc))
+                continue
+
+            self.encoder_waiting[recv_req.rid] = pending
+
+        timeout = self.server_args.encoder_request_timeout_seconds
+        for rid, pending in list(self.encoder_waiting.items()):
+            recv_req = pending.recv_req
+
+            try:
+                result = pending.poll()
+            except Exception as exc:
+                self._abort_encoder_request(recv_req, str(exc))
+                self._remove_encoder_waiting(rid)
+                continue
+
+            if result is not None:
+                if recv_req.mm_inputs is None:
+                    recv_req.mm_inputs = {}
+                recv_req.mm_inputs.update(result)
+                ready.append(recv_req)
+                self._remove_encoder_waiting(rid)
+                continue
+
+            if timeout > 0 and now - pending.started_at >= timeout:
+                self._abort_encoder_request(
+                    recv_req,
+                    f"encoder timed out after {timeout}s",
+                )
+                self._remove_encoder_waiting(rid)
+
+        return ready
+
+    @staticmethod
+    def _needs_encoder(recv_req) -> bool:
+        if not isinstance(recv_req, TokenizedGenerateReqInput):
+            return False
+        if not recv_req.need_wait_for_mm_inputs:
+            return False
+        return recv_req.mm_inputs is None or recv_req.mm_inputs.get("multimodal_embedding") is None
+
+    def _abort_encoder_request(self, recv_req, error_msg: str) -> None:
+        logger.error("Encoder request failed. rid=%s error=%s", recv_req.rid, error_msg)
+        output = AbortReq(rid=recv_req.rid, aborted_message=error_msg)
+        if self._comm_backend is not None:
+            self._comm_backend.send_pyobj(output)
+        else:
+            self.send_to_tokenizer.send_pyobj(output)
+
+    def _remove_encoder_waiting(self, rid: str) -> None:
+        pending = self.encoder_waiting.pop(rid)
+        pending.close()
+
+    def _cancel_encoder_requests(self, recv_req: AbortReq) -> None:
+        for rid in list(self.encoder_waiting):
+            if recv_req.abort_all or rid.startswith(recv_req.rid):
+                self._remove_encoder_waiting(rid)
+                output = AbortReq(rid=rid)
                 if self._comm_backend is not None:
                     self._comm_backend.send_pyobj(output)
                 else:
@@ -2790,6 +2886,7 @@ class Scheduler(
         self.parent_process.send_signal(signal.SIGQUIT)
 
     def abort_request(self, recv_req: AbortReq):
+        self._cancel_encoder_requests(recv_req)
         self._sync_chunked_req_owners()
         self._mark_pending_chunked_aborts(recv_req)
 
