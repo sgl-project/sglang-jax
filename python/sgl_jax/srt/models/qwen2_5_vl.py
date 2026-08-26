@@ -373,6 +373,7 @@ class Qwen2_5_VisionTransformer(nnx.Module):
         input_buckets: tuple[int, ...] | None = None,
     ):
         self.mesh = mesh
+        self.dtype = dtype
         self.vision_tp = vision_tp
         self.specs = VisionShardSpecs(mesh, vision_tp)
         self.input_buckets = input_buckets or tuple(resolve_vision_patch_buckets(None))
@@ -491,6 +492,7 @@ class Qwen2_5_VisionTransformer(nnx.Module):
             patch_dim=self.patch_dim,
             merge_unit=self.spatial_merge_unit,
             rope_type="rope_3d",
+            dtype=self.dtype,
         )
 
     def _build_metadata(
@@ -632,11 +634,7 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         # Vision tower.
         self.visual_config = config.vision_config
 
-        from sgl_jax.srt.managers.schedule_batch import global_server_args_dict
-
-        vision_tp = resolve_encoder_tp(
-            mesh, global_server_args_dict.get("vision_encoder_parallel", "dp")
-        )
+        vision_tp = resolve_encoder_tp(mesh, getattr(config, "vision_encoder_parallel", "dp"))
         self.visual = Qwen2_5_VisionTransformer(
             config=self.visual_config,
             dtype=self.dtype,
@@ -646,7 +644,7 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
             vision_tp=vision_tp,
             input_buckets=tuple(
                 resolve_vision_patch_buckets(
-                    global_server_args_dict.get("precompile_vision_patch_paddings")
+                    getattr(config, "precompile_vision_patch_paddings", None)
                 )
             ),
         )
@@ -678,6 +676,7 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
             buckets=self.visual.input_buckets,
             merge_unit=self.visual.spatial_merge_unit,
             rope_type="rope_3d",
+            dtype=self.dtype,
         )
 
     def get_multimodal_encode_funcs(self):

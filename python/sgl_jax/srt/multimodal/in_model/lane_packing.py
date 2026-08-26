@@ -95,7 +95,7 @@ def _bucket_capacity(length: int, buckets: tuple[int, ...], unit: int) -> int:
     """Smallest ``unit``-aligned bucket that fits ``length`` (power-of-two fallback)."""
     return next(
         (bucket for bucket in buckets if bucket >= length and bucket % unit == 0),
-        ((1 << (length - 1).bit_length()) + unit - 1) // unit * unit,
+        1 << (length - 1).bit_length(),
     )
 
 
@@ -105,7 +105,7 @@ def pack_lanes(
     *,
     buckets: tuple[int, ...],
     merge_unit: int,
-    dtype: np.dtype | type = np.float32,
+    dtype: np.dtype | type,
 ) -> PackedLanes:
     features_np = [np.asarray(item.feature) for item in items]
     lengths = [feature.shape[0] for feature in features_np]
@@ -150,6 +150,7 @@ def pack_vision_inputs(
     num_lanes: int,
     buckets: tuple[int, ...],
     merge_unit: int,
+    dtype: np.dtype | type,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     _validate_vision_items(items, merge_unit)
     packed = pack_lanes(
@@ -157,6 +158,7 @@ def pack_vision_inputs(
         num_lanes,
         buckets=buckets,
         merge_unit=merge_unit,
+        dtype=dtype,
     )
     grid_thw = np.zeros(
         (num_lanes, max(map(len, packed.lanes)), 3),
@@ -174,6 +176,7 @@ def pack_2d_position_inputs(
     num_lanes: int,
     buckets: tuple[int, ...],
     merge_unit: int,
+    dtype: np.dtype | type,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Pack vision inputs that carry explicit per-patch 2D positions."""
     item_positions = []
@@ -210,6 +213,7 @@ def pack_2d_position_inputs(
         num_lanes,
         buckets=buckets,
         merge_unit=merge_unit,
+        dtype=dtype,
     )
     position_ids = np.full(
         (num_lanes, packed.cap, 2),
@@ -273,6 +277,7 @@ def run_mrope_vision_model(
     buckets: tuple[int, ...],
     merge_unit: int,
     rope_type: Literal["rope_3d", "rope_2d", "rope_2d_packed"],
+    dtype: np.dtype | type,
 ) -> jax.Array:
     """Pack, run, and restore a sharded vision model with RoPE metadata."""
     if rope_type == "rope_2d_packed":
@@ -281,6 +286,7 @@ def run_mrope_vision_model(
             num_lanes=num_lanes,
             buckets=buckets,
             merge_unit=merge_unit,
+            dtype=dtype,
         )
         output = vision_model(patches, position_ids, patch_counts)
     elif rope_type in ("rope_3d", "rope_2d"):
@@ -289,6 +295,7 @@ def run_mrope_vision_model(
             num_lanes=num_lanes,
             buckets=buckets,
             merge_unit=merge_unit,
+            dtype=dtype,
         )
         output = vision_model(patches, grid_thw)
     else:
@@ -307,6 +314,7 @@ def precompile_mrope_vision_model(
     patch_dim: int,
     merge_unit: int,
     rope_type: Literal["rope_3d", "rope_2d", "rope_2d_packed"],
+    dtype: np.dtype | type,
 ) -> None:
     merge_size = math.isqrt(merge_unit)
     for capacity in buckets:
@@ -320,7 +328,7 @@ def precompile_mrope_vision_model(
             )
         item = MultimodalDataItem(
             modality=Modality.IMAGE,
-            feature=np.zeros((capacity, patch_dim), dtype=np.float32),
+            feature=np.zeros((capacity, patch_dim), dtype=dtype),
             placeholder_ranges=[(0, capacity // merge_unit)],
             model_specific_data=model_specific_data,
         )
@@ -332,5 +340,6 @@ def precompile_mrope_vision_model(
             buckets=buckets,
             merge_unit=merge_unit,
             rope_type=rope_type,
+            dtype=dtype,
         )
         jax.block_until_ready(output)

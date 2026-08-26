@@ -40,6 +40,18 @@ jax.tree_util.register_dataclass(
 )
 
 
+def _resolve_vision_vmem_limit_bytes(mesh, vmem_limit_bytes: int | None) -> int:
+    if vmem_limit_bytes is not None:
+        return vmem_limit_bytes
+    if mesh.devices.flat[0].platform == "tpu":
+        from jax.experimental.pallas import tpu as pltpu
+
+        # Keep Pallas programs below the physical per-core VMEM capacity.
+        # A fixed 128 MiB limit exceeds the 64 MiB capacity of v7x.
+        return int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
+    return 128 * 1024 * 1024
+
+
 def vision_segment_ids_from_cu_seqlens(
     cu_seqlens: jax.Array,
     sequence_length: int,
@@ -150,17 +162,7 @@ class VisionFlashAttentionBackend(AttentionBackend):
         head_tp: bool = False,
     ):
         interpret = mesh.devices.flat[0].platform == "cpu"
-        if vmem_limit_bytes is None:
-            if mesh.devices.flat[0].platform == "tpu":
-                from jax.experimental.pallas import tpu as pltpu
-
-                # Keep the Pallas program below the physical VMEM capacity.
-                # The old 128 MiB default lets the compiler produce programs
-                # that exceed v7x's 64 MiB per-core limit.
-                vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
-            else:
-                vmem_limit_bytes = 128 * 1024 * 1024
-        self.vmem_limit_bytes = vmem_limit_bytes
+        self.vmem_limit_bytes = _resolve_vision_vmem_limit_bytes(mesh, vmem_limit_bytes)
         if head_tp:
             if "tensor" not in mesh.axis_names:
                 raise ValueError("head_tp requires a tensor mesh axis")
@@ -250,13 +252,13 @@ class VisionVarlenAttentionBackend(AttentionBackend):
         mesh,
         sm_scale: float = 1.0,
         head_tp: bool = False,
-        vmem_limit_bytes: int = 128 * 1024 * 1024,
+        vmem_limit_bytes: int | None = None,
     ):
         self.mesh = mesh
         self.sm_scale = sm_scale
-        self.vmem_limit_bytes = vmem_limit_bytes
         if mesh.devices.flat[0].platform != "tpu":
             raise ValueError("VisionVarlenAttentionBackend requires a TPU mesh")
+        self.vmem_limit_bytes = _resolve_vision_vmem_limit_bytes(mesh, vmem_limit_bytes)
         if head_tp:
             if "tensor" not in mesh.axis_names:
                 raise ValueError("head_tp requires a tensor mesh axis")
