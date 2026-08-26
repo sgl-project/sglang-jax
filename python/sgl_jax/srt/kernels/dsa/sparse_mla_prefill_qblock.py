@@ -9,14 +9,20 @@ rows, idling the MXU.
 
 The blocked kernel amortises both: ``QB`` queries share one program, the block's
 selected-page **union** is DMA'd once per page, and per-query selection is
-restored with a ``-inf`` membership bias (bitmap AND causal AND kv_len) inside a
+restored with a ``-inf`` membership bias (bitmap AND causal) inside a
 flash-softmax over ``QB*H`` score rows.
 
-This module hosts (in build order):
+This module hosts:
 
 1. ``build_block_unit_tables`` — jnp preprocessing (outside the kernel): turn
-   ``topk_units [T, K]`` into per-block union tables + membership bitmaps.
-2. the Pallas query-block kernel itself (v1: single-sequence flat).
+   ``topk_units [T, K]`` into per-block union lists + a **by-unit-id** membership
+   bitmap. Deliberately scatter-free: an earlier compacted-slot bitmap built with
+   a 3D ``.at[].set`` scatter cost ~25 ms/layer on TPU at the 110k shape; the
+   broadcast-compare + sort form is ~0.6 ms.
+2. the Pallas query-block kernel (v1: single-sequence flat KV) with an
+   ``NBUF``-deep ring of unit DMAs — the per-unit fetches are latency-bound
+   (~1.5 µs each), so the next units are prefetched while the current one is
+   scored.
 """
 
 from __future__ import annotations
@@ -30,11 +36,14 @@ from jax.experimental.pallas import tpu as pltpu
 
 _SENTINEL = jnp.iinfo(jnp.int32).max
 
+_NBUF = 4  # DMA ring depth (prefetch distance)
+
 
 def build_block_unit_tables(
     topk_units,  # [T, K] int32 selected unit ids per query, -1 padded
     *,
     query_block: int,  # QB: queries per block
+    num_units: int,  # total unit-id space (ids are in [0, num_units) or -1)
     u_max: int,  # static cap on the per-block union size
 ):
     """Per-query-block union + membership tables for the blocked kernel.
@@ -43,56 +52,43 @@ def build_block_unit_tables(
 
     * ``blk_units [nQB, u_max]`` int32 — the block's selected units, sorted
       ascending, ``-1`` padded. Uniques beyond ``u_max`` are dropped.
-    * ``blk_member [nQB, query_block, u_max]`` int8 — 1 where query ``q`` of the
-      block selected ``blk_units[b, u]`` (the kernel's -inf bias source).
+    * ``blk_member [nQB, query_block, num_units]`` int8 — 1 where query ``q`` of
+      the block selected unit id ``p`` (indexed **by unit id**, not by union
+      slot — the kernel's -inf bias source).
     * ``blk_counts [nQB]`` int32 — the TRUE union size, **uncapped**: a value
-      ``> u_max`` means the block overflowed and its tables are incomplete; the
-      caller must gate (pick ``u_max >= min(query_block*K, num_units)`` to make
-      overflow impossible).
+      ``> u_max`` means ``blk_units`` is incomplete and the caller must gate
+      (pick ``u_max >= min(query_block*K, num_units)`` to make overflow
+      impossible). ``blk_member`` is by-id and unaffected by overflow.
 
     ``T`` need not divide ``query_block``; trailing queries are padded with
-    ``-1`` rows (all-zero membership). Unit ids are opaque keys: callers with
-    packed multi-request (ragged) inputs lift seq-local ids to global keys
-    (e.g. ``base + page``) before calling, so blocks may straddle requests.
+    ``-1`` rows (all-zero membership). Callers with packed multi-request
+    (ragged) inputs lift seq-local ids to global keys (e.g. ``base + page``)
+    before calling, so blocks may straddle requests.
     """
     T, K = topk_units.shape
     qb = query_block
     n_blk = -(-T // qb)
     pad = n_blk * qb - T
     tk = jnp.pad(topk_units.astype(jnp.int32), ((0, pad), (0, 0)), constant_values=-1)
-    flat = tk.reshape(n_blk, qb * K)
+    tk = tk.reshape(n_blk, qb, K)
 
-    # sort with -1/padding mapped to a +inf sentinel so invalids sink to the end
-    vals = jnp.where(flat < 0, _SENTINEL, flat)
-    svals = jnp.sort(vals, axis=1)
-    is_new = jnp.concatenate([jnp.ones((n_blk, 1), bool), svals[:, 1:] != svals[:, :-1]], axis=1)
-    uniq = is_new & (svals != _SENTINEL)
-    blk_counts = uniq.sum(axis=1).astype(jnp.int32)
+    # membership by unit id: broadcast compare + reduce over K (fuses on TPU;
+    # negative/padded selections match nothing).
+    ids = jnp.arange(num_units, dtype=jnp.int32)
+    sel = (tk[:, :, :, None] == ids[None, None, None, :]).any(axis=2)  # [nQB,qb,NU]
+    blk_member = sel.astype(jnp.int8)
 
-    # compact: scatter each first-occurrence to its rank; overflow ranks drop
-    rank = jnp.cumsum(uniq, axis=1) - 1
-    rank = jnp.where(uniq, rank, u_max)  # non-unique/sentinel -> out of range
-    rows = jnp.broadcast_to(jnp.arange(n_blk, dtype=jnp.int32)[:, None], rank.shape)
-    blk_units = jnp.full((n_blk, u_max), -1, jnp.int32)
-    blk_units = blk_units.at[rows, rank].set(svals, mode="drop")
-
-    # membership: binary-search every (query, k) selection in the compacted
-    # table (valid prefix ascending; -1 pad remapped to the sentinel so the
-    # array is globally sorted). O(T*K*log u_max) and no [.., K, u_max]
-    # broadcast materialisation.
-    search_tbl = jnp.where(blk_units < 0, _SENTINEL, blk_units)
-    pos = jax.vmap(jnp.searchsorted)(search_tbl, vals)  # [n_blk, qb*K]
-    pos_c = jnp.minimum(pos, u_max - 1)
-    hit = (
-        (vals != _SENTINEL)
-        & (pos < u_max)
-        & (jnp.take_along_axis(search_tbl, pos_c, axis=1) == vals)
+    # union list: presence per block, compacted by sorting masked unit ids
+    present = sel.any(axis=1)  # [n_blk, NU]
+    blk_counts = present.sum(axis=1).astype(jnp.int32)
+    masked = jnp.where(present, ids[None, :], _SENTINEL)
+    srt = jax.lax.sort(masked, dimension=1)
+    srt = (
+        srt[:, :u_max]
+        if u_max < num_units
+        else jnp.pad(srt, ((0, 0), (0, u_max - num_units)), constant_values=_SENTINEL)
     )
-    b_idx = jnp.broadcast_to(jnp.arange(n_blk, dtype=jnp.int32)[:, None, None], (n_blk, qb, K))
-    q_idx = jnp.broadcast_to(jnp.arange(qb, dtype=jnp.int32)[None, :, None], (n_blk, qb, K))
-    u_idx = jnp.where(hit, pos, u_max).reshape(n_blk, qb, K)  # miss -> dropped
-    blk_member = jnp.zeros((n_blk, qb, u_max), jnp.int8)
-    blk_member = blk_member.at[b_idx, q_idx, u_idx].set(1, mode="drop")
+    blk_units = jnp.where(srt == _SENTINEL, -1, srt)
     return blk_units, blk_member, blk_counts
 
 
@@ -101,25 +97,30 @@ def _qblock_kernel(
     units_ref,  # [1, 1, 1, U_pad]  SMEM  block union unit ids (-1 pad)
     cnt_ref,  # [1, 1, 1, 1]        SMEM  block union size (loop bound)
     qpos_ref,  # [1, 1, 1, QBHp]    VMEM  per-row query position (-1 on pad rows)
-    mem_ref,  # [1, 1, U_pad, QBHp] VMEM  int8 membership, unit-major
+    mem_ref,  # [1, 1, NU_pad, QBHp] VMEM int8 membership, indexed by unit id
     kv_hbm,  # [B, T(+RBF), Dk_pad] HBM   flat latent (DMA-gathered)
     o_ref,  # [1, 1, QBHp, Dv]
-    kv_scratch,  # [RBF, Dk_pad] VMEM     one gathered unit
-    sem,  # DMA semaphore
+    kv_scratch,  # [NBUF, RBF, Dk_pad] VMEM  DMA ring
+    sem,  # DMA semaphores (NBUF,)
     *,
     sm_scale: float,
     Dv: int,
     RB: int,
     RBF: int,
 ):
-    """Query-block sparse-MLA kernel, v1 (flat single-buffer form).
+    """Query-block sparse-MLA kernel (flat KV), ring-prefetched.
 
     Score layout is **key-major**: the unit's ``RBF`` keys sit on the sublane
     axis and the block's ``QB*H`` (query, head) rows sit on the *lane* axis
     (``s = kv · qᵀ -> [RBF, QBHp]``). That orientation lets the per-unit
-    membership bias come straight from a dynamic **sublane** row read of
-    ``mem_ref`` (lane-axis dynamic slicing is not needed anywhere), and the
-    flash-softmax state (``m``/``l``) lives as plain lane vectors.
+    membership bias come from an aligned-window sublane read of ``mem_ref``
+    (no lane-axis dynamic slicing anywhere), and the flash-softmax state
+    (``m``/``l``) lives as plain lane vectors.
+
+    Unit fetches are pipelined through an ``NBUF``-slot VMEM ring: iteration
+    ``j`` waits on slot ``j % NBUF`` while slots for ``j+1 .. j+NBUF-1`` are in
+    flight — without this the loop is bound by per-DMA latency (~1.5 µs), not
+    bandwidth.
     """
     b = pl.program_id(0)
     QBHp = q_ref.shape[2]
@@ -128,6 +129,19 @@ def _qblock_kernel(
     qpos_row = qpos_ref[0, 0]  # [1, QBHp] int32
     rows = jax.lax.broadcasted_iota(jnp.int32, (RBF, 1), 0)  # key row within unit
 
+    def _copy(j, slot):
+        u = jnp.maximum(units_ref[0, 0, 0, j], 0)
+        return pltpu.make_async_copy(
+            kv_hbm.at[b, pl.ds(u * RB, RBF), :], kv_scratch.at[slot], sem.at[slot]
+        )
+
+    # prologue: fill the ring (d=d: bind the loop var per iteration, B023)
+    for d in range(_NBUF - 1):
+
+        @pl.when(d < cnt)
+        def _(d=d):
+            _copy(d, d).start()
+
     m0 = jnp.full((QBHp,), -jnp.inf, dtype=jnp.float32)
     l0 = jnp.zeros((QBHp,), dtype=jnp.float32)
     acc0 = jnp.zeros((QBHp, Dv), dtype=jnp.float32)
@@ -135,16 +149,23 @@ def _qblock_kernel(
     def unit_body(j, carry):
         m_i, l_i, acc = carry
         u = units_ref[0, 0, 0, j]  # scalar unit id (>= 0 for j < cnt)
-        pltpu.make_async_copy(kv_hbm.at[b, pl.ds(u * RB, RBF), :], kv_scratch.at[...], sem).start()
+        slot = jax.lax.rem(j, _NBUF)
 
-        # membership row for this unit. A direct mem_ref[0, 0, j, :] is not
+        # keep the ring full: issue the fetch NBUF-1 ahead
+        nxt = j + _NBUF - 1
+
+        @pl.when(nxt < cnt)
+        def _():
+            _copy(nxt, jax.lax.rem(nxt, _NBUF)).start()
+
+        # membership row for this unit id. A direct mem_ref[.., u, :] is not
         # Mosaic-lowerable (int8 tile is (32, 128): a dynamic sublane index
         # must be provably %32), so read the aligned 32-row window containing
-        # j — (j // 32) * 32 is provably aligned, the same idiom as the paged
-        # r8*8 trick — and select row j within it via an iota compare + max.
-        j32 = (j // 32) * 32
-        mem_win = mem_ref[0, 0, pl.ds(j32, 32), :]  # [32, QBHp] int8
-        rowsel = jax.lax.broadcasted_iota(jnp.int32, (32, 1), 0) == (j - j32)
+        # u — (u // 32) * 32 is provably aligned, the same idiom as the paged
+        # r8*8 trick — and select row u within it via an iota compare + max.
+        u32 = (u // 32) * 32
+        mem_win = mem_ref[0, 0, pl.ds(u32, 32), :]  # [32, QBHp] int8
+        rowsel = jax.lax.broadcasted_iota(jnp.int32, (32, 1), 0) == (u - u32)
         mem_row = jnp.max(
             jnp.where(rowsel, mem_win.astype(jnp.int32), 0), axis=0, keepdims=True
         )  # [1, QBHp]
@@ -154,8 +175,8 @@ def _qblock_kernel(
             valid &= rows < RB  # drop sublane over-fetch rows
         bias = jnp.where(valid, 0.0, -jnp.inf)  # [RBF, QBHp] fp32
 
-        pltpu.make_async_copy(kv_hbm.at[b, pl.ds(u * RB, RBF), :], kv_scratch.at[...], sem).wait()
-        kv_blk = kv_scratch[...]  # [RBF, Dk_pad]
+        _copy(j, slot).wait()
+        kv_blk = kv_scratch[slot]  # [RBF, Dk_pad]
 
         # score: [RBF,Dk]·[QBHp,Dk] -> [RBF, QBHp] (keys sublane, queries lane)
         s = (
@@ -219,22 +240,25 @@ def sparse_mla_attention_qblock(
         u_max = min(QB * K, num_units)
 
     # ── preprocessing (jnp, outside the kernel) ────────────────────────────
-    blk_u, bm, bc = jax.vmap(
-        functools.partial(build_block_unit_tables, query_block=QB, u_max=u_max)
+    blk_u, blk_m, blk_c = jax.vmap(
+        functools.partial(build_block_unit_tables, query_block=QB, num_units=num_units, u_max=u_max)
     )(indices)
-    # blk_u [B,nQB,u_max] bm [B,nQB,QB,u_max] bc [B,nQB]
+    # blk_u [B,nQB,u_max] blk_m [B,nQB,QB,NU] blk_c [B,nQB]
     nQB = blk_u.shape[1]
-    U_pad = ((u_max + 31) // 32) * 32  # int8 sublane tile
+    U_pad = ((u_max + 31) // 32) * 32
+    NU_pad = ((num_units + 31) // 32) * 32  # int8 sublane tile
     QBH = QB * H
     QBHp = ((QBH + 127) // 128) * 128  # lane axis of the score
 
-    # membership: -> unit-major [B,nQB,U_pad,QBHp] int8, rows H-expanded so the
+    # membership: -> id-major [B,nQB,NU_pad,QBHp] int8, lanes H-expanded so the
     # kernel's lane r = q*H + h reads member[q] directly.
-    memt = jnp.repeat(bm.transpose(0, 1, 3, 2), H, axis=3)  # [B,nQB,u_max,QBH]
-    memt = jnp.pad(memt, ((0, 0), (0, 0), (0, U_pad - u_max), (0, QBHp - QBH)))
+    memt = jnp.repeat(blk_m.transpose(0, 1, 3, 2), H, axis=3)  # [B,nQB,NU,QBH]
+    memt = jnp.pad(memt, ((0, 0), (0, 0), (0, NU_pad - num_units), (0, QBHp - QBH)))
     units4 = jnp.pad(blk_u, ((0, 0), (0, 0), (0, U_pad - u_max)), constant_values=-1)
     units4 = units4.reshape(B, nQB, 1, U_pad)
-    counts4 = bc.reshape(B, nQB, 1, 1)
+    # clamp: if a block overflowed u_max (impossible with the default cap), only
+    # the retained prefix of the union is walked.
+    counts4 = jnp.minimum(blk_c, u_max).reshape(B, nQB, 1, 1)
 
     # q -> [B, nQB, QBHp, Dk_pad] (row = q*H + h), zero pad rows/features
     Dk_pad = ((Dk + 127) // 128) * 128
@@ -263,14 +287,14 @@ def sparse_mla_attention_qblock(
             pl.BlockSpec((1, 1, 1, U_pad), lambda b, n: (b, n, 0, 0), memory_space=smem),
             pl.BlockSpec((1, 1, 1, 1), lambda b, n: (b, n, 0, 0), memory_space=smem),
             pl.BlockSpec((1, 1, 1, QBHp), lambda b, n: (b, n, 0, 0)),  # qpos rows
-            pl.BlockSpec((1, 1, U_pad, QBHp), lambda b, n: (b, n, 0, 0)),  # membership
+            pl.BlockSpec((1, 1, NU_pad, QBHp), lambda b, n: (b, n, 0, 0)),  # membership
             pl.BlockSpec(memory_space=pltpu.HBM),  # kv (untiled, DMA-gathered)
         ],
         out_specs=pl.BlockSpec((1, 1, QBHp, Dv), lambda b, n: (b, n, 0, 0)),
         out_shape=jax.ShapeDtypeStruct((B, nQB, QBHp, Dv), jnp.float32),
         scratch_shapes=[
-            pltpu.VMEM((RBF, Dk_pad), kv.dtype),
-            pltpu.SemaphoreType.DMA,
+            pltpu.VMEM((_NBUF, RBF, Dk_pad), kv.dtype),
+            pltpu.SemaphoreType.DMA((_NBUF,)),
         ],
         interpret=interpret,
     )(q4, units4, counts4, pos_rows, memt, kv)
