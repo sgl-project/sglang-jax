@@ -98,3 +98,85 @@ def test_qblock_tpu_parity(B, S, H, K, pages, qb, dtype, tol):
     )
     assert e_qb < tol, f"qblock vs oracle: {e_qb}"
     assert e_x < tol, f"qblock vs deployed kernel: {e_x}"
+
+
+# ── packed-ragged TPU parity: qblock ragged vs deployed ragged wrapper ──────
+
+from sgl_jax.srt.kernels.dsa.sparse_mla_prefill import prefill_write_and_attend_ragged
+from sgl_jax.srt.kernels.dsa.sparse_mla_prefill_qblock import (
+    prefill_write_and_attend_ragged_qblock,
+)
+
+_PS = 128
+_ROPE = 64
+_DK_PAD = 640
+
+
+@pytest.mark.parametrize(
+    "seq_lens_list, qb, tol",
+    [
+        ([640, 1024, 1, 200], 48, 3e-2),  # varlen, blocks straddle requests
+        ([1024, 1024], 64, 3e-2),  # aligned blocks
+    ],
+)
+def test_ragged_qblock_tpu(seq_lens_list, qb, tol):
+    rng = np.random.default_rng(17)
+    H = 4
+    K = 6
+    num_seqs = len(seq_lens_list)
+    pages_per_seq = int(np.ceil(max(seq_lens_list) / _PS))
+    S_pad = pages_per_seq * _PS
+    total = num_seqs * S_pad
+    num_pages = num_seqs * pages_per_seq
+    phys = rng.permutation(num_pages).reshape(num_seqs, pages_per_seq).astype(np.int32)
+
+    ql = np.zeros((total, H, _KV_LORA), np.float32)
+    qpe = np.zeros((total, H, _ROPE), np.float32)
+    kvc = np.zeros((total, _KV_LORA), np.float32)
+    kpe = np.zeros((total, _ROPE), np.float32)
+    positions = np.zeros(total, np.int32)
+    loc = np.full(total, -1, np.int32)
+    tp = np.full((total, K), -1, np.int32)
+    real = np.zeros(total, bool)
+    for i, L in enumerate(seq_lens_list):
+        base = i * S_pad
+        ql[base : base + L] = rng.standard_normal((L, H, _KV_LORA)) * 0.1
+        qpe[base : base + L] = rng.standard_normal((L, H, _ROPE)) * 0.1
+        kvc[base : base + L] = rng.standard_normal((L, _KV_LORA)) * 0.1
+        kpe[base : base + L] = rng.standard_normal((L, _ROPE)) * 0.1
+        for j in range(L):
+            t = base + j
+            real[t] = True
+            positions[t] = j
+            loc[t] = phys[i, j // _PS] * _PS + (j % _PS)
+            hi = j // _PS + 1
+            n = min(K, hi)
+            ch = rng.choice(hi, size=n, replace=False)
+            if 0 not in ch:
+                ch[0] = 0
+            tp[t, :n] = ch
+
+    args = (
+        jnp.asarray(ql, jnp.bfloat16),
+        jnp.asarray(qpe, jnp.bfloat16),
+        jnp.asarray(kvc, jnp.bfloat16),
+        jnp.asarray(kpe, jnp.bfloat16),
+        jnp.zeros((num_pages, _PS // 2, 2, _DK_PAD), jnp.bfloat16),
+        jnp.asarray(tp),
+        jnp.asarray(positions),
+        jnp.asarray(loc),
+        jnp.asarray(seq_lens_list, jnp.int32),
+        jnp.asarray(np.arange(num_seqs + 1) * S_pad, jnp.int32),
+        jnp.asarray(np.arange(num_seqs + 1) * pages_per_seq * _PS, jnp.int32),
+        jnp.asarray(phys.reshape(-1)),
+    )
+    kw = dict(kv_lora_rank=_KV_LORA, page_size=_PS, sm_scale=_SCALE)
+    o_cur, cache_cur = prefill_write_and_attend_ragged(*args, **kw)
+    o_qb, cache_qb = prefill_write_and_attend_ragged_qblock(*args, query_block=qb, **kw)
+    d_o = np.abs(np.asarray(o_qb)[real] - np.asarray(o_cur)[real]).max()
+    d_c = np.abs(
+        np.asarray(cache_qb, dtype=np.float32) - np.asarray(cache_cur, dtype=np.float32)
+    ).max()
+    print(f"[tpu ragged qblock qb={qb}] |o_qb-o_cur|={d_o:.3e} |cache diff|={d_c:.3e}")
+    assert d_c == 0.0, "self-write must be identical"
+    assert d_o < tol, f"ragged qblock vs deployed drifted: {d_o}"
