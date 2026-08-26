@@ -581,6 +581,7 @@ def _build_draft_extend(num_layers: int, topk: int):
 
             topk_idx = _topk1_index_from_logits(output.next_token_logits)
             all_topk_index.append(topk_idx)
+            jax.debug.print("[SPEC_DRAFT_EXTEND] Step {step} predicted draft token IDs: {tok}", step=i, tok=topk_idx[:, 0])
 
             if i < num_layers - 1:
                 ext_lens = forward_batch.extend_seq_lens
@@ -757,10 +758,16 @@ def _make_target_verify_metadata(
 
     valid_rows = _reshape_per_dp_rows(valid, dp_size)
     local_num_seqs = jnp.sum(valid_rows.astype(jnp.int32), axis=1)
-    distribution = jnp.stack(
-        [jnp.zeros_like(local_num_seqs), local_num_seqs, local_num_seqs],
-        axis=1,
-    ).reshape((dp_size * 3,))
+    if type(old_metadata).__name__ == "MLAAttentionMetadata":
+        distribution = jnp.stack(
+            [jnp.zeros_like(local_num_seqs), jnp.zeros_like(local_num_seqs), local_num_seqs],
+            axis=1,
+        ).reshape((dp_size * 3,))
+    else:
+        distribution = jnp.stack(
+            [jnp.zeros_like(local_num_seqs), local_num_seqs, local_num_seqs],
+            axis=1,
+        ).reshape((dp_size * 3,))
 
     data_sharding = jax.typeof(old_metadata.seq_lens).sharding
     if isinstance(data_sharding, NamedSharding) and not data_sharding.mesh.empty:
@@ -824,10 +831,16 @@ def _make_draft_extend_metadata(
 
     valid_rows = _reshape_per_dp_rows(valid, dp_size)
     local_num_seqs = jnp.sum(valid_rows.astype(jnp.int32), axis=1)
-    distribution = jnp.stack(
-        [jnp.zeros_like(local_num_seqs), local_num_seqs, local_num_seqs],
-        axis=1,
-    ).reshape((dp_size * 3,))
+    if type(old_metadata).__name__ == "MLAAttentionMetadata":
+        distribution = jnp.stack(
+            [jnp.zeros_like(local_num_seqs), jnp.zeros_like(local_num_seqs), local_num_seqs],
+            axis=1,
+        ).reshape((dp_size * 3,))
+    else:
+        distribution = jnp.stack(
+            [jnp.zeros_like(local_num_seqs), local_num_seqs, local_num_seqs],
+            axis=1,
+        ).reshape((dp_size * 3,))
 
     data_sharding = jax.typeof(old_metadata.seq_lens).sharding
     if isinstance(data_sharding, NamedSharding) and not data_sharding.mesh.empty:
@@ -1050,6 +1063,14 @@ def _build_verify(topk: int):
         prepared_sel_pos = prepared.sel_pos
         prepared_sel_pos_data = prepared.sel_pos
         prepared_predict = prepared.predict
+        
+        jax.debug.print(
+            "\n[SPEC_VERIFY]\n  Draft tokens: {d}\n  Target predicted: {t}\n  Accept length: {a}\n  Verified tokens: {v}",
+            d=draft_tokens,
+            t=prepared.predict,
+            a=prepared.accept_lens,
+            v=prepared.verified_id,
+        )
         prepared_positions = prepared.positions
         prepared_positions_data = prepared.positions
         prepared_verify_seq_lens = target_forward_batch.seq_lens
