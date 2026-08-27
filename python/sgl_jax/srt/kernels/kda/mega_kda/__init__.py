@@ -76,7 +76,7 @@ def kda_forward_packed(
     dt_bias: jax.Array,
     scale: float,
     initial_state: jax.Array,
-    lower_bound: float,
+    lower_bound: float | None,
     chunk_size: int = 64,
 ) -> tuple[jax.Array, jax.Array]:
     """Run Mega KDA for a packed ``B=1`` inference batch.
@@ -165,7 +165,8 @@ def kda_forward_inference(
       use_qk_l2norm_in_kernel: Must be True.
       use_gate_in_kernel: Must be True.
       safe_gate: Must be True.
-      lower_bound: Sigmoid-gate lower bound in ``[-5, 0)``.
+      lower_bound: Sigmoid-gate lower bound in ``[-5, 0)`` for K3, or None
+        for Kimi-Linear's unbounded ``-exp(A_log) * softplus`` gate.
       chunk_size: Recurrently ordered token tile size; currently required to
         be 64. Tiles within one segment are not sequence-parallel.
       N_max: Static maximum number of packed segments.
@@ -182,8 +183,8 @@ def kda_forward_inference(
         raise ValueError(f"kda_forward_inference currently requires BF16, got {q.dtype}")
     if not (q.dtype == k.dtype == v.dtype == g.dtype):
         raise ValueError("q, k, v, and g must have the same dtype")
-    if beta.dtype != q.dtype:
-        raise ValueError("beta must have the same dtype as q")
+    if beta.dtype not in (q.dtype, jnp.float32):
+        raise ValueError("beta must use the input dtype or float32")
     if chunk_size != 64:
         raise ValueError("the optimized inference kernel currently requires chunk_size=64")
     if q.shape[:3] != k.shape[:3] or q.shape != g.shape:
@@ -209,8 +210,8 @@ def kda_forward_inference(
         )
     if not use_gate_in_kernel or not safe_gate:
         raise ValueError("standalone inference requires safe fused gate activation")
-    if lower_bound is None or not (-5 <= lower_bound < 0):
-        raise ValueError("safe fused gate activation requires lower_bound in [-5, 0)")
+    if lower_bound is not None and not (-5 <= lower_bound < 0):
+        raise ValueError("bounded fused gate activation requires lower_bound in [-5, 0)")
     if N_max is None:
         if initial_state is not None:
             N_max = initial_state.shape[-4]

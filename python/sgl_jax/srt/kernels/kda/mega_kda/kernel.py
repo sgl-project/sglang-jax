@@ -84,6 +84,201 @@ def _build_chunk_metadata(segment_ids, chunk_size):
     return chunk_kind, seg_first, seg_last, seg_id
 
 
+def _build_unbounded_intra_terms(q, k, g_cumsum, beta, scale, block_size, precision):
+    """Build causal Aqk/L terms without positive gate exponentials.
+
+    Kimi-Linear's unbounded gate can accumulate far below the BF16/FP32
+    exponent range inside one 64-token tile.  Cross-block products use the
+    first gate value of the row block as a shared reference, which keeps both
+    factors in ``[0, 1]``.  The diagonal block uses the causal gate difference
+    directly because no single shared reference is safe on both sides of its
+    diagonal.
+    """
+    _, tokens, _ = q.shape
+    num_blocks = tokens // block_size
+    aqk_rows = []
+    l_rows = []
+
+    def _dot(lhs, rhs):
+        return jax.lax.dot_general(
+            lhs,
+            rhs,
+            (((2,), (2,)), ((0,), (0,))),
+            precision=precision,
+            preferred_element_type=jnp.float32,
+        )
+
+    for row_block in range(num_blocks):
+        row_start = row_block * block_size
+        row_end = row_start + block_size
+        q_row = q[:, row_start:row_end]
+        k_row = k[:, row_start:row_end]
+        g_row = g_cumsum[:, row_start:row_end]
+        reference = g_row[:, :1]
+        row_decay = jnp.exp2(jnp.clip(g_row - reference, -126.0, 0.0))
+        aqk_blocks = []
+        l_blocks = []
+
+        for col_block in range(row_block):
+            col_start = col_block * block_size
+            col_end = col_start + block_size
+            k_col = k[:, col_start:col_end]
+            g_col = g_cumsum[:, col_start:col_end]
+            col_decay = jnp.exp2(jnp.clip(reference - g_col, -126.0, 0.0))
+            scaled_k_col = k_col * col_decay
+            aqk_blocks.append(_dot(q_row * row_decay, scaled_k_col))
+            l_blocks.append(_dot(k_row * row_decay, scaled_k_col))
+
+        gate_diff = g_row[:, :, None, :] - g_row[:, None, :, :]
+        diagonal_decay = jnp.exp2(jnp.clip(gate_diff, -126.0, 0.0))
+        aqk_diagonal = jnp.sum(
+            q_row[:, :, None, :] * diagonal_decay * k_row[:, None, :, :],
+            axis=-1,
+        )
+        l_diagonal = jnp.sum(
+            k_row[:, :, None, :] * diagonal_decay * k_row[:, None, :, :],
+            axis=-1,
+        )
+        row_iota = jax.lax.broadcasted_iota(jnp.int32, aqk_diagonal.shape, 1)
+        col_iota = jax.lax.broadcasted_iota(jnp.int32, aqk_diagonal.shape, 2)
+        aqk_blocks.append(jnp.where(row_iota >= col_iota, aqk_diagonal, 0.0))
+        l_blocks.append(jnp.where(row_iota > col_iota, l_diagonal, 0.0))
+
+        trailing = tokens - row_end
+        if trailing:
+            zeros = jnp.zeros((q.shape[0], block_size, trailing), dtype=jnp.float32)
+            aqk_blocks.append(zeros)
+            l_blocks.append(zeros)
+        aqk_rows.append(jnp.concatenate(aqk_blocks, axis=2))
+        l_rows.append(jnp.concatenate(l_blocks, axis=2))
+
+    aqk = jnp.concatenate(aqk_rows, axis=1) * scale
+    lower_matrix = jnp.concatenate(l_rows, axis=1) * beta[:, :, None]
+    g_last = g_cumsum[:, -1:, :]
+    kg = k * jnp.exp2(jnp.clip(g_last - g_cumsum, -126.0, 0.0))
+    return aqk, lower_matrix, kg
+
+
+def _build_bounded_intra_terms(q, k, g_cumsum, beta, scale, block_size, precision, safe_gate):
+    """Build the existing fast factored Aqk/L terms for bounded K3 gates."""
+    mini_batch, tokens, _ = q.shape
+    num_blocks = tokens // block_size
+    reference_index = block_size // 2 if safe_gate else 0
+    row_iota = jax.lax.broadcasted_iota(jnp.int32, (block_size, tokens), 0)
+    col_iota = jax.lax.broadcasted_iota(jnp.int32, (block_size, tokens), 1)
+    aqk_rows = []
+    l_rows = []
+    k_inverse_prefix = None
+    previous_reference = None
+
+    for block in range(num_blocks):
+        start = block * block_size
+        end = start + block_size
+        q_block = q[:, start:end]
+        k_block = k[:, start:end]
+        g_block = g_cumsum[:, start:end]
+        reference = g_block[:, reference_index : reference_index + 1]
+        gate_difference = g_block - reference
+        gate_exp = jnp.exp2(gate_difference)
+        q_scaled = q_block * gate_exp
+        k_scaled = k_block * gate_exp
+        k_inverse_current = k_block * jnp.exp2(-gate_difference)
+        if block == 0:
+            k_inverse_prefix = k_inverse_current
+        else:
+            reference_decay = jnp.exp2(reference - previous_reference)
+            k_inverse_prefix = jnp.concatenate(
+                [k_inverse_prefix * reference_decay, k_inverse_current], axis=1
+            )
+        previous_reference = reference
+        qk_scaled = jnp.concatenate([q_scaled, k_scaled], axis=1)
+        qk_dot_valid = jax.lax.dot_general(
+            qk_scaled,
+            k_inverse_prefix,
+            (((2,), (2,)), ((0,), (0,))),
+            precision=precision,
+            preferred_element_type=jnp.float32,
+        )
+        if end < tokens:
+            qk_dot = jnp.concatenate(
+                [
+                    qk_dot_valid,
+                    jnp.zeros(
+                        (mini_batch, 2 * block_size, tokens - end),
+                        dtype=jnp.float32,
+                    ),
+                ],
+                axis=2,
+            )
+        else:
+            qk_dot = qk_dot_valid
+        aqk_row = qk_dot[:, :block_size] * scale
+        l_row = qk_dot[:, block_size:] * beta[:, start:end, None]
+        in_diagonal_block = (col_iota >= start) & (col_iota < end)
+        local_col = col_iota - start
+        aqk_row = jnp.where((~in_diagonal_block) | (row_iota >= local_col), aqk_row, 0.0)
+        l_row = jnp.where((~in_diagonal_block) | (row_iota > local_col), l_row, 0.0)
+        aqk_rows.append(aqk_row)
+        l_rows.append(l_row)
+
+    g_last = g_cumsum[:, -1:, :]
+    kg = k_inverse_prefix * jnp.exp2(g_last - previous_reference)
+    return jnp.concatenate(aqk_rows, axis=1), jnp.concatenate(l_rows, axis=1), kg
+
+
+def _solve_unbounded_block_forward(L, rhs, block_inverse, block_size, precision):
+    """Solve ``(I + L) x = rhs`` with stable block forward substitution."""
+    _, tokens, _ = L.shape
+    solved_blocks = []
+
+    def _dot(lhs, rhs):
+        return jax.lax.dot_general(
+            lhs,
+            rhs,
+            (((2,), (1,)), ((0,), (0,))),
+            precision=precision,
+            preferred_element_type=jnp.float32,
+        )
+
+    for block in range(tokens // block_size):
+        start = block * block_size
+        end = start + block_size
+        residual = rhs[:, start:end]
+        if solved_blocks:
+            solved_prefix = jnp.concatenate(solved_blocks, axis=1)
+            residual -= _dot(L[:, start:end, :start], solved_prefix)
+        inverse = block_inverse[:, start:end, start:end]
+        solved_blocks.append(_dot(inverse, residual))
+    return jnp.concatenate(solved_blocks, axis=1)
+
+
+def _solve_unbounded_unit_lower(L, rhs, block_size, precision):
+    """Create small diagonal inverses, then run ordered block substitution."""
+    tokens = L.shape[1]
+    identity = jnp.eye(tokens, dtype=jnp.float32)
+    indices = jnp.arange(tokens, dtype=jnp.int32)
+    block_indices = indices // block_size
+    same_block = (block_indices[:, None] == block_indices[None, :]).astype(jnp.float32)
+    negative_diagonal_blocks = -(L.astype(jnp.float32) * same_block[None])
+
+    def _dot(lhs, rhs):
+        return jax.lax.dot_general(
+            lhs,
+            rhs,
+            (((2,), (1,)), ((0,), (0,))),
+            precision=precision,
+            preferred_element_type=jnp.float32,
+        )
+
+    block_inverse = identity[None] + negative_diagonal_blocks
+    power = negative_diagonal_blocks
+    num_steps = {4: 1, 8: 2, 16: 3, 32: 4, 64: 5}[block_size]
+    for _ in range(num_steps):
+        power = _dot(power, power)
+        block_inverse = _dot(block_inverse, identity[None] + power)
+    return _solve_unbounded_block_forward(L, rhs, block_inverse, block_size, precision)
+
+
 # =====================================================================
 # Native segment_ids mega kernel -- avoids _align_seqs gather/scatter
 # =====================================================================
@@ -303,65 +498,15 @@ def _fwd_mega_kernel_native_segids(
 
         # --- Stage 2: Intra-chunk solve ---
         BC = QK_BC
-        NC = BT // BC
         beta_f32 = beta[:, :, None]
-        ref_idx = BC // 2 if safe_gate else 0
-        row_iota_bc_bt = jax.lax.broadcasted_iota(jnp.int32, (BC, BT), 0)
-        col_iota_bc_bt = jax.lax.broadcasted_iota(jnp.int32, (BC, BT), 1)
-        Aqk_rows, L_rows = [], []
-        k_eng_prefix = None
-        prev_gn = None
-        for i_sc in range(NC):
-            i_s = i_sc * BC
-            q_i, k_i = q[:, i_s : i_s + BC], k[:, i_s : i_s + BC]
-            g_i = g_cumsum[:, i_s : i_s + BC]
-            beta_i = beta_f32[:, i_s : i_s + BC]
-            gn = g_i[:, ref_idx : ref_idx + 1, :]
-            diff_i = g_i - gn
-            exp_i = jnp.exp2(diff_i)
-            q_eg, k_eg = q_i * exp_i, k_i * exp_i
-            j_end = i_s + BC
-            k_eng_current = k_i * jnp.exp2(-diff_i)
-            if i_sc == 0:
-                k_eng_prefix = k_eng_current
-            else:
-                ref_decay = jnp.exp2(gn - prev_gn)
-                k_eng_prefix = jnp.concatenate(
-                    [k_eng_prefix * ref_decay, k_eng_current],
-                    axis=1,
-                )
-            prev_gn = gn
-            qk_eg = jnp.concatenate([q_eg, k_eg], axis=1)
-            qk_dot_valid = jax.lax.dot_general(
-                qk_eg,
-                k_eng_prefix,
-                (((2,), (2,)), ((0,), (0,))),
-                precision=OUTPUT_PRECISION,
-                preferred_element_type=jnp.float32,
+        if lower_bound is None:
+            Aqk, L, kg = _build_unbounded_intra_terms(
+                q, k, g_cumsum, beta, scale, BC, OUTPUT_PRECISION
             )
-            if j_end < BT:
-                qk_dot = jnp.concatenate(
-                    [
-                        qk_dot_valid,
-                        jnp.zeros((MB, 2 * BC, BT - j_end), dtype=jnp.float32),
-                    ],
-                    axis=2,
-                )
-            else:
-                qk_dot = qk_dot_valid
-            Aqk_r = qk_dot[:, :BC] * scale
-            Akk_r = qk_dot[:, BC:] * beta_i
-            ind = (col_iota_bc_bt >= i_s) & (col_iota_bc_bt < i_s + BC)
-            cl = col_iota_bc_bt - i_s
-            Aqk_r = jnp.where((~ind) | (row_iota_bc_bt >= cl), Aqk_r, 0.0)
-            Akk_r = jnp.where((~ind) | (row_iota_bc_bt > cl), Akk_r, 0.0)
-            Aqk_rows.append(Aqk_r)
-            L_rows.append(Akk_r)
-
-        g_last = g_cumsum[:, BT - 1 : BT, :]
-        kg = k_eng_prefix * jnp.exp2(g_last - prev_gn)
-        Aqk = jnp.concatenate(Aqk_rows, axis=1)
-        L = jnp.concatenate(L_rows, axis=1)
+        else:
+            Aqk, L, kg = _build_bounded_intra_terms(
+                q, k, g_cumsum, beta, scale, BC, OUTPUT_PRECISION, safe_gate
+            )
 
         v_beta = v * beta_f32
         k_eg_beta = k * jnp.exp2(g_cumsum) * beta_f32
@@ -449,7 +594,10 @@ def _fwd_mega_kernel_native_segids(
             if NC_inv == 1:
                 A_inv = P
         else:
-            raise NotImplementedError("mega KDA supports only the Kimi-K3 bfloat16 Neumann path")
+            rhs = jnp.concatenate([v_beta, k_eg_beta], axis=-1)
+            result = _solve_unbounded_unit_lower(L, rhs, INV_BC, OUTPUT_PRECISION)
+            u = result[:, :, :V_PAD]
+            w = result[:, :, V_PAD : V_PAD + K_PAD]
 
         # --- Stage 3+4: State + Output ---
         b_h = scratch_ref[...]
@@ -595,62 +743,15 @@ def _fwd_mega_kernel_native_segids(
             shift *= 2
 
         BC = QK_BC
-        NC = BT // BC
         beta_f32 = beta[:, :, None]
-        ref_idx = BC // 2 if safe_gate else 0
-        row_iota_bc_bt = jax.lax.broadcasted_iota(jnp.int32, (BC, BT), 0)
-        col_iota_bc_bt = jax.lax.broadcasted_iota(jnp.int32, (BC, BT), 1)
-        Aqk_rows, L_rows = [], []
-        k_eng_prefix = None
-        prev_gn = None
-        for i_sc in range(NC):
-            i_s = i_sc * BC
-            q_i, k_i = q[:, i_s : i_s + BC], k[:, i_s : i_s + BC]
-            g_i = g_cumsum[:, i_s : i_s + BC]
-            beta_i = beta_f32[:, i_s : i_s + BC]
-            gn = g_i[:, ref_idx : ref_idx + 1, :]
-            diff_i = g_i - gn
-            exp_i = jnp.exp2(diff_i)
-            q_eg, k_eg = q_i * exp_i, k_i * exp_i
-            j_end = i_s + BC
-            k_eng_current = k_i * jnp.exp2(-diff_i)
-            if i_sc == 0:
-                k_eng_prefix = k_eng_current
-            else:
-                ref_decay = jnp.exp2(gn - prev_gn)
-                k_eng_prefix = jnp.concatenate(
-                    [k_eng_prefix * ref_decay, k_eng_current],
-                    axis=1,
-                )
-            prev_gn = gn
-            qk_eg = jnp.concatenate([q_eg, k_eg], axis=1)
-            qk_dot_valid = jax.lax.dot_general(
-                qk_eg,
-                k_eng_prefix,
-                (((2,), (2,)), ((0,), (0,))),
-                precision=OUTPUT_PRECISION,
-                preferred_element_type=jnp.float32,
+        if lower_bound is None:
+            Aqk, L, _ = _build_unbounded_intra_terms(
+                q, k, g_cumsum, beta, scale, BC, OUTPUT_PRECISION
             )
-            if j_end < BT:
-                qk_dot = jnp.concatenate(
-                    [
-                        qk_dot_valid,
-                        jnp.zeros((MB, 2 * BC, BT - j_end), dtype=jnp.float32),
-                    ],
-                    axis=2,
-                )
-            else:
-                qk_dot = qk_dot_valid
-            Aqk_r = qk_dot[:, :BC] * scale
-            Akk_r = qk_dot[:, BC:] * beta_i
-            ind = (col_iota_bc_bt >= i_s) & (col_iota_bc_bt < i_s + BC)
-            cl = col_iota_bc_bt - i_s
-            Aqk_r = jnp.where((~ind) | (row_iota_bc_bt >= cl), Aqk_r, 0.0)
-            Akk_r = jnp.where((~ind) | (row_iota_bc_bt > cl), Akk_r, 0.0)
-            Aqk_rows.append(Aqk_r)
-            L_rows.append(Akk_r)
-        Aqk = jnp.concatenate(Aqk_rows, axis=1)
-        L = jnp.concatenate(L_rows, axis=1)
+        else:
+            Aqk, L, _ = _build_bounded_intra_terms(
+                q, k, g_cumsum, beta, scale, BC, OUTPUT_PRECISION, safe_gate
+            )
         v_beta = v * beta_f32
         k_eg_beta = k * jnp.exp2(g_cumsum) * beta_f32
         I_bt = jnp.eye(BT, dtype=jnp.float32)
@@ -712,7 +813,10 @@ def _fwd_mega_kernel_native_segids(
             if NC_inv == 1:
                 A_inv = P
         else:
-            raise NotImplementedError("mega KDA supports only the Kimi-K3 bfloat16 Neumann path")
+            rhs = jnp.concatenate([v_beta, k_eg_beta], axis=-1)
+            result = _solve_unbounded_unit_lower(L, rhs, INV_BC, OUTPUT_PRECISION)
+            u = result[:, :, :V_PAD]
+            w = result[:, :, V_PAD : V_PAD + K_PAD]
         g_last = (g_cumsum * vm[None, :, None]).min(axis=1, keepdims=True)
         kg = k * jnp.exp2(g_last - g_cumsum) * vm[None, :, None]
 
@@ -884,63 +988,24 @@ def _fwd_mega_kernel_native_segids(
 
         # Aqk/L (FULL-style, no cross-seg masking in loop for stability)
         BC = QK_BC
-        NC = BT // BC
         beta_f32 = beta[:, :, None]
-        ref_idx = BC // 2 if safe_gate else 0
-        row_iota_bc_bt = jax.lax.broadcasted_iota(jnp.int32, (BC, BT), 0)
-        col_iota_bc_bt = jax.lax.broadcasted_iota(jnp.int32, (BC, BT), 1)
-        Aqk_rows, L_rows = [], []
-        k_eng_prefix = None
-        prev_gn = None
-        for i_sc in range(NC):
-            i_s = i_sc * BC
-            q_i = q[:, i_s : i_s + BC]
-            k_i = k[:, i_s : i_s + BC]
-            g_i = g_cumsum[:, i_s : i_s + BC]
-            beta_i = beta_f32[:, i_s : i_s + BC]
-            gn = g_i[:, ref_idx : ref_idx + 1, :]
-            diff_i = g_i - gn
-            exp_i = jnp.exp2(diff_i)
-            q_eg = q_i * exp_i
-            k_eg = k_i * exp_i
-            j_end = i_s + BC
-            k_eng_current = k_i * jnp.exp2(-diff_i)
-            if i_sc == 0:
-                k_eng_prefix = k_eng_current
-            else:
-                ref_decay = jnp.exp2(gn - prev_gn)
-                k_eng_prefix = jnp.concatenate(
-                    [k_eng_prefix * ref_decay, k_eng_current],
-                    axis=1,
-                )
-            prev_gn = gn
-            qk_eg = jnp.concatenate([q_eg, k_eg], axis=1)
-            qk_dot_valid = jax.lax.dot_general(
-                qk_eg,
-                k_eng_prefix,
-                (((2,), (2,)), ((0,), (0,))),
-                preferred_element_type=jnp.float32,
+        if lower_bound is None:
+            # Restart the log-domain prefix at the packed segment boundary.
+            # This preserves segment B's initial-state contribution even when
+            # segment A has accumulated a very negative unbounded gate.
+            first_segment_total = jnp.min(
+                jnp.where(seg_A_mask[None, :, None] > 0, g_cumsum, 0.0),
+                axis=1,
+                keepdims=True,
             )
-            if j_end < BT:
-                qk_dot = jnp.concatenate(
-                    [
-                        qk_dot_valid,
-                        jnp.zeros((MB, 2 * BC, BT - j_end), dtype=jnp.float32),
-                    ],
-                    axis=2,
-                )
-            else:
-                qk_dot = qk_dot_valid
-            Aqk_r = qk_dot[:, :BC] * scale
-            Akk_r = qk_dot[:, BC:] * beta_i
-            ind = (col_iota_bc_bt >= i_s) & (col_iota_bc_bt < i_s + BC)
-            cl = col_iota_bc_bt - i_s
-            Aqk_r = jnp.where((~ind) | (row_iota_bc_bt >= cl), Aqk_r, 0.0)
-            Akk_r = jnp.where((~ind) | (row_iota_bc_bt > cl), Akk_r, 0.0)
-            Aqk_rows.append(Aqk_r)
-            L_rows.append(Akk_r)
-        Aqk = jnp.concatenate(Aqk_rows, axis=1)
-        L = jnp.concatenate(L_rows, axis=1)
+            g_cumsum = g_cumsum - first_segment_total * seg_B_mask[None, :, None]
+            Aqk, L, _ = _build_unbounded_intra_terms(
+                q, k, g_cumsum, beta, scale, BC, OUTPUT_PRECISION
+            )
+        else:
+            Aqk, L, _ = _build_bounded_intra_terms(
+                q, k, g_cumsum, beta, scale, BC, OUTPUT_PRECISION, safe_gate
+            )
 
         # Mask L for segment-independent solve
         same_seg_L = (
@@ -1025,7 +1090,10 @@ def _fwd_mega_kernel_native_segids(
             u = result[:, :, :V_PAD]
             w = result[:, :, V_PAD : V_PAD + K_PAD]
         else:
-            raise NotImplementedError("mega KDA supports only the Kimi-K3 bfloat16 Neumann path")
+            rhs = jnp.concatenate([v_beta, k_eg_beta], axis=-1)
+            result = _solve_unbounded_unit_lower(L, rhs, INV_BC, OUTPUT_PRECISION)
+            u = result[:, :, :V_PAD]
+            w = result[:, :, V_PAD : V_PAD + K_PAD]
 
         if HAS_H0:
             if MANUAL_H0_DMA:
@@ -1111,7 +1179,7 @@ def _fwd_mega_kernel_native_segids(
         # produce inf * 0 = NaN for tokens belonging to the other segment.
         kg_A_exp = jnp.where(mask_A != 0, g_A_total - g_cumsum, 0.0)
         kg_A = k * jnp.exp2(kg_A_exp) * mask_A
-        g_cumsum_B_local = g_cumsum - g_A_total
+        g_cumsum_B_local = g_cumsum if lower_bound is None else g_cumsum - g_A_total
         kg_B_exp = jnp.where(mask_B != 0, g_B_total - g_cumsum_B_local, 0.0)
         kg_B = k * jnp.exp2(kg_B_exp) * mask_B
 
@@ -1242,6 +1310,8 @@ def _chunk_kda_fwd_native_segids_impl(
     BT = chunk_size
     if only_fwd and (disable_recompute or store_h or store_v_new):
         raise ValueError("only_fwd=True is incompatible with backward-intermediate storage")
+    if lower_bound is None and not only_fwd:
+        raise ValueError("unbounded Mega KDA currently supports inference-only forward execution")
     if disable_recompute:
         store_h = True
 
@@ -1320,7 +1390,10 @@ def _chunk_kda_fwd_native_segids_impl(
         else beta.transpose(2, 0, 1).reshape(H, B, NT, 1, BT)
     )
 
-    use_neumann = q.dtype == jnp.bfloat16
+    # The gate family is a model-static specialization. K3's bounded gate
+    # keeps the faster global Neumann composition; Kimi-Linear's unbounded
+    # gate uses ordered block substitution to avoid cancellation.
+    use_neumann = lower_bound is not None
     # With gate values as low as -5, a 32-token block can form masked
     # pre-causal products near 2**155 before the mask is applied. Keeping the
     # rescaling window at 16 bounds those products below the FP32/BF16 range.
@@ -1336,7 +1409,9 @@ def _chunk_kda_fwd_native_segids_impl(
     # 64x64 mask on the Stage 4 dependency chain.  Keep the training lowering
     # unchanged because it shares this kernel body.
     skip_stage4_mask = only_fwd
-    pack_head_inv = only_fwd and MB % 2 == 0 and os.environ.get("KDA_PACK_HEAD_INV", "1") == "1"
+    pack_head_inv = (
+        use_neumann and only_fwd and MB % 2 == 0 and os.environ.get("KDA_PACK_HEAD_INV", "1") == "1"
+    )
     clip_beta_in_kernel = only_fwd
     overlap_h0_dma = only_fwd and os.environ.get("KDA_OVERLAP_H0_DMA", "1") == "1"
     overlap_ht_dma = only_fwd and os.environ.get("KDA_OVERLAP_HT_DMA", "1") == "1"

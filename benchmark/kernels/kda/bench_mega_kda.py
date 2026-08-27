@@ -88,9 +88,20 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument("--seed", type=int, default=1550)
+    parser.add_argument(
+        "--gate-mode",
+        choices=("bounded", "unbounded"),
+        default="bounded",
+        help="bounded selects K3's sigmoid gate; unbounded selects Kimi-Linear's softplus gate",
+    )
     args = parser.parse_args()
+    lower_bound = LOWER_BOUND if args.gate_mode == "bounded" else None
 
-    arrays = _inputs(args.tokens, args.heads, args.segments, args.seed)
+    arrays = list(_inputs(args.tokens, args.heads, args.segments, args.seed))
+    if args.gate_mode == "unbounded":
+        # Kimi-Linear produces FP32 beta even though q/k/v/g use BF16.
+        arrays[4] = arrays[4].astype(jnp.float32)
+    arrays = tuple(arrays)
 
     @jax.jit
     def chunked(q, k, v, g, beta, a_log, dt_bias, initial_state, cu_seqlens):
@@ -106,7 +117,7 @@ def main() -> None:
             cu_seqlens=cu_seqlens,
             chunk_size=CHUNK_SIZE,
             safe_gate=True,
-            lower_bound=LOWER_BOUND,
+            lower_bound=lower_bound,
             use_gate_in_kernel=True,
             A_log=a_log,
             dt_bias=dt_bias,
@@ -126,7 +137,7 @@ def main() -> None:
             dt_bias=dt_bias,
             scale=SCALE,
             initial_state=initial_state,
-            lower_bound=LOWER_BOUND,
+            lower_bound=lower_bound,
             chunk_size=CHUNK_SIZE,
         )
 
@@ -137,6 +148,7 @@ def main() -> None:
         json.dumps(
             {
                 "event": "correctness",
+                "gate_mode": args.gate_mode,
                 "output_max_abs": float(
                     jnp.max(
                         jnp.abs(
@@ -170,6 +182,7 @@ def main() -> None:
                         "tokens": args.tokens,
                         "heads": args.heads,
                         "segments": args.segments,
+                        "gate_mode": args.gate_mode,
                         "iterations": args.iterations,
                         "median_ms": statistics.median(samples),
                         "mean_ms": statistics.mean(samples),

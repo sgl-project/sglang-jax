@@ -365,7 +365,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             raise ValueError(
                 f"SGLANG_JAX_KDA_PREFILL_KERNEL must be 'chunked' or 'mega', got {kernel!r}"
             )
-        use_mega = kernel == "mega" and lower_bound is not None
+        use_mega = kernel == "mega"
 
         def _prefill_call(q, k, v, g, beta, initial_state, cu_seqlens, A_log, dt_bias):
             operands = (q, k, v, g, beta, initial_state, cu_seqlens, A_log, dt_bias)
