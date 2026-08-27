@@ -61,9 +61,9 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         v_conv_w = layer.v_conv1d.weight.value
         # _unpack_conv_states splits proj_size in 3 equal pieces; only valid
         # when proj_q == proj_k == proj_v (Kimi-Linear shape).
-        assert q_conv_w.shape[0] == k_conv_w.shape[0] == v_conv_w.shape[0], (
-            f"unequal Q/K/V proj widths: {q_conv_w.shape[0]}/{k_conv_w.shape[0]}/{v_conv_w.shape[0]}"
-        )
+        assert (
+            q_conv_w.shape[0] == k_conv_w.shape[0] == v_conv_w.shape[0]
+        ), f"unequal Q/K/V proj widths: {q_conv_w.shape[0]}/{k_conv_w.shape[0]}/{v_conv_w.shape[0]}"
         q_state, k_state, v_state = self._unpack_conv_states(conv_states)
 
         cu_q_lens = self.forward_metadata.cu_q_lens

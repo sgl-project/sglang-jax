@@ -13,9 +13,7 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
-from sgl_jax.srt.kernels.kda.mega_kda.kernel import (
-    _chunk_kda_fwd_native_segids,
-)
+from sgl_jax.srt.kernels.kda.mega_kda.kernel import _chunk_kda_fwd_native_segids
 
 
 def is_mega_kda_layout_supported(

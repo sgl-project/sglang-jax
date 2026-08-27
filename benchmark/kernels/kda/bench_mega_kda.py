@@ -145,9 +145,7 @@ def main() -> None:
                         )
                     )
                 ),
-                "state_max_abs": float(
-                    jnp.max(jnp.abs(mega_result[1] - chunked_result[1]))
-                ),
+                "state_max_abs": float(jnp.max(jnp.abs(mega_result[1] - chunked_result[1]))),
             },
             sort_keys=True,
         )
