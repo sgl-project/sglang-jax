@@ -195,11 +195,11 @@ class TestNativeAttentionPagedDecode(unittest.TestCase):
             None,  # extend_seq_lens
             num_heads,
             num_kv_heads,
-            scale,
-            False,  # is_causal: a decode query attends over its whole prefix
-            ForwardMode.DECODE,
-            None,  # kv_sharding
             page_size=page_size,
+            scale=scale,
+            is_causal=False,  # a decode query attends over its whole prefix
+            mode=ForwardMode.DECODE,
+            kv_sharding=None,
             mesh=_cpu_mesh(),
             sliding_window_size=sliding_window_size,
         )
@@ -336,11 +336,11 @@ class TestNativeAttentionPagedExtend(unittest.TestCase):
             jnp.asarray(np.asarray(extend_lens, np.int32)),
             num_heads,
             num_kv_heads,
-            scale,
-            True,  # is_causal: extend queries are ordered within their own sequence
-            ForwardMode.EXTEND,
-            None,  # kv_sharding
             page_size=page_size,
+            scale=scale,
+            is_causal=True,  # extend queries are ordered within their own sequence
+            mode=ForwardMode.EXTEND,
+            kv_sharding=None,
             mesh=_cpu_mesh(),
             sliding_window_size=sliding_window_size,
         )

@@ -101,11 +101,11 @@ class NativeAttention(AttentionBackend):
             forward_batch.extend_seq_lens,
             layer.q_head_num,
             layer.kv_head_num,
-            scale,
-            is_causal,
-            forward_batch.forward_mode,
-            self.kv_sharding,
             page_size=token_to_kv_pool.page_size,
+            scale=scale,
+            is_causal=is_causal,
+            mode=forward_batch.forward_mode,
+            kv_sharding=self.kv_sharding,
             mesh=self.mesh,
             xai_temperature_len=xai_temp_len,
             attention_sink=attention_sink,
@@ -177,6 +177,8 @@ def forward_attention(
     extend_seq_lens: jax.Array,
     num_heads,
     num_kv_heads,
+    *,
+    page_size: int,
     scale=None,
     is_causal=True,
     mode=ForwardMode.DECODE,
@@ -186,8 +188,6 @@ def forward_attention(
     attention_sink: jax.Array | None = None,
     sliding_window_size: int | None = None,
     softmax_dtype: jnp.dtype | None = None,
-    *,
-    page_size: int,
 ):
     """
     Forward pass using native JAX implementation with block-diagonal attention.
@@ -203,11 +203,11 @@ def forward_attention(
         extend_seq_lens: sequence lengths of each batch in extend mode
         num_heads: number of query heads
         num_kv_heads: number of key/value heads
+        page_size: KV pool page size; decode `loc` blocks are page-aligned per request
         scale: scale for the attention weights
         xai_temperature_len: length of the xai temperature
         attention_sink: per-head bias for phantom attention sink token
         sliding_window_size: sliding window size for attention
-        page_size: KV pool page size; decode `loc` blocks are page-aligned per request
 
     Returns:
         Output tensor of shape[batch_size, hidden_size]
