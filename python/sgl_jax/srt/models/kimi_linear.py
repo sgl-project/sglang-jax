@@ -251,6 +251,7 @@ class KimiDeltaAttention(nnx.Module):
             A_log=self.A_log,
             dt_bias=self.dt_bias,
         )
+        self.attn.kda_gate_lower_bound = linear_config.get("gate_lower_bound")
 
     def __call__(
         self,
