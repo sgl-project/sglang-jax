@@ -302,6 +302,11 @@ suites = {
     # have a conditional CPU pin gated on USE_DEVICE_TYPE=cpu — the
     # cpu-test CI job sets that env var.
     "unit-test-cpu": [
+        TestFile(
+            "python/sgl_jax/test/test_embedding_pool.py",
+            0.1,
+            runner="pytest",
+        ),
         TestFile("test/srt/test_tokenizer_manager_event.py", 0.1),
         TestFile("test/srt/disaggregation/test_pd_auth.py", 0.3, runner="pytest"),
         TestFile("test/srt/disaggregation/test_pd_bootstrap.py", 0.5, runner="pytest"),
