@@ -5,16 +5,41 @@ import time
 from collections import defaultdict
 from typing import TYPE_CHECKING
 
-from sgl_jax.srt.managers.schedule_policy import PrefillAdder
-from sgl_jax.srt.managers.scheduler import Req, ScheduleBatch
 from sgl_jax.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
+    from sgl_jax.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sgl_jax.srt.managers.schedule_policy import PrefillAdder
     from sgl_jax.srt.managers.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
 
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
+
+
+def record_queue_wait_times(reqs: list[Req], now: float | None = None) -> dict[int, list[float]]:
+    """Finish first-admission queue timing and group observations by DP rank.
+
+    Queue time starts when a request first enters the scheduler (including the
+    grammar queue) and ends when it is admitted to its first prefill batch.
+    Requests admitted again after retraction retain their original measurement.
+
+    This is the request-scheduling analogue of Linux run-queue latency: the time
+    a runnable task spends on the run queue before the scheduler gives it a CPU.
+    """
+    if now is None:
+        now = time.perf_counter()
+
+    waits_by_dp: dict[int, list[float]] = defaultdict(list)
+    for req in reqs:
+        if req.queue_time_start is None or req.queue_time_end is not None:
+            continue
+
+        req.queue_time_end = now
+        if req.dp_rank is not None:
+            waits_by_dp[req.dp_rank].append(max(0.0, now - req.queue_time_start))
+
+    return waits_by_dp
 
 
 class SchedulerMetricsMixin:
@@ -34,6 +59,7 @@ class SchedulerMetricsMixin:
         can_run_list: list[Req],
         running_bs: int,
     ):
+        queue_waits_by_dp = record_queue_wait_times(can_run_list)
         gap_latency = time.perf_counter() - self.last_prefill_stats_tic
         self.last_prefill_stats_tic = time.perf_counter()
         self.last_input_throughput = self.last_prefill_tokens / gap_latency
@@ -82,6 +108,20 @@ class SchedulerMetricsMixin:
             ]
             f += f"#prefill per DP: {per_dp_prefill}, #running per DP: {per_dp_running}, "
 
+            per_dp_queue_wait = []
+            for dp_rank in range(self.dp_size):
+                waits = queue_waits_by_dp.get(dp_rank, ())
+                if waits:
+                    per_dp_queue_wait.append(
+                        {
+                            "avg": round(sum(waits) / len(waits) * 1000, 2),
+                            "max": round(max(waits) * 1000, 2),
+                        }
+                    )
+                else:
+                    per_dp_queue_wait.append(None)
+            f += f"queue-wait per DP (ms): {per_dp_queue_wait}, "
+
         f += f"#queue-req: {len(self.waiting_queue)}, "
 
         logger.info(f)
@@ -115,7 +155,7 @@ class SchedulerMetricsMixin:
             )
         else:
             num_used, token_usage, _, _ = self._get_token_info()
-            token_msg = f"#token: {num_used}, " f"token usage: {token_usage:.2f}, "
+            token_msg = f"#token: {num_used}, token usage: {token_usage:.2f}, "
 
         if RECORD_STEP_TIME:
             self.step_time_dict[num_running_reqs].append(
