@@ -103,22 +103,23 @@ def _make_padded_mega(
 
     segments_per_tile = min(max_segments_per_tile, CHUNK_SIZE // segment_length)
     padded_tokens = ((segments + segments_per_tile - 1) // segments_per_tile) * CHUNK_SIZE
-    destination_positions = []
-    segment_ids = np.zeros(padded_tokens, dtype=np.int32)
-    for segment in range(segments):
-        tile = segment // segments_per_tile
-        slot = segment % segments_per_tile
-        start = tile * CHUNK_SIZE + slot * segment_length
-        positions = np.arange(start, start + segment_length, dtype=np.int32)
-        destination_positions.extend(positions.tolist())
-        segment_ids[positions] = segment + 1
-
-    destination_positions = jnp.asarray(destination_positions, dtype=jnp.int32)
-    segment_ids = jnp.asarray(segment_ids, dtype=jnp.int32)[None, :]
-
     @jax.jit
     def padded_mega(q, k, v, g, beta, a_log, dt_bias, initial_state, cu_seqlens):
-        del cu_seqlens
+        source_positions = jnp.arange(tokens, dtype=jnp.int32)
+        lengths = jnp.diff(cu_seqlens).astype(jnp.int32)
+        source_segments = jnp.repeat(
+            jnp.arange(segments, dtype=jnp.int32),
+            lengths,
+            total_repeat_length=tokens,
+        )
+        tile_indices = source_segments // segments_per_tile
+        tile_source_starts = cu_seqlens[tile_indices * segments_per_tile]
+        destination_positions = (
+            tile_indices * CHUNK_SIZE + source_positions - tile_source_starts
+        )
+        segment_ids = jnp.zeros(padded_tokens, dtype=jnp.int32).at[
+            destination_positions
+        ].set(source_segments + 1)[None, :]
 
         def _repack(value):
             shape = list(value.shape)
