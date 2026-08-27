@@ -307,6 +307,12 @@ suites = {
             0.1,
             runner="pytest",
         ),
+        TestFile(
+            "python/sgl_jax/test/multimodal/test_qwen_vl_processor.py",
+            0.1,
+            runner="pytest",
+        ),
+        TestFile("test/srt/test_radix_input_ids.py", 0.1, runner="pytest"),
         TestFile("test/srt/test_tokenizer_manager_event.py", 0.1),
         TestFile("test/srt/disaggregation/test_pd_auth.py", 0.3, runner="pytest"),
         TestFile("test/srt/disaggregation/test_pd_bootstrap.py", 0.5, runner="pytest"),
@@ -438,6 +444,11 @@ suites = {
         TestFile("test/srt/test_prepare_for_extend_protected_len.py", 0.2),
     ],
     "unit-test-tpu-v6e-4": [
+        TestFile(
+            "python/sgl_jax/test/test_vlm_stage1_framework.py",
+            1,
+            runner="pytest",
+        ),
         TestFile("python/sgl_jax/test/test_mesh.py", 0.4),
         TestFile("python/sgl_jax/test/test_linear_tp.py", 0.3, runner="pytest"),
         TestFile(
