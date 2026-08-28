@@ -2,8 +2,8 @@
 
 Dequantizing K3's experts to bf16 works at 4 layers and cannot work at 93 -- 2.723 T routed-expert
 params cost **5,072 GiB** as bf16 against **1,347 GiB** kept as fp4, i.e. 26.8 chips of weights
-instead of 7.1 at v7x's measured 189.5 GiB/chip. So the load path has to hand native fp4 to the
-kernel, which is what the vllm-torchtpu lane already does to serve this model.
+instead of 7.1 at v7x's measured 189.5 GiB/chip. So the load path keeps the weights native fp4
+in HBM, and the MoE widens per block scale at matmul time.
 
 These tests pin the three things that make that substitution safe:
 
@@ -203,17 +203,3 @@ def test_missing_expert_raises_rather_than_stacking_short():
 
     with pytest.raises(KeyError, match="missing"):
         build_fp4_expert_weights(tensors, layer, num_experts=3, prefix=prefix)
-
-
-def test_vendored_fp4_kernel_imports_and_exposes_the_packing_hook():
-    """The vendored megablox package must import with no vllm_torchtpu dependency left.
-
-    ``get_packing_factor`` is the sub-byte entry point sglang-jax's own gmm_v2 does not have; if
-    this import breaks, the fp4 path silently has no kernel to run on.
-    """
-    from sgl_jax.srt.kernels.gmm.megablox_fp4.gmm_v2 import get_packing_factor, gmm_v2
-
-    assert callable(gmm_v2)
-    # one fp4 value per 4 bits of an 8-bit carrier
-    assert get_packing_factor(jnp.uint8.dtype, jnp.float4_e2m1fn.dtype) == 2
-    assert get_packing_factor(jnp.int8.dtype, jnp.int8.dtype) == 1

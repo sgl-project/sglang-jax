@@ -33,7 +33,6 @@ from sgl_jax.srt.layers.moe import EPMoE
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as _P
-from sgl_jax.srt.kernels.gmm.megablox_fp4.gmm_v2 import gmm_v2 as fp4_gmm_v2
 from sgl_jax.srt.layers.quantization.mxfp4 import MXFP4_GROUP_SIZE
 from sgl_jax.srt.models.kimi_k3_layers import (
     AttentionResidual,
@@ -143,8 +142,7 @@ class KimiK3MLAAttention(KimiMLAAttention):
 
     Kimi-Linear's MLA has no gate. K3 ships ``self_attn.g_proj.weight`` ``[12288, 7168]`` on every
     MLA layer -- ``num_attention_heads * v_head_dim`` -- and the reference applies it to the
-    attention output BEFORE ``o_proj``
-    (``layers/vllm/custom_ops/mla_attention_op.py:601``)::
+    attention output BEFORE ``o_proj``, matching the torch reference::
 
         attn_out *= self.g_proj(hidden_states)[0].sigmoid()
         return self.o_proj(attn_out)[0]
@@ -294,10 +292,11 @@ class KimiK3EPMoE(EPMoE):
     cannot be expressed through the stock silu/gelu branch. Leaving the default (``silu``) loads
     cleanly, runs, and computes a different model.
 
-    **fp4.** Dequantizing the experts to bf16 is 5,072 GiB at full depth versus 1,347 GiB kept as
-    fp4 (measured 0.535 B/value on v7x). sglang-jax's own GMM has no sub-byte path, so the
-    forward is routed to the fp4-capable megablox kernel vendored from vllm-torchtpu -- the lane
-    already serving this model.
+    **fp4.** The released K3 experts are MXFP4 (e2m1 values + per-32 e8m0 block scales). This
+    reference path widens them to bf16 with their block scales and runs the standard grouped
+    matmul; correct and portable. Keeping the experts sub-byte through a fused GMM kernel is a
+    separate optimization (bf16 experts are 5,072 GiB at full depth versus 1,347 GiB kept as fp4,
+    measured 0.535 B/value on v7x), tracked outside this change.
     """
 
     def __init__(self, *args, situ_beta=None, situ_linear_beta=None, fp4: bool = False, **kwargs):
@@ -354,10 +353,24 @@ class KimiK3EPMoE(EPMoE):
     def _call_gmm(self, **kwargs):
         if not self.fp4:
             return super()._call_gmm(**kwargs)
-        # The vendored kernel takes the same core arguments; `activation_quantized_dtype` and
-        # `tiling`/`v2_tile_info` are backend-wrapper concerns that it does not have.
+        # Reference MXFP4 path: widen the e2m1 expert weights to bf16 with their per-32 e8m0 block
+        # scales, then run the standard grouped matmul. `rhs` is native float4_e2m1fn [E, K, N] and
+        # `rhs_scale` is fp32 [E, num_k_blocks, 1, N] (one scale per MXFP4_GROUP_SIZE along K).
+        rhs = kwargs.pop("rhs")
+        scale = kwargs.pop("rhs_scale", None)
+        kwargs.pop("rhs_bias", None)
         kwargs.pop("activation_quantized_dtype", None)
-        return fp4_gmm_v2(**kwargs)
+        w = rhs.astype(jnp.bfloat16)
+        if scale is not None:
+            num_experts, size_k, size_n = w.shape
+            num_k_blocks = scale.shape[1]
+            block = size_k // num_k_blocks
+            s = jnp.broadcast_to(
+                scale.reshape(num_experts, num_k_blocks, 1, size_n),
+                (num_experts, num_k_blocks, block, size_n),
+            ).reshape(num_experts, size_k, size_n)
+            w = w * s.astype(jnp.bfloat16)
+        return super()._call_gmm(rhs=w, **kwargs)
 
 
 class KimiK3DecoderLayer(nnx.Module):
@@ -900,8 +913,7 @@ class KimiK3ForCausalLM(nnx.Module):
         ``q/k/v_proj`` are ``[12288, ...]`` = 96*128. So ``A_log`` is stored padded to
         ``head_dim`` and only its first ``num_heads`` entries are meaningful.
 
-        This mirrors the torch/GPU reference exactly
-        (``vllm_torchtpu/.../kimi_k3/attention.py::_load_a_log``)::
+        This mirrors the torch reference's A_log loader exactly::
 
             shard_size = parameter.shape[0]                       # num_heads // tp
             loaded_weight.narrow(0, rank * shard_size, shard_size)
@@ -1211,8 +1223,7 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
     > Routing must come from the TOP-LEVEL architectures, which is what this name pins.
 
     Text-only for now: the released checkpoint also carries a vision tower and ``mm_projector.*``,
-    which this class does not construct (the vLLM lane serves K3 text-only via
-    ``--language-model-only``).
+    which this class does not construct; the text stack is served on its own.
     """
 
 

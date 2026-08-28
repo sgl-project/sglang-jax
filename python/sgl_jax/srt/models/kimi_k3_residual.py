@@ -3,7 +3,7 @@
 This is the bookkeeping half of Attention Residuals. The *math* lives in
 ``kimi_k3_layers.AttentionResidual``; what lives here is the per-layer state machine that decides
 which candidates that math sees, ported from ``KimiDecoderLayer.forward`` in
-``vllm_torchtpu/models/vllm/kimi_k3/model.py``.
+the K3 torch reference.
 
 The protocol per layer, when ``attn_res_block_size`` is set::
 

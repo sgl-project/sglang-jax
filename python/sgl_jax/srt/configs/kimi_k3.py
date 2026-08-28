@@ -8,7 +8,7 @@ fields (``kv_lora_rank``, ``qk_nope_head_dim``, ``qk_rope_head_dim``, ``mla_use_
 inherited unchanged.
 
 The K3-only fields, derived by diffing every ``config.*`` access in
-``vllm_torchtpu/models/vllm/kimi_k3/*.py`` against ``KimiLinearConfig``:
+the K3 torch reference against ``KimiLinearConfig``:
 
 ===============================  ====================================================
 ``activation_situ_beta``         SITU gate soft-clip bound (``beta``)

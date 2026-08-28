@@ -118,8 +118,8 @@ def test_parse_expert_id():
     assert parse_expert_id("model.layers.3.self_attn.q_proj.weight") is None
 
 
-def test_expert_suffix_list_is_the_vllm_one():
-    """Kept in sync with vllm_torchtpu's _EXPERT_WEIGHT_SUFFIXES on purpose."""
+def test_expert_suffix_list_is_exact():
+    """The suffix list is exact on purpose: widening it silently drops shared state."""
     assert EXPERT_SUFFIXES == (".weight", ".weight_packed", ".weight_scale")
 
 

@@ -110,8 +110,8 @@ def build_epmoe_weights(
 # 26.8 chips of weights instead of 7.1, at v7x's measured 189.5 GiB/chip.
 #
 # The functions below keep the weights fp4 all the way into the kernel, matching what the
-# vllm-torchtpu lane already does to serve K3 (`layers/common/fused_moe_gmm.py`). They pair with
-# the vendored fp4 GMM in `sgl_jax/srt/kernels/gmm/megablox_fp4/`.
+# reference MXFP4 dequant path in the K3 MoE. They widen the released e2m1 expert weights and
+# their e8m0 block scales to bf16 for the standard grouped matmul.
 
 
 def unpack_fp4_to_e2m1(packed: jax.Array) -> jax.Array:
@@ -126,7 +126,7 @@ def unpack_fp4_to_e2m1(packed: jax.Array) -> jax.Array:
       ``[size_group, size_k, size_n]``.
 
     The result stays 4 bits per value -- there is no widening anywhere in here, which is the whole
-    point. Ported from ``vllm_torchtpu.layers.common.fused_moe_gmm.unpack_fp4_to_e2m1``.
+    point.
     """
     if packed.dtype != jnp.uint8:
         raise TypeError(f"expected uint8 packed weight, got {packed.dtype}")

@@ -5,7 +5,7 @@ disk, and a ``tpu7x-standard-4t`` node has ~919 GB of tmpfs -- so the released c
 fit on a host *before* any sharding. That is the blocker for the full 93-layer model; HBM is not
 (experts kept in fp4 are 1,357 GiB, which fits 16 chips).
 
-Two reductions, the same two the vllm-torchtpu lane uses to serve this model today
+Two reductions that make the released K3 checkpoint loadable within host memory
 (``model_loader_patches.py::_sharded_runai_weights_iterator``):
 
 **Stream.** safetensors is a header plus a flat data block, and every tensor's byte range is in
@@ -17,7 +17,7 @@ exactly the tensors wanted. Peak local footprint is one tensor, not one shard an
 the saving is in bytes *moved*, not merely bytes retained. Everything that is not a per-expert
 tensor (dense layers, shared experts, the router, norms) is read by every rank.
 
-The vllm lane's filter and its FusedMoE expert map are derived from the same computation so they
+The EP weight filter and its FusedMoE expert map are derived from the same computation so they
 cannot disagree; :func:`local_expert_ids` here plays that role, and the caller is expected to use
 it for both the fetch plan and the device placement.
 """
@@ -50,7 +50,7 @@ _EXPERT_RE = re.compile(r"\.experts\.(\d+)\.")
 
 # Suffixes of PER-EXPERT tensors that may be skipped for non-local experts. Anything else --
 # dense layers, shared experts, the gate, norms -- is needed by every rank. Mirrors
-# vllm_torchtpu's _EXPERT_WEIGHT_SUFFIXES; widening this list silently drops shared state.
+# the expert-weight suffixes; widening this list silently drops shared state.
 EXPERT_SUFFIXES = (".weight", ".weight_packed", ".weight_scale")
 
 
@@ -313,7 +313,7 @@ class GcsSource:
     **Requests are the cost, not bytes.** K3 has 896 experts x 3 projections x 2 tensors per MoE
     layer, so one GET per tensor is ~5.4k requests for a 4-layer truncation and ~165k for the full
     93 -- at even 20 ms of round-trip each that is most of an hour of pure latency. Two fixes, both
-    of which the vllm-torchtpu lane also applies:
+    of which are:
 
     * **prefetch in parallel** -- a small thread pool hides round-trip latency; GCS is happy with
       concurrent ranged reads and the bottleneck becomes bandwidth rather than RTT;
@@ -370,7 +370,7 @@ class GcsSource:
         Requests dominate: K3 asks 1,792 tensors per (layer, projection) group, and one GET each
         measured **46 s per group** on a 4-host run -- about 3.5 h for the model. But a shard lays
         consecutive experts out contiguously, so those thousands of small ranges collapse into a
-        handful of large sequential reads. This is what the vllm-torchtpu lane does with the
+        handful of large sequential reads. The streaming loader does this with the
         Run:AI streamer's ``FileChunks`` runs.
 
         Call with one group at a time. Fetching the whole model here would defeat the point --
