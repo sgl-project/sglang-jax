@@ -752,7 +752,9 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             )
 
         elif backend == "tt":
-            from sgl_jax.srt.layers.attention.tt_backend import TTAttention
+            from sgl_jax.srt.hardware_backend.tt.attention.tt_backend import (
+                TTAttention,
+            )
 
             full_attn_backend = TTAttention(
                 self.num_attn_heads,

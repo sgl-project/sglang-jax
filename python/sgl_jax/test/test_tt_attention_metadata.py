@@ -9,7 +9,7 @@ from jax.sharding import Mesh
 # Trigger JAX plugin discovery before importing the TT-only MLIR lowerings.
 jax.devices()
 
-from sgl_jax.srt.layers.attention.tt_backend import TTAttention
+from sgl_jax.srt.hardware_backend.tt.attention.tt_backend import TTAttention
 
 
 class TTAttentionMetadataTest(unittest.TestCase):
