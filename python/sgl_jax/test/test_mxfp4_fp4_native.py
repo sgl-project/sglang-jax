@@ -1,9 +1,12 @@
 """The fp4-native MoE load path: same numbers as the bf16 path, a quarter of the HBM.
 
-Dequantizing K3's experts to bf16 works at 4 layers and cannot work at 93 -- 2.723 T routed-expert
-params cost **5,072 GiB** as bf16 against **1,347 GiB** kept as fp4, i.e. 26.8 chips of weights
-instead of 7.1 at v7x's measured 189.5 GiB/chip. So the load path keeps the weights native fp4
-in HBM, and the MoE widens per block scale at matmul time.
+Dequantizing K3's experts to bf16 at load multiplies their resident size by ~4x (16 bits per
+value against 4), which is what makes the difference between a truncated bring-up and full depth.
+So the load path keeps the weights native fp4 in HBM, and the MoE widens per block scale at
+matmul time.
+
+TODO(vlasenkoalexey): once a sub-byte fp4 GMM kernel lands, these invariants become its operand
+contract and the MoE's dequant-at-matmul step goes away.
 
 These tests pin the three things that make that substitution safe:
 
@@ -84,10 +87,9 @@ def _device_bytes(make) -> tuple[int, int]:
 def test_unpacked_weight_is_sub_byte_in_hbm():
     """The claim the full-model plan rests on: fp4 stays ~0.5 B/value in HBM, not 1 or 2.
 
-    K3's 2.723 T routed-expert params are 5,072 GiB at 2 B/value and 1,347 GiB at 0.5 -- 26.8
-    chips of weights versus 7.1 at v7x's 189.5 GiB/chip. If XLA silently widened fp4 to a byte,
-    the port would still be numerically correct and the model would still not fit, so this is
-    measured rather than assumed.
+    The released routed experts dominate the checkpoint, so a silent widening of fp4 to a byte
+    would quadruple their resident size. The port would still be numerically correct and the
+    model would still not fit, so this is asserted rather than assumed.
     """
     packed, _ = _real_expert()
     w = unpack_fp4_to_e2m1(jnp.asarray(packed))
