@@ -102,9 +102,7 @@ class BailingMoeV3Config(PretrainedConfig):
         self.v_head_dim = v_head_dim
         self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
         self.mla_use_nope = use_mla_nope
-        self.gated_attention_proj_granularity_type = (
-            gated_attention_proj_granularity_type
-        )
+        self.gated_attention_proj_granularity_type = gated_attention_proj_granularity_type
 
         # KDA
         self.layer_group_size = layer_group_size
@@ -153,16 +151,10 @@ class BailingMoeV3Config(PretrainedConfig):
         # one is a full-attention (MLA) layer; the others are KDA.
         # For Ling3-Tiny: layer_group_size=4 → MLA at 0-based [3,7,11,15,19,23],
         # KDA at 0-based [0,1,2,4,5,6,8,9,10,12,...] = 1-based [1,2,3,5,6,7,...].
-        kda_layers = [
-            i
-            for i in range(1, num_hidden_layers + 1)
-            if i % layer_group_size != 0
-        ]
-        full_attn_layers = [
-            i
-            for i in range(1, num_hidden_layers + 1)
-            if i % layer_group_size == 0
-        ]
+        if layer_group_size <= 0:
+            raise ValueError(f"layer_group_size must be positive, got {layer_group_size}")
+        kda_layers = [i for i in range(1, num_hidden_layers + 1) if i % layer_group_size != 0]
+        full_attn_layers = [i for i in range(1, num_hidden_layers + 1) if i % layer_group_size == 0]
         self.linear_attn_config = {
             "kda_layers": kda_layers,
             "full_attn_layers": full_attn_layers,
@@ -199,9 +191,23 @@ class BailingMoeV3Config(PretrainedConfig):
 
     @property
     def full_attention_layer_ids(self) -> list[int]:
-        return [
-            i for i in range(self.num_hidden_layers) if not self.is_kda_layer(i)
-        ]
+        return [i for i in range(self.num_hidden_layers) if not self.is_kda_layer(i)]
+
+    @property
+    def linear_state_params(self):
+        """Describe Ling-3 KDA state for the recurrent radix-cache pool."""
+        from sgl_jax.srt.mem_cache.recurrent_state_pool import (
+            LinearRecurrentStateParams,
+            recurrent_state_dtype,
+        )
+
+        return LinearRecurrentStateParams(
+            layers=self.linear_layer_ids,
+            num_heads=self.num_attention_heads,
+            head_dim=self.head_dim,
+            conv_kernel_size=self.short_conv_kernel_size,
+            dtype=recurrent_state_dtype(),
+        )
 
     def _swiglu_limit(self, limit_list, layer_idx: int):
         """Per-layer SwiGLU clamp lookup. Mirrors maxtext's get_swiglu_limit

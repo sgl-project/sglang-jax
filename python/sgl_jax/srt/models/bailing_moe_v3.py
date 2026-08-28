@@ -24,6 +24,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.bailing_moe_v3 import BailingMoeV3Config
@@ -36,7 +37,7 @@ from sgl_jax.srt.layers.gate import GateLogit, TopK
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sgl_jax.srt.layers.moe import EPMoE, create_moe_weights_mapping
+from sgl_jax.srt.layers.moe import EPMoE
 from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.deepseek_v3 import DeepseekV3Attention
@@ -222,50 +223,73 @@ class BailingKDAAttention(nnx.Module):
         self.q_proj = LinearBase(
             input_size=self.hidden_size,
             output_size=self.projection_k_size,
-            mesh=mesh, use_bias=False, params_dtype=dtype,
-            kernel_axes=(None, "tensor"), scope_name="q_proj",
+            mesh=mesh,
+            use_bias=False,
+            params_dtype=dtype,
+            kernel_axes=(None, "tensor"),
+            scope_name="q_proj",
         )
         self.k_proj = LinearBase(
             input_size=self.hidden_size,
             output_size=self.projection_k_size,
-            mesh=mesh, use_bias=False, params_dtype=dtype,
-            kernel_axes=(None, "tensor"), scope_name="k_proj",
+            mesh=mesh,
+            use_bias=False,
+            params_dtype=dtype,
+            kernel_axes=(None, "tensor"),
+            scope_name="k_proj",
         )
         self.v_proj = LinearBase(
             input_size=self.hidden_size,
             output_size=self.projection_size,
-            mesh=mesh, use_bias=False, params_dtype=dtype,
-            kernel_axes=(None, "tensor"), scope_name="v_proj",
+            mesh=mesh,
+            use_bias=False,
+            params_dtype=dtype,
+            kernel_axes=(None, "tensor"),
+            scope_name="v_proj",
         )
 
         # Short conv weight containers — never called, only their .weight.value
         # is read by short_convolution. Layout [D, K]; D sharded on "tensor".
         self.q_conv1d = LinearBase(
-            self.projection_k_size, self.conv_size,
-            mesh, use_bias=False, params_dtype=dtype,
-            kernel_axes=("tensor", None), scope_name="q_conv1d",
+            self.projection_k_size,
+            self.conv_size,
+            mesh,
+            use_bias=False,
+            params_dtype=dtype,
+            kernel_axes=("tensor", None),
+            scope_name="q_conv1d",
         )
         self.k_conv1d = LinearBase(
-            self.projection_k_size, self.conv_size,
-            mesh, use_bias=False, params_dtype=dtype,
-            kernel_axes=("tensor", None), scope_name="k_conv1d",
+            self.projection_k_size,
+            self.conv_size,
+            mesh,
+            use_bias=False,
+            params_dtype=dtype,
+            kernel_axes=("tensor", None),
+            scope_name="k_conv1d",
         )
         self.v_conv1d = LinearBase(
-            self.projection_size, self.conv_size,
-            mesh, use_bias=False, params_dtype=dtype,
-            kernel_axes=("tensor", None), scope_name="v_conv1d",
+            self.projection_size,
+            self.conv_size,
+            mesh,
+            use_bias=False,
+            params_dtype=dtype,
+            kernel_axes=("tensor", None),
+            scope_name="v_conv1d",
         )
 
         # KDA recurrent params.
         self.A_log = nnx.Param(
             jnp.zeros(
-                (1, 1, self.num_heads, 1), dtype=jnp.float32,
+                (1, 1, self.num_heads, 1),
+                dtype=jnp.float32,
                 out_sharding=P(None, None, "tensor", None),
             )
         )
         self.dt_bias = nnx.Param(
             jnp.zeros(
-                (self.projection_size,), dtype=jnp.float32,
+                (self.projection_size,),
+                dtype=jnp.float32,
                 out_sharding=P("tensor"),
             )
         )
@@ -275,28 +299,40 @@ class BailingKDAAttention(nnx.Module):
         self.f_proj = LinearBase(
             input_size=self.hidden_size,
             output_size=self.projection_size,
-            mesh=mesh, use_bias=False, params_dtype=dtype,
-            kernel_axes=(None, "tensor"), scope_name="f_proj",
+            mesh=mesh,
+            use_bias=False,
+            params_dtype=dtype,
+            kernel_axes=(None, "tensor"),
+            scope_name="f_proj",
         )
         self.g_proj = LinearBase(
             input_size=self.hidden_size,
             output_size=self.projection_size,
-            mesh=mesh, use_bias=False, params_dtype=dtype,
-            kernel_axes=(None, "tensor"), scope_name="g_proj",
+            mesh=mesh,
+            use_bias=False,
+            params_dtype=dtype,
+            kernel_axes=(None, "tensor"),
+            scope_name="g_proj",
         )
         self.b_proj = LinearBase(
             input_size=self.hidden_size,
             output_size=self.num_heads,
-            mesh=mesh, use_bias=False, params_dtype=dtype,
-            kernel_axes=(None, "tensor"), scope_name="b_proj",
+            mesh=mesh,
+            use_bias=False,
+            params_dtype=dtype,
+            kernel_axes=(None, "tensor"),
+            scope_name="b_proj",
         )
 
         self.o_norm = GatedRMSNorm(self.head_dim, epsilon=self.rms_norm_eps)
         self.o_proj = LinearBase(
             input_size=self.projection_size,
             output_size=self.hidden_size,
-            mesh=mesh, use_bias=False, params_dtype=dtype,
-            kernel_axes=("tensor", None), scope_name="o_proj",
+            mesh=mesh,
+            use_bias=False,
+            params_dtype=dtype,
+            kernel_axes=("tensor", None),
+            scope_name="o_proj",
         )
 
         self.attn = RadixLinearAttention(
@@ -335,18 +371,20 @@ class BailingKDAAttention(nnx.Module):
         beta = jax.nn.sigmoid(self.b_proj(hidden_states)[0].astype(jnp.float32))
 
         o, recurrent_state_pool = self.attn(
-            forward_batch, q, k, v, raw_gate, beta, recurrent_state_pool,
+            forward_batch,
+            q,
+            k,
+            v,
+            raw_gate,
+            beta,
+            recurrent_state_pool,
         )
         o = o.reshape(hidden_states.shape[0], self.num_heads, self.head_dim)
 
         output_gate, _ = self.g_proj(hidden_states)
-        output_gate = output_gate.reshape(
-            hidden_states.shape[0], self.num_heads, self.head_dim
-        )
+        output_gate = output_gate.reshape(hidden_states.shape[0], self.num_heads, self.head_dim)
         # GatedRMSNorm: RMSNorm(o) * sigmoid(output_gate).
-        o = self.o_norm(o, output_gate).reshape(
-            hidden_states.shape[0], self.projection_size
-        )
+        o = self.o_norm(o, output_gate).reshape(hidden_states.shape[0], self.projection_size)
         o, _ = self.o_proj(o)
         return o, recurrent_state_pool
 
@@ -366,6 +404,7 @@ class BailingMoeV3DecoderLayer(nnx.Module):
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.mesh = mesh
         self.is_kda = config.is_kda_layer(layer_idx)
 
         # Attention
@@ -392,6 +431,7 @@ class BailingMoeV3DecoderLayer(nnx.Module):
                 rope_interleave=config.rope_interleave,
                 max_position_embeddings=config.max_position_embeddings,
                 dtype=dtype,
+                use_absorbed=getattr(config, "use_absorbed_mla", True),
             )
 
         # MLP — layer 0 dense, layers 1..23 MoE.
@@ -424,6 +464,7 @@ class BailingMoeV3DecoderLayer(nnx.Module):
                 topk_group=config.topk_group,
                 routed_scaling_factor=config.routed_scaling_factor,
                 layer_id=layer_idx,
+                mesh=mesh,
             )
 
             if self.use_fused:
@@ -447,7 +488,7 @@ class BailingMoeV3DecoderLayer(nnx.Module):
                     dtype=dtype,
                     layer_id=layer_idx,
                     ep_size=getattr(config, "ep_size", 1),
-                    activation_fn=config.score_function,
+                    activation="silu",
                     renormalize_topk_logits=config.norm_topk_prob,
                     routed_scaling_factor=config.routed_scaling_factor,
                     use_grouped_topk=config.n_group > 0,
@@ -455,6 +496,7 @@ class BailingMoeV3DecoderLayer(nnx.Module):
                     top_k_groups=config.topk_group,
                     num_shared_experts=config.num_shared_experts,
                     moe_shared_expert_intermediate_size=config.moe_shared_expert_intermediate_size,
+                    quantization_config=getattr(config, "quantization_config", None),
                 )
                 self.shared_experts = None
             else:
@@ -469,6 +511,7 @@ class BailingMoeV3DecoderLayer(nnx.Module):
                     layer_id=layer_idx,
                     ep_size=getattr(config, "ep_size", 1),
                     swiglu_limit=config.expert_swiglu_limit(layer_idx),
+                    quantization_config=getattr(config, "quantization_config", None),
                 )
                 if config.num_shared_experts > 0:
                     self.shared_experts = BailingMoeV3MLP(
@@ -519,7 +562,10 @@ class BailingMoeV3DecoderLayer(nnx.Module):
         else:
             kv_pool = memory_pools.token_to_kv_pool
         hidden_states, kv_fused = self.self_attn(
-            positions, hidden_states, forward_batch, kv_pool,
+            positions,
+            hidden_states,
+            forward_batch,
+            kv_pool,
         )
 
         # Post-attention residual + norm.
@@ -529,22 +575,32 @@ class BailingMoeV3DecoderLayer(nnx.Module):
 
         # MLP.
         if self.is_moe_layer:
-            shared_output = self.shared_experts(hidden_states) if self.shared_experts is not None else None
+            shared_output = (
+                self.shared_experts(hidden_states) if self.shared_experts is not None else None
+            )
 
             router_logits = self.moe_gate(hidden_states)
-            correction_bias = (
-                self.moe_gate.bias.value if self.moe_gate.bias is not None else None
-            )
+            correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
             topk_weights, topk_ids = self.topk(
-                router_logits, correction_bias, dispatch_info=dispatch_info
+                router_logits,
+                correction_bias,
+                dispatch_info=dispatch_info,
+                routing_sharding=NamedSharding(self.mesh, P("data", None)),
             )
             if self.use_fused:
                 token_valid_mask = forward_batch.get_token_valid_mask(
-                    hidden_states.shape[0]
+                    hidden_states.shape[0],
+                    out_sharding=NamedSharding(self.mesh, P("data")),
                 )
-                topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
+                if token_valid_mask is not None:
+                    topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
 
-            hidden_states = self.experts(hidden_states, topk_weights, topk_ids)
+            hidden_states = self.experts(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                out_sharding=NamedSharding(self.mesh, P("data", None)),
+            )
             if shared_output is not None:
                 hidden_states = hidden_states + shared_output
         else:
@@ -580,7 +636,10 @@ class BailingMoeV3Model(nnx.Module):
         self.layers = nnx.data(
             [
                 BailingMoeV3DecoderLayer(
-                    config=config, mesh=mesh, layer_idx=i, dtype=dtype,
+                    config=config,
+                    mesh=mesh,
+                    layer_idx=i,
+                    dtype=dtype,
                 )
                 for i in range(config.num_hidden_layers)
             ]
@@ -639,9 +698,7 @@ class BailingMoeV3ForCausalLM(nnx.Module):
     @classmethod
     def patch_model_config(cls, mc: ModelConfig) -> None:
         mc.attention_arch = AttentionArch.MLA
-        mc.head_dim = (
-            mc.hf_text_config.qk_nope_head_dim + mc.hf_text_config.qk_rope_head_dim
-        )
+        mc.head_dim = mc.hf_text_config.qk_nope_head_dim + mc.hf_text_config.qk_rope_head_dim
 
     def __init__(
         self,
@@ -670,17 +727,13 @@ class BailingMoeV3ForCausalLM(nnx.Module):
         memory_pools,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_kv_fused, layers_recurrent_state, layers_topk_ids = (
-            self.model(forward_batch, memory_pools)
+        hidden_states, layers_kv_fused, layers_recurrent_state, layers_topk_ids = self.model(
+            forward_batch, memory_pools
         )
         if not getattr(self.config, "tie_word_embeddings", False):
-            output = self.logits_processor(
-                hidden_states, self.lm_head, logits_metadata
-            )
+            output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         else:
-            output = self.logits_processor(
-                hidden_states, self.model.embed_tokens, logits_metadata
-            )
+            output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
         return (
             output,
             {
@@ -948,9 +1001,7 @@ class BailingMoeV3ForCausalLM(nnx.Module):
             metadata = get_global_expert_location_metadata()
             phy_to_log = None
             if metadata is not None:
-                physical_to_logical_map = np.array(
-                    jax.device_get(metadata.physical_to_logical_map)
-                )
+                physical_to_logical_map = np.array(jax.device_get(metadata.physical_to_logical_map))
                 phy_to_log = physical_to_logical_map[layer_idx]
 
             if moe_backend == "fused":
@@ -962,7 +1013,8 @@ class BailingMoeV3ForCausalLM(nnx.Module):
             for source_name, target_name in expert_target_map.items():
                 if moe_backend == "epmoe":
                     sharding = (
-                        ("expert", "tensor", None) if target_name == "wo"
+                        ("expert", "tensor", None)
+                        if target_name == "wo"
                         else ("expert", None, "tensor")
                     )
                 else:
@@ -986,12 +1038,10 @@ class BailingMoeV3ForCausalLM(nnx.Module):
                     ("up_proj", (None, "tensor")),
                     ("down_proj", ("tensor", None)),
                 ]:
-                    mappings[f"{prefix}.mlp.shared_experts.{proj_name}.weight"] = (
-                        WeightMapping(
-                            target_path=f"{target_prefix}.shared_experts.{proj_name}.weight",
-                            sharding=sharding,
-                            transpose=True,
-                        )
+                    mappings[f"{prefix}.mlp.shared_experts.{proj_name}.weight"] = WeightMapping(
+                        target_path=f"{target_prefix}.shared_experts.{proj_name}.weight",
+                        sharding=sharding,
+                        transpose=True,
                     )
 
         return mappings
