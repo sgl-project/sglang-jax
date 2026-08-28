@@ -56,6 +56,10 @@ class BailingMoeV3Config(PretrainedConfig):
         scoring_func="sigmoid",
         routed_scaling_factor=2.5,
         router_dtype="fp32",
+        # Ling-3-Tiny is served with attention DP. Keeping the complete expert
+        # table on every DP rank avoids EP dispatch/all-to-all for this small
+        # model and lets each rank evaluate its local tokens independently.
+        replicate_moe=True,
         # SwiGLU clamp (Ling3-Flash only — trained with maxtext's MoE block
         # which clamps gate/up activations on the last few layers; see
         # maxtext/src/MaxText/layers/moe.py:737-759 and configs/models/ling3-flash.yml.
@@ -130,6 +134,7 @@ class BailingMoeV3Config(PretrainedConfig):
         self.moe_router_activation_func = score_function
         self.routed_scaling_factor = routed_scaling_factor
         self.router_dtype = router_dtype
+        self.replicate_moe = replicate_moe
 
         # SwiGLU clamp (per-layer scalar; 0 / None / out-of-range = disabled).
         # Spelling matches the HF config field name (`share_` not `shared_`).

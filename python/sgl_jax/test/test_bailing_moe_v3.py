@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from flax import nnx
 from jax.sharding import NamedSharding
@@ -55,6 +56,21 @@ def _tiny_config(**overrides):
     return BailingMoeV3Config(**defaults)
 
 
+def _pure_dp_mesh():
+    return create_device_mesh(
+        ici_parallelism=[jax.device_count(), 1],
+        dcn_parallelism=[1, 1],
+    )
+
+
+def _single_device_mesh():
+    return create_device_mesh(
+        ici_parallelism=[1, 1],
+        dcn_parallelism=[1, 1],
+        devices=jax.devices()[:1],
+    )
+
+
 def test_ling3_config_exposes_recurrent_radix_state_layout():
     cfg = _tiny_config(num_hidden_layers=8, layer_group_size=4)
 
@@ -104,7 +120,7 @@ def test_ling3_architecture_and_hybrid_backend_are_registered():
     assert model_cls is BailingMoeV3ForCausalLM
     assert arch == "BailingMoeV3ForCausalLM"
 
-    mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
+    mesh = _pure_dp_mesh()
     full_backend = object()
     backend = attn_backend_wrapper(
         SimpleNamespace(
@@ -123,11 +139,11 @@ def test_ling3_architecture_and_hybrid_backend_are_registered():
     assert backend.full_attn_layers == frozenset({1})
 
 
-def test_ling3_model_builds_kda_mla_and_epmoe_on_current_main():
+def test_ling3_model_builds_kda_mla_and_replicated_moe_on_current_main():
     cfg = _tiny_config(use_absorbed_mla=False)
-    cfg.ep_size = 1
+    cfg.ep_size = 8
     cfg.moe_backend = "epmoe"
-    mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
+    mesh = _pure_dp_mesh()
 
     with jax.set_mesh(mesh):
         model = BailingMoeV3ForCausalLM(cfg, mesh, dtype=jnp.float32)
@@ -136,7 +152,16 @@ def test_ling3_model_builds_kda_mla_and_epmoe_on_current_main():
     assert isinstance(model.model.layers[1].self_attn, BailingMLA)
     assert model.model.layers[1].self_attn.use_absorbed is False
     assert isinstance(model.model.layers[1].experts, EPMoE)
+    assert model.model.layers[1].experts.replicate_experts is True
+    assert model.model.layers[1].experts.ep_size == 1
+    assert model.model.layers[1].experts.tp_size == 1
+    assert model.model.layers[1].experts.wi_0.value.sharding.spec == P(None, None, None)
     assert model.model.layers[1].topk.mesh is mesh
+
+    mappings = model._create_weight_mappings()
+    expert_mapping = mappings["__MOE_EXPERTS__model.layers.1.experts.wi_0"]
+    assert expert_mapping.sharding == (None, None, None)
+    assert expert_mapping.physical_to_logical_map is None
 
 
 def test_ling3_kda_lower_bound_is_used_by_decode_gate():
@@ -153,8 +178,77 @@ def test_ling3_kda_lower_bound_is_used_by_decode_gate():
     assert jnp.allclose(actual, expected[None, ...])
 
 
+def test_replicated_moe_matches_local_dense_reference():
+    mesh = _pure_dp_mesh()
+    with jax.set_mesh(mesh):
+        moe = EPMoE(
+            hidden_size=4,
+            num_experts=4,
+            num_experts_per_tok=2,
+            ep_size=4,
+            mesh=mesh,
+            intermediate_dim=8,
+            weight_dtype=jnp.float32,
+            dtype=jnp.float32,
+            replicate_experts=True,
+        )
+
+        hidden_states = jax.device_put(
+            jnp.arange(32, dtype=jnp.float32).reshape(8, 4) / 10,
+            NamedSharding(mesh, P("data", None)),
+        )
+        topk_ids = jax.device_put(
+            jnp.array(
+                [[0, 1], [1, 2], [2, 3], [3, 0], [0, 2], [1, 3], [2, 0], [3, 1]],
+                dtype=jnp.int32,
+            ),
+            NamedSharding(mesh, P("data", None)),
+        )
+        topk_weights = jax.device_put(
+            jnp.array(
+                [
+                    [0.7, 0.3],
+                    [0.6, 0.4],
+                    [0.8, 0.2],
+                    [0.5, 0.5],
+                    [0.9, 0.1],
+                    [0.4, 0.6],
+                    [0.3, 0.7],
+                    [0.2, 0.8],
+                ],
+                dtype=jnp.float32,
+            ),
+            NamedSharding(mesh, P("data", None)),
+        )
+        output = moe(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            out_sharding=NamedSharding(mesh, P("data", None)),
+        )
+
+        hidden_np = np.asarray(jax.device_get(hidden_states))
+        ids_np = np.asarray(jax.device_get(topk_ids))
+        weights_np = np.asarray(jax.device_get(topk_weights))
+        wi_0_np = np.asarray(jax.device_get(moe.wi_0.value))
+        wi_1_np = np.asarray(jax.device_get(moe.wi_1.value))
+        wo_np = np.asarray(jax.device_get(moe.wo.value))
+        expected = np.zeros_like(hidden_np)
+        for token_idx, token in enumerate(hidden_np):
+            for weight, expert_id in zip(weights_np[token_idx], ids_np[token_idx]):
+                gate = token @ wi_0_np[expert_id]
+                up = token @ wi_1_np[expert_id]
+                silu_gate = gate / (1.0 + np.exp(-gate))
+                expected[token_idx] += weight * ((silu_gate * up) @ wo_np[expert_id])
+
+    assert output.sharding == NamedSharding(mesh, P("data", None))
+    np.testing.assert_allclose(np.asarray(jax.device_get(output)), expected, rtol=2e-4, atol=2e-4)
+
+
 def test_ling3_kda_lower_bound_is_threaded_to_prefill(monkeypatch):
-    mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
+    # This unit only checks lower_bound plumbing into the prefill kernel. Keep
+    # it independent of the process-wide virtual-device count used by DP tests.
+    mesh = _single_device_mesh()
     backend = KDAAttnBackend(mesh=mesh)
     captured = {}
 
@@ -191,7 +285,7 @@ def test_ling3_kda_lower_bound_is_threaded_to_prefill(monkeypatch):
     assert captured["lower_bound"] == -5.0
 
 
-def test_ling3_epmoe_preserves_data_parallel_output_layout():
+def test_ling3_replicated_moe_preserves_data_parallel_output_layout():
     mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
     captured = {}
 

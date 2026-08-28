@@ -41,12 +41,17 @@ class EPMoE(nnx.Module):
         physical_to_logical_map: "jax.Array | None" = None,
         pre_gather_quant_dtype=None,
         swiglu_limit: float | None = None,
+        replicate_experts: bool = False,
     ):
         self.num_experts_per_tok = num_experts_per_tok
         self.physical_to_logical_map = physical_to_logical_map
         self.pre_gather_quant_dtype = pre_gather_quant_dtype
+        self.replicate_experts = replicate_experts
 
-        metadata = get_global_expert_location_metadata()
+        # Replicated MoE keeps the logical expert table intact on every data
+        # rank. EPLB's physical expert remapping is an EP-only optimization and
+        # must not change the table shape in this mode.
+        metadata = None if replicate_experts else get_global_expert_location_metadata()
         if metadata is not None and layer_id is not None:
             self.num_experts = metadata.num_physical_experts
         else:
@@ -74,25 +79,46 @@ class EPMoE(nnx.Module):
             getattr(quantization_config, "weight_block_size", None) if quantization_config else None
         )
 
-        if self.num_experts % self.ep_size != 0:
+        if self.replicate_experts and self.quantized_dtype is not None:
+            raise NotImplementedError(
+                "replicated EPMoE currently supports BF16/FP32 weights only; "
+                "quantized replicated experts are not implemented"
+            )
+
+        if not self.replicate_experts and self.num_experts % self.ep_size != 0:
             raise ValueError(
                 f"num_experts({self.num_experts}) must be divisible by ep_size ({self.ep_size})"
             )
-        world_size = math.prod(self.mesh.shape.values())
-        self.tp_size = world_size // self.ep_size
-        self.experts_per_device = self.num_experts // self.ep_size
 
-        devices = self.mesh.devices.flatten()
-        self.moe_mesh = jax.sharding.Mesh(
-            devices.reshape(self.ep_size, self.tp_size),
-            axis_names=("expert", "tensor"),
-            axis_types=(jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit),
-        )
+        if self.replicate_experts:
+            # Preserve the model mesh (normally data=dp, tensor=1 for Ling-3).
+            # Every data rank owns all experts and evaluates only its local
+            # token slice, so there is no expert dispatch/combine collective.
+            self.ep_size = 1
+            self.tp_size = 1
+            self.experts_per_device = self.num_experts
+            self.moe_mesh = self.mesh
+            self.updated_mesh = self.mesh.abstract_mesh
+            wi_sharding = P(None, None, None)
+            wo_sharding = P(None, None, None)
+        else:
+            world_size = math.prod(self.mesh.shape.values())
+            self.tp_size = world_size // self.ep_size
+            self.experts_per_device = self.num_experts // self.ep_size
 
-        abstract_mesh = self.mesh.abstract_mesh
-        self.updated_mesh = abstract_mesh.update(
-            axis_sizes=(self.ep_size, self.tp_size), axis_names=("expert", "tensor")
-        )
+            devices = self.mesh.devices.flatten()
+            self.moe_mesh = jax.sharding.Mesh(
+                devices.reshape(self.ep_size, self.tp_size),
+                axis_names=("expert", "tensor"),
+                axis_types=(jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit),
+            )
+
+            abstract_mesh = self.mesh.abstract_mesh
+            self.updated_mesh = abstract_mesh.update(
+                axis_sizes=(self.ep_size, self.tp_size), axis_names=("expert", "tensor")
+            )
+            wi_sharding = P("expert", None, "tensor")
+            wo_sharding = P("expert", "tensor", None)
 
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
             # MOE weights' shape is (num_experts, k, n)
@@ -101,7 +127,7 @@ class EPMoE(nnx.Module):
                     jax.random.PRNGKey(0),
                     (self.num_experts, hidden_size, intermediate_dim),
                     dtype=weight_dtype,
-                    out_sharding=P("expert", None, "tensor"),
+                    out_sharding=wi_sharding,
                 )
             )
 
@@ -110,7 +136,7 @@ class EPMoE(nnx.Module):
                     jax.random.PRNGKey(0),
                     (self.num_experts, hidden_size, intermediate_dim),
                     dtype=weight_dtype,
-                    out_sharding=P("expert", None, "tensor"),
+                    out_sharding=wi_sharding,
                 )
             )
 
@@ -119,7 +145,7 @@ class EPMoE(nnx.Module):
                     jax.random.PRNGKey(0),
                     (self.num_experts, intermediate_dim, hidden_size),
                     dtype=weight_dtype,
-                    out_sharding=P("expert", "tensor", None),
+                    out_sharding=wo_sharding,
                 )
             )
 
@@ -420,6 +446,14 @@ class EPMoE(nnx.Module):
     ) -> jax.Array:
         if out_sharding is None:
             out_sharding = jax.sharding.NamedSharding(self.mesh, P(*([None] * hidden_states.ndim)))
+        if self.replicate_experts:
+            return self._call_replicated(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                out_sharding=out_sharding,
+            )
+
         # Translate the caller's target sharding (on self.mesh: data,tensor)
         # into shard_map out_specs (on self.moe_mesh: expert,tensor). Only
         # 'tensor' is shared between the two meshes; everything else is
@@ -496,6 +530,86 @@ class EPMoE(nnx.Module):
         # the original mesh so downstream ops (residual add, layernorm) see a
         # consistent context.
         return jax.sharding.reshard(result, out_sharding)
+
+    def _call_replicated(
+        self,
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        *,
+        out_sharding: jax.sharding.NamedSharding,
+    ) -> jax.Array:
+        """Run a local all-expert GMM independently on every data rank."""
+        if any(scale is not None for scale in (self.wi_0_scale, self.wi_1_scale, self.wo_scale)):
+            raise NotImplementedError("replicated EPMoE does not yet support quantized weights")
+
+        token_spec = P("data", *([None] * (hidden_states.ndim - 1)))
+        routing_spec = P("data", *([None] * (topk_ids.ndim - 1)))
+        weight_spec = P(None, None, None)
+
+        with jax.sharding.use_abstract_mesh(self.updated_mesh):
+            hidden_states = jax.sharding.reshard(hidden_states, token_spec)
+            topk_weights = jax.sharding.reshard(topk_weights, routing_spec)
+            topk_ids = jax.sharding.reshard(topk_ids, routing_spec)
+            result = shard_map(
+                self._forward_replicated,
+                mesh=self.moe_mesh,
+                in_specs=(
+                    token_spec,
+                    routing_spec,
+                    routing_spec,
+                    weight_spec,
+                    weight_spec,
+                    weight_spec,
+                ),
+                out_specs=token_spec,
+                check_vma=False,
+            )(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                self.wi_0.value,
+                self.wi_1.value,
+                self.wo.value,
+            )
+
+        return jax.sharding.reshard(result, out_sharding)
+
+    def _forward_replicated(
+        self,
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        w0_weights,
+        w1_weights,
+        wo_weights,
+    ):
+        """Per-rank MoE body: no EP dispatch, TP reduce, or expert combine."""
+        if hidden_states.ndim == 2:
+            total_tokens = hidden_states.shape[0]
+            batch_size, seq_len = 1, total_tokens
+        else:
+            batch_size, seq_len = hidden_states.shape[0], hidden_states.shape[1]
+
+        inputs_2d, token_indices, sorted_selected_experts, weights, group_sizes = self._permute(
+            hidden_states, topk_ids, topk_weights
+        )
+        intermediate_output = self._gmm_compute(
+            inputs_2d,
+            token_indices,
+            group_sizes.astype(jnp.int32),
+            w0_weights,
+            w1_weights,
+            wo_weights,
+            jnp.array(0, dtype=jnp.int32),
+        )
+        return self._unpermute(
+            intermediate_output,
+            sorted_selected_experts,
+            weights,
+            batch_size,
+            seq_len,
+        )
 
     def _forward(
         self,

@@ -13,7 +13,8 @@ Reuses:
 - KimiDeltaAttention's KDA wiring as a starting point, but Ling3 has
   no_kda_lora=True so the f_a/f_b and g_a/g_b LoRA pairs collapse into single
   f_proj / g_proj direct projections.
-- BailingMoE-style MoE blocks: mlp.gate (GateLogit), TopK, EPMoE, shared_experts.
+- BailingMoE-style MoE blocks: mlp.gate (GateLogit), TopK, replicated local GMM,
+  shared_experts. Ling-3 defaults to a complete expert table on every DP rank.
 """
 
 from __future__ import annotations
@@ -44,6 +45,8 @@ from sgl_jax.srt.models.deepseek_v3 import DeepseekV3Attention
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
+
+_REPLICATED_MOE_BACKEND = "replicated"
 
 
 # ---------------------------------------------------------------------------
@@ -436,7 +439,12 @@ class BailingMoeV3DecoderLayer(nnx.Module):
 
         # MLP — layer 0 dense, layers 1..23 MoE.
         self.is_moe_layer = layer_idx >= config.first_k_dense_replace
-        self.moe_backend = getattr(config, "moe_backend", MoEBackend.EPMOE)
+        requested_moe_backend = getattr(config, "moe_backend", MoEBackend.EPMOE)
+        self.moe_backend = (
+            _REPLICATED_MOE_BACKEND
+            if getattr(config, "replicate_moe", True)
+            else requested_moe_backend
+        )
         self.use_fused = self.moe_backend == "fused"
 
         if not self.is_moe_layer:
@@ -509,9 +517,14 @@ class BailingMoeV3DecoderLayer(nnx.Module):
                     weight_dtype=dtype,
                     dtype=dtype,
                     layer_id=layer_idx,
-                    ep_size=getattr(config, "ep_size", 1),
+                    ep_size=(
+                        1
+                        if self.moe_backend == _REPLICATED_MOE_BACKEND
+                        else getattr(config, "ep_size", 1)
+                    ),
                     swiglu_limit=config.expert_swiglu_limit(layer_idx),
                     quantization_config=getattr(config, "quantization_config", None),
+                    replicate_experts=self.moe_backend == _REPLICATED_MOE_BACKEND,
                 )
                 if config.num_shared_experts > 0:
                     self.shared_experts = BailingMoeV3MLP(
@@ -826,7 +839,11 @@ class BailingMoeV3ForCausalLM(nnx.Module):
 
         num_layers = self.config.num_hidden_layers
         first_k_dense_replace = self.config.first_k_dense_replace
-        moe_backend = getattr(self.config, "moe_backend", "epmoe")
+        moe_backend = (
+            _REPLICATED_MOE_BACKEND
+            if getattr(self.config, "replicate_moe", True)
+            else getattr(self.config, "moe_backend", "epmoe")
+        )
 
         for layer_idx in range(num_layers):
             is_dense = layer_idx < first_k_dense_replace
@@ -1007,7 +1024,7 @@ class BailingMoeV3ForCausalLM(nnx.Module):
             if moe_backend == "fused":
                 expert_target_map = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}
                 fused_sharding = (("data", "tensor"), None, None)
-            else:  # epmoe
+            else:  # epmoe or replicated local GMM
                 expert_target_map = {"gate_proj": "wi_0", "up_proj": "wi_1", "down_proj": "wo"}
 
             for source_name, target_name in expert_target_map.items():
@@ -1017,6 +1034,8 @@ class BailingMoeV3ForCausalLM(nnx.Module):
                         if target_name == "wo"
                         else ("expert", None, "tensor")
                     )
+                elif moe_backend == _REPLICATED_MOE_BACKEND:
+                    sharding = (None, None, None)
                 else:
                     sharding = fused_sharding
                 target_path_base = f"{target_prefix}.experts.{target_name}"
@@ -1028,7 +1047,9 @@ class BailingMoeV3ForCausalLM(nnx.Module):
                     target_path=[target_path_base] + expert_keys,
                     sharding=sharding,
                     transpose=True,
-                    physical_to_logical_map=phy_to_log,
+                    physical_to_logical_map=(
+                        None if moe_backend == _REPLICATED_MOE_BACKEND else phy_to_log
+                    ),
                 )
 
             # Shared experts.
