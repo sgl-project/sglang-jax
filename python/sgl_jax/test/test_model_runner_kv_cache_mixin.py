@@ -3,7 +3,7 @@ import types
 import jax.numpy as jnp
 import pytest
 
-from sgl_jax.srt.mem_cache.mla_cache_layout import MLACacheLayout
+from sgl_jax.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
     _enforce_recurrent_state_server_constraints,
@@ -132,22 +132,6 @@ _MLA_BYTES_PER_TOKEN = _allocated_bytes_per_page(640) // 128 * 78
 _INDEXER_BYTES_PER_TOKEN = _allocated_bytes_per_page(128) // 128 * 21
 
 
-def test_mla_cache_layout_exposes_latent_and_indexer_roles():
-    """Callers select the semantic buffer role; feature width never selects it."""
-    import jax.numpy as jnp
-
-    layout = MLACacheLayout(
-        page_size=128,
-        dtype=jnp.bfloat16,
-        kv_lora_rank=192,
-        qk_rope_head_dim=64,
-        indexer_key_dim=128,
-    )
-
-    assert layout.latent_shape(total_num_pages=2) == (2, 64, 2, 384)
-    assert layout.indexer_shape(total_num_pages=2) == (2, 64, 2, 128)
-
-
 def test_cell_size_excludes_indexer_for_non_dsa_mla():
     """`fa` allocates no indexer buffer, so it must not be charged for one."""
     assert _CellSizeRunner("fa")._compute_cell_size() == _MLA_BYTES_PER_TOKEN
@@ -178,18 +162,19 @@ def test_cell_size_rounds_up_fractional_page_cost():
     """Capacity profiling must never truncate a partial byte/token ratio."""
     import jax.numpy as jnp
 
-    layout = MLACacheLayout(
-        page_size=3,
-        dtype=jnp.bfloat16,
-        kv_lora_rank=512,
-        qk_rope_head_dim=64,
-    )
-    page_bytes = layout.latent_bytes(total_num_pages=1)
+    page_size = 3
+    page_bytes = _allocated_bytes_per_page(640, page_size)
 
-    assert page_bytes % layout.page_size != 0
+    assert page_bytes % page_size != 0
     assert (
-        layout.bytes_per_token(num_latent_layers=1, num_indexer_layers=0)
-        == (page_bytes + layout.page_size - 1) // layout.page_size
+        MLATokenToKVPool.profiled_bytes_per_token(
+            page_size=3,
+            dtype=jnp.bfloat16,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            num_latent_layers=1,
+        )
+        == (page_bytes + page_size - 1) // page_size
     )
 
 
@@ -264,8 +249,8 @@ def test_allocated_bytes_match_the_budget_and_the_report():
     assert resident == cell * (size + runner.page_size * 1)
 
 
-def test_mla_pool_pytree_round_trip_preserves_layout_contract():
-    """JAX transformations must retain the semantic layout after unflattening."""
+def test_mla_pool_pytree_round_trip_preserves_logical_dimensions():
+    """JAX transformations retain logical dimensions before physical alignment."""
     import jax
 
     runner = _CellSizeRunner("dsa_sparse", num_layers=8, index_head_dim=96)
@@ -274,12 +259,16 @@ def test_mla_pool_pytree_round_trip_preserves_layout_contract():
     leaves, tree = jax.tree_util.tree_flatten(pool)
     restored = jax.tree_util.tree_unflatten(tree, leaves)
 
-    assert pool.cache_layout.indexer_key_dim == 96
+    assert pool.indexer_key_dim_raw == 96
     assert pool.indexer_key_dim == 128
-    assert restored.cache_layout == pool.cache_layout
+    assert restored.indexer_key_dim_raw == pool.indexer_key_dim_raw
     assert restored.indexer_key_dim == pool.indexer_key_dim
-    assert restored.cache_layout.latent_shape(1) == pool.cache_layout.latent_shape(1)
-    assert restored.cache_layout.indexer_shape(1) == pool.cache_layout.indexer_shape(1)
+    assert [buffer.shape for buffer in restored.kv_buffer] == [
+        buffer.shape for buffer in pool.kv_buffer
+    ]
+    assert [buffer.shape for buffer in restored.indexer_key_buffer] == [
+        buffer.shape for buffer in pool.indexer_key_buffer
+    ]
     assert restored.get_kv_size_bytes() == pool.get_kv_size_bytes()
 
 

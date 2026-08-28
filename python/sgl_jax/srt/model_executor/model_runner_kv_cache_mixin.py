@@ -16,8 +16,11 @@ from typing import TYPE_CHECKING
 import jax.numpy as jnp
 import numpy as np
 
-from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool, MemoryPools
-from sgl_jax.srt.mem_cache.mla_cache_layout import MLACacheLayout
+from sgl_jax.srt.mem_cache.memory_pool import (
+    HybridReqToTokenPool,
+    MemoryPools,
+    MLATokenToKVPool,
+)
 from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
 
 if TYPE_CHECKING:
@@ -325,15 +328,13 @@ class ModelRunnerKVCacheMixin:
         if self.use_mla_backend and self.server_args.attention_backend in ("fa", "dsa_sparse"):
             cfg = self.model_config.hf_text_config
             indexer_key_dim, num_indexer_layers = self._dsa_indexer_cache_params()
-            layout = MLACacheLayout(
+            return MLATokenToKVPool.profiled_bytes_per_token(
                 page_size=self.page_size,
                 dtype=self.kv_cache_dtype,
                 kv_lora_rank=cfg.kv_lora_rank,
                 qk_rope_head_dim=cfg.qk_rope_head_dim,
-                indexer_key_dim=indexer_key_dim,
-            )
-            return layout.bytes_per_token(
                 num_latent_layers=num_layers,
+                indexer_key_dim=indexer_key_dim,
                 num_indexer_layers=num_indexer_layers,
             )
 
@@ -722,8 +723,6 @@ class ModelRunnerKVCacheMixin:
                 dp_size=dp_size,
             )
         elif self.use_mla_backend and self.server_args.attention_backend in ("fa", "dsa_sparse"):
-            from sgl_jax.srt.mem_cache.memory_pool import MLATokenToKVPool
-
             hf_text_config = self.model_config.hf_text_config
             kv_lora_rank = getattr(hf_text_config, "kv_lora_rank", None)
             qk_rope_head_dim = getattr(hf_text_config, "qk_rope_head_dim", None)
