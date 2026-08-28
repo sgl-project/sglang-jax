@@ -1,7 +1,7 @@
 """K3-specific layers that Kimi-Linear does not have: SITU activation and Attention Residuals.
 
 Ported from the PyTorch reference at
-``vllm_torchtpu/models/vllm/kimi_k3/layers.py`` (SituAndMul, AttentionResidual).
+the K3 torch reference (SituAndMul, AttentionResidual).
 
 Kimi-Linear (already in ``models/kimi_linear.py``) supplies KDA, MLA and the MoE routing that K3
 also uses. These two modules are the architectural delta:

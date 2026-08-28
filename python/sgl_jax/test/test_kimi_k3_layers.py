@@ -1,10 +1,10 @@
 """Parity tests for the K3-specific JAX layers vs a numpy oracle.
 
-The oracle is transcribed LINE BY LINE from the PyTorch reference at
-``vllm_torchtpu/models/vllm/kimi_k3/layers.py``. torch is not installed in this environment, so
-this is a faithful transcription rather than an execution of the torch module -- a true
-torch-vs-jax cross-check should be run inside the vllm-torchtpu image before the port is trusted
-end to end. The math here is small enough that transcription is a defensible oracle.
+The oracle is transcribed LINE BY LINE from the K3 PyTorch reference implementation. Where torch
+is unavailable this is a faithful transcription rather than an execution of the torch module; the
+executable torch-vs-jax cross-check lives in ``test_kimi_k3_torch_parity.py``, which runs the
+reference functions directly when torch is installed. The math here is small enough that
+transcription is a defensible oracle.
 """
 import jax, jax.numpy as jnp, numpy as np, pytest
 from sgl_jax.srt.models.kimi_k3_layers import situ_and_mul, attention_residual_apply
