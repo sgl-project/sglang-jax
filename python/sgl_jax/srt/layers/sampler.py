@@ -14,6 +14,10 @@ from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
+# Rejection value for the mask sampling path. Low enough that `softmax` flushes
+# it to 0.0, and shared by every filter in that path -- they have to agree.
+_MASK_FILL_VALUE = -1e12
+
 
 class Sampler(nnx.Module):
     def __init__(self, rngs: nnx.Rngs = None, mesh: Mesh = None):
@@ -331,12 +335,23 @@ def top_p_normalize_probs_jax(
 
 
 def _apply_min_p_filter(operands):
-    """Apply min_p filtering when need_min_p_sampling=True"""
+    """Keep entries whose probability is >= `min_p` times the row maximum.
+
+    `use_probs` selects the space `inputs` lives in; both the threshold and the
+    rejection value follow from it:
+
+    * ``True``  -- probabilities. Threshold ``max(p) * min_p``, reject to ``0.0``.
+    * ``False`` -- logits. Threshold ``max(z) + log(min_p)``, reject to
+      ``_MASK_FILL_VALUE`` (``0.0`` is an ordinary logit, not a rejection).
+    """
     inputs, min_ps, use_probs = operands
     max_per_bs = jnp.max(inputs, axis=1)
-    min_p_thresholds = max_per_bs * min_ps
-    min_p_mask = inputs < min_p_thresholds.reshape(-1, 1)
-    return jnp.where(min_p_mask, 0.0, inputs)
+    if use_probs:
+        min_p_thresholds = max_per_bs * min_ps
+        return jnp.where(inputs < min_p_thresholds.reshape(-1, 1), 0.0, inputs)
+    # log(0) = -inf, so min_p=0 (the "disabled" encoding) rejects nothing.
+    min_p_thresholds = max_per_bs + jnp.log(min_ps)
+    return jnp.where(inputs < min_p_thresholds.reshape(-1, 1), _MASK_FILL_VALUE, inputs)
 
 
 def top_k_top_p_min_p_sampling_from_probs_jax(
@@ -424,11 +439,17 @@ def top_k_top_p_min_p_sampling_from_probs_jax_with_mask(args):
         rng,
     ) = args
     logits = logits.astype(jnp.float32)
-    logits = topk_mask(logits, top_ks, replace_val=-1e12)
-    logits = topp_mask(logits, top_ps, replace_val=-1e12)
 
+    # Before the masks: the cutoffs below have to be measured on the scaled
+    # distribution, which is what the sort path samples from.
     temperatures = temperatures.astype(logits.dtype)
     logits = jnp.divide(logits, temperatures)
+
+    # top-p first: `topp_mask` softmaxes internally, so after top-k it would
+    # measure the nucleus on the renormalized tail. `topk_mask` ranks by value,
+    # so it is unaffected by the sentinels top-p leaves behind.
+    logits = topp_mask(logits, top_ps, replace_val=_MASK_FILL_VALUE)
+    logits = topk_mask(logits, top_ks, replace_val=_MASK_FILL_VALUE)
 
     min_p_operands = (logits, min_ps)
     apply_min_p_filter_fn = lambda op: _apply_min_p_filter((*op, False))
