@@ -1220,7 +1220,20 @@ class MLATokenToKVPool(KVCache):
     """
 
     @staticmethod
+    def _aligned_latent_dims(kv_lora_rank: int, qk_rope_head_dim: int) -> tuple[int, int]:
+        from sgl_jax.srt.kernels.mla.v2.kernel import align_to
+
+        return align_to(kv_lora_rank, 128), align_to(qk_rope_head_dim, 128)
+
+    @staticmethod
+    def _aligned_indexer_dim(indexer_key_dim: int) -> int:
+        from sgl_jax.srt.kernels.mla.v2.kernel import align_to
+
+        return align_to(indexer_key_dim, 128) if indexer_key_dim else 0
+
+    @classmethod
     def _latent_cache_shape(
+        cls,
         *,
         total_num_pages: int,
         page_size: int,
@@ -1228,18 +1241,19 @@ class MLATokenToKVPool(KVCache):
         kv_lora_rank: int,
         qk_rope_head_dim: int,
     ) -> tuple[int, ...]:
-        from sgl_jax.srt.kernels.mla.v2.kernel import align_to, get_kv_cache_shape
+        from sgl_jax.srt.kernels.mla.v2.kernel import get_kv_cache_shape
 
-        latent_dim = align_to(kv_lora_rank, 128) + align_to(qk_rope_head_dim, 128)
+        nope_dim, rope_dim = cls._aligned_latent_dims(kv_lora_rank, qk_rope_head_dim)
         return get_kv_cache_shape(
             total_num_pages=total_num_pages,
             page_size=page_size,
-            kv_dim=latent_dim,
+            kv_dim=nope_dim + rope_dim,
             kv_dtype=dtype,
         )
 
-    @staticmethod
+    @classmethod
     def _indexer_cache_shape(
+        cls,
         *,
         total_num_pages: int,
         page_size: int,
@@ -1251,7 +1265,7 @@ class MLATokenToKVPool(KVCache):
         return get_kv_cache_shape(
             total_num_pages=total_num_pages,
             page_size=page_size,
-            kv_dim=indexer_key_dim,
+            kv_dim=cls._aligned_indexer_dim(indexer_key_dim),
             kv_dtype=dtype,
         )
 
@@ -1320,14 +1334,10 @@ class MLATokenToKVPool(KVCache):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.kv_partition_axis = kv_partition_axis
         self.dp_size = dp_size
-
-        from sgl_jax.srt.kernels.mla.v2.kernel import align_to
-
-        self.nope_dim = align_to(kv_lora_rank, 128)
-        self.rope_dim = align_to(qk_rope_head_dim, 128)
+        self.nope_dim, self.rope_dim = self._aligned_latent_dims(kv_lora_rank, qk_rope_head_dim)
         self.kv_dim = self.nope_dim + self.rope_dim
         self.indexer_key_dim_raw = indexer_key_dim
-        self.indexer_key_dim = align_to(indexer_key_dim, 128) if indexer_key_dim else 0
+        self.indexer_key_dim = self._aligned_indexer_dim(indexer_key_dim)
         self.num_indexer_layers = num_indexer_layers
 
         self._create_buffers()
@@ -1376,16 +1386,12 @@ class MLATokenToKVPool(KVCache):
         obj.dp_size = aux_data.get("dp_size", 1)
         obj.kv_sharding = aux_data["kv_sharding"]
         obj.num_indexer_layers = aux_data.get("num_indexer_layers", 0)
-
-        from sgl_jax.srt.kernels.mla.v2.kernel import align_to
-
-        obj.nope_dim = align_to(obj.kv_lora_rank, 128)
-        obj.rope_dim = align_to(obj.qk_rope_head_dim, 128)
+        obj.nope_dim, obj.rope_dim = cls._aligned_latent_dims(
+            obj.kv_lora_rank, obj.qk_rope_head_dim
+        )
         obj.kv_dim = obj.nope_dim + obj.rope_dim
         obj.indexer_key_dim_raw = aux_data.get("indexer_key_dim", 0)
-        obj.indexer_key_dim = (
-            align_to(obj.indexer_key_dim_raw, 128) if obj.indexer_key_dim_raw else 0
-        )
+        obj.indexer_key_dim = cls._aligned_indexer_dim(obj.indexer_key_dim_raw)
 
         obj.kv_buffer = kv_buffer
         obj.indexer_key_buffer = indexer_key_buffer
