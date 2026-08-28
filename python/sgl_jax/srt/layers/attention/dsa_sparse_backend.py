@@ -545,7 +545,12 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                     w_,
                     cache3d.reshape(cache_.shape),
                     seq_lens_,
-                    pi_,
+                    # the kernel indexes page_indices[seq_id * pages_per_seq + p]
+                    # (fixed stride), but sglang packs seq i's pages at
+                    # cu_kv_lens[i]//page_size (variable stride) — repack, same
+                    # as the decode call site, or a multi-request EXTEND batch
+                    # with unequal lengths reads another sequence's pages.
+                    _fixed_stride_pages(pi_, cukv_, page_size, pages_per_seq),
                     cuq_,
                     dist_[2],
                     k_pages=k_pages,
