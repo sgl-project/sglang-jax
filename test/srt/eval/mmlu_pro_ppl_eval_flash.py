@@ -6,8 +6,8 @@ multiple_choice convention). Robust to DP mesh-shape numerical perturbation.
 Engine flags are tuned for Ling-3-flash (237 GiB bf16) on TPU v6e 4x4,
 tp=16 nnodes=4. Defaults to the accuracy-baseline config (chunked_prefill_size
 =4096, mem_fraction_static=0.8, max_running_requests=256); set EVAL_EFFICIENT=1
-for the faster, lower-memory variant. Reproduces the MMLU-Pro number reported in
-https://github.com/primatrix/sglang-jax-private/pull/8#issuecomment-4560593346
+for the faster, lower-memory variant. Reproduces the Ling-3 Flash MMLU-Pro
+reference result used during implementation validation.
 
 Usage:
     DIST_INIT_ADDR=<host:port> NODE_RANK=<rank> python mmlu_pro_ppl_eval_flash.py \\
