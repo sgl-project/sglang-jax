@@ -7,16 +7,6 @@ the live tree / load state; these functions hold only the decision math.
 
 from __future__ import annotations
 
-# Soft affinity-vs-load thresholds (upstream sgl-router defaults). When the load
-# skew across eligible ranks is large, ignore cache affinity and balance; else
-# route a request to the least-loaded rank that holds a substantial cached prefix
-# (match_rate > CACHE_THRESHOLD), so a hot prefix spreads across its holders
-# instead of concentrating on the single longest-match rank.
-BALANCE_ABS = 32
-BALANCE_REL = 1.1
-CACHE_THRESHOLD = 0.5
-
-
 def req_prefix_match_key(req) -> tuple[list[int] | None, str | None]:
     """Effective ``(token_ids, extra_key)`` for a cache-affinity prefix probe.
 
@@ -75,17 +65,14 @@ def pick_cache_aware_dp(
 ) -> int | None:
     """Cache-affinity DP policy with shape-aware miss fallback.
 
-    1. If the load skew across eligible ranks is large
-       (``max-min > BALANCE_ABS`` and ``max > min*BALANCE_REL``), ignore cache
-       affinity and pick the least-loaded rank.
-    2. Otherwise route to the least-loaded rank among the *holders* -- ranks whose
-       cached prefix covers more than ``CACHE_THRESHOLD`` of the prompt -- so a hot
-       prefix spreads across all its holders by load.
-    3. No holders (or no usable ``prompt_len``) -> shape-aware fallback.
+    1. If any eligible rank holds a cached prefix, route to a rank with the
+       longest match. Break equal-match ties by load.
+    2. No cached match (or no usable ``prompt_len``) -> shape-aware fallback.
 
-    Holder and large-skew load order is ``(running, tokens, rank)``. Eligibility
-    (the per-rank admission cap) is decided by the caller; this only chooses among
-    eligible ranks.
+    Cache affinity is deliberately strict: an agent turn should not miss its
+    conversation prefix merely because another rank is less loaded. Eligibility
+    (the per-rank admission cap) is still decided by the caller, so a full cache
+    holder can fall back to another rank instead of blocking admission.
     """
     if not eligible:
         return None
@@ -93,15 +80,11 @@ def pick_cache_aware_dp(
     def least_loaded(ranks: list[int]) -> int:
         return min(ranks, key=lambda r: (counts[r], token_counts[r], r))
 
-    loads = [counts[r] for r in eligible]
-    max_load, min_load = max(loads), min(loads)
-    if max_load - min_load > BALANCE_ABS and max_load > min_load * BALANCE_REL:
-        return least_loaded(eligible)
-
     if prompt_len > 0:
-        holders = [r for r in eligible if matches.get(r, 0) / prompt_len > CACHE_THRESHOLD]
-        if holders:
-            return least_loaded(holders)
+        best_match = max(matches.get(r, 0) for r in eligible)
+        if best_match > 0:
+            best_holders = [r for r in eligible if matches.get(r, 0) == best_match]
+            return least_loaded(best_holders)
 
     return pick_shape_aware_dp(eligible, input_counts, output_counts, item_input, item_output)
 

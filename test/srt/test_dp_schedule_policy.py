@@ -47,13 +47,13 @@ def test_holder_wins_when_loads_equal():
     assert _pick([0, 1, 2, 3], counts, tokens, matches, prompt_len=512) == 1
 
 
-def test_least_loaded_among_holders():
-    # Both 0 and 1 hold a substantial prefix; rank 1 is less loaded. The longer
-    # match (rank 0, 600) does NOT win -- the hot prefix spreads to the lighter holder.
+def test_longest_match_wins_over_holder_load():
+    # Cache-first routing keeps the maximum reusable prefix even when another
+    # holder is lighter loaded.
     counts = [3, 1, 0, 0]
     tokens = [30, 10, 0, 0]
     matches = {0: 600, 1: 400}
-    assert _pick([0, 1, 2, 3], counts, tokens, matches, prompt_len=512) == 1
+    assert _pick([0, 1, 2, 3], counts, tokens, matches, prompt_len=512) == 0
 
 
 def test_no_cached_match_falls_back_to_shape_aware():
@@ -80,21 +80,20 @@ def test_no_cached_match_falls_back_to_shape_aware():
     )
 
 
-def test_below_threshold_match_is_not_a_holder():
-    # 100/512 < 0.5 -> rank 0 is not a holder; route by load to the idle rank 1.
+def test_partial_match_still_has_priority():
+    # Even a partial reusable prefix is better than a forced miss on an idle rank.
     counts = [5, 0]
     tokens = [50, 0]
     matches = {0: 100}
-    assert _pick([0, 1], counts, tokens, matches, prompt_len=512) == 1
+    assert _pick([0, 1], counts, tokens, matches, prompt_len=512) == 0
 
 
-def test_large_load_skew_overrides_cache_affinity():
-    # Rank 0 holds the full prefix but is overloaded; the skew (40-0 > 32) forces
-    # load balancing to the idle rank 1.
+def test_large_load_skew_does_not_override_cache_affinity():
+    # Agent-session affinity wins while the holder remains admission-eligible.
     counts = [40, 0]
     tokens = [400, 0]
     matches = {0: 512}
-    assert _pick([0, 1], counts, tokens, matches, prompt_len=512) == 1
+    assert _pick([0, 1], counts, tokens, matches, prompt_len=512) == 0
 
 
 def test_small_load_skew_keeps_affinity():
@@ -119,6 +118,13 @@ def test_holder_and_load_tie_breaks_by_lowest_rank():
     tokens = [20, 20, 20, 20]
     matches = {0: 256, 1: 256, 2: 0, 3: 0}
     assert _pick([0, 1, 2, 3], counts, tokens, matches, prompt_len=256) == 0
+
+
+def test_equal_longest_matches_break_tie_by_load():
+    counts = [4, 1, 0]
+    tokens = [400, 100, 0]
+    matches = {0: 512, 1: 512, 2: 0}
+    assert _pick([0, 1, 2], counts, tokens, matches, prompt_len=700) == 1
 
 
 def test_prompt_len_zero_falls_back_to_shape_aware():

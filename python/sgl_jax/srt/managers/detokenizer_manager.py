@@ -300,6 +300,7 @@ class DetokenizerManager:
             output_hidden_states=recv_obj.output_hidden_states,
             cache_miss_count=recv_obj.cache_miss_count,
             output_routed_experts=output_routed_experts,
+            dp_ranks=recv_obj.dp_ranks,
         )
 
 

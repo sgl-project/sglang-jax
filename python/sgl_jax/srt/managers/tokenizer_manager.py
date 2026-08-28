@@ -1137,7 +1137,12 @@ class TokenizerManager:
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
             }
-            dp_rank = getattr(state.obj, "dp_rank", None)
+            dp_ranks = getattr(recv_obj, "dp_ranks", None)
+            dp_rank = (
+                dp_ranks[i]
+                if dp_ranks is not None and i < len(dp_ranks)
+                else getattr(state.obj, "dp_rank", None)
+            )
             if dp_rank is not None:
                 meta_info["dp_rank"] = dp_rank
             disagg_prefill_dp_rank = getattr(state.obj, "disagg_prefill_dp_rank", None)

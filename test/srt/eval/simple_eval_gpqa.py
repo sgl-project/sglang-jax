@@ -82,7 +82,10 @@ class GPQAEval(Eval):
                 html=html,
                 score=score,
                 convo=convo,
-                metrics={"chars": len(response_text)},
+                metrics={
+                    "chars": len(response_text),
+                    "answer_extracted": 1.0 if extracted_answer is not None else 0.0,
+                },
             )
 
         results = common.map_with_progress(fn, self.examples, self.num_threads)

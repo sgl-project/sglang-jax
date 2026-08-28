@@ -152,7 +152,13 @@ class ChatCompletionSampler(SamplerBase):
                     hasattr(response.choices[0].message, "reasoning_content")
                     and response.choices[0].message.reasoning_content
                 ):
-                    txt = f"{response.choices[0].message.reasoning_content}\n{txt}"
+                    # Preserve reasoning in reports without letting its first
+                    # incidental ``Answer:`` override the parsed final answer.
+                    # Evaluators that call strip_reasoning() remove this block.
+                    txt = (
+                        f"<think>{response.choices[0].message.reasoning_content}</think>\n"
+                        f"{txt}"
+                    )
                 return txt
             # NOTE: BadRequestError is triggered once for MMMU, please uncomment if you are rerunning MMMU
             except openai.BadRequestError as e:

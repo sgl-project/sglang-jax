@@ -801,6 +801,7 @@ class SchedulerOutputProcessorMixin:
         prompt_tokens = []
         completion_tokens = []
         cached_tokens = []
+        dp_ranks = []
         spec_verify_ct = []
         spec_accepted_tokens = []
         output_hidden_states = None
@@ -890,6 +891,7 @@ class SchedulerOutputProcessorMixin:
                 prompt_tokens.append(len(req.origin_input_ids))
                 completion_tokens.append(len(output_ids_))
                 cached_tokens.append(req.cached_tokens)
+                dp_ranks.append(req.dp_rank if req.dp_rank is not None else 0)
 
                 if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
@@ -986,6 +988,7 @@ class SchedulerOutputProcessorMixin:
                 output_hidden_states_for_mm,
                 cache_miss_count,
                 output_routed_experts,
+                dp_ranks,
             )
             if self._comm_backend is not None:
                 self._comm_backend.send_pyobj(out)

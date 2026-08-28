@@ -465,6 +465,8 @@ class ChatCompletionResponseChoice(BaseModel):
     ) = None
     matched_stop: None | int | str = None
     hidden_states: object | None = None
+    # Non-standard diagnostic: actual scheduler-assigned DP rank.
+    dp_rank: int | None = None
 
     # @model_serializer(mode="wrap")  # Not available in pydantic v1
     # def _serialize(self, handler):

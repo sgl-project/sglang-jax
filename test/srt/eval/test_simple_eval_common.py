@@ -9,7 +9,11 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from eval.simple_eval_common import ANSWER_PATTERN_MULTICHOICE, strip_reasoning
+from eval.simple_eval_common import (
+    ANSWER_PATTERN_MULTICHOICE,
+    ChatCompletionSampler,
+    strip_reasoning,
+)
 from run_eval import build_extra_body
 
 
@@ -21,6 +25,30 @@ def _extract_answer(response_text: str, *, strip: bool) -> str | None:
 
 
 class TestSimpleEvalCommon(unittest.TestCase):
+    def test_sampler_tags_separate_reasoning_before_answer_extraction(self):
+        sampler = object.__new__(ChatCompletionSampler)
+        sampler.model = "ling3"
+        sampler.system_message = None
+        sampler.temperature = 1.0
+        sampler.max_tokens = 32
+        sampler.top_p = 0.95
+        sampler.extra_body = {}
+        message = SimpleNamespace(
+            reasoning_content="A scratch guess says Answer: A.",
+            content="Answer: C",
+        )
+        response = SimpleNamespace(choices=[SimpleNamespace(message=message)])
+        sampler.client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=lambda **_: response)
+            )
+        )
+
+        text = sampler([{"role": "user", "content": "question"}])
+
+        self.assertIn("<think>", text)
+        self.assertEqual(_extract_answer(text, strip=True), "C")
+
     def test_full_think_block_must_be_stripped_before_extraction(self):
         # A reasoning model writes a mid-thought guess inside <think> and the
         # real answer after it. ANSWER_PATTERN_MULTICHOICE + re.search take the

@@ -89,6 +89,9 @@ class BatchStrOut:
     # The routed experts for each output token
     output_routed_experts: list[str | None] = None
 
+    # Scheduler-assigned data-parallel rank for each request.
+    dp_ranks: list[int] | None = None
+
 
 @dataclass
 class BatchTokenIDOut:
@@ -134,6 +137,9 @@ class BatchTokenIDOut:
 
     # The routed experts for each output token
     output_routed_experts: list[np.ndarray] = None
+
+    # Scheduler-assigned data-parallel rank for each request.
+    dp_ranks: list[int] | None = None
 
 
 @dataclass

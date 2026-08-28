@@ -932,9 +932,9 @@ class Scheduler(
         """Route ``req`` by cache affinity with shape-aware miss fallback.
 
         Probes each eligible rank's cached prefix length, then defers to
-        ``pick_cache_aware_dp``: balance on large load skew, else least-loaded
-        among the ranks holding a substantial cached prefix, else shape-aware
-        selection. Returns None if all DP ranks are full.
+        ``pick_cache_aware_dp``: prefer the longest cached prefix regardless of
+        load, break equal-match ties by load, and use shape-aware selection only
+        on a complete cache miss. Returns None if all DP ranks are full.
         """
         if self.dp_size == 1:
             return 0

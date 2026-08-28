@@ -721,6 +721,7 @@ Assistant: {% endif %}"""
                     else None
                 ),
                 hidden_states=hidden_states,
+                dp_rank=ret_item["meta_info"].get("dp_rank"),
             )
             choices.append(choice_data)
 
