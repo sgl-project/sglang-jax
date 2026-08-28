@@ -140,6 +140,32 @@ class EPMoE(nnx.Module):
         except Exception as _:
             return False, "cpu"
 
+    def _apply_activation(self, layer_w0: jax.Array, layer_w1: jax.Array) -> jax.Array:
+        """Gated activation between the two GEMMs. Overridable for gates this one lacks.
+
+        ``layer_w0`` is the gate branch (``wi_0``/``w1``), ``layer_w1`` the up branch
+        (``wi_1``/``w3``). Kimi-K3 overrides this with SITU, which is not expressible as
+        ``f(gate) * up`` with an elementwise ``f`` -- it consumes both branches together.
+        """
+        if self.activation == "silu":
+            layer_act = jax.nn.silu(layer_w0)
+        elif self.activation == "gelu":
+            layer_act = jax.nn.gelu(layer_w0)
+        else:
+            raise ValueError(f"Unsupported activation function {self.activation}")
+        return jnp.multiply(layer_act, layer_w1)
+
+    def _call_gmm(self, **kwargs):
+        """The GMM this MoE runs on. Overridable so a subclass can swap the kernel.
+
+        A method rather than an attribute on purpose: nnx traverses module *state*, and a callable
+        stored on the instance would be walked by split/jit. Class-level methods are not state.
+
+        Default is the module-level `gmm`, so every existing model is unchanged. Kimi-K3 overrides
+        it with the fp4-capable megablox kernel -- this backend has no sub-byte path.
+        """
+        return gmm(**kwargs)
+
     def _normalize_scale_for_gmm(
         self,
         scale: jax.Array | None,
@@ -617,7 +643,7 @@ class EPMoE(nnx.Module):
         )
 
         # === GEMM1: x @ w0 and x @ w1 ===
-        layer_w0 = gmm(
+        layer_w0 = self._call_gmm(
             lhs=x,
             rhs=w0_kernel,
             rhs_scale=w0_kernel_scale,
@@ -626,7 +652,7 @@ class EPMoE(nnx.Module):
             activation_quantized_dtype=act_q_dtype,
             **gmm_kwargs,
         )
-        layer_w1 = gmm(
+        layer_w1 = self._call_gmm(
             lhs=x,
             rhs=w1_kernel,
             rhs_scale=w1_kernel_scale,
@@ -637,16 +663,10 @@ class EPMoE(nnx.Module):
         )
 
         # === Activation ===
-        if self.activation == "silu":
-            layer_act = jax.nn.silu(layer_w0)
-        elif self.activation == "gelu":
-            layer_act = jax.nn.gelu(layer_w0)
-        else:
-            raise ValueError(f"Unsupported activation function {self.activation}")
-        intermediate_layer = jnp.multiply(layer_act, layer_w1)
+        intermediate_layer = self._apply_activation(layer_w0, layer_w1)
 
         # === GEMM2: intermediate @ wo ===
-        return gmm(
+        return self._call_gmm(
             lhs=intermediate_layer,
             rhs=wo_kernel,
             rhs_scale=wo_kernel_scale,
