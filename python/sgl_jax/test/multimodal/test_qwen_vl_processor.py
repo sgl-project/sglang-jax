@@ -46,8 +46,11 @@ def test_qwen_vl_rejects_audio_inputs():
     processor = QwenVLProcessor(SimpleNamespace(), SimpleNamespace(), object())
     request = SimpleNamespace(audio_data=["audio.wav"])
 
-    with pytest.raises(ValueError, match="does not support audio"):
-        asyncio.run(processor.process_mm_data_async(None, "prompt", request))
+    try:
+        with pytest.raises(ValueError, match="does not support audio"):
+            asyncio.run(processor.process_mm_data_async(None, "prompt", request))
+    finally:
+        processor.shutdown()
 
 
 def test_qwen_process_and_combine_runs_in_hf_processor_worker():
