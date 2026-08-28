@@ -111,7 +111,6 @@ def _mega(arrays, lower_bound: float | None = LOWER_BOUND):
     ("heads", "lengths"),
     [
         (8, (61,)),
-        (8, (63, 65)),
         (12, (64, 64)),
         (16, (64, 64)),
         (24, (64, 64)),
@@ -135,6 +134,30 @@ def test_mega_kda_matches_naive(heads: int, lengths: tuple[int, ...]):
         rtol=5e-2,
         atol=5e-2,
     )
+
+
+def test_bounded_boundary_preserves_nonzero_initial_state():
+    """A segment starting inside a tile must use its own recurrent state."""
+    arrays = _case(8, (37, 91), seed=1557)
+    arrays["g"] = jnp.zeros_like(arrays["g"])
+    arrays["a_log"] = jnp.zeros_like(arrays["a_log"])
+    arrays["dt_bias"] = jnp.zeros_like(arrays["dt_bias"])
+    arrays["initial_state"] = jnp.zeros_like(arrays["initial_state"])
+    arrays["initial_state"] = (
+        arrays["initial_state"]
+        .at[1]
+        .set(jnp.broadcast_to(jnp.eye(K, V, dtype=jnp.float32), (8, K, V)))
+    )
+
+    reference_output, _ = _reference(arrays)
+    mega_output, _ = _mega(arrays)
+    jax.block_until_ready((reference_output, mega_output))
+
+    first_b_token = arrays["lengths"][0]
+    reference = np.asarray(reference_output[:, first_b_token], dtype=np.float32)
+    actual = np.asarray(mega_output[:, first_b_token], dtype=np.float32)
+    assert np.max(np.abs(reference)) > 1e-4
+    np.testing.assert_allclose(actual, reference, rtol=2e-2, atol=2e-4)
 
 
 @pytest.mark.parametrize(

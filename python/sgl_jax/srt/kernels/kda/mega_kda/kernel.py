@@ -989,16 +989,16 @@ def _fwd_mega_kernel_native_segids(
         # Aqk/L (FULL-style, no cross-seg masking in loop for stability)
         BC = QK_BC
         beta_f32 = beta[:, :, None]
+        # Restart the log-domain prefix at the packed segment boundary. This
+        # preserves segment B's initial-state contribution; within-segment
+        # gate differences used by Aqk/L are unchanged by the constant shift.
+        first_segment_total = jnp.min(
+            jnp.where(seg_A_mask[None, :, None] > 0, g_cumsum, 0.0),
+            axis=1,
+            keepdims=True,
+        )
+        g_cumsum = g_cumsum - first_segment_total * seg_B_mask[None, :, None]
         if lower_bound is None:
-            # Restart the log-domain prefix at the packed segment boundary.
-            # This preserves segment B's initial-state contribution even when
-            # segment A has accumulated a very negative unbounded gate.
-            first_segment_total = jnp.min(
-                jnp.where(seg_A_mask[None, :, None] > 0, g_cumsum, 0.0),
-                axis=1,
-                keepdims=True,
-            )
-            g_cumsum = g_cumsum - first_segment_total * seg_B_mask[None, :, None]
             Aqk, L, _ = _build_unbounded_intra_terms(
                 q, k, g_cumsum, beta, scale, BC, OUTPUT_PRECISION
             )
@@ -1179,8 +1179,7 @@ def _fwd_mega_kernel_native_segids(
         # produce inf * 0 = NaN for tokens belonging to the other segment.
         kg_A_exp = jnp.where(mask_A != 0, g_A_total - g_cumsum, 0.0)
         kg_A = k * jnp.exp2(kg_A_exp) * mask_A
-        g_cumsum_B_local = g_cumsum if lower_bound is None else g_cumsum - g_A_total
-        kg_B_exp = jnp.where(mask_B != 0, g_B_total - g_cumsum_B_local, 0.0)
+        kg_B_exp = jnp.where(mask_B != 0, g_B_total - g_cumsum, 0.0)
         kg_B = k * jnp.exp2(kg_B_exp) * mask_B
 
         # seg_A final state
