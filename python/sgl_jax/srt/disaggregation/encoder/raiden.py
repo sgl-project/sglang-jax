@@ -143,7 +143,7 @@ class RaidenReceiveSession:
         if self.transfer_id in failed:
             raise RuntimeError(f"Raiden embedding transfer failed: {self.transfer_id}")
         if self.transfer_id in received:
-            return self.buffer
+            return self.buffer[0]
         return None
 
     def close(self) -> None:
@@ -214,7 +214,7 @@ class RaidenReceiverBackend:
             remote_block_ids,
             local_block_ids,
         )
-        return RaidenReceiveSession(transfer_id, buffer[0], transfer)
+        return RaidenReceiveSession(transfer_id, buffer, transfer)
 
     def close(self) -> None:
         return None

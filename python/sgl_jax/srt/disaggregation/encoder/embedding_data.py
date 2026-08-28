@@ -144,7 +144,7 @@ class MultiModalEmbeddingData:
             if data.modality == Modality.VIDEO:
                 values = getattr(data, "second_per_grid_ts", None)
                 if values is not None:
-                    second_per_grid_ts.extend(jnp.asarray(values).reshape(-1).tolist())
+                    second_per_grid_ts.extend(jnp.asarray(values).ravel().tolist())
         if second_per_grid_ts:
             result["second_per_grid_ts"] = second_per_grid_ts
         return result

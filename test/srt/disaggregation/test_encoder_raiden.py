@@ -20,6 +20,7 @@ from sgl_jax.srt.disaggregation.encoder.embedding_data import (
 from sgl_jax.srt.disaggregation.encoder.raiden import (
     RaidenEncoderServerTransfer,
     RaidenReceiverBackend,
+    RaidenReceiveSession,
 )
 from sgl_jax.srt.managers.io_struct import TokenizedGenerateReqInput
 from sgl_jax.srt.multimodal.common.modality_enum import Modality
@@ -175,6 +176,9 @@ def test_raiden_request_receives_into_matching_jax_buffer(monkeypatch):
     buffers, options = session.started
     assert buffers[0].shape == (1, 2, 3)
     assert buffers[0].dtype == jnp.float32
+    receive_session = request.sessions[0][1]
+    assert isinstance(receive_session, RaidenReceiveSession)
+    assert receive_session.buffer.shape == (1, 2, 3)
     assert options == {"max_blocks": 1, "num_slots": 1, "timeout_s": 30.0}
     assert session.read == (
         "part-0:embedding",
@@ -195,7 +199,6 @@ def test_raiden_request_receives_into_matching_jax_buffer(monkeypatch):
 def test_raiden_request_surfaces_receive_failure():
     transfer = mock.Mock()
     transfer.poll_stats.return_value = ([], [], ["part-0:embedding"])
-    from sgl_jax.srt.disaggregation.encoder.raiden import RaidenReceiveSession
 
     session = RaidenReceiveSession(
         "part-0:embedding",

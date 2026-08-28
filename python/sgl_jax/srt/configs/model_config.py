@@ -88,6 +88,8 @@ class ModelConfig:
         multimodal: bool = False,
         moe_backend: str | MoEBackend = MoEBackend.AUTO,
         model_sub_dir: str | None = None,
+        encoder_only: bool = False,
+        language_only: bool = False,
     ) -> None:
         self.model_path = model_path
         self.model_sub_dir = model_sub_dir
@@ -136,6 +138,12 @@ class ModelConfig:
                 **kwargs,
             )
         )
+
+        # Encoder disaggregation is a runtime deployment mode rather than
+        # checkpoint metadata. Carry it on the HF config because model classes
+        # receive that config when deciding which submodules to construct.
+        self.hf_config.encoder_only = encoder_only
+        self.hf_config.language_only = language_only
 
         if not getattr(self.hf_config, "architectures", None):
             raise ValueError(
@@ -572,10 +580,10 @@ class ModelConfig:
             multimodal=server_args.multimodal,
             moe_backend=server_args.moe_backend,
             model_sub_dir=model_sub_dir,
+            encoder_only=server_args.encoder_only,
+            language_only=server_args.language_only,
             **kwargs,
         )
-        model_config.hf_config.encoder_only = getattr(server_args, "encoder_only", False)
-        model_config.hf_config.language_only = getattr(server_args, "language_only", False)
         return model_config
 
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
