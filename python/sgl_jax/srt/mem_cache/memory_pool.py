@@ -23,6 +23,7 @@ from sgl_jax.srt.kernels.update_kv_cache.update_kv_cache import (
     kv_cache_update,
     kv_cache_update_impl,
 )
+from sgl_jax.srt.mem_cache.mla_cache_layout import MLACacheLayout
 
 # Module-level cache for jitted zero-allocators.
 # Keyed by (mesh_id, shape, dtype, sharding_spec, memory_kind).
@@ -1239,13 +1240,17 @@ class MLATokenToKVPool(KVCache):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.kv_partition_axis = kv_partition_axis
         self.dp_size = dp_size
-
-        from sgl_jax.srt.kernels.mla.v2.kernel import align_to
-
-        self.nope_dim = align_to(kv_lora_rank, 128)
-        self.rope_dim = align_to(qk_rope_head_dim, 128)
-        self.kv_dim = self.nope_dim + self.rope_dim
-        self.indexer_key_dim = align_to(indexer_key_dim, 128) if indexer_key_dim else 0
+        self.cache_layout = MLACacheLayout(
+            page_size=page_size,
+            dtype=dtype,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            indexer_key_dim=indexer_key_dim,
+        )
+        self.nope_dim = self.cache_layout.nope_dim
+        self.rope_dim = self.cache_layout.rope_dim
+        self.kv_dim = self.cache_layout.latent_dim
+        self.indexer_key_dim = self.cache_layout.indexer_dim
         self.num_indexer_layers = num_indexer_layers
 
         self._create_buffers()
@@ -1301,6 +1306,13 @@ class MLATokenToKVPool(KVCache):
         obj.kv_sharding = aux_data["kv_sharding"]
         obj.indexer_key_dim = aux_data.get("indexer_key_dim", 0)
         obj.num_indexer_layers = aux_data.get("num_indexer_layers", 0)
+        obj.cache_layout = MLACacheLayout(
+            page_size=obj.page_size,
+            dtype=obj.dtype,
+            kv_lora_rank=obj.kv_lora_rank,
+            qk_rope_head_dim=obj.qk_rope_head_dim,
+            indexer_key_dim=obj.indexer_key_dim,
+        )
 
         obj.kv_buffer = kv_buffer
         obj.indexer_key_buffer = indexer_key_buffer
@@ -1324,28 +1336,14 @@ class MLATokenToKVPool(KVCache):
         DeepSeek-V3 (lora=512, rope=64) is a coincidental match — 512+128=640
         and align(576,128)=640.
         """
-        from sgl_jax.srt.kernels.mla.v2.kernel import get_kv_cache_shape
-
         # MLA cache has no head axis to shard; page axis is sharded by DP.
         self.kv_sharding = NamedSharding(self.mesh, P("data", None, None, None))
 
         assert self.size % self.page_size == 0, "Cache size must be divisible by page size"
 
         total_num_pages = (self.size + self.page_size * self.dp_size) // self.page_size
-        buffer_shape = get_kv_cache_shape(
-            total_num_pages=total_num_pages,
-            page_size=self.page_size,
-            kv_dim=self.kv_dim,
-            kv_dtype=self.dtype,
-        )
-
-        per_layer_bytes = (
-            buffer_shape[0]
-            * buffer_shape[1]
-            * buffer_shape[2]
-            * buffer_shape[3]
-            * jnp.dtype(self.dtype).itemsize
-        )
+        buffer_shape = self.cache_layout.latent_shape(total_num_pages)
+        per_layer_bytes = self.cache_layout.latent_bytes(total_num_pages)
         logger.info(
             "MLA KV cache shape per layer: %s, dtype: %s, %.2f GB",
             buffer_shape,
@@ -1361,31 +1359,17 @@ class MLATokenToKVPool(KVCache):
 
             self.indexer_key_buffer = []
             if self.indexer_key_dim > 0 and self.num_indexer_layers > 0:
-                idx_shape = get_kv_cache_shape(
-                    total_num_pages=total_num_pages,
-                    page_size=self.page_size,
-                    kv_dim=self.indexer_key_dim,
-                    kv_dtype=self.dtype,
-                )
+                idx_shape = self.cache_layout.indexer_shape(total_num_pages)
+                indexer_bytes = self.cache_layout.indexer_bytes(total_num_pages)
                 logger.info(
                     "DSA indexer-key cache: %d slots × %s (%.2f GB total)",
                     self.num_indexer_layers,
                     idx_shape,
-                    self.num_indexer_layers
-                    * idx_shape[0]
-                    * idx_shape[1]
-                    * idx_shape[2]
-                    * idx_shape[3]
-                    * jnp.dtype(self.dtype).itemsize
-                    / GB,
+                    self.num_indexer_layers * indexer_bytes / GB,
                 )
+                allocate_indexer = _get_kv_zero_allocator(idx_shape, self.dtype, self.kv_sharding)
                 for _ in range(self.num_indexer_layers):
-                    self.indexer_key_buffer.append(
-                        jax.jit(
-                            lambda: jnp.zeros(shape=idx_shape, dtype=self.dtype),
-                            out_shardings=self.kv_sharding,
-                        )()
-                    )
+                    self.indexer_key_buffer.append(allocate_indexer())
 
     def get_indexer_key_buffer(self, slot_id: int) -> jax.Array:
         return self.indexer_key_buffer[slot_id]
@@ -1410,22 +1394,15 @@ class MLATokenToKVPool(KVCache):
             breakdown,
         )
 
-    def _buffer_bytes(self, kv_dim: int | None = None) -> int:
-        """Bytes for ONE paged buffer of ``kv_dim`` feature width (default: latent)."""
+    def _buffer_bytes(self) -> int:
+        """Resident bytes for one latent paged buffer."""
         total_num_pages = (self.size + self.page_size * self.dp_size) // self.page_size
-        from sgl_jax.srt.kernels.mla.v2.kernel import get_kv_cache_shape
-
-        shape = get_kv_cache_shape(
-            total_num_pages=total_num_pages,
-            page_size=self.page_size,
-            kv_dim=self.kv_dim if kv_dim is None else kv_dim,
-            kv_dtype=self.dtype,
-        )
-        return shape[0] * shape[1] * shape[2] * shape[3] * jnp.dtype(self.dtype).itemsize
+        return self.cache_layout.latent_bytes(total_num_pages)
 
     def _indexer_buffer_bytes(self) -> int:
         """Bytes for ONE DSA indexer key buffer; 0 when none is allocated."""
-        return self._buffer_bytes(kv_dim=self.indexer_key_dim)
+        total_num_pages = (self.size + self.page_size * self.dp_size) // self.page_size
+        return self.cache_layout.indexer_bytes(total_num_pages)
 
     def get_kv_size_bytes(self):
         """Resident bytes for this pool, including the DSA indexer key buffers."""
