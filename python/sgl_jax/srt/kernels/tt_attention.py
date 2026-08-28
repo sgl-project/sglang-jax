@@ -57,11 +57,28 @@ _paged_scaled_dot_product_attention_decode = _primitive(
 )
 _paged_update_cache = _primitive("tt.paged_update_cache")
 _paged_fill_cache = _primitive("tt.paged_fill_cache")
+_chunked_scaled_dot_product_attention = _primitive(
+    "tt.chunked_scaled_dot_product_attention"
+)
 _weight_dtype_override = _primitive("tt.weight_dtype_override")
 
 
 def scaled_dot_product_attention(query, key, value):
     return _scaled_dot_product_attention.bind(query, key, value)
+
+
+def chunked_scaled_dot_product_attention(
+    query, key_cache, value_cache, page_table, chunk_start, *, scale=None
+):
+    attributes = {} if scale is None else {"scale": str(scale)}
+    return _chunked_scaled_dot_product_attention.bind(
+        query,
+        key_cache,
+        value_cache,
+        page_table,
+        chunk_start,
+        **attributes,
+    )
 
 
 def paged_scaled_dot_product_attention_decode(

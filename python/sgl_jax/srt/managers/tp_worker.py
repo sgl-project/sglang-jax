@@ -270,13 +270,15 @@ class ModelWorker:
             page_size=self.page_size,
             max_req_len=self.max_req_len,
             vocab_size=self.model_config.vocab_size,
-            # cache_loc bucket cap under Pathways proxy backend (PD or colocated
-            # alike -- both do H2D over gRPC where the smaller bucket helps). On
-            # native TPU the smaller/odd bucket shape yields a slower Pallas
-            # ragged-attention kernel and native H2D is fast enough that the
-            # uncapped bucket is not on the critical path.
+            # Cap cache_loc buckets for Pathways proxy, where it reduces H2D,
+            # and TT, whose paged kernels require the page-table width not to
+            # exceed the physical KV-cache page count. Native TPU keeps its
+            # uncapped buckets because odd shapes slow the Pallas kernel.
             max_total_num_tokens=(
-                self.max_total_num_tokens if os.getenv("JAX_PLATFORMS") == "proxy" else 0
+                self.max_total_num_tokens
+                if os.getenv("JAX_PLATFORMS") == "proxy"
+                or server_args.attention_backend == "tt"
+                else 0
             ),
             multimodal=server_args.multimodal,
             has_recurrent_state=has_recurrent_state,

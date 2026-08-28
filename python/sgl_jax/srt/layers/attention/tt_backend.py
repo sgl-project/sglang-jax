@@ -74,21 +74,24 @@ class TTAttentionMetadata:
     page_table: jax.Array | None = None
     positions: jax.Array | None = None
     fill_page_table: jax.Array | None = None
-    fill_batch_indices: jax.Array | None = None
-    tokens_per_sequence: int | None = None
+    prefill_chunk_start: jax.Array | None = None
+    prefill_input_indices: jax.Array | None = None
+    prefill_output_indices: jax.Array | None = None
 
     def tree_flatten(self):
         children = (
             self.page_table,
             self.positions,
             self.fill_page_table,
-            self.fill_batch_indices,
+            self.prefill_chunk_start,
+            self.prefill_input_indices,
+            self.prefill_output_indices,
         )
-        return children, self.tokens_per_sequence
+        return children, None
 
     @classmethod
-    def tree_unflatten(cls, tokens_per_sequence, children):
-        return cls(*children, tokens_per_sequence=tokens_per_sequence)
+    def tree_unflatten(cls, _aux_data, children):
+        return cls(*children)
 
 
 def _pad_page_table(table: np.ndarray, users: int) -> np.ndarray:
@@ -149,8 +152,6 @@ class TTAttention(AttentionBackend):
     token_to_kv_pool_class = TTTokenToKVPool
     use_fast_greedy_sampler = True
     compiler_options = {
-        "math_fidelity": "hifi4",
-        "fp32_dest_acc_en": "true",
         "experimental_enable_permute_matmul_fusion": "true",
         "optimization_level": "1",
         "experimental_weight_dtype": "bfp_bf8",
@@ -206,11 +207,6 @@ class TTAttention(AttentionBackend):
         raise ValueError(f"TT attention does not support {batch.forward_mode}")
 
     def _decode_metadata(self, batch: ModelWorkerBatch) -> TTAttentionMetadata:
-        if batch.dp_size <= 0 or batch.per_dp_bs_size <= 0:
-            raise ValueError("TT attention received invalid DP batch metadata")
-        if len(batch.cache_loc) % batch.dp_size:
-            raise ValueError("TT cache locations must be evenly partitioned across DP ranks")
-
         batch_size_per_dp = max(max(batch.real_bs_per_dp), 1)
         sequence_lengths = np.zeros(
             batch.dp_size * batch_size_per_dp, dtype=np.int32
@@ -240,55 +236,95 @@ class TTAttention(AttentionBackend):
             (0, max(0, users - len(positions))),
             constant_values=-1,
         )
-        return TTAttentionMetadata(
-            page_table=device_array(
-                page_table, sharding=NamedSharding(self.mesh, P("data", None))
-            ),
-            positions=device_array(
-                positions, sharding=NamedSharding(self.mesh, P("data"))
-            ),
+        metadata = TTAttentionMetadata()
+        metadata.page_table, metadata.positions = device_array(
+            (page_table, positions),
+            sharding=NamedSharding(self.mesh, P("data")),
         )
+        return metadata
 
     def _prefill_metadata(self, batch: ModelWorkerBatch) -> TTAttentionMetadata:
         real_batch_size = int(batch.real_bs)
-        sequence_lengths = np.asarray(
-            batch.extend_seq_lens[:real_batch_size], dtype=np.int32
-        )
-        prefix_lengths = np.asarray(
-            batch.extend_prefix_lens[:real_batch_size], dtype=np.int32
-        )
-        if (
-            real_batch_size == 0
-            or batch.out_cache_loc is None
-            or np.any(prefix_lengths)
-            or np.any(sequence_lengths != sequence_lengths[0])
-        ):
-            raise ValueError(
-                "TT prefill requires non-empty, equal-length requests without cached prefixes"
-            )
+        active_slots = np.asarray(batch.logits_indices_selector, dtype=np.int32)
+        chunk_lengths = np.asarray(batch.extend_seq_lens, dtype=np.int32)[active_slots]
+        prefix_lengths = np.asarray(batch.extend_prefix_lens, dtype=np.int32)[
+            active_slots
+        ]
+        if np.any(prefix_lengths % self.page_size):
+            raise ValueError("TT prefill prefixes must be page-aligned")
 
-        tokens_per_sequence = int(sequence_lengths[0])
-        locations = np.asarray(batch.out_cache_loc, dtype=np.int32)[
-            : real_batch_size * tokens_per_sequence
-        ].reshape(real_batch_size, tokens_per_sequence)
-        expected = locations[:, :1] + np.arange(tokens_per_sequence, dtype=np.int32)
-        page_starts = locations[:, :: self.page_size]
-        if np.any(locations < 0) or np.any(locations != expected) or np.any(
-            page_starts % self.page_size
-        ):
-            raise ValueError("TT prefill requires contiguous, page-aligned cache locations")
+        # The scheduler owns semantic chunking. Bucket one chunk to a
+        # power-of-two page count, matching SGLang's token bucketing without
+        # imposing another chunk-size policy in the attention backend.
+        live_page_counts = cdiv(chunk_lengths, self.page_size)
+        max_live_pages = int(np.max(live_page_counts))
+        bucket_pages = max(16, 1 << (max_live_pages - 1).bit_length())
+        tokens_per_sequence = bucket_pages * self.page_size
 
-        page_table = _pad_page_table(page_starts // self.page_size, users=8)
-        return TTAttentionMetadata(
-            fill_page_table=device_array(
-                page_table, sharding=NamedSharding(self.mesh, P("data", None))
-            ),
-            fill_batch_indices=device_array(
-                np.arange(real_batch_size, dtype=np.int32),
-                sharding=NamedSharding(self.mesh, P("data")),
-            ),
-            tokens_per_sequence=tokens_per_sequence,
+        page_table = _decode_page_table(
+            np.asarray(batch.cache_loc, dtype=np.int32),
+            np.asarray(batch.seq_lens, dtype=np.int32),
+            self.page_size,
+            batch.dp_size,
+            batch.per_dp_bs_size,
+        )[active_slots]
+
+        # SGLang packs each request's live tokens inside a per-DP token bucket.
+        # Repack those ragged ranges into rectangular TT rows and remember how
+        # to restore the scheduler layout after attention.
+        tokens_per_dp = len(batch.input_ids) // batch.dp_size
+        chunk_lengths_2d = np.asarray(
+            batch.extend_seq_lens, dtype=np.int32
+        ).reshape(batch.dp_size, batch.per_dp_bs_size)
+        input_starts = (
+            np.cumsum(chunk_lengths_2d, axis=1, dtype=np.int32)
+            - chunk_lengths_2d
+            + np.arange(batch.dp_size, dtype=np.int32)[:, None] * tokens_per_dp
+        ).ravel()[active_slots]
+
+        token_offsets = np.arange(tokens_per_sequence, dtype=np.int32)
+        input_indices = input_starts[:, None] + token_offsets
+        live_tokens = token_offsets < chunk_lengths[:, None]
+        prefill_input_indices = np.where(live_tokens, input_indices, 0)
+
+        output_indices = (
+            np.arange(real_batch_size, dtype=np.int32)[:, None]
+            * tokens_per_sequence
+            + token_offsets
         )
+        prefill_output_indices = np.zeros(len(batch.input_ids), dtype=np.int32)
+        prefill_output_indices[input_indices[live_tokens]] = output_indices[
+            live_tokens
+        ]
+
+        page_offsets = np.arange(bucket_pages, dtype=np.int32)
+        live_pages = page_offsets < live_page_counts[:, None]
+        page_columns = prefix_lengths[:, None] // self.page_size + page_offsets
+        fill_page_table = np.take_along_axis(
+            page_table,
+            np.where(live_pages, page_columns, 0),
+            axis=1,
+        )
+        fill_page_table[~live_pages] = 0
+
+        metadata = TTAttentionMetadata()
+        (
+            metadata.page_table,
+            metadata.fill_page_table,
+            metadata.prefill_chunk_start,
+            metadata.prefill_input_indices,
+            metadata.prefill_output_indices,
+        ) = device_array(
+            (
+                page_table,
+                _pad_page_table(fill_page_table, users=8),
+                prefix_lengths,
+                prefill_input_indices,
+                prefill_output_indices,
+            ),
+            sharding=NamedSharding(self.mesh, P("data")),
+        )
+        return metadata
 
     @named_scope
     def __call__(
@@ -316,57 +352,57 @@ class TTAttention(AttentionBackend):
 
     def _prefill(self, q, k, v, layer, token_to_kv_pool):
         metadata = self.forward_metadata
-        if metadata.tokens_per_sequence is None:
-            raise ValueError("TT prefill metadata is missing")
-
         k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        batch_size = metadata.page_table.shape[0]
+        fill_batch_indices = jnp.arange(
+            batch_size,
+            dtype=jnp.int32,
+            out_sharding=NamedSharding(self.mesh, P("data")),
+        )
+        k_value = self._prefill_cache_value(k, k_cache.shape[-1])
+        v_value = self._prefill_cache_value(v, v_cache.shape[-1])
         k_cache = tt_ops.paged_fill_cache(
             k_cache,
-            self._prefill_cache_value(k, k_cache.shape[-1]),
+            k_value,
             metadata.fill_page_table,
-            metadata.fill_batch_indices,
+            fill_batch_indices,
         )
         v_cache = tt_ops.paged_fill_cache(
             v_cache,
-            self._prefill_cache_value(v, v_cache.shape[-1]),
+            v_value,
             metadata.fill_page_table,
-            metadata.fill_batch_indices,
+            fill_batch_indices,
         )
         k_cache, v_cache = self._cache_barrier((k_cache, v_cache))
 
-        tokens = metadata.tokens_per_sequence
-        batch_size = metadata.fill_batch_indices.shape[0]
-        active_tokens = batch_size * tokens
-        total_tokens = q.shape[0]
-        q = q[:active_tokens].reshape(batch_size, tokens, q.shape[1], q.shape[2])
-        k = k[:active_tokens].reshape(batch_size, tokens, k.shape[1], k.shape[2])
-        v = v[:active_tokens].reshape(batch_size, tokens, v.shape[1], v.shape[2])
-
-        padded_tokens = cdiv(tokens, 32) * 32
-        if padded_tokens != tokens:
-            padding = ((0, 0), (0, padded_tokens - tokens), (0, 0), (0, 0))
-            q, k, v = (jnp.pad(value, padding) for value in (q, k, v))
-
-        output = tt_ops.scaled_dot_product_attention(
-            jnp.transpose(q, (0, 2, 1, 3)),
-            jnp.transpose(k, (0, 2, 1, 3)),
-            jnp.transpose(v, (0, 2, 1, 3)),
+        tokens = metadata.prefill_input_indices.shape[1]
+        q = q.at[metadata.prefill_input_indices].get(
+            out_sharding=NamedSharding(
+                self.mesh, P("data", None, "tensor", None)
+            )
         )
-        output = jnp.transpose(output, (0, 2, 1, 3))[:, :tokens]
-        output = output.reshape(
-            active_tokens,
+        q = jnp.transpose(q, (0, 2, 1, 3))
+        output = tt_ops.chunked_scaled_dot_product_attention(
+            q,
+            k_cache,
+            v_cache,
+            metadata.page_table,
+            metadata.prefill_chunk_start,
+            scale=layer.scaling,
+        )
+
+        output = jnp.transpose(output, (0, 2, 1, 3)).reshape(
+            batch_size * tokens,
             -1,
             out_sharding=NamedSharding(self.mesh, P("data", "tensor")),
         )
-        if active_tokens < total_tokens:
-            output = jnp.pad(output, ((0, total_tokens - active_tokens), (0, 0)))
+        output = output.at[metadata.prefill_output_indices].get(
+            out_sharding=NamedSharding(self.mesh, P("data", "tensor"))
+        )
         return output, (k_cache, v_cache)
 
     def _decode(self, q, k, v, layer, token_to_kv_pool):
         metadata = self.forward_metadata
-        if metadata.page_table is None or metadata.positions is None:
-            raise ValueError("TT decode metadata is missing")
-
         k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
         num_tokens = q.shape[0]
         q = q.reshape(1, num_tokens, q.shape[1], q.shape[2])
@@ -393,10 +429,10 @@ class TTAttention(AttentionBackend):
         ), None
 
     def _prefill_cache_value(self, value, head_dim):
-        tokens = self.forward_metadata.tokens_per_sequence
-        batch_size = self.forward_metadata.fill_batch_indices.shape[0]
-        value = self._pad_head_dim(value[: batch_size * tokens], head_dim)
-        value = value.reshape(batch_size, tokens, value.shape[1], value.shape[2])
+        value = value.at[self.forward_metadata.prefill_input_indices].get(
+            out_sharding=NamedSharding(self.mesh, P("data", None, "tensor", None))
+        )
+        value = self._pad_head_dim(value, head_dim)
         return jnp.transpose(value, (0, 2, 1, 3))
 
     @staticmethod
