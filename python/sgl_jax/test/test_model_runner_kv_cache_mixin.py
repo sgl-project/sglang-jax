@@ -320,8 +320,12 @@ def test_embedding_pool_bytes_only_for_in_model_prefill():
         max_prefill_tokens=100,
         multimodal=False,
         enable_lora=False,
+        disaggregation_mode="null",
     )
     assert _embedding_pool_bytes(config, args) == 128 * 8 * 2
+    args.disaggregation_mode = "decode"
+    assert _embedding_pool_bytes(config, args) == 0
+    args.disaggregation_mode = "null"
     args.multimodal = True
     assert _embedding_pool_bytes(config, args) == 0
 
@@ -343,6 +347,7 @@ def test_deepstack_embedding_pool_uses_packed_feature_width():
         max_prefill_tokens=100,
         multimodal=False,
         enable_lora=False,
+        disaggregation_mode="null",
     )
     model = types.SimpleNamespace(deepstack_visual_layers=3)
     budget = _embedding_pool_bytes(config, args, multimodal_model=model)
@@ -381,6 +386,7 @@ def test_embedding_pool_capacity_and_pages_follow_lm_limits():
         max_prefill_tokens=129,
         multimodal=False,
         enable_lora=False,
+        disaggregation_mode="null",
     )
     model = types.SimpleNamespace(deepstack_visual_layers=3)
     budget = _embedding_pool_bytes(config, args, multimodal_model=model)
