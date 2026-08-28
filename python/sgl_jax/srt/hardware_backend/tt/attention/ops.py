@@ -51,7 +51,6 @@ def _primitive(name):
     return primitive
 
 
-_scaled_dot_product_attention = _primitive("tt.scaled_dot_product_attention")
 _paged_scaled_dot_product_attention_decode = _primitive(
     "tt.paged_scaled_dot_product_attention_decode"
 )
@@ -61,10 +60,6 @@ _chunked_scaled_dot_product_attention = _primitive(
     "tt.chunked_scaled_dot_product_attention"
 )
 _weight_dtype_override = _primitive("tt.weight_dtype_override")
-
-
-def scaled_dot_product_attention(query, key, value):
-    return _scaled_dot_product_attention.bind(query, key, value)
 
 
 def chunked_scaled_dot_product_attention(
