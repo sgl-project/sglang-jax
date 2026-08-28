@@ -1266,11 +1266,8 @@ class MLATokenToKVPool(KVCache):
             "qk_rope_head_dim": self.qk_rope_head_dim,
             "kv_partition_axis": self.kv_partition_axis,
             "dp_size": self.dp_size,
-            "nope_dim": self.nope_dim,
-            "rope_dim": self.rope_dim,
-            "kv_dim": self.kv_dim,
             "kv_sharding": self.kv_sharding,
-            "indexer_key_dim": self.indexer_key_dim,
+            "indexer_key_dim": self.cache_layout.indexer_key_dim,
             "num_indexer_layers": self.num_indexer_layers,
         }
         return (children, aux_data)
@@ -1300,19 +1297,19 @@ class MLATokenToKVPool(KVCache):
         obj.qk_rope_head_dim = aux_data["qk_rope_head_dim"]
         obj.kv_partition_axis = aux_data["kv_partition_axis"]
         obj.dp_size = aux_data.get("dp_size", 1)
-        obj.nope_dim = aux_data["nope_dim"]
-        obj.rope_dim = aux_data["rope_dim"]
-        obj.kv_dim = aux_data["kv_dim"]
         obj.kv_sharding = aux_data["kv_sharding"]
-        obj.indexer_key_dim = aux_data.get("indexer_key_dim", 0)
         obj.num_indexer_layers = aux_data.get("num_indexer_layers", 0)
         obj.cache_layout = MLACacheLayout(
             page_size=obj.page_size,
             dtype=obj.dtype,
             kv_lora_rank=obj.kv_lora_rank,
             qk_rope_head_dim=obj.qk_rope_head_dim,
-            indexer_key_dim=obj.indexer_key_dim,
+            indexer_key_dim=aux_data.get("indexer_key_dim", 0),
         )
+        obj.nope_dim = obj.cache_layout.nope_dim
+        obj.rope_dim = obj.cache_layout.rope_dim
+        obj.kv_dim = obj.cache_layout.latent_dim
+        obj.indexer_key_dim = obj.cache_layout.indexer_dim
 
         obj.kv_buffer = kv_buffer
         obj.indexer_key_buffer = indexer_key_buffer

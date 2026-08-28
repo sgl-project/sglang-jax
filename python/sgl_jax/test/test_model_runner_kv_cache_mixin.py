@@ -268,13 +268,16 @@ def test_mla_pool_pytree_round_trip_preserves_layout_contract():
     """JAX transformations must retain the semantic layout after unflattening."""
     import jax
 
-    runner = _CellSizeRunner("dsa_sparse", num_layers=8)
+    runner = _CellSizeRunner("dsa_sparse", num_layers=8, index_head_dim=96)
     pool = _build_pool(runner, size=256, mesh=_single_device_mesh())
 
     leaves, tree = jax.tree_util.tree_flatten(pool)
     restored = jax.tree_util.tree_unflatten(tree, leaves)
 
+    assert pool.cache_layout.indexer_key_dim == 96
+    assert pool.indexer_key_dim == 128
     assert restored.cache_layout == pool.cache_layout
+    assert restored.indexer_key_dim == pool.indexer_key_dim
     assert restored.cache_layout.latent_shape(1) == pool.cache_layout.latent_shape(1)
     assert restored.cache_layout.indexer_shape(1) == pool.cache_layout.indexer_shape(1)
     assert restored.get_kv_size_bytes() == pool.get_kv_size_bytes()
