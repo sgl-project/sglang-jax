@@ -436,6 +436,7 @@ suites = {
         TestFile("test/srt/test_recurrent_track_scatter.py", 0.3),
         TestFile("test/srt/test_recurrent_split_equivalence.py", 0.3),
         TestFile("test/srt/test_prepare_for_extend_protected_len.py", 0.2),
+        TestFile("test/srt/test_native_attention_paged_decode.py", 1),
     ],
     "unit-test-tpu-v6e-4": [
         TestFile("python/sgl_jax/test/test_mesh.py", 0.4),
