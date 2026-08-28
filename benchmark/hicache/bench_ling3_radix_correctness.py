@@ -199,17 +199,26 @@ def run_level(args, page_size: int, track_interval: int, parallel: int) -> dict:
         (prompt.family, prompt.branch): tuple(response.output_ids)
         for prompt, response in zip(probes, first_responses)
     }
+    first_response = {
+        (prompt.family, prompt.branch): response
+        for prompt, response in zip(probes, first_responses)
+    }
     shuffled = list(probes)
     random.Random(args.seed + parallel).shuffle(shuffled)
     replay_responses, replay_wall = _run_requests(
         shuffled, generate_url, parallel, args.output_length
     )
     for prompt, response in zip(shuffled, replay_responses):
-        assert (
-            tuple(response.output_ids)
-            == expected_output[(prompt.family, prompt.branch)]
-        ), (
-            f"family={prompt.family} branch={prompt.branch}: hit output differs from first output"
+        key = (prompt.family, prompt.branch)
+        expected_ids = expected_output[key]
+        actual_ids = tuple(response.output_ids)
+        assert actual_ids == expected_ids, (
+            f"family={prompt.family} branch={prompt.branch}: hit output differs "
+            f"from first output; expected_output_ids={expected_ids}, "
+            f"actual_output_ids={actual_ids}, "
+            f"first_cached_tokens={first_response[key].cached_tokens}, "
+            f"replay_cached_tokens={response.cached_tokens}, "
+            f"prompt_len={response.prompt_len}"
         )
         expected_floor = (prompt.shared_tokens // track_interval) * track_interval
         assert response.cached_tokens >= expected_floor
@@ -227,10 +236,15 @@ def run_level(args, page_size: int, track_interval: int, parallel: int) -> dict:
     )
     for prompt, response in zip(cold_subset, cold_responses):
         assert response.cached_tokens == 0
-        assert (
-            tuple(response.output_ids)
-            == expected_output[(prompt.family, prompt.branch)]
-        ), f"family={prompt.family}: cold output differs from radix-hit output"
+        key = (prompt.family, prompt.branch)
+        expected_ids = expected_output[key]
+        actual_ids = tuple(response.output_ids)
+        assert actual_ids == expected_ids, (
+            f"family={prompt.family}: cold output differs from radix-hit output; "
+            f"expected_output_ids={expected_ids}, actual_output_ids={actual_ids}, "
+            f"first_cached_tokens={first_response[key].cached_tokens}, "
+            f"cold_cached_tokens={response.cached_tokens}, prompt_len={response.prompt_len}"
+        )
 
     first_ttft = [response.ttft for response in first_responses]
     replay_ttft = [response.ttft for response in replay_responses]
