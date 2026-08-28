@@ -10,6 +10,7 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.bailing_moe_v3 import BailingMoeV3Config
+from sgl_jax.srt.configs.bailing_hybrid import get_bailing_hybrid_config
 from sgl_jax.srt.hf_transformers_utils import get_config
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -81,6 +82,13 @@ def test_ling3_config_exposes_recurrent_radix_state_layout():
     assert state.num_heads == 2
     assert state.head_dim == 8
     assert state.conv_kernel_size == 4
+
+
+def test_ling3_legacy_model_type_does_not_route_to_ling2_hybrid_config():
+    cfg = _tiny_config(model_type="bailing_hybrid")
+
+    assert cfg.model_type == "bailing_hybrid"
+    assert get_bailing_hybrid_config(cfg) is None
 
 
 def test_ling3_config_rejects_invalid_layer_group_size():

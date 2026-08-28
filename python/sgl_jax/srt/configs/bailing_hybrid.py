@@ -201,9 +201,16 @@ def get_bailing_hybrid_config(hf_config: Any) -> BailingHybridConfig | None:
 
 
 def _is_bailing_hybrid_config(hf_config: Any) -> bool:
+    # Ling-3 checkpoints intentionally keep the legacy ``bailing_hybrid``
+    # model_type for AutoConfig compatibility, but their architecture is
+    # handled by BailingMoeV3Config (KDA + MLA), not this Ling-2.x adapter.
+    # Check the architecture first so the recurrent-cache path does not try
+    # to read Ling-2.x-only fields such as ``layers_block_type``.
+    architectures = getattr(hf_config, "architectures", None) or []
+    if any(str(arch) == "BailingMoeV3ForCausalLM" for arch in architectures):
+        return False
     if getattr(hf_config, "model_type", None) == "bailing_hybrid":
         return True
-    architectures = getattr(hf_config, "architectures", None) or []
     return any(str(arch) == "BailingMoeV2_5ForCausalLM" for arch in architectures)
 
 
