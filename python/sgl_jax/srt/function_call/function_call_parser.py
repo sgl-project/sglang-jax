@@ -34,6 +34,7 @@ class FunctionCallParser:
         "mimo": MiMoDetector,
         "glm47": Glm47MoeDetector,
         "glm45": Glm4MoeDetector,
+        "ling3": Glm47MoeDetector,
     }
 
     def __init__(self, tools: list[Tool], tool_call_parser: str):

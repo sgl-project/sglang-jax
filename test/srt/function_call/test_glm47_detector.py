@@ -11,12 +11,24 @@ Run with:
 import json
 import unittest
 
+from sgl_jax.srt.function_call.function_call_parser import FunctionCallParser
 from sgl_jax.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sgl_jax.test.test_utils import CustomTestCase
 from sgl_jax.test.tool_parser_test_config import ToolParserTestConfig as C
 
 
 class TestGlm47Detector(CustomTestCase):
+    def test_ling3_parser_registered(self):
+        parser = FunctionCallParser([C.bash_tool()], "ling3")
+        normal, calls = parser.parse_non_stream(
+            "<tool_call>execute_bash\n<arg_key>command</arg_key>"
+            "<arg_value>ls</arg_value></tool_call>"
+        )
+        self.assertEqual(normal, "")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "execute_bash")
+        self.assertEqual(json.loads(calls[0].parameters), {"command": "ls"})
+
     def test_has_tool_call(self):
         d = Glm47MoeDetector()
         self.assertTrue(d.has_tool_call("foo<tool_call>bar"))
