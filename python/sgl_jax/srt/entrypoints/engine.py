@@ -110,6 +110,10 @@ class Engine(EngineBase):
 
             require_raiden_preloaded()
 
+        self.server_args = server_args
+        self.tokenizer_manager = None
+        self.send_to_rpc = None
+
         # Shutdown the subprocesses automatically when the program exits
         atexit.register(self.shutdown)
 
@@ -122,7 +126,6 @@ class Engine(EngineBase):
             server_args=server_args,
             port_args=self.port_args,
         )
-        self.server_args = server_args
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
         self.scheduler_info = scheduler_info
@@ -302,14 +305,10 @@ class Engine(EngineBase):
 
     def shutdown(self):
         """Shutdown the engine"""
-        tokenizer_manager = getattr(self, "tokenizer_manager", None)
-        if tokenizer_manager is not None:
-            tokenizer_manager.shutdown()
+        if self.tokenizer_manager is not None:
+            self.tokenizer_manager.shutdown()
         kill_process_tree(os.getpid(), include_parent=False)
-        if (
-            getattr(self, "server_args", None) is not None
-            and self.server_args.enable_single_process
-        ):
+        if self.server_args.enable_single_process and self.send_to_rpc is not None:
             self.send_to_rpc.close()
 
     def __enter__(self):
