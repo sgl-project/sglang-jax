@@ -76,6 +76,7 @@ def _embedding_pool_bytes(
         and not is_draft_worker
         and not server_args.multimodal
         and not server_args.enable_lora
+        and server_args.disaggregation_mode != "decode"
     )
     if not enabled:
         return 0

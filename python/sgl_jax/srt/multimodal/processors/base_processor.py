@@ -95,22 +95,23 @@ class BaseMultimodalProcessor(ABC):
             raise ValueError("Multimodal processor worker count must be positive.")
         if self.mm_processor_worker_num > 1 and not self.supports_mm_processor_concurrency:
             logger.warning(
-                "%s does not support concurrent multimodal processing; using one worker.",
+                "%s does not support concurrent multimodal processing; using synchronous processing.",
                 type(self).__name__,
             )
             self.mm_processor_worker_num = 1
-        try:
-            self.mm_processor_executor = MultimodalProcessorExecutor(
-                processor, self.mm_processor_worker_num
-            )
-        except Exception:
-            logger.warning(
-                "Unable to clone %s processor; using one worker.",
-                type(self).__name__,
-                exc_info=True,
-            )
-            self.mm_processor_worker_num = 1
-            self.mm_processor_executor = MultimodalProcessorExecutor(processor, 1)
+        self.mm_processor_executor = None
+        if self.mm_processor_worker_num > 1:
+            try:
+                self.mm_processor_executor = MultimodalProcessorExecutor(
+                    processor, self.mm_processor_worker_num
+                )
+            except Exception:
+                logger.warning(
+                    "Unable to clone %s processor; using synchronous processing.",
+                    type(self).__name__,
+                    exc_info=True,
+                )
+                self.mm_processor_worker_num = 1
 
     def apply_chat_template(self, *args, **kwargs):
         return self.processor.apply_chat_template(*args, **kwargs)
@@ -257,7 +258,16 @@ class BaseMultimodalProcessor(ABC):
         audios: list | None = None,
         **processor_kwargs,
     ) -> MultimodalInputs:
-        """Run HF processing and output collection outside the event loop."""
+        """Run HF processing with isolated workers when concurrency is enabled."""
+        if self.mm_processor_executor is None:
+            return self.process_and_combine_mm_data(
+                input_text,
+                images,
+                videos,
+                audios,
+                processor=self.processor,
+                **processor_kwargs,
+            )
         return await self.mm_processor_executor.run(
             self.process_and_combine_mm_data,
             input_text,
@@ -272,4 +282,5 @@ class BaseMultimodalProcessor(ABC):
             return
         self._shutdown = True
         self.io_executor.shutdown(wait=False, cancel_futures=True)
-        self.mm_processor_executor.shutdown()
+        if self.mm_processor_executor is not None:
+            self.mm_processor_executor.shutdown()

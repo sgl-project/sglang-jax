@@ -446,7 +446,7 @@ suites = {
     ],
     "unit-test-tpu-v6e-4": [
         TestFile(
-            "python/sgl_jax/test/test_vlm_stage1_framework.py",
+            "test/srt/multimodal/test_in_model_multimodal.py",
             1,
             runner="pytest",
         ),

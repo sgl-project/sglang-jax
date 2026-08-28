@@ -1632,7 +1632,10 @@ class ServerArgs:
         parser.add_argument(
             "--multimodal",
             action="store_true",
-            help="Enable multimodal HTTP server.",
+            help=(
+                "Enable the standalone multi-stage multimodal HTTP server. "
+                "This flag is not required for multimodal models using the regular SRT runtime."
+            ),
         )
         parser.add_argument(
             "--limit-mm-data-per-request",
