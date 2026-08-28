@@ -294,9 +294,9 @@ class KimiK3EPMoE(EPMoE):
 
     **fp4.** The released K3 experts are MXFP4 (e2m1 values + per-32 e8m0 block scales). This
     reference path widens them to bf16 with their block scales and runs the standard grouped
-    matmul; correct and portable. Keeping the experts sub-byte through a fused GMM kernel is a
-    separate optimization (bf16 experts are 5,072 GiB at full depth versus 1,347 GiB kept as fp4,
-    measured 0.535 B/value on v7x), tracked outside this change.
+    matmul; correct and portable. Keeping the experts sub-byte end to end through a fused GMM
+    kernel (~4x less resident expert memory: 4 bits per value against bf16's 16) is a separate
+    optimization -- see the TODO at :meth:`_call_gmm`.
     """
 
     def __init__(self, *args, situ_beta=None, situ_linear_beta=None, fp4: bool = False, **kwargs):
@@ -353,6 +353,13 @@ class KimiK3EPMoE(EPMoE):
     def _call_gmm(self, **kwargs):
         if not self.fp4:
             return super()._call_gmm(**kwargs)
+        # TODO(vlasenkoalexey): replace this dequant-to-bf16 path with a sub-byte fp4 GMM
+        # kernel. Widening here materializes bf16 experts for every matmul (~4x their packed
+        # size) and is the memory
+        # wall at full depth; a kernel that consumes e2m1 operands with e8m0 block scales
+        # directly would keep them packed end to end. Until then this path is the correct,
+        # portable reference.
+        #
         # Reference MXFP4 path: widen the e2m1 expert weights to bf16 with their per-32 e8m0 block
         # scales, then run the standard grouped matmul. `rhs` is native float4_e2m1fn [E, K, N] and
         # `rhs_scale` is fp32 [E, num_k_blocks, 1, N] (one scale per MXFP4_GROUP_SIZE along K).

@@ -105,13 +105,17 @@ def build_epmoe_weights(
 # ==============================================================================================
 # fp4-NATIVE path -- what the full 93-layer model needs
 # ==============================================================================================
-# Dequantizing to bf16 (above) is fine for a truncated bring-up and impossible at full depth:
-# K3's 2.723 T routed-expert params cost 5,072 GiB as bf16 versus 1,347 GiB kept as fp4 --
-# 26.8 chips of weights instead of 7.1, at v7x's measured 189.5 GiB/chip.
+# Dequantizing to bf16 (above) is fine for a truncated bring-up but multiplies the resident
+# expert footprint by ~4x (16 bits per value against 4), which is the constraint at full depth.
 #
-# The functions below keep the weights fp4 all the way into the kernel, matching what the
-# reference MXFP4 dequant path in the K3 MoE. They widen the released e2m1 expert weights and
-# their e8m0 block scales to bf16 for the standard grouped matmul.
+# The functions below keep the released weights in their packed e2m1 form with e8m0 block scales,
+# so the MoE can widen per block at matmul time rather than materializing bf16 experts at load.
+#
+# TODO(vlasenkoalexey): consume these packed operands from a sub-byte fp4 GMM kernel instead of
+# widening them in the MoE forward. The layouts here are already what such a kernel wants --
+# K-major e2m1 weights and (group, num_k_blocks, 1, n) fp32 scales -- so the substitution is at
+# the matmul call site
+# (see the TODO in KimiK3 MoE `_call_gmm`), not in this load path.
 
 
 def unpack_fp4_to_e2m1(packed: jax.Array) -> jax.Array:
