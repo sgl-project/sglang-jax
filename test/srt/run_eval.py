@@ -80,7 +80,13 @@ def run_eval(args):
         from eval.simple_eval_gpqa import GPQAEval
 
         filename = "https://openaipublic.blob.core.windows.net/simple-evals/gpqa_diamond.csv"
-        eval_obj = GPQAEval(filename, args.num_examples, args.num_threads)
+        eval_obj = GPQAEval(
+            filename,
+            args.num_examples,
+            args.num_threads,
+            checkpoint_path=args.checkpoint_path,
+            resume_unextracted_only=args.resume_unextracted_only,
+        )
     elif args.eval_name == "humaneval":
         from eval.simple_eval_humaneval import HumanEval
 
@@ -190,6 +196,17 @@ if __name__ == "__main__":
     parser.add_argument("--repetition-penalty", type=float, default=None)
     parser.add_argument("--frequency-penalty", type=float, default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--checkpoint-path",
+        type=str,
+        default=None,
+        help="Append one durable JSONL record per completed GPQA example.",
+    )
+    parser.add_argument(
+        "--resume-unextracted-only",
+        action="store_true",
+        help="For GPQA, reuse checkpointed answers and run only missing/unextracted examples.",
+    )
     parser.add_argument(
         "--enable-thinking",
         type=lambda x: (str(x).lower() in ["true", "1", "yes"]),
