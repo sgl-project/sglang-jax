@@ -7,8 +7,9 @@ level it verifies:
 
 1. unrelated anchors are cold after ``/flush_cache``;
 2. divergent sibling prompts reuse the anchor's recurrent prefix;
-3. exact concurrent replays preserve output IDs and keep the prefix hit;
-4. a post-flush cold subset is byte-identical to the previous hit result.
+3. same-order concurrent replays preserve output IDs and keep the prefix hit;
+4. shuffled replays keep prefix hits under a different batch composition;
+5. a post-flush same-order cold round is byte-identical to the hit result.
 
 Example::
 
@@ -203,12 +204,14 @@ def run_level(args, page_size: int, track_interval: int, parallel: int) -> dict:
         (prompt.family, prompt.branch): response
         for prompt, response in zip(probes, first_responses)
     }
-    shuffled = list(probes)
-    random.Random(args.seed + parallel).shuffle(shuffled)
+    # Keep request order and concurrency identical for the byte-exact replay.
+    # TPU matmul schedules can change at batch-composition boundaries; ordering
+    # differences are stressed separately below without conflating those
+    # numerical differences with recurrent-state corruption.
     replay_responses, replay_wall = _run_requests(
-        shuffled, generate_url, parallel, args.output_length
+        probes, generate_url, parallel, args.output_length
     )
-    for prompt, response in zip(shuffled, replay_responses):
+    for prompt, response in zip(probes, replay_responses):
         key = (prompt.family, prompt.branch)
         expected_ids = expected_output[key]
         actual_ids = tuple(response.output_ids)
@@ -223,18 +226,29 @@ def run_level(args, page_size: int, track_interval: int, parallel: int) -> dict:
         expected_floor = (prompt.shared_tokens // track_interval) * track_interval
         assert response.cached_tokens >= expected_floor
 
-    # Compare one prompt per unrelated family against a truly cold post-flush
-    # execution. This catches recurrent snapshot corruption that an exact
-    # replay alone could reproduce twice.
-    cold_subset = [prompt for prompt in probes if prompt.branch == 0]
+    shuffled = list(probes)
+    random.Random(args.seed + parallel).shuffle(shuffled)
+    shuffled_responses, shuffled_wall = _run_requests(
+        shuffled, generate_url, parallel, args.output_length
+    )
+    for prompt, response in zip(shuffled, shuffled_responses):
+        expected_floor = (prompt.shared_tokens // track_interval) * track_interval
+        assert response.cached_tokens >= expected_floor, (
+            f"family={prompt.family} branch={prompt.branch}: shuffled replay "
+            f"cached_tokens={response.cached_tokens}, expected at least {expected_floor}"
+        )
+
+    # Compare the complete workload against a truly cold post-flush execution,
+    # preserving request order and concurrency. This catches recurrent snapshot
+    # corruption that an exact replay alone could reproduce twice.
     flush_cache(args.server_url)
     cold_responses, _ = _run_requests(
-        cold_subset,
+        probes,
         generate_url,
-        min(parallel, len(cold_subset)),
+        parallel,
         args.output_length,
     )
-    for prompt, response in zip(cold_subset, cold_responses):
+    for prompt, response in zip(probes, cold_responses):
         assert response.cached_tokens == 0
         key = (prompt.family, prompt.branch)
         expected_ids = expected_output[key]
@@ -259,10 +273,14 @@ def run_level(args, page_size: int, track_interval: int, parallel: int) -> dict:
         "replay_cached_tokens": sum(
             response.cached_tokens for response in replay_responses
         ),
+        "shuffled_cached_tokens": sum(
+            response.cached_tokens for response in shuffled_responses
+        ),
         "first_ttft_p50_ms": statistics.median(first_ttft) * 1000,
         "replay_ttft_p50_ms": statistics.median(replay_ttft) * 1000,
         "first_throughput_req_s": len(first_responses) / first_wall,
         "replay_throughput_req_s": len(replay_responses) / replay_wall,
+        "shuffled_throughput_req_s": len(shuffled_responses) / shuffled_wall,
         "correctness": "pass",
     }
 
