@@ -38,7 +38,11 @@ from sgl_jax.srt.disaggregation.encoder.client import (
 from sgl_jax.srt.disaggregation.pathways_scheduler import PathwaysPDSchedulerMixin
 from sgl_jax.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sgl_jax.srt.disaggregation.runtime import install_disaggregation_wiring
-from sgl_jax.srt.hf_transformers_utils import get_tokenizer
+from sgl_jax.srt.hf_transformers_utils import (
+    get_processor,
+    get_tokenizer,
+    get_tokenizer_from_processor,
+)
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.managers.communication import CommunicationBackend
 from sgl_jax.srt.managers.dp_rank_assignment import assign_dp_ranks
@@ -92,6 +96,11 @@ from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     recurrent_admission_blocked,
+)
+from sgl_jax.srt.multimodal.common.modality_enum import build_radix_input_ids
+from sgl_jax.srt.multimodal.manager.multimodal_processor import (
+    get_mm_processor,
+    import_processors,
 )
 from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.precision_tracer import precision_tracer
@@ -585,7 +594,7 @@ class Scheduler(
             ]
         )
 
-        if server_args.encoder_urls or server_args.encoder_bootstrap_port is not None:
+        if server_args.language_only:
             self.init_encoder_disaggregation()
 
         if not server_args.disable_precompile and not self.pd:
@@ -717,8 +726,27 @@ class Scheduler(
         self.model_config = ModelConfig.from_server_args(server_args)
         apply_multimodal_model_defaults(server_args, self.model_config)
         self.is_generation = self.model_config.is_generation
+        self.processor = None
+        self._mm_processor = None
         if server_args.skip_tokenizer_init:
-            self.tokenizer = self.processor = None
+            self.tokenizer = None
+        elif self.model_config.is_multimodal and server_args.language_only:
+            tokenizer_path = server_args.tokenizer_path
+            tokenizer_subdir = resolve_tokenizer_subdir(server_args.model_path, tokenizer_path)
+            if tokenizer_subdir:
+                tokenizer_path = os.path.join(tokenizer_path, tokenizer_subdir)
+            self.processor = get_processor(
+                tokenizer_path,
+                tokenizer_mode=server_args.tokenizer_mode,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+                use_fast=True,
+            )
+            self.tokenizer = get_tokenizer_from_processor(self.processor)
+            import_processors("sgl_jax.srt.multimodal.processors")
+            self._mm_processor = get_mm_processor(
+                self.model_config.hf_config, server_args, self.processor
+            )
         else:
             tokenizer_subdir = ""
             if server_args.multimodal:
@@ -1344,6 +1372,8 @@ class Scheduler(
     def init_encoder_disaggregation(self) -> None:
         if self.nnodes > 1:
             raise RuntimeError("encoder disaggregation does not support multi-host schedulers yet")
+        if self._mm_processor is None:
+            raise ValueError("encoder disaggregation requires a multimodal processor")
         self.encoder_client = create_encoder_client(self.server_args, self.mesh)
 
     def process_encoder_requests(self, recv_reqs: list) -> list:
@@ -1377,10 +1407,12 @@ class Scheduler(
                 continue
 
             if result is not None:
-                if recv_req.mm_inputs is None:
-                    recv_req.mm_inputs = {}
-                recv_req.mm_inputs.update(result)
-                ready.append(recv_req)
+                try:
+                    self._apply_encoder_result(recv_req, result)
+                except Exception as exc:
+                    self._abort_encoder_request(recv_req, str(exc))
+                else:
+                    ready.append(recv_req)
                 self._remove_encoder_waiting(rid)
                 continue
 
@@ -1393,13 +1425,28 @@ class Scheduler(
 
         return ready
 
+    def _apply_encoder_result(self, recv_req, result: dict) -> None:
+        embeddings = result.get("embeddings")
+        if embeddings is None:
+            raise ValueError("encoder result contains no embeddings")
+        prompt = recv_req.text if recv_req.text is not None else recv_req.input_ids
+        mm_inputs = self._mm_processor.get_mm_data(
+            prompt,
+            embeddings,
+            **{key: value for key, value in result.items() if key != "embeddings"},
+        )
+        if mm_inputs.input_ids is None:
+            raise ValueError("multimodal processor produced no input_ids")
+        recv_req.mm_inputs = mm_inputs
+        recv_req.input_ids = mm_inputs.input_ids
+        recv_req.radix_input_ids = build_radix_input_ids(recv_req.input_ids, mm_inputs)
+        recv_req.need_wait_for_mm_inputs = False
+
     @staticmethod
     def _needs_encoder(recv_req) -> bool:
-        if not isinstance(recv_req, TokenizedGenerateReqInput):
-            return False
-        if not recv_req.need_wait_for_mm_inputs:
-            return False
-        return recv_req.mm_inputs is None or recv_req.mm_inputs.get("multimodal_embedding") is None
+        return isinstance(recv_req, TokenizedGenerateReqInput) and bool(
+            recv_req.need_wait_for_mm_inputs
+        )
 
     def _abort_encoder_request(self, recv_req, error_msg: str) -> None:
         logger.error("Encoder request failed. rid=%s error=%s", recv_req.rid, error_msg)

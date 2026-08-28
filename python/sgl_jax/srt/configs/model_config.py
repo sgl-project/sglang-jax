@@ -556,7 +556,7 @@ class ModelConfig:
         **kwargs,
     ):
         model_sub_dir = getattr(server_args, "model_sub_dir", None)
-        return ModelConfig(
+        model_config = ModelConfig(
             model_path=model_path or server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
             revision=model_revision or server_args.revision,
@@ -574,6 +574,9 @@ class ModelConfig:
             model_sub_dir=model_sub_dir,
             **kwargs,
         )
+        model_config.hf_config.encoder_only = getattr(server_args, "encoder_only", False)
+        model_config.hf_config.language_only = getattr(server_args, "language_only", False)
+        return model_config
 
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
     def get_total_num_kv_heads(self) -> int:

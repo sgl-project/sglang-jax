@@ -82,10 +82,13 @@ class RaidenEncoderServerTransfer:
     def publish(self, transfer_id: str, embedding: jax.Array) -> dict[str, Any]:
         if transfer_id in self._sessions:
             raise ValueError(f"duplicate Raiden transfer_id: {transfer_id}")
-        if not embedding.shape or embedding.shape[0] <= 0:
-            raise ValueError("Raiden embedding must have a non-empty block dimension")
+        if embedding.ndim != 2 or embedding.shape[0] <= 0:
+            raise ValueError("Raiden embedding must be a non-empty matrix")
 
-        block_ids = list(range(int(embedding.shape[0])))
+        # Treat one embedding as one physical major slice. The leading transfer
+        # axis makes TPU tile padding part of the slice instead of row stride.
+        buffer = embedding[jnp.newaxis, ...]
+        block_ids = [0]
         transfer_uuid = _uuid_to_int(transfer_id)
         session = RaidenTransferWrapper(
             self._host_ip,
@@ -93,8 +96,8 @@ class RaidenEncoderServerTransfer:
             parallelism=self._parallelism,
         )
         session.start(
-            [embedding],
-            max_blocks=len(block_ids),
+            [buffer],
+            max_blocks=1,
             num_slots=1,
             timeout_s=self._timeout_s,
         )
@@ -166,8 +169,8 @@ class RaidenReceiverBackend:
         if data.shape is None or data.dtype is None:
             raise ValueError("embedding shape and dtype are required")
         shape = tuple(int(dim) for dim in data.shape)
-        if not shape or shape[0] <= 0:
-            raise ValueError("Raiden embedding must have a non-empty block dimension")
+        if len(shape) != 2 or shape[0] <= 0:
+            raise ValueError("Raiden embedding must be a non-empty matrix")
 
         transfer_id = getattr(data, "transfer_id", None)
         transfer_uuid = getattr(data, "transfer_uuid", None)
@@ -175,7 +178,7 @@ class RaidenReceiverBackend:
         endpoints = getattr(data, "transfer_address", None)
         if not transfer_id or not isinstance(transfer_uuid, int):
             raise ValueError("Raiden transfer identity is incomplete")
-        if not isinstance(remote_block_ids, list) or len(remote_block_ids) != shape[0]:
+        if not isinstance(remote_block_ids, list) or len(remote_block_ids) != 1:
             raise ValueError("Raiden block metadata does not match embedding shape")
         remote_block_ids = [int(block_id) for block_id in remote_block_ids]
         if len(set(remote_block_ids)) != len(remote_block_ids) or any(
@@ -190,9 +193,9 @@ class RaidenReceiverBackend:
             raise ValueError("Raiden transfer_host is required")
         remote_endpoints = _normalize_endpoints(endpoints, transfer_host)
 
-        buffer = jax.device_put(jnp.zeros(shape, dtype=jnp.dtype(data.dtype)), self._sharding)
+        buffer = jax.device_put(jnp.zeros((1, *shape), dtype=jnp.dtype(data.dtype)), self._sharding)
         jax.block_until_ready(buffer)
-        local_block_ids = list(range(shape[0]))
+        local_block_ids = [0]
         transfer = RaidenTransferWrapper(
             self._host,
             0,
@@ -200,7 +203,7 @@ class RaidenReceiverBackend:
         )
         transfer.start(
             [buffer],
-            max_blocks=len(local_block_ids),
+            max_blocks=1,
             num_slots=1,
             timeout_s=self._transfer_timeout_s,
         )
@@ -211,7 +214,7 @@ class RaidenReceiverBackend:
             remote_block_ids,
             local_block_ids,
         )
-        return RaidenReceiveSession(transfer_id, buffer, transfer)
+        return RaidenReceiveSession(transfer_id, buffer[0], transfer)
 
     def close(self) -> None:
         return None

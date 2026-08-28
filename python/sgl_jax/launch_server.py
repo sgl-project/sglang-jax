@@ -15,7 +15,11 @@ def main():
 
     try:
         server_args = ServerArgs.from_cli()
-        if server_args.multimodal:
+        if server_args.encoder_only:
+            from sgl_jax.srt.disaggregation.encoder import server as encoder_server
+
+            encoder_server.launch(server_args)
+        elif server_args.multimodal:
             from sgl_jax.srt.multimodal.entrypoint import (
                 http_server as multimodal_http_server,
             )

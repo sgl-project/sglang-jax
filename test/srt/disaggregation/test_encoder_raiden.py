@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import Future
+from typing import ClassVar
 from unittest import mock
 
 import jax
@@ -33,7 +34,7 @@ def _pretend_raiden_is_preloaded(monkeypatch):
 
 
 class _FakeRaidenWrapper:
-    instances: list[_FakeRaidenWrapper] = []
+    instances: ClassVar[list[_FakeRaidenWrapper]] = []
 
     def __init__(self, host: str, port: int, *, parallelism: int) -> None:
         self.host = host
@@ -94,12 +95,14 @@ def test_raiden_server_binds_the_produced_embedding(monkeypatch):
 
     session = _FakeRaidenWrapper.instances[0]
     buffers, options = session.started
-    assert buffers == [embedding]
-    assert options == {"max_blocks": 4, "num_slots": 1, "timeout_s": 12.0}
+    assert len(buffers) == 1
+    np.testing.assert_array_equal(buffers[0][0], embedding)
+    assert buffers[0].shape == (1, 4, 3)
+    assert options == {"max_blocks": 1, "num_slots": 1, "timeout_s": 12.0}
     assert session.registered == (
         "part-0:embedding",
         metadata["transfer_uuid"],
-        [0, 1, 2, 3],
+        [0],
     )
     assert metadata["transfer_address"] == session.endpoints
     assert metadata["transfer_host"] == "10.0.0.4"
@@ -163,28 +166,28 @@ def test_raiden_request_receives_into_matching_jax_buffer(monkeypatch):
         transfer_uuid=17,
         transfer_address=[{"endpoint": "127.0.0.1:7788", "shards": [0]}],
         transfer_host="10.0.0.8",
-        transfer_block_ids=[0, 1],
+        transfer_block_ids=[0],
     )
 
     request._start_receive(data)
 
     session = _FakeRaidenWrapper.instances[0]
     buffers, options = session.started
-    assert buffers[0].shape == (2, 3)
+    assert buffers[0].shape == (1, 2, 3)
     assert buffers[0].dtype == jnp.float32
-    assert options == {"max_blocks": 2, "num_slots": 1, "timeout_s": 30.0}
+    assert options == {"max_blocks": 1, "num_slots": 1, "timeout_s": 30.0}
     assert session.read == (
         "part-0:embedding",
         17,
         [{"endpoint": "10.0.0.8:7788", "shards": [0]}],
-        [0, 1],
-        [0, 1],
+        [0],
+        [0],
     )
 
     session.stats = ([], ["part-0:embedding"], [])
     result = request.poll()
 
-    np.testing.assert_array_equal(result["multimodal_embedding"], np.zeros((2, 3)))
+    np.testing.assert_array_equal(result["embeddings"][Modality.IMAGE], np.zeros((2, 3)))
     request.close()
     assert receiver.closed
 

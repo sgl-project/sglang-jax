@@ -155,6 +155,10 @@ class MultimodalDataItem:
     # Raw features returned by processor, e.g. pixel_values or audio_features
     feature: jax.Array | np.ndarray | None = None
 
+    # Encoder-disaggregated output. When present, the language worker merges
+    # this tensor directly and never executes its local multimodal encoder.
+    precomputed_embeddings: jax.Array | np.ndarray | None = None
+
     # Model-specific data stored in dictionary
     model_specific_data: dict[str, Any] = dataclasses.field(default_factory=dict)
 
@@ -186,7 +190,7 @@ class MultimodalDataItem:
 
     def set_pad_value(self) -> None:
         if self.hash is None:
-            feature = self.feature
+            feature = self.feature if self.feature is not None else self.precomputed_embeddings
             layout = (
                 (tuple(feature.shape), str(feature.dtype))
                 if isinstance(feature, (jax.Array, np.ndarray))

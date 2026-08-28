@@ -7,6 +7,10 @@ import jax.numpy as jnp
 
 from sgl_jax.srt.multimodal.common.modality_enum import Modality
 
+# Adapted for JAX from SGLang's encoder receiver data structures:
+# https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/disaggregation/encode_receiver.py
+
+
 _MODALITY_GRID_KEYS = {
     Modality.IMAGE: ("img_grid_thw", False),
     Modality.VIDEO: ("video_grid_thw", False),
@@ -118,7 +122,7 @@ class MultiModalEmbeddingData:
             for modality, embeddings in grouped.items()
         }
 
-    def get_mm_extra_meta(self) -> dict[str, jax.Array]:
+    def get_mm_extra_meta(self) -> dict[str, Any]:
         result = {}
         parts = [part for part in self._parts if part is not None]
         for modality, (key, flatten) in _MODALITY_GRID_KEYS.items():
@@ -134,4 +138,13 @@ class MultiModalEmbeddingData:
                 values.append(value)
             if values:
                 result[key] = jnp.concatenate(values)
+
+        second_per_grid_ts = []
+        for data, _ in parts:
+            if data.modality == Modality.VIDEO:
+                values = getattr(data, "second_per_grid_ts", None)
+                if values is not None:
+                    second_per_grid_ts.extend(jnp.asarray(values).reshape(-1).tolist())
+        if second_per_grid_ts:
+            result["second_per_grid_ts"] = second_per_grid_ts
         return result

@@ -141,13 +141,10 @@ def validate_encoder_response(
 
 
 def build_encoder_result(accumulator: Any) -> dict[str, Any]:
-    import jax.numpy as jnp
-
-    grouped = list(accumulator.get_embedding(is_concat=True).values())
-    embedding = grouped[0] if len(grouped) == 1 else jnp.concatenate(grouped)
-    mm_inputs = accumulator.get_mm_extra_meta()
-    mm_inputs["multimodal_embedding"] = embedding
-    return mm_inputs
+    return {
+        "embeddings": accumulator.get_embedding(is_concat=True),
+        **accumulator.get_mm_extra_meta(),
+    }
 
 
 class EncoderReceiveSession(Protocol):

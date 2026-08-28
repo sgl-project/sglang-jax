@@ -265,6 +265,8 @@ class ServerArgs:
     mm_processor_worker_num: int = 0
 
     # Encoder disaggregation
+    encoder_only: bool = False
+    language_only: bool = False
     encoder_urls: list[str] | None = None
     encoder_bootstrap_port: int | None = None
     encoder_register_urls: list[str] | None = None
@@ -565,8 +567,22 @@ class ServerArgs:
                 f"--disaggregation-mode must be one of {valid_modes}, "
                 f"got {self.disaggregation_mode!r}"
             )
-        # TODO: Unify it to use a language-only flag for determination.
-        encoder_disaggregation = bool(self.encoder_urls or self.encoder_bootstrap_port is not None)
+        if self.encoder_only and self.language_only:
+            raise ValueError("--encoder-only and --language-only are mutually exclusive")
+        if self.encoder_only and (self.encoder_urls or self.encoder_bootstrap_port is not None):
+            raise ValueError("--encoder-only cannot consume external encoders")
+        if self.language_only and not (
+            self.encoder_urls or self.encoder_bootstrap_port is not None
+        ):
+            raise ValueError("--language-only requires --encoder-urls or --encoder-bootstrap-port")
+        if (
+            self.encoder_urls or self.encoder_bootstrap_port is not None
+        ) and not self.language_only:
+            raise ValueError("--encoder-urls and --encoder-bootstrap-port require --language-only")
+        if self.encoder_register_urls and not self.encoder_only:
+            raise ValueError("--encoder-register-urls requires --encoder-only")
+
+        encoder_disaggregation = self.encoder_only or self.language_only
         if encoder_disaggregation and self.disaggregation_mode == "decode":
             raise ValueError("Encoder disaggregation is not used by a decode-only server")
         if self.encoder_bootstrap_port is not None and not (
@@ -1660,6 +1676,16 @@ class ServerArgs:
             type=int,
             default=ServerArgs.mm_processor_worker_num,
             help="Number of multimodal processor workers. 0 uses the model default.",
+        )
+        parser.add_argument(
+            "--encoder-only",
+            action="store_true",
+            help="Run only the multimodal encoder as an EPD worker.",
+        )
+        parser.add_argument(
+            "--language-only",
+            action="store_true",
+            help="Load only the language model and consume external encoder outputs.",
         )
         parser.add_argument(
             "--encoder-urls",

@@ -373,12 +373,18 @@ class TokenizerManager:
         input_text = obj.text
         input_ids = obj.input_ids
         mm_inputs = None
+        use_remote_encoder = (
+            isinstance(obj, GenerateReqInput)
+            and self._encoder_disaggregation_enabled()
+            and obj.contains_mm_input()
+        )
         if isinstance(obj, GenerateReqInput) and obj.contains_mm_input():
+            self._validate_mm_limits(obj)
+        if isinstance(obj, GenerateReqInput) and obj.contains_mm_input() and not use_remote_encoder:
             if self.mm_processor is None:
                 raise ValueError(
                     "Multimodal input was provided, but the model has no multimodal processor."
                 )
-            self._validate_mm_limits(obj)
             mm_inputs = await self.mm_processor.process_mm_data_async(
                 image_data=obj.image_data,
                 input_text=input_text or input_ids,
@@ -399,11 +405,7 @@ class TokenizerManager:
         self._validate_one_request(obj, input_ids)
         tokenized_obj = self._create_tokenized_object(obj, input_text, input_ids, mm_inputs)
 
-        if (
-            isinstance(obj, GenerateReqInput)
-            and self._encoder_disaggregation_enabled()
-            and obj.contains_mm_input()
-        ):
+        if use_remote_encoder:
             encoder_urls = await self._get_encoder_urls()
             timeout = self.server_args.encoder_control_timeout_seconds
             assignments, dispatch_task = dispatch_encoder_request(
@@ -420,7 +422,7 @@ class TokenizerManager:
         return tokenized_obj
 
     def _encoder_disaggregation_enabled(self) -> bool:
-        return bool(self.encoder_urls or self.encoder_bootstrap_server is not None)
+        return self.server_args.language_only
 
     async def _get_encoder_urls(self) -> list[str]:
         encoder_urls = (

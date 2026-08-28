@@ -618,44 +618,48 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         )
 
         # Language backbone.
-        self.model = Qwen2Model(self.text_config, mesh=mesh, dtype=self.dtype)
-        if not getattr(self.text_config, "tie_word_embeddings", False):
-            self.lm_head = ParallelLMHead(
-                self.text_config.vocab_size,
-                self.text_config.hidden_size,
-                dtype=self.dtype,
-                param_dtype=self.dtype,
-                kernel_axes=("tensor", None),
-            )
-        self.logits_processor = LogitsProcessor(self.text_config.vocab_size, mesh=self.mesh)
+        if not getattr(config, "encoder_only", False):
+            self.model = Qwen2Model(self.text_config, mesh=mesh, dtype=self.dtype)
+            if not getattr(self.text_config, "tie_word_embeddings", False):
+                self.lm_head = ParallelLMHead(
+                    self.text_config.vocab_size,
+                    self.text_config.hidden_size,
+                    dtype=self.dtype,
+                    param_dtype=self.dtype,
+                    kernel_axes=("tensor", None),
+                )
+            self.logits_processor = LogitsProcessor(self.text_config.vocab_size, mesh=self.mesh)
         self.image_token_id = getattr(self.config, "image_token_id", None)
         self.video_token_id = getattr(self.config, "video_token_id", None)
 
         # Vision tower.
         self.visual_config = config.vision_config
-
-        vision_tp = resolve_encoder_tp(mesh, getattr(config, "vision_encoder_parallel", "dp"))
-        self.visual = Qwen2_5_VisionTransformer(
-            config=self.visual_config,
-            dtype=self.dtype,
-            rngs=rngs,
-            mesh=mesh,
-            norm_eps=getattr(self.visual_config, "rms_norm_eps", 1e-6),
-            vision_tp=vision_tp,
-            input_buckets=tuple(
-                resolve_vision_patch_buckets(
-                    getattr(config, "precompile_vision_patch_paddings", None)
-                )
-            ),
-        )
+        if not getattr(config, "language_only", False):
+            vision_tp = resolve_encoder_tp(mesh, getattr(config, "vision_encoder_parallel", "dp"))
+            self.visual = Qwen2_5_VisionTransformer(
+                config=self.visual_config,
+                dtype=self.dtype,
+                rngs=rngs,
+                mesh=mesh,
+                norm_eps=getattr(self.visual_config, "rms_norm_eps", 1e-6),
+                vision_tp=vision_tp,
+                input_buckets=tuple(
+                    resolve_vision_patch_buckets(
+                        getattr(config, "precompile_vision_patch_paddings", None)
+                    )
+                ),
+            )
 
     def get_input_embeddings(self) -> Callable[[jax.Array], jax.Array]:
         return self.model.embed_tokens
 
     def precompile_multimodal(self) -> None:
-        self.visual.precompile()
+        if hasattr(self, "visual"):
+            self.visual.precompile()
 
     def get_multimodal_embedding_packed_capacities(self) -> tuple[int, ...]:
+        if not hasattr(self, "visual"):
+            return ()
         rows = encoder_num_lanes(self.mesh, self.visual.vision_tp)
         unit = self.visual.spatial_merge_unit
         return tuple(rows * bucket // unit for bucket in self.visual.input_buckets)
@@ -688,21 +692,23 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
 
     def load_weights(self, model_config: ModelConfig) -> None:
         # Text backbone + lm_head.
-        loader = WeightLoader(
-            model=self, model_config=model_config, mesh=self.mesh, dtype=self.dtype
-        )
-        loader.load_weights_from_safetensors(self._language_weight_mappings())
-        logger.info("Qwen2.5-VL (LLM) weights loaded.")
+        if hasattr(self, "model"):
+            loader = WeightLoader(
+                model=self, model_config=model_config, mesh=self.mesh, dtype=self.dtype
+            )
+            loader.load_weights_from_safetensors(self._language_weight_mappings())
+            logger.info("Qwen2.5-VL (LLM) weights loaded.")
         # ViT weights — carry vision head info so _split_qkv_weight can slice the
         # fused ``qkv.weight`` / ``qkv.bias`` into q_proj, k_proj, v_proj.
-        vc = self.visual_config
-        vision_model_config = SimpleNamespace(
-            model_path=model_config.model_path,
-            num_attention_heads=vc.num_heads,
-            hidden_size=vc.hidden_size,
-            get_total_num_kv_heads=lambda: vc.num_heads,  # no GQA in ViT
-        )
-        self._load_vision_weights(vision_model_config)
+        if hasattr(self, "visual"):
+            vc = self.visual_config
+            vision_model_config = SimpleNamespace(
+                model_path=model_config.model_path,
+                num_attention_heads=vc.num_heads,
+                hidden_size=vc.hidden_size,
+                get_total_num_kv_heads=lambda: vc.num_heads,  # no GQA in ViT
+            )
+            self._load_vision_weights(vision_model_config)
 
     def _language_weight_mappings(self) -> dict:
         mappings = {

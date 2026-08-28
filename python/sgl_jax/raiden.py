@@ -23,12 +23,16 @@ def raiden_requested(argv: Sequence[str] | None = None) -> bool:
         elif arg.startswith("--encoder-transfer-backend="):
             encoder_requested = arg.split("=", 1)[1] == "raiden"
         elif arg in (
+            "--encoder-only",
+            "--language-only",
             "--encoder-urls",
             "--encoder-bootstrap-port",
             "--encoder-register-urls",
         ) or any(
             arg.startswith(f"{option}=")
             for option in (
+                "--encoder-only",
+                "--language-only",
                 "--encoder-urls",
                 "--encoder-bootstrap-port",
                 "--encoder-register-urls",

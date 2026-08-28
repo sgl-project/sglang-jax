@@ -46,6 +46,20 @@ class ItemTask:
 _MultimodalBatch = dict[Modality, tuple[ItemTask, ...]]
 
 
+def _encode_tasks(
+    tasks: Sequence[ItemTask],
+    encode_func,
+) -> jax.Array:
+    precomputed = [task.item.precomputed_embeddings for task in tasks]
+    if all(value is not None for value in precomputed):
+        return jnp.concatenate([jnp.asarray(value) for value in precomputed], axis=0)
+    if any(value is not None for value in precomputed):
+        raise ValueError("cannot mix local and precomputed embeddings for one modality")
+    if encode_func is None:
+        raise ValueError(f"no embedding function for modality {tasks[0].item.modality}")
+    return encode_func([task.item for task in tasks])
+
+
 def _build_item_task(
     item: MultimodalDataItem,
     token_base: int,
@@ -338,14 +352,9 @@ def embed_multimodal_inputs(
         encode_funcs = multimodal_model.get_multimodal_encode_funcs()
         for modality, tasks in multimodal_batch.items():
             encode_func = encode_funcs.get(modality)
-            if encode_func is None:
-                raise ValueError(
-                    f"no embedding function for modality {modality}; "
-                    "in-model multimodal models must expose one"
-                )
 
             if embedding_pool is None:
-                packed = encode_func([task.item for task in tasks])
+                packed = _encode_tasks(tasks, encode_func)
                 running = _gather_merge(running, packed, tasks, mesh)
                 continue
 
@@ -369,7 +378,7 @@ def embed_multimodal_inputs(
             if hit_tasks:
                 running = _gather_from_pool(running, embedding_pool, hit_tasks, hit_entries, mesh)
             if miss_tasks:
-                packed = encode_func([task.item for task in miss_tasks])
+                packed = _encode_tasks(miss_tasks, encode_func)
                 running = _gather_merge(running, packed, tuple(miss_tasks), mesh)
                 _write_misses_to_pool(embedding_pool, packed, miss_tasks)
 
