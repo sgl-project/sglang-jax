@@ -752,9 +752,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             )
 
             full_attn_backend = TTAttention(
-                self.num_attn_heads,
-                self.num_kv_heads,
-                self.model_config.head_dim,
                 page_size=self.page_size,
                 mesh=self.mesh,
             )

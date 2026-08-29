@@ -56,19 +56,13 @@ class TTTokenToKVPool(MHATokenToKVPool):
             ]
         logger.info("Created TT KV buffers in %.2f seconds", time.time() - start)
 
-    def get_fused_kv_buffer(self, layer_id):
-        return self.get_kv_buffer(layer_id)
-
-    def get_kv_buffer(self, layer_id):
-        return self.kv_buffer[layer_id - self.start_layer]
-
     def replace_buffer(self, new_buffer):
         if new_buffer is None or all(value is None for value in new_buffer):
             return
         super().replace_buffer(new_buffer)
 
 
-@register_pytree_node_class
+@jax.tree_util.register_dataclass
 @dataclass
 class TTAttentionMetadata:
     page_table: jax.Array | None = None
@@ -77,21 +71,6 @@ class TTAttentionMetadata:
     prefill_chunk_start: jax.Array | None = None
     prefill_input_indices: jax.Array | None = None
     prefill_output_indices: jax.Array | None = None
-
-    def tree_flatten(self):
-        children = (
-            self.page_table,
-            self.positions,
-            self.fill_page_table,
-            self.prefill_chunk_start,
-            self.prefill_input_indices,
-            self.prefill_output_indices,
-        )
-        return children, None
-
-    @classmethod
-    def tree_unflatten(cls, _aux_data, children):
-        return cls(*children)
 
 
 def _pad_page_table(table: np.ndarray, users: int) -> np.ndarray:
@@ -146,30 +125,17 @@ class TTAttention(AttentionBackend):
         "enable_trace": "true",
     }
 
-    def __init__(
-        self,
-        num_attn_heads: int,
-        num_kv_heads: int,
-        head_dim: int,
-        page_size: int,
-        mesh: jax.sharding.Mesh,
-    ):
+    def __init__(self, page_size: int, mesh: jax.sharding.Mesh):
         if page_size < 32 or page_size % 32:
             raise ValueError("TT attention requires a page size divisible by 32")
         if mesh.shape["data"] != 1:
             raise NotImplementedError("TT attention currently supports dp_size=1 only")
-        self.num_heads = num_attn_heads
-        self.num_kv_heads = num_kv_heads or num_attn_heads
-        self.head_dim = head_dim
         self.page_size = page_size
         self.mesh = mesh
         self.forward_metadata = nnx.data(TTAttentionMetadata())
 
     def tree_flatten(self):
         return (self.forward_metadata,), {
-            "num_attn_heads": self.num_heads,
-            "num_kv_heads": self.num_kv_heads,
-            "head_dim": self.head_dim,
             "page_size": self.page_size,
             "mesh": self.mesh,
         }

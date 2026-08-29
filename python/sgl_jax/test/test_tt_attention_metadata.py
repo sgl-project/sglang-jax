@@ -23,13 +23,7 @@ class TTAttentionMetadataTest(unittest.TestCase):
         )
 
     def setUp(self):
-        self.backend = TTAttention(
-            num_attn_heads=8,
-            num_kv_heads=2,
-            head_dim=128,
-            page_size=32,
-            mesh=self.mesh,
-        )
+        self.backend = TTAttention(page_size=32, mesh=self.mesh)
 
     @staticmethod
     def _batch(
@@ -48,10 +42,8 @@ class TTAttentionMetadataTest(unittest.TestCase):
 
         input_bucket = 1 << max(6, (sum(chunk_tokens) - 1).bit_length())
         input_ids = np.zeros(input_bucket, dtype=np.int32)
-        out_cache_loc = np.full(input_bucket, -1, dtype=np.int32)
 
         cache_locations = []
-        chunk_locations = []
         start = 32
         for prefix_length, chunk_length in zip(prefix_tokens, chunk_tokens):
             total_tokens = prefix_length + chunk_length
@@ -60,24 +52,16 @@ class TTAttentionMetadataTest(unittest.TestCase):
                 start, start + cache_capacity, dtype=np.int32
             )
             cache_locations.append(user_locations)
-            chunk_locations.append(
-                user_locations[prefix_length : prefix_length + chunk_length]
-            )
             start += cache_capacity
-        out_cache_loc[: sum(chunk_tokens)] = np.concatenate(chunk_locations)
 
         return SimpleNamespace(
             input_ids=input_ids,
             seq_lens=np.add(prefix_tokens, chunk_tokens, dtype=np.int32),
-            out_cache_loc=out_cache_loc,
             cache_loc=np.concatenate(cache_locations),
             extend_seq_lens=np.asarray(chunk_tokens, dtype=np.int32),
             extend_prefix_lens=np.asarray(prefix_tokens, dtype=np.int32),
             real_bs=batch_size,
-            real_bs_per_dp=[batch_size],
             logits_indices_selector=np.arange(batch_size, dtype=np.int32),
-            dp_size=1,
-            per_dp_bs_size=batch_size,
         )
 
     def test_first_scheduler_chunk_uses_bucketed_attention_shape(self):
@@ -206,13 +190,7 @@ class TTAttentionMetadataTest(unittest.TestCase):
     def test_data_parallelism_is_rejected(self):
         mesh = SimpleNamespace(shape={"data": 2})
         with self.assertRaisesRegex(NotImplementedError, "dp_size=1"):
-            TTAttention(
-                num_attn_heads=8,
-                num_kv_heads=2,
-                head_dim=128,
-                page_size=32,
-                mesh=mesh,
-            )
+            TTAttention(page_size=32, mesh=mesh)
 
     def test_decode_metadata_pads_after_live_requests(self):
         batch = SimpleNamespace(
@@ -238,7 +216,6 @@ class TTAttentionMetadataTest(unittest.TestCase):
             start + np.arange(32, dtype=np.int32) for start in page_starts
         ]
         batch.cache_loc = np.concatenate(cache_pages)
-        batch.out_cache_loc = np.concatenate(cache_pages[8:])
 
         metadata = self.backend._prefill_metadata(batch)
 

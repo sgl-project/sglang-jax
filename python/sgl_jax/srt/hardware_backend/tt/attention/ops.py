@@ -3,36 +3,9 @@
 from __future__ import annotations
 
 import jax.numpy as jnp
+from jax._src.interpreters import mlir
 from jax.extend import core
 from jax.extend.mlir import ir
-from jax.extend.mlir.dialects import stablehlo
-from jax.interpreters import mlir
-
-
-def custom_call(
-    name,
-    operands,
-    result_types,
-    *,
-    backend_config="",
-    frontend_attributes=None,
-):
-    i32 = ir.IntegerType.get_signless(32)
-    op = stablehlo.CustomCallOp(
-        result_types,
-        operands,
-        ir.StringAttr.get(name),
-        backend_config=ir.StringAttr.get(backend_config),
-        api_version=ir.IntegerAttr.get(i32, 2),
-    )
-    if frontend_attributes is not None:
-        op.operation.attributes["mhlo.frontend_attributes"] = ir.DictAttr.get(
-            {
-                key: ir.StringAttr.get(value)
-                for key, value in frontend_attributes.items()
-            }
-        )
-    return op.results
 
 
 def _primitive(name):
@@ -40,12 +13,23 @@ def _primitive(name):
     primitive.def_abstract_eval(lambda result, *_operands, **_attrs: result)
 
     def lowering(_ctx, *operands, **attrs):
-        return custom_call(
+        extra_attributes = None
+        if attrs:
+            extra_attributes = {
+                "mhlo.frontend_attributes": ir.DictAttr.get(
+                    {
+                        key: ir.StringAttr.get(value)
+                        for key, value in attrs.items()
+                    }
+                )
+            }
+
+        return mlir.custom_call(
             name,
-            operands,
-            [operands[0].type],
-            frontend_attributes=attrs,
-        )
+            result_types=[operands[0].type],
+            operands=operands,
+            extra_attributes=extra_attributes,
+        ).results
 
     mlir.register_lowering(primitive, lowering, platform="tt")
     return primitive
