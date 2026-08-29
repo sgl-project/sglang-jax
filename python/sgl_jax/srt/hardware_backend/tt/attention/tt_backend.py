@@ -101,47 +101,36 @@ def _pad_page_table(table: np.ndarray, users: int) -> np.ndarray:
     )
 
 
-def _decode_page_table(
+def _page_table(
     cache_locations: np.ndarray,
     sequence_lengths: np.ndarray,
     block_size: int,
-    dp_size: int,
-    batch_size_per_dp: int,
 ) -> np.ndarray:
-    locations_per_dp = len(cache_locations) // dp_size
-    if locations_per_dp % block_size:
+    if len(cache_locations) % block_size:
         raise ValueError("TT cache-location capacity must be page-aligned")
 
     aligned_lengths = cdiv(sequence_lengths, block_size) * block_size
     page_counts = cdiv(sequence_lengths, block_size)
-    page_capacity = max(locations_per_dp // block_size, 1)
+    page_capacity = max(len(cache_locations) // block_size, 1)
     if np.any(page_counts > page_capacity):
         raise ValueError("TT sequence exceeds the cache-location page capacity")
 
-    # cache_locations is scheduler-bucketed, so its per-DP size is stable while
+    # cache_locations is scheduler-bucketed, so its capacity is stable while
     # sequences grow. Use that capacity for the page table instead of its live
-    # width to keep decode's JAX input shape fixed.
+    # width to keep the JAX input shape fixed.
     table = np.zeros(
         (len(sequence_lengths), page_capacity),
         dtype=np.int32,
     )
 
-    for dp_rank in range(dp_size):
-        row_base = dp_rank * batch_size_per_dp
-        token_base = dp_rank * locations_per_dp
-        rank_lengths = aligned_lengths[row_base : row_base + batch_size_per_dp]
-        offsets = np.zeros(batch_size_per_dp, dtype=np.int64)
-        if batch_size_per_dp > 1:
-            offsets[1:] = np.cumsum(rank_lengths[:-1], dtype=np.int64)
-
-        for local_row in range(batch_size_per_dp):
-            row = row_base + local_row
-            count = int(page_counts[row])
-            start = token_base + int(offsets[local_row])
-            locations = cache_locations[
-                start : start + int(rank_lengths[local_row]) : block_size
-            ]
-            table[row, :count] = locations[:count] // block_size
+    offsets = np.zeros(len(sequence_lengths), dtype=np.int64)
+    if len(sequence_lengths) > 1:
+        offsets[1:] = np.cumsum(aligned_lengths[:-1], dtype=np.int64)
+    for row, start in enumerate(offsets):
+        length = aligned_lengths[row]
+        count = page_counts[row]
+        locations = cache_locations[start : start + length : block_size]
+        table[row, :count] = locations[:count] // block_size
 
     return table
 
@@ -167,6 +156,8 @@ class TTAttention(AttentionBackend):
     ):
         if page_size < 32 or page_size % 32:
             raise ValueError("TT attention requires a page size divisible by 32")
+        if mesh.shape["data"] != 1:
+            raise NotImplementedError("TT attention currently supports dp_size=1 only")
         self.num_heads = num_attn_heads
         self.num_kv_heads = num_kv_heads or num_attn_heads
         self.head_dim = head_dim
@@ -206,26 +197,14 @@ class TTAttention(AttentionBackend):
         raise ValueError(f"TT attention does not support {batch.forward_mode}")
 
     def _decode_metadata(self, batch: ModelWorkerBatch) -> TTAttentionMetadata:
-        batch_size_per_dp = max(max(batch.real_bs_per_dp), 1)
-        sequence_lengths = np.zeros(
-            batch.dp_size * batch_size_per_dp, dtype=np.int32
-        )
-        source_lengths = np.asarray(batch.seq_lens, dtype=np.int32)
-        for dp_rank, real_batch_size in enumerate(batch.real_bs_per_dp):
-            source = dp_rank * batch.per_dp_bs_size
-            target = dp_rank * batch_size_per_dp
-            sequence_lengths[target : target + real_batch_size] = source_lengths[
-                source : source + real_batch_size
-            ]
+        sequence_lengths = np.asarray(batch.seq_lens, dtype=np.int32)[: batch.real_bs]
 
         users = max(len(batch.input_ids), 1)
         page_table = _pad_page_table(
-            _decode_page_table(
+            _page_table(
                 np.asarray(batch.cache_loc, dtype=np.int32),
                 sequence_lengths,
                 self.page_size,
-                batch.dp_size,
-                batch_size_per_dp,
             ),
             users,
         )
@@ -243,7 +222,6 @@ class TTAttention(AttentionBackend):
         return metadata
 
     def _prefill_metadata(self, batch: ModelWorkerBatch) -> TTAttentionMetadata:
-        real_batch_size = int(batch.real_bs)
         active_slots = np.asarray(batch.logits_indices_selector, dtype=np.int32)
         chunk_lengths = np.asarray(batch.extend_seq_lens, dtype=np.int32)[active_slots]
         prefix_lengths = np.asarray(batch.extend_prefix_lens, dtype=np.int32)[
@@ -260,26 +238,19 @@ class TTAttention(AttentionBackend):
         bucket_pages = max(16, 1 << (max_live_pages - 1).bit_length())
         tokens_per_sequence = bucket_pages * self.page_size
 
-        page_table = _decode_page_table(
+        page_table = _page_table(
             np.asarray(batch.cache_loc, dtype=np.int32),
             np.asarray(batch.seq_lens, dtype=np.int32),
             self.page_size,
-            batch.dp_size,
-            batch.per_dp_bs_size,
         )[active_slots]
 
-        # SGLang packs each request's live tokens inside a per-DP token bucket.
+        # SGLang packs each request's live tokens inside an input bucket.
         # Repack those ragged ranges into rectangular TT rows and remember how
         # to restore the scheduler layout after attention.
-        tokens_per_dp = len(batch.input_ids) // batch.dp_size
-        chunk_lengths_2d = np.asarray(
-            batch.extend_seq_lens, dtype=np.int32
-        ).reshape(batch.dp_size, batch.per_dp_bs_size)
+        all_chunk_lengths = np.asarray(batch.extend_seq_lens, dtype=np.int32)
         input_starts = (
-            np.cumsum(chunk_lengths_2d, axis=1, dtype=np.int32)
-            - chunk_lengths_2d
-            + np.arange(batch.dp_size, dtype=np.int32)[:, None] * tokens_per_dp
-        ).ravel()[active_slots]
+            np.cumsum(all_chunk_lengths, dtype=np.int32) - all_chunk_lengths
+        )[active_slots]
 
         token_offsets = np.arange(tokens_per_sequence, dtype=np.int32)
         input_indices = input_starts[:, None] + token_offsets
@@ -287,7 +258,7 @@ class TTAttention(AttentionBackend):
         prefill_input_indices = np.where(live_tokens, input_indices, 0)
 
         output_indices = (
-            np.arange(real_batch_size, dtype=np.int32)[:, None]
+            np.arange(len(active_slots), dtype=np.int32)[:, None]
             * tokens_per_sequence
             + token_offsets
         )

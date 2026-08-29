@@ -203,36 +203,33 @@ class TTAttentionMetadataTest(unittest.TestCase):
             np.asarray(metadata.prefill_output_indices), expected_output_indices
         )
 
-    def test_ragged_scheduler_batch_preserves_dp_segments(self):
-        rank_0_locations = np.arange(32, 32 + 256, dtype=np.int32)
-        rank_1_locations = np.pad(
-            np.arange(320, 320 + 128, dtype=np.int32), (0, 128)
-        )
+    def test_data_parallelism_is_rejected(self):
+        mesh = SimpleNamespace(shape={"data": 2})
+        with self.assertRaisesRegex(NotImplementedError, "dp_size=1"):
+            TTAttention(
+                num_attn_heads=8,
+                num_kv_heads=2,
+                head_dim=128,
+                page_size=32,
+                mesh=mesh,
+            )
+
+    def test_decode_metadata_pads_after_live_requests(self):
         batch = SimpleNamespace(
-            input_ids=np.zeros(512, dtype=np.int32),
-            seq_lens=np.asarray([100, 128, 0, 112, 0, 0], dtype=np.int32),
-            out_cache_loc=None,
-            cache_loc=np.concatenate((rank_0_locations, rank_1_locations)),
-            extend_seq_lens=np.asarray([100, 64, 0, 80, 0, 0], dtype=np.int32),
-            extend_prefix_lens=np.asarray([0, 64, 0, 32, 0, 0], dtype=np.int32),
-            real_bs=3,
-            real_bs_per_dp=[2, 1],
-            logits_indices_selector=np.asarray([0, 1, 3], dtype=np.int32),
-            dp_size=2,
-            per_dp_bs_size=3,
+            input_ids=np.zeros(4, dtype=np.int32),
+            seq_lens=np.asarray([32, 64, 0, 0], dtype=np.int32),
+            cache_loc=np.arange(32, 160, dtype=np.int32),
+            real_bs=2,
         )
 
-        metadata = self.backend._prefill_metadata(batch)
+        metadata = self.backend._decode_metadata(batch)
 
-        input_indices = np.asarray(metadata.prefill_input_indices)
-        np.testing.assert_array_equal(input_indices[0, :100], np.arange(100))
-        np.testing.assert_array_equal(input_indices[1, :64], np.arange(100, 164))
-        np.testing.assert_array_equal(input_indices[2, :80], np.arange(256, 336))
-
-        fill_page_table = np.asarray(metadata.fill_page_table)
-        np.testing.assert_array_equal(fill_page_table[0, :4], np.arange(1, 5))
-        np.testing.assert_array_equal(fill_page_table[1, :2], np.arange(7, 9))
-        np.testing.assert_array_equal(fill_page_table[2, :3], np.arange(11, 14))
+        np.testing.assert_array_equal(
+            np.asarray(metadata.page_table)[:, 0], [1, 2, 0, 0]
+        )
+        np.testing.assert_array_equal(
+            np.asarray(metadata.positions), [31, 63, -1, -1]
+        )
 
     def test_scheduler_chunk_accepts_noncontiguous_physical_pages(self):
         batch = self._batch(prefix_tokens=256, chunk_tokens=256)
