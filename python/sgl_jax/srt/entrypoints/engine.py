@@ -516,6 +516,10 @@ class Engine(EngineBase):
 
 
 def _set_envs_and_config(server_args):
+    if server_args.device == "tt":
+        os.environ["JAX_USE_SHARDY_PARTITIONER"] = "0"
+        jax.config.update("jax_use_shardy_partitioner", False)
+
     # Set ulimit
     set_ulimit()
 

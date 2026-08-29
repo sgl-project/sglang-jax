@@ -312,10 +312,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         def jitted_compute_logprobs(mesh, logits, next_tokens):
             return compute_logprobs(mesh, logits, next_tokens)
 
-        @jax.jit
-        def jitted_greedy_sampler(logits_output):
-            return jnp.argmax(logits_output.next_token_logits, axis=-1).flatten()
-
         # Opt-in (SGLANG_JAX_AOT_DISPATCH=auto|1): weights enter jit as
         # ~thousands of flat args; AotDispatcher skips pjit's per-arg Python
         # dispatch (O(n_args) checks + shard_args) by caching an AOT
@@ -487,7 +483,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             )
 
         self.jitted_run_and_sample = run_and_sample_wrapper
-        self.jitted_greedy_sampler = jitted_greedy_sampler
 
     def get_available_device_memory(self):
         distributed = jax.process_count() != 1
@@ -880,8 +875,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self,
         logits_output: LogitsProcessorOutput,
         sampling_metadata: SamplingMetadata,
-        *,
-        allow_fast_greedy: bool = True,
     ) -> jax.Array:
         """Sample and compute logprobs and update logits_output.
 
@@ -892,15 +885,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         Returns:
             A list of next_token_ids
         """
-        if (
-            allow_fast_greedy
-            and getattr(self.attn_backend, "use_fast_greedy_sampler", False)
-            and sampling_metadata.is_all_greedy
-            and not sampling_metadata.do_penalties
-            and not sampling_metadata.apply_vocab_mask
-        ):
-            return self.jitted_greedy_sampler(logits_output), None, None
-
         # Advance step counter (pure Python, zero device overhead).
         # fold_in(base_key, step) inside JIT produces a unique RNG per step.
         self._sampler_step += 1

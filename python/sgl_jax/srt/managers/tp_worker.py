@@ -569,10 +569,6 @@ class ModelWorker:
                 next_token_ids_device, token_logprobs, new_logits_output = self.model_runner.sample(
                     logits_output,
                     sampling_metadata,
-                    allow_fast_greedy=not (
-                        model_worker_batch.return_logprob
-                        or model_worker_batch.return_output_logprob_only
-                    ),
                 )
                 cache_miss_count += count()
             # `selector` reorders DP-interleaved per-req tensors back to

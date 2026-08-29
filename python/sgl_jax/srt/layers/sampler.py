@@ -178,31 +178,26 @@ class Sampler(nnx.Module):
             use_sort_for_toppk_minp: whether use sort when dealing with top_k, top_k and min_p.
         """
 
-        # Apply penalties before sampling
-        logits = lax.cond(
-            sampling_metadata.do_penalties,
-            self._apply_linear_penalty,
-            lambda operands: operands[0],
-            (logits_output.next_token_logits, sampling_metadata),
-        )
+        logits = logits_output.next_token_logits
+        if sampling_metadata.do_penalties:
+            logits = self._apply_linear_penalty((logits, sampling_metadata))
+        if sampling_metadata.apply_vocab_mask:
+            logits = apply_token_bitmask(logits, sampling_metadata.vocab_mask)
 
-        # Apply grammar-constrained vocab mask
-        logits = lax.cond(
-            sampling_metadata.apply_vocab_mask,
-            lambda operands: apply_token_bitmask(operands[0], operands[1]),
-            lambda operands: operands[0],
-            (logits, sampling_metadata.vocab_mask),
-        )
+        if sampling_metadata.is_all_greedy:
+            batch_next_token_ids, logprobs = self._greedy_sampling(
+                (logits, sampling_metadata, None)
+            )
+        else:
+            _, rng = jax.random.split(
+                rng_override if rng_override is not None else self.rngs.params()
+            )
+            batch_next_token_ids, logprobs = self._regular_sampling(
+                (logits, sampling_metadata, rng, use_sort_for_toppk_minp)
+            )
 
-        _, rng = jax.random.split(rng_override if rng_override is not None else self.rngs.params())
-        operands = (logits, sampling_metadata, rng)
-        regular_fn = lambda op: self._regular_sampling((*op, use_sort_for_toppk_minp))
-        batch_next_token_ids, logprobs = lax.cond(
-            sampling_metadata.is_all_greedy,
-            self._greedy_sampling,
-            regular_fn,
-            operands,
-        )
+        if not sampling_metadata.return_logprob:
+            logprobs = None
 
         logprob_operands = (
             logits_output,

@@ -150,7 +150,6 @@ class TTAttention(AttentionBackend):
     """TTNN prefill and paged-decode attention with an in-place KV cache."""
 
     token_to_kv_pool_class = TTTokenToKVPool
-    use_fast_greedy_sampler = True
     compiler_options = {
         "experimental_enable_permute_matmul_fusion": "true",
         "optimization_level": "1",
