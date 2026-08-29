@@ -146,10 +146,12 @@ class TTAttentionMetadataTest(unittest.TestCase):
         calls = [
             equation
             for equation in graph.jaxpr.eqns
-            if equation.primitive.name
-            == "tt_chunked_scaled_dot_product_attention"
+            if equation.primitive.name == "ffi_call"
+            and equation.params["target_name"]
+            == "tt.chunked_scaled_dot_product_attention"
         ]
         self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].params["custom_call_api_version"], 4)
         self.assertEqual(calls[0].invars[0].aval.shape[0], 2)
         self.assertEqual(calls[0].invars[3].aval.shape[0], 2)
         self.assertEqual(calls[0].invars[4].aval.shape, (2,))
