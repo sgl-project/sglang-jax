@@ -31,11 +31,36 @@ GRAMMAR_BACKEND_CHOICES = ["llguidance", "none"]
 _REJECTED_PD_HOST_ALIASES = frozenset({"localhost"})
 
 
+def apply_multimodal_model_defaults(server_args, model_config) -> None:
+    if not model_config.is_multimodal:
+        return
+
+    from sgl_jax.srt.models.registry import ModelRegistry
+
+    hf_config = getattr(model_config, "hf_config", None)
+    architectures = list(getattr(hf_config, "architectures", None) or [])
+    in_model = ModelRegistry.is_in_model_multimodal(architectures)
+
+    if not in_model and not server_args.disable_radix_cache:
+        logger.info("Multimodal model detected, disabling radix cache")
+        server_args.disable_radix_cache = True
+
+    if not in_model and (
+        server_args.chunked_prefill_size is None or server_args.chunked_prefill_size > 0
+    ):
+        logger.info("Multimodal model detected, disabling chunked prefill")
+        server_args.chunked_prefill_size = -1
+    if server_args.enable_mixed_chunk and not in_model:
+        logger.info("Multimodal model does not support mixed chunk; disabling it")
+        server_args.enable_mixed_chunk = False
+    if server_args.limit_mm_data_per_request is None:
+        server_args.limit_mm_data_per_request = {"image": 16}
+
+
 def _validate_disaggregation_host_ip(host_ip: str) -> str:
     if host_ip in _REJECTED_PD_HOST_ALIASES:
         raise ValueError(
-            "--disaggregation-host-ip must be a routable address; "
-            f"got loopback alias {host_ip!r}"
+            f"--disaggregation-host-ip must be a routable address; got loopback alias {host_ip!r}"
         )
     try:
         addr = ipaddress.ip_address(host_ip)
@@ -44,8 +69,7 @@ def _validate_disaggregation_host_ip(host_ip: str) -> str:
     if addr.is_loopback or addr.is_unspecified:
         kind = "loopback" if addr.is_loopback else "bind/unspecified"
         raise ValueError(
-            "--disaggregation-host-ip must be a routable address; "
-            f"got {kind} address {host_ip!r}"
+            f"--disaggregation-host-ip must be a routable address; got {kind} address {host_ip!r}"
         )
     return host_ip
 
@@ -194,6 +218,11 @@ class ServerArgs:
 
     precompile_token_paddings: list[int] | None = None
     precompile_bs_paddings: list[int] | None = None
+    precompile_vision_patch_paddings: list[int] | None = None
+
+    # "dp" load-balances images over all mesh devices; "tp" shards ViT weights
+    # over the tensor axis and load-balances images over data-parallel groups.
+    vision_encoder_parallel: str = "dp"
 
     disable_precompile: bool = False
 
@@ -232,6 +261,8 @@ class ServerArgs:
     # Multimodal
     multimodal: bool = False
     limit_mm_data_per_request: dict[str, int] | None = None
+    mm_io_worker_num: int = 0
+    mm_processor_worker_num: int = 0
 
     enable_return_routed_experts: bool = False
     enable_expert_balance_debug: bool = False
@@ -514,6 +545,12 @@ class ServerArgs:
             self.device_indexes = None
         if self.multimodal:
             self.model_path = download_from_hf(self.model_path, allow_patterns=None)
+            if self.limit_mm_data_per_request is None:
+                self.limit_mm_data_per_request = {"image": 16}
+        if self.mm_io_worker_num < 0:
+            raise ValueError("--mm-io-worker-num must be non-negative")
+        if self.mm_processor_worker_num < 0:
+            raise ValueError("--mm-processor-worker-num must be non-negative")
 
         if self.ep_num_redundant_experts < 0:
             raise ValueError("ep_num_redundant_experts must be non-negative")
@@ -1423,6 +1460,22 @@ class ServerArgs:
             help="Set the list of batch sizes buckets for jax jit",
         )
         parser.add_argument(
+            "--precompile-vision-patch-paddings",
+            type=int,
+            nargs="+",
+            default=ServerArgs.precompile_vision_patch_paddings,
+            help="JIT buckets for the vision encoder patch dimension.",
+        )
+        parser.add_argument(
+            "--vision-encoder-parallel",
+            type=str,
+            choices=["dp", "tp"],
+            default=ServerArgs.vision_encoder_parallel,
+            help="'dp' (default) load-balances images over all mesh devices; 'tp' "
+            "shards ViT weights over the tensor axis and load-balances images over "
+            "data-parallel groups (requires tp_size > 1).",
+        )
+        parser.add_argument(
             "--disable-precompile",
             action="store_true",
             help="whether disable precompile",
@@ -1579,14 +1632,28 @@ class ServerArgs:
         parser.add_argument(
             "--multimodal",
             action="store_true",
-            help="Enable multimodal HTTP server.",
+            help=(
+                "Enable the standalone multi-stage multimodal HTTP server. "
+                "This flag is not required for multimodal models using the regular SRT runtime."
+            ),
         )
         parser.add_argument(
             "--limit-mm-data-per-request",
             type=json.loads,
             default=ServerArgs.limit_mm_data_per_request,
-            help="JSON object that limits multimodal items per request, "
-            "for example '{\"image\": 16}'.",
+            help="JSON object that limits the number of multimodal items per request, e.g. '{\"image\": 16}'.",
+        )
+        parser.add_argument(
+            "--mm-io-worker-num",
+            type=int,
+            default=ServerArgs.mm_io_worker_num,
+            help="Number of multimodal data loading workers. 0 uses the model default.",
+        )
+        parser.add_argument(
+            "--mm-processor-worker-num",
+            type=int,
+            default=ServerArgs.mm_processor_worker_num,
+            help="Number of multimodal processor workers. 0 uses the model default.",
         )
 
         # LoRA
@@ -1749,7 +1816,7 @@ class ServerArgs:
             "--disaggregation-bootstrap-timeout-seconds",
             type=float,
             default=ServerArgs.disaggregation_bootstrap_timeout_seconds,
-            help="Bootstrap-server query timeout in seconds. <=0 to " "disable.",
+            help="Bootstrap-server query timeout in seconds. <=0 to disable.",
         )
         parser.add_argument(
             "--disaggregation-pull-timeout-seconds",
@@ -1774,7 +1841,7 @@ class ServerArgs:
             "--disaggregation-orphan-reaper-interval-seconds",
             type=float,
             default=ServerArgs.disaggregation_orphan_reaper_interval_seconds,
-            help="How often the background reaper scans for orphan " "senders/receivers.",
+            help="How often the background reaper scans for orphan senders/receivers.",
         )
         parser.add_argument(
             "--disaggregation-decode-watchdog-seconds",

@@ -963,3 +963,6 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         )
         output = self.logits_processor(hidden_states, head, logits_metadata)
         return output, layers_kv_fused, layers_callback_flag, None
+
+
+EntryClass = Qwen2_5_VLForConditionalGeneration

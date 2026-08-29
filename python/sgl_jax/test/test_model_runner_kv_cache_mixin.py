@@ -1,5 +1,6 @@
 import types
 
+import jax.numpy as jnp
 import pytest
 
 from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
@@ -71,6 +72,7 @@ class _CellSizeRunner(ModelRunnerKVCacheMixin):
         self.kv_cache_dtype = jnp.bfloat16
         self.page_size = page_size
         self.use_mla_backend = True
+        self.embedding_pool_bytes = 0
         self._num_layers = num_layers
         self.server_args = ServerArgs(model_path="dummy", attention_backend=attention_backend)
         # GLM-5.2 shape: "full" at layers 0-2, then every 4th, giving 21 full layers.
@@ -291,3 +293,116 @@ def test_hybrid_pool_rejects_a_dsa_indexer_cache():
             indexer_key_dim=indexer_key_dim,
             num_indexer_layers=num_indexer_layers,
         )
+
+
+@pytest.mark.parametrize(("embedding_pool_bytes", "expected"), [(0, 700), (100, 600)])
+def test_profile_available_bytes_reserves_static_and_embedding_pool(embedding_pool_bytes, expected):
+    runner = types.SimpleNamespace(
+        get_available_device_memory=lambda: 900,
+        mem_fraction_static=0.8,
+        embedding_pool_bytes=embedding_pool_bytes,
+        linear_recurrent_config=None,
+    )
+    assert ModelRunnerKVCacheMixin._profile_available_bytes(runner, 1000) == expected
+
+
+def test_embedding_pool_bytes_only_for_in_model_prefill():
+    from sgl_jax.srt.model_executor.model_runner import _embedding_pool_bytes
+
+    config = types.SimpleNamespace(
+        is_multimodal=True,
+        hidden_size=8,
+        dtype=jnp.bfloat16,
+        hf_config=types.SimpleNamespace(architectures=["Qwen2_5_VLForConditionalGeneration"]),
+    )
+    args = types.SimpleNamespace(
+        page_size=64,
+        max_prefill_tokens=100,
+        multimodal=False,
+        enable_lora=False,
+        disaggregation_mode="null",
+    )
+    assert _embedding_pool_bytes(config, args) == 128 * 8 * 2
+    args.disaggregation_mode = "decode"
+    assert _embedding_pool_bytes(config, args) == 0
+    args.disaggregation_mode = "null"
+    args.multimodal = True
+    assert _embedding_pool_bytes(config, args) == 0
+
+
+def test_deepstack_embedding_pool_uses_packed_feature_width():
+    from sgl_jax.srt.model_executor.model_runner import (
+        ModelRunner,
+        _embedding_pool_bytes,
+    )
+
+    config = types.SimpleNamespace(
+        is_multimodal=True,
+        hidden_size=8,
+        dtype=jnp.bfloat16,
+        hf_config=types.SimpleNamespace(architectures=["Qwen2_5_VLForConditionalGeneration"]),
+    )
+    args = types.SimpleNamespace(
+        page_size=64,
+        max_prefill_tokens=100,
+        multimodal=False,
+        enable_lora=False,
+        disaggregation_mode="null",
+    )
+    model = types.SimpleNamespace(deepstack_visual_layers=3)
+    budget = _embedding_pool_bytes(config, args, multimodal_model=model)
+    assert budget == 128 * 32 * 2
+
+    runner = types.SimpleNamespace(
+        embedding_pool_bytes=budget,
+        server_args=args,
+        model_config=config,
+        model=model,
+        dtype=jnp.bfloat16,
+        mesh=None,
+        embedding_pool=None,
+    )
+    ModelRunner._build_embedding_pool(runner)
+
+    assert runner.embedding_pool.hidden == 32
+    assert runner.embedding_pool.num_pages == 2
+    assert runner.embedding_pool.pages.shape == (2, 64, 32)
+
+
+def test_embedding_pool_capacity_and_pages_follow_lm_limits():
+    from sgl_jax.srt.model_executor.model_runner import (
+        ModelRunner,
+        _embedding_pool_bytes,
+    )
+
+    config = types.SimpleNamespace(
+        is_multimodal=True,
+        hidden_size=8,
+        dtype=jnp.bfloat16,
+        hf_config=types.SimpleNamespace(architectures=["Qwen2_5_VLForConditionalGeneration"]),
+    )
+    args = types.SimpleNamespace(
+        page_size=128,
+        max_prefill_tokens=129,
+        multimodal=False,
+        enable_lora=False,
+        disaggregation_mode="null",
+    )
+    model = types.SimpleNamespace(deepstack_visual_layers=3)
+    budget = _embedding_pool_bytes(config, args, multimodal_model=model)
+    assert budget == 256 * 32 * 2
+
+    runner = types.SimpleNamespace(
+        embedding_pool_bytes=budget,
+        server_args=args,
+        model_config=config,
+        model=model,
+        dtype=jnp.bfloat16,
+        mesh=None,
+        embedding_pool=None,
+    )
+    ModelRunner._build_embedding_pool(runner)
+
+    assert runner.embedding_pool.hidden == 32
+    assert runner.embedding_pool.page_size == 128
+    assert runner.embedding_pool.num_pages == 2

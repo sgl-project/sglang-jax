@@ -4,17 +4,17 @@ title: "Qwen2.5-VL"
 
 # Qwen2.5-VL on SGL-JAX
 
-> **Validated recipe** — empirically validated on TPU v6e-4 with sglang-jax 0.1.0; §4 Benchmark is intentionally omitted (see §4 omitted note + design §3 Validated criteria interpretation).
+> **Validated recipe** — Qwen2.5-VL-32B-Instruct validated on a single TPU v7x-8 with DP4 × effective TP2, including MMMU/MMMU-Pro accuracy and a multimodal serving benchmark.
 
 ## 1. Model Introduction
 
-[**Qwen/Qwen2.5-VL**](https://huggingface.co/Qwen) is Alibaba's second-generation Qwen vision-language family — multimodal decoders that ingest images / video frames and emit text, with the same chat interface as text-only Qwen2.5. SGL-JAX serves it through the multimodal pipeline (`--multimodal`), which runs a separate ViT stage that produces vision embeddings and an autoregressive stage that does prefill/decode.
+[**Qwen/Qwen2.5-VL**](https://huggingface.co/Qwen) is Alibaba's second-generation Qwen vision-language family — multimodal decoders that ingest images / video frames and emit text, with the same chat interface as text-only Qwen2.5. SGL-JAX serves it through the regular autoregressive server, which activates the in-model vision encoder for multimodal requests before language-model prefill and decode.
 
 **Variants** (pick by size):
 
 - [**Qwen/Qwen2.5-VL-3B-Instruct**](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct) — 3B parameters; candidate single-host path on v6e-4 with `--tp-size 1`.
 - [**Qwen/Qwen2.5-VL-7B-Instruct**](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct) — 7B; candidate single-host path on v6e-4 with `--tp-size 1`.
-- [**Qwen/Qwen2.5-VL-32B-Instruct**](https://huggingface.co/Qwen/Qwen2.5-VL-32B-Instruct) — 32B; starter single-host path on v6e-4 with `--tp-size 4`.
+- [**Qwen/Qwen2.5-VL-32B-Instruct**](https://huggingface.co/Qwen/Qwen2.5-VL-32B-Instruct) — 32B; validated on v7x-8 with `--tp-size 8 --dp-size 4`.
 - [**Qwen/Qwen2.5-VL-72B-Instruct**](https://huggingface.co/Qwen/Qwen2.5-VL-72B-Instruct) — 72B; multi-host serving is pending.
 
 For the text-only Qwen3 dense recipes see [Qwen3 recipe](/autoregressive/Qwen/Qwen3).
@@ -24,7 +24,7 @@ For the text-only Qwen3 dense recipes see [Qwen3 recipe](/autoregressive/Qwen/Qw
 - **Multi-image and video input** — single chat request can mix any number of `image_url` and `video_url` content blocks alongside the text prompt; the OpenAI Vision API schema is used directly.
 - **Long-context VL** — supports the underlying Qwen2.5 32K context window (extendable to 128K with rope scaling on supported checkpoints).
 - **Instruction-tuned** — default chat behaviour; no per-request `enable_thinking` toggle (Qwen2.5 is non-reasoning; for reasoning use Qwen3).
-- **Two-stage SGL-JAX pipeline** — Qwen2.5-VL runs as a `vit` scheduler stage producing vision embeddings + an `auto_regressive` stage doing prefill/decode; `--multimodal` enables both.
+- **In-model vision encoder** — the regular autoregressive server runs vision encoding, embedding merge, LM prefill, and decode; `--vision-encoder-parallel` selects DP or TP placement for the ViT.
 
 **Recommended Generation Parameters**: `temperature=0.7`, `top_p=0.95`, `max_tokens=1024` (verify defaults against each variant's model card).
 
@@ -36,59 +36,61 @@ For the text-only Qwen3 dense recipes see [Qwen3 recipe](/autoregressive/Qwen/Qw
 
 | Model | TPU | Topology | `--tp-size` | Notes |
 |---|---|---|---|---|
-| Qwen2.5-VL-32B | **v6e-4** | 2x2 | 4 | This is the slice we walked end-to-end. Single host; v6e is 1:1 chip↔device. For 3B / 7B variants, use the same v6e-4 host with `--tp-size 1` and the launch shape in §2.3. The 72B variant needs a multi-host SGL-JAX staging path that isn't followable today. |
+| Qwen2.5-VL-32B | **v7x-8** | `2x2x1` | 8 | Single host with 4 chips / 8 JAX devices; `--dp-size 4` gives DP4 × effective TP2. |
 
-> Multimodal recipes are constrained by SGL-JAX's built-in staged runtime. Use the `--tp-size` shown for the model; a larger TPU slice is not automatically used by changing only `--tp-size`.
+The validated benchmark uses data-parallel vision-encoder placement. TP vision-encoder placement was separately verified on the same topology.
 
-See [TPU topology reference](/base/tpu-topology-reference) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](/base/tpu-topology-reference#adapting-to-other-topologies).
+See [TPU topology reference](/base/tpu-topology-reference) for the TPU generation reference. For other slices, see [Adapting to other topologies](/base/tpu-topology-reference#adapting-to-other-topologies).
 
 ### 2.2 Environment
 
-Install per [Install guide](/get_started/install). For the current single-host VL paths use [Single-host Docker template](/deployment/single-host-docker). Qwen2.5-VL 72B multi-host should stay pending until the built-in staging and scheduler path are fixed.
+Install per [Install guide](/get_started/install). For the current single-host VL path use [Single-host Docker template](/deployment/single-host-docker).
 
 Extra pip for accuracy benchmarking only:
 
 ```bash
-pip install evalscope==0.17.1
+pip install 'evalscope[app,perf]==1.5.1'
 ```
 
 ### 2.3 Launch
 
-#### Single-host — TPU v6e-4
+#### Single-host — TPU v7x-8
 
 ```bash
-JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
-  --multimodal \
+JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache \
+python -u -m sgl_jax.launch_server \
   --model-path Qwen/Qwen2.5-VL-32B-Instruct \
   --trust-remote-code \
-  --tp-size 4 \
   --device tpu \
-  --dtype bfloat16 \
-  --mem-fraction-static 0.8 \
-  --chunked-prefill-size 2048 \
-  --page-size 128 \
-  --max-running-requests 32 \
+  --tp-size 8 --dp-size 4 \
+  --dtype bfloat16 --kv-cache-dtype bf16 \
+  --context-length 32768 --max-seq-len 32768 \
+  --max-running-requests 1024 \
+  --max-prefill-tokens 16384 --chunked-prefill-size 4096 \
+  --mem-fraction-static 0.9 --page-size 128 \
+  --vision-encoder-parallel dp \
+  --mm-io-worker-num 4 \
+  --mm-processor-worker-num 16 \
+  --random-seed 0 \
   --skip-server-warmup \
   --host 0.0.0.0 --port 30000
 ```
 
-For Qwen2.5-VL-3B or Qwen2.5-VL-7B, use the same command shape but set `--model-path` to the target checkpoint and `--tp-size 1`.
-
-> `--multimodal` is required — without it, the launcher boots the text-only HTTP server which has no ViT stage and cannot consume `image_url` / `video_url` content blocks.
+The regular server recognizes the model's multimodal contract. The separate `--multimodal` staged runtime is used by diffusion recipes and is not needed here.
 
 ### 2.4 Configuration Tips
 
 **Memory Management:**
-- VL workloads use HBM for both KV cache **and** vision embeddings (ViT output). The 32B/72B variants run with lower `--mem-fraction-static` (0.8 / 0.9) than the equivalent text-only Qwen3 to leave room for vision tensors that scale with input image count.
-- Lower `--max-running-requests` (64 for VL vs 256 for text-only Qwen3 at the same size) — each VL request can carry multiple high-resolution images that explode KV demand. Raise only if you measure HBM headroom.
+- VL workloads use HBM for both KV cache **and** vision embeddings (ViT output). Leave sufficient headroom for vision tensors that scale with input image count.
+- Tune `--max-running-requests` against the target image count and resolution; each VL request can carry multiple high-resolution images that increase KV and embedding demand.
 
-**Built-in multimodal staging:**
-- SGL-JAX internally splits Qwen2.5-VL into a vision stage and an autoregressive generation stage.
-- The public launch knob is still `--tp-size`, but it must match the supported staging path for the selected model. Do not scale VL models by increasing only `--tp-size`.
-- Current cookbook paths: 3B/7B candidates use `--tp-size 1`, 32B uses `--tp-size 4`, and 72B multi-host remains pending.
+**In-model multimodal serving:**
+- Qwen2.5-VL uses the regular autoregressive server; `--multimodal` is not required.
+- `--tp-size 8 --dp-size 4` gives effective TP2 for the language model.
+- `--vision-encoder-parallel dp` load-balances images across all devices. `tp` shards the ViT attention, MLP, and merger linear weights over each replica's tensor axis.
 
 **Chunked Prefill (image embeddings):**
-- `--chunked-prefill-size 2048` bounds peak HBM during prefill. Vision-language prefills include both text tokens and vision embeddings — raising this past 4096 risks prefill-time OOM on 32B/72B variants.
+- `--chunked-prefill-size 4096` bounds peak HBM during prefill. Vision-language prefills include both text tokens and vision embeddings.
 
 **Multimodal Attention Backend:**
 - The vision-language attention path runs on the default `--attention-backend fa` (FlashAttention on Pallas) — no override needed.
@@ -97,10 +99,10 @@ For Qwen2.5-VL-3B or Qwen2.5-VL-7B, use the same command shape but set `--model-
 - `image_url` / `video_url` inputs must be fetchable **from the TPU host** — a URL that loads in your browser can still fail server-side on auth / region / firewall. Stage the media on a mounted volume and pass `file:///path/to/media`, or use a publicly reachable URL.
 
 **Compilation Cache Hygiene:**
-- `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per stage while XLA/Pallas re-compiles every kernel (ViT and AR each compile independently).
+- `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` avoids recompiling the vision and autoregressive kernels after restart.
 - The cache keys on full kernel shape: changing `--page-size`, `--tp-size`, image resolution buckets, or `--context-length` invalidates cached entries.
 
-For full flag definitions see [Launch flags reference](/base/launch-flags-reference); run `python -m sgl_jax.launch_server --multimodal --help` to see multimodal-specific flags.
+For full flag definitions see [Launch flags reference](/base/launch-flags-reference); run `python -m sgl_jax.launch_server --help` to see the available flags.
 
 ## 3. Invocation
 
@@ -197,7 +199,7 @@ The 'before' shot shows an empty workshop floor; the 'after' shot shows the same
 
 #### Video
 
-Use a `video_url` content block — same schema as `image_url`. The server samples frames from the video and feeds them through the ViT stage:
+Use a `video_url` content block — same schema as `image_url`. The server samples frames from the video and feeds them through the in-model vision encoder:
 
 ```python
 messages = [
@@ -232,9 +234,141 @@ print(response.choices[0].message.content)
 
 ## 4. Benchmark
 
-> Benchmark section is intentionally omitted — Qwen2.5-VL is a Starter recipe (banner). All §4.1 Accuracy / §4.2 Speed cells are pending real PR-back measurements. When you run a numbered MMMU / MMMU Pro Vision / DocVQA / ChartQA eval against the model on TPU, file a PR adding the §4 block back with the actual numbers and upgrade the banner to Partially validated or Validated. For the canonical four-part §4 form (Test Environment / Deployment Command / Benchmark Command / Test Results) see any Validated recipe in [Autoregressive index](/autoregressive).
->
-> Note: `bench_serving` does not have native multimodal input support today, so §4.2 Speed needs a custom OpenAI-client load test driving the §3.2 multi-image / video patterns; PR back full TTFT / ITL / output tok/s along with the image resolution and prompt template used.
+The data below is a snapshot of Qwen2.5-VL-32B-Instruct on a single TPU v7x-8. Accuracy and performance use separate context sizes, recorded in their respective test environments.
+
+### 4.1 Accuracy — MMMU and MMMU-Pro Vision
+
+**Test Environment**
+
+| Field | Value |
+|---|---|
+| Hardware | TPU v7x-8, single host, 4 chips / 8 JAX devices |
+| Model | `Qwen/Qwen2.5-VL-32B-Instruct` |
+| Parallelism | DP4 × effective TP2 (`--tp-size 8 --dp-size 4`) |
+| Precision | BF16 model, vision, and KV; no quantization |
+| Context / max sequence | 32768 / 32768 |
+| Evaluator | EvalScope 1.5.1, OpenAI-compatible API |
+| Generation | `max_tokens=8192`, temperature 0, seed 42 |
+| Evaluation batch size | 24 |
+
+**Deployment Command** — use the [§2.3 v7x-8 launch command](/autoregressive/Qwen/Qwen2.5-VL#2-3-launch).
+
+**Benchmark Command**
+
+```python
+from evalscope import TaskConfig, run_task
+
+task_cfg = TaskConfig(
+    model="Qwen/Qwen2.5-VL-32B-Instruct",
+    api_url="http://127.0.0.1:30000/v1",
+    api_key="EMPTY",
+    eval_type="openai_api",
+    datasets=["mmmu", "mmmu_pro"],
+    dataset_hub="huggingface",
+    dataset_args={
+        "mmmu": {"dataset_id": "MMMU/MMMU"},
+        "mmmu_pro": {
+            "dataset_id": "MMMU/MMMU_Pro",
+            "extra_params": {"dataset_format": "vision"},
+        },
+    },
+    eval_batch_size=24,
+    generation_config={
+        "max_tokens": 8192,
+        "temperature": 0.0,
+        "stream": False,
+    },
+    seed=42,
+    work_dir="./outputs/qwen25vl32b_vlm",
+)
+
+run_task(task_cfg=task_cfg)
+```
+
+**Test Results**
+
+| Dataset | Metric | Samples | Score |
+|---|---|---:|---:|
+| MMMU Val | Mean Accuracy | 900 | **62.67%** |
+| MMMU-Pro Vision | Mean Accuracy | 1,730 | **47.75%** |
+
+### 4.2 Speed — single multimodal workload
+
+> **Multimodal throughput row.** The workload submits 1,000 requests at an unbounded request rate. Each request contains 1,024 random source-text tokens and one random 512×512 JPEG, averages 1,097.23 text tokens plus 326.00 vision tokens after chat templating, and generates 500 output tokens. The run uses one warmup request and flushes the cache before measurement.
+
+**Test Environment**
+
+| Field | Value |
+|---|---|
+| Hardware | TPU v7x-8, single host, 4 chips / 8 JAX devices |
+| Model | `Qwen/Qwen2.5-VL-32B-Instruct` |
+| Parallelism | DP4 × effective TP2 (`--tp-size 8 --dp-size 4`) |
+| Precision | BF16 model, vision, and KV; no quantization |
+| Context / max sequence | 2048 / 2048 |
+| Preprocessing | 4 I/O workers, 16 processor workers |
+| Cache | Radix Cache disabled; cache flushed before each case |
+| Traffic | 1,000 requests, request rate `inf`, 500 output tokens |
+
+**Serving Flags Used**
+
+```bash
+JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache \
+python -u -m sgl_jax.launch_server \
+  --model-path Qwen/Qwen2.5-VL-32B-Instruct \
+  --trust-remote-code --skip-server-warmup \
+  --device tpu --tp-size 8 --dp-size 4 \
+  --dtype bfloat16 --kv-cache-dtype bf16 \
+  --context-length 2048 --max-seq-len 2048 \
+  --max-running-requests 1024 \
+  --max-prefill-tokens 16384 --chunked-prefill-size 4096 \
+  --mem-fraction-static 0.9 --page-size 128 \
+  --disable-radix-cache --vision-encoder-parallel dp \
+  --mm-io-worker-num 4 --mm-processor-worker-num 16 \
+  --random-seed 0 --host 0.0.0.0 --port 30000
+```
+
+**Benchmark Command**
+
+```bash
+python -m sgl_jax.bench_serving \
+  --backend sglang-oai-chat \
+  --host 127.0.0.1 --port 30000 \
+  --model Qwen/Qwen2.5-VL-32B-Instruct \
+  --tokenizer Qwen/Qwen2.5-VL-32B-Instruct \
+  --dataset-name image \
+  --num-prompts 1000 \
+  --random-input-len 1024 --random-output-len 500 \
+  --random-range-ratio 1.0 \
+  --image-count 1 --image-resolution 512x512 \
+  --image-format jpeg --image-content random \
+  --request-rate inf \
+  --seed 0 --warmup-requests 1 --flush-cache --output-details
+```
+
+**Test Results**
+
+| Metric | Result |
+|---|---:|
+| Successful requests | 1,000 |
+| Avg text input tokens / request | 1,097.23 |
+| Avg vision input tokens / request | 326.00 |
+| Avg total input tokens / request | 1,423.24 |
+| Output tokens / request | 500 |
+| Mean TTFT | 19,145.39 ms |
+| Median TTFT | 15,025.80 ms |
+| P99 TTFT | 55,411.70 ms |
+| Duration | 66.641 s |
+| Request throughput | 15.006 req/s |
+| Input token throughput | 21,356.74 tok/s |
+| Output token throughput | 7,502.88 tok/s |
+| Total token throughput | 28,859.62 tok/s |
+| Mean TPOT | 69.91 ms |
+| Median TPOT | 74.01 ms |
+| P99 TPOT | 99.35 ms |
+| Median E2E latency | 52,066.95 ms |
+| P99 E2E latency | 66,011.26 ms |
+
+This is a saturated burst workload, so TTFT includes scheduler queueing in addition to multimodal preprocessing, vision encoding, embedding merge, and LM prefill.
 
 ## Additional Resources
 
