@@ -274,7 +274,7 @@ suites = {
         TestFile("python/sgl_jax/test/kernels/fused_moe_v2_test.py", 3),
         TestFile("python/sgl_jax/test/kernels/biased_topk_test.py", 1, runner="pytest"),
         TestFile("python/sgl_jax/test/kernels/grouped_topk_test.py", 1, runner="pytest"),
-        TestFile("python/sgl_jax/test/test_sampler.py", 0.2),
+        TestFile("python/sgl_jax/test/test_sampler.py", 0.5),
         TestFile("python/sgl_jax/test/test_sampler_deterministic_cond.py", 0.3),
         TestFile("python/sgl_jax/test/test_utils.py", 0.1),
         TestFile("python/sgl_jax/test/mem_cache/test_kv_cache.py", 0.7),
@@ -305,6 +305,17 @@ suites = {
     # have a conditional CPU pin gated on USE_DEVICE_TYPE=cpu — the
     # cpu-test CI job sets that env var.
     "unit-test-cpu": [
+        TestFile(
+            "python/sgl_jax/test/test_embedding_pool.py",
+            0.1,
+            runner="pytest",
+        ),
+        TestFile(
+            "python/sgl_jax/test/multimodal/test_qwen_vl_processor.py",
+            0.1,
+            runner="pytest",
+        ),
+        TestFile("test/srt/test_radix_input_ids.py", 0.1, runner="pytest"),
         TestFile("test/srt/test_tokenizer_manager_event.py", 0.1),
         TestFile("test/srt/disaggregation/test_pd_auth.py", 0.3, runner="pytest"),
         TestFile("test/srt/disaggregation/test_pd_bootstrap.py", 0.5, runner="pytest"),
@@ -434,8 +445,14 @@ suites = {
         TestFile("test/srt/test_recurrent_track_scatter.py", 0.3),
         TestFile("test/srt/test_recurrent_split_equivalence.py", 0.3),
         TestFile("test/srt/test_prepare_for_extend_protected_len.py", 0.2),
+        TestFile("test/srt/test_native_attention_paged_decode.py", 1),
     ],
     "unit-test-tpu-v6e-4": [
+        TestFile(
+            "test/srt/multimodal/test_in_model_multimodal.py",
+            1,
+            runner="pytest",
+        ),
         TestFile("python/sgl_jax/test/test_mesh.py", 0.4),
         TestFile("python/sgl_jax/test/test_linear_tp.py", 0.3, runner="pytest"),
         TestFile(

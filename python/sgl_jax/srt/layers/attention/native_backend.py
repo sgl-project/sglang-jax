@@ -101,10 +101,11 @@ class NativeAttention(AttentionBackend):
             forward_batch.extend_seq_lens,
             layer.q_head_num,
             layer.kv_head_num,
-            scale,
-            is_causal,
-            forward_batch.forward_mode,
-            self.kv_sharding,
+            page_size=token_to_kv_pool.page_size,
+            scale=scale,
+            is_causal=is_causal,
+            mode=forward_batch.forward_mode,
+            kv_sharding=self.kv_sharding,
             mesh=self.mesh,
             xai_temperature_len=xai_temp_len,
             attention_sink=attention_sink,
@@ -176,6 +177,8 @@ def forward_attention(
     extend_seq_lens: jax.Array,
     num_heads,
     num_kv_heads,
+    *,
+    page_size: int,
     scale=None,
     is_causal=True,
     mode=ForwardMode.DECODE,
@@ -200,6 +203,7 @@ def forward_attention(
         extend_seq_lens: sequence lengths of each batch in extend mode
         num_heads: number of query heads
         num_kv_heads: number of key/value heads
+        page_size: KV pool page size; decode `loc` blocks are page-aligned per request
         scale: scale for the attention weights
         xai_temperature_len: length of the xai temperature
         attention_sink: per-head bias for phantom attention sink token
@@ -293,9 +297,12 @@ def forward_attention(
             is_causal,
             sliding_window_size,
             mesh=mesh,
+            page_size=page_size,
         )
     else:
-        attn_logits = _apply_decode_mask(attn_logits, seq_lengths, sliding_window_size, mesh=mesh)
+        attn_logits = _apply_decode_mask(
+            attn_logits, seq_lengths, page_size, sliding_window_size, mesh=mesh
+        )
 
     # Softmax (with optional attention sink)
     # Cast to softmax_dtype if specified for improved numerical stability
@@ -335,10 +342,14 @@ def _apply_extend_mask(
     is_causal: bool = True,
     sliding_window_size: int | None = None,
     mesh: Mesh | None = None,
+    *,
+    page_size: int,
 ):
     """
     Applies a block-diagonal and optionally a causal/SWA mask in a unified,
     efficient way, correctly handling padding.
+
+    page_size: KV pool page size; extend `loc` blocks are page-aligned per request.
     """
     query_len, _, key_len = attn_weights.shape
 
@@ -351,17 +362,24 @@ def _apply_extend_mask(
 
     # --- Create validity masks to handle padding ---
     q_valid_mask = jnp.arange(query_len) < jnp.sum(extend_seq_lens)
-    k_valid_mask = jnp.arange(key_len) < jnp.sum(seq_lengths)
 
     # --- 1. Generate Batch IDs (Optimized) ---
     q_starts = jnp.cumsum(extend_seq_lens, dtype=jnp.int32) - extend_seq_lens
     q_batch_indicators = jnp.zeros(query_len, dtype=jnp.int32).at[q_starts].set(1)
     q_batch_ids = jnp.cumsum(q_batch_indicators, dtype=jnp.int32) - 1
 
-    full_seq_lens = seq_lengths
-    k_starts = jnp.cumsum(full_seq_lens, dtype=jnp.int32) - full_seq_lens
+    # `cache_loc` blocks are page-aligned per request (_merge_cache_loc), so the block
+    # offsets step by the aligned lengths while each block's valid span stays at the real
+    # length; the gap in between is that request's page tail.
+    aligned_lengths = ((seq_lengths + page_size - 1) // page_size) * page_size
+    k_starts = jnp.cumsum(aligned_lengths, dtype=jnp.int32) - aligned_lengths
     k_batch_indicators = jnp.zeros(key_len, dtype=jnp.int32).at[k_starts].set(1)
     k_batch_ids = jnp.cumsum(k_batch_indicators, dtype=jnp.int32) - 1
+
+    # Per-column end, not a single `arange < sum(seq_lens)`: k_batch_ids assigns every
+    # column to some request, so only an end term excludes the page tails. It subsumes the
+    # trailing batch padding the scalar bound used to cut.
+    k_valid_mask = jnp.arange(key_len) < (k_starts + seq_lengths)[k_batch_ids]
 
     # --- 2. Create block-diagonal mask ---
     final_mask = q_batch_ids[:, None] == k_batch_ids[None, :]
@@ -399,6 +417,7 @@ def _apply_extend_mask(
 def _apply_decode_mask(
     attn_weights: jax.Array,
     seq_lengths: jax.Array,
+    page_size: int,
     sliding_window_size: int | None = None,
     mesh: Mesh | None = None,
 ):
@@ -412,7 +431,10 @@ def _apply_decode_mask(
 
     def create_decode_sequence_mask():
         total_prefix_len = key_len
-        seq_starts = jnp.cumsum(jnp.concatenate([jnp.array([0]), seq_lengths[:-1]]))
+        # `cache_loc` blocks are page-aligned per request (_merge_cache_loc), so the offsets
+        # step by aligned lengths while each span stays at the real length, excluding page tails.
+        aligned_lengths = ((seq_lengths + page_size - 1) // page_size) * page_size
+        seq_starts = jnp.cumsum(jnp.concatenate([jnp.array([0]), aligned_lengths[:-1]]))
         seq_ends = seq_starts + seq_lengths
         all_positions = jnp.arange(total_prefix_len)
         seq_mask = (all_positions[None, :] >= seq_starts[:, None]) & (

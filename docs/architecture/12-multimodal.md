@@ -2,11 +2,13 @@
 
 ## Module Overview
 
-sglang-jax's multimodal subsystem is an independent parallel architecture supporting text-to-image / video (Wan), vision-language understanding (Qwen2.5-VL), omni-modal (Qwen3-Omni), and audio (MiMo Audio) modalities. Unlike the single-Scheduler architecture used for text inference, multimodal uses a `GlobalScheduler` to orchestrate a multi-stage pipeline, with each stage owning its own Scheduler, Model Executor, and device mesh. The reason for adopting an independent multi-stage architecture rather than reusing the text engine is that multimodal tasks have computational patterns fundamentally different from autoregressive text generation: Diffusion requires fixed-step iterative denoising, ViT processes the full image patch grid in one pass, VAE needs large memory blocks for latent decoding — these stages have different scheduling strategies, memory management, and parallelism patterns, and cannot be unified into the text engine's prefill-decode loop.
+sglang-jax's standalone multimodal subsystem is an independent parallel architecture supporting text-to-image / video (Wan), vision-language understanding (Qwen2.5-VL), omni-modal (Qwen3-Omni), and audio (MiMo Audio) modalities. The newly added in-model path is now a supported execution path for regular autoregressive multimodal models through the standard SRT prefill-decode loop. The standalone runtime uses a `GlobalScheduler` to orchestrate multi-stage workloads, with each stage owning its own Scheduler, Model Executor, and device mesh. Diffusion requires fixed-step iterative denoising, ViT processes the full image patch grid in one pass, and VAE needs large memory blocks for latent decoding, so these stages retain their own scheduling strategies, memory management, and parallelism patterns.
+
+Here, `model_config.is_multimodal` describes whether the model accepts multimodal inputs, `server_args.multimodal` selects this standalone runtime, and `ModelRegistry.is_in_model_multimodal(...)` identifies architectures whose encoder is integrated into the regular SRT `ModelRunner`.
 
 Multimodal mode automatically disables the radix cache because the prefix-sharing rate of multimodal requests is extremely low — each image/video's visual token sequence is highly unlikely to overlap with another request's, so the maintenance overhead of the radix tree (LRU tracking, refcounts, eviction logic) yields no payoff in prefix reuse.
 
-**`Modality` enum** (`multimodal/common/modality_enum.py`): `IMAGE`, `MULTI_IMAGES`, `VIDEO`, `AUDIO`
+**`Modality` enum** (`multimodal/common/modality_enum.py`): `IMAGE`, `MULTI_IMAGES`, `VIDEO`, `AUDIO`. `MULTI_IMAGES` is retained for legacy compatibility; new multi-image requests use multiple `IMAGE` items.
 
 ![Multimodal request processing flow](images/12-multimodal-request-flow.svg)
 
@@ -346,7 +348,7 @@ Auto-behaviors when `multimodal` is enabled:
 | `Stage` | `multimodal/manager/stage.py` | Pipeline stage definition |
 | `DeviceManager` | `multimodal/manager/device_manager.py` | Device mesh allocation (greedy in-order) |
 | `StageConfigRegistry` | `multimodal/models/static_configs/` | Mapping from model name → stage config YAML |
-| `Modality` | `multimodal/common/modality_enum.py` | Modality enum (IMAGE/MULTI_IMAGES/VIDEO/AUDIO) |
+| `Modality` | `multimodal/common/modality_enum.py` | Modality enum (IMAGE/VIDEO/AUDIO) |
 | `DataType` | `multimodal/manager/io_struct.py` | Request data-type enum (IMAGE/VIDEO/AUDIO) |
 | `GenerateMMReqInput` | `multimodal/manager/io_struct.py` | Image/video generation request |
 | `TokenizedGenerateMMReqInput` | `multimodal/manager/io_struct.py` | Tokenized image/video generation request (ZMQ transport) |

@@ -67,10 +67,26 @@ class _ModelRegistry:
 
         return self._raise_for_unsupported(architectures)
 
+    def is_in_model_multimodal(self, architectures: str | list[str]) -> bool:
+        from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
+
+        try:
+            model_cls, _ = self.resolve_model_cls(architectures)
+        except ValueError:
+            return False
+        return issubclass(model_cls, InModelMultimodalContract)
+
 
 @lru_cache
-def import_model_classes():
-    model_arch_name_to_cls = {}
+def import_model_classes() -> dict[str, type[Any]]:
+    model_arch_name_to_cls: dict[str, type[Any]] = {}
+
+    def register(model_cls: type[Any]) -> None:
+        assert (
+            model_cls.__name__ not in model_arch_name_to_cls
+        ), f"Duplicated model implementation for {model_cls.__name__}"
+        model_arch_name_to_cls[model_cls.__name__] = model_cls
+
     package_name = "sgl_jax.srt.models"
     package = importlib.import_module(package_name)
     for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
@@ -83,16 +99,10 @@ def import_model_classes():
             if hasattr(module, "EntryClass"):
                 entry = module.EntryClass
                 if isinstance(entry, list):  # To support multiple model classes in one module
-                    for tmp in entry:
-                        assert (
-                            tmp.__name__ not in model_arch_name_to_cls
-                        ), f"Duplicated model implementation for {tmp.__name__}"
-                        model_arch_name_to_cls[tmp.__name__] = tmp
+                    for model_cls in entry:
+                        register(model_cls)
                 else:
-                    assert (
-                        entry.__name__ not in model_arch_name_to_cls
-                    ), f"Duplicated model implementation for {entry.__name__}"
-                    model_arch_name_to_cls[entry.__name__] = entry
+                    register(entry)
 
     return model_arch_name_to_cls
 
