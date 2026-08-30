@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from sgl_jax.srt.kernels.ragged_paged_attention.util import cdiv, get_dtype_packing
 
@@ -171,6 +172,38 @@ def create_decode_uniform_data(
         cache_loc,
         distribution,
     )
+
+
+def create_tree_mask(
+    *,
+    batch_size: int,
+    draft_token_num: int,
+    kv_len: int,
+    aligned_kv_len: int,
+    seed: int = 42,
+):
+    """Tree attention mask in the layout the kernel reads today: one flat int32
+    array holding a [draft_token_num, aligned_kv_len] block per sequence.
+
+    Shaped after what ``eagle_util.build_tree_mask_for_draft_decode`` and the
+    tree-structure kernel produce: the committed prefix is all ones (every
+    draft token attends to all of it) and only the trailing
+    ``draft_token_num x draft_token_num`` corner carries tree structure. Mask
+    content does not affect kernel timing -- the cost is structural -- but
+    keeping it faithful avoids anyone reading a degenerate all-ones result as
+    representative.
+
+    Row width is the page-aligned kv length, i.e. the ``cu_kv_lens`` delta, so
+    this pairs with ``mask_aligned_to_cu_kv=True``.
+    """
+    prefix_len = kv_len - draft_token_num
+    rng = np.random.default_rng(seed)
+    corner = rng.integers(0, 2, size=(draft_token_num, draft_token_num), dtype=np.int64)
+    np.fill_diagonal(corner, 1)  # a draft token always attends to itself
+    block = np.zeros((draft_token_num, aligned_kv_len), dtype=np.int32)
+    block[:, :prefix_len] = 1
+    block[:, prefix_len:kv_len] = corner.astype(np.int32)
+    return jnp.asarray(np.tile(block, (batch_size, 1)).reshape(-1))
 
 
 def create_target_verify_uniform_data(
