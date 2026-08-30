@@ -8,6 +8,7 @@ import random
 import re
 import shutil
 import string
+import warnings
 from typing import Any
 
 import jax
@@ -35,6 +36,15 @@ def _extract_marker_durations_ms(trace: dict[str, Any], task: str | None = None)
                 elif "dur" in e:
                     durations_ms.append(float(e["dur"]) / 1e3)
             return durations_ms
+        warnings.warn(
+            f"no trace event name matched task={task!r}; falling back to MARKER scope "
+            "events, whose durations are host-side and NOT comparable to the "
+            "device_duration_ps used on the matching path. Two runs measured through "
+            "different paths cannot be compared. Check that `task` matches the "
+            "pallas_call name exactly.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     # Fallback: use MARKER-based extraction
     marker_events: list[dict[str, Any]] = []
