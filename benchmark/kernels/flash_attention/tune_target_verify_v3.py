@@ -22,14 +22,13 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-from utils import create_target_verify_uniform_data, create_tree_mask
+from utils import create_target_verify_uniform_data, create_tree_mask_rank3
 
 from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import (
     get_vmem_estimate_bytes,
     get_vmem_limit,
     ragged_paged_attention,
 )
-from sgl_jax.srt.kernels.ragged_paged_attention.util import cdiv
 from sgl_jax.srt.kernels.utils.perf import multiple_iteration_timeit_from_trace
 from sgl_jax.srt.utils.jax_utils import get_device_name
 
@@ -126,7 +125,6 @@ def _benchmark_one(
             distribution,
             custom_mask=custom_mask,
             causal=0 if use_mask else 1,
-            mask_aligned_to_cu_kv=use_mask,
             sm_scale=sm_scale,
             sliding_window=sliding_window,
             chunk_prefill_size=None,
@@ -248,13 +246,11 @@ def main():
     )
     inputs["distribution"] = values[-1]
     inputs["page_size"] = args.page_size
-    _kv_len = args.prefix_len + args.draft_token_num
     inputs["custom_mask"] = (
-        create_tree_mask(
+        create_tree_mask_rank3(
             batch_size=args.batch_size,
             draft_token_num=args.draft_token_num,
-            kv_len=_kv_len,
-            aligned_kv_len=cdiv(_kv_len, args.page_size) * args.page_size,
+            kv_len=args.prefix_len + args.draft_token_num,
         )
         if args.custom_mask
         else None
