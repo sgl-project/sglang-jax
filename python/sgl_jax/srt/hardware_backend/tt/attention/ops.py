@@ -7,12 +7,13 @@ import jax.numpy as jnp
 import numpy as np
 
 
-def _call(name, *operands, **attributes):
+def _call(name, *operands, input_output_aliases=None, **attributes):
     result = operands[0]
     return jax.ffi.ffi_call(
         name,
         jax.ShapeDtypeStruct(result.shape, result.dtype),
         vmap_method="sequential",
+        input_output_aliases=input_output_aliases,
     )(*operands, **attributes)
 
 
@@ -45,11 +46,25 @@ def paged_scaled_dot_product_attention_decode(
 
 
 def paged_update_cache(cache, value, positions, page_table):
-    return _call("tt.paged_update_cache", cache, value, positions, page_table)
+    return _call(
+        "tt.paged_update_cache",
+        cache,
+        value,
+        positions,
+        page_table,
+        input_output_aliases={0: 0},
+    )
 
 
 def paged_fill_cache(cache, value, page_table, batch_indices):
-    return _call("tt.paged_fill_cache", cache, value, page_table, batch_indices)
+    return _call(
+        "tt.paged_fill_cache",
+        cache,
+        value,
+        page_table,
+        batch_indices,
+        input_output_aliases={0: 0},
+    )
 
 
 def annotate_weight_dtype(tensor, dtype):

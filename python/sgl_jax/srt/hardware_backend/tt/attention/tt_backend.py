@@ -56,12 +56,6 @@ class TTTokenToKVPool(MHATokenToKVPool):
             ]
         logger.info("Created TT KV buffers in %.2f seconds", time.time() - start)
 
-    def replace_buffer(self, new_buffer):
-        if new_buffer is None or all(value is None for value in new_buffer):
-            return
-        super().replace_buffer(new_buffer)
-
-
 @jax.tree_util.register_dataclass
 @dataclass
 class TTAttentionMetadata:
@@ -362,7 +356,7 @@ class TTAttention(AttentionBackend):
         output_sharding = NamedSharding(self.mesh, P("data", "tensor"))
         return output[:, :num_tokens].reshape(
             num_tokens, -1, out_sharding=output_sharding
-        ), None
+        ), (k_cache, v_cache)
 
     def _prefill_cache_value(self, value, head_dim):
         value = value.at[self.forward_metadata.prefill_input_indices].get(
