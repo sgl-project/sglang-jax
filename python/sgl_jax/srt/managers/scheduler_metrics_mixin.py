@@ -5,6 +5,8 @@ import time
 from collections import defaultdict
 from typing import TYPE_CHECKING
 
+from prometheus_client import Histogram
+
 from sgl_jax.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
@@ -16,9 +18,54 @@ logger = logging.getLogger(__name__)
 
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 
+# Keep these queue-latency buckets aligned with upstream SGLang's
+# sglang:queue_time_seconds histogram.
+QUEUE_TIME_BUCKETS = (
+    0.0,
+    0.001,
+    0.005,
+    0.01,
+    0.05,
+    0.1,
+    0.2,
+    0.5,
+    1,
+    2,
+    3,
+    4,
+    5,
+    10,
+    15,
+    20,
+    30,
+    40,
+    50,
+    60,
+    70,
+    80,
+    90,
+    100,
+    200,
+    300,
+    400,
+    500,
+    600,
+    700,
+    800,
+    900,
+    1000,
+    1200,
+    1400,
+    1600,
+    1800,
+    2000,
+    2500,
+    3000,
+)
 
-def record_queue_wait_times(reqs: list[Req], now: float | None = None) -> dict[int, list[float]]:
-    """Finish first-admission queue timing and group observations by DP rank.
+
+def record_queue_wait_times(reqs: list[Req], metric, now: float | None = None) -> None:
+    """Record first-admission queue latency, labeled by DP rank.
 
     Queue time starts when a request first enters the scheduler (including the
     grammar queue) and ends when it is admitted to its first prefill batch.
@@ -30,16 +77,13 @@ def record_queue_wait_times(reqs: list[Req], now: float | None = None) -> dict[i
     if now is None:
         now = time.perf_counter()
 
-    waits_by_dp: dict[int, list[float]] = defaultdict(list)
     for req in reqs:
         if req.queue_time_start is None or req.queue_time_end is not None:
             continue
 
         req.queue_time_end = now
         if req.dp_rank is not None:
-            waits_by_dp[req.dp_rank].append(max(0.0, now - req.queue_time_start))
-
-    return waits_by_dp
+            metric.labels(dp_rank=str(req.dp_rank)).observe(max(0.0, now - req.queue_time_start))
 
 
 class SchedulerMetricsMixin:
@@ -52,6 +96,16 @@ class SchedulerMetricsMixin:
         self.cum_spec_accept_length = 0
         self.cum_spec_accept_count = 0
         self.total_retracted_reqs = 0
+        self.queue_time = (
+            Histogram(
+                name="sglang:queue_time_seconds",
+                documentation="Histogram of queueing time in seconds.",
+                labelnames=("dp_rank",),
+                buckets=QUEUE_TIME_BUCKETS,
+            )
+            if self.server_args.enable_metrics
+            else None
+        )
 
     def log_prefill_stats(
         self: Scheduler,
@@ -59,7 +113,8 @@ class SchedulerMetricsMixin:
         can_run_list: list[Req],
         running_bs: int,
     ):
-        queue_waits_by_dp = record_queue_wait_times(can_run_list)
+        if self.queue_time is not None:
+            record_queue_wait_times(can_run_list, self.queue_time)
         gap_latency = time.perf_counter() - self.last_prefill_stats_tic
         self.last_prefill_stats_tic = time.perf_counter()
         self.last_input_throughput = self.last_prefill_tokens / gap_latency
@@ -107,20 +162,6 @@ class SchedulerMetricsMixin:
                 for i in range(self.dp_size)
             ]
             f += f"#prefill per DP: {per_dp_prefill}, #running per DP: {per_dp_running}, "
-
-            per_dp_queue_wait = []
-            for dp_rank in range(self.dp_size):
-                waits = queue_waits_by_dp.get(dp_rank, ())
-                if waits:
-                    per_dp_queue_wait.append(
-                        {
-                            "avg": round(sum(waits) / len(waits) * 1000, 2),
-                            "max": round(max(waits) * 1000, 2),
-                        }
-                    )
-                else:
-                    per_dp_queue_wait.append(None)
-            f += f"queue-wait per DP (ms): {per_dp_queue_wait}, "
 
         f += f"#queue-req: {len(self.waiting_queue)}, "
 
