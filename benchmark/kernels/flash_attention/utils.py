@@ -174,16 +174,14 @@ def create_decode_uniform_data(
     )
 
 
-def create_tree_mask(
+def create_tree_mask_rank3(
     *,
     batch_size: int,
     draft_token_num: int,
     kv_len: int,
-    aligned_kv_len: int,
     seed: int = 42,
 ):
-    """Tree attention mask in the layout the kernel reads today: one flat int32
-    array holding a [draft_token_num, aligned_kv_len] block per sequence.
+    """Tree attention mask in the layout the kernel takes: [rows, 1, W] int32.
 
     Shaped after what ``eagle_util.build_tree_mask_for_draft_decode`` and the
     tree-structure kernel produce: the committed prefix is all ones (every
@@ -193,17 +191,18 @@ def create_tree_mask(
     keeping it faithful avoids anyone reading a degenerate all-ones result as
     representative.
 
-    Row width is the page-aligned kv length, i.e. the ``cu_kv_lens`` delta, so
-    this pairs with ``mask_aligned_to_cu_kv=True``.
+    ``W`` is the smallest power of two >= kv_len and >= 128, matching
+    ``flashattention_backend.mask_row_width``.
     """
+    width = max(128, 1 << max(kv_len - 1, 1).bit_length())
     prefix_len = kv_len - draft_token_num
     rng = np.random.default_rng(seed)
     corner = rng.integers(0, 2, size=(draft_token_num, draft_token_num), dtype=np.int64)
     np.fill_diagonal(corner, 1)  # a draft token always attends to itself
-    block = np.zeros((draft_token_num, aligned_kv_len), dtype=np.int32)
-    block[:, :prefix_len] = 1
-    block[:, prefix_len:kv_len] = corner.astype(np.int32)
-    return jnp.asarray(np.tile(block, (batch_size, 1)).reshape(-1))
+    mask = np.zeros((batch_size * draft_token_num, 1, width), dtype=np.int32)
+    mask[:, 0, :prefix_len] = 1
+    mask[:, 0, prefix_len:kv_len] = np.tile(corner.astype(np.int32), (batch_size, 1))
+    return jnp.asarray(mask)
 
 
 def create_target_verify_uniform_data(

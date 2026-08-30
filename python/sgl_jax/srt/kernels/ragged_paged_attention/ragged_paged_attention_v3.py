@@ -271,8 +271,10 @@ def get_vmem_estimate_bytes(
     )
 
     if use_custom_mask:
-        # bkvmask_double_buf: (2, bq_sz, bkv_sz, head_dim) in int32
-        total_bits += 2 * bq_sz * bkv_sz * head_dim * 32
+        # bkvmask_double_buf: (2, bq_sz, 1, bkv_sz) in int32. The size-1
+        # second-minor axis takes a (1, 128) tile, so it costs no sublane
+        # padding: one mask bit is one int32, not head_dim of them.
+        total_bits += 2 * bq_sz * bkv_sz * 32
 
     # Attention compute intermediates (f32). The for-loop over kv_heads is
     # statically unrolled by the compiler, so all heads' intermediates coexist
@@ -332,7 +334,7 @@ def _ragged_paged_attention_kernel_loop(
     page_indices_ref,  # [flat page indices]
     cu_q_lens_ref,  # [max_num_seqs + 1]
     cu_kv_lens_ref,  # [max_num_seqs + 1]
-    cu_seq_mask_lens,  # [max_num_seqs + 1]
+    cu_seq_mask_lens,  # [1], unused placeholder
     distribution_ref,  # [3] (decode_end, prefill_end, mixed_end)
     sem_ids_ref,  # [3] (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
     bo_ids_ref,  # [4]
@@ -341,14 +343,14 @@ def _ragged_paged_attention_kernel_loop(
     q_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     kv_hbm_ref,  # [max_num_tokens, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
     kv_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
-    custom_mask_ref,  # [flatten_total_kv_len, head_dim] or None
-    zero_mask_ref,  # [bkv_sz, head_dim] or None
+    custom_mask_ref,  # [total_q_rows, 1, mask_width] or None
+    zero_mask_ref,  # [bq_sz, 1, bkv_sz] or None
     attention_sink_ref,  # [actual_num_kv_heads, num_q_heads_per_kv_head, 128] or None
     # Output
     o_hbm_ref,  # same shape as q_hbm_ref
     updated_kv_cache_hbm_ref,  # same shape as kv_cache_hbm_ref
     # Scratch
-    bkvmask_ref,  # [2, bq_sz, bkv_sz, head_dim] or None
+    bkvmask_ref,  # [2, bq_sz, 1, bkv_sz] or None
     bkv_x2_ref,  # [2, bkv_sz, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
     bq_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     bo_x2_ref,  # [2, actual_num_kv_heads, bq_sz, ...]
@@ -376,7 +378,6 @@ def _ragged_paged_attention_kernel_loop(
     skip_kv_mask: bool = False,
     tpu_version: int = 6,
     debug_mode: bool = False,
-    mask_aligned_to_cu_kv: bool = False,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
     assert q_hbm_ref.shape[-1] == kv_cache_hbm_ref.shape[-1]
@@ -564,52 +565,55 @@ def _ragged_paged_attention_kernel_loop(
             cp.start()
 
     def _fetch_mask(seq_idx, bq_idx, bkvmask_idx, bkvmask_sem_idx, *, wait=False):
+        """Fetch the [bq_sz, bkv_sz] mask tile for this (bq, bkv) block.
+
+        The mask is a rectangle [total_q_rows, 1, mask_width] holding one int32
+        per mask bit, with kv on the lane axis. Two properties let the whole
+        tile arrive in a single DMA:
+
+        * A row is addressed by the global q-token index, which lands on the
+          LEADING dim. Mosaic's slice-alignment check only inspects the last
+          `tile_rank` dims, so a dynamic and unaligned row start is legal with
+          no `pl.multiple_of` promise -- worth more than it looks, since under
+          `disable_bounds_checks=True` a wrong promise miscompiles silently
+          rather than faulting.
+        * mask_width and bkv_sz are both multiples of 128 -- the host pads every
+          row to a common power-of-two width, and `bkv_alignment` is 128 on this
+          path -- so every lane offset and length below is lane-tile aligned by
+          construction.
+        """
         if custom_mask_ref is None:
             return
         sem = sems.at[4, bkvmask_sem_idx]
         kvmask_vmem_ref = bkvmask_ref.at[bkvmask_sem_idx]
 
-        if mask_aligned_to_cu_kv:
-            # Host padded each mask row to the page-aligned kv_len (= cu_kv_lens
-            # delta), so stride/offset/size are statically tiling(8)-divisible.
-            mask_kv_len = pl.multiple_of(cu_kv_lens_ref[seq_idx + 1] - cu_kv_lens_ref[seq_idx], 8)
-        else:
-            mask_kv_len = kv_lens_ref[seq_idx]
-        mask_start = bkvmask_idx * bkv_sz
-        mask_left = mask_kv_len - mask_start
-        load_kvmask_sz = jnp.minimum(bkv_sz, mask_left)
-        if mask_aligned_to_cu_kv:
-            load_kvmask_sz = pl.multiple_of(load_kvmask_sz, 8)
+        # Static: the rectangle is uniform, so there is no per-sequence stride
+        # and `cu_seq_mask_lens` is not needed at all.
+        mask_w = custom_mask_ref.shape[-1]
+        mask_start = pl.multiple_of(bkvmask_idx * bkv_sz, 128)
+        load_kvmask_sz = pl.multiple_of(jnp.minimum(bkv_sz, mask_w - mask_start), 128)
+        zero_sz = pl.multiple_of(bkv_sz - load_kvmask_sz, 128)
 
         q_len_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
         q_end = cu_q_lens_ref[seq_idx + 1]
         load_q_sz = jnp.minimum(bq_sz, q_end - q_len_start)
 
-        cur_seq_mask_start = cu_seq_mask_lens[seq_idx]
-        cur_bq_mask_start = cur_seq_mask_start + bq_idx * bq_sz * mask_kv_len
-        zero_sz = bkv_sz - load_kvmask_sz
-        if mask_aligned_to_cu_kv:
-            cur_seq_mask_start = pl.multiple_of(cur_seq_mask_start, 8)
-            zero_sz = pl.multiple_of(zero_sz, 8)
-
-        def loop_body(i, _):
-            start = cur_bq_mask_start + i * mask_kv_len + mask_start
-            if mask_aligned_to_cu_kv:
-                start = pl.multiple_of(start, 8)
-            _async_copy(
-                custom_mask_ref.at[pl.ds(start, load_kvmask_sz)],
-                kvmask_vmem_ref.at[i, pl.ds(0, load_kvmask_sz)],
-                sem,
-                wait,
-            )
-            _async_copy(
-                zero_mask_ref.at[pl.ds(0, zero_sz)],
-                kvmask_vmem_ref.at[i, pl.ds(load_kvmask_sz, zero_sz)],
-                sem,
-                wait,
-            )
-
-        lax.fori_loop(0, load_q_sz, loop_body, None, unroll=False)
+        _async_copy(
+            custom_mask_ref.at[pl.ds(q_len_start, load_q_sz), :, pl.ds(mask_start, load_kvmask_sz)],
+            kvmask_vmem_ref.at[pl.ds(0, load_q_sz), :, pl.ds(0, load_kvmask_sz)],
+            sem,
+            wait,
+        )
+        # Tail zero-fill. `zero_sz` is 0 whenever mask_width is a multiple of
+        # bkv_sz (the common case), but it must stay: a stale 1 left by the
+        # previous double-buffer tenant would let through a KV token that
+        # should have been masked, and the mask polarity is 1=keep.
+        _async_copy(
+            zero_mask_ref.at[pl.ds(0, load_q_sz), :, pl.ds(0, zero_sz)],
+            kvmask_vmem_ref.at[pl.ds(0, load_q_sz), :, pl.ds(load_kvmask_sz, zero_sz)],
+            sem,
+            wait,
+        )
 
     def _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, *, wait=False):
         sem = sems.at[0, bkv_sem_idx]
@@ -1012,11 +1016,6 @@ def _ragged_paged_attention_kernel_loop(
                 if debug_mode:
                     return
 
-                # Load custom mask data for this block
-                custom_mask_data = None
-                if bkvmask_ref is not None:
-                    custom_mask_data = bkvmask_ref[bkv_sem_idx, :actual_bq_sz, :, 0]
-
                 # Flash attention with cur bkv and bq
                 effective_bkv_sz = jnp.minimum(effective_kv_len - bkv_idx * bkv_sz, bkv_sz)
                 effective_bkv_sz = jnp.maximum(effective_bkv_sz, 0)
@@ -1034,12 +1033,15 @@ def _ragged_paged_attention_kernel_loop(
                         for bq_start in range(0, actual_bq_sz, actual_bq_csz):
                             # Slice custom mask for this compute sub-block
                             cur_mask_data = None
-                            if custom_mask_data is not None:
+                            if bkvmask_ref is not None:
+                                # kv is on the lane axis, so this is a plain
+                                # 2-D read: the middle index drops a size-1
+                                # axis rather than gathering across sublanes.
                                 cur_mask_data = bkvmask_ref[
                                     bkv_sem_idx,
                                     pl.ds(bq_start, actual_bq_csz),
-                                    pl.ds(bkv_start, bkv_csz),
                                     0,
+                                    pl.ds(pl.multiple_of(bkv_start, 128), bkv_csz),
                                 ]
 
                             # Slice xai temperature for this compute sub-block
@@ -1552,6 +1554,12 @@ def get_default_block_sizes(
             raise NotImplementedError(f"Unsupported {tpu_version=}.")
 
     bkv_alignment = max(page_size, kv_packing)
+    if use_custom_mask:
+        # The mask puts kv on the lane axis, so every kv slice offset and length
+        # has to be a multiple of the 128-lane tile. The default alignment above
+        # does not give that: with page_size=16 and bf16 (kv_packing=2) it is
+        # only 16, and at page_size=1 it drops to kv_packing itself.
+        bkv_alignment = max(bkv_alignment, 128)
     # Custom-mask intermediates exceed v5/v6 scoped VMEM with a 32-row query tile.
     if use_custom_mask and tpu_version in (5, 6):
         bq_sz = min(bq_sz, 16)
@@ -1660,7 +1668,6 @@ def get_vmem_limit():
         "skip_kv_mask",
         "disable_semaphore_checks",
         "debug_mode",
-        "mask_aligned_to_cu_kv",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache_fused"),
 )
@@ -1696,7 +1703,6 @@ def ragged_paged_attention(
     skip_kv_mask: bool = False,
     disable_semaphore_checks: bool = True,
     debug_mode: bool = False,
-    mask_aligned_to_cu_kv: bool = False,
 ):
     """Ragged paged attention with fused KV cache.
 
@@ -1710,7 +1716,12 @@ def ragged_paged_attention(
       cu_q_lens: cumulative sum of effective query lengths.
       cu_kv_lens: cumulative sum of effective key/value lengths.
       distribution: (i, j, k) decode/prefill/mixed sequence ranges.
-      custom_mask: custom attention mask for speculative decoding.
+      custom_mask: custom attention mask for speculative decoding, as an
+        int32 rectangle [total_q_rows, 1, mask_width]. Row r is the mask for
+        global q token r (i.e. indexed by cu_q_lens), one int32 per mask bit
+        with 1 = keep, and mask_width must be a multiple of 128 and at least
+        the largest padded kv length in the batch. The host pads every row to
+        this common width.
       attention_sink: per-head sink logits for streaming inference.
       causal: 1 for causal mask, 0 for custom mask.
       sm_scale: softmax scale applied to Q@K^T.
@@ -1788,24 +1799,20 @@ def ragged_paged_attention(
     if out_dtype is None:
         out_dtype = jnp.float32 if q.dtype == jnp.float32 else jnp.bfloat16
 
-    # mask_aligned_to_cu_kv: when True the kernel uses cu_kv_lens deltas
-    # (page-aligned) as mask row widths; the host must have padded each row
-    # accordingly. target_verify always pads; prefill does not.
-
-    # Prepare custom mask.
+    # The mask is a rectangle: row r carries the mask for global q token r
+    # (i.e. rows are indexed by cu_q_lens), every row is the same width, and kv
+    # runs along the minor axis.
     if custom_mask is not None:
         if custom_mask.dtype == jnp.bool_:
             custom_mask = custom_mask.astype(jnp.int32)
-        custom_mask = jnp.repeat(jnp.expand_dims(custom_mask, axis=1), repeats=head_dim, axis=1)
-
-        q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
-        mask_kv_lens = (cu_kv_lens[1:] - cu_kv_lens[:-1]) if mask_aligned_to_cu_kv else kv_lens
-        seq_mask_lens = mask_kv_lens * q_lens
-        cu_seq_mask_lens = jnp.concatenate(
-            [jnp.array([0], dtype=jnp.int32), jnp.cumsum(seq_mask_lens)]
-        )
-    else:
-        cu_seq_mask_lens = jnp.array([0])
+        if custom_mask.ndim != 3 or custom_mask.shape[1] != 1 or custom_mask.shape[2] % 128:
+            raise ValueError(
+                "custom_mask must be [total_q_rows, 1, mask_width] with mask_width a "
+                f"multiple of 128 (kv lives on the lane axis); got {custom_mask.shape}."
+            )
+    # Unread by the kernel, but kept in the scalar-prefetch tuple so that
+    # input_output_aliases keeps its absolute operand indices.
+    cu_seq_mask_lens = jnp.array([0], dtype=jnp.int32)
 
     # Scalar prefetch init values.
     init_sem_ids = jnp.zeros((3,), jnp.int32)
@@ -1826,6 +1833,11 @@ def ragged_paged_attention(
         static_q_len=None,
         case: RpaCase = RpaCase.MIXED,
     ):
+        if custom_mask is not None and (bkv_sz % 128 or bkv_csz % 128):
+            # Only get_default_block_sizes guarantees this; an explicit
+            # m_block_sizes or a tuned-table hit both bypass it.
+            raise ValueError(f"custom_mask needs 128-aligned kv blocks, got {bkv_sz=} {bkv_csz=}.")
+
         in_specs = [
             pl.BlockSpec(memory_space=pltpu.HBM),  # q
             pl.BlockSpec(memory_space=pltpu.HBM),  # kv
@@ -1873,7 +1885,7 @@ def ragged_paged_attention(
             bkvmask_double_buf = None
         else:
             bkvmask_double_buf = pltpu.VMEM(
-                (2, bq_sz, bkv_sz, head_dim),
+                (2, bq_sz, 1, bkv_sz),
                 jnp.int32,
             )
 
@@ -1944,7 +1956,6 @@ def ragged_paged_attention(
                 skip_kv_mask=skip_kv_mask,
                 tpu_version=tpu_version,
                 debug_mode=debug_mode,
-                mask_aligned_to_cu_kv=mask_aligned_to_cu_kv,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=len(scalar_prefetches),
@@ -1977,7 +1988,7 @@ def ragged_paged_attention(
             name=scope_name,
         )
 
-        zero_mask = jnp.zeros((bkv_sz, head_dim), dtype=jnp.int32)
+        zero_mask = jnp.zeros((bq_sz, 1, bkv_sz), dtype=jnp.int32)
 
         if tpu_version >= 7:
 
@@ -2049,7 +2060,6 @@ def ragged_paged_attention(
                     use_custom_mask=custom_mask is not None,
                     sliding_window=sliding_window,
                 )
-
         return {
             "bq_sz": block_sizes[0],
             "bkv_sz": block_sizes[1],

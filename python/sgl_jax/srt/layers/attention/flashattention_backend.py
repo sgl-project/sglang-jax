@@ -39,6 +39,65 @@ def _per_dp_cumsum(lens, dp_size: int, per_dp_bs: int) -> np.ndarray:
     return cu.ravel()
 
 
+def mask_row_width(aligned_seq_lens) -> int:
+    """Common row width `W` for the rank-3 verify mask.
+
+    The kernel wants the mask as a rectangle `[total_q_rows, 1, W]` with kv on
+    the lane axis, which needs one width for the whole batch. Two constraints:
+
+    * ``W % 128 == 0`` -- kv lives on the lane axis, and Mosaic checks tile
+      alignment on the two minormost dims of every slice.
+    * ``W >= max(aligned_seq_lens)`` -- a narrower W would silently drop the
+      right-hand columns, i.e. exactly the draft tokens being verified.
+
+    Rounding up to a power of two (rather than using the raw batch max) keeps
+    the number of distinct traced shapes at O(log max_context_len) instead of
+    one per batch.
+    """
+    w_max = int(np.max(aligned_seq_lens, initial=1))
+    return max(128, 1 << max(w_max - 1, 1).bit_length())
+
+
+def _pack_verify_mask(
+    cm: np.ndarray,
+    seq_lens: np.ndarray,
+    aligned_seq_lens: np.ndarray,
+    cm_off: np.ndarray,
+    q: int,
+    dp_size: int,
+    per_dp_bs: int,
+) -> np.ndarray:
+    """Repack the flat tree mask into the kernel's rank-3 rectangle.
+
+    Returns `[dp_size * per_dp_bs * q, 1, W]` int32, 1 = keep.
+
+    Row layout must match what the kernel computes, which is
+    ``cu_q_lens_ref[seq_idx] + bq_idx * bq_sz`` where ``cu_q_lens`` is the
+    *per-DP-rank* cumsum of ``extend_seq_lens`` (see ``_per_dp_cumsum``). So
+    within a rank the real slots are packed back to back, `q` rows each, and
+    padding slots contribute no rows at all. Each rank's block is padded out to
+    the full ``per_dp_bs * q`` rows so the leading dim splits evenly under
+    ``P("data")`` and the shape stays bucket-stable.
+
+    Columns past a sequence's own kv_len stay zero. That is not just padding:
+    zero means "masked", which is the safe value if the kernel's independent
+    ``k_span < effective_kv_len`` guard is ever disabled (``skip_kv_mask``).
+    """
+    W = mask_row_width(aligned_seq_lens)
+    rows_per_rank = per_dp_bs * q
+    packed = np.zeros((dp_size * rows_per_rank, 1, W), dtype=np.int32)
+    for r in range(dp_size):
+        row = r * rows_per_rank
+        for j in range(per_dp_bs):
+            s = r * per_dp_bs + j
+            if seq_lens[s] <= 0:
+                continue
+            kl = int(seq_lens[s])
+            packed[row : row + q, 0, :kl] = cm[cm_off[s] : cm_off[s] + q * kl].reshape(q, kl)
+            row += q
+    return packed
+
+
 def _pad_page_indices(
     page_indices: np.ndarray,
     max_num_seqs: int,
@@ -322,45 +381,23 @@ class FlashAttention(AttentionBackend):
             seq_lens += extend_seq_lens
             aligned_seq_lens = ((seq_lens + self.page_size - 1) // self.page_size) * self.page_size
             # Verify mask must be (a) DP-segmented per rank when dp>1 so each
-            # rank's P("data") shard sees its own slots, and (b) padded so each
-            # row width = aligned_seq_lens (= cu_kv_lens delta). The RPA kernel
-            # always takes the cu_kv_lens-aligned path now (#1089 used to gate
-            # on page_size>=256, which broke dp=1 + smaller pages — Mosaic
-            # could not prove tiling(8) on the unaligned slice). dp=1 reduces
-            # to a single rank chunk; dp>1 keeps the per-rank repack from
-            # #1108 P1-7.
+            # rank's P("data") shard sees its own slots, and (b) laid out as the
+            # kernel's rectangle [total_q_rows, 1, W] -- kv on the lane axis,
+            # one uniform 128-aligned W for the whole batch (see mask_row_width
+            # and _pack_verify_mask). dp=1 reduces to a single rank chunk;
+            # dp>1 keeps the per-rank repack from #1108 P1-7.
             if metadata.custom_mask is not None:
                 q = batch.spec_info_padded.draft_token_num
                 cm = np.asarray(jax.device_get(metadata.custom_mask))
-                # Pin per-rank mask target from the pre-repacking mask capacity
-                # (tree_mask_capacity from build_tree, already bucket-stable).
-                cm_total = len(cm)
-                per_rank_mask_target = ((cm_total // dp_size + 7) // 8) * 8 or 8
+                assert cm.ndim == 1, f"unexpected tree-mask rank {cm.shape}"
                 # cm is DP-slot-ordered (build_tree got verified_seq_len = mwb.seq_lens-1
                 # over total_bs). Per-slot cm length = q*(verified_seq_len[s]+q); for pad
                 # slots verified_seq_len=-1 → q*(q-1).
                 cm_kl = np.where(seq_lens > 0, seq_lens, q - 1).astype(np.int64)
                 cm_off = np.concatenate([[0], np.cumsum(q * cm_kl)])
-                row_width = aligned_seq_lens
-                rank_chunks: list[np.ndarray] = []
-                for r in range(dp_size):
-                    parts = []
-                    for j in range(per_dp_bs):
-                        s = r * per_dp_bs + j
-                        kla = int(row_width[s])
-                        if seq_lens[s] > 0:
-                            kl = int(seq_lens[s])
-                            row = cm[cm_off[s] : cm_off[s] + q * kl].reshape(q, kl)
-                            parts.append(np.pad(row, ((0, 0), (0, kla - kl))).reshape(-1))
-                        elif kla > 0:
-                            parts.append(np.zeros(q * kla, dtype=cm.dtype))
-                    rank_chunks.append(
-                        np.concatenate(parts) if parts else np.zeros(0, dtype=cm.dtype)
-                    )
-                max_len = max(max((len(c) for c in rank_chunks), default=0), per_rank_mask_target)
-                packed = np.concatenate(
-                    [np.pad(c, (0, max_len - len(c))) for c in rank_chunks]
-                ).astype(np.int32)
+                packed = _pack_verify_mask(
+                    cm, seq_lens, aligned_seq_lens, cm_off, q, dp_size, per_dp_bs
+                )
                 metadata.custom_mask = device_array(
                     packed,
                     sharding=NamedSharding(self.mesh, P("data")),
@@ -662,7 +699,7 @@ class FlashAttention(AttentionBackend):
                 P(self.attention_data_partition_axis)
                 if self.forward_metadata.custom_mask is not None
                 else P()
-            ),  # custom_mask: DP-segmented per-rank (cu_seq_mask_lens is rank-local)
+            ),  # custom_mask: [total_q_rows, 1, W], leading dim DP-segmented
             (
                 P(self.kv_partition_axis) if attention_sink is not None else P()
             ),  # attention sink: (num_q_heads,), sharded by heads
@@ -675,10 +712,6 @@ class FlashAttention(AttentionBackend):
             ),  # updated kv_cache_fused (head interleaved) - 3D: [total_tokens, num_kv_heads*2, head_dim]
         )
 
-        mask_aligned_to_cu_kv = (
-            self.forward_metadata.custom_mask is not None
-            and forward_batch.forward_mode.is_target_verify()
-        )
         target_verify_tokens_per_seq = (
             getattr(forward_batch.spec_info, "draft_token_num", None)
             if forward_batch.forward_mode.is_target_verify()
@@ -726,7 +759,6 @@ class FlashAttention(AttentionBackend):
                     layer.xai_temperature_len if layer.xai_temperature_len > 0 else None
                 ),
                 softmax_dtype=layer.softmax_dtype,
-                mask_aligned_to_cu_kv=mask_aligned_to_cu_kv,
                 m_block_sizes=target_verify_m_block_sizes,
             )
 
