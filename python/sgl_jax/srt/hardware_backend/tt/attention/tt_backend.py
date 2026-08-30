@@ -352,7 +352,7 @@ class TTAttention(AttentionBackend):
             positions,
         )
         output_sharding = NamedSharding(self.mesh, P("data", "tensor"))
-        return output[:, :num_tokens].reshape(
+        return output.reshape(
             num_tokens, -1, out_sharding=output_sharding
         ), (k_cache, v_cache)
 

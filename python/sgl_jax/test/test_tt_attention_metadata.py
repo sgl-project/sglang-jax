@@ -6,9 +6,6 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh
 
-# Trigger JAX plugin discovery before importing the TT-only MLIR lowerings.
-jax.devices()
-
 from sgl_jax.srt.hardware_backend.tt.attention.tt_backend import TTAttention
 
 
