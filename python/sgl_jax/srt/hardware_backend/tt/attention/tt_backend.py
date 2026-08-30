@@ -303,7 +303,6 @@ class TTAttention(AttentionBackend):
             metadata.fill_page_table,
             fill_batch_indices,
         )
-        k_cache, v_cache = self._cache_barrier((k_cache, v_cache))
 
         tokens = metadata.prefill_input_indices.shape[1]
         q = q.at[metadata.prefill_input_indices].get(
@@ -344,7 +343,6 @@ class TTAttention(AttentionBackend):
         v_update = self._decode_cache_value(v, v_cache.shape[-1])
         k_cache = tt_ops.paged_update_cache(k_cache, k_update, positions, page_table)
         v_cache = tt_ops.paged_update_cache(v_cache, v_update, positions, page_table)
-        k_cache, v_cache = self._cache_barrier((k_cache, v_cache))
 
         output = tt_ops.paged_scaled_dot_product_attention_decode(
             q,
@@ -378,10 +376,6 @@ class TTAttention(AttentionBackend):
                 value, ((0, 0), (0, 0), (0, head_dim - value.shape[-1]))
             )
         return value[..., :head_dim]
-
-    @staticmethod
-    def _cache_barrier(cache):
-        return tuple(jax.lax.optimization_barrier(value) for value in cache)
 
     @staticmethod
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
