@@ -1,0 +1,65 @@
+kubernetes:
+  pod_config:
+    metadata:
+      annotations:
+        gke-gcsfuse/volumes: "true"
+    spec:
+      tolerations:
+        - key: "google.com/tpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: <ACCELERATOR_TYPE>
+        cloud.google.com/gke-tpu-topology: <TPU_TOPOLOGY>
+      containers:
+        - name: ray-node
+          image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu@sha256:33fd74d1ac4a45de18855cfec6c41644bf59d5b4e76a343d32f52b6553f0e804
+          resources:
+            requests:
+              cpu: "<CPU_REQUEST>"
+              memory: "<MEMORY_REQUEST>"
+              google.com/tpu: <CHIPS_PER_HOST>
+            limits:
+              cpu: "<CPU_REQUEST>"
+              memory: "<MEMORY_REQUEST>"
+              google.com/tpu: <CHIPS_PER_HOST>
+          volumeMounts:
+            - name: gcs-models
+              mountPath: /models
+              readOnly: true
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/bash
+                  - -c
+                  - |
+                    cat > /etc/profile.d/tpu-env.sh << TPUEOF
+                    # TPU Environment Variables (auto-generated from container env)
+                    export TPU_ACCELERATOR_TYPE="${TPU_ACCELERATOR_TYPE}"
+                    export TPU_CHIPS_PER_HOST_BOUNDS="${TPU_CHIPS_PER_HOST_BOUNDS}"
+                    export TPU_HOST_BOUNDS="${TPU_HOST_BOUNDS}"
+                    export TPU_RUNTIME_METRICS_PORTS="${TPU_RUNTIME_METRICS_PORTS}"
+                    export TPU_SKIP_MDS_QUERY="${TPU_SKIP_MDS_QUERY}"
+                    export TPU_TOPOLOGY_ALT="${TPU_TOPOLOGY_ALT}"
+                    export TPU_TOPOLOGY_WRAP="${TPU_TOPOLOGY_WRAP}"
+                    export TPU_TOPOLOGY="${TPU_TOPOLOGY}"
+                    export VBAR_CONTROL_SERVICE_URL="${VBAR_CONTROL_SERVICE_URL}"
+
+                    export TPU_WORKER_HOSTNAMES="${TPU_WORKER_HOSTNAMES}"
+                    export TPU_WORKER_ID="${TPU_WORKER_ID}"
+                    TPUEOF
+
+                    # Auto-load TPU environment for all login shells
+                    if ! grep -q 'source /etc/profile.d/tpu-env.sh' /root/.bashrc 2>/dev/null; then
+                      echo '# Auto-load TPU environment variables' >> /root/.bashrc
+                      echo 'source /etc/profile.d/tpu-env.sh' >> /root/.bashrc
+                    fi
+      volumes:
+        - name: gcs-models
+          csi:
+            driver: gcsfuse.csi.storage.gke.io
+            readOnly: true
+            volumeAttributes:
+              bucketName: model-storage-sglang
+              mountOptions: "implicit-dirs"
