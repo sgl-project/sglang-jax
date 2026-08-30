@@ -5,8 +5,6 @@ import time
 from collections import defaultdict
 from typing import TYPE_CHECKING
 
-from prometheus_client import Histogram
-
 from sgl_jax.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
@@ -64,6 +62,20 @@ QUEUE_TIME_BUCKETS = (
 )
 
 
+def create_queue_time_histogram():
+    # prometheus_client chooses its storage backend when it is first imported.
+    # Keep this import on the runtime initialization path, after the HTTP server
+    # has configured PROMETHEUS_MULTIPROC_DIR.
+    from prometheus_client import Histogram
+
+    return Histogram(
+        name="sglang:queue_time_seconds",
+        documentation="Histogram of queueing time in seconds.",
+        labelnames=("dp_rank",),
+        buckets=QUEUE_TIME_BUCKETS,
+    )
+
+
 def record_queue_wait_times(reqs: list[Req], metric, now: float | None = None) -> None:
     """Record first-admission queue latency, labeled by DP rank.
 
@@ -96,16 +108,7 @@ class SchedulerMetricsMixin:
         self.cum_spec_accept_length = 0
         self.cum_spec_accept_count = 0
         self.total_retracted_reqs = 0
-        self.queue_time = (
-            Histogram(
-                name="sglang:queue_time_seconds",
-                documentation="Histogram of queueing time in seconds.",
-                labelnames=("dp_rank",),
-                buckets=QUEUE_TIME_BUCKETS,
-            )
-            if self.server_args.enable_metrics
-            else None
-        )
+        self.queue_time = create_queue_time_histogram() if self.server_args.enable_metrics else None
 
     def log_prefill_stats(
         self: Scheduler,

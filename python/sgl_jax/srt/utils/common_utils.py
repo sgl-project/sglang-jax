@@ -210,12 +210,26 @@ def set_prometheus_multiproc_dir():
         )
 
 
-def add_prometheus_middleware(app):
-    from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
-    from starlette.routing import Mount
+def get_prometheus_registry():
+    from prometheus_client import REGISTRY, CollectorRegistry, multiprocess, values
+
+    # prometheus_client fixes ValueClass at first import. Normally launch() sets
+    # PROMETHEUS_MULTIPROC_DIR before that import, but embedders may have already
+    # imported the client. Scrape the registry matching the selected backend so
+    # in-process metrics are never hidden behind a MultiProcessCollector.
+    if values.ValueClass.__name__ == "MutexValue":
+        return REGISTRY
 
     registry = CollectorRegistry()
     multiprocess.MultiProcessCollector(registry)
+    return registry
+
+
+def add_prometheus_middleware(app):
+    from prometheus_client import make_asgi_app
+    from starlette.routing import Mount
+
+    registry = get_prometheus_registry()
 
     metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
     # Workaround for 307 Redirect for /metrics.
