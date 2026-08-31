@@ -201,17 +201,11 @@ def _install_prefill_capture_hooks(model):
         return hook
 
     def capture_router(layer_index: int):
-        def hook(module, _inputs, output):
+        def hook(_module, _inputs, output):
             topk_ids, topk_weights, raw_logits = output
             raw_logits = raw_logits.reshape(-1, raw_logits.shape[-1])[-1].detach().float().cpu()
-            if module.score_func == "sigmoid":
-                scores = torch.sigmoid(raw_logits)
-            elif module.score_func == "softmax":
-                scores = torch.softmax(raw_logits, dim=-1)
-            else:
-                raise AssertionError(f"Unsupported router score_func: {module.score_func}")
             captures["router_raw_logits"][layer_index] = raw_logits
-            captures["router_scores"][layer_index] = scores
+            captures["router_scores"][layer_index] = torch.sigmoid(raw_logits)
             captures["router_topk_ids"][layer_index] = (
                 topk_ids.reshape(-1, topk_ids.shape[-1])[-1].detach().cpu()
             )
