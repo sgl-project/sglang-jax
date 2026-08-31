@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch_cpu_ops import install_cpu_reference_ops
+from torch_cpu_ops import install_cpu_reference_ops, kda_cpu_reference
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 
@@ -84,7 +84,59 @@ def _make_reduced_config(model_path: str, revision: str):
     return config
 
 
+def _check_kda_against_fla_naive() -> None:
+    """Check the CPU shim against FLA's own unfused PyTorch recurrence."""
+
+    from fla.ops.kda.naive import naive_recurrent_kda
+
+    generator = torch.Generator(device="cpu").manual_seed(20260831)
+    shape = (1, 5, 2, 4)
+    q = torch.randn(shape, generator=generator)
+    k = torch.randn(shape, generator=generator)
+    v = torch.randn((1, 5, 2, 3), generator=generator)
+    raw_gate = torch.randn(shape, generator=generator)
+    raw_beta = torch.randn((1, 5, 2), generator=generator)
+    a_log = torch.randn((2,), generator=generator)
+    dt_bias = torch.randn((2, 4), generator=generator)
+    initial_state = torch.randn((1, 2, 4, 3), generator=generator)
+    lower_bound = -5.0
+
+    q_normalized = q * torch.rsqrt(q.square().sum(dim=-1, keepdim=True) + 1e-6)
+    k_normalized = k * torch.rsqrt(k.square().sum(dim=-1, keepdim=True) + 1e-6)
+    gate = lower_bound * torch.sigmoid(
+        a_log.exp().reshape(2, 1) * (raw_gate + dt_bias.reshape(2, 4))
+    )
+    beta = torch.sigmoid(raw_beta)
+    expected_output, expected_state = naive_recurrent_kda(
+        q_normalized,
+        k_normalized,
+        v,
+        gate,
+        beta,
+        initial_state=initial_state,
+        output_final_state=True,
+    )
+    actual_output, actual_state = kda_cpu_reference(
+        q,
+        k,
+        v,
+        raw_gate,
+        raw_beta,
+        A_log=a_log,
+        dt_bias=dt_bias,
+        initial_state=initial_state,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        use_beta_sigmoid_in_kernel=True,
+        lower_bound=lower_bound,
+    )
+    torch.testing.assert_close(actual_output, expected_output, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(actual_state, expected_state, rtol=1e-5, atol=1e-5)
+
+
 def run_cpu_op_self_test(model_path: str, revision: str) -> None:
+    _check_kda_against_fla_naive()
     config = _make_reduced_config(model_path, revision)
     model = AutoModelForCausalLM.from_config(config, trust_remote_code=True).to(
         device="cpu", dtype=torch.bfloat16
