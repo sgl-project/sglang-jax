@@ -20,6 +20,7 @@ from sgl_jax.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
+    InsertResult,
     MatchPrefixParams,
 )
 from sgl_jax.srt.mem_cache.cache_init_params import CacheInitParams
@@ -35,9 +36,11 @@ from sgl_jax.srt.mem_cache.registry import (
     TreeCacheBuildContext,
     default_radix_cache_factory,
 )
+from sgl_jax.srt.mem_cache.unified_cache_components import ComponentType, FullComponent
 from sgl_jax.srt.mem_cache.unified_cache_components import (
-    ComponentType,
-    FullComponent,
+    InsertResult as ComponentInsertResult,
+)
+from sgl_jax.srt.mem_cache.unified_cache_components import (
     LRURefreshPhase,
     TreeComponent,
     get_and_increase_time_counter,
@@ -2169,8 +2172,8 @@ class _RecordingAuxComponent(TreeComponent):
     def create_match_validator(self, match_device_only=False):
         return lambda node: True
 
-    def refresh_lru(self, node, phase):
-        self.hook_log.append(("refresh", phase, node.id))
+    def refresh_lru(self, phase, node, root_node):
+        self.hook_log.append(("refresh", phase, node.id, root_node.id))
         node.component_data[self.component_type].metadata[
             "last_access_time"
         ] = get_and_increase_time_counter()
@@ -2242,6 +2245,17 @@ class TestUnifiedRadixCacheComponentSeams(unittest.TestCase):
             tree_components=tree_components,
         )
         return req_pool, allocator, cache
+
+    def test_insert_result_is_base_contract_with_recurrent_extension(self):
+        self.assertIs(ComponentInsertResult, InsertResult)
+        result = InsertResult(
+            prefix_len=4,
+            recurrent_exist=True,
+            recurrent_committed=True,
+        )
+        self.assertEqual(result.prefix_len, 4)
+        self.assertTrue(result.recurrent_exist)
+        self.assertTrue(result.recurrent_committed)
 
     def test_components_receive_cache_init_params(self):
         COMPONENT_REGISTRY[ComponentType.FULL] = _RecordingFullComponent
@@ -2414,7 +2428,7 @@ class TestUnifiedRadixCacheComponentSeams(unittest.TestCase):
         self.assertIn(new_parent, candidates)
         self.assertIn(child, candidates)
 
-    def test_component_lru_refresh_is_range_scoped(self):
+    def test_component_lru_refresh_uses_upstream_contract_and_is_range_scoped(self):
         _, _, cache = self._create_cache()
         cache.insert(
             InsertParams(
@@ -2445,6 +2459,8 @@ class TestUnifiedRadixCacheComponentSeams(unittest.TestCase):
 
         phases = [entry[1] for entry in aux.hook_log if entry[0] == "refresh"]
         self.assertEqual(phases, [LRURefreshPhase.WALKDOWN, LRURefreshPhase.MATCH_END])
+        root_ids = [entry[3] for entry in aux.hook_log if entry[0] == "refresh"]
+        self.assertEqual(root_ids, [cache.root_node.id, cache.root_node.id])
         self.assertGreater(
             data_a.metadata["last_access_time"],
             timestamp_a,

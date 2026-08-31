@@ -44,6 +44,17 @@ class InsertParams:
 
 
 @dataclasses.dataclass
+class InsertResult:
+    """Result of an insert operation."""
+
+    prefix_len: int = 0
+    # recurrent_committed: the tree took ownership of the request's slot;
+    # cleanup_after_caching_req keys donate-vs-free on it.
+    recurrent_exist: bool = False
+    recurrent_committed: bool = False
+
+
+@dataclasses.dataclass
 class EvictParams:
     """Unified parameters for evict across cache types."""
 

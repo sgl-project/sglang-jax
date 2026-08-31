@@ -27,6 +27,7 @@ from sgl_jax.srt.mem_cache.base_prefix_cache import (
     EvictResult,
     IncLockRefResult,
     InsertParams,
+    InsertResult,
     MatchPrefixParams,
     MatchResult,
     build_swa_cache_ledger_snapshot,
@@ -48,7 +49,6 @@ from sgl_jax.srt.mem_cache.unified_cache_components import (
     ComponentType,
     EvictLayer,
     FullComponent,
-    InsertResult,
     LRURefreshPhase,
     RecurrentComponent,
     SWAComponent,
@@ -738,7 +738,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def _refresh_component_lru(self, node: UnifiedTreeNode, phase: LRURefreshPhase) -> None:
         for component in self._components_tuple:
             if component.component_type != BASE_COMPONENT_TYPE:
-                component.refresh_lru(node=node, phase=phase)
+                component.refresh_lru(phase, node, self.root_node)
 
     def _update_aux_evictable_node_sets(self, node: UnifiedTreeNode | None) -> None:
         """Keep component-owned, unlocked device nodes available to aux LRU drivers."""

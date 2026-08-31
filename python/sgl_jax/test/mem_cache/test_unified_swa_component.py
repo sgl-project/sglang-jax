@@ -766,23 +766,67 @@ class TestUnifiedSWAComponentPage1(unittest.TestCase):
         )
         self.assertTrue(np.all(_swa_indices(allocator, full[:2], 0) == 0))
 
-    def test_long_prefix_lock_and_lru_touch_only_physical_window_suffix(self):
-        cache, allocator = _make_cache(window=4)
+    def test_lru_refresh_includes_page_cushion_but_lock_stays_window_bounded(self):
+        cache, allocator = _make_cache(page_size=2, window=4)
         _insert(cache, allocator, list(range(12)))
         endpoint = cache.match_prefix(
             MatchPrefixParams(key=RadixKey(list(range(8))))
         ).last_device_node
-        component = cache.components[ComponentType.SWA]
-        component.refresh_lru(endpoint, LRURefreshPhase.MATCH_END)
-        self.assertLessEqual(len(endpoint.component_data[ComponentType.SWA].value), 4)
         first = next(iter(cache.root_node.children.values()))
+        descendant = next(iter(endpoint.children.values()))
+        first_data = first.component_data[ComponentType.SWA]
+        endpoint_data = endpoint.component_data[ComponentType.SWA]
+        descendant_data = descendant.component_data[ComponentType.SWA]
+        first_data.metadata["last_access_time"] = 1.0
+        endpoint_data.metadata["last_access_time"] = 2.0
+        descendant_data.metadata["last_access_time"] = 3.0
+
+        component = cache.components[ComponentType.SWA]
+        component.refresh_lru(LRURefreshPhase.MATCH_END, endpoint, cache.root_node)
+        self.assertGreater(first_data.metadata["last_access_time"], 1.0)
+        self.assertGreater(endpoint_data.metadata["last_access_time"], 2.0)
         self.assertLess(
-            first.component_data[ComponentType.SWA].metadata.get("last_access_time", 0),
-            endpoint.component_data[ComponentType.SWA].metadata["last_access_time"],
+            first_data.metadata["last_access_time"],
+            endpoint_data.metadata["last_access_time"],
         )
+        self.assertEqual(descendant_data.metadata["last_access_time"], 3.0)
+
         lock = cache.inc_lock_ref(endpoint)
         self.assertEqual(cache.component_protected_size_[ComponentType.SWA][0], 4)
         cache.dec_lock_ref(endpoint, lock.to_dec_params())
+
+    def test_lru_refresh_counts_tombstones_in_logical_window(self):
+        cache, allocator = _make_cache(page_size=2, window=4)
+        matched_tokens = list(range(12))
+        _insert(cache, allocator, matched_tokens)
+        _insert(cache, allocator, list(range(8)) + list(range(100, 104)))
+        _insert(cache, allocator, list(range(4)) + list(range(200, 204)))
+
+        ancestor = next(iter(cache.root_node.children.values()))
+        middle = next(
+            child
+            for child in ancestor.children.values()
+            if list(child.key.token_ids) == list(range(4, 8))
+        )
+        endpoint = next(
+            child
+            for child in middle.children.values()
+            if list(child.key.token_ids) == list(range(8, 12))
+        )
+        ancestor_data = ancestor.component_data[ComponentType.SWA]
+        middle_data = middle.component_data[ComponentType.SWA]
+        endpoint_data = endpoint.component_data[ComponentType.SWA]
+        self.assertEqual([len(ancestor.key), len(middle.key), len(endpoint.key)], [4, 4, 4])
+        cache.components[ComponentType.SWA].evict_component(middle)
+        self.assertIsNone(middle_data.value)
+        ancestor_data.metadata["last_access_time"] = 1.0
+        endpoint_data.metadata["last_access_time"] = 2.0
+
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(matched_tokens)))
+
+        self.assertIs(match.last_device_node, endpoint)
+        self.assertEqual(ancestor_data.metadata["last_access_time"], 1.0)
+        self.assertGreater(endpoint_data.metadata["last_access_time"], 2.0)
 
     def test_split_moves_window_lock_uuid_to_new_parent(self):
         cache, allocator = _make_cache(window=8)
@@ -934,10 +978,12 @@ class TestUnifiedSWAComponentPagedAndDP2(unittest.TestCase):
         """Check healing; admission/pressure tests own capacity-triggered eviction."""
         shared = list(range(4))
         seed_inputs = [
-            shared + list(range(100, 108)),
-            shared + list(range(200, 208)),
+            # Keep the shared node outside the active window + page cushion so
+            # repeated public eviction can reach a real internal tombstone.
+            shared + list(range(100, 116)),
+            shared + list(range(200, 216)),
         ]
-        evict_params = EvictParams(swa_num_tokens=len(shared) + 8, dp_rank=0)
+        evict_params = EvictParams(swa_num_tokens=len(shared), dp_rank=0)
         previous_chunk = global_server_args_dict.get("chunked_prefill_size")
         global_server_args_dict["chunked_prefill_size"] = 64
         try:
@@ -970,9 +1016,20 @@ class TestUnifiedSWAComponentPagedAndDP2(unittest.TestCase):
                         self.assertIsNotNone(target.component_data[ComponentType.SWA].value)
 
                     before_evict = cache.cache_ledger_snapshot(0, [])
-                    evicted = cache.evict(evict_params)
+                    for _ in range(3):
+                        evicted = cache.evict(evict_params)
+                        self.assertGreater(evicted.swa_num_tokens_evicted, 0)
+                        is_tombstone = (
+                            target.swa_tombstone
+                            if kind == "legacy"
+                            else target.component_data[ComponentType.SWA].value is None
+                        )
+                        if is_tombstone:
+                            break
+                    else:
+                        self.fail(f"{kind} did not tombstone the shared internal prefix")
+
                     after_evict = cache.cache_ledger_snapshot(0, [])
-                    self.assertGreater(evicted.swa_num_tokens_evicted, 0)
                     self.assertTrue(target.children)
                     if kind == "legacy":
                         self.assertIsNotNone(target.value)

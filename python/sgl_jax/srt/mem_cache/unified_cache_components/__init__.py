@@ -1,3 +1,4 @@
+from sgl_jax.srt.mem_cache.base_prefix_cache import InsertResult
 from sgl_jax.srt.mem_cache.unified_cache_components.full_component import FullComponent
 from sgl_jax.srt.mem_cache.unified_cache_components.recurrent_component import (
     RecurrentComponent,
@@ -10,7 +11,6 @@ from sgl_jax.srt.mem_cache.unified_cache_components.tree_component import (
     ComponentData,
     ComponentType,
     EvictLayer,
-    InsertResult,
     LRURefreshPhase,
     TreeComponent,
     get_and_increase_time_counter,

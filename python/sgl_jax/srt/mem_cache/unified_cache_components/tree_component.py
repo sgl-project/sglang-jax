@@ -23,6 +23,7 @@ from sgl_jax.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     IncLockRefResult,
     InsertParams,
+    InsertResult,
     MatchPrefixParams,
     MatchResult,
 )
@@ -73,20 +74,6 @@ class ComponentData:
     metadata: dict[str, Any] = dataclasses.field(default_factory=dict)
     host_value: np.ndarray | None = None
     host_lock_ref: int = 0
-
-
-@dataclasses.dataclass
-class InsertResult:
-    """Result of an insert operation.
-
-    Lean local version (upstream keeps this in base_prefix_cache);
-    used only in component seam annotations."""
-
-    prefix_len: int = 0
-    # recurrent_committed: the tree took ownership of the request's slot;
-    # cleanup_after_caching_req keys donate-vs-free on it.
-    recurrent_exist: bool = False
-    recurrent_committed: bool = False
 
 
 class EvictLayer(IntFlag):
@@ -147,8 +134,9 @@ class TreeComponent(ABC):
 
     def refresh_lru(
         self,
-        node: UnifiedTreeNode,
         phase: LRURefreshPhase,
+        node: UnifiedTreeNode,
+        root_node: UnifiedTreeNode,
     ) -> None:
         """Refresh this component's LRU state for one tree phase."""
         return None

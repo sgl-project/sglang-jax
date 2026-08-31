@@ -13,11 +13,11 @@ from sgl_jax.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     IncLockRefResult,
     InsertParams,
+    InsertResult,
 )
 from sgl_jax.srt.mem_cache.unified_cache_components.tree_component import (
     ComponentType,
     EvictLayer,
-    InsertResult,
     LRURefreshPhase,
     TreeComponent,
     get_and_increase_time_counter,
@@ -93,18 +93,24 @@ class SWAComponent(TreeComponent):
 
         return validate
 
-    def refresh_lru(self, node: UnifiedTreeNode, phase: LRURefreshPhase) -> None:
+    def refresh_lru(
+        self,
+        phase: LRURefreshPhase,
+        node: UnifiedTreeNode,
+        root_node: UnifiedTreeNode,
+    ) -> None:
         if phase == LRURefreshPhase.WALKDOWN:
             return
         ct = self.component_type
-        remaining = self.sliding_window_size
+        remaining = self.sliding_window_size + self.cache.page_size
+        cur_time = get_and_increase_time_counter()
         current: UnifiedTreeNode | None = node
-        while current is not self.cache.root_node and remaining > 0:
+        while current is not root_node and remaining > 0:
             cd = current.component_data[ct]
             if cd.value is not None:
-                cd.metadata["last_access_time"] = get_and_increase_time_counter()
-                # Component values are one-to-one with live FULL mappings.
-                remaining -= len(cd.value)
+                cd.metadata["last_access_time"] = cur_time
+            remaining -= len(current.key)
+            cur_time -= 0.00001
             current = current.parent
 
     def update_component_on_insert_overlap(
