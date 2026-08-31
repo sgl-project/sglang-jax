@@ -117,8 +117,13 @@ class AotDispatcher:
             self._stable_ids = tuple(id(a) for a in self._stable_flat_args)
             self._cache.clear()
 
-        dyn_leaves = jax.tree_util.tree_leaves(dyn_args)
-        key = tuple((getattr(a, "shape", None), getattr(a, "dtype", None)) for a in dyn_leaves)
+        dyn_leaves, dyn_tree = jax.tree_util.tree_flatten(dyn_args)
+        # Custom-node auxiliary data lives in the PyTreeDef. It includes
+        # static sampling branches such as is_all_greedy and do_penalties.
+        key = (
+            dyn_tree,
+            tuple((getattr(a, "shape", None), getattr(a, "dtype", None)) for a in dyn_leaves),
+        )
         entry = self._cache.get(key)
         if entry is None:
             return self._compile_and_first_call(key, dyn_args)

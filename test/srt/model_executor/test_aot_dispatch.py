@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from sgl_jax.srt.model_executor.aot_dispatch import AotDispatcher
+from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 
 
 class TestAotDispatcher(unittest.TestCase):
@@ -51,6 +52,44 @@ class TestAotDispatcher(unittest.TestCase):
         eout8, _ = ref(jnp.ones(4) * 8, jnp.zeros(4), jnp.float32(2.0))
         np.testing.assert_allclose(np.asarray(out8), np.asarray(eout8))
         self.assertEqual(len(disp._cache), 1)  # same shapes -> one entry
+
+    def test_pytree_aux_data_partitions_cache(self):
+        @jax.jit
+        def sample(metadata):
+            if metadata.is_all_greedy:
+                return metadata.temperatures + 1
+            if metadata.do_penalties:
+                return metadata.temperatures + metadata.linear_penalty[:, :1]
+            return metadata.temperatures - 1
+
+        def metadata(*, is_all_greedy=False, do_penalties=False):
+            return SamplingMetadata(
+                return_logprob=False,
+                top_logprobs_nums=None,
+                token_ids_logprobs=None,
+                temperatures=jnp.ones((1, 1)),
+                top_ps=jnp.ones(1),
+                top_ks=jnp.ones(1, dtype=jnp.int32),
+                min_ps=jnp.zeros(1),
+                sampling_seeds=None,
+                positions=jnp.zeros(1, dtype=jnp.int32),
+                is_all_greedy=is_all_greedy,
+                need_min_p_sampling=False,
+                do_penalties=do_penalties,
+                linear_penalty=jnp.full((1, 4), 3.0),
+            )
+
+        disp = AotDispatcher(sample, stable_call_args=(), stable_flat_args=(), name="sampler")
+        cases = (
+            (metadata(is_all_greedy=True), 2.0),
+            (metadata(), 0.0),
+            (metadata(do_penalties=True), 4.0),
+        )
+        for sampling_metadata, expected in cases:
+            actual = disp(sampling_metadata)
+            np.testing.assert_allclose(np.asarray(actual), expected)
+
+        self.assertEqual(len(disp._cache), len(cases))
 
     def test_stable_replacement_invalidates(self):
         disp, ref = self._make()
