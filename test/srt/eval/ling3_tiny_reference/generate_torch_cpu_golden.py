@@ -184,7 +184,10 @@ def _install_prefill_capture_hooks(model):
         "attention_output": {},
         "moe_input": {},
         "mlp_output": {},
+        "router_raw_logits": {},
+        "router_scores": {},
         "router_topk_ids": {},
+        "router_topk_weights": {},
     }
     handles = []
 
@@ -198,10 +201,22 @@ def _install_prefill_capture_hooks(model):
         return hook
 
     def capture_router(layer_index: int):
-        def hook(_module, _inputs, output):
-            topk_ids = output[0]
+        def hook(module, _inputs, output):
+            topk_ids, topk_weights, raw_logits = output
+            raw_logits = raw_logits.reshape(-1, raw_logits.shape[-1])[-1].detach().float().cpu()
+            if module.score_func == "sigmoid":
+                scores = torch.sigmoid(raw_logits)
+            elif module.score_func == "softmax":
+                scores = torch.softmax(raw_logits, dim=-1)
+            else:
+                raise AssertionError(f"Unsupported router score_func: {module.score_func}")
+            captures["router_raw_logits"][layer_index] = raw_logits
+            captures["router_scores"][layer_index] = scores
             captures["router_topk_ids"][layer_index] = (
                 topk_ids.reshape(-1, topk_ids.shape[-1])[-1].detach().cpu()
+            )
+            captures["router_topk_weights"][layer_index] = (
+                topk_weights.reshape(-1, topk_weights.shape[-1])[-1].detach().float().cpu()
             )
 
         return hook
@@ -269,14 +284,33 @@ def _generate_case(
                 num_layers = len(capture_layers)
                 topk = int(model.config.num_experts_per_tok)
                 prefill_components = {
-                    name: torch.stack([values[index] for index in range(num_layers)]).numpy()
-                    for name, values in component_captures.items()
-                    if name != "router_topk_ids"
+                    name: torch.stack(
+                        [component_captures[name][index] for index in range(num_layers)]
+                    ).numpy()
+                    for name in ("attention_input", "attention_output", "moe_input", "mlp_output")
                 }
+                num_experts = int(model.config.num_experts)
+                for name in ("router_raw_logits", "router_scores"):
+                    prefill_components[name] = torch.stack(
+                        [
+                            component_captures[name].get(
+                                index, torch.full((num_experts,), torch.nan, dtype=torch.float32)
+                            )
+                            for index in range(num_layers)
+                        ]
+                    ).numpy()
                 prefill_components["router_topk_ids"] = torch.stack(
                     [
                         component_captures["router_topk_ids"].get(
                             index, torch.full((topk,), -1, dtype=torch.long)
+                        )
+                        for index in range(num_layers)
+                    ]
+                ).numpy()
+                prefill_components["router_topk_weights"] = torch.stack(
+                    [
+                        component_captures["router_topk_weights"].get(
+                            index, torch.full((topk,), torch.nan, dtype=torch.float32)
                         )
                         for index in range(num_layers)
                     ]
