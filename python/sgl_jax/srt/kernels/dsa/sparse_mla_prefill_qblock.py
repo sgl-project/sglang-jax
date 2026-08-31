@@ -556,13 +556,14 @@ def _build_write_runs(loc, *, kv_packing: int, r_cap: int):
     return table, n_raw
 
 
-def _write_back_kernel(tbl_ref, row_ref, cache_in_ref, out_ref, sem):
+def _write_back_kernel(tbl_ref, row_ref, cache_in_ref, out_ref, wdst_ref, wsrc_ref, sem):
     del cache_in_ref  # aliased with out_ref; all access goes through out_ref
     Pn, pspk, pk, D = out_ref.shape
-    cache_w = out_ref.reshape(Pn * pspk, pk, D)  # word view (ref reshape: free)
-    cache_t = out_ref.reshape(Pn * pspk * pk, D)  # token view
-    Tw = row_ref.shape[0]
-    row_t = row_ref.reshape(Tw * pk, D)
+    # word view: dim0 (words) is untiled, so dynamic word offsets are legal.
+    # A flat [Pn*ps, D] token view is NOT: it inherits the (pk, ...) pairing
+    # tile on dim0 and single-token slices at odd offsets fail Mosaic
+    # alignment. Edge tokens therefore go through a word-granular RMW below.
+    cache_w = out_ref.reshape(Pn * pspk, pk, D)
     E = tbl_ref.shape[0]
 
     def entry(e, carry):
@@ -579,12 +580,30 @@ def _write_back_kernel(tbl_ref, row_ref, cache_in_ref, out_ref, sem):
 
         @pl.when((kind == 1) & (n > 0))
         def _():
+            # per-token read-modify-write at word granularity: fetch the dst
+            # word (preserving the neighbour token), overwrite one row via
+            # statically-unrolled phase branches (pk is static), write back.
             def tok(i, c):
-                cp = pltpu.make_async_copy(
-                    row_t.at[pl.ds(src + i, 1)], cache_t.at[pl.ds(dst + i, 1)], sem
-                )
-                cp.start()
-                cp.wait()
+                st = src + i
+                dt = dst + i
+                sw = st // pk
+                dw = dt // pk
+                cpa = pltpu.make_async_copy(cache_w.at[pl.ds(dw, 1)], wdst_ref, sem)
+                cpa.start()
+                cpa.wait()
+                cpb = pltpu.make_async_copy(row_ref.at[pl.ds(sw, 1)], wsrc_ref, sem)
+                cpb.start()
+                cpb.wait()
+                for spv in range(pk):
+                    for dpv in range(pk):
+
+                        @pl.when((st % pk == spv) & (dt % pk == dpv))
+                        def _(spv=spv, dpv=dpv):
+                            wdst_ref[0, dpv, :] = wsrc_ref[0, spv, :]
+
+                cpc = pltpu.make_async_copy(wdst_ref, cache_w.at[pl.ds(dw, 1)], sem)
+                cpc.start()
+                cpc.wait()
                 return c
 
             jax.lax.fori_loop(0, n, tok, 0)
@@ -633,7 +652,11 @@ def paged_write_back(
             ],
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
             out_shape=jax.ShapeDtypeStruct(cache.shape, cache.dtype),
-            scratch_shapes=[pltpu.SemaphoreType.DMA],
+            scratch_shapes=[
+                pltpu.VMEM((1, pk, D), cache.dtype),
+                pltpu.VMEM((1, pk, D), cache.dtype),
+                pltpu.SemaphoreType.DMA,
+            ],
             input_output_aliases={2: 0},
             interpret=interpret,
         )(table, row_w, cache)
