@@ -27,9 +27,10 @@ if TYPE_CHECKING:
 
 
 def l2_normalize(x: jax.Array, epsilon: float = 1e-6) -> jax.Array:
-    """L2-normalize along the last axis. Computed in fp32, cast back to input dtype."""
-    norm = jnp.linalg.norm(x.astype(jnp.float32), axis=-1, keepdims=True)
-    return (x.astype(jnp.float32) / jnp.maximum(norm, epsilon)).astype(x.dtype)
+    """Match FLA ``l2norm_fwd``: ``x / sqrt(sum(x**2) + eps)``."""
+    x32 = x.astype(jnp.float32)
+    rstd = jax.lax.rsqrt(jnp.sum(jnp.square(x32), axis=-1, keepdims=True) + epsilon)
+    return (x32 * rstd).astype(x.dtype)
 
 
 class KDAAttnBackend(LinearRecurrentAttnBackend):

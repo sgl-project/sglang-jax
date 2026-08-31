@@ -43,6 +43,7 @@ from sgl_jax.srt.layers.moe import EPMoE
 from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.deepseek_v3 import DeepseekV3Attention
+from sgl_jax.srt.utils.debug_utils import jax_debug_dump_enabled, maybe_dump_jax_array
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
@@ -667,7 +668,19 @@ class BailingMoeV3Model(nnx.Module):
         )
 
     def __call__(self, forward_batch: ForwardBatch, memory_pools):
+        maybe_dump_jax_array(
+            forward_batch.input_ids,
+            component="ling3_io",
+            name="input_ids",
+            forward_mode=forward_batch.forward_mode,
+        )
         hidden_states = self.embed_tokens(forward_batch.input_ids)
+        maybe_dump_jax_array(
+            hidden_states,
+            component="ling3_model",
+            name="embedding",
+            forward_mode=forward_batch.forward_mode,
+        )
 
         residual = None
         layers_kv_fused = []
@@ -691,10 +704,24 @@ class BailingMoeV3Model(nnx.Module):
             else:
                 layers_kv_fused.append(attn_state)
             layers_topk_ids.append(topk_ids)
+            if jax_debug_dump_enabled("ling3_layer", layer.layer_idx):
+                maybe_dump_jax_array(
+                    hidden_states + residual,
+                    component="ling3_layer",
+                    name="post_layer_hidden",
+                    layer_id=layer.layer_idx,
+                    forward_mode=forward_batch.forward_mode,
+                )
 
         if residual is not None:
             hidden_states += residual
         hidden_states = self.norm(hidden_states)
+        maybe_dump_jax_array(
+            hidden_states,
+            component="ling3_model",
+            name="final_hidden",
+            forward_mode=forward_batch.forward_mode,
+        )
         return (
             hidden_states,
             layers_kv_fused,
@@ -758,6 +785,12 @@ class BailingMoeV3ForCausalLM(nnx.Module):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         else:
             output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
+        maybe_dump_jax_array(
+            output.next_token_logits,
+            component="ling3_io",
+            name="next_token_logits",
+            forward_mode=forward_batch.forward_mode,
+        )
         return (
             output,
             {

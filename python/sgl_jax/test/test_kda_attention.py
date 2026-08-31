@@ -35,6 +35,22 @@ def test_kda_lower_bound_is_used_by_decode_gate():
     np.testing.assert_allclose(actual, expected[None, ...])
 
 
+def test_l2_normalize_matches_fla_cpu_formula():
+    x = jnp.array(
+        [
+            [0.0, 0.0, 0.0],
+            [3.0, 4.0, 0.0],
+            [1.0e-4, -2.0e-4, 3.0e-4],
+        ],
+        dtype=jnp.float32,
+    )
+    expected = np.asarray(x) / np.sqrt(
+        np.sum(np.square(np.asarray(x)), axis=-1, keepdims=True) + 1.0e-6
+    )
+
+    np.testing.assert_allclose(l2_normalize(x), expected, rtol=1e-6, atol=1e-7)
+
+
 def _scaled_randn(rng: np.random.Generator, shape, scale: float = 0.1) -> np.ndarray:
     # scale=0.1 is a test-only hack: it shrinks the recurrent state so bf16 noise
     # in the delta-rule update fits the global atol=1e-2 (shared with flashattn).
@@ -152,9 +168,14 @@ def ref_kda_attention(
     k = l2_normalize(k.reshape(k.shape[0], num_heads, head_dim))
     v = v.reshape(v.shape[0], num_heads, head_dim)
     g = a.reshape(a.shape[0], num_heads, head_dim)
-    g = -jnp.exp(a_log.reshape(num_heads, 1).astype(jnp.float32)) * jax.nn.softplus(
-        g.astype(jnp.float32) + dt_bias.reshape(num_heads, head_dim).astype(jnp.float32)
-    )
+    gate_input = g.astype(jnp.float32) + dt_bias.reshape(num_heads, head_dim).astype(jnp.float32)
+    exp_a = jnp.exp(a_log.reshape(num_heads, 1).astype(jnp.float32))
+    if layer.kda_lower_bound is None:
+        g = -exp_a * jax.nn.softplus(gate_input)
+    else:
+        # Official Ling3 / FLA safe-gate CPU formula:
+        # lower_bound * sigmoid(exp(A_log) * (g + dt_bias)).
+        g = layer.kda_lower_bound * jax.nn.sigmoid(exp_a * gate_input)
     g = g.astype(q.dtype)
 
     cu = np.asarray(cu_seqlens)
@@ -239,6 +260,7 @@ def create_test_data(
     all_have_initial_state: bool | list[bool] = False,
     initial_ssm_state: jax.Array | None = None,
     initial_conv_state: jax.Array | None = None,
+    kda_lower_bound: float | None = None,
 ):
     assert mode in ("prefill", "decode")
     forward_mode = ForwardMode.EXTEND if mode == "prefill" else ForwardMode.DECODE
@@ -283,6 +305,7 @@ def create_test_data(
             value=jax.device_put(normal((num_heads, head_dim), scale=1.0), param_head_sharding)
         ),
         scale=head_dim**-0.5,
+        kda_lower_bound=kda_lower_bound,
     )
     pool = RecurrentStatePool(
         linear_recurrent_layer_ids=[layer_id],
@@ -415,6 +438,7 @@ class TestKDAAttention(unittest.TestCase):
         all_have_initial_state: bool | list[bool] = False,
         initial_ssm_state: jax.Array | None = None,
         initial_conv_state: jax.Array | None = None,
+        kda_lower_bound: float | None = None,
     ):
         if mode_args is None:
             mode_args = (self.NUM_HEADS, self.HEAD_DIM, self.CONV_KERNEL_SIZE, self.DTYPE)
@@ -444,6 +468,7 @@ class TestKDAAttention(unittest.TestCase):
             all_have_initial_state=all_have_initial_state,
             initial_ssm_state=initial_ssm_state,
             initial_conv_state=initial_conv_state,
+            kda_lower_bound=kda_lower_bound,
         )
 
         expected, expected_ssm, expected_conv = ref_kda_attention(
@@ -521,6 +546,14 @@ class TestKDAAttention(unittest.TestCase):
             initial_conv_state=conv,
         )
 
+    def test_ling3_safe_gate_extend(self):
+        self.run_test(
+            "prefill",
+            [64],
+            mode_args=(4, 128, self.CONV_KERNEL_SIZE, self.DTYPE),
+            kda_lower_bound=-5.0,
+        )
+
     def test_single_step_decode(self):
         ssm, conv = self.random_states(batch_size=1)
         self.run_test(
@@ -529,6 +562,26 @@ class TestKDAAttention(unittest.TestCase):
             all_have_initial_state=True,
             initial_ssm_state=ssm,
             initial_conv_state=conv,
+        )
+
+    def test_ling3_safe_gate_decode(self):
+        num_heads, head_dim = 4, 128
+        ssm, conv = create_random_states(
+            1,
+            num_heads,
+            head_dim,
+            self.CONV_KERNEL_SIZE,
+            self.DTYPE,
+            self.rng,
+        )
+        self.run_test(
+            "decode",
+            [1],
+            mode_args=(num_heads, head_dim, self.CONV_KERNEL_SIZE, self.DTYPE),
+            all_have_initial_state=True,
+            initial_ssm_state=ssm,
+            initial_conv_state=conv,
+            kda_lower_bound=-5.0,
         )
 
     def test_multi_request_decode(self):

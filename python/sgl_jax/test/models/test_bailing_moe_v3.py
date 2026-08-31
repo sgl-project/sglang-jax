@@ -8,8 +8,10 @@ from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from sgl_jax.srt.configs.bailing_hybrid import BailingHybridConfig
+from sgl_jax.srt.layers.gate import TopK
 from sgl_jax.srt.layers.moe import EPMoE
 from sgl_jax.srt.model_loader.arch import get_model_architecture
 from sgl_jax.srt.models.bailing_moe_v3 import (
@@ -49,6 +51,11 @@ def _config(**overrides):
         first_k_dense_replace=1,
         n_group=2,
         topk_group=1,
+        norm_topk_prob=True,
+        routed_scaling_factor=2.5,
+        moe_router_enable_expert_bias=True,
+        score_function="sigmoid",
+        router_dtype="fp32",
         max_position_embeddings=128,
     )
     values.update(overrides)
@@ -126,3 +133,42 @@ def test_weight_mappings_cover_tiny_q_lora_and_flash_flat_q():
         flash_mappings["model.layers.1.mlp.shared_experts.gate_proj.weight"].target_path
         == "model.layers.1.experts.w1_shared"
     )
+
+
+def test_ling3_router_matches_hf_group_limited_topk():
+    """Match official BailingMoeV3Gate: top-2 sum selects groups, while
+    un-biased sigmoid scores determine the normalized routed weights.
+    """
+
+    scores = jnp.array(
+        [
+            [0.10, 0.90, 0.20, 0.30, 0.80, 0.70, 0.40, 0.50],
+            [0.95, 0.05, 0.60, 0.55, 0.10, 0.20, 0.80, 0.75],
+        ],
+        dtype=jnp.float32,
+    )
+    correction_bias = jnp.array([0.0, 0.0, 0.5, 0.4, -0.2, -0.2, 0.1, 0.1], dtype=jnp.float32)
+    topk = TopK(
+        topk=2,
+        renormalize=True,
+        num_expert_group=4,
+        topk_group=2,
+        routed_scaling_factor=2.5,
+        layer_id=1,
+    )
+
+    actual_weights, actual_ids = topk(scores, correction_bias)
+
+    choice = np.asarray(scores + correction_bias)
+    grouped = choice.reshape(2, 4, 2)
+    group_scores = np.sort(grouped, axis=-1)[..., -2:].sum(axis=-1)
+    selected_groups = np.argsort(group_scores, axis=-1)[:, -2:]
+    group_mask = np.zeros((2, 4), dtype=bool)
+    np.put_along_axis(group_mask, selected_groups, True, axis=1)
+    masked = np.where(np.repeat(group_mask, 2, axis=1), choice, -np.inf)
+    expected_ids = np.argsort(masked, axis=-1)[:, -2:][:, ::-1]
+    expected_weights = np.take_along_axis(np.asarray(scores), expected_ids, axis=1)
+    expected_weights = expected_weights / expected_weights.sum(axis=-1, keepdims=True) * 2.5
+
+    np.testing.assert_array_equal(np.asarray(actual_ids), expected_ids)
+    np.testing.assert_allclose(np.asarray(actual_weights), expected_weights, rtol=1e-6)

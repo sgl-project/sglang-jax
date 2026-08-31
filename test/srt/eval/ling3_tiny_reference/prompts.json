@@ -1,0 +1,45 @@
+{
+  "model_id": "inclusionAI/Ling-3.0-tiny",
+  "revision": "b61f4338de3e68ffc9c0bc1ed5e902981a4a929e",
+  "enable_thinking": true,
+  "max_new_tokens": 8,
+  "top_k": 20,
+  "cases": [
+    {
+      "name": "english_fact",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is the capital of France? Answer in one short sentence."
+        }
+      ]
+    },
+    {
+      "name": "chinese_math",
+      "messages": [
+        {
+          "role": "user",
+          "content": "计算 17 × 23，并说明最关键的一步。"
+        }
+      ]
+    },
+    {
+      "name": "python_code",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Write a Python function that returns the first repeated item in a list."
+        }
+      ]
+    },
+    {
+      "name": "long_prefill",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Read the following notes and return only the project codename. The launch review happened on Monday. The storage migration finished on Tuesday. The inference team validated deterministic decoding on Wednesday. The temporary benchmark pool was removed on Thursday. The project codename is Cedar Lantern. The release manager signed the checklist on Friday. The monitoring dashboard stayed green during the weekend. What is the project codename?"
+        }
+      ]
+    }
+  ]
+}
