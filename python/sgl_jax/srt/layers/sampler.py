@@ -185,6 +185,9 @@ class Sampler(nnx.Module):
             logits = apply_token_bitmask(logits, sampling_metadata.vocab_mask)
 
         if sampling_metadata.is_all_greedy:
+            logits = jax.sharding.reshard(
+                logits, NamedSharding(self.mesh, P("data", None))
+            )
             batch_next_token_ids, logprobs = self._greedy_sampling(
                 (logits, sampling_metadata, None)
             )
