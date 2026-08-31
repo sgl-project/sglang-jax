@@ -687,7 +687,7 @@ def test_internal_ledger_snapshot_rejects_duplicate_live_rid_objects():
         Scheduler._snapshot_swa_cache_ledger(scheduler, require_idle=False)
 
 
-def test_internal_ledger_snapshot_is_read_only():
+def test_internal_ledger_snapshot_rejects_mutating_cache():
     class MutatingCache(_LedgerCache):
         def cache_ledger_snapshot(self, dp_rank, live_reqs):
             self.allocator_available[dp_rank] -= 1

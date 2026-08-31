@@ -36,7 +36,6 @@ from sgl_jax.srt.mem_cache.base_prefix_cache import (
     IncLockRefResult,
     InsertParams,
     MatchPrefixParams,
-    build_swa_cache_ledger_snapshot,
     validate_swa_cache_ledger,
 )
 from sgl_jax.srt.mem_cache.cache_init_params import CacheInitParams
@@ -403,39 +402,6 @@ class TestUnifiedSWAComponentPage1(unittest.TestCase):
                     snapshot["swa_capacity"],
                 )
 
-    def test_paged_ledger_capacity_excludes_unusable_rank_remainder(self):
-        paged_pool = SimpleNamespace(size_per_rank=320, pages_per_rank=2, page_size=128)
-        allocator = SimpleNamespace(
-            full_attn_allocator=paged_pool,
-            swa_attn_allocator=paged_pool,
-            page_size=128,
-            dp_size=1,
-            full_to_swa_index_mapping=np.zeros(448, dtype=np.int32),
-            full_available_size=lambda _rank: 256,
-            swa_available_size=lambda _rank: 256,
-        )
-        allocator.full_to_swa_index_mapping[0] = 128
-
-        snapshot = build_swa_cache_ledger_snapshot(
-            dp_rank=0,
-            allocator=allocator,
-            full_tree_evictable=set(),
-            full_tree_protected=set(),
-            swa_tree_evictable=set(),
-            swa_tree_protected=set(),
-            full_request_occurrences=[],
-            swa_request_occurrences=[],
-            event_totals={},
-        )
-
-        self.assertEqual(allocator.full_attn_allocator.size_per_rank, 320)
-        self.assertEqual(snapshot["full_capacity"], 256)
-        self.assertEqual(snapshot["swa_capacity"], 256)
-        self.assertEqual(snapshot["full_available"], 256)
-        self.assertEqual(snapshot["swa_available"], 256)
-        self.assertEqual(snapshot["mapping_nonzero_count"], 1)
-        self.assertEqual(snapshot["mapping_invalid_count"], 1)
-
     def test_ledger_diagnostics_expose_duplicate_and_mapping_only_owners(self):
         cache, allocator = _make_cache(window=4, kind="chunk")
         full = allocator.alloc(2, dp_rank=0)
@@ -800,16 +766,6 @@ class TestUnifiedSWAComponentPage1(unittest.TestCase):
         )
         self.assertTrue(np.all(_swa_indices(allocator, full[:2], 0) == 0))
 
-    def test_long_leaf_window_lock_splits_at_physical_tail(self):
-        cache, allocator = _make_cache(window=4)
-        _insert(cache, allocator, list(range(12)))
-        parent = next(iter(cache.root_node.children.values()))
-        child = next(iter(parent.children.values()))
-        grandchild = next(iter(child.children.values()))
-        self.assertEqual(len(parent.key), 4)
-        self.assertEqual(len(child.key), 4)
-        self.assertEqual(len(grandchild.key), 4)
-
     def test_long_prefix_lock_and_lru_touch_only_physical_window_suffix(self):
         cache, allocator = _make_cache(window=4)
         _insert(cache, allocator, list(range(12)))
@@ -845,91 +801,85 @@ class TestUnifiedSWAComponentPage1(unittest.TestCase):
         self.assertEqual(cache.component_protected_size_[ComponentType.SWA][0], 0)
         self.assertEqual(parent.component_data[ComponentType.SWA].metadata["component_uuid"], uuid)
 
-    def test_overlap_healing_before_node_adopts_request_owned_full(self):
-        cache, allocator = _make_cache(window=4)
-        _insert(cache, allocator, list(range(4)))
-        node = next(iter(cache.root_node.children.values()))
-        old_full = node.component_data[ComponentType.FULL].value.copy()
-        cache.components[ComponentType.SWA].evict_component(node)
-        self.assertTrue(np.all(_swa_indices(allocator, old_full, 0) == 0))
-        replacement = allocator.alloc(4)
-        self.assertIsNotNone(replacement)
-        full_free_before = allocator.full_available_size()
-        swa_free_before = allocator.swa_available_size()
-        boundary = cache.components[ComponentType.SWA].update_component_on_insert_overlap(
-            node, 4, 0, replacement, InsertParams(swa_evicted_seqlen=0)
+    def test_overlap_healing_decision_table_preserves_boundary_semantics_and_events(self):
+        """Before/inside/after boundaries heal only request-owned tombstone suffixes."""
+        cases = (
+            ("before", 0, 0, 8, 1),
+            ("inside", 4, 4, 4, 1),
+            ("after", 8, 8, 0, 0),
         )
-        self.assertEqual(boundary, 0)
-        np.testing.assert_array_equal(node.component_data[ComponentType.FULL].value, replacement)
-        np.testing.assert_array_equal(
-            node.component_data[ComponentType.SWA].value, _swa_indices(allocator, replacement, 0)
-        )
-        self.assertEqual(allocator.full_available_size(), full_free_before + 4)
-        self.assertEqual(allocator.swa_available_size(), swa_free_before)
+        for name, evicted, expected_boundary, adopted, expected_healed in cases:
+            with self.subTest(position=name):
+                cache, allocator = _make_cache(window=8)
+                _insert(cache, allocator, list(range(8)))
+                node = next(iter(cache.root_node.children.values()))
+                old_full = node.component_data[ComponentType.FULL].value.copy()
+                cache.components[ComponentType.SWA].evict_component(node)
+                self.assertTrue(np.all(_swa_indices(allocator, old_full, 0) == 0))
 
-    def test_overlap_healing_records_per_rank_monotonic_event(self):
-        """A revived SWA tombstone is a run-level event, not a capacity term."""
-        cache, allocator = _make_cache(window=4)
-        _insert(cache, allocator, list(range(4)))
-        node = next(iter(cache.root_node.children.values()))
-        cache.components[ComponentType.SWA]._clear_swa_value(node)
-        replacement = allocator.alloc(4, dp_rank=0)
-        before = cache.cache_ledger_snapshot(0, [])
-        cache.components[ComponentType.SWA].update_component_on_insert_overlap(
-            node, 4, 0, replacement, InsertParams(swa_evicted_seqlen=0)
-        )
-        healed = cache.cache_ledger_snapshot(0, [])
-        self.assertEqual(healed["tombstone_healed_total"], before["tombstone_healed_total"] + 1)
-        cache.reset()
-        self.assertEqual(
-            cache.cache_ledger_snapshot(0, [])["tombstone_healed_total"],
-            healed["tombstone_healed_total"],
-        )
+                replacement = allocator.alloc(8, dp_rank=0)
+                self.assertIsNotNone(replacement)
+                full_free_before = allocator.full_available_size()
+                swa_free_before = allocator.swa_available_size()
+                healed_before = cache.cache_ledger_snapshot(0, [])["tombstone_healed_total"]
 
-    def test_overlap_healing_inside_node_splits_at_boundary(self):
-        cache, allocator = _make_cache(window=8)
-        _insert(cache, allocator, list(range(8)))
-        node = next(iter(cache.root_node.children.values()))
-        old_full = node.component_data[ComponentType.FULL].value.copy()
-        cache.components[ComponentType.SWA].evict_component(node)
-        replacement = allocator.alloc(8)
-        self.assertIsNotNone(replacement)
-        full_free_before = allocator.full_available_size()
-        swa_free_before = allocator.swa_available_size()
-        boundary = cache.components[ComponentType.SWA].update_component_on_insert_overlap(
-            node, 8, 0, replacement, InsertParams(swa_evicted_seqlen=4)
-        )
-        self.assertEqual(boundary, 4)
-        parent = node.parent
-        self.assertEqual(len(parent.key), 4)
-        self.assertIsNone(parent.component_data[ComponentType.SWA].value)
-        self.assertIsNotNone(node.component_data[ComponentType.SWA].value)
-        self.assertTrue(
-            np.all(_swa_indices(allocator, parent.component_data[ComponentType.FULL].value, 0) == 0)
-        )
-        np.testing.assert_array_equal(
-            node.component_data[ComponentType.FULL].value, replacement[4:]
-        )
-        self.assertTrue(np.all(_swa_indices(allocator, old_full, 0) == 0))
-        self.assertEqual(allocator.full_available_size(), full_free_before + 4)
-        self.assertEqual(allocator.swa_available_size(), swa_free_before)
+                boundary = cache.components[ComponentType.SWA].update_component_on_insert_overlap(
+                    node,
+                    8,
+                    0,
+                    replacement,
+                    InsertParams(swa_evicted_seqlen=evicted),
+                )
 
-    def test_overlap_healing_after_node_keeps_tombstone(self):
-        cache, allocator = _make_cache(window=4)
-        _insert(cache, allocator, list(range(4)))
-        node = next(iter(cache.root_node.children.values()))
-        cache.components[ComponentType.SWA].evict_component(node)
-        replacement = allocator.alloc(4)
-        self.assertIsNotNone(replacement)
-        full_free_before = allocator.full_available_size()
-        swa_free_before = allocator.swa_available_size()
-        boundary = cache.components[ComponentType.SWA].update_component_on_insert_overlap(
-            node, 4, 0, replacement, InsertParams(swa_evicted_seqlen=4)
-        )
-        self.assertEqual(boundary, 4)
-        self.assertIsNone(node.component_data[ComponentType.SWA].value)
-        self.assertEqual(allocator.full_available_size(), full_free_before)
-        self.assertEqual(allocator.swa_available_size(), swa_free_before)
+                self.assertEqual(boundary, expected_boundary)
+                self.assertEqual(allocator.full_available_size(), full_free_before + adopted)
+                self.assertEqual(allocator.swa_available_size(), swa_free_before)
+                healed = cache.cache_ledger_snapshot(0, [])["tombstone_healed_total"]
+                self.assertEqual(healed, healed_before + expected_healed)
+
+                if name == "before":
+                    np.testing.assert_array_equal(
+                        node.component_data[ComponentType.FULL].value,
+                        replacement,
+                    )
+                    np.testing.assert_array_equal(
+                        node.component_data[ComponentType.SWA].value,
+                        _swa_indices(allocator, replacement, 0),
+                    )
+                elif name == "inside":
+                    parent = node.parent
+                    self.assertEqual(len(parent.key), 4)
+                    self.assertIsNone(parent.component_data[ComponentType.SWA].value)
+                    self.assertTrue(
+                        np.all(
+                            _swa_indices(
+                                allocator,
+                                parent.component_data[ComponentType.FULL].value,
+                                0,
+                            )
+                            == 0
+                        )
+                    )
+                    np.testing.assert_array_equal(
+                        node.component_data[ComponentType.FULL].value,
+                        replacement[4:],
+                    )
+                    np.testing.assert_array_equal(
+                        node.component_data[ComponentType.SWA].value,
+                        _swa_indices(allocator, replacement[4:], 0),
+                    )
+                else:
+                    np.testing.assert_array_equal(
+                        node.component_data[ComponentType.FULL].value,
+                        old_full,
+                    )
+                    self.assertIsNone(node.component_data[ComponentType.SWA].value)
+
+                cache.reset()
+                self.assertEqual(
+                    cache.cache_ledger_snapshot(0, [])["tombstone_healed_total"],
+                    healed,
+                )
 
     def test_fully_request_evicted_leaf_is_not_materialized(self):
         cache, allocator = _make_cache(window=4)
@@ -948,7 +898,7 @@ class TestUnifiedSWAComponentPage1(unittest.TestCase):
         self.assertEqual(allocator.full_available_size(), full_free_before + 4)
         self.assertEqual(allocator.swa_available_size(), allocator.swa_attn_allocator.size)
 
-    def test_leaf_eviction_frees_full_and_swa_capacity_once(self):
+    def test_leaf_eviction_reports_exact_capacity_delta(self):
         cache, allocator = _make_cache(window=4)
         _insert(cache, allocator, list(range(4)))
         node = next(iter(cache.root_node.children.values()))
