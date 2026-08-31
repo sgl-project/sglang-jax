@@ -166,7 +166,7 @@ class CompilationManager:
 
         start_time = time.perf_counter()
         bs = self.max_padded_batch_size
-        multimodal_options = (False, True) if self.precompile_in_model_multimodal else (False,)
+        multimodal_options = (True,) if self.precompile_in_model_multimodal else (False,)
         logger.info(
             "[EXTEND] Begin to precompile bs_paddings=%s token_paddings=%s multimodal=%s",
             [bs],
@@ -201,14 +201,14 @@ class CompilationManager:
                         precompile_multimodal_inputs,
                     )
 
-                    input_embedding, deepstack = precompile_multimodal_inputs(
+                    input_embedding, deepstack, apply_for_deepstack = precompile_multimodal_inputs(
                         batch.forward_batch.input_ids,
                         model_runner.model,
                         model_runner.embedding_pool,
                     )
                     batch.forward_batch.input_embedding = input_embedding
                     batch.forward_batch.deepstack_visual_embedding = deepstack
-                    batch.forward_batch.apply_for_deepstack = deepstack is not None
+                    batch.forward_batch.apply_for_deepstack = apply_for_deepstack
                 if future_token_ids_map is not None:
                     from sgl_jax.srt.managers.utils import resolve_future_token_ids
 
@@ -218,13 +218,12 @@ class CompilationManager:
                 forward_fn(
                     batch,
                     launch_done=None,
-                    skip_sample=use_multimodal_input,
+                    skip_sample=False,
                     sampling_metadata=sampling_metadata,
                 )
+                self._compiled_variants.add((ForwardMode.EXTEND, num_tokens, bs_val, False))
                 if use_multimodal_input:
                     self._compiled_multimodal_extend_shapes.add((num_tokens, bs_val))
-                else:
-                    self._compiled_variants.add((ForwardMode.EXTEND, num_tokens, bs_val, False))
 
         end_time = time.perf_counter()
         logger.info("[EXTEND] Precompile finished in %.0f secs", end_time - start_time)
