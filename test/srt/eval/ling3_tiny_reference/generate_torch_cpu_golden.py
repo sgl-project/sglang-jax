@@ -41,6 +41,7 @@ def _load_model(model_path: str, revision: str):
         revision=revision,
         trust_remote_code=True,
         low_cpu_mem_usage=True,
+        attn_implementation="eager",
     )
     try:
         return AutoModelForCausalLM.from_pretrained(
@@ -57,7 +58,9 @@ def _load_model(model_path: str, revision: str):
 
 
 def _make_reduced_config(model_path: str, revision: str):
-    config = AutoConfig.from_pretrained(model_path, revision=revision, trust_remote_code=True)
+    config = AutoConfig.from_pretrained(
+        model_path, revision=revision, trust_remote_code=True
+    )
     overrides = {
         "vocab_size": 64,
         "pad_token_id": 0,
@@ -155,9 +158,13 @@ def run_cpu_op_self_test(model_path: str, revision: str) -> None:
     with torch.inference_mode():
         output = model(input_ids=input_ids, use_cache=True, return_dict=True)
         if output.logits.shape != (1, input_ids.shape[1], config.vocab_size):
-            raise AssertionError(f"Unexpected self-test logits shape: {output.logits.shape}")
+            raise AssertionError(
+                f"Unexpected self-test logits shape: {output.logits.shape}"
+            )
         if not torch.isfinite(output.logits.float()).all():
-            raise AssertionError("CPU reference op self-test produced non-finite logits")
+            raise AssertionError(
+                "CPU reference op self-test produced non-finite logits"
+            )
         decode = model(
             input_ids=torch.tensor([[8]], dtype=torch.long),
             attention_mask=torch.ones((1, input_ids.shape[1] + 1), dtype=torch.long),
@@ -166,9 +173,13 @@ def run_cpu_op_self_test(model_path: str, revision: str) -> None:
             return_dict=True,
         )
         if decode.logits.shape != (1, 1, config.vocab_size):
-            raise AssertionError(f"Unexpected decode logits shape: {decode.logits.shape}")
+            raise AssertionError(
+                f"Unexpected decode logits shape: {decode.logits.shape}"
+            )
         if not torch.isfinite(decode.logits.float()).all():
-            raise AssertionError("CPU reference op decode self-test produced non-finite logits")
+            raise AssertionError(
+                "CPU reference op decode self-test produced non-finite logits"
+            )
     print("CPU reference op self-test passed", flush=True)
 
 
@@ -212,14 +223,19 @@ def _install_prefill_capture_hooks(model):
     def capture_router(layer_index: int):
         def hook(_module, _inputs, output):
             topk_ids, topk_weights, raw_logits = output
-            raw_logits = raw_logits.reshape(-1, raw_logits.shape[-1])[-1].detach().float().cpu()
+            raw_logits = (
+                raw_logits.reshape(-1, raw_logits.shape[-1])[-1].detach().float().cpu()
+            )
             captures["router_raw_logits"][layer_index] = raw_logits
             captures["router_scores"][layer_index] = torch.sigmoid(raw_logits)
             captures["router_topk_ids"][layer_index] = (
                 topk_ids.reshape(-1, topk_ids.shape[-1])[-1].detach().cpu()
             )
             captures["router_topk_weights"][layer_index] = (
-                topk_weights.reshape(-1, topk_weights.shape[-1])[-1].detach().float().cpu()
+                topk_weights.reshape(-1, topk_weights.shape[-1])[-1]
+                .detach()
+                .float()
+                .cpu()
             )
 
         return hook
@@ -232,14 +248,18 @@ def _install_prefill_capture_hooks(model):
             )
         )
         handles.append(
-            layer.attention.register_forward_hook(capture_hidden("attention_output", layer_index))
+            layer.attention.register_forward_hook(
+                capture_hidden("attention_output", layer_index)
+            )
         )
         handles.append(
             layer.post_attention_layernorm.register_forward_hook(
                 capture_hidden("moe_input", layer_index)
             )
         )
-        handles.append(layer.mlp.register_forward_hook(capture_hidden("mlp_output", layer_index)))
+        handles.append(
+            layer.mlp.register_forward_hook(capture_hidden("mlp_output", layer_index))
+        )
         gate = getattr(layer.mlp, "gate", None)
         if gate is not None:
             handles.append(gate.register_forward_hook(capture_router(layer_index)))
@@ -264,7 +284,9 @@ def _generate_case(
     first_token_logits = None
     prefill_hidden_states = None
     prefill_components = None
-    capture_layers, component_captures, capture_handles = _install_prefill_capture_hooks(model)
+    capture_layers, component_captures, capture_handles = (
+        _install_prefill_capture_hooks(model)
+    )
 
     with torch.inference_mode():
         for step in range(max_new_tokens):
@@ -290,14 +312,22 @@ def _generate_case(
                     name: torch.stack(
                         [component_captures[name][index] for index in range(num_layers)]
                     ).numpy()
-                    for name in ("attention_input", "attention_output", "moe_input", "mlp_output")
+                    for name in (
+                        "attention_input",
+                        "attention_output",
+                        "moe_input",
+                        "mlp_output",
+                    )
                 }
                 num_experts = int(model.config.num_experts)
                 for name in ("router_raw_logits", "router_scores"):
                     prefill_components[name] = torch.stack(
                         [
                             component_captures[name].get(
-                                index, torch.full((num_experts,), torch.nan, dtype=torch.float32)
+                                index,
+                                torch.full(
+                                    (num_experts,), torch.nan, dtype=torch.float32
+                                ),
                             )
                             for index in range(num_layers)
                         ]
@@ -372,9 +402,16 @@ def main() -> None:
         return
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    tokenizer = AutoTokenizer.from_pretrained(model_path, revision=revision, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path, revision=revision, trust_remote_code=True
+    )
     load_started = time.perf_counter()
     model = _load_model(model_path, revision)
+    if model.config._attn_implementation != "eager":
+        raise RuntimeError(
+            "Torch CPU golden requires a causal eager attention mask, got "
+            f"{model.config._attn_implementation!r}"
+        )
     patches = install_cpu_reference_ops(model)
     model.eval()
     load_seconds = time.perf_counter() - load_started
@@ -417,6 +454,7 @@ def main() -> None:
         "modeling_source": str(modeling_source),
         "modeling_source_sha256": _sha256(modeling_source),
         "cpu_op_replacements": patches,
+        "attn_implementation": model.config._attn_implementation,
         "torch_version": torch.__version__,
         "transformers_version": __import__("transformers").__version__,
         "python_version": platform.python_version(),
