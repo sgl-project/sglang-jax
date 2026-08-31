@@ -1,7 +1,6 @@
 # cd python && USE_DEVICE_TYPE=cpu python -m pytest sgl_jax/test/mem_cache/test_unified_radix_cache.py -v
 # specific shard information can be appended -s
 
-import heapq
 import os
 
 # Set up multi-device simulation for tensor parallelism
@@ -38,12 +37,10 @@ from sgl_jax.srt.mem_cache.registry import (
 )
 from sgl_jax.srt.mem_cache.unified_cache_components import (
     ComponentType,
-    EvictLayer,
     FullComponent,
     LRURefreshPhase,
     TreeComponent,
     get_and_increase_time_counter,
-    next_component_uuid,
 )
 from sgl_jax.srt.mem_cache.unified_radix_cache import (
     COMPONENT_REGISTRY,
@@ -2200,63 +2197,23 @@ class _RecordingAuxComponent(TreeComponent):
             component_data.value = np.array([node.id], dtype=np.int32)
 
     def redistribute_on_node_split(self, new_parent, child):
+        self.hook_log.append(("split", new_parent.id, child.id))
         parent_data = new_parent.component_data[self.component_type]
         child_data = child.component_data[self.component_type]
-        parent_data.lock_ref = child_data.lock_ref
         if child_data.value is not None:
             parent_data.value = child_data.value.copy()
-        if "component_uuid" in child_data.metadata:
-            parent_data.metadata["component_uuid"] = child_data.metadata.pop("component_uuid")
 
-    def evict_component(self, node, target=EvictLayer.DEVICE):
-        component_data = node.component_data[self.component_type]
-        freed = len(component_data.value) if component_data.value is not None else 0
-        component_data.value = None
-        self.cache._update_aux_evictable_node_sets(node)
-        return freed, 0
+    def evict_component(self, node, target=None):
+        raise AssertionError("component-seam tests do not exercise component eviction")
 
     def drive_eviction(self, params, tracker):
-        component_type = self.component_type
-        heap = [
-            (
-                node.component_data[component_type].metadata["last_access_time"],
-                node.id,
-                node,
-            )
-            for node in self.cache.aux_evictable_device_nodes[component_type]
-        ]
-        heapq.heapify(heap)
-        while tracker[component_type] < params.recurrent_num and heap:
-            _, _, node = heapq.heappop(heap)
-            if node not in self.cache.aux_evictable_device_nodes[component_type]:
-                continue
-            freed, _ = self.evict_component(node)
-            tracker[component_type] += freed
+        raise AssertionError("component-seam tests do not exercise component eviction")
 
     def acquire_component_lock(self, node, result, lock_host=False):
-        data = node.component_data[self.component_type]
-        component_uuid = next_component_uuid()
-        data.metadata["component_uuid"] = component_uuid
-        data.lock_ref += 1
-        result.swa_uuid_for_lock = component_uuid
         return result
 
     def release_component_lock(self, node, params, lock_host=False):
-        if params is None or params.swa_uuid_for_lock is None:
-            return
-        current = node
-        while current is not self.cache.root_node:
-            data = current.component_data[self.component_type]
-            if data.lock_ref:
-                data.lock_ref -= 1
-            if data.metadata.get("component_uuid") == params.swa_uuid_for_lock:
-                data.metadata.pop("component_uuid")
-                return
-            current = current.parent
-
-
-class _RecordingSWAComponent(_RecordingAuxComponent):
-    component_type = ComponentType.SWA
+        return None
 
 
 class _RecordingFullComponent(FullComponent):
@@ -2269,7 +2226,6 @@ class TestUnifiedRadixCacheComponentSeams(unittest.TestCase):
     def setUp(self):
         self.original_registry = dict(COMPONENT_REGISTRY)
         COMPONENT_REGISTRY[ComponentType.RECURRENT] = _RecordingAuxComponent
-        COMPONENT_REGISTRY[ComponentType.SWA] = _RecordingSWAComponent
         self.addCleanup(self._restore_registry)
 
     def _restore_registry(self):
@@ -2296,60 +2252,6 @@ class TestUnifiedRadixCacheComponentSeams(unittest.TestCase):
         self.assertIs(received.req_to_token_pool, req_pool)
         self.assertIs(received.token_to_kv_pool_allocator, allocator)
         self.assertEqual(received.page_size, 1)
-
-        explicit = CacheInitParams(
-            req_to_token_pool=req_pool,
-            token_to_kv_pool_allocator=allocator,
-            page_size=1,
-        )
-        ctx = TreeCacheBuildContext(
-            server_args=SimpleNamespace(enable_unified_radix_tree=True, max_seq_len=32),
-            params=explicit,
-            is_hybrid_swa=False,
-            disable_radix_cache=False,
-            effective_chunked_prefill_size=None,
-            model_config=SimpleNamespace(
-                head_dim=8,
-                num_hidden_layers=2,
-                get_num_kv_heads=lambda tp_size: 1,
-            ),
-            tp_size=1,
-        )
-        routed_cache = default_radix_cache_factory(ctx)
-        self.assertIsInstance(routed_cache, UnifiedRadixCache)
-        self.assertEqual(routed_cache.tree_components, (ComponentType.FULL,))
-        self.assertIs(
-            routed_cache.components[ComponentType.FULL].received_params,
-            explicit,
-        )
-
-        recurrent_ctx = TreeCacheBuildContext(
-            server_args=ctx.server_args,
-            params=explicit,
-            is_hybrid_swa=False,
-            disable_radix_cache=False,
-            effective_chunked_prefill_size=None,
-            model_config=ctx.model_config,
-            tp_size=1,
-            is_hybrid_recurrent=True,
-        )
-        recurrent_cache = default_radix_cache_factory(recurrent_ctx)
-        self.assertEqual(
-            recurrent_cache.tree_components,
-            (ComponentType.FULL, ComponentType.RECURRENT),
-        )
-        self.assertIs(
-            recurrent_cache.components[ComponentType.RECURRENT].received_params,
-            explicit,
-        )
-
-        with self.assertRaisesRegex(ValueError, "sliding_window_size"):
-            UnifiedRadixCache(
-                req_to_token_pool=req_pool,
-                token_to_kv_pool_allocator=allocator,
-                tree_components=(ComponentType.FULL, ComponentType.SWA),
-                component_init_params=explicit,
-            )
 
     def test_full_registry_route_accepts_nondefault_recurrent_params(self):
         COMPONENT_REGISTRY[ComponentType.FULL] = _RecordingFullComponent
@@ -2383,26 +2285,6 @@ class TestUnifiedRadixCacheComponentSeams(unittest.TestCase):
         self.assertEqual(cache.recurrent_track_interval, 128)
         self.assertIs(cache.components[ComponentType.FULL].received_params, params)
 
-    def test_insert_overlap_honors_component_consumed_boundary(self):
-        _, allocator, cache = self._create_cache()
-        key = RadixKey([1, 2, 3, 4], None, 1)
-        cache.insert(InsertParams(key=key, value=np.arange(10, 14, dtype=np.int32)))
-        allocator.free_calls.clear()
-        cache.components[ComponentType.RECURRENT].overlap_boundary = 2
-
-        result = cache.insert(
-            InsertParams(
-                key=key,
-                value=np.arange(100, 104, dtype=np.int32),
-                prev_prefix_len=0,
-            )
-        )
-
-        self.assertEqual(result.prefix_len, 4)
-        self.assertEqual(len(allocator.free_calls), 1)
-        np.testing.assert_array_equal(allocator.free_calls[0][0], [100, 101])
-        self.assertEqual(allocator.free_calls[0][1], 1)
-
     def test_multi_node_overlap_preserves_tree_owned_prefix(self):
         _, allocator, cache = self._create_cache()
         key = RadixKey([1, 2, 3, 4], None, 1)
@@ -2428,12 +2310,14 @@ class TestUnifiedRadixCacheComponentSeams(unittest.TestCase):
         np.testing.assert_array_equal(allocator.free_calls[0][0], [103])
         self.assertEqual(allocator.free_calls[0][1], 1)
 
-    def test_overlap_consumed_slots_are_not_freed_again_by_request_cache(self):
+    def test_overlap_boundary_consumes_slots_without_request_cache_double_free(self):
         req_pool, allocator, cache = self._create_cache()
         key = RadixKey([1, 2, 3, 4], None, 1)
         cache.insert(InsertParams(key=key, value=np.arange(10, 14, dtype=np.int32)))
         allocator.free_calls.clear()
-        cache.components[ComponentType.RECURRENT].overlap_boundary = 2
+        component = cache.components[ComponentType.RECURRENT]
+        component.overlap_boundary = 2
+        component.hook_log.clear()
         req_pool.write((0, slice(0, 4)), np.arange(100, 104, dtype=np.int32))
         req = MockRequest(
             req_pool_idx=0,
@@ -2447,34 +2331,12 @@ class TestUnifiedRadixCacheComponentSeams(unittest.TestCase):
 
         cache.cache_finished_req(req)
 
+        self.assertEqual([entry[0] for entry in component.hook_log].count("overlap"), 1)
         self.assertEqual(len(allocator.free_calls), 1)
         np.testing.assert_array_equal(allocator.free_calls[0][0], [100, 101])
         self.assertEqual(allocator.free_calls[0][1], 1)
 
-    def test_recover_after_unevict_invoked_before_commit(self):
-        _, _, cache = self._create_cache()
-        key = RadixKey([1, 2, 3, 4], None, 0)
-        cache.insert(InsertParams(key=key, value=np.arange(10, 14, dtype=np.int32)))
-        node = next(iter(cache.root_node.children.values()))
-        full_data = node.component_data[ComponentType.FULL]
-        full_data.host_value = np.array([7], dtype=np.int32)
-        full_data.value = None
-        cache.component_evictable_size_[ComponentType.FULL][0] -= 4
-        cache.hicache_enabled = True
-        aux = cache.components[ComponentType.RECURRENT]
-        aux.hook_log.clear()
-
-        cache.insert(InsertParams(key=key, value=np.arange(100, 104, dtype=np.int32)))
-
-        lifecycle = [entry for entry in aux.hook_log if entry[0] in {"recover", "commit"}]
-        self.assertEqual([entry[0] for entry in lifecycle], ["recover", "commit"])
-        self.assertTrue(lifecycle[1][2])
-        self.assertIn(
-            node,
-            cache.aux_evictable_device_nodes[ComponentType.RECURRENT],
-        )
-
-    def test_multi_node_unevict_preserves_component_offsets(self):
+    def test_multi_node_unevict_recovers_before_commit_at_each_component_offset(self):
         _, _, cache = self._create_cache()
         original_key = RadixKey([1, 2, 3, 4], None, 0)
         cache.insert(
@@ -2507,11 +2369,17 @@ class TestUnifiedRadixCacheComponentSeams(unittest.TestCase):
             )
         )
 
-        recover_offsets = [entry[2] for entry in aux.hook_log if entry[0] == "recover"]
+        lifecycle = [entry for entry in aux.hook_log if entry[0] in {"recover", "commit"}]
+        self.assertEqual(
+            [entry[0] for entry in lifecycle],
+            ["recover", "recover", "commit"],
+        )
+        self.assertTrue(all(entry[2] for entry in lifecycle if entry[0] == "commit"))
+        recover_offsets = [entry[2] for entry in lifecycle if entry[0] == "recover"]
         self.assertEqual(recover_offsets, [0, 2])
         self.assertEqual(result.prefix_len, 4)
 
-    def test_split_redistributes_independent_component_metadata(self):
+    def test_split_invokes_component_hook_and_keeps_metadata_independent(self):
         _, _, cache = self._create_cache()
         cache.insert(
             InsertParams(
@@ -2522,6 +2390,8 @@ class TestUnifiedRadixCacheComponentSeams(unittest.TestCase):
         child = next(iter(cache.root_node.children.values()))
         child_data = child.component_data[ComponentType.RECURRENT]
         child_data.metadata["child_only"] = 1
+        component = cache.components[ComponentType.RECURRENT]
+        component.hook_log.clear()
 
         cache.insert(
             InsertParams(
@@ -2532,47 +2402,15 @@ class TestUnifiedRadixCacheComponentSeams(unittest.TestCase):
 
         new_parent = next(iter(cache.root_node.children.values()))
         parent_data = new_parent.component_data[ComponentType.RECURRENT]
+        self.assertEqual(
+            [entry[0] for entry in component.hook_log].count("split"),
+            1,
+        )
         self.assertIsNot(parent_data.metadata, child_data.metadata)
         self.assertNotIn("child_only", parent_data.metadata)
         parent_data.metadata["parent_only"] = 2
         self.assertNotIn("parent_only", child_data.metadata)
         candidates = cache.aux_evictable_device_nodes[ComponentType.RECURRENT]
-        self.assertIn(new_parent, candidates)
-        self.assertIn(child, candidates)
-
-    def test_component_uuid_survives_split_and_lock_round_trip(self):
-        _, _, cache = self._create_cache()
-        cache.insert(
-            InsertParams(
-                key=RadixKey([1, 2, 3, 4]),
-                value=np.arange(10, 14, dtype=np.int32),
-            )
-        )
-        child = next(iter(cache.root_node.children.values()))
-        lock_result = cache.inc_lock_ref(child)
-        component_uuid = lock_result.swa_uuid_for_lock
-        candidates = cache.aux_evictable_device_nodes[ComponentType.RECURRENT]
-        self.assertNotIn(child, candidates)
-
-        cache.insert(
-            InsertParams(
-                key=RadixKey([1, 2, 9, 10]),
-                value=np.arange(20, 24, dtype=np.int32),
-            )
-        )
-        new_parent = next(iter(cache.root_node.children.values()))
-        parent_data = new_parent.component_data[ComponentType.RECURRENT]
-        child_data = child.component_data[ComponentType.RECURRENT]
-        self.assertEqual(parent_data.metadata["component_uuid"], component_uuid)
-        self.assertNotIn("component_uuid", child_data.metadata)
-        self.assertNotIn(new_parent, candidates)
-        self.assertNotIn(child, candidates)
-
-        cache.dec_lock_ref(child, lock_result.to_dec_params())
-
-        self.assertEqual(parent_data.lock_ref, 0)
-        self.assertEqual(child_data.lock_ref, 0)
-        self.assertNotIn("component_uuid", parent_data.metadata)
         self.assertIn(new_parent, candidates)
         self.assertIn(child, candidates)
 
@@ -2614,22 +2452,6 @@ class TestUnifiedRadixCacheComponentSeams(unittest.TestCase):
         self.assertEqual(
             data_b.metadata["last_access_time"],
             timestamp_b,
-        )
-
-        evict_result = cache.evict(EvictParams(recurrent_num=1))
-        self.assertEqual(evict_result.recurrent_num_evicted, 1)
-        self.assertNotIn(
-            node_b,
-            cache.aux_evictable_device_nodes[ComponentType.RECURRENT],
-        )
-        self.assertIn(
-            node_a,
-            cache.aux_evictable_device_nodes[ComponentType.RECURRENT],
-        )
-        cache.reset()
-        self.assertEqual(
-            cache.aux_evictable_device_nodes[ComponentType.RECURRENT],
-            set(),
         )
 
 

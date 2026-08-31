@@ -337,7 +337,6 @@ class SWAComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> int | None:
-        del token_ids_len
-        if is_finished:
-            insert_params.swa_evicted_seqlen = req.swa_evicted_seqlen
+        del token_ids_len, is_finished
+        insert_params.swa_evicted_seqlen = req.swa_evicted_seqlen
         return None

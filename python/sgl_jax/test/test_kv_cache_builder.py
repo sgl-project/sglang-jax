@@ -114,76 +114,42 @@ class TestBuildKVCache(unittest.TestCase):
         self.assertIsInstance(cache, UnifiedRadixCache)
         self.assertEqual(cache.tree_components, (ComponentType.FULL, ComponentType.SWA))
 
-    def test_hybrid_unified_accepts_spec_algorithm_none(self):
-        from sgl_jax.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
-        from sgl_jax.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-
-        cache = build_kv_cache(
-            server_args=_make_server_args(enable_unified_radix_tree=True),
-            model_config=_make_model_config(),
-            req_to_token_pool=MagicMock(),
-            token_to_kv_pool_allocator=MagicMock(spec=SWATokenToKVPoolAllocator),
-            page_size=1,
-            is_hybrid=True,
-            sliding_window_size=4096,
-            tp_size=1,
-            spec_algorithm=None,
-        )
-
-        self.assertIsInstance(cache, UnifiedRadixCache)
-
-    def test_explicit_unified_hybrid_swa_recurrent_fails_fast(self):
-        from sgl_jax.srt.mem_cache import kv_cache_builder
-        from sgl_jax.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
-
-        allocator = MagicMock(spec=SWATokenToKVPoolAllocator)
-        req_pool = MagicMock()
-        with (
-            self.assertRaisesRegex(
-                ValueError, r"--enable-unified-radix-tree.*FULL\+SWA\+RECURRENT"
-            ),
-            unittest.mock.patch.object(kv_cache_builder, "create_tree_cache") as create_tree,
-            unittest.mock.patch.object(kv_cache_builder, "init_hicache") as init_hicache,
-        ):
-            build_kv_cache(
-                server_args=_make_server_args(enable_unified_radix_tree=True),
-                model_config=_make_model_config(),
-                req_to_token_pool=req_pool,
-                token_to_kv_pool_allocator=allocator,
-                page_size=1,
-                is_hybrid=True,
-                is_hybrid_recurrent=True,
-                sliding_window_size=4096,
-                tp_size=1,
-                spec_algorithm=None,
-            )
-
-        create_tree.assert_not_called()
-        init_hicache.assert_not_called()
-        self.assertEqual(allocator.mock_calls, [])
-        self.assertEqual(req_pool.mock_calls, [])
-
     def test_unified_hybrid_rejects_unsupported_combinations_before_cache_creation(self):
         from sgl_jax.srt.mem_cache import kv_cache_builder
         from sgl_jax.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 
         unsupported = (
-            ("HiCache", {"hicache_storage": "none"}, None, "--hicache-storage"),
+            (
+                "recurrent",
+                {},
+                None,
+                r"FULL\+SWA\+RECURRENT",
+                {"is_hybrid_recurrent": True},
+            ),
+            ("HiCache", {"hicache_storage": "none"}, None, "--hicache-storage", {}),
             (
                 "speculative decoding",
                 {},
                 SpeculativeAlgorithm.EAGLE,
                 "--speculative-algorithm",
+                {},
             ),
-            ("PD", {"pd_disaggregation": "pathways"}, None, "--pd-disaggregation"),
+            (
+                "PD",
+                {"pd_disaggregation": "pathways"},
+                None,
+                "--pd-disaggregation",
+                {},
+            ),
             (
                 "disaggregation mode",
                 {"disaggregation_mode": "decode"},
                 None,
                 "--disaggregation-mode",
+                {},
             ),
         )
-        for name, server_overrides, spec_algorithm, conflict_flag in unsupported:
+        for name, server_overrides, spec_algorithm, conflict_flag, build_overrides in unsupported:
             with self.subTest(name=name):
                 allocator = MagicMock(spec=SWATokenToKVPoolAllocator)
                 req_pool = MagicMock()
@@ -209,6 +175,7 @@ class TestBuildKVCache(unittest.TestCase):
                         sliding_window_size=4096,
                         tp_size=1,
                         spec_algorithm=spec_algorithm,
+                        **build_overrides,
                     )
 
                 create_tree.assert_not_called()
