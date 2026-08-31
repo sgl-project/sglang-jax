@@ -163,7 +163,9 @@ class TestHiCacheE2ETPU(unittest.TestCase):
         tokens = [10, 11, 12, 13]
         idx, orig = self._fill(len(tokens), seed=1)
         self.cache.insert(InsertParams(key=self._key(tokens), value=idx))
-        self.cache.insert(InsertParams(key=self._key(tokens), value=idx))  # trigger backup
+        self.cache.insert(
+            InsertParams(key=self._key(tokens), value=idx, prev_prefix_len=len(tokens))
+        )  # trigger backup
         self._settle()
 
         # Verify host_value is set and memory_kind is pinned_host.
@@ -226,7 +228,9 @@ class TestHiCacheE2ETPU(unittest.TestCase):
         tokens = [30, 31, 32, 33]
         idx, _ = self._fill(len(tokens), seed=3)
         self.cache.insert(InsertParams(key=self._key(tokens), value=idx))
-        self.cache.insert(InsertParams(key=self._key(tokens), value=idx))
+        self.cache.insert(
+            InsertParams(key=self._key(tokens), value=idx, prev_prefix_len=len(tokens))
+        )
         self._settle()
         self.cache.evict(EvictParams(num_tokens=len(tokens), dp_rank=0))
 
@@ -247,7 +251,9 @@ class TestHiCacheE2ETPU(unittest.TestCase):
         idx, orig = self._fill(len(tokens), seed=4)
         self.cache.insert(InsertParams(key=self._key(tokens), value=idx))
         for _ in range(3):
-            self.cache.insert(InsertParams(key=self._key(tokens), value=idx))
+            self.cache.insert(
+                InsertParams(key=self._key(tokens), value=idx, prev_prefix_len=len(tokens))
+            )
         node = list(self.cache.root_node.children.values())[0]
         self.assertFalse(node.backuped, "write_back must not backup on reuse")
         self._settle()
