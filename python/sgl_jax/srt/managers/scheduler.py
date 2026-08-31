@@ -885,6 +885,13 @@ class Scheduler(
         input_token_len, est_output_tokens = self._estimate_req_input_output_tokens(req)
         return input_token_len + est_output_tokens
 
+    def _iter_encoder_waiting_reqs(self) -> Iterable[TokenizedGenerateReqInput]:
+        """Yield EPD requests that already own a DP rank."""
+        for pending in self.encoder_waiting.values():
+            req = pending.recv_req
+            if req.dp_rank is not None:
+                yield req
+
     def _get_dp_load_snapshot(self) -> tuple[list[int], list[int]]:
         """Return per-DP (request_count, token_count) for in-flight scheduled work."""
         req_counts = [0] * self.dp_size
@@ -921,6 +928,10 @@ class Scheduler(
         for req in self.waiting_queue:
             if req.dp_rank is None:
                 continue
+            req_counts[req.dp_rank] += 1
+            token_counts[req.dp_rank] += self._estimate_req_tokens(req)
+
+        for req in self._iter_encoder_waiting_reqs():
             req_counts[req.dp_rank] += 1
             token_counts[req.dp_rank] += self._estimate_req_tokens(req)
 
@@ -1074,6 +1085,9 @@ class Scheduler(
         for req in self.waiting_queue:
             if req.dp_rank is not None:
                 add(req, req.dp_rank)
+
+        for req in self._iter_encoder_waiting_reqs():
+            add(req, req.dp_rank)
 
         return input_counts, output_counts
 
