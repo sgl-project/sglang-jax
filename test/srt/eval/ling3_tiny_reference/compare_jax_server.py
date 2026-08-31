@@ -81,7 +81,10 @@ def _wait_for_prefill_logits(
                     "the BF16-to-FP32 debug dump conversion enabled"
                 )
             if array.ndim == 2:
-                array = array[last_row]
+                # LogitsProcessor packs one next-token row per request at the
+                # front of this padded batch. The matching input position is
+                # only used to reject warmup/other-request dumps.
+                array = array[0]
             if array.ndim != 1:
                 raise ValueError(f"Unexpected JAX logits dump shape: {array.shape}")
             return np.asarray(array, dtype=np.float32)

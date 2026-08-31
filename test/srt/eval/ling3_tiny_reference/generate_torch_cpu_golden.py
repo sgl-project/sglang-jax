@@ -178,6 +178,56 @@ def _render_input_ids(tokenizer, case: dict, enable_thinking: bool) -> torch.Ten
     return tokenized.to(device="cpu", dtype=torch.long)
 
 
+def _install_prefill_capture_hooks(model):
+    captures: dict[str, dict[int, torch.Tensor]] = {
+        "attention_input": {},
+        "attention_output": {},
+        "moe_input": {},
+        "mlp_output": {},
+        "router_topk_ids": {},
+    }
+    handles = []
+
+    def capture_hidden(name: str, layer_index: int):
+        def hook(_module, _inputs, output):
+            value = output[0] if isinstance(output, tuple) else output
+            captures[name][layer_index] = (
+                value.reshape(-1, value.shape[-1])[-1].detach().float().cpu()
+            )
+
+        return hook
+
+    def capture_router(layer_index: int):
+        def hook(_module, _inputs, output):
+            topk_ids = output[0]
+            captures["router_topk_ids"][layer_index] = (
+                topk_ids.reshape(-1, topk_ids.shape[-1])[-1].detach().cpu()
+            )
+
+        return hook
+
+    layers = list(model.model.layers[: model.config.num_hidden_layers])
+    for layer_index, layer in enumerate(layers):
+        handles.append(
+            layer.input_layernorm.register_forward_hook(
+                capture_hidden("attention_input", layer_index)
+            )
+        )
+        handles.append(
+            layer.attention.register_forward_hook(capture_hidden("attention_output", layer_index))
+        )
+        handles.append(
+            layer.post_attention_layernorm.register_forward_hook(
+                capture_hidden("moe_input", layer_index)
+            )
+        )
+        handles.append(layer.mlp.register_forward_hook(capture_hidden("mlp_output", layer_index)))
+        gate = getattr(layer.mlp, "gate", None)
+        if gate is not None:
+            handles.append(gate.register_forward_hook(capture_router(layer_index)))
+    return layers, captures, handles
+
+
 def _generate_case(
     model,
     tokenizer,
@@ -195,6 +245,8 @@ def _generate_case(
     topk_logprobs = []
     first_token_logits = None
     prefill_hidden_states = None
+    prefill_components = None
+    capture_layers, component_captures, capture_handles = _install_prefill_capture_hooks(model)
 
     with torch.inference_mode():
         for step in range(max_new_tokens):
@@ -208,9 +260,26 @@ def _generate_case(
             )
             logits = output.logits[0, -1].float()
             if step == 0:
+                for handle in capture_handles:
+                    handle.remove()
                 first_token_logits = logits.cpu().numpy()
                 prefill_hidden_states = torch.stack(
                     [state[0, -1].float().cpu() for state in output.hidden_states]
+                ).numpy()
+                num_layers = len(capture_layers)
+                topk = int(model.config.num_experts_per_tok)
+                prefill_components = {
+                    name: torch.stack([values[index] for index in range(num_layers)]).numpy()
+                    for name, values in component_captures.items()
+                    if name != "router_topk_ids"
+                }
+                prefill_components["router_topk_ids"] = torch.stack(
+                    [
+                        component_captures["router_topk_ids"].get(
+                            index, torch.full((topk,), -1, dtype=torch.long)
+                        )
+                        for index in range(num_layers)
+                    ]
                 ).numpy()
 
             logprobs = torch.log_softmax(logits, dim=-1)
@@ -228,7 +297,7 @@ def _generate_case(
                 (attention_mask, torch.ones((1, 1), dtype=attention_mask.dtype)), dim=1
             )
 
-    return {
+    result = {
         "input_ids": input_ids[0].cpu().numpy().astype(np.int32),
         "first_token_logits": first_token_logits.astype(np.float32),
         "prefill_hidden_states": prefill_hidden_states.astype(np.float32),
@@ -236,6 +305,10 @@ def _generate_case(
         "step_topk_logprobs": np.stack(topk_logprobs).astype(np.float32),
         "greedy_token_ids": np.asarray(greedy_ids, dtype=np.int32),
     }
+    for name, values in prefill_components.items():
+        dtype = np.int32 if name == "router_topk_ids" else np.float32
+        result[f"prefill_{name}"] = values.astype(dtype)
+    return result
 
 
 def parse_args() -> argparse.Namespace:

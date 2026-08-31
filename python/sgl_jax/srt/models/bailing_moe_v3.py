@@ -571,6 +571,13 @@ class BailingMoeV3DecoderLayer(nnx.Module):
             hidden_states += residual
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+        maybe_dump_jax_array(
+            hidden_states,
+            component="ling3_layer_detail",
+            name="attention_input",
+            layer_id=self.layer_idx,
+            forward_mode=forward_batch.forward_mode,
+        )
 
         # Attention.
         if self.is_kda:
@@ -583,11 +590,25 @@ class BailingMoeV3DecoderLayer(nnx.Module):
             forward_batch,
             kv_pool,
         )
+        maybe_dump_jax_array(
+            hidden_states,
+            component="ling3_layer_detail",
+            name="attention_output",
+            layer_id=self.layer_idx,
+            forward_mode=forward_batch.forward_mode,
+        )
 
         # Post-attention residual + norm.
         hidden_states += residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        maybe_dump_jax_array(
+            hidden_states,
+            component="ling3_layer_detail",
+            name="moe_input",
+            layer_id=self.layer_idx,
+            forward_mode=forward_batch.forward_mode,
+        )
 
         # MLP.
         if self.is_moe_layer:
@@ -603,6 +624,27 @@ class BailingMoeV3DecoderLayer(nnx.Module):
                 dispatch_info=dispatch_info,
                 routing_sharding=NamedSharding(self.mesh, P("data", None)),
             )
+            maybe_dump_jax_array(
+                router_logits,
+                component="ling3_router",
+                name="router_logits",
+                layer_id=self.layer_idx,
+                forward_mode=forward_batch.forward_mode,
+            )
+            maybe_dump_jax_array(
+                topk_ids,
+                component="ling3_router",
+                name="topk_ids",
+                layer_id=self.layer_idx,
+                forward_mode=forward_batch.forward_mode,
+            )
+            maybe_dump_jax_array(
+                topk_weights,
+                component="ling3_router",
+                name="topk_weights",
+                layer_id=self.layer_idx,
+                forward_mode=forward_batch.forward_mode,
+            )
             if self.use_fused:
                 token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
                 topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
@@ -616,11 +658,33 @@ class BailingMoeV3DecoderLayer(nnx.Module):
                     shared_swiglu_limit=self.config.shared_expert_swiglu_limit(self.layer_idx),
                 )
             hidden_states = self.experts(hidden_states, topk_weights, topk_ids, **moe_kwargs)
+            maybe_dump_jax_array(
+                hidden_states,
+                component="ling3_layer_detail",
+                name="routed_expert_output",
+                layer_id=self.layer_idx,
+                forward_mode=forward_batch.forward_mode,
+            )
             if shared_output is not None:
+                maybe_dump_jax_array(
+                    shared_output,
+                    component="ling3_layer_detail",
+                    name="shared_expert_output",
+                    layer_id=self.layer_idx,
+                    forward_mode=forward_batch.forward_mode,
+                )
                 hidden_states = hidden_states + shared_output
         else:
             hidden_states = self.mlp(hidden_states)
             topk_ids = None
+
+        maybe_dump_jax_array(
+            hidden_states,
+            component="ling3_layer_detail",
+            name="mlp_output",
+            layer_id=self.layer_idx,
+            forward_mode=forward_batch.forward_mode,
+        )
 
         return hidden_states, residual, kv_fused, topk_ids
 
