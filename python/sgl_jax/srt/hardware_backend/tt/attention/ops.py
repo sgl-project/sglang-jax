@@ -42,6 +42,10 @@ def paged_scaled_dot_product_attention_decode(
         value_cache,
         page_table,
         positions,
+        is_causal=True,
+        has_attention_mask=False,
+        has_cur_pos_tensor=True,
+        has_attention_sink=False,
     )
 
 
