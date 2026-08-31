@@ -130,7 +130,7 @@ async def lifespan(fast_api_app: FastAPI):
     try:
         yield
     finally:
-        _global_state.tokenizer_manager.shutdown()
+        await _global_state.tokenizer_manager.aclose()
 
 
 # Fast API

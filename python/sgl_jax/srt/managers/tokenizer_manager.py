@@ -31,7 +31,7 @@ from fastapi import BackgroundTasks
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.disaggregation.encoder.bootstrap import EncoderBootstrapServer
-from sgl_jax.srt.disaggregation.encoder.client import dispatch_encoder_request
+from sgl_jax.srt.disaggregation.encoder.client import EncoderRequestDispatcher
 from sgl_jax.srt.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -245,6 +245,10 @@ class TokenizerManager:
         # The local bootstrap and the request path share this list by reference.
         # Static URLs remain available and dynamic registrations are added in place.
         self.encoder_urls = list(server_args.encoder_urls)
+        timeout = server_args.encoder_control_timeout_seconds
+        self.encoder_request_dispatcher = EncoderRequestDispatcher(
+            None if timeout <= 0 else timeout
+        )
         self.encoder_bootstrap_server: EncoderBootstrapServer | None = None
         if server_args.encoder_bootstrap_port is not None:
             self.encoder_bootstrap_server = EncoderBootstrapServer(
@@ -315,6 +319,10 @@ class TokenizerManager:
         self._shutdown = True
         if self.mm_processor is not None:
             self.mm_processor.shutdown()
+
+    async def aclose(self) -> None:
+        self.shutdown()
+        await self.encoder_request_dispatcher.close()
 
     async def generate_request(
         self,
@@ -407,11 +415,9 @@ class TokenizerManager:
 
         if use_remote_encoder:
             encoder_urls = await self._get_encoder_urls()
-            timeout = self.server_args.encoder_control_timeout_seconds
-            assignments, dispatch_task = dispatch_encoder_request(
+            assignments, dispatch_task = self.encoder_request_dispatcher.dispatch(
                 obj,
                 encoder_urls,
-                None if timeout <= 0 else timeout,
             )
             self.asyncio_tasks.add(dispatch_task)
             dispatch_task.add_done_callback(self.asyncio_tasks.discard)
@@ -1177,7 +1183,7 @@ class TokenizerManager:
                 self.dump_requests_before_crash()
                 break
 
-        self.shutdown()
+        await self.aclose()
         if self.encoder_bootstrap_server is not None:
             self.encoder_bootstrap_server.close()
         kill_process_tree(os.getpid(), include_parent=True)

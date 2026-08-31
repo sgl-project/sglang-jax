@@ -264,10 +264,32 @@ class EncoderClient:
         self._executor.shutdown(wait=False, cancel_futures=True)
 
 
+class EncoderRequestDispatcher:
+    """Dispatch encoder requests through a reusable HTTP client."""
+
+    def __init__(self, timeout: float | None) -> None:
+        self._timeout = timeout
+        self._client: httpx.AsyncClient | None = None
+
+    def dispatch(
+        self,
+        request: GenerateReqInput,
+        encoder_urls: list[str],
+    ) -> tuple[dict[Modality, list[int]], asyncio.Task[None]]:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=self._timeout)
+        return dispatch_encoder_request(request, encoder_urls, self._client)
+
+    async def close(self) -> None:
+        client, self._client = self._client, None
+        if client is not None:
+            await client.aclose()
+
+
 def dispatch_encoder_request(
     request: GenerateReqInput,
     encoder_urls: list[str],
-    timeout: float | None,
+    client: httpx.AsyncClient,
 ) -> tuple[dict[Modality, list[int]], asyncio.Task[None]]:
     if not isinstance(request.rid, str):
         raise ValueError("encoder request requires a single rid")
@@ -331,22 +353,20 @@ def dispatch_encoder_request(
             item_offset += count
 
     async def send_encode_requests() -> None:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-
-            async def send_one(encoder_url: str, payload: dict[str, Any]) -> None:
-                response = await client.post(
-                    f"{encoder_url.rstrip('/')}/encode",
-                    json=payload,
-                )
-                response.raise_for_status()
-
-            results = await asyncio.gather(
-                *(send_one(*encode_request) for encode_request in encode_requests),
-                return_exceptions=True,
+        async def send_one(encoder_url: str, payload: dict[str, Any]) -> None:
+            response = await client.post(
+                f"{encoder_url.rstrip('/')}/encode",
+                json=payload,
             )
-            for result in results:
-                if isinstance(result, Exception):
-                    raise result
+            response.raise_for_status()
+
+        results = await asyncio.gather(
+            *(send_one(*encode_request) for encode_request in encode_requests),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, Exception):
+                raise result
 
     task = asyncio.create_task(
         send_encode_requests(),
