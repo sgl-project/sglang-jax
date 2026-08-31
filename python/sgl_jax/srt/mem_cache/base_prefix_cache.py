@@ -5,6 +5,7 @@ import dataclasses
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import jax
+import numpy as np
 
 if TYPE_CHECKING:
     from sgl_jax.srt.mem_cache.radix_cache import RadixKey, TreeNode
@@ -32,7 +33,9 @@ class InsertParams:
 
     key: RadixKey | None = None
     value: Any = None
-    # SWA-specific: consumed by SWARadixCache, ignored by RadixCache.
+    # Length of ``value`` already owned by the tree. UnifiedRadixCache uses it
+    # to free only request-owned overlap; SWARadixCache also uses it for SWA
+    # overlap/healing. RadixCache ignores it.
     prev_prefix_len: int = 0
     swa_evicted_seqlen: int = 0
     # Length-1 int32 array (a RecurrentStatePool slot index); ownership passes
@@ -142,6 +145,14 @@ class BasePrefixCache(abc.ABC):
     def evictable_size(self, dp_rank: int = 0):
         return 0
 
+    def supports_swa(self) -> bool:
+        """Whether this cache owns a sliding-window KV pool."""
+        return False
+
+    def cache_ledger_snapshot(self, dp_rank: int, live_reqs):
+        """Debug-only ownership ledger; subclasses must provide real data."""
+        raise NotImplementedError
+
     def supports_recurrent(self) -> bool:
         return False
 
@@ -160,10 +171,10 @@ class BasePrefixCache(abc.ABC):
     def protected_size(self, dp_rank: int = 0):
         return 0
 
-    def full_protected_size(self):
+    def full_protected_size(self, dp_rank: int = 0):
         return 0
 
-    def swa_protected_size(self):
+    def swa_protected_size(self, dp_rank: int = 0):
         return 0
 
     def total_size(self):
@@ -193,3 +204,139 @@ class BasePrefixCache(abc.ABC):
 
     def take_events(self):
         return []
+
+
+def build_swa_cache_ledger_snapshot(
+    *,
+    dp_rank: int,
+    allocator: Any,
+    full_tree_evictable: set[int],
+    full_tree_protected: set[int],
+    swa_tree_evictable: set[int],
+    swa_tree_protected: set[int],
+    full_request_occurrences: list[int],
+    swa_request_occurrences: list[int],
+    event_totals: dict[str, int],
+) -> dict[str, int]:
+    """Build the common debug-only SWA ownership schema from real owners."""
+
+    def usable_capacity(pool: Any) -> int:
+        if hasattr(pool, "pages_per_rank"):
+            return pool.pages_per_rank * pool.page_size
+        return pool.size_per_rank
+
+    def reserved_page_slack(*owners: set[int]) -> int:
+        if allocator.page_size == 1:
+            return 0
+        owned = set().union(*owners)
+        reserved_pages = {index // allocator.page_size for index in owned}
+        return len(reserved_pages) * allocator.page_size - len(owned)
+
+    full_request = set(full_request_occurrences)
+    swa_request = set(swa_request_occurrences)
+    full_capacity = usable_capacity(allocator.full_attn_allocator)
+    swa_capacity = usable_capacity(allocator.swa_attn_allocator)
+
+    page_size = allocator.page_size
+    first_usable = page_size if page_size > 1 else 1
+    mapping = (
+        allocator.full_to_swa_index_mapping
+        if allocator.dp_size == 1
+        else allocator.full_to_swa_index_mapping[dp_rank]
+    )
+    mapping_array = np.asarray(mapping)
+    nonzero_sources = np.flatnonzero(mapping_array)
+    nonzero = mapping_array[nonzero_sources]
+    last_usable_full = first_usable + full_capacity - 1
+    last_usable_swa = first_usable + swa_capacity - 1
+
+    snapshot = {
+        "dp_rank": dp_rank,
+        "full_capacity": full_capacity,
+        "full_available": allocator.full_available_size(dp_rank),
+        "full_tree_evictable": len(full_tree_evictable),
+        "full_tree_protected": len(full_tree_protected),
+        "full_request_owned": len(full_request),
+        "full_reserved_page_slack": reserved_page_slack(
+            full_tree_evictable, full_tree_protected, full_request
+        ),
+        "swa_capacity": swa_capacity,
+        "swa_available": allocator.swa_available_size(dp_rank),
+        "swa_tree_evictable": len(swa_tree_evictable),
+        "swa_tree_protected": len(swa_tree_protected),
+        "swa_request_owned": len(swa_request),
+        "swa_reserved_page_slack": reserved_page_slack(
+            swa_tree_evictable, swa_tree_protected, swa_request
+        ),
+        "mapping_nonzero_count": int(len(nonzero)),
+        "mapping_invalid_count": int(
+            (
+                (nonzero_sources < first_usable)
+                | (nonzero_sources > last_usable_full)
+                | (nonzero < first_usable)
+                | (nonzero > last_usable_swa)
+            ).sum()
+        ),
+        "mapping_duplicate_count": int(len(nonzero) - len(set(map(int, nonzero)))),
+        "full_duplicate_request_owner_count": len(full_request_occurrences) - len(full_request),
+        "swa_duplicate_request_owner_count": len(swa_request_occurrences) - len(swa_request),
+        "full_request_tree_overlap_count": len(
+            full_request & (full_tree_evictable | full_tree_protected)
+        ),
+        "swa_request_tree_overlap_count": len(
+            swa_request & (swa_tree_evictable | swa_tree_protected)
+        ),
+    }
+    for field in (
+        "full_evicted_total",
+        "swa_evicted_total",
+        "tombstone_created_total",
+        "tombstone_healed_total",
+    ):
+        snapshot[field] = int(event_totals.get(field, 0))
+    return snapshot
+
+
+def validate_swa_cache_ledger(snapshot: dict[str, int], *, require_idle: bool) -> None:
+    """Reject leaks and ambiguous ownership before or after an idle flush."""
+    for pool in ("full", "swa"):
+        actual = sum(
+            snapshot[f"{pool}_{owner}"]
+            for owner in (
+                "available",
+                "tree_evictable",
+                "tree_protected",
+                "request_owned",
+                "reserved_page_slack",
+            )
+        )
+        expected = snapshot[f"{pool}_capacity"]
+        if actual != expected:
+            raise ValueError(
+                f"[{pool}] balance mismatch for dp_rank={snapshot['dp_rank']}: "
+                f"expected={expected}, actual={actual}"
+            )
+
+    for field in (
+        "mapping_invalid_count",
+        "mapping_duplicate_count",
+        "full_duplicate_request_owner_count",
+        "swa_duplicate_request_owner_count",
+        "full_request_tree_overlap_count",
+        "swa_request_tree_overlap_count",
+    ):
+        if snapshot[field] != 0:
+            raise ValueError(
+                f"SWA ledger {field}={snapshot[field]} for dp_rank={snapshot['dp_rank']}"
+            )
+
+    mapped_owners = sum(
+        snapshot[f"swa_{owner}"] for owner in ("tree_evictable", "tree_protected", "request_owned")
+    )
+    if snapshot["mapping_nonzero_count"] != mapped_owners:
+        raise ValueError(
+            f"SWA mapping ownership mismatch for dp_rank={snapshot['dp_rank']}: "
+            f"mapping_nonzero={snapshot['mapping_nonzero_count']}, owners={mapped_owners}"
+        )
+    if require_idle and (snapshot["full_request_owned"] or snapshot["swa_request_owned"]):
+        raise ValueError(f"Idle SWA ledger still has request owners: {snapshot}")

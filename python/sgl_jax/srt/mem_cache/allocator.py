@@ -462,7 +462,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 np.zeros(mapping_size, dtype=np.int32) for _ in range(dp_size)
             ]
         self.is_not_in_free_group = True
-        self.free_group = [[] for _ in range(self.dp_size)]
+        self._reset_free_group_state()
         self.clear()
 
         self._kvcache.full_to_swa_index_mapping = self.full_to_swa_index_mapping
@@ -574,14 +574,46 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         mapping[full_indices] = swa_indices
         return full_indices
 
+    def translate_full_to_swa(
+        self,
+        full_indices: np.ndarray,
+        *,
+        dp_rank: int,
+        require_mapped: bool = True,
+    ) -> np.ndarray:
+        """Return a copy of rank-local SWA indices without changing ownership."""
+        full_indices = np.asarray(full_indices, dtype=np.int32)
+        mapping = (
+            self.full_to_swa_index_mapping
+            if self.dp_size == 1
+            else self.full_to_swa_index_mapping[dp_rank]
+        )
+        swa_indices = mapping[full_indices].copy()
+        if require_mapped:
+            unmapped = full_indices[swa_indices == 0]
+            if unmapped.size:
+                raise ValueError(
+                    f"Unmapped FULL indices for dp_rank={dp_rank}: " f"{unmapped.tolist()}"
+                )
+        return swa_indices
+
+    def free_full(self, full_indices: np.ndarray, *, dp_rank: int) -> None:
+        """Free only FULL slots while preserving SWA slots and their mapping."""
+        if self.is_not_in_free_group:
+            self.full_attn_allocator.free(full_indices, dp_rank=dp_rank)
+        else:
+            self._queue_group_free(
+                full_indices,
+                dp_rank=dp_rank,
+                queues=self._free_group_full,
+                seen=self._free_group_full_seen,
+            )
+
     def free(self, free_index: np.array, dp_rank: int = 0):
         if len(free_index) == 0:
             return
-        if self.is_not_in_free_group:
-            self.full_attn_allocator.free(free_index, dp_rank=dp_rank)
-            self.free_swa(free_index, dp_rank=dp_rank)
-        else:
-            self.free_group[dp_rank].append(free_index)
+        self.free_full(free_index, dp_rank=dp_rank)
+        self.free_swa(free_index, dp_rank=dp_rank)
         full_expected = (
             self.full_attn_allocator.size_per_rank
             if self.dp_size > 1
@@ -603,8 +635,16 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         map_vals = mapping[free_index]
         swa_indices = map_vals[map_vals > 0]
-        self.swa_attn_allocator.free(swa_indices, dp_rank=dp_rank)
         mapping[free_index] = 0
+        if self.is_not_in_free_group:
+            self.swa_attn_allocator.free(swa_indices, dp_rank=dp_rank)
+        else:
+            self._queue_group_free(
+                swa_indices,
+                dp_rank=dp_rank,
+                queues=self._free_group_swa,
+                seen=self._free_group_swa_seen,
+            )
 
     def count_swa_mapped(self, indices: np.array, dp_rank: int = 0) -> int:
         """Count how many of the given full indices have an active SWA mapping."""
@@ -631,6 +671,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             else:
                 for rank in range(self.dp_size):
                     self.full_to_swa_index_mapping[rank].fill(0)
+            self.is_not_in_free_group = True
+            self._reset_free_group_state()
         else:
             # Clear specific rank
             self.swa_attn_allocator.clear(dp_rank=dp_rank)
@@ -639,6 +681,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 self.full_to_swa_index_mapping.fill(0)
             else:
                 self.full_to_swa_index_mapping[dp_rank].fill(0)
+            self._clear_free_group_rank(dp_rank)
 
     def free_group_begin(self):
         self.is_not_in_free_group = False
@@ -646,7 +689,41 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_group_end(self):
         self.is_not_in_free_group = True
         for rank in range(self.dp_size):
-            if self.free_group[rank]:
-                all_free_indices = np.concatenate(self.free_group[rank])
-                self.free(all_free_indices, dp_rank=rank)
-                self.free_group[rank] = []
+            if self._free_group_full[rank]:
+                full_indices = np.concatenate(self._free_group_full[rank])
+                self.full_attn_allocator.free(full_indices, dp_rank=rank)
+            if self._free_group_swa[rank]:
+                swa_indices = np.concatenate(self._free_group_swa[rank])
+                self.swa_attn_allocator.free(swa_indices, dp_rank=rank)
+        self._reset_free_group_state()
+
+    def _reset_free_group_state(self) -> None:
+        self._free_group_full = [[] for _ in range(self.dp_size)]
+        self._free_group_swa = [[] for _ in range(self.dp_size)]
+        self._free_group_full_seen = [set() for _ in range(self.dp_size)]
+        self._free_group_swa_seen = [set() for _ in range(self.dp_size)]
+        # Preserve the existing observable attribute for legacy tests/callers.
+        self.free_group = self._free_group_full
+
+    def _clear_free_group_rank(self, dp_rank: int) -> None:
+        self._free_group_full[dp_rank] = []
+        self._free_group_swa[dp_rank] = []
+        self._free_group_full_seen[dp_rank] = set()
+        self._free_group_swa_seen[dp_rank] = set()
+
+    def _queue_group_free(
+        self,
+        indices: np.ndarray,
+        *,
+        dp_rank: int,
+        queues: list[list[np.ndarray]],
+        seen: list[set[int]],
+    ) -> None:
+        new_indices = []
+        for index in np.asarray(indices, dtype=np.int32).reshape(-1):
+            physical_index = int(index)
+            if physical_index not in seen[dp_rank]:
+                seen[dp_rank].add(physical_index)
+                new_indices.append(physical_index)
+        if new_indices:
+            queues[dp_rank].append(np.asarray(new_indices, dtype=np.int32))

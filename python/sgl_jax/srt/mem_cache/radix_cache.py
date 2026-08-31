@@ -303,6 +303,12 @@ class RadixCache(BasePrefixCache):
             )
             kv_indices = kv_indices[kv_indices != 0]
             self.token_to_kv_pool_allocator.free(kv_indices, dp_rank=dp_rank)
+            self.dec_lock_ref(
+                getattr(req, "last_node", None),
+                getattr(req, "cache_lock_params", None),
+            )
+            req.cache_lock_params = None
+            req.swa_uuid_for_lock = None
             return
 
         radix_key = build_radix_key(req, committed_kv_len)
@@ -345,11 +351,20 @@ class RadixCache(BasePrefixCache):
                 kv_indices[old_prefix_len:page_aligned_len], dp_rank=dp_rank
             )
 
-        self.dec_lock_ref(req.last_node)
+        self.dec_lock_ref(req.last_node, getattr(req, "cache_lock_params", None))
+        req.cache_lock_params = None
+        req.swa_uuid_for_lock = None
 
     def cache_unfinished_req(self, req: Req):
         """Cache incomplete requests"""
         if self.disable:
+            self.dec_lock_ref(
+                getattr(req, "last_node", None),
+                getattr(req, "cache_lock_params", None),
+            )
+            lock_result = self.inc_lock_ref(getattr(req, "last_node", None))
+            req.cache_lock_params = lock_result.to_dec_params()
+            req.swa_uuid_for_lock = req.cache_lock_params.swa_uuid_for_lock
             return
 
         dp_rank = req.dp_rank if req.dp_rank is not None else 0
@@ -395,8 +410,10 @@ class RadixCache(BasePrefixCache):
         )
         req.last_matched_prefix_len = len(new_indices)
         req.cache_protected_len = len(new_indices)
-        self.dec_lock_ref(req.last_node)
-        self.inc_lock_ref(new_last_node)
+        self.dec_lock_ref(req.last_node, getattr(req, "cache_lock_params", None))
+        lock_result = self.inc_lock_ref(new_last_node)
+        req.cache_lock_params = lock_result.to_dec_params()
+        req.swa_uuid_for_lock = req.cache_lock_params.swa_uuid_for_lock
 
         # `req.prefix_indices` will be used later in `PrefillAdder::add_chunked_req`
         if self.page_size != 1:

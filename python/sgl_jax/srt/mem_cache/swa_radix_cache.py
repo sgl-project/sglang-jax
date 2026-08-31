@@ -19,6 +19,7 @@ from sgl_jax.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
     MatchResult,
+    build_swa_cache_ledger_snapshot,
 )
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
 from sgl_jax.srt.mem_cache.radix_cache import RadixKey
@@ -310,7 +311,54 @@ class SWARadixCache(BasePrefixCache):
             self.get_child_key_fn = partial(get_child_key, page_size=page_size)
 
         self.sliding_window_size = sliding_window_size
+        self._ledger_event_totals = defaultdict(lambda: defaultdict(int))
         self.reset()
+
+    def supports_swa(self) -> bool:
+        return True
+
+    def cache_ledger_snapshot(self, dp_rank: int, live_reqs):
+        """Per-rank tree/request ledger for the legacy hybrid fallback."""
+        full_evictable, full_protected = set(), set()
+        swa_evictable, swa_protected = set(), set()
+        stack = [self.root_node]
+        while stack:
+            node = stack.pop()
+            stack.extend(node.children.values())
+            if node is self.root_node or (node.key.dp_rank or 0) != dp_rank or node.value is None:
+                continue
+            full_owners = full_protected if node.full_lock_ref else full_evictable
+            full_owners.update(int(i) for i in node.value if int(i))
+            mapped = self.token_to_kv_pool_allocator.translate_full_to_swa(
+                node.value, dp_rank=dp_rank, require_mapped=False
+            )
+            swa_owners = swa_protected if node.swa_lock_ref else swa_evictable
+            swa_owners.update(int(i) for i in mapped if int(i))
+        full_occurrences, swa_occurrences = [], []
+        for req in live_reqs or ():
+            if (req.dp_rank or 0) != dp_rank or req.req_pool_idx is None:
+                continue
+            start = getattr(req, "cache_protected_len", 0)
+            end = getattr(req, "kv_allocated_len", 0)
+            row = self.req_to_token_pool.req_to_token[req.req_pool_idx, start:end]
+            full_occurrences.extend(int(i) for i in row if int(i))
+            swa_start = max(start, getattr(req, "swa_evicted_seqlen", 0))
+            row = self.req_to_token_pool.req_to_token[req.req_pool_idx, swa_start:end]
+            mapped = self.token_to_kv_pool_allocator.translate_full_to_swa(
+                row, dp_rank=dp_rank, require_mapped=False
+            )
+            swa_occurrences.extend(int(i) for i in mapped if int(i))
+        return build_swa_cache_ledger_snapshot(
+            dp_rank=dp_rank,
+            allocator=self.token_to_kv_pool_allocator,
+            full_tree_evictable=full_evictable,
+            full_tree_protected=full_protected,
+            swa_tree_evictable=swa_evictable,
+            swa_tree_protected=swa_protected,
+            full_request_occurrences=full_occurrences,
+            swa_request_occurrences=swa_occurrences,
+            event_totals=self._ledger_event_totals.get(dp_rank, {}),
+        )
 
     # Effective SWA length for a set of FULL indices (number of indices still mapped to SWA)
     def _swa_eff_len(self, full_indices: np.ndarray, dp_rank: int = 0) -> int:
@@ -408,6 +456,11 @@ class SWARadixCache(BasePrefixCache):
                 :committed_kv_len,
             ]
             self.token_to_kv_pool_allocator.free(kv_indices, dp_rank=dp_rank)
+            self.dec_lock_ref(
+                getattr(req, "last_node", None), getattr(req, "cache_lock_params", None)
+            )
+            req.cache_lock_params = None
+            req.swa_uuid_for_lock = None
             return
 
         radix_key = build_radix_key(req, committed_kv_len)
@@ -441,7 +494,13 @@ class SWARadixCache(BasePrefixCache):
                     kv_indices[old_prefix_len:page_aligned_len], dp_rank=dp_rank
                 )
 
-        self.dec_lock_ref(req.last_node, DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock))
+        self.dec_lock_ref(
+            req.last_node,
+            getattr(req, "cache_lock_params", None)
+            or DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+        )
+        req.cache_lock_params = None
+        req.swa_uuid_for_lock = None
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
@@ -449,6 +508,12 @@ class SWARadixCache(BasePrefixCache):
             kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, : len(req.fill_ids)]
 
             req.prefix_indices = kv_indices.copy()
+            self.dec_lock_ref(
+                getattr(req, "last_node", None), getattr(req, "cache_lock_params", None)
+            )
+            lock_result = self.inc_lock_ref(getattr(req, "last_node", None))
+            req.cache_lock_params = lock_result.to_dec_params()
+            req.swa_uuid_for_lock = req.cache_lock_params.swa_uuid_for_lock
             return
 
         radix_key = build_radix_key(req, len(req.fill_ids))
@@ -484,15 +549,20 @@ class SWARadixCache(BasePrefixCache):
             new_indices[old_prefix_len:],
         )
 
-        self.dec_lock_ref(req.last_node, DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock))
-        swa_uuid_for_lock = self.inc_lock_ref(new_last_node).swa_uuid_for_lock
+        self.dec_lock_ref(
+            req.last_node,
+            getattr(req, "cache_lock_params", None)
+            or DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+        )
+        lock_result = self.inc_lock_ref(new_last_node)
 
         if self.page_size != 1:
             req.prefix_indices = np.concatenate([new_indices, kv_indices[len(new_indices) :]])
         else:
             req.prefix_indices = new_indices
         req.last_node = new_last_node
-        req.swa_uuid_for_lock = swa_uuid_for_lock
+        req.cache_lock_params = lock_result.to_dec_params()
+        req.swa_uuid_for_lock = req.cache_lock_params.swa_uuid_for_lock
         req.last_matched_prefix_len = len(new_indices)
         req.cache_protected_len = len(new_indices)
 
@@ -512,6 +582,14 @@ class SWARadixCache(BasePrefixCache):
         if self.disable:
             return EvictResult()
 
+        ranks = range(self.token_to_kv_pool_allocator.dp_size) if dp_rank is None else (dp_rank,)
+        before = {
+            rank: (
+                self.token_to_kv_pool_allocator.full_available_size(rank),
+                self.token_to_kv_pool_allocator.swa_available_size(rank),
+            )
+            for rank in ranks
+        }
         full_num_evicted = 0
         swa_num_evicted = 0
         if full_num_tokens > 0:
@@ -610,9 +688,20 @@ class SWARadixCache(BasePrefixCache):
 
                 x = x_next
 
-        return EvictResult(
+        result = EvictResult(
             num_tokens_evicted=full_num_evicted, swa_num_tokens_evicted=swa_num_evicted
         )
+        for rank, (full_before, swa_before) in before.items():
+            totals = self._ledger_event_totals[rank]
+            totals["full_evicted_total"] += max(
+                0,
+                self.token_to_kv_pool_allocator.full_available_size(rank) - full_before,
+            )
+            totals["swa_evicted_total"] += max(
+                0,
+                self.token_to_kv_pool_allocator.swa_available_size(rank) - swa_before,
+            )
+        return result
 
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         """
@@ -704,15 +793,15 @@ class SWARadixCache(BasePrefixCache):
 
     def evictable_size(self, dp_rank: int = 0) -> int:
         return min(
-            self.full_evictable_size_[dp_rank],
-            self.swa_evictable_size_[dp_rank],
+            self.full_evictable_size_.get(dp_rank, 0),
+            self.swa_evictable_size_.get(dp_rank, 0),
         )
 
     def full_evictable_size(self, dp_rank: int = 0) -> int:
-        return self.full_evictable_size_[dp_rank]
+        return self.full_evictable_size_.get(dp_rank, 0)
 
     def swa_evictable_size(self, dp_rank: int = 0) -> int:
-        return self.swa_evictable_size_[dp_rank]
+        return self.swa_evictable_size_.get(dp_rank, 0)
 
     # Note: this is expensive, only use for debug
     def full_lru_list_evictable_size(self) -> int:
@@ -742,11 +831,11 @@ class SWARadixCache(BasePrefixCache):
 
     def full_protected_size(self, dp_rank: int = 0) -> int:
         # protected size refers to the size of the full cache that is locked
-        return self.full_protected_size_[dp_rank]
+        return self.full_protected_size_.get(dp_rank, 0)
 
     def swa_protected_size(self, dp_rank: int = 0) -> int:
         # protected size refers to the size of the swa cache that is locked
-        return self.swa_protected_size_[dp_rank]
+        return self.swa_protected_size_.get(dp_rank, 0)
 
     def _node_prefix_len(self, node: TreeNode | None) -> int:
         prefix_len = 0
@@ -776,7 +865,9 @@ class SWARadixCache(BasePrefixCache):
         free_slots = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, req.swa_evicted_seqlen : new_evicted
         ]
+        freed = self.token_to_kv_pool_allocator.count_swa_mapped(free_slots, dp_rank=dp_rank)
         self.token_to_kv_pool_allocator.free_swa(free_slots, dp_rank=dp_rank)
+        self._ledger_event_totals[dp_rank]["swa_evicted_total"] += freed
         req.swa_evicted_seqlen = new_evicted
 
     def all_values_flatten(self) -> jnp.Array:
@@ -966,6 +1057,7 @@ class SWARadixCache(BasePrefixCache):
                         )
                         node.value = np.array(value[:prefix_len], copy=True)
                         node.swa_tombstone = False
+                        self._ledger_event_totals[node_dp_rank]["tombstone_healed_total"] += 1
                         self.swa_lru_list.insert_mru(node)
                         self.swa_evictable_size_[node_dp_rank] += len(node.value)
 
@@ -978,6 +1070,7 @@ class SWARadixCache(BasePrefixCache):
                         self._split_node(node, start_update_idx)
                         node.value = np.array(value[start_update_idx:prefix_len], copy=True)
                         node.swa_tombstone = False
+                        self._ledger_event_totals[node_dp_rank]["tombstone_healed_total"] += 1
                         self.swa_lru_list.insert_mru(node)
                         self.swa_evictable_size_[node_dp_rank] += len(node.value)
                         value_dp_rank = key.dp_rank if key.dp_rank is not None else 0
@@ -1063,6 +1156,8 @@ class SWARadixCache(BasePrefixCache):
 
     def _tombstone_internal_node(self, node: TreeNode) -> None:
         assert len(node.children) != 0, f"Cannot tombstone a leaf node, {node.id=}"
+        rank = node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
+        self._ledger_event_totals[rank]["tombstone_created_total"] += 1
         node.swa_tombstone = True
         node_dp_rank = node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
         self.swa_evictable_size_[node_dp_rank] -= len(node.value)

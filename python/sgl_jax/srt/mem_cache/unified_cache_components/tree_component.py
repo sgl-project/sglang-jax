@@ -3,7 +3,7 @@
 Ships the FULL (full-attention) and recurrent (KDA / GDN) components. The seam
 surface is wider than those two exercise: CacheTransferPhase / LRURefreshPhase /
 next_component_uuid / eviction_priority / recover_after_unevict / value_len /
-the ComponentType.is_* helpers and the unused ``params`` ctor arg exist so SWA /
+the ComponentType.is_* helpers and the ``params`` ctor arg exist so SWA /
 HiCache components can land against a stable contract without re-touching this
 module.
 """
@@ -70,6 +70,7 @@ _COMPONENT_UUID_COUNTER = 1
 class ComponentData:
     value: np.ndarray | None = None
     lock_ref: int = 0
+    metadata: dict[str, Any] = dataclasses.field(default_factory=dict)
     host_value: np.ndarray | None = None
     host_lock_ref: int = 0
 
@@ -144,6 +145,14 @@ class TreeComponent(ABC):
         value = node.component_data[self.component_type].value
         return len(value) if value is not None else 0
 
+    def refresh_lru(
+        self,
+        node: UnifiedTreeNode,
+        phase: LRURefreshPhase,
+    ) -> None:
+        """Refresh this component's LRU state for one tree phase."""
+        return None
+
     @abstractmethod
     def create_match_validator(
         self, match_device_only: bool = False
@@ -185,10 +194,8 @@ class TreeComponent(ABC):
         Returns the index within value_slice from which this component
         consumed (took ownership of) the underlying KV pool slots.
         Returns prefix_len if nothing was consumed (default).
-        The core currently discards the return value (request-caching
-        callers free the duplicate overlap instead); a future aux component
-        that consumes here would have _insert_helper use it to free only the
-        non-consumed duplicate portion: value_slice[dup_start:consumed_from]."""
+        The core frees only the non-consumed duplicate portion:
+        value_slice[dup_start:consumed_from]."""
         return prefix_len
 
     def should_skip_leaf_creation(

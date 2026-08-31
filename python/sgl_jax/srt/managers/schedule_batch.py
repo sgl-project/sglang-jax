@@ -37,10 +37,10 @@ from sgl_jax.srt.mem_cache.allocator import (
 )
 from sgl_jax.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    DecLockRefParams,
     EvictParams,
     MatchPrefixParams,
 )
-from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 from sgl_jax.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -49,7 +49,6 @@ from sgl_jax.srt.mem_cache.common import (
 )
 from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sgl_jax.srt.mem_cache.radix_cache import RadixKey, build_radix_key
-from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.multimodal.common.modality_enum import MultimodalInputs
 from sgl_jax.srt.multimodal.in_model.host_orchestration import build_multimodal_batch
@@ -297,6 +296,9 @@ class Req:
         self.last_host_node: Any = None
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: int | None = None
+        # Exact acquire receipt.  The UUID is only the legacy compatibility
+        # mirror; component releases also need their skip-node set.
+        self.cache_lock_params: DecLockRefParams | None = None
         # SWA eviction: sequence positions [0, swa_evicted_seqlen) have had
         # their SWA pool slots freed (no longer in the sliding window).
         self.swa_evicted_seqlen: int = 0
@@ -665,6 +667,7 @@ class Req:
         self.prefix_indices = []
         self.last_node = None
         self.swa_uuid_for_lock = None
+        self.cache_lock_params = None
         self.extend_input_len = 0
         self.is_retracted = True
         self.input_token_logprobs = None
@@ -946,9 +949,10 @@ class ScheduleBatch:
         return_output_logprob_only = all(req.return_output_logprob_only for req in all_reqs)
         is_hybrid = False
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
-            assert tree_cache is None or isinstance(
-                tree_cache, (SWARadixCache, ChunkCache)
-            ), "SWARadixCache or ChunkCache is required for SWATokenToKVPoolAllocator"
+            if tree_cache is None or not tree_cache.supports_swa():
+                raise ValueError(
+                    "An SWA-capable tree cache is required for " "SWATokenToKVPoolAllocator"
+                )
             is_hybrid = True
 
         is_hybrid_recurrent = isinstance(req_to_token_pool, HybridReqToTokenPool)
@@ -1595,32 +1599,14 @@ class ScheduleBatch:
                 if not info.reqs:
                     continue
                 for req in info.reqs:
-                    if isinstance(self.tree_cache, ChunkCache):
-                        # ChunkCache/SWAChunkCache: no tree-node overlap concern,
-                        # evict on every decode step to prevent SWA exhaustion.
-                        # TODO(PD-disagg): evicting at decode_batch_idx==0 may
-                        # conflict with KV transfer in a future PD disaggregation
-                        # pipeline; revisit when implementing PD.
-                        if req.decode_batch_idx % evict_interval == 0:
-                            self._evict_swa(
-                                req, req.seqlen - 1, sliding_window_size, page_size, dp_rank
-                            )
-                    else:
-                        # SWARadixCache: skip decode_batch_idx==0 in overlap mode
-                        # because the previous extend batch may still be running.
-                        if req.decode_batch_idx % evict_interval == 1:
-                            self._evict_swa(
-                                req, req.seqlen - 1, sliding_window_size, page_size, dp_rank
-                            )
+                    safe_offset = 1 if self.enable_overlap else 0
+                    if req.decode_batch_idx % evict_interval == safe_offset:
+                        self._evict_swa(
+                            req, req.seqlen - 1, sliding_window_size, page_size, dp_rank
+                        )
             return
 
         if self.forward_mode is None or not self.forward_mode.is_extend():
-            return
-
-        # For SWARadixCache with active tree, extend-time SWA ownership stays
-        # with the tree — eviction is deferred to tree insert / pressure handling.
-        # ChunkCache and SWAChunkCache need direct per-request eviction.
-        if not isinstance(self.tree_cache, ChunkCache):
             return
 
         chunked_prefill_size = global_server_args_dict["chunked_prefill_size"]
@@ -1646,21 +1632,10 @@ class ScheduleBatch:
         page_size: int,
         dp_rank: int = 0,
     ):
-        """Free SWA pool slots for tokens outside the sliding window."""
-        if isinstance(self.tree_cache, SWARadixCache):
-            self.tree_cache.evict_req_swa(req, pre_len, dp_rank=dp_rank)
-            return
-
-        new_evicted = max(req.swa_evicted_seqlen, pre_len - sliding_window_size - page_size)
-        if page_size > 1:
-            new_evicted = (new_evicted // page_size) * page_size
-        if new_evicted <= req.swa_evicted_seqlen:
-            return
-        free_slots = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, req.swa_evicted_seqlen : new_evicted
-        ]
-        self.token_to_kv_pool_allocator.free_swa(free_slots, dp_rank=dp_rank)
-        req.swa_evicted_seqlen = new_evicted
+        """Ask the cache to reclaim only request-owned SWA slots."""
+        if self.tree_cache is None or not self.tree_cache.supports_swa():
+            raise RuntimeError("Hybrid scheduler lost its SWA-capable cache")
+        self.tree_cache.evict_req_swa(req, pre_len, dp_rank=dp_rank)
 
     def prepare_for_decode(self):
         """Prepare for decode phase (unified for all dp_size >= 1).
@@ -3444,9 +3419,20 @@ class ScheduleBatch:
                 result_strs.append(
                     f"{prefix}Available full tokens: {full_available_size + full_evictable_size} ({full_available_size=} + {full_evictable_size=})\n"
                     f"{prefix}Available swa tokens: {swa_available_size + swa_evictable_size} ({swa_available_size=} + {swa_evictable_size=})\n"
-                    f"{prefix}Full LRU list evictable size: {self.tree_cache.full_lru_list_evictable_size()}\n"
-                    f"{prefix}SWA LRU list evictable size: {self.tree_cache.swa_lru_list_evictable_size()}\n"
                 )
+                for label, accessor in (
+                    ("Full LRU list evictable size", "full_lru_list_evictable_size"),
+                    ("SWA LRU list evictable size", "swa_lru_list_evictable_size"),
+                ):
+                    diagnostic = getattr(self.tree_cache, accessor, None)
+                    if not callable(diagnostic):
+                        continue
+                    try:
+                        value = diagnostic()
+                    except Exception as exc:
+                        result_strs.append(f"{prefix}{label}: unavailable ({type(exc).__name__})\n")
+                    else:
+                        result_strs.append(f"{prefix}{label}: {value}\n")
             else:
                 available_size = self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank)
                 evictable_size = self.tree_cache.evictable_size(dp_rank=dp_rank)

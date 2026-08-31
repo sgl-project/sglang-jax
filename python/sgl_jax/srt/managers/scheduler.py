@@ -78,12 +78,14 @@ from sgl_jax.srt.managers.scheduler_profiler_mixing import SchedulerProfilerMixi
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.managers.tp_worker_overlap_thread import ModelWorkerClient
 from sgl_jax.srt.managers.utils import validate_input_length
-from sgl_jax.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+from sgl_jax.srt.mem_cache.base_prefix_cache import (
+    MatchPrefixParams,
+    validate_swa_cache_ledger,
+)
 from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 from sgl_jax.srt.mem_cache.common import release_kv_cache
 from sgl_jax.srt.mem_cache.kv_cache_builder import build_kv_cache
 from sgl_jax.srt.mem_cache.radix_cache import RadixKey
-from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     recurrent_admission_blocked,
@@ -562,7 +564,6 @@ class Scheduler(
 
         # Initialize DP scheduling state
         self.dp_round_robin_counter = 0
-
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
             [
@@ -739,6 +740,22 @@ class Scheduler(
             tp_size=self.tp_size,
             spec_algorithm=self.spec_algorithm,
             mesh=self.mesh,
+        )
+        component_values = getattr(self.tree_cache, "tree_components", None)
+        components = (
+            [getattr(component, "name", str(component)) for component in component_values]
+            if component_values
+            else (["FULL", "SWA"] if self.tree_cache.supports_swa() else ["FULL"])
+        )
+        logger.info(
+            "KV cache initialized: implementation=%s components=%s "
+            "sliding_window=%s page_size=%s hybrid=%s recurrent=%s",
+            type(self.tree_cache).__name__,
+            components,
+            self.sliding_window_size,
+            self.page_size,
+            self.is_hybrid,
+            isinstance(self.req_to_token_pool, HybridReqToTokenPool),
         )
         # write_back eviction runs inside get_next_batch_to_run, before the event
         # loop's launch_done.wait. Hand the cache a barrier so the D2H gather
@@ -1639,6 +1656,197 @@ class Scheduler(
             flushed_items=flushed_items,
         )
 
+    @staticmethod
+    def _batch_live_reqs(batch) -> list[Req]:
+        if batch is None:
+            return []
+        return [
+            req
+            for info in getattr(batch, "reqs_info", ())
+            for req in (getattr(info, "reqs", None) or ())
+        ]
+
+    def _collect_cache_ledger_live_reqs(self) -> dict[int, list[Req]]:
+        """Collect each live KV owner once, grouped by its scheduler rank."""
+        candidates = []
+        candidates.extend(getattr(self, "waiting_queue", ()) or ())
+        candidates.extend(getattr(self, "grammar_queue", ()) or ())
+        for batch_name in ("running_batch", "cur_batch", "last_batch"):
+            candidates.extend(self._batch_live_reqs(getattr(self, batch_name, None)))
+        candidates.extend(
+            req for req in (getattr(self, "chunked_reqs", ()) or ()) if req is not None
+        )
+        candidates.extend(
+            req
+            for req in (getattr(self, "_pending_chunked_abort_reqs", ()) or ())
+            if req is not None
+        )
+
+        by_identity: dict[int, Req] = {}
+        rid_identity: dict[str, int] = {}
+        for req in candidates:
+            identity = id(req)
+            if identity in by_identity:
+                continue
+            rid = getattr(req, "rid", None)
+            previous = rid_identity.get(rid)
+            if rid is not None and previous is not None and previous != identity:
+                raise RuntimeError(f"Multiple live request objects share rid={rid!r}")
+            by_identity[identity] = req
+            if rid is not None:
+                rid_identity[rid] = identity
+
+        by_rank = {dp_rank: [] for dp_rank in range(self.dp_size)}
+        for req in by_identity.values():
+            if getattr(req, "req_pool_idx", None) is None:
+                continue
+            dp_rank = getattr(req, "dp_rank", None)
+            if not isinstance(dp_rank, int) or not 0 <= dp_rank < self.dp_size:
+                raise RuntimeError(
+                    f"Live KV owner rid={getattr(req, 'rid', None)!r} has "
+                    f"invalid dp_rank={dp_rank!r}"
+                )
+            by_rank[dp_rank].append(req)
+        return by_rank
+
+    @staticmethod
+    def _stable_debug_value(value):
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        if isinstance(value, dict):
+            return tuple(
+                sorted(
+                    (str(key), Scheduler._stable_debug_value(item)) for key, item in value.items()
+                )
+            )
+        if isinstance(value, (list, tuple, set, deque)):
+            return tuple(Scheduler._stable_debug_value(item) for item in value)
+        try:
+            array = np.asarray(value)
+            if array.dtype != object:
+                return (str(array.dtype), tuple(array.shape), tuple(array.reshape(-1).tolist()))
+        except Exception:
+            pass
+        return repr(value)
+
+    def _cache_ledger_readonly_fingerprint(self, live_reqs_by_rank: dict[int, list[Req]]) -> tuple:
+        allocator = self.token_to_kv_pool_allocator
+        pool_state = []
+        tree_state = []
+        for dp_rank in range(self.dp_size):
+            rank_state = []
+            for accessor in (
+                "available_size",
+                "full_available_size",
+                "swa_available_size",
+            ):
+                method = getattr(allocator, accessor, None)
+                if method is not None:
+                    rank_state.append((accessor, int(method(dp_rank))))
+            pool_state.append(tuple(rank_state))
+            rank_tree_state = []
+            tree_accessors = (
+                "full_evictable_size",
+                "full_protected_size",
+                "swa_evictable_size",
+                "swa_protected_size",
+            )
+            for accessor in tree_accessors:
+                method = getattr(self.tree_cache, accessor, None)
+                if method is not None:
+                    rank_tree_state.append((accessor, int(method(dp_rank=dp_rank))))
+            tree_state.append(tuple(rank_tree_state))
+        mapping = self._stable_debug_value(getattr(allocator, "full_to_swa_index_mapping", None))
+        event_source = getattr(self.tree_cache, "_ledger_event_totals", {})
+        event_fields = (
+            "full_evicted_total",
+            "swa_evicted_total",
+            "tombstone_created_total",
+            "tombstone_healed_total",
+        )
+        event_container_keys = tuple(
+            sorted((type(key).__name__, repr(key)) for key in event_source)
+        )
+        event_totals = tuple(
+            tuple(int(event_source.get(rank, {}).get(field, 0)) for field in event_fields)
+            for rank in range(self.dp_size)
+        )
+        request_state = []
+        for reqs in live_reqs_by_rank.values():
+            for req in reqs:
+                request_state.append(
+                    (
+                        id(req),
+                        getattr(req, "rid", None),
+                        getattr(req, "dp_rank", None),
+                        getattr(req, "req_pool_idx", None),
+                        getattr(req, "kv_allocated_len", None),
+                        getattr(req, "cache_protected_len", None),
+                        getattr(req, "swa_evicted_seqlen", None),
+                        self._stable_debug_value(getattr(req, "prefix_indices", None)),
+                        repr(getattr(req, "cache_lock_params", None)),
+                        id(getattr(req, "last_node", None)),
+                    )
+                )
+        return (
+            tuple(pool_state),
+            tuple(tree_state),
+            mapping,
+            event_container_keys,
+            event_totals,
+            tuple(sorted(request_state)),
+        )
+
+    @staticmethod
+    def _normalize_cache_ledger_row(snapshot: dict) -> dict:
+        row = dict(snapshot)
+        row.setdefault("mapping_nonzero", row.get("mapping_nonzero_count", 0))
+        row.setdefault("mapping_invalid_full_slot", row.get("mapping_invalid_count", 0))
+        row.setdefault("mapping_invalid_swa_slot", row.get("mapping_invalid_count", 0))
+        row.setdefault("mapping_duplicate_swa_slot", row.get("mapping_duplicate_count", 0))
+        for pool in ("full", "swa"):
+            row.setdefault(f"{pool}_reserved_page_slack", 0)
+            row[f"{pool}_balance_error"] = (
+                row[f"{pool}_available"]
+                + row[f"{pool}_tree_evictable"]
+                + row[f"{pool}_tree_protected"]
+                + row[f"{pool}_request_owned"]
+                + row[f"{pool}_reserved_page_slack"]
+                - row[f"{pool}_capacity"]
+            )
+        return row
+
+    def _snapshot_swa_cache_ledger(self, *, require_idle: bool) -> list[dict]:
+        tree_cache = self.tree_cache
+        if tree_cache is None or not tree_cache.supports_swa():
+            raise RuntimeError("Cache ledger requested for a non-SWA cache")
+        live_reqs_by_rank = self._collect_cache_ledger_live_reqs()
+        before = self._cache_ledger_readonly_fingerprint(live_reqs_by_rank)
+        snapshots = []
+        implementation = type(tree_cache).__name__
+        for dp_rank in range(self.dp_size):
+            raw = tree_cache.cache_ledger_snapshot(dp_rank, live_reqs=live_reqs_by_rank[dp_rank])
+            row = self._normalize_cache_ledger_row(raw)
+            try:
+                validate_swa_cache_ledger(raw, require_idle=require_idle)
+            except (KeyError, ValueError) as exc:
+                raise ValueError(
+                    f"cache={implementation} full owners="
+                    f"({row.get('full_tree_evictable')},"
+                    f"{row.get('full_tree_protected')},"
+                    f"{row.get('full_request_owned')}) "
+                    f"swa owners=({row.get('swa_tree_evictable')},"
+                    f"{row.get('swa_tree_protected')},"
+                    f"{row.get('swa_request_owned')}) dp_rank={dp_rank} "
+                    f"full_balance_error={row.get('full_balance_error')} "
+                    f"swa_balance_error={row.get('swa_balance_error')}: {exc}"
+                ) from exc
+            snapshots.append(row)
+        after = self._cache_ledger_readonly_fingerprint(live_reqs_by_rank)
+        if after != before:
+            raise RuntimeError("Cache ledger validation mutated cache ownership state")
+        return snapshots
+
     def _can_flush_cache(self) -> tuple[bool, str]:
         """Return whether cache flush can proceed and an optional error message."""
 
@@ -1693,11 +1901,16 @@ class Scheduler(
         can_flush, _ = self._can_flush_cache()
         return can_flush
 
+    def _validate_idle_swa_cache_ledger(self) -> None:
+        tree_cache = self.tree_cache
+        if tree_cache is None or not tree_cache.supports_swa():
+            return
+        self._snapshot_swa_cache_ledger(require_idle=True)
+
     def on_idle(self):
         if not self.is_fully_idle():
             return
         self.check_memory()
-        self.check_tree_cache()
         self.new_token_ratio = self.init_new_token_ratio
 
     def flush_cache(self) -> tuple[bool, str, int]:
@@ -1705,6 +1918,10 @@ class Scheduler(
         if not can_flush:
             logger.warning(message)
             return False, message, 0
+
+        # The cache is idle, so validate the real ownership partition before
+        # any clear can hide a leak.
+        self._validate_idle_swa_cache_ledger()
 
         # Reset scheduling state
         self.cur_batch = None
@@ -1733,6 +1950,7 @@ class Scheduler(
             self.req_to_token_pool.clear()
         if self.token_to_kv_pool_allocator is not None:
             self.token_to_kv_pool_allocator.clear()
+        self._validate_idle_swa_cache_ledger()
         if self.grammar_backend is not None:
             self.grammar_backend.reset()
         _clear_embedding_pools(
@@ -1765,10 +1983,46 @@ class Scheduler(
 
     def check_memory(self):
         if self.is_hybrid:
-            # Per-rank invariant: available + evictable + protected == size_per_rank.
-            # Checking per-rank avoids one rank's over-count masking another's leak.
-            full_size_per_rank = self.token_to_kv_pool_allocator.full_attn_allocator.size_per_rank
-            swa_size_per_rank = self.token_to_kv_pool_allocator.swa_attn_allocator.size_per_rank
+            # A paged allocation reserves a whole page even when the tree owns
+            # only part of it. These O(1) bounds can detect only an aggregate
+            # owner count below the number of reserved pages; the strict
+            # flush ledger validates exact per-page ownership.
+            def check_pool(dp, pool, allocator, available, evictable, protected):
+                page_size = allocator.page_size
+                if page_size <= 0:
+                    return f"[dp={dp}][{pool}] invalid {page_size=}"
+
+                capacity = (
+                    allocator.pages_per_rank * page_size
+                    if hasattr(allocator, "pages_per_rank")
+                    else allocator.size_per_rank
+                )
+                if capacity < 0 or capacity % page_size != 0:
+                    return f"[dp={dp}][{pool}] {capacity=}, {page_size=} must be page-aligned"
+                if available < 0 or available > capacity:
+                    return f"[dp={dp}][{pool}] {available=} outside [0, {capacity=}]"
+                if available % page_size != 0:
+                    return f"[dp={dp}][{pool}] {available=}, {page_size=} must be page-aligned"
+
+                reserved_capacity = capacity - available
+                reserved_pages = reserved_capacity // page_size
+                owned = evictable + protected
+                if owned > reserved_capacity:
+                    return (
+                        f"[dp={dp}][{pool}] {owned=}, {reserved_capacity=}, "
+                        f"{available=}, {capacity=}, {page_size=}, "
+                        f"{evictable=}, {protected=}"
+                    )
+                if owned < reserved_pages:
+                    return (
+                        f"[dp={dp}][{pool}] {owned=}, {reserved_pages=}, "
+                        f"{reserved_capacity=}, {available=}, {capacity=}, "
+                        f"{page_size=}, {evictable=}, {protected=}"
+                    )
+                return None
+
+            full_allocator = self.token_to_kv_pool_allocator.full_attn_allocator
+            swa_allocator = self.token_to_kv_pool_allocator.swa_attn_allocator
             leak_msgs = []
             for dp in range(self.dp_size):
                 full_avail = self.token_to_kv_pool_allocator.full_available_size(dp)
@@ -1777,16 +2031,26 @@ class Scheduler(
                 swa_avail = self.token_to_kv_pool_allocator.swa_available_size(dp)
                 swa_evict = self.tree_cache.swa_evictable_size(dp_rank=dp)
                 swa_protected = self.tree_cache.swa_protected_size(dp_rank=dp)
-                if full_avail + full_evict + full_protected != full_size_per_rank:
-                    leak_msgs.append(
-                        f"[dp={dp}][full] expected={full_size_per_rank}, "
-                        f"{full_avail=}, {full_evict=}, {full_protected=}"
-                    )
-                if swa_avail + swa_evict + swa_protected != swa_size_per_rank:
-                    leak_msgs.append(
-                        f"[dp={dp}][swa] expected={swa_size_per_rank}, "
-                        f"{swa_avail=}, {swa_evict=}, {swa_protected=}"
-                    )
+                full_error = check_pool(
+                    dp,
+                    "full",
+                    full_allocator,
+                    full_avail,
+                    full_evict,
+                    full_protected,
+                )
+                if full_error is not None:
+                    leak_msgs.append(full_error)
+                swa_error = check_pool(
+                    dp,
+                    "swa",
+                    swa_allocator,
+                    swa_avail,
+                    swa_evict,
+                    swa_protected,
+                )
+                if swa_error is not None:
+                    leak_msgs.append(swa_error)
             if leak_msgs:
                 raise ValueError(
                     "token_to_kv_pool_allocator memory leak detected!\n" + "\n".join(leak_msgs)
@@ -1816,10 +2080,6 @@ class Scheduler(
                 f"total_size={self.req_to_token_pool.size}\n"
             )
             raise ValueError(msg)
-
-    def check_tree_cache(self):
-        if self.is_hybrid and isinstance(self.tree_cache, SWARadixCache):
-            self.tree_cache.sanity_check()
 
     def _get_token_info(self):
         available_size = sum(

@@ -24,10 +24,60 @@ class TreeCacheBuildContext:
     model_config: ModelConfig
     tp_size: int
     is_hybrid_recurrent: bool = False
+    has_speculative: bool = False
+
+
+def _uses_unified_hybrid_swa(ctx: TreeCacheBuildContext) -> bool:
+    return (
+        ctx.is_hybrid_swa
+        and ctx.server_args.enable_unified_radix_tree
+        and not ctx.disable_radix_cache
+    )
+
+
+def validate_unified_hybrid_swa_route(ctx: TreeCacheBuildContext) -> None:
+    """Reject combinations that have no safe unified FULL+SWA implementation."""
+    if not _uses_unified_hybrid_swa(ctx):
+        return
+
+    if ctx.is_hybrid_recurrent:
+        raise ValueError(
+            "--enable-unified-radix-tree cannot activate FULL+SWA+RECURRENT "
+            "for a hybrid SWA recurrent model"
+        )
+    if getattr(ctx.server_args, "hicache_storage", "disable") != "disable":
+        raise ValueError(
+            "--enable-unified-radix-tree does not support hybrid SWA with " "--hicache-storage"
+        )
+    if ctx.has_speculative:
+        raise ValueError(
+            "--enable-unified-radix-tree does not support hybrid SWA with "
+            "--speculative-algorithm"
+        )
+    if bool(getattr(ctx.server_args, "pd_disaggregation", "")):
+        raise ValueError(
+            "--enable-unified-radix-tree does not support hybrid SWA with " "--pd-disaggregation"
+        )
+    if getattr(ctx.server_args, "disaggregation_mode", "null") != "null":
+        raise ValueError(
+            "--enable-unified-radix-tree does not support hybrid SWA with " "--disaggregation-mode"
+        )
+    if ctx.params.sliding_window_size is None or ctx.params.sliding_window_size <= 0:
+        raise ValueError(
+            "--enable-unified-radix-tree requires positive sliding_window_size " "for hybrid SWA"
+        )
+
+    from sgl_jax.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
+
+    if not isinstance(ctx.params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
+        raise ValueError(
+            "--enable-unified-radix-tree requires SWATokenToKVPoolAllocator " "for hybrid SWA"
+        )
 
 
 def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     params = ctx.params
+    validate_unified_hybrid_swa_route(ctx)
 
     if ctx.is_hybrid_swa:
         if ctx.disable_radix_cache:
@@ -38,6 +88,26 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
                 token_to_kv_pool_allocator=params.token_to_kv_pool_allocator,
                 page_size=params.page_size,
                 sliding_window_size=params.sliding_window_size,
+            )
+
+        if ctx.server_args.enable_unified_radix_tree:
+            from sgl_jax.srt.mem_cache.unified_cache_components import ComponentType
+            from sgl_jax.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+            return UnifiedRadixCache(
+                req_to_token_pool=params.req_to_token_pool,
+                token_to_kv_pool_allocator=params.token_to_kv_pool_allocator,
+                page_size=params.page_size,
+                disable=False,
+                kv_head_num=ctx.model_config.get_num_kv_heads(ctx.tp_size),
+                head_dim=ctx.model_config.head_dim,
+                layer_num=ctx.model_config.num_hidden_layers,
+                max_seq_len=ctx.server_args.max_seq_len,
+                is_eagle=params.is_eagle,
+                tree_components=(ComponentType.FULL, ComponentType.SWA),
+                enable_recurrent_extra_buffer=params.enable_recurrent_extra_buffer,
+                recurrent_track_interval=params.recurrent_track_interval,
+                component_init_params=params,
             )
 
         from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
@@ -80,6 +150,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             tree_components=(ComponentType.FULL, ComponentType.RECURRENT),
             enable_recurrent_extra_buffer=params.enable_recurrent_extra_buffer,
             recurrent_track_interval=params.recurrent_track_interval,
+            component_init_params=params,
         )
 
     if (
@@ -102,6 +173,9 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             max_seq_len=ctx.server_args.max_seq_len,
             is_eagle=params.is_eagle,
             tree_components=(ComponentType.FULL,),
+            enable_recurrent_extra_buffer=params.enable_recurrent_extra_buffer,
+            recurrent_track_interval=params.recurrent_track_interval,
+            component_init_params=params,
         )
 
     from sgl_jax.srt.mem_cache.radix_cache import RadixCache

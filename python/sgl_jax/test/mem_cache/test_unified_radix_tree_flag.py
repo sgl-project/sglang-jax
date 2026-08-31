@@ -226,8 +226,24 @@ class TestUnifiedRadixTreeFlag(CustomTestCase):
         self.assertEqual(cache.tree_components, (ComponentType.FULL,))
         self.assertIs(cache.disable, False)
 
-    def test_factory_flag_on_hybrid_unaffected(self):
+    def test_factory_flag_on_hybrid_returns_unified_full_and_swa(self):
         server_args = _make_server_args(enable_unified_radix_tree=True)
+        req_pool, allocator = self._create_swa_pools()
+        ctx = self._build_ctx(
+            server_args,
+            req_pool,
+            allocator,
+            is_hybrid_swa=True,
+            sliding_window_size=64,
+        )
+
+        cache = default_radix_cache_factory(ctx)
+
+        self.assertIsInstance(cache, UnifiedRadixCache)
+        self.assertEqual(cache.tree_components, (ComponentType.FULL, ComponentType.SWA))
+
+    def test_factory_hybrid_with_unified_flag_off_returns_legacy_swa_radix_cache(self):
+        server_args = _make_server_args(enable_unified_radix_tree=False)
         req_pool, allocator = self._create_swa_pools()
         ctx = self._build_ctx(
             server_args,
@@ -241,6 +257,40 @@ class TestUnifiedRadixTreeFlag(CustomTestCase):
 
         self.assertIsInstance(cache, SWARadixCache)
         self.assertNotIsInstance(cache, UnifiedRadixCache)
+
+    def test_factory_unified_hybrid_requires_positive_sliding_window_size(self):
+        server_args = _make_server_args(enable_unified_radix_tree=True)
+        for sliding_window_size in (None, 0):
+            with self.subTest(sliding_window_size=sliding_window_size):
+                req_pool, allocator = self._create_swa_pools()
+                ctx = self._build_ctx(
+                    server_args,
+                    req_pool,
+                    allocator,
+                    is_hybrid_swa=True,
+                    sliding_window_size=sliding_window_size,
+                )
+
+                with self.assertRaisesRegex(
+                    ValueError, r"--enable-unified-radix-tree.*sliding_window_size"
+                ):
+                    default_radix_cache_factory(ctx)
+
+    def test_factory_unified_hybrid_requires_swa_allocator(self):
+        server_args = _make_server_args(enable_unified_radix_tree=True)
+        req_pool, allocator = self._create_pools()
+        ctx = self._build_ctx(
+            server_args,
+            req_pool,
+            allocator,
+            is_hybrid_swa=True,
+            sliding_window_size=64,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, r"--enable-unified-radix-tree.*SWATokenToKVPoolAllocator"
+        ):
+            default_radix_cache_factory(ctx)
 
     def test_factory_flag_on_hybrid_disabled_returns_swa_chunk_cache(self):
         # hybrid + disabled radix wins over the unified flag (registry checks

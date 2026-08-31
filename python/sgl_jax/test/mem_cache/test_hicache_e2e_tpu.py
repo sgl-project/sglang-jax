@@ -195,7 +195,9 @@ class TestHiCacheE2ETPU(unittest.TestCase):
         tokens = [20, 21, 22, 23]
         idx, _ = self._fill(len(tokens), seed=2)
         self.cache.insert(InsertParams(key=self._key(tokens), value=idx))
-        self.cache.insert(InsertParams(key=self._key(tokens), value=idx))
+        self.cache.insert(
+            InsertParams(key=self._key(tokens), value=idx, prev_prefix_len=len(tokens))
+        )
         self._settle()
         self.cache.evict(EvictParams(num_tokens=len(tokens), dp_rank=0))
 
@@ -211,7 +213,9 @@ class TestHiCacheE2ETPU(unittest.TestCase):
         self.assertEqual(avail + evict + prot, self.DEVICE_SIZE)
 
         # Evict again, verify locks are released.
-        self.cache.insert(InsertParams(key=self._key(tokens), value=new_idx))
+        self.cache.insert(
+            InsertParams(key=self._key(tokens), value=new_idx, prev_prefix_len=len(tokens))
+        )
         self._settle()
         self.cache.evict(EvictParams(num_tokens=len(tokens), dp_rank=0))
         _, _, prot = self._token_counters()

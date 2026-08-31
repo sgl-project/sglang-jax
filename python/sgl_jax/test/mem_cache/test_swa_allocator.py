@@ -19,6 +19,8 @@ from sgl_jax.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     SWAKVPool,
 )
+from sgl_jax.srt.mem_cache.unified_cache_components.full_component import FullComponent
+from sgl_jax.srt.mem_cache.unified_cache_components.tree_component import ComponentType
 from sgl_jax.test.test_utils import CustomTestCase
 
 
@@ -116,26 +118,6 @@ class TestSWAAllocatorTokenLevel(CustomTestCase):
         self.assertEqual(self.alloc.full_available_size(), full_before)
         # SWA pool restored
         self.assertEqual(self.alloc.swa_available_size(), swa_before + 10)
-
-    # 7
-    def test_free_swa_clears_mapping(self):
-        """free_swa() zeroes out the mapping for freed indices."""
-        indices = self.alloc.alloc(5)
-        # Mapping should be non-zero
-        self.assertTrue(np.all(self.alloc.full_to_swa_index_mapping[indices] > 0))
-        self.alloc.free_swa(indices)
-        # Mapping should be zero
-        self.assertTrue(np.all(self.alloc.full_to_swa_index_mapping[indices] == 0))
-
-    # 8
-    def test_free_swa_idempotent(self):
-        """free_swa() twice on same indices does not crash or double-free."""
-        indices = self.alloc.alloc(5)
-        self.alloc.free_swa(indices)
-        swa_after_first = self.alloc.swa_available_size()
-        # Second call should be a no-op (mapping is already 0)
-        self.alloc.free_swa(indices)
-        self.assertEqual(self.alloc.swa_available_size(), swa_after_first)
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +343,297 @@ class TestSWAAllocatorPaged(CustomTestCase):
 
 
 # ---------------------------------------------------------------------------
-# Class 3: SWA Eviction logic
+# Class 3: Unified SWA ownership contracts
+# ---------------------------------------------------------------------------
+class TestSWAAllocatorUnifiedOwnership(CustomTestCase):
+    def setUp(self):
+        self.mesh = _make_mesh()
+
+    def _make_allocator(self, *, size=16, size_swa=16, dp_size=1):
+        kvcache = _make_swa_pool(
+            size=size,
+            size_swa=size_swa,
+            page_size=1,
+            mesh=self.mesh,
+        )
+        return SWATokenToKVPoolAllocator(
+            size=size,
+            size_swa=size_swa,
+            kvcache=kvcache,
+            page_size=1,
+            dp_size=dp_size,
+        )
+
+    def test_translate_full_to_swa_is_rank_local(self):
+        allocator = self._make_allocator(dp_size=2)
+        full_rank0 = allocator.alloc(2, dp_rank=0)
+        self.assertIsNotNone(full_rank0)
+
+        # Offset rank 1's physical SWA allocation while keeping the same local
+        # FULL indices on both ranks.
+        reserved_swa_rank1 = allocator.swa_attn_allocator.alloc(1, dp_rank=1)
+        self.assertIsNotNone(reserved_swa_rank1)
+        full_rank1 = allocator.alloc(2, dp_rank=1)
+        self.assertIsNotNone(full_rank1)
+        np.testing.assert_array_equal(full_rank0, full_rank1)
+
+        swa_rank0 = allocator.translate_full_to_swa(full_rank0, dp_rank=0)
+        swa_rank1 = allocator.translate_full_to_swa(full_rank1, dp_rank=1)
+        self.assertFalse(np.array_equal(swa_rank0, swa_rank1))
+
+        # Translation is a copy, not a mutable view into the mapping table.
+        swa_rank0[0] = 0
+        self.assertGreater(
+            allocator.full_to_swa_index_mapping[0][full_rank0[0]],
+            0,
+        )
+        empty = np.empty(0, dtype=np.int32)
+        translated_empty = allocator.translate_full_to_swa(empty, dp_rank=0)
+        self.assertEqual(translated_empty.dtype, np.int32)
+        self.assertEqual(translated_empty.size, 0)
+        self.assertIsNot(translated_empty, empty)
+
+        unmapped = np.array([int(full_rank0[-1]) + 1], dtype=np.int32)
+        with self.assertRaisesRegex(ValueError, r"dp_rank=0.*3"):
+            allocator.translate_full_to_swa(unmapped, dp_rank=0)
+
+    def test_free_full_only_preserves_swa_and_mapping_until_cascade(self):
+        allocator = self._make_allocator()
+        full_initial = allocator.full_available_size(dp_rank=0)
+        swa_initial = allocator.swa_available_size(dp_rank=0)
+        full_indices = allocator.alloc(4, dp_rank=0)
+        self.assertIsNotNone(full_indices)
+        mapped_swa = allocator.full_to_swa_index_mapping[full_indices].copy()
+
+        allocator.free_full(full_indices, dp_rank=0)
+
+        self.assertEqual(allocator.full_available_size(dp_rank=0), full_initial)
+        self.assertEqual(allocator.swa_available_size(dp_rank=0), swa_initial - 4)
+        np.testing.assert_array_equal(
+            allocator.full_to_swa_index_mapping[full_indices],
+            mapped_swa,
+        )
+
+    def test_free_swa_clears_mapping_and_is_idempotent(self):
+        allocator = self._make_allocator()
+        full_indices = allocator.alloc(4, dp_rank=0)
+        self.assertIsNotNone(full_indices)
+        swa_initial = allocator.swa_available_size(dp_rank=0) + len(full_indices)
+
+        allocator.free_swa(full_indices, dp_rank=0)
+        self.assertTrue(np.all(allocator.full_to_swa_index_mapping[full_indices] == 0))
+        self.assertEqual(allocator.swa_available_size(dp_rank=0), swa_initial)
+
+        allocator.free_swa(full_indices, dp_rank=0)
+        self.assertEqual(allocator.swa_available_size(dp_rank=0), swa_initial)
+
+    def test_full_then_swa_free_restores_each_pool_exactly_once(self):
+        allocator = self._make_allocator()
+        full_initial = allocator.full_available_size(dp_rank=0)
+        swa_initial = allocator.swa_available_size(dp_rank=0)
+        full_indices = allocator.alloc(4, dp_rank=0)
+        self.assertIsNotNone(full_indices)
+
+        allocator.free_full(full_indices, dp_rank=0)
+        self.assertEqual(allocator.full_available_size(dp_rank=0), full_initial)
+        self.assertEqual(allocator.swa_available_size(dp_rank=0), swa_initial - 4)
+
+        allocator.free_swa(full_indices, dp_rank=0)
+        self.assertEqual(allocator.full_available_size(dp_rank=0), full_initial)
+        self.assertEqual(allocator.swa_available_size(dp_rank=0), swa_initial)
+
+        allocator.free_swa(full_indices, dp_rank=0)
+        self.assertEqual(allocator.swa_available_size(dp_rank=0), swa_initial)
+
+    def test_grouped_full_then_swa_free_is_not_reusable_before_group_end(self):
+        allocator = self._make_allocator(size=8, size_swa=8)
+        full_indices = allocator.alloc(8, dp_rank=0)
+        self.assertIsNotNone(full_indices)
+        freed_indices = full_indices[:4]
+
+        allocator.free_group_begin()
+        allocator.free_full(freed_indices, dp_rank=0)
+        allocator.free_swa(freed_indices, dp_rank=0)
+
+        self.assertTrue(np.all(allocator.full_to_swa_index_mapping[freed_indices] == 0))
+        self.assertEqual(allocator.full_available_size(dp_rank=0), 0)
+        self.assertEqual(allocator.swa_available_size(dp_rank=0), 0)
+        self.assertIsNone(allocator.alloc(1, dp_rank=0))
+
+        allocator.free_group_end()
+        self.assertEqual(allocator.full_available_size(dp_rank=0), 4)
+        self.assertEqual(allocator.swa_available_size(dp_rank=0), 4)
+
+    def test_grouped_repeated_free_swa_clears_mapping_and_queues_once(self):
+        allocator = self._make_allocator(size=8, size_swa=8)
+        full_indices = allocator.alloc(8, dp_rank=0)
+        self.assertIsNotNone(full_indices)
+
+        allocator.free_group_begin()
+        allocator.free_swa(full_indices, dp_rank=0)
+        allocator.free_swa(full_indices, dp_rank=0)
+
+        self.assertTrue(np.all(allocator.full_to_swa_index_mapping[full_indices] == 0))
+        self.assertEqual(allocator.full_available_size(dp_rank=0), 0)
+        self.assertEqual(allocator.swa_available_size(dp_rank=0), 0)
+
+        allocator.free_group_end()
+        self.assertEqual(allocator.full_available_size(dp_rank=0), 0)
+        self.assertEqual(allocator.swa_available_size(dp_rank=0), 8)
+
+    def test_grouped_composite_free_captures_both_pools_and_is_idempotent(self):
+        allocator = self._make_allocator(size=8, size_swa=8)
+        full_indices = allocator.alloc(8, dp_rank=0)
+        self.assertIsNotNone(full_indices)
+        swa_indices = allocator.translate_full_to_swa(full_indices, dp_rank=0)
+
+        allocator.free_group_begin()
+        allocator.free(full_indices, dp_rank=0)
+        allocator.free(full_indices, dp_rank=0)
+
+        self.assertTrue(np.all(allocator.full_to_swa_index_mapping[full_indices] == 0))
+        self.assertEqual(allocator.full_available_size(dp_rank=0), 0)
+        self.assertEqual(allocator.swa_available_size(dp_rank=0), 0)
+
+        allocator.free_group_end()
+        self.assertEqual(allocator.full_available_size(dp_rank=0), 8)
+        self.assertEqual(allocator.swa_available_size(dp_rank=0), 8)
+
+        reallocated_full = allocator.alloc(8, dp_rank=0)
+        self.assertIsNotNone(reallocated_full)
+        reallocated_swa = allocator.translate_full_to_swa(
+            reallocated_full,
+            dp_rank=0,
+        )
+        np.testing.assert_array_equal(np.sort(reallocated_full), np.sort(full_indices))
+        np.testing.assert_array_equal(np.sort(reallocated_swa), np.sort(swa_indices))
+
+    def test_grouped_composite_and_ownership_specific_frees_share_dedup_state(self):
+        allocator = self._make_allocator(size=8, size_swa=8)
+        full_indices = allocator.alloc(8, dp_rank=0)
+        self.assertIsNotNone(full_indices)
+
+        allocator.free_group_begin()
+        allocator.free(full_indices[:4], dp_rank=0)
+        allocator.free_full(full_indices, dp_rank=0)
+        allocator.free_swa(full_indices, dp_rank=0)
+
+        self.assertTrue(np.all(allocator.full_to_swa_index_mapping[full_indices] == 0))
+        self.assertEqual(allocator.full_available_size(dp_rank=0), 0)
+        self.assertEqual(allocator.swa_available_size(dp_rank=0), 0)
+
+        allocator.free_group_end()
+        self.assertEqual(allocator.full_available_size(dp_rank=0), 8)
+        self.assertEqual(allocator.swa_available_size(dp_rank=0), 8)
+
+    def test_rank_local_clear_preserves_other_grouped_frees_and_group_state(self):
+        allocator = self._make_allocator(size=16, size_swa=16, dp_size=2)
+        full_rank0 = allocator.alloc(4, dp_rank=0)
+        full_rank1 = allocator.alloc(4, dp_rank=1)
+        self.assertIsNotNone(full_rank0)
+        self.assertIsNotNone(full_rank1)
+
+        allocator.free_group_begin()
+        allocator.free(full_rank0, dp_rank=0)
+        allocator.free(full_rank1, dp_rank=1)
+        allocator.clear(dp_rank=0)
+
+        self.assertFalse(allocator.is_not_in_free_group)
+        self.assertEqual(allocator.full_available_size(dp_rank=0), 8)
+        self.assertEqual(allocator.swa_available_size(dp_rank=0), 8)
+        self.assertEqual(allocator.full_available_size(dp_rank=1), 4)
+        self.assertEqual(allocator.swa_available_size(dp_rank=1), 4)
+
+        # Rank 0's seen state was cleared, so reusing the same local IDs must
+        # create new grouped frees. Rank 1's seen state was preserved, so a
+        # repeated free of its captured IDs must remain a no-op.
+        replacement_rank0 = allocator.alloc(4, dp_rank=0)
+        self.assertIsNotNone(replacement_rank0)
+        np.testing.assert_array_equal(replacement_rank0, full_rank0)
+        allocator.free(replacement_rank0, dp_rank=0)
+        allocator.free(full_rank1, dp_rank=1)
+
+        allocator.free_group_end()
+        self.assertEqual(allocator.full_available_size(dp_rank=0), 8)
+        self.assertEqual(allocator.swa_available_size(dp_rank=0), 8)
+        self.assertEqual(allocator.full_available_size(dp_rank=1), 8)
+        self.assertEqual(allocator.swa_available_size(dp_rank=1), 8)
+
+    def test_repeated_free_group_begin_preserves_captured_indices(self):
+        allocator = self._make_allocator(size=8, size_swa=8)
+        full_indices = allocator.alloc(8, dp_rank=0)
+        self.assertIsNotNone(full_indices)
+
+        allocator.free_group_begin()
+        allocator.free(full_indices[:4], dp_rank=0)
+        allocator.free_group_begin()
+        allocator.free(full_indices[4:], dp_rank=0)
+        allocator.free_group_end()
+
+        self.assertTrue(np.all(allocator.full_to_swa_index_mapping[full_indices] == 0))
+        self.assertEqual(allocator.full_available_size(dp_rank=0), 8)
+        self.assertEqual(allocator.swa_available_size(dp_rank=0), 8)
+
+    def test_dp2_same_local_full_index_does_not_alias_mapping(self):
+        allocator = self._make_allocator(dp_size=2)
+        full_rank0 = allocator.alloc(1, dp_rank=0)
+        self.assertIsNotNone(full_rank0)
+        reserved_swa_rank1 = allocator.swa_attn_allocator.alloc(1, dp_rank=1)
+        self.assertIsNotNone(reserved_swa_rank1)
+        full_rank1 = allocator.alloc(1, dp_rank=1)
+        self.assertIsNotNone(full_rank1)
+        np.testing.assert_array_equal(full_rank0, full_rank1)
+
+        mapped_rank1 = allocator.translate_full_to_swa(full_rank1, dp_rank=1)
+        swa_rank1_before = allocator.swa_available_size(dp_rank=1)
+        allocator.free_swa(full_rank0, dp_rank=0)
+
+        np.testing.assert_array_equal(
+            allocator.translate_full_to_swa(full_rank1, dp_rank=1),
+            mapped_rank1,
+        )
+        self.assertEqual(
+            allocator.swa_available_size(dp_rank=1),
+            swa_rank1_before,
+        )
+
+    def test_swa_allocation_failure_rolls_back_full_and_mapping(self):
+        allocator = self._make_allocator(size=8, size_swa=8)
+        full_before = allocator.full_available_size(dp_rank=0)
+        swa_before = allocator.swa_available_size(dp_rank=0)
+        mapping_before = allocator.full_to_swa_index_mapping.copy()
+        original_swa_alloc = allocator.swa_attn_allocator.alloc
+        allocator.swa_attn_allocator.alloc = lambda need_size, dp_rank=0: None
+        try:
+            result = allocator.alloc(2, dp_rank=0)
+        finally:
+            allocator.swa_attn_allocator.alloc = original_swa_alloc
+
+        self.assertIsNone(result)
+        self.assertEqual(allocator.full_available_size(dp_rank=0), full_before)
+        self.assertEqual(allocator.swa_available_size(dp_rank=0), swa_before)
+        np.testing.assert_array_equal(
+            allocator.full_to_swa_index_mapping,
+            mapping_before,
+        )
+
+    def test_full_component_selects_pool_specific_free_for_swa_tree(self):
+        allocator = self._make_allocator()
+        swa_cache = SimpleNamespace(
+            token_to_kv_pool_allocator=allocator,
+            tree_components={ComponentType.FULL: object(), ComponentType.SWA: object()},
+        )
+        full_only_cache = SimpleNamespace(
+            token_to_kv_pool_allocator=allocator,
+            tree_components={ComponentType.FULL: object()},
+        )
+
+        self.assertEqual(FullComponent(swa_cache)._free_full.__name__, "free_full")
+        self.assertEqual(FullComponent(full_only_cache)._free_full.__name__, "free")
+
+
+# ---------------------------------------------------------------------------
+# Class 4: SWA Eviction logic
 # ---------------------------------------------------------------------------
 class TestSWAEviction(CustomTestCase):
     """Tests for _evict_swa logic (called via maybe_evict_swa)."""
@@ -521,7 +793,7 @@ class TestSWAEviction(CustomTestCase):
 
 
 # ---------------------------------------------------------------------------
-# Class 4: Overlap safety
+# Class 5: Overlap safety
 # ---------------------------------------------------------------------------
 class TestSWAOverlapSafety(CustomTestCase):
     """Test overlap-aware reclaim timing for decode and chunked extend."""
@@ -582,16 +854,13 @@ class TestSWAOverlapSafety(CustomTestCase):
 
     def _make_batch(self, req, *, enable_overlap, forward_mode, prefix_lens=None, chunked_req=None):
         from sgl_jax.srt.managers.schedule_batch import ScheduleBatch, ScheduleReqsInfo
-        from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
+        from sgl_jax.srt.mem_cache.chunk_cache import SWAChunkCache
 
-        tree_cache = (
-            ChunkCache(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.alloc,
-                page_size=self.page_size,
-            )
-            if forward_mode.is_extend()
-            else None
+        tree_cache = SWAChunkCache(
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.alloc,
+            page_size=self.page_size,
+            sliding_window_size=self.sliding_window,
         )
 
         reqs_info = ScheduleReqsInfo(
