@@ -27,6 +27,15 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _cpu_model() -> str:
+    cpuinfo = Path("/proc/cpuinfo")
+    if cpuinfo.exists():
+        for line in cpuinfo.read_text(encoding="utf-8").splitlines():
+            if line.startswith("model name"):
+                return line.partition(":")[2].strip()
+    return platform.processor() or "unknown"
+
+
 def _load_model(model_path: str, revision: str):
     kwargs = dict(
         revision=revision,
@@ -412,6 +421,9 @@ def main() -> None:
         "transformers_version": __import__("transformers").__version__,
         "python_version": platform.python_version(),
         "platform": platform.platform(),
+        "cpu_model": _cpu_model(),
+        "aten_cpu_capability": os.environ.get("ATEN_CPU_CAPABILITY"),
+        "torch_num_threads": torch.get_num_threads(),
         "load_seconds": load_seconds,
         "artifacts": artifacts,
     }

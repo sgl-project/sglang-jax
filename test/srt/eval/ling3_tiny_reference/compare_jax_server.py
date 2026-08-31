@@ -127,37 +127,115 @@ def _raw_logit_metrics(golden: np.ndarray, actual: np.ndarray, top_k: int) -> di
     }
 
 
+def _top_logprob_metrics(
+    expected_ids: np.ndarray,
+    expected_logprobs: np.ndarray,
+    actual_row: list,
+    top_k: int,
+) -> tuple[float, float]:
+    actual = {int(item[1]): float(item[0]) for item in actual_row}
+    expected = {
+        int(token_id): float(logprob) for token_id, logprob in zip(expected_ids, expected_logprobs)
+    }
+    common = set(actual) & set(expected)
+    overlap = len(common) / top_k
+    common_delta = (
+        max(abs(actual[token_id] - expected[token_id]) for token_id in common)
+        if common
+        else math.inf
+    )
+    return overlap, common_delta
+
+
 def _server_step_metrics(golden: dict[str, np.ndarray], response: dict, top_k: int) -> dict:
     output_ids = np.asarray(response["output_ids"], dtype=np.int32)
     expected_ids = golden["greedy_token_ids"]
     exact_tokens = bool(np.array_equal(output_ids, expected_ids))
 
+    common_length = min(output_ids.shape[0], expected_ids.shape[0])
+    mismatch_indices = np.flatnonzero(output_ids[:common_length] != expected_ids[:common_length])
+    first_mismatch = int(mismatch_indices[0]) if mismatch_indices.size else None
+    # The distributions at the first mismatching token still share the same
+    # prefix. Any later free-running steps are conditioned on different token
+    # histories and must not be presented as an accuracy comparison.
+    comparable_steps = first_mismatch + 1 if first_mismatch is not None else common_length
+
     output_top = response["meta_info"]["output_top_logprobs"]
     step_overlaps = []
     step_common_deltas = []
-    for step, row in enumerate(output_top[: expected_ids.shape[0]]):
-        actual = {int(item[1]): float(item[0]) for item in row}
-        expected = {
-            int(token_id): float(logprob)
-            for token_id, logprob in zip(
-                golden["step_topk_ids"][step], golden["step_topk_logprobs"][step]
-            )
-        }
-        common = set(actual) & set(expected)
-        step_overlaps.append(len(common) / top_k)
-        step_common_deltas.append(
-            max(abs(actual[token_id] - expected[token_id]) for token_id in common)
-            if common
-            else math.inf
+    for step, row in enumerate(output_top[:comparable_steps]):
+        overlap, common_delta = _top_logprob_metrics(
+            golden["step_topk_ids"][step],
+            golden["step_topk_logprobs"][step],
+            row,
+            top_k,
         )
+        step_overlaps.append(overlap)
+        step_common_deltas.append(common_delta)
     return {
         "greedy_token_ids_exact": exact_tokens,
         "expected_token_ids": expected_ids.tolist(),
         "jax_token_ids": output_ids.tolist(),
+        "first_greedy_mismatch_step": first_mismatch,
+        "same_context_steps_compared": comparable_steps,
         "min_step_topk_overlap": min(step_overlaps) if step_overlaps else 0.0,
         "max_step_common_logprob_delta": (
             max(step_common_deltas) if step_common_deltas else math.inf
         ),
+    }
+
+
+def _teacher_forced_step_metrics(
+    golden: dict[str, np.ndarray],
+    first_response: dict,
+    base_url: str,
+    request_timeout: float,
+    top_k: int,
+) -> dict:
+    expected_ids = golden["greedy_token_ids"]
+    input_ids = golden["input_ids"]
+    per_step = []
+    for step in range(expected_ids.shape[0]):
+        if step == 0:
+            response = first_response
+        else:
+            context_ids = np.concatenate((input_ids, expected_ids[:step]))
+            payload = {
+                "input_ids": context_ids.tolist(),
+                "sampling_params": {
+                    "temperature": 0.0,
+                    "top_k": 1,
+                    "max_new_tokens": 1,
+                },
+                "return_logprob": True,
+                "top_logprobs_num": top_k,
+            }
+            response = _post_json(f"{base_url.rstrip('/')}/generate", payload, request_timeout)
+        actual_id = int(response["output_ids"][0])
+        row = response["meta_info"]["output_top_logprobs"][0]
+        overlap, common_delta = _top_logprob_metrics(
+            golden["step_topk_ids"][step],
+            golden["step_topk_logprobs"][step],
+            row,
+            top_k,
+        )
+        per_step.append(
+            {
+                "step": step,
+                "expected_greedy_id": int(expected_ids[step]),
+                "jax_greedy_id": actual_id,
+                "greedy_id_exact": actual_id == int(expected_ids[step]),
+                "topk_overlap": overlap,
+                "topk_common_max_logprob_delta": common_delta,
+            }
+        )
+    return {
+        "greedy_token_ids_exact": all(row["greedy_id_exact"] for row in per_step),
+        "min_step_topk_overlap": min(row["topk_overlap"] for row in per_step),
+        "max_step_common_logprob_delta": max(
+            row["topk_common_max_logprob_delta"] for row in per_step
+        ),
+        "steps": per_step,
     }
 
 
@@ -186,7 +264,8 @@ def main() -> None:
             "max_logit_rmse": args.max_logit_rmse,
             "min_topk_overlap": args.min_topk_overlap,
             "max_topk_logprob_delta": args.max_topk_logprob_delta,
-            "greedy_token_ids_exact": True,
+            "autoregressive_greedy_token_ids_exact": True,
+            "teacher_forced_greedy_token_ids_exact": True,
         },
         "cases": [],
     }
@@ -219,6 +298,13 @@ def main() -> None:
         )
         raw_metrics = _raw_logit_metrics(golden["first_token_logits"], jax_logits, top_k)
         step_metrics = _server_step_metrics(golden, response, top_k)
+        teacher_forced_metrics = _teacher_forced_step_metrics(
+            golden,
+            response,
+            args.base_url,
+            args.request_timeout,
+            top_k,
+        )
         passed = (
             raw_metrics["cosine_similarity"] >= args.min_logit_cosine
             and raw_metrics["rmse"] <= args.max_logit_rmse
@@ -227,12 +313,17 @@ def main() -> None:
             and step_metrics["min_step_topk_overlap"] >= args.min_topk_overlap
             and step_metrics["max_step_common_logprob_delta"] <= args.max_topk_logprob_delta
             and step_metrics["greedy_token_ids_exact"]
+            and teacher_forced_metrics["min_step_topk_overlap"] >= args.min_topk_overlap
+            and teacher_forced_metrics["max_step_common_logprob_delta"]
+            <= args.max_topk_logprob_delta
+            and teacher_forced_metrics["greedy_token_ids_exact"]
         )
         case_result = {
             "name": name,
             "passed": passed,
             "raw_first_token": raw_metrics,
-            "generation": step_metrics,
+            "autoregressive_generation": step_metrics,
+            "teacher_forced_steps": teacher_forced_metrics,
         }
         results["cases"].append(case_result)
         print(json.dumps(case_result, sort_keys=True), flush=True)

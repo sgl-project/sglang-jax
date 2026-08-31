@@ -12,8 +12,12 @@ JAX comparison does not depend on tokenizer or chat-template behavior.
 
 ## 1. Generate the Torch CPU golden
 
-Use a Linux machine with at least 48 GiB RAM and enough local/model-cache space
-for the 15.8 GB BF16 checkpoint.
+Use an `n2-highmem-16` Linux machine with at least 48 GiB RAM and enough
+local/model-cache space for the 15.8 GB BF16 checkpoint. Torch BF16 CPU kernels
+are hardware-sensitive enough to change MoE routes, so canonical artifacts must
+be regenerated on that machine family. `ATEN_CPU_CAPABILITY=default` was tested
+and does not make the outputs portable across n2 and v6 host CPUs. The manifest
+records the CPU model and ATen capability for provenance.
 
 ```bash
 python generate_torch_cpu_golden.py \
@@ -59,7 +63,10 @@ python compare_jax_server.py \
   --output /artifacts/ling3-tiny-comparison.json
 ```
 
-The gate checks full first-token logits, top-k logprobs at every step, and exact
-greedy token IDs. The checked-in thresholds are initial cross-device BF16
-guardrails; the validation report must retain the raw metrics so reviewers can
-judge the observed margin rather than seeing only pass/fail.
+The gate checks full first-token logits and the exact autoregressive greedy token
+IDs. It also teacher-forces the same HF golden prefix into JAX at every step
+before comparing top-k logprobs and per-step greedy IDs. This avoids presenting
+later free-running steps as comparable after the first token mismatch. The
+checked-in thresholds are initial cross-device BF16 guardrails; the validation
+report must retain the raw metrics so reviewers can judge the observed margin
+rather than seeing only pass/fail.
