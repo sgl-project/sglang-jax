@@ -12,7 +12,7 @@ End-to-end recipes for serving specific models on specific TPU (or GPU) topologi
 
 | Section | What's inside |
 |---|---|
-| [`autoregressive/`](/autoregressive) | Token-generating recipes organized by vendor subdir: text-only LLMs plus vision-language decoders such as Qwen2.5-VL. |
+| [`autoregressive/`](/autoregressive) | Token-generating recipes organized by vendor subdir: text-only LLMs plus vision-language decoders such as Qwen2.5-VL and Qwen3-VL. |
 | [`diffusion/`](/diffusion) | Diffusion-style media generation recipes such as Wan 2.1/2.2 T2V. |
 | [`base/basic-api-usage.md`](/base/basic-api-usage) | Shared request examples for running OpenAI-compatible and native API calls. |
 | [`base/tpu-topology-reference.md`](/base/tpu-topology-reference) | TPU generation, topology, device-count, and HBM reference. |
@@ -51,7 +51,7 @@ Status prefix: ✅ validated · 🧪 partially validated · 🚧 starter (not ye
 | TPU | Topology | Recipes |
 |---|---|---|
 | v6e-4 | 2x2 | ✅ [Qwen-7B-Chat](/autoregressive/Qwen/Qwen) · ✅ [Qwen3-8B / 32B](/autoregressive/Qwen/Qwen3) · ✅ [Qwen2.5-VL 3B / 7B candidates](/autoregressive/Qwen/Qwen2.5-VL) (`--tp-size 1`) · ✅ [Qwen2.5-VL 32B](/autoregressive/Qwen/Qwen2.5-VL) (`--tp-size 4`) · ✅ [Llama 3.1 8B-Instruct](/autoregressive/Llama/Llama3.1) · ✅ [Gemma 2 27B-it](/autoregressive/Google/Gemma2) · ✅ [MiMo-7B-RL](/autoregressive/Xiaomi/MiMo-7B) · ✅ [DeepSeek-V2-Lite](/autoregressive/DeepSeek/DeepSeek-V2) |
-| v7x-8 | single host (4 chips × 2 devices) | ✅ [Qwen2.5-VL-32B](/autoregressive/Qwen/Qwen2.5-VL) (`--tp-size 8 --dp-size 4`) · ✅ [MiMo-V2-Flash](/autoregressive/Xiaomi/MiMo-V2-Flash) |
+| v7x-8 | single host (4 chips × 2 devices) | ✅ [Qwen2.5-VL-32B](/autoregressive/Qwen/Qwen2.5-VL) (`--tp-size 8 --dp-size 4`) · ✅ [Qwen3-VL-32B](/autoregressive/Qwen/Qwen3-VL) (`--tp-size 8 --dp-size 4`) · ✅ [MiMo-V2-Flash](/autoregressive/Xiaomi/MiMo-V2-Flash) |
 
 ### Multi-host
 

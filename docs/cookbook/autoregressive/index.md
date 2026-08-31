@@ -71,6 +71,7 @@ End-to-end serving recipes for autoregressive models on SGL-JAX, organized by ve
 | ✅ | Qwen3-8B / Qwen3-32B | [`Qwen/Qwen3.md`](/autoregressive/Qwen/Qwen3) | v6e-4; 8B v7x-4 | dense + reasoning (`qwen3`) + tool (`qwen25`) |
 | ✅ | Qwen3-30B-A3B | [`Qwen/Qwen3-MoE.md`](/autoregressive/Qwen/Qwen3-MoE) | v6e-16 / v7x-4 | MoE + reasoning (`qwen3`) + tool (`qwen25`) |
 | ✅ | Qwen2.5-VL (3B / 7B / 32B / 72B) | [`Qwen/Qwen2.5-VL.md`](/autoregressive/Qwen/Qwen2.5-VL) | v6e-4 for 3B/7B/32B; 32B also validated on v7x-8; 72B pending | vision-language autoregressive decoder |
+| ✅ | Qwen3-VL-32B-Instruct | [`Qwen/Qwen3-VL.md`](/autoregressive/Qwen/Qwen3-VL) | v7x-8 | vision-language autoregressive decoder; DP4 × effective TP2 |
 | 📝 | Qwen2 / Qwen2-MoE | _no recipe — same family runtime path_ | — | dense / MoE |
 
 ### Xiaomi — `Xiaomi/`
@@ -89,7 +90,7 @@ A model that generates text one token at a time, conditioning on its own previou
 
 - **Dense LLMs** — Qwen / Qwen3 / Llama / Gemma 2 / MiMo-7B.
 - **MoE LLMs** — Qwen3-MoE / DeepSeek V2/V3/R1 / GLM-4.5 / Ling 2.6 / MiMo-V2-Flash / MiMo-V2.5-Pro / Kimi-Linear / Grok-2 (base).
-- **Vision-language decoders** — Qwen2.5-VL ingests image / video inputs, but the answer is still produced by an autoregressive generation stage.
+- **Vision-language decoders** — Qwen2.5-VL and Qwen3-VL ingest image / video inputs, but the answer is still produced by an autoregressive generation stage.
 
 Diffusion image/video generation models live in [Diffusion recipes](/diffusion).
 
@@ -100,7 +101,7 @@ Diffusion image/video generation models live in [Diffusion recipes](/diffusion).
 | Single-host dense model | [`Qwen/Qwen.md`](/autoregressive/Qwen/Qwen) ✅ or [`Llama/Llama3.1.md`](/autoregressive/Llama/Llama3.1) ✅ |
 | Dense model with benchmark rows | [`Qwen/Qwen3.md`](/autoregressive/Qwen/Qwen3) ✅ |
 | Single-host MoE with backend choice | [`Xiaomi/MiMo-V2-Flash.md`](/autoregressive/Xiaomi/MiMo-V2-Flash) ✅ |
-| Vision-language chat | [`Qwen/Qwen2.5-VL.md`](/autoregressive/Qwen/Qwen2.5-VL) ✅ |
+| Vision-language chat | [`Qwen/Qwen3-VL.md`](/autoregressive/Qwen/Qwen3-VL) ✅ or [`Qwen/Qwen2.5-VL.md`](/autoregressive/Qwen/Qwen2.5-VL) ✅ |
 | Large multi-node MoE with GKE manifest | [`Xiaomi/MiMo-V2.5-Pro.md`](/autoregressive/Xiaomi/MiMo-V2.5-Pro) ✅ |
 | Multi-node dense | [`Llama/Llama3.3-70B.md`](/autoregressive/Llama/Llama3.3-70B) ✅ (+ [GKE Indexed Job launcher](/deployment/gke-indexed-job)) |
 | Base model (no chat template, `/v1/completions` flow) | [`Grok/Grok2.md`](/autoregressive/Grok/Grok2) ✅ |
