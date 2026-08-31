@@ -194,9 +194,7 @@ class SamplingMetadata:
             )
 
         return cls(
-            return_logprob=(
-                batch.return_logprob or batch.return_output_logprob_only
-            ),
+            return_logprob=(batch.return_logprob or batch.return_output_logprob_only),
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
             temperatures=temperatures_device,

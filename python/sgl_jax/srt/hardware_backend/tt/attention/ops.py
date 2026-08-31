@@ -32,9 +32,7 @@ def chunked_scaled_dot_product_attention(
     )
 
 
-def paged_scaled_dot_product_attention_decode(
-    query, key_cache, value_cache, page_table, positions
-):
+def paged_scaled_dot_product_attention_decode(query, key_cache, value_cache, page_table, positions):
     return _call(
         "tt.paged_scaled_dot_product_attention_decode",
         query,

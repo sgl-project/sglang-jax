@@ -45,9 +45,7 @@ class TTAttentionMetadataTest(unittest.TestCase):
         for prefix_length, chunk_length in zip(prefix_tokens, chunk_tokens):
             total_tokens = prefix_length + chunk_length
             cache_capacity = ((total_tokens + 31) // 32) * 32
-            user_locations = np.arange(
-                start, start + cache_capacity, dtype=np.int32
-            )
+            user_locations = np.arange(start, start + cache_capacity, dtype=np.int32)
             cache_locations.append(user_locations)
             start += cache_capacity
 
@@ -62,9 +60,7 @@ class TTAttentionMetadataTest(unittest.TestCase):
         )
 
     def test_first_scheduler_chunk_uses_bucketed_attention_shape(self):
-        metadata = self.backend._prefill_metadata(
-            self._batch(prefix_tokens=0, chunk_tokens=100)
-        )
+        metadata = self.backend._prefill_metadata(self._batch(prefix_tokens=0, chunk_tokens=100))
 
         self.assertEqual(metadata.prefill_input_indices.shape, (1, 512))
         np.testing.assert_array_equal(
@@ -85,9 +81,7 @@ class TTAttentionMetadataTest(unittest.TestCase):
         )
 
     def test_later_scheduler_chunk_uses_full_page_table(self):
-        metadata = self.backend._prefill_metadata(
-            self._batch(prefix_tokens=256, chunk_tokens=100)
-        )
+        metadata = self.backend._prefill_metadata(self._batch(prefix_tokens=256, chunk_tokens=100))
 
         self.assertEqual(metadata.prefill_input_indices.shape, (1, 512))
         np.testing.assert_array_equal(
@@ -105,14 +99,10 @@ class TTAttentionMetadataTest(unittest.TestCase):
 
     def test_scheduler_chunk_requires_page_aligned_prefix(self):
         with self.assertRaisesRegex(ValueError, "prefixes must be page-aligned"):
-            self.backend._prefill_metadata(
-                self._batch(prefix_tokens=16, chunk_tokens=100)
-            )
+            self.backend._prefill_metadata(self._batch(prefix_tokens=16, chunk_tokens=100))
 
     def test_attention_backend_does_not_cap_scheduler_chunks(self):
-        metadata = self.backend._prefill_metadata(
-            self._batch(prefix_tokens=0, chunk_tokens=1024)
-        )
+        metadata = self.backend._prefill_metadata(self._batch(prefix_tokens=0, chunk_tokens=1024))
 
         self.assertEqual(metadata.prefill_input_indices.shape, (1, 1024))
 
@@ -132,9 +122,7 @@ class TTAttentionMetadataTest(unittest.TestCase):
         pool = SimpleNamespace(get_kv_buffer=lambda _layer_id: (cache, cache))
         layer = SimpleNamespace(layer_id=0, scaling=128**-0.5)
 
-        graph = jax.make_jaxpr(
-            lambda q, k, v: self.backend._prefill(q, k, v, layer, pool)
-        )(
+        graph = jax.make_jaxpr(lambda q, k, v: self.backend._prefill(q, k, v, layer, pool))(
             jnp.zeros((1024, 8, 128), dtype=jnp.bfloat16),
             jnp.zeros((1024, 2, 128), dtype=jnp.bfloat16),
             jnp.zeros((1024, 2, 128), dtype=jnp.bfloat16),
@@ -144,8 +132,7 @@ class TTAttentionMetadataTest(unittest.TestCase):
             equation
             for equation in graph.jaxpr.eqns
             if equation.primitive.name == "ffi_call"
-            and equation.params["target_name"]
-            == "tt.chunked_scaled_dot_product_attention"
+            and equation.params["target_name"] == "tt.chunked_scaled_dot_product_attention"
         ]
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].params["custom_call_api_version"], 4)
@@ -201,19 +188,13 @@ class TTAttentionMetadataTest(unittest.TestCase):
 
         metadata = self.backend._decode_metadata(batch)
 
-        np.testing.assert_array_equal(
-            np.asarray(metadata.page_table)[:, 0], [1, 2, 0, 0]
-        )
-        np.testing.assert_array_equal(
-            np.asarray(metadata.positions), [31, 63, -1, -1]
-        )
+        np.testing.assert_array_equal(np.asarray(metadata.page_table)[:, 0], [1, 2, 0, 0])
+        np.testing.assert_array_equal(np.asarray(metadata.positions), [31, 63, -1, -1])
 
     def test_scheduler_chunk_accepts_noncontiguous_physical_pages(self):
         batch = self._batch(prefix_tokens=256, chunk_tokens=256)
         page_starts = np.arange(32, 32 + 16 * 64, 64, dtype=np.int32)
-        cache_pages = [
-            start + np.arange(32, dtype=np.int32) for start in page_starts
-        ]
+        cache_pages = [start + np.arange(32, dtype=np.int32) for start in page_starts]
         batch.cache_loc = np.concatenate(cache_pages)
 
         metadata = self.backend._prefill_metadata(batch)

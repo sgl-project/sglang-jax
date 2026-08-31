@@ -56,6 +56,7 @@ class TTTokenToKVPool(MHATokenToKVPool):
             ]
         logger.info("Created TT KV buffers in %.2f seconds", time.time() - start)
 
+
 @jax.tree_util.register_dataclass
 @dataclass
 class TTAttentionMetadata:
@@ -142,10 +143,12 @@ class TTAttention(AttentionBackend):
 
     def prepare_model_state(self, leaves):
         return tuple(
-            prepare_weight(leaf)
-            if getattr(leaf, "ndim", 0) > 0
-            and getattr(leaf, "dtype", None) in (jnp.bfloat16, jnp.float32)
-            else leaf
+            (
+                prepare_weight(leaf)
+                if getattr(leaf, "ndim", 0) > 0
+                and getattr(leaf, "dtype", None) in (jnp.bfloat16, jnp.float32)
+                else leaf
+            )
             for leaf in leaves
         )
 
@@ -184,9 +187,7 @@ class TTAttention(AttentionBackend):
     def _prefill_metadata(self, batch: ModelWorkerBatch) -> TTAttentionMetadata:
         active_slots = np.asarray(batch.logits_indices_selector, dtype=np.int32)
         chunk_lengths = np.asarray(batch.extend_seq_lens, dtype=np.int32)[active_slots]
-        prefix_lengths = np.asarray(batch.extend_prefix_lens, dtype=np.int32)[
-            active_slots
-        ]
+        prefix_lengths = np.asarray(batch.extend_prefix_lens, dtype=np.int32)[active_slots]
         if np.any(prefix_lengths % self.page_size):
             raise ValueError("TT prefill prefixes must be page-aligned")
 
@@ -208,9 +209,9 @@ class TTAttention(AttentionBackend):
         # Repack those ragged ranges into rectangular TT rows and remember how
         # to restore the scheduler layout after attention.
         all_chunk_lengths = np.asarray(batch.extend_seq_lens, dtype=np.int32)
-        input_starts = (
-            np.cumsum(all_chunk_lengths, dtype=np.int32) - all_chunk_lengths
-        )[active_slots]
+        input_starts = (np.cumsum(all_chunk_lengths, dtype=np.int32) - all_chunk_lengths)[
+            active_slots
+        ]
 
         token_offsets = np.arange(tokens_per_sequence, dtype=np.int32)
         input_indices = input_starts[:, None] + token_offsets
@@ -218,14 +219,11 @@ class TTAttention(AttentionBackend):
         prefill_input_indices = np.where(live_tokens, input_indices, 0)
 
         output_indices = (
-            np.arange(len(active_slots), dtype=np.int32)[:, None]
-            * tokens_per_sequence
+            np.arange(len(active_slots), dtype=np.int32)[:, None] * tokens_per_sequence
             + token_offsets
         )
         prefill_output_indices = np.zeros(len(batch.input_ids), dtype=np.int32)
-        prefill_output_indices[input_indices[live_tokens]] = output_indices[
-            live_tokens
-        ]
+        prefill_output_indices[input_indices[live_tokens]] = output_indices[live_tokens]
 
         page_offsets = np.arange(bucket_pages, dtype=np.int32)
         live_pages = page_offsets < live_page_counts[:, None]
@@ -306,9 +304,7 @@ class TTAttention(AttentionBackend):
 
         tokens = metadata.prefill_input_indices.shape[1]
         q = q.at[metadata.prefill_input_indices].get(
-            out_sharding=NamedSharding(
-                self.mesh, P("data", None, "tensor", None)
-            )
+            out_sharding=NamedSharding(self.mesh, P("data", None, "tensor", None))
         )
         q = jnp.transpose(q, (0, 2, 1, 3))
         output = tt_ops.chunked_scaled_dot_product_attention(
@@ -352,9 +348,7 @@ class TTAttention(AttentionBackend):
             positions,
         )
         output_sharding = NamedSharding(self.mesh, P("data", "tensor"))
-        return output.reshape(
-            num_tokens, -1, out_sharding=output_sharding
-        ), (k_cache, v_cache)
+        return output.reshape(num_tokens, -1, out_sharding=output_sharding), (k_cache, v_cache)
 
     def _prefill_cache_value(self, value, head_dim):
         value = value.at[self.forward_metadata.prefill_input_indices].get(
@@ -372,9 +366,7 @@ class TTAttention(AttentionBackend):
     @staticmethod
     def _pad_head_dim(value, head_dim):
         if value.shape[-1] < head_dim:
-            return jnp.pad(
-                value, ((0, 0), (0, 0), (0, head_dim - value.shape[-1]))
-            )
+            return jnp.pad(value, ((0, 0), (0, 0), (0, head_dim - value.shape[-1])))
         return value[..., :head_dim]
 
     @staticmethod

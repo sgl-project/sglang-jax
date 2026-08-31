@@ -276,8 +276,7 @@ class ModelWorker:
             # uncapped buckets because odd shapes slow the Pallas kernel.
             max_total_num_tokens=(
                 self.max_total_num_tokens
-                if os.getenv("JAX_PLATFORMS") == "proxy"
-                or server_args.attention_backend == "tt"
+                if os.getenv("JAX_PLATFORMS") == "proxy" or server_args.attention_backend == "tt"
                 else 0
             ),
             multimodal=server_args.multimodal,

@@ -274,9 +274,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             memory_pools,
             logits_metadata,
         ):
-            prepare_model_state = getattr(
-                self.attn_backend, "prepare_model_state", None
-            )
+            prepare_model_state = getattr(self.attn_backend, "prepare_model_state", None)
             if prepare_model_state is not None:
                 model_state_leaves = prepare_model_state(model_state_leaves)
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
@@ -747,9 +745,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             )
 
         elif backend == "tt":
-            from sgl_jax.srt.hardware_backend.tt.attention.tt_backend import (
-                TTAttention,
-            )
+            from sgl_jax.srt.hardware_backend.tt.attention.tt_backend import TTAttention
 
             full_attn_backend = TTAttention(
                 page_size=self.page_size,
