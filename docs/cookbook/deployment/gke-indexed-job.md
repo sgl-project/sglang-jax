@@ -13,6 +13,6 @@ Common conventions:
 - Let GKE provide TPU worker environment variables such as `TPU_PROCESS_ADDRESSES` and `TPU_WORKER_HOSTNAMES`.
 - Keep `JAX_COMPILATION_CACHE_DIR` set for every rank.
 
-For topology sizing, see [TPU topology reference](/base/tpu-topology-reference). For multi-node startup failures, see [Troubleshooting](/deployment/troubleshooting).
+For topology sizing, see [TPU topology reference](../base/tpu-topology-reference.md). For multi-node startup failures, see [Troubleshooting](../deployment/troubleshooting.md).
 
 The full canonical template lives in the main Sphinx docs at `docs/deployment/gke-indexed-job.md`.

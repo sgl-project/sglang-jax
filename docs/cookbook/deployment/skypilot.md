@@ -13,6 +13,6 @@ Common conventions:
 - Keep distributed flags aligned with the recipe: `--nnodes`, `--node-rank`, `--dist-init-addr`, `--tp-size`, `--dp-size`, and `--ep-size`.
 - Use a persistent compilation cache when running repeated experiments.
 
-For TPU sizing, see [TPU topology reference](/base/tpu-topology-reference). For provisioning and quota notes, see [TPU resources guide](/developer_guide/tpu_resources_guide).
+For TPU sizing, see [TPU topology reference](../base/tpu-topology-reference.md). For provisioning and quota notes, see [TPU resources guide](../developer_guide/tpu_resources_guide.md).
 
 The full canonical template lives in the main Sphinx docs at `docs/deployment/skypilot.md`.
