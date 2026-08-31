@@ -97,6 +97,8 @@ def _scores_kernel(
     bkv_p: int,
     bq_sz: int,
     seq_batch_size: int,
+    page_pool_size: int | None = None,
+    num_bkv_max: int | None = None,
 ):
     _, num_q_heads, head_dim = q_hbm_ref.shape
     lkv_dim = cache_kv_hbm_ref.shape[-1]
@@ -160,6 +162,21 @@ def _scores_kernel(
             wait=False,
         )
 
+    def start_send_page_scores(bo_sem_idx, sz, token_start):
+        # Page mode: one DMA per bq block covering ALL page columns (the
+        # accumulator already holds the max over every bkv block).
+        bo_sz_ref[bo_sem_idx] = sz
+        num_page_sublanes = scores_hbm_ref.shape[1]
+        _async_copy(
+            scores_block_x2_ref.at[bo_sem_idx, pl.ds(0, seq_batch_size * sz)],
+            scores_hbm_ref.at[
+                pl.ds(token_start, seq_batch_size * sz),
+                pl.ds(0, num_page_sublanes),
+            ],
+            sems.at[2, bo_sem_idx, 0],
+            wait=False,
+        )
+
     def _async_copy(src, dst, sem, wait):
         cp = pltpu.make_async_copy(src, dst, sem)
         if wait:
@@ -183,20 +200,42 @@ def _scores_kernel(
             page_indices_offset = (seq_idx + batch_idx) * pages_per_seq + kv_p_start
 
             if not wait:
-                for i in range(bkv_p):
-                    sz_per_kv_packing = page_size_per_kv_packing
+
+                def _start_fetch_page(
+                    i,
+                    carry,
+                    page_indices_offset=page_indices_offset,
+                    bkv_vmem_ref=bkv_vmem_ref,
+                    sem=sem,
+                ):
                     page_idx = jnp.minimum(page_indices_offset + i, num_page_indices - 1)
                     safe_page_offset = jnp.minimum(
                         page_indices_ref[page_idx] * page_size_per_kv_packing,
                         jnp.maximum(0, max_hbm_pages - page_size_per_kv_packing),
                     )
-
                     _async_copy(
-                        reshaped_cache_hbm_ref.at[pl.ds(safe_page_offset, sz_per_kv_packing)],
-                        bkv_vmem_ref.at[pl.ds(i * page_size_per_kv_packing, sz_per_kv_packing)],
+                        reshaped_cache_hbm_ref.at[
+                            pl.ds(safe_page_offset, page_size_per_kv_packing)
+                        ],
+                        bkv_vmem_ref.at[
+                            pl.ds(i * page_size_per_kv_packing, page_size_per_kv_packing)
+                        ],
                         sem,
                         wait=False,
                     )
+                    return carry
+
+                if bkv_p > 64:
+                    # Large page blocks (page mode, bkv_p=128): a python-unrolled
+                    # per-page DMA loop bloats the Mosaic program and costs ~40s
+                    # of compile per kernel instance (measured v7x, T=8192); a
+                    # fori_loop compiles in <1s with identical steady-state
+                    # performance (DMA issue rate is not the bottleneck).
+                    lax.fori_loop(0, bkv_p, _start_fetch_page, None, unroll=False)
+                else:
+                    # Keep the merged decode path (bkv_p<=64) byte-identical.
+                    for i in range(bkv_p):
+                        _start_fetch_page(i, None)
             else:
                 dma_bkv_sz = bkv_p * page_size_per_kv_packing
                 dst_kv = bkv_vmem_ref.at[pl.ds(0, dma_bkv_sz)]
@@ -355,7 +394,14 @@ def _scores_kernel(
                 causal_mask = k_span <= bq_pos_compressed[:, None]
                 mask = jnp.logical_and(valid_mask, causal_mask)
                 s_summed = jnp.where(mask, s_summed, -jnp.inf)
-                ret.append(s_summed.reshape(-1, num_sublanes_bkv, 128))
+                if page_pool_size is not None:
+                    # Page mode: max-pool token scores within each page. Columns
+                    # are linear (compressed) kv positions, and bkv_sz is a whole
+                    # number of pages, so pooling groups are exact pages.
+                    cols_per_page = page_pool_size // compression_ratio
+                    ret.append(s_summed.reshape(-1, bkv_p, cols_per_page).max(axis=-1))
+                else:
+                    ret.append(s_summed.reshape(-1, num_sublanes_bkv, 128))
             return jnp.concatenate(ret, axis=0)
 
         def compute_with_bq(bq_idx, _):
@@ -427,7 +473,88 @@ def _scores_kernel(
 
             lax.fori_loop(0, num_bkv, compute_with_bkv, None, unroll=False)
 
-        lax.fori_loop(0, num_bq, compute_with_bq, None, unroll=False)
+        def compute_with_bq_paged(bq_idx, _):
+            # Page-mode twin of compute_with_bq: pooled page scores accumulate in
+            # a fori carry ([rows, num_bkv_max, bkv_p], untouched blocks stay
+            # -inf) and are written back with ONE DMA per bq block — no
+            # [T, max_kv] token-score materialization ever reaches HBM.
+            bq_sem_idx = sem_ids_ref[0]
+            next_seq_idx, next_bq_idx, next_bq_sem_idx = get_next_bq_ids(
+                batch_start_seq_idx, bq_idx, bq_sem_idx
+            )
+
+            @pl.when(next_seq_idx < end_seq_idx)
+            def prefetch_next_bq():
+                sem_ids_ref[0] = next_bq_sem_idx
+                start_fetch_bq(next_seq_idx, next_bq_idx, next_bq_sem_idx)
+
+            bq_pos_compressed_vec = []
+            for batch_idx in range(seq_batch_size):
+                q_pos = (
+                    seq_lens[batch_idx]
+                    - q_lens[batch_idx]
+                    + bq_idx * bq_sz
+                    + jnp.arange(bq_sz, dtype=jnp.int32)
+                )
+                bq_pos_compressed_vec.append(q_pos // compression_ratio)
+
+            wait_fetch_bq(batch_start_seq_idx, bq_idx, bq_sem_idx)
+            bq_vec = load_bq(bq_sem_idx)
+            bq_weights_vec = load_bq_weights(bq_sem_idx)
+
+            token_start = cu_q_lens_ref[batch_start_seq_idx] + bq_idx * bq_sz
+            curr_q_end = cu_q_lens_ref[batch_start_seq_idx + 1]
+            sz = jnp.maximum(0, jnp.minimum(bq_sz, curr_q_end - token_start))
+
+            assert bkv_p == 128, "page mode requires bkv_p == 128 (one lane row per block)"
+
+            # Acquire the output buffer up-front: wait_send_scores waits on the
+            # DMA issued for this buffer TWO bq iterations ago (buffers
+            # alternate), so the -inf fill below can never race an in-flight
+            # read. Each bkv block then stores its pooled lane-row [rows, 128]
+            # at sublane index bkv_idx; untouched trailing blocks (dynamic
+            # num_bkv < num_bkv_max, which only sizes the output layout) stay
+            # -inf and are masked to -1 after top_k.
+            bo_sem_idx = sem_ids_ref[2]
+            wait_send_scores(bo_sem_idx)
+            scores_block_x2_ref[bo_sem_idx, ...] = jnp.full(
+                scores_block_x2_ref.shape[1:], -jnp.inf, dtype=jnp.float32
+            )
+
+            def compute_with_bkv_paged(bkv_idx, _):
+                bkv_sem_idx = sem_ids_ref[1]
+                next_seq_idx, _u, next_bkv_idx, next_bkv_sem_idx = get_next_bkv_ids(
+                    batch_start_seq_idx, bq_idx, bkv_idx, bkv_sem_idx
+                )
+
+                @pl.when(next_seq_idx < end_seq_idx)
+                def prefetch_next_bkv():
+                    sem_ids_ref[1] = next_bkv_sem_idx
+                    start_fetch_bkv(next_seq_idx, next_bkv_idx, next_bkv_sem_idx)
+
+                wait_fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx)
+                bkv_vec, scale_val_vec = load_bkv(bkv_sem_idx)
+
+                page_scores = compute_scores(
+                    bq_vec,
+                    bkv_vec,
+                    scale_val_vec,
+                    bq_weights_vec,
+                    bq_pos_compressed_vec,
+                    bkv_idx,
+                )  # [rows, 128] — one pooled lane row per block
+                scores_block_x2_ref[bo_sem_idx, :, bkv_idx, :] = page_scores
+                return None
+
+            lax.fori_loop(0, num_bkv, compute_with_bkv_paged, None, unroll=False)
+
+            start_send_page_scores(bo_sem_idx, sz, token_start)
+            sem_ids_ref[2] = lax.select(bo_sem_idx == 0, 1, 0)
+
+        if page_pool_size is None:
+            lax.fori_loop(0, num_bq, compute_with_bq, None, unroll=False)
+        else:
+            lax.fori_loop(0, num_bq, compute_with_bq_paged, None, unroll=False)
 
     ### ------- Kernel start ------- ###
 
@@ -793,3 +920,130 @@ def streamindex_topk(
     top_vals, top_idxs = jax.lax.approx_max_k(scores, k, reduction_dimension=-1, recall_target=1.0)
     topk_idxs = jnp.where(top_vals == -jnp.inf, -1, top_idxs)
     return topk_idxs[: q.shape[0], :k]
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "k_pages",
+        "compression_ratio",
+        "num_kv_pages_per_block",
+        "num_queries_per_block",
+        "vmem_limit_bytes",
+    ),
+)
+def streamindex_page_topk(
+    q: jax.Array,  # [max_num_tokens, num_q_heads, head_dim]
+    indexer_weights: jax.Array,  # [max_num_tokens, num_q_heads]
+    cache_kv: jax.Array,  # [total_pages, page_size_per_kv_packing, kv_packing, lkv]
+    seq_lens: jax.Array,  # i32[max_num_seqs]
+    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    num_seqs: jax.Array,  # i32[] number of valid sequences
+    *,
+    k_pages: int,
+    compression_ratio: int = 1,
+    num_kv_pages_per_block: int = 128,
+    num_queries_per_block: int = 512,
+    vmem_limit_bytes: int | None = 64 * 1024 * 1024,
+) -> jax.Array:
+    """Page-level lightning-indexer top-k (prefill/extend form).
+
+    Pallas twin of ``ref.streamindex_page_topk_ref(one_token_per_seq=False)``:
+    scores are max-pooled to page granularity inside the kernel (only
+    ``[T, pages_per_seq]`` ever reaches HBM — no ``[T, max_kv]`` token-score
+    materialization), then a cheap ``top_k`` over pages selects the budget.
+
+    Returns:
+      i32[T, k_pages] seq-local page ids per query token; -1 for padding.
+    """
+    max_num_seqs = seq_lens.shape[0]
+    original_dtype = q.dtype
+    prepared_indexer_weights = prepare_index_weights(indexer_weights, original_dtype)
+    q = prepare_q_inputs(q)
+    _, num_q_heads, head_dim = q.shape
+    lkv_dim = cache_kv.shape[-1]
+    _, page_size_per_kv_packing, kv_packing, _ = cache_kv.shape
+    page_size = page_size_per_kv_packing * kv_packing
+    pages_per_seq = page_indices.shape[0] // max_num_seqs
+    if compression_ratio != 1:
+        raise NotImplementedError(
+            "page mode is validated for compression_ratio=1 only (GLM); the"
+            " compressed causal bound interacts with page pooling and needs its"
+            " own parity gate before enabling."
+        )
+
+    bkv_p = num_kv_pages_per_block
+    if bkv_p != 128:
+        raise ValueError("page mode requires num_kv_pages_per_block == 128")
+    bq_sz = num_queries_per_block
+    num_bkv_max = cdiv(pages_per_seq, bkv_p)
+    num_page_cols = align_to(num_bkv_max * bkv_p, 128)
+    num_page_sublanes = num_page_cols // 128
+    bkv_sz = page_size * bkv_p // compression_ratio
+    if bkv_sz % 128 != 0:
+        raise ValueError(f"bkv block token span ({bkv_sz}) must be a multiple of 128.")
+
+    T = q.shape[0]
+    scores_init = jnp.full((T, num_page_sublanes, 128), -jnp.inf, dtype=jnp.float32)
+
+    in_specs = [
+        pl.BlockSpec(memory_space=pltpu.HBM),
+        pl.BlockSpec(memory_space=pltpu.HBM),
+        pl.BlockSpec(memory_space=pltpu.HBM),
+        pl.BlockSpec(memory_space=pltpu.HBM),
+    ]
+    out_specs = pl.BlockSpec(memory_space=pltpu.HBM)
+
+    scratch_shapes = [
+        pltpu.VMEM((2, 1, bkv_p * page_size_per_kv_packing, kv_packing, lkv_dim), cache_kv.dtype),
+        pltpu.VMEM((2, 1, bq_sz, num_q_heads, head_dim), q.dtype),
+        pltpu.VMEM((2, 1, bq_sz, num_q_heads), prepared_indexer_weights.dtype),
+        pltpu.VMEM((2, bq_sz, num_page_sublanes, 128), jnp.float32),
+        pltpu.SemaphoreType.DMA((4, 2, 1)),
+    ]
+
+    scalar_prefetches = (
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        jnp.stack([jnp.int32(0), num_seqs.astype(jnp.int32)]),
+        jnp.zeros((3,), jnp.int32),
+        jnp.full((2,), -1, jnp.int32),
+    )
+
+    scope_name = f"StreamIdxPageTC-bq_{bq_sz}-bkvp_{bkv_p}"
+    kernel = jax.named_scope(scope_name)(
+        pl.pallas_call(
+            functools.partial(
+                _scores_kernel,
+                compression_ratio=compression_ratio,
+                static_q_len=None,
+                bq_sz=bq_sz,
+                bkv_p=bkv_p,
+                seq_batch_size=1,
+                page_pool_size=page_size,
+                num_bkv_max=num_bkv_max,
+            ),
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=len(scalar_prefetches),
+                in_specs=in_specs,
+                out_specs=out_specs,
+                grid=(num_seqs.astype(jnp.int32),),
+                scratch_shapes=scratch_shapes,
+            ),
+            compiler_params=pltpu.CompilerParams(
+                dimension_semantics=("arbitrary",),
+                vmem_limit_bytes=vmem_limit_bytes,
+                disable_bounds_checks=True,
+            ),
+            out_shape=jax.ShapeDtypeStruct(shape=(T, num_page_sublanes, 128), dtype=jnp.float32),
+            input_output_aliases={len(scalar_prefetches) + 3: 0},
+            name=scope_name,
+        )
+    )
+    page_scores = kernel(*scalar_prefetches, q, prepared_indexer_weights, cache_kv, scores_init)
+
+    page_scores = page_scores.reshape(T, num_page_cols)[:, :pages_per_seq]
+    top_vals, top_idxs = jax.lax.top_k(page_scores, k_pages)
+    return jnp.where(top_vals > -jnp.inf, top_idxs, -1)
