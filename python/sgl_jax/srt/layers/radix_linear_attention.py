@@ -31,6 +31,7 @@ class RadixLinearAttention(nnx.Module):
         A_log: nnx.Param | None = None,
         dt_bias: nnx.Param | None = None,
         scale: float | None = None,
+        kda_lower_bound: float | None = None,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -56,6 +57,7 @@ class RadixLinearAttention(nnx.Module):
         self.A_log = A_log
         self.dt_bias = dt_bias
         self.scale = scale if scale is not None else head_v_dim**-0.5
+        self.kda_lower_bound = kda_lower_bound
         assert not (
             self.conv1d is not None
             and (

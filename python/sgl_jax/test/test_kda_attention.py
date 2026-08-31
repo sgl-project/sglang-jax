@@ -21,6 +21,20 @@ mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
 jax.sharding.set_mesh(mesh)
 
 
+def test_kda_lower_bound_is_used_by_decode_gate():
+    layer = SimpleNamespace(
+        A_log=nnx.Param(jnp.zeros((1, 1, 2, 1), dtype=jnp.float32)),
+        dt_bias=nnx.Param(jnp.array([0.0, 1.0, -1.0, 0.5], dtype=jnp.float32)),
+        kda_lower_bound=-5.0,
+    )
+    gate = jnp.zeros((1, 2, 2), dtype=jnp.float32)
+
+    actual = KDAAttnBackend()._fused_kda_gate(layer, gate)
+    expected = -5.0 * jax.nn.sigmoid(layer.dt_bias.value.reshape(2, 2))
+
+    np.testing.assert_allclose(actual, expected[None, ...])
+
+
 def _scaled_randn(rng: np.random.Generator, shape, scale: float = 0.1) -> np.ndarray:
     # scale=0.1 is a test-only hack: it shrinks the recurrent state so bf16 noise
     # in the delta-rule update fits the global atol=1e-2 (shared with flashattn).

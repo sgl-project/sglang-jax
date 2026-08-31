@@ -61,9 +61,9 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         v_conv_w = layer.v_conv1d.weight.value
         # _unpack_conv_states splits proj_size in 3 equal pieces; only valid
         # when proj_q == proj_k == proj_v (Kimi-Linear shape).
-        assert (
-            q_conv_w.shape[0] == k_conv_w.shape[0] == v_conv_w.shape[0]
-        ), f"unequal Q/K/V proj widths: {q_conv_w.shape[0]}/{k_conv_w.shape[0]}/{v_conv_w.shape[0]}"
+        assert q_conv_w.shape[0] == k_conv_w.shape[0] == v_conv_w.shape[0], (
+            f"unequal Q/K/V proj widths: {q_conv_w.shape[0]}/{k_conv_w.shape[0]}/{v_conv_w.shape[0]}"
+        )
         q_state, k_state, v_state = self._unpack_conv_states(conv_states)
 
         cu_q_lens = self.forward_metadata.cu_q_lens
@@ -360,6 +360,8 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         dt_bias = layer.dt_bias.value.reshape(H, -1)
         scale = scale if scale is not None else layer.scale
         lower_bound = getattr(layer, "kda_gate_lower_bound", None)
+        if lower_bound is None:
+            lower_bound = getattr(layer, "kda_lower_bound", None)
         kernel = os.environ.get("SGLANG_JAX_KDA_PREFILL_KERNEL", "mega").strip().lower()
         if kernel not in {"chunked", "mega"}:
             raise ValueError(
@@ -511,6 +513,8 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         g32 = g.astype(jnp.float32) + layer.dt_bias.value.reshape(H, -1).astype(jnp.float32)
         a_scale = jnp.exp(layer.A_log.value.reshape(H, 1).astype(jnp.float32))
         lower_bound = getattr(layer, "kda_gate_lower_bound", None)
+        if lower_bound is None:
+            lower_bound = getattr(layer, "kda_lower_bound", None)
         if lower_bound is None:
             out = -a_scale * jax.nn.softplus(g32)
         else:

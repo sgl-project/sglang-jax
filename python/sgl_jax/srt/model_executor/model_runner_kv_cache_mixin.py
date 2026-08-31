@@ -151,8 +151,7 @@ def _enforce_recurrent_state_server_constraints(server_args, is_lightning: bool 
     )
     if not server_args.enable_recurrent_extra_buffer:
         assert server_args.page_size == 1, (
-            "Recurrent radix caching requires --page-size 1 unless "
-            "--enable-recurrent-extra-buffer."
+            "Recurrent radix caching requires --page-size 1 unless --enable-recurrent-extra-buffer."
         )
 
 
@@ -235,14 +234,14 @@ def _build_hybrid_pools(
     defaults to `max_num_reqs` (1:1 mapping, used when radix cache is
     disabled and no explicit state size is supplied).
     """
-    assert (
-        max_num_reqs % dp_size == 0
-    ), f"max_num_reqs ({max_num_reqs}) must be divisible by dp_size ({dp_size})."
+    assert max_num_reqs % dp_size == 0, (
+        f"max_num_reqs ({max_num_reqs}) must be divisible by dp_size ({dp_size})."
+    )
     if state_size is None:
         state_size = max_num_reqs
-    assert (
-        state_size % dp_size == 0
-    ), f"recurrent state_size ({state_size}) must be divisible by dp_size ({dp_size})."
+    assert state_size % dp_size == 0, (
+        f"recurrent state_size ({state_size}) must be divisible by dp_size ({dp_size})."
+    )
 
     state_params = _linear_state_params_from_config(cfg)
     rsp = RecurrentStatePool(
@@ -293,7 +292,6 @@ def _build_non_hybrid_memory_pools(token_to_kv_pool) -> MemoryPools:
 
 
 class ModelRunnerKVCacheMixin:
-
     def _dsa_indexer_cache_params(self: ModelRunner) -> tuple[int, int]:
         """``(indexer_key_dim, num_indexer_layers)``, or ``(0, 0)`` when no DSA
         indexer key cache is allocated.
@@ -632,9 +630,9 @@ class ModelRunnerKVCacheMixin:
             # `_validate_kv_pool_compatibility` owns the user-facing check at
             # dispatch. Keep this assertion as a defensive invariant in case a
             # future caller constructs a hybrid pool through this lower seam.
-            assert not kvcache_kwargs.get(
-                "num_indexer_layers"
-            ), "hybrid-recurrent models do not support --attention-backend dsa_sparse"
+            assert not kvcache_kwargs.get("num_indexer_layers"), (
+                "hybrid-recurrent models do not support --attention-backend dsa_sparse"
+            )
 
             return HybridLinearKVPool(
                 size=self.max_total_num_tokens,
@@ -813,7 +811,11 @@ class ModelRunnerKVCacheMixin:
         # 2. Enforce constraints for hybrid recurrent
         if self.linear_recurrent_config is not None:
             _enforce_recurrent_state_server_constraints(
-                self.server_args, is_lightning=self.lightning_config is not None
+                self.server_args,
+                is_lightning=(
+                    self.lightning_config is not None
+                    and not getattr(self.linear_recurrent_config, "use_kda", False)
+                ),
             )
 
         # 3. Profile max tokens

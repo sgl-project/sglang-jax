@@ -144,6 +144,10 @@ class Glm4MoeDetector(BaseFormatDetector):
     Uses a streaming state machine to convert XML to JSON incrementally for maximum speed.
     """
 
+    _STREAMING_PARTIAL_PATTERN = re.compile(
+        r"<tool_call>(.*?)(?:\\n|\n)(.*?)(</tool_call>|$)", re.DOTALL
+    )
+
     def __init__(self):
         super().__init__()
         self.bot_token = "<tool_call>"
@@ -440,11 +444,7 @@ class Glm4MoeDetector(BaseFormatDetector):
         calls: list[ToolCallItem] = []
         try:
             # Try to match a partial or complete tool call
-            partial_match = re.search(
-                pattern=r"<tool_call>(.*?)(?:\\n|\n)(.*?)(</tool_call>|$)",
-                string=current_text,
-                flags=re.DOTALL,
-            )
+            partial_match = self._STREAMING_PARTIAL_PATTERN.search(current_text)
             if partial_match:
                 func_name_raw = partial_match.group(1)
                 func_args_raw = partial_match.group(2)
@@ -546,9 +546,9 @@ class Glm4MoeDetector(BaseFormatDetector):
                             pairs = self.func_arg_regex.findall(func_args_raw)
                             if pairs:
                                 arguments = self._parse_argument_pairs(pairs, func_name, tools)
-                                self.prev_tool_call_arr[self.current_tool_id][
-                                    "arguments"
-                                ] = arguments
+                                self.prev_tool_call_arr[self.current_tool_id]["arguments"] = (
+                                    arguments
+                                )
                         except Exception as e:
                             logger.debug("Failed to parse arguments: %s", e, exc_info=True)
 

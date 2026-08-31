@@ -299,6 +299,26 @@ class Gemma4Detector(BaseReasoningFormatDetector):
         return StreamingParseResult()
 
 
+class Ling3Detector(Glm45Detector):
+    """Detector for Ling 3 models.
+
+    Ling 3 starts generation inside a ``<think>`` block by default, uses
+    ``<tool_call>`` as an implicit reasoning terminator, and preserves an
+    unterminated reasoning-only response as normal content.  The latter
+    matches the upstream Ling 3 parser and prevents a length-truncated answer
+    from becoming an empty assistant message.
+    """
+
+    def __init__(self, stream_reasoning: bool = True):
+        super().__init__(stream_reasoning=stream_reasoning, force_reasoning=True)
+
+    def detect_and_parse(self, text: str) -> StreamingParseResult:
+        result = super().detect_and_parse(text)
+        if result.reasoning_text and not result.normal_text and "<tool_call>" not in text:
+            return StreamingParseResult(normal_text=result.reasoning_text)
+        return result
+
+
 class ReasoningParser:
     """
     Parser that handles both streaming and non-streaming scenarios for extracting
@@ -317,6 +337,7 @@ class ReasoningParser:
         "kimi": KimiDetector,
         "glm45": Glm45Detector,
         "gemma4": Gemma4Detector,
+        "ling3": Ling3Detector,
     }
 
     def __init__(self, model_type: str | None = None, stream_reasoning: bool = True):

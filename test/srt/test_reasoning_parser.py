@@ -11,7 +11,9 @@ class TestReasoningParserQwen3(CustomTestCase):
         Detector must still split on `</think>`.
         """
         parser = ReasoningParser(model_type="qwen3")
-        reasoning, normal = parser.parse_non_stream("step1 step2\n</think>\n\nfinal answer")
+        reasoning, normal = parser.parse_non_stream(
+            "step1 step2\n</think>\n\nfinal answer"
+        )
         self.assertEqual(reasoning, "step1 step2\n")
         self.assertEqual(normal, "final answer")
 
@@ -61,6 +63,29 @@ class TestReasoningParserGlm(CustomTestCase):
         reasoning, normal = parser.parse_non_stream("<think>thinking...<tool_call>func")
         self.assertEqual(reasoning, "thinking...")
         self.assertEqual(normal, "<tool_call>func")
+
+
+class TestReasoningParserLing3(CustomTestCase):
+    def test_ling3_registered_and_defaults_to_reasoning(self):
+        parser = ReasoningParser(model_type="ling3")
+        reasoning, normal = parser.parse_non_stream("reasoning</think>answer")
+        self.assertEqual(reasoning, "reasoning")
+        self.assertEqual(normal, "answer")
+
+    def test_ling3_open_reasoning_is_preserved_as_content(self):
+        parser = ReasoningParser(model_type="ling3")
+        reasoning, normal = parser.parse_non_stream("only reasoning")
+        self.assertEqual(reasoning, "")
+        self.assertEqual(normal, "only reasoning")
+
+    def test_ling3_tool_call_interrupts_reasoning(self):
+        parser = ReasoningParser(model_type="ling3")
+        reasoning, normal = parser.parse_non_stream(
+            "thinking...<tool_call>execute_bash<arg_key>command</arg_key>"
+            "<arg_value>ls</arg_value></tool_call>"
+        )
+        self.assertEqual(reasoning, "thinking...")
+        self.assertTrue(normal.startswith("<tool_call>execute_bash"))
 
 
 if __name__ == "__main__":

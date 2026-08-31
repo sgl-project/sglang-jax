@@ -66,6 +66,7 @@ def test_bailing_hybrid_config_exposes_runner_linear_state_params():
     assert get_bailing_hybrid_config(cfg) is cfg
     assert cfg.linear_attn_config == {
         "kda_layers": [0, 2, 4, 6],
+        "full_attn_layers": [1, 3, 5, 7],
         "num_heads": 2,
         "head_dim": 8,
         "short_conv_kernel_size": 1,

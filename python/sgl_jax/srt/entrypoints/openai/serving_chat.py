@@ -902,6 +902,12 @@ Assistant: {% endif %}"""
             return kwargs.get("enable_thinking") is not False
         if parser == "mimo":
             return kwargs.get("enable_thinking") is True
+        if parser == "ling3":
+            thinking = kwargs.get("thinking")
+            enable_thinking = kwargs.get("enable_thinking")
+            if thinking is None and enable_thinking is None:
+                return True
+            return bool(thinking) or bool(enable_thinking)
         return True
 
     async def _process_tool_call_stream(

@@ -6,7 +6,7 @@ from transformers import PretrainedConfig
 
 
 class BailingHybridConfig(PretrainedConfig):
-    """Minimal Bailing hybrid config for Ling/Ring 2.5 linear-attention models."""
+    """Shared config for Bailing hybrid models, including Ling 2.x and Ling 3."""
 
     model_type = "bailing_hybrid"
     keys_to_ignore_at_inference = ["past_key_values"]
@@ -27,6 +27,9 @@ class BailingHybridConfig(PretrainedConfig):
         max_position_embeddings: int = 32768,
         rope_theta: float = 600000.0,
         rope_scaling: dict[str, Any] | None = None,
+        rope_interleave: bool = True,
+        partial_rotary_factor: float = 0.5,
+        rotary_dim: int = 64,
         pad_token_id: int = 156892,
         eos_token_id: int = 156892,
         num_experts: int = 256,
@@ -34,7 +37,9 @@ class BailingHybridConfig(PretrainedConfig):
         num_experts_per_tok: int = 8,
         n_group: int = 8,
         topk_group: int = 4,
+        topk_method: str = "noaux_tc",
         moe_intermediate_size: int = 512,
+        moe_shared_expert_intermediate_size: int | None = None,
         first_k_dense_replace: int = 1,
         head_dim: int | None = 128,
         use_qk_norm: bool = True,
@@ -42,6 +47,7 @@ class BailingHybridConfig(PretrainedConfig):
         norm_topk_prob: bool = False,
         routed_scaling_factor: float = 1.0,
         score_function: str = "sigmoid",
+        scoring_func: str | None = None,
         router_dtype: str | None = None,
         layer_group_size: int = 1,
         layers_block_type: list[str] | None = None,
@@ -55,9 +61,19 @@ class BailingHybridConfig(PretrainedConfig):
         qk_rope_head_dim: int = 64,
         qk_nope_head_dim: int = 128,
         v_head_dim: int = 128,
-        rope_interleave: bool = True,
+        use_mla_nope: bool = False,
+        gated_attention_proj_granularity_type: str | None = None,
+        short_conv_kernel_size: int | None = None,
+        no_kda_lora: bool = False,
+        kda_safe_gate: bool = False,
+        kda_lower_bound: float | None = None,
+        expert_swiglu_limit_list: list[float] | None = None,
+        share_expert_swiglu_limit_list: list[float] | None = None,
         num_nextn_predict_layers: int = 0,
         mtp_loss_scaling_factor: float = 0.0,
+        mtp_use_kda: bool = False,
+        initializer_range: float = 0.02,
+        use_cache: bool = True,
         quantization_config: dict | None = None,
         **kwargs,
     ):
@@ -74,20 +90,34 @@ class BailingHybridConfig(PretrainedConfig):
         self.max_position_embeddings = max_position_embeddings
         self.rope_theta = rope_theta
         self.rope_scaling = rope_scaling
+        self.rope_interleave = rope_interleave
+        self.partial_rotary_factor = partial_rotary_factor
+        self.rotary_dim = rotary_dim
         self.head_dim = head_dim or hidden_size // num_attention_heads
         self.use_qk_norm = use_qk_norm
 
-        self.num_experts = num_experts
+        self.n_routed_experts = self.num_experts = num_experts
         self.num_shared_experts = num_shared_experts
         self.num_experts_per_tok = num_experts_per_tok
+        self.num_experts_per_token = num_experts_per_tok
         self.n_group = n_group
+        self.num_expert_group = n_group
         self.topk_group = topk_group
+        self.topk_method = topk_method
         self.moe_intermediate_size = moe_intermediate_size
+        self.moe_shared_expert_intermediate_size = (
+            moe_shared_expert_intermediate_size
+            if moe_shared_expert_intermediate_size is not None
+            else moe_intermediate_size
+        )
         self.first_k_dense_replace = first_k_dense_replace
         self.moe_router_enable_expert_bias = moe_router_enable_expert_bias
         self.norm_topk_prob = norm_topk_prob
+        self.moe_renormalize = norm_topk_prob
         self.routed_scaling_factor = routed_scaling_factor
         self.score_function = score_function
+        self.scoring_func = scoring_func or score_function
+        self.moe_router_activation_func = score_function
         self.router_dtype = router_dtype
 
         self.layer_group_size = layer_group_size
@@ -105,13 +135,28 @@ class BailingHybridConfig(PretrainedConfig):
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
         self.v_head_dim = v_head_dim
-        self.rope_interleave = rope_interleave
+        self.mla_use_nope = use_mla_nope
+        self.gated_attention_proj_granularity_type = gated_attention_proj_granularity_type
+
+        # Ling 3 uses KDA when a short-convolution kernel is declared. Ling 2.x
+        # checkpoints omit this field and continue to use the Lightning backend.
+        self.short_conv_kernel_size = short_conv_kernel_size
+        self.use_kda = short_conv_kernel_size is not None
+        self.no_kda_lora = no_kda_lora
+        self.kda_safe_gate = kda_safe_gate
+        self.kda_lower_bound = kda_lower_bound if kda_safe_gate else None
+
+        self.expert_swiglu_limit_list = expert_swiglu_limit_list
+        self.share_expert_swiglu_limit_list = share_expert_swiglu_limit_list
 
         # NextN/MTP fields — base inference does not use them, but transformers'
         # `from_dict` will fail if the keys are present in the HF config and not
         # accepted by __init__. The model only constructs layers 0..num_hidden_layers-1.
         self.num_nextn_predict_layers = num_nextn_predict_layers
         self.mtp_loss_scaling_factor = mtp_loss_scaling_factor
+        self.mtp_use_kda = mtp_use_kda
+        self.initializer_range = initializer_range
+        self.use_cache = use_cache
         # NOTE: only set quantization_config when non-None. transformers'
         # `to_diff_dict` constructs a default `__class__()` to compute the diff;
         # in that default instance `to_dict` calls `self.quantization_config.to_dict()`
@@ -169,7 +214,7 @@ class BailingHybridConfig(PretrainedConfig):
             layers=self.linear_layer_ids,
             num_heads=self.num_linear_key_value_heads,
             head_dim=self.head_dim,
-            conv_kernel_size=1,
+            conv_kernel_size=self.short_conv_kernel_size or 1,
             dtype=recurrent_state_dtype(),
         )
 
@@ -177,10 +222,39 @@ class BailingHybridConfig(PretrainedConfig):
     def linear_attn_config(self) -> dict[str, Any]:
         return {
             "kda_layers": self.linear_layer_ids,
+            "full_attn_layers": self.full_attention_layer_ids,
             "num_heads": self.num_attention_heads,
             "head_dim": self.head_dim,
-            "short_conv_kernel_size": 1,
+            "short_conv_kernel_size": self.short_conv_kernel_size or 1,
         }
+
+    @property
+    def is_mla(self) -> bool:
+        return self.full_attention_type == "mla"
+
+    @property
+    def is_moe(self) -> bool:
+        return self.num_experts is not None and self.num_experts > 0
+
+    @property
+    def is_linear_attn(self) -> bool:
+        return bool(self.linear_layer_ids)
+
+    def is_kda_layer(self, layer_idx: int) -> bool:
+        return self.use_kda and layer_idx in self.linear_layer_ids
+
+    @staticmethod
+    def _swiglu_limit(limit_list: list[float] | None, layer_idx: int) -> float | None:
+        if limit_list is None or layer_idx < 0 or layer_idx >= len(limit_list):
+            return None
+        value = limit_list[layer_idx]
+        return value if value else None
+
+    def expert_swiglu_limit(self, layer_idx: int) -> float | None:
+        return self._swiglu_limit(self.expert_swiglu_limit_list, layer_idx)
+
+    def shared_expert_swiglu_limit(self, layer_idx: int) -> float | None:
+        return self._swiglu_limit(self.share_expert_swiglu_limit_list, layer_idx)
 
 
 def get_bailing_hybrid_config(hf_config: Any) -> BailingHybridConfig | None:
