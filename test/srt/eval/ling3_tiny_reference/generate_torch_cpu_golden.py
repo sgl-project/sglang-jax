@@ -52,6 +52,9 @@ def _make_reduced_config(model_path: str, revision: str):
     config = AutoConfig.from_pretrained(model_path, revision=revision, trust_remote_code=True)
     overrides = {
         "vocab_size": 64,
+        "pad_token_id": 0,
+        "bos_token_id": 1,
+        "eos_token_id": 2,
         "hidden_size": 32,
         "intermediate_size": 64,
         "num_hidden_layers": 4,
@@ -95,6 +98,17 @@ def run_cpu_op_self_test(model_path: str, revision: str) -> None:
             raise AssertionError(f"Unexpected self-test logits shape: {output.logits.shape}")
         if not torch.isfinite(output.logits.float()).all():
             raise AssertionError("CPU reference op self-test produced non-finite logits")
+        decode = model(
+            input_ids=torch.tensor([[8]], dtype=torch.long),
+            attention_mask=torch.ones((1, input_ids.shape[1] + 1), dtype=torch.long),
+            past_key_values=output.past_key_values,
+            use_cache=True,
+            return_dict=True,
+        )
+        if decode.logits.shape != (1, 1, config.vocab_size):
+            raise AssertionError(f"Unexpected decode logits shape: {decode.logits.shape}")
+        if not torch.isfinite(decode.logits.float()).all():
+            raise AssertionError("CPU reference op decode self-test produced non-finite logits")
     print("CPU reference op self-test passed", flush=True)
 
 
