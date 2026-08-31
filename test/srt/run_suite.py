@@ -362,6 +362,11 @@ suites = {
         TestFile("python/sgl_jax/test/models/test_dflash.py", 0.2, runner="pytest"),
         TestFile("python/sgl_jax/test/models/test_mimo_v2_nextn.py", 0.2, runner="pytest"),
         TestFile(
+            "python/sgl_jax/test/models/test_bailing_moe_v3.py",
+            0.2,
+            runner="pytest",
+        ),
+        TestFile(
             "python/sgl_jax/test/multimodal/test_kimi_k25_weight_mapping.py",
             0.2,
             runner="pytest",
@@ -430,6 +435,7 @@ suites = {
         TestFile("test/srt/function_call/test_qwen25_detector.py", 0.1),
         TestFile("test/srt/function_call/test_mimo_detector.py", 0.1),
         TestFile("test/srt/function_call/test_glm47_detector.py", 0.1),
+        TestFile("test/srt/function_call/test_ling3_detector.py", 0.1),
         TestFile("test/srt/openai_server/basic/test_protocol.py", 0.1),
         TestFile("test/srt/openai_server/basic/test_serving_chat.py", 0.1),
         TestFile("test/srt/openai_server/basic/test_serving_completions.py", 0.1),
