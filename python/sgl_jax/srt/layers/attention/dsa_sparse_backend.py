@@ -76,13 +76,15 @@ _INDEXER_KERNEL_KV_PAGES_PER_BLOCK = 64
 # reduce to the same per-query-token kernel contract and are validated by the
 # A1/A2 parity gates in test/srt/kernels/dsa/test_sparse_mla_prefill_parity.py.
 _PREFILL_SPARSE = int(os.environ.get("DSA_PREFILL_SPARSE", "0"))
-# Opt-in refinement of DSA_PREFILL_SPARSE: run the sparse extend through the
-# query-BLOCK kernel (``sparse_mla_prefill_qblock``) — QB queries share one
+# Within DSA_PREFILL_SPARSE=1, the sparse extend runs through the query-BLOCK
+# kernel (``sparse_mla_prefill_qblock``) by DEFAULT — QB queries share one
 # program and each block DMAs its selected-page *union* once, instead of one
-# program (and K page DMAs) per query. Wins whenever neighbouring queries'
-# selections overlap (sinks + local windows); parity-gated against the
-# per-query kernel. Default OFF; requires DSA_PREFILL_SPARSE=1.
-_PREFILL_QBLOCK = os.environ.get("DSA_PREFILL_QBLOCK", "0") == "1"
+# program (and K page DMAs) per query. Semantics are parity-gated against the
+# per-query kernel (same masked-softmax math); it wins whenever neighbouring
+# queries' selections overlap (sinks + local windows). The default sparse=0
+# path is completely unaffected. ``DSA_PREFILL_QBLOCK=0`` is an escape hatch
+# back to the per-query kernel (e.g. for pathological no-locality selections).
+_PREFILL_QBLOCK = os.environ.get("DSA_PREFILL_QBLOCK", "1") == "1"
 _PREFILL_QBLOCK_QB = int(os.environ.get("DSA_PREFILL_QBLOCK_QB", "64"))
 
 
