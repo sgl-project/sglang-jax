@@ -36,23 +36,54 @@ def _read_dump_manifest(dump_dir: Path) -> list[dict]:
 def _wait_for_prefill_logits(
     dump_dir: Path,
     minimum_index: int,
+    expected_input_ids: np.ndarray,
     timeout: float = 30.0,
 ) -> np.ndarray:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         records = _read_dump_manifest(dump_dir)
-        matches = [
+        input_records = [
             record
             for record in records
             if record["index"] > minimum_index
             and record["component"] == "ling3_io"
-            and record["name"] == "next_token_logits"
+            and record["name"] == "input_ids"
             and "extend" in (record.get("forward_mode") or "")
         ]
-        if matches:
-            array = np.load(dump_dir / matches[0]["filename"])
+        for input_record in input_records:
+            dumped_ids = np.asarray(
+                np.load(dump_dir / input_record["filename"]), dtype=np.int32
+            ).reshape(-1)
+            last_row = None
+            width = int(expected_input_ids.shape[0])
+            for start in range(dumped_ids.shape[0] - width + 1):
+                if np.array_equal(dumped_ids[start : start + width], expected_input_ids):
+                    last_row = start + width - 1
+                    break
+            if last_row is None:
+                continue
+
+            logits_records = [
+                record
+                for record in records
+                if record["process_id"] == input_record["process_id"]
+                and record["index"] > input_record["index"]
+                and record["component"] == "ling3_io"
+                and record["name"] == "next_token_logits"
+                and "extend" in (record.get("forward_mode") or "")
+            ]
+            if not logits_records:
+                continue
+            array = np.load(dump_dir / logits_records[0]["filename"])
+            if array.dtype.kind == "V":
+                raise TypeError(
+                    "JAX logits dump has an opaque dtype; restart the server with "
+                    "the BF16-to-FP32 debug dump conversion enabled"
+                )
             if array.ndim == 2:
-                array = array[0]
+                array = array[last_row]
+            if array.ndim != 1:
+                raise ValueError(f"Unexpected JAX logits dump shape: {array.shape}")
             return np.asarray(array, dtype=np.float32)
         time.sleep(0.25)
     raise TimeoutError("Timed out waiting for the JAX prefill logits dump")
@@ -178,7 +209,11 @@ def main() -> None:
         response = _post_json(
             f"{args.base_url.rstrip('/')}/generate", payload, args.request_timeout
         )
-        jax_logits = _wait_for_prefill_logits(args.jax_dump_dir, minimum_index)
+        jax_logits = _wait_for_prefill_logits(
+            args.jax_dump_dir,
+            minimum_index,
+            golden["input_ids"],
+        )
         raw_metrics = _raw_logit_metrics(golden["first_token_logits"], jax_logits, top_k)
         step_metrics = _server_step_metrics(golden, response, top_k)
         passed = (

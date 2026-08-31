@@ -39,6 +39,7 @@ python -m sgl_jax.launch_server \
   --model-path /models/Ling-3.0-tiny-b61f4338 \
   --tp-size 1 \
   --device tpu \
+  --page-size 128 \
   --host 127.0.0.1 \
   --port 30000
 ```

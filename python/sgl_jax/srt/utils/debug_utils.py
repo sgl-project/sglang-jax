@@ -81,6 +81,11 @@ def maybe_dump_jax_array(
 
     def _save_to_file(host_array):
         host_array = np.asarray(host_array)
+        source_dtype = str(host_array.dtype)
+        # NumPy serializes ml_dtypes.bfloat16 as an opaque two-byte void dtype,
+        # which cannot be converted back to numbers after np.load. Debug dumps
+        # favor portable numerical artifacts over preserving the storage dtype.
+        saved_array = host_array.astype(np.float32) if source_dtype == "bfloat16" else host_array
         with _DUMP_LOCK:
             index = next(_DUMP_COUNTER)
             parts = [f"p{process_id:05d}", f"{index:06d}", _sanitize_filename_part(component)]
@@ -92,7 +97,7 @@ def maybe_dump_jax_array(
             filename = "_".join(parts) + ".npy"
 
             os.makedirs(dump_dir, exist_ok=True)
-            np.save(os.path.join(dump_dir, filename), host_array)
+            np.save(os.path.join(dump_dir, filename), saved_array)
             record = {
                 "index": index,
                 "process_id": process_id,
@@ -100,8 +105,9 @@ def maybe_dump_jax_array(
                 "name": name,
                 "layer_id": layer_id,
                 "forward_mode": None if mode_name is None else str(mode_name).lower(),
-                "shape": list(host_array.shape),
-                "dtype": str(host_array.dtype),
+                "shape": list(saved_array.shape),
+                "dtype": source_dtype,
+                "saved_dtype": str(saved_array.dtype),
                 "filename": filename,
             }
             manifest = os.path.join(dump_dir, f"manifest-p{process_id:05d}.jsonl")
