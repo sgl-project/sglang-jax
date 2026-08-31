@@ -376,6 +376,7 @@ suites = {
             0.2,
             runner="pytest",
         ),
+        TestFile("python/sgl_jax/test/multimodal/test_encoder_scheduler_kwargs.py", 0.1),
         TestFile("python/sgl_jax/test/models/test_qwen3_5.py", 2, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/kernels/test_gdn_fused_chunk_parallel_provenance.py",
