@@ -32,7 +32,6 @@ def _load_model(model_path: str, revision: str):
         revision=revision,
         trust_remote_code=True,
         low_cpu_mem_usage=True,
-        device_map="cpu",
     )
     try:
         return AutoModelForCausalLM.from_pretrained(
