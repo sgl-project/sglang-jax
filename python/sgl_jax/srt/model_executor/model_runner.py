@@ -39,7 +39,7 @@ from sgl_jax.srt.model_executor.aot_dispatch import (
     aot_dispatch_requested,
 )
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
-from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
     _build_non_hybrid_memory_pools,
@@ -48,6 +48,7 @@ from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.models.registry import ModelRegistry
 from sgl_jax.srt.multimodal.in_model.embedding_pool import EmbeddingPool
 from sgl_jax.srt.multimodal.in_model.host_orchestration import embed_multimodal_inputs
+from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
@@ -927,8 +928,11 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.forward_pass_id += 1
         precision_tracer.start_batch_trace(forward_batch.bid)
         precision_tracer.set_current_forward_pass_id(self.forward_pass_id)
-        if forward_batch.multimodal_batch is not None:
-            input_embedding, deepstack = embed_multimodal_inputs(
+        if isinstance(self.model, InModelMultimodalContract) and forward_batch.forward_mode in (
+            ForwardMode.EXTEND,
+            ForwardMode.MIXED,
+        ):
+            input_embedding, deepstack, apply_for_deepstack = embed_multimodal_inputs(
                 multimodal_batch=forward_batch.multimodal_batch,
                 input_ids=forward_batch.input_ids,
                 multimodal_model=self.model,
@@ -936,7 +940,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             )
             forward_batch.input_embedding = input_embedding
             forward_batch.deepstack_visual_embedding = deepstack
-            forward_batch.apply_for_deepstack = deepstack is not None
+            forward_batch.apply_for_deepstack = apply_for_deepstack
         with jax.profiler.TraceAnnotation("_forward_raw"):
             ret = self._forward_raw(forward_batch, logits_metadata)
         return ret
