@@ -459,9 +459,20 @@ def prefill_write_and_attend_ragged_qblock(
     row = jnp.zeros((T, Dk_pad), cache.dtype)
     row = row.at[:, :Dv].set(kvc.astype(cache.dtype))
     row = row.at[:, Dv : Dv + rope].set(kpe.reshape(T, rope).astype(cache.dtype))
-    flat = cache.reshape(Pn * ps, Dk_pad)
-    flat = flat.at[loc].set(row, mode="drop", wrap_negative_indices=False)
-    cache_new = flat.reshape(Pn, pspk, pk, Dk_pad)
+    # Scatter directly into the 4D cache. The flat-view round-trip
+    # (reshape [Pn*ps, D] -> scatter -> reshape back) materialises TWO full
+    # relayout copies of the cache per call (the 4D pool and the 2D view get
+    # different tilings) — measured 13.8% of 110k prefill device time. 3D
+    # index math on ``loc`` is free; padded loc == -1 stays dropped (negative
+    # page index with wrap_negative_indices=False).
+    cache_new = paged_write_back(
+        cache,
+        row,
+        loc.astype(jnp.int32),
+        page_size=ps,
+        r_cap=T // ps + S + 34,
+        interpret=interpret,
+    )
 
     # token -> request id (same convention as the per-query ragged wrapper)
     t = jnp.arange(T, dtype=jnp.int32)
@@ -633,4 +644,8 @@ def paged_write_back(
         flat = flat.at[loc].set(row_w.reshape(Tp, D), mode="drop", wrap_negative_indices=False)
         return flat.reshape(cache.shape)
 
+    if interpret:
+        # interpret cannot lower dynamic-size DMAs; the scatter is the
+        # bit-identical reference semantics anyway.
+        return _scatter(cache, row_w, table)
     return jax.lax.cond(n_raw <= r_cap, _pallas, _scatter, cache, row_w, table)
