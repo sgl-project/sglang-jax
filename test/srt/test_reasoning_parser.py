@@ -11,9 +11,7 @@ class TestReasoningParserQwen3(CustomTestCase):
         Detector must still split on `</think>`.
         """
         parser = ReasoningParser(model_type="qwen3")
-        reasoning, normal = parser.parse_non_stream(
-            "step1 step2\n</think>\n\nfinal answer"
-        )
+        reasoning, normal = parser.parse_non_stream("step1 step2\n</think>\n\nfinal answer")
         self.assertEqual(reasoning, "step1 step2\n")
         self.assertEqual(normal, "final answer")
 

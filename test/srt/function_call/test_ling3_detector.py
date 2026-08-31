@@ -58,9 +58,7 @@ class TestLing3Detector(CustomTestCase):
             calls.extend(detector.parse_streaming_increment(chunk, tools).calls)
 
         self.assertEqual([call.name for call in calls if call.name], ["execute_bash"])
-        self.assertEqual(
-            json.loads("".join(call.parameters for call in calls)), {"command": "ls"}
-        )
+        self.assertEqual(json.loads("".join(call.parameters for call in calls)), {"command": "ls"})
 
 
 if __name__ == "__main__":
