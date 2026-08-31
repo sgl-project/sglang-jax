@@ -12,10 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from sgl_jax.srt.kernels.kda.kda import chunk_kda_fwd
-from sgl_jax.srt.kernels.kda.mega_kda import (
-    kda_forward_inference,
-    kda_forward_packed,
-)
+from sgl_jax.srt.kernels.kda.mega_kda import kda_forward_inference, kda_forward_packed
 
 CHUNK_SIZE = 64
 KEY_DIM = VALUE_DIM = 128
@@ -103,6 +100,7 @@ def _make_padded_mega(
 
     segments_per_tile = min(max_segments_per_tile, CHUNK_SIZE // segment_length)
     padded_tokens = ((segments + segments_per_tile - 1) // segments_per_tile) * CHUNK_SIZE
+
     @jax.jit
     def padded_mega(q, k, v, g, beta, a_log, dt_bias, initial_state, cu_seqlens):
         source_positions = jnp.arange(tokens, dtype=jnp.int32)
@@ -114,12 +112,12 @@ def _make_padded_mega(
         )
         tile_indices = source_segments // segments_per_tile
         tile_source_starts = cu_seqlens[tile_indices * segments_per_tile]
-        destination_positions = (
-            tile_indices * CHUNK_SIZE + source_positions - tile_source_starts
+        destination_positions = tile_indices * CHUNK_SIZE + source_positions - tile_source_starts
+        segment_ids = (
+            jnp.zeros(padded_tokens, dtype=jnp.int32)
+            .at[destination_positions]
+            .set(source_segments + 1)[None, :]
         )
-        segment_ids = jnp.zeros(padded_tokens, dtype=jnp.int32).at[
-            destination_positions
-        ].set(source_segments + 1)[None, :]
 
         def _repack(value):
             shape = list(value.shape)
@@ -290,9 +288,7 @@ def main() -> None:
                             )
                         )
                     ),
-                    "state_max_abs": float(
-                        jnp.max(jnp.abs(result[1] - chunked_result[1]))
-                    ),
+                    "state_max_abs": float(jnp.max(jnp.abs(result[1] - chunked_result[1]))),
                 },
                 sort_keys=True,
             )
