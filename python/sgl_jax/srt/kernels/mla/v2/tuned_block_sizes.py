@@ -76,6 +76,34 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 256): (8, 256),
         ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 512): (8, 256),
         ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 1024): (8, 256),
+        # ===== GLM-5.2 (kv_lora_rank=512, qk_rope_head_dim=64) =====
+        # Deploy: --tp-size 64 --dp-size 8 --page-size 128
+        # → attention_tp = 8 → per-shard num_q_heads = 64/8 = 8.
+        # Transitional values (#1546): borrowed row-for-row from the DSv3
+        # 16-head family above; validated on a v6e-64 slice with a paired
+        # eval + throughput sweep up to concurrency 460 (zero Mosaic
+        # errors). A tuner sweep should replace these.
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 1): (16, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 8): (16, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 16): (32, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 32): (32, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 64): (32, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 128): (32, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 256): (32, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 512): (32, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 1024): (32, 1, 2),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 1): (16, 64),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 8): (16, 64),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 16): (16, 64),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 32): (16, 64),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 64): (16, 64),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 128): (16, 128),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 256): (8, 256),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 512): (8, 256),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 1024): (8, 256),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 2048): (8, 256),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 4096): (8, 256),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 8192): (8, 256),
     },
     "TPU v7": {
         # ===== Ling-2.6-1T (kv_lora_rank=512, qk_rope_head_dim=64) =====
