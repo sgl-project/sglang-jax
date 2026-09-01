@@ -203,16 +203,16 @@ def test_raiden_request_receives_into_matching_jax_buffer(monkeypatch):
 
     request._start_receive(data)
 
-    session = _FakeRaidenWrapper.instances[0]
-    buffers, options = session.started
-    assert buffers[0].shape == (1, 2, 3)
-    assert buffers[0].dtype == jnp.float32
     receive_session = request.sessions[0][1]
     assert isinstance(receive_session, DeferredRaidenReceiveSession)
     session = receive_session._future.result(timeout=1)
+    transfer = session.transfer
+    buffers, options = transfer.started
+    assert buffers[0].shape == (1, 2, 3)
+    assert buffers[0].dtype == jnp.float32
     assert session.buffer.shape == (1, 2, 3)
     assert options == {"max_blocks": 1, "num_slots": 1, "timeout_s": 30.0}
-    assert session.read == (
+    assert transfer.read == (
         "part-0:embedding",
         17,
         [{"endpoint": "10.0.0.8:7788", "shards": [0]}],
@@ -220,7 +220,7 @@ def test_raiden_request_receives_into_matching_jax_buffer(monkeypatch):
         [0],
     )
 
-    session.stats = ([], ["part-0:embedding"], [])
+    transfer.stats = ([], ["part-0:embedding"], [])
     result = request.poll()
 
     np.testing.assert_array_equal(result["embeddings"][Modality.IMAGE], np.zeros((2, 3)))

@@ -267,6 +267,7 @@ class ModelWorker:
             self.model_config.is_multimodal
             and ModelRegistry.is_in_model_multimodal(self.model_config.hf_config.architectures)
             and not use_multistage_multimodal
+            and not server_args.simulate_compute
         )
         self.compilation_manager = CompilationManager(
             server_args=server_args,
@@ -337,12 +338,13 @@ class ModelWorker:
             prepare_lora,
             future_token_ids_map,
         )
-        if only == "extend":
-            self.compilation_manager._precompile_extend(*args)
-        elif only == "decode":
-            self.compilation_manager._precompile_decode(*args)
-        else:
-            self.compilation_manager.precompile_all(*args)
+        with self.model_runner.simulation_precompile():
+            if only == "extend":
+                self.compilation_manager._precompile_extend(*args)
+            elif only == "decode":
+                self.compilation_manager._precompile_decode(*args)
+            else:
+                self.compilation_manager.precompile_all(*args)
 
     def set_forward_metadata(self, model_worker_batch: ModelWorkerBatch):
         self.model_runner.attn_backend.forward_metadata = (

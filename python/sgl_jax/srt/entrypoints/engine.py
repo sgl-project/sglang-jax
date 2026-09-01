@@ -306,11 +306,30 @@ class Engine(EngineBase):
     def shutdown(self):
         """Shutdown the engine"""
         if self.tokenizer_manager is not None:
-            close = self.tokenizer_manager.aclose()
             if self.loop.is_running():
-                asyncio.run_coroutine_threadsafe(close, self.loop).result()
+                try:
+                    running_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    running_loop = None
+                if running_loop is self.loop:
+                    raise RuntimeError(
+                        "Engine.shutdown() cannot wait on its own running event loop; "
+                        "use `await engine.async_shutdown()` instead"
+                    )
+                asyncio.run_coroutine_threadsafe(
+                    self.tokenizer_manager.aclose(), self.loop
+                ).result()
             else:
-                self.loop.run_until_complete(close)
+                self.loop.run_until_complete(self.tokenizer_manager.aclose())
+        self._shutdown_processes()
+
+    async def async_shutdown(self):
+        """Asynchronously shut down an engine owned by the current event loop."""
+        if self.tokenizer_manager is not None:
+            await self.tokenizer_manager.aclose()
+        self._shutdown_processes()
+
+    def _shutdown_processes(self):
         kill_process_tree(os.getpid(), include_parent=False)
         if self.server_args.enable_single_process and self.send_to_rpc is not None:
             self.send_to_rpc.close()

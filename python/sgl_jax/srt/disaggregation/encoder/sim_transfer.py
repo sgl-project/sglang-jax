@@ -9,6 +9,7 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from sgl_jax.srt.disaggregation.encoder.client import EncoderClient
 from sgl_jax.srt.disaggregation.encoder.embedding_data import EmbeddingData
@@ -37,7 +38,7 @@ class SimEncoderServerTransfer:
     register-and-return behavior.
     """
 
-    def publish(self, transfer_id: str, embedding: jax.Array) -> dict[str, Any]:
+    async def publish(self, transfer_id: str, embedding: jax.Array) -> dict[str, Any]:
         if embedding.ndim != 2 or embedding.shape[0] <= 0:
             raise ValueError("Sim embedding must be a non-empty matrix")
         # No transfer endpoints: the receiver reconstructs zeros from shape/dtype.
@@ -85,7 +86,10 @@ class SimReceiverBackend:
         shape = tuple(int(dim) for dim in data.shape)
         if len(shape) != 2 or shape[0] <= 0:
             raise ValueError("Sim embedding must be a non-empty matrix")
-        buffer = jax.device_put(jnp.zeros(shape, dtype=jnp.dtype(data.dtype)), self._sharding)
+        buffer = jax.device_put(
+            np.zeros(shape, dtype=jnp.dtype(data.dtype)),
+            self._sharding,
+        )
         # One-way network RTT (embedding hop) + size-proportional bandwidth term.
         delay_s = (self._rtt_ms + self._ms_per_mb * _embedding_mib(shape, data.dtype)) / 1000.0
         return SimReceiveSession(buffer=buffer, ready_at=time.monotonic() + delay_s)

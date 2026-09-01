@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
@@ -23,11 +24,26 @@ logger = logging.getLogger(__name__)
 
 
 class PendingRequest:
-    __slots__ = ("future", "request")
+    __slots__ = (
+        "_enqueue_mono_ns",
+        "dequeue_ns",
+        "enqueue_ns",
+        "future",
+        "queue_duration_ns",
+        "request",
+    )
 
     def __init__(self, request: dict[str, Any]) -> None:
         self.request = request
         self.future: asyncio.Future[PublishedEmbedding] = asyncio.get_running_loop().create_future()
+        self.enqueue_ns = time.time_ns()
+        self._enqueue_mono_ns = time.monotonic_ns()
+        self.dequeue_ns = 0
+        self.queue_duration_ns = 0
+
+    def mark_dequeued(self) -> None:
+        self.dequeue_ns = time.time_ns()
+        self.queue_duration_ns = max(0, time.monotonic_ns() - self._enqueue_mono_ns)
 
 
 DispatchBatchFn = Callable[[list[PendingRequest]], Awaitable[None]]
@@ -60,11 +76,16 @@ class EncoderScheduler:
         dispatch_batch: DispatchBatchFn,
         max_batch_size: int = 8,
         request_timeout: float | None = 300.0,
+        log_queue_timing: bool = False,
+        max_inflight_batches: int = 1,
     ) -> None:
         self._dispatch_batch = dispatch_batch
         self._max_batch_size = max(1, int(max_batch_size))
+        self._max_inflight_batches = max(1, int(max_inflight_batches))
         self._request_timeout = request_timeout
+        self._log_queue_timing = log_queue_timing
         self._pending_queue: asyncio.Queue[PendingRequest] = asyncio.Queue()
+        self._inflight_tasks: set[asyncio.Task[None]] = set()
         self._worker_task: asyncio.Task[None] | None = None
 
     def start(self) -> None:
@@ -77,6 +98,12 @@ class EncoderScheduler:
             with suppress(asyncio.CancelledError):
                 await self._worker_task
             self._worker_task = None
+
+        for task in self._inflight_tasks:
+            task.cancel()
+        if self._inflight_tasks:
+            await asyncio.gather(*self._inflight_tasks, return_exceptions=True)
+            self._inflight_tasks.clear()
 
         while True:
             try:
@@ -97,37 +124,70 @@ class EncoderScheduler:
         return await asyncio.wait_for(pending.future, self._request_timeout)
 
     async def _collect_batch(self) -> list[PendingRequest]:
-        batch = [await self._pending_queue.get()]
+        first = await self._pending_queue.get()
+        first.mark_dequeued()
+        batch = [first]
         while len(batch) < self._max_batch_size:
             try:
-                batch.append(self._pending_queue.get_nowait())
+                pending = self._pending_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+            pending.mark_dequeued()
+            batch.append(pending)
+
+        if self._log_queue_timing:
+            queue_depth = self._pending_queue.qsize()
+            for pending in batch:
+                queue_duration_ns = pending.queue_duration_ns
+                logger.info(
+                    "ENCODER-QUEUE-TIME req_id=%s part_idx=%s enqueue_ns=%d "
+                    "dequeue_ns=%d queue_duration_ns=%d queue_ms=%.3f "
+                    "batch_size=%d queue_depth=%d",
+                    pending.request.get("req_id"),
+                    pending.request.get("part_idx", 0),
+                    pending.enqueue_ns,
+                    pending.dequeue_ns,
+                    queue_duration_ns,
+                    queue_duration_ns / 1_000_000,
+                    len(batch),
+                    queue_depth,
+                )
         return batch
 
     async def _batch_worker(self) -> None:
         while True:
+            while len(self._inflight_tasks) >= self._max_inflight_batches:
+                await asyncio.wait(
+                    self._inflight_tasks,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
             batch = await self._collect_batch()
-            try:
-                groups: dict[Modality, list[PendingRequest]] = defaultdict(list)
-                for pending in batch:
-                    modality = Modality.from_str(pending.request.get("modality", "image"))
-                    groups[modality].append(pending)
-                for group in groups.values():
-                    await self._dispatch_batch(group)
-            except asyncio.CancelledError:
-                for pending in batch:
-                    if not pending.future.done():
-                        pending.future.set_exception(RuntimeError("EncoderScheduler stopped"))
-                raise
-            except Exception as exc:
-                logger.exception("Encoder batch failed")
-                for pending in batch:
-                    if not pending.future.done():
-                        pending.future.set_exception(exc)
-            finally:
-                for _ in batch:
-                    self._pending_queue.task_done()
+            task = asyncio.create_task(self._run_batch(batch))
+            self._inflight_tasks.add(task)
+            task.add_done_callback(self._inflight_tasks.discard)
+
+    async def _run_batch(self, batch: list[PendingRequest]) -> None:
+        try:
+            groups: dict[Modality, list[PendingRequest]] = defaultdict(list)
+            for pending in batch:
+                modality = Modality.from_str(pending.request.get("modality", "image"))
+                groups[modality].append(pending)
+            for group in groups.values():
+                await self._dispatch_batch(group)
+        except asyncio.CancelledError:
+            for pending in batch:
+                if not pending.future.done():
+                    pending.future.set_exception(RuntimeError("EncoderScheduler stopped"))
+            raise
+        except Exception as exc:
+            logger.exception("Encoder batch failed")
+            for pending in batch:
+                if not pending.future.done():
+                    pending.future.set_exception(exc)
+        finally:
+            for _ in batch:
+                self._pending_queue.task_done()
 
 
 class EncoderRuntime:
@@ -140,7 +200,9 @@ class EncoderRuntime:
         *,
         receiver_timeout: float | None = 300.0,
         max_batch_size: int = 8,
+        max_inflight_batches: int = 1,
         request_timeout: float | None = 300.0,
+        log_queue_timing: bool = False,
     ) -> None:
         self._batch_encode_fn = batch_encode_fn
         self._transfer = transfer
@@ -151,8 +213,10 @@ class EncoderRuntime:
         self._receiver_events: dict[str, asyncio.Event] = {}
         self.scheduler = EncoderScheduler(
             self._dispatch_batch,
-            max_batch_size,
-            request_timeout,
+            max_batch_size=max_batch_size,
+            max_inflight_batches=max_inflight_batches,
+            request_timeout=request_timeout,
+            log_queue_timing=log_queue_timing,
         )
         self._release_task: asyncio.Task[None] | None = None
 
@@ -215,14 +279,16 @@ class EncoderRuntime:
                     pending.future.set_exception(exc)
             return
 
+        publish_items = [
+            (pending, result)
+            for pending, result in zip(pending_requests, results)
+            if not pending.future.done()
+        ]
         published = await asyncio.gather(
-            *(
-                self._publish_result(pending.request, *result)
-                for pending, result in zip(pending_requests, results)
-            ),
+            *(self._publish_result(pending, *result) for pending, result in publish_items),
             return_exceptions=True,
         )
-        for pending, result in zip(pending_requests, published):
+        for (pending, _), result in zip(publish_items, published):
             if isinstance(result, Exception):
                 if not pending.future.done():
                     pending.future.set_exception(result)
@@ -252,12 +318,14 @@ class EncoderRuntime:
 
     async def _publish_result(
         self,
-        request: dict[str, Any],
+        pending: PendingRequest,
         embedding: jax.Array,
         metadata: dict[str, Any],
     ) -> PublishedEmbedding:
+        request = pending.request
         req_id = request["req_id"]
         modality = Modality.from_str(request["modality"])
+        queue_duration_ns = pending.queue_duration_ns
 
         transfer_id = f"{req_id}:{request.get('part_idx', 0)}:embedding"
         transfer_metadata = await self._transfer.publish(transfer_id, embedding)
@@ -271,6 +339,10 @@ class EncoderRuntime:
             modality=modality,
             embedding_shape=embedding.shape,
             dtype=str(embedding.dtype),
+            enqueue_ns=pending.enqueue_ns,
+            dequeue_ns=pending.dequeue_ns,
+            queue_duration_ns=queue_duration_ns,
+            queue_ms=queue_duration_ns / 1_000_000,
             **transfer_metadata,
             **metadata,
         )

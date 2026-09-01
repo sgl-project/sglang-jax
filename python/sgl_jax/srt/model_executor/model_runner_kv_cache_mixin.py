@@ -631,6 +631,7 @@ class ModelRunnerKVCacheMixin:
         from sgl_jax.srt.mem_cache.memory_pool import (
             MHATokenToKVPool,
             ReqToTokenPool,
+            SimulationTokenToKVPool,
             SWAKVPool,
         )
 
@@ -645,7 +646,20 @@ class ModelRunnerKVCacheMixin:
             )
 
         # --- KV pool ---
-        if self.is_hybrid:
+        if self.server_args.simulate_compute and not self.is_hybrid and not has_recurrent_state:
+            self.token_to_kv_pool = SimulationTokenToKVPool(
+                size=self.max_total_num_tokens,
+                page_size=self.page_size,
+                dtype=self.kv_cache_dtype,
+                head_num=self.model_config.get_total_num_kv_heads_with_replication(
+                    self.attention_tp_size
+                ),
+                head_dim=(self.model_config.head_dim + 127) // 128 * 128,
+                layer_num=self._kv_pool_layer_count(),
+                mesh=self.mesh,
+                dp_size=dp_size,
+            )
+        elif self.is_hybrid:
             swa_num_kv_heads = getattr(self.model_config.hf_config, "swa_num_key_value_heads", None)
             if swa_num_kv_heads is not None:
                 swa_head_num = max(swa_num_kv_heads, self.attention_tp_size)
@@ -778,7 +792,11 @@ class ModelRunnerKVCacheMixin:
             )
 
         # 3. Profile max tokens
-        self.max_total_num_tokens = self.profile_max_num_token(total_device_memory)
+        if self.server_args.simulate_compute and max_total_tokens is not None:
+            self.max_total_num_tokens = max_total_tokens
+            max_total_tokens = None
+        else:
+            self.max_total_num_tokens = self.profile_max_num_token(total_device_memory)
 
         # 4. Resolve max_num_reqs (needed for spec dec headroom)
         max_num_reqs = self._resolve_max_num_reqs(max_num_reqs)

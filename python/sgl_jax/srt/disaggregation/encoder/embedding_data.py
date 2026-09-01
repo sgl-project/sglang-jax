@@ -34,6 +34,10 @@ class EmbeddingData:
         dtype: Any = None,
         error_msg: str | None = None,
         error_code: int | None = None,
+        enqueue_ns: int | None = None,
+        dequeue_ns: int | None = None,
+        queue_duration_ns: int | None = None,
+        queue_ms: float | None = None,
         **kwargs: Any,
     ) -> None:
         self.req_id = req_id
@@ -52,6 +56,13 @@ class EmbeddingData:
         )
         self.error_msg = error_msg
         self.error_code = error_code
+        # Encoder scheduler application-level timing. enqueue_ns/dequeue_ns
+        # use Unix epoch time for cross-process correlation; queue_duration_ns
+        # and queue_ms are calculated from a monotonic clock.
+        self.enqueue_ns = enqueue_ns
+        self.dequeue_ns = dequeue_ns
+        self.queue_duration_ns = queue_duration_ns
+        self.queue_ms = queue_ms
         for key, value in kwargs.items():
             setattr(self, key, value)
 

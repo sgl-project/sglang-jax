@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 from sgl_jax.srt.disaggregation.encoder import client as encoder_client
 from sgl_jax.srt.managers.io_struct import GenerateReqInput
+from sgl_jax.srt.multimodal.common.modality_enum import Modality
 
 
 def test_encoder_receiver_reuses_http_client(monkeypatch):
@@ -37,6 +39,41 @@ def test_encoder_receiver_reuses_http_client(monkeypatch):
     assert len(clients) == 1
     assert clients[0].timeout == 12.0
     assert clients[0].closed
+
+
+def test_encoder_receiver_registers_parts_concurrently():
+    barrier = threading.Barrier(2)
+    posts = []
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            pass
+
+    class FakeClient:
+        def post(self, url, *, json):
+            posts.append((url, json["req_id"]))
+            barrier.wait(timeout=1)
+            return FakeResponse()
+
+    executor = ThreadPoolExecutor(max_workers=2)
+    try:
+        future = encoder_client.submit_scheduler_receiver_registrations(
+            executor,
+            [
+                ("http://encoder-0", "request-0", Modality.IMAGE),
+                ("http://encoder-1", "request-1", Modality.IMAGE),
+            ],
+            "127.0.0.1:1234",
+            FakeClient(),
+        )
+        future.result(timeout=2)
+    finally:
+        executor.shutdown(cancel_futures=True)
+
+    assert sorted(posts) == [
+        ("http://encoder-0/scheduler_receive_url", "request-0"),
+        ("http://encoder-1/scheduler_receive_url", "request-1"),
+    ]
 
 
 def test_encoder_request_dispatcher_reuses_http_client(monkeypatch):

@@ -765,6 +765,19 @@ class MHATokenToKVPool(KVCache):
 
 
 @register_pytree_node_class
+class SimulationTokenToKVPool(MHATokenToKVPool):
+    def _create_buffers(self):
+        self.kv_buffer = []
+        self.kv_sharding = None
+
+    def _calculate_memory_usage(self):
+        self.mem_usage = 0
+
+    def get_kv_size_bytes(self):
+        return 0, 0
+
+
+@register_pytree_node_class
 class SWAKVPool(KVCache):
     """KV cache with separate pools for full and SWA attention layers."""
 

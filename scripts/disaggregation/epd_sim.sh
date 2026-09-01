@@ -10,10 +10,14 @@
 # auto-discovered from the HuggingFace cache. Weights are never loaded.
 #
 # Coefficients (env, all optional; defaults give a readable illustrative graph):
-#   SIM_ENC_BASE_MS SIM_ENC_MS_PER_TOKEN SIM_PREFILL_MS_PER_TOKEN
-#   SIM_DECODE_MS_PER_SEQ SIM_TRANSFER_MS_PER_MB SIM_NET_RTT_MS
+#   SIM_ENC_BASE_MS SIM_ENC_MS_PER_TOKEN
+#   SIM_PREFILL_BASE_MS SIM_PREFILL_MS_PER_TOKEN
+#   SIM_DECODE_BASE_MS SIM_DECODE_MS_PER_SEQ
+#   SIM_TRANSFER_MS_PER_MB SIM_NET_RTT_MS
 # Topology / workload (env, optional):
 #   NUM_ENCODERS TP_SIZE DP_SIZE N_REQUESTS MAX_TOKENS IMAGE PROFILER_DIR PY_TRACER
+#   SIM_MAX_TOTAL_TOKENS SIM_CHUNKED_PREFILL_SIZE
+#   ENCODER_MAX_INFLIGHT_BATCHES MM_PROCESSOR_WORKERS
 #
 set -euo pipefail
 
@@ -26,22 +30,28 @@ DEVICE_COUNT=$((TP_SIZE * DP_SIZE))   # language mesh needs #devices == tp*dp
 ENCODER_PORT_BASE=${ENCODER_PORT_BASE:-31001}
 LANG_PORT=${LANG_PORT:-30000}
 PROFILER_DIR=${PROFILER_DIR:-/tmp/epd-sim-profile}
-N_REQUESTS=${N_REQUESTS:-128}
+N_REQUESTS=${N_REQUESTS:-64}
 MAX_TOKENS=${MAX_TOKENS:-24}
 CONCURRENCY=${CONCURRENCY:-32}   # >1 exercises prefill/decode batching
 # Let the scheduler actually batch concurrent requests together.
 MAX_RUNNING=${MAX_RUNNING:-$((CONCURRENCY > 8 ? CONCURRENCY : 8))}
+SIM_MAX_TOTAL_TOKENS=${SIM_MAX_TOTAL_TOKENS:-32768}  # logical only; no physical sim KV buffers
+SIM_CHUNKED_PREFILL_SIZE=${SIM_CHUNKED_PREFILL_SIZE:-8192}
+ENCODER_MAX_INFLIGHT_BATCHES=${ENCODER_MAX_INFLIGHT_BATCHES:-2}
+MM_PROCESSOR_WORKERS=${MM_PROCESSOR_WORKERS:-2}
 IMAGES_PER_REQ=${IMAGES_PER_REQ:-2}   # image items attached per request
 IMAGE_SIZE=${IMAGE_SIZE:-512}         # px (square) for the auto-generated image
 PY_TRACER=${PY_TRACER:-0}   # 0 = clean stage view (good for flame graph + timeline)
 IMAGE=${IMAGE:-}
 
-SIM_ENC_BASE_MS=${SIM_ENC_BASE_MS:-10}
-SIM_ENC_MS_PER_TOKEN=${SIM_ENC_MS_PER_TOKEN:-0.2}
-SIM_PREFILL_MS_PER_TOKEN=${SIM_PREFILL_MS_PER_TOKEN:-1.0}
-SIM_DECODE_MS_PER_SEQ=${SIM_DECODE_MS_PER_SEQ:-3}
-SIM_TRANSFER_MS_PER_MB=${SIM_TRANSFER_MS_PER_MB:-10}
-SIM_NET_RTT_MS=${SIM_NET_RTT_MS:-30}
+SIM_ENC_BASE_MS=${SIM_ENC_BASE_MS:-3}
+SIM_ENC_MS_PER_TOKEN=${SIM_ENC_MS_PER_TOKEN:-0.014}
+SIM_PREFILL_BASE_MS=${SIM_PREFILL_BASE_MS:-3}
+SIM_PREFILL_MS_PER_TOKEN=${SIM_PREFILL_MS_PER_TOKEN:-0.08}
+SIM_DECODE_BASE_MS=${SIM_DECODE_BASE_MS:-14}
+SIM_DECODE_MS_PER_SEQ=${SIM_DECODE_MS_PER_SEQ:-0.05}
+SIM_TRANSFER_MS_PER_MB=${SIM_TRANSFER_MS_PER_MB:-0.12}
+SIM_NET_RTT_MS=${SIM_NET_RTT_MS:-0.3}
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "${SCRIPT_DIR}/../.." && pwd)
@@ -103,7 +113,9 @@ sim_args=(
   --simulate-compute
   --simulate-compute-encoder-base-ms "${SIM_ENC_BASE_MS}"
   --simulate-compute-encoder-ms-per-token "${SIM_ENC_MS_PER_TOKEN}"
+  --simulate-compute-prefill-base-ms "${SIM_PREFILL_BASE_MS}"
   --simulate-compute-prefill-ms-per-token "${SIM_PREFILL_MS_PER_TOKEN}"
+  --simulate-compute-decode-base-ms "${SIM_DECODE_BASE_MS}"
   --simulate-compute-decode-ms-per-seq "${SIM_DECODE_MS_PER_SEQ}"
   --simulate-transfer-ms-per-mb "${SIM_TRANSFER_MS_PER_MB}"
   --simulate-network-rtt-ms "${SIM_NET_RTT_MS}"
@@ -112,22 +124,29 @@ common_args=(
   --model-path "${MODEL_PATH}" --tp-size "${TP_SIZE}" --dp-size "${DP_SIZE}"
   --device cpu --load-format dummy --dtype bfloat16 --attention-backend native
   --trust-remote-code --disaggregation-host-ip 127.0.0.1
+  --enable-request-time-stats-logging
 )
 
 ENCODER_URLS=()
 for ((i = 0; i < NUM_ENCODERS; i++)); do
   port=$((ENCODER_PORT_BASE + i))
   echo ">> starting encoder ${i} on :${port}"
-  "${PY}" -m sgl_jax.launch_server "${common_args[@]}" "${sim_args[@]}" \
-    --encoder-only --disable-precompile --host 127.0.0.1 --port "${port}" \
+"${PY}" -m sgl_jax.launch_server "${common_args[@]}" "${sim_args[@]}" \
+    --encoder-only \
+    --encoder-max-inflight-batches "${ENCODER_MAX_INFLIGHT_BATCHES}" \
+    --mm-processor-worker-num "${MM_PROCESSOR_WORKERS}" \
+    --host 127.0.0.1 --port "${port}" \
     > "${PROFILER_DIR}/encoder_${i}.log" 2>&1 &
   PIDS+=($!)
   ENCODER_URLS+=("http://127.0.0.1:${port}")
 done
 
 echo ">> starting language server on :${LANG_PORT}"
-"${PY}" -m sgl_jax.launch_server "${common_args[@]}" "${sim_args[@]}" \
+  "${PY}" -m sgl_jax.launch_server "${common_args[@]}" "${sim_args[@]}" \
   --language-only --encoder-urls "${ENCODER_URLS[@]}" \
+  --disable-radix-cache \
+  --max-total-tokens "${SIM_MAX_TOTAL_TOKENS}" \
+  --chunked-prefill-size "${SIM_CHUNKED_PREFILL_SIZE}" \
   --context-length 4096 --max-running-requests "${MAX_RUNNING}" --mem-fraction-static 0.1 \
   --host 127.0.0.1 --port "${LANG_PORT}" > "${PROFILER_DIR}/language.log" 2>&1 &
 PIDS+=($!)
@@ -216,11 +235,8 @@ if [ "${CONCURRENCY}" -gt 1 ]; then
   echo "  * Single-request timeline skipped (only valid for sequential drive);"
   echo "    read the FLAME GRAPH + Perfetto. For a per-request waterfall run with"
   echo "    CONCURRENCY=1."
-  echo "  * Decode is modeled as base_ms + per_seq_ms*batch. With the default"
-  echo "    (base 0) decode grows linearly with batch, so batching looks harmful."
-  echo "    For realistic batched decode set the FIXED cost via SIM_DECODE_BASE_MS"
-  echo "    (dominant) and keep SIM_DECODE_MS_PER_SEQ small, e.g."
-  echo "    SIM_DECODE_BASE_MS=20 SIM_DECODE_MS_PER_SEQ=0.5"
+  echo "  * Decode uses base_ms + per_seq_ms*batch; override the SIM_DECODE_* env"
+  echo "    variables to explore another serving configuration."
 fi
 # Open the timeline only when it was produced (sequential); otherwise leave the
 # flame graph SVG for the user to open.

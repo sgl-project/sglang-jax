@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, InvalidStateError, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -85,24 +86,107 @@ def plan_encoder_registrations(
     return registrations
 
 
-def register_scheduler_receivers(
-    registrations: list[tuple[str, str, Modality | None]],
+def register_scheduler_receiver(
+    registration: tuple[str, str, Modality | None],
     receive_url: str,
     client: httpx.Client,
 ) -> None:
-    for encoder_url, req_id, modality in registrations:
-        payload = {
-            "req_id": req_id,
-            "receive_count": 1,
-            "receive_url": receive_url,
-        }
-        if modality is not None:
-            payload["modality"] = modality.name
-        response = client.post(
-            f"{encoder_url.rstrip('/')}/scheduler_receive_url",
-            json=payload,
-        )
-        response.raise_for_status()
+    encoder_url, req_id, modality = registration
+    payload = {
+        "req_id": req_id,
+        "receive_count": 1,
+        "receive_url": receive_url,
+    }
+    if modality is not None:
+        payload["modality"] = modality.name
+    response = client.post(
+        f"{encoder_url.rstrip('/')}/scheduler_receive_url",
+        json=payload,
+    )
+    response.raise_for_status()
+
+
+def submit_scheduler_receiver_registrations(
+    executor: ThreadPoolExecutor,
+    registrations: list[tuple[str, str, Modality | None]],
+    receive_url: str,
+    client: httpx.Client,
+) -> Future[None]:
+    """Submit independent encoder registrations and aggregate their futures."""
+    combined: Future[None] = Future()
+    children: list[Future[None]] = []
+    lock = threading.Lock()
+    remaining = len(registrations)
+    first_exception: BaseException | None = None
+    child_cancelled = False
+
+    if remaining == 0:
+        combined.set_result(None)
+        return combined
+
+    def finish(child: Future[None]) -> None:
+        nonlocal child_cancelled, first_exception, remaining
+        action = None
+        with lock:
+            remaining -= 1
+            if combined.done():
+                return
+            if child.cancelled():
+                child_cancelled = True
+            else:
+                exception = child.exception()
+                if exception is not None and first_exception is None:
+                    first_exception = exception
+
+            # Match the old gather(return_exceptions=True) behavior: let every
+            # registration finish before surfacing the first failure.
+            if remaining != 0:
+                return
+            if child_cancelled:
+                action = ("cancel", None)
+            elif first_exception is not None:
+                action = ("exception", first_exception)
+            else:
+                action = ("result", None)
+
+        # ``combined.cancel()`` invokes callbacks synchronously, so complete it
+        # outside ``lock`` to avoid re-entering ``finish`` while cancelling peers.
+        try:
+            if action is None:
+                return
+            kind, value = action
+            if kind == "cancel":
+                combined.cancel()
+            elif kind == "exception":
+                combined.set_exception(value)
+            else:
+                combined.set_result(None)
+        except InvalidStateError:
+            # A caller may cancel the aggregate between the done check and the
+            # completion above. Its cancellation already represents the result.
+            pass
+
+    def cancel_children(done: Future[None]) -> None:
+        if done.cancelled():
+            for child in children:
+                child.cancel()
+
+    combined.add_done_callback(cancel_children)
+    try:
+        for registration in registrations:
+            child = executor.submit(
+                register_scheduler_receiver,
+                registration,
+                receive_url,
+                client,
+            )
+            children.append(child)
+            child.add_done_callback(finish)
+    except Exception:
+        for child in children:
+            child.cancel()
+        raise
+    return combined
 
 
 def validate_encoder_response(
@@ -224,8 +308,8 @@ class EncoderClient:
         port = receiver.bind_to_random_port(f"tcp://{self._host}")
         receive_url = f"{self._host}:{port}"
         try:
-            register_future = self._executor.submit(
-                register_scheduler_receivers,
+            register_future = submit_scheduler_receiver_registrations(
+                self._executor,
                 registrations,
                 receive_url,
                 self._registration_client,

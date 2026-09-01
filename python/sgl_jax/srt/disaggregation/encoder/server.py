@@ -3,14 +3,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import time
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import jax
-import jax.numpy as jnp
 import jax.profiler
 import numpy as np
 import uvicorn
@@ -40,6 +38,7 @@ from sgl_jax.srt.multimodal.manager.multimodal_processor import (
 )
 from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.server_args import ServerArgs, apply_multimodal_model_defaults
+from sgl_jax.srt.utils import configure_logger, set_uvicorn_logging_configs
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 
 # Adapted for JAX from SGLang's encoder server:
@@ -72,6 +71,7 @@ class MMEncoder:
         self._simulate_compute = server_args.simulate_compute
         self._sim_encoder_base_ms = server_args.simulate_compute_encoder_base_ms
         self._sim_encoder_ms_per_token = server_args.simulate_compute_encoder_ms_per_token
+        self._sim_encode_lock = asyncio.Lock()
 
         config = self.model_config.hf_config
         config.vision_encoder_parallel = server_args.vision_encoder_parallel
@@ -125,27 +125,29 @@ class MMEncoder:
         processed = await asyncio.gather(
             *(self._process_request(request, modality) for request in requests)
         )
-        items = [item for mm_inputs in processed for item in mm_inputs.mm_items]
-        with jax.profiler.TraceAnnotation(f"mm_encode:{modality.name}:{len(requests)}"):
-            if self._simulate_compute:
-                # Model the ViT forward as a sleep; return a zero embedding of the
-                # exact packed shape so the slicing/validation below still holds.
-                token_count_total = sum(
-                    end - start
-                    for mm_inputs in processed
-                    for item in mm_inputs.mm_items
-                    for start, end in item.placeholder_ranges or ()
-                )
-                sleep_ms = (
-                    self._sim_encoder_base_ms + self._sim_encoder_ms_per_token * token_count_total
-                )
-                if sleep_ms > 0:
-                    time.sleep(sleep_ms / 1000.0)
-                packed = jnp.zeros(
-                    (token_count_total, self.model_config.hidden_size),
-                    dtype=self.model_config.dtype,
-                )
-            else:
+        simulate = getattr(self, "_simulate_compute", False)
+        if simulate:
+            token_count_total = sum(
+                end - start
+                for mm_inputs in processed
+                for item in mm_inputs.mm_items
+                for start, end in item.placeholder_ranges or ()
+            )
+            async with self._sim_encode_lock:
+                with jax.profiler.TraceAnnotation(f"mm_encode:{modality.name}:{len(requests)}"):
+                    sleep_ms = (
+                        self._sim_encoder_base_ms
+                        + self._sim_encoder_ms_per_token * token_count_total
+                    )
+                    if sleep_ms > 0:
+                        await asyncio.sleep(sleep_ms / 1000.0)
+            packed = np.zeros(
+                (token_count_total, self.model_config.hidden_size),
+                dtype=self.model_config.dtype,
+            )
+        else:
+            with jax.profiler.TraceAnnotation(f"mm_encode:{modality.name}:{len(requests)}"):
+                items = [item for mm_inputs in processed for item in mm_inputs.mm_items]
                 target = self.model.thinker if hasattr(self.model, "thinker") else self.model
                 get_feature = getattr(target, f"get_{modality.name.lower()}_feature", None)
                 if get_feature is None:
@@ -161,6 +163,8 @@ class MMEncoder:
                 for start, end in item.placeholder_ranges or ()
             )
             embedding = packed[offset : offset + token_count]
+            if simulate:
+                embedding = jax.device_put(embedding)
             if embedding.shape[0] != token_count:
                 raise ValueError(f"incomplete {modality.name} encoder output")
             results.append((embedding, self._metadata(mm_inputs, modality)))
@@ -233,8 +237,10 @@ class EncoderServer:
         advertise_url: str | None = None,
         bootstrap_timeout: float = 5.0,
         max_batch_size: int = 8,
+        max_inflight_batches: int = 1,
         request_timeout: float | None = 300.0,
         network_rtt_ms: float = 0.0,
+        log_queue_timing: bool = False,
     ) -> None:
         encoder_register_urls = list(encoder_register_urls or ())
         if bool(encoder_register_urls) != bool(advertise_url):
@@ -246,7 +252,9 @@ class EncoderServer:
             transfer,
             receiver_timeout=receiver_timeout,
             max_batch_size=max_batch_size,
+            max_inflight_batches=max_inflight_batches,
             request_timeout=request_timeout,
+            log_queue_timing=log_queue_timing,
         )
 
         @asynccontextmanager
@@ -393,6 +401,8 @@ class EncoderServer:
 
 
 def launch(server_args: ServerArgs) -> None:
+    configure_logger(server_args)
+    set_uvicorn_logging_configs()
     encoder = MMEncoder(server_args)
     try:
         if server_args.simulate_compute:
@@ -420,10 +430,12 @@ def launch(server_args: ServerArgs) -> None:
             encoder_register_urls=server_args.encoder_register_urls,
             advertise_url=advertise_url,
             bootstrap_timeout=control_timeout if control_timeout > 0 else 5.0,
+            max_inflight_batches=server_args.encoder_max_inflight_batches,
             request_timeout=server_args.encoder_request_timeout_seconds,
             network_rtt_ms=(
                 server_args.simulate_network_rtt_ms if server_args.simulate_compute else 0.0
             ),
+            log_queue_timing=server_args.enable_request_time_stats_logging,
         )
         server.run(server_args.host, server_args.port)
     finally:

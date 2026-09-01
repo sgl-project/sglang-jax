@@ -273,6 +273,7 @@ class ServerArgs:
     encoder_transfer_backend: str = "raiden"
     encoder_control_timeout_seconds: float = 300.0
     encoder_request_timeout_seconds: float = 300.0
+    encoder_max_inflight_batches: int = 1
 
     # CPU simulation: replace real device compute (encoder / prefill / decode
     # forward) and the Raiden embedding transfer with a modeled ``time.sleep``,
@@ -1746,6 +1747,12 @@ class ServerArgs:
             type=float,
             default=ServerArgs.encoder_request_timeout_seconds,
             help="Timeout for completing an encoder request. <=0 disables it.",
+        )
+        parser.add_argument(
+            "--encoder-max-inflight-batches",
+            type=int,
+            default=ServerArgs.encoder_max_inflight_batches,
+            help="Maximum Encoder batches concurrently preprocessing or awaiting transfer.",
         )
 
         # CPU compute/transfer simulation (local EPD profiling without TPU)

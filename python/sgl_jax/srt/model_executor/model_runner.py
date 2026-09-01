@@ -225,6 +225,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         # resolution, preserving host/device overlap.
         self._sim_device = _SimDevice() if server_args.simulate_compute else None
         self._sim_completions: queue.Queue = queue.Queue()
+        self._sim_precompiling = False
         total_device_memory = self.get_available_device_memory()
         self.init_attention_backend()
         self.load_model()
@@ -944,6 +945,8 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
     def _sim_duration_s(self, forward_batch: ForwardBatch) -> float:
         """Modeled device forward time (seconds), linear in batch shape."""
+        if self._sim_precompiling:
+            return 0.0
         sa = self.server_args
         if forward_batch.forward_mode.is_extend():
             ms = (
@@ -957,6 +960,26 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         else:
             ms = 0.0
         return ms / 1000.0
+
+    @contextlib.contextmanager
+    def simulation_precompile(self):
+        """Compile simulator JAX paths without enqueueing modeled device time."""
+        if self._sim_device is None:
+            yield
+            return
+
+        previous = self._sim_precompiling
+        self._sim_precompiling = True
+        try:
+            yield
+        finally:
+            while True:
+                try:
+                    done = self._sim_completions.get_nowait()
+                except queue.Empty:
+                    break
+                done.wait()
+            self._sim_precompiling = previous
 
     def sim_wait_next_completion(self) -> None:
         """Block until the oldest in-flight simulated forward completes.

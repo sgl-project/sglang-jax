@@ -3,11 +3,29 @@ import types
 import jax.numpy as jnp
 import pytest
 
+from sgl_jax.srt.mem_cache.memory_pool import SimulationTokenToKVPool
 from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
     _enforce_recurrent_state_server_constraints,
 )
 from sgl_jax.srt.server_args import ServerArgs
+
+
+def test_simulation_token_pool_has_logical_capacity_without_buffers():
+    pool = SimulationTokenToKVPool(
+        size=32768,
+        page_size=1,
+        dtype=jnp.bfloat16,
+        head_num=8,
+        head_dim=128,
+        layer_num=64,
+        mesh=None,
+    )
+
+    assert pool.size == 32768
+    assert pool.kv_buffer == []
+    assert pool.mem_usage == 0
+    assert pool.get_kv_size_bytes() == (0, 0)
 
 
 def test_recurrent_state_legacy_disable_radix_cache_passes():
