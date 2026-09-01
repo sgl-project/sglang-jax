@@ -174,13 +174,23 @@ echo ">> rendering flame graph + timeline"
 "${PY}" "${SCRIPT_DIR}/trace_to_flamegraph.py" --profiler-dir "${PROFILER_DIR}"
 "${PY}" "${SCRIPT_DIR}/trace_to_timeline_html.py" --profiler-dir "${PROFILER_DIR}" --rtt-ms "${SIM_NET_RTT_MS}"
 
+# Level-1 traces carry the stdlib/framework firehose; auto-slim to project
+# functions so the .slim.trace.json.gz is a readable Perfetto middle ground.
+if [ "${PY_TRACER}" -ge 1 ]; then
+  echo ">> slimming level-1 trace (project functions only)"
+  "${PY}" "${SCRIPT_DIR}/trace_slim.py" --profiler-dir "${PROFILER_DIR}" || true
+fi
+
 HTML="${PROFILER_DIR}/epd_timeline.html"
 echo ""
 echo "=========================================================="
 echo "Done. Artifacts in ${PROFILER_DIR}:"
 echo "  epd_timeline.html   <- single-request critical path (open this first)"
 echo "  epd_flamegraph.svg  <- CPU self-time flame graph"
-echo "  {encoder_*,language}/plugins/profile/.../*.trace.json.gz  <- Perfetto"
+if [ "${PY_TRACER}" -ge 1 ]; then
+  echo "  {encoder_0,language}.slim.trace.json.gz  <- Perfetto (project funcs, de-noised)"
+fi
+echo "  {encoder_*,language}/plugins/profile/.../*.trace.json.gz  <- Perfetto (raw)"
 echo "=========================================================="
 if [ "${CONCURRENCY}" -gt 1 ]; then
   echo ""
