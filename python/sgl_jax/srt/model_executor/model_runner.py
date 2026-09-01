@@ -594,11 +594,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.model_config.hf_config.enable_sequence_parallel = (
             self.server_args.enable_sequence_parallel
         )
-        self.model_config.hf_config.vision_encoder_parallel = getattr(
-            self.server_args, "vision_encoder_parallel", "dp"
+        self.model_config.hf_config.vision_encoder_parallel = (
+            self.server_args.vision_encoder_parallel
         )
-        self.model_config.hf_config.precompile_vision_patch_paddings = getattr(
-            self.server_args, "precompile_vision_patch_paddings", None
+
+        self.model_config.hf_config.precompile_vision_patch_paddings = (
+            self.server_args.precompile_vision_patch_paddings
         )
 
         if self.server_args.ep_dispatch_algorithm:

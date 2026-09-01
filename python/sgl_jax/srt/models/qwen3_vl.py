@@ -593,11 +593,7 @@ class Qwen3VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
                 mesh=mesh,
             )
         self.logits_processor = LogitsProcessor(self.text_config.vocab_size, mesh=mesh)
-        from sgl_jax.srt.managers.schedule_batch import global_server_args_dict
-
-        encoder_tp = resolve_encoder_tp(
-            mesh, global_server_args_dict.get("vision_encoder_parallel", "dp")
-        )
+        encoder_tp = resolve_encoder_tp(mesh, getattr(config, "vision_encoder_parallel", "dp"))
         self.visual = Qwen3VLVisionModel(
             config.vision_config,
             self.dtype,
@@ -606,7 +602,7 @@ class Qwen3VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
             encoder_tp,
             tuple(
                 resolve_vision_patch_buckets(
-                    global_server_args_dict.get("precompile_vision_patch_paddings")
+                    getattr(config, "precompile_vision_patch_paddings", None)
                 )
             ),
         )
