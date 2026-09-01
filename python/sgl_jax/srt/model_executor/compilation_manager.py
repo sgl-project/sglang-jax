@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import itertools
 import logging
 import time
 from collections.abc import Callable
@@ -19,6 +18,13 @@ if TYPE_CHECKING:
     from sgl_jax.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+_SAMPLER_PRECOMPILE_VARIANTS = (
+    (False, False),
+    (False, True),
+    (True, False),
+    (True, True),
+)
 
 
 class CompilationManager:
@@ -164,11 +170,19 @@ class CompilationManager:
             self.token_buckets,
         )
 
-        pairs = list(itertools.product([bs], self.token_buckets))
-        with tqdm(pairs, desc="[EXTEND] PRECOMPILE", leave=False) as pbar:
-            for pair in pbar:
-                bs_val, num_tokens = pair
-                pbar.set_postfix(bs=bs_val, tokens=num_tokens)
+        variants = [
+            (bs, num_tokens, is_all_greedy, return_logprob)
+            for num_tokens in self.token_buckets
+            for is_all_greedy, return_logprob in _SAMPLER_PRECOMPILE_VARIANTS
+        ]
+        with tqdm(variants, desc="[EXTEND] PRECOMPILE", leave=False) as pbar:
+            for bs_val, num_tokens, is_all_greedy, return_logprob in pbar:
+                pbar.set_postfix(
+                    bs=bs_val,
+                    tokens=num_tokens,
+                    greedy=is_all_greedy,
+                    logprob=return_logprob,
+                )
                 if bs_val > num_tokens:
                     logger.warning("bs=%s > num_tokens=%s, skip this pair", bs_val, num_tokens)
                     continue
@@ -179,6 +193,8 @@ class CompilationManager:
                     self.cache_loc_buckets[-1],
                     dp_size=self.dp_size,
                     per_dp_bs_size=bs_val // self.dp_size,
+                    is_all_greedy=is_all_greedy,
+                    return_output_logprob_only=return_logprob,
                 )
                 if prepare_lora_fn is not None:
                     prepare_lora_fn(batch)
@@ -198,7 +214,15 @@ class CompilationManager:
                     skip_sample=False,
                     sampling_metadata=sampling_metadata,
                 )
-                self._compiled_variants.add((ForwardMode.EXTEND, num_tokens, bs_val, False))
+                self._compiled_variants.add(
+                    (
+                        ForwardMode.EXTEND,
+                        num_tokens,
+                        bs_val,
+                        is_all_greedy,
+                        return_logprob,
+                    )
+                )
 
         end_time = time.perf_counter()
         logger.info("[EXTEND] Precompile finished in %.0f secs", end_time - start_time)
@@ -221,14 +245,23 @@ class CompilationManager:
             self.bs_buckets,
         )
 
+        variants = [
+            (i, bs_val, is_all_greedy, return_logprob)
+            for i, bs_val in enumerate(self.bs_buckets)
+            for is_all_greedy, return_logprob in _SAMPLER_PRECOMPILE_VARIANTS
+        ]
         with tqdm(
-            enumerate(self.bs_buckets),
+            variants,
             desc="[DECODE] PRECOMPILE",
             leave=False,
-            total=len(self.bs_buckets),
+            total=len(variants),
         ) as pbar:
-            for i, bs_val in pbar:
-                pbar.set_postfix(bs=bs_val)
+            for i, bs_val, is_all_greedy, return_logprob in pbar:
+                pbar.set_postfix(
+                    bs=bs_val,
+                    greedy=is_all_greedy,
+                    logprob=return_logprob,
+                )
                 aligned_cache_loc_size = self.cache_loc_buckets[i]
                 batch = self._make_dummy_batch(
                     bs_val,
@@ -237,6 +270,8 @@ class CompilationManager:
                     aligned_cache_loc_size,
                     dp_size=self.dp_size,
                     per_dp_bs_size=bs_val // self.dp_size,
+                    is_all_greedy=is_all_greedy,
+                    return_output_logprob_only=return_logprob,
                 )
                 if prepare_lora_fn is not None:
                     prepare_lora_fn(batch)
@@ -269,7 +304,15 @@ class CompilationManager:
                         future_token_ids_map.shape[0],
                     )
                     set_future_token_ids(future_token_ids_map, slots, next_token_ids, mesh)
-                self._compiled_variants.add((ForwardMode.DECODE, bs_val, bs_val, False))
+                self._compiled_variants.add(
+                    (
+                        ForwardMode.DECODE,
+                        bs_val,
+                        bs_val,
+                        is_all_greedy,
+                        return_logprob,
+                    )
+                )
 
         end_time = time.perf_counter()
         logger.info("[DECODE] Precompile finished in %.0f secs", end_time - start_time)
@@ -285,6 +328,8 @@ class CompilationManager:
         speculative_algorithm=None,
         dp_size: int = 1,
         per_dp_bs_size: int = 0,
+        is_all_greedy: bool | None = None,
+        return_output_logprob_only: bool | None = None,
     ):
         import jax.numpy as jnp
 
@@ -322,15 +367,20 @@ class CompilationManager:
         extend_seq_lens = np.array([1] * bs) if mode == ForwardMode.EXTEND else None
         logits_indices = np.array([0] * bs) if mode == ForwardMode.EXTEND else None
 
-        if speculative_algorithm is None:
-            sampling_info = ModelWorkerSamplingInfo.generate_for_precompile(bs, self.vocab_size)
-            return_output_logprob_only = True
-        else:
+        if is_all_greedy is None:
+            is_all_greedy = speculative_algorithm is not None
+        if return_output_logprob_only is None:
+            return_output_logprob_only = speculative_algorithm is None
+
+        if is_all_greedy:
             sampling_info = ModelWorkerSamplingInfo.generate_for_precompile_all_greedy(
                 bs, self.vocab_size
             )
+        else:
+            sampling_info = ModelWorkerSamplingInfo.generate_for_precompile(bs, self.vocab_size)
+
+        if speculative_algorithm is not None:
             sampling_info.vocab_mask = None
-            return_output_logprob_only = False
 
         return ModelWorkerBatch(
             bid=1,
@@ -387,8 +437,9 @@ class CompilationManager:
     def register_variant_if_new(self, variant_key: tuple) -> bool:
         """Register a compilation variant and return True if it was not seen before.
 
-        Used to detect first-time compilation of a (mode, num_tokens, bs, logprob)
-        shape tuple so the caller can log or act on cold-compile events.
+        Used to detect first-time compilation of a
+        (mode, num_tokens, bs, greedy, logprob) variant so the caller can log
+        or act on cold-compile events.
         TODO: add runtime consumer that warns on cache misses (issue #609).
         """
         if variant_key in self._compiled_variants:

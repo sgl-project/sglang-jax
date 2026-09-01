@@ -3,6 +3,7 @@
 import os
 import unittest
 from functools import partial
+from itertools import product
 
 os.environ["SGLANG_JAX_AOT_DISPATCH"] = "1"  # force-on regardless of arg count
 
@@ -53,18 +54,36 @@ class TestAotDispatcher(unittest.TestCase):
         np.testing.assert_allclose(np.asarray(out8), np.asarray(eout8))
         self.assertEqual(len(disp._cache), 1)  # same shapes -> one entry
 
-    def test_pytree_aux_data_partitions_cache(self):
+    def test_sampler_static_metadata_partitions_cache(self):
         @jax.jit
         def sample(metadata):
+            value = jax.lax.cond(
+                metadata.do_penalties,
+                lambda x: x + metadata.linear_penalty[:, :1],
+                lambda x: x,
+                metadata.temperatures,
+            )
+            value = jax.lax.cond(
+                metadata.apply_vocab_mask,
+                lambda x: x + metadata.vocab_mask[:, :1],
+                lambda x: x,
+                value,
+            )
             if metadata.is_all_greedy:
-                return metadata.temperatures + 1
-            if metadata.do_penalties:
-                return metadata.temperatures + metadata.linear_penalty[:, :1]
-            return metadata.temperatures - 1
+                value += 10
+            if metadata.return_logprob:
+                value += 20
+            return value
 
-        def metadata(*, is_all_greedy=False, do_penalties=False):
+        def metadata(
+            *,
+            is_all_greedy=False,
+            do_penalties=False,
+            apply_vocab_mask=False,
+            return_logprob=False,
+        ):
             return SamplingMetadata(
-                return_logprob=False,
+                return_logprob=return_logprob,
                 top_logprobs_nums=None,
                 token_ids_logprobs=None,
                 temperatures=jnp.ones((1, 1)),
@@ -77,19 +96,25 @@ class TestAotDispatcher(unittest.TestCase):
                 need_min_p_sampling=False,
                 do_penalties=do_penalties,
                 linear_penalty=jnp.full((1, 4), 3.0),
+                vocab_mask=jnp.full((1, 1), 5.0),
+                apply_vocab_mask=apply_vocab_mask,
             )
 
         disp = AotDispatcher(sample, stable_call_args=(), stable_flat_args=(), name="sampler")
-        cases = (
-            (metadata(is_all_greedy=True), 2.0),
-            (metadata(), 0.0),
-            (metadata(do_penalties=True), 4.0),
-        )
-        for sampling_metadata, expected in cases:
+        for greedy, penalty, grammar, logprob in product((False, True), repeat=4):
+            sampling_metadata = metadata(
+                is_all_greedy=greedy,
+                do_penalties=penalty,
+                apply_vocab_mask=grammar,
+                return_logprob=logprob,
+            )
+            expected = 1 + 3 * penalty + 5 * grammar + 10 * greedy + 20 * logprob
             actual = disp(sampling_metadata)
             np.testing.assert_allclose(np.asarray(actual), expected)
 
-        self.assertEqual(len(disp._cache), len(cases))
+        # Only greedy and logprob are static PyTree metadata. Penalties and
+        # grammar masks are runtime predicates inside each compiled graph.
+        self.assertEqual(len(disp._cache), 4)
 
     def test_stable_replacement_invalidates(self):
         disp, ref = self._make()

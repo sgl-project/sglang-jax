@@ -179,10 +179,18 @@ class Sampler(nnx.Module):
         """
 
         logits = logits_output.next_token_logits
-        if sampling_metadata.do_penalties:
-            logits = self._apply_linear_penalty((logits, sampling_metadata))
-        if sampling_metadata.apply_vocab_mask:
-            logits = apply_token_bitmask(logits, sampling_metadata.vocab_mask)
+        logits = lax.cond(
+            sampling_metadata.do_penalties,
+            self._apply_linear_penalty,
+            lambda operands: operands[0],
+            (logits, sampling_metadata),
+        )
+        logits = lax.cond(
+            sampling_metadata.apply_vocab_mask,
+            lambda operands: apply_token_bitmask(operands[0], operands[1]),
+            lambda operands: operands[0],
+            (logits, sampling_metadata.vocab_mask),
+        )
 
         if sampling_metadata.is_all_greedy:
             logits = jax.sharding.reshard(logits, NamedSharding(self.mesh, P("data", None)))
