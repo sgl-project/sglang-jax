@@ -25,6 +25,7 @@ _SAMPLER_PRECOMPILE_VARIANTS = (
     (True, False),
     (True, True),
 )
+_DEFAULT_SAMPLER_PRECOMPILE_VARIANT = (False, True)
 
 
 class CompilationManager:
@@ -170,11 +171,20 @@ class CompilationManager:
             self.token_buckets,
         )
 
-        variants = [
-            (bs, num_tokens, is_all_greedy, return_logprob)
-            for num_tokens in self.token_buckets
-            for is_all_greedy, return_logprob in _SAMPLER_PRECOMPILE_VARIANTS
-        ]
+        variants = []
+        sampler_variants_pending = True
+        for num_tokens in self.token_buckets:
+            sampler_variants = (
+                _SAMPLER_PRECOMPILE_VARIANTS
+                if sampler_variants_pending and bs <= num_tokens
+                else (_DEFAULT_SAMPLER_PRECOMPILE_VARIANT,)
+            )
+            variants.extend(
+                (bs, num_tokens, is_all_greedy, return_logprob)
+                for is_all_greedy, return_logprob in sampler_variants
+            )
+            if bs <= num_tokens:
+                sampler_variants_pending = False
         with tqdm(variants, desc="[EXTEND] PRECOMPILE", leave=False) as pbar:
             for bs_val, num_tokens, is_all_greedy, return_logprob in pbar:
                 pbar.set_postfix(

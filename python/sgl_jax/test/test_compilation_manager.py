@@ -103,21 +103,24 @@ class TestSamplerPrecompileVariants(unittest.TestCase):
             for batch in batches
         }
 
-    def test_extend_precompiles_four_sampler_variants_per_shape(self):
+    def test_extend_precompiles_four_sampler_variants_once(self):
         cm = _make_precompile_manager()
         batches = _collect_precompile_batches(cm, ForwardMode.EXTEND)
 
-        assert len(batches) == 4 * len(cm.token_buckets)
-        for num_tokens in cm.token_buckets:
+        assert len(batches) == len(cm.token_buckets) + 3
+        for index, num_tokens in enumerate(cm.token_buckets):
             shape_batches = [
                 batch for batch in batches if len(batch.input_ids) == num_tokens
             ]
-            assert self._sampler_variants(shape_batches) == {
-                (False, False),
-                (False, True),
-                (True, False),
-                (True, True),
-            }
+            if index == 0:
+                assert self._sampler_variants(shape_batches) == {
+                    (False, False),
+                    (False, True),
+                    (True, False),
+                    (True, True),
+                }
+            else:
+                assert self._sampler_variants(shape_batches) == {(False, True)}
 
     def test_decode_precompiles_four_sampler_variants_per_shape(self):
         cm = _make_precompile_manager()
@@ -327,7 +330,7 @@ class TestRecurrentPrecompileStructure(unittest.TestCase):
         extend_batches = _collect_precompile_batches(cm, ForwardMode.EXTEND)
         decode_batches = _collect_precompile_batches(cm, ForwardMode.DECODE)
 
-        assert len(extend_batches) == 4 * len(cm.token_buckets)
+        assert len(extend_batches) == len(cm.token_buckets) + 3
         assert len(decode_batches) == 4 * len(cm.bs_buckets)
         assert all(self._presence(batch) == (False, False) for batch in extend_batches)
         assert all(self._presence(batch) == (False, False) for batch in decode_batches)
@@ -338,7 +341,7 @@ class TestRecurrentPrecompileStructure(unittest.TestCase):
         extend_batches = _collect_precompile_batches(cm, ForwardMode.EXTEND)
         decode_batches = _collect_precompile_batches(cm, ForwardMode.DECODE)
 
-        assert len(extend_batches) == 4 * len(cm.token_buckets)
+        assert len(extend_batches) == len(cm.token_buckets) + 3
         assert len(decode_batches) == 4 * len(cm.bs_buckets)
         assert all(self._presence(batch) == (False, False) for batch in extend_batches)
         assert all(self._presence(batch) == (False, False) for batch in decode_batches)
@@ -353,7 +356,7 @@ class TestRecurrentPrecompileStructure(unittest.TestCase):
         extend_batches = _collect_precompile_batches(cm, ForwardMode.EXTEND)
         decode_batches = _collect_precompile_batches(cm, ForwardMode.DECODE)
 
-        assert len(extend_batches) == 4 * len(cm.token_buckets)
+        assert len(extend_batches) == len(cm.token_buckets) + 3
         assert len(decode_batches) == 4 * len(cm.bs_buckets)
         assert all(self._presence(batch) == (True, False) for batch in extend_batches)
         assert all(self._presence(batch) == (False, False) for batch in decode_batches)
@@ -368,7 +371,7 @@ class TestRecurrentPrecompileStructure(unittest.TestCase):
         extend_batches = _collect_precompile_batches(cm, ForwardMode.EXTEND)
         decode_batches = _collect_precompile_batches(cm, ForwardMode.DECODE)
 
-        assert len(extend_batches) == 4 * len(cm.token_buckets)
+        assert len(extend_batches) == len(cm.token_buckets) + 3
         assert len(decode_batches) == 4 * len(cm.bs_buckets)
         assert all(self._presence(batch) == (True, True) for batch in extend_batches)
         assert all(self._presence(batch) == (False, True) for batch in decode_batches)
