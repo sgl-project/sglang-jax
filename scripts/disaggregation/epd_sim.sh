@@ -176,9 +176,19 @@ echo ">> profiling ${N_REQUESTS} requests (concurrency ${CONCURRENCY}, ${IMAGES_
   --concurrency "${CONCURRENCY}" \
   --warmup 1 --python-tracer-level "${PY_TRACER}" --profiler-dir "${PROFILER_DIR}"
 
-echo ">> rendering flame graph + timeline"
+echo ">> rendering flame graph"
 "${PY}" "${SCRIPT_DIR}/trace_to_flamegraph.py" --profiler-dir "${PROFILER_DIR}"
-"${PY}" "${SCRIPT_DIR}/trace_to_timeline_html.py" --profiler-dir "${PROFILER_DIR}" --rtt-ms "${SIM_NET_RTT_MS}"
+# The single-request timeline only reconstructs cleanly from a SEQUENTIAL drive;
+# under concurrency decode is batched and prefill chunked, so per-request
+# segmentation is invalid. Only build it at CONCURRENCY=1.
+TIMELINE=""
+if [ "${CONCURRENCY}" -eq 1 ]; then
+  echo ">> rendering single-request timeline"
+  "${PY}" "${SCRIPT_DIR}/trace_to_timeline_html.py" --profiler-dir "${PROFILER_DIR}" --rtt-ms "${SIM_NET_RTT_MS}"
+  TIMELINE="${PROFILER_DIR}/epd_timeline.html"
+else
+  echo ">> skipping single-request timeline (concurrency ${CONCURRENCY}); use the flame graph / Perfetto"
+fi
 
 # Level-1 traces carry the stdlib/framework firehose; auto-slim to project
 # functions so the .slim.trace.json.gz is a readable Perfetto middle ground.
@@ -187,12 +197,13 @@ if [ "${PY_TRACER}" -ge 1 ]; then
   "${PY}" "${SCRIPT_DIR}/trace_slim.py" --profiler-dir "${PROFILER_DIR}" || true
 fi
 
-HTML="${PROFILER_DIR}/epd_timeline.html"
 echo ""
 echo "=========================================================="
 echo "Done. Artifacts in ${PROFILER_DIR}:"
-echo "  epd_timeline.html   <- single-request critical path (open this first)"
-echo "  epd_flamegraph.svg  <- CPU self-time flame graph"
+echo "  epd_flamegraph.svg  <- CPU self-time flame graph (primary view)"
+if [ -n "${TIMELINE}" ]; then
+  echo "  epd_timeline.html   <- single-request critical path (sequential only)"
+fi
 if [ "${PY_TRACER}" -ge 1 ]; then
   echo "  {encoder_0,language}.slim.trace.json.gz  <- Perfetto (project funcs, de-noised)"
 fi
@@ -201,15 +212,20 @@ echo "=========================================================="
 if [ "${CONCURRENCY}" -gt 1 ]; then
   echo ""
   echo "NOTE (concurrency ${CONCURRENCY}):"
-  echo "  * Requests now batch in the scheduler (see #running-req in language.log)."
-  echo "  * The single-request TIMELINE assumes sequential drive; under concurrency"
-  echo "    read the FLAME GRAPH + Perfetto instead (decode spans cover the batch)."
+  echo "  * Requests batch in the scheduler (see #running-req in language.log)."
+  echo "  * Single-request timeline skipped (only valid for sequential drive);"
+  echo "    read the FLAME GRAPH + Perfetto. For a per-request waterfall run with"
+  echo "    CONCURRENCY=1."
   echo "  * Decode is modeled as base_ms + per_seq_ms*batch. With the default"
   echo "    (base 0) decode grows linearly with batch, so batching looks harmful."
   echo "    For realistic batched decode set the FIXED cost via SIM_DECODE_BASE_MS"
   echo "    (dominant) and keep SIM_DECODE_MS_PER_SEQ small, e.g."
   echo "    SIM_DECODE_BASE_MS=20 SIM_DECODE_MS_PER_SEQ=0.5"
 fi
-if command -v open >/dev/null 2>&1; then open "${HTML}"
-elif command -v xdg-open >/dev/null 2>&1; then xdg-open "${HTML}" >/dev/null 2>&1 || true
-else echo "open ${HTML} in a browser"; fi
+# Open the timeline only when it was produced (sequential); otherwise leave the
+# flame graph SVG for the user to open.
+if [ -n "${TIMELINE}" ]; then
+  if command -v open >/dev/null 2>&1; then open "${TIMELINE}"
+  elif command -v xdg-open >/dev/null 2>&1; then xdg-open "${TIMELINE}" >/dev/null 2>&1 || true
+  else echo "open ${TIMELINE} in a browser"; fi
+fi

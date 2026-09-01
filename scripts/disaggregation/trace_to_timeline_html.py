@@ -92,6 +92,10 @@ def main() -> int:
     gap_us, spans = rep
 
     prefill_us = spans[0][1]
+    # A ~0-duration "prefill" (or overlapping spans) means the cluster is not a
+    # clean single request: the capture was concurrent / chunked, so per-request
+    # segmentation is invalid. Flag it instead of showing misleading zeros.
+    degenerate = prefill_us < 500  # < 0.5 ms
     decode = spans[1:]
     decode_total_us = sum(d for _, d in decode)
     # within-cluster orchestration (gaps between decode steps) = sampler + scheduling
@@ -200,6 +204,7 @@ def main() -> int:
  .note{{color:#666;font-size:12px;margin-top:6px;max-width:900px}}
 </style></head><body>
 <h1>EPD CPU-sim — single request critical path (representative request)</h1>
+{'<div style="background:#c0392b;color:#fff;padding:8px;font-size:13px;border-radius:4px">⚠ This capture looks CONCURRENT / chunked (representative prefill ≈ 0 ms), so per-request reconstruction below is UNRELIABLE. The single-request timeline is only valid for a sequential drive (CONCURRENCY=1). Under concurrency use the flame graph / Perfetto.</div>' if degenerate else ''}
 <div class="note">Time flows left → right. <b>Amber/red = waiting</b> (encoder round-trip, network RTT),
 <b>blue/green = compute</b> (prefill / decode). Total request ≈ {ms(total_us):.0f} ms.
 This is the view for the "wait-type" latency the aggregated flame graph cannot show.</div>
@@ -220,6 +225,11 @@ embedding round-trip sits) is what to read. Encoder ViT is placed inside the wai
     out = args.out or os.path.join(args.profiler_dir, "epd_timeline.html")
     open(out, "w").write(doc)
     print(f"wrote {out}")
+    if degenerate:
+        print(
+            "  WARNING: representative prefill ~0 ms -> capture looks concurrent/chunked; "
+            "per-request timeline is unreliable. Re-capture with CONCURRENCY=1 or use the flame graph."
+        )
     print(
         f"representative request ~{ms(total_us):.0f} ms: "
         f"wait {ms(gap_us):.0f} / prefill {ms(prefill_us):.0f} / "
