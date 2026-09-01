@@ -597,6 +597,36 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 )
         return swa_indices
 
+    def transfer_swa_mapping(
+        self,
+        source_full_indices: np.ndarray,
+        target_full_indices: np.ndarray,
+        *,
+        dp_rank: int,
+    ) -> None:
+        """Move SWA ownership to existing FULL slots and free the source FULL slots."""
+        source_full_indices = np.asarray(source_full_indices, dtype=np.int32)
+        target_full_indices = np.asarray(target_full_indices, dtype=np.int32)
+        if source_full_indices.shape != target_full_indices.shape:
+            raise ValueError(
+                "SWA mapping transfer requires equal source and target shapes: "
+                f"{source_full_indices.shape} != {target_full_indices.shape}"
+            )
+        mapping = (
+            self.full_to_swa_index_mapping
+            if self.dp_size == 1
+            else self.full_to_swa_index_mapping[dp_rank]
+        )
+        source_swa_indices = mapping[source_full_indices].copy()
+        if np.any(source_swa_indices == 0):
+            raise ValueError("SWA mapping transfer requires fully mapped source FULL slots")
+        if np.any(mapping[target_full_indices] != 0):
+            raise ValueError("SWA mapping transfer requires unmapped target FULL slots")
+
+        mapping[target_full_indices] = source_swa_indices
+        mapping[source_full_indices] = 0
+        self.free_full(source_full_indices, dp_rank=dp_rank)
+
     def free_full(self, full_indices: np.ndarray, *, dp_rank: int) -> None:
         """Free only FULL slots while preserving SWA slots and their mapping."""
         if self.is_not_in_free_group:

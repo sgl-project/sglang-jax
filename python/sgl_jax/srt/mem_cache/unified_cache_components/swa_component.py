@@ -113,6 +113,28 @@ class SWAComponent(TreeComponent):
             cur_time -= 0.00001
             current = current.parent
 
+    def _heal_from_fresh_full(
+        self,
+        node: UnifiedTreeNode,
+        fresh_full: np.ndarray,
+        *,
+        dp_rank: int,
+    ) -> None:
+        full_cd = node.component_data[ComponentType.FULL]
+        old_full = full_cd.value
+        assert old_full is not None
+        assert not self.allocator.translate_full_to_swa(
+            old_full, dp_rank=dp_rank, require_mapped=False
+        ).any()
+        if full_cd.lock_ref > 0:
+            # Another request may still reference the tree's FULL slots. Keep
+            # those slots stable and move only the freshly computed SWA view.
+            self.allocator.transfer_swa_mapping(fresh_full, old_full, dp_rank=dp_rank)
+        else:
+            self.allocator.free_full(old_full, dp_rank=dp_rank)
+            full_cd.value = fresh_full.copy()
+        self._set_swa_value(node)
+
     def update_component_on_insert_overlap(
         self,
         node: UnifiedTreeNode,
@@ -131,18 +153,11 @@ class SWAComponent(TreeComponent):
             # lock; a tombstone here has no fresh request mapping to donate.
             return prefix_len
         boundary = max(params.swa_evicted_seqlen, params.prev_prefix_len)
-        old_full = node.component_data[ComponentType.FULL].value
-        assert old_full is not None
         dp_rank = _node_dp_rank(self.cache, node)
 
         if boundary <= total_prefix_len:
             # The request owns a fresh full slice for the entire tombstone.
-            assert not self.allocator.translate_full_to_swa(
-                old_full, dp_rank=dp_rank, require_mapped=False
-            ).any()
-            self.allocator.free_full(old_full, dp_rank=dp_rank)
-            node.component_data[ComponentType.FULL].value = value_slice.copy()
-            self._set_swa_value(node)
+            self._heal_from_fresh_full(node, value_slice, dp_rank=dp_rank)
             self.cache.record_swa_tombstone_healed(dp_rank)
             self.cache._update_aux_evictable_node_sets(node)
             return 0
@@ -152,14 +167,7 @@ class SWAComponent(TreeComponent):
             start_idx = boundary - total_prefix_len
             new_parent = self.cache._split_node(node.key, node, start_idx)
             suffix = next(iter(new_parent.children.values()))
-            old_suffix = suffix.component_data[ComponentType.FULL].value
-            assert old_suffix is not None
-            assert not self.allocator.translate_full_to_swa(
-                old_suffix, dp_rank=dp_rank, require_mapped=False
-            ).any()
-            self.allocator.free_full(old_suffix, dp_rank=dp_rank)
-            suffix.component_data[ComponentType.FULL].value = value_slice[start_idx:].copy()
-            self._set_swa_value(suffix)
+            self._heal_from_fresh_full(suffix, value_slice[start_idx:], dp_rank=dp_rank)
             self.cache.record_swa_tombstone_healed(dp_rank)
             self.cache._update_aux_evictable_node_sets(suffix)
             return start_idx

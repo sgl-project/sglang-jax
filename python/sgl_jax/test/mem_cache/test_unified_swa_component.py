@@ -925,6 +925,51 @@ class TestUnifiedSWAComponentPage1(unittest.TestCase):
                     healed,
                 )
 
+    def test_locked_tombstone_healing_preserves_full_indices_for_existing_request(self):
+        """Healing may adopt fresh SWA slots, but must not free another request's FULL KV."""
+        for name, evicted in (("whole", 0), ("partial", 4)):
+            with self.subTest(position=name):
+                cache, allocator = _make_cache(window=8)
+                tokens = list(range(8))
+                _insert(cache, allocator, tokens, dp_rank=0)
+                node = next(iter(cache.root_node.children.values()))
+                old_full = node.component_data[ComponentType.FULL].value.copy()
+                cache.components[ComponentType.SWA].evict_component(node)
+                self.assertTrue(np.all(_swa_indices(allocator, old_full, 0) == 0))
+
+                existing_request_lock = cache.inc_lock_ref(node)
+                self.assertEqual(node.component_data[ComponentType.FULL].lock_ref, 1)
+
+                replacement = allocator.alloc(8, dp_rank=0)
+                self.assertIsNotNone(replacement)
+                replacement_swa = _swa_indices(allocator, replacement, 0)
+                result = cache.insert(
+                    InsertParams(
+                        key=RadixKey(tokens, dp_rank=0),
+                        value=replacement,
+                        swa_evicted_seqlen=evicted,
+                    )
+                )
+
+                self.assertEqual(result.prefix_len, 8)
+                np.testing.assert_array_equal(
+                    node.component_data[ComponentType.FULL].value,
+                    old_full[evicted:],
+                )
+                np.testing.assert_array_equal(
+                    node.component_data[ComponentType.SWA].value,
+                    replacement_swa[evicted:],
+                )
+                self.assertTrue(np.all(_swa_indices(allocator, replacement, 0) == 0))
+
+                full_free = _allocator_free_indices(allocator.full_attn_allocator, 0)
+                self.assertTrue(set(int(index) for index in old_full).isdisjoint(full_free))
+                self.assertTrue(set(int(index) for index in replacement).issubset(full_free))
+
+                cache.dec_lock_ref(node, existing_request_lock.to_dec_params())
+                self.assertEqual(cache.component_protected_size_[ComponentType.FULL][0], 0)
+                _assert_rank_ledger(self, cache, allocator, _RequestOwnership(), 0)
+
     def test_fully_request_evicted_leaf_is_not_materialized(self):
         cache, allocator = _make_cache(window=4)
         request = allocator.alloc(4)
