@@ -54,16 +54,13 @@ def _image_content(image: str) -> dict:
     return {"type": "image_url", "image_url": {"url": url}}
 
 
-def _chat_request(args, image_block: dict) -> dict:
+def _chat_request(args, image_blocks: list) -> dict:
     return {
         "model": args.model,
         "messages": [
             {
                 "role": "user",
-                "content": [
-                    {"type": "text", "text": args.prompt},
-                    image_block,
-                ],
+                "content": [{"type": "text", "text": args.prompt}, *image_blocks],
             }
         ],
         "max_tokens": args.max_tokens,
@@ -95,6 +92,12 @@ def main() -> int:
         help="Encoder base URL (repeat for multiple encoders).",
     )
     p.add_argument("--image", required=True, help="Image URL or local file path.")
+    p.add_argument(
+        "--images-per-request",
+        type=int,
+        default=1,
+        help="How many image items to attach per request (drives encoder + prefill load).",
+    )
     p.add_argument("--prompt", default="Describe this image in detail.")
     p.add_argument("--model", default="model")
     p.add_argument("--n-requests", type=int, default=4)
@@ -131,12 +134,12 @@ def main() -> int:
     args = p.parse_args()
 
     encoder_urls = args.encoder_url or ["http://127.0.0.1:31001"]
-    image_block = _image_content(args.image)
+    image_blocks = [_image_content(args.image)] * max(1, args.images_per_request)
 
     # Warmup outside the trace window to keep the flame graph focused.
     for i in range(args.warmup):
         print(f"warmup {i + 1}/{args.warmup}")
-        _post(f"{args.lang_url}/v1/chat/completions", _chat_request(args, image_block))
+        _post(f"{args.lang_url}/v1/chat/completions", _chat_request(args, image_blocks))
 
     print("arming profilers:")
     for idx, url in enumerate(encoder_urls):
@@ -145,7 +148,7 @@ def main() -> int:
 
     def one(_):
         t = time.monotonic()
-        _post(f"{args.lang_url}/v1/chat/completions", _chat_request(args, image_block))
+        _post(f"{args.lang_url}/v1/chat/completions", _chat_request(args, image_blocks))
         return time.monotonic() - t
 
     conc = max(1, args.concurrency)

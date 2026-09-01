@@ -26,11 +26,13 @@ DEVICE_COUNT=$((TP_SIZE * DP_SIZE))   # language mesh needs #devices == tp*dp
 ENCODER_PORT_BASE=${ENCODER_PORT_BASE:-31001}
 LANG_PORT=${LANG_PORT:-30000}
 PROFILER_DIR=${PROFILER_DIR:-/tmp/epd-sim-profile}
-N_REQUESTS=${N_REQUESTS:-20}
+N_REQUESTS=${N_REQUESTS:-128}
 MAX_TOKENS=${MAX_TOKENS:-24}
-CONCURRENCY=${CONCURRENCY:-1}   # >1 exercises prefill/decode batching
+CONCURRENCY=${CONCURRENCY:-32}   # >1 exercises prefill/decode batching
 # Let the scheduler actually batch concurrent requests together.
 MAX_RUNNING=${MAX_RUNNING:-$((CONCURRENCY > 8 ? CONCURRENCY : 8))}
+IMAGES_PER_REQ=${IMAGES_PER_REQ:-2}   # image items attached per request
+IMAGE_SIZE=${IMAGE_SIZE:-512}         # px (square) for the auto-generated image
 PY_TRACER=${PY_TRACER:-0}   # 0 = clean stage view (good for flame graph + timeline)
 IMAGE=${IMAGE:-}
 
@@ -135,15 +137,18 @@ for url in "${ENCODER_URLS[@]}"; do wait_for_health "${url}/health"; done
 wait_for_health "http://127.0.0.1:${LANG_PORT}/health"
 echo ">> all healthy"
 
-# Auto-generate a small test image if none supplied (works offline).
+# Auto-generate a test image if none supplied (works offline).
 if [ -z "${IMAGE}" ]; then
   IMAGE="${PROFILER_DIR}/_test.png"
-  "${PY}" - "${IMAGE}" <<'PY'
+  "${PY}" - "${IMAGE}" "${IMAGE_SIZE}" <<'PY'
 import sys
 try:
-    from PIL import Image
     import random
-    img = Image.new("RGB", (112, 112), (random.randint(0,255),)*3)
+
+    from PIL import Image
+
+    n = int(sys.argv[2])
+    img = Image.new("RGB", (n, n), (random.randint(0, 255),) * 3)
     img.save(sys.argv[1])
 except Exception as e:
     sys.exit(f"could not create test image ({e}); pass IMAGE=/path/to.jpg")
@@ -163,10 +168,11 @@ if [ "${PY_TRACER}" -ge 1 ] && { [ "$((N_REQUESTS * MAX_TOKENS))" -gt 40 ] || [ 
   echo "  workloads use PY_TRACER=0 (stage annotations, never near the cap)."
 fi
 
-echo ">> profiling ${N_REQUESTS} requests (concurrency ${CONCURRENCY})"
+echo ">> profiling ${N_REQUESTS} requests (concurrency ${CONCURRENCY}, ${IMAGES_PER_REQ} img/req @ ${IMAGE_SIZE}px)"
 "${PY}" "${SCRIPT_DIR}/profile_epd_cpu_sim.py" \
   --lang-url "http://127.0.0.1:${LANG_PORT}" "${enc_flags[@]}" \
-  --image "${IMAGE}" --n-requests "${N_REQUESTS}" --max-tokens "${MAX_TOKENS}" \
+  --image "${IMAGE}" --images-per-request "${IMAGES_PER_REQ}" \
+  --n-requests "${N_REQUESTS}" --max-tokens "${MAX_TOKENS}" \
   --concurrency "${CONCURRENCY}" \
   --warmup 1 --python-tracer-level "${PY_TRACER}" --profiler-dir "${PROFILER_DIR}"
 
