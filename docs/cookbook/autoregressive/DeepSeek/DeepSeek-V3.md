@@ -42,6 +42,8 @@ For evaluation, additionally install `evalscope` in the client environment (any 
 pip install evalscope==0.17.1
 ```
 
+<a id="deployment-launch"></a>
+
 ### 2.3 Launch
 
 #### Multi-host — TPU v6e-64
@@ -133,7 +135,7 @@ print(resp.choices[0].message.content)
 | Expert Parallelism | 64 |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3](../../autoregressive/DeepSeek/DeepSeek-V3.md#2-3-launch).
+**Deployment Command** — same as [§2.3](../../autoregressive/DeepSeek/DeepSeek-V3.md#deployment-launch).
 
 **Benchmark Command**
 

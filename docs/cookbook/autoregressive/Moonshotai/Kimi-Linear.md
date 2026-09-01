@@ -37,6 +37,8 @@ See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU g
 
 Install per [Install guide](../../get_started/install.md). Multi-host recommended at this size — use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](../../deployment/skypilot.md).
 
+<a id="deployment-launch"></a>
+
 ### 2.3 Launch
 
 Two slices we measured on, each as a separate launch path:
@@ -180,7 +182,7 @@ print()
 | Recurrent State Memory Ratio | 0.9 |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — see [§2.3](../../autoregressive/Moonshotai/Kimi-Linear.md#2-3-launch) (v6e-16) or [§2.3](../../autoregressive/Moonshotai/Kimi-Linear.md#2-3-launch) (v6e-32).
+**Deployment Command** — see [§2.3](../../autoregressive/Moonshotai/Kimi-Linear.md#deployment-launch) (v6e-16) or [§2.3](../../autoregressive/Moonshotai/Kimi-Linear.md#deployment-launch) (v6e-32).
 
 **Benchmark Command** — example for GSM8K:
 

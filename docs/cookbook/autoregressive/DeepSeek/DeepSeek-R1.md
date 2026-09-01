@@ -15,7 +15,7 @@ title: "DeepSeek R1"
 - **MLA** — uses the FlashAttention Pallas MLA kernel by default; no extra flag needed.
 - **MoE with shared + routed experts** — 256 routed experts and 1 shared expert per MoE layer; first 3 layers are dense MLP. See §2.4 for the backend choice.
 - **FP8 block-quant compatibility** — the per-rank `out_dim` of the shared expert `gate_proj` / `up_proj` must be **strictly greater than** `block_size_out=128`. This forces the v6e-64 mesh shape and is why `--dp-size 8` (effective tensor axis 8) is recommended over `--dp-size 4` (tensor axis 16, which collides with the block size — see §2.4).
-- Reasoning surface needs `--reasoning-parser deepseek-r1` at launch — see [§3.2](../../autoregressive/DeepSeek/DeepSeek-R1.md#3-2-reasoning-thinking-enabled-streaming) for the streaming pattern.
+- Reasoning surface needs `--reasoning-parser deepseek-r1` at launch — see [§3.2](../../autoregressive/DeepSeek/DeepSeek-R1.md#reasoning-streaming) for the streaming pattern.
 
 **Recommended Generation Parameters**: `temperature=0.6`, `top_p=0.95`, `max_tokens=4096+` (give room for thinking).
 
@@ -41,6 +41,8 @@ For evaluation, additionally install `evalscope` in the client environment:
 ```bash
 pip install evalscope==0.17.1
 ```
+
+<a id="deployment-launch"></a>
 
 ### 2.3 Launch
 
@@ -70,7 +72,7 @@ For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../.
 ### 2.4 Configuration Tips
 
 **Reasoning Parser:**
-- `--reasoning-parser deepseek-r1` is **required** for R1 — without it, the model's `<think>` content stays inline in `content` instead of being split into `reasoning_content`. See [§3.2](../../autoregressive/DeepSeek/DeepSeek-R1.md#3-2-reasoning-thinking-enabled-streaming) for the streaming pattern.
+- `--reasoning-parser deepseek-r1` is **required** for R1 — without it, the model's `<think>` content stays inline in `content` instead of being split into `reasoning_content`. See [§3.2](../../autoregressive/DeepSeek/DeepSeek-R1.md#reasoning-streaming) for the streaming pattern.
 
 **Tensor/Data Mesh Layout:**
 - Mesh shape is `Mesh(data=dp_size, tensor=tp_size/dp_size)`. On v6e-64 with `--tp-size 64 --dp-size 8`, the tensor axis is **8**.
@@ -122,6 +124,8 @@ resp = client.chat.completions.create(
 )
 print(resp.choices[0].message.content)
 ```
+
+<a id="reasoning-streaming"></a>
 
 ### 3.2 Reasoning (thinking-enabled streaming)
 
@@ -192,7 +196,7 @@ For non-streaming requests, the field appears on `response.choices[0].message.re
 | Reasoning Parser | deepseek-r1 |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3](../../autoregressive/DeepSeek/DeepSeek-R1.md#2-3-launch).
+**Deployment Command** — same as [§2.3](../../autoregressive/DeepSeek/DeepSeek-R1.md#deployment-launch).
 
 **Benchmark Command**
 

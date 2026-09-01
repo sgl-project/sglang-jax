@@ -42,6 +42,8 @@ Extra pip for accuracy benchmarking only:
 pip install evalscope
 ```
 
+<a id="deployment-launch"></a>
+
 ### 2.3 Launch
 
 #### Single-host — TPU v6e-4
@@ -117,7 +119,7 @@ print(resp.choices[0].message.content)
 | Tensor Parallelism | 4 |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3 Single-host](../../autoregressive/Qwen/Qwen.md#2-3-launch).
+**Deployment Command** — same as [§2.3 Single-host](../../autoregressive/Qwen/Qwen.md#deployment-launch).
 
 **Benchmark Command**
 
@@ -144,7 +146,7 @@ evalscope eval \
 
 **Test Environment** — same as §4.1.
 
-**Deployment Command** — same as [§2.3 Single-host](../../autoregressive/Qwen/Qwen.md#2-3-launch).
+**Deployment Command** — same as [§2.3 Single-host](../../autoregressive/Qwen/Qwen.md#deployment-launch).
 
 **Benchmark Command**
 

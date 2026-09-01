@@ -35,6 +35,8 @@ See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU g
 
 Install per [Install guide](../../get_started/install.md) and use [Single-host Docker template](../../deployment/single-host-docker.md) for the container setup.
 
+<a id="deployment-launch"></a>
+
 ### 2.3 Launch
 
 #### Single-host — TPU v6e-4
@@ -57,7 +59,7 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
 - `--mem-fraction-static 0.88` is the TPU default. Raise to `0.9` for dedicated serving / higher concurrency.
 
 **Tool Calling:**
-- MiMo-7B-RL uses the `mimo` tool-call parser format. Add `--tool-call-parser mimo` when using the OpenAI tools API. See [§3.3](../../autoregressive/Xiaomi/MiMo-7B.md#3-3-tool-calling) for the request/response pattern.
+- MiMo-7B-RL uses the `mimo` tool-call parser format. Add `--tool-call-parser mimo` when using the OpenAI tools API. See [§3.3](../../autoregressive/Xiaomi/MiMo-7B.md#tool-calling) for the request/response pattern.
 
 **Reasoning Parser:**
 - MiMo-7B-RL uses `--reasoning-parser mimo` (alias of the `qwen3` reasoning parser — same `<think>...</think>` format + `enable_thinking` switch). Append to the §2.3 launch command to expose `reasoning_content` separated from `content`.
@@ -150,6 +152,8 @@ response = client.chat.completions.create(
 )
 print(response.choices[0].message.content)
 ```
+
+<a id="tool-calling"></a>
 
 ### 3.3 Tool Calling
 
@@ -285,7 +289,7 @@ To see the full set of `--reasoning-parser` / `--tool-call-parser` keys availabl
 | Reasoning Parser | `mimo` (thinking-on per-request via `chat_template_kwargs.enable_thinking=true`) |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3](../../autoregressive/Xiaomi/MiMo-7B.md#2-3-launch) plus `--reasoning-parser mimo --tool-call-parser mimo`.
+**Deployment Command** — same as [§2.3](../../autoregressive/Xiaomi/MiMo-7B.md#deployment-launch) plus `--reasoning-parser mimo --tool-call-parser mimo`.
 
 **Benchmark Command**
 
@@ -322,7 +326,7 @@ Recommended additional datasets for reasoning variants: AIME 2025, MATH.
 | Tensor Parallelism | 4 |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3](../../autoregressive/Xiaomi/MiMo-7B.md#2-3-launch).
+**Deployment Command** — same as [§2.3](../../autoregressive/Xiaomi/MiMo-7B.md#deployment-launch).
 
 **Benchmark Command**
 

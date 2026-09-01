@@ -47,6 +47,8 @@ Extra pip for accuracy benchmarking only:
 pip install evalscope==0.17.1
 ```
 
+<a id="deployment-launch"></a>
+
 ### 2.3 Launch
 
 Two slices we measured on, each as a separate launch path:
@@ -390,7 +392,7 @@ To see the full set of `--tool-call-parser` keys available in your build, run `p
 | Reasoning Parser | `mimo` |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3 Multi-host](../../autoregressive/Xiaomi/MiMo-V2-Flash.md#2-3-launch), plus `--reasoning-parser mimo`.
+**Deployment Command** — same as [§2.3 Multi-host](../../autoregressive/Xiaomi/MiMo-V2-Flash.md#deployment-launch), plus `--reasoning-parser mimo`.
 
 **Benchmark Command**
 
@@ -431,7 +433,7 @@ This recipe uses a **single-workload configuration sweep**: one fixed ISL/OSL/co
 
 **Workload**: 256 prompts, ISL=16384, OSL=1024, concurrency=64 (single fixed cell).
 
-**Deployment Command** — same shape as [§2.3 Single-host](../../autoregressive/Xiaomi/MiMo-V2-Flash.md#2-3-launch), with `--dp-size 1` and the sweep dimensions (`--moe-backend` / `--chunked-prefill-size` / `--swa-full-tokens-ratio` / `--mem-fraction-static`) varied per row.
+**Deployment Command** — same shape as [§2.3 Single-host](../../autoregressive/Xiaomi/MiMo-V2-Flash.md#deployment-launch), with `--dp-size 1` and the sweep dimensions (`--moe-backend` / `--chunked-prefill-size` / `--swa-full-tokens-ratio` / `--mem-fraction-static`) varied per row.
 
 **Benchmark Command**
 

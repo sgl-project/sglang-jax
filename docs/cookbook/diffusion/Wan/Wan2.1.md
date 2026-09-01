@@ -17,7 +17,7 @@ title: "Wan 2.1 T2V"
 
 **Recommended Generation Parameters** (request body, not launch flags):
 
-- `size` - `720*1280` (default), `480*832` (lower-cost), or another precompiled bucket. **Format is `WIDTH*HEIGHT` (asterisk-separated), the same syntax as `--precompile-width-heights`.** Sending `WIDTHxHEIGHT` (lowercase `x`) raises `ValueError: invalid literal for int() with base 10: ...` and crashes the GlobalScheduler. Must match a precompiled bucket; see [§2.4 Configuration Tips](../../diffusion/Wan/Wan2.1.md#2-4-configuration-tips).
+- `size` - `720*1280` (default), `480*832` (lower-cost), or another precompiled bucket. **Format is `WIDTH*HEIGHT` (asterisk-separated), the same syntax as `--precompile-width-heights`.** Sending `WIDTHxHEIGHT` (lowercase `x`) raises `ValueError: invalid literal for int() with base 10: ...` and crashes the GlobalScheduler. Must match a precompiled bucket; see [§2.4 Configuration Tips](../../diffusion/Wan/Wan2.1.md#configuration-tips).
 - `num_frames` - defaults to the model-card recommended count, commonly 41 for Wan 2.1.
 - `num_inference_steps` - defaults to the model-card recommended count.
 - `seconds` / `fps` - alternative way to specify frame count; the server resolves to `num_frames`.
@@ -67,6 +67,8 @@ Swap to a different Wan release at your own risk; other Wan releases have differ
 VAE tiling is enabled by default in the multimodal server and there is no `--no-vae-tiling` flag to disable it today.
 
 > `--multimodal` is required. Without it, the text-only launcher boots and the `/api/v1/videos/generation` endpoint is not registered.
+
+<a id="configuration-tips"></a>
 
 ### 2.4 Configuration Tips
 

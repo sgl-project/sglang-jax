@@ -13,7 +13,7 @@ title: "Grok-2"
 **Key Features**:
 
 - **~269B MoE / ~70B active** — 8 experts, 2 active per token (25% active fraction); served via SGL-JAX `Grok1ForCausalLM` runtime. The validated v6e-64 path uses `--moe-backend epmoe`.
-- **Base model, not chat-tuned** — has no chat template; use the raw `/v1/completions` endpoint (see [§3.1](../../autoregressive/Grok/Grok2.md#3-1-basic-text-completion-base-model)), not `/v1/chat/completions`. xAI did not release a chat / instruct variant.
+- **Base model, not chat-tuned** — has no chat template; use the raw `/v1/completions` endpoint (see [§3.1](../../autoregressive/Grok/Grok2.md#basic-text-completion)), not `/v1/chat/completions`. xAI did not release a chat / instruct variant.
 - **Pre-sharded TP=8 safetensors checkpoint** — files named `pytorch_model-NNNNN-TP-{000..007}.safetensors`. The 8 per-expert/per-shard files imply the checkpoint expects **TP to be a multiple of 8** when serving (matches `--ep-size 8` for the MoE experts).
 - **GQA attention** — `num_attention_heads=64`, `num_key_value_heads=8` → 8 KV heads (sharding constraint: tensor axis must divide 8).
 - **Long context** — `max_position_embeddings=131072` (128K tokens native).
@@ -105,6 +105,8 @@ For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../.
 For full flag definitions and defaults see [Launch flags reference](../../base/launch-flags-reference.md).
 
 ## 3. Invocation
+
+<a id="basic-text-completion"></a>
 
 ### 3.1 Basic Text Completion (base model)
 

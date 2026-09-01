@@ -48,5 +48,6 @@ When adding a page:
 2. Add it to the relevant model index, such as `autoregressive/index.md` or `diffusion/index.md`.
 3. Add or update the hardware coverage table in `docs/cookbook/index.md`.
 4. Keep benchmark matrices in the recipe benchmark section or summarize them there; do not create a standalone benchmark-report section.
-5. If the recipe introduces a non-obvious runtime flag, link to `/base/launch-flags-reference`.
-6. Keep cookbook links inside the `docs/cookbook` root with extensionless root routes such as `/deployment/troubleshooting`. Do not link to `../deployment/*`, `../get_started/*`, or other paths outside the cookbook root.
+5. If the recipe introduces a non-obvious runtime flag, link to `base/launch-flags-reference.md` using a file-relative path from the current page (for example, `../../base/launch-flags-reference.md` from a vendor recipe).
+6. Keep internal cookbook links inside the `docs/cookbook` root. Use file-relative paths with the `.md` extension, and point directory landing pages at their explicit `index.md` file; do not use root-relative site routes or paths outside the cookbook root.
+7. For cross-page section links, add a stable explicit anchor such as `<a id="configuration-tips"></a>` immediately before the target heading and link to that ID. Do not rely on an automatically generated heading slug, because GitHub and Mintlify generate different IDs for numbered headings.

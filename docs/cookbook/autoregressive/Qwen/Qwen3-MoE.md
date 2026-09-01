@@ -42,6 +42,8 @@ See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU g
 
 Install per [Install guide](../../get_started/install.md). For multi-host launches use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](../../deployment/skypilot.md).
 
+<a id="deployment-launch"></a>
+
 ### 2.3 Launch
 
 #### Multi-host — TPU v6e-16
@@ -303,7 +305,7 @@ To see the full set of `--reasoning-parser` / `--tool-call-parser` keys availabl
 | Expert Parallelism | 16 |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3](../../autoregressive/Qwen/Qwen3-MoE.md#2-3-launch).
+**Deployment Command** — same as [§2.3](../../autoregressive/Qwen/Qwen3-MoE.md#deployment-launch).
 
 **Benchmark Command** — example for GSM8K (with thinking-on for reasoning):
 
