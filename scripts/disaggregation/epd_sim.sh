@@ -153,6 +153,16 @@ fi
 enc_flags=()
 for url in "${ENCODER_URLS[@]}"; do enc_flags+=(--encoder-url "${url}"); done
 
+# Footgun guard: python_tracer_level=1 records every Python call; the trace->JSON
+# converter caps at ~1M events and silently truncates in Perfetto. Keep level-1
+# captures to a tiny slice (1 request, few tokens, no concurrency).
+if [ "${PY_TRACER}" -ge 1 ] && { [ "$((N_REQUESTS * MAX_TOKENS))" -gt 40 ] || [ "${CONCURRENCY}" -gt 1 ]; }; then
+  echo "WARNING: PY_TRACER=1 with this workload will likely TRUNCATE the trace at ~1M"
+  echo "  events (Perfetto shows it cut). For un-truncated function detail use e.g."
+  echo "  PY_TRACER=1 CONCURRENCY=1 N_REQUESTS=1 MAX_TOKENS=8 ...; for concurrency/large"
+  echo "  workloads use PY_TRACER=0 (stage annotations, never near the cap)."
+fi
+
 echo ">> profiling ${N_REQUESTS} requests (concurrency ${CONCURRENCY})"
 "${PY}" "${SCRIPT_DIR}/profile_epd_cpu_sim.py" \
   --lang-url "http://127.0.0.1:${LANG_PORT}" "${enc_flags[@]}" \
