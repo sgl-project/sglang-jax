@@ -55,6 +55,7 @@ from sgl_jax.srt.mem_cache.unified_cache_components import (
 from sgl_jax.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
+from sgl_jax.test.test_utils import CustomTestCase
 
 
 def _mesh() -> Mesh:
@@ -361,7 +362,7 @@ def _assert_rank_ledger(
     )
 
 
-class TestUnifiedSWAComponentPage1(unittest.TestCase):
+class TestUnifiedSWAComponentPage1(CustomTestCase):
     def test_live_request_ledgers_share_schema_units_and_conserve_ownership(self):
         """All SWA routes report allocator slots with route-specific tree ownership."""
         for kind in ("unified", "legacy", "chunk"):
@@ -1077,7 +1078,7 @@ class TestUnifiedSWAComponentPage1(unittest.TestCase):
                 )
 
 
-class TestUnifiedSWAComponentPagedAndDP2(unittest.TestCase):
+class TestUnifiedSWAComponentPagedAndDP2(CustomTestCase):
     def test_scheduler_lifecycle_heals_internal_tombstones_for_both_swa_routes(self):
         """Check healing; admission/pressure tests own capacity-triggered eviction."""
         shared = list(range(4))
