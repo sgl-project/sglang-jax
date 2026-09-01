@@ -198,12 +198,18 @@ class Sampler(nnx.Module):
             (logits, sampling_metadata.vocab_mask),
         )
 
-        _, rng = jax.random.split(rng_override if rng_override is not None else self.rngs.params())
-        operands = (logits, sampling_metadata, rng)
-        regular_fn = lambda op: self._regular_sampling((*op, use_sort_for_toppk_minp))
+        operands = (logits, sampling_metadata)
+        greedy_fn = lambda op: self._greedy_sampling((*op, None))
+
+        def regular_fn(op):
+            _, rng = jax.random.split(
+                rng_override if rng_override is not None else self.rngs.params()
+            )
+            return self._regular_sampling((*op, rng, use_sort_for_toppk_minp))
+
         batch_next_token_ids, logprobs = lax.cond(
             sampling_metadata.is_all_greedy,
-            self._greedy_sampling,
+            greedy_fn,
             regular_fn,
             operands,
         )
