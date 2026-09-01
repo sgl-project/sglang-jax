@@ -597,7 +597,7 @@ class Scheduler(
         if server_args.language_only:
             self.init_encoder_disaggregation()
 
-        if not server_args.disable_precompile and not self.pd:
+        if not server_args.disable_precompile and not self.pd and not server_args.simulate_compute:
             if self.spec_algorithm is None or self.spec_algorithm.is_none():
                 logger.info("[Scheduler] Begins to run worker precompile.")
                 self.tp_worker.run_precompile()

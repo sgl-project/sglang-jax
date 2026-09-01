@@ -11,6 +11,11 @@ _RAIDEN_EXTENSION = "tpu_raiden.frameworks.jax._tpu_raiden_jax"
 
 def raiden_requested(argv: Sequence[str] | None = None) -> bool:
     args = list(sys.argv[1:] if argv is None else argv)
+    # --simulate-compute swaps Raiden for an in-process sim transfer, so the
+    # native (libtpu-backed) extension must not be preloaded — this is what
+    # lets EPD run on a CPU-only box.
+    if "--simulate-compute" in args:
+        return False
     pd_requested = False
     encoder_requested = False
     for index, arg in enumerate(args):

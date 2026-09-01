@@ -274,6 +274,26 @@ class ServerArgs:
     encoder_control_timeout_seconds: float = 300.0
     encoder_request_timeout_seconds: float = 300.0
 
+    # CPU simulation: replace real device compute (encoder / prefill / decode
+    # forward) and the Raiden embedding transfer with a modeled ``time.sleep``,
+    # so the full EPD orchestration can run and be profiled on a local CPU box
+    # without TPU. All coefficients default to 0.0 (no artificial latency);
+    # when ``simulate_compute`` is False none of the sim branches are entered,
+    # so production behavior is unchanged. Sleep is modeled linearly on batch
+    # shape (see the per-field comments below).
+    simulate_compute: bool = False
+    simulate_compute_encoder_base_ms: float = 0.0
+    simulate_compute_encoder_ms_per_token: float = 0.0  # x total placeholder tokens
+    simulate_compute_prefill_base_ms: float = 0.0
+    simulate_compute_prefill_ms_per_token: float = 0.0  # x input_ids.shape[0]
+    simulate_compute_decode_base_ms: float = 0.0
+    simulate_compute_decode_ms_per_seq: float = 0.0  # x batch_size, per decode step
+    simulate_transfer_ms_per_mb: float = 0.0  # x embedding bytes / 1MiB
+    # One-way network latency added to each cross-tier hop (language<->encoder
+    # HTTP request and the embedding delivery), so a single-box sim can model
+    # the cross-host RTT that real EPD pays but loopback does not.
+    simulate_network_rtt_ms: float = 0.0
+
     enable_return_routed_experts: bool = False
     enable_expert_balance_debug: bool = False
     expert_balance_segment_counter: int = 100
@@ -349,7 +369,7 @@ class ServerArgs:
         from sgl_jax.srt.disaggregation.pd_auth import resolve_secret
 
         self.disaggregation_shared_secret = resolve_secret(self.disaggregation_shared_secret)
-        if self.disaggregation_host_ip is not None:
+        if self.disaggregation_host_ip is not None and not self.simulate_compute:
             self.disaggregation_host_ip = _validate_disaggregation_host_ip(
                 self.disaggregation_host_ip
             )
@@ -1726,6 +1746,65 @@ class ServerArgs:
             type=float,
             default=ServerArgs.encoder_request_timeout_seconds,
             help="Timeout for completing an encoder request. <=0 disables it.",
+        )
+
+        # CPU compute/transfer simulation (local EPD profiling without TPU)
+        parser.add_argument(
+            "--simulate-compute",
+            action="store_true",
+            help="Replace encoder/prefill/decode forward and the Raiden embedding "
+            "transfer with a modeled time.sleep so the full EPD orchestration can "
+            "run and be profiled on CPU. All coefficients default to 0 (no added "
+            "latency); the real forward/transfer is skipped when this is set.",
+        )
+        parser.add_argument(
+            "--simulate-compute-encoder-base-ms",
+            type=float,
+            default=ServerArgs.simulate_compute_encoder_base_ms,
+            help="Fixed per-batch encoder sleep (ms) under --simulate-compute.",
+        )
+        parser.add_argument(
+            "--simulate-compute-encoder-ms-per-token",
+            type=float,
+            default=ServerArgs.simulate_compute_encoder_ms_per_token,
+            help="Encoder sleep (ms) per total placeholder token under --simulate-compute.",
+        )
+        parser.add_argument(
+            "--simulate-compute-prefill-base-ms",
+            type=float,
+            default=ServerArgs.simulate_compute_prefill_base_ms,
+            help="Fixed per-batch prefill sleep (ms) under --simulate-compute.",
+        )
+        parser.add_argument(
+            "--simulate-compute-prefill-ms-per-token",
+            type=float,
+            default=ServerArgs.simulate_compute_prefill_ms_per_token,
+            help="Prefill sleep (ms) per input token under --simulate-compute.",
+        )
+        parser.add_argument(
+            "--simulate-compute-decode-base-ms",
+            type=float,
+            default=ServerArgs.simulate_compute_decode_base_ms,
+            help="Fixed per-step decode sleep (ms) under --simulate-compute.",
+        )
+        parser.add_argument(
+            "--simulate-compute-decode-ms-per-seq",
+            type=float,
+            default=ServerArgs.simulate_compute_decode_ms_per_seq,
+            help="Decode sleep (ms) per sequence in the batch, per step, under --simulate-compute.",
+        )
+        parser.add_argument(
+            "--simulate-transfer-ms-per-mb",
+            type=float,
+            default=ServerArgs.simulate_transfer_ms_per_mb,
+            help="Embedding transfer sleep (ms) per MiB under --simulate-compute.",
+        )
+        parser.add_argument(
+            "--simulate-network-rtt-ms",
+            type=float,
+            default=ServerArgs.simulate_network_rtt_ms,
+            help="One-way network latency (ms) added to each language<->encoder "
+            "hop under --simulate-compute, to model cross-host RTT on a single box.",
         )
 
         # LoRA

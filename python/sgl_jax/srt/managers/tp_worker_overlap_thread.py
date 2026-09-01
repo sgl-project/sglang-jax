@@ -190,6 +190,10 @@ class ModelWorkerClient:
         """
         _r0 = time.perf_counter()
         _, logits_output, next_token_ids, cache_miss_count = self.output_queue.get()
+        # --simulate-compute: the worker dispatched this batch to the background
+        # device and moved on; block here (as the real device_get would) until
+        # the modeled forward completes, so host scheduling overlapped with it.
+        self.worker.model_runner.sim_wait_next_completion()
         _r1 = time.perf_counter()
         # Step 1: kick off async D2H copies for everything we need
         async_next_logprobs = (

@@ -370,6 +370,11 @@ def create_encoder_client(
     server_args,
     mesh: Any,
 ) -> EncoderClient:
+    if server_args.simulate_compute:
+        from sgl_jax.srt.disaggregation.encoder.sim_transfer import create_sim_client
+
+        return create_sim_client(server_args, mesh)
+
     from sgl_jax.srt.disaggregation.encoder.raiden import create_raiden_client
 
     return create_raiden_client(server_args, mesh)
