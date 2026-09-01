@@ -26,8 +26,10 @@ class Sampler(nnx.Module):
 
     def _greedy_sampling(self, operands):
         """Greedy sampling branch"""
-        logits, _, _ = operands
+        logits, sampling_metadata, _ = operands
         batch_next_token_ids = jnp.argmax(logits, -1).flatten()
+        if not sampling_metadata.return_logprob:
+            return batch_next_token_ids, None
         logprobs = jax.nn.log_softmax(logits, axis=-1)
         return batch_next_token_ids, logprobs
 
@@ -68,11 +70,17 @@ class Sampler(nnx.Module):
             use_sort_for_toppk_minp,
         )
 
-        log_probs = jnp.log(probs).clip(min=jnp.finfo(probs.dtype).min)
-        return (
-            jax.sharding.reshard(batch_next_token_ids, NamedSharding(self.mesh, P("data"))),
-            jax.sharding.reshard(log_probs, NamedSharding(self.mesh, P("data", "tensor"))),
+        batch_next_token_ids = jax.sharding.reshard(
+            batch_next_token_ids, NamedSharding(self.mesh, P("data"))
         )
+        if not sampling_metadata.return_logprob:
+            return batch_next_token_ids, None
+
+        log_probs = jnp.log(probs).clip(min=jnp.finfo(probs.dtype).min)
+        log_probs = jax.sharding.reshard(
+            log_probs, NamedSharding(self.mesh, P("data", "tensor"))
+        )
+        return batch_next_token_ids, log_probs
 
     def _process_logprob_results(self, operands):
         """Process logprob results when return_logprob=True"""

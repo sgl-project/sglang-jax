@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import jax
@@ -7,6 +8,29 @@ import numpy as np
 
 from sgl_jax.srt.layers import sampler as sampler_mod
 from sgl_jax.srt.layers.sampler import multinomial_with_seed
+
+
+class TestGreedySamplingLogprobs(unittest.TestCase):
+    def setUp(self):
+        self.sampler = sampler_mod.Sampler()
+        self.logits = jnp.array([[1.0, 3.0, 2.0], [4.0, 0.0, 5.0]])
+
+    def test_skips_logprobs_when_not_requested(self):
+        metadata = SimpleNamespace(return_logprob=False)
+        with mock.patch.object(
+            jax.nn, "log_softmax", side_effect=AssertionError("log_softmax must not run")
+        ):
+            token_ids, logprobs = self.sampler._greedy_sampling((self.logits, metadata, None))
+
+        np.testing.assert_array_equal(token_ids, jnp.array([1, 2]))
+        self.assertIsNone(logprobs)
+
+    def test_computes_logprobs_when_requested(self):
+        metadata = SimpleNamespace(return_logprob=True)
+        token_ids, logprobs = self.sampler._greedy_sampling((self.logits, metadata, None))
+
+        np.testing.assert_array_equal(token_ids, jnp.array([1, 2]))
+        np.testing.assert_allclose(logprobs, jax.nn.log_softmax(self.logits, axis=-1))
 
 
 class TestMultinomialWithSeed(unittest.TestCase):
