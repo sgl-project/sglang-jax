@@ -16,7 +16,6 @@ from sgl_jax.srt.configs.model_config import AttentionArch, ModelConfig, MoEBack
 from sgl_jax.srt.eplb.expert_location import ExpertLocationMetadata
 from sgl_jax.srt.layers.attention.fla.gated_rmsnorm import GatedRMSNorm
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead
-from sgl_jax.srt.layers.fused_moe import FusedEPMoE, FusedEPMoEV2
 from sgl_jax.srt.layers.gate import GateLogit, TopK
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
@@ -377,8 +376,6 @@ class BailingMoeV3DecoderLayer(nnx.Module):
             )
 
         self.is_moe_layer = layer_idx >= config.first_k_dense_replace
-        self.moe_backend = MoEBackend(getattr(config, "moe_backend", MoEBackend.EPMOE))
-        self.use_fused = self.moe_backend in (MoEBackend.FUSED, MoEBackend.FUSED_V2)
 
         if not self.is_moe_layer:
             self.mlp = BailingMoeV3MLP(
@@ -407,54 +404,28 @@ class BailingMoeV3DecoderLayer(nnx.Module):
                 mesh=mesh,
             )
 
-            if self.use_fused:
-                fused_moe_cls = (
-                    FusedEPMoEV2 if self.moe_backend == MoEBackend.FUSED_V2 else FusedEPMoE
-                )
-                self.experts = fused_moe_cls(
+            self.experts = EPMoE(
+                hidden_size=config.hidden_size,
+                num_experts=config.num_experts,
+                num_experts_per_tok=config.num_experts_per_tok,
+                intermediate_dim=config.moe_intermediate_size,
+                mesh=mesh,
+                weight_dtype=dtype,
+                dtype=dtype,
+                layer_id=layer_idx,
+                ep_size=getattr(config, "ep_size", 1),
+                quantization_config=getattr(config, "quantization_config", None),
+            )
+            if config.num_shared_experts > 0:
+                self.shared_experts = BailingMoeV3MLP(
                     hidden_size=config.hidden_size,
-                    num_experts=config.num_experts,
-                    num_experts_per_tok=config.num_experts_per_tok,
-                    intermediate_dim=config.moe_intermediate_size,
+                    intermediate_size=config.moe_shared_expert_intermediate_size
+                    * config.num_shared_experts,
                     mesh=mesh,
-                    weight_dtype=dtype,
                     dtype=dtype,
-                    layer_id=layer_idx,
-                    ep_size=getattr(config, "ep_size", 1),
-                    activation="silu",
-                    renormalize_topk_logits=config.norm_topk_prob,
-                    routed_scaling_factor=config.routed_scaling_factor,
-                    use_grouped_topk=config.n_group > 0,
-                    num_groups=config.n_group,
-                    top_k_groups=config.topk_group,
-                    num_shared_experts=config.num_shared_experts,
-                    moe_shared_expert_intermediate_size=config.moe_shared_expert_intermediate_size,
-                    quantization_config=getattr(config, "quantization_config", None),
                 )
-                self.shared_experts = None
             else:
-                self.experts = EPMoE(
-                    hidden_size=config.hidden_size,
-                    num_experts=config.num_experts,
-                    num_experts_per_tok=config.num_experts_per_tok,
-                    intermediate_dim=config.moe_intermediate_size,
-                    mesh=mesh,
-                    weight_dtype=dtype,
-                    dtype=dtype,
-                    layer_id=layer_idx,
-                    ep_size=getattr(config, "ep_size", 1),
-                    quantization_config=getattr(config, "quantization_config", None),
-                )
-                if config.num_shared_experts > 0:
-                    self.shared_experts = BailingMoeV3MLP(
-                        hidden_size=config.hidden_size,
-                        intermediate_size=config.moe_shared_expert_intermediate_size
-                        * config.num_shared_experts,
-                        mesh=mesh,
-                        dtype=dtype,
-                    )
-                else:
-                    self.shared_experts = None
+                self.shared_experts = None
 
         self.input_layernorm = RMSNorm(
             config.hidden_size,
@@ -514,9 +485,6 @@ class BailingMoeV3DecoderLayer(nnx.Module):
                 dispatch_info=dispatch_info,
                 routing_sharding=NamedSharding(self.mesh, P("data", None)),
             )
-            if self.use_fused:
-                token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
-                topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
 
             moe_kwargs = {"out_sharding": NamedSharding(self.mesh, P("data", None))}
             hidden_states = self.experts(hidden_states, topk_weights, topk_ids, **moe_kwargs)
@@ -622,6 +590,9 @@ class BailingMoeV3ForCausalLM(nnx.Module):
             )
         if config.q_lora_rank is None:
             raise ValueError("Ling-3.0-tiny requires q_lora_rank")
+        moe_backend = MoEBackend(getattr(config, "moe_backend", MoEBackend.EPMOE))
+        if moe_backend != MoEBackend.EPMOE:
+            raise ValueError("Ling-3.0-tiny currently supports only --moe-backend epmoe")
         gate_granularity = config.gated_attention_proj_granularity_type
         if gate_granularity != "head_wise":
             raise ValueError(
@@ -736,7 +707,6 @@ class BailingMoeV3ForCausalLM(nnx.Module):
 
         num_layers = self.config.num_hidden_layers
         first_k_dense_replace = self.config.first_k_dense_replace
-        moe_backend = MoEBackend(getattr(self.config, "moe_backend", MoEBackend.EPMOE))
 
         for layer_idx in range(num_layers):
             is_dense = layer_idx < first_k_dense_replace
@@ -746,15 +716,12 @@ class BailingMoeV3ForCausalLM(nnx.Module):
                     layer_idx,
                     is_dense=is_dense,
                     is_kda=is_kda,
-                    moe_backend=moe_backend,
                 )
             )
 
         return mappings
 
-    def _create_layer_mappings(
-        self, layer_idx: int, *, is_dense: bool, is_kda: bool, moe_backend: str
-    ) -> dict:
+    def _create_layer_mappings(self, layer_idx: int, *, is_dense: bool, is_kda: bool) -> dict:
         prefix = f"model.layers.{layer_idx}"
         target_prefix = f"model.layers.{layer_idx}"
         mappings: dict[str, WeightMapping] = {
@@ -888,21 +855,16 @@ class BailingMoeV3ForCausalLM(nnx.Module):
                 physical_to_logical_map = np.array(jax.device_get(metadata.physical_to_logical_map))
                 phy_to_log = physical_to_logical_map[layer_idx]
 
-            if moe_backend in (MoEBackend.FUSED, MoEBackend.FUSED_V2):
-                expert_target_map = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}
-                fused_sharding = (("data", "tensor"), None, None)
-            else:
-                expert_target_map = {"gate_proj": "wi_0", "up_proj": "wi_1", "down_proj": "wo"}
-
-            for source_name, target_name in expert_target_map.items():
-                if moe_backend == "epmoe":
-                    sharding = (
-                        ("expert", "tensor", None)
-                        if target_name == "wo"
-                        else ("expert", None, "tensor")
-                    )
-                else:
-                    sharding = fused_sharding
+            for source_name, target_name in (
+                ("gate_proj", "wi_0"),
+                ("up_proj", "wi_1"),
+                ("down_proj", "wo"),
+            ):
+                sharding = (
+                    ("expert", "tensor", None)
+                    if target_name == "wo"
+                    else ("expert", None, "tensor")
+                )
                 target_path_base = f"{target_prefix}.experts.{target_name}"
                 expert_keys = [
                     f"{prefix}.mlp.experts.{i}.{source_name}.weight"
@@ -916,30 +878,16 @@ class BailingMoeV3ForCausalLM(nnx.Module):
                 )
 
             if self.config.num_shared_experts > 0:
-                if moe_backend in (MoEBackend.FUSED, MoEBackend.FUSED_V2):
-                    for source_name, target_name in (
-                        ("gate_proj", "w1_shared"),
-                        ("up_proj", "w3_shared"),
-                        ("down_proj", "w2_shared"),
-                    ):
-                        mappings[f"{prefix}.mlp.shared_experts.{source_name}.weight"] = (
-                            WeightMapping(
-                                target_path=f"{target_prefix}.experts.{target_name}",
-                                sharding=(None, None),
-                                transpose=True,
-                            )
-                        )
-                else:
-                    for proj_name, sharding in [
-                        ("gate_proj", (None, "tensor")),
-                        ("up_proj", (None, "tensor")),
-                        ("down_proj", ("tensor", None)),
-                    ]:
-                        mappings[f"{prefix}.mlp.shared_experts.{proj_name}.weight"] = WeightMapping(
-                            target_path=f"{target_prefix}.shared_experts.{proj_name}.weight",
-                            sharding=sharding,
-                            transpose=True,
-                        )
+                for proj_name, sharding in [
+                    ("gate_proj", (None, "tensor")),
+                    ("up_proj", (None, "tensor")),
+                    ("down_proj", ("tensor", None)),
+                ]:
+                    mappings[f"{prefix}.mlp.shared_experts.{proj_name}.weight"] = WeightMapping(
+                        target_path=f"{target_prefix}.shared_experts.{proj_name}.weight",
+                        sharding=sharding,
+                        transpose=True,
+                    )
 
         return mappings
 
