@@ -1,22 +1,4 @@
-"""Ling3 (BailingMoE V3) — hybrid KDA + MLA + MoE.
-
-Layer pattern (Ling3-Tiny: 24 main layers, layer_group_size=4):
-- layer 0: dense MLP, KDA attention
-- layer i in {1..23}: MoE MLP
-  - if (i+1) % 4 == 0 → MLA attention (0-based [3,7,11,15,19,23])
-  - else              → KDA attention
-
-Ling3-Flash uses the same implementation with a six-layer group, a flat Q
-projection on MLA layers, and per-layer SwiGLU limits from its config.
-
-Reuses:
-- DeepseekV3Attention for MLA (subclassed as BailingMLA to insert head-wise gate
-  before o_proj — relies on the P1.1 _attention_core / _apply_o_proj split).
-- KimiDeltaAttention's KDA wiring as a starting point, but Ling3 has
-  no_kda_lora=True so the f_a/f_b and g_a/g_b LoRA pairs collapse into single
-  f_proj / g_proj direct projections.
-- BailingMoE-style MoE blocks: mlp.gate (GateLogit), TopK, EPMoE, shared_experts.
-"""
+"""Ling-3.0-tiny (BailingMoE V3) hybrid KDA/MLA model."""
 
 from __future__ import annotations
 
@@ -48,25 +30,15 @@ from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# MLP
-# ---------------------------------------------------------------------------
-
-
 class BailingMoeV3MLP(nnx.Module):
-    """Standard SwiGLU MLP — used both as the dense layer-0 MLP and as the
-    shared-expert path for MoE layers."""
-
     def __init__(
         self,
         hidden_size: int,
         intermediate_size: int,
         mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
-        swiglu_limit: float | None = None,
     ):
         super().__init__()
-        self.swiglu_limit = swiglu_limit
         self.gate_proj = LinearBase(
             input_size=hidden_size,
             output_size=intermediate_size,
@@ -99,33 +71,18 @@ class BailingMoeV3MLP(nnx.Module):
         gate, _ = self.gate_proj(hidden_states)
         up, _ = self.up_proj(hidden_states)
         gate = jax.nn.silu(gate)
-        if self.swiglu_limit is not None:
-            # Matches maxtext/src/MaxText/layers/linears.py:500-543:
-            # gate (post-silu) clamped single-sided, up clamped double-sided.
-            gate = jnp.clip(gate, max=self.swiglu_limit)
-            up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
         output, _ = self.down_proj(gate * up)
         return output
 
 
-# ---------------------------------------------------------------------------
-# MLA: head-wise gated o_proj
-# ---------------------------------------------------------------------------
-
-
 class BailingMLA(DeepseekV3Attention):
-    """MLA with a head-wise sigmoid gate inserted before o_proj.
-
-    Reuses parent _attention_core (Q/KV/RoPE/attn). Only _apply_o_proj is
-    overridden — multiplies the pre-o_proj tensor by sigmoid(g_proj(hidden_states))
-    broadcast over (num_heads, v_head_dim), then defers to parent o_proj.
-    """
+    """Reuse DeepSeek MLA because Ling3 only adds a gate before ``o_proj``."""
 
     def __init__(
         self,
         hidden_size: int,
         num_heads: int,
-        q_lora_rank: int | None,
+        q_lora_rank: int,
         kv_lora_rank: int,
         qk_nope_head_dim: int,
         qk_rope_head_dim: int,
@@ -157,7 +114,6 @@ class BailingMLA(DeepseekV3Attention):
             use_absorbed=use_absorbed,
             skip_rope=False,
         )
-        # Head-wise gate: hidden_size -> num_heads (one scalar gate per head).
         self.g_proj = LinearBase(
             input_size=hidden_size,
             output_size=num_heads,
@@ -168,35 +124,21 @@ class BailingMLA(DeepseekV3Attention):
             scope_name="g_proj",
         )
 
-    def _apply_o_proj(
+    def _pre_o_proj(
         self,
-        pre_o_proj: jax.Array,
+        attn_output: jax.Array,
         hidden_states: jax.Array,
     ) -> jax.Array:
         gate, _ = self.g_proj(hidden_states)
-        gate = jax.nn.sigmoid(gate.astype(jnp.float32)).astype(pre_o_proj.dtype)
-        # pre_o_proj is flat [T, num_heads * v_head_dim]; gate is [T, num_heads].
-        T = pre_o_proj.shape[0]
-        gated = pre_o_proj.reshape(T, self.num_heads, self.v_head_dim) * gate[:, :, None]
-        gated = gated.reshape(T, self.num_heads * self.v_head_dim)
-        return super()._apply_o_proj(gated, hidden_states)
-
-
-# ---------------------------------------------------------------------------
-# KDA: Kimi-style delta attention without f/g LoRA
-# ---------------------------------------------------------------------------
+        gate = jax.nn.sigmoid(gate.astype(jnp.float32)).astype(attn_output.dtype)
+        num_tokens = attn_output.shape[0]
+        gated = attn_output.reshape(num_tokens, self.num_heads, self.v_head_dim)
+        gated *= gate[:, :, None]
+        return gated.reshape(num_tokens, self.num_heads * self.v_head_dim)
 
 
 class BailingKDAAttention(nnx.Module):
-    """KDA layer for Ling3 (no_kda_lora=True).
-
-    Mirrors KimiDeltaAttention except:
-    - f_a_proj/f_b_proj collapse into a single f_proj (hidden -> projection_size).
-    - g_a_proj/g_b_proj collapse into a single g_proj (hidden -> projection_size).
-    - RadixLinearAttention is constructed with kda_lower_bound=config.kda_lower_bound
-      (=-5.0 for Ling3-Tiny) so the chunk_kda kernel and decode _fused_kda_gate
-      switch to kda_lower_bound * sigmoid(exp(A) * (g + dt_bias)).
-    """
+    """Ling3 KDA uses direct gate projections instead of Kimi's LoRA pairs."""
 
     def __init__(
         self,
@@ -229,7 +171,6 @@ class BailingKDAAttention(nnx.Module):
         self.projection_size = self.num_heads * self.head_dim
         self.rms_norm_eps = config.rms_norm_eps
 
-        # Q/K/V projections — sharded along the head axis.
         self.q_proj = LinearBase(
             input_size=self.hidden_size,
             output_size=self.projection_k_size,
@@ -258,8 +199,7 @@ class BailingKDAAttention(nnx.Module):
             scope_name="v_proj",
         )
 
-        # Short conv weight containers — never called, only their .weight.value
-        # is read by short_convolution. Layout [D, K]; D sharded on "tensor".
+        # The KDA backend reads these weights directly, so they stay live containers.
         self.q_conv1d = LinearBase(
             self.projection_k_size,
             self.conv_size,
@@ -288,7 +228,6 @@ class BailingKDAAttention(nnx.Module):
             scope_name="v_conv1d",
         )
 
-        # KDA recurrent params.
         self.A_log = nnx.Param(
             jnp.zeros(
                 (1, 1, self.num_heads, 1),
@@ -304,8 +243,6 @@ class BailingKDAAttention(nnx.Module):
             )
         )
 
-        # Decay-gate (f) and output-gate (g): direct hidden -> projection_size,
-        # NO LoRA bottleneck (no_kda_lora=True for Ling3).
         self.f_proj = LinearBase(
             input_size=self.hidden_size,
             output_size=self.projection_size,
@@ -393,15 +330,9 @@ class BailingKDAAttention(nnx.Module):
 
         output_gate, _ = self.g_proj(hidden_states)
         output_gate = output_gate.reshape(hidden_states.shape[0], self.num_heads, self.head_dim)
-        # GatedRMSNorm: RMSNorm(o) * sigmoid(output_gate).
         o = self.o_norm(o, output_gate).reshape(hidden_states.shape[0], self.projection_size)
         o, _ = self.o_proj(o)
         return o, recurrent_state_pool
-
-
-# ---------------------------------------------------------------------------
-# Decoder layer
-# ---------------------------------------------------------------------------
 
 
 class BailingMoeV3DecoderLayer(nnx.Module):
@@ -419,7 +350,6 @@ class BailingMoeV3DecoderLayer(nnx.Module):
         self.hidden_size = config.hidden_size
         self.is_kda = config.is_kda_layer(layer_idx)
 
-        # Attention
         if self.is_kda:
             self.self_attn = BailingKDAAttention(
                 config=config,
@@ -446,7 +376,6 @@ class BailingMoeV3DecoderLayer(nnx.Module):
                 use_absorbed=getattr(config, "use_absorbed_mla", True),
             )
 
-        # MLP — layer 0 dense, layers 1..23 MoE.
         self.is_moe_layer = layer_idx >= config.first_k_dense_replace
         self.moe_backend = MoEBackend(getattr(config, "moe_backend", MoEBackend.EPMOE))
         self.use_fused = self.moe_backend in (MoEBackend.FUSED, MoEBackend.FUSED_V2)
@@ -460,7 +389,6 @@ class BailingMoeV3DecoderLayer(nnx.Module):
             )
             self.moe_gate = None
         else:
-            # Router. router_dtype="fp32" so GateLogit weight/bias are fp32.
             router_dtype = jnp.float32 if config.router_dtype == "fp32" else dtype
             self.moe_gate = GateLogit(
                 input_size=config.hidden_size,
@@ -480,16 +408,6 @@ class BailingMoeV3DecoderLayer(nnx.Module):
             )
 
             if self.use_fused:
-                if self.moe_backend == MoEBackend.FUSED and (
-                    config.expert_swiglu_limit(layer_idx) is not None
-                    or config.shared_expert_swiglu_limit(layer_idx) is not None
-                ):
-                    raise NotImplementedError(
-                        f"layer {layer_idx}: FusedEPMoE path does not yet implement "
-                        "SwiGLU clamp; fused kernel folds silu*up inside its fused "
-                        "moe op. Use the EPMoE backend (default) for Flash, or "
-                        "extend fused_moe to plumb the clamp before enabling fused."
-                    )
                 fused_moe_cls = (
                     FusedEPMoEV2 if self.moe_backend == MoEBackend.FUSED_V2 else FusedEPMoE
                 )
@@ -525,7 +443,6 @@ class BailingMoeV3DecoderLayer(nnx.Module):
                     dtype=dtype,
                     layer_id=layer_idx,
                     ep_size=getattr(config, "ep_size", 1),
-                    swiglu_limit=config.expert_swiglu_limit(layer_idx),
                     quantization_config=getattr(config, "quantization_config", None),
                 )
                 if config.num_shared_experts > 0:
@@ -535,7 +452,6 @@ class BailingMoeV3DecoderLayer(nnx.Module):
                         * config.num_shared_experts,
                         mesh=mesh,
                         dtype=dtype,
-                        swiglu_limit=config.shared_expert_swiglu_limit(layer_idx),
                     )
                 else:
                     self.shared_experts = None
@@ -562,7 +478,6 @@ class BailingMoeV3DecoderLayer(nnx.Module):
         residual: jax.Array | None = None,
         dispatch_info: ExpertLocationMetadata | None = None,
     ):
-        # Pre-norm residual pattern.
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -571,7 +486,6 @@ class BailingMoeV3DecoderLayer(nnx.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
 
-        # Attention.
         if self.is_kda:
             kv_pool = memory_pools.recurrent_state_pool
         else:
@@ -583,12 +497,10 @@ class BailingMoeV3DecoderLayer(nnx.Module):
             kv_pool,
         )
 
-        # Post-attention residual + norm.
         hidden_states += residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
-        # MLP.
         if self.is_moe_layer:
             shared_output = (
                 self.shared_experts(hidden_states) if self.shared_experts is not None else None
@@ -606,14 +518,7 @@ class BailingMoeV3DecoderLayer(nnx.Module):
                 token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
                 topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
 
-            moe_kwargs = {
-                "out_sharding": NamedSharding(self.mesh, P("data", None)),
-            }
-            if self.moe_backend == MoEBackend.FUSED_V2:
-                moe_kwargs.update(
-                    swiglu_limit=self.config.expert_swiglu_limit(self.layer_idx),
-                    shared_swiglu_limit=self.config.shared_expert_swiglu_limit(self.layer_idx),
-                )
+            moe_kwargs = {"out_sharding": NamedSharding(self.mesh, P("data", None))}
             hidden_states = self.experts(hidden_states, topk_weights, topk_ids, **moe_kwargs)
             if shared_output is not None:
                 hidden_states = hidden_states + shared_output
@@ -622,11 +527,6 @@ class BailingMoeV3DecoderLayer(nnx.Module):
             topk_ids = None
 
         return hidden_states, residual, kv_fused, topk_ids
-
-
-# ---------------------------------------------------------------------------
-# Top-level model
-# ---------------------------------------------------------------------------
 
 
 class BailingMoeV3Model(nnx.Module):
@@ -703,11 +603,6 @@ class BailingMoeV3Model(nnx.Module):
         )
 
 
-# ---------------------------------------------------------------------------
-# CausalLM wrapper + weight loader
-# ---------------------------------------------------------------------------
-
-
 class BailingMoeV3ForCausalLM(nnx.Module):
     @classmethod
     def patch_model_config(cls, mc: ModelConfig) -> None:
@@ -725,10 +620,12 @@ class BailingMoeV3ForCausalLM(nnx.Module):
                 f"BailingMoeV3 requires full_attention_type='mla', got "
                 f"{config.full_attention_type!r}"
             )
+        if config.q_lora_rank is None:
+            raise ValueError("Ling-3.0-tiny requires q_lora_rank")
         gate_granularity = config.gated_attention_proj_granularity_type
-        if gate_granularity not in (None, "head_wise"):
+        if gate_granularity != "head_wise":
             raise ValueError(
-                f"BailingMoeV3 supports only head-wise MLA gating, got {gate_granularity!r}"
+                f"Ling-3.0-tiny requires head-wise MLA gating, got {gate_granularity!r}"
             )
         self.config = config
         self.mesh = mesh
@@ -768,10 +665,6 @@ class BailingMoeV3ForCausalLM(nnx.Module):
             layers_topk_ids,
         )
 
-    # -----------------------------------------------------------------
-    # Weight loading
-    # -----------------------------------------------------------------
-
     def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(
             model=self,
@@ -780,23 +673,19 @@ class BailingMoeV3ForCausalLM(nnx.Module):
             dtype=self.dtype,
         )
         weight_mappings = self._create_weight_mappings()
-        # Strictness check (per plan §2): every ckpt key must be either covered
-        # by a mapping or pruned by WeightLoader._is_excluded_layer_weight (which
-        # auto-drops layers >= num_hidden_layers — that's how MTP at layer 24
-        # gets skipped). Raise on any other unmapped key BEFORE invoking the
-        # loader so we don't silently drop weights.
         self._assert_full_ckpt_coverage(loader, weight_mappings)
         loader.load_weights_from_safetensors(weight_mappings)
         for layer in self.model.layers:
             if not layer.is_kda:
                 layer.self_attn.post_load_weights()
-        logger.info("Ling3 weights loaded successfully.")
+        logger.info("Ling-3.0-tiny weights loaded successfully.")
 
     def _assert_full_ckpt_coverage(
         self,
         loader: WeightLoader,
         weight_mappings: dict,
     ) -> None:
+        """Fail before loading because WeightLoader otherwise skips unknown keys."""
         import re
 
         ckpt_keys = set(loader._scan_weight_info().keys())
@@ -804,7 +693,6 @@ class BailingMoeV3ForCausalLM(nnx.Module):
         covered: set[str] = set()
         for mapping_key in weight_mappings:
             if mapping_key.startswith("__MOE_EXPERTS__"):
-                # Aggregated MoE entries: mapping.target_path is [target, *expert_keys].
                 m = weight_mappings[mapping_key]
                 expert_keys = m.target_path[1:] if isinstance(m.target_path, list) else []
                 covered.update(k for k in expert_keys if k in ckpt_keys)
@@ -816,7 +704,6 @@ class BailingMoeV3ForCausalLM(nnx.Module):
                 if mapping_key in ckpt_keys:
                     covered.add(mapping_key)
 
-        # Loader auto-skips ckpt keys for layers >= num_hidden_layers (MTP).
         auto_skipped = {k for k in ckpt_keys if loader._is_excluded_layer_weight(k)}
 
         unmapped = ckpt_keys - covered - auto_skipped
@@ -829,7 +716,6 @@ class BailingMoeV3ForCausalLM(nnx.Module):
 
     def _create_weight_mappings(self) -> dict:
         mappings: dict[str, WeightMapping] = {
-            # Ling3 ckpt uses model.word_embeddings.weight (NOT embed_tokens).
             "model.word_embeddings.weight": WeightMapping(
                 target_path="model.embed_tokens.embedding",
                 sharding=("tensor", None),
@@ -884,8 +770,7 @@ class BailingMoeV3ForCausalLM(nnx.Module):
             ),
         }
 
-        # ----- attention -----
-        # Ling3 ckpt uses .attention.* (NOT .self_attn.*) as the source prefix.
+        # Ling3 checkpoint and runtime use different attention prefixes.
         attn_src = f"{prefix}.attention"
         attn_target = f"{target_prefix}.self_attn"
 
@@ -907,7 +792,6 @@ class BailingMoeV3ForCausalLM(nnx.Module):
             projection_size = num_heads * head_dim
             for conv_name in ("q_conv1d", "k_conv1d", "v_conv1d"):
                 mappings[f"{attn_src}.{conv_name}.weight"] = WeightMapping(
-                    # conv1d weights live under self_attn.attn (RadixLinearAttention).
                     target_path=f"{attn_target}.attn.{conv_name}.weight",
                     sharding=("tensor", None),
                     transpose=False,
@@ -927,37 +811,24 @@ class BailingMoeV3ForCausalLM(nnx.Module):
                 target_path=f"{attn_target}.A_log",
                 sharding=(None, None, "tensor", None),
                 transpose=False,
-                # ckpt stores [H]; KDA layer expects [1, 1, H, 1] (Kimi shape).
                 reshape=(1, 1, self.config.num_attention_heads, 1),
             )
         else:
-            # MLA (Q[-LoRA] + KV-LoRA + head-wise gate).
-            # Q projection: Tiny (q_lora_rank=256) uses Q-LoRA (q_a_proj +
-            # q_a_layernorm + q_b_proj); Flash (q_lora_rank=null) uses a flat
-            # q_proj. Semantics aligned with the q-LoRA / flat-q switch in
-            # deepseek_v3.py::_create_weight_mappings.
-            if self.config.q_lora_rank is None:
-                mappings[f"{attn_src}.q_proj.weight"] = WeightMapping(
-                    target_path=f"{attn_target}.q_proj.weight",
-                    sharding=(None, "tensor"),
-                    transpose=True,
-                )
-            else:
-                mappings[f"{attn_src}.q_a_proj.weight"] = WeightMapping(
-                    target_path=f"{attn_target}.q_a_proj.weight",
-                    sharding=(None, None),
-                    transpose=True,
-                )
-                mappings[f"{attn_src}.q_a_layernorm.weight"] = WeightMapping(
-                    target_path=f"{attn_target}.q_a_layernorm.scale",
-                    sharding=(None,),
-                    transpose=False,
-                )
-                mappings[f"{attn_src}.q_b_proj.weight"] = WeightMapping(
-                    target_path=f"{attn_target}.q_b_proj.weight",
-                    sharding=(None, "tensor"),
-                    transpose=True,
-                )
+            mappings[f"{attn_src}.q_a_proj.weight"] = WeightMapping(
+                target_path=f"{attn_target}.q_a_proj.weight",
+                sharding=(None, None),
+                transpose=True,
+            )
+            mappings[f"{attn_src}.q_a_layernorm.weight"] = WeightMapping(
+                target_path=f"{attn_target}.q_a_layernorm.scale",
+                sharding=(None,),
+                transpose=False,
+            )
+            mappings[f"{attn_src}.q_b_proj.weight"] = WeightMapping(
+                target_path=f"{attn_target}.q_b_proj.weight",
+                sharding=(None, "tensor"),
+                transpose=True,
+            )
             mappings[f"{attn_src}.kv_a_proj_with_mqa.weight"] = WeightMapping(
                 target_path=f"{attn_target}.kv_a_proj.weight",
                 sharding=(None, None),
@@ -973,20 +844,17 @@ class BailingMoeV3ForCausalLM(nnx.Module):
                 sharding=(None, "tensor"),
                 transpose=True,
             )
-            # Ling3 head-wise MLA gate: ckpt [16,1536] -> JAX [1536,16].
             mappings[f"{attn_src}.g_proj.weight"] = WeightMapping(
                 target_path=f"{attn_target}.g_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             )
-            # MLA output projection: ckpt name is `dense`, our target is o_proj.
             mappings[f"{attn_src}.dense.weight"] = WeightMapping(
                 target_path=f"{attn_target}.o_proj.weight",
                 sharding=("tensor", None),
                 transpose=True,
             )
 
-        # ----- FFN -----
         if is_dense:
             for proj_name, sharding in [
                 ("gate_proj", (None, "tensor")),
@@ -999,8 +867,6 @@ class BailingMoeV3ForCausalLM(nnx.Module):
                     transpose=True,
                 )
         else:
-            # MoE — Ling3 ckpt uses mlp.gate / mlp.gate.expert_bias /
-            # mlp.experts.{i} / mlp.shared_experts.
             mappings[f"{prefix}.mlp.gate.weight"] = WeightMapping(
                 target_path=f"{target_prefix}.moe_gate.kernel",
                 sharding=(None, None),
@@ -1011,13 +877,7 @@ class BailingMoeV3ForCausalLM(nnx.Module):
                 sharding=(None,),
             )
 
-            # Routed experts. The Ling3 ckpt stores experts under `mlp.experts.{i}.{proj}.weight`,
-            # but our nnx tree exposes them as `experts.{wi_0|wi_1|wo}` (EPMoE) or
-            # `experts.{w1|w3|w2}` (FusedEPMoE). Source and target prefixes don't share
-            # the moe_path segment, so we build the __MOE_EXPERTS__ mappings manually
-            # rather than going through create_moe_weights_mapping (which assumes
-            # source_path = `{prefix}.{moe_path}.experts.{i}...` and
-            # target_path = `{target_prefix}.{moe_path}.{wi_0|...}` with the same moe_path).
+            # The generic helper assumes identical source/target MoE prefixes; Ling3 differs.
             from sgl_jax.srt.eplb.expert_location import (
                 get_global_expert_location_metadata,
             )
@@ -1055,7 +915,6 @@ class BailingMoeV3ForCausalLM(nnx.Module):
                     physical_to_logical_map=phy_to_log,
                 )
 
-            # Shared experts.
             if self.config.num_shared_experts > 0:
                 if moe_backend in (MoEBackend.FUSED, MoEBackend.FUSED_V2):
                     for source_name, target_name in (

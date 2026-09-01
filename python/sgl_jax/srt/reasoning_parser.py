@@ -300,14 +300,7 @@ class Gemma4Detector(BaseReasoningFormatDetector):
 
 
 class Ling3Detector(Glm45Detector):
-    """Detector for Ling 3 models.
-
-    Ling 3 starts generation inside a ``<think>`` block by default, uses
-    ``<tool_call>`` as an implicit reasoning terminator, and preserves an
-    unterminated reasoning-only response as normal content.  The latter
-    matches the upstream Ling 3 parser and prevents a length-truncated answer
-    from becoming an empty assistant message.
-    """
+    """Preserve unfinished reasoning so a truncated answer is not returned empty."""
 
     def __init__(self, stream_reasoning: bool = True):
         super().__init__(stream_reasoning=stream_reasoning, force_reasoning=True)

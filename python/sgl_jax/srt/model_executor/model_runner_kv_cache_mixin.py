@@ -150,9 +150,10 @@ def _enforce_recurrent_state_server_constraints(server_args, is_lightning: bool 
         "(--hicache-storage must be 'disable' for linear-recurrent models)."
     )
     if not server_args.enable_recurrent_extra_buffer:
-        assert (
-            server_args.page_size == 1
-        ), "Recurrent radix caching requires --page-size 1 unless --enable-recurrent-extra-buffer."
+        assert server_args.page_size == 1, (
+            "Recurrent radix caching requires --page-size 1 unless "
+            "--enable-recurrent-extra-buffer."
+        )
 
 
 # Fraction of a rank's recurrent slots reserved for cross-request snapshots when
@@ -292,6 +293,7 @@ def _build_non_hybrid_memory_pools(token_to_kv_pool) -> MemoryPools:
 
 
 class ModelRunnerKVCacheMixin:
+
     def _dsa_indexer_cache_params(self: ModelRunner) -> tuple[int, int]:
         """``(indexer_key_dim, num_indexer_layers)``, or ``(0, 0)`` when no DSA
         indexer key cache is allocated.

@@ -1,5 +1,3 @@
-"""Unit tests for Ling3Detector's newline-optional tool-call format."""
-
 import json
 import unittest
 

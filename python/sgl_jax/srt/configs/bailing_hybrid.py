@@ -67,8 +67,6 @@ class BailingHybridConfig(PretrainedConfig):
         no_kda_lora: bool = False,
         kda_safe_gate: bool = False,
         kda_lower_bound: float | None = None,
-        expert_swiglu_limit_list: list[float] | None = None,
-        share_expert_swiglu_limit_list: list[float] | None = None,
         num_nextn_predict_layers: int = 0,
         mtp_loss_scaling_factor: float = 0.0,
         mtp_use_kda: bool = False,
@@ -138,30 +136,19 @@ class BailingHybridConfig(PretrainedConfig):
         self.mla_use_nope = use_mla_nope
         self.gated_attention_proj_granularity_type = gated_attention_proj_granularity_type
 
-        # Ling 3 uses KDA when a short-convolution kernel is declared. Ling 2.x
-        # checkpoints omit this field and continue to use the Lightning backend.
+        # Ling 2.x omits the short-convolution field and must keep using Lightning.
         self.short_conv_kernel_size = short_conv_kernel_size
         self.use_kda = short_conv_kernel_size is not None
         self.no_kda_lora = no_kda_lora
         self.kda_safe_gate = kda_safe_gate
         self.kda_lower_bound = kda_lower_bound if kda_safe_gate else None
 
-        self.expert_swiglu_limit_list = expert_swiglu_limit_list
-        self.share_expert_swiglu_limit_list = share_expert_swiglu_limit_list
-
-        # NextN/MTP fields — base inference does not use them, but transformers'
-        # `from_dict` will fail if the keys are present in the HF config and not
-        # accepted by __init__. The model only constructs layers 0..num_hidden_layers-1.
         self.num_nextn_predict_layers = num_nextn_predict_layers
         self.mtp_loss_scaling_factor = mtp_loss_scaling_factor
         self.mtp_use_kda = mtp_use_kda
         self.initializer_range = initializer_range
         self.use_cache = use_cache
-        # NOTE: only set quantization_config when non-None. transformers'
-        # `to_diff_dict` constructs a default `__class__()` to compute the diff;
-        # in that default instance `to_dict` calls `self.quantization_config.to_dict()`
-        # without a None guard (see configuration_utils.py:961-966), so always
-        # assigning a None attribute would crash any repr / json serialization.
+        # Transformers serializes this attribute via ``to_dict`` without a None guard.
         if quantization_config is not None:
             self.quantization_config = quantization_config
 
@@ -222,7 +209,6 @@ class BailingHybridConfig(PretrainedConfig):
     def linear_attn_config(self) -> dict[str, Any]:
         return {
             "kda_layers": self.linear_layer_ids,
-            "full_attn_layers": self.full_attention_layer_ids,
             "num_heads": self.num_attention_heads,
             "head_dim": self.head_dim,
             "short_conv_kernel_size": self.short_conv_kernel_size or 1,
@@ -232,29 +218,8 @@ class BailingHybridConfig(PretrainedConfig):
     def is_mla(self) -> bool:
         return self.full_attention_type == "mla"
 
-    @property
-    def is_moe(self) -> bool:
-        return self.num_experts is not None and self.num_experts > 0
-
-    @property
-    def is_linear_attn(self) -> bool:
-        return bool(self.linear_layer_ids)
-
     def is_kda_layer(self, layer_idx: int) -> bool:
         return self.use_kda and layer_idx in self.linear_layer_ids
-
-    @staticmethod
-    def _swiglu_limit(limit_list: list[float] | None, layer_idx: int) -> float | None:
-        if limit_list is None or layer_idx < 0 or layer_idx >= len(limit_list):
-            return None
-        value = limit_list[layer_idx]
-        return value if value else None
-
-    def expert_swiglu_limit(self, layer_idx: int) -> float | None:
-        return self._swiglu_limit(self.expert_swiglu_limit_list, layer_idx)
-
-    def shared_expert_swiglu_limit(self, layer_idx: int) -> float | None:
-        return self._swiglu_limit(self.share_expert_swiglu_limit_list, layer_idx)
 
 
 def get_bailing_hybrid_config(hf_config: Any) -> BailingHybridConfig | None:
