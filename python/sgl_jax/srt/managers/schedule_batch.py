@@ -1600,7 +1600,10 @@ class ScheduleBatch:
                     continue
                 for req in info.reqs:
                     safe_offset = 1 if self.enable_overlap else 0
-                    if req.decode_batch_idx % evict_interval == safe_offset:
+                    if (
+                        req.decode_batch_idx >= safe_offset
+                        and (req.decode_batch_idx - safe_offset) % evict_interval == 0
+                    ):
                         self._evict_swa(
                             req, req.seqlen - 1, sliding_window_size, page_size, dp_rank
                         )

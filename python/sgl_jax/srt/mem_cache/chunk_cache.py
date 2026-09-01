@@ -123,6 +123,8 @@ class SWAChunkCache(ChunkCache):
     def cache_ledger_snapshot(self, dp_rank: int, live_reqs):
         full_occurrences: list[int] = []
         swa_occurrences: list[int] = []
+        mapping_pair_full_sources: list[int] = []
+        mapping_pair_swa_destinations: list[int] = []
         for req in live_reqs or ():
             if (req.dp_rank or 0) != dp_rank or req.req_pool_idx is None:
                 continue
@@ -136,16 +138,23 @@ class SWAChunkCache(ChunkCache):
                 mapped = self.token_to_kv_pool_allocator.translate_full_to_swa(
                     swa_row, dp_rank=dp_rank, require_mapped=False
                 )
-                swa_occurrences.extend(int(index) for index in mapped if int(index) != 0)
+                for source, destination in zip(swa_row, mapped):
+                    if int(destination) == 0:
+                        continue
+                    swa_occurrences.append(int(destination))
+                    mapping_pair_full_sources.append(int(source))
+                    mapping_pair_swa_destinations.append(int(destination))
         return build_swa_cache_ledger_snapshot(
             dp_rank=dp_rank,
             allocator=self.token_to_kv_pool_allocator,
-            full_tree_evictable=set(),
-            full_tree_protected=set(),
-            swa_tree_evictable=set(),
-            swa_tree_protected=set(),
+            full_tree_evictable=[],
+            full_tree_protected=[],
+            swa_tree_evictable=[],
+            swa_tree_protected=[],
             full_request_occurrences=full_occurrences,
             swa_request_occurrences=swa_occurrences,
+            mapping_pair_full_sources=mapping_pair_full_sources,
+            mapping_pair_swa_destinations=mapping_pair_swa_destinations,
             event_totals=self._ledger_event_totals.get(dp_rank, {}),
         )
 

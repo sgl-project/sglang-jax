@@ -652,8 +652,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def cache_ledger_snapshot(self, dp_rank: int, live_reqs):
         """Return a per-rank debug ownership partition (never residual math)."""
         allocator = self.token_to_kv_pool_allocator
-        full_tree_evictable, full_tree_protected = set(), set()
-        swa_tree_evictable, swa_tree_protected = set(), set()
+        full_tree_evictable, full_tree_protected = [], []
+        swa_tree_evictable, swa_tree_protected = [], []
+        mapping_pair_full_sources, mapping_pair_swa_destinations = [], []
         stack = [self.root_node]
         while stack:
             node = stack.pop()
@@ -668,12 +669,14 @@ class UnifiedRadixCache(BasePrefixCache):
                 if node.component_data[BASE_COMPONENT_TYPE].lock_ref
                 else full_tree_evictable
             )
-            target.update(int(i) for i in np.asarray(full) if int(i) != 0)
+            target.extend(int(i) for i in np.asarray(full) if int(i) != 0)
             if self.supports_swa():
                 swa_data = node.component_data[ComponentType.SWA]
                 if swa_data.value is not None:
                     target = swa_tree_protected if swa_data.lock_ref else swa_tree_evictable
-                    target.update(int(i) for i in np.asarray(swa_data.value) if int(i) != 0)
+                    target.extend(int(i) for i in np.asarray(swa_data.value) if int(i) != 0)
+                    mapping_pair_full_sources.extend(int(i) for i in np.asarray(full))
+                    mapping_pair_swa_destinations.extend(int(i) for i in np.asarray(swa_data.value))
 
         full_occurrences, swa_occurrences = [], []
         for req in live_reqs or ():
@@ -692,7 +695,13 @@ class UnifiedRadixCache(BasePrefixCache):
                     dp_rank=dp_rank,
                     require_mapped=False,
                 )
-                swa_occurrences.extend(int(i) for i in np.asarray(mapped) if int(i) != 0)
+                sources = self.req_to_token_pool.read(req.req_pool_idx, end)[swa_start:end]
+                for source, destination in zip(sources, mapped):
+                    if int(destination) == 0:
+                        continue
+                    swa_occurrences.append(int(destination))
+                    mapping_pair_full_sources.append(int(source))
+                    mapping_pair_swa_destinations.append(int(destination))
         return build_swa_cache_ledger_snapshot(
             dp_rank=dp_rank,
             allocator=allocator,
@@ -702,6 +711,8 @@ class UnifiedRadixCache(BasePrefixCache):
             swa_tree_protected=swa_tree_protected,
             full_request_occurrences=full_occurrences,
             swa_request_occurrences=swa_occurrences,
+            mapping_pair_full_sources=mapping_pair_full_sources,
+            mapping_pair_swa_destinations=mapping_pair_swa_destinations,
             event_totals=self._ledger_event_totals.get(dp_rank, {}),
         )
 

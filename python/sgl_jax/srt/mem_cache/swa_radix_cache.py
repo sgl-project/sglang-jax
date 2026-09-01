@@ -319,8 +319,9 @@ class SWARadixCache(BasePrefixCache):
 
     def cache_ledger_snapshot(self, dp_rank: int, live_reqs):
         """Per-rank tree/request ledger for the legacy hybrid fallback."""
-        full_evictable, full_protected = set(), set()
-        swa_evictable, swa_protected = set(), set()
+        full_evictable, full_protected = [], []
+        swa_evictable, swa_protected = [], []
+        mapping_pair_full_sources, mapping_pair_swa_destinations = [], []
         stack = [self.root_node]
         while stack:
             node = stack.pop()
@@ -328,12 +329,17 @@ class SWARadixCache(BasePrefixCache):
             if node is self.root_node or (node.key.dp_rank or 0) != dp_rank or node.value is None:
                 continue
             full_owners = full_protected if node.full_lock_ref else full_evictable
-            full_owners.update(int(i) for i in node.value if int(i))
+            full_owners.extend(int(i) for i in node.value if int(i))
             mapped = self.token_to_kv_pool_allocator.translate_full_to_swa(
                 node.value, dp_rank=dp_rank, require_mapped=False
             )
             swa_owners = swa_protected if node.swa_lock_ref else swa_evictable
-            swa_owners.update(int(i) for i in mapped if int(i))
+            for source, destination in zip(node.value, mapped):
+                if int(destination) == 0:
+                    continue
+                swa_owners.append(int(destination))
+                mapping_pair_full_sources.append(int(source))
+                mapping_pair_swa_destinations.append(int(destination))
         full_occurrences, swa_occurrences = [], []
         for req in live_reqs or ():
             if (req.dp_rank or 0) != dp_rank or req.req_pool_idx is None:
@@ -347,7 +353,12 @@ class SWARadixCache(BasePrefixCache):
             mapped = self.token_to_kv_pool_allocator.translate_full_to_swa(
                 row, dp_rank=dp_rank, require_mapped=False
             )
-            swa_occurrences.extend(int(i) for i in mapped if int(i))
+            for source, destination in zip(row, mapped):
+                if int(destination) == 0:
+                    continue
+                swa_occurrences.append(int(destination))
+                mapping_pair_full_sources.append(int(source))
+                mapping_pair_swa_destinations.append(int(destination))
         return build_swa_cache_ledger_snapshot(
             dp_rank=dp_rank,
             allocator=self.token_to_kv_pool_allocator,
@@ -357,6 +368,8 @@ class SWARadixCache(BasePrefixCache):
             swa_tree_protected=swa_protected,
             full_request_occurrences=full_occurrences,
             swa_request_occurrences=swa_occurrences,
+            mapping_pair_full_sources=mapping_pair_full_sources,
+            mapping_pair_swa_destinations=mapping_pair_swa_destinations,
             event_totals=self._ledger_event_totals.get(dp_rank, {}),
         )
 

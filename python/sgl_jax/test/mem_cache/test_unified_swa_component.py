@@ -221,6 +221,13 @@ _LEDGER_FIELDS = {
     "mapping_nonzero_count",
     "mapping_invalid_count",
     "mapping_duplicate_count",
+    "mapping_source_mismatch_count",
+    "mapping_owner_mismatch_count",
+    "mapping_pair_mismatch_count",
+    "full_duplicate_tree_owner_count",
+    "swa_duplicate_tree_owner_count",
+    "full_tree_bucket_overlap_count",
+    "swa_tree_bucket_overlap_count",
     "full_duplicate_request_owner_count",
     "swa_duplicate_request_owner_count",
     "full_request_tree_overlap_count",
@@ -440,6 +447,58 @@ class TestUnifiedSWAComponentPage1(unittest.TestCase):
         self.assertEqual(snapshot["mapping_nonzero_count"], 4)
         with self.assertRaisesRegex(ValueError, "swa.*balance|mapping ownership"):
             validate_swa_cache_ledger(snapshot, require_idle=True)
+
+    def test_tree_ledger_rejects_duplicate_owner_occurrences(self):
+        cache, allocator = _make_cache(window=4)
+        _insert(cache, allocator, [0, 1, 2, 3])
+        node = next(iter(cache.root_node.children.values()))
+        full = node.component_data[ComponentType.FULL]
+        swa = node.component_data[ComponentType.SWA]
+        full.value = np.append(full.value, full.value[0])
+        swa.value = np.append(swa.value, swa.value[0])
+
+        snapshot = cache.cache_ledger_snapshot(0, [])
+
+        self.assertEqual(snapshot["full_duplicate_tree_owner_count"], 1)
+        self.assertEqual(snapshot["swa_duplicate_tree_owner_count"], 1)
+        with self.assertRaisesRegex(ValueError, "duplicate_tree_owner"):
+            validate_swa_cache_ledger(snapshot, require_idle=True)
+
+    def test_tree_ledger_rejects_mapping_source_destination_and_pair_mismatches(self):
+        cache, allocator = _make_cache(window=4)
+        _insert(cache, allocator, [0, 1, 2, 3])
+        node = next(iter(cache.root_node.children.values()))
+        full = node.component_data[ComponentType.FULL].value
+        swa = node.component_data[ComponentType.SWA]
+        mapping = allocator.full_to_swa_index_mapping
+
+        swa.value = np.roll(swa.value, 1)
+        pair_snapshot = cache.cache_ledger_snapshot(0, [])
+        self.assertEqual(pair_snapshot["mapping_source_mismatch_count"], 0)
+        self.assertEqual(pair_snapshot["mapping_owner_mismatch_count"], 0)
+        self.assertEqual(pair_snapshot["mapping_pair_mismatch_count"], len(full))
+        with self.assertRaisesRegex(ValueError, "mapping_pair_mismatch_count"):
+            validate_swa_cache_ledger(pair_snapshot, require_idle=True)
+
+        swa.value = mapping[full].copy()
+        free_full = next(iter(_allocator_free_indices(allocator.full_attn_allocator, 0)))
+        mapping[free_full] = mapping[full[0]]
+        mapping[full[0]] = 0
+        source_snapshot = cache.cache_ledger_snapshot(0, [])
+        self.assertEqual(source_snapshot["mapping_source_mismatch_count"], 2)
+        with self.assertRaisesRegex(ValueError, "mapping_source_mismatch_count"):
+            validate_swa_cache_ledger(source_snapshot, require_idle=True)
+
+        cache, allocator = _make_cache(window=4)
+        _insert(cache, allocator, [0, 1, 2, 3])
+        node = next(iter(cache.root_node.children.values()))
+        swa = node.component_data[ComponentType.SWA]
+        free_swa = next(iter(_allocator_free_indices(allocator.swa_attn_allocator, 0)))
+        swa.value[0] = free_swa
+        owner_snapshot = cache.cache_ledger_snapshot(0, [])
+        self.assertEqual(owner_snapshot["mapping_owner_mismatch_count"], 2)
+        with self.assertRaisesRegex(ValueError, "mapping_owner_mismatch_count"):
+            validate_swa_cache_ledger(owner_snapshot, require_idle=True)
 
     def test_request_tail_reclaim_preserves_each_route_live_window(self):
         for kind in ("unified", "legacy", "chunk"):

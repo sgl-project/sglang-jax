@@ -46,6 +46,13 @@ def _empty_ledger(*, full_capacity=8, swa_capacity=8):
         "mapping_nonzero_count": 0,
         "mapping_invalid_count": 0,
         "mapping_duplicate_count": 0,
+        "mapping_source_mismatch_count": 0,
+        "mapping_owner_mismatch_count": 0,
+        "mapping_pair_mismatch_count": 0,
+        "full_duplicate_tree_owner_count": 0,
+        "swa_duplicate_tree_owner_count": 0,
+        "full_tree_bucket_overlap_count": 0,
+        "swa_tree_bucket_overlap_count": 0,
         "full_duplicate_request_owner_count": 0,
         "swa_duplicate_request_owner_count": 0,
         "full_request_tree_overlap_count": 0,
@@ -255,6 +262,13 @@ def test_idle_flush_validates_before_mutation_then_resets_and_post_validates():
         (False, "swa_request_tree_overlap_count", "swa_request_tree_overlap_count"),
         (False, "mapping_invalid_count", "mapping_invalid_count"),
         (False, "mapping_duplicate_count", "mapping_duplicate_count"),
+        (False, "mapping_source_mismatch_count", "mapping_source_mismatch_count"),
+        (False, "mapping_owner_mismatch_count", "mapping_owner_mismatch_count"),
+        (False, "mapping_pair_mismatch_count", "mapping_pair_mismatch_count"),
+        (False, "full_duplicate_tree_owner_count", "full_duplicate_tree_owner_count"),
+        (False, "swa_duplicate_tree_owner_count", "swa_duplicate_tree_owner_count"),
+        (False, "full_tree_bucket_overlap_count", "full_tree_bucket_overlap_count"),
+        (False, "swa_tree_bucket_overlap_count", "swa_tree_bucket_overlap_count"),
     ],
 )
 def test_idle_flush_rejects_invalid_preledger_before_mutation(invalid_pre, invalid_field, message):
@@ -377,6 +391,35 @@ def test_maybe_evict_swa_delegates_request_tail_reclaim_to_cache():
     ScheduleBatch.maybe_evict_swa(batch)
 
     assert calls == [("r", 15, 1)]
+
+
+def test_overlap_interval_one_reclaims_after_safe_decode_offset():
+    calls = []
+    req = SimpleNamespace(rid="r", decode_batch_idx=0, seqlen=8)
+    tree = SimpleNamespace(
+        supports_swa=lambda: True,
+        evict_req_swa=lambda req, pre_len, dp_rank=0: calls.append(
+            (req.decode_batch_idx, pre_len, dp_rank)
+        ),
+    )
+    batch = SimpleNamespace(
+        is_hybrid=True,
+        model_config=SimpleNamespace(sliding_window=1),
+        token_to_kv_pool_allocator=SimpleNamespace(page_size=1),
+        forward_mode=SimpleNamespace(is_decode=lambda: True),
+        reqs_info=[SimpleNamespace(reqs=[req])],
+        tree_cache=tree,
+        enable_overlap=True,
+    )
+    batch._evict_swa = lambda req, pre_len, window, page, dp_rank=0: (
+        ScheduleBatch._evict_swa(batch, req, pre_len, window, page, dp_rank)
+    )
+
+    ScheduleBatch.maybe_evict_swa(batch)
+    req.decode_batch_idx = 1
+    ScheduleBatch.maybe_evict_swa(batch)
+
+    assert calls == [(1, 7, 0)]
 
 
 def test_swa_size_accessors_accept_dp_rank():

@@ -221,12 +221,14 @@ def build_swa_cache_ledger_snapshot(
     *,
     dp_rank: int,
     allocator: Any,
-    full_tree_evictable: set[int],
-    full_tree_protected: set[int],
-    swa_tree_evictable: set[int],
-    swa_tree_protected: set[int],
+    full_tree_evictable: list[int],
+    full_tree_protected: list[int],
+    swa_tree_evictable: list[int],
+    swa_tree_protected: list[int],
     full_request_occurrences: list[int],
     swa_request_occurrences: list[int],
+    mapping_pair_full_sources: list[int],
+    mapping_pair_swa_destinations: list[int],
     event_totals: dict[str, int],
 ) -> dict[str, int]:
     """Build the common debug-only SWA ownership schema from real owners."""
@@ -243,6 +245,14 @@ def build_swa_cache_ledger_snapshot(
         reserved_pages = {index // allocator.page_size for index in owned}
         return len(reserved_pages) * allocator.page_size - len(owned)
 
+    full_tree_evictable_occurrences = list(full_tree_evictable)
+    full_tree_protected_occurrences = list(full_tree_protected)
+    swa_tree_evictable_occurrences = list(swa_tree_evictable)
+    swa_tree_protected_occurrences = list(swa_tree_protected)
+    full_tree_evictable = set(full_tree_evictable_occurrences)
+    full_tree_protected = set(full_tree_protected_occurrences)
+    swa_tree_evictable = set(swa_tree_evictable_occurrences)
+    swa_tree_protected = set(swa_tree_protected_occurrences)
     full_request = set(full_request_occurrences)
     swa_request = set(swa_request_occurrences)
     full_capacity = usable_capacity(allocator.full_attn_allocator)
@@ -258,6 +268,17 @@ def build_swa_cache_ledger_snapshot(
     mapping_array = np.asarray(mapping)
     nonzero_sources = np.flatnonzero(mapping_array)
     nonzero = mapping_array[nonzero_sources]
+    mapping_sources = set(map(int, nonzero_sources))
+    mapping_destinations = set(map(int, nonzero))
+    owner_sources = set(mapping_pair_full_sources)
+    owner_destinations = swa_tree_evictable | swa_tree_protected | swa_request
+    mapping_pair_mismatch_count = abs(
+        len(mapping_pair_full_sources) - len(mapping_pair_swa_destinations)
+    )
+    for source, destination in zip(mapping_pair_full_sources, mapping_pair_swa_destinations):
+        mapping_pair_mismatch_count += int(
+            source < 0 or source >= len(mapping_array) or int(mapping_array[source]) != destination
+        )
     last_usable_full = first_usable + full_capacity - 1
     last_usable_swa = first_usable + swa_capacity - 1
 
@@ -289,6 +310,23 @@ def build_swa_cache_ledger_snapshot(
             ).sum()
         ),
         "mapping_duplicate_count": int(len(nonzero) - len(set(map(int, nonzero)))),
+        "mapping_source_mismatch_count": len(mapping_sources ^ owner_sources),
+        "mapping_owner_mismatch_count": len(mapping_destinations ^ owner_destinations),
+        "mapping_pair_mismatch_count": mapping_pair_mismatch_count,
+        "full_duplicate_tree_owner_count": (
+            len(full_tree_evictable_occurrences)
+            - len(full_tree_evictable)
+            + len(full_tree_protected_occurrences)
+            - len(full_tree_protected)
+        ),
+        "swa_duplicate_tree_owner_count": (
+            len(swa_tree_evictable_occurrences)
+            - len(swa_tree_evictable)
+            + len(swa_tree_protected_occurrences)
+            - len(swa_tree_protected)
+        ),
+        "full_tree_bucket_overlap_count": len(full_tree_evictable & full_tree_protected),
+        "swa_tree_bucket_overlap_count": len(swa_tree_evictable & swa_tree_protected),
         "full_duplicate_request_owner_count": len(full_request_occurrences) - len(full_request),
         "swa_duplicate_request_owner_count": len(swa_request_occurrences) - len(swa_request),
         "full_request_tree_overlap_count": len(
@@ -331,6 +369,13 @@ def validate_swa_cache_ledger(snapshot: dict[str, int], *, require_idle: bool) -
     for field in (
         "mapping_invalid_count",
         "mapping_duplicate_count",
+        "mapping_source_mismatch_count",
+        "mapping_owner_mismatch_count",
+        "mapping_pair_mismatch_count",
+        "full_duplicate_tree_owner_count",
+        "swa_duplicate_tree_owner_count",
+        "full_tree_bucket_overlap_count",
+        "swa_tree_bucket_overlap_count",
         "full_duplicate_request_owner_count",
         "swa_duplicate_request_owner_count",
         "full_request_tree_overlap_count",
