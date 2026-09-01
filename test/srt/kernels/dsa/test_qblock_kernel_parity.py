@@ -315,3 +315,61 @@ def test_ragged_qblock_vs_deployed(seq_lens_list, qb):
     print(f"[ragged qblock qb={qb}] |o_qb-o_cur|={d_o:.3e} |cache diff|={d_c:.3e}")
     assert d_c == 0.0, "self-write must be identical"
     assert d_o < 2e-3, f"ragged qblock vs deployed ragged drifted: {d_o}"
+
+
+# ── argument validation: ragged page-size guard, u_max truncation warning ───
+
+
+def test_ragged_rejects_non16_page_size():
+    # RB == page_size == 24 passes the equality check but must hit the %16
+    # guard (same contract as the per-query paged kernel) before any layout
+    # work — the arrays are never touched, so dummies suffice.
+    S = 8
+    q = jnp.zeros((1, S, 2, 576), jnp.float32)
+    kv = jnp.zeros((4, 24, 1, _DK_PAD), jnp.float32)
+    idx = jnp.full((1, S, 2), -1, jnp.int32)
+    pos = jnp.zeros((1, S), jnp.int32)
+    with pytest.raises(ValueError, match="read_block % 16 == 0"):
+        sparse_mla_attention_qblock(
+            q,
+            kv,
+            idx,
+            pos,
+            read_block=24,
+            sm_scale=_SC,
+            page_size=24,
+            q_seq_id=jnp.zeros((S,), jnp.int32),
+            seq_lens=jnp.asarray([S], jnp.int32),
+            cu_kv_lens=jnp.asarray([0, 96], jnp.int32),
+            page_indices=jnp.asarray([0, 1, 2, 3], jnp.int32),
+        )
+
+
+def test_umax_reduced_warns_once(caplog):
+    # explicit u_max below the lossless bound min(QB*K, num_units) must log a
+    # one-time warning; the default (None) must stay silent.
+    qb_mod._warn_umax_truncation.cache_clear()
+    c = _make_case(B=1, S=64, H=4, K=2, pages=4, seed=5)
+    common = dict(
+        kv_lora_rank=c["kv_lora_rank"],
+        read_block=c["page_size"],
+        query_block=64,
+        sm_scale=c["sm_scale"],
+        interpret=True,
+    )
+    with caplog.at_level("WARNING", logger=qb_mod.__name__):
+        sparse_mla_attention_qblock(
+            c["q"], c["kv"], c["indices"], c["positions"], u_max=3, **common
+        )
+        sparse_mla_attention_qblock(
+            c["q"], c["kv"], c["indices"], c["positions"], u_max=3, **common
+        )
+    hits = [r for r in caplog.records if "u_max" in r.getMessage()]
+    assert len(hits) == 1, f"expected exactly one truncation warning, got {len(hits)}"
+
+    caplog.clear()
+    with caplog.at_level("WARNING", logger=qb_mod.__name__):
+        sparse_mla_attention_qblock(c["q"], c["kv"], c["indices"], c["positions"], **common)
+    assert not [
+        r for r in caplog.records if "u_max" in r.getMessage()
+    ], "default u_max must not warn"

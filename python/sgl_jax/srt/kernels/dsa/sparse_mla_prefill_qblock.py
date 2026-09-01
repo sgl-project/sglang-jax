@@ -32,15 +32,31 @@ Implementation notes (each earned on the TPU):
 from __future__ import annotations
 
 import functools
+import logging
 
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+logger = logging.getLogger(__name__)
+
 _SENTINEL = jnp.iinfo(jnp.int32).max
 
 _NBUF = 4  # DMA ring depth (prefetch distance)
+
+
+@functools.cache
+def _warn_umax_truncation(u_max: int, u_safe: int) -> None:
+    # functools.cache => one warning per distinct (u_max, u_safe), not per trace
+    logger.warning(
+        "sparse_mla_attention_qblock: u_max=%d < %d (the lossless bound "
+        "min(query_block*K, num_units)); blocks whose selected-page union "
+        "exceeds the cap silently drop the tail of the union, so outputs may "
+        "lose accuracy vs the per-query kernel.",
+        u_max,
+        u_safe,
+    )
 
 
 def build_block_unit_tables(
@@ -259,7 +275,15 @@ def sparse_mla_attention_qblock(
     * ragged (``q_seq_id`` set): ``kv`` is the packed 4D paged MLA cache and
       ``indices`` are **seq-local page ids** (as produced by the indexer);
       they are lifted to global page-table keys here. Requires
-      ``read_block == page_size`` and ``B == 1``.
+      ``read_block == page_size`` (``% 16 == 0``) and ``B == 1``.
+
+    ``u_max`` caps the per-block union table. The default,
+    ``min(query_block * K, num_units)``, makes overflow impossible and is
+    lossless. An explicitly smaller cap trades accuracy for preprocessing
+    footprint: a block whose true union exceeds it has the tail of its sorted
+    union silently dropped (those keys are never attended), so outputs may
+    diverge from :func:`sparse_mla_prefill.sparse_mla_attention`. A one-time
+    warning is logged when such a cap is in effect.
     """
     B, S, H, Dk = q.shape
     K = indices.shape[2]
@@ -274,6 +298,14 @@ def sparse_mla_attention_qblock(
             raise ValueError("ragged mode requires seq_lens, cu_kv_lens and page_indices")
         if page_size is None or page_size != RB:
             raise ValueError("qblock ragged mode requires read_block == page_size")
+        if RB % 16 != 0:
+            # same contract as the per-query paged kernel: _copy resolves the
+            # page start as (PS//8)*8 and reads RBF = align_up(RB, 16) rows, so
+            # a non-%16 page size would offset wrong / cross a page silently.
+            raise ValueError(
+                f"qblock ragged mode requires read_block % 16 == 0 (got {RB}): "
+                "exact PS//8 sublane offset, no cross-page over-fetch"
+            )
 
     Dk_pad = ((Dk + 127) // 128) * 128
     RBF = ((RB + 15) // 16) * 16
@@ -305,8 +337,11 @@ def sparse_mla_attention_qblock(
         kv2 = jnp.pad(kv, ((0, 0), (0, RBF), (0, Dk_pad - Dk)))
         pt_arg = jnp.zeros((B, 1, 1, 1), jnp.int32)
 
+    u_safe = min(QB * K, num_units)
     if u_max is None:
-        u_max = min(QB * K, num_units)
+        u_max = u_safe
+    elif u_max < u_safe:
+        _warn_umax_truncation(u_max, u_safe)
 
     # ── preprocessing (jnp, outside the kernel) ────────────────────────────
     blk_u, blk_m, blk_c = jax.vmap(
