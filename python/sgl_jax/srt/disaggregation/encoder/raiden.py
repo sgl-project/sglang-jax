@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import logging
 from collections.abc import Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -78,13 +78,33 @@ class RaidenEncoderServerTransfer:
         self._timeout_s = float(timeout_s)
         self._poll_interval_s = float(poll_interval_s)
         self._sessions: dict[str, RaidenTransferWrapper] = {}
+        self._preparing: set[str] = set()
+        self._executor = ThreadPoolExecutor(max_workers=self._parallelism)
 
-    def publish(self, transfer_id: str, embedding: jax.Array) -> dict[str, Any]:
-        if transfer_id in self._sessions:
+    async def publish(self, transfer_id: str, embedding: jax.Array) -> dict[str, Any]:
+        if transfer_id in self._sessions or transfer_id in self._preparing:
             raise ValueError(f"duplicate Raiden transfer_id: {transfer_id}")
         if embedding.ndim != 2 or embedding.shape[0] <= 0:
             raise ValueError("Raiden embedding must be a non-empty matrix")
 
+        self._preparing.add(transfer_id)
+        try:
+            session, metadata = await asyncio.get_running_loop().run_in_executor(
+                self._executor,
+                self._prepare,
+                transfer_id,
+                embedding,
+            )
+        finally:
+            self._preparing.discard(transfer_id)
+        self._sessions[transfer_id] = session
+        return metadata
+
+    def _prepare(
+        self,
+        transfer_id: str,
+        embedding: jax.Array,
+    ) -> tuple[RaidenTransferWrapper, dict[str, Any]]:
         # Treat one embedding as one physical major slice. The leading transfer
         # axis makes TPU tile padding part of the slice instead of row stride.
         buffer = embedding[jnp.newaxis, ...]
@@ -103,14 +123,16 @@ class RaidenEncoderServerTransfer:
         )
         if not session.register_read(transfer_id, transfer_uuid, block_ids):
             raise RuntimeError(f"Raiden rejected encoder transfer {transfer_id!r}")
-        self._sessions[transfer_id] = session
-        return {
-            "transfer_id": transfer_id,
-            "transfer_uuid": transfer_uuid,
-            "transfer_address": session.endpoints,
-            "transfer_host": self._host_ip,
-            "transfer_block_ids": block_ids,
-        }
+        return (
+            session,
+            {
+                "transfer_id": transfer_id,
+                "transfer_uuid": transfer_uuid,
+                "transfer_address": session.endpoints,
+                "transfer_host": self._host_ip,
+                "transfer_block_ids": block_ids,
+            },
+        )
 
     async def release_completed(self) -> None:
         while True:
@@ -130,6 +152,7 @@ class RaidenEncoderServerTransfer:
 
     def close(self) -> None:
         self._sessions.clear()
+        self._executor.shutdown(cancel_futures=True)
 
 
 @dataclass(slots=True)
@@ -152,6 +175,40 @@ class RaidenReceiveSession:
         return None
 
 
+class DeferredRaidenReceiveSession:
+    """Expose a non-blocking session while Raiden setup runs off-loop."""
+
+    def __init__(self, future: Future[RaidenReceiveSession]) -> None:
+        self._future = future
+        self._session: RaidenReceiveSession | None = None
+        self._closed = False
+
+    def poll(self) -> jax.Array | None:
+        if self._closed:
+            return None
+        if self._session is None:
+            if not self._future.done():
+                return None
+            self._session = self._future.result()
+        return self._session.poll()
+
+    def close(self) -> None:
+        self._closed = True
+        if self._session is not None:
+            self._session.close()
+        elif not self._future.cancel():
+            self._future.add_done_callback(self._close_session)
+
+    @staticmethod
+    def _close_session(future: Future[RaidenReceiveSession]) -> None:
+        if future.cancelled():
+            return
+        try:
+            future.result().close()
+        except Exception:
+            logger.exception("Deferred Raiden receiver setup failed during cleanup")
+
+
 class RaidenReceiverBackend:
     def __init__(
         self,
@@ -164,8 +221,14 @@ class RaidenReceiverBackend:
         self._sharding = sharding
         self._parallelism = max(1, int(parallelism))
         self._transfer_timeout_s = float(transfer_timeout_s)
+        # Receiver setup contends on JAX/Raiden initialization. Serialize it
+        # off-loop while keeping Raiden's data-plane parallelism unchanged.
+        self._executor = ThreadPoolExecutor(max_workers=1)
 
-    def start(self, data: EmbeddingData) -> RaidenReceiveSession:
+    def start(self, data: EmbeddingData) -> DeferredRaidenReceiveSession:
+        return DeferredRaidenReceiveSession(self._executor.submit(self._start, data))
+
+    def _start(self, data: EmbeddingData) -> RaidenReceiveSession:
         if data.shape is None or data.dtype is None:
             raise ValueError("embedding shape and dtype are required")
         shape = tuple(int(dim) for dim in data.shape)
@@ -217,7 +280,7 @@ class RaidenReceiverBackend:
         return RaidenReceiveSession(transfer_id, buffer, transfer)
 
     def close(self) -> None:
-        return None
+        self._executor.shutdown(cancel_futures=True)
 
 
 RaidenEncoderClient = EncoderClient

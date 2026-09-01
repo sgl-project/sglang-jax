@@ -88,38 +88,21 @@ def plan_encoder_registrations(
 def register_scheduler_receivers(
     registrations: list[tuple[str, str, Modality | None]],
     receive_url: str,
-    timeout: float | None,
+    client: httpx.Client,
 ) -> None:
-    async def register() -> None:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-
-            async def register_one(
-                encoder_url: str,
-                req_id: str,
-                modality: Modality | None,
-            ) -> None:
-                payload = {
-                    "req_id": req_id,
-                    "receive_count": 1,
-                    "receive_url": receive_url,
-                }
-                if modality is not None:
-                    payload["modality"] = modality.name
-                response = await client.post(
-                    f"{encoder_url.rstrip('/')}/scheduler_receive_url",
-                    json=payload,
-                )
-                response.raise_for_status()
-
-            results = await asyncio.gather(
-                *(register_one(*registration) for registration in registrations),
-                return_exceptions=True,
-            )
-            for result in results:
-                if isinstance(result, Exception):
-                    raise result
-
-    asyncio.run(register())
+    for encoder_url, req_id, modality in registrations:
+        payload = {
+            "req_id": req_id,
+            "receive_count": 1,
+            "receive_url": receive_url,
+        }
+        if modality is not None:
+            payload["modality"] = modality.name
+        response = client.post(
+            f"{encoder_url.rstrip('/')}/scheduler_receive_url",
+            json=payload,
+        )
+        response.raise_for_status()
 
 
 def validate_encoder_response(
@@ -231,7 +214,7 @@ class EncoderClient:
         self._backend = backend
         self._encoder_urls = list(encoder_urls)
         self._executor = executor
-        self._registration_timeout = registration_timeout
+        self._registration_client = httpx.Client(timeout=registration_timeout)
 
     def receive(self, request: TokenizedGenerateReqInput) -> PendingEncoderRequest:
         registrations = plan_encoder_registrations(request, self._encoder_urls)
@@ -245,7 +228,7 @@ class EncoderClient:
                 register_scheduler_receivers,
                 registrations,
                 receive_url,
-                self._registration_timeout,
+                self._registration_client,
             )
         except Exception:
             receiver.close()
@@ -261,7 +244,8 @@ class EncoderClient:
 
     def close(self) -> None:
         self._backend.close()
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._executor.shutdown(cancel_futures=True)
+        self._registration_client.close()
 
 
 class EncoderRequestDispatcher:

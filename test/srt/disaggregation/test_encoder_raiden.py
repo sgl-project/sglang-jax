@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from concurrent.futures import Future
 from typing import ClassVar
 from unittest import mock
@@ -18,6 +19,7 @@ from sgl_jax.srt.disaggregation.encoder.embedding_data import (
     MultiModalEmbeddingData,
 )
 from sgl_jax.srt.disaggregation.encoder.raiden import (
+    DeferredRaidenReceiveSession,
     RaidenEncoderServerTransfer,
     RaidenReceiverBackend,
     RaidenReceiveSession,
@@ -36,6 +38,7 @@ def _pretend_raiden_is_preloaded(monkeypatch):
 
 class _FakeRaidenWrapper:
     instances: ClassVar[list[_FakeRaidenWrapper]] = []
+    start_barrier: ClassVar[threading.Barrier | None] = None
 
     def __init__(self, host: str, port: int, *, parallelism: int) -> None:
         self.host = host
@@ -49,6 +52,8 @@ class _FakeRaidenWrapper:
         self.instances.append(self)
 
     def start(self, buffers, **kwargs) -> None:
+        if self.start_barrier is not None:
+            self.start_barrier.wait(timeout=1)
         self.started = (buffers, kwargs)
 
     def register_read(self, *args) -> bool:
@@ -92,7 +97,7 @@ def test_raiden_server_binds_the_produced_embedding(monkeypatch):
     )
     embedding = jnp.arange(12, dtype=jnp.float32).reshape(4, 3)
 
-    metadata = transfer.publish("part-0:embedding", embedding)
+    metadata = asyncio.run(transfer.publish("part-0:embedding", embedding))
 
     session = _FakeRaidenWrapper.instances[0]
     buffers, options = session.started
@@ -107,6 +112,31 @@ def test_raiden_server_binds_the_produced_embedding(monkeypatch):
     )
     assert metadata["transfer_address"] == session.endpoints
     assert metadata["transfer_host"] == "10.0.0.4"
+    transfer.close()
+
+
+def test_raiden_server_prepares_batch_transfers_concurrently(monkeypatch):
+    _FakeRaidenWrapper.instances.clear()
+    _FakeRaidenWrapper.start_barrier = threading.Barrier(2)
+    monkeypatch.setattr(
+        "sgl_jax.srt.disaggregation.encoder.raiden.RaidenTransferWrapper",
+        _FakeRaidenWrapper,
+    )
+    transfer = RaidenEncoderServerTransfer("10.0.0.4", parallelism=2)
+
+    async def publish_batch() -> None:
+        await asyncio.gather(
+            transfer.publish("part-0:embedding", jnp.zeros((2, 3))),
+            transfer.publish("part-1:embedding", jnp.zeros((2, 3))),
+        )
+
+    try:
+        asyncio.run(publish_batch())
+    finally:
+        _FakeRaidenWrapper.start_barrier = None
+        transfer.close()
+
+    assert len(_FakeRaidenWrapper.instances) == 2
 
 
 def test_raiden_server_reaps_completed_sender(monkeypatch):
@@ -116,7 +146,7 @@ def test_raiden_server_reaps_completed_sender(monkeypatch):
         _FakeRaidenWrapper,
     )
     transfer = RaidenEncoderServerTransfer("10.0.0.4")
-    transfer.publish("part-0:embedding", jnp.zeros((2, 3)))
+    asyncio.run(transfer.publish("part-0:embedding", jnp.zeros((2, 3))))
     _FakeRaidenWrapper.instances[0].stats = (["part-0:embedding"], [], [])
 
     async def stop_after_poll(_delay):
@@ -130,6 +160,7 @@ def test_raiden_server_reaps_completed_sender(monkeypatch):
         asyncio.run(transfer.release_completed())
 
     assert not transfer._sessions
+    transfer.close()
 
 
 def test_raiden_request_receives_into_matching_jax_buffer(monkeypatch):
@@ -177,8 +208,9 @@ def test_raiden_request_receives_into_matching_jax_buffer(monkeypatch):
     assert buffers[0].shape == (1, 2, 3)
     assert buffers[0].dtype == jnp.float32
     receive_session = request.sessions[0][1]
-    assert isinstance(receive_session, RaidenReceiveSession)
-    assert receive_session.buffer.shape == (1, 2, 3)
+    assert isinstance(receive_session, DeferredRaidenReceiveSession)
+    session = receive_session._future.result(timeout=1)
+    assert session.buffer.shape == (1, 2, 3)
     assert options == {"max_blocks": 1, "num_slots": 1, "timeout_s": 30.0}
     assert session.read == (
         "part-0:embedding",
@@ -193,6 +225,7 @@ def test_raiden_request_receives_into_matching_jax_buffer(monkeypatch):
 
     np.testing.assert_array_equal(result["embeddings"][Modality.IMAGE], np.zeros((2, 3)))
     request.close()
+    backend.close()
     assert receiver.closed
 
 

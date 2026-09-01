@@ -43,7 +43,7 @@ class PublishedEmbedding:
 
 
 class EncoderServerTransfer(Protocol):
-    def publish(self, transfer_id: str, embedding: jax.Array) -> dict[str, Any]: ...
+    async def publish(self, transfer_id: str, embedding: jax.Array) -> dict[str, Any]: ...
 
     async def release_completed(self) -> None: ...
 
@@ -215,19 +215,23 @@ class EncoderRuntime:
                     pending.future.set_exception(exc)
             return
 
-        for pending, result in zip(pending_requests, results):
-            if pending.future.done():
-                continue
-            try:
-                published = self._publish_result(pending.request, *result)
-            except Exception as exc:
-                pending.future.set_exception(exc)
+        published = await asyncio.gather(
+            *(
+                self._publish_result(pending.request, *result)
+                for pending, result in zip(pending_requests, results)
+            ),
+            return_exceptions=True,
+        )
+        for pending, result in zip(pending_requests, published):
+            if isinstance(result, Exception):
+                if not pending.future.done():
+                    pending.future.set_exception(result)
                 continue
 
             if pending.future.done():
-                self._transfer.release(published.transfer_id)
+                self._transfer.release(result.transfer_id)
                 continue
-            pending.future.set_result(published)
+            pending.future.set_result(result)
 
     async def _encode_batch(self, requests: list[dict[str, Any]]) -> list[EncodeResult]:
         results = await self._batch_encode_fn(requests)
@@ -246,7 +250,7 @@ class EncoderRuntime:
             )
         return results
 
-    def _publish_result(
+    async def _publish_result(
         self,
         request: dict[str, Any],
         embedding: jax.Array,
@@ -256,7 +260,7 @@ class EncoderRuntime:
         modality = Modality.from_str(request["modality"])
 
         transfer_id = f"{req_id}:{request.get('part_idx', 0)}:embedding"
-        transfer_metadata = self._transfer.publish(transfer_id, embedding)
+        transfer_metadata = await self._transfer.publish(transfer_id, embedding)
 
         metadata = dict(metadata)
         data = EmbeddingData(
