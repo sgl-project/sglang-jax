@@ -6,7 +6,7 @@ title: "TPU Resources Guide"
 
 Use this page as the cookbook-local pointer for TPU provisioning notes referenced by topology and SkyPilot guidance.
 
-For cookbook sizing math, start with [TPU topology reference](/base/tpu-topology-reference). Recipes list only topologies that have been validated or partially validated.
+For cookbook sizing math, start with [TPU topology reference](../base/tpu-topology-reference.md). Recipes list only topologies that have been validated or partially validated.
 
 When provisioning TPU resources:
 

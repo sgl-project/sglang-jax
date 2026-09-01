@@ -35,11 +35,11 @@ title: "Qwen3"
 | Qwen3-8B | **v6e-4** | 2x2 | 4 | 4 | This is the slice we measured on. Single host; ~16 GB BF16 weights. |
 | Qwen3-32B | **v6e-4** | 2x2 | 4 | 4 | This is the slice we measured on. Single host; ~64 GB BF16 weights — fits with `--mem-fraction-static 0.8`. |
 
-Both v6e rows fit on a single v6e-4 host with `bfloat16`; the v7x row uses one 4-chip v7x slice. See [TPU topology reference](/base/tpu-topology-reference) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](/base/tpu-topology-reference#adapting-to-other-topologies).
+Both v6e rows fit on a single v6e-4 host with `bfloat16`; the v7x row uses one 4-chip v7x slice. See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
 
 ### 2.2 Environment
 
-Install per [Install guide](/get_started/install) and use [Single-host Docker template](/deployment/single-host-docker) for the container setup.
+Install per [Install guide](../../get_started/install.md) and use [Single-host Docker template](../../deployment/single-host-docker.md) for the container setup.
 
 ### 2.3 Launch
 
@@ -81,13 +81,13 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python3 -u -m sgl_jax.launch_server \
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min while XLA/Pallas re-compiles.
 - The cache keys on full kernel shape: changing `--page-size`, `--tp-size`, `--chunked-prefill-size`, or `--context-length` invalidates cached entries.
 
-For full flag definitions and defaults see [Launch flags reference](/base/launch-flags-reference).
+For full flag definitions and defaults see [Launch flags reference](../../base/launch-flags-reference.md).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-For full cURL + native `/generate` patterns see [Basic API usage](/base/basic-api-usage). For thinking + content streaming see §3.2, for tool calling see §3.3.
+For full cURL + native `/generate` patterns see [Basic API usage](../../base/basic-api-usage.md). For thinking + content streaming see §3.2, for tool calling see §3.3.
 
 Short Python OpenAI client example (thinking-off baseline):
 
@@ -318,7 +318,7 @@ To see the full set of `--tool-call-parser` keys available in your build, run `p
 | Tensor Parallelism | 4 |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3 Single-host](/autoregressive/Qwen/Qwen3#2-3-launch).
+**Deployment Command** — same as [§2.3 Single-host](../../autoregressive/Qwen/Qwen3.md#2-3-launch).
 
 **Benchmark Command**
 
@@ -414,7 +414,7 @@ PYTHONPATH=/tmp/sglang-jax/python python -m sgl_jax.bench_serving \
 
 Methodology: TTFT measured at `output_len=1` to isolate first-token latency; ITL / throughput measured at `output_len=1024`. Workload sweeps input lengths 1024 / 4096 / 8192 tokens × output lengths 1 / 1024 tokens × concurrency 8 / 16 / 32 / 64 / 128 / 256.
 
-**Deployment Command** — same as [§2.3 Single-host](/autoregressive/Qwen/Qwen3#2-3-launch).
+**Deployment Command** — same as [§2.3 Single-host](../../autoregressive/Qwen/Qwen3.md#2-3-launch).
 
 **Benchmark Command** — bash driver that sweeps (ISL × OSL × concurrency):
 
@@ -488,5 +488,5 @@ Lower than the 1977 tok/s c=64 table cell because c=16 leaves the batch under-fi
 ## Additional Resources
 
 - [Qwen Model Cards](https://huggingface.co/Qwen)
-- [Launch flags reference](/base/launch-flags-reference)
-- [Cross-recipe troubleshooting](/deployment/troubleshooting) — cross-recipe generic issues.
+- [Launch flags reference](../../base/launch-flags-reference.md)
+- [Cross-recipe troubleshooting](../../deployment/troubleshooting.md) — cross-recipe generic issues.
