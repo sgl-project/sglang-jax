@@ -20,9 +20,11 @@ import base64
 import json
 import mimetypes
 import os
+import statistics
 import sys
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 DEFAULT_PROFILER_DIR = "/tmp/epd-sim-profile"
 
@@ -96,6 +98,14 @@ def main() -> int:
     p.add_argument("--prompt", default="Describe this image in detail.")
     p.add_argument("--model", default="model")
     p.add_argument("--n-requests", type=int, default=4)
+    p.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Requests in flight at once. >1 exercises the scheduler's prefill/"
+        "decode batching (the interesting EPD orchestration under load). 1 = "
+        "sequential (clean per-request timeline).",
+    )
     p.add_argument("--warmup", type=int, default=1)
     p.add_argument("--max-tokens", type=int, default=32)
     p.add_argument(
@@ -133,12 +143,34 @@ def main() -> int:
         _arm(url, os.path.join(args.profiler_dir, f"encoder_{idx}"), args)
     _arm(args.lang_url, os.path.join(args.profiler_dir, "language"), args)
 
+    def one(_):
+        t = time.monotonic()
+        _post(f"{args.lang_url}/v1/chat/completions", _chat_request(args, image_block))
+        return time.monotonic() - t
+
+    conc = max(1, args.concurrency)
+    print(f"driving {args.n_requests} requests, concurrency={conc}")
     t0 = time.monotonic()
-    for i in range(args.n_requests):
-        r = _post(f"{args.lang_url}/v1/chat/completions", _chat_request(args, image_block))
-        usage = r.get("usage", {}) if isinstance(r, dict) else {}
-        print(f"request {i + 1}/{args.n_requests}  usage={usage}")
+    if conc == 1:
+        lats = [one(i) for i in range(args.n_requests)]
+    else:
+        with ThreadPoolExecutor(max_workers=conc) as ex:
+            lats = list(ex.map(one, range(args.n_requests)))
     elapsed = time.monotonic() - t0
+
+    lats_ms = sorted(x * 1000 for x in lats)
+
+    def pctl(p):
+        return lats_ms[min(len(lats_ms) - 1, int(p / 100 * len(lats_ms)))]
+
+    print(
+        f"\n{args.n_requests} requests, concurrency {conc}, in {elapsed:.2f}s "
+        f"-> {args.n_requests / elapsed:.1f} req/s"
+    )
+    print(
+        f"per-request latency ms: p50 {pctl(50):.0f}  p99 {pctl(99):.0f}  "
+        f"mean {statistics.mean(lats_ms):.0f}  max {lats_ms[-1]:.0f}"
+    )
 
     print("stopping profilers:")
     for url in encoder_urls:
@@ -147,10 +179,6 @@ def main() -> int:
     _post(f"{args.lang_url}/stop_profile", None)
     print(f"  stop_profile -> {args.lang_url}")
 
-    print(
-        f"\n{args.n_requests} requests in {elapsed:.2f}s "
-        f"({elapsed / max(1, args.n_requests) * 1000:.1f} ms/req)"
-    )
     print(f"\nTraces under {args.profiler_dir}:")
     print("  encoder_*/plugins/profile/.../*.trace.json.gz")
     print("  language/plugins/profile/.../*.trace.json.gz")

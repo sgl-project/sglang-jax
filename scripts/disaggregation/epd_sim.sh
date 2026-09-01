@@ -28,6 +28,9 @@ LANG_PORT=${LANG_PORT:-30000}
 PROFILER_DIR=${PROFILER_DIR:-/tmp/epd-sim-profile}
 N_REQUESTS=${N_REQUESTS:-20}
 MAX_TOKENS=${MAX_TOKENS:-24}
+CONCURRENCY=${CONCURRENCY:-1}   # >1 exercises prefill/decode batching
+# Let the scheduler actually batch concurrent requests together.
+MAX_RUNNING=${MAX_RUNNING:-$((CONCURRENCY > 8 ? CONCURRENCY : 8))}
 PY_TRACER=${PY_TRACER:-0}   # 0 = clean stage view (good for flame graph + timeline)
 IMAGE=${IMAGE:-}
 
@@ -123,7 +126,7 @@ done
 echo ">> starting language server on :${LANG_PORT}"
 "${PY}" -m sgl_jax.launch_server "${common_args[@]}" "${sim_args[@]}" \
   --language-only --encoder-urls "${ENCODER_URLS[@]}" \
-  --context-length 4096 --max-running-requests 8 --mem-fraction-static 0.1 \
+  --context-length 4096 --max-running-requests "${MAX_RUNNING}" --mem-fraction-static 0.1 \
   --host 127.0.0.1 --port "${LANG_PORT}" > "${PROFILER_DIR}/language.log" 2>&1 &
 PIDS+=($!)
 
@@ -150,10 +153,11 @@ fi
 enc_flags=()
 for url in "${ENCODER_URLS[@]}"; do enc_flags+=(--encoder-url "${url}"); done
 
-echo ">> profiling ${N_REQUESTS} requests"
+echo ">> profiling ${N_REQUESTS} requests (concurrency ${CONCURRENCY})"
 "${PY}" "${SCRIPT_DIR}/profile_epd_cpu_sim.py" \
   --lang-url "http://127.0.0.1:${LANG_PORT}" "${enc_flags[@]}" \
   --image "${IMAGE}" --n-requests "${N_REQUESTS}" --max-tokens "${MAX_TOKENS}" \
+  --concurrency "${CONCURRENCY}" \
   --warmup 1 --python-tracer-level "${PY_TRACER}" --profiler-dir "${PROFILER_DIR}"
 
 echo ">> rendering flame graph + timeline"
@@ -168,6 +172,18 @@ echo "  epd_timeline.html   <- single-request critical path (open this first)"
 echo "  epd_flamegraph.svg  <- CPU self-time flame graph"
 echo "  {encoder_*,language}/plugins/profile/.../*.trace.json.gz  <- Perfetto"
 echo "=========================================================="
+if [ "${CONCURRENCY}" -gt 1 ]; then
+  echo ""
+  echo "NOTE (concurrency ${CONCURRENCY}):"
+  echo "  * Requests now batch in the scheduler (see #running-req in language.log)."
+  echo "  * The single-request TIMELINE assumes sequential drive; under concurrency"
+  echo "    read the FLAME GRAPH + Perfetto instead (decode spans cover the batch)."
+  echo "  * Decode is modeled as base_ms + per_seq_ms*batch. With the default"
+  echo "    (base 0) decode grows linearly with batch, so batching looks harmful."
+  echo "    For realistic batched decode set the FIXED cost via SIM_DECODE_BASE_MS"
+  echo "    (dominant) and keep SIM_DECODE_MS_PER_SEQ small, e.g."
+  echo "    SIM_DECODE_BASE_MS=20 SIM_DECODE_MS_PER_SEQ=0.5"
+fi
 if command -v open >/dev/null 2>&1; then open "${HTML}"
 elif command -v xdg-open >/dev/null 2>&1; then xdg-open "${HTML}" >/dev/null 2>&1 || true
 else echo "open ${HTML} in a browser"; fi
