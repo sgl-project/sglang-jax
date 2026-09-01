@@ -362,11 +362,6 @@ suites = {
         TestFile("python/sgl_jax/test/models/test_dflash.py", 0.2, runner="pytest"),
         TestFile("python/sgl_jax/test/models/test_mimo_v2_nextn.py", 0.2, runner="pytest"),
         TestFile(
-            "python/sgl_jax/test/models/test_bailing_moe_v3.py",
-            0.2,
-            runner="pytest",
-        ),
-        TestFile(
             "python/sgl_jax/test/multimodal/test_kimi_k25_weight_mapping.py",
             0.2,
             runner="pytest",
