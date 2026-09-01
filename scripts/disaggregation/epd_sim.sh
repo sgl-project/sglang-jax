@@ -6,6 +6,9 @@
 #
 #   MODEL_PATH=/path/to/qwen2.5-vl ./scripts/disaggregation/epd_sim.sh
 #
+# MODEL_PATH is OPTIONAL: if unset, a cached VLM (config+processor) is
+# auto-discovered from the HuggingFace cache. Weights are never loaded.
+#
 # Coefficients (env, all optional; defaults give a readable illustrative graph):
 #   SIM_ENC_BASE_MS SIM_ENC_MS_PER_TOKEN SIM_PREFILL_MS_PER_TOKEN
 #   SIM_DECODE_MS_PER_SEQ SIM_TRANSFER_MS_PER_MB SIM_NET_RTT_MS
@@ -14,7 +17,7 @@
 #
 set -euo pipefail
 
-: "${MODEL_PATH:?set MODEL_PATH to an in-model multimodal arch dir (config+processor; weights unused)}"
+MODEL_PATH="${MODEL_PATH:-}"
 
 NUM_ENCODERS=${NUM_ENCODERS:-1}
 TP_SIZE=${TP_SIZE:-1}
@@ -39,6 +42,36 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "${SCRIPT_DIR}/../.." && pwd)
 PY=python
 [ -x "${ROOT}/.venv/bin/python" ] && PY="${ROOT}/.venv/bin/python"
+
+# Resolve a model directory (config + tokenizer + processor; weights unused).
+# Prefer $MODEL_PATH, else auto-discover a cached VLM from the HF cache.
+if [ -z "${MODEL_PATH}" ]; then
+  MODEL_PATH=$("${PY}" - <<'PY'
+import glob, json, os
+best, best_score = None, (-1, 1 << 30)
+for cfg in glob.glob(os.path.expanduser("~/.cache/huggingface/hub/models--*/snapshots/*/config.json")):
+    try:
+        d = json.load(open(cfg))
+    except Exception:
+        continue
+    mt = str(d.get("model_type", "")).lower()
+    arch = ",".join(d.get("architectures") or [])
+    is_vlm = ("vision_config" in d) or ("image_token_id" in d) or ("vl" in mt) or ("VL" in arch)
+    if not is_vlm:
+        continue
+    layers = d.get("num_hidden_layers") or (d.get("text_config") or {}).get("num_hidden_layers") or 1 << 20
+    score = (2 if "vl" in mt else 1, layers)  # prefer *vl* model_type, then fewer layers
+    if (score[0], -score[1]) > (best_score[0], -best_score[1]):
+        best, best_score = os.path.dirname(cfg), score
+print(best or "")
+PY
+)
+  if [ -z "${MODEL_PATH}" ]; then
+    echo "no cached VLM found in ~/.cache/huggingface/hub; set MODEL_PATH=/path/to/vlm" >&2
+    exit 2
+  fi
+  echo ">> auto-discovered model config: ${MODEL_PATH}"
+fi
 
 export JAX_PLATFORMS=cpu
 export XLA_FLAGS="--xla_force_host_platform_device_count=${DEVICE_COUNT} ${XLA_FLAGS:-}"
