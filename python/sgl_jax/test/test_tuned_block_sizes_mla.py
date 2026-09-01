@@ -154,3 +154,62 @@ def test_glm52_v7_entries_hit(monkeypatch):
     for mnt in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096):
         hit = get_tuned_block_sizes_mla("mixed", jnp.bfloat16, jnp.bfloat16, 4, 512, 64, 128, mnt)
         assert hit is not None and len(hit) == 2, f"mixed mnt={mnt} missed"
+
+
+def test_fallback_decode_keeps_historical_values():
+    from sgl_jax.srt.kernels.mla.v2.tuned_block_sizes import (
+        get_fallback_block_sizes_mla,
+    )
+
+    assert get_fallback_block_sizes_mla("decode", jnp.bfloat16, 4, 128) == (3, 1)
+    assert get_fallback_block_sizes_mla("decode", jnp.bfloat16, 16, 128) == (3, 1)
+
+
+def test_fallback_mixed_full_tile_heads_keep_historical_values():
+    from sgl_jax.srt.kernels.mla.v2.tuned_block_sizes import (
+        get_fallback_block_sizes_mla,
+    )
+
+    # >=16-head bf16 shards fill whole sublane tiles: historical (1, 16).
+    assert get_fallback_block_sizes_mla("mixed", jnp.bfloat16, 16, 128) == (1, 16)
+    assert get_fallback_block_sizes_mla("mixed", jnp.bfloat16, 32, 128) == (1, 16)
+
+
+def test_fallback_mixed_subtile_heads_are_tiling_legal():
+    """Sub-tile head counts must never return the historical (1, 16) —
+    that's the exact block Mosaic rejects at mnt>=256 for 4-head bf16
+    shards (#1546) — and must land in the validated family."""
+    from sgl_jax.srt.kernels.mla.v2.tuned_block_sizes import (
+        get_fallback_block_sizes_mla,
+    )
+    from sgl_jax.srt.kernels.ragged_paged_attention.util import (
+        align_to,
+        get_dtype_packing,
+    )
+
+    # GLM-5.2 tp16 (4 heads, page 128) must get the v7x-validated (16, 64).
+    assert get_fallback_block_sizes_mla("mixed", jnp.bfloat16, 4, 128) == (16, 64)
+
+    for dtype in (jnp.bfloat16, jnp.float32):
+        packing = get_dtype_packing(jnp.dtype(dtype))
+        tile = 8 * packing
+        for heads in (1, 2, 4, 8):
+            heads_padded = align_to(heads, packing)
+            if heads_padded % tile == 0:
+                continue
+            for page_size in (64, 128, 256):
+                bkv_p, bq = get_fallback_block_sizes_mla("mixed", dtype, heads, page_size)
+                # q-block rows cover whole tile groups
+                assert (bq * heads_padded) % (tile * packing) == 0, (dtype, heads, page_size)
+                assert bq * heads_padded >= tile * tile, (dtype, heads, page_size)
+                # KV block is a whole number of pages covering 2048 tokens
+                assert bkv_p >= 1 and bkv_p * page_size >= min(2048, page_size)
+
+
+def test_fallback_rejects_bad_case_label():
+    from sgl_jax.srt.kernels.mla.v2.tuned_block_sizes import (
+        get_fallback_block_sizes_mla,
+    )
+
+    with pytest.raises(ValueError):
+        get_fallback_block_sizes_mla("prefill", jnp.bfloat16, 4, 128)
