@@ -36,6 +36,8 @@ See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU g
 
 Install per [Install guide](../../get_started/install.md) and use [Single-host Docker template](../../deployment/single-host-docker.md) for the container setup.
 
+<a id="deployment-launch"></a>
+
 ### 2.3 Launch
 
 #### Single-host — TPU v6e-4 (Gemma 2 27B-it)
@@ -118,7 +120,7 @@ print(resp.choices[0].message.content)
 | Tensor Parallelism | 4 |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3 27B-it](../../autoregressive/Google/Gemma2.md#2-3-launch).
+**Deployment Command** — same as [§2.3 27B-it](../../autoregressive/Google/Gemma2.md#deployment-launch).
 
 **Benchmark Command** — example for GSM8K:
 

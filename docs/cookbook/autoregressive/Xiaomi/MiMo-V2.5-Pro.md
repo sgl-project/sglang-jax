@@ -50,6 +50,8 @@ Extra pip for accuracy benchmarking only:
 pip install evalscope==0.17.1
 ```
 
+<a id="deployment-launch"></a>
+
 ### 2.3 Launch
 
 MiMo-V2.5-Pro is multi-host only. Run the same command on every node; only `${NODE_RANK}` and `${MASTER_ADDR}` vary across nodes.
@@ -160,6 +162,8 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
+<a id="reasoning-modes"></a>
+
 ### 3.2 Reasoning (thinking-on default, thinking-off optional)
 
 MiMo-V2.5-Pro is a hybrid reasoning model: thinking-on is the default; turn it off per-request via `chat_template_kwargs`. Launch the server with `--reasoning-parser mimo` so the API splits `reasoning_content` from `content`:
@@ -246,6 +250,8 @@ The capital of France is Paris.
 ```
 
 To see the full set of `--reasoning-parser` keys available in your build, run `python -m sgl_jax.launch_server --help`.
+
+<a id="tool-calling"></a>
 
 ### 3.3 Tool Calling
 
@@ -395,7 +401,7 @@ To see the full set of `--tool-call-parser` keys available in your build, run `p
 | Reasoning Parser | `mimo` |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3 Multi-host (v6e-64)](../../autoregressive/Xiaomi/MiMo-V2.5-Pro.md#2-3-launch), plus `--reasoning-parser mimo`.
+**Deployment Command** — same as [§2.3 Multi-host (v6e-64)](../../autoregressive/Xiaomi/MiMo-V2.5-Pro.md#deployment-launch), plus `--reasoning-parser mimo`.
 
 **Benchmark Command**
 
@@ -430,7 +436,7 @@ evalscope eval \
 | Data Parallelism | 4 |
 | Expert Parallelism | 32 |
 
-**Deployment Command** — same as [§2.3 Multi-host (v7x-16)](../../autoregressive/Xiaomi/MiMo-V2.5-Pro.md#2-3-launch).
+**Deployment Command** — same as [§2.3 Multi-host (v7x-16)](../../autoregressive/Xiaomi/MiMo-V2.5-Pro.md#deployment-launch).
 
 **Benchmark Command**
 

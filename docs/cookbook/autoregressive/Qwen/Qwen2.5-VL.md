@@ -52,6 +52,8 @@ Extra pip for accuracy benchmarking only:
 pip install 'evalscope[app,perf]==1.5.1'
 ```
 
+<a id="deployment-launch"></a>
+
 ### 2.3 Launch
 
 #### Single-host — TPU v7x-8
@@ -230,7 +232,7 @@ print(response.choices[0].message.content)
 
 > **Long video / large image set:** Make sure `--context-length` is large enough to fit the vision token count plus the text prompt and response. Each high-resolution image and each sampled video frame contributes a non-trivial number of vision tokens to the prefill.
 
-> Qwen2.5-VL is non-reasoning (no `<think>` blocks) and does not ship a native tool-call format. For reasoning workloads use [Qwen3](./Qwen3.md); for tool-calling workloads use a model with `--tool-call-parser` support (see [`Qwen3.md` §3.3](./Qwen3.md#3-3-tool-calling)).
+> Qwen2.5-VL is non-reasoning (no `<think>` blocks) and does not ship a native tool-call format. For reasoning workloads use [Qwen3](./Qwen3.md); for tool-calling workloads use a model with `--tool-call-parser` support (see [`Qwen3.md` §3.3](./Qwen3.md#tool-calling)).
 
 ## 4. Benchmark
 
@@ -251,7 +253,7 @@ The data below is a snapshot of Qwen2.5-VL-32B-Instruct on a single TPU v7x-8. A
 | Generation | `max_tokens=8192`, temperature 0, seed 42 |
 | Evaluation batch size | 24 |
 
-**Deployment Command** — use the [§2.3 v7x-8 launch command](./Qwen2.5-VL.md#2-3-launch).
+**Deployment Command** — use the [§2.3 v7x-8 launch command](./Qwen2.5-VL.md#deployment-launch).
 
 **Benchmark Command**
 

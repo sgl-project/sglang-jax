@@ -41,6 +41,8 @@ Both v6e rows fit on a single v6e-4 host with `bfloat16`; the v7x row uses one 4
 
 Install per [Install guide](../../get_started/install.md) and use [Single-host Docker template](../../deployment/single-host-docker.md) for the container setup.
 
+<a id="deployment-launch"></a>
+
 ### 2.3 Launch
 
 #### Single-host — TPU v6e-4
@@ -188,6 +190,8 @@ The capital of France is Paris.
 
 To see the full set of `--reasoning-parser` keys available in your build, run `python -m sgl_jax.launch_server --help`.
 
+<a id="tool-calling"></a>
+
 ### 3.3 Tool Calling
 
 Launch with `--tool-call-parser qwen25` (compatible with Qwen3 tool-call format) plus `--reasoning-parser qwen3` if you also want thinking. Append these flags to the §2.3 launch command.
@@ -318,7 +322,7 @@ To see the full set of `--tool-call-parser` keys available in your build, run `p
 | Tensor Parallelism | 4 |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3 Single-host](../../autoregressive/Qwen/Qwen3.md#2-3-launch).
+**Deployment Command** — same as [§2.3 Single-host](../../autoregressive/Qwen/Qwen3.md#deployment-launch).
 
 **Benchmark Command**
 
@@ -414,7 +418,7 @@ PYTHONPATH=/tmp/sglang-jax/python python -m sgl_jax.bench_serving \
 
 Methodology: TTFT measured at `output_len=1` to isolate first-token latency; ITL / throughput measured at `output_len=1024`. Workload sweeps input lengths 1024 / 4096 / 8192 tokens × output lengths 1 / 1024 tokens × concurrency 8 / 16 / 32 / 64 / 128 / 256.
 
-**Deployment Command** — same as [§2.3 Single-host](../../autoregressive/Qwen/Qwen3.md#2-3-launch).
+**Deployment Command** — same as [§2.3 Single-host](../../autoregressive/Qwen/Qwen3.md#deployment-launch).
 
 **Benchmark Command** — bash driver that sweeps (ISL × OSL × concurrency):
 

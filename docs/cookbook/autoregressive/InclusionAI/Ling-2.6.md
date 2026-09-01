@@ -40,6 +40,8 @@ For evaluation, additionally install `evalscope` in the client environment:
 pip install evalscope==0.17.1
 ```
 
+<a id="deployment-launch"></a>
+
 ### 2.3 Launch
 
 #### Multi-host — TPU v6e-64
@@ -204,7 +206,7 @@ For non-streaming requests, the field appears on `response.choices[0].message.re
 
 ### 4.1 Accuracy — GSM8K
 
-**Deployment Command** — launch a server per [§2.3 Launch](../../autoregressive/InclusionAI/Ling-2.6.md#2-3-launch).
+**Deployment Command** — launch a server per [§2.3 Launch](../../autoregressive/InclusionAI/Ling-2.6.md#deployment-launch).
 
 **Benchmark Command**
 
@@ -232,7 +234,7 @@ evalscope eval \
 
 Sanity-checks the quantized fused-MoE serving path on competition math: AIME 2026 (`MathArena/aime_2026`, 30 problems, pass@1; extracted answers exact-matched against the reference). Point `test/srt/run_eval.py` at the served Ling-2.6-1T endpoint.
 
-**Deployment Command** — launch a server per [§2.3 Launch](../../autoregressive/InclusionAI/Ling-2.6.md#2-3-launch).
+**Deployment Command** — launch a server per [§2.3 Launch](../../autoregressive/InclusionAI/Ling-2.6.md#deployment-launch).
 
 **Benchmark Command**
 

@@ -33,6 +33,8 @@ See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU g
 
 Install per [Install guide](../../get_started/install.md). For V2-Lite single-host use [Single-host Docker template](../../deployment/single-host-docker.md).
 
+<a id="deployment-launch"></a>
+
 ### 2.3 Launch
 
 #### Single-host — TPU v6e-4 (DeepSeek-V2-Lite)
@@ -112,7 +114,7 @@ print(resp.choices[0].message.content)
 
 > **Use the `-Chat` checkpoint for accuracy eval.** The base `DeepSeek-V2-Lite` ships without a chat template; evalscope's few-shot GSM8K prompt loops indefinitely against `/v1/chat/completions` (observed 0.014 score, `finish_reason: length`). The instruct-tuned `DeepSeek-V2-Lite-Chat` has the chat template and parses `\nThe answer is X` reliably.
 
-**Deployment Command** — same as [§2.3](../../autoregressive/DeepSeek/DeepSeek-V2.md#2-3-launch) but swap `--model-path` to `deepseek-ai/DeepSeek-V2-Lite-Chat`.
+**Deployment Command** — same as [§2.3](../../autoregressive/DeepSeek/DeepSeek-V2.md#deployment-launch) but swap `--model-path` to `deepseek-ai/DeepSeek-V2-Lite-Chat`.
 
 **Benchmark Command** — example for GSM8K:
 
