@@ -70,7 +70,10 @@ from sgl_jax.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
-from sgl_jax.srt.managers.scheduler_metrics_mixin import SchedulerMetricsMixin
+from sgl_jax.srt.managers.scheduler_metrics_mixin import (
+    SchedulerMetricsMixin,
+    compute_avg_spec_accept_length,
+)
 from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
@@ -1509,6 +1512,9 @@ class Scheduler(
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = dict(global_server_args_dict)
         ret["last_gen_throughput"] = self.last_gen_throughput
+        ret["avg_spec_accept_length"] = compute_avg_spec_accept_length(
+            self.cum_spec_accept_length, self.cum_spec_accept_count
+        )
         ret["memory_usage"] = {
             "kvcache": round(self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2),
             "token_capacity": int(self.max_total_num_tokens),

@@ -17,13 +17,24 @@ logger = logging.getLogger(__name__)
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 
 
+def compute_avg_spec_accept_length(cum_accept_length: int, cum_accept_count: int) -> float | None:
+    """Tokens committed per verify step; >= 1.0, since the bonus token always lands.
+
+    None rather than 0.0 before the first verify step: the benchmark clients
+    print any float verbatim and only fall back to "n/a" on None.
+    """
+    if cum_accept_count <= 0:
+        return None
+    return cum_accept_length / cum_accept_count
+
+
 class SchedulerMetricsMixin:
     def init_metrics(self: Scheduler):
         self.last_gen_throughput: float = 0.0
         self.last_input_throughput: float = 0.0
         self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
-        self.spec_num_total_accepted_tokens = 0
-        self.spec_num_total_forward_ct = 0
+        # accept_token / spec_num_forward_ct count the same thing, but log_decode_stats
+        # zeroes them every interval; these two are never reset.
         self.cum_spec_accept_length = 0
         self.cum_spec_accept_count = 0
         self.total_retracted_reqs = 0
