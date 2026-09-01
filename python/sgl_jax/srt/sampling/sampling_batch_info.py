@@ -70,15 +70,15 @@ class SamplingMetadata:
             self.positions,
             self.need_min_p_sampling,
             self.linear_penalty,
+            self.do_penalties,
             self.vocab_mask,
+            self.apply_vocab_mask,
         )
 
         aux_data = {
             "return_logprob": self.return_logprob,
             "top_logprobs_nums": self.top_logprobs_nums,
             "is_all_greedy": self.is_all_greedy,
-            "do_penalties": self.do_penalties,
-            "apply_vocab_mask": self.apply_vocab_mask,
             "token_ids_logprobs": self.token_ids_logprobs,
         }
         return (children, aux_data)
@@ -95,13 +95,13 @@ class SamplingMetadata:
         obj.positions = children[5]
         obj.need_min_p_sampling = children[6]
         obj.linear_penalty = children[7]
-        obj.vocab_mask = children[8]
+        obj.do_penalties = children[8]
+        obj.vocab_mask = children[9]
+        obj.apply_vocab_mask = children[10]
 
         obj.return_logprob = aux_data["return_logprob"]
         obj.top_logprobs_nums = aux_data["top_logprobs_nums"]
         obj.is_all_greedy = aux_data["is_all_greedy"]
-        obj.do_penalties = aux_data["do_penalties"]
-        obj.apply_vocab_mask = aux_data["apply_vocab_mask"]
         obj.token_ids_logprobs = aux_data["token_ids_logprobs"]
 
         return obj
