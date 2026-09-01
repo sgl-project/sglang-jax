@@ -370,6 +370,36 @@ class SchedulerOutputProcessorMixin:
                             and getattr(info.spec_info, "future_indices", None) is not None
                         ), "spec relay prefill output must carry future_indices"
 
+    def account_spec_decode_tokens(self: Scheduler, batch: ScheduleBatch, next_token_ids):
+        """Token counters for one speculative verify step.
+
+        Two pairs move together and must stay in step: accept_token /
+        spec_num_forward_ct, which log_decode_stats prints as accept-len and then
+        resets, and cum_spec_accept_length / cum_spec_accept_count, which are never
+        reset so /get_server_info can report the whole-run average.
+
+        Split out of process_batch_result_decode so a unit test can reach it;
+        speculative decoding needs a TPU and a draft model, so nothing else in the
+        CPU suite exercises these increments.
+        """
+        active_spec_reqs = 0
+        per_dp_bs = batch.per_dp_bs_size
+        for dp_rank, info in enumerate(batch.reqs_info):
+            base = dp_rank * per_dp_bs
+            for j, req in enumerate(info.reqs or []):
+                if self.enable_overlap and (req.finished() or req.is_retracted):
+                    continue
+                if req.is_retracted:
+                    continue
+                accepted = len(next_token_ids[base + j])
+                self.num_generated_tokens += accepted
+                self.accept_token += accepted
+                self.cum_spec_accept_length += accepted
+                active_spec_reqs += 1
+        self.spec_num_forward_ct += active_spec_reqs
+        self.cum_spec_accept_count += active_spec_reqs
+        self.draft_token += active_spec_reqs * self.draft_worker.speculative_num_draft_tokens
+
     def process_batch_result_decode(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -420,21 +450,7 @@ class SchedulerOutputProcessorMixin:
         if not is_spec_decode:
             self.num_generated_tokens += batch.batch_size()
         else:
-            active_spec_reqs = 0
-            per_dp_bs = batch.per_dp_bs_size
-            for dp_rank, info in enumerate(batch.reqs_info):
-                base = dp_rank * per_dp_bs
-                for j, req in enumerate(info.reqs or []):
-                    if self.enable_overlap and (req.finished() or req.is_retracted):
-                        continue
-                    if req.is_retracted:
-                        continue
-                    accepted = len(next_token_ids[base + j])
-                    self.num_generated_tokens += accepted
-                    self.accept_token += accepted
-                    active_spec_reqs += 1
-            self.spec_num_forward_ct += active_spec_reqs
-            self.draft_token += active_spec_reqs * self.draft_worker.speculative_num_draft_tokens
+            self.account_spec_decode_tokens(batch, next_token_ids)
         # FIXME(pc) add spec decode metrics
 
         if self.enable_overlap:

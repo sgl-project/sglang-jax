@@ -17,13 +17,30 @@ logger = logging.getLogger(__name__)
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 
 
+def compute_avg_spec_accept_length(cum_accept_length: int, cum_accept_count: int) -> float | None:
+    """Mean number of tokens committed per verify step.
+
+    The value is at least 1.0, since every verify step commits the bonus token
+    even when all speculated tokens are rejected; 1.0 therefore means the
+    speculation produced no gain at all.
+
+    Returns None rather than 0.0 when no verify step has run yet, because the
+    benchmark clients treat any float as a real measurement and only fall back
+    to "n/a" on None (see bench_one_batch_server.py and bench_serving.py).
+    """
+    if cum_accept_count <= 0:
+        return None
+    return cum_accept_length / cum_accept_count
+
+
 class SchedulerMetricsMixin:
     def init_metrics(self: Scheduler):
         self.last_gen_throughput: float = 0.0
         self.last_input_throughput: float = 0.0
         self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
-        self.spec_num_total_accepted_tokens = 0
-        self.spec_num_total_forward_ct = 0
+        # Cumulative twins of accept_token / spec_num_forward_ct, which
+        # log_decode_stats resets on every log interval. These are never reset,
+        # so /get_server_info reports the whole-run average.
         self.cum_spec_accept_length = 0
         self.cum_spec_accept_count = 0
         self.total_retracted_reqs = 0

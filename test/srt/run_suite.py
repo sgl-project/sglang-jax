@@ -342,6 +342,7 @@ suites = {
         TestFile("python/sgl_jax/test/test_scheduler_chunked_ownership.py", 0.1),
         TestFile("python/sgl_jax/test/test_scheduler_dp_load.py", 0.1, runner="pytest"),
         TestFile("python/sgl_jax/test/test_scheduler_retraction.py", 0.1),
+        TestFile("python/sgl_jax/test/test_spec_accept_metrics.py", 0.1),
         TestFile("python/sgl_jax/test/test_swa_schedule_budget.py", 0.1),
         TestFile("test/srt/test_dtype_config_llama.py", 1),
         TestFile("test/srt/test_dtype_config_consistency.py", 10),
