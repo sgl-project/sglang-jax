@@ -8,6 +8,7 @@ import numpy as np
 
 from sgl_jax.srt.layers import sampler as sampler_mod
 from sgl_jax.srt.layers.sampler import multinomial_with_seed
+from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 
 
 class TestGreedySamplingLogprobs(unittest.TestCase):
@@ -31,6 +32,61 @@ class TestGreedySamplingLogprobs(unittest.TestCase):
 
         np.testing.assert_array_equal(token_ids, jnp.array([1, 2]))
         np.testing.assert_allclose(logprobs, jax.nn.log_softmax(self.logits, axis=-1))
+
+
+class _RngCaptureSampler(sampler_mod.Sampler):
+    def _regular_sampling(self, operands):
+        return operands[2].astype(jnp.int32), None
+
+
+class TestLazySamplerRng(unittest.TestCase):
+    def setUp(self):
+        batch, vocab = 2, 32
+        self.sampler = _RngCaptureSampler()
+        self.logits_output = SimpleNamespace(
+            next_token_logits=jnp.zeros((batch, vocab), dtype=jnp.bfloat16)
+        )
+        self.metadata = SamplingMetadata(
+            return_logprob=False,
+            top_logprobs_nums=None,
+            token_ids_logprobs=None,
+            temperatures=jnp.ones((batch, 1), dtype=jnp.float32),
+            top_ps=jnp.ones((batch,), dtype=jnp.float32),
+            top_ks=jnp.full((batch,), vocab, dtype=jnp.int32),
+            min_ps=jnp.zeros((batch,), dtype=jnp.float32),
+            sampling_seeds=None,
+            positions=jnp.zeros((batch,), dtype=jnp.int32),
+            is_all_greedy=False,
+            need_min_p_sampling=False,
+            do_penalties=False,
+            linear_penalty=jnp.zeros((batch, vocab), dtype=jnp.bfloat16),
+            vocab_mask=jnp.zeros((batch, vocab // 32), dtype=jnp.int32),
+            apply_vocab_mask=False,
+        )
+
+    def _sample(self, rng_override, rng_step=None):
+        return self.sampler(
+            self.logits_output,
+            self.metadata,
+            use_sort_for_toppk_minp=False,
+            rng_override=rng_override,
+            rng_step=rng_step,
+        )[0]
+
+    def test_lazy_fold_in_matches_prefolded_key(self):
+        base_key = jax.random.PRNGKey(17)
+        step = jnp.int32(23)
+        expected = self._sample(jax.random.fold_in(base_key, step))
+        actual = self._sample(base_key, rng_step=step)
+        np.testing.assert_array_equal(actual, expected)
+
+    def test_fold_in_is_not_in_the_parent_jaxpr(self):
+        base_key = jax.random.PRNGKey(17)
+        closed_jaxpr = jax.make_jaxpr(
+            lambda step: self._sample(base_key, rng_step=step)
+        )(jnp.int32(23))
+        parent_primitives = {eqn.primitive.name for eqn in closed_jaxpr.jaxpr.eqns}
+        self.assertNotIn("random_fold_in", parent_primitives)
 
 
 class TestMultinomialWithSeed(unittest.TestCase):
