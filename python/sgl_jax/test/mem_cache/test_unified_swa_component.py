@@ -573,6 +573,97 @@ class TestUnifiedSWAComponentPage1(CustomTestCase):
 
 class TestUnifiedSWAComponentPaged(CustomTestCase):
 
+    def test_request_tail_reclaim_preserves_tree_prefix_and_live_window(self):
+        cache, allocator = _make_cache(page_size=4, window=8)
+        tokens = list(range(8))
+        _insert(cache, allocator, tokens)
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
+        tree_full = np.asarray(match.device_indices).copy()
+        tree_swa = _swa_indices(allocator, tree_full, 0).copy()
+        tail = allocator.alloc(16)
+        self.assertIsNotNone(tail)
+        row = np.concatenate([tree_full, tail])
+        cache.req_to_token_pool.write((0, slice(0, len(row))), row)
+        req = SimpleNamespace(
+            req_pool_idx=0,
+            last_node=match.last_device_node,
+            swa_evicted_seqlen=0,
+        )
+        full_free_before = allocator.full_available_size()
+        swa_free_before = allocator.swa_available_size()
+
+        cache.evict_req_swa(req, pre_len=len(row), dp_rank=0)
+
+        self.assertEqual(req.swa_evicted_seqlen, 12)
+        np.testing.assert_array_equal(_swa_indices(allocator, tree_full, 0), tree_swa)
+        self.assertTrue(np.all(_swa_indices(allocator, row[8:12], 0) == 0))
+        self.assertTrue(np.all(_swa_indices(allocator, row[12:], 0) > 0))
+        self.assertEqual(allocator.full_available_size(), full_free_before)
+        self.assertEqual(allocator.swa_available_size(), swa_free_before + 4)
+
+    def test_dp2_rejects_ambiguous_missing_node_rank(self):
+        cache, allocator = _make_cache(page_size=4, dp_size=2, window=4)
+
+        with self.assertRaisesRegex(ValueError, "dp_rank"):
+            _insert(cache, allocator, list(range(4)))
+
+    def test_dp2_swa_evict_and_heal_are_rank_local(self):
+        cache, allocator = _make_cache(page_size=4, dp_size=2, window=8)
+        tokens0 = list(range(8))
+        tokens1 = list(range(100, 108))
+        _insert(cache, allocator, tokens0, dp_rank=0)
+        reserved = allocator.swa_attn_allocator.alloc(4, dp_rank=1)
+        self.assertIsNotNone(reserved)
+        _insert(cache, allocator, tokens1, dp_rank=1)
+        allocator.swa_attn_allocator.free(reserved, dp_rank=1)
+        node0 = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(tokens0, dp_rank=0))
+        ).last_device_node
+        node1 = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(tokens1, dp_rank=1))
+        ).last_device_node
+        full0 = node0.component_data[ComponentType.FULL].value.copy()
+        full1 = node1.component_data[ComponentType.FULL].value.copy()
+        swa0 = node0.component_data[ComponentType.SWA].value.copy()
+        rank0_full_free = allocator.full_available_size(0)
+        rank0_swa_free = allocator.swa_available_size(0)
+        rank1_full_free = allocator.full_available_size(1)
+        rank1_swa_free = allocator.swa_available_size(1)
+
+        cache.components[ComponentType.SWA].evict_component(node1)
+
+        self.assertIsNone(node1.component_data[ComponentType.SWA].value)
+        np.testing.assert_array_equal(node0.component_data[ComponentType.FULL].value, full0)
+        np.testing.assert_array_equal(node0.component_data[ComponentType.SWA].value, swa0)
+        self.assertTrue(np.all(_swa_indices(allocator, full1, 1) == 0))
+        self.assertEqual(allocator.full_available_size(0), rank0_full_free)
+        self.assertEqual(allocator.swa_available_size(0), rank0_swa_free)
+        self.assertEqual(allocator.full_available_size(1), rank1_full_free)
+        self.assertEqual(allocator.swa_available_size(1), rank1_swa_free + 8)
+
+        replacement = allocator.alloc(8, dp_rank=1)
+        self.assertIsNotNone(replacement)
+        replacement_swa = _swa_indices(allocator, replacement, 1).copy()
+        cache.insert(
+            InsertParams(
+                key=RadixKey(tokens1, dp_rank=1),
+                value=replacement,
+                swa_evicted_seqlen=0,
+            )
+        )
+
+        np.testing.assert_array_equal(node1.component_data[ComponentType.FULL].value, replacement)
+        np.testing.assert_array_equal(
+            node1.component_data[ComponentType.SWA].value,
+            replacement_swa,
+        )
+        np.testing.assert_array_equal(node0.component_data[ComponentType.FULL].value, full0)
+        np.testing.assert_array_equal(node0.component_data[ComponentType.SWA].value, swa0)
+        self.assertEqual(allocator.full_available_size(0), rank0_full_free)
+        self.assertEqual(allocator.swa_available_size(0), rank0_swa_free)
+        self.assertEqual(allocator.full_available_size(1), rank1_full_free)
+        self.assertEqual(allocator.swa_available_size(1), rank1_swa_free)
+
     def test_paged_mid_node_split_and_heal_are_page_aligned(self):
         """Both page sizes exercise a mid-node split; page1 covers whole-node healing."""
         for page_size in (128, 256):
