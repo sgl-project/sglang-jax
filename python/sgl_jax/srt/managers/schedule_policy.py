@@ -21,6 +21,7 @@ from sgl_jax.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sgl_jax.srt.mem_cache.radix_cache import RadixCache, TreeNode
+from sgl_jax.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 if TYPE_CHECKING:
     from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -713,8 +714,9 @@ class PrefillAdder:
                 # Non-chunked prefill
                 self.can_run_list[dp_rank].append(req)
                 res = self.tree_cache.inc_lock_ref(req.last_node)
-                req.cache_lock_params = res.to_dec_params()
-                req.swa_uuid_for_lock = req.cache_lock_params.swa_uuid_for_lock
+                if isinstance(self.tree_cache, UnifiedRadixCache):
+                    req.cache_lock_params = res.to_dec_params()
+                req.swa_uuid_for_lock = res.swa_uuid_for_lock
                 self._update_prefill_budget(
                     prefix_len,
                     input_tokens,
@@ -728,8 +730,9 @@ class PrefillAdder:
                 self.can_run_list[dp_rank].append(req)
                 self.new_chunked_reqs[dp_rank] = req
                 res = self.tree_cache.inc_lock_ref(req.last_node)
-                req.cache_lock_params = res.to_dec_params()
-                req.swa_uuid_for_lock = req.cache_lock_params.swa_uuid_for_lock
+                if isinstance(self.tree_cache, UnifiedRadixCache):
+                    req.cache_lock_params = res.to_dec_params()
+                req.swa_uuid_for_lock = res.swa_uuid_for_lock
                 self._update_prefill_budget(prefix_len, input_tokens, 0, dp_rank)
             else:
                 # Make sure at least one page is available
@@ -744,8 +747,9 @@ class PrefillAdder:
                 self.can_run_list[dp_rank].append(req)
                 self.new_chunked_reqs[dp_rank] = req
                 res = self.tree_cache.inc_lock_ref(req.last_node)
-                req.cache_lock_params = res.to_dec_params()
-                req.swa_uuid_for_lock = req.cache_lock_params.swa_uuid_for_lock
+                if isinstance(self.tree_cache, UnifiedRadixCache):
+                    req.cache_lock_params = res.to_dec_params()
+                req.swa_uuid_for_lock = res.swa_uuid_for_lock
                 self._update_prefill_budget(prefix_len, trunc_len, 0, dp_rank)
 
         return self._budget_state_after_add(dp_rank)

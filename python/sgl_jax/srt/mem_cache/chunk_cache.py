@@ -55,18 +55,11 @@ class ChunkCache(BasePrefixCache):
         self.token_to_kv_pool_allocator.free(
             kv_indices, req.dp_rank if req.dp_rank is not None else 0
         )
-        self.dec_lock_ref(getattr(req, "last_node", None), getattr(req, "cache_lock_params", None))
-        req.cache_lock_params = None
-        req.swa_uuid_for_lock = None
 
     def cache_unfinished_req(self, req: Req):
         req.prefix_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(req.fill_ids)
         ].copy()
-        self.dec_lock_ref(getattr(req, "last_node", None), getattr(req, "cache_lock_params", None))
-        lock_result = self.inc_lock_ref(getattr(req, "last_node", None))
-        req.cache_lock_params = lock_result.to_dec_params()
-        req.swa_uuid_for_lock = req.cache_lock_params.swa_uuid_for_lock
 
     def evict(self, params: EvictParams) -> EvictResult:
         return EvictResult()

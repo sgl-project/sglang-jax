@@ -17,9 +17,7 @@ import numpy as np
 
 from sgl_jax.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.base_prefix_cache import (
-    DecLockRefParams,
     EvictParams,
-    IncLockRefResult,
     InsertParams,
     MatchPrefixParams,
 )
@@ -649,84 +647,9 @@ class TestRadixCacheWithRequests(CustomTestCase):
             dtype=self.dtype,
         )
 
-    def _insert_and_lock_prefix(self, tokens):
-        indices = self.allocator.alloc(len(tokens))
-        self.assertIsNotNone(indices)
-        self.cache.insert(InsertParams(key=RadixKey(tokens), value=indices))
-        match = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
-        lock = self.cache.inc_lock_ref(match.last_device_node)
-        return match, lock.to_dec_params()
-
-    def test_finished_retract_passes_and_clears_complete_lock_receipt(self):
-        tokens = [1, 2, 3, 4]
-        match, receipt = self._insert_and_lock_prefix(tokens)
-        self.req_pool.write((0, slice(0, 4)), match.device_indices)
-        req = MockRequest(
-            req_pool_idx=0,
-            origin_input_ids=tokens,
-            output_ids=[],
-            fill_ids=tokens,
-            prefix_indices=match.device_indices,
-            last_node=match.last_device_node,
-        )
-        req.cache_lock_params = receipt
-        req.swa_uuid_for_lock = 17
-        observed_params = []
-        original_dec = self.cache.dec_lock_ref
-
-        def record_dec(node, params=None):
-            observed_params.append(params)
-            return original_dec(node, params)
-
-        self.cache.dec_lock_ref = record_dec
-
-        self.cache.cache_finished_req(req, is_insert=False)
-
-        self.assertEqual(observed_params, [receipt])
-        self.assertIsNone(req.cache_lock_params)
-        self.assertIsNone(req.swa_uuid_for_lock)
-        self.assertEqual(match.last_device_node.lock_ref, 0)
-
-    def test_unfinished_refreshes_receipt_then_finish_clears_it(self):
-        prefix = [1, 2, 3, 4]
-        match, old_receipt = self._insert_and_lock_prefix(prefix)
-        tail = self.allocator.alloc(4)
-        self.assertIsNotNone(tail)
-        row = np.concatenate([np.asarray(match.device_indices), tail])
-        self.req_pool.write((0, slice(0, 8)), row)
-        req = MockRequest(
-            req_pool_idx=0,
-            origin_input_ids=prefix,
-            output_ids=[5, 6, 7, 8, 9],
-            fill_ids=prefix + [5, 6, 7, 8],
-            prefix_indices=match.device_indices,
-            last_node=match.last_device_node,
-        )
-        req.cache_lock_params = old_receipt
-        req.swa_uuid_for_lock = 17
-        observed_params = []
-        original_dec = self.cache.dec_lock_ref
-
-        def record_dec(node, params=None):
-            observed_params.append(params)
-            return original_dec(node, params)
-
-        self.cache.dec_lock_ref = record_dec
-
-        self.cache.cache_unfinished_req(req)
-
-        self.assertEqual(observed_params, [old_receipt])
-        self.assertIsNot(req.cache_lock_params, old_receipt)
-        self.assertIsNone(req.swa_uuid_for_lock)
-        self.assertEqual(req.last_node.lock_ref, 1)
-
-        self.cache.cache_finished_req(req, is_insert=False)
-        self.assertIsNone(req.cache_lock_params)
-        self.assertIsNone(req.swa_uuid_for_lock)
-        self.assertEqual(req.last_node.lock_ref, 0)
-
     def test_cache_finished_req_disabled(self):
-        """Disabled finish still releases and clears the exact lock receipt."""
+        """test cache finished request disabled"""
+        # create disabled cache
         disabled_cache = RadixCache(
             req_to_token_pool=self.req_pool,
             token_to_kv_pool_allocator=self.allocator,
@@ -739,6 +662,7 @@ class TestRadixCacheWithRequests(CustomTestCase):
             dtype=self.dtype,
         )
 
+        # create mock request
         mock_req = MockRequest(
             req_pool_idx=0,
             origin_input_ids=[1, 2, 3],
@@ -747,29 +671,14 @@ class TestRadixCacheWithRequests(CustomTestCase):
             prefix_indices=jnp.array([1, 2, 3]),
             last_node=disabled_cache.root_node,
         )
-        old_receipt = DecLockRefParams(
-            swa_uuid_for_lock=17,
-            skip_lock_node_ids={"probe": [3]},
-        )
-        mock_req.cache_lock_params = old_receipt
-        mock_req.swa_uuid_for_lock = 17
-        observed_params = []
-        original_dec = disabled_cache.dec_lock_ref
 
-        def record_dec(node, params=None):
-            observed_params.append(params)
-            return original_dec(node, params)
-
-        disabled_cache.dec_lock_ref = record_dec
-
-        disabled_cache.cache_finished_req(mock_req)
-
-        self.assertEqual(observed_params, [old_receipt])
-        self.assertIsNone(mock_req.cache_lock_params)
-        self.assertIsNone(mock_req.swa_uuid_for_lock)
+        # should execute normally without throwing exception
+        try:
+            disabled_cache.cache_finished_req(mock_req)
+        except Exception as e:
+            self.fail(f"cache_finished_req raised an exception: {e}")
 
     def test_cache_unfinished_req_disabled(self):
-        """Disabled unfinished relock replaces the old receipt and mirror."""
         disabled_cache = RadixCache(
             req_to_token_pool=self.req_pool,
             token_to_kv_pool_allocator=self.allocator,
@@ -782,6 +691,7 @@ class TestRadixCacheWithRequests(CustomTestCase):
             dtype=self.dtype,
         )
 
+        # create mock request
         mock_req = MockRequest(
             req_pool_idx=0,
             origin_input_ids=[1, 2, 3],
@@ -790,31 +700,12 @@ class TestRadixCacheWithRequests(CustomTestCase):
             prefix_indices=jnp.array([1, 2, 3]),
             last_node=disabled_cache.root_node,
         )
-        old_receipt = DecLockRefParams(
-            swa_uuid_for_lock=17,
-            skip_lock_node_ids={"probe": [3]},
-        )
-        new_lock = IncLockRefResult(
-            swa_uuid_for_lock=23,
-            skip_lock_node_ids={"probe": [7]},
-        )
-        mock_req.cache_lock_params = old_receipt
-        mock_req.swa_uuid_for_lock = 17
-        observed_params = []
-        original_dec = disabled_cache.dec_lock_ref
 
-        def record_dec(node, params=None):
-            observed_params.append(params)
-            return original_dec(node, params)
-
-        disabled_cache.dec_lock_ref = record_dec
-        disabled_cache.inc_lock_ref = lambda node: new_lock
-
-        disabled_cache.cache_unfinished_req(mock_req)
-
-        self.assertEqual(observed_params, [old_receipt])
-        self.assertEqual(mock_req.cache_lock_params, new_lock.to_dec_params())
-        self.assertEqual(mock_req.swa_uuid_for_lock, 23)
+        # should execute normally without throwing exception
+        try:
+            disabled_cache.cache_unfinished_req(mock_req)
+        except Exception as e:
+            self.fail(f"cache_unfinished_req raised an exception: {e}")
 
 
 if __name__ == "__main__":

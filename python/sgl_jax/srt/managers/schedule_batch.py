@@ -1603,28 +1603,55 @@ class ScheduleBatch:
                 if not info.reqs:
                     continue
                 for req in info.reqs:
-                    if isinstance(self.tree_cache, ChunkCache):
-                        should_evict = req.decode_batch_idx % evict_interval == 0
-                    elif isinstance(self.tree_cache, UnifiedRadixCache):
+                    if isinstance(self.tree_cache, UnifiedRadixCache):
                         safe_offset = 1 if self.enable_overlap else 0
-                        should_evict = (
+                        if (
                             req.decode_batch_idx >= safe_offset
                             and (req.decode_batch_idx - safe_offset) % evict_interval == 0
-                        )
+                        ):
+                            self.tree_cache.evict_req_swa(req, req.seqlen - 1, dp_rank=dp_rank)
+                        continue
+                    if isinstance(self.tree_cache, ChunkCache):
+                        # ChunkCache/SWAChunkCache: no tree-node overlap concern,
+                        # evict on every decode step to prevent SWA exhaustion.
+                        # TODO(PD-disagg): evicting at decode_batch_idx==0 may
+                        # conflict with KV transfer in a future PD disaggregation
+                        # pipeline; revisit when implementing PD.
+                        if req.decode_batch_idx % evict_interval == 0:
+                            self._evict_swa(
+                                req, req.seqlen - 1, sliding_window_size, page_size, dp_rank
+                            )
                     else:
-                        should_evict = req.decode_batch_idx % evict_interval == 1
-                    if should_evict:
-                        self._evict_swa(
-                            req, req.seqlen - 1, sliding_window_size, page_size, dp_rank
-                        )
+                        # SWARadixCache: skip decode_batch_idx==0 in overlap mode
+                        # because the previous extend batch may still be running.
+                        if req.decode_batch_idx % evict_interval == 1:
+                            self._evict_swa(
+                                req, req.seqlen - 1, sliding_window_size, page_size, dp_rank
+                            )
             return
 
         if self.forward_mode is None or not self.forward_mode.is_extend():
             return
 
-        # Preserve existing ChunkCache reclaim and add the Unified path only.
-        # Legacy SWARadixCache keeps tree-owned extend behavior unchanged.
-        if not isinstance(self.tree_cache, (ChunkCache, UnifiedRadixCache)):
+        if isinstance(self.tree_cache, UnifiedRadixCache):
+            chunked_prefill_size = global_server_args_dict["chunked_prefill_size"]
+            for dp_rank, info in enumerate(self.reqs_info):
+                if not info.reqs or not info.prefix_lens:
+                    continue
+                for idx, req in enumerate(info.reqs):
+                    pre_len = info.prefix_lens[idx]
+                    if self.enable_overlap:
+                        if req.extend_batch_idx < 2:
+                            continue
+                        if chunked_prefill_size is not None and chunked_prefill_size > 0:
+                            pre_len -= chunked_prefill_size
+                    self.tree_cache.evict_req_swa(req, pre_len, dp_rank=dp_rank)
+            return
+
+        # For SWARadixCache with active tree, extend-time SWA ownership stays
+        # with the tree — eviction is deferred to tree insert / pressure handling.
+        # ChunkCache and SWAChunkCache need direct per-request eviction.
+        if not isinstance(self.tree_cache, ChunkCache):
             return
 
         chunked_prefill_size = global_server_args_dict["chunked_prefill_size"]
@@ -1650,8 +1677,8 @@ class ScheduleBatch:
         page_size: int,
         dp_rank: int = 0,
     ):
-        """Free SWA slots outside the window for the active cache implementation."""
-        if isinstance(self.tree_cache, (SWARadixCache, UnifiedRadixCache)):
+        """Free SWA pool slots for tokens outside the sliding window."""
+        if isinstance(self.tree_cache, SWARadixCache):
             self.tree_cache.evict_req_swa(req, pre_len, dp_rank=dp_rank)
             return
 
@@ -3448,20 +3475,9 @@ class ScheduleBatch:
                 result_strs.append(
                     f"{prefix}Available full tokens: {full_available_size + full_evictable_size} ({full_available_size=} + {full_evictable_size=})\n"
                     f"{prefix}Available swa tokens: {swa_available_size + swa_evictable_size} ({swa_available_size=} + {swa_evictable_size=})\n"
+                    f"{prefix}Full LRU list evictable size: {self.tree_cache.full_lru_list_evictable_size()}\n"
+                    f"{prefix}SWA LRU list evictable size: {self.tree_cache.swa_lru_list_evictable_size()}\n"
                 )
-                for label, accessor in (
-                    ("Full LRU list evictable size", "full_lru_list_evictable_size"),
-                    ("SWA LRU list evictable size", "swa_lru_list_evictable_size"),
-                ):
-                    diagnostic = getattr(self.tree_cache, accessor, None)
-                    if not callable(diagnostic):
-                        continue
-                    try:
-                        value = diagnostic()
-                    except Exception as exc:
-                        result_strs.append(f"{prefix}{label}: unavailable ({type(exc).__name__})\n")
-                    else:
-                        result_strs.append(f"{prefix}{label}: {value}\n")
             else:
                 available_size = self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank)
                 evictable_size = self.tree_cache.evictable_size(dp_rank=dp_rank)

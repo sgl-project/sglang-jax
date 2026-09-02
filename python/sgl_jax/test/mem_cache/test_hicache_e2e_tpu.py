@@ -163,9 +163,7 @@ class TestHiCacheE2ETPU(unittest.TestCase):
         tokens = [10, 11, 12, 13]
         idx, orig = self._fill(len(tokens), seed=1)
         self.cache.insert(InsertParams(key=self._key(tokens), value=idx))
-        self.cache.insert(
-            InsertParams(key=self._key(tokens), value=idx, prev_prefix_len=len(tokens))
-        )  # trigger backup
+        self.cache.insert(InsertParams(key=self._key(tokens), value=idx))  # trigger backup
         self._settle()
 
         # Verify host_value is set and memory_kind is pinned_host.
@@ -197,9 +195,7 @@ class TestHiCacheE2ETPU(unittest.TestCase):
         tokens = [20, 21, 22, 23]
         idx, _ = self._fill(len(tokens), seed=2)
         self.cache.insert(InsertParams(key=self._key(tokens), value=idx))
-        self.cache.insert(
-            InsertParams(key=self._key(tokens), value=idx, prev_prefix_len=len(tokens))
-        )
+        self.cache.insert(InsertParams(key=self._key(tokens), value=idx))
         self._settle()
         self.cache.evict(EvictParams(num_tokens=len(tokens), dp_rank=0))
 
@@ -215,9 +211,7 @@ class TestHiCacheE2ETPU(unittest.TestCase):
         self.assertEqual(avail + evict + prot, self.DEVICE_SIZE)
 
         # Evict again, verify locks are released.
-        self.cache.insert(
-            InsertParams(key=self._key(tokens), value=new_idx, prev_prefix_len=len(tokens))
-        )
+        self.cache.insert(InsertParams(key=self._key(tokens), value=new_idx))
         self._settle()
         self.cache.evict(EvictParams(num_tokens=len(tokens), dp_rank=0))
         _, _, prot = self._token_counters()
@@ -228,9 +222,7 @@ class TestHiCacheE2ETPU(unittest.TestCase):
         tokens = [30, 31, 32, 33]
         idx, _ = self._fill(len(tokens), seed=3)
         self.cache.insert(InsertParams(key=self._key(tokens), value=idx))
-        self.cache.insert(
-            InsertParams(key=self._key(tokens), value=idx, prev_prefix_len=len(tokens))
-        )
+        self.cache.insert(InsertParams(key=self._key(tokens), value=idx))
         self._settle()
         self.cache.evict(EvictParams(num_tokens=len(tokens), dp_rank=0))
 
@@ -251,9 +243,7 @@ class TestHiCacheE2ETPU(unittest.TestCase):
         idx, orig = self._fill(len(tokens), seed=4)
         self.cache.insert(InsertParams(key=self._key(tokens), value=idx))
         for _ in range(3):
-            self.cache.insert(
-                InsertParams(key=self._key(tokens), value=idx, prev_prefix_len=len(tokens))
-            )
+            self.cache.insert(InsertParams(key=self._key(tokens), value=idx))
         node = list(self.cache.root_node.children.values())[0]
         self.assertFalse(node.backuped, "write_back must not backup on reuse")
         self._settle()

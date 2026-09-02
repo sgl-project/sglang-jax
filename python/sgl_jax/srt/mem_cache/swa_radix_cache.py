@@ -408,11 +408,6 @@ class SWARadixCache(BasePrefixCache):
                 :committed_kv_len,
             ]
             self.token_to_kv_pool_allocator.free(kv_indices, dp_rank=dp_rank)
-            self.dec_lock_ref(
-                getattr(req, "last_node", None), getattr(req, "cache_lock_params", None)
-            )
-            req.cache_lock_params = None
-            req.swa_uuid_for_lock = None
             return
 
         radix_key = build_radix_key(req, committed_kv_len)
@@ -446,13 +441,7 @@ class SWARadixCache(BasePrefixCache):
                     kv_indices[old_prefix_len:page_aligned_len], dp_rank=dp_rank
                 )
 
-        self.dec_lock_ref(
-            req.last_node,
-            getattr(req, "cache_lock_params", None)
-            or DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
-        )
-        req.cache_lock_params = None
-        req.swa_uuid_for_lock = None
+        self.dec_lock_ref(req.last_node, DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock))
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
@@ -460,12 +449,6 @@ class SWARadixCache(BasePrefixCache):
             kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, : len(req.fill_ids)]
 
             req.prefix_indices = kv_indices.copy()
-            self.dec_lock_ref(
-                getattr(req, "last_node", None), getattr(req, "cache_lock_params", None)
-            )
-            lock_result = self.inc_lock_ref(getattr(req, "last_node", None))
-            req.cache_lock_params = lock_result.to_dec_params()
-            req.swa_uuid_for_lock = req.cache_lock_params.swa_uuid_for_lock
             return
 
         radix_key = build_radix_key(req, len(req.fill_ids))
@@ -501,20 +484,15 @@ class SWARadixCache(BasePrefixCache):
             new_indices[old_prefix_len:],
         )
 
-        self.dec_lock_ref(
-            req.last_node,
-            getattr(req, "cache_lock_params", None)
-            or DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
-        )
-        lock_result = self.inc_lock_ref(new_last_node)
+        self.dec_lock_ref(req.last_node, DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock))
+        swa_uuid_for_lock = self.inc_lock_ref(new_last_node).swa_uuid_for_lock
 
         if self.page_size != 1:
             req.prefix_indices = np.concatenate([new_indices, kv_indices[len(new_indices) :]])
         else:
             req.prefix_indices = new_indices
         req.last_node = new_last_node
-        req.cache_lock_params = lock_result.to_dec_params()
-        req.swa_uuid_for_lock = req.cache_lock_params.swa_uuid_for_lock
+        req.swa_uuid_for_lock = swa_uuid_for_lock
         req.last_matched_prefix_len = len(new_indices)
         req.cache_protected_len = len(new_indices)
 
@@ -725,7 +703,10 @@ class SWARadixCache(BasePrefixCache):
         self.swa_lru_list.sanity_check(self)
 
     def evictable_size(self, dp_rank: int = 0) -> int:
-        return min(self.full_evictable_size_[dp_rank], self.swa_evictable_size_[dp_rank])
+        return min(
+            self.full_evictable_size_[dp_rank],
+            self.swa_evictable_size_[dp_rank],
+        )
 
     def full_evictable_size(self, dp_rank: int = 0) -> int:
         return self.full_evictable_size_[dp_rank]

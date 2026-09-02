@@ -451,11 +451,17 @@ class UnifiedRadixCache(BasePrefixCache):
 
         insert_result = None
         if is_insert and effective_cache_len > 0:
-            insert_params.prev_prefix_len = old_prefix_len
+            if len(self._components_tuple) > 1:
+                insert_params.prev_prefix_len = old_prefix_len
             insert_params.key = radix_key[:page_aligned_token_len]
             insert_params.value = page_aligned_kv_indices
             # Radix cache takes over one reference from the memory pool.
             insert_result = self.insert(insert_params)
+            if len(self._components_tuple) == 1:
+                self.token_to_kv_pool_allocator.free(
+                    kv_indices[old_prefix_len : insert_result.prefix_len],
+                    dp_rank=dp_rank,
+                )
         elif not is_insert:
             self.token_to_kv_pool_allocator.free(
                 kv_indices[old_prefix_len:page_aligned_len], dp_rank=dp_rank
@@ -485,6 +491,7 @@ class UnifiedRadixCache(BasePrefixCache):
             req.swa_uuid_for_lock = req.cache_lock_params.swa_uuid_for_lock
             return
 
+        dp_rank = req.dp_rank if req.dp_rank is not None else 0
         radix_key = build_radix_key(req, len(req.fill_ids))
         all_token_len = len(radix_key)
         actual_kv_len = all_token_len - 1 if self.is_eagle else all_token_len
@@ -529,9 +536,15 @@ class UnifiedRadixCache(BasePrefixCache):
 
         insert_params.key = page_aligned_key
         insert_params.value = page_aligned_kv_indices
-        insert_params.prev_prefix_len = old_prefix_len
+        if len(self._components_tuple) > 1:
+            insert_params.prev_prefix_len = old_prefix_len
         # Radix cache takes over one reference from the memory pool.
         insert_result = self.insert(insert_params)
+        if len(self._components_tuple) == 1:
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[old_prefix_len : insert_result.prefix_len],
+                dp_rank=dp_rank,
+            )
 
         # Prefix indices may have been updated, reuse them.
         new_match_result = self.match_prefix(
@@ -593,6 +606,14 @@ class UnifiedRadixCache(BasePrefixCache):
         if not self.supports_swa():
             return 0
         return self.component_protected_size_[ComponentType.SWA].get(dp_rank, 0)
+
+    def full_lru_list_evictable_size(self) -> int:
+        return sum(self.component_evictable_size_[BASE_COMPONENT_TYPE].values())
+
+    def swa_lru_list_evictable_size(self) -> int:
+        if not self.supports_swa():
+            return 0
+        return sum(self.component_evictable_size_[ComponentType.SWA].values())
 
     def _node_prefix_len(self, node: UnifiedTreeNode | None) -> int:
         length = 0
@@ -913,7 +934,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     consumed_from = min(consumed_from, boundary)
 
                 dup_start = max(0, params.prev_prefix_len - total_prefix_length)
-                if dup_start < consumed_from:
+                if len(self._components_tuple) > 1 and dup_start < consumed_from:
                     node_dp_rank = (
                         node.key.dp_rank
                         if node.key is not None and node.key.dp_rank is not None

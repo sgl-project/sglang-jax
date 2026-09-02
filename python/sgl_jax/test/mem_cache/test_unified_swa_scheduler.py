@@ -3,7 +3,6 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import numpy as np
 import pytest
 
 from sgl_jax.srt.managers.schedule_batch import (
@@ -14,8 +13,6 @@ from sgl_jax.srt.managers.schedule_batch import (
 from sgl_jax.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sgl_jax.srt.managers.scheduler import Scheduler
 from sgl_jax.srt.mem_cache.base_prefix_cache import DecLockRefParams, IncLockRefResult
-from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
-from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 
@@ -86,20 +83,19 @@ def test_request_reset_clears_full_lock_receipt_and_legacy_mirror():
     assert req.swa_uuid_for_lock is None
 
 
-def test_prefill_admission_stores_the_complete_lock_receipt():
+def _run_unified_prefill_admission():
     releases = []
     lock_result = IncLockRefResult(
         swa_uuid_for_lock=17,
         skip_lock_node_ids={"swa": [3, 5]},
     )
-    tree = SimpleNamespace(
-        disable=False,
-        hicache_enabled=False,
-        inc_lock_ref=lambda node: lock_result,
-        dec_lock_ref=lambda node, params: releases.append(params),
-        recurrent_extra_buffer_active=lambda: False,
-        evictable_size=lambda dp_rank=0: 0,
-    )
+    tree = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    tree.disable = False
+    tree.hicache_enabled = False
+    tree.inc_lock_ref = lambda node: lock_result
+    tree.dec_lock_ref = lambda node, params: releases.append(params)
+    tree.recurrent_extra_buffer_active = lambda: False
+    tree.evictable_size = lambda dp_rank=0: 0
     adder = PrefillAdder(
         page_size=1,
         tree_cache=tree,
@@ -123,6 +119,12 @@ def test_prefill_admission_stores_the_complete_lock_receipt():
     )
 
     result = adder.add_one_req(req)
+
+    return result, req, releases
+
+
+def test_unified_prefill_admission_stores_the_complete_lock_receipt():
+    result, req, releases = _run_unified_prefill_admission()
 
     assert result is AddReqResult.CONTINUE
     assert req.cache_lock_params.swa_uuid_for_lock == 17
@@ -163,8 +165,8 @@ def _decode_batch(tree, req, *, enable_overlap=False):
         tree_cache=tree,
         enable_overlap=enable_overlap,
     )
-    batch._evict_swa = lambda request, pre_len, window, page, dp_rank=0: (
-        ScheduleBatch._evict_swa(batch, request, pre_len, window, page, dp_rank)
+    batch._evict_swa = lambda request, pre_len, window, page, dp_rank=0: ScheduleBatch._evict_swa(
+        batch, request, pre_len, window, page, dp_rank
     )
     return batch
 
@@ -198,22 +200,6 @@ def test_unified_overlap_decode_waits_for_safe_offset():
     assert calls == [(1, 7, 0)]
 
 
-def test_legacy_decode_reclaim_offset_is_unchanged():
-    calls = []
-    tree = SWARadixCache.__new__(SWARadixCache)
-    tree.evict_req_swa = lambda req, pre_len, dp_rank=0: calls.append(
-        (req.decode_batch_idx, pre_len, dp_rank)
-    )
-    req = SimpleNamespace(decode_batch_idx=0, seqlen=8)
-    batch = _decode_batch(tree, req)
-
-    ScheduleBatch.maybe_evict_swa(batch)
-    req.decode_batch_idx = 1
-    ScheduleBatch.maybe_evict_swa(batch)
-
-    assert calls == [(1, 7, 0)]
-
-
 def test_unified_extend_delegates_request_tail_reclaim_to_cache():
     calls = []
     tree = UnifiedRadixCache.__new__(UnifiedRadixCache)
@@ -228,50 +214,14 @@ def test_unified_extend_delegates_request_tail_reclaim_to_cache():
         tree_cache=tree,
         enable_overlap=False,
     )
-    batch._evict_swa = lambda request, pre_len, window, page, dp_rank=0: (
-        ScheduleBatch._evict_swa(batch, request, pre_len, window, page, dp_rank)
+    batch._evict_swa = lambda request, pre_len, window, page, dp_rank=0: ScheduleBatch._evict_swa(
+        batch, request, pre_len, window, page, dp_rank
     )
 
     with patch.dict(global_server_args_dict, {"chunked_prefill_size": None}):
         ScheduleBatch.maybe_evict_swa(batch)
 
     assert calls == [("r", 12, 0)]
-
-
-def test_legacy_extend_reclaim_behavior_is_unchanged():
-    tree = SWARadixCache.__new__(SWARadixCache)
-    batch = SimpleNamespace(
-        is_hybrid=True,
-        model_config=SimpleNamespace(sliding_window=4),
-        token_to_kv_pool_allocator=SimpleNamespace(page_size=1),
-        forward_mode=SimpleNamespace(is_decode=lambda: False, is_extend=lambda: True),
-        reqs_info=[SimpleNamespace(reqs=[object()], prefix_lens=[12])],
-        tree_cache=tree,
-        enable_overlap=False,
-        _evict_swa=lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("legacy extend must keep tree-owned SWA behavior")
-        ),
-    )
-
-    ScheduleBatch.maybe_evict_swa(batch)
-
-
-def test_chunk_reclaim_keeps_direct_allocator_path():
-    freed = []
-    req = SimpleNamespace(req_pool_idx=0, swa_evicted_seqlen=0)
-    batch = SimpleNamespace(
-        tree_cache=ChunkCache.__new__(ChunkCache),
-        req_to_token_pool=SimpleNamespace(req_to_token=np.arange(16).reshape(1, 16)),
-        token_to_kv_pool_allocator=SimpleNamespace(
-            free_swa=lambda slots, dp_rank=0: freed.append((slots.copy(), dp_rank))
-        ),
-    )
-
-    ScheduleBatch._evict_swa(batch, req, pre_len=12, sliding_window_size=4, page_size=1)
-
-    assert req.swa_evicted_seqlen == 7
-    np.testing.assert_array_equal(freed[0][0], np.arange(7))
-    assert freed[0][1] == 0
 
 
 def _paged_idle_scheduler(
@@ -286,12 +236,11 @@ def _paged_idle_scheduler(
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.dp_size = 1
     scheduler.is_hybrid = True
-    scheduler.tree_cache = SimpleNamespace(
-        full_evictable_size=lambda dp_rank=0: full_owned,
-        full_protected_size=lambda dp_rank=0: 0,
-        swa_evictable_size=lambda dp_rank=0: swa_owned,
-        swa_protected_size=lambda dp_rank=0: 0,
-    )
+    scheduler.tree_cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    scheduler.tree_cache.full_evictable_size = lambda dp_rank=0: full_owned
+    scheduler.tree_cache.full_protected_size = lambda dp_rank=0: 0
+    scheduler.tree_cache.swa_evictable_size = lambda dp_rank=0: swa_owned
+    scheduler.tree_cache.swa_protected_size = lambda dp_rank=0: 0
     scheduler.token_to_kv_pool_allocator = SimpleNamespace(
         full_attn_allocator=full_allocator,
         swa_attn_allocator=swa_allocator,
