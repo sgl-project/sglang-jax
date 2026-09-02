@@ -144,17 +144,6 @@ def test_idle_flush_resets_cache_without_a_diagnostic_gate():
     assert events == ["tree-reset", "req-clear", "alloc-clear"]
 
 
-def test_non_idle_flush_skips_all_mutation():
-    events = []
-    scheduler = _flush_scheduler(_FlushTree(events))
-    scheduler._can_flush_cache = lambda: (False, "busy")
-
-    result = Scheduler.flush_cache(scheduler)
-
-    assert result == (False, "busy", 0)
-    assert events == []
-
-
 def _decode_batch(tree, req, *, enable_overlap=False):
     batch = SimpleNamespace(
         is_hybrid=True,

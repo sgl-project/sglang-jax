@@ -904,15 +904,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 cd.value = value[:prefix_len].copy()
                 node_dp_rank = node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
                 self.component_evictable_size_[BASE_COMPONENT_TYPE][node_dp_rank] += prefix_len
-                for component in self._components_tuple:
-                    if component.component_type == BASE_COMPONENT_TYPE:
-                        continue
-                    component.recover_after_unevict(
-                        node=node,
-                        prefix_len=prefix_len,
-                        total_prefix_len=total_prefix_length,
-                        params=params,
-                    )
                 self._update_aux_evictable_node_sets(node)
                 self._update_evictable_leaf_sets(node)
                 self._update_evictable_leaf_sets(node.parent)

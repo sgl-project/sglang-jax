@@ -178,17 +178,6 @@ class SWAComponent(TreeComponent):
     ) -> bool:
         return params.swa_evicted_seqlen >= total_prefix_len + key_len
 
-    def recover_after_unevict(
-        self,
-        node: UnifiedTreeNode,
-        prefix_len: int,
-        total_prefix_len: int,
-        params: InsertParams,
-    ) -> None:
-        del prefix_len, total_prefix_len, params
-        if node.component_data[self.component_type].value is None:
-            self._set_swa_value(node)
-
     def commit_insert_component_data(
         self,
         node: UnifiedTreeNode,

@@ -2186,16 +2186,8 @@ class _RecordingAuxComponent(TreeComponent):
             return prefix_len
         return self.overlap_boundary
 
-    def recover_after_unevict(self, node, prefix_len, total_prefix_len, params):
-        self.hook_log.append(("recover", node.id, total_prefix_len))
-        component_data = node.component_data[self.component_type]
-        component_data.metadata["recovered"] = True
-        component_data.value = np.arange(prefix_len, dtype=np.int32)
-
     def commit_insert_component_data(self, node, is_new_leaf, params, result):
         component_data = node.component_data[self.component_type]
-        recovered = getattr(component_data, "metadata", {}).get("recovered", False)
-        self.hook_log.append(("commit", node.id, recovered))
         if component_data.value is None:
             component_data.value = np.array([node.id], dtype=np.int32)
 
@@ -2349,49 +2341,6 @@ class TestUnifiedRadixCacheComponentSeams(unittest.TestCase):
         self.assertEqual(len(allocator.free_calls), 1)
         np.testing.assert_array_equal(allocator.free_calls[0][0], [100, 101])
         self.assertEqual(allocator.free_calls[0][1], 1)
-
-    def test_multi_node_unevict_recovers_before_commit_at_each_component_offset(self):
-        _, _, cache = self._create_cache()
-        original_key = RadixKey([1, 2, 3, 4], None, 0)
-        cache.insert(
-            InsertParams(
-                key=original_key,
-                value=np.arange(10, 14, dtype=np.int32),
-            )
-        )
-        cache.insert(
-            InsertParams(
-                key=RadixKey([1, 2, 9, 10], None, 0),
-                value=np.arange(20, 24, dtype=np.int32),
-            )
-        )
-        parent = next(iter(cache.root_node.children.values()))
-        child = parent.children[cache.get_child_key_fn(RadixKey([3], None, 0))]
-        for node in (parent, child):
-            full_data = node.component_data[ComponentType.FULL]
-            full_data.host_value = np.array([7], dtype=np.int32)
-            full_data.value = None
-        cache.component_evictable_size_[ComponentType.FULL][0] -= 4
-        cache.hicache_enabled = True
-        aux = cache.components[ComponentType.RECURRENT]
-        aux.hook_log.clear()
-
-        result = cache.insert(
-            InsertParams(
-                key=original_key,
-                value=np.arange(100, 104, dtype=np.int32),
-            )
-        )
-
-        lifecycle = [entry for entry in aux.hook_log if entry[0] in {"recover", "commit"}]
-        self.assertEqual(
-            [entry[0] for entry in lifecycle],
-            ["recover", "recover", "commit"],
-        )
-        self.assertTrue(all(entry[2] for entry in lifecycle if entry[0] == "commit"))
-        recover_offsets = [entry[2] for entry in lifecycle if entry[0] == "recover"]
-        self.assertEqual(recover_offsets, [0, 2])
-        self.assertEqual(result.prefix_len, 4)
 
     def test_split_invokes_component_hook_and_keeps_metadata_independent(self):
         _, _, cache = self._create_cache()
