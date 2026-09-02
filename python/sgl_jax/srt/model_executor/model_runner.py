@@ -326,6 +326,14 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 **backend_compiler_options,
                 **(jit_compiler_options or {}),
             }
+        sampler_compiler_options = (
+            {"enable_trace": backend_compiler_options["enable_trace"]}
+            if (
+                backend_compiler_options
+                and "enable_trace" in backend_compiler_options
+            )
+            else None
+        )
 
         @partial(
             jax.jit,
@@ -356,7 +364,11 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         base_rng_key = self._sampler_base_rng
         _fused_mesh = self.mesh
 
-        @partial(jax.jit, static_argnames=["sampler_state_def", "use_sort_for_toppk_minp"])
+        @partial(
+            jax.jit,
+            static_argnames=["sampler_state_def", "use_sort_for_toppk_minp"],
+            compiler_options=sampler_compiler_options,
+        )
         def jitted_sampler(
             sampler_def,
             sampler_state_def,
