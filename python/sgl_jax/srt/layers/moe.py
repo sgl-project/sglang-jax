@@ -676,16 +676,11 @@ class EPMoE(nnx.Module):
         return jax.lax.psum(data, "expert")
 
     def _permute(self, inputs, top_k_indices):
-        inputs_shape = inputs.shape
-
-        if len(inputs_shape) == 2:
-            bsz_times_seq_len = inputs_shape[0]
-            inputs_2d = inputs
-        else:
-            bsz_times_seq_len = inputs_shape[0] * inputs_shape[1]
-            inputs_2d = jnp.reshape(inputs, (bsz_times_seq_len, inputs_shape[-1]))
-
-        del bsz_times_seq_len
+        if inputs.ndim != 2:
+            raise ValueError(
+                "EPMoE._permute expects 2-D hidden states [tokens, hidden], "
+                f"got shape {inputs.shape}"
+            )
 
         flatten_selected_experts = jnp.ravel(top_k_indices)
         sorted_selected_experts = jnp.argsort(flatten_selected_experts, stable=True)
@@ -697,7 +692,7 @@ class EPMoE(nnx.Module):
         group_sizes = jnp.bincount(flatten_selected_experts, length=self.num_experts)
 
         return (
-            inputs_2d,
+            inputs,
             token_indices,
             sorted_selected_experts,
             group_sizes,
