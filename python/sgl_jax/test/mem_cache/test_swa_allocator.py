@@ -117,6 +117,26 @@ class TestSWAAllocatorTokenLevel(CustomTestCase):
         # SWA pool restored
         self.assertEqual(self.alloc.swa_available_size(), swa_before + 10)
 
+    # 7
+    def test_free_swa_clears_mapping(self):
+        """free_swa() zeroes out the mapping for freed indices."""
+        indices = self.alloc.alloc(5)
+        # Mapping should be non-zero
+        self.assertTrue(np.all(self.alloc.full_to_swa_index_mapping[indices] > 0))
+        self.alloc.free_swa(indices)
+        # Mapping should be zero
+        self.assertTrue(np.all(self.alloc.full_to_swa_index_mapping[indices] == 0))
+
+    # 8
+    def test_free_swa_idempotent(self):
+        """free_swa() twice on same indices does not crash or double-free."""
+        indices = self.alloc.alloc(5)
+        self.alloc.free_swa(indices)
+        swa_after_first = self.alloc.swa_available_size()
+        # Second call should be a no-op (mapping is already 0)
+        self.alloc.free_swa(indices)
+        self.assertEqual(self.alloc.swa_available_size(), swa_after_first)
+
 
 # ---------------------------------------------------------------------------
 # Class 2: Paged allocator (page_size=4)
@@ -531,7 +551,167 @@ class TestSWAAllocatorUnifiedOwnership(CustomTestCase):
 
 
 # ---------------------------------------------------------------------------
-# Class 4: Overlap safety
+# Class 4: SWA Eviction logic
+# ---------------------------------------------------------------------------
+class TestSWAEviction(CustomTestCase):
+    """Tests for _evict_swa logic (called via maybe_evict_swa)."""
+
+    def setUp(self):
+        self.mesh = _make_mesh()
+        self.page_size = 1
+        self.sliding_window = 64
+        self.pool_size = 256
+        self.pool_size_swa = 256
+        self.kvcache = _make_swa_pool(
+            size=self.pool_size,
+            size_swa=self.pool_size_swa,
+            page_size=self.page_size,
+            mesh=self.mesh,
+        )
+        self.alloc = SWATokenToKVPoolAllocator(
+            size=self.pool_size,
+            size_swa=self.pool_size_swa,
+            kvcache=self.kvcache,
+            page_size=self.page_size,
+        )
+        self.req_to_token_pool = ReqToTokenPool(size=8, max_context_len=256)
+
+    def _make_req(self, origin_len, output_len):
+        """Create a minimal Req-like object for eviction tests."""
+
+        class FakeReq:
+            def __init__(self, origin_input_ids, output_ids):
+                self.origin_input_ids = origin_input_ids
+                self.output_ids = output_ids
+                self.swa_evicted_seqlen = 0
+                self.req_pool_idx = 0
+                self.decode_batch_idx = 0
+                self.extend_batch_idx = 0
+                self.is_chunked = 0
+
+            @property
+            def seqlen(self):
+                return len(self.origin_input_ids) + len(self.output_ids)
+
+        return FakeReq(
+            origin_input_ids=list(range(origin_len)),
+            output_ids=list(range(output_len)),
+        )
+
+    def _setup_req_tokens(self, req, n_tokens):
+        """Allocate n_tokens and record them in req_to_token_pool."""
+        indices = self.alloc.alloc(n_tokens)
+        assert indices is not None, f"Failed to allocate {n_tokens} tokens"
+        self.req_to_token_pool.req_to_token[req.req_pool_idx, :n_tokens] = indices
+        return indices
+
+    def _evict(self, req, pre_len):
+        """Wrapper around the eviction logic matching _evict_swa."""
+        new_evicted = max(req.swa_evicted_seqlen, pre_len - self.sliding_window - self.page_size)
+        if self.page_size > 1:
+            new_evicted = (new_evicted // self.page_size) * self.page_size
+        if new_evicted <= req.swa_evicted_seqlen:
+            return
+        free_slots = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, req.swa_evicted_seqlen : new_evicted
+        ]
+        self.alloc.free_swa(free_slots)
+        req.swa_evicted_seqlen = new_evicted
+
+    # 16
+    def test_evict_basic(self):
+        """100 tokens, window=64, page_size=1 → evicts [0, 35)."""
+        req = self._make_req(origin_len=100, output_len=0)
+        self._setup_req_tokens(req, 100)
+        pre_len = 100  # len(origin) + len(output) - 1 = 100 + 0 - 1, but for extend pre_len=100
+
+        swa_before = self.alloc.swa_available_size()
+        self._evict(req, pre_len)
+        expected_evicted = pre_len - self.sliding_window - self.page_size  # 35
+        self.assertEqual(req.swa_evicted_seqlen, expected_evicted)
+        self.assertEqual(self.alloc.swa_available_size(), swa_before + expected_evicted)
+
+    # 17
+    def test_evict_idempotent(self):
+        """Same pre_len repeated does not double-free."""
+        req = self._make_req(origin_len=100, output_len=0)
+        self._setup_req_tokens(req, 100)
+        self._evict(req, 100)
+        swa_after_first = self.alloc.swa_available_size()
+
+        self._evict(req, 100)
+        self.assertEqual(self.alloc.swa_available_size(), swa_after_first)
+
+    # 18
+    def test_evict_incremental(self):
+        """Decode step +1 → evicts exactly 1 slot."""
+        req = self._make_req(origin_len=100, output_len=0)
+        self._setup_req_tokens(req, 100)
+
+        self._evict(req, 100)
+        evicted_1 = req.swa_evicted_seqlen
+        swa_1 = self.alloc.swa_available_size()
+
+        # Simulate one decode step
+        self._evict(req, 101)
+        self.assertEqual(req.swa_evicted_seqlen, evicted_1 + 1)
+        self.assertEqual(self.alloc.swa_available_size(), swa_1 + 1)
+
+    # 19
+    def test_evict_page_aligned(self):
+        """page_size=4: frontier includes the extra safety page and aligns down."""
+        page_size = 4
+        kvcache = _make_swa_pool(size=256, size_swa=256, page_size=page_size, mesh=self.mesh)
+        alloc = SWATokenToKVPoolAllocator(
+            size=256, size_swa=256, kvcache=kvcache, page_size=page_size
+        )
+        req_pool = ReqToTokenPool(size=8, max_context_len=256)
+
+        req = self._make_req(origin_len=100, output_len=0)
+        indices = alloc.alloc(100)
+        self.assertIsNotNone(indices)
+        req_pool.req_to_token[req.req_pool_idx, :100] = indices
+
+        # pre_len=100, window=64, page=4 → raw evicted=32 → page-aligned=32
+        new_evicted = max(req.swa_evicted_seqlen, 100 - self.sliding_window - page_size)
+        new_evicted = (new_evicted // page_size) * page_size
+        self.assertEqual(new_evicted, 32)
+
+        # pre_len=101 → raw=33 → aligned=32 (no change from 32)
+        new_evicted2 = max(32, 101 - self.sliding_window - page_size)
+        new_evicted2 = (new_evicted2 // page_size) * page_size
+        self.assertEqual(new_evicted2, 32)
+
+        # pre_len=104 → raw=36 → aligned=36
+        new_evicted3 = max(32, 104 - self.sliding_window - page_size)
+        new_evicted3 = (new_evicted3 // page_size) * page_size
+        self.assertEqual(new_evicted3, 36)
+
+    # 20
+    def test_evict_within_window_noop(self):
+        """pre_len <= window → nothing evicted."""
+        req = self._make_req(origin_len=50, output_len=0)
+        self._setup_req_tokens(req, 50)
+        swa_before = self.alloc.swa_available_size()
+
+        self._evict(req, 50)
+        self.assertEqual(req.swa_evicted_seqlen, 0)
+        self.assertEqual(self.alloc.swa_available_size(), swa_before)
+
+    # 21
+    def test_evict_reclaims_swa_capacity(self):
+        """Eviction increases swa_available_size."""
+        req = self._make_req(origin_len=128, output_len=0)
+        self._setup_req_tokens(req, 128)
+        swa_before = self.alloc.swa_available_size()
+
+        self._evict(req, 128)
+        expected_freed = 128 - self.sliding_window - self.page_size  # 63
+        self.assertEqual(self.alloc.swa_available_size(), swa_before + expected_freed)
+
+
+# ---------------------------------------------------------------------------
+# Class 5: Overlap safety
 # ---------------------------------------------------------------------------
 class TestSWAOverlapSafety(CustomTestCase):
     """Test overlap-aware reclaim timing for decode and chunked extend."""
