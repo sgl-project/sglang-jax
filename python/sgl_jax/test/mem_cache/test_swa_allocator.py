@@ -531,9 +531,6 @@ class TestSWAAllocatorUnifiedOwnership(CustomTestCase):
 
 
 # ---------------------------------------------------------------------------
-# Class 4: request SWA eviction through a public cache route
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
 # Class 4: Overlap safety
 # ---------------------------------------------------------------------------
 class TestSWAOverlapSafety(CustomTestCase):
@@ -742,11 +739,6 @@ class TestSWAOverlapSafety(CustomTestCase):
             )
         finally:
             global_server_args_dict["chunked_prefill_size"] = old_chunked_prefill_size
-
-
-# ---------------------------------------------------------------------------
-# Class 5: Overlap safety
-# ---------------------------------------------------------------------------
 
 
 if __name__ == "__main__":
