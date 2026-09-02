@@ -1904,7 +1904,7 @@ class WeightLoader:
         if unmapped:
             sample = unmapped[:10]
             raise RuntimeError(
-                f"Strict weight loading found {len(unmapped)} checkpoint tensor(s) "
+                f"Checkpoint coverage validation found {len(unmapped)} tensor(s) "
                 f"without a mapping. First {len(sample)}: {sample}"
             )
 
@@ -1913,12 +1913,13 @@ class WeightLoader:
         weight_mappings: Mapping[str, WeightMappingSpec],
         safetensors_partition=1,
         dummy=False,
-        strict=False,
+        validate_checkpoint_coverage=False,
     ):
         """Load weights using JAX lazy evaluation and parallel I/O.
 
-        When ``strict`` is true, every checkpoint tensor must be covered by a
-        regular mapping, an MoE expert group, or an excluded layer.
+        When ``validate_checkpoint_coverage`` is true, every checkpoint tensor
+        must be covered by a regular mapping, an MoE expert group, or an
+        excluded layer.
         """
         params = nnx.state(self.model)
 
@@ -1978,7 +1979,7 @@ class WeightLoader:
                         else:
                             regular_mappings[weight_info_key] = replaced_mapping
 
-        if strict:
+        if validate_checkpoint_coverage:
             self._validate_checkpoint_coverage(weight_info, regular_mappings, moe_mappings)
 
         logger.info("Starting parallel weight loading via JAX Lazy Loader...")

@@ -655,7 +655,10 @@ class BailingMoeV3ForCausalLM(nnx.Module):
             dtype=self.dtype,
         )
         weight_mappings = self._create_weight_mappings()
-        loader.load_weights_from_safetensors(weight_mappings, strict=True)
+        loader.load_weights_from_safetensors(
+            weight_mappings,
+            validate_checkpoint_coverage=True,
+        )
         for layer in self.model.layers:
             if not layer.is_kda:
                 layer.self_attn.post_load_weights()

@@ -15,7 +15,7 @@ class TestLing3Detector(CustomTestCase):
     def test_non_stream_with_newline(self):
         parser = FunctionCallParser([C.bash_tool()], "ling3")
         normal, calls = parser.parse_non_stream(
-            "thinking done\n<tool_call>execute_bash\n"
+            "thinking done\n<tool_call>execute_bash  \n"
             "<arg_key>command</arg_key><arg_value>ls</arg_value></tool_call>"
         )
         self.assertEqual(normal, "thinking done")
@@ -56,7 +56,9 @@ class TestLing3Detector(CustomTestCase):
             calls.extend(detector.parse_streaming_increment(chunk, tools).calls)
 
         self.assertEqual([call.name for call in calls if call.name], ["execute_bash"])
-        self.assertEqual(json.loads("".join(call.parameters for call in calls)), {"command": "ls"})
+        self.assertEqual(
+            json.loads("".join(call.parameters for call in calls)), {"command": "ls"}
+        )
 
 
 if __name__ == "__main__":
