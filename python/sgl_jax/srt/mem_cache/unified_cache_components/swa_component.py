@@ -158,7 +158,6 @@ class SWAComponent(TreeComponent):
         if boundary <= total_prefix_len:
             # The request owns a fresh full slice for the entire tombstone.
             self._heal_from_fresh_full(node, value_slice, dp_rank=dp_rank)
-            self.cache.record_swa_tombstone_healed(dp_rank)
             self.cache._update_aux_evictable_node_sets(node)
             return 0
 
@@ -168,7 +167,6 @@ class SWAComponent(TreeComponent):
             new_parent = self.cache._split_node(node.key, node, start_idx)
             suffix = next(iter(new_parent.children.values()))
             self._heal_from_fresh_full(suffix, value_slice[start_idx:], dp_rank=dp_rank)
-            self.cache.record_swa_tombstone_healed(dp_rank)
             self.cache._update_aux_evictable_node_sets(suffix)
             return start_idx
 
@@ -190,7 +188,6 @@ class SWAComponent(TreeComponent):
         del prefix_len, total_prefix_len, params
         if node.component_data[self.component_type].value is None:
             self._set_swa_value(node)
-            self.cache.record_swa_tombstone_healed(_node_dp_rank(self.cache, node))
 
     def commit_insert_component_data(
         self,
@@ -253,10 +250,6 @@ class SWAComponent(TreeComponent):
         if EvictLayer.DEVICE not in target:
             return 0, 0
         freed = self._clear_swa_value(node)
-        if freed and node.children:
-            self.cache._ledger_event_totals[_node_dp_rank(self.cache, node)][
-                "tombstone_created_total"
-            ] += 1
         self.cache._update_aux_evictable_node_sets(node)
         return freed, 0
 

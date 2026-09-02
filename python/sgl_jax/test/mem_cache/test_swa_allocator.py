@@ -533,53 +533,8 @@ class TestSWAAllocatorUnifiedOwnership(CustomTestCase):
 # ---------------------------------------------------------------------------
 # Class 4: request SWA eviction through a public cache route
 # ---------------------------------------------------------------------------
-class TestSWARequestEviction(CustomTestCase):
-    def test_public_route_is_window_bounded_monotonic_and_idempotent(self):
-        from sgl_jax.srt.mem_cache.chunk_cache import SWAChunkCache
-
-        cases = (
-            (1, ((50, 0), (100, 35), (100, 35), (101, 36))),
-            (4, ((50, 0), (100, 32), (101, 32), (104, 36))),
-        )
-        for page_size, checkpoints in cases:
-            with self.subTest(page_size=page_size):
-                mesh = _make_mesh()
-                kvcache = _make_swa_pool(
-                    size=256,
-                    size_swa=256,
-                    page_size=page_size,
-                    mesh=mesh,
-                )
-                allocator = SWATokenToKVPoolAllocator(
-                    size=256,
-                    size_swa=256,
-                    kvcache=kvcache,
-                    page_size=page_size,
-                )
-                req_pool = ReqToTokenPool(size=8, max_context_len=256)
-                cache = SWAChunkCache(
-                    req_to_token_pool=req_pool,
-                    token_to_kv_pool_allocator=allocator,
-                    page_size=page_size,
-                    sliding_window_size=64,
-                )
-                row = allocator.alloc(128)
-                self.assertIsNotNone(row)
-                req_pool.req_to_token[0, :128] = row
-                req = SimpleNamespace(req_pool_idx=0, swa_evicted_seqlen=0)
-                swa_before = allocator.swa_available_size()
-
-                for pre_len, expected_evicted in checkpoints:
-                    cache.evict_req_swa(req, pre_len=pre_len)
-                    self.assertEqual(req.swa_evicted_seqlen, expected_evicted)
-                    self.assertEqual(
-                        allocator.swa_available_size(),
-                        swa_before + expected_evicted,
-                    )
-
-
 # ---------------------------------------------------------------------------
-# Class 5: Overlap safety
+# Class 4: Overlap safety
 # ---------------------------------------------------------------------------
 class TestSWAOverlapSafety(CustomTestCase):
     """Test overlap-aware reclaim timing for decode and chunked extend."""
@@ -640,13 +595,16 @@ class TestSWAOverlapSafety(CustomTestCase):
 
     def _make_batch(self, req, *, enable_overlap, forward_mode, prefix_lens=None, chunked_req=None):
         from sgl_jax.srt.managers.schedule_batch import ScheduleBatch, ScheduleReqsInfo
-        from sgl_jax.srt.mem_cache.chunk_cache import SWAChunkCache
+        from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 
-        tree_cache = SWAChunkCache(
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.alloc,
-            page_size=self.page_size,
-            sliding_window_size=self.sliding_window,
+        tree_cache = (
+            ChunkCache(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.alloc,
+                page_size=self.page_size,
+            )
+            if forward_mode.is_extend()
+            else None
         )
 
         reqs_info = ScheduleReqsInfo(
@@ -705,8 +663,24 @@ class TestSWAOverlapSafety(CustomTestCase):
         self.assertEqual(req.swa_evicted_seqlen, expected)
         self.assertEqual(self.alloc.swa_available_size(), swa_before + expected)
 
-    def test_overlap_chunked_extend_preserves_inflight_swa_slots(self):
-        """Overlap eviction keeps every SWA slot visible to the prior forward."""
+    def test_overlap_chunked_extend_protects_inflight_chunk(self):
+        """Overlap chunked extend must never free SWA slots that the previous
+        chunk's in-flight forward could still be reading.
+
+        Real flow grows ``req.prefix_indices`` incrementally — each iter's
+        ``cache_unfinished_req`` captures the full row up to the cumulative
+        chunk boundary. Subtracting ``chunked_prefill_size`` from
+        ``pre_len`` shifts the eviction boundary back by exactly one chunk,
+        which by construction keeps ``new_evicted`` at most
+        ``len_{N-2} - sliding_window`` — the lowest position the in-flight
+        chunk N-1 forward could still be reading.
+
+        We assert two things:
+          1. ``swa_evicted_seqlen`` never exceeds the in-flight safe bound.
+          2. Eviction does kick in once cumulative prefix grows past
+             ``chunked_prefill_size + sliding_window``, so the test isn't
+             vacuously satisfied by always returning 0.
+        """
         from sgl_jax.srt.managers.schedule_batch import global_server_args_dict
         from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -731,7 +705,7 @@ class TestSWAOverlapSafety(CustomTestCase):
         global_server_args_dict["chunked_prefill_size"] = self.chunked_prefill_size
         try:
             num_chunks = total_len // self.chunked_prefill_size
-            saw_stale_slot_reclaimed = False
+            saw_eviction = False
             for k in range(num_chunks + 1):
                 cumulative = k * self.chunked_prefill_size
                 # Mirror cache_unfinished_req: prefix_indices is the row data
@@ -741,44 +715,38 @@ class TestSWAOverlapSafety(CustomTestCase):
                 # Sync batch-level prefix_lens (used by maybe_evict_swa)
                 batch.reqs_info[0].prefix_lens = [cumulative]
 
-                previous_prefix_end = max(0, cumulative - self.chunked_prefill_size)
-                previous_prefix = full_row[:previous_prefix_end]
-                inflight_full = previous_prefix[-self.sliding_window :]
-                inflight_swa_before = self.alloc.translate_full_to_swa(
-                    inflight_full,
-                    dp_rank=0,
-                    require_mapped=True,
-                )
-
                 batch.maybe_evict_swa()
 
-                np.testing.assert_array_equal(
-                    self.alloc.translate_full_to_swa(
-                        inflight_full,
-                        dp_rank=0,
-                        require_mapped=False,
-                    ),
-                    inflight_swa_before,
-                    err_msg=f"iter {k}: eviction hid an SWA slot still visible to the prior forward",
+                # In-flight chunk N-1 reads SWA from
+                # [len_{N-2} - sliding_window, len_{N-1}). The lowest position
+                # we must NOT have evicted is len_{N-2} - sliding_window.
+                # len_{N-2} = max(0, cumulative - chunked_prefill_size).
+                in_flight_low = max(
+                    0,
+                    cumulative - self.chunked_prefill_size - self.sliding_window - self.page_size,
                 )
+                self.assertLessEqual(
+                    req.swa_evicted_seqlen,
+                    in_flight_low,
+                    f"iter {k}: evicted={req.swa_evicted_seqlen} would corrupt "
+                    f"in-flight chunk reading from position {in_flight_low}",
+                )
+                if req.swa_evicted_seqlen > 0:
+                    saw_eviction = True
 
-                stale_full = previous_prefix[: -self.sliding_window]
-                if stale_full.size and np.any(
-                    self.alloc.translate_full_to_swa(
-                        stale_full,
-                        dp_rank=0,
-                        require_mapped=False,
-                    )
-                    == 0
-                ):
-                    saw_stale_slot_reclaimed = True
-
+            # Sanity: with total_len=200 the loop must reach iters where
+            # eviction kicks in, otherwise the test would be vacuous.
             self.assertTrue(
-                saw_stale_slot_reclaimed,
-                "Test never observed an old SWA slot being reclaimed",
+                saw_eviction,
+                "Test never observed any SWA eviction; widen the loop range " "or weaken the setup",
             )
         finally:
             global_server_args_dict["chunked_prefill_size"] = old_chunked_prefill_size
+
+
+# ---------------------------------------------------------------------------
+# Class 5: Overlap safety
+# ---------------------------------------------------------------------------
 
 
 if __name__ == "__main__":

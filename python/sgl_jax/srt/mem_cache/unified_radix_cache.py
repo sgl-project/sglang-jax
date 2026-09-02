@@ -30,7 +30,6 @@ from sgl_jax.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
     MatchResult,
-    build_swa_cache_ledger_snapshot,
 )
 from sgl_jax.srt.mem_cache.cache_init_params import CacheInitParams
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -133,8 +132,6 @@ class UnifiedRadixCache(BasePrefixCache):
         self.enable_recurrent_extra_buffer = enable_recurrent_extra_buffer
         self.recurrent_track_interval = recurrent_track_interval
         self.kv_event_queue: list = []
-        # Run-level diagnostics intentionally survive tree reset/flush.
-        self._ledger_event_totals = defaultdict(lambda: defaultdict(int))
 
         if component_init_params is None:
             component_init_params = CacheInitParams(
@@ -301,37 +298,15 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.disable:
             return EvictResult()
 
-        allocator = self.token_to_kv_pool_allocator
-        before = {}
-        if self.supports_swa():
-            ranks = (
-                range(getattr(allocator, "dp_size", 1))
-                if params.dp_rank is None
-                else (params.dp_rank,)
-            )
-            before = {
-                rank: (
-                    allocator.full_available_size(rank),
-                    allocator.swa_available_size(rank),
-                )
-                for rank in ranks
-            }
         tracker = {ct: 0 for ct in self.tree_components}
         for component in self._components_tuple:
             component.drive_eviction(params=params, tracker=tracker)
 
-        result = EvictResult(
+        return EvictResult(
             num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],
             swa_num_tokens_evicted=tracker.get(ComponentType.SWA, 0),
             recurrent_num_evicted=tracker.get(ComponentType.RECURRENT, 0),
         )
-        for rank, (full_before, swa_before) in before.items():
-            totals = self._ledger_event_totals[rank]
-            totals["full_evicted_total"] += max(
-                0, allocator.full_available_size(rank) - full_before
-            )
-            totals["swa_evicted_total"] += max(0, allocator.swa_available_size(rank) - swa_before)
-        return result
 
     def supports_recurrent(self) -> bool:
         return ComponentType.RECURRENT in self.components
@@ -404,10 +379,6 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def supports_swa(self) -> bool:
         return ComponentType.SWA in self.components
-
-    def record_swa_tombstone_healed(self, dp_rank: int) -> None:
-        """Record a real SWA ownership revival; deliberately survives reset."""
-        self._ledger_event_totals[dp_rank]["tombstone_healed_total"] += 1
 
     @property
     def sliding_window_size(self) -> int | None:
@@ -644,77 +615,8 @@ class UnifiedRadixCache(BasePrefixCache):
             new = new // self.page_size * self.page_size
         if new > old:
             slots = self.req_to_token_pool.read(req.req_pool_idx, new)[old:new]
-            freed = self.token_to_kv_pool_allocator.count_swa_mapped(slots, dp_rank=dp_rank)
             self.token_to_kv_pool_allocator.free_swa(slots, dp_rank=dp_rank)
-            self._ledger_event_totals[dp_rank]["swa_evicted_total"] += freed
             req.swa_evicted_seqlen = new
-
-    def cache_ledger_snapshot(self, dp_rank: int, live_reqs):
-        """Return a per-rank debug ownership partition (never residual math)."""
-        allocator = self.token_to_kv_pool_allocator
-        full_tree_evictable, full_tree_protected = [], []
-        swa_tree_evictable, swa_tree_protected = [], []
-        mapping_pair_full_sources, mapping_pair_swa_destinations = [], []
-        stack = [self.root_node]
-        while stack:
-            node = stack.pop()
-            stack.extend(node.children.values())
-            if node is self.root_node or (node.key.dp_rank or 0) != dp_rank:
-                continue
-            full = node.component_data[BASE_COMPONENT_TYPE].value
-            if full is None:
-                continue
-            target = (
-                full_tree_protected
-                if node.component_data[BASE_COMPONENT_TYPE].lock_ref
-                else full_tree_evictable
-            )
-            target.extend(int(i) for i in np.asarray(full) if int(i) != 0)
-            if self.supports_swa():
-                swa_data = node.component_data[ComponentType.SWA]
-                if swa_data.value is not None:
-                    target = swa_tree_protected if swa_data.lock_ref else swa_tree_evictable
-                    target.extend(int(i) for i in np.asarray(swa_data.value) if int(i) != 0)
-                    mapping_pair_full_sources.extend(int(i) for i in np.asarray(full))
-                    mapping_pair_swa_destinations.extend(int(i) for i in np.asarray(swa_data.value))
-
-        full_occurrences, swa_occurrences = [], []
-        for req in live_reqs or ():
-            if (req.dp_rank or 0) != dp_rank or req.req_pool_idx is None:
-                continue
-            start = max(0, getattr(req, "cache_protected_len", 0))
-            end = max(start, getattr(req, "kv_allocated_len", 0))
-            if end == start:
-                continue
-            row = self.req_to_token_pool.read(req.req_pool_idx, end)[start:end]
-            full_occurrences.extend(int(i) for i in np.asarray(row) if int(i) != 0)
-            swa_start = max(start, getattr(req, "swa_evicted_seqlen", 0))
-            if self.supports_swa() and swa_start < end:
-                mapped = allocator.translate_full_to_swa(
-                    self.req_to_token_pool.read(req.req_pool_idx, end)[swa_start:end],
-                    dp_rank=dp_rank,
-                    require_mapped=False,
-                )
-                sources = self.req_to_token_pool.read(req.req_pool_idx, end)[swa_start:end]
-                for source, destination in zip(sources, mapped):
-                    if int(destination) == 0:
-                        continue
-                    swa_occurrences.append(int(destination))
-                    mapping_pair_full_sources.append(int(source))
-                    mapping_pair_swa_destinations.append(int(destination))
-        return build_swa_cache_ledger_snapshot(
-            dp_rank=dp_rank,
-            allocator=allocator,
-            full_tree_evictable=full_tree_evictable,
-            full_tree_protected=full_tree_protected,
-            swa_tree_evictable=swa_tree_evictable,
-            swa_tree_protected=swa_tree_protected,
-            full_request_occurrences=full_occurrences,
-            swa_request_occurrences=swa_occurrences,
-            mapping_pair_full_sources=mapping_pair_full_sources,
-            mapping_pair_swa_destinations=mapping_pair_swa_destinations,
-            event_totals=self._ledger_event_totals.get(dp_rank, {}),
-        )
 
     def total_size(self):
         total_size = 0

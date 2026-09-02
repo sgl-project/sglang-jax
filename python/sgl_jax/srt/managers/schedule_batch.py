@@ -41,6 +41,7 @@ from sgl_jax.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     MatchPrefixParams,
 )
+from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 from sgl_jax.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -49,6 +50,8 @@ from sgl_jax.srt.mem_cache.common import (
 )
 from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sgl_jax.srt.mem_cache.radix_cache import RadixKey, build_radix_key
+from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
+from sgl_jax.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.multimodal.common.modality_enum import MultimodalInputs
 from sgl_jax.srt.multimodal.in_model.host_orchestration import build_multimodal_batch
@@ -949,10 +952,11 @@ class ScheduleBatch:
         return_output_logprob_only = all(req.return_output_logprob_only for req in all_reqs)
         is_hybrid = False
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
-            if tree_cache is None or not tree_cache.supports_swa():
-                raise ValueError(
-                    "An SWA-capable tree cache is required for " "SWATokenToKVPoolAllocator"
-                )
+            assert tree_cache is None or isinstance(
+                tree_cache, (SWARadixCache, ChunkCache, UnifiedRadixCache)
+            ), "An SWA cache is required for SWATokenToKVPoolAllocator"
+            if isinstance(tree_cache, UnifiedRadixCache) and not tree_cache.supports_swa():
+                raise ValueError("UnifiedRadixCache requires its SWA component")
             is_hybrid = True
 
         is_hybrid_recurrent = isinstance(req_to_token_pool, HybridReqToTokenPool)
@@ -1599,17 +1603,28 @@ class ScheduleBatch:
                 if not info.reqs:
                     continue
                 for req in info.reqs:
-                    safe_offset = 1 if self.enable_overlap else 0
-                    if (
-                        req.decode_batch_idx >= safe_offset
-                        and (req.decode_batch_idx - safe_offset) % evict_interval == 0
-                    ):
+                    if isinstance(self.tree_cache, ChunkCache):
+                        should_evict = req.decode_batch_idx % evict_interval == 0
+                    elif isinstance(self.tree_cache, UnifiedRadixCache):
+                        safe_offset = 1 if self.enable_overlap else 0
+                        should_evict = (
+                            req.decode_batch_idx >= safe_offset
+                            and (req.decode_batch_idx - safe_offset) % evict_interval == 0
+                        )
+                    else:
+                        should_evict = req.decode_batch_idx % evict_interval == 1
+                    if should_evict:
                         self._evict_swa(
                             req, req.seqlen - 1, sliding_window_size, page_size, dp_rank
                         )
             return
 
         if self.forward_mode is None or not self.forward_mode.is_extend():
+            return
+
+        # Preserve existing ChunkCache reclaim and add the Unified path only.
+        # Legacy SWARadixCache keeps tree-owned extend behavior unchanged.
+        if not isinstance(self.tree_cache, (ChunkCache, UnifiedRadixCache)):
             return
 
         chunked_prefill_size = global_server_args_dict["chunked_prefill_size"]
@@ -1635,10 +1650,21 @@ class ScheduleBatch:
         page_size: int,
         dp_rank: int = 0,
     ):
-        """Ask the cache to reclaim only request-owned SWA slots."""
-        if self.tree_cache is None or not self.tree_cache.supports_swa():
-            raise RuntimeError("Hybrid scheduler lost its SWA-capable cache")
-        self.tree_cache.evict_req_swa(req, pre_len, dp_rank=dp_rank)
+        """Free SWA slots outside the window for the active cache implementation."""
+        if isinstance(self.tree_cache, (SWARadixCache, UnifiedRadixCache)):
+            self.tree_cache.evict_req_swa(req, pre_len, dp_rank=dp_rank)
+            return
+
+        new_evicted = max(req.swa_evicted_seqlen, pre_len - sliding_window_size - page_size)
+        if page_size > 1:
+            new_evicted = (new_evicted // page_size) * page_size
+        if new_evicted <= req.swa_evicted_seqlen:
+            return
+        free_slots = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, req.swa_evicted_seqlen : new_evicted
+        ]
+        self.token_to_kv_pool_allocator.free_swa(free_slots, dp_rank=dp_rank)
+        req.swa_evicted_seqlen = new_evicted
 
     def prepare_for_decode(self):
         """Prepare for decode phase (unified for all dp_size >= 1).

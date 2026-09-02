@@ -36,6 +36,7 @@ class TestSchedulerIdleCheck(unittest.TestCase):
         scheduler.new_token_ratio = 0.25
         scheduler.calls = []
         scheduler.check_memory = lambda: scheduler.calls.append("memory")
+        scheduler.check_tree_cache = lambda: scheduler.calls.append("tree")
         return scheduler
 
     def test_idle_check_skips_pending_work(self):
@@ -75,7 +76,7 @@ class TestSchedulerIdleCheck(unittest.TestCase):
 
         scheduler.on_idle()
 
-        self.assertEqual(scheduler.calls, ["memory"])
+        self.assertEqual(scheduler.calls, ["memory", "tree"])
         self.assertEqual(scheduler.new_token_ratio, scheduler.init_new_token_ratio)
 
 

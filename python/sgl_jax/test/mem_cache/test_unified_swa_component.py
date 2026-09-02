@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import os
 import unittest
-from collections import defaultdict
 from types import SimpleNamespace
 
 # Must precede the first direct JAX import: this module owns a 2x2 CPU mesh.
@@ -20,41 +19,28 @@ from jax.sharding import Mesh
 
 assert jax.device_count() == 4
 
-from sgl_jax.srt.managers.schedule_batch import (
-    Req,
-    ScheduleBatch,
-    global_server_args_dict,
-)
-from sgl_jax.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sgl_jax.srt.managers.schedule_batch import ScheduleBatch
 from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
 from sgl_jax.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.base_prefix_cache import (
-    DecLockRefParams,
     EvictParams,
-    IncLockRefResult,
     InsertParams,
     MatchPrefixParams,
-    validate_swa_cache_ledger,
 )
 from sgl_jax.srt.mem_cache.cache_init_params import CacheInitParams
-from sgl_jax.srt.mem_cache.chunk_cache import SWAChunkCache
-from sgl_jax.srt.mem_cache.common import release_kv_cache
 from sgl_jax.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     ReqToTokenPool,
     SWAKVPool,
 )
 from sgl_jax.srt.mem_cache.radix_cache import RadixKey
-from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.mem_cache.unified_cache_components import (
     ComponentType,
     LRURefreshPhase,
 )
 from sgl_jax.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sgl_jax.srt.sampling.sampling_params import SamplingParams
 from sgl_jax.test.test_utils import CustomTestCase
 
 
@@ -77,7 +63,6 @@ def _make_cache(
     page_size: int = 1,
     dp_size: int = 1,
     window: int = 4,
-    kind: str = "unified",
     size: int | None = None,
     size_swa: int | None = None,
 ):
@@ -107,157 +92,18 @@ def _make_cache(
         page_size=page_size,
         sliding_window_size=window,
     )
-    if kind == "legacy":
-        cache = SWARadixCache(
-            req_to_token_pool=req_pool,
-            token_to_kv_pool_allocator=allocator,
-            sliding_window_size=window,
-            page_size=page_size,
-        )
-    elif kind == "chunk":
-        cache = SWAChunkCache(
-            req_to_token_pool=req_pool,
-            token_to_kv_pool_allocator=allocator,
-            page_size=page_size,
-            sliding_window_size=window,
-        )
-    else:
-        cache = UnifiedRadixCache(
-            req_to_token_pool=req_pool,
-            token_to_kv_pool_allocator=allocator,
-            page_size=page_size,
-            kv_head_num=2,
-            head_dim=1,
-            layer_num=2,
-            max_seq_len=size,
-            tree_components=(ComponentType.FULL, ComponentType.SWA),
-            component_init_params=component_params,
-        )
+    cache = UnifiedRadixCache(
+        req_to_token_pool=req_pool,
+        token_to_kv_pool_allocator=allocator,
+        page_size=page_size,
+        kv_head_num=2,
+        head_dim=1,
+        layer_num=2,
+        max_seq_len=size,
+        tree_components=(ComponentType.FULL, ComponentType.SWA),
+        component_init_params=component_params,
+    )
     return cache, allocator
-
-
-_LIFECYCLE_MODEL_CONFIG = SimpleNamespace(vocab_size=4096, sliding_window=8)
-
-
-def _run_scheduler_lifecycle(
-    cache,
-    allocator,
-    *,
-    rid: str,
-    input_ids: list[int],
-    output_len: int = 2,
-) -> None:
-    """Run one request through the real scheduler/cache ownership path."""
-    req = Req(
-        rid=rid,
-        origin_input_text="",
-        origin_input_ids=input_ids,
-        sampling_params=SamplingParams(
-            max_new_tokens=output_len,
-            temperature=0,
-            top_p=1.0,
-            ignore_eos=True,
-        ),
-        dp_rank=0,
-        eos_token_ids={1},
-        vocab_size=_LIFECYCLE_MODEL_CONFIG.vocab_size,
-    )
-    req.init_next_round_input(cache)
-    adder = PrefillAdder(
-        page_size=cache.page_size,
-        tree_cache=cache,
-        token_to_kv_pool_allocator=allocator,
-        running_batch=SimpleNamespace(reqs_info=[SimpleNamespace(reqs=[])]),
-        new_token_ratio=0.7,
-        rem_input_tokens=128,
-        rem_chunk_tokens=64,
-        dp_size=1,
-    )
-    assert adder.add_one_req(req) == AddReqResult.CONTINUE
-    assert adder.can_run_list[0] == [req]
-
-    batch = ScheduleBatch.init_new(
-        reqs=[[req]],
-        req_to_token_pool=cache.req_to_token_pool,
-        token_to_kv_pool_allocator=allocator,
-        tree_cache=cache,
-        model_config=_LIFECYCLE_MODEL_CONFIG,
-        enable_overlap=True,
-        dp_size=1,
-        spec_algorithm=None,
-        mesh=None,
-    )
-    batch.prepare_for_extend()
-    info = batch.reqs_info[0]
-    info.req_pool_indices = np.asarray([req.req_pool_idx], dtype=np.int32)
-    info.seq_lens = np.asarray([len(req.origin_input_ids)], dtype=np.int32)
-    info.seq_lens_sum = int(info.seq_lens.sum())
-    info.sampling_info = SamplingBatchInfo.from_schedule_batch(
-        info,
-        _LIFECYCLE_MODEL_CONFIG.vocab_size,
-        batch=batch,
-    )
-    req.output_ids = [3000]
-    for _ in range(output_len - 1):
-        info.output_ids = np.asarray([3000], dtype=np.int32)
-        batch.prepare_for_decode()
-        req.output_ids.append(3000)
-    release_kv_cache(req, cache)
-
-
-_LEDGER_FIELDS = {
-    "dp_rank",
-    "full_capacity",
-    "full_available",
-    "full_tree_evictable",
-    "full_tree_protected",
-    "full_request_owned",
-    "full_reserved_page_slack",
-    "swa_capacity",
-    "swa_available",
-    "swa_tree_evictable",
-    "swa_tree_protected",
-    "swa_request_owned",
-    "swa_reserved_page_slack",
-    "mapping_nonzero_count",
-    "mapping_invalid_count",
-    "mapping_duplicate_count",
-    "mapping_source_mismatch_count",
-    "mapping_owner_mismatch_count",
-    "mapping_pair_mismatch_count",
-    "full_duplicate_tree_owner_count",
-    "swa_duplicate_tree_owner_count",
-    "full_tree_bucket_overlap_count",
-    "swa_tree_bucket_overlap_count",
-    "full_duplicate_request_owner_count",
-    "swa_duplicate_request_owner_count",
-    "full_request_tree_overlap_count",
-    "swa_request_tree_overlap_count",
-    "full_evicted_total",
-    "swa_evicted_total",
-    "tombstone_created_total",
-    "tombstone_healed_total",
-}
-
-
-class _RequestOwnership:
-    """Independent request-owner record used by the conservation assertions."""
-
-    def __init__(self):
-        self.full: dict[int, set[int]] = defaultdict(set)
-        self.swa: dict[int, set[int]] = defaultdict(set)
-
-    def record_alloc(self, allocator, full_indices: np.ndarray, rank: int) -> None:
-        swa_indices = _swa_indices(allocator, full_indices, rank)
-        assert np.all(swa_indices > 0)
-        self.full[rank].update(int(index) for index in full_indices)
-        self.swa[rank].update(int(index) for index in swa_indices)
-
-    def transfer_to_tree(self, allocator, full_indices: np.ndarray, rank: int) -> None:
-        self.full[rank].difference_update(int(index) for index in full_indices)
-        self.swa[rank].difference_update(
-            int(index) for index in _swa_indices(allocator, full_indices, rank)
-        )
 
 
 def _insert(
@@ -266,34 +112,16 @@ def _insert(
     tokens: list[int],
     *,
     dp_rank: int | None = None,
-    ownership: _RequestOwnership | None = None,
 ):
     rank = dp_rank or 0
     value = allocator.alloc(len(tokens), dp_rank=rank)
     assert value is not None
-    if ownership is not None:
-        ownership.record_alloc(allocator, value, rank)
     result = cache.insert(InsertParams(key=RadixKey(tokens, dp_rank=dp_rank), value=value))
-    if ownership is not None:
-        ownership.transfer_to_tree(allocator, value, rank)
     return result
 
 
 def _swa_indices(allocator, full_indices, rank: int) -> np.ndarray:
     return allocator.translate_full_to_swa(full_indices, dp_rank=rank, require_mapped=False)
-
-
-def _tree_full_indices(cache, rank: int) -> list[np.ndarray]:
-    values = []
-    pending = [cache.root_node]
-    while pending:
-        node = pending.pop()
-        if node is not cache.root_node and node.key.dp_rank == rank:
-            full = node.component_data[ComponentType.FULL].value
-            if full is not None:
-                values.append(full)
-        pending.extend(node.children.values())
-    return values
 
 
 def _allocator_free_indices(pool, rank: int) -> set[int]:
@@ -304,316 +132,7 @@ def _allocator_free_indices(pool, rank: int) -> set[int]:
     return set(int(index) for index in indices.reshape(-1))
 
 
-def _assert_rank_ledger(
-    test: unittest.TestCase,
-    cache,
-    allocator,
-    ownership: _RequestOwnership,
-    rank: int,
-) -> None:
-    """Assert the allocator partition from independently recorded owners."""
-    full_tree: set[int] = set()
-    swa_tree: set[int] = set()
-    pending = [cache.root_node]
-    while pending:
-        node = pending.pop()
-        pending.extend(node.children.values())
-        if node is cache.root_node or node.key.dp_rank != rank:
-            continue
-        full_value = node.component_data[ComponentType.FULL].value
-        if full_value is None:
-            continue
-        full_indices = set(int(index) for index in full_value)
-        test.assertTrue(full_tree.isdisjoint(full_indices))
-        full_tree.update(full_indices)
-        swa_value = node.component_data[ComponentType.SWA].value
-        if swa_value is None:
-            continue
-        expected_swa = _swa_indices(allocator, full_value, rank)
-        np.testing.assert_array_equal(swa_value, expected_swa)
-        test.assertTrue(np.all(expected_swa > 0))
-        swa_indices = set(int(index) for index in swa_value)
-        test.assertTrue(swa_tree.isdisjoint(swa_indices))
-        swa_tree.update(swa_indices)
-
-    full_free = _allocator_free_indices(allocator.full_attn_allocator, rank)
-    swa_free = _allocator_free_indices(allocator.swa_attn_allocator, rank)
-    full_request = ownership.full[rank]
-    swa_request = ownership.swa[rank]
-    for owners in ((full_free, full_tree, full_request), (swa_free, swa_tree, swa_request)):
-        test.assertTrue(owners[0].isdisjoint(owners[1]))
-        test.assertTrue(owners[0].isdisjoint(owners[2]))
-        test.assertTrue(owners[1].isdisjoint(owners[2]))
-
-    test.assertEqual(len(full_free), allocator.full_available_size(rank))
-    test.assertEqual(len(swa_free), allocator.swa_available_size(rank))
-    test.assertEqual(
-        allocator.full_attn_allocator.size_per_rank,
-        len(full_free | full_tree | full_request),
-    )
-    test.assertEqual(
-        allocator.swa_attn_allocator.size_per_rank,
-        len(swa_free | swa_tree | swa_request),
-    )
-    test.assertEqual(
-        len(swa_tree),
-        cache.component_evictable_size_[ComponentType.SWA][rank]
-        + cache.component_protected_size_[ComponentType.SWA][rank],
-    )
-
-
 class TestUnifiedSWAComponentPage1(CustomTestCase):
-    def test_live_request_ledgers_share_schema_units_and_conserve_ownership(self):
-        """All SWA routes report allocator slots with route-specific tree ownership."""
-        for kind in ("unified", "legacy", "chunk"):
-            with self.subTest(kind=kind):
-                cache, allocator = _make_cache(window=4, kind=kind)
-                full = allocator.alloc(4, dp_rank=0)
-                self.assertIsNotNone(full)
-                cache.req_to_token_pool.write((0, slice(0, 4)), full)
-                req = SimpleNamespace(
-                    dp_rank=0,
-                    req_pool_idx=0,
-                    cache_protected_len=0,
-                    kv_allocated_len=4,
-                    swa_evicted_seqlen=0,
-                )
-
-                snapshot = cache.cache_ledger_snapshot(0, [req])
-
-                self.assertEqual(set(snapshot), _LEDGER_FIELDS)
-                self.assertEqual(
-                    snapshot["full_capacity"], allocator.full_attn_allocator.size_per_rank
-                )
-                self.assertEqual(
-                    snapshot["swa_capacity"], allocator.swa_attn_allocator.size_per_rank
-                )
-                self.assertEqual(snapshot["full_request_owned"], 4)
-                self.assertEqual(snapshot["swa_request_owned"], 4)
-                self.assertEqual(snapshot["mapping_nonzero_count"], 4)
-                self.assertEqual(snapshot["mapping_invalid_count"], 0)
-                self.assertEqual(snapshot["mapping_duplicate_count"], 0)
-                if kind == "chunk":
-                    for field in (
-                        "full_tree_evictable",
-                        "full_tree_protected",
-                        "swa_tree_evictable",
-                        "swa_tree_protected",
-                    ):
-                        self.assertEqual(snapshot[field], 0)
-                self.assertEqual(
-                    snapshot["full_available"] + snapshot["full_request_owned"],
-                    snapshot["full_capacity"],
-                )
-                self.assertEqual(
-                    snapshot["swa_available"] + snapshot["swa_request_owned"],
-                    snapshot["swa_capacity"],
-                )
-
-    def test_ledger_diagnostics_expose_duplicate_and_mapping_only_owners(self):
-        cache, allocator = _make_cache(window=4, kind="chunk")
-        full = allocator.alloc(2, dp_rank=0)
-        self.assertIsNotNone(full)
-        mapping = allocator.full_to_swa_index_mapping
-        mapping[full[1]] = mapping[full[0]]
-        duplicate_row = np.repeat(full[:1], 2)
-        cache.req_to_token_pool.write((0, slice(0, 2)), duplicate_row)
-        cache.req_to_token_pool.write((1, slice(0, 2)), duplicate_row)
-        reqs = [
-            SimpleNamespace(
-                dp_rank=0,
-                req_pool_idx=index,
-                cache_protected_len=0,
-                kv_allocated_len=2,
-                swa_evicted_seqlen=0,
-            )
-            for index in (0, 1)
-        ]
-
-        snapshot = cache.cache_ledger_snapshot(0, reqs)
-
-        self.assertEqual(snapshot["full_duplicate_request_owner_count"], 3)
-        self.assertEqual(snapshot["swa_duplicate_request_owner_count"], 3)
-        self.assertEqual(snapshot["mapping_nonzero_count"], 2)
-        self.assertEqual(snapshot["mapping_duplicate_count"], 1)
-
-        cache, allocator = _make_cache(window=4)
-        _insert(cache, allocator, [0, 1, 2, 3])
-        node = next(iter(cache.root_node.children.values()))
-        node.component_data[ComponentType.SWA].value = None
-
-        snapshot = cache.cache_ledger_snapshot(0, [])
-
-        self.assertEqual(snapshot["swa_tree_evictable"], 0)
-        self.assertEqual(snapshot["mapping_nonzero_count"], 4)
-        with self.assertRaisesRegex(ValueError, "swa.*balance|mapping ownership"):
-            validate_swa_cache_ledger(snapshot, require_idle=True)
-
-    def test_tree_ledger_rejects_duplicate_owner_occurrences(self):
-        cache, allocator = _make_cache(window=4)
-        _insert(cache, allocator, [0, 1, 2, 3])
-        node = next(iter(cache.root_node.children.values()))
-        full = node.component_data[ComponentType.FULL]
-        swa = node.component_data[ComponentType.SWA]
-        full.value = np.append(full.value, full.value[0])
-        swa.value = np.append(swa.value, swa.value[0])
-
-        snapshot = cache.cache_ledger_snapshot(0, [])
-
-        self.assertEqual(snapshot["full_duplicate_tree_owner_count"], 1)
-        self.assertEqual(snapshot["swa_duplicate_tree_owner_count"], 1)
-        with self.assertRaisesRegex(ValueError, "duplicate_tree_owner"):
-            validate_swa_cache_ledger(snapshot, require_idle=True)
-
-    def test_tree_ledger_rejects_mapping_source_destination_and_pair_mismatches(self):
-        cache, allocator = _make_cache(window=4)
-        _insert(cache, allocator, [0, 1, 2, 3])
-        node = next(iter(cache.root_node.children.values()))
-        full = node.component_data[ComponentType.FULL].value
-        swa = node.component_data[ComponentType.SWA]
-        mapping = allocator.full_to_swa_index_mapping
-
-        swa.value = np.roll(swa.value, 1)
-        pair_snapshot = cache.cache_ledger_snapshot(0, [])
-        self.assertEqual(pair_snapshot["mapping_source_mismatch_count"], 0)
-        self.assertEqual(pair_snapshot["mapping_owner_mismatch_count"], 0)
-        self.assertEqual(pair_snapshot["mapping_pair_mismatch_count"], len(full))
-        with self.assertRaisesRegex(ValueError, "mapping_pair_mismatch_count"):
-            validate_swa_cache_ledger(pair_snapshot, require_idle=True)
-
-        swa.value = mapping[full].copy()
-        free_full = next(iter(_allocator_free_indices(allocator.full_attn_allocator, 0)))
-        mapping[free_full] = mapping[full[0]]
-        mapping[full[0]] = 0
-        source_snapshot = cache.cache_ledger_snapshot(0, [])
-        self.assertEqual(source_snapshot["mapping_source_mismatch_count"], 2)
-        with self.assertRaisesRegex(ValueError, "mapping_source_mismatch_count"):
-            validate_swa_cache_ledger(source_snapshot, require_idle=True)
-
-        cache, allocator = _make_cache(window=4)
-        _insert(cache, allocator, [0, 1, 2, 3])
-        node = next(iter(cache.root_node.children.values()))
-        swa = node.component_data[ComponentType.SWA]
-        free_swa = next(iter(_allocator_free_indices(allocator.swa_attn_allocator, 0)))
-        swa.value[0] = free_swa
-        owner_snapshot = cache.cache_ledger_snapshot(0, [])
-        self.assertEqual(owner_snapshot["mapping_owner_mismatch_count"], 2)
-        with self.assertRaisesRegex(ValueError, "mapping_owner_mismatch_count"):
-            validate_swa_cache_ledger(owner_snapshot, require_idle=True)
-
-    def test_request_tail_reclaim_preserves_each_route_live_window(self):
-        for kind in ("unified", "legacy", "chunk"):
-            with self.subTest(kind=kind):
-                cache, allocator = _make_cache(window=4, kind=kind)
-                if kind == "chunk":
-                    tree_full = np.empty(0, dtype=np.int32)
-                    tree_swa = np.empty(0, dtype=np.int32)
-                    row = allocator.alloc(16, dp_rank=0)
-                    self.assertIsNotNone(row)
-                    last_node = None
-                else:
-                    _insert(cache, allocator, [0, 1, 2, 3])
-                    match = cache.match_prefix(MatchPrefixParams(key=RadixKey([0, 1, 2, 3])))
-                    tree_full = np.asarray(match.device_indices).copy()
-                    tree_swa = _swa_indices(allocator, tree_full, 0).copy()
-                    tail = allocator.alloc(12, dp_rank=0)
-                    self.assertIsNotNone(tail)
-                    row = np.concatenate([tree_full, tail])
-                    last_node = match.last_device_node
-                cache.req_to_token_pool.write((0, slice(0, len(row))), row)
-                req = SimpleNamespace(
-                    req_pool_idx=0,
-                    last_node=last_node,
-                    swa_evicted_seqlen=0,
-                )
-
-                cache.evict_req_swa(req, pre_len=16, dp_rank=0)
-
-                self.assertEqual(req.swa_evicted_seqlen, 11)
-                if kind == "chunk":
-                    self.assertTrue(np.all(_swa_indices(allocator, row[:11], 0) == 0))
-                    self.assertTrue(np.all(_swa_indices(allocator, row[11:], 0) > 0))
-                else:
-                    np.testing.assert_array_equal(_swa_indices(allocator, tree_full, 0), tree_swa)
-                    self.assertTrue(np.all(_swa_indices(allocator, row[4:11], 0) == 0))
-                    self.assertTrue(np.all(_swa_indices(allocator, row[11:], 0) > 0))
-
-    def test_chunk_cache_refreshes_then_releases_exact_lock_receipt(self):
-        cache, allocator = _make_cache(window=4, kind="chunk")
-        full = allocator.alloc(4, dp_rank=0)
-        self.assertIsNotNone(full)
-        cache.req_to_token_pool.write((0, slice(0, 4)), full)
-        old_receipt = DecLockRefParams(
-            swa_uuid_for_lock=17,
-            skip_lock_node_ids={ComponentType.SWA: [3]},
-        )
-        new_lock = IncLockRefResult(
-            swa_uuid_for_lock=23,
-            skip_lock_node_ids={ComponentType.SWA: [9]},
-        )
-        releases = []
-        cache.dec_lock_ref = lambda _node, params=None: releases.append(params) or 0
-        cache.inc_lock_ref = lambda _node: new_lock
-
-        class _Req:
-            def pop_committed_kv_cache(self):
-                return 4
-
-        req = _Req()
-        req.req_pool_idx = 0
-        req.dp_rank = 0
-        req.fill_ids = [0, 1, 2, 3]
-        req.last_node = object()
-        req.cache_lock_params = old_receipt
-        req.swa_uuid_for_lock = old_receipt.swa_uuid_for_lock
-
-        cache.cache_unfinished_req(req)
-        refreshed = req.cache_lock_params
-
-        self.assertEqual(releases, [old_receipt])
-        self.assertEqual(refreshed.swa_uuid_for_lock, 23)
-        self.assertEqual(refreshed.skip_lock_node_ids, {ComponentType.SWA: [9]})
-        self.assertEqual(req.swa_uuid_for_lock, 23)
-
-        cache.cache_finished_req(req)
-
-        self.assertEqual(len(releases), 2)
-        self.assertIs(releases[1], refreshed)
-        self.assertIsNone(req.cache_lock_params)
-        self.assertIsNone(req.swa_uuid_for_lock)
-
-    def test_disabled_radix_finish_still_clears_lock_receipt(self):
-        for kind in ("unified", "legacy"):
-            with self.subTest(kind=kind):
-                cache, allocator = _make_cache(window=4, kind=kind)
-                cache.disable = True
-                full = allocator.alloc(4, dp_rank=0)
-                self.assertIsNotNone(full)
-                cache.req_to_token_pool.write((0, slice(0, 4)), full)
-
-                class _Req:
-                    def pop_committed_kv_cache(self):
-                        return 4
-
-                req = _Req()
-                req.req_pool_idx = 0
-                req.dp_rank = 0
-                req.fill_ids = [0, 1, 2, 3]
-                req.last_node = None
-                req.cache_lock_params = DecLockRefParams(swa_uuid_for_lock=17)
-                req.swa_uuid_for_lock = 17
-
-                cache.cache_unfinished_req(req)
-                self.assertIsNotNone(req.cache_lock_params)
-                self.assertIsNone(req.cache_lock_params.swa_uuid_for_lock)
-                self.assertIsNone(req.swa_uuid_for_lock)
-
-                req.cache_lock_params = DecLockRefParams(swa_uuid_for_lock=17)
-                req.swa_uuid_for_lock = 17
-                cache.cache_finished_req(req)
-
-                self.assertIsNone(req.cache_lock_params)
-                self.assertIsNone(req.swa_uuid_for_lock)
 
     def test_internal_swa_eviction_keeps_full_tree_owned(self):
         cache, allocator = _make_cache(window=4)
@@ -905,14 +424,14 @@ class TestUnifiedSWAComponentPage1(CustomTestCase):
         self.assertEqual(cache.component_protected_size_[ComponentType.SWA][0], 0)
         self.assertEqual(parent.component_data[ComponentType.SWA].metadata["component_uuid"], uuid)
 
-    def test_overlap_healing_decision_table_preserves_boundary_semantics_and_events(self):
+    def test_overlap_healing_decision_table_preserves_boundary_semantics(self):
         """Before/inside/after boundaries heal only request-owned tombstone suffixes."""
         cases = (
-            ("before", 0, 0, 8, 1),
-            ("inside", 4, 4, 4, 1),
-            ("after", 8, 8, 0, 0),
+            ("before", 0, 0, 8),
+            ("inside", 4, 4, 4),
+            ("after", 8, 8, 0),
         )
-        for name, evicted, expected_boundary, adopted, expected_healed in cases:
+        for name, evicted, expected_boundary, adopted in cases:
             with self.subTest(position=name):
                 cache, allocator = _make_cache(window=8)
                 _insert(cache, allocator, list(range(8)))
@@ -925,7 +444,6 @@ class TestUnifiedSWAComponentPage1(CustomTestCase):
                 self.assertIsNotNone(replacement)
                 full_free_before = allocator.full_available_size()
                 swa_free_before = allocator.swa_available_size()
-                healed_before = cache.cache_ledger_snapshot(0, [])["tombstone_healed_total"]
 
                 boundary = cache.components[ComponentType.SWA].update_component_on_insert_overlap(
                     node,
@@ -938,9 +456,6 @@ class TestUnifiedSWAComponentPage1(CustomTestCase):
                 self.assertEqual(boundary, expected_boundary)
                 self.assertEqual(allocator.full_available_size(), full_free_before + adopted)
                 self.assertEqual(allocator.swa_available_size(), swa_free_before)
-                healed = cache.cache_ledger_snapshot(0, [])["tombstone_healed_total"]
-                self.assertEqual(healed, healed_before + expected_healed)
-
                 if name == "before":
                     np.testing.assert_array_equal(
                         node.component_data[ComponentType.FULL].value,
@@ -978,12 +493,6 @@ class TestUnifiedSWAComponentPage1(CustomTestCase):
                         old_full,
                     )
                     self.assertIsNone(node.component_data[ComponentType.SWA].value)
-
-                cache.reset()
-                self.assertEqual(
-                    cache.cache_ledger_snapshot(0, [])["tombstone_healed_total"],
-                    healed,
-                )
 
     def test_locked_tombstone_healing_preserves_full_indices_for_existing_request(self):
         """Healing may adopt fresh SWA slots, but must not free another request's FULL KV."""
@@ -1028,7 +537,6 @@ class TestUnifiedSWAComponentPage1(CustomTestCase):
 
                 cache.dec_lock_ref(node, existing_request_lock.to_dec_params())
                 self.assertEqual(cache.component_protected_size_[ComponentType.FULL][0], 0)
-                _assert_rank_ledger(self, cache, allocator, _RequestOwnership(), 0)
 
     def test_fully_request_evicted_leaf_is_not_materialized(self):
         cache, allocator = _make_cache(window=4)
@@ -1062,204 +570,8 @@ class TestUnifiedSWAComponentPage1(CustomTestCase):
         self.assertEqual(allocator.swa_available_size(), swa_free_before + 4)
         self.assertIsNone(node.component_data[ComponentType.FULL].value)
 
-    def test_leaf_deletion_does_not_count_as_a_retained_swa_tombstone(self):
-        for kind in ("unified", "legacy"):
-            with self.subTest(kind=kind):
-                cache, allocator = _make_cache(window=4, kind=kind)
-                _insert(cache, allocator, list(range(4)))
-                before = cache.cache_ledger_snapshot(0, [])["tombstone_created_total"]
 
-                cache.evict(EvictParams(swa_num_tokens=4))
-
-                self.assertFalse(cache.root_node.children)
-                self.assertEqual(
-                    cache.cache_ledger_snapshot(0, [])["tombstone_created_total"],
-                    before,
-                )
-
-
-class TestUnifiedSWAComponentPagedAndDP2(CustomTestCase):
-    def test_scheduler_lifecycle_heals_internal_tombstones_for_both_swa_routes(self):
-        """Check healing; admission/pressure tests own capacity-triggered eviction."""
-        shared = list(range(4))
-        seed_inputs = [
-            # Keep the shared node outside the active window + page cushion so
-            # repeated public eviction can reach a real internal tombstone.
-            shared + list(range(100, 116)),
-            shared + list(range(200, 216)),
-        ]
-        evict_params = EvictParams(swa_num_tokens=len(shared), dp_rank=0)
-        previous_chunk = global_server_args_dict.get("chunked_prefill_size")
-        global_server_args_dict["chunked_prefill_size"] = 64
-        try:
-            for kind in ("legacy", "unified"):
-                with self.subTest(kind=kind):
-                    cache, allocator = _make_cache(
-                        page_size=4,
-                        window=8,
-                        kind=kind,
-                        size=128,
-                        size_swa=128,
-                    )
-                    for ordinal, input_ids in enumerate(seed_inputs):
-                        _run_scheduler_lifecycle(
-                            cache,
-                            allocator,
-                            rid=f"{kind}-seed-{ordinal}",
-                            input_ids=input_ids,
-                        )
-
-                    self.assertEqual(len(cache.root_node.children), 1)
-                    target = next(iter(cache.root_node.children.values()))
-                    self.assertEqual(list(target.key.token_ids), shared)
-                    self.assertTrue(target.children)
-                    if kind == "legacy":
-                        self.assertIsNotNone(target.value)
-                        self.assertFalse(target.swa_tombstone)
-                    else:
-                        self.assertIsNotNone(target.component_data[ComponentType.FULL].value)
-                        self.assertIsNotNone(target.component_data[ComponentType.SWA].value)
-
-                    before_evict = cache.cache_ledger_snapshot(0, [])
-                    for _ in range(3):
-                        evicted = cache.evict(evict_params)
-                        self.assertGreater(evicted.swa_num_tokens_evicted, 0)
-                        is_tombstone = (
-                            target.swa_tombstone
-                            if kind == "legacy"
-                            else target.component_data[ComponentType.SWA].value is None
-                        )
-                        if is_tombstone:
-                            break
-                    else:
-                        self.fail(f"{kind} did not tombstone the shared internal prefix")
-
-                    after_evict = cache.cache_ledger_snapshot(0, [])
-                    self.assertTrue(target.children)
-                    if kind == "legacy":
-                        self.assertIsNotNone(target.value)
-                        self.assertTrue(target.swa_tombstone)
-                    else:
-                        self.assertIsNotNone(target.component_data[ComponentType.FULL].value)
-                        self.assertIsNone(target.component_data[ComponentType.SWA].value)
-                    self.assertGreater(
-                        after_evict["tombstone_created_total"],
-                        before_evict["tombstone_created_total"],
-                    )
-
-                    _run_scheduler_lifecycle(
-                        cache,
-                        allocator,
-                        rid=f"{kind}-healing",
-                        input_ids=seed_inputs[0],
-                    )
-
-                    healed = cache.cache_ledger_snapshot(0, [])
-                    self.assertGreater(
-                        healed["tombstone_healed_total"],
-                        after_evict["tombstone_healed_total"],
-                    )
-                    if kind == "legacy":
-                        self.assertFalse(target.swa_tombstone)
-                    else:
-                        self.assertIsNotNone(target.component_data[ComponentType.SWA].value)
-                    match = cache.match_prefix(MatchPrefixParams(key=RadixKey(shared, dp_rank=0)))
-                    self.assertIs(match.last_device_node, target)
-                    self.assertEqual(len(match.device_indices), len(shared))
-                    validate_swa_cache_ledger(healed, require_idle=True)
-
-                    cache.reset()
-                    reset = cache.cache_ledger_snapshot(0, [])
-                    self.assertEqual(cache.swa_evictable_size(), 0)
-                    self.assertEqual(cache.swa_protected_size(), 0)
-                    self.assertEqual(
-                        reset["tombstone_created_total"],
-                        healed["tombstone_created_total"],
-                    )
-                    self.assertEqual(
-                        reset["tombstone_healed_total"],
-                        healed["tombstone_healed_total"],
-                    )
-        finally:
-            if previous_chunk is None:
-                global_server_args_dict.pop("chunked_prefill_size", None)
-            else:
-                global_server_args_dict["chunked_prefill_size"] = previous_chunk
-
-    def test_live_partial_page_ledger_conserves_all_three_swa_routes(self):
-        """Reserved page tails remain owned without pretending to be mapped tokens."""
-        for page_size in (128, 256):
-            for kind in ("unified", "legacy", "chunk"):
-                with self.subTest(page_size=page_size, kind=kind):
-                    cache, allocator = _make_cache(
-                        page_size=page_size,
-                        window=page_size,
-                        kind=kind,
-                    )
-                    full = allocator.alloc_extend(
-                        prefix_lens=[0],
-                        seq_lens=[1],
-                        last_loc=[0],
-                        extend_num_tokens=1,
-                        dp_rank=0,
-                    )
-                    self.assertIsNotNone(full)
-                    cache.req_to_token_pool.write((0, slice(0, 1)), full)
-                    req = SimpleNamespace(
-                        rid=f"{kind}-{page_size}",
-                        dp_rank=0,
-                        req_pool_idx=0,
-                        cache_protected_len=0,
-                        kv_allocated_len=1,
-                        swa_evicted_seqlen=0,
-                    )
-
-                    snapshot = cache.cache_ledger_snapshot(0, [req])
-
-                    self.assertEqual(snapshot["full_request_owned"], 1)
-                    self.assertEqual(snapshot["swa_request_owned"], 1)
-                    self.assertEqual(snapshot["full_reserved_page_slack"], page_size - 1)
-                    self.assertEqual(snapshot["swa_reserved_page_slack"], page_size - 1)
-                    self.assertEqual(snapshot["mapping_nonzero_count"], 1)
-                    validate_swa_cache_ledger(snapshot, require_idle=False)
-
-                    if kind == "legacy":
-                        cache.insert(
-                            InsertParams(
-                                key=RadixKey([1]),
-                                value=full,
-                            )
-                        )
-                        idle_snapshot = cache.cache_ledger_snapshot(0, [])
-                        self.assertEqual(idle_snapshot["full_tree_evictable"], 1)
-                        self.assertEqual(idle_snapshot["swa_tree_evictable"], 1)
-                        self.assertEqual(idle_snapshot["full_request_owned"], 0)
-                        self.assertEqual(idle_snapshot["swa_request_owned"], 0)
-                        self.assertEqual(idle_snapshot["full_reserved_page_slack"], page_size - 1)
-                        self.assertEqual(idle_snapshot["swa_reserved_page_slack"], page_size - 1)
-                        validate_swa_cache_ledger(idle_snapshot, require_idle=True)
-
-    def test_unscoped_eviction_totals_are_attributed_to_each_rank_and_survive_reset(self):
-        cache, allocator = _make_cache(page_size=128, dp_size=2, window=128)
-        _insert(cache, allocator, list(range(128)), dp_rank=0)
-        _insert(cache, allocator, list(range(1000, 1128)), dp_rank=1)
-
-        result = cache.evict(EvictParams(swa_num_tokens=256, dp_rank=None))
-
-        self.assertEqual(result.swa_num_tokens_evicted, 256)
-        before_reset = [cache.cache_ledger_snapshot(rank, []) for rank in (0, 1)]
-        self.assertEqual([row["full_evicted_total"] for row in before_reset], [128, 128])
-        self.assertEqual([row["swa_evicted_total"] for row in before_reset], [128, 128])
-        cache.reset()
-        after_reset = [cache.cache_ledger_snapshot(rank, []) for rank in (0, 1)]
-        self.assertEqual(
-            [row["full_evicted_total"] for row in after_reset],
-            [row["full_evicted_total"] for row in before_reset],
-        )
-        self.assertEqual(
-            [row["swa_evicted_total"] for row in after_reset],
-            [row["swa_evicted_total"] for row in before_reset],
-        )
+class TestUnifiedSWAComponentPaged(CustomTestCase):
 
     def test_paged_mid_node_split_and_heal_are_page_aligned(self):
         """Both page sizes exercise a mid-node split; page1 covers whole-node healing."""
@@ -1334,102 +646,6 @@ class TestUnifiedSWAComponentPagedAndDP2(CustomTestCase):
         self.assertEqual(result.swa_num_tokens_evicted, allocator.swa_available_size() - before)
         self.assertEqual(result.swa_num_tokens_evicted, 128)
 
-    def test_dp2_rejects_ambiguous_missing_node_rank(self):
-        cache, allocator = _make_cache(page_size=128, dp_size=2, window=128)
-        with self.assertRaisesRegex(ValueError, "dp_rank"):
-            _insert(cache, allocator, list(range(128)))
-
-    def test_dp2_free_evict_heal_mutate_only_target_rank(self):
-        cache, allocator = _make_cache(page_size=128, dp_size=2, window=128)
-        ownership = _RequestOwnership()
-        _insert(cache, allocator, list(range(128)), dp_rank=0, ownership=ownership)
-        reserved = allocator.swa_attn_allocator.alloc(128, dp_rank=1)
-        self.assertIsNotNone(reserved)
-        _insert(
-            cache,
-            allocator,
-            list(range(1000, 1128)),
-            dp_rank=1,
-            ownership=ownership,
-        )
-        node0 = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(list(range(128)), dp_rank=0))
-        ).last_device_node
-        node1 = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(list(range(1000, 1128)), dp_rank=1))
-        ).last_device_node
-        np.testing.assert_array_equal(
-            node0.component_data[ComponentType.FULL].value,
-            node1.component_data[ComponentType.FULL].value,
-        )
-        self.assertFalse(
-            np.array_equal(
-                node0.component_data[ComponentType.SWA].value,
-                node1.component_data[ComponentType.SWA].value,
-            )
-        )
-        allocator.swa_attn_allocator.free(reserved, dp_rank=1)
-        for rank in (0, 1):
-            _assert_rank_ledger(self, cache, allocator, ownership, rank)
-            snapshot = cache.cache_ledger_snapshot(rank, [])
-            validate_swa_cache_ledger(snapshot, require_idle=True)
-            self.assertEqual(snapshot["full_tree_evictable"], 128)
-            self.assertEqual(snapshot["swa_tree_evictable"], 128)
-        full0 = node0.component_data[ComponentType.FULL].value.copy()
-        full1 = node1.component_data[ComponentType.FULL].value.copy()
-        swa0 = _swa_indices(allocator, full0, 0)
-        swa1 = _swa_indices(allocator, full1, 1)
-        rank0_full_free_before_evict = _allocator_free_indices(allocator.full_attn_allocator, 0)
-        rank0_swa_free_before_evict = _allocator_free_indices(allocator.swa_attn_allocator, 0)
-        rank1_full_free = _allocator_free_indices(allocator.full_attn_allocator, 1)
-        rank1_swa_free = _allocator_free_indices(allocator.swa_attn_allocator, 1)
-        cache.components[ComponentType.SWA].evict_component(node0)
-        self.assertTrue(np.all(_swa_indices(allocator, full0, 0) == 0))
-        self.assertTrue(np.all(_swa_indices(allocator, full1, 1) > 0))
-        self.assertEqual(
-            _allocator_free_indices(allocator.full_attn_allocator, 0), rank0_full_free_before_evict
-        )
-        self.assertEqual(
-            _allocator_free_indices(allocator.swa_attn_allocator, 0),
-            rank0_swa_free_before_evict | set(int(index) for index in swa0),
-        )
-        self.assertEqual(_allocator_free_indices(allocator.full_attn_allocator, 1), rank1_full_free)
-        self.assertEqual(_allocator_free_indices(allocator.swa_attn_allocator, 1), rank1_swa_free)
-        replacement = allocator.alloc(128, dp_rank=0)
-        self.assertIsNotNone(replacement)
-        replacement_swa = _swa_indices(allocator, replacement, 0)
-        rank0_full_free_before_heal = _allocator_free_indices(allocator.full_attn_allocator, 0)
-        rank0_swa_free_before_heal = _allocator_free_indices(allocator.swa_attn_allocator, 0)
-        cache.insert(
-            InsertParams(
-                key=RadixKey(list(range(128)), dp_rank=0),
-                value=replacement,
-                swa_evicted_seqlen=0,
-            )
-        )
-        np.testing.assert_array_equal(node0.component_data[ComponentType.FULL].value, replacement)
-        np.testing.assert_array_equal(
-            node0.component_data[ComponentType.SWA].value, replacement_swa
-        )
-        self.assertTrue(np.all(replacement_swa > 0))
-        self.assertEqual(
-            _allocator_free_indices(allocator.full_attn_allocator, 0),
-            rank0_full_free_before_heal | set(int(index) for index in full0),
-        )
-        self.assertEqual(
-            _allocator_free_indices(allocator.swa_attn_allocator, 0), rank0_swa_free_before_heal
-        )
-        np.testing.assert_array_equal(node1.component_data[ComponentType.FULL].value, full1)
-        np.testing.assert_array_equal(node1.component_data[ComponentType.SWA].value, swa1)
-        self.assertEqual(_allocator_free_indices(allocator.full_attn_allocator, 1), rank1_full_free)
-        self.assertEqual(_allocator_free_indices(allocator.swa_attn_allocator, 1), rank1_swa_free)
-        _assert_rank_ledger(self, cache, allocator, ownership, 0)
-        _assert_rank_ledger(self, cache, allocator, ownership, 1)
-        lock = cache.inc_lock_ref(node0)
-        _assert_rank_ledger(self, cache, allocator, ownership, 0)
-        _assert_rank_ledger(self, cache, allocator, ownership, 1)
-        cache.dec_lock_ref(node0, lock.to_dec_params())
-
     def test_real_retract_and_abort_release_receipts_and_window_locks(self):
         class _ReleaseReq:
             def __init__(self, cache, allocator, rid):
@@ -1494,7 +710,6 @@ class TestUnifiedSWAComponentPagedAndDP2(CustomTestCase):
         self.assertIsNone(retract_req.swa_uuid_for_lock)
         for component_data in retract_req.last_node.component_data:
             self.assertEqual(component_data.lock_ref, 0)
-        validate_swa_cache_ledger(cache.cache_ledger_snapshot(0, []), require_idle=True)
 
         cache, allocator = _make_cache(window=4)
         abort_req = _ReleaseReq(cache, allocator, "abort")
@@ -1513,7 +728,6 @@ class TestUnifiedSWAComponentPagedAndDP2(CustomTestCase):
         self.assertIsNone(abort_req.req_pool_idx)
         for component_data in abort_req.last_node.component_data:
             self.assertEqual(component_data.lock_ref, 0)
-        validate_swa_cache_ledger(cache.cache_ledger_snapshot(0, []), require_idle=True)
 
 
 if __name__ == "__main__":
