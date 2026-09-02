@@ -513,15 +513,9 @@ class EPMoE(nnx.Module):
         scatter_on_tensor: bool = False,
     ):
         expert_shard_id = jax.lax.axis_index("expert")
-        if hidden_states.ndim == 2:
-            total_tokens = hidden_states.shape[0]
-            batch_size, seq_len = 1, total_tokens
-        else:
-            batch_size, seq_len = hidden_states.shape[0], hidden_states.shape[1]
-            total_tokens = batch_size * seq_len
 
-        inputs_2d, token_indices, sorted_selected_experts, weights, group_sizes = self._permute(
-            hidden_states, topk_ids, topk_weights
+        inputs_2d, token_indices, sorted_selected_experts, group_sizes = self._permute(
+            hidden_states, topk_ids
         )
 
         group_sizes = group_sizes.astype(jnp.int32)
@@ -547,9 +541,7 @@ class EPMoE(nnx.Module):
         output = self._unpermute(
             intermediate_output,
             sorted_selected_experts,
-            weights,
-            batch_size,
-            seq_len,
+            topk_weights,
         )
 
         # Reduce on the "tensor" axis. RS (psum_scatter) when caller asked
@@ -683,12 +675,12 @@ class EPMoE(nnx.Module):
     def _combine(self, data):
         return jax.lax.psum(data, "expert")
 
-    def _permute(self, inputs, top_k_indices, top_k_weights):
+    def _permute(self, inputs, top_k_indices):
         inputs_shape = inputs.shape
 
         if len(inputs_shape) == 2:
-            inputs_2d = inputs
             bsz_times_seq_len = inputs_shape[0]
+            inputs_2d = inputs
         else:
             bsz_times_seq_len = inputs_shape[0] * inputs_shape[1]
             inputs_2d = jnp.reshape(inputs, (bsz_times_seq_len, inputs_shape[-1]))
@@ -708,11 +700,16 @@ class EPMoE(nnx.Module):
             inputs_2d,
             token_indices,
             sorted_selected_experts,
-            top_k_weights,
             group_sizes,
         )
 
-    def _unpermute(self, intermediate, sorted_selected_experts, weights, batch_size, seq_len):
+    def _unpermute(self, intermediate, sorted_selected_experts, weights):
+        if weights.ndim != 2:
+            raise ValueError(
+                "EPMoE._unpermute expects 2-D routing weights [tokens, top_k], got "
+                f"shape {weights.shape}"
+            )
+
         expected_tokens = sorted_selected_experts.shape[0]
         actual_tokens = intermediate.shape[0]
 
@@ -748,10 +745,7 @@ class EPMoE(nnx.Module):
             weights_fp32,
         )
 
-        if len(weights.shape) == 2:
-            final_output = output.astype(self.dtype)
-        else:
-            final_output = output.reshape(batch_size, seq_len, -1).astype(self.dtype)
+        final_output = output.astype(self.dtype)
 
         return final_output
 
