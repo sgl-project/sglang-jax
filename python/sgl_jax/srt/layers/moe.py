@@ -16,6 +16,7 @@ from sgl_jax.srt.kernels.sparse_core.moe_permute import (
     moe_sc_permute_enabled_by_env,
     sc_combine,
     sc_dispatch_gather,
+    should_use_sparse_core,
 )
 
 # Re-export for backward compatibility: external code imports from this module.
@@ -632,7 +633,11 @@ class EPMoE(nnx.Module):
 
         local_range = None
         valid_mask = None
-        if self.use_sc_permute:
+        # Trace-time gate: small (decode-sized) batches keep the exact XLA path so
+        # their HLO is identical to the flag-off build.
+        if self.use_sc_permute and should_use_sparse_core(
+            token_indices.shape[0], inputs_2d.shape[-1], self.dtype
+        ):
             # Sorted-row range owned by this expert shard, and which routed slots
             # (token-major order) landed on a local expert.
             csum = jnp.cumsum(group_sizes)

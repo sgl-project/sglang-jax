@@ -159,6 +159,37 @@ class EPMoEScPermuteTest(absltest.TestCase):
         self.assertLess(np.abs(a - b).max(), 2e-2 * scale)
         self.assertLess(np.abs(a - b).mean(), 5e-3 * np.abs(a).mean())
 
+    def test_small_batch_lowers_to_identical_hlo(self):
+        """Decode-sized batches must not pay for the opt-in: the SC gate is trace-time,
+        so the lowered module is byte-identical to the flag-off path."""
+        ndev = len(jax.devices())
+        mesh = create_device_mesh(ici_parallelism=[1, ndev], dcn_parallelism=[1, 1])
+        hidden, inter, num_experts, topk, T = 1024, 512, 4 * ndev, 4, 32
+        topk_ids, w, *_ = _routing(T, num_experts, topk, seed=5)
+        with jax.set_mesh(mesh):
+            common = dict(
+                hidden_size=hidden,
+                num_experts=num_experts,
+                num_experts_per_tok=topk,
+                ep_size=ndev,
+                mesh=mesh,
+                intermediate_dim=inter,
+            )
+            layer_xla = EPMoE(use_sc_permute=False, **common)
+            layer_sc = EPMoE(use_sc_permute=True, **common)
+            for name in ("wi_0", "wi_1", "wo"):
+                getattr(layer_sc, name).value = getattr(layer_xla, name).value
+            sh = jax.sharding.NamedSharding(mesh, P(None, None))
+            hs = jax.device_put(jnp.zeros((T, hidden), jnp.bfloat16), sh)
+            tw = jax.device_put(jnp.asarray(w), sh)
+            ti = jax.device_put(jnp.asarray(topk_ids.astype(np.int32)), sh)
+            texts = []
+            for layer in (layer_xla, layer_sc):
+                fn = jax.jit(lambda h, tw_, ti_, layer_=layer: layer_(h, tw_, ti_))
+                texts.append(fn.lower(hs, tw, ti).as_text())
+        self.assertEqual(texts[0], texts[1])
+        self.assertNotIn("sc_ragged_gather", texts[1])
+
     def test_env_flag_default_off(self):
         ndev = len(jax.devices())
         mesh = create_device_mesh(ici_parallelism=[1, ndev], dcn_parallelism=[1, 1])

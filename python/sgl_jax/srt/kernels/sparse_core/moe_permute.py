@@ -56,6 +56,22 @@ def _small_for_sparse_core(nbytes: int) -> bool:
     return nbytes * 2 < _tc_vmem_bytes() * _SMALL_INPUT_VMEM_FRACTION
 
 
+def should_use_sparse_core(num_rows: int, hidden: int, dtype) -> bool:
+    """Trace-time decision shared by EPMoE and the wrappers below.
+
+    False means "emit exactly the XLA formulation" -- callers must not add any
+    masking/range bookkeeping in that case, so decode-sized batches keep an HLO
+    identical to the flag-off path (and hit the same compilation cache).
+    """
+    nbits = jax.dtypes.itemsize_bits(dtype)
+    return (
+        sparse_core_available()
+        and nbits in _SUPPORTED_GATHER_BITS
+        and hidden % 128 == 0
+        and not _small_for_sparse_core(num_rows * hidden * nbits // 8)
+    )
+
+
 def reference_combine(
     intermediate: jax.Array, revert_indices: jax.Array, weights: jax.Array, top_k: int
 ) -> jax.Array:
@@ -75,14 +91,7 @@ def sc_dispatch_gather(
     Rows outside the range are never read by the grouped matmul (they belong to
     other devices' experts), so skipping them is what makes this cheaper than XLA.
     """
-    rows, hidden = token_indices.shape[0], inputs_2d.shape[-1]
-    nbits = jax.dtypes.itemsize_bits(inputs_2d.dtype)
-    if (
-        not sparse_core_available()
-        or nbits not in _SUPPORTED_GATHER_BITS
-        or hidden % 128 != 0
-        or _small_for_sparse_core(rows * hidden * nbits // 8)
-    ):
+    if not should_use_sparse_core(token_indices.shape[0], inputs_2d.shape[-1], inputs_2d.dtype):
         return inputs_2d[token_indices]
     from sgl_jax.srt.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
 
@@ -101,13 +110,12 @@ def sc_combine(
     ``valid_mask[i]`` marks whether routed slot ``i`` (token-major order) hit a
     local expert; masked rows contribute zero regardless of their contents.
     """
-    hidden = intermediate.shape[-1]
     if (
-        not sparse_core_available()
-        or intermediate.dtype != jnp.bfloat16
+        intermediate.dtype != jnp.bfloat16
         or weights.dtype not in (jnp.float32, jnp.bfloat16)
-        or hidden % 128 != 0
-        or _small_for_sparse_core(intermediate.size * 2)
+        or not should_use_sparse_core(
+            intermediate.shape[0], intermediate.shape[-1], intermediate.dtype
+        )
     ):
         masked = jnp.where(valid_mask.reshape(-1, 1), weights.reshape(-1, 1), 0).reshape(-1)
         return reference_combine(intermediate, revert_indices, masked, top_k)
