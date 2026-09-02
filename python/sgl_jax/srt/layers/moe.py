@@ -704,10 +704,10 @@ class EPMoE(nnx.Module):
         )
 
     def _unpermute(self, intermediate, sorted_selected_experts, weights):
-        if weights.ndim != 2:
+        if weights.ndim != 2 or weights.shape[1] != self.num_experts_per_tok:
             raise ValueError(
-                "EPMoE._unpermute expects 2-D routing weights [tokens, top_k], got "
-                f"shape {weights.shape}"
+                "EPMoE._unpermute expects 2-D routing weights "
+                f"[tokens, {self.num_experts_per_tok}], got shape {weights.shape}"
             )
 
         expected_tokens = sorted_selected_experts.shape[0]
@@ -728,16 +728,13 @@ class EPMoE(nnx.Module):
         )
         unsort_intermediate = jnp.take(intermediate, indices=argsort_indices, axis=0)
 
-        total_tokens = weights.shape[0] * weights.shape[1] // self.num_experts_per_tok
-
-        reshaped_weights = jnp.reshape(weights, (total_tokens, self.num_experts_per_tok))
         reshaped_intermediate = jnp.reshape(
             unsort_intermediate,
-            (total_tokens, self.num_experts_per_tok, -1),
+            (weights.shape[0], self.num_experts_per_tok, -1),
         )
 
         intermediate_fp32 = reshaped_intermediate.astype(jnp.float32)
-        weights_fp32 = reshaped_weights.astype(jnp.float32)
+        weights_fp32 = weights.astype(jnp.float32)
 
         output = jnp.einsum(
             "BKE,BK -> BE",

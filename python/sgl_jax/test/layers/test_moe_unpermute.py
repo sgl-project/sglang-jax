@@ -52,9 +52,11 @@ def test_unpermute():
         np.asarray(moe._unpermute(padded, order, weights)), np.asarray(out)
     )
 
-    # sglang-jax is token-flat, so anything but [tokens, top_k] is a caller bug.
-    with pytest.raises(ValueError, match="expects 2-D routing weights"):
-        moe._unpermute(gmm_out, order, jnp.reshape(weights, (1, TOKENS, TOP_K)))
+    # sglang-jax is token-flat, so anything but [tokens, top_k] is a caller bug --
+    # including (tokens * top_k, 1), which reshapes cleanly but means something else.
+    for bad_shape in ((1, TOKENS, TOP_K), (TOKENS * TOP_K, 1)):
+        with pytest.raises(ValueError, match="expects 2-D routing weights"):
+            moe._unpermute(gmm_out, order, jnp.reshape(weights, bad_shape))
 
 
 if __name__ == "__main__":
