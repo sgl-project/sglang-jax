@@ -581,7 +581,7 @@ def _build_draft_extend(num_layers: int, topk: int):
 
             topk_idx = _topk1_index_from_logits(output.next_token_logits)
             all_topk_index.append(topk_idx)
-            jax.debug.print("[SPEC_DRAFT_EXTEND] Step {step} predicted draft token IDs: {tok}", step=i, tok=topk_idx[:, 0])
+            # jax.debug.print("[SPEC_DRAFT_EXTEND] Step {step} predicted draft token IDs: {tok}", step=i, tok=topk_idx[:, 0])
 
             if i < num_layers - 1:
                 ext_lens = forward_batch.extend_seq_lens
@@ -1064,13 +1064,13 @@ def _build_verify(topk: int):
         prepared_sel_pos_data = prepared.sel_pos
         prepared_predict = prepared.predict
         
-        jax.debug.print(
-            "\n[SPEC_VERIFY]\n  Draft tokens: {d}\n  Target predicted: {t}\n  Accept length: {a}\n  Verified tokens: {v}",
-            d=draft_tokens,
-            t=prepared.predict,
-            a=prepared.accept_lens,
-            v=prepared.verified_id,
-        )
+        # jax.debug.print(
+        #     "\n[SPEC_VERIFY]\n  Draft tokens: {d}\n  Target predicted: {t}\n  Accept length: {a}\n  Verified tokens: {v}",
+        #     d=draft_tokens,
+        #     t=prepared.predict,
+        #     a=prepared.accept_lens,
+        #     v=prepared.verified_id,
+        # )
         prepared_positions = prepared.positions
         prepared_positions_data = prepared.positions
         prepared_verify_seq_lens = target_forward_batch.seq_lens

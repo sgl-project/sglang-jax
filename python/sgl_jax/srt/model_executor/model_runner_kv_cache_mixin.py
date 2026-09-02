@@ -436,7 +436,7 @@ class ModelRunnerKVCacheMixin:
             and not self.spec_algorithm.is_none()
         ):
             # Reserve 2 GB entirely for the Draft Worker's KV buffer and XLA fragmentation.
-            overhead_bytes = 18 * 1024 * 1024 * 1024
+            overhead_bytes = 3 * 1024 * 1024 * 1024
             logger.info(f"Deducting {overhead_bytes} bytes from available KV cache for draft memory overhead")
             available_kv_cache_bytes -= overhead_bytes
 
@@ -873,6 +873,10 @@ class ModelRunnerKVCacheMixin:
 
         For hybrid recurrent models, only full-attention layers need KV cache.
         """
+
+        if getattr(self, "is_draft_worker", False):
+            return 1
+
         cfg = self.linear_recurrent_config
         if cfg is not None:
             return len(cfg.full_attention_layer_ids)
