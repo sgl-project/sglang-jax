@@ -150,7 +150,6 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             tree_components=(ComponentType.FULL, ComponentType.RECURRENT),
             enable_recurrent_extra_buffer=params.enable_recurrent_extra_buffer,
             recurrent_track_interval=params.recurrent_track_interval,
-            component_init_params=params,
         )
 
     if (
@@ -173,9 +172,6 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             max_seq_len=ctx.server_args.max_seq_len,
             is_eagle=params.is_eagle,
             tree_components=(ComponentType.FULL,),
-            enable_recurrent_extra_buffer=params.enable_recurrent_extra_buffer,
-            recurrent_track_interval=params.recurrent_track_interval,
-            component_init_params=params,
         )
 
     from sgl_jax.srt.mem_cache.radix_cache import RadixCache

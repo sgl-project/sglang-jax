@@ -183,7 +183,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
         self.tree_components = tree_components
         self.components: dict[ComponentType, TreeComponent] = {
-            ct: COMPONENT_REGISTRY[ct](self, component_init_params) for ct in tree_components
+            ct: COMPONENT_REGISTRY[ct](
+                self,
+                component_init_params if ct == ComponentType.SWA else None,
+            )
+            for ct in tree_components
         }
         self._components_tuple: tuple[TreeComponent, ...] = tuple(self.components.values())
 

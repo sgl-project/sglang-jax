@@ -10,7 +10,6 @@ if os.environ.get("USE_DEVICE_TYPE") == "cpu":
     os.environ["JAX_PLATFORMS"] = "cpu"
 
 import unittest
-from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -32,10 +31,6 @@ from sgl_jax.srt.mem_cache.memory_pool import (
 )
 from sgl_jax.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
-from sgl_jax.srt.mem_cache.registry import (
-    TreeCacheBuildContext,
-    default_radix_cache_factory,
-)
 from sgl_jax.srt.mem_cache.unified_cache_components import ComponentType, FullComponent
 from sgl_jax.srt.mem_cache.unified_cache_components import (
     InsertResult as ComponentInsertResult,
@@ -2249,47 +2244,27 @@ class TestUnifiedRadixCacheComponentSeams(unittest.TestCase):
         self.assertTrue(result.recurrent_exist)
         self.assertTrue(result.recurrent_committed)
 
-    def test_components_receive_cache_init_params(self):
-        COMPONENT_REGISTRY[ComponentType.FULL] = _RecordingFullComponent
-        req_pool, allocator, cache = self._create_cache(tree_components=(ComponentType.FULL,))
-
-        received = cache.components[ComponentType.FULL].received_params
-        self.assertIsInstance(received, CacheInitParams)
-        self.assertIs(received.req_to_token_pool, req_pool)
-        self.assertIs(received.token_to_kv_pool_allocator, allocator)
-        self.assertEqual(received.page_size, 1)
-
-    def test_full_registry_route_accepts_nondefault_recurrent_params(self):
+    def test_cache_init_params_are_scoped_to_swa_component(self):
         COMPONENT_REGISTRY[ComponentType.FULL] = _RecordingFullComponent
         req_pool = _RecordingReqToTokenPool()
         allocator = _RecordingAllocator()
         params = CacheInitParams(
             req_to_token_pool=req_pool,
             token_to_kv_pool_allocator=allocator,
-            page_size=128,
-            enable_recurrent_extra_buffer=True,
-            recurrent_track_interval=128,
-        )
-        ctx = TreeCacheBuildContext(
-            server_args=SimpleNamespace(enable_unified_radix_tree=True, max_seq_len=512),
-            params=params,
-            is_hybrid_swa=False,
-            disable_radix_cache=False,
-            effective_chunked_prefill_size=None,
-            model_config=SimpleNamespace(
-                head_dim=8,
-                num_hidden_layers=2,
-                get_num_kv_heads=lambda tp_size: 1,
-            ),
-            tp_size=1,
+            page_size=1,
+            sliding_window_size=4,
         )
 
-        cache = default_radix_cache_factory(ctx)
+        cache = UnifiedRadixCache(
+            req_to_token_pool=req_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            tree_components=(ComponentType.FULL, ComponentType.SWA),
+            component_init_params=params,
+        )
 
-        self.assertEqual(cache.tree_components, (ComponentType.FULL,))
-        self.assertTrue(cache.enable_recurrent_extra_buffer)
-        self.assertEqual(cache.recurrent_track_interval, 128)
-        self.assertIs(cache.components[ComponentType.FULL].received_params, params)
+        self.assertIsNone(cache.components[ComponentType.FULL].received_params)
+        self.assertEqual(cache.components[ComponentType.SWA].sliding_window_size, 4)
 
     def test_multi_node_overlap_preserves_tree_owned_prefix(self):
         _, allocator, cache = self._create_cache()
