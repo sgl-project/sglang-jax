@@ -25,7 +25,7 @@ def _scaled_randn(rng: np.random.Generator, shape, scale: float = 0.1) -> np.nda
     # scale=0.1 is a test-only hack: it shrinks the recurrent state so bf16 noise
     # in the delta-rule update fits the global atol=1e-2 (shared with flashattn).
     # Kernel correctness is validated end-to-end (MMLU-pro on tp4dp4, PR #1047);
-    # only inputs that grow the state need it (q/k/v/a/b + initial state).
+    # only inputs that grow the state need it (q/k/v/a + initial state).
     return rng.standard_normal(shape).astype(np.float32) * scale
 
 
@@ -289,7 +289,8 @@ def create_test_data(
     k = normal((total_tokens, hidden))
     v = normal((total_tokens, hidden))
     a = normal((total_tokens, hidden))
-    b = normal((total_tokens, num_heads))
+    # Production Kimi-Linear computes beta as sigmoid(b_proj(...).float()).
+    b = jax.nn.sigmoid(normal((total_tokens, num_heads), scale=1.0).astype(jnp.float32))
 
     recurrent_indices = np.arange(1, batch_size + 1, dtype=np.int32)
     initial_ssm_state_dev = initial_ssm_state
