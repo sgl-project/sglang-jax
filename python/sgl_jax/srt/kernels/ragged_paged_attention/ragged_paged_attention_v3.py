@@ -59,6 +59,26 @@ def _semaphore_kwargs(disable_semaphore_checks: bool) -> dict:
     return {}
 
 
+def _get_span_int_dtype(
+    q_dtype: jnp.dtype,
+    *,
+    tpu_version: int,
+    use_causal_mask: bool,
+    pages_per_seq: int,
+    page_size: int,
+) -> jnp.dtype:
+    """Select the narrow span dtype only when the full per-sequence capacity is safe."""
+
+    if (
+        get_dtype_packing(q_dtype) != 1
+        and tpu_version >= 6
+        and use_causal_mask
+        and pages_per_seq * page_size <= jnp.iinfo(jnp.int16).max
+    ):
+        return jnp.int16
+    return jnp.int32
+
+
 class RpaCase(Enum):
     """Represents the different cases for Ragged Paged Attention.
 
@@ -486,11 +506,10 @@ def _ragged_paged_attention_kernel_loop(
         if soft_cap is not None:
             s = soft_cap * jnp.tanh(s / soft_cap)
 
-        # Use int16 for span computations when safe: non-f32 dtype on TPU v6+
-        # with causal mask. Custom mask shapes can trigger a Mosaic compiler bug.
-        int_ty = jnp.int32
-        if get_dtype_packing(q.dtype) != 1 and tpu_version >= 6 and use_causal_mask:
-            int_ty = jnp.int16
+        # Use int16 only when the entire per-sequence KV capacity fits in int16.
+        # Custom mask shapes can trigger a Mosaic compiler bug, so the causal-mask
+        # guard remains part of the fast-path check.
+        int_ty = span_int_ty
         processed_q_len_int = processed_q_len.astype(int_ty)
         processed_kv_len_int = processed_kv_len.astype(int_ty)
         effective_kv_len_int = effective_kv_len.astype(int_ty)
@@ -1814,6 +1833,13 @@ def ragged_paged_attention(
 
     use_causal_mask = causal == 1
     tpu_version = get_tpu_version()
+    span_int_ty = _get_span_int_dtype(
+        q.dtype,
+        tpu_version=tpu_version,
+        use_causal_mask=use_causal_mask,
+        pages_per_seq=pages_per_seq,
+        page_size=page_size,
+    )
 
     def run_rpa_kernel(
         q,
