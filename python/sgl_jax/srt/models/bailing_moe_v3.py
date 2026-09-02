@@ -128,12 +128,23 @@ class BailingMLA(DeepseekV3Attention):
         attn_output: jax.Array,
         hidden_states: jax.Array,
     ) -> jax.Array:
-        gate, _ = self.g_proj(hidden_states)
+        flat_sharding = NamedSharding(self.mesh, P("data", "tensor"))
+        head_sharding = NamedSharding(self.mesh, P("data", "tensor", None))
+        gate, _ = self.g_proj(hidden_states, out_sharding=flat_sharding)
         gate = jax.nn.sigmoid(gate.astype(jnp.float32)).astype(attn_output.dtype)
         num_tokens = attn_output.shape[0]
-        gated = attn_output.reshape(num_tokens, self.num_heads, self.v_head_dim)
+        gated = attn_output.reshape(
+            num_tokens,
+            self.num_heads,
+            self.v_head_dim,
+            out_sharding=head_sharding,
+        )
         gated *= gate[:, :, None]
-        return gated.reshape(num_tokens, self.num_heads * self.v_head_dim)
+        return gated.reshape(
+            num_tokens,
+            self.num_heads * self.v_head_dim,
+            out_sharding=flat_sharding,
+        )
 
 
 class BailingKDAAttention(nnx.Module):
@@ -644,46 +655,11 @@ class BailingMoeV3ForCausalLM(nnx.Module):
             dtype=self.dtype,
         )
         weight_mappings = self._create_weight_mappings()
-        self._assert_full_ckpt_coverage(loader, weight_mappings)
-        loader.load_weights_from_safetensors(weight_mappings)
+        loader.load_weights_from_safetensors(weight_mappings, strict=True)
         for layer in self.model.layers:
             if not layer.is_kda:
                 layer.self_attn.post_load_weights()
         logger.info("Ling-3.0-tiny weights loaded successfully.")
-
-    def _assert_full_ckpt_coverage(
-        self,
-        loader: WeightLoader,
-        weight_mappings: dict,
-    ) -> None:
-        """Fail before loading because WeightLoader otherwise skips unknown keys."""
-        import re
-
-        ckpt_keys = set(loader._scan_weight_info().keys())
-
-        covered: set[str] = set()
-        for mapping_key in weight_mappings:
-            if mapping_key.startswith("__MOE_EXPERTS__"):
-                m = weight_mappings[mapping_key]
-                expert_keys = m.target_path[1:] if isinstance(m.target_path, list) else []
-                covered.update(k for k in expert_keys if k in ckpt_keys)
-                continue
-            if "*" in mapping_key:
-                pattern = re.escape(mapping_key).replace(r"\*", r"(.*?)")
-                covered.update(k for k in ckpt_keys if re.fullmatch(pattern, k))
-            else:
-                if mapping_key in ckpt_keys:
-                    covered.add(mapping_key)
-
-        auto_skipped = {k for k in ckpt_keys if loader._is_excluded_layer_weight(k)}
-
-        unmapped = ckpt_keys - covered - auto_skipped
-        if unmapped:
-            sample = sorted(unmapped)[:10]
-            raise RuntimeError(
-                f"Ling3 loader: {len(unmapped)} ckpt key(s) have no mapping and "
-                f"were not auto-skipped. First {len(sample)}: {sample}"
-            )
 
     def _create_weight_mappings(self) -> dict:
         mappings: dict[str, WeightMapping] = {

@@ -1465,8 +1465,7 @@ class WeightLoader:
         if do_transpose and len(single_expert_shape) >= 2 and weight_dims_unsharded:
             defer_transpose = True
             logger.info(
-                "MoE defer_transpose=True: will load in HF layout and "
-                "transpose on TPU (shape=%s)",
+                "MoE defer_transpose=True: will load in HF layout and transpose on TPU (shape=%s)",
                 single_expert_shape,
             )
 
@@ -1888,13 +1887,39 @@ class WeightLoader:
             )
         return result
 
+    def _validate_checkpoint_coverage(
+        self,
+        weight_info: Mapping[str, list[dict]],
+        regular_mappings: Mapping[str, WeightMappingSpec],
+        moe_mappings: Mapping[str, WeightMappingSpec],
+    ) -> None:
+        covered = set(regular_mappings).intersection(weight_info)
+        for mapping in moe_mappings.values():
+            if not isinstance(mapping, WeightMapping) or not isinstance(mapping.target_path, list):
+                raise TypeError("MoE mappings must use WeightMapping with a list target_path")
+            covered.update(key for key in mapping.target_path[1:] if key in weight_info)
+
+        excluded = {key for key in weight_info if self._is_excluded_layer_weight(key)}
+        unmapped = sorted(set(weight_info) - covered - excluded)
+        if unmapped:
+            sample = unmapped[:10]
+            raise RuntimeError(
+                f"Strict weight loading found {len(unmapped)} checkpoint tensor(s) "
+                f"without a mapping. First {len(sample)}: {sample}"
+            )
+
     def load_weights_from_safetensors(
         self,
         weight_mappings: Mapping[str, WeightMappingSpec],
         safetensors_partition=1,
         dummy=False,
+        strict=False,
     ):
-        """Load weights using JAX lazy evaluation and parallel I/O."""
+        """Load weights using JAX lazy evaluation and parallel I/O.
+
+        When ``strict`` is true, every checkpoint tensor must be covered by a
+        regular mapping, an MoE expert group, or an excluded layer.
+        """
         params = nnx.state(self.model)
 
         if dummy or self.dummy_mode:
@@ -1952,6 +1977,9 @@ class WeightLoader:
                             moe_mappings[weight_info_key] = replaced_mapping
                         else:
                             regular_mappings[weight_info_key] = replaced_mapping
+
+        if strict:
+            self._validate_checkpoint_coverage(weight_info, regular_mappings, moe_mappings)
 
         logger.info("Starting parallel weight loading via JAX Lazy Loader...")
         quant_cfg = getattr(self.model_config, "quantization_config", None)
@@ -2374,7 +2402,6 @@ class WeightLoader:
                 regular_mappings[hf_key] = mapping
 
         for hf_key, mapping in regular_mappings.items():
-
             if isinstance(mapping, str | list):
                 mapping = WeightMapping(target_path=mapping)
             elif not isinstance(mapping, WeightMapping):

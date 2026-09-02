@@ -52,18 +52,30 @@ def test_bailing_mla_applies_head_gate_before_o_proj():
     gate_logits = jnp.array([[0.0, jnp.log(3.0)], [0.0, jnp.log(3.0)]])
 
     class _GateProjection:
-        def __call__(self, hidden_states):
+        def __call__(self, hidden_states, *, out_sharding=None):
             del hidden_states
+            del out_sharding
             return gate_logits, None
 
+    mesh = create_device_mesh(
+        ici_parallelism=[1, -1],
+        dcn_parallelism=[1, 1],
+        devices=[jax.devices()[0]],
+    )
     attention = type(
         "FakeBailingMLA",
         (),
-        {"g_proj": _GateProjection(), "num_heads": 2, "v_head_dim": 3},
+        {
+            "g_proj": _GateProjection(),
+            "mesh": mesh,
+            "num_heads": 2,
+            "v_head_dim": 3,
+        },
     )()
     attn_output = jnp.ones((2, 6), dtype=jnp.float32)
 
-    actual = BailingMLA._pre_o_proj(attention, attn_output, jnp.zeros((2, 4)))
+    with jax.set_mesh(mesh):
+        actual = BailingMLA._pre_o_proj(attention, attn_output, jnp.zeros((2, 4)))
     expected = jnp.tile(jnp.array([[0.5] * 3 + [0.75] * 3]), (2, 1))
 
     assert jnp.allclose(actual, expected)
