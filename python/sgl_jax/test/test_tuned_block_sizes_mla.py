@@ -25,7 +25,9 @@ def _patch_env(monkeypatch, *, tpu_version: int = 7, device: str = "TPU v7"):
 
 
 def test_empty_table_returns_none(monkeypatch):
-    _patch_env(monkeypatch)
+    # "TPU v5" ships an empty dict — a supported device with no entries yet.
+    # (The "TPU v7" table now carries entries at this key, see #1344.)
+    _patch_env(monkeypatch, tpu_version=5, device="TPU v5")
     assert (
         get_tuned_block_sizes_mla("decode", jnp.bfloat16, jnp.bfloat16, 8, 512, 64, 256, 128)
         is None
@@ -113,7 +115,8 @@ def test_pre_v5_returns_none(monkeypatch):
 
 def test_warned_misses_is_one_shot_per_key(monkeypatch, caplog):
     """Each unique miss-key logs INFO at most once."""
-    _patch_env(monkeypatch)
+    # Use the empty "TPU v5" table so every lookup below is a genuine miss.
+    _patch_env(monkeypatch, tpu_version=5, device="TPU v5")
     import logging
 
     # Bind caplog to the module's logger explicitly — relying on root-level
@@ -131,3 +134,82 @@ def test_warned_misses_is_one_shot_per_key(monkeypatch, caplog):
     get_tuned_block_sizes_mla("mixed", jnp.bfloat16, jnp.bfloat16, 8, 512, 64, 256, 512)
     miss_records = [r for r in caplog.records if "MLA tuned-block-size LOOKUP MISS" in r.message]
     assert len(miss_records) == 2, f"expected 2 miss logs, got {len(miss_records)}"
+
+
+def test_glm52_v6e_entries_hit(monkeypatch):
+    """GLM-5.2 v6e deploy shape (tp64/dp8 -> 8 q-heads/shard, page 128) must
+    hit the table for every decode/mixed mnt bucket (#1546)."""
+    _patch_env(monkeypatch, tpu_version=6, device="TPU v6e")
+    for mnt in (1, 8, 16, 32, 64, 128, 256, 512, 1024):
+        hit = get_tuned_block_sizes_mla("decode", jnp.bfloat16, jnp.bfloat16, 8, 512, 64, 128, mnt)
+        assert hit is not None and len(hit) == 3, f"decode mnt={mnt} missed"
+    for mnt in (1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192):
+        hit = get_tuned_block_sizes_mla("mixed", jnp.bfloat16, jnp.bfloat16, 8, 512, 64, 128, mnt)
+        assert hit is not None and len(hit) == 2, f"mixed mnt={mnt} missed"
+
+
+def test_glm52_v7_entries_hit(monkeypatch):
+    """GLM-5.2 v7 tp16 shape (4 q-heads/shard, page 128) mixed buckets (#1546)."""
+    _patch_env(monkeypatch, tpu_version=7, device="TPU v7")
+    for mnt in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096):
+        hit = get_tuned_block_sizes_mla("mixed", jnp.bfloat16, jnp.bfloat16, 4, 512, 64, 128, mnt)
+        assert hit is not None and len(hit) == 2, f"mixed mnt={mnt} missed"
+
+
+def test_fallback_decode_keeps_historical_values():
+    from sgl_jax.srt.kernels.mla.v2.tuned_block_sizes import (
+        get_fallback_block_sizes_mla,
+    )
+
+    assert get_fallback_block_sizes_mla("decode", jnp.bfloat16, 4, 128) == (3, 1)
+    assert get_fallback_block_sizes_mla("decode", jnp.bfloat16, 16, 128) == (3, 1)
+
+
+def test_fallback_mixed_full_tile_heads_keep_historical_values():
+    from sgl_jax.srt.kernels.mla.v2.tuned_block_sizes import (
+        get_fallback_block_sizes_mla,
+    )
+
+    # >=16-head bf16 shards fill whole sublane tiles: historical (1, 16).
+    assert get_fallback_block_sizes_mla("mixed", jnp.bfloat16, 16, 128) == (1, 16)
+    assert get_fallback_block_sizes_mla("mixed", jnp.bfloat16, 32, 128) == (1, 16)
+
+
+def test_fallback_mixed_subtile_heads_are_tiling_legal():
+    """Sub-tile head counts must never return the historical (1, 16) —
+    that's the exact block Mosaic rejects at mnt>=256 for 4-head bf16
+    shards (#1546) — and must land in the validated family."""
+    from sgl_jax.srt.kernels.mla.v2.tuned_block_sizes import (
+        get_fallback_block_sizes_mla,
+    )
+    from sgl_jax.srt.kernels.ragged_paged_attention.util import (
+        align_to,
+        get_dtype_packing,
+    )
+
+    # GLM-5.2 tp16 (4 heads, page 128) must get the v7x-validated (16, 64).
+    assert get_fallback_block_sizes_mla("mixed", jnp.bfloat16, 4, 128) == (16, 64)
+
+    for dtype in (jnp.bfloat16, jnp.float32):
+        packing = get_dtype_packing(jnp.dtype(dtype))
+        tile = 8 * packing
+        for heads in (1, 2, 4, 8):
+            heads_padded = align_to(heads, packing)
+            if heads_padded % tile == 0:
+                continue
+            for page_size in (64, 128, 256):
+                bkv_p, bq = get_fallback_block_sizes_mla("mixed", dtype, heads, page_size)
+                # q-block rows cover whole tile groups
+                assert (bq * heads_padded) % (tile * packing) == 0, (dtype, heads, page_size)
+                assert bq * heads_padded >= tile * tile, (dtype, heads, page_size)
+                # KV block is a whole number of pages covering 2048 tokens
+                assert bkv_p >= 1 and bkv_p * page_size >= min(2048, page_size)
+
+
+def test_fallback_rejects_bad_case_label():
+    from sgl_jax.srt.kernels.mla.v2.tuned_block_sizes import (
+        get_fallback_block_sizes_mla,
+    )
+
+    with pytest.raises(ValueError):
+        get_fallback_block_sizes_mla("prefill", jnp.bfloat16, 4, 128)

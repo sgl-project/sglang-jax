@@ -144,6 +144,10 @@ class Glm4MoeDetector(BaseFormatDetector):
     Uses a streaming state machine to convert XML to JSON incrementally for maximum speed.
     """
 
+    _STREAMING_PARTIAL_PATTERN = re.compile(
+        r"<tool_call>(.*?)(?:\\n|\n)(.*?)(</tool_call>|$)", re.DOTALL
+    )
+
     def __init__(self):
         super().__init__()
         self.bot_token = "<tool_call>"
@@ -196,7 +200,7 @@ class Glm4MoeDetector(BaseFormatDetector):
                 func_detail = self.func_detail_regex.search(match_result)
                 if func_detail is None:
                     continue
-                func_name = func_detail.group(1) if func_detail.group(1) else ""
+                func_name = (func_detail.group(1) or "").strip()
                 func_args = func_detail.group(2) if func_detail.group(2) else ""
                 pairs = self.func_arg_regex.findall(func_args)
 
@@ -440,11 +444,7 @@ class Glm4MoeDetector(BaseFormatDetector):
         calls: list[ToolCallItem] = []
         try:
             # Try to match a partial or complete tool call
-            partial_match = re.search(
-                pattern=r"<tool_call>(.*?)(?:\\n|\n)(.*?)(</tool_call>|$)",
-                string=current_text,
-                flags=re.DOTALL,
-            )
+            partial_match = self._STREAMING_PARTIAL_PATTERN.search(current_text)
             if partial_match:
                 func_name_raw = partial_match.group(1)
                 func_args_raw = partial_match.group(2)

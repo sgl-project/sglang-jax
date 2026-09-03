@@ -25,7 +25,10 @@ from jax.tree_util import register_pytree_node_class
 from sgl_jax.srt.kernels.dsa.ref import streamindex_page_topk_ref, streamindex_topk_ref
 from sgl_jax.srt.kernels.dsa.sparse_mla import compute_topk_pages, sparse_mla_page_level
 from sgl_jax.srt.kernels.dsa.sparse_mla_prefill import prefill_write_and_attend_ragged
-from sgl_jax.srt.kernels.dsa.streamindex_topk import streamindex_topk
+from sgl_jax.srt.kernels.dsa.streamindex_topk import (
+    streamindex_page_topk,
+    streamindex_topk,
+)
 from sgl_jax.srt.kernels.mla.v2.kernel import mla_ragged_paged_attention
 from sgl_jax.srt.layers.attention.mla_backend import MLAAttentionBackend
 from sgl_jax.srt.utils.profiling_utils import named_scope
@@ -49,6 +52,12 @@ _PAGE_TOPK_BUDGET = int(os.environ.get("DSA_PAGE_TOPK", "0"))
 # (sum_h relu(q·k)·w_h, approx_max_k). Token-topk path only; DSA_PAGE_TOPK
 # takes precedence when both are set.
 _INDEXER_KERNEL = os.environ.get("DSA_INDEXER_KERNEL", "0") == "1"
+# Opt-in: prefill/extend page-level indexer top-k via the page-pooled Pallas
+# streamindex kernel instead of the jnp reference. The kernel scores O(actual
+# kv_len) pages (ref is O(max_ctx) padded gather) and never materializes
+# [T, max_kv] token scores in HBM — the dominant HLO-temporaries term at long
+# context. Same selection semantics as the ref (parity-gated). Default OFF.
+_INDEXER_KERNEL_PREFILL = os.environ.get("DSA_INDEXER_KERNEL_PREFILL", "0") == "1"
 # bkv block of 64 pages (4K tokens @ page 64) benched fastest across
 # B=8..64, ctx 8K..128K on v7x/v6e.
 _INDEXER_KERNEL_KV_PAGES_PER_BLOCK = 64
@@ -525,19 +534,41 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             pages_per_seq = pi_.shape[0] // seq_lens_.shape[0]
             cache3d = cache_.reshape(cache_.shape[0], page_size, idx_dim)
             cache3d = _scatter_paged(cache3d, k_, seq_lens_, pi_, cuq_, cukv_, pages_per_seq)
-            topk_pages = streamindex_page_topk_ref(
-                q_,
-                w_,
-                cache3d,
-                seq_lens_,
-                pi_,
-                cuq_,
-                cukv_,
-                dist_,
-                k_pages=k_pages,
-                pages_per_seq=pages_per_seq,
-                one_token_per_seq=False,  # prefill: T>1 tokens/seq, per-query causal
-            )
+            if _INDEXER_KERNEL_PREFILL:
+                # dist_[2] == number of real (seq_len > 0) sequences in this
+                # EXTEND batch: mla_backend builds distribution = [0, 0, N] for
+                # ForwardMode.EXTEND (decode runs as a separate forward), so the
+                # kernel's per-seq grid over [0, N) matches the ref's masked
+                # full-batch loop exactly; padded seqs stay -1 on both paths.
+                topk_pages = streamindex_page_topk(
+                    q_,
+                    w_,
+                    cache3d.reshape(cache_.shape),
+                    seq_lens_,
+                    # the kernel indexes page_indices[seq_id * pages_per_seq + p]
+                    # (fixed stride), but sglang packs seq i's pages at
+                    # cu_kv_lens[i]//page_size (variable stride) — repack, same
+                    # as the decode call site, or a multi-request EXTEND batch
+                    # with unequal lengths reads another sequence's pages.
+                    _fixed_stride_pages(pi_, cukv_, page_size, pages_per_seq),
+                    cuq_,
+                    dist_[2],
+                    k_pages=k_pages,
+                )
+            else:
+                topk_pages = streamindex_page_topk_ref(
+                    q_,
+                    w_,
+                    cache3d,
+                    seq_lens_,
+                    pi_,
+                    cuq_,
+                    cukv_,
+                    dist_,
+                    k_pages=k_pages,
+                    pages_per_seq=pages_per_seq,
+                    one_token_per_seq=False,  # prefill: T>1 tokens/seq, per-query causal
+                )
             return cache3d.reshape(cache_.shape), topk_pages
 
         idx_cache, topk_pages = jax.shard_map(

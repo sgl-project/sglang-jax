@@ -1,3 +1,5 @@
+"""Ling-3.0-tiny (BailingMoE V3) hybrid KDA/MLA model."""
+
 from __future__ import annotations
 
 import logging
@@ -6,28 +8,28 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
+from sgl_jax.srt.configs.bailing_hybrid import BailingHybridConfig
 from sgl_jax.srt.configs.model_config import AttentionArch, ModelConfig, MoEBackend
 from sgl_jax.srt.eplb.expert_location import ExpertLocationMetadata
 from sgl_jax.srt.layers.attention.fla.gated_rmsnorm import GatedRMSNorm
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead
-from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 from sgl_jax.srt.layers.gate import GateLogit, TopK
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sgl_jax.srt.layers.moe import EPMoE, create_moe_weights_mapping
+from sgl_jax.srt.layers.moe import EPMoE
 from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.models.deepseek_v3 import DeepseekV3Attention as KimiMLAAttention
+from sgl_jax.srt.models.deepseek_v3 import DeepseekV3Attention
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
 
-class KimiMLP(nnx.Module):
+class BailingMoeV3MLP(nnx.Module):
     def __init__(
         self,
         hidden_size: int,
@@ -67,75 +69,147 @@ class KimiMLP(nnx.Module):
     def __call__(self, hidden_states: jax.Array) -> jax.Array:
         gate, _ = self.gate_proj(hidden_states)
         up, _ = self.up_proj(hidden_states)
-        output, _ = self.down_proj(jax.nn.silu(gate) * up)
+        gate = jax.nn.silu(gate)
+        output, _ = self.down_proj(gate * up)
         return output
 
 
-class KimiDeltaAttention(nnx.Module):
-    """Standalone Kimi Delta Attention layer.
-
-    This intentionally implements only the KDA attention module. Full
-    KimiDecoderLayer/KimiLinearModel assembly is handled by the model skeleton
-    integration work.
-    """
+class BailingMLA(DeepseekV3Attention):
+    """Reuse DeepSeek MLA because Ling3 only adds a gate before ``o_proj``."""
 
     def __init__(
         self,
-        config,
-        layer_idx: int = 0,
-        mesh: jax.sharding.Mesh | None = None,
+        hidden_size: int,
+        num_heads: int,
+        q_lora_rank: int,
+        kv_lora_rank: int,
+        qk_nope_head_dim: int,
+        qk_rope_head_dim: int,
+        v_head_dim: int,
+        mesh: jax.sharding.Mesh,
+        layer_id: int = 0,
+        rope_theta: float = 10000.0,
+        rope_scaling: dict | None = None,
+        rope_interleave: bool = True,
+        max_position_embeddings: int = 8192,
+        dtype: jnp.dtype = jnp.bfloat16,
+        use_absorbed: bool = True,
+    ):
+        super().__init__(
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            q_lora_rank=q_lora_rank,
+            kv_lora_rank=kv_lora_rank,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            v_head_dim=v_head_dim,
+            mesh=mesh,
+            layer_id=layer_id,
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
+            rope_interleave=rope_interleave,
+            max_position_embeddings=max_position_embeddings,
+            dtype=dtype,
+            use_absorbed=use_absorbed,
+            skip_rope=False,
+        )
+        self.g_proj = LinearBase(
+            input_size=hidden_size,
+            output_size=num_heads,
+            kernel_axes=(None, "tensor"),
+            use_bias=False,
+            params_dtype=dtype,
+            mesh=mesh,
+            scope_name="g_proj",
+        )
+
+    def _pre_o_proj(
+        self,
+        attn_output: jax.Array,
+        hidden_states: jax.Array,
+    ) -> jax.Array:
+        flat_sharding = NamedSharding(self.mesh, P("data", "tensor"))
+        head_sharding = NamedSharding(self.mesh, P("data", "tensor", None))
+        gate, _ = self.g_proj(hidden_states, out_sharding=flat_sharding)
+        gate = jax.nn.sigmoid(gate.astype(jnp.float32)).astype(attn_output.dtype)
+        num_tokens = attn_output.shape[0]
+        gated = attn_output.reshape(
+            num_tokens,
+            self.num_heads,
+            self.v_head_dim,
+            out_sharding=head_sharding,
+        )
+        gated *= gate[:, :, None]
+        return gated.reshape(
+            num_tokens,
+            self.num_heads * self.v_head_dim,
+            out_sharding=flat_sharding,
+        )
+
+
+class BailingKDAAttention(nnx.Module):
+    """Ling3 KDA uses direct gate projections instead of Kimi's LoRA pairs."""
+
+    def __init__(
+        self,
+        config: BailingHybridConfig,
+        layer_idx: int,
+        mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
-        self.mesh = mesh
-
+        super().__init__()
+        if not config.use_kda:
+            raise ValueError("BailingMoeV3 requires short_conv_kernel_size for KDA layers")
+        if not config.no_kda_lora:
+            raise NotImplementedError("BailingMoeV3 currently supports only no_kda_lora=True")
+        if config.v_head_dim != config.head_dim:
+            raise ValueError(
+                "BailingMoeV3 KDA requires v_head_dim == head_dim, got "
+                f"{config.v_head_dim} and {config.head_dim}"
+            )
         linear_config = config.linear_attn_config
-        self.config = config
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.conv_size = linear_config["short_conv_kernel_size"]
         self.head_dim = linear_config["head_dim"]
         self.k_head_dim = self.head_dim
-        self.v_head_dim = getattr(config, "v_head_dim", None) or self.head_dim
+        self.v_head_dim = config.v_head_dim or self.head_dim
         self.num_heads = linear_config["num_heads"]
         self.num_k_heads = self.num_heads
         self.num_v_heads = self.num_heads
         self.projection_k_size = self.num_k_heads * self.k_head_dim
         self.projection_size = self.num_heads * self.head_dim
-        self.rms_norm_eps = getattr(config, "rms_norm_eps", 1e-6)
+        self.rms_norm_eps = config.rms_norm_eps
 
         self.q_proj = LinearBase(
-            self.hidden_size,
-            self.projection_k_size,
-            mesh,
+            input_size=self.hidden_size,
+            output_size=self.projection_k_size,
+            mesh=mesh,
             use_bias=False,
             params_dtype=dtype,
             kernel_axes=(None, "tensor"),
             scope_name="q_proj",
         )
         self.k_proj = LinearBase(
-            self.hidden_size,
-            self.projection_k_size,
-            mesh,
+            input_size=self.hidden_size,
+            output_size=self.projection_k_size,
+            mesh=mesh,
             use_bias=False,
             params_dtype=dtype,
             kernel_axes=(None, "tensor"),
             scope_name="k_proj",
         )
         self.v_proj = LinearBase(
-            self.hidden_size,
-            self.projection_size,
-            mesh,
+            input_size=self.hidden_size,
+            output_size=self.projection_size,
+            mesh=mesh,
             use_bias=False,
             params_dtype=dtype,
             kernel_axes=(None, "tensor"),
             scope_name="v_proj",
         )
 
-        # Depthwise short-conv weights stored in ``[D, K]`` directly — that's
-        # the layout ``short_convolution`` consumes. We use LinearBase only as
-        # a parameter container (never call it); ``input_size=D``,
-        # ``output_size=K`` makes ``weight.value`` ship out as ``[D, K]`` with
-        # D sharded across "tensor".
+        # The KDA backend reads these weights directly, so they stay live containers.
         self.q_conv1d = LinearBase(
             self.projection_k_size,
             self.conv_size,
@@ -179,56 +253,39 @@ class KimiDeltaAttention(nnx.Module):
             )
         )
 
-        self.f_a_proj = LinearBase(
-            self.hidden_size,
-            self.head_dim,
-            mesh,
-            use_bias=False,
-            params_dtype=dtype,
-            kernel_axes=(None, None),
-            scope_name="f_a_proj",
-        )
-        self.f_b_proj = LinearBase(
-            self.head_dim,
-            self.projection_size,
-            mesh,
+        self.f_proj = LinearBase(
+            input_size=self.hidden_size,
+            output_size=self.projection_size,
+            mesh=mesh,
             use_bias=False,
             params_dtype=dtype,
             kernel_axes=(None, "tensor"),
-            scope_name="f_b_proj",
+            scope_name="f_proj",
+        )
+        self.g_proj = LinearBase(
+            input_size=self.hidden_size,
+            output_size=self.projection_size,
+            mesh=mesh,
+            use_bias=False,
+            params_dtype=dtype,
+            kernel_axes=(None, "tensor"),
+            scope_name="g_proj",
         )
         self.b_proj = LinearBase(
-            self.hidden_size,
-            self.num_heads,
-            mesh,
+            input_size=self.hidden_size,
+            output_size=self.num_heads,
+            mesh=mesh,
             use_bias=False,
             params_dtype=dtype,
             kernel_axes=(None, "tensor"),
             scope_name="b_proj",
         )
-        self.g_a_proj = LinearBase(
-            self.hidden_size,
-            self.head_dim,
-            mesh,
-            use_bias=False,
-            params_dtype=dtype,
-            kernel_axes=(None, None),
-            scope_name="g_a_proj",
-        )
-        self.g_b_proj = LinearBase(
-            self.head_dim,
-            self.projection_size,
-            mesh,
-            use_bias=False,
-            params_dtype=dtype,
-            kernel_axes=(None, "tensor"),
-            scope_name="g_b_proj",
-        )
+
         self.o_norm = GatedRMSNorm(self.head_dim, epsilon=self.rms_norm_eps)
         self.o_proj = LinearBase(
-            self.projection_size,
-            self.hidden_size,
-            mesh,
+            input_size=self.projection_size,
+            output_size=self.hidden_size,
+            mesh=mesh,
             use_bias=False,
             params_dtype=dtype,
             kernel_axes=("tensor", None),
@@ -250,23 +307,23 @@ class KimiDeltaAttention(nnx.Module):
             activation=jax.nn.silu,
             A_log=self.A_log,
             dt_bias=self.dt_bias,
+            kda_lower_bound=config.kda_lower_bound,
         )
-        self.attn.kda_gate_lower_bound = linear_config.get("gate_lower_bound")
 
     def __call__(
         self,
-        positions: jax.Array | None,
+        positions: jax.Array,
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         recurrent_state_pool,
-    ) -> tuple[jax.Array, object]:
-        del positions
+    ):
+        del positions  # KDA is position-agnostic.
 
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
 
-        raw_gate, _ = self.f_b_proj(self.f_a_proj(hidden_states)[0])
+        raw_gate, _ = self.f_proj(hidden_states)
         raw_gate = raw_gate.reshape(hidden_states.shape[0], self.num_heads, self.head_dim)
         beta = jax.nn.sigmoid(self.b_proj(hidden_states)[0].astype(jnp.float32))
 
@@ -281,37 +338,37 @@ class KimiDeltaAttention(nnx.Module):
         )
         o = o.reshape(hidden_states.shape[0], self.num_heads, self.head_dim)
 
-        g_a, _ = self.g_a_proj(hidden_states)
-        output_gate, _ = self.g_b_proj(g_a)
+        output_gate, _ = self.g_proj(hidden_states)
         output_gate = output_gate.reshape(hidden_states.shape[0], self.num_heads, self.head_dim)
         o = self.o_norm(o, output_gate).reshape(hidden_states.shape[0], self.projection_size)
         o, _ = self.o_proj(o)
-
         return o, recurrent_state_pool
 
 
-class KimiDecoderLayer(nnx.Module):
+class BailingMoeV3DecoderLayer(nnx.Module):
     def __init__(
         self,
-        config: KimiLinearConfig,
+        config: BailingHybridConfig,
         mesh: jax.sharding.Mesh,
         layer_idx: int,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
         super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.mesh = mesh
         self.hidden_size = config.hidden_size
         self.is_kda = config.is_kda_layer(layer_idx)
 
-        # Attention
         if self.is_kda:
-            self.self_attn = KimiDeltaAttention(
+            self.self_attn = BailingKDAAttention(
                 config=config,
+                layer_idx=layer_idx,
                 mesh=mesh,
                 dtype=dtype,
-                layer_idx=layer_idx,
             )
         else:
-            self.self_attn = KimiMLAAttention(
+            self.self_attn = BailingMLA(
                 hidden_size=config.hidden_size,
                 num_heads=config.num_attention_heads,
                 q_lora_rank=config.q_lora_rank,
@@ -321,23 +378,18 @@ class KimiDecoderLayer(nnx.Module):
                 v_head_dim=config.v_head_dim,
                 mesh=mesh,
                 layer_id=layer_idx,
+                rope_theta=config.rope_theta,
+                rope_scaling=config.rope_scaling,
+                rope_interleave=config.rope_interleave,
+                max_position_embeddings=config.max_position_embeddings,
                 dtype=dtype,
                 use_absorbed=getattr(config, "use_absorbed_mla", True),
-                skip_rope=config.mla_use_nope,
             )
 
-        # FFN
-        is_moe = (
-            config.is_moe
-            and layer_idx >= config.first_k_dense_replace
-            and layer_idx % config.moe_layer_freq == 0
-        )
-        self.is_moe_layer = is_moe
-        self.moe_backend = getattr(config, "moe_backend", MoEBackend.EPMOE)
-        self.use_fused = self.moe_backend == "fused"
+        self.is_moe_layer = layer_idx >= config.first_k_dense_replace
 
-        if not is_moe:
-            self.mlp = KimiMLP(
+        if not self.is_moe_layer:
+            self.mlp = BailingMoeV3MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 mesh=mesh,
@@ -345,64 +397,41 @@ class KimiDecoderLayer(nnx.Module):
             )
             self.moe_gate = None
         else:
-            # Gate
+            router_dtype = jnp.float32 if config.router_dtype == "fp32" else dtype
             self.moe_gate = GateLogit(
                 input_size=config.hidden_size,
                 num_experts=config.num_experts,
-                enable_expert_bias=True,
-                weight_dtype=dtype,
-                score_func=config.moe_router_activation_func,
+                enable_expert_bias=config.moe_router_enable_expert_bias,
+                weight_dtype=router_dtype,
+                score_func=config.score_function,
             )
-
-            # TopK routing
             self.topk = TopK(
-                topk=config.num_experts_per_token,
-                renormalize=config.moe_renormalize,
-                num_expert_group=config.num_expert_group,
+                topk=config.num_experts_per_tok,
+                renormalize=config.norm_topk_prob,
+                num_expert_group=config.n_group,
                 topk_group=config.topk_group,
                 routed_scaling_factor=config.routed_scaling_factor,
                 layer_id=layer_idx,
                 mesh=mesh,
             )
 
-            if self.use_fused:
-                self.block_sparse_moe = FusedEPMoE(
-                    hidden_size=config.hidden_size,
-                    num_experts=config.num_experts,
-                    num_experts_per_tok=config.num_experts_per_token,
-                    intermediate_dim=config.moe_intermediate_size,
-                    mesh=mesh,
-                    weight_dtype=dtype,
-                    dtype=dtype,
-                    layer_id=layer_idx,
-                    ep_size=config.ep_size,
-                    activation_fn=config.moe_router_activation_func,
-                    renormalize_topk_logits=config.moe_renormalize,
-                    routed_scaling_factor=config.routed_scaling_factor,
-                    use_grouped_topk=config.num_expert_group > 0,
-                    num_groups=config.num_expert_group,
-                    top_k_groups=config.topk_group,
-                    num_shared_experts=config.num_shared_experts,
-                    moe_shared_expert_intermediate_size=config.moe_intermediate_size,
-                )
-            else:
-                self.block_sparse_moe = EPMoE(
-                    hidden_size=config.hidden_size,
-                    num_experts=config.num_experts,
-                    num_experts_per_tok=config.num_experts_per_token,
-                    intermediate_dim=config.moe_intermediate_size,
-                    mesh=mesh,
-                    weight_dtype=dtype,
-                    dtype=dtype,
-                    layer_id=layer_idx,
-                    ep_size=config.ep_size,
-                )
-
-            # Shared experts
+            self.experts = EPMoE(
+                hidden_size=config.hidden_size,
+                num_experts=config.num_experts,
+                num_experts_per_tok=config.num_experts_per_tok,
+                intermediate_dim=config.moe_intermediate_size,
+                mesh=mesh,
+                weight_dtype=dtype,
+                dtype=dtype,
+                layer_id=layer_idx,
+                ep_size=getattr(config, "ep_size", 1),
+                quantization_config=getattr(config, "quantization_config", None),
+            )
             if config.num_shared_experts > 0:
-                self.shared_experts = KimiMLP(
+                self.shared_experts = BailingMoeV3MLP(
                     hidden_size=config.hidden_size,
-                    intermediate_size=config.moe_intermediate_size * config.num_shared_experts,
+                    intermediate_size=config.moe_shared_expert_intermediate_size
+                    * config.num_shared_experts,
                     mesh=mesh,
                     dtype=dtype,
                 )
@@ -431,7 +460,6 @@ class KimiDecoderLayer(nnx.Module):
         residual: jax.Array | None = None,
         dispatch_info: ExpertLocationMetadata | None = None,
     ):
-        # Pre-norm residual pattern
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -440,42 +468,37 @@ class KimiDecoderLayer(nnx.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
 
-        # Attention
         if self.is_kda:
             kv_pool = memory_pools.recurrent_state_pool
         else:
             kv_pool = memory_pools.token_to_kv_pool
-
         hidden_states, kv_fused = self.self_attn(
             positions,
             hidden_states,
             forward_batch,
             kv_pool,
         )
-        # Post-attention residual + norm
+
         hidden_states += residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
-        # MLP (MoE or dense)
         if self.is_moe_layer:
-            if self.shared_experts is not None:
-                shared_output = self.shared_experts(hidden_states)
-            else:
-                shared_output = None
+            shared_output = (
+                self.shared_experts(hidden_states) if self.shared_experts is not None else None
+            )
 
             router_logits = self.moe_gate(hidden_states)
             correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
             topk_weights, topk_ids = self.topk(
-                router_logits, correction_bias, dispatch_info=dispatch_info
+                router_logits,
+                correction_bias,
+                dispatch_info=dispatch_info,
+                routing_sharding=NamedSharding(self.mesh, P("data", None)),
             )
 
-            if self.use_fused:
-                token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
-                topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
-
-            hidden_states = self.block_sparse_moe(hidden_states, topk_weights, topk_ids)
-
+            moe_kwargs = {"out_sharding": NamedSharding(self.mesh, P("data", None))}
+            hidden_states = self.experts(hidden_states, topk_weights, topk_ids, **moe_kwargs)
             if shared_output is not None:
                 hidden_states = hidden_states + shared_output
         else:
@@ -485,13 +508,13 @@ class KimiDecoderLayer(nnx.Module):
         return hidden_states, residual, kv_fused, topk_ids
 
 
-class KimiModel(nnx.Module):
+class BailingMoeV3Model(nnx.Module):
     def __init__(
         self,
-        config: KimiLinearConfig,
+        config: BailingHybridConfig,
         mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
-    ) -> None:
+    ):
         self.config = config
         self.vocab_size = config.vocab_size
 
@@ -503,10 +526,9 @@ class KimiModel(nnx.Module):
             kernel_axes=("tensor", None),
             mesh=mesh,
         )
-
         self.layers = nnx.data(
             [
-                KimiDecoderLayer(
+                BailingMoeV3DecoderLayer(
                     config=config,
                     mesh=mesh,
                     layer_idx=i,
@@ -515,7 +537,6 @@ class KimiModel(nnx.Module):
                 for i in range(config.num_hidden_layers)
             ]
         )
-
         self.norm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
@@ -524,11 +545,7 @@ class KimiModel(nnx.Module):
             scope_name="norm",
         )
 
-    def __call__(
-        self,
-        forward_batch: ForwardBatch,
-        memory_pools,
-    ) -> tuple[jax.Array, list, list, list]:
+    def __call__(self, forward_batch: ForwardBatch, memory_pools):
         hidden_states = self.embed_tokens(forward_batch.input_ids)
 
         residual = None
@@ -556,7 +573,6 @@ class KimiModel(nnx.Module):
 
         if residual is not None:
             hidden_states += residual
-
         hidden_states = self.norm(hidden_states)
         return (
             hidden_states,
@@ -566,26 +582,37 @@ class KimiModel(nnx.Module):
         )
 
 
-class KimiLinearForCausalLM(nnx.Module):
+class BailingMoeV3ForCausalLM(nnx.Module):
     @classmethod
-    def patch_model_config(cls, config: ModelConfig) -> None:
-        config.attention_arch = AttentionArch.MLA
-        qk_nope = getattr(config.hf_text_config, "qk_nope_head_dim", 0)
-        qk_rope = getattr(config.hf_text_config, "qk_rope_head_dim", 0)
-        if qk_nope and qk_rope:
-            config.head_dim = qk_nope + qk_rope
+    def patch_model_config(cls, mc: ModelConfig) -> None:
+        mc.attention_arch = AttentionArch.MLA
+        mc.head_dim = mc.hf_text_config.qk_nope_head_dim + mc.hf_text_config.qk_rope_head_dim
 
     def __init__(
-        self, config: KimiLinearConfig, mesh: jax.sharding.Mesh, dtype: jnp.dtype = jnp.bfloat16
-    ) -> None:
+        self,
+        config: BailingHybridConfig,
+        mesh: jax.sharding.Mesh,
+        dtype: jnp.dtype = jnp.bfloat16,
+    ):
+        if not config.is_mla:
+            raise ValueError(
+                f"BailingMoeV3 requires full_attention_type='mla', got "
+                f"{config.full_attention_type!r}"
+            )
+        if config.q_lora_rank is None:
+            raise ValueError("Ling-3.0-tiny requires q_lora_rank")
+        moe_backend = MoEBackend(getattr(config, "moe_backend", MoEBackend.EPMOE))
+        if moe_backend != MoEBackend.EPMOE:
+            raise ValueError("Ling-3.0-tiny currently supports only --moe-backend epmoe")
+        gate_granularity = config.gated_attention_proj_granularity_type
+        if gate_granularity != "head_wise":
+            raise ValueError(
+                f"Ling-3.0-tiny requires head-wise MLA gating, got {gate_granularity!r}"
+            )
         self.config = config
         self.mesh = mesh
         self.dtype = dtype
-        self.model = KimiModel(
-            config=config,
-            mesh=mesh,
-            dtype=dtype,
-        )
+        self.model = BailingMoeV3Model(config=config, mesh=mesh, dtype=dtype)
 
         if not getattr(config, "tie_word_embeddings", False):
             self.lm_head = ParallelLMHead(
@@ -595,7 +622,6 @@ class KimiLinearForCausalLM(nnx.Module):
                 param_dtype=dtype,
                 kernel_axes=("tensor", None),
             )
-
         self.logits_processor = LogitsProcessor(config.vocab_size, mesh=mesh)
 
     def __call__(
@@ -605,8 +631,7 @@ class KimiLinearForCausalLM(nnx.Module):
         logits_metadata: LogitsMetadata,
     ):
         hidden_states, layers_kv_fused, layers_recurrent_state, layers_topk_ids = self.model(
-            forward_batch,
-            memory_pools,
+            forward_batch, memory_pools
         )
         if not getattr(self.config, "tie_word_embeddings", False):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
@@ -630,15 +655,18 @@ class KimiLinearForCausalLM(nnx.Module):
             dtype=self.dtype,
         )
         weight_mappings = self._create_weight_mappings()
-        loader.load_weights_from_safetensors(weight_mappings)
+        loader.load_weights_from_safetensors(
+            weight_mappings,
+            validate_checkpoint_coverage=True,
+        )
         for layer in self.model.layers:
             if not layer.is_kda:
                 layer.self_attn.post_load_weights()
-        logger.info("Weights loaded successfully!")
+        logger.info("Ling-3.0-tiny weights loaded successfully.")
 
     def _create_weight_mappings(self) -> dict:
-        mappings = {
-            "model.embed_tokens.weight": WeightMapping(
+        mappings: dict[str, WeightMapping] = {
+            "model.word_embeddings.weight": WeightMapping(
                 target_path="model.embed_tokens.embedding",
                 sharding=("tensor", None),
                 transpose=False,
@@ -649,7 +677,6 @@ class KimiLinearForCausalLM(nnx.Module):
                 transpose=False,
             ),
         }
-
         if not getattr(self.config, "tie_word_embeddings", False):
             mappings["lm_head.weight"] = WeightMapping(
                 target_path="lm_head.embedding",
@@ -659,29 +686,24 @@ class KimiLinearForCausalLM(nnx.Module):
 
         num_layers = self.config.num_hidden_layers
         first_k_dense_replace = self.config.first_k_dense_replace
-        moe_backend = getattr(self.config, "moe_backend", "epmoe")
 
         for layer_idx in range(num_layers):
             is_dense = layer_idx < first_k_dense_replace
             is_kda = self.config.is_kda_layer(layer_idx)
-            layer_mappings = self._create_layer_mappings(
-                layer_idx,
-                is_dense=is_dense,
-                is_kda=is_kda,
-                moe_backend=moe_backend,
+            mappings.update(
+                self._create_layer_mappings(
+                    layer_idx,
+                    is_dense=is_dense,
+                    is_kda=is_kda,
+                )
             )
-            mappings.update(layer_mappings)
 
         return mappings
 
-    def _create_layer_mappings(
-        self, layer_idx: int, *, is_dense: bool, is_kda: bool, moe_backend: str
-    ) -> dict:
+    def _create_layer_mappings(self, layer_idx: int, *, is_dense: bool, is_kda: bool) -> dict:
         prefix = f"model.layers.{layer_idx}"
         target_prefix = f"model.layers.{layer_idx}"
-
-        mappings = {
-            # Layer norms (all layers)
+        mappings: dict[str, WeightMapping] = {
             f"{prefix}.input_layernorm.weight": WeightMapping(
                 target_path=f"{target_prefix}.input_layernorm.scale",
                 sharding=(None,),
@@ -694,87 +716,92 @@ class KimiLinearForCausalLM(nnx.Module):
             ),
         }
 
-        # --- Attention mappings ---
+        # Ling3 checkpoint and runtime use different attention prefixes.
+        attn_src = f"{prefix}.attention"
+        attn_target = f"{target_prefix}.self_attn"
+
         if is_kda:
-            attn_target = f"{target_prefix}.self_attn"
-            for proj_name in ("q_proj", "k_proj", "v_proj", "f_b_proj", "b_proj", "g_b_proj"):
-                mappings[f"{prefix}.self_attn.{proj_name}.weight"] = WeightMapping(
-                    target_path=f"{attn_target}.{proj_name}.weight",
+            for proj in ("q_proj", "k_proj", "v_proj", "f_proj", "g_proj", "b_proj"):
+                mappings[f"{attn_src}.{proj}.weight"] = WeightMapping(
+                    target_path=f"{attn_target}.{proj}.weight",
                     sharding=(None, "tensor"),
                     transpose=True,
                 )
-            for proj_name in ("f_a_proj", "g_a_proj"):
-                mappings[f"{prefix}.self_attn.{proj_name}.weight"] = WeightMapping(
-                    target_path=f"{attn_target}.{proj_name}.weight",
-                    sharding=(None, None),
-                    transpose=True,
-                )
-            mappings[f"{prefix}.self_attn.o_proj.weight"] = WeightMapping(
+            mappings[f"{attn_src}.o_proj.weight"] = WeightMapping(
                 target_path=f"{attn_target}.o_proj.weight",
                 sharding=("tensor", None),
                 transpose=True,
             )
-            # Conv1d weights: HF shape (projection_size, 1, conv_size) -> JAX (conv_size, projection_size) -> (projection_size, conv_size)
-            # These live under self_attn.attn (RadixLinearAttention), not self_attn directly.
             conv_size = self.config.linear_attn_config["short_conv_kernel_size"]
             num_heads = self.config.linear_attn_config["num_heads"]
             head_dim = self.config.linear_attn_config["head_dim"]
             projection_size = num_heads * head_dim
             for conv_name in ("q_conv1d", "k_conv1d", "v_conv1d"):
-                mappings[f"{prefix}.self_attn.{conv_name}.weight"] = WeightMapping(
+                mappings[f"{attn_src}.{conv_name}.weight"] = WeightMapping(
                     target_path=f"{attn_target}.attn.{conv_name}.weight",
                     sharding=("tensor", None),
                     transpose=False,
-                    # transpose_axes=(2, 0, 1),
                     reshape=(projection_size, conv_size),
                 )
-            mappings[f"{prefix}.self_attn.o_norm.weight"] = WeightMapping(
+            mappings[f"{attn_src}.o_norm.weight"] = WeightMapping(
                 target_path=f"{attn_target}.o_norm.weight",
                 sharding=(None,),
                 transpose=False,
             )
-            mappings[f"{prefix}.self_attn.dt_bias"] = WeightMapping(
+            mappings[f"{attn_src}.dt_bias"] = WeightMapping(
                 target_path=f"{attn_target}.attn.dt_bias",
                 sharding=("tensor",),
                 transpose=False,
             )
-            mappings[f"{prefix}.self_attn.A_log"] = WeightMapping(
+            mappings[f"{attn_src}.A_log"] = WeightMapping(
                 target_path=f"{attn_target}.A_log",
                 sharding=(None, None, "tensor", None),
                 transpose=False,
+                reshape=(1, 1, self.config.num_attention_heads, 1),
             )
         else:
-            # MLA layer — MLAAttention is directly self.self_attn
-            attn_target = f"{target_prefix}.self_attn"
-            mappings[f"{prefix}.self_attn.q_proj.weight"] = WeightMapping(
-                target_path=f"{attn_target}.q_proj.weight",
+            mappings[f"{attn_src}.q_a_proj.weight"] = WeightMapping(
+                target_path=f"{attn_target}.q_a_proj.weight",
+                sharding=(None, None),
+                transpose=True,
+            )
+            mappings[f"{attn_src}.q_a_layernorm.weight"] = WeightMapping(
+                target_path=f"{attn_target}.q_a_layernorm.scale",
+                sharding=(None,),
+                transpose=False,
+            )
+            mappings[f"{attn_src}.q_b_proj.weight"] = WeightMapping(
+                target_path=f"{attn_target}.q_b_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             )
-            mappings[f"{prefix}.self_attn.o_proj.weight"] = WeightMapping(
-                target_path=f"{attn_target}.o_proj.weight",
-                sharding=("tensor", None),
-                transpose=True,
-            )
-            mappings[f"{prefix}.self_attn.kv_a_proj_with_mqa.weight"] = WeightMapping(
+            mappings[f"{attn_src}.kv_a_proj_with_mqa.weight"] = WeightMapping(
                 target_path=f"{attn_target}.kv_a_proj.weight",
                 sharding=(None, None),
                 transpose=True,
             )
-            mappings[f"{prefix}.self_attn.kv_a_layernorm.weight"] = WeightMapping(
+            mappings[f"{attn_src}.kv_a_layernorm.weight"] = WeightMapping(
                 target_path=f"{attn_target}.kv_a_layernorm.scale",
                 sharding=(None,),
                 transpose=False,
             )
-            mappings[f"{prefix}.self_attn.kv_b_proj.weight"] = WeightMapping(
+            mappings[f"{attn_src}.kv_b_proj.weight"] = WeightMapping(
                 target_path=f"{attn_target}.kv_b_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             )
+            mappings[f"{attn_src}.g_proj.weight"] = WeightMapping(
+                target_path=f"{attn_target}.g_proj.weight",
+                sharding=(None, "tensor"),
+                transpose=True,
+            )
+            mappings[f"{attn_src}.dense.weight"] = WeightMapping(
+                target_path=f"{attn_target}.o_proj.weight",
+                sharding=("tensor", None),
+                transpose=True,
+            )
 
-        # --- FFN mappings ---
         if is_dense:
-            # Dense MLP
             for proj_name, sharding in [
                 ("gate_proj", (None, "tensor")),
                 ("up_proj", (None, "tensor")),
@@ -786,22 +813,17 @@ class KimiLinearForCausalLM(nnx.Module):
                     transpose=True,
                 )
         else:
-            # MoE — gate/topk are flat on decoder layer, experts in block_sparse_moe
-
-            # Gate
-            mappings[f"{prefix}.block_sparse_moe.gate.weight"] = WeightMapping(
+            mappings[f"{prefix}.mlp.gate.weight"] = WeightMapping(
                 target_path=f"{target_prefix}.moe_gate.kernel",
                 sharding=(None, None),
                 transpose=True,
             )
-            mappings[f"{prefix}.block_sparse_moe.gate.e_score_correction_bias"] = WeightMapping(
+            mappings[f"{prefix}.mlp.gate.expert_bias"] = WeightMapping(
                 target_path=f"{target_prefix}.moe_gate.bias",
                 sharding=(None,),
             )
 
-            # Expert weights
-            num_logical_experts = self.config.num_experts
-
+            # The generic helper assumes identical source/target MoE prefixes; Ling3 differs.
             from sgl_jax.srt.eplb.expert_location import (
                 get_global_expert_location_metadata,
             )
@@ -812,32 +834,41 @@ class KimiLinearForCausalLM(nnx.Module):
                 physical_to_logical_map = np.array(jax.device_get(metadata.physical_to_logical_map))
                 phy_to_log = physical_to_logical_map[layer_idx]
 
-            moe_mappings = create_moe_weights_mapping(
-                prefix=prefix,
-                target_prefix=target_prefix,
-                num_experts=num_logical_experts,
-                expert_type_names=("w1", "w3", "w2"),
-                moe_backend=moe_backend,
-                moe_path="block_sparse_moe",
-                physical_to_logical_map=phy_to_log,
-            )
-            mappings.update(moe_mappings)
+            for source_name, target_name in (
+                ("gate_proj", "wi_0"),
+                ("up_proj", "wi_1"),
+                ("down_proj", "wo"),
+            ):
+                sharding = (
+                    ("expert", "tensor", None)
+                    if target_name == "wo"
+                    else ("expert", None, "tensor")
+                )
+                target_path_base = f"{target_prefix}.experts.{target_name}"
+                expert_keys = [
+                    f"{prefix}.mlp.experts.{i}.{source_name}.weight"
+                    for i in range(self.config.num_experts)
+                ]
+                mappings[f"__MOE_EXPERTS__{target_path_base}"] = WeightMapping(
+                    target_path=[target_path_base] + expert_keys,
+                    sharding=sharding,
+                    transpose=True,
+                    physical_to_logical_map=phy_to_log,
+                )
 
-            # Shared experts
-            for proj_name, sharding in [
-                ("gate_proj", (None, "tensor")),
-                ("up_proj", (None, "tensor")),
-                ("down_proj", ("tensor", None)),
-            ]:
-                mappings[f"{prefix}.block_sparse_moe.shared_experts.{proj_name}.weight"] = (
-                    WeightMapping(
+            if self.config.num_shared_experts > 0:
+                for proj_name, sharding in [
+                    ("gate_proj", (None, "tensor")),
+                    ("up_proj", (None, "tensor")),
+                    ("down_proj", ("tensor", None)),
+                ]:
+                    mappings[f"{prefix}.mlp.shared_experts.{proj_name}.weight"] = WeightMapping(
                         target_path=f"{target_prefix}.shared_experts.{proj_name}.weight",
                         sharding=sharding,
                         transpose=True,
                     )
-                )
 
         return mappings
 
 
-EntryClass = KimiLinearForCausalLM
+EntryClass = BailingMoeV3ForCausalLM

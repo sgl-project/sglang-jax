@@ -296,8 +296,18 @@ class DeepseekV3Attention(nnx.Module):
                 q_nope, q_rope, compressed, k_rope, forward_batch, token_to_kv_pool
             )
 
+        attn_output = self._pre_o_proj(attn_output, hidden_states)
         output, _ = self.o_proj(attn_output)
         return output, kv_fused
+
+    def _pre_o_proj(
+        self,
+        attn_output: jax.Array,
+        hidden_states: jax.Array,
+    ) -> jax.Array:
+        """Let MLA variants reuse this class without duplicating its core."""
+        del hidden_states
+        return attn_output
 
     def post_load_weights(self):
         """Split kv_b_proj.weight into absorbed-MLA folded projections.
