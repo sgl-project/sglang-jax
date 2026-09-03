@@ -26,10 +26,8 @@ class Sampler(nnx.Module):
 
     def _greedy_sampling(self, operands):
         """Greedy sampling branch"""
-        logits, sampling_metadata, _ = operands
+        logits, _, _ = operands
         batch_next_token_ids = jnp.argmax(logits, -1).flatten()
-        if not sampling_metadata.return_logprob:
-            return batch_next_token_ids, None
         logprobs = jax.nn.log_softmax(logits, axis=-1)
         return batch_next_token_ids, logprobs
 
@@ -70,17 +68,11 @@ class Sampler(nnx.Module):
             use_sort_for_toppk_minp,
         )
 
-        batch_next_token_ids = jax.sharding.reshard(
-            batch_next_token_ids, NamedSharding(self.mesh, P("data"))
-        )
-        if not sampling_metadata.return_logprob:
-            return batch_next_token_ids, None
-
         log_probs = jnp.log(probs).clip(min=jnp.finfo(probs.dtype).min)
-        log_probs = jax.sharding.reshard(
-            log_probs, NamedSharding(self.mesh, P("data", "tensor"))
+        return (
+            jax.sharding.reshard(batch_next_token_ids, NamedSharding(self.mesh, P("data"))),
+            jax.sharding.reshard(log_probs, NamedSharding(self.mesh, P("data", "tensor"))),
         )
-        return batch_next_token_ids, log_probs
 
     def _process_logprob_results(self, operands):
         """Process logprob results when return_logprob=True"""
@@ -181,7 +173,6 @@ class Sampler(nnx.Module):
         sampling_metadata: SamplingMetadata,
         use_sort_for_toppk_minp: bool,
         rng_override: jax.Array | None = None,
-        rng_step: int | jax.Array | None = None,
     ):
         """Run a sampler & compute logprobs and update logits_output accordingly.
 
@@ -189,8 +180,6 @@ class Sampler(nnx.Module):
             logits_output: The logits from the model forward
             sampling_metadata: Metadata for sampling
             use_sort_for_toppk_minp: whether use sort when dealing with top_k, top_k and min_p.
-            rng_override: Base RNG key to use instead of the module RNG.
-            rng_step: Optional step folded into the RNG key inside the regular-sampling branch.
         """
 
         # Apply penalties before sampling
@@ -209,19 +198,12 @@ class Sampler(nnx.Module):
             (logits, sampling_metadata.vocab_mask),
         )
 
-        operands = (logits, sampling_metadata)
-        greedy_fn = lambda op: self._greedy_sampling((*op, None))
-
-        def regular_fn(op):
-            rng = rng_override if rng_override is not None else self.rngs.params()
-            if rng_step is not None:
-                rng = jax.random.fold_in(rng, rng_step)
-            _, rng = jax.random.split(rng)
-            return self._regular_sampling((*op, rng, use_sort_for_toppk_minp))
-
+        _, rng = jax.random.split(rng_override if rng_override is not None else self.rngs.params())
+        operands = (logits, sampling_metadata, rng)
+        regular_fn = lambda op: self._regular_sampling((*op, use_sort_for_toppk_minp))
         batch_next_token_ids, logprobs = lax.cond(
             sampling_metadata.is_all_greedy,
-            greedy_fn,
+            self._greedy_sampling,
             regular_fn,
             operands,
         )
