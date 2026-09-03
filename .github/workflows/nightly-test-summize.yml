@@ -20,7 +20,7 @@ permissions:
 jobs:
   generate-summary:
     if: github.repository == 'sgl-project/sglang-jax'
-    runs-on: arc-runner-v6e-1-us-south1-ai1b
+    runs-on: arc-runner-v6e-1
     continue-on-error: true
     env:
       TZ: Asia/Shanghai
@@ -33,10 +33,11 @@ jobs:
         run: echo "DATE_DIR=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
 
       - name: Set up Python Environment
-        uses: ./.github/actions/setup-venv
-        with:
-          install-target: ''
-          extra-packages: requests pandas matplotlib seaborn
+        run: |
+          python3.12 -m venv .venv
+          source .venv/bin/activate
+          pip install uv
+          uv pip install requests pandas matplotlib seaborn
 
 
       - name: Prepare Image Directory

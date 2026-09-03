@@ -294,7 +294,7 @@ suites = {
         TestFile("python/sgl_jax/test/layers/test_merged_column_parallel_linear.py", 0.1),
         TestFile("test/srt/kernels/dsa/test_streamindex_topk.py", 3, runner="pytest"),
     ],
-    # CPU-only unit tests — moved off the v6e-1 TPU runner to a dedicated
+    # CPU-only unit tests — moved off arc-runner-v6e-1 to a dedicated
     # CPU runner so they don't consume TPU capacity. Either pure
     # Python / numpy / mocks (no JAX device ops) or JAX kernels whose
     # header already pins JAX_PLATFORMS=cpu and which target CPU
