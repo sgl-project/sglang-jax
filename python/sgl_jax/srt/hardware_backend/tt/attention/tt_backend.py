@@ -119,6 +119,7 @@ class TTAttention(AttentionBackend):
         "experimental_weight_dtype": "bfp_bf8",
         "enable_trace": "true",
     }
+    sampler_compiler_options = {"enable_trace": "true"}
 
     def __init__(self, page_size: int, mesh: jax.sharding.Mesh):
         if page_size < 32 or page_size % 32:

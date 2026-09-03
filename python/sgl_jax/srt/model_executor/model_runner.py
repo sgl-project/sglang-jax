@@ -321,19 +321,14 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 "(compiler_options: xla_tpu_enable_log_recorder=true)."
             )
         backend_compiler_options = getattr(self.attn_backend, "compiler_options", None)
+        sampler_compiler_options = getattr(
+            self.attn_backend, "sampler_compiler_options", None
+        )
         if backend_compiler_options:
             jit_compiler_options = {
                 **backend_compiler_options,
                 **(jit_compiler_options or {}),
             }
-        sampler_compiler_options = (
-            {"enable_trace": backend_compiler_options["enable_trace"]}
-            if (
-                backend_compiler_options
-                and "enable_trace" in backend_compiler_options
-            )
-            else None
-        )
 
         @partial(
             jax.jit,
