@@ -813,7 +813,11 @@ class ModelRunnerKVCacheMixin:
         # 2. Enforce constraints for hybrid recurrent
         if self.linear_recurrent_config is not None:
             _enforce_recurrent_state_server_constraints(
-                self.server_args, is_lightning=self.lightning_config is not None
+                self.server_args,
+                is_lightning=(
+                    self.lightning_config is not None
+                    and not getattr(self.linear_recurrent_config, "use_kda", False)
+                ),
             )
 
         # 3. Profile max tokens

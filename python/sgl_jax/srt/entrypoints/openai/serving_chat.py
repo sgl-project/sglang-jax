@@ -898,7 +898,7 @@ Assistant: {% endif %}"""
         if not parser:
             return False
         kwargs = request.chat_template_kwargs or {}
-        if parser == "qwen3":
+        if parser in ("qwen3", "ling3"):
             return kwargs.get("enable_thinking") is not False
         if parser == "mimo":
             return kwargs.get("enable_thinking") is True

@@ -27,9 +27,10 @@ if TYPE_CHECKING:
 
 
 def l2_normalize(x: jax.Array, epsilon: float = 1e-6) -> jax.Array:
-    """L2-normalize along the last axis. Computed in fp32, cast back to input dtype."""
-    norm = jnp.linalg.norm(x.astype(jnp.float32), axis=-1, keepdims=True)
-    return (x.astype(jnp.float32) / jnp.maximum(norm, epsilon)).astype(x.dtype)
+    """Match FLA ``l2norm_fwd``: ``x / sqrt(sum(x**2) + eps)``."""
+    x32 = x.astype(jnp.float32)
+    rstd = jax.lax.rsqrt(jnp.sum(jnp.square(x32), axis=-1, keepdims=True) + epsilon)
+    return (x32 * rstd).astype(x.dtype)
 
 
 class KDAAttnBackend(LinearRecurrentAttnBackend):
@@ -360,6 +361,8 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         dt_bias = layer.dt_bias.value.reshape(H, -1)
         scale = scale if scale is not None else layer.scale
         lower_bound = getattr(layer, "kda_gate_lower_bound", None)
+        if lower_bound is None:
+            lower_bound = getattr(layer, "kda_lower_bound", None)
         kernel = os.environ.get("SGLANG_JAX_KDA_PREFILL_KERNEL", "mega").strip().lower()
         if kernel not in {"chunked", "mega"}:
             raise ValueError(
@@ -511,6 +514,8 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         g32 = g.astype(jnp.float32) + layer.dt_bias.value.reshape(H, -1).astype(jnp.float32)
         a_scale = jnp.exp(layer.A_log.value.reshape(H, 1).astype(jnp.float32))
         lower_bound = getattr(layer, "kda_gate_lower_bound", None)
+        if lower_bound is None:
+            lower_bound = getattr(layer, "kda_lower_bound", None)
         if lower_bound is None:
             out = -a_scale * jax.nn.softplus(g32)
         else:
