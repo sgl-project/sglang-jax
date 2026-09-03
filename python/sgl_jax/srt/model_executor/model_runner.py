@@ -358,9 +358,9 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             with LoraBatchContext.set_batch(forward_batch):
                 return model(forward_batch, memory_pools, logits_metadata)
 
-        # Capture base RNG key as a constant in the JIT closure.
-        # fold_in(constant, dynamic_step) is computed inside JIT, avoiding
-        # the eager jax.random.split that would serialize the host-device pipeline.
+        # Capture the base RNG key as a constant in the JIT closure. The sampler
+        # folds in the dynamic step inside its regular-sampling cond branch, so
+        # greedy decoding does not execute PRNG operations.
         base_rng_key = self._sampler_base_rng
         _fused_mesh = self.mesh
 
@@ -379,9 +379,11 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         ):
             model_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
             sampler = nnx.merge(sampler_def, model_state)
-            rng_key = jax.random.fold_in(base_rng_key, rng_step)
             return sampler(
-                *args, use_sort_for_toppk_minp=use_sort_for_toppk_minp, rng_override=rng_key
+                *args,
+                use_sort_for_toppk_minp=use_sort_for_toppk_minp,
+                rng_override=base_rng_key,
+                rng_step=rng_step,
             )
 
         @partial(jax.jit, static_argnames=["mesh"])
@@ -512,12 +514,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 )
             s_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
             sampler = nnx.merge(sampler_def, s_state)
-            rng_key = jax.random.fold_in(base_rng_key, rng_step)
             next_ids, token_logprobs, _new_output = sampler(
                 output,
                 sampling_metadata,
                 use_sort_for_toppk_minp=use_sort_for_toppk_minp,
-                rng_override=rng_key,
+                rng_override=base_rng_key,
+                rng_step=rng_step,
             )
             # async_gather + set_future_token_ids inlined. Per-request slot
             # scatter (req_pool_idx + 1); padding rows (seq_lens == 0) go out
