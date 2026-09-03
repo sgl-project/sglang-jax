@@ -45,7 +45,7 @@ dependencies = [
     "omegaconf",
     "imageio[ffmpeg]",
     "librosa>=0.10",
-    "datasets",
+    "datasets>=2.15.0",
 ]
 
 [project.optional-dependencies]
