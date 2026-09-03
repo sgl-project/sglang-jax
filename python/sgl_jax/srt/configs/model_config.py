@@ -57,6 +57,8 @@ _FUSED_MOE_V2_SUPPORTED_ARCHITECTURES = frozenset(
 
 _FORCED_FUSED_EP_MOE_ARCHS = frozenset({"Qwen3_5MoeForConditionalGeneration"})
 
+_MOE_DP_SUPPORTED_ARCHITECTURES = frozenset({"BailingMoeV3ForCausalLM"})
+
 
 def _assert_fused_moe_v2_supported(moe_backend: MoEBackend, architectures: list[str]) -> None:
     if moe_backend != MoEBackend.FUSED_V2:
@@ -66,6 +68,26 @@ def _assert_fused_moe_v2_supported(moe_backend: MoEBackend, architectures: list[
         "moe_backend='fused_v2' only supports Bailing/MiMo/GLM model architectures for now; "
         f"got architectures={architectures}"
     )
+
+
+def _assert_moe_data_parallel_supported(
+    moe_dp_size: int,
+    moe_backend: MoEBackend,
+    architectures: list[str],
+    quantization_config: QuantizationConfig | None,
+) -> None:
+    if moe_dp_size == 1:
+        return
+
+    if moe_backend != MoEBackend.EPMOE:
+        raise ValueError("MoE data parallelism currently requires moe_backend='epmoe'")
+    if not any(arch in _MOE_DP_SUPPORTED_ARCHITECTURES for arch in architectures):
+        raise ValueError(
+            "MoE data parallelism currently supports only Ling-3.0-Tiny "
+            f"(BailingMoeV3ForCausalLM); got architectures={architectures}"
+        )
+    if quantization_config is not None:
+        raise ValueError("MoE data parallelism currently supports unquantized experts only")
 
 
 class ModelConfig:
@@ -87,6 +109,7 @@ class ModelConfig:
         model_layer_nums: int | None = None,
         multimodal: bool = False,
         moe_backend: str | MoEBackend = MoEBackend.AUTO,
+        moe_dp_size: int = 1,
         model_sub_dir: str | None = None,
     ) -> None:
         self.model_path = model_path
@@ -95,6 +118,7 @@ class ModelConfig:
         self.model_impl = model_impl
         self.quantization = quantization
         self.quantization_config_path = quantization_config_path
+        self.moe_dp_size = moe_dp_size
         # Create unified quantization config from path
         self.quantization_config = QuantizationConfig.from_path(quantization_config_path)
         # if ep_size > 1, use ep moe, else use fused moe
@@ -168,6 +192,12 @@ class ModelConfig:
         # 3. Otherwise -> None
         # After this, quantization_config is always QuantizationConfig or None
         self.quantization_config = self._resolve_quantization_config()
+        _assert_moe_data_parallel_supported(
+            self.moe_dp_size,
+            self.moe_backend,
+            self.hf_config.architectures,
+            self.quantization_config,
+        )
 
         # Attach unified quantization config to hf_config so models can access it.
         # Only set when non-None: HuggingFace's to_dict() calls
@@ -571,6 +601,7 @@ class ModelConfig:
             model_layer_nums=server_args.model_layer_nums,
             multimodal=server_args.multimodal,
             moe_backend=server_args.moe_backend,
+            moe_dp_size=server_args.moe_dp_size,
             model_sub_dir=model_sub_dir,
             **kwargs,
         )

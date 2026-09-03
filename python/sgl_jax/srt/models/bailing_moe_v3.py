@@ -20,7 +20,7 @@ from sgl_jax.srt.layers.gate import GateLogit, TopK
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sgl_jax.srt.layers.moe import EPMoE, _is_replicated_moe_enabled
+from sgl_jax.srt.layers.moe import EPMoE
 from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.deepseek_v3 import DeepseekV3Attention
@@ -359,7 +359,8 @@ class BailingMoeV3DecoderLayer(nnx.Module):
         self.mesh = mesh
         self.hidden_size = config.hidden_size
         self.is_kda = config.is_kda_layer(layer_idx)
-        self.replicate_moe = _is_replicated_moe_enabled()
+        self.moe_dp_size = getattr(config, "moe_dp_size", 1)
+        self.replicate_moe = self.moe_dp_size > 1
 
         if self.is_kda:
             self.self_attn = BailingKDAAttention(
@@ -427,6 +428,7 @@ class BailingMoeV3DecoderLayer(nnx.Module):
                 layer_id=layer_idx,
                 ep_size=getattr(config, "ep_size", 1),
                 quantization_config=getattr(config, "quantization_config", None),
+                moe_dp_size=self.moe_dp_size,
             )
             if config.num_shared_experts > 0:
                 self.shared_experts = BailingMoeV3MLP(
@@ -613,9 +615,10 @@ class BailingMoeV3ForCausalLM(nnx.Module):
         self.config = config
         self.mesh = mesh
         self.dtype = dtype
-        self.replicate_moe = _is_replicated_moe_enabled()
+        self.moe_dp_size = getattr(config, "moe_dp_size", 1)
+        self.replicate_moe = self.moe_dp_size > 1
         if self.replicate_moe:
-            logger.warning("Enabling replicated MoE through SGLANG_JAX_ENABLE_REPLICATED_MOE")
+            logger.info("Enabling replicated MoE with moe_dp_size=%d", self.moe_dp_size)
         self.model = BailingMoeV3Model(config=config, mesh=mesh, dtype=dtype)
 
         if not getattr(config, "tie_word_embeddings", False):

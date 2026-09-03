@@ -30,7 +30,7 @@ For a validated recipe, include:
 
 | Evidence | Requirement |
 |---|---|
-| Hardware | TPU/GPU type, topology, node count, chip count, and `--tp-size` / `--dp-size` / `--ep-size`. |
+| Hardware | TPU/GPU type, topology, node count, chip count, and `--tp-size` / `--dp-size` / `--ep-size`; include `--moe-dp-size` when MoE DP is enabled. |
 | Environment | SGL-JAX commit or version, JAX/JAXLIB/libtpu versions, container image when relevant. |
 | Launch | Copy-pasteable server command for the claimed primary path. |
 | Invocation | At least one `curl` or OpenAI-compatible request example. |

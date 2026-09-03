@@ -16,19 +16,12 @@ from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
 # Re-export for backward compatibility: external code imports from this module.
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE, FusedEPMoEV2  # noqa: F401
 from sgl_jax.srt.layers.gate import GateLogit, TopK  # noqa: F401
-from sgl_jax.srt.utils.common_utils import get_bool_env_var
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import (
     quantize_tensor,
     quantize_tensor_simple,
 )
 from sgl_jax.srt.utils.weight_utils import WeightMapping
-
-_REPLICATED_MOE_ENV = "SGLANG_JAX_ENABLE_REPLICATED_MOE"
-
-
-def _is_replicated_moe_enabled() -> bool:
-    return get_bool_env_var(_REPLICATED_MOE_ENV)
 
 
 class EPMoE(nnx.Module):
@@ -47,11 +40,13 @@ class EPMoE(nnx.Module):
         quantization_config=None,
         physical_to_logical_map: "jax.Array | None" = None,
         pre_gather_quant_dtype=None,
+        moe_dp_size: int = 1,
     ):
         self.num_experts_per_tok = num_experts_per_tok
         self.physical_to_logical_map = physical_to_logical_map
         self.pre_gather_quant_dtype = pre_gather_quant_dtype
-        self.replicate_experts = _is_replicated_moe_enabled()
+        self.moe_dp_size = moe_dp_size
+        self.replicate_experts = self.moe_dp_size > 1
 
         metadata = None if self.replicate_experts else get_global_expert_location_metadata()
         if metadata is not None and layer_id is not None:
@@ -80,6 +75,8 @@ class EPMoE(nnx.Module):
             getattr(quantization_config, "weight_block_size", None) if quantization_config else None
         )
 
+        if self.moe_dp_size < 1:
+            raise ValueError(f"moe_dp_size must be at least 1, got {self.moe_dp_size}")
         if self.replicate_experts and self.ep_size != 1:
             raise ValueError(f"replicated EPMoE requires ep_size=1, got ep_size={self.ep_size}")
         if self.replicate_experts and (
@@ -97,6 +94,11 @@ class EPMoE(nnx.Module):
                 raise ValueError(
                     "replicated EPMoE requires a model mesh with ('data', 'tensor') axes; "
                     f"got {self.mesh.axis_names}"
+                )
+            if self.mesh.shape["data"] != self.moe_dp_size:
+                raise ValueError(
+                    "replicated EPMoE requires moe_dp_size to match the model mesh data axis; "
+                    f"got moe_dp_size={self.moe_dp_size}, data={self.mesh.shape['data']}"
                 )
             self.tp_size = self.mesh.shape["tensor"]
             self.experts_per_device = self.num_experts
