@@ -359,6 +359,7 @@ class Qwen3VLVisionModel(nnx.Module):
     ):
         rngs = rngs or nnx.Rngs(0)
         self.mesh = mesh
+        self.dtype = dtype
         self.vision_tp = tp
         self.specs = VisionShardSpecs(mesh, tp)
         self.input_buckets = input_buckets or tuple(resolve_vision_patch_buckets(None))
@@ -532,6 +533,7 @@ class Qwen3VLVisionModel(nnx.Module):
             patch_dim=self.patch_dim,
             merge_unit=self.spatial_merge_unit,
             rope_type="rope_3d",
+            dtype=self.dtype,
         )
 
     def _build_metadata(self, grid_thw: np.ndarray | jax.Array, capacity: int):
