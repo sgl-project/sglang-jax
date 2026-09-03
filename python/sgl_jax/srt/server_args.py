@@ -1305,7 +1305,13 @@ class ServerArgs:
         parser.add_argument(
             "--dp-schedule-policy",
             type=str,
-            choices=["round_robin", "min_running_queue", "cache_aware", "shape_aware"],
+            choices=[
+                "round_robin",
+                "min_running_queue",
+                "cache_aware",
+                "force_cache_aware",
+                "shape_aware",
+            ],
             default=ServerArgs.dp_schedule_policy,
             help=(
                 "DP scheduling policy for assigning dp_rank to new requests. "
@@ -1315,6 +1321,9 @@ class ServerArgs:
                 "it balances on large load skew, else picks the least-loaded rank "
                 "among those holding a substantial cached prefix, so a hot prefix "
                 "spreads across its holders. Improves prefix reuse under DP. "
+                "'force_cache_aware' always chooses the longest eligible cached "
+                "prefix, breaking equal-prefix ties by load, and falls back to "
+                "shape-aware scheduling only on a full cache miss. "
                 "'shape_aware' balances input (prefill) and output (decode) "
                 "token load jointly, routing to the replica whose bottleneck "
                 "dimension stays smallest: score = max(sum_input, sum_output)."
