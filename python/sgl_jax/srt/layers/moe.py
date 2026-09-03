@@ -727,9 +727,10 @@ class EPMoE(nnx.Module):
 
         output = None
         for k in range(top_k):
-            contribution = jnp.take(
-                intermediate, indices=grouped_indices[:, k], axis=0
-            ).astype(jnp.float32) * weights_fp32[:, k, None]
+            contribution = (
+                jnp.take(intermediate, indices=grouped_indices[:, k], axis=0).astype(jnp.float32)
+                * weights_fp32[:, k, None]
+            )
             output = contribution if output is None else output + contribution
 
         final_output = output.astype(self.dtype)
