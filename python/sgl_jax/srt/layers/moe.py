@@ -16,12 +16,19 @@ from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
 # Re-export for backward compatibility: external code imports from this module.
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE, FusedEPMoEV2  # noqa: F401
 from sgl_jax.srt.layers.gate import GateLogit, TopK  # noqa: F401
+from sgl_jax.srt.utils.common_utils import get_bool_env_var
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import (
     quantize_tensor,
     quantize_tensor_simple,
 )
 from sgl_jax.srt.utils.weight_utils import WeightMapping
+
+_REPLICATED_MOE_ENV = "SGLANG_JAX_ENABLE_REPLICATED_MOE"
+
+
+def _is_replicated_moe_enabled() -> bool:
+    return get_bool_env_var(_REPLICATED_MOE_ENV)
 
 
 class EPMoE(nnx.Module):
@@ -44,8 +51,9 @@ class EPMoE(nnx.Module):
         self.num_experts_per_tok = num_experts_per_tok
         self.physical_to_logical_map = physical_to_logical_map
         self.pre_gather_quant_dtype = pre_gather_quant_dtype
+        self.replicate_experts = _is_replicated_moe_enabled()
 
-        metadata = get_global_expert_location_metadata()
+        metadata = None if self.replicate_experts else get_global_expert_location_metadata()
         if metadata is not None and layer_id is not None:
             self.num_experts = metadata.num_physical_experts
         else:
@@ -72,25 +80,48 @@ class EPMoE(nnx.Module):
             getattr(quantization_config, "weight_block_size", None) if quantization_config else None
         )
 
-        if self.num_experts % self.ep_size != 0:
+        if self.replicate_experts and self.ep_size != 1:
+            raise ValueError(f"replicated EPMoE requires ep_size=1, got ep_size={self.ep_size}")
+        if self.replicate_experts and (
+            self.quantized_dtype is not None or self.activation_quantized_dtype is not None
+        ):
+            raise NotImplementedError(
+                "replicated EPMoE currently supports unquantized experts only"
+            )
+        if not self.replicate_experts and self.num_experts % self.ep_size != 0:
             raise ValueError(
                 f"num_experts({self.num_experts}) must be divisible by ep_size ({self.ep_size})"
             )
-        world_size = math.prod(self.mesh.shape.values())
-        self.tp_size = world_size // self.ep_size
-        self.experts_per_device = self.num_experts // self.ep_size
+        if self.replicate_experts:
+            if "data" not in self.mesh.axis_names or "tensor" not in self.mesh.axis_names:
+                raise ValueError(
+                    "replicated EPMoE requires a model mesh with ('data', 'tensor') axes; "
+                    f"got {self.mesh.axis_names}"
+                )
+            self.tp_size = self.mesh.shape["tensor"]
+            self.experts_per_device = self.num_experts
+            self.moe_mesh = self.mesh
+            self.updated_mesh = self.mesh.abstract_mesh
+            wi_sharding = P(None, None, "tensor")
+            wo_sharding = P(None, "tensor", None)
+        else:
+            world_size = math.prod(self.mesh.shape.values())
+            self.tp_size = world_size // self.ep_size
+            self.experts_per_device = self.num_experts // self.ep_size
 
-        devices = self.mesh.devices.flatten()
-        self.moe_mesh = jax.sharding.Mesh(
-            devices.reshape(self.ep_size, self.tp_size),
-            axis_names=("expert", "tensor"),
-            axis_types=(jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit),
-        )
+            devices = self.mesh.devices.flatten()
+            self.moe_mesh = jax.sharding.Mesh(
+                devices.reshape(self.ep_size, self.tp_size),
+                axis_names=("expert", "tensor"),
+                axis_types=(jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit),
+            )
 
-        abstract_mesh = self.mesh.abstract_mesh
-        self.updated_mesh = abstract_mesh.update(
-            axis_sizes=(self.ep_size, self.tp_size), axis_names=("expert", "tensor")
-        )
+            abstract_mesh = self.mesh.abstract_mesh
+            self.updated_mesh = abstract_mesh.update(
+                axis_sizes=(self.ep_size, self.tp_size), axis_names=("expert", "tensor")
+            )
+            wi_sharding = P("expert", None, "tensor")
+            wo_sharding = P("expert", "tensor", None)
 
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
             # MOE weights' shape is (num_experts, k, n)
@@ -99,7 +130,7 @@ class EPMoE(nnx.Module):
                     jax.random.PRNGKey(0),
                     (self.num_experts, hidden_size, intermediate_dim),
                     dtype=weight_dtype,
-                    out_sharding=P("expert", None, "tensor"),
+                    out_sharding=wi_sharding,
                 )
             )
 
@@ -108,7 +139,7 @@ class EPMoE(nnx.Module):
                     jax.random.PRNGKey(0),
                     (self.num_experts, hidden_size, intermediate_dim),
                     dtype=weight_dtype,
-                    out_sharding=P("expert", None, "tensor"),
+                    out_sharding=wi_sharding,
                 )
             )
 
@@ -117,7 +148,7 @@ class EPMoE(nnx.Module):
                     jax.random.PRNGKey(0),
                     (self.num_experts, intermediate_dim, hidden_size),
                     dtype=weight_dtype,
-                    out_sharding=P("expert", "tensor", None),
+                    out_sharding=wo_sharding,
                 )
             )
 
@@ -416,8 +447,22 @@ class EPMoE(nnx.Module):
         *,
         out_sharding: jax.sharding.NamedSharding | None = None,
     ) -> jax.Array:
+        if self.replicate_experts:
+            if out_sharding is None:
+                out_sharding = jax.sharding.NamedSharding(
+                    self.mesh,
+                    P("data", *([None] * (hidden_states.ndim - 1))),
+                )
+            return self._call_replicated(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                out_sharding=out_sharding,
+            )
+
         if out_sharding is None:
             out_sharding = jax.sharding.NamedSharding(self.mesh, P(*([None] * hidden_states.ndim)))
+
         # Translate the caller's target sharding (on self.mesh: data,tensor)
         # into shard_map out_specs (on self.moe_mesh: expert,tensor). Only
         # 'tensor' is shared between the two meshes; everything else is
@@ -495,6 +540,53 @@ class EPMoE(nnx.Module):
         # consistent context.
         return jax.sharding.reshard(result, out_sharding)
 
+    def _call_replicated(
+        self,
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        *,
+        out_sharding: jax.sharding.NamedSharding,
+    ) -> jax.Array:
+        token_spec = P("data", *([None] * (hidden_states.ndim - 1)))
+        routing_spec = P("data", *([None] * (topk_ids.ndim - 1)))
+        out_spec = out_sharding.spec
+        token_axis = out_spec[0] if len(out_spec) > 0 else None
+        token_axes = token_axis if isinstance(token_axis, tuple) else (token_axis,)
+        if self.mesh.shape["data"] > 1 and "data" not in token_axes:
+            raise ValueError(
+                "replicated EPMoE output must shard the token dimension over the data axis"
+            )
+        scatter_on_tensor = "tensor" in token_axes
+
+        with jax.sharding.use_abstract_mesh(self.updated_mesh):
+            hidden_states = jax.sharding.reshard(hidden_states, token_spec)
+            topk_weights = jax.sharding.reshard(topk_weights, routing_spec)
+            topk_ids = jax.sharding.reshard(topk_ids, routing_spec)
+            result = shard_map(
+                partial(self._forward, scatter_on_tensor=scatter_on_tensor),
+                mesh=self.moe_mesh,
+                in_specs=(
+                    token_spec,
+                    routing_spec,
+                    routing_spec,
+                    P(None, None, "tensor"),
+                    P(None, None, "tensor"),
+                    P(None, "tensor", None),
+                ),
+                out_specs=out_spec,
+                check_vma=False,
+            )(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                self.wi_0[...],
+                self.wi_1[...],
+                self.wo[...],
+            )
+
+        return jax.sharding.reshard(result, out_sharding)
+
     def _forward(
         self,
         hidden_states,
@@ -512,7 +604,11 @@ class EPMoE(nnx.Module):
         *,
         scatter_on_tensor: bool = False,
     ):
-        expert_shard_id = jax.lax.axis_index("expert")
+        expert_shard_id = (
+            jnp.array(0, dtype=jnp.int32)
+            if self.replicate_experts
+            else jax.lax.axis_index("expert")
+        )
 
         inputs_2d, token_indices, sorted_selected_experts, group_sizes = self._permute(
             hidden_states, topk_ids
