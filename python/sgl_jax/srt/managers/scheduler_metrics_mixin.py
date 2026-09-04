@@ -134,12 +134,23 @@ class SchedulerMetricsMixin:
             and self.draft_token > 0
             and self.spec_num_forward_ct > 0
         ):
-            accept_ratio = self.accept_token / self.draft_token
             accept_len = self.accept_token / self.spec_num_forward_ct
+            accepted_draft_tokens = self.accept_token - self.spec_num_forward_ct
+            drafted_tokens = self.draft_token - self.spec_num_forward_ct
+            if self.spec_algorithm.is_dflash():
+                accept_ratio = accepted_draft_tokens / drafted_tokens if drafted_tokens > 0 else 0.0
+            else:
+                accept_ratio = self.accept_token / self.draft_token
+            msg += (
+                f"accept-len {accept_len:.4f}, "
+                f"accept-ratio {accept_ratio:.4f}, "
+                f"accepted-draft {accepted_draft_tokens}, "
+                f"drafted {drafted_tokens}, "
+                f"spec-requests {self.spec_num_forward_ct}, "
+            )
             self.accept_token = 0
             self.draft_token = 0
             self.spec_num_forward_ct = 0
-            msg += f"accept-len {accept_len:.2f}, accept-ratio {accept_ratio:.2f}, "
 
         msg += (
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "

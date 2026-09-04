@@ -2012,11 +2012,15 @@ class ServerArgs:
                 and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
                 and self.attention_backend == "fa"
             )
-            supports_dflash_overlap = self.speculative_algorithm == "DFLASH"
+            supports_dflash_overlap = (
+                self.speculative_algorithm == "DFLASH"
+                and self.speculative_eagle_topk == 1
+                and self.speculative_num_steps == 1
+            )
             if not (supports_nextn_overlap or supports_eagle3_overlap or supports_dflash_overlap):
                 raise ValueError(
-                    "Speculative overlap scheduler only supports DFLASH, EAGLE3+FA, "
-                    "or NEXTN with --speculative-eagle-topk=1 and "
+                    "Speculative overlap scheduler only supports DFLASH, EAGLE3+FA, or NEXTN "
+                    "with --speculative-eagle-topk=1 and "
                     "--speculative-num-draft-tokens == --speculative-num-steps + 1. "
                     "Please pass --disable-overlap-schedule for other speculative configs."
                 )

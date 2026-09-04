@@ -843,7 +843,6 @@ class ModelRunnerKVCacheMixin:
                 )
                 self.max_total_num_tokens += spec_headroom
                 self.server_args.max_num_reqs = max_num_reqs
-                self.server_args.draft_runner_cache_size = self.max_total_num_tokens
 
         # 6. Apply constraints (CI, user cap, page align, dp).
         self.max_total_num_tokens = self._apply_token_constraints(
@@ -851,6 +850,12 @@ class ModelRunnerKVCacheMixin:
             None if self.is_draft_worker else max_total_tokens,
             dp_size,
         )
+        if (
+            not self.is_draft_worker
+            and self.spec_algorithm is not None
+            and not self.spec_algorithm.is_none()
+        ):
+            self.server_args.draft_runner_cache_size = self.max_total_num_tokens
 
         # 7. Hybrid SWA token split. draft_runner_cache_size was saved
         # above (per-chip, pre-dp) so the draft won't see hybrid inflation.
