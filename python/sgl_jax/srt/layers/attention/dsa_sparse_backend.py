@@ -85,7 +85,12 @@ _PREFILL_SPARSE = int(os.environ.get("DSA_PREFILL_SPARSE", "0"))
 # path is completely unaffected. ``DSA_PREFILL_QBLOCK=0`` is an escape hatch
 # back to the per-query kernel (e.g. for pathological no-locality selections).
 _PREFILL_QBLOCK = os.environ.get("DSA_PREFILL_QBLOCK", "1") == "1"
-_PREFILL_QBLOCK_QB = int(os.environ.get("DSA_PREFILL_QBLOCK_QB", "64"))
+# Default 256 from the QB sweep on GLM-5.2 (v7x tp16 and v6e-64): saturated
+# attend work scales as (T/QB) * ctx_pages, and 64->256 was uniformly positive
+# (110k TTFT -10%, 16k -11%) with paired-accuracy gates clean at every step.
+# 512 projects <2% further and grows the per-block union tail, so 256 is the
+# sweet spot. Override per deployment via DSA_PREFILL_QBLOCK_QB.
+_PREFILL_QBLOCK_QB = int(os.environ.get("DSA_PREFILL_QBLOCK_QB", "256"))
 
 
 @register_pytree_node_class

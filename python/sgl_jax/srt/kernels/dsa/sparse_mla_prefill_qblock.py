@@ -252,7 +252,7 @@ def sparse_mla_attention_qblock(
     *,
     kv_lora_rank: int = 512,
     read_block: int = 128,
-    query_block: int = 64,
+    query_block: int = 256,
     u_max: int | None = None,  # per-block union cap; default makes overflow impossible
     sm_scale: float,
     interpret: bool = False,
@@ -437,7 +437,7 @@ def prefill_write_and_attend_ragged_qblock(
     kv_lora_rank: int,
     page_size: int,
     sm_scale: float,
-    query_block: int = 64,
+    query_block: int = 256,
     interpret: bool = False,
 ):
     """Packed-ragged self-write + **blocked** sparse-MLA prefill.
