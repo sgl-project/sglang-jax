@@ -252,7 +252,7 @@ def sparse_mla_attention_qblock(
     *,
     kv_lora_rank: int = 512,
     read_block: int = 128,
-    query_block: int = 64,
+    query_block: int = 256,
     u_max: int | None = None,  # per-block union cap; default makes overflow impossible
     sm_scale: float,
     interpret: bool = False,
@@ -437,7 +437,7 @@ def prefill_write_and_attend_ragged_qblock(
     kv_lora_rank: int,
     page_size: int,
     sm_scale: float,
-    query_block: int = 64,
+    query_block: int = 256,
     interpret: bool = False,
 ):
     """Packed-ragged self-write + **blocked** sparse-MLA prefill.
@@ -459,9 +459,20 @@ def prefill_write_and_attend_ragged_qblock(
     row = jnp.zeros((T, Dk_pad), cache.dtype)
     row = row.at[:, :Dv].set(kvc.astype(cache.dtype))
     row = row.at[:, Dv : Dv + rope].set(kpe.reshape(T, rope).astype(cache.dtype))
-    flat = cache.reshape(Pn * ps, Dk_pad)
-    flat = flat.at[loc].set(row, mode="drop", wrap_negative_indices=False)
-    cache_new = flat.reshape(Pn, pspk, pk, Dk_pad)
+    # Scatter directly into the 4D cache. The flat-view round-trip
+    # (reshape [Pn*ps, D] -> scatter -> reshape back) materialises TWO full
+    # relayout copies of the cache per call (the 4D pool and the 2D view get
+    # different tilings) — measured 13.8% of 110k prefill device time. 3D
+    # index math on ``loc`` is free; padded loc == -1 stays dropped (negative
+    # page index with wrap_negative_indices=False).
+    cache_new = paged_write_back(
+        cache,
+        row,
+        loc.astype(jnp.int32),
+        page_size=ps,
+        r_cap=T // ps + S + 34,
+        interpret=interpret,
+    )
 
     # token -> request id (same convention as the per-query ragged wrapper)
     t = jnp.arange(T, dtype=jnp.int32)
@@ -486,3 +497,178 @@ def prefill_write_and_attend_ragged_qblock(
         interpret=interpret,
     )
     return out.reshape(T, H, Dv), cache_new
+
+
+# ── pallas paged write-back (self-write without the XLA scatter) ─────────────
+#
+# ``flat.at[loc].set(row)`` (and its 4D-index form) makes XLA canonicalise the
+# scatter through a flat view of the pool: two full-cache relayout copies per
+# call (the 4D pool and the 2D view tile differently) — measured 13.8% of 110k
+# prefill device time, plus the scatter itself (~4%). This kernel writes the
+# rows in place instead: the pool is input/output-aliased, and the new rows are
+# DMA'd HBM->HBM in maximal contiguous runs (out_cache_loc is page-contiguous,
+# so a chunked single-request prefill is ONE run; ragged batches get ~one run
+# per page). kv_packing word alignment is handled by splitting each run into
+# head-tokens / aligned-words / tail-tokens entries at trace time.
+
+
+def _build_write_runs(loc, *, kv_packing: int, r_cap: int):
+    """Run table for :func:`paged_write_back`.
+
+    Returns ``(table [3*r_cap, 4] int32, n_raw_runs)``; entry = (kind, src,
+    dst, n) where kind 0 = word run (src/dst in kv_packing-word indices) and
+    kind 1 = token run (src/dst in token indices). Entries with n == 0 are
+    no-ops. ``n_raw_runs > r_cap`` means the table overflowed and the caller
+    must fall back.
+    """
+    T = loc.shape[0]
+    pk = kv_packing
+    R = r_cap
+    loc = loc.astype(jnp.int32)
+    valid = loc >= 0
+    contig = jnp.concatenate(
+        [jnp.zeros((1,), bool), (loc[1:] == loc[:-1] + 1) & valid[1:] & valid[:-1]]
+    )
+    is_start = valid & ~contig
+    rid = jnp.cumsum(is_start) - 1  # run id per token (where valid)
+    n_raw = is_start.sum().astype(jnp.int32)
+
+    t_idx = jnp.arange(T, dtype=jnp.int32)
+    sidx = jnp.where(is_start, rid, R)
+    src0 = jnp.zeros((R,), jnp.int32).at[sidx].set(t_idx, mode="drop")
+    dst0 = jnp.zeros((R,), jnp.int32).at[sidx].set(loc, mode="drop")
+    lens = jnp.zeros((R,), jnp.int32).at[jnp.where(valid, rid, R)].add(1, mode="drop")
+
+    # split by word phase: aligned middle goes as one word run, edges per token
+    phase_ok = (src0 % pk) == (dst0 % pk)
+    head = jnp.where(phase_ok, (-dst0) % pk, 0)
+    head = jnp.minimum(head, lens)
+    words = jnp.where(phase_ok, (lens - head) // pk, 0)
+    tail = lens - head - words * pk
+
+    zero = jnp.zeros((R,), jnp.int32)
+    one = jnp.ones((R,), jnp.int32)
+    e_kind = jnp.stack([one, zero, one], axis=1)  # [R, 3]
+    e_src = jnp.stack([src0, (src0 + head) // pk, src0 + head + words * pk], axis=1)
+    e_dst = jnp.stack([dst0, (dst0 + head) // pk, dst0 + head + words * pk], axis=1)
+    e_n = jnp.stack([head, words, tail], axis=1)
+    table = jnp.stack([e_kind, e_src, e_dst, e_n], axis=2).reshape(3 * R, 4)
+    return table, n_raw
+
+
+def _write_back_kernel(tbl_ref, row_ref, cache_in_ref, out_ref, wdst_ref, wsrc_ref, sem):
+    del cache_in_ref  # aliased with out_ref; all access goes through out_ref
+    Pn, pspk, pk, D = out_ref.shape
+    # word view: dim0 (words) is untiled, so dynamic word offsets are legal.
+    # A flat [Pn*ps, D] token view is NOT: it inherits the (pk, ...) pairing
+    # tile on dim0 and single-token slices at odd offsets fail Mosaic
+    # alignment. Edge tokens therefore go through a word-granular RMW below.
+    cache_w = out_ref.reshape(Pn * pspk, pk, D)
+    E = tbl_ref.shape[0]
+
+    def entry(e, carry):
+        kind = tbl_ref[e, 0]
+        src = tbl_ref[e, 1]
+        dst = tbl_ref[e, 2]
+        n = tbl_ref[e, 3]
+
+        @pl.when((kind == 0) & (n > 0))
+        def _():
+            cp = pltpu.make_async_copy(row_ref.at[pl.ds(src, n)], cache_w.at[pl.ds(dst, n)], sem)
+            cp.start()
+            cp.wait()
+
+        @pl.when((kind == 1) & (n > 0))
+        def _():
+            # per-token read-modify-write at word granularity: fetch the dst
+            # word (preserving the neighbour token), overwrite one row via
+            # statically-unrolled phase branches (pk is static), write back.
+            def tok(i, c):
+                st = src + i
+                dt = dst + i
+                sw = st // pk
+                dw = dt // pk
+                cpa = pltpu.make_async_copy(cache_w.at[pl.ds(dw, 1)], wdst_ref, sem)
+                cpa.start()
+                cpa.wait()
+                cpb = pltpu.make_async_copy(row_ref.at[pl.ds(sw, 1)], wsrc_ref, sem)
+                cpb.start()
+                cpb.wait()
+                for spv in range(pk):
+                    for dpv in range(pk):
+
+                        @pl.when((st % pk == spv) & (dt % pk == dpv))
+                        def _(spv=spv, dpv=dpv):
+                            wdst_ref[0, dpv, :] = wsrc_ref[0, spv, :]
+
+                cpc = pltpu.make_async_copy(wdst_ref, cache_w.at[pl.ds(dw, 1)], sem)
+                cpc.start()
+                cpc.wait()
+                return c
+
+            jax.lax.fori_loop(0, n, tok, 0)
+
+        return carry
+
+    jax.lax.fori_loop(0, E, entry, 0)
+
+
+def paged_write_back(
+    cache,  # [Pn, ps//pk, pk, D] paged pool
+    row,  # [T, D] new rows (already cache dtype / padded feature dim)
+    loc,  # [T] int32 flat slot per token; -1 = dropped
+    *,
+    page_size: int,
+    r_cap: int | None = None,
+    interpret: bool = False,
+):
+    """In-place paged self-write: ``cache[loc[t]] = row[t]`` for ``loc >= 0``.
+
+    Bit-identical to ``cache.reshape(-1, D).at[loc].set(row, mode="drop",
+    wrap_negative_indices=False)`` but without the scatter's flat-view
+    relayout round-trip. Falls back to that scatter when the run table
+    overflows ``r_cap`` (pathologically fragmented ``loc``).
+    """
+    Pn, pspk, pk, D = cache.shape
+    ps = page_size
+    assert pspk * pk == ps, (cache.shape, page_size)
+    T = row.shape[0]
+    Tp = -(-T // pk) * pk
+    if Tp != T:
+        row = jnp.pad(row, ((0, Tp - T), (0, 0)))
+        loc = jnp.pad(loc, ((0, Tp - T),), constant_values=-1)
+    if r_cap is None:
+        r_cap = 2 * (Tp // ps) + 130
+    table, n_raw = _build_write_runs(loc, kv_packing=pk, r_cap=r_cap)
+    row_w = row.reshape(Tp // pk, pk, D)
+
+    def _pallas(cache, row_w, table):
+        return pl.pallas_call(
+            _write_back_kernel,
+            in_specs=[
+                pl.BlockSpec(memory_space=pltpu.SMEM),  # run table
+                pl.BlockSpec(memory_space=pltpu.HBM),  # row (word view)
+                pl.BlockSpec(memory_space=pltpu.HBM),  # cache (aliased)
+            ],
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            out_shape=jax.ShapeDtypeStruct(cache.shape, cache.dtype),
+            scratch_shapes=[
+                pltpu.VMEM((1, pk, D), cache.dtype),
+                pltpu.VMEM((1, pk, D), cache.dtype),
+                pltpu.SemaphoreType.DMA,
+            ],
+            input_output_aliases={2: 0},
+            interpret=interpret,
+        )(table, row_w, cache)
+
+    def _scatter(cache, row_w, table):
+        del table
+        flat = cache.reshape(Pn * ps, D)
+        flat = flat.at[loc].set(row_w.reshape(Tp, D), mode="drop", wrap_negative_indices=False)
+        return flat.reshape(cache.shape)
+
+    if interpret:
+        # interpret cannot lower dynamic-size DMAs; the scatter is the
+        # bit-identical reference semantics anyway.
+        return _scatter(cache, row_w, table)
+    return jax.lax.cond(n_raw <= r_cap, _pallas, _scatter, cache, row_w, table)

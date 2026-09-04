@@ -138,3 +138,27 @@ def test_packed_multirequest_global_keys(num_seqs):
         rows.append(np.where(tk >= 0, tk + base, -1))
     tk_packed = np.concatenate(rows, axis=0)
     _check(tk_packed, qb=64, u_max=num_seqs * pages_per_seq)
+
+
+def test_build_write_runs_table():
+    # run-table builder for the pallas write-back: word/token split + overflow
+    from sgl_jax.srt.kernels.dsa.sparse_mla_prefill_qblock import _build_write_runs
+
+    pk = 2
+    # aligned contiguous run + gap(-1) + odd-phase run
+    loc = np.array([4, 5, 6, 7, -1, -1, 11, 12, 13], np.int32)  # src 0..3 / 6..8
+    tbl, n_raw = _build_write_runs(jnp.asarray(loc), kv_packing=pk, r_cap=8)
+    tbl = np.asarray(tbl)
+    assert int(n_raw) == 2
+    live = tbl[tbl[:, 3] > 0]
+    # reconstruct per-token writes from the table and compare with the oracle
+    writes = {}
+    for kind, src, dst, n in live.tolist():
+        for i in range(n):
+            if kind == 0:  # word run
+                for w in range(pk):
+                    writes[(dst + i) * pk + w] = (src + i) * pk + w
+            else:
+                writes[dst + i] = src + i
+    want = {int(l): t for t, l in enumerate(loc) if l >= 0}
+    assert writes == want, (writes, want)
