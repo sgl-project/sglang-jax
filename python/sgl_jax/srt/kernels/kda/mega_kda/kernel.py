@@ -989,29 +989,41 @@ def _fwd_mega_kernel_native_segids(
         # Aqk/L (FULL-style, no cross-seg masking in loop for stability)
         BC = QK_BC
         beta_f32 = beta[:, :, None]
-        # Restart the log-domain prefix at the packed segment boundary. This
-        # preserves segment B's initial-state contribution; within-segment
-        # gate differences used by Aqk/L are unchanged by the constant shift.
-        first_segment_total = jnp.min(
-            jnp.where(seg_A_mask[None, :, None] > 0, g_cumsum, 0.0),
-            axis=1,
-            keepdims=True,
-        )
-        g_cumsum = g_cumsum - first_segment_total * seg_B_mask[None, :, None]
+        # Build the intra terms before restarting segment B's log-domain
+        # prefix. Resetting first introduces a large positive discontinuity at
+        # the packed boundary, so the factored exponentials can overflow before
+        # the cross-segment entries are masked. Within-segment gate differences
+        # are invariant to the later constant shift.
+        continuous_g_cumsum = g_cumsum
         if lower_bound is None:
             Aqk, L, _ = _build_unbounded_intra_terms(
-                q, k, g_cumsum, beta, scale, BC, OUTPUT_PRECISION
+                q, k, continuous_g_cumsum, beta, scale, BC, OUTPUT_PRECISION
             )
         else:
             Aqk, L, _ = _build_bounded_intra_terms(
-                q, k, g_cumsum, beta, scale, BC, OUTPUT_PRECISION, safe_gate
+                q,
+                k,
+                continuous_g_cumsum,
+                beta,
+                scale,
+                BC,
+                OUTPUT_PRECISION,
+                safe_gate,
             )
 
-        # Mask L for segment-independent solve
-        same_seg_L = (
-            seg_A_mask[:, None] * seg_A_mask[None, :] + seg_B_mask[:, None] * seg_B_mask[None, :]
+        # Restart segment B for its initial-state and final-state paths.
+        first_segment_total = jnp.min(
+            jnp.where(seg_A_mask[None, :, None] > 0, continuous_g_cumsum, 0.0),
+            axis=1,
+            keepdims=True,
         )
-        L = L * same_seg_L[None]
+        g_cumsum = continuous_g_cumsum - first_segment_total * seg_B_mask[None, :, None]
+
+        # Mask L for segment-independent solve
+        same_seg_L = (seg_A_mask[:, None] * seg_A_mask[None, :]) + (
+            seg_B_mask[:, None] * seg_B_mask[None, :]
+        ) > 0
+        L = jnp.where(same_seg_L[None], L, 0.0)
 
         # Solve (same as FULL)
         v_beta = v * beta_f32
@@ -1150,7 +1162,7 @@ def _fwd_mega_kernel_native_segids(
         # Output: Aqk is already same-segment masked.  Build the correct
         # per-segment v_new before the intra-chunk matmul so segment B does not
         # need two additional Aqk compensation matmuls.
-        Aqk_seg = Aqk * same_seg_L[None]
+        Aqk_seg = jnp.where(same_seg_L[None], Aqk, 0.0)
         if SKIP_STAGE4_MASK:
             Aqk_stage4 = Aqk_seg.astype(jnp.float32)
         else:
