@@ -346,6 +346,11 @@ suites = {
         TestFile("test/srt/test_dtype_config_llama.py", 1),
         TestFile("test/srt/test_dtype_config_consistency.py", 10),
         TestFile("python/sgl_jax/test/test_compilation_manager.py", 1),
+        TestFile(
+            "python/sgl_jax/test/kernels/test_fused_moe_token_padding.py",
+            0.1,
+            runner="pytest",
+        ),
         TestFile("python/sgl_jax/test/test_kernel_utils.py", 1),
         TestFile("python/sgl_jax/test/speculative/test_dflash_info.py", 0.2, runner="pytest"),
         TestFile(
