@@ -25,12 +25,15 @@ import os
 import re
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.qwen3_5 import Qwen3_5DenseConfig, Qwen3_5HybridConfig
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
@@ -39,6 +42,96 @@ _mesh = create_device_mesh(
     ici_parallelism=[1, 1], dcn_parallelism=[1, 1], devices=[jax.devices()[0]]
 )
 jax.sharding.set_mesh(_mesh)
+
+
+class _LinearRecorder:
+    """Minimal LinearBase stand-in that records the per-call output target."""
+
+    def __init__(self, output):
+        self.output = output
+        self.out_shardings = []
+
+    def __call__(self, *args, out_sharding=None, **kwargs):
+        del args, kwargs
+        self.out_shardings.append(out_sharding)
+        output = self.output
+        if out_sharding is not None:
+            output = jax.sharding.reshard(output, out_sharding)
+        return output, None
+
+
+class _ArrayRecorder:
+    """Array-returning stand-in for MLP, router, and expert modules."""
+
+    def __init__(self, output):
+        self.output = output
+        self.out_shardings = []
+
+    def __call__(self, *args, out_sharding=None, **kwargs):
+        del args, kwargs
+        self.out_shardings.append(out_sharding)
+        output = self.output
+        if out_sharding is not None:
+            output = jax.sharding.reshard(output, out_sharding)
+        return output
+
+
+class _PairRecorder:
+    """Pair-returning stand-in for attention modules."""
+
+    def __init__(self, output, state):
+        self.output = output
+        self.state = state
+        self.out_shardings = []
+        self.args = []
+
+    def __call__(self, *args, out_sharding=None, **kwargs):
+        del kwargs
+        self.args.append(args)
+        self.out_shardings.append(out_sharding)
+        output = self.output
+        if out_sharding is not None:
+            output = jax.sharding.reshard(output, out_sharding)
+        return output, self.state
+
+
+class _Identity:
+    def __call__(self, value, *args, **kwargs):
+        del args, kwargs
+        return value
+
+
+class _RotaryIdentity:
+    def __call__(self, positions, q, k):
+        del positions
+        return q, k
+
+
+class _TopKRecorder:
+    def __init__(self, weights, ids):
+        self.weights = weights
+        self.ids = ids
+        self.routing_shardings = []
+
+    def __call__(self, router_logits, dispatch_info=None, routing_sharding=None):
+        del router_logits, dispatch_info
+        self.routing_shardings.append(routing_sharding)
+        return self.weights, self.ids
+
+
+class _TokenMaskRecorder:
+    def __init__(self, mask):
+        self.mask = mask
+        self.out_sharding = None
+
+    def get_token_valid_mask(self, num_tokens, *, out_sharding=None):
+        if num_tokens != self.mask.shape[0]:
+            raise AssertionError(f"Expected {self.mask.shape[0]} tokens, got {num_tokens}.")
+        self.out_sharding = out_sharding
+        mask = self.mask
+        if out_sharding is not None:
+            mask = jax.sharding.reshard(mask, out_sharding)
+        return mask
 
 
 # RoPE block as the real config.json ships it (nested ``rope_parameters``, HF 5.x);
@@ -392,6 +485,227 @@ class TestQwen3_5(unittest.TestCase):
             )
             self.assertIsInstance(cap, _RoutedExpertsCapturerReal)
             self.assertEqual(cap.host_buffer.shape, (2, 1, 4))
+
+
+class TestQwen3_5SequenceParallelWiring(unittest.TestCase):
+    """Hub-free call-contract tests for Qwen3.5 sequence-parallel wiring.
+
+    The recorders deliberately stop before RadixAttention, GDN, and fused-MoE
+    kernels. These tests answer only whether the root flag selects a target and
+    whether that exact target reaches every row-parallel consumer.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mesh = _mesh
+
+    def _target(self):
+        return NamedSharding(self.mesh, P(("data", "tensor"), None))
+
+    def test_decoder_reads_root_sequence_parallel_flag_default_and_enabled(self):
+        from sgl_jax.srt.models.qwen3_5 import Qwen3_5DecoderLayer
+
+        default_cfg = _make_config(num_layers=4, is_moe=False)
+        default_layer = Qwen3_5DecoderLayer(default_cfg, self.mesh, layer_id=3)
+        self.assertFalse(default_layer.enable_sequence_parallel)
+
+        enabled_cfg = _make_config(num_layers=4, is_moe=False)
+        enabled_cfg.enable_sequence_parallel = True
+        enabled_layer = Qwen3_5DecoderLayer(enabled_cfg, self.mesh, layer_id=3)
+        self.assertTrue(enabled_layer.enable_sequence_parallel)
+
+    def test_qwen2_moe_mlp_threads_target_to_down_projection(self):
+        from sgl_jax.srt.models.qwen2_moe import Qwen2MoeMLP
+
+        tokens, hidden, intermediate = 4, 32, 64
+        mlp = Qwen2MoeMLP(hidden, intermediate, self.mesh)
+        down_proj = _LinearRecorder(jnp.zeros((tokens, hidden), dtype=jnp.bfloat16))
+        mlp.down_proj = down_proj
+        hidden_states = jnp.zeros((tokens, hidden), dtype=jnp.bfloat16)
+        target = self._target()
+
+        output = mlp(hidden_states, out_sharding=target)
+        self.assertIs(down_proj.out_shardings[-1], target)
+        self.assertEqual(output.sharding.spec, target.spec)
+
+        mlp(hidden_states)
+        self.assertIsNone(down_proj.out_shardings[-1])
+
+    def test_full_attention_threads_target_to_o_projection(self):
+        from sgl_jax.srt.models.qwen3_5 import Qwen3_5Attention
+
+        cfg = _make_config(num_layers=4, is_moe=False)
+        tc = cfg.text_config
+        tokens = 4
+        attn = Qwen3_5Attention(cfg, self.mesh, layer_id=3)
+        attn.q_proj = _LinearRecorder(
+            jnp.zeros(
+                (tokens, attn.num_heads * 2 * attn.head_dim),
+                dtype=jnp.bfloat16,
+            )
+        )
+        attn.k_proj = _LinearRecorder(
+            jnp.zeros((tokens, attn.num_kv_heads * attn.head_dim), dtype=jnp.bfloat16)
+        )
+        attn.v_proj = _LinearRecorder(
+            jnp.zeros((tokens, attn.num_kv_heads * attn.head_dim), dtype=jnp.bfloat16)
+        )
+        attn.q_norm = _Identity()
+        attn.k_norm = _Identity()
+        attn.rotary_emb = _RotaryIdentity()
+        attn.attn = _PairRecorder(
+            jnp.zeros((tokens, attn.num_heads * attn.head_dim), dtype=jnp.bfloat16),
+            "kv-state",
+        )
+        o_proj = _LinearRecorder(jnp.zeros((tokens, tc.hidden_size), dtype=jnp.bfloat16))
+        attn.o_proj = o_proj
+        target = self._target()
+
+        output, state = attn(
+            jnp.arange(tokens),
+            jnp.zeros((tokens, tc.hidden_size), dtype=jnp.bfloat16),
+            object(),
+            object(),
+            out_sharding=target,
+        )
+
+        self.assertIs(o_proj.out_shardings[-1], target)
+        self.assertEqual(output.sharding.spec, target.spec)
+        self.assertEqual(state, "kv-state")
+
+    def test_gdn_threads_target_to_out_projection(self):
+        from sgl_jax.srt.models.qwen3_5 import Qwen3_5GatedDeltaNet
+
+        cfg = _make_config(num_layers=4, is_moe=False)
+        tc = cfg.text_config
+        tokens = 4
+        gdn = Qwen3_5GatedDeltaNet(cfg, self.mesh, layer_id=0)
+        qkvz_width = 2 * gdn.key_dim + 2 * gdn.value_dim
+        gdn.in_proj_qkvz = _LinearRecorder(jnp.zeros((tokens, qkvz_width), dtype=jnp.bfloat16))
+        gdn.in_proj_ba = _LinearRecorder(
+            jnp.zeros((tokens, 2 * gdn.num_v_heads), dtype=jnp.bfloat16)
+        )
+        gdn._shard_dt = _Identity()
+        gdn._norm_gate = _Identity()
+        gdn.self_attn = _PairRecorder(
+            jnp.zeros((tokens, gdn.value_dim), dtype=jnp.bfloat16),
+            "recurrent-state",
+        )
+        out_proj = _LinearRecorder(jnp.zeros((tokens, tc.hidden_size), dtype=jnp.bfloat16))
+        gdn.out_proj = out_proj
+        target = self._target()
+
+        output, state = gdn(
+            jnp.arange(tokens),
+            jnp.zeros((tokens, tc.hidden_size), dtype=jnp.bfloat16),
+            object(),
+            object(),
+            out_sharding=target,
+        )
+
+        self.assertIs(out_proj.out_shardings[-1], target)
+        self.assertEqual(output.sharding.spec, target.spec)
+        self.assertEqual(state, "recurrent-state")
+
+    def test_moe_threads_target_to_shared_routed_and_mask_paths(self):
+        from sgl_jax.srt.models.qwen3_5 import Qwen3_5MoeBlock
+
+        cfg = _make_config(num_layers=4, is_moe=True)
+        tc = cfg.text_config
+        tokens = 4
+        hidden_states = jnp.zeros((tokens, tc.hidden_size), dtype=jnp.bfloat16)
+        block = Qwen3_5MoeBlock(cfg, self.mesh, layer_id=0)
+        shared = _ArrayRecorder(jnp.zeros_like(hidden_states))
+        shared_gate = _LinearRecorder(jnp.zeros((tokens, 1), dtype=jnp.bfloat16))
+        experts = _ArrayRecorder(jnp.zeros_like(hidden_states))
+        self.assertIs(block.topk.mesh, self.mesh)
+        block.shared_experts = shared
+        block.shared_expert_gate = shared_gate
+        block.moe_gate = _ArrayRecorder(jnp.zeros((tokens, tc.num_experts), dtype=jnp.float32))
+        raw_ids = jnp.arange(tokens * tc.num_experts_per_tok, dtype=jnp.int32).reshape(
+            tokens, tc.num_experts_per_tok
+        )
+        topk = _TopKRecorder(
+            jnp.ones((tokens, tc.num_experts_per_tok), dtype=jnp.bfloat16),
+            raw_ids,
+        )
+        block.topk = topk
+        block.experts = experts
+        forward_batch = _TokenMaskRecorder(jnp.array([True, False, True, False]))
+        target = self._target()
+
+        output, topk_ids = block(
+            hidden_states,
+            forward_batch,
+            dispatch_info=object(),
+            out_sharding=target,
+        )
+
+        self.assertIs(shared.out_shardings[-1], target)
+        self.assertIs(shared_gate.out_shardings[-1], target)
+        self.assertIs(topk.routing_shardings[-1], target)
+        self.assertIs(experts.out_shardings[-1], target)
+        self.assertEqual(output.sharding.spec, target.spec)
+        self.assertIsNotNone(forward_batch.out_sharding)
+        self.assertEqual(forward_batch.out_sharding.spec, P(("data", "tensor")))
+        self.assertTrue(
+            all(axis is None for axis in topk_ids.sharding.spec),
+            msg=f"topk_ids must remain replicated, got {topk_ids.sharding.spec}",
+        )
+        expected_ids = np.asarray(raw_ids).copy()
+        expected_ids[[1, 3], :] = -1
+        np.testing.assert_array_equal(np.asarray(topk_ids), expected_ids)
+
+    def test_decoder_threads_one_target_to_attention_mlp_and_residual(self):
+        from sgl_jax.srt.models.qwen3_5 import Qwen3_5DecoderLayer
+
+        cfg = _make_config(num_layers=4, is_moe=False)
+        cfg.enable_sequence_parallel = True
+        tc = cfg.text_config
+        tokens = 4
+        target = self._target()
+        memory_pools = SimpleNamespace(
+            token_to_kv_pool=object(),
+            recurrent_state_pool=object(),
+        )
+        cases = (
+            (3, memory_pools.token_to_kv_pool, "full-attention-state"),
+            (0, memory_pools.recurrent_state_pool, "gdn-state"),
+        )
+
+        for layer_id, expected_pool, expected_state in cases:
+            with self.subTest(layer_id=layer_id):
+                hidden_states = jnp.zeros((tokens, tc.hidden_size), dtype=jnp.bfloat16)
+                layer = Qwen3_5DecoderLayer(cfg, self.mesh, layer_id=layer_id)
+                layer.input_layernorm = _Identity()
+                layer.post_attention_layernorm = _Identity()
+                attention = _PairRecorder(jnp.zeros_like(hidden_states), expected_state)
+                mlp = _ArrayRecorder(jnp.zeros_like(hidden_states))
+                layer.self_attn = attention
+                layer.mlp = mlp
+
+                with mock.patch(
+                    "sgl_jax.srt.models.qwen3_5.make_reduce_sharding",
+                    return_value=target,
+                ) as make_target:
+                    output, residual, state, topk_ids = layer(
+                        jnp.arange(tokens),
+                        hidden_states,
+                        object(),
+                        memory_pools,
+                    )
+
+                args, kwargs = make_target.call_args
+                self.assertIs(args[0], hidden_states)
+                self.assertIs(args[1], self.mesh)
+                self.assertEqual(kwargs, {"enable_sp": True})
+                self.assertIs(attention.args[-1][3], expected_pool)
+                self.assertIs(attention.out_shardings[-1], target)
+                self.assertIs(mlp.out_shardings[-1], target)
+                self.assertEqual(output.sharding.spec, target.spec)
+                self.assertEqual(residual.sharding.spec, target.spec)
+                self.assertEqual(state, expected_state)
+                self.assertIsNone(topk_ids)
 
 
 class TestQwen3_5Dense(unittest.TestCase):
