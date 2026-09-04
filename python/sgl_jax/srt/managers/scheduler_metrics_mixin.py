@@ -5,16 +5,97 @@ import time
 from collections import defaultdict
 from typing import TYPE_CHECKING
 
-from sgl_jax.srt.managers.schedule_policy import PrefillAdder
-from sgl_jax.srt.managers.scheduler import Req, ScheduleBatch
 from sgl_jax.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
+    from sgl_jax.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sgl_jax.srt.managers.schedule_policy import PrefillAdder
     from sgl_jax.srt.managers.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
 
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
+
+# Keep these queue-latency buckets aligned with upstream SGLang's
+# sglang:queue_time_seconds histogram.
+QUEUE_TIME_BUCKETS = (
+    0.0,
+    0.001,
+    0.005,
+    0.01,
+    0.05,
+    0.1,
+    0.2,
+    0.5,
+    1,
+    2,
+    3,
+    4,
+    5,
+    10,
+    15,
+    20,
+    30,
+    40,
+    50,
+    60,
+    70,
+    80,
+    90,
+    100,
+    200,
+    300,
+    400,
+    500,
+    600,
+    700,
+    800,
+    900,
+    1000,
+    1200,
+    1400,
+    1600,
+    1800,
+    2000,
+    2500,
+    3000,
+)
+
+
+def create_queue_time_histogram():
+    # prometheus_client chooses its storage backend when it is first imported.
+    # Keep this import on the runtime initialization path, after the HTTP server
+    # has configured PROMETHEUS_MULTIPROC_DIR.
+    from prometheus_client import Histogram
+
+    return Histogram(
+        name="sglang:queue_time_seconds",
+        documentation="Histogram of queueing time in seconds.",
+        labelnames=("dp_rank",),
+        buckets=QUEUE_TIME_BUCKETS,
+    )
+
+
+def record_queue_wait_times(reqs: list[Req], metric, now: float | None = None) -> None:
+    """Record first-admission queue latency, labeled by DP rank.
+
+    Queue time starts when a request first enters the scheduler (including the
+    grammar queue) and ends when it is admitted to its first prefill batch.
+    Requests admitted again after retraction retain their original measurement.
+
+    This is the request-scheduling analogue of Linux run-queue latency: the time
+    a runnable task spends on the run queue before the scheduler gives it a CPU.
+    """
+    if now is None:
+        now = time.perf_counter()
+
+    for req in reqs:
+        if req.queue_time_start is None or req.queue_time_end is not None:
+            continue
+
+        req.queue_time_end = now
+        if req.dp_rank is not None:
+            metric.labels(dp_rank=str(req.dp_rank)).observe(max(0.0, now - req.queue_time_start))
 
 
 class SchedulerMetricsMixin:
@@ -27,6 +108,7 @@ class SchedulerMetricsMixin:
         self.cum_spec_accept_length = 0
         self.cum_spec_accept_count = 0
         self.total_retracted_reqs = 0
+        self.queue_time = create_queue_time_histogram() if self.server_args.enable_metrics else None
 
     def log_prefill_stats(
         self: Scheduler,
@@ -34,6 +116,8 @@ class SchedulerMetricsMixin:
         can_run_list: list[Req],
         running_bs: int,
     ):
+        if self.queue_time is not None:
+            record_queue_wait_times(can_run_list, self.queue_time)
         gap_latency = time.perf_counter() - self.last_prefill_stats_tic
         self.last_prefill_stats_tic = time.perf_counter()
         self.last_input_throughput = self.last_prefill_tokens / gap_latency
@@ -115,7 +199,7 @@ class SchedulerMetricsMixin:
             )
         else:
             num_used, token_usage, _, _ = self._get_token_info()
-            token_msg = f"#token: {num_used}, " f"token usage: {token_usage:.2f}, "
+            token_msg = f"#token: {num_used}, token usage: {token_usage:.2f}, "
 
         if RECORD_STEP_TIME:
             self.step_time_dict[num_running_reqs].append(
