@@ -25,6 +25,9 @@ from jax.tree_util import register_pytree_node_class
 from sgl_jax.srt.kernels.dsa.ref import streamindex_page_topk_ref, streamindex_topk_ref
 from sgl_jax.srt.kernels.dsa.sparse_mla import compute_topk_pages, sparse_mla_page_level
 from sgl_jax.srt.kernels.dsa.sparse_mla_prefill import prefill_write_and_attend_ragged
+from sgl_jax.srt.kernels.dsa.sparse_mla_prefill_qblock import (
+    prefill_write_and_attend_ragged_qblock,
+)
 from sgl_jax.srt.kernels.dsa.streamindex_topk import (
     streamindex_page_topk,
     streamindex_topk,
@@ -73,6 +76,16 @@ _INDEXER_KERNEL_KV_PAGES_PER_BLOCK = 64
 # reduce to the same per-query-token kernel contract and are validated by the
 # A1/A2 parity gates in test/srt/kernels/dsa/test_sparse_mla_prefill_parity.py.
 _PREFILL_SPARSE = int(os.environ.get("DSA_PREFILL_SPARSE", "0"))
+# Within DSA_PREFILL_SPARSE=1, the sparse extend runs through the query-BLOCK
+# kernel (``sparse_mla_prefill_qblock``) by DEFAULT — QB queries share one
+# program and each block DMAs its selected-page *union* once, instead of one
+# program (and K page DMAs) per query. Semantics are parity-gated against the
+# per-query kernel (same masked-softmax math); it wins whenever neighbouring
+# queries' selections overlap (sinks + local windows). The default sparse=0
+# path is completely unaffected. ``DSA_PREFILL_QBLOCK=0`` is an escape hatch
+# back to the per-query kernel (e.g. for pathological no-locality selections).
+_PREFILL_QBLOCK = os.environ.get("DSA_PREFILL_QBLOCK", "1") == "1"
+_PREFILL_QBLOCK_QB = int(os.environ.get("DSA_PREFILL_QBLOCK_QB", "64"))
 
 
 @register_pytree_node_class
@@ -621,23 +634,43 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         out_specs = (P(dpa, "tensor", None), P(dpa, None, None, None))
 
         def _run(ql_, qpe_, kvc_, kpe_, cache_, tp_, pos_, loc_, sl_, cuq_, cukv_, pi_):
-            o, cache_new = prefill_write_and_attend_ragged(
-                ql_,
-                qpe_,
-                kvc_,
-                kpe_,
-                cache_,
-                tp_,
-                pos_,
-                loc_,
-                sl_,
-                cuq_,
-                cukv_,
-                pi_,
-                kv_lora_rank=kv_lora_rank,
-                page_size=page_size,
-                sm_scale=sm,
-            )
+            if _PREFILL_QBLOCK:
+                o, cache_new = prefill_write_and_attend_ragged_qblock(
+                    ql_,
+                    qpe_,
+                    kvc_,
+                    kpe_,
+                    cache_,
+                    tp_,
+                    pos_,
+                    loc_,
+                    sl_,
+                    cuq_,
+                    cukv_,
+                    pi_,
+                    kv_lora_rank=kv_lora_rank,
+                    page_size=page_size,
+                    sm_scale=sm,
+                    query_block=_PREFILL_QBLOCK_QB,
+                )
+            else:
+                o, cache_new = prefill_write_and_attend_ragged(
+                    ql_,
+                    qpe_,
+                    kvc_,
+                    kpe_,
+                    cache_,
+                    tp_,
+                    pos_,
+                    loc_,
+                    sl_,
+                    cuq_,
+                    cukv_,
+                    pi_,
+                    kv_lora_rank=kv_lora_rank,
+                    page_size=page_size,
+                    sm_scale=sm,
+                )
             return o.astype(ql_.dtype), cache_new
 
         return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(
