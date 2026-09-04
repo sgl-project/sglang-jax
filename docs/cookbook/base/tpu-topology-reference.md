@@ -32,12 +32,12 @@ v6e (and every other generation) is 1:1 chip→device, so `--tp-size` matches ch
 
 | Slice name | Nodes | Chips/node | JAX devices | Used by |
 |---|---|---|---|---|
-| `v6e-4` | 1 | 4 | 4 | [Qwen-7B-Chat](/autoregressive/Qwen/Qwen), [Qwen3-8B / 32B](/autoregressive/Qwen/Qwen3), [Qwen2.5-VL](/autoregressive/Qwen/Qwen2.5-VL), [Wan 2.1](/diffusion/Wan/Wan2.1), [Wan 2.2](/diffusion/Wan/Wan2.2) |
-| `v6e-16` (`4x4`) | 4 | 4 | 16 | [MiMo-V2-Flash](/autoregressive/Xiaomi/MiMo-V2-Flash) (multi-node) |
-| `v6e-32` | 8 | 4 | 32 | [Grok-2](/autoregressive/Grok/Grok2) |
-| `v6e-64` (`4x4x4`) | 16 | 4 | 64 | [MiMo-V2.5-Pro](/autoregressive/Xiaomi/MiMo-V2.5-Pro) |
-| `v7x-8` | 1 | 4 | 8 | [Qwen2.5-VL-32B](/autoregressive/Qwen/Qwen2.5-VL), [MiMo-V2-Flash](/autoregressive/Xiaomi/MiMo-V2-Flash) (single-node) |
-| `v7x-16` (`2x2x4`) | 4 | 4 | 32 | [MiMo-V2.5-Pro](/autoregressive/Xiaomi/MiMo-V2.5-Pro) |
+| `v6e-4` | 1 | 4 | 4 | [Qwen-7B-Chat](../autoregressive/Qwen/Qwen.md), [Qwen3-8B / 32B](../autoregressive/Qwen/Qwen3.md), [Qwen2.5-VL](../autoregressive/Qwen/Qwen2.5-VL.md), [Wan 2.1](../diffusion/Wan/Wan2.1.md), [Wan 2.2](../diffusion/Wan/Wan2.2.md) |
+| `v6e-16` (`4x4`) | 4 | 4 | 16 | [MiMo-V2-Flash](../autoregressive/Xiaomi/MiMo-V2-Flash.md) (multi-node) |
+| `v6e-32` | 8 | 4 | 32 | [Grok-2](../autoregressive/Grok/Grok2.md) |
+| `v6e-64` (`4x4x4`) | 16 | 4 | 64 | [MiMo-V2.5-Pro](../autoregressive/Xiaomi/MiMo-V2.5-Pro.md) |
+| `v7x-8` | 1 | 4 | 8 | [Qwen2.5-VL-32B](../autoregressive/Qwen/Qwen2.5-VL.md), [MiMo-V2-Flash](../autoregressive/Xiaomi/MiMo-V2-Flash.md) (single-node) |
+| `v7x-16` (`2x2x4`) | 4 | 4 | 32 | [MiMo-V2.5-Pro](../autoregressive/Xiaomi/MiMo-V2.5-Pro.md) |
 
 ## Choosing `--tp-size`
 
@@ -48,7 +48,7 @@ v6e-N    →  --tp-size = N
 v7x-N    →  --tp-size = N * 2      (N is chip count)
 ```
 
-For MoE models also set `--ep-size = --tp-size` to put one expert shard per device, and split attention with `--dp-size` (attention-TP becomes `tp_size / dp_size`).
+For the standard MoE layout, also set `--ep-size = --tp-size` to put one expert shard per device, and split attention with `--dp-size` (attention-TP becomes `tp_size / dp_size`). Replicated MoE is configured independently with `--moe-dp-size = --dp-size` and currently requires `--ep-size 1`; omitting `--moe-dp-size` preserves the standard layout.
 
 ## Per-chip HBM accounting
 
@@ -139,7 +139,7 @@ Before you hit "go", verify against `python/sgl_jax/srt/configs/model_config.py`
 | 5 | Hybrid recurrent models (Ling-2.6, Kimi-Linear) require `--disable-radix-cache` | Server asserts on startup | Recipe §2.4 |
 | 6 | MLA models (DeepSeek family) require `--page-size >= 2` | MLA backend asserts on startup | Recipe §2.4 |
 
-The recipe's §2.4 Configuration Tips covers these constraints; see the [central Troubleshooting page](/deployment/troubleshooting) if launch still fails.
+The recipe's §2.4 Configuration Tips covers these constraints; see the [central Troubleshooting page](../deployment/troubleshooting.md) if launch still fails.
 
 ### Step 4 — If launch hits OOM
 
@@ -171,14 +171,14 @@ If you size a slice this section's math suggests, run the recipe end-to-end, and
 
 | Identifier | Value | Used in |
 |---|---|---|
-| GKE accelerator label (v7x) | `cloud.google.com/gke-tpu-accelerator: tpu7x` | [MiMo-V2.5-Pro GKE manifest](/autoregressive/Xiaomi/MiMo-V2.5-Pro) |
+| GKE accelerator label (v7x) | `cloud.google.com/gke-tpu-accelerator: tpu7x` | [MiMo-V2.5-Pro GKE manifest](../autoregressive/Xiaomi/MiMo-V2.5-Pro.md) |
 | GKE topology label | `cloud.google.com/gke-tpu-topology: 2x2x4` | same |
 | Docker image | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` | same |
-| SkyPilot resource (v6e) | `tpu-v6e-N` where N is 1, 4, 8, 16, 32, or 64 | [SkyPilot launcher](/deployment/skypilot), `scripts/launch_tpu.sh` |
-| SkyPilot runtime (v6e) | `runtime_version: v2-alpha-tpuv6e` | `scripts/tpu_resource.sky.yaml`, [`developer_guide/tpu_resources_guide.md`](/developer_guide/tpu_resources_guide) |
+| SkyPilot resource (v6e) | `tpu-v6e-N` where N is 1, 4, 8, 16, 32, or 64 | [SkyPilot launcher](../deployment/skypilot.md), `scripts/launch_tpu.sh` |
+| SkyPilot runtime (v6e) | `runtime_version: v2-alpha-tpuv6e` | `scripts/tpu_resource.sky.yaml`, [`developer_guide/tpu_resources_guide.md`](../developer_guide/tpu_resources_guide.md) |
 
 ## What this page intentionally does NOT cover
 
 - Pricing / region availability — see Google Cloud TPU docs.
-- Provisioning / quota workflows — see [`developer_guide/tpu_resources_guide.md`](/developer_guide/tpu_resources_guide) (SkyPilot) and per-recipe GKE manifests.
+- Provisioning / quota workflows — see [`developer_guide/tpu_resources_guide.md`](../developer_guide/tpu_resources_guide.md) (SkyPilot) and per-recipe GKE manifests.
 - Per-recipe TP/DP/EP numbers and the §4 benchmark data points — those live in each recipe's `## 2.1 Hardware Matrix`. This page covers the **scaling math** to adapt them, not the specific tested numbers.

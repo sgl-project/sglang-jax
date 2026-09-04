@@ -379,6 +379,7 @@ suites = {
             0.2,
             runner="pytest",
         ),
+        TestFile("python/sgl_jax/test/multimodal/test_encoder_scheduler_kwargs.py", 0.1),
         TestFile("python/sgl_jax/test/models/test_qwen3_5.py", 2, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/kernels/test_gdn_fused_chunk_parallel_provenance.py",
@@ -432,6 +433,7 @@ suites = {
         TestFile("test/srt/function_call/test_qwen25_detector.py", 0.1),
         TestFile("test/srt/function_call/test_mimo_detector.py", 0.1),
         TestFile("test/srt/function_call/test_glm47_detector.py", 0.1),
+        TestFile("test/srt/function_call/test_ling3_detector.py", 0.1),
         TestFile("test/srt/openai_server/basic/test_protocol.py", 0.1),
         TestFile("test/srt/openai_server/basic/test_serving_chat.py", 0.1),
         TestFile("test/srt/openai_server/basic/test_serving_completions.py", 0.1),

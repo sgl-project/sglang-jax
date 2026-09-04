@@ -259,6 +259,21 @@ def test_cache_aware_receives_pending_io_split_from_prior_same_tick_assignment()
     ]
 
 
+def test_force_cache_aware_uses_cache_dispatch_and_pending_io_tracking():
+    harness = _DpAssignmentHarness()
+    first = _req("first", input_len=10, max_new_tokens=3)
+    second = _req("second", input_len=5, max_new_tokens=7)
+
+    result = _assign(recv_reqs=[first, second], policy="force_cache_aware", harness=harness)
+
+    assert result.ready_reqs == [first, second]
+    assert result.pending_reqs == []
+    assert harness.cache_aware_calls == [
+        ("first", [0, 0], [0, 0], 10, 3, [0, 0], [0, 0]),
+        ("second", [1, 0], [13, 0], 5, 7, [10, 0], [3, 0]),
+    ]
+
+
 def test_shape_aware_receives_pending_io_split_from_prior_requests():
     # Guards the load-bearing same-tick pending-IO tracking: a request assigned
     # earlier in this intake tick (the sticky request on rank 0) must be reflected

@@ -15,7 +15,7 @@ title: "DeepSeek R1"
 - **MLA** — uses the FlashAttention Pallas MLA kernel by default; no extra flag needed.
 - **MoE with shared + routed experts** — 256 routed experts and 1 shared expert per MoE layer; first 3 layers are dense MLP. See §2.4 for the backend choice.
 - **FP8 block-quant compatibility** — the per-rank `out_dim` of the shared expert `gate_proj` / `up_proj` must be **strictly greater than** `block_size_out=128`. This forces the v6e-64 mesh shape and is why `--dp-size 8` (effective tensor axis 8) is recommended over `--dp-size 4` (tensor axis 16, which collides with the block size — see §2.4).
-- Reasoning surface needs `--reasoning-parser deepseek-r1` at launch — see [§3.2](/autoregressive/DeepSeek/DeepSeek-R1#3-2-reasoning-thinking-enabled-streaming) for the streaming pattern.
+- Reasoning surface needs `--reasoning-parser deepseek-r1` at launch — see [§3.2](../../autoregressive/DeepSeek/DeepSeek-R1.md#reasoning-streaming) for the streaming pattern.
 
 **Recommended Generation Parameters**: `temperature=0.6`, `top_p=0.95`, `max_tokens=4096+` (give room for thinking).
 
@@ -30,11 +30,11 @@ title: "DeepSeek R1"
 | **v7x-16** | 2x2x4 | 4 | 16 chips / 32 devices | 32 | 4 | 8 | 32 | Launch and benchmark template in §4.2. v7x exposes 2 JAX devices/chip; keep tensor axis 8 for the FP8 block-quant and MLA layout. |
 | **v6e-64** | 8x8 | 16 | 64 | 64 | 8 | 8 | 64 | This is the slice we measured on. `dp=8` required for FP8 shared-expert block-quant compatibility (`2048/8=256 > 128 = block_size`); `dp=4` silently collapses. Dense MLP block-quant scale grid `(144, 56)` further requires `144 % tensor == 0`, so tensor=8 is the only working option. HBM is tight at `dp=8`; see §2.4 Memory Management. |
 
-See [TPU topology reference](/base/tpu-topology-reference) for the TPU generation reference. For other slices (larger v6e, v7x variants, scaled-down configs), see [Adapting to other topologies](/base/tpu-topology-reference#adapting-to-other-topologies).
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants, scaled-down configs), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
 
 ### 2.2 Environment
 
-Install per [Install guide](/get_started/install). Multi-host required — use [GKE Indexed Job launcher](/deployment/gke-indexed-job) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](/deployment/skypilot).
+Install per [Install guide](../../get_started/install.md). Multi-host required — use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](../../deployment/skypilot.md).
 
 For evaluation, additionally install `evalscope` in the client environment:
 
@@ -42,11 +42,13 @@ For evaluation, additionally install `evalscope` in the client environment:
 pip install evalscope==0.17.1
 ```
 
+<a id="deployment-launch"></a>
+
 ### 2.3 Launch
 
 #### Multi-host — TPU v6e-64
 
-Use [GKE Indexed Job launcher](/deployment/gke-indexed-job) with `<JOB>=deepseek-r1`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=8x8`, `parallelism: 16`, `completions: 16`, and `backoffLimit: 16` (transient GKE control-plane blips happen; a non-zero backoff lets the job survive). Put these model-specific flags into `<LAUNCH_FLAGS>`:
+Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=deepseek-r1`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=8x8`, `parallelism: 16`, `completions: 16`, and `backoffLimit: 16` (transient GKE control-plane blips happen; a non-zero backoff lets the job survive). Put these model-specific flags into `<LAUNCH_FLAGS>`:
 
 ```bash
   --model-path deepseek-ai/DeepSeek-R1 \
@@ -65,12 +67,12 @@ Use [GKE Indexed Job launcher](/deployment/gke-indexed-job) with `<JOB>=deepseek
 
 Mount a shared `JAX_COMPILATION_CACHE_DIR` on the same PVC as the model weights — first-time compile is ~4 minutes total (EXTEND ~70 s + DECODE ~3 min); subsequent restarts with the same mesh shape skip almost all of that.
 
-For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](/deployment/skypilot) with the same launch flags.
+For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../deployment/skypilot.md) with the same launch flags.
 
 ### 2.4 Configuration Tips
 
 **Reasoning Parser:**
-- `--reasoning-parser deepseek-r1` is **required** for R1 — without it, the model's `<think>` content stays inline in `content` instead of being split into `reasoning_content`. See [§3.2](/autoregressive/DeepSeek/DeepSeek-R1#3-2-reasoning-thinking-enabled-streaming) for the streaming pattern.
+- `--reasoning-parser deepseek-r1` is **required** for R1 — without it, the model's `<think>` content stays inline in `content` instead of being split into `reasoning_content`. See [§3.2](../../autoregressive/DeepSeek/DeepSeek-R1.md#reasoning-streaming) for the streaming pattern.
 
 **Tensor/Data Mesh Layout:**
 - Mesh shape is `Mesh(data=dp_size, tensor=tp_size/dp_size)`. On v6e-64 with `--tp-size 64 --dp-size 8`, the tensor axis is **8**.
@@ -98,13 +100,13 @@ For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](/dep
 - `JAX_COMPILATION_CACHE_DIR` is mandatory — without it, first request blocks ~4 min per node and is repeated on every restart.
 - Mount a shared PVC at the cache directory to amortize compilation across all 16 nodes and across pod restarts. Mesh shape (`data × tensor`) is part of the cache key; changing `--dp-size` invalidates the cache.
 
-For full flag definitions see [Launch flags reference](/base/launch-flags-reference).
+For full flag definitions see [Launch flags reference](../../base/launch-flags-reference.md).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-For full cURL + native `/generate` patterns see [Basic API usage](/base/basic-api-usage). For thinking + content streaming see §3.2.
+For full cURL + native `/generate` patterns see [Basic API usage](../../base/basic-api-usage.md). For thinking + content streaming see §3.2.
 
 Short Python OpenAI client example (replace `<rank0-ip>` with your rank-0 internal IP; give `max_tokens` room for the thinking trace):
 
@@ -122,6 +124,8 @@ resp = client.chat.completions.create(
 )
 print(resp.choices[0].message.content)
 ```
+
+<a id="reasoning-streaming"></a>
 
 ### 3.2 Reasoning (thinking-enabled streaming)
 
@@ -172,7 +176,7 @@ Let me verify: 10% of 240 is 24, 5% is 12, so 15% = 24 + 12 = 36. ✓
 
 For non-streaming requests, the field appears on `response.choices[0].message.reasoning_content` and `response.choices[0].message.content`.
 
-> R1 does not ship with a native tool-call format. For tool-call workloads, see the **Parser key reference** in [Parser key reference](/autoregressive#parser-key-reference) for the list of cookbook recipes with tool-call parsers registered.
+> R1 does not ship with a native tool-call format. For tool-call workloads, see the **Parser key reference** in [Parser key reference](../../autoregressive/index.md#parser-key-reference) for the list of cookbook recipes with tool-call parsers registered.
 
 ## 4. Benchmark
 
@@ -192,7 +196,7 @@ For non-streaming requests, the field appears on `response.choices[0].message.re
 | Reasoning Parser | deepseek-r1 |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3](/autoregressive/DeepSeek/DeepSeek-R1#2-3-launch).
+**Deployment Command** — same as [§2.3](../../autoregressive/DeepSeek/DeepSeek-R1.md#deployment-launch).
 
 **Benchmark Command**
 
@@ -275,5 +279,5 @@ PYTHONPATH=/tmp/sglang-jax/python python -m sgl_jax.bench_serving \
 ## Additional Resources
 
 - [DeepSeek-R1 model card](https://huggingface.co/deepseek-ai/DeepSeek-R1)
-- [Launch flags reference](/base/launch-flags-reference)
-- [Cross-recipe troubleshooting](/deployment/troubleshooting) — cross-recipe generic issues.
+- [Launch flags reference](../../base/launch-flags-reference.md)
+- [Cross-recipe troubleshooting](../../deployment/troubleshooting.md) — cross-recipe generic issues.

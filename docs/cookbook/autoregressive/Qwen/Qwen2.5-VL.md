@@ -17,7 +17,7 @@ title: "Qwen2.5-VL"
 - [**Qwen/Qwen2.5-VL-32B-Instruct**](https://huggingface.co/Qwen/Qwen2.5-VL-32B-Instruct) — 32B; validated on v7x-8 with `--tp-size 8 --dp-size 4`.
 - [**Qwen/Qwen2.5-VL-72B-Instruct**](https://huggingface.co/Qwen/Qwen2.5-VL-72B-Instruct) — 72B; multi-host serving is pending.
 
-For the text-only Qwen3 dense recipes see [Qwen3 recipe](/autoregressive/Qwen/Qwen3).
+For the text-only Qwen3 dense recipes see [Qwen3 recipe](./Qwen3.md).
 
 **Key Features**:
 
@@ -40,17 +40,19 @@ For the text-only Qwen3 dense recipes see [Qwen3 recipe](/autoregressive/Qwen/Qw
 
 The validated benchmark uses data-parallel vision-encoder placement. TP vision-encoder placement was separately verified on the same topology.
 
-See [TPU topology reference](/base/tpu-topology-reference) for the TPU generation reference. For other slices, see [Adapting to other topologies](/base/tpu-topology-reference#adapting-to-other-topologies).
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices, see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
 
 ### 2.2 Environment
 
-Install per [Install guide](/get_started/install). For the current single-host VL path use [Single-host Docker template](/deployment/single-host-docker).
+Install per [Install guide](../../get_started/install.md). For the current single-host VL path use [Single-host Docker template](../../deployment/single-host-docker.md).
 
 Extra pip for accuracy benchmarking only:
 
 ```bash
 pip install 'evalscope[app,perf]==1.5.1'
 ```
+
+<a id="deployment-launch"></a>
 
 ### 2.3 Launch
 
@@ -102,7 +104,7 @@ The regular server recognizes the model's multimodal contract. The separate `--m
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` avoids recompiling the vision and autoregressive kernels after restart.
 - The cache keys on full kernel shape: changing `--page-size`, `--tp-size`, image resolution buckets, or `--context-length` invalidates cached entries.
 
-For full flag definitions see [Launch flags reference](/base/launch-flags-reference); run `python -m sgl_jax.launch_server --help` to see the available flags.
+For full flag definitions see [Launch flags reference](../../base/launch-flags-reference.md); run `python -m sgl_jax.launch_server --help` to see the available flags.
 
 ## 3. Invocation
 
@@ -230,7 +232,7 @@ print(response.choices[0].message.content)
 
 > **Long video / large image set:** Make sure `--context-length` is large enough to fit the vision token count plus the text prompt and response. Each high-resolution image and each sampled video frame contributes a non-trivial number of vision tokens to the prefill.
 
-> Qwen2.5-VL is non-reasoning (no `<think>` blocks) and does not ship a native tool-call format. For reasoning workloads use [Qwen3](/autoregressive/Qwen/Qwen3); for tool-calling workloads use a model with `--tool-call-parser` support (see [`Qwen3.md` §3.3](/autoregressive/Qwen/Qwen3#3-3-tool-calling)).
+> Qwen2.5-VL is non-reasoning (no `<think>` blocks) and does not ship a native tool-call format. For reasoning workloads use [Qwen3](./Qwen3.md); for tool-calling workloads use a model with `--tool-call-parser` support (see [`Qwen3.md` §3.3](./Qwen3.md#tool-calling)).
 
 ## 4. Benchmark
 
@@ -251,7 +253,7 @@ The data below is a snapshot of Qwen2.5-VL-32B-Instruct on a single TPU v7x-8. A
 | Generation | `max_tokens=8192`, temperature 0, seed 42 |
 | Evaluation batch size | 24 |
 
-**Deployment Command** — use the [§2.3 v7x-8 launch command](/autoregressive/Qwen/Qwen2.5-VL#2-3-launch).
+**Deployment Command** — use the [§2.3 v7x-8 launch command](./Qwen2.5-VL.md#deployment-launch).
 
 **Benchmark Command**
 
@@ -373,6 +375,6 @@ This is a saturated burst workload, so TTFT includes scheduler queueing in addit
 ## Additional Resources
 
 - [Qwen2.5-VL model collection](https://huggingface.co/Qwen)
-- [Qwen3 recipe](/autoregressive/Qwen/Qwen3) — text-only Qwen3 dense recipe (Qwen3 series is the reasoning generation).
-- [Launch flags reference](/base/launch-flags-reference)
-- [Cross-recipe troubleshooting](/deployment/troubleshooting) — cross-recipe generic issues.
+- [Qwen3 recipe](./Qwen3.md) — text-only Qwen3 dense recipe (Qwen3 series is the reasoning generation).
+- [Launch flags reference](../../base/launch-flags-reference.md)
+- [Cross-recipe troubleshooting](../../deployment/troubleshooting.md) — cross-recipe generic issues.

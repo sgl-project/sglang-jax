@@ -23,7 +23,7 @@ def _scaled_randn(rng: np.random.Generator, shape, scale: float = 0.1) -> np.nda
     # scale=0.1 is a test-only hack: it shrinks the recurrent state so bf16 noise
     # in the delta-rule update fits the global atol=1e-2 (shared with flashattn).
     # Kernel correctness is validated end-to-end (MMLU-pro on tp4dp4, PR #1047);
-    # only inputs that grow the state need it (q/k/v/a/b + initial state).
+    # only inputs that grow the state need it (q/k/v/a + initial state).
     return rng.standard_normal(shape).astype(np.float32) * scale
 
 
@@ -315,7 +315,9 @@ def create_test_data(
             k_i = _scaled_randn(rank_rng, (q_len, hidden))
             v_i = _scaled_randn(rank_rng, (q_len, hidden))
             a_i = _scaled_randn(rank_rng, (q_len, hidden))
-            b_i = _scaled_randn(rank_rng, (q_len, num_heads))
+            # Production Kimi-Linear computes beta as sigmoid(b_proj(...).float()).
+            b_logits = _scaled_randn(rank_rng, (q_len, num_heads), scale=1.0)
+            b_i = 1.0 / (1.0 + np.exp(-b_logits))
 
             req_has_initial_state = (
                 has_initial_state_per_rank is not None
@@ -447,7 +449,7 @@ def create_test_data(
     k_dev = jax.device_put(jnp.asarray(k_global, dtype=dtype), hidden_sharding)
     v_dev = jax.device_put(jnp.asarray(v_global, dtype=dtype), hidden_sharding)
     a_dev = jax.device_put(jnp.asarray(a_global, dtype=dtype), hidden_sharding)
-    b_dev = jax.device_put(jnp.asarray(b_global, dtype=dtype), head_sharding)
+    b_dev = jax.device_put(jnp.asarray(b_global, dtype=jnp.float32), head_sharding)
 
     return (
         fb,

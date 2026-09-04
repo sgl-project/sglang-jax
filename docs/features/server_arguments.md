@@ -104,7 +104,8 @@ For reusable Docker, GKE, and SkyPilot launchers, see [Deployment](../deployment
 |---|---|
 | `--tensor-parallel-size`, `--tp-size` | Total tensor-parallel JAX devices. |
 | `--data-parallel-size`, `--dp-size` | Data parallelism factor for supported execution paths. |
-| `--dp-schedule-policy` | DP rank assignment policy. If unset, radix-cache serving uses `cache_aware`; `--disable-radix-cache` and Pathways PD use `min_running_queue`. Explicit choices are `cache_aware`, `shape_aware`, `min_running_queue`, and `round_robin`; use non-default choices as workload-specific tuning overrides. |
+| `--moe-data-parallel-size`, `--moe-dp-size` | MoE data parallelism factor. Defaults to `1`; replicated MoE currently requires it to equal `--dp-size`. |
+| `--dp-schedule-policy` | DP rank assignment policy. If unset, radix-cache serving uses `cache_aware`; `--disable-radix-cache` and Pathways PD use `min_running_queue`. Explicit choices are `cache_aware`, `force_cache_aware`, `shape_aware`, `min_running_queue`, and `round_robin`. `force_cache_aware` is an opt-in override for multi-turn agentic workloads that prioritizes conversation-prefix reuse over even load distribution. |
 | `--ep-size` | Expert parallelism size for MoE models. |
 | `--ep-num-redundant-experts` | Add redundant physical experts for EP load balancing. |
 | `--ep-dispatch-algorithm` | Expert dispatch algorithm: `static`, `dynamic`, or `fake`. |

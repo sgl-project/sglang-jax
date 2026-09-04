@@ -26,17 +26,19 @@ title: "GLM-4.5"
 | GLM-4.5-Air (106B) | **v7x-4** | 2x2x1 | 1 | 4 chips / 8 devices | 8 | 8 | Recommended throughput recipe in §4.2. v7x exposes 2 JAX devices/chip. |
 | GLM-4.5-Air (106B) | **v6e-32** | 4x8 | 8  | 32 | 32 | 32 | This is the slice we measured on. BF16 ~210 GB. |
 
-See [TPU topology reference](/base/tpu-topology-reference) for the TPU generation reference. For other slices (larger v6e, v7x variants, scaled-down configs), see [Adapting to other topologies](/base/tpu-topology-reference#adapting-to-other-topologies).
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants, scaled-down configs), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
 
 ### 2.2 Environment
 
-Install per [Install guide](/get_started/install). Multi-host required — use [GKE Indexed Job launcher](/deployment/gke-indexed-job) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](/deployment/skypilot).
+Install per [Install guide](../../get_started/install.md). Multi-host required — use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](../../deployment/skypilot.md).
+
+<a id="deployment-launch"></a>
 
 ### 2.3 Launch
 
 #### Multi-host — TPU v6e-32
 
-Use [GKE Indexed Job launcher](/deployment/gke-indexed-job) with `<JOB>=glm-4-5-air`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x8`, `parallelism: 8`, and `completions: 8`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
+Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=glm-4-5-air`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x8`, `parallelism: 8`, and `completions: 8`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
 
 ```bash
   --model-path zai-org/GLM-4.5-Air \
@@ -54,7 +56,7 @@ Use [GKE Indexed Job launcher](/deployment/gke-indexed-job) with `<JOB>=glm-4-5-
 
 > `--moe-backend epmoe` is mandatory for GLM-4.5-Air. The fused Pallas backend requires `moe_intermediate_size % 512 == 0`; GLM-4.5-Air's `moe_intermediate_size=1408` fails that alignment and crashes at startup (`tile_n` divisibility assert).
 
-For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](/deployment/skypilot) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
+For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../deployment/skypilot.md) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
 
 ### 2.4 Configuration Tips
 
@@ -77,13 +79,13 @@ For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](/dep
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per node.
 - Mount a shared PVC across the cluster's nodes to amortize compilation.
 
-For full flag definitions see [Launch flags reference](/base/launch-flags-reference).
+For full flag definitions see [Launch flags reference](../../base/launch-flags-reference.md).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-For full cURL + native `/generate` patterns see [Basic API usage](/base/basic-api-usage).
+For full cURL + native `/generate` patterns see [Basic API usage](../../base/basic-api-usage.md).
 
 Short Python OpenAI client example (replace `<rank0-ip>` with your rank-0 internal IP):
 
@@ -238,7 +240,7 @@ To see the full set of `--reasoning-parser` / `--tool-call-parser` keys availabl
 | Expert Parallelism | 32 |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3](/autoregressive/GLM/GLM-4.5#2-3-launch).
+**Deployment Command** — same as [§2.3](../../autoregressive/GLM/GLM-4.5.md#deployment-launch).
 
 **Benchmark Command** — example for GSM8K:
 
@@ -321,5 +323,5 @@ PYTHONPATH=/tmp/sglang-jax/python python -m sgl_jax.bench_serving \
 ## Additional Resources
 
 - [GLM-4.5-Air model card](https://huggingface.co/zai-org/GLM-4.5-Air)
-- [Launch flags reference](/base/launch-flags-reference)
-- [Cross-recipe troubleshooting](/deployment/troubleshooting) — cross-recipe generic issues.
+- [Launch flags reference](../../base/launch-flags-reference.md)
+- [Cross-recipe troubleshooting](../../deployment/troubleshooting.md) — cross-recipe generic issues.

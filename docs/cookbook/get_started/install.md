@@ -18,6 +18,6 @@ Use the extra that matches your hardware:
 - `python[gpu]` for GPU experiments.
 - `python[cpu]` for CPU-only debugging.
 
-After installation, return to the model recipe and use its §2.3 launch command. For reusable launcher patterns, see [Deployment references](/deployment).
+After installation, return to the model recipe and use its §2.3 launch command. For reusable launcher patterns, see [Deployment references](../deployment/index.md).
 
 The full canonical installation guide lives in the main Sphinx docs at `docs/get_started/install.md`.

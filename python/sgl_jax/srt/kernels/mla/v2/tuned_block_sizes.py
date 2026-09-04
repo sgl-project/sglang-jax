@@ -36,6 +36,8 @@ import logging
 import jax.numpy as jnp
 
 from sgl_jax.srt.kernels.ragged_paged_attention.util import (
+    align_to,
+    get_dtype_packing,
     get_tpu_version,
     next_power_of_2,
 )
@@ -76,6 +78,34 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 256): (8, 256),
         ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 512): (8, 256),
         ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 1024): (8, 256),
+        # ===== GLM-5.2 (kv_lora_rank=512, qk_rope_head_dim=64) =====
+        # Deploy: --tp-size 64 --dp-size 8 --page-size 128
+        # → attention_tp = 8 → per-shard num_q_heads = 64/8 = 8.
+        # Transitional values (#1546): borrowed row-for-row from the DSv3
+        # 16-head family above; validated on a v6e-64 slice with a paired
+        # eval + throughput sweep up to concurrency 460 (zero Mosaic
+        # errors). A tuner sweep should replace these.
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 1): (16, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 8): (16, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 16): (32, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 32): (32, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 64): (32, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 128): (32, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 256): (32, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 512): (32, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 128, 1024): (32, 1, 2),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 1): (16, 64),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 8): (16, 64),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 16): (16, 64),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 32): (16, 64),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 64): (16, 64),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 128): (16, 128),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 256): (8, 256),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 512): (8, 256),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 1024): (8, 256),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 2048): (8, 256),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 4096): (8, 256),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 128, 8192): (8, 256),
     },
     "TPU v7": {
         # ===== Ling-2.6-1T (kv_lora_rank=512, qk_rope_head_dim=64) =====
@@ -139,6 +169,26 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 512): (8, 128),
         ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 1024): (8, 128),
         ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 2048): (8, 128),
+        # ===== GLM-5.2 (tp16: 4 q-heads/shard, kv_lora=512, page=128) =====
+        # decode from the DSv3 page-128 family; mixed uses 16-row blocks (bf16
+        # tiling needs 16-row alignment at 4 heads/shard; 8-row blocks and the
+        # hardcoded fallback both fail Mosaic window setup at mnt>=256).
+        # Full mnt bucket coverage pending a tuner sweep.
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 1): (16, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 8): (16, 1, 2),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 1): (16, 64),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 2): (16, 64),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 4): (16, 64),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 8): (16, 64),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 16): (16, 64),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 32): (16, 64),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 64): (16, 64),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 128): (16, 64),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 256): (16, 128),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 512): (16, 128),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 1024): (16, 128),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 2048): (16, 128),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 4096): (16, 128),
         # ===== GLM-5.1 (TP=32) configurations on TPU v7 =====
         # Decode & Mixed tuned for q_head_num=2 (TP=32 sharding)
         ("decode", "bfloat16", "bfloat16", 2, 512, 64, 64, 1): (16, 1, 4),
@@ -257,3 +307,45 @@ def get_tuned_block_sizes_mla(
             device_name,
         )
     return hit
+
+
+def get_fallback_block_sizes_mla(
+    case_label: str,
+    q_dtype,
+    actual_num_q_heads: int,
+    page_size: int,
+) -> tuple:
+    """Tiling-legal hardcoded fallback for tuned-table misses (#1546).
+
+    The historical mixed fallback ``(1, 16)`` implicitly assumed the packed
+    q/o layout fills whole sublane tiles: each token occupies
+    ``align(num_q_heads, q_packing)`` rows, and the bf16 tile is
+    ``8 * q_packing = 16`` rows. With >= 16 q-heads/shard every token fills
+    the tile and any block shape is legal; with fewer heads (e.g. GLM-5.2
+    tp16 -> 4 heads/shard) token boundaries land inside the tile and Mosaic
+    rejects the window at larger mnt buckets
+    (E2002 CompileTimeMosaicMisalignedBlockAndTiling).
+
+    For the sub-tile case we return a block from the validated family: a
+    q-block covering whole tile groups (``bq * heads_padded`` a multiple of
+    ``sublane_tile**2``) and a 2048-token KV block. A table miss should cost
+    performance, never a crash.
+
+    Returns ``(num_kv_pages_per_block, num_queries_per_block)`` for both
+    cases; the decode fallback keeps the historical ``(3, 1)`` (decode runs
+    with ``bq_sz = 1``, no observed illegal geometry).
+    """
+    if case_label == "decode":
+        return (3, 1)
+    if case_label != "mixed":
+        raise ValueError(f"case_label must be 'decode' or 'mixed', got {case_label!r}")
+    q_packing = get_dtype_packing(jnp.dtype(q_dtype))
+    sublane_tile = 8 * q_packing
+    heads_padded = align_to(actual_num_q_heads, q_packing)
+    if heads_padded % sublane_tile == 0:
+        # every token fills whole sublane tiles: the historical fallback is
+        # legal and keeps prod behaviour unchanged for >=16-head shards.
+        return (1, 16)
+    num_queries_per_block = max(sublane_tile, (sublane_tile * sublane_tile) // heads_padded)
+    num_kv_pages_per_block = max(1, 2048 // page_size)
+    return (num_kv_pages_per_block, num_queries_per_block)

@@ -27,11 +27,13 @@ title: "DeepSeek V2"
 |---|---|---|---|---|---|---|---|
 | DeepSeek-V2-Lite | **v6e-4**  | 2x2 | 1 | 4  | 4  | 4  | This is the slice we measured on. BF16 ~32 GB — single host. |
 
-See [TPU topology reference](/base/tpu-topology-reference) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](/base/tpu-topology-reference#adapting-to-other-topologies).
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
 
 ### 2.2 Environment
 
-Install per [Install guide](/get_started/install). For V2-Lite single-host use [Single-host Docker template](/deployment/single-host-docker).
+Install per [Install guide](../../get_started/install.md). For V2-Lite single-host use [Single-host Docker template](../../deployment/single-host-docker.md).
+
+<a id="deployment-launch"></a>
 
 ### 2.3 Launch
 
@@ -71,13 +73,13 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
 **Compilation Cache Hygiene:**
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per node.
 
-For full flag definitions see [Launch flags reference](/base/launch-flags-reference).
+For full flag definitions see [Launch flags reference](../../base/launch-flags-reference.md).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-For full cURL + native `/generate` patterns see [Basic API usage](/base/basic-api-usage).
+For full cURL + native `/generate` patterns see [Basic API usage](../../base/basic-api-usage.md).
 
 Short Python OpenAI client example (replace `<rank0-ip>` with your rank-0 internal IP):
 
@@ -112,7 +114,7 @@ print(resp.choices[0].message.content)
 
 > **Use the `-Chat` checkpoint for accuracy eval.** The base `DeepSeek-V2-Lite` ships without a chat template; evalscope's few-shot GSM8K prompt loops indefinitely against `/v1/chat/completions` (observed 0.014 score, `finish_reason: length`). The instruct-tuned `DeepSeek-V2-Lite-Chat` has the chat template and parses `\nThe answer is X` reliably.
 
-**Deployment Command** — same as [§2.3](/autoregressive/DeepSeek/DeepSeek-V2#2-3-launch) but swap `--model-path` to `deepseek-ai/DeepSeek-V2-Lite-Chat`.
+**Deployment Command** — same as [§2.3](../../autoregressive/DeepSeek/DeepSeek-V2.md#deployment-launch) but swap `--model-path` to `deepseek-ai/DeepSeek-V2-Lite-Chat`.
 
 **Benchmark Command** — example for GSM8K:
 
@@ -162,5 +164,5 @@ Mean TPOT (ms):                          7.41
 ## Additional Resources
 
 - [DeepSeek-V2-Lite model card](https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite)
-- [Launch flags reference](/base/launch-flags-reference)
-- [Cross-recipe troubleshooting](/deployment/troubleshooting) — cross-recipe generic issues.
+- [Launch flags reference](../../base/launch-flags-reference.md)
+- [Cross-recipe troubleshooting](../../deployment/troubleshooting.md) — cross-recipe generic issues.
