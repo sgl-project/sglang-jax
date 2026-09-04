@@ -160,6 +160,35 @@ def test_bounded_boundary_preserves_nonzero_initial_state():
     np.testing.assert_allclose(actual, reference, rtol=2e-2, atol=2e-4)
 
 
+def test_bounded_boundary_with_strong_decay_matches_naive():
+    """A packed boundary must not make factored gate exponentials overflow."""
+    arrays = _case(16, (63, 65), seed=1558)
+    arrays["g"] = jnp.zeros_like(arrays["g"])
+    arrays["a_log"] = jnp.zeros_like(arrays["a_log"])
+    arrays["dt_bias"] = jnp.full_like(arrays["dt_bias"], np.log(1.5))
+
+    reference_output, reference_state = _reference(arrays)
+    mega_output, mega_state = _mega(arrays)
+    jax.block_until_ready((reference_output, reference_state, mega_output, mega_state))
+
+    actual_output = np.asarray(mega_output, dtype=np.float32)
+    actual_state = np.asarray(mega_state, dtype=np.float32)
+    assert np.isfinite(actual_output).all()
+    assert np.isfinite(actual_state).all()
+    np.testing.assert_allclose(
+        actual_output,
+        np.asarray(reference_output, dtype=np.float32),
+        rtol=5e-2,
+        atol=5e-2,
+    )
+    np.testing.assert_allclose(
+        actual_state,
+        np.asarray(reference_state, dtype=np.float32),
+        rtol=5e-2,
+        atol=5e-2,
+    )
+
+
 @pytest.mark.parametrize(
     ("heads", "lengths"),
     [
