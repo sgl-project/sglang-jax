@@ -3,7 +3,7 @@
 Ships the FULL (full-attention) and recurrent (KDA / GDN) components. The seam
 surface is wider than those two exercise: CacheTransferPhase / LRURefreshPhase /
 next_component_uuid / eviction_priority / recover_after_unevict / value_len /
-the ComponentType.is_* helpers and the unused ``params`` ctor arg exist so SWA /
+the ComponentType.is_* helpers and the ``params`` ctor arg exist so SWA /
 HiCache components can land against a stable contract without re-touching this
 module.
 """
@@ -23,6 +23,7 @@ from sgl_jax.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     IncLockRefResult,
     InsertParams,
+    InsertResult,
     MatchPrefixParams,
     MatchResult,
 )
@@ -70,22 +71,9 @@ _COMPONENT_UUID_COUNTER = 1
 class ComponentData:
     value: np.ndarray | None = None
     lock_ref: int = 0
+    metadata: dict[str, Any] = dataclasses.field(default_factory=dict)
     host_value: np.ndarray | None = None
     host_lock_ref: int = 0
-
-
-@dataclasses.dataclass
-class InsertResult:
-    """Result of an insert operation.
-
-    Lean local version (upstream keeps this in base_prefix_cache);
-    used only in component seam annotations."""
-
-    prefix_len: int = 0
-    # recurrent_committed: the tree took ownership of the request's slot;
-    # cleanup_after_caching_req keys donate-vs-free on it.
-    recurrent_exist: bool = False
-    recurrent_committed: bool = False
 
 
 class EvictLayer(IntFlag):
@@ -144,6 +132,15 @@ class TreeComponent(ABC):
         value = node.component_data[self.component_type].value
         return len(value) if value is not None else 0
 
+    def refresh_lru(
+        self,
+        phase: LRURefreshPhase,
+        node: UnifiedTreeNode,
+        root_node: UnifiedTreeNode,
+    ) -> None:
+        """Refresh this component's LRU state for one tree phase."""
+        return None
+
     @abstractmethod
     def create_match_validator(
         self, match_device_only: bool = False
@@ -185,10 +182,8 @@ class TreeComponent(ABC):
         Returns the index within value_slice from which this component
         consumed (took ownership of) the underlying KV pool slots.
         Returns prefix_len if nothing was consumed (default).
-        The core currently discards the return value (request-caching
-        callers free the duplicate overlap instead); a future aux component
-        that consumes here would have _insert_helper use it to free only the
-        non-consumed duplicate portion: value_slice[dup_start:consumed_from]."""
+        The core frees only the non-consumed duplicate portion:
+        value_slice[dup_start:consumed_from]."""
         return prefix_len
 
     def should_skip_leaf_creation(
@@ -355,7 +350,7 @@ class TreeComponent(ABC):
         Return None for no truncation opinion (use full length);
         return int >= 0 for effective cache length.
         - Full: no-op, returns None.
-        - SWA: sets insert_params.swa_evicted_seqlen on finished; returns None.
+        - SWA: propagates req.swa_evicted_seqlen for every insert; returns None.
         - Recurrent: prepares recurrent_value (finished from ping-pong buffer,
           unfinished fork from req); returns recurrent_last_track_seqlen."""
         return None

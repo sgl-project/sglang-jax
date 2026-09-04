@@ -37,6 +37,7 @@ from sgl_jax.srt.mem_cache.allocator import (
 )
 from sgl_jax.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    DecLockRefParams,
     EvictParams,
     MatchPrefixParams,
 )
@@ -50,6 +51,7 @@ from sgl_jax.srt.mem_cache.common import (
 from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sgl_jax.srt.mem_cache.radix_cache import RadixKey, build_radix_key
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
+from sgl_jax.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.multimodal.common.modality_enum import MultimodalInputs
 from sgl_jax.srt.multimodal.in_model.host_orchestration import build_multimodal_batch
@@ -297,6 +299,9 @@ class Req:
         self.last_host_node: Any = None
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: int | None = None
+        # Exact acquire receipt.  The UUID is only the legacy compatibility
+        # mirror; component releases also need their skip-node set.
+        self.cache_lock_params: DecLockRefParams | None = None
         # SWA eviction: sequence positions [0, swa_evicted_seqlen) have had
         # their SWA pool slots freed (no longer in the sliding window).
         self.swa_evicted_seqlen: int = 0
@@ -665,6 +670,7 @@ class Req:
         self.prefix_indices = []
         self.last_node = None
         self.swa_uuid_for_lock = None
+        self.cache_lock_params = None
         self.extend_input_len = 0
         self.is_retracted = True
         self.input_token_logprobs = None
@@ -947,8 +953,10 @@ class ScheduleBatch:
         is_hybrid = False
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
             assert tree_cache is None or isinstance(
-                tree_cache, (SWARadixCache, ChunkCache)
-            ), "SWARadixCache or ChunkCache is required for SWATokenToKVPoolAllocator"
+                tree_cache, (SWARadixCache, ChunkCache, UnifiedRadixCache)
+            ), "An SWA cache is required for SWATokenToKVPoolAllocator"
+            if isinstance(tree_cache, UnifiedRadixCache) and not tree_cache.supports_swa():
+                raise ValueError("UnifiedRadixCache requires its SWA component")
             is_hybrid = True
 
         is_hybrid_recurrent = isinstance(req_to_token_pool, HybridReqToTokenPool)
@@ -1595,6 +1603,14 @@ class ScheduleBatch:
                 if not info.reqs:
                     continue
                 for req in info.reqs:
+                    if isinstance(self.tree_cache, UnifiedRadixCache):
+                        safe_offset = 1 if self.enable_overlap else 0
+                        if (
+                            req.decode_batch_idx >= safe_offset
+                            and (req.decode_batch_idx - safe_offset) % evict_interval == 0
+                        ):
+                            self.tree_cache.evict_req_swa(req, req.seqlen - 1, dp_rank=dp_rank)
+                        continue
                     if isinstance(self.tree_cache, ChunkCache):
                         # ChunkCache/SWAChunkCache: no tree-node overlap concern,
                         # evict on every decode step to prevent SWA exhaustion.
@@ -1615,6 +1631,21 @@ class ScheduleBatch:
             return
 
         if self.forward_mode is None or not self.forward_mode.is_extend():
+            return
+
+        if isinstance(self.tree_cache, UnifiedRadixCache):
+            chunked_prefill_size = global_server_args_dict["chunked_prefill_size"]
+            for dp_rank, info in enumerate(self.reqs_info):
+                if not info.reqs or not info.prefix_lens:
+                    continue
+                for idx, req in enumerate(info.reqs):
+                    pre_len = info.prefix_lens[idx]
+                    if self.enable_overlap:
+                        if req.extend_batch_idx < 2:
+                            continue
+                        if chunked_prefill_size is not None and chunked_prefill_size > 0:
+                            pre_len -= chunked_prefill_size
+                    self.tree_cache.evict_req_swa(req, pre_len, dp_rank=dp_rank)
             return
 
         # For SWARadixCache with active tree, extend-time SWA ownership stays
