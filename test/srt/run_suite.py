@@ -308,6 +308,11 @@ suites = {
             runner="pytest",
         ),
         TestFile(
+            "python/sgl_jax/test/test_verify_mask_packing.py",
+            0.1,
+            runner="pytest",
+        ),
+        TestFile(
             "python/sgl_jax/test/multimodal/test_qwen_vl_processor.py",
             0.1,
             runner="pytest",
@@ -457,6 +462,11 @@ suites = {
         TestFile(
             "python/sgl_jax/test/layers/test_lightning_backend_dp.py",
             1,
+            runner="pytest",
+        ),
+        TestFile(
+            "python/sgl_jax/test/test_flashattention_custom_mask_dp.py",
+            2,
             runner="pytest",
         ),
         TestFile("python/sgl_jax/test/test_kda_attention.py", 6.5),

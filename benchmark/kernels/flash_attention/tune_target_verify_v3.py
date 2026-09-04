@@ -22,7 +22,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-from utils import create_target_verify_uniform_data
+from utils import create_target_verify_uniform_data, create_tree_mask_rank3
 
 from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import (
     get_vmem_estimate_bytes,
@@ -93,6 +93,8 @@ def _benchmark_one(
     tries: int,
     sliding_window: int | None,
 ) -> float:
+    use_mask = inputs.get("custom_mask") is not None
+
     @functools.partial(
         jax.jit,
         static_argnames=("sm_scale", "m_block_sizes"),
@@ -107,6 +109,7 @@ def _benchmark_one(
         cu_q_lens,
         cu_kv_lens,
         distribution,
+        custom_mask,
         sm_scale,
         m_block_sizes,
     ):
@@ -120,8 +123,8 @@ def _benchmark_one(
             cu_q_lens,
             cu_kv_lens,
             distribution,
-            custom_mask=None,
-            causal=1,
+            custom_mask=custom_mask,
+            causal=0 if use_mask else 1,
             sm_scale=sm_scale,
             sliding_window=sliding_window,
             chunk_prefill_size=None,
@@ -140,11 +143,19 @@ def _benchmark_one(
         inputs["cu_q_lens"],
         inputs["cu_kv_lens"],
         inputs["distribution"],
+        inputs.get("custom_mask"),
         head_dim**-0.5,
         block_sizes,
     )
     out = bound()
     jax.block_until_ready(out)
+    # This string is used as a REGEX over trace event names to pull
+    # device_duration_ps, so it must match the pallas_call name built in
+    # ragged_paged_attention_v3.py (`scope_name`) exactly. On a miss the
+    # extractor silently falls back to host-side MARKER events, which are not
+    # comparable -- two runs would then be timed by two different methods.
+    # Which mode ran is already recorded in the header line and the JSONL, so
+    # do not encode it here.
     scope = (
         f"RPAm-p_{inputs['page_size']}"
         f"-bq_{block_sizes[0]}_{block_sizes[2]}"
@@ -171,6 +182,15 @@ def main():
     parser.add_argument("--kv-head-num", type=int, default=1)
     parser.add_argument("--head-dim", type=int, default=256)
     parser.add_argument("--tries", type=int, default=5)
+    parser.add_argument(
+        "--custom-mask",
+        action="store_true",
+        help=(
+            "run the tree-mask path (causal=0 + a rank-3 custom_mask) instead of "
+            "causal verification. Run once with and once without to measure what "
+            "the mask costs; nothing else in this repo exercises the masked path."
+        ),
+    )
     parser.add_argument(
         "--sliding-window",
         type=int,
@@ -226,6 +246,15 @@ def main():
     )
     inputs["distribution"] = values[-1]
     inputs["page_size"] = args.page_size
+    inputs["custom_mask"] = (
+        create_tree_mask_rank3(
+            batch_size=args.batch_size,
+            draft_token_num=args.draft_token_num,
+            kv_len=args.prefix_len + args.draft_token_num,
+        )
+        if args.custom_mask
+        else None
+    )
 
     candidates = args.candidates or (
         _focused_candidates(args.draft_token_num, args.sliding_window or None)
@@ -239,8 +268,11 @@ def main():
         f"bs{args.batch_size}xq{args.draft_token_num} "
         f"prefix={args.prefix_len} page={args.page_size} "
         f"q_heads={args.q_head_num} kv_heads={args.kv_head_num} hd={args.head_dim} "
-        f"sliding_window={args.sliding_window or None}"
+        f"sliding_window={args.sliding_window or None} "
+        f"custom_mask={'on (causal=0)' if args.custom_mask else 'off (causal=1)'}"
     )
+    if args.custom_mask:
+        print(f"# custom_mask shape={inputs['custom_mask'].shape} dtype=int32")
     print(
         f"# shapes q={inputs['q'].shape} kv_cache={inputs['kv_cache'].shape} "
         f"page_indices={inputs['page_indices'].shape}"
@@ -256,7 +288,7 @@ def main():
             block_sizes[1],
             jnp.bfloat16,
             jnp.bfloat16,
-            use_custom_mask=False,
+            use_custom_mask=inputs.get("custom_mask") is not None,
             bkv_csz=block_sizes[3],
         )
         if est > vmem_limit:
@@ -303,6 +335,7 @@ def main():
                             "kv_head_num": args.kv_head_num,
                             "head_dim": args.head_dim,
                             "sliding_window": args.sliding_window or None,
+                            "custom_mask": bool(args.custom_mask),
                             "block_sizes": list(block_sizes),
                             "latency_ms": elapsed,
                             "estimated_vmem_mib": est / 2**20,
