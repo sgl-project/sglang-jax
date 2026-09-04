@@ -320,6 +320,15 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 "Enabling TPU log recorder for JIT compilation "
                 "(compiler_options: xla_tpu_enable_log_recorder=true)."
             )
+        backend_compiler_options = getattr(self.attn_backend, "compiler_options", None)
+        sampler_compiler_options = getattr(
+            self.attn_backend, "sampler_compiler_options", None
+        )
+        if backend_compiler_options:
+            jit_compiler_options = {
+                **backend_compiler_options,
+                **(jit_compiler_options or {}),
+            }
 
         @partial(
             jax.jit,
@@ -335,19 +344,26 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             memory_pools,
             logits_metadata,
         ):
+            prepare_model_state = getattr(self.attn_backend, "prepare_model_state", None)
+            if prepare_model_state is not None:
+                model_state_leaves = prepare_model_state(model_state_leaves)
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
             memory_pools = _maybe_apply_recurrent_cow(forward_batch, memory_pools)
             with LoraBatchContext.set_batch(forward_batch):
                 return model(forward_batch, memory_pools, logits_metadata)
 
-        # Capture base RNG key as a constant in the JIT closure.
-        # fold_in(constant, dynamic_step) is computed inside JIT, avoiding
-        # the eager jax.random.split that would serialize the host-device pipeline.
+        # Capture the base RNG key as a constant in the JIT closure. The sampler
+        # folds in the dynamic step inside its regular-sampling cond branch, so
+        # greedy decoding does not execute PRNG operations.
         base_rng_key = self._sampler_base_rng
         _fused_mesh = self.mesh
 
-        @partial(jax.jit, static_argnames=["sampler_state_def", "use_sort_for_toppk_minp"])
+        @partial(
+            jax.jit,
+            static_argnames=["sampler_state_def", "use_sort_for_toppk_minp"],
+            compiler_options=sampler_compiler_options,
+        )
         def jitted_sampler(
             sampler_def,
             sampler_state_def,
@@ -358,9 +374,11 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         ):
             model_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
             sampler = nnx.merge(sampler_def, model_state)
-            rng_key = jax.random.fold_in(base_rng_key, rng_step)
             return sampler(
-                *args, use_sort_for_toppk_minp=use_sort_for_toppk_minp, rng_override=rng_key
+                *args,
+                use_sort_for_toppk_minp=use_sort_for_toppk_minp,
+                rng_override=base_rng_key,
+                rng_step=rng_step,
             )
 
         @partial(jax.jit, static_argnames=["mesh"])
@@ -491,12 +509,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 )
             s_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
             sampler = nnx.merge(sampler_def, s_state)
-            rng_key = jax.random.fold_in(base_rng_key, rng_step)
             next_ids, token_logprobs, _new_output = sampler(
                 output,
                 sampling_metadata,
                 use_sort_for_toppk_minp=use_sort_for_toppk_minp,
-                rng_override=rng_key,
+                rng_override=base_rng_key,
+                rng_step=rng_step,
             )
             # async_gather + set_future_token_ids inlined. Per-request slot
             # scatter (req_pool_idx + 1); padding rows (seq_lens == 0) go out
@@ -839,6 +857,14 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 self.num_attn_heads,
                 num_kv_heads,
                 head_dim,
+                page_size=self.page_size,
+                mesh=self.mesh,
+            )
+
+        elif backend == "tt":
+            from sgl_jax.srt.hardware_backend.tt.attention.tt_backend import TTAttention
+
+            full_attn_backend = TTAttention(
                 page_size=self.page_size,
                 mesh=self.mesh,
             )

@@ -1489,6 +1489,7 @@ class ServerArgs:
                 "fa",
                 "fa_mha",
                 "dsa_sparse",
+                "tt",
             ],
             default=ServerArgs.attention_backend,
             help=(
@@ -1498,7 +1499,8 @@ class ServerArgs:
                 "(decompress latent KV per-forward via kv_b_proj; ~70x more KV cache than 'fa', "
                 "intended for kernel A/B on short contexts). "
                 "'dsa_sparse' = DeepSeek Sparse Attention (lightning-indexer top-k + sparse MLA) "
-                "with IndexShare cross-layer reuse; MLA models with index_* config only."
+                "with IndexShare cross-layer reuse; MLA models with index_* config only. "
+                "'tt' = TTNN prefill and paged decode."
             ),
         )
         parser.add_argument(
