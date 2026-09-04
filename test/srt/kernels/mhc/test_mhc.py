@@ -19,6 +19,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+
 from sgl_jax.srt.kernels.mhc import (
     mhc_gates,
     mhc_head_collapse_fused,
@@ -51,18 +52,16 @@ def _inputs(n, hc=HC, hidden=HIDDEN, seed=0):
     keys = jax.random.split(jax.random.PRNGKey(seed), 6)
     mix_hc = ref.mix_hc_width(hc)
     return {
-        "x": (jax.random.normal(keys[0], (n, hc, hidden), jnp.float32) * 0.1).astype(
-            jnp.bfloat16
-        ),
+        "x": (jax.random.normal(keys[0], (n, hc, hidden), jnp.float32) * 0.1).astype(jnp.bfloat16),
         "fn": jax.random.normal(keys[1], (mix_hc, hc * hidden), jnp.float32) * 0.01,
         "head_fn": jax.random.normal(keys[2], (hc, hc * hidden), jnp.float32) * 0.01,
         "scale": jnp.asarray([0.7, 1.1, 0.9], jnp.float32),
         "base": jax.random.normal(keys[3], (mix_hc,), jnp.float32) * 0.05,
         "head_scale": jnp.asarray([0.8], jnp.float32),
         "head_base": jax.random.normal(keys[4], (hc,), jnp.float32) * 0.05,
-        "block_out": (
-            jax.random.normal(keys[5], (n, hidden), jnp.float32) * 0.1
-        ).astype(jnp.bfloat16),
+        "block_out": (jax.random.normal(keys[5], (n, hidden), jnp.float32) * 0.1).astype(
+            jnp.bfloat16
+        ),
         "mixes": jax.random.normal(keys[0], (n, mix_hc), jnp.float32),
     }
 
@@ -184,9 +183,7 @@ def test_shapes_beyond_the_shipped_config(hc, hidden):
     d = _inputs(512, hc=hc, hidden=hidden)
     args = (d["x"], d["fn"], d["scale"], d["base"])
     kw = {"hc_mult": hc, "sinkhorn_iters": ITERS, "norm_eps": EPS, "hc_eps": EPS}
-    _close(
-        mhc_pre_fused(*args, **kw), ref.pre(*args, **kw), f"pre hc={hc} hidden={hidden}"
-    )
+    _close(mhc_pre_fused(*args, **kw), ref.pre(*args, **kw), f"pre hc={hc} hidden={hidden}")
 
 
 def test_f32_activations_fit_vmem():

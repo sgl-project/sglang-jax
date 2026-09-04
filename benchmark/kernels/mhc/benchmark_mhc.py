@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: E402
 """Fair operator-level mHC comparison against TPU-Inference on one TPU.
 
 TPU-Inference and vLLM are optional external checkouts. Point
@@ -34,20 +35,21 @@ import jax
 import jax.numpy as jnp
 import jaxlib
 import numpy as np
-import sgl_jax.srt.kernels.mhc.mhc as sglang_source
 import torchax
 import tpu_inference.layers.vllm.custom_ops.mhc as tpu_source
 import vllm.model_executor.layers.mhc as vllm_source
-from sgl_jax.srt.kernels.mhc import (
-    mhc_head_collapse_fused,
-    mhc_post_fused,
-    mhc_pre_fused,
-)
 from torchax.interop import jax_view, torch_view
 from vllm.config import set_current_vllm_config
 from vllm.config.compilation import CompilationConfig
 from vllm.model_executor.layers.mhc import HCHeadOp, MHCPostOp, MHCPreOp
 from vllm.platforms import current_platform
+
+import sgl_jax.srt.kernels.mhc.mhc as sglang_source
+from sgl_jax.srt.kernels.mhc import (
+    mhc_head_collapse_fused,
+    mhc_post_fused,
+    mhc_pre_fused,
+)
 
 HC = 4
 HIDDEN = 4096
@@ -69,9 +71,7 @@ def _inside(module, root: Path) -> bool:
 
 
 if not _inside(sglang_source, SGLANG_ROOT):
-    raise RuntimeError(
-        f"loaded SGLang source outside snapshot: {sglang_source.__file__}"
-    )
+    raise RuntimeError(f"loaded SGLang source outside snapshot: {sglang_source.__file__}")
 if not _inside(tpu_source, TPU_INFERENCE_ROOT):
     raise RuntimeError(f"loaded TPU-inference outside snapshot: {tpu_source.__file__}")
 if not _inside(vllm_source, VLLM_ROOT):
@@ -94,9 +94,7 @@ def _check_dispatch(op, method: str) -> None:
     if type(op).__module__ != "tpu_inference.layers.vllm.custom_ops.mhc":
         raise RuntimeError(f"unexpected TPU implementation: {type(op)}")
     if op._forward_method.__qualname__ != method:
-        raise RuntimeError(
-            f"unexpected TPU dispatch: {op._forward_method.__qualname__}"
-        )
+        raise RuntimeError(f"unexpected TPU dispatch: {op._forward_method.__qualname__}")
 
 
 _check_dispatch(_TPU_PRE, "VllmMHCPreOp.forward_tpu")
@@ -127,9 +125,7 @@ def sglang_pre(
     sinkhorn_iterations=20,
 ):
     if hc_pre_eps != hc_sinkhorn_eps or post_multiplier != 2.0:
-        raise ValueError(
-            "the common ABI requires equal eps values and post_multiplier=2"
-        )
+        raise ValueError("the common ABI requires equal eps values and post_multiplier=2")
     layer_input, post_mix, comb_mix = mhc_pre_fused(
         residual,
         fn,
@@ -255,25 +251,17 @@ def _inputs(tokens: int, seed: int) -> dict[str, jax.Array]:
         "residual": jnp.asarray(
             rng.standard_normal((tokens, HC, HIDDEN), dtype=np.float32) * 0.1
         ).astype(jnp.bfloat16),
-        "fn": jnp.asarray(
-            rng.standard_normal((ROWS, HC * HIDDEN), dtype=np.float32) * 0.01
-        ),
+        "fn": jnp.asarray(rng.standard_normal((ROWS, HC * HIDDEN), dtype=np.float32) * 0.01),
         "scale": jnp.asarray([0.7, 1.1, 0.9], jnp.float32),
         "base": jnp.asarray(rng.standard_normal(ROWS, dtype=np.float32) * 0.05),
-        "x": jnp.asarray(
-            rng.standard_normal((tokens, HIDDEN), dtype=np.float32) * 0.1
-        ).astype(jnp.bfloat16),
+        "x": jnp.asarray(rng.standard_normal((tokens, HIDDEN), dtype=np.float32) * 0.1).astype(
+            jnp.bfloat16
+        ),
         "post": jnp.asarray(
-            2.0
-            / (
-                1.0
-                + np.exp(-rng.standard_normal((tokens, HC, 1), dtype=np.float32) * 0.1)
-            )
+            2.0 / (1.0 + np.exp(-rng.standard_normal((tokens, HC, 1), dtype=np.float32) * 0.1))
         ),
         "comb": jnp.asarray(comb),
-        "head_fn": jnp.asarray(
-            rng.standard_normal((HC, HC * HIDDEN), dtype=np.float32) * 0.01
-        ),
+        "head_fn": jnp.asarray(rng.standard_normal((HC, HC * HIDDEN), dtype=np.float32) * 0.01),
         "head_scale": jnp.asarray([0.8], jnp.float32),
         "head_base": jnp.asarray(rng.standard_normal(HC, dtype=np.float32) * 0.05),
     }
@@ -359,9 +347,7 @@ def _profile_block(function, op: str, buffers, position: int):
         else:
             merged.append((begin, end))
     if len(merged) != TIMED_RUNS_PER_BLOCK:
-        raise RuntimeError(
-            f"expected {TIMED_RUNS_PER_BLOCK} device calls, found {len(merged)}"
-        )
+        raise RuntimeError(f"expected {TIMED_RUNS_PER_BLOCK} device calls, found {len(merged)}")
     return {
         "active_ms": sum(end - begin for begin, end in merged) / 1e6,
         "module_events": event_count,
@@ -394,8 +380,7 @@ def _profile_pair(left, right, op: str, buffers):
     for total in totals:
         if total["merged_intervals"] != TIMED_RUNS:
             raise RuntimeError(
-                f"expected {TIMED_RUNS} total device calls, "
-                f"found {total['merged_intervals']}"
+                f"expected {TIMED_RUNS} total device calls, " f"found {total['merged_intervals']}"
             )
         total["mean_ms"] = total.pop("active_ms") / TIMED_RUNS
     return totals
@@ -404,9 +389,7 @@ def _profile_pair(left, right, op: str, buffers):
 def _revision(path: Path, override_env: str | None = None) -> str:
     if override_env and (revision := os.environ.get(override_env)):
         return revision
-    return subprocess.check_output(
-        ("git", "-C", str(path), "rev-parse", "HEAD"), text=True
-    ).strip()
+    return subprocess.check_output(("git", "-C", str(path), "rev-parse", "HEAD"), text=True).strip()
 
 
 def _sha256(path: Path) -> str:
@@ -417,8 +400,7 @@ def _provenance():
     files = {
         "sglang_mhc": SGLANG_ROOT / "python/sgl_jax/srt/kernels/mhc/mhc.py",
         "sglang_tune": SGLANG_ROOT / "python/sgl_jax/srt/kernels/mhc/tune.py",
-        "tpu_dispatch": TPU_INFERENCE_ROOT
-        / "tpu_inference/layers/vllm/custom_ops/mhc.py",
+        "tpu_dispatch": TPU_INFERENCE_ROOT / "tpu_inference/layers/vllm/custom_ops/mhc.py",
         "vllm_math": VLLM_ROOT / "vllm/model_executor/kernels/mhc/torch.py",
         "benchmark": Path(__file__).resolve(),
     }
@@ -446,10 +428,7 @@ def _markdown(payload) -> str:
             f"dot_precision={payload['configuration']['dot_precision']}."
         ),
         "",
-        (
-            "The same dot_precision is applied to both implementations for pre, "
-            "post, and head."
-        ),
+        ("The same dot_precision is applied to both implementations for pre, " "post, and head."),
         "",
         (
             "Four independent input buffers rotate through every measurement. Both "
@@ -485,9 +464,7 @@ def main():
         default=(1, 128, 256, 512, 1024, 2048, 4096, 8192),
     )
     parser.add_argument("--hidden-size", type=int, choices=(4096, 7168), default=4096)
-    parser.add_argument(
-        "--dot-precision", choices=("default", "highest"), default="default"
-    )
+    parser.add_argument("--dot-precision", choices=("default", "highest"), default="default")
     parser.add_argument(
         "--output",
         type=Path,
@@ -504,9 +481,7 @@ def main():
         raise SystemExit("a physical TPU is required")
     devices = jax.devices()
     if len(devices) != 1:
-        raise SystemExit(
-            f"this benchmark requires one TPU device, found {len(devices)}"
-        )
+        raise SystemExit(f"this benchmark requires one TPU device, found {len(devices)}")
     if any(tokens <= 0 for tokens in args.tokens):
         raise SystemExit("token counts must be positive")
     if inspect.signature(sglang_pre) != inspect.signature(tpu_pre):
@@ -529,8 +504,7 @@ def main():
                 flush=True,
             )
             buffers = [
-                _inputs(tokens, seed=INPUT_SEED + index)
-                for index in range(ROTATING_BUFFERS)
+                _inputs(tokens, seed=INPUT_SEED + index) for index in range(ROTATING_BUFFERS)
             ]
             operators = {}
             for op, (sglang, tpu) in implementations.items():

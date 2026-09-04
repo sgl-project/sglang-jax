@@ -43,9 +43,7 @@ def sinkhorn_gates(mixes, hc_scale, hc_base, *, hc_mult, sinkhorn_iters, eps):
     base = np.asarray(hc_base, np.float64)
 
     pre = 1.0 / (1.0 + np.exp(-(mixes[..., :hc] * scale[0] + base[:hc]))) + eps
-    post = 2.0 / (
-        1.0 + np.exp(-(mixes[..., hc : 2 * hc] * scale[1] + base[hc : 2 * hc]))
-    )
+    post = 2.0 / (1.0 + np.exp(-(mixes[..., hc : 2 * hc] * scale[1] + base[hc : 2 * hc])))
 
     comb = mixes[..., 2 * hc :].reshape(*mixes.shape[:-1], hc, hc)
     comb = comb * scale[2] + base[2 * hc :].reshape(hc, hc)
@@ -65,9 +63,7 @@ def _projection(x_streams, hc_fn, *, norm_eps):
     return flat @ np.asarray(hc_fn, np.float64).T * rsqrt
 
 
-def pre(
-    x_streams, hc_fn, hc_scale, hc_base, *, hc_mult, sinkhorn_iters, norm_eps, hc_eps
-):
+def pre(x_streams, hc_fn, hc_scale, hc_base, *, hc_mult, sinkhorn_iters, norm_eps, hc_eps):
     """Collapse hc streams to one and emit the gates the post step will need."""
     x = np.asarray(x_streams, np.float64)
     mixes = _projection(x, hc_fn, norm_eps=norm_eps)
@@ -102,10 +98,7 @@ def head_collapse(x_streams, hc_fn, hc_scale, hc_base, *, norm_eps, hc_eps):
     rsqrt = 1.0 / np.sqrt(np.mean(flat**2, axis=-1, keepdims=True) + norm_eps)
     normalized = bf16(flat * rsqrt).astype(np.float64)
     mixes = normalized @ np.asarray(hc_fn, np.float64).T
-    gate = (
-        1.0 / (1.0 + np.exp(-(mixes * np.asarray(hc_scale, np.float64)[0] + hc_base)))
-        + hc_eps
-    )
+    gate = 1.0 / (1.0 + np.exp(-(mixes * np.asarray(hc_scale, np.float64)[0] + hc_base))) + hc_eps
     return (gate[..., None] * x).sum(axis=-2)
 
 
