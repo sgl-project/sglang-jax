@@ -35,7 +35,7 @@ grep -n 'add_argument' python/sgl_jax/srt/server_args.py
 | `--tensor-parallel-size` / `--tp-size` | `1` | Total JAX devices across all nodes. See [`tpu-topology-reference.md`](../base/tpu-topology-reference.md) for the v7x 2-devices-per-chip rule. |
 | `--data-parallel-size` / `--dp-size` | `1` | DP factor for the **attention** path only. Attention TP becomes `tp_size / dp_size`. MoE layers still run with full `ep_size`. |
 | `--moe-data-parallel-size` / `--moe-dp-size` | `1` | DP factor for MoE. The default preserves the existing EP/TP layout. Replicated MoE currently requires `moe_dp_size == dp_size`, `ep_size == 1`, the `epmoe` backend, and an unquantized Ling-3.0-Tiny model. |
-| `--dp-schedule-policy` | auto | DP rank assignment policy. If unset, radix-cache serving uses `cache_aware`; `--disable-radix-cache` and Pathways PD use `min_running_queue`. Explicit choices are `cache_aware`, `shape_aware`, `min_running_queue`, and `round_robin`; use non-default choices as workload-specific tuning overrides. |
+| `--dp-schedule-policy` | auto | DP rank assignment policy. If unset, radix-cache serving uses `cache_aware`; `--disable-radix-cache` and Pathways PD use `min_running_queue`. Explicit choices are `cache_aware`, `force_cache_aware`, `shape_aware`, `min_running_queue`, and `round_robin`. `force_cache_aware` is an opt-in override for multi-turn agentic workloads that prioritizes conversation-prefix reuse over even load distribution. |
 | `--ep-size` | `1` | Expert parallelism. Typically `--ep-size == --tp-size` for MoE models. |
 
 ## 3. KV cache & sequence length

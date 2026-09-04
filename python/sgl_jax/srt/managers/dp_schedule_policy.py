@@ -106,6 +106,35 @@ def pick_cache_aware_dp(
     return pick_shape_aware_dp(eligible, input_counts, output_counts, item_input, item_output)
 
 
+def pick_force_cache_aware_dp(
+    eligible: list[int],
+    counts: list[int],
+    token_counts: list[int],
+    matches: dict[int, int],
+    prompt_len: int,
+    input_counts: list[int],
+    output_counts: list[int],
+    item_input: int = 0,
+    item_output: int = 0,
+) -> int | None:
+    """Strict cache affinity with shape-aware miss fallback.
+
+    Prefer the longest cached prefix among eligible ranks regardless of load,
+    breaking equal-prefix ties by ``(running, tokens, rank)``. Fall back to
+    shape-aware scheduling only when no eligible rank has a reusable prefix.
+    """
+    if not eligible:
+        return None
+
+    if prompt_len > 0:
+        best_match = max(matches.get(r, 0) for r in eligible)
+        if best_match > 0:
+            best_holders = [r for r in eligible if matches.get(r, 0) == best_match]
+            return min(best_holders, key=lambda r: (counts[r], token_counts[r], r))
+
+    return pick_shape_aware_dp(eligible, input_counts, output_counts, item_input, item_output)
+
+
 def pick_shape_aware_dp(
     eligible: list[int],
     input_counts: list[int],

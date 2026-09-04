@@ -39,6 +39,7 @@ from sgl_jax.srt.managers.communication import CommunicationBackend
 from sgl_jax.srt.managers.dp_rank_assignment import assign_dp_ranks
 from sgl_jax.srt.managers.dp_schedule_policy import (
     pick_cache_aware_dp,
+    pick_force_cache_aware_dp,
     pick_shape_aware_dp,
     req_prefix_match_key,
 )
@@ -955,12 +956,12 @@ class Scheduler(
         extra_input_counts: list[int],
         extra_output_counts: list[int],
     ) -> int | None:
-        """Route ``req`` by cache affinity with shape-aware miss fallback.
+        """Route ``req`` by the configured cache policy with shape-aware fallback.
 
-        Probes each eligible rank's cached prefix length, then defers to
-        ``pick_cache_aware_dp``: balance on large load skew, else least-loaded
-        among the ranks holding a substantial cached prefix, else shape-aware
-        selection. Returns None if all DP ranks are full.
+        ``cache_aware`` keeps its soft affinity/load tradeoff;
+        ``force_cache_aware`` always prefers the longest eligible cache hit.
+        Both use shape-aware selection on a full miss and return None if all DP
+        ranks are full.
         """
         if self.dp_size == 1:
             return 0
@@ -983,7 +984,12 @@ class Scheduler(
         output_counts = [running_output[i] + extra_output_counts[i] for i in range(self.dp_size)]
         item_input, item_output = self._estimate_req_input_output_tokens(req)
 
-        return pick_cache_aware_dp(
+        picker = (
+            pick_force_cache_aware_dp
+            if self.dp_schedule_policy == "force_cache_aware"
+            else pick_cache_aware_dp
+        )
+        return picker(
             eligible,
             counts,
             token_counts,

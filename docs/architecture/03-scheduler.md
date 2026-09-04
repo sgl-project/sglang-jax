@@ -241,6 +241,7 @@ Data Parallel does not change the number of Scheduler processes. After receiving
 | `dp_schedule_policy` | Description |
 |---|---|
 | `cache_aware` | Prefers eligible DP ranks that hold a substantial reusable radix-cache prefix, preserves large-load-skew balancing, and uses shape-aware selection on cache misses |
+| `force_cache_aware` | Always selects the eligible rank with the longest reusable prefix, even under load skew; this opt-in policy is intended for multi-turn agentic workloads where preserving conversation-prefix locality matters more than even load distribution |
 | `shape_aware` | Balances input/prefill and output/decode token load separately by minimizing the post-admission bottleneck dimension |
 | `min_running_queue` | Picks the DP rank with the fewest currently running requests, then scheduled tokens |
 | `round_robin` | Rotates new requests across ranks |
