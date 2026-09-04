@@ -99,3 +99,18 @@ def test_dflash_server_args_allows_data_parallel_attention(monkeypatch):
 
     assert args.dp_size == 2
     assert args.tp_size // args.dp_size == 2
+
+
+def test_dflash_server_args_allows_overlap(monkeypatch):
+    def fail_parse(*args, **kwargs):
+        raise AssertionError("non-default DFlash draft token count should not be inferred")
+
+    monkeypatch.setattr(dflash_util, "parse_dflash_draft_config", fail_parse)
+
+    args = _dflash_args(
+        speculative_num_draft_tokens=16,
+        disable_overlap_schedule=False,
+    )
+    args.check_server_args()
+
+    assert not args.disable_overlap_schedule

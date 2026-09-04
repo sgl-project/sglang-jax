@@ -486,11 +486,10 @@ def _ragged_paged_attention_kernel_loop(
         if soft_cap is not None:
             s = soft_cap * jnp.tanh(s / soft_cap)
 
-        # Use int16 for span computations when safe: non-f32 dtype on TPU v6+
-        # with causal mask. Custom mask shapes can trigger a Mosaic compiler bug.
+        # These are absolute sequence positions. int16 overflows once either a
+        # position or ``k_span + sliding_window`` crosses 32767, which silently
+        # corrupts causal/sliding-window masks for long-context verification.
         int_ty = jnp.int32
-        if get_dtype_packing(q.dtype) != 1 and tpu_version >= 6 and use_causal_mask:
-            int_ty = jnp.int16
         processed_q_len_int = processed_q_len.astype(int_ty)
         processed_kv_len_int = processed_kv_len.astype(int_ty)
         effective_kv_len_int = effective_kv_len.astype(int_ty)

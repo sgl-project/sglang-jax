@@ -24,7 +24,7 @@ from sgl_jax.srt.speculative.dflash_info import (
     DFlashVerifyInput,
     _mask_draft_kv_writes,
     build_dflash_draft_block,
-    dflash_greedy_verify,
+    dflash_target_only_verify,
 )
 from sgl_jax.srt.speculative.dflash_util import (
     parse_dflash_draft_config,
@@ -41,6 +41,33 @@ from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 logger = logging.getLogger(__name__)
 
 
+def _resolve_dflash_query_block_size(verify_width: int, checkpoint_max: int) -> int:
+    if verify_width > checkpoint_max:
+        raise ValueError(
+            "DFLASH verify width exceeds the assistant checkpoint canvas: "
+            f"verify_block_size={verify_width}, draft_block_size={checkpoint_max}."
+        )
+    return verify_width
+
+
+def _configure_draft_swa_mapping(
+    draft_kv_pool,
+    draft_attn_backend,
+    shared_allocator,
+    draft_layers: int,
+) -> None:
+    """Keep attention page indices consistent with the draft's physical KV pool."""
+    if getattr(draft_kv_pool, "swa_layer_nums", 0) != draft_layers:
+        draft_kv_pool.full_to_swa_index_mapping = None
+        object.__setattr__(draft_attn_backend, "swa_index_mapping", None)
+        return
+    shared_mapping = getattr(shared_allocator, "full_to_swa_index_mapping", None)
+    if shared_mapping is None:
+        return
+    draft_kv_pool.full_to_swa_index_mapping = shared_mapping
+    object.__setattr__(draft_attn_backend, "swa_index_mapping", shared_mapping)
+
+
 @dataclass(frozen=True)
 class DFlashVerifyBucketTemplate:
     extend_seq_lens: np.ndarray
@@ -53,6 +80,7 @@ class DFlashVerifyBucketTemplate:
 class DraftForwardPlan:
     forward_batch: ForwardBatch
     forward_metadata: object
+    page_indices: np.ndarray
     seq_lens: np.ndarray
     target_prefix_lens: np.ndarray
     positions_host: np.ndarray
@@ -80,11 +108,14 @@ class TargetVerifyPlan:
     allocated_lens: jax.Array
     relay_future_indices: jax.Array
     relay_valid_mask: jax.Array
+    temperatures: jax.Array
+    top_ks: jax.Array
+    top_ps: jax.Array
     update_relay: bool = False
 
 
 class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
-    """DFlash draft/verify runtime worker (greedy, DP/TP aware)."""
+    """DFlash draft/verify runtime worker (target-only sampling, DP/TP aware)."""
 
     def __init__(self, server_args, target_worker: ModelWorker):
         super().__init__(
@@ -93,11 +124,27 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             self,
         )
         self.block_size = self.speculative_num_draft_tokens
+        dflash_config = parse_dflash_draft_config(
+            server_args.speculative_draft_model_path,
+            revision=server_args.speculative_draft_model_revision,
+        )
+        self.draft_max_block_size = int(dflash_config.block_size)
+        # vLLM presents exactly one seed plus the requested draft proposals to
+        # the bidirectional DFlash head. The checkpoint block size is a maximum,
+        # not a requirement to append extra MASK tokens: those extra tokens can
+        # change every proposal because draft attention is non-causal.
+        self.draft_block_size = _resolve_dflash_query_block_size(
+            self.block_size, self.draft_max_block_size
+        )
+        self.speculative_num_kv_slots = self.draft_block_size
         self._target_impl = getattr(target_worker, "worker", target_worker)
         self._target_compilation_manager = self._target_impl.compilation_manager
 
         draft_server_args = copy.deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
+        # The shared target allocator may address the target's hybrid-inflated pool.
+        # Give the draft the same physical capacity before constructing it.
+        draft_server_args.draft_runner_cache_size = int(target_worker.max_total_num_tokens)
 
         from sgl_jax.srt.models.dflash import DFlashDraftModel
 
@@ -113,10 +160,16 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         # Alias the KV allocator so draft block allocation draws from the same
         # free list the target uses (no collision with committed slots).
         self.draft_model_runner.token_to_kv_pool_allocator = self.token_to_kv_pool_allocator
+        _configure_draft_swa_mapping(
+            self.draft_model_runner.token_to_kv_pool,
+            self.draft_model_runner.attn_backend,
+            self.token_to_kv_pool_allocator,
+            int(draft_model.config.num_hidden_layers),
+        )
 
         target_model = target_worker.model_runner.model
         embed_weight, head_weight = target_model.get_embed_and_head()
-        self._target_lm_head = head_weight  # [vocab, hidden], for greedy head sampling
+        self._target_lm_head = head_weight  # [vocab, hidden], for draft head sampling
         self._target_embed = embed_weight  # [vocab, hidden]
         self._target_vocab_size = int(target_worker.model_runner.model_config.vocab_size)
 
@@ -133,10 +186,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         )
         self._verify_bucket_templates: dict[tuple, DFlashVerifyBucketTemplate] = {}
 
-        dflash_config = parse_dflash_draft_config(
-            server_args.speculative_draft_model_path,
-            revision=server_args.speculative_draft_model_revision,
-        )
         self._mask_token_id = resolve_mask_token_id(
             dflash_config,
             getattr(self._target_impl, "tokenizer", None),
@@ -159,10 +208,14 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         self._init_jit_draft_block()
 
         logger.info(
-            "Initialized DFLASH worker: block_size=%d, mask_token_id=%d, "
+            "Initialized DFLASH worker: verify_block_size=%d, draft_block_size=%d, "
+            "draft_max_block_size=%d, "
+            "mask_token_id=%d, "
             "draft_layers=%d, page_indices_pool_capacity=%d, "
             "page_indices_per_seq_capacity=%d",
             self.block_size,
+            self.draft_block_size,
+            self.draft_max_block_size,
             self._mask_token_id,
             self.draft_layers,
             self._page_indices_pool_capacity,
@@ -262,7 +315,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             target_hidden=logits_output.hidden_states,
             ctx_lens=accept_lens_out,
             draft_seq_lens=None,
-            block_size=self.block_size,
+            block_size=self.draft_block_size,
         )
         next_draft_input.new_seq_lens = new_seq_lens
         next_draft_input._target_verify_plan = plan
@@ -308,7 +361,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             target_hidden=target_hidden,
             ctx_lens=seq_lens,
             draft_seq_lens=prefix_lens,
-            block_size=self.block_size,
+            block_size=self.draft_block_size,
         )
 
         # Materialization only depends on target hidden states. Dispatch it before
@@ -360,8 +413,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
 
         if not model_worker_batch.forward_mode.is_extend():
             raise NotImplementedError("DFLASH prefill overlap requires an extend batch.")
-        if not self._can_use_fused_spec_prefill(model_worker_batch):
-            raise NotImplementedError("DFLASH prefill overlap only supports greedy sampling.")
 
         self.init_spec_relay_buffers()
         if model_worker_batch.sampling_info.temperatures.ndim == 1:
@@ -374,12 +425,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             self.mesh,
             vocab_size=self.target_worker.model_config.vocab_size,
         )
-        logits_output, _, cache_miss_count, bid, seq_lens = self.forward_target_extend(
-            model_worker_batch,
-            sampling_metadata,
-            skip_sample=True,
+        logits_output, next_token_ids, cache_miss_count, bid, seq_lens = (
+            self._forward_target_prefill_overlap(model_worker_batch, sampling_metadata)
         )
-        next_token_ids = jnp.argmax(logits_output.next_token_logits, axis=-1).astype(jnp.int32)
 
         sel = np.asarray(model_worker_batch.logits_indices_selector, dtype=np.int32)
         extend_seq_lens = np.asarray(model_worker_batch.extend_seq_lens, dtype=np.int32)[sel]
@@ -389,7 +437,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             target_hidden=logits_output.hidden_states,
             ctx_lens=extend_seq_lens,
             draft_seq_lens=extend_prefix_lens,
-            block_size=self.block_size,
+            block_size=self.draft_block_size,
         )
         self._append_target_hidden_to_draft_kv(model_worker_batch, materialize_input)
 
@@ -424,7 +472,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         future_indices = np.asarray(model_worker_batch.req_pool_indices, dtype=np.int32)[sel]
         next_draft_input = DFlashDraftInput(
             future_indices=future_indices,
-            block_size=self.block_size,
+            block_size=self.draft_block_size,
         )
         model_worker_batch.spec_info_padded = next_draft_input
         launch_done = getattr(model_worker_batch, "launch_done", None)
@@ -442,6 +490,17 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             extend_logprob_start_len_per_req=None,
         )
 
+    def _forward_target_prefill_overlap(self, model_worker_batch, sampling_metadata):
+        if model_worker_batch.sampling_info.is_all_greedy:
+            logits_output, _, cache_miss_count, bid, seq_lens = self.forward_target_extend(
+                model_worker_batch,
+                sampling_metadata,
+                skip_sample=True,
+            )
+            next_token_ids = jnp.argmax(logits_output.next_token_logits, axis=-1).astype(jnp.int32)
+            return logits_output, next_token_ids, cache_miss_count, bid, seq_lens
+        return self.forward_target_extend(model_worker_batch, sampling_metadata)
+
     def forward_batch_speculative_decode_overlap(self, model_worker_batch: ModelWorkerBatch):
         if not model_worker_batch.forward_mode.is_decode():
             raise NotImplementedError("DFLASH decode overlap requires a decode batch.")
@@ -458,7 +517,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         sel = np.asarray(model_worker_batch.logits_indices_selector, dtype=np.int32)
         next_draft_input = DFlashDraftInput(
             future_indices=np.asarray(model_worker_batch.req_pool_indices, dtype=np.int32)[sel],
-            block_size=self.block_size,
+            block_size=self.draft_block_size,
         )
         batch_output.next_draft_input = next_draft_input
         batch_output.spec_relay_buffers = self.spec_relay_buffers
@@ -516,7 +575,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             verified_id=verified_id,
             mask_token_id=self._mask_token_id,
             target_prefix_lens=target_prefix_lens,
-            block_size=self.block_size,
+            block_size=self.draft_block_size,
         )
         block_ids_flat = block_ids.reshape(-1)
         positions_flat = positions.reshape(-1)
@@ -545,7 +604,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             )
         allocated_lens = draft_input.allocate_lens
         if allocated_lens is None:
-            allocated_lens = target_prefix_lens + self.block_size
+            allocated_lens = target_prefix_lens + self.draft_block_size
         allocated_lens = np.asarray(allocated_lens, dtype=np.int32)
         reservation_base_lens = draft_input.reservation_base_lens
         if reservation_base_lens is None:
@@ -563,7 +622,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             bs,
             allocated_lens=allocated_lens if use_relay_state else None,
         )
-        template = self._get_verify_bucket_template(draft_mwb, bs)
+        template = self._get_verify_bucket_template(draft_mwb, bs, block_size=self.draft_block_size)
         metadata = self.draft_model_runner.attn_backend.get_eagle_forward_metadata(
             draft_mwb,
             page_indices=page_indices,
@@ -573,18 +632,18 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             distribution=template.distribution,
         )
         relay_future_indices = (
-            np.asarray(draft_input.future_indices, dtype=np.int32)
+            self._current_relay_indices(model_worker_batch, active_mask, bs)
             if use_relay_state
             else np.zeros((bs,), dtype=np.int32)
         )
-        relay_future_indices = np.where(active_mask, relay_future_indices, 0)
         data_sharding = NamedSharding(self.mesh, P("data"))
         return DraftForwardPlan(
             forward_batch=forward_batch,
             forward_metadata=metadata,
+            page_indices=page_indices,
             seq_lens=np.asarray(model_worker_batch.seq_lens, dtype=np.int32),
             target_prefix_lens=np.asarray(target_prefix_lens, dtype=np.int32),
-            positions_host=positions_flat,
+            positions_host=positions[:, : self.block_size].reshape(-1),
             allocated_lens=jax.device_put(allocated_lens, data_sharding),
             reservation_base_lens=jax.device_put(reservation_base_lens, data_sharding),
             relay_future_indices=jax.device_put(relay_future_indices, data_sharding),
@@ -603,6 +662,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         resolved_positions: jax.Array,
         resolved_cache_loc: jax.Array,
     ) -> TargetVerifyPlan:
+        from jax.sharding import NamedSharding
+        from jax.sharding import PartitionSpec as P
+
         bs = draft_plan.bs
         target_mwb = copy.copy(model_worker_batch)
         target_mwb.forward_mode = ForwardMode.TARGET_VERIFY
@@ -623,6 +685,22 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
 
         template = self._get_verify_bucket_template(target_mwb, bs)
 
+        # The draft and target runners can have different hybrid-KV layouts.
+        # In particular, Muse Glimmer's target mixes SWA and full-attention
+        # layers while its DFlash draft has a different cache layout. Reusing
+        # the draft backend's metadata would therefore give target SWA layers
+        # page indices derived from the wrong allocator mapping.
+        target_forward_metadata = (
+            self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
+                target_mwb,
+                page_indices=draft_plan.page_indices,
+                page_indices_capacity=self._page_indices_capacity(bs),
+                extend_seq_lens=template.extend_seq_lens,
+                cu_q_lens=template.cu_q_lens,
+                distribution=template.distribution,
+            )
+        )
+
         # Reuse proposal positions, request indices, and other device buffers
         # from the draft plan. In particular, do not upload MASK ids for target
         # verify and overwrite them with draft_token afterwards.
@@ -638,10 +716,24 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         target_forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         target_forward_batch.input_embedding = None
 
+        sampling_info = model_worker_batch.sampling_info
+        sampling_values = (
+            np.asarray(sampling_info.temperatures, dtype=np.float32),
+            np.asarray(sampling_info.top_ks, dtype=np.int32),
+            np.asarray(sampling_info.top_ps, dtype=np.float32),
+        )
+        if self.mesh is None:
+            temperatures, top_ks, top_ps = map(jnp.asarray, sampling_values)
+        else:
+            data_sharding = NamedSharding(self.mesh, P("data"))
+            temperatures, top_ks, top_ps = (
+                jax.device_put(value, data_sharding) for value in sampling_values
+            )
+
         return TargetVerifyPlan(
             model_worker_batch=target_mwb,
             forward_batch=target_forward_batch,
-            forward_metadata=draft_plan.forward_metadata,
+            forward_metadata=target_forward_metadata,
             logits_metadata=LogitsMetadata.from_model_worker_batch(target_mwb, self.mesh),
             seq_lens=draft_plan.seq_lens,
             target_prefix_lens=draft_plan.target_prefix_lens,
@@ -652,6 +744,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             allocated_lens=draft_plan.allocated_lens,
             relay_future_indices=draft_plan.relay_future_indices,
             relay_valid_mask=draft_plan.relay_valid_mask,
+            temperatures=temperatures,
+            top_ks=top_ks,
+            top_ps=top_ps,
         )
 
     def _make_draft_block_mwb(
@@ -672,7 +767,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         mwb.spec_algorithm = SpeculativeAlgorithm.DFLASH
         mwb.spec_info_padded = DFlashVerifyInput(
             draft_token=block_ids_flat,
-            draft_token_num=self.block_size,
+            draft_token_num=self.draft_block_size,
         )
         # DFlashDraftInput.prepare_for_decode already reserved and packed one
         # block per active request into the first half of each DP rank section.
@@ -681,7 +776,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         mwb.out_cache_loc = (
             np.asarray(base_mwb.out_cache_loc, dtype=np.int32)
             if use_relay_state
-            else self._verify_write_cache_loc(base_mwb)
+            else self._verify_write_cache_loc(base_mwb, self.draft_block_size)
         )
         mwb.cache_loc = None
         return mwb
@@ -702,7 +797,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         runner = self.draft_model_runner
         model_def = runner._model_def
         model_state_def = runner._model_state_def
-        block_size = self.block_size
+        block_size = self.draft_block_size
+        verify_block_size = self.block_size
         vocab_size = self._target_vocab_size
         embedding_sharding = NamedSharding(runner.mesh, P("data", "tensor"))
         logits_sharding = NamedSharding(runner.mesh, P("data", "tensor"))
@@ -715,6 +811,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             static_argnames=[
                 "model_state_def",
                 "block_size",
+                "verify_block_size",
                 "vocab_size",
                 "use_relay_state",
                 "dp_size",
@@ -735,6 +832,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             reservation_base_lens,
             *,
             block_size: int,
+            verify_block_size: int,
             vocab_size: int,
             use_relay_state: bool,
             dp_size: int,
@@ -812,7 +910,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             draft_hidden = output.hidden_states.reshape(
                 (-1, block_size, output.hidden_states.shape[-1])
             )
-            proposal_hidden = draft_hidden[:, 1:, :]
+            proposal_hidden = draft_hidden[:, 1:verify_block_size, :]
             proposal_flat = proposal_hidden.reshape((-1, proposal_hidden.shape[-1]))
             logits = jnp.dot(
                 proposal_flat,
@@ -826,12 +924,20 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             draft_next = jax.sharding.reshard(draft_next, cache_row_sharding)
             draft_token = jnp.concatenate([seed, draft_next], axis=1).reshape(-1)
             draft_token = jax.sharding.reshard(draft_token, token_sharding)
+            verify_positions = forward_batch.positions.reshape((-1, block_size))[
+                :, :verify_block_size
+            ].reshape(-1)
+            verify_cache_loc = selected_cache_loc.reshape((-1, block_size))[
+                :, :verify_block_size
+            ].reshape(-1)
+            verify_positions = jax.sharding.reshard(verify_positions, token_sharding)
+            verify_cache_loc = jax.sharding.reshard(verify_cache_loc, token_sharding)
             return (
                 pool_updates,
                 draft_token,
                 target_prefix_lens,
-                forward_batch.positions,
-                selected_cache_loc,
+                verify_positions,
+                verify_cache_loc,
             )
 
         self._jit_draft_block = _partial(
@@ -839,6 +945,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             model_def,
             model_state_def,
             block_size=block_size,
+            verify_block_size=verify_block_size,
             vocab_size=vocab_size,
         )
 
@@ -875,7 +982,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             return _call_and_replace()
 
     def _init_jit_target_verify(self):
-        """Build target model forward + DFlash greedy verification as one JIT."""
+        """Build target model forward + DFlash target-only verification as one JIT."""
         from functools import partial as _partial
 
         from flax import nnx
@@ -919,6 +1026,11 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             relay_buffers,
             relay_future_indices,
             relay_valid_mask,
+            temperatures,
+            top_ks,
+            top_ps,
+            base_rng_key,
+            rng_step,
             *,
             draft_token_num: int,
             use_relay_state: bool,
@@ -943,9 +1055,14 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 output, pool_updates, _, layers_topk_ids = model(
                     forward_batch, memory_pools, logits_metadata
                 )
-            accept_lens_out, next_token_ids_flat, new_verified_id, _ = dflash_greedy_verify(
+            rng_key = jax.random.fold_in(base_rng_key, rng_step)
+            accept_lens_out, next_token_ids_flat, new_verified_id, _ = dflash_target_only_verify(
                 draft_token,
                 output.next_token_logits,
+                temperatures,
+                top_ks,
+                top_ps,
+                rng_key,
                 draft_token_num=draft_token_num,
             )
             accept_lens_out = jax.sharding.reshard(accept_lens_out, token_sharding)
@@ -996,6 +1113,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             target_worker.prepare_lora_batch(model_worker_batch)
 
         def _call_and_replace():
+            runner._sampler_step += 1
             with jtu.count_pjit_cpp_cache_miss() as count:
                 (
                     output,
@@ -1017,6 +1135,11 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                     self.spec_relay_buffers if plan.update_relay else None,
                     plan.relay_future_indices,
                     plan.relay_valid_mask,
+                    plan.temperatures,
+                    plan.top_ks,
+                    plan.top_ps,
+                    runner._sampler_base_rng,
+                    runner._sampler_step,
                     use_relay_state=plan.update_relay,
                     update_relay=plan.update_relay,
                     dp_size=plan.model_worker_batch.dp_size,
@@ -1071,7 +1194,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         from sgl_jax.srt.mem_cache.memory_pool import _set_fused_kv_buffer, merge_kv
 
         runner = self.draft_model_runner
-        pool = runner.token_to_kv_pool
+        pool, _ = self._get_draft_materialize_pool()
         page_size = pool.page_size
         kv_part = pool.kv_partition_axis
         data_part = pool.attention_data_partition_axis
@@ -1133,6 +1256,22 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
 
         self._jit_materialize_write = _partial(draft_extend, model_def, model_state_def)
 
+    def _get_draft_materialize_pool(self):
+        """Return the physical KV pool used by the DFlash draft layers."""
+        pool = self.draft_model_runner.token_to_kv_pool
+        if not hasattr(pool, "swa_kv_pool"):
+            return pool, None
+
+        if pool.swa_layer_nums == self.draft_layers and pool.full_layer_nums == 0:
+            first_layer_id = min(pool.layers_mapping)
+            return pool.swa_kv_pool, first_layer_id
+        if pool.full_layer_nums == self.draft_layers and pool.swa_layer_nums == 0:
+            return pool.full_kv_pool, None
+        raise NotImplementedError(
+            "DFLASH draft KV materialization does not support mixed sliding-window "
+            "and full-attention draft layers."
+        )
+
     def _append_target_hidden_to_draft_kv(
         self,
         model_worker_batch: ModelWorkerBatch,
@@ -1146,6 +1285,19 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             model_worker_batch,
             target_hidden,
         )
+
+        pool, remap_layer_id = self._get_draft_materialize_pool()
+        valid_cache_loc = cache_loc[cache_loc >= 0]
+        cache_capacity = int(pool.kv_buffer[0].shape[0]) * int(pool.page_size)
+        if (
+            remap_layer_id is None
+            and valid_cache_loc.size
+            and int(valid_cache_loc.max()) >= cache_capacity
+        ):
+            raise ValueError(
+                "DFLASH prefill cache location exceeds the draft KV pool: "
+                f"max={int(valid_cache_loc.max())}, capacity={cache_capacity}."
+            )
 
         self._run_jit_draft_extend(target_hidden, positions, cache_loc)
 
@@ -1164,7 +1316,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         accept_lens=None,
         active_mask=None,
     ):
-        pool = self.draft_model_runner.token_to_kv_pool
+        logical_pool = self.draft_model_runner.token_to_kv_pool
+        pool, remap_layer_id = self._get_draft_materialize_pool()
         if accept_lens is None:
             # Prefill metadata is already on the host. Build its fixed masks with
             # NumPy so they become inputs to jit_draft_extend instead of separate
@@ -1174,6 +1327,11 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             if active_mask is None:
                 active_mask = cache_loc >= 0
         cache_loc = jnp.asarray(cache_loc)
+        if remap_layer_id is not None:
+            valid_cache_loc = cache_loc >= 0
+            safe_cache_loc = jnp.where(valid_cache_loc, cache_loc, 0)
+            cache_loc = logical_pool.remap_cache_loc(safe_cache_loc, remap_layer_id)
+            cache_loc = jnp.where(valid_cache_loc, cache_loc, -1)
         accept_lens = jnp.asarray(accept_lens)
         active_mask = jnp.asarray(active_mask)
         if cache_loc.shape[0] % accept_lens.shape[0] != 0:
@@ -1360,7 +1518,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
 
         req_to_token = self.req_to_token_pool.req_to_token
         if allocated_lens is None:
-            allocated_lens = prefix_lens + self.block_size
+            allocated_lens = prefix_lens + getattr(self, "draft_block_size", self.block_size)
         allocated_lens = np.asarray(allocated_lens, dtype=np.int32)
         if allocated_lens.shape != (bs,):
             raise ValueError(
@@ -1424,6 +1582,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         self,
         model_worker_batch: ModelWorkerBatch,
         bs: int,
+        *,
+        block_size: int | None = None,
     ) -> DFlashVerifyBucketTemplate:
         from jax.sharding import NamedSharding
         from jax.sharding import PartitionSpec as P
@@ -1435,14 +1595,15 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             selector = np.arange(int(getattr(model_worker_batch, "real_bs", bs)), dtype=np.int32)
         else:
             selector = np.asarray(selector, dtype=np.int32)
-        key = (dp_size, per_dp_bs, tuple(selector.tolist()), self.block_size)
+        block_size = self.block_size if block_size is None else int(block_size)
+        key = (dp_size, per_dp_bs, tuple(selector.tolist()), block_size)
         cached = self._verify_bucket_templates.get(key)
         if cached is not None:
             return cached
 
         active_host = np.zeros(bs, dtype=np.bool_)
         active_host[selector] = True
-        extend_seq_lens = active_host.astype(np.int32) * self.block_size
+        extend_seq_lens = active_host.astype(np.int32) * block_size
         cu_q_lens = np.zeros((dp_size, per_dp_bs + 1), dtype=np.int32)
         cu_q_lens[:, 1:] = np.cumsum(
             extend_seq_lens.reshape(dp_size, per_dp_bs),
@@ -1476,6 +1637,21 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             mask[start:end] = True
         return mask
 
+    @staticmethod
+    def _current_relay_indices(
+        model_worker_batch,
+        active_mask: np.ndarray,
+        total_bs: int,
+    ) -> np.ndarray:
+        """Use the current batch order when reading request-indexed relay state."""
+        req_pool_indices = np.asarray(model_worker_batch.req_pool_indices, dtype=np.int32)
+        if req_pool_indices.shape != (total_bs,):
+            raise ValueError(
+                "DFLASH relay indices must match the padded decode batch: "
+                f"shape={req_pool_indices.shape}, bs={total_bs}."
+            )
+        return np.where(active_mask, req_pool_indices, 0)
+
     def _can_use_fused_spec_prefill(self, model_worker_batch: ModelWorkerBatch) -> bool:
         if (
             self.server_args.disable_overlap_schedule
@@ -1488,8 +1664,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             getattr(penalizer, "is_required", False)
         )
         return (
-            bool(getattr(sampling_info, "is_all_greedy", False))
-            and not has_penalty
+            not has_penalty
             and getattr(sampling_info, "vocab_mask", None) is None
             and not getattr(model_worker_batch, "return_logprob", False)
             and not getattr(model_worker_batch, "return_output_logprob_only", False)
@@ -1582,21 +1757,27 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         )
 
     def _precompile_dflash_variant(self, bs: int) -> None:
-        row_width = max(self.block_size, 16 * self.page_size)
+        row_width = max(self.draft_block_size, 16 * self.page_size)
         page_indices = np.zeros(self._page_indices_capacity(bs), dtype=np.int32)
-        draft_batch = self._make_verify_dummy_batch(bs, row_width, is_draft=True)
+        draft_batch = self._make_verify_dummy_batch(
+            bs, row_width, is_draft=True, block_size=self.draft_block_size
+        )
         use_relay_state = not self.server_args.disable_overlap_schedule
         if use_relay_state:
             draft_batch.out_cache_loc = np.arange(
                 1,
-                bs * 2 * self.block_size + 1,
+                bs * 2 * self.draft_block_size + 1,
                 dtype=np.int32,
             )
         else:
-            draft_batch.out_cache_loc = self._verify_write_cache_loc(draft_batch)
+            draft_batch.out_cache_loc = self._verify_write_cache_loc(
+                draft_batch, self.draft_block_size
+            )
         forward_batch = ForwardBatch.init_new(draft_batch, self.draft_model_runner)
         forward_batch.forward_mode = ForwardMode.TARGET_VERIFY
-        template = self._get_verify_bucket_template(draft_batch, bs)
+        template = self._get_verify_bucket_template(
+            draft_batch, bs, block_size=self.draft_block_size
+        )
         draft_metadata = self.draft_model_runner.attn_backend.get_eagle_forward_metadata(
             draft_batch,
             page_indices=page_indices,
@@ -1619,7 +1800,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 int(draft_batch.dp_size),
             )
             relay_future_indices = jax.device_put(future_indices, data_sharding)
-            allocated_lens = prefix_lens + 2 * self.block_size
+            allocated_lens = prefix_lens + 2 * self.draft_block_size
             self.init_spec_relay_buffers()
             self._update_relay(
                 jnp.ones((bs,), dtype=jnp.int32),
@@ -1630,10 +1811,11 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             )
         else:
             relay_future_indices = jax.device_put(np.zeros(bs, dtype=np.int32), data_sharding)
-            allocated_lens = prefix_lens + self.block_size
+            allocated_lens = prefix_lens + self.draft_block_size
         draft_plan = DraftForwardPlan(
             forward_batch=forward_batch,
             forward_metadata=draft_metadata,
+            page_indices=page_indices,
             seq_lens=prefix_lens + 1,
             target_prefix_lens=prefix_lens,
             positions_host=np.asarray(draft_batch.positions, dtype=np.int32),
@@ -1654,12 +1836,21 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
 
         # Match the serving dependency and sharding exactly: target verify
         # consumes the P("data") proposal produced by jit_draft.
-        target_batch = self._make_verify_dummy_batch(bs, row_width)
+        target_batch = self._make_verify_dummy_batch(bs, row_width, block_size=self.block_size)
         verify_input = DFlashVerifyInput(
             draft_token=draft_token,
             draft_token_num=self.block_size,
         )
         target_batch.spec_info_padded = verify_input
+        target_template = self._get_verify_bucket_template(target_batch, bs)
+        target_metadata = self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
+            target_batch,
+            page_indices=page_indices,
+            page_indices_capacity=self._page_indices_capacity(bs),
+            extend_seq_lens=target_template.extend_seq_lens,
+            cu_q_lens=target_template.cu_q_lens,
+            distribution=target_template.distribution,
+        )
         target_forward_batch = copy.copy(forward_batch)
         target_forward_batch.input_ids = draft_token
         target_forward_batch.positions = resolved_positions
@@ -1672,20 +1863,32 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         target_plan = TargetVerifyPlan(
             model_worker_batch=target_batch,
             forward_batch=target_forward_batch,
-            forward_metadata=draft_metadata,
+            forward_metadata=target_metadata,
             logits_metadata=LogitsMetadata.from_model_worker_batch(target_batch, self.mesh),
             seq_lens=np.asarray(target_batch.seq_lens, dtype=np.int32) + 1,
             target_prefix_lens=np.asarray(target_batch.seq_lens, dtype=np.int32),
             resolved_target_prefix_lens=resolved_prefix_lens,
             draft_extend_positions=resolved_positions,
             draft_extend_cache_loc=resolved_cache_loc,
-            active_mask=template.active_mask,
+            active_mask=target_template.active_mask,
             allocated_lens=draft_plan.allocated_lens,
             relay_future_indices=draft_plan.relay_future_indices,
             relay_valid_mask=draft_plan.relay_valid_mask,
+            temperatures=jax.device_put(
+                np.asarray(target_batch.sampling_info.temperatures, dtype=np.float32),
+                data_sharding,
+            ),
+            top_ks=jax.device_put(
+                np.asarray(target_batch.sampling_info.top_ks, dtype=np.int32),
+                data_sharding,
+            ),
+            top_ps=jax.device_put(
+                np.asarray(target_batch.sampling_info.top_ps, dtype=np.float32),
+                data_sharding,
+            ),
             update_relay=use_relay_state,
         )
-        self.target_worker.model_runner.attn_backend.forward_metadata = draft_metadata
+        self.target_worker.model_runner.attn_backend.forward_metadata = target_metadata
         logits_output, _, accept_lens, *_ = self._run_jit_target_verify(target_plan)
         self._run_jit_draft_extend(
             logits_output.hidden_states,
@@ -1695,9 +1898,12 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             active_mask=target_plan.active_mask,
         )
 
-    def _verify_write_cache_loc(self, batch: ModelWorkerBatch) -> np.ndarray:
+    def _verify_write_cache_loc(
+        self, batch: ModelWorkerBatch, block_size: int | None = None
+    ) -> np.ndarray:
         dp_size = int(batch.dp_size)
-        per_dp_tokens = int(batch.per_dp_bs_size) * self.block_size
+        block_size = self.block_size if block_size is None else int(block_size)
+        per_dp_tokens = int(batch.per_dp_bs_size) * block_size
         out_cache_loc = np.asarray(batch.out_cache_loc, dtype=np.int32)
         if out_cache_loc.shape[0] % dp_size != 0:
             raise ValueError(
@@ -1713,9 +1919,13 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         return out_cache_loc.reshape(dp_size, per_dp_ocl)[:, :per_dp_tokens].reshape(-1)
 
     def _make_verify_dummy_batch(
-        self, bs: int, row_width: int, is_draft: bool = False
+        self,
+        bs: int,
+        row_width: int,
+        is_draft: bool = False,
+        block_size: int | None = None,
     ) -> ModelWorkerBatch:
-        block_size = self.block_size
+        block_size = self.block_size if block_size is None else int(block_size)
         num_tokens = bs * block_size
         dp_size = int(self._target_compilation_manager.dp_size)
         if bs % dp_size != 0:

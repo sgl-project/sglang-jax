@@ -187,8 +187,8 @@ def validate_dflash_request(req) -> str | None:
         or getattr(sp, "structural_tag", None) is not None
     ):
         return "DFLASH speculative decoding does not support grammar-constrained decoding yet."
-    if sp.top_k != 1:
-        return "DFLASH speculative decoding currently only supports greedy sampling."
+    if getattr(sp, "min_p", 0.0) != 0.0:
+        return "DFLASH speculative decoding does not support min-p sampling yet."
     if (
         sp.frequency_penalty != 0.0
         or sp.presence_penalty != 0.0
@@ -2688,7 +2688,11 @@ class Scheduler(
                 precompile_cache_loc_paddings,
                 self.page_size,
                 self.server_args.enable_static_lora,
-                draft_token_num=self.draft_worker.speculative_num_draft_tokens,
+                draft_token_num=getattr(
+                    self.draft_worker,
+                    "speculative_num_kv_slots",
+                    self.draft_worker.speculative_num_draft_tokens,
+                ),
             )
 
         use_spec_decode_overlap = can_use_spec_decode_overlap(
