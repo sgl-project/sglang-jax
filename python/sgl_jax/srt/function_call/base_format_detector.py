@@ -306,6 +306,10 @@ class BaseFormatDetector(ABC):
         """Return True if this detector supports structural tag format."""
         return True
 
+    def parses_required_natively(self) -> bool:
+        """Return True when required tool calls use the model's native format."""
+        return False
+
     @abstractmethod
     def structure_info(self) -> _GetInfoFunc:
         """

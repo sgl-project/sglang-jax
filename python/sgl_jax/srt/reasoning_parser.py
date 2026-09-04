@@ -1,3 +1,6 @@
+import re
+
+
 class StreamingParseResult:
     """Result of streaming incremental parsing."""
 
@@ -312,6 +315,78 @@ class Ling3Detector(Glm45Detector):
         return result
 
 
+class MuseGlimmerDetector(BaseReasoningFormatDetector):
+    """Split Muse Glimmer Harmony channels into reasoning and visible content."""
+
+    _header_re = re.compile(
+        r"(?:<\|start\|>assistant\s*)?\s*to=(?P<recipient>[^\s<]+)<\|message\|>"
+    )
+    _end_re = re.compile(r"<\|eom\|>|<\|eot\|>")
+    _markers = ("<|eom|>", "<|eot|>", "<|start|>", "<|message|>")
+
+    def __init__(self, stream_reasoning: bool = True):
+        super().__init__("to=self<|message|>", "<|eom|>", stream_reasoning=stream_reasoning)
+        self._full_text = ""
+        self._emitted_reasoning = 0
+        self._emitted_normal = 0
+
+    @classmethod
+    def _safe_open_body(cls, body: str) -> str:
+        for overlap in range(min(len(body), max(map(len, cls._markers)) - 1), 0, -1):
+            suffix = body[-overlap:]
+            if any(marker.startswith(suffix) for marker in cls._markers):
+                return body[:-overlap]
+        return body
+
+    @classmethod
+    def _classify(cls, text: str) -> tuple[str, str]:
+        reasoning = []
+        normal = []
+        matches = list(cls._header_re.finditer(text))
+        if not matches:
+            stripped = text.lstrip()
+            if (
+                stripped in {"t", "to", "to="}
+                or stripped.startswith("to=")
+                or stripped.startswith("<|start|")
+            ):
+                return "", ""
+            return "", text
+        for index, match in enumerate(matches):
+            body_start = match.end()
+            next_header = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+            end_match = cls._end_re.search(text, body_start, next_header)
+            closed = end_match is not None
+            body_end = end_match.start() if end_match is not None else next_header
+            body = text[body_start:body_end]
+            if not closed and index == len(matches) - 1:
+                body = cls._safe_open_body(body)
+            recipient = match.group("recipient")
+            if recipient == "self":
+                reasoning.append(body)
+            elif recipient == "user":
+                normal.append(body)
+            else:
+                normal.append(body)
+        return "".join(reasoning), "".join(normal)
+
+    def detect_and_parse(self, text: str) -> StreamingParseResult:
+        reasoning, normal = self._classify(text)
+        return StreamingParseResult(normal_text=normal, reasoning_text=reasoning)
+
+    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        self._full_text += new_text
+        reasoning, normal = self._classify(self._full_text)
+        reasoning_delta = reasoning[self._emitted_reasoning :]
+        normal_delta = normal[self._emitted_normal :]
+        self._emitted_reasoning = len(reasoning)
+        self._emitted_normal = len(normal)
+        return StreamingParseResult(
+            normal_text=normal_delta,
+            reasoning_text=reasoning_delta,
+        )
+
+
 class ReasoningParser:
     """
     Parser that handles both streaming and non-streaming scenarios for extracting
@@ -331,6 +406,7 @@ class ReasoningParser:
         "glm45": Glm45Detector,
         "gemma4": Gemma4Detector,
         "ling3": Ling3Detector,
+        "muse_glimmer": MuseGlimmerDetector,
     }
 
     def __init__(self, model_type: str | None = None, stream_reasoning: bool = True):

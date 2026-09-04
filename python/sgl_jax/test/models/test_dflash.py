@@ -54,7 +54,9 @@ def test_dflash_weight_mapping_covers_tiny_config():
 
     expected = {
         "fc.weight",
+        "encoder.fc.weight",
         "hidden_norm.weight",
+        "encoder.output_norm_enc.weight",
         "norm.weight",
     }
     for layer_idx in range(2):
@@ -124,3 +126,13 @@ def test_qwen3_dflash_capture_sets_explicit_layers():
     model.set_dflash_layers_to_capture([1, 3])
     assert model.capture_aux_hidden_states is True
     assert model.model.layers_to_capture == [2, 4]
+
+
+def test_muse_assistant_config_flattens_rope_theta():
+    from sgl_jax.srt.configs.muse_glimmer import MuseGlimmerAssistantConfig
+
+    config = MuseGlimmerAssistantConfig(
+        rope_parameters={"rope_type": "default", "rope_theta": 500000.0}
+    )
+
+    assert config.rope_theta == 500000.0

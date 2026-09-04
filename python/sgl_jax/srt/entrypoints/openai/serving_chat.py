@@ -47,6 +47,13 @@ from sgl_jax.utils import convert_json_schema_to_str
 logger = logging.getLogger(__name__)
 
 
+def normalize_message_reasoning(message: dict[str, Any]) -> dict[str, Any]:
+    """Expose vLLM's ``reasoning`` request field to HF chat templates."""
+    if message.get("reasoning_content") is None and message.get("reasoning") is not None:
+        message["reasoning_content"] = message["reasoning"]
+    return message
+
+
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
@@ -171,7 +178,7 @@ class OpenAIServingChat(OpenAIServingBase):
         for message in request.messages:
             if message.content is None:
                 message.content = ""
-            msg_dict = message.model_dump()
+            msg_dict = normalize_message_reasoning(message.model_dump())
 
             # Process content based on detected template format
             processed_msg = process_content_for_template_format(
@@ -366,7 +373,7 @@ Assistant: {% endif %}"""
         """Build sampling parameters for the request"""
 
         skip_special = request.skip_special_tokens
-        if self.tokenizer_manager.server_args.reasoning_parser == "gemma4":
+        if self.tokenizer_manager.server_args.reasoning_parser in ("gemma4", "muse_glimmer"):
             skip_special = False
 
         sampling_params = {
@@ -956,15 +963,25 @@ Assistant: {% endif %}"""
                 if isinstance(call_item.parameters, str):
                     latest_delta_len = len(call_item.parameters)
 
-                expected_call = json.dumps(
-                    parser.detector.prev_tool_call_arr[index].get("arguments", {}),
-                    ensure_ascii=False,
-                )
-                actual_call = parser.detector.streamed_args_for_tool[index]
-                if latest_delta_len > 0:
-                    actual_call = actual_call[:-latest_delta_len]
-                remaining_call = expected_call.replace(actual_call, "", 1)
-                call_item.parameters = remaining_call
+                tool_index = call_item.tool_index
+                if (
+                    tool_index >= 0
+                    and tool_index < len(parser.detector.prev_tool_call_arr)
+                    and tool_index < len(parser.detector.streamed_args_for_tool)
+                ):
+                    expected_args = parser.detector.prev_tool_call_arr[tool_index].get(
+                        "arguments", {}
+                    )
+                    expected_call = (
+                        expected_args
+                        if isinstance(expected_args, str)
+                        else json.dumps(expected_args, ensure_ascii=False)
+                    )
+                    actual_call = parser.detector.streamed_args_for_tool[tool_index]
+                    if latest_delta_len > 0:
+                        actual_call = actual_call[:-latest_delta_len]
+                    if expected_call.startswith(actual_call):
+                        call_item.parameters = expected_call[len(actual_call) :]
                 finish_reason_type = "tool_calls"
 
             tool_call = ToolCall(
