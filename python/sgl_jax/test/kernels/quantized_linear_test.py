@@ -18,6 +18,7 @@ from sgl_jax.srt.layers.linear import LinearBase, QuantizedLinear
 from sgl_jax.srt.utils.quantization.quantization_utils import (
     apply_linear_quantization,
     quantize_tensor,
+    quantize_tensor_simple,
 )
 
 blockwise_quant_util = importlib.import_module(
@@ -531,6 +532,62 @@ def test_ignored_layers_exact_match_does_not_overmatch():
     apply_linear_quantization(model_config, model, is_static_input=False)
     assert isinstance(model.self_attn.q_proj, QuantizedLinear)
     assert isinstance(model.self_attn.o_proj, QuantizedLinear)
+
+
+def _max_abs_err_in_lsb(original, dequantized, scale):
+    """Per-element quantization error, expressed in units of one scale step."""
+    return float(jnp.max(jnp.abs(dequantized - original) / scale))
+
+
+def test_quantize_tensor_int8_rounds_to_nearest():
+    """Integer quantization must round, not truncate: error stays within 0.5 LSB."""
+    w = jax.random.normal(jax.random.PRNGKey(0), (512, 1024), jnp.float32)
+
+    w_q, scale = quantize_tensor(dtype=jnp.int8, tensor=w, axis=1)
+    dequantized = w_q.astype(jnp.float32) * scale[:, None]
+
+    assert _max_abs_err_in_lsb(w, dequantized, scale[:, None]) <= 0.5 + 1e-4
+    # Truncation biases every code toward zero; rounding leaves no such bias.
+    shrinkage = float((jnp.abs(dequantized) - jnp.abs(w)).mean())
+    assert abs(shrinkage) < 1e-4, f"systematic magnitude bias: {shrinkage:.3e}"
+
+
+def test_quantize_tensor_simple_int8_rounds_to_nearest():
+    """Same requirement on the per-token activation quantizer."""
+    x = jax.random.normal(jax.random.PRNGKey(1), (256, 512), jnp.float32)
+
+    x_q, scale = quantize_tensor_simple(x, jnp.int8, dim=-1)
+    dequantized = x_q.astype(jnp.float32) * scale
+
+    assert _max_abs_err_in_lsb(x, dequantized, scale) <= 0.5 + 1e-4
+    shrinkage = float((jnp.abs(dequantized) - jnp.abs(x)).mean())
+    assert abs(shrinkage) < 1e-4, f"systematic magnitude bias: {shrinkage:.3e}"
+
+
+def test_int8_quantizers_agree_with_kernel_quantizer():
+    """quantize_tensor/_simple must produce the same codes as util.quantize_block."""
+    x = jax.random.normal(jax.random.PRNGKey(2), (256, 512), jnp.float32)
+
+    expected, _ = blockwise_quant_util.quantize_block(x, axis=-1, target_dtype=jnp.int8)
+
+    w_q, _ = quantize_tensor(dtype=jnp.int8, tensor=x, axis=-1)
+    np.testing.assert_array_equal(np.asarray(w_q), np.asarray(expected))
+
+    x_q, _ = quantize_tensor_simple(x, jnp.int8, dim=-1)
+    np.testing.assert_array_equal(np.asarray(x_q), np.asarray(expected))
+
+
+@pytest.mark.parametrize("dtype", [jnp.float8_e4m3fn, jnp.float8_e5m2])
+def test_float8_quantization_is_not_rounded_twice(dtype):
+    """Float targets round in the cast; the integer guard must leave them alone."""
+    x = jax.random.normal(jax.random.PRNGKey(3), (128, 256), jnp.float32)
+
+    expected, _ = blockwise_quant_util.quantize_block(x, axis=-1, target_dtype=dtype)
+    x_q, _ = quantize_tensor(dtype=dtype, tensor=x, axis=-1)
+
+    np.testing.assert_array_equal(
+        np.asarray(x_q).view(np.uint8), np.asarray(expected).view(np.uint8)
+    )
 
 
 if __name__ == "__main__":
