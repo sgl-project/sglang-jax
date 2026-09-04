@@ -359,6 +359,8 @@ class BailingMoeV3DecoderLayer(nnx.Module):
         self.mesh = mesh
         self.hidden_size = config.hidden_size
         self.is_kda = config.is_kda_layer(layer_idx)
+        self.moe_dp_size = getattr(config, "moe_dp_size", 1)
+        self.replicate_moe = self.moe_dp_size > 1
 
         if self.is_kda:
             self.self_attn = BailingKDAAttention(
@@ -426,6 +428,7 @@ class BailingMoeV3DecoderLayer(nnx.Module):
                 layer_id=layer_idx,
                 ep_size=getattr(config, "ep_size", 1),
                 quantization_config=getattr(config, "quantization_config", None),
+                moe_dp_size=self.moe_dp_size,
             )
             if config.num_shared_experts > 0:
                 self.shared_experts = BailingMoeV3MLP(
@@ -493,7 +496,7 @@ class BailingMoeV3DecoderLayer(nnx.Module):
             topk_weights, topk_ids = self.topk(
                 router_logits,
                 correction_bias,
-                dispatch_info=dispatch_info,
+                dispatch_info=None if self.replicate_moe else dispatch_info,
                 routing_sharding=NamedSharding(self.mesh, P("data", None)),
             )
 
@@ -612,6 +615,10 @@ class BailingMoeV3ForCausalLM(nnx.Module):
         self.config = config
         self.mesh = mesh
         self.dtype = dtype
+        self.moe_dp_size = getattr(config, "moe_dp_size", 1)
+        self.replicate_moe = self.moe_dp_size > 1
+        if self.replicate_moe:
+            logger.info("Enabling replicated MoE with moe_dp_size=%d", self.moe_dp_size)
         self.model = BailingMoeV3Model(config=config, mesh=mesh, dtype=dtype)
 
         if not getattr(config, "tie_word_embeddings", False):
@@ -828,7 +835,7 @@ class BailingMoeV3ForCausalLM(nnx.Module):
                 get_global_expert_location_metadata,
             )
 
-            metadata = get_global_expert_location_metadata()
+            metadata = None if self.replicate_moe else get_global_expert_location_metadata()
             phy_to_log = None
             if metadata is not None:
                 physical_to_logical_map = np.array(jax.device_get(metadata.physical_to_logical_map))
@@ -839,11 +846,16 @@ class BailingMoeV3ForCausalLM(nnx.Module):
                 ("up_proj", "wi_1"),
                 ("down_proj", "wo"),
             ):
-                sharding = (
-                    ("expert", "tensor", None)
-                    if target_name == "wo"
-                    else ("expert", None, "tensor")
-                )
+                if self.replicate_moe:
+                    sharding = (
+                        (None, "tensor", None) if target_name == "wo" else (None, None, "tensor")
+                    )
+                else:
+                    sharding = (
+                        ("expert", "tensor", None)
+                        if target_name == "wo"
+                        else ("expert", None, "tensor")
+                    )
                 target_path_base = f"{target_prefix}.experts.{target_name}"
                 expert_keys = [
                     f"{prefix}.mlp.experts.{i}.{source_name}.weight"

@@ -150,6 +150,7 @@ class ServerArgs:
 
     # Data parallel
     dp_size: int = 1
+    moe_dp_size: int = 1
     dp_schedule_policy: str | None = None
 
     # Logging
@@ -1290,6 +1291,18 @@ class ServerArgs:
             help="The data parallelism size.",
         )
         parser.add_argument(
+            "--moe-data-parallel-size",
+            "--moe-dp-size",
+            dest="moe_dp_size",
+            type=int,
+            default=ServerArgs.moe_dp_size,
+            help=(
+                "The MoE data parallelism size. The default (1) preserves the "
+                "existing EP/TP layout. Replicated MoE currently requires this "
+                "to equal --dp-size with --ep-size 1."
+            ),
+        )
+        parser.add_argument(
             "--dp-schedule-policy",
             type=str,
             choices=["round_robin", "min_running_queue", "cache_aware", "shape_aware"],
@@ -1944,6 +1957,27 @@ class ServerArgs:
 
     def check_server_args(self):
         assert (self.tp_size) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+
+        if self.moe_dp_size < 1:
+            raise ValueError("--moe-dp-size must be at least 1")
+
+        # moe_dp_size=1 is the compatibility path and deliberately keeps all
+        # existing recipes under their previous EP/TP validation rules.
+        if self.moe_dp_size > 1:
+            if self.moe_dp_size != self.dp_size:
+                raise ValueError(
+                    "replicated MoE currently requires --moe-dp-size to equal --dp-size"
+                )
+            if self.tp_size % self.dp_size != 0:
+                raise ValueError("replicated MoE requires --tp-size to be divisible by --dp-size")
+            if self.ep_size != 1:
+                raise ValueError("replicated MoE currently requires --ep-size 1")
+            if self.moe_backend != "epmoe":
+                raise ValueError("replicated MoE currently requires --moe-backend epmoe")
+            if self.ep_num_redundant_experts != 0:
+                raise ValueError("replicated MoE does not support --ep-num-redundant-experts")
+            if self.ep_dispatch_algorithm is not None:
+                raise ValueError("replicated MoE does not support --ep-dispatch-algorithm")
 
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).

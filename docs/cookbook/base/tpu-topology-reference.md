@@ -48,7 +48,7 @@ v6e-N    →  --tp-size = N
 v7x-N    →  --tp-size = N * 2      (N is chip count)
 ```
 
-For MoE models also set `--ep-size = --tp-size` to put one expert shard per device, and split attention with `--dp-size` (attention-TP becomes `tp_size / dp_size`).
+For the standard MoE layout, also set `--ep-size = --tp-size` to put one expert shard per device, and split attention with `--dp-size` (attention-TP becomes `tp_size / dp_size`). Replicated MoE is configured independently with `--moe-dp-size = --dp-size` and currently requires `--ep-size 1`; omitting `--moe-dp-size` preserves the standard layout.
 
 ## Per-chip HBM accounting
 

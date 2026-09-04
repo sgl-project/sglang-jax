@@ -136,6 +136,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             self.attention_tp_size
         )
         self.ep_size = server_args.ep_size
+        self.moe_dp_size = server_args.moe_dp_size
         self.server_args = server_args
         self.embedding_pool: EmbeddingPool | None = None
         self.is_generation = model_config.is_generation
@@ -571,6 +572,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.model_config.configure_for_tensor_parallel(self.attention_tp_size)
         self.model_config.log_kv_heads_info(self.attention_tp_size)
         self.model_config.hf_config.ep_size = self.ep_size
+        self.model_config.hf_config.moe_dp_size = self.moe_dp_size
         self.model_config.hf_config.ep_num_redundant_experts = (
             self.server_args.ep_num_redundant_experts
         )
