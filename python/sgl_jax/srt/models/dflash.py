@@ -229,6 +229,7 @@ class DFlashDecoderLayer(nnx.Module):
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
+        self.layer_id = layer_id
         hidden_size = int(config.hidden_size)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
         self.input_layernorm = RMSNorm(
@@ -411,7 +412,17 @@ class DFlashDraftModel(nnx.Module):
                 sharding=(None, None),
                 transpose=True,
             ),
+            "encoder.fc.weight": WeightMapping(
+                target_path="fc.weight",
+                sharding=(None, None),
+                transpose=True,
+            ),
             "hidden_norm.weight": WeightMapping(
+                target_path="hidden_norm.scale",
+                sharding=(None,),
+                transpose=False,
+            ),
+            "encoder.output_norm_enc.weight": WeightMapping(
                 target_path="hidden_norm.scale",
                 sharding=(None,),
                 transpose=False,
