@@ -151,9 +151,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
         self.forward_pass_id = 0
 
-        # For sampling
-        self.use_sort_for_toppk_minp = server_args.use_sort_for_toppk_minp
-
         self.max_padding = max_padding
 
         # Global vars
@@ -362,14 +359,13 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
         @partial(
             jax.jit,
-            static_argnames=["sampler_state_def", "use_sort_for_toppk_minp"],
+            static_argnames=["sampler_state_def"],
             compiler_options=sampler_compiler_options,
         )
         def jitted_sampler(
             sampler_def,
             sampler_state_def,
             sampler_state_leaves,
-            use_sort_for_toppk_minp,
             rng_step,
             *args,
         ):
@@ -377,7 +373,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             sampler = nnx.merge(sampler_def, model_state)
             return sampler(
                 *args,
-                use_sort_for_toppk_minp=use_sort_for_toppk_minp,
                 rng_override=base_rng_key,
                 rng_step=rng_step,
             )
@@ -433,7 +428,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                     sampler_def,
                     sampler_state_def,
                     sampler_state_leaves,
-                    self.use_sort_for_toppk_minp,
                 ),
                 stable_flat_args=(sampler_def, sampler_state_leaves),
                 name="sampler",
@@ -459,7 +453,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 sampler_def,
                 sampler_state_def,
                 sampler_state_leaves,
-                self.use_sort_for_toppk_minp,
             )
 
         self.jitted_compute_logprobs = partial(jitted_compute_logprobs, self.mesh)
@@ -470,7 +463,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         @partial(
             jax.jit,
             donate_argnames=["memory_pools"],
-            static_argnames=["model_state_def", "sampler_state_def", "use_sort_for_toppk_minp"],
+            static_argnames=["model_state_def", "sampler_state_def"],
             compiler_options=jit_compiler_options,
         )
         def jitted_run_and_sample(
@@ -483,7 +476,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             sampler_def,
             sampler_state_def,
             sampler_state_leaves,
-            use_sort_for_toppk_minp,
             rng_step,
             sampling_metadata,
             future_token_ids_map,
@@ -514,7 +506,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             next_ids, token_logprobs, _new_output = sampler(
                 output,
                 sampling_metadata,
-                use_sort_for_toppk_minp=use_sort_for_toppk_minp,
                 rng_override=base_rng_key,
                 rng_step=rng_step,
             )
@@ -551,7 +542,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 sampler_def,
                 sampler_state_def,
                 sampler_state_leaves,
-                self.use_sort_for_toppk_minp,
                 self._sampler_step,
                 sampling_metadata,
                 future_map,
