@@ -10,6 +10,9 @@ from sgl_jax.srt.utils.jax_utils import get_device_name
 # Values are (tile_m, tile_k, tile_n).
 TUNED_TILE_SIZES_GMM_V2 = {
     "TPU v7": {
+        # Ling-3.0-tiny replicated EPMoE, decode BS=1 hot wi shape.
+        # Measured kernel latency: 0.555ms -> 0.382ms (31.1% lower).
+        ("bfloat16", "bfloat16", 128, 32, 1536, 512): (32, 768, 512),
         # Ling-3.0-tiny replicated EPMoE, 2K balanced prefill hot shapes.
         ("bfloat16", "bfloat16", 128, 2048, 1536, 512): (32, 1536, 512),
         ("bfloat16", "bfloat16", 128, 2048, 512, 1536): (32, 512, 1536),

@@ -959,9 +959,9 @@ class Scheduler(
         """Route ``req`` by the configured cache policy with shape-aware fallback.
 
         ``cache_aware`` keeps its soft affinity/load tradeoff;
-        ``force_cache_aware`` always prefers the longest eligible cache hit.
-        Both use shape-aware selection on a full miss and return None if all DP
-        ranks are full.
+        ``force_cache_aware`` always prefers the globally longest cache hit and
+        defers if all of its holders are temporarily full. Both use shape-aware
+        selection on a full miss and return None if all DP ranks are full.
         """
         if self.dp_size == 1:
             return 0
@@ -976,7 +976,10 @@ class Scheduler(
         matches: dict[int, int] = {}
         prompt_len = len(token_ids) if token_ids else 0
         if token_ids:
-            for dp_rank in eligible:
+            probe_ranks = (
+                range(self.dp_size) if self.dp_schedule_policy == "force_cache_aware" else eligible
+            )
+            for dp_rank in probe_ranks:
                 matches[dp_rank] = self._cached_prefix_len(token_ids, extra_key, dp_rank)
 
         running_input, running_output = self._get_dp_io_snapshot()

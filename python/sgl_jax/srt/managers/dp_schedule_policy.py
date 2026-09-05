@@ -119,17 +119,23 @@ def pick_force_cache_aware_dp(
 ) -> int | None:
     """Strict cache affinity with shape-aware miss fallback.
 
-    Prefer the longest cached prefix among eligible ranks regardless of load,
-    breaking equal-prefix ties by ``(running, tokens, rank)``. Fall back to
-    shape-aware scheduling only when no eligible rank has a reusable prefix.
+    Prefer the globally longest cached prefix regardless of load, breaking
+    equal-prefix ties by ``(running, tokens, rank)``. If every rank holding that
+    prefix is temporarily admission-ineligible, defer instead of spilling to a
+    shorter hit or miss. Fall back to shape-aware scheduling only on a complete
+    cache miss.
     """
     if not eligible:
         return None
 
     if prompt_len > 0:
-        best_match = max(matches.get(r, 0) for r in eligible)
+        # ``matches`` includes admission-ineligible ranks. Preserving affinity
+        # requires comparing eligible ranks against the global best match.
+        best_match = max(matches.values(), default=0)
         if best_match > 0:
             best_holders = [r for r in eligible if matches.get(r, 0) == best_match]
+            if not best_holders:
+                return None
             return min(best_holders, key=lambda r: (counts[r], token_counts[r], r))
 
     return pick_shape_aware_dp(eligible, input_counts, output_counts, item_input, item_output)
