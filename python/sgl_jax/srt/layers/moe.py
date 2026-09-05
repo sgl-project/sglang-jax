@@ -682,6 +682,13 @@ class EPMoE(nnx.Module):
                 f"got shape {inputs.shape}"
             )
 
+        expected_indices_shape = (inputs.shape[0], self.num_experts_per_tok)
+        if top_k_indices.shape != expected_indices_shape:
+            raise ValueError(
+                "EPMoE._permute expects routing indices with shape "
+                f"{expected_indices_shape}, got shape {top_k_indices.shape}"
+            )
+
         flatten_selected_experts = jnp.ravel(top_k_indices)
         sorted_selected_experts = jnp.argsort(flatten_selected_experts, stable=True)
         # token_indices: maps each sorted position to the original token index.
@@ -699,13 +706,20 @@ class EPMoE(nnx.Module):
         )
 
     def _unpermute(self, intermediate, sorted_selected_experts, weights):
-        if weights.ndim != 2 or weights.shape[1] != self.num_experts_per_tok:
+        top_k = self.num_experts_per_tok
+        if weights.ndim != 2 or weights.shape[1] != top_k:
             raise ValueError(
                 "EPMoE._unpermute expects 2-D routing weights "
-                f"[tokens, {self.num_experts_per_tok}], got shape {weights.shape}"
+                f"[tokens, {top_k}], got shape {weights.shape}"
             )
 
-        expected_tokens = sorted_selected_experts.shape[0]
+        expected_tokens = weights.shape[0] * top_k
+        if sorted_selected_experts.ndim != 1 or sorted_selected_experts.shape[0] != expected_tokens:
+            raise ValueError(
+                "EPMoE._unpermute expects 1-D sorted routing indices with "
+                f"{expected_tokens} entries, got shape {sorted_selected_experts.shape}"
+            )
+
         actual_tokens = intermediate.shape[0]
 
         if actual_tokens != expected_tokens:
@@ -721,7 +735,6 @@ class EPMoE(nnx.Module):
             .at[sorted_selected_experts]
             .set(jnp.arange(expected_tokens, dtype=jnp.int32))
         )
-        top_k = self.num_experts_per_tok
         grouped_indices = jnp.reshape(argsort_indices, (weights.shape[0], top_k))
         weights_fp32 = weights.astype(jnp.float32)
 
