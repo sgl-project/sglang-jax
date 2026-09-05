@@ -310,7 +310,12 @@ def quantize_tensor_simple(
     scale = x_abs_max / max_val
     # Guard all-zero slices to avoid 0/0 -> NaN.
     scale_safe = scale + (scale == 0).astype(scale.dtype)
-    x_q = jnp.clip(x / scale_safe, min_val, max_val).astype(dtype)
+    x_scaled = x / scale_safe
+    if jnp.issubdtype(dtype, jnp.integer):
+        # float->int casts truncate toward zero; integer quantization needs
+        # round-to-nearest. Float targets (fp8) round in the cast itself.
+        x_scaled = jnp.round(x_scaled)
+    x_q = jnp.clip(x_scaled, min_val, max_val).astype(dtype)
     return x_q, scale.astype(out_dtype)
 
 
@@ -405,7 +410,11 @@ def quantize_tensor(
 
     # Guard all-zero blocks/tensors: scale==0 would produce 0/0 -> NaN.
     scale_safe = scale + (scale == 0).astype(scale.dtype)
-    tensor_q = jnp.clip(tensor / scale_safe, dtype_min, dtype_max)
+    tensor_scaled = tensor / scale_safe
+    if jnp.issubdtype(dtype, jnp.integer):
+        # Round to nearest before the integer cast below.
+        tensor_scaled = jnp.round(tensor_scaled)
+    tensor_q = jnp.clip(tensor_scaled, dtype_min, dtype_max)
     if block_size is not None and isinstance(original_input_sharding, NamedSharding):
         tensor_q = jax.lax.reshape(tensor_q, orig_shape, out_sharding=original_input_sharding)
     else:
