@@ -637,10 +637,16 @@ def _reshape_per_dp_rows(values, dp_size: int):
 def _per_dp_cumsum_device(lens, dp_size: int):
     per_dp_bs = lens.shape[0] // dp_size
     lens_2d = _reshape_per_dp_rows(lens, dp_size)
+    rows_sharding = jax.typeof(lens_2d).sharding
     zeros = jnp.zeros_like(lens_2d[:, :1], dtype=jnp.int32)
-    result = jnp.concatenate([zeros, jnp.cumsum(lens_2d, axis=1, dtype=jnp.int32)], axis=1).reshape(
-        (dp_size * (per_dp_bs + 1),)
-    )
+    cumsum = jnp.cumsum(lens_2d, axis=1, dtype=jnp.int32)
+    if isinstance(rows_sharding, NamedSharding) and not rows_sharding.mesh.empty:
+        # Explicit-sharding JAX requires concatenate operands to carry the same
+        # sharding. zeros_like may otherwise infer replicated sharding even
+        # though lens_2d and its cumulative sum are data-sharded.
+        zeros = jax.sharding.reshard(zeros, rows_sharding)
+        cumsum = jax.sharding.reshard(cumsum, rows_sharding)
+    result = jnp.concatenate([zeros, cumsum], axis=1).reshape((dp_size * (per_dp_bs + 1),))
     sharding = jax.typeof(lens).sharding
     if isinstance(sharding, NamedSharding) and not sharding.mesh.empty:
         result = jax.sharding.reshard(result, sharding)

@@ -79,7 +79,7 @@ class NDRotaryEmbedding(nnx.Module):
         else:
             self.interpolation_factor = interpolation_factor
 
-        self.rope_generators = []
+        self.rope_generators = nnx.List([])
         for i in range(self.ndim):
             self.rope_generators.append(
                 OneDRotaryEmbedding(
