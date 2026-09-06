@@ -449,6 +449,11 @@ suites = {
     ],
     "unit-test-tpu-v6e-4": [
         TestFile(
+            "python/sgl_jax/test/multimodal/test_flux_attention.py",
+            0.1,
+            runner="pytest",
+        ),
+        TestFile(
             "python/sgl_jax/test/speculative/test_draft_extend_fused.py",
             0.1,
             runner="pytest",
