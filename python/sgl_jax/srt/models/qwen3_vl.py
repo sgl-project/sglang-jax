@@ -1,12 +1,13 @@
 import logging
 from collections.abc import Callable
+from functools import partial
 from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
-from jax.sharding import PartitionSpec
+from jax.sharding import NamedSharding, PartitionSpec
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.hf_transformers_utils import get_hf_text_config
@@ -24,7 +25,6 @@ from sgl_jax.srt.multimodal.in_model.lane_packing import (
     run_mrope_vision_model,
 )
 from sgl_jax.srt.multimodal.layers.attention.flash_attention_backend import (
-    VisionAttentionMetadata,
     make_vision_attention_backend,
 )
 from sgl_jax.srt.multimodal.layers.vision_sharding import (
@@ -155,7 +155,7 @@ def _merge_order(x: np.ndarray, t: int, h: int, w: int, merge: int) -> np.ndarra
 def _rope(x: jax.Array, freqs: jax.Array) -> jax.Array:
     half = x.shape[-1] // 2
     left, right = x[..., :half], x[..., half:]
-    cos, sin = jnp.cos(freqs)[:, :, None], jnp.sin(freqs)[:, :, None]
+    cos, sin = jnp.cos(freqs)[:, None, :], jnp.sin(freqs)[:, None, :]
     return jnp.concatenate((left * cos - right * sin, left * sin + right * cos), axis=-1).astype(
         x.dtype
     )
@@ -181,10 +181,10 @@ class Qwen3VLPatchEmbed(nnx.Module):
         )
 
     def __call__(self, x):
-        batch, length, _ = x.shape
+        tokens = x.shape[0]
         sh = self.specs.sharding(self.specs.batch_axis)
         x = x.reshape(
-            batch * length,
+            tokens,
             self.channels,
             self.temporal,
             self.patch,
@@ -192,7 +192,7 @@ class Qwen3VLPatchEmbed(nnx.Module):
             out_sharding=sh,
         )
         x = jnp.transpose(x, (0, 2, 3, 4, 1))
-        x = self.proj(x, out_sharding=sh).reshape(batch, length, self.hidden, out_sharding=sh)
+        x = self.proj(x, out_sharding=sh).reshape(tokens, self.hidden, out_sharding=sh)
         if self.mesh is not None:
             x = apply_data_sharding(x, self.mesh, PartitionSpec(self.specs.batch_axis))
         return x
@@ -221,7 +221,7 @@ class Qwen3VLVisionMLP(nnx.Module):
 
     def __call__(self, x):
         specs = self.specs
-        x, _ = self.fc1(x, out_sharding=specs.sharding(specs.batch_axis, None, specs.tensor_axis))
+        x, _ = self.fc1(x, out_sharding=specs.sharding(specs.batch_axis, specs.tensor_axis))
         x = jax.nn.gelu(x, approximate=self.approximate)
         return self.fc2(x, out_sharding=specs.sharding(specs.batch_axis))[0]
 
@@ -263,10 +263,10 @@ class Qwen3VLVisionAttention(nnx.Module):
             use_varlen=True,
         )
 
-    def __call__(self, x, freqs, metadata):
-        batch, length, _ = x.shape
+    def __call__(self, x, freqs, cu_seqlens, *, max_seq_len: int):
+        tokens, hidden = x.shape
         specs = self.specs
-        col = specs.sharding(specs.batch_axis, None, specs.tensor_axis)
+        col = specs.sharding(specs.batch_axis, specs.tensor_axis)
         q, k, v = (
             layer(x, out_sharding=col)[0]
             for layer in (
@@ -275,13 +275,20 @@ class Qwen3VLVisionAttention(nnx.Module):
                 self.v_proj,
             )
         )
-        sharding = specs.sharding(specs.batch_axis, None, specs.tensor_axis, None)
+        sharding = specs.sharding(specs.batch_axis, specs.tensor_axis, None)
         q, k, v = (
-            value.reshape(batch, length, self.heads, self.head_dim, out_sharding=sharding)
+            value.reshape(tokens, self.heads, self.head_dim, out_sharding=sharding)
             for value in (q, k, v)
         )
-        output = self.backend(_rope(q, freqs), _rope(k, freqs), v, metadata)
-        output = output.reshape(batch, length, self.hidden, out_sharding=col)
+        q, k = _rope(q, freqs), _rope(k, freqs)
+        output = self.backend(
+            q,
+            k,
+            v,
+            cu_seqlens,
+            max_seq_len=max_seq_len,
+        )
+        output = output.reshape(tokens, hidden, out_sharding=col)
         return self.proj(output, out_sharding=specs.sharding(specs.batch_axis))[0]
 
 
@@ -300,8 +307,13 @@ class Qwen3VLVisionBlock(nnx.Module):
         self.attn = Qwen3VLVisionAttention(config, dtype, mesh, specs)
         self.mlp = Qwen3VLVisionMLP(config, dtype, mesh, specs)
 
-    def __call__(self, x, freqs, metadata):
-        x = x + self.attn(self.norm1(x), freqs, metadata)
+    def __call__(self, x, freqs, cu_seqlens, *, max_seq_len: int):
+        x = x + self.attn(
+            self.norm1(x),
+            freqs,
+            cu_seqlens,
+            max_seq_len=max_seq_len,
+        )
         return x + self.mlp(self.norm2(x))
 
 
@@ -339,10 +351,10 @@ class Qwen3VLPatchMerger(nnx.Module):
         specs = self.specs
         sharding = specs.sharding(specs.batch_axis)
         if self.postshuffle:
-            x = self.norm(x.reshape(x.shape[0], -1, self.hidden, out_sharding=sharding))
+            x = self.norm(x.reshape(-1, self.hidden, out_sharding=sharding))
         else:
-            x = self.norm(x).reshape(x.shape[0], -1, self.hidden, out_sharding=sharding)
-        x, _ = self.fc1(x, out_sharding=specs.sharding(specs.batch_axis, None, specs.tensor_axis))
+            x = self.norm(x).reshape(-1, self.hidden, out_sharding=sharding)
+        x, _ = self.fc1(x, out_sharding=specs.sharding(specs.batch_axis, specs.tensor_axis))
         x = jax.nn.gelu(x, approximate=False)
         return self.fc2(x, out_sharding=sharding)[0]
 
@@ -438,9 +450,9 @@ class Qwen3VLVisionModel(nnx.Module):
     def __call__(
         self,
         patches: jax.Array,
-        grid_thw: np.ndarray | jax.Array,
+        metadata: jax.Array,
     ) -> jax.Array:
-        return self.encode(patches, grid_thw)
+        return self.encode(patches, metadata)
 
     def _forward(
         self,
@@ -448,8 +460,10 @@ class Qwen3VLVisionModel(nnx.Module):
         pos_indices: jax.Array,
         pos_weights: jax.Array,
         position_ids: jax.Array,
-        metadata: VisionAttentionMetadata,
+        cu_seqlens: jax.Array,
     ) -> tuple[jax.Array, jax.Array]:
+        tokens = patches.shape[0]
+        capacity = tokens // encoder_num_lanes(self.mesh, self.vision_tp)
         inv_freq = 1.0 / (
             10000.0 ** (jnp.arange(0, self.rotary_dim, 2, dtype=jnp.float32) / self.rotary_dim)
         )
@@ -469,60 +483,65 @@ class Qwen3VLVisionModel(nnx.Module):
         # by every block.
         deepstack = []
         for index, block in enumerate(self.blocks):
-            x = block(x, rotary_pos_emb, metadata)
+            x = block(x, rotary_pos_emb, cu_seqlens, max_seq_len=capacity)
             if index in self.deepstack_indexes:
                 merger = self.deepstack_mergers[self.deepstack_indexes.index(index)]
                 deepstack.append(merger(x))
         merged = self.merger(x)
         deepstack = (
-            jnp.stack(deepstack, axis=2)
+            jnp.stack(deepstack, axis=1)
             if deepstack
-            else jnp.empty((x.shape[0], merged.shape[1], 0, merged.shape[2]), x.dtype)
+            else jnp.empty((merged.shape[0], 0, merged.shape[1]), x.dtype)
         )
         return merged, deepstack
 
     @jax.jit
-    def _encode_jit(
+    def encode(
         self,
         patches: jax.Array,
-        pos_indices: jax.Array,
-        pos_weights: jax.Array,
-        position_ids: jax.Array,
-        metadata: VisionAttentionMetadata,
+        metadata: jax.Array,
     ) -> jax.Array:
-        output, deepstack = self._forward(
-            patches,
-            pos_indices,
-            pos_weights,
-            position_ids,
-            metadata,
+        """Encode flat lane-major patch and metadata buffers."""
+        num_lanes = encoder_num_lanes(self.mesh, self.vision_tp)
+        capacity = patches.size // (num_lanes * self.patch_dim)
+        token_sharding = self.specs.sharding(self.specs.batch_axis)
+        patches = patches.reshape(
+            -1,
+            self.patch_dim,
+            out_sharding=token_sharding,
         )
+        spec = PartitionSpec(self.specs.batch_axis)
+        metadata_views = jax.shard_map(
+            partial(self._metadata_views, capacity=capacity),
+            mesh=self.mesh,
+            in_specs=spec,
+            out_specs=(spec,) * 4,
+            check_vma=False,
+        )(metadata)
+        patches = patches.astype(self.dtype)
+        output, deepstack = self._forward(patches, *metadata_views)
         if self.mesh is not None:
             output = apply_data_sharding(output, self.mesh, PartitionSpec(self.specs.batch_axis))
             deepstack = apply_data_sharding(
                 deepstack, self.mesh, PartitionSpec(self.specs.batch_axis)
             )
         # Concatenate deepstack planes onto the trailing feature axis so the merge
-        # gathers one [rows, cap, (1+D)*H] tensor. D is static at trace time.
-        deepstack_dim = deepstack.shape[2]
+        # gathers one [rows, (1+D)*H] tensor. D is static at trace time.
+        deepstack_dim = deepstack.shape[1]
         if deepstack_dim:
-            b, cap, h = output.shape
+            tokens, hidden = output.shape
             output = jnp.concatenate(
-                [output, deepstack.reshape(b, cap, deepstack_dim * h)], axis=-1
+                [
+                    output,
+                    deepstack.reshape(
+                        tokens,
+                        deepstack_dim * hidden,
+                        out_sharding=token_sharding,
+                    ),
+                ],
+                axis=-1,
             )
         return output
-
-    def encode(self, patches: jax.Array, grid_thw: np.ndarray | jax.Array) -> jax.Array:
-        batch_sharding = self.specs.sharding(self.specs.batch_axis)
-        patches = jax.device_put(patches, batch_sharding)
-        metadata = jax.device_put(
-            self._build_metadata(grid_thw, patches.shape[1]),
-            batch_sharding,
-        )
-        if self.mesh is None:
-            return self._encode_jit(patches, *metadata)
-        with jax.set_mesh(self.mesh):
-            return self._encode_jit(patches, *metadata)
 
     def precompile(self) -> None:
         precompile_mrope_vision_model(
@@ -533,13 +552,43 @@ class Qwen3VLVisionModel(nnx.Module):
             patch_dim=self.patch_dim,
             merge_unit=self.spatial_merge_unit,
             rope_type="rope_3d",
-            dtype=self.dtype,
+            input_sharding=self.specs.sharding(self.specs.batch_axis),
+            output_sharding=self.specs.sharding(),
         )
 
-    def _build_metadata(self, grid_thw: np.ndarray | jax.Array, capacity: int):
-        grid_thw = np.asarray(jax.device_get(grid_thw), dtype=np.int32)
-        if grid_thw.ndim == 2:
-            grid_thw = grid_thw[None]
+    def prepare_metadata(
+        self,
+        grid_thw: np.ndarray,
+        capacity: int,
+        *,
+        sharding: NamedSharding,
+    ) -> jax.Array:
+        with jax.profiler.TraceAnnotation("encoder_metadata_host_build"):
+            grid_thw = np.asarray(grid_thw, dtype=np.int32)
+            if grid_thw.ndim == 2:
+                grid_thw = grid_thw[None]
+            if grid_thw.ndim != 3 or grid_thw.shape[-1] != 3:
+                raise ValueError("grid_thw must have shape [items, 3] or [lanes, items, 3]")
+            metadata = self._build_metadata(grid_thw, capacity)
+        with jax.profiler.TraceAnnotation("encoder_metadata_device_put"):
+            return jax.device_put(metadata, sharding)
+
+    def _metadata_views(self, metadata: np.ndarray | jax.Array, capacity: int):
+        """Decode one lane's flat metadata buffer into token-major views."""
+        leading_shape = metadata.shape[:-1]
+        indices_end = 4 * capacity
+        weights_end = indices_end + 4 * capacity
+        positions_end = weights_end + 2 * capacity
+        return (
+            metadata[..., :indices_end].reshape(*leading_shape, capacity, 4),
+            jax.lax.bitcast_convert_type(
+                metadata[..., indices_end:weights_end], jnp.float32
+            ).reshape(*leading_shape, capacity, 4),
+            metadata[..., weights_end:positions_end].reshape(*leading_shape, capacity, 2),
+            metadata[..., positions_end:],
+        )
+
+    def _build_metadata(self, grid_thw: np.ndarray, capacity: int):
         lane_metadata = [
             self._lane_metadata(
                 [tuple(map(int, grid)) for grid in lane if np.any(grid)],
@@ -547,14 +596,19 @@ class Qwen3VLVisionModel(nnx.Module):
             )
             for lane in grid_thw
         ]
-        pos_indices, pos_weights, position_ids, cu_seqlens = (
-            np.stack(values) for values in zip(*lane_metadata, strict=True)
-        )
-        metadata = VisionAttentionMetadata(
-            cu_seqlens,
-            max_seq_len=capacity,
-        )
-        return pos_indices, pos_weights, position_ids, metadata
+        flat_lanes = []
+        for pos_indices, pos_weights, position_ids, cu_seqlens in lane_metadata:
+            flat_lanes.append(
+                np.concatenate(
+                    (
+                        pos_indices.T.reshape(-1),
+                        np.ascontiguousarray(pos_weights.T).view(np.int32).reshape(-1),
+                        position_ids.reshape(-1),
+                        cu_seqlens,
+                    )
+                )
+            )
+        return np.stack(flat_lanes).reshape(-1)
 
 
 class Qwen3VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
@@ -637,6 +691,8 @@ class Qwen3VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
             buckets=self.visual.input_buckets,
             merge_unit=self.visual.spatial_merge_unit,
             rope_type="rope_3d",
+            input_sharding=self.visual.specs.sharding(self.visual.specs.batch_axis),
+            output_sharding=self.visual.specs.sharding(),
         )
 
     def get_multimodal_encode_funcs(self):

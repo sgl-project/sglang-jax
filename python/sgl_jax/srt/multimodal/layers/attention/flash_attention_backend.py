@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import dataclasses
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -13,31 +12,6 @@ from sgl_jax.srt.multimodal.kernels.varlen_attention import varlen_attention
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
-
-
-@dataclasses.dataclass
-class VisionAttentionMetadata:
-    """Block-diagonal (packed) self-attention layout for the vision tower.
-
-    ``cu_seqlens`` are bucket-shaped cumulative segment boundaries with shape
-    ``[num_lanes, K + 1]``: each row starts with zero, holds a lane's cumulative
-    segment ends, then repeats the final valid end through the padding slots.
-    ``max_seq_len`` is a host-computed upper bound on every positive boundary
-    difference. It is static JAX metadata so the varlen backend can select
-    compile-time block sizes without inspecting traced boundary values. The
-    bound should be stable for an input-shape bucket to avoid recompilation for
-    different segment values with the same shapes.
-    """
-
-    cu_seqlens: Any
-    max_seq_len: int | None = None
-
-
-jax.tree_util.register_dataclass(
-    VisionAttentionMetadata,
-    data_fields=["cu_seqlens"],
-    meta_fields=["max_seq_len"],
-)
 
 
 def _resolve_vision_vmem_limit_bytes(mesh, vmem_limit_bytes: int | None) -> int:
@@ -141,16 +115,12 @@ class FlashAttentionBackend(AttentionBackend):
 
 
 class VisionFlashAttentionBackend(AttentionBackend):
-    """Batch-sharded segment-flash attention for the in-model VLM ViT.
+    """Segment-flash attention over flat ``[tokens, heads, head_dim]`` inputs.
 
-    Kept SEPARATE from ``FlashAttentionBackend`` (which is head-TP, used by
-    ``USPAttention`` for Flux / Wan / Qwen3-Omni audio) so that class stays
-    untouched. With replicated ViT weights, batch lanes span both ``data`` and
-    ``tensor``. With ``head_tp=True``, batch is sharded on ``data`` and heads on
-    ``tensor``. Bucket-shaped cumulative lengths follow the batch sharding and
-    are expanded to dense ids locally inside the shard map. On CPU meshes the
-    same Pallas kernel runs in interpret mode, so this is the only vision
-    backend.
+    Each token shard contains one complete lane. Its flat cumulative lengths
+    are expanded to segment ids locally. The dense kernel's singleton batch
+    and head-major layout are introduced only inside the shard map. CPU meshes
+    run the Pallas kernel in interpret mode.
     """
 
     def __init__(
@@ -171,18 +141,26 @@ class VisionFlashAttentionBackend(AttentionBackend):
         else:
             batch_axis = ("data", "tensor") if "tensor" in mesh.axis_names else "data"
             head_axis = None
-        qkv_spec = P(batch_axis, head_axis, None, None)
-        metadata_spec = P(batch_axis, None)
+        qkv_spec = P(batch_axis, head_axis, None)
+        metadata_spec = P(batch_axis)
         in_specs = (qkv_spec, qkv_spec, qkv_spec, metadata_spec)
         out_specs = qkv_spec
 
         def _flash_attention(q, k, v, cu_seqlens):
+            seq_len = q.shape[0]
+            # The dense kernel requires [1, heads, tokens, head_dim] and a
+            # sequence capacity aligned to its query tile.
+            q, k, v = (jnp.transpose(x, (1, 0, 2))[None] for x in (q, k, v))
+            aligned = max(256, ((seq_len + 255) // 256) * 256)
+            pad = aligned - seq_len
+            if pad:
+                q, k, v = (jnp.pad(x, ((0, 0), (0, 0), (0, pad), (0, 0))) for x in (q, k, v))
             segment_ids = vision_segment_ids_from_cu_seqlens(
-                cu_seqlens,
-                q.shape[2],
+                cu_seqlens[None],
+                aligned,
                 search_method="scan",
             )
-            return flash_attention(
+            out = flash_attention(
                 q,
                 k,
                 v,
@@ -192,6 +170,7 @@ class VisionFlashAttentionBackend(AttentionBackend):
                 vmem_limit_bytes=self.vmem_limit_bytes,
                 interpret=interpret,
             )
+            return jnp.transpose(out[0, :, :seq_len], (1, 0, 2))
 
         self.jit_flash_attention = jax.jit(
             jax.shard_map(
@@ -199,34 +178,13 @@ class VisionFlashAttentionBackend(AttentionBackend):
             )
         )
 
-    def __call__(self, q, k, v, metadata: VisionAttentionMetadata):
-        """Segment-flash attention over batch-leading ``[B, T, heads, head_dim]``.
-
-        Adapts to the kernel's head-leading layout and pads the sequence to the
-        tile its block-size path needs, then restores ``[B, T, heads, head_dim]``
-        so every vision backend shares one THD in/out contract.
-        """
-        cu_seqlens = metadata.cu_seqlens
-        if q.shape[0] != cu_seqlens.shape[0]:
-            raise ValueError(
-                f"vision cu_seqlens batch must match q/k/v: {cu_seqlens.shape[0]} != {q.shape[0]}"
-            )
-        seq_len = q.shape[1]
-        if seq_len != k.shape[1]:
+    def __call__(self, q, k, v, cu_seqlens: jax.Array, *, max_seq_len: int | None = None):
+        """Attend within lane-local segments; ``max_seq_len`` is varlen-only."""
+        if q.ndim != 3 or k.ndim != 3 or v.ndim != 3 or cu_seqlens.ndim != 1:
+            raise ValueError("vision attention requires [tokens, heads, dim] and flat cu_seqlens")
+        if q.shape[0] != k.shape[0] or q.shape[0] != v.shape[0]:
             raise ValueError("a single vision cu_seqlens requires equal q and kv lengths")
-
-        # [B, T, H, D] -> [B, H, T, D] for the kernel.
-        q, k, v = (jnp.transpose(x, (0, 2, 1, 3)) for x in (q, k, v))
-
-        # The dense kernel's default query tile is 256 tokens.
-        alignment = 256
-        aligned = max(256, ((seq_len + alignment - 1) // alignment) * alignment)
-        pad = aligned - seq_len
-        if pad:
-            q, k, v = (jnp.pad(x, ((0, 0), (0, 0), (0, pad), (0, 0))) for x in (q, k, v))
-
-        out = self.jit_flash_attention(q, k, v, cu_seqlens)  # [B, H, aligned, D]
-        return jnp.transpose(out[:, :, :seq_len], (0, 2, 1, 3))  # -> [B, T, H, D]
+        return self.jit_flash_attention(q, k, v, cu_seqlens)
 
     def get_forward_metadata(self, batch: ModelWorkerBatch):
         """Init the metadata for a forward pass and return it"""
@@ -234,17 +192,11 @@ class VisionFlashAttentionBackend(AttentionBackend):
 
 
 class VisionVarlenAttentionBackend(AttentionBackend):
-    """Batch-sharded packed variable-length vision attention.
+    """TPU variable-length attention over flat token and boundary buffers.
 
-    Shares the ``[B, T, heads, head_dim]`` + bucket-shaped ``cu_seqlens``
-    contract of :class:`VisionFlashAttentionBackend`, but each batch lane maps
-    *directly* to the ``varlen_attention`` kernel's packed ``[tokens, heads,
-    head_dim]`` layout: no head-major transpose and no sequence padding (the
-    kernel reserves its own DMA tail slack). A lane's ``num_seqs`` is the count
-    of positive-length segments in its bucket row -- the repeated tail ends
-    become zero-length segments the kernel skips. Unlike the flash backend this
-    kernel supports GQA, per-call local ``window_size`` and per-head attention
-    sinks, so it backs models like MiMo-V2. It is TPU-only.
+    Each token shard maps directly to the kernel's ``[tokens, heads, head_dim]``
+    layout. Lane-local cumulative lengths retain repeated tail ends; those
+    zero-length segments are skipped. No batch axis or vmap is needed.
     """
 
     def __init__(
@@ -267,32 +219,28 @@ class VisionVarlenAttentionBackend(AttentionBackend):
         else:
             batch_axis = ("data", "tensor") if "tensor" in mesh.axis_names else "data"
             self.head_axis = None
-        # q/k/v are token-major [B, T, heads, head_dim]: batch on dim 0, heads on dim 2.
-        self.qkv_spec = P(batch_axis, None, self.head_axis, None)
-        self.cu_spec = P(batch_axis, None)
+        self.qkv_spec = P(batch_axis, self.head_axis, None)
+        self.cu_spec = P(batch_axis)
 
     def __call__(
         self,
-        q,  # [B, T, heads, head_dim]
-        k,  # [B, T, kv_heads, head_dim]
-        v,  # [B, T, kv_heads, head_dim]
-        cu_seqlens,  # int32[B, boundary_capacity + 1] or VisionAttentionMetadata
+        q,  # [tokens, heads, head_dim]
+        k,  # [tokens, kv_heads, head_dim]
+        v,  # [tokens, kv_heads, head_dim]
+        cu_seqlens: jax.Array,  # Flat lane-local cumulative lengths.
         attention_sink=None,  # float[heads] or None
         *,
         window_size: tuple[int, int] = (-1, -1),
+        max_seq_len: int | None = None,
     ):
-        # Accept either a raw cu_seqlens array (MiMo/Omni) or the shared
-        # VisionAttentionMetadata (Qwen VL), so this backend is a drop-in for
-        # VisionFlashAttentionBackend's (q, k, v, metadata) contract too.
-        max_seq_len = None
-        if isinstance(cu_seqlens, VisionAttentionMetadata):
-            max_seq_len = cu_seqlens.max_seq_len
-            cu_seqlens = cu_seqlens.cu_seqlens
-        if q.shape[0] != cu_seqlens.shape[0]:
-            raise ValueError(
-                f"vision cu_seqlens batch must match q/k/v: {cu_seqlens.shape[0]} != {q.shape[0]}"
-            )
-        if q.shape[1] != k.shape[1]:
+        """Attend within segments, using a static length bound for kernel tuning.
+
+        ``max_seq_len`` should be a Python int stable within each input-shape
+        bucket. If omitted, the kernel uses the packed Q capacity as its bound.
+        """
+        if q.ndim != 3 or k.ndim != 3 or v.ndim != 3 or cu_seqlens.ndim != 1:
+            raise ValueError("vision attention requires [tokens, heads, dim] and flat cu_seqlens")
+        if q.shape[0] != k.shape[0] or q.shape[0] != v.shape[0]:
             raise ValueError("a single vision cu_seqlens requires equal q and kv lengths")
 
         def per_lane(lane_q, lane_k, lane_v, lane_cu, lane_sink):
@@ -312,20 +260,18 @@ class VisionVarlenAttentionBackend(AttentionBackend):
                 vmem_limit_bytes=self.vmem_limit_bytes,
             )
 
-        # A sink is a shard_map input so it follows the head sharding; without one
-        # it is broadcast (in_axes=None) as a plain Python ``None`` per lane.
-        over_batch = (0, 0, 0, 0, None)
+        # A sink follows the head sharding; each shard already contains one lane.
         if attention_sink is None:
 
-            def sharded(bq, bk, bv, bcu):
-                return jax.vmap(per_lane, in_axes=over_batch)(bq, bk, bv, bcu, None)
+            def sharded(q, k, v, cu):
+                return per_lane(q, k, v, cu, None)
 
             in_specs = (self.qkv_spec, self.qkv_spec, self.qkv_spec, self.cu_spec)
             args = (q, k, v, cu_seqlens)
         else:
 
-            def sharded(bq, bk, bv, bcu, sink):
-                return jax.vmap(per_lane, in_axes=over_batch)(bq, bk, bv, bcu, sink)
+            def sharded(q, k, v, cu, sink):
+                return per_lane(q, k, v, cu, sink)
 
             in_specs = (*(self.qkv_spec,) * 3, self.cu_spec, P(self.head_axis))
             args = (q, k, v, cu_seqlens, attention_sink)
@@ -347,13 +293,13 @@ def make_vision_attention_backend(
     head_tp: bool = False,
     use_varlen: bool = False,
 ) -> AttentionBackend:
-    """Build the batch-sharded vision attention backend.
+    """Build vision attention over flat tokens sharded into complete lanes.
 
     On TPU, ``use_varlen`` routes the tower through the packed
     ``varlen_attention`` kernel instead of the dense ``flash_attention``
     kernel. Varlen walks each cu_seqlens segment, so window
-    layers cost O(sum segment^2) rather than the dense O(T^2). The host-computed
-    maximum segment length in :class:`VisionAttentionMetadata` selects the
+    layers cost O(sum segment^2) rather than the dense O(T^2). The static
+    ``max_seq_len`` upper bound passed to the backend selects the
     v7x-tuned block sizes. CPU meshes use the flash backend's test-only
     interpreter path.
     """

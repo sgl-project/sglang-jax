@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
-from jax.typing import ArrayLike
+from numba import njit, types
 from transformers import modeling_flax_utils
 
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -31,7 +31,6 @@ from sgl_jax.srt.multimodal.in_model.lane_packing import (
     run_mrope_vision_model,
 )
 from sgl_jax.srt.multimodal.layers.attention.flash_attention_backend import (
-    VisionAttentionMetadata,
     make_vision_attention_backend,
 )
 from sgl_jax.srt.multimodal.layers.vision_sharding import (
@@ -53,7 +52,7 @@ def _apply_rotary_pos_emb_vision(
     cos: jax.Array,
     sin: jax.Array,
 ) -> jax.Array:
-    """Apply precomputed vision RoPE to ``x[B, T, heads, head_dim]``."""
+    """Apply precomputed vision RoPE to ``x[tokens, heads, head_dim]``."""
     half_dim = x.shape[-1] // 2
     x_real, x_imag = x[..., :half_dim], x[..., half_dim:]
     return jnp.concatenate(
@@ -93,30 +92,21 @@ class Qwen2_5_VisionPatchEmbed(nnx.Module):
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        """*x*: ``[B, S, C·T·H·W]`` → ``[B, S, hidden_size]``."""
-        B, S, D = x.shape
+        """*x*: ``[tokens, C·T·H·W]`` → ``[tokens, hidden_size]``."""
+        tokens, D = x.shape
         C = D // (self.temporal_patch_size * self.patch_size * self.patch_size)
-        x = x.reshape(B, S, C, self.temporal_patch_size, self.patch_size, self.patch_size)
+        x = x.reshape(tokens, C, self.temporal_patch_size, self.patch_size, self.patch_size)
         x = apply_data_sharding(x, self.mesh, PartitionSpec(self.specs.batch_axis))
 
-        # [B, S, C, T, H, W] → [B, S, T, H, W, C]
-        x = jnp.transpose(x, (0, 1, 3, 4, 5, 2))
+        # Each token is one independent convolution input patch.
+        x = jnp.transpose(x, (0, 2, 3, 4, 1))
 
         sh = None
         if "data" in self.mesh.abstract_mesh.explicit_axes:
             sh = self.specs.sharding(self.specs.batch_axis)
 
-        x = x.reshape(
-            B * S,
-            self.temporal_patch_size,
-            self.patch_size,
-            self.patch_size,
-            C,
-            out_sharding=sh,
-        )
         x = self.proj(x, out_sharding=sh)
-        x = x.reshape(B, S, 1, 1, 1, self.hidden_size, out_sharding=sh)
-        return jnp.squeeze(x, axis=(2, 3, 4))
+        return x.reshape(tokens, self.hidden_size, out_sharding=sh)
 
 
 class Qwen2_5_VLMLP(nnx.Module):
@@ -160,7 +150,7 @@ class Qwen2_5_VLMLP(nnx.Module):
 
     def __call__(self, x: jax.Array) -> jax.Array:
         specs = self.specs
-        col = specs.sharding(specs.batch_axis, None, specs.tensor_axis)
+        col = specs.sharding(specs.batch_axis, specs.tensor_axis)
         row = specs.sharding(specs.batch_axis)
         gate, _ = self.gate_proj(x, out_sharding=col)
         up, _ = self.up_proj(x, out_sharding=col)
@@ -237,27 +227,29 @@ class Qwen2_5_VisionAttention(nnx.Module):
         x: jax.Array,
         rotary_cos: jax.Array,
         rotary_sin: jax.Array,
-        metadata: VisionAttentionMetadata,
+        cu_seqlens: jax.Array,
+        *,
+        max_seq_len: int,
     ) -> jax.Array:
-        B, T, D = x.shape
+        tokens, D = x.shape
         specs = self.specs
-        col = specs.sharding(specs.batch_axis, None, specs.tensor_axis)
+        col = specs.sharding(specs.batch_axis, specs.tensor_axis)
 
         # Project Q, K, V separately (TP-safe: each is independently column-parallel).
         q, _ = self.q_proj(x, out_sharding=col)
         k, _ = self.k_proj(x, out_sharding=col)
         v, _ = self.v_proj(x, out_sharding=col)
 
-        hs = specs.sharding(specs.batch_axis, None, specs.tensor_axis, None)
-        q = q.reshape(B, T, self.num_heads, self.head_dim, out_sharding=hs)
-        k = k.reshape(B, T, self.num_heads, self.head_dim, out_sharding=hs)
-        v = v.reshape(B, T, self.num_heads, self.head_dim, out_sharding=hs)
+        hs = specs.sharding(specs.batch_axis, specs.tensor_axis, None)
+        q = q.reshape(tokens, self.num_heads, self.head_dim, out_sharding=hs)
+        k = k.reshape(tokens, self.num_heads, self.head_dim, out_sharding=hs)
+        v = v.reshape(tokens, self.num_heads, self.head_dim, out_sharding=hs)
 
         q = _apply_rotary_pos_emb_vision(q, rotary_cos, rotary_sin)
         k = _apply_rotary_pos_emb_vision(k, rotary_cos, rotary_sin)
 
-        out = self.attn_backend(q, k, v, metadata)
-        out = out.reshape(B, T, D, out_sharding=col)
+        out = self.attn_backend(q, k, v, cu_seqlens, max_seq_len=max_seq_len)
+        out = out.reshape(tokens, D, out_sharding=col)
         out, _ = self.proj(out, out_sharding=specs.sharding(specs.batch_axis))
         return out
 
@@ -295,15 +287,19 @@ class Qwen2_5_VisionBlock(nnx.Module):
         x: jax.Array,
         rotary_cos: jax.Array,
         rotary_sin: jax.Array,
-        metadata: VisionAttentionMetadata,
+        cu_seqlens: jax.Array,
+        *,
+        max_seq_len: int,
     ) -> jax.Array:
-        x = x + self.attn(self.norm1(x), rotary_cos, rotary_sin, metadata)
+        x = x + self.attn(
+            self.norm1(x), rotary_cos, rotary_sin, cu_seqlens, max_seq_len=max_seq_len
+        )
         x = x + self.mlp(self.norm2(x))
         return x
 
 
 class Qwen2_5_VisionPatchMerger(nnx.Module):
-    """Spatial merge: LN → reshape(sms²) → 2-layer MLP → [B, T/sms², d_model]."""
+    """Spatial merge: LN → reshape(sms²) → MLP → [tokens/sms², d_model]."""
 
     def __init__(
         self,
@@ -349,11 +345,8 @@ class Qwen2_5_VisionPatchMerger(nnx.Module):
         specs = self.specs
         row = specs.sharding(specs.batch_axis)
         x = self.ln_q(x)
-        B = x.shape[0]
-        x = x.reshape(B, -1, self.hidden_size, out_sharding=row)
-        x, _ = self.mlp_fc1(
-            x, out_sharding=specs.sharding(specs.batch_axis, None, specs.tensor_axis)
-        )
+        x = x.reshape(-1, self.hidden_size, out_sharding=row)
+        x, _ = self.mlp_fc1(x, out_sharding=specs.sharding(specs.batch_axis, specs.tensor_axis))
         x = self.mlp_act(x)
         x, _ = self.mlp_fc2(x, out_sharding=row)
         return x
@@ -426,62 +419,195 @@ class Qwen2_5_VisionTransformer(nnx.Module):
         self.theta = float(getattr(config, "rope_theta", 10000.0))
         self.rot_dim = 2 * len(range(0, self.rotary_dim, 2))
 
+    # Compile (or load the cache) before serving, with dimensions as runtime values.
+    # Accept strided and read-only grids without additional specializations.
+    @staticmethod
+    @njit(
+        types.int32[::1](
+            types.Array(types.int32, 3, "A", readonly=True),
+            types.int64,
+            types.int64,
+            types.int64,
+        ),
+        nogil=True,
+        cache=True,
+    )
+    def _build_metadata(grid_thw, capacity, merge, window):
+        """Write lane-local permutations, positions and boundaries in one pass.
+
+        The flat buffer matches ``Qwen2_5_VisionTransformer._metadata_views``.
+        Visit only valid merge units in window order, avoiding padded indices,
+        coordinate grids, gathers and per-image temporary arrays.
+        """
+        if merge <= 0 or window <= 0 or capacity < 0:
+            raise ValueError("merge/window must be positive and capacity non-negative")
+        unit = merge * merge
+        if capacity % unit:
+            raise ValueError("capacity must be divisible by the spatial merge unit")
+        if grid_thw.shape[2] != 3:
+            raise ValueError("grid_thw must have three coordinates per grid")
+        num_lanes = grid_thw.shape[0]
+        num_units = capacity // unit
+        positions_start = 2 * num_units
+        window_start = positions_start + 2 * capacity
+        full_start = window_start + num_units + 1
+        metadata = np.zeros((num_lanes, full_start + num_units + 1), dtype=np.int32)
+
+        for lane in range(num_lanes):
+            # Padding units retain the identity permutation and zero positions.
+            for index in range(num_units):
+                metadata[lane, 2 * index] = index
+                metadata[lane, 2 * index + 1] = index
+            patch_offset = unit_offset = 0
+            window_segment = frame_segment = 1
+            for image in range(grid_thw.shape[1]):
+                t, h, w = grid_thw[lane, image]
+                if t == 0 and h == 0 and w == 0:
+                    continue
+                # Validate before writing: Numba does not bounds-check array access.
+                if t <= 0 or h <= 0 or w <= 0 or h % merge or w % merge:
+                    raise ValueError("grid dimensions must be positive and spatially merge-aligned")
+                if t * h * w > capacity - patch_offset:
+                    raise ValueError("vision grids exceed the lane capacity")
+                grid_h, grid_w = h // merge, w // merge
+                image_unit_offset = unit_offset
+                for frame in range(t):
+                    frame_unit_offset = image_unit_offset + frame * grid_h * grid_w
+                    for window_y in range(0, grid_h, window):
+                        for window_x in range(0, grid_w, window):
+                            for y in range(window_y, min(window_y + window, grid_h)):
+                                for x in range(window_x, min(window_x + window, grid_w)):
+                                    source_unit = frame_unit_offset + y * grid_w + x
+                                    metadata[lane, 2 * unit_offset] = source_unit
+                                    metadata[lane, 2 * source_unit + 1] = unit_offset
+                                    for dy in range(merge):
+                                        for dx in range(merge):
+                                            position = positions_start + 2 * patch_offset
+                                            metadata[lane, position] = y * merge + dy
+                                            metadata[lane, position + 1] = x * merge + dx
+                                            patch_offset += 1
+                                    unit_offset += 1
+                            metadata[lane, window_start + window_segment] = patch_offset
+                            window_segment += 1
+                    metadata[lane, full_start + frame_segment] = patch_offset
+                    frame_segment += 1
+            # Repeated final ends describe empty segments in the bucket padding.
+            metadata[lane, window_start + window_segment : full_start] = patch_offset
+            metadata[lane, full_start + frame_segment :] = patch_offset
+        return metadata.reshape(-1)
+
+    def prepare_metadata(
+        self, grid_thw: np.ndarray, capacity: int, *, sharding: NamedSharding
+    ) -> jax.Array:
+        """Build host attention metadata and upload it with the input sharding."""
+        with jax.profiler.TraceAnnotation("encoder_metadata_host_build"):
+            grid_thw = np.asarray(grid_thw, dtype=np.int32)
+            if grid_thw.ndim == 2:
+                grid_thw = grid_thw[None]
+            if grid_thw.ndim != 3 or grid_thw.shape[-1] != 3:
+                raise ValueError("grid_thw must have shape [items, 3] or [lanes, items, 3]")
+            metadata = self._build_metadata(
+                grid_thw,
+                capacity,
+                self.spatial_merge_size,
+                self.window_size // self.spatial_merge_size // self.patch_size,
+            )
+        with jax.profiler.TraceAnnotation("encoder_metadata_device_put"):
+            return jax.device_put(metadata, sharding)
+
+    def _metadata_views(self, metadata: np.ndarray | jax.Array, capacity: int):
+        """Views of the same buffer on the host and inside the ViT JIT."""
+        leading_shape = metadata.shape[:-1]
+        num_units = capacity // self.spatial_merge_unit
+        indices_end = 2 * num_units
+        positions_end = indices_end + 2 * capacity
+        window_end = positions_end + num_units + 1
+        return (
+            metadata[..., :indices_end].reshape(*leading_shape, num_units, 2),
+            metadata[..., indices_end:positions_end].reshape(*leading_shape, capacity, 2),
+            metadata[..., positions_end:window_end],
+            metadata[..., window_end:],
+        )
+
+    def _reorder(self, x: jax.Array, indices: jax.Array) -> jax.Array:
+        """Gather within each device's lane, using lane-local unit indices."""
+        spec = PartitionSpec(self.specs.batch_axis)
+        return jax.shard_map(
+            lambda values, order: values[order],
+            mesh=self.mesh,
+            in_specs=(spec, spec),
+            out_specs=spec,
+            check_vma=False,
+        )(x, indices)
+
     def __call__(
         self,
-        patches: ArrayLike,
-        grid_thw: np.ndarray,
+        patches: jax.Array,
+        metadata: jax.Array,
     ) -> jax.Array:
-        return self.encode(patches, grid_thw)
+        return self.encode(patches, metadata)
 
     def _forward(
         self,
         patches: jax.Array,
         indices: jax.Array,
         position_ids: jax.Array,
-        window_attn: VisionAttentionMetadata,
-        full_attn: VisionAttentionMetadata,
+        window_cu_seqlens: jax.Array,
+        full_cu_seqlens: jax.Array,
     ) -> jax.Array:
-        B, S = patches.shape[:2]
+        """Run the ViT over flat tokens with lane-local indices and boundaries."""
+        tokens = patches.shape[0]
+        capacity = tokens // encoder_num_lanes(self.mesh, self.vision_tp)
         u = self.spatial_merge_unit
-        n_units = S // u
-        window_index, reverse_indices = indices[:, :, 0], indices[:, :, 1]
+        window_index, reverse_indices = indices[:, 0], indices[:, 1]
         inv_freq = 1.0 / (
             self.theta ** (jnp.arange(0, self.rotary_dim, 2, dtype=jnp.float32) / self.rotary_dim)
         )
         rotary_pos_emb = (position_ids[..., None].astype(jnp.float32) * inv_freq).reshape(
-            B, S, self.rot_dim
+            tokens, self.rot_dim
         )
-        rotary_cos = jnp.cos(rotary_pos_emb)[:, :, None, :]
-        rotary_sin = jnp.sin(rotary_pos_emb)[:, :, None, :]
+        rotary_cos = jnp.cos(rotary_pos_emb)[:, None, :]
+        rotary_sin = jnp.sin(rotary_pos_emb)[:, None, :]
 
         x = self.patch_embed(patches)
-        x = x.reshape(B, n_units, u, -1)
-
-        # Window reorder (batch axis stays on 0).
-        x = jnp.take_along_axis(x, window_index[:, :, None, None], axis=1)
-        x = x.reshape(B, S, -1)
+        x = x.reshape(tokens // u, u, -1)
+        x = self._reorder(x, window_index).reshape(tokens, -1)
 
         # Select the pre-planned metadata per block: full-frame for the layers in
         # ``fullatt_block_indexes``, otherwise the local-window layout.
-        layout_metadata = (window_attn, full_attn)
+        cu_seqlens = (window_cu_seqlens, full_cu_seqlens)
+        window = self.window_size // self.spatial_merge_size // self.patch_size
+        # Static bounds depend only on the compile bucket and model config so
+        # different segment values with the same shapes share a compilation.
+        max_seq_lens = (min(capacity, window * window * u), capacity)
         for i, blk in enumerate(self.blocks):
-            block_meta = layout_metadata[int(i in self.fullatt_block_indexes)]
-            x = blk(x, rotary_cos, rotary_sin, block_meta)
+            layout = int(i in self.fullatt_block_indexes)
+            x = blk(x, rotary_cos, rotary_sin, cu_seqlens[layout], max_seq_len=max_seq_lens[layout])
 
         x = self.merger(x)
-        return jnp.take_along_axis(x, reverse_indices[:, :, None], axis=1)
+        return self._reorder(x, reverse_indices)
 
+    @jax.jit
     def encode(
         self,
-        patches: ArrayLike,
-        grid_thw: np.ndarray,
+        patches: jax.Array,
+        metadata: jax.Array,
     ) -> jax.Array:
-        batch_sharding = self.specs.sharding(self.specs.batch_axis)
-        patches = jax.device_put(patches, batch_sharding)
-        metadata = self._build_metadata(grid_thw, patches.shape[1])
-        metadata = jax.device_put(metadata, batch_sharding)
-        with jax.set_mesh(self.mesh):
-            return self._encode_jit(patches, *metadata)
+        """Encode flat lane-major patch and metadata buffers."""
+        num_lanes = encoder_num_lanes(self.mesh, self.vision_tp)
+        capacity = patches.size // (num_lanes * self.patch_dim)
+        token_sharding = self.specs.sharding(self.specs.batch_axis)
+        patches = patches.reshape(-1, self.patch_dim, out_sharding=token_sharding)
+        spec = PartitionSpec(self.specs.batch_axis)
+        metadata_views = jax.shard_map(
+            partial(self._metadata_views, capacity=capacity),
+            mesh=self.mesh,
+            in_specs=spec,
+            out_specs=(spec,) * 4,
+            check_vma=False,
+        )(metadata)
+        patches = patches.astype(self.dtype)
+        return self._forward(patches, *metadata_views)
 
     def precompile(self) -> None:
         precompile_mrope_vision_model(
@@ -492,109 +618,8 @@ class Qwen2_5_VisionTransformer(nnx.Module):
             patch_dim=self.patch_dim,
             merge_unit=self.spatial_merge_unit,
             rope_type="rope_3d",
-            dtype=self.dtype,
-        )
-
-    def _build_metadata(
-        self,
-        lane_grids: np.ndarray,
-        capacity: int,
-    ) -> tuple[np.ndarray, np.ndarray, VisionAttentionMetadata, VisionAttentionMetadata]:
-        lane_grids = np.asarray(lane_grids, dtype=np.int32)
-        if lane_grids.ndim == 2:
-            lane_grids = lane_grids[None]
-        batch = len(lane_grids)
-        merge = self.spatial_merge_size
-        unit = self.spatial_merge_unit
-        num_units = capacity // unit
-        window = self.window_size // merge // self.patch_size
-        unit_range = np.arange(num_units, dtype=np.int32)
-        indices = np.broadcast_to(unit_range[None, :, None], (batch, num_units, 2)).copy()
-        position_ids = np.zeros((batch, capacity, 2), dtype=np.int32)
-        cu_seqlens = np.zeros((batch, 2, num_units + 1), dtype=np.int32)
-
-        def grid_layout(t: int, h: int, w: int):
-            grid_h, grid_w = h // merge, w // merge
-            index = np.arange(t * grid_h * grid_w).reshape(t, grid_h, grid_w)
-            pad_h, pad_w = (-grid_h) % window, (-grid_w) % window
-            windows_h, windows_w = (grid_h + pad_h) // window, (grid_w + pad_w) // window
-            index = np.pad(index, ((0, 0), (0, pad_h), (0, pad_w)), constant_values=-1)
-            index = index.reshape(t, windows_h, window, windows_w, window)
-            index = index.transpose(0, 1, 3, 2, 4).reshape(-1, window, window)
-            window_lengths = (index != -1).sum(axis=(1, 2)).astype(np.int32) * unit
-            index = index.reshape(-1)
-            index = index[index != -1].astype(np.int32)
-
-            y, x = np.indices((h, w))
-            coords = np.stack((y, x), axis=-1)
-            coords = coords.reshape(grid_h, merge, grid_w, merge, 2)
-            coords = coords.transpose(0, 2, 1, 3, 4).reshape(h * w, 2)
-            coords = np.tile(coords, (t, 1))
-            coords = coords.reshape(-1, unit, 2)[index].reshape(t * h * w, 2)
-            return index, window_lengths, coords
-
-        for lane, grids in enumerate(lane_grids):
-            patch_offset = unit_offset = 0
-            window_ends = []
-            frame_ends = []
-            for grid in grids:
-                if not np.any(grid):
-                    continue
-                t, h, w = map(int, grid)
-                patch_count = t * h * w
-                window_index, window_lengths, coords = grid_layout(t, h, w)
-                unit_count = patch_count // unit
-                patch_slice = slice(patch_offset, patch_offset + patch_count)
-                unit_slice = slice(unit_offset, unit_offset + unit_count)
-                indices[lane, unit_slice, 0] = window_index + unit_offset
-                position_ids[lane, patch_slice] = coords
-                window_ends.extend(patch_offset + np.cumsum(window_lengths))
-                frame_ends.extend(patch_offset + np.arange(1, t + 1, dtype=np.int32) * h * w)
-                patch_offset += patch_count
-                unit_offset += unit_count
-            indices[lane, :, 1] = np.argsort(indices[lane, :, 0]).astype(np.int32)
-            for layout, ends in enumerate((window_ends, frame_ends)):
-                count = len(ends)
-                cu_seqlens[lane, layout, 1 : count + 1] = ends
-                cu_seqlens[lane, layout, count + 1 :] = patch_offset
-        # cu_seqlens[:, 0] is the window layout, [:, 1] the full-frame layout.
-        window_cu_seqlens = cu_seqlens[:, 0]
-        full_cu_seqlens = cu_seqlens[:, 1]
-        # Static bounds must depend only on the compile bucket, not the request's
-        # exact segment values, so requests in one bucket share a compilation.
-        window_max_seq_len = min(capacity, window * window * unit)
-        return (
-            indices,
-            position_ids,
-            VisionAttentionMetadata(
-                window_cu_seqlens,
-                max_seq_len=window_max_seq_len,
-            ),
-            VisionAttentionMetadata(
-                full_cu_seqlens,
-                max_seq_len=capacity,
-            ),
-        )
-
-    @jax.jit
-    def _encode_jit(
-        self,
-        patches: jax.Array,
-        indices: jax.Array,
-        position_ids: jax.Array,
-        window_attn: VisionAttentionMetadata,
-        full_attn: VisionAttentionMetadata,
-    ) -> jax.Array:
-        features = self._forward(patches, indices, position_ids, window_attn, full_attn)
-        # Keep the DP lane-to-replicated transition inside the compiled encode.
-        # An eager reshard of a multi-device result can otherwise stage through
-        # the host when no source device owns the complete array.
-        return jax.sharding.reshard(
-            features,
-            NamedSharding(
-                self.mesh,
-                PartitionSpec(*([None] * features.ndim)),
-            ),
+            input_sharding=self.specs.sharding(self.specs.batch_axis),
+            output_sharding=self.specs.sharding(),
         )
 
 
@@ -661,12 +686,6 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         return tuple(rows * bucket // unit for bucket in self.visual.input_buckets)
 
     def get_image_feature(self, items: list[MultimodalDataItem]) -> jax.Array:
-        return self._get_visual_feature(items)
-
-    def get_video_feature(self, items: list[MultimodalDataItem]) -> jax.Array:
-        return self._get_visual_feature(items)
-
-    def _get_visual_feature(self, items: list[MultimodalDataItem]) -> jax.Array:
         num_lanes = encoder_num_lanes(self.mesh, self.visual.vision_tp)
         return run_mrope_vision_model(
             self.visual,
@@ -676,8 +695,12 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
             buckets=self.visual.input_buckets,
             merge_unit=self.visual.spatial_merge_unit,
             rope_type="rope_3d",
-            dtype=self.dtype,
+            input_sharding=self.visual.specs.sharding(self.visual.specs.batch_axis),
+            output_sharding=self.visual.specs.sharding(),
         )
+
+    def get_video_feature(self, items: list[MultimodalDataItem]) -> jax.Array:
+        return self.get_image_feature(items)
 
     def get_multimodal_encode_funcs(self):
         return {

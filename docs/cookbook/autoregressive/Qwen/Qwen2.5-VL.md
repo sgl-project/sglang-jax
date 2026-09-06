@@ -71,7 +71,6 @@ python -u -m sgl_jax.launch_server \
   --max-prefill-tokens 16384 --chunked-prefill-size 4096 \
   --mem-fraction-static 0.9 --page-size 128 \
   --vision-encoder-parallel dp \
-  --mm-io-worker-num 4 \
   --mm-processor-worker-num 16 \
   --random-seed 0 \
   --skip-server-warmup \
@@ -325,7 +324,7 @@ python -u -m sgl_jax.launch_server \
   --max-prefill-tokens 16384 --chunked-prefill-size 4096 \
   --mem-fraction-static 0.9 --page-size 128 \
   --disable-radix-cache --vision-encoder-parallel dp \
-  --mm-io-worker-num 4 --mm-processor-worker-num 16 \
+  --mm-processor-worker-num 16 \
   --random-seed 0 --host 0.0.0.0 --port 30000
 ```
 
