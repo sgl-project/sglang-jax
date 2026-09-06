@@ -324,7 +324,9 @@ def _run_backend_decode(B, H, K, dtype, h0, rng_seed, layer_id=_LAYER_ID):
 
     # Reference
     scale = K**-0.5
-    out_ref, state_ref = naive_gla_decode(q, k, v, g_gamma, h0, scale=scale)
+    # Match the replicated Q/K/V without changing the backend state carried across calls.
+    h0_ref = _put(h0)
+    out_ref, state_ref = naive_gla_decode(q, k, v, g_gamma, h0_ref, scale=scale)
     out_ref = out_ref.reshape(B, -1)
 
     return out_backend, state_backend, out_ref, state_ref, pool, pu
