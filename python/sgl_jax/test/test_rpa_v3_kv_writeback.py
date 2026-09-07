@@ -25,48 +25,39 @@ from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import
     ids=["cold", "warm-ragged", "chunk-prefill", "decode", "full", "sink"],
 )
 def test_kv_writeback(sequences, page_size, window, chunk_size, sink):
-    # Each sequence is (new token count, cached prefix length). Use multiple
-    # query blocks, unaligned boundaries and a non-contiguous physical page map.
-    q_lens = [q_len for q_len, _ in sequences]
-    kv_lens = [q_len + prefix for q_len, prefix in sequences]
-    page_counts = [(length + page_size - 1) // page_size for length in kv_lens]
-    capacities = np.array(page_counts) * page_size
-    num_pages = sum(page_counts)
-    num_tokens = sum(q_lens)
+    # Each sequence is (new token count, cached prefix length).
+    q_lens, prefixes = np.array(sequences).T
+    kv_lens = q_lens + prefixes
+    cu_q_lens = np.r_[0, np.cumsum(q_lens)]
+    page_counts = (kv_lens + page_size - 1) // page_size
+    page_offsets = np.r_[0, np.cumsum(page_counts)]
+    num_tokens = cu_q_lens[-1]
     padded_tokens = (num_tokens + 31) // 32 * 32
     num_heads, head_dim = 4, 128
     rng = np.random.default_rng(42)
-    page_indices = rng.permutation(np.arange(1, num_pages + 1))
+    page_indices = rng.permutation(np.arange(1, page_offsets[-1] + 1))
     # The first/last pages and unused slots within mapped pages must stay intact.
-    cache = np.full((num_pages + 2, page_size, 1, 2, head_dim), -7, np.float32)
+    cache = np.full((page_offsets[-1] + 2, page_size, 1, 2, head_dim), -7, np.float32)
     expected_cache = cache.copy()
-    keys = np.zeros((padded_tokens, 1, head_dim), np.float32)
-    values = np.zeros_like(keys)
+    new_kv = np.zeros((padded_tokens, 2, head_dim), np.float32)
     reference_pages = np.zeros((len(sequences), max(page_counts)), np.int32)
-    token_offset = page_offset = 0
-    for seq_idx, ((q_len, prefix), kv_len, page_count) in enumerate(
-        zip(sequences, kv_lens, page_counts)
-    ):
-        kv = rng.integers(-4, 5, size=(kv_len, 2, head_dim)).astype(np.float32)
-        pages = page_indices[page_offset : page_offset + page_count]
-        reference_pages[seq_idx, :page_count] = pages
+    for i, prefix in enumerate(prefixes):
+        kv = rng.integers(-4, 5, size=(kv_lens[i], 2, head_dim)).astype(np.float32)
+        pages = page_indices[page_offsets[i] : page_offsets[i + 1]]
+        reference_pages[i, : len(pages)] = pages
         # Token-level scatter is independent of the kernel's DMA/window tiling.
-        for position in range(kv_len):
-            physical_page = pages[position // page_size]
-            slot = position % page_size
-            expected_cache[physical_page, slot, 0] = kv[position]
-            if position < prefix:
-                cache[physical_page, slot, 0] = kv[position]
-        keys[token_offset : token_offset + q_len, 0] = kv[prefix:, 0]
-        values[token_offset : token_offset + q_len, 0] = kv[prefix:, 1]
-        token_offset += q_len
-        page_offset += page_count
+        positions = np.arange(kv_lens[i])
+        physical_pages, slots = pages[positions // page_size], positions % page_size
+        expected_cache[physical_pages, slots, 0] = kv
+        cache[physical_pages[:prefix], slots[:prefix], 0] = kv[:prefix]
+        new_kv[cu_q_lens[i] : cu_q_lens[i + 1]] = kv[prefix:]
 
     queries = jnp.asarray(
         rng.uniform(-0.25, 0.25, (padded_tokens, num_heads, head_dim)), jnp.bfloat16
     )
-    cu_q_lens = jnp.asarray(np.cumsum([0] + q_lens), jnp.int32)
+    cu_q_lens = jnp.asarray(cu_q_lens, jnp.int32)
     kv_lens = jnp.asarray(kv_lens, jnp.int32)
+    attention_args = dict(sm_scale=head_dim**-0.5, sliding_window=window, attention_sink=sink)
     expected_output = ref_ragged_paged_attention(
         queries,
         jnp.asarray(expected_cache[:, :, :, 0, :], jnp.bfloat16),
@@ -75,31 +66,27 @@ def test_kv_writeback(sequences, page_size, window, chunk_size, sink):
         jnp.asarray(reference_pages),
         cu_q_lens,
         jnp.array([len(sequences)], jnp.int32),
-        sm_scale=head_dim**-0.5,
-        sliding_window=window,
-        attention_sink=sink,
+        **attention_args,
     )
     count = len(sequences)
-    decode_count = count if all(q_len == 1 for q_len in q_lens) else 0
+    decode_count = count if np.all(q_lens == 1) else 0
     prefill_count = count if chunk_size is not None else decode_count
     output, updated_cache = ragged_paged_attention(
         queries,
-        jnp.asarray(keys, jnp.bfloat16),
-        jnp.asarray(values, jnp.bfloat16),
+        jnp.asarray(new_kv[:, 0:1], jnp.bfloat16),
+        jnp.asarray(new_kv[:, 1:2], jnp.bfloat16),
         jnp.asarray(cache, jnp.bfloat16),
         kv_lens,
         jnp.asarray(page_indices, jnp.int32),
         cu_q_lens,
-        jnp.asarray(np.cumsum(np.r_[0, capacities]), jnp.int32),
+        jnp.asarray(page_offsets * page_size, jnp.int32),
         jnp.array([decode_count, prefill_count, count], jnp.int32),
         None,
-        sliding_window=window,
-        sm_scale=head_dim**-0.5,
         chunk_prefill_size=chunk_size,
-        attention_sink=sink,
         d_block_sizes=(1, 256, 1, 256),
         p_block_sizes=(32, 256, 32, 256),
         m_block_sizes=(32, 256, 32, 256),
+        **attention_args,
     )
     output, updated_cache = jax.device_get((output, updated_cache))
 
