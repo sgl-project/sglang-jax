@@ -189,11 +189,18 @@ def test_force_cache_aware_full_miss_falls_back_to_shape_aware():
     )
 
 
-def test_force_cache_aware_considers_only_eligible_matches():
+def test_force_cache_aware_defers_for_ineligible_longest_holder():
     counts = [8, 0]
     tokens = [800, 0]
     matches = {0: 1024, 1: 512}
-    assert _pick([1], counts, tokens, matches, prompt_len=1200, picker=force_pick) == 1
+    assert _pick([1], counts, tokens, matches, prompt_len=1200, picker=force_pick) is None
+
+
+def test_force_cache_aware_defers_when_only_holder_is_ineligible():
+    counts = [8, 0]
+    tokens = [800, 0]
+    matches = {0: 1024, 1: 0}
+    assert _pick([1], counts, tokens, matches, prompt_len=1200, picker=force_pick) is None
 
 
 def _req(

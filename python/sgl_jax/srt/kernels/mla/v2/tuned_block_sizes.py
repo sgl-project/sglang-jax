@@ -147,6 +147,18 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 256, 1024): (8, 256),
         ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 256, 2048): (8, 256),
         ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 256, 4096): (8, 256),
+        # ===== Ling-3.0-Tiny (16 q-heads, TP8/DP8 → attention TP=1, page=256) =====
+        # The table key does not include actual KV length, so these are minimax
+        # choices that beat the fallback at both KV=2048 and KV=8192. Kernel
+        # latency reductions versus mixed=(1,16):
+        #   mnt=64:  (16,32), 13.5% / 25.3%
+        #   mnt=128: (8,16),  31.5% / 33.3%
+        #   mnt=256: (4,64),  35.3% / 35.4%
+        # Decode winners changed with KV length (or stayed below 10%), so no
+        # Ling-3 decode entries are installed from this sweep.
+        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 256, 64): (16, 32),
+        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 256, 128): (8, 16),
+        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 256, 256): (4, 64),
         # ===== DeepSeek-V3 671B (num_q_heads=128 → 16/shard, kv_lora=512,
         # page=128). decode reuses v6e sweep; mixed bq capped at 128 — v7x
         # scoped VMEM limit is 57.6M (< v6e), bq=256 OOMs by 3.6M at mnt≥256.
