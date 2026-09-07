@@ -1,15 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${RAIDEN_SRC:?set RAIDEN_SRC to a tpu-raiden checkout}"
+: "${RAIDEN_SRC:?set RAIDEN_SRC to a tpu-sync checkout}"
 : "${RAIDEN_CACHE_ROOT:?set RAIDEN_CACHE_ROOT to a persistent cache directory}"
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PATCH="$SCRIPT_DIR/patches/tpu-sync/jax-0.11.1.patch"
 PYTHON_BIN=${PYTHON_BIN:-python3.12}
-JAX_VERSION=${JAX_VERSION:-0.10.2}
-JAXLIB_VERSION=${JAXLIB_VERSION:-${JAX_VERSION}}
-LIBTPU_VERSION=${LIBTPU_VERSION:-0.0.42.1}
-RAIDEN_COMMIT=${RAIDEN_COMMIT:-$(git -C "${RAIDEN_SRC}" rev-parse HEAD)}
+JAX_VERSION=0.11.1
+JAXLIB_VERSION=0.11.1
+LIBTPU_VERSION=0.0.46.1
+RAIDEN_COMMIT=6d43141191210b73359d22743be619532ad587dc
 CACHE_DIR=${RAIDEN_CACHE_ROOT}/${RAIDEN_COMMIT}-jax${JAX_VERSION}-jaxlib${JAXLIB_VERSION}-libtpu${LIBTPU_VERSION}
+
+test "$(git -C "${RAIDEN_SRC}" rev-parse HEAD)" = "${RAIDEN_COMMIT}"
+if ! git -C "${RAIDEN_SRC}" apply --reverse --check "$PATCH" 2>/dev/null; then
+  git -C "${RAIDEN_SRC}" apply --check "$PATCH"
+  git -C "${RAIDEN_SRC}" apply "$PATCH"
+fi
 
 if [[ -s "${CACHE_DIR}/READY" && -s "${CACHE_DIR}/SHA256SUMS" ]]; then
   (
@@ -20,7 +28,6 @@ if [[ -s "${CACHE_DIR}/READY" && -s "${CACHE_DIR}/SHA256SUMS" ]]; then
   exit 0
 fi
 
-test "$(git -C "${RAIDEN_SRC}" rev-parse HEAD)" = "${RAIDEN_COMMIT}"
 grep -q "jax==${JAX_VERSION}" "${RAIDEN_SRC}/requirements.txt"
 grep -q "jaxlib==${JAXLIB_VERSION}" "${RAIDEN_SRC}/requirements.txt"
 grep -q "libtpu==${LIBTPU_VERSION}" "${RAIDEN_SRC}/requirements.txt"
