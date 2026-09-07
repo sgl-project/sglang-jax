@@ -304,6 +304,11 @@ suites = {
     # cpu-test CI job sets that env var.
     "unit-test-cpu": [
         TestFile(
+            "python/sgl_jax/test/configs/test_deepseek_v4_config.py",
+            0.1,
+            runner="pytest",
+        ),
+        TestFile(
             "python/sgl_jax/test/test_embedding_pool.py",
             0.1,
             runner="pytest",
