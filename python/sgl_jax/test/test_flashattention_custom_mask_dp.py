@@ -90,8 +90,20 @@ def _build(kv_lens, n_kv_heads, dp_size, seed=0):
     extend = np.full((bs,), q, dtype=np.int32)
     cu_q = _per_dp_cumsum(extend, dp_size, per_dp_bs)
     cu_kv = _per_dp_cumsum(np.asarray(aligned, np.int32), dp_size, per_dp_bs)
-    # Rank-local page indices, repeated per rank.
-    page_indices = np.tile(np.arange(pages_per_rank, dtype=np.int32), dp_size)
+    # Rank-local page indices. The kernel starts sequence i's pages at
+    # ``cu_kv_lens[i] // PAGE_SIZE`` (ragged_paged_attention_v3.py:640), i.e.
+    # packed by actual aligned length -- not at ``i * pages_per_seq``. Production
+    # reaches that layout by repacking page_indices on the host
+    # (flashattention_backend.py:426); index from cu_kv here for the same reason.
+    # A dense arange would instead point the two arms at different cache pages
+    # from the first short sequence onward, and the batch is ragged on purpose.
+    cu_kv_2d = cu_kv.reshape(dp_size, per_dp_bs + 1)
+    page_indices = np.zeros(dp_size * pages_per_rank, np.int32)
+    for r in range(dp_size):
+        for j in range(per_dp_bs):
+            n = aligned[r * per_dp_bs + j] // PAGE_SIZE
+            slot = r * pages_per_rank + cu_kv_2d[r, j] // PAGE_SIZE
+            page_indices[slot : slot + n] = j * pages_per_seq + np.arange(n)
     distribution = np.tile(np.array([0, per_dp_bs, per_dp_bs], np.int32), dp_size)
 
     total_q = bs * q
@@ -104,9 +116,10 @@ def _build(kv_lens, n_kv_heads, dp_size, seed=0):
     # (b) a wrong page index reads zeros just like a right one, so the rank-local
     # page addressing this test also exercises would go unchecked.
     #
-    # Both arms allocate the same total page count (dp=4: 4*32, dp=1: 1*128) and
-    # sequence s reads global pages [s*16, (s+1)*16) either way, so seeding from
-    # the same key gives both arms identical per-sequence cache contents.
+    # Both arms allocate the same total page count (dp=4: 4*32, dp=1: 1*128), and
+    # the page_indices packing above is what makes sequence s read global pages
+    # [s*16, (s+1)*16) in both, so seeding from the same key gives both arms
+    # identical per-sequence cache contents.
     return dict(
         q=jax.random.normal(keys[0], (total_q, n_q_heads, HEAD_DIM), DTYPE),
         k=jax.random.normal(keys[1], (total_q, n_kv_heads, HEAD_DIM), DTYPE),
