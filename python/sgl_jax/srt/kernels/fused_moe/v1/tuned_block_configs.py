@@ -136,6 +136,12 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         ('bfloat16', 'float8_e4m3fn', 8192, 384, 8, 6144, 2048, 32, False, False): (128, 1024, 2048, 2048, 64, 64, 1024, 2048, 2048, 1024),
         ('bfloat16', 'float8_e4m3fn', 16384, 384, 8, 6144, 2048, 32, False, False): (128, 1024, 2048, 2048, 64, 64, 1024, 2048, 2048, 1024),
 
+        # DeepSeek-V3 671B (hidden=7168, ep=32) — shared expert computed
+        # out-of-kernel (use_shared=False). bd1/bd2=1024 (must divide 7168).
+        # T=512 (bt=16) verified on v7x-16; T<512 entries pending verification.
+        ('bfloat16', 'float8_e4m3fn', 512, 256, 8, 7168, 2048, 32, False, False): (16, 2048, 1024, 1024, 64, 16, 2048, 1024, 1024, 256),
+        ('bfloat16', 'float8_e4m3fn', 512, 256, 8, 7168, 2048, 32, False, True): (16, 2048, 1024, 1024, 64, 16, 2048, 1024, 1024, 256),
+
         ('bfloat16', 'float8_e4m3fn', 64, 256, 8, 8192, 2048, 32, True, True): (2, 2048, 4096, 4096, 4, 4, 256, 512, 4096, 512),
         ('bfloat16', 'float8_e4m3fn', 128, 256, 8, 8192, 2048, 32, True, True): (4, 2048, 4096, 4096, 8, 8, 256, 512, 4096, 256),
         ('bfloat16', 'float8_e4m3fn', 256, 256, 8, 8192, 2048, 32, True, True): (8, 2048, 2048, 2048, 16, 16, 256, 512, 2048, 2048),
@@ -229,6 +235,16 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         ('bfloat16', 'bfloat16', 2048, 128, 8, 2048, 768, 4, False, False): (512, 768, 2048, 2048, 128, 128, 768, 2048, 2048, 768),
         ('bfloat16', 'bfloat16', 4096, 128, 8, 2048, 768, 4, False, False): (512, 768, 2048, 2048, 128, 128, 768, 2048, 2048, 768),
         ('bfloat16', 'bfloat16', 8192, 128, 8, 2048, 768, 4, False, False): (512, 768, 2048, 2048, 128, 128, 768, 2048, 2048, 768),
+        # DeepSeek-V3: 256 experts, top_k=8, H=7168, I=2048, ep=64. Shared expert
+        # computed out-of-kernel → use_shared=False. DECODE only (T≤512): raise
+        # bts from DEFAULT bts=bt (2/4/8, MXU-underutilized) to 64; bd=1024
+        # (must divide 7168). EXTEND (T≥1024) uses DEFAULT (large bts → VMEM OOM).
+        ('bfloat16', 'float8_e4m3fn', 128, 256, 8, 7168, 2048, 64, False, False): (2, 2048, 1024, 1024, 64, 2, 2048, 1024, 1024, 256),
+        ('bfloat16', 'float8_e4m3fn', 256, 256, 8, 7168, 2048, 64, False, False): (4, 2048, 1024, 1024, 64, 4, 2048, 1024, 1024, 256),
+        ('bfloat16', 'float8_e4m3fn', 512, 256, 8, 7168, 2048, 64, False, False): (8, 2048, 1024, 1024, 64, 8, 2048, 1024, 1024, 256),
+        ('bfloat16', 'float8_e4m3fn', 128, 256, 8, 7168, 2048, 64, False, True): (2, 2048, 1024, 1024, 64, 2, 2048, 1024, 1024, 256),
+        ('bfloat16', 'float8_e4m3fn', 256, 256, 8, 7168, 2048, 64, False, True): (4, 2048, 1024, 1024, 64, 4, 2048, 1024, 1024, 256),
+        ('bfloat16', 'float8_e4m3fn', 512, 256, 8, 7168, 2048, 64, False, True): (8, 2048, 1024, 1024, 64, 8, 2048, 1024, 1024, 256),
     },
     # Fallback for any device kind.
     "*": {},
