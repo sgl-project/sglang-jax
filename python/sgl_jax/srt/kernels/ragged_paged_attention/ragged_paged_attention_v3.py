@@ -886,6 +886,17 @@ def _ragged_paged_attention_kernel_loop(
 
         actual_bq_csz = min(bq_csz, actual_bq_sz)
 
+        def get_bkv_start(bq_idx):
+            start = 0
+            if sliding_window is not None:
+                start = jnp.maximum(kv_q_gap + bq_idx * actual_bq_sz - sliding_window, 0) // bkv_sz
+                # Only the last query block writes back KV. It must visit all
+                # new KV blocks, including those outside its attention window.
+                start = lax.select(
+                    bq_idx == num_bq - 1, jnp.minimum(start, kv_q_gap // bkv_sz), start
+                )
+            return start
+
         def get_next_bq_ids(seq_idx, bq_idx, bq_sem_idx):
             next_bq_idx = bq_idx + 1
             is_last_bq = next_bq_idx == num_bq
@@ -903,12 +914,7 @@ def _ragged_paged_attention_kernel_loop(
             next_seq_idx = lax.select(is_last_bq, seq_idx + 1, seq_idx)
             next_bkv_sem_idx = lax.select(bkv_sem_idx == 0, 1, 0)
 
-            next_bq_start_bkv_idx = 0
-            if sliding_window is not None:
-                next_bq_start_bkv_idx = (
-                    jnp.maximum(kv_q_gap + (bq_idx + 1) * actual_bq_sz - sliding_window, 0)
-                    // bkv_sz
-                )
+            next_bq_start_bkv_idx = get_bkv_start(bq_idx + 1)
             next_bkv_idx = lax.select(is_last_bkv, next_bq_start_bkv_idx, next_bkv_idx)
             next_bkv_idx = lax.select(is_last_bq, next_seq_start_bkv_idx, next_bkv_idx)
             return next_seq_idx, next_bq_idx, next_bkv_idx, next_bkv_sem_idx
@@ -941,9 +947,10 @@ def _ragged_paged_attention_kernel_loop(
             )
 
             processed_q_len = kv_q_gap + bq_idx * actual_bq_sz
-            start_bkv_idx = 0
+            attention_start_bkv_idx = 0
             if sliding_window is not None:
-                start_bkv_idx = jnp.maximum(processed_q_len - sliding_window, 0) // bkv_sz
+                attention_start_bkv_idx = jnp.maximum(processed_q_len - sliding_window, 0) // bkv_sz
+            start_bkv_idx = get_bkv_start(bq_idx)
             if use_causal_mask:
                 effective_kv_len = jnp.minimum(kv_len, processed_q_len + actual_bq_sz)
             else:
@@ -1029,7 +1036,12 @@ def _ragged_paged_attention_kernel_loop(
                 def attention_loop(idx):
                     bkv_start = idx * bkv_csz
 
-                    @pl.when(bkv_start < effective_bkv_sz)
+                    @pl.when(
+                        jnp.logical_and(
+                            bkv_start < effective_bkv_sz,
+                            bkv_idx >= attention_start_bkv_idx,
+                        )
+                    )
                     def _():
                         for bq_start in range(0, actual_bq_sz, actual_bq_csz):
                             # Slice custom mask for this compute sub-block
