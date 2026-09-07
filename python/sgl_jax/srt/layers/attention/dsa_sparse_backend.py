@@ -800,7 +800,11 @@ def _scatter_paged(
     offset = abs_pos % page_size
     page = page_indices[cu_kv_lens[seq_id] // page_size + page_local]
 
-    sentinel = cache3d.shape[0] - 1
+    # Padding rows must land on the reserved page: the allocator hands out
+    # local pages 1..pages_per_rank and keeps page 0 (reads through it are
+    # masked past kv_len), while the LAST page is allocatable — near-full
+    # pools would otherwise get offset 0 of a live page's keys clobbered.
+    sentinel = 0
     safe_page = jnp.where(valid, page, sentinel)
     safe_off = jnp.where(valid, offset, 0)
     return cache3d.at[safe_page, safe_off].set(new_tokens.astype(cache3d.dtype))
