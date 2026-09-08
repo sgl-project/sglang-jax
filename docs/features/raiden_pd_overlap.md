@@ -81,11 +81,14 @@ gap between these events; this is server-side availability, not client TTFT.
    short requests, multi-chunk prompts, concurrency, cancellation, timeout,
    retraction and a healthy sentinel request after failures. Record pool usage
    after requests drain. Larger local DP configurations need larger TPU shapes.
-4. After correctness passes, alternate warmed A/B runs with identical requests
-   and at least three repetitions. Record client TTFT, TPOT, p95/p99, goodput and
-   raw request samples. Capture separate profiler runs to establish actual CPU
-   scheduling, TPU compute and Raiden transfer overlap. Do not infer device
-   overlap from CPU tests or attribute D-only improvements to transport.
+4. After correctness passes, alternate continuous-load A/B runs with identical
+   requests and at least three repetitions. Record in-window output throughput,
+   client TTFT, inter-token latency, E2E latency and raw request samples. Check
+   matched arrival rates when higher closed-loop throughput changes queueing.
+   Capture separate profiles to inspect CPU scheduling and TPU compute; establish
+   native transfer overlap only if the trace exposes the necessary events. CPU
+   overlap and D-only improvements do not establish physical DMA overlap. SLO
+   goodput requires an explicit latency target and a separate load sweep.
 
 CPU regression command (install the project's test dependencies first):
 
