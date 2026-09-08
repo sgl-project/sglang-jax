@@ -1,6 +1,5 @@
 import logging
 from collections.abc import Callable
-from functools import partial
 from types import SimpleNamespace
 
 import jax
@@ -450,9 +449,9 @@ class Qwen3VLVisionModel(nnx.Module):
     def __call__(
         self,
         patches: jax.Array,
-        metadata: jax.Array,
+        **metadata: jax.Array,
     ) -> jax.Array:
-        return self.encode(patches, metadata)
+        return self.encode(patches, **metadata)
 
     def _forward(
         self,
@@ -499,27 +498,27 @@ class Qwen3VLVisionModel(nnx.Module):
     def encode(
         self,
         patches: jax.Array,
-        metadata: jax.Array,
+        *,
+        pos_indices: jax.Array,
+        pos_weights: jax.Array,
+        position_ids: jax.Array,
+        cu_seqlens: jax.Array,
     ) -> jax.Array:
-        """Encode flat lane-major patch and metadata buffers."""
-        num_lanes = encoder_num_lanes(self.mesh, self.vision_tp)
-        capacity = patches.size // (num_lanes * self.patch_dim)
+        """Encode flat patches with lane-major position and attention metadata."""
         token_sharding = self.specs.sharding(self.specs.batch_axis)
         patches = patches.reshape(
             -1,
             self.patch_dim,
             out_sharding=token_sharding,
         )
-        spec = PartitionSpec(self.specs.batch_axis)
-        metadata_views = jax.shard_map(
-            partial(self._metadata_views, capacity=capacity),
-            mesh=self.mesh,
-            in_specs=spec,
-            out_specs=(spec,) * 4,
-            check_vma=False,
-        )(metadata)
         patches = patches.astype(self.dtype)
-        output, deepstack = self._forward(patches, *metadata_views)
+        output, deepstack = self._forward(
+            patches,
+            pos_indices,
+            pos_weights,
+            position_ids,
+            cu_seqlens,
+        )
         if self.mesh is not None:
             output = apply_data_sharding(output, self.mesh, PartitionSpec(self.specs.batch_axis))
             deepstack = apply_data_sharding(
@@ -562,7 +561,7 @@ class Qwen3VLVisionModel(nnx.Module):
         capacity: int,
         *,
         sharding: NamedSharding,
-    ) -> jax.Array:
+    ) -> dict[str, jax.Array]:
         with jax.profiler.TraceAnnotation("encoder_metadata_host_build"):
             grid_thw = np.asarray(grid_thw, dtype=np.int32)
             if grid_thw.ndim == 2:
@@ -573,21 +572,6 @@ class Qwen3VLVisionModel(nnx.Module):
         with jax.profiler.TraceAnnotation("encoder_metadata_device_put"):
             return jax.device_put(metadata, sharding)
 
-    def _metadata_views(self, metadata: np.ndarray | jax.Array, capacity: int):
-        """Decode one lane's flat metadata buffer into token-major views."""
-        leading_shape = metadata.shape[:-1]
-        indices_end = 4 * capacity
-        weights_end = indices_end + 4 * capacity
-        positions_end = weights_end + 2 * capacity
-        return (
-            metadata[..., :indices_end].reshape(*leading_shape, capacity, 4),
-            jax.lax.bitcast_convert_type(
-                metadata[..., indices_end:weights_end], jnp.float32
-            ).reshape(*leading_shape, capacity, 4),
-            metadata[..., weights_end:positions_end].reshape(*leading_shape, capacity, 2),
-            metadata[..., positions_end:],
-        )
-
     def _build_metadata(self, grid_thw: np.ndarray, capacity: int):
         lane_metadata = [
             self._lane_metadata(
@@ -596,19 +580,13 @@ class Qwen3VLVisionModel(nnx.Module):
             )
             for lane in grid_thw
         ]
-        flat_lanes = []
-        for pos_indices, pos_weights, position_ids, cu_seqlens in lane_metadata:
-            flat_lanes.append(
-                np.concatenate(
-                    (
-                        pos_indices.T.reshape(-1),
-                        np.ascontiguousarray(pos_weights.T).view(np.int32).reshape(-1),
-                        position_ids.reshape(-1),
-                        cu_seqlens,
-                    )
-                )
-            )
-        return np.stack(flat_lanes).reshape(-1)
+        pos_indices, pos_weights, position_ids, cu_seqlens = zip(*lane_metadata)
+        return {
+            "pos_indices": np.concatenate([indices.T for indices in pos_indices]),
+            "pos_weights": np.concatenate([weights.T for weights in pos_weights]),
+            "position_ids": np.concatenate(position_ids),
+            "cu_seqlens": np.concatenate(cu_seqlens),
+        }
 
 
 class Qwen3VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):

@@ -423,7 +423,7 @@ class Qwen2_5_VisionTransformer(nnx.Module):
     # Accept strided and read-only grids without additional specializations.
     @staticmethod
     @njit(
-        types.int32[::1](
+        types.Tuple((types.int32[:, ::1], types.int32[:, ::1], types.int32[::1], types.int32[::1]))(
             types.Array(types.int32, 3, "A", readonly=True),
             types.int64,
             types.int64,
@@ -435,7 +435,6 @@ class Qwen2_5_VisionTransformer(nnx.Module):
     def _build_metadata(grid_thw, capacity, merge, window):
         """Write lane-local permutations, positions and boundaries in one pass.
 
-        The flat buffer matches ``Qwen2_5_VisionTransformer._metadata_views``.
         Visit only valid merge units in window order, avoiding padded indices,
         coordinate grids, gathers and per-image temporary arrays.
         """
@@ -448,16 +447,16 @@ class Qwen2_5_VisionTransformer(nnx.Module):
             raise ValueError("grid_thw must have three coordinates per grid")
         num_lanes = grid_thw.shape[0]
         num_units = capacity // unit
-        positions_start = 2 * num_units
-        window_start = positions_start + 2 * capacity
-        full_start = window_start + num_units + 1
-        metadata = np.zeros((num_lanes, full_start + num_units + 1), dtype=np.int32)
+        indices = np.zeros((num_lanes, num_units, 2), dtype=np.int32)
+        position_ids = np.zeros((num_lanes, capacity, 2), dtype=np.int32)
+        window_cu_seqlens = np.zeros((num_lanes, num_units + 1), dtype=np.int32)
+        full_cu_seqlens = np.zeros((num_lanes, num_units + 1), dtype=np.int32)
 
         for lane in range(num_lanes):
             # Padding units retain the identity permutation and zero positions.
             for index in range(num_units):
-                metadata[lane, 2 * index] = index
-                metadata[lane, 2 * index + 1] = index
+                indices[lane, index, 0] = index
+                indices[lane, index, 1] = index
             patch_offset = unit_offset = 0
             window_segment = frame_segment = 1
             for image in range(grid_thw.shape[1]):
@@ -478,27 +477,31 @@ class Qwen2_5_VisionTransformer(nnx.Module):
                             for y in range(window_y, min(window_y + window, grid_h)):
                                 for x in range(window_x, min(window_x + window, grid_w)):
                                     source_unit = frame_unit_offset + y * grid_w + x
-                                    metadata[lane, 2 * unit_offset] = source_unit
-                                    metadata[lane, 2 * source_unit + 1] = unit_offset
+                                    indices[lane, unit_offset, 0] = source_unit
+                                    indices[lane, source_unit, 1] = unit_offset
                                     for dy in range(merge):
                                         for dx in range(merge):
-                                            position = positions_start + 2 * patch_offset
-                                            metadata[lane, position] = y * merge + dy
-                                            metadata[lane, position + 1] = x * merge + dx
+                                            position_ids[lane, patch_offset, 0] = y * merge + dy
+                                            position_ids[lane, patch_offset, 1] = x * merge + dx
                                             patch_offset += 1
                                     unit_offset += 1
-                            metadata[lane, window_start + window_segment] = patch_offset
+                            window_cu_seqlens[lane, window_segment] = patch_offset
                             window_segment += 1
-                    metadata[lane, full_start + frame_segment] = patch_offset
+                    full_cu_seqlens[lane, frame_segment] = patch_offset
                     frame_segment += 1
             # Repeated final ends describe empty segments in the bucket padding.
-            metadata[lane, window_start + window_segment : full_start] = patch_offset
-            metadata[lane, full_start + frame_segment :] = patch_offset
-        return metadata.reshape(-1)
+            window_cu_seqlens[lane, window_segment:] = patch_offset
+            full_cu_seqlens[lane, frame_segment:] = patch_offset
+        return (
+            indices.reshape(-1, 2),
+            position_ids.reshape(-1, 2),
+            window_cu_seqlens.reshape(-1),
+            full_cu_seqlens.reshape(-1),
+        )
 
     def prepare_metadata(
         self, grid_thw: np.ndarray, capacity: int, *, sharding: NamedSharding
-    ) -> jax.Array:
+    ) -> dict[str, jax.Array]:
         """Build host attention metadata and upload it with the input sharding."""
         with jax.profiler.TraceAnnotation("encoder_metadata_host_build"):
             grid_thw = np.asarray(grid_thw, dtype=np.int32)
@@ -506,28 +509,20 @@ class Qwen2_5_VisionTransformer(nnx.Module):
                 grid_thw = grid_thw[None]
             if grid_thw.ndim != 3 or grid_thw.shape[-1] != 3:
                 raise ValueError("grid_thw must have shape [items, 3] or [lanes, items, 3]")
-            metadata = self._build_metadata(
+            indices, position_ids, window_cu_seqlens, full_cu_seqlens = self._build_metadata(
                 grid_thw,
                 capacity,
                 self.spatial_merge_size,
                 self.window_size // self.spatial_merge_size // self.patch_size,
             )
+            metadata = {
+                "indices": indices,
+                "position_ids": position_ids,
+                "window_cu_seqlens": window_cu_seqlens,
+                "full_cu_seqlens": full_cu_seqlens,
+            }
         with jax.profiler.TraceAnnotation("encoder_metadata_device_put"):
             return jax.device_put(metadata, sharding)
-
-    def _metadata_views(self, metadata: np.ndarray | jax.Array, capacity: int):
-        """Views of the same buffer on the host and inside the ViT JIT."""
-        leading_shape = metadata.shape[:-1]
-        num_units = capacity // self.spatial_merge_unit
-        indices_end = 2 * num_units
-        positions_end = indices_end + 2 * capacity
-        window_end = positions_end + num_units + 1
-        return (
-            metadata[..., :indices_end].reshape(*leading_shape, num_units, 2),
-            metadata[..., indices_end:positions_end].reshape(*leading_shape, capacity, 2),
-            metadata[..., positions_end:window_end],
-            metadata[..., window_end:],
-        )
 
     def _reorder(self, x: jax.Array, indices: jax.Array) -> jax.Array:
         """Gather within each device's lane, using lane-local unit indices."""
@@ -543,9 +538,9 @@ class Qwen2_5_VisionTransformer(nnx.Module):
     def __call__(
         self,
         patches: jax.Array,
-        metadata: jax.Array,
+        **metadata: jax.Array,
     ) -> jax.Array:
-        return self.encode(patches, metadata)
+        return self.encode(patches, **metadata)
 
     def _forward(
         self,
@@ -591,23 +586,23 @@ class Qwen2_5_VisionTransformer(nnx.Module):
     def encode(
         self,
         patches: jax.Array,
-        metadata: jax.Array,
+        *,
+        indices: jax.Array,
+        position_ids: jax.Array,
+        window_cu_seqlens: jax.Array,
+        full_cu_seqlens: jax.Array,
     ) -> jax.Array:
-        """Encode flat lane-major patch and metadata buffers."""
-        num_lanes = encoder_num_lanes(self.mesh, self.vision_tp)
-        capacity = patches.size // (num_lanes * self.patch_dim)
+        """Encode flat patches with lane-major attention metadata."""
         token_sharding = self.specs.sharding(self.specs.batch_axis)
         patches = patches.reshape(-1, self.patch_dim, out_sharding=token_sharding)
-        spec = PartitionSpec(self.specs.batch_axis)
-        metadata_views = jax.shard_map(
-            partial(self._metadata_views, capacity=capacity),
-            mesh=self.mesh,
-            in_specs=spec,
-            out_specs=(spec,) * 4,
-            check_vma=False,
-        )(metadata)
         patches = patches.astype(self.dtype)
-        return self._forward(patches, *metadata_views)
+        return self._forward(
+            patches,
+            indices,
+            position_ids,
+            window_cu_seqlens,
+            full_cu_seqlens,
+        )
 
     def precompile(self) -> None:
         precompile_mrope_vision_model(

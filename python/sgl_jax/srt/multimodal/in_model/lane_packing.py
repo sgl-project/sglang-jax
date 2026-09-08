@@ -324,12 +324,12 @@ def run_mrope_vision_model(
     input_sharding: NamedSharding,
     output_sharding: NamedSharding,
 ) -> jax.Array:
-    """Prepare sharded patch/metadata buffers, run the model, and restore order.
+    """Prepare sharded patches and metadata, run the model, and restore order.
 
     The model's ``prepare_metadata`` method receives host grids or positions/counts
-    plus ``capacity`` and ``sharding`` and returns a flat device metadata buffer.
-    Both inputs to ``vision_model(patches, metadata)`` are one-dimensional,
-    with contiguous lane slices following ``input_sharding``.
+    plus ``capacity`` and ``sharding`` and returns a dict of model-specific device arrays.
+    Patches are flat; metadata arrays retain their field shapes. Both use
+    contiguous lane slices following ``input_sharding``.
     The restored encoder output uses ``output_sharding``.
     Patches retain their input dtype; the model casts them inside its encode JIT.
     """
@@ -361,7 +361,7 @@ def run_mrope_vision_model(
         )
     with jax.set_mesh(mesh):
         with jax.profiler.TraceAnnotation("encoder_vision_dispatch"):
-            output = vision_model(patches, metadata)
+            output = vision_model(patches, **metadata)
         return restore_encoder_output(output, output_indices, output_sharding)
 
 

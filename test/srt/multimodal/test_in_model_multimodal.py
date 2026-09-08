@@ -143,7 +143,7 @@ def _qwen2_metadata(visual, grid_thw, capacity):
     metadata = visual.prepare_metadata(
         grid_thw, capacity, sharding=visual.specs.sharding(visual.specs.batch_axis)
     )
-    return visual._metadata_views(metadata.reshape(len(grid_thw), -1), capacity)
+    return jax.tree.map(lambda x: x.reshape(len(grid_thw), -1, *x.shape[1:]), metadata)
 
 
 def _run_grid_vision(visual, items):
@@ -246,14 +246,15 @@ def _schedule_batch(req, model_config=None):
 def _assert_vision_precompile(visual):
     calls = []
 
-    def encode(patches, metadata):
+    def encode(patches, **metadata):
         sharding = visual.specs.sharding(visual.specs.batch_axis)
-        for value in (patches, metadata):
+        assert patches.ndim == 1
+        for value in (patches, *metadata.values()):
             assert isinstance(value, jax.Array)
-            assert value.ndim == 1
-            assert value.sharding.is_equivalent_to(sharding, ndim=1)
-        assert metadata.dtype == jnp.int32
-        calls.append((patches.shape, metadata.shape))
+            assert value.sharding.is_equivalent_to(sharding, ndim=value.ndim)
+        for name, value in metadata.items():
+            assert value.dtype == (jnp.float32 if name == "pos_weights" else jnp.int32)
+        calls.append((patches.shape, {name: value.shape for name, value in metadata.items()}))
         num_lanes = encoder_num_lanes(visual.mesh, visual.vision_tp)
         capacity = patches.size // (num_lanes * visual.patch_dim)
         return jnp.zeros((num_lanes * capacity // visual.spatial_merge_unit, 1))
@@ -272,20 +273,52 @@ def test_qwen2_vision_precompile_warms_configured_buckets():
         deepstack_visual_indexes=[],
     )
     assert _assert_vision_precompile(_visual(config=config, input_buckets=(4, 8))) == [
-        ((4,), (14,)),
-        ((8,), (26,)),
+        (
+            (4,),
+            {
+                "indices": (1, 2),
+                "position_ids": (4, 2),
+                "window_cu_seqlens": (2,),
+                "full_cu_seqlens": (2,),
+            },
+        ),
+        (
+            (8,),
+            {
+                "indices": (2, 2),
+                "position_ids": (8, 2),
+                "window_cu_seqlens": (3,),
+                "full_cu_seqlens": (3,),
+            },
+        ),
     ]
 
 
-def test_qwen3_vision_precompile_uses_flat_buffers():
+def test_qwen3_vision_precompile_uses_structured_metadata():
     config = _vision_config(
         spatial_merge_size=2,
         num_position_embeddings=16,
         deepstack_visual_indexes=[],
     )
     assert _assert_vision_precompile(_qwen3_visual(config, input_buckets=(4, 8))) == [
-        ((4,), (42,)),
-        ((8,), (83,)),
+        (
+            (4,),
+            {
+                "pos_indices": (4, 4),
+                "pos_weights": (4, 4),
+                "position_ids": (4, 2),
+                "cu_seqlens": (2,),
+            },
+        ),
+        (
+            (8,),
+            {
+                "pos_indices": (8, 4),
+                "pos_weights": (8, 4),
+                "position_ids": (8, 2),
+                "cu_seqlens": (3,),
+            },
+        ),
     ]
 
 
@@ -722,7 +755,7 @@ def test_qwen2_vision_metadata_is_bucket_stable():
     visual = _visual(config, input_buckets=(32,))
     first = _items([(1, 4, 6)], [(0, 6)])
     patches, grid_thw, output_indices = _pack_qwen2(visual, first)
-    _, position_ids, _, _ = _qwen2_metadata(visual, grid_thw, patches.shape[1])
+    position_ids = _qwen2_metadata(visual, grid_thw, patches.shape[1])["position_ids"]
 
     np.testing.assert_array_equal(output_indices[:6], np.arange(6))
     assert position_ids.shape == (1, 32, 2)
