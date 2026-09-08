@@ -28,13 +28,23 @@ from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.jax_utils import device_array
 
 
-class EagleDraftWorker(BaseDraftWorker):
-    """EAGLE draft model worker.
+class EagleDraftWorkerBase(BaseDraftWorker):
+    """Shared EAGLE-shaped draft-worker mechanics.
 
     Holds a ``ModelWorker`` (the draft model runner) via composition and
     implements draft-specific logic: multi-step decode, tree building,
     prefill extend, and decode extend.
+
+    This named base keeps reusable proposal machinery separate from the
+    ordinary concrete EAGLE worker. Frozen-KV can reuse these mechanics while
+    owning its target-KV setup and future seed handoff independently.
     """
+
+    draft_input_cls = EagleDraftInput
+
+    def new_draft_input(self, **kwargs) -> EagleDraftInput:
+        """Construct this worker's persistent next-round speculative state."""
+        return self.draft_input_cls(**kwargs)
 
     def __init__(self, server_args, target_worker: ModelWorker):
         self.server_args = server_args
@@ -217,7 +227,7 @@ class EagleDraftWorker(BaseDraftWorker):
     ) -> None:
         sel = np.asarray(model_worker_batch.logits_indices_selector)
         verified_id_np = np.asarray(jax.device_get(next_token_ids))[sel]
-        model_worker_batch.spec_info_padded = EagleDraftInput(
+        model_worker_batch.spec_info_padded = self.new_draft_input(
             hidden_states=hidden_states,
             verified_id=verified_id_np,
             num_tokens_per_batch=np.asarray(1, dtype=jnp.int32),
@@ -270,7 +280,7 @@ class EagleDraftWorker(BaseDraftWorker):
     ) -> None:
         if batch_output.next_draft_input.verified_id.shape[0] <= 0:
             return
-        draft_input = EagleDraftInput(
+        draft_input = self.new_draft_input(
             hidden_states=batch_output.logits_output.hidden_states,
             allocate_lens=batch_output.next_draft_input.allocate_lens,
         )
@@ -279,9 +289,11 @@ class EagleDraftWorker(BaseDraftWorker):
             self.draft_model_runner,
             batch_output,
             self.speculative_num_draft_tokens,
+            prepare_batch_for_forward=self.prepare_draft_extend_batch,
         )
 
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
+        forward_batch.spec_info = self.model_forward_spec_info(forward_batch.spec_info)
         if forward_batch.input_ids.shape[0] <= 0:
             return
         draft_logits_output, _, _ = self.draft_model_runner.forward(
@@ -319,6 +331,26 @@ class EagleDraftWorker(BaseDraftWorker):
             : model_worker_batch.real_bs
         ]
         batch_output.accept_lens = accept_host
+
+    def prepare_draft_extend_batch(
+        self, model_worker_batch: ModelWorkerBatch, step_plus_1: int
+    ) -> None:
+        """Optional pre-forward DRAFT_EXTEND normalization hook.
+
+        Generic EAGLE keeps its existing real-size behavior.  Frozen-KV
+        overrides this hook because its non-overlap merge intentionally lets
+        the live request count vary within a compiled batch bucket.
+        """
+        del model_worker_batch, step_plus_1
+
+    def model_forward_spec_info(self, spec_info: EagleDraftInput) -> EagleDraftInput:
+        """Return the speculative state that is an actual model input.
+
+        Generic EAGLE passes its persistent state through unchanged.  Frozen-KV
+        overrides this to keep scheduler-only KV allocation bookkeeping out of
+        the JAX executable's input pytree.
+        """
+        return spec_info
 
     # -- Internal draft helpers --
 
@@ -604,8 +636,19 @@ class EagleDraftWorker(BaseDraftWorker):
         return select_bs_index
 
 
+class EagleDraftWorker(EagleDraftWorkerBase):
+    """Concrete ordinary EAGLE draft worker.
+
+    Existing EAGLE and multi-layer callers keep this public class name. The
+    implementation is inherited from ``EagleDraftWorkerBase`` so Frozen-KV can
+    reuse common proposal mechanics without subclassing this concrete worker.
+    """
+
+    pass
+
+
 # ---------------------------------------------------------------------------
-# Module-level JIT helpers (used exclusively by EagleDraftWorker)
+# Module-level JIT helpers (used by EAGLE-shaped draft workers)
 # ---------------------------------------------------------------------------
 
 
