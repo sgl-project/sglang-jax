@@ -98,3 +98,9 @@ KV/queue recovery. Sample server states at one-second intervals to distinguish
 active decode with incoming PD work from client concurrency alone. Profiles are
 captured separately for five seconds during continuous mixed traffic; profile
 and export delays are never included in reported performance measurements.
+
+The PR sequence also runs a final 4K/256 C32 comparison of B1, D-only,
+P-only and PD (`steady_ablation.py`). These contemporaneous controls help
+separate queueing changes from a role-specific regression when throughput
+improves but steady TTFT increases. They use the same measurement windows and
+require the main steady/soak suite to have passed.

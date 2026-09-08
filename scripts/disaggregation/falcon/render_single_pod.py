@@ -37,6 +37,7 @@ files = {
         "performance_suite.py",
         "steady_client.py",
         "steady_suite.py",
+        "steady_ablation.py",
         "pr_validation_suite.py",
         "stream_regression.py",
         "eos_checks.py",

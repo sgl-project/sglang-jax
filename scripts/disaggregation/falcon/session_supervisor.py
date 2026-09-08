@@ -73,6 +73,23 @@ def main():
                 "timeout_s": 18000,
             },
         )
+        write(
+            commands / "003-steady-ablation.json",
+            {
+                "id": "steady-ablation",
+                "command": [
+                    sys.executable,
+                    str(ROOT / "scripts/disaggregation/falcon/steady_ablation.py"),
+                ],
+                "env": {
+                    "PD_REQUIRE_SUMMARY": str(RESULTS / "correctness-01/summary.json"),
+                    "PD_REQUIRE_STEADY_SUMMARY": str(
+                        RESULTS / "pr-validation/steady/steady-summary.json"
+                    ),
+                },
+                "timeout_s": 3600,
+            },
+        )
     completed = set()
     last_exit = 1
     while time.monotonic() < DEADLINE:
