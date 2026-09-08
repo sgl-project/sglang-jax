@@ -277,7 +277,7 @@ def run_mrope_vision_model(
     buckets: tuple[int, ...],
     merge_unit: int,
     rope_type: Literal["rope_3d", "rope_2d", "rope_2d_packed"],
-    dtype: np.dtype | type,
+    dtype: np.dtype | type = jnp.bfloat16,
 ) -> jax.Array:
     """Pack, run, and restore a sharded vision model with RoPE metadata."""
     if rope_type == "rope_2d_packed":
@@ -314,7 +314,7 @@ def precompile_mrope_vision_model(
     patch_dim: int,
     merge_unit: int,
     rope_type: Literal["rope_3d", "rope_2d", "rope_2d_packed"],
-    dtype: np.dtype | type,
+    dtype: np.dtype | type = jnp.bfloat16,
 ) -> None:
     merge_size = math.isqrt(merge_unit)
     for capacity in buckets:

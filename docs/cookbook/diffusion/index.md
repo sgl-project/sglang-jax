@@ -31,7 +31,7 @@ End-to-end serving recipes for diffusion-style image and video generation models
 
 A diffusion recipe covers models where the expensive generation loop is denoising, not autoregressive token decoding. For Wan, SGL-JAX stages a text encoder, a DiT denoiser, and a VAE decoder; the endpoint returns an image or video artifact rather than chat tokens.
 
-Autoregressive text and vision-language decoders, including Qwen2.5-VL, live in [Autoregressive recipes](../autoregressive/index.md).
+Autoregressive text and vision-language decoders, including Qwen2.5-VL and Qwen3-VL, live in [Autoregressive recipes](../autoregressive/index.md).
 
 ## Built-in Staging Constraint
 

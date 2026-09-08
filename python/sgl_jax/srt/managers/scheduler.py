@@ -39,6 +39,7 @@ from sgl_jax.srt.managers.communication import CommunicationBackend
 from sgl_jax.srt.managers.dp_rank_assignment import assign_dp_ranks
 from sgl_jax.srt.managers.dp_schedule_policy import (
     pick_cache_aware_dp,
+    pick_force_cache_aware_dp,
     pick_shape_aware_dp,
     req_prefix_match_key,
 )
@@ -70,7 +71,10 @@ from sgl_jax.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
-from sgl_jax.srt.managers.scheduler_metrics_mixin import SchedulerMetricsMixin
+from sgl_jax.srt.managers.scheduler_metrics_mixin import (
+    SchedulerMetricsMixin,
+    compute_avg_spec_accept_length,
+)
 from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
@@ -968,12 +972,12 @@ class Scheduler(
         extra_input_counts: list[int],
         extra_output_counts: list[int],
     ) -> int | None:
-        """Route ``req`` by cache affinity with shape-aware miss fallback.
+        """Route ``req`` by the configured cache policy with shape-aware fallback.
 
-        Probes each eligible rank's cached prefix length, then defers to
-        ``pick_cache_aware_dp``: balance on large load skew, else least-loaded
-        among the ranks holding a substantial cached prefix, else shape-aware
-        selection. Returns None if all DP ranks are full.
+        ``cache_aware`` keeps its soft affinity/load tradeoff;
+        ``force_cache_aware`` always prefers the globally longest cache hit and
+        defers if all of its holders are temporarily full. Both use shape-aware
+        selection on a full miss and return None if all DP ranks are full.
         """
         if self.dp_size == 1:
             return 0
@@ -988,7 +992,10 @@ class Scheduler(
         matches: dict[int, int] = {}
         prompt_len = len(token_ids) if token_ids else 0
         if token_ids:
-            for dp_rank in eligible:
+            probe_ranks = (
+                range(self.dp_size) if self.dp_schedule_policy == "force_cache_aware" else eligible
+            )
+            for dp_rank in probe_ranks:
                 matches[dp_rank] = self._cached_prefix_len(token_ids, extra_key, dp_rank)
 
         running_input, running_output = self._get_dp_io_snapshot()
@@ -996,7 +1003,12 @@ class Scheduler(
         output_counts = [running_output[i] + extra_output_counts[i] for i in range(self.dp_size)]
         item_input, item_output = self._estimate_req_input_output_tokens(req)
 
-        return pick_cache_aware_dp(
+        picker = (
+            pick_force_cache_aware_dp
+            if self.dp_schedule_policy == "force_cache_aware"
+            else pick_cache_aware_dp
+        )
+        return picker(
             eligible,
             counts,
             token_counts,
@@ -1522,6 +1534,9 @@ class Scheduler(
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = dict(global_server_args_dict)
         ret["last_gen_throughput"] = self.last_gen_throughput
+        ret["avg_spec_accept_length"] = compute_avg_spec_accept_length(
+            self.cum_spec_accept_length, self.cum_spec_accept_count
+        )
         ret["memory_usage"] = {
             "kvcache": round(self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2),
             "token_capacity": int(self.max_total_num_tokens),

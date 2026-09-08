@@ -60,6 +60,14 @@ def _sdpa_attention(
     k = key.astype(jnp.float32)
     v = value.astype(jnp.float32)
 
+    if query.shape[0] == 1:
+        sharding = jax.typeof(q).sharding
+        if isinstance(sharding, NamedSharding) and not sharding.mesh.empty:
+            # JAX's grouped-query reshape drops the singleton batch sharding
+            # from Q. Match K/V at the boundary while preserving head sharding.
+            sharding = NamedSharding(sharding.mesh, P(None, *sharding.spec[1:]))
+            q, k, v = (jax.sharding.reshard(x, sharding) for x in (q, k, v))
+
     output = jax.nn.dot_product_attention(
         q,
         k,

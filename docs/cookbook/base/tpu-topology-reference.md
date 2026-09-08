@@ -36,7 +36,7 @@ v6e (and every other generation) is 1:1 chip→device, so `--tp-size` matches ch
 | `v6e-16` (`4x4`) | 4 | 4 | 16 | [MiMo-V2-Flash](../autoregressive/Xiaomi/MiMo-V2-Flash.md) (multi-node) |
 | `v6e-32` | 8 | 4 | 32 | [Grok-2](../autoregressive/Grok/Grok2.md) |
 | `v6e-64` (`4x4x4`) | 16 | 4 | 64 | [MiMo-V2.5-Pro](../autoregressive/Xiaomi/MiMo-V2.5-Pro.md) |
-| `v7x-8` | 1 | 4 | 8 | [Qwen2.5-VL-32B](../autoregressive/Qwen/Qwen2.5-VL.md), [MiMo-V2-Flash](../autoregressive/Xiaomi/MiMo-V2-Flash.md) (single-node) |
+| `v7x-8` | 1 | 4 | 8 | [Qwen2.5-VL-32B](../autoregressive/Qwen/Qwen2.5-VL.md), [Qwen3-VL-32B](../autoregressive/Qwen/Qwen3-VL.md), [MiMo-V2-Flash](../autoregressive/Xiaomi/MiMo-V2-Flash.md) (single-node) |
 | `v7x-16` (`2x2x4`) | 4 | 4 | 32 | [MiMo-V2.5-Pro](../autoregressive/Xiaomi/MiMo-V2.5-Pro.md) |
 
 ## Choosing `--tp-size`
@@ -48,7 +48,7 @@ v6e-N    →  --tp-size = N
 v7x-N    →  --tp-size = N * 2      (N is chip count)
 ```
 
-For MoE models also set `--ep-size = --tp-size` to put one expert shard per device, and split attention with `--dp-size` (attention-TP becomes `tp_size / dp_size`).
+For the standard MoE layout, also set `--ep-size = --tp-size` to put one expert shard per device, and split attention with `--dp-size` (attention-TP becomes `tp_size / dp_size`). Replicated MoE is configured independently with `--moe-dp-size = --dp-size` and currently requires `--ep-size 1`; omitting `--moe-dp-size` preserves the standard layout.
 
 ## Per-chip HBM accounting
 

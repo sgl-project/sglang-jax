@@ -443,7 +443,7 @@ class TestDummyBatch(unittest.TestCase):
         batch = cm._make_dummy_batch(32, 128, ForwardMode.EXTEND, 512)
         assert batch.capture_hidden_mode == CaptureHiddenMode.FULL
 
-    def test_precompile_extend_warms_text_and_multimodal_signatures(self):
+    def test_precompile_extend_uses_one_unified_multimodal_signature(self):
         cm = CompilationManager(
             server_args=_make_server_args(
                 precompile_token_paddings=[4],
@@ -486,7 +486,7 @@ class TestDummyBatch(unittest.TestCase):
             patch.object(
                 host_orchestration,
                 "precompile_multimodal_inputs",
-                return_value=(input_embedding, deepstack),
+                return_value=(input_embedding, deepstack, True),
             ) as precompile_multimodal_inputs,
             patch.object(
                 SamplingMetadata,
@@ -502,10 +502,7 @@ class TestDummyBatch(unittest.TestCase):
                 future_token_ids_map=None,
             )
 
-        assert calls == [
-            (None, None, False, False),
-            (input_embedding, deepstack, True, True),
-        ]
+        assert calls == [(input_embedding, deepstack, True, False)]
         assert cm._compiled_variants == {(ForwardMode.EXTEND, 4, 2, False)}
         assert cm._compiled_multimodal_extend_shapes == {(4, 2)}
         precompile_multimodal_inputs.assert_called_once_with(
