@@ -599,6 +599,21 @@ class Gemma4ForCausalLM(nnx.Module):
         )
         self.capture_aux_hidden_states = False
 
+    def get_embed_and_head(self):
+        """Expose the input embedding and output head to a speculative draft.
+
+        Required by the draft workers' shared-embed step (same contract as
+        llama.py / qwen3.py). The Gemma4 assistant draft embeds tokens with the
+        TARGET's embedding, so this is what binds its ``_target_embed_weight``.
+
+        Gemma4 ties the head by default and only creates ``lm_head`` when
+        ``tie_word_embeddings`` is false, so fall back to the embedding.
+        """
+        embed = self.model.embed_tokens.embedding.value
+        lm_head = getattr(self, "lm_head", None)
+        head = lm_head.embedding.value if lm_head is not None else embed
+        return embed, head
+
     def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(
             model=self,
@@ -915,6 +930,15 @@ class Gemma4ForCausalLM(nnx.Module):
         hidden_states, aux_hidden_states, layers_kv_fused, layers_callback_flag, layers_topk_ids = (
             self.model(forward_batch, kv_pool)
         )
+        # Gemma4Model always returns a list, so it is [] (not None) when nothing
+        # is captured. LogitsProcessor branches on `is not None` and would then
+        # jnp.concat([]) under CaptureHiddenMode.LAST — i.e. on every speculative
+        # verify forward. Mirror llama.py / qwen3.py and normalize to None.
+        # FROZEN_KV_MTP sets capture_aux_hidden_states with a never-matching layer
+        # id on purpose (it wants the final hidden, not an intermediate one), so
+        # the list can be empty even when capture is on — normalize both cases.
+        if not self.capture_aux_hidden_states or not aux_hidden_states:
+            aux_hidden_states = None
         if not getattr(self.config, "tie_word_embeddings", True):
             output = self.logits_processor(
                 hidden_states, self.lm_head, logits_metadata, aux_hidden_states=aux_hidden_states

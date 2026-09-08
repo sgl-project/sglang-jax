@@ -665,6 +665,22 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 # if there is no aux layer, set to None
                 eagle_aux_hidden_state_layer_ids = None
             self.model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
+        elif self.server_args.speculative_algorithm == "FROZEN_KV_MTP" and not self.is_draft_worker:
+            # Gemma4 FROZEN_KV_MTP: the draft model consumes target hidden states
+            # through forward_batch.spec_info.hidden_states. The target's FINAL
+            # transformer output (post-norm, backbone_hidden_size-dim) is what the
+            # draft's pre_projection expects. Use a never-matching layer id so no
+            # intermediate layer is captured and FULL-mode falls back to final hidden.
+            self.model.capture_aux_hidden_states = True
+            # SGLang uses 1-based layer convention: layer i captures layer i-1's
+            # output. num_hidden_layers + 1 never matches the enumerate range
+            # (0..num_hidden_layers-1), so aux_hidden_states stays empty and the
+            # logits processor's FULL-mode fallback stores the final hidden.
+            last_layer_idx = self.model_config.num_hidden_layers
+            if hasattr(self.model, "set_eagle3_layers_to_capture"):
+                self.model.set_eagle3_layers_to_capture([last_layer_idx])
+            elif hasattr(self.model.model, "layers_to_capture"):
+                self.model.model.layers_to_capture = [last_layer_idx]
         elif self.server_args.speculative_algorithm == "DFLASH" and not self.is_draft_worker:
             # The captured layers must match the draft checkpoint's projection input.
             from sgl_jax.srt.speculative.dflash_util import parse_dflash_draft_config
