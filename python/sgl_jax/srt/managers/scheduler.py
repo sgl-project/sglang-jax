@@ -217,6 +217,29 @@ class Scheduler(
     A scheduler that manages a tensor parallel TPU worker, which managaes fixed multi TPU devices.
     """
 
+    def _select_eagle_worker_class(self, server_args: ServerArgs):
+        """Select the worker from the resolved speculative algorithm and model shape."""
+        if self.spec_algorithm.is_frozen_kv_mtp():
+            from sgl_jax.srt.speculative.frozen_kv_mtp_worker import FrozenKvMtpWorker
+
+            return FrozenKvMtpWorker
+
+        n_mtp = getattr(self.tp_worker.model_config.hf_config, "num_nextn_predict_layers", None)
+        if n_mtp is None and self.spec_algorithm.is_nextn():
+            n_mtp = server_args.speculative_num_steps
+        self._spec_multi_layer = n_mtp is not None and n_mtp > 1
+
+        if self._spec_multi_layer:
+            from sgl_jax.srt.speculative.multi_layer_eagle_worker import (
+                MultiLayerEAGLEWorker,
+            )
+
+            return MultiLayerEAGLEWorker
+
+        from sgl_jax.srt.speculative.eagle_worker import EAGLEWorker
+
+        return EAGLEWorker
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -411,25 +434,7 @@ class Scheduler(
         # launch draft worker
         self._spec_multi_layer = False
         if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
-            # Multi-layer vs single-layer is a model property (how many MTP heads
-            # the target ships), not a CLI-algorithm property. NEXTN with a single
-            # MTP head behaves exactly like EAGLE (same head run N times).
-            # DeepSeek-style configs expose num_nextn_predict_layers; MiMo-style
-            # configs don't, so fall back to --speculative-num-steps under NEXTN
-            # (one MTP weight set per step).
-            n_mtp = getattr(self.tp_worker.model_config.hf_config, "num_nextn_predict_layers", None)
-            if n_mtp is None and self.spec_algorithm.is_nextn():
-                n_mtp = server_args.speculative_num_steps
-            self._spec_multi_layer = n_mtp is not None and n_mtp > 1
-            if self._spec_multi_layer:
-                from sgl_jax.srt.speculative.multi_layer_eagle_worker import (
-                    MultiLayerEAGLEWorker as _SpecWorkerCls,
-                )
-            else:
-                from sgl_jax.srt.speculative.eagle_worker import (
-                    EAGLEWorker as _SpecWorkerCls,
-                )
-
+            _SpecWorkerCls = self._select_eagle_worker_class(server_args)
             self.draft_worker = _SpecWorkerCls(
                 server_args=server_args,
                 target_worker=self.tp_worker,
