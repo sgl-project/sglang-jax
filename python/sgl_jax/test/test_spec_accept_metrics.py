@@ -73,13 +73,14 @@ class TestComputeAvgSpecAcceptLength(unittest.TestCase):
 
 class TestSpecAcceptCounters(unittest.TestCase):
     def test_init_metrics_defines_the_counters_the_processor_increments(self):
-        obj = types.SimpleNamespace()
+        obj = types.SimpleNamespace(server_args=types.SimpleNamespace(enable_metrics=False))
         SchedulerMetricsMixin.init_metrics(obj)
         self.assertEqual(obj.cum_spec_accept_length, 0)
         self.assertEqual(obj.cum_spec_accept_count, 0)
 
     def test_accounting_moves_both_counter_pairs(self):
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.server_args = types.SimpleNamespace(enable_metrics=False)
         SchedulerMetricsMixin.init_metrics(scheduler)
         scheduler.num_generated_tokens = 0
         scheduler.accept_token = 0
@@ -113,6 +114,7 @@ class TestSpecAcceptCounters(unittest.TestCase):
 
     def test_log_decode_stats_reset_does_not_touch_cumulative_counters(self):
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.server_args = types.SimpleNamespace(enable_metrics=False, decode_log_interval=1)
         SchedulerMetricsMixin.init_metrics(scheduler)
         scheduler.running_batch = _Batch()
         scheduler.last_decode_stats_tic = 0.0
@@ -121,7 +123,6 @@ class TestSpecAcceptCounters(unittest.TestCase):
         scheduler._get_token_info = lambda: (0, 0.0, 0, 0)
         scheduler.spec_algorithm = _SpecAlgorithm()
         scheduler.waiting_queue = []
-        scheduler.server_args = types.SimpleNamespace(decode_log_interval=1)
         # One interval's worth of what log_decode_stats consumes...
         scheduler.accept_token = 30
         scheduler.draft_token = 40
@@ -148,6 +149,7 @@ class TestSpecAcceptCounters(unittest.TestCase):
 class TestGetInternalStateExposesAcceptLength(unittest.TestCase):
     def _make_scheduler(self):
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.server_args = types.SimpleNamespace(enable_metrics=False)
         SchedulerMetricsMixin.init_metrics(scheduler)
         scheduler.token_to_kv_pool_allocator = _Allocator()
         scheduler.max_total_num_tokens = 1024
