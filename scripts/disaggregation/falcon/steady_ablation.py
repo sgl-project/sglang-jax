@@ -46,9 +46,6 @@ def main():
         json.loads(Path(os.environ["PD_REQUIRE_SUMMARY"]).read_text())["status"]
         == "passed_implemented_correctness_checks"
     )
-    assert (
-        json.loads(Path(os.environ["PD_REQUIRE_STEADY_SUMMARY"]).read_text())["status"] == "passed"
-    )
     suite.driver.TOKENIZER = AutoTokenizer.from_pretrained(suite.driver.MODEL)
     suite.REPORT["purpose"] = "4K/256 C32 TTFT: same-window B1, D-only, P-only and PD controls"
     suite.save()

@@ -103,7 +103,7 @@ The PR sequence also runs a final 4K/256 C32 comparison of B1, D-only,
 P-only and PD (`steady_ablation.py`). These contemporaneous controls help
 separate queueing changes from a role-specific regression when throughput
 improves but steady TTFT increases. They use the same measurement windows and
-require the main steady/soak suite to have passed.
+require a successful native/model correctness run.
 
 The follow-up also compares B1 and PD at matched deterministic arrival rates:
 5 requests/s for 4K/256 and 1.2 requests/s for 16K/256, below the observed B1
@@ -112,3 +112,16 @@ checks actual cohort RPS and arrival lateness, and fails if its in-flight cap
 would silently throttle the load. It reports latency for the start-in-window
 cohort, including drain; it does not present completion-count throughput as
 fixed-window token throughput. The already tested SSE request parser is reused.
+
+`profile_suite.py` is a separate gate. JAX trace export blocks the scheduler:
+an observed 80–93-second export exceeded the normal 30-second pull and
+60-second ack budgets even in B1. Profile servers alone use 300 seconds for
+both timeouts, retain strict stream-completion and KV-recovery checks, and
+record export durations. Ordinary performance and fault tests keep their
+original budgets. Profile traffic latencies are not performance results.
+
+Use `--diagnostics-only` instead of `--pr-validation` to repeat fresh native
+and model correctness, C32 role ablations, matched-rate latency and profiles
+without repeating the three-repetition matrix and soak. Retain the earlier
+matrix/soak report and its exact runtime source identity when combining results;
+a diagnostic rerun does not turn a failed earlier experiment into a success.

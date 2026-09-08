@@ -58,10 +58,10 @@ def main():
             "timeout_s": 7200,
         },
     )
-    automatic = json.loads((RESULTS / "source-manifest.json").read_text()).get(
-        "pr_validation", False
-    )
-    if automatic:
+    manifest = json.loads((RESULTS / "source-manifest.json").read_text())
+    diagnostic = manifest.get("diagnostics_only", False)
+    automatic = manifest.get("pr_validation", False) or diagnostic
+    if automatic and not diagnostic:
         write(
             commands / "002-pr-validation.json",
             {
@@ -83,13 +83,27 @@ def main():
                 ],
                 "env": {
                     "PD_REQUIRE_SUMMARY": str(RESULTS / "correctness-01/summary.json"),
-                    "PD_REQUIRE_STEADY_SUMMARY": str(
-                        RESULTS / "pr-validation/steady/steady-summary.json"
-                    ),
                 },
                 "timeout_s": 3600,
             },
         )
+    if diagnostic:
+        for number, name, runner, limit in [
+            (2, "steady-ablation", "steady_ablation.py", 3600),
+            (3, "profiles", "profile_suite.py", 2400),
+        ]:
+            write(
+                commands / f"{number:03}-{name}.json",
+                {
+                    "id": name,
+                    "command": [
+                        sys.executable,
+                        str(ROOT / "scripts/disaggregation/falcon" / runner),
+                    ],
+                    "env": {"PD_REQUIRE_SUMMARY": str(RESULTS / "correctness-01/summary.json")},
+                    "timeout_s": limit,
+                },
+            )
     completed = set()
     last_exit = 1
     while time.monotonic() < DEADLINE:

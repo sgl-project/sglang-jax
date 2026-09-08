@@ -114,6 +114,9 @@ def measure(tag, port, shapes, concurrency, duration=180, expected=None, warmup=
 def profile(tag, port):
     # Separate from benchmark: profiling/export may block either scheduler.
     # Stop both roles concurrently after a short capture to bound artifact size.
+    baseline = lifecycle.idle()
+    exports = []
+
     def load():
         return asyncio.run(run(f"http://127.0.0.1:{port}/generate", bodies(MIXED), 16, 60, 120))
 
@@ -137,13 +140,19 @@ def profile(tag, port):
                 started.append(server_port)
             time.sleep(5)
         finally:
-            futures = [
-                pool.submit(requests.post, f"http://127.0.0.1:{p}/stop_profile", timeout=300)
-                for p in started
-            ]
+
+            def stop_capture(server_port):
+                begin = time.perf_counter()
+                response = requests.post(
+                    f"http://127.0.0.1:{server_port}/stop_profile", timeout=300
+                )
+                response.raise_for_status()
+                return {"port": server_port, "export_s": time.perf_counter() - begin}
+
+            futures = [pool.submit(stop_capture, p) for p in started]
             for future in futures:
-                future.result().raise_for_status()
-        traffic.result(timeout=720)
+                exports.append(future.result())
+        traffic_result = traffic.result(timeout=720)
     files = list((driver.OUT / "profiles" / tag).rglob("*.xplane.pb"))
     assert len(files) >= 2 and all(p.stat().st_size for p in files)
     REPORT["profiles"].append(
@@ -151,10 +160,14 @@ def profile(tag, port):
             "tag": tag,
             "capture_s": 5,
             "traffic": "continuous mixed C16",
+            "export": exports,
+            "completed_requests": traffic_result["completed_total"],
+            "failed_requests": traffic_result["failed"],
+            "baseline": baseline,
+            "after": lifecycle.idle(baseline),
             "files": [{"path": str(p), "bytes": p.stat().st_size} for p in files],
         }
     )
-    lifecycle.idle()
     save()
 
 
@@ -198,10 +211,6 @@ def main():
     REPORT["soak"] = measure("soak-PD-mixed-c32", port, MIXED, 32, duration=1200, expected=expected)
     save()
     driver.stop()
-    for name, overlap in [("B1", False), ("PD", True)]:
-        port = driver.boot("profile-" + name, overlap, overlap, True)
-        profile(name, port)
-        driver.stop()
     REPORT["status"] = "passed"
     save()
 

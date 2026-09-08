@@ -25,6 +25,7 @@ def main():
         ("eos", "eos_checks.py", "eos-summary.json", 1800),
         ("mixed", "mixed_requests.py", "mixed-summary.json", 1800),
         ("steady", "steady_suite.py", "steady-summary.json", 14000),
+        ("profiles", "profile_suite.py", "steady-summary.json", 2400),
     ]:
         directory = OUT / name
         directory.mkdir(exist_ok=False)

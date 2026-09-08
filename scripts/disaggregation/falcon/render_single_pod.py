@@ -18,8 +18,15 @@ parser.add_argument("--name", required=True, help="Unique Falcon experiment name
 parser.add_argument(
     "--pr-validation", action="store_true", help="Run all PR gates and exit automatically"
 )
+parser.add_argument(
+    "--diagnostics-only",
+    action="store_true",
+    help="Run fresh correctness, steady role/rate diagnostics and profiles, then exit",
+)
 parser.add_argument("--output", type=Path, required=True, help="Destination YAML")
 args = parser.parse_args()
+if args.pr_validation and args.diagnostics_only:
+    parser.error("choose --pr-validation or --diagnostics-only")
 head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
 patch = subprocess.check_output(
     ["git", "diff", "--binary", BASE, "--", "python", "test", "docs/features"], cwd=ROOT
@@ -39,6 +46,7 @@ files = {
         "steady_suite.py",
         "steady_ablation.py",
         "steady_rate_client.py",
+        "profile_suite.py",
         "pr_validation_suite.py",
         "stream_regression.py",
         "eos_checks.py",
@@ -48,6 +56,7 @@ files = {
 files["source.patch"] = patch
 manifest = {
     "pr_validation": args.pr_validation,
+    "diagnostics_only": args.diagnostics_only,
     "base_commit": BASE,
     "implementation_commit": head,
     "files_sha256": {k: hashlib.sha256(v).hexdigest() for k, v in files.items()},
