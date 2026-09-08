@@ -81,16 +81,30 @@ class EAGLEWorker(BaseSpecWorker):
                     dp_size=dp_size,
                     per_dp_bs_size=per_dp_bs,
                 )
-                if not self._can_use_fused_spec_prefill(model_worker_batch):
+                use_fused_prefill = self._can_use_fused_spec_prefill(model_worker_batch)
+                use_non_fused_prefill = (
+                    not use_fused_prefill and self.supports_non_fused_spec_prefill_precompile()
+                )
+                if not use_fused_prefill and not use_non_fused_prefill:
                     logger.warning(
-                        "[SPEC_EXTEND] skip fused precompile because fused spec prefill is disabled"
+                        "[SPEC_EXTEND] skip precompile because neither fused prefill nor "
+                        "the non-fused prefill capability is available"
                     )
                     continue
-                if self.spec_relay_buffers is not None:
+                if use_fused_prefill and self.spec_relay_buffers is not None:
                     self.forward_batch_speculative_prefill_overlap(model_worker_batch)
                     jax.block_until_ready(self.spec_relay_buffers)
                 else:
-                    self.forward_batch_speculative_generation(model_worker_batch)
+                    result = self.forward_batch_speculative_generation(model_worker_batch)
+                    if use_non_fused_prefill:
+                        self.wait_for_spec_prefill_precompile(result)
+                        logger.info(
+                            "[SPEC_EXTEND] compiled path=non_fused padded_bs=%d "
+                            "padded_tokens=%d cache_loc_size=%d",
+                            bs,
+                            num_tokens,
+                            self.precompile_cache_loc_paddings[-1],
+                        )
         end_time = time.perf_counter()
         logger.info("[SPEC_EXTEND] Precompile finished in %.0f secs", end_time - start_time)
 
@@ -163,11 +177,22 @@ class EAGLEWorker(BaseSpecWorker):
                 else:
                     topk_shape = (bs, num_steps, self.topk) if is_multi_layer else (bs, self.topk)
                 data_sharding = NamedSharding(self.mesh, P("data"))
-                spec_info = EagleDraftInput(
+                spec_info = self.draft_worker.new_draft_input(
                     topk_p=jax.device_put(np.ones(topk_shape, dtype=np.float32), data_sharding),
                     topk_index=jax.device_put(np.ones(topk_shape, dtype=np.int32), data_sharding),
+                    # TARGET's hidden size, not the draft's. spec_info.hidden_states
+                    # always carries TARGET hidden states -- either captured from
+                    # the target's verify forward, or projected back into target
+                    # space by the draft (gemma4_mtp's post_projection exists for
+                    # exactly that). base_worker.py's relay buffers already size
+                    # this from the target; precompile disagreed.
+                    # For EAGLE/NEXTN the two models share a hidden size, so this
+                    # is a no-op there. FROZEN_KV_MTP is the first algorithm where
+                    # they differ (draft 1024 vs target 5376), and the mismatch
+                    # showed up as a dot_general contracting-dim error in
+                    # pre_projection: 5376+1024=6400 fed to a 2*5376=10752 input.
                     hidden_states=np.ones(
-                        (bs, self.draft_worker.model_config.hidden_size),
+                        (bs, self.target_worker.model_config.hidden_size),
                         dtype=(
                             jnp.bfloat16 if self.server_args.dtype == "bfloat16" else np.float32
                         ),
@@ -191,7 +216,7 @@ class EAGLEWorker(BaseSpecWorker):
                     jax.block_until_ready(self.spec_relay_buffers)
 
                     model_worker_batch = _make_decode_batch()
-                    spec_info = EagleDraftInput(
+                    spec_info = self.draft_worker.new_draft_input(
                         future_indices=np.asarray(
                             model_worker_batch.req_pool_indices, dtype=np.int32
                         ),
