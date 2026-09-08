@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -23,8 +24,9 @@ from sgl_jax.srt.disaggregation.base.transfer import (
 )
 from sgl_jax.srt.disaggregation.bootstrap import BootstrapClient, PrefillInfoCache
 from sgl_jax.srt.disaggregation.common.capacity import per_rank_inflight_limit
-from sgl_jax.srt.managers.schedule_batch import get_disagg_transport_id
+from sgl_jax.srt.managers.schedule_batch import ScheduleBatch, get_disagg_transport_id
 from sgl_jax.srt.mem_cache.memory_pool import write_kv_layer
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import Req
@@ -200,6 +202,118 @@ class SchedulerDisaggregationDecodeMixin:
     disagg_prefill_info_cache: PrefillInfoCache
     disagg_prealloc_queue: DecodePreallocQueue
     disagg_transfer_queue: DecodeTransferQueue
+
+    def event_loop_overlap_disagg_decode(self: Scheduler) -> None:
+        """Overlap D scheduling with forward, retaining the PD admission gates.
+
+        Exactly one unconsumed result crosses an iteration boundary. The first
+        batch (including the post-transfer EXTEND) uses the normal overlap
+        worker's dummy sampling handshake. Later batches consume their
+        predecessor only after dispatch, so future token IDs and request slots
+        follow the same ownership protocol as the non-PD overlap loop.
+        """
+        self.result_queue = deque()
+        wd = self.disagg_decode_watchdog
+        wd.start()
+        while True:
+            wd.beat("recv_requests")
+            recv_reqs = (
+                self._comm_backend.recv_requests()
+                if self._comm_backend is not None
+                else self.recv_requests()
+            )
+            recv_reqs = self.select_dp_for_request(recv_reqs)
+            wd.beat("process_input_requests")
+            self.process_input_requests_disagg_decode(recv_reqs)
+
+            # pause_generation normally consumes the outstanding result. Also
+            # handle a paused flag set without that handler, without admitting
+            # new transfers or leaving a worker result stranded indefinitely.
+            if self._engine_paused:
+                self._drain_disagg_decode_overlap_results()
+                self._wait_donation_safe()
+                self._drain_decode_transfer_terminals()
+                continue
+
+            # Raiden resolves the current pool arrays outside the worker. Wait
+            # for replace_all, not device completion: received pages are owned
+            # by the transfer queue and cannot appear in the running batch.
+            wd.beat("wait_donation_safe")
+            self._wait_donation_safe()
+            self._wait_decode_admission_safe()
+            wd.beat("process_decode_queue")
+            self.process_decode_queue()
+            wd.beat("get_next_batch")
+            batch = self.get_next_batch_to_run()
+            self.cur_batch = batch
+            had_pending_result = bool(self.result_queue)
+
+            if batch is not None:
+                batch.launch_done = threading.Event()
+                wd.beat("run_batch")
+                result = self.run_batch(batch)
+                self.result_queue.append((batch.copy(), result))
+                if not had_pending_result:
+                    dummy = ScheduleBatch.init_new(
+                        reqs=[[] for _ in range(self.dp_size)],
+                        req_to_token_pool=self.req_to_token_pool,
+                        token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                        tree_cache=self.tree_cache,
+                        model_config=self.model_config,
+                        enable_overlap=self.enable_overlap,
+                        dp_size=self.dp_size,
+                        spec_algorithm=self.spec_algorithm,
+                        mesh=self.mesh,
+                    )
+                    dummy.forward_mode = ForwardMode.DUMMY_FIRST
+                    dummy.next_batch_sampling_info = (
+                        self._current_sampling_info_owner().cur_sampling_info
+                    )
+                    self.process_batch_result(dummy, None, batch.launch_done)
+
+            if had_pending_result:
+                wd.beat("process_batch_result")
+                previous, result = self.result_queue.popleft()
+                previous.next_batch_sampling_info = (
+                    self._current_sampling_info_owner().cur_sampling_info
+                    if batch is not None
+                    else None
+                )
+                self.process_batch_result(
+                    previous, result, batch.launch_done if batch is not None else None
+                )
+            elif batch is None:
+                wd.beat("idle")
+                # Generic on_idle checks omit the reservations in PD queues.
+                self.new_token_ratio = self.init_new_token_ratio
+                if self._comm_backend is not None:
+                    self._comm_backend.wait_for_new_requests(0.001)
+            self.last_batch = batch
+
+    def _drain_disagg_decode_overlap_results(self: Scheduler) -> None:
+        """Quiesce pending compute before pause/retraction releases its pages."""
+        if self.result_queue:
+            self._wait_donation_safe()
+            jax.block_until_ready(self.token_to_kv_pool_allocator.get_kvcache().kv_buffer)
+        while self.result_queue:
+            batch, result = self.result_queue.popleft()
+            batch.next_batch_sampling_info = None
+            self.process_batch_result(batch, result)
+        self.last_batch = None
+        self.cur_batch = None
+
+    def _wait_decode_admission_safe(self: Scheduler) -> None:
+        """Fence previous device writes before Raiden reuses freed KV pages.
+
+        Result N-1 can retire a request while the already launched step N writes
+        its pages. JAX orders subsequent forwards, but native Raiden writes do
+        not participate in that dependency chain. Until page quarantine is
+        implemented, new native receive admission requires a whole-pool device
+        fence. Steady decode and polling existing receives need no such fence.
+        """
+        if len(self.disagg_prealloc_queue):
+            self._wait_donation_safe()
+            jax.block_until_ready(self.token_to_kv_pool_allocator.get_kvcache().kv_buffer)
 
     def event_loop_normal_disagg_decode(self: Scheduler) -> None:
         """Decode event loop."""
@@ -421,20 +535,7 @@ class SchedulerDisaggregationDecodeMixin:
                     )
                     self._set_decode_bookkeeping(entry.req, entry.kv_indices)
                     self._enqueue_for_decode(entry.req)
-                    self._pd_mark_time(entry.req, "first_token")
-                    from sgl_jax.srt.disaggregation.req_time_stats import (
-                        maybe_log_time_stats,
-                    )
-
-                    maybe_log_time_stats(
-                        entry.req.pd_time_stats,
-                        req_id=entry.req_id,
-                        enabled=getattr(
-                            self.server_args,
-                            "enable_request_time_stats_logging",
-                            False,
-                        ),
-                    )
+                    self._pd_mark_time(entry.req, "decode_ready")
                 except Exception:
                     logger.exception(
                         "failed to install KV / enqueue decode for req_id=%s; releasing resources",

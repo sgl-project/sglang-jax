@@ -32,7 +32,8 @@ _PHASE_SPECS: dict[str, tuple[tuple[str, str, str], ...]] = {
     "decode": (
         ("bootstrap_start", "bootstrap_done", "bootstrap"),
         ("prealloc_entry", "transfer_entry", "prealloc_wait"),
-        ("transfer_entry", "first_token", "kv_wait"),
+        ("transfer_entry", "decode_ready", "kv_wait"),
+        ("decode_ready", "first_token", "decode_start"),
         ("bootstrap_start", "first_token", "total"),
     ),
 }

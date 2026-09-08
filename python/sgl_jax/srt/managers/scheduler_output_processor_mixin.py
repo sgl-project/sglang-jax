@@ -31,6 +31,28 @@ logger = logging.getLogger(__name__)
 DEFAULT_FORCE_STREAM_INTERVAL = 50
 
 
+def _mark_pd_decode_first_token(scheduler: Scheduler, req: Req) -> None:
+    """Record first resolved output, including D's post-transfer EXTEND.
+
+    This is server-side token availability, not client receipt. Recording at
+    KV admission incorrectly omits ready-queue time and the first forward.
+    """
+    args = getattr(scheduler, "server_args", None)
+    if (
+        getattr(args, "disaggregation_mode", None) != "decode"
+        or not getattr(args, "enable_request_time_stats_logging", False)
+        or not req.output_ids
+    ):
+        return
+    ts = req.pd_time_stats
+    if ts is not None and "first_token" in ts.marks:
+        return
+    scheduler._pd_mark_time(req, "first_token")
+    from sgl_jax.srt.disaggregation.req_time_stats import maybe_log_time_stats
+
+    maybe_log_time_stats(req.pd_time_stats, req_id=req.rid, enabled=True)
+
+
 def _complete_precision_trace(req: Req) -> None:
     if not precision_tracer.get_trace_active():
         return
@@ -226,6 +248,7 @@ class SchedulerOutputProcessorMixin:
 
                 if req.is_chunked <= 0:
                     req.output_ids.append(next_token_id)
+                    _mark_pd_decode_first_token(self, req)
                     req.check_finished()
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
@@ -506,6 +529,7 @@ class SchedulerOutputProcessorMixin:
                     req.output_ids.extend([int(t) for t in next_token_id])
                     new_accepted_len = len(next_token_id)
 
+                _mark_pd_decode_first_token(self, req)
                 req.check_finished(new_accepted_len)
 
                 if req.finished():

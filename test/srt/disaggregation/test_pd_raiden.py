@@ -1615,6 +1615,9 @@ def test_raiden_wrapper_uses_public_jax_api_and_configured_parallelism():
     engine.get_local_endpoints.return_value = [{"endpoint": "127.0.0.1:7788", "shards": [0]}]
     manager_cls = mock.MagicMock(return_value=engine)
     modules = {
+        "tpu_raiden.frameworks.jax._tpu_raiden_jax": types.ModuleType(
+            "tpu_raiden.frameworks.jax._tpu_raiden_jax"
+        ),
         "tpu_raiden": types.ModuleType("tpu_raiden"),
         "tpu_raiden.api": types.ModuleType("tpu_raiden.api"),
         "tpu_raiden.api.jax": types.ModuleType("tpu_raiden.api.jax"),
@@ -1646,6 +1649,9 @@ def test_raiden_wrapper_routes_each_operation_to_its_dp_manager():
         engine.poll_stats.return_value = ([], [], [])
     manager_cls = mock.MagicMock(side_effect=engines)
     modules = {
+        "tpu_raiden.frameworks.jax._tpu_raiden_jax": types.ModuleType(
+            "tpu_raiden.frameworks.jax._tpu_raiden_jax"
+        ),
         "tpu_raiden": types.ModuleType("tpu_raiden"),
         "tpu_raiden.api": types.ModuleType("tpu_raiden.api"),
         "tpu_raiden.api.jax": types.ModuleType("tpu_raiden.api.jax"),

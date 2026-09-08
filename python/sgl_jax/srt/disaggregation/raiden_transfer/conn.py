@@ -723,6 +723,12 @@ class RaidenTransferKVSender(KVSender, StateHolder):
             return self._pending_failure_reason is not None
 
     @property
+    def has_pending_chunks(self) -> bool:
+        """Whether completed prefill chunks are waiting for a transfer slot."""
+        with self._state_lock:
+            return bool(self._pending_chunks)
+
+    @property
     def has_started_chunks(self) -> bool:
         with self._state_lock:
             return bool(self._started_chunks)
