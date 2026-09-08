@@ -85,7 +85,12 @@ _PREFILL_SPARSE = int(os.environ.get("DSA_PREFILL_SPARSE", "0"))
 # path is completely unaffected. ``DSA_PREFILL_QBLOCK=0`` is an escape hatch
 # back to the per-query kernel (e.g. for pathological no-locality selections).
 _PREFILL_QBLOCK = os.environ.get("DSA_PREFILL_QBLOCK", "1") == "1"
-_PREFILL_QBLOCK_QB = int(os.environ.get("DSA_PREFILL_QBLOCK_QB", "64"))
+# Default 256 from the QB sweep on GLM-5.2 (v7x tp16 and v6e-64): saturated
+# attend work scales as (T/QB) * ctx_pages, and 64->256 was uniformly positive
+# (110k TTFT -10%, 16k -11%) with paired-accuracy gates clean at every step.
+# 512 projects <2% further and grows the per-block union tail, so 256 is the
+# sweet spot. Override per deployment via DSA_PREFILL_QBLOCK_QB.
+_PREFILL_QBLOCK_QB = int(os.environ.get("DSA_PREFILL_QBLOCK_QB", "256"))
 
 
 @register_pytree_node_class
@@ -795,7 +800,11 @@ def _scatter_paged(
     offset = abs_pos % page_size
     page = page_indices[cu_kv_lens[seq_id] // page_size + page_local]
 
-    sentinel = cache3d.shape[0] - 1
+    # Padding rows must land on the reserved page: the allocator hands out
+    # local pages 1..pages_per_rank and keeps page 0 (reads through it are
+    # masked past kv_len), while the LAST page is allocatable — near-full
+    # pools would otherwise get offset 0 of a live page's keys clobbered.
+    sentinel = 0
     safe_page = jnp.where(valid, page, sentinel)
     safe_off = jnp.where(valid, offset, 0)
     return cache3d.at[safe_page, safe_off].set(new_tokens.astype(cache3d.dtype))

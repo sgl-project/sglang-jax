@@ -180,3 +180,50 @@ def test_ragged_qblock_tpu(seq_lens_list, qb, tol):
     print(f"[tpu ragged qblock qb={qb}] |o_qb-o_cur|={d_o:.3e} |cache diff|={d_c:.3e}")
     assert d_c == 0.0, "self-write must be identical"
     assert d_o < tol, f"ragged qblock vs deployed drifted: {d_o}"
+
+
+# ── pallas write-back vs XLA scatter (bit-identical contract) ────────────────
+
+from sgl_jax.srt.kernels.dsa.sparse_mla_prefill_qblock import paged_write_back
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        # single-seq page-aligned chunk (the 110k shape): one giant run
+        dict(T=512, pages=6, locs="contig", seed=0),
+        # multi-request, non-adjacent physical pages: run per page
+        dict(T=384, pages=8, locs="scattered_pages", seed=1),
+        # odd offsets: run starts mid-word (kv_packing phase mismatch paths)
+        dict(T=131, pages=4, locs="odd", seed=2),
+        # padded tail: loc == -1 must be dropped (canary)
+        dict(T=256, pages=4, locs="padded", seed=3),
+    ],
+)
+def test_paged_write_back_parity(case):
+    rng = np.random.default_rng(case["seed"])
+    ps, pk, D = 128, 2, 640
+    T, Pn = case["T"], case["pages"]
+    row = jnp.asarray(rng.standard_normal((T, D)) * 0.1, jnp.bfloat16)
+    cache = jnp.asarray(rng.standard_normal((Pn, ps // pk, pk, D)) * 0.1, jnp.bfloat16)
+
+    if case["locs"] == "contig":
+        loc = np.arange(T, dtype=np.int32) + ps  # starts at page 1, aligned
+    elif case["locs"] == "scattered_pages":
+        pages = rng.permutation(Pn)[: -(-T // ps)]
+        loc = np.concatenate(
+            [p * ps + np.arange(min(ps, T - i * ps)) for i, p in enumerate(pages)]
+        ).astype(np.int32)
+    elif case["locs"] == "odd":
+        loc = np.arange(T, dtype=np.int32) + ps + 1  # word-phase mismatch start
+    else:  # padded
+        loc = np.concatenate([np.arange(T - 64) + ps, np.full(64, -1)]).astype(np.int32)
+    loc = jnp.asarray(loc)
+
+    # oracle: the XLA flat scatter
+    flat = cache.reshape(Pn * ps, D)
+    want = flat.at[loc].set(row, mode="drop", wrap_negative_indices=False).reshape(cache.shape)
+    got = paged_write_back(cache, row, loc, page_size=ps)
+    np.testing.assert_array_equal(
+        np.asarray(got, dtype=np.float32), np.asarray(want, dtype=np.float32)
+    )
