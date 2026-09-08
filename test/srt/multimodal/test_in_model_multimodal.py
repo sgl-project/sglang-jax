@@ -288,7 +288,7 @@ def test_qwen2_vision_encode_and_merge_spmd(encoder_tp):
         jnp.zeros(8, dtype=jnp.int32),
         Model(running),
     )
-    output, _ = host_orchestration.embed_multimodal_inputs(*args)
+    output, _, _ = host_orchestration.embed_multimodal_inputs(*args)
     assert output.sharding.spec == PartitionSpec("data", None)
     assert calls == 1
 
@@ -366,12 +366,14 @@ def test_merge_preserves_unmasked_tokens():
             return {Modality.AUDIO: lambda _: jnp.array([[10.0, 11.0], [20.0, 21.0]])}
 
     running = jnp.array([[1, 2], [3, 4], [5, 6]], dtype=jnp.float32)
-    output, _ = host_orchestration.embed_multimodal_inputs(
+    output, deepstack, apply_for_deepstack = host_orchestration.embed_multimodal_inputs(
         batch,
         jnp.zeros(3, dtype=jnp.int32),
         Model(running),
     )
     np.testing.assert_array_equal(output, [[10, 11], [3, 4], [20, 21]])
+    assert deepstack is None
+    assert apply_for_deepstack is False
 
 
 def test_packed_gather_merge_preserves_data_sharding():
@@ -407,13 +409,20 @@ def test_packed_gather_merge_preserves_data_sharding():
 
     Model.mesh = mesh
     running = jax.device_put(jnp.zeros((4, 1)), NamedSharding(mesh, PartitionSpec("data", None)))
-    out, ds = host_orchestration.embed_multimodal_inputs(
+    out, ds, apply_for_deepstack = host_orchestration.embed_multimodal_inputs(
         batch, jnp.zeros(4, dtype=jnp.int32), Model(running)
     )
     np.testing.assert_array_equal(out[:, 0], [10, 11, 20, 21])
     np.testing.assert_array_equal(ds[0, :, 0], [30, 31, 40, 41])
     assert out.sharding.spec == PartitionSpec("data", None)
     assert ds.sharding.spec == PartitionSpec(None, "data", None)
+    assert apply_for_deepstack is True
+
+    _, text_ds, text_apply_for_deepstack = host_orchestration.embed_multimodal_inputs(
+        None, jnp.zeros(4, dtype=jnp.int32), Model(running)
+    )
+    np.testing.assert_array_equal(text_ds, 0)
+    assert text_apply_for_deepstack is False
 
 
 def test_precompile_multimodal_inputs_matches_runtime_layout():
@@ -434,7 +443,7 @@ def test_precompile_multimodal_inputs_matches_runtime_layout():
         "_gather_merge",
         wraps=host_orchestration._gather_merge,
     ) as merge:
-        output, deepstack = host_orchestration.precompile_multimodal_inputs(
+        output, deepstack, apply_for_deepstack = host_orchestration.precompile_multimodal_inputs(
             jax.device_put(jnp.arange(4), data),
             Model(),
         )
@@ -444,6 +453,7 @@ def test_precompile_multimodal_inputs_matches_runtime_layout():
     np.testing.assert_array_equal(deepstack, 0)
     assert output.dtype == jnp.float32
     assert deepstack.dtype == jnp.float32
+    assert apply_for_deepstack is True
     assert output.sharding.spec == PartitionSpec("data", None)
     assert deepstack.sharding.spec == PartitionSpec(None, "data", None)
 
@@ -467,13 +477,13 @@ def test_embedding_pool_reuses_full_item_across_chunks():
 
     pool = EmbeddingPool(num_pages=4, page_size=2, hidden=1, dtype=jnp.float32)
     model = Model(jnp.zeros((2, 1), dtype=jnp.float32))
-    first, _ = host_orchestration.embed_multimodal_inputs(
+    first, _, _ = host_orchestration.embed_multimodal_inputs(
         _batch([item], prefix=0, extend=2, per_dp_token=2),
         jnp.zeros(2, dtype=jnp.int32),
         model,
         pool,
     )
-    second, _ = host_orchestration.embed_multimodal_inputs(
+    second, _, _ = host_orchestration.embed_multimodal_inputs(
         _batch([item], prefix=2, extend=2, per_dp_token=2),
         jnp.zeros(2, dtype=jnp.int32),
         model,
@@ -511,10 +521,11 @@ def test_model_runner_forward_embeds_multimodal_inputs():
 
     input_ids = jnp.asarray([1], dtype=jnp.int32)
     multimodal_batch = {Modality.IMAGE: ()}
-    model = object()
+    model = _TestInModelModel()
     embedding_pool = object()
     forward_batch = SimpleNamespace(
         bid=1,
+        forward_mode=ForwardMode.EXTEND,
         input_ids=input_ids,
         multimodal_batch=multimodal_batch,
         input_embedding=None,
@@ -533,7 +544,7 @@ def test_model_runner_forward_embeds_multimodal_inputs():
         patch(
             "sgl_jax.srt.model_executor.model_runner.embed_multimodal_inputs",
             autospec=True,
-            return_value=("embedded", "deepstack"),
+            return_value=("embedded", "deepstack", True),
         ) as embed,
         patch("sgl_jax.srt.model_executor.model_runner.precision_tracer.start_batch_trace"),
         patch(

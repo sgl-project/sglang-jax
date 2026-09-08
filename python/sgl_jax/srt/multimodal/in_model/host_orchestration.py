@@ -276,7 +276,7 @@ def precompile_multimodal_inputs(
     input_ids: jax.Array,
     multimodal_model: InModelMultimodalContract,
     embedding_pool: EmbeddingPool | None = None,
-) -> tuple[jax.Array, jax.Array | None]:
+) -> tuple[jax.Array, jax.Array | None, bool]:
     """Warm merge kernels and return a multimodal-shaped forward input."""
     capacities = tuple(map(int, multimodal_model.get_multimodal_embedding_packed_capacities()))
     if any(capacity <= 0 for capacity in capacities):
@@ -307,7 +307,8 @@ def precompile_multimodal_inputs(
             running = _gather_from_pool(running, embedding_pool, (task,), (entry,), mesh)
             jax.block_until_ready(running)
 
-    return _split_embeddings(running, hidden, deepstack_dim, mesh)
+    input_embedding, deepstack = _split_embeddings(running, hidden, deepstack_dim, mesh)
+    return input_embedding, deepstack, deepstack_dim > 0
 
 
 def precompile_multimodal_components(
@@ -321,22 +322,32 @@ def precompile_multimodal_components(
 
 
 def embed_multimodal_inputs(
-    multimodal_batch: _MultimodalBatch,
+    multimodal_batch: _MultimodalBatch | None,
     input_ids: jax.Array,
     multimodal_model: InModelMultimodalContract,
     embedding_pool: EmbeddingPool | None = None,
-) -> tuple[jax.Array, jax.Array | None]:
+) -> tuple[jax.Array, jax.Array | None, bool]:
     """Merge padded, item-ordered encoder outputs into the token stream."""
     mesh = multimodal_model.mesh
     with jax.set_mesh(mesh) if mesh is not None else nullcontext():
         running = multimodal_model.get_input_embeddings()(input_ids)
         hidden = running.shape[-1]
         deepstack_dim = multimodal_model.deepstack_visual_layers
+        if deepstack_dim and multimodal_batch is None:
+            deepstack = jnp.zeros(
+                (deepstack_dim, running.shape[0], hidden),
+                dtype=running.dtype,
+                out_sharding=NamedSharding(
+                    mesh,
+                    PartitionSpec(None, "data", None),
+                ),
+            )
+            return running, deepstack, False
         if deepstack_dim:
             running = jnp.pad(running, ((0, 0), (0, hidden * deepstack_dim)))
 
         encode_funcs = multimodal_model.get_multimodal_encode_funcs()
-        for modality, tasks in multimodal_batch.items():
+        for modality, tasks in (multimodal_batch or {}).items():
             encode_func = encode_funcs.get(modality)
             if encode_func is None:
                 raise ValueError(
@@ -373,4 +384,6 @@ def embed_multimodal_inputs(
                 running = _gather_merge(running, packed, tuple(miss_tasks), mesh)
                 _write_misses_to_pool(embedding_pool, packed, miss_tasks)
 
-        return _split_embeddings(running, hidden, deepstack_dim, mesh)
+        input_embedding, deepstack = _split_embeddings(running, hidden, deepstack_dim, mesh)
+        apply_for_deepstack = deepstack_dim > 0 and multimodal_batch is not None
+        return input_embedding, deepstack, apply_for_deepstack

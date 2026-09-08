@@ -9,7 +9,7 @@ from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
+from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, get_rope
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -95,12 +95,13 @@ class QWen3Attention(nnx.Module):
             mesh=mesh,
             scope_name="o_proj",
         )
-        self.rotary_emb = RotaryEmbedding(
+        self.rotary_emb = get_rope(
             head_size=self.head_dim,
             rotary_dim=self.head_dim,
-            max_position_embeddings=max_position_embeddings,
+            max_position=max_position_embeddings,
             base=rope_theta,
             is_neox_style=True,
+            rope_scaling=rope_scaling,
             dtype=dtype,
         )
 
@@ -348,24 +349,39 @@ class QWen3Model(nnx.Module):
         self,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
+        positions: jax.Array | None = None,
     ):
         residual = None
-        hidden_states = self.embed_tokens(forward_batch.input_ids)
+        hidden_states = (
+            self.embed_tokens(forward_batch.input_ids)
+            if forward_batch.input_embedding is None
+            else forward_batch.input_embedding
+        )
         layers_kv_fused = []
         layers_callback_flag = []
         aux_hidden_states = []
+        positions = forward_batch.positions if positions is None else positions
+        # When connecting the vision head, even without deepstack, it should be padded with 0, which avoids doubling the EXTEND compilation.
+        deepstack = forward_batch.deepstack_visual_embedding
         for layer_id, layer in enumerate(self.layers):
             if layer_id in self.layers_to_capture:
                 aux_hidden_states.append(
                     hidden_states + residual if residual is not None else hidden_states
                 )
             hidden_states, residual, kv_fused, callback_flag = layer(
-                forward_batch.positions,
+                positions,
                 hidden_states,
                 forward_batch,
                 token_to_kv_pool,
                 residual,
             )
+            if deepstack is not None and layer_id < deepstack.shape[0]:
+                hidden_states = jax.lax.cond(
+                    forward_batch.apply_for_deepstack,
+                    lambda values: values[0] + values[1].astype(values[0].dtype),
+                    lambda values: values[0],
+                    (hidden_states, deepstack[layer_id]),
+                )
             layers_kv_fused.append(kv_fused)
             layers_callback_flag.extend(callback_flag)
 
