@@ -104,3 +104,11 @@ P-only and PD (`steady_ablation.py`). These contemporaneous controls help
 separate queueing changes from a role-specific regression when throughput
 improves but steady TTFT increases. They use the same measurement windows and
 require the main steady/soak suite to have passed.
+
+The follow-up also compares B1 and PD at matched deterministic arrival rates:
+5 requests/s for 4K/256 and 1.2 requests/s for 16K/256, below the observed B1
+capacity. `steady_rate_client.py` schedules arrivals independently of responses,
+checks actual cohort RPS and arrival lateness, and fails if its in-flight cap
+would silently throttle the load. It reports latency for the start-in-window
+cohort, including drain; it does not present completion-count throughput as
+fixed-window token throughput. The already tested SSE request parser is reused.

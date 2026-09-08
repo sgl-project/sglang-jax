@@ -38,6 +38,7 @@ files = {
         "steady_client.py",
         "steady_suite.py",
         "steady_ablation.py",
+        "steady_rate_client.py",
         "pr_validation_suite.py",
         "stream_regression.py",
         "eos_checks.py",
