@@ -93,7 +93,11 @@ def _numpy_topk_oracle(
             q_abs_pos = (S_total - T_seq) + t_idx
 
             for s_idx in range(S_valid):
-                if s_idx * comp_ratio > q_abs_pos:
+                # Compressed entry ``s_idx`` covers original positions
+                # [s_idx*ratio, (s_idx+1)*ratio-1]; it is visible only once its
+                # last token is at or before the query (DeepSeek-V4
+                # ``inference/model.py`` Indexer mask).
+                if (s_idx + 1) * comp_ratio - 1 > q_abs_pos:
                     continue
 
                 score = 0.0
@@ -455,7 +459,10 @@ def test_streamindex_topk_quantized():
     naive_scores = np.full((T_seq, max(S_valid, k)), -np.inf, dtype=np.float32)
 
     for t_idx in range(T_seq):
+        q_abs_pos = (S_seq - T_seq) + t_idx
         for s_idx in range(S_valid):
+            if (s_idx + 1) * comp_ratio - 1 > q_abs_pos:
+                continue
             score = 0.0
             for h in range(H_I):
                 h_kv = h // (H_I // H_KV)
@@ -586,6 +593,83 @@ def test_streamindex_topk_bf16_matches_oracle(T_list, S_list, k):
             assert (
                 inter / len(want) >= 0.99
             ), f"row {row}: only {inter}/{len(want)} topk overlap vs oracle"
+
+
+def _run_topk_bf16(c, *, seq_lens, cu_q, dist, k, ratio, rows=None):
+    q = c["q"] if rows is None else c["q"][:rows]
+    w = c["w"] if rows is None else c["w"][:rows]
+    got = streamindex_topk(
+        q=q,
+        indexer_weights=w,
+        cache_kv=c["cache4d"],
+        seq_lens=jnp.asarray(np.array(seq_lens, np.int32)),
+        page_indices=jnp.asarray(c["block_table"].flatten()),
+        cu_q_lens=jnp.asarray(np.array(cu_q, np.int32)),
+        distribution=jnp.asarray(dist, jnp.int32),
+        k=k,
+        compression_ratio=ratio,
+        num_kv_pages_per_block=2,
+        num_queries_per_block=8,
+    )
+    return np.asarray(jax.block_until_ready(got))
+
+
+@pytest.mark.parametrize(
+    "T_list, S_list",
+    [
+        ([6], [22]),  # prefill chunk 16..21 over a ratio-4 cache
+        ([1, 7], [21, 23]),  # decode at 20 + prefill chunk 16..22
+        ([3], [12]),  # chunk end exactly on a group boundary
+        ([5], [5]),  # prefill from position 0: nothing visible before pos 3
+    ],
+)
+def test_streamindex_topk_compressed_visibility_is_completed_groups(T_list, S_list):
+    """With ``compression_ratio > 1`` a query at position ``p`` may see only the
+    compressed entries whose *last* token is at or before ``p``, i.e. entries
+    ``[0, (p+1)//ratio)`` (DeepSeek-V4 ``inference/model.py`` Indexer mask).
+    ``k`` exceeds the entry count, so the returned set must equal that range
+    exactly; the entry the query sits inside must not appear.
+    """
+    ratio, k = 4, 1024
+    page_size, H, D = 64, 8, 128
+    c = _build_bf16_case(T_list, S_list, page_size, H, D, num_pages=16, seed=1)
+    B = len(S_list)
+    nd = int(c["dist"][0])
+    got = _run_topk_bf16(
+        c, seq_lens=S_list, cu_q=np.asarray(c["cu_q"]), dist=(nd, nd, B), k=k, ratio=ratio
+    )
+    _verify_padding_at_end(got)
+    cu_q = np.asarray(c["cu_q"])
+    for b in range(B):
+        kv_len = S_list[b] // ratio
+        for t in range(T_list[b]):
+            row = cu_q[b] + t
+            pos = S_list[b] - T_list[b] + t
+            visible = min(kv_len, (pos + 1) // ratio)
+            selected = sorted(got[row][got[row] >= 0].tolist())
+            assert selected == list(range(visible)), (
+                f"seq {b} query pos {pos}: selected {selected}, expected entries" f" [0, {visible})"
+            )
+
+
+def test_streamindex_topk_selection_does_not_depend_on_chunk_end():
+    """The same query must select the same compressed entries whether or not the
+    chunk it arrives in also completes the next group. Two chunks starting at
+    position 16: one ends at 17 (group 4 incomplete), one ends at 19 (group 4
+    complete). Rows for positions 16 and 17 must be identical in both.
+    """
+    ratio, k = 4, 1024
+    page_size, H, D = 64, 8, 128
+    c = _build_bf16_case([4], [20], page_size, H, D, num_pages=16, seed=2)
+    long_chunk = _run_topk_bf16(c, seq_lens=[20], cu_q=[0, 4], dist=(0, 0, 1), k=k, ratio=ratio)
+    short_chunk = _run_topk_bf16(
+        c, seq_lens=[18], cu_q=[0, 2], dist=(0, 0, 1), k=k, ratio=ratio, rows=2
+    )
+    np.testing.assert_array_equal(
+        np.sort(short_chunk, axis=-1),
+        np.sort(long_chunk[:2], axis=-1),
+        err_msg="later tokens in the chunk changed an earlier query's selection",
+    )
 
 
 def test_fixed_stride_pages_repack_multi_seq():
