@@ -1736,3 +1736,51 @@ def test_rank_local_array_rejects_kv_replicated_across_data_axis():
 
     with pytest.raises(ValueError, match="KV PartitionSpec"):
         _rank_local_array(array, dp_rank=0, dp_size=2)
+
+
+def test_new_raiden_sender_timeout_is_terminal_failure():
+    raiden = _FakeRaiden()
+    manager = _manager(raiden, _FakeBootstrap())
+    sender = manager.create_sender("expired")
+    sender.init(None, transfer_id="wire-expired")
+    sender.attach_block_ids([1], bootstrap_room=91, dp_rank=0)
+    sender.send()
+    raiden.stats = ([], [], ["wire-expired"])
+    assert sender.poll() == KVPoll.FAILED
+    assert "expired" not in manager._senders
+
+
+def test_new_raiden_chunk_failure_waits_for_other_started_reads():
+    raiden = _FakeRaiden()
+    manager = _chunk_manager(raiden, _FakeBootstrap())
+    sender = manager.create_sender("mixed")
+    sender.init(None, transfer_id="wire-mixed")
+    for index in range(2):
+        sender.send_chunk(
+            index,
+            [index + 1],
+            bootstrap_room=92,
+            chunk_page_offset=index,
+            is_final=index == 1,
+            expected_total_pages=2,
+        )
+    raiden.stats = ([], [], ["wire-mixed#c0"])
+    assert sender.poll() == KVPoll.TRANSFERRING
+    assert "mixed" in manager._senders
+    raiden.stats = (["wire-mixed#c1"], [], [])
+    assert sender.poll() == KVPoll.FAILED
+    assert "mixed" not in manager._senders
+
+
+def test_multi_endpoint_failure_does_not_release_other_shards():
+    raiden = _FakeRaiden()
+    raiden.endpoints = [{"endpoint": "a:1", "shards": [0]}, {"endpoint": "b:2", "shards": [1]}]
+    manager = _manager(raiden, _FakeBootstrap())
+    sender = manager.create_sender("multi")
+    sender.init(None, transfer_id="wire-multi")
+    sender.attach_block_ids([1], bootstrap_room=93, dp_rank=0)
+    sender.send()
+    sender.abort()
+    raiden.stats = ([], [], ["wire-multi"])
+    assert sender.poll() == KVPoll.TRANSFERRING
+    assert "multi" in manager._senders

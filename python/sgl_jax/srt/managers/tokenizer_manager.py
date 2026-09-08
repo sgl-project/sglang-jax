@@ -1405,8 +1405,12 @@ class TokenizerManager:
             self.crash_dump_request_list.popleft()
 
     def _handle_abort_req(self, recv_obj):
-        state = self.rid_to_state[recv_obj.rid]
+        # A late or repeated cancellation can race the final model output.
+        state = self.rid_to_state.pop(recv_obj.rid, None)
+        if state is None:
+            return
         state.finished = True
+        state.finished_time = time.time()
         state.out_list.append(
             {
                 "text": "",
@@ -1421,7 +1425,7 @@ class TokenizerManager:
                 },
             }
         )
-        state.event.set()
+        self._notify_state_event(state)
 
     def _handle_open_session_req_output(self, recv_obj):
         self.session_futures[recv_obj.session_id].set_result(

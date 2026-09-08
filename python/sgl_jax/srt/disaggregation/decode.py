@@ -534,6 +534,16 @@ class SchedulerDisaggregationDecodeMixin:
                         )
                     )
                     self._set_decode_bookkeeping(entry.req, entry.kv_indices)
+                    # D recomputes the last prompt token. If that token alone
+                    # occupies the final received page, the extend allocator
+                    # will allocate a replacement page: no prefix slot retains
+                    # ownership of this one. Transfer is terminal before reuse.
+                    prefix_len = len(entry.req.origin_input_ids) - 1
+                    page_size = self.token_to_kv_pool_allocator.page_size
+                    if prefix_len >= 0 and prefix_len % page_size == 0:
+                        unused_tail = entry.kv_indices[prefix_len:]
+                        entry.kv_indices = entry.kv_indices[:prefix_len]
+                        self._release_decode_kv_indices(unused_tail, entry.req.dp_rank)
                     self._enqueue_for_decode(entry.req)
                     self._pd_mark_time(entry.req, "decode_ready")
                 except Exception:

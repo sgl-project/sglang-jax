@@ -53,6 +53,34 @@ class TestTokenizerManagerEvent(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
+    async def test_abort_cleans_state_and_tolerates_late_duplicates(self):
+        tm = _make_tm()
+        state = _make_state(asyncio.get_running_loop())
+        tm.rid_to_state = {"cancelled": state}
+        tm._handle_abort_req(SimpleNamespace(rid="cancelled"))
+        self.assertTrue(state.finished)
+        self.assertTrue(state.event.is_set())
+        self.assertNotIn("cancelled", tm.rid_to_state)
+        self.assertEqual(state.out_list[0]["meta_info"]["finish_reason"]["type"], "abort")
+        tm._handle_abort_req(SimpleNamespace(rid="cancelled"))
+        tm._handle_abort_req(SimpleNamespace(rid="already-finished"))
+        self.assertEqual(len(state.out_list), 1)
+
+    async def test_abort_from_other_thread_wakes_waiting_response(self):
+        tm = _make_tm()
+        tm.wait_timeout = 10
+        loop = asyncio.get_running_loop()
+        state = _make_state(loop)
+        tm.rid_to_state = {"cancelled": state}
+        response = tm._wait_one_response(SimpleNamespace(rid="cancelled", stream=True), state)
+        pending = asyncio.create_task(response.__anext__())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        await loop.run_in_executor(None, tm._handle_abort_req, SimpleNamespace(rid="cancelled"))
+        result = await asyncio.wait_for(pending, timeout=1)
+        self.assertEqual(result["meta_info"]["finish_reason"]["type"], "abort")
+        await response.aclose()
+
     async def test_atomic_drain_handles_stale_wakeup(self):
         """A stale event ``set`` with an empty ``out_list`` (the cross-loop
         fallback path can still defer past ``clear()``) must hit the

@@ -785,6 +785,7 @@ def test_paused_decode_drains_inflight_transfer_to_completion():
 
         def __init__(self, entry):
             self._engine_paused = True
+            self.token_to_kv_pool_allocator = SimpleNamespace(page_size=4)
             self.entry = entry
             self.installed = []
             self.bookkept = []
@@ -1111,3 +1112,37 @@ class TestTerminalRecords:
         m.record_terminal("r1", role="prefill", transfer_id="t1", state=KVPoll.FAILED, reason="x")
         m.register_sender("r1", _FakeParticipant(1.0))
         assert m.get_terminal_record("r1", role="prefill") is None
+
+
+def test_received_prompt_tail_page_is_reclaimed_at_page_boundaries():
+    import numpy as np
+    from sgl_jax.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
+
+    for page_size in (1, 128):
+        for seqlen in (1, 127, 128, 129, 2048, 2049):
+            allocator = PagedTokenToKVPoolAllocator(4096, page_size, None)
+            indices = allocator.alloc((seqlen + page_size - 1) // page_size * page_size)
+            req = SimpleNamespace(origin_input_ids=list(range(seqlen)), dp_rank=0, output_ids=[])
+            entry = DecodeBookkeeping(
+                req_id="tail",
+                req=req,
+                kv_indices=indices,
+                receiver=SimpleNamespace(commit=lambda install: None),
+                synced_state=KVPoll.SUCCESS,
+            )
+            scheduler = SimpleNamespace(
+                token_to_kv_pool_allocator=allocator,
+                _drain_transfer_queue_synced=lambda: [entry],
+                _set_decode_bookkeeping=lambda r, ix: SchedulerDisaggregationDecodeMixin._set_decode_bookkeeping(
+                    scheduler, r, ix
+                ),
+                _release_decode_kv_indices=lambda ix, rank: allocator.free(np.asarray(ix), rank),
+                _enqueue_for_decode=lambda r: None,
+                _pd_mark_time=lambda r, name: None,
+            )
+            SchedulerDisaggregationDecodeMixin._drain_decode_transfer_terminals(scheduler)
+            assert len(req.prefix_indices) == seqlen - 1
+            # Reclaim every page owned by the decode prefix; together with the
+            # unused received tail, this must restore the full allocator.
+            allocator.free(req.prefix_indices)
+            assert allocator.available_size() == 4096, (page_size, seqlen)

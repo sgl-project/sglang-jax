@@ -71,9 +71,11 @@ gap between these events; this is server-side availability, not client TTFT.
    extension preload, runtime versions, TPU discovery, manager construction, and
    bitwise float32/bfloat16 transfer. Publish wheel, SHA256 and provenance; publish
    the cache READY marker only after smoke tests and download verification pass.
-2. On two single-chip v6e hosts, reproduce ordinary PD with the same wheel and
-   model before enabling overlap. Run native page-isolation, donation-address,
-   late-completion and cancellation probes.
+2. Start with one Falcon v7x-8 pod, splitting chips 0,1 for P and 2,3 for D
+   (four JAX devices per role). Reproduce ordinary PD with the same wheel and
+   model before enabling overlap. Run native page-isolation and reuse probes.
+   This validates independent P/D processes but not cross-host networking;
+   separate-host validation remains a follow-up.
 3. Compare four role combinations (both off, D only, P only, both on), with chunk
    transfer independently off/on. Start with DP=1. Check deterministic token IDs,
    short requests, multi-chunk prompts, concurrency, cancellation, timeout,
@@ -95,3 +97,30 @@ PYTHONPATH=python python -m pytest -q \
   python/sgl_jax/test/test_scheduler_retraction.py \
   python/sgl_jax/test/test_scheduler_idle_check.py
 ```
+
+### Raiden failure-event compatibility
+
+The JAX 0.11.1 `tpu_sync` wheel based on upstream `6d431411` reports
+expired producer registrations in the third (`failed_recving`) result of
+`poll_stats()`. The connector treats these as sender failures and waits for
+all registered chunks before releasing source KV. Older wheels that report
+sender completion through `done_sending` remain supported.
+
+This failure-recovery path requires one native endpoint per DP rank, which
+is the current wheel's default (`ENABLE_MULTI_NUMA` unset). Its multi-NUMA
+wrapper reports the first sub-manager failure before all other sub-managers
+settle. The connector conservatively retains pages in that case; multi-NUMA
+failure recovery is not validated and needs an aggregate terminal-event
+contract in Raiden before it can be enabled safely.
+
+### Serving regressions covered by the device harness
+
+The Falcon harness under `scripts/disaggregation/falcon` checks original KV
+capacity after page-boundary prompts, not just the capacity observed before
+cancellation. D recomputes the final prompt token; when it occupies a received
+page without any prefix tokens, that page is returned after transfer completion.
+
+Output-only logprobs are sent as deltas across the scheduler/tokenizer boundary,
+including mixed request batches. SSE supports NumPy values and large cumulative
+logprob events without the default aiohttp line limit. The harness compares both
+output token IDs and logprob counts, and separately tests long streaming responses.

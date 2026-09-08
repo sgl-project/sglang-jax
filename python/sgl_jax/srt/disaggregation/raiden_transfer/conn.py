@@ -663,6 +663,17 @@ class RaidenTransferKVManager(CommonKVManager):
         with self._poll_lock:
             return req_id in self._done_sending
 
+    def sender_failed(self, req_id: str, dp_rank: int) -> bool:
+        with self._poll_lock:
+            failed = req_id in self._failed_receiving
+        if not failed:
+            return False
+        # tpu-sync@6d43141 reports expired sends through failed_recving too.
+        # Its multi-NUMA wrapper emits the first sub-manager failure before
+        # the others settle. Only a single endpoint proves all source shards
+        # are released; otherwise retain ownership conservatively.
+        return len(self.wrapper.endpoints_by_dp_rank.get(dp_rank, ())) == 1
+
     def receiver_state(self, req_id: str) -> str | None:
         with self._poll_lock:
             if req_id in self._failed_receiving:
@@ -922,6 +933,12 @@ class RaidenTransferKVSender(KVSender, StateHolder):
             pending_failure = self._pending_failure_reason
         self._manager.poll_engine()
         if chunk_mode:
+            if any(
+                self._manager.sender_failed(chunk_transfer_id(self.uuid, k), self._dp_rank)
+                for k in started_chunks
+            ):
+                self.request_abort("raiden_failed_sending")
+                pending_failure = self._pending_failure_reason
             if pending_failure is None:
                 self._pump_pending_chunks(raise_on_error=False)
             with self._state_lock:
@@ -932,7 +949,11 @@ class RaidenTransferKVSender(KVSender, StateHolder):
                 num_chunks = self._num_chunks
                 pending_failure = self._pending_failure_reason
             child_ids = [chunk_transfer_id(self.uuid, k) for k in started_chunks]
-            if not all(self._manager.sender_done(child_id) for child_id in child_ids):
+            if not all(
+                self._manager.sender_done(child_id)
+                or self._manager.sender_failed(child_id, self._dp_rank)
+                for child_id in child_ids
+            ):
                 return KVPoll.TRANSFERRING
             if pending_failure is not None:
                 return self._finish(KVPoll.FAILED, pending_failure)
@@ -945,10 +966,12 @@ class RaidenTransferKVSender(KVSender, StateHolder):
                     self._transfer_started_at = None
                 return KVPoll.TRANSFERRING
             return self._finish(KVPoll.SUCCESS, "raiden_chunks_done_sending")
-        if not self._manager.sender_done(self.uuid):
+        if self._manager.sender_failed(self.uuid, self._dp_rank):
+            self.request_abort("raiden_failed_sending")
+        elif not self._manager.sender_done(self.uuid):
             return KVPoll.TRANSFERRING
-        # tpu-raiden@8756479 CompleteReadRaw reports send-side failures and
-        # timeouts through done_sending; failed_recving is receiver-only.
+        # Older Raiden wheels signal send failures through done_sending;
+        # newer single-endpoint wheels also have an explicit failure event.
         reason = self._pending_failure_reason
         return self._finish(
             KVPoll.FAILED if reason is not None else KVPoll.SUCCESS,
