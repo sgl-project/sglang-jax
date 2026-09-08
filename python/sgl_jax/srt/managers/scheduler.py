@@ -1552,6 +1552,8 @@ class Scheduler(
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = dict(global_server_args_dict)
         ret["last_gen_throughput"] = self.last_gen_throughput
+        ret["disagg_decode_admission_fences"] = getattr(self, "disagg_decode_admission_fences", 0)
+        ret["disagg_decode_admitted"] = getattr(self, "disagg_decode_admitted", 0)
         ret["avg_spec_accept_length"] = compute_avg_spec_accept_length(
             self.cum_spec_accept_length, self.cum_spec_accept_count
         )

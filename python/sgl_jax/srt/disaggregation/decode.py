@@ -240,7 +240,6 @@ class SchedulerDisaggregationDecodeMixin:
             # by the transfer queue and cannot appear in the running batch.
             wd.beat("wait_donation_safe")
             self._wait_donation_safe()
-            self._wait_decode_admission_safe()
             wd.beat("process_decode_queue")
             self.process_decode_queue()
             wd.beat("get_next_batch")
@@ -311,7 +310,8 @@ class SchedulerDisaggregationDecodeMixin:
         implemented, new native receive admission requires a whole-pool device
         fence. Steady decode and polling existing receives need no such fence.
         """
-        if len(self.disagg_prealloc_queue):
+        self.disagg_decode_admission_fences = getattr(self, "disagg_decode_admission_fences", 0) + 1
+        with jax.profiler.TraceAnnotation("pd_decode_admission_fence"):
             self._wait_donation_safe()
             jax.block_until_ready(self.token_to_kv_pool_allocator.get_kvcache().kv_buffer)
 
@@ -656,6 +656,7 @@ class SchedulerDisaggregationDecodeMixin:
         transfer_per_dp = self.disagg_transfer_queue.count_by_rank(self.dp_size)
         admitted_per_dp = [0] * self.dp_size
         capacity_blocked_ranks: set[int] = set()
+        admission_fenced = False
 
         for entry in self.disagg_prealloc_queue.items_fifo():
             decode_dp_rank = _request_dp_rank(entry.req, self.dp_size)
@@ -694,6 +695,14 @@ class SchedulerDisaggregationDecodeMixin:
             if not metadata_ready:
                 self._expire_decode_prealloc(entry)
                 continue
+
+            # Fence only candidates that passed admission gates. A full transfer
+            # window or pending metadata must not serialize otherwise independent
+            # decode compute. No forwards launch inside this sweep, so one fence
+            # protects every native receive admitted here.
+            if getattr(self, "enable_overlap", False) and not admission_fenced:
+                self._wait_decode_admission_safe()
+                admission_fenced = True
 
             kv_indices = allocator.alloc(page_aligned, dp_rank=decode_dp_rank)
             if kv_indices is None:
@@ -744,6 +753,7 @@ class SchedulerDisaggregationDecodeMixin:
             self._pd_mark_time(entry.req, "transfer_entry")
             self.disagg_prealloc_queue.remove(entry.req_id)
             self.disagg_transfer_queue.add(entry)
+            self.disagg_decode_admitted = getattr(self, "disagg_decode_admitted", 0) + 1
             admitted += 1
             admitted_per_dp[decode_dp_rank] += 1
 

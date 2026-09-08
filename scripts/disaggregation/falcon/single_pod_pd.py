@@ -3,12 +3,12 @@
 import concurrent.futures
 import json
 import os
-from pathlib import Path
 import signal
 import subprocess
 import sys
 import time
 import traceback
+from pathlib import Path
 
 import requests
 from transformers import AutoTokenizer

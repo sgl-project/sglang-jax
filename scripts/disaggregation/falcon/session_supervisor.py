@@ -1,14 +1,14 @@
 """Bounded Falcon development session with serial, auditable test commands."""
 
-import json
 import hashlib
+import json
 import os
-from pathlib import Path
 import shutil
 import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 STATE = Path("/tmp/tpu_logs/pd-session")
@@ -58,6 +58,21 @@ def main():
             "timeout_s": 7200,
         },
     )
+    automatic = json.loads((RESULTS / "source-manifest.json").read_text()).get(
+        "pr_validation", False
+    )
+    if automatic:
+        write(
+            commands / "002-pr-validation.json",
+            {
+                "id": "pr-validation",
+                "command": [
+                    sys.executable,
+                    str(ROOT / "scripts/disaggregation/falcon/pr_validation_suite.py"),
+                ],
+                "timeout_s": 18000,
+            },
+        )
     completed = set()
     last_exit = 1
     while time.monotonic() < DEADLINE:
@@ -68,6 +83,8 @@ def main():
             return code
         pending = [p for p in sorted(commands.glob("*.json")) if p.name not in completed]
         if not pending:
+            if automatic:
+                return last_exit
             write(
                 STATE / "status.json",
                 {
@@ -120,6 +137,8 @@ def main():
         write(out / "session-result.json", status)
         archive()
         print("SESSION_COMMAND_FINISHED=" + json.dumps(status), flush=True)
+        if automatic and last_exit != 0:
+            return last_exit
     return 124
 
 

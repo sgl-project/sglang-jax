@@ -2,14 +2,15 @@
 
 import json
 import os
-from pathlib import Path
 import signal
 import subprocess
 import sys
 import time
 import traceback
-from transformers import AutoTokenizer
+from pathlib import Path
+
 import single_pod_pd as driver
+from transformers import AutoTokenizer
 
 REPORT = {"status": "running", "checks": []}
 

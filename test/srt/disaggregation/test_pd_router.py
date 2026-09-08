@@ -878,8 +878,9 @@ class TestServingCompletionsPassthrough:
     ],
 )
 def test_stream_logprobs_allow_missing_or_late_prefill_input_logprobs(prefill_metadata):
-    import orjson
     from types import SimpleNamespace
+
+    import orjson
 
     class Lines:
         def __init__(self, values):
@@ -934,6 +935,7 @@ def test_stream_logprobs_allow_missing_or_late_prefill_input_logprobs(prefill_me
 def test_stream_lines_support_large_events_and_fragmented_utf8(size):
     import aiohttp
     from aiohttp import web
+
     from sgl_jax.srt.disaggregation.mini_lb import _iter_stream_lines
 
     async def run():

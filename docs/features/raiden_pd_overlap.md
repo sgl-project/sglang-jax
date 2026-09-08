@@ -124,3 +124,21 @@ Output-only logprobs are sent as deltas across the scheduler/tokenizer boundary,
 including mixed request batches. SSE supports NumPy values and large cumulative
 logprob events without the default aiohttp line limit. The harness compares both
 output token IDs and logprob counts, and separately tests long streaming responses.
+
+### Admission fencing and steady-state validation
+
+Decode fences outstanding device writes only when a receive candidate passes
+capacity, transfer-window and metadata checks. One fence covers the admission
+sweep; polling existing receives or a blocked preallocation queue does not
+require a new device fence. The safety requirement still applies before native
+Raiden receives can reuse pages retired by earlier results. Internal state
+exposes `disagg_decode_admission_fences` and `disagg_decode_admitted`, and profiles
+include `pd_decode_admission_fence`.
+
+The Falcon harness supports `render_single_pod.py --pr-validation` for a bounded
+correctness, lifecycle, continuous-load and soak run. Continuous throughput
+counts SSE token deltas inside a fixed wall-clock window after uninterrupted
+warm traffic. It does not count completed-request token totals over repeated
+waves. See `scripts/disaggregation/falcon/README.md` for measurement boundaries
+and scope. Retain the default-off setting until the intended deployment's
+correctness and workload-specific performance have been validated.

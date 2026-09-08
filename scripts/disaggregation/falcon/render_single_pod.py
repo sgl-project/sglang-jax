@@ -5,16 +5,19 @@ import base64
 import gzip
 import hashlib
 import json
-from pathlib import Path
 import subprocess
+from pathlib import Path
 
 import yaml
 
 ROOT = Path(__file__).resolve().parents[3]
 HERE = Path(__file__).resolve().parent
-BASE = "24ef4d3aa5de85246d0c1ee09572784e879000e4"
+BASE = "a0de20d967909a7f509d2601156b51b36c86e801"
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--name", required=True, help="Unique Falcon experiment name")
+parser.add_argument(
+    "--pr-validation", action="store_true", help="Run all PR gates and exit automatically"
+)
 parser.add_argument("--output", type=Path, required=True, help="Destination YAML")
 args = parser.parse_args()
 head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
@@ -32,6 +35,9 @@ files = {
         "fault_suite.py",
         "fault_sitecustomize.py",
         "performance_suite.py",
+        "steady_client.py",
+        "steady_suite.py",
+        "pr_validation_suite.py",
         "stream_regression.py",
         "eos_checks.py",
         "mixed_requests.py",
@@ -39,6 +45,7 @@ files = {
 }
 files["source.patch"] = patch
 manifest = {
+    "pr_validation": args.pr_validation,
     "base_commit": BASE,
     "implementation_commit": head,
     "files_sha256": {k: hashlib.sha256(v).hexdigest() for k, v in files.items()},

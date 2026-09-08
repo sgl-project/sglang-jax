@@ -4,16 +4,15 @@ import concurrent.futures
 import hashlib
 import json
 import os
-from pathlib import Path
 import signal
 import time
 import traceback
-
-import requests
-from transformers import AutoTokenizer
+from pathlib import Path
 
 import lifecycle_checks as lifecycle
+import requests
 import single_pod_pd as driver
+from transformers import AutoTokenizer
 
 REPORT = {
     "status": "running",

@@ -13,7 +13,10 @@ import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
 from jax.sharding import Mesh, NamedSharding, PartitionSpec  # noqa: E402
-from sgl_jax.srt.disaggregation.raiden_transfer.wrapper import RaidenTransferWrapper  # noqa: E402
+
+from sgl_jax.srt.disaggregation.raiden_transfer.wrapper import (  # noqa: E402
+    RaidenTransferWrapper,
+)
 
 
 def write(path, value):

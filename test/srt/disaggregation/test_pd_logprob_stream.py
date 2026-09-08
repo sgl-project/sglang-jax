@@ -3,8 +3,11 @@
 from types import SimpleNamespace
 
 import pytest
+
 from sgl_jax.srt.managers.schedule_batch import Req
-from sgl_jax.srt.managers.scheduler_output_processor_mixin import SchedulerOutputProcessorMixin
+from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
+    SchedulerOutputProcessorMixin,
+)
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 
 

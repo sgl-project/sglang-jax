@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+
 from sgl_jax.srt.managers import scheduler as scheduler_module
 from sgl_jax.srt.managers import tp_worker_overlap_thread as worker_module
 

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import orjson
+
 from sgl_jax.srt.entrypoints import http_server
 
 

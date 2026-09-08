@@ -6,6 +6,7 @@ from copy import copy
 from types import SimpleNamespace
 
 import pytest
+
 from sgl_jax.srt.disaggregation import decode
 
 
@@ -162,14 +163,11 @@ def test_pause_handler_already_drained_is_not_consumed_twice(monkeypatch):
     assert scheduler.events.count("dummy") == 2
 
 
-def test_new_receive_waits_for_device_writes_but_steady_decode_does_not(monkeypatch):
+def test_admission_fence_waits_for_donation_then_device_writes(monkeypatch):
     scheduler = _Scheduler([])
     monkeypatch.setattr(
         decode.jax, "block_until_ready", lambda _: scheduler.events.append("device_ready")
     )
-    scheduler._wait_decode_admission_safe()
-    assert scheduler.events == []
-    scheduler.disagg_prealloc_queue.append(object())
     scheduler._wait_decode_admission_safe()
     assert scheduler.events == ["donation", "device_ready"]
 

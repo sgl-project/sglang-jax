@@ -3,17 +3,16 @@
 import asyncio
 import json
 import os
-from pathlib import Path
 import signal
-import time
 import threading
+import time
 import traceback
+from pathlib import Path
 
 import aiohttp
 import requests
-from transformers import AutoTokenizer
-
 import single_pod_pd as driver
+from transformers import AutoTokenizer
 
 REPORT = {
     "status": "running",

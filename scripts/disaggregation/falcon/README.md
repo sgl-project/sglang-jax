@@ -75,3 +75,26 @@ Falcon's terminal state, then analyze each profile through Falcon's
 `xprof-summary` plugin with a separate `params.subpath`. Profile capture alone
 does not establish physical Raiden compute/transfer overlap. Stop any temporary
 monitor after collecting and reporting the results.
+
+## Continuous steady-state PR gates
+
+Pass `--pr-validation` to the renderer to run correctness followed by stream,
+fault, EOS, mixed-output, continuous performance, soak and profiling checks.
+The supervisor fails fast on any failed gate and exits automatically after all
+stages finish; the six-hour deadline still applies. It does not create a PR.
+
+`performance_suite.py` is the original warmed **finite-wave** benchmark. Use
+`steady_suite.py` for steady-state claims: independent client slots replenish
+immediately in one persistent session, with 60 seconds of uninterrupted warm
+traffic and a fixed 180-second measurement window. Count observed token deltas
+inside the window, including partial requests; latency includes the full drain
+of the start-in-window cohort. Workloads and per-slot payload sequences are
+identical across configurations, although completion timing naturally differs.
+
+Three paired B1/PD repetitions cover 4K/16K input, 256 output, C16/C32 and mixed
+4K/16K plus 256/1024 at C16. P-only/D-only use the mixed case. A separate C32
+20-minute soak checks every output against non-PD references and requires full
+KV/queue recovery. Sample server states at one-second intervals to distinguish
+active decode with incoming PD work from client concurrency alone. Profiles are
+captured separately for five seconds during continuous mixed traffic; profile
+and export delays are never included in reported performance measurements.

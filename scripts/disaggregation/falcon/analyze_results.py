@@ -2,8 +2,8 @@
 
 import json
 import os
-from pathlib import Path
 import statistics
+from pathlib import Path
 
 
 def summarize(root, runs):
