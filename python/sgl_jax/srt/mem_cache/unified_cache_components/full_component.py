@@ -28,7 +28,10 @@ class FullComponent(TreeComponent):
 
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams | None = None):
         super().__init__(cache, params)
-        self._free_full = cache.token_to_kv_pool_allocator.free
+        allocator = cache.token_to_kv_pool_allocator
+        self._free_full = (
+            allocator.free_full if ComponentType.SWA in cache.tree_components else allocator.free
+        )
 
     def create_match_validator(
         self, match_device_only: bool = False
