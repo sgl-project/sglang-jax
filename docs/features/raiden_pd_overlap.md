@@ -145,3 +145,44 @@ warm traffic. It does not count completed-request token totals over repeated
 waves. See `scripts/disaggregation/falcon/README.md` for measurement boundaries
 and scope. Retain the default-off setting until the intended deployment's
 correctness and workload-specific performance have been validated.
+
+
+### Observed device continuity and remaining gaps
+
+On the validated single-pod Qwen3-30B-A3B mixed C16 workload, decode
+inter-forward gaps fall from a median of 4.241 ms with PD overlap disabled to
+0.107 ms with overlap enabled (p95: 6.441 ms to 3.088 ms). These gaps include
+auxiliary JIT modules, so they are not a measurement of pure device idle time.
+The baseline is PD with overlap disabled, not non-PD serving.
+
+![Recorded device forward intervals](images/raiden_pd_overlap_timeline.png)
+
+Regular decode forwards are nearly contiguous, but receive admission still
+interrupts the pipeline. Ten of the eleven recorded gaps above 1 ms follow a
+forward intersecting an admission fence; the two illustrated gaps are 5.361 ms
+and 9.167 ms. Prefill chunk gaps also remain. This feature does not remove the
+whole-pool admission fence or guarantee uninterrupted forward execution under
+continuous incoming PD traffic.
+
+Canonical XLA Ops inspection in three decode windows finds at most
+21/63/141 microseconds without op coverage inside model spans. No millisecond
+internal blank was observed in those windows, but individual ops can contain
+waits. No independent Raiden DMA events were available, so this is not proof
+that DMA never stalls compute. Device events cover only the first 2.401 seconds
+of the roughly five-second decode host capture; the remaining time is not
+counted as device idle.
+
+### Multi-process collective ordering
+
+The single-JAX-process restriction is a correctness boundary. In a multi-process
+instance, transfer-queue polling can call `process_allgather` while the forward
+thread dispatches sampler collectives. Different process-local thread orders
+can then produce mismatched collective execution order. Draining every previous
+forward before polling avoids that race but serializes the pipeline.
+
+This implementation rejects `nnodes != 1` at argument validation and rejects
+`jax.process_count() != 1` at runtime. With one JAX process, transfer draining
+bypasses cross-process synchronization. It therefore does not implement or
+validate multi-process PD overlap; the single-process TPU measurements must not
+be used to relax either guard. Supporting that configuration requires a separate
+collective-ordering design and multi-process validation.

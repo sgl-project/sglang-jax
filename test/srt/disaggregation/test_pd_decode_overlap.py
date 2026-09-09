@@ -185,3 +185,22 @@ def test_retraction_drain_fences_before_processing_result(monkeypatch):
     assert scheduler.events == ["donation", "device_ready", ("result", "decode")]
     assert not scheduler.result_queue
     assert scheduler.last_batch is scheduler.cur_batch is None
+
+
+def test_single_process_transfer_drain_does_not_issue_multihost_collectives(monkeypatch):
+    from sgl_jax.srt.disaggregation.common import multihost_sync
+
+    monkeypatch.setattr(decode.jax, "process_count", lambda: 1)
+
+    def unexpected_collective(*args, **kwargs):
+        pytest.fail("single-process PD polling must not issue multihost collectives")
+
+    monkeypatch.setattr(multihost_sync, "synced_terminal_rooms", unexpected_collective)
+    completed = [object()]
+    scheduler = SimpleNamespace(
+        disagg_transfer_queue=SimpleNamespace(drain_terminal=lambda: completed)
+    )
+    assert (
+        decode.SchedulerDisaggregationDecodeMixin._drain_transfer_queue_synced(scheduler)
+        is completed
+    )
