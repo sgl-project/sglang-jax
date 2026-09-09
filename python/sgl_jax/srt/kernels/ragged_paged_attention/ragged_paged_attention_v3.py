@@ -1255,11 +1255,44 @@ def prepare_inputs(
     return q, kv, attention_sink
 
 
+def _prepare_outputs_packed_bf16_kernel(src_ref, dst_ref):
+    # Bitcasting packs the second-minor dimension, keeping each pair of BF16
+    # query heads together in one uint32 word throughout the conversion.
+    src = src_ref.bitcast(jnp.uint32).reshape(2, 256, 128)
+    dst = dst_ref.bitcast(jnp.uint32).reshape(512, 128)
+    for h in range(2):
+        for g in range(2):
+            # dst[t, 4*h + 2*g + p, d] = src[h, t, g, p, d].
+            dst[pl.ds(2 * h + g, 128, 4), :] = src[h, pl.ds(g, 128, 2), :]
+
+
 def prepare_outputs(
     out,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     actual_num_q_heads_per_kv_head: int,
     actual_head_dim: int,
 ):
+    if (
+        out.shape == (2, 2048, 2, 2, 128)
+        and out.dtype == jnp.bfloat16
+        and actual_num_q_heads_per_kv_head == 4
+        and actual_head_dim == 128
+    ):
+        # Materialize the public layout directly in independent 128-token
+        # tiles, without a global BF16 transpose/reshape.
+        # Use integer call boundaries to preserve BF16 subnormals and NaN
+        # payloads without floating-point normalization during transfers.
+        out_bits = lax.bitcast_convert_type(out, jnp.uint16)
+        result_bits = pl.pallas_call(
+            _prepare_outputs_packed_bf16_kernel,
+            out_shape=jax.ShapeDtypeStruct((2048, 8, 128), jnp.uint16),
+            grid=(16,),
+            in_specs=[pl.BlockSpec((2, 128, 2, 2, 128), lambda i: (0, i, 0, 0, 0))],
+            out_specs=pl.BlockSpec((128, 8, 128), lambda i: (i, 0, 0)),
+            compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+            name="rpa_prepare_outputs_packed_bf16",
+        )(out_bits)
+        return lax.bitcast_convert_type(result_bits, out.dtype)
+
     (
         actual_num_kv_heads,
         max_num_tokens,
