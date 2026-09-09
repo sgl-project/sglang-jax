@@ -73,6 +73,7 @@ def _logits(bs, e, seed):
 
 CONFIGS = [
     # (E, G, Gtop, k, name)
+    (896, 1, 1, 16, "router_E896_G1_Gtop1_k16"),
     (256, 8, 4, 8, "A_E256_G8_Gtop4_k8"),  # sgl-jax DeepSeek-V3 / Ling
     (512, 8, 4, 8, "B_E512_G8_Gtop4_k8"),  # MaxText
     (128, 4, 2, 6, "small_E128_G4_Gtop2_k6"),
