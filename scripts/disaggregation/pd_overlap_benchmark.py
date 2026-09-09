@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from ipaddress import IPv4Address
 from pathlib import Path
 
 import aiohttp
@@ -372,13 +373,20 @@ def main():
         parser.error("invalid workload duration/repetition count")
     if args.output.exists():
         parser.error("output directory must be new to avoid mixing runs")
-    # Refuse occupied ports so health probes cannot accept another serving job.
-    for port in (8998, 30000, 30001, 30010, 30011, 30020, 9600, 9700):
-        with socket.socket() as sock:
-            try:
-                sock.bind(("0.0.0.0", port))
-            except OSError:
-                parser.error(f"port {port} is occupied; use an idle host/pod")
+    try:
+        host_ip = IPv4Address(args.host_ip)
+    except ValueError:
+        parser.error("host-ip must be a local IPv4 address")
+    if host_ip.is_unspecified or host_ip.is_multicast:
+        parser.error("host-ip must identify a specific local interface")
+    # Check both endpoints so health probes cannot accept another serving job.
+    for host in dict.fromkeys(("127.0.0.1", str(host_ip))):
+        for port in (8998, 30000, 30001, 30010, 30011, 30020, 9600, 9700):
+            with socket.socket() as sock:
+                try:
+                    sock.bind((host, port))
+                except OSError as exc:
+                    parser.error(f"cannot reserve {host}:{port}: {exc}; use an idle host/pod")
     args.output = args.output.resolve()
     args.output.mkdir(parents=True)
     servers = Servers(args)
