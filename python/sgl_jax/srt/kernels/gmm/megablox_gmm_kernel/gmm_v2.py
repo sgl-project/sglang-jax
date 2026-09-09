@@ -73,6 +73,7 @@ class GmmConfigs:
     out_dtype: jnp.dtype
     acc_dtype: jnp.dtype
     zero_init: bool
+    output_activation: str | None = None
 
 
 TileFn = Callable[[jnp.dtype, jnp.dtype, Dimensions, int], TileSizes]
@@ -111,6 +112,16 @@ class IndexMaps:
         group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
         return (group_id, k_id, 0, n_id)
 
+    def output_multiplier_index_map(self, n_id: jax.Array, gm_id: jax.Array, _: jax.Array):
+        m_start = self.metadata_ref.gm_id_to_m_offset[gm_id]
+        m_end = self.metadata_ref.gm_id_to_m_offset[gm_id + 1]
+
+        # Unlike the output DMA, the epilogue needs the final partial sublane
+        # on every step, including rows carried forward through partial_out_ref.
+        row_start = m_start // self.cfgs.dims.size_lhs_sublane
+        row_end = pl.cdiv(m_end, self.cfgs.dims.size_lhs_sublane)
+        return (pl.ds(row_start, row_end - row_start), 0, n_id)
+
     def out_index_map(self, n_id: jax.Array, gm_id: jax.Array, _: jax.Array):
         is_last_gm = gm_id == (pl.num_programs(1) - 1)
         m_start = self.metadata_ref.gm_id_to_m_offset[gm_id]
@@ -127,7 +138,7 @@ class IndexMaps:
 
 def generate_block_specs(
     metadata_ref: MetadataRef, cfgs: GmmConfigs
-) -> tuple[tuple[pl.BlockSpec, WeightsRef], pl.BlockSpec]:
+) -> tuple[tuple[pl.BlockSpec, WeightsRef, pl.BlockSpec | None], pl.BlockSpec]:
     """Generates block specs for the given lhs, rhs, and out refs."""
 
     index_map = IndexMaps(metadata_ref, cfgs)
@@ -177,7 +188,15 @@ def generate_block_specs(
         index_map.out_index_map,
     )
 
-    return (lhs_block_spec, rhs_block_spec), out_block_spec
+    output_multiplier_spec = None
+    if cfgs.output_activation is not None:
+        output_multiplier_spec = pl.BlockSpec(
+            (bounded_slice_gm, cfgs.dims.size_lhs_sublane, cfgs.tiles.tile_n),
+            index_map.output_multiplier_index_map,
+            pipeline_mode=pl.Buffered(buffer_count=2),
+        )
+
+    return (lhs_block_spec, rhs_block_spec, output_multiplier_spec), out_block_spec
 
 
 # Define kernels.
@@ -188,6 +207,7 @@ def inner_kernel(
     tiled_lhs_ref: jax.Array,
     # [tile_m // size_lhs_sublane, size_lhs_sublane, tile_k]
     tiled_rhs_ref: WeightsRef,  # [tile_k, tile_n]
+    tiled_output_multiplier_ref: jax.Array | None,
     # Out
     tiled_out_ref: jax.Array,
     # [tile_m // size_lhs_sublane, size_lhs_sublane, tile_n]
@@ -210,6 +230,8 @@ def inner_kernel(
         tiled_lhs_ref: Contains value lhs[m_start:m_end, k_start:k_end]
         tiled_rhs_ref: Contains value rhs[g_id, k_start:k_end, n_start:n_end]. where
             g_id is the group associated with lhs[m_start:m_end, :]
+        tiled_output_multiplier_ref: Optional multiplier for all rows in the tile,
+            including the final partial sublane, and the same output columns.
         tiled_out_ref: Contains value out[m_start:m_end, n_start:n_end]
         partial_out_ref: Contains last size_lhs_sublane rows of the previous output.
             Will be initialized to zero if this is first tile for grid[n_id, :, :].
@@ -326,6 +348,15 @@ def inner_kernel(
                 acc *= tiled_rhs_ref.scale[...].astype(acc.dtype)
             if cfgs.rhs_cfgs.has_bias:
                 acc += tiled_rhs_ref.bias[...].astype(acc.dtype)
+
+            if cfgs.output_activation == "silu":
+                with jax.named_scope("output_silu_gating"):
+                    # Match the materialized gate GMM's BF16 rounding before
+                    # doing the activation and multiplication in FP32. Activate
+                    # only the new result, before merging previously gated rows.
+                    gate = acc.astype(cfgs.out_dtype)
+                    multiplier = tiled_output_multiplier_ref[...].reshape(acc.shape)
+                    acc = _silu_output(gate, multiplier)
 
             gm_id = pl.program_id(1)
 
@@ -582,6 +613,7 @@ def kernel_main(
     # In
     lhs_ref: jax.Array,  # [size_m, size_k]
     rhs_ref: WeightsRef,  # [size_group, size_k, size_n]
+    output_multiplier_ref: jax.Array | None,  # [size_m, size_n]
     # Out
     out_ref: jax.Array,  # [size_m, size_n]
     # Scratch memory
@@ -611,6 +643,7 @@ def kernel_main(
         group_offset_ref: Reference to the group offset.
         lhs_ref: Reference to the lhs.
         rhs_ref: Reference to the rhs.
+        output_multiplier_ref: Optional reference to the output-shaped multiplier.
         out_ref: Reference to the out.
         partial_out_ref: Reference to the partial output.
         acc_ref: Reference to the accumulator.
@@ -654,9 +687,14 @@ def kernel_main(
     # Bounded slice requires second last dim to be aligned to the sublane size.
     # rhs_ref uses static tiling thus reshape is not needed.
     lhs_in = lhs_ref.reshape(-1, cfgs.dims.size_lhs_sublane, lhs_ref.shape[-1])
+    output_multiplier_in = None
+    if output_multiplier_ref is not None:
+        output_multiplier_in = output_multiplier_ref.reshape(
+            -1, cfgs.dims.size_lhs_sublane, output_multiplier_ref.shape[-1]
+        )
     out_in = out_ref.reshape(-1, cfgs.dims.size_lhs_sublane, out_ref.shape[-1])
     scratches = [partial_out_ref, acc_ref, metadata_ref]
-    pipeline_fn(lhs_in, rhs_ref, out_in, scratches=scratches)
+    pipeline_fn(lhs_in, rhs_ref, output_multiplier_in, out_in, scratches=scratches)
 
     if cfgs.zero_init:
         zero_out_end(out_ref, semaphore_ref, zero_size, dims=cfgs.dims)
@@ -787,6 +825,7 @@ def get_cost_estimate(
     rhs: WeightsRef,
     out_dtype: jnp.dtype,
     dims: Dimensions,
+    output_multiplier: jax.Array | None = None,
 ):
     """Returns the cost estimate for the GMM kernel."""
     assert isinstance(rhs.weight, jax.Array)
@@ -806,12 +845,99 @@ def get_cost_estimate(
     out_bytes = dims.size_m * dims.size_n * jnp.dtype(out_dtype).itemsize
 
     total_bytes = lhs_bytes + rhs_bytes + out_bytes
+    transcendentals = 0
+    if output_multiplier is not None:
+        # As for the matmul estimate, use full M; metadata selects local rows.
+        output_elements = dims.size_m * dims.size_n
+        total_bytes += output_elements * output_multiplier.dtype.itemsize
+        flops += 4 * output_elements
+        transcendentals = 2 * output_elements  # exp and reciprocal
 
     return pl.CostEstimate(
         flops=flops,
         bytes_accessed=total_bytes,
-        transcendentals=0,
+        transcendentals=transcendentals,
     )
+
+
+def validate_output_activation(output_shape, output_dtype, output_multiplier, output_activation):
+    """Validate the paired epilogue arguments against the logical, unpadded output."""
+    if output_activation not in (None, "silu"):
+        raise ValueError(f"Unsupported output activation: {output_activation}")
+    if (output_activation is None) != (output_multiplier is None):
+        raise ValueError("output_activation and output_multiplier must be supplied together")
+    if output_multiplier is not None and (
+        output_multiplier.shape != output_shape
+        or output_multiplier.dtype != jnp.dtype(output_dtype)
+    ):
+        raise ValueError("output_multiplier must match the logical GMM output shape and dtype")
+
+
+def _silu_output(gate, multiplier):
+    """Gate is already rounded to the GMM output dtype; round again only at the end."""
+    compute_dtype = jnp.promote_types(gate.dtype, jnp.float32)
+    gate_f32 = gate.astype(compute_dtype)
+    up = multiplier.astype(compute_dtype)
+    sigmoid = lax.reciprocal(1.0 + jnp.exp(-gate_f32))
+    return (gate_f32 * sigmoid * up).astype(gate.dtype)
+
+
+def materialize_output_activation(
+    out, output_multiplier, group_sizes, group_offset, num_groups, *, zero_initialize
+):
+    """Apply the epilogue to visited rows while retaining the initialization contract."""
+    offset = jnp.asarray(0 if group_offset is None else group_offset, dtype=jnp.int32).reshape(())
+    group_ids = jnp.arange(group_sizes.shape[0], dtype=jnp.int32)
+    row_start = jnp.sum(jnp.where(group_ids < offset, group_sizes, 0))
+    row_end = jnp.sum(jnp.where(group_ids < offset + num_groups, group_sizes, 0))
+    rows = jnp.arange(out.shape[0], dtype=jnp.int32)[:, None]
+    visited = (row_start <= rows) & (rows < row_end)
+    gated = _silu_output(out, output_multiplier)
+    # In particular, NaNs in an unvisited multiplier must not turn zero-filled
+    # rows into NaNs. With zero_initialize=False those rows remain unspecified.
+    unvisited = jnp.zeros_like(out) if zero_initialize else out
+    return jnp.where(visited, gated, unvisited)
+
+
+def can_fuse_output_silu(lhs, rhs, cfgs: GmmConfigs, vmem_limit_bytes: int) -> bool:
+    """Admit unquantized BF16 full-K/full-N tiles without changing the chosen tiling."""
+    dims, tiles = cfgs.dims, cfgs.tiles
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    if (
+        lhs.dtype != jnp.bfloat16
+        or rhs.dtype != jnp.bfloat16
+        or cfgs.out_dtype != jnp.bfloat16
+        or cfgs.acc_dtype != jnp.float32
+        or cfgs.lhs_cfgs.quant_dtype is not None
+        or cfgs.rhs_cfgs.has_scale
+        or tiles.tile_k != dims.size_k
+        or tiles.tile_n != dims.size_n
+        or tiles.tile_k % num_lanes != 0
+        or tiles.tile_n % num_lanes != 0
+        or tiles.tile_m <= 0
+        or tiles.tile_m % dims.size_lhs_sublane != 0
+        or dims.size_m % dims.size_lhs_sublane != 0
+    ):
+        return False
+
+    # Budget double-buffered LHS, multiplier and output, triple-buffered RHS,
+    # accumulator and partial-output scratches, plus six FP32 epilogue tiles.
+    # This is a conservative admission estimate, not a compiler spill check.
+    lhs_elements = tiles.tile_m * tiles.tile_k
+    out_elements = tiles.tile_m * tiles.tile_n
+    out_bytes = cfgs.out_dtype.itemsize
+    f32_bytes = jnp.dtype(jnp.float32).itemsize
+    vmem_bytes = 2 * lhs_elements * jnp.dtype(lhs.dtype).itemsize
+    vmem_bytes += 3 * tiles.tile_k * tiles.tile_n * jnp.dtype(rhs.dtype).itemsize
+    vmem_bytes += 4 * out_elements * out_bytes
+    vmem_bytes += out_elements * jnp.dtype(cfgs.acc_dtype).itemsize
+    vmem_bytes += dims.size_lhs_sublane * tiles.tile_n * out_bytes
+    vmem_bytes += 6 * out_elements * f32_bytes
+    if cfgs.rhs_cfgs.has_bias:
+        vmem_bytes += 2 * tiles.tile_n * f32_bytes
+    if cfgs.zero_init:
+        vmem_bytes += min(2 * 1024 * 1024, dims.size_m * num_lanes * out_bytes)
+    return vmem_bytes <= vmem_limit_bytes
 
 
 def get_scope_name(dims: Dimensions, tiles: TileSizes) -> str:
@@ -932,6 +1058,7 @@ def get_metadata(cfgs: GmmConfigs):
         "acc_dtype",
         "maybe_quantize_lhs",
         "zero_initialize",
+        "output_activation",
     ]
 )
 def gmm_v2(
@@ -949,6 +1076,8 @@ def gmm_v2(
     acc_dtype: jnp.dtype | None = None,
     maybe_quantize_lhs: bool = True,
     zero_initialize: bool = True,
+    output_multiplier: jax.Array | None = None,
+    output_activation: str | None = None,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -970,12 +1099,27 @@ def gmm_v2(
           acc_dtype: Optional jnp.dtype for the accumulator.
           maybe_quantize_lhs: Quantize lhs if set to True and rhs is quantized.
           zero_initialize: Whether to initialize unvisited output elements to zero.
+          output_multiplier: Optional operand matching the logical output shape
+              and dtype, paired with output_activation.
+          output_activation: Static epilogue mode. "silu" rounds the GMM result
+              to the output dtype, computes silu(result) * output_multiplier in
+              at least FP32, and rounds the product to the output dtype. Only
+              visited rows are activated; unvisited rows are zero when
+              zero_initialize=True and unspecified otherwise. Unquantized BF16
+              full-K/full-N tiles fuse the epilogue when the VMEM estimate fits;
+              other configurations materialize it after the unchanged GMM.
 
     Returns:
           Output of shape [size_m, size_n].
     """
 
     del precision
+    validate_output_activation(
+        (lhs.shape[0], rhs.shape[-1]),
+        lhs.dtype if preferred_element_type is None else preferred_element_type,
+        output_multiplier,
+        output_activation,
+    )
 
     if group_offset is None:
         group_offset = jnp.array([0], dtype=jnp.int32)
@@ -1002,6 +1146,14 @@ def gmm_v2(
     )
     dims = cfgs.dims
     tiles = cfgs.tiles
+
+    materialized_multiplier = None
+    if output_activation is not None:
+        if can_fuse_output_silu(lhs, rhs, cfgs, vmem_limit_bytes):
+            cfgs = dataclasses.replace(cfgs, output_activation=output_activation)
+        else:
+            materialized_multiplier = output_multiplier
+            output_multiplier = None
 
     # Prepare block specs.
     rhs_scale_spec = rhs_bias_spec = None
@@ -1064,7 +1216,7 @@ def gmm_v2(
     out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
     rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
 
-    return pl.pallas_call(
+    out = pl.pallas_call(
         functools.partial(kernel_main, cfgs=cfgs),
         out_shape=out_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -1076,6 +1228,7 @@ def gmm_v2(
                     scale=rhs_scale_spec,
                     bias=rhs_bias_spec,
                 ),
+                pl.BlockSpec(memory_space=pltpu.HBM) if output_multiplier is not None else None,
             ],
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
             scratch_shapes=scratch_shapes,
@@ -1084,10 +1237,20 @@ def gmm_v2(
             vmem_limit_bytes=vmem_limit_bytes,
             disable_bounds_checks=True,
         ),
-        name=get_scope_name(dims, tiles),
-        cost_estimate=get_cost_estimate(lhs, rhs_weights, out_init.dtype, dims),
+        name=get_scope_name(dims, tiles) + ("-output_silu" if cfgs.output_activation else ""),
+        cost_estimate=get_cost_estimate(lhs, rhs_weights, out_init.dtype, dims, output_multiplier),
         metadata=get_metadata(cfgs),
-    )(group_sizes, group_offset, lhs, rhs_weights)[:, : dims.size_n]
+    )(group_sizes, group_offset, lhs, rhs_weights, output_multiplier)[:, : dims.size_n]
+    if materialized_multiplier is not None:
+        out = materialize_output_activation(
+            out,
+            materialized_multiplier,
+            group_sizes,
+            group_offset,
+            dims.size_group,
+            zero_initialize=zero_initialize,
+        )
+    return out
 
 
 def is_supported_by_gmm_v2(
