@@ -318,6 +318,26 @@ def _mla_ragged_paged_attention_kernel(
     bkv_sz = bkv_sz_per_kv_packing * kv_packing
     page_size = page_size_per_kv_packing * kv_packing
 
+    can_skip_causal_blocks = (
+        batch_size == 1
+        and static_q_len is None
+        and q_dtype == jnp.bfloat16
+        and kv_dtype == jnp.bfloat16
+        and mask_value == DEFAULT_MASK_VALUE
+    )
+    # Separate compute width from the unchanged KV transfer geometry only for
+    # the short prefill shape. Other shapes retain whole-block attention.
+    use_attention_subblocks = (
+        can_skip_causal_blocks
+        and ql_nope_hbm_ref.shape[0] == 512
+        and num_q_heads == 8
+        and lkv_dim == 512
+        and r_dim == 128
+        and page_size == 128
+        and bq_sz == 256
+        and bkv_sz == 1024
+    )
+
     start_seq_idx = start_end_seq_idx_ref[0]
     end_seq_idx = start_end_seq_idx_ref[1]
     batch_start_seq_idx = start_seq_idx + pl.program_id(0) * batch_size
@@ -340,11 +360,13 @@ def _mla_ragged_paged_attention_kernel(
     def flash_attention(
         ql_nope,  # [batch_size, actual_bq_sz * num_q_heads, lkv_dim]
         q_pe,  # [batch_size, actual_bq_sz * num_q_heads, r_dim]
-        kv_c,  # [batch_size, bkv_sz, lkv_dim] <- Correspond to data from bkvc_x2_ref
-        k_pe,  # [batch_size, bkv_sz, r_dim] <- Correspond to data from bpe_x2_ref
+        kv_c,  # [batch_size, compute_bkv_sz, lkv_dim] <- Data from bkvc_x2_ref
+        k_pe,  # [batch_size, compute_bkv_sz, r_dim] <- Data from bkpe_x2_ref
         *,
         bq_idx,
         bkv_idx,
+        compute_key_start=None,
+        initialize=None,
     ):
         assert len(ql_nope.shape) == 3
         assert len(q_pe.shape) == 3
@@ -355,14 +377,19 @@ def _mla_ragged_paged_attention_kernel(
         assert q_pe.shape[1] % bq_sz == 0
         assert ql_nope.shape[2] == lkv_dim
         assert q_pe.shape[2] == r_dim
-        assert kv_c.shape == (batch_size, bkv_sz, lkv_dim)
-        assert k_pe.shape == (batch_size, bkv_sz, r_dim)
+        compute_bkv_sz = kv_c.shape[1]
+        assert kv_c.shape == (batch_size, compute_bkv_sz, lkv_dim)
+        assert k_pe.shape == (batch_size, compute_bkv_sz, r_dim)
+        if compute_key_start is None:
+            compute_key_start = bkv_idx * bkv_sz
+        if initialize is None:
+            initialize = bkv_idx == 0
         head_l_ref = l_ref.at[:, : ql_nope.shape[1]]
         head_m_ref = m_ref.at[:, : ql_nope.shape[1]]
         head_acc_ref = acc_ref.at[:, : ql_nope.shape[1]]
 
         def load_with_init(ref, init_val):
-            return jnp.where(bkv_idx == 0, jnp.full_like(ref, init_val), ref[...])
+            return jnp.where(initialize, jnp.full_like(ref, init_val), ref[...])
 
         # Follow FlashAttention-2 forward pass.
         q = jnp.concatenate([ql_nope, q_pe], axis=-1)
@@ -374,7 +401,7 @@ def _mla_ragged_paged_attention_kernel(
         if q_scale is not None:
             s *= q_scale
 
-        k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(jnp.int32, s.shape[1:], 1)
+        k_span = compute_key_start + lax.broadcasted_iota(jnp.int32, s.shape[1:], 1)
 
         mask_list = []
         for b in range(batch_size):
@@ -1038,15 +1065,22 @@ def _mla_ragged_paged_attention_kernel(
 
         return q_nope_vec, q_rope_vec
 
-    def load_bkv(bkv_sem_idx):
+    def load_bkv(bkv_sem_idx, *, local_offset=0, slice_len=bkv_sz):
+        # Offsets and lengths are in tokens; the uint32 Ref view packs BF16
+        # pairs. A 256-token subblock therefore loads 128 packed rows.
+        assert 0 < slice_len <= bkv_sz
+        assert slice_len % kv_packing == 0
+        packed_slice = pl.ds(
+            floor_div_on_kv_packing(local_offset, kv_packing), slice_len // kv_packing
+        )
         bkvc_vecs = []
         bkpe_vecs = []
         for b in range(batch_size):
-            bkvc_ref = bkvc_x2_ref.bitcast(jnp.uint32).at[bkv_sem_idx, b, :bkv_sz_per_kv_packing]
-            bkvc_vec = pltpu.bitcast(bkvc_ref[...], kv_dtype).reshape(bkv_sz, lkv_dim)
+            bkvc_ref = bkvc_x2_ref.bitcast(jnp.uint32).at[bkv_sem_idx, b, packed_slice]
+            bkvc_vec = pltpu.bitcast(bkvc_ref[...], kv_dtype).reshape(slice_len, lkv_dim)
 
-            bkpe_ref = bkpe_x2_ref.bitcast(jnp.uint32).at[bkv_sem_idx, b, :bkv_sz_per_kv_packing]
-            bkpe_vec = pltpu.bitcast(bkpe_ref[...], kv_dtype).reshape(bkv_sz, r_dim)
+            bkpe_ref = bkpe_x2_ref.bitcast(jnp.uint32).at[bkv_sem_idx, b, packed_slice]
+            bkpe_vec = pltpu.bitcast(bkpe_ref[...], kv_dtype).reshape(slice_len, r_dim)
             bkvc_vecs.append(bkvc_vec)
             bkpe_vecs.append(bkpe_vec)
         return jnp.stack(bkvc_vecs), jnp.stack(bkpe_vecs)
@@ -1156,41 +1190,85 @@ def _mla_ragged_paged_attention_kernel(
                 def update_cur_bkv_to_cache():
                     start_update_kv_cache(batch_start_seq_idx, bkv_sem_idx, offsets, update_szs)
 
-                # Load bkv into vreg. There is no need to mask out invalid k/v entries,
-                # because the score of invalid Q.K^T pairs are masked (to be zero) in
-                # flash attention, so that the invalid kv entries
-                # (as long as they are not NaN or inf) won't affect to the output.
-                bkvc, bkpe = load_bkv(
-                    bkv_sem_idx,
-                )
+                def compute_attention_block(
+                    *,
+                    local_offset=0,
+                    slice_len=bkv_sz,
+                    compute_key_start=None,
+                    initialize=None,
+                ):
+                    # Load operands only inside the visibility guards. Invalid
+                    # finite K/V entries are masked out by flash attention.
+                    bkvc, bkpe = load_bkv(
+                        bkv_sem_idx, local_offset=local_offset, slice_len=slice_len
+                    )
 
-                bq_nope_vec, bq_pe_vec = load_bq(bq_sem_idx, actual_bq_sz=actual_bq_sz)
+                    bq_nope_vec, bq_pe_vec = load_bq(bq_sem_idx, actual_bq_sz=actual_bq_sz)
 
-                debug_print("[RPA debug] flash attention")
-                debug_print(
-                    "[RPA debug] bq_nope_vec.shape={}, {}",
-                    bq_nope_vec.shape[0],
-                    bq_nope_vec.shape[1],
-                )  # num_bkv=3, bkv_sz=512
-                debug_print(
-                    "[RPA debug] bq_pe_vec.shape={}, {}",
-                    bq_pe_vec.shape[0],
-                    bq_pe_vec.shape[1],
-                )
-                debug_print("[RPA debug] bkvc.shape={}, {}", bkvc.shape[0], bkvc.shape[1])
-                debug_print("[RPA debug] bkpe.shape={}, {}", bkpe.shape[0], bkpe.shape[1])
+                    debug_print("[RPA debug] flash attention")
+                    debug_print(
+                        "[RPA debug] bq_nope_vec.shape={}, {}",
+                        bq_nope_vec.shape[0],
+                        bq_nope_vec.shape[1],
+                    )  # num_bkv=3, bkv_sz=512
+                    debug_print(
+                        "[RPA debug] bq_pe_vec.shape={}, {}",
+                        bq_pe_vec.shape[0],
+                        bq_pe_vec.shape[1],
+                    )
+                    debug_print("[RPA debug] bkvc.shape={}, {}", bkvc.shape[0], bkvc.shape[1])
+                    debug_print("[RPA debug] bkpe.shape={}, {}", bkpe.shape[0], bkpe.shape[1])
 
-                if debug_mode:
-                    return
+                    if debug_mode:
+                        return
 
-                flash_attention(
-                    bq_nope_vec,
-                    bq_pe_vec,
-                    bkvc,
-                    bkpe,
-                    bq_idx=bq_idx,
-                    bkv_idx=bkv_idx,
-                )
+                    flash_attention(
+                        bq_nope_vec,
+                        bq_pe_vec,
+                        bkvc,
+                        bkpe,
+                        bq_idx=bq_idx,
+                        bkv_idx=bkv_idx,
+                        compute_key_start=compute_key_start,
+                        initialize=initialize,
+                    )
+
+                # The first query block must still update every new KV block,
+                # so all transfers, packing and cache updates stay above here.
+                block_start = bkv_idx * bkv_sz
+                has_visible_kv = True
+                if can_skip_causal_blocks:
+                    q_len = (
+                        cu_q_lens_ref[batch_start_seq_idx + 1] - cu_q_lens_ref[batch_start_seq_idx]
+                    )
+                    visible_end = (
+                        kv_lens_ref[batch_start_seq_idx]
+                        - q_len
+                        + jnp.minimum((bq_idx + 1) * actual_bq_sz, q_len)
+                    )
+                    has_visible_kv = block_start < visible_end
+
+                @pl.when(has_visible_kv)
+                def compute_visible_attention():
+                    if use_attention_subblocks:
+
+                        def compute_with_subblock(sub_idx, _):
+                            local_offset = sub_idx * 256
+                            compute_key_start = block_start + local_offset
+
+                            @pl.when(compute_key_start < visible_end)
+                            def compute_visible_subblock():
+                                compute_attention_block(
+                                    local_offset=local_offset,
+                                    slice_len=256,
+                                    compute_key_start=compute_key_start,
+                                    # Carry softmax state across both loops.
+                                    initialize=jnp.logical_and(bkv_idx == 0, sub_idx == 0),
+                                )
+
+                        lax.fori_loop(0, 4, compute_with_subblock, None, unroll=False)
+                    else:
+                        compute_attention_block()
 
             lax.fori_loop(0, num_bkv, compute_with_bkv, None, unroll=False)
 
