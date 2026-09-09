@@ -39,7 +39,7 @@ from sgl_jax.srt.model_executor.aot_dispatch import (
     aot_dispatch_requested,
 )
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
-from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
     _build_non_hybrid_memory_pools,
@@ -48,6 +48,7 @@ from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.models.registry import ModelRegistry
 from sgl_jax.srt.multimodal.in_model.embedding_pool import EmbeddingPool
 from sgl_jax.srt.multimodal.in_model.host_orchestration import embed_multimodal_inputs
+from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
@@ -136,6 +137,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             self.attention_tp_size
         )
         self.ep_size = server_args.ep_size
+        self.moe_dp_size = server_args.moe_dp_size
         self.server_args = server_args
         self.embedding_pool: EmbeddingPool | None = None
         self.is_generation = model_config.is_generation
@@ -587,6 +589,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.model_config.configure_for_tensor_parallel(self.attention_tp_size)
         self.model_config.log_kv_heads_info(self.attention_tp_size)
         self.model_config.hf_config.ep_size = self.ep_size
+        self.model_config.hf_config.moe_dp_size = self.moe_dp_size
         self.model_config.hf_config.ep_num_redundant_experts = (
             self.server_args.ep_num_redundant_experts
         )
@@ -609,11 +612,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.model_config.hf_config.enable_sequence_parallel = (
             self.server_args.enable_sequence_parallel
         )
-        self.model_config.hf_config.vision_encoder_parallel = getattr(
-            self.server_args, "vision_encoder_parallel", "dp"
+        self.model_config.hf_config.vision_encoder_parallel = (
+            self.server_args.vision_encoder_parallel
         )
-        self.model_config.hf_config.precompile_vision_patch_paddings = getattr(
-            self.server_args, "precompile_vision_patch_paddings", None
+
+        self.model_config.hf_config.precompile_vision_patch_paddings = (
+            self.server_args.precompile_vision_patch_paddings
         )
 
         if self.server_args.ep_dispatch_algorithm:
@@ -951,8 +955,11 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.forward_pass_id += 1
         precision_tracer.start_batch_trace(forward_batch.bid)
         precision_tracer.set_current_forward_pass_id(self.forward_pass_id)
-        if forward_batch.multimodal_batch is not None:
-            input_embedding, deepstack = embed_multimodal_inputs(
+        if isinstance(self.model, InModelMultimodalContract) and forward_batch.forward_mode in (
+            ForwardMode.EXTEND,
+            ForwardMode.MIXED,
+        ):
+            input_embedding, deepstack, apply_for_deepstack = embed_multimodal_inputs(
                 multimodal_batch=forward_batch.multimodal_batch,
                 input_ids=forward_batch.input_ids,
                 multimodal_model=self.model,
@@ -960,7 +967,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             )
             forward_batch.input_embedding = input_embedding
             forward_batch.deepstack_visual_embedding = deepstack
-            forward_batch.apply_for_deepstack = deepstack is not None
+            forward_batch.apply_for_deepstack = apply_for_deepstack
         with jax.profiler.TraceAnnotation("_forward_raw"):
             ret = self._forward_raw(forward_batch, logits_metadata)
         return ret

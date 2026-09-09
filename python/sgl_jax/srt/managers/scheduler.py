@@ -39,6 +39,7 @@ from sgl_jax.srt.managers.communication import CommunicationBackend
 from sgl_jax.srt.managers.dp_rank_assignment import assign_dp_ranks
 from sgl_jax.srt.managers.dp_schedule_policy import (
     pick_cache_aware_dp,
+    pick_force_cache_aware_dp,
     pick_shape_aware_dp,
     req_prefix_match_key,
 )
@@ -70,7 +71,10 @@ from sgl_jax.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
-from sgl_jax.srt.managers.scheduler_metrics_mixin import SchedulerMetricsMixin
+from sgl_jax.srt.managers.scheduler_metrics_mixin import (
+    SchedulerMetricsMixin,
+    compute_avg_spec_accept_length,
+)
 from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
@@ -84,6 +88,7 @@ from sgl_jax.srt.mem_cache.common import release_kv_cache
 from sgl_jax.srt.mem_cache.kv_cache_builder import build_kv_cache
 from sgl_jax.srt.mem_cache.radix_cache import RadixKey
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
+from sgl_jax.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     recurrent_admission_blocked,
@@ -740,6 +745,18 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             mesh=self.mesh,
         )
+        if isinstance(self.tree_cache, UnifiedRadixCache):
+            components = [component.name for component in self.tree_cache.tree_components]
+            logger.info(
+                "KV cache initialized: implementation=%s components=%s "
+                "sliding_window=%s page_size=%s hybrid=%s recurrent=%s",
+                type(self.tree_cache).__name__,
+                components,
+                self.sliding_window_size,
+                self.page_size,
+                self.is_hybrid,
+                isinstance(self.req_to_token_pool, HybridReqToTokenPool),
+            )
         # write_back eviction runs inside get_next_batch_to_run, before the event
         # loop's launch_done.wait. Hand the cache a barrier so the D2H gather
         # blocks until kv_buffer is rebound (donation-safe).
@@ -955,12 +972,12 @@ class Scheduler(
         extra_input_counts: list[int],
         extra_output_counts: list[int],
     ) -> int | None:
-        """Route ``req`` by cache affinity with shape-aware miss fallback.
+        """Route ``req`` by the configured cache policy with shape-aware fallback.
 
-        Probes each eligible rank's cached prefix length, then defers to
-        ``pick_cache_aware_dp``: balance on large load skew, else least-loaded
-        among the ranks holding a substantial cached prefix, else shape-aware
-        selection. Returns None if all DP ranks are full.
+        ``cache_aware`` keeps its soft affinity/load tradeoff;
+        ``force_cache_aware`` always prefers the globally longest cache hit and
+        defers if all of its holders are temporarily full. Both use shape-aware
+        selection on a full miss and return None if all DP ranks are full.
         """
         if self.dp_size == 1:
             return 0
@@ -975,7 +992,10 @@ class Scheduler(
         matches: dict[int, int] = {}
         prompt_len = len(token_ids) if token_ids else 0
         if token_ids:
-            for dp_rank in eligible:
+            probe_ranks = (
+                range(self.dp_size) if self.dp_schedule_policy == "force_cache_aware" else eligible
+            )
+            for dp_rank in probe_ranks:
                 matches[dp_rank] = self._cached_prefix_len(token_ids, extra_key, dp_rank)
 
         running_input, running_output = self._get_dp_io_snapshot()
@@ -983,7 +1003,12 @@ class Scheduler(
         output_counts = [running_output[i] + extra_output_counts[i] for i in range(self.dp_size)]
         item_input, item_output = self._estimate_req_input_output_tokens(req)
 
-        return pick_cache_aware_dp(
+        picker = (
+            pick_force_cache_aware_dp
+            if self.dp_schedule_policy == "force_cache_aware"
+            else pick_cache_aware_dp
+        )
+        return picker(
             eligible,
             counts,
             token_counts,
@@ -1509,6 +1534,9 @@ class Scheduler(
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = dict(global_server_args_dict)
         ret["last_gen_throughput"] = self.last_gen_throughput
+        ret["avg_spec_accept_length"] = compute_avg_spec_accept_length(
+            self.cum_spec_accept_length, self.cum_spec_accept_count
+        )
         ret["memory_usage"] = {
             "kvcache": round(self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2),
             "token_capacity": int(self.max_total_num_tokens),
@@ -1769,6 +1797,47 @@ class Scheduler(
             # Checking per-rank avoids one rank's over-count masking another's leak.
             full_size_per_rank = self.token_to_kv_pool_allocator.full_attn_allocator.size_per_rank
             swa_size_per_rank = self.token_to_kv_pool_allocator.swa_attn_allocator.size_per_rank
+            is_unified = isinstance(self.tree_cache, UnifiedRadixCache)
+            if is_unified:
+                # A paged allocation reserves a whole page even when the tree
+                # owns only part of it, so check the reserved-page bounds.
+                def check_pool(dp, pool, allocator, available, evictable, protected):
+                    page_size = allocator.page_size
+                    if page_size <= 0:
+                        return f"[dp={dp}][{pool}] invalid {page_size=}"
+
+                    capacity = (
+                        allocator.pages_per_rank * page_size
+                        if hasattr(allocator, "pages_per_rank")
+                        else allocator.size_per_rank
+                    )
+                    if capacity < 0 or capacity % page_size != 0:
+                        return f"[dp={dp}][{pool}] {capacity=}, {page_size=} must be page-aligned"
+                    if available < 0 or available > capacity:
+                        return f"[dp={dp}][{pool}] {available=} outside [0, {capacity=}]"
+                    if available % page_size != 0:
+                        return f"[dp={dp}][{pool}] {available=}, {page_size=} must be page-aligned"
+
+                    reserved_capacity = capacity - available
+                    reserved_pages = reserved_capacity // page_size
+                    owned = evictable + protected
+                    if owned > reserved_capacity:
+                        return (
+                            f"[dp={dp}][{pool}] {owned=}, {reserved_capacity=}, "
+                            f"{available=}, {capacity=}, {page_size=}, "
+                            f"{evictable=}, {protected=}"
+                        )
+                    if owned < reserved_pages:
+                        return (
+                            f"[dp={dp}][{pool}] {owned=}, {reserved_pages=}, "
+                            f"{reserved_capacity=}, {available=}, {capacity=}, "
+                            f"{page_size=}, {evictable=}, {protected=}"
+                        )
+                    return None
+
+                full_allocator = self.token_to_kv_pool_allocator.full_attn_allocator
+                swa_allocator = self.token_to_kv_pool_allocator.swa_attn_allocator
+
             leak_msgs = []
             for dp in range(self.dp_size):
                 full_avail = self.token_to_kv_pool_allocator.full_available_size(dp)
@@ -1777,16 +1846,38 @@ class Scheduler(
                 swa_avail = self.token_to_kv_pool_allocator.swa_available_size(dp)
                 swa_evict = self.tree_cache.swa_evictable_size(dp_rank=dp)
                 swa_protected = self.tree_cache.swa_protected_size(dp_rank=dp)
-                if full_avail + full_evict + full_protected != full_size_per_rank:
-                    leak_msgs.append(
-                        f"[dp={dp}][full] expected={full_size_per_rank}, "
-                        f"{full_avail=}, {full_evict=}, {full_protected=}"
+                if is_unified:
+                    full_error = check_pool(
+                        dp,
+                        "full",
+                        full_allocator,
+                        full_avail,
+                        full_evict,
+                        full_protected,
                     )
-                if swa_avail + swa_evict + swa_protected != swa_size_per_rank:
-                    leak_msgs.append(
-                        f"[dp={dp}][swa] expected={swa_size_per_rank}, "
-                        f"{swa_avail=}, {swa_evict=}, {swa_protected=}"
+                    if full_error is not None:
+                        leak_msgs.append(full_error)
+                    swa_error = check_pool(
+                        dp,
+                        "swa",
+                        swa_allocator,
+                        swa_avail,
+                        swa_evict,
+                        swa_protected,
                     )
+                    if swa_error is not None:
+                        leak_msgs.append(swa_error)
+                else:
+                    if full_avail + full_evict + full_protected != full_size_per_rank:
+                        leak_msgs.append(
+                            f"[dp={dp}][full] expected={full_size_per_rank}, "
+                            f"{full_avail=}, {full_evict=}, {full_protected=}"
+                        )
+                    if swa_avail + swa_evict + swa_protected != swa_size_per_rank:
+                        leak_msgs.append(
+                            f"[dp={dp}][swa] expected={swa_size_per_rank}, "
+                            f"{swa_avail=}, {swa_evict=}, {swa_protected=}"
+                        )
             if leak_msgs:
                 raise ValueError(
                     "token_to_kv_pool_allocator memory leak detected!\n" + "\n".join(leak_msgs)

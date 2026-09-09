@@ -19,8 +19,10 @@ from sgl_jax.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
+    InsertResult,
     MatchPrefixParams,
 )
+from sgl_jax.srt.mem_cache.cache_init_params import CacheInitParams
 from sgl_jax.srt.mem_cache.common import release_kv_cache
 from sgl_jax.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
@@ -29,8 +31,19 @@ from sgl_jax.srt.mem_cache.memory_pool import (
 )
 from sgl_jax.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
-from sgl_jax.srt.mem_cache.unified_cache_components import ComponentType
-from sgl_jax.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sgl_jax.srt.mem_cache.unified_cache_components import ComponentType, FullComponent
+from sgl_jax.srt.mem_cache.unified_cache_components import (
+    InsertResult as ComponentInsertResult,
+)
+from sgl_jax.srt.mem_cache.unified_cache_components import (
+    LRURefreshPhase,
+    TreeComponent,
+    get_and_increase_time_counter,
+)
+from sgl_jax.srt.mem_cache.unified_radix_cache import (
+    COMPONENT_REGISTRY,
+    UnifiedRadixCache,
+)
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.test.test_utils import CustomTestCase
 
@@ -2113,6 +2126,273 @@ class TestUnifiedRadixCacheRecurrentExtraBuffer(CustomTestCase):
             req, is_finished=False, insert_result=None, insert_params=params
         )
         self.assertEqual(req.recurrent_ping_pong_track_buffer, buffer_before)
+
+
+class _RecordingAllocator:
+    """Minimal ownership spy for component-seam tests."""
+
+    def __init__(self):
+        self.free_calls = []
+
+    def free(self, indices, dp_rank=0):
+        values = np.asarray(indices, dtype=np.int32).copy()
+        if len(values):
+            self.free_calls.append((values, dp_rank))
+
+    def free_full(self, indices, dp_rank=0):
+        self.free(indices, dp_rank=dp_rank)
+
+
+class _RecordingReqToTokenPool:
+    def __init__(self):
+        self.rows = {0: np.zeros(64, dtype=np.int32)}
+
+    def read(self, req_pool_idx, length):
+        return self.rows[req_pool_idx][:length].copy()
+
+    def write(self, location, values):
+        req_pool_idx, target = location
+        self.rows[req_pool_idx][target] = np.asarray(values, dtype=np.int32)
+
+
+class _RecordingAuxComponent(TreeComponent):
+    component_type = ComponentType.RECURRENT
+
+    def __init__(self, cache, params=None):
+        super().__init__(cache, params)
+        self.received_params = params
+        self.hook_log = []
+        self.overlap_boundary = None
+
+    def create_match_validator(self, match_device_only=False):
+        return lambda node: True
+
+    def refresh_lru(self, phase, node, root_node):
+        self.hook_log.append(("refresh", phase, node.id, root_node.id))
+        node.component_data[self.component_type].metadata[
+            "last_access_time"
+        ] = get_and_increase_time_counter()
+
+    def update_component_on_insert_overlap(
+        self, node, prefix_len, total_prefix_len, value_slice, params
+    ):
+        self.hook_log.append(("overlap", node.id))
+        if self.overlap_boundary is None:
+            return prefix_len
+        return self.overlap_boundary
+
+    def commit_insert_component_data(self, node, is_new_leaf, params, result):
+        component_data = node.component_data[self.component_type]
+        if component_data.value is None:
+            component_data.value = np.array([node.id], dtype=np.int32)
+
+    def redistribute_on_node_split(self, new_parent, child):
+        self.hook_log.append(("split", new_parent.id, child.id))
+        parent_data = new_parent.component_data[self.component_type]
+        child_data = child.component_data[self.component_type]
+        if child_data.value is not None:
+            parent_data.value = child_data.value.copy()
+
+    def evict_component(self, node, target=None):
+        raise AssertionError("component-seam tests do not exercise component eviction")
+
+    def drive_eviction(self, params, tracker):
+        raise AssertionError("component-seam tests do not exercise component eviction")
+
+    def acquire_component_lock(self, node, result, lock_host=False):
+        return result
+
+    def release_component_lock(self, node, params, lock_host=False):
+        return None
+
+
+class _RecordingFullComponent(FullComponent):
+    def __init__(self, cache, params=None):
+        super().__init__(cache, params)
+        self.received_params = params
+
+
+class TestUnifiedRadixCacheComponentSeams(unittest.TestCase):
+    def setUp(self):
+        self.original_registry = dict(COMPONENT_REGISTRY)
+        COMPONENT_REGISTRY[ComponentType.RECURRENT] = _RecordingAuxComponent
+        self.addCleanup(self._restore_registry)
+
+    def _restore_registry(self):
+        COMPONENT_REGISTRY.clear()
+        COMPONENT_REGISTRY.update(self.original_registry)
+
+    def _create_cache(self, *, tree_components=(ComponentType.FULL, ComponentType.RECURRENT)):
+        req_pool = _RecordingReqToTokenPool()
+        allocator = _RecordingAllocator()
+        cache = UnifiedRadixCache(
+            req_to_token_pool=req_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            tree_components=tree_components,
+        )
+        return req_pool, allocator, cache
+
+    def test_insert_result_is_base_contract_with_recurrent_extension(self):
+        self.assertIs(ComponentInsertResult, InsertResult)
+        result = InsertResult(
+            prefix_len=4,
+            recurrent_exist=True,
+            recurrent_committed=True,
+        )
+        self.assertEqual(result.prefix_len, 4)
+        self.assertTrue(result.recurrent_exist)
+        self.assertTrue(result.recurrent_committed)
+
+    def test_cache_init_params_are_scoped_to_swa_component(self):
+        COMPONENT_REGISTRY[ComponentType.FULL] = _RecordingFullComponent
+        req_pool = _RecordingReqToTokenPool()
+        allocator = _RecordingAllocator()
+        params = CacheInitParams(
+            req_to_token_pool=req_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            sliding_window_size=4,
+        )
+
+        cache = UnifiedRadixCache(
+            req_to_token_pool=req_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            tree_components=(ComponentType.FULL, ComponentType.SWA),
+            component_init_params=params,
+        )
+
+        self.assertIsNone(cache.components[ComponentType.FULL].received_params)
+        self.assertEqual(cache.components[ComponentType.SWA].sliding_window_size, 4)
+
+    def test_multi_node_overlap_preserves_tree_owned_prefix(self):
+        _, allocator, cache = self._create_cache()
+        key = RadixKey([1, 2, 3, 4], None, 1)
+        cache.insert(InsertParams(key=key, value=np.arange(10, 14, dtype=np.int32)))
+        cache.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 9, 10], None, 1),
+                value=np.arange(20, 24, dtype=np.int32),
+            )
+        )
+        allocator.free_calls.clear()
+
+        result = cache.insert(
+            InsertParams(
+                key=key,
+                value=np.arange(100, 104, dtype=np.int32),
+                prev_prefix_len=3,
+            )
+        )
+
+        self.assertEqual(result.prefix_len, 4)
+        self.assertEqual(len(allocator.free_calls), 1)
+        np.testing.assert_array_equal(allocator.free_calls[0][0], [103])
+        self.assertEqual(allocator.free_calls[0][1], 1)
+
+    def test_overlap_boundary_consumes_slots_without_request_cache_double_free(self):
+        req_pool, allocator, cache = self._create_cache()
+        key = RadixKey([1, 2, 3, 4], None, 1)
+        cache.insert(InsertParams(key=key, value=np.arange(10, 14, dtype=np.int32)))
+        allocator.free_calls.clear()
+        component = cache.components[ComponentType.RECURRENT]
+        component.overlap_boundary = 2
+        component.hook_log.clear()
+        req_pool.write((0, slice(0, 4)), np.arange(100, 104, dtype=np.int32))
+        req = MockRequest(
+            req_pool_idx=0,
+            origin_input_ids=[1, 2, 3, 4],
+            output_ids=[],
+            fill_ids=[1, 2, 3, 4],
+            prefix_indices=np.empty((0,), dtype=np.int32),
+            last_node=cache.root_node,
+            dp_rank=1,
+        )
+
+        cache.cache_finished_req(req)
+
+        self.assertEqual([entry[0] for entry in component.hook_log].count("overlap"), 1)
+        self.assertEqual(len(allocator.free_calls), 1)
+        np.testing.assert_array_equal(allocator.free_calls[0][0], [100, 101])
+        self.assertEqual(allocator.free_calls[0][1], 1)
+
+    def test_split_invokes_component_hook_and_keeps_metadata_independent(self):
+        _, _, cache = self._create_cache()
+        cache.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 3, 4]),
+                value=np.arange(10, 14, dtype=np.int32),
+            )
+        )
+        child = next(iter(cache.root_node.children.values()))
+        child_data = child.component_data[ComponentType.RECURRENT]
+        child_data.metadata["child_only"] = 1
+        component = cache.components[ComponentType.RECURRENT]
+        component.hook_log.clear()
+
+        cache.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 9, 10]),
+                value=np.arange(20, 24, dtype=np.int32),
+            )
+        )
+
+        new_parent = next(iter(cache.root_node.children.values()))
+        parent_data = new_parent.component_data[ComponentType.RECURRENT]
+        self.assertEqual(
+            [entry[0] for entry in component.hook_log].count("split"),
+            1,
+        )
+        self.assertIsNot(parent_data.metadata, child_data.metadata)
+        self.assertNotIn("child_only", parent_data.metadata)
+        parent_data.metadata["parent_only"] = 2
+        self.assertNotIn("parent_only", child_data.metadata)
+        candidates = cache.aux_evictable_device_nodes[ComponentType.RECURRENT]
+        self.assertIn(new_parent, candidates)
+        self.assertIn(child, candidates)
+
+    def test_component_lru_refresh_uses_upstream_contract_and_is_range_scoped(self):
+        _, _, cache = self._create_cache()
+        cache.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 3, 4]),
+                value=np.arange(10, 14, dtype=np.int32),
+            )
+        )
+        cache.insert(
+            InsertParams(
+                key=RadixKey([9, 10, 11, 12]),
+                value=np.arange(20, 24, dtype=np.int32),
+            )
+        )
+        node_a = cache.root_node.children[cache.get_child_key_fn(RadixKey([1]))]
+        node_b = cache.root_node.children[cache.get_child_key_fn(RadixKey([9]))]
+        aux = cache.components[ComponentType.RECURRENT]
+        self.assertEqual(
+            cache.aux_evictable_device_nodes[ComponentType.RECURRENT],
+            {node_a, node_b},
+        )
+        data_a = node_a.component_data[ComponentType.RECURRENT]
+        data_b = node_b.component_data[ComponentType.RECURRENT]
+        timestamp_a = getattr(data_a, "metadata", {}).get("last_access_time")
+        timestamp_b = getattr(data_b, "metadata", {}).get("last_access_time")
+        aux.hook_log.clear()
+
+        cache.match_prefix(MatchPrefixParams(key=RadixKey([1, 2, 3, 4])))
+
+        phases = [entry[1] for entry in aux.hook_log if entry[0] == "refresh"]
+        self.assertEqual(phases, [LRURefreshPhase.WALKDOWN, LRURefreshPhase.MATCH_END])
+        root_ids = [entry[3] for entry in aux.hook_log if entry[0] == "refresh"]
+        self.assertEqual(root_ids, [cache.root_node.id, cache.root_node.id])
+        self.assertGreater(
+            data_a.metadata["last_access_time"],
+            timestamp_a,
+        )
+        self.assertEqual(
+            data_b.metadata["last_access_time"],
+            timestamp_b,
+        )
 
 
 if __name__ == "__main__":

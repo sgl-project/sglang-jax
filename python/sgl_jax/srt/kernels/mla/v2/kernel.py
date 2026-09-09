@@ -1412,6 +1412,7 @@ def mla_ragged_paged_attention(
         # placeholder. The "decode" tuned entry also carries
         # `decode_batch_size`, which overrides the caller's value if hit.
         from sgl_jax.srt.kernels.mla.v2.tuned_block_sizes import (
+            get_fallback_block_sizes_mla,
             get_tuned_block_sizes_mla,
         )
 
@@ -1442,18 +1443,23 @@ def mla_ragged_paged_attention(
             page_size_lookup,
             max_num_tokens_lookup,
         )
-        # Fallback hardcoded defaults match the historical
-        # mla_backend.py:97-106 defaults — same numbers that prod was using
-        # before the tuned table existed.
+        # Fallback defaults are derived from the dtype tiling and per-shard
+        # head count so a table miss always yields a Mosaic-legal block
+        # (#1546); for >=16-head bf16 shards they reduce to the historical
+        # mla_backend.py:97-106 numbers.
         if tuned_d is not None:
             bkv_p_d, bq_d, dbs_lookup = tuned_d
             decode_batch_size = dbs_lookup
         else:
-            bkv_p_d, bq_d = 3, 1
+            bkv_p_d, bq_d = get_fallback_block_sizes_mla(
+                "decode", ql_nope.dtype, actual_num_q_heads, page_size_lookup
+            )
         if tuned_m is not None:
             bkv_p_m, bq_m = tuned_m
         else:
-            bkv_p_m, bq_m = 1, 16
+            bkv_p_m, bq_m = get_fallback_block_sizes_mla(
+                "mixed", ql_nope.dtype, actual_num_q_heads, page_size_lookup
+            )
 
         num_kv_pages_per_blocks = (bkv_p_d, 1, bkv_p_m)  # slot[1] is dead
         num_queries_per_blocks = (bq_d, 1, bq_m)

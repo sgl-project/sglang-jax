@@ -62,11 +62,15 @@ def assign_dp_ranks(
 
     pending_counts = [0] * dp_size
     pending_token_counts = [0] * dp_size
-    # shape_aware balances prefill (input) and decode (output) separately. cache_aware
-    # needs the same split for its no-holder/cache-miss shape-aware fallback. Include
-    # requests assigned earlier in this intake tick, otherwise bursts route against a
-    # stale snapshot and mis-balance.
-    tracks_pending_io = dp_schedule_policy in ("shape_aware", "cache_aware")
+    # shape_aware balances prefill (input) and decode (output) separately. Both cache
+    # policies need the same split for their cache-miss shape-aware fallback. Include
+    # requests assigned earlier in this intake tick, otherwise bursts route against
+    # a stale snapshot and mis-balance.
+    tracks_pending_io = dp_schedule_policy in (
+        "shape_aware",
+        "cache_aware",
+        "force_cache_aware",
+    )
     pending_input_counts = [0] * dp_size
     pending_output_counts = [0] * dp_size
     ready_reqs: list[Any] = []
@@ -104,7 +108,7 @@ def assign_dp_ranks(
             ready_reqs.append(req)
             continue
 
-        if dp_schedule_policy == "cache_aware":
+        if dp_schedule_policy in ("cache_aware", "force_cache_aware"):
             dp_rank = select_cache_aware_dp(
                 req,
                 pending_counts,
