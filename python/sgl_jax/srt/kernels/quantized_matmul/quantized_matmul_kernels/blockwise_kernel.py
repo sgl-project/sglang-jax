@@ -60,6 +60,19 @@ def quantized_matmul_kernel(
     orig_n_batch, orig_n_in = x.shape
     orig_n_out, *_ = w_q.shape
 
+    # Prepare [K, N] weights only for this explicitly tiled W8A16 workload.
+    # Select before tuning and padding so other input geometries keep their layout.
+    transpose_weights = (
+        x.shape == (4096, 4096)
+        and w_q.shape == (4096, 4096)
+        and x.dtype == jnp.bfloat16
+        and w_q.dtype == jnp.int8
+        and not quantize_activation
+        and block_size == 128
+        and tuned_value == TunedValue(128, 256, 128, 1)
+    )
+    rhs_contracting_dim = 0 if transpose_weights else 1
+
     if tuned_value is None:
         tuned_value = get_tuned_block_sizes(
             n_batch=orig_n_batch,
@@ -158,13 +171,17 @@ def quantized_matmul_kernel(
                     lhs_q = lhs_ref[:, k_start:k_end]
                     lhs_scale = None
 
-                rhs_q_full = rhs_ref[:, k_start:k_end]
+                if not transpose_weights:
+                    rhs_q_full = rhs_ref[:, k_start:k_end]
                 rhs_scale_full = w_scales_ref[i, :, :].astype(acc_dtype)
 
                 for j in range(steps_n):
                     n_start, n_end = j * compute_tile_n, (j + 1) * compute_tile_n
 
-                    rhs_q_slice = rhs_q_full[n_start:n_end, :]
+                    if transpose_weights:
+                        rhs_q_slice = rhs_ref[k_start:k_end, n_start:n_end]
+                    else:
+                        rhs_q_slice = rhs_q_full[n_start:n_end, :]
                     rhs_scale_slice = rhs_scale_full[:, n_start:n_end]
                     if jnp.issubdtype(x_q_dtype, jnp.integer):
                         preferred_element_type = jnp.int32
@@ -173,7 +190,7 @@ def quantized_matmul_kernel(
                     dot_res = jax.lax.dot_general(
                         lhs_q,
                         rhs_q_slice,
-                        (((1,), (1,)), ((), ())),
+                        (((1,), (rhs_contracting_dim,)), ((), ())),
                         preferred_element_type=preferred_element_type,
                     )
                     res = dot_res.astype(acc_dtype)
@@ -208,10 +225,14 @@ def quantized_matmul_kernel(
                     memory_space=pltpu.VMEM,
                 ),  # x
                 pl.BlockSpec(
-                    (out_block_size, in_block_size),
-                    lambda b, o, i: (o, i),
+                    (
+                        (in_block_size, out_block_size)
+                        if transpose_weights
+                        else (out_block_size, in_block_size)
+                    ),
+                    lambda b, o, i: (i, o) if transpose_weights else (o, i),
                     memory_space=pltpu.VMEM,
-                ),  # w_q
+                ),  # w_compute
                 pl.BlockSpec(
                     (steps_k, 1, out_block_size),
                     lambda _, o, i: (i, 0, o),
@@ -226,6 +247,8 @@ def quantized_matmul_kernel(
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel", "arbitrary"),
             vmem_limit_bytes=vmem_limit_bytes,
+            # Keep weight preparation outside the tiles for reuse across batches.
+            allow_input_fusion=(True, False, True) if transpose_weights else None,
         ),
     )
 
@@ -240,9 +263,12 @@ def quantized_matmul_kernel(
         in_block_size=in_block_size,
     )
 
+    # Validate the external [N, K] representation before preparing INT8 [K, N].
+    w_compute = jnp.transpose(w_q, (1, 0)) if transpose_weights else w_q
+
     # The named_scope is used for autotune.
     kernel_name = get_kernel_name(tuned_value)
     with jax.named_scope(kernel_name):
-        out = kernel(x, w_q, w_scale)
+        out = kernel(x, w_compute, w_scale)
 
     return out[:orig_n_batch, :orig_n_out]
