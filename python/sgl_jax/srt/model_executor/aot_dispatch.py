@@ -77,13 +77,21 @@ class AotDispatcher:
     containers between calls.
     """
 
-    def __init__(self, jit_fn, stable_call_args: tuple, stable_flat_args: tuple, name: str):
+    def __init__(
+        self,
+        jit_fn,
+        stable_call_args: tuple,
+        stable_flat_args: tuple,
+        name: str,
+        compiler_options_fn=None,
+    ):
         self._jit_fn = jit_fn
         self._stable_call_args = stable_call_args
         self._stable_flat_args = stable_flat_args
         self._stable_ids = tuple(id(a) for a in stable_flat_args)
         self._cache = {}
         self._name = name
+        self._compiler_options_fn = compiler_options_fn
         self._enabled = None  # decided on first call from flat arg count
 
     def invalidate(self) -> None:
@@ -160,7 +168,17 @@ class AotDispatcher:
                 )
                 return self._jit_fn(*self._stable_call_args, *dyn_args)
 
-        compiled = self._jit_fn.lower(*self._stable_call_args, *dyn_args).compile()
+        compile_opts = self._compiler_options_fn(dyn_args) if self._compiler_options_fn else None
+        lowered = self._jit_fn.lower(*self._stable_call_args, *dyn_args)
+        if compile_opts:
+            logger.info(
+                "[aot-dispatch:%s] compiling with compiler_options=%s",
+                self._name,
+                compile_opts,
+            )
+            compiled = lowered.compile(compiler_options=compile_opts)
+        else:
+            compiled = lowered.compile()
         unsafe = compiled._executable.unsafe_call
         if (
             unsafe.ordered_effects
