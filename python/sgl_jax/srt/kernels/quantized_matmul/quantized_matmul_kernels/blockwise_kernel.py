@@ -57,6 +57,70 @@ def quantized_matmul_kernel(
         x_q_dtype = x.dtype
     quantize_activation = x_q_dtype != x.dtype
 
+    # Stage the full reduction dimension for this explicitly tuned geometry.
+    # Check before resolving default tuning so other configurations keep their
+    # existing scheduling.
+    if (
+        x.shape == (512, 4096)
+        and w_q.shape == (4096, 4096)
+        and w_scale.shape == (32, 1, 4096)
+        and x.dtype == jnp.bfloat16
+        and w_q.dtype == jnp.int8
+        and not quantize_activation
+        and block_size == 128
+        and tuned_value == TunedValue(128, 256, 128, 1)
+    ):
+        if w_scale.dtype != jnp.float32:
+            w_scale = w_scale.astype(jnp.float32)
+
+        def full_k_kernel(lhs_ref, rhs_ref, w_scales_ref, out_ref):
+            def contribution(i):
+                k_slice = pl.ds(i * 128, 128)
+                dot_res = jax.lax.dot_general(
+                    lhs_ref[:, k_slice],
+                    rhs_ref[:, k_slice],
+                    (((1,), (1,)), ((), ())),
+                    preferred_element_type=jnp.float32,
+                )
+                res = dot_res.astype(jnp.bfloat16)
+                scale = w_scales_ref[i, :, :].astype(jnp.bfloat16)
+                return (res * scale).astype(jnp.bfloat16)
+
+            # Peel the first contribution, then preserve the original order:
+            # each BF16 contribution is added to the preceding BF16 accumulator.
+            acc = contribution(0)
+
+            def body(i, acc):
+                return (contribution(i) + acc).astype(jnp.bfloat16)
+
+            acc = jax.lax.fori_loop(1, 32, body, acc, unroll=False)
+            out_ref[...] = acc
+
+        # Logical tiles use 1 MiB each for activations and weights, 32 KiB for
+        # all 32 FP32 scale blocks, and 64 KiB for output. The 8 MiB budget also
+        # allows buffering, layout padding, and temporaries; the general helper
+        # only accounts for one scale block.
+        kernel = pl.pallas_call(
+            full_k_kernel,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=0,
+                in_specs=[
+                    pl.BlockSpec((128, 4096), lambda b, o: (b, 0), memory_space=pltpu.VMEM),
+                    pl.BlockSpec((256, 4096), lambda b, o: (o, 0), memory_space=pltpu.VMEM),
+                    pl.BlockSpec((32, 1, 256), lambda b, o: (0, 0, o), memory_space=pltpu.VMEM),
+                ],
+                out_specs=pl.BlockSpec((128, 256), lambda b, o: (b, o)),
+                grid=(4, 16),
+            ),
+            out_shape=jax.ShapeDtypeStruct((512, 4096), x.dtype),
+            compiler_params=pltpu.CompilerParams(
+                dimension_semantics=("parallel", "parallel"),
+                vmem_limit_bytes=min(8 * 1024 * 1024, get_device_vmem_limit()),
+            ),
+        )
+        with jax.named_scope(get_kernel_name(tuned_value)):
+            return kernel(x, w_q, w_scale)
+
     orig_n_batch, orig_n_in = x.shape
     orig_n_out, *_ = w_q.shape
 
