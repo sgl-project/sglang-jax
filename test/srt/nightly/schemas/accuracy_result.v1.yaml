@@ -100,11 +100,18 @@ fields:
     description: "Lower bound the case is gated against. Null = warn-only (no gating)."
     example: 0.85
 
+  score_upper_threshold:
+    type: [number, "null"]
+    required: false
+    description: "Optional inclusive upper bound, used with score_threshold."
+    example: 0.80
+
   passed:
     type: [boolean, "null"]
     required: true
     description: |
-      Gating outcome. `true` iff `score >= score_threshold`. Null when either
+      Gating outcome. `true` iff `score >= score_threshold` and the optional
+      upper bound is not exceeded. Null when either
       `score` or `score_threshold` is null (gating not applicable).
     example: true
 

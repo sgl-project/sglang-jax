@@ -51,6 +51,11 @@ def run_eval(args):
 
     base_url = f"{args.base_url}/v1" if args.base_url else f"http://{args.host}:{args.port}/v1"
 
+    if args.eval_name == "mmbench_v11":
+        from eval.simple_eval_mmbench import run_mmbench
+
+        return run_mmbench(args)
+
     if args.eval_name == "mmlu":
         from eval.simple_eval_mmlu import MMLUEval
 

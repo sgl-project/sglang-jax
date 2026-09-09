@@ -80,6 +80,11 @@ def run_accuracy_case(
 
     score = result["score"]
     threshold = case.score_threshold
+    upper = (
+        f", upper_threshold={_fmt(case.score_upper_threshold)}"
+        if case.score_upper_threshold is not None
+        else ""
+    )
     if result["passed"] is True:
         status = "PASS"
     elif result["passed"] is False:
@@ -89,12 +94,13 @@ def run_accuracy_case(
 
     if is_in_ci():
         write_github_step_summary(
-            f"### {case.name}\n" f"score={_fmt(score)}  threshold={_fmt(threshold)}  **{status}**\n"
+            f"### {case.name}\n"
+            f"score={_fmt(score)}  threshold={_fmt(threshold)}{upper}  **{status}**\n"
         )
 
     print(
         f"[accuracy-runner] {case.name}: score={_fmt(score)}, "
-        f"threshold={_fmt(threshold)}, {status}",
+        f"threshold={_fmt(threshold)}{upper}, {status}",
         flush=True,
     )
 
@@ -128,8 +134,15 @@ def profile_server_spec(profile: LaunchProfile) -> dict:
         dist_init_addr=f"127.0.0.1:{profile.port + _DIST_INIT_PORT_OFFSET}",
         port=profile.port,
     )
+    if profile.revision:
+        from huggingface_hub import snapshot_download
+
+        # Use the same immutable snapshot for weights, tokenizer and benchmark processor.
+        model = snapshot_download(profile.model_path, revision=profile.revision)
+    else:
+        model = _local_or_hf(profile.model_path)
     return {
-        "model": _local_or_hf(profile.model_path),
+        "model": model,
         "base_url": f"http://127.0.0.1:{profile.port}",
         "other_args": build_other_server_args(profile, runtime),
     }

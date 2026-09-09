@@ -325,6 +325,32 @@ jobs:
               python3 scripts/ci/publish.py --data-type perf --source-dir ./test/nightly_test_output
 
 
+  weekly-test-vlm-4-tpu:
+    if: github.repository == 'sgl-project/sglang-jax'
+    runs-on: arc-runner-v6e-4-us-south1-ai1b
+    env:
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      RESULTS_DIR: ${{ github.workspace }}/test/nightly_test_output/vlm
+      VLM_TP_SIZE: "4"
+      VLM_FULL_REGRESSION: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-venv
+        with:
+          install-target: python[all,multimodal]
+      - name: Check VLM cache, chunk and encoder sharding equivalence
+        timeout-minutes: 60
+        run: python test/srt/test_vlm_models.py
+      - name: Run full MMBench V1.1 CircularEval
+        if: ${{ !cancelled() }}
+        timeout-minutes: 120
+        run: python test/srt/nightly/single_host/suite_runner.py --suite vlm-weekly-v6e-4
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: weekly-vlm-results
+          path: test/nightly_test_output/vlm
+
   nightly-test-finish:
     needs: [
       nightly-test-accuracy-text-models-1-tpu,
@@ -333,6 +359,7 @@ jobs:
       nightly-test-perf-text-models-4-tpu-part1,
       nightly-test-perf-text-models-4-tpu-part2,
       nightly-test-perf-text-models-4-tpu-part3,
+      weekly-test-vlm-4-tpu,
     ]
     if: always() && github.repository == 'sgl-project/sglang-jax'
     runs-on: ubuntu-latest
@@ -350,6 +377,7 @@ jobs:
 
           has_failure=false
           for job_result in \
+            "vlm-4-tpu=${{ needs.weekly-test-vlm-4-tpu.result }}" \
             "accuracy-1-tpu=${{ needs.nightly-test-accuracy-text-models-1-tpu.result }}" \
             "accuracy-4-tpu=${{ needs.nightly-test-accuracy-text-models-4-tpu.result }}" \
             "perf-text-1-tpu=${{ needs.nightly-test-perf-text-models-1-tpu.result }}" \

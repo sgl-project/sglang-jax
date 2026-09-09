@@ -65,6 +65,12 @@ def run_accuracy_case(case: AccuracyCase, profile: LaunchProfile) -> None:
                     f"against threshold={case.score_threshold}"
                 ),
             )
+        if case.score_upper_threshold is not None and score > case.score_upper_threshold:
+            raise SuiteError(
+                kind="threshold",
+                message=f"Accuracy case {case.name} score={score:.4f} above "
+                f"upper threshold={case.score_upper_threshold:.4f}",
+            )
         if score < case.score_threshold:
             raise SuiteError(
                 kind="threshold",
