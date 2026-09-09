@@ -1125,7 +1125,9 @@ def test_received_prompt_tail_page_is_reclaimed_at_page_boundaries():
         for seqlen in (1, 127, 128, 129, 2048, 2049):
             allocator = PagedTokenToKVPoolAllocator(4096, page_size, None)
             indices = allocator.alloc((seqlen + page_size - 1) // page_size * page_size)
-            req = SimpleNamespace(origin_input_ids=list(range(seqlen)), dp_rank=0, output_ids=[])
+            req = SimpleNamespace(
+                origin_input_ids=list(range(seqlen)), dp_rank=0, output_ids=[], pd_time_stats=None
+            )
             entry = DecodeBookkeeping(
                 req_id="tail",
                 req=req,
@@ -1134,6 +1136,7 @@ def test_received_prompt_tail_page_is_reclaimed_at_page_boundaries():
                 synced_state=KVPoll.SUCCESS,
             )
             scheduler = SimpleNamespace(
+                server_args=SimpleNamespace(enable_request_time_stats_logging=False),
                 token_to_kv_pool_allocator=allocator,
                 _drain_transfer_queue_synced=lambda: [entry],
                 _set_decode_bookkeeping=lambda r, ix: SchedulerDisaggregationDecodeMixin._set_decode_bookkeeping(

@@ -473,6 +473,9 @@ class Scheduler(
         self.per_dp_max_running_requests = self.max_running_requests // self.dp_size
 
         self.is_hybrid = self.tp_worker.is_hybrid
+        # ServerArgs validates launch flags; these facts are only known after
+        # model/runtime initialization. nnodes=1 does not prove one JAX process,
+        # and the multimodal launch flag does not identify every model type.
         if server_args.disaggregation_enable_overlap_schedule and (
             self.is_hybrid or self.model_config.is_multimodal or jax.process_count() != 1
         ):
@@ -1552,8 +1555,6 @@ class Scheduler(
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = dict(global_server_args_dict)
         ret["last_gen_throughput"] = self.last_gen_throughput
-        ret["disagg_decode_admission_fences"] = getattr(self, "disagg_decode_admission_fences", 0)
-        ret["disagg_decode_admitted"] = getattr(self, "disagg_decode_admitted", 0)
         ret["avg_spec_accept_length"] = compute_avg_spec_accept_length(
             self.cum_spec_accept_length, self.cum_spec_accept_count
         )

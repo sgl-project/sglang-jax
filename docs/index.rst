@@ -46,7 +46,6 @@ the model cookbook is maintained as a Mintlify-style recipe collection.
    features/lora
    features/quantization
    features/radix_cache
-   features/raiden_pd_overlap
    features/run_in_pathways
    features/server_arguments
    features/speculative_decoding

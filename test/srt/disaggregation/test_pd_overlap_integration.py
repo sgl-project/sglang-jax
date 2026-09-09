@@ -174,6 +174,7 @@ def test_prefill_worker_fences_before_publishing_or_next_forward(monkeypatch, fu
     buffers = object()
 
     def forward(batch, *_, **__):
+        client.worker.model_runner.token_to_kv_pool.kv_buffer = (buffers, batch.bid)
         events.append(f"forward{batch.bid}")
         return (None, [42], 0, object()) if fused else (None, [42], 0)
 
@@ -189,7 +190,7 @@ def test_prefill_worker_fences_before_publishing_or_next_forward(monkeypatch, fu
     monkeypatch.setattr(worker_module, "set_future_token_ids", lambda *args: args[0])
 
     def fence(actual):
-        assert actual is buffers
+        assert actual == (buffers, 1 if "publish" not in events else 2)
         events.append("fence")
         if fence_fails:
             raise RuntimeError("device fence failed")

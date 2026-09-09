@@ -310,7 +310,6 @@ class SchedulerDisaggregationDecodeMixin:
         implemented, new native receive admission requires a whole-pool device
         fence. Steady decode and polling existing receives need no such fence.
         """
-        self.disagg_decode_admission_fences = getattr(self, "disagg_decode_admission_fences", 0) + 1
         with jax.profiler.TraceAnnotation("pd_decode_admission_fence"):
             self._wait_donation_safe()
             jax.block_until_ready(self.token_to_kv_pool_allocator.get_kvcache().kv_buffer)
@@ -545,7 +544,20 @@ class SchedulerDisaggregationDecodeMixin:
                         entry.kv_indices = entry.kv_indices[:prefix_len]
                         self._release_decode_kv_indices(unused_tail, entry.req.dp_rank)
                     self._enqueue_for_decode(entry.req)
-                    self._pd_mark_time(entry.req, "decode_ready")
+                    self._pd_mark_time(entry.req, "first_token")
+                    from sgl_jax.srt.disaggregation.req_time_stats import (
+                        maybe_log_time_stats,
+                    )
+
+                    maybe_log_time_stats(
+                        entry.req.pd_time_stats,
+                        req_id=entry.req_id,
+                        enabled=getattr(
+                            self.server_args,
+                            "enable_request_time_stats_logging",
+                            False,
+                        ),
+                    )
                 except Exception:
                     logger.exception(
                         "failed to install KV / enqueue decode for req_id=%s; releasing resources",
@@ -753,7 +765,6 @@ class SchedulerDisaggregationDecodeMixin:
             self._pd_mark_time(entry.req, "transfer_entry")
             self.disagg_prealloc_queue.remove(entry.req_id)
             self.disagg_transfer_queue.add(entry)
-            self.disagg_decode_admitted = getattr(self, "disagg_decode_admitted", 0) + 1
             admitted += 1
             admitted_per_dp[decode_dp_rank] += 1
 

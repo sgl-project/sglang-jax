@@ -10,7 +10,6 @@ Feature docs describe runtime capabilities, operational behavior, and user-visib
 | [LoRA](lora.md) | LoRA adapter serving support. |
 | [Quantization](quantization.md) | Quantized model serving support. |
 | [Radix cache](radix_cache.md) | Prefix KV cache reuse. |
-| [Raiden PD scheduler overlap](raiden_pd_overlap.md) | Opt-in prefill/decode scheduler overlap, ownership fences, and validation scope. |
 | [Run in Pathways](run_in_pathways.md) | Pathways execution notes. |
 | [Server Arguments](server_arguments.md) | Launch flags and runtime configuration entry point. |
 | [Speculative decoding](speculative_decoding.md) | Draft/verify decoding support. |

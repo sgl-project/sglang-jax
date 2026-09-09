@@ -2,7 +2,6 @@
 
 from collections import deque
 from dataclasses import FrozenInstanceError
-from queue import Queue
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
 
@@ -191,57 +190,6 @@ def test_pause_drain_processes_all_results_before_reaping():
     assert events == [first, second, "reap"]
     assert scheduler.last_batch is scheduler.cur_batch is None
     assert not scheduler.result_queue
-
-
-@pytest.mark.parametrize("fused", [False, True])
-def test_worker_waits_for_current_pool_before_result_publish_and_next_forward(monkeypatch, fused):
-    client = ModelWorkerClient.__new__(ModelWorkerClient)
-    events = []
-    pool = NS(kv_buffer=None)
-    args = NS(disaggregation_mode="prefill", disaggregation_enable_overlap_schedule=True)
-
-    def forward(batch, *args, **kwargs):
-        pool.kv_buffer = f"pool-{batch.bid}"
-        events.append(f"forward-{batch.bid}")
-        return (None, [1], 0, []) if fused else (None, [1], 0)
-
-    client.worker = NS(
-        server_args=args,
-        model_runner=NS(token_to_kv_pool=pool),
-        _pd_fuse_for_batch=lambda batch: fused,
-        forward_batch_generation=forward,
-    )
-    client.input_queue = Queue()
-    for bid in [1, 2]:
-        client.input_queue.put(
-            (
-                NS(bid=bid, launch_done=None, forward_batch=NS(input_ids=[0])),
-                [],
-                None,
-                None,
-            )
-        )
-    client.input_queue.put((None, None, None, None))
-    client.output_queue = NS(put=lambda result: events.append("publish"))
-    client.future_token_ids_map = []
-    client.mesh = None
-    client.async_gather_fn = lambda value: value
-    monkeypatch.setattr(worker_module, "resolve_future_token_ids", lambda values, *_: values)
-    monkeypatch.setattr(worker_module, "set_future_token_ids", lambda *args: [])
-    monkeypatch.setattr(
-        worker_module.jax,
-        "block_until_ready",
-        lambda value: events.append(f"ready-{value}"),
-    )
-    client.forward_thread_func_()
-    assert events == [
-        "forward-1",
-        "ready-pool-1",
-        "publish",
-        "forward-2",
-        "ready-pool-2",
-        "publish",
-    ]
 
 
 @pytest.mark.parametrize(
