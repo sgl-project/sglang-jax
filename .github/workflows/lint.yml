@@ -4,7 +4,7 @@ on: [ pull_request ]
 
 jobs:
   lint:
-    runs-on: arc-runner-cpu-us-south1-b
+    runs-on: ${{ github.run_attempt == '1' && 'arc-runner-cpu-us-east5-a' || 'arc-runner-cpu-us-south1-b' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
