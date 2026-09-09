@@ -234,6 +234,7 @@ class ServerArgs:
     speculative_num_steps: int = 4
     speculative_eagle_topk: int = 5
     speculative_num_draft_tokens: int = 4
+    dspark_sample_from_anchor: bool = False
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
 
@@ -1619,6 +1620,13 @@ class ServerArgs:
             default=ServerArgs.speculative_num_draft_tokens,
         )
         parser.add_argument(
+            "--dspark-sample-from-anchor",
+            action="store_true",
+            help="Use the DFlash anchor position to predict the next token. "
+            "Draft query length is --speculative-num-draft-tokens minus one; "
+            "the latter remains the target verify length including the seed.",
+        )
+        parser.add_argument(
             "--speculative-accept-threshold-single",
             type=float,
             help="Accept a draft token if its probability in the target model is greater than this threshold.",
@@ -2021,6 +2029,9 @@ class ServerArgs:
                     "Please pass --disable-overlap-schedule for other speculative configs."
                 )
 
+        if self.dspark_sample_from_anchor and self.speculative_algorithm != "DFLASH":
+            raise ValueError("--dspark-sample-from-anchor requires --speculative-algorithm DFLASH.")
+
         # DFLASH: non-causal one-shot diffusion draft + linear-chain greedy verify.
         if self.speculative_algorithm == "DFLASH":
             if self.tp_size < 1:
@@ -2054,14 +2065,17 @@ class ServerArgs:
                     revision=self.speculative_draft_model_revision,
                     trust_remote_code=self.trust_remote_code,
                 )
-                if draft_config.block_size != self.speculative_num_draft_tokens:
+                verify_tokens = draft_config.block_size + int(self.dspark_sample_from_anchor)
+                if verify_tokens != self.speculative_num_draft_tokens:
                     logger.info(
-                        "DFLASH: using draft config block_size=%d for "
+                        "DFLASH: using inferred verify length=%d for "
                         "--speculative-num-draft-tokens (default was %d).",
-                        draft_config.block_size,
+                        verify_tokens,
                         self.speculative_num_draft_tokens,
                     )
-                    self.speculative_num_draft_tokens = draft_config.block_size
+                    self.speculative_num_draft_tokens = verify_tokens
+            if self.speculative_num_draft_tokens < 2:
+                raise ValueError("DFLASH requires at least two verify tokens (seed + candidate).")
             if self.enable_lora or self.enable_static_lora or self.lora_paths:
                 raise ValueError("DFLASH does not support LoRA.")
             if self.grammar_backend not in (None, "none"):
