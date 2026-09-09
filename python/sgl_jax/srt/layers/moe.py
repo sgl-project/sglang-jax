@@ -833,16 +833,36 @@ class EPMoE(nnx.Module):
             .at[sorted_selected_experts]
             .set(jnp.arange(expected_tokens, dtype=jnp.int32))
         )
-        grouped_indices = jnp.reshape(argsort_indices, (weights.shape[0], top_k))
         weights_fp32 = weights.astype(jnp.float32)
 
-        output = None
-        for k in range(top_k):
-            contribution = (
-                jnp.take(intermediate, indices=grouped_indices[:, k], axis=0).astype(jnp.float32)
-                * weights_fp32[:, k, None]
+        # Small (decode-shaped) batches: the einsum's (tokens, top_k, hidden)
+        # fp32 intermediate is tiny, while the unrolled per-k gather costs
+        # +0.9 ms/token on GLM-5.2 decode (top_k=8, 78L, TPU v7x, jax 0.11.1).
+        # Large (prefill-shaped) batches: that intermediate is ~0.5 GB/layer
+        # and the unrolled path from #1578 is a big win (-2.8 s on 110k TTFT).
+        # Branch on the static token count: both shapes get their fast path.
+        if weights.shape[0] <= 256:
+            unsort_intermediate = jnp.take(intermediate, indices=argsort_indices, axis=0)
+            reshaped_intermediate = jnp.reshape(
+                unsort_intermediate,
+                (weights.shape[0], top_k, -1),
             )
-            output = contribution if output is None else output + contribution
+            output = jnp.einsum(
+                "BKE,BK -> BE",
+                reshaped_intermediate.astype(jnp.float32),
+                weights_fp32,
+            )
+        else:
+            grouped_indices = jnp.reshape(argsort_indices, (weights.shape[0], top_k))
+            output = None
+            for k in range(top_k):
+                contribution = (
+                    jnp.take(intermediate, indices=grouped_indices[:, k], axis=0).astype(
+                        jnp.float32
+                    )
+                    * weights_fp32[:, k, None]
+                )
+                output = contribution if output is None else output + contribution
 
         final_output = output.astype(self.dtype)
 
