@@ -1,3 +1,4 @@
+# Adapted from https://github.com/vllm-project/tpu-inference/blob/main/tpu_inference/kernels/quantized_matmul/kernel.py
 # SPDX-License-Identifier: Apache-2.0
 """Quantized matmul kernel."""
 
