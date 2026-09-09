@@ -33,6 +33,13 @@ class MetadataRef:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
+class LhsRef:
+    value: Any
+    multiplier: Any | None = None
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
 class WeightsRef:
     weight: Any
     scale: Any | None
@@ -73,6 +80,7 @@ class GmmConfigs:
     out_dtype: jnp.dtype
     acc_dtype: jnp.dtype
     zero_init: bool
+    lhs_activation: str | None = None
 
 
 TileFn = Callable[[jnp.dtype, jnp.dtype, Dimensions, int], TileSizes]
@@ -127,7 +135,7 @@ class IndexMaps:
 
 def generate_block_specs(
     metadata_ref: MetadataRef, cfgs: GmmConfigs
-) -> tuple[tuple[pl.BlockSpec, WeightsRef], pl.BlockSpec]:
+) -> tuple[tuple[LhsRef, WeightsRef], pl.BlockSpec]:
     """Generates block specs for the given lhs, rhs, and out refs."""
 
     index_map = IndexMaps(metadata_ref, cfgs)
@@ -177,7 +185,12 @@ def generate_block_specs(
         index_map.out_index_map,
     )
 
-    return (lhs_block_spec, rhs_block_spec), out_block_spec
+    lhs_specs = LhsRef(
+        value=lhs_block_spec,
+        # Both inputs use the same bounded rows and default double buffering.
+        multiplier=lhs_block_spec if cfgs.lhs_activation is not None else None,
+    )
+    return (lhs_specs, rhs_block_spec), out_block_spec
 
 
 # Define kernels.
@@ -185,7 +198,7 @@ def generate_block_specs(
 
 def inner_kernel(
     # In
-    tiled_lhs_ref: jax.Array,
+    tiled_lhs_ref: LhsRef,
     # [tile_m // size_lhs_sublane, size_lhs_sublane, tile_k]
     tiled_rhs_ref: WeightsRef,  # [tile_k, tile_n]
     # Out
@@ -207,7 +220,7 @@ def inner_kernel(
     invalid data and needs to be masked out.
 
     Args:
-        tiled_lhs_ref: Contains value lhs[m_start:m_end, k_start:k_end]
+        tiled_lhs_ref: Contains lhs and optional multiplier for the same rows and K slice.
         tiled_rhs_ref: Contains value rhs[g_id, k_start:k_end, n_start:n_end]. where
             g_id is the group associated with lhs[m_start:m_end, :]
         tiled_out_ref: Contains value out[m_start:m_end, n_start:n_end]
@@ -219,7 +232,16 @@ def inner_kernel(
     """
 
     def _matmul(is_first_k_step: bool, is_last_k_step: bool):
-        tiled_lhs = tiled_lhs_ref[...].reshape(-1, cfgs.tiles.tile_k)
+        tiled_lhs = tiled_lhs_ref.value[...].reshape(-1, cfgs.tiles.tile_k)
+        if cfgs.lhs_activation == "silu":
+            # Match the fused XLA activation: FP32 arithmetic followed by one
+            # BF16 conversion before the FP32-accumulating matmul. The pipeline
+            # only invokes this for local expert tiles (plus boundary rows).
+            with jax.named_scope("lhs_silu_gating"):
+                gate = tiled_lhs.astype(jnp.float32)
+                up = tiled_lhs_ref.multiplier[...].reshape(gate.shape).astype(jnp.float32)
+                sigmoid = lax.reciprocal(1.0 + jnp.exp(-gate))
+                tiled_lhs = (gate * sigmoid * up).astype(tiled_lhs.dtype)
         tiled_rhs = tiled_rhs_ref.weight[...]
 
         valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
@@ -580,7 +602,7 @@ def kernel_main(
     lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
     group_offset_ref: jax.Array,  # int32[1]
     # In
-    lhs_ref: jax.Array,  # [size_m, size_k]
+    lhs_ref: LhsRef,  # Each leaf: [size_m, size_k]
     rhs_ref: WeightsRef,  # [size_group, size_k, size_n]
     # Out
     out_ref: jax.Array,  # [size_m, size_n]
@@ -609,7 +631,7 @@ def kernel_main(
     Args:
         lhs_group_sizes_ref: Reference to the group sizes of lhs.
         group_offset_ref: Reference to the group offset.
-        lhs_ref: Reference to the lhs.
+        lhs_ref: References to the lhs and optional multiplier.
         rhs_ref: Reference to the rhs.
         out_ref: Reference to the out.
         partial_out_ref: Reference to the partial output.
@@ -653,7 +675,9 @@ def kernel_main(
 
     # Bounded slice requires second last dim to be aligned to the sublane size.
     # rhs_ref uses static tiling thus reshape is not needed.
-    lhs_in = lhs_ref.reshape(-1, cfgs.dims.size_lhs_sublane, lhs_ref.shape[-1])
+    lhs_in = jax.tree.map(
+        lambda ref: ref.reshape(-1, cfgs.dims.size_lhs_sublane, ref.shape[-1]), lhs_ref
+    )
     out_in = out_ref.reshape(-1, cfgs.dims.size_lhs_sublane, out_ref.shape[-1])
     scratches = [partial_out_ref, acc_ref, metadata_ref]
     pipeline_fn(lhs_in, rhs_ref, out_in, scratches=scratches)
@@ -787,6 +811,7 @@ def get_cost_estimate(
     rhs: WeightsRef,
     out_dtype: jnp.dtype,
     dims: Dimensions,
+    lhs_multiplier: jax.Array | None = None,
 ):
     """Returns the cost estimate for the GMM kernel."""
     assert isinstance(rhs.weight, jax.Array)
@@ -794,6 +819,14 @@ def get_cost_estimate(
     flops = 2 * dims.size_m * dims.size_k * dims.size_n
 
     lhs_bytes = dims.size_m * dims.size_k * lhs.dtype.itemsize
+    transcendentals = 0
+    if lhs_multiplier is not None:
+        # As with the matmul estimate, use the full M as a static estimate;
+        # runtime metadata determines the local rows and boundary overhead.
+        activation_elements = dims.size_m * dims.size_k
+        lhs_bytes += activation_elements * lhs_multiplier.dtype.itemsize
+        flops += 4 * activation_elements
+        transcendentals = 2 * activation_elements  # exp and reciprocal
 
     rhs_bytes = (
         dims.size_group * dims.size_k * dims.size_n * jax.dtypes.itemsize_bits(rhs.weight)
@@ -810,8 +843,55 @@ def get_cost_estimate(
     return pl.CostEstimate(
         flops=flops,
         bytes_accessed=total_bytes,
-        transcendentals=0,
+        transcendentals=transcendentals,
     )
+
+
+def validate_lhs_activation(lhs, lhs_multiplier, lhs_activation):
+    """Validate the optional two-input activation without changing either input."""
+    if lhs_activation not in (None, "silu"):
+        raise ValueError(f"Unsupported lhs activation: {lhs_activation}")
+    if (lhs_activation is None) != (lhs_multiplier is None):
+        raise ValueError("lhs_activation and lhs_multiplier must be supplied together")
+    if lhs_multiplier is not None and (
+        lhs_multiplier.shape != lhs.shape or lhs_multiplier.dtype != lhs.dtype
+    ):
+        raise ValueError("lhs_multiplier must have the same shape and dtype as lhs")
+
+
+def can_fuse_lhs_silu(lhs, rhs, cfgs: GmmConfigs, vmem_limit_bytes: int) -> bool:
+    """Keep fusion on unquantized BF16 tiles that visit each K/N dimension once."""
+    dims, tiles = cfgs.dims, cfgs.tiles
+    if (
+        lhs.dtype != jnp.bfloat16
+        or rhs.dtype != jnp.bfloat16
+        or cfgs.out_dtype != jnp.bfloat16
+        or cfgs.acc_dtype != jnp.float32
+        or cfgs.lhs_cfgs.quant_dtype is not None
+        or cfgs.rhs_cfgs.has_scale
+        or tiles.tile_k != dims.size_k
+        or tiles.tile_n != dims.size_n
+    ):
+        return False
+
+    # Retain the incumbent geometry. Budget both double-buffered LHS leaves,
+    # triple-buffered weights, double-buffered output, and existing scratches.
+    # Reserve six FP32 activation tiles for vector temporaries as well. This
+    # is an admission estimate; compiler allocation/spills still need checking.
+    lhs_tile_elements = tiles.tile_m * tiles.tile_k
+    out_tile_elements = tiles.tile_m * tiles.tile_n
+    vmem_bytes = 2 * 2 * lhs_tile_elements * jnp.dtype(lhs.dtype).itemsize
+    vmem_bytes += 3 * tiles.tile_k * tiles.tile_n * jnp.dtype(rhs.dtype).itemsize
+    vmem_bytes += 2 * out_tile_elements * cfgs.out_dtype.itemsize
+    vmem_bytes += out_tile_elements * jnp.dtype(cfgs.acc_dtype).itemsize
+    vmem_bytes += dims.size_lhs_sublane * tiles.tile_n * cfgs.out_dtype.itemsize
+    if cfgs.rhs_cfgs.has_bias:
+        vmem_bytes += 2 * tiles.tile_n * jnp.dtype(jnp.float32).itemsize
+    if cfgs.zero_init:
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        vmem_bytes += min(2 * 1024 * 1024, dims.size_m * num_lanes * cfgs.out_dtype.itemsize)
+    vmem_bytes += 6 * lhs_tile_elements * jnp.dtype(jnp.float32).itemsize
+    return vmem_bytes <= vmem_limit_bytes
 
 
 def get_scope_name(dims: Dimensions, tiles: TileSizes) -> str:
@@ -932,6 +1012,7 @@ def get_metadata(cfgs: GmmConfigs):
         "acc_dtype",
         "maybe_quantize_lhs",
         "zero_initialize",
+        "lhs_activation",
     ]
 )
 def gmm_v2(
@@ -949,6 +1030,8 @@ def gmm_v2(
     acc_dtype: jnp.dtype | None = None,
     maybe_quantize_lhs: bool = True,
     zero_initialize: bool = True,
+    lhs_multiplier: jax.Array | None = None,
+    lhs_activation: str | None = None,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -970,12 +1053,17 @@ def gmm_v2(
           acc_dtype: Optional jnp.dtype for the accumulator.
           maybe_quantize_lhs: Quantize lhs if set to True and rhs is quantized.
           zero_initialize: Whether to initialize unvisited output elements to zero.
+          lhs_multiplier: Optional input with the same shape and dtype as lhs.
+          lhs_activation: Static activation mode. "silu" computes silu(lhs) *
+              lhs_multiplier inside unquantized BF16 full-K/full-N tiles when
+              the memory estimate fits; otherwise materializes it before GMM.
 
     Returns:
           Output of shape [size_m, size_n].
     """
 
     del precision
+    validate_lhs_activation(lhs, lhs_multiplier, lhs_activation)
 
     if group_offset is None:
         group_offset = jnp.array([0], dtype=jnp.int32)
@@ -1002,6 +1090,15 @@ def gmm_v2(
     )
     dims = cfgs.dims
     tiles = cfgs.tiles
+
+    if lhs_activation is not None:
+        if can_fuse_lhs_silu(lhs, rhs, cfgs, vmem_limit_bytes):
+            cfgs = dataclasses.replace(cfgs, lhs_activation=lhs_activation)
+        else:
+            # Preserve the original activation and tiling for other dtypes,
+            # quantized inputs, split K/N tiles, or insufficient VMEM.
+            lhs = jax.nn.silu(lhs) * lhs_multiplier
+            lhs_multiplier = None
 
     # Prepare block specs.
     rhs_scale_spec = rhs_bias_spec = None
@@ -1062,6 +1159,11 @@ def gmm_v2(
 
     aligned_n = align_to(dims.size_n, num_lanes)
     out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
+    lhs_inputs = LhsRef(value=lhs, multiplier=lhs_multiplier)
+    lhs_spec = LhsRef(
+        value=pl.BlockSpec(memory_space=pltpu.HBM),
+        multiplier=pl.BlockSpec(memory_space=pltpu.HBM) if lhs_multiplier is not None else None,
+    )
     rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
 
     return pl.pallas_call(
@@ -1070,7 +1172,7 @@ def gmm_v2(
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
             in_specs=[
-                pl.BlockSpec(memory_space=pltpu.HBM),
+                lhs_spec,
                 WeightsRef(
                     weight=pl.BlockSpec(memory_space=pltpu.HBM),
                     scale=rhs_scale_spec,
@@ -1084,10 +1186,10 @@ def gmm_v2(
             vmem_limit_bytes=vmem_limit_bytes,
             disable_bounds_checks=True,
         ),
-        name=get_scope_name(dims, tiles),
-        cost_estimate=get_cost_estimate(lhs, rhs_weights, out_init.dtype, dims),
+        name=get_scope_name(dims, tiles) + ("-lhs_silu" if cfgs.lhs_activation else ""),
+        cost_estimate=get_cost_estimate(lhs, rhs_weights, out_init.dtype, dims, lhs_multiplier),
         metadata=get_metadata(cfgs),
-    )(group_sizes, group_offset, lhs, rhs_weights)[:, : dims.size_n]
+    )(group_sizes, group_offset, lhs_inputs, rhs_weights)[:, : dims.size_n]
 
 
 def is_supported_by_gmm_v2(

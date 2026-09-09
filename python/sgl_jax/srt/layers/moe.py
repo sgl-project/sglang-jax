@@ -727,13 +727,27 @@ class EPMoE(nnx.Module):
         )
 
         # === Activation ===
-        if self.activation == "silu":
-            layer_act = jax.nn.silu(layer_w0)
-        elif self.activation == "gelu":
-            layer_act = jax.nn.gelu(layer_w0)
+        if (
+            self.activation == "silu"
+            and self.dtype == jnp.bfloat16
+            and act_q_dtype is None
+            and all(w.dtype == jnp.bfloat16 for w in (w0_kernel, w1_kernel, wo_kernel))
+            and all(s is None for s in (w0_kernel_scale, w1_kernel_scale, wo_kernel_scale))
+        ):
+            # Let the down GMM activate only the rows visited by its local
+            # expert metadata. The backend retains materialized activation for
+            # v1 and for v2 configurations without full-K/full-N tile capacity.
+            intermediate_layer = layer_w0
+            gmm_kwargs["lhs_multiplier"] = layer_w1
+            gmm_kwargs["lhs_activation"] = "silu"
         else:
-            raise ValueError(f"Unsupported activation function {self.activation}")
-        intermediate_layer = jnp.multiply(layer_act, layer_w1)
+            if self.activation == "silu":
+                layer_act = jax.nn.silu(layer_w0)
+            elif self.activation == "gelu":
+                layer_act = jax.nn.gelu(layer_w0)
+            else:
+                raise ValueError(f"Unsupported activation function {self.activation}")
+            intermediate_layer = jnp.multiply(layer_act, layer_w1)
 
         # === GEMM2: intermediate @ wo ===
         return gmm(
