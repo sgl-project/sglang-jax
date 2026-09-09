@@ -79,6 +79,23 @@ def quantized_matmul_kernel(
     # The num_blocks should become 1 in case of channelwise.
     block_size = tuned_value.in_block_size if block_size == orig_n_in else block_size
 
+    # Transfer eight groups at a time for this W8A16 schedule, while keeping
+    # each dot and BF16 accumulation at the original 128-element granularity.
+    # Restrict this to the one-group tuning value: larger original K tiles
+    # have a different partial-sum grouping that must not be changed here.
+    use_rolled_reduction = (
+        x.shape == (2048, 4096)
+        and w_q.shape == (4096, 4096)
+        and w_scale.shape == (32, 1, 4096)
+        and x.dtype == jnp.bfloat16
+        and w_q.dtype == jnp.int8
+        and not quantize_activation
+        and block_size == 128
+        and tuned_value == TunedValue(128, 256, 128, 1)
+    )
+    if use_rolled_reduction:
+        in_block_size = 1024
+
     # Pad the inputs to be multiple of block size.
     padded_n_batch = next_multiple(orig_n_batch, batch_block_size)
     if orig_n_batch < padded_n_batch:
@@ -134,6 +151,15 @@ def quantized_matmul_kernel(
     )
 
     steps_k = in_block_size // block_size
+    if use_rolled_reduction:
+        # get_vmem_limit already accounts for the larger lhs/rhs transfers,
+        # double buffers, output and accumulator scratch, but reserves only
+        # one scale row. Reserve all groups, with the singleton row dimension
+        # padded to eight in VMEM. Match its two compute/spill copies plus the
+        # extra transfer buffer, and retain the device limit.
+        extra_scale_bytes = (steps_k * 8 - 1) * out_block_size * jnp.dtype(jnp.float32).itemsize
+        vmem_limit_bytes = min(vmem_limit_bytes + 3 * extra_scale_bytes, get_device_vmem_limit())
+
     # n_lane_multiplier > 1 could improve perf by reducing loop overhead and increasing instruction-level parallelism,
     # allowing the compiler to overlap output fusion and packing overhead with MXU computation
     # TODO(amandaliang): use pltpu.get_tpu_info().mxu_column_size when JAX version is newer
@@ -197,8 +223,49 @@ def quantized_matmul_kernel(
 
         unfold_args((is_first_step, is_last_step), (), accum)
 
+    def rolled_kernel(lhs_ref, rhs_ref, w_scales_ref, out_ref, acc_scratch):
+        pid_k = pl.program_id(2)
+        is_first_step = pid_k == 0
+        is_last_step = pid_k == (n_in - 1)
+
+        # The first tile has no initialized scratch. Its placeholder is
+        # replaced directly by the first group's result, without adding zero.
+        acc_block = jax.lax.cond(
+            is_first_step,
+            lambda: jnp.zeros((batch_block_size, out_block_size), acc_dtype),
+            lambda: acc_scratch[...],
+        )
+
+        def reduce_group(i, acc):
+            k_slice = pl.ds(i * block_size, block_size)
+            lhs_q = lhs_ref[:, k_slice]
+            rhs_q = rhs_ref[:, k_slice]
+            rhs_scale = w_scales_ref[i, :, :].astype(acc_dtype)
+            dot_res = jax.lax.dot_general(
+                lhs_q,
+                rhs_q,
+                (((1,), (1,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+            res = dot_res.astype(acc_dtype)
+            res = res * rhs_scale
+
+            # Keep the shared dot/scale body outside the conditional and
+            # preserve the baseline's BF16 res + previous_sum operand order.
+            return jax.lax.cond(is_first_step & (i == 0), lambda: res, lambda: res + acc)
+
+        acc_block = jax.lax.fori_loop(0, steps_k, reduce_group, acc_block, unroll=False)
+
+        def store_output():
+            out_ref[...] = acc_block.astype(out_ref.dtype)
+
+        def store_scratch():
+            acc_scratch[...] = acc_block
+
+        jax.lax.cond(is_last_step, store_output, store_scratch)
+
     kernel = pl.pallas_call(
-        kernel,
+        rolled_kernel if use_rolled_reduction else kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
             in_specs=[
