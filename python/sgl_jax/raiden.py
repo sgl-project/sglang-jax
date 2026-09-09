@@ -7,7 +7,7 @@ import sys
 from collections.abc import Sequence
 from typing import Any
 
-# New wheels use tpu_sync; older wheels retain the tpu_raiden namespace.
+# Resolve one namespace consistently to avoid loading two native runtimes.
 _RAIDEN_NAMESPACES = ("tpu_sync", "tpu_raiden")
 _EXTENSION_SUFFIX = ".frameworks.jax._tpu_raiden_jax"
 

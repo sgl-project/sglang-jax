@@ -970,8 +970,7 @@ class RaidenTransferKVSender(KVSender, StateHolder):
             self.request_abort("raiden_failed_sending")
         elif not self._manager.sender_done(self.uuid):
             return KVPoll.TRANSFERRING
-        # Older Raiden wheels signal send failures through done_sending;
-        # newer single-endpoint wheels also have an explicit failure event.
+        # Native completion permits release, but must not erase an abort reason.
         reason = self._pending_failure_reason
         return self._finish(
             KVPoll.FAILED if reason is not None else KVPoll.SUCCESS,

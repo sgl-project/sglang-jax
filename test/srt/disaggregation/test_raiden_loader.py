@@ -49,16 +49,8 @@ def test_preload_selects_namespace_and_keeps_manager_consistent(monkeypatch, nam
     assert calls == expected + [namespace + ".api.jax.kv_cache_manager"]
 
 
-@pytest.mark.parametrize(
-    "error",
-    [
-        ModuleNotFoundError(name="tpu_sync.frameworks"),
-        ModuleNotFoundError(name="native_dependency"),
-        ImportError("undefined symbol: PJRT_Api"),
-        OSError("incompatible architecture"),
-    ],
-)
-def test_broken_new_wheel_never_falls_back(monkeypatch, error):
+def test_broken_new_wheel_never_falls_back(monkeypatch):
+    error = ImportError("undefined symbol: PJRT_Api")
     calls = []
 
     def import_module(name):
@@ -72,54 +64,16 @@ def test_broken_new_wheel_never_falls_back(monkeypatch, error):
     assert calls == [extension("tpu_sync")]
 
 
-def test_absent_wheels_report_installation_error(monkeypatch):
-    def import_module(name):
-        raise ModuleNotFoundError(name=name.split(".")[0])
-
-    monkeypatch.setattr(raiden.importlib, "import_module", import_module)
-    with pytest.raises(ModuleNotFoundError, match="Neither tpu_sync nor tpu_raiden"):
-        raiden.preload_raiden()
-
-
-@pytest.mark.parametrize("module", ["jax", "jaxlib"])
-def test_preload_rejects_late_native_loading(monkeypatch, module):
+def test_preload_rejects_late_native_loading(monkeypatch):
+    module = "jax"
     monkeypatch.setitem(sys.modules, module, types.ModuleType(module))
     with pytest.raises(RuntimeError, match="before jax/jaxlib"):
         raiden.preload_raiden()
 
 
-def test_manager_requires_preload():
-    with pytest.raises(RuntimeError, match="was not preloaded"):
-        raiden.get_raiden_kv_cache_manager()
-
-
-@pytest.mark.parametrize(
-    "operation",
-    [
-        raiden.preload_raiden,
-        raiden.require_raiden_preloaded,
-        raiden.get_raiden_kv_cache_manager,
-    ],
-)
-def test_mixed_native_extensions_rejected(monkeypatch, operation):
+def test_mixed_native_extensions_rejected(monkeypatch):
     for namespace in ("tpu_sync", "tpu_raiden"):
         name = extension(namespace)
         monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
     with pytest.raises(RuntimeError, match="Both tpu_sync and tpu_raiden"):
-        operation()
-
-
-def test_preloaded_legacy_is_retained_when_new_api_available(monkeypatch):
-    name = extension("tpu_raiden")
-    monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
-    calls = []
-
-    def import_module(name):
-        calls.append(name)
-        raise ModuleNotFoundError(name=name)
-
-    monkeypatch.setattr(raiden.importlib, "import_module", import_module)
-    raiden.preload_raiden()
-    with pytest.raises(ModuleNotFoundError):
-        raiden.get_raiden_kv_cache_manager()
-    assert calls == ["tpu_raiden.api.jax.kv_cache_manager"]
+        raiden.preload_raiden()

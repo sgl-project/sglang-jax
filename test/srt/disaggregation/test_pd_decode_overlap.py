@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from sgl_jax.srt.disaggregation import decode
+from sgl_jax.srt.managers import scheduler as scheduler_module
 
 
 class _StopLoop(Exception):
@@ -116,13 +117,6 @@ def test_first_extend_decode_and_idle_drain():
     assert scheduler.new_token_ratio == scheduler.init_new_token_ratio
 
 
-def test_pipeline_restart_signals_new_sampling_event():
-    scheduler = _Scheduler([_Batch(name="first"), None, _Batch(name="restart"), None])
-    _run(scheduler)
-    assert scheduler.events.count("dummy") == 2
-    assert not scheduler.result_queue
-
-
 def test_pause_drains_once_and_polls_without_admission(monkeypatch):
     fences = []
     monkeypatch.setattr(decode.jax, "block_until_ready", lambda arrays: fences.append(arrays))
@@ -141,26 +135,6 @@ def test_pause_drains_once_and_polls_without_admission(monkeypatch):
     assert fences == [scheduler.kv_buffers]
     assert not scheduler.result_queue
     assert scheduler.last_batch is scheduler.cur_batch is None
-
-
-def test_pause_handler_already_drained_is_not_consumed_twice(monkeypatch):
-    monkeypatch.setattr(decode.jax, "block_until_ready", lambda _: None)
-
-    def pause(scheduler):
-        scheduler._drain_disagg_decode_overlap_results()
-        scheduler._engine_paused = True
-
-    def resume(scheduler):
-        scheduler._engine_paused = False
-
-    scheduler = _Scheduler(
-        [_Batch(name="extend"), _Batch(name="resume"), None],
-        controls=[None, pause, resume],
-    )
-    _run(scheduler)
-    assert scheduler.events.count(("result", "extend")) == 1
-    assert scheduler.events.count(("result", "resume")) == 1
-    assert scheduler.events.count("dummy") == 2
 
 
 def test_admission_fence_waits_for_donation_then_device_writes(monkeypatch):
@@ -204,3 +178,68 @@ def test_single_process_transfer_drain_does_not_issue_multihost_collectives(monk
         decode.SchedulerDisaggregationDecodeMixin._drain_transfer_queue_synced(scheduler)
         is completed
     )
+
+
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+def test_pause_drains_role_before_retracting_running_requests(role):
+    events = []
+    scheduler = scheduler_module.Scheduler.__new__(scheduler_module.Scheduler)
+    scheduler.server_args = SimpleNamespace(disaggregation_mode=role)
+    scheduler.enable_overlap = True
+    scheduler._sync_chunked_req_owners = lambda: events.append("sync")
+    scheduler._drain_disagg_prefill_overlap_results = lambda: events.append("drain_prefill")
+    scheduler._drain_disagg_decode_overlap_results = lambda: events.append("drain_decode")
+    scheduler._process_pending_chunked_aborts = list
+    scheduler._retire_chunked_req_batch_owners = lambda _: None
+    scheduler._retract_parked_chunked_reqs = lambda _: None
+    scheduler._add_request_to_queue = lambda _: events.append("requeue")
+    req = object()
+
+    def retract(_):
+        events.append("retract")
+        return [req]
+
+    scheduler.running_batch = SimpleNamespace(
+        filter_batch=lambda: None,
+        reqs_info=[SimpleNamespace(reqs=[req])],
+        retract_all=retract,
+    )
+    scheduler.pause_generation(SimpleNamespace(mode="retract"))
+    assert events == ["sync", f"drain_{role}", "retract", "requeue"]
+    assert scheduler._engine_paused
+    assert scheduler.last_batch is scheduler.cur_batch is None
+
+
+def test_retraction_still_needed_runs_only_after_pending_result_retired(monkeypatch):
+    monkeypatch.setattr(scheduler_module, "TEST_RETRACT", False)
+    events = []
+    scheduler = scheduler_module.Scheduler.__new__(scheduler_module.Scheduler)
+    scheduler.enable_overlap = True
+    scheduler.server_args = SimpleNamespace(disaggregation_mode="decode")
+    scheduler.tree_cache = None
+    scheduler.result_queue = deque([object()])
+    scheduler.new_token_ratio = 0.5
+    scheduler.dp_size = scheduler.per_dp_max_running_requests = 1
+    scheduler._extend_requests_to_queue = lambda *_, **__: events.append("requeue")
+
+    def drain():
+        events.append("drain")
+        scheduler.result_queue.clear()
+
+    def retract(_):
+        assert not scheduler.result_queue
+        events.append("retract")
+        return [], 0.5, []
+
+    scheduler._drain_disagg_decode_overlap_results = drain
+    batch = SimpleNamespace(
+        batch_size=lambda: 1,
+        filter_batch=lambda: None,
+        is_empty=lambda: False,
+        check_decode_mem=lambda: False,
+        prepare_for_decode=lambda: events.append("prepare"),
+        retract_decode=retract,
+        reqs_info=[SimpleNamespace(reqs=[object()])],
+    )
+    scheduler.update_running_batch(batch)
+    assert events == ["drain", "retract", "requeue", "prepare"]

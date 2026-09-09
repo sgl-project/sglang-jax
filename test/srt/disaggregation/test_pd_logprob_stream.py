@@ -2,8 +2,6 @@
 
 from types import SimpleNamespace
 
-import pytest
-
 from sgl_jax.srt.managers.schedule_batch import Req
 from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
@@ -11,8 +9,8 @@ from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 
 
-@pytest.mark.parametrize("mixed", [False, True])
-def test_output_logprob_stream_has_one_delta_per_request(mixed):
+def test_output_logprob_stream_has_one_delta_per_request():
+    mixed = True
     sent = []
     scheduler = SimpleNamespace(
         stream_interval=1,

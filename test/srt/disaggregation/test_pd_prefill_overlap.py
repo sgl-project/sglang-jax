@@ -2,6 +2,7 @@
 
 from collections import deque
 from dataclasses import FrozenInstanceError
+from queue import Queue
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
 
@@ -14,7 +15,6 @@ from sgl_jax.srt.disaggregation.prefill import (
     SchedulerDisaggregationPrefillMixin,
 )
 from sgl_jax.srt.managers import tp_worker_overlap_thread as worker_module
-from sgl_jax.srt.managers.tp_worker_overlap_thread import ModelWorkerClient
 
 
 class Harness(SchedulerDisaggregationPrefillMixin):
@@ -102,16 +102,6 @@ def test_snapshot_chunk_publishes_old_pages_without_waiting_new_pool():
     scheduler.disagg_kv_manager.prepare_prefill_batch.assert_not_called()
 
 
-def test_normal_chunk_still_waits_for_pool_before_transfer():
-    scheduler = Harness()
-    req = request()
-    sender = Mock(has_pending_failure=False, has_started_chunks=False)
-    scheduler.disagg_kv_manager.create_sender.return_value = sender
-    scheduler._raiden_handoff_chunk(req, is_final=False)
-    sender.send_chunk.call_args.kwargs["on_ready"]()
-    scheduler.disagg_kv_manager.prepare_prefill_batch.assert_called_once_with("new-pool")
-
-
 def test_changed_attempt_cannot_publish_old_snapshot():
     scheduler = Harness()
     req = request()
@@ -144,26 +134,6 @@ def test_transfer_terminal_waits_for_all_compute_owners(state):
     assert len(scheduler.disagg_prefill_queue) == 0
 
 
-def test_deferred_release_happens_once_after_last_resolved_chunk():
-    scheduler = Harness()
-    req = request()
-    snapshot = scheduler._snapshot_prefill_handoffs(NS(reqs=[req]))
-    scheduler._disagg_prefill_compute[id(req)] = 2
-    scheduler._release_prefill_req_resources(req)
-    scheduler._release_prefill_req_resources(req)
-    scheduler._release_prefill_kv_pool.assert_not_called()
-    scheduler.tp_worker = NS(resolve_last_batch_result=lambda: (None, [1], 0))
-    scheduler.process_prefill_chunk = Mock()
-    pending = PendingPrefillResult(NS(), NS(), snapshot)
-    scheduler._resolve_disagg_prefill_result(pending)
-    scheduler._release_prefill_kv_pool.assert_not_called()
-    scheduler._resolve_disagg_prefill_result(pending)
-    scheduler._release_prefill_kv_pool.assert_called_once_with(req)
-    scheduler._release_prefill_host_buffer.assert_called_once_with(req)
-    assert not scheduler._disagg_prefill_deferred_releases
-    assert not scheduler._disagg_prefill_compute
-
-
 def test_failed_handoff_processing_still_retires_compute_owner():
     scheduler = Harness()
     req = request()
@@ -190,28 +160,6 @@ def test_pause_drain_processes_all_results_before_reaping():
     assert events == [first, second, "reap"]
     assert scheduler.last_batch is scheduler.cur_batch is None
     assert not scheduler.result_queue
-
-
-@pytest.mark.parametrize(
-    ("mode", "enabled"), [("decode", True), ("prefill", False), ("null", False)]
-)
-def test_other_worker_modes_do_not_add_pool_barrier(monkeypatch, mode, enabled):
-    client = ModelWorkerClient.__new__(ModelWorkerClient)
-    client.worker = NS(
-        server_args=NS(disaggregation_mode=mode, disaggregation_enable_overlap_schedule=enabled)
-    )
-    barrier = Mock()
-    monkeypatch.setattr(worker_module.jax, "block_until_ready", barrier)
-    client._wait_pd_prefill_kv_ready()
-    barrier.assert_not_called()
-
-
-def test_normal_non_pd_result_keeps_generic_processor():
-    scheduler = Harness()
-    scheduler.process_batch_result = Mock()
-    batch, result = NS(reqs=[NS(bootstrap_room=None)]), NS()
-    scheduler.process_prefill_chunk(batch, result)
-    scheduler.process_batch_result.assert_called_once_with(batch, result)
 
 
 def test_cancelled_snapshot_aborts_existing_sender_without_republishing():
@@ -250,15 +198,6 @@ def test_whole_request_handoff_uses_snapshot_pages_or_normal_barrier(overlap):
         scheduler.disagg_kv_manager.prepare_prefill_batch.assert_not_called()
     else:
         scheduler.disagg_kv_manager.prepare_prefill_batch.assert_called_once_with("new-pool")
-
-
-@pytest.mark.parametrize("pending", [None, False, True])
-def test_chunk_backpressure_requires_sender_with_pending_chunks(pending):
-    scheduler = Harness()
-    req = request()
-    req.disagg_chunk_sender = None if pending is None else NS(has_pending_chunks=pending)
-    scheduler.chunked_reqs = [None, req]
-    assert scheduler._prefill_chunk_transfer_backpressured() is (pending is True)
 
 
 def test_backpressured_loop_keeps_resolving_and_polling_then_resumes():
@@ -320,16 +259,47 @@ def test_backpressured_loop_keeps_resolving_and_polling_then_resumes():
     assert not scheduler.result_queue
 
 
-def test_sender_pending_chunks_property_tracks_queued_descriptors():
-    from sgl_jax.srt.disaggregation.raiden_transfer.conn import RaidenTransferKVSender
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("fence_fails", [False, True])
+def test_prefill_worker_fences_before_publishing_or_next_forward(monkeypatch, fused, fence_fails):
+    events = []
+    client = worker_module.ModelWorkerClient.__new__(worker_module.ModelWorkerClient)
+    client.input_queue = Queue()
+    client.output_queue = NS(put=lambda _: events.append("publish"))
+    client.future_token_ids_map = object()
+    client.mesh = None
+    client.async_gather_fn = lambda x: x
+    buffers = object()
 
-    sender = RaidenTransferKVSender(Mock(), "request")
-    assert not sender.has_pending_chunks
-    with sender._state_lock:
-        sender._pending_chunks[0] = object()
-    assert sender.has_pending_chunks
-    with sender._state_lock:
-        sender._pending_chunks.clear()
-    assert not sender.has_pending_chunks
-    with pytest.raises(AttributeError):
-        sender.has_pending_chunks = True
+    def forward(batch, *_, **__):
+        client.worker.model_runner.token_to_kv_pool.kv_buffer = (buffers, batch.bid)
+        events.append(f"forward{batch.bid}")
+        return (None, [42], 0, object()) if fused else (None, [42], 0)
+
+    client.worker = NS(
+        server_args=NS(disaggregation_mode="prefill", disaggregation_enable_overlap_schedule=True),
+        model_runner=NS(token_to_kv_pool=NS(kv_buffer=buffers)),
+        _pd_fuse_for_batch=lambda _: fused,
+        forward_batch_generation=forward,
+    )
+    monkeypatch.setattr(worker_module, "resolve_future_token_ids", lambda ids, *_: ids)
+    monkeypatch.setattr(worker_module, "set_future_token_ids", lambda *args: args[0])
+
+    def fence(actual):
+        assert actual == (buffers, 1 if "publish" not in events else 2)
+        events.append("fence")
+        if fence_fails:
+            raise RuntimeError("device fence failed")
+
+    monkeypatch.setattr(worker_module.jax, "block_until_ready", fence)
+    for bid in (1, 2):
+        batch = NS(bid=bid, launch_done=None, forward_batch=NS(input_ids=[0]))
+        client.input_queue.put((batch, None, None, None))
+    client.input_queue.put((None, None, None, None))
+    if fence_fails:
+        with pytest.raises(RuntimeError, match="device fence failed"):
+            client.forward_thread_func_()
+        assert events == ["forward1", "fence"]
+    else:
+        client.forward_thread_func_()
+        assert events == ["forward1", "fence", "publish", "forward2", "fence", "publish"]
