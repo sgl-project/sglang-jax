@@ -1707,7 +1707,7 @@ class ScheduleBatch:
         # (asserts shape[0] == batch_size); rebuild via _concat, run it, then
         # split allocate_lens back to per-rank.
         if self.spec_algorithm is not None and (
-            self.spec_algorithm.is_eagle() or self.spec_algorithm.is_block_draft()
+            self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash_family()
         ):
             for info in self.reqs_info:
                 if not info.reqs:

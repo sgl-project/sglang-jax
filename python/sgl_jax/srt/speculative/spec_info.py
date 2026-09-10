@@ -89,7 +89,7 @@ class SpeculativeAlgorithm(IntEnum):
     def is_dspark(self):
         return self == SpeculativeAlgorithm.DSPARK
 
-    def is_block_draft(self):
+    def is_dflash_family(self):
         return self.is_dflash() or self.is_dspark()
 
     @staticmethod

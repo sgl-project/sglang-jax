@@ -502,7 +502,7 @@ class SchedulerOutputProcessorMixin:
                 new_accepted_len = 1
                 if not is_spec_decode:
                     req.output_ids.append(next_token_id)
-                elif self.spec_algorithm.is_eagle() or self.spec_algorithm.is_block_draft():
+                elif self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash_family():
                     req.output_ids.extend([int(t) for t in next_token_id])
                     new_accepted_len = len(next_token_id)
 
@@ -528,7 +528,7 @@ class SchedulerOutputProcessorMixin:
                     )
                 elif (
                     is_spec_decode
-                    and (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_block_draft())
+                    and (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash_family())
                     and not legacy_eagle3_non_overlap
                 ):
                     req.kv_committed_len += new_accepted_len - 1
