@@ -24,6 +24,10 @@ from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_N
 from sgl_jax.srt.configs.bailing_hybrid import BailingHybridConfig
 from sgl_jax.srt.configs.gemma4 import Gemma4Config
 from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
+from sgl_jax.srt.configs.muse_glimmer import (
+    MuseGlimmerAssistantConfig,
+    MuseGlimmerConfig,
+)
 from sgl_jax.srt.configs.qwen3_5 import Qwen3_5DenseConfig, Qwen3_5HybridConfig
 from sgl_jax.srt.managers.tiktoken_tokenizer import TiktokenTokenizer
 from sgl_jax.srt.utils.common_utils import is_remote_url, lru_cache_frozenset
@@ -46,14 +50,19 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
         Qwen3_5HybridConfig,
         Qwen3_5DenseConfig,
         Gemma4Config,
+        MuseGlimmerConfig,
+        MuseGlimmerAssistantConfig,
     ]
 }
 
-if "glm_moe_dsa" not in CONFIG_MAPPING:
+if "glm_moe_dsa" not in CONFIG_MAPPING or "muse_glimmer" not in CONFIG_MAPPING:
     with contextlib.suppress(Exception):
         from transformers.models.auto.tokenization_auto import TOKENIZER_MAPPING
 
-        TOKENIZER_MAPPING._reverse_config_mapping["GlmMoeDsaConfig"] = "gpt2"
+        if "glm_moe_dsa" not in CONFIG_MAPPING:
+            TOKENIZER_MAPPING._reverse_config_mapping["GlmMoeDsaConfig"] = "gpt2"
+        if "muse_glimmer" not in CONFIG_MAPPING:
+            TOKENIZER_MAPPING._reverse_config_mapping["MuseGlimmerConfig"] = "gpt2"
 
 # Register local configs; suppress() defers to stock on a name clash (fine for
 # bailing/kimi which don't clash, and for the glm stub where stock is preferable).

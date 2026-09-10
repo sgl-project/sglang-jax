@@ -303,6 +303,7 @@ class ChatCompletionMessageGenericParam(BaseModel):
     content: str | list[ChatCompletionMessageContentTextPart] | None
     tool_call_id: str | None = None
     name: str | None = None
+    reasoning: str | None = None
     reasoning_content: str | None = None
     tool_calls: list[ToolCall] | None = Field(default=None, examples=[None])
 
