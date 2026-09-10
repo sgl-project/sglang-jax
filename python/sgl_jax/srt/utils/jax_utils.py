@@ -152,8 +152,8 @@ def get_available_device_memory(
             selected_devices = device_list
         return selected_devices
 
-    if device == "tpu":
-        raw_devices = jax.local_devices()
+    if device in ("tpu", "tt"):
+        raw_devices = jax.local_devices(backend=device)
         devices = filter_devices(raw_devices, device_indexes)
         if empty_cache:
             gc.collect()  # collect garbage to free up memory used by quantization

@@ -747,8 +747,9 @@ class ModelRunnerKVCacheMixin:
                 **dsa_kwargs,
             )
         else:
+            pool_class = getattr(self.attn_backend, "token_to_kv_pool_class", MHATokenToKVPool)
             self.token_to_kv_pool = self._maybe_wrap_hybrid_kv_pool(
-                MHATokenToKVPool,
+                pool_class,
                 head_num=self.model_config.get_total_num_kv_heads_with_replication(
                     self.attention_tp_size
                 ),
