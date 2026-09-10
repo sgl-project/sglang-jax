@@ -112,6 +112,14 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             model_class=DFlashDraftModel,
         )
         draft_model = self.draft_model_runner.model
+        if draft_model.markov_head is not None:
+            if not self.sample_from_anchor:
+                raise ValueError("DSpark Markov checkpoints require --dspark-sample-from-anchor.")
+            if self.draft_query_tokens != int(draft_model.config.block_size):
+                raise ValueError(
+                    "DSpark stage1 requires verify width = checkpoint block_size + 1."
+                )
+            logger.info("DSpark stage1: vanilla Markov head, rank=%d.", draft_model.markov_rank)
 
         # Alias the KV allocator so draft block allocation draws from the same
         # free list the target uses (no collision with committed slots).
@@ -122,6 +130,11 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         self._target_lm_head = head_weight  # [vocab, hidden], for greedy head sampling
         self._target_embed = embed_weight  # [vocab, hidden]
         self._target_vocab_size = int(target_worker.model_runner.model_config.vocab_size)
+        if (
+            draft_model.markov_head is not None
+            and draft_model.markov_head.vocab_size != self._target_vocab_size
+        ):
+            raise ValueError("DSpark Markov head and target must have the same vocabulary size.")
 
         pool_pages = (
             int(target_worker.max_total_num_tokens) + self.page_size - 1
@@ -846,8 +859,12 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 lm_head.T,
                 out_sharding=logits_sharding,
             )[:, :vocab_size]
-            draft_next = jnp.argmax(logits, axis=-1).astype(jnp.int32)
-            draft_next = draft_next.reshape(proposal_hidden.shape[:-1])
+            if model.markov_head is None:
+                draft_next = jnp.argmax(logits, axis=-1).astype(jnp.int32)
+                draft_next = draft_next.reshape(proposal_hidden.shape[:-1])
+            else:
+                base_logits = logits.reshape((*proposal_hidden.shape[:-1], vocab_size))
+                draft_next = model.markov_head.sample_block_tokens(base_logits, seed[:, 0])
             seed = jax.sharding.reshard(seed, cache_row_sharding)
             draft_next = jax.sharding.reshard(draft_next, cache_row_sharding)
             draft_token = jnp.concatenate([seed, draft_next], axis=1).reshape(-1)
