@@ -400,8 +400,6 @@ class DFlashDraftModel(nnx.Module):
         return jnp.argmax(base_logits, axis=-1).astype(jnp.int32)
 
     def load_weights(self, model_config: ModelConfig) -> None:
-        if int(getattr(self.config, "markov_rank", 0)) > 0:
-            raise ValueError("Markov checkpoints require --speculative-algorithm DSPARK.")
         loader = WeightLoader(
             model=self,
             model_config=model_config,

@@ -190,7 +190,7 @@ Stage1 verifies all candidates at a fixed width. Confidence head weights, if
 present, are unused; there is no confidence-based truncation or dynamic
 verification planning. Gated and recurrent Markov heads are unsupported.
 Checkpoints without a Markov head (`markov_rank` absent or zero) continue to use
-`DFLASH`. DFlash rejects Markov checkpoints rather than silently ignoring the head.
+`DFLASH`. The DFLASH path loads only backbone weights; use DSPARK to include the Markov head.
 
 For `deepseek-ai/dspark_qwen3_8b_block7`:
 
