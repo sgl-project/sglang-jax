@@ -683,7 +683,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 # if there is no aux layer, set to None
                 eagle_aux_hidden_state_layer_ids = None
             self.model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
-        elif self.server_args.speculative_algorithm == "DFLASH" and not self.is_draft_worker:
+        elif self.server_args.speculative_algorithm in ("DFLASH", "DSPARK") and not self.is_draft_worker:
             # The captured layers must match the draft checkpoint's projection input.
             from sgl_jax.srt.speculative.dflash_util import parse_dflash_draft_config
 

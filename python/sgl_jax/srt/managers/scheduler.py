@@ -437,10 +437,11 @@ class Scheduler(
             )
             if self.enable_overlap and hasattr(self.draft_worker, "init_spec_relay_buffers"):
                 self.draft_worker.init_spec_relay_buffers()
-        elif self.spec_algorithm is not None and self.spec_algorithm.is_dflash():
-            from sgl_jax.srt.speculative.dflash_worker import (
-                DFlashWorker as _SpecWorkerCls,
-            )
+        elif self.spec_algorithm is not None and self.spec_algorithm.is_block_draft():
+            if self.spec_algorithm.is_dspark():
+                from sgl_jax.srt.speculative.dspark_worker import DSparkWorker as _SpecWorkerCls
+            else:
+                from sgl_jax.srt.speculative.dflash_worker import DFlashWorker as _SpecWorkerCls
 
             self.draft_worker = _SpecWorkerCls(
                 server_args=server_args,
@@ -1409,7 +1410,7 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if self.spec_algorithm is not None and self.spec_algorithm.is_dflash():
+        if self.spec_algorithm is not None and self.spec_algorithm.is_block_draft():
             dflash_err = validate_dflash_request(req)
             if dflash_err is not None:
                 req.set_finish_with_abort(dflash_err)
@@ -2692,7 +2693,7 @@ class Scheduler(
                 batch_output.next_token_ids
                 if (
                     self.spec_algorithm is not None
-                    and (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash())
+                    and (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_block_draft())
                     and (batch.forward_mode.is_decode() or defer_spec_prefill_output)
                     and self.enable_overlap
                 )
@@ -2707,7 +2708,7 @@ class Scheduler(
         )
         if (
             self.spec_algorithm is not None
-            and (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash())
+            and (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_block_draft())
             and batch_output.next_draft_input is not None
         ):
             assert isinstance(batch_output.next_draft_input, (EagleDraftInput, DFlashDraftInput))

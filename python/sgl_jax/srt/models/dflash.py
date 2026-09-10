@@ -333,22 +333,6 @@ class DFlashDraftModel(nnx.Module):
         self.config = config
         self.mesh = mesh
         self.dtype = dtype
-        self.markov_rank = int(getattr(config, "markov_rank", 0))
-        if self.markov_rank < 0:
-            raise ValueError("markov_rank must be non-negative.")
-        if self.markov_rank:
-            if getattr(config, "markov_head_type", None) != "vanilla":
-                raise ValueError("DSpark stage1 only supports markov_head_type='vanilla'.")
-            from sgl_jax.srt.models.dspark_head import VanillaMarkovHead
-
-            self.markov_head = VanillaMarkovHead(
-                vocab_size=int(config.vocab_size),
-                markov_rank=self.markov_rank,
-                mesh=mesh,
-                dtype=dtype,
-            )
-        else:
-            self.markov_head = None
         self.model = DFlashBackbone(config=config, mesh=mesh, dtype=dtype)
 
         hidden_size = int(config.hidden_size)
@@ -410,26 +394,21 @@ class DFlashDraftModel(nnx.Module):
         output = LogitsProcessorOutput(next_token_logits=None, hidden_states=hidden_states)
         return output, {"token_to_kv_pool": layers_kv_fused}, [], None
 
+    def sample_block_tokens(
+        self, base_logits: jax.Array, first_prev_tokens: jax.Array
+    ) -> jax.Array:
+        return jnp.argmax(base_logits, axis=-1).astype(jnp.int32)
+
     def load_weights(self, model_config: ModelConfig) -> None:
+        if int(getattr(self.config, "markov_rank", 0)) > 0:
+            raise ValueError("Markov checkpoints require --speculative-algorithm DSPARK.")
         loader = WeightLoader(
             model=self,
             model_config=model_config,
             mesh=self.mesh,
             dtype=self.dtype,
         )
-        mappings = self._create_weight_mappings()
-        if self.markov_head is not None and not loader.dummy_mode:
-            keys = set(loader._scan_weight_info())
-            missing = set(mappings) - keys
-            if missing:
-                raise ValueError(
-                    f"DSpark checkpoint is missing required weights: {sorted(missing)}."
-                )
-            if any(key.startswith("confidence_head.") for key in keys):
-                logger.info(
-                    "DSpark stage1 ignores confidence head weights; verifies all proposals."
-                )
-        loader.load_weights_from_safetensors(mappings)
+        loader.load_weights_from_safetensors(self._create_weight_mappings())
         logger.info("DFlash draft weights loaded successfully.")
 
     def _create_weight_mappings(self) -> dict[str, WeightMapping]:
@@ -529,21 +508,6 @@ class DFlashDraftModel(nnx.Module):
                     transpose=False,
                 )
 
-        if int(getattr(self.config, "markov_rank", 0)) > 0:
-            mappings.update(
-                {
-                    "markov_head.markov_w1.weight": WeightMapping(
-                        target_path="markov_head.markov_w1",
-                        sharding=(None, None),
-                        transpose=False,
-                    ),
-                    "markov_head.markov_w2.weight": WeightMapping(
-                        target_path="markov_head.markov_w2.weight",
-                        sharding=(None, "tensor"),
-                        transpose=True,
-                    ),
-                }
-            )
         return mappings
 
 

@@ -86,6 +86,17 @@ class TargetVerifyPlan:
 class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
     """DFlash draft/verify runtime worker (greedy, DP/TP aware)."""
 
+    algorithm = SpeculativeAlgorithm.DFLASH
+
+    @staticmethod
+    def _draft_model_class():
+        from sgl_jax.srt.models.dflash import DFlashDraftModel
+
+        return DFlashDraftModel
+
+    def _validate_draft_model(self, draft_model):
+        pass
+
     def __init__(self, server_args, target_worker: ModelWorker):
         super().__init__(
             server_args,
@@ -102,25 +113,14 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         draft_server_args = copy.deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
 
-        from sgl_jax.srt.models.dflash import DFlashDraftModel
-
         self._worker = ModelWorker(
             server_args=draft_server_args,
             mesh=self.mesh,
             req_to_token_pool=self.req_to_token_pool,
             is_draft_worker=True,
-            model_class=DFlashDraftModel,
+            model_class=self._draft_model_class(),
         )
         draft_model = self.draft_model_runner.model
-        if draft_model.markov_head is not None:
-            if not self.sample_from_anchor:
-                raise ValueError("DSpark Markov checkpoints require --dspark-sample-from-anchor.")
-            if self.draft_query_tokens != int(draft_model.config.block_size):
-                raise ValueError(
-                    "DSpark stage1 requires verify width = checkpoint block_size + 1."
-                )
-            logger.info("DSpark stage1: vanilla Markov head, rank=%d.", draft_model.markov_rank)
-
         # Alias the KV allocator so draft block allocation draws from the same
         # free list the target uses (no collision with committed slots).
         self.draft_model_runner.token_to_kv_pool_allocator = self.token_to_kv_pool_allocator
@@ -130,11 +130,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         self._target_lm_head = head_weight  # [vocab, hidden], for greedy head sampling
         self._target_embed = embed_weight  # [vocab, hidden]
         self._target_vocab_size = int(target_worker.model_runner.model_config.vocab_size)
-        if (
-            draft_model.markov_head is not None
-            and draft_model.markov_head.vocab_size != self._target_vocab_size
-        ):
-            raise ValueError("DSpark Markov head and target must have the same vocabulary size.")
+        self._validate_draft_model(draft_model)
 
         pool_pages = (
             int(target_worker.max_total_num_tokens) + self.page_size - 1
@@ -175,10 +171,11 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         self._init_jit_draft_block()
 
         logger.info(
-            "Initialized DFLASH worker: verify_tokens=%d, draft_query_tokens=%d, "
+            "Initialized %s worker: verify_tokens=%d, draft_query_tokens=%d, "
             "sample_from_anchor=%s, mask_token_id=%d, "
             "draft_layers=%d, page_indices_pool_capacity=%d, "
             "page_indices_per_seq_capacity=%d",
+            self.algorithm.name,
             self.block_size,
             self.draft_query_tokens,
             self.sample_from_anchor,
@@ -688,7 +685,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         mwb.positions = np.asarray(positions_flat, dtype=np.int32)
         mwb.seq_lens = np.asarray(prefix_lens, dtype=np.int32)
         mwb.capture_hidden_mode = CaptureHiddenMode.NULL
-        mwb.spec_algorithm = SpeculativeAlgorithm.DFLASH
+        mwb.spec_algorithm = self.algorithm
         mwb.spec_info_padded = DFlashVerifyInput(
             draft_token=block_ids_flat,
             draft_token_num=self.block_size,
@@ -859,12 +856,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 lm_head.T,
                 out_sharding=logits_sharding,
             )[:, :vocab_size]
-            if model.markov_head is None:
-                draft_next = jnp.argmax(logits, axis=-1).astype(jnp.int32)
-                draft_next = draft_next.reshape(proposal_hidden.shape[:-1])
-            else:
-                base_logits = logits.reshape((*proposal_hidden.shape[:-1], vocab_size))
-                draft_next = model.markov_head.sample_block_tokens(base_logits, seed[:, 0])
+            base_logits = logits.reshape((*proposal_hidden.shape[:-1], vocab_size))
+            draft_next = model.sample_block_tokens(base_logits, seed[:, 0])
             seed = jax.sharding.reshard(seed, cache_row_sharding)
             draft_next = jax.sharding.reshard(draft_next, cache_row_sharding)
             draft_token = jnp.concatenate([seed, draft_next], axis=1).reshape(-1)
@@ -1584,7 +1577,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 num_tokens,
                 ForwardMode.EXTEND,
                 manager.cache_loc_buckets[-1],
-                speculative_algorithm=SpeculativeAlgorithm.DFLASH,
+                speculative_algorithm=self.algorithm,
                 dp_size=manager.dp_size,
                 per_dp_bs_size=bs // manager.dp_size,
             )
@@ -1776,7 +1769,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             num_tokens,
             ForwardMode.TARGET_VERIFY,
             bs * row_width,
-            speculative_algorithm=SpeculativeAlgorithm.DFLASH,
+            speculative_algorithm=self.algorithm,
             dp_size=dp_size,
             per_dp_bs_size=per_dp_bs,
         )
