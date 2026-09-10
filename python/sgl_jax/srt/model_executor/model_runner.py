@@ -37,6 +37,7 @@ from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sgl_jax.srt.model_executor.aot_dispatch import (
     AotDispatcher,
     aot_dispatch_requested,
+    decode_no_sc_gather_compiler_options_fn,
 )
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -385,41 +386,13 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             )
             use_aot_dispatch = False
 
-        # Opt-in workaround for the jax 0.11.1 SparseCore gather-offload decode
-        # regression on TPU v7x (#1613, jax-ml/jax#40553): compile decode-shaped
-        # executables with the offload pass disabled while prefill keeps the
-        # default (the offload is profitable for large prefill gathers, and a
-        # process-global LIBTPU_INIT_ARGS disable costs ~+12% on 110k prefill).
-        # Only effective together with SGLANG_JAX_AOT_DISPATCH since it hooks
-        # the per-shape AOT compile path.
-        decode_no_sc_gather = jax.default_backend() == "tpu" and get_bool_env_var(
-            "SGLANG_JAX_DECODE_DISABLE_SC_GATHER_OFFLOAD"
-        )
-
-        def _run_model_compiler_options(dyn_args):
-            if not decode_no_sc_gather:
-                return None
-            forward_batch = dyn_args[0]
-            if forward_batch.forward_mode.is_decode():
-                return {
-                    "xla_tpu_offload_gather_to_sparsecore": "false",
-                    "xla_tpu_offload_all_supported_gathers_to_sparsecore": "false",
-                }
-            return None
-
         if use_aot_dispatch:
-            if decode_no_sc_gather:
-                logger.info(
-                    "SGLANG_JAX_DECODE_DISABLE_SC_GATHER_OFFLOAD: decode "
-                    "executables will be compiled with SparseCore gather "
-                    "offload disabled."
-                )
             self._run_model_dispatcher = AotDispatcher(
                 jitted_run_model,
                 stable_call_args=(model_def, model_state_def, self.model_state_leaves),
                 stable_flat_args=(model_def, self.model_state_leaves),
                 name="run_model",
-                compiler_options_fn=_run_model_compiler_options,
+                compiler_options_fn=decode_no_sc_gather_compiler_options_fn(),
             )
 
             def run_model_wrapper(forward_batch, logits_metadata):

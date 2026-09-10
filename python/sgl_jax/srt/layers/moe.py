@@ -835,12 +835,9 @@ class EPMoE(nnx.Module):
         )
         weights_fp32 = weights.astype(jnp.float32)
 
-        # Small (decode-shaped) batches: the einsum's (tokens, top_k, hidden)
-        # fp32 intermediate is tiny, while the unrolled per-k gather costs
-        # +0.9 ms/token on GLM-5.2 decode (top_k=8, 78L, TPU v7x, jax 0.11.1).
-        # Large (prefill-shaped) batches: that intermediate is ~0.5 GB/layer
-        # and the unrolled path from #1578 is a big win (-2.8 s on 110k TTFT).
-        # Branch on the static token count: both shapes get their fast path.
+        # Static token-count branch: small (decode) batches avoid the unrolled
+        # per-k gather overhead; large (prefill) batches avoid the fp32
+        # (tokens, top_k, hidden) intermediate. Benchmarks in the PR description.
         if weights.shape[0] <= 256:
             unsort_intermediate = jnp.take(intermediate, indices=argsort_indices, axis=0)
             reshaped_intermediate = jnp.reshape(
