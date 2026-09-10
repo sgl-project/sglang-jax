@@ -246,6 +246,23 @@ class TestBucketComputation(unittest.TestCase):
         assert 256 in cm.token_buckets
         assert 512 in cm.token_buckets
 
+    def test_issue_1415_dp4_keeps_adjacent_2032_and_2048_buckets(self):
+        cm = CompilationManager(
+            server_args=_make_server_args(
+                precompile_token_paddings=[512, 1024, 2032, 2048],
+            ),
+            max_padded_batch_size=64,
+            max_padded_num_tokens=2048,
+            dp_size=4,
+            tp_size=4,
+            page_size=128,
+            max_req_len=4096,
+            vocab_size=32000,
+        )
+
+        index_2032 = cm.token_buckets.index(2032)
+        assert cm.token_buckets[index_2032 : index_2032 + 2] == [2032, 2048]
+
 
 class TestLazyCompilation(unittest.TestCase):
     def test_register_variant_if_new_first_time(self):
