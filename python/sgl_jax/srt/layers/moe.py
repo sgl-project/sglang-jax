@@ -220,7 +220,7 @@ class EPMoE(nnx.Module):
                         f"Expected k_blocks dimension to be 1 or {expected_k_blocks}."
                     )
             final_scale_sharding = (
-                P("expert", "tensor", None, None)
+                P("expert", "tensor" if scale.shape[1] > 1 else None, None, None)
                 if scale_name == "wo_scale"
                 else P("expert", None, None, "tensor")
             )
@@ -247,7 +247,7 @@ class EPMoE(nnx.Module):
 
                 if scale.shape == (num_experts, out_dim, expected_k_blocks):
                     final_scale_sharding = (
-                        P("expert", "tensor", None, None)
+                        P("expert", "tensor" if expected_k_blocks > 1 else None, None, None)
                         if scale_name == "wo_scale"
                         else P("expert", None, None, "tensor")
                     )
@@ -261,7 +261,7 @@ class EPMoE(nnx.Module):
                         else P("expert", "tensor", None)
                     )
                     final_scale_sharding = (
-                        P("expert", "tensor", None, None)
+                        P("expert", "tensor" if expected_k_blocks > 1 else None, None, None)
                         if scale_name == "wo_scale"
                         else P("expert", None, None, "tensor")
                     )
@@ -340,7 +340,7 @@ class EPMoE(nnx.Module):
                 k_blocks_wi = (hidden_size // block_size_k) if block_size_k else 1
                 k_blocks_wo = (intermediate_dim // block_size_k) if block_size_k else 1
                 wi_scale_sharding = P("expert", None, None, "tensor")
-                wo_scale_sharding = P("expert", "tensor", None, None)
+                wo_scale_sharding = P("expert", "tensor" if k_blocks_wo > 1 else None, None, None)
                 wi_sharding = P("expert", None, "tensor")
                 wo_sharding = P("expert", "tensor", None)
 
@@ -516,7 +516,7 @@ class EPMoE(nnx.Module):
                 del self.wo_scale
             self.wo_scale = nnx.Param(
                 wo_scale,
-                out_sharding=P("expert", "tensor", None, None),
+                out_sharding=P("expert", "tensor" if wo_scale.shape[1] > 1 else None, None, None),
             )
 
     @named_scope
@@ -593,7 +593,7 @@ class EPMoE(nnx.Module):
                     # scales [g, 1, 1, n]
                     P("expert", None, None, "tensor"),
                     P("expert", None, None, "tensor"),
-                    P("expert", "tensor", None, None),
+                    P("expert", "tensor" if (wo_scale is not None and wo_scale.shape[1] > 1) else None, None, None),
                     # biases [g, 1, n] (unused)
                     P("expert", None, "tensor"),
                     P("expert", None, "tensor"),
