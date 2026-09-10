@@ -32,7 +32,10 @@ def get_slot_mapping(
     return slot_mapping.astype(jnp.int32)
 
 
-VMEM_SIZE = 64 * 1024 * 1024  # 32MB
+VMEM_SIZE = 64 * 1024 * 1024  # 64 MiB
+# Pallas programs need a small amount of VMEM beyond explicitly declared scratch.
+# A tile that consumes the full nominal capacity fails to compile on TPU v7e.
+VMEM_HEADROOM_BYTES = 128 * 1024
 
 
 def get_num_slices_per_block(new_kv: jax.Array, kv_cache: jax.Array, page_size=128):
@@ -56,7 +59,9 @@ def get_num_slices_per_block(new_kv: jax.Array, kv_cache: jax.Array, page_size=1
     kv_head_num = new_kv.shape[2] * new_kv.shape[3]
     head_dim = new_kv.shape[4]
 
-    max_num_slices_per_block = VMEM_SIZE // (bytes_per_element * page_size * kv_head_num * head_dim)
+    bytes_per_slice = bytes_per_element * page_size * kv_head_num * head_dim
+    usable_vmem_size = VMEM_SIZE - VMEM_HEADROOM_BYTES
+    max_num_slices_per_block = usable_vmem_size // bytes_per_slice
     assert (
         max_num_slices_per_block > 0
     ), f"max_num_slices_per_block={max_num_slices_per_block} is not greater than 0"
