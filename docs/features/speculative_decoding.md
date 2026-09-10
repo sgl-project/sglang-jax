@@ -132,7 +132,7 @@ The default draft input contains the seed plus seven masks and skips the seed's
 hidden state when sampling.
 
 For a checkpoint trained to predict the next token from the anchor position,
-explicitly add `--dspark-sample-from-anchor`:
+explicitly add `--speculative-sample-from-anchor`:
 
 ```bash
 --speculative-algorithm DFLASH \
@@ -140,7 +140,7 @@ explicitly add `--dspark-sample-from-anchor`:
 --speculative-num-steps 1 \
 --speculative-eagle-topk 1 \
 --grammar-backend none \
---dspark-sample-from-anchor
+--speculative-sample-from-anchor
 ```
 
 This uses seven draft query positions (seed plus six masks), samples all seven
@@ -149,7 +149,9 @@ attention metadata and KV writes use the shorter query; target verification and
 accepted-context KV materialization retain the full verification width. Both
 layouts use greedy draft sampling and verification.
 
-The flag defaults to false and is not inferred from the checkpoint name or
+The flag describes the checkpoint prediction layout, independently of whether
+a Markov head is present. This implementation supports the flag with DFLASH.
+It defaults to false and is not inferred from the checkpoint name or
 architecture. If the verification width is omitted, the checkpoint's
 `block_size` is used unchanged for the default layout, or incremented by one
 when this flag is set. An explicitly supplied verification width takes precedence.

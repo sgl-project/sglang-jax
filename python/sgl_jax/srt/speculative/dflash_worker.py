@@ -94,7 +94,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         )
         # Scheduler allocation and target verification include the seed.
         self.block_size = self.speculative_num_draft_tokens
-        self.sample_from_anchor = server_args.dspark_sample_from_anchor
+        self.sample_from_anchor = server_args.speculative_sample_from_anchor
         self.draft_query_tokens = self.block_size - int(self.sample_from_anchor)
         self._target_impl = getattr(target_worker, "worker", target_worker)
         self._target_compilation_manager = self._target_impl.compilation_manager

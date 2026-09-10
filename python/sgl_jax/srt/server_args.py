@@ -234,7 +234,7 @@ class ServerArgs:
     speculative_num_steps: int = 4
     speculative_eagle_topk: int = 5
     speculative_num_draft_tokens: int = 4
-    dspark_sample_from_anchor: bool = False
+    speculative_sample_from_anchor: bool = False
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
 
@@ -1620,9 +1620,10 @@ class ServerArgs:
             default=ServerArgs.speculative_num_draft_tokens,
         )
         parser.add_argument(
-            "--dspark-sample-from-anchor",
+            "--speculative-sample-from-anchor",
             action="store_true",
-            help="Use the DFlash anchor position to predict the next token. "
+            help="Sample draft candidates starting at the anchor output position "
+            "(currently DFLASH only). "
             "Draft query length is --speculative-num-draft-tokens minus one; "
             "the latter remains the target verify length including the seed.",
         )
@@ -2029,8 +2030,10 @@ class ServerArgs:
                     "Please pass --disable-overlap-schedule for other speculative configs."
                 )
 
-        if self.dspark_sample_from_anchor and self.speculative_algorithm != "DFLASH":
-            raise ValueError("--dspark-sample-from-anchor requires --speculative-algorithm DFLASH.")
+        if self.speculative_sample_from_anchor and self.speculative_algorithm != "DFLASH":
+            raise ValueError(
+                "--speculative-sample-from-anchor requires --speculative-algorithm DFLASH."
+            )
 
         # DFLASH: non-causal one-shot diffusion draft + linear-chain greedy verify.
         if self.speculative_algorithm == "DFLASH":
@@ -2065,7 +2068,7 @@ class ServerArgs:
                     revision=self.speculative_draft_model_revision,
                     trust_remote_code=self.trust_remote_code,
                 )
-                verify_tokens = draft_config.block_size + int(self.dspark_sample_from_anchor)
+                verify_tokens = draft_config.block_size + int(self.speculative_sample_from_anchor)
                 if verify_tokens != self.speculative_num_draft_tokens:
                     logger.info(
                         "DFLASH: using inferred verify length=%d for "
