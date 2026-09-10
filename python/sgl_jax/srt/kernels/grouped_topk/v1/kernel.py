@@ -80,34 +80,39 @@ def _grouped_topk_kernel(
     with jax.named_scope("bias_add"):
         scores = logits + bias_ref[...][:, None]  # [E, BT] post-bias
 
-    # ① group score = sum of top-2 within each group, via 2-pass max (no sort). argmax tie-break is
-    #    irrelevant here — the top-2 sum is identical whichever of two equal maxima is masked first.
-    with jax.named_scope("group_top2"):
-        sg = jnp.reshape(scores, (n_group, S, bt))  # [G, S, BT]
-        v1 = jnp.max(sg, axis=1, keepdims=True)
-        i1 = jnp.argmax(sg, axis=1, keepdims=True)
-        s_iota = jax.lax.broadcasted_iota(jnp.int32, (n_group, S, bt), 1)
-        v2 = jnp.max(jnp.where(s_iota == i1, NEG_INF, sg), axis=1, keepdims=True)
-        group_scores = jnp.squeeze(v1 + v2, axis=1)  # [G, BT]
+    # Selecting every group retains every expert; group scores cannot affect
+    # the expert set. Keep the original selection when groups are dropped.
+    if topk_group == n_group:
+        masked = scores
+    else:
+        # ① group score = sum of top-2 within each group, via 2-pass max (no sort). argmax tie-break is
+        #    irrelevant here — the top-2 sum is identical whichever of two equal maxima is masked first.
+        with jax.named_scope("group_top2"):
+            sg = jnp.reshape(scores, (n_group, S, bt))  # [G, S, BT]
+            v1 = jnp.max(sg, axis=1, keepdims=True)
+            i1 = jnp.argmax(sg, axis=1, keepdims=True)
+            s_iota = jax.lax.broadcasted_iota(jnp.int32, (n_group, S, bt), 1)
+            v2 = jnp.max(jnp.where(s_iota == i1, NEG_INF, sg), axis=1, keepdims=True)
+            group_scores = jnp.squeeze(v1 + v2, axis=1)  # [G, BT]
 
-    # ② select `topk_group` groups, lowest-index tie-break (max + masked-min).
-    with jax.named_scope("group_select"):
-        group_mask = jnp.zeros((n_group, bt), dtype=jnp.bool_)
-        g_iota = jax.lax.broadcasted_iota(jnp.int32, (n_group, bt), 0)
-        tmp = group_scores
-        for _ in range(topk_group):
-            gmax = jnp.max(tmp, axis=0, keepdims=True)
-            gi = jnp.min(jnp.where(tmp == gmax, g_iota, n_group), axis=0, keepdims=True)
-            m = g_iota == gi
-            group_mask = jnp.logical_or(group_mask, m)
-            tmp = jnp.where(m, NEG_INF, tmp)
+        # ② select `topk_group` groups, lowest-index tie-break (max + masked-min).
+        with jax.named_scope("group_select"):
+            group_mask = jnp.zeros((n_group, bt), dtype=jnp.bool_)
+            g_iota = jax.lax.broadcasted_iota(jnp.int32, (n_group, bt), 0)
+            tmp = group_scores
+            for _ in range(topk_group):
+                gmax = jnp.max(tmp, axis=0, keepdims=True)
+                gi = jnp.min(jnp.where(tmp == gmax, g_iota, n_group), axis=0, keepdims=True)
+                m = g_iota == gi
+                group_mask = jnp.logical_or(group_mask, m)
+                tmp = jnp.where(m, NEG_INF, tmp)
 
-    # ③ mask experts in dropped groups -> -inf. Applied ONCE (loop-invariant) before the pick loop.
-    with jax.named_scope("expert_mask"):
-        masked = jnp.reshape(
-            jnp.where(group_mask[:, None, :], jnp.reshape(scores, (n_group, S, bt)), NEG_INF),
-            (E, bt),
-        )  # [E, BT]
+        # ③ mask experts in dropped groups -> -inf. Applied ONCE (loop-invariant) before the pick loop.
+        with jax.named_scope("expert_mask"):
+            masked = jnp.reshape(
+                jnp.where(group_mask[:, None, :], jnp.reshape(scores, (n_group, S, bt)), NEG_INF),
+                (E, bt),
+            )  # [E, BT]
 
     # ④ select `topk` experts, lowest-index tie-break; weight = PRE-bias logit at the winner. A
     #    fori_loop carries the [E,BT] working array and writes each pick into ROW k of the [topk,BT]
