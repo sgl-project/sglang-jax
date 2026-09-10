@@ -20,6 +20,8 @@ Renormalize / routed_scaling_factor are applied by the caller (`TopK.__call__`).
 
 Tie-break: selection uses `max` + masked `min(iota)` (smallest index achieving the max) rather than
 `argmax`, because TPU Mosaic's reduction argmax does not break ties toward the lowest index.
+The unpacked group and expert selections implement the index minimum with exact reversed f32
+priorities when possible, allowing those reductions to use native floating-point max instructions.
 """
 
 from __future__ import annotations
@@ -90,14 +92,24 @@ def _grouped_topk_kernel(
         v2 = jnp.max(jnp.where(s_iota == i1, NEG_INF, sg), axis=1, keepdims=True)
         group_scores = jnp.squeeze(v1 + v2, axis=1)  # [G, BT]
 
-    # ② select `topk_group` groups, lowest-index tie-break (max + masked-min).
+    # ② select `topk_group` groups, lowest-index tie-break.
     with jax.named_scope("group_select"):
         group_mask = jnp.zeros((n_group, bt), dtype=jnp.bool_)
         g_iota = jax.lax.broadcasted_iota(jnp.int32, (n_group, bt), 0)
+        use_float_group_priority = not packed and n_group <= (1 << 24)
+        if use_float_group_priority:
+            # Exact reversed priorities preserve ties and the no-match sentinel.
+            group_priority = (n_group - g_iota).astype(jnp.float32)
         tmp = group_scores
         for _ in range(topk_group):
             gmax = jnp.max(tmp, axis=0, keepdims=True)
-            gi = jnp.min(jnp.where(tmp == gmax, g_iota, n_group), axis=0, keepdims=True)
+            if use_float_group_priority:
+                max_priority = jnp.max(
+                    jnp.where(tmp == gmax, group_priority, 0.0), axis=0, keepdims=True
+                )
+                gi = n_group - max_priority.astype(jnp.int32)
+            else:
+                gi = jnp.min(jnp.where(tmp == gmax, g_iota, n_group), axis=0, keepdims=True)
             m = g_iota == gi
             group_mask = jnp.logical_or(group_mask, m)
             tmp = jnp.where(m, NEG_INF, tmp)
@@ -115,8 +127,9 @@ def _grouped_topk_kernel(
     #    small and static) so the picks overlap.
     #
     #    Two selection modes (compile-time `packed`):
-    #      packed=False — the f32 contract: `max` + masked-`min` finds the smallest expert id at the
-    #        max score, bit-exact to `lax.top_k` on the f32 scores.
+    #      packed=False — the f32 contract: `max` + stable index selection finds the smallest expert
+    #        id at the max score, bit-exact to `lax.top_k` on the f32 scores. Bounded ids use exact
+    #        reversed f32 priorities for the index reduction; scores are never rounded.
     #      packed=True  — the bf16 contract: bf16-round each score into an int32 order-preserving key
     #        (plain int order == (score DESC, index ASC)), so each pick is ONE reduction + a low-bit
     #        decode instead of the max+masked-min pair. Lossless for bf16 inputs (the low 16 mantissa
@@ -142,6 +155,12 @@ def _grouped_topk_kernel(
                 work0 = (key_score & clear_mask) | (E - 1 - e_iota)  # [E, BT] packed key
         else:
             work0 = masked  # [E, BT] f32 working scores
+            if E <= (1 << 24):
+                # All priorities 0..E are exact in f32. TPU lowers an integer min
+                # tree to compare/select pairs, while f32 max uses native vmax.
+                # Higher priority means lower expert id; zero is the no-match
+                # sentinel and decodes back to E, just like the masked min below.
+                index_priority = (E - e_iota).astype(jnp.float32)
 
         def _pick(k, carry):
             cur, ids_buf, w_buf = carry
@@ -150,9 +169,18 @@ def _grouped_topk_kernel(
                 idx = (E - 1) - (kmax & low_mask)  # [1, BT] lowest-index winner from the low bits
             else:
                 cmax = jnp.max(cur, axis=0, keepdims=True)
-                idx = jnp.min(
-                    jnp.where(cur == cmax, e_iota, E), axis=0, keepdims=True
-                )  # [1, BT] lowest expert id achieving the max
+                if E <= (1 << 24):
+                    max_priority = jnp.max(
+                        jnp.where(cur == cmax, index_priority, 0.0),
+                        axis=0,
+                        keepdims=True,
+                    )
+                    idx = E - max_priority.astype(jnp.int32)
+                else:
+                    # Keep integer selection when f32 cannot represent every id.
+                    idx = jnp.min(
+                        jnp.where(cur == cmax, e_iota, E), axis=0, keepdims=True
+                    )  # [1, BT] lowest expert id achieving the max
             sel = e_iota == idx  # [E, BT]
             # weight from PRE-bias logits via masked sum (gather is unsupported in Pallas/Mosaic).
             wval = jnp.sum(jnp.where(sel, logits, 0.0), axis=0, keepdims=True)  # [1, BT]
