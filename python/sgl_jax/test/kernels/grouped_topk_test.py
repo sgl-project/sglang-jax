@@ -210,6 +210,34 @@ def test_matches_ref_on_flat_ties():
     np.testing.assert_allclose(np.array(w_pal), np.array(w_ref), rtol=0, atol=1e-6)
 
 
+@pytest.mark.parametrize("topk_group", [1, 2, 3, 4])
+@pytest.mark.parametrize("block_tokens", [128, 256])
+def test_matches_ref_on_group_boundary_ties(topk_group, block_tokens):
+    """Tied group sums must keep the lowest group ids at the selection boundary."""
+    bs, E, G, k = 256, 256, 4, 4
+    # Group 2 wins outright; groups 0, 1 and 3 tie despite different expert scores.
+    scores = jnp.zeros((G, E // G), dtype=jnp.float32)
+    scores = scores.at[:, :2].set(
+        jnp.array([[0.875, 0.125], [0.625, 0.375], [0.75, 0.75], [0.9375, 0.0625]])
+    )
+    bias = jnp.arange(E, dtype=jnp.float32) / 1024
+    logits = jnp.broadcast_to(scores.reshape(E) - bias, (bs, E))
+    w_ref, ids_ref = ref_biased_grouped_topk(
+        logits, bias, num_expert_group=G, topk_group=topk_group, topk=k
+    )
+    w_pal, ids_pal = grouped_topk_pallas(
+        logits,
+        bias,
+        num_expert_group=G,
+        topk_group=topk_group,
+        topk=k,
+        block_tokens=block_tokens,
+        interpret=True,
+    )
+    np.testing.assert_array_equal(np.array(ids_pal), np.array(ids_ref))
+    np.testing.assert_array_equal(np.array(w_pal), np.array(w_ref))
+
+
 # --- bf16 packed-key final-select path (packed=True; caller enables it when logits are bf16) -------
 #
 # IMPORTANT: the packed path builds an int32 order key with bitcast_convert_type + bf16 rounding +

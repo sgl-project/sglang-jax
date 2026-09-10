@@ -20,8 +20,8 @@ Renormalize / routed_scaling_factor are applied by the caller (`TopK.__call__`).
 
 Tie-break: selection uses `max` + masked `min(iota)` (smallest index achieving the max) rather than
 `argmax`, because TPU Mosaic's reduction argmax does not break ties toward the lowest index.
-The final f32 path implements the index minimum with exact reversed f32 priorities when possible,
-allowing that reduction to use native floating-point max instructions.
+The unpacked group and expert selections implement the index minimum with exact reversed f32
+priorities when possible, allowing those reductions to use native floating-point max instructions.
 """
 
 from __future__ import annotations
@@ -92,14 +92,24 @@ def _grouped_topk_kernel(
         v2 = jnp.max(jnp.where(s_iota == i1, NEG_INF, sg), axis=1, keepdims=True)
         group_scores = jnp.squeeze(v1 + v2, axis=1)  # [G, BT]
 
-    # ② select `topk_group` groups, lowest-index tie-break (max + masked-min).
+    # ② select `topk_group` groups, lowest-index tie-break.
     with jax.named_scope("group_select"):
         group_mask = jnp.zeros((n_group, bt), dtype=jnp.bool_)
         g_iota = jax.lax.broadcasted_iota(jnp.int32, (n_group, bt), 0)
+        use_float_group_priority = not packed and n_group <= (1 << 24)
+        if use_float_group_priority:
+            # Exact reversed priorities preserve ties and the no-match sentinel.
+            group_priority = (n_group - g_iota).astype(jnp.float32)
         tmp = group_scores
         for _ in range(topk_group):
             gmax = jnp.max(tmp, axis=0, keepdims=True)
-            gi = jnp.min(jnp.where(tmp == gmax, g_iota, n_group), axis=0, keepdims=True)
+            if use_float_group_priority:
+                max_priority = jnp.max(
+                    jnp.where(tmp == gmax, group_priority, 0.0), axis=0, keepdims=True
+                )
+                gi = n_group - max_priority.astype(jnp.int32)
+            else:
+                gi = jnp.min(jnp.where(tmp == gmax, g_iota, n_group), axis=0, keepdims=True)
             m = g_iota == gi
             group_mask = jnp.logical_or(group_mask, m)
             tmp = jnp.where(m, NEG_INF, tmp)
