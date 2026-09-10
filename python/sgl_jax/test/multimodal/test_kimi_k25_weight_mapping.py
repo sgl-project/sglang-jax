@@ -2,7 +2,9 @@ import types
 from types import SimpleNamespace
 
 
-def _make_stub(num_hidden_layers, first_k_dense_replace, n_routed_experts):
+def _make_stub(
+    num_hidden_layers, first_k_dense_replace, n_routed_experts, quant_config=None
+):
     from sgl_jax.srt.multimodal.models.kimi_k25.kimi_k25_vl_generation import (
         KimiK25ForConditionalGeneration,
     )
@@ -17,7 +19,7 @@ def _make_stub(num_hidden_layers, first_k_dense_replace, n_routed_experts):
         ),
         hf_weight_prefix="language_model.",
         loader=SimpleNamespace(
-            is_static_quant=False,
+            is_static_quant=quant_config.is_static_checkpoint if quant_config else False,
             is_quant_ignored=lambda k: False,
         ),
     )
@@ -29,7 +31,7 @@ def _make_stub(num_hidden_layers, first_k_dense_replace, n_routed_experts):
         num_hidden_layers=num_hidden_layers,
         first_k_dense_replace=first_k_dense_replace,
         n_routed_experts=n_routed_experts,
-        quantization_config=None,
+        quantization_config=quant_config,
     )
     return KimiK25ForConditionalGeneration._create_weight_mappings(model, config)
 
@@ -67,3 +69,32 @@ def test_no_target_has_language_model_prefix():
         targets = m.target_path[0] if isinstance(m.target_path, list) else [m.target_path]
         for t in targets:
             assert not t.startswith("language_model."), f"target_path should not have prefix: {t}"
+
+
+def test_int4_moe_weight_mappings():
+    import jax.numpy as jnp
+    from sgl_jax.srt.configs.quantization_config import QuantizationConfig
+
+    quant_config = QuantizationConfig(
+        is_static_checkpoint=True,
+        linear_rules=[],
+        moe_weight_dtype=getattr(jnp, "int4", None) or getattr(jnp, "uint4", None),
+    )
+    mappings = _make_stub(
+        num_hidden_layers=2,
+        first_k_dense_replace=1,
+        n_routed_experts=16,
+        quant_config=quant_config,
+    )
+
+    # Layer 0 (dense) linear weights should be unquantized (.weight)
+    assert "language_model.model.layers.0.mlp.gate_proj.weight" in mappings
+
+    # Layer 1 (MoE) expert weights should use weight_packed
+    expert_group_wi_0 = mappings["__MOE_EXPERTS__model.layers.1.mlp.wi_0"]
+    assert any(".weight_packed" in k for k in expert_group_wi_0.target_path[1:])
+
+    # Layer 1 (MoE) scales should use .weight_scale
+    scale_group_wi_0 = mappings["__MOE_EXPERTS__model.layers.1.mlp.wi_0_scale"]
+    assert any(".weight_scale" in k for k in scale_group_wi_0.target_path[1:])
+
