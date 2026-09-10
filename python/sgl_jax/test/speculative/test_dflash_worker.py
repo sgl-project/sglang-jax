@@ -2,10 +2,19 @@ from types import SimpleNamespace
 
 import jax
 import numpy as np
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.attention.flashattention_backend import _pad_page_indices
+from sgl_jax.srt.layers.logits_processor import LogitsMetadata
 from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput, _mask_draft_kv_writes
-from sgl_jax.srt.speculative.dflash_worker import DFlashWorker
+from sgl_jax.srt.speculative.dflash_worker import (
+    DFlashWorker,
+    DraftForwardPlan,
+    _configure_draft_swa_mapping,
+    _resolve_dflash_query_block_size,
+)
+from sgl_jax.srt.speculative.draft_extend_fused import _per_dp_cumsum_device
 
 
 def _bare_worker(**attrs):
@@ -13,6 +22,47 @@ def _bare_worker(**attrs):
     for k, v in attrs.items():
         object.__setattr__(w, k, v)
     return w
+
+
+def test_per_dp_cumsum_preserves_explicit_sharding():
+    mesh = jax.sharding.Mesh(
+        np.asarray(jax.devices()[:1]).reshape(1, 1),
+        ("data", "tensor"),
+        axis_types=(jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit),
+    )
+    sharding = NamedSharding(mesh, P("data"))
+    with jax.set_mesh(mesh):
+        lens = jax.device_put(np.asarray([4, 0], dtype=np.int32), sharding)
+        result = jax.jit(lambda values: _per_dp_cumsum_device(values, 1))(lens)
+
+    np.testing.assert_array_equal(np.asarray(result), np.asarray([0, 4, 4]))
+    assert result.sharding.spec == P("data")
+
+
+def test_dflash_runtime_query_width_uses_requested_nst():
+    assert _resolve_dflash_query_block_size(4, 16) == 4
+    with np.testing.assert_raises_regex(ValueError, "exceeds.*checkpoint canvas"):
+        _resolve_dflash_query_block_size(17, 16)
+
+
+def test_dflash_only_uses_swa_mapping_for_swa_backed_draft_layers():
+    mapping = np.array([0, 4, 7], dtype=np.int32)
+    allocator = SimpleNamespace(full_to_swa_index_mapping=mapping)
+    full_pool = SimpleNamespace(swa_layer_nums=0, full_to_swa_index_mapping="stale")
+    full_backend = SimpleNamespace(swa_index_mapping="stale")
+
+    _configure_draft_swa_mapping(full_pool, full_backend, allocator, draft_layers=5)
+
+    assert full_pool.full_to_swa_index_mapping is None
+    assert full_backend.swa_index_mapping is None
+
+    swa_pool = SimpleNamespace(swa_layer_nums=5, full_to_swa_index_mapping=None)
+    swa_backend = SimpleNamespace(swa_index_mapping=None)
+
+    _configure_draft_swa_mapping(swa_pool, swa_backend, allocator, draft_layers=5)
+
+    assert swa_pool.full_to_swa_index_mapping is mapping
+    assert swa_backend.swa_index_mapping is mapping
 
 
 def test_prefill_draft_extend_metadata_preserves_dp_rank_sections():
@@ -56,7 +106,7 @@ def test_draft_extend_masks_unaccepted_and_padded_rows():
 
 
 def test_verify_bucket_template_is_cached_by_active_slots():
-    mesh = jax.sharding.Mesh(np.asarray(jax.devices()).reshape(1, 1), ("data", "tensor"))
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()).reshape(1, -1), ("data", "tensor"))
     worker = _bare_worker(
         block_size=4,
         mesh=mesh,
@@ -79,6 +129,10 @@ def test_verify_bucket_template_is_cached_by_active_slots():
         np.asarray(first.active_mask), np.array([True, False, True, False])
     )
     np.testing.assert_array_equal(np.asarray(first.distribution), np.array([0, 2, 2]))
+
+    draft = worker._get_verify_bucket_template(mwb, bs=4, block_size=16)
+    assert draft is not first
+    np.testing.assert_array_equal(draft.extend_seq_lens, np.array([16, 0, 16, 0]))
 
 
 def test_build_page_indices_preserves_dp_rank_sections():
@@ -280,3 +334,72 @@ def test_pad_page_indices_rejects_fixed_capacity_overflow():
             max_num_seqs=2,
             fixed_capacity=8,
         )
+
+
+def test_target_verify_plan_rebuilds_metadata_with_target_backend(monkeypatch):
+    target_metadata = object()
+    calls = []
+
+    class TargetBackend:
+        def get_eagle_forward_metadata(self, batch, **kwargs):
+            calls.append((batch, kwargs))
+            return target_metadata
+
+    target_backend = TargetBackend()
+    worker = _bare_worker(
+        block_size=3,
+        mesh=None,
+        _page_indices_pool_capacity=16,
+        _page_indices_per_seq_capacity=8,
+        _target_worker=SimpleNamespace(model_runner=SimpleNamespace(attn_backend=target_backend)),
+    )
+    template = SimpleNamespace(
+        extend_seq_lens=np.array([3], dtype=np.int32),
+        cu_q_lens=np.array([0, 3], dtype=np.int32),
+        active_mask=np.array([True]),
+        distribution=np.array([0, 1, 1], dtype=np.int32),
+    )
+    worker._get_verify_bucket_template = lambda _batch, _bs: template
+    monkeypatch.setattr(
+        LogitsMetadata,
+        "from_model_worker_batch",
+        staticmethod(lambda _batch, _mesh: "logits-metadata"),
+    )
+
+    base_batch = SimpleNamespace(
+        dp_size=1,
+        sampling_info=SimpleNamespace(
+            temperatures=np.ones((1, 1), dtype=np.float32),
+            top_ks=np.ones((1, 1), dtype=np.int32),
+            top_ps=np.ones((1, 1), dtype=np.float32),
+        ),
+    )
+    draft_forward_batch = SimpleNamespace()
+    draft_plan = DraftForwardPlan(
+        forward_batch=draft_forward_batch,
+        forward_metadata=object(),
+        page_indices=np.array([2, 4, 0, 0], dtype=np.int32),
+        seq_lens=np.array([9], dtype=np.int32),
+        target_prefix_lens=np.array([8], dtype=np.int32),
+        positions_host=np.array([8, 9, 10], dtype=np.int32),
+        allocated_lens=np.array([11], dtype=np.int32),
+        reservation_base_lens=np.array([8], dtype=np.int32),
+        relay_future_indices=np.array([0], dtype=np.int32),
+        relay_valid_mask=np.array([True]),
+        use_relay_state=False,
+        dp_size=1,
+        bs=1,
+    )
+
+    plan = worker._build_target_verify_plan(
+        base_batch,
+        draft_plan,
+        draft_token=np.array([7, 8, 9], dtype=np.int32),
+        resolved_target_prefix_lens=np.array([8], dtype=np.int32),
+        resolved_positions=np.array([8, 9, 10], dtype=np.int32),
+        resolved_cache_loc=np.array([20, 21, 22], dtype=np.int32),
+    )
+
+    assert plan.forward_metadata is target_metadata
+    assert calls[0][1]["page_indices"] is draft_plan.page_indices
+    assert plan.forward_batch.attn_backend is target_backend

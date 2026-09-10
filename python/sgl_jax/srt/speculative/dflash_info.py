@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.tree_util import register_pytree_node_class
 
+from sgl_jax.srt.layers.binary_search import topk_mask, topp_mask
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
 
 
@@ -122,6 +123,119 @@ def dflash_greedy_verify(
 
     accept_lens_out = (accept_len_draft + 1).astype(jnp.int32)
     return accept_lens_out, target_predict_flat, bonus, accept_len_draft.astype(jnp.int32)
+
+
+def dflash_target_only_verify(
+    draft_token: jax.Array,
+    target_logits: jax.Array,
+    temperatures: jax.Array,
+    top_ks: jax.Array,
+    top_ps: jax.Array,
+    rng_key: jax.Array,
+    *,
+    draft_token_num: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Verify a linear DFlash proposal with target-only rejection sampling.
+
+    DFlash does not expose proposal probabilities. As in the TPU vLLM path,
+    each draft token is therefore accepted with probability ``p_target(token)``.
+    On rejection, the replacement is sampled from the target distribution with
+    the rejected draft token removed. If every proposal is accepted, the final
+    token is sampled from the target distribution at the bonus position.
+    """
+    block_size = int(draft_token_num)
+    candidates = draft_token.reshape((-1, block_size))
+    batch_size = candidates.shape[0]
+    vocab_size = target_logits.shape[-1]
+    temperatures = temperatures.reshape((batch_size, 1))
+    top_ks = top_ks.reshape((batch_size, 1))
+    top_ps = top_ps.reshape((batch_size, 1))
+
+    mesh = getattr(jax.typeof(target_logits).sharding, "mesh", None)
+    if mesh is not None and getattr(mesh, "empty", False):
+        mesh = None
+    target_logits = target_logits.reshape((batch_size, block_size, vocab_size))
+
+    def _verify_local(local_candidates, local_logits, local_temps, local_top_ks, local_top_ps, key):
+        local_bs = local_candidates.shape[0]
+        param_shape = (local_bs, block_size)
+        expanded_top_ks = jnp.broadcast_to(local_top_ks.reshape(-1, 1), param_shape)
+        expanded_top_ps = jnp.broadcast_to(local_top_ps.reshape(-1, 1), param_shape)
+        expanded_temperatures = jnp.broadcast_to(local_temps.reshape(-1, 1), param_shape)
+        expanded_top_ks = jnp.where(expanded_top_ks > 0, expanded_top_ks, vocab_size)
+
+        logits = local_logits.reshape((-1, vocab_size)).astype(jnp.float32)
+        logits = topk_mask(logits, expanded_top_ks.reshape(-1), replace_val=-jnp.inf)
+        logits = topp_mask(logits, expanded_top_ps.reshape(-1), replace_val=-jnp.inf)
+        logits = logits / jnp.maximum(expanded_temperatures.reshape(-1, 1), 1e-5)
+        logits = logits.reshape((local_bs, block_size, vocab_size))
+        target_probs = jax.nn.softmax(logits, axis=-1)
+
+        proposals = local_candidates[:, 1:]
+        proposal_probs = jnp.take_along_axis(
+            target_probs[:, :-1, :], proposals[:, :, None], axis=-1
+        ).squeeze(-1)
+        accept_key, recovery_key, bonus_key = jax.random.split(key, 3)
+        accepted = jax.random.uniform(accept_key, proposal_probs.shape) < proposal_probs
+        accepted_prefix = jnp.cumprod(accepted.astype(jnp.int32), axis=1)
+        accepted_drafts = jnp.sum(accepted_prefix, axis=1).astype(jnp.int32)
+
+        rejected_logits = jnp.where(
+            jax.nn.one_hot(proposals, vocab_size, dtype=jnp.bool_),
+            -jnp.inf,
+            logits[:, :-1, :],
+        )
+        recovered = jax.random.categorical(recovery_key, rejected_logits, axis=-1).astype(jnp.int32)
+        bonus = jax.random.categorical(bonus_key, logits[:, -1, :], axis=-1).astype(jnp.int32)
+
+        output = jnp.zeros((local_bs, block_size), dtype=jnp.int32)
+        for position in range(block_size - 1):
+            output = output.at[:, position].set(
+                jnp.where(
+                    position < accepted_drafts,
+                    proposals[:, position],
+                    jnp.where(position == accepted_drafts, recovered[:, position], 0),
+                )
+            )
+        output = output.at[:, -1].set(jnp.where(accepted_drafts == block_size - 1, bonus, 0))
+        verified_id = jnp.take_along_axis(output, accepted_drafts[:, None], axis=1).reshape(-1)
+        return accepted_drafts + 1, output.reshape(-1), verified_id, accepted_drafts
+
+    if mesh is None:
+        return _verify_local(candidates, target_logits, temperatures, top_ks, top_ps, rng_key)
+
+    from jax.sharding import NamedSharding
+    from jax.sharding import PartitionSpec as P
+
+    candidates = jax.sharding.reshard(candidates, NamedSharding(mesh, P("data", None)))
+    target_logits = jax.sharding.reshard(target_logits, NamedSharding(mesh, P("data", None, None)))
+    temperatures = jax.sharding.reshard(temperatures, NamedSharding(mesh, P("data", None)))
+    top_ks = jax.sharding.reshard(top_ks, NamedSharding(mesh, P("data", None)))
+    top_ps = jax.sharding.reshard(top_ps, NamedSharding(mesh, P("data", None)))
+
+    def _verify_shard(local_candidates, local_logits, local_temps, local_top_ks, local_top_ps, key):
+        return _verify_local(
+            local_candidates,
+            local_logits,
+            local_temps,
+            local_top_ks,
+            local_top_ps,
+            jax.random.fold_in(key, jax.lax.axis_index("data")),
+        )
+
+    return jax.shard_map(
+        _verify_shard,
+        mesh=mesh,
+        in_specs=(
+            P("data", None),
+            P("data", None, None),
+            P("data", None),
+            P("data", None),
+            P("data", None),
+            P(),
+        ),
+        out_specs=(P("data"), P("data"), P("data"), P("data")),
+    )(candidates, target_logits, temperatures, top_ks, top_ps, rng_key)
 
 
 @dataclass

@@ -8,6 +8,7 @@ from sgl_jax.srt.speculative.dflash_info import (
     DFlashVerifyInput,
     build_dflash_draft_block,
     dflash_greedy_verify,
+    dflash_target_only_verify,
 )
 from sgl_jax.srt.speculative.overlap_utils import (
     can_merge_spec_non_overlap_prefill,
@@ -85,6 +86,64 @@ def test_dflash_greedy_verify_keeps_outputs_data_sharded():
         assert output.sharding.spec == P("data")
     np.testing.assert_array_equal(np.asarray(accept_lens), np.full(bs, 4, dtype=np.int32))
     np.testing.assert_array_equal(np.asarray(verified_id), np.full(bs, 99, dtype=np.int32))
+
+
+def test_dflash_target_only_verify_matches_greedy_with_top_k_one():
+    draft_token = jnp.array([10, 11, 12, 13, 20, 21, 22, 23], dtype=jnp.int32)
+    target_predict = np.array([[11, 12, 13, 99], [21, 77, 88, 99]], dtype=np.int32)
+    logits = np.full((8, 100), -10.0, dtype=np.float32)
+    logits[np.arange(8), target_predict.reshape(-1)] = 10.0
+
+    actual = dflash_target_only_verify(
+        draft_token,
+        jnp.asarray(logits),
+        jnp.ones((2, 1), dtype=jnp.float32),
+        jnp.ones((2, 1), dtype=jnp.int32),
+        jnp.ones((2, 1), dtype=jnp.float32),
+        jax.random.PRNGKey(7),
+        draft_token_num=4,
+    )
+    expected = dflash_greedy_verify(
+        draft_token,
+        jnp.asarray(logits),
+        draft_token_num=4,
+    )
+
+    np.testing.assert_array_equal(np.asarray(actual[0]), np.asarray(expected[0]))
+    np.testing.assert_array_equal(np.asarray(actual[2]), np.asarray(expected[2]))
+    np.testing.assert_array_equal(np.asarray(actual[3]), np.asarray(expected[3]))
+    expected_rows = np.asarray(expected[1]).reshape(2, 4)
+    for index, (row, accepted) in enumerate(
+        zip(np.asarray(actual[1]).reshape(2, 4), np.asarray(actual[0]))
+    ):
+        expected_row = expected_rows[index]
+        np.testing.assert_array_equal(row[:accepted], expected_row[:accepted])
+
+
+def test_dflash_target_only_verify_accepts_by_target_probability():
+    draft_token = jnp.array([10, 11, 12, 13], dtype=jnp.int32)
+    logits = np.full((4, 32), -20.0, dtype=np.float32)
+    logits[0, 11] = 20.0
+    logits[1, 15] = 20.0
+    logits[2, 13] = 20.0
+    logits[3, 16] = 20.0
+
+    accept_lens, output, verified_id, accepted_drafts = dflash_target_only_verify(
+        draft_token,
+        jnp.asarray(logits),
+        jnp.ones((1, 1), dtype=jnp.float32),
+        jnp.full((1, 1), 32, dtype=jnp.int32),
+        jnp.ones((1, 1), dtype=jnp.float32),
+        jax.random.PRNGKey(0),
+        draft_token_num=4,
+    )
+
+    # The first proposal has probability one. The second has probability zero,
+    # so it is rejected and replaced by the only non-negligible token, 15.
+    np.testing.assert_array_equal(np.asarray(accept_lens), np.array([2], dtype=np.int32))
+    np.testing.assert_array_equal(np.asarray(accepted_drafts), np.array([1], dtype=np.int32))
+    np.testing.assert_array_equal(np.asarray(output)[:2], np.array([11, 15], dtype=np.int32))
+    np.testing.assert_array_equal(np.asarray(verified_id), np.array([15], dtype=np.int32))
 
 
 def test_dflash_draft_input_filter_batch():
