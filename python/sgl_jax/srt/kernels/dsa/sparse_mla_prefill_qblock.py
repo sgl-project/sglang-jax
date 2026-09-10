@@ -331,7 +331,6 @@ def sparse_mla_attention_qblock(
         base_tok = base_pages * ps  # [S]
         if kv.shape[-1] != Dk_pad:
             raise ValueError(f"paged cache last dim {kv.shape[-1]} != Dk_pad {Dk_pad}")
-        num_pages = kv.shape[0]
         kv2 = kv  # native 4D pool; flattened inside the kernel (HBM ref view)
         pt_arg = page_indices.reshape(1, 1, 1, PTW).astype(jnp.int32)
     else:
