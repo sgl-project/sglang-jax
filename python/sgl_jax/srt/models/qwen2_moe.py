@@ -69,11 +69,16 @@ class Qwen2MoeMLP(nnx.Module):
 
         self.act_fn = jax.nn.silu
 
-    def __call__(self, hidden_states: jax.Array):
+    def __call__(
+        self,
+        hidden_states: jax.Array,
+        *,
+        out_sharding: jax.sharding.Sharding | None = None,
+    ):
         a1, _ = self.gate_proj(hidden_states)
         a2, _ = self.up_proj(hidden_states)
         intermediate_parallel = a2 * self.act_fn(a1)
-        output, _ = self.down_proj(intermediate_parallel)
+        output, _ = self.down_proj(intermediate_parallel, out_sharding=out_sharding)
         return output
 
 

@@ -48,6 +48,7 @@ from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
 from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.qwen2_moe import Qwen2MoeMLP
+from sgl_jax.srt.utils.parallel_utils import make_reduce_sharding
 from sgl_jax.srt.utils.weight_utils import WeightMapping
 
 logger = logging.getLogger(__name__)
@@ -143,7 +144,15 @@ class Qwen3_5Attention(nnx.Module):
             layer_id=layer_id,
         )
 
-    def __call__(self, positions, hidden_states, forward_batch, token_to_kv_pool):
+    def __call__(
+        self,
+        positions,
+        hidden_states,
+        forward_batch,
+        token_to_kv_pool,
+        *,
+        out_sharding: jax.sharding.Sharding | None = None,
+    ):
         T = hidden_states.shape[0]
         q_raw, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
@@ -198,7 +207,7 @@ class Qwen3_5Attention(nnx.Module):
             attn_out = attn_out * jax.nn.sigmoid(gate)
             attn_out = attn_out.reshape(T, self.num_heads * self.head_dim)
 
-        out, _ = self.o_proj(attn_out)
+        out, _ = self.o_proj(attn_out, out_sharding=out_sharding)
         return out, kv_fused
 
 
@@ -319,7 +328,15 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         )
         return core_out * jax.nn.silu(z)
 
-    def __call__(self, positions, hidden_states, forward_batch, recurrent_state_pool):
+    def __call__(
+        self,
+        positions,
+        hidden_states,
+        forward_batch,
+        recurrent_state_pool,
+        *,
+        out_sharding: jax.sharding.Sharding | None = None,
+    ):
         del positions  # GDN is position-agnostic.
         qkvz, _ = self.in_proj_qkvz(hidden_states)  # [T, 2*key_dim + 2*value_dim]
         ba, _ = self.in_proj_ba(hidden_states)  # [T, 2*num_v_heads]
@@ -335,7 +352,7 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         core_out, attn_state = self.self_attn(forward_batch, q, k, v, a, b, recurrent_state_pool)
         # core_out: [T, value_dim] -> per-head RMSNorm + silu(z) gate.
         core_out = self._norm_gate(core_out, z)
-        out, _ = self.out_proj(core_out)
+        out, _ = self.out_proj(core_out, out_sharding=out_sharding)
         return out, attn_state
 
 
@@ -352,6 +369,7 @@ class Qwen3_5MoeBlock(nnx.Module):
     ):
         text_cfg = config.text_config
         self.layer_id = layer_id
+        self.mesh = mesh
         hidden = text_cfg.hidden_size
         inter = text_cfg.moe_intermediate_size
         se_inter = text_cfg.shared_expert_intermediate_size
@@ -404,17 +422,38 @@ class Qwen3_5MoeBlock(nnx.Module):
             scope_name="shared_expert_gate",
         )
 
-    def __call__(self, hidden_states, forward_batch, dispatch_info=None):
-        shared_out = self.shared_experts(hidden_states)
-        gate_logit, _ = self.shared_expert_gate(hidden_states)  # [T, 1]
+    def __call__(
+        self,
+        hidden_states,
+        forward_batch,
+        dispatch_info=None,
+        *,
+        out_sharding: jax.sharding.Sharding | None = None,
+    ):
+        shared_out = self.shared_experts(hidden_states, out_sharding=out_sharding)
+        gate_logit, _ = self.shared_expert_gate(hidden_states, out_sharding=out_sharding)  # [T, 1]
         shared_out = jax.nn.sigmoid(gate_logit) * shared_out
 
         router_logits = self.moe_gate(hidden_states)
-        topk_weights, topk_ids = self.topk(router_logits, dispatch_info=dispatch_info)
-        token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
+        topk_weights, topk_ids = self.topk(
+            router_logits,
+            dispatch_info=dispatch_info,
+            routing_sharding=out_sharding,
+        )
+        mask_sharding = (
+            NamedSharding(self.mesh, P(out_sharding.spec[0])) if out_sharding is not None else None
+        )
+        token_valid_mask = forward_batch.get_token_valid_mask(
+            hidden_states.shape[0], out_sharding=mask_sharding
+        )
         topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
 
-        routed_out = self.experts(hidden_states, topk_weights, topk_ids)
+        routed_out = self.experts(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            out_sharding=out_sharding,
+        )
         return routed_out + shared_out, jax.sharding.reshard(topk_ids, P(None))
 
 
@@ -430,6 +469,8 @@ class Qwen3_5DecoderLayer(nnx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
     ):
         text_cfg = config.text_config
+        self.mesh = mesh
+        self.enable_sequence_parallel = getattr(config, "enable_sequence_parallel", False)
         self.is_full_attn = layer_id in text_cfg.full_attention_layer_ids
         self.is_moe = text_cfg.is_moe
 
@@ -464,6 +505,10 @@ class Qwen3_5DecoderLayer(nnx.Module):
         residual=None,
         dispatch_info: ExpertLocationMetadata | None = None,
     ):
+        reduce_sharding = make_reduce_sharding(
+            hidden_states, self.mesh, enable_sp=self.enable_sequence_parallel
+        )
+
         # Deferred-residual pre-norm pattern (mirrors qwen2_moe / kimi_linear).
         if residual is None:
             residual = hidden_states
@@ -477,18 +522,30 @@ class Qwen3_5DecoderLayer(nnx.Module):
             pool = memory_pools.token_to_kv_pool
         else:
             pool = memory_pools.recurrent_state_pool
-        hidden_states, attn_state = self.self_attn(positions, hidden_states, forward_batch, pool)
+        hidden_states, attn_state = self.self_attn(
+            positions,
+            hidden_states,
+            forward_batch,
+            pool,
+            out_sharding=reduce_sharding,
+        )
 
-        hidden_states = hidden_states + residual
+        hidden_states = hidden_states + jax.sharding.reshard(residual, reduce_sharding)
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
         # MoE MLP consumes routing info and returns topk_ids; dense takes only hidden.
         if self.is_moe:
-            hidden_states, topk_ids = self.mlp(hidden_states, forward_batch, dispatch_info)
+            hidden_states, topk_ids = self.mlp(
+                hidden_states,
+                forward_batch,
+                dispatch_info,
+                out_sharding=reduce_sharding,
+            )
         else:
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.mlp(hidden_states, out_sharding=reduce_sharding)
             topk_ids = None
+        residual = jax.sharding.reshard(residual, reduce_sharding)
         return hidden_states, residual, attn_state, topk_ids
 
 
