@@ -394,6 +394,11 @@ class DFlashDraftModel(nnx.Module):
         output = LogitsProcessorOutput(next_token_logits=None, hidden_states=hidden_states)
         return output, {"token_to_kv_pool": layers_kv_fused}, [], None
 
+    def sample_block_tokens(
+        self, base_logits: jax.Array, first_prev_tokens: jax.Array
+    ) -> jax.Array:
+        return jnp.argmax(base_logits, axis=-1).astype(jnp.int32)
+
     def load_weights(self, model_config: ModelConfig) -> None:
         loader = WeightLoader(
             model=self,

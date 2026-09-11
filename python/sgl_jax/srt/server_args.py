@@ -1584,7 +1584,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "DFLASH"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "DFLASH", "DSPARK"],
             help="Speculative algorithm.",
             default=ServerArgs.speculative_algorithm,
         )
@@ -1625,7 +1625,7 @@ class ServerArgs:
             "--speculative-sample-from-anchor",
             action="store_true",
             help="Sample draft candidates starting at the anchor output position "
-            "(currently DFLASH only). "
+            "(DFLASH or DSPARK). "
             "Draft query length is --speculative-num-draft-tokens minus one; "
             "the latter remains the target verify length including the seed.",
         )
@@ -2023,22 +2023,27 @@ class ServerArgs:
                 and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
                 and self.attention_backend == "fa"
             )
-            supports_dflash_overlap = self.speculative_algorithm == "DFLASH"
+            supports_dflash_overlap = self.speculative_algorithm in ("DFLASH", "DSPARK")
             if not (supports_nextn_overlap or supports_eagle3_overlap or supports_dflash_overlap):
                 raise ValueError(
-                    "Speculative overlap scheduler only supports DFLASH, EAGLE3+FA, "
+                    "Speculative overlap scheduler only supports DFLASH/DSPARK, EAGLE3+FA, "
                     "or NEXTN with --speculative-eagle-topk=1 and "
                     "--speculative-num-draft-tokens == --speculative-num-steps + 1. "
                     "Please pass --disable-overlap-schedule for other speculative configs."
                 )
 
-        if self.speculative_sample_from_anchor and self.speculative_algorithm != "DFLASH":
+        if self.speculative_algorithm == "DSPARK":
+            self.speculative_sample_from_anchor = True
+        if self.speculative_sample_from_anchor and self.speculative_algorithm not in (
+            "DFLASH",
+            "DSPARK",
+        ):
             raise ValueError(
-                "--speculative-sample-from-anchor requires --speculative-algorithm DFLASH."
+                "--speculative-sample-from-anchor requires --speculative-algorithm DFLASH or DSPARK."
             )
 
         # DFLASH: non-causal one-shot diffusion draft + linear-chain greedy verify.
-        if self.speculative_algorithm == "DFLASH":
+        if self.speculative_algorithm in ("DFLASH", "DSPARK"):
             if self.tp_size < 1:
                 raise ValueError("DFLASH requires --tp-size>=1.")
             if self.speculative_eagle_topk != 1:

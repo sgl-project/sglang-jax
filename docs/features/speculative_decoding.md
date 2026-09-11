@@ -150,10 +150,56 @@ accepted-context KV materialization retain the full verification width. Both
 layouts use greedy draft sampling and verification.
 
 The flag describes the checkpoint prediction layout, independently of whether
-a Markov head is present. This implementation supports the flag with DFLASH.
-It defaults to false and is not inferred from the checkpoint name or
+a Markov head is present. The flag is supported with DFLASH and DSPARK.
+For DFLASH it defaults to false and is not inferred from the checkpoint name or
 architecture. If the verification width is omitted, the checkpoint's
 `block_size` is used unchanged for the default layout, or incremented by one
 when this flag is set. An explicitly supplied verification width takes precedence.
 Choose the layout using the checkpoint's reference implementation; enabling the
 flag is not itself evidence of checkpoint compatibility or improved acceptance.
+
+
+## DSpark stage1: vanilla Markov head
+
+Use `--speculative-algorithm DSPARK` for DSpark checkpoints with
+`markov_rank > 0` and `markov_head_type="vanilla"`. This selects the dedicated
+DSpark model and worker and automatically enables sampling from the anchor.
+The
+verification width must equal checkpoint `block_size + 1` (for example, 8
+for a block7 checkpoint). If omitted, the verification width is inferred as
+explained above. Draft and target vocabulary sizes must match.
+
+The backbone runs once per block to produce all base logits. Candidates are
+then sampled greedily in sequence:
+
+```text
+previous_token = anchor
+for position in draft_output_positions:
+    logits = base_logits[position] + W2(W1[previous_token])
+    candidate = argmax(logits)
+    previous_token = candidate
+```
+
+The checkpoint supplies `markov_head.markov_w1.weight` (a vocabulary-to-rank
+embedding) and `markov_head.markov_w2.weight` (a rank-to-vocabulary projection).
+The projection is transposed into the JAX linear weight layout and sharded
+along vocabulary across TP ranks; the embedding is replicated. Missing
+required weights cause loading to fail.
+
+Stage1 verifies all candidates at a fixed width. Confidence head weights, if
+present, are unused; there is no confidence-based truncation or dynamic
+verification planning. Gated and recurrent Markov heads are unsupported.
+Checkpoints without a Markov head (`markov_rank` absent or zero) continue to use
+`DFLASH`. The DFLASH path loads only backbone weights; use DSPARK to include the Markov head.
+
+For `deepseek-ai/dspark_qwen3_8b_block7`:
+
+```bash
+--speculative-algorithm DSPARK \
+--speculative-draft-model-path deepseek-ai/dspark_qwen3_8b_block7 \
+--speculative-num-draft-tokens 8 \
+--speculative-num-steps 1 \
+--speculative-eagle-topk 1 \
+--grammar-backend none \
+--disable-overlap-schedule
+```
