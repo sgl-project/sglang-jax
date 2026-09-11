@@ -1,11 +1,10 @@
-import asyncio
-import base64
 import logging
 import math
 import os
 import tempfile
 
 import numpy as np
+import pybase64
 from PIL import Image
 
 from sgl_jax.srt.multimodal.common.modality_enum import (
@@ -45,6 +44,8 @@ _QWEN3VL_ARCHITECTURES = frozenset(
 )
 
 
+# Video preprocessing adapted from SGLang:
+# https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/multimodal/processors/qwen_vl.py
 def smart_resize(
     height: int,
     width: int,
@@ -194,10 +195,10 @@ def preprocess_video(source, video_config: dict) -> np.ndarray:
                 vr = VideoReader(tmp_path, ctx=ctx)
             elif source.startswith("data:") and "base64," in source:
                 payload = source.split("base64,", 1)[1]
-                tmp_path = _write_temp_video(base64.b64decode(payload))
+                tmp_path = _write_temp_video(pybase64.b64decode(payload))
                 vr = VideoReader(tmp_path, ctx=ctx)
             else:
-                tmp_path = _write_temp_video(base64.b64decode(source, validate=True))
+                tmp_path = _write_temp_video(pybase64.b64decode(source, validate=True))
                 vr = VideoReader(tmp_path, ctx=ctx)
         else:
             raise ValueError(f"Unsupported video input type: {type(source)}")
@@ -225,6 +226,7 @@ def preprocess_video(source, video_config: dict) -> np.ndarray:
 class QwenVLProcessor(BaseMultimodalProcessor):
     auto_mm_processor_worker_num = 2
     supports_mm_processor_concurrency = True
+    use_torchcodec_image_decode = True
     models = (
         "Qwen2VLForConditionalGeneration",
         "Qwen2_5_VLForConditionalGeneration",
@@ -250,10 +252,27 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         image_sources = self.normalize_data(image_data)
         video_data = self.normalize_data(getattr(request_obj, "video_data", None))
         video_config = self._build_video_config(request_obj)
-        images, videos = await asyncio.gather(
-            self.load_images_async(image_sources),
-            self._load_videos_async(video_data, video_config),
+        return await self.mm_processor_executor.run(
+            self._process_mm_data,
+            input_text,
+            image_sources,
+            video_data,
+            video_config,
         )
+
+    def _process_mm_data(
+        self,
+        input_text,
+        image_sources,
+        video_data,
+        video_config,
+        *,
+        processor,
+    ) -> MultimodalInputs:
+        images = [self.load_image(source) for source in image_sources]
+        videos = [
+            preprocess_video(self.unwrap_source(source), video_config) for source in video_data
+        ]
         processor_kwargs = {}
         if videos:
             processor_kwargs["videos_kwargs"] = {
@@ -264,10 +283,11 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         if uses_qwen3vl_processor:
             processor_kwargs["return_mm_token_type_ids"] = True
 
-        return await self.process_and_combine_mm_data_async(
+        return self.process_and_combine_mm_data(
             input_text,
             images=images,
             videos=videos,
+            processor=processor,
             **processor_kwargs,
         )
 
@@ -504,14 +524,6 @@ class QwenVLProcessor(BaseMultimodalProcessor):
             raise ValueError("Qwen3-VL has unmatched vision token groups.")
         return result
 
-    async def _load_videos_async(self, video_data, video_config):
-        return await asyncio.gather(
-            *(
-                self._run_io_async(preprocess_video, self.unwrap_source(item), video_config)
-                for item in video_data
-            )
-        )
-
     def _build_video_config(self, request_obj):
         vision_config = self.hf_config.vision_config
         video_config = {"factor": int(vision_config.patch_size * vision_config.spatial_merge_size)}
@@ -522,12 +534,6 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         if nframes is not None and "fps" not in video_config:
             video_config["nframes"] = nframes
         return video_config
-
-    @classmethod
-    def _to_grid_list(cls, value):
-        if value is None:
-            return None
-        return [tuple(int(item) for item in row) for row in cls._to_numpy(value).tolist()]
 
     @classmethod
     def _to_list(cls, value):

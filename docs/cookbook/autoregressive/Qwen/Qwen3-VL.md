@@ -296,7 +296,7 @@ for dataset, batch_size in (("mmmu", 24), ("mmmu_pro", 256)):
 
 ### 4.2 Speed — single multimodal workload
 
-> **Multimodal throughput row.** The workload submits 1,000 requests at an unbounded request rate. Each request contains 1,024 random source-text tokens and one random 512×512 JPEG, averages 1,086.25 text tokens plus 258 vision tokens after chat templating, and generates 500 output tokens. The run uses one warmup request and flushes the cache before measurement.
+> **Multimodal throughput row.** The workload submits 1,000 requests at an unbounded request rate. Each request contains 1,024 random source-text tokens and one random 512×512 JPEG and generates 500 output tokens. The run totals 1,344,206 server-verified input tokens. The run uses one warmup request and flushes the cache before measurement.
 
 **Test Environment**
 
@@ -358,23 +358,26 @@ python -m sgl_jax.bench_serving \
 | Metric | Result |
 |---|---:|
 | Successful requests | 1,000 |
-| Avg text input tokens / request | 1,086.25 |
-| Avg vision input tokens / request | 258.00 |
-| Avg total input tokens / request | 1,344.25 |
-| Output tokens / request | 500 |
-| Mean TTFT | 16,636.34 ms |
-| Median TTFT | 13,818.60 ms |
-| P99 TTFT | 54,075.23 ms |
-| Duration | 64.332 s |
-| Request throughput | 15.544 req/s |
-| Input token throughput | 20,895.61 tok/s |
-| Output token throughput | 7,772.22 tok/s |
-| Total token throughput | 28,667.82 tok/s |
-| Mean TPOT | 73.94 ms |
-| Median TPOT | 77.37 ms |
-| P99 TPOT | 100.26 ms |
-| Median E2E latency | 52,606.81 ms |
-| P99 E2E latency | 63,657.17 ms |
+| Input tokens (server-verified) | 1,344,206 |
+| Output tokens (server-verified) | 500,000 |
+| Duration | 58.634 s |
+| Request throughput | 17.055 req/s |
+| Input token throughput | 22,925.18 tok/s |
+| Output token throughput | 8,527.41 tok/s |
+| Total token throughput | 31,452.59 tok/s |
+| Mean TTFT | 15,937.96 ms |
+| Median TTFT | 13,425.55 ms |
+| P99 TTFT | 49,192.05 ms |
+| Mean TPOT | 65.44 ms |
+| Median TPOT | 68.36 ms |
+| P99 TPOT | 90.18 ms |
+| Mean E2E latency | 48,591.19 ms |
+| Median E2E latency | 47,598.53 ms |
+| P99 E2E latency | 57,846.17 ms |
+| Mean ITL | 66.64 ms |
+| Median ITL | 33.06 ms |
+| P95 ITL | 62.41 ms |
+| P99 ITL | 358.61 ms |
 
 This is a saturated burst workload, so TTFT includes scheduler queueing in addition to media processing, vision encoding, embedding merge, and language-model prefill.
 

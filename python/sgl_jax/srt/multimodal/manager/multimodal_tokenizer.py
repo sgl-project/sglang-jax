@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import dataclasses
 import hashlib
 import io
@@ -20,6 +19,7 @@ import imageio.v3 as iio
 import librosa
 import numpy as np
 import psutil
+import pybase64
 import requests
 import setproctitle
 from PIL import Image
@@ -670,10 +670,10 @@ class MultimodalTokenizer(TokenizerManager):
                     vr = VideoReader(tmp_path, ctx=ctx)
                 elif source.startswith("data:") and "base64," in source:
                     payload = source.split("base64,", 1)[1]
-                    tmp_path = self._write_temp_video(base64.b64decode(payload))
+                    tmp_path = self._write_temp_video(pybase64.b64decode(payload))
                     vr = VideoReader(tmp_path, ctx=ctx)
                 else:
-                    tmp_path = self._write_temp_video(base64.b64decode(source, validate=True))
+                    tmp_path = self._write_temp_video(pybase64.b64decode(source, validate=True))
                     vr = VideoReader(tmp_path, ctx=ctx)
             else:
                 raise ValueError(f"Unsupported video input type: {type(source)}")
@@ -762,9 +762,9 @@ class MultimodalTokenizer(TokenizerManager):
             return Image.open(io.BytesIO(resp.content)).convert("RGB")
         if source.startswith("data:") and "base64," in source:
             payload = source.split("base64,", 1)[1]
-            return Image.open(io.BytesIO(base64.b64decode(payload))).convert("RGB")
+            return Image.open(io.BytesIO(pybase64.b64decode(payload))).convert("RGB")
         try:
-            return Image.open(io.BytesIO(base64.b64decode(source, validate=True))).convert("RGB")
+            return Image.open(io.BytesIO(pybase64.b64decode(source, validate=True))).convert("RGB")
         except Exception as exc:
             raise ValueError("Unsupported image source format") from exc
 
