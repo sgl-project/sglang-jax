@@ -20,6 +20,7 @@
 
 import enum
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -616,6 +617,139 @@ def prepare_outputs(out):
     return out
 
 
+# ----------------------------------------------------------------------------
+# Exit-stage selection: SparseCore radix select (exact) vs XLA approx_max_k.
+#
+# ``jax.lax.approx_max_k(recall_target=1.0)`` lowers to a full sort of every row on
+# TPU (XLA short-circuits recall_target == 1.0 to log2_reduction=0), which at
+# DeepSeek-V4 scale (E = 262144 compressed entries per query, k=512) is 56% (decode
+# B=64) to 84% (prefill T=2048) of this kernel's wall time on v7x. The vendored
+# SparseCore MSB radix-select kernel (``sc_topk``) is exact and 4-6x faster on that
+# stage on both v6e and v7x. Small rows are cheaper on the XLA path (fixed SC launch
+# cost), so the policy below keeps them there.
+# ----------------------------------------------------------------------------
+
+# Rows shorter than this stay on the XLA path. Measured: E=256 rows are ~30% slower on
+# SparseCore, E=25000 rows are ~2.3x faster; tokamax switches to cooperative subcores
+# above 4096 entries. Override with DSA_SC_TOPK_MIN_ENTRIES. Both env vars are read
+# when the calling function is traced (jit-cached afterwards).
+SC_TOPK_MIN_ENTRIES = int(os.environ.get("DSA_SC_TOPK_MIN_ENTRIES", "8192"))
+# Fraction of one SparseCore subcore's VMEM the kernel may use for its per-subcore
+# key + value slice (the rest holds histograms, output buffers and the carry-forward).
+_SC_TOPK_VMEM_BUDGET = 0.5
+# Above this many entries the vendored kernel splits each row across all subcores of a
+# core (``num_cooperating_tiles = mesh.num_subcores``); at or below it one subcore
+# owns the whole row.
+_SC_TOPK_COOPERATIVE_ABOVE = 4096
+_SC_TOPK_KEY_VALUE_BYTES = 8  # f32 key + int32 value per candidate
+
+
+@functools.lru_cache(maxsize=1)
+def _sparse_core_info():
+    """SparseCore geometry of the current TPU (cached), or None when unavailable."""
+    if jax.default_backend() != "tpu":
+        return None
+    try:
+        info = pltpu.get_tpu_info()
+    except (RuntimeError, ValueError):
+        return None
+    if getattr(info, "generation", 0) < 6 or getattr(info, "sparse_core", None) is None:
+        return None
+    return info.sparse_core
+
+
+def sc_topk_available() -> bool:
+    """True when the SparseCore radix-select kernel can run on this device.
+
+    DSA_SC_TOPK=0 disables the path; the check runs at trace time of the caller.
+    """
+    return os.environ.get("DSA_SC_TOPK", "1") != "0" and _sparse_core_info() is not None
+
+
+def _sc_topk_max_entries(info) -> int:
+    """Largest row whose per-subcore key+value slice fits the VMEM budget."""
+    per_subcore = int(info.vmem_capacity_bytes * _SC_TOPK_VMEM_BUDGET)
+    per_subcore //= _SC_TOPK_KEY_VALUE_BYTES
+    per_subcore -= per_subcore % info.num_lanes
+    return per_subcore * info.num_subcores
+
+
+def should_use_sc_topk(num_entries: int, batch: int) -> bool:
+    """Routing policy for the exit-stage top-k: pure function of shape and device.
+
+    Evaluated on the device the caller is traced on; off-TPU it is always False.
+    """
+    del batch  # the kernel handles any batch; kept in the signature for future tuning
+    info = _sparse_core_info()
+    if info is None or num_entries < SC_TOPK_MIN_ENTRIES:
+        return False
+    return num_entries <= _sc_topk_max_entries(info)
+
+
+def _sc_padded_width(n: int, info) -> int:
+    """Smallest width >= n satisfying the kernel's layout constraints: the row is split
+    into ``num_subcores`` tiles above the cooperative threshold (one tile below it), and
+    each tile must be a whole number of ``num_lanes``-wide vectors."""
+    tiles = 1 if n <= _SC_TOPK_COOPERATIVE_ABOVE else info.num_subcores
+    unit = tiles * info.num_lanes
+    padded = -(-n // unit) * unit
+    if n <= _SC_TOPK_COOPERATIVE_ABOVE < padded:  # padding crossed the threshold
+        unit = info.num_subcores * info.num_lanes
+        padded = -(-n // unit) * unit
+    return padded
+
+
+def _sc_select(scores: jax.Array, k: int) -> jax.Array:
+    from sgl_jax.srt.kernels.dsa import sc_topk
+
+    info = _sparse_core_info()
+    if info is None:
+        raise ValueError(
+            "SparseCore top-k requested but no SparseCore is available on backend "
+            f"{jax.default_backend()!r}; use topk_backend='xla' or 'auto'."
+        )
+    n = scores.shape[-1]
+    padded = _sc_padded_width(n, info)
+    if padded != n:
+        scores = jnp.pad(scores, ((0, 0), (0, padded - n)), constant_values=-jnp.inf)
+    vals, idxs = sc_topk.top_k(keys=scores, k=k, num_seq_windows=1, digit_width=4, num_digits=8)
+    # The kernel does not order its output; the indexer contract is descending values
+    # with -1 (from -inf) packed at the tail.
+    vals, idxs = jax.lax.sort((vals, idxs), dimension=-1)
+    vals, idxs = jnp.flip(vals, axis=-1), jnp.flip(idxs, axis=-1)
+    return jnp.where(vals == -jnp.inf, -1, idxs)
+
+
+def _xla_select(scores: jax.Array, k: int) -> jax.Array:
+    # jax.lax.approx_max_k(recall_target=1.0) is equivalent to jax.lax.top_k
+    # but faster.
+    top_vals, top_idxs = jax.lax.approx_max_k(scores, k, reduction_dimension=-1, recall_target=1.0)
+    return jnp.where(top_vals == -jnp.inf, -1, top_idxs)
+
+
+def select_topk_indices(scores: jax.Array, k: int, *, backend: str = "auto") -> jax.Array:
+    """Exact top-k indices of ``scores`` ([T, E] f32, -inf = invalid), descending, -1 tail.
+
+    backend: "auto" routes by ``should_use_sc_topk``; "sc" / "xla" force a path.
+    """
+    if scores.shape[-1] < k:
+        scores = jnp.pad(scores, ((0, 0), (0, k - scores.shape[-1])), constant_values=-jnp.inf)
+    if backend == "auto":
+        use_sc = sc_topk_available() and should_use_sc_topk(scores.shape[-1], scores.shape[0])
+    elif backend == "sc":
+        if not sc_topk_available():
+            raise ValueError(
+                "topk_backend='sc' requires a TPU with a SparseCore (v6e or newer) and "
+                "DSA_SC_TOPK unset or != '0'."
+            )
+        use_sc = True
+    elif backend == "xla":
+        use_sc = False
+    else:
+        raise ValueError(f"unknown top-k backend {backend!r}; expected auto | sc | xla")
+    return _sc_select(scores, k) if use_sc else _xla_select(scores, k)
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -625,6 +759,7 @@ def prepare_outputs(out):
         "num_queries_per_block",
         "vmem_limit_bytes",
         "decode_req_batch_size",
+        "topk_backend",
     ),
 )
 def streamindex_topk(
@@ -642,6 +777,7 @@ def streamindex_topk(
     num_queries_per_block: tuple[int, int, int] | int | None = None,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     decode_req_batch_size: int = 4,
+    topk_backend: str = "auto",
 ) -> jax.Array:
     """StreamIndex Top-K retrieval.
 
@@ -663,6 +799,8 @@ def streamindex_topk(
       num_queries_per_block: number of queries to be processed in one block in the
         pallas kernel. This is a tuple of (decode, prefill, mixed) cases.
       vmem_limit_bytes: the vmem limit for the pallas kernel.
+      topk_backend: exit-stage selector: "auto" (SparseCore radix select when
+        available and the row is large enough, else XLA), "sc" or "xla".
 
     Returns:
       Top-K indices (in compressed space).
@@ -903,22 +1041,7 @@ def streamindex_topk(
     )
 
     scores = scores.reshape(q.shape[0], -1)
-    if scores.shape[1] < k:
-        scores = jnp.pad(
-            scores,
-            ((0, 0), (0, k - scores.shape[1])),
-            constant_values=-jnp.inf,
-        )
-
-    # TODO: Re-evaluate replacing this with the sparsecore_topk kernel
-    # once SparseCore supports direct VMEM access (e.g., on TPU v8).
-    # Currently, jax.lax.approx_max_k wins due to the HBM read/write tax, but
-    # direct VMEM streaming will allow SC to beat TensorCore performance.
-
-    # jax.lax.approx_max_k(recall_target=1.0) is equivalent to jax.lax.top_k
-    # but faster.
-    top_vals, top_idxs = jax.lax.approx_max_k(scores, k, reduction_dimension=-1, recall_target=1.0)
-    topk_idxs = jnp.where(top_vals == -jnp.inf, -1, top_idxs)
+    topk_idxs = select_topk_indices(scores, k, backend=topk_backend)
     return topk_idxs[: q.shape[0], :k]
 
 
