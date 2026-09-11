@@ -35,7 +35,7 @@ from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
-_ILV_FIX = os.environ.get("SGLANG_ROTARY_ILV_FIX", "0") == "1"
+_ILV_FIX = os.environ.get("SGLANG_ROTARY_ILV_FIX", "1") == "1"
 
 
 @partial(jax.jit, static_argnames=("quantized_dtype",))

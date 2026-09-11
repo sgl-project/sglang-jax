@@ -568,7 +568,7 @@ def rotary_embedding_forward(
     return query, key
 
 
-_ILV_FIX = os.environ.get("SGLANG_ROTARY_ILV_FIX", "0") == "1"
+_ILV_FIX = os.environ.get("SGLANG_ROTARY_ILV_FIX", "1") == "1"
 
 
 # @partial(jax.jit, static_argnames=["is_neox_style"])
