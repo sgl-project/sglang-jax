@@ -185,7 +185,7 @@ class TestWriteThrough(HiCacheE2EBase):
         self.assertEqual(node.hit_count, 0)
 
         # Second insert (prefix reuse): hit_count crosses threshold -> backup.
-        self.cache.insert(InsertParams(key=_key(tokens), value=idx))
+        self.cache.insert(InsertParams(key=_key(tokens), value=idx, prev_prefix_len=len(idx)))
         self.assertTrue(node.backuped)
         self.assertEqual(len(node.component_data[0].host_value), self._pages(len(tokens)))
         # The device lock is taken only around the synchronous gather inside
@@ -208,9 +208,13 @@ class TestWriteThrough(HiCacheE2EBase):
         idx, _ = self._alloc_and_fill(len(tokens), seed=2)
         self.cache.insert(InsertParams(key=_key(tokens), value=idx))
         node = self._child_of_root()
-        self.cache.insert(InsertParams(key=_key(tokens), value=idx))  # hit_count=1
+        self.cache.insert(
+            InsertParams(key=_key(tokens), value=idx, prev_prefix_len=len(idx))
+        )  # hit_count=1
         self.assertFalse(node.backuped)
-        self.cache.insert(InsertParams(key=_key(tokens), value=idx))  # hit_count=2
+        self.cache.insert(
+            InsertParams(key=_key(tokens), value=idx, prev_prefix_len=len(idx))
+        )  # hit_count=2
         self.assertTrue(node.backuped)
         self._settle_writes()
 
@@ -220,7 +224,9 @@ class TestEvictAndLoadBack(HiCacheE2EBase):
         tokens = [20, 21, 22, 23]
         idx, orig = self._alloc_and_fill(len(tokens), seed=7)
         self.cache.insert(InsertParams(key=_key(tokens), value=idx))
-        self.cache.insert(InsertParams(key=_key(tokens), value=idx))  # trigger backup
+        self.cache.insert(
+            InsertParams(key=_key(tokens), value=idx, prev_prefix_len=len(idx))
+        )  # trigger backup
         node = self._child_of_root()
         self._settle_writes()
 
@@ -259,9 +265,13 @@ class TestEvictAndLoadBack(HiCacheE2EBase):
             InsertParams(key=_key(seg_a + seg_b), value=np.concatenate([idx_a, idx_b]))
         )
         # Reuse to back both nodes up.
-        self.cache.insert(InsertParams(key=_key(seg_a), value=idx_a))
+        self.cache.insert(InsertParams(key=_key(seg_a), value=idx_a, prev_prefix_len=len(idx_a)))
         self.cache.insert(
-            InsertParams(key=_key(seg_a + seg_b), value=np.concatenate([idx_a, idx_b]))
+            InsertParams(
+                key=_key(seg_a + seg_b),
+                value=np.concatenate([idx_a, idx_b]),
+                prev_prefix_len=len(np.concatenate([idx_a, idx_b])),
+            )
         )
         self._settle_writes()
         self.cache.evict(EvictParams(num_tokens=len(seg_a) + len(seg_b), dp_rank=0))
@@ -302,7 +312,7 @@ class TestWriteBack(HiCacheE2EBase):
         node = self._child_of_root()
         # Even repeated prefix reuse must NOT trigger a hit-time backup.
         for _ in range(5):
-            self.cache.insert(InsertParams(key=_key(tokens), value=idx))
+            self.cache.insert(InsertParams(key=_key(tokens), value=idx, prev_prefix_len=len(idx)))
         self.assertFalse(node.backuped)
         self.assertEqual(len(self.cache.ongoing_write), 0)
 
@@ -310,7 +320,7 @@ class TestWriteBack(HiCacheE2EBase):
         tokens = [50, 51, 52, 53]
         idx, orig = self._alloc_and_fill(len(tokens), seed=22)
         self.cache.insert(InsertParams(key=_key(tokens), value=idx))
-        self.cache.insert(InsertParams(key=_key(tokens), value=idx))
+        self.cache.insert(InsertParams(key=_key(tokens), value=idx, prev_prefix_len=len(idx)))
         node = self._child_of_root()
         # Not backed up yet (write_back defers to eviction).
         self.assertFalse(node.backuped)
@@ -391,7 +401,9 @@ class TestTombstoneRevival(HiCacheE2EBase):
         idx, _ = self._alloc_and_fill(len(tokens), seed=31)
         self.cache.insert(InsertParams(key=_key(tokens), value=idx))
         node = self._child_of_root()
-        self.cache.insert(InsertParams(key=_key(tokens), value=idx))  # back up
+        self.cache.insert(
+            InsertParams(key=_key(tokens), value=idx, prev_prefix_len=len(idx))
+        )  # back up
         self._settle_writes()
         self.cache.evict(EvictParams(num_tokens=len(tokens), dp_rank=0))
         self.assertTrue(node.evicted and node.backuped)
@@ -417,7 +429,9 @@ class TestTombstoneRevival(HiCacheE2EBase):
         idx, _ = self._alloc_and_fill(len(head), seed=41)
         self.cache.insert(InsertParams(key=_key(head), value=idx))
         node = self._child_of_root()
-        self.cache.insert(InsertParams(key=_key(head), value=idx))  # back up
+        self.cache.insert(
+            InsertParams(key=_key(head), value=idx, prev_prefix_len=len(idx))
+        )  # back up
         self._settle_writes()
         self.cache.evict(EvictParams(num_tokens=len(head), dp_rank=0))
         self.assertTrue(node.evicted and node.backuped)
@@ -443,14 +457,16 @@ class TestTombstoneRevival(HiCacheE2EBase):
         tokens = [70, 71, 72, 73]
         idx, _ = self._alloc_and_fill(len(tokens), seed=51)
         self.cache.insert(InsertParams(key=_key(tokens), value=idx))
-        self.cache.insert(InsertParams(key=_key(tokens), value=idx))
+        self.cache.insert(InsertParams(key=_key(tokens), value=idx, prev_prefix_len=len(idx)))
         self._settle_writes()
         self.cache.evict(EvictParams(num_tokens=len(tokens), dp_rank=0))
 
         # Revive, then drive another backup + eviction cycle.
         new_idx, _ = self._alloc_and_fill(len(tokens), seed=52)
         self.cache.insert(InsertParams(key=_key(tokens), value=new_idx))
-        self.cache.insert(InsertParams(key=_key(tokens), value=new_idx))  # re-backup
+        self.cache.insert(
+            InsertParams(key=_key(tokens), value=new_idx, prev_prefix_len=len(new_idx))
+        )  # re-backup
         self._settle_writes()
         self.cache.evict(EvictParams(num_tokens=len(tokens), dp_rank=0))
 
@@ -465,7 +481,7 @@ class TestFullMiss(HiCacheE2EBase):
         tokens = [40, 41, 42, 43]
         idx, _ = self._alloc_and_fill(len(tokens), seed=21)
         self.cache.insert(InsertParams(key=_key(tokens), value=idx))
-        self.cache.insert(InsertParams(key=_key(tokens), value=idx))
+        self.cache.insert(InsertParams(key=_key(tokens), value=idx, prev_prefix_len=len(idx)))
         node = self._child_of_root()
         self._settle_writes()
         self.cache.evict(EvictParams(num_tokens=len(tokens), dp_rank=0))
@@ -492,7 +508,7 @@ class TestHostEvictionTOCTOU(HiCacheE2EBase):
         tokens = [50, 51, 52, 53]
         idx, _ = self._alloc_and_fill(len(tokens), seed=31)
         self.cache.insert(InsertParams(key=_key(tokens), value=idx))
-        self.cache.insert(InsertParams(key=_key(tokens), value=idx))
+        self.cache.insert(InsertParams(key=_key(tokens), value=idx, prev_prefix_len=len(idx)))
         node = self._child_of_root()
         buffer_ids = [int(b) for b in node.component_data[0].host_value]
         # While in flight, the controller must reject releasing those buffers.
@@ -512,7 +528,7 @@ class TestSwitchabilityBoundary(HiCacheE2EBase):
         tokens = [60, 61, 62]
         idx, _ = self._alloc_and_fill(len(tokens), seed=41)
         self.cache.insert(InsertParams(key=_key(tokens), value=idx))
-        self.cache.insert(InsertParams(key=_key(tokens), value=idx))
+        self.cache.insert(InsertParams(key=_key(tokens), value=idx, prev_prefix_len=len(idx)))
         node = self._child_of_root()
         # host_value is an int buffer-id array, never a jax.Array.
         hv = node.component_data[0].host_value
@@ -570,7 +586,9 @@ class TestHostCopyReuse(HiCacheE2EBase):
         tokens = [70, 71, 72, 73]
         idx, orig = self._alloc_and_fill(len(tokens), seed=51)
         self.cache.insert(InsertParams(key=_key(tokens), value=idx))
-        self.cache.insert(InsertParams(key=_key(tokens), value=idx))  # backup
+        self.cache.insert(
+            InsertParams(key=_key(tokens), value=idx, prev_prefix_len=len(idx))
+        )  # backup
         node = self._child_of_root()
         self._settle_writes()
         host_first = [int(b) for b in node.component_data[0].host_value]
@@ -627,8 +645,10 @@ class TestPartialHit(HiCacheE2EBase):
         full = np.concatenate([idx_a, idx_b])
         self.cache.insert(InsertParams(key=_key(seg_a + seg_b), value=full))
         # Reuse both so both back up.
-        self.cache.insert(InsertParams(key=_key(seg_a), value=idx_a))
-        self.cache.insert(InsertParams(key=_key(seg_a + seg_b), value=full))
+        self.cache.insert(InsertParams(key=_key(seg_a), value=idx_a, prev_prefix_len=len(idx_a)))
+        self.cache.insert(
+            InsertParams(key=_key(seg_a + seg_b), value=full, prev_prefix_len=len(full))
+        )
         self._settle_writes()
 
         # Evict only enough to demote the deep (LRU) leaf, keeping seg_a resident.
@@ -671,7 +691,9 @@ class TestLoadBackPreEvicts(HiCacheE2EBase):
         target = [90, 91, 92, 93, 94, 95, 96, 97]  # 8 tokens
         idx, orig = self._alloc_and_fill(len(target), seed=71)
         self.cache.insert(InsertParams(key=_key(target), value=idx))
-        self.cache.insert(InsertParams(key=_key(target), value=idx))  # backup
+        self.cache.insert(
+            InsertParams(key=_key(target), value=idx, prev_prefix_len=len(idx))
+        )  # backup
         node = self._child_of_root()
         self._settle_writes()
         # Demote the target to host, freeing its device slots.
@@ -721,7 +743,9 @@ class TestRoundTripProperty(HiCacheE2EBase):
             tokens = list(range(base, base + length))
             idx, orig = self._alloc_and_fill(length, seed=100 + s)
             self.cache.insert(InsertParams(key=_key(tokens), value=idx))
-            self.cache.insert(InsertParams(key=_key(tokens), value=idx))  # backup
+            self.cache.insert(
+                InsertParams(key=_key(tokens), value=idx, prev_prefix_len=len(idx))
+            )  # backup
             seqs.append((tokens, length))
             truth[s] = orig
         self._settle_writes()
@@ -883,12 +907,16 @@ class TestHiCacheEquivalence(unittest.TestCase):
         idx_off = self._fill(self.cache_off, self.alloc_off, len(tokens), seed=1)
 
         self.cache_on.insert(InsertParams(key=_key(tokens), value=idx_on))
-        self.cache_on.insert(InsertParams(key=_key(tokens), value=idx_on))
+        self.cache_on.insert(
+            InsertParams(key=_key(tokens), value=idx_on, prev_prefix_len=len(idx_on))
+        )
         self._settle()
         self.cache_on.evict(EvictParams(num_tokens=4, dp_rank=0))
 
         self.cache_off.insert(InsertParams(key=_key(tokens), value=idx_off))
-        self.cache_off.insert(InsertParams(key=_key(tokens), value=idx_off))
+        self.cache_off.insert(
+            InsertParams(key=_key(tokens), value=idx_off, prev_prefix_len=len(idx_off))
+        )
         self.cache_off.evict(EvictParams(num_tokens=4, dp_rank=0))
 
         mr_on = self.cache_on.match_prefix(MatchPrefixParams(key=_key(tokens)))
@@ -954,7 +982,7 @@ class TestOverlapE2E(HiCacheE2EBase):
         self.cache.insert(InsertParams(key=_key(tokens), value=idx))
         # write_back: no backup on hit
         for _ in range(3):
-            self.cache.insert(InsertParams(key=_key(tokens), value=idx))
+            self.cache.insert(InsertParams(key=_key(tokens), value=idx, prev_prefix_len=len(idx)))
         self.assertFalse(list(self.cache.root_node.children.values())[0].backuped)
 
         # Eviction triggers barrier → gather → async flush.
@@ -975,7 +1003,7 @@ class TestOverlapE2E(HiCacheE2EBase):
         idx, orig = self._alloc_and_fill(len(tokens), seed=11)
         self.cache.insert(InsertParams(key=_key(tokens), value=idx))
         for _ in range(3):
-            self.cache.insert(InsertParams(key=_key(tokens), value=idx))
+            self.cache.insert(InsertParams(key=_key(tokens), value=idx, prev_prefix_len=len(idx)))
 
         node = list(self.cache.root_node.children.values())[0]
         self.assertFalse(node.backuped)
@@ -1004,7 +1032,7 @@ class TestOverlapE2E(HiCacheE2EBase):
         idx, _ = self._alloc_and_fill(len(tokens), seed=12)
         self.cache.insert(InsertParams(key=_key(tokens), value=idx))
         for _ in range(3):
-            self.cache.insert(InsertParams(key=_key(tokens), value=idx))
+            self.cache.insert(InsertParams(key=_key(tokens), value=idx, prev_prefix_len=len(idx)))
         self.cache.evict(EvictParams(num_tokens=len(tokens), dp_rank=0))
         self._settle_writes()
         node = list(self.cache.root_node.children.values())[0]
@@ -1025,7 +1053,7 @@ class TestResetHostCapacity(HiCacheE2EBase):
         tokens = [10, 11, 12, 13]
         idx, _ = self._alloc_and_fill(len(tokens), seed=1)
         self.cache.insert(InsertParams(key=_key(tokens), value=idx))
-        self.cache.insert(InsertParams(key=_key(tokens), value=idx))
+        self.cache.insert(InsertParams(key=_key(tokens), value=idx, prev_prefix_len=len(idx)))
         self._settle_writes()
         # Host pool consumed pages for the write-through backup.
         self.assertLess(self.host_pool.available_size(), total)
@@ -1038,7 +1066,7 @@ class TestResetHostCapacity(HiCacheE2EBase):
         tokens = [20, 21, 22, 23]
         idx, _ = self._alloc_and_fill(len(tokens), seed=2)
         self.cache.insert(InsertParams(key=_key(tokens), value=idx))
-        self.cache.insert(InsertParams(key=_key(tokens), value=idx))
+        self.cache.insert(InsertParams(key=_key(tokens), value=idx, prev_prefix_len=len(idx)))
         self._settle_writes()
         self.cache.reset()
         self.assertEqual(len(self.cache.ongoing_write), 0)
