@@ -307,6 +307,8 @@ suites = {
     # have a conditional CPU pin gated on USE_DEVICE_TYPE=cpu — the
     # cpu-test CI job sets that env var.
     "unit-test-cpu": [
+        TestFile("test/srt/test_vlm_ci.py", 0.1, runner="pytest"),
+        TestFile("test/srt/multimodal/test_engine_multimodal.py", 0.1, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/test_embedding_pool.py",
             0.1,
@@ -543,6 +545,7 @@ suites = {
         ),
     ],
     "e2e-test-tpu-v6e-1": [
+        TestFile("test/srt/test_vlm_models.py", 15),
         # openai_server e2e test
         TestFile("test/srt/openai_server/basic/test_openai_server.py", 1),
         TestFile("test/srt/openai_server/features/test_ebnf.py", 2),

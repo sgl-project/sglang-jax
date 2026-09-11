@@ -6,10 +6,7 @@ name: Nightly Test Daily
 run-name: >-
   ${{ inputs.pr_number != '' && format('Nightly Test Daily — PR #{0} {1}', inputs.pr_number, inputs.cases || inputs.job_filter) || 'Nightly Test Daily' }}
 
-# NOTE: The daily nightly suites are currently empty shells. Coverage will be
-# redefined as part of the nightly vs daily split decision. The workflow is
-# kept so any new daily case can be added by populating run_suite.py without
-# restructuring CI.
+# The single-host catalog also carries VLM cases alongside text-model cases.
 
 on:
   schedule:
@@ -186,6 +183,8 @@ jobs:
           persist-credentials: false
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
+        with:
+          install-target: python[all,multimodal]
       - name: Run 4-TPU accuracy daily suite
         id: run
         timeout-minutes: 150
@@ -212,6 +211,13 @@ jobs:
             cp "${files[@]}" "$DEST"/
             echo "Published ${#files[@]} accuracy JSON file(s) to $DEST"
           fi
+
+      - name: Upload accuracy results, including per-sample VLM answers
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: single-host-accuracy-results
+          path: test/nightly_test_output/accuracy
 
   nightly-test-accuracy-4-tpu-comment:
     # Posts PASS/FAIL from a clean job (no PR-HEAD code ran here) so the write token
