@@ -631,72 +631,85 @@ def prepare_outputs(out):
 
 # Rows shorter than this stay on the XLA path. Measured: E=256 rows are ~30% slower on
 # SparseCore, E=25000 rows are ~2.3x faster; tokamax switches to cooperative subcores
-# above 4096 entries. Override with DSA_SC_TOPK_MIN_ENTRIES.
+# above 4096 entries. Override with DSA_SC_TOPK_MIN_ENTRIES. Both env vars are read
+# when the calling function is traced (jit-cached afterwards).
 SC_TOPK_MIN_ENTRIES = int(os.environ.get("DSA_SC_TOPK_MIN_ENTRIES", "8192"))
 # Fraction of one SparseCore subcore's VMEM the kernel may use for its per-subcore
 # key + value slice (the rest holds histograms, output buffers and the carry-forward).
 _SC_TOPK_VMEM_BUDGET = 0.5
-_SC_TOPK_COOPERATING_SUBCORES = 16  # tokamax kernel constant for rows > 4096 entries
+# Above this many entries the vendored kernel splits each row across all subcores of a
+# core (``num_cooperating_tiles = mesh.num_subcores``); at or below it one subcore
+# owns the whole row.
+_SC_TOPK_COOPERATIVE_ABOVE = 4096
 _SC_TOPK_KEY_VALUE_BYTES = 8  # f32 key + int32 value per candidate
 
 
 @functools.lru_cache(maxsize=1)
 def _sparse_core_info():
-    """SparseCore geometry of the current TPU, or None when unavailable."""
+    """SparseCore geometry of the current TPU (cached), or None when unavailable."""
     if jax.default_backend() != "tpu":
         return None
     try:
         info = pltpu.get_tpu_info()
-        if getattr(info, "generation", 0) < 6 or info.sparse_core is None:
-            return None
-        return info.sparse_core
-    except Exception:  # noqa: BLE001 - any failure means "no SparseCore path"
+    except (RuntimeError, ValueError):
         return None
+    if getattr(info, "generation", 0) < 6 or getattr(info, "sparse_core", None) is None:
+        return None
+    return info.sparse_core
 
 
-@functools.lru_cache(maxsize=1)
 def sc_topk_available() -> bool:
-    """True when the SparseCore radix-select kernel can run on this device."""
-    if os.environ.get("DSA_SC_TOPK", "1") == "0":
-        return False
-    if _sparse_core_info() is None:
-        return False
-    try:
-        from sgl_jax.srt.kernels.dsa import sc_topk  # noqa: F401
+    """True when the SparseCore radix-select kernel can run on this device.
 
-        return True
-    except ImportError:
-        return False
+    DSA_SC_TOPK=0 disables the path; the check runs at trace time of the caller.
+    """
+    return os.environ.get("DSA_SC_TOPK", "1") != "0" and _sparse_core_info() is not None
 
 
-def _sc_topk_max_entries(vmem_capacity_bytes: int, num_lanes: int) -> int:
-    per_subcore = int(vmem_capacity_bytes * _SC_TOPK_VMEM_BUDGET) // _SC_TOPK_KEY_VALUE_BYTES
-    per_subcore -= per_subcore % num_lanes
-    return per_subcore * _SC_TOPK_COOPERATING_SUBCORES
+def _sc_topk_max_entries(info) -> int:
+    """Largest row whose per-subcore key+value slice fits the VMEM budget."""
+    per_subcore = int(info.vmem_capacity_bytes * _SC_TOPK_VMEM_BUDGET)
+    per_subcore //= _SC_TOPK_KEY_VALUE_BYTES
+    per_subcore -= per_subcore % info.num_lanes
+    return per_subcore * info.num_subcores
 
 
 def should_use_sc_topk(num_entries: int, batch: int) -> bool:
-    """Host-side routing policy for the exit-stage top-k (pure function of shape)."""
+    """Routing policy for the exit-stage top-k: pure function of shape and device.
+
+    Evaluated on the device the caller is traced on; off-TPU it is always False.
+    """
     del batch  # the kernel handles any batch; kept in the signature for future tuning
-    if num_entries < SC_TOPK_MIN_ENTRIES:
-        return False
     info = _sparse_core_info()
-    # Off-TPU callers (tests, tracing on CPU) get the most conservative geometry: v6e.
-    vmem = info.vmem_capacity_bytes if info is not None else 256 * 1024
-    lanes = info.num_lanes if info is not None else 8
-    return num_entries <= _sc_topk_max_entries(vmem, lanes)
+    if info is None or num_entries < SC_TOPK_MIN_ENTRIES:
+        return False
+    return num_entries <= _sc_topk_max_entries(info)
+
+
+def _sc_padded_width(n: int, info) -> int:
+    """Smallest width >= n satisfying the kernel's layout constraints: the row is split
+    into ``num_subcores`` tiles above the cooperative threshold (one tile below it), and
+    each tile must be a whole number of ``num_lanes``-wide vectors."""
+    tiles = 1 if n <= _SC_TOPK_COOPERATIVE_ABOVE else info.num_subcores
+    unit = tiles * info.num_lanes
+    padded = -(-n // unit) * unit
+    if n <= _SC_TOPK_COOPERATIVE_ABOVE < padded:  # padding crossed the threshold
+        unit = info.num_subcores * info.num_lanes
+        padded = -(-n // unit) * unit
+    return padded
 
 
 def _sc_select(scores: jax.Array, k: int) -> jax.Array:
     from sgl_jax.srt.kernels.dsa import sc_topk
 
     info = _sparse_core_info()
-    lanes = info.num_lanes if info is not None else 8
+    if info is None:
+        raise ValueError(
+            "SparseCore top-k requested but no SparseCore is available on backend "
+            f"{jax.default_backend()!r}; use topk_backend='xla' or 'auto'."
+        )
     n = scores.shape[-1]
-    # Kernel layout constraints: rows > 4096 are split across 16 cooperating subcores
-    # and every per-subcore tile must be a whole number of vector registers.
-    unit = lanes if n <= 4096 else lanes * _SC_TOPK_COOPERATING_SUBCORES
-    padded = -(-n // unit) * unit
+    padded = _sc_padded_width(n, info)
     if padded != n:
         scores = jnp.pad(scores, ((0, 0), (0, padded - n)), constant_values=-jnp.inf)
     vals, idxs = sc_topk.top_k(keys=scores, k=k, num_seq_windows=1, digit_width=4, num_digits=8)
@@ -724,6 +737,11 @@ def select_topk_indices(scores: jax.Array, k: int, *, backend: str = "auto") -> 
     if backend == "auto":
         use_sc = sc_topk_available() and should_use_sc_topk(scores.shape[-1], scores.shape[0])
     elif backend == "sc":
+        if not sc_topk_available():
+            raise ValueError(
+                "topk_backend='sc' requires a TPU with a SparseCore (v6e or newer) and "
+                "DSA_SC_TOPK unset or != '0'."
+            )
         use_sc = True
     elif backend == "xla":
         use_sc = False

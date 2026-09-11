@@ -12,8 +12,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+import sgl_jax.srt.kernels.dsa.streamindex_topk as streamindex_topk_mod
 from sgl_jax.srt.kernels.dsa.streamindex_topk import (
     SC_TOPK_MIN_ENTRIES,
+    _sc_padded_width,
     sc_topk_available,
     select_topk_indices,
     should_use_sc_topk,
@@ -42,14 +44,62 @@ def _trailing_minus_one(a):
     return bool(np.all(np.diff(flags, axis=1) >= 0))
 
 
-def test_should_use_sc_topk_thresholds():
-    """Pure host-side policy: small rows fall back to XLA, large rows go to SparseCore."""
+class _FakeSparseCore:
+    """v6e geometry (pltpu.get_tpu_info().sparse_core on TPU v6e)."""
+
+    num_cores = 2
+    num_subcores = 16
+    num_lanes = 8
+    vmem_capacity_bytes = 262144
+
+
+def test_should_use_sc_topk_thresholds(monkeypatch):
+    """Pure policy: small rows fall back to XLA, large rows go to SparseCore, rows whose
+    per-subcore key+value slice exceeds half of VMEM fall back."""
+    monkeypatch.setattr(streamindex_topk_mod, "_sparse_core_info", lambda: _FakeSparseCore())
     assert not should_use_sc_topk(num_entries=256, batch=8)
     assert not should_use_sc_topk(num_entries=SC_TOPK_MIN_ENTRIES - 1, batch=64)
     assert should_use_sc_topk(num_entries=SC_TOPK_MIN_ENTRIES, batch=1)
+    # 262144 entries / 16 subcores * 8 B = 128 KiB = exactly half of v6e VMEM.
     assert should_use_sc_topk(num_entries=262144, batch=2048)
-    # Rows that cannot fit one SparseCore subcore's VMEM must not be routed to the kernel.
+    assert not should_use_sc_topk(num_entries=262144 + 16 * 8, batch=1)
     assert not should_use_sc_topk(num_entries=1 << 26, batch=1)
+
+
+def test_should_use_sc_topk_false_without_sparse_core(monkeypatch):
+    monkeypatch.setattr(streamindex_topk_mod, "_sparse_core_info", lambda: None)
+    assert not should_use_sc_topk(num_entries=262144, batch=64)
+    assert not sc_topk_available()
+    with pytest.raises(ValueError, match="requires a TPU with a SparseCore"):
+        select_topk_indices(jnp.zeros((1, 8192), jnp.float32), K, backend="sc")
+
+
+def test_sc_padded_width_matches_kernel_constraints():
+    info = _FakeSparseCore()
+    # Below the cooperative threshold: one tile, whole vectors of num_lanes.
+    assert _sc_padded_width(4096, info) == 4096
+    assert _sc_padded_width(4090, info) == 4096
+    # Above it: num_subcores tiles, each a whole number of vectors.
+    assert _sc_padded_width(4097, info) == 4224  # next multiple of 16 * 8
+    assert _sc_padded_width(25000, info) == 25088
+    assert _sc_padded_width(262144, info) == 262144
+
+
+def test_auto_backend_routes_by_row_width(monkeypatch):
+    """auto -> XLA for short rows, SparseCore for long rows (both selectors observed)."""
+    calls = []
+    orig_sc, orig_xla = streamindex_topk_mod._sc_select, streamindex_topk_mod._xla_select
+    monkeypatch.setattr(
+        streamindex_topk_mod, "_sc_select", lambda s, k: (calls.append("sc"), orig_sc(s, k))[1]
+    )
+    monkeypatch.setattr(
+        streamindex_topk_mod, "_xla_select", lambda s, k: (calls.append("xla"), orig_xla(s, k))[1]
+    )
+    select_topk_indices(jnp.zeros((1, 256), jnp.float32), K, backend="auto")
+    assert calls == ["xla"]
+    if sc_topk_available():
+        select_topk_indices(jnp.zeros((1, 262144), jnp.float32), K, backend="auto")
+        assert calls == ["xla", "sc"]
 
 
 @pytest.mark.skipif(not sc_topk_available(), reason="no SparseCore top-k on this chip")
@@ -81,6 +131,21 @@ def test_sc_selector_fewer_valid_than_k_pads_with_minus_one():
     assert np.all((got >= 0).sum(1) == 300)
     assert _trailing_minus_one(got)
     assert _set_rows_equal(got, _exact_indices(scores, K))
+
+
+@pytest.mark.skipif(not sc_topk_available(), reason="no SparseCore top-k on this chip")
+def test_sc_selector_edge_rows():
+    """E == k (no -1), all -inf (all -1) and 600 tied maxima (exact set, no early -1)."""
+    exact_k = jnp.asarray(np.random.default_rng(5).standard_normal((4, K), np.float32))
+    got = np.asarray(select_topk_indices(exact_k, K, backend="sc"))
+    assert np.all(got >= 0) and _set_rows_equal(got, _exact_indices(exact_k, K))
+
+    all_inf = jnp.full((2, 8192), -jnp.inf, jnp.float32)
+    assert np.all(np.asarray(select_topk_indices(all_inf, K, backend="sc")) == -1)
+
+    tied = jnp.zeros((1, 8192), jnp.float32).at[0, :600].set(1.0)
+    got = np.asarray(select_topk_indices(tied, K, backend="sc"))
+    assert np.all(got >= 0) and np.all(got[0] < 600) and len(set(got[0].tolist())) == K
 
 
 def test_xla_selector_unchanged():
