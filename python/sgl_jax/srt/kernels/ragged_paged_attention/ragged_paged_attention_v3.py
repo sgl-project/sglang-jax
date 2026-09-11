@@ -222,7 +222,7 @@ def get_smem_estimate_bytes(max_num_seqs, pages_per_seq):
         # distribution_ref: i32[3]
         128 * 32
         +
-        # sem_ids_ref: i32[3]
+        # sem_ids_ref: i32[5]
         128 * 32
         +
         # bo_ids_ref: i32[4]
@@ -336,7 +336,7 @@ def _ragged_paged_attention_kernel_loop(
     cu_kv_lens_ref,  # [max_num_seqs + 1]
     cu_seq_mask_lens,  # [1], unused placeholder
     distribution_ref,  # [3] (decode_end, prefill_end, mixed_end)
-    sem_ids_ref,  # [3] (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
+    sem_ids_ref,  # [5] (bq_sem_idx, bkv_sem_idx, bo_sem_idx, bkv0_pending, bkv1_pending)
     bo_ids_ref,  # [4]
     bkv_update_ids_ref,  # [6]
     # Input
@@ -661,14 +661,20 @@ def _ragged_paged_attention_kernel_loop(
                 sem,
                 wait,
             )
+            sem_ids_ref[3 + bkv_sem_idx] = 1
         else:
-            dst = vmem_ref.at[pl.ds(0, bkv_sz_frm_cache + bkv_sz_frm_new)]
-            _async_copy(
-                src=dst,
-                dst=dst,
-                sem=sem,
-                wait=True,
-            )
+            # A buffer kept for the same block by the previous step was already
+            # waited on and has no DMA in flight.
+            @pl.when(sem_ids_ref[3 + bkv_sem_idx] != 0)
+            def _():
+                sem_ids_ref[3 + bkv_sem_idx] = 0
+                dst = vmem_ref.at[pl.ds(0, bkv_sz_frm_cache + bkv_sz_frm_new)]
+                _async_copy(
+                    src=dst,
+                    dst=dst,
+                    sem=sem,
+                    wait=True,
+                )
         return kv_len_start + bkv_sz_frm_cache, bkv_sz_frm_new
 
     def _update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz, *, wait=False):
@@ -994,8 +1000,19 @@ def _ragged_paged_attention_kernel_loop(
                 )
                 processed_kv_len = bkv_idx * bkv_sz
 
-                # Prefetch next bkv
-                @pl.when(next_seq_idx < end_seq_idx)
+                # Prefetch next bkv. If the next step reads this same block (the
+                # visible KV fits in one bkv tile, e.g. every bq of a prefill of at
+                # most bkv_sz tokens), keep it in the current buffer instead of
+                # copying it from HBM again. Custom masks are per bq and share the
+                # buffer index, so they always fetch.
+                fetch_next_bkv = next_seq_idx < end_seq_idx
+                if custom_mask_ref is None:
+                    fetch_next_bkv = jnp.logical_and(
+                        fetch_next_bkv,
+                        jnp.logical_or(next_seq_idx != seq_idx, next_bkv_idx != bkv_idx),
+                    )
+
+                @pl.when(fetch_next_bkv)
                 def prefetch_next_bkv():
                     sem_ids_ref[1] = next_bkv_sem_idx
                     start_fetch_bkv(next_seq_idx, next_bkv_idx, next_bkv_sem_idx)
@@ -1827,7 +1844,7 @@ def ragged_paged_attention(
     cu_seq_mask_lens = jnp.array([0], dtype=jnp.int32)
 
     # Scalar prefetch init values.
-    init_sem_ids = jnp.zeros((3,), jnp.int32)
+    init_sem_ids = jnp.zeros((5,), jnp.int32)
     init_bo_ids = jnp.full((4,), -1, jnp.int32)
     init_bkv_update_ids = jnp.full((6,), -1, jnp.int32)
 
