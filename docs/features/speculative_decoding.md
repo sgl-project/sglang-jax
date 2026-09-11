@@ -122,3 +122,38 @@ matches the target model.
 
 For more background on the EAGLE algorithm, refer to the original paper
 [EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty](https://arxiv.org/abs/2401.15077).
+
+
+## DFlash checkpoint prediction layout
+
+DFlash uses `--speculative-num-draft-tokens` as the target verification width,
+including the seed token. With a value of `8`, it proposes seven candidate tokens.
+The default draft input contains the seed plus seven masks and skips the seed's
+hidden state when sampling.
+
+For a checkpoint trained to predict the next token from the anchor position,
+explicitly add `--speculative-sample-from-anchor`:
+
+```bash
+--speculative-algorithm DFLASH \
+--speculative-num-draft-tokens 8 \
+--speculative-num-steps 1 \
+--speculative-eagle-topk 1 \
+--grammar-backend none \
+--speculative-sample-from-anchor
+```
+
+This uses seven draft query positions (seed plus six masks), samples all seven
+hidden states, and verifies the seed plus seven candidates on the target. Draft
+attention metadata and KV writes use the shorter query; target verification and
+accepted-context KV materialization retain the full verification width. Both
+layouts use greedy draft sampling and verification.
+
+The flag describes the checkpoint prediction layout, independently of whether
+a Markov head is present. This implementation supports the flag with DFLASH.
+It defaults to false and is not inferred from the checkpoint name or
+architecture. If the verification width is omitted, the checkpoint's
+`block_size` is used unchanged for the default layout, or incremented by one
+when this flag is set. An explicitly supplied verification width takes precedence.
+Choose the layout using the checkpoint's reference implementation; enabling the
+flag is not itself evidence of checkpoint compatibility or improved acceptance.
