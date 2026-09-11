@@ -140,10 +140,30 @@ def quantized_matmul_kernel(
     compute_tile_n = MXU_SIZE * n_lane_multiplier
     steps_n = out_block_size // compute_tile_n
 
-    def kernel(lhs_ref, rhs_ref, w_scales_ref, out_ref, acc_scratch):
-        pid_k = pl.program_id(2)
+    # Consecutive in-block steps revisit the same output block, so its window can carry
+    # the partial sum when it has the accumulation dtype. This removes the scratch
+    # buffer and the separate last-step code path.
+    acc_in_out = jnp.dtype(acc_dtype) == jnp.dtype(x.dtype)
+
+    def kernel(lhs_ref, rhs_ref, w_scales_ref, out_ref, acc_scratch=None):
+        pid_b, pid_o, pid_k = pl.program_id(0), pl.program_id(1), pl.program_id(2)
         is_first_step = pid_k == 0
         is_last_step = pid_k == (n_in - 1)
+        # x, w_q and w_scale already reside in VMEM. Address this step's blocks in place;
+        # prefetch windows would copy both blocks again at every step, since the in-block
+        # index changes every step.
+        lhs_blk = lhs_ref.at[
+            pl.ds(pid_b * batch_block_size, batch_block_size),
+            pl.ds(pid_k * in_block_size, in_block_size),
+        ]
+        rhs_blk = rhs_ref.at[
+            pl.ds(pid_o * out_block_size, out_block_size),
+            pl.ds(pid_k * in_block_size, in_block_size),
+        ]
+        w_scales_blk = w_scales_ref.at[
+            pl.ds(pid_k * steps_k, steps_k), :, pl.ds(pid_o * out_block_size, out_block_size)
+        ]
+        acc_ref = out_ref if acc_in_out else acc_scratch
 
         def accum(is_first_step, is_last_step):
             accumulators = [None] * steps_n
@@ -151,15 +171,15 @@ def quantized_matmul_kernel(
             for i in range(steps_k):
                 k_start, k_end = i * block_size, (i + 1) * block_size
                 if quantize_activation:
-                    lhs_sub = lhs_ref[:, k_start:k_end].astype(jnp.float32)
+                    lhs_sub = lhs_blk[:, k_start:k_end].astype(jnp.float32)
                     lhs_q, lhs_scale = util.quantize_block(lhs_sub, 1, x_q_dtype)
                     lhs_scale = lhs_scale.astype(acc_dtype)
                 else:
-                    lhs_q = lhs_ref[:, k_start:k_end]
+                    lhs_q = lhs_blk[:, k_start:k_end]
                     lhs_scale = None
 
-                rhs_q_full = rhs_ref[:, k_start:k_end]
-                rhs_scale_full = w_scales_ref[i, :, :].astype(acc_dtype)
+                rhs_q_full = rhs_blk[:, k_start:k_end]
+                rhs_scale_full = w_scales_blk[i, :, :].astype(acc_dtype)
 
                 for j in range(steps_n):
                     n_start, n_end = j * compute_tile_n, (j + 1) * compute_tile_n
@@ -188,38 +208,28 @@ def quantized_matmul_kernel(
             acc_block = jnp.concatenate(accumulators, axis=1)
 
             if not is_first_step:
-                acc_block += acc_scratch[...]
+                acc_block += acc_ref[...]
 
-            if is_last_step:
-                out_ref[...] = acc_block.astype(out_ref.dtype)
+            if acc_in_out or not is_last_step:
+                acc_ref[...] = acc_block
             else:
-                acc_scratch[...] = acc_block
+                out_ref[...] = acc_block.astype(out_ref.dtype)
 
-        unfold_args((is_first_step, is_last_step), (), accum)
+        unfold_args((is_first_step, True if acc_in_out else is_last_step), (), accum)
 
     kernel = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
             in_specs=[
-                pl.BlockSpec(
-                    (batch_block_size, in_block_size),
-                    lambda b, o, i: (b, i),
-                    memory_space=pltpu.VMEM,
-                ),  # x
-                pl.BlockSpec(
-                    (out_block_size, in_block_size),
-                    lambda b, o, i: (o, i),
-                    memory_space=pltpu.VMEM,
-                ),  # w_q
-                pl.BlockSpec(
-                    (steps_k, 1, out_block_size),
-                    lambda _, o, i: (i, 0, o),
-                    memory_space=pltpu.VMEM,
-                ),
-            ],  # w_scale
+                pl.BlockSpec(memory_space=pltpu.VMEM),  # x
+                pl.BlockSpec(memory_space=pltpu.VMEM),  # w_q
+                pl.BlockSpec(memory_space=pltpu.VMEM),  # w_scale
+            ],
             out_specs=pl.BlockSpec((batch_block_size, out_block_size), lambda b, o, i: (b, o)),
-            scratch_shapes=[pltpu.VMEM((batch_block_size, out_block_size), acc_dtype)],
+            scratch_shapes=(
+                [] if acc_in_out else [pltpu.VMEM((batch_block_size, out_block_size), acc_dtype)]
+            ),
             grid=(n_batch, n_out, n_in),
         ),
         out_shape=jax.ShapeDtypeStruct((padded_n_batch, padded_n_out), x.dtype),
