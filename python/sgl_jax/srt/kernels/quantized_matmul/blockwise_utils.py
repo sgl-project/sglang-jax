@@ -367,14 +367,21 @@ def get_safe_blockwise_tuned_value(
     n_lane_multiplier = max(1, int(tuned.n_lane_multiplier))
     compute_tile_n = 256 * n_lane_multiplier
 
-    # batch: cap to actual batch size, then enforce the Pallas TPU block-shape
-    # constraint (block_m % 8 == 0 OR block_m == array_m). When Tier-1 fuzzy
-    # match returns a small batch_block_size (e.g. 1 from a #1191 entry) but
-    # n_batch is in (1, 8), the unaligned block triggers a lowering ValueError.
+    # batch: cap to actual batch size, then enforce the Mosaic block-shape
+    # constraint: block_m must equal array_m or divide the operand's sublane
+    # tiling evenly. jax >= 0.11 tiles operands at their native sublane
+    # granularity (256 / dtype_bits rows: fp32 8, bf16 16, fp8/int8 32) and
+    # rejects smaller blocks with E2002, so a borrowed batch_block_size from a
+    # nearest-neighbour table entry (e.g. the n_batch=8 entry serving a padded
+    # 16-row decode bucket) must be aligned up to the tile floor.
     n_batch_i = int(n_batch)
+    sublane_m = max(8, 256 // max(8, jnp.dtype(x_q_dtype).itemsize * 8))
     batch_block_size = max(1, min(int(tuned.batch_block_size), n_batch_i))
-    if batch_block_size < n_batch_i and batch_block_size % 8 != 0:
-        batch_block_size = n_batch_i if n_batch_i <= 8 else max(8, batch_block_size & ~7)
+    if batch_block_size < n_batch_i and batch_block_size % sublane_m != 0:
+        if n_batch_i <= sublane_m:
+            batch_block_size = n_batch_i
+        else:
+            batch_block_size = min(n_batch_i, _next_multiple(batch_block_size, sublane_m))
 
     # out (N): round up to compute_tile_n, cap to matrix N, then snap to
     # nearest power-of-two multiple for TPU alignment.
