@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
@@ -25,6 +26,25 @@ if TYPE_CHECKING:
     from sgl_jax.srt.managers.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class PrefillHandoff:
+    """Immutable page ownership for one scheduled request/chunk."""
+
+    req: Req
+    transfer_id: str
+    start: int
+    end: int
+    block_ids: tuple[int, ...]
+    is_final: bool
+
+
+@dataclass
+class PendingPrefillResult:
+    batch: object
+    result: object
+    handoffs: tuple[PrefillHandoff, ...]
 
 
 def _batch_reqs(batch) -> tuple[Req, ...]:
@@ -192,14 +212,16 @@ class PrefillBootstrapQueue:
                 on_terminal=on_terminal,
             )
 
-    def drain_terminal(self) -> list[PrefillBookkeeping]:
+    def drain_terminal(self, can_release=None) -> list[PrefillBookkeeping]:
         """Remove and return entries that reached SUCCESS or FAILED."""
 
         terminal: list[PrefillBookkeeping] = []
         with self._lock:
             for req_id, entry in list(self._entries.items()):
                 state = entry.sender.poll()
-                if state in (KVPoll.SUCCESS, KVPoll.FAILED):
+                if state in (KVPoll.SUCCESS, KVPoll.FAILED) and (
+                    can_release is None or can_release(entry.req)
+                ):
                     terminal.append(entry)
                     del self._entries[req_id]
         return terminal
@@ -230,6 +252,120 @@ class SchedulerDisaggregationPrefillMixin:
     disagg_kv_manager: TransferBackend
     disagg_prefill_queue: PrefillBootstrapQueue
     disagg_use_d2h_staging: bool
+
+    def _snapshot_prefill_handoffs(self: Scheduler, batch) -> tuple[PrefillHandoff, ...]:
+        chunked = tuple(r for r in self.chunked_reqs if r is not None)
+        chunk_transfer = self.server_args.disaggregation_enable_chunk_prefill_transfer
+        handoffs = []
+        for req in _batch_reqs(batch):
+            if req.bootstrap_room is None:
+                continue
+            end = len(req.fill_ids)
+            start = end - req.extend_input_len
+            is_final = not any(req is r for r in chunked)
+            pages = (
+                self._extract_req_block_ids_range(req, start if chunk_transfer else 0, end)
+                if chunk_transfer or is_final
+                else ()
+            )
+            handoffs.append(
+                PrefillHandoff(
+                    req, get_disagg_transport_id(req), start, end, tuple(pages), is_final
+                )
+            )
+        return tuple(handoffs)
+
+    def _prefill_compute_released(self: Scheduler, req) -> bool:
+        return not getattr(self, "_disagg_prefill_compute", {}).get(id(req), 0)
+
+    def _resolve_disagg_prefill_result(self: Scheduler, pending: PendingPrefillResult) -> None:
+        # The forward worker publishes only after this batch's KV writes are
+        # device-ready. No old donated Array escapes to this thread.
+        result = pending.result
+        result.logits_output, result.next_token_ids, result.cache_miss_count = (
+            self.tp_worker.resolve_last_batch_result()
+        )
+        try:
+            self.process_prefill_chunk(pending.batch, result, handoffs=pending.handoffs)
+        finally:
+            for item in pending.handoffs:
+                key = id(item.req)
+                self._disagg_prefill_compute[key] -= 1
+                if not self._disagg_prefill_compute[key]:
+                    del self._disagg_prefill_compute[key]
+                    deferred = self._disagg_prefill_deferred_releases.pop(key, None)
+                    if deferred is not None:
+                        self._release_prefill_req_resources(deferred)
+
+    def _drain_disagg_prefill_overlap_results(self: Scheduler) -> None:
+        while self.result_queue:
+            self._resolve_disagg_prefill_result(self.result_queue.popleft())
+        self.last_batch = None
+        self.cur_batch = None
+        self.send_kv_chunk()
+
+    def _prefill_chunk_transfer_backpressured(self: Scheduler) -> bool:
+        # Stop adding chunks when native read slots are full. The overlap loop
+        # still resolves its one already-submitted forward and polls senders,
+        # so completed reads can reopen the window without new compute.
+        return any(
+            sender is not None and sender.has_pending_chunks
+            for req in self.chunked_reqs
+            if req is not None
+            for sender in (getattr(req, "disagg_chunk_sender", None),)
+        )
+
+    def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
+        """Prepare N+1 on CPU while N executes; publish only N's ready pages."""
+        self.result_queue = deque()
+        self._disagg_prefill_compute = {}
+        self._disagg_prefill_deferred_releases = {}
+        while True:
+            recv_reqs = (
+                self._comm_backend.recv_requests()
+                if self._comm_backend is not None
+                else self.recv_requests()
+            )
+            self.process_input_requests(self.select_dp_for_request(recv_reqs))
+            if self._engine_paused:
+                self._drain_disagg_prefill_overlap_results()
+                continue
+
+            self._wait_donation_safe()
+            self.send_kv_chunk()
+            # PD producers never merge into the local decode running batch.
+            # Their chunk continuation is owned by chunked_reqs/ChunkCache.
+            self.last_batch = None
+            batch = (
+                None
+                if self._prefill_chunk_transfer_backpressured()
+                else self.get_next_batch_to_run()
+            )
+            self.cur_batch = batch
+            had_pending = bool(self.result_queue)
+            if batch is not None:
+                handoffs = self._snapshot_prefill_handoffs(batch)
+                for item in handoffs:
+                    key = id(item.req)
+                    self._disagg_prefill_compute[key] = self._disagg_prefill_compute.get(key, 0) + 1
+                    self._pd_mark_time(item.req, "forward_start")
+                batch.launch_done = threading.Event()
+                result = self.run_batch(batch)
+                copied = batch.copy()
+                # P does not generate client tokens, so its sampler has no
+                # dependency on the previous P result's output processing.
+                copied.next_batch_sampling_info = self.tp_worker.cur_sampling_info
+                self.set_next_batch_sampling_info_done(copied)
+                copied.next_batch_sampling_info = None
+                self.result_queue.append(PendingPrefillResult(copied, result, handoffs))
+            if had_pending:
+                self._resolve_disagg_prefill_result(self.result_queue.popleft())
+            elif batch is None:
+                self.new_token_ratio = self.init_new_token_ratio
+                if self._comm_backend is not None:
+                    self._comm_backend.wait_for_new_requests(0.001)
+            self.send_kv_chunk()
+            self.last_batch = batch
 
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """Prefill-only event loop."""
@@ -274,14 +410,22 @@ class SchedulerDisaggregationPrefillMixin:
                 None if batch and any(r.bootstrap_room is not None for r in batch_reqs) else batch
             )
 
-    def process_prefill_chunk(self: Scheduler, batch, result) -> None:
+    def process_prefill_chunk(
+        self: Scheduler, batch, result, *, handoffs: tuple[PrefillHandoff, ...] | None = None
+    ) -> None:
         """Extract KV for PD reqs and hand off to sender."""
 
         batch_reqs = _batch_reqs(batch)
         pd_reqs = [req for req in batch_reqs if req.bootstrap_room is not None]
         if not pd_reqs:
+            if handoffs is not None:
+                # Already resolved by the dedicated P loop; the generic
+                # overlap result processor would consume the queue twice.
+                raise RuntimeError("PD prefill overlap requires bootstrapped PD requests")
             self.process_batch_result(batch, result)
             return
+
+        snapshots = {id(item.req): item for item in handoffs or ()}
 
         for req in pd_reqs:
             self._pd_mark_time(req, "forward_done")
@@ -300,19 +444,47 @@ class SchedulerDisaggregationPrefillMixin:
             req
             for req in pd_reqs
             if not chunk_transfer_enabled
-            and not any(req is chunked_req for chunked_req in chunked_now)
+            and (
+                snapshots[id(req)].is_final
+                if id(req) in snapshots
+                else not any(req is chunked_req for chunked_req in chunked_now)
+            )
             and req.rid not in self.disagg_prefill_queue._entries
         ]
-        if ready_to_transfer:
+        if ready_to_transfer and handoffs is None:
             kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
             self.disagg_kv_manager.prepare_prefill_batch(kv_pool.kv_buffer)
         for req in batch_reqs:
             if req.bootstrap_room is None:
                 continue
             req_id = req.rid
-            is_mid_chunk = any(req is cr for cr in chunked_now)
+            snapshot = snapshots.get(id(req))
+            is_mid_chunk = (
+                not snapshot.is_final if snapshot else any(req is cr for cr in chunked_now)
+            )
+            if snapshot and snapshot.transfer_id != get_disagg_transport_id(req):
+                raise RuntimeError("PD request identity changed while its prefill was in flight")
+            if snapshot and (req.finished() or req.to_finish is not None):
+                # An older chunk may have failed while this forward was in
+                # flight. Never resurrect its producer or publish new pages.
+                if is_mid_chunk and req.is_chunked > 0:
+                    req.is_chunked -= 1
+                sender = req.disagg_chunk_sender
+                if sender is not None:
+                    sender.abort()
+                    self._ensure_chunk_sender_queued(req, sender)
+                elif not req.finished():
+                    req.check_finished()
+                    req.output_ids = []
+                    self._stream_prefill_req(req)
+                    self._release_prefill_req_resources(req)
+                self._retire_chunk_producer_ownership(req)
+                continue
             if chunk_transfer_enabled:
-                self._raiden_handoff_chunk(req, is_final=not is_mid_chunk)
+                if snapshot is None:
+                    self._raiden_handoff_chunk(req, is_final=not is_mid_chunk)
+                else:
+                    self._raiden_handoff_chunk(req, is_final=not is_mid_chunk, snapshot=snapshot)
                 if is_mid_chunk and req.is_chunked > 0:
                     req.is_chunked -= 1
                 continue
@@ -338,7 +510,9 @@ class SchedulerDisaggregationPrefillMixin:
                         dp_rank=int(req.dp_rank),
                         buffer_id=req.disagg_host_buffer_id,
                         payload_factory=lambda req_obj=req: {"kv": self._extract_req_kv(req_obj)},
-                        block_ids_factory=lambda req_obj=req: self._extract_req_block_ids(req_obj),
+                        block_ids_factory=lambda req_obj=req, snap=snapshot: (
+                            list(snap.block_ids) if snap else self._extract_req_block_ids(req_obj)
+                        ),
                         on_payload=lambda payload, req_obj=req: (
                             self._maybe_log_prefill_extract_debug(
                                 req_obj,
@@ -374,7 +548,10 @@ class SchedulerDisaggregationPrefillMixin:
     def send_kv_chunk(self: Scheduler) -> None:
         """Reap senders that reached SUCCESS / FAILED."""
 
-        terminal = self.disagg_prefill_queue.drain_terminal()
+        if getattr(self, "_disagg_prefill_compute", None):
+            terminal = self.disagg_prefill_queue.drain_terminal(self._prefill_compute_released)
+        else:
+            terminal = self.disagg_prefill_queue.drain_terminal()
         for entry in terminal:
             on_terminal = entry.on_terminal
             if on_terminal is None:
@@ -434,7 +611,9 @@ class SchedulerDisaggregationPrefillMixin:
         ]
         return list(slots_to_page_ids(slot_source, page_size, end - start))
 
-    def _raiden_handoff_chunk(self: Scheduler, req: Req, *, is_final: bool) -> None:
+    def _raiden_handoff_chunk(
+        self: Scheduler, req: Req, *, is_final: bool, snapshot: PrefillHandoff | None = None
+    ) -> None:
         """Register exactly the KV pages produced by the current prefill round."""
 
         req_id = req.rid
@@ -443,8 +622,8 @@ class SchedulerDisaggregationPrefillMixin:
             self._retire_chunk_producer_ownership(req)
             return
 
-        end = len(req.fill_ids)
-        scheduled_start = end - req.extend_input_len
+        end = snapshot.end if snapshot else len(req.fill_ids)
+        scheduled_start = snapshot.start if snapshot else end - req.extend_input_len
         start = int(req.start_send_idx)
         if start != scheduled_start:
             error = RuntimeError(
@@ -477,7 +656,11 @@ class SchedulerDisaggregationPrefillMixin:
                 raise ValueError(
                     f"middle chunk ends at unaligned token {end} for page_size={page_size}"
                 )
-            block_ids = self._extract_req_block_ids_range(req, start, end)
+            block_ids = (
+                list(snapshot.block_ids)
+                if snapshot
+                else self._extract_req_block_ids_range(req, start, end)
+            )
             expected_total_pages = (len(req.origin_input_ids) + page_size - 1) // page_size
             if is_final:
                 from sgl_jax.srt.disaggregation.debug_utils import kv_debug_enabled
@@ -503,8 +686,12 @@ class SchedulerDisaggregationPrefillMixin:
                 is_final=is_final,
                 dp_rank=int(req.dp_rank),
                 expected_total_pages=expected_total_pages,
-                on_ready=lambda buffers=kv_pool.kv_buffer: (
-                    self.disagg_kv_manager.prepare_prefill_batch(buffers)
+                on_ready=(
+                    None
+                    if snapshot
+                    else lambda buffers=kv_pool.kv_buffer: (
+                        self.disagg_kv_manager.prepare_prefill_batch(buffers)
+                    )
                 ),
             )
         except Exception as exc:
@@ -574,6 +761,13 @@ class SchedulerDisaggregationPrefillMixin:
         Returns a per-layer list of ``(padded_pages, page_size, ...)`` arrays.
         """
 
+        # Raiden normally uses raw page IDs. Optional debug extraction uses
+        # JAX arrays and must wait for the newest queued forward's replace_all
+        # before reading the pool, including when resolving an older result.
+        if getattr(self.server_args, "disaggregation_enable_overlap_schedule", False):
+            current = getattr(self, "cur_batch", None)
+            if current is not None and getattr(current, "launch_done", None) is not None:
+                current.launch_done.wait()
         req_to_token = self.req_to_token_pool.req_to_token
         kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
         page_size = kv_pool.page_size
@@ -645,6 +839,9 @@ class SchedulerDisaggregationPrefillMixin:
     def _release_prefill_req_resources(self: Scheduler, req: Req) -> None:
         """Release prefill-side KV and request-pool resources."""
 
+        if not self._prefill_compute_released(req):
+            self._disagg_prefill_deferred_releases[id(req)] = req
+            return
         self._release_prefill_kv_pool(req)
         self._release_prefill_host_buffer(req)
 

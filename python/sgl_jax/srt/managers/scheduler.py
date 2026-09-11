@@ -337,8 +337,8 @@ class Scheduler(
             self.enable_overlap = False
             logger.info("Overlap scheduler is disabled for the multimodal stage pipeline.")
         if server_args.disaggregation_mode != "null":
-            logger.info("PD disaggregation mode enabled, disabling overlap schedule")
-            self.enable_overlap = False
+            self.enable_overlap = server_args.disaggregation_enable_overlap_schedule
+            logger.info("PD scheduler overlap enabled=%s", self.enable_overlap)
 
         # Init grammar backend for structured output
         self.grammar_backend = None
@@ -354,6 +354,8 @@ class Scheduler(
             self.grammar_backend = None
 
         if not self.is_generation:
+            if server_args.disaggregation_enable_overlap_schedule:
+                raise ValueError("PD scheduler overlap requires a generation model")
             self.enable_overlap = False
             logger.info("Overlap scheduler is disabled for embedding models.")
 
@@ -471,6 +473,16 @@ class Scheduler(
         self.per_dp_max_running_requests = self.max_running_requests // self.dp_size
 
         self.is_hybrid = self.tp_worker.is_hybrid
+        # ServerArgs validates launch flags; these facts are only known after
+        # model/runtime initialization. nnodes=1 does not prove one JAX process,
+        # and the multimodal launch flag does not identify every model type.
+        if server_args.disaggregation_enable_overlap_schedule and (
+            self.is_hybrid or self.model_config.is_multimodal or jax.process_count() != 1
+        ):
+            raise ValueError(
+                "PD scheduler overlap currently requires a single-process, "
+                "full-attention text model"
+            )
         self.sliding_window_size = None
         if self.is_hybrid:
             self.sliding_window_size = self.tp_worker.sliding_window_size
@@ -1383,6 +1395,15 @@ class Scheduler(
         req.bootstrap_room = recv_req.bootstrap_room
         req.disagg_prefill_dp_rank = getattr(recv_req, "disagg_prefill_dp_rank", None)
         req.disagg_transfer_id = recv_req.disagg_transfer_id or req.rid
+        if (
+            getattr(self.server_args, "disaggregation_enable_overlap_schedule", False)
+            and self.server_args.disaggregation_mode == "prefill"
+            and req.bootstrap_room is None
+        ):
+            req.set_finish_with_abort("PD prefill overlap requires a bootstrap_room")
+            req.check_finished()
+            self._stream_prefill_req(req)
+            return
         if hasattr(recv_req, "mm_inputs") and recv_req.mm_inputs:
             req.mm_inputs = recv_req.mm_inputs
             multimodal_embedding = _extract_mm_value(recv_req.mm_inputs, "multimodal_embedding")
@@ -1595,6 +1616,9 @@ class Scheduler(
         ret["disagg_prefill_queue_size"] = len(self.disagg_prefill_queue or ())
         ret["disagg_prealloc_queue_size"] = len(self.disagg_prealloc_queue or ())
         ret["disagg_transfer_queue_size"] = len(self.disagg_transfer_queue or ())
+        ret["disaggregation_overlap_enabled"] = (
+            self.enable_overlap and self.server_args.disaggregation_mode != "null"
+        )
 
         return GetInternalStateReqOutput(internal_state=ret)
 
@@ -2507,6 +2531,21 @@ class Scheduler(
         if (kv_full_retract_flag := not batch.check_decode_mem()) or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
+            if (
+                self.enable_overlap
+                and self.server_args.disaggregation_mode == "decode"
+                and self.result_queue
+            ):
+                # Native receives may reuse freed pages outside JAX's ordered
+                # dispatch. Retraction must retire all prior compute first.
+                self._drain_disagg_decode_overlap_results()
+                batch.filter_batch()
+                for info in batch.reqs_info:
+                    if len(info.reqs) < self.per_dp_max_running_requests:
+                        info.batch_is_full = False
+                if batch.is_empty():
+                    return batch
+                return self.update_running_batch(batch)
             old_ratio = self.new_token_ratio
 
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(self.server_args)
@@ -2995,7 +3034,11 @@ class Scheduler(
 
         # finish all in-flight request; in overlap mode, last_batch is running
         self._sync_chunked_req_owners()
-        if self.enable_overlap and self.last_batch:
+        if self.enable_overlap and self.server_args.disaggregation_mode == "prefill":
+            self._drain_disagg_prefill_overlap_results()
+        elif self.enable_overlap and self.server_args.disaggregation_mode == "decode":
+            self._drain_disagg_decode_overlap_results()
+        elif self.enable_overlap and self.last_batch:
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
             self.last_batch = None
@@ -3071,9 +3114,15 @@ def dispatch_scheduler_event_loop(scheduler: Scheduler, server_args: ServerArgs)
 
     mode = server_args.disaggregation_mode
     if mode == "prefill":
-        scheduler.event_loop_normal_disagg_prefill()
+        if scheduler.enable_overlap:
+            scheduler.event_loop_overlap_disagg_prefill()
+        else:
+            scheduler.event_loop_normal_disagg_prefill()
     elif mode == "decode":
-        scheduler.event_loop_normal_disagg_decode()
+        if scheduler.enable_overlap:
+            scheduler.event_loop_overlap_disagg_decode()
+        else:
+            scheduler.event_loop_normal_disagg_decode()
     elif scheduler.pd == "pathways" and getattr(scheduler, "_pd_n_decode", 1) > 1:
         scheduler.event_loop_overlap_pd_nd()
     elif scheduler.enable_overlap:

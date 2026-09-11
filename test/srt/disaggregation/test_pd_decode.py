@@ -8,6 +8,8 @@ import time
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
 from sgl_jax.srt.disaggregation.base.transfer import DecodeAdmission
 from sgl_jax.srt.disaggregation.common.core import CommonKVManager
@@ -785,6 +787,7 @@ def test_paused_decode_drains_inflight_transfer_to_completion():
 
         def __init__(self, entry):
             self._engine_paused = True
+            self.token_to_kv_pool_allocator = SimpleNamespace(page_size=4)
             self.entry = entry
             self.installed = []
             self.bookkept = []
@@ -1111,3 +1114,80 @@ class TestTerminalRecords:
         m.record_terminal("r1", role="prefill", transfer_id="t1", state=KVPoll.FAILED, reason="x")
         m.register_sender("r1", _FakeParticipant(1.0))
         assert m.get_terminal_record("r1", role="prefill") is None
+
+
+def test_received_prompt_tail_page_is_reclaimed_at_page_boundaries():
+    import numpy as np
+
+    from sgl_jax.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
+
+    for page_size in (1, 128):
+        for seqlen in (1, 127, 128, 129, 2048, 2049):
+            allocator = PagedTokenToKVPoolAllocator(4096, page_size, None)
+            indices = allocator.alloc((seqlen + page_size - 1) // page_size * page_size)
+            req = SimpleNamespace(
+                origin_input_ids=list(range(seqlen)), dp_rank=0, output_ids=[], pd_time_stats=None
+            )
+            entry = DecodeBookkeeping(
+                req_id="tail",
+                req=req,
+                kv_indices=indices,
+                receiver=SimpleNamespace(commit=lambda install: None),
+                synced_state=KVPoll.SUCCESS,
+            )
+            scheduler = SimpleNamespace(
+                server_args=SimpleNamespace(enable_request_time_stats_logging=False),
+                token_to_kv_pool_allocator=allocator,
+                _drain_transfer_queue_synced=lambda: [entry],
+                _set_decode_bookkeeping=lambda r, ix: SchedulerDisaggregationDecodeMixin._set_decode_bookkeeping(
+                    scheduler, r, ix
+                ),
+                _release_decode_kv_indices=lambda ix, rank: allocator.free(np.asarray(ix), rank),
+                _enqueue_for_decode=lambda r: None,
+                _pd_mark_time=lambda r, name: None,
+            )
+            SchedulerDisaggregationDecodeMixin._drain_decode_transfer_terminals(scheduler)
+            assert len(req.prefix_indices) == seqlen - 1
+            # Reclaim every page owned by the decode prefix; together with the
+            # unused received tail, this must restore the full allocator.
+            allocator.free(req.prefix_indices)
+            assert allocator.available_size() == 4096, (page_size, seqlen)
+
+
+@pytest.mark.parametrize("blocked", ["window", "capacity", "metadata"])
+def test_overlap_does_not_fence_inadmissible_receives(blocked):
+    sched = _AdmScheduler(
+        capacity=0 if blocked == "capacity" else 100,
+        reserved=0,
+        max_inflight=1 if blocked == "window" else 0,
+    )
+    sched.enable_overlap = True
+    sched._wait_decode_admission_safe = mock.Mock()
+    entry = _enqueue(sched, "pending", seqlen=4)
+    if blocked == "window":
+        sched.disagg_transfer_queue.add(entry)
+    if blocked == "metadata":
+        sched.disagg_kv_manager.metadata_ready = False
+    sched._admit_decode_prealloc()
+    sched._wait_decode_admission_safe.assert_not_called()
+    assert not sched.disagg_kv_manager.created
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_receive_admission_fences_once_before_all_native_receives(overlap):
+    sched = _AdmScheduler(capacity=100, reserved=0)
+    sched.enable_overlap = overlap
+    events = []
+    sched._wait_decode_admission_safe = lambda: events.append("fence")
+    start = sched.disagg_kv_manager.try_start_decode
+
+    def receive(context):
+        events.append(context.req_id)
+        return start(context)
+
+    sched.disagg_kv_manager.try_start_decode = receive
+    _enqueue(sched, "a", seqlen=4)
+    _enqueue(sched, "b", seqlen=4)
+    sched._admit_decode_prealloc()
+    assert events == (["fence"] if overlap else []) + ["a", "b"]
+    assert len(sched.disagg_transfer_queue) == 2

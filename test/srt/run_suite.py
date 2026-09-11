@@ -339,6 +339,12 @@ suites = {
         TestFile("test/srt/disaggregation/test_pd_raiden.py", 0.5, runner="pytest"),
         TestFile("test/srt/disaggregation/test_pd_router.py", 0.5, runner="pytest"),
         TestFile("test/srt/disaggregation/test_pd_transfer.py", 0.5, runner="pytest"),
+        TestFile("test/srt/disaggregation/test_pd_decode_overlap.py", 0.1, runner="pytest"),
+        TestFile("test/srt/disaggregation/test_pd_prefill_overlap.py", 0.1, runner="pytest"),
+        TestFile("test/srt/disaggregation/test_pd_overlap_args.py", 0.1, runner="pytest"),
+        TestFile("test/srt/disaggregation/test_pd_logprob_stream.py", 0.1, runner="pytest"),
+        TestFile("test/srt/disaggregation/test_raiden_loader.py", 0.1, runner="pytest"),
+        TestFile("test/srt/test_generate_stream_numpy.py", 0.1, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/test_model_runner_kv_cache_mixin.py",
             0.2,
