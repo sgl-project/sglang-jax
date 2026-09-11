@@ -1156,41 +1156,64 @@ def _mla_ragged_paged_attention_kernel(
                 def update_cur_bkv_to_cache():
                     start_update_kv_cache(batch_start_seq_idx, bkv_sem_idx, offsets, update_szs)
 
-                # Load bkv into vreg. There is no need to mask out invalid k/v entries,
-                # because the score of invalid Q.K^T pairs are masked (to be zero) in
-                # flash attention, so that the invalid kv entries
-                # (as long as they are not NaN or inf) won't affect to the output.
-                bkvc, bkpe = load_bkv(
-                    bkv_sem_idx,
-                )
+                # Skip wholly future blocks only for BF16 ragged prefill with the
+                # default mask. Keep all DMA and cache work above unconditional:
+                # the first query block must still update every new KV block.
+                has_visible_kv = True
+                if (
+                    batch_size == 1
+                    and static_q_len is None
+                    and q_dtype == jnp.bfloat16
+                    and kv_dtype == jnp.bfloat16
+                    and mask_value == DEFAULT_MASK_VALUE
+                ):
+                    q_len = (
+                        cu_q_lens_ref[batch_start_seq_idx + 1] - cu_q_lens_ref[batch_start_seq_idx]
+                    )
+                    visible_end = (
+                        kv_lens_ref[batch_start_seq_idx]
+                        - q_len
+                        + jnp.minimum((bq_idx + 1) * actual_bq_sz, q_len)
+                    )
+                    has_visible_kv = bkv_idx * bkv_sz < visible_end
 
-                bq_nope_vec, bq_pe_vec = load_bq(bq_sem_idx, actual_bq_sz=actual_bq_sz)
+                @pl.when(has_visible_kv)
+                def compute_attention_block():
+                    # Load bkv into vreg. There is no need to mask out invalid k/v entries,
+                    # because the score of invalid Q.K^T pairs are masked (to be zero) in
+                    # flash attention, so that the invalid kv entries
+                    # (as long as they are not NaN or inf) won't affect to the output.
+                    bkvc, bkpe = load_bkv(
+                        bkv_sem_idx,
+                    )
 
-                debug_print("[RPA debug] flash attention")
-                debug_print(
-                    "[RPA debug] bq_nope_vec.shape={}, {}",
-                    bq_nope_vec.shape[0],
-                    bq_nope_vec.shape[1],
-                )  # num_bkv=3, bkv_sz=512
-                debug_print(
-                    "[RPA debug] bq_pe_vec.shape={}, {}",
-                    bq_pe_vec.shape[0],
-                    bq_pe_vec.shape[1],
-                )
-                debug_print("[RPA debug] bkvc.shape={}, {}", bkvc.shape[0], bkvc.shape[1])
-                debug_print("[RPA debug] bkpe.shape={}, {}", bkpe.shape[0], bkpe.shape[1])
+                    bq_nope_vec, bq_pe_vec = load_bq(bq_sem_idx, actual_bq_sz=actual_bq_sz)
 
-                if debug_mode:
-                    return
+                    debug_print("[RPA debug] flash attention")
+                    debug_print(
+                        "[RPA debug] bq_nope_vec.shape={}, {}",
+                        bq_nope_vec.shape[0],
+                        bq_nope_vec.shape[1],
+                    )  # num_bkv=3, bkv_sz=512
+                    debug_print(
+                        "[RPA debug] bq_pe_vec.shape={}, {}",
+                        bq_pe_vec.shape[0],
+                        bq_pe_vec.shape[1],
+                    )
+                    debug_print("[RPA debug] bkvc.shape={}, {}", bkvc.shape[0], bkvc.shape[1])
+                    debug_print("[RPA debug] bkpe.shape={}, {}", bkpe.shape[0], bkpe.shape[1])
 
-                flash_attention(
-                    bq_nope_vec,
-                    bq_pe_vec,
-                    bkvc,
-                    bkpe,
-                    bq_idx=bq_idx,
-                    bkv_idx=bkv_idx,
-                )
+                    if debug_mode:
+                        return
+
+                    flash_attention(
+                        bq_nope_vec,
+                        bq_pe_vec,
+                        bkvc,
+                        bkpe,
+                        bq_idx=bq_idx,
+                        bkv_idx=bkv_idx,
+                    )
 
             lax.fori_loop(0, num_bkv, compute_with_bkv, None, unroll=False)
 
