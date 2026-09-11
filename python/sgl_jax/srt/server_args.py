@@ -57,6 +57,22 @@ def apply_multimodal_model_defaults(server_args, model_config) -> None:
         server_args.limit_mm_data_per_request = {"image": 16}
 
 
+# Exact list, matching resolve_speculative_algorithm in upstream
+# sgl-project/sglang (srt/arg_groups/speculative_hook.py). Kept exact rather
+# than a Gemma4*Assistant* pattern so a future assistant variant fails loudly
+# on the unsupported path instead of being silently promoted into a frozen-KV
+# path that may not fit it. Keep in sync with EntryClass in models/gemma4_mtp.py.
+_FROZEN_KV_MTP_DRAFT_ARCHS = (
+    "Gemma4AssistantForCausalLM",
+    "Gemma4UnifiedAssistantForCausalLM",
+)
+
+
+def _is_frozen_kv_mtp_arch(architecture: str) -> bool:
+    """Is this draft architecture a Q-only, KV-sharing (frozen-KV) MTP head?"""
+    return architecture in _FROZEN_KV_MTP_DRAFT_ARCHS
+
+
 def _validate_disaggregation_host_ip(host_ip: str) -> str:
     if host_ip in _REJECTED_PD_HOST_ALIASES:
         raise ValueError(
@@ -1584,7 +1600,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "DFLASH"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "FROZEN_KV_MTP", "STANDALONE", "DFLASH"],
             help="Speculative algorithm.",
             default=ServerArgs.speculative_algorithm,
         )
@@ -1975,7 +1991,97 @@ class ServerArgs:
         )
         return hf_config
 
+    def get_speculative_draft_hf_config(self):
+        """HF config of the draft checkpoint, or None if it cannot be read.
+
+        Best-effort: a missing or unreadable draft config is not fatal here, the
+        draft ModelWorker will fail with a better message than arg validation can.
+        """
+        if not self.speculative_draft_model_path:
+            return None
+        try:
+            return get_config(
+                self.speculative_draft_model_path,
+                trust_remote_code=self.trust_remote_code,
+                revision=self.speculative_draft_model_revision or self.revision,
+            )
+        except Exception as e:
+            logger.debug("Could not read draft config for algorithm promotion: %s", e)
+            return None
+
+    def maybe_promote_speculative_algorithm(self):
+        """Promote NEXTN/EAGLE to FROZEN_KV_MTP for Gemma4 assistant drafts.
+
+        Mirrors ``resolve_speculative_algorithm`` in upstream sgl-project/sglang
+        (srt/arg_groups/speculative_hook.py): both NEXTN and EAGLE promote, and
+        EAGLE3 is rejected outright for this draft architecture. Upstream's
+        Gemma 4 cookbook documents ``--speculative-algorithm NEXTN`` with a
+        ``*-it-assistant`` draft, so users never type FROZEN_KV_MTP.
+
+        Without the promotion that documented command silently does the wrong
+        thing here: NEXTN routes to MultiLayerDraftWorker's per-layer branch,
+        which builds one full draft model per step and never applies the
+        KV-share redirect, so the Q-only attention reads an empty draft-local
+        cache and returns garbage rather than failing.
+
+        Deliberately NOT copied from upstream: its fallthrough rewrites a
+        non-Gemma4 NEXTN to EAGLE. Upstream has no NEXTN enum member, whereas
+        here NEXTN is a distinct algorithm with its own per-layer worker for
+        DeepSeek/MiMo drafts, so that rewrite would break it.
+        """
+        if self.speculative_algorithm not in ("NEXTN", "EAGLE", "EAGLE3"):
+            return
+        draft_config = self.get_speculative_draft_hf_config()
+        if draft_config is None:
+            return
+        architectures = getattr(draft_config, "architectures", None) or []
+        matched = next((a for a in architectures if _is_frozen_kv_mtp_arch(a)), None)
+        if matched is None:
+            return
+
+        if self.speculative_algorithm == "EAGLE3":
+            raise ValueError(
+                f"{matched} draft requires --speculative-algorithm NEXTN or EAGLE; "
+                f"EAGLE3 is not supported for this draft architecture."
+            )
+
+        logger.info(
+            "Detected %s draft; promoting --speculative-algorithm %s to FROZEN_KV_MTP.",
+            matched,
+            self.speculative_algorithm,
+        )
+        self.speculative_algorithm = "FROZEN_KV_MTP"
+
+    def _validate_frozen_kv_mtp_args(self):
+        """Fail at startup for configurations the dedicated worker cannot run."""
+        if self.speculative_algorithm != "FROZEN_KV_MTP":
+            return
+        if self.speculative_draft_model_path is None:
+            raise ValueError("FROZEN_KV_MTP requires --speculative-draft-model-path.")
+
+        draft_config = self.get_speculative_draft_hf_config()
+        architectures = getattr(draft_config, "architectures", None) or []
+        if not any(_is_frozen_kv_mtp_arch(arch) for arch in architectures):
+            raise ValueError(
+                "FROZEN_KV_MTP requires a supported Gemma 4 assistant draft architecture; "
+                f"found {architectures or 'no architecture metadata'}."
+            )
+        if self.speculative_eagle_topk != 1:
+            raise ValueError("FROZEN_KV_MTP requires --speculative-eagle-topk=1.")
+        if self.speculative_num_draft_tokens != self.speculative_num_steps + 1:
+            raise ValueError(
+                "FROZEN_KV_MTP requires --speculative-num-draft-tokens to equal "
+                "--speculative-num-steps + 1."
+            )
+        if not self.disable_overlap_schedule:
+            raise ValueError("FROZEN_KV_MTP currently requires --disable-overlap-schedule.")
+
     def check_server_args(self):
+        # Runs before every speculative_algorithm check below, so they all see
+        # the promoted value rather than the raw CLI string.
+        self.maybe_promote_speculative_algorithm()
+        self._validate_frozen_kv_mtp_args()
+
         assert (self.tp_size) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
 
         if self.moe_dp_size < 1:

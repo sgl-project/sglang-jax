@@ -131,6 +131,49 @@ RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
 
 
+def _split_spec_new_seq_lens(
+    new_seq_lens,
+    *,
+    real_bs_per_dp: list[int],
+    per_dp_bs: int,
+) -> list[np.ndarray]:
+    """Map speculative sequence lengths back to their DP-attention ranks.
+
+    Frozen-KV publishes only live request rows in rank order, while existing
+    static-shape speculative programs can publish the full padded DP bucket.
+    Only the scheduler knows both ``real_bs_per_dp`` and ``per_dp_bs``, so it
+    normalizes the two layouts here instead of teaching a model worker about
+    scheduler padding policy.
+    """
+    invalid_rank_size = any(rank_bs < 0 or rank_bs > per_dp_bs for rank_bs in real_bs_per_dp)
+    if per_dp_bs <= 0 or invalid_rank_size:
+        raise ValueError(
+            "Invalid speculative DP batch geometry: "
+            f"per_dp_bs={per_dp_bs}, real_bs_per_dp={real_bs_per_dp}."
+        )
+    values = np.asarray(new_seq_lens).reshape(-1)
+    real_bs = sum(real_bs_per_dp)
+    padded_bs = per_dp_bs * len(real_bs_per_dp)
+    if values.shape[0] == real_bs:
+        result = []
+        offset = 0
+        for rank_bs in real_bs_per_dp:
+            result.append(values[offset : offset + rank_bs])
+            offset += rank_bs
+        return result
+    if values.shape[0] == padded_bs:
+        return [
+            values[rank * per_dp_bs : rank * per_dp_bs + rank_bs]
+            for rank, rank_bs in enumerate(real_bs_per_dp)
+        ]
+    raise ValueError(
+        "Speculative next sequence lengths match neither compact nor DP-padded "
+        "request layout: "
+        f"rows={values.shape[0]}, real_bs={real_bs}, padded_bs={padded_bs}, "
+        f"real_bs_per_dp={real_bs_per_dp}."
+    )
+
+
 def _clear_embedding_pools(
     workers: Iterable[ModelWorker | ModelWorkerClient | None],
 ) -> None:
@@ -217,6 +260,29 @@ class Scheduler(
     """
     A scheduler that manages a tensor parallel TPU worker, which managaes fixed multi TPU devices.
     """
+
+    def _select_eagle_worker_class(self, server_args: ServerArgs):
+        """Select the worker from the resolved speculative algorithm and model shape."""
+        if self.spec_algorithm.is_frozen_kv_mtp():
+            from sgl_jax.srt.speculative.frozen_kv_mtp_worker import FrozenKvMtpWorker
+
+            return FrozenKvMtpWorker
+
+        n_mtp = getattr(self.tp_worker.model_config.hf_config, "num_nextn_predict_layers", None)
+        if n_mtp is None and self.spec_algorithm.is_nextn():
+            n_mtp = server_args.speculative_num_steps
+        self._spec_multi_layer = n_mtp is not None and n_mtp > 1
+
+        if self._spec_multi_layer:
+            from sgl_jax.srt.speculative.multi_layer_eagle_worker import (
+                MultiLayerEAGLEWorker,
+            )
+
+            return MultiLayerEAGLEWorker
+
+        from sgl_jax.srt.speculative.eagle_worker import EAGLEWorker
+
+        return EAGLEWorker
 
     def __init__(
         self,
@@ -412,25 +478,7 @@ class Scheduler(
         # launch draft worker
         self._spec_multi_layer = False
         if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
-            # Multi-layer vs single-layer is a model property (how many MTP heads
-            # the target ships), not a CLI-algorithm property. NEXTN with a single
-            # MTP head behaves exactly like EAGLE (same head run N times).
-            # DeepSeek-style configs expose num_nextn_predict_layers; MiMo-style
-            # configs don't, so fall back to --speculative-num-steps under NEXTN
-            # (one MTP weight set per step).
-            n_mtp = getattr(self.tp_worker.model_config.hf_config, "num_nextn_predict_layers", None)
-            if n_mtp is None and self.spec_algorithm.is_nextn():
-                n_mtp = server_args.speculative_num_steps
-            self._spec_multi_layer = n_mtp is not None and n_mtp > 1
-            if self._spec_multi_layer:
-                from sgl_jax.srt.speculative.multi_layer_eagle_worker import (
-                    MultiLayerEAGLEWorker as _SpecWorkerCls,
-                )
-            else:
-                from sgl_jax.srt.speculative.eagle_worker import (
-                    EAGLEWorker as _SpecWorkerCls,
-                )
-
+            _SpecWorkerCls = self._select_eagle_worker_class(server_args)
             self.draft_worker = _SpecWorkerCls(
                 server_args=server_args,
                 target_worker=self.tp_worker,
@@ -2826,12 +2874,28 @@ class Scheduler(
                 )
                 advance_from_accept_lens = False
             per_dp_bs = model_worker_batch.per_dp_bs_size
+            new_seq_lens_per_dp = None
+            if new_seq_lens is not None:
+                # Do not use ``dp_rank * per_dp_bs`` unconditionally here.
+                # Frozen-KV returns compact rank-concatenated rows, so an
+                # unbalanced DP-attention batch such as [15, 16] starts rank 1
+                # at row 15 rather than at its static bucket offset, row 32.
+                real_bs_per_dp = list(model_worker_batch.real_bs_per_dp)
+                new_seq_lens_per_dp = _split_spec_new_seq_lens(
+                    new_seq_lens,
+                    real_bs_per_dp=real_bs_per_dp,
+                    per_dp_bs=per_dp_bs,
+                )
             for dp_rank, info in enumerate(batch.reqs_info):
                 if info.seq_lens is None or len(info.seq_lens) == 0:
                     continue
                 if new_seq_lens is not None:
-                    off = dp_rank * per_dp_bs
-                    delta = new_seq_lens[off : off + len(info.seq_lens)]
+                    delta = new_seq_lens_per_dp[dp_rank]
+                    if len(delta) != len(info.seq_lens):
+                        raise ValueError(
+                            "Speculative next sequence lengths lost request rows during DP split: "
+                            f"rank={dp_rank}, rows={len(delta)}, requests={len(info.seq_lens)}."
+                        )
                     if advance_from_accept_lens:
                         info.seq_lens = info.seq_lens + delta
                     else:

@@ -2810,7 +2810,7 @@ class ScheduleBatch:
             return out
 
         if legacy_host_scatter:
-            return type(flat)(
+            kwargs = dict(
                 topk_p=_scatter1(flat.topk_p),
                 topk_index=_scatter1(flat.topk_index),
                 hidden_states=_scatter1(flat.hidden_states),
@@ -2822,8 +2822,13 @@ class ScheduleBatch:
                 new_seq_lens=_scatter1(flat.new_seq_lens),
                 future_indices=_scatter1(flat.future_indices),
             )
+            if getattr(flat, "seed_state", None) is not None:
+                kwargs["seed_state"] = flat.seed_state.scatter(selector, total_bs)
+            if hasattr(flat, "relay_seed_mask"):
+                kwargs["relay_seed_mask"] = _scatter1(getattr(flat, "relay_seed_mask", None))
+            return type(flat)(**kwargs)
 
-        return type(flat)(
+        kwargs = dict(
             topk_p=_scatter1(flat.topk_p, data_sharded=True),
             topk_index=_scatter1(flat.topk_index, data_sharded=True),
             hidden_states=_scatter1(flat.hidden_states),
@@ -2835,6 +2840,14 @@ class ScheduleBatch:
             new_seq_lens=_scatter1(flat.new_seq_lens),
             future_indices=_scatter1(flat.future_indices),
         )
+        if getattr(flat, "seed_state", None) is not None:
+            kwargs["seed_state"] = flat.seed_state.scatter(selector, total_bs)
+        if hasattr(flat, "relay_seed_mask"):
+            # This is scheduler metadata, not a device model tensor.  It tells
+            # Frozen-KV whether a restored relay row starts from a target seed
+            # or from ordinary prefill proposal state.
+            kwargs["relay_seed_mask"] = _scatter1(getattr(flat, "relay_seed_mask", None))
+        return type(flat)(**kwargs)
 
     @staticmethod
     def _split_spec_info_per_rank(flat, real_bs_per_dp: list[int]) -> list:
@@ -2937,6 +2950,7 @@ class ScheduleBatch:
             if n == 0:
                 out.append(None)
                 continue
+            end = offset + n
             kwargs = {"capture_hidden_mode": flat.capture_hidden_mode}
             for f in per_req_fields:
                 v = getattr(flat, f, None)
@@ -2949,6 +2963,13 @@ class ScheduleBatch:
                     kwargs[f] = None
                 else:
                     kwargs[f] = None if v is None else v[offset : offset + n]
+            if getattr(flat, "seed_state", None) is not None:
+                kwargs["seed_state"] = flat.seed_state.filter(
+                    np.arange(offset, end, dtype=np.int32)
+                )
+            if hasattr(flat, "relay_seed_mask"):
+                value = getattr(flat, "relay_seed_mask", None)
+                kwargs["relay_seed_mask"] = None if value is None else np.asarray(value)[offset:end]
             out.append(type(flat)(**kwargs))
             offset += n
         return out
@@ -3052,6 +3073,25 @@ class ScheduleBatch:
             else:
                 nonnull = [np.asarray(v) for v in nonnull]
                 kwargs[f] = np.concatenate(nonnull, axis=0)
+        seed_states = [getattr(s, "seed_state", None) for s in nonempty]
+        if any(s is not None for s in seed_states):
+            if not all(s is not None for s in seed_states):
+                raise ValueError("Frozen-KV seed_state must be present on every non-empty DP rank")
+            merged_seed = seed_states[0]
+            for seed in seed_states[1:]:
+                merged_seed = merged_seed.merge(seed)
+            kwargs["seed_state"] = merged_seed
+        if hasattr(nonempty[0], "relay_seed_mask"):
+            relay_masks = [getattr(s, "relay_seed_mask", None) for s in nonempty]
+            nonnull_masks = [m for m in relay_masks if m is not None]
+            if nonnull_masks:
+                if len(nonnull_masks) != len(nonempty):
+                    raise ValueError(
+                        "Frozen-KV relay_seed_mask must be present on every non-empty DP rank"
+                    )
+                kwargs["relay_seed_mask"] = np.concatenate(
+                    [np.asarray(m, dtype=bool) for m in nonnull_masks], axis=0
+                )
         return type(nonempty[0])(**kwargs)
 
     def get_model_worker_batch(

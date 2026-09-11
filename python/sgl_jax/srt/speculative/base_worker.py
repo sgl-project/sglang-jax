@@ -57,6 +57,33 @@ class BaseDraftWorker(ABC):
     def draft_extend_for_decode(self, model_worker_batch, batch_output):
         pass
 
+    def build_next_draft_input_after_verify(
+        self,
+        *,
+        verified_id,
+        hidden_states,
+        new_seq_lens,
+        allocate_lens,
+        accept_lens,
+        accept_index,
+        model_worker_batch,
+    ):
+        """Build the next-round draft state after shared target verification.
+
+        The default keeps the existing EAGLE behavior: verification has already
+        gathered the accepted token and corresponding target hidden state, so
+        construct the usual ``new_draft_input`` object from those arrays.
+        Algorithms with a different handoff (for example Frozen-KV) can
+        override this seam without replacing the common target verification
+        and scheduler bookkeeping.
+        """
+        return self.new_draft_input(
+            verified_id=verified_id,
+            new_seq_lens=new_seq_lens,
+            allocate_lens=allocate_lens,
+            hidden_states=hidden_states,
+        )
+
 
 class BaseSpecWorker:
     """Speculative decode orchestrator.
@@ -146,6 +173,28 @@ class BaseSpecWorker:
             and not getattr(model_worker_batch, "return_logprob", False)
             and not getattr(model_worker_batch, "return_output_logprob_only", False)
         )
+
+    def supports_non_fused_spec_prefill_precompile(self) -> bool:
+        """Whether generic startup may warm this algorithm's normal EXTEND path.
+
+        Batch/token/cache bucket selection stays in ``EAGLEWorker``.  An
+        algorithm opts in only when ``forward_batch_speculative_generation``
+        can safely execute its non-fused prefill path using the standard dummy
+        batch.  This is deliberately separate from whether fused prefill or
+        overlap is supported.
+        """
+        return False
+
+    @staticmethod
+    def wait_for_spec_prefill_precompile(result) -> None:
+        """Wait for small output leaves so startup compilation really completes."""
+        leaves = [getattr(result, "next_token_ids", None)]
+        draft_input = getattr(result, "next_draft_input", None)
+        if draft_input is not None:
+            leaves.append(getattr(draft_input, "topk_index", None))
+        for leaf in leaves:
+            if hasattr(leaf, "block_until_ready"):
+                leaf.block_until_ready()
 
     def _get_cur_allocate_lens(self, model_worker_batch: ModelWorkerBatch):
         allocate_lens = getattr(model_worker_batch.spec_info_padded, "allocate_lens", None)
@@ -364,7 +413,7 @@ class BaseSpecWorker:
 
     def verify(self, model_worker_batch: ModelWorkerBatch, cur_allocate_lens: jax.Array):
         from sgl_jax.srt.managers.scheduler import GenerationBatchResult
-        from sgl_jax.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+        from sgl_jax.srt.speculative.eagle_info import EagleVerifyInput
 
         spec_info: EagleVerifyInput = model_worker_batch.spec_info_padded
         spec_info.allocate_lens = cur_allocate_lens
@@ -372,7 +421,6 @@ class BaseSpecWorker:
         forward_metadata = self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
         )
-
         logits_output, _, cache_miss_count = self.target_worker.forward_batch_generation(
             model_worker_batch, skip_sample=True, forward_metadata=forward_metadata
         )
@@ -422,11 +470,14 @@ class BaseSpecWorker:
             # scheduler-visible length must advance from the original length by the
             # accepted tokens, so add that slot back when publishing new_seq_lens.
             new_seq_lens = model_worker_batch.seq_lens + accept_length + 1
-        next_draft_input = EagleDraftInput(
+        next_draft_input = self.draft_worker.build_next_draft_input_after_verify(
             verified_id=verified_id,
+            hidden_states=logits_output.hidden_states,
             new_seq_lens=new_seq_lens,
             allocate_lens=cur_allocate_lens,
-            hidden_states=logits_output.hidden_states,
+            accept_lens=accept_length,
+            accept_index=accept_index,
+            model_worker_batch=model_worker_batch,
         )
 
         model_worker_batch.spec_info_padded = next_draft_input

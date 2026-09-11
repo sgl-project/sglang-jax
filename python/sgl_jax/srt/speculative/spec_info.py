@@ -60,6 +60,7 @@ class SpeculativeAlgorithm(IntEnum):
     EAGLE = auto()
     EAGLE3 = auto()
     NEXTN = auto()
+    FROZEN_KV_MTP = auto()
     STANDALONE = auto()
     DFLASH = auto()
 
@@ -67,10 +68,17 @@ class SpeculativeAlgorithm(IntEnum):
         return self == SpeculativeAlgorithm.NONE
 
     def is_eagle(self):
+        # FROZEN_KV_MTP is included for the same reason EAGLE3 and NEXTN are:
+        # it shares EAGLE's chain-verify token accounting at every gate site.
+        # Mirrors upstream sgl-project/sglang, whose is_eagle() also covers it
+        # (with a FIXME to drop it once their scheduler supports it natively).
+        # Only the KV pool differs, and that is handled by the draft worker,
+        # not by these predicates.
         return self in (
             SpeculativeAlgorithm.EAGLE,
             SpeculativeAlgorithm.EAGLE3,
             SpeculativeAlgorithm.NEXTN,
+            SpeculativeAlgorithm.FROZEN_KV_MTP,
         )
 
     def is_eagle3(self):
@@ -78,6 +86,9 @@ class SpeculativeAlgorithm(IntEnum):
 
     def is_nextn(self):
         return self == SpeculativeAlgorithm.NEXTN
+
+    def is_frozen_kv_mtp(self):
+        return self == SpeculativeAlgorithm.FROZEN_KV_MTP
 
     def is_standalone(self):
         return self == SpeculativeAlgorithm.STANDALONE
@@ -91,6 +102,7 @@ class SpeculativeAlgorithm(IntEnum):
             "EAGLE": SpeculativeAlgorithm.EAGLE,
             "EAGLE3": SpeculativeAlgorithm.EAGLE3,
             "NEXTN": SpeculativeAlgorithm.NEXTN,
+            "FROZEN_KV_MTP": SpeculativeAlgorithm.FROZEN_KV_MTP,
             "STANDALONE": SpeculativeAlgorithm.STANDALONE,
             "DFLASH": SpeculativeAlgorithm.DFLASH,
             None: SpeculativeAlgorithm.NONE,

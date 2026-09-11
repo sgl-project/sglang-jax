@@ -27,6 +27,10 @@ Two draft families are available:
 - **NEXTN** – fused MTP / NextN speculative path. The CLI and enum support it,
   but the overlap path is restricted to the fused `topk=1` shape described in
   `ServerArgs` validation.
+- **Frozen-KV MTP** – Gemma 4's assistant architecture. It reads the target
+  model's committed KV cache and target hidden states; it does not own or write
+  a separate draft KV cache. The server recognizes the Gemma assistant
+  checkpoint and selects the dedicated Frozen-KV worker automatically.
 
 ## Enabling speculative decoding
 
@@ -99,6 +103,30 @@ At the time of writing we have not published public drafts for other models. If
 you have your own EAGLE/EAGLE3 distilled checkpoint, point
 `--speculative-draft-model-path` to that repo and ensure the tokenizer exactly
 matches the target model.
+
+### Gemma 4 Frozen-KV MTP
+
+The text-only `google/gemma-4-31B-it` assistant is a Frozen-KV MTP draft, not
+an ordinary EAGLE checkpoint. Launch it through the familiar `NEXTN` interface;
+the server promotes the Gemma assistant architecture to the dedicated worker.
+
+```bash
+python3 -m sgl_jax.launch_server \
+  --model-path google/gemma-4-31B-it \
+  --speculative-algorithm NEXTN \
+  --speculative-draft-model-path google/gemma-4-31B-it-assistant \
+  --speculative-num-steps 3 \
+  --speculative-num-draft-tokens 4 \
+  --speculative-eagle-topk 1 \
+  --device tpu --tp-size 4 --attention-backend fa --page-size 128 \
+  --disable-overlap-schedule
+```
+
+Frozen-KV uses a dedicated non-overlap state handoff: after target verification,
+the accepted token and corresponding target hidden state seed the next assistant
+proposal. It supports non-overlap prefill admission and batch merge, but does
+not support speculative overlap scheduling. Use greedy/top-k-one decoding for
+the validated path.
 
 ## Known Gaps
 

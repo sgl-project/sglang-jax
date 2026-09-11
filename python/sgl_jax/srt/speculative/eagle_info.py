@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -221,6 +222,7 @@ class EagleDraftInput:
         speculative_num_draft_tokens: int,
         *,
         use_device_metadata: bool = False,
+        prepare_batch_for_forward: Callable[[ModelWorkerBatch, int], None] | None = None,
     ):
         legacy_non_overlap = (
             model_worker_batch.spec_algorithm is not None
@@ -260,6 +262,8 @@ class EagleDraftInput:
         ) or model_worker_batch.spec_info_padded.accept_length is None:
             model_worker_batch.spec_info_padded.accept_length = batch_output.accept_lens
         model_worker_batch.input_ids = batch_output.next_draft_input.verified_id
+        if prepare_batch_for_forward is not None:
+            prepare_batch_for_forward(model_worker_batch, step_plus_1)
         if use_device_metadata:
             forward_metadata = draft_model_runner.attn_backend.get_eagle_base_metadata(
                 model_worker_batch
@@ -620,22 +624,18 @@ class EagleVerifyInput:
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         model_worker_batch.extend_seq_lens = self.draft_token
 
-    def sample(
+    def sample_device(
         self,
         model_worker_batch: ModelWorkerBatch,
         logits_output: LogitsProcessorOutput,
         rng: nnx.Rngs,
         mesh: Mesh,
-    ) -> jax.Array:
-        """
-        Verify and find accepted tokens based on logits output and batch
-        (which contains spec decoding information).
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        """Return acceptance tensors without a host transfer.
 
-        WARNING: This API in-place modifies the states of logits_output
-
-        This API updates values inside logits_output based on the accepted
-        tokens. I.e., logits_output.next_token_logits only contains
-        accepted token logits.
+        The generic ``sample`` wrapper below preserves the scheduler's
+        host-facing API; dedicated workers can retain the accepted row on
+        device to construct their next-round seed state.
         """
         sampling_info = model_worker_batch.sampling_info
         bs = self.retrive_index.shape[0]
@@ -740,14 +740,32 @@ class EagleVerifyInput:
                 rng=simulation_rng,
             )
 
-        for arr in (predict, accept_index, accept_length):
+        accept_index = accept_index.reshape(-1)
+        safe_accept_index = jnp.clip(accept_index, 0, predict.shape[0] - 1)
+        verified_id = jnp.where(
+            accept_index >= 0,
+            jnp.take(predict, safe_accept_index, axis=0),
+            jnp.zeros_like(accept_index, dtype=predict.dtype),
+        )
+        return predict, verified_id, accept_length, accept_index
+
+    def sample(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        logits_output: LogitsProcessorOutput,
+        rng: nnx.Rngs,
+        mesh: Mesh,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Return acceptance in the generic scheduler's host representation."""
+        predict, verified_id, accept_length, accept_index = self.sample_device(
+            model_worker_batch, logits_output, rng, mesh
+        )
+        for arr in (predict, verified_id, accept_index, accept_length):
             if hasattr(arr, "copy_to_host_async"):
                 arr.copy_to_host_async()
-        predict = np.asarray(predict)
-        accept_index = np.asarray(accept_index)
-        accept_length = np.asarray(accept_length)
-
-        accept_index = accept_index.flatten()
-        verified_id = np.zeros_like(accept_index, dtype=predict.dtype)
-        verified_id[accept_index != -1] = predict[accept_index[accept_index != -1]]
-        return predict, verified_id, accept_length, accept_index
+        return (
+            np.asarray(predict),
+            np.asarray(verified_id),
+            np.asarray(accept_length),
+            np.asarray(accept_index).reshape(-1),
+        )
