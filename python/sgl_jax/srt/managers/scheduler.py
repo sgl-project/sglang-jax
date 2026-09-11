@@ -439,9 +439,13 @@ class Scheduler(
                 self.draft_worker.init_spec_relay_buffers()
         elif self.spec_algorithm is not None and self.spec_algorithm.is_dflash_family():
             if self.spec_algorithm.is_dspark():
-                from sgl_jax.srt.speculative.dspark_worker import DSparkWorker as _SpecWorkerCls
+                from sgl_jax.srt.speculative.dspark_worker import (
+                    DSparkWorker as _SpecWorkerCls,
+                )
             else:
-                from sgl_jax.srt.speculative.dflash_worker import DFlashWorker as _SpecWorkerCls
+                from sgl_jax.srt.speculative.dflash_worker import (
+                    DFlashWorker as _SpecWorkerCls,
+                )
 
             self.draft_worker = _SpecWorkerCls(
                 server_args=server_args,

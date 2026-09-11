@@ -2035,7 +2035,8 @@ class ServerArgs:
         if self.speculative_algorithm == "DSPARK":
             self.speculative_sample_from_anchor = True
         if self.speculative_sample_from_anchor and self.speculative_algorithm not in (
-            "DFLASH", "DSPARK"
+            "DFLASH",
+            "DSPARK",
         ):
             raise ValueError(
                 "--speculative-sample-from-anchor requires --speculative-algorithm DFLASH or DSPARK."
