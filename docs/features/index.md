@@ -8,6 +8,7 @@ Feature docs describe runtime capabilities, operational behavior, and user-visib
 | [Chunked prefill](chunked_prefill.md) | Splitting long prefill into smaller chunks. |
 | [Global JIT compile](global_jit_compile.md) | Compilation cache and startup flow. |
 | [LoRA](lora.md) | LoRA adapter serving support. |
+| [Muse Glimmer](muse_glimmer.md) | Muse Glimmer model, parser, and DFlash design for TPU. |
 | [Quantization](quantization.md) | Quantized model serving support. |
 | [Radix cache](radix_cache.md) | Prefix KV cache reuse. |
 | [Run in Pathways](run_in_pathways.md) | Pathways execution notes. |
