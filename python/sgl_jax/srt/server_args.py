@@ -243,9 +243,6 @@ class ServerArgs:
     enable_single_process: bool = False
     enable_nan_detection: bool = False
 
-    # For sampling
-    use_sort_for_toppk_minp: bool = False
-
     # LoRA
     enable_lora: bool | None = None
     max_lora_rank: int | None = None
@@ -1653,13 +1650,6 @@ class ServerArgs:
             "--enable-single-process",
             action="store_true",
             help="Enable run the engine with single process.",
-        )
-
-        # For sampling
-        parser.add_argument(
-            "--use-sort-for-toppk-minp",
-            action="store_true",
-            help="Use jnp.sort to deal with top_k, top_p and min_p, which improves the grades for math-500 but increase precompile time a lot",
         )
 
         parser.add_argument(

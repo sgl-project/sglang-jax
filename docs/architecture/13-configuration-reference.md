@@ -234,7 +234,6 @@ The table below summarizes the most commonly used launch parameters, recommended
 | `enable_precision_tracer` | `bool` | `False` | Precision tracer (disables chunked prefill) |
 | `enable_deterministic_sampling` | `bool` | `False` | Deterministic sampling |
 | `enable_nan_detection` | `bool` | `False` | NaN detection |
-| `use_sort_for_toppk_minp` | `bool` | `False` | Use `jnp.sort` for Top-K / Top-P |
 | `model_layer_nums` | `int \| None` | `None` | Override the number of model layers |
 | `json_model_override_args` | `str` | `"{}"` | JSON-formatted model config overrides |
 

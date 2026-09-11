@@ -170,7 +170,7 @@ The additional `jax.tree_util.tree_flatten(model_state)` step is not the minimum
 | JIT Function | Use | Key Parameters |
 |---------|------|---------|
 | `jitted_run_model` | Model forward inference | `donate_argnames=["memory_pools"]`, `static_argnames=["model_state_def"]` |
-| `jitted_sampler` | Sampling | `static_argnames=["sampler_state_def", "use_sort_for_toppk_minp"]` |
+| `jitted_sampler` | Sampling | `static_argnames=["sampler_state_def"]` |
 | `jitted_compute_logprobs` | Logprob computation | `static_argnames=["mesh"]` |
 
 `jitted_run_model` internal flow: unflatten `model_state_leaves` into a state tree → rebuild the model via `nnx.merge(model_def, state)` → call `model(forward_batch, memory_pools, logits_metadata)`. The model fetches sub-pools by name from `memory_pools` (such as `token_to_kv_pool`, `swa_kv_pool`, recurrent pool, etc.); the returned updated arrays are passed back to ModelRunner as a `{"token_to_kv_pool": layers_kv_fused, ...}` dict, and `self.memory_pools.replace_all(pool_updates)` writes them back.
