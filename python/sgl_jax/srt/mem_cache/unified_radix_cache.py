@@ -455,17 +455,12 @@ class UnifiedRadixCache(BasePrefixCache):
 
         insert_result = None
         if is_insert and effective_cache_len > 0:
-            if len(self._components_tuple) > 1:
-                insert_params.prev_prefix_len = old_prefix_len
+            insert_params.prev_prefix_len = old_prefix_len
             insert_params.key = radix_key[:page_aligned_token_len]
             insert_params.value = page_aligned_kv_indices
-            # Radix cache takes over one reference from the memory pool.
+            # Radix cache takes over one reference from the memory pool;
+            # _insert_helper frees the request's duplicate slots per node.
             insert_result = self.insert(insert_params)
-            if len(self._components_tuple) == 1:
-                self.token_to_kv_pool_allocator.free(
-                    kv_indices[old_prefix_len : insert_result.prefix_len],
-                    dp_rank=dp_rank,
-                )
         elif not is_insert:
             self.token_to_kv_pool_allocator.free(
                 kv_indices[old_prefix_len:page_aligned_len], dp_rank=dp_rank
@@ -495,7 +490,6 @@ class UnifiedRadixCache(BasePrefixCache):
             req.swa_uuid_for_lock = req.cache_lock_params.swa_uuid_for_lock
             return
 
-        dp_rank = req.dp_rank if req.dp_rank is not None else 0
         radix_key = build_radix_key(req, len(req.fill_ids))
         all_token_len = len(radix_key)
         actual_kv_len = all_token_len - 1 if self.is_eagle else all_token_len
@@ -540,15 +534,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
         insert_params.key = page_aligned_key
         insert_params.value = page_aligned_kv_indices
-        if len(self._components_tuple) > 1:
-            insert_params.prev_prefix_len = old_prefix_len
+        insert_params.prev_prefix_len = old_prefix_len
         # Radix cache takes over one reference from the memory pool.
         insert_result = self.insert(insert_params)
-        if len(self._components_tuple) == 1:
-            self.token_to_kv_pool_allocator.free(
-                kv_indices[old_prefix_len : insert_result.prefix_len],
-                dp_rank=dp_rank,
-            )
 
         # Prefix indices may have been updated, reuse them.
         new_match_result = self.match_prefix(
@@ -874,6 +862,22 @@ class UnifiedRadixCache(BasePrefixCache):
         self._update_evictable_leaf_sets(parent)
         return new_node
 
+    def _unevict_node_on_insert(self, node: UnifiedTreeNode, fresh_value: np.ndarray) -> None:
+        """Restore an evicted node's FULL device value from the request's fresh
+        KV indices during insert. Ownership of those slots moves to the tree."""
+        cd = node.component_data[BASE_COMPONENT_TYPE]
+        assert cd.value is None
+        assert len(fresh_value) % self.page_size == 0, (
+            f"tombstone revive at non-page-aligned len {len(fresh_value)} "
+            f"(page_size={self.page_size})"
+        )
+        cd.value = fresh_value.copy()
+        node_dp_rank = node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
+        self.component_evictable_size_[BASE_COMPONENT_TYPE][node_dp_rank] += len(fresh_value)
+        self._update_aux_evictable_node_sets(node)
+        self._update_evictable_leaf_sets(node)
+        self._update_evictable_leaf_sets(node.parent)
+
     def _insert_helper(
         self,
         node: UnifiedTreeNode,
@@ -895,25 +899,22 @@ class UnifiedRadixCache(BasePrefixCache):
             if prefix_len < len(node.key):
                 node = self._split_node(node.key, node, prefix_len)
 
-            cd = node.component_data[BASE_COMPONENT_TYPE]
-            if self.hicache_enabled and cd.value is None:
-                # Revive a tombstone: adopt the recomputed KV as device value
-                # while keeping the host copy. Duplicate-free is skipped because
-                # the tree owns these fresh slots; the logical walk offset still
-                # advances after this branch.
-                assert prefix_len % self.page_size == 0, (
-                    f"tombstone revive at non-page-aligned len {prefix_len} "
-                    f"(page_size={self.page_size})"
-                )
-                cd.value = value[:prefix_len].copy()
-                node_dp_rank = node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
-                self.component_evictable_size_[BASE_COMPONENT_TYPE][node_dp_rank] += prefix_len
-                self._update_aux_evictable_node_sets(node)
-                self._update_evictable_leaf_sets(node)
-                self._update_evictable_leaf_sets(node.parent)
+            if node.evicted:
+                # Host-backed tombstone: the tree adopts the request's fresh KV
+                # for this span, so none of it is a duplicate to free.
+                self._unevict_node_on_insert(node, value[:prefix_len])
+                for component in self._components_tuple:
+                    if component.component_type != BASE_COMPONENT_TYPE:
+                        component.recover_after_unevict(
+                            node=node,
+                            prefix_len=prefix_len,
+                            total_prefix_len=total_prefix_length,
+                            params=params,
+                        )
             else:
                 value_slice = value[:prefix_len]
                 consumed_from = prefix_len
+                # Let each component claim ownership of overlapping KV slots.
                 for component in self._components_tuple:
                     boundary = component.update_component_on_insert_overlap(
                         node=node,
@@ -929,12 +930,14 @@ class UnifiedRadixCache(BasePrefixCache):
                     consumed_from = min(consumed_from, boundary)
 
                 dup_start = max(0, params.prev_prefix_len - total_prefix_length)
-                if len(self._components_tuple) > 1 and dup_start < consumed_from:
+                if dup_start < consumed_from:
                     node_dp_rank = (
                         node.key.dp_rank
                         if node.key is not None and node.key.dp_rank is not None
                         else 0
                     )
+                    # The request's duplicate of a tree-owned span; free_swa
+                    # skips slots the request already released.
                     self.token_to_kv_pool_allocator.free(
                         value_slice[dup_start:consumed_from],
                         dp_rank=node_dp_rank,
