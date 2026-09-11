@@ -833,16 +833,33 @@ class EPMoE(nnx.Module):
             .at[sorted_selected_experts]
             .set(jnp.arange(expected_tokens, dtype=jnp.int32))
         )
-        grouped_indices = jnp.reshape(argsort_indices, (weights.shape[0], top_k))
         weights_fp32 = weights.astype(jnp.float32)
 
-        output = None
-        for k in range(top_k):
-            contribution = (
-                jnp.take(intermediate, indices=grouped_indices[:, k], axis=0).astype(jnp.float32)
-                * weights_fp32[:, k, None]
+        # Static token-count branch: small (decode) batches avoid the unrolled
+        # per-k gather overhead; large (prefill) batches avoid the fp32
+        # (tokens, top_k, hidden) intermediate. Benchmarks in the PR description.
+        if weights.shape[0] <= 256:
+            unsort_intermediate = jnp.take(intermediate, indices=argsort_indices, axis=0)
+            reshaped_intermediate = jnp.reshape(
+                unsort_intermediate,
+                (weights.shape[0], top_k, -1),
             )
-            output = contribution if output is None else output + contribution
+            output = jnp.einsum(
+                "BKE,BK -> BE",
+                reshaped_intermediate.astype(jnp.float32),
+                weights_fp32,
+            )
+        else:
+            grouped_indices = jnp.reshape(argsort_indices, (weights.shape[0], top_k))
+            output = None
+            for k in range(top_k):
+                contribution = (
+                    jnp.take(intermediate, indices=grouped_indices[:, k], axis=0).astype(
+                        jnp.float32
+                    )
+                    * weights_fp32[:, k, None]
+                )
+                output = contribution if output is None else output + contribution
 
         final_output = output.astype(self.dtype)
 

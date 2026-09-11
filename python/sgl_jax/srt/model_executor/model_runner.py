@@ -37,6 +37,7 @@ from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sgl_jax.srt.model_executor.aot_dispatch import (
     AotDispatcher,
     aot_dispatch_requested,
+    decode_no_sc_gather_compiler_options_fn,
 )
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -407,6 +408,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 stable_call_args=(model_def, model_state_def, self.model_state_leaves),
                 stable_flat_args=(model_def, self.model_state_leaves),
                 name="run_model",
+                compiler_options_fn=decode_no_sc_gather_compiler_options_fn(),
             )
 
             def run_model_wrapper(forward_batch, logits_metadata):

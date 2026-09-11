@@ -124,7 +124,7 @@ def _qblock_kernel(
     kvlen_ref,  # [1, 1, 1, QBHp]   VMEM  per-row kv length bound
     base_ref,  # [1, 1, 1, QBHp]    VMEM  per-row page-table base, in TOKENS
     mem_ref,  # [1, 1, U_pad, QBHp] VMEM  int8 membership by union slot
-    kv_hbm,  # flat: [B, T(+RBF), Dk_pad]; paged: [1, num_pages*PS, Dk_pad] HBM
+    kv_hbm,  # flat: [B, T(+RBF), Dk_pad]; paged: 4D pool or [1, Pn*PS, Dk_pad] HBM
     pt_ref,  # [1, 1, 1, PTW]      SMEM  packed page table (paged only)
     o_ref,  # [1, 1, QBHp, Dv]
     kv_scratch,  # [NBUF, RBF, Dk_pad] VMEM  DMA ring
@@ -138,6 +138,15 @@ def _qblock_kernel(
     PS: int,  # page size (paged only; == RB in v1 paged mode)
     PTW: int,
 ):
+    if kv_hbm.ndim == 4:
+        # Paged pool passed in its native word-packed shape. Flattening the
+        # HBM ref here (instead of a host-side jnp.reshape) keeps the pool's
+        # native tile in the graph: on jax 0.11.1 the host-side flat view
+        # forces a full T(2,128)->T(8,128) retile copy of the pool per
+        # chunk (110k prefill: ~+2s). HBM refs are DMA-addressed, so the
+        # in-kernel view is free (same trick as _write_back_kernel).
+        _pn, _pspk, _pk, _dk = kv_hbm.shape
+        kv_hbm = kv_hbm.reshape(1, _pn * _pspk * _pk, _dk)
     """Query-block sparse-MLA kernel, ring-prefetched (flat or packed-paged KV).
 
     In paged mode a unit id is a **global key** = position in the packed
@@ -322,8 +331,7 @@ def sparse_mla_attention_qblock(
         base_tok = base_pages * ps  # [S]
         if kv.shape[-1] != Dk_pad:
             raise ValueError(f"paged cache last dim {kv.shape[-1]} != Dk_pad {Dk_pad}")
-        num_pages = kv.shape[0]
-        kv2 = kv.reshape(1, num_pages * ps, Dk_pad)
+        kv2 = kv  # native 4D pool; flattened inside the kernel (HBM ref view)
         pt_arg = page_indices.reshape(1, 1, 1, PTW).astype(jnp.int32)
     else:
         ps = 0
@@ -663,9 +671,15 @@ def paged_write_back(
 
     def _scatter(cache, row_w, table):
         del table
-        flat = cache.reshape(Pn * ps, D)
-        flat = flat.at[loc].set(row_w.reshape(Tp, D), mode="drop", wrap_negative_indices=False)
-        return flat.reshape(cache.shape)
+        # 4D-native scatter: same slot semantics as the flat-view version but
+        # without cache.reshape(Pn*ps, D), which on jax 0.11.1 materializes a
+        # full retile of the pool inside this cond branch (branch_1_fun,
+        # ~2ms/layer at 110k).
+        page = jnp.where(loc >= 0, loc // ps, -1)
+        rem = jnp.where(loc >= 0, loc % ps, 0)
+        return cache.at[page, rem // pk, rem % pk].set(
+            row.astype(cache.dtype), mode="drop", wrap_negative_indices=False
+        )
 
     if interpret:
         # interpret cannot lower dynamic-size DMAs; the scatter is the

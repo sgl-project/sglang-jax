@@ -36,6 +36,8 @@ import os
 import jax
 from jax._src.lib import xla_client as _xc
 
+from sgl_jax.srt.utils.common_utils import get_bool_env_var
+
 logger = logging.getLogger(__name__)
 
 _ENV = os.environ.get("SGLANG_JAX_AOT_DISPATCH", "0")
@@ -59,6 +61,41 @@ def aot_dispatch_enabled(num_flat_args: int) -> bool:
     return _ENV == "1"
 
 
+def decode_no_sc_gather_compiler_options_fn():
+    """Temporary XLA workaround for the jax 0.11.1 SparseCore gather-offload
+    decode regression on TPU v7x (#1613, jax-ml/jax#40553).
+
+    When SGLANG_JAX_DECODE_DISABLE_SC_GATHER_OFFLOAD is set on TPU, returns a
+    ``compiler_options_fn`` that compiles decode-shaped executables with the
+    offload pass disabled while prefill keeps the default (the offload is
+    profitable for large prefill gathers, and a process-global
+    LIBTPU_INIT_ARGS disable costs ~+12% on 110k prefill). Returns ``None``
+    when the workaround is not requested. Only effective together with
+    SGLANG_JAX_AOT_DISPATCH since it hooks the per-shape AOT compile path.
+    Remove once the upstream cost-model fix ships.
+    """
+    if not (
+        jax.default_backend() == "tpu"
+        and get_bool_env_var("SGLANG_JAX_DECODE_DISABLE_SC_GATHER_OFFLOAD")
+    ):
+        return None
+    logger.info(
+        "SGLANG_JAX_DECODE_DISABLE_SC_GATHER_OFFLOAD: decode executables "
+        "will be compiled with SparseCore gather offload disabled."
+    )
+
+    def _compiler_options_fn(dyn_args):
+        forward_batch = dyn_args[0]
+        if forward_batch.forward_mode.is_decode():
+            return {
+                "xla_tpu_offload_gather_to_sparsecore": "false",
+                "xla_tpu_offload_all_supported_gathers_to_sparsecore": "false",
+            }
+        return None
+
+    return _compiler_options_fn
+
+
 class AotDispatcher:
     """Dispatch ``jit_fn(*stable_call_args, *dyn_args)`` via cached AOT executables.
 
@@ -77,13 +114,21 @@ class AotDispatcher:
     containers between calls.
     """
 
-    def __init__(self, jit_fn, stable_call_args: tuple, stable_flat_args: tuple, name: str):
+    def __init__(
+        self,
+        jit_fn,
+        stable_call_args: tuple,
+        stable_flat_args: tuple,
+        name: str,
+        compiler_options_fn=None,
+    ):
         self._jit_fn = jit_fn
         self._stable_call_args = stable_call_args
         self._stable_flat_args = stable_flat_args
         self._stable_ids = tuple(id(a) for a in stable_flat_args)
         self._cache = {}
         self._name = name
+        self._compiler_options_fn = compiler_options_fn
         self._enabled = None  # decided on first call from flat arg count
 
     def invalidate(self) -> None:
@@ -160,7 +205,17 @@ class AotDispatcher:
                 )
                 return self._jit_fn(*self._stable_call_args, *dyn_args)
 
-        compiled = self._jit_fn.lower(*self._stable_call_args, *dyn_args).compile()
+        compile_opts = self._compiler_options_fn(dyn_args) if self._compiler_options_fn else None
+        lowered = self._jit_fn.lower(*self._stable_call_args, *dyn_args)
+        if compile_opts:
+            logger.info(
+                "[aot-dispatch:%s] compiling with compiler_options=%s",
+                self._name,
+                compile_opts,
+            )
+            compiled = lowered.compile(compiler_options=compile_opts)
+        else:
+            compiled = lowered.compile()
         unsafe = compiled._executable.unsafe_call
         if (
             unsafe.ordered_effects
