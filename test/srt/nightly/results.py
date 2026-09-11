@@ -159,6 +159,7 @@ def build_perf_result(
         "itl_ms": _f("median_itl_ms"),
         "in_tps": _f("input_throughput"),
         "out_tps": _f("output_throughput"),
+        "cache_hit_rate": _f("cache_hit_rate"),
         # Gate-helper fields (not written to CSV).
         "case": case.name,
         "completed": completed,
@@ -293,9 +294,7 @@ def gate_perf_result(case: PerfCase, result: dict) -> tuple[str, str] | None:
 
     # 2. absolute floor — per-metric hard minimum/maximum, by metric direction
     # (higher-is-better → fail under floor; lower-is-better latency → fail over
-    # floor). Today's registered floors are all out_tps (higher), so this is the
-    # same `value < floor` as before; the direction split only matters if a
-    # latency floor (e.g. ttft_ms) is ever registered.
+    # floor).
     floor_failures: list[str] = []
     for metric, floor in floors.items():
         if floor is None:
@@ -308,6 +307,7 @@ def gate_perf_result(case: PerfCase, result: dict) -> tuple[str, str] | None:
                 floor_failures.append(f"{metric}={value:.1f} > floor {floor:.1f}")
         elif value < floor:
             floor_failures.append(f"{metric}={value:.1f} < floor {floor:.1f}")
+
     result["absolute_floor_passed"] = not floor_failures
 
     # 3. trailing baseline (best-effort; skipped when history < min nights).
