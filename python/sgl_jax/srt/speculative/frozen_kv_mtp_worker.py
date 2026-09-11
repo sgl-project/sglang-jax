@@ -484,6 +484,7 @@ class FrozenKvMtpDraftWorker(EagleDraftWorkerBase):
 
         data_sharding = NamedSharding(self.mesh, P("data"))
         hidden_sharding = NamedSharding(self.mesh, P("data", None))
+        replicated_sharding = NamedSharding(self.mesh, P())
 
         @partial(
             jax.jit,
@@ -502,11 +503,16 @@ class FrozenKvMtpDraftWorker(EagleDraftWorkerBase):
             dp_size: int,
         ):
             future_indices = jax.sharding.reshard(future_indices, data_sharding)
-            selector = jax.sharding.reshard(selector, data_sharding)
-            verified_id = jax.sharding.reshard(verified_id, data_sharding)
-            draft_token_ids = jax.sharding.reshard(draft_token_ids, data_sharding)
-            hidden_states = jax.sharding.reshard(hidden_states, hidden_sharding)
-            is_target_seed = jax.sharding.reshard(is_target_seed, data_sharding)
+            # These are compact live-request rows, not the scheduler's padded
+            # DP-attention bucket. A c1 prefill is valid when dp_size > 1, and
+            # even a divisible live-row count need not be balanced by rank.
+            # Replicate the compact values, then use the scheduler-provided
+            # selector to scatter them into their real DP-padded slots below.
+            selector = jax.sharding.reshard(selector, replicated_sharding)
+            verified_id = jax.sharding.reshard(verified_id, replicated_sharding)
+            draft_token_ids = jax.sharding.reshard(draft_token_ids, replicated_sharding)
+            hidden_states = jax.sharding.reshard(hidden_states, replicated_sharding)
+            is_target_seed = jax.sharding.reshard(is_target_seed, replicated_sharding)
 
             total_bs = future_indices.shape[0]
 
@@ -652,42 +658,52 @@ class FrozenKvMtpDraftWorker(EagleDraftWorkerBase):
         seq_lens = jnp.asarray(model_worker_batch.seq_lens, dtype=jnp.int32).reshape(-1)
         allocate = jnp.asarray(allocate_lens, dtype=jnp.int32).reshape(-1)
         req_indices = jnp.asarray(model_worker_batch.req_pool_indices, dtype=jnp.int32).reshape(-1)
-        if min(int(seq_lens.shape[0]), int(allocate.shape[0]), int(req_indices.shape[0])) <= int(
-            selector_host.max(initial=-1)
-        ):
-            raise ValueError("Frozen-KV device verify metadata is smaller than its live selector.")
 
-        def gather_request_rows(value):
-            """Gather selected scheduler rows without losing native sharding.
+        def compact_request_rows(value, field):
+            """Normalize compact or padded scheduler metadata to live rows.
 
-            The padded verifier can be TP-sharded by candidate rows, while the
-            compact live request count may be c1/c2 and therefore cannot use a
-            data-partitioned result.  Annotate only this small metadata gather;
-            never force its source into a replicated layout first.
+            ``_get_cur_allocate_lens`` already compacts ``allocate_lens`` on
+            the host, whereas seq lengths, request-pool indices, and verifier
+            acceptance retain the DP-padded scheduler layout.  Treat both
+            representations as an explicit contract instead of indexing a
+            compact vector with global padded slots.
             """
+            if int(value.shape[0]) == int(selector.shape[0]):
+                return value
+            max_slot = int(selector_host.max(initial=-1))
+            if int(value.shape[0]) <= max_slot:
+                raise ValueError(
+                    "Frozen-KV device verify metadata does not match its live selector: "
+                    f"field={field}, rows={value.shape[0]}, "
+                    f"requests={selector.shape[0]}, selector={selector_host.tolist()}"
+                )
+
+            # The padded verifier can be TP-sharded by candidate rows, while
+            # the compact live request count may be c1/c2 and therefore cannot
+            # use a data-partitioned result. Annotate only this small metadata
+            # gather; never force its source into a replicated layout first.
             value_sharding = jax.typeof(value).sharding
             if isinstance(value_sharding, NamedSharding):
-                mesh = value_sharding.mesh
-                # Generic startup precompile can use a TP-only mesh, whereas
-                # serving meshes also have ``data``.  Only partition compact
-                # scheduler metadata when that axis actually exists.
-                data_size = int(mesh.shape.get("data", 1))
-                if "data" in mesh.shape and selector.shape[0] % data_size == 0:
-                    output_spec = P("data", *([None] * (value.ndim - 1)))
-                else:
-                    output_spec = P()
-                return value.at[selector].get(out_sharding=NamedSharding(mesh, output_spec))
+                # The compact result is ordered by live request, not by equal
+                # DP-attention partitions. Even a divisible row count can
+                # represent an unbalanced batch, so keep this small metadata
+                # gather replicated. The relay publisher scatters these rows
+                # into the scheduler's explicitly selected padded slots.
+                output_spec = P(*([None] * value.ndim))
+                return value.at[selector].get(
+                    out_sharding=NamedSharding(value_sharding.mesh, output_spec)
+                )
             return jnp.take(value, selector, axis=0)
 
-        accept_live = gather_request_rows(accept_padded)
+        accept_live = compact_request_rows(accept_padded, "accept_lengths")
         seed_state = select_after_verify(
             jnp.asarray(verified_tokens, dtype=jnp.int32),
             jnp.asarray(target_hidden),
             selector,
             accept_live,
-            gather_request_rows(seq_lens) + accept_live + 1,
-            gather_request_rows(allocate),
-            gather_request_rows(req_indices),
+            compact_request_rows(seq_lens, "seq_lens") + accept_live + 1,
+            compact_request_rows(allocate, "allocate_lens"),
+            compact_request_rows(req_indices, "req_pool_indices"),
             rows_per_request=rows_per_request,
         )
         self._publish_seed_relay(
