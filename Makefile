@@ -9,7 +9,7 @@ REMOTE_IMAGE := $(REGISTRY)/$(IMAGE_NAME):$(IMAGE_TAG)
 .PHONY: build push release validate-version build-wheel smoke-wheel build-docker smoke-docker require-version
 
 build:
-	docker build --platform linux/amd64 -t $(IMAGE_NAME):$(IMAGE_TAG) .
+	docker build --platform linux/amd64 -f docker/Dockerfile.runtime -t $(IMAGE_NAME):$(IMAGE_TAG) .
 	@echo "Built image: $(IMAGE_NAME):$(IMAGE_TAG)"
 
 push: build
@@ -52,7 +52,7 @@ build-docker: validate-version
 		--build-arg SETUPTOOLS_SCM_PRETEND_VERSION=$(VERSION) \
 		--load \
 		-t $(RELEASE_DOCKER_TAG) \
-		-f Dockerfile .
+		-f docker/Dockerfile.runtime .
 
 smoke-docker: build-docker
 	docker run --rm $(RELEASE_DOCKER_TAG) python -c "import sgl_jax; \

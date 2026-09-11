@@ -1,0 +1,43 @@
+FROM python:3.12
+
+WORKDIR /app
+
+# Copy the project files
+COPY . .
+
+# Version injection for setuptools-scm
+ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=${SETUPTOOLS_SCM_PRETEND_VERSION}
+
+# Install sglang-jax package with TPU support in editable mode for development
+RUN pip install --no-cache-dir -e ./python[tpu]
+
+# Set environment variable for JAX compilation cache
+ENV JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache
+
+# Create directories that may need to be mounted from host
+RUN mkdir -p /tmp/jit_cache /tmp/models
+
+# Build and install tpu-sync (aka tpu-raiden) wheel using build_raiden_wheel.sh.
+# Running preload_raiden() acts as a build-time smoke test to verify native extension linking.
+ARG RAIDEN_REPO="https://github.com/google/tpu-sync.git"
+ARG RAIDEN_SRC="/tmp/tpu-raiden"
+ARG RAIDEN_CACHE_ROOT="/tmp/raiden-cache"
+# Pin tpu-sync to a specific version for stability
+ARG RAIDEN_COMMIT="6d43141191210b73359d22743be619532ad587dc"
+
+RUN apt-get update && apt-get install -y --no-install-recommends clang \
+    && rm -rf /var/lib/apt/lists/* \
+    && git clone "${RAIDEN_REPO}" "${RAIDEN_SRC}" \
+    && git -C "${RAIDEN_SRC}" checkout "${RAIDEN_COMMIT}" \
+    && CC=clang CXX=clang++ \
+       RAIDEN_SRC="${RAIDEN_SRC}" \
+       RAIDEN_CACHE_ROOT="${RAIDEN_CACHE_ROOT}" \
+       bash scripts/disaggregation/build_raiden_wheel.sh \
+    && wheel=$(find "${RAIDEN_CACHE_ROOT}" -name "*.whl" | head -n 1) \
+    && pip install --no-cache-dir --no-deps "${wheel}" \
+    && python -c "from sgl_jax.raiden import preload_raiden; preload_raiden()" \
+    && rm -rf "${RAIDEN_SRC}" "${RAIDEN_CACHE_ROOT}" /tmp/tpu_raiden_bazel_output*
+
+
+CMD ["/bin/bash"]
