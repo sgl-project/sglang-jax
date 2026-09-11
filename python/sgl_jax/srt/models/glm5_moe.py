@@ -1,4 +1,5 @@
 import logging
+import os
 from functools import partial
 from typing import Any
 
@@ -33,6 +34,8 @@ from sgl_jax.srt.utils.quantization.quantization_utils import (
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
+
+_ILV_FIX = os.environ.get("SGLANG_ROTARY_ILV_FIX", "1") == "1"
 
 
 @partial(jax.jit, static_argnames=("quantized_dtype",))
@@ -190,8 +193,14 @@ class GlmDsaIndexer(nnx.Module):
         q_rope = query[:, :, :rope_dim]
         k_rope = key[:, :rope_dim][:, None, :]
         q_rope, k_rope = rotary_emb(positions, q_rope, k_rope)
-        query = query.at[:, :, :rope_dim].set(q_rope)
-        key = key.at[:, :rope_dim].set(k_rope.squeeze(1))
+        if _ILV_FIX:
+            # concat instead of at[].set: avoids a read-modify-write of the
+            # full [T, n_head, head_dim] tensor (values are identical).
+            query = jnp.concatenate((q_rope, query[:, :, rope_dim:]), axis=-1)
+            key = jnp.concatenate((k_rope.squeeze(1), key[:, rope_dim:]), axis=-1)
+        else:
+            query = query.at[:, :, :rope_dim].set(q_rope)
+            key = key.at[:, :rope_dim].set(k_rope.squeeze(1))
 
         h_matrix = get_hadamard_matrix(128) * (128**-0.5)
         query = jnp.einsum("thd,de->the", query, h_matrix)
@@ -219,8 +228,12 @@ class GlmDsaIndexer(nnx.Module):
         q_rope, k_rope = rotary_emb(positions, q_rope, k_rope)
         k_rope = k_rope.squeeze(1)  # Remove head dim
 
-        query = query.at[:, :, :rope_dim].set(q_rope)
-        key = key.at[:, :rope_dim].set(k_rope)
+        if _ILV_FIX:
+            query = jnp.concatenate((q_rope, query[:, :, rope_dim:]), axis=-1)
+            key = jnp.concatenate((k_rope, key[:, rope_dim:]), axis=-1)
+        else:
+            query = query.at[:, :, :rope_dim].set(q_rope)
+            key = key.at[:, :rope_dim].set(k_rope)
 
         # Apply Hadamard Transform
         h_matrix = get_hadamard_matrix(128)
