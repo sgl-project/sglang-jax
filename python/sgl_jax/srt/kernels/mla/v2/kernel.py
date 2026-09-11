@@ -670,12 +670,23 @@ def _mla_ragged_paged_attention_kernel(
                 q_end = cu_q_lens_ref[seq_idx + 1]
                 kv_len = kv_lens_ref[seq_idx]
 
-                update_kv_packing_iters = cdiv_on_kv_packing(
-                    (offset % kv_packing) + update_sz, kv_packing
-                )
                 kv_packing_offset = offset % kv_packing
                 new_kv_len_start = q_end - kv_len + offset
                 new_kv_packing_offset = new_kv_len_start % kv_packing
+
+                # _fetch_bkv appends the new KV words right after the last word holding
+                # cached KV. If both the destination and the source token offsets are
+                # word-aligned (e.g. a prefill without cached prefix), those words are
+                # already in their final position and each merge_loop_body iteration
+                # would store a word back unchanged, so merge no words at all.
+                new_kv_in_place = jnp.logical_and(
+                    kv_packing_offset == 0, new_kv_packing_offset == 0
+                )
+                update_kv_packing_iters = jnp.where(
+                    new_kv_in_place,
+                    0,
+                    cdiv_on_kv_packing(kv_packing_offset + update_sz, kv_packing),
+                )
 
                 token_offset_in_bkv = offset % bkv_sz
                 kv_packing_idx = floor_div_on_kv_packing(token_offset_in_bkv, kv_packing)
