@@ -6,9 +6,13 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+import pandas
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from eval.sglang_mmlu import SglangMMLUEval
 from eval.simple_eval_common import ANSWER_PATTERN_MULTICHOICE, strip_reasoning
 from run_eval import build_extra_body
 
@@ -94,6 +98,86 @@ class TestSimpleEvalCommon(unittest.TestCase):
             build_extra_body(args),
             {"chat_template_kwargs": {"enable_thinking": False}},
         )
+
+
+class TestSglangMMLU(unittest.TestCase):
+    def setUp(self):
+        row = dict(Subject="anatomy", Question="Q", A="a", B="b", C="c", D="d", Answer="B")
+        self.client = Mock(base_url="http://localhost:32000/v1/")
+        self.client.get.return_value = {"model_path": "model"}
+        self.scores = {" AD": -1.0, " B": -2.0, " A": -3.0, " C": -4.0, " D": -5.0}
+        self.logprobs = SimpleNamespace(top_logprobs=[self.scores])
+        self.client.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(text=" AD", logprobs=self.logprobs)]
+        )
+        self.sampler = SimpleNamespace(model="model", client=self.client)
+        self.tokenizer = Mock()
+        self.tokenizer.apply_chat_template.return_value = "native assistant\n"
+        for target, value in (
+            ("transformers.AutoTokenizer.from_pretrained", self.tokenizer),
+            ("eval.sglang_mmlu.pandas.read_csv", pandas.DataFrame([row])),
+        ):
+            patcher = patch(target, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def evaluation(self, **kwargs):
+        return SglangMMLUEval("unused.csv", None, 1, **kwargs)(self.sampler)
+
+    def test_raw_and_chat_prompts_use_one_token_choice_scoring(self):
+        raw = (
+            "The following are multiple choice questions (with answers) about anatomy.\n\n"
+            "Q\nA. a\nB. b\nC. c\nD. d\nAnswer:"
+        )
+        for chat in (False, True):
+            with self.subTest(chat=chat):
+                result = self.evaluation(use_chat_template=chat)
+                self.client.completions.create.assert_called_with(
+                    model="model",
+                    prompt="native assistant\nAnswer:" if chat else raw,
+                    temperature=0,
+                    max_tokens=1,
+                    logprobs=20,
+                )
+                self.assertEqual(result.score, 1.0)  # B wins by logprob, not the emitted AD.
+        self.tokenizer.apply_chat_template.assert_called_once_with(
+            [
+                {
+                    "role": "user",
+                    "content": "Answer the final multiple-choice question with exactly "
+                    "one letter: A, B, C, or D.\n\n" + raw,
+                }
+            ],
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+
+        for method in (self.client.completions.create, self.tokenizer.apply_chat_template):
+            method.side_effect = RuntimeError("request failed")
+            with self.assertRaisesRegex(RuntimeError, "request failed"):
+                self.evaluation(use_chat_template=True)
+            method.side_effect = None
+
+    def test_partial_top_logprobs_identify_the_best_choice(self):
+        self.logprobs.top_logprobs = [{" **": -1.0, " B": -2.0, " x": -3.0}]
+        self.assertEqual(self.evaluation().score, 1.0)
+
+    def test_insufficient_or_invalid_logprobs_fail(self):
+        invalid = [
+            [],
+            [self.scores, self.scores],
+            [{}],
+            [{" **": -1.0}],
+            [{" **": -1.0, " B": -2.0}],
+        ]  # A missing answer could tie B at the cutoff.
+        for value in (None, float("nan"), float("inf")):
+            invalid.append([dict(self.scores, **{" B": value})])
+        for scores in invalid:
+            with self.subTest(scores=scores):
+                self.logprobs.top_logprobs = scores
+                with self.assertRaises(ValueError):
+                    self.evaluation()
 
 
 if __name__ == "__main__":

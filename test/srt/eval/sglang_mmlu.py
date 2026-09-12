@@ -1,3 +1,4 @@
+import math
 import random
 import re
 
@@ -11,12 +12,21 @@ class SglangMMLUEval(Eval):
     Replicates the SGLang benchmark logic for MMLU:
     - Few-shot prompting (default 5 shots).
     - No Chain-of-Thought (direct answer).
-    - Expects model to output just the answer letter (we set max_tokens=1 if possible).
+    - Scores the next-token probabilities of the four answer letters.
+    - Optionally wraps the prompt in a non-thinking chat template.
     """
 
-    def __init__(self, filename: str, num_examples: int | None, num_threads: int, n_shots: int = 5):
+    def __init__(
+        self,
+        filename: str,
+        num_examples: int | None,
+        num_threads: int,
+        n_shots: int = 5,
+        use_chat_template: bool = False,
+    ):
         df = pandas.read_csv(filename)
         self.n_shots = n_shots
+        self.use_chat_template = use_chat_template
 
         # Group by subject to get shots from the same subject
         from collections import defaultdict
@@ -44,6 +54,17 @@ class SglangMMLUEval(Eval):
         self.num_threads = num_threads
 
     def __call__(self, sampler: SamplerBase) -> EvalResult:
+        if self.use_chat_template:
+            from transformers import AutoTokenizer
+
+            base_url = str(sampler.client.base_url).rstrip("/").removesuffix("/v1")
+            config = sampler.client.get(f"{base_url}/get_server_info", cast_to=dict[str, object])
+            tokenizer = AutoTokenizer.from_pretrained(
+                config.get("tokenizer_path") or config["model_path"],
+                revision=config.get("revision"),
+                use_fast=config.get("tokenizer_mode") != "slow",
+            )
+
         def fn(row: dict):
             subject = row["Subject"]
             shots = self.shots.get(subject, [])
@@ -59,24 +80,34 @@ class SglangMMLUEval(Eval):
             prompt += f"A. {row['A']}\nB. {row['B']}\nC. {row['C']}\nD. {row['D']}\n"
             prompt += "Answer:"
 
-            # Use raw completions to bypass chat templates
-            try:
-                response = sampler.client.completions.create(
-                    model=sampler.model,
-                    prompt=prompt,
-                    temperature=0,
-                    max_tokens=1,
+            if self.use_chat_template:
+                instruction = (
+                    "Answer the final multiple-choice question with exactly one letter: "
+                    "A, B, C, or D."
                 )
-                response_text = response.choices[0].text
-            except Exception as e:
-                # Fallback to chat completions if raw fails
-                prompt_messages = [{"role": "user", "content": prompt}]
-                response_text = sampler(prompt_messages)
-
-            # Direct answer extraction: take the first non-whitespace character
-            extracted_answer = response_text.strip()[0] if len(response_text.strip()) > 0 else None
-            if extracted_answer:
-                extracted_answer = extracted_answer.upper()
+                prompt = tokenizer.apply_chat_template(
+                    [{"role": "user", "content": instruction + "\n\n" + prompt}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+                prompt += "Answer:"
+            response = sampler.client.completions.create(
+                model=sampler.model,
+                prompt=prompt,
+                temperature=0,
+                max_tokens=1,
+                logprobs=20,
+            )
+            response_text = response.choices[0].text
+            (scores,) = response.choices[0].logprobs.top_logprobs
+            if not scores or any(v is None or not math.isfinite(v) for v in scores.values()):
+                raise ValueError("Expected finite next-token logprobs")
+            choices = {letter: scores[" " + letter] for letter in "ABCD" if " " + letter in scores}
+            # Missing choices cannot beat a returned choice above the top-k cutoff.
+            if not choices or (len(choices) < 4 and max(choices.values()) <= min(scores.values())):
+                raise ValueError("Top logprobs do not identify the best A/B/C/D answer")
+            extracted_answer = max(choices, key=choices.get)
 
             score = 1.0 if extracted_answer == row["Answer"] else 0.0
 
