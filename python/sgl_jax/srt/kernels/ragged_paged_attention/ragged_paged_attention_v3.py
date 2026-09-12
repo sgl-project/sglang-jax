@@ -487,19 +487,45 @@ def _ragged_paged_attention_kernel_loop(
         if soft_cap is not None:
             s = soft_cap * jnp.tanh(s / soft_cap)
 
+        # The masks below compare a query position against a key position inside
+        # the same tile, so they need the *offset* between the two tiles, never
+        # absolute positions. Absolute positions are also unsafe here: the int16
+        # narrowing just below wraps instead of saturating (Mosaic lowers the
+        # cast to arith.trunci), so anything past 32767 silently corrupts the
+        # mask. Rebasing to the key tile's origin keeps every operand within a
+        # couple of tile widths instead.
+
         # Use int16 for span computations when safe: non-f32 dtype on TPU v6+
         # with causal mask. Custom mask shapes can trigger a Mosaic compiler bug.
         int_ty = jnp.int32
-        if get_dtype_packing(q.dtype) != 1 and tpu_version >= 6 and use_causal_mask:
+        if (
+            get_dtype_packing(q.dtype) != 1
+            and tpu_version >= 6
+            and use_causal_mask
+            and bkv_csz + actual_bq_csz <= jnp.iinfo(jnp.int16).max  # widest span below
+        ):
             int_ty = jnp.int16
-        processed_q_len_int = processed_q_len.astype(int_ty)
-        processed_kv_len_int = processed_kv_len.astype(int_ty)
-        effective_kv_len_int = effective_kv_len.astype(int_ty)
-        q_span = processed_q_len_int + (
-            lax.broadcasted_iota(jnp.int32, s.shape, 0) // num_q_heads_per_kv_head
-        ).astype(int_ty)
-        k_span = processed_kv_len_int + lax.broadcasted_iota(int_ty, s.shape, 1)
-        v_span = processed_kv_len_int + lax.broadcasted_iota(int_ty, v.shape, 0)
+        q_row = (lax.broadcasted_iota(jnp.int32, s.shape, 0) // num_q_heads_per_kv_head).astype(
+            int_ty
+        )
+
+        def rebased_q_span(window):
+            """Query span measured from the key tile's origin, less `window`.
+
+            Every predicate using this is monotone in it, and it is only ever
+            compared against k_span in [0, bkv_csz), so once it leaves
+            [-(actual_bq_csz + 1), bkv_csz + 1] the tile is uniformly masked or
+            uniformly visible. Clamping there is exact, not an approximation.
+            Folding `window` in before the clamp keeps an arbitrarily large
+            sliding window out of int16 as well.
+            """
+            delta = processed_q_len - processed_kv_len - window
+            return jnp.clip(delta, -(actual_bq_csz + 1), bkv_csz + 1).astype(int_ty) + q_row
+
+        q_span = rebased_q_span(0)
+        k_span = lax.broadcasted_iota(int_ty, s.shape, 1)
+        v_span = lax.broadcasted_iota(int_ty, v.shape, 0)
+        kv_span_limit = jnp.clip(effective_kv_len - processed_kv_len, 0, bkv_csz).astype(int_ty)
 
         mask = None
         if use_causal_mask:
@@ -511,11 +537,11 @@ def _ragged_paged_attention_kernel_loop(
             mask = mask_and(mask, custom_mask_expanded == 1)
 
         if not skip_kv_mask:
-            mask = mask_and(mask, k_span < effective_kv_len_int)
-            v = jnp.where(v_span < effective_kv_len_int, v, 0.0)
+            mask = mask_and(mask, k_span < kv_span_limit)
+            v = jnp.where(v_span < kv_span_limit, v, 0.0)
 
         if sliding_window is not None:
-            mask = mask_and(mask, q_span < k_span + sliding_window)
+            mask = mask_and(mask, rebased_q_span(sliding_window) < k_span)
 
         if mask is not None:
             s = jnp.where(mask, s, mask_value)
