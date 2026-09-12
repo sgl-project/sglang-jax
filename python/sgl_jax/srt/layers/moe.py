@@ -12,6 +12,12 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
+from sgl_jax.srt.kernels.sparse_core.moe_permute import (
+    moe_sc_permute_enabled_by_env,
+    sc_combine,
+    sc_dispatch_gather,
+    should_use_sparse_core,
+)
 
 # Re-export for backward compatibility: external code imports from this module.
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE, FusedEPMoEV2  # noqa: F401
@@ -41,8 +47,13 @@ class EPMoE(nnx.Module):
         physical_to_logical_map: "jax.Array | None" = None,
         pre_gather_quant_dtype=None,
         moe_dp_size: int = 1,
+        use_sc_permute: bool | None = None,
     ):
         self.num_experts_per_tok = num_experts_per_tok
+        # Opt-in SparseCore permute/unpermute kernels; ``None`` defers to the env flag.
+        self.use_sc_permute = (
+            moe_sc_permute_enabled_by_env() if use_sc_permute is None else bool(use_sc_permute)
+        )
         self.physical_to_logical_map = physical_to_logical_map
         self.pre_gather_quant_dtype = pre_gather_quant_dtype
         self.moe_dp_size = moe_dp_size
@@ -620,6 +631,25 @@ class EPMoE(nnx.Module):
 
         group_offset = self._dispatch(group_sizes, expert_shard_id)
 
+        local_range = None
+        valid_mask = None
+        # Trace-time gate: small (decode-sized) batches keep the exact XLA path so
+        # their HLO is identical to the flag-off build.
+        if self.use_sc_permute and should_use_sparse_core(
+            token_indices.shape[0], inputs_2d.shape[-1], self.dtype
+        ):
+            # Sorted-row range owned by this expert shard, and which routed slots
+            # (token-major order) landed on a local expert.
+            csum = jnp.cumsum(group_sizes)
+            start = jnp.where(group_offset == 0, 0, csum[jnp.maximum(group_offset - 1, 0)])
+            end = csum[group_offset + self.experts_per_device - 1]
+            if self.ep_size > 1:
+                local_range = (start.astype(jnp.int32), end.astype(jnp.int32))
+            flat_experts = jnp.ravel(topk_ids)
+            valid_mask = (flat_experts >= group_offset) & (
+                flat_experts < group_offset + self.experts_per_device
+            )
+
         intermediate_output = self._gmm_compute(
             inputs_2d,
             token_indices,
@@ -634,12 +664,14 @@ class EPMoE(nnx.Module):
             w0_kernel_bias,
             w1_kernel_bias,
             wo_kernel_bias,
+            local_range=local_range,
         )
 
         output = self._unpermute(
             intermediate_output,
             sorted_selected_experts,
             topk_weights,
+            valid_mask=valid_mask,
         )
 
         # Reduce on the "tensor" axis. RS (psum_scatter) when caller asked
@@ -670,6 +702,7 @@ class EPMoE(nnx.Module):
         w0_kernel_bias=None,
         w1_kernel_bias=None,
         wo_kernel_bias=None,
+        local_range=None,
     ):
         if token_indices.shape[0] == 0:
             return jnp.zeros((0, wo_kernel.shape[-1]), dtype=inputs_2d.dtype)
@@ -683,6 +716,10 @@ class EPMoE(nnx.Module):
             x = x_q[token_indices]
             x_scale = x_scale[token_indices]
             x = (x.astype(jnp.float32) * x_scale).astype(self.dtype)
+        elif local_range is not None:
+            # SparseCore ragged gather: only rows [start, end) (local experts) are
+            # materialized; gmm never reads the others thanks to group_offset.
+            x = sc_dispatch_gather(inputs_2d, token_indices, *local_range).astype(self.dtype)
         else:
             x = inputs_2d[token_indices].astype(self.dtype)
 
@@ -803,7 +840,7 @@ class EPMoE(nnx.Module):
             group_sizes,
         )
 
-    def _unpermute(self, intermediate, sorted_selected_experts, weights):
+    def _unpermute(self, intermediate, sorted_selected_experts, weights, valid_mask=None):
         top_k = self.num_experts_per_tok
         if weights.ndim != 2 or weights.shape[1] != top_k:
             raise ValueError(
@@ -833,6 +870,17 @@ class EPMoE(nnx.Module):
             .at[sorted_selected_experts]
             .set(jnp.arange(expected_tokens, dtype=jnp.int32))
         )
+        if self.use_sc_permute and valid_mask is not None:
+            # SparseCore fused gather + top-k weighted reduce (falls back to XLA when
+            # SparseCore is absent or the problem is too small to benefit).
+            return sc_combine(
+                intermediate,
+                argsort_indices,
+                jnp.reshape(weights, (-1,)),
+                valid_mask,
+                self.num_experts_per_tok,
+            ).astype(self.dtype)
+
         weights_fp32 = weights.astype(jnp.float32)
 
         # Static token-count branch: small (decode) batches avoid the unrolled
