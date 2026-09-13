@@ -425,7 +425,10 @@ def _scores_kernel(
                     + bq_idx * bq_sz
                     + jnp.arange(bq_sz, dtype=jnp.int32)
                 )
-                bq_pos_compressed_vec.append(q_pos // compression_ratio)
+                # Last visible compressed entry: the one whose final token
+                # (entry+1)*ratio-1 is at or before q_pos, i.e. entries
+                # [0, (q_pos+1)//ratio). Identity for ratio == 1.
+                bq_pos_compressed_vec.append((q_pos + 1) // compression_ratio - 1)
 
             # Wait for cur bq if not ready yet
             wait_fetch_bq(batch_start_seq_idx, bq_idx, bq_sem_idx)
@@ -496,7 +499,10 @@ def _scores_kernel(
                     + bq_idx * bq_sz
                     + jnp.arange(bq_sz, dtype=jnp.int32)
                 )
-                bq_pos_compressed_vec.append(q_pos // compression_ratio)
+                # Last visible compressed entry: the one whose final token
+                # (entry+1)*ratio-1 is at or before q_pos, i.e. entries
+                # [0, (q_pos+1)//ratio). Identity for ratio == 1.
+                bq_pos_compressed_vec.append((q_pos + 1) // compression_ratio - 1)
 
             wait_fetch_bq(batch_start_seq_idx, bq_idx, bq_sem_idx)
             bq_vec = load_bq(bq_sem_idx)
@@ -657,7 +663,10 @@ def streamindex_topk(
         sequences[i:j] are chunked-prefill-only, and sequences[j:k] are mixed. The
         k is also the total number of sequences.
       k: Number of top-K elements to retrieve.
-      compression_ratio: KV cache compression ratio.
+      compression_ratio: KV cache compression ratio. Compressed entry ``e``
+        covers original positions ``[e*ratio, (e+1)*ratio-1]`` and is visible
+        to a query only once its last token is at or before the query
+        position (``e < (q_pos+1)//ratio``, the DeepSeek-V4 indexer rule).
       num_kv_pages_per_block: number of kv pages to be processed in one block in
         the pallas kernel. This is a tuple of (decode, prefill, mixed) cases.
       num_queries_per_block: number of queries to be processed in one block in the
