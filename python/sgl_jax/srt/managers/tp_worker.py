@@ -16,7 +16,6 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.constrained.bitmask_ops import allocate_token_bitmask
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.layers.routed_experts_capturer import get_global_experts_capturer
 from sgl_jax.srt.managers.schedule_batch import (
@@ -448,14 +447,9 @@ class ModelWorker:
                 batch.sampling_info.sampling_info_done.wait()
             else:
                 batch.sampling_info.update_grammar_vocab_mask()
-        if batch.sampling_info.vocab_mask is None:
-            sampling_metadata.apply_vocab_mask = False
-            sampling_metadata.vocab_mask = allocate_token_bitmask(
-                len(batch.sampling_info.temperatures), batch.sampling_info.vocab_size
-            )
-        else:
-            sampling_metadata.apply_vocab_mask = True
-            sampling_metadata.vocab_mask = batch.sampling_info.vocab_mask
+        sampling_metadata.update_vocab_mask(
+            batch.sampling_info.vocab_mask, self.mesh, self.model_config.vocab_size
+        )
 
     def _pd_fuse_for_batch(self, model_worker_batch: ModelWorkerBatch) -> bool:
         """Batch-level fused-sample eligibility. The single source of truth

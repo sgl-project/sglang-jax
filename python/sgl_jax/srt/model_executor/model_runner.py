@@ -208,7 +208,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             self.init_lora_manager()
 
         self._sampler_base_rng = jax.random.PRNGKey(server_args.random_seed)
-        self._sampler_step = 0
+        self._sampler_step = jax.device_put(np.int32(0), NamedSharding(self.mesh, P()))
         if not self.is_draft_worker:
             self.initialize_jit()
 
@@ -375,12 +375,14 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         ):
             model_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
             sampler = nnx.merge(sampler_def, model_state)
-            return sampler(
+            rng_step = rng_step + jnp.int32(1)
+            result = sampler(
                 *args,
                 use_sort_for_toppk_minp=use_sort_for_toppk_minp,
                 rng_override=base_rng_key,
                 rng_step=rng_step,
             )
+            return result, rng_step
 
         @partial(jax.jit, static_argnames=["mesh"])
         def jitted_compute_logprobs(mesh, logits, next_tokens):
@@ -511,6 +513,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 )
             s_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
             sampler = nnx.merge(sampler_def, s_state)
+            rng_step = rng_step + jnp.int32(1)
             next_ids, token_logprobs, _new_output = sampler(
                 output,
                 sampling_metadata,
@@ -537,11 +540,11 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 layers_topk_ids,
                 token_logprobs,
                 new_future_map,
+                rng_step,
             )
 
         def run_and_sample_wrapper(forward_batch, logits_metadata, sampling_metadata, future_map):
-            self._sampler_step += 1
-            return jitted_run_and_sample(
+            *result, self._sampler_step = jitted_run_and_sample(
                 model_def,
                 model_state_def,
                 self.model_state_leaves,
@@ -556,6 +559,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 sampling_metadata,
                 future_map,
             )
+            return tuple(result)
 
         self.jitted_run_and_sample = run_and_sample_wrapper
 
@@ -1012,15 +1016,13 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         Returns:
             A list of next_token_ids
         """
-        # Advance step counter (pure Python, zero device overhead).
-        # fold_in(base_key, step) inside JIT produces a unique RNG per step.
-        self._sampler_step += 1
-        # Penalty application has been moved to the Sampler for better JIT performance
-        return self.jitted_sampler(
+        # Advance the device counter inside JIT; fold_in uses steps 1, 2, ... .
+        result, self._sampler_step = self.jitted_sampler(
             self._sampler_step,
             logits_output,
             sampling_metadata,
         )
+        return result
 
     def compute_logprobs(self, logits, token_ids: jax.Array) -> jax.Array:
         return self.jitted_compute_logprobs(logits, token_ids)

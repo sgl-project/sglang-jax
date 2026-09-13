@@ -271,6 +271,7 @@ class CompilationManager:
                 batch.forward_batch = ForwardBatch.init_new(batch, model_runner)
                 if future_token_ids_map is not None:
                     from sgl_jax.srt.managers.utils import (
+                        get_token_ids_gather,
                         resolve_future_token_ids,
                         set_future_token_ids,
                     )
@@ -286,14 +287,14 @@ class CompilationManager:
                 )
                 if future_token_ids_map is not None:
                     _, next_token_ids, _ = result
-                    from sgl_jax.srt.managers.utils import future_slot_indices
-
-                    slots = future_slot_indices(
-                        np.asarray(batch.seq_lens),
-                        np.asarray(batch.req_pool_indices),
-                        future_token_ids_map.shape[0],
+                    set_future_token_ids(
+                        future_token_ids_map,
+                        batch.forward_batch.seq_lens,
+                        batch.forward_batch.req_pool_indices,
+                        next_token_ids,
+                        mesh,
                     )
-                    set_future_token_ids(future_token_ids_map, slots, next_token_ids, mesh)
+                    get_token_ids_gather(mesh)(next_token_ids).block_until_ready()
                 self._compiled_variants.add((ForwardMode.DECODE, bs_val, bs_val, False))
 
         end_time = time.perf_counter()
