@@ -118,9 +118,7 @@ class TestSglangMMLUChat(unittest.TestCase):
             ("transformers.AutoTokenizer.from_pretrained", self.tokenizer),
             ("eval.sglang_mmlu.pandas.read_csv", pandas.DataFrame([row])),
         ):
-            patcher = patch(target, return_value=value)
-            patcher.start()
-            self.addCleanup(patcher.stop)
+            self.enterContext(patch(target, return_value=value))
 
     def evaluation(self):
         return SglangMMLUChatEval("unused.csv", None, 1)(self.sampler)
@@ -139,14 +137,12 @@ class TestSglangMMLUChat(unittest.TestCase):
             logprobs=20,
         )
         self.assertEqual(result.score, 1.0)  # B wins by logprob, not the emitted AD.
+        user_prompt = (
+            "Answer the final multiple-choice question with exactly one letter: "
+            "A, B, C, or D.\n\n" + raw
+        )
         self.tokenizer.apply_chat_template.assert_called_once_with(
-            [
-                {
-                    "role": "user",
-                    "content": "Answer the final multiple-choice question with exactly "
-                    "one letter: A, B, C, or D.\n\n" + raw,
-                }
-            ],
+            [{"role": "user", "content": user_prompt}],
             tokenize=False,
             add_generation_prompt=True,
             enable_thinking=False,

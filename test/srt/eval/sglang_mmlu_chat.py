@@ -3,13 +3,13 @@ import math
 import eval.simple_eval_common as common
 from eval.sglang_mmlu import SglangMMLUEval
 from eval.simple_eval_common import EvalResult, SamplerBase, SingleEvalResult
+from eval.simple_eval_mmlu import subject2category
+
+QUESTION_TEMPLATE = "{Question}\nA. {A}\nB. {B}\nC. {C}\nD. {D}\nAnswer:"
 
 
 class SglangMMLUChatEval(SglangMMLUEval):
-    """Non-thinking chat MMLU with next-token A/B/C/D choice scoring.
-
-    Reuses the raw evaluator's subject split and few-shot selection.
-    """
+    """Non-thinking chat MMLU with choice scoring and the existing few-shot split."""
 
     def __call__(self, sampler: SamplerBase) -> EvalResult:
         from transformers import AutoTokenizer
@@ -24,18 +24,10 @@ class SglangMMLUChatEval(SglangMMLUEval):
 
         def fn(row: dict):
             subject = row["Subject"]
-            shots = self.shots.get(subject, [])
-
-            # Construct prompt identical to SGLang style
             prompt = f"The following are multiple choice questions (with answers) about {subject.replace('_', ' ')}.\n\n"
-            for shot in shots:
-                prompt += f"{shot['Question']}\n"
-                prompt += f"A. {shot['A']}\nB. {shot['B']}\nC. {shot['C']}\nD. {shot['D']}\n"
-                prompt += f"Answer: {shot['Answer']}\n\n"
-
-            prompt += f"{row['Question']}\n"
-            prompt += f"A. {row['A']}\nB. {row['B']}\nC. {row['C']}\nD. {row['D']}\n"
-            prompt += "Answer:"
+            for shot in self.shots.get(subject, []):
+                prompt += QUESTION_TEMPLATE.format(**shot) + f" {shot['Answer']}\n\n"
+            prompt += QUESTION_TEMPLATE.format(**row)
 
             instruction = (
                 "Answer the final multiple-choice question with exactly one letter: "
@@ -54,9 +46,8 @@ class SglangMMLUChatEval(SglangMMLUEval):
                 temperature=0,
                 max_tokens=1,
                 logprobs=20,
-            )
-            response_text = response.choices[0].text
-            (scores,) = response.choices[0].logprobs.top_logprobs
+            ).choices[0]
+            (scores,) = response.logprobs.top_logprobs
             if not scores or any(v is None or not math.isfinite(v) for v in scores.values()):
                 raise ValueError("Expected finite next-token logprobs")
             choices = {letter: scores[" " + letter] for letter in "ABCD" if " " + letter in scores}
@@ -67,17 +58,13 @@ class SglangMMLUChatEval(SglangMMLUEval):
 
             score = 1.0 if extracted_answer == row["Answer"] else 0.0
 
-            from eval.simple_eval_mmlu import subject2category
-
-            category = subject2category.get(subject, "other")
-
             return SingleEvalResult(
-                html=f"<p>Prompt: {prompt}</p><p>Response: {response_text}</p><p>Extracted: {extracted_answer}</p><p>Correct Answer: {row['Answer']}</p>",
+                html=f"<p>Prompt: {prompt}</p><p>Response: {response.text}</p><p>Extracted: {extracted_answer}</p><p>Correct Answer: {row['Answer']}</p>",
                 score=score,
-                metrics={category: score},
+                metrics={subject2category.get(subject, "other"): score},
                 convo=[
                     {"role": "user", "content": prompt},
-                    {"role": "assistant", "content": response_text},
+                    {"role": "assistant", "content": response.text},
                 ],
             )
 
