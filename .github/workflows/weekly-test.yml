@@ -340,7 +340,7 @@ jobs:
           install-target: python[all,multimodal]
       - name: Check VLM cache, chunk and encoder sharding equivalence
         timeout-minutes: 60
-        run: python test/srt/test_vlm_models.py
+        run: python test/srt/multimodal/test_vlm_models.py
       - name: Run full MMBench V1.1 CircularEval
         if: ${{ !cancelled() }}
         timeout-minutes: 120

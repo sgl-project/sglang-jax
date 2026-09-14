@@ -1,22 +1,28 @@
 """Real-weight VLM smoke and scheduling regression (one TPU by default)."""
 
 import os
+import sys
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import requests
 from openai import OpenAI
 from PIL import Image
-from vlm_utils import complete, image_content
 
 from sgl_jax.srt.utils import kill_process_tree
 from sgl_jax.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    CustomTestCase,
     popen_launch_server,
 )
 
+# Keep shared SRT helpers importable when this file is run directly by run_suite.py.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from vlm_utils import complete, image_content  # noqa: E402
 
-class TestVLM(unittest.TestCase):
+
+class TestVLM(CustomTestCase):
     def test_serving_equivalence(self):
         from nightly.single_host.accuracy_case_runner import (
             load_profile_file,
