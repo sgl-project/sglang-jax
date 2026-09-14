@@ -217,14 +217,15 @@ class GenerationBatchResult:
     accept_lens: np.ndarray | None = None
 
 
-def validate_dflash_request(req) -> str | None:
-    """Per-request DFLASH guard (mirrors SGLang PR 22077).
+def validate_greedy_spec_request(req, algorithm_name: str) -> str | None:
+    """Reject request features unsupported by a greedy-only spec worker.
 
-    Returns an error message if the request uses an unsupported DFLASH feature,
-    otherwise None.
+    DFlash and Frozen-KV MTP verify a single top-1 candidate chain directly
+    from target logits.  Validate that contract before scheduling so these
+    workers never silently ignore sampling transforms or grammar constraints.
     """
     if req.return_logprob or req.return_output_logprob_only:
-        return "DFLASH speculative decoding does not support return_logprob yet."
+        return f"{algorithm_name} speculative decoding does not support return_logprob yet."
     sp = req.sampling_params
     if (
         getattr(sp, "json_schema", None) is not None
@@ -232,9 +233,12 @@ def validate_dflash_request(req) -> str | None:
         or getattr(sp, "ebnf", None) is not None
         or getattr(sp, "structural_tag", None) is not None
     ):
-        return "DFLASH speculative decoding does not support grammar-constrained decoding yet."
+        return (
+            f"{algorithm_name} speculative decoding does not support "
+            "grammar-constrained decoding yet."
+        )
     if sp.top_k != 1:
-        return "DFLASH speculative decoding currently only supports greedy sampling."
+        return f"{algorithm_name} speculative decoding currently only supports greedy sampling."
     if (
         sp.frequency_penalty != 0.0
         or sp.presence_penalty != 0.0
@@ -242,9 +246,28 @@ def validate_dflash_request(req) -> str | None:
         or sp.min_new_tokens != 0
     ):
         return (
-            "DFLASH speculative decoding does not support frequency, presence, "
+            f"{algorithm_name} speculative decoding does not support frequency, presence, "
             "or repetition penalties, or min_new_tokens yet."
         )
+    return None
+
+
+def validate_dflash_request(req) -> str | None:
+    """Per-request DFLASH guard (mirrors SGLang PR 22077)."""
+    return validate_greedy_spec_request(req, "DFLASH")
+
+
+def validate_frozen_kv_mtp_request(req) -> str | None:
+    """Per-request guard for Frozen-KV MTP's fused top-1 chain path."""
+    return validate_greedy_spec_request(req, "FROZEN_KV_MTP")
+
+
+def validate_speculative_request(req, algorithm: SpeculativeAlgorithm) -> str | None:
+    """Route request validation to algorithms with restricted contracts."""
+    if algorithm.is_dflash():
+        return validate_dflash_request(req)
+    if algorithm.is_frozen_kv_mtp():
+        return validate_frozen_kv_mtp_request(req)
     return None
 
 
@@ -1444,10 +1467,10 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if self.spec_algorithm is not None and self.spec_algorithm.is_dflash():
-            dflash_err = validate_dflash_request(req)
-            if dflash_err is not None:
-                req.set_finish_with_abort(dflash_err)
+        if self.spec_algorithm is not None:
+            spec_err = validate_speculative_request(req, self.spec_algorithm)
+            if spec_err is not None:
+                req.set_finish_with_abort(spec_err)
                 self._add_request_to_queue(req)
                 return
 

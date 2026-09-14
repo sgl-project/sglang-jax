@@ -125,13 +125,14 @@ python3 -m sgl_jax.launch_server \
 Frozen-KV uses a dedicated non-overlap state handoff: after target verification,
 the accepted token and corresponding target hidden state seed the next assistant
 proposal. It supports non-overlap prefill admission and batch merge, but does
-not support speculative overlap scheduling. Use greedy/top-k-one decoding for
-the validated path.
+not support speculative overlap scheduling. Like DFlash, it explicitly rejects
+requests outside its greedy/top-k-one contract, including logprob output,
+grammar constraints, sampling penalties, and `min_new_tokens`.
 
 ## Known Gaps
 
 - **Performance tuning:** Some array operations in the speculative path still need to move into JIT-compiled functions before treating the path as fully optimized.
-- **Non-greedy sampling:** Kernel coverage for verifying branched candidate tokens is still incomplete. The validated TPU command above uses `--speculative-eagle-topk 1`.
+- **Non-greedy sampling:** Kernel coverage for verifying branched candidate tokens is still incomplete. Frozen-KV MTP rejects these requests instead of silently using incompatible top-1 verification semantics.
 
 ## Operational tips
 
