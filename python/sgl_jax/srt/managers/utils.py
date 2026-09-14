@@ -1,4 +1,5 @@
 import logging
+from functools import cache
 
 import jax
 from jax import numpy as jnp
@@ -70,8 +71,13 @@ def future_slot_indices(seq_lens_np, req_pool_indices_np, map_size):
     ).astype(np.int32)
 
 
+@cache
+def get_token_ids_gather(mesh):
+    return jax.jit(lambda x: x, out_shardings=NamedSharding(mesh, P()))
+
+
 @jax.jit(static_argnames=("mesh"))
-def set_future_token_ids(future_token_ids_map, slot_indices, next_token_ids, mesh):
+def set_future_token_ids(future_token_ids_map, seq_lens, req_pool_indices, next_token_ids, mesh):
     """Write each request's pending next token at its req-pool slot.
 
     Slot addressing replaces the previous ring-buffer cursor: the cursor
@@ -82,6 +88,12 @@ def set_future_token_ids(future_token_ids_map, slot_indices, next_token_ids, mes
     overwritten by another request; padding rows scatter out of bounds and
     are dropped.
     """
+    # Reuse the batch's device arrays instead of uploading host-computed slots.
+    slot_indices = jnp.where(
+        seq_lens > 0,
+        req_pool_indices.astype(jnp.int32) + 1,
+        jnp.int32(future_token_ids_map.shape[0]),
+    )
     next_token_ids_global = jax.sharding.reshard(next_token_ids, NamedSharding(mesh, P()))
     slot_indices_global = jax.sharding.reshard(slot_indices, NamedSharding(mesh, P()))
     return future_token_ids_map.at[slot_indices_global].set(next_token_ids_global, mode="drop")

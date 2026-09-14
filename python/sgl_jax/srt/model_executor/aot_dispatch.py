@@ -24,8 +24,8 @@ tp16 for GLM-5.2 753B — device-independent).
 Donation is unaffected: XLA input-output aliasing is baked into the
 executable, and ``ExecuteReplicated`` adds no Python-side donation logic.
 
-Enabling: ``SGLANG_JAX_AOT_DISPATCH`` = ``auto`` (default: on when the
-function sees >= ``_AUTO_MIN_ARGS`` flat args), ``1`` (always), ``0`` (off).
+Enabling: ``SGLANG_JAX_AOT_DISPATCH`` = ``auto`` (on when the function sees
+>= ``_AUTO_MIN_ARGS`` flat args), ``1`` (always), ``0`` (default, off).
 """
 
 from __future__ import annotations
@@ -162,8 +162,11 @@ class AotDispatcher:
             self._stable_ids = tuple(id(a) for a in self._stable_flat_args)
             self._cache.clear()
 
-        dyn_leaves = jax.tree_util.tree_leaves(dyn_args)
-        key = tuple((getattr(a, "shape", None), getattr(a, "dtype", None)) for a in dyn_leaves)
+        dyn_leaves, dyn_tree = jax.tree_util.tree_flatten(dyn_args)
+        # Batch mode and other pytree metadata can change the program even
+        # when all array shapes match. Scalar types also affect compilation.
+        avals = [jax.typeof(a) for a in dyn_leaves]
+        key = (dyn_tree, tuple((a.shape, a.dtype, a.weak_type) for a in avals))
         entry = self._cache.get(key)
         if entry is None:
             return self._compile_and_first_call(key, dyn_args)
@@ -180,11 +183,10 @@ class AotDispatcher:
             dyn_layouts,
             dyn_copy,
         ) = entry
-        args_flat, _ = jax.tree_util.tree_flatten((self._stable_flat_args + dyn_args, {}))
         from jax._src.interpreters import pxla
 
         dyn_bufs = pxla.shard_args(
-            dyn_shardings, dyn_layouts, dyn_copy, [args_flat[i] for i in dyn_kept]
+            dyn_shardings, dyn_layouts, dyn_copy, [dyn_leaves[i] for i in dyn_kept]
         )
         results = xla_exec.execute_sharded(static_bufs + list(dyn_bufs))
         out_flat = results.consume_with_handlers(out_handlers)
@@ -255,7 +257,7 @@ class AotDispatcher:
             unsafe.out_handler.handlers,
             compiled._params.out_tree,
             static_bufs,
-            dyn_kept,
+            [i - n_stable for i in dyn_kept],
             shardings[n_static:],
             layouts[n_static:],
             [_xc.ArrayCopySemantics.REUSE_INPUT] * len(dyn_kept),

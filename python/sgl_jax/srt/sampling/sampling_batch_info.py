@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+from functools import cache
 from typing import TYPE_CHECKING
 
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
@@ -28,6 +29,16 @@ logger = logging.getLogger(__name__)
 
 _zero_linear_penalty_cache: dict[tuple[int, int], jax.Array] = {}
 _zero_linear_penalty_lock = threading.Lock()
+
+
+@cache
+def _sampler_bools(sharding):
+    return tuple(jax.device_put(np.bool_(value), sharding) for value in (False, True))
+
+
+@cache
+def _empty_vocab_mask(batch_size, vocab_size, sharding):
+    return jax.device_put(np.zeros((batch_size, (vocab_size + 31) // 32), dtype=np.int32), sharding)
 
 
 @register_pytree_node_class
@@ -59,6 +70,16 @@ class SamplingMetadata:
     # Grammar vocab mask
     vocab_mask: jax.Array | None = None
     apply_vocab_mask: bool = False
+
+    def update_vocab_mask(self, mask, mesh, vocab_size):
+        sharding = NamedSharding(mesh, PartitionSpec())
+        self.apply_vocab_mask = _sampler_bools(sharding)[mask is not None]
+        # Grammar masks are mutable: upload current contents after the grammar update.
+        self.vocab_mask = (
+            jax.device_put(mask, sharding)
+            if mask is not None
+            else _empty_vocab_mask(self.temperatures.shape[0], vocab_size, sharding)
+        )
 
     def tree_flatten(self):
         children = (
@@ -193,6 +214,8 @@ class SamplingMetadata:
                 target_shape, linear_penalty_sharding
             )
 
+        replicated_sharding = NamedSharding(mesh, PartitionSpec())
+        bools = _sampler_bools(replicated_sharding)
         return cls(
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
@@ -202,12 +225,16 @@ class SamplingMetadata:
             top_ks=top_ks_device,
             min_ps=min_ps_device,
             sampling_seeds=sampling_seeds_device,
-            is_all_greedy=batch.sampling_info.is_all_greedy,
+            is_all_greedy=bools[bool(batch.sampling_info.is_all_greedy)],
             positions=positions_device,
-            need_min_p_sampling=batch.sampling_info.need_min_p_sampling,
+            need_min_p_sampling=bools[bool(batch.sampling_info.need_min_p_sampling)],
             linear_penalty=linear_penalty_device,
-            do_penalties=do_penalties,
-            vocab_mask=batch.sampling_info.vocab_mask,
+            do_penalties=bools[do_penalties],
+            # The worker installs the current grammar mask after its update completes.
+            apply_vocab_mask=bools[False],
+            vocab_mask=_empty_vocab_mask(
+                temperatures_device.shape[0], vocab_size, replicated_sharding
+            ),
         )
 
 
