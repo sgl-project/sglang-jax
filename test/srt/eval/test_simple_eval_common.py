@@ -118,9 +118,7 @@ class TestSglangMMLUChat(unittest.TestCase):
         # A real, offline tokenizer with BOS insertion and SentencePiece-style decoding.
         vocab = {t: i for i, t in enumerate(["<unk>", "<s>", "▁Answer:", "▁A", "▁B", "▁C", "▁D"])}
         backend = Tokenizer(models.WordLevel(vocab, unk_token="<unk>"))
-        backend.pre_tokenizer = pre_tokenizers.Sequence(
-            [pre_tokenizers.WhitespaceSplit(), pre_tokenizers.Metaspace()]
-        )
+        backend.pre_tokenizer = pre_tokenizers.Metaspace()
         backend.decoder = decoders.Metaspace()
         backend.post_processor = processors.TemplateProcessing(
             single="<s> $A", special_tokens=[("<s>", 1)]
@@ -129,7 +127,11 @@ class TestSglangMMLUChat(unittest.TestCase):
             tokenizer_object=backend,
             bos_token="<s>",
             unk_token="<unk>",
-            chat_template="{{ bos_token }}user\n{{ messages[0]['content'] }}\nassistant{{ '\\n' }}",
+            chat_template=(
+                "{{ bos_token }}user\n{{ messages[0]['content'] }}\n"
+                "{% if add_generation_prompt %}assistant\n{% endif %}"
+                "{% if enable_thinking is not defined or enable_thinking %}<think>{% endif %}"
+            ),
         )
         for target, value in (
             ("transformers.AutoTokenizer.from_pretrained", self.tokenizer),
@@ -141,26 +143,15 @@ class TestSglangMMLUChat(unittest.TestCase):
         return SglangMMLUChatEval("unused.csv", None, 1)(self.sampler)
 
     def test_chat_prompt_uses_one_token_choice_scoring(self):
-        raw = (
-            "The following are multiple choice questions (with answers) about anatomy.\n\n"
-            "Q\nA. a\nB. b\nC. c\nD. d\nAnswer:"
-        )
-        with patch.object(
-            self.tokenizer, "apply_chat_template", wraps=self.tokenizer.apply_chat_template
-        ) as format_prompt:
-            result = self.evaluation()
+        result = self.evaluation()
         self.assertEqual(result.score, 1.0)  # B wins by logprob, not the emitted AD.
-        user_prompt = (
-            "Answer the final multiple-choice question with exactly one letter: "
-            "A, B, C, or D.\n\n" + raw
+        prompt = (
+            "<s>user\nAnswer the final multiple-choice question with exactly one letter: "
+            "A, B, C, or D.\n\n"
+            "The following are multiple choice questions (with answers) about anatomy.\n\n"
+            "Q\nA. a\nB. b\nC. c\nD. d\nAnswer:\nassistant\nAnswer:"
         )
-        format_prompt.assert_called_once_with(
-            [{"role": "user", "content": user_prompt}],
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=False,
-        )
-        prompt = "<s>user\n" + user_prompt + "\nassistant\nAnswer:"
+        self.assertEqual(result.convos[0][0]["content"], prompt)
         self.client.post.assert_called_once_with(
             "http://localhost:32000/generate",
             cast_to=dict[str, object],
@@ -177,10 +168,11 @@ class TestSglangMMLUChat(unittest.TestCase):
         self.assertEqual(self.tokenizer.encode(prompt)[:2], [1, 1])  # Old text path doubles BOS.
         self.assertEqual(input_ids.count(self.tokenizer.bos_token_id), 1)
         self.assertEqual(self.tokenizer.batch_decode([[i] for i in [3, 4, 5, 6]]), list("ABCD"))
+        self.scores[0][0] = -2.0  # B wins a tie with D, even when D is returned first.
+        self.assertEqual(self.evaluation().score, 1.0)
 
     def test_request_and_template_errors_propagate(self):
-        for method in ("post", "apply_chat_template"):
-            target = self.client if method == "post" else self.tokenizer
+        for target, method in ((self.client, "post"), (self.tokenizer, "apply_chat_template")):
             with patch.object(target, method, side_effect=RuntimeError("request failed")):
                 with self.assertRaisesRegex(RuntimeError, "request failed"):
                     self.evaluation()
