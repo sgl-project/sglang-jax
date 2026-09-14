@@ -7,17 +7,12 @@ import os
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import pytest
 
 from sgl_jax.srt.managers.schedule_batch import ScheduleBatch, ScheduleReqsInfo
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
-from sgl_jax.srt.speculative.frozen_kv_mtp_seed import FrozenKvMtpSeedState
-from sgl_jax.srt.speculative.frozen_kv_mtp_worker import (
-    FrozenKvMtpDraftInput,
-    FrozenKvMtpDraftWorker,
-)
+from sgl_jax.srt.speculative.frozen_kv_mtp_worker import FrozenKvMtpDraftInput
 from sgl_jax.srt.speculative.overlap_utils import can_merge_spec_non_overlap_prefill
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -84,41 +79,27 @@ def test_frozen_kv_merge_keeps_token_seed_and_kv_length_rows_together():
 
 def test_frozen_kv_merge_allows_prefill_without_accept_length_and_preserves_its_input():
     """GSM8K c32 merges a verified decode batch with a fresh prefill batch."""
-    running = _state([(11, 101, 128, 127)])
-    running.seed_state = FrozenKvMtpSeedState(
-        bonus_token=jnp.asarray([99], dtype=jnp.int32),
-        target_hidden=jnp.asarray([[909]], dtype=jnp.float32),
-        committed_lens=jnp.asarray([127], dtype=jnp.int32),
-        allocate_lens=jnp.asarray([128], dtype=jnp.int32),
-        request_indices=jnp.asarray([5], dtype=jnp.int32),
-        valid_mask=jnp.asarray([True]),
+    running = FrozenKvMtpDraftInput(
+        future_indices=np.asarray([5], dtype=np.int32),
+        allocate_lens=np.asarray([128], dtype=np.int32),
+        new_seq_lens=np.asarray([127], dtype=np.int32),
+        accept_length_cpu=np.asarray([2], dtype=np.int32),
+        relay_seed_mask=np.asarray([True]),
     )
-    prefill = _state([(22, 202, 256, 255)])
-    prefill.accept_length = None
-    prefill.accept_length_cpu = None
+    prefill = FrozenKvMtpDraftInput(
+        future_indices=np.asarray([9], dtype=np.int32),
+        allocate_lens=np.asarray([256], dtype=np.int32),
+        new_seq_lens=np.asarray([255], dtype=np.int32),
+        relay_seed_mask=np.asarray([True]),
+    )
 
     running.merge_batch(prefill)
 
-    assert running.accept_length is None
+    np.testing.assert_array_equal(running.future_indices, [5, 9])
+    np.testing.assert_array_equal(running.allocate_lens, [128, 256])
+    np.testing.assert_array_equal(running.new_seq_lens, [127, 255])
     assert running.accept_length_cpu is None
-    np.testing.assert_array_equal(running.seed_state.valid_mask, [True, False])
-
-    worker = FrozenKvMtpDraftWorker.__new__(FrozenKvMtpDraftWorker)
-    batch = type(
-        "Batch",
-        (),
-        {
-            "spec_info_padded": running,
-            "logits_indices_selector": np.asarray([0, 1], dtype=np.int32),
-        },
-    )()
-    worker._prepare_seed_proposal(batch)
-
-    # Existing decoded request consumes its target seed; the new prefill keeps
-    # its own generic draft token/hidden state until it is verified once.
-    np.testing.assert_array_equal(running.verified_id, [99, 22])
-    np.testing.assert_array_equal(running.hidden_states[:, 0], [909, 202])
-    assert running.seed_state is None
+    np.testing.assert_array_equal(running.relay_seed_mask, [True, True])
 
 
 def test_frozen_kv_state_remains_a_jax_pytree_after_its_specialization():

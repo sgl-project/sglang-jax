@@ -24,23 +24,13 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
-from sgl_jax.srt.layers.logits_processor import LogitsMetadata
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.managers.tp_worker import ModelWorker
-from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.speculative.base_worker import replicate_to_mesh
-from sgl_jax.srt.speculative.eagle_draft_worker import (
-    EagleDraftWorkerBase,
-    topk_probs_from_logits,
-)
+from sgl_jax.srt.speculative.eagle_draft_worker import EagleDraftWorkerBase
 from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
 from sgl_jax.srt.speculative.eagle_util import build_chain_verify_inputs_device
 from sgl_jax.srt.speculative.eagle_worker import EAGLEWorker
-from sgl_jax.srt.speculative.frozen_kv_mtp_seed import (
-    FrozenKvMtpSeedState,
-    select_after_verify,
-    verify_frozen_kv_mtp_chain_greedy,
-)
+from sgl_jax.srt.speculative.frozen_kv_mtp_seed import verify_frozen_kv_mtp_chain_greedy
 from sgl_jax.srt.speculative.relay_buffer import (
     SpecSeedRelayBuffers,
     create_spec_seed_relay_buffers,
@@ -48,7 +38,6 @@ from sgl_jax.srt.speculative.relay_buffer import (
     update_spec_seed_relay_buffers,
 )
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
-from sgl_jax.srt.utils.jax_utils import device_array
 
 logger = logging.getLogger(__name__)
 
@@ -198,13 +187,12 @@ def _select_frozen_kv_proposal_start(
     seed_logits,
     seed_hidden,
 ):
-    """Select the first proposal state for target-seed and prefill rows.
+    """Select the first proposal state for live target seeds and padding.
 
-    A post-verify row must consume its accepted target token/hidden pair in the
-    assistant before proposing.  A newly-prefilled row already contains that
-    first assistant proposal in the relay.  Keeping this selection inside the
-    proposal JIT avoids separately dispatched reshard/select operations when
-    the scheduler merges both row kinds into one static bucket.
+    Every live row consumes its target token/hidden pair in the assistant
+    before proposing. False rows are inactive scheduler padding and retain
+    zero relay state. Keeping this selection inside the proposal JIT avoids
+    separately dispatched reshard/select operations.
     """
     seed_token = _frozen_kv_top1_token(seed_logits)
     # Model outputs can retain a replicated batch dimension even when relay
@@ -237,6 +225,36 @@ def _frozen_kv_top1_token(logits):
         token = jnp.argmax(logits, axis=-1).astype(jnp.int32)
         return jax.sharding.reshard(token, NamedSharding(sharding.mesh, P("data")))
     return jnp.argmax(logits, axis=-1).astype(jnp.int32)
+
+
+def _select_frozen_kv_prefill_seed_hidden(hidden_states, logits_indices):
+    """Select each request's final prompt hidden state with DP-local indices.
+
+    Target prefill returns token-major hidden states, while ``logits_indices``
+    contains indices local to each data-parallel token shard.  A plain global
+    gather is therefore wrong for DP ranks after rank zero.  This is the same
+    local-gather contract used by :class:`LogitsProcessor`; keeping it here
+    lets the seed selection remain inside Frozen-KV's relay publication JIT.
+    """
+    hidden_sharding = jax.typeof(hidden_states).sharding
+    if isinstance(hidden_sharding, NamedSharding) and not hidden_sharding.mesh.empty:
+        mesh = hidden_sharding.mesh
+        if "data" in mesh.shape:
+            hidden_states = jax.sharding.reshard(
+                hidden_states, NamedSharding(mesh, P("data", None))
+            )
+            logits_indices = jax.sharding.reshard(logits_indices, NamedSharding(mesh, P("data")))
+
+            def select_local(local_states, local_indices):
+                return local_states[local_indices]
+
+            return jax.shard_map(
+                select_local,
+                mesh=mesh,
+                in_specs=(P("data", None), P("data")),
+                out_specs=P("data", None),
+            )(hidden_states, logits_indices)
+    return hidden_states[logits_indices]
 
 
 def _build_frozen_kv_fused_draft_extend(num_steps: int):
@@ -283,10 +301,9 @@ def _build_frozen_kv_fused_draft_extend(num_steps: int):
             dp_size=dp_size,
         )
 
-        # Post-verify rows first need Gemma's target-hidden -> assistant-state
-        # transition.  This call also runs for prefill-origin padded rows so the
-        # executable shape is independent of the scheduler's dynamic mixture;
-        # their already-computed proposal state is selected below.
+        # Both post-prefill and post-verify rows need Gemma's target-hidden ->
+        # assistant-state transition. This call also runs for padded rows so
+        # the executable shape is independent of the live request count.
         forward_batch.input_ids = relay_verified_id
         forward_batch.positions = forward_batch.seq_lens - 1
         forward_batch.spec_info.hidden_states = relay_hidden
@@ -367,15 +384,10 @@ class FrozenKvMtpDraftInput(EagleDraftInput):
         "accept_length_cpu",
         "new_seq_lens",
     )
-    # The seed is deliberately optional while prefill and legacy compatibility
-    # states are being migrated. Once present, it is the sole source for the
-    # next Frozen proposal's token/target-hidden pair.
-    seed_state: FrozenKvMtpSeedState | None = None
     # Opaque relay descriptors deliberately keep model tensors on device.  This
     # host-side, request-aligned bit is the only Frozen-specific information
-    # needed before the next static scheduler bucket is selected: rows marked
-    # true need an assistant seed forward; false rows are fresh prefills and
-    # already contain ordinary one-token proposal state in the relay buffer.
+    # needed before the next static scheduler bucket is selected: true rows
+    # contain valid target token/hidden seeds; false rows are padded slots.
     relay_seed_mask: np.ndarray | None = None
     # Upstream EAGLE no longer carries this legacy overlap relay handle. Frozen
     # keeps the explicit sentinel so its non-overlap state validation can reject
@@ -396,7 +408,6 @@ class FrozenKvMtpDraftInput(EagleDraftInput):
             + (
                 self.allocate_lens,
                 self.new_seq_lens,
-                self.seed_state,
                 self.relay_seed_mask,
             ),
             aux_data,
@@ -404,12 +415,11 @@ class FrozenKvMtpDraftInput(EagleDraftInput):
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
-        # ``tree_flatten`` appends four Frozen-only children after the base
+        # ``tree_flatten`` appends three Frozen-only children after the base
         # EAGLE state.  Pass exactly the base children back to its unflattener.
-        obj = EagleDraftInput.tree_unflatten.__func__(cls, aux_data, children[:-4])
-        obj.allocate_lens = children[-4]
-        obj.new_seq_lens = children[-3]
-        obj.seed_state = children[-2]
+        obj = EagleDraftInput.tree_unflatten.__func__(cls, aux_data, children[:-3])
+        obj.allocate_lens = children[-3]
+        obj.new_seq_lens = children[-2]
         obj.relay_seed_mask = children[-1]
         obj.pending_draft_extend_result = None
         return obj
@@ -443,7 +453,6 @@ class FrozenKvMtpDraftInput(EagleDraftInput):
                     "hidden_states",
                     "verified_id",
                     "accept_length",
-                    "seed_state",
                 )
                 if getattr(self, field, None) is not None
             ]
@@ -489,43 +498,10 @@ class FrozenKvMtpDraftInput(EagleDraftInput):
             raise ValueError(
                 "Frozen-KV MTP allocation length is shorter than its committed sequence length."
             )
-        if self.seed_state is not None and self.seed_state.batch_size != batch_size:
-            raise ValueError(
-                "Frozen-KV seed state has a different request count from draft state: "
-                f"seed={self.seed_state.batch_size}, state={batch_size}."
-            )
 
     @staticmethod
     def _select(value, indices):
         return None if value is None else np.asarray(value)[indices]
-
-    def _invalid_seed_state(self) -> FrozenKvMtpSeedState:
-        """Represent prefill-origin rows that have no post-verify seed yet.
-
-        A merged non-overlap batch can contain both an existing speculative
-        request (which has a target token/hidden seed from verification) and a
-        request that has just completed prefill.  The latter starts from its
-        normal draft-input fields, not a synthetic target-verify row.  Carry a
-        shape-compatible, invalid seed entry for it so one batched draft can
-        retain both forms of input.
-        """
-        batch_size = self._batch_size()
-        hidden = jnp.asarray(self.hidden_states)
-        return FrozenKvMtpSeedState(
-            bonus_token=jnp.asarray(self.verified_id, dtype=jnp.int32),
-            target_hidden=hidden,
-            committed_lens=jnp.asarray(
-                (
-                    self.new_seq_lens
-                    if self.new_seq_lens is not None
-                    else np.zeros(batch_size, dtype=np.int32)
-                ),
-                dtype=jnp.int32,
-            ),
-            allocate_lens=jnp.asarray(self.allocate_lens, dtype=jnp.int32),
-            request_indices=jnp.arange(batch_size, dtype=jnp.int32),
-            valid_mask=jnp.zeros((batch_size,), dtype=bool),
-        )
 
     def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True) -> None:
         """Keep state rows in exact request-pool order after finish/retract."""
@@ -553,8 +529,6 @@ class FrozenKvMtpDraftInput(EagleDraftInput):
         )
         for field in self._REQUIRED_FIELDS + self._OPTIONAL_PER_REQUEST_FIELDS:
             setattr(self, field, self._select(getattr(self, field), indices))
-        if self.seed_state is not None:
-            self.seed_state = self.seed_state.filter(jnp.asarray(indices, dtype=jnp.int32))
         self._validate_non_overlap_state()
 
     def trim_to_length(self, n: int) -> None:
@@ -567,10 +541,7 @@ class FrozenKvMtpDraftInput(EagleDraftInput):
             self._validate_non_overlap_state()
             return
 
-        old_size = self._batch_size()
         super().trim_to_length(n)
-        if self.seed_state is not None and n < old_size:
-            self.seed_state = self.seed_state.filter(jnp.arange(n, dtype=jnp.int32))
         self._validate_non_overlap_state()
 
     def merge_batch(self, other: EagleDraftInput) -> None:
@@ -607,9 +578,6 @@ class FrozenKvMtpDraftInput(EagleDraftInput):
         other._ensure_host()
         self._validate_non_overlap_state()
         other._validate_non_overlap_state()
-        left_seed = self.seed_state or self._invalid_seed_state()
-        right_seed = other.seed_state or other._invalid_seed_state()
-
         for field in self._REQUIRED_FIELDS:
             setattr(
                 self,
@@ -634,7 +602,6 @@ class FrozenKvMtpDraftInput(EagleDraftInput):
                     f"Frozen-KV MTP merge requires optional field {field!r} on both sides or neither."
                 )
             setattr(self, field, np.concatenate([np.asarray(left), np.asarray(right)]))
-        self.seed_state = left_seed.merge(right_seed)
         self._validate_non_overlap_state()
 
 
@@ -740,7 +707,7 @@ class FrozenKvMtpDraftWorker(EagleDraftWorkerBase):
         # Frozen-KV intentionally does not implement.
         self.seed_relay_buffers: SpecSeedRelayBuffers | None = None
         self._jit_publish_seed_relay = None
-        self._jit_gather_seed_relay = None
+        self._jit_publish_prefill_seed_relay = None
 
         (
             self.precompile_token_paddings,
@@ -771,14 +738,16 @@ class FrozenKvMtpDraftWorker(EagleDraftWorkerBase):
         """Create generic bucketed device programs for Frozen relay state.
 
         Request IDs and the choice of padded batch remain scheduler-owned host
-        metadata.  Once a scheduler bucket is chosen, however, compact-row
-        scatter/update and request-indexed gather must execute as a single
-        device program.  Calling the pure relay helpers eagerly creates many
-        tiny dispatches and turns otherwise asynchronous JAX arrays into host
-        synchronization points.  This mirrors DFlash's cached relay JITs;
-        it does not introduce a Frozen-specific batch policy.
+        metadata. Once a scheduler bucket is chosen, compact precompile
+        publication and token-major prefill seed selection must each remain a
+        single device program. Calling the pure relay helpers eagerly creates
+        tiny dispatches and host synchronization points. This mirrors
+        DFlash's cached relay JITs; it does not introduce batch policy.
         """
-        if getattr(self, "_jit_publish_seed_relay", None) is not None:
+        if (
+            getattr(self, "_jit_publish_seed_relay", None) is not None
+            and getattr(self, "_jit_publish_prefill_seed_relay", None) is not None
+        ):
             return
 
         from functools import partial
@@ -840,26 +809,49 @@ class FrozenKvMtpDraftWorker(EagleDraftWorkerBase):
                 dp_size=dp_size,
             )
 
-        @partial(jax.jit, static_argnames=("dp_size",))
-        def gather(buffers, future_indices, relay_seed_mask, *, dp_size: int):
+        @partial(
+            jax.jit,
+            donate_argnames=("buffers",),
+            static_argnames=("dp_size",),
+        )
+        def publish_prefill(
+            buffers,
+            future_indices,
+            selector,
+            verified_id,
+            target_hidden,
+            logits_indices,
+            *,
+            dp_size: int,
+        ):
+            """Select the target prefill seed and publish it in one dispatch."""
             future_indices = jax.sharding.reshard(future_indices, data_sharding)
-            relay_seed_mask = jax.sharding.reshard(relay_seed_mask, data_sharding)
-            verified_id, draft_token_ids, hidden_states, _is_target_seed = (
-                gather_spec_seed_relay_buffers(buffers, future_indices, dp_size=dp_size)
+            verified_id = jax.sharding.reshard(verified_id, data_sharding)
+            logits_indices = jax.sharding.reshard(logits_indices, data_sharding)
+            selector = jax.sharding.reshard(selector, replicated_sharding)
+            seed_hidden = _select_frozen_kv_prefill_seed_hidden(
+                target_hidden,
+                logits_indices,
             )
-            # `relay_seed_mask` is scheduler-owned lifecycle metadata.  It is
-            # authoritative for this round; `is_target_seed` remains stored as
-            # part of the generic relay contract for diagnostics/future users.
-            return (
-                verified_id,
-                draft_token_ids,
-                hidden_states,
+            total_bs = future_indices.shape[0]
+            valid_mask = (
+                jax.sharding.reshard(jnp.zeros((total_bs,), dtype=bool), data_sharding)
+                .at[selector]
+                .set(True, out_sharding=data_sharding)
+            )
+            return update_spec_seed_relay_buffers(
+                buffers,
                 future_indices,
-                relay_seed_mask,
+                valid_mask,
+                verified_id,
+                verified_id,
+                seed_hidden,
+                valid_mask,
+                dp_size=dp_size,
             )
 
         self._jit_publish_seed_relay = publish
-        self._jit_gather_seed_relay = gather
+        self._jit_publish_prefill_seed_relay = publish_prefill
 
     def _publish_seed_relay(
         self,
@@ -901,6 +893,35 @@ class FrozenKvMtpDraftWorker(EagleDraftWorkerBase):
                 dp_size=self.server_args.dp_size,
             )
 
+    def _publish_prefill_seed_relay(
+        self,
+        *,
+        model_worker_batch: ModelWorkerBatch,
+        target_hidden,
+        verified_id,
+    ) -> None:
+        """Publish the seed produced by target prefill without a draft forward."""
+        if getattr(self, "seed_relay_buffers", None) is None:
+            raise RuntimeError("Frozen-KV prefill requires initialized seed relay buffers.")
+        self._init_jit_seed_relay_ops()
+        total_bs = int(model_worker_batch.req_pool_indices.shape[0])
+        selector = np.asarray(model_worker_batch.logits_indices_selector, dtype=np.int32)
+        if model_worker_batch.logits_indices.shape != (total_bs,):
+            raise ValueError("Frozen-KV prefill logits indices must match the padded batch.")
+        if jnp.asarray(verified_id).shape != (total_bs,):
+            raise ValueError("Frozen-KV prefill tokens must match the padded batch.")
+
+        with jax.set_mesh(self.mesh):
+            self.seed_relay_buffers = self._jit_publish_prefill_seed_relay(
+                self.seed_relay_buffers,
+                model_worker_batch.req_pool_indices,
+                jnp.asarray(selector, dtype=jnp.int32),
+                verified_id,
+                target_hidden,
+                model_worker_batch.logits_indices,
+                dp_size=self.server_args.dp_size,
+            )
+
     @staticmethod
     def _compact_request_rows(value, selector: np.ndarray, expected: int):
         """Return compact live rows without changing their value dtype."""
@@ -914,569 +935,33 @@ class FrozenKvMtpDraftWorker(EagleDraftWorkerBase):
             f"rows={value.shape[0]}, requests={expected}, selector={selector.tolist()}"
         )
 
-    def publish_seed_after_verify_device(
-        self,
-        *,
-        model_worker_batch: ModelWorkerBatch,
-        verified_tokens: jax.Array,
-        target_hidden: jax.Array,
-        accept_lengths: jax.Array,
-        allocate_lens,
-    ) -> None:
-        """Select and relay the next Frozen seed without host acceptance reads.
-
-        ``EagleVerifyInput.sample_device`` returns a padded candidate layout.
-        The scheduler only needs its small acceptance result on host, whereas
-        Frozen's next proposal needs the selected target token/hidden pair on
-        device.  Select and publish that pair before the caller waits for the
-        scheduler result.  Request IDs and bucket selection remain scheduler
-        metadata; no model-specific admission policy enters this path.
-        """
-        if getattr(self, "seed_relay_buffers", None) is None:
-            return
-
-        selector_host = np.asarray(
-            getattr(model_worker_batch, "logits_indices_selector", ()), dtype=np.int32
-        ).reshape(-1)
-        if selector_host.size == 0:
-            return
-        selector = jnp.asarray(selector_host, dtype=jnp.int32)
-        accept_padded = jnp.asarray(accept_lengths, dtype=jnp.int32).reshape(-1)
-        if int(accept_padded.shape[0]) <= int(selector_host.max(initial=-1)):
-            raise ValueError(
-                "Frozen-KV device verify acceptance has fewer padded rows than its selector: "
-                f"accept_rows={accept_padded.shape[0]}, selector={selector_host.tolist()}"
-            )
-
-        rows_per_request = self.speculative_num_steps + 1
-        if int(verified_tokens.shape[0]) < int(accept_padded.shape[0]) * rows_per_request:
-            raise ValueError(
-                "Frozen-KV device verify tokens do not cover the padded candidate layout: "
-                f"tokens={verified_tokens.shape[0]}, accept_rows={accept_padded.shape[0]}, "
-                f"rows_per_request={rows_per_request}"
-            )
-
-        seq_lens = jnp.asarray(model_worker_batch.seq_lens, dtype=jnp.int32).reshape(-1)
-        allocate = jnp.asarray(allocate_lens, dtype=jnp.int32).reshape(-1)
-        req_indices = jnp.asarray(model_worker_batch.req_pool_indices, dtype=jnp.int32).reshape(-1)
-
-        def compact_request_rows(value, field):
-            """Normalize compact or padded scheduler metadata to live rows.
-
-            ``_get_cur_allocate_lens`` already compacts ``allocate_lens`` on
-            the host, whereas seq lengths, request-pool indices, and verifier
-            acceptance retain the DP-padded scheduler layout.  Treat both
-            representations as an explicit contract instead of indexing a
-            compact vector with global padded slots.
-            """
-            if int(value.shape[0]) == int(selector.shape[0]):
-                return value
-            max_slot = int(selector_host.max(initial=-1))
-            if int(value.shape[0]) <= max_slot:
-                raise ValueError(
-                    "Frozen-KV device verify metadata does not match its live selector: "
-                    f"field={field}, rows={value.shape[0]}, "
-                    f"requests={selector.shape[0]}, selector={selector_host.tolist()}"
-                )
-
-            # The padded verifier can be TP-sharded by candidate rows, while
-            # the compact live request count may be c1/c2 and therefore cannot
-            # use a data-partitioned result. Annotate only this small metadata
-            # gather; never force its source into a replicated layout first.
-            value_sharding = jax.typeof(value).sharding
-            if isinstance(value_sharding, NamedSharding):
-                # The compact result is ordered by live request, not by equal
-                # DP-attention partitions. Even a divisible row count can
-                # represent an unbalanced batch, so keep this small metadata
-                # gather replicated. The relay publisher scatters these rows
-                # into the scheduler's explicitly selected padded slots.
-                output_spec = P(*([None] * value.ndim))
-                return value.at[selector].get(
-                    out_sharding=NamedSharding(value_sharding.mesh, output_spec)
-                )
-            return jnp.take(value, selector, axis=0)
-
-        accept_live = compact_request_rows(accept_padded, "accept_lengths")
-        seed_state = select_after_verify(
-            jnp.asarray(verified_tokens, dtype=jnp.int32),
-            jnp.asarray(target_hidden),
-            selector,
-            accept_live,
-            compact_request_rows(seq_lens, "seq_lens") + accept_live + 1,
-            compact_request_rows(allocate, "allocate_lens"),
-            compact_request_rows(req_indices, "req_pool_indices"),
-            rows_per_request=rows_per_request,
-        )
-        self._publish_seed_relay(
-            model_worker_batch=model_worker_batch,
-            verified_id=seed_state.bonus_token,
-            draft_token_ids=seed_state.bonus_token,
-            hidden_states=seed_state.target_hidden,
-            is_target_seed=seed_state.valid_mask,
-        )
-
-    def build_next_draft_input_after_verify(
-        self,
-        *,
-        verified_id,
-        hidden_states,
-        new_seq_lens,
-        allocate_lens,
-        accept_lens,
-        accept_index,
-        model_worker_batch,
-    ) -> FrozenKvMtpDraftInput:
-        """Publish one target-hidden/token seed per request after verify.
-
-        The common verifier has already made ``verified_id`` and
-        ``hidden_states`` request-row aligned using its safe acceptance index.
-        Frozen keeps that pair as a device-resident ``FrozenKvMtpSeedState``;
-        the next ``draft`` consumes it before entering the recurrent proposal
-        loop. No generic EAGLE extension result is returned as the seed state.
-        """
-        accept_padded = np.asarray(accept_lens, dtype=np.int32).reshape(-1)
-        if accept_padded.size == 0:
-            return self.new_draft_input(
-                verified_id=np.empty(0, dtype=np.int32),
-                hidden_states=jnp.empty((0, 0), dtype=jnp.float32),
-                topk_p=np.empty((0, 1), dtype=np.float32),
-                topk_index=np.empty((0, 1), dtype=np.int32),
-                accept_length=accept_padded,
-                accept_length_cpu=accept_padded.copy(),
-                allocate_lens=np.empty(0, dtype=np.int32),
-                new_seq_lens=np.empty(0, dtype=np.int32),
-                seed_state=None,
-            )
-
-        selector = np.asarray(
-            getattr(model_worker_batch, "logits_indices_selector", np.arange(accept_padded.size)),
-            dtype=np.int32,
-        ).reshape(-1)
-        # ``EagleVerifyInput.sample`` returns one accept length for every
-        # *padded* verifier slot.  The Frozen seed state instead has one row
-        # per live scheduler request, identified by ``selector``.  Earlier we
-        # assumed those shapes were already compact, which crashed the first
-        # real Seed-MTP request at c1: selector=(1,), accept_lens=(16,).
-        accept = self._compact_request_rows(accept_padded, selector, selector.size)
-        if selector.size != accept.size:
-            raise ValueError(
-                "Frozen-KV verify selector must have one slot per accepted request: "
-                f"selector={selector.shape}, accept_lens={accept.shape}"
-            )
-
-        verified = jnp.asarray(verified_id)
-        hidden = jnp.asarray(hidden_states)
-        accept_index = np.asarray(accept_index).reshape(-1)
-        if accept_index.size % accept_padded.size != 0:
-            raise ValueError(
-                "Frozen-KV accept_index must contain a fixed candidate width per request: "
-                f"rows={accept_index.size}, padded_requests={accept_padded.size}"
-            )
-        rows_per_request = accept_index.size // accept_padded.size
-        if verified.shape[0] < accept_padded.size * rows_per_request:
-            raise ValueError(
-                "Frozen-KV verified rows are smaller than the padded verifier layout: "
-                f"rows={verified.shape[0]}, padded_requests={accept_padded.size}, "
-                f"rows_per_request={rows_per_request}"
-            )
-        committed = self._compact_request_rows(new_seq_lens, selector, accept.size)
-        allocated = self._compact_request_rows(allocate_lens, selector, accept.size)
-        req_indices = np.asarray(
-            getattr(model_worker_batch, "req_pool_indices", np.arange(accept.size)),
-            dtype=np.int32,
-        ).reshape(-1)
-        req_indices = self._compact_request_rows(req_indices, selector, accept.size)
-        seed_state = select_after_verify(
-            verified,
-            hidden,
-            jnp.asarray(selector),
-            jnp.asarray(accept),
-            jnp.asarray(committed),
-            jnp.asarray(allocated),
-            jnp.asarray(req_indices),
-            rows_per_request=rows_per_request,
-        )
-        if getattr(self, "seed_relay_buffers", None) is not None:
-            # Publish the target-selected seed in request-pool storage, then
-            # return only scheduler metadata.  In particular, do not return
-            # ``seed_state`` here: split/merge/filter would otherwise
-            # materialize its variable-size hidden tensor before the next
-            # static decode bucket is known.
-            self._publish_seed_relay(
-                model_worker_batch=model_worker_batch,
-                verified_id=seed_state.bonus_token,
-                draft_token_ids=seed_state.bonus_token,
-                hidden_states=seed_state.target_hidden,
-                is_target_seed=seed_state.valid_mask,
-            )
-            return self.new_draft_input(
-                future_indices=req_indices,
-                allocate_lens=allocated,
-                new_seq_lens=committed,
-                accept_length_cpu=accept.copy(),
-                relay_seed_mask=np.ones((accept.size,), dtype=bool),
-            )
-        # These fields remain the scheduler-compatible representation. The
-        # dedicated draft consumes seed_state and replaces top-k values after
-        # its seed forward; they are not interpreted as a generic EAGLE
-        # DRAFT_EXTEND result.
-        return self.new_draft_input(
-            verified_id=seed_state.bonus_token,
-            hidden_states=seed_state.target_hidden,
-            topk_p=jnp.ones((accept.size, 1), dtype=jnp.float32),
-            topk_index=seed_state.bonus_token[:, None],
-            accept_length=jnp.asarray(accept),
-            accept_length_cpu=accept.copy(),
-            allocate_lens=allocated,
-            new_seq_lens=committed,
-            seed_state=seed_state,
-        )
-
-    def _consume_seed_state(self, seed_state: FrozenKvMtpSeedState) -> tuple[jax.Array, jax.Array]:
-        """Consume and validate the next Frozen proposal's seed pair.
-
-        The returned token/hidden tensors are the inputs to the dedicated seed
-        forward. Keeping this tiny seam separate lets fake runners test the
-        handoff without constructing a TPU model runner.
-        """
-        if not isinstance(seed_state, FrozenKvMtpSeedState):
-            raise TypeError(f"expected FrozenKvMtpSeedState, got {type(seed_state).__name__}")
-        if not bool(np.all(np.asarray(seed_state.valid_mask))):
-            raise ValueError("Frozen-KV cannot start a proposal from an invalid seed row")
-        return seed_state.bonus_token, seed_state.target_hidden
-
-    def _prepare_seed_proposal(self, model_worker_batch: ModelWorkerBatch) -> jax.Array | None:
-        """Expose the seed-row mask for the next assistant seed forward.
-
-        The scheduler has already scattered ``seed_state`` into its DP-padded
-        slots.  Earlier experimental code compacted those slots and installed
-        target hidden states as if they were EAGLE hidden states.  That skips
-        Gemma's required assistant seed forward and also destroys the DP slot
-        layout.  Keep the padded layout intact: ``draft_forward`` will run one
-        assistant forward for every bucket slot and use this mask to retain its
-        result only for rows which came from target verification.
-        """
-        state = model_worker_batch.spec_info_padded
-        if not isinstance(state, FrozenKvMtpDraftInput) or state.seed_state is None:
-            return None
-        seed_state = state.seed_state
-        valid_mask = jnp.asarray(seed_state.valid_mask, dtype=bool)
-        state_rows = int(state.verified_id.shape[0])
-        if seed_state.batch_size != state_rows:
-            raise ValueError(
-                "Frozen-KV seed state and draft fields must have the same DP-padded slots: "
-                f"seed_bs={seed_state.batch_size}, draft_bs={state_rows}."
-            )
-
-        # Keep the target pair in the ordinary per-slot input fields so it
-        # survives merge/split/scatter implementations which do not know about
-        # ``seed_state`` yet.  Do not touch top-k values: target hidden is the
-        # *input* of the assistant seed forward, never generic EAGLE output.
-        # Relay lookup is data-sharded, while inherited draft-input fields can
-        # be replicated. `where` does not insert a collective implicitly, so
-        # align its predicate with each consumer field explicitly.
-        def _mask_for(reference):
-            sharding = getattr(reference, "sharding", None)
-            if not isinstance(sharding, NamedSharding):
-                return valid_mask if sharding is None else jax.device_put(valid_mask, sharding)
-            # A hidden-state reference is rank two/three, but the `where`
-            # predicate remains rank one before broadcasting.  Preserve the
-            # relevant leading partition axes without applying a rank-two
-            # sharding annotation to a vector.
-            mask_sharding = NamedSharding(
-                sharding.mesh, P(*tuple(sharding.spec)[: valid_mask.ndim])
-            )
-            return jax.device_put(valid_mask, mask_sharding)
-
-        token_mask = _mask_for(state.verified_id)
-        hidden_mask = _mask_for(state.hidden_states)
-        state.verified_id = jnp.where(
-            token_mask,
-            jnp.asarray(seed_state.bonus_token, dtype=jnp.int32),
-            jnp.asarray(state.verified_id, dtype=jnp.int32),
-        )
-        state.hidden_states = jnp.where(
-            hidden_mask[:, None],
-            jnp.asarray(seed_state.target_hidden),
-            jnp.asarray(state.hidden_states),
-        )
-        state.seed_state = None
-        return token_mask
-
-    def _restore_seed_relay(self, model_worker_batch: ModelWorkerBatch) -> None:
-        """Restore opaque relay metadata into one scheduler-selected bucket.
-
-        ``future_indices`` is intentionally consumed here, after
-        ``ScheduleBatch`` has merged/filtered and DP-scattered request metadata.
-        No dynamic model tensor participates in those operations.  The request
-        pool is the stable key, so slot reordering cannot pair one request with
-        another request's target hidden state.
-        """
-        state = model_worker_batch.spec_info_padded
-        if not isinstance(state, FrozenKvMtpDraftInput) or state.future_indices is None:
-            return
-        if getattr(self, "seed_relay_buffers", None) is None:
-            raise RuntimeError(
-                "Frozen-KV received a relay descriptor without initialized seed relay buffers."
-            )
-        if state.relay_seed_mask is None:
-            raise ValueError("Frozen-KV relay descriptor is missing relay_seed_mask.")
-
-        future_indices = np.asarray(state.future_indices, dtype=np.int32)
-        relay_seed_mask = np.asarray(state.relay_seed_mask, dtype=bool)
-        if future_indices.shape != relay_seed_mask.shape:
-            raise ValueError(
-                "Frozen-KV relay future_indices and relay_seed_mask must have identical shapes: "
-                f"indices={future_indices.shape}, mask={relay_seed_mask.shape}."
-            )
-        self._init_jit_seed_relay_ops()
-        with jax.set_mesh(self.mesh):
-            (
-                verified_id,
-                draft_token_ids,
-                hidden_states,
-                device_indices,
-                device_relay_seed_mask,
-            ) = self._jit_gather_seed_relay(
-                self.seed_relay_buffers,
-                future_indices,
-                relay_seed_mask,
-                dp_size=int(model_worker_batch.dp_size),
-            )
-
-        state.verified_id = verified_id
-        state.topk_index = draft_token_ids[:, None]
-        # A top-1 proposal's probability affects tree scores but not its only
-        # candidate token.  The first recurrent model forward replaces it
-        # immediately; use a device scalar rather than retaining a second
-        # request-indexed float buffer solely for that degenerate tree shape.
-        state.topk_p = jnp.ones_like(state.topk_index, dtype=jnp.float32)
-        state.hidden_states = hidden_states
-        state.future_indices = None
-        state.relay_seed_mask = None
-
-        # Always retain a device mask, including an all-false one.  Branching
-        # on `np.any` would materialize the just-gathered device relay state on
-        # the host; `_prepare_seed_proposal` naturally becomes a no-op when no
-        # row needs a target-hidden assistant seed forward.
-        state.seed_state = FrozenKvMtpSeedState(
-            bonus_token=verified_id,
-            target_hidden=hidden_states,
-            committed_lens=jnp.asarray(state.new_seq_lens, dtype=jnp.int32),
-            allocate_lens=jnp.asarray(state.allocate_lens, dtype=jnp.int32),
-            request_indices=device_indices,
-            valid_mask=device_relay_seed_mask,
-        )
-        # Do not call ``_validate_non_overlap_state`` here: its intentional
-        # CPU-side structural checks would materialize the freshly gathered
-        # device arrays. Descriptor validation happens before the scheduler
-        # stores the state; shape checks above cover this reconstruction seam.
-
-    @staticmethod
-    def _pad_seed_valid_mask(valid_mask, *, padded_bs: int, dp_size: int) -> jax.Array:
-        """Pad a scheduler-slot mask with the same DP layout as draft fields."""
-        valid_mask = jnp.asarray(valid_mask, dtype=bool).reshape(-1)
-        if valid_mask.shape[0] == padded_bs:
-            return valid_mask
-        if valid_mask.shape[0] > padded_bs or padded_bs % dp_size:
-            raise ValueError(
-                "Frozen-KV seed mask cannot be padded to the draft bucket: "
-                f"mask={valid_mask.shape[0]}, padded_bs={padded_bs}, dp_size={dp_size}."
-            )
-        if dp_size == 1 or valid_mask.shape[0] % dp_size:
-            return jnp.pad(valid_mask, (0, padded_bs - valid_mask.shape[0]))
-        per_dp_real = valid_mask.shape[0] // dp_size
-        per_dp_padded = padded_bs // dp_size
-        return jnp.pad(
-            valid_mask.reshape(dp_size, per_dp_real),
-            ((0, 0), (0, per_dp_padded - per_dp_real)),
-        ).reshape(-1)
-
-    @staticmethod
-    def _replace_seed_rows(
-        *,
-        valid_mask: jax.Array,
-        old_topk_p: jax.Array,
-        old_topk_index: jax.Array,
-        old_hidden: jax.Array,
-        seed_topk_p: jax.Array,
-        seed_topk_index: jax.Array,
-        seed_hidden: jax.Array,
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """Use seed-forward outputs without disturbing freshly-prefilled rows."""
-        valid_mask = jnp.asarray(valid_mask, dtype=bool)
-
-        def _reshard_like(value: jax.Array, reference: jax.Array) -> jax.Array:
-            """Match the persistent draft state's layout before `where`.
-
-            The seed model forward returns data-sharded output, whereas the
-            existing generic draft state is intentionally replicated at this
-            handoff.  JAX rejects `where` across those layouts (correctly: it
-            would otherwise require an implicit collective).  The state layout
-            is the consumer contract for the inherited recurrence, so make the
-            one explicit reshard here.
-            """
-            sharding = jax.typeof(reference).sharding
-            # CPU unit tests use a zero-axis NamedSharding, which is already
-            # effectively replicated and is not a legal `reshard` target.
-            if isinstance(sharding, NamedSharding) and sharding.mesh.axis_names:
-                return jax.sharding.reshard(value, sharding)
-            return value
-
-        def _mask_like(reference: jax.Array) -> jax.Array:
-            sharding = getattr(reference, "sharding", None)
-            if not isinstance(sharding, NamedSharding):
-                return valid_mask if sharding is None else jax.device_put(valid_mask, sharding)
-            mask_sharding = NamedSharding(
-                sharding.mesh, P(*tuple(sharding.spec)[: valid_mask.ndim])
-            )
-            return jax.device_put(valid_mask, mask_sharding)
-
-        seed_topk_p = _reshard_like(seed_topk_p, old_topk_p)
-        seed_topk_index = _reshard_like(seed_topk_index, old_topk_index)
-        seed_hidden = _reshard_like(seed_hidden, old_hidden)
-        return (
-            jnp.where(_mask_like(old_topk_p)[:, None], seed_topk_p, old_topk_p),
-            jnp.where(
-                _mask_like(old_topk_index)[:, None],
-                seed_topk_index,
-                old_topk_index,
-            ),
-            jnp.where(_mask_like(old_hidden)[:, None], seed_hidden, old_hidden),
-        )
-
-    def _run_seed_forward(
-        self,
-        model_worker_batch: ModelWorkerBatch,
-        *,
-        target_hidden: jax.Array,
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """Run Gemma's one-token target-hidden -> assistant-state transition.
-
-        Target verification produced the final accepted token and its target
-        hidden state.  Gemma's assistant must consume that pair before the
-        ordinary EAGLE-shaped recurrence can select a first draft candidate.
-        This is intentionally a DECODE-shaped assistant operation: it reads
-        the target KV view and has no assistant-owned cache to extend.
-        """
-        if self.topk != 1:
-            raise NotImplementedError(
-                "Frozen-KV seed forward currently supports speculative_eagle_topk=1 only."
-            )
-        state = model_worker_batch.spec_info_padded
-        assert isinstance(state, FrozenKvMtpDraftInput)
-        bs = int(model_worker_batch.seq_lens.shape[0])
-        if target_hidden.shape[0] != bs:
-            raise ValueError(
-                "Frozen-KV seed hidden state must match the padded draft batch: "
-                f"hidden_bs={target_hidden.shape[0]}, draft_bs={bs}."
-            )
-
-        metadata_per_step = self.draft_model_runner.attn_backend.get_eagle_multi_step_metadata(
-            model_worker_batch
-        )
-        logits_metadata = LogitsMetadata.from_model_worker_batch(
-            model_worker_batch, self.draft_model_runner.mesh
-        )
-        forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
-        forward_batch.out_cache_loc = np.empty((1,))
-        forward_batch.cache_loc = np.empty((1,))
-        forward_batch.spec_info = EagleDraftInput(hidden_states=jnp.asarray(target_hidden))
-        # ``device_array`` intentionally accepts host arrays and therefore
-        # calls ``np.asarray`` internally. The accepted Frozen seed is already
-        # device-resident; preserve it with an explicit reshard instead.
-        input_sharding = NamedSharding(self.mesh, P())
-        forward_batch.input_ids = jax.device_put(
-            jnp.asarray(state.verified_id, dtype=jnp.int32), input_sharding
-        )
-        # The seed token is already committed in target KV. Its target hidden
-        # therefore belongs to the final committed position, not the next
-        # proposal position. The attention metadata still exposes the target
-        # cache at the current committed sequence length.
-        forward_batch.positions = device_array(
-            np.asarray(model_worker_batch.seq_lens, dtype=np.int32) - 1,
-            sharding=NamedSharding(self.mesh, P()),
-        )
-        forward_batch.bid = model_worker_batch.bid
-        self.draft_model_runner.attn_backend.forward_metadata = metadata_per_step[0]
-        logits_output, _, _ = self.draft_model_runner.forward(
-            forward_batch,
-            logits_metadata=logits_metadata,
-        )
-        topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits, self.topk)
-        if self.hot_token_ids is not None:
-            topk_index = self._map_hot_token_ids(topk_index)
-        return topk_p, topk_index, replicate_to_mesh(self.mesh, logits_output.hidden_states)
-
-    def draft_forward(self, model_worker_batch: ModelWorkerBatch):
-        """Start Frozen proposals with an assistant seed forward when required."""
-        valid_mask = getattr(model_worker_batch, "_frozen_kv_seed_valid_mask", None)
-        if valid_mask is None:
-            return super().draft_forward(model_worker_batch)
-
-        state = model_worker_batch.spec_info_padded
-        assert isinstance(state, FrozenKvMtpDraftInput)
-        padded_mask = self._pad_seed_valid_mask(
-            valid_mask,
-            padded_bs=int(model_worker_batch.seq_lens.shape[0]),
-            dp_size=int(model_worker_batch.dp_size),
-        )
-        seed_topk_p, seed_topk_index, seed_hidden = self._run_seed_forward(
-            model_worker_batch,
-            target_hidden=jnp.asarray(state.hidden_states),
-        )
-        state.topk_p, state.topk_index, state.hidden_states = self._replace_seed_rows(
-            valid_mask=padded_mask,
-            old_topk_p=jnp.asarray(state.topk_p),
-            old_topk_index=jnp.asarray(state.topk_index),
-            old_hidden=jnp.asarray(state.hidden_states),
-            seed_topk_p=seed_topk_p,
-            seed_topk_index=seed_topk_index,
-            seed_hidden=seed_hidden,
-        )
-        return super().draft_forward(model_worker_batch)
-
     def draft_extend_for_prefill(self, model_worker_batch, hidden_states, next_token_ids) -> None:
-        """Publish the prefill's committed length for a later non-overlap merge."""
-        super().draft_extend_for_prefill(model_worker_batch, hidden_states, next_token_ids)
-        draft_input = model_worker_batch.spec_info_padded
-        assert isinstance(draft_input, FrozenKvMtpDraftInput)
-        selector = np.asarray(model_worker_batch.logits_indices_selector)
-        draft_input.new_seq_lens = np.asarray(model_worker_batch.seq_lens)[selector].copy()
-        draft_input._validate_non_overlap_state()
-        if getattr(self, "seed_relay_buffers", None) is not None:
-            # The inherited prefill extension currently computes the assistant
-            # proposal correctly, but leaves compact model tensors in
-            # ``draft_input``. Publish those tensors immediately and keep only
-            # scheduler metadata for non-overlap merge/filter. A later dedicated
-            # prefill program can remove that inherited host capture as a
-            # separate, measurable change; this slice removes the cross-round
-            # materialization without changing prefill math.
-            self._publish_seed_relay(
-                model_worker_batch=model_worker_batch,
-                verified_id=draft_input.verified_id,
-                draft_token_ids=jnp.asarray(draft_input.topk_index)[:, 0],
-                hidden_states=draft_input.hidden_states,
-                is_target_seed=jnp.zeros((selector.size,), dtype=bool),
-            )
-            model_worker_batch.spec_info_padded = self.new_draft_input(
-                future_indices=np.asarray(model_worker_batch.req_pool_indices, dtype=np.int32)[
-                    selector
-                ],
-                allocate_lens=np.asarray(draft_input.allocate_lens),
-                new_seq_lens=np.asarray(draft_input.new_seq_lens),
-                relay_seed_mask=np.zeros((selector.size,), dtype=bool),
-            )
-            model_worker_batch.spec_info_padded._validate_non_overlap_state()
+        """Publish target prefill's token/hidden pair as the next draft seed.
+
+        Gemma 4 Frozen-KV extension is seed selection, not an assistant model
+        forward.  The first fused draft call consumes this pair and performs
+        the assistant seed forward together with the recurrent proposal loop.
+        """
+        selector = np.asarray(model_worker_batch.logits_indices_selector, dtype=np.int32)
+        self._publish_prefill_seed_relay(
+            model_worker_batch=model_worker_batch,
+            target_hidden=hidden_states,
+            verified_id=next_token_ids,
+        )
+        seq_lens = np.asarray(model_worker_batch.seq_lens, dtype=np.int32)[selector]
+        model_worker_batch.spec_info_padded = self.new_draft_input(
+            future_indices=np.asarray(model_worker_batch.req_pool_indices, dtype=np.int32)[
+                selector
+            ],
+            allocate_lens=seq_lens.copy(),
+            new_seq_lens=seq_lens.copy(),
+            relay_seed_mask=np.ones((selector.size,), dtype=bool),
+        )
+        model_worker_batch.spec_info_padded._validate_non_overlap_state()
+        model_worker_batch.return_hidden_states = False
 
     def draft_extend_for_decode(self, model_worker_batch, batch_output) -> None:
-        """Publish the already-selected seed; do not run generic DRAFT_EXTEND.
-
-        ``BaseSpecWorker.verify`` has already called
-        ``build_next_draft_input_after_verify``. Frozen's next draft consumes
-        that state at the start of ``draft``; there is no assistant forward at
-        this boundary and no host-visible generic extension result.
-        """
+        """Install the descriptor already published by fused target verify."""
         next_state = batch_output.next_draft_input
         if not isinstance(next_state, FrozenKvMtpDraftInput):
             raise TypeError(
@@ -1628,26 +1113,14 @@ class FrozenKvMtpDraftWorker(EagleDraftWorkerBase):
         )
 
     def draft(self, model_worker_batch):
-        """Run one fused Frozen proposal dispatch when its contract is available."""
-        if self._can_use_fused_draft(model_worker_batch):
-            return self._draft_fused_linear_chain(model_worker_batch)
-
-        # Fake runners, direct state tests, and future non-linear configurations
-        # retain the exact legacy mechanics as an explicit correctness fallback.
-        self._restore_seed_relay(model_worker_batch)
-        valid_mask = self._prepare_seed_proposal(model_worker_batch)
-        if valid_mask is None:
-            return super().draft(model_worker_batch)
-
-        # This marker is deliberately ephemeral. It describes the current
-        # scheduler batch only; persisting it in ``FrozenKvMtpDraftInput``
-        # would make a finished/retracted request's validity leak into a later
-        # batch.
-        model_worker_batch._frozen_kv_seed_valid_mask = valid_mask
-        try:
-            return super().draft(model_worker_batch)
-        finally:
-            delattr(model_worker_batch, "_frozen_kv_seed_valid_mask")
+        """Run the only supported Frozen proposal path as one TPU dispatch."""
+        if not self._can_use_fused_draft(model_worker_batch):
+            raise RuntimeError(
+                "Frozen-KV MTP requires its fused top-1 linear draft path; "
+                "the relay descriptor, model runner, or launch configuration "
+                "does not satisfy that contract."
+            )
+        return self._draft_fused_linear_chain(model_worker_batch)
 
     def _redirect_layer_ids(self, draft_model, target_model) -> None:
         """Point each draft layer at the target cache slot it shares K/V with.
@@ -1706,9 +1179,10 @@ class FrozenKvMtpWorker(EAGLEWorker):
     """EAGLE orchestration with a frozen-KV draft worker.
 
     Startup bucket selection and dummy-batch construction are inherited from
-    ``EAGLEWorker`` just like ordinary multi-layer MTP.  Frozen-KV only opts
-    into that shared driver's non-fused prefill branch because its query-only
-    assistant cannot use the generic fused NEXTN prefill path.
+    ``EAGLEWorker`` just like ordinary multi-layer MTP. Target-model prefill is
+    compiled by the normal model runner; Frozen-KV does not compile or execute
+    a separate assistant prefill. Instead it publishes target prefill's final
+    token/hidden pair for the first fused proposal round.
     """
 
     def __init__(self, server_args, target_worker: ModelWorker):
@@ -1723,6 +1197,14 @@ class FrozenKvMtpWorker(EAGLEWorker):
         self.draft_worker.init_seed_relay_buffers()
 
     def supports_non_fused_spec_prefill_precompile(self) -> bool:
+        """Warm target prefill plus seed publication, never an assistant EXTEND.
+
+        The generic speculative startup driver owns the scheduler's batch and
+        token buckets. Frozen-KV opts into its non-overlap prefill call so both
+        the ordinary target prefill and the small final-hidden relay publisher
+        compile before traffic. ``draft_extend_for_prefill`` is seed-only, so
+        this capability does not restore the removed assistant prefill path.
+        """
         return True
 
     def prepare_spec_decode_precompile_state(self, model_worker_batch, spec_info):
@@ -1867,15 +1349,13 @@ class FrozenKvMtpWorker(EAGLEWorker):
         next assistant seed into its device relay.  Only the small acceptance
         length vector is then read by the scheduler-facing descriptor.
 
-        For the supported greedy linear chain, target forward, acceptance,
-        accepted-row selection, and relay publication are one compiled
-        executable. Other sampling/tree contracts retain the generic fallback
-        rather than silently changing semantics.
+        Target forward, acceptance, accepted-row selection, and relay
+        publication are one compiled executable. Server admission rejects
+        sampling/tree contracts outside this greedy top-1 linear path.
         """
         if not self.server_args.disable_overlap_schedule:
-            return super().verify(model_worker_batch, cur_allocate_lens)
+            raise RuntimeError("Frozen-KV MTP does not support overlap scheduling.")
 
-        from sgl_jax.srt.managers.scheduler import GenerationBatchResult
         from sgl_jax.srt.speculative.eagle_info import EagleVerifyInput
 
         if cur_allocate_lens is None:
@@ -1892,15 +1372,9 @@ class FrozenKvMtpWorker(EAGLEWorker):
         forward_metadata = self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
         )
-        # Frozen-KV MTP's public contract is a top-k-one chain.  Verify that
+        # Frozen-KV MTP's public contract is a top-k-one chain. Verify that
         # chain directly against the target's native output sharding, following
-        # DFlash's target-verify design.  Generic EAGLE tree verification has
-        # P()-replicated Pallas inputs, which used to force both target logits
-        # and target hidden states through ``replicate_to_mesh`` here before
-        # the Frozen-specific seed relay could consume them.
-        #
-        # Keep the generic route as a correctness fallback for a future
-        # branching configuration: its retrieval graph is not a linear chain.
+        # DFlash's dedicated greedy target-verify design.
         native_chain_verify = (
             model_worker_batch.sampling_info.is_all_greedy
             and spec_info.custom_mask is None
@@ -1912,112 +1386,14 @@ class FrozenKvMtpWorker(EAGLEWorker):
             and hasattr(self.target_worker.model_runner, "_model_def")
             and hasattr(self.target_worker.model_runner, "_model_state_def")
         )
-        if fused_verify_ready:
-            return self._verify_fused_linear_chain(
-                model_worker_batch,
-                spec_info,
-                cur_allocate_lens,
-                forward_metadata,
+        if not fused_verify_ready:
+            raise RuntimeError(
+                "Frozen-KV MTP requires its fused greedy linear verify path; "
+                "the relay buffer, model runner, or verify metadata is incompatible."
             )
-
-        logits_output, _, cache_miss_count = self.target_worker.forward_batch_generation(
-            model_worker_batch, skip_sample=True, forward_metadata=forward_metadata
-        )
-        if native_chain_verify:
-            (
-                predict_device,
-                accept_lengths_device,
-                accept_index_device,
-            ) = verify_frozen_kv_mtp_chain_greedy(
-                spec_info.draft_token,
-                logits_output.next_token_logits,
-                draft_token_num=spec_info.draft_token_num,
-            )
-            verified_tokens_device = predict_device
-        else:
-            logits_output.next_token_logits, logits_output.hidden_states = replicate_to_mesh(
-                self.mesh, logits_output.next_token_logits, logits_output.hidden_states
-            )
-            (
-                predict_device,
-                verified_tokens_device,
-                accept_lengths_device,
-                accept_index_device,
-            ) = spec_info.sample_device(
-                model_worker_batch,
-                logits_output,
-                self.draft_worker.draft_model_runner.rngs,
-                self.mesh,
-            )
-
-        # Select and store the next target token/hidden seed before the host
-        # waits for acceptance.  This follows DFlash's target-verify ownership:
-        # device state is advanced first, host scheduler metadata follows.
-        self.draft_worker.publish_seed_after_verify_device(
-            model_worker_batch=model_worker_batch,
-            verified_tokens=verified_tokens_device,
-            target_hidden=logits_output.hidden_states,
-            accept_lengths=accept_lengths_device,
-            allocate_lens=cur_allocate_lens,
-        )
-
-        accept_width = self.speculative_num_steps + 1
-        draft_width = self.speculative_num_draft_tokens
-        flat_accept_index = jnp.asarray(accept_index_device, dtype=jnp.int32).reshape(-1)
-        request_ids = jnp.arange(flat_accept_index.shape[0], dtype=jnp.int32) // accept_width
-        per_request_last = request_ids * draft_width + draft_width - 1
-        safe_index = jnp.where(flat_accept_index >= 0, flat_accept_index, per_request_last)
-
-        # Preserve the target program's data/tensor output layouts through the
-        # scheduler-facing candidate-row gather. Plain advanced indexing cannot
-        # infer a safe output sharding when rows are TP-partitioned. This is a
-        # device gather, not a host materialization or a P() replication.
-        def gather_rows(value, indices):
-            value_sharding = jax.typeof(value).sharding
-            if isinstance(value_sharding, NamedSharding):
-                return value.at[indices].get(out_sharding=value_sharding)
-            return value[indices]
-
-        logits_output.next_token_logits = gather_rows(logits_output.next_token_logits, safe_index)
-        logits_output.hidden_states = gather_rows(logits_output.hidden_states, safe_index)
-        model_worker_batch.positions = gather_rows(model_worker_batch.positions, safe_index)
-
-        # The scheduler needs the acceptance length, but not the candidate-row
-        # acceptance index. Start that small transfer after the relay dispatch;
-        # it can overlap later device work exactly as in DFlash.
-        if hasattr(accept_lengths_device, "copy_to_host_async"):
-            accept_lengths_device.copy_to_host_async()
-        accept_padded = np.asarray(accept_lengths_device, dtype=np.int32).reshape(-1)
-        selector = np.asarray(model_worker_batch.logits_indices_selector, dtype=np.int32).reshape(
-            -1
-        )
-        accept_live = self.draft_worker._compact_request_rows(
-            accept_padded, selector, selector.size
-        )
-        seq_lens = np.asarray(model_worker_batch.seq_lens, dtype=np.int32).reshape(-1)
-        allocate_lens = self.draft_worker._compact_request_rows(
-            cur_allocate_lens, selector, selector.size
-        )
-        req_indices = self.draft_worker._compact_request_rows(
-            model_worker_batch.req_pool_indices, selector, selector.size
-        )
-        new_seq_lens = seq_lens[selector] + accept_live + 1
-        next_draft_input = self.draft_worker.new_draft_input(
-            future_indices=req_indices,
-            allocate_lens=allocate_lens,
-            new_seq_lens=new_seq_lens,
-            accept_length_cpu=accept_live.copy(),
-            relay_seed_mask=np.ones((selector.size,), dtype=bool),
-        )
-        next_draft_input._validate_non_overlap_state()
-        model_worker_batch.spec_info_padded = next_draft_input
-        return GenerationBatchResult(
-            logits_output=logits_output,
-            next_token_ids=predict_device,
-            next_draft_input=next_draft_input,
-            accept_lens=accept_padded,
-            bid=model_worker_batch.bid,
-            cache_miss_count=cache_miss_count,
-            extend_input_len_per_req=None,
-            extend_logprob_start_len_per_req=None,
+        return self._verify_fused_linear_chain(
+            model_worker_batch,
+            spec_info,
+            cur_allocate_lens,
+            forward_metadata,
         )

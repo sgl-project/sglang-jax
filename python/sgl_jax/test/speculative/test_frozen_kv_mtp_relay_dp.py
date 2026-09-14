@@ -17,6 +17,7 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.speculative.eagle_util import build_chain_verify_inputs_device
 from sgl_jax.srt.speculative.frozen_kv_mtp_worker import (
+    FrozenKvMtpDraftInput,
     FrozenKvMtpDraftWorker,
     _frozen_kv_top1_token,
     _select_frozen_kv_proposal_start,
@@ -140,7 +141,6 @@ def test_single_live_prefill_publishes_into_a_dp2_seed_relay():
     worker._worker = types.SimpleNamespace(mesh=mesh)
     worker.server_args = types.SimpleNamespace(dp_size=2)
     worker._jit_publish_seed_relay = None
-    worker._jit_gather_seed_relay = None
     req_pool = types.SimpleNamespace(req_to_token=np.zeros((8, 1), dtype=np.int32))
     worker.seed_relay_buffers = create_spec_seed_relay_buffers(
         mesh,
@@ -193,7 +193,6 @@ def test_compact_updates_use_explicit_dp_padded_slots(selector, expected_tokens)
     worker._worker = types.SimpleNamespace(mesh=mesh)
     worker.server_args = types.SimpleNamespace(dp_size=2)
     worker._jit_publish_seed_relay = None
-    worker._jit_gather_seed_relay = None
     req_pool = types.SimpleNamespace(req_to_token=np.zeros((8, 1), dtype=np.int32))
     worker.seed_relay_buffers = create_spec_seed_relay_buffers(
         mesh,
@@ -229,8 +228,8 @@ def test_compact_updates_use_explicit_dp_padded_slots(selector, expected_tokens)
 
 
 @pytest.mark.skipif(jax.device_count() < 2, reason="requires two CPU test devices")
-def test_dp2_verify_accepts_compact_allocate_lens_with_padded_metadata():
-    """Verify handoff must not index compact allocation rows by padded slots."""
+def test_prefill_seed_publish_selects_each_dp_ranks_last_prompt_hidden():
+    """Prefill indices are local to each DP token shard, not global rows."""
     mesh = Mesh(
         np.asarray(jax.devices()[:2]).reshape(2, 1),
         ("data", "tensor"),
@@ -239,52 +238,79 @@ def test_dp2_verify_accepts_compact_allocate_lens_with_padded_metadata():
     worker = FrozenKvMtpDraftWorker.__new__(FrozenKvMtpDraftWorker)
     worker._worker = types.SimpleNamespace(mesh=mesh)
     worker.server_args = types.SimpleNamespace(dp_size=2)
-    worker.speculative_num_steps = 3
     worker._jit_publish_seed_relay = None
-    worker._jit_gather_seed_relay = None
+    worker._jit_publish_prefill_seed_relay = None
     req_pool = types.SimpleNamespace(req_to_token=np.zeros((8, 1), dtype=np.int32))
     worker.seed_relay_buffers = create_spec_seed_relay_buffers(
         mesh,
         req_pool,
         dp_size=2,
-        hidden_size=3,
+        hidden_size=2,
         hidden_dtype=jnp.float32,
     )
     batch = types.SimpleNamespace(
-        logits_indices_selector=np.asarray([0], dtype=np.int32),
-        seq_lens=jax.device_put(
-            jnp.asarray([10, 0], dtype=jnp.int32), NamedSharding(mesh, P("data"))
-        ),
+        # One live request on each DP rank; slots 1 and 3 are padding.
+        logits_indices_selector=np.asarray([0, 2], dtype=np.int32),
         req_pool_indices=jax.device_put(
-            jnp.asarray([3, 0], dtype=jnp.int32), NamedSharding(mesh, P("data"))
+            jnp.asarray([3, 0, 5, 0], dtype=jnp.int32),
+            NamedSharding(mesh, P("data")),
+        ),
+        # Each rank has four packed prompt-token rows. These indices are local
+        # within the rank's shard: rank zero selects row 1, rank one row 0.
+        logits_indices=jax.device_put(
+            jnp.asarray([1, 3, 0, 2], dtype=jnp.int32),
+            NamedSharding(mesh, P("data")),
         ),
     )
-    verified_tokens = jax.device_put(
-        jnp.arange(100, 108, dtype=jnp.int32), NamedSharding(mesh, P("data"))
-    )
-    hidden = jax.device_put(
-        jnp.arange(24, dtype=jnp.float32).reshape(8, 3),
+    target_hidden = jax.device_put(
+        jnp.arange(16, dtype=jnp.float32).reshape(8, 2),
         NamedSharding(mesh, P("data", None)),
     )
-    accept_lengths = jax.device_put(
-        jnp.asarray([3, 0], dtype=jnp.int32), NamedSharding(mesh, P("data"))
+    verified_id = jax.device_put(
+        jnp.asarray([51, 0, 53, 0], dtype=jnp.int32),
+        NamedSharding(mesh, P("data")),
     )
 
-    # This field is intentionally compact: BaseDraftWorker._get_cur_allocate_lens
-    # has already selected live rows before entering FrozenKvMtpWorker.verify.
-    worker.publish_seed_after_verify_device(
+    worker._publish_prefill_seed_relay(
         model_worker_batch=batch,
-        verified_tokens=verified_tokens,
-        target_hidden=hidden,
-        accept_lengths=accept_lengths,
-        allocate_lens=np.asarray([20], dtype=np.int32),
+        target_hidden=target_hidden,
+        verified_id=verified_id,
     )
 
-    indices = jax.device_put(jnp.asarray([3, 0], dtype=jnp.int32), NamedSharding(mesh, P("data")))
+    indices = jax.device_put(
+        jnp.asarray([3, 0, 5, 0], dtype=jnp.int32), NamedSharding(mesh, P("data"))
+    )
     token_ids, draft_ids, selected_hidden, is_target_seed = gather_spec_seed_relay_buffers(
         worker.seed_relay_buffers, indices, dp_size=2
     )
-    np.testing.assert_array_equal(token_ids, [102, 0])
-    np.testing.assert_array_equal(draft_ids, [102, 0])
-    np.testing.assert_allclose(selected_hidden, [[6.0, 7.0, 8.0], [0.0, 0.0, 0.0]])
-    np.testing.assert_array_equal(is_target_seed, [True, False])
+    np.testing.assert_array_equal(token_ids, [51, 0, 53, 0])
+    np.testing.assert_array_equal(draft_ids, [51, 0, 53, 0])
+    np.testing.assert_allclose(selected_hidden, [[2, 3], [0, 0], [8, 9], [0, 0]])
+    np.testing.assert_array_equal(is_target_seed, [True, False, True, False])
+
+
+def test_prefill_extension_only_publishes_seed_descriptor():
+    """Frozen prefill must not invoke the inherited assistant forward."""
+    calls = []
+    worker = FrozenKvMtpDraftWorker.__new__(FrozenKvMtpDraftWorker)
+    worker._publish_prefill_seed_relay = lambda **kwargs: calls.append(kwargs)
+    batch = types.SimpleNamespace(
+        logits_indices_selector=np.asarray([0, 2], dtype=np.int32),
+        req_pool_indices=np.asarray([4, -1, 7], dtype=np.int32),
+        seq_lens=np.asarray([10, 0, 20], dtype=np.int32),
+        return_hidden_states=True,
+        spec_info_padded=None,
+    )
+    hidden = jnp.arange(12, dtype=jnp.float32).reshape(6, 2)
+    tokens = jnp.asarray([101, 0, 201], dtype=jnp.int32)
+
+    worker.draft_extend_for_prefill(batch, hidden, tokens)
+
+    assert calls[0]["target_hidden"] is hidden
+    assert calls[0]["verified_id"] is tokens
+    assert isinstance(batch.spec_info_padded, FrozenKvMtpDraftInput)
+    np.testing.assert_array_equal(batch.spec_info_padded.future_indices, [4, 7])
+    np.testing.assert_array_equal(batch.spec_info_padded.allocate_lens, [10, 20])
+    np.testing.assert_array_equal(batch.spec_info_padded.new_seq_lens, [10, 20])
+    np.testing.assert_array_equal(batch.spec_info_padded.relay_seed_mask, [True, True])
+    assert batch.return_hidden_states is False

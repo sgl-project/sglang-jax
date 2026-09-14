@@ -35,11 +35,11 @@ class SpecSeedRelayBuffers(NamedTuple):
 
     This is intentionally smaller than :class:`SpecRelayBuffers`: top-1
     speculative algorithms need one verified token, one proposal token, and
-    one hidden state per request.  A Frozen-KV row can be either a normal
-    prefill-origin proposal or a target-verify-origin seed; ``is_target_seed``
-    identifies the latter.  The scheduler owns the request-to-slot mapping;
-    this buffer only preserves device-resident values across that
-    variable-size scheduler boundary.
+    one hidden state per request. Frozen-KV publishes a target token/hidden
+    seed after both prefill and verification; ``is_target_seed`` distinguishes
+    valid live rows from padding. The scheduler owns request-to-slot mapping;
+    this buffer only preserves device-resident values across that variable-size
+    scheduler boundary.
     """
 
     token_ids: jax.Array
