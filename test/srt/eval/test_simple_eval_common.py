@@ -9,6 +9,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pandas
+from tokenizers import Tokenizer, decoders, models, pre_tokenizers, processors
+from transformers import PreTrainedTokenizerFast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -106,14 +108,29 @@ class TestSglangMMLUChat(unittest.TestCase):
         row = dict(Subject="anatomy", Question="Q", A="a", B="b", C="c", D="d", Answer="B")
         self.client = Mock(base_url="http://localhost:32000/v1/")
         self.client.get.return_value = {"model_path": "model"}
-        self.scores = {" AD": -1.0, " B": -2.0, " A": -3.0, " C": -4.0, " D": -5.0}
-        self.logprobs = SimpleNamespace(top_logprobs=[self.scores])
+        self.scores = [[-5.0, 6, None], [-2.0, 4, None], [-3.0, 3, None], [-4.0, 5, None]]
+        self.meta = {"output_token_ids_logprobs": [self.scores]}
+        self.client.post.return_value = {"text": " AD", "meta_info": self.meta}
         self.client.completions.create.return_value = SimpleNamespace(
-            choices=[SimpleNamespace(text=" AD", logprobs=self.logprobs)]
+            choices=[SimpleNamespace(text=" AD")]
         )
         self.sampler = SimpleNamespace(model="model", client=self.client)
-        self.tokenizer = Mock()
-        self.tokenizer.apply_chat_template.return_value = "native assistant\n"
+        # A real, offline tokenizer with BOS insertion and SentencePiece-style decoding.
+        vocab = {t: i for i, t in enumerate(["<unk>", "<s>", "▁Answer:", "▁A", "▁B", "▁C", "▁D"])}
+        backend = Tokenizer(models.WordLevel(vocab, unk_token="<unk>"))
+        backend.pre_tokenizer = pre_tokenizers.Sequence(
+            [pre_tokenizers.WhitespaceSplit(), pre_tokenizers.Metaspace()]
+        )
+        backend.decoder = decoders.Metaspace()
+        backend.post_processor = processors.TemplateProcessing(
+            single="<s> $A", special_tokens=[("<s>", 1)]
+        )
+        self.tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=backend,
+            bos_token="<s>",
+            unk_token="<unk>",
+            chat_template="{{ bos_token }}user\n{{ messages[0]['content'] }}\nassistant{{ '\\n' }}",
+        )
         for target, value in (
             ("transformers.AutoTokenizer.from_pretrained", self.tokenizer),
             ("eval.sglang_mmlu.pandas.read_csv", pandas.DataFrame([row])),
@@ -128,31 +145,45 @@ class TestSglangMMLUChat(unittest.TestCase):
             "The following are multiple choice questions (with answers) about anatomy.\n\n"
             "Q\nA. a\nB. b\nC. c\nD. d\nAnswer:"
         )
-        result = self.evaluation()
-        self.client.completions.create.assert_called_with(
-            model="model",
-            prompt="native assistant\nAnswer:",
-            temperature=0,
-            max_tokens=1,
-            logprobs=20,
-        )
+        with patch.object(
+            self.tokenizer, "apply_chat_template", wraps=self.tokenizer.apply_chat_template
+        ) as format_prompt:
+            result = self.evaluation()
         self.assertEqual(result.score, 1.0)  # B wins by logprob, not the emitted AD.
         user_prompt = (
             "Answer the final multiple-choice question with exactly one letter: "
             "A, B, C, or D.\n\n" + raw
         )
-        self.tokenizer.apply_chat_template.assert_called_once_with(
+        format_prompt.assert_called_once_with(
             [{"role": "user", "content": user_prompt}],
             tokenize=False,
             add_generation_prompt=True,
             enable_thinking=False,
         )
+        prompt = "<s>user\n" + user_prompt + "\nassistant\nAnswer:"
+        self.client.post.assert_called_once_with(
+            "http://localhost:32000/generate",
+            cast_to=dict[str, object],
+            body={
+                "input_ids": self.tokenizer.encode(prompt, add_special_tokens=False),
+                "sampling_params": {"temperature": 0, "max_new_tokens": 1},
+                "return_logprob": True,
+                "return_text_in_logprobs": False,
+                "token_ids_logprob": [3, 4, 5, 6],
+            },
+        )
+        self.client.completions.create.assert_not_called()
+        input_ids = self.client.post.call_args.kwargs["body"]["input_ids"]
+        self.assertEqual(self.tokenizer.encode(prompt)[:2], [1, 1])  # Old text path doubles BOS.
+        self.assertEqual(input_ids.count(self.tokenizer.bos_token_id), 1)
+        self.assertEqual(self.tokenizer.batch_decode([[i] for i in [3, 4, 5, 6]]), list("ABCD"))
 
-        for method in (self.client.completions.create, self.tokenizer.apply_chat_template):
-            method.side_effect = RuntimeError("request failed")
-            with self.assertRaisesRegex(RuntimeError, "request failed"):
-                self.evaluation()
-            method.side_effect = None
+    def test_request_and_template_errors_propagate(self):
+        for method in ("post", "apply_chat_template"):
+            target = self.client if method == "post" else self.tokenizer
+            with patch.object(target, method, side_effect=RuntimeError("request failed")):
+                with self.assertRaisesRegex(RuntimeError, "request failed"):
+                    self.evaluation()
 
     def test_raw_evaluator_keeps_greedy_answer_extraction(self):
         result = SglangMMLUEval("unused.csv", None, 1)(self.sampler)
@@ -161,27 +192,26 @@ class TestSglangMMLUChat(unittest.TestCase):
         self.assertTrue(request["prompt"].endswith("Answer:"))
         self.assertEqual(result.score, 0.0)  # The emitted AD is scored as A.
         self.client.get.assert_not_called()
-        self.tokenizer.apply_chat_template.assert_not_called()
+        self.client.post.assert_not_called()
 
-    def test_partial_top_logprobs_identify_the_best_choice(self):
-        self.logprobs.top_logprobs = [{" **": -1.0, " B": -2.0, " x": -3.0}]
-        self.assertEqual(self.evaluation().score, 1.0)
-
-    def test_insufficient_or_invalid_logprobs_fail(self):
-        invalid = [
-            [],
-            [self.scores, self.scores],
-            [{}],
-            [{" **": -1.0}],
-            [{" **": -1.0, " B": -2.0}],
-        ]  # A missing answer could tie B at the cutoff.
+    def test_incomplete_or_invalid_logprobs_fail(self):
+        invalid = [[], [self.scores, self.scores], [[]], [self.scores[:-1]]]
         for value in (None, float("nan"), float("inf")):
-            invalid.append([dict(self.scores, **{" B": value})])
+            invalid.append([[[value, 6, None]] + self.scores[1:]])
         for scores in invalid:
             with self.subTest(scores=scores):
-                self.logprobs.top_logprobs = scores
+                self.meta["output_token_ids_logprobs"] = scores
                 with self.assertRaises(ValueError):
                     self.evaluation()
+
+    def test_answers_must_be_distinct_single_token_continuations(self):
+        for completed in ([1, 2, 3, 4], [9, 7], [1, 2]):
+            with self.subTest(completed=completed):
+                # Multi-token continuation, changed prefix, or identical answer tokens.
+                with patch.object(self.tokenizer, "encode", side_effect=[[1]] + [completed] * 4):
+                    with self.assertRaises(ValueError):
+                        self.evaluation()
+                self.client.post.assert_not_called()
 
 
 if __name__ == "__main__":

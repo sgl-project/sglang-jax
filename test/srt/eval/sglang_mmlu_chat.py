@@ -40,31 +40,44 @@ class SglangMMLUChatEval(SglangMMLUEval):
                 enable_thinking=False,
             )
             prompt += "Answer:"
-            response = sampler.client.completions.create(
-                model=sampler.model,
-                prompt=prompt,
-                temperature=0,
-                max_tokens=1,
-                logprobs=20,
-            ).choices[0]
-            (scores,) = response.logprobs.top_logprobs
-            if not scores or any(v is None or not math.isfinite(v) for v in scores.values()):
-                raise ValueError("Expected finite next-token logprobs")
-            choices = {letter: scores[" " + letter] for letter in "ABCD" if " " + letter in scores}
-            # Missing choices cannot beat a returned choice above the top-k cutoff.
-            if not choices or (len(choices) < 4 and max(choices.values()) <= min(scores.values())):
-                raise ValueError("Top logprobs do not identify the best A/B/C/D answer")
-            extracted_answer = max(choices, key=choices.get)
+            # Chat templates already include any required special tokens.
+            input_ids = tokenizer.encode(prompt, add_special_tokens=False)
+            choices = {}
+            for letter in "ABCD":
+                completed = tokenizer.encode(prompt + " " + letter, add_special_tokens=False)
+                if completed[:-1] != input_ids:
+                    raise ValueError(f"Answer {letter!r} must be a single-token continuation")
+                choices[letter] = completed[-1]
+            if len(set(choices.values())) != 4:
+                raise ValueError("A/B/C/D must have distinct token IDs")
+
+            response = sampler.client.post(
+                f"{base_url}/generate",
+                cast_to=dict[str, object],
+                body={
+                    "input_ids": input_ids,
+                    "sampling_params": {"temperature": 0, "max_new_tokens": 1},
+                    "return_logprob": True,
+                    "return_text_in_logprobs": False,
+                    "token_ids_logprob": list(choices.values()),
+                },
+            )
+            (token_scores,) = response["meta_info"]["output_token_ids_logprobs"]
+            scores = {token_id: value for value, token_id, _ in token_scores}
+            if any(scores.get(t) is None or not math.isfinite(scores[t]) for t in choices.values()):
+                raise ValueError("Expected finite logprobs for all A/B/C/D token IDs")
+            extracted_answer = max(choices, key=lambda letter: scores[choices[letter]])
+            response_text = response["text"]
 
             score = 1.0 if extracted_answer == row["Answer"] else 0.0
 
             return SingleEvalResult(
-                html=f"<p>Prompt: {prompt}</p><p>Response: {response.text}</p><p>Extracted: {extracted_answer}</p><p>Correct Answer: {row['Answer']}</p>",
+                html=f"<p>Prompt: {prompt}</p><p>Response: {response_text}</p><p>Extracted: {extracted_answer}</p><p>Correct Answer: {row['Answer']}</p>",
                 score=score,
                 metrics={subject2category.get(subject, "other"): score},
                 convo=[
                     {"role": "user", "content": prompt},
-                    {"role": "assistant", "content": response.text},
+                    {"role": "assistant", "content": response_text},
                 ],
             )
 
