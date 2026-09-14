@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from functools import partial
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
@@ -32,6 +34,7 @@ from sgl_jax.srt.speculative.eagle_draft_worker import (
     topk_probs_from_logits,
 )
 from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
+from sgl_jax.srt.speculative.eagle_util import build_chain_verify_inputs_device
 from sgl_jax.srt.speculative.eagle_worker import EAGLEWorker
 from sgl_jax.srt.speculative.frozen_kv_mtp_seed import (
     FrozenKvMtpSeedState,
@@ -48,6 +51,304 @@ from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.jax_utils import device_array
 
 logger = logging.getLogger(__name__)
+
+
+def _frozen_kv_verify_and_publish(
+    draft_tokens,
+    target_logits,
+    target_hidden,
+    positions,
+    seed_relay_buffers,
+    relay_future_indices,
+    relay_valid_mask,
+    *,
+    draft_token_num: int,
+    dp_size: int,
+):
+    """Verify a linear chain and publish its next target seed on device."""
+    predict, accept_lens, accept_index = verify_frozen_kv_mtp_chain_greedy(
+        draft_tokens,
+        target_logits,
+        draft_token_num=draft_token_num,
+    )
+
+    padded_bs = accept_lens.shape[0]
+    row_offset = jnp.clip(accept_lens - 1, 0, draft_token_num - 1)
+    seed_rows = jnp.arange(padded_bs, dtype=jnp.int32) * draft_token_num + row_offset
+
+    def gather_rows(values, indices, *, output_bs=None):
+        sharding = jax.typeof(values).sharding
+        if isinstance(sharding, NamedSharding):
+            mesh = sharding.mesh
+            result_bs = padded_bs if output_bs is None else output_bs
+            if "data" in mesh.shape and result_bs % int(mesh.shape["data"]) == 0:
+                out_spec = P("data", *([None] * (values.ndim - 1)))
+            else:
+                out_spec = P(*([None] * values.ndim))
+            return values.at[indices].get(out_sharding=NamedSharding(mesh, out_spec))
+        return jnp.take(values, indices, axis=0)
+
+    seed_token = gather_rows(predict, seed_rows)
+    seed_hidden = gather_rows(target_hidden, seed_rows)
+    seed_valid = relay_valid_mask & (accept_lens > 0)
+    updated_seed_relay_buffers = update_spec_seed_relay_buffers(
+        seed_relay_buffers,
+        relay_future_indices,
+        seed_valid,
+        seed_token,
+        seed_token,
+        seed_hidden,
+        seed_valid,
+        dp_size=dp_size,
+    )
+
+    accept_width = draft_token_num
+    request_ids = jnp.arange(accept_index.shape[0], dtype=jnp.int32) // accept_width
+    per_request_last = request_ids * draft_token_num + draft_token_num - 1
+    accept_index_sharding = jax.typeof(accept_index).sharding
+    if isinstance(accept_index_sharding, NamedSharding) and not accept_index_sharding.mesh.empty:
+        per_request_last = jax.sharding.reshard(per_request_last, accept_index_sharding)
+    safe_index = jnp.where(accept_index >= 0, accept_index, per_request_last)
+    selected_logits = gather_rows(target_logits, safe_index, output_bs=accept_index.shape[0])
+    selected_hidden = gather_rows(target_hidden, safe_index, output_bs=accept_index.shape[0])
+    selected_positions = gather_rows(positions, safe_index, output_bs=accept_index.shape[0])
+    return (
+        selected_logits,
+        selected_hidden,
+        selected_positions,
+        predict,
+        accept_lens,
+        updated_seed_relay_buffers,
+    )
+
+
+def _build_frozen_kv_fused_verify():
+    """Build one target-forward/verify/seed-publication executable.
+
+    The Frozen-KV seed is a target token/hidden-state pair selected by the
+    verification result.  Keeping that selection and the request-indexed relay
+    update in the same JIT as the target forward prevents eager gather,
+    reshard, and scatter operations from becoming separate TPU dispatches.
+    Scheduler-owned request ordering and bucket selection remain inputs.
+    """
+
+    @partial(
+        jax.jit,
+        donate_argnames=("target_memory_pools", "seed_relay_buffers"),
+        static_argnames=("target_model_state_def", "draft_token_num", "dp_size"),
+    )
+    def fused_verify(
+        target_model_def,
+        target_model_state_def,
+        target_leaves,
+        target_forward_batch,
+        target_memory_pools,
+        target_logits_metadata,
+        seed_relay_buffers,
+        relay_future_indices,
+        relay_valid_mask,
+        *,
+        draft_token_num: int,
+        dp_size: int,
+    ):
+        target_state = jax.tree_util.tree_unflatten(target_model_state_def, target_leaves)
+        target_model = nnx.merge(target_model_def, target_state)
+        target_output, target_pool_updates, _, _ = target_model(
+            target_forward_batch,
+            target_memory_pools,
+            target_logits_metadata,
+        )
+
+        (
+            selected_logits,
+            selected_hidden,
+            selected_positions,
+            predict,
+            accept_lens,
+            updated_seed_relay_buffers,
+        ) = _frozen_kv_verify_and_publish(
+            target_forward_batch.spec_info.draft_token,
+            target_output.next_token_logits,
+            target_output.hidden_states,
+            target_forward_batch.positions,
+            seed_relay_buffers,
+            relay_future_indices,
+            relay_valid_mask,
+            draft_token_num=draft_token_num,
+            dp_size=dp_size,
+        )
+
+        return (
+            target_pool_updates,
+            selected_logits,
+            selected_hidden,
+            selected_positions,
+            predict,
+            accept_lens,
+            updated_seed_relay_buffers,
+        )
+
+    return fused_verify
+
+
+def _select_frozen_kv_proposal_start(
+    relay_draft_token,
+    relay_hidden,
+    relay_seed_mask,
+    seed_logits,
+    seed_hidden,
+):
+    """Select the first proposal state for target-seed and prefill rows.
+
+    A post-verify row must consume its accepted target token/hidden pair in the
+    assistant before proposing.  A newly-prefilled row already contains that
+    first assistant proposal in the relay.  Keeping this selection inside the
+    proposal JIT avoids separately dispatched reshard/select operations when
+    the scheduler merges both row kinds into one static bucket.
+    """
+    seed_token = _frozen_kv_top1_token(seed_logits)
+    # Model outputs can retain a replicated batch dimension even when relay
+    # state is P("data").  Normalize both cases to the relay layouts before
+    # select; explicit TPU sharding rejects semantically equivalent P(None)
+    # and P("data") values even when the data mesh axis has size one.
+    token_sharding = jax.typeof(relay_draft_token).sharding
+    hidden_sharding = jax.typeof(relay_hidden).sharding
+    relay_seed_mask = jnp.asarray(relay_seed_mask, dtype=bool)
+    if isinstance(token_sharding, NamedSharding) and not token_sharding.mesh.empty:
+        seed_token = jax.sharding.reshard(seed_token, token_sharding)
+        relay_seed_mask = jax.sharding.reshard(relay_seed_mask, token_sharding)
+    if isinstance(hidden_sharding, NamedSharding) and not hidden_sharding.mesh.empty:
+        seed_hidden = jax.sharding.reshard(seed_hidden, hidden_sharding)
+    return (
+        jnp.where(relay_seed_mask, seed_token, relay_draft_token),
+        jnp.where(relay_seed_mask[:, None], seed_hidden, relay_hidden),
+    )
+
+
+def _frozen_kv_top1_token(logits):
+    """Compute the global top-1 token while retaining the active mesh contract."""
+    sharding = jax.typeof(logits).sharding
+    if isinstance(sharding, NamedSharding) and not sharding.mesh.empty:
+        # The vocabulary must be replicated before argmax, but the request
+        # dimension must stay data-sharded.  Replicating the whole tensor here
+        # gives the resulting token vector P(None), which cannot be selected
+        # against the P("data") relay mask under explicit TPU sharding.
+        logits = jax.sharding.reshard(logits, NamedSharding(sharding.mesh, P("data", None)))
+        token = jnp.argmax(logits, axis=-1).astype(jnp.int32)
+        return jax.sharding.reshard(token, NamedSharding(sharding.mesh, P("data")))
+    return jnp.argmax(logits, axis=-1).astype(jnp.int32)
+
+
+def _build_frozen_kv_fused_draft_extend(num_steps: int):
+    """Build one request-relay/seed/recurrent-proposal executable.
+
+    Frozen-KV uses one assistant repeatedly, unlike generic multi-layer NEXTN
+    where each MTP depth owns a distinct model runner.  This dedicated program
+    therefore mirrors the recurrent shape used by EAGLE3 while preserving the
+    Frozen contract: every assistant attention reads target KV and every pool
+    update is the model's unchanged target-buffer pass-through.
+    """
+    assert num_steps > 0
+
+    @partial(
+        jax.jit,
+        donate_argnames=("memory_pools",),
+        static_argnames=("model_state_def", "num_steps", "dp_size"),
+    )
+    def draft_extend_fused(
+        model_def,
+        model_state_def,
+        model_leaves,
+        forward_batch,
+        memory_pools,
+        logits_metadata,
+        metadata_per_step,
+        seed_relay_buffers,
+        relay_future_indices,
+        relay_seed_mask,
+        *,
+        num_steps: int,
+        dp_size: int,
+    ):
+        state = jax.tree_util.tree_unflatten(model_state_def, model_leaves)
+        model = nnx.merge(model_def, state)
+        (
+            relay_verified_id,
+            relay_draft_token,
+            relay_hidden,
+            _stored_seed_mask,
+        ) = gather_spec_seed_relay_buffers(
+            seed_relay_buffers,
+            relay_future_indices,
+            dp_size=dp_size,
+        )
+
+        # Post-verify rows first need Gemma's target-hidden -> assistant-state
+        # transition.  This call also runs for prefill-origin padded rows so the
+        # executable shape is independent of the scheduler's dynamic mixture;
+        # their already-computed proposal state is selected below.
+        forward_batch.input_ids = relay_verified_id
+        forward_batch.positions = forward_batch.seq_lens - 1
+        forward_batch.spec_info.hidden_states = relay_hidden
+        forward_batch.attn_backend.forward_metadata = metadata_per_step[0]
+        output, pool_updates, _, _ = model(
+            forward_batch,
+            memory_pools,
+            logits_metadata,
+        )
+        memory_pools.replace_all(pool_updates)
+        token, hidden = _select_frozen_kv_proposal_start(
+            relay_draft_token,
+            relay_hidden,
+            relay_seed_mask,
+            output.next_token_logits,
+            output.hidden_states,
+        )
+        proposal_tokens = [token]
+        proposal_token_sharding = jax.typeof(token).sharding
+
+        # The seed call produced proposal zero.  Each remaining call consumes
+        # the previous assistant token/hidden state at the same target-KV view
+        # used by the legacy Frozen recurrence for that speculative position.
+        for step in range(num_steps - 1):
+            forward_batch.input_ids = token
+            forward_batch.positions = forward_batch.seq_lens + step
+            forward_batch.spec_info.hidden_states = hidden
+            forward_batch.attn_backend.forward_metadata = metadata_per_step[step]
+            output, pool_updates, _, _ = model(
+                forward_batch,
+                memory_pools,
+                logits_metadata,
+            )
+            memory_pools.replace_all(pool_updates)
+            token = _frozen_kv_top1_token(output.next_token_logits)
+            if (
+                isinstance(proposal_token_sharding, NamedSharding)
+                and not proposal_token_sharding.mesh.empty
+            ):
+                token = jax.sharding.reshard(token, proposal_token_sharding)
+            hidden = output.hidden_states
+            proposal_tokens.append(token)
+
+        token_list = jnp.stack(proposal_tokens, axis=1)
+        padded_bs = forward_batch.seq_lens.shape[0]
+        packed = build_chain_verify_inputs_device(
+            relay_verified_id,
+            token_list,
+            forward_batch.seq_lens - 1,
+            num_steps + 1,
+            padded_bs,
+        )
+        return (
+            pool_updates,
+            packed[0],
+            packed[1],
+            packed[2].reshape(padded_bs, num_steps + 1),
+            packed[3].reshape(padded_bs, num_steps + 1),
+            packed[4].reshape(padded_bs, num_steps + 1),
+        )
+
+    return draft_extend_fused
 
 
 @register_pytree_node_class
@@ -1186,8 +1487,153 @@ class FrozenKvMtpDraftWorker(EagleDraftWorkerBase):
         model_worker_batch.spec_info_padded = next_state
         batch_output.accept_lens = np.asarray(batch_output.accept_lens, dtype=np.int32)
 
+    @staticmethod
+    def _pad_relay_rows_for_bucket(value, *, padded_bs: int, dp_size: int, fill_value=0):
+        """Pad scheduler relay metadata with the generic DP bucket layout."""
+        value = np.asarray(value)
+        if value.shape[0] == padded_bs:
+            return value
+        if value.shape[0] > padded_bs or padded_bs % dp_size:
+            raise ValueError(
+                "Frozen-KV relay metadata cannot fit the selected draft bucket: "
+                f"rows={value.shape[0]}, padded_bs={padded_bs}, dp_size={dp_size}."
+            )
+        if dp_size == 1 or value.shape[0] % dp_size:
+            pad = [(0, padded_bs - value.shape[0])] + [(0, 0)] * (value.ndim - 1)
+            return np.pad(value, pad, constant_values=fill_value)
+        per_dp_real = value.shape[0] // dp_size
+        per_dp_padded = padded_bs // dp_size
+        reshaped = value.reshape((dp_size, per_dp_real) + value.shape[1:])
+        pad = [(0, 0), (0, per_dp_padded - per_dp_real)] + [(0, 0)] * (value.ndim - 1)
+        return np.pad(reshaped, pad, constant_values=fill_value).reshape(
+            (padded_bs,) + value.shape[1:]
+        )
+
+    def _can_use_fused_draft(self, model_worker_batch: ModelWorkerBatch) -> bool:
+        state = model_worker_batch.spec_info_padded
+        runner = self.draft_model_runner
+        return (
+            self.topk == 1
+            and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
+            and isinstance(state, FrozenKvMtpDraftInput)
+            and state.future_indices is not None
+            and state.relay_seed_mask is not None
+            and self.seed_relay_buffers is not None
+            and hasattr(runner, "_model_def")
+            and hasattr(runner, "_model_state_def")
+        )
+
+    def _draft_fused_linear_chain(self, model_worker_batch: ModelWorkerBatch) -> None:
+        """Produce and pack the Frozen top-1 chain in one TPU dispatch."""
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _make_forward_batch,
+            _prepare_device_array,
+            _prepare_logits_metadata,
+        )
+        from sgl_jax.srt.speculative.eagle_info import EagleVerifyInput
+
+        state = model_worker_batch.spec_info_padded
+        assert isinstance(state, FrozenKvMtpDraftInput)
+        relay_future_indices = np.asarray(state.future_indices, dtype=np.int32)
+        relay_seed_mask = np.asarray(state.relay_seed_mask, dtype=bool)
+        if relay_future_indices.shape != relay_seed_mask.shape:
+            raise ValueError(
+                "Frozen-KV relay indices and seed mask must have identical shapes: "
+                f"indices={relay_future_indices.shape}, mask={relay_seed_mask.shape}."
+            )
+
+        # padding_for_decode owns the generic scheduler bucket and target-page
+        # metadata.  Install shape-only placeholders so it need not dispatch a
+        # device gather before the fused program; actual values are restored
+        # from the request-indexed relay inside that program.
+        compact_bs = relay_future_indices.shape[0]
+        hidden_size = self.target_worker_ref.model_config.hidden_size
+        state.verified_id = np.empty((compact_bs,), dtype=np.int32)
+        state.topk_index = np.empty((compact_bs, 1), dtype=np.int32)
+        state.topk_p = np.empty((compact_bs, 1), dtype=np.float32)
+        state.hidden_states = np.empty((compact_bs, hidden_size), dtype=np.float32)
+        state.future_indices = None
+        state.relay_seed_mask = None
+        self.padding_for_decode(model_worker_batch)
+
+        padded_bs = int(model_worker_batch.seq_lens.shape[0])
+        dp_size = int(model_worker_batch.dp_size)
+        relay_future_indices = self._pad_relay_rows_for_bucket(
+            relay_future_indices,
+            padded_bs=padded_bs,
+            dp_size=dp_size,
+        )
+        relay_seed_mask = self._pad_relay_rows_for_bucket(
+            relay_seed_mask,
+            padded_bs=padded_bs,
+            dp_size=dp_size,
+            fill_value=False,
+        )
+
+        runner = self.draft_model_runner
+        metadata_per_step = runner.attn_backend.get_eagle_multi_step_metadata(model_worker_batch)
+        runner.attn_backend.forward_metadata = metadata_per_step[0]
+        forward_batch = _make_forward_batch(model_worker_batch, runner)
+        forward_batch.bid = model_worker_batch.bid
+        logits_metadata = _prepare_logits_metadata(model_worker_batch, self.mesh)
+        data_sharding = NamedSharding(self.mesh, P("data"))
+        relay_future_indices = _prepare_device_array(
+            relay_future_indices,
+            data_sharding,
+            "frozen_draft.relay_future_indices",
+        )
+        relay_seed_mask = _prepare_device_array(
+            relay_seed_mask,
+            data_sharding,
+            "frozen_draft.relay_seed_mask",
+        )
+        if not hasattr(self, "_frozen_kv_fused_draft_jit_fn"):
+            self._frozen_kv_fused_draft_jit_fn = _build_frozen_kv_fused_draft_extend(
+                self.speculative_num_steps
+            )
+
+        with jax.set_mesh(self.mesh):
+            (
+                pool_updates,
+                draft_tokens,
+                positions,
+                retrive_index,
+                retrive_next_token,
+                retrive_next_sibling,
+            ) = self._frozen_kv_fused_draft_jit_fn(
+                runner._model_def,
+                runner._model_state_def,
+                tuple(runner.model_state_leaves),
+                forward_batch,
+                runner.memory_pools,
+                logits_metadata,
+                tuple(metadata_per_step),
+                self.seed_relay_buffers,
+                relay_future_indices,
+                relay_seed_mask,
+                num_steps=self.speculative_num_steps,
+                dp_size=dp_size,
+            )
+
+        runner.memory_pools.replace_all(pool_updates)
+        model_worker_batch.spec_info_padded = EagleVerifyInput(
+            draft_token=draft_tokens,
+            custom_mask=None,
+            positions=positions,
+            retrive_index=retrive_index,
+            retrive_next_token=retrive_next_token,
+            retrive_next_sibling=retrive_next_sibling,
+            spec_steps=self.speculative_num_steps,
+            draft_token_num=self.speculative_num_draft_tokens,
+        )
+
     def draft(self, model_worker_batch):
-        """Run the seed transition, then the common recurrent proposal loop."""
+        """Run one fused Frozen proposal dispatch when its contract is available."""
+        if self._can_use_fused_draft(model_worker_batch):
+            return self._draft_fused_linear_chain(model_worker_batch)
+
+        # Fake runners, direct state tests, and future non-linear configurations
+        # retain the exact legacy mechanics as an explicit correctness fallback.
         self._restore_seed_relay(model_worker_batch)
         valid_mask = self._prepare_seed_proposal(model_worker_batch)
         if valid_mask is None:
@@ -1279,6 +1725,138 @@ class FrozenKvMtpWorker(EAGLEWorker):
     def supports_non_fused_spec_prefill_precompile(self) -> bool:
         return True
 
+    def prepare_spec_decode_precompile_state(self, model_worker_batch, spec_info):
+        """Seed the relay so startup exercises the real fused decode route."""
+        selector = np.asarray(model_worker_batch.logits_indices_selector, dtype=np.int32)
+        verified_id = np.asarray(spec_info.verified_id)[selector]
+        draft_token_ids = np.asarray(spec_info.topk_index)[selector, 0]
+        hidden_states = np.asarray(spec_info.hidden_states)[selector]
+        self.draft_worker._publish_seed_relay(
+            model_worker_batch=model_worker_batch,
+            verified_id=verified_id,
+            draft_token_ids=draft_token_ids,
+            hidden_states=hidden_states,
+            is_target_seed=np.ones(selector.shape, dtype=bool),
+        )
+        allocate_lens = np.asarray(spec_info.allocate_lens)[selector]
+        return self.draft_worker.new_draft_input(
+            future_indices=np.asarray(
+                model_worker_batch.req_pool_indices,
+                dtype=np.int32,
+            )[selector],
+            allocate_lens=allocate_lens,
+            new_seq_lens=np.asarray(model_worker_batch.seq_lens, dtype=np.int32)[selector],
+            relay_seed_mask=np.ones(selector.shape, dtype=bool),
+        )
+
+    def _verify_fused_linear_chain(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        spec_info,
+        cur_allocate_lens,
+        forward_metadata,
+    ):
+        """Run the supported Frozen top-1 verify as one compiled dispatch."""
+        from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
+        from sgl_jax.srt.managers.scheduler import GenerationBatchResult
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _active_dp_slot_mask,
+            _count_pjit_cpp_cache_miss,
+            _make_forward_batch,
+            _prepare_device_array,
+            _prepare_logits_metadata,
+        )
+
+        target_mr = self.target_worker.model_runner
+        target_mr.attn_backend.forward_metadata = forward_metadata
+        target_forward_batch = _make_forward_batch(model_worker_batch, target_mr)
+        target_forward_batch.bid = model_worker_batch.bid
+        target_logits_metadata = _prepare_logits_metadata(model_worker_batch, self.mesh)
+
+        total_bs = int(model_worker_batch.seq_lens.shape[0])
+        data_sharding = NamedSharding(self.mesh, P("data"))
+        relay_future_indices = _prepare_device_array(
+            model_worker_batch.req_pool_indices,
+            data_sharding,
+            "frozen_verify.relay_future_indices",
+        )
+        relay_valid_mask = _prepare_device_array(
+            _active_dp_slot_mask(model_worker_batch, total_bs),
+            data_sharding,
+            "frozen_verify.relay_valid_mask",
+        )
+        if not hasattr(self, "_frozen_kv_fused_verify_jit_fn"):
+            self._frozen_kv_fused_verify_jit_fn = _build_frozen_kv_fused_verify()
+
+        with jax.set_mesh(self.mesh), _count_pjit_cpp_cache_miss() as count:
+            (
+                target_pool_updates,
+                selected_logits,
+                selected_hidden,
+                selected_positions,
+                predict_device,
+                accept_lengths_device,
+                updated_seed_relay_buffers,
+            ) = self._frozen_kv_fused_verify_jit_fn(
+                target_mr._model_def,
+                target_mr._model_state_def,
+                tuple(target_mr.model_state_leaves),
+                target_forward_batch,
+                target_mr.memory_pools,
+                target_logits_metadata,
+                self.draft_worker.seed_relay_buffers,
+                relay_future_indices,
+                relay_valid_mask,
+                draft_token_num=spec_info.draft_token_num,
+                dp_size=int(model_worker_batch.dp_size),
+            )
+            cache_miss_count = count()
+
+        target_mr.memory_pools.replace_all(target_pool_updates)
+        self.draft_worker.seed_relay_buffers = updated_seed_relay_buffers
+        model_worker_batch.positions = selected_positions
+
+        # The scheduler must inspect accepted lengths to commit output tokens;
+        # this compact vector is the sole mandatory device-to-host boundary.
+        if hasattr(accept_lengths_device, "copy_to_host_async"):
+            accept_lengths_device.copy_to_host_async()
+        accept_padded = np.asarray(accept_lengths_device, dtype=np.int32).reshape(-1)
+        selector = np.asarray(model_worker_batch.logits_indices_selector, dtype=np.int32).reshape(
+            -1
+        )
+        accept_live = self.draft_worker._compact_request_rows(
+            accept_padded, selector, selector.size
+        )
+        seq_lens = np.asarray(model_worker_batch.seq_lens, dtype=np.int32).reshape(-1)
+        allocate_lens = self.draft_worker._compact_request_rows(
+            cur_allocate_lens, selector, selector.size
+        )
+        req_indices = self.draft_worker._compact_request_rows(
+            model_worker_batch.req_pool_indices, selector, selector.size
+        )
+        next_draft_input = self.draft_worker.new_draft_input(
+            future_indices=req_indices,
+            allocate_lens=allocate_lens,
+            new_seq_lens=seq_lens[selector] + accept_live + 1,
+            accept_length_cpu=accept_live.copy(),
+            relay_seed_mask=np.ones((selector.size,), dtype=bool),
+        )
+        next_draft_input._validate_non_overlap_state()
+        model_worker_batch.spec_info_padded = next_draft_input
+        return GenerationBatchResult(
+            logits_output=LogitsProcessorOutput(
+                next_token_logits=selected_logits,
+                hidden_states=selected_hidden,
+            ),
+            next_token_ids=predict_device,
+            next_draft_input=next_draft_input,
+            accept_lens=accept_padded,
+            bid=model_worker_batch.bid,
+            cache_miss_count=cache_miss_count,
+            extend_input_len_per_req=None,
+            extend_logprob_start_len_per_req=None,
+        )
+
     def verify(self, model_worker_batch: ModelWorkerBatch, cur_allocate_lens=None):
         """Dedicated Frozen-KV target verify and seed-relay handoff.
 
@@ -1289,10 +1867,10 @@ class FrozenKvMtpWorker(EAGLEWorker):
         next assistant seed into its device relay.  Only the small acceptance
         length vector is then read by the scheduler-facing descriptor.
 
-        This is deliberately the first DFlash-aligned slice, not a full target
-        forward fusion: the target executable is unchanged, but the
-        verify-to-next-draft ownership boundary is Frozen-specific and no
-        longer inherits generic EAGLE's host handoff.
+        For the supported greedy linear chain, target forward, acceptance,
+        accepted-row selection, and relay publication are one compiled
+        executable. Other sampling/tree contracts retain the generic fallback
+        rather than silently changing semantics.
         """
         if not self.server_args.disable_overlap_schedule:
             return super().verify(model_worker_batch, cur_allocate_lens)
@@ -1314,9 +1892,6 @@ class FrozenKvMtpWorker(EAGLEWorker):
         forward_metadata = self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
         )
-        logits_output, _, cache_miss_count = self.target_worker.forward_batch_generation(
-            model_worker_batch, skip_sample=True, forward_metadata=forward_metadata
-        )
         # Frozen-KV MTP's public contract is a top-k-one chain.  Verify that
         # chain directly against the target's native output sharding, following
         # DFlash's target-verify design.  Generic EAGLE tree verification has
@@ -1331,6 +1906,23 @@ class FrozenKvMtpWorker(EAGLEWorker):
             and spec_info.custom_mask is None
             and spec_info.draft_token_num == spec_info.spec_steps + 1
         )
+        fused_verify_ready = (
+            native_chain_verify
+            and getattr(self.draft_worker, "seed_relay_buffers", None) is not None
+            and hasattr(self.target_worker.model_runner, "_model_def")
+            and hasattr(self.target_worker.model_runner, "_model_state_def")
+        )
+        if fused_verify_ready:
+            return self._verify_fused_linear_chain(
+                model_worker_batch,
+                spec_info,
+                cur_allocate_lens,
+                forward_metadata,
+            )
+
+        logits_output, _, cache_miss_count = self.target_worker.forward_batch_generation(
+            model_worker_batch, skip_sample=True, forward_metadata=forward_metadata
+        )
         if native_chain_verify:
             (
                 predict_device,
@@ -1341,8 +1933,6 @@ class FrozenKvMtpWorker(EAGLEWorker):
                 logits_output.next_token_logits,
                 draft_token_num=spec_info.draft_token_num,
             )
-            # For a linear chain each candidate row's target argmax is both
-            # the scheduler-visible prediction and the potential next seed.
             verified_tokens_device = predict_device
         else:
             logits_output.next_token_logits, logits_output.hidden_states = replicate_to_mesh(

@@ -38,6 +38,15 @@ class EAGLEWorker(BaseSpecWorker):
 
     # -- Precompilation --
 
+    def prepare_spec_decode_precompile_state(self, model_worker_batch, spec_info):
+        """Adapt dummy decode state for an algorithm-specific execution route.
+
+        Bucket construction and iteration remain common. Workers whose normal
+        runtime path uses an opaque relay descriptor can override this seam so
+        startup compiles that same route instead of a legacy fallback.
+        """
+        return spec_info
+
     def run_spec_decode_precompile(self):
         if not self.server_args.disable_overlap_schedule:
             self.init_spec_relay_buffers()
@@ -203,6 +212,10 @@ class EAGLEWorker(BaseSpecWorker):
                     num_tokens_for_logprob_per_batch=np.asarray(1, dtype=np.int32),
                     allocate_lens=model_worker_batch.seq_lens
                     + EagleDraftInput.ALLOC_LEN_PER_DECODE,
+                )
+                spec_info = self.prepare_spec_decode_precompile_state(
+                    model_worker_batch,
+                    spec_info,
                 )
                 if self.spec_relay_buffers is not None:
                     model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST

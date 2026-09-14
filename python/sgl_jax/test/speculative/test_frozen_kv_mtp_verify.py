@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import types
+from functools import partial
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -11,7 +13,125 @@ from sgl_jax.srt.speculative.eagle_info import EagleVerifyInput
 from sgl_jax.srt.speculative.frozen_kv_mtp_worker import (
     FrozenKvMtpDraftWorker,
     FrozenKvMtpWorker,
+    _build_frozen_kv_fused_draft_extend,
+    _frozen_kv_verify_and_publish,
+    _select_frozen_kv_proposal_start,
 )
+from sgl_jax.srt.speculative.relay_buffer import SpecSeedRelayBuffers
+
+
+def test_fused_verify_publishes_selected_target_seed_in_same_jit():
+    """Acceptance, row selection, and relay scatter share one executable."""
+    draft_tokens = jnp.asarray([7, 10, 11, 12, 8, 30, 31, 32], dtype=jnp.int32)
+    target_top1 = jnp.asarray([10, 11, 99, 13, 88, 30, 31, 32], dtype=jnp.int32)
+    logits = jnp.full((8, 128), -10.0, dtype=jnp.float32)
+    logits = logits.at[jnp.arange(8), target_top1].set(10.0)
+    hidden = jnp.arange(16, dtype=jnp.float32).reshape(8, 2)
+    positions = jnp.arange(8, dtype=jnp.int32)
+    capacity = 8
+    buffers = SpecSeedRelayBuffers(
+        token_ids=jnp.zeros((1, capacity), dtype=jnp.int32),
+        draft_token_ids=jnp.zeros((1, capacity), dtype=jnp.int32),
+        hidden_states=jnp.zeros((1, capacity, 2), dtype=jnp.float32),
+        is_target_seed=jnp.zeros((1, capacity), dtype=bool),
+    )
+
+    run = jax.jit(
+        partial(
+            _frozen_kv_verify_and_publish,
+            draft_token_num=4,
+            dp_size=1,
+        )
+    )
+    _, _, _, predict, accept_lens, updated = run(
+        draft_tokens,
+        logits,
+        hidden,
+        positions,
+        buffers,
+        jnp.asarray([2, 5], dtype=jnp.int32),
+        jnp.asarray([True, True]),
+    )
+
+    np.testing.assert_array_equal(np.asarray(accept_lens), [3, 1])
+    np.testing.assert_array_equal(np.asarray(updated.token_ids)[0, [2, 5]], [99, 88])
+    np.testing.assert_array_equal(np.asarray(updated.draft_token_ids)[0, [2, 5]], [99, 88])
+    np.testing.assert_array_equal(np.asarray(updated.hidden_states)[0, [2, 5]], [[4, 5], [8, 9]])
+    np.testing.assert_array_equal(np.asarray(updated.is_target_seed)[0, [2, 5]], [True, True])
+    np.testing.assert_array_equal(np.asarray(predict), target_top1)
+
+
+def test_fused_draft_selects_seed_output_only_for_post_verify_rows():
+    """A mixed prefill/decode bucket keeps each row's correct proposal origin."""
+    relay_token = jnp.asarray([10, 20, 30], dtype=jnp.int32)
+    relay_hidden = jnp.asarray([[1, 2], [3, 4], [5, 6]], dtype=jnp.float32)
+    seed_logits = jnp.full((3, 64), -10.0, dtype=jnp.float32)
+    seed_logits = seed_logits.at[jnp.arange(3), jnp.asarray([11, 22, 33])].set(10.0)
+    seed_hidden = relay_hidden + 100
+
+    run = jax.jit(_select_frozen_kv_proposal_start)
+    token, hidden = run(
+        relay_token,
+        relay_hidden,
+        jnp.asarray([True, False, True]),
+        seed_logits,
+        seed_hidden,
+    )
+
+    np.testing.assert_array_equal(np.asarray(token), [11, 20, 33])
+    np.testing.assert_array_equal(np.asarray(hidden), [[101, 102], [3, 4], [105, 106]])
+
+
+def test_fused_draft_builder_has_stable_profile_name():
+    """The TPU trace exposes the reviewer-requested top-level dispatch name."""
+    assert _build_frozen_kv_fused_draft_extend(3).__name__ == "draft_extend_fused"
+
+
+def test_relay_padding_preserves_dp_segments():
+    """Generic bucket padding must not move rank-one rows into rank zero."""
+    value = np.asarray([10, 11, 20, 21], dtype=np.int32)
+    padded = FrozenKvMtpDraftWorker._pad_relay_rows_for_bucket(
+        value,
+        padded_bs=8,
+        dp_size=2,
+        fill_value=-1,
+    )
+    np.testing.assert_array_equal(padded, [10, 11, -1, -1, 20, 21, -1, -1])
+
+
+def test_decode_precompile_uses_the_same_relay_descriptor_as_runtime():
+    """Startup must compile the fused route instead of its legacy fallback."""
+    calls = []
+
+    class _Draft:
+        def _publish_seed_relay(self, **kwargs):
+            calls.append(kwargs)
+
+        def new_draft_input(self, **kwargs):
+            return kwargs
+
+    worker = FrozenKvMtpWorker.__new__(FrozenKvMtpWorker)
+    worker._draft_worker = _Draft()
+    batch = types.SimpleNamespace(
+        logits_indices_selector=np.asarray([0, 2], dtype=np.int32),
+        req_pool_indices=np.asarray([4, -1, 7], dtype=np.int32),
+        seq_lens=np.asarray([10, 0, 20], dtype=np.int32),
+    )
+    spec_info = types.SimpleNamespace(
+        verified_id=np.asarray([100, 0, 200], dtype=np.int32),
+        topk_index=np.asarray([[101], [0], [201]], dtype=np.int32),
+        hidden_states=np.asarray([[1, 2], [0, 0], [3, 4]], dtype=np.float32),
+        allocate_lens=np.asarray([16, 0, 32], dtype=np.int32),
+    )
+
+    descriptor = worker.prepare_spec_decode_precompile_state(batch, spec_info)
+
+    np.testing.assert_array_equal(calls[0]["verified_id"], [100, 200])
+    np.testing.assert_array_equal(calls[0]["draft_token_ids"], [101, 201])
+    np.testing.assert_array_equal(descriptor["future_indices"], [4, 7])
+    np.testing.assert_array_equal(descriptor["allocate_lens"], [16, 32])
+    np.testing.assert_array_equal(descriptor["new_seq_lens"], [10, 20])
+    np.testing.assert_array_equal(descriptor["relay_seed_mask"], [True, True])
 
 
 class _FakeNextDraftInput:

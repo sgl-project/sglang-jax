@@ -15,11 +15,117 @@ import pytest
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.speculative.frozen_kv_mtp_worker import FrozenKvMtpDraftWorker
+from sgl_jax.srt.speculative.eagle_util import build_chain_verify_inputs_device
+from sgl_jax.srt.speculative.frozen_kv_mtp_worker import (
+    FrozenKvMtpDraftWorker,
+    _frozen_kv_top1_token,
+    _select_frozen_kv_proposal_start,
+)
 from sgl_jax.srt.speculative.relay_buffer import (
     create_spec_seed_relay_buffers,
     gather_spec_seed_relay_buffers,
 )
+
+
+@pytest.mark.skipif(jax.device_count() < 2, reason="requires two CPU test devices")
+def test_top1_preserves_data_sharding_after_vocab_replication():
+    """Fused proposal selection requires token IDs and relay masks to agree."""
+    mesh = Mesh(
+        np.asarray(jax.devices()[:2]).reshape(1, 2),
+        ("data", "tensor"),
+        axis_types=(jax.sharding.AxisType.Explicit,) * 2,
+    )
+    logits = jax.device_put(
+        jnp.asarray([[0.0, 3.0, 1.0], [4.0, 2.0, 1.0]], dtype=jnp.float32),
+        NamedSharding(mesh, P("data", None)),
+    )
+
+    token = jax.jit(_frozen_kv_top1_token)(logits)
+
+    assert token.sharding.spec == P("data")
+    np.testing.assert_array_equal(token, [1, 0])
+
+
+@pytest.mark.skipif(jax.device_count() < 2, reason="requires two CPU test devices")
+def test_proposal_select_normalizes_replicated_model_output_to_relay_layout():
+    """Explicit TPU sharding rejects P(None) and P("data") select cases."""
+    mesh = Mesh(
+        np.asarray(jax.devices()[:2]).reshape(1, 2),
+        ("data", "tensor"),
+        axis_types=(jax.sharding.AxisType.Explicit,) * 2,
+    )
+    relay_token = jax.device_put(jnp.asarray([10, 20]), NamedSharding(mesh, P("data")))
+    relay_hidden = jax.device_put(
+        jnp.asarray([[1.0, 2.0], [3.0, 4.0]]), NamedSharding(mesh, P("data", None))
+    )
+    relay_seed_mask = jax.device_put(jnp.asarray([True, False]), NamedSharding(mesh, P("data")))
+    seed_logits = jax.device_put(
+        jnp.asarray([[0.0, 3.0, 1.0], [4.0, 2.0, 1.0]]), NamedSharding(mesh, P())
+    )
+    seed_hidden = jax.device_put(relay_hidden + 100, NamedSharding(mesh, P()))
+
+    token, hidden = jax.jit(_select_frozen_kv_proposal_start)(
+        relay_token,
+        relay_hidden,
+        relay_seed_mask,
+        seed_logits,
+        seed_hidden,
+    )
+
+    assert token.sharding.spec == P("data")
+    assert hidden.sharding.spec == P("data", None)
+    np.testing.assert_array_equal(token, [1, 20])
+    np.testing.assert_allclose(hidden, [[101.0, 102.0], [3.0, 4.0]])
+
+
+@pytest.mark.skipif(jax.device_count() < 2, reason="requires two CPU test devices")
+def test_proposal_select_normalizes_dp1_mask_to_replicated_relay_layout():
+    """A size-one data mesh still requires exact explicit-sharding equality."""
+    mesh = Mesh(
+        np.asarray(jax.devices()[:2]).reshape(1, 2),
+        ("data", "tensor"),
+        axis_types=(jax.sharding.AxisType.Explicit,) * 2,
+    )
+    relay_token = jax.device_put(jnp.asarray([10, 20]), NamedSharding(mesh, P()))
+    relay_hidden = jax.device_put(jnp.asarray([[1.0, 2.0], [3.0, 4.0]]), NamedSharding(mesh, P()))
+    relay_seed_mask = jax.device_put(jnp.asarray([True, False]), NamedSharding(mesh, P("data")))
+    seed_logits = jax.device_put(
+        jnp.asarray([[0.0, 3.0, 1.0], [4.0, 2.0, 1.0]]), NamedSharding(mesh, P())
+    )
+    seed_hidden = jax.device_put(relay_hidden + 100, NamedSharding(mesh, P()))
+
+    token, hidden = jax.jit(_select_frozen_kv_proposal_start)(
+        relay_token,
+        relay_hidden,
+        relay_seed_mask,
+        seed_logits,
+        seed_hidden,
+    )
+
+    assert token.sharding.spec == P(None)
+    assert hidden.sharding.spec == P(None, None)
+    np.testing.assert_array_equal(token, [1, 20])
+    np.testing.assert_allclose(hidden, [[101.0, 102.0], [3.0, 4.0]])
+
+
+@pytest.mark.skipif(jax.device_count() < 2, reason="requires two CPU test devices")
+def test_chain_packing_normalizes_dynamic_and_static_row_layouts():
+    """Packed verify metadata follows the draft-token batch layout."""
+    mesh = Mesh(
+        np.asarray(jax.devices()[:2]).reshape(1, 2),
+        ("data", "tensor"),
+        axis_types=(jax.sharding.AxisType.Explicit,) * 2,
+    )
+    replicated = NamedSharding(mesh, P())
+    data_sharded = NamedSharding(mesh, P("data"))
+    verified_id = jax.device_put(jnp.asarray([10, 20]), replicated)
+    token_list = jax.device_put(jnp.asarray([[11, 12, 13], [21, 22, 23]]), replicated)
+    seq_lens = jax.device_put(jnp.asarray([100, 200]), data_sharded)
+
+    packed = build_chain_verify_inputs_device(verified_id, token_list, seq_lens, 4, 2)
+
+    assert packed.sharding.spec == P(None, None)
+    np.testing.assert_array_equal(packed[1], jnp.asarray([100, 101, 102, 103, 200, 201, 202, 203]))
 
 
 @pytest.mark.skipif(jax.device_count() < 2, reason="requires two CPU test devices")
