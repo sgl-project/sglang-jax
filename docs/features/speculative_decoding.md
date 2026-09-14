@@ -200,6 +200,5 @@ For `deepseek-ai/dspark_qwen3_8b_block7`:
 --speculative-num-draft-tokens 8 \
 --speculative-num-steps 1 \
 --speculative-eagle-topk 1 \
---grammar-backend none \
---disable-overlap-schedule
+--grammar-backend none
 ```
