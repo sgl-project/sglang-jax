@@ -13,6 +13,7 @@ import pandas
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from eval.sglang_mmlu import SglangMMLUEval
+from eval.sglang_mmlu_chat import SglangMMLUChatEval
 from eval.simple_eval_common import ANSWER_PATTERN_MULTICHOICE, strip_reasoning
 from run_eval import build_extra_body
 
@@ -100,7 +101,7 @@ class TestSimpleEvalCommon(unittest.TestCase):
         )
 
 
-class TestSglangMMLU(unittest.TestCase):
+class TestSglangMMLUChat(unittest.TestCase):
     def setUp(self):
         row = dict(Subject="anatomy", Question="Q", A="a", B="b", C="c", D="d", Answer="B")
         self.client = Mock(base_url="http://localhost:32000/v1/")
@@ -121,25 +122,23 @@ class TestSglangMMLU(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def evaluation(self, **kwargs):
-        return SglangMMLUEval("unused.csv", None, 1, **kwargs)(self.sampler)
+    def evaluation(self):
+        return SglangMMLUChatEval("unused.csv", None, 1)(self.sampler)
 
-    def test_raw_and_chat_prompts_use_one_token_choice_scoring(self):
+    def test_chat_prompt_uses_one_token_choice_scoring(self):
         raw = (
             "The following are multiple choice questions (with answers) about anatomy.\n\n"
             "Q\nA. a\nB. b\nC. c\nD. d\nAnswer:"
         )
-        for chat in (False, True):
-            with self.subTest(chat=chat):
-                result = self.evaluation(use_chat_template=chat)
-                self.client.completions.create.assert_called_with(
-                    model="model",
-                    prompt="native assistant\nAnswer:" if chat else raw,
-                    temperature=0,
-                    max_tokens=1,
-                    logprobs=20,
-                )
-                self.assertEqual(result.score, 1.0)  # B wins by logprob, not the emitted AD.
+        result = self.evaluation()
+        self.client.completions.create.assert_called_with(
+            model="model",
+            prompt="native assistant\nAnswer:",
+            temperature=0,
+            max_tokens=1,
+            logprobs=20,
+        )
+        self.assertEqual(result.score, 1.0)  # B wins by logprob, not the emitted AD.
         self.tokenizer.apply_chat_template.assert_called_once_with(
             [
                 {
@@ -156,8 +155,17 @@ class TestSglangMMLU(unittest.TestCase):
         for method in (self.client.completions.create, self.tokenizer.apply_chat_template):
             method.side_effect = RuntimeError("request failed")
             with self.assertRaisesRegex(RuntimeError, "request failed"):
-                self.evaluation(use_chat_template=True)
+                self.evaluation()
             method.side_effect = None
+
+    def test_raw_evaluator_keeps_greedy_answer_extraction(self):
+        result = SglangMMLUEval("unused.csv", None, 1)(self.sampler)
+        request = self.client.completions.create.call_args.kwargs
+        self.assertNotIn("logprobs", request)
+        self.assertTrue(request["prompt"].endswith("Answer:"))
+        self.assertEqual(result.score, 0.0)  # The emitted AD is scored as A.
+        self.client.get.assert_not_called()
+        self.tokenizer.apply_chat_template.assert_not_called()
 
     def test_partial_top_logprobs_identify_the_best_choice(self):
         self.logprobs.top_logprobs = [{" **": -1.0, " B": -2.0, " x": -3.0}]

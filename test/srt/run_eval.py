@@ -57,16 +57,16 @@ def run_eval(args):
 
         filename = "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
         eval_obj = MMLUEval(filename, args.num_examples, args.num_threads)
-    elif args.eval_name in ("sglang_mmlu", "sglang_mmlu_chat"):
+    elif args.eval_name == "sglang_mmlu":
         from eval.sglang_mmlu import SglangMMLUEval
 
         filename = "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
-        eval_obj = SglangMMLUEval(
-            filename,
-            args.num_examples,
-            args.num_threads,
-            use_chat_template=args.eval_name == "sglang_mmlu_chat",
-        )
+        eval_obj = SglangMMLUEval(filename, args.num_examples, args.num_threads)
+    elif args.eval_name == "sglang_mmlu_chat":
+        from eval.sglang_mmlu_chat import SglangMMLUChatEval
+
+        filename = "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
+        eval_obj = SglangMMLUChatEval(filename, args.num_examples, args.num_threads)
     elif args.eval_name == "math":
         from eval.simple_eval_math import MathEval
 
