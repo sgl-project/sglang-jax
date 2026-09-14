@@ -192,6 +192,7 @@ class ServerArgs:
     # HiCache (L1<->L2 KV cache offloading). hicache_storage: "disable" off,
     # "none" enables L1+L2 (host pinned pool), "file" still not supported.
     hicache_storage: str = "disable"
+    hicache_transfer_backend: str = "jax"
     hicache_ratio: float = 2.0
     hicache_write_through_threshold: int = 1
     # Write policy:
@@ -515,6 +516,24 @@ class ServerArgs:
 
         if os.getenv("SGLANG_JAX_ENABLE_UNIFIED_RADIX_TREE", "0") == "1":
             self.enable_unified_radix_tree = True
+
+        if self.hicache_transfer_backend not in ("jax", "raiden"):
+            raise ValueError("hicache_transfer_backend must be jax or raiden")
+        if self.hicache_transfer_backend == "raiden":
+            if self.hicache_storage != "none":
+                raise ValueError("Raiden HiCache requires --hicache-storage none")
+            if (
+                self.pd_disaggregation
+                or self.disaggregation_use_raiden
+                or self.disaggregation_mode != "null"
+            ):
+                raise ValueError(
+                    "Raiden HiCache with PD is not supported in the initial L2 release"
+                )
+            if self.nnodes != 1 or self.device != "tpu":
+                raise ValueError("Raiden HiCache currently requires single-host TPU serving")
+            if self.speculative_algorithm is not None:
+                raise ValueError("Raiden HiCache does not yet support speculative decoding")
 
         if self.hicache_storage != "disable":
             if self.hicache_storage not in ("none", "file"):
@@ -1379,6 +1398,13 @@ class ServerArgs:
             "(host pinned pool), 'file' reserved for L3(not support yet). "
             "Unsupported for linear-recurrent models under the unified radix "
             "tree (rejected at init).",
+        )
+        parser.add_argument(
+            "--hicache-transfer-backend",
+            choices=["jax", "raiden"],
+            default=ServerArgs.hicache_transfer_backend,
+            help="Local L1/L2 transfer backend. Raiden uses native DMA with completion "
+            "barriers (FULL KV, single-host TPU, no PD/speculative decoding yet).",
         )
         parser.add_argument(
             "--hicache-ratio",

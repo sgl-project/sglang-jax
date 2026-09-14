@@ -384,6 +384,7 @@ class TreeComponent(ABC):
         token_ids: Sequence[int] | None = None,
         prefetch_tokens: int = 0,
         last_hash: str | None = None,
+        device_indices: Sequence[int] | None = None,
     ) -> list | None:
         """Build transfer descriptors for this component in the given phase.
         Returns None if the component has nothing to transfer."""
