@@ -137,12 +137,17 @@ def _calculate_num_column_partitions(
     # partition's size is not too small for DMA pipeline efficiency and each
     # partition's size can divide the hidden size.
 
+    def _can_split_further(num_column_partitions: int) -> bool:
+        return (
+            num_cores % (num_column_partitions * 2) == 0
+            and hidden_size % (num_lanes * num_column_partitions * 2) == 0
+        )
+
     # Each column partition will do DMA pipelining on col_size.
     preferred_num_stages = 4
     num_column_partitions = 1
     while (
-        num_cores % (num_column_partitions * 2) == 0
-        and hidden_size % (num_lanes * num_column_partitions * 2) == 0
+        _can_split_further(num_column_partitions)
         and hidden_size // (num_column_partitions * 2 * num_lanes) >= preferred_num_stages
     ):
         next_candidate = num_column_partitions * 2
@@ -165,6 +170,14 @@ def _calculate_num_column_partitions(
             break
 
         num_column_partitions = next_candidate
+
+    # Keep splitting until num_row_partitions <= num_simd_lanes (hard limit),
+    # even when that means dropping below the preferred pipeline depth
+    # (upstream tpu-inference #3513).
+    while num_cores // num_column_partitions > num_simd_lanes and _can_split_further(
+        num_column_partitions
+    ):
+        num_column_partitions *= 2
 
     return num_column_partitions
 

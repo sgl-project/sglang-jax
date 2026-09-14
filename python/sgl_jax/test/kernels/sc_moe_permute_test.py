@@ -206,5 +206,63 @@ class EPMoEScPermuteTest(absltest.TestCase):
         self.assertNotIn("SGL_JAX_MOE_SC_PERMUTE", os.environ)
 
 
+class ColumnPartitionHardLimitTest(parameterized.TestCase):
+    """Host-side regression for the num_row_partitions <= num_simd_lanes hard
+    limit (upstream tpu-inference #3513): the preferred-pipeline-depth loop
+    must not stop splitting before the hardware constraint is satisfied."""
+
+    @parameterized.parameters(
+        # (hidden, num_cores, num_lanes, num_simd_lanes) — both cases used to
+        # yield num_row_partitions of 32 (limit 16) and 16 (limit 8).
+        (512, 32, 128, 16),
+        (1024, 32, 128, 8),
+    )
+    def test_reported_violations_now_satisfy_limit(self, hidden, cores, lanes, simd):
+        from sgl_jax.srt.kernels.sparse_core.ragged_gather_reduce_v2 import (
+            _calculate_num_column_partitions,
+        )
+
+        ncp = _calculate_num_column_partitions(
+            hidden_size=hidden,
+            input_size=32768,
+            num_cores=cores,
+            num_lanes=lanes,
+            num_simd_lanes=simd,
+        )
+        self.assertLessEqual(cores // ncp, simd)
+
+    def test_hard_limit_whenever_divisibility_permits(self):
+        from sgl_jax.srt.kernels.sparse_core.ragged_gather_reduce_v2 import (
+            _calculate_num_column_partitions,
+        )
+
+        for hidden in (512, 1024, 2048, 4096, 6144):
+            for cores in (8, 16, 32, 64):
+                for simd in (8, 16):
+                    for input_size in (8192, 32768):
+                        ncp = _calculate_num_column_partitions(
+                            hidden_size=hidden,
+                            input_size=input_size,
+                            num_cores=cores,
+                            num_lanes=128,
+                            num_simd_lanes=simd,
+                        )
+                        # A compliant split must be reachable by doubling while
+                        # cores and hidden stay divisible; assert we took it.
+                        reachable = ncp
+                        while (
+                            cores // reachable > simd
+                            and cores % (reachable * 2) == 0
+                            and hidden % (128 * reachable * 2) == 0
+                        ):
+                            reachable *= 2
+                        if cores // reachable <= simd:
+                            self.assertLessEqual(
+                                cores // ncp,
+                                simd,
+                                msg=f"hidden={hidden} cores={cores} simd={simd} in={input_size} ncp={ncp}",
+                            )
+
+
 if __name__ == "__main__":
     absltest.main()
