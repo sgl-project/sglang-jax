@@ -20,6 +20,11 @@ def raiden_requested(argv: Sequence[str] | None = None) -> bool:
 
 
 def preload_raiden() -> None:
+    """Preload the tpu-raiden native extension module.
+
+    Must be called before importing JAX or jaxlib to ensure the native C++
+    runtime extensions link and initialize properly before libtpu loads.
+    """
     if _RAIDEN_EXTENSION in sys.modules:
         return
     if "jax" in sys.modules or "jaxlib" in sys.modules:
