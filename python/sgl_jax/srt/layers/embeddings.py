@@ -15,7 +15,6 @@
 """Embedding Layers."""
 
 import math
-import os
 from typing import Any
 
 import jax
@@ -27,6 +26,7 @@ from flax.typing import PromoteDtypeFn
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.environ import envs as _envs
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
 
@@ -568,7 +568,7 @@ def rotary_embedding_forward(
     return query, key
 
 
-_ILV_FIX = os.environ.get("SGLANG_ROTARY_ILV_FIX", "1") == "1"
+_ROTARY_INTERLEAVED = _envs.SGLANG_JAX_ROTARY_INTERLEAVED.get()
 
 
 # @partial(jax.jit, static_argnames=["is_neox_style"])
@@ -591,7 +591,7 @@ def apply_rotary_emb(
     if is_neox_style:
         x1, x2 = jnp.split(x, 2, axis=-1)
     else:
-        if _ILV_FIX:
+        if _ROTARY_INTERLEAVED:
             # GPT-J rotary computed directly in the interleaved domain:
             # avoids the strided even/odd slices and the stack+reshape
             # re-interleave; bit-identical to the slice formulation.

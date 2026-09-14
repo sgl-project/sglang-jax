@@ -1,5 +1,6 @@
-"""The interleaved-domain GPT-J rotary (SGLANG_ROTARY_ILV_FIX, default on) must be
-bit-identical to the strided-slice formulation, and the neox path must be untouched."""
+"""The interleaved-domain GPT-J rotary (SGLANG_JAX_ROTARY_INTERLEAVED, default on)
+must be bit-identical to the strided-slice formulation, and the neox path must be
+untouched. The env is declared in sgl_jax.srt.environ."""
 
 import importlib
 import os
@@ -12,16 +13,16 @@ import sgl_jax.srt.layers.embeddings as embeddings
 
 
 def _apply_with_flag(flag: str, x, cos, sin, is_neox_style: bool):
-    old = os.environ.get("SGLANG_ROTARY_ILV_FIX")
-    os.environ["SGLANG_ROTARY_ILV_FIX"] = flag
+    old = os.environ.get("SGLANG_JAX_ROTARY_INTERLEAVED")
+    os.environ["SGLANG_JAX_ROTARY_INTERLEAVED"] = flag
     try:
         mod = importlib.reload(embeddings)
         return mod.apply_rotary_emb(x, cos, sin, is_neox_style)
     finally:
         if old is None:
-            os.environ.pop("SGLANG_ROTARY_ILV_FIX", None)
+            os.environ.pop("SGLANG_JAX_ROTARY_INTERLEAVED", None)
         else:
-            os.environ["SGLANG_ROTARY_ILV_FIX"] = old
+            os.environ["SGLANG_JAX_ROTARY_INTERLEAVED"] = old
         importlib.reload(embeddings)
 
 
@@ -46,3 +47,12 @@ def test_neox_path_untouched():
     ref = _apply_with_flag("0", x, cos, sin, is_neox_style=True)
     fix = _apply_with_flag("1", x, cos, sin, is_neox_style=True)
     assert bool(jnp.all(ref == fix))
+
+
+def test_environ_registry_defaults(monkeypatch):
+    from sgl_jax.srt.environ import envs as registry
+
+    assert registry.SGLANG_JAX_ROTARY_INTERLEAVED.get() is True
+    assert registry.SGLANG_JAX_INDEXER_ROPE_CONCAT.get() is True
+    monkeypatch.setenv("SGLANG_JAX_INDEXER_ROPE_CONCAT", "0")
+    assert registry.SGLANG_JAX_INDEXER_ROPE_CONCAT.get() is False

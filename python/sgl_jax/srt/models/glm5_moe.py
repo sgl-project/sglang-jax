@@ -1,5 +1,4 @@
 import logging
-import os
 from functools import partial
 from typing import Any
 
@@ -10,6 +9,7 @@ from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig, MoEBackend
+from sgl_jax.srt.environ import envs
 from sgl_jax.srt.eplb.expert_location import ExpertLocationMetadata
 from sgl_jax.srt.kernels.fused_mlp import apply_fused_mlp_with_padding
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
@@ -35,7 +35,7 @@ from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
-_ILV_FIX = os.environ.get("SGLANG_ROTARY_ILV_FIX", "1") == "1"
+_INDEXER_ROPE_CONCAT = envs.SGLANG_JAX_INDEXER_ROPE_CONCAT.get()
 
 
 @partial(jax.jit, static_argnames=("quantized_dtype",))
@@ -193,7 +193,7 @@ class GlmDsaIndexer(nnx.Module):
         q_rope = query[:, :, :rope_dim]
         k_rope = key[:, :rope_dim][:, None, :]
         q_rope, k_rope = rotary_emb(positions, q_rope, k_rope)
-        if _ILV_FIX:
+        if _INDEXER_ROPE_CONCAT:
             # concat instead of at[].set: avoids a read-modify-write of the
             # full [T, n_head, head_dim] tensor (values are identical).
             query = jnp.concatenate((q_rope, query[:, :, rope_dim:]), axis=-1)
@@ -228,7 +228,7 @@ class GlmDsaIndexer(nnx.Module):
         q_rope, k_rope = rotary_emb(positions, q_rope, k_rope)
         k_rope = k_rope.squeeze(1)  # Remove head dim
 
-        if _ILV_FIX:
+        if _INDEXER_ROPE_CONCAT:
             query = jnp.concatenate((q_rope, query[:, :, rope_dim:]), axis=-1)
             key = jnp.concatenate((k_rope, key[:, rope_dim:]), axis=-1)
         else:
