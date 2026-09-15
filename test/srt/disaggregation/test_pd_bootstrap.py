@@ -51,6 +51,66 @@ def server_and_client():
     server.stop()
 
 
+class TestWaitUntilReady:
+    """Tests for IPv4 and IPv6 target health checks invoked via server.start()."""
+
+    def test_ipv4_target_success(self, monkeypatch):
+        server = BootstrapServer(port=8998)
+        called_urls: list[str] = []
+
+        def mock_get(url: str, timeout: float = 0.5):
+            called_urls.append(url)
+            resp = mock.MagicMock()
+            resp.status_code = 200
+            return resp
+
+        monkeypatch.setattr("threading.Thread", mock.MagicMock())
+        monkeypatch.setattr("sgl_jax.srt.disaggregation.bootstrap.httpx.get", mock_get)
+        server.start()
+        assert server.is_started is True
+        assert called_urls == ["http://127.0.0.1:8998/health"]
+
+    def test_ipv6_target_success_when_ipv4_fails(self, monkeypatch):
+        server = BootstrapServer(port=8998)
+        called_urls: list[str] = []
+
+        def mock_get(url: str, timeout: float = 0.5):
+            called_urls.append(url)
+            if "127.0.0.1" in url:
+                raise httpx.ConnectError("IPv4 connection refused")
+            resp = mock.MagicMock()
+            resp.status_code = 200
+            return resp
+
+        monkeypatch.setattr("threading.Thread", mock.MagicMock())
+        monkeypatch.setattr("sgl_jax.srt.disaggregation.bootstrap.httpx.get", mock_get)
+        server.start()
+        assert server.is_started is True
+        assert "http://127.0.0.1:8998/health" in called_urls
+        assert "http://[::1]:8998/health" in called_urls
+
+    def test_both_targets_fail_raises_timeout(self, monkeypatch):
+        server = BootstrapServer(port=8998)
+        monkeypatch.setattr("threading.Thread", mock.MagicMock())
+        monkeypatch.setattr(
+            "sgl_jax.srt.disaggregation.bootstrap.httpx.get",
+            mock.MagicMock(side_effect=httpx.ConnectError("connection refused")),
+        )
+        current_time = [100.0]
+
+        def mock_monotonic():
+            return current_time[0]
+
+        def mock_sleep(seconds: float):
+            current_time[0] += seconds + 1.0
+
+        monkeypatch.setattr("sgl_jax.srt.disaggregation.bootstrap.time.monotonic", mock_monotonic)
+        monkeypatch.setattr("sgl_jax.srt.disaggregation.bootstrap.time.sleep", mock_sleep)
+
+        with pytest.raises(TimeoutError, match="BootstrapServer did not become ready"):
+            server.start()
+
+
 # ==================================================================
 # Bootstrap server + client (from test_bootstrap_server)
 # ==================================================================

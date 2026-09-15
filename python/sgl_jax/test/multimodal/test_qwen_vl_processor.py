@@ -16,12 +16,12 @@ from sgl_jax.srt.multimodal.processors.qwen_vl import QwenVLProcessor
 IMAGE_TOKEN = 151655
 
 
-def _make_qwen_processor():
+def _make_qwen_processor(workers=2):
     hf_config = SimpleNamespace(
         architectures=["Qwen2_5_VLForConditionalGeneration"],
         vision_config=SimpleNamespace(patch_size=14, spatial_merge_size=2),
     )
-    return QwenVLProcessor(hf_config, SimpleNamespace(), object())
+    return QwenVLProcessor(hf_config, SimpleNamespace(mm_processor_worker_num=workers), object())
 
 
 def test_build_radix_input_ids():
@@ -66,7 +66,7 @@ def test_qwen_process_and_combine_runs_in_hf_processor_worker():
 
     async def run_processor():
         event_loop_thread_id = threading.get_ident()
-        output = await processor.process_and_combine_mm_data_async("prompt")
+        output = await processor.process_mm_data_async(None, "prompt", SimpleNamespace())
         return event_loop_thread_id, output
 
     try:
@@ -78,29 +78,36 @@ def test_qwen_process_and_combine_runs_in_hf_processor_worker():
     assert output.input_ids == [10, 11]
 
 
-def test_qwen_loads_images_and_videos_concurrently():
-    processor = _make_qwen_processor()
+@pytest.mark.parametrize("workers", [1, 2])
+def test_qwen_loads_and_processes_images_and_videos_in_one_worker(monkeypatch, workers):
+    processor = _make_qwen_processor(workers)
+    stages = []
+    event_loop_thread_id = threading.get_ident()
+
+    def load_image(source):
+        assert source == "image-source"
+        stages.append(("image", threading.get_ident()))
+        return "loaded-image"
+
+    def load_video(source, config):
+        assert source == "video-source"
+        assert config["factor"] == 28
+        stages.append(("video", threading.get_ident()))
+        return "loaded-video"
+
+    def combine(input_text, images=None, videos=None, *, processor, **kwargs):
+        assert input_text == "prompt"
+        assert images == ["loaded-image"]
+        assert videos == ["loaded-video"]
+        assert kwargs["videos_kwargs"]["do_sample_frames"] is False
+        stages.append(("processor", threading.get_ident()))
+        return MultimodalInputs(mm_items=[], input_ids=[10, 11])
+
+    monkeypatch.setattr(processor, "load_image", load_image)
+    monkeypatch.setattr("sgl_jax.srt.multimodal.processors.qwen_vl.preprocess_video", load_video)
+    monkeypatch.setattr(processor, "process_and_combine_mm_data", combine)
 
     async def run_processor():
-        loaders_ready = asyncio.Barrier(2)
-
-        async def load(sources, expected_source, result):
-            assert sources == [expected_source]
-            await loaders_ready.wait()
-            return [result]
-
-        async def combine(input_text, images=None, videos=None, **kwargs):
-            assert input_text == "prompt"
-            assert images == ["loaded-image"]
-            assert videos == ["loaded-video"]
-            return MultimodalInputs(mm_items=[], input_ids=[10, 11])
-
-        processor.load_images_async = lambda sources: load(sources, "image-source", "loaded-image")
-        processor._load_videos_async = lambda sources, _: load(
-            sources, "video-source", "loaded-video"
-        )
-        processor.process_and_combine_mm_data_async = combine
-
         return await asyncio.wait_for(
             processor.process_mm_data_async(
                 "image-source",
@@ -116,6 +123,9 @@ def test_qwen_loads_images_and_videos_concurrently():
         processor.shutdown()
 
     assert output.input_ids == [10, 11]
+    assert [stage for stage, _ in stages] == ["image", "video", "processor"]
+    assert len({thread_id for _, thread_id in stages}) == 1
+    assert stages[0][1] != event_loop_thread_id
 
 
 def test_placeholder_ranges_are_half_open():

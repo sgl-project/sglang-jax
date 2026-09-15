@@ -14,6 +14,40 @@ from sgl_jax.srt.model_executor.aot_dispatch import AotDispatcher
 
 
 class TestAotDispatcher(unittest.TestCase):
+    def test_batch_metadata_selects_distinct_executable(self):
+        @jax.tree_util.register_pytree_node_class
+        class Batch:
+            def __init__(self, value, decode):
+                self.value, self.decode = value, decode
+
+            def tree_flatten(self):
+                return (self.value,), self.decode
+
+            @classmethod
+            def tree_unflatten(cls, decode, children):
+                return cls(children[0], decode)
+
+        @jax.jit
+        def f(batch):
+            return batch.value + (1 if batch.decode else 10)
+
+        disp = AotDispatcher(f, stable_call_args=(), stable_flat_args=(), name="metadata")
+        for decode in (True, False, True, False):
+            batch = Batch(jnp.ones(4), decode)
+            np.testing.assert_array_equal(np.asarray(disp(batch)), np.asarray(f(batch)))
+
+    def test_python_scalar_types_select_distinct_executable(self):
+        @jax.jit
+        def f(value):
+            return value + 1
+
+        disp = AotDispatcher(f, stable_call_args=(), stable_flat_args=(), name="scalar")
+        for value in (2, 2.5, 3, 3.5):
+            result = disp(value)
+            expected = f(value)
+            self.assertEqual(result.dtype, expected.dtype)
+            np.testing.assert_array_equal(np.asarray(result), np.asarray(expected))
+
     def _make(self):
         @partial(jax.jit, static_argnames=["state_def", "flag"], donate_argnames=["pool"])
         def f(weights_def, state_def, leaves, flag, batch, pool, meta):

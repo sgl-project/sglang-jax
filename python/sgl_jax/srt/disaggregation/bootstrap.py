@@ -620,16 +620,17 @@ class BootstrapServer:
         self._started = False
 
     def _wait_until_ready(self, timeout_s: float) -> None:
-        url = f"http://127.0.0.1:{self._port}/health"
+        targets = ["127.0.0.1", "[::1]"]
         deadline = time.monotonic() + timeout_s
         last_err: Exception | None = None
         while time.monotonic() < deadline:
-            try:
-                r = httpx.get(url, timeout=0.5)
-                if r.status_code == 200:
-                    return
-            except Exception as e:  # noqa: BLE001
-                last_err = e
+            for target in targets:
+                try:
+                    r = httpx.get(f"http://{target}:{self._port}/health", timeout=0.5)
+                    if r.status_code == 200:
+                        return
+                except Exception as e:  # noqa: BLE001
+                    last_err = e
             time.sleep(0.05)
         raise TimeoutError(
             f"BootstrapServer did not become ready within {timeout_s}s (last error: {last_err})"

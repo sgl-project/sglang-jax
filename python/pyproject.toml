@@ -19,6 +19,7 @@ dependencies = [
     "modelscope~=1.28.2",
     "msgpack-python~=0.5.6",
     "numpy~=2.2.6",
+    "numba>=0.61.2",
     "orjson~=3.11.1",
     "pillow~=11.3.0",
     "prometheus-client>=0.20.0",
@@ -34,6 +35,7 @@ dependencies = [
     "typing-extensions~=4.14.1",
     "uvicorn~=0.35.0",
     "uvloop~=0.21.0",
+    "xxhash>=3.0.0",
     "psutil",
     "httpx",
     "openai",
@@ -69,6 +71,7 @@ all = [
 ]
 multimodal = [
     "torch",
+    "torchcodec",
     "torchvision",
     "torchaudio",
     "decord",
@@ -149,6 +152,9 @@ ignore = [
 "sgl_jax/srt/kernels/fused_moe/v1/kernel.py" = ["B023"]
 "sgl_jax/srt/kernels/fused_moe/v2/kernel.py" = ["B023", "F841", "SIM102", "SIM108"]
 "sgl_jax/srt/kernels/mla/v2/kernel.py" = ["B023"]
+# Vendored openxla/tokamax SparseCore top-k kernel: kept byte-identical to upstream
+# apart from the logging import; same statically-unrolled-loop closures as above.
+"sgl_jax/srt/kernels/dsa/sc_topk.py" = ["B023", "SIM212"]
 # TPU benchmark/debug scripts intentionally initialize distributed JAX before
 # importing local kernels, and benchmark closures capture loop-state values.
 "sgl_jax/srt/kernels/fused_moe/v2/bench_compare.py" = ["B023", "E402"]
@@ -196,5 +202,6 @@ explicit = true
 
 [tool.uv.sources]
 torch = { index = "pytorch-cpu" }
+torchcodec = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
 torchaudio = { index = "pytorch-cpu" }

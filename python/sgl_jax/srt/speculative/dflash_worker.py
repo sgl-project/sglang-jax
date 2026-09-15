@@ -86,30 +86,41 @@ class TargetVerifyPlan:
 class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
     """DFlash draft/verify runtime worker (greedy, DP/TP aware)."""
 
+    algorithm = SpeculativeAlgorithm.DFLASH
+
+    @staticmethod
+    def _draft_model_class():
+        from sgl_jax.srt.models.dflash import DFlashDraftModel
+
+        return DFlashDraftModel
+
+    def _validate_draft_model(self, draft_model):
+        pass
+
     def __init__(self, server_args, target_worker: ModelWorker):
         super().__init__(
             server_args,
             target_worker,
             self,
         )
+        # Scheduler allocation and target verification include the seed.
         self.block_size = self.speculative_num_draft_tokens
+        self.sample_from_anchor = server_args.speculative_sample_from_anchor
+        self.draft_query_tokens = self.block_size - int(self.sample_from_anchor)
         self._target_impl = getattr(target_worker, "worker", target_worker)
         self._target_compilation_manager = self._target_impl.compilation_manager
 
         draft_server_args = copy.deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
 
-        from sgl_jax.srt.models.dflash import DFlashDraftModel
-
         self._worker = ModelWorker(
             server_args=draft_server_args,
             mesh=self.mesh,
             req_to_token_pool=self.req_to_token_pool,
             is_draft_worker=True,
-            model_class=DFlashDraftModel,
+            model_class=self._draft_model_class(),
         )
         draft_model = self.draft_model_runner.model
-
         # Alias the KV allocator so draft block allocation draws from the same
         # free list the target uses (no collision with committed slots).
         self.draft_model_runner.token_to_kv_pool_allocator = self.token_to_kv_pool_allocator
@@ -119,6 +130,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         self._target_lm_head = head_weight  # [vocab, hidden], for greedy head sampling
         self._target_embed = embed_weight  # [vocab, hidden]
         self._target_vocab_size = int(target_worker.model_runner.model_config.vocab_size)
+        self._validate_draft_model(draft_model)
 
         pool_pages = (
             int(target_worker.max_total_num_tokens) + self.page_size - 1
@@ -159,10 +171,14 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         self._init_jit_draft_block()
 
         logger.info(
-            "Initialized DFLASH worker: block_size=%d, mask_token_id=%d, "
+            "Initialized %s worker: verify_tokens=%d, draft_query_tokens=%d, "
+            "sample_from_anchor=%s, mask_token_id=%d, "
             "draft_layers=%d, page_indices_pool_capacity=%d, "
             "page_indices_per_seq_capacity=%d",
+            self.algorithm.name,
             self.block_size,
+            self.draft_query_tokens,
+            self.sample_from_anchor,
             self._mask_token_id,
             self.draft_layers,
             self._page_indices_pool_capacity,
@@ -669,7 +685,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         mwb.positions = np.asarray(positions_flat, dtype=np.int32)
         mwb.seq_lens = np.asarray(prefix_lens, dtype=np.int32)
         mwb.capture_hidden_mode = CaptureHiddenMode.NULL
-        mwb.spec_algorithm = SpeculativeAlgorithm.DFLASH
+        mwb.spec_algorithm = self.algorithm
         mwb.spec_info_padded = DFlashVerifyInput(
             draft_token=block_ids_flat,
             draft_token_num=self.block_size,
@@ -703,6 +719,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         model_def = runner._model_def
         model_state_def = runner._model_state_def
         block_size = self.block_size
+        draft_query_tokens = self.draft_query_tokens
+        sample_start = 0 if self.sample_from_anchor else 1
         vocab_size = self._target_vocab_size
         embedding_sharding = NamedSharding(runner.mesh, P("data", "tensor"))
         logits_sharding = NamedSharding(runner.mesh, P("data", "tensor"))
@@ -767,14 +785,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                     positions.reshape(-1), token_sharding
                 )
                 forward_batch.seq_lens = target_prefix_lens
-                forward_batch.attn_backend.forward_metadata = _make_target_verify_metadata(
-                    forward_batch.attn_backend.forward_metadata,
-                    target_prefix_lens,
-                    allocated_lens,
-                    speculative_num_draft_tokens=block_size,
-                    page_size=forward_batch.attn_backend.page_size,
-                    dp_size=dp_size,
-                )
 
             cache_rows = forward_batch.out_cache_loc.reshape((target_prefix_lens.shape[0], -1))
             cache_offsets = jnp.where(
@@ -801,6 +811,33 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             ).reshape(-1)
             forward_batch.out_cache_loc = selected_cache_loc
 
+            # Keep the full verify layout for the target and accepted-context KV
+            # materialization. Only the draft backbone sees the shorter query.
+            verify_positions = forward_batch.positions
+            seed = forward_batch.input_ids.reshape((-1, block_size))[:, :1]
+            if draft_query_tokens != block_size:
+
+                def draft_rows(values):
+                    values = values.reshape((-1, block_size))[:, :draft_query_tokens]
+                    return jax.sharding.reshard(values.reshape(-1), token_sharding)
+
+                forward_batch.input_ids = draft_rows(forward_batch.input_ids)
+                forward_batch.positions = draft_rows(verify_positions)
+                forward_batch.out_cache_loc = draft_rows(selected_cache_loc)
+                forward_batch.spec_info = DFlashVerifyInput(
+                    draft_token=forward_batch.input_ids,
+                    draft_token_num=draft_query_tokens,
+                )
+            if use_relay_state or draft_query_tokens != block_size:
+                forward_batch.attn_backend.forward_metadata = _make_target_verify_metadata(
+                    forward_batch.attn_backend.forward_metadata,
+                    target_prefix_lens,
+                    allocated_lens,
+                    speculative_num_draft_tokens=draft_query_tokens,
+                    page_size=forward_batch.attn_backend.page_size,
+                    dp_size=dp_size,
+                )
+
             input_embedding = embed.at[forward_batch.input_ids].get(out_sharding=embedding_sharding)
             forward_batch.input_embedding = input_embedding
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
@@ -810,18 +847,17 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 output, pool_updates, _, _ = model(forward_batch, memory_pools, None)
 
             draft_hidden = output.hidden_states.reshape(
-                (-1, block_size, output.hidden_states.shape[-1])
+                (-1, draft_query_tokens, output.hidden_states.shape[-1])
             )
-            proposal_hidden = draft_hidden[:, 1:, :]
+            proposal_hidden = draft_hidden[:, sample_start:, :]
             proposal_flat = proposal_hidden.reshape((-1, proposal_hidden.shape[-1]))
             logits = jnp.dot(
                 proposal_flat,
                 lm_head.T,
                 out_sharding=logits_sharding,
             )[:, :vocab_size]
-            draft_next = jnp.argmax(logits, axis=-1).astype(jnp.int32)
-            draft_next = draft_next.reshape(proposal_hidden.shape[:-1])
-            seed = forward_batch.input_ids.reshape((-1, block_size))[:, :1]
+            base_logits = logits.reshape((*proposal_hidden.shape[:-1], vocab_size))
+            draft_next = model.sample_block_tokens(base_logits, seed[:, 0])
             seed = jax.sharding.reshard(seed, cache_row_sharding)
             draft_next = jax.sharding.reshard(draft_next, cache_row_sharding)
             draft_token = jnp.concatenate([seed, draft_next], axis=1).reshape(-1)
@@ -830,7 +866,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 pool_updates,
                 draft_token,
                 target_prefix_lens,
-                forward_batch.positions,
+                verify_positions,
                 selected_cache_loc,
             )
 
@@ -1541,7 +1577,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 num_tokens,
                 ForwardMode.EXTEND,
                 manager.cache_loc_buckets[-1],
-                speculative_algorithm=SpeculativeAlgorithm.DFLASH,
+                speculative_algorithm=self.algorithm,
                 dp_size=manager.dp_size,
                 per_dp_bs_size=bs // manager.dp_size,
             )
@@ -1733,7 +1769,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             num_tokens,
             ForwardMode.TARGET_VERIFY,
             bs * row_width,
-            speculative_algorithm=SpeculativeAlgorithm.DFLASH,
+            speculative_algorithm=self.algorithm,
             dp_size=dp_size,
             per_dp_bs_size=per_dp_bs,
         )
