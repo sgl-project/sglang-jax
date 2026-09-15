@@ -7,6 +7,7 @@ from typing import Any, Literal
 import jax
 import jax.numpy as jnp
 import numpy as np
+import xxhash
 
 
 def flatten_nested_list(nested_list):
@@ -28,8 +29,7 @@ def hash_feature(f: Any) -> int:
             return tensor_hash(f)
         return data_hash(tuple(flatten_nested_list(f)))
     elif isinstance(f, np.ndarray):
-        arr = np.ascontiguousarray(f)
-        return data_hash(arr.tobytes())
+        return _array_hash(f)
     elif isinstance(f, jnp.ndarray):
         return tensor_hash([f])
     return data_hash(pickle.dumps(f))
@@ -39,6 +39,11 @@ def data_hash(data: Any) -> int:
     """Hash raw data bytes"""
     hash_bytes = hashlib.sha256(data).digest()[:8]
     return int.from_bytes(hash_bytes, byteorder="big", signed=False)
+
+
+def _array_hash(array: np.ndarray) -> int:
+    """Hash a NumPy array without copying its contiguous byte buffer."""
+    return xxhash.xxh3_64_intdigest(np.ascontiguousarray(array))
 
 
 def tensor_hash(tensor_list: Any) -> int:
@@ -68,7 +73,7 @@ def tensor_hash(tensor_list: Any) -> int:
     # Handle numpy arrays with CPU-based hashing
     if isinstance(tensor, np.ndarray):
         arr = np.ascontiguousarray(tensor.astype(np.float32))
-        return data_hash(arr.tobytes())
+        return _array_hash(arr)
 
     raise TypeError(f"Unsupported tensor type: {type(tensor)}")
 
