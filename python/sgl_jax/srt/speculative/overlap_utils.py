@@ -80,7 +80,7 @@ def can_merge_spec_non_overlap_prefill(enable_overlap, spec_algorithm) -> bool:
         not enable_overlap
         and spec_algorithm is not None
         and not spec_algorithm.is_none()
-        and (spec_algorithm.is_eagle3() or spec_algorithm.is_dflash())
+        and (spec_algorithm.is_eagle3() or spec_algorithm.is_dflash_family())
     )
 
 
