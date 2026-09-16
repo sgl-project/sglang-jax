@@ -71,7 +71,7 @@ def replicate_across_mesh(array: ArrayLike, mesh: Mesh) -> jax.Array:
     # even when it was requested with ``P()``.  Compare the effective layout
     # instead of the syntactic PartitionSpec so an already-replicated encoder
     # result does not compile an identity reshard on the first real request.
-    if array.sharding.is_fully_replicated and array.sharding.device_set == spec.device_set:
+    if array.sharding.is_fully_replicated:
         return array
     return _replicate_fn(mesh, array.ndim)(array)
 
@@ -116,6 +116,25 @@ def _build_output_indices(lengths, output_starts, output_size, merge_unit):
             output_indices[cursor + index] = source_start + index
         cursor += output_len
     return output_indices
+
+
+def plan_encoder_lanes(item_lengths, num_lanes, *, merge_unit):
+    """Map logical tokens to lane-local encoder output without device work."""
+    lengths = np.asarray(item_lengths, dtype=np.int32)
+    lanes = balance_lanes(lengths.tolist(), num_lanes)
+    capacity = (
+        _bucket_capacity(
+            max(sum(int(lengths[index]) for index in lane) for lane in lanes), merge_unit
+        )
+        // merge_unit
+    )
+    starts = np.empty(len(lengths), dtype=np.int32)
+    for rank, lane in enumerate(lanes):
+        offset = rank * capacity
+        for index in lane:
+            starts[index] = offset
+            offset += int(lengths[index]) // merge_unit
+    return lanes, _build_output_indices(lengths, starts, num_lanes * capacity, merge_unit)
 
 
 def pack_lanes(
