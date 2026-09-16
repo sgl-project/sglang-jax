@@ -117,6 +117,8 @@ def _per_req_state_bytes_from_config(cfg, tp_size: int) -> int:
 
 def _enforce_recurrent_state_server_constraints(server_args, is_lightning: bool = False) -> None:
     """Assert server constraints for hybrid recurrent state models."""
+    if server_args.attention_backend == "tt" and server_args.enable_mixed_chunk:
+        raise ValueError("TT recurrent attention does not support --enable-mixed-chunk")
     if server_args.enable_recurrent_extra_buffer:
         # GLA/Lightning decode is a fused Pallas kernel that cannot add a masked
         # recurrent track scatter, so the extra-buffer path is unsupported. Reject

@@ -8,10 +8,12 @@ from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
 from sgl_jax.srt.disaggregation.prefill import PrefillBootstrapQueue
 from sgl_jax.srt.managers.io_struct import AbortReq, PauseGenerationReqInput
 from sgl_jax.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
+from sgl_jax.srt.managers.schedule_policy import AddReqResult
 from sgl_jax.srt.managers.scheduler import GenerationBatchResult, Scheduler
 from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
+from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 
 
@@ -371,6 +373,58 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
 
         scheduler.continue_generation(SimpleNamespace())
         self.assertFalse(scheduler._engine_paused)
+
+    def test_tt_recurrent_prefills_are_serialized(self):
+        for backend, recurrent in [("tt", True), ("tt", False), ("fa", True)]:
+            for continuing in (False, True):
+                with self.subTest(backend=backend, recurrent=recurrent, continuing=continuing):
+                    chunk = self._make_req("chunk", [1, 2], []) if continuing else None
+                    waiting = [self._make_req(str(i), [1, 2], []) for i in range(2)]
+                    scheduler, _ = self._make_scheduler([[]], active_reqs=[chunk])
+                    scheduler.waiting_queue = waiting.copy()
+                    scheduler.server_args = SimpleNamespace(attention_backend=backend)
+                    scheduler.req_to_token_pool = (
+                        HybridReqToTokenPool.__new__(HybridReqToTokenPool) if recurrent else None
+                    )
+                    scheduler.tree_cache.supports_recurrent = lambda: False
+                    scheduler.per_dp_max_running_requests = 4
+                    scheduler.model_config = SimpleNamespace(vocab_size=100)
+                    scheduler.mesh = None
+                    scheduler.log_prefill_stats = Mock()
+                    running = self._make_req("running", [1, 2], [])
+                    scheduler.running_batch = self._make_batch([[running]], [None])
+                    for req in [*waiting, *([chunk] if chunk else [])]:
+                        req.init_next_round_input = Mock()
+
+                    admitted = []
+
+                    def add_one_req(req, admitted=admitted):
+                        admitted.append(req)
+                        return AddReqResult.CONTINUE
+
+                    adder = SimpleNamespace(
+                        can_run_list={0: admitted},
+                        pending_h2d=[],
+                        new_chunked_reqs=[None],
+                        # Finish the existing chunk with room left in the token budget.
+                        add_chunked_req=admitted.append,
+                        add_one_req=add_one_req,
+                    )
+                    with (
+                        patch("sgl_jax.srt.managers.scheduler.PrefillAdder", return_value=adder),
+                        patch.object(ScheduleBatch, "prepare_for_extend"),
+                    ):
+                        batch = scheduler.get_new_batch_prefill()
+
+                    expected = ([chunk] if continuing else []) + waiting
+                    if backend == "tt" and recurrent:
+                        expected = expected[:1]
+                    self.assertEqual(batch.reqs_info[0].reqs, expected)
+                    self.assertEqual(
+                        scheduler.waiting_queue, [r for r in waiting if r not in expected]
+                    )
+                    self.assertEqual(scheduler.running_batch.reqs_info[0].reqs, [running])
+                    self.assertEqual(scheduler.chunked_reqs, [None])
 
     def test_pending_abort_chunk_is_not_rescheduled(self):
         req = self._make_req("inflight", [1, 2], [10, 11])

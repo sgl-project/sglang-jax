@@ -8,6 +8,7 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
@@ -17,7 +18,12 @@ _RECURRENT_ZERO_ALLOCATOR_CACHE: dict = {}
 
 
 def _get_recurrent_zero_allocator(shape, dtype, sharding):
-    """Return a cached jax.jit(jnp.zeros) allocator for recurrent/conv buffers."""
+    """Return an allocator for independent recurrent/conv state buffers."""
+    if sharding.mesh.devices.flat[0].platform == "tt":
+        # Constant-only TT executables share cached outputs. In-place state
+        # kernels need a distinct allocation for every layer, as TT KV does.
+        return lambda: jax.device_put(np.zeros(shape, dtype=np.dtype(dtype)), sharding)
+
     key = (
         id(sharding.mesh),
         tuple(shape),
@@ -222,10 +228,7 @@ class RecurrentStatePool:
                 self.conv_buffers[layer][i] = cbuf
 
     def clear(self) -> None:
-        for layer in range(self.num_linear_recurrent_layers):
-            self.recurrent_buffers[layer] = jnp.zeros_like(self.recurrent_buffers[layer])
-            for inner in range(len(self.conv_buffers[layer])):
-                self.conv_buffers[layer][inner] = jnp.zeros_like(self.conv_buffers[layer][inner])
+        self.recurrent_buffers, self.conv_buffers = self._create_buffers()
 
     def copy_slots(self, src_indices, dst_indices):
         """Clone src->dst slots across all layers; rows with src==0 keep dst.
