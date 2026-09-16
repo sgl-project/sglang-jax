@@ -18,6 +18,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 """
 
 import dataclasses
+import functools
 import itertools
 import logging
 import os
@@ -96,6 +97,23 @@ PADDING_BUCKETS = [1 << i for i in range(6, 21)]
 global_server_args_dict = {k: getattr(ServerArgs, k) for k in GLOBAL_SERVER_ARGS_KEYS}
 
 logger = logging.getLogger(__name__)
+
+
+@functools.cache
+def _decode_kv_ladder_steps(page_size: int) -> tuple[int, ...]:
+    """Optional per-request KV capacity ladder for decode cache_loc sizing.
+
+    SGLANG_JAX_DECODE_KV_LADDER="4096,16384,65536" lets short-context decode
+    batches run on smaller cache_loc shapes (and therefore smaller attention /
+    indexer buffers) instead of always padding every request to max_req_len.
+    Each step is page-aligned; the max-capacity bucket remains the fallback.
+    Unset/empty keeps the single max-capacity bucket (default behavior).
+    """
+    raw = os.environ.get("SGLANG_JAX_DECODE_KV_LADDER", "").strip()
+    if not raw:
+        return ()
+    steps = {(int(s) + page_size - 1) // page_size * page_size for s in raw.split(",") if s.strip()}
+    return tuple(sorted(steps))
 
 
 class BaseFinishReason:
@@ -2409,6 +2427,23 @@ class ScheduleBatch:
             total_bs = per_dp_bs_size * self.dp_size
             _, bs_index = pad_to_bucket(total_bs, bs_paddings)
             total_cache_loc_size = cache_loc_paddings[bs_index]
+            ladder = _decode_kv_ladder_steps(page_size)
+            if ladder:
+                # Pick the smallest per-request KV capacity step that holds the
+                # longest sequence in the batch; fall back to the bs bucket's
+                # max-capacity padding when every step is too small. The chosen
+                # size must match a precompiled shape (compilation_manager
+                # precompiles the same ladder), since cache_loc length is part
+                # of the jit cache key.
+                max_kv_len = 0
+                for info in self.reqs_info:
+                    if info.seq_lens is not None and len(info.seq_lens) > 0:
+                        max_kv_len = max(max_kv_len, int(np.max(info.seq_lens)))
+                padded_bs = bs_paddings[bs_index]
+                for step in ladder:
+                    if max_kv_len <= step and padded_bs * step < total_cache_loc_size:
+                        total_cache_loc_size = padded_bs * step
+                        break
 
         per_dp_cache_loc_size = total_cache_loc_size // self.dp_size
         # View into the persistent buffer; intentionally NOT re-zeroed per step.
