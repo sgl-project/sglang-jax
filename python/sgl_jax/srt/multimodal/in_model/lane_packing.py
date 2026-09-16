@@ -87,7 +87,7 @@ def _bucket_capacity(length: int, buckets: tuple[int, ...], unit: int) -> int:
     """Smallest ``unit``-aligned bucket that fits ``length`` (power-of-two fallback)."""
     return next(
         (bucket for bucket in buckets if bucket >= length and bucket % unit == 0),
-        1 << (length - 1).bit_length(),
+        math.ceil((1 << (length - 1).bit_length()) / unit) * unit,
     )
 
 
