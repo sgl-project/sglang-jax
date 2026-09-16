@@ -99,10 +99,19 @@ def gather_overlay(
     *,
     out_sharding: NamedSharding | None,
 ) -> jax.Array:
-    if out_sharding is None:
-        gathered = source[pos_idx]
+    if source.ndim > 2:
+        # Gather the requested rows before reshaping. Flattening the fixed pool
+        # outside this JIT can reformat the entire registered buffer.
+        indices = (pos_idx // source.shape[1], pos_idx % source.shape[1])
     else:
-        gathered = source.at[pos_idx].get(out_sharding=out_sharding)
+        indices = pos_idx
+    if out_sharding is None:
+        gathered = source[indices]
+    else:
+        gathered = source.at[indices].get(out_sharding=out_sharding)
+    gathered = gathered.reshape(pos_idx.shape[0], -1)
+    # Raiden rows may include trailing physical tile padding.
+    gathered = gathered[:, : running.shape[-1]]
     return jnp.where(mask[:, None], gathered, running)
 
 

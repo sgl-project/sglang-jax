@@ -619,42 +619,44 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         self.is_mrope_enabled = "mrope_section" in self.text_config.rope_parameters
 
         # Language backbone.
-        self.model = Qwen2Model(self.text_config, mesh=mesh, dtype=self.dtype)
-        if not getattr(self.text_config, "tie_word_embeddings", False):
-            self.lm_head = ParallelLMHead(
+        if not getattr(config, "encoder_only", False):
+            self.model = Qwen2Model(self.text_config, mesh=mesh, dtype=self.dtype)
+            if not getattr(self.text_config, "tie_word_embeddings", False):
+                self.lm_head = ParallelLMHead(
+                    self.text_config.vocab_size,
+                    self.text_config.hidden_size,
+                    dtype=self.dtype,
+                    param_dtype=self.dtype,
+                    mesh=mesh,
+                    enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
+                )
+            self.logits_processor = LogitsProcessor(
                 self.text_config.vocab_size,
-                self.text_config.hidden_size,
-                dtype=self.dtype,
-                param_dtype=self.dtype,
-                mesh=mesh,
+                mesh=self.mesh,
                 enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
             )
-        self.logits_processor = LogitsProcessor(
-            self.text_config.vocab_size,
-            mesh=self.mesh,
-            enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
-        )
         self.image_token_id = getattr(self.config, "image_token_id", None)
         self.video_token_id = getattr(self.config, "video_token_id", None)
 
         # Vision tower.
         self.visual_config = config.vision_config
 
-        vision_tp = resolve_encoder_tp(mesh, getattr(config, "vision_encoder_parallel", "dp"))
-        self.visual = Qwen2_5_VisionTransformer(
-            config=self.visual_config,
-            dtype=self.dtype,
-            rngs=rngs,
-            mesh=mesh,
-            norm_eps=getattr(self.visual_config, "rms_norm_eps", 1e-6),
-            vision_tp=vision_tp,
-        )
+        if not getattr(config, "language_only", False):
+            vision_tp = resolve_encoder_tp(mesh, getattr(config, "vision_encoder_parallel", "dp"))
+            self.visual = Qwen2_5_VisionTransformer(
+                config=self.visual_config,
+                dtype=self.dtype,
+                rngs=rngs,
+                mesh=mesh,
+                norm_eps=getattr(self.visual_config, "rms_norm_eps", 1e-6),
+                vision_tp=vision_tp,
+            )
 
-        self.vision_input_spec = VisionInputSpec(
-            patch_dim=self.visual.patch_dim,
-            spatial_merge_size=int(config.vision_config.spatial_merge_size),
-            dtype=np.dtype("float32"),
-        )
+            self.vision_input_spec = VisionInputSpec(
+                patch_dim=self.visual.patch_dim,
+                spatial_merge_size=int(config.vision_config.spatial_merge_size),
+                dtype=np.dtype("float32"),
+            )
 
     def get_input_embeddings(self) -> Callable[[jax.Array], jax.Array]:
         return self.model.embed_tokens
@@ -676,6 +678,8 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         return self.get_image_feature(items_per_lane)
 
     def get_multimodal_encode_funcs(self):
+        if not hasattr(self, "visual"):
+            return {}
         return {
             Modality.IMAGE: self.get_image_feature,
             Modality.MULTI_IMAGES: self.get_image_feature,
@@ -683,8 +687,11 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         }
 
     def load_weights(self, model_config: ModelConfig) -> None:
-        mappings = self._language_weight_mappings()
-        mappings.update(self._vision_weight_mappings())
+        mappings = {}
+        if hasattr(self, "model"):
+            mappings.update(self._language_weight_mappings())
+        if hasattr(self, "visual"):
+            mappings.update(self._vision_weight_mappings())
         WeightLoader(self, model_config, self.mesh, self.dtype).load(mappings)
         logger.info("Qwen2.5-VL weights loaded.")
 
