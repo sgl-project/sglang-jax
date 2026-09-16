@@ -33,6 +33,7 @@ from sgl_jax.srt.multimodal.in_model.lane_packing import (
     pack_vision_inputs,
     run_mrope_vision_model,
 )
+from sgl_jax.srt.multimodal.in_model.mm_utils import ItemTask, MergeMapping, gather_merge
 
 
 def _mesh(dp=1, tp=1):
@@ -181,9 +182,9 @@ def test_forward_reencodes_cache_hit_evicted_after_scheduling():
 
 @pytest.mark.parametrize("destination", [-1, 4])
 def test_merge_rejects_mappings_outside_chunk(destination):
-    task = orchestration.ItemTask(_item(), 1, [orchestration.MergeMapping(0, destination, 1)])
+    task = ItemTask(_item(), 1, [MergeMapping(0, destination, 1)])
     with pytest.raises(ValueError, match="exceeds"):
-        orchestration._gather_merge(jnp.zeros((4, 1)), jnp.ones((1, 1)), [task], None)
+        gather_merge(jnp.zeros((4, 1)), jnp.ones((1, 1)), [task], None)
 
 
 def _vision(model_type, mesh, tensor_parallel):

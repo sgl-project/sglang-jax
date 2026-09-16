@@ -31,6 +31,10 @@ from jax._src import mesh as mesh_lib
 
 from sgl_jax.global_config import global_config
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.disaggregation.encoder.embedding_data import (
+    ReceivedEmbeddingBatch,
+    build_received_embedding_batch,
+)
 from sgl_jax.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
@@ -79,6 +83,7 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
 GLOBAL_SERVER_ARGS_KEYS = [
     "device",
+    "language_only",
     "chunked_prefill_size",
     "disable_radix_cache",
     "speculative_algorithm",
@@ -3224,17 +3229,22 @@ class ScheduleBatch:
         deepstack_visual_embedding = _mm["deepstack_visual_embedding"]
         # Keep items whose placeholder rows intersect the current prefill window.
         if self.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
-            multimodal_batch = build_multimodal_batch(
-                self.reqs_info,
-                self.dp_size,
-                self.model_config,
-                per_dp_token_padding,
-                embedding_pool=self.embedding_pool,
-                num_encoder_lanes=encoder_num_lanes(
-                    self.mesh,
-                    tensor_parallel=self.model_config.hf_config.vision_encoder_parallel == "tp",
-                ),
-            )
+            if global_server_args_dict["language_only"]:
+                multimodal_batch = build_received_embedding_batch(
+                    self.reqs_info, self.dp_size, per_dp_token_padding
+                )
+            else:
+                multimodal_batch = build_multimodal_batch(
+                    self.reqs_info,
+                    self.dp_size,
+                    self.model_config,
+                    per_dp_token_padding,
+                    embedding_pool=self.embedding_pool,
+                    num_encoder_lanes=encoder_num_lanes(
+                        self.mesh,
+                        tensor_parallel=self.model_config.hf_config.vision_encoder_parallel == "tp",
+                    ),
+                )
         else:
             multimodal_batch = None
 
@@ -3774,7 +3784,7 @@ class ModelWorkerBatch:
 
     input_embedding: np.ndarray | None = None
 
-    multimodal_batch: MultimodalBatch | None = None
+    multimodal_batch: MultimodalBatch | ReceivedEmbeddingBatch | None = None
 
     apply_for_deepstack: bool = False
 
