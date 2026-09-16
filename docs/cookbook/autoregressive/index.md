@@ -69,6 +69,7 @@ End-to-end serving recipes for autoregressive models on SGL-JAX, organized by ve
 |---|---|---|---|---|
 | ✅ | Qwen-7B-Chat | [`Qwen/Qwen.md`](./Qwen/Qwen.md) | v6e-4 | dense |
 | ✅ | Qwen3-8B / Qwen3-32B | [`Qwen/Qwen3.md`](./Qwen/Qwen3.md) | v6e-4; 8B v7x-4 | dense + reasoning (`qwen3`) + tool (`qwen25`) |
+| ✅ | Qwen3.8-27B | [`Qwen/Qwen3.8.md`](./Qwen/Qwen3.8.md) | v6e-4 | Qwen3.5 hybrid dense path; text-only |
 | ✅ | Qwen3-30B-A3B | [`Qwen/Qwen3-MoE.md`](./Qwen/Qwen3-MoE.md) | v6e-16 / v7x-4 | MoE + reasoning (`qwen3`) + tool (`qwen25`) |
 | ✅ | Qwen2.5-VL (3B / 7B / 32B / 72B) | [`Qwen/Qwen2.5-VL.md`](./Qwen/Qwen2.5-VL.md) | v6e-4 for 3B/7B/32B; 32B also validated on v7x-8; 72B pending | vision-language autoregressive decoder |
 | ✅ | Qwen3-VL-32B-Instruct | [`Qwen/Qwen3-VL.md`](./Qwen/Qwen3-VL.md) | v7x-8 | vision-language autoregressive decoder; DP4 × effective TP2 |
@@ -117,7 +118,7 @@ Reasoning models that emit `<think>` blocks need `--reasoning-parser <key>` at l
 | `deepseek-r1` | ✓ (`<think>...</think>`) | — | [DeepSeek-R1](./DeepSeek/DeepSeek-R1.md), Ling 2.6 reasoning variants (use as `<think>` parser) |
 | `qwen3` | ✓ (`<think>...</think>` + `enable_thinking` switch) | — | [Qwen3](./Qwen/Qwen3.md), [Qwen3-MoE](./Qwen/Qwen3-MoE.md) |
 | `qwen25` | — | ✓ | Qwen3 / Qwen3-MoE tool-calling |
-| `qwen3_coder` | — | ✓ | Qwen3-Coder variants |
+| `qwen3_coder` | — | ✓ | Qwen3-Coder variants, [Qwen3.8](./Qwen/Qwen3.8.md) |
 | `mimo` | ✓ (alias of `qwen3` parser) | ✓ | [MiMo-V2-Flash](./Xiaomi/MiMo-V2-Flash.md), [MiMo-V2.5-Pro](./Xiaomi/MiMo-V2.5-Pro.md), [MiMo-7B](./Xiaomi/MiMo-7B.md) |
 | `glm45` | ✓ (`<think>...</think>`) | ✓ | [GLM-4.5 / 4.5-Air](./GLM/GLM-4.5.md) |
 | `kimi` | ✓ (`◁think▷...◁/think▷`) | — | Reserved for Kimi reasoning variants; Kimi-Linear-Instruct is not reasoning |
