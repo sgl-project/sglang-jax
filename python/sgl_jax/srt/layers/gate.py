@@ -73,7 +73,9 @@ class GateLogit(nnx.Module):
             jax.random.normal(
                 jax.random.PRNGKey(0),
                 (input_size, num_experts),
-                dtype=jnp.float32,
+                # checkpoint-native BF16; upcast at use keeps HIGHEST-dot bits
+                # identical to f32 storage while halving the per-step read.
+                dtype=jnp.bfloat16,
                 out_sharding=P(None, None),
             ),
         )
@@ -91,7 +93,11 @@ class GateLogit(nnx.Module):
 
     @named_scope
     def __call__(self, hidden_states: jax.Array) -> tuple[jax.Array, jax.Array | None]:
-        logits = jnp.dot(hidden_states, self.kernel.value, precision=jax.lax.Precision.HIGHEST)
+        logits = jnp.dot(
+            hidden_states,
+            self.kernel.value.astype(jnp.float32),
+            precision=jax.lax.Precision.HIGHEST,
+        )
 
         if self.score_func:
             if self.score_func == "softmax":
