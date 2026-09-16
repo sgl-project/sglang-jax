@@ -350,8 +350,20 @@ class CompilationManager:
             for tokens in self.token_buckets:
                 yield self.max_padded_batch_size, tokens, self.cache_loc_buckets[-1]
         elif mode.is_decode():
+            from sgl_jax.srt.managers.schedule_batch import _decode_kv_ladder_steps
+
+            # Each bs bucket compiles at its max-capacity cache_loc padding, plus
+            # one shape per enabled decode KV ladder step (opt-in via
+            # SGLANG_JAX_DECODE_KV_LADDER, see _decode_kv_ladder_steps in
+            # schedule_batch.py): cache_loc length is part of the jit cache key,
+            # so the ladder shapes must be part of the precompile set.
+            ladder_steps = _decode_kv_ladder_steps(self.page_size)
             for bs, cache_loc in zip(self.bs_buckets, self.cache_loc_buckets):
                 yield bs, bs, cache_loc
+                for step in ladder_steps:
+                    ladder_size = bs * step
+                    if ladder_size < cache_loc:
+                        yield bs, bs, ladder_size
         else:
             raise ValueError(f"No serving precompile shapes for {mode}")
 
