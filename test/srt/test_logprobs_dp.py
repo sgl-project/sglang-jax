@@ -16,7 +16,6 @@ DP_REGRESSION_ENGINE_CONFIG = {
     "skip_server_warmup": True,
     "mem_fraction_static": 0.8,
     "disable_overlap_schedule": True,
-    "use_sort_for_toppk_minp": True,
     "log_level": "info",
     "tp_size": 4,
     "dp_size": 2,
