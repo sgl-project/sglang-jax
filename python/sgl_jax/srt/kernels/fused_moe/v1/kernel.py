@@ -14,6 +14,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sgl_jax.srt.kernels.fused_moe.token_padding import align_fused_moe_v1_num_tokens
+
 P = jax.sharding.PartitionSpec
 
 cdiv = pl.cdiv
@@ -3019,6 +3021,7 @@ def _validate_fused_ep_moe_args(
     b2: jax.Array | None,
     b3: jax.Array | None,
     block_config: FusedMoEBlockConfig,
+    launch_num_tokens: int,
     dp_axis_name: str,
     tp_axis_name: str,
 ) -> None:
@@ -3026,8 +3029,15 @@ def _validate_fused_ep_moe_args(
         raise NotImplementedError("Only 2D mesh is supported.")
 
     ep_size = get_ep_size(mesh, dp_axis_name, tp_axis_name)
-    num_tokens, hidden_size = tokens.shape
+    logical_num_tokens, hidden_size = tokens.shape
     num_experts, intermediate_size, _ = w2.shape
+    if logical_num_tokens % ep_size != 0:
+        raise ValueError(f"Expected {logical_num_tokens=} to be aligned to {ep_size=}.")
+    if launch_num_tokens < logical_num_tokens or launch_num_tokens % ep_size != 0:
+        raise ValueError(
+            "Expected launch_num_tokens to cover the logical token extent and be "
+            f"aligned to ep_size, got {logical_num_tokens=}, {launch_num_tokens=}, {ep_size=}."
+        )
 
     if w1.shape != (num_experts, hidden_size, intermediate_size):
         raise ValueError(
@@ -3044,14 +3054,14 @@ def _validate_fused_ep_moe_args(
             f"Expected {w3.shape=} to be {(num_experts, hidden_size, intermediate_size)}."
         )
 
-    if topk_weights.shape != (num_tokens, top_k):
-        raise ValueError(f"Expected {topk_weights.shape=} to be {(num_tokens, top_k)}.")
+    if topk_weights.shape != (logical_num_tokens, top_k):
+        raise ValueError(f"Expected {topk_weights.shape=} to be {(logical_num_tokens, top_k)}.")
 
-    if topk_ids.shape != (num_tokens, top_k):
-        raise ValueError(f"Expected {topk_ids.shape=} to be {(num_tokens, top_k)}.")
+    if topk_ids.shape != (logical_num_tokens, top_k):
+        raise ValueError(f"Expected {topk_ids.shape=} to be {(logical_num_tokens, top_k)}.")
 
     validate_fused_moe_block_config(
-        num_tokens=num_tokens,
+        num_tokens=launch_num_tokens,
         num_experts=num_experts,
         top_k=top_k,
         hidden_size=hidden_size,
@@ -3064,7 +3074,7 @@ def _validate_fused_ep_moe_args(
 
     # Mosaic DMA tiling constraint for `start_fetch_topk`: the slice shape along the
     # token dimension must be aligned to the underlying HBM tiling of topk weights/ids.
-    local_num_tokens = num_tokens // ep_size
+    local_num_tokens = launch_num_tokens // ep_size
     topk_bits = jnp.dtype(topk_weights.dtype).itemsize * 8
     topk_tile0 = math.gcd(256 // topk_bits, local_num_tokens)
     if block_config.bt % topk_tile0 != 0:
@@ -3358,13 +3368,25 @@ def fused_ep_moe(
                 "disable_sync_barrier is only supported with disable_a2a=True or ep_size=1."
             )
 
+    logical_num_tokens, hidden_size = tokens.shape
+    t_packing = get_dtype_packing(tokens.dtype)
+    launch_num_tokens = align_fused_moe_v1_num_tokens(
+        logical_num_tokens,
+        ep_size,
+        t_packing,
+    )
+    # Keep the scheduler-visible/global shape unchanged. Only device-local
+    # shards are padded inside shard_map for v1 launch legality.
+    orig_local_num_tokens = logical_num_tokens // ep_size
+    local_num_tokens = launch_num_tokens // ep_size
+    pad_local = local_num_tokens - orig_local_num_tokens
+
     num_experts, intermediate_size, _ = w2.shape
     if block_config is None:
         from .tuned_block_configs import get_tuned_fused_moe_block_config
 
-        num_tokens, hidden_size = tokens.shape
         block_config = get_tuned_fused_moe_block_config(
-            num_tokens=num_tokens,
+            num_tokens=launch_num_tokens,
             num_experts=num_experts,
             top_k=top_k,
             hidden_size=hidden_size,
@@ -3376,7 +3398,7 @@ def fused_ep_moe(
             use_grouped_topk=use_grouped_topk,
         )
     block_config = block_config.effective_for(
-        num_tokens=tokens.shape[0],
+        num_tokens=launch_num_tokens,
         ep_size=ep_size,
         dtype=tokens.dtype,
         quant_block_k=quant_block_k,
@@ -3405,17 +3427,16 @@ def fused_ep_moe(
         b2=b2,
         b3=b3,
         block_config=block_config,
+        launch_num_tokens=launch_num_tokens,
         dp_axis_name=dp_axis_name,
         tp_axis_name=tp_axis_name,
     )
 
     num_devices = ep_size
 
-    num_tokens, hidden_size = tokens.shape
     local_num_experts = num_experts // ep_size
     se_inter_size = w2_shared.shape[0] if w2_shared is not None else 0
 
-    local_num_tokens = num_tokens // ep_size
     bt = block_config.bt
     if bt <= 0:
         raise ValueError(f"Expected {bt=} to be > 0.")
@@ -3757,6 +3778,20 @@ def fused_ep_moe(
         w3_shared_scale=None,
         w2_shared_scale=None,
     ):
+        if pad_local > 0:
+            tokens = jnp.pad(tokens, ((0, pad_local), (0, 0), (0, 0)))
+            topk_weights = jnp.pad(
+                topk_weights,
+                ((0, pad_local), (0, 0)),
+                constant_values=0.0,
+            )
+            topk_ids = jnp.pad(
+                topk_ids,
+                ((0, pad_local), (0, 0)),
+                mode="constant",
+                constant_values=-1,
+            )
+
         if needs_jax_allreduce:
             metadata_starts, metadata_sizes, metadata_d2e_counts = jax_allreduce_metadata_by_bt(
                 topk_ids[:, :top_k],
@@ -3841,6 +3876,8 @@ def fused_ep_moe(
             metadata_sizes_arg,
             metadata_d2e_counts_arg,
         )
+        if pad_local > 0:
+            local_output = local_output[:orig_local_num_tokens]
         return local_output
 
     a2a_s_x2_hbm_scratch = pl.empty(
