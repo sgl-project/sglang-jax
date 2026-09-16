@@ -188,6 +188,15 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         # Full mnt bucket coverage pending a tuner sweep.
         ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 1): (16, 1, 2),
         ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 8): (16, 1, 2),
+        # decode mnt 16-128 tuned 2026-09-16 on v7x (2x2x1 and 2x2x2 hosts) via
+        # get_block_spec_config_mla.py at kv_len 2048 AND 8192 (minimax pick:
+        # (16,1,2) wins kv=2048 by ~44% and trails the kv=8192 winner by <2.5%).
+        # vs heuristic (3,1,4): mnt16 +20.0%/+19.2%, mnt32 +21.8%/+20.4%,
+        # mnt64 +23.5%, mnt128 +24.4% (kv2048/kv8192; two independent sweeps).
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 16): (16, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 32): (16, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 64): (16, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 128): (16, 1, 4),
         ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 1): (16, 64),
         ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 2): (16, 64),
         ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 4): (16, 64),
@@ -195,11 +204,19 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 16): (16, 64),
         ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 32): (16, 64),
         ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 64): (16, 64),
-        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 128): (16, 64),
-        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 256): (16, 128),
-        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 512): (16, 128),
-        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 1024): (16, 128),
-        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 2048): (16, 128),
+        # mixed mnt 128-2048 tuned 2026-09-16 (get_block_spec_config_mla.py,
+        # kv_len=2048, two independent v7x sweeps). 16-row blocks only
+        # (bkv_p>=16): 8-row winners are within 2.4% but 8-row blocks have a
+        # Mosaic window-setup failure history at mnt>=256 on this 4-head
+        # family (see #1546 note above). mnt128 (16,128) is -22% vs the old
+        # (16,64); (16,256) beats the old (16,128) entries by -19%/-29%/-36%/
+        # -42% at mnt 256/512/1024/2048. mnt4096 keeps the previously
+        # validated (16,128) pending a sweep at that size.
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 128): (16, 128),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 256): (16, 256),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 512): (16, 256),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 1024): (16, 256),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 2048): (16, 256),
         ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 4096): (16, 128),
         # ===== GLM-5.1 (TP=32) configurations on TPU v7 =====
         # Decode & Mixed tuned for q_head_num=2 (TP=32 sharding)
