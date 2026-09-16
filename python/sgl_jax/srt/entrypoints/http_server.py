@@ -127,10 +127,7 @@ async def lifespan(fast_api_app: FastAPI):
     warmup_thread = getattr(fast_api_app, "warmup_thread", None)
     if warmup_thread is not None:
         warmup_thread.start()
-    try:
-        yield
-    finally:
-        _global_state.tokenizer_manager.shutdown()
+    yield
 
 
 # Fast API

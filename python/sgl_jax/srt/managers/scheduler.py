@@ -12,7 +12,6 @@ import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Iterable
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -30,10 +29,20 @@ from sgl_jax.srt.constrained.base_grammar_backend import (
     create_grammar_backend,
 )
 from sgl_jax.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
+from sgl_jax.srt.disaggregation.encoder.embedding_data import (
+    release_received_embeddings,
+)
+from sgl_jax.srt.disaggregation.encoder.scheduler_mixin import (
+    SchedulerDisaggregationEncoderMixin,
+)
 from sgl_jax.srt.disaggregation.pathways_scheduler import PathwaysPDSchedulerMixin
 from sgl_jax.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sgl_jax.srt.disaggregation.runtime import install_disaggregation_wiring
-from sgl_jax.srt.hf_transformers_utils import get_tokenizer
+from sgl_jax.srt.hf_transformers_utils import (
+    get_processor,
+    get_tokenizer,
+    get_tokenizer_from_processor,
+)
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.managers.communication import CommunicationBackend
 from sgl_jax.srt.managers.dp_load import DpLoadSnapshot, DpRouter
@@ -89,6 +98,10 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     recurrent_admission_blocked,
 )
+from sgl_jax.srt.multimodal.manager.multimodal_processor import (
+    get_mm_processor,
+    import_processors,
+)
 from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.server_args import (
@@ -119,27 +132,13 @@ from sgl_jax.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
+
 # Test retract decode for debugging purposes
 TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
 TEST_RETRACT_INTERVAL = int(os.environ.get("SGLANG_TEST_RETRACT_INTERVAL", "3"))
 TEST_RETRACT_NO_PREFILL_BS = int(os.environ.get("SGLANG_TEST_RETRACT_NO_PREFILL_BS", str(2**31)))
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
-
-
-def _clear_embedding_pools(
-    workers: Iterable[ModelWorker | ModelWorkerClient | None],
-) -> None:
-    seen: set[int] = set()
-    for worker in workers:
-        if worker is None:
-            continue
-        runner = worker.get_model_runner()
-        if id(runner) in seen:
-            continue
-        seen.add(id(runner))
-        if getattr(runner, "embedding_pool", None) is not None:
-            runner.embedding_pool.clear()
 
 
 class SyncError(Exception):
@@ -206,6 +205,7 @@ class Scheduler(
     SchedulerOutputProcessorMixin,
     SchedulerProfilerMixin,
     SchedulerMetricsMixin,
+    SchedulerDisaggregationEncoderMixin,
     SchedulerDisaggregationPrefillMixin,
     SchedulerDisaggregationDecodeMixin,
     PathwaysPDSchedulerMixin,
@@ -596,6 +596,8 @@ class Scheduler(
             ]
         )
 
+        self.init_encoder_disaggregation()
+
         if not server_args.disable_precompile and not self.pd:
             if self.spec_algorithm is None or self.spec_algorithm.is_none():
                 logger.info("[Scheduler] Begins to run worker precompile.")
@@ -726,8 +728,27 @@ class Scheduler(
         apply_multimodal_model_defaults(server_args, self.model_config)
         self.model_config.hf_config.vision_encoder_parallel = server_args.vision_encoder_parallel
         self.is_generation = self.model_config.is_generation
+        self.processor = None
+        self._mm_processor = None
         if server_args.skip_tokenizer_init:
-            self.tokenizer = self.processor = None
+            self.tokenizer = None
+        elif self.model_config.is_multimodal and server_args.language_only:
+            tokenizer_path = server_args.tokenizer_path
+            tokenizer_subdir = resolve_tokenizer_subdir(server_args.model_path, tokenizer_path)
+            if tokenizer_subdir:
+                tokenizer_path = os.path.join(tokenizer_path, tokenizer_subdir)
+            self.processor = get_processor(
+                tokenizer_path,
+                tokenizer_mode=server_args.tokenizer_mode,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+                use_fast=True,
+            )
+            self.tokenizer = get_tokenizer_from_processor(self.processor)
+            import_processors("sgl_jax.srt.multimodal.processors")
+            self._mm_processor = get_mm_processor(
+                self.model_config.hf_config, server_args, self.processor
+            )
         else:
             tokenizer_subdir = ""
             if server_args.multimodal:
@@ -920,7 +941,7 @@ class Scheduler(
                     yield req.dp_rank, req
 
     def _collect_dp_load(self) -> DpLoadSnapshot:
-        return DpLoadSnapshot.collect(
+        snapshot = DpLoadSnapshot.collect(
             self.dp_size,
             self._iter_dp_requests(),
             self._estimate_req_input_output_tokens,
@@ -929,6 +950,21 @@ class Scheduler(
                 for info in self.running_batch.reqs_info
             ),
         )
+
+        # Encoder waiters are tokenized inputs, not scheduled Req objects;
+        # they have no finished() state and cannot enter DpLoadSnapshot.collect.
+        counts = list(snapshot.request_counts)
+        inputs = list(snapshot.input_tokens)
+        outputs = list(snapshot.output_tokens)
+        for pending in self.encoder_waiting.values():
+            req = pending.recv_req
+            rank = req.dp_rank
+            if rank is not None:
+                in_tokens, out_tokens = self._estimate_req_input_output_tokens(req)
+                counts[rank] += 1
+                inputs[rank] += in_tokens
+                outputs[rank] += out_tokens
+        return DpLoadSnapshot(tuple(counts), tuple(inputs), tuple(outputs), snapshot.request_limits)
 
     def select_dp_for_request(self, recv_reqs: list[Req]) -> list[Req]:
         """Route against one snapshot; retry unassigned requests when ranks are full."""
@@ -1005,6 +1041,7 @@ class Scheduler(
                 if self._comm_backend is not None:
                     self._comm_backend.wait_for_new_requests(0.001)
 
+            self._admit_completed_encoder_requests()
             self.last_batch = batch
 
     def event_loop_overlap(self):
@@ -1080,6 +1117,11 @@ class Scheduler(
                     )
                     with jax.profiler.TraceAnnotation("process_batch_result"):
                         self.process_batch_result(tmp_batch, None, batch.launch_done)
+
+            # The accelerator is already running the selected batch. Admit any
+            # newly ready encoder results while that work is in flight so the
+            # next scheduler iteration can consume them immediately.
+            self._admit_completed_encoder_requests()
 
             if self.last_batch:
                 # Process the results of the last batch
@@ -1179,6 +1221,9 @@ class Scheduler(
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: list):
+        if self.encoder_client is not None:
+            recv_reqs = self.process_encoder_requests(recv_reqs)
+
         for recv_req in recv_reqs:
             output = self._request_dispatcher(recv_req)
             if output is not None:
@@ -1186,6 +1231,11 @@ class Scheduler(
                     self._comm_backend.send_pyobj(output)
                 else:
                     self.send_to_tokenizer.send_pyobj(output)
+
+    def _admit_completed_encoder_requests(self) -> None:
+        client = self.encoder_client
+        if client is not None and client.has_completed():
+            self.process_input_requests([])
 
     def handle_generate_request(
         self,
@@ -1575,6 +1625,17 @@ class Scheduler(
         self.check_tree_cache()
         self.new_token_ratio = self.init_new_token_ratio
 
+    def _clear_embedding_cache(self) -> None:
+        """Clear each worker's local embedding cache once, including shared pools."""
+        seen: set[int] = set()
+        for worker in (self.tp_worker, self.tp_worker_p, *getattr(self, "tp_workers_p", ())):
+            if worker is None:
+                continue
+            pool = worker.get_embedding_pool()
+            if pool is not None and id(pool) not in seen:
+                seen.add(id(pool))
+                pool.clear()
+
     def flush_cache(self) -> tuple[bool, str, int]:
         can_flush, message = self._can_flush_cache()
         if not can_flush:
@@ -1611,9 +1672,7 @@ class Scheduler(
             self.token_to_kv_pool_allocator.clear()
         if self.grammar_backend is not None:
             self.grammar_backend.reset()
-        _clear_embedding_pools(
-            (self.tp_worker, self.tp_worker_p, *getattr(self, "tp_workers_p", ()))
-        )
+        self._clear_embedding_cache()
 
         self.num_generated_tokens = 0
         self.forward_ct_decode = 0
@@ -1739,7 +1798,7 @@ class Scheduler(
                 protected = self.tree_cache.protected_size(dp_rank=dp)
                 if avail + evict + protected != size_per_rank:
                     leak_msgs.append(
-                        f"[dp={dp}] expected={size_per_rank}, " f"{avail=}, {evict=}, {protected=}"
+                        f"[dp={dp}] expected={size_per_rank}, {avail=}, {evict=}, {protected=}"
                     )
             if leak_msgs:
                 raise ValueError(
@@ -2398,7 +2457,7 @@ class Scheduler(
                 )
             else:
                 logger.info(
-                    "Testing retraction." " #retracted_reqs: %d, #aborted_reqs: %d",
+                    "Testing retraction. #retracted_reqs: %d, #aborted_reqs: %d",
                     num_retracted_reqs,
                     len(reqs_to_abort),
                 )
@@ -2480,7 +2539,6 @@ class Scheduler(
                 with jax.profiler.TraceAnnotation(
                     f"forward_batch_generation_overlap {self.forward_ct}"
                 ):
-
                     logits_output, next_token_ids, cache_miss_count = (
                         self.tp_worker.forward_batch_generation(
                             model_worker_batch, sampling_metadata=None
@@ -2746,6 +2804,7 @@ class Scheduler(
         self.parent_process.send_signal(signal.SIGQUIT)
 
     def abort_request(self, recv_req: AbortReq):
+        self._cancel_encoder_requests(recv_req)
         self._sync_chunked_req_owners()
         self._mark_pending_chunked_aborts(recv_req)
 
@@ -2761,6 +2820,7 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            release_received_embeddings(req.mm_inputs)
             abort_out = AbortReq(rid=req.rid)
             if self._comm_backend is not None:
                 self._comm_backend.send_pyobj(abort_out)
@@ -2775,6 +2835,7 @@ class Scheduler(
                 if req.grammar:
                     req.grammar.cancel()
                 req.set_finish_with_abort("Aborted by AbortReq.")
+                release_received_embeddings(req.mm_inputs)
 
         # Delete requests in the running batch
         reqs = []

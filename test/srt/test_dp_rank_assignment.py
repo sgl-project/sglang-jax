@@ -142,6 +142,7 @@ def test_chunk_alias_and_parked_chunk_have_same_snapshot():
     scheduler.last_batch = batch([req], req, True)
     scheduler.chunked_reqs = [req, None]
     scheduler.waiting_queue = scheduler.grammar_queue = []
+    scheduler.encoder_waiting = {}
     scheduler._estimate_req_input_output_tokens = lambda req: (3, 8)
     expected = DpLoadSnapshot((1, 0), (3, 0), (8, 0), (256, 256))
     assert scheduler._collect_dp_load() == expected
@@ -149,6 +150,8 @@ def test_chunk_alias_and_parked_chunk_have_same_snapshot():
     assert scheduler._collect_dp_load() == expected
     req.finished = lambda: True
     assert scheduler._collect_dp_load().request_counts == (0, 0)
+    scheduler.encoder_waiting = {"encoder": SimpleNamespace(recv_req=SimpleNamespace(dp_rank=1))}
+    assert scheduler._collect_dp_load() == DpLoadSnapshot((0, 1), (0, 3), (0, 8), (256, 256))
 
 
 @pytest.mark.parametrize(
@@ -243,6 +246,7 @@ def test_scheduler_snapshots_full_flag_and_request_cap():
         reqs_info=[SimpleNamespace(batch_is_full=True), SimpleNamespace(batch_is_full=False)]
     )
     scheduler._iter_dp_requests = lambda: iter(())
+    scheduler.encoder_waiting = {}
     scheduler._estimate_req_input_output_tokens = Mock()
     assert scheduler._collect_dp_load().request_limits == (0, 8)
     scheduler.running_batch.reqs_info[0].batch_is_full = False

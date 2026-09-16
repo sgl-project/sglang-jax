@@ -71,7 +71,7 @@ def replicate_across_mesh(array: ArrayLike, mesh: Mesh) -> jax.Array:
     # even when it was requested with ``P()``.  Compare the effective layout
     # instead of the syntactic PartitionSpec so an already-replicated encoder
     # result does not compile an identity reshard on the first real request.
-    if array.sharding.is_fully_replicated:
+    if array.sharding.is_fully_replicated and array.sharding.device_set == spec.device_set:
         return array
     return _replicate_fn(mesh, array.ndim)(array)
 

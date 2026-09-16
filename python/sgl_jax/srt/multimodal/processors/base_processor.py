@@ -13,6 +13,7 @@ import requests
 from PIL import Image
 
 from sgl_jax.srt.multimodal.common.modality_enum import MultimodalInputs
+from sgl_jax.srt.multimodal.processors.encoder import DisaggregatedInputMixin
 from sgl_jax.srt.multimodal.processors.executor import MultimodalProcessorExecutor
 
 if TYPE_CHECKING:
@@ -66,7 +67,7 @@ def _normalize_image_source(source) -> bytes | str:
     return pybase64.b64decode(source, validate=True)
 
 
-class BaseMultimodalProcessor(ABC):
+class BaseMultimodalProcessor(DisaggregatedInputMixin, ABC):
     models: tuple[str, ...] = ()
     auto_mm_processor_worker_num = 1
     supports_mm_processor_concurrency = False
@@ -114,6 +115,29 @@ class BaseMultimodalProcessor(ABC):
     ) -> MultimodalInputs:
         """Process multimodal payload and return a ``MultimodalInputs``."""
         pass
+
+    async def process_encoder_mm_data_async(
+        self,
+        image_data,
+        input_text,
+        request_obj,
+        **kwargs,
+    ) -> MultimodalInputs:
+        """Encode images without constructing unused language-model inputs."""
+        if image_data is not None and not (
+            self.normalize_data(getattr(request_obj, "video_data", None))
+            or self.normalize_data(getattr(request_obj, "audio_data", None))
+        ):
+            return await self.mm_processor_executor.run(
+                self.process_encoder_images, self.normalize_data(image_data)
+            )
+        return await self.process_mm_data_async(
+            image_data=image_data,
+            input_text=input_text,
+            request_obj=request_obj,
+            **kwargs,
+        )
+
 
     @staticmethod
     def normalize_data(data) -> list:

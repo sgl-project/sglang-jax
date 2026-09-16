@@ -113,6 +113,8 @@ class ModelConfig:
         moe_dp_size: int = 1,
         model_sub_dir: str | None = None,
         hf_config: PretrainedConfig | None = None,
+        encoder_only: bool = False,
+        language_only: bool = False,
     ) -> None:
         self.model_path = model_path
         self.model_sub_dir = model_sub_dir
@@ -149,6 +151,12 @@ class ModelConfig:
             apply_model_config_overrides(self.hf_config, self.model_override_args)
             if multimodal and self.model_sub_dir:
                 self.model_path = os.path.join(self.model_path, self.model_sub_dir)
+
+        # Encoder disaggregation is a runtime deployment mode rather than
+        # checkpoint metadata. Carry it on the HF config because model classes
+        # receive that config when deciding which submodules to construct.
+        self.hf_config.encoder_only = encoder_only
+        self.hf_config.language_only = language_only
 
         if not getattr(self.hf_config, "architectures", None):
             raise ValueError(
@@ -621,6 +629,8 @@ class ModelConfig:
             moe_backend=server_args.moe_backend,
             moe_dp_size=server_args.moe_dp_size,
             model_sub_dir=model_sub_dir,
+            encoder_only=server_args.encoder_only,
+            language_only=server_args.language_only,
             **kwargs,
         )
 
