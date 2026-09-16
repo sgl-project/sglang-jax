@@ -250,6 +250,7 @@ class ServerArgs:
     speculative_num_steps: int = 4
     speculative_eagle_topk: int = 5
     speculative_num_draft_tokens: int = 4
+    speculative_sample_from_anchor: bool = False
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
 
@@ -278,7 +279,6 @@ class ServerArgs:
     # Multimodal
     multimodal: bool = False
     limit_mm_data_per_request: dict[str, int] | None = None
-    mm_io_worker_num: int = 0
     mm_processor_worker_num: int = 0
 
     enable_return_routed_experts: bool = False
@@ -564,8 +564,6 @@ class ServerArgs:
             self.model_path = download_from_hf(self.model_path, allow_patterns=None)
             if self.limit_mm_data_per_request is None:
                 self.limit_mm_data_per_request = {"image": 16}
-        if self.mm_io_worker_num < 0:
-            raise ValueError("--mm-io-worker-num must be non-negative")
         if self.mm_processor_worker_num < 0:
             raise ValueError("--mm-processor-worker-num must be non-negative")
 
@@ -1527,6 +1525,7 @@ class ServerArgs:
                 "fa",
                 "fa_mha",
                 "dsa_sparse",
+                "tt",
             ],
             default=ServerArgs.attention_backend,
             help=(
@@ -1536,7 +1535,8 @@ class ServerArgs:
                 "(decompress latent KV per-forward via kv_b_proj; ~70x more KV cache than 'fa', "
                 "intended for kernel A/B on short contexts). "
                 "'dsa_sparse' = DeepSeek Sparse Attention (lightning-indexer top-k + sparse MLA) "
-                "with IndexShare cross-layer reuse; MLA models with index_* config only."
+                "with IndexShare cross-layer reuse; MLA models with index_* config only. "
+                "'tt' = TTNN prefill and paged decode."
             ),
         )
         parser.add_argument(
@@ -1597,7 +1597,15 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "FROZEN_KV_MTP", "STANDALONE", "DFLASH"],
+            choices=[
+                "EAGLE",
+                "EAGLE3",
+                "NEXTN",
+                "FROZEN_KV_MTP",
+                "STANDALONE",
+                "DFLASH",
+                "DSPARK",
+            ],
             help="Speculative algorithm.",
             default=ServerArgs.speculative_algorithm,
         )
@@ -1633,6 +1641,14 @@ class ServerArgs:
             type=int,
             help="The number of tokens sampled from the draft model in Speculative Decoding.",
             default=ServerArgs.speculative_num_draft_tokens,
+        )
+        parser.add_argument(
+            "--speculative-sample-from-anchor",
+            action="store_true",
+            help="Sample draft candidates starting at the anchor output position "
+            "(DFLASH or DSPARK). "
+            "Draft query length is --speculative-num-draft-tokens minus one; "
+            "the latter remains the target verify length including the seed.",
         )
         parser.add_argument(
             "--speculative-accept-threshold-single",
@@ -1680,12 +1696,6 @@ class ServerArgs:
             type=json.loads,
             default=ServerArgs.limit_mm_data_per_request,
             help="JSON object that limits the number of multimodal items per request, e.g. '{\"image\": 16}'.",
-        )
-        parser.add_argument(
-            "--mm-io-worker-num",
-            type=int,
-            default=ServerArgs.mm_io_worker_num,
-            help="Number of multimodal data loading workers. 0 uses the model default.",
         )
         parser.add_argument(
             "--mm-processor-worker-num",
@@ -2118,17 +2128,27 @@ class ServerArgs:
                 and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
                 and self.attention_backend == "fa"
             )
-            supports_dflash_overlap = self.speculative_algorithm == "DFLASH"
+            supports_dflash_overlap = self.speculative_algorithm in ("DFLASH", "DSPARK")
             if not (supports_nextn_overlap or supports_eagle3_overlap or supports_dflash_overlap):
                 raise ValueError(
-                    "Speculative overlap scheduler only supports DFLASH, EAGLE3+FA, "
+                    "Speculative overlap scheduler only supports DFLASH/DSPARK, EAGLE3+FA, "
                     "or NEXTN with --speculative-eagle-topk=1 and "
                     "--speculative-num-draft-tokens == --speculative-num-steps + 1. "
                     "Please pass --disable-overlap-schedule for other speculative configs."
                 )
 
+        if self.speculative_algorithm == "DSPARK":
+            self.speculative_sample_from_anchor = True
+        if self.speculative_sample_from_anchor and self.speculative_algorithm not in (
+            "DFLASH",
+            "DSPARK",
+        ):
+            raise ValueError(
+                "--speculative-sample-from-anchor requires --speculative-algorithm DFLASH or DSPARK."
+            )
+
         # DFLASH: non-causal one-shot diffusion draft + linear-chain greedy verify.
-        if self.speculative_algorithm == "DFLASH":
+        if self.speculative_algorithm in ("DFLASH", "DSPARK"):
             if self.tp_size < 1:
                 raise ValueError("DFLASH requires --tp-size>=1.")
             if self.speculative_eagle_topk != 1:
@@ -2160,14 +2180,17 @@ class ServerArgs:
                     revision=self.speculative_draft_model_revision,
                     trust_remote_code=self.trust_remote_code,
                 )
-                if draft_config.block_size != self.speculative_num_draft_tokens:
+                verify_tokens = draft_config.block_size + int(self.speculative_sample_from_anchor)
+                if verify_tokens != self.speculative_num_draft_tokens:
                     logger.info(
-                        "DFLASH: using draft config block_size=%d for "
+                        "DFLASH: using inferred verify length=%d for "
                         "--speculative-num-draft-tokens (default was %d).",
-                        draft_config.block_size,
+                        verify_tokens,
                         self.speculative_num_draft_tokens,
                     )
-                    self.speculative_num_draft_tokens = draft_config.block_size
+                    self.speculative_num_draft_tokens = verify_tokens
+            if self.speculative_num_draft_tokens < 2:
+                raise ValueError("DFLASH requires at least two verify tokens (seed + candidate).")
             if self.enable_lora or self.enable_static_lora or self.lora_paths:
                 raise ValueError("DFLASH does not support LoRA.")
             if self.grammar_backend not in (None, "none"):

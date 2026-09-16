@@ -16,7 +16,6 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.constrained.bitmask_ops import allocate_token_bitmask
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.layers.routed_experts_capturer import get_global_experts_capturer
 from sgl_jax.srt.managers.schedule_batch import (
@@ -277,13 +276,14 @@ class ModelWorker:
             page_size=self.page_size,
             max_req_len=self.max_req_len,
             vocab_size=self.model_config.vocab_size,
-            # cache_loc bucket cap under Pathways proxy backend (PD or colocated
-            # alike -- both do H2D over gRPC where the smaller bucket helps). On
-            # native TPU the smaller/odd bucket shape yields a slower Pallas
-            # ragged-attention kernel and native H2D is fast enough that the
-            # uncapped bucket is not on the critical path.
+            # Cap cache_loc buckets for Pathways proxy, where it reduces H2D,
+            # and TT, whose paged kernels require the page-table width not to
+            # exceed the physical KV-cache page count. Native TPU keeps its
+            # uncapped buckets because odd shapes slow the Pallas kernel.
             max_total_num_tokens=(
-                self.max_total_num_tokens if os.getenv("JAX_PLATFORMS") == "proxy" else 0
+                self.max_total_num_tokens
+                if os.getenv("JAX_PLATFORMS") == "proxy" or server_args.attention_backend == "tt"
+                else 0
             ),
             # Multimodal models use the regular in-model path by default.
             # --multimodal selects the standalone multistage pipeline instead.
@@ -447,14 +447,9 @@ class ModelWorker:
                 batch.sampling_info.sampling_info_done.wait()
             else:
                 batch.sampling_info.update_grammar_vocab_mask()
-        if batch.sampling_info.vocab_mask is None:
-            sampling_metadata.apply_vocab_mask = False
-            sampling_metadata.vocab_mask = allocate_token_bitmask(
-                len(batch.sampling_info.temperatures), batch.sampling_info.vocab_size
-            )
-        else:
-            sampling_metadata.apply_vocab_mask = True
-            sampling_metadata.vocab_mask = batch.sampling_info.vocab_mask
+        sampling_metadata.update_vocab_mask(
+            batch.sampling_info.vocab_mask, self.mesh, self.model_config.vocab_size
+        )
 
     def _pd_fuse_for_batch(self, model_worker_batch: ModelWorkerBatch) -> bool:
         """Batch-level fused-sample eligibility. The single source of truth

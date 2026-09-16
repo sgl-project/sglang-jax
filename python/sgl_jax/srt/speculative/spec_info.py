@@ -63,6 +63,7 @@ class SpeculativeAlgorithm(IntEnum):
     FROZEN_KV_MTP = auto()
     STANDALONE = auto()
     DFLASH = auto()
+    DSPARK = auto()
 
     def is_none(self):
         return self == SpeculativeAlgorithm.NONE
@@ -96,6 +97,12 @@ class SpeculativeAlgorithm(IntEnum):
     def is_dflash(self):
         return self == SpeculativeAlgorithm.DFLASH
 
+    def is_dspark(self):
+        return self == SpeculativeAlgorithm.DSPARK
+
+    def is_dflash_family(self):
+        return self.is_dflash() or self.is_dspark()
+
     @staticmethod
     def from_string(name: str):
         name_map = {
@@ -105,6 +112,7 @@ class SpeculativeAlgorithm(IntEnum):
             "FROZEN_KV_MTP": SpeculativeAlgorithm.FROZEN_KV_MTP,
             "STANDALONE": SpeculativeAlgorithm.STANDALONE,
             "DFLASH": SpeculativeAlgorithm.DFLASH,
+            "DSPARK": SpeculativeAlgorithm.DSPARK,
             None: SpeculativeAlgorithm.NONE,
         }
         if name is not None:

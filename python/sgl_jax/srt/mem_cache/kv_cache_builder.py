@@ -5,7 +5,11 @@ from typing import TYPE_CHECKING
 
 from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sgl_jax.srt.mem_cache.cache_init_params import CacheInitParams
-from sgl_jax.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
+from sgl_jax.srt.mem_cache.registry import (
+    TreeCacheBuildContext,
+    create_tree_cache,
+    validate_unified_hybrid_swa_route,
+)
 
 if TYPE_CHECKING:
     from jax.sharding import Mesh
@@ -43,18 +47,19 @@ def build_kv_cache(
         recurrent_track_interval=server_args.recurrent_track_interval,
     )
 
-    cache = create_tree_cache(
-        TreeCacheBuildContext(
-            server_args=server_args,
-            params=params,
-            is_hybrid_swa=is_hybrid,
-            is_hybrid_recurrent=is_hybrid_recurrent,
-            disable_radix_cache=server_args.disable_radix_cache,
-            effective_chunked_prefill_size=server_args.chunked_prefill_size,
-            model_config=model_config,
-            tp_size=tp_size,
-        )
+    ctx = TreeCacheBuildContext(
+        server_args=server_args,
+        params=params,
+        is_hybrid_swa=is_hybrid,
+        is_hybrid_recurrent=is_hybrid_recurrent,
+        disable_radix_cache=server_args.disable_radix_cache,
+        effective_chunked_prefill_size=server_args.chunked_prefill_size,
+        model_config=model_config,
+        tp_size=tp_size,
+        has_speculative=(spec_algorithm is not None and not spec_algorithm.is_none()),
     )
+    validate_unified_hybrid_swa_route(ctx)
+    cache = create_tree_cache(ctx)
 
     if server_args.hicache_storage != "disable":
         init_hicache(cache, server_args, mesh, token_to_kv_pool_allocator)

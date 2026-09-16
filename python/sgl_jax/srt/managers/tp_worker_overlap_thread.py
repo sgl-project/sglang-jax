@@ -18,6 +18,7 @@ from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.managers.utils import (
     future_slot_indices,
+    get_token_ids_gather,
     resolve_future_token_ids,
     set_future_token_ids,
 )
@@ -67,8 +68,7 @@ class ModelWorkerClient:
         )
         self.forward_thread.start()
         self.parent_process = psutil.Process().parent()
-        replicated_sharding = NamedSharding(mesh, PartitionSpec())
-        self.async_gather_fn = jax.jit(lambda x: x, out_shardings=replicated_sharding)
+        self.async_gather_fn = get_token_ids_gather(mesh)
 
     @property
     def model_runner(self):
@@ -163,7 +163,8 @@ class ModelWorkerClient:
             # set_future's cpp-fastpath cache hits; async_gather afterwards.
             self.future_token_ids_map = set_future_token_ids(
                 self.future_token_ids_map,
-                future_slot_indices_np,
+                model_worker_batch.forward_batch.seq_lens,
+                model_worker_batch.forward_batch.req_pool_indices,
                 next_token_ids,
                 self.mesh,
             )

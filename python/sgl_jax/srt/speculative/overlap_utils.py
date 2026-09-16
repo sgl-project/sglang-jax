@@ -82,7 +82,7 @@ def can_merge_spec_non_overlap_prefill(enable_overlap, spec_algorithm) -> bool:
         and not spec_algorithm.is_none()
         and (
             spec_algorithm.is_eagle3()
-            or spec_algorithm.is_dflash()
+            or spec_algorithm.is_dflash_family()
             or spec_algorithm.is_frozen_kv_mtp()
         )
     )

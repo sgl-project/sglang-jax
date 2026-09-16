@@ -172,15 +172,16 @@ def test_scatter_paged_padding_seq_no_leak():
     seq_lens = jnp.asarray([3, 0], jnp.int32)  # seq1 = padding
     cu_q_lens = jnp.asarray([0, 1, 2], jnp.int32)  # DECODE arange
     cu_kv_lens = jnp.asarray([0, ps, ps], jnp.int32)  # seq0 aligned=4, seq1 aligned=0
-    page_indices = jnp.asarray([0, 1, 2, 3], jnp.int32)
+    # Production allocator convention: real pages start at 1, page 0 reserved.
+    page_indices = jnp.asarray([1, 2, 3, 0], jnp.int32)
     new_tokens = jnp.asarray([[1.0] * D, [99.0] * D], jnp.float32)
 
     out = np.asarray(
         _scatter_paged(cache, new_tokens, seq_lens, page_indices, cu_q_lens, cu_kv_lens, pps)
     )
-    assert out[0, 2, 0] == 1.0  # real seq0 write
-    # padding seq1 must NOT leak into any non-sentinel page
-    assert not np.any(out[: P - 1] == 99.0), f"leaked: {np.argwhere(out[:P-1]==99.0)}"
+    assert out[1, 2, 0] == 1.0  # real seq0 write (page 1)
+    # padding seq1 may only land on the reserved page 0 — never a live page
+    assert not np.any(out[1:] == 99.0), f"leaked: {np.argwhere(out[1:]==99.0)}"
 
 
 def test_sparse_mla_multi_seq_packed_layout():

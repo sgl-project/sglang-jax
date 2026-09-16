@@ -81,4 +81,5 @@ def test_validation_router_leaves_general_spec_algorithms_unchanged():
 
     assert validate_speculative_request(req, SpeculativeAlgorithm.FROZEN_KV_MTP) is not None
     assert validate_speculative_request(req, SpeculativeAlgorithm.DFLASH) is not None
+    assert validate_speculative_request(req, SpeculativeAlgorithm.DSPARK) is not None
     assert validate_speculative_request(req, SpeculativeAlgorithm.NEXTN) is None

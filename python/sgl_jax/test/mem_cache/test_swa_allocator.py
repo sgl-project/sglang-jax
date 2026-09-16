@@ -361,7 +361,197 @@ class TestSWAAllocatorPaged(CustomTestCase):
 
 
 # ---------------------------------------------------------------------------
-# Class 3: SWA Eviction logic
+# Class 3: Unified SWA ownership contracts
+# ---------------------------------------------------------------------------
+class TestSWAAllocatorUnifiedOwnership(CustomTestCase):
+    def setUp(self):
+        self.mesh = _make_mesh()
+
+    def _make_allocator(self, *, size=16, size_swa=16, dp_size=1):
+        kvcache = _make_swa_pool(
+            size=size,
+            size_swa=size_swa,
+            page_size=1,
+            mesh=self.mesh,
+        )
+        return SWATokenToKVPoolAllocator(
+            size=size,
+            size_swa=size_swa,
+            kvcache=kvcache,
+            page_size=1,
+            dp_size=dp_size,
+        )
+
+    def test_translate_full_to_swa_is_rank_local(self):
+        allocator = self._make_allocator(dp_size=2)
+        full_rank0 = allocator.alloc(2, dp_rank=0)
+        self.assertIsNotNone(full_rank0)
+
+        # Offset rank 1's physical SWA allocation while keeping the same local
+        # FULL indices on both ranks.
+        reserved_swa_rank1 = allocator.swa_attn_allocator.alloc(1, dp_rank=1)
+        self.assertIsNotNone(reserved_swa_rank1)
+        full_rank1 = allocator.alloc(2, dp_rank=1)
+        self.assertIsNotNone(full_rank1)
+        np.testing.assert_array_equal(full_rank0, full_rank1)
+
+        swa_rank0 = allocator.translate_full_to_swa(full_rank0, dp_rank=0)
+        swa_rank1 = allocator.translate_full_to_swa(full_rank1, dp_rank=1)
+        self.assertFalse(np.array_equal(swa_rank0, swa_rank1))
+
+        # Translation is a copy, not a mutable view into the mapping table.
+        swa_rank0[0] = 0
+        self.assertGreater(
+            allocator.full_to_swa_index_mapping[0][full_rank0[0]],
+            0,
+        )
+        empty = np.empty(0, dtype=np.int32)
+        translated_empty = allocator.translate_full_to_swa(empty, dp_rank=0)
+        self.assertEqual(translated_empty.dtype, np.int32)
+        self.assertEqual(translated_empty.size, 0)
+        self.assertIsNot(translated_empty, empty)
+
+        unmapped = np.array([int(full_rank0[-1]) + 1], dtype=np.int32)
+        with self.assertRaisesRegex(ValueError, r"dp_rank=0.*3"):
+            allocator.translate_full_to_swa(unmapped, dp_rank=0)
+
+        swa_rank1_before = allocator.swa_available_size(dp_rank=1)
+        allocator.free_swa(full_rank0, dp_rank=0)
+        np.testing.assert_array_equal(
+            allocator.translate_full_to_swa(full_rank1, dp_rank=1),
+            swa_rank1,
+        )
+        self.assertEqual(
+            allocator.swa_available_size(dp_rank=1),
+            swa_rank1_before,
+        )
+
+    def test_full_then_swa_free_preserves_mapping_and_restores_each_pool_once(self):
+        allocator = self._make_allocator()
+        full_initial = allocator.full_available_size(dp_rank=0)
+        swa_initial = allocator.swa_available_size(dp_rank=0)
+        full_indices = allocator.alloc(4, dp_rank=0)
+        self.assertIsNotNone(full_indices)
+        mapped_swa = allocator.full_to_swa_index_mapping[full_indices].copy()
+
+        allocator.free_full(full_indices, dp_rank=0)
+
+        self.assertEqual(allocator.full_available_size(dp_rank=0), full_initial)
+        self.assertEqual(allocator.swa_available_size(dp_rank=0), swa_initial - 4)
+        np.testing.assert_array_equal(
+            allocator.full_to_swa_index_mapping[full_indices],
+            mapped_swa,
+        )
+
+        allocator.free_swa(full_indices, dp_rank=0)
+        self.assertTrue(np.all(allocator.full_to_swa_index_mapping[full_indices] == 0))
+        self.assertEqual(allocator.full_available_size(dp_rank=0), full_initial)
+        self.assertEqual(allocator.swa_available_size(dp_rank=0), swa_initial)
+
+        allocator.free_swa(full_indices, dp_rank=0)
+        self.assertEqual(allocator.swa_available_size(dp_rank=0), swa_initial)
+
+    def test_grouped_mixed_frees_are_deferred_deduplicated_and_restore_both_pools(self):
+        allocator = self._make_allocator(size=8, size_swa=8)
+        full_indices = allocator.alloc(8, dp_rank=0)
+        self.assertIsNotNone(full_indices)
+        swa_indices = allocator.translate_full_to_swa(full_indices, dp_rank=0)
+
+        allocator.free_group_begin()
+        allocator.free(full_indices[:4], dp_rank=0)
+        allocator.free(full_indices[:4], dp_rank=0)
+        allocator.free_full(full_indices, dp_rank=0)
+        allocator.free_swa(full_indices, dp_rank=0)
+
+        self.assertTrue(np.all(allocator.full_to_swa_index_mapping[full_indices] == 0))
+        self.assertEqual(allocator.full_available_size(dp_rank=0), 0)
+        self.assertEqual(allocator.swa_available_size(dp_rank=0), 0)
+        self.assertIsNone(allocator.alloc(1, dp_rank=0))
+
+        allocator.free_group_end()
+        self.assertEqual(allocator.full_available_size(dp_rank=0), 8)
+        self.assertEqual(allocator.swa_available_size(dp_rank=0), 8)
+
+        reallocated_full = allocator.alloc(8, dp_rank=0)
+        self.assertIsNotNone(reallocated_full)
+        reallocated_swa = allocator.translate_full_to_swa(
+            reallocated_full,
+            dp_rank=0,
+        )
+        np.testing.assert_array_equal(np.sort(reallocated_full), np.sort(full_indices))
+        np.testing.assert_array_equal(np.sort(reallocated_swa), np.sort(swa_indices))
+
+    def test_rank_local_clear_preserves_other_grouped_frees_and_group_state(self):
+        allocator = self._make_allocator(size=16, size_swa=16, dp_size=2)
+        full_rank0 = allocator.alloc(4, dp_rank=0)
+        full_rank1 = allocator.alloc(4, dp_rank=1)
+        self.assertIsNotNone(full_rank0)
+        self.assertIsNotNone(full_rank1)
+
+        allocator.free_group_begin()
+        allocator.free(full_rank0, dp_rank=0)
+        allocator.free(full_rank1, dp_rank=1)
+        allocator.clear(dp_rank=0)
+
+        self.assertFalse(allocator.is_not_in_free_group)
+        self.assertEqual(allocator.full_available_size(dp_rank=0), 8)
+        self.assertEqual(allocator.swa_available_size(dp_rank=0), 8)
+        self.assertEqual(allocator.full_available_size(dp_rank=1), 4)
+        self.assertEqual(allocator.swa_available_size(dp_rank=1), 4)
+
+        # Rank 0's seen state was cleared, so reusing the same local IDs must
+        # create new grouped frees. Rank 1's seen state was preserved, so a
+        # repeated free of its captured IDs must remain a no-op.
+        replacement_rank0 = allocator.alloc(4, dp_rank=0)
+        self.assertIsNotNone(replacement_rank0)
+        np.testing.assert_array_equal(replacement_rank0, full_rank0)
+        allocator.free(replacement_rank0, dp_rank=0)
+        allocator.free(full_rank1, dp_rank=1)
+
+        allocator.free_group_end()
+        self.assertEqual(allocator.full_available_size(dp_rank=0), 8)
+        self.assertEqual(allocator.swa_available_size(dp_rank=0), 8)
+        self.assertEqual(allocator.full_available_size(dp_rank=1), 8)
+        self.assertEqual(allocator.swa_available_size(dp_rank=1), 8)
+
+    def test_repeated_free_group_begin_preserves_captured_indices(self):
+        allocator = self._make_allocator(size=8, size_swa=8)
+        full_indices = allocator.alloc(8, dp_rank=0)
+        self.assertIsNotNone(full_indices)
+
+        allocator.free_group_begin()
+        allocator.free(full_indices[:4], dp_rank=0)
+        allocator.free_group_begin()
+        allocator.free(full_indices[4:], dp_rank=0)
+        allocator.free_group_end()
+
+        self.assertTrue(np.all(allocator.full_to_swa_index_mapping[full_indices] == 0))
+        self.assertEqual(allocator.full_available_size(dp_rank=0), 8)
+        self.assertEqual(allocator.swa_available_size(dp_rank=0), 8)
+
+    def test_swa_allocation_failure_rolls_back_full_and_mapping(self):
+        allocator = self._make_allocator(size=8, size_swa=8)
+        full_before = allocator.full_available_size(dp_rank=0)
+        swa_before = allocator.swa_available_size(dp_rank=0)
+        mapping_before = allocator.full_to_swa_index_mapping.copy()
+        original_swa_alloc = allocator.swa_attn_allocator.alloc
+        allocator.swa_attn_allocator.alloc = lambda need_size, dp_rank=0: None
+        try:
+            result = allocator.alloc(2, dp_rank=0)
+        finally:
+            allocator.swa_attn_allocator.alloc = original_swa_alloc
+
+        self.assertIsNone(result)
+        self.assertEqual(allocator.full_available_size(dp_rank=0), full_before)
+        self.assertEqual(allocator.swa_available_size(dp_rank=0), swa_before)
+        np.testing.assert_array_equal(
+            allocator.full_to_swa_index_mapping,
+            mapping_before,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Class 4: SWA Eviction logic
 # ---------------------------------------------------------------------------
 class TestSWAEviction(CustomTestCase):
     """Tests for _evict_swa logic (called via maybe_evict_swa)."""
@@ -521,7 +711,7 @@ class TestSWAEviction(CustomTestCase):
 
 
 # ---------------------------------------------------------------------------
-# Class 4: Overlap safety
+# Class 5: Overlap safety
 # ---------------------------------------------------------------------------
 class TestSWAOverlapSafety(CustomTestCase):
     """Test overlap-aware reclaim timing for decode and chunked extend."""

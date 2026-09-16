@@ -18,13 +18,13 @@ from sgl_jax.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     IncLockRefResult,
     InsertParams,
+    InsertResult,
     MatchPrefixParams,
     MatchResult,
 )
 from sgl_jax.srt.mem_cache.unified_cache_components.tree_component import (
     ComponentType,
     EvictLayer,
-    InsertResult,
     TreeComponent,
 )
 

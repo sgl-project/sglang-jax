@@ -38,7 +38,13 @@ logger = logging.getLogger(__name__)
 
 PRECOMPILE_DEFAULT_TOKEN_PADDINGS = [1 << i for i in range(6, 14)]
 PRECOMPILE_DEFAULT_BS_PADDINGS = [1 << i for i in range(0, 9)]
-PRECOMPILE_DEFAULT_VISION_PATCH_PADDINGS = [256, 1024, 2048, 4096, 5120, 8192, 12288, 16384]
+PRECOMPILE_DEFAULT_VISION_PATCH_PADDINGS = [
+    1024,
+    2048,
+    4096,
+    5120,
+    8192,
+]
 
 
 def resolve_vision_patch_buckets(user_paddings: list[int] | None) -> list[int]:

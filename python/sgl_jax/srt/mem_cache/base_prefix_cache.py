@@ -32,12 +32,25 @@ class InsertParams:
 
     key: RadixKey | None = None
     value: Any = None
-    # SWA-specific: consumed by SWARadixCache, ignored by RadixCache.
+    # Length of ``value`` already owned by the tree. UnifiedRadixCache uses it
+    # to free only request-owned overlap; SWARadixCache also uses it for SWA
+    # overlap/healing. RadixCache ignores it.
     prev_prefix_len: int = 0
     swa_evicted_seqlen: int = 0
     # Length-1 int32 array (a RecurrentStatePool slot index); ownership passes
     # to the tree at commit.
     recurrent_value: Any = None
+
+
+@dataclasses.dataclass
+class InsertResult:
+    """Result of an insert operation."""
+
+    prefix_len: int = 0
+    # recurrent_committed: the tree took ownership of the request's slot;
+    # cleanup_after_caching_req keys donate-vs-free on it.
+    recurrent_exist: bool = False
+    recurrent_committed: bool = False
 
 
 @dataclasses.dataclass
@@ -160,10 +173,10 @@ class BasePrefixCache(abc.ABC):
     def protected_size(self, dp_rank: int = 0):
         return 0
 
-    def full_protected_size(self):
+    def full_protected_size(self, dp_rank: int = 0):
         return 0
 
-    def swa_protected_size(self):
+    def swa_protected_size(self, dp_rank: int = 0):
         return 0
 
     def total_size(self):

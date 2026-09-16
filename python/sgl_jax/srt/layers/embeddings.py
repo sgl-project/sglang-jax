@@ -26,6 +26,7 @@ from flax.typing import PromoteDtypeFn
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.environ import envs as _envs
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
 
@@ -567,6 +568,9 @@ def rotary_embedding_forward(
     return query, key
 
 
+_ROTARY_INTERLEAVED = _envs.SGLANG_JAX_ROTARY_INTERLEAVED.get()
+
+
 # @partial(jax.jit, static_argnames=["is_neox_style"])
 def apply_rotary_emb(
     x: jax.Array,
@@ -587,6 +591,15 @@ def apply_rotary_emb(
     if is_neox_style:
         x1, x2 = jnp.split(x, 2, axis=-1)
     else:
+        if _ROTARY_INTERLEAVED:
+            # GPT-J rotary computed directly in the interleaved domain:
+            # avoids the strided even/odd slices and the stack+reshape
+            # re-interleave; bit-identical to the slice formulation.
+            cos_il = jnp.repeat(cos, 2, axis=-1)
+            sin_il = jnp.repeat(sin, 2, axis=-1)
+            sign = jnp.tile(jnp.array([-1, 1], dtype=x.dtype), x.shape[-1] // 2)
+            x_swap = jnp.flip(x.reshape(*x.shape[:-1], -1, 2), axis=-1).reshape(x.shape)
+            return x * cos_il + x_swap * (sin_il * sign)
         x1 = x[..., ::2]
         x2 = x[..., 1::2]
     o1 = x1 * cos - x2 * sin
