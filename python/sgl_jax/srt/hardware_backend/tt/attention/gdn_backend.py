@@ -27,17 +27,6 @@ class TTGDNAttnBackend(GDNAttnBackend):
         if (self.head_k_dim, self.head_v_dim, self.conv_kernel_size) != (128, 128, 4):
             raise NotImplementedError("TT GDN requires 128-wide heads and a four-tap convolution")
 
-    def prepare_model_state(self, leaves):
-        return tuple(
-            (
-                ops.annotate_weight_dtype(leaf, "bfp_bf8" if leaf.ndim >= 2 else "bf16")
-                if getattr(leaf, "ndim", 0) > 0
-                and getattr(leaf, "dtype", None) in (jnp.bfloat16, jnp.float32)
-                else leaf
-            )
-            for leaf in leaves
-        )
-
     def get_forward_metadata(self, batch):
         if batch.forward_mode.is_extend() and batch.real_bs > 1:
             raise NotImplementedError("TT GDN prefill supports one request at a time")

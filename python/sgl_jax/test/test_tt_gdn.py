@@ -10,6 +10,7 @@ import pytest
 
 from sgl_jax.srt.hardware_backend.tt.attention import ops
 from sgl_jax.srt.hardware_backend.tt.attention.gdn_backend import TTGDNAttnBackend
+from sgl_jax.srt.hardware_backend.tt.attention.tt_backend import TTAttention
 from sgl_jax.srt.kernels.gdn.gated_delta import (
     _gated_delta_step,
     _scatter_idx0_safe,
@@ -17,6 +18,9 @@ from sgl_jax.srt.kernels.gdn.gated_delta import (
     jax_causal_conv1d_prefill,
     jax_causal_conv1d_update,
     ragged_gated_delta_rule_ref,
+)
+from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
+    HybridLinearAttnBackend,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -42,7 +46,11 @@ def test_weight_precision_policy(monkeypatch):
         jnp.ones((), jnp.float32),
         jnp.ones((32,), jnp.int32),
     )
-    backend = TTGDNAttnBackend.__new__(TTGDNAttnBackend)
+    backend = HybridLinearAttnBackend(
+        full_attn_backend=TTAttention.__new__(TTAttention),
+        linear_attn_backend=TTGDNAttnBackend.__new__(TTGDNAttnBackend),
+        full_attn_layers=[0],
+    )
     prepared = backend.prepare_model_state(leaves)
     assert all(a is b for a, b in zip(prepared, leaves))
     assert annotations == [((128, 64), "bfp_bf8"), ((128,), "bf16")]
