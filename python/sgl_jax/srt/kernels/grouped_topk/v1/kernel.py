@@ -19,7 +19,9 @@ Algorithm (matches `_biased_grouped_topk` exactly, ties included):
 Renormalize / routed_scaling_factor are applied by the caller (`TopK.__call__`).
 
 Tie-break: selection uses `max` + masked `min(iota)` (smallest index achieving the max) rather than
-`argmax`, because TPU Mosaic's reduction argmax does not break ties toward the lowest index.
+`argmax`, because TPU Mosaic's reduction argmax does not break ties toward the lowest index. The
+iota is carried in f32 (exact for E <= 2**24): the vector core has float min/max but no integer
+min/max, so an int32 masked-min costs a compare+select on every vreg of the [E,BT] block.
 """
 
 from __future__ import annotations
@@ -124,6 +126,12 @@ def _grouped_topk_kernel(
     #        the caller selects packed only when router_logits is bf16.
     with jax.named_scope("final_select"):
         e_iota = jax.lax.broadcasted_iota(jnp.int32, (E, bt), 0)
+        # The same expert ids carried in f32 (`tpu.iota` is integer-only, so this is one
+        # loop-invariant convert). Exact for every E a TPU can hold (E <= 2**24), so 0..E
+        # round-trip through f32 unchanged; `_pick` reduces and compares against this copy
+        # because the vector core has float min/max but no integer min/max.
+        e_iota_f = e_iota.astype(jnp.float32)
+        e_sentinel_f = jnp.float32(E)
         row_iota = jax.lax.broadcasted_iota(jnp.int32, (topk, bt), 0)
         ids_init = jnp.full((topk, bt), -1, dtype=jnp.int32)
         w_init = jnp.zeros((topk, bt), dtype=jnp.float32)
@@ -148,18 +156,32 @@ def _grouped_topk_kernel(
             if packed:
                 kmax = jnp.max(cur, axis=0, keepdims=True)  # [1, BT] single reduction
                 idx = (E - 1) - (kmax & low_mask)  # [1, BT] lowest-index winner from the low bits
+                idxf = idx.astype(jnp.float32)
             else:
                 cmax = jnp.max(cur, axis=0, keepdims=True)
-                idx = jnp.min(
-                    jnp.where(cur == cmax, e_iota, E), axis=0, keepdims=True
-                )  # [1, BT] lowest expert id achieving the max
-            sel = e_iota == idx  # [E, BT]
+                # Masked-min over the f32 expert ids: same exact integers as the int32 form,
+                # but the reduction lowers to `multi_reduction<minimumf>` -> one `vmin` per
+                # vreg, whereas `<minsi>` has no integer-min instruction behind it and is
+                # expanded to a `vlt.s32` + `vsel` pair on every vreg of the [E,BT] block.
+                idxf = jnp.min(
+                    jnp.where(cur == cmax, e_iota_f, e_sentinel_f), axis=0, keepdims=True
+                )  # [1, BT] lowest expert id achieving the max (E when no element matches)
+                idx = idxf.astype(jnp.int32)
+            # The winner one-hot feeds two consumers (weight gather, drop-the-winner). Kept as
+            # ONE [E,BT] i1 value it outlives both uses, so Mosaic materialises it, spills it to
+            # VMEM and re-expands it (`vnez.u8`) at each use. Comparing twice — once in f32 for
+            # the gather, once in i32 for the update, on the same winner id — is one compare per
+            # use with no shared array: neither CSE nor Mosaic can merge a cmpf with a cmpi, and
+            # each mask dies into its consumer inside a vector mask register.
             # weight from PRE-bias logits via masked sum (gather is unsupported in Pallas/Mosaic).
-            wval = jnp.sum(jnp.where(sel, logits, 0.0), axis=0, keepdims=True)  # [1, BT]
+            wval = jnp.sum(
+                jnp.where(e_iota_f == idxf, logits, 0.0), axis=0, keepdims=True
+            )  # [1, BT]
             write = row_iota == k  # [topk, BT] one-hot on row k (loop index)
             ids_buf = jnp.where(write, idx.astype(jnp.int32), ids_buf)
             w_buf = jnp.where(write, wval.astype(jnp.float32), w_buf)
-            cur = jnp.where(sel, _I32_MIN if packed else NEG_INF, cur)  # drop the winner
+            # drop the winner
+            cur = jnp.where(e_iota == idx, _I32_MIN if packed else NEG_INF, cur)
             return cur, ids_buf, w_buf
 
         _, ids_out, w_out = jax.lax.fori_loop(
