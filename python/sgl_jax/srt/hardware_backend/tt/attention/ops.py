@@ -127,23 +127,8 @@ def state_pool_update(state, indices, updates):
 
 
 def gated_delta_rule(q, k, v, gate, beta, state):
-    # Upstream's chunk kernel takes caller-owned constants so capture needs no
-    # host uploads. These become ordinary constant-folded device tensors.
-    row, col = np.indices((32, 32))
-    masks = np.concatenate(
-        ((row < 16) & (col < 16), (row >= 16) & (col >= 16), (row >= 16) & (col < 16)), axis=1
-    )
-    constants = (np.eye(32), np.tril(np.ones((32, 32))), np.ones((32, 32)), masks)
     return jax.ffi.ffi_call(
         "tt.gated_delta_rule",
         (jax.ShapeDtypeStruct(state.shape, state.dtype), jax.ShapeDtypeStruct(v.shape, v.dtype)),
         vmap_method="sequential",
-    )(
-        q,
-        k,
-        v,
-        gate,
-        beta,
-        state,
-        *(jnp.asarray(x, dtype=jnp.float32)[None, None] for x in constants),
-    )
+    )(q, k, v, gate, beta, state)
