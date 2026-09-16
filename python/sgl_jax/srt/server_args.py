@@ -1313,6 +1313,8 @@ class ServerArgs:
             default=ServerArgs.dp_schedule_policy,
             help=(
                 "DP scheduling policy for assigning dp_rank to new requests. "
+                "Load-based routing defers unassigned requests when no rank has room; "
+                "prefill admission also checks execution and memory capacity. "
                 "When unset, defaults to 'cache_aware' with radix cache enabled "
                 "and 'min_running_queue' with radix cache disabled or Pathways PD. "
                 "'cache_aware' routes by cache affinity with soft load balancing: "
