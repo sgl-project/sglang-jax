@@ -149,6 +149,37 @@ class TestQwen3_5(unittest.TestCase):
         cls.cfg = _make_config(num_layers=4, is_moe=True)
 
     # --- config: nested rope_parameters flattened to rope_scaling/theta/partial ---
+    def test_vision_wrapper_constructs_under_eval_shape(self):
+        from flax import nnx
+
+        from sgl_jax.srt.models.qwen3_5 import Qwen3_5ForConditionalGeneration
+        from sgl_jax.srt.models.qwen3_vl import Qwen3VLVisionModel
+
+        cfg = Qwen3_5DenseConfig(
+            text_config={"hidden_size": 32, "vocab_size": 64, "num_hidden_layers": 0},
+            vision_config=dict(
+                depth=2,
+                hidden_size=32,
+                intermediate_size=64,
+                num_heads=4,
+                patch_size=2,
+                temporal_patch_size=2,
+                in_channels=3,
+                out_hidden_size=32,
+                spatial_merge_size=2,
+                num_position_embeddings=16,
+                hidden_act="gelu_pytorch_tanh",
+            ),
+            tie_word_embeddings=True,
+            precompile_vision_patch_paddings=[64],
+        )
+        # Catch assigning a vision module to an attribute NNX already marked static.
+        with jax.set_mesh(self.mesh):
+            model = nnx.eval_shape(lambda: Qwen3_5ForConditionalGeneration(cfg, self.mesh))
+        self.assertIsInstance(model.visual, Qwen3VLVisionModel)
+        self.assertIs(model.get_input_embeddings(), model.language_model.model.embed_tokens)
+        self.assertEqual(model.get_multimodal_embedding_packed_capacities(), (16,))
+
     def test_config_flattens_rope_parameters(self):
         tc = self.cfg.text_config
         self.assertEqual(type(self.cfg).__name__, "Qwen3_5HybridConfig")
