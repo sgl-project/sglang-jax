@@ -209,42 +209,58 @@ class KimiK25VisionAttention(nnx.Module):
 
         is_cpu = list(self.mesh.devices.flat)[0].platform == "cpu"
 
-        # ``flash_attention`` below is a Pallas *TPU* kernel. On CPU Pallas can
-        # only emulate it (``interpret=True``), and the emulator walks the kernel
-        # grid block by block, so its cost grows with the square of the patch
-        # count: ~0.02s at 512 patches against ~23s at 22k -- and that is per
+        # ``flash_attention`` is a Pallas *TPU* kernel. On CPU Pallas can only
+        # emulate it (``interpret=True``), and the emulator walks the kernel grid
+        # block by block, so its cost grows with the square of the sequence
+        # length: ~0.02s at 512 patches against ~23s at 22k -- and that is per
         # layer. An image is a few hundred patches so this never showed up, but a
         # video is tens of thousands and the tower stalls for minutes, which in
         # turn blocks the scheduler when it materializes the embedding.
         #
         # Attention here is block-diagonal (patches only attend within their own
-        # item) and the item lengths are static, so on CPU the blocks can be
-        # evaluated directly as a few dense matmuls, skipping the emulator.
+        # item), so on CPU the same kernel is invoked once per item instead of
+        # once over the concatenated sequence. Same result, much smaller grid.
         if is_cpu and seq_lens:
             return self._segmented_attention(q, k, v, seq_lens).reshape(sum_seq_len, D)
-
-        align_seq_len = align_to(sum_seq_len, 256)
-
-        pad_q = q
-        pad_k = k
-        pad_v = v
-
-        if sum_seq_len != align_seq_len:
-            pad_q = jnp.pad(q, ((0, align_seq_len - sum_seq_len), (0, 0), (0, 0)))
-            pad_k = jnp.pad(k, ((0, align_seq_len - sum_seq_len), (0, 0), (0, 0)))
-            pad_v = jnp.pad(v, ((0, align_seq_len - sum_seq_len), (0, 0), (0, 0)))
 
         indices = jnp.arange(sum_seq_len)
         item_ids = jnp.sum(indices[:, None] >= cu_seqlens[1:][None, :], axis=-1) + 1
 
-        seg_q = jnp.pad(item_ids, (0, align_seq_len - sum_seq_len))
-        seg_kv = jnp.pad(item_ids, (0, align_seq_len - sum_seq_len))
+        output = self._flash_attention(q, k, v, item_ids, interpret=is_cpu)
 
-        segment_ids = SegmentIds(q=seg_q[None, :], kv=seg_kv[None, :])
+        return output.reshape(sum_seq_len, D)
 
-        pad_q = jnp.transpose(pad_q, (1, 0, 2))[None, ...]
-        pad_k = jnp.transpose(pad_k, (1, 0, 2))[None, ...]
-        pad_v = jnp.transpose(pad_v, (1, 0, 2))[None, ...]
+    def _flash_attention(
+        self,
+        q: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
+        item_ids: jax.Array,
+        interpret: bool,
+    ) -> jax.Array:
+        """Run the Pallas kernel over ``[seq_len, num_heads, head_dim]`` inputs.
+
+        The sequence is padded up to the kernel's 256-wide query block. Padded
+        positions get segment id 0, which no real token carries, so the kernel
+        masks them out. ``item_ids`` gives each real token the 1-based index of
+        the item it belongs to, which is what makes attention block-diagonal.
+        """
+        seq_len = q.shape[0]
+        align_seq_len = align_to(seq_len, 256)
+        pad_len = align_seq_len - seq_len
+
+        if pad_len:
+            padding = ((0, pad_len), (0, 0), (0, 0))
+            q = jnp.pad(q, padding)
+            k = jnp.pad(k, padding)
+            v = jnp.pad(v, padding)
+
+        seg = jnp.pad(item_ids, (0, pad_len))
+        segment_ids = SegmentIds(q=seg[None, :], kv=seg[None, :])
+
+        pad_q = jnp.transpose(q, (1, 0, 2))[None, ...]
+        pad_k = jnp.transpose(k, (1, 0, 2))[None, ...]
+        pad_v = jnp.transpose(v, (1, 0, 2))[None, ...]
 
         def local_flash_attention(q, k, v, segment_ids):
             return flash_attention(
@@ -254,14 +270,14 @@ class KimiK25VisionAttention(nnx.Module):
                 segment_ids=segment_ids,
                 causal=False,
                 sm_scale=self.scale,
-                interpret=is_cpu,
+                interpret=interpret,
             )
 
         in_specs = (
             jax.sharding.PartitionSpec(None, None, None, None),
             jax.sharding.PartitionSpec(None, None, None, None),
             jax.sharding.PartitionSpec(None, None, None, None),
-            jax.sharding.PartitionSpec() if segment_ids is not None else None,
+            jax.sharding.PartitionSpec(),
         )
 
         output = jax.shard_map(
@@ -272,10 +288,7 @@ class KimiK25VisionAttention(nnx.Module):
             check_vma=False,
         )(pad_q, pad_k, pad_v, segment_ids)
 
-        output = jnp.transpose(output[0], (1, 0, 2))
-        output = output[:sum_seq_len, :, :].reshape(sum_seq_len, D)
-
-        return output
+        return jnp.transpose(output[0], (1, 0, 2))[:seq_len, :, :]
 
     def _segmented_attention(
         self,
@@ -284,32 +297,32 @@ class KimiK25VisionAttention(nnx.Module):
         v: jax.Array,
         seq_lens: tuple[int, ...],
     ) -> jax.Array:
-        """Block-diagonal attention via ``jax.nn.dot_product_attention``.
+        """Block-diagonal attention, one kernel invocation per item.
 
-        ``q``/``k``/``v`` are ``[sum(seq_lens), num_heads, head_dim]``. Each item
-        attends only within itself, so this issues one dense attention per item
-        rather than one masked attention over the whole batch: for a video that
-        is ~8 blocks of ~3.5k patches instead of a single 26k x 26k score matrix,
-        which would not fit in memory anyway.
+        ``q``/``k``/``v`` are ``[sum(seq_lens), num_heads, head_dim]``. Since
+        patches only attend within their own item, slicing the sequence per item
+        and running the kernel on each slice computes exactly what one masked
+        call over the concatenated sequence would -- but the emulated grid costs
+        ``sum(n_i^2)`` blocks instead of ``(sum n_i)^2``. For the Kimi demo video
+        (8 chunks, ~26k patches) that is a ~8x reduction; for a single image
+        there is only one item and nothing changes.
 
-        Padding the items to a common length and passing ``query_seq_lengths``
-        would collapse this into a single call, but it materializes every item's
-        scores at once and pads the short ones, which measured 2x slower than
-        this loop. ``seq_lens`` is static, so the loop unrolls at trace time.
+        ``seq_lens`` is static, so the loop is unrolled at trace time.
         """
         outputs = []
         start = 0
         for length in seq_lens:
             end = start + length
-            # dot_product_attention wants [batch, seq, heads, dim].
+            # One item per call, so every real token shares segment id 1; only
+            # the alignment padding inside the helper is masked off.
             outputs.append(
-                jax.nn.dot_product_attention(
-                    q[start:end][None],
-                    k[start:end][None],
-                    v[start:end][None],
-                    scale=self.scale,
-                    implementation="xla",
-                )[0]
+                self._flash_attention(
+                    q[start:end],
+                    k[start:end],
+                    v[start:end],
+                    jnp.ones(length, dtype=jnp.int32),
+                    interpret=True,
+                )
             )
             start = end
 
