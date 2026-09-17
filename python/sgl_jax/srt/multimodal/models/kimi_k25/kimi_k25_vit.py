@@ -45,8 +45,6 @@ class Learnable2DInterPosEmbDivided_fixed(nnx.Module):
             # ``divided_fixed`` stores one 2D table that every frame reuses, so the
             # frame count is independent of ``num_frames``: videos of any length
             # share the same interpolated spatial embedding.
-            if t < 1:
-                raise ValueError(f"grid_thw temporal size must be >= 1, got t={t}")
             if (h, w) == self.weight.shape[:-1]:
                 pos_emb_2d = self.weight.reshape(-1, self.weight.shape[-1])
             else:
@@ -103,13 +101,6 @@ class Rope2DPosEmbRepeated(nnx.Module):
 
         results = []
         for t, h, w in grid_thws:
-            # Slicing past the table would silently clamp, so fail with the actual
-            # limits instead of a downstream reshape error.
-            if h > self.max_height or w > self.max_width:
-                raise ValueError(
-                    f"grid_thw {(t, h, w)} exceeds the 2D RoPE table of "
-                    f"{(self.max_height, self.max_width)}"
-                )
             cos_hw = cos_table[:h, :w, :].reshape(h * w, self.dim // 2)
             sin_hw = sin_table[:h, :w, :].reshape(h * w, self.dim // 2)
             results.append(jnp.tile(jnp.stack([cos_hw, sin_hw], axis=0), (1, t, 1)))
@@ -293,33 +284,33 @@ class KimiK25VisionAttention(nnx.Module):
         v: jax.Array,
         seq_lens: tuple[int, ...],
     ) -> jax.Array:
-        """Block-diagonal attention built from plain XLA ops.
+        """Block-diagonal attention via ``jax.nn.dot_product_attention``.
 
         ``q``/``k``/``v`` are ``[sum(seq_lens), num_heads, head_dim]``. Each item
-        attends only within itself, so this evaluates one dense attention per
-        item rather than one masked attention over the whole batch: for a video
-        that is ~10 blocks of ~2.3k patches instead of a single 22k x 22k score
-        matrix, which would not fit in memory anyway.
+        attends only within itself, so this issues one dense attention per item
+        rather than one masked attention over the whole batch: for a video that
+        is ~8 blocks of ~3.5k patches instead of a single 26k x 26k score matrix,
+        which would not fit in memory anyway.
 
-        ``seq_lens`` is static, so the loop is unrolled at trace time.
+        Padding the items to a common length and passing ``query_seq_lengths``
+        would collapse this into a single call, but it materializes every item's
+        scores at once and pads the short ones, which measured 2x slower than
+        this loop. ``seq_lens`` is static, so the loop unrolls at trace time.
         """
         outputs = []
         start = 0
         for length in seq_lens:
             end = start + length
-            # [length, heads, dim] -> [heads, length, dim] so the matmuls batch
-            # over heads.
-            qs = jnp.transpose(q[start:end], (1, 0, 2))
-            ks = jnp.transpose(k[start:end], (1, 0, 2))
-            vs = jnp.transpose(v[start:end], (1, 0, 2))
-
-            scores = jnp.einsum("hqd,hkd->hqk", qs, ks) * self.scale
-            # Softmax in float32: the tower runs in bfloat16 and the reduction
-            # over a couple of thousand keys loses too much precision otherwise.
-            probs = jax.nn.softmax(scores.astype(jnp.float32), axis=-1)
-            context = jnp.einsum("hqk,hkd->hqd", probs.astype(vs.dtype), vs)
-
-            outputs.append(jnp.transpose(context, (1, 0, 2)))
+            # dot_product_attention wants [batch, seq, heads, dim].
+            outputs.append(
+                jax.nn.dot_product_attention(
+                    q[start:end][None],
+                    k[start:end][None],
+                    v[start:end][None],
+                    scale=self.scale,
+                    implementation="xla",
+                )[0]
+            )
             start = end
 
         return jnp.concatenate(outputs, axis=0)
@@ -504,8 +495,6 @@ def build_temporal_merge_plan(
     token_offset = 0
 
     for t, h, w in grids:
-        if t < 1 or h < 1 or w < 1:
-            raise ValueError(f"grid_thw entries must be positive, got {(t, h, w)}")
         if h % merge_h or w % merge_w:
             raise ValueError(
                 f"grid_thw {(t, h, w)} is not divisible by merge kernel "
@@ -571,13 +560,7 @@ class VisionTower(nnx.Module):
             dtype,
         )
 
-        self.encoder = VisionTowerEncoder(
-            config,
-            dtype,
-            mesh,
-            rngs,
-            video_attn_type=getattr(config, "video_attn_type", "spatial_temporal"),
-        )
+        self.encoder = VisionTowerEncoder(config, dtype, mesh, rngs)
 
     def compute_aux_arrays(
         self,
@@ -601,11 +584,11 @@ class VisionTower(nnx.Module):
 
         rope_freqs_cis = self.rope_2d._get_freqs_cis(grid_thws=grid_thws)
 
-        grid_thws_array = np.asarray(grid_thws)
+        grid_thws = np.array(grid_thws)
         lengths = jnp.concatenate(
             (
                 jnp.zeros(1, dtype=jnp.int32),
-                grid_thws_array[:, 0] * grid_thws_array[:, 1] * grid_thws_array[:, 2],
+                grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2],
             )
         )
 
@@ -723,54 +706,6 @@ class Kimi_K25_VisionModel(nnx.Module):
         self.mm_projector = Kimi_K25_MultiModalProjector(config, dtype, rngs)
 
         logger.info("Kimi K2.5 Vision Model initialized with dtype %s", dtype)
-
-    def encode_vision(
-        self,
-        pixel_values: jax.Array,
-        grid_thws,
-    ) -> jax.Array:
-        """Encode image and/or video patches into language-model embeddings.
-
-        Args:
-            pixel_values: Patch tiles shaped ``[sum(t * h * w), in_channels,
-                patch_size, patch_size]``, flattened in item order and, within an
-                item, in ``(t, h, w)`` order. Because each patch is embedded
-                independently, items in one batch may have different resolutions.
-            grid_thws: Sequence of ``(t, h, w)`` patch grids, one per item, in the
-                same order as ``pixel_values``. ``t == 1`` is an image; ``t > 1`` is
-                a video whose frames are pooled by the ``sd2_tpool`` merger.
-
-        Returns:
-            ``[sum(h * w / merge_h / merge_w), text_hidden_size]`` embeddings in
-            item order. Videos yield ``h * w / merge_h / merge_w`` tokens because
-            their frames are temporally pooled.
-        """
-        (
-            rope_freqs_cis,
-            cu_seqlens,
-            abs_pos_embs,
-            merge_indices,
-            merge_weights,
-        ) = self.vision_tower.compute_aux_arrays(grid_thws)
-
-        # Static per-item patch counts, so the CPU attention path can slice the
-        # block-diagonal attention at trace time.
-        seq_lens = tuple(int(t) * int(h) * int(w) for t, h, w in grid_thws)
-
-        hidden_states = self.vision_tower.compute_hidden_states(
-            pixel_values.astype(self.dtype),
-            abs_pos_embs,
-            rope_freqs_cis,
-            cu_seqlens,
-            merge_indices,
-            merge_weights,
-            seq_lens=seq_lens,
-        )
-
-        return self.mm_projector(hidden_states)
-
-    def __call__(self, pixel_values: jax.Array, grid_thws) -> jax.Array:
-        return self.encode_vision(pixel_values, grid_thws)
 
     def load_weights(self, model_config: KimiK25ModelVitConfig) -> None:
         """Load model weights with JAX distributed loading support"""

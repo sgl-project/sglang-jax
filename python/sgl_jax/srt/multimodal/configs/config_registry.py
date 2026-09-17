@@ -80,7 +80,6 @@ _KIMI_VL_VISION_KEY_MAP = {
     "projector_hidden_act": "projector_hidden_act",
     "projector_ln_eps": "projector_ln_eps",
     "text_hidden_size": "text_hidden_size",
-    "video_attn_type": "video_attn_type",
     "vt_hidden_size": "vt_hidden_size",
     "vt_intermediate_size": "vt_intermediate_size",
     "vt_num_attention_heads": "vt_num_attention_heads",
@@ -613,7 +612,7 @@ def get_qwen_vl_config(model_path: str) -> QwenVLModelVitConfig:
         model_path: The model path from server args.
 
     Returns:
-        A ViT config instance configured for the specified model.
+        A VAE config instance configured for the specified model.
     """
     return QwenVLConfigRegistry.get_config(model_path)
 

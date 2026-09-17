@@ -1,11 +1,9 @@
 """Forward-pass tests for the Kimi-K2.5 vision tower on video inputs.
 
-These build a reduced-depth model with random weights on an explicit CPU mesh.
-The CPU mesh matters: it makes the Pallas attention run in interpret mode, so the
-numbers are exact enough to assert the temporal-merge invariant below. (The Kimi
-stage config also schedules the ViT on CPU.) On TPU the same comparison holds
-only to roughly bfloat16 epsilon, which is kernel precision rather than a
-property of the video path.
+These build a reduced-depth model with random weights on an explicit CPU mesh,
+which is also where the Kimi stage config schedules the ViT. ``_encode`` mirrors
+the call sequence in ``vit_model_runner``: the aux arrays are built on the host
+and then handed to the tower body and the projector.
 """
 
 import jax
@@ -48,7 +46,28 @@ def _encode(vision_model, grid_thws, pixel_values=None):
     model, mesh, _ = vision_model
     values = _patches(grid_thws) if pixel_values is None else pixel_values
     with mesh:
-        return model.encode_vision(values, grid_thws)
+        (
+            rope_freqs_cis,
+            cu_seqlens,
+            abs_pos_embs,
+            merge_indices,
+            merge_weights,
+        ) = model.vision_tower.compute_aux_arrays(grid_thws)
+
+        # Static per-item patch counts, so the block-diagonal attention can be
+        # sliced at trace time.
+        seq_lens = tuple(int(t) * int(h) * int(w) for t, h, w in grid_thws)
+
+        hidden_states = model.vision_tower.compute_hidden_states(
+            values.astype(model.dtype),
+            abs_pos_embs,
+            rope_freqs_cis,
+            cu_seqlens,
+            merge_indices,
+            merge_weights,
+            seq_lens=seq_lens,
+        )
+        return model.mm_projector(hidden_states)
 
 
 @pytest.mark.parametrize(

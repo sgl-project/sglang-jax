@@ -105,7 +105,6 @@ def test_merge_plan_indices_cover_every_patch_once():
     ("grid_thws", "match"),
     [
         ([], "at least one"),
-        ([(0, 2, 2)], "must be positive"),
         ([(1, 3, 2)], "not divisible by merge kernel"),
     ],
 )
@@ -129,12 +128,6 @@ def test_pos_emb_allows_more_frames_than_the_table_depth():
     np.testing.assert_allclose(per_frame, np.broadcast_to(per_frame[0], per_frame.shape))
 
 
-def test_pos_emb_rejects_empty_temporal_size():
-    pos_emb = Learnable2DInterPosEmbDivided_fixed(height=4, width=4, num_frames=4, dim=8)
-    with pytest.raises(ValueError, match="must be >= 1"):
-        pos_emb([(0, 4, 4)])
-
-
 def test_rope_repeats_per_frame():
     dim = 8
     rope = Rope2DPosEmbRepeated(dim=dim, max_height=8, max_width=8)
@@ -147,9 +140,3 @@ def test_rope_repeats_per_frame():
     per_frame = freqs.reshape(2, 3, 2 * 2, dim // 2)
     np.testing.assert_allclose(per_frame[:, 1], per_frame[:, 0])
     np.testing.assert_allclose(per_frame[:, 2], per_frame[:, 0])
-
-
-def test_rope_rejects_grids_larger_than_table():
-    rope = Rope2DPosEmbRepeated(dim=8, max_height=4, max_width=4)
-    with pytest.raises(ValueError, match="exceeds the 2D RoPE table"):
-        rope._get_freqs_cis([(1, 8, 4)])

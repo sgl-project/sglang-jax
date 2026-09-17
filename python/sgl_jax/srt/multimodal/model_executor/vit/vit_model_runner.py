@@ -254,5 +254,4 @@ class VitModelRunner(BaseModelRunner):
                 )
                 if merged_embeds is not None:
                     mm_inputs["multimodal_embedding"] = merged_embeds
-                    batch.input_embeds = merged_embeds
         return batch

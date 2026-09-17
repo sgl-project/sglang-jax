@@ -24,8 +24,6 @@ class KimiK25ModelVitConfig(MultiModalModelConfigs):
     projector_hidden_act = "gelu"
     projector_ln_eps = 1e-05
     text_hidden_size = 7168
-    # Video frames attend to each other jointly with the spatial patches.
-    video_attn_type = "spatial_temporal"
     vocab_size = 163840
     vt_hidden_size = 1152
     vt_intermediate_size = 4304
