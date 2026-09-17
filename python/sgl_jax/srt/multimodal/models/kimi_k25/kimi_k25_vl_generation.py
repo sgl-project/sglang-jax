@@ -32,7 +32,7 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM):
         # Clear it here so FusedMoE doesn't receive a raw dict as the config contains 'pack-quantized'
         # format which isn't yet supported.
         if isinstance(getattr(self.text_config, "quantization_config", None), dict):
-            self.text_config.quantization_config = None
+            self.text_config.quantization_config = getattr(config, "quantization_config", None)
 
         super().__init__(
             config=self.text_config,

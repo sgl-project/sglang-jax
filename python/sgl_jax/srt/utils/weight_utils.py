@@ -1,4 +1,5 @@
 import copy
+import functools
 import glob
 import json
 import logging
@@ -67,6 +68,35 @@ def _reinterpret_dtype_if_needed(data: np.ndarray, target_dtype: jnp.dtype) -> n
     elif data.dtype == np.dtype("V2"):
         return data.view(ml_dtypes.bfloat16)
     return data
+
+
+@functools.partial(jax.jit, static_argnames=("target_dtype", "do_transpose"))
+def unpack_4bit_jax(
+    lazy_weight: jax.Array,
+    target_dtype: jnp.dtype,
+    do_transpose: bool = False,
+) -> jax.Array:
+    if lazy_weight.dtype in [jnp.int32, jnp.uint32]:
+        shifts = jnp.arange(0, 32, 4, dtype=jnp.int32)
+        unpacked = (lazy_weight[..., None] >> shifts) & 0x0F
+        unpacked = jnp.reshape(unpacked, lazy_weight.shape[:-1] + (lazy_weight.shape[-1] * 8,))
+    else:
+        unpacked = jnp.stack([lazy_weight & 0x0F, lazy_weight >> 4], axis=-1)
+        unpacked = jnp.reshape(unpacked, lazy_weight.shape[:-1] + (lazy_weight.shape[-1] * 2,))
+
+    int4_dtype = getattr(jnp, "int4", getattr(ml_dtypes, "int4", None))
+    # In compressed-tensors pack-quantized format, signed 4-bit weights are stored
+    # with an offset of +8 (i.e. unsigned 0..15 maps to signed -8..7, centered at 8).
+    unpacked_signed = unpacked.astype(jnp.int8) - 8
+    if int4_dtype is not None and target_dtype == int4_dtype:
+        final_array = unpacked_signed.astype(int4_dtype)
+    else:
+        final_array = unpacked_signed.astype(target_dtype)
+
+    if do_transpose:
+        final_array = jnp.transpose(final_array, (0, 2, 1))
+
+    return final_array
 
 
 @dataclass
@@ -2072,6 +2102,12 @@ class WeightLoader:
                         target_path = mapping.target_path
                         model_param = self._get_param(params, target_path)
 
+                        int4_types = [
+                            getattr(jnp, t) for t in ["int4", "uint4", "float4_e2m1fn"] if hasattr(jnp, t)
+                        ]
+                        if model_param.value.dtype in int4_types and lazy_weight.dtype in [jnp.int32, jnp.uint32, jnp.int8, jnp.uint8]:
+                            lazy_weight = unpack_4bit_jax(lazy_weight, model_param.value.dtype)
+
                         # Expand 2D block-quant scale to 3D kernel-ready layout.
                         lazy_weight = self._maybe_expand_linear_block_scale(
                             lazy_weight, model_param, target_path
@@ -2183,11 +2219,17 @@ class WeightLoader:
                         final_sharding = jax.sharding.NamedSharding(self.mesh, P(*mapping.sharding))
 
                     target_path = mapping.target_path[0]
+                    model_param = self._get_param(params, target_path)
+
+                    int4_types = [
+                        getattr(jnp, t) for t in ["int4", "uint4", "float4_e2m1fn"] if hasattr(jnp, t)
+                    ]
+                    is_int4_weight = model_param.value.dtype in int4_types
+
                     _pd_cache = os.environ.get("SGLANG_PD_WEIGHT_CACHE") == "1"
                     if _pd_cache and target_path in _PD_WEIGHT_CACHE:
                         _t0 = time.monotonic()
                         cached = _PD_WEIGHT_CACHE[target_path]
-                        model_param = self._get_param(params, target_path)
                         model_param.value = jax.device_put(
                             cached, self._pd_remap_sharding(cached.sharding)
                         )
@@ -2199,14 +2241,25 @@ class WeightLoader:
                         )
                         continue
 
+                    load_sharding = final_sharding
+                    if (
+                        is_int4_weight
+                        and mapping.transpose
+                        and isinstance(final_sharding, jax.sharding.NamedSharding)
+                    ):
+                        pspec = final_sharding.spec
+                        if len(pspec) == 3:
+                            load_pspec = jax.sharding.PartitionSpec(pspec[0], pspec[2], pspec[1])
+                            load_sharding = jax.sharding.NamedSharding(final_sharding.mesh, load_pspec)
+
                     # 2. Call creator
                     _t_load_start = time.monotonic()
                     stacked_weight = self._create_stacked_moe_lazy_tensor(
                         expected_hf_keys,
                         weight_info,
                         file_manager,
-                        do_transpose=mapping.transpose,  # CPU transpose
-                        target_sharding=final_sharding,  # Global loading
+                        do_transpose=mapping.transpose if not is_int4_weight else False,
+                        target_sharding=load_sharding,  # Global loading
                         physical_to_logical_map=mapping.physical_to_logical_map,
                     )
                     _t_load = time.monotonic() - _t_load_start
@@ -2219,8 +2272,18 @@ class WeightLoader:
                         axis, times = mapping.repeat
                         stacked_weight = jnp.repeat(stacked_weight, times, axis=axis)
 
+                    # Unpack 4-bit weights if needed (e.g. MoE int4)
+                    if is_int4_weight and stacked_weight.dtype in [jnp.int32, jnp.uint32, jnp.int8, jnp.uint8]:
+                        stacked_weight = unpack_4bit_jax(
+                            stacked_weight,
+                            model_param.value.dtype,
+                            do_transpose=mapping.transpose,
+                        )
+                        param_sharding = getattr(model_param.value, "sharding", None)
+                        if param_sharding is not None:
+                            stacked_weight = jax.sharding.reshard(stacked_weight, param_sharding)
+
                     # 3. Direct assignment
-                    model_param = self._get_param(params, target_path)
                     _t_conv_start = time.monotonic()
                     stacked_weight = self._maybe_convert_epmoe_scale_for_kernel(
                         stacked_weight,
@@ -2252,6 +2315,9 @@ class WeightLoader:
                         _t_assign = time.monotonic() - _t_assign_start
                         if _pd_cache:
                             _PD_WEIGHT_CACHE[target_path] = model_param.value
+                        del stacked_weight
+                        import gc
+                        gc.collect()
                         logger.info(
                             "MoE group %s: load=%.2fs conv=%.2fs assign=%.2fs total=%.2fs "
                             "shape=%s sharding=%s",
@@ -2287,13 +2353,13 @@ class WeightLoader:
                             moe_key,
                             num_logical,
                             num_physical,
-                            stacked_weight.shape,
+                            loaded_shape,
                         )
                     else:
                         logger.info(
                             "Assigned MoE group %s, shape: %s",
                             moe_key,
-                            stacked_weight.shape,
+                            loaded_shape,
                         )
                 else:
                     ep_size = getattr(self.model_config.hf_config, "ep_size", 1)
