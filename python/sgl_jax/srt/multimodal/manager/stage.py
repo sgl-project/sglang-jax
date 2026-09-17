@@ -28,6 +28,10 @@ from sgl_jax.srt.multimodal.models.encoders.t5 import T5EncoderModel
 from sgl_jax.srt.multimodal.models.encoders.t5 import (
     UMT5EncoderModel as MultimodalUMT5EncoderModel,
 )
+from sgl_jax.srt.multimodal.models.kimi_k25.kimi_k25_vit import Kimi_K25_VisionModel
+from sgl_jax.srt.multimodal.models.kimi_k25.kimi_k25_vl_generation import (
+    KimiK25ForConditionalGeneration,
+)
 from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_backbone import (
     MiMoAudioForCausalLM,
 )
@@ -257,6 +261,8 @@ def get_model_class(name: str) -> type | list[type]:
         "T5EncoderModel": T5EncoderModel,
         "FluxTransformer2DModel": FluxTransformer2DModel,
         "AutoencoderKL": AutoencoderKL,
+        "Kimi_K25_VisionModel": Kimi_K25_VisionModel,
+        "KimiK25ForConditionalGeneration": KimiK25ForConditionalGeneration,
     }
 
     if "," in name:
