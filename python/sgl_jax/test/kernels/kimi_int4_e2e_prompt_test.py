@@ -1,7 +1,5 @@
 import logging
 import os
-import sys
-import time
 from types import SimpleNamespace
 
 # Setup TPU networking environment variables before JAX initializes
@@ -13,24 +11,23 @@ if "TPU_PROCESS_ADDRESSES" not in os.environ:
     os.environ["TPU_PROCESS_ADDRESSES"] = "localhost:8471"
 
 import jax
-import jax.numpy as jnp
 import numpy as np
+import pytest
 from transformers import AutoTokenizer
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.entrypoints.engine import _set_envs_and_config
-from sgl_jax.srt.hf_transformers_utils import get_tokenizer
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata
 from sgl_jax.srt.managers.schedule_batch import Req, ScheduleBatch
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.model_executor.model_runner import ModelRunner
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
-from sgl_jax.srt.server_args import PortArgs, ServerArgs
+from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("test_kimi_int4_prompt")
+logger = logging.getLogger("kimi_int4_e2e_prompt_test")
 
 
 def _run_forward_and_sample(model_runner, batch: ScheduleBatch, token_first_arg: int):
@@ -227,6 +224,14 @@ def main():
         assert len(out.strip()) > 0, f"Empty response generated for prompt: {p}"
 
     logger.info("SUCCESS: All prompt generation tests passed with verified legible responses!")
+
+
+@pytest.mark.skipif(
+    not os.path.exists(os.environ.get("MODEL_PATH", "/dsk/kimi_original_new")),
+    reason="Model checkpoint not available on host",
+)
+def test_kimi_int4_e2e_prompt():
+    main()
 
 
 if __name__ == "__main__":

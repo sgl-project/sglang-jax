@@ -1,11 +1,19 @@
 import logging
 import os
 
+import pytest
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from jax.sharding import AxisType, Mesh
+
+# Initialize JAX distributed if coordinator address is provided
+if "JAX_COORDINATOR_ADDRESS" in os.environ:
+    try:
+        jax.distributed.initialize()
+    except Exception as e:
+        logging.info("JAX distributed init failed or already initialized: %s", e)
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.multimodal.models.kimi_k25.kimi_k25_vl_generation import (
@@ -17,7 +25,7 @@ from sgl_jax.srt.utils.quantization.quantization_utils import (
 )
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("test_kimi_int4_loading_single")
+logger = logging.getLogger("kimi_int4_loading_test")
 
 
 def main():
@@ -40,19 +48,18 @@ def main():
         dtype="bfloat16",
     )
 
-    # Configure ideal sharding for available devices (EP=1, TP=len(devices))
-    model_config.ep_size = 1
+    # Configure ideal sharding for available devices
+    ep_size = int(os.environ.get("EP_SIZE", len(devices)))
+    model_config.ep_size = ep_size
     if hasattr(model_config, "hf_config"):
-        model_config.hf_config.ep_size = 1
+        model_config.hf_config.ep_size = ep_size
         if (
             hasattr(model_config.hf_config, "text_config")
             and model_config.hf_config.text_config is not None
         ):
-            model_config.hf_config.text_config.ep_size = 1
-            model_config.hf_config.text_config.n_routed_experts = 16
+            model_config.hf_config.text_config.ep_size = ep_size
     if hasattr(model_config, "hf_text_config") and model_config.hf_text_config is not None:
-        model_config.hf_text_config.ep_size = 1
-        model_config.hf_text_config.n_routed_experts = 16
+        model_config.hf_text_config.ep_size = ep_size
 
     num_layers_env = os.environ.get("NUM_LAYERS")
     if num_layers_env is not None:
@@ -145,6 +152,14 @@ def main():
     )
 
     logger.info("SUCCESS: Kimi K2.5 Raw INT4 Weights Successfully Unpacked, Loaded and Verified!")
+
+
+@pytest.mark.skipif(
+    not os.path.exists(os.environ.get("MODEL_PATH", "/dsk/models/kimi_original_new")),
+    reason="Model checkpoint not available on host",
+)
+def test_kimi_int4_loading():
+    main()
 
 
 if __name__ == "__main__":

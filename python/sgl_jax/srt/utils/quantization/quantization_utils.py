@@ -18,6 +18,15 @@ from sgl_jax.srt.configs.quantization_config import (
 
 logger = logging.getLogger(__name__)
 
+INT4_DTYPES = tuple(
+    getattr(jnp, t) for t in ("int4", "uint4", "float4_e2m1fn") if hasattr(jnp, t)
+)
+
+
+def is_int4_dtype(dtype) -> bool:
+    """Return True if dtype is a 4-bit integer or float type."""
+    return dtype in INT4_DTYPES
+
 
 def _get_block_reshape_sharding(
     tensor: jax.Array,
@@ -96,11 +105,31 @@ def apply_linear_quantization(
     from sgl_jax.srt.layers.linear import LinearBase, QuantizedLinear
 
     quant_config = model_config.quantization_config
-    if quant_config is None or not quant_config.has_linear_quantization():
+    if quant_config is None:
         return model
 
-    linear_rules = quant_config.get_linear_rules()
+    if hasattr(quant_config, "has_linear_quantization"):
+        if not quant_config.has_linear_quantization():
+            return model
+    elif not getattr(quant_config, "linear_rules", None) and not hasattr(
+        quant_config, "get_linear_rules"
+    ):
+        return model
+
+    linear_rules = (
+        quant_config.get_linear_rules()
+        if hasattr(quant_config, "get_linear_rules")
+        else getattr(quant_config, "linear_rules", None)
+    )
     if not linear_rules:
+        if (
+            hasattr(quant_config, "has_linear_quantization")
+            and quant_config.has_linear_quantization()
+        ):
+            raise ValueError(
+                "has_linear_quantization() is True but no linear rules found in quantization config. "
+                "Check your quantization config YAML file."
+            )
         return model
 
     # Compile regex patterns from rules
@@ -167,13 +196,10 @@ def apply_linear_quantization(
                 if isinstance(attr_value, LinearBase):
                     # Check if this path matches any rule
                     dot_path = child_path.replace("/", ".")
-                    path_parts = dot_path.replace("[", ".").replace("]", "").split(".")
                     if any(
-                        ig in path_parts
-                        or dot_path == ig
-                        or dot_path.endswith(f".{ig}")
-                        or f".{ig}." in dot_path
+                        dot_path == ig
                         or dot_path.startswith(f"{ig}.")
+                        or dot_path.endswith(f".{ig}")
                         for ig in ignored_layers
                     ):
                         logger.info("Skipping %s - in ignored_layers", dot_path)
