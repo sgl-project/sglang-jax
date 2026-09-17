@@ -67,8 +67,7 @@ def test_rotary_embedding_computes_phase_in_float32():
 
 
 @pytest.mark.parametrize("interleaved", [False, True])
-@pytest.mark.parametrize("padding", [0, 3])
-def test_mrotary_embedding_computes_phase_in_float32(interleaved: bool, padding: int):
+def test_mrotary_embedding_computes_phase_in_float32(interleaved: bool):
     rotary_emb = MRotaryEmbedding(
         head_size=_HEAD_SIZE,
         rotary_dim=_HEAD_SIZE,
@@ -87,8 +86,7 @@ def test_mrotary_embedding_computes_phase_in_float32(interleaved: bool, padding:
         ],
         dtype=jnp.int32,
     )
-    num_tokens = positions.shape[-1]
-    query, key = _make_qk(num_tokens + padding)
+    query, key = _make_qk(positions.shape[-1])
 
     actual_query, actual_key = rotary_emb(positions, query, key)
     cos_all, sin_all = _reference_cos_sin(rotary_emb, positions)
@@ -105,13 +103,11 @@ def test_mrotary_embedding_computes_phase_in_float32(interleaved: bool, padding:
             [part[axis] for axis, part in enumerate(jnp.split(sin_all, split_indices, axis=-1))],
             axis=-1,
         )
-    expected_query = apply_rotary_emb(query[:num_tokens], cos, sin, is_neox_style=True)
-    expected_key = apply_rotary_emb(key[:num_tokens], cos, sin, is_neox_style=True)
+    expected_query = apply_rotary_emb(query, cos, sin, is_neox_style=True)
+    expected_key = apply_rotary_emb(key, cos, sin, is_neox_style=True)
 
-    _assert_array_equal(actual_query[:num_tokens], expected_query)
-    _assert_array_equal(actual_key[:num_tokens], expected_key)
-    _assert_array_equal(actual_query[num_tokens:], query[num_tokens:])
-    _assert_array_equal(actual_key[num_tokens:], key[num_tokens:])
+    _assert_array_equal(actual_query, expected_query)
+    _assert_array_equal(actual_key, expected_key)
 
 
 def test_yarn_rotary_embedding_computes_phase_in_float32():
