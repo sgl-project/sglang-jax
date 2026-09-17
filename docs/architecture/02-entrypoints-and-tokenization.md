@@ -229,11 +229,17 @@ engine = Engine(model_path="Qwen/Qwen2.5-7B")
 result = engine.generate(prompt="Hello", sampling_params={"max_new_tokens": 50})
 
 # Asynchronous
-async for chunk in engine.async_generate(prompt="Hello", sampling_params={"max_new_tokens": 50}, stream=True):
+chunks = await engine.async_generate(prompt="Hello", sampling_params={"max_new_tokens": 50}, stream=True)
+async for chunk in chunks:
     print(chunk)
 ```
 
 `generate()` builds a `GenerateReqInput` and delegates to `tokenizer_manager.generate_request()` for processing. In streaming mode, the async generator is wrapped as a sync generator.
+
+Both methods accept keyword-only `image_data` and `video_data`. For batched
+prompts, pass one media entry per prompt; nest lists for multiple images.
+Qwen-VL requires chat-template-formatted text in `prompt`, rather than
+multimodal `input_ids`. Pass media separately from `sampling_params`.
 
 **Extension APIs**:
 

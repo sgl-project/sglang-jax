@@ -157,6 +157,7 @@ class AccuracyCase:
     limit: int | None = None
     timeout: int | None = None
     score_threshold: float | None = None
+    score_upper_threshold: float | None = None
 
 
 # Default gsm8k sampling (greedy). Lives here (host-neutral, stdlib-only) so the
