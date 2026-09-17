@@ -228,7 +228,10 @@ class RecurrentStatePool:
                 self.conv_buffers[layer][i] = cbuf
 
     def clear(self) -> None:
-        self.recurrent_buffers, self.conv_buffers = self._create_buffers()
+        for layer in range(self.num_linear_recurrent_layers):
+            self.recurrent_buffers[layer] = jnp.zeros_like(self.recurrent_buffers[layer])
+            for inner in range(len(self.conv_buffers[layer])):
+                self.conv_buffers[layer][inner] = jnp.zeros_like(self.conv_buffers[layer][inner])
 
     def copy_slots(self, src_indices, dst_indices):
         """Clone src->dst slots across all layers; rows with src==0 keep dst.
