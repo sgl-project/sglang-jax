@@ -8,7 +8,6 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
@@ -18,12 +17,7 @@ _RECURRENT_ZERO_ALLOCATOR_CACHE: dict = {}
 
 
 def _get_recurrent_zero_allocator(shape, dtype, sharding):
-    """Return an allocator for independent recurrent/conv state buffers."""
-    if sharding.mesh.devices.flat[0].platform == "tt":
-        # Constant-only TT executables share cached outputs. In-place state
-        # kernels need a distinct allocation for every layer, as TT KV does.
-        return lambda: jax.device_put(np.zeros(shape, dtype=np.dtype(dtype)), sharding)
-
+    """Return a cached jax.jit(jnp.zeros) allocator for recurrent/conv buffers."""
     key = (
         id(sharding.mesh),
         tuple(shape),
