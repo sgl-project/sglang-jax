@@ -39,6 +39,7 @@ from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.model_loader.weights import WeightLoader, WeightSpec
+from sgl_jax.srt.utils.quantization.quantization_utils import is_int4_dtype
 
 logger = logging.getLogger(__name__)
 
@@ -813,9 +814,8 @@ class DeepseekV3ForCausalLM(nnx.Module):
         def _is_linear_quantized(subpath: str) -> bool:
             if not is_static_quant:
                 return False
-            path_parts = subpath.replace("[", ".").replace("]", "").split(".")
             for ig in ignored_layers:
-                if ig in path_parts or ig == subpath:
+                if subpath == ig or subpath.startswith(f"{ig}.") or subpath.endswith(f".{ig}"):
                     return False
             linear_rules = quant_config.get_linear_rules() if quant_config else []
             return bool(linear_rules)
@@ -920,10 +920,7 @@ class DeepseekV3ForCausalLM(nnx.Module):
             physical_to_logical_map = np.array(jax.device_get(metadata.physical_to_logical_map))
             phy_to_log = physical_to_logical_map[layer_idx]
 
-        int4_types = [
-            getattr(jnp, t) for t in ["int4", "uint4", "float4_e2m1fn"] if hasattr(jnp, t)
-        ]
-        is_int4_moe = getattr(quant_config, "moe_weight_dtype", None) in int4_types
+        is_int4_moe = is_int4_dtype(getattr(quant_config, "moe_weight_dtype", None))
         weight_suffix = "weight_packed" if is_int4_moe else "weight"
         scale_suffix = ".weight_scale" if is_int4_moe else ".weight_scale_inv"
 
