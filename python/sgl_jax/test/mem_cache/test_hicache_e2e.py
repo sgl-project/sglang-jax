@@ -262,7 +262,11 @@ class TestEvictAndLoadBack(HiCacheE2EBase):
         idx_b, _ = self._alloc_and_fill(len(seg_b), seed=12)
         self.cache.insert(InsertParams(key=_key(seg_a), value=idx_a))
         self.cache.insert(
-            InsertParams(key=_key(seg_a + seg_b), value=np.concatenate([idx_a, idx_b]))
+            InsertParams(
+                key=_key(seg_a + seg_b),
+                value=np.concatenate([idx_a, idx_b]),
+                prev_prefix_len=len(idx_a),
+            )
         )
         # Reuse to back both nodes up.
         self.cache.insert(InsertParams(key=_key(seg_a), value=idx_a, prev_prefix_len=len(idx_a)))
@@ -356,7 +360,11 @@ class TestWriteBack(HiCacheE2EBase):
         idx_b, _ = self._alloc_and_fill(len(seg_b), seed=32)
         self.cache.insert(InsertParams(key=_key(seg_a), value=idx_a))
         self.cache.insert(
-            InsertParams(key=_key(seg_a + seg_b), value=np.concatenate([idx_a, idx_b]))
+            InsertParams(
+                key=_key(seg_a + seg_b),
+                value=np.concatenate([idx_a, idx_b]),
+                prev_prefix_len=len(idx_a),
+            )
         )
         # No backup happened on these inserts.
         self.assertEqual(len(self.cache.ongoing_write), 0)
@@ -643,7 +651,9 @@ class TestPartialHit(HiCacheE2EBase):
         idx_b, orig_b = self._alloc_and_fill(len(seg_b), seed=62)
         self.cache.insert(InsertParams(key=_key(seg_a), value=idx_a))
         full = np.concatenate([idx_a, idx_b])
-        self.cache.insert(InsertParams(key=_key(seg_a + seg_b), value=full))
+        self.cache.insert(
+            InsertParams(key=_key(seg_a + seg_b), value=full, prev_prefix_len=len(idx_a))
+        )
         # Reuse both so both back up.
         self.cache.insert(InsertParams(key=_key(seg_a), value=idx_a, prev_prefix_len=len(idx_a)))
         self.cache.insert(
