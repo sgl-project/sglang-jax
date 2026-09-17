@@ -11,6 +11,7 @@ from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.layers.embeddings import Embed
+from sgl_jax.srt.layers.lm_head_parallel import compute_lm_head_logits
 from sgl_jax.srt.utils.jax_utils import device_array
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
@@ -252,6 +253,7 @@ class LogitsProcessor(nnx.Module):
     def __init__(self, vocab_size: int, mesh: Mesh, soft_cap: float | None = None):
         self.vocab_size = vocab_size
         self.soft_cap = soft_cap
+        self.enable_dp_lm_head = False
         self.mesh = mesh
 
     def _select_hidden_states(self, hidden_states: jax.Array, indices: jax.Array) -> jax.Array:
@@ -283,11 +285,16 @@ class LogitsProcessor(nnx.Module):
         def select_local_fn(local_logits, local_indices):
             return local_logits[local_indices]
 
+        spec = (
+            P("data", "tensor")
+            if self.vocab_size % self.mesh.shape["tensor"] == 0
+            else P("data", None)
+        )
         return jax.shard_map(
             select_local_fn,
             mesh=self.mesh,
-            in_specs=(P("data", "tensor"), P("data")),
-            out_specs=P("data", "tensor"),
+            in_specs=(spec, P("data")),
+            out_specs=spec,
         )(logits, indices)
 
     def _select_input_token_logprobs(
@@ -535,16 +542,9 @@ class LogitsProcessor(nnx.Module):
             (hidden_states, lm_head.embedding.value),
             dtype=lm_head.dtype,
         )
-        hidden_states = jax.sharding.reshard(
-            hidden_states,
-            NamedSharding(self.mesh, P("data", None)),
+        logits = compute_lm_head_logits(
+            hidden_states, embedding, self.mesh, self.vocab_size, self.enable_dp_lm_head
         )
-
-        logits = jnp.dot(
-            hidden_states, embedding.T, out_sharding=NamedSharding(self.mesh, P("data", "tensor"))
-        )
-
-        logits = logits[:, : self.vocab_size] if logits.ndim > 1 else logits[: self.vocab_size]
 
         if self.soft_cap:
             logits = self.soft_cap * jnp.tanh(logits / self.soft_cap)

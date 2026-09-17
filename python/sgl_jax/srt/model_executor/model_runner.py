@@ -584,6 +584,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.model_config.validate_tensor_parallel_config(self.attention_tp_size)
         self.model_config.configure_for_tensor_parallel(self.attention_tp_size)
         self.model_config.log_kv_heads_info(self.attention_tp_size)
+        self.model_config.hf_config.enable_dp_lm_head = self.server_args.enable_dp_lm_head
         self.model_config.hf_config.ep_size = self.ep_size
         self.model_config.hf_config.moe_dp_size = self.moe_dp_size
         self.model_config.hf_config.ep_num_redundant_experts = (
