@@ -1660,11 +1660,6 @@ class HybridLinearKVPool(KVCache):
             )
         self.full_kv_pool.replace_buffer(kv_buffer)
 
-    def set_kv_buffer_legacy(self, layer_id, loc, cache_k, cache_v):
-        return self.full_kv_pool.set_kv_buffer_legacy(
-            self._to_physical(layer_id), loc, cache_k, cache_v
-        )
-
     def get_kv_size_bytes(self):
         return self.full_kv_pool.get_kv_size_bytes()
 

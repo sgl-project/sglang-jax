@@ -1,6 +1,7 @@
-"""TT adapter semantics, with CPU references replacing only the device calls."""
+"""TT GDN parity with the upstream JAX backend and device state ownership."""
 
 import os
+from functools import partial
 from types import SimpleNamespace
 
 import jax
@@ -14,14 +15,13 @@ from sgl_jax.srt.hardware_backend.tt.attention.tt_backend import TTAttention
 from sgl_jax.srt.kernels.gdn.gated_delta import (
     _gated_delta_step,
     _scatter_idx0_safe,
-    decode_gated_delta_rule_ref,
-    jax_causal_conv1d_prefill,
     jax_causal_conv1d_update,
-    ragged_gated_delta_rule_ref,
 )
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
+    LinearRecurrentAttnBackendMetadata,
 )
+from sgl_jax.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
 
@@ -82,21 +82,23 @@ def reference_conv(state, value, weight, indices, initial):
     return state, out
 
 
-def make_backend(device, length, initial, num_k_heads=2, num_v_heads=4):
-    backend = TTGDNAttnBackend(
+def make_backend(
+    device, length, initial, num_k_heads=2, num_v_heads=4, backend_cls=TTGDNAttnBackend
+):
+    backend = backend_cls(
         num_k_heads=num_k_heads,
         num_v_heads=num_v_heads,
         head_k_dim=128,
         head_v_dim=128,
         conv_kernel_size=4,
-        mesh=jax.sharding.Mesh(np.array([device]), ("tensor",)),
+        mesh=jax.sharding.Mesh(np.array([[device]]), ("data", "tensor")),
         dtype=jnp.bfloat16,
+        prefill_impl="chunked_jax",
     )
-    backend.forward_metadata = SimpleNamespace(
+    backend.forward_metadata = LinearRecurrentAttnBackendMetadata(
         cu_q_lens=jnp.array([0, length], dtype=jnp.int32),
         recurrent_indices=jnp.array([1], dtype=jnp.int32),
         has_initial_state=jnp.array([initial]),
-        recurrent_track_indices=None,
     )
     return backend
 
@@ -124,58 +126,13 @@ def inputs(count, num_k_heads=2, num_v_heads=4, seed=35, slots=3):
     )
 
 
-def reference(backend, args, decode=False):
-    x, conv, state, b, a, weight, A_log, bias = args
-    meta = backend.forward_metadata
+@partial(jax.jit, static_argnames=("num_k_heads", "num_v_heads", "decode"))
+def reference(args, metadata, num_k_heads=2, num_v_heads=4, decode=False):
+    native = make_backend(jax.devices("cpu")[0], 1, False, num_k_heads, num_v_heads, GDNAttnBackend)
+    native.forward_metadata = metadata
     if decode:
-        y, new_conv = jax_causal_conv1d_update(
-            x,
-            conv,
-            meta.recurrent_indices,
-            weight,
-            activation="silu",
-            has_initial_state=meta.has_initial_state,
-        )
-        new_state, out = decode_gated_delta_rule_ref(
-            y,
-            b,
-            a,
-            state,
-            A_log,
-            bias,
-            meta.recurrent_indices,
-            n_kq=backend.num_k_heads,
-            n_v=backend.num_v_heads,
-            d_k=128,
-            d_v=128,
-            has_initial_state=meta.has_initial_state,
-        )
-    else:
-        y, new_conv = jax_causal_conv1d_prefill(
-            x.T,
-            weight,
-            cu_seqlens=meta.cu_q_lens,
-            conv_state=conv,
-            state_indices=meta.recurrent_indices,
-            has_initial_state=meta.has_initial_state,
-            activation="silu",
-        )
-        new_state, out = ragged_gated_delta_rule_ref(
-            y.T,
-            b,
-            a,
-            state,
-            A_log,
-            bias,
-            cu_seqlens=meta.cu_q_lens,
-            state_indices=meta.recurrent_indices,
-            has_initial_state=meta.has_initial_state,
-            n_kq=backend.num_k_heads,
-            n_v=backend.num_v_heads,
-            d_k=128,
-            d_v=128,
-        )
-    return out, new_conv, new_state
+        return native.forward_decode(*args)
+    return native.forward_extend(*args, seq_lens=None)
 
 
 @pytest.fixture
@@ -197,7 +154,7 @@ def test_prefill(reference_ops, length, initial, metadata_size):
         meta.has_initial_state = jnp.pad(meta.has_initial_state, (0, metadata_size - 1))
         meta.cu_q_lens = jnp.pad(meta.cu_q_lens, (0, metadata_size - 1), mode="edge")
         args = inputs((length + 31) // 32 * 32)
-        expected = reference(backend, args)
+        expected = reference(args, backend.forward_metadata)
         actual = backend.forward_extend(*args, seq_lens=None)
         # The reference leaves padded outputs unspecified; only live tokens
         # and the complete saved state are part of the serving contract.
@@ -223,7 +180,7 @@ def test_decode(reference_ops, indices, initial):
         backend.forward_metadata.recurrent_indices = jnp.array(indices, jnp.int32)
         backend.forward_metadata.has_initial_state = jnp.array(initial)
         args = inputs(len(indices), slots=max(indices) + 2)
-        expected = reference(backend, args, decode=True)
+        expected = reference(args, backend.forward_metadata, decode=True)
         actual = backend.forward_decode(*args)
         for result, wanted in zip(actual, expected):
             np.testing.assert_allclose(
@@ -278,11 +235,10 @@ def test_explicit_serving_mesh(decode, batch):
     def forward(indices, initial, lengths, *args):
         backend = make_backend(cpu, 1 if decode else 5, False)
         backend.mesh = mesh
-        backend.forward_metadata = SimpleNamespace(
+        backend.forward_metadata = LinearRecurrentAttnBackendMetadata(
             cu_q_lens=lengths,
             recurrent_indices=indices,
             has_initial_state=initial,
-            recurrent_track_indices=None,
         )
         if decode:
             return backend.forward_decode(*args)
@@ -309,11 +265,10 @@ def test_device_state_handoff(trace, heads, batch):
     def compile_forward(decode):
         def forward(indices, initial, lengths, *args):
             backend = make_backend(tt, 1, False, *heads)
-            backend.forward_metadata = SimpleNamespace(
+            backend.forward_metadata = LinearRecurrentAttnBackendMetadata(
                 cu_q_lens=lengths,
                 recurrent_indices=indices,
                 has_initial_state=initial,
-                recurrent_track_indices=None,
             )
             if decode:
                 return backend.forward_decode(*args)
@@ -367,7 +322,7 @@ def test_device_state_handoff(trace, heads, batch):
             backend.forward_metadata.recurrent_indices = jnp.array(indices, jnp.int32)
             backend.forward_metadata.has_initial_state = jnp.array(initial)
             backend.forward_metadata.cu_q_lens = jnp.asarray(np.cumsum([0, *lengths]), jnp.int32)
-            expected = reference(backend, host, decode=decode)
+            expected = reference(host, backend.forward_metadata, *heads, decode=decode)
         dynamic = to_device((sample[0], *sample[3:5]))
         metadata = to_device(
             (
