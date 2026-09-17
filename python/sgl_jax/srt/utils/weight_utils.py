@@ -31,6 +31,7 @@ from safetensors import safe_open
 from tqdm import tqdm
 
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.utils.quantization.quantization_utils import is_int4_dtype
 
 logger = logging.getLogger(__name__)
 
@@ -2137,10 +2138,7 @@ class WeightLoader:
                         target_path = mapping.target_path
                         model_param = self._get_param(params, target_path)
 
-                        int4_types = [
-                            getattr(jnp, t) for t in ["int4", "uint4", "float4_e2m1fn"] if hasattr(jnp, t)
-                        ]
-                        if model_param.value.dtype in int4_types and lazy_weight.dtype in [jnp.int32, jnp.uint32, jnp.int8, jnp.uint8]:
+                        if is_int4_dtype(model_param.value.dtype) and lazy_weight.dtype in [jnp.int32, jnp.uint32, jnp.int8, jnp.uint8]:
                             lazy_weight = unpack_4bit_jax(lazy_weight, model_param.value.dtype)
 
                         # Expand 2D block-quant scale to 3D kernel-ready layout.
@@ -2256,10 +2254,7 @@ class WeightLoader:
                     target_path = mapping.target_path[0]
                     model_param = self._get_param(params, target_path)
 
-                    int4_types = [
-                        getattr(jnp, t) for t in ["int4", "uint4", "float4_e2m1fn"] if hasattr(jnp, t)
-                    ]
-                    is_int4_weight = model_param.value.dtype in int4_types
+                    is_int4_weight = is_int4_dtype(model_param.value.dtype)
 
                     _pd_cache = os.environ.get("SGLANG_PD_WEIGHT_CACHE") == "1"
                     if _pd_cache and target_path in _PD_WEIGHT_CACHE:

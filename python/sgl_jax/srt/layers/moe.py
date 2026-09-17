@@ -184,6 +184,26 @@ class EPMoE(nnx.Module):
         except Exception as _:
             return False, "cpu"
 
+    def _get_wo_scale_sharding(
+        self, scale: jax.Array | None = None, is_block: bool | None = None
+    ) -> P:
+        """Derive the sharding spec for wo_scale.
+
+        When contracting-dimension block quantization is used (k_blocks > 1),
+        wo_scale's K-dimension is partitioned across the tensor axis.
+        """
+        if is_block is None:
+            if scale is not None:
+                is_block = scale.shape[1] > 1 if scale.ndim == 4 else scale.shape[-1] > 1
+            elif self.wo_scale is not None:
+                wo_scale_val = (
+                    self.wo_scale.value if hasattr(self.wo_scale, "value") else self.wo_scale
+                )
+                is_block = wo_scale_val.shape[1] > 1 if wo_scale_val is not None else False
+            else:
+                is_block = False
+        return P("expert", "tensor" if is_block else None, None, None)
+
     def _normalize_scale_for_gmm(
         self,
         scale: jax.Array | None,
@@ -231,7 +251,7 @@ class EPMoE(nnx.Module):
                         f"Expected k_blocks dimension to be 1 or {expected_k_blocks}."
                     )
             final_scale_sharding = (
-                P("expert", "tensor" if scale.shape[1] > 1 else None, None, None)
+                self._get_wo_scale_sharding(scale)
                 if scale_name == "wo_scale"
                 else P("expert", None, None, "tensor")
             )
@@ -258,7 +278,7 @@ class EPMoE(nnx.Module):
 
                 if scale.shape == (num_experts, out_dim, expected_k_blocks):
                     final_scale_sharding = (
-                        P("expert", "tensor" if expected_k_blocks > 1 else None, None, None)
+                        self._get_wo_scale_sharding(is_block=(expected_k_blocks > 1))
                         if scale_name == "wo_scale"
                         else P("expert", None, None, "tensor")
                     )
@@ -271,16 +291,15 @@ class EPMoE(nnx.Module):
                         if scale_name == "wo_scale"
                         else P("expert", "tensor", None)
                     )
+                    scale_per_out = scale.at[
+                        :, jnp.arange(out_dim, dtype=jnp.int32) // block_size_out, :
+                    ].get(out_sharding=scale_per_out_sharding)
+                    scale_gmm = jnp.transpose(scale_per_out, (0, 2, 1))[:, :, None, :]
                     final_scale_sharding = (
-                        P("expert", "tensor" if expected_k_blocks > 1 else None, None, None)
+                        self._get_wo_scale_sharding(is_block=(expected_k_blocks > 1))
                         if scale_name == "wo_scale"
                         else P("expert", None, None, "tensor")
                     )
-                    out_block_ids = jnp.arange(out_dim, dtype=jnp.int32) // block_size_out
-                    scale_per_out = scale.at[:, out_block_ids, :].get(
-                        out_sharding=scale_per_out_sharding
-                    )
-                    scale_gmm = jnp.transpose(scale_per_out, (0, 2, 1))[:, :, None, :]
                     return jax.sharding.reshard(scale_gmm, final_scale_sharding)
 
                 if scale.shape == (num_experts, expected_k_blocks, out_dim):
@@ -364,119 +383,65 @@ class EPMoE(nnx.Module):
                 k_blocks_wi = (hidden_size // block_size_k) if block_size_k else 1
                 k_blocks_wo = (intermediate_dim // block_size_k) if block_size_k else 1
                 wi_scale_sharding = P("expert", None, None, "tensor")
-                wo_scale_sharding = P("expert", "tensor" if k_blocks_wo > 1 else None, None, None)
+                wo_scale_sharding = self._get_wo_scale_sharding(is_block=(k_blocks_wo > 1))
                 wi_sharding = P("expert", None, "tensor")
                 wo_sharding = P("expert", "tensor", None)
 
                 is_abstract = isinstance(self.wi_0.value, jax.ShapeDtypeStruct)
 
-                if is_abstract:
-                    if hasattr(self, "wi_0_scale"):
-                        del self.wi_0_scale
-                    self.wi_0_scale = nnx.Param(
-                        jax.ShapeDtypeStruct(
-                            (num_experts, k_blocks_wi, 1, intermediate_dim),
-                            dtype=self.dtype,
-                            sharding=jax.sharding.NamedSharding(self.moe_mesh, wi_scale_sharding),
+                def _make_param(shape, dtype, sharding_spec):
+                    if is_abstract:
+                        return nnx.Param(
+                            jax.ShapeDtypeStruct(
+                                shape,
+                                dtype=dtype,
+                                sharding=jax.sharding.NamedSharding(self.moe_mesh, sharding_spec),
+                            )
                         )
+                    return nnx.Param(
+                        jnp.zeros(shape, dtype=dtype),
+                        out_sharding=sharding_spec,
                     )
 
-                    if hasattr(self, "wi_1_scale"):
-                        del self.wi_1_scale
-                    self.wi_1_scale = nnx.Param(
-                        jax.ShapeDtypeStruct(
-                            (num_experts, k_blocks_wi, 1, intermediate_dim),
-                            dtype=self.dtype,
-                            sharding=jax.sharding.NamedSharding(self.moe_mesh, wi_scale_sharding),
-                        )
-                    )
+                if hasattr(self, "wi_0_scale"):
+                    del self.wi_0_scale
+                self.wi_0_scale = _make_param(
+                    (num_experts, k_blocks_wi, 1, intermediate_dim),
+                    self.dtype,
+                    wi_scale_sharding,
+                )
 
-                    if hasattr(self, "wo_scale"):
-                        del self.wo_scale
-                    self.wo_scale = nnx.Param(
-                        jax.ShapeDtypeStruct(
-                            (num_experts, k_blocks_wo, 1, hidden_size),
-                            dtype=self.dtype,
-                            sharding=jax.sharding.NamedSharding(self.moe_mesh, wo_scale_sharding),
-                        )
-                    )
+                if hasattr(self, "wi_1_scale"):
+                    del self.wi_1_scale
+                self.wi_1_scale = _make_param(
+                    (num_experts, k_blocks_wi, 1, intermediate_dim),
+                    self.dtype,
+                    wi_scale_sharding,
+                )
 
-                    self.wi_0 = nnx.Param(
-                        jax.ShapeDtypeStruct(
-                            (num_experts, hidden_size, intermediate_dim),
-                            dtype=self.quantized_dtype,
-                            sharding=jax.sharding.NamedSharding(self.moe_mesh, wi_sharding),
-                        )
-                    )
-                    self.wi_1 = nnx.Param(
-                        jax.ShapeDtypeStruct(
-                            (num_experts, hidden_size, intermediate_dim),
-                            dtype=self.quantized_dtype,
-                            sharding=jax.sharding.NamedSharding(self.moe_mesh, wi_sharding),
-                        )
-                    )
-                    self.wo = nnx.Param(
-                        jax.ShapeDtypeStruct(
-                            (num_experts, intermediate_dim, hidden_size),
-                            dtype=self.quantized_dtype,
-                            sharding=jax.sharding.NamedSharding(self.moe_mesh, wo_sharding),
-                        )
-                    )
-                else:
-                    if hasattr(self, "wi_0_scale"):
-                        del self.wi_0_scale
-                    self.wi_0_scale = nnx.Param(
-                        jnp.zeros(
-                            (num_experts, k_blocks_wi, 1, intermediate_dim),
-                            dtype=self.dtype,
-                            out_sharding=wi_scale_sharding,
-                        ),
-                        out_sharding=wi_scale_sharding,
-                    )
+                if hasattr(self, "wo_scale"):
+                    del self.wo_scale
+                self.wo_scale = _make_param(
+                    (num_experts, k_blocks_wo, 1, hidden_size),
+                    self.dtype,
+                    wo_scale_sharding,
+                )
 
-                    if hasattr(self, "wi_1_scale"):
-                        del self.wi_1_scale
-                    self.wi_1_scale = nnx.Param(
-                        jnp.zeros(
-                            (num_experts, k_blocks_wi, 1, intermediate_dim),
-                            dtype=self.dtype,
-                            out_sharding=wi_scale_sharding,
-                        ),
-                        out_sharding=wi_scale_sharding,
-                    )
-
-                    if hasattr(self, "wo_scale"):
-                        del self.wo_scale
-                    self.wo_scale = nnx.Param(
-                        jnp.zeros(
-                            (num_experts, k_blocks_wo, 1, hidden_size),
-                            dtype=self.dtype,
-                            out_sharding=wo_scale_sharding,
-                        ),
-                        out_sharding=wo_scale_sharding,
-                    )
-
-                    self.wi_0 = nnx.Param(
-                        jnp.zeros(
-                            (num_experts, hidden_size, intermediate_dim),
-                            dtype=self.quantized_dtype,
-                        ),
-                        out_sharding=wi_sharding,
-                    )
-                    self.wi_1 = nnx.Param(
-                        jnp.zeros(
-                            (num_experts, hidden_size, intermediate_dim),
-                            dtype=self.quantized_dtype,
-                        ),
-                        out_sharding=wi_sharding,
-                    )
-                    self.wo = nnx.Param(
-                        jnp.zeros(
-                            (num_experts, intermediate_dim, hidden_size),
-                            dtype=self.quantized_dtype,
-                        ),
-                        out_sharding=wo_sharding,
-                    )
+                self.wi_0 = _make_param(
+                    (num_experts, hidden_size, intermediate_dim),
+                    self.quantized_dtype,
+                    wi_sharding,
+                )
+                self.wi_1 = _make_param(
+                    (num_experts, hidden_size, intermediate_dim),
+                    self.quantized_dtype,
+                    wi_sharding,
+                )
+                self.wo = _make_param(
+                    (num_experts, intermediate_dim, hidden_size),
+                    self.quantized_dtype,
+                    wo_sharding,
+                )
                 return
 
             # Quantize weights along k-dim (axis=1 in [g, k, n] layout)
@@ -540,7 +505,7 @@ class EPMoE(nnx.Module):
                 del self.wo_scale
             self.wo_scale = nnx.Param(
                 wo_scale,
-                out_sharding=P("expert", "tensor" if wo_scale.shape[1] > 1 else None, None, None),
+                out_sharding=self._get_wo_scale_sharding(wo_scale),
             )
 
     @named_scope
@@ -617,7 +582,7 @@ class EPMoE(nnx.Module):
                     # scales [g, 1, 1, n]
                     P("expert", None, None, "tensor"),
                     P("expert", None, None, "tensor"),
-                    P("expert", "tensor" if (wo_scale is not None and wo_scale.shape[1] > 1) else None, None, None),
+                    self._get_wo_scale_sharding(wo_scale),
                     # biases [g, 1, n] (unused)
                     P("expert", None, "tensor"),
                     P("expert", None, "tensor"),
