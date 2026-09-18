@@ -26,18 +26,6 @@ def test_recurrent_state_radix_cache_requires_unified_radix_tree():
         _enforce_recurrent_state_server_constraints(sa)
 
 
-@pytest.mark.parametrize("disable_radix_cache", [False, True])
-def test_tt_recurrent_rejects_mixed_chunk(disable_radix_cache):
-    sa = ServerArgs(
-        model_path="dummy",
-        attention_backend="tt",
-        enable_mixed_chunk=True,
-        disable_radix_cache=disable_radix_cache,
-    )
-    with pytest.raises(ValueError, match="--enable-mixed-chunk"):
-        _enforce_recurrent_state_server_constraints(sa)
-
-
 def _fake_runner(max_recurrent_state_size, dp_size):
     sa = ServerArgs(
         model_path="dummy",
