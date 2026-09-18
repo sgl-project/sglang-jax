@@ -128,6 +128,25 @@ def _pad_page_indices(
     return page_indices
 
 
+def _upload_eagle_pages(batch, pages, sharding, *, cacheable):
+    """Reuse only immutable, unrepacked page IDs within one speculative batch."""
+    source = getattr(batch, "allocated_page_indices", None)
+    cacheable = cacheable and isinstance(source, np.ndarray) and not source.flags.writeable
+    cached = getattr(batch, "eagle_page_indices_device_cache", None)
+    if (
+        cacheable
+        and cached is not None
+        and cached[0] is source
+        and cached[1] == sharding
+        and cached[2] == pages.shape
+    ):
+        return cached[3]
+    result = device_array(pages, sharding=sharding)
+    if cacheable:
+        batch.eagle_page_indices_device_cache = (source, sharding, pages.shape, result)
+    return result
+
+
 @register_pytree_node_class
 @dataclass
 class FlashAttentionMetadata:
@@ -300,13 +319,18 @@ class FlashAttention(AttentionBackend):
     def get_eagle_base_metadata(self, batch: ModelWorkerBatch):
         """Upload only allocated page ids; fused JITs rebuild dynamic metadata."""
         metadata = FlashAttentionMetadata()
-        page_indices = (
-            np.asarray(batch.cache_loc[:: self.page_size], dtype=np.int32) // self.page_size
-        )
+        page_indices = getattr(batch, "allocated_page_indices", None)
+        reuse_allocated_pages = page_indices is not None
+        if not reuse_allocated_pages:
+            page_indices = (
+                np.asarray(batch.cache_loc[:: self.page_size], dtype=np.int32) // self.page_size
+            )
         max_num_seqs = batch.dp_size * batch.per_dp_bs_size
         page_indices = _pad_page_indices(page_indices, max_num_seqs)
         data_sharding = NamedSharding(self.mesh, P("data"))
-        metadata.page_indices = device_array(page_indices, sharding=data_sharding)
+        metadata.page_indices = _upload_eagle_pages(
+            batch, page_indices, data_sharding, cacheable=reuse_allocated_pages
+        )
 
         if batch.forward_mode == ForwardMode.TARGET_VERIFY:
             metadata.custom_mask = batch.spec_info_padded.custom_mask
@@ -341,7 +365,12 @@ class FlashAttention(AttentionBackend):
         """Return the metadata for a forward pass."""
         # below code is for verify and draft extend phase
         metadata = FlashAttentionMetadata()
-        if page_indices is None:
+        reuse_allocated_pages = (
+            page_indices is None and getattr(batch, "allocated_page_indices", None) is not None
+        )
+        if reuse_allocated_pages:
+            page_indices = batch.allocated_page_indices
+        elif page_indices is None:
             indices = np.arange(0, len(batch.cache_loc), self.page_size)
             selected_cache_locs = batch.cache_loc[indices]
             page_indices = (selected_cache_locs // self.page_size).astype(np.int32)
@@ -442,6 +471,9 @@ class FlashAttention(AttentionBackend):
                 src_off[r] += int(alloc_pg[k])
                 dst_off[r] += n
             page_indices = new_pi
+            reuse_allocated_pages = (
+                False  # This request-length repack cannot reuse allocated pages.
+            )
 
         if distribution is None:
             seq_2d = np.asarray(batch.seq_lens).reshape(dp_size, per_dp_bs)
@@ -461,15 +493,24 @@ class FlashAttention(AttentionBackend):
 
         seq_lens = np.array(seq_lens)
         metadata.cu_q_lens = cu_q_lens
-        if isinstance(distribution, jax.Array):
+        data_sharding = NamedSharding(self.mesh, P("data"))
+        if reuse_allocated_pages:
+            metadata.page_indices = _upload_eagle_pages(
+                batch, page_indices, data_sharding, cacheable=True
+            )
+            if isinstance(distribution, jax.Array):
+                metadata.distribution = distribution
+                metadata.cu_kv_lens, metadata.seq_lens = device_array(
+                    (cu_kv_lens, seq_lens), sharding=data_sharding
+                )
+            else:
+                metadata.cu_kv_lens, metadata.seq_lens, metadata.distribution = device_array(
+                    (cu_kv_lens, seq_lens, distribution), sharding=data_sharding
+                )
+        elif isinstance(distribution, jax.Array):
             metadata.distribution = distribution
-            (
-                metadata.cu_kv_lens,
-                metadata.page_indices,
-                metadata.seq_lens,
-            ) = device_array(
-                (cu_kv_lens, page_indices, seq_lens),
-                sharding=(NamedSharding(self.mesh, P("data"))),
+            metadata.cu_kv_lens, metadata.page_indices, metadata.seq_lens = device_array(
+                (cu_kv_lens, page_indices, seq_lens), sharding=data_sharding
             )
         else:
             (
@@ -479,7 +520,7 @@ class FlashAttention(AttentionBackend):
                 metadata.distribution,
             ) = device_array(
                 (cu_kv_lens, page_indices, seq_lens, distribution),
-                sharding=(NamedSharding(self.mesh, P("data"))),
+                sharding=data_sharding,
             )
         # Hybrid SWA targets need swa_page_indices for TARGET_VERIFY too,
         # otherwise SWA layers index the swa sub-pool with full-pool page ids.
@@ -688,7 +729,11 @@ class FlashAttention(AttentionBackend):
             P(self.attention_data_partition_axis, self.kv_partition_axis),  # keys (new tokens)
             P(self.attention_data_partition_axis, self.kv_partition_axis),  # values (new tokens)
             P(
-                self.attention_data_partition_axis, None, self.kv_partition_axis, None, None
+                self.attention_data_partition_axis,
+                None,
+                self.kv_partition_axis,
+                None,
+                None,
             ),  # kv_cache_fused (head interleaved)
             P(self.attention_data_partition_axis),  # kv_lens
             P(self.attention_data_partition_axis),  # page_indices
@@ -708,7 +753,11 @@ class FlashAttention(AttentionBackend):
         out_specs = (
             P(self.attention_data_partition_axis, self.kv_partition_axis),  # attention output
             P(
-                self.attention_data_partition_axis, None, self.kv_partition_axis, None, None
+                self.attention_data_partition_axis,
+                None,
+                self.kv_partition_axis,
+                None,
+                None,
             ),  # updated kv_cache_fused (head interleaved) - 3D: [total_tokens, num_kv_heads*2, head_dim]
         )
 

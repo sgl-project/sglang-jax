@@ -424,10 +424,10 @@ class SamplingBatchInfo:
     def __len__(self):
         return len(self.temperatures)
 
-    def update_penalties(self):
+    def update_penalties(self, out: np.ndarray | None = None):
         if self.penalizer_orchestrator.is_required:
             # Get penalty array directly from orchestrator - no np.zeros() needed!
-            self.linear_penalty = self.penalizer_orchestrator.apply()
+            self.linear_penalty = self.penalizer_orchestrator.apply(out=out)
         else:
             self.linear_penalty = None
 

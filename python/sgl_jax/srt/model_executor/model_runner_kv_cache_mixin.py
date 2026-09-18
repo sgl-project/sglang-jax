@@ -897,12 +897,20 @@ class ModelRunnerKVCacheMixin:
         return get_qwen3_5_hybrid_config(self.model_config.hf_config)
 
     @property
+    def qwen4_exp_config(self: ModelRunner):
+        from sgl_jax.srt.configs.qwen4_exp import get_qwen4_exp_config
+
+        return get_qwen4_exp_config(self.model_config.hf_config)
+
+    @property
     def linear_recurrent_config(self: ModelRunner):
         """Return linear recurrent config if the model has linear attention, else None."""
         if self.kimi_linear_config is not None:
             return self.kimi_linear_config
         if self.qwen3_5_hybrid_config is not None:
             return self.qwen3_5_hybrid_config.text_config
+        if self.qwen4_exp_config is not None:
+            return self.qwen4_exp_config.text_config
         return self.lightning_config
 
     def _kv_pool_layer_count(self: ModelRunner):

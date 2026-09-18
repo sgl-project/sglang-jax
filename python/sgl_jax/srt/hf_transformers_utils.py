@@ -25,6 +25,7 @@ from sgl_jax.srt.configs.bailing_hybrid import BailingHybridConfig
 from sgl_jax.srt.configs.gemma4 import Gemma4Config
 from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
 from sgl_jax.srt.configs.qwen3_5 import Qwen3_5DenseConfig, Qwen3_5HybridConfig
+from sgl_jax.srt.configs.qwen4_exp import Qwen4ExpConfig
 from sgl_jax.srt.managers.tiktoken_tokenizer import TiktokenTokenizer
 from sgl_jax.srt.utils.common_utils import is_remote_url, lru_cache_frozenset
 
@@ -45,6 +46,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
         GlmMoeDsaConfig,
         Qwen3_5HybridConfig,
         Qwen3_5DenseConfig,
+        Qwen4ExpConfig,
         Gemma4Config,
     ]
 }
@@ -67,6 +69,12 @@ for name, cls in _CONFIG_REGISTRY.items():
 # ours to win for both the MoE and dense root model types.
 AutoConfig.register("qwen3_5_moe", Qwen3_5HybridConfig, exist_ok=True)
 AutoConfig.register("qwen3_5", Qwen3_5DenseConfig, exist_ok=True)
+
+# Same treatment for qwen4_exp, preemptively: no shipped transformers owns the
+# name yet, so the loop above already wins, but ours is not interchangeable
+# either (same rope flattening + hybrid/GDN interface) and the loop's
+# suppress(ValueError) would hand the name to stock silently once it lands.
+AutoConfig.register("qwen4_exp", Qwen4ExpConfig, exist_ok=True)
 
 
 _UNSET = object()
