@@ -44,6 +44,7 @@ class StageConfigRegistry:
         # MiMo Audio series
         "XiaomiMiMo/MiMo-Audio-7B-Instruct": "mimo_audio_stage_config.yaml",
         "XiaomiMiMo/MiMo-Audio-7B-Base": "mimo_audio_stage_config.yaml",
+        "moonshotai/Kimi-K2.5": "kimi_k2_5_stage_config.yaml",
         "black-forest-labs/FLUX.1-dev": "flux1_dev_stage_config.yaml",
     }
 
@@ -53,6 +54,7 @@ class StageConfigRegistry:
         ("Wan2.1", "wan2_1_stage_config.yaml"),
         ("Qwen2.5-VL", "qwen2_5_vl_stage_config.yaml"),
         ("Qwen3-Omni", "qwen3_omni_stage_config.yaml"),
+        ("Kimi-K2.5", "kimi_k2_5_stage_config.yaml"),
         ("MiMo-Audio-7B-Instruct", "mimo_audio_stage_config.yaml"),
         ("MiMo-Audio-7B-Base", "mimo_audio_stage_config.yaml"),
         ("FLUX.1-dev", "flux1_dev_stage_config.yaml"),

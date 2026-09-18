@@ -1,0 +1,22 @@
+model_arch: Kimi-K2.5
+stage_args:
+ - stage_id: 0
+   stage_sub_dir: ""
+   runtime:
+     num_tpus: 1
+     max_batch_size: 1
+     device_kind: cpu
+   scheduler: vit
+   final_output: false
+   scheduler_params: {}
+   model_class: Kimi_K25_VisionModel
+
+ - stage_id: 1
+   stage_sub_dir: ""
+   runtime:
+     num_tpus: 8
+     max_batch_size: 1
+   scheduler: auto_regressive
+   scheduler_params: {}
+   model_class: KimiK25ForConditionalGeneration
+   final_output: true

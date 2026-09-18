@@ -42,7 +42,6 @@ class Learnable2DInterPosEmbDivided_fixed(nnx.Module):
 
         pos_embs = []
         for t, h, w in grid_thws:
-            assert t <= self.num_frames, f"t:{t} > self.num_frames:{self.num_frames}"
             if (h, w) == self.weight.shape[:-1]:
                 pos_emb_2d = self.weight.reshape(-1, self.weight.shape[-1])
             else:
@@ -190,6 +189,7 @@ class KimiK25VisionAttention(nnx.Module):
         hidden_states: jax.Array,
         cu_seqlens: jax.Array,
         position_embeddings: jax.Array,
+        seq_lens: tuple[int, ...] | None = None,
     ) -> jax.Array:
         sum_seq_len, D = hidden_states.shape
 
@@ -204,30 +204,52 @@ class KimiK25VisionAttention(nnx.Module):
         q = apply_2d_rope(q, cos_emb, sin_emb)
         k = apply_2d_rope(k, cos_emb, sin_emb)
 
-        align_seq_len = align_to(sum_seq_len, 256)
+        is_cpu = list(self.mesh.devices.flat)[0].platform == "cpu"
 
-        pad_q = q
-        pad_k = k
-        pad_v = v
-
-        if sum_seq_len != align_seq_len:
-            pad_q = jnp.pad(q, ((0, align_seq_len - sum_seq_len), (0, 0), (0, 0)))
-            pad_k = jnp.pad(k, ((0, align_seq_len - sum_seq_len), (0, 0), (0, 0)))
-            pad_v = jnp.pad(v, ((0, align_seq_len - sum_seq_len), (0, 0), (0, 0)))
+        # Attention here is block-diagonal (patches only attend within their own
+        # item), so on CPU the same kernel is invoked once per item instead of
+        # once over the concatenated sequence. Same result, much smaller grid.
+        if is_cpu and seq_lens:
+            return self._segmented_attention(q, k, v, seq_lens).reshape(sum_seq_len, D)
 
         indices = jnp.arange(sum_seq_len)
         item_ids = jnp.sum(indices[:, None] >= cu_seqlens[1:][None, :], axis=-1) + 1
 
-        seg_q = jnp.pad(item_ids, (0, align_seq_len - sum_seq_len))
-        seg_kv = jnp.pad(item_ids, (0, align_seq_len - sum_seq_len))
+        output = self._flash_attention(q, k, v, item_ids, interpret=is_cpu)
 
-        segment_ids = SegmentIds(q=seg_q[None, :], kv=seg_kv[None, :])
+        return output.reshape(sum_seq_len, D)
 
-        pad_q = jnp.transpose(pad_q, (1, 0, 2))[None, ...]
-        pad_k = jnp.transpose(pad_k, (1, 0, 2))[None, ...]
-        pad_v = jnp.transpose(pad_v, (1, 0, 2))[None, ...]
+    def _flash_attention(
+        self,
+        q: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
+        item_ids: jax.Array,
+        interpret: bool,
+    ) -> jax.Array:
+        """Run the Pallas kernel over ``[seq_len, num_heads, head_dim]`` inputs.
 
-        is_cpu = list(self.mesh.devices.flat)[0].platform == "cpu"
+        The sequence is padded up to the kernel's 256-wide query block. Padded
+        positions get segment id 0, which no real token carries, so the kernel
+        masks them out. ``item_ids`` gives each real token the 1-based index of
+        the item it belongs to, which is what makes attention block-diagonal.
+        """
+        seq_len = q.shape[0]
+        align_seq_len = align_to(seq_len, 256)
+        pad_len = align_seq_len - seq_len
+
+        if pad_len:
+            padding = ((0, pad_len), (0, 0), (0, 0))
+            q = jnp.pad(q, padding)
+            k = jnp.pad(k, padding)
+            v = jnp.pad(v, padding)
+
+        seg = jnp.pad(item_ids, (0, pad_len))
+        segment_ids = SegmentIds(q=seg[None, :], kv=seg[None, :])
+
+        pad_q = jnp.transpose(q, (1, 0, 2))[None, ...]
+        pad_k = jnp.transpose(k, (1, 0, 2))[None, ...]
+        pad_v = jnp.transpose(v, (1, 0, 2))[None, ...]
 
         def local_flash_attention(q, k, v, segment_ids):
             return flash_attention(
@@ -237,14 +259,14 @@ class KimiK25VisionAttention(nnx.Module):
                 segment_ids=segment_ids,
                 causal=False,
                 sm_scale=self.scale,
-                interpret=is_cpu,
+                interpret=interpret,
             )
 
         in_specs = (
             jax.sharding.PartitionSpec(None, None, None, None),
             jax.sharding.PartitionSpec(None, None, None, None),
             jax.sharding.PartitionSpec(None, None, None, None),
-            jax.sharding.PartitionSpec() if segment_ids is not None else None,
+            jax.sharding.PartitionSpec(),
         )
 
         output = jax.shard_map(
@@ -255,10 +277,45 @@ class KimiK25VisionAttention(nnx.Module):
             check_vma=False,
         )(pad_q, pad_k, pad_v, segment_ids)
 
-        output = jnp.transpose(output[0], (1, 0, 2))
-        output = output[:sum_seq_len, :, :].reshape(sum_seq_len, D)
+        return jnp.transpose(output[0], (1, 0, 2))[:seq_len, :, :]
 
-        return output
+    def _segmented_attention(
+        self,
+        q: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
+        seq_lens: tuple[int, ...],
+    ) -> jax.Array:
+        """Block-diagonal attention, one kernel invocation per item.
+
+        ``q``/``k``/``v`` are ``[sum(seq_lens), num_heads, head_dim]``. Since
+        patches only attend within their own item, slicing the sequence per item
+        and running the kernel on each slice computes exactly what one masked
+        call over the concatenated sequence would -- but the emulated grid costs
+        ``sum(n_i^2)`` blocks instead of ``(sum n_i)^2``. For the Kimi demo video
+        (8 chunks, ~26k patches) that is a ~8x reduction; for a single image
+        there is only one item and nothing changes.
+
+        ``seq_lens`` is static, so the loop is unrolled at trace time.
+        """
+        outputs = []
+        start = 0
+        for length in seq_lens:
+            end = start + length
+            # One item per call, so every real token shares segment id 1; only
+            # the alignment padding inside the helper is masked off.
+            outputs.append(
+                self._flash_attention(
+                    q[start:end],
+                    k[start:end],
+                    v[start:end],
+                    jnp.ones(length, dtype=jnp.int32),
+                    interpret=True,
+                )
+            )
+            start = end
+
+        return jnp.concatenate(outputs, axis=0)
 
 
 class KimiK25VisionMLP(nnx.Module):
@@ -329,6 +386,7 @@ class KimiK25VisionBlock(nnx.Module):
         hidden_states: jax.Array,
         cu_seqlens: jax.Array,
         rope_freqs_cis: jax.Array,
+        seq_lens: tuple[int, ...] | None = None,
     ):
         residual = hidden_states
         hidden_states = self.pre_norm(hidden_states)
@@ -336,6 +394,7 @@ class KimiK25VisionBlock(nnx.Module):
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=rope_freqs_cis,
+            seq_lens=seq_lens,
         )
         hidden_states = self.proj(hidden_states)
         hidden_states = residual + hidden_states
@@ -386,14 +445,88 @@ class VisionTowerEncoder(nnx.Module):
         hidden_states: jax.Array,
         rope_freqs_cis: jax.Array,
         cu_seqlens: jax.Array,
+        seq_lens: tuple[int, ...] | None = None,
     ) -> jax.Array:
 
         for block in self.blocks:
-            hidden_states = block(hidden_states, cu_seqlens, rope_freqs_cis=rope_freqs_cis)
+            hidden_states = block(
+                hidden_states,
+                cu_seqlens,
+                rope_freqs_cis=rope_freqs_cis,
+                seq_lens=seq_lens,
+            )
 
         hidden_states = self.final_layernorm(hidden_states)
 
         return hidden_states
+
+
+def build_temporal_merge_plan(
+    grid_thws,
+    merge_kernel_size,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Plan the sd2_tpool merge for a batch of image and/or video items.
+
+    The merger groups merge_h * merge_w neighboring patches and averages over
+    the temporal axis. Items in a batch can have different frame counts (an image
+    has t == 1, a video has t > 1), so the temporal axis is padded to the
+    batch-wide maximum with duplicated, zero-weighted slots. That keeps a single
+    static-shaped gather for the whole batch while leaving each item's mean exact,
+    including when t does not divide max_t.
+
+    Args:
+        grid_thws: Sequence of (t, h, w) patch grids, one per item, matching
+            the order of the flattened patch sequence.
+        merge_kernel_size: (merge_h, merge_w) spatial merge kernel.
+
+    Returns:
+        merge_indices shaped [num_output_tokens, merge_h * merge_w, max_t]
+        with indices into the flat patch sequence, and merge_weights shaped
+        [num_output_tokens, max_t] holding 1 / t for real frames and 0 for
+        padded slots.
+    """
+    if len(grid_thws) == 0:
+        raise ValueError("grid_thws must contain at least one (t, h, w) grid")
+
+    merge_h, merge_w = merge_kernel_size
+    grids = [(int(t), int(h), int(w)) for t, h, w in grid_thws]
+    max_t = max(t for t, _, _ in grids)
+
+    all_merge_indices = []
+    all_merge_weights = []
+    token_offset = 0
+
+    for t, h, w in grids:
+        if h % merge_h or w % merge_w:
+            raise ValueError(
+                f"grid_thw {(t, h, w)} is not divisible by merge kernel " f"{(merge_h, merge_w)}"
+            )
+
+        new_h, new_w = h // merge_h, w // merge_w
+
+        indices = np.arange(token_offset, token_offset + t * h * w, dtype=np.int32)
+        indices = indices.reshape(t, new_h, merge_h, new_w, merge_w)
+        indices = indices.transpose(1, 3, 2, 4, 0)
+        indices = indices.reshape(new_h * new_w, merge_h * merge_w, t)
+
+        if t < max_t:
+            # Duplicate the first frame into the padded slots. They carry weight 0,
+            # so they never contribute; duplicating a valid index just keeps the
+            # gather in bounds.
+            padding = np.repeat(indices[:, :, :1], max_t - t, axis=2)
+            indices = np.concatenate([indices, padding], axis=2)
+
+        weights = np.zeros((new_h * new_w, max_t), dtype=np.float32)
+        weights[:, :t] = 1.0 / t
+
+        all_merge_indices.append(indices)
+        all_merge_weights.append(weights)
+        token_offset += t * h * w
+
+    return (
+        np.concatenate(all_merge_indices, axis=0),
+        np.concatenate(all_merge_weights, axis=0),
+    )
 
 
 class VisionTower(nnx.Module):
@@ -434,31 +567,18 @@ class VisionTower(nnx.Module):
         self,
         grid_thws,
     ):
-        all_merge_indices = []
-        token_offset = 0
+        """Build the host-side arrays the ViT body needs for one batch.
 
-        max_t = max(t for t, h, w in grid_thws)
+        Args:
+            grid_thws: Sequence of (t, h, w) patch grids, one per item.
+                t == 1 is a still image; t > 1 is a video.
 
-        # Alternative for tpool_patch_merger to build aux arrays to enable jit compilation of ViT layers
-        for t, h, w in grid_thws:
-            merge_h, merge_w = self.merge_kernel_size
-            new_h, new_w = h // merge_h, w // merge_w
-
-            indices = np.arange(token_offset, token_offset + t * h * w)
-
-            indices = indices.reshape(t, new_h, merge_h, new_w, merge_w)
-
-            indices = indices.transpose(1, 3, 2, 4, 0)
-
-            indices = indices.reshape(new_h * new_w, merge_h * merge_w, t)
-
-            repeats = max_t // t
-            indices = np.tile(indices, (1, 1, repeats))
-
-            all_merge_indices.append(indices)
-            token_offset += t * h * w
-
-        merge_indices = np.concatenate(all_merge_indices, axis=0)
+        Returns:
+            (rope_freqs_cis, cu_seqlens, abs_pos_embs, merge_indices,
+            merge_weights). The last two are consumed by compute_hidden_states
+            to pool merge_h * merge_w patches spatially and t frames temporally.
+        """
+        merge_indices, merge_weights = build_temporal_merge_plan(grid_thws, self.merge_kernel_size)
 
         rope_freqs_cis = self.rope_2d._get_freqs_cis(grid_thws=grid_thws)
 
@@ -474,7 +594,7 @@ class VisionTower(nnx.Module):
 
         abs_pos_embs = self.patch_embed.pos_emb(grid_thws)
 
-        return rope_freqs_cis, cu_seqlens, abs_pos_embs, merge_indices
+        return rope_freqs_cis, cu_seqlens, abs_pos_embs, merge_indices, merge_weights
 
     def compute_hidden_states(
         self,
@@ -483,16 +603,35 @@ class VisionTower(nnx.Module):
         rope_freq_cis: jax.Array,
         cu_seqlens: jax.Array,
         merge_indices: jax.Array,
-    ) -> list[jax.Array]:
+        merge_weights: jax.Array | None = None,
+        seq_lens: tuple[int, ...] | None = None,
+    ) -> jax.Array:
+        """Run the ViT body and merge patches into merge_h * merge_w groups.
+
+        merge_weights averages every item over its own frame count. It is
+        required whenever a batch mixes items with different t (an image plus
+        a video, or two videos with different frame counts). When omitted, all
+        temporal slots are averaged uniformly, which matches the behavior of
+        batches where every item has the same t.
+
+        seq_lens is the static per-item patch count (t * h * w), the same
+        information cu_seqlens carries but available at trace time. The CPU
+        attention path needs static bounds to slice the block-diagonal attention;
+        on TPU it is unused.
+        """
 
         hidden_states = self.patch_embed(pixel_values)
         hidden_states = hidden_states + abs_pos_embs
 
-        hidden_states = self.encoder(hidden_states, rope_freq_cis, cu_seqlens)
+        hidden_states = self.encoder(hidden_states, rope_freq_cis, cu_seqlens, seq_lens=seq_lens)
 
         merged_states = hidden_states[merge_indices]
 
-        merged_states = merged_states.mean(axis=2)
+        if merge_weights is None:
+            merged_states = merged_states.mean(axis=2)
+        else:
+            weights = jnp.asarray(merge_weights, dtype=merged_states.dtype)
+            merged_states = (merged_states * weights[:, None, :, None]).sum(axis=2)
 
         return merged_states
 
@@ -510,7 +649,10 @@ class Kimi_K25_MultiModalProjector(nnx.Module):
 
         _rngs = rngs or nnx.Rngs(0)
         self.pre_norm = nnx.LayerNorm(
-            config.vt_hidden_size, config.projector_ln_eps, param_dtype=dtype, rngs=_rngs
+            config.vt_hidden_size,
+            epsilon=config.projector_ln_eps,
+            param_dtype=dtype,
+            rngs=_rngs,
         )
 
         self.proj_0 = nnx.Linear(

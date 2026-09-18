@@ -7,7 +7,7 @@ from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
-from sgl_jax.srt.multimodal.configs.config_registry import get_qwen_vl_config
+from sgl_jax.srt.multimodal.configs.config_registry import get_vl_config
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 
 
@@ -34,7 +34,7 @@ class VitModelRunner(BaseModelRunner):
         self.initialize_jit()
 
     def load_model(self):
-        self.model_config = get_qwen_vl_config(self.server_args.model_path)
+        self.model_config = get_vl_config(self.model_class, self.server_args.model_path)
         self.model_config.model_path = self.server_args.model_path
         self.model_config.model_class = self.model_class
         self.model = self.model_loader.load_model(
@@ -42,6 +42,90 @@ class VitModelRunner(BaseModelRunner):
         )
 
     def initialize_jit(self):
+        if getattr(type(self.model), "__name__", "") == "Kimi_K25_VisionModel":
+            self._initialize_jit_kimi()
+        else:
+            self._initialize_jit_qwen()
+
+    def _initialize_jit_kimi(self):
+        model_def, model_state = nnx.split(self.model)
+        model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
+
+        def _encode_vision_impl(
+            model_def,
+            model_state_def,
+            model_state_leaves,
+            pixel_values,
+            abs_pos_embs,
+            rope_freqs_cis,
+            cu_seqlens,
+            merge_indices,
+            merge_weights,
+            seq_lens=None,
+        ):
+            model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
+            model = nnx.merge(model_def, model_state)
+            hidden_states = model.vision_tower.compute_hidden_states(
+                pixel_values,
+                abs_pos_embs,
+                rope_freqs_cis,
+                cu_seqlens,
+                merge_indices,
+                merge_weights,
+                seq_lens=seq_lens,
+            )
+            return model.mm_projector(hidden_states)
+
+        encode_vision = jax.jit(
+            _encode_vision_impl, static_argnames=["model_state_def", "seq_lens"]
+        )
+
+        def _to_static_grid(grid_thw):
+            if grid_thw is None:
+                return ()
+            if isinstance(grid_thw, tuple):
+                return tuple(tuple(int(x) for x in row) for row in grid_thw)
+            grid = np.asarray(grid_thw)
+            if grid.size == 0:
+                return ()
+            return tuple(tuple(int(x) for x in row) for row in grid.tolist())
+
+        def encode_vision_wrapper(pixel_values, image_grid_thw, video_grid_thw):
+            # Images and video chunks go through the same tower; only ``t``
+            # differs, and the tower pools those frames away.
+            combined_grid_thw = _to_static_grid(image_grid_thw) + _to_static_grid(video_grid_thw)
+            if not combined_grid_thw:
+                return jnp.zeros(
+                    (0, self.model.config.text_hidden_size),
+                    dtype=pixel_values.dtype if pixel_values is not None else jnp.float32,
+                )
+
+            (
+                rope_freqs_cis,
+                cu_seqlens,
+                abs_pos_embs,
+                merge_indices,
+                merge_weights,
+            ) = self.model.vision_tower.compute_aux_arrays(combined_grid_thw)
+
+            seq_lens = tuple(int(t) * int(h) * int(w) for t, h, w in combined_grid_thw)
+
+            return encode_vision(
+                model_def,
+                model_state_def,
+                model_state_leaves,
+                pixel_values.astype(self.model.dtype),
+                abs_pos_embs,
+                rope_freqs_cis,
+                cu_seqlens,
+                merge_indices,
+                merge_weights,
+                seq_lens=seq_lens,
+            )
+
+        self.jitted_encode_vision = encode_vision_wrapper
+
+    def _initialize_jit_qwen(self):
         model_def, model_state = nnx.split(self.model)
         model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
 
@@ -119,7 +203,13 @@ class VitModelRunner(BaseModelRunner):
         if vision_embeds.size == 0:
             return None
 
-        image_token_id = mm_inputs.get("im_token_id") or mm_inputs.get("image_token_id")
+        # Kimi-K2.5 marks every media slot (image or video chunk) with a single
+        # media placeholder token instead of separate image/video tokens.
+        image_token_id = (
+            mm_inputs.get("im_token_id")
+            or mm_inputs.get("image_token_id")
+            or mm_inputs.get("media_placeholder_token_id")
+        )
         video_token_id = mm_inputs.get("video_token_id")
         placeholder_token_ids = [tok for tok in (image_token_id, video_token_id) if tok is not None]
         if not placeholder_token_ids:
