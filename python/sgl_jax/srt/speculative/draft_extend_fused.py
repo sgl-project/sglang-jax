@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import replace
 from functools import partial
 from typing import NamedTuple
 
@@ -14,6 +15,7 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.speculative.kernel import top_k_renorm_prob, top_p_renorm_prob
+from sgl_jax.srt.layers.lm_head_parallel import argmax_with_dp_sharding
 from sgl_jax.srt.sampling.sampling_params import TOP_K_ALL
 from sgl_jax.srt.speculative.relay_buffer import (
     gather_spec_relay_buffers,
@@ -496,7 +498,7 @@ def _reshard_values(sharding, *values):
 
 
 def _topk1_index_from_logits(logits):
-    topk_idx = jnp.argmax(logits, axis=-1).astype(jnp.int32)[:, None]
+    topk_idx = argmax_with_dp_sharding(logits)[:, None]
     return topk_idx
 
 
@@ -531,6 +533,7 @@ def _build_draft_extend(num_layers: int, topk: int):
         update_relay,
         dp_size,
     ):
+        logits_metadata = replace(logits_metadata, preserve_vocab_sharding=True)
         all_topk_index = []
         all_pool_updates = []
         layer0_hidden = None
@@ -909,7 +912,7 @@ def _make_eagle3_decode_metadata(
 
 
 def _eagle3_raw_and_mapped_token_from_logits(logits, hot_token_ids):
-    raw_token = jnp.argmax(logits, axis=-1).astype(jnp.int32)
+    raw_token = argmax_with_dp_sharding(logits)
     if hot_token_ids is None:
         return raw_token, raw_token
     return raw_token, _map_eagle3_token_ids(raw_token, hot_token_ids)
@@ -959,6 +962,7 @@ def _build_eagle3_recurrent_draft_extend(num_steps: int, topk: int):
         update_relay,
         dp_size,
     ):
+        logits_metadata = replace(logits_metadata, preserve_vocab_sharding=True)
         state = jax.tree_util.tree_unflatten(model_state_def, model_leaves)
         model = nnx.merge(model_def, state)
         base_metadata = forward_batch.attn_backend.forward_metadata
@@ -1199,6 +1203,10 @@ def _build_verify(topk: int):
 
         target_state = jax.tree_util.tree_unflatten(target_model_state_def, target_leaves)
         target_model = nnx.merge(target_model_def, target_state)
+        target_logits_metadata = replace(
+            target_logits_metadata,
+            preserve_vocab_sharding=is_greedy and not return_target_logits,
+        )
         target_output, target_pool_updates, _, _ = target_model(
             target_forward_batch,
             target_memory_pools,
@@ -1214,7 +1222,7 @@ def _build_verify(topk: int):
         sampling_rng = jax.random.fold_in(sampling_base_rng, sampling_step)
         simulation_rng = jax.random.fold_in(sampling_rng, 1)
         if is_greedy:
-            target_predict = jnp.argmax(target_logits, axis=-1).astype(jnp.int32).reshape(-1)
+            target_predict = argmax_with_dp_sharding(target_logits).reshape(-1)
             prepared = _verify_greedy(
                 target_hidden=target_hidden,
                 positions=target_forward_batch.positions,
@@ -1406,6 +1414,8 @@ def _build_prefill(num_layers: int, topk: int):
         per_dp_bs,
         update_relay,
     ):
+        target_logits_metadata = replace(target_logits_metadata, preserve_vocab_sharding=True)
+        draft_logits_metadata = replace(draft_logits_metadata, preserve_vocab_sharding=True)
         target_state = jax.tree_util.tree_unflatten(target_model_state_def, target_leaves)
         target_model = nnx.merge(target_model_def, target_state)
         target_output, target_pool_updates, _, _ = target_model(
@@ -1416,7 +1426,7 @@ def _build_prefill(num_layers: int, topk: int):
 
         target_logits = target_output.next_token_logits
         target_hidden = target_output.hidden_states
-        next_token_ids = jnp.argmax(target_logits, axis=-1).astype(jnp.int32)
+        next_token_ids = argmax_with_dp_sharding(target_logits)
         input_ids = _rotate_prefill_input_ids(
             draft_forward_batch.input_ids,
             draft_forward_batch.extend_seq_lens,
