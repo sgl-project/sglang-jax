@@ -3711,7 +3711,7 @@ class ModelWorkerBatch:
     logits_indices_selector: np.ndarray | None = None
 
     # Batch-owned immutable page IDs for supported speculative relay backends.
-    cache_loc_page_indices: np.ndarray | None = None
+    allocated_page_indices: np.ndarray | None = None
     eagle_page_indices_device_cache: tuple | None = None
 
     # Pre-bucketed per-token gather indices for the padded logprob path; None on

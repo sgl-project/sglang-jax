@@ -130,7 +130,7 @@ def _pad_page_indices(
 
 def _upload_eagle_pages(batch, pages, sharding, *, cacheable):
     """Reuse only immutable, unrepacked page IDs within one speculative batch."""
-    source = getattr(batch, "cache_loc_page_indices", None)
+    source = getattr(batch, "allocated_page_indices", None)
     cacheable = cacheable and isinstance(source, np.ndarray) and not source.flags.writeable
     cached = getattr(batch, "eagle_page_indices_device_cache", None)
     if (
@@ -196,8 +196,6 @@ class FlashAttentionMetadata:
 @dataclass
 class FlashAttention(AttentionBackend):
     """Native Attention layer for variable-length sequences using ForwardBatch."""
-
-    supports_eagle_compact_cache = True
 
     def __init__(
         self,
@@ -321,9 +319,9 @@ class FlashAttention(AttentionBackend):
     def get_eagle_base_metadata(self, batch: ModelWorkerBatch):
         """Upload only allocated page ids; fused JITs rebuild dynamic metadata."""
         metadata = FlashAttentionMetadata()
-        page_indices = getattr(batch, "cache_loc_page_indices", None)
-        compact = page_indices is not None
-        if not compact:
+        page_indices = getattr(batch, "allocated_page_indices", None)
+        reuse_allocated_pages = page_indices is not None
+        if not reuse_allocated_pages:
             page_indices = (
                 np.asarray(batch.cache_loc[:: self.page_size], dtype=np.int32) // self.page_size
             )
@@ -331,7 +329,7 @@ class FlashAttention(AttentionBackend):
         page_indices = _pad_page_indices(page_indices, max_num_seqs)
         data_sharding = NamedSharding(self.mesh, P("data"))
         metadata.page_indices = _upload_eagle_pages(
-            batch, page_indices, data_sharding, cacheable=compact
+            batch, page_indices, data_sharding, cacheable=reuse_allocated_pages
         )
 
         if batch.forward_mode == ForwardMode.TARGET_VERIFY:
@@ -367,11 +365,11 @@ class FlashAttention(AttentionBackend):
         """Return the metadata for a forward pass."""
         # below code is for verify and draft extend phase
         metadata = FlashAttentionMetadata()
-        compact = (
-            page_indices is None and getattr(batch, "cache_loc_page_indices", None) is not None
+        reuse_allocated_pages = (
+            page_indices is None and getattr(batch, "allocated_page_indices", None) is not None
         )
-        if compact:
-            page_indices = batch.cache_loc_page_indices
+        if reuse_allocated_pages:
+            page_indices = batch.allocated_page_indices
         elif page_indices is None:
             indices = np.arange(0, len(batch.cache_loc), self.page_size)
             selected_cache_locs = batch.cache_loc[indices]
@@ -473,7 +471,7 @@ class FlashAttention(AttentionBackend):
                 src_off[r] += int(alloc_pg[k])
                 dst_off[r] += n
             page_indices = new_pi
-            compact = False  # This request-length repack cannot reuse allocated pages.
+            reuse_allocated_pages = False  # This request-length repack cannot reuse allocated pages.
 
         if distribution is None:
             seq_2d = np.asarray(batch.seq_lens).reshape(dp_size, per_dp_bs)
@@ -494,7 +492,7 @@ class FlashAttention(AttentionBackend):
         seq_lens = np.array(seq_lens)
         metadata.cu_q_lens = cu_q_lens
         data_sharding = NamedSharding(self.mesh, P("data"))
-        if compact:
+        if reuse_allocated_pages:
             metadata.page_indices = _upload_eagle_pages(
                 batch, page_indices, data_sharding, cacheable=True
             )
