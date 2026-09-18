@@ -18,6 +18,15 @@ from sgl_jax.srt.configs.quantization_config import (
 
 logger = logging.getLogger(__name__)
 
+INT4_DTYPES = tuple(
+    getattr(jnp, t) for t in ("int4", "uint4", "float4_e2m1fn") if hasattr(jnp, t)
+)
+
+
+def is_int4_dtype(dtype) -> bool:
+    """Return True if dtype is a 4-bit integer or float type."""
+    return dtype in INT4_DTYPES
+
 
 def _get_block_reshape_sharding(
     tensor: jax.Array,
@@ -97,17 +106,31 @@ def apply_linear_quantization(
 
     quant_config = model_config.quantization_config
     if quant_config is None:
-        raise ValueError(
-            "apply_linear_quantization called but model_config.quantization_config is None. "
-            "Ensure --quantization-config-path is set."
-        )
+        return model
 
-    linear_rules = quant_config.get_linear_rules()
+    if hasattr(quant_config, "has_linear_quantization"):
+        if not quant_config.has_linear_quantization():
+            return model
+    elif not getattr(quant_config, "linear_rules", None) and not hasattr(
+        quant_config, "get_linear_rules"
+    ):
+        return model
+
+    linear_rules = (
+        quant_config.get_linear_rules()
+        if hasattr(quant_config, "get_linear_rules")
+        else getattr(quant_config, "linear_rules", None)
+    )
     if not linear_rules:
-        raise ValueError(
-            "No linear rules found in quantization config. "
-            "Check your quantization config YAML file."
-        )
+        if (
+            hasattr(quant_config, "has_linear_quantization")
+            and quant_config.has_linear_quantization()
+        ):
+            raise ValueError(
+                "has_linear_quantization() is True but no linear rules found in quantization config. "
+                "Check your quantization config YAML file."
+            )
+        return model
 
     # Compile regex patterns from rules
     compiled_rules = []
@@ -174,8 +197,10 @@ def apply_linear_quantization(
                     # Check if this path matches any rule
                     dot_path = child_path.replace("/", ".")
                     if any(
-                        dot_path == ignored or dot_path.endswith(f".{ignored}")
-                        for ignored in ignored_layers
+                        dot_path == ig
+                        or dot_path.startswith(f"{ig}.")
+                        or dot_path.endswith(f".{ig}")
+                        for ig in ignored_layers
                     ):
                         logger.info("Skipping %s - in ignored_layers", dot_path)
                         continue
@@ -273,6 +298,10 @@ def apply_moe_quantization(
                 logger.info("Skipping MoE quantization for %s (matched ignored_layers)", log_path)
                 return
             logger.debug("Quantizing MoE weights path=%s", log_path)
+            if hasattr(obj, "quantized_dtype") and obj.quantized_dtype is None:
+                obj.quantized_dtype = quant_config.get_moe_weight_dtype()
+                obj.activation_quantized_dtype = quant_config.get_moe_activation_dtype()
+                obj.weight_block_size = getattr(quant_config, "weight_block_size", None)
             obj.quantize_weights(is_static=is_static_input)
             return
 

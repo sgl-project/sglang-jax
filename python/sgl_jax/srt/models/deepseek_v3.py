@@ -38,6 +38,7 @@ from sgl_jax.srt.layers.moe import (
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.utils.quantization.quantization_utils import is_int4_dtype
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
@@ -815,6 +816,8 @@ class DeepseekV3ForCausalLM(nnx.Module):
         moe_backend = getattr(self.config, "moe_backend", "epmoe")
         use_fused = moe_backend == "fused"
 
+        quant_config = getattr(model_config, "quantization_config", None)
+
         for layer_idx in range(self.config.num_hidden_layers):
             is_moe = (
                 n_routed_experts is not None
@@ -822,7 +825,7 @@ class DeepseekV3ForCausalLM(nnx.Module):
                 and layer_idx % moe_layer_freq == 0
             )
             layer_mappings = self._create_layer_mappings(
-                layer_idx, is_moe, moe_backend, use_fused, is_static_quant
+                layer_idx, is_moe, moe_backend, use_fused, is_static_quant, quant_config=quant_config
             )
             mappings.update(layer_mappings)
 
@@ -835,10 +838,22 @@ class DeepseekV3ForCausalLM(nnx.Module):
         moe_backend: str,
         use_fused: bool,
         is_static_quant: bool = False,
+        quant_config=None,
     ) -> dict:
         prefix = f"{self.hf_weight_prefix}model.layers.{layer_idx}"
         target = f"model.layers.{layer_idx}"
         mappings: dict = {}
+
+        ignored_layers = getattr(quant_config, "ignored_layers", None) or []
+
+        def _is_linear_quantized(subpath: str) -> bool:
+            if not is_static_quant:
+                return False
+            for ig in ignored_layers:
+                if subpath == ig or subpath.startswith(f"{ig}.") or subpath.endswith(f".{ig}"):
+                    return False
+            linear_rules = quant_config.get_linear_rules() if quant_config else []
+            return bool(linear_rules)
 
         def add_linear(hf_prefix: str, target_prefix: str, sharding_std: tuple):
             # HF weights are `[out, in]`.
@@ -847,7 +862,7 @@ class DeepseekV3ForCausalLM(nnx.Module):
             #   Static FP8: loaded into QuantizedLinear.weight_q `[out, in]`
             #   directly; sharding is kernel_axes swapped. Also register the
             #   `weight_scale_inv` sidecar into `weight_scale`.
-            if not is_static_quant:
+            if not _is_linear_quantized(target_prefix):
                 mappings[f"{hf_prefix}.weight"] = WeightMapping(
                     target_path=f"{target_prefix}.weight",
                     sharding=sharding_std,
@@ -918,7 +933,25 @@ class DeepseekV3ForCausalLM(nnx.Module):
                 add_linear(f"{prefix}.mlp.{proj}", f"{target}.mlp.{proj}", sharding)
             return mappings
 
-        # MoE gate (router) — NOT quantized in HF FP8 checkpoint.
+        # MoE Shared Experts
+        if hasattr(self.config, "n_shared_experts") and self.config.n_shared_experts > 0:
+            add_linear(
+                f"{prefix}.mlp.shared_experts.gate_proj",
+                f"{target}.mlp.shared_experts.gate_proj",
+                (None, "tensor"),
+            )
+            add_linear(
+                f"{prefix}.mlp.shared_experts.up_proj",
+                f"{target}.mlp.shared_experts.up_proj",
+                (None, "tensor"),
+            )
+            add_linear(
+                f"{prefix}.mlp.shared_experts.down_proj",
+                f"{target}.mlp.shared_experts.down_proj",
+                ("tensor", None),
+            )
+
+        # MoE Gate
         mappings[f"{prefix}.mlp.gate.weight"] = WeightMapping(
             target_path=f"{target}.moe_gate.kernel",
             sharding=(None, None),
@@ -940,6 +973,10 @@ class DeepseekV3ForCausalLM(nnx.Module):
             physical_to_logical_map = np.array(jax.device_get(metadata.physical_to_logical_map))
             phy_to_log = physical_to_logical_map[layer_idx]
 
+        is_int4_moe = is_int4_dtype(getattr(quant_config, "moe_weight_dtype", None))
+        weight_suffix = "weight_packed" if is_int4_moe else "weight"
+        scale_suffix = ".weight_scale" if is_int4_moe else ".weight_scale_inv"
+
         moe_mappings = create_moe_weights_mapping(
             prefix=prefix,
             target_prefix=target,
@@ -947,6 +984,7 @@ class DeepseekV3ForCausalLM(nnx.Module):
             expert_type_names=("gate_proj", "up_proj", "down_proj"),
             moe_backend=moe_backend,
             physical_to_logical_map=phy_to_log,
+            weight_suffix=weight_suffix,
         )
         mappings.update(moe_mappings)
 
@@ -967,17 +1005,19 @@ class DeepseekV3ForCausalLM(nnx.Module):
                     continue
                 target_base = wm.target_path[0]
                 expert_scale_keys = [
-                    k.replace(".weight", ".weight_scale_inv") for k in wm.target_path[1:]
+                    k.replace(f".{weight_suffix}", scale_suffix) for k in wm.target_path[1:]
                 ]
                 scale_target = f"{target_base}_scale"
-                # Stacked checkpoint scale is `[E, out_blocks, in_blocks]`. Load
-                # replicated on the block dims; _maybe_convert_epmoe_scale_for_kernel
-                # expands via jnp.take, which fails if the gathered axis is
-                # tensor-sharded (ambiguous output sharding). The converter reshards
-                # to model_param.value.sharding at the end.
+                # Stacked checkpoint scale is `[E, out_blocks, in_blocks]`.
+                # For wi_0/wi_1: out_dim (intermediate_dim) is dim 1, sharded on "tensor".
+                # For wo: in_dim (intermediate_dim // 32 = k_blocks_wo) is dim 2, sharded on "tensor".
+                if "wo" in target_base:
+                    scale_sharding = ("expert", None, "tensor")
+                else:
+                    scale_sharding = ("expert", "tensor", None)
                 mappings[f"__MOE_EXPERTS__{scale_target}"] = WeightMapping(
                     target_path=[scale_target] + expert_scale_keys,
-                    sharding=("expert", None, None),
+                    sharding=scale_sharding,
                     transpose=False,
                     physical_to_logical_map=wm.physical_to_logical_map,
                 )

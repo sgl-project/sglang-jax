@@ -503,10 +503,19 @@ class ModelRunnerKVCacheMixin:
             token_capacity = min(token_capacity, max_total_tokens)
 
         # Page alignment
-        token_capacity = token_capacity // self.server_args.page_size * self.server_args.page_size
+        token_capacity = (token_capacity // self.server_args.page_size) * self.server_args.page_size
 
         # DP scale
         token_capacity = token_capacity * dp_size
+
+        # Data mesh sharding alignment on total pages
+        if hasattr(self, "mesh") and self.mesh is not None and "data" in self.mesh.shape:
+            data_mesh_dim = self.mesh.shape["data"]
+            if data_mesh_dim > 1:
+                total_pages = token_capacity // self.server_args.page_size
+                total_pages = (total_pages // data_mesh_dim) * data_mesh_dim
+                token_capacity = total_pages * self.server_args.page_size
+
         logger.info(
             "ModelRunner per dp max_total_num_tokens after dp_size %s: %s",
             dp_size,
