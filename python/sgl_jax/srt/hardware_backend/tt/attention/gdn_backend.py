@@ -160,18 +160,12 @@ class TTGDNAttnBackend(GDNAttnBackend):
         beta, gate = (jnp.where(valid[..., None], x, 0) for x in (beta, gate))
         state, out = ops.gated_delta_rule(q, k, v, gate, beta, gather(recurrent_state_in))
         new_rec = ops.state_pool_update(recurrent_state_in, indices, state)
-        if batch == 1:
-            out = out[0]
-        else:
+        out = out.reshape(-1, self.num_v_heads, self.head_v_dim)
+        if batch > 1:
             token = jnp.arange(count)
             sequence = jnp.searchsorted(cu_q_lens[1:], token, side="right")
             sequence = jnp.minimum(sequence, batch - 1)
             row = sequence * width + token - starts[sequence]
-            out = (
-                out.reshape((batch * width, -1))
-                .at[row]
-                .get(mode="clip", out_sharding=replicated)
-                .reshape((count, self.num_v_heads, self.head_v_dim))
-            )
+            out = out.at[row].get(mode="clip", out_sharding=replicated)
             out = jnp.where((token < cu_q_lens[-1])[:, None, None], out, 0)
         return out.astype(mixed_qkv.dtype), new_conv, new_rec
