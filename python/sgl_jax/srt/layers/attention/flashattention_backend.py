@@ -471,7 +471,9 @@ class FlashAttention(AttentionBackend):
                 src_off[r] += int(alloc_pg[k])
                 dst_off[r] += n
             page_indices = new_pi
-            reuse_allocated_pages = False  # This request-length repack cannot reuse allocated pages.
+            reuse_allocated_pages = (
+                False  # This request-length repack cannot reuse allocated pages.
+            )
 
         if distribution is None:
             seq_2d = np.asarray(batch.seq_lens).reshape(dp_size, per_dp_bs)
