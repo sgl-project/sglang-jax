@@ -333,6 +333,64 @@ def test_pool_initialization_rejects_hybrid_dsa():
         runner._init_pools(max_num_reqs=1, dp_size=1)
 
 
+class _QSACellSizeRunner(ModelRunnerKVCacheMixin):
+    """Minimal stand-in for the plain-GQA branch of `_compute_cell_size`.
+
+    The text config is a real `Qwen4ExpConfig` one, not a namespace, so the
+    tests pin that the budget reads the config's own `full_attention_layer_ids`
+    rather than a predicate of its own.
+    """
+
+    def __init__(self, attention_backend, *, num_layers=8):
+        from sgl_jax.srt.configs.qwen4_exp import Qwen4ExpConfig
+
+        self.kv_cache_dtype = jnp.bfloat16
+        self.page_size = 128
+        self.use_mla_backend = False
+        self.attention_tp_size = 2
+        self.server_args = ServerArgs(model_path="dummy", attention_backend=attention_backend)
+        text = Qwen4ExpConfig(
+            text_config=dict(
+                num_hidden_layers=num_layers,
+                full_attention_interval=4,
+                head_dim=256,
+                indexer_budget=2048,
+                indexer_compress_ratio=4,
+                indexer_head_dim=128,
+                indexer_n_heads=4,
+                indexer_kv_heads=1,
+            )
+        ).text_config
+        self.model_config = types.SimpleNamespace(
+            hf_config=types.SimpleNamespace(),
+            hf_text_config=text,
+            head_dim=256,
+            get_num_kv_heads=lambda _tp: 1,
+        )
+        self._num_full = len(text.full_attention_layer_ids)
+
+    def _kv_pool_layer_count(self):
+        return self._num_full
+
+
+# 1 KV head x align128(256) x 2 (K and V) x 2 full-attention layers x 2 bytes.
+_QSA_GQA_BYTES_PER_TOKEN = 1 * 256 * 2 * 2 * 2
+# One compressed key per 4 tokens: align128(128) x 2 bytes x 2 layers // 4.
+_QSA_INDEXER_BYTES_PER_TOKEN = 128 * 2 * 2 // 4
+
+
+def test_cell_size_charges_for_the_qsa_compressed_cache_only_on_qsa():
+    """`QSATokenToKVPool` allocates a compressed key per compress_ratio tokens
+    for each full-attention layer. Budgeting only the GQA cache over-provisions
+    the pool and the excess comes out of the activation reserve; charging a
+    non-QSA backend for it wastes capacity on every other model."""
+    assert _QSACellSizeRunner("fa")._compute_cell_size() == _QSA_GQA_BYTES_PER_TOKEN
+    assert (
+        _QSACellSizeRunner("qsa_sparse")._compute_cell_size()
+        == _QSA_GQA_BYTES_PER_TOKEN + _QSA_INDEXER_BYTES_PER_TOKEN
+    )
+
+
 @pytest.mark.parametrize(("embedding_pool_bytes", "expected"), [(0, 700), (100, 600)])
 def test_profile_available_bytes_reserves_static_and_embedding_pool(embedding_pool_bytes, expected):
     runner = types.SimpleNamespace(
