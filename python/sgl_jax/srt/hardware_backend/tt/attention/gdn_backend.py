@@ -135,11 +135,13 @@ class TTGDNAttnBackend(GDNAttnBackend):
         sharding = jax.sharding.NamedSharding(self.mesh, jax.typeof(packed).sharding.spec)
         saved = jax.sharding.reshard(gather(conv_state_in).swapaxes(-1, -2), sharding)
         history = jnp.concatenate((saved, packed), axis=-2)
-        convolved = sum(
-            history[..., tap : tap + width, :].astype(jnp.float32)
-            * conv1d_weight[:, tap].astype(jnp.float32)
-            for tap in range(self.conv_kernel_size)
-        ).astype(mixed_qkv.dtype)
+        convolved = None
+        for tap in range(self.conv_kernel_size):
+            window = history[..., tap : tap + width, :].astype(jnp.float32)
+            weight = conv1d_weight[:, tap].astype(jnp.float32)
+            term = window * weight
+            convolved = term if convolved is None else convolved + term
+        convolved = convolved.astype(mixed_qkv.dtype)
         convolved = jax.nn.silu(convolved)
         tail_indices = lengths[..., None] + jnp.arange(self.conv_kernel_size - 1)
         tail_indices += jnp.arange(batch)[:, None] * history.shape[-2]
