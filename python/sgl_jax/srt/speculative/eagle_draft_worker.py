@@ -343,6 +343,7 @@ class EagleDraftWorker(BaseDraftWorker):
         model_worker_batch: ModelWorkerBatch,
         *,
         map_hot_token_ids: bool = True,
+        compact_cache: bool = False,
     ):
         # At dp>1 the incoming mwb is already DP-padded to total_bs (== a bucket
         # value, see _get_spec_decode_mwb_dp); use the larger of real_bs and the
@@ -380,7 +381,14 @@ class EagleDraftWorker(BaseDraftWorker):
         per_dp_bs = model_worker_batch.per_dp_bs_size if dp_size > 1 else len(seq_lens_cpu)
         assert total_cache_loc_size % dp_size == 0
         per_dp_cache_len = total_cache_loc_size // dp_size
-        cache_loc_cpu = self._get_decode_cache_loc_buffer(total_cache_loc_size)
+        if compact_cache:
+            assert not legacy_non_overlap
+            assert per_dp_cache_len % page_size == 0
+            cache_loc_cpu = np.zeros(total_cache_loc_size // page_size, dtype=np.int32)
+        else:
+            cache_loc_cpu = self._get_decode_cache_loc_buffer(total_cache_loc_size)
+        model_worker_batch.cache_loc_page_indices = None
+        model_worker_batch.eagle_page_indices_device_cache = None
         valid_mask = seq_lens_cpu > 0
         if np.any(valid_mask):
             valid_indices = np.where(valid_mask)[0]
@@ -399,6 +407,16 @@ class EagleDraftWorker(BaseDraftWorker):
                     cache_loc_cpu[base : base + allocate_len] = token_indices_with_all_reqs[
                         seq_idx, :allocate_len
                     ]
+                elif compact_cache:
+                    num_pages = int(aligned_len // page_size)
+                    page_base = int(base // page_size)
+                    cache_loc_cpu[page_base : page_base + num_pages] = (
+                        req_to_token_pool.req_to_token[
+                            model_worker_batch.req_pool_indices[seq_idx],
+                            :aligned_len:page_size,
+                        ]
+                        // page_size
+                    )
                 else:
                     page_offsets = np.arange(0, aligned_len, page_size)
                     cache_loc_cpu[base + page_offsets] = req_to_token_pool.req_to_token[
@@ -406,7 +424,12 @@ class EagleDraftWorker(BaseDraftWorker):
                     ]
                 intra_rank_off[r] += aligned_len
 
-        model_worker_batch.cache_loc = cache_loc_cpu
+        if compact_cache:
+            cache_loc_cpu.setflags(write=False)
+            model_worker_batch.cache_loc_page_indices = cache_loc_cpu
+            model_worker_batch.cache_loc = np.empty(0, dtype=np.int32)
+        else:
+            model_worker_batch.cache_loc = cache_loc_cpu
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
 
         topk_index = spec_info.topk_index

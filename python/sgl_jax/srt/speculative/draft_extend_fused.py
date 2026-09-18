@@ -1502,6 +1502,7 @@ def _prepare_verify(
     model_worker_batch,
     *,
     draft_padding_prepared: bool = False,
+    compact_cache: bool = False,
 ):
     """Prepare fixed-shape verify placeholders while keeping chain build inside JIT."""
     from sgl_jax.srt.speculative.eagle_info import EagleVerifyInput
@@ -1535,6 +1536,7 @@ def _prepare_verify(
         draft_worker.padding_for_decode(
             model_worker_batch,
             map_hot_token_ids=not use_relay_state,
+            **({"compact_cache": True} if compact_cache else {}),
         )
     draft_input = model_worker_batch.spec_info_padded
     previous_verified_id = draft_input.verified_id
@@ -2344,6 +2346,18 @@ def spec_decode_verify(
         draft_worker,
         model_worker_batch,
         draft_padding_prepared=draft_padding_prepared,
+        compact_cache=(
+            use_relay_state
+            and getattr(target_mr.attn_backend, "supports_eagle_compact_cache", False)
+            and getattr(
+                draft_worker.draft_model_runner.attn_backend,
+                "supports_eagle_compact_cache",
+                False,
+            )
+            and target_mr.attn_backend.page_size
+            == draft_worker.draft_model_runner.attn_backend.page_size
+            == draft_worker.page_size
+        ),
     )
     spec_info = model_worker_batch.spec_info_padded
     return_target_logits = bool(
@@ -2517,7 +2531,7 @@ def spec_decode_verify(
     next_draft_input.sel_pos = prepared_sel_pos
     next_draft_input.positions = prepared_positions
     next_draft_input.verify_seq_lens = prepared_verify_seq_lens
-    if draft_padding_prepared:
+    if draft_padding_prepared or use_relay_state:
         for value in (
             prepared_accept_lens_host,
             prepared_predict,
