@@ -9,7 +9,10 @@ import numpy as np
 import pytest
 
 from sgl_jax.srt.hardware_backend.tt.attention import ops
-from sgl_jax.srt.hardware_backend.tt.attention.gdn_backend import TTGDNAttnBackend, TTGDNMetadata
+from sgl_jax.srt.hardware_backend.tt.attention.gdn_backend import (
+    TTGDNAttnBackend,
+    TTGDNMetadata,
+)
 from sgl_jax.srt.hardware_backend.tt.attention.tt_backend import TTAttention
 from sgl_jax.srt.kernels.gdn.gated_delta import (
     _gated_delta_step,
