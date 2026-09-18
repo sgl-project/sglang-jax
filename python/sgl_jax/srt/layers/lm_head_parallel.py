@@ -3,7 +3,8 @@
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax.sharding import NamedSharding, PartitionSpec as P
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead
 

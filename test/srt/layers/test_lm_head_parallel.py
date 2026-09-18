@@ -7,6 +7,7 @@ import pytest
 from flax import nnx
 from jax.sharding import AxisType, Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
+
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead
 from sgl_jax.srt.layers.lm_head_parallel import (
     configure_lm_heads,
@@ -59,11 +60,7 @@ def test_projection_and_dp_local_selection(mesh, dp_head, vocab):
         expected_logits = hidden @ weight.T
         out = jax.jit(lambda x, y: proc._get_logits(x, y))(h, head)
         np.testing.assert_allclose(out, expected_logits, rtol=2e-5, atol=2e-5)
-        expected = (
-            P("data", "tensor")
-            if vocab % mesh.shape["tensor"] == 0
-            else P("data", None)
-        )
+        expected = P("data", "tensor") if vocab % mesh.shape["tensor"] == 0 else P("data", None)
         assert out.sharding.spec == expected
         assert w.sharding.spec == weight_spec(dp_head)
         parts = mesh.shape["tensor"] * (1 if dp_head else mesh.shape["data"])
@@ -74,12 +71,8 @@ def test_projection_and_dp_local_selection(mesh, dp_head, vocab):
         idx = jax.device_put(idx_np, NamedSharding(mesh, P("data")))
         selected = jax.jit(proc._select_logits)(out, idx)
         rows = np.arange(dp) * (16 // dp) + idx_np
-        np.testing.assert_allclose(
-            selected, expected_logits[rows], rtol=2e-5, atol=2e-5
-        )
-        np.testing.assert_array_equal(
-            jnp.argmax(out, -1), np.argmax(expected_logits, -1)
-        )
+        np.testing.assert_allclose(selected, expected_logits[rows], rtol=2e-5, atol=2e-5)
+        np.testing.assert_array_equal(jnp.argmax(out, -1), np.argmax(expected_logits, -1))
 
 
 @pytest.mark.parametrize("dp_head", [False, True])
@@ -121,6 +114,7 @@ def test_weight_loader(mesh, dp_head, vocab, dummy, tmp_path):
     from types import SimpleNamespace
 
     from safetensors.numpy import save_file
+
     from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
     original = np.arange(vocab * 12, dtype=np.float32).reshape(vocab, 12) / 100
@@ -134,11 +128,7 @@ def test_weight_loader(mesh, dp_head, vocab, dummy, tmp_path):
         model = nnx.eval_shape(lambda: _HeadModel(mesh, vocab))
         loader = WeightLoader(model, config, mesh, dtype=jnp.float32)
         loader.load_weights_from_safetensors(
-            {
-                "lm_head.weight": WeightMapping(
-                    "lm_head.embedding", sharding=("tensor", None)
-                )
-            }
+            {"lm_head.weight": WeightMapping("lm_head.embedding", sharding=("tensor", None))}
         )
         # Divisible heads must already be sharded directly by the loader.
         if vocab == 32:
@@ -159,9 +149,7 @@ def test_cli_flag():
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     assert not parser.parse_args(["--model-path", "/unused"]).enable_dp_lm_head
-    assert parser.parse_args(
-        ["--model-path", "/unused", "--enable-dp-lm-head"]
-    ).enable_dp_lm_head
+    assert parser.parse_args(["--model-path", "/unused", "--enable-dp-lm-head"]).enable_dp_lm_head
 
 
 @pytest.mark.parametrize("dp_head", [False, True])
@@ -188,17 +176,13 @@ def test_forward_modes(mesh, dp_head, mode):
             md.extend_seq_lens = jax.device_put(
                 np.full(dp, per_dp, np.int32), NamedSharding(mesh, P("data"))
             )
-            md.accept_lens = jax.device_put(
-                np.ones(dp, np.int32), NamedSharding(mesh, P("data"))
-            )
+            md.accept_lens = jax.device_put(np.ones(dp, np.int32), NamedSharding(mesh, P("data")))
             rows = np.arange(dp) * per_dp
         result = jax.jit(lambda h, w, m: proc(h, w, m))(
             jax.device_put(hidden, NamedSharding(mesh, P("data", None))), head, md
         )
         expected = 3.0 * np.tanh((hidden[rows] @ weight.T) / 3.0)
-        np.testing.assert_allclose(
-            result.next_token_logits, expected, rtol=2e-5, atol=2e-5
-        )
+        np.testing.assert_allclose(result.next_token_logits, expected, rtol=2e-5, atol=2e-5)
         np.testing.assert_array_equal(result.hidden_states, hidden)
 
 
@@ -220,9 +204,7 @@ def test_model_without_lm_head_accepts_other_mesh_axes():
 @pytest.mark.parametrize("dp_head", [False, True])
 @pytest.mark.parametrize("vocab", [32, 29])
 @pytest.mark.parametrize("mode", ["TARGET_VERIFY", "DRAFT_EXTEND", "DECODE", "EXTEND"])
-def test_greedy_projection_preserves_vocab_shards_and_dp_ids(
-    mesh, dp_head, vocab, mode
-):
+def test_greedy_projection_preserves_vocab_shards_and_dp_ids(mesh, dp_head, vocab, mode):
     from sgl_jax.srt.layers.lm_head_parallel import argmax_with_dp_sharding
 
     # All real logits are negative, so padded zero weights must never win.
@@ -247,20 +229,14 @@ def test_greedy_projection_preserves_vocab_shards_and_dp_ids(
             out = proc(h, w, metadata).next_token_logits
             return out, argmax_with_dp_sharding(out)
 
-        logits, ids = run(
-            jax.device_put(hidden, NamedSharding(mesh, P("data", None))), head, md
-        )
+        logits, ids = run(jax.device_put(hidden, NamedSharding(mesh, P("data", None))), head, md)
         rows = 16 if mode in ("TARGET_VERIFY", "DECODE") else dp
         np.testing.assert_array_equal(ids, np.ones(rows, np.int32))
         assert ids.sharding.spec == P("data")
         if not dp_head and vocab == 32:
             assert logits.sharding.spec == P(None, ("data", "tensor"))
         else:
-            expected = (
-                P("data", "tensor")
-                if vocab % mesh.shape["tensor"] == 0
-                else P("data", None)
-            )
+            expected = P("data", "tensor") if vocab % mesh.shape["tensor"] == 0 else P("data", None)
             assert logits.sharding.spec == expected
         expected_logits = 3.0 * np.tanh((hidden[:rows] @ weights.T) / 3.0)
         np.testing.assert_allclose(logits, expected_logits, rtol=2e-5, atol=2e-5)
@@ -276,9 +252,7 @@ def test_fused_greedy_consumers_keep_row_order_and_map_draft_vocab(mesh):
     expected = np.argmax(logits_np, axis=-1)
     mapping_np = np.arange(32, dtype=np.int32)[::-1].copy() * 7
     with jax.set_mesh(mesh):
-        logits = jax.device_put(
-            logits_np, NamedSharding(mesh, P(None, ("data", "tensor")))
-        )
+        logits = jax.device_put(logits_np, NamedSharding(mesh, P(None, ("data", "tensor"))))
         mapping = jax.device_put(mapping_np, NamedSharding(mesh, P()))
         indices = jax.jit(_topk1_index_from_logits)(logits)
         raw, mapped = jax.jit(_eagle3_raw_and_mapped_token_from_logits)(logits, mapping)
