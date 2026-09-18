@@ -66,6 +66,7 @@ from sgl_jax.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
+from sgl_jax.srt.managers.mm_utils import send_mm_request
 from sgl_jax.srt.multimodal.common.modality_enum import build_radix_input_ids
 from sgl_jax.srt.multimodal.manager.multimodal_processor import (
     get_mm_processor_cls,
@@ -595,7 +596,7 @@ class TokenizerManager:
         tokenized_obj: TokenizedGenerateReqInput | TokenizedEmbeddingReqInput,
         created_time: float | None = None,
     ):
-        self.send_to_scheduler.send_pyobj(tokenized_obj)
+        send_mm_request(self.send_to_scheduler, tokenized_obj)
         # Capture the caller's event loop so that _notify_state_event can use
         # call_soon_threadsafe when handle_loop runs on a different thread
         # (e.g. enable_engine_loop_run_forever_daemon mode).
