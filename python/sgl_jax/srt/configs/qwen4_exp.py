@@ -86,7 +86,7 @@ class _Qwen4ExpTextConfig(PretrainedConfig):
         output_gate_type: str = "sigmoid",
         # Hyper connections. The inter-block residual carries hc_count
         # parallel streams, so backbone hidden states are hidden_size *
-        # hc_count wide. See layers/gated_residual.py.
+        # hc_count wide. See layers/hyperconnection.py.
         hc_count: int = 4,
         hc_lowrank: int = 320,
         # N-gram embedding ("ple" in the config and the checkpoint).
