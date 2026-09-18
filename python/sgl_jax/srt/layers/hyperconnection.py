@@ -75,6 +75,7 @@ class GroupedGemmaRMSNorm(nnx.Module):
         epsilon: float = 1e-6,
         group_size: int | None = None,
         kernel_axes: tuple[str | None, ...] | None = None,
+        params_dtype: jnp.dtype = jnp.float32,
     ):
         if group_size is not None and hidden_size % group_size:
             raise ValueError(
@@ -85,7 +86,7 @@ class GroupedGemmaRMSNorm(nnx.Module):
         self.group_size = group_size
         self.weight = nnx.Param(
             nnx.with_partitioning(nnx.initializers.zeros, kernel_axes)(
-                jax.random.PRNGKey(0), (hidden_size,)
+                jax.random.PRNGKey(0), (hidden_size,), params_dtype
             )
         )
 
@@ -141,18 +142,15 @@ class HyperConnectionBase(nnx.Module):
             )
 
     @named_scope
-    def mix(self, hyper_input: jax.Array) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
+    def mix(self, hyper_input: jax.Array) -> tuple[jax.Array, jax.Array]:
         """Collapse the streams to one ``HS``-wide input for the block."""
         self._check_hyper(hyper_input)
         mixed = jnp.mean(self._unflatten(hyper_input), axis=-2)
-        # Second element is unused here; the payload stays a 2-tuple so the
-        # base and its subclasses share one contract.
-        return mixed, (hyper_input, hyper_input)
+        return mixed, hyper_input
 
     @named_scope
-    def combine(self, block_output: jax.Array, residuals: tuple[jax.Array, jax.Array]) -> jax.Array:
+    def combine(self, block_output: jax.Array, hyper_input: jax.Array) -> jax.Array:
         """Add the block output into every stream."""
-        hyper_input, _ = residuals
         self._check_hyper(hyper_input)
         if block_output.shape[-1] != self.hidden_size:
             raise ValueError(
@@ -193,7 +191,10 @@ class GatedResidual(HyperConnectionBase):
         norm_dim = self.hyper_hidden_size if config.hc_per_branch_norm else self.hidden_size
         group_size = self.hidden_size if config.hc_per_branch_norm else None
         self.hc_norm = GroupedGemmaRMSNorm(
-            norm_dim, epsilon=config.rms_norm_eps, group_size=group_size
+            norm_dim,
+            epsilon=config.rms_norm_eps,
+            group_size=group_size,
+            params_dtype=config.params_dtype,
         )
 
         # Replicated, not tensor-parallel: `up` emits [..., HC*HS], so a

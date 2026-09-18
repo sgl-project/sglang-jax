@@ -145,12 +145,13 @@ class TestHyperConnectionBase(CustomTestCase):
 
         with jax.set_mesh(mesh):
             layer = HyperConnectionBase(_make_config(mesh))
-            mixed, residuals = layer.mix(jnp.array(hyper_input))
+            mixed, residual = layer.mix(jnp.array(hyper_input))
 
         expected = hyper_input.reshape(TOKENS, HC_COUNT, HIDDEN_SIZE).mean(axis=-2)
         np.testing.assert_allclose(np.array(mixed), expected, atol=ATOL, rtol=ATOL)
-        # 2-tuple like the gated subclass's, so both share one contract.
-        self.assertEqual(len(residuals), 2)
+        # The base's payload is the untouched input itself; only GatedResidual
+        # carries a second element, the normalized copy its gates need.
+        np.testing.assert_array_equal(np.array(residual), hyper_input)
 
     def test_combine_adds_to_every_stream(self):
         mesh = _make_mesh()
@@ -160,8 +161,8 @@ class TestHyperConnectionBase(CustomTestCase):
 
         with jax.set_mesh(mesh):
             layer = HyperConnectionBase(_make_config(mesh))
-            _, residuals = layer.mix(jnp.array(hyper_input))
-            combined = layer.combine(jnp.array(block_output), residuals)
+            _, residual = layer.mix(jnp.array(hyper_input))
+            combined = layer.combine(jnp.array(block_output), residual)
 
         delta = np.array(combined).reshape(TOKENS, HC_COUNT, HIDDEN_SIZE) - hyper_input.reshape(
             TOKENS, HC_COUNT, HIDDEN_SIZE
@@ -346,6 +347,18 @@ class TestGatedResidual(CustomTestCase):
                     mesh=mesh,
                 )
             )
+        # Every parameter has to be the dtype the config asked for. The output
+        # dtypes below cannot show this on their own: the norm casts back to its
+        # input's dtype, so they would hold even if a weight were created at
+        # some other precision.
+        for name, param in (
+            ("hc_norm", layer.hc_norm.weight),
+            ("input_mix_weight_down", layer.input_mix_weight_down.weight),
+            ("input_mix_weight_up", layer.input_mix_weight_up.weight),
+            ("block_inject_weight", layer.block_inject_weight.weight),
+        ):
+            self.assertEqual(param[...].dtype, jnp.bfloat16, name)
+
         _assign(layer.hc_norm.weight, weights["norm"], mesh, P(None))
         _assign(layer.input_mix_weight_down.weight, weights["down"], mesh, P(None, None))
         _assign(layer.input_mix_weight_up.weight, weights["up"], mesh, P(None, None))
