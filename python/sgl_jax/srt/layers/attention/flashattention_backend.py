@@ -102,9 +102,13 @@ def _pad_page_indices(
     page_indices: np.ndarray,
     max_num_seqs: int,
     fixed_capacity: int | None = None,
+    *,
+    dp_size: int = 1,
 ) -> np.ndarray:
-    """Pad page indices to either a fixed capacity or a per-sequence bucket."""
+    """Pad each DP rank's page table without moving pages between ranks."""
     page_indices = np.asarray(page_indices, dtype=np.int32)
+    if dp_size <= 0 or len(page_indices) % dp_size:
+        raise ValueError("page_indices must contain equally sized DP segments")
     if fixed_capacity is not None:
         target_len = int(fixed_capacity)
         if target_len < len(page_indices):
@@ -119,12 +123,14 @@ def _pad_page_indices(
     else:
         return page_indices
 
+    if target_len % dp_size:
+        raise ValueError("page_indices capacity must be divisible by dp_size")
     if len(page_indices) < target_len:
         page_indices = np.pad(
-            page_indices,
-            (0, target_len - len(page_indices)),
+            page_indices.reshape(dp_size, -1),
+            ((0, 0), (0, (target_len - len(page_indices)) // dp_size)),
             constant_values=0,
-        )
+        ).reshape(-1)
     return page_indices
 
 
@@ -326,7 +332,7 @@ class FlashAttention(AttentionBackend):
                 np.asarray(batch.cache_loc[:: self.page_size], dtype=np.int32) // self.page_size
             )
         max_num_seqs = batch.dp_size * batch.per_dp_bs_size
-        page_indices = _pad_page_indices(page_indices, max_num_seqs)
+        page_indices = _pad_page_indices(page_indices, max_num_seqs, dp_size=batch.dp_size)
         data_sharding = NamedSharding(self.mesh, P("data"))
         metadata.page_indices = _upload_eagle_pages(
             batch, page_indices, data_sharding, cacheable=reuse_allocated_pages
@@ -489,6 +495,7 @@ class FlashAttention(AttentionBackend):
             page_indices,
             max_num_seqs,
             fixed_capacity=page_indices_capacity,
+            dp_size=dp_size,
         )
 
         seq_lens = np.array(seq_lens)
