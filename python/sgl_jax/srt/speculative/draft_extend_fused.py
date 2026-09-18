@@ -1217,6 +1217,8 @@ def _build_verify(topk: int):
         mesh = sh.mesh if isinstance(sh, NamedSharding) else None
         target_logits = target_output.next_token_logits
         target_hidden = target_output.hidden_states
+        # Advance inside verify, avoiding an eager scalar-add dispatch on every decode.
+        sampling_step = sampling_step + 1
         sampling_rng = jax.random.fold_in(sampling_base_rng, sampling_step)
         simulation_rng = jax.random.fold_in(sampling_rng, 1)
         if is_greedy:
@@ -1276,6 +1278,7 @@ def _build_verify(topk: int):
             prepared.verified_id, prepared.select_index
         )
         prepared_new_seq_lens = prepared.new_seq_lens
+        prepared_new_seq_lens_data = prepared.new_seq_lens
         prepared_accept_lens_host = prepared.accept_lens
         prepared_accept_lens_data = prepared.accept_lens
         prepared_extend_seq_lens = jnp.where(
@@ -1324,6 +1327,7 @@ def _build_verify(topk: int):
             (
                 prepared_verified_id_data,
                 prepared_next_verified_id,
+                prepared_new_seq_lens_data,
                 prepared_accept_lens_data,
                 prepared_extend_seq_lens,
                 prepared_logits_indices,
@@ -1334,6 +1338,7 @@ def _build_verify(topk: int):
                 data,
                 prepared_verified_id_data,
                 prepared_next_verified_id,
+                prepared_new_seq_lens_data,
                 prepared_accept_lens_data,
                 prepared_extend_seq_lens,
                 prepared_logits_indices,
@@ -1363,6 +1368,8 @@ def _build_verify(topk: int):
             prepared_verify_seq_lens,
             prepared_allocate_lens_data,
             target_logits_for_host,
+            prepared_new_seq_lens_data,
+            sampling_step,
         )
 
     return fused_verify
@@ -2052,8 +2059,11 @@ def launch_eagle3_recurrent_draft_extend_for_decode(
         data_sharding,
         "eagle3_draft_extend.verify_seq_lens",
     )
+    # Verify provides a device-sharded copy separately from the scheduler copy.
+    # Host device_put(P() -> P("data")) can materialize the array on CPU and
+    # block draft submission until verify finishes.
     next_new_seq_lens = _prepare_device_array(
-        batch_output.next_draft_input.new_seq_lens,
+        batch_output.next_draft_input.new_seq_lens_for_draft_extend,
         data_sharding,
         "eagle3_draft_extend.new_seq_lens",
     )
@@ -2452,10 +2462,6 @@ def spec_decode_verify(
     )
     _sv_thr_acc = float(getattr(spec_worker.server_args, "speculative_accept_threshold_acc", 1.0))
 
-    # Advance the per-step sampling RNG; coins are generated inside the verify JIT
-    # from (base_rng, step), so only this small int crosses the host->device boundary.
-    target_mr._sampler_step += 1
-
     with jax.set_mesh(draft_worker.mesh), _count_pjit_cpp_cache_miss() as count:
         (
             target_pool_updates,
@@ -2476,6 +2482,8 @@ def spec_decode_verify(
             prepared_verify_seq_lens,
             prepared_allocate_lens_data,
             target_logits,
+            prepared_new_seq_lens_data,
+            target_mr._sampler_step,
         ) = draft_worker._fused_greedy_verify_jit_fn(
             target_mr._model_def,
             target_mr._model_state_def,
@@ -2527,6 +2535,7 @@ def spec_decode_verify(
     next_draft_input.sel_pos = prepared_sel_pos
     next_draft_input.positions = prepared_positions
     next_draft_input.verify_seq_lens = prepared_verify_seq_lens
+    next_draft_input.new_seq_lens_for_draft_extend = prepared_new_seq_lens_data
     if draft_padding_prepared:
         for value in (
             prepared_accept_lens_host,
