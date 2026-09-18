@@ -63,6 +63,7 @@ class GateLogit(nnx.Module):
         num_experts: int = 0,
         weight_dtype: jnp.dtype = jnp.bfloat16,
         enable_expert_bias: bool | None = False,
+        kernel_dtype: jnp.dtype = jnp.float32,
         score_func: str | None = "softmax",
     ):
         self.weight_dtype = weight_dtype
@@ -73,9 +74,11 @@ class GateLogit(nnx.Module):
             jax.random.normal(
                 jax.random.PRNGKey(0),
                 (input_size, num_experts),
-                # checkpoint-native BF16; upcast at use keeps HIGHEST-dot bits
-                # identical to f32 storage while halving the per-step read.
-                dtype=jnp.bfloat16,
+                # kernel_dtype should match the checkpoint's native gate dtype:
+                # storing wider than the checkpoint wastes read bandwidth, storing
+                # narrower loses bits. The f32 default preserves prior behavior;
+                # the upcast at use keeps HIGHEST-dot bits identical either way.
+                dtype=kernel_dtype,
                 out_sharding=P(None, None),
             ),
         )
