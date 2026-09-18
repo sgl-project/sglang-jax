@@ -308,6 +308,7 @@ suites = {
     # cpu-test CI job sets that env var.
     "unit-test-cpu": [
         TestFile("test/srt/multimodal/test_engine_multimodal.py", 0.1, runner="pytest"),
+        TestFile("python/sgl_jax/test/layers/test_qsa_indexer.py", 0.1),
         TestFile(
             "python/sgl_jax/test/test_embedding_pool.py",
             0.1,
