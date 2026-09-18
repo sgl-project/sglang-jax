@@ -63,9 +63,6 @@ _QWEN_VL_VISION_LIST_FIELDS = {
     "fullatt_block_indexes",
 }
 
-# Kimi-K2.5 stores these under ``vision_config`` in the checkpoint's config.json.
-# The names already match KimiK25ModelVitConfig, so the map is an identity map
-# that also serves as the allow-list of keys we are willing to override.
 _KIMI_VL_VISION_KEY_MAP = {
     "init_pos_emb_height": "init_pos_emb_height",
     "init_pos_emb_time": "init_pos_emb_time",
@@ -123,10 +120,10 @@ def _load_local_config_dict(model_path: str) -> dict | None:
 def _apply_kimi_vl_vision_overrides(
     config: KimiK25ModelVitConfig, model_path: str
 ) -> KimiK25ModelVitConfig:
-    """Override Kimi ViT defaults with the checkpoint's ``vision_config``.
+    """Override Kimi ViT defaults with the checkpoint's vision_config.
 
     Falls back to the dataclass defaults when the checkpoint is a bare HF repo id
-    that has not been downloaded yet, or when it carries no ``vision_config``.
+    that has not been downloaded yet, or when it carries no vision_config.
     """
     config_dict = _load_local_config_dict(model_path)
     if not config_dict:
@@ -469,13 +466,11 @@ class VAEConfigRegistry:
 class KimiVLConfigRegistry:
     """Maps a Kimi-K2.5 model path to its vision-tower config."""
 
-    # Model name -> config factory mapping
     _REGISTRY: dict[str, callable] = {
         "moonshotai/Kimi-K2.5": lambda: KimiK25ModelVitConfig(),
         "Kimi-K2.5": lambda: KimiK25ModelVitConfig(),
     }
 
-    # Keyword patterns for fallback matching (order matters - more specific first)
     _KEYWORD_PATTERNS: list[tuple[str, callable]] = [
         ("Kimi-K2.5", lambda: KimiK25ModelVitConfig()),
     ]

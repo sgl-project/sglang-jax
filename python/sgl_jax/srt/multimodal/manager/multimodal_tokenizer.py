@@ -498,10 +498,10 @@ class MultimodalTokenizer(TokenizerManager):
                 processor_kwargs["videos_kwargs"] = {"do_sample_frames": False}
                 processor_kwargs["videos_kwargs"]["fps"] = video_config.get("fps", _QWEN_FPS)
             elif self._is_kimi_processor():
-                # Kimi takes a single ordered ``medias`` list instead of separate
+                # Kimi takes a single ordered medias list instead of separate
                 # images/videos. It does its own decoding and sampling, so raw
                 # sources are handed over untouched: the processor samples at
-                # ``sample_fps`` and splits a video into fixed-size frame chunks.
+                # sample_fps and splits a video into fixed-size frame chunks.
                 medias = [{"type": "image", "image": img} for img in images]
                 medias.extend(
                     {"type": "video", "video": item, "first_frame_timestamp": 0.0}
@@ -526,7 +526,7 @@ class MultimodalTokenizer(TokenizerManager):
                 input_ids = processor_out["input_ids"][0].tolist()
 
             # Kimi reports every media item (image or video chunk) in one
-            # ``grid_thws`` tensor rather than split image/video tensors.
+            # grid_thws tensor rather than split image/video tensors.
             image_grid_thw = self._to_grid_list(
                 processor_out.get("image_grid_thw")
                 if processor_out.get("image_grid_thw") is not None
@@ -676,7 +676,7 @@ class MultimodalTokenizer(TokenizerManager):
         """Make sure the prompt carries one video placeholder per video.
 
         The chat template emits these automatically, but a raw prompt sent with
-        ``video_data`` will not have them. The processor asserts that the count
+        video_data will not have them. The processor asserts that the count
         matches, and without a placeholder the per-chunk prompts (which carry the
         media tokens) would never reach the text.
         """
@@ -713,8 +713,8 @@ class MultimodalTokenizer(TokenizerManager):
         """Expand each media placeholder into one token per visual token.
 
         Kimi's template emits a single placeholder per media item (an image, or a
-        single chunk of a video). The count is ``h * w / merge_area`` and is
-        independent of ``t``: the vision tower average-pools a chunk's frames, so
+        single chunk of a video). The count is h * w / merge_area and is
+        independent of t: the vision tower average-pools a chunk's frames, so
         a 4-frame chunk still yields the spatial token count of one frame.
         """
         mm_token_id = getattr(self.mm_config, "media_placeholder_token_id", None)

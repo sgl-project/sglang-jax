@@ -540,26 +540,7 @@ def _execute_multimodal_server_warmup(
             ],
             "max_tokens": 3,
         }
-    elif "Qwen3-Omni" in server_args.model_path:
-        request_endpoint = "/v1/chat/completions"
-        json_data = {
-            "model": server_args.model_path,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Hello"},
-                    ],
-                }
-            ],
-            "max_tokens": 3,
-        }
-    elif "Kimi-K2.5" in server_args.model_path:
-        # Kimi-K2.5 is a vision-language LLM, not a diffusion pipeline. Without
-        # this branch it falls through to the image-generation default below,
-        # which routes the request down the text-encoder prompt/negative-prompt
-        # path; the autoregressive stage returns no hidden states for it and the
-        # global scheduler dies, taking the server with it.
+    elif "Qwen3-Omni" in server_args.model_path or "Kimi-K2.5" in server_args.model_path:
         request_endpoint = "/v1/chat/completions"
         json_data = {
             "model": server_args.model_path,

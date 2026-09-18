@@ -42,9 +42,6 @@ class Learnable2DInterPosEmbDivided_fixed(nnx.Module):
 
         pos_embs = []
         for t, h, w in grid_thws:
-            # ``divided_fixed`` stores one 2D table that every frame reuses, so the
-            # frame count is independent of ``num_frames``: videos of any length
-            # share the same interpolated spatial embedding.
             if (h, w) == self.weight.shape[:-1]:
                 pos_emb_2d = self.weight.reshape(-1, self.weight.shape[-1])
             else:
@@ -209,14 +206,6 @@ class KimiK25VisionAttention(nnx.Module):
 
         is_cpu = list(self.mesh.devices.flat)[0].platform == "cpu"
 
-        # ``flash_attention`` is a Pallas *TPU* kernel. On CPU Pallas can only
-        # emulate it (``interpret=True``), and the emulator walks the kernel grid
-        # block by block, so its cost grows with the square of the sequence
-        # length: ~0.02s at 512 patches against ~23s at 22k -- and that is per
-        # layer. An image is a few hundred patches so this never showed up, but a
-        # video is tens of thousands and the tower stalls for minutes, which in
-        # turn blocks the scheduler when it materializes the embedding.
-        #
         # Attention here is block-diagonal (patches only attend within their own
         # item), so on CPU the same kernel is invoked once per item instead of
         # once over the concatenated sequence. Same result, much smaller grid.
@@ -476,25 +465,25 @@ def build_temporal_merge_plan(
     grid_thws,
     merge_kernel_size,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Plan the ``sd2_tpool`` merge for a batch of image and/or video items.
+    """Plan the sd2_tpool merge for a batch of image and/or video items.
 
-    The merger groups ``merge_h * merge_w`` neighboring patches and averages over
+    The merger groups merge_h * merge_w neighboring patches and averages over
     the temporal axis. Items in a batch can have different frame counts (an image
-    has ``t == 1``, a video has ``t > 1``), so the temporal axis is padded to the
+    has t == 1, a video has t > 1), so the temporal axis is padded to the
     batch-wide maximum with duplicated, zero-weighted slots. That keeps a single
     static-shaped gather for the whole batch while leaving each item's mean exact,
-    including when ``t`` does not divide ``max_t``.
+    including when t does not divide max_t.
 
     Args:
-        grid_thws: Sequence of ``(t, h, w)`` patch grids, one per item, matching
+        grid_thws: Sequence of (t, h, w) patch grids, one per item, matching
             the order of the flattened patch sequence.
-        merge_kernel_size: ``(merge_h, merge_w)`` spatial merge kernel.
+        merge_kernel_size: (merge_h, merge_w) spatial merge kernel.
 
     Returns:
-        ``merge_indices`` shaped ``[num_output_tokens, merge_h * merge_w, max_t]``
-        with indices into the flat patch sequence, and ``merge_weights`` shaped
-        ``[num_output_tokens, max_t]`` holding ``1 / t`` for real frames and ``0``
-        for padded slots.
+        merge_indices shaped [num_output_tokens, merge_h * merge_w, max_t]
+        with indices into the flat patch sequence, and merge_weights shaped
+        [num_output_tokens, max_t] holding 1 / t for real frames and 0 for
+        padded slots.
     """
     if len(grid_thws) == 0:
         raise ValueError("grid_thws must contain at least one (t, h, w) grid")
@@ -510,8 +499,7 @@ def build_temporal_merge_plan(
     for t, h, w in grids:
         if h % merge_h or w % merge_w:
             raise ValueError(
-                f"grid_thw {(t, h, w)} is not divisible by merge kernel "
-                f"{(merge_h, merge_w)}"
+                f"grid_thw {(t, h, w)} is not divisible by merge kernel " f"{(merge_h, merge_w)}"
             )
 
         new_h, new_w = h // merge_h, w // merge_w
@@ -582,18 +570,15 @@ class VisionTower(nnx.Module):
         """Build the host-side arrays the ViT body needs for one batch.
 
         Args:
-            grid_thws: Sequence of ``(t, h, w)`` patch grids, one per item.
-                ``t == 1`` is a still image; ``t > 1`` is a video.
+            grid_thws: Sequence of (t, h, w) patch grids, one per item.
+                t == 1 is a still image; t > 1 is a video.
 
         Returns:
-            ``(rope_freqs_cis, cu_seqlens, abs_pos_embs, merge_indices,
-            merge_weights)``. The last two are consumed by
-            :meth:`compute_hidden_states` to pool ``merge_h * merge_w`` patches
-            spatially and ``t`` frames temporally.
+            (rope_freqs_cis, cu_seqlens, abs_pos_embs, merge_indices,
+            merge_weights). The last two are consumed by compute_hidden_states
+            to pool merge_h * merge_w patches spatially and t frames temporally.
         """
-        merge_indices, merge_weights = build_temporal_merge_plan(
-            grid_thws, self.merge_kernel_size
-        )
+        merge_indices, merge_weights = build_temporal_merge_plan(grid_thws, self.merge_kernel_size)
 
         rope_freqs_cis = self.rope_2d._get_freqs_cis(grid_thws=grid_thws)
 
@@ -621,16 +606,16 @@ class VisionTower(nnx.Module):
         merge_weights: jax.Array | None = None,
         seq_lens: tuple[int, ...] | None = None,
     ) -> jax.Array:
-        """Run the ViT body and merge patches into ``merge_h * merge_w`` groups.
+        """Run the ViT body and merge patches into merge_h * merge_w groups.
 
-        ``merge_weights`` averages every item over its own frame count. It is
-        required whenever a batch mixes items with different ``t`` (an image plus
+        merge_weights averages every item over its own frame count. It is
+        required whenever a batch mixes items with different t (an image plus
         a video, or two videos with different frame counts). When omitted, all
         temporal slots are averaged uniformly, which matches the behavior of
-        batches where every item has the same ``t``.
+        batches where every item has the same t.
 
-        ``seq_lens`` is the static per-item patch count (``t * h * w``), the same
-        information ``cu_seqlens`` carries but available at trace time. The CPU
+        seq_lens is the static per-item patch count (t * h * w), the same
+        information cu_seqlens carries but available at trace time. The CPU
         attention path needs static bounds to slice the block-diagonal attention;
         on TPU it is unused.
         """
@@ -638,9 +623,7 @@ class VisionTower(nnx.Module):
         hidden_states = self.patch_embed(pixel_values)
         hidden_states = hidden_states + abs_pos_embs
 
-        hidden_states = self.encoder(
-            hidden_states, rope_freq_cis, cu_seqlens, seq_lens=seq_lens
-        )
+        hidden_states = self.encoder(hidden_states, rope_freq_cis, cu_seqlens, seq_lens=seq_lens)
 
         merged_states = hidden_states[merge_indices]
 

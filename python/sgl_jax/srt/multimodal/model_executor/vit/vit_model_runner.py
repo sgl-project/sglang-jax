@@ -42,8 +42,6 @@ class VitModelRunner(BaseModelRunner):
         )
 
     def initialize_jit(self):
-        # The vision towers have incompatible signatures, so each gets its own
-        # jitted wrapper.
         if getattr(type(self.model), "__name__", "") == "Kimi_K25_VisionModel":
             self._initialize_jit_kimi()
         else:
@@ -76,8 +74,6 @@ class VitModelRunner(BaseModelRunner):
                 merge_weights,
                 seq_lens=seq_lens,
             )
-            # Project inside the jit so callers get language-model embeddings
-            # directly, matching what the Qwen branch returns.
             return model.mm_projector(hidden_states)
 
         encode_vision = jax.jit(
@@ -112,10 +108,6 @@ class VitModelRunner(BaseModelRunner):
                 merge_weights,
             ) = self.model.vision_tower.compute_aux_arrays(combined_grid_thw)
 
-            # Static per-item patch counts. ``cu_seqlens`` carries the same
-            # information but only as a traced array; the CPU attention path
-            # needs the bounds at trace time to slice the block-diagonal
-            # attention instead of falling back to the emulated TPU kernel.
             seq_lens = tuple(int(t) * int(h) * int(w) for t, h, w in combined_grid_thw)
 
             return encode_vision(

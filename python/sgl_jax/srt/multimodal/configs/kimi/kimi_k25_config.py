@@ -9,13 +9,10 @@ class KimiK25ModelVitConfig(MultiModalModelConfigs):
     base_config_key = "vision_config"
 
     init_pos_emb_height = 64
-    # Nominal depth of the position-embedding table. ``divided_fixed`` reuses one
-    # 2D table for every frame, so this does not bound a video's frame count.
     init_pos_emb_time = 4
     init_pos_emb_width = 64
     in_channels = 3
     merge_kernel_size = [2, 2]
-    # "sd2_tpool": merge 2x2 patches spatially and average-pool over frames.
     merge_type = "sd2_tpool"
     mm_hidden_size = 1152
     mm_projector_type = "patchmerger"
