@@ -63,6 +63,7 @@ class GateLogit(nnx.Module):
         num_experts: int = 0,
         weight_dtype: jnp.dtype = jnp.bfloat16,
         enable_expert_bias: bool | None = False,
+        kernel_dtype: jnp.dtype = jnp.float32,
         score_func: str | None = "softmax",
     ):
         self.weight_dtype = weight_dtype
@@ -73,7 +74,11 @@ class GateLogit(nnx.Module):
             jax.random.normal(
                 jax.random.PRNGKey(0),
                 (input_size, num_experts),
-                dtype=jnp.float32,
+                # kernel_dtype should match the checkpoint's native gate dtype:
+                # storing wider than the checkpoint wastes read bandwidth, storing
+                # narrower loses bits. The f32 default preserves prior behavior;
+                # the upcast at use keeps HIGHEST-dot bits identical either way.
+                dtype=kernel_dtype,
                 out_sharding=P(None, None),
             ),
         )
@@ -91,7 +96,11 @@ class GateLogit(nnx.Module):
 
     @named_scope
     def __call__(self, hidden_states: jax.Array) -> tuple[jax.Array, jax.Array | None]:
-        logits = jnp.dot(hidden_states, self.kernel.value, precision=jax.lax.Precision.HIGHEST)
+        logits = jnp.dot(
+            hidden_states,
+            self.kernel.value.astype(jnp.float32),
+            precision=jax.lax.Precision.HIGHEST,
+        )
 
         if self.score_func:
             if self.score_func == "softmax":
