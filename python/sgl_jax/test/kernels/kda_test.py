@@ -31,6 +31,7 @@ import numpy as np
 from sgl_jax.srt.kernels.kda import chunk_kda, naive_recurrent_kda
 from sgl_jax.srt.kernels.kda.kda import (
     align_up,
+    chunk_gated_delta_rule_fwd_h,
     chunk_local_cumsum_vector,
     kda_gate_chunk_cumsum,
     prepare_chunk_indices,
@@ -433,6 +434,144 @@ def test_chunk_kda_32k_no_zero_length_output_and_final_state_match_naive_recurre
         rtol=2e-2,
         atol=1e-2,
     )
+
+
+def _run_empty_sequence_case(seq_lens, *, with_initial_state, activate):
+    """Exercise empty states through the same full pipeline and recurrent reference."""
+    rng = np.random.default_rng(326)
+    total_t = sum(seq_lens)
+    shape = (1, total_t, _H, _K)
+    q, k, v = (jnp.asarray(0.1 * rng.standard_normal(shape), dtype=jnp.bfloat16) for _ in range(3))
+    raw_g = jnp.asarray(0.25 + 0.2 * rng.standard_normal(shape), dtype=jnp.float32)
+    beta = jax.nn.sigmoid(jnp.asarray(rng.standard_normal((1, total_t, _H)), dtype=jnp.float32))
+    A_log = jnp.asarray(-1.5 + 0.1 * rng.standard_normal((_H,)), dtype=jnp.float32)
+    dt_bias = jnp.asarray(0.1 + 0.2 * rng.standard_normal((_H, _K)), dtype=jnp.float32)
+    activated_g = -jnp.exp(A_log)[None, None, :, None] * jax.nn.softplus(
+        raw_g + dt_bias[None, None, :, :]
+    )
+    state_shape = (len(seq_lens), _H, _K, _V)
+    initial_state = (
+        jnp.asarray(0.03 * rng.standard_normal(state_shape), dtype=jnp.float32)
+        if with_initial_state
+        else None
+    )
+    cu_seqlens = jnp.asarray([0, *np.cumsum(seq_lens)], dtype=jnp.int32)
+    output, final_state, *_ = chunk_kda(
+        q,
+        k,
+        v,
+        raw_g if activate else activated_g,
+        beta,
+        scale=_K**-0.5,
+        initial_state=initial_state,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        chunk_size=_BT,
+        use_gate_in_kernel=activate,
+        A_log=A_log if activate else None,
+        dt_bias=dt_bias if activate else None,
+    )
+    # The existing packed reference helper takes an explicit state per request.
+    # No initial state is equivalent to an all-zero state for the recurrence.
+    reference_initial_state = (
+        initial_state if with_initial_state else jnp.zeros(state_shape, dtype=jnp.float32)
+    )
+    reference_output, reference_state = _full_naive_reference(
+        seq_lens,
+        cu_seqlens,
+        q,
+        k,
+        v,
+        activated_g,
+        beta,
+        reference_initial_state,
+        _K**-0.5,
+    )
+    jax.block_until_ready((output, final_state, reference_output, reference_state))
+    assert output.shape == reference_output.shape == (1, total_t, _H, _V)
+    assert final_state.shape == reference_state.shape == state_shape
+    assert final_state.dtype == reference_state.dtype == jnp.float32
+    assert np.isfinite(np.asarray(output, dtype=np.float32)).all()
+    assert np.isfinite(np.asarray(final_state)).all()
+    np.testing.assert_allclose(output, reference_output, rtol=2e-2, atol=1e-2)
+    np.testing.assert_allclose(final_state, reference_state, rtol=2e-2, atol=1e-2)
+    empty = np.asarray(seq_lens) == 0
+    np.testing.assert_array_equal(
+        np.asarray(final_state)[empty], np.asarray(reference_state)[empty]
+    )
+    np.testing.assert_array_equal(
+        np.asarray(final_state)[empty], np.asarray(reference_initial_state)[empty]
+    )
+
+
+def test_chunk_kda_empty_sequences_preserve_final_state():
+    """Leading, interior and trailing empties alongside partial and full chunks."""
+    for seq_lens, activate in (
+        ([13, 0, 67, 5, 0], True),
+        ([0, 1, 64, 0, 65, 0], False),
+    ):
+        for with_initial_state in (True, False):
+            _run_empty_sequence_case(
+                seq_lens,
+                with_initial_state=with_initial_state,
+                activate=activate,
+            )
+
+
+def test_chunk_kda_all_empty_sequences_preserve_final_state():
+    """All-empty inputs must still initialize every final state."""
+    for seq_lens in ([0], [0, 0, 0]):
+        for with_initial_state in (True, False):
+            _run_empty_sequence_case(
+                seq_lens,
+                with_initial_state=with_initial_state,
+                activate=True,
+            )
+
+
+def test_chunk_kda_zero_token_state_wrapper():
+    """A direct state call with no tiles preserves optional-output and state semantics."""
+    k = jnp.zeros((1, 0, _H, _K), dtype=jnp.bfloat16)
+    beta = jnp.zeros((1, 0, _H), dtype=jnp.float32)
+    cu_seqlens = jnp.zeros((4,), dtype=jnp.int32)
+    chunk_indices = jnp.zeros((0, 2), dtype=jnp.int32)
+    initial = jnp.asarray(
+        np.random.default_rng(326).standard_normal((3, _H, _K, _V)), dtype=jnp.float32
+    )
+    for initial_state in (initial, None):
+        _, expected = naive_recurrent_kda(
+            jnp.repeat(k, 3, axis=0),
+            jnp.repeat(k, 3, axis=0),
+            jnp.repeat(k, 3, axis=0),
+            jnp.repeat(k, 3, axis=0),
+            jnp.repeat(beta, 3, axis=0),
+            initial_state=initial_state,
+            output_final_state=True,
+        )
+        for output_final_state in (True, False):
+            for save_new_value in (True, False):
+                h, v_new, ht = chunk_gated_delta_rule_fwd_h(
+                    k,
+                    k,
+                    k,
+                    initial_state=initial_state,
+                    output_final_state=output_final_state,
+                    save_new_value=save_new_value,
+                    cu_seqlens=cu_seqlens,
+                    chunk_indices=chunk_indices,
+                )
+                assert h.shape == (1, 0, _H, _K, _V)
+                assert h.dtype == jnp.float32
+                if save_new_value:
+                    assert v_new.shape == k.shape
+                    assert v_new.dtype == jnp.float32
+                else:
+                    assert v_new is None
+                if output_final_state:
+                    assert ht.dtype == jnp.float32
+                    np.testing.assert_array_equal(ht, expected)
+                else:
+                    assert ht is None
 
 
 def test_chunk_local_cumsum_preserves_custom_chunk_order_and_masks_invalid_chunks():
