@@ -14,7 +14,8 @@ from sgl_jax.srt.layers.lm_head_parallel import (
     prepare_weight,
     weight_spec,
 )
-from sgl_jax.srt.layers.logits_processor import LogitsProcessor
+from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 
 
 @pytest.fixture(params=[(1, 8), (4, 2), (8, 1)])
@@ -28,6 +29,23 @@ def mesh(request):
     )
 
 
+class _HeadModel(nnx.Module):
+    def __init__(self, mesh, vocab=32):
+        self.lm_head = ParallelLMHead(vocab, 12, param_dtype=jnp.float32)
+        self.logits_processor = LogitsProcessor(vocab, mesh)
+
+
+def _projection(mesh, dp_head, weight, soft_cap=None):
+    vocab, hidden = weight.shape
+    head = ParallelLMHead(vocab, hidden, dtype=jnp.float32, param_dtype=jnp.float32)
+    head.embedding.value = prepare_weight(
+        jax.device_put(weight, NamedSharding(mesh, P())), mesh, dp_head
+    )
+    proc = LogitsProcessor(vocab, mesh, soft_cap=soft_cap)
+    proc.enable_dp_lm_head = dp_head
+    return head, proc
+
+
 @pytest.mark.parametrize("dp_head", [False, True])
 @pytest.mark.parametrize("vocab", [32, 30, 29])
 def test_projection_and_dp_local_selection(mesh, dp_head, vocab):
@@ -35,14 +53,12 @@ def test_projection_and_dp_local_selection(mesh, dp_head, vocab):
     hidden = rng.normal(size=(16, 12)).astype(np.float32)
     weight = rng.normal(size=(vocab, 12)).astype(np.float32)
     h = jax.device_put(hidden, NamedSharding(mesh, P("data", None)))
-    w = prepare_weight(jax.device_put(weight, NamedSharding(mesh, P())), mesh, dp_head)
     with jax.set_mesh(mesh):
-        head = ParallelLMHead(vocab, 12, dtype=jnp.float32, param_dtype=jnp.float32)
-        head.embedding.value = w
-        proc = LogitsProcessor(vocab, mesh)
-        proc.enable_dp_lm_head = dp_head
+        head, proc = _projection(mesh, dp_head, weight)
+        w = head.embedding.value
+        expected_logits = hidden @ weight.T
         out = jax.jit(lambda x, y: proc._get_logits(x, y))(h, head)
-        np.testing.assert_allclose(out, hidden @ weight.T, rtol=2e-5, atol=2e-5)
+        np.testing.assert_allclose(out, expected_logits, rtol=2e-5, atol=2e-5)
         expected = (
             P("data", "tensor")
             if vocab % mesh.shape["tensor"] == 0
@@ -59,22 +75,17 @@ def test_projection_and_dp_local_selection(mesh, dp_head, vocab):
         selected = jax.jit(proc._select_logits)(out, idx)
         rows = np.arange(dp) * (16 // dp) + idx_np
         np.testing.assert_allclose(
-            selected, (hidden @ weight.T)[rows], rtol=2e-5, atol=2e-5
+            selected, expected_logits[rows], rtol=2e-5, atol=2e-5
         )
         np.testing.assert_array_equal(
-            jnp.argmax(out, -1), np.argmax(hidden @ weight.T, -1)
+            jnp.argmax(out, -1), np.argmax(expected_logits, -1)
         )
 
 
 @pytest.mark.parametrize("dp_head", [False, True])
 def test_loading_and_shared_draft_head(mesh, dp_head):
-    class Model(nnx.Module):
-        def __init__(self):
-            self.lm_head = ParallelLMHead(32, 12, param_dtype=jnp.float32)
-            self.logits_processor = LogitsProcessor(32, mesh)
-
     with jax.set_mesh(mesh):
-        model, draft = Model(), Model()
+        model, draft = _HeadModel(mesh), _HeadModel(mesh)
         mappings = lm_head_load_shardings(model, mesh, dp_head)
         assert mappings == {"lm_head.embedding": tuple(weight_spec(dp_head))}
         original = np.asarray(model.lm_head.embedding.value)
@@ -112,11 +123,6 @@ def test_weight_loader(mesh, dp_head, vocab, dummy, tmp_path):
     from safetensors.numpy import save_file
     from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
-    class Model(nnx.Module):
-        def __init__(self):
-            self.lm_head = ParallelLMHead(vocab, 12, param_dtype=jnp.float32)
-            self.logits_processor = LogitsProcessor(vocab, mesh)
-
     original = np.arange(vocab * 12, dtype=np.float32).reshape(vocab, 12) / 100
     save_file({"lm_head.weight": original}, tmp_path / "model.safetensors")
     config = SimpleNamespace(
@@ -125,7 +131,7 @@ def test_weight_loader(mesh, dp_head, vocab, dummy, tmp_path):
         _dummy_mode=dummy,
     )
     with jax.set_mesh(mesh):
-        model = nnx.eval_shape(Model)
+        model = nnx.eval_shape(lambda: _HeadModel(mesh, vocab))
         loader = WeightLoader(model, config, mesh, dtype=jnp.float32)
         loader.load_weights_from_safetensors(
             {
@@ -161,24 +167,13 @@ def test_cli_flag():
 @pytest.mark.parametrize("dp_head", [False, True])
 @pytest.mark.parametrize("mode", ["EXTEND", "DECODE", "TARGET_VERIFY", "DRAFT_EXTEND"])
 def test_forward_modes(mesh, dp_head, mode):
-    from sgl_jax.srt.layers.logits_processor import LogitsMetadata
-    from sgl_jax.srt.model_executor.forward_batch_info import (
-        CaptureHiddenMode,
-        ForwardMode,
-    )
-
     rng = np.random.default_rng(17)
     hidden = rng.normal(size=(16, 12)).astype(np.float32)
     weight = rng.normal(size=(32, 12)).astype(np.float32)
     dp = mesh.shape["data"]
     per_dp = 16 // dp
     with jax.set_mesh(mesh):
-        head = ParallelLMHead(32, 12, dtype=jnp.float32, param_dtype=jnp.float32)
-        head.embedding.value = prepare_weight(
-            jax.device_put(weight, NamedSharding(mesh, P())), mesh, dp_head
-        )
-        proc = LogitsProcessor(32, mesh, soft_cap=3.0)
-        proc.enable_dp_lm_head = dp_head
+        head, proc = _projection(mesh, dp_head, weight, soft_cap=3.0)
         md = LogitsMetadata(
             forward_mode=ForwardMode[mode],
             capture_hidden_mode=CaptureHiddenMode.FULL,
@@ -229,11 +224,6 @@ def test_greedy_projection_preserves_vocab_shards_and_dp_ids(
     mesh, dp_head, vocab, mode
 ):
     from sgl_jax.srt.layers.lm_head_parallel import argmax_with_dp_sharding
-    from sgl_jax.srt.layers.logits_processor import LogitsMetadata
-    from sgl_jax.srt.model_executor.forward_batch_info import (
-        CaptureHiddenMode,
-        ForwardMode,
-    )
 
     # All real logits are negative, so padded zero weights must never win.
     # Equal maxima straddle vocabulary shards, testing global first-index ties.
@@ -242,12 +232,7 @@ def test_greedy_projection_preserves_vocab_shards_and_dp_ids(
     weights[1] = weights[vocab - 1] = -1.0
     dp = mesh.shape["data"]
     with jax.set_mesh(mesh):
-        head = ParallelLMHead(vocab, 4, dtype=jnp.float32, param_dtype=jnp.float32)
-        head.embedding.value = prepare_weight(
-            jax.device_put(weights, NamedSharding(mesh, P())), mesh, dp_head
-        )
-        proc = LogitsProcessor(vocab, mesh, soft_cap=3.0)
-        proc.enable_dp_lm_head = dp_head
+        head, proc = _projection(mesh, dp_head, weights, soft_cap=3.0)
         md = LogitsMetadata(
             forward_mode=ForwardMode[mode],
             capture_hidden_mode=CaptureHiddenMode.NULL,
