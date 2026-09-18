@@ -94,6 +94,57 @@ def test_streamindex_topk_matches_numpy():
         assert (got[t] == -1).sum() == max(0, k - n_valid)
 
 
+def test_streamindex_topk_ref_compressed_visibility_is_completed_groups():
+    """With ``compression_ratio > 1`` an entry covers ``ratio`` consecutive token
+    positions and is visible only once its LAST token is at or before the query,
+    i.e. entries ``[0, (p + 1) // ratio)``. Giving ``k`` more room than there are
+    entries makes the returned set exactly that range, so the rule is pinned
+    without an oracle. The ratio reaches the scores only through this mask, so
+    this is the whole of what the parameter does. Two sequences over a shuffled
+    page table keep the per-sequence page walk honest.
+    """
+    rng = np.random.default_rng(0)
+    ratio, page_size, pages_per_seq = 4, 8, 2
+    # k has to stay under the reduction width (pages_per_seq * page_size = 16)
+    # while still exceeding the 5 entries any query can see.
+    H, D, k = 2, 8, 12
+    seq_lens = np.array([22, 12], np.int32)  # uncompressed tokens: 5 and 3 entries
+    q_lens = [6, 4]  # prefill chunks ending at token 21 and token 11
+    T = sum(q_lens)
+
+    cache = rng.normal(size=(6, page_size, D)).astype(np.float32)
+    page_idx = np.array([4, 1, 5, 0], np.int32)
+    q = rng.normal(size=(T, H, D)).astype(np.float32)
+    weights = rng.normal(size=(T, H)).astype(np.float32)
+    cu_q = np.array([0, q_lens[0], T], np.int32)
+    stride = pages_per_seq * page_size
+    cu_kv = np.array([0, stride, 2 * stride], np.int32)
+
+    got = np.asarray(
+        streamindex_topk_ref(
+            jnp.array(q),
+            jnp.array(weights),
+            jnp.array(cache),
+            jnp.array(seq_lens),
+            jnp.array(page_idx),
+            jnp.array(cu_q),
+            jnp.array(cu_kv),
+            jnp.array([0, 2, 2], np.int32),
+            k=k,
+            pages_per_seq=pages_per_seq,
+            compression_ratio=ratio,
+        )
+    )
+
+    for seq, n_q in enumerate(q_lens):
+        for i in range(n_q):
+            row = int(cu_q[seq]) + i
+            pos = int(seq_lens[seq]) - n_q + i
+            want = set(range((pos + 1) // ratio))
+            live = {e for e in got[row].tolist() if e >= 0}
+            assert live == want, f"seq {seq} pos {pos}: got {sorted(live)} want {sorted(want)}"
+
+
 def test_sparse_mla_full_topk_equals_dense():
     rng = np.random.default_rng(1)
     T, H, Dq, KV, page_size, v_dim = 3, 4, 16, 24, 8, 12
