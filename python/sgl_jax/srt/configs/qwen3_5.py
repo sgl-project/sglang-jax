@@ -197,9 +197,8 @@ class _Qwen3_5TextConfig(PretrainedConfig):
 class Qwen3_5HybridConfig(PretrainedConfig):
     """Root config for Qwen3.5-35B-A3B (hybrid attention + MoE).
 
-    HF 35B-A3B carries a vision sub-config; M1 is text-only, so the
-    vision side is accepted but unused. ``AutoConfig.register(...,
-    exist_ok=True)`` is needed when running against transformers 5.3+
+    The vision sub-config uses the Qwen3-VL encoder without DeepStack.
+    ``AutoConfig.register(..., exist_ok=True)`` is needed with transformers 5.3+
     (which ships its own ``qwen3_5_moe`` class).
     """
 
@@ -228,8 +227,12 @@ class Qwen3_5HybridConfig(PretrainedConfig):
             text_config = _Qwen3_5TextConfig(**text_config)
         self.text_config = text_config
 
-        # Keep vision_config as a plain dict — base inference path doesn't
-        # construct vision layers, so we don't need a typed sub-config.
+        if isinstance(vision_config, dict):
+            vision_config = PretrainedConfig(**vision_config)
+        if vision_config is not None:
+            if getattr(vision_config, "deepstack_visual_indexes", []):
+                raise ValueError("Qwen3.5 does not support DeepStack vision layers")
+            vision_config.deepstack_visual_indexes = []
         self.vision_config = vision_config
 
         self.image_token_id = image_token_id

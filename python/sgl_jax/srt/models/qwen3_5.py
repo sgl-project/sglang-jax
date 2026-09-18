@@ -1,6 +1,6 @@
-"""Qwen3.5-35B-A3B hybrid-attention MoE (text-only for M1).
+"""Qwen3.5 hybrid-attention dense/MoE models with image and video inputs.
 
-Layer layout (40 total, ``full_attention_interval=4``): full-attention at
+35B-A3B layer layout (40 total, ``full_attention_interval=4``): full-attention at
 indices 3, 7, ..., 39 (10 layers); Gated DeltaNet (GDN linear attention) at
 all other indices (30 layers). Per RFC §3.3.
 
@@ -26,6 +26,7 @@ Key conventions confirmed against the upstream torch reference
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -48,6 +49,13 @@ from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
 from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.qwen2_moe import Qwen2MoeMLP
+from sgl_jax.srt.models.qwen3_vl import (
+    Qwen3VLForConditionalGeneration,
+    Qwen3VLVisionModel,
+)
+from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
+from sgl_jax.srt.multimodal.layers.vision_sharding import resolve_encoder_tp
+from sgl_jax.srt.utils.common_utils import resolve_vision_patch_buckets
 from sgl_jax.srt.utils.weight_utils import WeightMapping
 
 logger = logging.getLogger(__name__)
@@ -521,7 +529,17 @@ class Qwen3_5MoeModel(nnx.Module):
         self.norm = GemmaRMSNorm(text_cfg.hidden_size, epsilon=text_cfg.rms_norm_eps)
 
     def __call__(self, forward_batch: ForwardBatch, memory_pools):
-        hidden_states = self.embed_tokens(forward_batch.input_ids)
+        input_embeds = (
+            forward_batch.input_embedding
+            if forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            else None
+        )
+        hidden_states = (
+            self.embed_tokens(forward_batch.input_ids) if input_embeds is None else input_embeds
+        )
+        positions = forward_batch.mrope_positions
+        if positions is None:
+            positions = forward_batch.positions
         residual = None
         layers_kv_fused = []
         layers_rec_buffers = []
@@ -529,7 +547,7 @@ class Qwen3_5MoeModel(nnx.Module):
         layers_topk_ids = []
         for layer in self.layers:
             hidden_states, residual, attn_state, topk_ids = layer(
-                forward_batch.positions,
+                positions,
                 hidden_states,
                 forward_batch,
                 memory_pools,
@@ -571,7 +589,32 @@ class Qwen3_5MoeForCausalLM(nnx.Module):
         return self.model(forward_batch, memory_pools)
 
 
-class Qwen3_5MoeForConditionalGeneration(nnx.Module):
+class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
+    mrope_position_axes = 3
+
+    # Qwen3.5 uses the same packed vision execution as Qwen3-VL, without
+    # DeepStack planes. Keep lane planning and modality dispatch shared.
+    get_image_feature = Qwen3VLForConditionalGeneration.get_image_feature
+    get_video_feature = Qwen3VLForConditionalGeneration.get_video_feature
+    _get_visual_feature = Qwen3VLForConditionalGeneration._get_visual_feature
+
+    def get_multimodal_embedding_packed_capacities(self):
+        if self.visual is None:
+            return ()
+        return Qwen3VLForConditionalGeneration.get_multimodal_embedding_packed_capacities(self)
+
+    def get_multimodal_encode_funcs(self):
+        if self.visual is None:
+            return {}
+        return Qwen3VLForConditionalGeneration.get_multimodal_encode_funcs(self)
+
+    def get_input_embeddings(self):
+        return self.language_model.model.embed_tokens
+
+    def precompile_multimodal(self):
+        if self.visual is not None:
+            self.visual.precompile()
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -582,9 +625,23 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module):
         self.mesh = mesh
         self.dtype = dtype
 
-        # Hidden-state-only language model (RFC §3.3). M2 replaces self.visual.
+        # The runner merges visual features before the language-model forward.
         self.language_model = Qwen3_5MoeForCausalLM(config, mesh, dtype=dtype)
-        self.visual = None
+        if config.vision_config is not None:
+            encoder_tp = resolve_encoder_tp(mesh, getattr(config, "vision_encoder_parallel", "dp"))
+            self.visual = Qwen3VLVisionModel(
+                config.vision_config,
+                dtype,
+                mesh=mesh,
+                tp=encoder_tp,
+                input_buckets=tuple(
+                    resolve_vision_patch_buckets(
+                        getattr(config, "precompile_vision_patch_paddings", None)
+                    )
+                ),
+            )
+        else:
+            self.visual = None
 
         text_cfg = config.text_config
         self.tie_word_embeddings = bool(getattr(config, "tie_word_embeddings", False))
@@ -604,9 +661,7 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module):
         forward_batch: ForwardBatch,
         memory_pools: MemoryPools,
         logits_metadata: LogitsMetadata,
-        pixel_values=None,
     ):
-        assert pixel_values is None, "Qwen3.5 M1 is text-only; multimodal lands in M2"
         hidden_states, layers_kv_fused, layers_rec_state, layers_topk_ids = self.language_model(
             forward_batch, memory_pools
         )
@@ -752,6 +807,25 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module):
                 for i in range(num_layers):
                     self._load_moe_gate_up(fm, weight_info, i)
 
+        if self.visual is not None:
+            vision_mappings = Qwen3VLForConditionalGeneration.create_vision_weight_mappings(
+                self.config, self.visual
+            )
+            missing_vision = vision_mappings.keys() - weight_info.keys()
+            if missing_vision:
+                raise RuntimeError(f"Missing Qwen3.5 vision weights: {sorted(missing_vision)}")
+            vc = self.config.vision_config
+            vision_config = SimpleNamespace(
+                model_path=model_config.model_path,
+                num_attention_heads=vc.num_heads,
+                hidden_size=vc.hidden_size,
+                get_total_num_kv_heads=lambda: vc.num_heads,
+            )
+            WeightLoader(self, vision_config, self.mesh, self.dtype).load_weights_from_safetensors(
+                vision_mappings
+            )
+            mappings.update(vision_mappings)
+            visual_skip = []
         self._log_load_summary(mappings, weight_info, visual_skip, mtp_skip)
 
     @staticmethod
