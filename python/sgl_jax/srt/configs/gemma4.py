@@ -34,3 +34,24 @@ class Gemma4Config(PretrainedConfig):
             self.sliding_window = getattr(tc, "sliding_window", None)
             self.attention_k_eq_v = getattr(tc, "attention_k_eq_v", None)
             self.hybrid_layer_pattern = getattr(tc, "hybrid_layer_pattern", None)
+
+
+class Gemma4AssistantConfig(Gemma4Config):
+    """Config for Gemma4 assistant (MTP draft) checkpoints.
+
+    Inherits ``Gemma4Config.__init__`` so the head_dim / swa_head_dim remap
+    fires automatically. Additional kwargs (backbone_hidden_size,
+    use_ordered_embeddings, etc.) are stored via PretrainedConfig.
+    """
+
+    model_type = "gemma4_assistant"
+
+
+class Gemma4UnifiedAssistantConfig(Gemma4Config):
+    """Config for Gemma4 unified assistant (12B) checkpoints.
+
+    Text path is identical to the non-unified assistant; only the model_type
+    string differs (``gemma4_unified_assistant`` vs ``gemma4_assistant``).
+    """
+
+    model_type = "gemma4_unified_assistant"

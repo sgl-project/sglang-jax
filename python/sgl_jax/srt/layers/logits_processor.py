@@ -410,7 +410,10 @@ class LogitsProcessor(nnx.Module):
             elif logits_metadata.capture_hidden_mode.is_last():
                 # Get the last token hidden states. If sample_indices is None,
                 # pruned states only contain the last tokens already.
-                if aux_hidden_states is not None:
+                # Length check mirrors the is_full() branch above: an empty aux
+                # list means nothing was captured, so fall back to the final
+                # hidden rather than jnp.concat([]).
+                if aux_hidden_states is not None and len(aux_hidden_states) > 0:
                     aux_pruned_states = jnp.concat(aux_pruned_states, axis=-1)
 
                     hidden_states_to_store = (

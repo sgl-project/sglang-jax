@@ -441,6 +441,16 @@ class KVCache(abc.ABC):
     def get_fused_kv_buffer(self, layer_id: int) -> jax.Array:
         raise NotImplementedError()
 
+    def get_all_fused_kv_buffers(self) -> list[jax.Array]:
+        """Every layer's fused KV buffer, in ``replace_buffer`` order.
+
+        Frozen-KV draft models (Gemma4 MTP) read the target's cache but must not
+        write to it. ``memory_pools`` is a donated jit argument, so a model that
+        returns nothing leaves the donated buffers deleted — returning this list
+        unchanged is the pass-through that keeps the cache alive and intact.
+        """
+        return [self.get_fused_kv_buffer(i) for i in range(self.layer_num)]
+
     @abc.abstractmethod
     def get_kv_buffer(self, layer_id: int) -> tuple[jax.Array, jax.Array]:
         """Get separate K and V buffers for native attention.
@@ -880,6 +890,10 @@ class SWAKVPool(KVCache):
         if is_swa:
             return self.swa_kv_pool.get_fused_kv_buffer(layer_id_pool)
         return self.full_kv_pool.get_fused_kv_buffer(layer_id_pool)
+
+    def get_all_fused_kv_buffers(self) -> list[jax.Array]:
+        # SWAKVPool has no self.layer_num; replace_buffer keys off layers_mapping.
+        return [self.get_fused_kv_buffer(i) for i in range(len(self.layers_mapping))]
 
     def _remap_swa_loc(self, loc: jax.Array) -> jax.Array:
         """Remap full-pool indices to SWA-pool indices, handling both DP=1 and DP>1.
