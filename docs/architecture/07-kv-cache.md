@@ -11,7 +11,7 @@ The KV Cache subsystem is the core of memory management in sglang-jax, with a fo
 Core files involved:
 
 - `mem_cache/base_prefix_cache.py` — `BasePrefixCache` abstract base class, `MatchResult`
-- `mem_cache/memory_pool.py` — `ReqToTokenPool`, `HybridReqToTokenPool`, `MHATokenToKVPool`, `MLATokenToKVPool`, `SWAKVPool`
+- `mem_cache/memory_pool.py` — `ReqToTokenPool`, `HybridReqToTokenPool`, `MHATokenToKVPool`, `MLATokenToKVPool`, `SWAKVPool`, `QSATokenToKVPool`
 - `mem_cache/recurrent_state_pool.py` — `RecurrentStatePool`, state management for linear recurrent layers
 - `mem_cache/allocator.py` — Token-level / Page-level / SWA Allocator
 - `mem_cache/radix_cache.py` — `RadixCache`, Radix Tree prefix sharing
@@ -71,12 +71,13 @@ The memory pool layer manages on-device memory through three independent class h
 ```text
 ReqToTokenPool                          KVCache (ABC)                       RecurrentStatePool       MemoryPools
   └── HybridReqToTokenPool                ├── MHATokenToKVPool              (standalone)              (aggregator)
+                                          │     └── QSATokenToKVPool ←── adds a compressed indexer cache
                                           ├── MLATokenToKVPool
                                           ├── SWAKVPool          ←── composes 2 MHATokenToKVPool
                                           └── HybridLinearKVPool ←── composes 1 MHA/MLATokenToKVPool
 ```
 
-`SWAKVPool` and `HybridLinearKVPool` are composition wrappers over inner MHA/MLA pools, not new storage layouts. `MemoryPools` bundles the active pools into one pytree and is passed across the JIT boundary via `donate_argnames=["memory_pools"]`.
+`SWAKVPool` and `HybridLinearKVPool` are composition wrappers over inner MHA/MLA pools, not new storage layouts; `QSATokenToKVPool` is a subclass that keeps the GQA layout and adds buffers beside it. `MemoryPools` bundles the active pools into one pytree and is passed across the JIT boundary via `donate_argnames=["memory_pools"]`.
 
 `ModelRunner._init_pools()` produces one of two configurations depending on the model:
 
@@ -249,6 +250,27 @@ Combining this with `dsa_sparse` is rejected at startup: the DSA indexer slot sp
 The model still iterates over a contiguous global `layer_id` range; every accessor calls `_to_physical(layer_id)` to translate to the inner pool's compacted index. Passing a non-full-attention layer ID raises `ValueError` — those layers must write to `RecurrentStatePool` instead.
 
 `replace_buffer(kv_buffer)` expects a **compacted** list of length `full_layer_nums` (not full-length like `SWAKVPool`), since KDA layers don't produce KV writebacks at all.
+
+#### 7.2.4.6 QSATokenToKVPool
+
+Used by **Qwen Sparse Attention** (`--attention-backend qsa_sparse`). QSA is GQA plus a lightweight indexer, so this subclasses `MHATokenToKVPool` and adds two buffers beside the inherited 5D cache, which is unchanged: a paged cache of compressed indexer keys, and a ring holding the keys of a group that has not closed yet, carried to the step that completes it.
+
+The indexer scores at block granularity — `compress_ratio` consecutive keys mean-pooled into one. Giving that cache a page size of `page_size // compress_ratio` makes **the token cache's page table address it unchanged**, so there is no second allocator, page table or metadata:
+
+```text
+entry = t // ratio
+entry // (page_size // ratio) == t // page_size          same logical page
+entry %  (page_size // ratio) == (t % page_size) // ratio
+```
+
+Two conditions are checked at construction: `compress_ratio` must divide `page_size`, or an entry straddles two pages; and `page_size // compress_ratio` must be a whole number of packed sublanes, or `get_kv_cache_shape` rounds the compressed page up and the identity breaks.
+
+| Buffer | Shape | Sharding |
+|--------|-------|----------|
+| `compressed_key_buffer` | `(num_pages, (page_size // ratio) // packing, packing, align128(indexer_key_dim))` | `P(data, None, None, None)` — page axis only; one indexer KV head, so no head axis to TP-shard |
+| `open_group_buffer` | `(max_reqs, compress_ratio, indexer_key_dim)` | Replicated; indexed by `ReqToTokenPool` slot, which says nothing about which shard holds the request's pages |
+
+`ModelRunnerKVCacheMixin._qsa_indexer_cache_params()` is the single source for the indexer dimensions, read by both `_compute_cell_size` and this pool's construction, which must agree. The ring is per-request rather than per-token, so it is not part of the cell size.
 
 ### 7.2.5 RecurrentStatePool
 
