@@ -2525,6 +2525,7 @@ def spec_decode_verify(
     next_draft_input.sel_pos = prepared_sel_pos
     next_draft_input.positions = prepared_positions
     next_draft_input.verify_seq_lens = prepared_verify_seq_lens
+    next_draft_input.new_seq_lens_for_draft_extend = prepared_new_seq_lens_data
     if draft_padding_prepared or use_relay_state:
         for value in (
             prepared_accept_lens_host,

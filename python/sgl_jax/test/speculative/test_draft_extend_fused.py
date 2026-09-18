@@ -193,3 +193,65 @@ def test_verify_device_handoff_and_rng_step(monkeypatch, dp_size, is_greedy):
                 _, coin_f_key = jax.random.split(old_rng)
                 expected = (jax.random.uniform(coin_f_key, (bs,)) * 10000).astype(jnp.int32)
             np.testing.assert_array_equal(np.asarray(result[12]), np.asarray(expected))
+
+
+@pytest.mark.parametrize("dp_size", [1, 8])
+def test_verify_publishes_device_lengths_for_recurrent_draft(monkeypatch, dp_size):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    from sgl_jax.srt.speculative import draft_extend_fused as fused
+
+    mesh = _explicit_mesh(dp_size)
+    data = NamedSharding(mesh, P("data"))
+    lengths = jax.device_put(np.arange(16, dtype=np.int32), data)
+    scheduler_lengths = jax.device_put(np.arange(16, dtype=np.int32), NamedSharding(mesh, P()))
+    outputs = [None] * 20
+    outputs[5] = scheduler_lengths
+    outputs[18] = lengths
+    outputs[19] = 1
+    runner = SimpleNamespace(
+        attn_backend=SimpleNamespace(get_eagle_forward_metadata=lambda _: None),
+        memory_pools=SimpleNamespace(replace_all=lambda _: None),
+        _model_def=None,
+        _model_state_def=None,
+        model_state_leaves=[],
+        _sampler_base_rng=None,
+        _sampler_step=0,
+    )
+    draft = SimpleNamespace(
+        mesh=mesh,
+        speculative_num_steps=5,
+        speculative_num_draft_tokens=6,
+        _fused_greedy_verify_jit_fn=lambda *args, **kwargs: tuple(outputs),
+    )
+    worker = SimpleNamespace(
+        mesh=mesh,
+        draft_worker=draft,
+        target_worker=SimpleNamespace(model_runner=runner),
+        server_args=SimpleNamespace(),
+    )
+    batch = SimpleNamespace(
+        spec_info_padded=SimpleNamespace(prepare_for_verify=lambda _: None),
+        seq_lens=np.arange(16, dtype=np.int32),
+        logits_indices_selector=np.arange(16),
+        sampling_info=SimpleNamespace(is_all_greedy=True),
+        dp_size=dp_size,
+        bid=0,
+    )
+    monkeypatch.setattr(fused, "_prepare_verify", lambda *args, **kwargs: (None, None))
+    monkeypatch.setattr(
+        fused, "_make_forward_batch", lambda *args: SimpleNamespace(seq_lens=lengths)
+    )
+    monkeypatch.setattr(fused, "_prepare_logits_metadata", lambda *args: SimpleNamespace())
+    monkeypatch.setattr(fused, "_count_pjit_cpp_cache_miss", lambda: nullcontext(lambda: 0))
+
+    result = fused.spec_decode_verify(worker, batch, np.ones(16, dtype=np.int32))
+
+    assert result.next_draft_input.new_seq_lens is scheduler_lengths
+    with jax.transfer_guard("disallow"):
+        ready = fused._prepare_device_array(
+            result.next_draft_input.new_seq_lens_for_draft_extend, data
+        )
+    assert ready is lengths
+    assert runner._sampler_step == 1
