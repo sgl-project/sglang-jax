@@ -69,15 +69,15 @@ class TTGDNAttnBackend(GDNAttnBackend):
         return meta, meta.recurrent_indices, meta.has_initial_state
 
     def _qkv(self, mixed):
-        count = mixed.shape[0]
+        shape = mixed.shape[:-1]
         # Q and K use the same normalization and head expansion. Process them
         # together to avoid launching the identical operation chain twice.
-        qk = mixed[:, : 2 * self.key_dim].reshape(count, 2 * self.num_k_heads, self.head_k_dim)
-        v = mixed[:, 2 * self.key_dim :].reshape(count, self.num_v_heads, self.head_v_dim)
+        qk = mixed[..., : 2 * self.key_dim].reshape(*shape, 2 * self.num_k_heads, self.head_k_dim)
+        v = mixed[..., 2 * self.key_dim :].reshape(*shape, self.num_v_heads, self.head_v_dim)
         repeats = self.num_v_heads // self.num_k_heads
         sharding = jax.sharding.NamedSharding(self.mesh, jax.typeof(qk).sharding.spec)
-        qk = jnp.repeat(_l2norm(qk.astype(jnp.float32)), repeats, axis=1, out_sharding=sharding)
-        q, k = qk[:, : self.num_v_heads], qk[:, self.num_v_heads :]
+        qk = jnp.repeat(_l2norm(qk.astype(jnp.float32)), repeats, axis=-2, out_sharding=sharding)
+        q, k = qk[..., : self.num_v_heads, :], qk[..., self.num_v_heads :, :]
         return q * self.head_k_dim**-0.5, k, v.astype(jnp.float32)
 
     def forward_decode(
@@ -113,7 +113,7 @@ class TTGDNAttnBackend(GDNAttnBackend):
         replicated = jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
         cu_q_lens = jax.sharding.reshard(meta.cu_q_lens, replicated)
         starts = cu_q_lens[:-1]
-        lengths = cu_q_lens[1] if batch == 1 else jnp.diff(cu_q_lens)
+        lengths = jnp.diff(cu_q_lens)
         width = getattr(meta, "max_prefill_len", 0) or count
         width = count if batch == 1 else min(width, count)
         valid = jnp.arange(width) < lengths[..., None]
@@ -127,19 +127,13 @@ class TTGDNAttnBackend(GDNAttnBackend):
         # Pack ragged requests into independent sequences for the native kernel.
         def pack(value):
             if batch == 1:
-                return value
+                return value[None]
             positions = starts[:, None] + jnp.arange(width)
             return value.at[positions].get(mode="clip", out_sharding=replicated)
 
-        def batched(value):
-            return value[None] if batch == 1 else value
-
         packed = pack(mixed_qkv)
         sharding = jax.sharding.NamedSharding(self.mesh, jax.typeof(packed).sharding.spec)
-        saved = gather(conv_state_in)
-        if batch == 1:
-            saved = saved[0]
-        saved = jax.sharding.reshard(saved.swapaxes(-1, -2), sharding)
+        saved = jax.sharding.reshard(gather(conv_state_in).swapaxes(-1, -2), sharding)
         history = jnp.concatenate((saved, packed), axis=-2)
         convolved = sum(
             history[..., tap : tap + width, :].astype(jnp.float32)
@@ -148,19 +142,15 @@ class TTGDNAttnBackend(GDNAttnBackend):
         ).astype(mixed_qkv.dtype)
         convolved = jax.nn.silu(convolved)
         tail_indices = lengths[..., None] + jnp.arange(self.conv_kernel_size - 1)
-        if batch > 1:
-            tail_indices += jnp.arange(batch)[:, None] * history.shape[-2]
+        tail_indices += jnp.arange(batch)[:, None] * history.shape[-2]
         tail = (
             history.reshape((-1, history.shape[-1]))
             .at[tail_indices]
             .get(mode="clip", out_sharding=replicated)
         )
-        new_conv = ops.state_pool_update(conv_state_in, indices, batched(tail.swapaxes(-1, -2)))
+        new_conv = ops.state_pool_update(conv_state_in, indices, tail.swapaxes(-1, -2))
 
-        q, k, v = (
-            x.reshape((*convolved.shape[:-1], self.num_v_heads, self.head_v_dim))
-            for x in self._qkv(convolved.reshape((-1, convolved.shape[-1])))
-        )
+        q, k, v = self._qkv(convolved)
         beta = jax.nn.sigmoid(pack(b).astype(jnp.float32))
         gate = -jnp.exp(A_log.astype(jnp.float32)) * jax.nn.softplus(
             pack(a).astype(jnp.float32) + dt_bias.astype(jnp.float32)
@@ -168,14 +158,7 @@ class TTGDNAttnBackend(GDNAttnBackend):
         # Padding is an identity recurrence: zero update and zero log-decay.
         q, k, v = (jnp.where(valid[..., None, None], x, 0) for x in (q, k, v))
         beta, gate = (jnp.where(valid[..., None], x, 0) for x in (beta, gate))
-        state, out = ops.gated_delta_rule(
-            batched(q),
-            batched(k),
-            batched(v),
-            batched(gate),
-            batched(beta),
-            gather(recurrent_state_in),
-        )
+        state, out = ops.gated_delta_rule(q, k, v, gate, beta, gather(recurrent_state_in))
         new_rec = ops.state_pool_update(recurrent_state_in, indices, state)
         if batch == 1:
             out = out[0]
