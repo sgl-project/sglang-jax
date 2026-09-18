@@ -155,8 +155,8 @@ class TTGDNAttnBackend(GDNAttnBackend):
         gate = -jnp.exp(A_log.astype(jnp.float32)) * jax.nn.softplus(
             pack(a).astype(jnp.float32) + dt_bias.astype(jnp.float32)
         )
-        # Padding is an identity recurrence: zero update and zero log-decay.
-        q, k, v = (jnp.where(valid[..., None, None], x, 0) for x in (q, k, v))
+        # Zero beta and log-decay preserve state; zero queries mask padded output.
+        q = jnp.where(valid[..., None, None], q, 0)
         beta, gate = (jnp.where(valid[..., None], x, 0) for x in (beta, gate))
         state, out = ops.gated_delta_rule(q, k, v, gate, beta, gather(recurrent_state_in))
         new_rec = ops.state_pool_update(recurrent_state_in, indices, state)
