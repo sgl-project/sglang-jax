@@ -2,7 +2,6 @@
 
 import os
 from functools import partial
-from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -10,7 +9,7 @@ import numpy as np
 import pytest
 
 from sgl_jax.srt.hardware_backend.tt.attention import ops
-from sgl_jax.srt.hardware_backend.tt.attention.gdn_backend import TTGDNAttnBackend
+from sgl_jax.srt.hardware_backend.tt.attention.gdn_backend import TTGDNAttnBackend, TTGDNMetadata
 from sgl_jax.srt.hardware_backend.tt.attention.tt_backend import TTAttention
 from sgl_jax.srt.kernels.gdn.gated_delta import (
     _gated_delta_step,
@@ -22,7 +21,6 @@ from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     LinearRecurrentAttnBackendMetadata,
 )
 from sgl_jax.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
-from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
 
 @pytest.fixture(autouse=True)
@@ -62,8 +60,8 @@ def reference_chunk(q, k, v, gate, beta, state):
     def step(state, inputs):
         return _gated_delta_step(state, *inputs)
 
-    state, out = jax.lax.scan(step, state[0], (q[0], k[0], v[0], gate[0], beta[0]))
-    return state[None], out[None]
+    state, out = jax.lax.scan(step, state, tuple(x.swapaxes(0, 1) for x in (q, k, v, gate, beta)))
+    return state, out.swapaxes(0, 1)
 
 
 def reference_decode(state, q, k, v, b, a, A_log, dt_bias, indices, initial):
@@ -138,9 +136,9 @@ def reference(args, metadata, num_k_heads=2, num_v_heads=4, decode=False):
 @pytest.fixture
 def reference_ops(monkeypatch):
     monkeypatch.setattr(ops, "gated_delta_rule", reference_chunk)
+    monkeypatch.setattr(ops, "state_pool_update", _scatter_idx0_safe)
     monkeypatch.setattr(ops, "gated_delta_decode", reference_decode)
     monkeypatch.setattr(ops, "causal_conv1d_update", reference_conv)
-    monkeypatch.setattr(ops, "state_pool_update", _scatter_idx0_safe)
 
 
 @pytest.mark.parametrize("length", [1, 5, 32, 47, 64])
@@ -189,14 +187,6 @@ def test_decode(reference_ops, indices, initial):
                 rtol=0.01,
                 atol=1e-5,
             )
-
-
-def test_batched_prefill_rejected():
-    with jax.default_device(jax.devices("cpu")[0]):
-        backend = make_backend(jax.devices("cpu")[0], 1, False)
-        batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND, real_bs=2)
-        with pytest.raises(NotImplementedError, match="prefill supports one request"):
-            backend.get_forward_metadata(batch)
 
 
 @pytest.mark.parametrize("decode,batch", [(False, 1), (False, 4), (True, 1), (True, 4)])
@@ -256,16 +246,19 @@ def test_explicit_serving_mesh(decode, batch):
     reason="requires JAX_PLATFORMS=tt,cpu and a Tenstorrent device",
 )
 @pytest.mark.parametrize("trace", [False, True])
-@pytest.mark.parametrize("heads", [(2, 4), (16, 32), (20, 40)])
-@pytest.mark.parametrize("batch", [1, 4])
+@pytest.mark.parametrize(
+    "heads,batch",
+    [(heads, batch) for heads in [(2, 4), (16, 32), (20, 40)] for batch in [1, 4]] + [((2, 4), 32)],
+)
 def test_device_state_handoff(trace, heads, batch):
     """Real kernels: warmup, replay, chunk continuation, slot reuse and padding."""
     cpu, tt = jax.devices("cpu")[0], jax.devices("tt")[0]
 
     def compile_forward(decode):
-        def forward(indices, initial, lengths, *args):
+        def forward(indices, initial, lengths, *args, max_prefill_len):
             backend = make_backend(tt, 1, False, *heads)
-            backend.forward_metadata = LinearRecurrentAttnBackendMetadata(
+            backend.forward_metadata = TTGDNMetadata(
+                max_prefill_len=max_prefill_len,
                 cu_q_lens=lengths,
                 recurrent_indices=indices,
                 has_initial_state=initial,
@@ -276,6 +269,7 @@ def test_device_state_handoff(trace, heads, batch):
 
         return jax.jit(
             forward,
+            static_argnames=("max_prefill_len",),
             donate_argnums=(4, 5),
             compiler_options={"optimization_level": "1", "enable_trace": str(trace).lower()},
         )
@@ -285,7 +279,7 @@ def test_device_state_handoff(trace, heads, batch):
     def to_device(tree):
         return jax.tree.map(lambda x: jax.device_put(np.asarray(x), tt), tree)
 
-    slots = 3 if batch == 1 else 6
+    slots = batch + 2
     with jax.default_device(cpu):
         base = inputs(1, *heads, slots=slots)
     host_states, device_states = base[1:3], to_device(base[1:3])
@@ -298,21 +292,24 @@ def test_device_state_handoff(trace, heads, batch):
     cases += [(False, 47, 2, True), (True, 1, 2, True), (False, 64, 1, False)]
     cases = [(decode, [length], [slot], [initial]) for decode, length, slot, initial in cases]
     if batch == 4:
-        # Prefill requests individually, then decode together. Reorder slots,
-        # continue chunks, reuse a slot and include dummy requests on replay.
-        cases = [(False, [n], [slot], [False]) for n, slot in [(5, 4), (2, 2), (17, 1)]]
+        # Ragged prefill, chunk continuation, slot reuse, and interspersed dummies.
+        cases = [(False, [5, 2, 17, 0], [4, 2, 1, 0], [False] * 4)]
         cases += [(True, [1] * 4, [4, 2, 0, 1], [True, True, False, True])] * 4
-        cases += [(False, [7], [1], [True]), (False, [25], [4], [True])]
+        cases += [(False, [7, 25, 1, 0], [1, 4, 2, 0], [True, True, False, False])]
         cases += [(True, [1] * 4, [2, 4, 1, 0], [True, True, True, False])] * 4
-        cases += [(False, [1], [2], [False]), (False, [17], [3], [False])]
+        cases += [(False, [0, 17, 0, 1], [0, 3, 0, 2], [False] * 4)]
         cases += [(True, [1] * 4, [3, 2, 1, 4], [True] * 4)]
-        cases += [(False, [65], [1], [True]), (False, [161], [4], [True])]
+        cases += [(False, [65, 2, 0, 161], [1, 2, 0, 4], [True, True, False, True])]
         cases += [(True, [1] * 4, [1, 4, 3, 0], [True, True, True, False])]
+    elif batch == 32:
+        indices = list(range(1, batch + 1))
+        cases = [(False, [1] * batch, indices, [False] * batch)]
+        cases += [(True, [1] * batch, indices, [True] * batch)] * 4
     for step, (decode, lengths, indices, initial) in enumerate(cases):
         if not decode:
-            lengths = lengths + [0] * (batch - 1)
-            indices = indices + [0] * (batch - 1)
-            initial = initial + [False] * (batch - 1)
+            lengths = lengths + [0] * (batch - len(lengths))
+            indices = indices + [0] * (batch - len(indices))
+            initial = initial + [False] * (batch - len(initial))
         length = sum(lengths)
         with jax.default_device(cpu):
             count = batch if decode else (length + 31) // 32 * 32
@@ -331,7 +328,14 @@ def test_device_state_handoff(trace, heads, batch):
                 np.cumsum([0, *lengths], dtype=np.int32),
             )
         )
-        actual = compiled[decode](*metadata, dynamic[0], *device_states, *dynamic[1:], *weights)
+        actual = compiled[decode](
+            *metadata,
+            dynamic[0],
+            *device_states,
+            *dynamic[1:],
+            *weights,
+            max_prefill_len=1 << (max(max(lengths), 32) - 1).bit_length(),
+        )
         for i, (result, wanted) in enumerate(zip(actual, expected)):
             result, wanted = (np.asarray(x, dtype=np.float32) for x in (result, wanted))
             if i == 0:

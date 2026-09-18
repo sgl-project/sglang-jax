@@ -86,7 +86,6 @@ from sgl_jax.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 from sgl_jax.srt.mem_cache.common import release_kv_cache
 from sgl_jax.srt.mem_cache.kv_cache_builder import build_kv_cache
-from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sgl_jax.srt.mem_cache.radix_cache import RadixKey
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -735,6 +734,8 @@ class Scheduler(
             )
 
     def init_memory_pool_and_cache(self):
+        from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool
+
         self.req_to_token_pool, self.token_to_kv_pool_allocator = self.tp_worker.get_memory_pool()
         self.tree_cache = build_kv_cache(
             server_args=self.server_args,
@@ -2307,15 +2308,6 @@ class Scheduler(
             if self.running_batch.reqs_info[dp_rank].batch_is_full or (
                 len(self.running_batch.reqs_info[dp_rank].reqs) + len(adder.can_run_list[dp_rank])
                 >= self.per_dp_max_running_requests
-            ):
-                continue
-
-            # TT recurrent prefill handles one request, including a continuing
-            # chunk. Completed prefills can still join the running decode batch.
-            if (
-                isinstance(self.req_to_token_pool, HybridReqToTokenPool)
-                and self.server_args.attention_backend == "tt"
-                and adder.can_run_list[dp_rank]
             ):
                 continue
 
