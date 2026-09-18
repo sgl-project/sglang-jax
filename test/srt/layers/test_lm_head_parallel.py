@@ -220,3 +220,85 @@ def test_model_without_lm_head_accepts_other_mesh_axes():
     assert lm_head_load_shardings(model, mesh, False) == {}
     configure_lm_heads(model, mesh, False)
     assert model.weight.value is original
+
+
+@pytest.mark.parametrize("dp_head", [False, True])
+@pytest.mark.parametrize("vocab", [32, 29])
+@pytest.mark.parametrize("mode", ["TARGET_VERIFY", "DRAFT_EXTEND", "DECODE", "EXTEND"])
+def test_greedy_projection_preserves_vocab_shards_and_dp_ids(
+    mesh, dp_head, vocab, mode
+):
+    from sgl_jax.srt.layers.lm_head_parallel import argmax_with_dp_sharding
+    from sgl_jax.srt.layers.logits_processor import LogitsMetadata
+    from sgl_jax.srt.model_executor.forward_batch_info import (
+        CaptureHiddenMode,
+        ForwardMode,
+    )
+
+    # All real logits are negative, so padded zero weights must never win.
+    # Equal maxima straddle vocabulary shards, testing global first-index ties.
+    hidden = np.ones((16, 4), np.float32)
+    weights = np.full((vocab, 4), -2.0, np.float32)
+    weights[1] = weights[vocab - 1] = -1.0
+    dp = mesh.shape["data"]
+    with jax.set_mesh(mesh):
+        head = ParallelLMHead(vocab, 4, dtype=jnp.float32, param_dtype=jnp.float32)
+        head.embedding.value = prepare_weight(
+            jax.device_put(weights, NamedSharding(mesh, P())), mesh, dp_head
+        )
+        proc = LogitsProcessor(vocab, mesh, soft_cap=3.0)
+        proc.enable_dp_lm_head = dp_head
+        md = LogitsMetadata(
+            forward_mode=ForwardMode[mode],
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            preserve_vocab_sharding=True,
+            logits_indices=jax.device_put(
+                np.full(dp, 16 // dp - 1, np.int32), NamedSharding(mesh, P("data"))
+            ),
+        )
+
+        @jax.jit
+        def run(h, w, metadata):
+            out = proc(h, w, metadata).next_token_logits
+            return out, argmax_with_dp_sharding(out)
+
+        logits, ids = run(
+            jax.device_put(hidden, NamedSharding(mesh, P("data", None))), head, md
+        )
+        rows = 16 if mode in ("TARGET_VERIFY", "DECODE") else dp
+        np.testing.assert_array_equal(ids, np.ones(rows, np.int32))
+        assert ids.sharding.spec == P("data")
+        if not dp_head and vocab == 32:
+            assert logits.sharding.spec == P(None, ("data", "tensor"))
+        else:
+            expected = (
+                P("data", "tensor")
+                if vocab % mesh.shape["tensor"] == 0
+                else P("data", None)
+            )
+            assert logits.sharding.spec == expected
+        expected_logits = 3.0 * np.tanh((hidden[:rows] @ weights.T) / 3.0)
+        np.testing.assert_allclose(logits, expected_logits, rtol=2e-5, atol=2e-5)
+
+
+def test_fused_greedy_consumers_keep_row_order_and_map_draft_vocab(mesh):
+    from sgl_jax.srt.speculative.draft_extend_fused import (
+        _eagle3_raw_and_mapped_token_from_logits,
+        _topk1_index_from_logits,
+    )
+
+    logits_np = np.random.default_rng(42).normal(size=(16, 32)).astype(np.float32)
+    expected = np.argmax(logits_np, axis=-1)
+    mapping_np = np.arange(32, dtype=np.int32)[::-1].copy() * 7
+    with jax.set_mesh(mesh):
+        logits = jax.device_put(
+            logits_np, NamedSharding(mesh, P(None, ("data", "tensor")))
+        )
+        mapping = jax.device_put(mapping_np, NamedSharding(mesh, P()))
+        indices = jax.jit(_topk1_index_from_logits)(logits)
+        raw, mapped = jax.jit(_eagle3_raw_and_mapped_token_from_logits)(logits, mapping)
+        np.testing.assert_array_equal(indices[:, 0], expected)
+        np.testing.assert_array_equal(raw, expected)
+        np.testing.assert_array_equal(mapped, mapping_np[expected])
+        assert raw.sharding.spec == P("data")
+        assert mapped.sharding.spec == P("data")

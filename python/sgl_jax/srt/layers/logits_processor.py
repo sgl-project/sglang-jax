@@ -119,6 +119,9 @@ class LogitsMetadata:
     top_p_normalized_logprobs: bool = False
     top_p: jax.Array = None
 
+    # Opt-in for fused callers that immediately reduce logits to greedy IDs.
+    preserve_vocab_sharding: bool = False
+
     def tree_flatten(self):
         children = (
             self.extend_seq_lens,
@@ -134,6 +137,7 @@ class LogitsMetadata:
         aux_data = {
             "forward_mode": self.forward_mode,
             "capture_hidden_mode": self.capture_hidden_mode,
+            "preserve_vocab_sharding": self.preserve_vocab_sharding,
             "extend_return_logprob": self.extend_return_logprob,
             "extend_return_top_logprob": self.extend_return_top_logprob,
             "extend_token_ids_logprob": self.extend_token_ids_logprob,
@@ -168,6 +172,7 @@ class LogitsMetadata:
 
         obj.forward_mode = aux_data["forward_mode"]
         obj.capture_hidden_mode = aux_data["capture_hidden_mode"]
+        obj.preserve_vocab_sharding = aux_data["preserve_vocab_sharding"]
         obj.extend_return_logprob = aux_data["extend_return_logprob"]
         obj.extend_return_top_logprob = aux_data["extend_return_top_logprob"]
         obj.extend_token_ids_logprob = aux_data["extend_token_ids_logprob"]
@@ -402,7 +407,15 @@ class LogitsProcessor(nnx.Module):
                 )
 
         # Compute logits for both input and sampled tokens.
-        logits = self._get_logits(pruned_states, lm_head)
+        logits = self._get_logits(
+            pruned_states,
+            lm_head,
+            preserve_vocab_sharding=(
+                logits_metadata.preserve_vocab_sharding
+                and not logits_metadata.extend_return_logprob
+                and sample_indices is None
+            ),
+        )
         sampled_logits = (
             self._select_logits(logits, sample_indices) if sample_indices is not None else logits
         )
@@ -531,6 +544,8 @@ class LogitsProcessor(nnx.Module):
         self,
         hidden_states: jax.Array,
         lm_head: Embed,
+        *,
+        preserve_vocab_sharding: bool = False,
     ) -> jax.Array:
         """Get logits from hidden_states.
 
@@ -543,7 +558,12 @@ class LogitsProcessor(nnx.Module):
             dtype=lm_head.dtype,
         )
         logits = compute_lm_head_logits(
-            hidden_states, embedding, self.mesh, self.vocab_size, self.enable_dp_lm_head
+            hidden_states,
+            embedding,
+            self.mesh,
+            self.vocab_size,
+            self.enable_dp_lm_head,
+            preserve_vocab_sharding=preserve_vocab_sharding,
         )
 
         if self.soft_cap:

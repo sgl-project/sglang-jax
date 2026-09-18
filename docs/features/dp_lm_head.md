@@ -17,9 +17,18 @@ For example, on 16 JAX devices:
 The mesh remains `(data=dp_size, tensor=tp_size/dp_size)`. Full-TP LM head weights
 use `P(("data", "tensor"), None)` for `[vocabulary, hidden]`. Token rows are
 replicated for the projection, and the vocabulary-sharded result is redistributed
-to the original data groups before sampling. JAX lowers these layout changes to
+to the original data groups before general sampling. JAX lowers these layout changes to
 collectives. There is no separate host gather and no assumption that every DP
 group has the same number of live requests (the existing padded batches apply).
+
+Fused speculative greedy verification and topk=1 draft calls instead keep the
+global vocabulary layout through argmax, then redistribute only token IDs to
+their DP groups. This avoids moving full logits between DP groups and allows
+the compiler to fuse projection with the local vocabulary reduction. Fused
+greedy prefill uses the same path. Calls returning target logits/logprobs,
+non-greedy target sampling, and vocabularies not divisible by global TP retain
+the existing full-logits path. The flag still controls weight partitioning for
+both target and draft; this optimization does not change its meaning.
 
 With the flag enabled, weights use `P("tensor", None)` and the projection keeps
 token rows sharded over `data`. With DP=1 both choices have the same physical
