@@ -204,11 +204,7 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     @property
     def compiler_options(self):
-        return getattr(
-            self.linear_attn_backend,
-            "compiler_options",
-            getattr(self.full_attn_backend, "compiler_options", None),
-        )
+        return getattr(self.linear_attn_backend, "compiler_options", None)
 
     @property
     def sampler_compiler_options(self):
