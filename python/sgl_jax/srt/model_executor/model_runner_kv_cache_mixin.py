@@ -502,12 +502,8 @@ class ModelRunnerKVCacheMixin:
                 )
             token_capacity = min(token_capacity, max_total_tokens)
 
-        # Page and Data mesh alignment
-        data_mesh_dim = 1
-        if hasattr(self, "mesh") and self.mesh is not None and "data" in self.mesh.shape:
-            data_mesh_dim = self.mesh.shape["data"]
-        alignment = self.server_args.page_size * max(1, data_mesh_dim)
-        token_capacity = (token_capacity // alignment) * alignment
+        # Page alignment
+        token_capacity = token_capacity // self.server_args.page_size * self.server_args.page_size
 
         # DP scale
         token_capacity = token_capacity * dp_size
