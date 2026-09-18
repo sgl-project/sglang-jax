@@ -30,6 +30,13 @@ def isolated_mesh():
         yield
 
 
+@pytest.fixture
+def tt_device():
+    if "tt" not in os.environ.get("JAX_PLATFORMS", "").split(","):
+        pytest.skip("requires JAX_PLATFORMS=tt,cpu and a Tenstorrent device")
+    return jax.devices("tt")[0]
+
+
 def test_weight_precision_policy(monkeypatch):
     annotations = []
 
@@ -80,9 +87,7 @@ def reference_conv(state, value, weight, indices, initial):
     return state, out
 
 
-def make_backend(
-    device, length, initial, num_k_heads=2, num_v_heads=4, backend_cls=TTGDNAttnBackend
-):
+def make_backend(device, metadata, num_k_heads=2, num_v_heads=4, backend_cls=TTGDNAttnBackend):
     backend = backend_cls(
         num_k_heads=num_k_heads,
         num_v_heads=num_v_heads,
@@ -93,11 +98,7 @@ def make_backend(
         dtype=jnp.bfloat16,
         prefill_impl="chunked_jax",
     )
-    backend.forward_metadata = LinearRecurrentAttnBackendMetadata(
-        cu_q_lens=jnp.array([0, length], dtype=jnp.int32),
-        recurrent_indices=jnp.array([1], dtype=jnp.int32),
-        has_initial_state=jnp.array([initial]),
-    )
+    backend.forward_metadata = metadata
     return backend
 
 
@@ -126,8 +127,7 @@ def inputs(count, num_k_heads=2, num_v_heads=4, seed=35, slots=3):
 
 @partial(jax.jit, static_argnames=("num_k_heads", "num_v_heads", "decode"))
 def reference(args, metadata, num_k_heads=2, num_v_heads=4, decode=False):
-    native = make_backend(jax.devices("cpu")[0], 1, False, num_k_heads, num_v_heads, GDNAttnBackend)
-    native.forward_metadata = metadata
+    native = make_backend(jax.devices("cpu")[0], metadata, num_k_heads, num_v_heads, GDNAttnBackend)
     if decode:
         return native.forward_decode(*args)
     return native.forward_extend(*args, seq_lens=None)
@@ -146,11 +146,12 @@ def reference_ops(monkeypatch):
 @pytest.mark.parametrize("metadata_size", [1, 4])
 def test_prefill(reference_ops, length, initial, metadata_size):
     with jax.default_device(jax.devices("cpu")[0]):
-        backend = make_backend(jax.devices("cpu")[0], length, initial)
-        meta = backend.forward_metadata
-        meta.recurrent_indices = jnp.pad(meta.recurrent_indices, (0, metadata_size - 1))
-        meta.has_initial_state = jnp.pad(meta.has_initial_state, (0, metadata_size - 1))
-        meta.cu_q_lens = jnp.pad(meta.cu_q_lens, (0, metadata_size - 1), mode="edge")
+        meta = LinearRecurrentAttnBackendMetadata(
+            cu_q_lens=jnp.array([0] + [length] * metadata_size, jnp.int32),
+            recurrent_indices=jnp.array([1] + [0] * (metadata_size - 1), jnp.int32),
+            has_initial_state=jnp.array([initial] + [False] * (metadata_size - 1)),
+        )
+        backend = make_backend(jax.devices("cpu")[0], meta)
         args = inputs((length + 31) // 32 * 32)
         expected = reference(args, backend.forward_metadata)
         actual = backend.forward_extend(*args, seq_lens=None)
@@ -174,9 +175,11 @@ def test_prefill(reference_ops, length, initial, metadata_size):
 )
 def test_decode(reference_ops, indices, initial):
     with jax.default_device(jax.devices("cpu")[0]):
-        backend = make_backend(jax.devices("cpu")[0], 1, False)
-        backend.forward_metadata.recurrent_indices = jnp.array(indices, jnp.int32)
-        backend.forward_metadata.has_initial_state = jnp.array(initial)
+        meta = LinearRecurrentAttnBackendMetadata(
+            recurrent_indices=jnp.array(indices, jnp.int32),
+            has_initial_state=jnp.array(initial),
+        )
+        backend = make_backend(jax.devices("cpu")[0], meta)
         args = inputs(len(indices), slots=max(indices) + 2)
         expected = reference(args, backend.forward_metadata, decode=True)
         actual = backend.forward_decode(*args)
@@ -204,80 +207,61 @@ def test_explicit_serving_mesh(decode, batch):
         for x, spec in zip(operands, specs)
     )
 
-    meta_sharding = jax.sharding.NamedSharding(mesh, P("data"))
-    metadata = tuple(
-        jax.device_put(x, meta_sharding)
-        for x in (
-            (
-                np.arange(1, batch + 1, dtype=np.int32)
-                if decode
-                else np.array([1] + [0] * (batch - 1), np.int32)
-            ),
-            np.zeros(batch, bool),
-            (
-                np.arange(batch + 1, dtype=np.int32)
-                if decode
-                else np.array([0] + [5] * batch, np.int32)
-            ),
-        )
+    metadata = LinearRecurrentAttnBackendMetadata(
+        recurrent_indices=(
+            np.arange(1, batch + 1, dtype=np.int32)
+            if decode
+            else np.array([1] + [0] * (batch - 1), np.int32)
+        ),
+        has_initial_state=np.zeros(batch, bool),
+        cu_q_lens=(
+            np.arange(batch + 1, dtype=np.int32)
+            if decode
+            else np.array([0] + [5] * batch, np.int32)
+        ),
     )
+    metadata = jax.device_put(metadata, jax.sharding.NamedSharding(mesh, P("data")))
 
-    def forward(indices, initial, lengths, *args):
-        backend = make_backend(cpu, 1 if decode else 5, False)
+    def forward(metadata, *args):
+        backend = make_backend(cpu, metadata)
         backend.mesh = mesh
-        backend.forward_metadata = LinearRecurrentAttnBackendMetadata(
-            cu_q_lens=lengths,
-            recurrent_indices=indices,
-            has_initial_state=initial,
-        )
         if decode:
             return backend.forward_decode(*args)
         return backend.forward_extend(*args, seq_lens=None)
 
     # Check JAX's explicit-sharding rules without executing the TT FFI on CPU.
     with jax.set_mesh(mesh):
-        result = jax.eval_shape(forward, *metadata, *operands)
+        result = jax.eval_shape(forward, metadata, *operands)
     assert result[1].shape == operands[1].shape
     assert result[2].shape == operands[2].shape
 
 
-@pytest.mark.skipif(
-    "tt" not in os.environ.get("JAX_PLATFORMS", "").split(","),
-    reason="requires JAX_PLATFORMS=tt,cpu and a Tenstorrent device",
-)
 @pytest.mark.parametrize("trace", [False, True])
 @pytest.mark.parametrize(
     "heads,batch",
     [(heads, batch) for heads in [(2, 4), (16, 32), (20, 40)] for batch in [1, 4]] + [((2, 4), 32)],
 )
-def test_device_state_handoff(trace, heads, batch):
+def test_device_state_handoff(tt_device, trace, heads, batch):
     """Real kernels: warmup, replay, chunk continuation, slot reuse and padding."""
-    cpu, tt = jax.devices("cpu")[0], jax.devices("tt")[0]
+    cpu = jax.devices("cpu")[0]
 
     def compile_forward(decode):
-        def forward(indices, initial, lengths, *args, max_prefill_len):
-            backend = make_backend(tt, 1, False, *heads)
-            backend.forward_metadata = TTGDNMetadata(
-                max_prefill_len=max_prefill_len,
-                cu_q_lens=lengths,
-                recurrent_indices=indices,
-                has_initial_state=initial,
-            )
+        def forward(metadata, *args):
+            backend = make_backend(tt_device, metadata, *heads)
             if decode:
                 return backend.forward_decode(*args)
             return backend.forward_extend(*args, seq_lens=None)
 
         return jax.jit(
             forward,
-            static_argnames=("max_prefill_len",),
-            donate_argnums=(4, 5),
+            donate_argnums=(2, 3),
             compiler_options={"optimization_level": "1", "enable_trace": str(trace).lower()},
         )
 
     compiled = {decode: compile_forward(decode) for decode in (False, True)}
 
     def to_device(tree):
-        return jax.tree.map(lambda x: jax.device_put(np.asarray(x), tt), tree)
+        return jax.tree.map(lambda x: jax.device_put(np.asarray(x), tt_device), tree)
 
     slots = batch + 2
     with jax.default_device(cpu):
@@ -285,13 +269,14 @@ def test_device_state_handoff(trace, heads, batch):
     host_states, device_states = base[1:3], to_device(base[1:3])
     previous_device_states = tuple(np.asarray(x, dtype=np.float32) for x in host_states)
     weights = to_device(base[5:])
-    # (decode, live length, slot, has initial state)
-    cases = [(False, 5, 1, False)] + [(True, 1, 1, True)] * 4
-    cases += [(False, 17, 1, True)] + [(True, 1, 1, True)] * 4
-    cases += [(False, 31, 2, False), (True, 1, 2, True), (True, 1, 0, False)]
-    cases += [(False, 47, 2, True), (True, 1, 2, True), (False, 64, 1, False)]
-    cases = [(decode, [length], [slot], [initial]) for decode, length, slot, initial in cases]
-    if batch == 4:
+    if batch == 1:
+        # (decode, live length, slot, has initial state)
+        cases = [(False, 5, 1, False)] + [(True, 1, 1, True)] * 4
+        cases += [(False, 17, 1, True)] + [(True, 1, 1, True)] * 4
+        cases += [(False, 31, 2, False), (True, 1, 2, True), (True, 1, 0, False)]
+        cases += [(False, 47, 2, True), (True, 1, 2, True), (False, 64, 1, False)]
+        cases = [(decode, [length], [slot], [initial]) for decode, length, slot, initial in cases]
+    elif batch == 4:
         # Ragged prefill, chunk continuation, slot reuse, and interspersed dummies.
         cases = [(False, [5, 2, 17, 0], [4, 2, 1, 0], [False] * 4)]
         cases += [(True, [1] * 4, [4, 2, 0, 1], [True, True, False, True])] * 4
@@ -306,38 +291,29 @@ def test_device_state_handoff(trace, heads, batch):
         cases = [(False, [1] * batch, indices, [False] * batch)]
         cases += [(True, [1] * batch, indices, [True] * batch)] * 4
     for step, (decode, lengths, indices, initial) in enumerate(cases):
-        if not decode:
-            lengths = lengths + [0] * (batch - len(lengths))
-            indices = indices + [0] * (batch - len(indices))
-            initial = initial + [False] * (batch - len(initial))
         length = sum(lengths)
         with jax.default_device(cpu):
             count = batch if decode else (length + 31) // 32 * 32
             sample = inputs(count, *heads, seed=35 + step, slots=slots)
             host = (sample[0], *host_states, *sample[3:5], *base[5:])
-            backend = make_backend(cpu, length, False, *heads)
-            backend.forward_metadata.recurrent_indices = jnp.array(indices, jnp.int32)
-            backend.forward_metadata.has_initial_state = jnp.array(initial)
-            backend.forward_metadata.cu_q_lens = jnp.asarray(np.cumsum([0, *lengths]), jnp.int32)
-            expected = reference(host, backend.forward_metadata, *heads, decode=decode)
-        dynamic = to_device((sample[0], *sample[3:5]))
-        metadata = to_device(
-            (
-                np.array(indices, np.int32),
-                np.array(initial),
-                np.cumsum([0, *lengths], dtype=np.int32),
+            metadata = TTGDNMetadata(
+                cu_q_lens=jnp.asarray(np.cumsum([0, *lengths]), jnp.int32),
+                recurrent_indices=jnp.array(indices, jnp.int32),
+                has_initial_state=jnp.array(initial),
+                max_prefill_len=1 << (max(max(lengths), 32) - 1).bit_length(),
             )
-        )
+            expected = reference(host, metadata, *heads, decode=decode)
+        dynamic = to_device((sample[0], *sample[3:5]))
         actual = compiled[decode](
-            *metadata,
+            to_device(metadata),
             dynamic[0],
             *device_states,
             *dynamic[1:],
             *weights,
-            max_prefill_len=1 << (max(max(lengths), 32) - 1).bit_length(),
         )
-        for i, (result, wanted) in enumerate(zip(actual, expected)):
-            result, wanted = (np.asarray(x, dtype=np.float32) for x in (result, wanted))
+        actual_host = jax.tree.map(lambda x: np.asarray(x, dtype=np.float32), actual)
+        for i, (result, wanted) in enumerate(zip(actual_host, expected)):
+            wanted = np.asarray(wanted, dtype=np.float32)
             if i == 0:
                 # Dummy-request and padded output is not part of the contract.
                 live = np.repeat(np.asarray(indices) != 0, lengths)
@@ -354,29 +330,26 @@ def test_device_state_handoff(trace, heads, batch):
                 np.testing.assert_array_equal(
                     result[untouched], previous_device_states[i - 1][untouched]
                 )
-        previous_device_states = tuple(np.asarray(x, dtype=np.float32) for x in actual[1:])
+        previous_device_states = actual_host[1:]
         host_states, device_states = expected[1:], actual[1:]
 
 
-@pytest.mark.skipif(
-    "tt" not in os.environ.get("JAX_PLATFORMS", "").split(","),
-    reason="requires JAX_PLATFORMS=tt,cpu and a Tenstorrent device",
-)
 @pytest.mark.parametrize("clear", [False, True])
-def test_device_pool_layers_are_independent(clear):
+def test_device_pool_layers_are_independent(tt_device, clear):
     from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
 
-    tt = jax.devices("tt")[0]
-    mesh = jax.sharding.Mesh(np.array([[tt]]), ("data", "tensor"))
+    mesh = jax.sharding.Mesh(np.array([[tt_device]]), ("data", "tensor"))
     pool = RecurrentStatePool([0, 1], 1, 4, 128, 4, mesh, num_k_heads=2)
     if clear:
         pool.clear()
     update = jax.jit(
         ops.state_pool_update, donate_argnums=(0,), compiler_options={"enable_trace": "false"}
     )
-    indices = jax.device_put(np.array([1], np.int32), tt)
+    indices = jax.device_put(np.array([1], np.int32), tt_device)
     for buffers in (pool.recurrent_buffers, [x[0] for x in pool.conv_buffers]):
-        values = jax.device_put(np.ones((1, *buffers[0].shape[1:]), np.dtype(buffers[0].dtype)), tt)
+        values = jax.device_put(
+            np.ones((1, *buffers[0].shape[1:]), np.dtype(buffers[0].dtype)), tt_device
+        )
         changed = update(buffers[0], indices, values)
         np.testing.assert_array_equal(np.asarray(changed)[1], 1)
         np.testing.assert_array_equal(np.asarray(buffers[1]), 0)
