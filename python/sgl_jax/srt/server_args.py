@@ -150,6 +150,7 @@ class ServerArgs:
 
     # Data parallel
     dp_size: int = 1
+    enable_dp_lm_head: bool = False
     moe_dp_size: int = 1
     dp_schedule_policy: str | None = None
 
@@ -1278,6 +1279,15 @@ class ServerArgs:
         )
 
         # Data parallelism
+        parser.add_argument(
+            "--enable-dp-lm-head",
+            action="store_true",
+            default=ServerArgs.enable_dp_lm_head,
+            help=(
+                "Run the LM head within each data-parallel group (TP/DP). "
+                "By default the LM head shards vocabulary over the full TP group."
+            ),
+        )
         parser.add_argument(
             "--data-parallel-size",
             "--dp-size",
