@@ -47,6 +47,9 @@ class InsertResult:
     """Result of an insert operation."""
 
     prefix_len: int = 0
+    # Token-offset ranges adopted while reviving FULL host-only nodes. These
+    # lie inside prefix_len but are newly tree-owned, not duplicate KV to free.
+    adopted_full_ranges: list[tuple[int, int]] = dataclasses.field(default_factory=list)
     # recurrent_committed: the tree took ownership of the request's slot;
     # cleanup_after_caching_req keys donate-vs-free on it.
     recurrent_exist: bool = False
