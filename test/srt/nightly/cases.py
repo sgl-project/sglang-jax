@@ -13,7 +13,7 @@ launch-profile validators) stay in ``test/srt/nightly/multi_host/multi_host_suit
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 
 class SuiteError(Exception):
@@ -25,12 +25,30 @@ class SuiteError(Exception):
 
 
 @dataclass(frozen=True)
+class GeneratedSharedPrefixParams:
+    num_groups: int
+    prompts_per_group: int
+    shared_prefix_len: int
+    question_len: int
+    range_ratio: float = 1.0
+
+    def __post_init__(self):
+        for name in ("num_groups", "prompts_per_group", "shared_prefix_len", "question_len"):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
+        if not 0 < self.range_ratio <= 1:
+            raise ValueError(f"range_ratio must be in (0, 1], got {self.range_ratio}")
+
+
+@dataclass(frozen=True)
 class PerfCase:
     name: str
     input_len: int
     output_len: int
     num_prompts: int
     max_concurrency: int
+    workload: Literal["random", "generated-shared-prefix"] = "random"
+    gsp_params: GeneratedSharedPrefixParams | None = None
     request_rate: float = float("inf")
     seed: int = 42
     flush_cache: bool = False
@@ -40,6 +58,28 @@ class PerfCase:
     # Set on the one representative point that captures an xprof trace.
     capture_trace: bool = False
     profile_num_steps: int | None = None
+
+    def __post_init__(self):
+        if self.workload == "random":
+            if self.gsp_params is not None:
+                raise ValueError(f"{self.name}: random workload cannot set gsp_params")
+            return
+        if self.workload != "generated-shared-prefix":
+            raise ValueError(f"{self.name}: unknown workload {self.workload!r}")
+        if self.gsp_params is None:
+            raise ValueError(f"{self.name}: generated-shared-prefix requires gsp_params")
+        expected_prompts = self.gsp_params.num_groups * self.gsp_params.prompts_per_group
+        if self.num_prompts != expected_prompts:
+            raise ValueError(
+                f"{self.name}: num_prompts={self.num_prompts} must equal "
+                f"num_groups*prompts_per_group={expected_prompts}"
+            )
+        expected_input = self.gsp_params.shared_prefix_len + self.gsp_params.question_len
+        if self.input_len != expected_input:
+            raise ValueError(
+                f"{self.name}: input_len={self.input_len} must equal "
+                f"shared_prefix_len+question_len={expected_input}"
+            )
 
 
 @dataclass(frozen=True)
@@ -94,6 +134,7 @@ class PerfParams:
     # (trace stays on profile_point/decode). Set per model at registration.
     prefill_floor_point: tuple[int, int, int] | None = None
     prefill_floors: dict[str, float] | None = None
+    flush_cache: bool = False
 
 
 def _perf_num_prompts(concurrency: int, output_len: int) -> int:
@@ -139,6 +180,7 @@ def perf_sweep_cases(prefix: str, params: PerfParams | None = None) -> list["Per
                 output_len=output_len,
                 num_prompts=_perf_num_prompts(concurrency, output_len),
                 max_concurrency=concurrency,
+                flush_cache=p.flush_cache,
                 floors=point_floors,
                 capture_trace=is_repr,  # trace only at decode repr
                 profile_num_steps=p.profile_num_steps if is_repr else None,
