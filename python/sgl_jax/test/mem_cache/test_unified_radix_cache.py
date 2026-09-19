@@ -587,6 +587,8 @@ class MockRequest:
         # so default to len(prefix_indices) (== matched prefix in the simple
         # mock setup; no unaligned tail because tests use page_size=1).
         self.cache_protected_len = len(prefix_indices)
+        # Mirrors init_next_round_input.
+        self.last_matched_prefix_len = len(prefix_indices)
 
     def pop_committed_kv_cache(self) -> int:
         assert not self.kv_committed_freed
@@ -785,6 +787,81 @@ class TestUnifiedRadixCacheWithRequests(CustomTestCase):
             disabled_cache.cache_unfinished_req(mock_req)
         except Exception as e:
             self.fail(f"cache_unfinished_req raised an exception: {e}")
+
+    # HiCache tombstone revive via cache_finished_req / cache_unfinished_req
+    # (test_hicache_e2e*.py only reach revive through cache.insert()).
+
+    def _tombstone_with_host_copy(self, cache, allocator, tokens):
+        """Insert ``tokens`` and evict the leaf to a host-backed tombstone."""
+        indices = allocator.alloc(len(tokens), dp_rank=0)
+        self.assertIsNotNone(indices)
+        cache.insert(InsertParams(key=RadixKey(tokens), value=indices))
+        node = cache.match_prefix(MatchPrefixParams(key=RadixKey(tokens))).last_device_node
+        self.assertEqual(len(node.key), len(tokens))
+        cache.hicache_enabled = True
+        cache.write_policy = "write_through"
+        node.component_data[ComponentType.FULL].host_value = np.arange(len(tokens), dtype=np.int32)
+        cache._evict_device_leaf(node, {ct: 0 for ct in cache.tree_components})
+        self.assertTrue(node.evicted and node.backuped)
+        return node
+
+    def _recomputed_request(self, pool, allocator, cache, tokens):
+        """Request that recomputed ``tokens`` on fresh slots."""
+        fresh = allocator.alloc(len(tokens), dp_rank=0)
+        self.assertIsNotNone(fresh)
+        pool.write((0, slice(0, len(tokens))), fresh)
+        req = MockRequest(
+            req_pool_idx=0,
+            origin_input_ids=list(tokens),
+            output_ids=[],
+            fill_ids=list(tokens),
+            prefix_indices=np.empty((0,), dtype=np.int32),
+            last_node=cache.root_node,
+        )
+        return req, fresh
+
+    def _assert_tree_owns_its_slots(self, cache, allocator, node):
+        value = node.component_data[ComponentType.FULL].value
+        self.assertIsNotNone(value, "tombstone should have been revived in place")
+        free = set(int(i) for i in allocator.free_slots[0])
+        leaked = sorted(int(i) for i in value if int(i) in free)
+        self.assertEqual(leaked, [], f"revived node references freed slots: {leaked}")
+        # Scheduler.check_memory invariant.
+        self.assertEqual(
+            allocator.available_size(0) + cache.evictable_size(0) + cache.protected_size(0),
+            self.pool_size,
+        )
+
+    def test_hicache_revive_through_cache_finished_req_keeps_adopted_slots(self):
+        pool, allocator, cache = self._create_stack(UnifiedRadixCache)
+        node = self._tombstone_with_host_copy(cache, allocator, [100, 200, 300, 400])
+        req, fresh = self._recomputed_request(
+            pool, allocator, cache, [100, 200, 300, 400, 500, 600]
+        )
+
+        cache.cache_finished_req(req)
+
+        self._assert_tree_owns_its_slots(cache, allocator, node)
+        np.testing.assert_array_equal(node.component_data[ComponentType.FULL].value, fresh[:4])
+        self.assertEqual(cache.total_size(), 6)
+
+    def test_hicache_revive_through_cache_unfinished_req_keeps_adopted_slots(self):
+        pool, allocator, cache = self._create_stack(UnifiedRadixCache)
+        node = self._tombstone_with_host_copy(cache, allocator, [100, 200, 300, 400])
+        req, fresh = self._recomputed_request(
+            pool, allocator, cache, [100, 200, 300, 400, 500, 600]
+        )
+
+        cache.cache_unfinished_req(req)
+
+        self._assert_tree_owns_its_slots(cache, allocator, node)
+        np.testing.assert_array_equal(node.component_data[ComponentType.FULL].value, fresh[:4])
+        self.assertEqual(req.cache_protected_len, 6)
+        np.testing.assert_array_equal(pool.read(0, 6), req.prefix_indices)
+        self.assertEqual(cache.protected_size(0), 6)
+        cache.dec_lock_ref(req.last_node, req.cache_lock_params)
+        self.assertEqual(cache.protected_size(0), 0)
+        self.assertEqual(cache.evictable_size(0), 6)
 
 
 class TestUnifiedRadixCacheEffectiveCacheLen(CustomTestCase):
