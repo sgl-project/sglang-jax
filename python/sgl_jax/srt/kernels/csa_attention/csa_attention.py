@@ -1,4 +1,4 @@
-"""Read-only paged CSA: compact gather and joint SWA/compressed attention."""
+"""Paged CSA gather, joint normalization and SWA ring writeback."""
 
 import functools
 import math
@@ -8,6 +8,8 @@ import jax
 import jax.experimental.pallas as pl
 import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
+
+from sgl_jax.srt.kernels.dsa.sparse_mla_prefill_qblock import paged_write_back
 
 from .tune import (
     APPEND_TILE,
@@ -27,6 +29,8 @@ class CSAAttentionMetadata(NamedTuple):
     use page-aligned cu_*_kv_lens:[B+1] in tokens/entries, as in HCA.
     Window tables address a window_size-token ring before this chunk. Compressed
     lengths:[B] count completed entries. Nonnegative Top-K entries must be unique.
+    window_write_locations:[T] identifies each ring slot's final writer; -1 drops
+    padding and overwritten chunk rows. Requests must exclusively own SWA pages.
     """
 
     query_seq_ids: jax.Array
@@ -37,6 +41,7 @@ class CSAAttentionMetadata(NamedTuple):
     compressed_page_indices: jax.Array
     compressed_cu_kv_lens: jax.Array
     compressed_kv_lens: jax.Array
+    window_write_locations: jax.Array
 
 
 def _broadcast_minor(value, width):
@@ -720,7 +725,10 @@ def csa_joint_attention(
     rows_per_group: int,
     interpret: bool = False,
 ):
-    """Return BF16 [T,H,D]; all input buffers, including caches, are read-only.
+    """Return (BF16 [T,H,D] attention, updated SWA cache).
+
+    Compressed caches are read-only. Ring writeback follows attention so parallel
+    query blocks finish consuming old history before final slot writers run.
 
     Queries are packed by request, followed by optional inactive padding.
     Queries in a block share page reads, with independent causal/Top-K masks.
@@ -796,15 +804,21 @@ def csa_joint_attention(
         raise ValueError("window page size must divide window_size")
     batch = metadata.seq_lens.shape[0]
     expected = (tokens, batch + 1, batch, None, batch + 1, None, batch + 1, batch)
-    for array, length in zip(metadata, expected, strict=True):
+    kernel_metadata = metadata[:8]
+    for array, length in zip(kernel_metadata, expected, strict=True):
         if (
             array.ndim != 1
             or array.dtype != jnp.int32
             or (length is not None and array.shape != (length,))
         ):
             raise ValueError("metadata must contain matching one-dimensional int32 arrays")
+    if (
+        metadata.window_write_locations.shape != (tokens,)
+        or metadata.window_write_locations.dtype != jnp.int32
+    ):
+        raise ValueError("window_write_locations must be int32 [T]")
     if not tokens or not batch:
-        return jnp.zeros_like(q)
+        return jnp.zeros_like(q), window_cache
     if not metadata.window_page_indices.size or not metadata.compressed_page_indices.size:
         raise ValueError("page tables must include at least a dummy page")
     bt = schedule.query_tile
@@ -833,7 +847,7 @@ def csa_joint_attention(
     else:
         route_input = topk_indices.reshape(tokens, 1, top_k)
         gather_scratch = (pltpu.VMEM((2, bt, tile), jnp.int32),)
-    return pl.pallas_call(
+    output = pl.pallas_call(
         functools.partial(
             _kernel,
             query_tile=bt,
@@ -848,7 +862,7 @@ def csa_joint_attention(
             scale=scale,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=len(metadata),
+            num_scalar_prefetch=len(kernel_metadata),
             grid=(pl.cdiv(tokens, bt),),
             in_specs=(
                 pl.BlockSpec((bt, heads, head_dim), lambda b, *_: (b, 0, 0)),
@@ -883,7 +897,7 @@ def csa_joint_attention(
         interpret=interpret,
         name="csa-joint-attention",
     )(
-        *metadata,
+        *kernel_metadata,
         q,
         jnp.pad(new_kv, ((0, -tokens % window_size), (0, 0))),
         window_cache,
@@ -892,3 +906,12 @@ def csa_joint_attention(
         route_input,
         attention_sink,
     )
+
+    window = paged_write_back(
+        window_cache,
+        new_kv,
+        metadata.window_write_locations,
+        page_size=window_page_size,
+        interpret=interpret,
+    )
+    return output, window

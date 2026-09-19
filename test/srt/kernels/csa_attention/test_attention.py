@@ -8,7 +8,7 @@ from jax.experimental.pallas import tpu as pltpu
 from sgl_jax.srt.kernels.csa_attention import CSAAttentionMetadata, csa_joint_attention
 from sgl_jax.srt.kernels.csa_attention.tune import CSAAttentionSchedule
 
-from .ref import reference
+from .ref import reference, update_window
 
 requires_tpu = pytest.mark.skipif(jax.default_backend() != "tpu", reason="requires TPU")
 
@@ -79,7 +79,11 @@ def make_case(
             :visible
         ]
     sink = np.linspace(-2, 2, heads, dtype=np.float32)
-    meta = CSAAttentionMetadata(reqs, cu, ends, wp, wc, cp, cc, compressed_lens)
+    locations = np.full(tokens, -1, np.int32)
+    for r, length in enumerate(lengths):
+        local = np.arange(max(0, length - window_size), length)
+        locations[cu[r] + local] = wp[r] * window_size + (prefixes[r] + local) % window_size
+    meta = CSAAttentionMetadata(reqs, cu, ends, wp, wc, cp, cc, compressed_lens, locations)
     return (
         q,
         new,
@@ -112,7 +116,10 @@ def run(
         compression_ratio=compression_ratio,
         schedule=CSAAttentionSchedule(query_tile=query_tile, selected_tile=selected_tile),
     )
-    return np.asarray(jax.block_until_ready(result)).astype(np.float32)
+    output, window = jax.tree.map(np.asarray, jax.block_until_ready(result))
+    expected_window = update_window(args[1], args[2], args[-1], window_size=window_size)
+    np.testing.assert_array_equal(window.view(np.uint16), expected_window.view(np.uint16))
+    return output.astype(np.float32)
 
 
 @pytest.mark.parametrize(
@@ -218,9 +225,10 @@ def test_empty_requests(lengths, prefixes, pad):
 
 
 @requires_tpu
-def test_missing_pages_and_readonly_cache():
+def test_missing_pages_and_readonly_compressed_cache():
     args = make_case((1, 1), (511, 4095), pad=1)
     args[-1].window_page_indices[:] = 0
+    args[-1].window_write_locations[:] = -1
     args[-1].compressed_page_indices[:] = 0
     arrays = jax.tree.map(jnp.asarray, args)
     before = [np.asarray(x).copy() for x in arrays[2:5]]
@@ -233,7 +241,7 @@ def test_missing_pages_and_readonly_cache():
             window_size=128,
             compression_ratio=4,
             schedule=CSAAttentionSchedule(query_tile=1),
-        )
+        )[0]
     ).astype(np.float32)
     assert_close(actual, reference(*args, scale=512**-0.5))
     for old, new in zip(before, arrays[2:5], strict=True):
@@ -321,7 +329,7 @@ def test_interpret_and_partial_tile(query_tile, prefix, interpret):
                 compression_ratio=4,
                 schedule=CSAAttentionSchedule(query_tile=query_tile),
                 interpret=interpret,
-            )
+            )[0]
         ).astype(np.float32)
     assert_close(actual, reference(*args, scale=512**-0.5))
 
@@ -355,6 +363,64 @@ def test_missing_compressed_mutation(monkeypatch):
     monkeypatch.setitem(run.__globals__, "csa_joint_attention", omit_compressed)
     with pytest.raises(AssertionError):
         test_attention((1,), (511,), 1)
+
+
+@requires_tpu
+def test_missing_window_write_is_detected(monkeypatch):
+    original = csa_joint_attention
+
+    def omit_write(*args, **kwargs):
+        output, _ = original(*args, **kwargs)
+        return output, args[2]
+
+    monkeypatch.setitem(run.__globals__, "csa_joint_attention", omit_write)
+    with pytest.raises(AssertionError):
+        run(make_case((1,), (3,)))
+
+
+@requires_tpu
+def test_decode_writeback_multiple_window_pages():
+    args = list(make_case((1, 0, 1), (0, 0, 255), pad=3, window_size=256))
+    # Split each request's 256-token window into two physical 128-token pages.
+    args[2] = args[2].reshape(-1, 64, 2, 512)
+    pages = args[-1].window_page_indices
+    args[-1] = args[-1]._replace(
+        window_page_indices=np.stack((pages * 2, pages * 2 + 1), axis=1).reshape(-1)
+    )
+    args[1][0] = np.float32(-0.0)
+    actual = run(tuple(args), window_size=256)
+    assert_close(actual, reference(*args, scale=512**-0.5, window_size=256))
+
+
+@requires_tpu
+def test_stateful_decode_ring_wrap():
+    args = list(make_case((1, 1), (126, 254), heads=64))
+    window = args[2].copy()
+    for step in range(4):
+        meta = args[-1]
+        positions = np.asarray((126, 254), np.int32) + step
+        args[-1] = meta._replace(
+            seq_lens=positions + 1,
+            compressed_kv_lens=(positions + 1) // 4,
+            window_write_locations=meta.window_page_indices * 128 + positions % 128,
+        )
+        args[2] = window
+        # Includes signed zero while preserving the rest of the physical page.
+        args[1][0, step] = np.float32(-0.0)
+        expected = reference(*args, scale=512**-0.5)
+        expected_window = update_window(args[1], window, args[-1], window_size=128)
+        output, updated = csa_joint_attention(
+            *jax.tree.map(jnp.asarray, args),
+            scale=512**-0.5,
+            schedule=CSAAttentionSchedule(query_tile=1),
+            window_size=128,
+            compression_ratio=4,
+            fp8_scale_block=64,
+            rows_per_group=4,
+        )
+        output, window = jax.tree.map(np.asarray, jax.block_until_ready((output, updated)))
+        assert_close(output.astype(np.float32), expected)
+        np.testing.assert_array_equal(window.view(np.uint16), expected_window.view(np.uint16))
 
 
 @pytest.mark.parametrize("query_tile", [1, 32])

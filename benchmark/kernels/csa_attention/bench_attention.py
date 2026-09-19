@@ -46,15 +46,21 @@ def inputs(batch, sequence, mode, heads, seed, *, device=True):
         for local in range(length):
             visible = (sequence - length + local + 1) // 4
             selected[cu[r] + local, : min(visible, 512)] = rng.permutation(visible)[:512]
+    window_pages = rng.permutation(np.arange(1, batch + 1, dtype=np.int32))
+    locations = np.full(tokens, -1, np.int32)
+    for r, length in enumerate(lengths):
+        local = np.arange(max(0, length - 128), length)
+        locations[cu[r] + local] = window_pages[r] * 128 + (sequence - length + local) % 128
     metadata = CSAAttentionMetadata(
         np.repeat(np.arange(batch, dtype=np.int32), lengths),
         cu,
         np.full(batch, sequence, np.int32),
-        rng.permutation(np.arange(1, batch + 1, dtype=np.int32)),
+        window_pages,
         np.arange(batch + 1, dtype=np.int32) * 128,
         rng.permutation(np.arange(1, pages, dtype=np.int32)),
         np.arange(batch + 1, dtype=np.int32) * pages_per_request * 128,
         np.full(batch, sequence // 4, np.int32),
+        locations,
     )
     arrays = (
         q,
