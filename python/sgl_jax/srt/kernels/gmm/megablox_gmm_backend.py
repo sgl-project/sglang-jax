@@ -7,7 +7,11 @@ import jax.numpy as jnp
 
 from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm import gmm as gmm_v1_kernel
 from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm_v2 import gmm_v2 as gmm_v2_kernel
-from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm_v2 import is_supported_by_gmm_v2
+from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.gmm_v2 import (
+    is_supported_by_gmm_v2,
+    materialize_output_activation,
+    validate_output_activation,
+)
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor_simple
 
@@ -28,6 +32,8 @@ def gmm(
     acc_dtype: jnp.dtype | None = None,
     activation_quantized_dtype: jnp.dtype | None = None,
     v2_tile_info: Any = None,
+    output_multiplier: jax.Array | None = None,
+    output_activation: str | None = None,
 ) -> jax.Array:
     """Dispatch GMM to v2 or v1, with optional activation quantization.
 
@@ -57,13 +63,29 @@ def gmm(
             output afterwards.
         v2_tile_info: Optional TileSizes or TileFn for v2 kernel tiling.
             Defaults to calculate_tiling (auto-tiler) when None.
+        output_multiplier: Optional operand matching the logical, unpadded
+            output shape and dtype. Must be paired with output_activation.
+        output_activation: Static epilogue mode. "silu" rounds the GMM result
+            to the output dtype, computes silu(result) * output_multiplier in
+            at least FP32, and rounds the product to the output dtype. Only
+            visited rows are activated. Unvisited rows are zero when
+            zero_initialize=True and unspecified otherwise. Supported BF16 v2
+            tiles fuse the epilogue; other configurations materialize it.
     """
+    output_dtype = lhs.dtype if preferred_element_type is None else preferred_element_type
+    validate_output_activation(
+        (lhs.shape[0], rhs.shape[-1]), output_dtype, output_multiplier, output_activation
+    )
     if interpret is None:
         interpret = not is_tpu_runtime()
 
     use_gmm_v2 = not interpret and is_supported_by_gmm_v2(
         rhs_scale, maybe_quantize_lhs=maybe_quantize_lhs
     )
+    materialize_epilogue = output_activation is not None and (
+        not use_gmm_v2 or activation_quantized_dtype is not None
+    )
+    logical_group_sizes = group_sizes
 
     # Pad LHS to multiple of 128 (or 32 for v2) on TPU to avoid small/unaligned tiles
     m = lhs.shape[0]
@@ -72,6 +94,12 @@ def gmm(
     if not interpret and m % alignment != 0:
         pad_size = alignment - (m % alignment)
         lhs = jax.lax.pad(lhs, jnp.zeros((), dtype=lhs.dtype), ((0, pad_size, 0), (0, 0, 0)))
+        if output_multiplier is not None and not materialize_epilogue:
+            output_multiplier = jax.lax.pad(
+                output_multiplier,
+                jnp.zeros((), dtype=output_multiplier.dtype),
+                ((0, pad_size, 0), (0, 0, 0)),
+            )
         group_sizes = group_sizes.at[-1].add(pad_size)
 
     lhs_scale = None
@@ -83,6 +111,9 @@ def gmm(
         v2_kwargs = {}
         if v2_tile_info is not None:
             v2_kwargs["tile_info"] = v2_tile_info
+        if output_activation is not None and not materialize_epilogue:
+            v2_kwargs["output_multiplier"] = output_multiplier
+            v2_kwargs["output_activation"] = output_activation
         out = gmm_v2_kernel(
             lhs,
             rhs,
@@ -116,5 +147,17 @@ def gmm(
     # Slice output back to original size if padded
     if pad_size > 0:
         out = out[:m]
+
+    if materialize_epilogue:
+        # Finish activation dequantization, logical slicing and output rounding
+        # before applying the same epilogue contract as the fused v2 path.
+        out = materialize_output_activation(
+            out.astype(output_dtype),
+            output_multiplier,
+            logical_group_sizes,
+            group_offset,
+            rhs.shape[0],
+            zero_initialize=zero_initialize,
+        )
 
     return out
