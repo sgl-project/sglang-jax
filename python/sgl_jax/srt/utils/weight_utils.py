@@ -10,7 +10,7 @@ import struct
 import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, cast
 
 import jax
@@ -1921,6 +1921,27 @@ class WeightLoader:
         must be covered by a regular mapping, an MoE expert group, or an
         excluded layer.
         """
+        from sgl_jax.srt.layers.lm_head_parallel import lm_head_load_shardings
+
+        # Change only standalone LM heads; tied input embeddings retain their
+        # embedding layout. Do this before both lazy and dummy loading.
+        head_shardings = lm_head_load_shardings(
+            self.model,
+            self.mesh,
+            getattr(self.model_config.hf_config, "enable_dp_lm_head", False),
+        )
+        weight_mappings = dict(weight_mappings)
+        for key, mapping in weight_mappings.items():
+            if isinstance(mapping, str | list):
+                mapping = WeightMapping(target_path=mapping)
+            if (
+                isinstance(mapping, WeightMapping)
+                and isinstance(mapping.target_path, str)
+                and mapping.target_path in head_shardings
+            ):
+                weight_mappings[key] = replace(
+                    mapping, sharding=head_shardings[mapping.target_path]
+                )
         params = nnx.state(self.model)
 
         if dummy or self.dummy_mode:

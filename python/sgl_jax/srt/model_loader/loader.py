@@ -316,6 +316,11 @@ class JAXModelLoader(DefaultModelLoader):
         else:
             logger.info("No quantization config found. Skipping quantization.")
         model.load_weights(model_config)
+        from sgl_jax.srt.layers.lm_head_parallel import configure_lm_heads
+
+        configure_lm_heads(
+            model, self.mesh, getattr(model_config.hf_config, "enable_dp_lm_head", False)
+        )
 
         print_parameter_shardings(model)
 
@@ -361,6 +366,11 @@ class JAXDummyModelLoader(BaseModelLoader):
         # Set a marker in model_config to indicate dummy mode
         model_config._dummy_mode = True
         model.load_weights(model_config)
+        from sgl_jax.srt.layers.lm_head_parallel import configure_lm_heads
+
+        configure_lm_heads(
+            model, self.mesh, getattr(model_config.hf_config, "enable_dp_lm_head", False)
+        )
 
         return model
 
