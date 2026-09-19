@@ -4,6 +4,27 @@ import ml_dtypes
 import numpy as np
 
 
+def update_window(new_kv, window_cache, metadata, *, window_size):
+    result = np.array(window_cache, copy=True)
+    requests, cu, ends, pages, offsets = map(np.asarray, metadata[:5])
+    page_size = result.shape[1] * result.shape[2]
+    for request in range(len(ends)):
+        begin, end = cu[request], cu[request + 1]
+        prefix = ends[request] - (end - begin)
+        for token in range(max(begin, end - window_size), end):
+            if token >= len(requests) or requests[token] != request:
+                continue
+            slot = (prefix + token - begin) % window_size
+            entry = offsets[request] // page_size + slot // page_size
+            if not (0 <= entry < len(pages) and entry < offsets[request + 1] // page_size):
+                continue
+            page = pages[entry]
+            if 0 < page < len(result):
+                row = slot % page_size
+                result[page, row // 2, row % 2] = new_kv[token]
+    return result
+
+
 def reference(
     q,
     new_kv,
@@ -22,7 +43,7 @@ def reference(
 ):
     q, new_kv, window = (np.asarray(x, np.float32) for x in (q, new_kv, window))
     nope, rope, indices, sink = (np.asarray(x) for x in (nope, rope, indices, sink))
-    reqs, cu, ends, wp, wc, cp, cc, compressed_lens = (np.asarray(x) for x in metadata)
+    reqs, cu, ends, wp, wc, cp, cc, compressed_lens = (np.asarray(x) for x in metadata[:8])
     output = np.zeros(q.shape, np.float32)
     wps, cps = window.shape[1] * 2, nope.shape[1]
 
