@@ -13,6 +13,7 @@ import ast
 import inspect
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -21,6 +22,9 @@ from flax import nnx
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.global_config import global_config
+from sgl_jax.srt.kernels.fused_moe.v1.kernel import FusedMoEBlockConfig
+from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 from sgl_jax.srt.layers.linear import LinearBase, QuantizedLinear
 from sgl_jax.srt.layers.moe import EPMoE
 from sgl_jax.srt.models.grok import Grok1Attention, Grok1DecoderLayer, Grok1MLP
@@ -103,6 +107,11 @@ class TestMakeReduceSharding(CustomTestCase):
         self.assertTrue(should_scatter(dim_size=2 * _MIN_LOCAL, num_devices=2))
         # Must divide evenly.
         self.assertFalse(should_scatter(dim_size=2 * _MIN_LOCAL + 1, num_devices=2))
+        # Issue #1415 relies on these adjacent global buckets remaining distinct:
+        # 2032 stays on the DP fallback while 2048 enters SP on EP16.
+        with mock.patch.object(global_config, "tpu_scatter_min_local_size", 128):
+            self.assertFalse(should_scatter(dim_size=2032, num_devices=16))
+            self.assertTrue(should_scatter(dim_size=2048, num_devices=16))
 
 
 class TestQuantizedLinearScatter(CustomTestCase):
@@ -456,6 +465,134 @@ def _make_dp_tp_mesh(dp_size: int, tp_size: int) -> Mesh:
         axis_names=("data", "tensor"),
         axis_types=(jax.sharding.AxisType.Explicit,) * 2,
     )
+
+
+@unittest.skipIf(_TOTAL_DEVICES < 4, "Needs >=4 devices for dp=2, tp=2.")
+class TestQwen35Dp2Tp2SequenceParallel(CustomTestCase):
+    """Qwen3.5 boundary policy and row-reduction contracts on a v6e-4 mesh."""
+
+    TOKENS = 512
+    HIDDEN_SIZE = 256
+    INTERMEDIATE_DIM = 256
+    NUM_EXPERTS = 8
+
+    def setUp(self):
+        self.mesh = _make_dp_tp_mesh(dp_size=2, tp_size=2)
+
+    def test_qwen35_bucket_boundary_policy(self):
+        """508/513 fall back, while divisible 512/1024 buckets activate SP."""
+        cases = (
+            (508, True, "data"),
+            (512, True, ("data", "tensor")),
+            (513, True, "data"),
+            (1024, True, ("data", "tensor")),
+            (1024, False, "data"),
+        )
+        with jax.set_mesh(self.mesh):
+            for tokens, enabled, expected_axis in cases:
+                with self.subTest(tokens=tokens, enable_sequence_parallel=enabled):
+                    hidden_shape = SimpleNamespace(
+                        shape=(tokens, self.HIDDEN_SIZE),
+                        ndim=2,
+                    )
+                    target = make_reduce_sharding(
+                        hidden_shape,
+                        self.mesh,
+                        enable_sp=enabled,
+                    )
+                    self.assertEqual(_spec_dim(target, 0), expected_axis)
+
+    def test_linear_base_512_active_and_forced_dp_are_numerically_equal(self):
+        key = jax.random.PRNGKey(1415)
+        x_key, weight_key = jax.random.split(key)
+        x_host = jax.random.normal(
+            x_key,
+            (self.TOKENS, self.HIDDEN_SIZE),
+            dtype=jnp.bfloat16,
+        )
+        weight = jax.random.normal(
+            weight_key,
+            (self.HIDDEN_SIZE, self.HIDDEN_SIZE),
+            dtype=jnp.bfloat16,
+        )
+
+        with jax.set_mesh(self.mesh):
+            linear = _build_linear_base(weight, self.mesh)
+            x = jax.device_put(
+                x_host,
+                NamedSharding(self.mesh, P("data", "tensor")),
+            )
+            sp_target = make_reduce_sharding(x, self.mesh, enable_sp=True)
+            dp_target = make_reduce_sharding(x, self.mesh, enable_sp=False)
+            sp_output, _ = linear(x, out_sharding=sp_target)
+            dp_output, _ = linear(x, out_sharding=dp_target)
+
+        self.assertEqual(_spec_dim(sp_output.sharding, 0), ("data", "tensor"))
+        self.assertEqual(_spec_dim(dp_output.sharding, 0), "data")
+        np.testing.assert_allclose(
+            _as_fp32(sp_output),
+            _as_fp32(dp_output),
+            rtol=0.05,
+            atol=1.0,
+        )
+
+    def test_fused_ep_moe_512_active_and_forced_dp_are_numerically_equal(self):
+        block_config = FusedMoEBlockConfig(
+            bt=128,
+            btc=128,
+            bf=256,
+            bfc=256,
+            bd1=256,
+            bd1c=256,
+            bd2=256,
+            bd2c=256,
+            bse=256,
+        )
+        x_host, topk_weights_host, topk_ids_host = _make_moe_inputs(
+            self.TOKENS,
+            self.HIDDEN_SIZE,
+            self.NUM_EXPERTS,
+        )
+        input_sharding = NamedSharding(self.mesh, P(("data", "tensor"), None))
+
+        with jax.set_mesh(self.mesh):
+            moe = FusedEPMoE(
+                hidden_size=self.HIDDEN_SIZE,
+                num_experts=self.NUM_EXPERTS,
+                num_experts_per_tok=1,
+                ep_size=4,
+                mesh=self.mesh,
+                intermediate_dim=self.INTERMEDIATE_DIM,
+                quantization_config=None,
+            )
+            hidden_states = jax.device_put(x_host, input_sharding)
+            # Production ``TopK`` always returns float32 weights; the fused
+            # Pallas kernel's DMA scratch contract relies on that dtype.
+            topk_weights = jax.device_put(
+                topk_weights_host.astype(jnp.float32),
+                input_sharding,
+            )
+            topk_ids = jax.device_put(topk_ids_host, input_sharding)
+            sp_target = make_reduce_sharding(hidden_states, self.mesh, enable_sp=True)
+            dp_target = make_reduce_sharding(hidden_states, self.mesh, enable_sp=False)
+            sp_output = moe(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                block_config=block_config,
+                out_sharding=sp_target,
+            )
+            dp_output = moe(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                block_config=block_config,
+                out_sharding=dp_target,
+            )
+
+        self.assertEqual(_spec_dim(sp_output.sharding, 0), ("data", "tensor"))
+        self.assertEqual(_spec_dim(dp_output.sharding, 0), "data")
+        np.testing.assert_array_equal(_as_fp32(sp_output), _as_fp32(dp_output))
 
 
 class TestDpSpComposition(CustomTestCase):
