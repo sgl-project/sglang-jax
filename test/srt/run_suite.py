@@ -298,6 +298,7 @@ suites = {
         TestFile("python/sgl_jax/test/kernels/simple_gla_fused_test.py", 1, runner="pytest"),
         TestFile("python/sgl_jax/test/layers/test_merged_column_parallel_linear.py", 0.1),
         TestFile("test/srt/kernels/dsa/test_streamindex_topk.py", 3, runner="pytest"),
+        TestFile("test/srt/kernels/qsa/test_sparse_gqa_parity.py", 1),
     ],
     # CPU-only unit tests — moved off the v6e-1 TPU runner to a dedicated
     # CPU runner so they don't consume TPU capacity. Either pure
@@ -309,6 +310,11 @@ suites = {
     "unit-test-cpu": [
         TestFile("test/srt/multimodal/test_engine_multimodal.py", 0.1, runner="pytest"),
         TestFile("python/sgl_jax/test/layers/test_hyperconnection.py", 0.1),
+        TestFile("python/sgl_jax/test/layers/test_qsa_indexer.py", 0.1),
+        TestFile("test/srt/kernels/qsa/test_sparse_gqa_ref.py", 0.1),
+        TestFile("test/srt/kernels/qsa/test_paging.py", 0.1),
+        TestFile("test/srt/kernels/qsa/test_qsa_pipeline.py", 0.5),
+        TestFile("test/srt/mem_cache/test_qsa_pool.py", 0.1),
         TestFile(
             "python/sgl_jax/test/test_embedding_pool.py",
             0.1,

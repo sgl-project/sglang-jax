@@ -316,6 +316,27 @@ class ModelRunnerKVCacheMixin:
             return 0, 0
         return cfg.index_head_dim, num_full
 
+    def _qsa_indexer_cache_params(self: ModelRunner) -> tuple[int, int, int]:
+        """``(indexer_key_dim, num_indexer_layers, compress_ratio)``, or zeros
+        when no QSA compressed cache is allocated.
+
+        Same contract as :meth:`_dsa_indexer_cache_params`: the budget and the
+        allocation both read it, and they must agree. Unlike DSA there is no
+        cross-layer sharing -- upstream builds an indexer per full-attention
+        layer -- so the slot count is just how many such layers there are.
+        """
+        if self.server_args.attention_backend != "qsa_sparse":
+            return 0, 0, 1
+
+        cfg = self.model_config.hf_text_config
+        if getattr(cfg, "indexer_budget", None) is None:
+            return 0, 0, 1
+        layer_types = getattr(cfg, "layer_types", None) or []
+        num_full = sum(1 for t in layer_types if t == "full_attention")
+        if num_full == 0:
+            return 0, 0, 1
+        return cfg.indexer_head_dim, num_full, cfg.indexer_compress_ratio
+
     def _compute_cell_size(self: ModelRunner) -> int:
         """Per-token KV cache cost in bytes per device, summed across layers."""
 
@@ -364,13 +385,18 @@ class ModelRunnerKVCacheMixin:
             )
             return int(full_cost + swa_cost)
 
-        return (
+        gqa = (
             self.model_config.get_num_kv_heads(self.attention_tp_size)
             * align128(self.model_config.head_dim)
             * 2
             * num_layers
             * dtype_size
         )
+        # QSA keeps one compressed indexer key per compress_ratio tokens, for
+        # each full-attention layer, on top of the GQA cache.
+        qsa_key_dim, qsa_layers, qsa_ratio = self._qsa_indexer_cache_params()
+        qsa = align128(qsa_key_dim) * dtype_size * qsa_layers // qsa_ratio
+        return int(gqa + qsa)
 
     def _profile_available_bytes(self: ModelRunner, total_device_memory: int) -> int:
         """Profile available bytes for KV cache (+ recurrent state)."""
@@ -748,6 +774,15 @@ class ModelRunnerKVCacheMixin:
             )
         else:
             pool_class = getattr(self.attn_backend, "token_to_kv_pool_class", MHATokenToKVPool)
+            pool_kwargs = {}
+            qsa_key_dim, qsa_layers, qsa_ratio = self._qsa_indexer_cache_params()
+            if qsa_key_dim > 0:
+                pool_kwargs.update(
+                    indexer_key_dim=qsa_key_dim,
+                    num_indexer_layers=qsa_layers,
+                    compress_ratio=qsa_ratio,
+                    max_reqs=max_num_reqs,
+                )
             self.token_to_kv_pool = self._maybe_wrap_hybrid_kv_pool(
                 pool_class,
                 head_num=self.model_config.get_total_num_kv_heads_with_replication(
@@ -755,6 +790,7 @@ class ModelRunnerKVCacheMixin:
                 ),
                 head_dim=(self.model_config.head_dim + 127) // 128 * 128,
                 dp_size=dp_size,
+                **pool_kwargs,
             )
 
         # --- MemoryPools wrapper (+ hybrid ReqToTokenPool) ---

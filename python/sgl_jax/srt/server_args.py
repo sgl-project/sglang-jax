@@ -1508,6 +1508,7 @@ class ServerArgs:
                 "fa",
                 "fa_mha",
                 "dsa_sparse",
+                "qsa_sparse",
                 "tt",
             ],
             default=ServerArgs.attention_backend,
@@ -1519,6 +1520,8 @@ class ServerArgs:
                 "intended for kernel A/B on short contexts). "
                 "'dsa_sparse' = DeepSeek Sparse Attention (lightning-indexer top-k + sparse MLA) "
                 "with IndexShare cross-layer reuse; MLA models with index_* config only. "
+                "'qsa_sparse' = Qwen Sparse Attention (compressed-key indexer top-k + sparse GQA); "
+                "GQA models with indexer_* config only. "
                 "'tt' = TTNN prefill and paged decode."
             ),
         )
