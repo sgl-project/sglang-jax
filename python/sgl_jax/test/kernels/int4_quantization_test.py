@@ -70,9 +70,12 @@ def test_model_config_pack_quantized_parsing():
     assert quant_cfg.ignored_layers == ["lm_head", "model.layers.0.mlp"]
     assert quant_cfg.weight_block_size == (32, 32)
     assert quant_cfg.linear_rules == []
+    assert quant_cfg.has_linear_quantization() is False
+    assert quant_cfg.has_moe_quantization() is True
 
 
-def test_apply_linear_quantization_noop_when_no_rules():
+def test_apply_linear_quantization_raises_when_no_rules():
+    import pytest
     from flax import nnx
 
     class DummyModel(nnx.Module):
@@ -86,5 +89,58 @@ def test_apply_linear_quantization_noop_when_no_rules():
         linear_rules=[],
     )
 
-    result = apply_linear_quantization(dummy_model_config, dummy_model)
-    assert result is dummy_model
+    assert dummy_model_config.quantization_config.has_linear_quantization() is False
+    with pytest.raises(ValueError, match="No linear rules found"):
+        apply_linear_quantization(dummy_model_config, dummy_model)
+
+
+def test_epmoe_static_scale_dtype_int4_vs_fp8():
+    import jax
+    from jax.sharding import AxisType, Mesh
+    from sgl_jax.srt.layers.moe import EPMoE
+
+    devices = np.array(jax.devices()[:1]).reshape(1, 1)
+    mesh = Mesh(
+        devices,
+        axis_names=("data", "tensor"),
+        axis_types=(AxisType.Explicit, AxisType.Explicit),
+    )
+
+    int4_cfg = QuantizationConfig(
+        is_static_checkpoint=True,
+        moe_weight_dtype=getattr(jnp, "int4", jnp.int8),
+        weight_block_size=(32, 32),
+    )
+    moe_int4 = EPMoE(
+        hidden_size=64,
+        num_experts=2,
+        num_experts_per_tok=1,
+        ep_size=1,
+        mesh=mesh,
+        intermediate_dim=64,
+        dtype=jnp.bfloat16,
+        quantization_config=int4_cfg,
+    )
+    moe_int4.quantize_weights(is_static=True)
+    assert moe_int4.wi_0_scale.value.dtype == jnp.bfloat16
+    assert moe_int4.wo_scale.value.dtype == jnp.bfloat16
+
+    fp8_cfg = QuantizationConfig(
+        is_static_checkpoint=True,
+        moe_weight_dtype=jnp.float8_e4m3fn,
+        weight_block_size=(32, 32),
+    )
+    moe_fp8 = EPMoE(
+        hidden_size=64,
+        num_experts=2,
+        num_experts_per_tok=1,
+        ep_size=1,
+        mesh=mesh,
+        intermediate_dim=64,
+        dtype=jnp.bfloat16,
+        quantization_config=fp8_cfg,
+    )
+    moe_fp8.quantize_weights(is_static=True)
+    assert moe_fp8.wi_0_scale.value.dtype == jnp.float32
+    assert moe_fp8.wo_scale.value.dtype == jnp.float32
+

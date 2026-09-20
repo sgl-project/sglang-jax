@@ -20,6 +20,7 @@ def _make_stub(
             num_hidden_layers=num_hidden_layers,
             first_k_dense_replace=first_k_dense_replace,
             n_routed_experts=n_routed_experts,
+            n_shared_experts=1,
             moe_layer_freq=1,
             moe_backend="epmoe",
         ),
@@ -152,7 +153,52 @@ def test_int4_moe_weight_mappings():
     expert_group_wi_0 = mappings["__MOE_EXPERTS__model.layers.1.mlp.wi_0"]
     assert any(".weight_packed" in k for k in expert_group_wi_0.target_path[1:])
 
-    # Layer 1 (MoE) scales should use .weight_scale
+    # Layer 1 (MoE) scales should use .weight_scale and tensor sharding
     scale_group_wi_0 = mappings["__MOE_EXPERTS__model.layers.1.mlp.wi_0_scale"]
+    scale_group_wo = mappings["__MOE_EXPERTS__model.layers.1.mlp.wo_scale"]
     assert any(".weight_scale" in k for k in scale_group_wi_0.target_path[1:])
+    assert scale_group_wi_0.sharding == ("expert", "tensor", None)
+    assert scale_group_wo.sharding == ("expert", None, "tensor")
+
+    # Shared experts should map to layer.shared_experts (non-fused path)
+    shared_gate = mappings["language_model.model.layers.1.mlp.shared_experts.gate_proj.weight"]
+    assert shared_gate.target_path == "model.layers.1.shared_experts.gate_proj.weight"
+
+
+def test_dynamic_int4_and_static_fp8_moe_weight_mappings():
+    import jax.numpy as jnp
+    from sgl_jax.srt.configs.quantization_config import QuantizationConfig
+
+    # 1. Dynamic INT4 (is_static_checkpoint=False) must load ordinary .weight tensors
+    dyn_int4_config = QuantizationConfig(
+        is_static_checkpoint=False,
+        linear_rules=[],
+        moe_weight_dtype=getattr(jnp, "int4", None) or getattr(jnp, "uint4", None),
+    )
+    dyn_mappings = _make_stub(
+        num_hidden_layers=2,
+        first_k_dense_replace=1,
+        n_routed_experts=16,
+        quant_config=dyn_int4_config,
+    )
+    expert_group_dyn = dyn_mappings["__MOE_EXPERTS__model.layers.1.mlp.wi_0"]
+    assert all(k.endswith(".weight") for k in expert_group_dyn.target_path[1:])
+    assert "__MOE_EXPERTS__model.layers.1.mlp.wi_0_scale" not in dyn_mappings
+
+    # 2. Static FP8 must keep replicated scale_sharding ("expert", None, None) and .weight_scale_inv
+    fp8_config = QuantizationConfig(
+        is_static_checkpoint=True,
+        linear_rules=[],
+        moe_weight_dtype=jnp.float8_e4m3fn,
+    )
+    fp8_mappings = _make_stub(
+        num_hidden_layers=2,
+        first_k_dense_replace=1,
+        n_routed_experts=16,
+        quant_config=fp8_config,
+    )
+    scale_group_fp8 = fp8_mappings["__MOE_EXPERTS__model.layers.1.mlp.wi_0_scale"]
+    assert all(k.endswith(".weight_scale_inv") for k in scale_group_fp8.target_path[1:])
+    assert scale_group_fp8.sharding == ("expert", None, None)
+
 

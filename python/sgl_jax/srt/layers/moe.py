@@ -24,6 +24,7 @@ from sgl_jax.srt.layers.fused_moe import FusedEPMoE, FusedEPMoEV2  # noqa: F401
 from sgl_jax.srt.layers.gate import GateLogit, TopK  # noqa: F401
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import (
+    is_int4_dtype,
     quantize_tensor,
     quantize_tensor_simple,
 )
@@ -388,6 +389,9 @@ class EPMoE(nnx.Module):
                 wo_sharding = P("expert", "tensor", None)
 
                 is_abstract = isinstance(self.wi_0.value, jax.ShapeDtypeStruct)
+                scale_dtype = (
+                    self.dtype if is_int4_dtype(self.quantized_dtype) else jnp.float32
+                )
 
                 def _make_param(shape, dtype, sharding_spec):
                     if is_abstract:
@@ -407,7 +411,7 @@ class EPMoE(nnx.Module):
                     del self.wi_0_scale
                 self.wi_0_scale = _make_param(
                     (num_experts, k_blocks_wi, 1, intermediate_dim),
-                    self.dtype,
+                    scale_dtype,
                     wi_scale_sharding,
                 )
 
@@ -415,7 +419,7 @@ class EPMoE(nnx.Module):
                     del self.wi_1_scale
                 self.wi_1_scale = _make_param(
                     (num_experts, k_blocks_wi, 1, intermediate_dim),
-                    self.dtype,
+                    scale_dtype,
                     wi_scale_sharding,
                 )
 
@@ -423,7 +427,7 @@ class EPMoE(nnx.Module):
                     del self.wo_scale
                 self.wo_scale = _make_param(
                     (num_experts, k_blocks_wo, 1, hidden_size),
-                    self.dtype,
+                    scale_dtype,
                     wo_scale_sharding,
                 )
 

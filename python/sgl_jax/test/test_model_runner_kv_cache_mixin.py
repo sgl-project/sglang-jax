@@ -444,3 +444,46 @@ def test_embedding_pool_capacity_and_pages_follow_lm_limits():
     assert runner.embedding_pool.hidden == 32
     assert runner.embedding_pool.page_size == 128
     assert runner.embedding_pool.num_pages == 2
+
+
+def test_apply_token_constraints_aligns_allocated_pages_with_reserved_dp_pages():
+    from sgl_jax.srt.model_executor.model_runner import ModelRunner
+
+    page_size = 64
+
+    # Case 1: data=2, dp_size=1 with 780 initial usable pages.
+    # The pool adds dp_size=1 reserved page (780 + 1 = 781, odd).
+    # Alignment should round allocated pages down to 780 (usable_pages = 779)
+    # so (token_capacity + page_size * dp_size) // page_size == 780 is divisible by data=2.
+    runner_dp1 = types.SimpleNamespace(
+        server_args=types.SimpleNamespace(page_size=page_size),
+        mesh=types.SimpleNamespace(shape={"data": 2, "tensor": 4}),
+    )
+    cap_dp1 = ModelRunner._apply_token_constraints(
+        runner_dp1,
+        token_capacity=780 * page_size,
+        max_total_tokens=None,
+        dp_size=1,
+    )
+    assert cap_dp1 == 779 * page_size
+    allocated_pages_dp1 = (cap_dp1 + page_size * 1) // page_size
+    assert allocated_pages_dp1 == 780
+    assert allocated_pages_dp1 % 2 == 0
+
+    # Case 2: data=4, dp_size=4 with 195 pages per DP (780 usable + 4 reserved = 784).
+    # 784 is already divisible by data=4, so zero capacity is lost.
+    runner_dp4 = types.SimpleNamespace(
+        server_args=types.SimpleNamespace(page_size=page_size),
+        mesh=types.SimpleNamespace(shape={"data": 4, "tensor": 2}),
+    )
+    cap_dp4 = ModelRunner._apply_token_constraints(
+        runner_dp4,
+        token_capacity=195 * page_size,
+        max_total_tokens=None,
+        dp_size=4,
+    )
+    assert cap_dp4 == 780 * page_size
+    allocated_pages_dp4 = (cap_dp4 + page_size * 4) // page_size
+    assert allocated_pages_dp4 == 784
+    assert allocated_pages_dp4 % 4 == 0
+

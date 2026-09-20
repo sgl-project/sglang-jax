@@ -122,31 +122,17 @@ def apply_linear_quantization(
 
     quant_config = model_config.quantization_config
     if quant_config is None:
-        return model
+        raise ValueError(
+            "apply_linear_quantization called but model_config.quantization_config is None. "
+            "Ensure --quantization-config-path is set."
+        )
 
-    if hasattr(quant_config, "has_linear_quantization"):
-        if not quant_config.has_linear_quantization():
-            return model
-    elif not getattr(quant_config, "linear_rules", None) and not hasattr(
-        quant_config, "get_linear_rules"
-    ):
-        return model
-
-    linear_rules = (
-        quant_config.get_linear_rules()
-        if hasattr(quant_config, "get_linear_rules")
-        else getattr(quant_config, "linear_rules", None)
-    )
+    linear_rules = quant_config.get_linear_rules()
     if not linear_rules:
-        if (
-            hasattr(quant_config, "has_linear_quantization")
-            and quant_config.has_linear_quantization()
-        ):
-            raise ValueError(
-                "has_linear_quantization() is True but no linear rules found in quantization config. "
-                "Check your quantization config YAML file."
-            )
-        return model
+        raise ValueError(
+            "No linear rules found in quantization config. "
+            "Check your quantization config YAML file."
+        )
 
     # Compile regex patterns from rules
     compiled_rules = []
@@ -213,10 +199,8 @@ def apply_linear_quantization(
                     # Check if this path matches any rule
                     dot_path = child_path.replace("/", ".")
                     if any(
-                        dot_path == ig
-                        or dot_path.startswith(f"{ig}.")
-                        or dot_path.endswith(f".{ig}")
-                        for ig in ignored_layers
+                        dot_path == ignored or dot_path.endswith(f".{ignored}")
+                        for ignored in ignored_layers
                     ):
                         logger.info("Skipping %s - in ignored_layers", dot_path)
                         continue

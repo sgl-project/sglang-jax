@@ -936,24 +936,6 @@ class DeepseekV3ForCausalLM(nnx.Module):
                 add_linear(f"{prefix}.mlp.{proj}", f"{target}.mlp.{proj}", sharding)
             return mappings
 
-        # MoE Shared Experts
-        if hasattr(self.config, "n_shared_experts") and self.config.n_shared_experts > 0:
-            add_linear(
-                f"{prefix}.mlp.shared_experts.gate_proj",
-                f"{target}.mlp.shared_experts.gate_proj",
-                (None, "tensor"),
-            )
-            add_linear(
-                f"{prefix}.mlp.shared_experts.up_proj",
-                f"{target}.mlp.shared_experts.up_proj",
-                (None, "tensor"),
-            )
-            add_linear(
-                f"{prefix}.mlp.shared_experts.down_proj",
-                f"{target}.mlp.shared_experts.down_proj",
-                ("tensor", None),
-            )
-
         # MoE Gate
         mappings[f"{prefix}.mlp.gate.weight"] = WeightMapping(
             target_path=f"{target}.moe_gate.kernel",
@@ -976,9 +958,11 @@ class DeepseekV3ForCausalLM(nnx.Module):
             physical_to_logical_map = np.array(jax.device_get(metadata.physical_to_logical_map))
             phy_to_log = physical_to_logical_map[layer_idx]
 
-        is_int4_moe = is_int4_dtype(getattr(quant_config, "moe_weight_dtype", None))
-        weight_suffix = "weight_packed" if is_int4_moe else "weight"
-        scale_suffix = ".weight_scale" if is_int4_moe else ".weight_scale_inv"
+        is_static_int4_moe = is_static_quant and is_int4_dtype(
+            getattr(quant_config, "moe_weight_dtype", None)
+        )
+        weight_suffix = "weight_packed" if is_static_int4_moe else "weight"
+        scale_suffix = ".weight_scale" if is_static_int4_moe else ".weight_scale_inv"
 
         moe_mappings = create_moe_weights_mapping(
             prefix=prefix,
@@ -991,7 +975,7 @@ class DeepseekV3ForCausalLM(nnx.Module):
         )
         mappings.update(moe_mappings)
 
-        # Routed expert weight-scale sidecars (static FP8, non-fused only).
+        # Routed expert weight-scale sidecars (static FP8 / INT4, non-fused only).
         # Fused MoE static-FP8 placeholder shapes are (1,) today — loading
         # block scales would need a dedicated fix in fused_moe.py. Skip.
         #
@@ -1012,12 +996,18 @@ class DeepseekV3ForCausalLM(nnx.Module):
                 ]
                 scale_target = f"{target_base}_scale"
                 # Stacked checkpoint scale is `[E, out_blocks, in_blocks]`.
-                # For wi_0/wi_1: out_dim (intermediate_dim) is dim 1, sharded on "tensor".
-                # For wo: in_dim (intermediate_dim // 32 = k_blocks_wo) is dim 2, sharded on "tensor".
-                if "wo" in target_base:
-                    scale_sharding = ("expert", None, "tensor")
+                # For FP8 checkpoints, load replicated on the block dims so
+                # _maybe_convert_epmoe_scale_for_kernel's jnp.take avoids
+                # ambiguous sharding errors. For static INT4 checkpoints,
+                # shard directly along the partitioned dimension.
+                if is_static_int4_moe:
+                    scale_sharding = (
+                        ("expert", None, "tensor")
+                        if "wo" in target_base
+                        else ("expert", "tensor", None)
+                    )
                 else:
-                    scale_sharding = ("expert", "tensor", None)
+                    scale_sharding = ("expert", None, None)
                 mappings[f"__MOE_EXPERTS__{scale_target}"] = WeightMapping(
                     target_path=[scale_target] + expert_scale_keys,
                     sharding=scale_sharding,
