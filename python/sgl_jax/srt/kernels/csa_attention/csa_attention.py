@@ -8,12 +8,15 @@ import jax
 import jax.experimental.pallas as pl
 import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
+from jax.experimental.pallas import tpu_sc as plsc
 
 from sgl_jax.srt.kernels.dsa.sparse_mla_prefill_qblock import paged_write_back
+from sgl_jax.srt.kernels.sparse_core import core_map_helper
 
 from .tune import (
     APPEND_TILE,
     DMA_DEPTH,
+    GATHER_STREAMS,
     LANES,
     MAX_QUERY_TILE,
     ROUTE_QUERY_TILE,
@@ -42,6 +45,266 @@ class CSAAttentionMetadata(NamedTuple):
     compressed_cu_kv_lens: jax.Array
     compressed_kv_lens: jax.Array
     window_write_locations: jax.Array
+
+
+def _decode_pages(table, offsets):
+    table = jnp.pad(table, (0, -table.size % LANES))
+
+    def kernel(pages, indices, output):
+        index = indices[...]
+        result = jnp.zeros_like(index)
+        for start in range(0, table.size, LANES):
+            local = index - start
+            panel = jnp.broadcast_to(pages[start : start + LANES], (SUBLANES, LANES))
+            values = jnp.take_along_axis(panel, jnp.clip(local, 0, LANES - 1), axis=1)
+            result = jnp.where((local >= 0) & (local < LANES), values, result)
+        output[...] = result
+
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct(offsets.shape, jnp.int32),
+        grid=(pl.cdiv(offsets.shape[0], SUBLANES),),
+        in_specs=(
+            pl.BlockSpec(table.shape, lambda b: (0,)),
+            pl.BlockSpec((SUBLANES, offsets.shape[1]), lambda b: (b, 0)),
+        ),
+        out_specs=pl.BlockSpec((SUBLANES, offsets.shape[1]), lambda b: (b, 0)),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
+        name="csa-decode-pages",
+    )(table, offsets)
+
+
+def _gather_decode_kernel(nope, rope, indices, out_nope, out_rope, *, mesh, chunks):
+    lanes = pltpu.get_tpu_info().sparse_core.num_lanes
+    core = jax.lax.axis_index((mesh.core_axis_name, mesh.subcore_axis_name))
+    cores = jax.lax.axis_size((mesh.core_axis_name, mesh.subcore_axis_name))
+    word_bytes = jnp.dtype(jnp.int32).itemsize
+    main_words, rope_words = nope.bitcast(jnp.int32), rope.bitcast(jnp.int32)
+    out_rope = out_rope.bitcast(jnp.int32)
+
+    def outer(ids):
+        block = pl.program_id(0)
+
+        def selected(step, stream):
+            return ids[pl.ds((step * GATHER_STREAMS + stream) * lanes, lanes)]
+
+        def body(*refs):
+            for stream in range(GATHER_STREAMS):
+                refs[-2][pl.ds(stream * lanes, lanes), :] = refs[stream][...]
+                group = selected(pl.program_id(0), stream)
+                source = refs[GATHER_STREAMS + stream]
+                # Pack two BF16 rows per word before crossing back to TensorCore.
+                for pair in range(lanes // 2):
+                    packed = jnp.zeros((1, LANES // 2), jnp.int32)
+                    for half in range(2):
+                        row = pair * 2 + half
+                        shift = (group[row] & (word_bytes - 1)) << 3
+                        high = (source[pl.ds(row, 1), : LANES // 2] >> shift) & 255
+                        low = (source[pl.ds(row, 1), LANES // 2 :] >> shift) & 255
+                        packed |= ((high << 8) | low) << (16 * half)
+                    refs[-1][pl.ds(stream * (lanes // 2) + pair, 1), :] = packed
+
+        inputs = tuple(
+            pl.BlockSpec((pl.Indirect(lanes), LANES), lambda step, s=s: (selected(step, s), 0))
+            for s in range(GATHER_STREAMS)
+        )
+        inputs += tuple(
+            pl.BlockSpec(
+                (pl.Indirect(lanes), LANES),
+                lambda step, s=s: (
+                    jnp.right_shift(selected(step, s), word_bytes.bit_length() - 1),
+                    0,
+                ),
+            )
+            for s in range(GATHER_STREAMS)
+        )
+        outputs = tuple(
+            pl.BlockSpec(
+                shape, lambda step: ((block * cores + core) * (chunks // GATHER_STREAMS) + step, 0)
+            )
+            for shape in (
+                (GATHER_STREAMS * lanes, LANES),
+                (GATHER_STREAMS * lanes // 2, LANES // 2),
+            )
+        )
+        pltpu.emit_pipeline(
+            body, grid=(chunks // GATHER_STREAMS,), in_specs=inputs, out_specs=outputs
+        )(*((main_words,) * GATHER_STREAMS), *((rope_words,) * GATHER_STREAMS), out_nope, out_rope)
+
+    pltpu.emit_pipeline(
+        outer,
+        grid=(pl.cdiv(indices.shape[0], cores * chunks * lanes),),
+        in_specs=pl.BlockSpec((chunks * lanes,), lambda b: (b * cores + core,)),
+    )(indices)
+
+
+def _gather_decode(nope, rope, indices):
+    info = pltpu.get_tpu_info().sparse_core
+    mesh = plsc.VectorSubcoreMesh(
+        num_cores=info.num_cores,
+        num_subcores=info.num_subcores,
+        core_axis_name="core",
+        subcore_axis_name="subcore",
+    )
+    cores = info.num_cores * info.num_subcores
+    chunks = max(
+        GATHER_STREAMS,
+        pl.cdiv(indices.size, cores * info.num_lanes * GATHER_STREAMS) * GATHER_STREAMS,
+    )
+    block = cores * info.num_lanes * chunks
+    padded = pl.cdiv(indices.size, block) * block
+    # Spread alignment padding across the reserved dummy page, not one address.
+    locations = jnp.concatenate(
+        (indices, jnp.arange(padded - indices.size, dtype=jnp.int32) % nope.shape[1])
+    )
+    result = core_map_helper.kernel(
+        functools.partial(_gather_decode_kernel, mesh=mesh, chunks=chunks),
+        out_type=(
+            jax.ShapeDtypeStruct((padded, LANES), jnp.int32),
+            jax.ShapeDtypeStruct((padded, LANES // 2), jnp.uint16),
+        ),
+        compiler_params=pltpu.CompilerParams(use_tc_tiling_on_sc=True, needs_layout_passes=True),
+        mesh=mesh,
+        name="csa-decode-gather",
+    )(nope.reshape(-1, LANES), rope.reshape(-1, LANES), locations)
+    return tuple(v[: indices.size] for v in result)
+
+
+def _decode_kernel(
+    positions,
+    active_rows,
+    window_pages,
+    q,
+    new,
+    main,
+    rope,
+    valid,
+    sink,
+    window,
+    output,
+    maximum,
+    denominator,
+    accumulator,
+    *,
+    scale,
+    fp8_scale_block,
+):
+    token = pl.program_id(0)
+    position, active = positions[token], active_rows[token] != 0
+    selected, dim = main.shape[1], q.shape[-1]
+    rope_dim = rope.shape[-1]
+    nope_dim = dim - rope_dim
+    codes = pltpu.bitcast(main[0], jnp.uint8).reshape(selected, dim)
+    fp8 = pltpu.bitcast(codes[:, :nope_dim], jnp.float8_e4m3fn).astype(jnp.bfloat16)
+    blocks = nope_dim // fp8_scale_block
+    scales = pltpu.bitcast(codes[:, nope_dim : nope_dim + blocks], jnp.float8_e8m0fnu).astype(
+        jnp.bfloat16
+    )
+    expansion = (
+        jnp.arange(blocks)[:, None] == jnp.arange(nope_dim)[None, :] // fp8_scale_block
+    ).astype(jnp.bfloat16)
+    expanded = jnp.dot(scales, expansion, preferred_element_type=jnp.float32).astype(jnp.bfloat16)
+    compressed = jnp.concatenate((fp8 * expanded, pltpu.bitcast(rope[0], jnp.bfloat16)), axis=1)
+    window_size = window.shape[1] * window.shape[2]
+    slots = jnp.arange(window_size)
+    current = jax.lax.broadcasted_iota(jnp.int32, (window_size, dim), 0) == position % window_size
+    history = jnp.where(current, new[0], window[0].reshape(window_size, dim))
+    window_valid = (slots <= position) & (
+        (window_pages[token] > 0) | (slots == position % window_size)
+    )
+    keep = (jnp.concatenate((window_valid.astype(jnp.int32), valid[0, 0])) != 0) & active
+    kv = jnp.where(
+        keep.astype(jnp.int32)[:, None] != 0, jnp.concatenate((history, compressed), axis=0), 0
+    )
+    maximum[...] = jnp.broadcast_to(sink[...].reshape(-1, 1), maximum.shape)
+    denominator[...] = jnp.ones(denominator.shape, jnp.float32)
+    accumulator[...] = jnp.zeros(accumulator.shape, jnp.float32)
+    attention_update(
+        jnp.where(active, q[0], 0),
+        kv,
+        keep[None, :],
+        maximum,
+        denominator,
+        accumulator,
+        scale=scale,
+    )
+    output[0] = jnp.where(active, accumulator[...] / denominator[...][:, :1], 0).astype(
+        jnp.bfloat16
+    )
+
+
+def _decode_attention(
+    q, new, window, nope, rope, indices, sink, meta, *, scale, compression_ratio, fp8_scale_block
+):
+    tokens, heads, dim = q.shape
+    selected = indices.shape[1]
+    request = meta.query_seq_ids
+    active = (request >= 0) & (request < meta.seq_lens.size)
+    safe = jnp.where(active, request, 0)
+    position = meta.seq_lens[safe] - 1
+    page_size = nope.shape[1]
+    start = meta.compressed_cu_kv_lens[safe] // page_size
+    end = meta.compressed_cu_kv_lens[safe + 1] // page_size
+    entry = start[:, None] + indices // page_size
+    visible = jnp.minimum(meta.compressed_kv_lens[safe], (position + 1) // compression_ratio)
+    valid = active[:, None] & (indices >= 0) & (indices < visible[:, None])
+    valid &= (entry >= start[:, None]) & (entry < end[:, None])
+    valid &= (entry >= 0) & (entry < meta.compressed_page_indices.size)
+    page = _decode_pages(meta.compressed_page_indices, jnp.where(valid, entry, -1))
+    valid &= (page > 0) & (page < nope.shape[0])
+    padding = jnp.arange(tokens * selected, dtype=jnp.int32).reshape(tokens, selected) % page_size
+    locations = jnp.where(valid, page * page_size + indices % page_size, padding)
+    main, rotary = _gather_decode(nope, rope, locations.reshape(-1))
+    window_size = window.shape[1] * window.shape[2]
+    wp_entry = meta.window_cu_kv_lens[safe] // window_size
+    wp = meta.window_page_indices[jnp.clip(wp_entry, 0, meta.window_page_indices.size - 1)]
+    wp = jnp.where(active & (wp > 0) & (wp < window.shape[0]), wp, 0)
+    output = pl.pallas_call(
+        functools.partial(_decode_kernel, scale=scale, fp8_scale_block=fp8_scale_block),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=3,
+            grid=(tokens,),
+            in_specs=(
+                pl.BlockSpec((1, heads, dim), lambda t, *_: (t, 0, 0)),
+                pl.BlockSpec((1, 1, dim), lambda t, *_: (t, 0, 0)),
+                pl.BlockSpec((1, selected, LANES), lambda t, *_: (t, 0, 0)),
+                pl.BlockSpec((1, selected, LANES // 2), lambda t, *_: (t, 0, 0)),
+                pl.BlockSpec((1, 1, selected), lambda t, *_: (t, 0, 0)),
+                pl.BlockSpec((heads,), lambda t, *_: (0,)),
+                pl.BlockSpec(
+                    (1, *window.shape[1:]), lambda t, pos, active, pages: (pages[t], 0, 0, 0)
+                ),
+            ),
+            out_specs=pl.BlockSpec((1, heads, dim), lambda t, *_: (t, 0, 0)),
+            scratch_shapes=(
+                pltpu.VMEM((heads, LANES), jnp.float32),
+                pltpu.VMEM((heads, LANES), jnp.float32),
+                pltpu.VMEM((heads, dim), jnp.float32),
+            ),
+        ),
+        out_shape=jax.ShapeDtypeStruct(q.shape, q.dtype),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
+        name="csa-decode-attention",
+    )(
+        position,
+        active.astype(jnp.int32),
+        wp,
+        q,
+        new[:, None],
+        main.reshape(tokens, selected, LANES),
+        rotary.reshape(tokens, selected, LANES // 2),
+        valid[:, None].astype(jnp.int32),
+        sink,
+        window,
+    )
+    # Keep the native packed axes: flattening can copy the entire persistent pool.
+    locations = meta.window_write_locations
+    pages = jnp.where(locations >= 0, locations // window_size, -1)
+    slots = jnp.where(locations >= 0, locations % window_size, 0)
+    updated = window.at[pages, slots // 2, slots % 2].set(
+        new, mode="drop", wrap_negative_indices=False
+    )
+    return output, updated
 
 
 def _broadcast_minor(value, width):
@@ -734,6 +997,8 @@ def csa_joint_attention(
     Queries in a block share page reads, with independent causal/Top-K masks.
     new_kv contains this chunk, not yet committed to the historical SWA ring.
     Cache scale blocks and RoPE row grouping must match the producer's format.
+    schedule.decode requires at most one query per request. Its supported packed
+    layout uses SparseCore gather through temporary HBM, then TensorCore attention.
     """
     if q.ndim != 3 or q.dtype != jnp.bfloat16:
         raise ValueError("q must be BF16 [T,H,D]")
@@ -754,7 +1019,8 @@ def csa_joint_attention(
     if topk_indices.ndim != 2 or topk_indices.shape[0] != tokens or topk_indices.dtype != jnp.int32:
         raise ValueError("topk_indices must be int32 [T,K]")
     top_k = topk_indices.shape[-1]
-    if top_k < APPEND_TILE or top_k & (top_k - 1):
+    minimum_top_k = LANES if schedule.decode else APPEND_TILE
+    if top_k < minimum_top_k or top_k & (top_k - 1):
         raise ValueError("Top-K width must be a power of two and at least one append tile")
     if attention_sink.shape != (heads,) or attention_sink.dtype != jnp.float32:
         raise ValueError("attention_sink must be finite FP32 [H]")
@@ -765,7 +1031,7 @@ def csa_joint_attention(
     if (
         schedule.selected_tile <= 0
         or schedule.selected_tile % LANES
-        or top_k % schedule.selected_tile
+        or (top_k % schedule.selected_tile and not schedule.decode)
     ):
         raise ValueError("selected_tile must be lane-aligned and divide the Top-K width")
     if (
@@ -821,6 +1087,27 @@ def csa_joint_attention(
         return jnp.zeros_like(q), window_cache
     if not metadata.window_page_indices.size or not metadata.compressed_page_indices.size:
         raise ValueError("page tables must include at least a dummy page")
+    if schedule.decode and schedule.query_tile != 1:
+        raise ValueError("decode requires query_tile=1")
+    if (
+        schedule.decode
+        and not interpret
+        and rows_per_group == word_bytes
+        and window_size == window_page_size == LANES
+    ):
+        return _decode_attention(
+            q,
+            new_kv,
+            window_cache,
+            compressed_nope,
+            compressed_rope,
+            topk_indices,
+            attention_sink,
+            metadata,
+            scale=scale,
+            compression_ratio=compression_ratio,
+            fp8_scale_block=fp8_scale_block,
+        )
     bt = schedule.query_tile
     # A cache fitting one lane-width panel needs no wider aggregation.
     tile = LANES if (pages - 1) * page_size <= LANES else schedule.selected_tile
