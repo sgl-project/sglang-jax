@@ -212,6 +212,9 @@ class ForwardBatch:
     recurrent_track_indices: jax.Array | None = None
     recurrent_track_mask: jax.Array | None = None
 
+    # [num_tokens, ple_embed_dim], gathered on the host.
+    ple_embeddings: jax.Array | None = None
+
     def tree_flatten(self):
         children = (
             self.input_ids,
@@ -237,6 +240,7 @@ class ForwardBatch:
             self.recurrent_cow_src_indices,
             self.recurrent_track_indices,
             self.recurrent_track_mask,
+            self.ple_embeddings,
         )
 
         aux_data = {
@@ -288,6 +292,7 @@ class ForwardBatch:
         obj.recurrent_cow_src_indices = children[20]
         obj.recurrent_track_indices = children[21]
         obj.recurrent_track_mask = children[22]
+        obj.ple_embeddings = children[23]
         return obj
 
     def __repr__(self) -> str:
@@ -464,6 +469,13 @@ class ForwardBatch:
                 sharding=NamedSharding(model_runner.mesh, PartitionSpec("data")),
             )
 
+        ple_embeddings = None
+        if batch.ple_embeddings is not None: # [T, ple_embed_dim]
+            (ple_embeddings,) = device_array(
+                (ple_embeddings,),
+                sharding=NamedSharding(model_runner.mesh, PartitionSpec("data")),
+            )
+
         obj = cls(
             bid=batch.bid,
             forward_mode=batch.forward_mode,
@@ -493,6 +505,7 @@ class ForwardBatch:
             recurrent_cow_src_indices=recurrent_cow_src_indices,
             recurrent_track_indices=recurrent_track_indices,
             recurrent_track_mask=recurrent_track_mask,
+            ple_embeddings=ple_embeddings,
         )
 
         # Auto-generate attention mask for Encoder-only models (e.g. UMT5Encoder, BERT)
