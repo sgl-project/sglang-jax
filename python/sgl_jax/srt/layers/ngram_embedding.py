@@ -226,6 +226,16 @@ def compute_ngram_ids(
     EOS is a barrier: once the walk back crosses one, every older position
     reads as EOS, so an n-gram never spans two documents. Ids stay under 2^31
     (the released table tops out at 320,001,446), so int32 is enough.
+
+    The mixing runs in [T], not [T, HEADS]: the ``heads_per_ngram`` heads of
+    one n-gram order share a hash and differ only in the prime they reduce it
+    by, and order ``o``'s hash is order ``o-1``'s XORed with one more term. So
+    one [T] prefix XOR produces every order in turn and the head axis appears
+    only in the final reduce -- the same shape vLLM's ``_hash_ids_kernel``
+    fuses to (``rolling ^= value * multiplier`` per shift, store per head).
+    The reduce runs in uint64 to skip numpy's floor-mod sign fixup; both
+    operands are non-negative by construction (``build_hash_params`` bounds
+    the multipliers so token * multiplier stays under 2^63).
     """
     input_ids = np.asarray(input_ids, dtype=np.int64).reshape(-1)  # [T]
     cu_seqlens = np.asarray(cu_seqlens, dtype=np.int64)  # [B+1]
@@ -233,32 +243,43 @@ def compute_ngram_ids(
     ctx_len = params.ngram_context_len
     num_tokens = input_ids.shape[0]  # T
     num_reqs = cu_seqlens.shape[0] - 1  # B
-    heads = params.ngram_heads  # HEADS
+    per_order = params.heads_per_ngram  # HEADS / ctx_len
     if context.shape != (num_reqs, ctx_len):
         raise ValueError(f"context must be [{num_reqs}, {ctx_len}], got {context.shape}")
 
-    t_idx = np.arange(num_tokens, dtype=np.int64)  # [T]
-    req = np.clip(np.searchsorted(cu_seqlens, t_idx, side="right") - 1, 0, num_reqs - 1)  # [T]
-    chunk_pos = t_idx - cu_seqlens[req]  # [T]  position within the request's chunk
-    order = np.arange(heads, dtype=np.int64) // params.heads_per_ngram + 2  # [HEADS]  2 or 3
+    sizes = params.sizes.reshape(ctx_len, per_order).astype(np.uint64)  # [ctx_len, hpn]
+    offsets = params.offsets.reshape(ctx_len, per_order).astype(np.uint64)
 
-    mixed = np.empty((num_tokens, heads), dtype=np.int64)  # [T, HEADS]
-    mixed[:] = (input_ids * params.multipliers[0])[:, None]  # [T, 1] -> [T, HEADS]
+    # One token per request is decode, and there every token sits at chunk
+    # position 0: each lookback is then a fixed column of `context` and none
+    # of the searchsorted/clip position machinery below is needed.
+    decode = num_tokens == num_reqs and bool((np.diff(cu_seqlens) == 1).all())
+    if not decode:
+        t_idx = np.arange(num_tokens, dtype=np.int64)  # [T]
+        req = np.clip(np.searchsorted(cu_seqlens, t_idx, side="right") - 1, 0, num_reqs - 1)
+        chunk_pos = t_idx - cu_seqlens[req]  # [T]  position within the request's chunk
 
+    rolling = input_ids * params.multipliers[0]  # [T]  prefix-XOR accumulator
+    rolling_u = rolling.view(np.uint64)  # [T]  same buffer, unsigned reduce
+    ids = np.empty((num_tokens, ctx_len, per_order), dtype=np.int32)
+    residues = np.empty((num_tokens, per_order), dtype=np.uint64)
     crossed = np.zeros(num_tokens, dtype=bool)  # [T]
     for shift in range(1, ctx_len + 1):
-        in_chunk = chunk_pos >= shift  # [T]
-        step_token = input_ids[np.clip(t_idx - shift, 0, num_tokens - 1)]  # [T]
-        ctx_col = np.clip(ctx_len - shift + chunk_pos, 0, ctx_len - 1)  # [T]
-        ctx_token = context[req, ctx_col]  # [T]
-        candidate = np.where(in_chunk, step_token, ctx_token)  # [T]
-        candidate = np.where(crossed, params.eos_token_id, candidate)  # [T]
-        crossed |= candidate == params.eos_token_id  # [T]
-        term = candidate * params.multipliers[shift]  # [T]
-        mixed ^= np.where(order[None, :] > shift, term[:, None], 0)  # [T, HEADS]
-
-    ids = mixed % params.sizes[None, :] + params.offsets[None, :]  # [T, HEADS]
-    return ids.astype(np.int32)
+        if decode:
+            token = context[:, ctx_len - shift].copy()  # [T]  copy: written below
+        else:
+            step_token = input_ids[np.clip(t_idx - shift, 0, num_tokens - 1)]  # [T]
+            ctx_col = np.clip(ctx_len - shift + chunk_pos, 0, ctx_len - 1)  # [T]
+            token = np.where(chunk_pos >= shift, step_token, context[req, ctx_col])  # [T]
+        np.copyto(token, params.eos_token_id, where=crossed)
+        crossed |= token == params.eos_token_id  # [T]
+        rolling ^= token * params.multipliers[shift]  # [T]
+        # `rolling` now holds the hash of the order-(shift+1) n-gram, which is
+        # what heads [shift-1] of the reshaped head axis reduce.
+        np.mod(rolling_u[:, None], sizes[shift - 1][None, :], out=residues)  # [T, hpn]
+        residues += offsets[shift - 1][None, :]
+        ids[:, shift - 1, :] = residues
+    return ids.reshape(num_tokens, ctx_len * per_order)  # [T, HEADS]
 
 
 # --- device layer ----------------------------------------------------------
