@@ -58,8 +58,7 @@ SHORT_CONV = "short_conv"
 
 @dataclass(frozen=True)
 class ConvStateSpec:
-    """[total_slots, channels, state_len]
-    """
+    """[total_slots, channels, state_len]"""
 
     name: Literal["linear", "short_conv"]
     layers: tuple[int, ...]
@@ -89,7 +88,7 @@ def _conv_specs(
     conv_kernel_size: int,
     conv_states: tuple[ConvStateSpec, ...] | None,
 ) -> tuple[ConvStateSpec, ...]:
-    """Every conv state the pool allocates. 
+    """Every conv state the pool allocates.
     Order is not meaningful. Consumers ask by name.
     """
     if conv_states is None:

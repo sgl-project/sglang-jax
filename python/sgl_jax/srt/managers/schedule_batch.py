@@ -2326,9 +2326,9 @@ class ScheduleBatch:
         input_ids_cpu: np.ndarray,
     ) -> np.ndarray | None:
         """Host-side PLE lookup
-        
+
         On Qwen4Exp, the table is 95 GiB and XLA:TPU cannot gather across memory spaces, so
-        the rows are fetched here and only `[total_token_size, ple_embed_dim]` 
+        the rows are fetched here and only `[total_token_size, ple_embed_dim]`
         crosses to the device. Doing it on the scheduler (rather than in
         ``ForwardBatch.init_new``) puts the ~2.3 ms prefill gather off the
         dispatch critical path under overlap scheduling. See

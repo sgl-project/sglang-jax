@@ -100,11 +100,14 @@ def main():
     print(
         f"\n{'B':>5}{'slots':>7}{'pool MiB':>10}" + "".join(f"{k:>18}" for k in widths), flush=True
     )
+
+    def put(x, spec):
+        return jax.device_put(jnp.asarray(x), NamedSharding(mesh, spec))
+
     for batch in (256, 512):
         for num_slots in (256, 1024, 2048):
             if num_slots < batch:
                 continue
-            put = lambda x, spec: jax.device_put(jnp.asarray(x), NamedSharding(mesh, spec))
             argv = [
                 put(jnp.zeros((num_slots, CHANNELS, STATE_LEN), DTYPE), P("data", "tensor", None)),
                 put(np.arange(batch, dtype=np.int32), P("data")),

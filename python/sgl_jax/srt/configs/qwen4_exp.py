@@ -340,8 +340,7 @@ class _Qwen4ExpTextConfig(PretrainedConfig):
 
     @property
     def linear_state_params(self):
-        """The recurrent (temporal) state RecurrentStatePool holds per request.
-        """
+        """The recurrent (temporal) state RecurrentStatePool holds per request."""
         from sgl_jax.srt.mem_cache.recurrent_state_pool import (
             LinearRecurrentStateParams,
             recurrent_state_dtype,
@@ -359,7 +358,7 @@ class _Qwen4ExpTextConfig(PretrainedConfig):
 
     @property
     def conv_state_specs(self):
-        """"linear" must stay first: GDN/KDA read conv_buffers[layer][0].
+        """ "linear" must stay first: GDN/KDA read conv_buffers[layer][0].
 
         TODO: let them ask by name (get_linear_conv_state) instead; skipped
         here because it edits GDN/KDA.
@@ -371,7 +370,10 @@ class _Qwen4ExpTextConfig(PretrainedConfig):
         )  # 48*128 + 2*16*128 = 10240
         specs = [
             ConvStateSpec(
-                "linear", tuple(self.linear_layer_ids), proj_size, self.linear_conv_kernel_dim - 1,
+                "linear",
+                tuple(self.linear_layer_ids),
+                proj_size,
+                self.linear_conv_kernel_dim - 1,
             )  # state_len 3
         ]
 

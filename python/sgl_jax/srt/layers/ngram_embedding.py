@@ -227,12 +227,9 @@ def compute_ngram_ids(
     reads as EOS, so an n-gram never spans two documents. Ids stay under 2^31
     (the released table tops out at 320,001,446), so int32 is enough.
 
-    The mixing runs in [T], not [T, HEADS]: the ``heads_per_ngram`` heads of
-    one n-gram order share a hash and differ only in the prime they reduce it
-    by, and order ``o``'s hash is order ``o-1``'s XORed with one more term. So
-    one [T] prefix XOR produces every order in turn and the head axis appears
-    only in the final reduce -- the same shape vLLM's ``_hash_ids_kernel``
-    fuses to (``rolling ^= value * multiplier`` per shift, store per head).
+    The mixing runs in [T], not [T, HEADS], so one [T] prefix XOR produces every
+    order in turn and the head axis appears only in the final reduce.
+
     The reduce runs in uint64 to skip numpy's floor-mod sign fixup; both
     operands are non-negative by construction (``build_hash_params`` bounds
     the multipliers so token * multiplier stays under 2^63).

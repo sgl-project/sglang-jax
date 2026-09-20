@@ -222,7 +222,10 @@ class TestForwardBatchPleField(CustomTestCase):
     def _batch(self, **kw):
         import jax.numpy as jnp
 
-        from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+        from sgl_jax.srt.model_executor.forward_batch_info import (
+            ForwardBatch,
+            ForwardMode,
+        )
 
         return ForwardBatch(
             bid=0,
