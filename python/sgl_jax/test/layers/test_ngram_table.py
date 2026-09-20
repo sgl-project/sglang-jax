@@ -178,9 +178,7 @@ class TestLoadAndGather(CustomTestCase):
                     params = _params()
                     table = NGramTable(params, dim)
                     rng = np.random.default_rng(0)
-                    table.data[:] = rng.integers(
-                        0, 1 << 16, size=table.data.shape, dtype=np.uint16
-                    )
+                    table.data[:] = rng.integers(0, 1 << 16, size=table.data.shape, dtype=np.uint16)
                     ids = np.array([[0, 7, 3, 1], [4, 1, 6, 2]], dtype=dtype)[:, :HEADS]
                     got = table.gather(ids)
                     self.assertEqual(got.shape, (ids.shape[0], HEADS * dim))

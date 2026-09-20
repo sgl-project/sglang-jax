@@ -287,8 +287,32 @@ _VLLM_MULTIPLIERS = (
     16_214_398_509_481_979,
     15_314_398_509_481_977,
 )
-_VLLM_SIZES = (101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157,
-               163, 167, 173, 179, 181, 191, 193, 197, 199, 211, 223, 227)
+_VLLM_SIZES = (
+    101,
+    103,
+    107,
+    109,
+    113,
+    127,
+    131,
+    137,
+    139,
+    149,
+    151,
+    157,
+    163,
+    167,
+    173,
+    179,
+    181,
+    191,
+    193,
+    197,
+    199,
+    211,
+    223,
+    227,
+)
 _VLLM_EOS = 251
 _VLLM_HEADS_PER_NGRAM = 8
 
@@ -324,21 +348,29 @@ class TestComputeNGramIdsVsVLLM(CustomTestCase):
         "power-of-two": ([4, 4], [0, 7], [[11, 12], [13, 14]], 20),
         "empty-request": ([4, 0, 3], [], [[11, 12], [13, 14], [15, 16]], 20),
         "trailing-padded-requests": (
-            [3, 2, 0, 0], [],
-            [[11, 12], [13, 14], [_VLLM_EOS, _VLLM_EOS], [_VLLM_EOS, _VLLM_EOS]], 20,
+            [3, 2, 0, 0],
+            [],
+            [[11, 12], [13, 14], [_VLLM_EOS, _VLLM_EOS], [_VLLM_EOS, _VLLM_EOS]],
+            20,
         ),
         "three-requests": (
-            [1, 33, 2], [5, 32],
-            [[_VLLM_EOS, 11], [12, 13], [14, _VLLM_EOS]], 20,
+            [1, 33, 2],
+            [5, 32],
+            [[_VLLM_EOS, 11], [12, 13], [14, _VLLM_EOS]],
+            20,
         ),
         "six-requests": (
-            [5, 12, 16, 1, 16, 17], [10, 40],
-            [[11, 12], [13, 14], [15, 16], [17, 18], [19, 20], [21, 22]], 20,
+            [5, 12, 16, 1, 16, 17],
+            [10, 40],
+            [[11, 12], [13, 14], [15, 16], [17, 18], [19, 20], [21, 22]],
+            20,
         ),
         "four-gram": ([5, 3], [3], [[11, 12, 13], [14, 15, 16]], 20),
         "int64-overflow": (
-            [4, 0, 3], [],
-            [[200_000, 200_001], [250_000, 250_001], [300_000, 300_001]], 350_000,
+            [4, 0, 3],
+            [],
+            [[200_000, 200_001], [250_000, 250_001], [300_000, 300_001]],
+            350_000,
         ),
         "large-int32-ids": ([3], [], [[1_000_000_000, 1_000_000_001]], 1_000_000_002),
     }
@@ -358,9 +390,7 @@ class TestComputeNGramIdsVsVLLM(CustomTestCase):
             with self.subTest(name):
                 params = _vllm_params(len(contexts[0]))
                 cu = np.concatenate([[0], np.cumsum(query_lens)]).astype(np.int64)
-                ids = np.arange(
-                    first_token_id, first_token_id + int(cu[-1]), dtype=np.int64
-                )
+                ids = np.arange(first_token_id, first_token_id + int(cu[-1]), dtype=np.int64)
                 for off in eos_offsets:
                     ids[off] = _VLLM_EOS
                 ctx = np.array(contexts, dtype=np.int64)
