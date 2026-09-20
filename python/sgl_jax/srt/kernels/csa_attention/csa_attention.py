@@ -912,6 +912,8 @@ def csa_joint_attention(
         new_kv,
         metadata.window_write_locations,
         page_size=window_page_size,
+        # Each final ring spans its pages plus at most one wrap split.
+        r_cap=batch * (window_size // window_page_size + 1),
         interpret=interpret,
     )
     return output, window

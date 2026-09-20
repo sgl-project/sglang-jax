@@ -499,3 +499,68 @@ def test_invalid_cache_format(fp8_scale_block, rows_per_group):
             fp8_scale_block=fp8_scale_block,
             rows_per_group=rows_per_group,
         )
+
+
+@requires_tpu
+def test_large_prefill_writeback():
+    # This token count overflowed the old SMEM run table despite a small final ring.
+    batch, sequence, heads, width, page_size = 32, 2048, 8, 512, 128
+    tokens = batch * sequence
+    pages = batch * (sequence // 4 // page_size) + 1
+    position = np.tile(np.arange(sequence, dtype=np.int32), batch)
+    requests = np.repeat(np.arange(batch, dtype=np.int32), sequence)
+    locations = np.where(
+        position >= sequence - page_size,
+        (requests + 1) * page_size + position % page_size,
+        -1,
+    )
+    meta = CSAAttentionMetadata(
+        requests,
+        np.arange(batch + 1, dtype=np.int32) * sequence,
+        np.full(batch, sequence, np.int32),
+        np.arange(1, batch + 1, dtype=np.int32),
+        np.arange(batch + 1, dtype=np.int32) * page_size,
+        np.arange(1, pages, dtype=np.int32),
+        np.arange(batch + 1, dtype=np.int32) * (sequence // 4),
+        np.full(batch, sequence // 4, np.int32),
+        locations,
+    )
+    nope = np.zeros((pages, page_size, width), np.uint8)
+    nope[..., 448:455] = 127
+    count = (position + 1) // 4
+    indices = np.where(
+        np.arange(512)[None, :] < count[:, None], np.arange(512)[None, :], -1
+    ).astype(np.int32)
+    output, window = jax.tree.map(
+        np.asarray,
+        jax.block_until_ready(
+            csa_joint_attention(
+                jnp.zeros((tokens, heads, width), jnp.bfloat16),
+                jnp.ones((tokens, width), jnp.bfloat16),
+                jnp.zeros((batch + 1, page_size // 2, 2, width), jnp.bfloat16),
+                jnp.asarray(nope.reshape(pages, page_size, 4, 128)),
+                jnp.zeros((pages, page_size // 4, 4, 128), jnp.uint8),
+                jnp.asarray(indices),
+                jnp.zeros(heads, jnp.float32),
+                jax.tree.map(jax.device_put, meta),
+                scale=width**-0.5,
+                schedule=CSAAttentionSchedule(query_tile=32),
+                window_size=page_size,
+                compression_ratio=4,
+                fp8_scale_block=64,
+                rows_per_group=4,
+            )
+        ),
+    )
+    # Zero logits give uniform weights, including one zero-valued sink.
+    window_count = np.minimum(position + 1, page_size).astype(np.float32)
+    expected = window_count / (window_count + count.astype(np.float32) + 1)
+    for start in range(0, tokens, sequence):
+        assert_close(
+            output[start : start + sequence].astype(np.float32),
+            np.broadcast_to(
+                expected[start : start + sequence, None, None], (sequence, heads, width)
+            ),
+        )
+    np.testing.assert_array_equal(window[0], 0)
+    np.testing.assert_array_equal(window[1:], 1)
