@@ -477,9 +477,9 @@ class ForwardBatch:
             )
 
         ple_embeddings = None
-        if batch.ple_embeddings is not None: # [T, ple_embed_dim]
+        if batch.ple_embeddings is not None:  # [T, ple_embed_dim]
             (ple_embeddings,) = device_array(
-                (ple_embeddings,),
+                (batch.ple_embeddings,),
                 sharding=NamedSharding(model_runner.mesh, PartitionSpec("data")),
             )
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from functools import partial
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
@@ -52,6 +53,17 @@ class RecurrentStateDType:
 
 
 @dataclass(frozen=True)
+class ConvStateSpec:
+    """[total_slots, channels, state_len]
+    """
+
+    name: Literal["linear", "short_conv"]
+    layers: tuple[int, ...]
+    channels: int
+    state_len: int
+
+
+@dataclass(frozen=True)
 class LinearRecurrentStateParams:
     layers: list[int]
     num_heads: int
@@ -64,6 +76,21 @@ class LinearRecurrentStateParams:
     # treating K dim = V dim.
     num_k_heads: int | None = None
     head_k_dim: int | None = None
+
+
+def _conv_specs(
+    *,
+    layers: tuple[int, ...],
+    proj_size: int,
+    conv_kernel_size: int,
+    conv_states: tuple[ConvStateSpec, ...] | None,
+) -> tuple[ConvStateSpec, ...]:
+    """Every conv state the pool allocates. 
+    Order is not meaningful. Consumers ask by name.
+    """
+    if conv_states is None:
+        return (ConvStateSpec("linear", layers, proj_size, conv_kernel_size - 1),)
+    return tuple(conv_states)
 
 
 def recurrent_state_dtype() -> RecurrentStateDType:
@@ -92,6 +119,7 @@ class RecurrentStatePool:
         conv_dtype=None,
         num_k_heads: int | None = None,
         head_k_dim: int | None = None,
+        conv_states: tuple[ConvStateSpec, ...] | None = None,
     ):
         """`size` is the **global** number of valid slots across all DP ranks
         (mirrors MHATokenToKVPool.size semantics). Internally we partition by
@@ -137,6 +165,20 @@ class RecurrentStatePool:
         proj_v = num_heads * head_dim
         proj_k = num_k_heads * head_k_dim
         self.proj_size = proj_v + 2 * proj_k
+        self.conv_specs: tuple[ConvStateSpec, ...] = _conv_specs(
+            layers=tuple(self.linear_recurrent_layer_ids),
+            proj_size=self.proj_size,
+            conv_kernel_size=conv_kernel_size,
+            conv_states=conv_states,
+        )
+        # A layer outside linear_recurrent_layer_ids has no slot to hang on.
+        for spec in self.conv_specs:
+            missing = sorted(set(spec.layers) - set(self.linear_recurrent_layer_ids))
+            assert not missing, (
+                f"conv state {spec.name!r} requested for layers {missing}, which are "
+                f"not linear recurrent layers ({self.linear_recurrent_layer_ids}); "
+                "a separate pool would be needed to hold them"
+            )
 
         # Each rank reserves slot 0 as a dummy → +1 per rank.
         self.total_slots = size + dp_size
@@ -160,6 +202,11 @@ class RecurrentStatePool:
             f"proj_size {self.proj_size} must be divisible by "
             f"'{conv_partition_axis}' size {conv_axis_size}"
         )
+        for spec in self.conv_specs:
+            assert spec.channels % conv_axis_size == 0, (
+                f"{spec.name} conv channels {spec.channels} must be divisible by "
+                f"'{conv_partition_axis}' size {conv_axis_size}"
+            )
 
         self.recurrent_sharding = NamedSharding(
             mesh, P(data_partition_axis, recurrent_partition_axis, None, None)
@@ -170,26 +217,61 @@ class RecurrentStatePool:
 
     def _create_buffers(self) -> tuple[list, list]:
         recurrent_shape = (self.total_slots, self.num_heads, self.head_dim, self.head_dim)
-        conv_shape = (self.total_slots, self.proj_size, self.conv_kernel_size - 1)
-        temporal_dtype = self.temporal_dtype
-        conv_dtype = self.conv_dtype
-
         alloc_recurrent = _get_recurrent_zero_allocator(
-            recurrent_shape, temporal_dtype, self.recurrent_sharding
+            recurrent_shape, self.temporal_dtype, self.recurrent_sharding
         )
-        alloc_conv = _get_recurrent_zero_allocator(conv_shape, conv_dtype, self.conv_sharding)
+        alloc_conv = {
+            spec.name: _get_recurrent_zero_allocator(
+                (self.total_slots, spec.channels, spec.state_len),
+                self.conv_dtype,
+                self.conv_sharding,
+            )
+            for spec in self.conv_specs
+        }
         with jax.set_mesh(self.mesh):
-            recurrent_buffers = []
-            for _ in range(self.num_linear_recurrent_layers):
-                recurrent_buffers.append(alloc_recurrent())
-
-            conv_buffers = []
-            for _ in range(self.num_linear_recurrent_layers):
-                inner = []
-                inner.append(alloc_conv())
-                conv_buffers.append(inner)
+            recurrent_buffers = [alloc_recurrent() for _ in range(self.num_linear_recurrent_layers)]
+            # Ragged per layer: a spec only contributes where it lists the
+            # layer. clear / replace_buffer / copy_slots iterate, so only
+            # get_conv_state needs to know an index.
+            conv_buffers = [
+                [alloc_conv[s.name]() for s in self.conv_specs if layer_id in s.layers]
+                for layer_id in self.linear_recurrent_layer_ids
+            ]
 
         return recurrent_buffers, conv_buffers
+
+    def conv_buffer_index(self, layer_id: int, name: str) -> int:
+        """Position of ``name``'s buffer within ``conv_buffers[layer]``."""
+        idx = 0
+        for spec in self.conv_specs:
+            if layer_id not in spec.layers:
+                continue
+            if spec.name == name:
+                return idx
+            idx += 1
+        raise ValueError(
+            f"layer_id={layer_id} has no {name!r} conv state; it has "
+            f"{[s.name for s in self.conv_specs if layer_id in s.layers]}"
+        )
+
+    def get_linear_conv_state(self, layer_id: int):
+        """[total_slots, proj_size, K-1] -- the linear-attention conv."""
+        return self.get_conv_state(layer_id, "linear")
+
+    def get_short_conv_state(self, layer_id: int):
+        """[total_slots, C, state_len] -- the N-gram short conv's state."""
+        return self.get_conv_state(layer_id, "short_conv")
+
+    def get_conv_state(self, layer_id: int, name: str):
+        """[total_slots, channels, state_len] for one named conv state."""
+        if layer_id not in self.layers_mapping:
+            raise ValueError(
+                f"layer_id={layer_id} is not a registered linear recurrent layer. "
+                f"Registered: {self.linear_recurrent_layer_ids}"
+            )
+        return self.conv_buffers[self.layers_mapping[layer_id]][
+            self.conv_buffer_index(layer_id, name)
+        ]
 
     def get_linear_recurrent_layer_cache(self, layer_id: int):
         if layer_id not in self.layers_mapping:
@@ -298,6 +380,7 @@ class RecurrentStatePool:
             self.data_partition_axis,
             self.recurrent_sharding,
             self.conv_sharding,
+            self.conv_specs,
         )
         return children, aux
 
@@ -321,6 +404,7 @@ class RecurrentStatePool:
             data_partition_axis,
             recurrent_sharding,
             conv_sharding,
+            conv_specs,
         ) = aux_data
         obj = cls.__new__(cls)
         obj.linear_recurrent_layer_ids = list(linear_recurrent_layer_ids_tup)
@@ -328,6 +412,7 @@ class RecurrentStatePool:
             layer_id: idx for idx, layer_id in enumerate(obj.linear_recurrent_layer_ids)
         }
         obj.num_linear_recurrent_layers = len(obj.linear_recurrent_layer_ids)
+        obj.conv_specs = conv_specs
         obj.size = size
         obj.dp_size = dp_size
         obj.slots_per_rank = size // dp_size

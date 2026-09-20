@@ -31,6 +31,11 @@ from jax._src import mesh as mesh_lib
 
 from sgl_jax.global_config import global_config
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.layers.ngram_embedding import (
+    compute_ngram_ids,
+    ngram_context_row_split,
+)
+from sgl_jax.srt.layers.ngram_table import get_ngram_table
 from sgl_jax.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
@@ -2297,6 +2302,103 @@ class ScheduleBatch:
             "deepstack_visual_embedding": dense,
         }
 
+    def _merge_ngram_ple(
+        self,
+        per_dp_token_size: int,
+        total_token_size: int,
+        input_ids_cpu: np.ndarray,
+    ) -> np.ndarray | None:
+        """Host-side PLE lookup
+        
+        On Qwen4Exp, the table is 95 GiB and XLA:TPU cannot gather across memory spaces, so
+        the rows are fetched here and only `[total_token_size, ple_embed_dim]` 
+        crosses to the device. Doing it on the scheduler (rather than in
+        ``ForwardBatch.init_new``) puts the ~2.3 ms prefill gather off the
+        dispatch critical path under overlap scheduling. See
+        ``sgl_jax/srt/layers/ngram_table.py``.
+
+        Returns None for every model that never installs a table.
+        """
+        table = get_ngram_table()
+        if table is None:
+            return None
+
+        if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
+            # A verify batch feeds draft tokens the host only holds in spec_info,
+            # so the context row -- built from origin_input_ids + output_ids --
+            # would be right for the first token and wrong for the rest. Wrong
+            # rows still hash to valid ids, so this has to be loud.
+            raise NotImplementedError(
+                "N-gram PLE does not cover speculative decoding yet: the context row "
+                "is built from origin_input_ids + output_ids, which does not contain "
+                "the draft tokens a verify batch feeds in."
+            )
+
+        params = table.params
+        ctx_len = params.ngram_context_len
+        is_extend = self.forward_mode.is_extend()
+
+        # Overlap scheduling hands the host negative future-token placeholders
+        # that only resolve on device (see resolve_future_token_ids), and the
+        # n-gram hash needs the real ids. Fail loudly rather than hash the
+        # placeholders into garbage rows.
+        if input_ids_cpu.size and int(input_ids_cpu.min()) < 0:
+            raise RuntimeError(
+                "N-gram PLE needs real token ids on the host, but this batch carries "
+                "unresolved future tokens. Serve this model with "
+                "--disable-overlap-schedule."
+            )
+
+        ids = np.zeros((total_token_size, params.ngram_heads), dtype=np.int32)
+
+        offset = 0
+        for dp_rank in range(self.dp_size):
+            info = self.reqs_info[dp_rank]
+            if not info.reqs or info.seq_lens is None or len(info.seq_lens) == 0:
+                offset += per_dp_token_size
+                continue
+
+            lens: list[int] = []
+            context: list[np.ndarray] = []
+            for i, req in enumerate(info.reqs):
+                seq_len = int(info.seq_lens[i])
+                if is_extend:
+                    chunk_start = int(info.prefix_lens[i])
+                    n_tokens = seq_len - chunk_start
+                else:
+                    chunk_start = seq_len - 1
+                    n_tokens = 1
+                if n_tokens <= 0:
+                    continue
+                lens.append(n_tokens)
+                context.append(
+                    ngram_context_row_split(
+                        req.origin_input_ids,
+                        req.output_ids,
+                        chunk_start,
+                        ctx_len,
+                        params.eos_token_id,
+                    )
+                )
+
+            if lens:
+                cu_seqlens = np.zeros(len(lens) + 1, dtype=np.int64)
+                np.cumsum(np.asarray(lens, dtype=np.int64), out=cu_seqlens[1:])
+                dp_len = int(cu_seqlens[-1])
+                ids[offset : offset + dp_len] = compute_ngram_ids(
+                    input_ids_cpu[offset : offset + dp_len],
+                    cu_seqlens,
+                    np.stack(context),
+                    params,
+                )
+            offset += per_dp_token_size
+
+        # ponytail: one gather for the whole padded batch. Padded rows read
+        # table row 0 and their output is discarded; skipping them would mean
+        # a scatter, and would shrink the row count the gather's thread pool
+        # sizes itself from. Revisit if a bucket ever pads by more than ~2x.
+        return table.gather(ids)
+
     def _merge_batch_metadata(
         self,
         per_dp_bs_size: int,
@@ -3211,6 +3313,10 @@ class ScheduleBatch:
         mrope_positions = _mm["mrope_positions"]
         apply_for_deepstack = _mm["apply_for_deepstack"]
         deepstack_visual_embedding = _mm["deepstack_visual_embedding"]
+        # Host PLE gather; None unless a model installed an N-gram table.
+        ple_embeddings = self._merge_ngram_ple(
+            per_dp_token_padding, total_token_size, input_ids_cpu
+        )
         # Keep items whose placeholder rows intersect the current prefill window.
         if self.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
             multimodal_batch = build_multimodal_batch(
@@ -3333,6 +3439,7 @@ class ScheduleBatch:
             recurrent_track_indices=recurrent_track_indices_cpu,
             recurrent_track_mask=recurrent_track_mask_cpu,
             has_initial_state=has_initial_state_cpu,
+            ple_embeddings=ple_embeddings,
             spec_algorithm=self.spec_algorithm,
         )
 

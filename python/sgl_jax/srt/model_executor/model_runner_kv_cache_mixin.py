@@ -44,19 +44,37 @@ def _compute_recurrent_per_req_bytes(
     conv_dtype_bytes: int,
     num_k_heads: int | None = None,
     head_k_dim: int | None = None,
+    conv_states=None,
 ) -> int:
     """Per-device per-request recurrent + conv buffer size in bytes."""
     if num_k_heads is None:
         num_k_heads = num_heads
     if head_k_dim is None:
         head_k_dim = head_dim
+    from sgl_jax.srt.mem_cache.recurrent_state_pool import _conv_specs
+
     assert num_heads % tp_size == 0, f"num_heads {num_heads} must be divisible by tp_size {tp_size}"
     proj_size = num_heads * head_dim + 2 * (num_k_heads * head_k_dim)
     assert proj_size % tp_size == 0, f"proj_size {proj_size} must be divisible by tp_size {tp_size}"
     per_req_recurrent = (
         num_layers * (num_heads // tp_size) * head_dim * head_dim * temporal_dtype_bytes
     )
-    per_req_conv = num_layers * (conv_kernel_size - 1) * (proj_size // tp_size) * conv_dtype_bytes
+    # Same spec list the pool allocates from, so a state it holds cannot be one
+    # the KV budget below also hands out. GDN is ~110 MiB/request here, the
+    # N-gram short conv 180 KiB.
+    per_req_conv = 0
+    for spec in _conv_specs(
+        layers=tuple(range(num_layers)),
+        proj_size=proj_size,
+        conv_kernel_size=conv_kernel_size,
+        conv_states=conv_states,
+    ):
+        assert (
+            spec.channels % tp_size == 0
+        ), f"{spec.name} conv channels {spec.channels} must be divisible by tp_size {tp_size}"
+        per_req_conv += (
+            len(spec.layers) * spec.state_len * (spec.channels // tp_size) * conv_dtype_bytes
+        )
     return per_req_recurrent + per_req_conv
 
 
@@ -99,6 +117,12 @@ def _linear_state_params_from_config(cfg):
     )
 
 
+def _conv_state_specs_from_config(cfg):
+    """Conv specs a config supplies directly; None -> derive GDN's from the
+    recurrent scalars, which is every family but Qwen4Exp."""
+    return getattr(cfg, "conv_state_specs", None)
+
+
 def _per_req_state_bytes_from_config(cfg, tp_size: int) -> int:
     """Per-request recurrent + conv state bytes for a hybrid recurrent model."""
     state_params = _linear_state_params_from_config(cfg)
@@ -110,6 +134,7 @@ def _per_req_state_bytes_from_config(cfg, tp_size: int) -> int:
         tp_size=tp_size,
         temporal_dtype_bytes=jnp.dtype(state_params.dtype.temporal).itemsize,
         conv_dtype_bytes=jnp.dtype(state_params.dtype.conv).itemsize,
+        conv_states=_conv_state_specs_from_config(cfg),
         num_k_heads=state_params.num_k_heads,
         head_k_dim=state_params.head_k_dim,
     )
@@ -259,6 +284,7 @@ def _build_hybrid_pools(
         conv_dtype=state_params.dtype.conv,
         num_k_heads=state_params.num_k_heads,
         head_k_dim=state_params.head_k_dim,
+        conv_states=_conv_state_specs_from_config(cfg),
     )
     hybrid_pool = HybridReqToTokenPool(
         size=max_num_reqs,
