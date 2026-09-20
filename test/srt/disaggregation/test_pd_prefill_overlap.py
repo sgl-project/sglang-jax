@@ -293,7 +293,11 @@ def test_prefill_worker_fences_before_publishing_or_next_forward(monkeypatch, fu
 
     monkeypatch.setattr(worker_module.jax, "block_until_ready", fence)
     for bid in (1, 2):
-        batch = NS(bid=bid, launch_done=None, forward_batch=NS(input_ids=[0]))
+        batch = NS(
+            bid=bid,
+            launch_done=None,
+            forward_batch=NS(input_ids=[0], seq_lens=[1], req_pool_indices=[0]),
+        )
         client.input_queue.put((batch, None, None, None))
     client.input_queue.put((None, None, None, None))
     if fence_fails:
