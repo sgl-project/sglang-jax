@@ -172,6 +172,7 @@ class MoEKernelTest(jtu.JaxTestCase):
         use_grouped_topk=False,
         num_groups=1,
         top_k_groups=1,
+        use_jax_allreduce_metadata=True,
         atol=2e-1,
         rtol=2e-1,
     ):
@@ -278,8 +279,10 @@ class MoEKernelTest(jtu.JaxTestCase):
             w2_shared_scale=w2_shared_scale,
             w3_shared_scale=w3_shared_scale,
             block_config=block_config,
+            use_jax_allreduce_metadata=use_jax_allreduce_metadata,
             tp_axis_name="tensor",
         )
+        self.assertEqual(actual.shape, a.shape)
         expected = ref_moe(
             a,
             w1,
@@ -358,6 +361,35 @@ class MoEKernelTest(jtu.JaxTestCase):
             bd1c=256,
             bd2c=256,
             bse=512,
+        )
+
+    @parameterized.product(
+        local_num_tokens=[127, 128],
+        use_jax_allreduce_metadata=[True, False],
+    )
+    def test_per_rank_padding_boundary(self, local_num_tokens, use_jax_allreduce_metadata):
+        ep_size = self.mesh.shape["data"] * self.mesh.shape["tensor"]
+        self._test_moe(
+            dtype=jnp.bfloat16,
+            top_k=2,
+            num_experts=max(2, ep_size),
+            hidden_size=256,
+            intermediate_size=256,
+            num_tokens=local_num_tokens * ep_size,
+            seed=1415,
+            renormalize_topk_logits=True,
+            bt=128,
+            bf=256,
+            bd1=256,
+            bd2=256,
+            btc=128,
+            bfc=128,
+            bd1c=256,
+            bd2c=256,
+            bse=256,
+            use_jax_allreduce_metadata=use_jax_allreduce_metadata,
+            atol=2e-1,
+            rtol=2e-1,
         )
 
     def test_layer_reshards_dp_inputs_for_fused_kernel(self):
