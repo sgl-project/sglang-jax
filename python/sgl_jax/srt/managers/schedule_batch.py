@@ -3765,6 +3765,9 @@ class ModelWorkerBatch:
     # MRoPE position information [3, total_tokens]
     mrope_positions: np.ndarray | None = None
 
+    # [num_tokens, ple_embed_dim]
+    ple_embeddings: np.ndarray | None = None
+
     # Recurrent state indices for hybrid recurrent models
     recurrent_indices: np.ndarray | None = None
 
