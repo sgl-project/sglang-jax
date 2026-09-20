@@ -1148,6 +1148,7 @@ def test_received_prompt_tail_page_is_reclaimed_at_page_boundaries():
             )
             SchedulerDisaggregationDecodeMixin._drain_decode_transfer_terminals(scheduler)
             assert len(req.prefix_indices) == seqlen - 1
+            np.testing.assert_array_equal(req._pd_prealloc_kv_indices, entry.kv_indices)
             # Reclaim every page owned by the decode prefix; together with the
             # unused received tail, this must restore the full allocator.
             allocator.free(req.prefix_indices)

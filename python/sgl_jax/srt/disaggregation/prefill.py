@@ -38,6 +38,7 @@ class PrefillHandoff:
     end: int
     block_ids: tuple[int, ...]
     is_final: bool
+    error: str | None = None
 
 
 @dataclass
@@ -263,14 +264,21 @@ class SchedulerDisaggregationPrefillMixin:
             end = len(req.fill_ids)
             start = end - req.extend_input_len
             is_final = not any(req is r for r in chunked)
-            pages = (
-                self._extract_req_block_ids_range(req, start if chunk_transfer else 0, end)
-                if chunk_transfer or is_final
-                else ()
-            )
+            error = None
+            try:
+                pages = (
+                    self._extract_req_block_ids_range(req, start if chunk_transfer else 0, end)
+                    if chunk_transfer or is_final
+                    else ()
+                )
+            except ValueError as exc:
+                # This batch already owns its scheduled slots. Keep its compute
+                # reference and defer failure/release until the forward resolves.
+                pages = ()
+                error = str(exc)
             handoffs.append(
                 PrefillHandoff(
-                    req, get_disagg_transport_id(req), start, end, tuple(pages), is_final
+                    req, get_disagg_transport_id(req), start, end, tuple(pages), is_final, error
                 )
             )
         return tuple(handoffs)
@@ -308,6 +316,8 @@ class SchedulerDisaggregationPrefillMixin:
         # Stop adding chunks when native read slots are full. The overlap loop
         # still resolves its one already-submitted forward and polls senders,
         # so completed reads can reopen the window without new compute.
+        # TODO: gate individual ranks when DP>1 overlap is validated; the
+        # current DP1 contract conservatively stalls admission on every rank.
         return any(
             sender is not None and sender.has_pending_chunks
             for req in self.chunked_reqs
@@ -364,7 +374,6 @@ class SchedulerDisaggregationPrefillMixin:
                 self.new_token_ratio = self.init_new_token_ratio
                 if self._comm_backend is not None:
                     self._comm_backend.wait_for_new_requests(0.001)
-            self.send_kv_chunk()
             self.last_batch = batch
 
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
@@ -478,6 +487,21 @@ class SchedulerDisaggregationPrefillMixin:
                     req.output_ids = []
                     self._stream_prefill_req(req)
                     self._release_prefill_req_resources(req)
+                self._retire_chunk_producer_ownership(req)
+                continue
+            if snapshot and snapshot.error is not None:
+                if is_mid_chunk and req.is_chunked > 0:
+                    req.is_chunked -= 1
+                sender = req.disagg_chunk_sender
+                if sender is not None:
+                    sender.fail(reason="chunk_handoff")
+                    self._ensure_chunk_sender_queued(req, sender)
+                else:
+                    self._abort_prefill_req(
+                        req,
+                        f"Prefill handoff snapshot failed for req_id={req_id!r}: {snapshot.error}",
+                        metric_reason="chunk_handoff",
+                    )
                 self._retire_chunk_producer_ownership(req)
                 continue
             if chunk_transfer_enabled:
@@ -742,15 +766,14 @@ class SchedulerDisaggregationPrefillMixin:
         dp_rank = int(req.dp_rank)
         if self.chunked_reqs[dp_rank] is req:
             self.chunked_reqs[dp_rank] = None
-        last_batch = getattr(self, "last_batch", None)
-        if last_batch is not None and last_batch.forward_mode.is_extend():
-            info = last_batch.reqs_info[dp_rank]
-            if info.chunked_req is req:
-                # The sender terminal callback can release the request slot and
-                # KV pages before the next scheduler tick. Drop the batch-side
-                # owner as well so _sync_chunked_req_owners cannot resurrect a
-                # producer whose allocations are already reusable.
-                info.chunked_req = None
+        for batch in (getattr(self, "last_batch", None), getattr(self, "cur_batch", None)):
+            if batch is not None and batch.forward_mode.is_extend():
+                info = batch.reqs_info[dp_rank]
+                if info.chunked_req is req:
+                    # During overlap resolve, the next chunk is in cur_batch
+                    # and last_batch is None. Retire both before the next
+                    # AbortReq/pause can restore the batch-side owner.
+                    info.chunked_req = None
         pending = getattr(self, "_pending_chunked_abort_reqs", None)
         if pending is not None and pending[dp_rank] is req:
             pending[dp_rank] = None

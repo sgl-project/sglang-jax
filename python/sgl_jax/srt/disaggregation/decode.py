@@ -532,7 +532,6 @@ class SchedulerDisaggregationDecodeMixin:
                             self._install_received_kv(req, indices, kv)
                         )
                     )
-                    self._set_decode_bookkeeping(entry.req, entry.kv_indices)
                     # D recomputes the last prompt token. If that token alone
                     # occupies the final received page, the extend allocator
                     # will allocate a replacement page: no prefix slot retains
@@ -543,6 +542,7 @@ class SchedulerDisaggregationDecodeMixin:
                         unused_tail = entry.kv_indices[prefix_len:]
                         entry.kv_indices = entry.kv_indices[:prefix_len]
                         self._release_decode_kv_indices(unused_tail, entry.req.dp_rank)
+                    self._set_decode_bookkeeping(entry.req, entry.kv_indices)
                     self._enqueue_for_decode(entry.req)
                     self._pd_mark_time(entry.req, "first_token")
                     from sgl_jax.srt.disaggregation.req_time_stats import (
@@ -934,11 +934,9 @@ class SchedulerDisaggregationDecodeMixin:
             np.asarray(kv_indices) if not isinstance(kv_indices, np.ndarray) else kv_indices
         )
         seqlen = len(req.origin_input_ids)
-        valid_slots = kv_indices_np[:seqlen]
-        if len(valid_slots) >= 1:
-            req.prefix_indices = valid_slots[:-1]
-        else:
-            req.prefix_indices = valid_slots
+        # The unused received tail page may already have been reclaimed.
+        # Slice by prompt length rather than dropping another retained slot.
+        req.prefix_indices = kv_indices_np[: max(seqlen - 1, 0)]
         req.last_matched_prefix_len = len(req.prefix_indices)
         req._pd_skip_prefix_match = True
         req._pd_prealloc_kv_indices = kv_indices_np

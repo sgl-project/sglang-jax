@@ -672,6 +672,9 @@ class RaidenTransferKVManager(CommonKVManager):
         # Its multi-NUMA wrapper emits the first sub-manager failure before
         # the others settle. Only a single endpoint proves all source shards
         # are released; otherwise retain ownership conservatively.
+        # TODO: expose per-shard terminal/cancellation acknowledgement in the
+        # native wrapper. Multi-endpoint failures can retain pages indefinitely;
+        # an ack timeout alone does not prove the remaining readers are done.
         return len(self.wrapper.endpoints_by_dp_rank.get(dp_rank, ())) == 1
 
     def receiver_state(self, req_id: str) -> str | None:

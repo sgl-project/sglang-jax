@@ -232,7 +232,7 @@ def test_backpressured_loop_keeps_resolving_and_polling_then_resumes():
         events.append(("poll", tick))
         # Native reads finish while CPU scheduling is stopped, and polling
         # drains pending registrations before the next admission check.
-        if tick == 3 and polls == 6:
+        if tick == 3 and polls == 3:
             sender.has_pending_chunks = False
 
     batch = NS(reqs=[req], copy=lambda: NS(reqs=[req]))
@@ -250,11 +250,12 @@ def test_backpressured_loop_keeps_resolving_and_polling_then_resumes():
         scheduler.event_loop_overlap_disagg_prefill()
     assert [event for event in events if event[0] == "schedule"] == [
         ("schedule", 1),
+        ("schedule", 3),
         ("schedule", 4),
     ]
     assert [event for event in events if event[0] == "resolve"] == [("resolve", 2)]
     assert [event for event in events if event[0] == "poll"] == [
-        ("poll", tick) for tick in range(1, 5) for _ in range(2)
+        ("poll", tick) for tick in range(1, 5)
     ]
     assert not scheduler.result_queue
 
@@ -307,3 +308,183 @@ def test_prefill_worker_fences_before_publishing_or_next_forward(monkeypatch, fu
     else:
         client.forward_thread_func_()
         assert events == ["forward1", "fence", "publish", "forward2", "fence", "publish"]
+
+
+def owner_batch(req):
+    return NS(
+        reqs_info=[NS(reqs=[req], chunked_req=req)],
+        forward_mode=NS(is_extend=lambda: True),
+    )
+
+
+def lifecycle_harness(req, *, chunk=True):
+    from sgl_jax.srt.managers.scheduler import Scheduler
+
+    scheduler = Harness(chunk=chunk)
+    del scheduler._retire_chunk_producer_ownership
+    scheduler.chunked_reqs = [req] if chunk else [None]
+    scheduler._pending_chunked_abort_reqs = [None]
+    scheduler.last_batch = None
+    scheduler.cur_batch = owner_batch(req)
+    scheduler.pd = "raiden"
+    scheduler._engine_paused = False
+    scheduler.waiting_queue = []
+    scheduler.grammar_queue = []
+    scheduler.running_batch = NS(reqs_info=[])
+    scheduler.disagg_prealloc_queue = None
+    scheduler.disagg_transfer_queue = None
+    scheduler._sync_chunked_req_owners = lambda: Scheduler._sync_chunked_req_owners(scheduler)
+    scheduler._mark_pending_chunked_aborts = lambda abort: Scheduler._mark_pending_chunked_aborts(
+        scheduler, abort
+    )
+    scheduler.tp_worker = NS(resolve_last_batch_result=lambda: (None, [1], 0))
+    req.pd_time_stats = None
+    req.finished_reason = None
+    req.finished = lambda: req.finished_reason is not None
+    req.check_finished = lambda: setattr(req, "finished_reason", req.to_finish)
+    return scheduler
+
+
+@pytest.mark.parametrize("chunk", [False, True])
+def test_abort_in_flight_resolves_before_terminal_and_releases_once(chunk):
+    from sgl_jax.srt.managers.io_struct import AbortReq
+    from sgl_jax.srt.managers.scheduler import Scheduler
+
+    req = request()
+    scheduler = lifecycle_harness(req, chunk=chunk)
+    snapshots = scheduler._snapshot_prefill_handoffs(scheduler.cur_batch)
+    scheduler._disagg_prefill_compute[id(req)] = 1
+    sender = Mock(has_pending_failure=False)
+    sender.poll.return_value = KVPoll.FAILED
+    if chunk:
+        req.disagg_chunk_sender = sender
+        scheduler._ensure_chunk_sender_queued(req, sender)
+    Scheduler.abort_request(scheduler, AbortReq(rid=req.rid))
+    assert req.to_finish is not None
+    scheduler.send_kv_chunk()
+    scheduler._release_prefill_kv_pool.assert_not_called()
+    scheduler._resolve_disagg_prefill_result(
+        PendingPrefillResult(scheduler.cur_batch, NS(), snapshots)
+    )
+    if chunk:
+        scheduler._release_prefill_kv_pool.assert_not_called()
+    scheduler.send_kv_chunk()
+    scheduler.send_kv_chunk()
+    scheduler._stream_prefill_req.assert_called_once_with(req)
+    scheduler._release_prefill_kv_pool.assert_called_once_with(req)
+    assert not scheduler._disagg_prefill_compute
+    assert not scheduler._disagg_prefill_deferred_releases
+    assert scheduler.chunked_reqs == [None]
+    # Simulate end-of-tick publication and a subsequent AbortReq owner sync.
+    scheduler.last_batch = scheduler.cur_batch
+    scheduler._sync_chunked_req_owners()
+    assert scheduler.chunked_reqs == [None]
+
+
+@pytest.mark.parametrize("existing_sender", [False, True])
+def test_snapshot_error_is_per_request_and_waits_for_compute_and_native_readers(existing_sender):
+    req = request()
+    scheduler = lifecycle_harness(req)
+    good = request()
+    good.rid = "good"
+    scheduler._extract_req_block_ids_range.side_effect = [ValueError("unaligned token"), [8]]
+    snapshots = scheduler._snapshot_prefill_handoffs(NS(reqs=[req, good]))
+    assert snapshots[0].error == "unaligned token"
+    assert snapshots[1].block_ids == (8,)
+    assert snapshots[1].error is None
+    scheduler._release_prefill_kv_pool.assert_not_called()
+    scheduler._stream_prefill_req.assert_not_called()
+    scheduler._disagg_prefill_compute[id(req)] = 1
+    sender = Mock()
+    sender.poll.return_value = KVPoll.TRANSFERRING
+    if existing_sender:
+        req.disagg_chunk_sender = sender
+    scheduler._resolve_disagg_prefill_result(
+        PendingPrefillResult(scheduler.cur_batch, NS(), snapshots[:1])
+    )
+    if existing_sender:
+        sender.fail.assert_called_once_with(reason="chunk_handoff")
+        scheduler.send_kv_chunk()
+        scheduler._release_prefill_kv_pool.assert_not_called()
+        sender.poll.return_value = KVPoll.FAILED
+        scheduler.send_kv_chunk()
+    scheduler._stream_prefill_req.assert_called_once_with(req)
+    scheduler._release_prefill_kv_pool.assert_called_once_with(req)
+    assert scheduler.chunked_reqs == [None]
+    assert scheduler.cur_batch.reqs_info[0].chunked_req is None
+
+
+def test_failed_sender_during_later_chunk_cannot_restore_producer():
+    req = request()
+    scheduler = lifecycle_harness(req)
+    snapshots = scheduler._snapshot_prefill_handoffs(scheduler.cur_batch)
+    sender = Mock(has_pending_failure=True)
+    sender.poll.return_value = KVPoll.FAILED
+    req.disagg_chunk_sender = sender
+    scheduler._ensure_chunk_sender_queued(req, sender)
+    scheduler._disagg_prefill_compute[id(req)] = 1
+    scheduler.send_kv_chunk()
+    scheduler._release_prefill_kv_pool.assert_not_called()
+    scheduler._resolve_disagg_prefill_result(
+        PendingPrefillResult(scheduler.cur_batch, NS(), snapshots)
+    )
+    sender.send_chunk.assert_not_called()
+    scheduler.last_batch = scheduler.cur_batch
+    scheduler._sync_chunked_req_owners()
+    assert scheduler.chunked_reqs == [None]
+    scheduler.send_kv_chunk()
+    scheduler.send_kv_chunk()
+    scheduler._release_prefill_kv_pool.assert_called_once_with(req)
+    scheduler._stream_prefill_req.assert_called_once_with(req)
+
+
+def test_run_batch_to_resolve_to_native_chunk_handoff():
+    import numpy as np
+
+    from sgl_jax.srt.managers.scheduler import Scheduler
+
+    req = request()
+    scheduler = lifecycle_harness(req)
+    scheduler.pd = None
+    scheduler.forward_ct = 0
+    scheduler.is_generation = scheduler.enable_overlap = True
+    scheduler.spec_algorithm = None
+    scheduler.page_size = 128
+    scheduler.server_args.enable_static_lora = False
+    scheduler._profile_batch_predicate = lambda _: None
+    scheduler._extract_dp_output_ids = lambda *_: None
+    events = []
+    sender = Mock(has_pending_failure=False)
+    sender.send_chunk.side_effect = lambda *a, **kw: events.append("send_chunk")
+    sender.poll.return_value = KVPoll.TRANSFERRING
+    scheduler.disagg_kv_manager.create_sender.return_value = sender
+
+    class Worker:
+        def get_precompile_paddings(self):
+            return [128], [1], [128]
+
+        def forward_batch_generation(self, batch, **kwargs):
+            events.append("launch")
+            return None, np.array([-1]), 0
+
+        def resolve_last_batch_result(self):
+            events.append("resolve")
+            return None, [42], 0
+
+    scheduler.tp_worker = Worker()
+    batch = scheduler.cur_batch
+    batch.return_logprob = False
+    batch.get_model_worker_batch = lambda *_: NS(bid=1)
+    snapshots = scheduler._snapshot_prefill_handoffs(batch)
+    scheduler._disagg_prefill_compute[id(req)] = 1
+    result = Scheduler.run_batch(scheduler, batch)
+    assert events == ["launch"]
+    scheduler._resolve_disagg_prefill_result(PendingPrefillResult(batch, result, snapshots))
+    assert events == ["launch", "resolve", "send_chunk"]
+    assert sender.send_chunk.call_args.args == (0, [7])
+    assert sender.send_chunk.call_args.kwargs["on_ready"] is None
+    assert req.start_send_idx == 128
+    scheduler._release_prefill_kv_pool.assert_not_called()
+    sender.poll.return_value = KVPoll.FAILED
+    scheduler.send_kv_chunk()
+    scheduler._release_prefill_kv_pool.assert_called_once_with(req)
