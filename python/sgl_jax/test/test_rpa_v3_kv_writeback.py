@@ -22,7 +22,7 @@ from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import
         ([(393, 0)], 256, None, None, None, 256, 256, False),
         ([(393, 0)], 256, 128, None, 2.0, 256, 256, False),
         ([(393, 0)], 128, 128, None, None, 256, 128, True),
-        ([(393, 273), (137, 512)], 128, 128, None, None, 256, 128, True),
+        ([(393, 273), (137, 512)], 128, 128, None, None, 256, 128, False),
         ([(416, 256)], 128, 128, 416, None, 256, 128, False),
         ([(1, 512), (1, 273)], 128, 128, None, None, 256, 128, False),
         ([(393, 0)], 128, None, None, None, 256, 128, False),
@@ -137,8 +137,9 @@ def test_kv_writeback(
     if not reuse_prefix:
         return
 
-    # Full attention must now consume the returned cache, including new KV
-    # outside the previous SWA window. These cases have room in each last page.
+    # Only cold-split checks subsequent consumption of the returned cache,
+    # including new KV outside the previous SWA window; this is not a
+    # service-level radix-cache reuse test. Its last page has room for decode.
     decode_kv = rng.integers(-4, 5, size=(32, 2, head_dim)).astype(np.float32)
     for i, old_len in enumerate(np.asarray(kv_lens)):
         assert old_len % page_size != 0
