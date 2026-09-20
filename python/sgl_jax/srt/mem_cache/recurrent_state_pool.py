@@ -52,6 +52,10 @@ class RecurrentStateDType:
     temporal: jnp.dtype
 
 
+LINEAR_CONV = "linear"
+SHORT_CONV = "short_conv"
+
+
 @dataclass(frozen=True)
 class ConvStateSpec:
     """[total_slots, channels, state_len]
@@ -89,7 +93,7 @@ def _conv_specs(
     Order is not meaningful. Consumers ask by name.
     """
     if conv_states is None:
-        return (ConvStateSpec("linear", layers, proj_size, conv_kernel_size - 1),)
+        return (ConvStateSpec(LINEAR_CONV, layers, proj_size, conv_kernel_size - 1),)
     return tuple(conv_states)
 
 
@@ -256,11 +260,11 @@ class RecurrentStatePool:
 
     def get_linear_conv_state(self, layer_id: int):
         """[total_slots, proj_size, K-1] -- the linear-attention conv."""
-        return self.get_conv_state(layer_id, "linear")
+        return self.get_conv_state(layer_id, LINEAR_CONV)
 
     def get_short_conv_state(self, layer_id: int):
         """[total_slots, C, state_len] -- the N-gram short conv's state."""
-        return self.get_conv_state(layer_id, "short_conv")
+        return self.get_conv_state(layer_id, SHORT_CONV)
 
     def get_conv_state(self, layer_id: int, name: str):
         """[total_slots, channels, state_len] for one named conv state."""
