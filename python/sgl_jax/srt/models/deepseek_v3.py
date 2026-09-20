@@ -920,9 +920,11 @@ class DeepseekV3ForCausalLM(nnx.Module):
             physical_to_logical_map = np.array(jax.device_get(metadata.physical_to_logical_map))
             phy_to_log = physical_to_logical_map[layer_idx]
 
-        is_int4_moe = is_int4_dtype(getattr(quant_config, "moe_weight_dtype", None))
-        weight_suffix = "weight_packed" if is_int4_moe else "weight"
-        scale_suffix = ".weight_scale" if is_int4_moe else ".weight_scale_inv"
+        is_static_int4_moe = is_static_quant and is_int4_dtype(
+            getattr(quant_config, "moe_weight_dtype", None)
+        )
+        weight_suffix = "weight_packed" if is_static_int4_moe else "weight"
+        scale_suffix = ".weight_scale" if is_static_int4_moe else ".weight_scale_inv"
 
         moe_mappings = create_moe_weights_mapping(
             prefix=prefix,
@@ -935,7 +937,7 @@ class DeepseekV3ForCausalLM(nnx.Module):
         )
         mappings.update(moe_mappings)
 
-        # Routed expert weight-scale sidecars (static FP8, non-fused only).
+        # Routed expert weight-scale sidecars (static FP8 / INT4, non-fused only).
         # Fused MoE static-FP8 placeholder shapes are (1,) today — loading
         # block scales would need a dedicated fix in fused_moe.py. Skip.
         #
@@ -951,17 +953,27 @@ class DeepseekV3ForCausalLM(nnx.Module):
                 if not wm.sources:
                     continue
                 target_base = wm.target_path
-                expert_scale_keys = [k.replace(".weight", ".weight_scale_inv") for k in wm.sources]
+                expert_scale_keys = [
+                    k.replace(f".{weight_suffix}", scale_suffix) for k in wm.sources
+                ]
                 scale_target = f"{target_base}_scale"
-                # Stacked checkpoint scale is `[E, out_blocks, in_blocks]`. Load
-                # replicated on the block dims; _maybe_convert_epmoe_scale_for_kernel
-                # expands via jnp.take, which fails if the gathered axis is
-                # tensor-sharded (ambiguous output sharding). The converter reshards
-                # to model_param.value.sharding at the end.
+                # Stacked checkpoint scale is `[E, out_blocks, in_blocks]`.
+                # For FP8 checkpoints, load replicated on the block dims so
+                # _maybe_convert_epmoe_scale_for_kernel's jnp.take avoids
+                # ambiguous sharding errors. For static INT4 checkpoints,
+                # shard directly along the partitioned dimension.
+                if is_static_int4_moe:
+                    scale_sharding = (
+                        ("expert", None, "tensor")
+                        if "wo" in target_base
+                        else ("expert", "tensor", None)
+                    )
+                else:
+                    scale_sharding = ("expert", None, None)
                 mappings[f"{scale_target}"] = WeightSpec(
                     target_path=scale_target,
                     sources=tuple(expert_scale_keys),
-                    sharding=("expert", None, None),
+                    sharding=scale_sharding,
                     transpose=False,
                     physical_to_logical_map=wm.physical_to_logical_map,
                 )

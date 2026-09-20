@@ -85,8 +85,14 @@ def main():
         )
 
     # 4. Apply Selective Quantization structure modifications on the abstract model
-    logger.info("Applying selective linear quantization (is_static_input=True) on abstract model...")
-    model = apply_linear_quantization(model_config, model, is_static_input=True)
+    if (
+        model_config.quantization_config is not None
+        and model_config.quantization_config.has_linear_quantization()
+    ):
+        logger.info(
+            "Applying selective linear quantization (is_static_input=True) on abstract model..."
+        )
+        model = apply_linear_quantization(model_config, model, is_static_input=True)
 
     logger.info("Applying MoE quantization (is_static_input=True) on abstract model...")
     model = apply_moe_quantization(model_config, model, is_static_input=True)
