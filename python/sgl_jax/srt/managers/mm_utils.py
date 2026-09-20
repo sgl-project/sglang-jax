@@ -133,9 +133,10 @@ def unwrap_shm_features(request):
             request,
             lambda value: value.materialize() if isinstance(value, ShmPointerMMData) else value,
         )
-    finally:
+    except BaseException:
         # Also release unvisited segments if materialization failed partway.
         discard_shm_features(request)
+        raise
 
 
 def send_mm_request(socket, request):
