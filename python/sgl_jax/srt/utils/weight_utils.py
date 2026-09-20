@@ -1928,7 +1928,7 @@ class WeightLoader:
         head_shardings = lm_head_load_shardings(
             self.model,
             self.mesh,
-            getattr(self.model_config.hf_config, "enable_dp_lm_head", False),
+            getattr(getattr(self.model_config, "hf_config", None), "enable_dp_lm_head", False),
         )
         weight_mappings = dict(weight_mappings)
         for key, mapping in weight_mappings.items():

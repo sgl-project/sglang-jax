@@ -261,3 +261,34 @@ def test_fused_greedy_consumers_keep_row_order_and_map_draft_vocab(mesh):
         np.testing.assert_array_equal(mapped, mapping_np[expected])
         assert raw.sharding.spec == P("data")
         assert mapped.sharding.spec == P("data")
+
+
+@pytest.mark.parametrize("dummy", [False, True])
+def test_multimodal_config_without_hf_config_loads_weights(tmp_path, dummy):
+    from safetensors.numpy import save_file
+
+    from sgl_jax.srt.configs.load_config import LoadConfig
+    from sgl_jax.srt.model_loader.loader import JAXModelLoader
+    from sgl_jax.srt.multimodal.configs.vaes.wan_vae_config import WanVAEConfig
+    from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
+
+    class Encoder(nnx.Module):
+        def __init__(self, config, dtype, mesh):
+            self.mesh = mesh
+            self.weight = nnx.Param(jnp.zeros((4, 4), dtype=dtype))
+
+        def load_weights(self, config):
+            WeightLoader(self, config, self.mesh, dtype=config.dtype).load_weights_from_safetensors(
+                {"weight": WeightMapping("weight", sharding=(None, None))}, dummy=dummy
+            )
+
+    original = np.arange(16, dtype=np.float32).reshape(4, 4)
+    save_file({"weight": original}, tmp_path / "model.safetensors")
+    config = WanVAEConfig(model_path=str(tmp_path), dtype=jnp.float32)
+    assert not hasattr(config, "hf_config")
+    mesh = Mesh(np.array(jax.devices()[:1]), ("encoder",))
+    model = JAXModelLoader(LoadConfig(), mesh)._get_model(Encoder, config)
+    np.testing.assert_array_equal(
+        np.asarray(model.weight.value), np.zeros_like(original) if dummy else original
+    )
+    assert model.weight.value.sharding.spec == P(None, None)

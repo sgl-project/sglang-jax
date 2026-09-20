@@ -319,7 +319,9 @@ class JAXModelLoader(DefaultModelLoader):
         from sgl_jax.srt.layers.lm_head_parallel import configure_lm_heads
 
         configure_lm_heads(
-            model, self.mesh, getattr(model_config.hf_config, "enable_dp_lm_head", False)
+            model,
+            self.mesh,
+            getattr(getattr(model_config, "hf_config", None), "enable_dp_lm_head", False),
         )
 
         print_parameter_shardings(model)
@@ -369,7 +371,9 @@ class JAXDummyModelLoader(BaseModelLoader):
         from sgl_jax.srt.layers.lm_head_parallel import configure_lm_heads
 
         configure_lm_heads(
-            model, self.mesh, getattr(model_config.hf_config, "enable_dp_lm_head", False)
+            model,
+            self.mesh,
+            getattr(getattr(model_config, "hf_config", None), "enable_dp_lm_head", False),
         )
 
         return model
