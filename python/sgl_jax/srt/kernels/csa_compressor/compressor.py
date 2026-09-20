@@ -986,6 +986,9 @@ def csa_compressor(
 ):
     """Dual CSA compression into caller-owned state and packed FP8 caches.
 
+    Initialize new/reassigned slots in both pools with KV=0 and scores=-inf.
+    Reuse returned state across prefill chunks and decode steps without resetting.
+
     Blocks are prepared by the backend: single tokens or aligned complete groups,
     ordered per request, with every real token covered exactly once. Metadata
     values are dynamic; block capacities/topology specialize the compiled program.
