@@ -40,6 +40,8 @@ FPS_MAX_FRAMES = 768
 _QWEN3VL_ARCHITECTURES = frozenset(
     {
         "Qwen3VLForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
     }
 )
 
@@ -231,6 +233,8 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         "Qwen2VLForConditionalGeneration",
         "Qwen2_5_VLForConditionalGeneration",
         "Qwen3VLForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
     )
 
     async def process_mm_data_async(
