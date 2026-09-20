@@ -57,6 +57,31 @@ def _manual_shard_map_for_pallas(
 
 
 class GateLogit(nnx.Module):
+    """MoE router gate: ``logits = score_func(hidden_states @ kernel)``.
+
+    Three dtypes are explicit and independent, so a model can match its
+    checkpoint without changing how the router computes:
+
+    - ``kernel_dtype``: storage dtype of the gate weight. Match the checkpoint's
+      native dtype: storing wider wastes read bandwidth every step (the gate is
+      read in full each decode step), storing narrower loses bits. Default
+      ``float32`` preserves the historical behaviour; models whose checkpoints
+      ship the gate in BF16 (GLM-5.2, DeepSeek V3-family, Kimi K2/K3, Qwen3-MoE
+      family) may opt into ``bfloat16``. MiMo ships FP32 and must stay FP32.
+    - ``compute_dtype``: dtype the router dot runs in. Both operands are cast to
+      it before a ``Precision.HIGHEST`` dot. Default ``float32`` preserves the
+      historical behaviour and Ling's ``router_dtype="fp32"`` semantics; it is
+      independent of ``kernel_dtype``, so BF16 storage still computes in f32.
+    - ``bias_dtype``: storage dtype of the optional expert correction bias.
+      ``None`` (default) falls back to ``weight_dtype``, which is what every
+      existing caller relied on; pass it explicitly to match the checkpoint
+      (F32 for the DeepSeek-family / GLM / Kimi-K bias, BF16 for Kimi-Linear).
+
+    ``weight_dtype`` is kept for backward compatibility: it only ever governed
+    the bias storage dtype (the kernel was always f32 before ``kernel_dtype``
+    existed) and is now the fallback for ``bias_dtype``.
+    """
+
     def __init__(
         self,
         input_size: int,
@@ -64,21 +89,22 @@ class GateLogit(nnx.Module):
         weight_dtype: jnp.dtype = jnp.bfloat16,
         enable_expert_bias: bool | None = False,
         kernel_dtype: jnp.dtype = jnp.float32,
+        compute_dtype: jnp.dtype = jnp.float32,
+        bias_dtype: jnp.dtype | None = None,
         score_func: str | None = "softmax",
     ):
         self.weight_dtype = weight_dtype
         self.enable_expert_bias = enable_expert_bias
         self.score_func = score_func
+        self.kernel_dtype = kernel_dtype
+        self.compute_dtype = compute_dtype
+        self.bias_dtype = weight_dtype if bias_dtype is None else bias_dtype
 
         self.kernel = nnx.Param(
             jax.random.normal(
                 jax.random.PRNGKey(0),
                 (input_size, num_experts),
-                # kernel_dtype should match the checkpoint's native gate dtype:
-                # storing wider than the checkpoint wastes read bandwidth, storing
-                # narrower loses bits. The f32 default preserves prior behavior;
-                # the upcast at use keeps HIGHEST-dot bits identical either way.
-                dtype=kernel_dtype,
+                dtype=self.kernel_dtype,
                 out_sharding=P(None, None),
             ),
         )
@@ -87,7 +113,7 @@ class GateLogit(nnx.Module):
                 jax.random.normal(
                     jax.random.PRNGKey(0),
                     (num_experts,),
-                    dtype=self.weight_dtype,
+                    dtype=self.bias_dtype,
                     out_sharding=P(None),
                 ),
             )
@@ -96,9 +122,12 @@ class GateLogit(nnx.Module):
 
     @named_scope
     def __call__(self, hidden_states: jax.Array) -> tuple[jax.Array, jax.Array | None]:
+        # XLA fuses the converts into the dot's operand reads, so a BF16-stored
+        # kernel computed in f32 reads half the bytes of an f32 kernel and yields
+        # the same HIGHEST-precision result.
         logits = jnp.dot(
-            hidden_states,
-            self.kernel.value.astype(jnp.float32),
+            hidden_states.astype(self.compute_dtype),
+            self.kernel.value.astype(self.compute_dtype),
             precision=jax.lax.Precision.HIGHEST,
         )
 
