@@ -13,6 +13,103 @@ from .ref import reference, update_window
 requires_tpu = pytest.mark.skipif(jax.default_backend() != "tpu", reason="requires TPU")
 
 
+@pytest.mark.parametrize("page_size", [16, 128])
+@pytest.mark.parametrize(
+    "lengths,prefixes,pad",
+    [
+        ((1,), (0,), 0),
+        ((1,), (127,), 0),
+        ((1,), (128,), 0),
+        ((1, 1, 1, 1), (0, 3, 2047, 8191), 3),
+        ((0, 1, 0, 1), (0, 4095, 2048, 8191), 4),
+        ((0, 0), (512, 8192), 2),
+    ],
+)
+@requires_tpu
+def test_sparsecore_decode(lengths, prefixes, pad, page_size):
+    args = make_case(lengths, prefixes, pad=pad, page_size=page_size)
+    # Missing pages and a poisoned dummy page must not contribute to attention.
+    args[-1].compressed_page_indices[1::2] = 0
+    actual, window = jax.tree.map(
+        np.asarray,
+        jax.block_until_ready(
+            csa_joint_attention(
+                *jax.tree.map(jnp.asarray, args),
+                scale=512**-0.5,
+                schedule=CSAAttentionSchedule(query_tile=1, decode=True),
+                window_size=128,
+                compression_ratio=4,
+                fp8_scale_block=64,
+                rows_per_group=4,
+            )
+        ),
+    )
+    assert_close(actual.astype(np.float32), reference(*args, scale=512**-0.5))
+    np.testing.assert_array_equal(
+        window.view(np.uint16),
+        update_window(args[1], args[2], args[-1], window_size=128).view(np.uint16),
+    )
+
+
+@pytest.mark.parametrize("count", [1, 127, 512, 2048])
+@requires_tpu
+def test_sparsecore_cache_gather(count):
+    from sgl_jax.srt.kernels.csa_attention.csa_attention import _gather_decode
+
+    rng = np.random.default_rng(count)
+    main = rng.integers(0, 256, (4, 128, 4, 128), dtype=np.uint8)
+    rope = rng.integers(0, 256, (4, 32, 4, 128), dtype=np.uint8)
+    indices = rng.integers(0, 512, count, dtype=np.int32)
+    actual_main, actual_rope = jax.tree.map(
+        np.asarray,
+        jax.block_until_ready(
+            jax.jit(_gather_decode)(jnp.asarray(main), jnp.asarray(rope), jnp.asarray(indices))
+        ),
+    )
+    rows = main.reshape(-1, 4, 128)[indices].astype(np.uint32)
+    expected_main = np.bitwise_or.reduce(
+        rows << (np.arange(4, dtype=np.uint32)[None, :, None] * 8), axis=1
+    )
+    rows = rope.reshape(-1, 128)[indices].astype(np.uint16)
+    np.testing.assert_array_equal(actual_main.view(np.uint32), expected_main)
+    np.testing.assert_array_equal(actual_rope, (rows[:, :64] << 8) | rows[:, 64:])
+
+
+@requires_tpu
+def test_sparsecore_payload_mutation(monkeypatch):
+    import importlib
+
+    module = importlib.import_module("sgl_jax.srt.kernels.csa_attention.csa_attention")
+    original = module._gather_decode
+
+    def broken(*args):
+        return tuple(jnp.zeros_like(value) for value in original(*args))
+
+    args = make_case((1,), (8191,))
+    jax.clear_caches()
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(module, "_gather_decode", broken)
+            actual, _ = jax.tree.map(
+                np.asarray,
+                jax.block_until_ready(
+                    csa_joint_attention(
+                        *jax.tree.map(jnp.asarray, args),
+                        scale=512**-0.5,
+                        schedule=CSAAttentionSchedule(query_tile=1, decode=True),
+                        window_size=128,
+                        compression_ratio=4,
+                        fp8_scale_block=64,
+                        rows_per_group=4,
+                    )
+                ),
+            )
+            with pytest.raises(AssertionError):
+                assert_close(actual.astype(np.float32), reference(*args, scale=512**-0.5))
+    finally:
+        jax.clear_caches()
+
+
 def assert_close(actual, expected):
     assert np.isfinite(actual).all() and np.isfinite(expected).all()
     np.testing.assert_allclose(actual, expected, rtol=2e-2, atol=1e-2)

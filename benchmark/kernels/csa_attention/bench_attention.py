@@ -153,6 +153,7 @@ def main():
             {
                 **vars(args),
                 "query_tile": schedule.query_tile,
+                "gather_backend": "sparsecore" if schedule.decode else "tensorcore",
                 "device": jax.devices()[0].device_kind,
                 "jax": jax.__version__,
                 "jaxlib": jaxlib.__version__,
