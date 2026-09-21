@@ -522,6 +522,8 @@ class Qwen2_5_VisionTransformer(nnx.Module):
     def _reorder(self, x: jax.Array, indices: jax.Array) -> jax.Array:
         """Gather within each device's lane, using lane-local unit indices."""
         spec = PartitionSpec(self.specs.batch_axis)
+        x = apply_data_sharding(x, self.mesh, spec)
+        indices = apply_data_sharding(indices, self.mesh, spec)
         return jax.shard_map(
             lambda values, order: values[order],
             mesh=self.mesh,
