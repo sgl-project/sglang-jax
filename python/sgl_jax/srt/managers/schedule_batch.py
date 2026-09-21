@@ -100,6 +100,16 @@ logger = logging.getLogger(__name__)
 
 
 @functools.cache
+def _decode_kv_ladder_min_bs() -> int:
+    """Batches smaller than this skip ladder steps below the small-batch floor."""
+    return int(os.environ.get("SGLANG_JAX_DECODE_KV_LADDER_MIN_BS", "0") or 0)
+
+
+def _decode_kv_ladder_smallbs_floor() -> int:
+    """Smallest ladder step (tokens) allowed for batches below the min bs."""
+    return int(os.environ.get("SGLANG_JAX_DECODE_KV_LADDER_SMALLBS_FLOOR", "4096") or 0)
+
+
 def _decode_kv_ladder_steps(page_size: int) -> tuple[int, ...]:
     """Optional per-request KV capacity ladder for decode cache_loc sizing.
 
@@ -2440,7 +2450,19 @@ class ScheduleBatch:
                     if info.seq_lens is not None and len(info.seq_lens) > 0:
                         max_kv_len = max(max_kv_len, int(np.max(info.seq_lens)))
                 padded_bs = bs_paddings[bs_index]
+                # Small-batch floor: below SGLANG_JAX_DECODE_KV_LADDER_MIN_BS
+                # requests the finer ladder steps are skipped (bs1 at the
+                # 2048 step ran +0.16 ms/step slower than at 4096 -- the sparse
+                # attend kernel degrades below 2 kv blocks), while T>=MIN_BS
+                # batches take the full ladder (cc64 1k/1k +4.2%).
+                floor_step = (
+                    _decode_kv_ladder_smallbs_floor()
+                    if padded_bs < _decode_kv_ladder_min_bs()
+                    else 0
+                )
                 for step in ladder:
+                    if step < floor_step:
+                        continue
                     if max_kv_len <= step and padded_bs * step < total_cache_loc_size:
                         total_cache_loc_size = padded_bs * step
                         break
