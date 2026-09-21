@@ -412,7 +412,8 @@ def test_no_tracking_preserves_state_trajectories_and_empty_slots(monkeypatch, d
         has_initial = has_initial.at[:4].set(True)
 
 
-def test_no_tracking_all_empty_batch_resets_only_fresh_nondummy_slots(monkeypatch):
+@pytest.mark.parametrize("fresh_slots", [(), (1,), (1, 2)])
+def test_no_tracking_all_empty_batch_resets_only_fresh_nondummy_slots(monkeypatch, fresh_slots):
     monkeypatch.setattr(adapter, "_fused_chunk_parallel_kernel", _stateful_vendor)
     inputs = _inputs()
 
@@ -423,11 +424,11 @@ def test_no_tracking_all_empty_batch_resets_only_fresh_nondummy_slots(monkeypatc
             conv,
             recurrent,
             *inputs[5:8],
-            jnp.zeros((5,), dtype=jnp.int32),
-            jnp.asarray([1, 2, 0, 0], dtype=jnp.int32),
+            jnp.zeros((6,), dtype=jnp.int32),
+            jnp.asarray([1, 2, 3, 0, 0], dtype=jnp.int32),
             None,
-            jnp.asarray([False, True, False, False]),
-            jnp.asarray([4, 4, 0, 0], dtype=jnp.int32),
+            jnp.asarray([1 not in fresh_slots, 2 not in fresh_slots, True, False, False]),
+            jnp.asarray([4, 4, 4, 0, 0], dtype=jnp.int32),
             n_kq=N_KQ,
             n_v=N_V,
             d_k=D_K,
@@ -437,9 +438,10 @@ def test_no_tracking_all_empty_batch_resets_only_fresh_nondummy_slots(monkeypatc
 
     _, conv, recurrent = run(inputs[3], inputs[4])
     for actual, original in zip((conv, recurrent), inputs[3:5], strict=True):
-        np.testing.assert_array_equal(actual[0], original[0])
-        np.testing.assert_array_equal(actual[1], 0)
-        np.testing.assert_array_equal(actual[2:], original[2:])
+        expected = np.asarray(original).copy()
+        for slot in fresh_slots:
+            expected[slot] = 0
+        np.testing.assert_array_equal(actual, expected)
 
 
 @pytest.mark.parametrize(

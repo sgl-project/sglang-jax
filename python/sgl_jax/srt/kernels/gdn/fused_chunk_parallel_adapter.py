@@ -316,14 +316,26 @@ def _fused_chunk_parallel_prefill_local(
 
     if track_indices is None:
         # Empty sequences have no kernel tiles, but a fresh request must still
-        # reset its slot. Drop all other updates without gathering the old pool.
-        empty_indices = jnp.where(
-            (query_lens == 0) & ~has_initial_state & (state_indices != 0),
-            state_indices,
-            recurrent_state.shape[0],
+        # reset its slot. Compact only metadata and visit the selected slots:
+        # a batched scatter of scalar zero materializes a batch-sized state
+        # tensor on TPU even when every update is dropped.
+        reset_mask = (query_lens == 0) & ~has_initial_state & (state_indices != 0)
+        reset_rows = jnp.nonzero(reset_mask, size=state_indices.size)[0]
+
+        def reset_empty_slot(i, states):
+            conv, recurrent = states
+            slot = state_indices[reset_rows[i]]
+            return (
+                conv.at[slot].set(0, mode="drop"),
+                recurrent.at[slot].set(0, mode="drop"),
+            )
+
+        new_conv_state, new_recurrent_state = jax.lax.fori_loop(
+            0,
+            reset_mask.sum(dtype=jnp.int32),
+            reset_empty_slot,
+            (kernel_conv_result.swapaxes(-1, -2), kernel_recurrent_result),
         )
-        new_conv_state = kernel_conv_result.swapaxes(-1, -2).at[empty_indices].set(0, mode="drop")
-        new_recurrent_state = kernel_recurrent_result.at[empty_indices].set(0, mode="drop")
         # Precompile can give dummy requests tokens. Save/restore only slot 0;
         # keeping the original full pool alive here defeats the kernel alias.
         new_conv_state = new_conv_state.at[0].set(dummy_conv)
