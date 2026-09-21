@@ -1483,7 +1483,7 @@ class ServerArgs:
             type=int,
             nargs="+",
             default=ServerArgs.precompile_vision_patch_paddings,
-            help="JIT buckets for the vision encoder patch dimension.",
+            help="Vision warmup patch counts, rounded up to power-of-two merge-unit counts.",
         )
         parser.add_argument(
             "--vision-encoder-parallel",

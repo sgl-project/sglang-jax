@@ -53,9 +53,11 @@ from sgl_jax.srt.models.qwen3_vl import (
     Qwen3VLForConditionalGeneration,
     Qwen3VLVisionModel,
 )
-from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
+from sgl_jax.srt.multimodal.in_model.interface import (
+    InModelMultimodalContract,
+    VisionInputSpec,
+)
 from sgl_jax.srt.multimodal.layers.vision_sharding import resolve_encoder_tp
-from sgl_jax.srt.utils.common_utils import resolve_vision_patch_buckets
 from sgl_jax.srt.utils.weight_utils import WeightMapping
 
 logger = logging.getLogger(__name__)
@@ -598,11 +600,6 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
     get_video_feature = Qwen3VLForConditionalGeneration.get_video_feature
     _get_visual_feature = Qwen3VLForConditionalGeneration._get_visual_feature
 
-    def get_multimodal_embedding_packed_capacities(self):
-        if self.visual is None:
-            return ()
-        return Qwen3VLForConditionalGeneration.get_multimodal_embedding_packed_capacities(self)
-
     def get_multimodal_encode_funcs(self):
         if self.visual is None:
             return {}
@@ -610,10 +607,6 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
 
     def get_input_embeddings(self):
         return self.language_model.model.embed_tokens
-
-    def precompile_multimodal(self):
-        if self.visual is not None:
-            self.visual.precompile()
 
     def __init__(
         self,
@@ -634,11 +627,10 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
                 dtype,
                 mesh=mesh,
                 tp=encoder_tp,
-                input_buckets=tuple(
-                    resolve_vision_patch_buckets(
-                        getattr(config, "precompile_vision_patch_paddings", None)
-                    )
-                ),
+            )
+            self.vision_input_spec = VisionInputSpec(
+                patch_dim=self.visual.patch_dim,
+                spatial_merge_size=int(config.vision_config.spatial_merge_size),
             )
         else:
             self.visual = None

@@ -54,7 +54,12 @@ from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.multimodal.common.modality_enum import MultimodalInputs
-from sgl_jax.srt.multimodal.in_model.host_orchestration import build_multimodal_batch
+from sgl_jax.srt.multimodal.in_model.embedding_pool import EmbeddingPool
+from sgl_jax.srt.multimodal.in_model.host_orchestration import (
+    MultimodalBatch,
+    build_multimodal_batch,
+)
+from sgl_jax.srt.multimodal.in_model.lane_packing import encoder_num_lanes
 from sgl_jax.srt.precision_tracer import (
     PrecisionTracerRequestMetadata,
     precision_tracer,
@@ -82,7 +87,6 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "enable_deterministic_sampling",
     "pd_disaggregation",
     "precompile_vision_patch_paddings",
-    "vision_encoder_parallel",
 ]
 
 
@@ -862,6 +866,9 @@ class ScheduleBatch:
 
     # Memory pool and cache (shared across all DP ranks)
     req_to_token_pool: ReqToTokenPool = None
+
+    embedding_pool: EmbeddingPool | None = None
+
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
     tree_cache: BasePrefixCache = None
     is_hybrid: bool = False
@@ -935,6 +942,7 @@ class ScheduleBatch:
             list[Req | None] | None
         ) = None,  # Per-DP chunked requests: list of length dp_size
         mesh: mesh_lib.Mesh = None,
+        embedding_pool: EmbeddingPool | None = None,
     ):
         # Validate input
         assert len(reqs) == dp_size, f"reqs length {len(reqs)} != dp_size {dp_size}"
@@ -972,6 +980,7 @@ class ScheduleBatch:
         return cls(
             reqs_info=reqs_info,
             req_to_token_pool=req_to_token_pool,
+            embedding_pool=embedding_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
             is_hybrid=is_hybrid,
@@ -3218,6 +3227,11 @@ class ScheduleBatch:
                 self.dp_size,
                 self.model_config,
                 per_dp_token_padding,
+                embedding_pool=self.embedding_pool,
+                num_encoder_lanes=encoder_num_lanes(
+                    self.mesh,
+                    tensor_parallel=self.model_config.hf_config.vision_encoder_parallel == "tp",
+                ),
             )
         else:
             multimodal_batch = None
@@ -3758,8 +3772,10 @@ class ModelWorkerBatch:
 
     input_embedding: np.ndarray | None = None
 
-    multimodal_batch: object | None = None
+    multimodal_batch: MultimodalBatch | None = None
+
     apply_for_deepstack: bool = False
+
     deepstack_visual_embedding: np.ndarray | None = None
 
     # MRoPE position information [3, total_tokens]

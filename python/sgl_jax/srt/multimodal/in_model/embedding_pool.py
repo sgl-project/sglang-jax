@@ -19,7 +19,6 @@ is updated in place (eager ``.at[].set`` would copy the whole pool per write).
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
@@ -112,38 +111,29 @@ class EmbeddingPool:
         return replicate_across_mesh(value, self.mesh)
 
     # -- allocation --------------------------------------------------------
-    def _pages_for(self, length: int) -> int:
-        return (length + self.page_size - 1) // self.page_size
-
-    def _alloc(self, n_pages: int) -> np.ndarray | None:
-        """Reserve ``n_pages`` pages, evicting LRU entries under pressure."""
-        while len(self._free_pages) < n_pages and self._entries:
-            _, evicted = self._entries.popitem(last=False)
-            self._free_pages = np.concatenate([self._free_pages, evicted.page_ids])
-        if len(self._free_pages) < n_pages:
-            return None
-        out = self._free_pages[:n_pages].copy()
-        self._free_pages = self._free_pages[n_pages:]
-        return out
-
-    def _reserve(self, item_hash: int, n_pages: int) -> np.ndarray | None:
-        """Drop any prior entry for ``item_hash`` and reserve ``n_pages`` fresh pages.
-
-        The ``n_pages > num_pages`` guard fails fast *before* eviction, so an item
-        too large for the whole pool never flushes the resident entries.
-        """
+    def _reserve(self, item_hash: int, length: int) -> EmbeddingPoolEntry | None:
+        """Replace an item and allocate its pages, evicting LRU entries."""
+        n_pages = (length + self.page_size - 1) // self.page_size
         if n_pages > self.num_pages:
             return None
         previous = self._entries.pop(item_hash, None)
         if previous is not None:
             self._free_pages = np.concatenate([self._free_pages, previous.page_ids])
-        return self._alloc(n_pages)
 
-    def _slots(self, page_ids: np.ndarray) -> np.ndarray:
-        """Flat row indices covered by ``page_ids`` (page-aligned)."""
-        return (page_ids[:, None] * self.page_size + np.arange(self.page_size)).reshape(-1)
+        while len(self._free_pages) < n_pages:
+            _, entry = self._entries.popitem(last=False)
+            self._free_pages = np.concatenate([self._free_pages, entry.page_ids])
+
+        entry = EmbeddingPoolEntry(self._free_pages[:n_pages].copy(), length)
+        self._free_pages = self._free_pages[n_pages:]
+        self._entries[item_hash] = entry
+        return entry
 
     # -- public API --------------------------------------------------------
+    def contains(self, item_hash: int) -> bool:
+        """Read-only scheduling hint; forward must recheck before using the cache."""
+        return item_hash in self._entries
+
     def lookup(self, item_hash: int) -> EmbeddingPoolEntry | None:
         """Return the entry for ``item_hash`` (moved to MRU) or ``None``."""
         entry = self._entries.pop(item_hash, None)
@@ -153,16 +143,15 @@ class EmbeddingPool:
 
     def write_packed(
         self,
-        item_hashes: Sequence[int],
+        item_hashes: list[int],
         packed_embeddings: ArrayLike,
-        lengths: Sequence[int],
+        lengths: list[int],
         *,
-        write_mask: Sequence[bool] | None = None,
-    ) -> tuple[EmbeddingPoolEntry | None, ...]:
+        write_mask: list[bool] | None = None,
+    ) -> list[EmbeddingPoolEntry | None]:
         """Cache one padded encoder output whose items are packed in input order."""
-        item_hashes = tuple(map(int, item_hashes))
-        lengths = tuple(map(int, lengths))
-        write_mask = (True,) * len(lengths) if write_mask is None else tuple(map(bool, write_mask))
+        if write_mask is None:
+            write_mask = [True] * len(lengths)
         if len(item_hashes) != len(lengths):
             raise ValueError(f"item/length count mismatch: {len(item_hashes)} != {len(lengths)}")
         if len(write_mask) != len(lengths):
@@ -178,35 +167,33 @@ class EmbeddingPool:
         if any(length < 0 for length in lengths) or sum(lengths) > capacity:
             raise ValueError(f"invalid item lengths {lengths} for capacity {capacity}")
 
-        planned: list[tuple[int, EmbeddingPoolEntry, int, int] | None] = []
-        offset = 0
-        for item_hash, length, should_write in zip(item_hashes, lengths, write_mask, strict=True):
-            page_ids = self._reserve(item_hash, self._pages_for(length)) if should_write else None
-            if page_ids is None:
-                planned.append(None)
-            else:
-                entry = EmbeddingPoolEntry(page_ids, length)
-                self._entries[item_hash] = entry
-                planned.append((item_hash, entry, offset, length))
-            offset += length
+        results = [
+            self._reserve(int(item_hash), int(length)) if should_write else None
+            for item_hash, length, should_write in zip(
+                item_hashes, lengths, write_mask, strict=True
+            )
+        ]
 
+        # Later allocations can evict or replace earlier items in this same batch.
+        # Build slots only after all placements are final.
         slots = np.full(capacity, -1, dtype=np.int32)
-        results: list[EmbeddingPoolEntry | None] = []
-        for plan in planned:
-            if plan is None:
-                results.append(None)
-                continue
-            item_hash, entry, offset, length = plan
-            if self._entries.get(item_hash) is not entry:
-                results.append(None)
-                continue
-            slots[offset : offset + length] = self._slots(entry.page_ids)[:length]
-            results.append(entry)
+        offset = 0
+        for i, (item_hash, length, entry) in enumerate(
+            zip(item_hashes, lengths, results, strict=True)
+        ):
+            if entry is not None and self._entries.get(int(item_hash)) is entry:
+                rows = np.arange(entry.length, dtype=np.int32)
+                slots[offset : offset + length] = (
+                    entry.page_ids[rows // self.page_size] * self.page_size + rows % self.page_size
+                )
+            else:
+                results[i] = None
+            offset += length
 
         if any(entry is not None and entry.length for entry in results):
             slots = self._replicate(slots)
             self._pages = _scatter_rows(self._pages, slots, packed_embeddings)
-        return tuple(results)
+        return results
 
     def precompile_packed_write(self, capacity: int) -> None:
         """Compile the packed writer for one encoder bucket without changing LRU state."""

@@ -337,7 +337,9 @@ class ModelWorker:
             prepare_lora,
             future_token_ids_map,
         )
-        if only == "extend":
+        if only == "encode":
+            self.compilation_manager._precompile_encode(self.model_runner)
+        elif only == "extend":
             self.compilation_manager._precompile_extend(*args)
         elif only == "decode":
             self.compilation_manager._precompile_decode(*args)
@@ -438,6 +440,9 @@ class ModelWorker:
             self.model_runner.token_to_kv_pool_allocator,
         )
 
+    def get_embedding_pool(self):
+        return self.model_runner.embedding_pool
+
     def _update_grammar_vocab_mask(
         self, batch: ModelWorkerBatch, sampling_metadata: SamplingMetadata
     ):
@@ -535,6 +540,7 @@ class ModelWorker:
         logits_output, cache_miss_count, layers_topk_ids = self.model_runner.forward(
             forward_batch,
             logits_metadata=logits_metadata,
+            multimodal_batch=model_worker_batch.multimodal_batch,
         )
 
         self.dump_topk_ids(layers_topk_ids, model_worker_batch)
@@ -793,6 +799,9 @@ class MockModelWorker:
 
     def get_memory_pool(self):
         return (self.model_runner.req_to_token_pool, self.model_runner.token_to_kv_pool)
+
+    def get_embedding_pool(self):
+        return self.model_runner.embedding_pool
 
     def forward_batch_generation(
         self,

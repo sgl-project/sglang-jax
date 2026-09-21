@@ -443,7 +443,7 @@ class TestDummyBatch(unittest.TestCase):
         batch = cm._make_dummy_batch(32, 128, ForwardMode.EXTEND, 512)
         assert batch.capture_hidden_mode == CaptureHiddenMode.FULL
 
-    def test_precompile_extend_uses_one_unified_multimodal_signature(self):
+    def test_precompile_extend_leaves_multimodal_embedding_to_forward(self):
         cm = CompilationManager(
             server_args=_make_server_args(
                 precompile_token_paddings=[4],
@@ -459,8 +459,6 @@ class TestDummyBatch(unittest.TestCase):
             precompile_in_model_multimodal=True,
         )
         model_runner = MagicMock()
-        input_embedding = object()
-        deepstack = object()
         calls = []
 
         def forward_fn(batch, **kwargs):
@@ -484,11 +482,6 @@ class TestDummyBatch(unittest.TestCase):
         with (
             patch.object(ForwardBatch, "init_new", return_value=forward_batch),
             patch.object(
-                host_orchestration,
-                "precompile_multimodal_inputs",
-                return_value=(input_embedding, deepstack, True),
-            ) as precompile_multimodal_inputs,
-            patch.object(
                 SamplingMetadata,
                 "from_model_worker_batch",
                 return_value=MagicMock(),
@@ -502,16 +495,10 @@ class TestDummyBatch(unittest.TestCase):
                 future_token_ids_map=None,
             )
 
-        assert calls == [(input_embedding, deepstack, True, False)]
+        assert calls == [(None, None, False, False)]
         assert cm._compiled_variants == {(ForwardMode.EXTEND, 4, 2, False)}
-        assert cm._compiled_multimodal_extend_shapes == {(4, 2)}
-        precompile_multimodal_inputs.assert_called_once_with(
-            forward_batch.input_ids,
-            model_runner.model,
-            model_runner.embedding_pool,
-        )
 
-    def test_precompile_all_warms_multimodal_encoder_between_model_modes(self):
+    def test_precompile_all_warms_multimodal_encoder_before_model_modes(self):
         cm = CompilationManager(
             server_args=_make_server_args(),
             max_padded_batch_size=2,
@@ -525,18 +512,29 @@ class TestDummyBatch(unittest.TestCase):
         )
         events = []
         model_runner = MagicMock()
-        model_runner.model.precompile_multimodal.side_effect = lambda: events.append("vision")
-        model_runner.model.get_multimodal_embedding_packed_capacities.return_value = (6, 10)
+        model_runner.mesh = None
+        model_runner.model_config.hf_config = SimpleNamespace(
+            vision_encoder_parallel="dp", precompile_vision_patch_paddings=[4, 8]
+        )
         with (
+            patch.object(
+                host_orchestration,
+                "precompile_multimodal_encoder",
+                side_effect=lambda *args, **kwargs: events.append("vision"),
+            ) as precompile_encoder,
             patch.object(cm, "_precompile_extend", side_effect=lambda *_: events.append("extend")),
             patch.object(cm, "_precompile_decode", side_effect=lambda *_: events.append("decode")),
         ):
             cm.precompile_all(MagicMock(), model_runner, MagicMock())
 
-        assert events == ["extend", "vision", "decode"]
-        assert [
-            call.args for call in model_runner.embedding_pool.precompile_packed_write.call_args_list
-        ] == [(6,), (10,)]
+        assert events == ["vision", "extend", "decode"]
+        precompile_encoder.assert_called_once_with(
+            model_runner.model,
+            model_runner.embedding_pool,
+            [4],
+            num_lanes=1,
+            patch_paddings=[4, 8],
+        )
 
     def test_invalid_cache_loc_raises(self):
         with self.assertRaises(ValueError):
