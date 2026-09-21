@@ -392,6 +392,7 @@ suites = {
             "python/sgl_jax/test/multimodal/test_kimi_k25_weight_mapping.py",
             0.2,
             runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "8"},
         ),
         TestFile(
             "python/sgl_jax/test/multimodal/test_stage_config_routing.py",
