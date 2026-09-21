@@ -258,6 +258,207 @@ def test_adapter_converts_layout_metadata_and_preserves_pool_contract():
     np.testing.assert_array_equal(new_recurrent[7], recurrent_state[7])
 
 
+def test_no_tracking_preserves_recurrent_pool_until_kernel(monkeypatch):
+    inputs = _inputs()
+
+    def vendor(qkv, b, a, conv_state, recurrent_state, *args, **kwargs):
+        # Reset requests must be encoded in metadata, not a modified pool.
+        # Eager optimization_barrier may return a new Python array object;
+        # actual copy elimination is checked by the real-TPU HLO benchmark.
+        np.testing.assert_array_equal(recurrent_state, inputs[4])
+        return (conv_state, recurrent_state), jnp.zeros((qkv.shape[0], N_V * D_V))
+
+    monkeypatch.setattr(adapter, "_fused_chunk_parallel_kernel", vendor)
+    adapter._fused_chunk_parallel_prefill_local(
+        *inputs[:10],
+        None,
+        *inputs[10:],
+        n_kq=N_KQ,
+        n_v=N_V,
+        d_k=D_K,
+        d_v=D_V,
+        kernel_size=KERNEL_SIZE,
+    )
+
+
+def _stateful_vendor(
+    qkv,
+    b,
+    a,
+    conv,
+    recurrent,
+    weight,
+    bias,
+    a_log,
+    dt_bias,
+    cu_seqlens,
+    indices,
+    distribution,
+    seq_lens,
+    **kwargs,
+):
+    """CPU stand-in for the TPU ABI, not for GDN numerical correctness.
+
+    Like PER_SEQ metadata and state DMA, skip empty sequences, initialize
+    from seq_lens, and update only indexed slots. Slot 0 is writable here.
+    """
+    query_lens = jnp.diff(cu_seqlens)
+    output = jnp.zeros((qkv.shape[0], N_V * D_V), dtype=qkv.dtype)
+    for row in range(indices.size):
+        idx = indices[row]
+        resume = seq_lens[row] > query_lens[row]
+        next_conv = jnp.where(resume, conv[idx], 0) + row + 1
+        next_recurrent = jnp.where(resume, recurrent[idx], 0) + 10 * (row + 1)
+        conv = conv.at[idx].set(jnp.where(query_lens[row] > 0, next_conv, conv[idx]))
+        recurrent = recurrent.at[idx].set(
+            jnp.where(query_lens[row] > 0, next_recurrent, recurrent[idx])
+        )
+        token_mask = (jnp.arange(qkv.shape[0]) >= cu_seqlens[row]) & (
+            jnp.arange(qkv.shape[0]) < cu_seqlens[row + 1]
+        )
+        output = jnp.where(token_mask[:, None], next_recurrent.reshape(1, -1), output)
+    return (conv, recurrent), output
+
+
+def test_no_tracking_handles_eager_kernel_donation(monkeypatch):
+    inputs = _inputs()
+    original_conv, original_recurrent = (np.asarray(pool).copy() for pool in inputs[3:5])
+    # The real vendor is itself jitted with both state arguments donated.
+    monkeypatch.setattr(
+        adapter,
+        "_fused_chunk_parallel_kernel",
+        jax.jit(_stateful_vendor, donate_argnums=(3, 4)),
+    )
+    _, conv, recurrent = adapter._fused_chunk_parallel_prefill_local(
+        *inputs[:10],
+        None,
+        *inputs[10:],
+        n_kq=N_KQ,
+        n_v=N_V,
+        d_k=D_K,
+        d_v=D_V,
+        kernel_size=KERNEL_SIZE,
+    )
+    for result, original in zip(
+        (conv, recurrent), (original_conv, original_recurrent), strict=True
+    ):
+        np.testing.assert_array_equal(result[0], original[0])
+        np.testing.assert_array_equal(result[3:], original[3:])
+    np.testing.assert_array_equal(recurrent[1], 10)
+    np.testing.assert_array_equal(recurrent[2], original_recurrent[2] + 20)
+
+
+@pytest.mark.parametrize("donate", [False, True])
+@pytest.mark.parametrize("snapshots", [False, True])
+def test_no_tracking_preserves_state_trajectories_and_empty_slots(monkeypatch, donate, snapshots):
+    monkeypatch.setattr(adapter, "_fused_chunk_parallel_kernel", _stateful_vendor)
+    inputs = _inputs()
+    # Fresh/resumed nonempty, fresh/resumed empty, and duplicate dummy slots.
+    # The first dummy has a token, as in startup precompile; the second is empty.
+    cu_seqlens = jnp.asarray([0, 1, 2, 2, 2, 3, 3], dtype=jnp.int32)
+    indices = jnp.asarray([1, 2, 3, 4, 0, 0], dtype=jnp.int32)
+    has_initial = jnp.asarray([False, True, False, True, False, False])
+    # A fresh slot may have a positive prefix length in the kernel metadata;
+    # the explicit has_initial flag must still prevent reading stale state.
+    seq_lens = jnp.asarray([9, 9, 8, 8, 1, 0], dtype=jnp.int32)
+
+    def run(conv, recurrent, initial, track_indices):
+        return adapter._fused_chunk_parallel_prefill_local(
+            *inputs[:3],
+            conv,
+            recurrent,
+            *inputs[5:8],
+            cu_seqlens,
+            indices,
+            track_indices,
+            initial,
+            seq_lens,
+            n_kq=N_KQ,
+            n_v=N_V,
+            d_k=D_K,
+            d_v=D_V,
+            kernel_size=KERNEL_SIZE,
+        )
+
+    candidate = jax.jit(
+        run,
+        donate_argnums=(0, 1) if donate else (),
+    )
+    baseline = jax.jit(
+        run,
+        donate_argnums=(0, 1) if donate else (),
+    )
+    original_conv, original_recurrent = np.asarray(inputs[3]), np.asarray(inputs[4])
+    actual_pools = (jnp.array(original_conv), jnp.array(original_recurrent))
+    expected_pools = (jnp.array(original_conv), jnp.array(original_recurrent))
+    saved_snapshot = None
+    for step in range(4):
+        track = jnp.asarray([5, 6, 0, 0, 0, 0]) if snapshots and step == 1 else None
+        if step == 3:
+            # Reuse an occupied slot for a new request after continuation.
+            has_initial = has_initial.at[0].set(False)
+        actual = jax.block_until_ready(candidate(*actual_pools, has_initial, track))
+        expected = jax.block_until_ready(
+            baseline(
+                *expected_pools, has_initial, jnp.zeros_like(indices) if track is None else track
+            )
+        )
+        for result, reference in zip(actual, expected, strict=True):
+            np.testing.assert_array_equal(result, reference)
+        for pool, original in zip(actual[1:], (original_conv, original_recurrent), strict=True):
+            np.testing.assert_array_equal(pool[0], original[0])
+            np.testing.assert_array_equal(pool[3], 0)
+            np.testing.assert_array_equal(pool[4], original[4])
+            np.testing.assert_array_equal(pool[7], original[7])
+        if step in (0, 3):
+            np.testing.assert_array_equal(actual[1][1], 1)
+            np.testing.assert_array_equal(actual[2][1], 10)
+        if step == 0:
+            np.testing.assert_array_equal(actual[2][2], original_recurrent[2] + 20)
+        if track is not None:
+            for pool in actual[1:]:
+                np.testing.assert_array_equal(pool[5:7], pool[1:3])
+            saved_snapshot = tuple(np.asarray(pool[5:7]).copy() for pool in actual[1:])
+        elif saved_snapshot is not None:
+            for pool, checkpoint in zip(actual[1:], saved_snapshot, strict=True):
+                np.testing.assert_array_equal(pool[5:7], checkpoint)
+        else:
+            np.testing.assert_array_equal(actual[1][5:7], original_conv[5:7])
+            np.testing.assert_array_equal(actual[2][5:7], original_recurrent[5:7])
+        actual_pools, expected_pools = actual[1:], expected[1:]
+        has_initial = has_initial.at[:4].set(True)
+
+
+def test_no_tracking_all_empty_batch_resets_only_fresh_nondummy_slots(monkeypatch):
+    monkeypatch.setattr(adapter, "_fused_chunk_parallel_kernel", _stateful_vendor)
+    inputs = _inputs()
+
+    @jax.jit
+    def run(conv, recurrent):
+        return adapter._fused_chunk_parallel_prefill_local(
+            *inputs[:3],
+            conv,
+            recurrent,
+            *inputs[5:8],
+            jnp.zeros((5,), dtype=jnp.int32),
+            jnp.asarray([1, 2, 0, 0], dtype=jnp.int32),
+            None,
+            jnp.asarray([False, True, False, False]),
+            jnp.asarray([4, 4, 0, 0], dtype=jnp.int32),
+            n_kq=N_KQ,
+            n_v=N_V,
+            d_k=D_K,
+            d_v=D_V,
+            kernel_size=KERNEL_SIZE,
+        )
+
+    _, conv, recurrent = run(inputs[3], inputs[4])
+    for actual, original in zip((conv, recurrent), inputs[3:5], strict=True):
+        np.testing.assert_array_equal(actual[0], original[0])
+        np.testing.assert_array_equal(actual[1], 0)
+        np.testing.assert_array_equal(actual[2:], original[2:])
+
+
 @pytest.mark.parametrize(
     ("track_indices", "match"),
     [
