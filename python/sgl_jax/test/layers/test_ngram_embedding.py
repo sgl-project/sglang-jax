@@ -480,8 +480,8 @@ class TestNGramEmbeddingLayer(CustomTestCase):
         np.testing.assert_allclose(np.asarray(y_d), np.asarray(y_e), atol=ATOL, rtol=RTOL)
         np.testing.assert_allclose(np.asarray(s_d), np.asarray(s_e), atol=ATOL, rtol=RTOL)
 
-    def test_extend_adds_into_the_residual_stream(self):
-        """A zero conv weight leaves output = hyper_input + gated, exactly."""
+    def test_extend_and_decode_return_only_the_ple_delta(self):
+        """A zero conv weight leaves only the gated value for the caller to add."""
         mesh = _make_mesh()
         rng = np.random.default_rng(SEED)
         layer, _ = _make_layer(mesh, rng)
@@ -494,7 +494,7 @@ class TestNGramEmbeddingLayer(CustomTestCase):
         hyper = jnp.asarray(rng.standard_normal((4, HYPER_SIZE)).astype(np.float32))
         emb = jnp.asarray(rng.standard_normal((4, PLE_EMBED_DIM)).astype(np.float32))
         pool = _put(
-            np.zeros((3, HYPER_SIZE, CONV_STATE_LEN), np.float32),
+            np.zeros((5, HYPER_SIZE, CONV_STATE_LEN), np.float32),
             mesh,
             P("data", "tensor", None),
         )
@@ -508,8 +508,16 @@ class TestNGramEmbeddingLayer(CustomTestCase):
                 _put(np.array([0, 4], np.int32), mesh, P("data")),
                 _put(np.array([False]), mesh, P("data")),
             )
+            decode_out, _ = layer.forward_decode(
+                hyper,
+                emb,
+                pool,
+                _put(np.array([1, 2, 3, 4], np.int32), mesh, P("data")),
+                _put(np.zeros(4, bool), mesh, P("data")),
+            )
         # SiLU(0) == 0, so the conv contributes nothing.
-        np.testing.assert_allclose(np.asarray(out), np.asarray(hyper + gated), atol=ATOL, rtol=RTOL)
+        np.testing.assert_allclose(np.asarray(out), np.asarray(gated), atol=ATOL, rtol=RTOL)
+        np.testing.assert_allclose(np.asarray(decode_out), np.asarray(gated), atol=ATOL, rtol=RTOL)
 
 
 class TestNGramContextRow(CustomTestCase):

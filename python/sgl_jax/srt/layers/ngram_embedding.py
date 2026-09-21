@@ -283,8 +283,8 @@ def compute_ngram_ids(
 
 
 class NGramEmbedding(nnx.Module):
-    """Gate, dilated short conv, injection. Lookup happens on the host; the
-    caller passes its result as ``ple_embeddings``.
+    """Gate and dilated short conv. Return only the PLE delta; Lookup happens on the host;
+    the caller passes its result as ``ple_embeddings``.
 
     Checkpoint weights::
 
@@ -450,7 +450,7 @@ class NGramEmbedding(nnx.Module):
             has_initial_state,
             cu_seqlens,
         )
-        return hyper_input + gated + conv_out, new_conv_state  # [T, HC*HS]
+        return gated + conv_out, new_conv_state  # [T, HC*HS]
 
     @named_scope
     def forward_decode(
@@ -483,7 +483,7 @@ class NGramEmbedding(nnx.Module):
             state_indices,
             has_initial_state,
         )
-        return hyper_input + gated + conv_out, new_conv_state  # [T, HC*HS]
+        return gated + conv_out, new_conv_state  # [B, HC*HS]
 
 
 __all__ = [
