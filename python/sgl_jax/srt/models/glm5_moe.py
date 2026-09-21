@@ -797,6 +797,12 @@ class Glm5DecoderLayer(nnx.Module):
                 num_experts=config.n_routed_experts,
                 enable_expert_bias=True,
                 weight_dtype=router_dtype,
+                # GLM-5.2 checkpoints ship the gate weight in BF16 and the
+                # e_score_correction_bias in F32: store both checkpoint-native,
+                # keep the router dot in f32 (unchanged numerics).
+                kernel_dtype=jnp.bfloat16,
+                compute_dtype=jnp.float32,
+                bias_dtype=jnp.float32,
                 score_func=getattr(config, "scoring_func", "sigmoid"),
             )
 
