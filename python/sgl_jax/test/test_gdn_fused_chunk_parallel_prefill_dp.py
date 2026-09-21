@@ -59,9 +59,8 @@ def _fake_fused_kernel(
 
 
 def test_adapter_executes_with_four_data_parallel_shards(monkeypatch):
-    if jax.device_count() < DP:
-        pytest.skip(f"requires at least {DP} devices")
-    devices = np.asarray(jax.devices()[:DP]).reshape(DP, 1)
+    assert jax.device_count() == DP
+    devices = np.asarray(jax.devices()).reshape(DP, 1)
     mesh = jax.sharding.Mesh(devices, ("data", "tensor"))
     monkeypatch.setattr(adapter, "_fused_chunk_parallel_kernel", _fake_fused_kernel)
 
