@@ -258,7 +258,7 @@ def test_adapter_converts_layout_metadata_and_preserves_pool_contract():
     np.testing.assert_array_equal(new_recurrent[7], recurrent_state[7])
 
 
-def test_no_tracking_preserves_recurrent_pool_until_kernel(monkeypatch):
+def test_no_tracking_preserves_recurrent_pool_until_kernel():
     inputs = _inputs()
 
     def vendor(qkv, b, a, conv_state, recurrent_state, *args, **kwargs):
@@ -268,17 +268,7 @@ def test_no_tracking_preserves_recurrent_pool_until_kernel(monkeypatch):
         np.testing.assert_array_equal(recurrent_state, inputs[4])
         return (conv_state, recurrent_state), jnp.zeros((qkv.shape[0], N_V * D_V))
 
-    monkeypatch.setattr(adapter, "_fused_chunk_parallel_kernel", vendor)
-    adapter._fused_chunk_parallel_prefill_local(
-        *inputs[:10],
-        None,
-        *inputs[10:],
-        n_kq=N_KQ,
-        n_v=N_V,
-        d_k=D_K,
-        d_v=D_V,
-        kernel_size=KERNEL_SIZE,
-    )
+    _call(track_indices=None, vendor=vendor)
 
 
 def _stateful_vendor(
@@ -380,14 +370,7 @@ def test_no_tracking_preserves_state_trajectories_and_empty_slots(monkeypatch, d
             kernel_size=KERNEL_SIZE,
         )
 
-    candidate = jax.jit(
-        run,
-        donate_argnums=(0, 1) if donate else (),
-    )
-    baseline = jax.jit(
-        run,
-        donate_argnums=(0, 1) if donate else (),
-    )
+    execute = jax.jit(run, donate_argnums=(0, 1) if donate else ())
     original_conv, original_recurrent = np.asarray(inputs[3]), np.asarray(inputs[4])
     actual_pools = (jnp.array(original_conv), jnp.array(original_recurrent))
     expected_pools = (jnp.array(original_conv), jnp.array(original_recurrent))
@@ -397,9 +380,9 @@ def test_no_tracking_preserves_state_trajectories_and_empty_slots(monkeypatch, d
         if step == 3:
             # Reuse an occupied slot for a new request after continuation.
             has_initial = has_initial.at[0].set(False)
-        actual = jax.block_until_ready(candidate(*actual_pools, has_initial, track))
+        actual = jax.block_until_ready(execute(*actual_pools, has_initial, track))
         expected = jax.block_until_ready(
-            baseline(
+            execute(
                 *expected_pools, has_initial, jnp.zeros_like(indices) if track is None else track
             )
         )

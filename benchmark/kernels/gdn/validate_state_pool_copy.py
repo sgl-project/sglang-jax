@@ -1,7 +1,9 @@
 """Real-TPU, donated-pool A/B validation for issue #1667.
 
-Export the untouched adapter with ``git show HEAD:python/sgl_jax/srt/kernels/gdn/
- fused_chunk_parallel_adapter.py > /tmp/baseline_adapter.py`` (join the path).
+Export the untouched adapter from baseline commit
+``1056e49ae2abea7e69a403644e26bc362e1deadb`` using ``git show
+<baseline>:python/sgl_jax/srt/kernels/gdn/fused_chunk_parallel_adapter.py
+> /tmp/baseline_adapter.py`` (join the command onto one line).
 Run with PYTHONPATH=python and explicit model head counts. Pool capacities exclude
 one dummy slot per DP rank: capacity 1024 means 4 * 257 physical pool slots.
 This checks single-layer equivalence; it does not establish full-model peak HBM.
