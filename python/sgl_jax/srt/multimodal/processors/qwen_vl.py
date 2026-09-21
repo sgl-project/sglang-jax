@@ -228,7 +228,6 @@ def preprocess_video(source, video_config: dict) -> np.ndarray:
 class QwenVLProcessor(BaseMultimodalProcessor):
     auto_mm_processor_worker_num = 2
     supports_mm_processor_concurrency = True
-    use_torchcodec_image_decode = True
     models = (
         "Qwen2VLForConditionalGeneration",
         "Qwen2_5_VLForConditionalGeneration",

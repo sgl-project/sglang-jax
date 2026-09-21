@@ -51,6 +51,7 @@ from sgl_jax.srt.managers.io_struct import (
     SetInternalStateReqOutput,
     TokenizedGenerateReqInput,
 )
+from sgl_jax.srt.managers.mm_utils import unwrap_shm_features
 from sgl_jax.srt.managers.schedule_batch import (
     FINISH_ABORT,
     Req,
@@ -1147,7 +1148,7 @@ class Scheduler(
                     recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
-                recv_reqs.append(recv_req)
+                recv_reqs.append(unwrap_shm_features(recv_req))
 
             while True:
                 try:
