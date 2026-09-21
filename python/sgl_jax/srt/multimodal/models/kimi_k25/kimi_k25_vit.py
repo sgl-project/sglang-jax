@@ -8,10 +8,13 @@ import numpy as np
 from flax import nnx
 from jax.sharding import Mesh
 
-from sgl_jax.srt.layers.embeddings import Embed
 from sgl_jax.srt.multimodal.configs.kimi.kimi_k25_config import KimiK25ModelVitConfig
-from sgl_jax.srt.multimodal.kernels.flash_attention import SegmentIds, flash_attention
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
+from sgl_jax.srt.multimodal.kernels.flash_attention import (
+    BlockSizes,
+    SegmentIds,
+    flash_attention,
+)
+from sgl_jax.srt.utils.weight_utils import WeightMapping
 
 init_fn = nnx.initializers.uniform()
 logger = logging.getLogger(__name__)
@@ -151,6 +154,39 @@ def align_to(x, a):
     return pl.cdiv(x, a) * a
 
 
+# The Pallas kernel's smallest addressable tile along the KV axis.
+_KV_MIN_BLOCK = 128
+
+# Cost of one KV token inside the kernel's VMEM window: the 72-wide heads pad up
+# to a full 128-lane register, the window is f32, and Pallas double-buffers it.
+_KV_WINDOW_BYTES_PER_TOKEN = 128 * 4 * 2
+
+# Q, the output tile and the softmax scratch all have to share VMEM with the KV
+# window, so only a fraction of the 64 MB budget is spent here.
+_KV_WINDOW_BUDGET_BYTES = 8 * 1024 * 1024
+
+
+def _vmem_safe_kv_block(kv_seq_len: int) -> int:
+    """Largest KV block the flash-attention kernel can hold in VMEM.
+
+    The kernel walks the KV axis in ``kv_seq_len // block_k_major`` steps, so the
+    block has to divide the sequence exactly, and it must also be a multiple of
+    the kernel's 128-lane minimum. ``kv_seq_len`` is returned unchanged when the
+    whole sequence already fits, which keeps short items -- images and brief
+    clips -- on the kernel's single-step fast path.
+    """
+    max_block = _KV_WINDOW_BUDGET_BYTES // _KV_WINDOW_BYTES_PER_TOKEN
+    if kv_seq_len <= max_block:
+        return kv_seq_len
+
+    # Callers align the sequence to 256, so 128 always divides it and the loop
+    # is guaranteed to terminate on a valid block.
+    for block in range(max_block - max_block % _KV_MIN_BLOCK, 0, -_KV_MIN_BLOCK):
+        if kv_seq_len % block == 0:
+            return block
+    return _KV_MIN_BLOCK
+
+
 def apply_2d_rope(x: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
     x_real = x[..., 0::2]
     x_imag = x[..., 1::2]
@@ -189,7 +225,6 @@ class KimiK25VisionAttention(nnx.Module):
         hidden_states: jax.Array,
         cu_seqlens: jax.Array,
         position_embeddings: jax.Array,
-        seq_lens: tuple[int, ...] | None = None,
     ) -> jax.Array:
         sum_seq_len, D = hidden_states.shape
 
@@ -204,18 +239,10 @@ class KimiK25VisionAttention(nnx.Module):
         q = apply_2d_rope(q, cos_emb, sin_emb)
         k = apply_2d_rope(k, cos_emb, sin_emb)
 
-        is_cpu = list(self.mesh.devices.flat)[0].platform == "cpu"
-
-        # Attention here is block-diagonal (patches only attend within their own
-        # item), so on CPU the same kernel is invoked once per item instead of
-        # once over the concatenated sequence. Same result, much smaller grid.
-        if is_cpu and seq_lens:
-            return self._segmented_attention(q, k, v, seq_lens).reshape(sum_seq_len, D)
-
         indices = jnp.arange(sum_seq_len)
         item_ids = jnp.sum(indices[:, None] >= cu_seqlens[1:][None, :], axis=-1) + 1
 
-        output = self._flash_attention(q, k, v, item_ids, interpret=is_cpu)
+        output = self._flash_attention(q, k, v, item_ids)
 
         return output.reshape(sum_seq_len, D)
 
@@ -225,7 +252,6 @@ class KimiK25VisionAttention(nnx.Module):
         k: jax.Array,
         v: jax.Array,
         item_ids: jax.Array,
-        interpret: bool,
     ) -> jax.Array:
         """Run the Pallas kernel over ``[seq_len, num_heads, head_dim]`` inputs.
 
@@ -251,6 +277,23 @@ class KimiK25VisionAttention(nnx.Module):
         pad_k = jnp.transpose(k, (1, 0, 2))[None, ...]
         pad_v = jnp.transpose(v, (1, 0, 2))[None, ...]
 
+        # For any ``kv_seq_len <= 92800`` the kernel forces
+        # ``block_k_major = block_k = kv_seq_len`` to reach its single-step fast
+        # path, which asks for a VMEM window of
+        # ``kv_seq_len * 128 lanes * 4 B * 2 buffers``. The 72-wide heads here pad
+        # to 128 lanes, so a 74240-token video needs 76 MB against a 64 MB budget
+        # and the kernel dies with RESOURCE_EXHAUSTED. Long videos therefore need
+        # an explicit, smaller KV block; short ones keep the fast path.
+        block_sizes = None
+        kv_block = _vmem_safe_kv_block(align_seq_len)
+        if kv_block < align_seq_len:
+            block_sizes = BlockSizes(
+                block_q=min(256, align_seq_len),
+                block_k_major=kv_block,
+                block_k=kv_block,
+                block_b=1,
+            )
+
         def local_flash_attention(q, k, v, segment_ids):
             return flash_attention(
                 q,
@@ -259,7 +302,7 @@ class KimiK25VisionAttention(nnx.Module):
                 segment_ids=segment_ids,
                 causal=False,
                 sm_scale=self.scale,
-                interpret=interpret,
+                block_sizes=block_sizes,
             )
 
         in_specs = (
@@ -278,44 +321,6 @@ class KimiK25VisionAttention(nnx.Module):
         )(pad_q, pad_k, pad_v, segment_ids)
 
         return jnp.transpose(output[0], (1, 0, 2))[:seq_len, :, :]
-
-    def _segmented_attention(
-        self,
-        q: jax.Array,
-        k: jax.Array,
-        v: jax.Array,
-        seq_lens: tuple[int, ...],
-    ) -> jax.Array:
-        """Block-diagonal attention, one kernel invocation per item.
-
-        ``q``/``k``/``v`` are ``[sum(seq_lens), num_heads, head_dim]``. Since
-        patches only attend within their own item, slicing the sequence per item
-        and running the kernel on each slice computes exactly what one masked
-        call over the concatenated sequence would -- but the emulated grid costs
-        ``sum(n_i^2)`` blocks instead of ``(sum n_i)^2``. For the Kimi demo video
-        (8 chunks, ~26k patches) that is a ~8x reduction; for a single image
-        there is only one item and nothing changes.
-
-        ``seq_lens`` is static, so the loop is unrolled at trace time.
-        """
-        outputs = []
-        start = 0
-        for length in seq_lens:
-            end = start + length
-            # One item per call, so every real token shares segment id 1; only
-            # the alignment padding inside the helper is masked off.
-            outputs.append(
-                self._flash_attention(
-                    q[start:end],
-                    k[start:end],
-                    v[start:end],
-                    jnp.ones(length, dtype=jnp.int32),
-                    interpret=True,
-                )
-            )
-            start = end
-
-        return jnp.concatenate(outputs, axis=0)
 
 
 class KimiK25VisionMLP(nnx.Module):
@@ -386,7 +391,6 @@ class KimiK25VisionBlock(nnx.Module):
         hidden_states: jax.Array,
         cu_seqlens: jax.Array,
         rope_freqs_cis: jax.Array,
-        seq_lens: tuple[int, ...] | None = None,
     ):
         residual = hidden_states
         hidden_states = self.pre_norm(hidden_states)
@@ -394,7 +398,6 @@ class KimiK25VisionBlock(nnx.Module):
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=rope_freqs_cis,
-            seq_lens=seq_lens,
         )
         hidden_states = self.proj(hidden_states)
         hidden_states = residual + hidden_states
@@ -445,7 +448,6 @@ class VisionTowerEncoder(nnx.Module):
         hidden_states: jax.Array,
         rope_freqs_cis: jax.Array,
         cu_seqlens: jax.Array,
-        seq_lens: tuple[int, ...] | None = None,
     ) -> jax.Array:
 
         for block in self.blocks:
@@ -453,7 +455,6 @@ class VisionTowerEncoder(nnx.Module):
                 hidden_states,
                 cu_seqlens,
                 rope_freqs_cis=rope_freqs_cis,
-                seq_lens=seq_lens,
             )
 
         hidden_states = self.final_layernorm(hidden_states)
@@ -604,7 +605,6 @@ class VisionTower(nnx.Module):
         cu_seqlens: jax.Array,
         merge_indices: jax.Array,
         merge_weights: jax.Array | None = None,
-        seq_lens: tuple[int, ...] | None = None,
     ) -> jax.Array:
         """Run the ViT body and merge patches into merge_h * merge_w groups.
 
@@ -613,17 +613,12 @@ class VisionTower(nnx.Module):
         a video, or two videos with different frame counts). When omitted, all
         temporal slots are averaged uniformly, which matches the behavior of
         batches where every item has the same t.
-
-        seq_lens is the static per-item patch count (t * h * w), the same
-        information cu_seqlens carries but available at trace time. The CPU
-        attention path needs static bounds to slice the block-diagonal attention;
-        on TPU it is unused.
         """
 
         hidden_states = self.patch_embed(pixel_values)
         hidden_states = hidden_states + abs_pos_embs
 
-        hidden_states = self.encoder(hidden_states, rope_freq_cis, cu_seqlens, seq_lens=seq_lens)
+        hidden_states = self.encoder(hidden_states, rope_freq_cis, cu_seqlens)
 
         merged_states = hidden_states[merge_indices]
 
@@ -682,8 +677,10 @@ class Kimi_K25_MultiModalProjector(nnx.Module):
 
 
 class Kimi_K25_VisionModel(nnx.Module):
-    """
-    Model implementation class for the ViT stage.
+    """Vision tower plus multimodal projector.
+
+    Held as ``self.visual`` by ``KimiK25ForConditionalGeneration``; weights are
+    loaded by that class, not here.
     """
 
     def __init__(
@@ -694,185 +691,149 @@ class Kimi_K25_VisionModel(nnx.Module):
         mesh: Mesh | None = None,
     ) -> None:
 
-        self.config = config
-        self.dtype = dtype
-        self.mesh = mesh
-
         self.vision_tower = VisionTower(config, dtype, rngs, mesh)
         self.mm_projector = Kimi_K25_MultiModalProjector(config, dtype, rngs)
 
         logger.info("Kimi K2.5 Vision Model initialized with dtype %s", dtype)
 
-    def load_weights(self, model_config: KimiK25ModelVitConfig) -> None:
-        """Load model weights with JAX distributed loading support"""
 
-        if not hasattr(self, "text_embed"):
-            with jax.set_mesh(self.mesh):
-                self.text_embed = Embed(
-                    num_embeddings=model_config.vocab_size,
-                    features=model_config.text_hidden_size,
-                    dtype=self.dtype,
-                    param_dtype=self.dtype,
-                    kernel_axes=("tensor", None),
-                    mesh=self.mesh,
-                )
+def create_kimi_vision_weight_mappings(
+    num_hidden_layers: int,
+    target_prefix: str = "",
+) -> dict:
+    """Map checkpoint keys for the Kimi vision tower and projector.
 
-        loader = WeightLoader(
-            model=self,
-            model_config=model_config,
-            mesh=self.mesh,
-            dtype=self.dtype,
-        )
-
-        weight_mappings = self._create_kimi_k25_vision_tower_weight_mappings()
-
-        if self.mesh is not None:
-            with self.mesh:
-                loader.load_weights_from_safetensors(weight_mappings)
-        else:
-            loader.load_weights_from_safetensors(weight_mappings)
-
-        logger.info("Kimi-K2.5 - ViT stage weights loaded successfully!")
-
-    def _create_kimi_k25_vision_tower_weight_mappings(self) -> dict:
-        mappings = {}
-
-        mappings["language_model.model.embed_tokens.weight"] = WeightMapping(
-            target_path="text_embed.embedding",
-            sharding=(None, None),
+    target_prefix names where the tower is mounted in the JAX module tree. The
+    in-model VLM nests it under ``visual.``; the checkpoint-side keys are the
+    same wherever it is mounted.
+    """
+    mappings = {
+        "vision_tower.patch_embed.pos_emb.weight": WeightMapping(
+            target_path=f"{target_prefix}vision_tower.patch_embed.pos_emb.weight",
+            sharding=(None,),
             transpose=False,
-        )
+        ),
+        "vision_tower.patch_embed.proj.weight": WeightMapping(
+            target_path=f"{target_prefix}vision_tower.patch_embed.proj.kernel",
+            sharding=(None, None, None, None),
+            transpose_axes=(2, 3, 1, 0),
+        ),
+        "vision_tower.patch_embed.proj.bias": WeightMapping(
+            target_path=f"{target_prefix}vision_tower.patch_embed.proj.bias",
+            sharding=(None,),
+            transpose=False,
+        ),
+        "vision_tower.encoder.final_layernorm.weight": WeightMapping(
+            target_path=f"{target_prefix}vision_tower.encoder.final_layernorm.scale",
+            sharding=(None,),
+            transpose=False,
+        ),
+        "vision_tower.encoder.final_layernorm.bias": WeightMapping(
+            target_path=f"{target_prefix}vision_tower.encoder.final_layernorm.bias",
+            sharding=(None,),
+            transpose=False,
+        ),
+        "mm_projector.pre_norm.bias": WeightMapping(
+            target_path=f"{target_prefix}mm_projector.pre_norm.bias",
+            sharding=(None,),
+            transpose=False,
+        ),
+        "mm_projector.pre_norm.weight": WeightMapping(
+            target_path=f"{target_prefix}mm_projector.pre_norm.scale",
+            sharding=(None,),
+            transpose=False,
+        ),
+        "mm_projector.proj.0.weight": WeightMapping(
+            target_path=f"{target_prefix}mm_projector.proj_0.kernel",
+            sharding=(None,),
+            transpose=True,
+        ),
+        "mm_projector.proj.0.bias": WeightMapping(
+            target_path=f"{target_prefix}mm_projector.proj_0.bias",
+            sharding=(None,),
+            transpose=False,
+        ),
+        "mm_projector.proj.2.weight": WeightMapping(
+            target_path=f"{target_prefix}mm_projector.proj_1.kernel",
+            sharding=(None,),
+            transpose=True,
+        ),
+        "mm_projector.proj.2.bias": WeightMapping(
+            target_path=f"{target_prefix}mm_projector.proj_1.bias",
+            sharding=(None,),
+            transpose=False,
+        ),
+    }
 
-        mappings.update(
-            {
-                "vision_tower.patch_embed.pos_emb.weight": WeightMapping(
-                    target_path="vision_tower.patch_embed.pos_emb.weight",
-                    sharding=(None,),
-                    transpose=False,
-                ),
-                "vision_tower.patch_embed.proj.weight": WeightMapping(
-                    target_path="vision_tower.patch_embed.proj.kernel",
-                    sharding=(None, None, None, None),
-                    transpose_axes=(2, 3, 1, 0),
-                ),
-                "vision_tower.patch_embed.proj.bias": WeightMapping(
-                    target_path="vision_tower.patch_embed.proj.bias",
-                    sharding=(None,),
-                    transpose=False,
-                ),
-                "vision_tower.encoder.final_layernorm.weight": WeightMapping(
-                    target_path="vision_tower.encoder.final_layernorm.scale",
-                    sharding=(None,),
-                    transpose=False,
-                ),
-                "vision_tower.encoder.final_layernorm.bias": WeightMapping(
-                    target_path="vision_tower.encoder.final_layernorm.bias",
-                    sharding=(None,),
-                    transpose=False,
-                ),
-                "mm_projector.pre_norm.bias": WeightMapping(
-                    target_path="mm_projector.pre_norm.bias",
-                    sharding=(None,),
-                    transpose=False,
-                ),
-                "mm_projector.pre_norm.weight": WeightMapping(
-                    target_path="mm_projector.pre_norm.scale",
-                    sharding=(None,),
-                    transpose=False,
-                ),
-                "mm_projector.proj.0.weight": WeightMapping(
-                    target_path="mm_projector.proj_0.kernel",
-                    sharding=(None,),
-                    transpose=True,
-                ),
-                "mm_projector.proj.0.bias": WeightMapping(
-                    target_path="mm_projector.proj_0.bias",
-                    sharding=(None,),
-                    transpose=False,
-                ),
-                "mm_projector.proj.2.weight": WeightMapping(
-                    target_path="mm_projector.proj_1.kernel",
-                    sharding=(None,),
-                    transpose=True,
-                ),
-                "mm_projector.proj.2.bias": WeightMapping(
-                    target_path="mm_projector.proj_1.bias",
-                    sharding=(None,),
-                    transpose=False,
-                ),
-            }
-        )
+    for layer_idx in range(num_hidden_layers):
+        mappings.update(create_kimi_vision_layer_mappings(layer_idx, target_prefix))
 
-        for layer_idx in range(self.config.vt_num_hidden_layers):
-            vision_layer_mappings = self._create_vision_layer_mappings(layer_idx)
-            mappings.update(vision_layer_mappings)
+    return mappings
 
-        return mappings
 
-    def _create_vision_layer_mappings(self, layer_idx: int) -> dict:
-        prefix = f"vision_tower.encoder.blocks.{layer_idx}"
+def create_kimi_vision_layer_mappings(layer_idx: int, target_prefix: str = "") -> dict:
+    source = f"vision_tower.encoder.blocks.{layer_idx}"
+    target = f"{target_prefix}vision_tower.encoder.blocks.{layer_idx}"
 
-        mappings = {
-            f"{prefix}.wqkv.weight": WeightMapping(
-                target_path=f"{prefix}.attn.qkv_proj.kernel",
-                sharding=(None,),
-                transpose=True,
-            ),
-            f"{prefix}.wqkv.bias": WeightMapping(
-                target_path=f"{prefix}.attn.qkv_proj.bias",
-                sharding=(None,),
-                transpose=False,
-            ),
-            f"{prefix}.wo.weight": WeightMapping(
-                target_path=f"{prefix}.proj.kernel",
-                sharding=(None,),
-                transpose=True,
-            ),
-            f"{prefix}.wo.bias": WeightMapping(
-                target_path=f"{prefix}.proj.bias",
-                sharding=(None,),
-                transpose=False,
-            ),
-            f"{prefix}.mlp.fc0.weight": WeightMapping(
-                target_path=f"{prefix}.mlp.up_proj.kernel",
-                sharding=(None,),
-                transpose=True,
-            ),
-            f"{prefix}.mlp.fc0.bias": WeightMapping(
-                target_path=f"{prefix}.mlp.up_proj.bias",
-                sharding=(None,),
-                transpose=False,
-            ),
-            f"{prefix}.mlp.fc1.weight": WeightMapping(
-                target_path=f"{prefix}.mlp.down_proj.kernel",
-                sharding=(None,),
-                transpose=True,
-            ),
-            f"{prefix}.mlp.fc1.bias": WeightMapping(
-                target_path=f"{prefix}.mlp.down_proj.bias",
-                sharding=(None,),
-                transpose=False,
-            ),
-            f"{prefix}.norm0.weight": WeightMapping(
-                target_path=f"{prefix}.pre_norm.scale",
-                sharding=(None,),
-                transpose=False,
-            ),
-            f"{prefix}.norm0.bias": WeightMapping(
-                target_path=f"{prefix}.pre_norm.bias",
-                sharding=(None,),
-                transpose=False,
-            ),
-            f"{prefix}.norm1.weight": WeightMapping(
-                target_path=f"{prefix}.post_norm.scale",
-                sharding=(None,),
-                transpose=False,
-            ),
-            f"{prefix}.norm1.bias": WeightMapping(
-                target_path=f"{prefix}.post_norm.bias",
-                sharding=(None,),
-                transpose=False,
-            ),
-        }
-
-        return mappings
+    return {
+        f"{source}.wqkv.weight": WeightMapping(
+            target_path=f"{target}.attn.qkv_proj.kernel",
+            sharding=(None,),
+            transpose=True,
+        ),
+        f"{source}.wqkv.bias": WeightMapping(
+            target_path=f"{target}.attn.qkv_proj.bias",
+            sharding=(None,),
+            transpose=False,
+        ),
+        f"{source}.wo.weight": WeightMapping(
+            target_path=f"{target}.proj.kernel",
+            sharding=(None,),
+            transpose=True,
+        ),
+        f"{source}.wo.bias": WeightMapping(
+            target_path=f"{target}.proj.bias",
+            sharding=(None,),
+            transpose=False,
+        ),
+        f"{source}.mlp.fc0.weight": WeightMapping(
+            target_path=f"{target}.mlp.up_proj.kernel",
+            sharding=(None,),
+            transpose=True,
+        ),
+        f"{source}.mlp.fc0.bias": WeightMapping(
+            target_path=f"{target}.mlp.up_proj.bias",
+            sharding=(None,),
+            transpose=False,
+        ),
+        f"{source}.mlp.fc1.weight": WeightMapping(
+            target_path=f"{target}.mlp.down_proj.kernel",
+            sharding=(None,),
+            transpose=True,
+        ),
+        f"{source}.mlp.fc1.bias": WeightMapping(
+            target_path=f"{target}.mlp.down_proj.bias",
+            sharding=(None,),
+            transpose=False,
+        ),
+        f"{source}.norm0.weight": WeightMapping(
+            target_path=f"{target}.pre_norm.scale",
+            sharding=(None,),
+            transpose=False,
+        ),
+        f"{source}.norm0.bias": WeightMapping(
+            target_path=f"{target}.pre_norm.bias",
+            sharding=(None,),
+            transpose=False,
+        ),
+        f"{source}.norm1.weight": WeightMapping(
+            target_path=f"{target}.post_norm.scale",
+            sharding=(None,),
+            transpose=False,
+        ),
+        f"{source}.norm1.bias": WeightMapping(
+            target_path=f"{target}.post_norm.bias",
+            sharding=(None,),
+            transpose=False,
+        ),
+    }

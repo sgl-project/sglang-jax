@@ -374,13 +374,24 @@ class ModelRunnerKVCacheMixin:
 
     def _profile_available_bytes(self: ModelRunner, total_device_memory: int) -> int:
         """Profile available bytes for KV cache (+ recurrent state)."""
-        rest_memory = (
-            self.get_available_device_memory()
-            - total_device_memory * (1 - self.mem_fraction_static)
-            - self.embedding_pool_bytes
-        )
+        free_memory = self.get_available_device_memory()
+        static_reserve = total_device_memory * (1 - self.mem_fraction_static)
+        rest_memory = free_memory - static_reserve - self.embedding_pool_bytes
         if rest_memory <= 0:
-            raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
+            # Report the terms: which one blew the budget determines the fix.
+            # A large `weights` means the model simply does not leave room for a
+            # KV cache at this mem_fraction_static, whereas a large
+            # `embedding_pool` points at max_prefill_tokens instead.
+            gib = 1 << 30
+            raise RuntimeError(
+                "Not enough memory. Please try to increase --mem-fraction-static. "
+                f"total={total_device_memory / gib:.2f}GiB "
+                f"weights={(total_device_memory - free_memory) / gib:.2f}GiB "
+                f"free_after_weights={free_memory / gib:.2f}GiB "
+                f"static_reserve={static_reserve / gib:.2f}GiB "
+                f"(mem_fraction_static={self.mem_fraction_static}) "
+                f"embedding_pool={self.embedding_pool_bytes / gib:.2f}GiB"
+            )
 
         if self.linear_recurrent_config is not None:
             rest_memory = self.handle_recurrent_cache(int(rest_memory))

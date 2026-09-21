@@ -33,7 +33,6 @@ from sgl_jax.srt.managers.io_struct import (
     ProfileReqOutput,
 )
 from sgl_jax.srt.managers.tokenizer_manager import ReqState, TokenizerManager
-from sgl_jax.srt.multimodal.common.mecord_compat import install_mecord_shim
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
 from sgl_jax.srt.multimodal.manager.io_struct import (
     AudioSpeechRequest,
@@ -302,12 +301,6 @@ class MultimodalTokenizer(TokenizerManager):
             }:
                 processor_candidates.append(os.path.dirname(model_path.rstrip("/")))
             trust_remote_code = server_args.trust_remote_code or server_args.multimodal
-            if trust_remote_code:
-                # Kimi-K2.5's remote code does `from mecord import VideoReader`
-                # at module import time, so the shim has to be registered
-                # before AutoProcessor pulls that code in. No-op when a real
-                # mecord is installed.
-                install_mecord_shim()
             for candidate in processor_candidates:
                 try:
                     self.mm_processor = AutoProcessor.from_pretrained(
@@ -497,20 +490,6 @@ class MultimodalTokenizer(TokenizerManager):
                 videos = [self._preprocess_qwen_video(item, video_config) for item in video_data]
                 processor_kwargs["videos_kwargs"] = {"do_sample_frames": False}
                 processor_kwargs["videos_kwargs"]["fps"] = video_config.get("fps", _QWEN_FPS)
-            elif self._is_kimi_processor():
-                # Kimi takes a single ordered medias list instead of separate
-                # images/videos. It does its own decoding and sampling, so raw
-                # sources are handed over untouched: the processor samples at
-                # sample_fps and splits a video into fixed-size frame chunks.
-                medias = [{"type": "image", "image": img} for img in images]
-                medias.extend(
-                    {"type": "video", "video": item, "first_frame_timestamp": 0.0}
-                    for item in video_data
-                )
-                processor_kwargs["medias"] = medias
-                input_text = self._ensure_kimi_video_placeholders(input_text, len(video_data))
-                images = None
-                videos = None
             else:
                 videos = [self._load_video_from_source(item) for item in video_data]
             audios = [self._load_audio_from_source(item) for item in audio_data]
@@ -525,18 +504,8 @@ class MultimodalTokenizer(TokenizerManager):
             if "input_ids" in processor_out:
                 input_ids = processor_out["input_ids"][0].tolist()
 
-            # Kimi reports every media item (image or video chunk) in one
-            # grid_thws tensor rather than split image/video tensors.
-            image_grid_thw = self._to_grid_list(
-                processor_out.get("image_grid_thw")
-                if processor_out.get("image_grid_thw") is not None
-                else processor_out.get("grid_thws")
-            )
+            image_grid_thw = self._to_grid_list(processor_out.get("image_grid_thw"))
             video_grid_thw = self._to_grid_list(processor_out.get("video_grid_thw"))
-
-            if self._is_kimi_processor() and image_grid_thw and input_ids is not None:
-                input_ids = self._expand_kimi_media_placeholders(input_ids, image_grid_thw)
-
             second_per_grid_ts = processor_out.get("second_per_grid_ts")
             if second_per_grid_ts is None:
                 second_per_grid_ts = processor_out.get("video_second_per_grid")
@@ -612,8 +581,7 @@ class MultimodalTokenizer(TokenizerManager):
                 "mm_items": mm_items,
                 "im_start_id": getattr(self.mm_config, "vision_start_token_id", None),
                 "im_end_id": getattr(self.mm_config, "vision_end_token_id", None),
-                "im_token_id": getattr(self.mm_config, "image_token_id", None)
-                or getattr(self.mm_config, "media_placeholder_token_id", None),
+                "im_token_id": getattr(self.mm_config, "image_token_id", None),
                 "video_token_id": getattr(self.mm_config, "video_token_id", None),
                 "audio_token_id": getattr(self.mm_config, "audio_token_id", None),
                 "mrope_positions": mrope_positions,
@@ -660,95 +628,6 @@ class MultimodalTokenizer(TokenizerManager):
             "Qwen2_5_VLProcessor",
             "Qwen3OmniMoeProcessor",
         }
-
-    def _is_kimi_processor(self) -> bool:
-        if self.mm_processor is None:
-            return False
-        return self.mm_processor.__class__.__name__ == "KimiK25Processor"
-
-    def _kimi_video_placeholder(self) -> str:
-        placeholder = getattr(self.mm_processor, "video_placeholder", None)
-        if not placeholder and self.mm_config is not None:
-            placeholder = getattr(self.mm_config, "video_placeholder", None)
-        return placeholder or "<|kimi_k25_video_placeholder|>"
-
-    def _ensure_kimi_video_placeholders(self, text: str | None, num_videos: int) -> str | None:
-        """Make sure the prompt carries one video placeholder per video.
-
-        The chat template emits these automatically, but a raw prompt sent with
-        video_data will not have them. The processor asserts that the count
-        matches, and without a placeholder the per-chunk prompts (which carry the
-        media tokens) would never reach the text.
-        """
-        if num_videos <= 0:
-            return text
-
-        placeholder = self._kimi_video_placeholder()
-        text = text or ""
-        missing = num_videos - text.count(placeholder)
-        if missing > 0:
-            text = placeholder * missing + text
-        return text
-
-    def _kimi_merge_kernel_area(self) -> int:
-        """Number of patches merged into one visual token."""
-        merge_kernel_size = None
-        if self.mm_config is not None:
-            vision_config = getattr(self.mm_config, "vision_config", None)
-            merge_kernel_size = getattr(vision_config, "merge_kernel_size", None) or getattr(
-                self.mm_config, "merge_kernel_size", None
-            )
-        if merge_kernel_size is None:
-            merge_kernel_size = [2, 2]
-        if isinstance(merge_kernel_size, int):
-            return merge_kernel_size * merge_kernel_size
-        area = 1
-        for value in merge_kernel_size:
-            area *= int(value)
-        return area
-
-    def _expand_kimi_media_placeholders(
-        self, input_ids: list[int], grid_thws: list[tuple[int, int, int]]
-    ) -> list[int]:
-        """Expand each media placeholder into one token per visual token.
-
-        Kimi's template emits a single placeholder per media item (an image, or a
-        single chunk of a video). The count is h * w / merge_area and is
-        independent of t: the vision tower average-pools a chunk's frames, so
-        a 4-frame chunk still yields the spatial token count of one frame.
-        """
-        mm_token_id = getattr(self.mm_config, "media_placeholder_token_id", None)
-        if mm_token_id is None:
-            return input_ids
-
-        merge_area = self._kimi_merge_kernel_area()
-        grid_iter = iter(grid_thws)
-        expanded: list[int] = []
-        for token in input_ids:
-            if token != mm_token_id:
-                expanded.append(token)
-                continue
-            grid = next(grid_iter, None)
-            if grid is None:
-                logger.warning(
-                    "More Kimi media placeholders than grids (%d grids); "
-                    "leaving the extra placeholder unexpanded.",
-                    len(grid_thws),
-                )
-                expanded.append(token)
-                continue
-            _, height, width = grid
-            num_visual_tokens = (height * width) // merge_area
-            expanded.extend([mm_token_id] * num_visual_tokens)
-
-        leftover = sum(1 for _ in grid_iter)
-        if leftover:
-            logger.warning(
-                "%d Kimi media grids had no placeholder in the prompt; "
-                "their embeddings will not be attached.",
-                leftover,
-            )
-        return expanded
 
     def _build_qwen_video_config(self, obj: GenerateMMReqInput | GenerateOmniReqInput) -> dict:
         video_config: dict[str, Any] = {}
