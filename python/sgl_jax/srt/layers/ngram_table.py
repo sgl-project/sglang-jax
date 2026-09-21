@@ -244,18 +244,16 @@ class NGramTable:
 
     def read_into(self, stream) -> None:
         """Fill the table from a stream written by :meth:`write_to`."""
-        view = self.data.reshape(-1).view(np.uint8)  # [padded_rows*dim*2]
-        got = stream.readinto(memoryview(view)) if hasattr(stream, "readinto") else None
-        if got is None:
-            got, pos = 0, memoryview(view)
-            while got < view.nbytes:
-                chunk = stream.read(1 << 26)
-                if not chunk:
-                    break
-                pos[got : got + len(chunk)] = chunk
-                got += len(chunk)
-        if got != view.nbytes:
-            raise ValueError(f"stream ended after {got} bytes, expected {view.nbytes}")
+        view = memoryview(self.data.reshape(-1).view(np.uint8))
+        offset = 0
+        while offset < len(view):
+            chunk = stream.read(min(1 << 26, len(view) - offset))
+            if not chunk:
+                break
+            view[offset : offset + len(chunk)] = chunk
+            offset += len(chunk)
+        if offset != len(view):
+            raise ValueError(f"stream ended after {offset} bytes, expected {len(view)}")
 
     def metadata(self) -> dict:
         return {
@@ -360,7 +358,6 @@ def _eos_token_id(config) -> int:
 
 # -- process-global handle --------------------------------------------------
 #
-# ponytail: a module global, not a field threaded scheduler -> ScheduleBatch.
 # The table is 95 GiB of host RAM, so there is exactly one per process by
 # construction; threading it through ScheduleBatch.init_new's five call sites
 # would only restate that. Swap to an explicit owner if a process ever needs
