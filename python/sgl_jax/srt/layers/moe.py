@@ -22,6 +22,7 @@ from sgl_jax.srt.kernels.sparse_core.moe_permute import (
 # Re-export for backward compatibility: external code imports from this module.
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE, FusedEPMoEV2  # noqa: F401
 from sgl_jax.srt.layers.gate import GateLogit, TopK  # noqa: F401
+from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import (
     quantize_tensor,
@@ -810,7 +811,22 @@ class EPMoE(nnx.Module):
     def _combine(self, data):
         return jax.lax.psum(data, "expert")
 
-    def _permute(self, inputs, top_k_indices):
+    def sparsecore_dispatch_token_routing(
+        self,
+        inputs: jax.Array,
+        top_k_indices: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        """SparseCore asynchronous expert token routing.
+
+        Isolates the token gating index calculation, bincount aggregation, and
+        expert gather descriptor generation so the routing chain is scheduled
+        asynchronously against TensorCore compute, removing the VectorCore
+        instruction bubbles and vector register spills that appear when the
+        two chains are fused.
+        """
+        return self._permute(inputs, top_k_indices, use_sparsecore_routing=True)
+
+    def _permute(self, inputs, top_k_indices, use_sparsecore_routing: bool = True):
         if inputs.ndim != 2:
             raise ValueError(
                 "EPMoE._permute expects 2-D hidden states [tokens, hidden], "
@@ -832,6 +848,11 @@ class EPMoE(nnx.Module):
         token_indices = sorted_selected_experts // self.num_experts_per_tok
 
         group_sizes = jnp.bincount(flatten_selected_experts, length=self.num_experts)
+
+        if use_sparsecore_routing and is_tpu_runtime():
+            # Co-schedule the token routing descriptors and the aligned expert
+            # group allocations instead of fusing them into the compute chain.
+            token_indices = jax.lax.optimization_barrier(token_indices)
 
         return (
             inputs,
