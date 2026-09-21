@@ -187,6 +187,17 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         # hardcoded fallback both fail Mosaic window setup at mnt>=256).
         # Full mnt bucket coverage pending a tuner sweep.
         ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 1): (16, 1, 2),
+        # Runtime lookup-miss fixes from server logs: the 4-head shard missed
+        # buckets 2/4 and the 64-head (unsharded / DP-attention) decode buckets
+        # 1-8 had no entries at all, so both fell back to the default (3, 1)
+        # blocks (128 pages split into 43 grid steps). Seed them with the
+        # validated 4-head bs1 value (16, 1, 2) pending a proper sweep.
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 2): (16, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 4): (16, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 1): (16, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 2): (16, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 4): (16, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 8): (16, 1, 2),
         ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 8): (16, 1, 2),
         # decode mnt 16-128 tuned 2026-09-16 on v7x (2x2x1 and 2x2x2 hosts) via
         # get_block_spec_config_mla.py at kv_len 2048 AND 8192 (minimax pick:
