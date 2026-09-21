@@ -276,7 +276,8 @@ def run(args, report):
                 for name in executables:
                     for leaf, host in zip(pools[name], host_pools):
                         for shard in leaf.addressable_shards:
-                            rank = shard.index[0].start // local_slots
+                            # DP=1 leaves the pool axis unsharded: slice(None).
+                            rank = (shard.index[0].start or 0) // local_slots
                             active = set(local_indices[rank]) - {0}
                             unchanged = [s for s in range(local_slots) if s not in active]
                             actual = np.asarray(shard.data)[unchanged]
