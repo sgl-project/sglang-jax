@@ -120,7 +120,7 @@ def jax_causal_conv1d_prefill(
     weight: jax.Array,  # [D, kernel_size]  depthwise weight
     bias: jax.Array | None = None,  # [D] optional
     cu_seqlens: jax.Array | None = None,  # [B+1]
-    conv_state: jax.Array | None = None,  # [num_blocks, D, kernel_size-1] full per-layer table
+    conv_state: jax.Array | None = None,  # [num_blocks, D, S] full per-layer table
     state_indices: jax.Array | None = None,  # [B] req → slot
     has_initial_state: jax.Array | None = None,  # [B] bool
     activation: str | None = None,
@@ -156,12 +156,13 @@ def jax_causal_conv1d_prefill(
     Returns ``(y [D, T], new_conv_state)``. ``new_conv_state`` holds the
     last ``S`` logical tokens of each request, scattered back into the
     full pool table at ``state_indices`` — its shape is
-    ``[num_blocks, D, K-1]`` (the input ``conv_state``'s shape) and its
+    ``[num_blocks, D, S]`` (the input ``conv_state``'s shape) and its
     dtype matches the pool. When ``conv_state`` is ``None`` (test
     fixture mode with no pool), ``new_conv_state`` falls back to the
-    per-request ``[B, D, K-1]`` slice. The scatter happens inside the
-    kernel so the same shape contract holds when this ref is later
-    replaced by a Pallas kernel that writes directly into pool buffers.
+    per-request ``[B, D, S]`` slice. Here, ``S = (K - 1) * dilation``.
+    The scatter happens inside the kernel so the same shape contract
+    holds when this ref is later replaced by a Pallas kernel that writes
+    directly into pool buffers.
     """
     if activation not in (None, "silu"):
         raise ValueError(f"Unsupported causal conv1d activation: {activation}")
@@ -290,7 +291,7 @@ def jax_causal_conv1d_prefill(
 
 def jax_causal_conv1d_update(
     x: jax.Array,  # [B, D]  one new token per batch element
-    conv_state: jax.Array,  # [num_blocks, D, kernel_size-1]  full per-layer table
+    conv_state: jax.Array,  # [num_blocks, D, S]  full per-layer table
     state_indices: jax.Array,  # [B]  req → slot
     weight: jax.Array,  # [D, kernel_size]
     bias: jax.Array | None = None,  # [D]
@@ -307,9 +308,10 @@ def jax_causal_conv1d_update(
     the per-request slice is gathered, updated, and scattered back inside
     the kernel. Returns ``(y [B, D], new_conv_state)`` where
     ``new_conv_state`` is the full pool table
-    ``[num_blocks, D, kernel_size-1]`` with the per-request slots
-    updated. Doing the scatter inside the kernel keeps the same shape
-    contract when this ref is later replaced by a Pallas kernel.
+    ``[num_blocks, D, S]``, where ``S = (kernel_size - 1) * dilation``,
+    with the per-request slots updated. Doing the scatter inside the
+    kernel keeps the same shape contract when this ref is later replaced
+    by a Pallas kernel.
 
     ``has_initial_state``: ``[B]`` bool, optional. ``True`` when the
     slot already holds valid conv state, ``False`` for brand-new
