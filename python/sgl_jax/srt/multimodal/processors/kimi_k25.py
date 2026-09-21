@@ -29,18 +29,14 @@ DEFAULT_MERGE_KERNEL_SIZE = (2, 2)
 class KimiK25Processor(BaseMultimodalProcessor):
     """Standard-serving-path processor for Kimi-K2.5.
 
-    Kimi differs from the Qwen-VL family in three ways that shape this class:
-
-    1. Its HF processor takes one ordered ``medias`` list rather than separate
-       ``images`` / ``videos`` arguments, and it does its own decoding and frame
+    1. Kimi's HF processor takes one ordered medias list rather than separate
+       images / videos arguments, and it does its own decoding and frame
        sampling. Raw sources are handed over untouched.
     2. It reports every media item - a still image, or one chunk of a video - in
-       a single ``grid_thws`` tensor, and emits exactly one media placeholder
+       a single grid_thws tensor, and emits exactly one media placeholder
        token per grid. There is no separate video tensor.
-    3. The vision tower average-pools a chunk's frames, so a grid ``(t, h, w)``
-       yields ``h * w / merge_area`` visual tokens *independently of t*. This is
-       why Kimi cannot reuse Qwen's `lane_packing` helper, which asserts that
-       placeholder count times the merge unit equals the patch count.
+    3. The vision tower average-pools a chunk's frames, so a grid (t, h, w)
+       yields h * w / merge_area visual tokens *independently of t*.
     """
 
     models = ("KimiK25ForConditionalGeneration",)
@@ -162,7 +158,7 @@ class KimiK25Processor(BaseMultimodalProcessor):
         ):
             item = MultimodalDataItem(
                 # Kimi tags video chunks as images: its processor emits a single
-                # `grid_thws`/`pixel_values` pair and never `pixel_values_videos`.
+                # grid_thws/pixel_values pair and never pixel_values_videos.
                 # A video is just a run of grids with t > 1, and the tower path
                 # is byte-for-byte identical, so there is nothing to distinguish.
                 modality=Modality.IMAGE,
@@ -182,10 +178,10 @@ class KimiK25Processor(BaseMultimodalProcessor):
         """Expand each media placeholder into one token per visual token.
 
         Kimi's template emits a single placeholder per media item. The expanded
-        count is ``h * w / merge_area`` and does not depend on ``t``, because the
+        count is h * w / merge_area and does not depend on t, because the
         vision tower average-pools a chunk's frames into one spatial grid.
 
-        Returns the expanded ids and the half-open ``[start, end)`` range each
+        Returns the expanded ids and the half-open [start, end) range each
         grid occupies in them. Those ranges are what drives the whole in-model
         merge, so a mismatch is fatal here rather than a warning: under-counting
         silently corrupted embeddings on the MultiStage path.

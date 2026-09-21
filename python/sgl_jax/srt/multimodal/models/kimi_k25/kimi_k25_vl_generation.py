@@ -27,21 +27,9 @@ logger = logging.getLogger(__name__)
 class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM, InModelMultimodalContract):
     """Kimi-K2.5 on the in-model multimodal path.
 
-    The vision tower lives inside this class as ``self.visual``. The engine calls
-    ``get_input_embeddings()`` to embed text and ``get_multimodal_encode_funcs()``
-    to encode media, then merges the two itself
-    (``multimodal/in_model/host_orchestration.py``).
-
-    Why Kimi does not reuse Qwen's ``run_mrope_vision_model``/``lane_packing``
-    helpers: ``lane_packing`` asserts
-    ``feature_patches == grid_patches == placeholder_patches``, where
-    ``placeholder_patches`` is the placeholder-token count times the merge unit.
-    Kimi's ``sd2_tpool`` merger averages the temporal axis away, so a grid
-    ``(t, h, w)`` produces ``t*h*w`` patches but only ``h*w/merge_area``
-    placeholder tokens. For any video chunk with ``t > 1`` that assertion fails.
-    Those helpers are Qwen conveniences, not contract obligations - the contract
-    only requires an item-ordered ``[capacity, hidden]`` array - so Kimi supplies
-    its own encode function below.
+    The vision tower lives inside this class as self.visual. The engine calls
+    get_input_embeddings() to embed text and get_multimodal_encode_funcs() to
+    encode media, then merges the two itself.
     """
 
     def __init__(
@@ -51,8 +39,6 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM, InModelMultimodalCo
         mesh=None,
         rngs: nnx.Rngs | None = None,
     ):
-        # super().__init__ sets self.config to text_config; the full VL config is
-        # only needed here to pull the text half out of it.
         self.text_config = get_hf_text_config(config) or config
         self.dtype = dtype or jnp.bfloat16
         self.mesh = mesh
@@ -72,12 +58,6 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM, InModelMultimodalCo
         )
         self.hf_weight_prefix = "language_model."
 
-        # The model loader constructs models as ``cls(config, dtype=, mesh=)`` and
-        # never passes rngs, so a default is required here.
-        #
-        # The dataclass defaults are the shipped Kimi-K2.5 architecture: every
-        # field matches the checkpoint's own ``vision_config`` exactly, so there
-        # is nothing to overlay from ``config``.
         self.vision_config = KimiK25ModelVitConfig()
         self.visual = Kimi_K25_VisionModel(
             self.vision_config,
@@ -86,10 +66,6 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM, InModelMultimodalCo
             mesh=self.mesh,
         )
         self._encode_vision_fn: Callable | None = None
-
-    # ------------------------------------------------------------------
-    # InModelMultimodalContract
-    # ------------------------------------------------------------------
 
     def get_input_embeddings(self) -> Callable[[jax.Array], jax.Array]:
         return self.model.embed_tokens
@@ -107,11 +83,11 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM, InModelMultimodalCo
         }
 
     def encode_vision_items(self, items: list[MultimodalDataItem]) -> jax.Array:
-        """Encode media items into one item-ordered ``[tokens, hidden]`` array.
+        """Encode media items into one item-ordered [tokens, hidden] array.
 
-        Row ``i`` of the result is the ``i``-th visual token in item order, which
-        is exactly what ``host_orchestration._gather_merge`` expects. The tower's
-        temporal pooling means each item contributes ``h*w/merge_area`` rows
+        Row i of the result is the i-th visual token in item order, which
+        is exactly what host_orchestration._gather_merge expects. The tower's
+        temporal pooling means each item contributes h*w/merge_area rows
         regardless of its frame count.
         """
         if not items:
@@ -129,11 +105,6 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM, InModelMultimodalCo
             merge_weights,
         ) = self.visual.vision_tower.compute_aux_arrays(grids)
 
-        # TODO(kimi-buckets): pixel_values / merge_indices are passed at their
-        # natural size, so a new grid combination triggers a recompile. Padding
-        # them to fixed capacities (and reporting those from
-        # get_multimodal_embedding_packed_capacities) is tracked separately
-        # because the bucket ladder depends on the deployed frame budget.
         return encode(
             pixel_values.astype(self.dtype),
             abs_pos_embs,
@@ -173,8 +144,8 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM, InModelMultimodalCo
     def _ensure_encoder(self) -> Callable:
         """Build the jitted tower + projector, once.
 
-        ``nnx.split`` captures parameter values, so this cannot run before
-        ``load_weights`` -- which is why ``load_weights`` calls it at the end.
+        nnx.split captures parameter values, so this cannot run before
+        load_weights -- which is why load_weights calls it at the end.
         The guard makes the per-request call a no-op.
         """
         if self._encode_vision_fn is not None:
@@ -208,16 +179,10 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM, InModelMultimodalCo
 
         jitted = jax.jit(_encode_vision_impl, static_argnames=["model_state_def"])
 
-        # The graphdef and the parameter leaves are fixed for the life of the
-        # model, so bind them once; callers pass only the per-request arrays.
         encode = functools.partial(jitted, model_def, model_state_def, model_state_leaves)
 
         self._encode_vision_fn = encode
         return encode
-
-    # ------------------------------------------------------------------
-    # Weights
-    # ------------------------------------------------------------------
 
     def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(
@@ -227,8 +192,7 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM, InModelMultimodalCo
             dtype=self.dtype,
         )
         weight_mappings = self._create_weight_mappings(model_config)
-        # Language-model and vision weights live in the same checkpoint under
-        # different prefixes, so one pass covers both.
+
         weight_mappings.update(
             create_kimi_vision_weight_mappings(
                 self.vision_config.vt_num_hidden_layers,
@@ -239,10 +203,6 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM, InModelMultimodalCo
 
         for layer in self.model.layers:
             layer.self_attn.post_load_weights()
-        # Build the encoder now that parameters are real. nnx.split captures
-        # values, so an encoder built earlier would hold initialisation noise,
-        # and building it later would mutate a module attribute after
-        # ModelRunner.initialize_jit has already snapshotted the graph.
         self._ensure_encoder()
         logger.info("Kimi K2.5 language model and vision tower weights loaded successfully!")
 

@@ -9,11 +9,7 @@ from flax import nnx
 from jax.sharding import Mesh
 
 from sgl_jax.srt.multimodal.configs.kimi.kimi_k25_config import KimiK25ModelVitConfig
-from sgl_jax.srt.multimodal.kernels.flash_attention import (
-    BlockSizes,
-    SegmentIds,
-    flash_attention,
-)
+from sgl_jax.srt.multimodal.kernels.flash_attention import SegmentIds, flash_attention
 from sgl_jax.srt.utils.weight_utils import WeightMapping
 
 init_fn = nnx.initializers.uniform()
@@ -154,39 +150,6 @@ def align_to(x, a):
     return pl.cdiv(x, a) * a
 
 
-# The Pallas kernel's smallest addressable tile along the KV axis.
-_KV_MIN_BLOCK = 128
-
-# Cost of one KV token inside the kernel's VMEM window: the 72-wide heads pad up
-# to a full 128-lane register, the window is f32, and Pallas double-buffers it.
-_KV_WINDOW_BYTES_PER_TOKEN = 128 * 4 * 2
-
-# Q, the output tile and the softmax scratch all have to share VMEM with the KV
-# window, so only a fraction of the 64 MB budget is spent here.
-_KV_WINDOW_BUDGET_BYTES = 8 * 1024 * 1024
-
-
-def _vmem_safe_kv_block(kv_seq_len: int) -> int:
-    """Largest KV block the flash-attention kernel can hold in VMEM.
-
-    The kernel walks the KV axis in ``kv_seq_len // block_k_major`` steps, so the
-    block has to divide the sequence exactly, and it must also be a multiple of
-    the kernel's 128-lane minimum. ``kv_seq_len`` is returned unchanged when the
-    whole sequence already fits, which keeps short items -- images and brief
-    clips -- on the kernel's single-step fast path.
-    """
-    max_block = _KV_WINDOW_BUDGET_BYTES // _KV_WINDOW_BYTES_PER_TOKEN
-    if kv_seq_len <= max_block:
-        return kv_seq_len
-
-    # Callers align the sequence to 256, so 128 always divides it and the loop
-    # is guaranteed to terminate on a valid block.
-    for block in range(max_block - max_block % _KV_MIN_BLOCK, 0, -_KV_MIN_BLOCK):
-        if kv_seq_len % block == 0:
-            return block
-    return _KV_MIN_BLOCK
-
-
 def apply_2d_rope(x: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
     x_real = x[..., 0::2]
     x_imag = x[..., 1::2]
@@ -253,13 +216,6 @@ class KimiK25VisionAttention(nnx.Module):
         v: jax.Array,
         item_ids: jax.Array,
     ) -> jax.Array:
-        """Run the Pallas kernel over ``[seq_len, num_heads, head_dim]`` inputs.
-
-        The sequence is padded up to the kernel's 256-wide query block. Padded
-        positions get segment id 0, which no real token carries, so the kernel
-        masks them out. ``item_ids`` gives each real token the 1-based index of
-        the item it belongs to, which is what makes attention block-diagonal.
-        """
         seq_len = q.shape[0]
         align_seq_len = align_to(seq_len, 256)
         pad_len = align_seq_len - seq_len
@@ -277,23 +233,6 @@ class KimiK25VisionAttention(nnx.Module):
         pad_k = jnp.transpose(k, (1, 0, 2))[None, ...]
         pad_v = jnp.transpose(v, (1, 0, 2))[None, ...]
 
-        # For any ``kv_seq_len <= 92800`` the kernel forces
-        # ``block_k_major = block_k = kv_seq_len`` to reach its single-step fast
-        # path, which asks for a VMEM window of
-        # ``kv_seq_len * 128 lanes * 4 B * 2 buffers``. The 72-wide heads here pad
-        # to 128 lanes, so a 74240-token video needs 76 MB against a 64 MB budget
-        # and the kernel dies with RESOURCE_EXHAUSTED. Long videos therefore need
-        # an explicit, smaller KV block; short ones keep the fast path.
-        block_sizes = None
-        kv_block = _vmem_safe_kv_block(align_seq_len)
-        if kv_block < align_seq_len:
-            block_sizes = BlockSizes(
-                block_q=min(256, align_seq_len),
-                block_k_major=kv_block,
-                block_k=kv_block,
-                block_b=1,
-            )
-
         def local_flash_attention(q, k, v, segment_ids):
             return flash_attention(
                 q,
@@ -302,7 +241,6 @@ class KimiK25VisionAttention(nnx.Module):
                 segment_ids=segment_ids,
                 causal=False,
                 sm_scale=self.scale,
-                block_sizes=block_sizes,
             )
 
         in_specs = (
