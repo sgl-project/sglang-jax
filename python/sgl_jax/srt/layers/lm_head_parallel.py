@@ -2,11 +2,8 @@
 
 import jax
 import jax.numpy as jnp
-from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
-
-from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead
 
 
 def weight_spec(enable_dp_lm_head: bool) -> P:
@@ -24,55 +21,6 @@ def prepare_weight(weight: jax.Array, mesh: jax.sharding.Mesh, enable_dp_lm_head
         weight = jax.sharding.reshard(weight, NamedSharding(mesh, P(None, None)))
         weight = jnp.pad(weight, ((0, padding), (0, 0)))
     return jax.sharding.reshard(weight, NamedSharding(mesh, weight_spec(enable_dp_lm_head)))
-
-
-def _standalone_heads(model):
-    modules = list(nnx.iter_modules(model))
-    tied = {
-        id(m.embedding)
-        for _, m in modules
-        if isinstance(m, Embed) and not isinstance(m, ParallelLMHead)
-    }
-    return [
-        (path, module)
-        for path, module in modules
-        if isinstance(module, ParallelLMHead) and id(module.embedding) not in tied
-    ]
-
-
-def lm_head_load_shardings(model, mesh, enable_dp_lm_head):
-    """Load divisible standalone heads directly into vocabulary shards.
-
-    Non-divisible heads load replicated and are padded once after loading.
-    Tied embeddings keep their original placement for embedding lookup.
-    """
-    heads = _standalone_heads(model)
-    if not heads:
-        return {}
-    partitions = mesh.shape["tensor"] * (1 if enable_dp_lm_head else mesh.shape["data"])
-    return {
-        ".".join(map(str, (*path, "embedding"))): (
-            tuple(weight_spec(enable_dp_lm_head))
-            if head.embedding.value.shape[0] % partitions == 0
-            else (None, None)
-        )
-        for path, head in heads
-    }
-
-
-def configure_lm_heads(model, mesh, enable_dp_lm_head):
-    # Local import avoids a cycle with LogitsProcessor's compute helper.
-    from sgl_jax.srt.layers.logits_processor import LogitsProcessor
-
-    for _, module in nnx.iter_modules(model):
-        if isinstance(module, LogitsProcessor):
-            module.enable_dp_lm_head = enable_dp_lm_head
-    for _, head in _standalone_heads(model):
-        # Draft heads supplied later by the target may still be abstract here.
-        if isinstance(head.embedding.value, jax.ShapeDtypeStruct):
-            continue
-        head.embedding.value = prepare_weight(head.embedding.value, mesh, enable_dp_lm_head)
-        head.kernel_axes = tuple(weight_spec(enable_dp_lm_head))
 
 
 def compute_lm_head_logits(

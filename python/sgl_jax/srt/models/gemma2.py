@@ -315,6 +315,7 @@ class Gemma2ForCausalLM(nnx.Module):
             self.config.vocab_size,
             soft_cap=self.config.final_logit_softcapping,
             mesh=self.mesh,
+            enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
         )
 
     def load_weights(self, model_config: ModelConfig):

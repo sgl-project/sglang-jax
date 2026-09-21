@@ -15,7 +15,7 @@
 """Embedding Layers."""
 
 import math
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
@@ -28,6 +28,9 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.environ import envs as _envs
 from sgl_jax.srt.utils.profiling_utils import named_scope
+
+if TYPE_CHECKING:
+    from sgl_jax.srt.utils.weight_utils import WeightMapping
 
 
 class Embed(nnx.Module):
@@ -108,6 +111,12 @@ class Embed(nnx.Module):
         output = embedding.at[inputs].get(out_sharding=output_sharding)
         return output
 
+    def weight_mapping(self, target_path: str) -> "WeightMapping":
+        """Declare the checkpoint layout without changing tied embedding storage."""
+        from sgl_jax.srt.utils.weight_utils import WeightMapping
+
+        return WeightMapping(target_path, sharding=self.kernel_axes)
+
     def attend(self, query: jax.Array) -> jax.Array:
         """Attend over the embedding using a query array.
 
@@ -140,9 +149,9 @@ class ParallelLMHead(Embed):
         dtype: jnp.dtype | None = None,
         param_dtype: jnp.dtype = jnp.bfloat16,
         promote_dtype: PromoteDtypeFn = dtypes.promote_dtype,
-        kernel_axes: tuple[str | None, ...] = ("tensor", None),
         mesh: jax.sharding.Mesh | None = None,
         use_bias: bool = False,
+        enable_dp_lm_head: bool = False,
     ):
         """
         Initialize the language model head.
@@ -155,11 +164,22 @@ class ParallelLMHead(Embed):
             param_dtype: Data type for parameter storage (weights and bias).
             promote_dtype: Function to handle dtype promotion during logits computation.
                           Controls how hidden_states and embedding tensors are promoted.
+            enable_dp_lm_head: Use attention TP within each DP group instead of global TP.
             use_bias: Whether to include bias parameters. Note: bias is currently
                      not used in logits computation, reserved for future extension.
         """
+        from sgl_jax.srt.layers.lm_head_parallel import weight_spec
+
+        self.enable_dp_lm_head = enable_dp_lm_head
+        kernel_axes = tuple(weight_spec(enable_dp_lm_head))
+        partitions = (
+            1
+            if mesh is None
+            else mesh.shape["tensor"] * (1 if enable_dp_lm_head else mesh.shape["data"])
+        )
+        self.vocab_padding = -num_embeddings % partitions
         super().__init__(
-            num_embeddings=num_embeddings,
+            num_embeddings=num_embeddings + self.vocab_padding,
             features=features,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -167,6 +187,7 @@ class ParallelLMHead(Embed):
             kernel_axes=kernel_axes,
             mesh=mesh,
         )
+        self.num_embeddings = num_embeddings
         if use_bias:
             bias_sharding = NamedSharding(mesh, P(None, "tensor")) if mesh is not None else None
             self.bias = nnx.Param(
@@ -180,9 +201,17 @@ class ParallelLMHead(Embed):
         else:
             self.bias = None
 
+    def weight_mapping(self, target_path: str) -> "WeightMapping":
+        mapping = super().weight_mapping(target_path)
+        if self.vocab_padding:
+            mapping.pad_width = ((0, self.vocab_padding), (0, 0))
+        return mapping
+
     def tie_weights(self, embed_tokens: Embed):
         """Tie the weights with word embeddings."""
         self.embedding = embed_tokens.embedding
+        self.kernel_axes = embed_tokens.kernel_axes
+        self.vocab_padding = 0
         return self
 
     def __call__(self, input_):

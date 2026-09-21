@@ -17,7 +17,7 @@ Fused speculative greedy verification and topk=1 draft calls instead keep the gl
 
 With the flag enabled, weights use `P("tensor", None)` and the projection keeps token rows sharded over `data`. With DP=1 both choices have the same physical partitioning.
 
-Standalone `ParallelLMHead` weights are loaded directly in their selected layout when vocabulary is divisible by the partition count. Other vocabulary sizes are padded once after loading and logits are trimmed to the real vocabulary before sampling. Non-divisible vocabularies temporarily load replicated, so their peak loading memory can exceed final weight memory. Tied input/output embeddings retain their input embedding layout and are reshared for the projection; they do not get the persistent-weight memory saving of an untied head.
+Standalone `ParallelLMHead` weights are loaded directly in their selected layout when vocabulary is divisible by the partition count. The model passes the policy explicitly to `ParallelLMHead` and `LogitsProcessor` at construction; the head declares its weight mapping and padded shape, so calling the model's own `load_weights()` is sufficient without a loader-side configuration pass. Other vocabulary sizes are padded during loading and logits are trimmed to the real vocabulary before sampling. Non-divisible vocabularies temporarily load replicated, so their peak loading memory can exceed final weight memory. Tied input/output embeddings retain their input embedding layout and are reshared for the projection; they do not get the persistent-weight memory saving of an untied head.
 
 Draft runners use the same flag. Target-to-draft head sharing retains the target array layout; this is not an independent draft TP control.
 

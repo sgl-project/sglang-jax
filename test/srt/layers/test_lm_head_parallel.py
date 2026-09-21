@@ -9,12 +9,7 @@ from jax.sharding import AxisType, Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead
-from sgl_jax.srt.layers.lm_head_parallel import (
-    configure_lm_heads,
-    lm_head_load_shardings,
-    prepare_weight,
-    weight_spec,
-)
+from sgl_jax.srt.layers.lm_head_parallel import prepare_weight, weight_spec
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 
@@ -31,19 +26,27 @@ def mesh(request):
 
 
 class _HeadModel(nnx.Module):
-    def __init__(self, mesh, vocab=32):
-        self.lm_head = ParallelLMHead(vocab, 12, param_dtype=jnp.float32)
-        self.logits_processor = LogitsProcessor(vocab, mesh)
+    def __init__(self, mesh, vocab=32, dp_head=False):
+        self.lm_head = ParallelLMHead(
+            vocab, 12, param_dtype=jnp.float32, mesh=mesh, enable_dp_lm_head=dp_head
+        )
+        self.logits_processor = LogitsProcessor(vocab, mesh, enable_dp_lm_head=dp_head)
 
 
 def _projection(mesh, dp_head, weight, soft_cap=None):
     vocab, hidden = weight.shape
-    head = ParallelLMHead(vocab, hidden, dtype=jnp.float32, param_dtype=jnp.float32)
+    head = ParallelLMHead(
+        vocab,
+        hidden,
+        dtype=jnp.float32,
+        param_dtype=jnp.float32,
+        mesh=mesh,
+        enable_dp_lm_head=dp_head,
+    )
     head.embedding.value = prepare_weight(
         jax.device_put(weight, NamedSharding(mesh, P())), mesh, dp_head
     )
-    proc = LogitsProcessor(vocab, mesh, soft_cap=soft_cap)
-    proc.enable_dp_lm_head = dp_head
+    proc = LogitsProcessor(vocab, mesh, soft_cap=soft_cap, enable_dp_lm_head=dp_head)
     return head, proc
 
 
@@ -78,12 +81,10 @@ def test_projection_and_dp_local_selection(mesh, dp_head, vocab):
 @pytest.mark.parametrize("dp_head", [False, True])
 def test_loading_and_shared_draft_head(mesh, dp_head):
     with jax.set_mesh(mesh):
-        model, draft = _HeadModel(mesh), _HeadModel(mesh)
-        mappings = lm_head_load_shardings(model, mesh, dp_head)
-        assert mappings == {"lm_head.embedding": tuple(weight_spec(dp_head))}
+        model, draft = _HeadModel(mesh, dp_head=dp_head), _HeadModel(mesh, dp_head=dp_head)
+        mapping = model.lm_head.weight_mapping("lm_head.embedding")
+        assert mapping.sharding == tuple(weight_spec(dp_head))
         original = np.asarray(model.lm_head.embedding.value)
-        configure_lm_heads(model, mesh, dp_head)
-        configure_lm_heads(draft, mesh, dp_head)
         draft.lm_head.embedding.value = model.lm_head.embedding.value
         assert draft.logits_processor.enable_dp_lm_head == dp_head
         assert draft.lm_head.embedding.value is model.lm_head.embedding.value
@@ -101,8 +102,7 @@ def test_tied_embedding_keeps_input_layout(mesh):
     with jax.set_mesh(mesh):
         model = Model()
         original = model.embed.embedding.value
-        assert lm_head_load_shardings(model, mesh, False) == {}
-        configure_lm_heads(model, mesh, False)
+        assert model.lm_head.weight_mapping("lm_head.embedding").sharding == model.embed.kernel_axes
         assert model.embed.embedding.value is original
         assert model.lm_head.embedding is model.embed.embedding
 
@@ -115,7 +115,7 @@ def test_weight_loader(mesh, dp_head, vocab, dummy, tmp_path):
 
     from safetensors.numpy import save_file
 
-    from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
+    from sgl_jax.srt.utils.weight_utils import WeightLoader
 
     original = np.arange(vocab * 12, dtype=np.float32).reshape(vocab, 12) / 100
     save_file({"lm_head.weight": original}, tmp_path / "model.safetensors")
@@ -125,15 +125,14 @@ def test_weight_loader(mesh, dp_head, vocab, dummy, tmp_path):
         _dummy_mode=dummy,
     )
     with jax.set_mesh(mesh):
-        model = nnx.eval_shape(lambda: _HeadModel(mesh, vocab))
+        model = nnx.eval_shape(lambda: _HeadModel(mesh, vocab, dp_head))
         loader = WeightLoader(model, config, mesh, dtype=jnp.float32)
         loader.load_weights_from_safetensors(
-            {"lm_head.weight": WeightMapping("lm_head.embedding", sharding=("tensor", None))}
+            {"lm_head.weight": model.lm_head.weight_mapping("lm_head.embedding")}
         )
         # Divisible heads must already be sharded directly by the loader.
         if vocab == 32:
             assert model.lm_head.embedding.value.sharding.spec == weight_spec(dp_head)
-        configure_lm_heads(model, mesh, dp_head)
         np.testing.assert_array_equal(
             np.asarray(model.lm_head.embedding.value)[:vocab],
             np.zeros_like(original) if dummy else original,
@@ -184,21 +183,6 @@ def test_forward_modes(mesh, dp_head, mode):
         expected = 3.0 * np.tanh((hidden[rows] @ weight.T) / 3.0)
         np.testing.assert_allclose(result.next_token_logits, expected, rtol=2e-5, atol=2e-5)
         np.testing.assert_array_equal(result.hidden_states, hidden)
-
-
-def test_model_without_lm_head_accepts_other_mesh_axes():
-    # The common loader is also used by vision/audio models, whose meshes do
-    # not necessarily have the language model's data/tensor axis names.
-    class Encoder(nnx.Module):
-        def __init__(self):
-            self.weight = nnx.Param(jnp.ones((4, 4)))
-
-    mesh = Mesh(np.array(jax.devices()[:1]), ("encoder",))
-    model = Encoder()
-    original = model.weight.value
-    assert lm_head_load_shardings(model, mesh, False) == {}
-    configure_lm_heads(model, mesh, False)
-    assert model.weight.value is original
 
 
 @pytest.mark.parametrize("dp_head", [False, True])
@@ -292,3 +276,55 @@ def test_multimodal_config_without_hf_config_loads_weights(tmp_path, dummy):
         np.asarray(model.weight.value), np.zeros_like(original) if dummy else original
     )
     assert model.weight.value.sharding.spec == P(None, None)
+
+
+@pytest.mark.parametrize("dp_head", [False, True])
+@pytest.mark.parametrize("dummy", [False, True])
+@pytest.mark.parametrize("tied", [False, True])
+def test_qwen3_direct_construction_and_load(mesh, dp_head, dummy, tied, tmp_path):
+    """The model's own load_weights must suffice without an outer model loader."""
+    from types import SimpleNamespace
+
+    from safetensors.numpy import save_file
+    from transformers import Qwen3Config
+
+    from sgl_jax.srt.models.qwen3 import Qwen3ForCausalLM
+
+    # Divisible by attention TP; deliberately needs global-TP padding at DP > 1.
+    vocab = 5 * mesh.shape["tensor"]
+    config = Qwen3Config(
+        vocab_size=vocab,
+        hidden_size=16,
+        num_hidden_layers=0,
+        num_attention_heads=8,
+        num_key_value_heads=8,
+        tie_word_embeddings=tied,
+    )
+    config.enable_dp_lm_head = dp_head
+    embed = np.arange(vocab * 16, dtype=np.float32).reshape(vocab, 16) / 100
+    weight = embed + 1
+    checkpoint = {"model.embed_tokens.weight": embed, "model.norm.weight": np.ones(16, np.float32)}
+    if not tied:
+        checkpoint["lm_head.weight"] = weight
+    save_file(checkpoint, tmp_path / "model.safetensors")
+    load_config = SimpleNamespace(model_path=str(tmp_path), hf_config=config, _dummy_mode=dummy)
+    with jax.set_mesh(mesh):
+        model = Qwen3ForCausalLM(config, mesh, dtype=jnp.float32)
+        assert model.logits_processor.enable_dp_lm_head == dp_head
+        if not tied:
+            assert model.lm_head.embedding.value.sharding.spec == weight_spec(dp_head)
+        model.load_weights(load_config)
+        head = model.model.embed_tokens if tied else model.lm_head
+        expected_weight = embed if tied else weight
+        if dummy:
+            expected_weight = np.zeros_like(expected_weight)
+        np.testing.assert_array_equal(np.asarray(head.embedding.value)[:vocab], expected_weight)
+        expected_spec = P("tensor", None) if tied else weight_spec(dp_head)
+        assert head.embedding.value.sharding.spec == expected_spec
+        if not tied:
+            np.testing.assert_array_equal(np.asarray(head.embedding.value)[vocab:], 0)
+        h = jax.device_put(np.ones((16, 16), np.float32), NamedSharding(mesh, P("data", None)))
+        result = jax.jit(lambda x, w: model.logits_processor._get_logits(x, w))(h, head)
+        np.testing.assert_allclose(result, np.ones((16, 16)) @ expected_weight.T, rtol=2e-5)
+        # Projection must not replace the tied input embedding with a padded head.
+        assert model.model.embed_tokens.embedding.value.shape == (vocab, 16)

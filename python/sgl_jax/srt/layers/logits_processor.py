@@ -255,10 +255,17 @@ class LogitsMetadata:
 class LogitsProcessor(nnx.Module):
     """Logits processor for the model."""
 
-    def __init__(self, vocab_size: int, mesh: Mesh, soft_cap: float | None = None):
+    def __init__(
+        self,
+        vocab_size: int,
+        mesh: Mesh,
+        soft_cap: float | None = None,
+        *,
+        enable_dp_lm_head: bool = False,
+    ):
         self.vocab_size = vocab_size
         self.soft_cap = soft_cap
-        self.enable_dp_lm_head = False
+        self.enable_dp_lm_head = enable_dp_lm_head
         self.mesh = mesh
 
     def _select_hidden_states(self, hidden_states: jax.Array, indices: jax.Array) -> jax.Array:

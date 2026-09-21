@@ -422,9 +422,14 @@ class LlamaForCausalLM(nnx.Module):
                 config.hidden_size,
                 dtype=self.dtype,
                 param_dtype=dtype_config.get_dtype("lm_head"),
-                kernel_axes=("tensor", None),
+                mesh=mesh,
+                enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
             )
-        self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
+        self.logits_processor = LogitsProcessor(
+            config.vocab_size,
+            mesh=self.mesh,
+            enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
+        )
         self.capture_aux_hidden_states = False
 
     def load_weights(self, model_config: ModelConfig):
@@ -453,9 +458,7 @@ class LlamaForCausalLM(nnx.Module):
         }
 
         if not getattr(self.config, "tie_word_embeddings", False):
-            mappings["lm_head.weight"] = WeightMapping(
-                target_path="lm_head.embedding", sharding=("tensor", None), transpose=False
-            )
+            mappings["lm_head.weight"] = self.lm_head.weight_mapping("lm_head.embedding")
 
         num_layers = self.config.num_hidden_layers
         for layer_idx in range(num_layers):

@@ -10,7 +10,7 @@ import struct
 import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 import jax
@@ -84,6 +84,7 @@ class WeightMapping:
     concat_axis: int | None = None
     is_eagle3: bool = False
     physical_to_logical_map: np.ndarray | None = None
+    pad_width: tuple[tuple[int, int], ...] | None = None
 
     def __post_init__(self):
         if self.sharding is None:
@@ -1921,27 +1922,6 @@ class WeightLoader:
         must be covered by a regular mapping, an MoE expert group, or an
         excluded layer.
         """
-        from sgl_jax.srt.layers.lm_head_parallel import lm_head_load_shardings
-
-        # Change only standalone LM heads; tied input embeddings retain their
-        # embedding layout. Do this before both lazy and dummy loading.
-        head_shardings = lm_head_load_shardings(
-            self.model,
-            self.mesh,
-            getattr(getattr(self.model_config, "hf_config", None), "enable_dp_lm_head", False),
-        )
-        weight_mappings = dict(weight_mappings)
-        for key, mapping in weight_mappings.items():
-            if isinstance(mapping, str | list):
-                mapping = WeightMapping(target_path=mapping)
-            if (
-                isinstance(mapping, WeightMapping)
-                and isinstance(mapping.target_path, str)
-                and mapping.target_path in head_shardings
-            ):
-                weight_mappings[key] = replace(
-                    mapping, sharding=head_shardings[mapping.target_path]
-                )
         params = nnx.state(self.model)
 
         if dummy or self.dummy_mode:
@@ -2034,6 +2014,7 @@ class WeightLoader:
                     isinstance(mapping.target_path, str)
                     and not mapping.target_path.startswith("__FUSED_QKV_")
                     and not mapping.target_path.startswith("__KV_")
+                    and mapping.pad_width is None
                     and mapping.reshape is None
                     and mapping.repeat is None  # Check repeat here too!
                     and not mapping.kv_head_padding
@@ -2631,6 +2612,9 @@ class WeightLoader:
             processed_weight = jnp.repeat(processed_weight, times, axis=axis)
         if mapping.kv_head_padding:
             processed_weight = self._apply_kv_head_padding(processed_weight, hf_key)
+
+        if mapping.pad_width is not None:
+            processed_weight = jnp.pad(processed_weight, mapping.pad_width)
 
         assert mapping.sharding is not None
         sharded_weight = self._shard_weight(processed_weight, mapping.sharding)

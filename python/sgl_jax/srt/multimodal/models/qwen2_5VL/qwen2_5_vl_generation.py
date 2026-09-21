@@ -118,9 +118,14 @@ class Qwen2_5_VL_Generation(nnx.Module):
                 self.text_config.hidden_size,
                 dtype=self.dtype,
                 param_dtype=self.dtype,
-                kernel_axes=("tensor", None),
+                mesh=mesh,
+                enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
             )
-        self.logits_processor = LogitsProcessor(self.text_config.vocab_size, mesh=self.mesh)
+        self.logits_processor = LogitsProcessor(
+            self.text_config.vocab_size,
+            mesh=self.mesh,
+            enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
+        )
 
         # Multimodal token ids (from full config, if available)
         self.image_token_id = getattr(self.config, "image_token_id", None)
@@ -150,9 +155,7 @@ class Qwen2_5_VL_Generation(nnx.Module):
         }
 
         if not getattr(self.text_config, "tie_word_embeddings", False):
-            mappings["lm_head.weight"] = WeightMapping(
-                target_path="lm_head.embedding", sharding=("tensor", None), transpose=False
-            )
+            mappings["lm_head.weight"] = self.lm_head.weight_mapping("lm_head.embedding")
 
         num_layers = self.text_config.num_hidden_layers
         for layer_idx in range(num_layers):
