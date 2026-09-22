@@ -23,7 +23,7 @@ from sgl_jax.srt.layers.attention.base_attn_backend import (
     AttentionBackendMetadata,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
-from sgl_jax.srt.utils.jax_utils import device_array
+from sgl_jax.srt.utils.jax_utils import device_array, is_tpu_runtime
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
@@ -348,7 +348,7 @@ class HCABackend(AttentionBackend):
         Factored out of the hot path for readability; under jit these run at
         trace time only. Must not mutate ``self`` -- nnx forbids it in a trace.
         """
-        if jax.default_backend() != "tpu":
+        if not is_tpu_runtime():
             raise RuntimeError("production HCABackend requires a TPU backend")
         weight_shape = (self.head_dim, self.compressor_hidden_size)
         if wkv.shape != weight_shape or wgate.shape != weight_shape:

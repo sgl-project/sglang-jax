@@ -192,6 +192,29 @@ and `linear_attn_config.full_attn_layers`. These lists use one-based layer IDs.
 v6e has one device per chip, and v7x has two. For example, `v7x-32` describes
 16 chips with 32 devices.
 
+The topology presets passed to libtpu are:
+
+| `--topology` | libtpu topology | Chips | Logical hosts |
+| --- | --- | --- | --- |
+| `v6e-1` | `v6e:1x1` | 1 | 1 |
+| `v6e-4` | `v6e:2x2` | 4 | 1 |
+| `v6e-8` | `v6e:2x4` | 8 | 2 |
+| `v6e-16` | `v6e:4x4` | 16 | 4 |
+| `v6e-32` | `v6e:4x8` | 32 | 8 |
+| `v6e-64` | `v6e:8x8` | 64 | 16 |
+| `v7x-8` | `TPU7x:2x2x1` | 4 | 1 |
+| `v7x-16` | `TPU7x:2x2x2` | 8 | 2 |
+| `v7x-32` | `TPU7x:2x2x4` | 16 | 4 |
+| `v7x-64` | `TPU7x:2x4x4` | 32 | 8 |
+
+Each preset uses one slice, no wraparound, and chips-per-host bounds `(2, 2, 1)`
+except `v6e-1`, which uses `(1, 1, 1)`. These hosts describe the target topology;
+the export itself runs in one CPU process. The logical mesh axis order is
+`(data, tensor)` with shape `(dp-size, tp-size / dp-size)`, using JAX's topology-aware
+mapping with physical-axis splitting allowed. Check `mesh`, `mesh_device_ids`
+(flattened in mesh axis order), and `target_topology` in the manifest when comparing
+collectives: device count alone does not identify the physical mapping.
+
 - `--tp-size`: total device count; it must match the topology suffix.
 - `--dp-size`: attention data parallelism. Attention TP is `tp-size / dp-size`.
 - `--ep-size`: expert parallelism. For the MiMo `fused_v2` command, set it equal
@@ -256,6 +279,19 @@ must start with `xla_`; their availability depends on the compiler version. Dump
 options are managed by the tool. Remove existing dump flags from `XLA_FLAGS` and
 `LIBTPU_INIT_ARGS` before running it, and invoke the CLI in a fresh Python process.
 
+To match serving decode's SparseCore gather workaround, prefix the command with
+`SGLANG_JAX_DECODE_DISABLE_SC_GATHER_OFFLOAD=1`. The exporter reuses serving's
+per-forward options: both gather-offload passes are disabled for `decode` and
+`mtp-draft`, while verify and draft-extend retain their defaults. Serving uses this
+workaround through its `SGLANG_JAX_AOT_DISPATCH` path; the exporter already compiles
+explicitly and needs no dispatch setting. `SGLANG_JAX_ENABLE_KERNEL_LOG_RECORDER=1`
+and attention-backend compiler options are also honored. Explicit
+`--compiler-option` values take precedence; inspect `compiler_options` in the
+manifest for the effective values.
+
+Leave `PALLAS_INTERPRET` unset when inspecting TPU kernels. Explicit interpret
+settings still select their debug implementations in kernels that honor them.
+
 ## Find and inspect the output
 
 | Path under `--output` | What to inspect |
@@ -272,6 +308,14 @@ Start with `manifest.json` and check for `status: complete` and the requested st
 For LLO inspection, look for `*-final_bundles.txt`; intermediate pass snapshots are
 also retained. Static memory reports describe compiler allocations, not measured
 runtime memory peaks. The output contains compiler IR, not a serialized executable.
+
+Inspect `custom_calls` in the manifest to check which kernels actually reached
+optimized HLO. Each entry records a custom-call target, HLO instruction, and source
+`op_name`. For example, an EPMoE GMM v2 export should contain a `tpu_custom_call`
+whose instruction name or `op_name` includes `gmm_v2-`; finding `gmm` elsewhere in
+HLO does not establish that the TPU kernel was compiled. Compile-only artifacts
+support graph, layout,
+and static-allocation analysis; measure performance on the target hardware.
 
 Prefer a local output directory, then archive it for transfer:
 

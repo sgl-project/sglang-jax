@@ -167,7 +167,8 @@ class RecurrentStatePool:
         )
         self.conv_sharding = NamedSharding(mesh, P(data_partition_axis, conv_partition_axis, None))
 
-        self.recurrent_buffers, self.conv_buffers = self._create_buffers(abstract=abstract)
+        buffers = self._create_buffers(abstract=True) if abstract else self._create_buffers()
+        self.recurrent_buffers, self.conv_buffers = buffers
 
     def _create_buffers(self, *, abstract: bool = False) -> tuple[list, list]:
         recurrent_shape = (self.total_slots, self.num_heads, self.head_dim, self.head_dim)

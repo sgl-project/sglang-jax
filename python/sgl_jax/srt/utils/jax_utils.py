@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 import gc
 from collections import defaultdict
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import cache
 from typing import Any
 
@@ -24,9 +26,39 @@ def get_device_id_offset(devices):
     return offset if offset != int32_max else 0
 
 
+_COMPILATION_TARGET = ContextVar("sgl_jax_compilation_target", default=None)
+
+
+def get_compilation_target():
+    """Explicit offline target device, or None during ordinary serving."""
+    return _COMPILATION_TARGET.get()
+
+
+@contextmanager
+def compilation_target(mesh):
+    """Select kernel capabilities for an offline export without changing the host.
+
+    Keep this scope around model construction, lowering, and compilation. The
+    JAX mesh also selects Pallas hardware information and participates in JAX's
+    tracing cache key. Nested scopes and exceptions restore the previous target;
+    physical device enumeration and the serving runtime cache remain untouched.
+    """
+    devices = list(mesh.devices.flat)
+    if not devices or len({(d.platform, d.device_kind) for d in devices}) != 1:
+        raise ValueError("Compilation requires a nonempty, homogeneous target mesh")
+    token = _COMPILATION_TARGET.set(devices[0])
+    try:
+        with jax.set_mesh(mesh):
+            yield
+    finally:
+        _COMPILATION_TARGET.reset(token)
+
+
 def get_device_kind():
     """Use the tracing target when cross-compiling on a different host backend."""
-    device = getattr(jax.sharding.get_abstract_mesh(), "abstract_device", None)
+    device = get_compilation_target()
+    if device is None:
+        device = getattr(jax.sharding.get_abstract_mesh(), "abstract_device", None)
     return device.device_kind if device is not None else jax.devices()[0].device_kind
 
 
@@ -271,10 +303,14 @@ def is_tpu_runtime(mesh=None) -> bool:
     """Return True if the current JAX runtime is on TPU devices.
 
     With a mesh, inspect its target devices (including an AOT topology).
-    Otherwise prefer actual runtime devices, falling back to the default backend.
+    An explicit compilation_target scope takes precedence over the cached host
+    runtime. Outside that scope, use the original serving runtime probe.
     """
     if mesh is not None:
         return all(d.platform == "tpu" for d in mesh.devices.flat)
+    target = get_compilation_target()
+    if target is not None:
+        return target.platform == "tpu"
     global _IS_TPU_RUNTIME_CACHED
     if _IS_TPU_RUNTIME_CACHED is not None:
         return _IS_TPU_RUNTIME_CACHED

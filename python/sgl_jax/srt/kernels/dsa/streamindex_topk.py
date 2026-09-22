@@ -28,6 +28,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
+
 Enum = enum.Enum
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
@@ -650,10 +652,9 @@ _SC_TOPK_COOPERATIVE_ABOVE = 4096
 _SC_TOPK_KEY_VALUE_BYTES = 8  # f32 key + int32 value per candidate
 
 
-@functools.lru_cache(maxsize=1)
 def _sparse_core_info():
-    """SparseCore geometry of the current TPU (cached), or None when unavailable."""
-    if jax.default_backend() != "tpu":
+    """Target SparseCore geometry; Pallas caches TPU info by trace context."""
+    if not is_tpu_runtime():
         return None
     try:
         info = pltpu.get_tpu_info()
