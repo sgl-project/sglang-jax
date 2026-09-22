@@ -40,6 +40,9 @@ from sgl_jax.srt.speculative.draft_extend_fused import (
     _make_draft_extend_metadata,
     _make_eagle3_decode_metadata,
     _make_target_verify_metadata,
+    _rotate_input_ids,
+    _rotate_prefill_input_ids,
+    _seed_topk_pages_from_step0,
 )
 from sgl_jax.srt.utils.jax_utils import device_array
 
@@ -83,6 +86,12 @@ def _assert_same_placement(tc, name, got, ref):
 def _consume_like_backend(*arrays):
     """Mirror the backend contract: shard_map with P('data') on every array."""
     specs = tuple(P("data") for _ in arrays)
+    return jax.shard_map(lambda *a: a, in_specs=specs, out_specs=specs, check_vma=False)(*arrays)
+
+
+def _consume_like_backend_2d(*arrays):
+    """Same contract for [T, k] arrays (topk pages): P('data', None)."""
+    specs = tuple(P("data", None) for _ in arrays)
     return jax.shard_map(lambda *a: a, in_specs=specs, out_specs=specs, check_vma=False)(*arrays)
 
 
@@ -154,6 +163,68 @@ class SpecMetadataShardingTest(unittest.TestCase):
 
             for name, arr in draft_decode_md(seq_lens, alloc, ref_md).items():
                 _assert_same_placement(self, f"draft_decode_md.{name}", arr, getattr(ref_md, name))
+
+            # IndexShare seed (draft step 0 -> later steps): [T, k] page-topk in,
+            # same placement out, since the backend shard_maps it with P("data", None).
+            tpr, k = n, 3
+            pages_np = np.arange(bs * tpr * k, dtype=np.int32).reshape(bs * tpr, k)
+            pages = device_array(pages_np, sharding=NamedSharding(mesh, P("data", None)))
+            ext = device_array(np.full((bs,), tpr, np.int32), sharding=data)
+            sel = device_array(np.full((bs,), tpr - 1, np.int32), sharding=data)
+
+            @jax.jit
+            def seed_pages(p, e, s):
+                (out,) = _consume_like_backend_2d(_seed_topk_pages_from_step0(p, e, s))
+                return out
+
+            seeded = seed_pages(pages, ext, sel)
+            _assert_same_placement(self, "index_share.seed_topk_pages", seeded, pages)
+            want = np.repeat(pages_np.reshape(bs, tpr, k)[:, tpr - 1 : tpr, :], tpr, axis=1)
+            np.testing.assert_array_equal(np.asarray(seeded).reshape(bs, tpr, k), want)
+
+            # Draft-step input-id rotation (every MTP layer after the first):
+            # [bs*n] ids in, same placement out (feeds the next layer's embedding).
+            ids_np = (100 + np.arange(bs * tpr)).astype(np.int32)
+            ids = device_array(ids_np, sharding=data)
+            new_np = (900 + np.arange(bs)).astype(np.int32)
+            new_tok = device_array(new_np, sharding=data)
+            ext_np = np.full((bs,), tpr, np.int32)
+            if bs > 1:
+                ext_np[-1] = 0  # a padding request keeps its ids
+            ext_pad = device_array(ext_np, sharding=data)
+            sel_np = np.clip(ext_np - 1, 0, None).astype(np.int32)
+            sel_pad = device_array(sel_np, sharding=data)
+
+            @jax.jit
+            def rotate(i, e, s, t):
+                (out,) = _consume_like_backend(_rotate_input_ids(i, e, s, t))
+                return out
+
+            rotated = rotate(ids, ext_pad, sel_pad, new_tok)
+            _assert_same_placement(self, "draft.rotate_input_ids", rotated, ids)
+            ids_2d = ids_np.reshape(bs, tpr)
+            want_ids = np.concatenate([ids_2d[:, 1:], ids_2d[:, -1:]], axis=1)
+            want_ids[np.arange(bs), sel_np] = new_np
+            want_ids[ext_np == 0] = ids_2d[ext_np == 0]
+            np.testing.assert_array_equal(np.asarray(rotated).reshape(bs, tpr), want_ids)
+
+            # Prefill-time rotation (target extend -> first draft extend): packed
+            # ragged ids per rank; each request's window shifts left by one and
+            # its last slot takes the verified id. Already validated on TPU; this
+            # keeps it covered under the dp=1 / dp=2 explicit meshes.
+            per_dp_bs = bs // dp
+            ext_full = device_array(np.full((bs,), tpr, np.int32), sharding=data)
+            verified = device_array((700 + np.arange(bs)).astype(np.int32), sharding=data)
+
+            @jax.jit
+            def rotate_prefill(i, e, v):
+                (out,) = _consume_like_backend(_rotate_prefill_input_ids(i, e, v, dp, per_dp_bs))
+                return out
+
+            prot = rotate_prefill(ids, ext_full, verified)
+            _assert_same_placement(self, "prefill.rotate_input_ids", prot, ids)
+            want_p = np.concatenate([ids_2d[:, 1:], (700 + np.arange(bs))[:, None]], axis=1)
+            np.testing.assert_array_equal(np.asarray(prot).reshape(bs, tpr), want_p)
 
     def test_dp1_matches_extend_placement(self):
         self._run_case(dp=1)
