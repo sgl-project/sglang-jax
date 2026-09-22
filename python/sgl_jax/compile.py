@@ -10,14 +10,23 @@ from pathlib import Path
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Qwen3 BF16 decode AOT export PoC (native attention)"
+        description="BF16 decode AOT export PoC (Qwen3/native or MiMo-V2-Flash/fa/fused_v2)"
     )
-    parser.add_argument(
-        "--model-config", help="Local Qwen3 config.json; omitted: built-in tiny model"
-    )
+    parser.add_argument("--model-config", help="Local config.json; omitted: built-in tiny Qwen3")
     parser.add_argument("--target", choices=("cpu", "tpu"), default="tpu")
-    parser.add_argument("--topology", choices=("v6e-1", "v6e-4"), help="Target TPU topology")
-    parser.add_argument("--tp-size", type=int, default=1)
+    parser.add_argument("--topology", choices=tuple(f"v6e-{n}" for n in (1, 4, 8, 16, 32, 64)))
+    parser.add_argument("--tp-size", type=int, default=1, help="Total devices, as in serving")
+    parser.add_argument(
+        "--dp-size", type=int, default=1, help="Attention DP; attention TP=tp_size/dp_size"
+    )
+    parser.add_argument("--ep-size", type=int, default=1)
+    parser.add_argument("--attention-backend", choices=("native", "fa"), default="native")
+    parser.add_argument("--moe-backend", choices=("fused_v2",))
+    parser.add_argument(
+        "--bf16-model",
+        action="store_true",
+        help="Explicitly replace checkpoint quantization with synthetic BF16 weights",
+    )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--context-length", type=int, default=32)
     parser.add_argument(
@@ -29,11 +38,23 @@ def parse_args():
     parser.add_argument("--output", type=Path, required=True, help="New or empty output directory")
     parser.add_argument("--compiler-option", action="append", default=[], metavar="NAME=JSON_VALUE")
     options = parser.parse_args()
-    for key in ("tp_size", "batch_size", "context_length", "kv_capacity", "page_size"):
+    for key in (
+        "tp_size",
+        "dp_size",
+        "ep_size",
+        "batch_size",
+        "context_length",
+        "kv_capacity",
+        "page_size",
+    ):
         if getattr(options, key) <= 0:
             parser.error(f"{key} must be positive")
-    if options.kv_capacity % options.page_size:
-        parser.error("kv_capacity must be divisible by page_size")
+    if options.tp_size % options.dp_size or options.batch_size % options.dp_size:
+        parser.error("tp_size and batch_size must be divisible by dp_size")
+    if options.kv_capacity % (options.page_size * options.dp_size):
+        parser.error("kv_capacity must be divisible by page_size * dp_size")
+    if options.attention_backend == "fa" and options.target != "tpu":
+        parser.error("fa requires --target=tpu")
     padded_context = -(-options.context_length // options.page_size) * options.page_size
     if options.batch_size * padded_context > options.kv_capacity:
         parser.error("kv_capacity must cover every request's page-aligned context")

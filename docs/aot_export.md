@@ -13,13 +13,16 @@ the scheduler, tokenizer, or HTTP server.
 - Built-in tiny model: 2 layers, hidden size 512, intermediate size 1024,
   4 query heads, 2 KV heads, and vocabulary size 256.
 - An optional local Qwen3 `config.json`; no checkpoint is loaded.
-- TPU topology mappings from MaxText: `v6e-1` and `v6e-4`. The built-in model supports
+- MiMo-V2-Flash BF16 decode with `fa` (RPA v3), `fused_v2`, hybrid sliding-window/full
+  attention, attention sinks, and separate full/SWA KV pools. Supply a local config.
+- TPU topology mappings from MaxText: `v6e-1/4/8/16/32/64`. The built-in model supports
   TP=1/2; TP=4 requires a model configuration whose KV heads and other partitioned
   dimensions are divisible by 4. TPU device count must match `--tp-size`.
 
-These are native-attention graphs and do not represent FlashAttention/RPA graphs
-or performance. Quantization, prefill, MoE, LoRA, MTP, multimodal models, and
-executable serialization are outside this PoC.
+Quantization, prefill, LoRA, MTP, multimodal models, and executable serialization
+are outside this PoC. These are synthetic BF16 graphs: the exporter does not infer
+per-tensor checkpoint dtypes or reproduce checkpoint-specific post-load transforms.
+In particular, this is not the official MiMo FP8 checkpoint graph.
 
 ## CPU checks
 
@@ -65,11 +68,48 @@ decode is currently fixed.
 The output directory must be new or empty so that stale dumps cannot count as new
 artifacts.
 
+## MiMo-V2-Flash with FA and fused MoE v2
+
+Use a local copy of the official model's
+[`config.json`](https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash/blob/2f5a22fe08d2c3ecad8fcaf119d47c8fc848bcd1/config.json).
+Its quantization metadata requires an
+explicit `--bf16-model` override; both the original config and effective graph config
+are saved. This changes the weight format, not the architecture or number of layers.
+
+```bash
+PYTHONPATH=python python -m sgl_jax.compile \
+  --model-config /path/to/MiMo-V2-Flash/config.json --bf16-model \
+  --target tpu --topology v6e-32 --tp-size 32 --dp-size 8 --ep-size 32 \
+  --attention-backend fa --moe-backend fused_v2 \
+  --batch-size 64 --context-length 1024 --kv-capacity 65536 --page-size 128 \
+  --stage compiled --dump-llo --output /tmp/mimo-v6e32-ir
+```
+
+For a 64-device target, change to `--topology v6e-64 --tp-size 64 --dp-size 16
+--ep-size 64`. Both examples use attention TP=4. As in serving, `--tp-size` counts
+all devices; `--dp-size` partitions attention requests and KV pages. In this PoC,
+fused MoE v2 uses all devices for EP, so `ep_size=tp_size`, expert count must divide
+evenly across EP, and batch size must be divisible by EP. KV capacity is global and
+must be divisible by `dp_size * page_size`.
+
+Both KV pools have the specified token capacity in this initial implementation;
+SWA uses its own page-table input. This is not an automatic HBM-budget allocator.
+FA cumulative lengths have `batch_size + dp_size` entries, and distribution has
+`3 * dp_size` entries, matching serving's per-DP decode metadata. Values are dynamic:
+the graph contains the backend's dynamic attention branches, not a constant-folded
+all-decode distribution. No actual requests or checkpoint tensors are allocated.
+
+For a reduced-depth smoke check, prepare a separate config with fewer layers and
+truncate both `hybrid_layer_pattern` and `moe_layer_freq` to the same count. Preserve
+the full configuration for a subsequent full-model export; reduced-depth results
+must not be reported as full-model compilation.
+
 ## Artifacts and failure behavior
 
 ```text
 manifest.json          Configuration, versions, source fingerprint, input signatures,
                        stage status, and artifact hashes
+source_config.json     Original local model configuration, when supplied
 stablehlo.mlir         Saved immediately after lowering
 optimized_hlo.txt      HLO after compilation for the selected backend
 xla_dump/             Backend HLO/proto, buffer assignment, memory reports, etc.
@@ -97,6 +137,8 @@ object storage.
 donation and backend state preparation. `aot_inputs.py` traces the existing model and
 dummy weight loader inside `nnx.eval_shape`, reusing the real weight mappings. Weights
 remain dynamic graph inputs; dummy zeros are not embedded as model constants.
+Parameter shardings are bound separately from those mappings: nested dummy-loader
+JITs can report replicated tracer outputs even when their compiled outputs are sharded.
 The KV pool's `abstract=True` option reuses its normal shape calculations and creates
 only abstract arrays.
 
@@ -111,11 +153,29 @@ PoC validation on 2026-09-22:
   text. With batch size 2, nonzero random weights/KV, and valid decode inputs, all
   three logits/KV output arrays matched exactly.
 - Existing `test_native_attention_paged_decode.py`: 17 tests and 40 subtests passed.
-- Linux CPU → v6e-1 cross-compilation with JAX/jaxlib 0.11.1, Flax 0.12.9, and
+- The initial Qwen3 PoC (`476553fb`) passed Linux CPU → v6e-1 cross-compilation
+  with JAX/jaxlib 0.11.1, Flax 0.12.9, and
   libtpu 0.0.46.1 produced 114,044 bytes of StableHLO, 352,637 bytes of optimized HLO,
   and 1,893 recognized LLO pass snapshots.
-- Physical TPU execution, larger model configurations, and v6e-4 remain unverified.
-  These results cover only the tiny model and native attention described above.
+- MiMo FA metadata shapes/shardings matched serving's decode metadata builder.
+  Weight specs matched the existing model mappings; implicit replacement of the
+  official config's FP8 metadata was rejected.
+- CPU → TPU MiMo compilation with FA/RPA v3, fused MoE v2, synthetic BF16 weights,
+  batch 64, context capacity 1024, page size 128, and KV capacity 65536 succeeded:
+
+  | Model scope | Target | Attention DP / TP | EP | StableHLO / optimized HLO / LLO | LLO snapshots |
+  | --- | --- | --- | --- | --- | --- |
+  | First 2 layers, original dimensions | v6e-8 | 2 / 4 | 8 | Complete | 3477 |
+  | Full 48 layers | v6e-32 | 8 / 4 | 32 | Complete | 3585 |
+  | Full 48 layers | v6e-64 | 16 / 4 | 64 | Complete | 3513 |
+
+  The full configuration retains 9 full-attention layers, 39 SWA layers, 47 MoE
+  layers with 256 experts each, and original hidden/intermediate/vocabulary sizes.
+  Compilation ran on a Linux CPU worker, without loading or executing the roughly
+  617.7 GB of abstract BF16 weights. The native-attention regression suite and
+  Qwen3 CPU TP=2 export also passed after adding the independent sharding binding.
+- Physical TPU execution, FP8 checkpoint fidelity, and runtime performance remain
+  unverified. Topology mappings for v6e-4/16 have not been compilation validated.
 
 References:
 

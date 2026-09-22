@@ -61,7 +61,7 @@ def export(options):
     manifest = {
         "schema_version": 1,
         "status": "running",
-        "scope": "Qwen3 BF16 full model forward, decode, native attention, DP=1",
+        "scope": "Synthetic BF16 model forward, decode, no checkpoint loading or execution",
         "executed": False,
         "options": {
             key: str(value) if isinstance(value, Path) else value
@@ -87,6 +87,20 @@ def export(options):
         mesh = build_mesh(options)
         fn, args, config = build_inputs(options, mesh)
         manifest["model_config"] = config.to_dict()
+        manifest["model_config"]["model_type"] = config.model_type
+        if options.model_config:
+            original = Path(options.model_config).read_bytes()
+            (output / "source_config.json").write_bytes(original)
+            manifest["source_config_sha256"] = hashlib.sha256(original).hexdigest()
+        manifest["workload"] = {
+            "model_type": config.model_type,
+            "num_hidden_layers": config.num_hidden_layers,
+            "attention_backend": options.attention_backend,
+            "moe_backend": options.moe_backend,
+            "attention_tp_size": options.tp_size // options.dp_size,
+            "ep_size": options.ep_size,
+            "weights": "synthetic_bfloat16",
+        }
         manifest["input_signature"] = _input_signature(args)
         manifest["target_devices"] = [str(device) for device in mesh.devices.flat]
         manifest["mesh"] = dict(mesh.shape)

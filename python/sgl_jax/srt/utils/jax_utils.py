@@ -24,8 +24,14 @@ def get_device_id_offset(devices):
     return offset if offset != int32_max else 0
 
 
+def get_device_kind():
+    """Use the tracing target when cross-compiling on a different host backend."""
+    device = getattr(jax.sharding.get_abstract_mesh(), "abstract_device", None)
+    return device.device_kind if device is not None else jax.devices()[0].device_kind
+
+
 def get_device_name(num_devices: int | None = None):
-    kind = jax.devices()[0].device_kind
+    kind = get_device_kind()
     if "TPU" not in kind:
         raise RuntimeError("Expected TPU devices")
     suffix = ""

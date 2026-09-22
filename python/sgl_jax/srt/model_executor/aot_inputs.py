@@ -1,9 +1,12 @@
-"""Abstract Qwen3 decode inputs for the initial offline export implementation.
+"""Abstract decode inputs for the initial offline export implementation.
 
 Like MaxText train_compile, construct shaped state using the real model and
 weight mappings, then compile the serving function without executing it.
 """
 
+import json
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import jax
@@ -11,11 +14,11 @@ import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
-from transformers import Qwen3Config
+from transformers import PretrainedConfig, Qwen3Config
 
 from sgl_jax.srt.layers.attention.native_backend import NativeAttention
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata
-from sgl_jax.srt.mem_cache.memory_pool import MemoryPools, MHATokenToKVPool
+from sgl_jax.srt.mem_cache.memory_pool import MemoryPools, MHATokenToKVPool, SWAKVPool
 from sgl_jax.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -38,6 +41,10 @@ def build_mesh(options):
         topology_name, host_bounds = {
             "v6e-1": ("v6e:1x1", (1, 1, 1)),
             "v6e-4": ("v6e:2x2", (2, 2, 1)),
+            "v6e-8": ("v6e:2x4", (2, 2, 1)),
+            "v6e-16": ("v6e:4x4", (2, 2, 1)),
+            "v6e-32": ("v6e:4x8", (2, 2, 1)),
+            "v6e-64": ("v6e:8x8", (2, 2, 1)),
         }[options.topology]
         devices = get_topology_desc(
             platform="tpu",
@@ -49,12 +56,21 @@ def build_mesh(options):
         ).devices
     if len(devices) != options.tp_size:
         raise ValueError(f"Target has {len(devices)} devices, but tp_size={options.tp_size}")
-    return create_device_mesh([1, options.tp_size], [1, 1], devices=devices, is_full_topology=True)
+    return create_device_mesh(
+        [options.dp_size, options.tp_size // options.dp_size],
+        [1, 1],
+        devices=devices,
+        is_full_topology=True,
+    )
 
 
 def load_config(options):
     if options.model_config:
-        config = Qwen3Config.from_json_file(options.model_config)
+        raw = json.loads(Path(options.model_config).read_text())
+        if raw.get("model_type") not in ("qwen3", "mimo_v2_flash"):
+            raise ValueError("This PoC supports Qwen3 and MiMo-V2-Flash only")
+        config_cls = Qwen3Config if raw["model_type"] == "qwen3" else PretrainedConfig
+        config = config_cls.from_dict(raw)
     else:
         config = Qwen3Config(
             vocab_size=256,
@@ -67,8 +83,35 @@ def load_config(options):
             max_position_embeddings=256,
             tie_word_embeddings=False,
         )
-    if config.model_type != "qwen3" or getattr(config, "quantization_config", None):
-        raise ValueError("This PoC supports unquantized Qwen3 only")
+    if getattr(config, "quantization_config", None) and not options.bf16_model:
+        raise ValueError(
+            "Quantized checkpoints are unsupported; --bf16-model explicitly exports a synthetic BF16 variant"
+        )
+    if hasattr(config, "quantization_config"):
+        del config.quantization_config
+    attention_tp = options.tp_size // options.dp_size
+    if config.model_type == "mimo_v2_flash":
+        if options.attention_backend != "fa" or options.moe_backend != "fused_v2":
+            raise ValueError("MiMo requires --attention-backend=fa --moe-backend=fused_v2")
+        if options.ep_size != options.tp_size or config.n_routed_experts % options.ep_size:
+            raise ValueError("fused_v2 requires ep_size=tp_size and experts divisible by ep_size")
+        if options.batch_size % options.ep_size:
+            raise ValueError("fused_v2 requires batch_size divisible by ep_size")
+        for name in ("hybrid_layer_pattern", "moe_layer_freq"):
+            if len(getattr(config, name)) != config.num_hidden_layers:
+                raise ValueError(f"{name} must describe every layer")
+        for name in ("swa_num_attention_heads", "swa_num_key_value_heads"):
+            if getattr(config, name) % attention_tp:
+                raise ValueError(f"{name} must be divisible by attention TP")
+        config.moe_backend = options.moe_backend
+        config.ep_size = options.ep_size
+    elif (
+        options.moe_backend
+        or options.ep_size != 1
+        or options.attention_backend != "native"
+        or options.dp_size != 1
+    ):
+        raise ValueError("Qwen3 PoC requires native attention, DP=1, EP=1 and no MoE backend")
     if getattr(config, "use_sliding_window", False):
         raise ValueError("Sliding-window Qwen3 is outside this PoC")
     for value in (
@@ -77,9 +120,11 @@ def load_config(options):
         config.vocab_size,
         config.intermediate_size,
     ):
-        if value % options.tp_size:
-            raise ValueError("Model dimensions must be divisible by tp_size (no head replication)")
-    if config.head_dim != 128:
+        if value % attention_tp:
+            raise ValueError(
+                "Model dimensions must be divisible by attention TP (no head replication)"
+            )
+    if config.model_type == "qwen3" and config.head_dim != 128:
         raise ValueError("This PoC requires head_dim=128 to match the serving KV layout")
     if options.context_length > config.max_position_embeddings:
         raise ValueError("context_length exceeds max_position_embeddings")
@@ -90,42 +135,114 @@ def build_inputs(options, mesh):
     config = load_config(options)
 
     def init_model():
-        model = Qwen3ForCausalLM(config, mesh, dtype=jnp.bfloat16)
+        if config.model_type == "mimo_v2_flash":
+            from sgl_jax.srt.models.mimo_v2_flash import MiMoV2FlashForCausalLM
+
+            model_cls = MiMoV2FlashForCausalLM
+        else:
+            model_cls = Qwen3ForCausalLM
+        model = model_cls(config, mesh, dtype=jnp.bfloat16)
         # Trace the existing dummy loader: applies real weight mappings without
         # materializing zero weights. The resulting weights remain JIT inputs.
-        model.load_weights(SimpleNamespace(_dummy_mode=True))
+        with tempfile.TemporaryDirectory() as empty_checkpoint:
+            model.load_weights(
+                SimpleNamespace(
+                    _dummy_mode=True,
+                    model_path=empty_checkpoint,
+                    quantization_config=None,
+                    hf_config=config,
+                    ep_size=options.ep_size,
+                )
+            )
         return model
-
-    def bind_sharding(value):
-        if not isinstance(value, jax.ShapeDtypeStruct):
-            return value
-        spec = getattr(value.sharding, "spec", P())
-        return jax.ShapeDtypeStruct(value.shape, value.dtype, sharding=NamedSharding(mesh, spec))
 
     with jax.set_mesh(mesh):
         model = nnx.eval_shape(init_model)
+        mappings = (
+            model._create_weight_mappings()
+            if config.model_type == "mimo_v2_flash"
+            else model._create_qwen3_weight_mappings()
+        )
+        parameter_specs = {
+            (m.target_path if isinstance(m.target_path, str) else m.target_path[0]): P(*m.sharding)
+            for m in mappings.values()
+        }
         model_def, model_state = nnx.split(model)
-        model_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
-        model_leaves = [bind_sharding(x) for x in model_leaves]
-        pool = MHATokenToKVPool(
+        leaves_with_paths, model_state_def = jax.tree_util.tree_flatten_with_path(model_state)
+        model_leaves = []
+        for path, value in leaves_with_paths:
+            # Nested dummy-loader JITs may expose replicated *tracer* shardings
+            # despite explicit output shardings. As in MaxText, bind abstract
+            # shapes to independently derived parameter shardings; never infer
+            # the checkpoint mapping from eval_shape's output placement.
+            name = ".".join(str(key.key) for key in path[:-1])
+            if name not in parameter_specs:
+                raise ValueError(f"No offline weight sharding mapping for {name}")
+            model_leaves.append(
+                jax.ShapeDtypeStruct(
+                    value.shape,
+                    value.dtype,
+                    sharding=NamedSharding(mesh, parameter_specs[name]),
+                )
+            )
+        pool_kwargs = dict(
             size=options.kv_capacity,
             page_size=options.page_size,
             dtype=jnp.bfloat16,
             head_num=config.num_key_value_heads,
-            head_dim=config.head_dim,
-            layer_num=config.num_hidden_layers,
+            head_dim=(config.head_dim + 127) // 128 * 128,
             mesh=mesh,
+            dp_size=options.dp_size,
             abstract=True,
         )
+        if config.model_type == "mimo_v2_flash":
+            pool = SWAKVPool(
+                **pool_kwargs,
+                size_swa=options.kv_capacity,
+                swa_attention_layer_ids=[
+                    i for i, swa in enumerate(config.hybrid_layer_pattern) if swa
+                ],
+                full_attention_layer_ids=[
+                    i for i, swa in enumerate(config.hybrid_layer_pattern) if not swa
+                ],
+                swa_head_num=config.swa_num_key_value_heads,
+                swa_head_dim=(config.swa_head_dim + 127) // 128 * 128,
+            )
+        else:
+            pool = MHATokenToKVPool(**pool_kwargs, layer_num=config.num_hidden_layers)
 
     def vector(length):
         return jax.ShapeDtypeStruct((length,), jnp.int32, sharding=NamedSharding(mesh, P("data")))
 
-    backend = NativeAttention(config.num_attention_heads, config.num_key_value_heads, mesh)
     batch_size = options.batch_size
     padded_context = (
         (options.context_length + options.page_size - 1) // options.page_size * options.page_size
     )
+    if options.attention_backend == "fa":
+        from sgl_jax.srt.layers.attention.flashattention_backend import (
+            FlashAttention,
+            FlashAttentionMetadata,
+        )
+
+        backend = FlashAttention(
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            config.head_dim,
+            page_size=options.page_size,
+            mesh=mesh,
+        )
+        # Same per-DP shapes as FlashAttention.get_forward_metadata(DECODE).
+        # Values remain runtime inputs; no token/page IDs are baked into IR.
+        backend.forward_metadata = FlashAttentionMetadata(
+            cu_q_lens=vector(batch_size + options.dp_size),
+            cu_kv_lens=vector(batch_size + options.dp_size),
+            page_indices=vector(batch_size * padded_context // options.page_size),
+            swa_page_indices=vector(batch_size * padded_context // options.page_size),
+            seq_lens=vector(batch_size),
+            distribution=vector(3 * options.dp_size),
+        )
+    else:
+        backend = NativeAttention(config.num_attention_heads, config.num_key_value_heads, mesh)
     batch = ForwardBatch(
         bid=0,
         forward_mode=ForwardMode.DECODE,
