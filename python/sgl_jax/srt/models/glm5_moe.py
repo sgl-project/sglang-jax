@@ -535,6 +535,7 @@ class Glm5Attention(nnx.Module):
         token_to_kv_pool: KVCache,
         dsa_topk_in: jax.Array | None = None,
         dsa_topk_pages_in: jax.Array | None = None,
+        dsa_topk_reuse: bool = False,
     ) -> tuple[jax.Array, jax.Array]:
         q_compressed, _ = self.q_a_proj(hidden_states)
         q_compressed = self.q_a_layernorm(q_compressed)
@@ -546,6 +547,7 @@ class Glm5Attention(nnx.Module):
             dsa_kwargs["indexer_type"] = self.indexer_type
             dsa_kwargs["dsa_topk_in"] = dsa_topk_in
             dsa_kwargs["dsa_topk_pages_in"] = dsa_topk_pages_in
+            dsa_kwargs["dsa_topk_reuse"] = dsa_topk_reuse
             if self.indexer is not None:
                 q_idx, k_idx, idx_w = self.indexer.project(
                     hidden_states, q_compressed, positions, self.rotary_emb
@@ -959,6 +961,7 @@ class Glm5DecoderLayer(nnx.Module):
         dispatch_info: ExpertLocationMetadata | None = None,
         dsa_topk_in: jax.Array | None = None,
         dsa_topk_pages_in: jax.Array | None = None,
+        dsa_topk_reuse: bool = False,
     ) -> tuple[jax.Array, jax.Array]:
         if residual is None:
             residual = hidden_states
@@ -975,6 +978,7 @@ class Glm5DecoderLayer(nnx.Module):
             token_to_kv_pool=token_to_kv_pool,
             dsa_topk_in=dsa_topk_in,
             dsa_topk_pages_in=dsa_topk_pages_in,
+            dsa_topk_reuse=dsa_topk_reuse,
         )
         hidden_states += residual
         residual = hidden_states
@@ -1485,7 +1489,18 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
         forward_batch: ForwardBatch,
         memory_pools,
         logits_metadata: LogitsMetadata,
+        dsa_topk_pages_in: jax.Array | None = None,
+        dsa_topk_reuse: bool = False,
+        return_dsa_topk_pages: bool = False,
     ):
+        """One MTP step.
+
+        GLM-5.2 IndexShare across MTP iterations (``index_share_for_mtp_iteration``):
+        the fused draft loop passes ``return_dsa_topk_pages=True`` to receive the
+        page-topk this step's indexer selected, and on later steps hands it back via
+        ``dsa_topk_pages_in`` with ``dsa_topk_reuse=True`` so the block attends over
+        the reused selection instead of re-running the indexer.
+        """
         from sgl_jax.srt.layers.attention.dsa_sparse_backend import DSAFusedCache
 
         embed = self.embed_tokens(forward_batch.input_ids)
@@ -1510,7 +1525,8 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
             None,
             dispatch_info=forward_batch.expert_location_metadata,
             dsa_topk_in=None,
-            dsa_topk_pages_in=None,
+            dsa_topk_pages_in=dsa_topk_pages_in,
+            dsa_topk_reuse=dsa_topk_reuse,
         )
 
         if residual is not None:
@@ -1521,7 +1537,10 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
             hidden_states, self.lm_head, logits_metadata, aux_hidden_states=None
         )
 
-        kv_cache_list = [kv_fused.kv] if isinstance(kv_fused, DSAFusedCache) else [kv_fused]
+        is_dsa = isinstance(kv_fused, DSAFusedCache)
+        kv_cache_list = [kv_fused.kv] if is_dsa else [kv_fused]
+        if return_dsa_topk_pages:
+            return output, kv_cache_list, True, None, (kv_fused.topk_pages if is_dsa else None)
         return output, kv_cache_list, True, None
 
     def load_weights(self, model_config: ModelConfig):

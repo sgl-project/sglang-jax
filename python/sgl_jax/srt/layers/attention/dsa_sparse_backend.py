@@ -195,6 +195,10 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         idx_weights: jax.Array | None = kwargs.get("idx_weights")
         dsa_topk_in: jax.Array | None = kwargs.get("dsa_topk_in")
         dsa_topk_pages_in: jax.Array | None = kwargs.get("dsa_topk_pages_in")
+        # GLM-5.2 MTP IndexShare (index_share_for_mtp_iteration): a FULL layer
+        # asked to reuse a threaded selection skips its own top-k (still writes
+        # its indexer-key cache) and attends over the caller's indices instead.
+        dsa_topk_reuse: bool = bool(kwargs.get("dsa_topk_reuse", False))
 
         layer_id = layer.layer_id
         is_full = indexer_type == "full"
@@ -256,8 +260,16 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         # the per-query-token kernel handles uniformly.
         if not is_decode:
             if _PREFILL_SPARSE:
+                reuse_pages = is_full and dsa_topk_reuse and dsa_topk_pages_in is not None
                 idx_cache, topk_pages = self._maybe_index_prefill_pages(
-                    is_full, q_idx, k_idx, idx_weights, idx_cache, dpa, md
+                    is_full,
+                    q_idx,
+                    k_idx,
+                    idx_weights,
+                    idx_cache,
+                    dpa,
+                    md,
+                    compute_pages=not reuse_pages,
                 )
                 # Page selection for the sparse-prefill attend. A FULL (indexer)
                 # layer just produced [T, k_pages] page-topk; a SHARED layer gets
@@ -267,7 +279,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 # query rows (the full layer above ran the same single-shot prefill)
                 # — NOT the decode one-query-per-seq shape. None (a shared layer
                 # before any full layer) ⇒ fall through to the dense attend below.
-                topk_pages_use = topk_pages if is_full else dsa_topk_pages_in
+                topk_pages_use = topk_pages if (is_full and not reuse_pages) else dsa_topk_pages_in
                 if topk_pages_use is not None:
                     o, kv_cache = self._run_sparse_prefill(
                         q,
@@ -310,11 +322,20 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             )
             return o, DSAFusedCache(kv=kv_cache, idx=idx_cache, topk=None, topk_pages=None)
 
-        # ── indexer top-k (full) or reuse (shared) ─────────────────────────
+        # ── indexer top-k (full) or reuse (shared / MTP IndexShare) ────────
+        reuse_topk = is_full and dsa_topk_reuse and dsa_topk_in is not None
         idx_cache, topk, topk_pages = self._maybe_index(
-            is_full, q_idx, k_idx, idx_weights, idx_cache, dpa, md, compute_pages=True
+            is_full,
+            q_idx,
+            k_idx,
+            idx_weights,
+            idx_cache,
+            dpa,
+            md,
+            compute_topk=not reuse_topk,
+            compute_pages=not reuse_topk,
         )
-        if not is_full:
+        if not is_full or reuse_topk:
             assert (
                 dsa_topk_in is not None
             ), f"shared layer {layer_id} requires dsa_topk_in from preceding full layer"
@@ -331,8 +352,8 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         return o, DSAFusedCache(
             kv=kv_cache,
             idx=idx_cache,
-            topk=topk if is_full else None,
-            topk_pages=topk_pages if is_full else None,
+            topk=topk if (is_full and not reuse_topk) else None,
+            topk_pages=topk_pages if (is_full and not reuse_topk) else None,
         )
 
     # ────────────────────────────────────────────────────────────────────────
@@ -520,10 +541,15 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             md.distribution,
         )
 
-    def _maybe_index_prefill_pages(self, is_full, q_idx, k_idx, idx_weights, idx_cache, dpa, md):
+    def _maybe_index_prefill_pages(
+        self, is_full, q_idx, k_idx, idx_weights, idx_cache, dpa, md, *, compute_pages=True
+    ):
         """Prefill page-topk: scatter ``k_idx`` into the paged indexer cache and,
         on full layers, compute per-query **causal** page-level top-k via the
         general (non-decode, ``one_token_per_seq=False``) indexer path.
+
+        ``compute_pages=False`` (MTP IndexShare reuse steps) only performs the
+        indexer-key cache write and returns ``topk_pages=None``.
 
         Returns ``(idx_cache, topk_pages)`` where ``topk_pages`` is ``[T, k_pages]``
         seq-local page ids (-1 padded) — exactly the sparse kernel's per-query
@@ -552,6 +578,10 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             pages_per_seq = pi_.shape[0] // seq_lens_.shape[0]
             cache3d = cache_.reshape(cache_.shape[0], page_size, idx_dim)
             cache3d = _scatter_paged(cache3d, k_, seq_lens_, pi_, cuq_, cukv_, pages_per_seq)
+            if not compute_pages:
+                return cache3d.reshape(cache_.shape), jnp.full(
+                    (q_.shape[0], k_pages), -1, jnp.int32
+                )
             if _INDEXER_KERNEL_PREFILL:
                 # dist_[2] == number of real (seq_len > 0) sequences in this
                 # EXTEND batch: mla_backend builds distribution = [0, 0, N] for
@@ -602,6 +632,8 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             md.cu_kv_lens,
             md.distribution,
         )
+        if not compute_pages:
+            return idx_cache, None
         return idx_cache, topk_pages
 
     def _run_sparse_prefill(
