@@ -14,7 +14,12 @@ def parse_args():
     )
     parser.add_argument("--model-config", help="Local config.json; omitted: built-in tiny Qwen3")
     parser.add_argument("--target", choices=("cpu", "tpu"), default="tpu")
-    parser.add_argument("--topology", choices=tuple(f"v6e-{n}" for n in (1, 4, 8, 16, 32, 64)))
+    parser.add_argument(
+        "--topology",
+        choices=tuple(f"v6e-{n}" for n in (1, 4, 8, 16, 32, 64))
+        + tuple(f"v7x-{n}" for n in (8, 16, 32, 64)),
+        help="Target TPU topology; the suffix counts JAX devices, not chips",
+    )
     parser.add_argument("--tp-size", type=int, default=1, help="Total devices, as in serving")
     parser.add_argument(
         "--dp-size", type=int, default=1, help="Attention DP; attention TP=tp_size/dp_size"

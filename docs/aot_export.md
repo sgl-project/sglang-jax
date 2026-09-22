@@ -15,7 +15,9 @@ the scheduler, tokenizer, or HTTP server.
 - An optional local Qwen3 `config.json`; no checkpoint is loaded.
 - MiMo-V2-Flash BF16 decode with `fa` (RPA v3), `fused_v2`, hybrid sliding-window/full
   attention, attention sinks, and separate full/SWA KV pools. Supply a local config.
-- TPU topology mappings from MaxText: `v6e-1/4/8/16/32/64`. The built-in model supports
+- Compile-only TPU topologies: `v6e-1/4/8/16/32/64` and `v7x-8/16/32/64`.
+  Following MaxText's topology/host-bounds approach, the suffix counts JAX-visible
+  devices. v6e has one device per chip; v7x has two. The built-in model supports
   TP=1/2; TP=4 requires a model configuration whose KV heads and other partitioned
   dimensions are divisible by 4. TPU device count must match `--tp-size`.
 
@@ -91,6 +93,15 @@ all devices; `--dp-size` partitions attention requests and KV pages. In this PoC
 fused MoE v2 uses all devices for EP, so `ep_size=tp_size`, expert count must divide
 evenly across EP, and batch size must be divisible by EP. KV capacity is global and
 must be divisible by `dp_size * page_size`.
+
+For v7x, select `--topology v7x-32` with the same 32-device command, or
+`--topology v7x-64 --tp-size 64 --dp-size 16 --ep-size 64` for 64 devices.
+The exporter targets TPU7x while running on the CPU host. These names map to
+`TPU7x:2x2x4` (16 chips / 32 devices) and `TPU7x:2x4x4` (32 chips / 64 devices),
+respectively. The smaller `v7x-8` and `v7x-16` targets use `2x2x1` and `2x2x2`.
+To preserve attention TP=4, use `--dp-size 2 --tp-size 8 --ep-size 8` or
+`--dp-size 4 --tp-size 16 --ep-size 16`. Target size alone does not establish that
+the compiled graph will fit in the target's HBM or run correctly on real hardware.
 
 Both KV pools have the specified token capacity in this initial implementation;
 SWA uses its own page-table input. This is not an automatic HBM-budget allocator.
