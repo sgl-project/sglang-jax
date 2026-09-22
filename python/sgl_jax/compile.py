@@ -33,6 +33,20 @@ def parse_args():
         help="Explicitly replace checkpoint quantization with synthetic BF16 weights",
     )
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--workload",
+        choices=("decode", "mtp-draft", "mtp-draft-extend", "target-verify"),
+        default="decode",
+        help="Model forward to export; batch-size always counts requests",
+    )
+    parser.add_argument(
+        "--draft-token-num",
+        type=int,
+        help="Tokens per request in verify/draft-extend, including seed",
+    )
+    parser.add_argument(
+        "--mtp-layer-idx", type=int, default=0, help="MTP weight-set index for a draft forward"
+    )
     parser.add_argument("--context-length", type=int, default=32)
     parser.add_argument(
         "--kv-capacity", type=int, default=128, help="KV token capacity, excluding padding"
@@ -61,6 +75,17 @@ def parse_args():
             parser.error(f"{key} must be positive")
     if options.tp_size % options.dp_size or options.batch_size % options.dp_size:
         parser.error("tp_size and batch_size must be divisible by dp_size")
+    if options.workload in ("target-verify", "mtp-draft-extend"):
+        if options.draft_token_num is None or options.draft_token_num < 2:
+            parser.error("verify/draft-extend requires --draft-token-num >= 2 (including seed)")
+        if options.draft_token_num > options.context_length:
+            parser.error("context_length must include the entire verify/draft-extend block")
+    elif options.draft_token_num is not None:
+        parser.error("--draft-token-num is only used by target-verify or mtp-draft-extend")
+    if options.mtp_layer_idx < 0 or (
+        options.mtp_layer_idx and not options.workload.startswith("mtp-draft")
+    ):
+        parser.error("mtp_layer_idx must be nonnegative and is only used by MTP draft workloads")
     if options.kv_capacity % (options.page_size * options.dp_size):
         parser.error("kv_capacity must be divisible by page_size * dp_size")
     if options.recurrent_capacity is not None and (

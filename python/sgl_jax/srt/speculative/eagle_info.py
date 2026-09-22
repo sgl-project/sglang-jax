@@ -53,7 +53,9 @@ def _as_int32_array(value: Any, *, fallback: int = -1) -> Any:
     """Convert scalar-like metadata into int32 arrays without forcing device work."""
     if value is None:
         return None
-    if isinstance(value, jax.Array):
+    # AOT re-flattens this pytree with shape/stage descriptors in place of
+    # array values. Preserve them rather than attempting NumPy conversion.
+    if isinstance(value, (jax.Array, jax.ShapeDtypeStruct, jax.stages.ArgInfo)):
         return value
     if isinstance(value, np.ndarray):
         return np.asarray(value, dtype=np.int32)

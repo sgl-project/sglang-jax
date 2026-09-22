@@ -41,9 +41,9 @@ def _source():
     return {"revision": revision, "python_source_sha256": digest}
 
 
-def _input_signature(args):
+def _array_signature(tree):
     result = []
-    for path, value in jax.tree_util.tree_flatten_with_path(args[2:])[0]:
+    for path, value in jax.tree_util.tree_flatten_with_path(tree)[0]:
         if hasattr(value, "shape"):
             result.append(
                 {
@@ -61,7 +61,7 @@ def export(options):
     manifest = {
         "schema_version": 1,
         "status": "running",
-        "scope": "Synthetic BF16 model forward, decode, no checkpoint loading or execution",
+        "scope": f"Synthetic BF16 model forward, {options.workload}, no checkpoint loading or execution",
         "executed": False,
         "options": {
             key: str(value) if isinstance(value, Path) else value
@@ -93,6 +93,8 @@ def export(options):
             (output / "source_config.json").write_bytes(original)
             manifest["source_config_sha256"] = hashlib.sha256(original).hexdigest()
         manifest["workload"] = {
+            "name": options.workload,
+            "model_class": config.architectures[0] if config.architectures else None,
             "model_type": config.model_type,
             "num_hidden_layers": config.num_hidden_layers,
             "attention_backend": options.attention_backend,
@@ -100,18 +102,24 @@ def export(options):
             "attention_tp_size": options.tp_size // options.dp_size,
             "ep_size": options.ep_size,
             "weights": "synthetic_bfloat16",
+            "tokens_per_request": options.draft_token_num or 1,
+            "input_token_count": args[3].input_ids.shape[0],
+            "mtp_layer_idx": (
+                config.mtp_layer_idx if options.workload.startswith("mtp-draft") else None
+            ),
         }
-        manifest["input_signature"] = _input_signature(args)
+        manifest["input_signature"] = _array_signature(args[2:])
         manifest["target_devices"] = [str(device) for device in mesh.devices.flat]
         manifest["mesh"] = dict(mesh.shape)
         manifest["static_args"] = {
-            "forward_mode": "DECODE",
-            "capture_hidden_mode": "NULL",
-            "spec_algorithm": "NONE",
+            "forward_mode": args[3].forward_mode.name,
+            "capture_hidden_mode": args[3].capture_hidden_mode.name,
+            "spec_algorithm": args[3].spec_algorithm.name,
         }
         manifest["donate_argnames"] = ["memory_pools"]
         with jax.set_mesh(mesh):
             lowered = fn.lower(*args)
+        manifest["output_signature"] = _array_signature(lowered.out_info)
         (output / "stablehlo.mlir").write_text(str(lowered.compiler_ir(dialect="stablehlo")))
         manifest["stages"]["stablehlo"] = "complete"
         save_manifest()

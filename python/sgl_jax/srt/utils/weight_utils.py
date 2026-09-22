@@ -215,6 +215,8 @@ class WeightLoader:
 
     def has_weight_on_disk(self, hf_key: str) -> bool:
         """Return whether a concrete HF weight key exists in the safetensors files."""
+        if self.dummy_mode:
+            return False
         return hf_key in self._scan_weight_info()
 
     # ------------------------------------------------------------------

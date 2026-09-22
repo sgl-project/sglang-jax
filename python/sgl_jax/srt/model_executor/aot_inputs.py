@@ -1,4 +1,4 @@
-"""Abstract model state and decode inputs for offline IR export.
+"""Abstract model state and forward inputs for offline IR export.
 
 Like MaxText train_compile, construct shaped state using the real model and
 weight mappings, then compile the serving function without executing it.
@@ -98,6 +98,13 @@ def load_config(options):
         )
     if hasattr(config, "quantization_config"):
         del config.quantization_config
+    if options.workload != "decode" and config.model_type != "mimo_v2_flash":
+        raise ValueError("Speculative input construction currently requires a MiMo-V2 config")
+    is_mtp = options.workload.startswith("mtp-draft")
+    if is_mtp:
+        from sgl_jax.srt.model_executor.aot_spec_inputs import configure_mtp
+
+        configure_mtp(config, options)
     attention_tp = options.tp_size // options.dp_size
     if options.recurrent_capacity is not None and config.model_type != "kimi_linear":
         raise ValueError("recurrent_capacity requires a linear-attention model")
@@ -106,12 +113,18 @@ def load_config(options):
 
         validate_config(config, options)
     elif config.model_type == "mimo_v2_flash":
-        if options.attention_backend != "fa" or options.moe_backend != "fused_v2":
+        if is_mtp:
+            if options.attention_backend != "fa" or options.moe_backend or options.ep_size != 1:
+                raise ValueError("MiMo MTP uses FA and a dense MLP: omit MoE backend and use EP=1")
+        elif options.attention_backend != "fa" or options.moe_backend != "fused_v2":
             raise ValueError("MiMo requires --attention-backend=fa --moe-backend=fused_v2")
-        if options.ep_size != options.tp_size or config.n_routed_experts % options.ep_size:
+        if not is_mtp and (
+            options.ep_size != options.tp_size or config.n_routed_experts % options.ep_size
+        ):
             raise ValueError("fused_v2 requires ep_size=tp_size and experts divisible by ep_size")
-        if options.batch_size % options.ep_size:
-            raise ValueError("fused_v2 requires batch_size divisible by ep_size")
+        input_tokens = options.batch_size * (options.draft_token_num or 1)
+        if input_tokens % options.ep_size:
+            raise ValueError("fused_v2 requires the input token count divisible by ep_size")
         for name in ("hybrid_layer_pattern", "moe_layer_freq"):
             if len(getattr(config, name)) != config.num_hidden_layers:
                 raise ValueError(f"{name} must describe every layer")
@@ -153,7 +166,11 @@ def build_inputs(options, mesh):
     config = load_config(options)
 
     def init_model():
-        if config.model_type == "mimo_v2_flash":
+        if options.workload.startswith("mtp-draft"):
+            from sgl_jax.srt.models.mimo_v2_nextn import MiMoV2MTPForCausalLM
+
+            model_cls = MiMoV2MTPForCausalLM
+        elif config.model_type == "mimo_v2_flash":
             from sgl_jax.srt.models.mimo_v2_flash import MiMoV2FlashForCausalLM
 
             model_cls = MiMoV2FlashForCausalLM
@@ -186,9 +203,16 @@ def build_inputs(options, mesh):
             else model._create_qwen3_weight_mappings()
         )
         parameter_specs = {
-            (m.target_path if isinstance(m.target_path, str) else m.target_path[0]): P(*m.sharding)
+            name: P(*m.sharding)
             for m in mappings.values()
+            for name in ([m.target_path] if isinstance(m.target_path, str) else m.target_path)
         }
+        if options.workload.startswith("mtp-draft"):
+            from sgl_jax.srt.model_executor.aot_spec_inputs import (
+                bind_shared_parameter_specs,
+            )
+
+            bind_shared_parameter_specs(parameter_specs)
         parameter_meshes = {}
         if config.model_type == "kimi_linear":
             from sgl_jax.srt.model_executor.aot_kimi_inputs import bind_parameter_specs
@@ -300,6 +324,10 @@ def build_inputs(options, mesh):
         capture_hidden_mode=CaptureHiddenMode.NULL,
         logits_indices=vector(batch_size),
     )
+    if options.workload != "decode":
+        from sgl_jax.srt.model_executor.aot_spec_inputs import configure_batch
+
+        configure_batch(config, options, mesh, batch, logits)
     args = (
         model_def,
         model_state_def,

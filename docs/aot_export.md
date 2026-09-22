@@ -94,6 +94,50 @@ To compile fewer layers, make a separate config and change `num_hidden_layers`,
 `hybrid_layer_pattern`, and `moe_layer_freq` together. Use the original config to
 export the full model.
 
+### MiMo MTP draft and target verify
+
+Use the same MiMo-V2-Flash config for both commands. To export one MTP draft
+forward with an abstract hidden-state input:
+
+```bash
+PYTHONPATH=python python -m sgl_jax.compile \
+  --model-config /path/to/MiMo-V2-Flash/config.json --bf16-model \
+  --workload mtp-draft --mtp-layer-idx 0 \
+  --target tpu --topology v7x-8 --tp-size 8 --dp-size 2 \
+  --attention-backend fa \
+  --batch-size 16 --context-length 1024 --kv-capacity 16384 --page-size 128 \
+  --stage compiled --dump-llo --output /tmp/mimo-mtp-draft-ir
+```
+
+Each MTP runner contains one SWA attention block and a dense MLP. Omit
+`--moe-backend` and keep `--ep-size 1` for draft workloads. Embedding and LM-head
+parameters have the same layouts as the arrays shared from the target in serving.
+`--mtp-layer-idx` selects a weight set; export each desired MTP layer separately.
+Without checkpoint loading, this index does not verify that the weight set exists.
+
+To export the draft-extend forward after target verification, replace
+`--workload mtp-draft` with `--workload mtp-draft-extend --draft-token-num 4` and
+choose a new output directory. This adds the hidden-state block and accepted-length
+inputs used to update draft KV and select the next logits.
+
+To export the full target verifying eight tokens per request:
+
+```bash
+PYTHONPATH=python python -m sgl_jax.compile \
+  --model-config /path/to/MiMo-V2-Flash/config.json --bf16-model \
+  --workload target-verify --draft-token-num 8 \
+  --target tpu --topology v7x-32 --tp-size 32 --dp-size 8 --ep-size 32 \
+  --attention-backend fa --moe-backend fused_v2 \
+  --batch-size 16 --context-length 1024 --kv-capacity 16384 --page-size 128 \
+  --stage compiled --dump-llo --output /tmp/mimo-target-verify-ir
+```
+
+`--batch-size` counts requests. This verify example has `16 * 8 = 128` input
+tokens and returns logits and hidden states for all 128 positions. The width
+includes the seed token, so eight positions represent the seed plus seven
+candidates. These exports use the NEXTN causal-chain model forwards (`topk=1`);
+sampling, token acceptance, and the scheduler run outside these graphs.
+
 ### Kimi Linear with KDA and MLA
 
 Save the model's
@@ -148,17 +192,28 @@ one of these combinations and select a new output directory:
 | `v6e-32` or `v7x-32` | 32 | 8 | 32 |
 | `v6e-64` or `v7x-64` | 64 | 16 | 64 |
 
-For fused MoE v2, both expert count and batch size must be divisible by EP.
+For fused MoE v2, both expert count and input token count must be divisible by EP.
+The input count is batch size for decode, or batch size times verification width
+for target verify.
 
 ## Set the workload shape
 
-The command builds one decode step with one new token per request. `--stage`
-controls compilation, not prefill/decode; there is currently no prefill selector.
+`--workload` selects the forward to export. The default `decode` has one new token
+per request. `--stage` independently selects how far compilation proceeds.
+
+| `--workload` | Model inputs and outputs |
+| --- | --- |
+| `decode` | One token per request, target model |
+| `mtp-draft` | One token and one hidden-state row per request, one MTP block |
+| `mtp-draft-extend` | A token/hidden-state block per request plus accepted lengths |
+| `target-verify` | A candidate-token block per request; logits and hidden states for every row |
 
 | Argument | Meaning |
 | --- | --- |
-| `--batch-size` | Number of requests in the decode step |
-| `--context-length` | Cache-location capacity per request, rounded up to a page boundary |
+| `--batch-size` | Number of requests |
+| `--draft-token-num` | Verify/draft-extend tokens per request, including the seed; at least 2 |
+| `--mtp-layer-idx` | MTP weight-set index, starting at 0 |
+| `--context-length` | Total KV context capacity per request, including the current token block; rounded up to a page boundary |
 | `--kv-capacity` | Global KV token capacity, excluding padding; applied to each full/SWA pool |
 | `--page-size` | Tokens per KV page |
 | `--recurrent-capacity` | Valid recurrent-state slots for linear attention; defaults to batch size |
@@ -190,7 +245,7 @@ options are managed by the tool. Remove existing dump flags from `XLA_FLAGS` and
 
 | Path under `--output` | What to inspect |
 | --- | --- |
-| `manifest.json` | Export status, stage results, options, effective config, input shapes/dtypes/shardings, versions, and file hashes |
+| `manifest.json` | Export status, actual forward mode, workload, effective config, input/output signatures, versions, and file hashes |
 | `source_config.json` | Original model config, when supplied |
 | `stablehlo.mlir` | Graph after lowering |
 | `optimized_hlo.txt` | HLO compiled for the selected target |
