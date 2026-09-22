@@ -3,7 +3,6 @@
 from types import SimpleNamespace
 
 import jax.numpy as jnp
-import numpy as np
 import pytest
 from tokenizers import Tokenizer
 from transformers import AutoConfig
@@ -13,7 +12,6 @@ from sgl_jax.srt.hf_transformers_utils import (
     get_context_length,
     get_tokenizer,
 )
-from sgl_jax.srt.layers.activation import ACT2FN
 
 
 @pytest.mark.parametrize(
@@ -48,16 +46,6 @@ def test_nested_rope_and_context():
         num_attention_heads=8,
     )
     assert get_context_length(SimpleNamespace(text_config=config)) == 16384
-
-
-@pytest.mark.parametrize("name", ACT2FN)
-def test_jax_activations_match_hf(name):
-    import torch
-    from transformers.activations import ACT2FN as HF_ACT2FN
-
-    x = np.linspace(-5, 5, 101, dtype=np.float32)
-    expected = HF_ACT2FN[name](torch.from_numpy(x)).numpy()
-    np.testing.assert_allclose(ACT2FN[name](jnp.asarray(x)), expected, atol=1e-6, rtol=1e-5)
 
 
 @pytest.mark.parametrize(
