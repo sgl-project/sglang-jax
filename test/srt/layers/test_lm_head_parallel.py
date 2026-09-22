@@ -328,3 +328,51 @@ def test_qwen3_direct_construction_and_load(mesh, dp_head, dummy, tied, tmp_path
         np.testing.assert_allclose(result, np.ones((16, 16)) @ expected_weight.T, rtol=2e-5)
         # Projection must not replace the tied input embedding with a padded head.
         assert model.model.embed_tokens.embedding.value.shape == (vocab, 16)
+
+
+@pytest.mark.parametrize("tp_size", [1, 4, 8])
+@pytest.mark.parametrize("dp_head", [False, True])
+@pytest.mark.parametrize("vocab", [16, 15])
+@pytest.mark.parametrize("dummy", [False, True])
+def test_tensor_only_mesh_loading_and_projection(tp_size, dp_head, vocab, dummy, tmp_path):
+    from types import SimpleNamespace
+
+    from safetensors.numpy import save_file
+
+    from sgl_jax.srt.layers.lm_head_parallel import argmax_with_dp_sharding
+    from sgl_jax.srt.utils.weight_utils import WeightLoader
+
+    if len(jax.devices()) < tp_size:
+        pytest.skip("Requires multiple devices; set JAX_NUM_CPU_DEVICES=8")
+    mesh = Mesh(np.array(jax.devices()[:tp_size]), ("tensor",), axis_types=(AxisType.Explicit,))
+    rng = np.random.default_rng(42)
+    weight = rng.normal(size=(vocab, 12)).astype(np.float32)
+    hidden = rng.normal(size=(3, 12)).astype(np.float32)
+    save_file({"lm_head.weight": weight}, tmp_path / "model.safetensors")
+    config = SimpleNamespace(
+        model_path=str(tmp_path), hf_config=SimpleNamespace(tie_word_embeddings=False)
+    )
+    with jax.set_mesh(mesh):
+        model = nnx.eval_shape(lambda: _HeadModel(mesh, vocab=vocab, dp_head=dp_head))
+        mapping = model.lm_head.weight_mapping("lm_head.embedding")
+        assert mapping.sharding == ("tensor", None)
+        WeightLoader(model, config, mesh, dtype=jnp.float32).load_weights_from_safetensors(
+            {"lm_head.weight": mapping}, dummy=dummy
+        )
+        loaded = model.lm_head.embedding.value
+        assert loaded.sharding.spec == P("tensor", None)
+        assert loaded.shape == (vocab + (-vocab % tp_size), 12)
+        expected_weight = np.zeros_like(weight) if dummy else weight
+        np.testing.assert_array_equal(np.asarray(loaded)[:vocab], expected_weight)
+        np.testing.assert_array_equal(np.asarray(loaded)[vocab:], 0)
+        h = jax.device_put(hidden, NamedSharding(mesh, P(None, None)))
+        expected = hidden @ expected_weight.T
+        for preserve in (False, True):
+            logits = jax.jit(
+                lambda x, head: model.logits_processor._get_logits(
+                    x, head, preserve_vocab_sharding=preserve
+                )
+            )(h, model.lm_head)
+            np.testing.assert_allclose(logits, expected, rtol=2e-5, atol=2e-5)
+            ids = jax.jit(argmax_with_dp_sharding)(logits)
+            np.testing.assert_array_equal(ids, np.argmax(expected, axis=-1))

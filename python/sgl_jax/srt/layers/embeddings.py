@@ -171,11 +171,11 @@ class ParallelLMHead(Embed):
         from sgl_jax.srt.layers.lm_head_parallel import weight_spec
 
         self.enable_dp_lm_head = enable_dp_lm_head
-        kernel_axes = tuple(weight_spec(enable_dp_lm_head))
+        kernel_axes = tuple(weight_spec(enable_dp_lm_head, mesh))
         partitions = (
             1
             if mesh is None
-            else mesh.shape["tensor"] * (1 if enable_dp_lm_head else mesh.shape["data"])
+            else mesh.shape["tensor"] * (1 if enable_dp_lm_head else mesh.shape.get("data", 1))
         )
         self.vocab_padding = -num_embeddings % partitions
         super().__init__(
