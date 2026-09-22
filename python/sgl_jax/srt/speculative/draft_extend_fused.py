@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from contextlib import contextmanager
 from dataclasses import replace
 from functools import partial
@@ -27,6 +29,8 @@ from sgl_jax.srt.speculative.spec_utils import (
     apply_simulated_acceptance,
 )
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
+
+logger = logging.getLogger(__name__)
 
 
 def _spec_decode_compiler_options():
@@ -553,7 +557,42 @@ def _topk1_index_from_logits(logits):
     return topk_idx
 
 
-def _build_draft_extend(num_layers: int, topk: int):
+def _seed_topk_pages_from_step0(topk_pages, ext_lens, sel_pos):
+    """GLM-5.2 MTP IndexShare: broadcast each request's step-0 selection.
+
+    ``topk_pages`` is the draft layer's ``[T, k_pages]`` per-query page-topk from
+    draft step 0, whose window rows are packed ``[bs, tokens_per_req]`` (same
+    layout ``_rotate_input_ids`` assumes). Row ``sel_pos[b]`` of request ``b`` is
+    its last verified token; every later draft step reuses that row for all of
+    the request's window rows, mirroring the reference implementation which
+    seeds the draft iterations from the draft-extend top-k of the last verified
+    token. Padding requests (``ext_lens == 0``) keep their step-0 rows.
+    """
+    bs = ext_lens.shape[0]
+    tokens_per_req = topk_pages.shape[0] // bs
+    pages_3d = topk_pages.reshape(bs, tokens_per_req, topk_pages.shape[1])
+    onehot = jnp.arange(tokens_per_req, dtype=jnp.int32)[None, :] == sel_pos[:, None]
+    seed = jnp.sum(jnp.where(onehot[:, :, None], pages_3d, 0), axis=1, dtype=pages_3d.dtype)
+    seeded = jnp.broadcast_to(seed[:, None, :], pages_3d.shape)
+    keep_step0 = (ext_lens == 0)[:, None, None]
+    seeded = jnp.where(keep_step0, pages_3d, seeded)
+    return seeded.reshape(topk_pages.shape)
+
+
+def mtp_index_share_enabled(hf_config, topk: int) -> bool:
+    """Whether draft steps reuse the step-0 indexer selection (IndexShare).
+
+    Default follows the checkpoint's ``index_share_for_mtp_iteration`` (GLM-5.2
+    sets it); ``SGLANG_JAX_MTP_INDEX_SHARE=0/1`` forces it for A/B runs. Only the
+    topk=1 chain is supported (rows are not reordered between steps).
+    """
+    forced = os.environ.get("SGLANG_JAX_MTP_INDEX_SHARE")
+    if forced is not None:
+        return forced.strip() not in ("", "0", "false", "False") and topk == 1
+    return bool(getattr(hf_config, "index_share_for_mtp_iteration", False)) and topk == 1
+
+
+def _build_draft_extend(num_layers: int, topk: int, index_share: bool = False):
     """Build the fused JIT. Called once, result cached on draft_worker."""
     assert topk == 1, "Fused draft extend only supports topk=1"
 
@@ -590,6 +629,7 @@ def _build_draft_extend(num_layers: int, topk: int):
         all_pool_updates = []
         layer0_hidden = None
         mesh = None
+        seed_topk_pages = None
         input_ids = forward_batch.input_ids
         if draft_verify_seq_lens is not None:
             valid_draft_slots = draft_verify_seq_lens > 0
@@ -615,9 +655,23 @@ def _build_draft_extend(num_layers: int, topk: int):
             forward_batch.spec_info.hidden_states = target_hidden
             forward_batch.input_ids = input_ids
 
-            output, pool_updates, _, _ = model(
-                forward_batch, all_memory_pools[pool_idx], logits_metadata
-            )
+            if index_share:
+                output, pool_updates, _, _, step_topk_pages = model(
+                    forward_batch,
+                    all_memory_pools[pool_idx],
+                    logits_metadata,
+                    dsa_topk_pages_in=seed_topk_pages,
+                    dsa_topk_reuse=seed_topk_pages is not None,
+                    return_dsa_topk_pages=True,
+                )
+                if i == 0 and step_topk_pages is not None:
+                    seed_topk_pages = _seed_topk_pages_from_step0(
+                        step_topk_pages, forward_batch.extend_seq_lens, sel_pos
+                    )
+            else:
+                output, pool_updates, _, _ = model(
+                    forward_batch, all_memory_pools[pool_idx], logits_metadata
+                )
             all_pool_updates.append(pool_updates)
 
             sh = jax.typeof(output.next_token_logits).sharding
@@ -1958,9 +2012,13 @@ def launch_fused_draft_extend_for_decode(
         relay_valid_mask, data_sharding, "draft_extend.relay_valid_mask"
     )
     if not hasattr(draft_worker, "_fused_jit_fn"):
+        hf_config = getattr(getattr(mr0, "model_config", None), "hf_config", None)
+        index_share = mtp_index_share_enabled(hf_config, draft_worker.topk)
+        logger.info("Fused draft extend: MTP IndexShare %s", "on" if index_share else "off")
         draft_worker._fused_jit_fn = _build_draft_extend(
             num_layers=draft_worker.speculative_num_steps,
             topk=draft_worker.topk,
+            index_share=index_share,
         )
 
     with jax.set_mesh(draft_worker.mesh):
