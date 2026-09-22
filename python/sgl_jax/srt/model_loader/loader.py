@@ -354,6 +354,17 @@ class JAXDummyModelLoader(BaseModelLoader):
         if "dtype_config" in inspect.signature(model_class.__init__).parameters:
             kwargs["dtype_config"] = getattr(model_config, "dtype_config", None)
 
+        if getattr(model_config, "_abstract_mode", False):
+            model_config._dummy_mode = True
+
+            def init_and_load():
+                model = model_class(model_config.hf_config, **kwargs)
+                model.load_weights(model_config)
+                return model
+
+            with jax.set_mesh(self.mesh):
+                return nnx.eval_shape(init_and_load)
+
         with jax.set_mesh(self.mesh):
             model = nnx.eval_shape(lambda: model_class(model_config.hf_config, **kwargs))
 

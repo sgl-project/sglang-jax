@@ -65,9 +65,24 @@ Add `--model-config /path/to/config.json` to select a local model configuration.
 The file describes the architecture; checkpoint tensors are not read. Without this
 argument, the tool uses a tiny two-layer Qwen3 model suitable for the first export.
 
-For a Qwen3 configuration, use native attention with `--dp-size 1`, `--ep-size 1`,
-and `head_dim=128`. Partitioned model dimensions, including KV heads, must be
-divisible by `--tp-size`. The built-in tiny model can use TP=1 or TP=2.
+The `architectures` field selects the model through the same registry and loader
+as serving. There is no separate AOT model list. Configuration classes come from
+the serving/Transformers config registry; registered model implementations whose
+`model_type` is not in that registry receive the JSON fields as a `PretrainedConfig`.
+Choose attention and MoE backends, TP/DP/EP, and cache capacities for your model as
+you would for serving. The exporter derives parameter shardings and cache layouts
+from the loaded model and serving factories.
+
+For example, a Llama or Qwen2 config can be exported directly:
+
+```bash
+PYTHONPATH=python python -m sgl_jax.compile \
+  --model-config /path/to/config.json \
+  --target tpu --topology v6e-4 --tp-size 4 \
+  --attention-backend fa --batch-size 4 \
+  --context-length 128 --kv-capacity 512 --page-size 128 \
+  --stage compiled --dump-llo --output /tmp/model-ir
+```
 
 ### MiMo-V2-Flash with FA and fused MoE v2
 
@@ -269,9 +284,9 @@ tar -czf /tmp/mimo-v7x32-ir.tar.gz -C /tmp mimo-v7x32-ir
 - **Output directory is not empty:** select a new directory for the next run.
 - **Device count or divisibility error:** check topology, TP/DP/EP, model dimensions,
   batch size, and KV capacity together.
-- **Model configuration is rejected:** the current input builder selects Qwen3,
-  MiMo-V2-Flash, or Kimi Linear. Additional architectures need their model/input
-  construction wired into `aot_inputs.py` before they can be selected from the CLI.
+- **Model configuration is rejected:** check `architectures` in the local JSON,
+  the installed serving model implementation, and the backend/parallelism settings
+  reported in `error.txt`. No model name needs to be added to the exporter.
 - **Backend compilation fails:** inspect `error.txt` and `manifest.json`. StableHLO
   is retained if lowering completed, even when later stages fail.
 - **Requested LLO is missing:** check the libtpu version and recorded dump flags in

@@ -111,6 +111,7 @@ class ModelConfig:
         moe_backend: str | MoEBackend = MoEBackend.AUTO,
         moe_dp_size: int = 1,
         model_sub_dir: str | None = None,
+        hf_config: PretrainedConfig | None = None,
     ) -> None:
         self.model_path = model_path
         self.model_sub_dir = model_sub_dir
@@ -134,12 +135,13 @@ class ModelConfig:
             # Otherwise use Fused kernel (single-device TPU optimization)
             self.moe_backend = MoEBackend.EPMOE if self.ep_size > 1 else MoEBackend.FUSED
         # Parse args
-        self.maybe_pull_model_tokenizer_from_remote()
+        if hf_config is None:
+            self.maybe_pull_model_tokenizer_from_remote()
         self.model_override_args = json.loads(model_override_args)
         kwargs = {}
         if override_config_file and override_config_file.strip():
             kwargs["_configuration_file"] = override_config_file.strip()
-        if multimodal:
+        if multimodal and hf_config is None:
             self.model_path = download_from_hf(self.model_path, allow_patterns=None)
         if multimodal and self.model_sub_dir is not None:
             if self.model_sub_dir:
@@ -151,8 +153,12 @@ class ModelConfig:
         # get_config is lru_cached; configure_for_tensor_parallel mutates
         # hf_text_config in-place, so deepcopy to avoid cross-ModelConfig
         # pollution (e.g. PD disaggregation creates two ModelConfigs).
+        # An already parsed config lets offline tools reuse all serving config
+        # normalization without downloading model or generation files.
         self.hf_config = copy.deepcopy(
-            get_config(
+            hf_config
+            if hf_config is not None
+            else get_config(
                 config_path,
                 trust_remote_code=trust_remote_code,
                 revision=revision,
@@ -206,11 +212,12 @@ class ModelConfig:
         if self.quantization_config is not None:
             self.hf_config.quantization_config = self.quantization_config
 
-        self.hf_generation_config = get_generation_config(
-            config_path,
-            trust_remote_code=trust_remote_code,
-            revision=revision,
-            **kwargs,
+        self.hf_generation_config = (
+            get_generation_config(
+                config_path, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+            )
+            if hf_config is None
+            else None
         )
 
         self.hf_text_config = get_hf_text_config(self.hf_config)

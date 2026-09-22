@@ -10,28 +10,6 @@ from sgl_jax.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
-def configure_mtp(config, options):
-    # Match ModelConfig(is_draft_model=True): each runner has one SWA block.
-    count = getattr(config, "num_nextn_predict_layers", None)
-    if count is not None and options.mtp_layer_idx >= count:
-        raise ValueError("mtp_layer_idx exceeds num_nextn_predict_layers")
-    config.architectures = ["MiMoV2MTPForCausalLM"]
-    config.num_hidden_layers = 1
-    config.num_attention_heads = config.swa_num_attention_heads
-    config.num_key_value_heads = config.swa_num_key_value_heads
-    config.head_dim = config.swa_head_dim
-    config.hybrid_layer_pattern = [1]
-    config.moe_layer_freq = [0]
-    config.mtp_layer_idx = options.mtp_layer_idx
-
-
-def bind_shared_parameter_specs(specs):
-    # MultiLayerDraftWorker copies these two arrays from the target. Preserve
-    # MiMoV2FlashForCausalLM's checkpoint mapping, rather than initializer sharding.
-    specs["model.embed_tokens.embedding"] = P("tensor", None)
-    specs["lm_head.embedding"] = P("tensor", None)
-
-
 def configure_batch(config, options, mesh, batch, logits):
     def shaped(shape, dtype=jnp.int32):
         return jax.ShapeDtypeStruct(shape, dtype, sharding=NamedSharding(mesh, P("data")))
