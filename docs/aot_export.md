@@ -1,20 +1,30 @@
-# AOT IR export PoC
+# Offline AOT compiler IR export
 
 `python -m sgl_jax.compile` provides an independent export path inspired by MaxText
 `train_compile`: target topology → abstract model/inputs → shared serving forward →
 lower → compile → save artifacts. It does not execute the forward function or start
 the scheduler, tokenizer, or HTTP server.
 
+Use this path to generate compiler artifacts for graph inspection and optimization.
+TPU cross-compilation runs on a Linux CPU host with libtpu: it describes the target
+device topology and constructs abstract model state and inputs, without requiring
+physical TPU hardware, checkpoint weights, or request data.
+
 ## Supported scope
 
-- Qwen3 dense, BF16, complete decode forward, including logits and KV updates.
-- Native attention, DP=1; model dimensions must satisfy TP divisibility constraints.
-- `head_dim=128`, using the serving `MHATokenToKVPool` layout.
+The export pipeline shares serving's forward function. The currently supported
+model/backend combinations are:
+
+| Model | Precision / workload | Attention | MoE | Constraints |
+| --- | --- | --- | --- | --- |
+| Qwen3 dense | BF16 decode, including logits and KV updates | Native | None | DP=1, EP=1, `head_dim=128`, no sliding window |
+| MiMo-V2-Flash | Synthetic BF16 decode | FA / RPA v3 | `fused_v2` | Hybrid full/SWA attention, attention sinks, separate KV pools, EP=total devices |
+
+- Model dimensions must satisfy the selected parallelism's divisibility constraints.
 - Built-in tiny model: 2 layers, hidden size 512, intermediate size 1024,
   4 query heads, 2 KV heads, and vocabulary size 256.
-- An optional local Qwen3 `config.json`; no checkpoint is loaded.
-- MiMo-V2-Flash BF16 decode with `fa` (RPA v3), `fused_v2`, hybrid sliding-window/full
-  attention, attention sinks, and separate full/SWA KV pools. Supply a local config.
+- Supply a local `config.json` for a different Qwen3 configuration or MiMo-V2-Flash;
+  no checkpoint is loaded.
 - Compile-only TPU topologies: `v6e-1/4/8/16/32/64` and `v7x-8/16/32/64`.
   Following MaxText's topology/host-bounds approach, the suffix counts JAX-visible
   devices. v6e has one device per chip; v7x has two. The built-in model supports
@@ -22,8 +32,8 @@ the scheduler, tokenizer, or HTTP server.
   dimensions are divisible by 4. TPU device count must match `--tp-size`.
 
 Quantization, prefill, LoRA, MTP, multimodal models, and executable serialization
-are outside this PoC. These are synthetic BF16 graphs: the exporter does not infer
-per-tensor checkpoint dtypes or reproduce checkpoint-specific post-load transforms.
+are not currently supported. These are synthetic BF16 graphs: the exporter does not
+infer per-tensor checkpoint dtypes or reproduce checkpoint-specific post-load transforms.
 In particular, this is not the official MiMo FP8 checkpoint graph.
 
 ## CPU checks
@@ -89,8 +99,8 @@ PYTHONPATH=python python -m sgl_jax.compile \
 
 For a 64-device target, change to `--topology v6e-64 --tp-size 64 --dp-size 16
 --ep-size 64`. Both examples use attention TP=4. As in serving, `--tp-size` counts
-all devices; `--dp-size` partitions attention requests and KV pages. In this PoC,
-fused MoE v2 uses all devices for EP, so `ep_size=tp_size`, expert count must divide
+all devices; `--dp-size` partitions attention requests and KV pages. For offline
+export, fused MoE v2 uses all devices for EP, so `ep_size=tp_size`, expert count must divide
 evenly across EP, and batch size must be divisible by EP. KV capacity is global and
 must be divisible by `dp_size * page_size`.
 
@@ -103,8 +113,8 @@ To preserve attention TP=4, use `--dp-size 2 --tp-size 8 --ep-size 8` or
 `--dp-size 4 --tp-size 16 --ep-size 16`. Target size alone does not establish that
 the compiled graph will fit in the target's HBM or run correctly on real hardware.
 
-Both KV pools have the specified token capacity in this initial implementation;
-SWA uses its own page-table input. This is not an automatic HBM-budget allocator.
+Both KV pools have the specified token capacity; SWA uses its own page-table input.
+This is not an automatic HBM-budget allocator.
 FA cumulative lengths have `batch_size + dp_size` entries, and distribution has
 `3 * dp_size` entries, matching serving's per-DP decode metadata. Values are dynamic:
 the graph contains the backend's dynamic attention branches, not a constant-folded
@@ -157,16 +167,16 @@ When changing the shared forward, compare StableHLO against the baseline functio
 and compare logits/KV outputs with nonzero inputs. Compiler artifacts do not replace
 physical TPU execution, numerical validation, or performance measurements.
 
-PoC validation on 2026-09-22:
+Validation on 2026-09-22:
 
 - CPU StableHLO-only, compiled HLO, and TP=2 exports succeeded.
 - A one-off comparison with the original serving JIT produced identical StableHLO
   text. With batch size 2, nonzero random weights/KV, and valid decode inputs, all
   three logits/KV output arrays matched exactly.
 - Existing `test_native_attention_paged_decode.py`: 17 tests and 40 subtests passed.
-- The initial Qwen3 PoC (`476553fb`) passed Linux CPU → v6e-1 cross-compilation
-  with JAX/jaxlib 0.11.1, Flax 0.12.9, and
-  libtpu 0.0.46.1 produced 114,044 bytes of StableHLO, 352,637 bytes of optimized HLO,
+- The Qwen3 exporter at `476553fb` passed Linux CPU → v6e-1 cross-compilation
+  with JAX/jaxlib 0.11.1, Flax 0.12.9, and libtpu 0.0.46.1. It produced
+  114,044 bytes of StableHLO, 352,637 bytes of optimized HLO,
   and 1,893 recognized LLO pass snapshots.
 - MiMo FA metadata shapes/shardings matched serving's decode metadata builder.
   Weight specs matched the existing model mappings; implicit replacement of the
@@ -179,14 +189,28 @@ PoC validation on 2026-09-22:
   | First 2 layers, original dimensions | v6e-8 | 2 / 4 | 8 | Complete | 3477 |
   | Full 48 layers | v6e-32 | 8 / 4 | 32 | Complete | 3585 |
   | Full 48 layers | v6e-64 | 16 / 4 | 64 | Complete | 3513 |
+  | First 2 layers, original dimensions | v7x-8 | 2 / 4 | 8 | Complete | 3383 |
+  | First 2 layers, original dimensions | v7x-16 | 4 / 4 | 16 | Complete | 3523 |
+  | Full 48 layers | v7x-32 | 8 / 4 | 32 | Complete | 3640 |
+  | Full 48 layers | v7x-64 | 16 / 4 | 64 | Complete | 3636 |
 
   The full configuration retains 9 full-attention layers, 39 SWA layers, 47 MoE
   layers with 256 experts each, and original hidden/intermediate/vocabulary sizes.
   Compilation ran on a Linux CPU worker, without loading or executing the roughly
   617.7 GB of abstract BF16 weights. The native-attention regression suite and
   Qwen3 CPU TP=2 export also passed after adding the independent sharding binding.
+- v7x validation used JAX/jaxlib 0.11.1, Flax 0.12.9, and libtpu 0.0.46.1.
+  The four targets produced 94/98/101/101 nonempty final LLO bundles, respectively,
+  including FA/RPA and fused MoE v2. Selected StableHLO, optimized HLO, source config,
+  final LLO, and static memory-report files were read back and verified against
+  manifest SHA256 hashes. The compiled repository Python source matched `c81ce8e97`;
+  installation added only the generated `_version.py` file.
+- Compile-only mesh/device-kind resolution and an all-reduce graph passed for
+  v6e-4 and all four v7x targets. HLO partition counts matched the requested device
+  counts, and hardware helpers restored CPU behavior outside the target mesh.
 - Physical TPU execution, FP8 checkpoint fidelity, and runtime performance remain
-  unverified. Topology mappings for v6e-4/16 have not been compilation validated.
+  unverified. v6e-4 has only the collective check above, and v6e-16 has not been
+  compilation validated.
 
 References:
 

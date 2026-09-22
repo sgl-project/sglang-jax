@@ -33,7 +33,7 @@ def _source():
         ).strip()
     except (OSError, subprocess.CalledProcessError):
         revision = None
-    # Include uncommitted/new Python files too: HEAD alone does not identify a PoC.
+    # Include uncommitted/new Python files too: HEAD alone does not identify the export source.
     files = {}
     for path in sorted((root / "python/sgl_jax").rglob("*.py")):
         files[str(path.relative_to(root))] = hashlib.sha256(path.read_bytes()).hexdigest()

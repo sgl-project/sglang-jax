@@ -1,4 +1,4 @@
-"""Abstract decode inputs for the initial offline export implementation.
+"""Abstract model state and decode inputs for offline IR export.
 
 Like MaxText train_compile, construct shaped state using the real model and
 weight mappings, then compile the serving function without executing it.
@@ -72,7 +72,7 @@ def load_config(options):
     if options.model_config:
         raw = json.loads(Path(options.model_config).read_text())
         if raw.get("model_type") not in ("qwen3", "mimo_v2_flash"):
-            raise ValueError("This PoC supports Qwen3 and MiMo-V2-Flash only")
+            raise ValueError("Offline export currently supports Qwen3 and MiMo-V2-Flash")
         config_cls = Qwen3Config if raw["model_type"] == "qwen3" else PretrainedConfig
         config = config_cls.from_dict(raw)
     else:
@@ -115,9 +115,9 @@ def load_config(options):
         or options.attention_backend != "native"
         or options.dp_size != 1
     ):
-        raise ValueError("Qwen3 PoC requires native attention, DP=1, EP=1 and no MoE backend")
+        raise ValueError("Qwen3 export requires native attention, DP=1, EP=1 and no MoE backend")
     if getattr(config, "use_sliding_window", False):
-        raise ValueError("Sliding-window Qwen3 is outside this PoC")
+        raise ValueError("Offline export does not yet support sliding-window Qwen3")
     for value in (
         config.num_attention_heads,
         config.num_key_value_heads,
@@ -129,7 +129,7 @@ def load_config(options):
                 "Model dimensions must be divisible by attention TP (no head replication)"
             )
     if config.model_type == "qwen3" and config.head_dim != 128:
-        raise ValueError("This PoC requires head_dim=128 to match the serving KV layout")
+        raise ValueError("Qwen3 export requires head_dim=128 to match the serving KV layout")
     if options.context_length > config.max_position_embeddings:
         raise ValueError("context_length exceeds max_position_embeddings")
     return config

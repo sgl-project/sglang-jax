@@ -10,7 +10,7 @@ from pathlib import Path
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="BF16 decode AOT export PoC (Qwen3/native or MiMo-V2-Flash/fa/fused_v2)"
+        description="Offline AOT compiler IR export (StableHLO, optimized HLO, and TPU LLO)"
     )
     parser.add_argument("--model-config", help="Local config.json; omitted: built-in tiny Qwen3")
     parser.add_argument("--target", choices=("cpu", "tpu"), default="tpu")
