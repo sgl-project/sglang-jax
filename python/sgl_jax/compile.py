@@ -26,7 +26,7 @@ def parse_args():
     )
     parser.add_argument("--ep-size", type=int, default=1)
     parser.add_argument("--attention-backend", choices=("native", "fa"), default="native")
-    parser.add_argument("--moe-backend", choices=("fused_v2",))
+    parser.add_argument("--moe-backend", choices=("epmoe", "fused_v2"))
     parser.add_argument(
         "--bf16-model",
         action="store_true",
@@ -38,6 +38,11 @@ def parse_args():
         "--kv-capacity", type=int, default=128, help="KV token capacity, excluding padding"
     )
     parser.add_argument("--page-size", type=int, default=16)
+    parser.add_argument(
+        "--recurrent-capacity",
+        type=int,
+        help="Global recurrent-state slots for linear attention; defaults to batch size",
+    )
     parser.add_argument("--stage", choices=("stablehlo", "compiled"), default="compiled")
     parser.add_argument("--dump-llo", action="store_true", help="Require TPU LLO text artifacts")
     parser.add_argument("--output", type=Path, required=True, help="New or empty output directory")
@@ -58,6 +63,11 @@ def parse_args():
         parser.error("tp_size and batch_size must be divisible by dp_size")
     if options.kv_capacity % (options.page_size * options.dp_size):
         parser.error("kv_capacity must be divisible by page_size * dp_size")
+    if options.recurrent_capacity is not None and (
+        options.recurrent_capacity < options.batch_size
+        or options.recurrent_capacity % options.dp_size
+    ):
+        parser.error("recurrent_capacity must cover batch_size and be divisible by dp_size")
     if options.attention_backend == "fa" and options.target != "tpu":
         parser.error("fa requires --target=tpu")
     padded_context = -(-options.context_length // options.page_size) * options.page_size

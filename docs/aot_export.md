@@ -94,6 +94,38 @@ To compile fewer layers, make a separate config and change `num_hidden_layers`,
 `hybrid_layer_pattern`, and `moe_layer_freq` together. Use the original config to
 export the full model.
 
+### Kimi Linear with KDA and MLA
+
+Save the model's
+[`config.json`](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct/blob/e1df551a447157d4658b573f9a695d57658590e9/config.json)
+locally, then run:
+
+```bash
+PYTHONPATH=python python -m sgl_jax.compile \
+  --model-config /path/to/Kimi-Linear-48B-A3B-Instruct/config.json \
+  --target tpu --topology v7x-16 --tp-size 16 --dp-size 4 --ep-size 16 \
+  --attention-backend fa --moe-backend epmoe \
+  --batch-size 32 --context-length 1024 --kv-capacity 32768 --page-size 256 \
+  --recurrent-capacity 128 \
+  --stage compiled --dump-llo --output /tmp/kimi-v7x16-ir
+```
+
+The model configuration selects KDA for linear-attention layers and absorbed MLA
+for full-attention layers. This command uses the model's EPMoE implementation,
+with `ep-size=tp-size`. `--recurrent-capacity` sets the global number of valid
+recurrent-state slots, independently of the token-based `--kv-capacity`. It defaults
+to batch size and must cover the batch and be divisible by DP. Each DP rank also
+gets a dummy state slot.
+
+Recurrent states use FP32 and convolution states use BF16 by default, following
+serving. `SGLANG_JAX_RECURRENT_STATE_DTYPE` and `SGLANG_JAX_CONV_STATE_DTYPE` select
+`float32`, `bfloat16`, or `float16`; inspect the manifest's input signatures for the
+resulting shapes and dtypes.
+
+For a four-layer export containing both KDA and MLA, set `num_hidden_layers=4` in
+a separate config and retain only IDs 1 through 4 in `linear_attn_config.kda_layers`
+and `linear_attn_config.full_attn_layers`. These lists use one-based layer IDs.
+
 ## Choose a TPU topology and parallelism
 
 `--topology` accepts `v6e-1`, `v6e-4`, `v6e-8`, `v6e-16`, `v6e-32`, `v6e-64`,
@@ -129,6 +161,7 @@ controls compilation, not prefill/decode; there is currently no prefill selector
 | `--context-length` | Cache-location capacity per request, rounded up to a page boundary |
 | `--kv-capacity` | Global KV token capacity, excluding padding; applied to each full/SWA pool |
 | `--page-size` | Tokens per KV page |
+| `--recurrent-capacity` | Valid recurrent-state slots for linear attention; defaults to batch size |
 
 Sequence lengths, token IDs, positions, and page mappings remain abstract runtime
 inputs. You do not need to supply a dataset or prompt file.
@@ -181,9 +214,9 @@ tar -czf /tmp/mimo-v7x32-ir.tar.gz -C /tmp mimo-v7x32-ir
 - **Output directory is not empty:** select a new directory for the next run.
 - **Device count or divisibility error:** check topology, TP/DP/EP, model dimensions,
   batch size, and KV capacity together.
-- **Model configuration is rejected:** the current input builder selects Qwen3 or
-  MiMo-V2-Flash. Additional architectures need their model/input construction wired
-  into `aot_inputs.py` before they can be selected from the CLI.
+- **Model configuration is rejected:** the current input builder selects Qwen3,
+  MiMo-V2-Flash, or Kimi Linear. Additional architectures need their model/input
+  construction wired into `aot_inputs.py` before they can be selected from the CLI.
 - **Backend compilation fails:** inspect `error.txt` and `manifest.json`. StableHLO
   is retained if lowering completed, even when later stages fail.
 - **Requested LLO is missing:** check the libtpu version and recorded dump flags in

@@ -16,6 +16,7 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig, Qwen3Config
 
+from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
 from sgl_jax.srt.layers.attention.native_backend import NativeAttention
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata
 from sgl_jax.srt.mem_cache.memory_pool import MemoryPools, MHATokenToKVPool, SWAKVPool
@@ -71,9 +72,13 @@ def build_mesh(options):
 def load_config(options):
     if options.model_config:
         raw = json.loads(Path(options.model_config).read_text())
-        if raw.get("model_type") not in ("qwen3", "mimo_v2_flash"):
-            raise ValueError("Offline export currently supports Qwen3 and MiMo-V2-Flash")
-        config_cls = Qwen3Config if raw["model_type"] == "qwen3" else PretrainedConfig
+        config_cls = {
+            "qwen3": Qwen3Config,
+            "mimo_v2_flash": PretrainedConfig,
+            "kimi_linear": KimiLinearConfig,
+        }.get(raw.get("model_type"))
+        if config_cls is None:
+            raise ValueError(f"No offline input builder for model_type={raw.get('model_type')!r}")
         config = config_cls.from_dict(raw)
     else:
         config = Qwen3Config(
@@ -94,7 +99,13 @@ def load_config(options):
     if hasattr(config, "quantization_config"):
         del config.quantization_config
     attention_tp = options.tp_size // options.dp_size
-    if config.model_type == "mimo_v2_flash":
+    if options.recurrent_capacity is not None and config.model_type != "kimi_linear":
+        raise ValueError("recurrent_capacity requires a linear-attention model")
+    if config.model_type == "kimi_linear":
+        from sgl_jax.srt.model_executor.aot_kimi_inputs import validate_config
+
+        validate_config(config, options)
+    elif config.model_type == "mimo_v2_flash":
         if options.attention_backend != "fa" or options.moe_backend != "fused_v2":
             raise ValueError("MiMo requires --attention-backend=fa --moe-backend=fused_v2")
         if options.ep_size != options.tp_size or config.n_routed_experts % options.ep_size:
@@ -130,8 +141,11 @@ def load_config(options):
             )
     if config.model_type == "qwen3" and config.head_dim != 128:
         raise ValueError("Qwen3 export requires head_dim=128 to match the serving KV layout")
-    if options.context_length > config.max_position_embeddings:
-        raise ValueError("context_length exceeds max_position_embeddings")
+    max_context = getattr(config, "max_position_embeddings", None) or getattr(
+        config, "model_max_length", None
+    )
+    if max_context is not None and options.context_length > max_context:
+        raise ValueError("context_length exceeds the model's context limit")
     return config
 
 
@@ -143,6 +157,10 @@ def build_inputs(options, mesh):
             from sgl_jax.srt.models.mimo_v2_flash import MiMoV2FlashForCausalLM
 
             model_cls = MiMoV2FlashForCausalLM
+        elif config.model_type == "kimi_linear":
+            from sgl_jax.srt.models.kimi_linear import KimiLinearForCausalLM
+
+            model_cls = KimiLinearForCausalLM
         else:
             model_cls = Qwen3ForCausalLM
         model = model_cls(config, mesh, dtype=jnp.bfloat16)
@@ -164,13 +182,18 @@ def build_inputs(options, mesh):
         model = nnx.eval_shape(init_model)
         mappings = (
             model._create_weight_mappings()
-            if config.model_type == "mimo_v2_flash"
+            if config.model_type != "qwen3"
             else model._create_qwen3_weight_mappings()
         )
         parameter_specs = {
             (m.target_path if isinstance(m.target_path, str) else m.target_path[0]): P(*m.sharding)
             for m in mappings.values()
         }
+        parameter_meshes = {}
+        if config.model_type == "kimi_linear":
+            from sgl_jax.srt.model_executor.aot_kimi_inputs import bind_parameter_specs
+
+            parameter_meshes = bind_parameter_specs(model, config, parameter_specs)
         model_def, model_state = nnx.split(model)
         leaves_with_paths, model_state_def = jax.tree_util.tree_flatten_with_path(model_state)
         model_leaves = []
@@ -186,7 +209,7 @@ def build_inputs(options, mesh):
                 jax.ShapeDtypeStruct(
                     value.shape,
                     value.dtype,
-                    sharding=NamedSharding(mesh, parameter_specs[name]),
+                    sharding=NamedSharding(parameter_meshes.get(name, mesh), parameter_specs[name]),
                 )
             )
         pool_kwargs = dict(
@@ -199,7 +222,11 @@ def build_inputs(options, mesh):
             dp_size=options.dp_size,
             abstract=True,
         )
-        if config.model_type == "mimo_v2_flash":
+        if config.model_type == "kimi_linear":
+            from sgl_jax.srt.model_executor.aot_kimi_inputs import build_resources
+
+            backend, memory_pools = build_resources(config, options, mesh)
+        elif config.model_type == "mimo_v2_flash":
             pool = SWAKVPool(
                 **pool_kwargs,
                 size_swa=options.kv_capacity,
@@ -214,6 +241,8 @@ def build_inputs(options, mesh):
             )
         else:
             pool = MHATokenToKVPool(**pool_kwargs, layer_num=config.num_hidden_layers)
+        if config.model_type != "kimi_linear":
+            memory_pools = MemoryPools(token_to_kv_pool=pool)
 
     def vector(length):
         return jax.ShapeDtypeStruct((length,), jnp.int32, sharding=NamedSharding(mesh, P("data")))
@@ -222,7 +251,9 @@ def build_inputs(options, mesh):
     padded_context = (
         (options.context_length + options.page_size - 1) // options.page_size * options.page_size
     )
-    if options.attention_backend == "fa":
+    if config.model_type == "kimi_linear":
+        recurrent_indices = backend.linear_attn_backend.forward_metadata.recurrent_indices
+    elif options.attention_backend == "fa":
         from sgl_jax.srt.layers.attention.flashattention_backend import (
             FlashAttention,
             FlashAttentionMetadata,
@@ -245,8 +276,10 @@ def build_inputs(options, mesh):
             seq_lens=vector(batch_size),
             distribution=vector(3 * options.dp_size),
         )
+        recurrent_indices = None
     else:
         backend = NativeAttention(config.num_attention_heads, config.num_key_value_heads, mesh)
+        recurrent_indices = None
     batch = ForwardBatch(
         bid=0,
         forward_mode=ForwardMode.DECODE,
@@ -258,6 +291,7 @@ def build_inputs(options, mesh):
         positions=vector(batch_size),
         attn_backend=backend,
         cache_loc=vector(batch_size * padded_context),
+        recurrent_indices=recurrent_indices,
         spec_algorithm=SpeculativeAlgorithm.NONE,
         capture_hidden_mode=CaptureHiddenMode.NULL,
     )
@@ -271,7 +305,7 @@ def build_inputs(options, mesh):
         model_state_def,
         model_leaves,
         batch,
-        MemoryPools(token_to_kv_pool=pool),
+        memory_pools,
         logits,
     )
     return make_jitted_run_model(backend), args, config
