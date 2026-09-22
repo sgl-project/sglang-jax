@@ -26,6 +26,34 @@ from sgl_jax.srt.speculative.spec_utils import (
     SIMULATED_ACCEPTANCE_CONFIG,
     apply_simulated_acceptance,
 )
+from sgl_jax.srt.utils.common_utils import get_bool_env_var
+
+
+def _spec_decode_compiler_options():
+    """Per-executable XLA options for the decode-shaped speculative executables.
+
+    The non-speculative decode path compiles its executables with the
+    SparseCore gather offload disabled when
+    ``SGLANG_JAX_DECODE_DISABLE_SC_GATHER_OFFLOAD`` is set (jax 0.11.1 TPU
+    regression, see ``aot_dispatch.decode_no_sc_gather_compiler_options_fn``).
+    The speculative draft-extend / fused-verify executables are decode-shaped
+    too but were compiled with plain ``jax.jit`` and therefore kept the
+    offload; on v7x tp16 that left ~2/3 of a fused-verify step in offloaded
+    small collectives. Mirror the same opt-in here so both paths agree; the
+    prefill-phase speculative executable keeps the default (large prefill
+    gathers profit from the offload).
+    """
+    if jax.default_backend() != "tpu" or not get_bool_env_var(
+        "SGLANG_JAX_DECODE_DISABLE_SC_GATHER_OFFLOAD"
+    ):
+        return None
+    return {
+        "xla_tpu_offload_gather_to_sparsecore": "false",
+        "xla_tpu_offload_all_supported_gathers_to_sparsecore": "false",
+    }
+
+
+_SPEC_DECODE_COMPILER_OPTIONS = _spec_decode_compiler_options()
 
 
 class GreedyDraftInputs(NamedTuple):
@@ -531,6 +559,7 @@ def _build_draft_extend(num_layers: int, topk: int):
 
     @partial(
         jax.jit,
+        compiler_options=_SPEC_DECODE_COMPILER_OPTIONS,
         donate_argnames=["all_memory_pools"],
         static_argnames=["model_state_def", "num_layers", "update_relay", "dp_size"],
     )
@@ -977,6 +1006,7 @@ def _build_eagle3_recurrent_draft_extend(num_steps: int, topk: int):
 
     @partial(
         jax.jit,
+        compiler_options=_SPEC_DECODE_COMPILER_OPTIONS,
         donate_argnames=["memory_pools"],
         static_argnames=["model_state_def", "num_steps", "update_relay", "dp_size"],
     )
@@ -1133,6 +1163,7 @@ def _build_verify(topk: int):
 
     @partial(
         jax.jit,
+        compiler_options=_SPEC_DECODE_COMPILER_OPTIONS,
         donate_argnames=["target_memory_pools"],
         static_argnames=[
             "target_model_state_def",
