@@ -261,11 +261,14 @@ def device_array(data, sharding=None, **kwargs) -> jax.Array:
 _IS_TPU_RUNTIME_CACHED: bool | None = None
 
 
-def is_tpu_runtime() -> bool:
+def is_tpu_runtime(mesh=None) -> bool:
     """Return True if the current JAX runtime is on TPU devices.
 
-    Prefer checking actual devices; fall back to default backend if necessary.
+    With a mesh, inspect its target devices (including an AOT topology).
+    Otherwise prefer actual runtime devices, falling back to the default backend.
     """
+    if mesh is not None:
+        return all(d.platform == "tpu" for d in mesh.devices.flat)
     global _IS_TPU_RUNTIME_CACHED
     if _IS_TPU_RUNTIME_CACHED is not None:
         return _IS_TPU_RUNTIME_CACHED

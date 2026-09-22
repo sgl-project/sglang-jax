@@ -507,6 +507,8 @@ class MHATokenToKVPool(KVCache):
         dp_size: int = 1,
         start_layer: int | None = None,
         end_layer: int | None = None,
+        *,
+        abstract: bool = False,
     ):
         super().__init__(size, page_size, dtype, layer_num, mesh, start_layer, end_layer)
         self.head_num = head_num
@@ -515,7 +517,7 @@ class MHATokenToKVPool(KVCache):
         self.kv_partition_axis = "tensor"
         self.attention_data_partition_axis = "data"
 
-        self._create_buffers()
+        self._create_buffers(abstract=abstract)
         self._calculate_memory_usage()
 
     def tree_flatten(self):
@@ -564,7 +566,7 @@ class MHATokenToKVPool(KVCache):
 
         return obj
 
-    def _create_buffers(self):
+    def _create_buffers(self, *, abstract: bool = False):
         """Create sharded fused KV cache buffers with proper distributed allocation"""
         self.kv_sharding = NamedSharding(
             self.mesh,
@@ -587,6 +589,12 @@ class MHATokenToKVPool(KVCache):
             packing,
             self.head_dim,
         )
+        if abstract:
+            self.kv_buffer = [
+                jax.ShapeDtypeStruct(fused_buffer_shape, self.dtype, sharding=self.kv_sharding)
+                for _ in range(self.layer_num)
+            ]
+            return
         total_memory_per_layer = (
             fused_buffer_shape[0]
             * fused_buffer_shape[1]
