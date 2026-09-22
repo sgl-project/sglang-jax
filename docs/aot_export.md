@@ -1,219 +1,191 @@
 # Offline AOT compiler IR export
 
-`python -m sgl_jax.compile` provides an independent export path inspired by MaxText
-`train_compile`: target topology → abstract model/inputs → shared serving forward →
-lower → compile → save artifacts. It does not execute the forward function or start
-the scheduler, tokenizer, or HTTP server.
+Use `python -m sgl_jax.compile` to save StableHLO, optimized HLO, and TPU LLO for
+graph inspection and optimization. TPU compilation runs on a Linux CPU host with
+libtpu, without physical TPUs, checkpoint weights, request data, or a running
+inference server.
 
-Use this path to generate compiler artifacts for graph inspection and optimization.
-TPU cross-compilation runs on a Linux CPU host with libtpu: it describes the target
-device topology and constructs abstract model state and inputs, without requiring
-physical TPU hardware, checkpoint weights, or request data.
+## Prepare the environment
 
-## Configuration
-
-- Model dimensions must satisfy the selected parallelism's divisibility constraints.
-- Built-in tiny model: 2 layers, hidden size 512, intermediate size 1024,
-  4 query heads, 2 KV heads, and vocabulary size 256.
-- Supply a local `config.json` with `--model-config`; no checkpoint is loaded.
-- Compile-only TPU topologies: `v6e-1/4/8/16/32/64` and `v7x-8/16/32/64`.
-  Following MaxText's topology/host-bounds approach, the suffix counts JAX-visible
-  devices. v6e has one device per chip; v7x has two. The built-in model supports
-  TP=1/2; TP=4 requires a model configuration whose KV heads and other partitioned
-  dimensions are divisible by 4. TPU device count must match `--tp-size`.
-
-## CPU checks
-
-From the repository root, with a compatible JAX 0.11.1 / Flax 0.12.9 environment:
+From the repository root, install the Python package with TPU dependencies in a
+Python 3.12 environment:
 
 ```bash
-PYTHONPATH=python python -m sgl_jax.compile \
-  --target cpu --stage stablehlo --output /tmp/qwen3-stablehlo
-
-PYTHONPATH=python python -m sgl_jax.compile \
-  --target cpu --stage compiled --output /tmp/qwen3-cpu-hlo
+python -m pip install -e "python[tpu]"
+PYTHONPATH=python python -m sgl_jax.compile --help
 ```
 
-CPU graphs use the CPU KV-update path and validate the export workflow. For TPU
-optimization, use StableHLO/HLO/LLO generated with `--target tpu`.
+Use compatible JAX/jaxlib and libtpu versions. The examples below were checked with
+JAX/jaxlib 0.11.1, Flax 0.12.9, and libtpu 0.0.46.1. The command selects a CPU host
+backend automatically; `--target tpu` selects the compilation target.
 
-## Cross-compile for TPU on a CPU host
+For CPU-target exports, install `python[cpu]` instead and use the CPU command below.
+TPU cross-compilation requires Linux; installing CPU JAX on macOS does not provide
+the TPU compiler.
 
-This requires Linux and matching `jax[tpu]` / libtpu packages. A macOS CPU environment
-cannot substitute for this check. The command sets `JAX_PLATFORMS=cpu` and describes
-the target with compile-only TPU devices; no physical TPU is allocated.
+## Export TPU IR
+
+This command uses the built-in tiny Qwen3 configuration and writes all three IR
+stages to a new directory:
 
 ```bash
 PYTHONPATH=python python -m sgl_jax.compile \
   --target tpu --topology v6e-1 --tp-size 1 \
-  --batch-size 1 --context-length 32 \
-  --kv-capacity 128 --page-size 16 \
+  --batch-size 1 --context-length 32 --kv-capacity 128 --page-size 16 \
   --stage compiled --dump-llo --output /tmp/qwen3-tpu-ir
 ```
 
-Add `--model-config /path/to/config.json` to supply a model configuration.
-Compiler options can be passed with repeated `--compiler-option NAME=JSON_VALUE`
-arguments, for example `--compiler-option xla_tpu_enable_log_recorder=true`.
-Available options depend on the libtpu version.
+Choose a new or empty `--output` directory for every run. The command prints a JSON
+summary with `status`, `output`, and `stages` when export finishes.
 
-`--batch-size` is the number of requests in one decode step, with one new token per
-request. `--context-length` sets the page-aligned cache-location capacity per request;
-sequence lengths and positions remain dynamic inputs. `--kv-capacity` must cover
-every request's page-aligned context. Capacity, page size, shapes, and TP are recorded
-in the manifest. `--stage` selects the compilation stage, not prefill versus decode;
-decode is currently fixed.
+Choose the amount of compilation to perform:
 
-The output directory must be new or empty so that stale dumps cannot count as new
-artifacts.
+| Arguments | Output |
+| --- | --- |
+| `--stage stablehlo` | StableHLO after lowering |
+| `--stage compiled` | StableHLO, optimized HLO, and XLA dumps |
+| `--stage compiled --dump-llo` | All of the above plus TPU LLO |
 
-## MiMo-V2-Flash with FA and fused MoE v2
+For StableHLO only, replace `--stage compiled --dump-llo` in the command with
+`--stage stablehlo`. Keep `--target tpu` when generating IR for TPU optimization.
 
-Use a local copy of the official model's
-[`config.json`](https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash/blob/2f5a22fe08d2c3ecad8fcaf119d47c8fc848bcd1/config.json).
-Its quantization metadata requires an
-explicit `--bf16-model` override; both the original config and effective graph config
-are saved. This changes the weight format, not the architecture or number of layers.
+To try the workflow with a CPU target:
+
+```bash
+PYTHONPATH=python python -m sgl_jax.compile \
+  --target cpu --stage compiled --output /tmp/qwen3-cpu-ir
+```
+
+CPU-target IR uses CPU kernel paths. Omit `--topology` and `--dump-llo` for this
+command.
+
+## Use a model configuration
+
+Add `--model-config /path/to/config.json` to select a local model configuration.
+The file describes the architecture; checkpoint tensors are not read. Without this
+argument, the tool uses a tiny two-layer Qwen3 model suitable for the first export.
+
+For a Qwen3 configuration, use native attention with `--dp-size 1`, `--ep-size 1`,
+and `head_dim=128`. Partitioned model dimensions, including KV heads, must be
+divisible by `--tp-size`. The built-in tiny model can use TP=1 or TP=2.
+
+### MiMo-V2-Flash with FA and fused MoE v2
+
+Save the model's
+[`config.json`](https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash/blob/2f5a22fe08d2c3ecad8fcaf119d47c8fc848bcd1/config.json)
+locally, then run:
 
 ```bash
 PYTHONPATH=python python -m sgl_jax.compile \
   --model-config /path/to/MiMo-V2-Flash/config.json --bf16-model \
-  --target tpu --topology v6e-32 --tp-size 32 --dp-size 8 --ep-size 32 \
+  --target tpu --topology v7x-32 --tp-size 32 --dp-size 8 --ep-size 32 \
   --attention-backend fa --moe-backend fused_v2 \
   --batch-size 64 --context-length 1024 --kv-capacity 65536 --page-size 128 \
-  --stage compiled --dump-llo --output /tmp/mimo-v6e32-ir
+  --stage compiled --dump-llo --output /tmp/mimo-v7x32-ir
 ```
 
-For a 64-device target, change to `--topology v6e-64 --tp-size 64 --dp-size 16
---ep-size 64`. Both examples use attention TP=4. As in serving, `--tp-size` counts
-all devices; `--dp-size` partitions attention requests and KV pages. For offline
-export, fused MoE v2 uses all devices for EP, so `ep_size=tp_size`, expert count must divide
-evenly across EP, and batch size must be divisible by EP. KV capacity is global and
-must be divisible by `dp_size * page_size`.
+The official config includes quantization metadata. `--bf16-model` explicitly
+replaces that metadata for a synthetic BF16 export; it preserves the architecture
+and layer count, but does not reproduce FP8 checkpoint computation. The original
+config is saved as `source_config.json`, and the effective config is recorded in
+`manifest.json`.
 
-For v7x, select `--topology v7x-32` with the same 32-device command, or
-`--topology v7x-64 --tp-size 64 --dp-size 16 --ep-size 64` for 64 devices.
-The exporter targets TPU7x while running on the CPU host. These names map to
-`TPU7x:2x2x4` (16 chips / 32 devices) and `TPU7x:2x4x4` (32 chips / 64 devices),
-respectively. The smaller `v7x-8` and `v7x-16` targets use `2x2x1` and `2x2x2`.
-To preserve attention TP=4, use `--dp-size 2 --tp-size 8 --ep-size 8` or
-`--dp-size 4 --tp-size 16 --ep-size 16`. Target size alone does not establish that
-the compiled graph will fit in the target's HBM or run correctly on real hardware.
+To compile fewer layers, make a separate config and change `num_hidden_layers`,
+`hybrid_layer_pattern`, and `moe_layer_freq` together. Use the original config to
+export the full model.
 
-Both KV pools have the specified token capacity; SWA uses its own page-table input.
-This is not an automatic HBM-budget allocator.
-FA cumulative lengths have `batch_size + dp_size` entries, and distribution has
-`3 * dp_size` entries, matching serving's per-DP decode metadata. Values are dynamic:
-the graph contains the backend's dynamic attention branches, not a constant-folded
-all-decode distribution. No actual requests or checkpoint tensors are allocated.
+## Choose a TPU topology and parallelism
 
-For a reduced-depth smoke check, prepare a separate config with fewer layers and
-truncate both `hybrid_layer_pattern` and `moe_layer_freq` to the same count. Preserve
-the full configuration for a subsequent full-model export; reduced-depth results
-must not be reported as full-model compilation.
+`--topology` accepts `v6e-1`, `v6e-4`, `v6e-8`, `v6e-16`, `v6e-32`, `v6e-64`,
+`v7x-8`, `v7x-16`, `v7x-32`, and `v7x-64`. The suffix counts JAX-visible devices:
+v6e has one device per chip, and v7x has two. For example, `v7x-32` describes
+16 chips with 32 devices.
 
-## Artifacts and failure behavior
+- `--tp-size`: total device count; it must match the topology suffix.
+- `--dp-size`: attention data parallelism. Attention TP is `tp-size / dp-size`.
+- `--ep-size`: expert parallelism. For the MiMo `fused_v2` command, set it equal
+  to the total device count.
+
+To keep attention TP=4 in the MiMo example, replace its parallelism arguments with
+one of these combinations and select a new output directory:
+
+| `--topology` | `--tp-size` | `--dp-size` | `--ep-size` |
+| --- | --- | --- | --- |
+| `v6e-8` or `v7x-8` | 8 | 2 | 8 |
+| `v6e-16` or `v7x-16` | 16 | 4 | 16 |
+| `v6e-32` or `v7x-32` | 32 | 8 | 32 |
+| `v6e-64` or `v7x-64` | 64 | 16 | 64 |
+
+For fused MoE v2, both expert count and batch size must be divisible by EP.
+
+## Set the workload shape
+
+The command builds one decode step with one new token per request. `--stage`
+controls compilation, not prefill/decode; there is currently no prefill selector.
+
+| Argument | Meaning |
+| --- | --- |
+| `--batch-size` | Number of requests in the decode step |
+| `--context-length` | Cache-location capacity per request, rounded up to a page boundary |
+| `--kv-capacity` | Global KV token capacity, excluding padding; applied to each full/SWA pool |
+| `--page-size` | Tokens per KV page |
+
+Sequence lengths, token IDs, positions, and page mappings remain abstract runtime
+inputs. You do not need to supply a dataset or prompt file.
+
+Set `kv-capacity` to at least
+`batch-size * ceil(context-length / page-size) * page-size`, and make it divisible
+by `dp-size * page-size`. Batch size must also be divisible by DP. For example,
+batch 64 with context capacity 1024 needs at least 65536 KV slots. KV capacity is
+specified directly; the tool does not choose it from an HBM budget.
+
+## Pass compiler options
+
+Append repeated `--compiler-option NAME=JSON_VALUE` arguments to an export command,
+for example:
 
 ```text
-manifest.json          Configuration, versions, source fingerprint, input signatures,
-                       stage status, and artifact hashes
-source_config.json     Original local model configuration, when supplied
-stablehlo.mlir         Saved immediately after lowering
-optimized_hlo.txt      HLO after compilation for the selected backend
-xla_dump/             Backend HLO/proto, buffer assignment, memory reports, etc.
-llo/                  Raw libtpu dumps when LLO export is requested
-error.txt             Python traceback on failure
+--compiler-option xla_tpu_enable_log_recorder=true
 ```
 
-Persistent compilation caching is disabled to ensure that code generation runs.
-Dump flags are configured before importing JAX. Existing dump flags in the environment
-are rejected so that artifacts cannot silently go to another directory.
+Values must be JSON scalars, such as `true`, `4`, or a quoted string. Option names
+must start with `xla_`; their availability depends on the compiler version. Dump
+options are managed by the tool. Remove existing dump flags from `XLA_FLAGS` and
+`LIBTPU_INIT_ARGS` before running it, and invoke the CLI in a fresh Python process.
 
-If backend compilation fails, any generated StableHLO is retained, the manifest is
-marked `failed`, and the process exits nonzero. Requested LLO output is also required:
-successful compilation without nonempty LLO snapshots is an export failure.
+## Find and inspect the output
 
-libtpu 0.0.46.1 writes LLO pass snapshots as `*-original.txt` and `*-post-*.txt`.
-The `llo/` directory retains intermediate and late-pass artifacts; auxiliary memory
-reports alone do not count as LLO. Prefer a local output directory and archive the
-results before uploading, rather than writing thousands of small files directly to
-object storage.
+| Path under `--output` | What to inspect |
+| --- | --- |
+| `manifest.json` | Export status, stage results, options, effective config, input shapes/dtypes/shardings, versions, and file hashes |
+| `source_config.json` | Original model config, when supplied |
+| `stablehlo.mlir` | Graph after lowering |
+| `optimized_hlo.txt` | HLO compiled for the selected target |
+| `xla_dump/` | Backend HLO/proto, buffer assignment, and static memory reports |
+| `llo/` | Raw TPU compiler dumps when `--dump-llo` is set |
+| `error.txt` | Traceback if export fails after initialization |
 
-## Implementation and validation
+Start with `manifest.json` and check for `status: complete` and the requested stages.
+For LLO inspection, look for `*-final_bundles.txt`; intermediate pass snapshots are
+also retained. Static memory reports describe compiler allocations, not measured
+runtime memory peaks. The output contains compiler IR, not a serialized executable.
 
-`model_forward.py` shares the forward/JIT configuration with serving, including
-donation and backend state preparation. `aot_inputs.py` traces the existing model and
-dummy weight loader inside `nnx.eval_shape`, reusing the real weight mappings. Weights
-remain dynamic graph inputs; dummy zeros are not embedded as model constants.
-Parameter shardings are bound separately from those mappings: nested dummy-loader
-JITs can report replicated tracer outputs even when their compiled outputs are sharded.
-The KV pool's `abstract=True` option reuses its normal shape calculations and creates
-only abstract arrays.
+Prefer a local output directory, then archive it for transfer:
 
-Lowering, compilation, and artifact export operate on the supplied forward function
-and abstract inputs. Model-specific construction lives in `aot_inputs.py`: it
-currently selects Qwen3 or MiMo-V2-Flash, with BF16 parameter/KV dtypes and decode
-metadata. Additional architectures, precision formats, or workloads need matching
-input construction; the compiler/export stages do not define a model whitelist.
-Checkpoint-specific post-load transforms are not inferred from model config alone.
-The command saves compiler IR and reports, rather than a serialized executable or
-a runtime memory-peak measurement.
+```bash
+tar -czf /tmp/mimo-v7x32-ir.tar.gz -C /tmp mimo-v7x32-ir
+```
 
-When changing the shared forward, compare StableHLO against the baseline function
-and compare logits/KV outputs with nonzero inputs. Compiler artifacts do not replace
-physical TPU execution, numerical validation, or performance measurements.
+## Troubleshooting
 
-Validation on 2026-09-22:
-
-| Model | Precision / workload | Attention | MoE | Configuration |
-| --- | --- | --- | --- | --- |
-| Qwen3 dense | BF16 decode, including logits and KV updates | Native | None | DP=1, EP=1, `head_dim=128`, no sliding window |
-| MiMo-V2-Flash | Synthetic BF16 decode | FA / RPA v3 | `fused_v2` | Hybrid full/SWA attention, attention sinks, separate KV pools, EP=total devices |
-
-- CPU StableHLO-only, compiled HLO, and TP=2 exports succeeded.
-- A one-off comparison with the original serving JIT produced identical StableHLO
-  text. With batch size 2, nonzero random weights/KV, and valid decode inputs, all
-  three logits/KV output arrays matched exactly.
-- Existing `test_native_attention_paged_decode.py`: 17 tests and 40 subtests passed.
-- The Qwen3 exporter at `476553fb` passed Linux CPU → v6e-1 cross-compilation
-  with JAX/jaxlib 0.11.1, Flax 0.12.9, and libtpu 0.0.46.1. It produced
-  114,044 bytes of StableHLO, 352,637 bytes of optimized HLO,
-  and 1,893 recognized LLO pass snapshots.
-- MiMo FA metadata shapes/shardings matched serving's decode metadata builder.
-  Weight specs matched the existing model mappings; implicit replacement of the
-  official config's FP8 metadata was rejected.
-- CPU → TPU MiMo compilation with FA/RPA v3, fused MoE v2, synthetic BF16 weights,
-  batch 64, context capacity 1024, page size 128, and KV capacity 65536 succeeded:
-
-  | Model scope | Target | Attention DP / TP | EP | StableHLO / optimized HLO / LLO | LLO snapshots |
-  | --- | --- | --- | --- | --- | --- |
-  | First 2 layers, original dimensions | v6e-8 | 2 / 4 | 8 | Complete | 3477 |
-  | Full 48 layers | v6e-32 | 8 / 4 | 32 | Complete | 3585 |
-  | Full 48 layers | v6e-64 | 16 / 4 | 64 | Complete | 3513 |
-  | First 2 layers, original dimensions | v7x-8 | 2 / 4 | 8 | Complete | 3383 |
-  | First 2 layers, original dimensions | v7x-16 | 4 / 4 | 16 | Complete | 3523 |
-  | Full 48 layers | v7x-32 | 8 / 4 | 32 | Complete | 3640 |
-  | Full 48 layers | v7x-64 | 16 / 4 | 64 | Complete | 3636 |
-
-  The full configuration retains 9 full-attention layers, 39 SWA layers, 47 MoE
-  layers with 256 experts each, and original hidden/intermediate/vocabulary sizes.
-  Compilation ran on a Linux CPU worker, without loading or executing the roughly
-  617.7 GB of abstract BF16 weights. The native-attention regression suite and
-  Qwen3 CPU TP=2 export also passed after adding the independent sharding binding.
-- v7x validation used JAX/jaxlib 0.11.1, Flax 0.12.9, and libtpu 0.0.46.1.
-  The four targets produced 94/98/101/101 nonempty final LLO bundles, respectively,
-  including FA/RPA and fused MoE v2. Selected StableHLO, optimized HLO, source config,
-  final LLO, and static memory-report files were read back and verified against
-  manifest SHA256 hashes. The compiled repository Python source matched `c81ce8e97`;
-  installation added only the generated `_version.py` file.
-- Compile-only mesh/device-kind resolution and an all-reduce graph passed for
-  v6e-4 and all four v7x targets. HLO partition counts matched the requested device
-  counts, and hardware helpers restored CPU behavior outside the target mesh.
-- Physical TPU execution, FP8 checkpoint fidelity, and runtime performance remain
-  unverified. v6e-4 has only the collective check above, and v6e-16 has not been
-  compilation validated.
-
-References:
-
-- [MaxText train_compile](https://github.com/AI-Hypercomputer/maxtext/blob/main/src/maxtext/trainers/pre_train/train_compile.py)
-- [JAX AOT](https://docs.jax.dev/en/latest/aot.html)
-- [XLA HLO dumps](https://openxla.org/xla/hlo_dumps)
+- **Output directory is not empty:** select a new directory for the next run.
+- **Device count or divisibility error:** check topology, TP/DP/EP, model dimensions,
+  batch size, and KV capacity together.
+- **Model configuration is rejected:** the current input builder selects Qwen3 or
+  MiMo-V2-Flash. Additional architectures need their model/input construction wired
+  into `aot_inputs.py` before they can be selected from the CLI.
+- **Backend compilation fails:** inspect `error.txt` and `manifest.json`. StableHLO
+  is retained if lowering completed, even when later stages fail.
+- **Requested LLO is missing:** check the libtpu version and recorded dump flags in
+  the manifest. Compilation caching is disabled so code generation runs on each
+  invocation; missing requested LLO makes the export fail.
