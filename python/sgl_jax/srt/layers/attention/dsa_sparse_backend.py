@@ -541,6 +541,14 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         def _run(ql_, qpe_, kvc_, kpe_, cache_, topk_, tpages_, seq_lens_, pi_, cuq_, cukv_, dist_):
             page_size = cache_.shape[1] * cache_.shape[2]
             pages_per_seq = pi_.shape[0] // seq_lens_.shape[0]
+            k_pages_max = (
+                min(_PAGE_TOPK_BUDGET, pages_per_seq) + 1 if _PAGE_TOPK_BUDGET > 0 else 512
+            )
+            if has_pages:
+                # Page lists from the prefill-form indexer (spec decode-form path)
+                # are index_topk/page_size wide; the page-level wrapper expects
+                # k_pages_max - 1 columns.
+                tpages_ = _pad_topk_pages(tpages_, k_pages_max - 1)
             return sparse_mla_page_level(
                 ql_,
                 qpe_,
@@ -558,9 +566,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 page_size=page_size,
                 pages_per_seq=pages_per_seq,
                 kv_lora_rank=self.kv_lora_rank,
-                k_pages_max=(
-                    min(_PAGE_TOPK_BUDGET, pages_per_seq) + 1 if _PAGE_TOPK_BUDGET > 0 else 512
-                ),
+                k_pages_max=k_pages_max,
                 vmem_limit_bytes=self.vmem_limit_bytes,
             )
 
@@ -1055,6 +1061,14 @@ def _spec_pseudo_decode_metadata(
     n_valid = jnp.sum(valid).astype(jnp.int32)
     dist = jnp.stack([n_valid, n_valid, n_valid]).astype(jnp.int32)
     return kv_len, cu_q, cu_kv, pi, dist
+
+
+def _pad_topk_pages(topk_pages: jax.Array, width: int) -> jax.Array:
+    """Right-pad a ``[T, k]`` page-topk with -1 to ``width`` columns (no-op if wide enough)."""
+    k = topk_pages.shape[1]
+    if k >= width:
+        return topk_pages
+    return jnp.pad(topk_pages, ((0, 0), (0, width - k)), constant_values=-1)
 
 
 def _placeholder_topk_like(topk_pages: jax.Array) -> jax.Array:
