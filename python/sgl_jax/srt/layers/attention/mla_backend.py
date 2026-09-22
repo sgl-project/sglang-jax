@@ -391,39 +391,43 @@ class MLAAttentionBackend(AttentionBackend):
     def get_eagle_forward_metadata(self, batch, **kwargs):
         # We don't support custom_mask in MLA yet, but for NEXTN it's just sequential draft tokens.
         import numpy as np
+
         from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+
         metadata = MLAAttentionMetadata()
-        
+
         dp_size = batch.dp_size
         per_dp_bs = batch.per_dp_bs_size if dp_size > 1 else len(batch.seq_lens)
-        
+
         if batch.forward_mode.is_target_verify():
             padded_batch_size = len(batch.seq_lens)
             extend_seq_lens = np.zeros(padded_batch_size, dtype=np.int32)
             extend_seq_lens[batch.logits_indices_selector] = batch.spec_info_padded.draft_token_num
         else:
             extend_seq_lens = batch.extend_seq_lens
-            
+
         ext_2d = extend_seq_lens.reshape(dp_size, per_dp_bs)
         cu_q_2d = np.zeros((dp_size, per_dp_bs + 1), dtype=np.int32)
         cu_q_2d[:, 1:] = np.cumsum(ext_2d, axis=1)
         metadata.cu_q_lens = cu_q_2d.ravel()
-        
+
         total_loc_len = len(batch.cache_loc)
         per_dp_loc_len = total_loc_len // batch.dp_size
         cache_loc_2d = batch.cache_loc.reshape(batch.dp_size, per_dp_loc_len)
         strided_2d = cache_loc_2d[:, :: self.page_size]
         metadata.page_indices = (strided_2d // self.page_size).ravel()
-        
-        aligned_seq_lens = ((batch.seq_lens + self.page_size - 1) // self.page_size) * self.page_size
+
+        aligned_seq_lens = (
+            (batch.seq_lens + self.page_size - 1) // self.page_size
+        ) * self.page_size
         aligned_2d = aligned_seq_lens.reshape(batch.dp_size, per_dp_bs)
         cu_kv_2d = np.zeros((batch.dp_size, per_dp_bs + 1), dtype=np.int32)
         cu_kv_2d[:, 1:] = np.cumsum(aligned_2d, axis=1)
         metadata.cu_kv_lens = cu_kv_2d.ravel()
-        
+
         seq_lens_2d = batch.seq_lens.reshape(batch.dp_size, per_dp_bs)
         metadata.seq_lens = seq_lens_2d.ravel()
-        
+
         local_num_seqs = np.sum(seq_lens_2d > 0, axis=1, dtype=np.int32)
         if batch.forward_mode == ForwardMode.DECODE:
             distribution = np.repeat(local_num_seqs, 3)
@@ -432,10 +436,12 @@ class MLAAttentionBackend(AttentionBackend):
                 [np.zeros_like(local_num_seqs), np.zeros_like(local_num_seqs), local_num_seqs]
             ).ravel()
         metadata.distribution = distribution
-        
+
+        from jax.sharding import NamedSharding
+        from jax.sharding import PartitionSpec as P
+
         from sgl_jax.srt.utils.jax_utils import device_array
-        from jax.sharding import NamedSharding, PartitionSpec as P
-        
+
         (
             metadata.cu_q_lens,
             metadata.cu_kv_lens,
@@ -443,8 +449,14 @@ class MLAAttentionBackend(AttentionBackend):
             metadata.seq_lens,
             metadata.distribution,
         ) = device_array(
-            (metadata.cu_q_lens, metadata.cu_kv_lens, metadata.page_indices, metadata.seq_lens, metadata.distribution),
+            (
+                metadata.cu_q_lens,
+                metadata.cu_kv_lens,
+                metadata.page_indices,
+                metadata.seq_lens,
+                metadata.distribution,
+            ),
             sharding=(NamedSharding(self.mesh, P(self.attention_data_partition_axis))),
         )
-        
+
         return metadata

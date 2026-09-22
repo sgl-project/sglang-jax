@@ -471,38 +471,38 @@ def _rotate_prefill_input_ids(input_ids, extend_seq_lens, verified_id, dp_size, 
     def rotate_rank(ids_rank, ext_rank, verified_rank):
         # We can implement a cumsum as a matrix multiplication!
         # A lower triangular matrix of ones multiplied by ext_rank gives the cumsum!
-        import jax.numpy as jnp
         import jax
-        
+        import jax.numpy as jnp
+
         N = ext_rank.shape[0]
         idx = jnp.arange(N)
         mask = (idx[:, None] >= idx[None, :]).astype(jnp.int32)
-        
+
         # This is exactly the inclusive cumsum!
         ext_rank_cumsum = jnp.dot(mask, ext_rank)
-        
+
         starts = ext_rank_cumsum - ext_rank
         ends = starts + ext_rank
         in_req = (tok[None, :] >= starts[:, None]) & (tok[None, :] < ends[:, None])
         has_req = jnp.any(in_req, axis=0)
         slot = jnp.argmax(in_req.astype(jnp.int32), axis=0)
-        
+
         # Matrix multiply bypassing JAX gather layout check
         one_hot_slot = jax.nn.one_hot(slot, N, dtype=starts.dtype)
         req_starts = jnp.dot(one_hot_slot, starts)
         req_lens = jnp.dot(one_hot_slot, ext_rank)
         req_verified = jnp.dot(one_hot_slot, verified_rank)
-        
+
         shifted_index = jnp.minimum(tok + 1, per_dp_tokens - 1)
         one_hot_shifted = jax.nn.one_hot(shifted_index, per_dp_tokens, dtype=starts.dtype)
         shifted = jnp.dot(one_hot_shifted, ids_rank)
-        
+
         # Bypass jnp.where ShardingTypeError by using algebraic boolean masks!
         # Multiplication automatically promotes sharding constraints!
         is_last = has_req & ((tok - req_starts) == (req_lens - 1))
         is_last_int = is_last.astype(jnp.int32)
         rotated = is_last_int * req_verified + (1 - is_last_int) * shifted
-        
+
         has_req_int = has_req.astype(jnp.int32)
         return has_req_int * rotated + (1 - has_req_int) * ids_rank
 
@@ -586,7 +586,9 @@ def _build_draft_extend(num_layers: int, topk: int):
             forward_batch.spec_info.hidden_states = target_hidden
             forward_batch.input_ids = input_ids
 
-            output, pool_updates, _, _ = model(forward_batch, all_memory_pools[pool_idx], logits_metadata)
+            output, pool_updates, _, _ = model(
+                forward_batch, all_memory_pools[pool_idx], logits_metadata
+            )
             all_pool_updates.append(pool_updates)
 
             sh = jax.typeof(output.next_token_logits).sharding
@@ -747,9 +749,6 @@ def _make_target_verify_metadata(
     page_size: int,
     dp_size: int,
 ):
-    from sgl_jax.srt.layers.attention.flashattention_backend import (
-        FlashAttentionMetadata,
-    )
 
     valid = verify_seq_lens > 0
     extend_seq_lens = jnp.where(
@@ -769,7 +768,7 @@ def _make_target_verify_metadata(
         dp_size=dp_size,
     )
     swa_page_indices = None
-    if getattr(old_metadata, 'swa_page_indices', None) is not None:
+    if getattr(old_metadata, "swa_page_indices", None) is not None:
         swa_page_indices = _repack_page_indices(
             old_metadata.swa_page_indices,
             allocated_lens,
@@ -824,9 +823,6 @@ def _make_draft_extend_metadata(
     page_size: int,
     dp_size: int,
 ):
-    from sgl_jax.srt.layers.attention.flashattention_backend import (
-        FlashAttentionMetadata,
-    )
 
     valid = draft_seq_lens > 0
     # Fused EAGLE3 passes device query lengths so this cumsum remains in the
@@ -844,7 +840,7 @@ def _make_draft_extend_metadata(
         dp_size=dp_size,
     )
     swa_page_indices = None
-    if getattr(old_metadata, 'swa_page_indices', None) is not None:
+    if getattr(old_metadata, "swa_page_indices", None) is not None:
         swa_page_indices = _repack_page_indices(
             old_metadata.swa_page_indices,
             allocated_lens,
@@ -1194,7 +1190,7 @@ def _build_verify(topk: int):
             valid_seq_lens = target_forward_batch.seq_lens > 0
             zeros = jnp.zeros_like(target_forward_batch.seq_lens)
             b = relay_new_seq_lens - 1 + zeros
-            
+
             target_forward_batch.seq_lens = jnp.where(
                 valid_seq_lens,
                 b,
@@ -1346,7 +1342,7 @@ def _build_verify(topk: int):
         prepared_sel_pos = prepared.sel_pos
         prepared_sel_pos_data = prepared.sel_pos
         prepared_predict = prepared.predict
-        
+
         # jax.debug.print(
         #     "\n[SPEC_VERIFY]\n  Draft tokens: {d}\n  Target predicted: {t}\n  Accept length: {a}\n  Verified tokens: {v}",
         #     d=draft_tokens,
@@ -2444,7 +2440,10 @@ def spec_decode_verify(
         target_mr.attn_backend.forward_metadata = target_mr.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
         )
-    if use_relay_state and getattr(target_mr.attn_backend.forward_metadata, "custom_mask", None) is not None:
+    if (
+        use_relay_state
+        and getattr(target_mr.attn_backend.forward_metadata, "custom_mask", None) is not None
+    ):
         raise NotImplementedError("Spec decode overlap relay path does not support custom_mask.")
     target_forward_batch = _make_forward_batch(model_worker_batch, target_mr)
     if rebuild_verify_metadata:

@@ -460,7 +460,7 @@ class ModelRunnerKVCacheMixin:
         available_kv_cache_bytes = self._profile_available_bytes(total_device_memory)
 
         cell_size = self._compute_cell_size()
-        
+
         # Accommodate Draft KV Cache Memory Footprint + Spec Headroom
         if (
             not self.is_draft_worker
@@ -469,7 +469,10 @@ class ModelRunnerKVCacheMixin:
         ):
             # Reserve 2 GB entirely for the Draft Worker's KV buffer and XLA fragmentation.
             overhead_bytes = 1 * 1024 * 1024 * 1024
-            logger.info(f"Deducting {overhead_bytes} bytes from available KV cache for draft memory overhead")
+            logger.info(
+                "Deducting %d bytes from available KV cache for draft memory overhead",
+                overhead_bytes,
+            )
             available_kv_cache_bytes -= overhead_bytes
 
         max_tokens = max(1, int(available_kv_cache_bytes // cell_size))
