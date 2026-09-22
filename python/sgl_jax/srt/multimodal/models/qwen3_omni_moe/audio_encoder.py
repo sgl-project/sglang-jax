@@ -75,6 +75,7 @@ class Qwen3OmniMoeAudioAttention(nnx.Module):
     def __call__(
         self,
         hidden_states: jax.Array,
+        attn_mask: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array | None, tuple[jax.Array] | None]:
         seq_length, _ = hidden_states.shape
 
@@ -88,6 +89,7 @@ class Qwen3OmniMoeAudioAttention(nnx.Module):
             value_states,
             scale=self.scaling,
             causal=False,
+            attn_mask=attn_mask,
         )
 
         attn_output = attn_output.reshape(seq_length, -1)
@@ -133,10 +135,11 @@ class Qwen3OmniMoeAudioEncoderLayer(nnx.Module):
     def __call__(
         self,
         hidden_states: jax.Array,
+        attn_mask: jax.Array | None = None,
     ) -> jax.Array:
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
-        hidden_states = self.self_attn(hidden_states)
+        hidden_states = self.self_attn(hidden_states, attn_mask)
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
@@ -277,9 +280,37 @@ class Qwen3OmniMoeAudioEncoder(nnx.Module):
         padded_embed = padded_embed + positional_embedding
         hidden_states = padded_embed[padded_mask_after_cnn]
 
+        # Build a block-diagonal attention mask so each audio window attends only
+        # within itself (mirrors HF Qwen3-Omni: attention is restricted to
+        # cu_seqlens blocks). Without this the encoder ran global bidirectional
+        # attention over the whole concatenated audio, which diverges for any
+        # audio spanning more than one window.
+        aftercnn_lens = self._get_feat_extract_output_lengths(feature_lens)
+        window_aftercnn = int(jnp.max(feature_lens_after_cnn)) * (
+            self.n_window_infer // (self.n_window * 2)
+        )
+        cu_chunk_lens = [0]
+        for cnn_len in aftercnn_lens.tolist():
+            cnn_len = int(cnn_len)
+            cu_chunk_lens += [window_aftercnn] * (cnn_len // window_aftercnn)
+            remainder = cnn_len % window_aftercnn
+            if remainder != 0:
+                cu_chunk_lens += [remainder]
+        cu_seqlens = jnp.cumsum(jnp.asarray(cu_chunk_lens, dtype=jnp.int32))
+
+        total_tokens = hidden_states.shape[0]
+        pos = jnp.arange(total_tokens)
+        # seg[p] = index of the cu_seqlens block that token p belongs to; tokens
+        # may attend iff they share a block. Robust to zero-width blocks.
+        seg = jnp.sum(pos[:, None] >= cu_seqlens[None, 1:], axis=1)
+        attn_mask = jnp.where(seg[:, None] == seg[None, :], 0.0, jnp.finfo(self.dtype).min).astype(
+            self.dtype
+        )
+
         for encoder_layer in self.layers:
             layer_outputs = encoder_layer(
                 hidden_states,
+                attn_mask,
             )
 
             hidden_states = layer_outputs
