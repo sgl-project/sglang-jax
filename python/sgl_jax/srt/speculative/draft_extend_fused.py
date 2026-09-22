@@ -493,15 +493,21 @@ def _rotate_input_ids(input_ids, ext_lens, sel_pos, new_tokens):
     """Mirror MultiLayerDraftWorker._rotate_ids on device for topk=1."""
     bs = ext_lens.shape[0]
     tokens_per_req = input_ids.shape[0] // bs
-    ids_2d = input_ids.reshape(bs, tokens_per_req)
-    shifted_2d = jnp.concatenate([ids_2d[:, 1:], ids_2d[:, -1:]], axis=1)
-    shifted_2d = shifted_2d.at[jnp.arange(bs), sel_pos].set(
-        new_tokens,
-        out_sharding=jax.typeof(shifted_2d).sharding,
-    )
-    pad_mask = (ext_lens == 0)[:, None]
-    shifted_2d = jnp.where(pad_mask, ids_2d, shifted_2d)
-    return shifted_2d.reshape(-1)
+
+    def _rotate(input_ids, ext_lens, sel_pos, new_tokens):
+        ids_2d = input_ids.reshape(bs, tokens_per_req)
+        shifted_2d = jnp.concatenate([ids_2d[:, 1:], ids_2d[:, -1:]], axis=1)
+        shifted_2d = shifted_2d.at[jnp.arange(bs), sel_pos].set(new_tokens)
+        pad_mask = (ext_lens == 0)[:, None]
+        shifted_2d = jnp.where(pad_mask, ids_2d, shifted_2d)
+        return shifted_2d.reshape(-1)
+
+    # Auto-sharded region: with an explicit mesh the [bs*n] -> [bs, n] split
+    # hangs a size-1 "data" axis (dp=1) on the n dim and the two slices no
+    # longer agree (concatenate raises ShardingTypeError). Let XLA infer the
+    # interior and pin only the output to the input's placement (it feeds the
+    # next draft layer's embedding).
+    return _auto_sharded(_rotate, input_ids)(input_ids, ext_lens, sel_pos, new_tokens)
 
 
 def _rotate_prefill_input_ids(input_ids, extend_seq_lens, verified_id, dp_size, per_dp_bs):
@@ -563,6 +569,22 @@ def _reshard_values(sharding, *values):
     return tuple(jax.sharding.reshard(value, sharding) for value in values)
 
 
+def _auto_sharded(fn, out_like):
+    """Run ``fn`` as an auto-sharded region whose result takes ``out_like``'s placement.
+
+    The fused spec JITs run on an explicit-sharding mesh, where in-JIT shape
+    plumbing (reshape / slice / concatenate / where on ``[bs*n]`` <-> ``[bs, n]``
+    views) must type-check shardings and a size-1 ``data`` axis (dp=1) makes the
+    inferred specs disagree. Inside ``jax.sharding.auto_axes`` XLA infers the
+    interior freely; only the exit placement is pinned. Without an explicit
+    mesh (plain CPU tests) ``fn`` is returned unchanged.
+    """
+    sharding = jax.typeof(out_like).sharding
+    if isinstance(sharding, NamedSharding) and not sharding.mesh.empty:
+        return jax.sharding.auto_axes(fn, out_sharding=sharding)
+    return fn
+
+
 def _topk1_index_from_logits(logits):
     topk_idx = argmax_with_dp_sharding(logits)[:, None]
     return topk_idx
@@ -581,13 +603,22 @@ def _seed_topk_pages_from_step0(topk_pages, ext_lens, sel_pos):
     """
     bs = ext_lens.shape[0]
     tokens_per_req = topk_pages.shape[0] // bs
-    pages_3d = topk_pages.reshape(bs, tokens_per_req, topk_pages.shape[1])
-    onehot = jnp.arange(tokens_per_req, dtype=jnp.int32)[None, :] == sel_pos[:, None]
-    seed = jnp.sum(jnp.where(onehot[:, :, None], pages_3d, 0), axis=1, dtype=pages_3d.dtype)
-    seeded = jnp.broadcast_to(seed[:, None, :], pages_3d.shape)
-    keep_step0 = (ext_lens == 0)[:, None, None]
-    seeded = jnp.where(keep_step0, pages_3d, seeded)
-    return seeded.reshape(topk_pages.shape)
+
+    def _seed(topk_pages, ext_lens, sel_pos):
+        pages_3d = topk_pages.reshape(bs, tokens_per_req, topk_pages.shape[1])
+        onehot = jnp.arange(tokens_per_req, dtype=jnp.int32)[None, :] == sel_pos[:, None]
+        seed = jnp.sum(jnp.where(onehot[:, :, None], pages_3d, 0), axis=1, dtype=pages_3d.dtype)
+        seeded = jnp.broadcast_to(seed[:, None, :], pages_3d.shape)
+        keep_step0 = (ext_lens == 0)[:, None, None]
+        seeded = jnp.where(keep_step0, pages_3d, seeded)
+        return seeded.reshape(topk_pages.shape)
+
+    # Auto-sharded region: with an explicit mesh the [T, k] -> [bs, tpr, k]
+    # split hangs a size-1 "data" axis (dp=1) on the tpr dim while ext_lens /
+    # sel_pos keep it on dim 0, and the where() broadcast becomes an illegal
+    # P("data", "data", None). Let XLA infer the interior and pin only the
+    # output to the input's placement (the backend shard_maps it P("data", None)).
+    return _auto_sharded(_seed, topk_pages)(topk_pages, ext_lens, sel_pos)
 
 
 def mtp_index_share_enabled(hf_config, topk: int) -> bool:
