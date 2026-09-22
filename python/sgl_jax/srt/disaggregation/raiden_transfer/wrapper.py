@@ -8,6 +8,8 @@ from typing import Any
 
 import jax
 
+from sgl_jax.raiden import get_raiden_kv_cache_manager
+
 logger = logging.getLogger(__name__)
 
 _GLOBAL_LOCK = threading.Lock()
@@ -75,13 +77,7 @@ class RaidenTransferWrapper:
         with self._init_lock:
             if self._engines:
                 return self.engine
-            try:
-                from tpu_raiden.api.jax.kv_cache_manager import KVCacheManager
-            except ModuleNotFoundError as exc:
-                raise RuntimeError(
-                    "Raiden is enabled but tpu_raiden is not installed; install "
-                    "a wheel matching the active JAX and libtpu versions"
-                ) from exc
+            KVCacheManager = get_raiden_kv_cache_manager()
 
             if not kv_caches:
                 raise ValueError("Raiden requires at least one KV cache tensor")

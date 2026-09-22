@@ -12,11 +12,37 @@ logger = logging.getLogger(__name__)
 AIOHTTP_STREAM_READ_CHUNK_SIZE = 1024 * 64
 
 
+async def _iter_stream_lines(content):
+    # Cumulative logprobs can exceed aiohttp's readline high-water mark.
+    # Read bounded transport chunks and reconstruct complete SSE lines ourselves.
+    pending = bytearray()
+    async for chunk in content.iter_chunked(AIOHTTP_STREAM_READ_CHUNK_SIZE):
+        pending.extend(chunk)
+        start = 0
+        while (end := pending.find(b"\n", start)) >= 0:
+            yield bytes(pending[start : end + 1])
+            start = end + 1
+        if start:
+            del pending[:start]
+    if pending:
+        yield bytes(pending)
+
+
 def _get_dp_size(server_info: dict) -> int:
     dp_size = server_info.get("dp_size")
     if dp_size is not None:
         return int(dp_size)
     return max(1, len(server_info.get("internal_states") or []))
+
+
+def _prepend_input_logprobs(prefill_meta: dict, response: dict) -> None:
+    # Output-only logprob requests legitimately omit prompt logprobs on P.
+    if "input_token_logprobs" not in prefill_meta:
+        return
+    decode_meta = response.setdefault("meta_info", {})
+    decode_meta["input_token_logprobs"] = (prefill_meta["input_token_logprobs"] or []) + (
+        decode_meta.get("input_token_logprobs") or []
+    )
 
 
 class MiniLoadBalancer:
@@ -173,11 +199,7 @@ class MiniLoadBalancer:
             if "return_logprob" in modified_request:
                 prefill_json = await prefill_response.json()
                 ret_json = await decode_response.json()
-                if "meta_info" in ret_json and "input_token_logprobs" in ret_json["meta_info"]:
-                    ret_json["meta_info"]["input_token_logprobs"] = (
-                        prefill_json["meta_info"]["input_token_logprobs"]
-                        + ret_json["meta_info"]["input_token_logprobs"]
-                    )
+                _prepend_input_logprobs(prefill_json.get("meta_info", {}), ret_json)
             else:
                 ret_json = await decode_response.json()
 
@@ -234,14 +256,15 @@ class MiniLoadBalancer:
                 prefill_response, decode_response = await asyncio.gather(*tasks)
 
                 if modified_request.get("return_logprob", False):
-                    prefill_chunks = []
-                    async for chunk in prefill_response.content:
-                        prefill_chunks.append(chunk)
+                    prefill_meta = {}
+                    async for chunk in _iter_stream_lines(prefill_response.content):
+                        if chunk.startswith(b"data:") and b"[DONE]" not in chunk:
+                            event_meta = orjson.loads(chunk[5:]).get("meta_info", {})
+                            if "input_token_logprobs" in event_meta:
+                                # Prompt logprobs may arrive after an initial empty event.
+                                prefill_meta = event_meta
 
-                    first_prefill_chunk = prefill_chunks[0].decode("utf-8")[5:].strip("\n")
-                    first_prefill_chunk_json = orjson.loads(first_prefill_chunk)
-
-                    async for chunk in decode_response.content:
+                    async for chunk in _iter_stream_lines(decode_response.content):
                         decoded_chunk = chunk.decode("utf-8")
                         if (
                             decoded_chunk
@@ -249,10 +272,7 @@ class MiniLoadBalancer:
                             and "[DONE]" not in decoded_chunk
                         ):
                             ret_json = orjson.loads(decoded_chunk[5:].strip("\n"))
-                            ret_json["meta_info"]["input_token_logprobs"] = (
-                                first_prefill_chunk_json["meta_info"]["input_token_logprobs"]
-                                + ret_json["meta_info"]["input_token_logprobs"]
-                            )
+                            _prepend_input_logprobs(prefill_meta, ret_json)
                             yield b"data: " + orjson.dumps(ret_json) + b"\n\n"
                         else:
                             yield chunk
