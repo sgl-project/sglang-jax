@@ -388,6 +388,18 @@ class MLAAttentionBackend(AttentionBackend):
         ), f"max running requests: {res} must larger than 0, please increase page size or decrease max context length"
         return res
 
+    def get_eagle_base_metadata(self, batch, **kwargs):
+        """Metadata for the fused speculative JITs that rebuild dynamic fields on device.
+
+        The FlashAttention backend uploads only page ids here; the MLA/DSA verify and
+        draft-extend helpers (``_make_target_verify_metadata`` /
+        ``_make_draft_extend_metadata``) rebuild seq_lens, cu_q_lens, cu_kv_lens and the
+        page table from ``page_indices`` themselves, so the full host metadata is a
+        valid (if slightly larger) base. Keep one construction path until MLA grows a
+        page-only upload.
+        """
+        return self.get_eagle_forward_metadata(batch, **kwargs)
+
     def get_eagle_forward_metadata(self, batch, **kwargs):
         # We don't support custom_mask in MLA yet, but for NEXTN it's just sequential draft tokens.
         import numpy as np
