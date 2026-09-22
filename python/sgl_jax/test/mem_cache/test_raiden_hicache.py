@@ -572,6 +572,13 @@ def test_scheduler_restore_can_evict_without_spending_reserved_tokens(direct, re
             assert match.last_host_node.evicted
             assert case.allocator.available_size(0) == 4
             assert not adder.pending_h2d
+        elif not direct:
+            assert result == AddReqResult.CONTINUE
+            assert len(req.prefix_indices) == 0
+            assert req.extend_input_len == 12
+            assert match.last_host_node.evicted
+            assert case.allocator.available_size(0) == 4
+            assert not adder.pending_h2d
         else:
             assert result == AddReqResult.CONTINUE
             assert len(req.prefix_indices) == 8
@@ -583,6 +590,85 @@ def test_scheduler_restore_can_evict_without_spending_reserved_tokens(direct, re
                     np.testing.assert_array_equal(
                         case._read_token(layer, int(index)), original[i][layer]
                     )
+    finally:
+        if req is not None and hasattr(req, "cache_lock_params"):
+            case.cache.dec_lock_ref(req.last_node, req.cache_lock_params)
+        case.tearDown()
+
+
+@pytest.mark.parametrize("direct", [False, True])
+@pytest.mark.parametrize("page_size", [1, 4])
+def test_scheduler_write_back_restore_with_both_tiers_full(direct, page_size):
+    from types import SimpleNamespace
+
+    from sgl_jax.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+
+    base = TestDirectLoadBack if direct else lifecycle.TestEvictAndLoadBack
+
+    class Case(base):
+        DEVICE_SIZE = 16
+        HOST_PAGES = 8 // page_size
+        PAGE_SIZE = page_size
+
+    case = Case()
+    case.setUp()
+    req = None
+    try:
+        case.cache.write_policy = "write_back"
+        target = list(range(100, 108))
+        indices, expected = case._alloc_and_fill(8, seed=101)
+        case.cache.insert(lifecycle.InsertParams(key=lifecycle._key(target), value=indices))
+        case.cache.evict(lifecycle.EvictParams(num_tokens=8, dp_rank=0))
+        case._settle_writes()
+        filler, _ = case._alloc_and_fill(16, seed=102)
+        case.cache.insert(
+            lifecycle.InsertParams(key=lifecycle._key(list(range(200, 216))), value=filler)
+        )
+        assert case.allocator.available_size(0) == case.host_pool.available_size() == 0
+        match = case.cache.match_prefix(lifecycle.MatchPrefixParams(key=lifecycle._key(target)))
+        assert match.host_hit_length == 8
+        host_handles = match.last_host_node.component_data[0].host_value.copy()
+        req = SimpleNamespace(
+            dp_rank=0,
+            sampling_params=SimpleNamespace(ignore_eos=False, max_new_tokens=1),
+            extend_input_len=9,
+            host_hit_length=8,
+            prefix_indices=match.device_indices,
+            last_node=match.last_device_node,
+            last_host_node=match.last_host_node,
+            fill_ids=target + [400],
+        )
+        adder = PrefillAdder(
+            page_size=page_size,
+            tree_cache=case.cache,
+            token_to_kv_pool_allocator=case.allocator,
+            running_batch=None,
+            new_token_ratio=1.0,
+            rem_input_tokens=32,
+            rem_chunk_tokens=16,
+        )
+        assert adder.add_one_req(req) == AddReqResult.CONTINUE
+        np.testing.assert_array_equal(
+            match.last_host_node.component_data[0].host_value, host_handles
+        )
+        assert not adder.pending_h2d
+        if direct:
+            assert len(req.prefix_indices) == 8
+            assert req.extend_input_len == 1
+            for i, index in enumerate(req.prefix_indices):
+                for layer in range(case.LAYER_NUM):
+                    np.testing.assert_array_equal(
+                        case._read_token(layer, int(index)), expected[i][layer]
+                    )
+        else:
+            # JAX recomputes instead of evicting its own unpinned host source.
+            assert len(req.prefix_indices) == 0
+            assert req.extend_input_len == 9
+            assert match.last_host_node.evicted
+            assert case.allocator.available_size(0) == 0
+        case.cache.dec_lock_ref(req.last_node, req.cache_lock_params)
+        req = None
+        assert case.allocator.available_size(0) + case.cache.evictable_size(0) == 16
     finally:
         if req is not None and hasattr(req, "cache_lock_params"):
             case.cache.dec_lock_ref(req.last_node, req.cache_lock_params)

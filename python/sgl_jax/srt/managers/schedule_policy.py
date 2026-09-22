@@ -672,10 +672,12 @@ class PrefillAdder:
             # HiCache: after budget gate, pull host-only prefix back to device.
             # Must happen after NO_TOKEN check so rejected reqs never trigger H2D.
             if getattr(self.tree_cache, "hicache_enabled", False) and req.host_hit_length > 0:
-                # Restore may evict unlocked device cache. Use the admission
-                # budget, which also excludes capacity reserved for other requests,
-                # rather than rejecting host hits whenever free pages are scarce.
-                mem_quota = self.rem_total_tokens_for_dp(dp_rank)
+                # Only the direct backend pins host sources across device
+                # eviction. JAX must stay within free capacity: write-back
+                # eviction could otherwise evict the prefix being restored.
+                mem_quota = self.token_to_kv_pool_allocator.available_size(dp_rank)
+                if getattr(self.tree_cache, "_direct_hicache", False):
+                    mem_quota = self.rem_total_tokens_for_dp(dp_rank)
                 new_indices, last_node, flush_plan = self.tree_cache.init_load_back(
                     req.last_host_node, req.host_hit_length, mem_quota=mem_quota
                 )
