@@ -125,9 +125,13 @@ class MLAAttentionBackend(AttentionBackend):
         self.mesh = mesh
         self.attention_data_partition_axis = attention_data_partition_axis
         if vmem_limit_bytes is None:
-            from jax.experimental.pallas import tpu as pltpu
+            if jax.default_backend() == "tpu":
+                from jax.experimental.pallas import tpu as pltpu
 
-            vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
+                vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
+            else:
+                # CPU (Pallas interpret) runs have no VMEM to size against.
+                vmem_limit_bytes = 64 * 1024 * 1024
         self.vmem_limit_bytes = vmem_limit_bytes
         self.num_kv_pages_per_block = num_kv_pages_per_block
         self.num_queries_per_block = num_queries_per_block

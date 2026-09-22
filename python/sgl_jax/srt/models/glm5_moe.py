@@ -1421,7 +1421,10 @@ class GlmMoeDsaForCausalLM(Glm5ForCausalLM):
         # become QuantizedLinear (no .weight), so post_load_weights cannot
         # populate w_gu/w_d and the abstract ShapeDtypeStruct placeholders
         # leak into jit inputs. Keep fused for bf16-only.
-        mc.hf_config._sgl_use_fused_mlp = mc.quantization_config is None
+        # The fused MLP is a TPU Pallas kernel; CPU (interpret/smoke) runs keep the plain path.
+        mc.hf_config._sgl_use_fused_mlp = (
+            mc.quantization_config is None and jax.default_backend() == "tpu"
+        )
 
 
 _NEXTN_TOP_LEVEL_MODULES = ("eh_proj", "enorm", "hnorm", "shared_head", "embed_tokens", "lm_head")
