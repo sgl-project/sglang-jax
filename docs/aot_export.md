@@ -61,19 +61,10 @@ command.
 
 ## Use a model configuration
 
-Add `--model-config /path/to/config.json` to select a local model configuration.
-The file describes the architecture; checkpoint tensors are not read. Without this
-argument, the tool uses a tiny two-layer Qwen3 model suitable for the first export.
-
-The `architectures` field selects the model through the same registry and loader
-as serving. There is no separate AOT model list. Configuration classes come from
-the serving/Transformers config registry; registered model implementations whose
-`model_type` is not in that registry receive the JSON fields as a `PretrainedConfig`.
-Choose attention and MoE backends, TP/DP/EP, and cache capacities for your model as
-you would for serving. The exporter derives parameter shardings and cache layouts
-from the loaded model and serving factories.
-
-For example, a Llama or Qwen2 config can be exported directly:
+Pass `--model-config /path/to/config.json` to select a local model configuration.
+Its `architectures` field selects the model through the serving registry and
+loader; checkpoint tensors are not read. Choose backends, parallelism, and cache
+capacities as you would for serving:
 
 ```bash
 PYTHONPATH=python python -m sgl_jax.compile \
@@ -84,106 +75,10 @@ PYTHONPATH=python python -m sgl_jax.compile \
   --stage compiled --dump-llo --output /tmp/model-ir
 ```
 
-### MiMo-V2-Flash with FA and fused MoE v2
-
-Save the model's
-[`config.json`](https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash/blob/2f5a22fe08d2c3ecad8fcaf119d47c8fc848bcd1/config.json)
-locally, then run:
-
-```bash
-PYTHONPATH=python python -m sgl_jax.compile \
-  --model-config /path/to/MiMo-V2-Flash/config.json --bf16-model \
-  --target tpu --topology v7x-32 --tp-size 32 --dp-size 8 --ep-size 32 \
-  --attention-backend fa --moe-backend fused_v2 \
-  --batch-size 64 --context-length 1024 --kv-capacity 65536 --page-size 128 \
-  --stage compiled --dump-llo --output /tmp/mimo-v7x32-ir
-```
-
-The official config includes quantization metadata. `--bf16-model` explicitly
-replaces that metadata for a synthetic BF16 export; it preserves the architecture
-and layer count, but does not reproduce FP8 checkpoint computation. The original
-config is saved as `source_config.json`, and the effective config is recorded in
-`manifest.json`.
-
-To compile fewer layers, make a separate config and change `num_hidden_layers`,
-`hybrid_layer_pattern`, and `moe_layer_freq` together. Use the original config to
-export the full model.
-
-### MiMo MTP draft and target verify
-
-Use the same MiMo-V2-Flash config for both commands. To export one MTP draft
-forward with an abstract hidden-state input:
-
-```bash
-PYTHONPATH=python python -m sgl_jax.compile \
-  --model-config /path/to/MiMo-V2-Flash/config.json --bf16-model \
-  --workload mtp-draft --mtp-layer-idx 0 \
-  --target tpu --topology v7x-8 --tp-size 8 --dp-size 2 \
-  --attention-backend fa \
-  --batch-size 16 --context-length 1024 --kv-capacity 16384 --page-size 128 \
-  --stage compiled --dump-llo --output /tmp/mimo-mtp-draft-ir
-```
-
-Each MTP runner contains one SWA attention block and a dense MLP. Omit
-`--moe-backend` and keep `--ep-size 1` for draft workloads. Embedding and LM-head
-parameters have the same layouts as the arrays shared from the target in serving.
-`--mtp-layer-idx` selects a weight set; export each desired MTP layer separately.
-Without checkpoint loading, this index does not verify that the weight set exists.
-
-To export the draft-extend forward after target verification, replace
-`--workload mtp-draft` with `--workload mtp-draft-extend --draft-token-num 4` and
-choose a new output directory. This adds the hidden-state block and accepted-length
-inputs used to update draft KV and select the next logits.
-
-To export the full target verifying eight tokens per request:
-
-```bash
-PYTHONPATH=python python -m sgl_jax.compile \
-  --model-config /path/to/MiMo-V2-Flash/config.json --bf16-model \
-  --workload target-verify --draft-token-num 8 \
-  --target tpu --topology v7x-32 --tp-size 32 --dp-size 8 --ep-size 32 \
-  --attention-backend fa --moe-backend fused_v2 \
-  --batch-size 16 --context-length 1024 --kv-capacity 16384 --page-size 128 \
-  --stage compiled --dump-llo --output /tmp/mimo-target-verify-ir
-```
-
-`--batch-size` counts requests. This verify example has `16 * 8 = 128` input
-tokens and returns logits and hidden states for all 128 positions. The width
-includes the seed token, so eight positions represent the seed plus seven
-candidates. These exports use the NEXTN causal-chain model forwards (`topk=1`);
-sampling, token acceptance, and the scheduler run outside these graphs.
-
-### Kimi Linear with KDA and MLA
-
-Save the model's
-[`config.json`](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct/blob/e1df551a447157d4658b573f9a695d57658590e9/config.json)
-locally, then run:
-
-```bash
-PYTHONPATH=python python -m sgl_jax.compile \
-  --model-config /path/to/Kimi-Linear-48B-A3B-Instruct/config.json \
-  --target tpu --topology v7x-16 --tp-size 16 --dp-size 4 --ep-size 16 \
-  --attention-backend fa --moe-backend epmoe \
-  --batch-size 32 --context-length 1024 --kv-capacity 32768 --page-size 256 \
-  --recurrent-capacity 128 \
-  --stage compiled --dump-llo --output /tmp/kimi-v7x16-ir
-```
-
-The model configuration selects KDA for linear-attention layers and absorbed MLA
-for full-attention layers. This command uses the model's EPMoE implementation,
-with `ep-size=tp-size`. `--recurrent-capacity` sets the global number of valid
-recurrent-state slots, independently of the token-based `--kv-capacity`. It defaults
-to batch size and must cover the batch and be divisible by DP. Each DP rank also
-gets a dummy state slot.
-
-Recurrent states use FP32 and convolution states use BF16 by default, following
-serving. `SGLANG_JAX_RECURRENT_STATE_DTYPE` and `SGLANG_JAX_CONV_STATE_DTYPE` select
-`float32`, `bfloat16`, or `float16`; inspect the manifest's input signatures for the
-resulting shapes and dtypes.
-
-For a four-layer export containing both KDA and MLA, set `num_hidden_layers=4` in
-a separate config and retain only IDs 1 through 4 in `linear_attn_config.kda_layers`
-and `linear_attn_config.full_attn_layers`. These lists use one-based layer IDs.
+If the config contains quantization metadata, add `--bf16-model` to explicitly
+export a synthetic BF16 variant. This preserves the architecture but does not
+reproduce quantized checkpoint computation. The original config is saved as
+`source_config.json`; the effective config is recorded in `manifest.json`.
 
 ## Choose a TPU topology and parallelism
 
@@ -217,18 +112,8 @@ collectives: device count alone does not identify the physical mapping.
 
 - `--tp-size`: total device count; it must match the topology suffix.
 - `--dp-size`: attention data parallelism. Attention TP is `tp-size / dp-size`.
-- `--ep-size`: expert parallelism. For the MiMo `fused_v2` command, set it equal
-  to the total device count.
-
-To keep attention TP=4 in the MiMo example, replace its parallelism arguments with
-one of these combinations and select a new output directory:
-
-| `--topology` | `--tp-size` | `--dp-size` | `--ep-size` |
-| --- | --- | --- | --- |
-| `v6e-8` or `v7x-8` | 8 | 2 | 8 |
-| `v6e-16` or `v7x-16` | 16 | 4 | 16 |
-| `v6e-32` or `v7x-32` | 32 | 8 | 32 |
-| `v6e-64` or `v7x-64` | 64 | 16 | 64 |
+- `--ep-size`: expert parallelism. With `--moe-backend fused_v2`, set it equal
+  to `--tp-size`.
 
 For fused MoE v2, both expert count and input token count must be divisible by EP.
 The input count is batch size for decode, or batch size times verification width
@@ -255,6 +140,17 @@ per request. `--stage` independently selects how far compilation proceeds.
 | `--kv-capacity` | Global KV token capacity, excluding padding; applied to each full/SWA pool |
 | `--page-size` | Tokens per KV page |
 | `--recurrent-capacity` | Valid recurrent-state slots for linear attention; defaults to batch size |
+
+For draft/verify exports, use the target model config and `--attention-backend fa`.
+`--draft-token-num` includes the seed token; for example, batch 16 with width 4
+has 64 input positions. These are NEXTN causal-chain forwards (`topk=1`); sampling
+and token acceptance happen outside the exported graph. Export each desired MTP
+weight set separately with `--mtp-layer-idx`.
+
+For linear attention, `--recurrent-capacity` must cover the batch and be divisible
+by DP. Recurrent states default to FP32 and convolution states to BF16, following
+serving. Override them with `SGLANG_JAX_RECURRENT_STATE_DTYPE` and
+`SGLANG_JAX_CONV_STATE_DTYPE` (`float32`, `bfloat16`, or `float16`).
 
 Sequence lengths, token IDs, positions, and page mappings remain abstract runtime
 inputs. You do not need to supply a dataset or prompt file.
@@ -314,13 +210,13 @@ optimized HLO. Each entry records a custom-call target, HLO instruction, and sou
 `op_name`. For example, an EPMoE GMM v2 export should contain a `tpu_custom_call`
 whose instruction name or `op_name` includes `gmm_v2-`; finding `gmm` elsewhere in
 HLO does not establish that the TPU kernel was compiled. Compile-only artifacts
-support graph, layout,
-and static-allocation analysis; measure performance on the target hardware.
+support graph, layout, and static-allocation analysis; measure performance on the
+target hardware.
 
 Prefer a local output directory, then archive it for transfer:
 
 ```bash
-tar -czf /tmp/mimo-v7x32-ir.tar.gz -C /tmp mimo-v7x32-ir
+tar -czf /tmp/model-ir.tar.gz -C /tmp model-ir
 ```
 
 ## Troubleshooting
