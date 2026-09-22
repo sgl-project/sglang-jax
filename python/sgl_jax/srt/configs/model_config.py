@@ -5,7 +5,7 @@ import os
 from enum import Enum, IntEnum, auto
 
 import jax.numpy as jnp
-from transformers import PretrainedConfig
+from transformers import GenerationConfig, PretrainedConfig
 
 from sgl_jax.srt.configs.dtype_config import STR_DTYPE_TO_JAX_DTYPE, DtypeConfig
 from sgl_jax.srt.configs.quantization_config import QuantizationConfig
@@ -134,38 +134,22 @@ class ModelConfig:
             # If ep_size > 1, use EPMoE (expert parallelism across devices)
             # Otherwise use Fused kernel (single-device TPU optimization)
             self.moe_backend = MoEBackend.EPMOE if self.ep_size > 1 else MoEBackend.FUSED
-        # Parse args
-        if hf_config is None:
-            self.maybe_pull_model_tokenizer_from_remote()
         self.model_override_args = json.loads(model_override_args)
-        kwargs = {}
-        if override_config_file and override_config_file.strip():
-            kwargs["_configuration_file"] = override_config_file.strip()
-        if multimodal and hf_config is None:
-            self.model_path = download_from_hf(self.model_path, allow_patterns=None)
-        if multimodal and self.model_sub_dir is not None:
-            if self.model_sub_dir:
-                self.model_path = os.path.join(self.model_path, self.model_sub_dir)
-            config_path = self.model_path
-
-        config_path = self.model_path
+        self.hf_generation_config = None
+        if hf_config is None:
+            hf_config, self.hf_generation_config = self._load_hf_configs(
+                trust_remote_code=trust_remote_code,
+                override_config_file=override_config_file,
+                multimodal=multimodal,
+            )
+        elif multimodal and self.model_sub_dir:
+            self.model_path = os.path.join(self.model_path, self.model_sub_dir)
 
         # get_config is lru_cached; configure_for_tensor_parallel mutates
         # hf_text_config in-place, so deepcopy to avoid cross-ModelConfig
         # pollution (e.g. PD disaggregation creates two ModelConfigs).
-        # An already parsed config lets offline tools reuse all serving config
-        # normalization without downloading model or generation files.
-        self.hf_config = copy.deepcopy(
-            hf_config
-            if hf_config is not None
-            else get_config(
-                config_path,
-                trust_remote_code=trust_remote_code,
-                revision=revision,
-                model_override_args=self.model_override_args,
-                **kwargs,
-            )
-        )
+        # Apply the same isolation to caller-owned configs used by offline tools.
+        self.hf_config = copy.deepcopy(hf_config)
 
         if not getattr(self.hf_config, "architectures", None):
             raise ValueError(
@@ -211,14 +195,6 @@ class ModelConfig:
         # None here would crash any repr() on the config (e.g. inside JAX tracing).
         if self.quantization_config is not None:
             self.hf_config.quantization_config = self.quantization_config
-
-        self.hf_generation_config = (
-            get_generation_config(
-                config_path, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-            )
-            if hf_config is None
-            else None
-        )
 
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.sliding_window = getattr(self.hf_text_config, "sliding_window", None)
@@ -346,6 +322,29 @@ class ModelConfig:
         # multimodal
         self.image_token_id = getattr(config, "image_token_id", None) or getattr(
             config, "image_token_index", None
+        )
+
+    def _load_hf_configs(
+        self,
+        *,
+        trust_remote_code: bool,
+        override_config_file: str | None,
+        multimodal: bool,
+    ) -> tuple[PretrainedConfig, GenerationConfig | None]:
+        """Load model and generation files only for path-based construction."""
+        self.maybe_pull_model_tokenizer_from_remote()
+        if multimodal:
+            self.model_path = download_from_hf(self.model_path, allow_patterns=None)
+            if self.model_sub_dir:
+                self.model_path = os.path.join(self.model_path, self.model_sub_dir)
+
+        kwargs = dict(trust_remote_code=trust_remote_code, revision=self.revision)
+        if override_config_file and override_config_file.strip():
+            kwargs["_configuration_file"] = override_config_file.strip()
+
+        return (
+            get_config(self.model_path, model_override_args=self.model_override_args, **kwargs),
+            get_generation_config(self.model_path, **kwargs),
         )
 
     def _get_hf_quant_config(self):
