@@ -192,6 +192,7 @@ class TestDirectWriteThrough(DirectSetup, lifecycle.TestWriteThrough):
             return chunks, future
 
         engine.d2h_auto_allocate = submit
+        params.prev_prefix_len = 4
         self.cache.insert(params)
         assert node.backuped
         assert node.component_data[0].lock_ref == 0
@@ -326,7 +327,11 @@ def test_manager_resolution_uses_preloaded_namespace(monkeypatch):
 
 
 def test_manager_resolution_does_not_hide_missing_dependency(monkeypatch):
+    import sys
+
     from sgl_jax import raiden
+
+    monkeypatch.setitem(sys.modules, "tpu_sync.frameworks.jax._tpu_raiden_jax", object())
 
     calls = []
 
@@ -419,7 +424,9 @@ class TestDirectRestorePressure(DirectSetup, lifecycle.HiCacheE2EBase):
         key_a = lifecycle._key([1, 2, 3, 4])
         key_ab = lifecycle._key(list(range(1, 9)))
         self.cache.insert(lifecycle.InsertParams(key=key_a, value=a))
-        self.cache.insert(lifecycle.InsertParams(key=key_ab, value=np.concatenate([a, b])))
+        self.cache.insert(
+            lifecycle.InsertParams(key=key_ab, value=np.concatenate([a, b]), prev_prefix_len=4)
+        )
         self.cache.evict(lifecycle.EvictParams(num_tokens=8, dp_rank=0))
         match = self.cache.match_prefix(lifecycle.MatchPrefixParams(key=key_ab))
         leaf = match.last_host_node
@@ -525,6 +532,7 @@ def test_scheduler_restore_can_evict_without_spending_reserved_tokens(direct, re
         indices, original = case._alloc_and_fill(8, seed=91)
         params = lifecycle.InsertParams(key=lifecycle._key(target), value=indices)
         case.cache.insert(params)
+        params.prev_prefix_len = 8
         case.cache.insert(params)
         case._settle_writes()
         case.cache.evict(lifecycle.EvictParams(num_tokens=8, dp_rank=0))
