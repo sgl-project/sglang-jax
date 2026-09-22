@@ -10,31 +10,17 @@ TPU cross-compilation runs on a Linux CPU host with libtpu: it describes the tar
 device topology and constructs abstract model state and inputs, without requiring
 physical TPU hardware, checkpoint weights, or request data.
 
-## Supported scope
-
-The export pipeline shares serving's forward function. The currently supported
-model/backend combinations are:
-
-| Model | Precision / workload | Attention | MoE | Constraints |
-| --- | --- | --- | --- | --- |
-| Qwen3 dense | BF16 decode, including logits and KV updates | Native | None | DP=1, EP=1, `head_dim=128`, no sliding window |
-| MiMo-V2-Flash | Synthetic BF16 decode | FA / RPA v3 | `fused_v2` | Hybrid full/SWA attention, attention sinks, separate KV pools, EP=total devices |
+## Configuration
 
 - Model dimensions must satisfy the selected parallelism's divisibility constraints.
 - Built-in tiny model: 2 layers, hidden size 512, intermediate size 1024,
   4 query heads, 2 KV heads, and vocabulary size 256.
-- Supply a local `config.json` for a different Qwen3 configuration or MiMo-V2-Flash;
-  no checkpoint is loaded.
+- Supply a local `config.json` with `--model-config`; no checkpoint is loaded.
 - Compile-only TPU topologies: `v6e-1/4/8/16/32/64` and `v7x-8/16/32/64`.
   Following MaxText's topology/host-bounds approach, the suffix counts JAX-visible
   devices. v6e has one device per chip; v7x has two. The built-in model supports
   TP=1/2; TP=4 requires a model configuration whose KV heads and other partitioned
   dimensions are divisible by 4. TPU device count must match `--tp-size`.
-
-Quantization, prefill, LoRA, MTP, multimodal models, and executable serialization
-are not currently supported. These are synthetic BF16 graphs: the exporter does not
-infer per-tensor checkpoint dtypes or reproduce checkpoint-specific post-load transforms.
-In particular, this is not the official MiMo FP8 checkpoint graph.
 
 ## CPU checks
 
@@ -163,11 +149,25 @@ JITs can report replicated tracer outputs even when their compiled outputs are s
 The KV pool's `abstract=True` option reuses its normal shape calculations and creates
 only abstract arrays.
 
+Lowering, compilation, and artifact export operate on the supplied forward function
+and abstract inputs. Model-specific construction lives in `aot_inputs.py`: it
+currently selects Qwen3 or MiMo-V2-Flash, with BF16 parameter/KV dtypes and decode
+metadata. Additional architectures, precision formats, or workloads need matching
+input construction; the compiler/export stages do not define a model whitelist.
+Checkpoint-specific post-load transforms are not inferred from model config alone.
+The command saves compiler IR and reports, rather than a serialized executable or
+a runtime memory-peak measurement.
+
 When changing the shared forward, compare StableHLO against the baseline function
 and compare logits/KV outputs with nonzero inputs. Compiler artifacts do not replace
 physical TPU execution, numerical validation, or performance measurements.
 
 Validation on 2026-09-22:
+
+| Model | Precision / workload | Attention | MoE | Configuration |
+| --- | --- | --- | --- | --- |
+| Qwen3 dense | BF16 decode, including logits and KV updates | Native | None | DP=1, EP=1, `head_dim=128`, no sliding window |
+| MiMo-V2-Flash | Synthetic BF16 decode | FA / RPA v3 | `fused_v2` | Hybrid full/SWA attention, attention sinks, separate KV pools, EP=total devices |
 
 - CPU StableHLO-only, compiled HLO, and TP=2 exports succeeded.
 - A one-off comparison with the original serving JIT produced identical StableHLO
