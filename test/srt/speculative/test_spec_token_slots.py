@@ -1,0 +1,256 @@
+"""Length / slot contract for the sparse-prefill self-write on speculative batches.
+
+Speculative verify and draft-extend batches do not carry a per-token
+``out_cache_loc`` (the scheduler hands a ``2 * draft_token_num`` allocation
+extension list, -1 padded), while the sparse-prefill self-write needs exactly one
+slot per query token. ``dsa_sparse_backend._spec_token_slots`` derives those
+slots from the ragged metadata the way the dense MLA / FA kernels place new KV
+(``seq_lens[s] - q_len[s] + i`` inside the packed page table).
+
+Checks, for bs in {1, 2, 4} x steps 3 / draft 4 x {no padding, bucket padding}:
+  * verify metadata -> slot count == bs * draft_tokens == positions count,
+    slots equal ``req_to_token[r, seq_len_r + t]``, unique, in range, -1 only for
+    padded (empty) sequences;
+  * draft-extend metadata -> same contract against the ``seq - q_len + i`` rule;
+  * ``paged_write_back`` (CPU scatter path) writes the derived slots and rejects
+    a ``loc`` whose length differs from the row count.
+"""
+
+import os
+
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+if "--xla_force_host_platform_device_count" not in os.environ.get("XLA_FLAGS", ""):
+    os.environ["XLA_FLAGS"] = (
+        os.environ.get("XLA_FLAGS", "") + " --xla_force_host_platform_device_count=4"
+    ).strip()
+
+import unittest
+from types import SimpleNamespace
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
+
+from sgl_jax.srt.kernels.dsa.sparse_mla_prefill_qblock import paged_write_back
+from sgl_jax.srt.layers.attention.dsa_sparse_backend import _spec_token_slots
+from sgl_jax.srt.layers.attention.mla_backend import (
+    MLAAttentionBackend,
+    MLAAttentionMetadata,
+)
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+from sgl_jax.srt.speculative.draft_extend_fused import (
+    _make_draft_extend_metadata,
+    _make_target_verify_metadata,
+)
+from sgl_jax.srt.utils.jax_utils import device_array
+
+PAGE_SIZE = 128
+NUM_STEPS = 3
+NUM_DRAFT_TOKENS = 4
+
+
+def _mesh(dp: int):
+    devices = np.array(jax.devices()[:4]).reshape(dp, 4 // dp)
+    return jax.sharding.Mesh(
+        devices,
+        axis_names=("data", "tensor"),
+        axis_types=(jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit),
+    )
+
+
+def _page_table(alloc_lens, dp):
+    """Contiguous per-request page allocation laid out per DP rank.
+
+    Returns (req_to_token, page_indices, num_pages). Like the production
+    ``padding_for_decode`` layout, rank r's pages occupy a fixed-size segment
+    (padded with page 0) so ``page_indices.reshape(dp, -1)[r]`` is rank-local.
+    """
+    pages = [int(-(-int(a) // PAGE_SIZE)) for a in alloc_lens]
+    next_page = 3  # leave a few pages unused so slot 0 is never a valid answer
+    req_pages = []
+    for n in pages:
+        req_pages.append(list(range(next_page, next_page + n)))
+        next_page += n
+    max_len = int(max(alloc_lens)) if len(alloc_lens) else 0
+    req_to_token = np.full((len(alloc_lens), max(max_len, 1)), -1, dtype=np.int32)
+    for r, pg in enumerate(req_pages):
+        for k, p in enumerate(pg):
+            lo, hi = k * PAGE_SIZE, min((k + 1) * PAGE_SIZE, int(alloc_lens[r]))
+            req_to_token[r, lo:hi] = p * PAGE_SIZE + np.arange(hi - lo)
+    per_dp_bs = len(alloc_lens) // dp
+    rank_segments = [
+        [p for j in range(per_dp_bs) for p in req_pages[r * per_dp_bs + j]] for r in range(dp)
+    ]
+    per_rank = max(len(seg) for seg in rank_segments)
+    page_indices = np.array(
+        [p for seg in rank_segments for p in seg + [0] * (per_rank - len(seg))], dtype=np.int32
+    )
+    return req_to_token, page_indices, next_page
+
+
+def _extend_metadata(mesh, seq_lens, page_indices):
+    backend = SimpleNamespace(mesh=mesh, page_size=PAGE_SIZE, attention_data_partition_axis="data")
+    dp = mesh.shape["data"]
+    batch = SimpleNamespace(
+        dp_size=dp,
+        per_dp_bs_size=len(seq_lens) // dp,
+        seq_lens=seq_lens,
+        extend_seq_lens=seq_lens,
+        # cache_loc only feeds page_indices (strided by page); rebuild it from ours.
+        cache_loc=np.repeat(page_indices * PAGE_SIZE, PAGE_SIZE)
+        + np.tile(np.arange(PAGE_SIZE), len(page_indices)),
+        forward_mode=ForwardMode.EXTEND,
+    )
+    md = MLAAttentionBackend.get_forward_metadata(backend, batch)
+    np.testing.assert_array_equal(np.asarray(md.page_indices), page_indices)
+    return md
+
+
+def _expected_slots_from_md(md, num_tokens):
+    """Independent numpy re-derivation of the dense kernels' placement rule."""
+    seq_lens = np.asarray(md.seq_lens)
+    cuq = np.asarray(md.cu_q_lens)
+    cukv = np.asarray(md.cu_kv_lens)
+    pi = np.asarray(md.page_indices)
+    out = np.full((num_tokens,), -1, dtype=np.int32)
+    for s in range(len(seq_lens)):
+        q0, q1 = int(cuq[s]), int(cuq[s + 1])
+        if q1 <= q0 or seq_lens[s] <= 0:
+            continue
+        for i in range(q0, q1):
+            kv_pos = int(seq_lens[s]) - (q1 - q0) + (i - q0)
+            page = pi[int(cukv[s]) // PAGE_SIZE + kv_pos // PAGE_SIZE]
+            out[i] = page * PAGE_SIZE + kv_pos % PAGE_SIZE
+    return out
+
+
+def _check_contract(tc, name, slots, expected, num_real_tokens):
+    slots = np.asarray(slots)
+    tc.assertEqual(slots.shape, expected.shape, f"{name}: slot count")
+    np.testing.assert_array_equal(slots, expected, err_msg=f"{name}: slot values")
+    valid = slots[slots >= 0]
+    tc.assertEqual(len(valid), num_real_tokens, f"{name}: one slot per real token")
+    tc.assertEqual(len(np.unique(valid)), len(valid), f"{name}: duplicate slots")
+
+
+class SpecTokenSlotsTest(unittest.TestCase):
+    def _case(self, dp, real_bs, pad_to):
+        mesh = _mesh(dp)
+        bs = pad_to
+        n = NUM_DRAFT_TOKENS
+        seq_np = np.zeros((bs,), np.int32)
+        seq_np[:real_bs] = 700 + 37 * np.arange(real_bs)  # straddle page boundaries
+        alloc_np = np.where(seq_np > 0, seq_np + 2 * n, 0).astype(np.int32)
+        req_to_token, page_indices, num_pages = _page_table(alloc_np, dp)
+        ref_md = _extend_metadata(mesh, alloc_np, page_indices)
+        data = NamedSharding(mesh, P("data"))
+
+        with jax.set_mesh(mesh):
+            seq_lens = device_array(seq_np, sharding=data)
+            alloc = device_array(alloc_np, sharding=data)
+
+            @jax.jit
+            def verify_md(sl, al, md):
+                return _make_target_verify_metadata(
+                    md, sl, al, speculative_num_draft_tokens=n, page_size=PAGE_SIZE, dp_size=dp
+                )
+
+            vmd = verify_md(seq_lens, alloc, ref_md)
+
+            @jax.jit
+            def draft_extend_md(sl, al, md):
+                q = jnp.where(sl > 0, jnp.full_like(sl, n), jnp.zeros_like(sl))
+                return _make_draft_extend_metadata(
+                    md, sl + q, al, query_lens=q, page_size=PAGE_SIZE, dp_size=dp
+                )
+
+            dmd = draft_extend_md(seq_lens, alloc, ref_md)
+
+        # Rank-local view (dp=1 covers the production shape; dp=2 checks the
+        # per-rank offsets): slice each rank's segment like shard_map would.
+        per_dp_bs = bs // dp
+        for rank in range(dp):
+            for name, md in (("verify", vmd), ("draft_extend", dmd)):
+                cuq = np.asarray(md.cu_q_lens).reshape(dp, per_dp_bs + 1)[rank]
+                cukv = np.asarray(md.cu_kv_lens).reshape(dp, per_dp_bs + 1)[rank]
+                sl = np.asarray(md.seq_lens).reshape(dp, per_dp_bs)[rank]
+                pi_all = np.asarray(md.page_indices)
+                pi = pi_all.reshape(dp, -1)[rank]
+                local = MLAAttentionMetadata(
+                    cu_q_lens=cuq, cu_kv_lens=cukv, page_indices=pi, seq_lens=sl, distribution=None
+                )
+                t_local = per_dp_bs * n
+                slots = jax.jit(
+                    lambda a, b, c, d: _spec_token_slots(a, b, c, d, t_local, PAGE_SIZE)
+                )(jnp.asarray(sl), jnp.asarray(cuq), jnp.asarray(cukv), jnp.asarray(pi))
+                expected = _expected_slots_from_md(local, t_local)
+                real_local = int(np.sum(sl > 0)) * n
+                _check_contract(
+                    self, f"{name}[dp{dp} bs{real_bs}/{bs} rank{rank}]", slots, expected, real_local
+                )
+                valid = np.asarray(slots)[np.asarray(slots) >= 0]
+                self.assertTrue(np.all(valid < num_pages * PAGE_SIZE), f"{name}: slot out of range")
+                if name == "verify":
+                    # Truth from the request page table: verify token t of req r
+                    # lives at req_to_token[r, seq_len_r + t] (positions == seq_len + t).
+                    for j in range(per_dp_bs):
+                        r = rank * per_dp_bs + j
+                        got = np.asarray(slots)[j * n : (j + 1) * n]
+                        if seq_np[r] <= 0:
+                            self.assertTrue(np.all(got == -1))
+                            continue
+                        want = req_to_token[r, seq_np[r] : seq_np[r] + n]
+                        np.testing.assert_array_equal(got, want)
+
+    def test_dp1_bs1_no_padding(self):
+        self._case(dp=1, real_bs=1, pad_to=1)
+
+    def test_dp1_bs2_no_padding(self):
+        self._case(dp=1, real_bs=2, pad_to=2)
+
+    def test_dp1_bs4_no_padding(self):
+        self._case(dp=1, real_bs=4, pad_to=4)
+
+    def test_dp1_bs1_padded_to_2(self):
+        self._case(dp=1, real_bs=1, pad_to=2)
+
+    def test_dp1_bs2_padded_to_4(self):
+        self._case(dp=1, real_bs=2, pad_to=4)
+
+    def test_dp2_bs4(self):
+        self._case(dp=2, real_bs=4, pad_to=4)
+
+    def test_dp2_bs2_padded_to_4(self):
+        self._case(dp=2, real_bs=2, pad_to=4)
+
+    def test_paged_write_back_scatter_matches_and_rejects_length_mismatch(self):
+        pk, pages, dv = 2, 6, 8
+        cache = jnp.zeros((pages, PAGE_SIZE // pk, pk, dv), jnp.float32)
+        rows = jnp.arange(4 * dv, dtype=jnp.float32).reshape(4, dv) + 1.0
+        loc = jnp.array([3 * PAGE_SIZE + 5, 3 * PAGE_SIZE + 6, 4 * PAGE_SIZE + 127, -1], jnp.int32)
+        out = paged_write_back(cache, rows, loc, page_size=PAGE_SIZE, interpret=True)
+        ref = (
+            cache.reshape(-1, dv)
+            .at[loc]
+            .set(rows, mode="drop", wrap_negative_indices=False)
+            .reshape(cache.shape)
+        )
+        np.testing.assert_array_equal(np.asarray(out), np.asarray(ref))
+        # Pre-fix this surfaced as the production error ("Incompatible types for
+        # broadcasting: ... [4,D] ... [8,D]"); the contract check must name the cause.
+        with self.assertRaisesRegex(
+            ValueError, "paged_write_back: loc has 8 entries but row has 4"
+        ):
+            paged_write_back(
+                cache,
+                rows,
+                jnp.pad(loc, (0, 4), constant_values=-1),
+                page_size=PAGE_SIZE,
+                interpret=True,
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

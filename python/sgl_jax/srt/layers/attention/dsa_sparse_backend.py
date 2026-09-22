@@ -648,11 +648,28 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         request this reduces to the previous single-shot behaviour. Returns
         ``(o_latent, updated_cache)``.
         """
-        loc = forward_batch.out_cache_loc.astype(jnp.int32)
         positions = forward_batch.positions.astype(jnp.int32)
         page_size = self.page_size
         kv_lora_rank = self.kv_lora_rank
         sm = float(sm_scale)
+        # Speculative verify / draft-extend batches carry no per-token
+        # out_cache_loc: the scheduler hands the 2 x draft_token_num
+        # allocation-extension list (-1 padded, schedule_batch spec decode), and
+        # the dense MLA / FA kernels never read it -- they place query token i
+        # of sequence s at kv index seq_lens[s] - q_len[s] + i. Derive the
+        # self-write slots the same way from the ragged metadata (rank-local,
+        # inside the shard_map) so both paths write the same cells.
+        mode = forward_batch.forward_mode
+        derive_loc = mode.is_target_verify() or mode.is_draft_extend()
+        if derive_loc:
+            loc = None
+        else:
+            loc = forward_batch.out_cache_loc.astype(jnp.int32)
+            if loc.shape[0] != ql.shape[0]:
+                raise ValueError(
+                    "sparse prefill self-write: out_cache_loc has "
+                    f"{loc.shape[0]} entries for {ql.shape[0]} tokens ({mode.name})"
+                )
 
         in_specs = (
             P(dpa, "tensor", None),  # ql   [T, H, kv_lora_rank]
@@ -662,15 +679,34 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             P(dpa, None, None, None),  # cache
             P(dpa, None),  # topk_pages [T, K]
             P(dpa),  # positions [T]
-            P(dpa),  # loc [T]
             P(dpa),  # seq_lens [S]
             P(dpa),  # cu_q_lens [S+1]
             P(dpa),  # cu_kv_lens [S+1]
             P(dpa),  # page_indices [total_pages]
         )
+        args = [
+            ql,
+            qpe,
+            kvc,
+            kpe,
+            cache,
+            topk_pages,
+            positions,
+            md.seq_lens,
+            md.cu_q_lens,
+            md.cu_kv_lens,
+            md.page_indices,
+        ]
+        if loc is not None:
+            in_specs = in_specs + (P(dpa),)  # loc [T]
+            args.append(loc)
         out_specs = (P(dpa, "tensor", None), P(dpa, None, None, None))
 
-        def _run(ql_, qpe_, kvc_, kpe_, cache_, tp_, pos_, loc_, sl_, cuq_, cukv_, pi_):
+        def _run(ql_, qpe_, kvc_, kpe_, cache_, tp_, pos_, sl_, cuq_, cukv_, pi_, *rest):
+            if rest:
+                loc_ = rest[0]
+            else:
+                loc_ = _spec_token_slots(sl_, cuq_, cukv_, pi_, ql_.shape[0], page_size)
             if _PREFILL_QBLOCK:
                 o, cache_new = prefill_write_and_attend_ragged_qblock(
                     ql_,
@@ -710,20 +746,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 )
             return o.astype(ql_.dtype), cache_new
 
-        return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(
-            ql,
-            qpe,
-            kvc,
-            kpe,
-            cache,
-            topk_pages,
-            positions,
-            loc,
-            md.seq_lens,
-            md.cu_q_lens,
-            md.cu_kv_lens,
-            md.page_indices,
-        )
+        return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(*args)
 
     def _run_dense(self, ql, qpe, kvc, kpe, cache, sm_scale, layer, dpa, md):
         in_specs = (
@@ -775,6 +798,44 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             md.cu_kv_lens,
             md.distribution,
         )
+
+
+def _spec_token_slots(
+    seq_lens: jax.Array,
+    cu_q_lens: jax.Array,
+    cu_kv_lens: jax.Array,
+    page_indices: jax.Array,
+    num_tokens: int,
+    page_size: int,
+) -> jax.Array:
+    """Per-token KV slot for a verify / draft-extend batch, from ragged metadata.
+
+    Rank-local (call inside the shard_map). Query token ``i`` of sequence ``s``
+    lands at kv index ``seq_lens[s] - q_len[s] + i`` -- the placement the dense
+    MLA v2 / FA kernels use -- inside the packed page table (sequence ``s``'s
+    pages start at ``cu_kv_lens[s] // page_size``). Tokens past
+    ``cu_q_lens[-1]`` (bucket padding) and tokens of empty sequences get -1,
+    which the self-write drops.
+    """
+    num_seqs = seq_lens.shape[0]
+    tok = jnp.arange(num_tokens, dtype=jnp.int32)
+    seg = jnp.searchsorted(cu_q_lens, tok, side="right").astype(jnp.int32) - 1
+    seg_c = jnp.clip(seg, 0, num_seqs - 1)
+    q_start = cu_q_lens[seg_c]
+    q_len = cu_q_lens[seg_c + 1] - q_start
+    kv_pos = seq_lens[seg_c] - q_len + (tok - q_start)
+    page_slot = cu_kv_lens[seg_c] // page_size + kv_pos // page_size
+    page_slot = jnp.clip(page_slot, 0, page_indices.shape[0] - 1)
+    slot = page_indices[page_slot] * page_size + kv_pos % page_size
+    valid = (
+        (tok < cu_q_lens[num_seqs])
+        & (seg >= 0)
+        & (seg < num_seqs)
+        & (seq_lens[seg_c] > 0)
+        & (q_len > 0)
+        & (kv_pos >= 0)
+    )
+    return jnp.where(valid, slot, -1).astype(jnp.int32)
 
 
 def _fixed_stride_pages(

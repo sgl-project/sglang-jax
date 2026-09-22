@@ -641,6 +641,12 @@ def paged_write_back(
     ps = page_size
     assert pspk * pk == ps, (cache.shape, page_size)
     T = row.shape[0]
+    if loc.shape[0] != T:
+        # Both branches index ``row`` by positions taken from ``loc`` (the run
+        # table's src offsets / the scatter's index set); a longer ``loc`` reads
+        # past ``row`` in the Pallas branch and fails to broadcast in the
+        # scatter branch. Fail at trace time with the real reason instead.
+        raise ValueError(f"paged_write_back: loc has {loc.shape[0]} entries but row has {T} rows")
     Tp = -(-T // pk) * pk
     if Tp != T:
         row = jnp.pad(row, ((0, Tp - T), (0, 0)))
