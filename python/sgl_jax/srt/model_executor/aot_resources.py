@@ -99,13 +99,13 @@ def _decode_metadata(backend, options, mesh):
     if isinstance(backend, NativeAttention):
         return None
     pages = bs * -(-options.context_length // options.page_size)
-    kwargs = dict(
-        cu_q_lens=vector(bs + dp),
-        cu_kv_lens=vector(bs + dp),
-        page_indices=vector(pages),
-        seq_lens=vector(bs),
-        distribution=vector(3 * dp),
-    )
+    kwargs = {
+        "cu_q_lens": vector(bs + dp),
+        "cu_kv_lens": vector(bs + dp),
+        "page_indices": vector(pages),
+        "seq_lens": vector(bs),
+        "distribution": vector(3 * dp),
+    }
     if isinstance(backend, FlashAttention):
         return FlashAttentionMetadata(**kwargs, swa_page_indices=vector(pages))
     if isinstance(backend, MLAAttentionBackend):

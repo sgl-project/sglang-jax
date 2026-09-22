@@ -701,7 +701,7 @@ class ModelRunnerKVCacheMixin:
                 swa_head_dim=swa_head_dim,
                 mesh=self.mesh,
                 dp_size=dp_size,
-                **({"abstract": True} if abstract else {}),
+                abstract=abstract,
             )
         elif self.use_mla_backend and self.server_args.attention_backend in ("fa", "dsa_sparse"):
             hf_text_config = self.model_config.hf_text_config
@@ -725,7 +725,7 @@ class ModelRunnerKVCacheMixin:
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
                 dp_size=dp_size,
-                **({"abstract": True} if abstract else {}),
+                abstract=abstract,
                 **dsa_kwargs,
             )
         else:
@@ -737,7 +737,7 @@ class ModelRunnerKVCacheMixin:
                 ),
                 head_dim=(self.model_config.head_dim + 127) // 128 * 128,
                 dp_size=dp_size,
-                **({"abstract": True} if abstract else {}),
+                abstract=abstract,
             )
 
     def _init_pools(self: ModelRunner, max_num_reqs: int, dp_size: int):

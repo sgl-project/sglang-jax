@@ -517,10 +517,7 @@ class MHATokenToKVPool(KVCache):
         self.kv_partition_axis = "tensor"
         self.attention_data_partition_axis = "data"
 
-        if abstract:
-            self._create_buffers(abstract=True)
-        else:
-            self._create_buffers()
+        self._create_buffers(abstract=abstract)
         self._calculate_memory_usage()
 
     def tree_flatten(self):
@@ -1352,10 +1349,7 @@ class MLATokenToKVPool(KVCache):
         self.indexer_key_dim = self._aligned_indexer_dim(indexer_key_dim)
         self.num_indexer_layers = num_indexer_layers
 
-        if abstract:
-            self._create_buffers(abstract=True)
-        else:
-            self._create_buffers()
+        self._create_buffers(abstract=abstract)
         self._calculate_memory_usage()
 
     def tree_flatten(self):

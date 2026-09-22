@@ -245,7 +245,7 @@ class ModelConfig:
             if self.model_sub_dir:
                 self.model_path = os.path.join(self.model_path, self.model_sub_dir)
 
-        kwargs = dict(trust_remote_code=trust_remote_code, revision=self.revision)
+        kwargs = {"trust_remote_code": trust_remote_code, "revision": self.revision}
         if override_config_file and override_config_file.strip():
             kwargs["_configuration_file"] = override_config_file.strip()
 

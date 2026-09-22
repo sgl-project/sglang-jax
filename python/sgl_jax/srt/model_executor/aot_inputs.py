@@ -70,19 +70,19 @@ def load_config(options, model_path, *, is_draft=False):
         raw = json.loads(Path(options.model_config).read_text())
     else:
         # A small example for the no-argument smoke command, not a model selector.
-        raw = dict(
-            model_type="qwen3",
-            architectures=["Qwen3ForCausalLM"],
-            vocab_size=256,
-            hidden_size=512,
-            intermediate_size=1024,
-            num_hidden_layers=2,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            head_dim=128,
-            max_position_embeddings=256,
-            tie_word_embeddings=False,
-        )
+        raw = {
+            "model_type": "qwen3",
+            "architectures": ["Qwen3ForCausalLM"],
+            "vocab_size": 256,
+            "hidden_size": 512,
+            "intermediate_size": 1024,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 128,
+            "max_position_embeddings": 256,
+            "tie_word_embeddings": False,
+        }
     if raw.get("quantization_config") and not options.bf16_model:
         raise ValueError(
             "Use --bf16-model to explicitly export a synthetic BF16 variant of a quantized config"
