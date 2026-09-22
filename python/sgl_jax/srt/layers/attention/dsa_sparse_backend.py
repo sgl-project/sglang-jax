@@ -26,6 +26,7 @@ from sgl_jax.srt.kernels.dsa.ref import streamindex_page_topk_ref, streamindex_t
 from sgl_jax.srt.kernels.dsa.sparse_mla import compute_topk_pages, sparse_mla_page_level
 from sgl_jax.srt.kernels.dsa.sparse_mla_prefill import prefill_write_and_attend_ragged
 from sgl_jax.srt.kernels.dsa.sparse_mla_prefill_qblock import (
+    paged_write_back,
     prefill_write_and_attend_ragged_qblock,
 )
 from sgl_jax.srt.kernels.dsa.streamindex_topk import (
@@ -91,6 +92,14 @@ _PREFILL_QBLOCK = os.environ.get("DSA_PREFILL_QBLOCK", "1") == "1"
 # 512 projects <2% further and grows the per-block union tail, so 256 is the
 # sweet spot. Override per deployment via DSA_PREFILL_QBLOCK_QB.
 _PREFILL_QBLOCK_QB = int(os.environ.get("DSA_PREFILL_QBLOCK_QB", "256"))
+# Opt-in (W7): run speculative TARGET_VERIFY / DRAFT_EXTEND batches through the
+# DECODE machinery instead of the sparse-prefill kernels. Every spec token
+# becomes its own one-query "sequence" (kv_len = its own position + 1), the new
+# KV rows are written up front with paged_write_back, then the decode indexer
+# (one_token_per_seq) and sparse_mla_page_level run exactly as for decode. The
+# extend-shaped prefill path costs ~10 ms/step at T=4 (bq_512 indexer blocks +
+# qblock machinery); this trades it for n decode queries. Default OFF.
+_SPEC_AS_DECODE = os.environ.get("DSA_SPEC_AS_DECODE", "0") == "1"
 
 
 @register_pytree_node_class
@@ -248,6 +257,32 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 compute_pages=is_decode,
             )
             return o, DSAFusedCache(kv=kv_cache, idx=idx_cache, topk=topk, topk_pages=topk_pages)
+
+        # ── W7: spec verify / draft-extend in decode form ─────────────────
+        mode = forward_batch.forward_mode
+        if (
+            not is_decode
+            and _SPEC_AS_DECODE
+            and (mode.is_target_verify() or mode.is_draft_extend())
+        ):
+            return self._run_spec_as_decode(
+                q,
+                q_rope,
+                new_kv_c,
+                new_k_pe,
+                kv_cache,
+                idx_cache,
+                q_idx,
+                k_idx,
+                idx_weights,
+                is_full,
+                dsa_topk_in,
+                dsa_topk_pages_in,
+                dsa_topk_reuse,
+                sm_scale,
+                dpa,
+                md,
+            )
 
         # ── prefill/mixed ─────────────────────────────────────────────────
         # Default: dense fallback (page_level is decode-only; the indexer still
@@ -636,6 +671,119 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             return idx_cache, None
         return idx_cache, topk_pages
 
+    def _spec_metadata_as_decode(self, md, num_tokens: int, dpa):
+        """Pseudo-decode metadata for a spec batch (rank-local build, P(dpa) out)."""
+        page_size = self.page_size
+        t_local = num_tokens // self.mesh.shape[dpa]
+        in_specs = (P(dpa), P(dpa), P(dpa), P(dpa))
+        out_specs = (P(dpa), P(dpa), P(dpa), P(dpa), P(dpa))
+
+        def _run(sl_, cuq_, cukv_, pi_):
+            return _spec_pseudo_decode_metadata(sl_, cuq_, cukv_, pi_, t_local, page_size)
+
+        kv_len, cu_q, cu_kv, pi, dist = jax.shard_map(
+            _run, in_specs=in_specs, out_specs=out_specs, check_vma=False
+        )(md.seq_lens, md.cu_q_lens, md.cu_kv_lens, md.page_indices)
+        return type(md)(
+            cu_q_lens=cu_q, cu_kv_lens=cu_kv, page_indices=pi, seq_lens=kv_len, distribution=dist
+        )
+
+    def _prewrite_spec_kv(self, kvc, kpe, cache, dpa, md):
+        """Write every spec token's latent KV row to its slot before attention.
+
+        The decode kernel writes only the token it attends for; token t must
+        already see tokens < t of the same request, so land all rows first (the
+        kernel then rewrites its own row with identical bytes).
+        """
+        page_size = self.page_size
+        kv_lora_rank = self.kv_lora_rank
+        in_specs = (
+            P(dpa, None),
+            P(dpa, None),
+            P(dpa, None, None, None),
+            P(dpa),
+            P(dpa),
+            P(dpa),
+            P(dpa),
+        )
+        out_specs = P(dpa, None, None, None)
+
+        def _run(kvc_, kpe_, cache_, sl_, cuq_, cukv_, pi_):
+            t = kvc_.shape[0]
+            rope = kpe_.shape[-1]
+            loc = _spec_token_slots(sl_, cuq_, cukv_, pi_, t, page_size)
+            row = jnp.zeros((t, cache_.shape[3]), cache_.dtype)
+            row = row.at[:, :kv_lora_rank].set(kvc_.astype(cache_.dtype))
+            row = row.at[:, kv_lora_rank : kv_lora_rank + rope].set(
+                kpe_.reshape(t, rope).astype(cache_.dtype)
+            )
+            return paged_write_back(cache_, row, loc, page_size=page_size)
+
+        return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(
+            kvc, kpe, cache, md.seq_lens, md.cu_q_lens, md.cu_kv_lens, md.page_indices
+        )
+
+    def _run_spec_as_decode(
+        self,
+        q,
+        q_rope,
+        new_kv_c,
+        new_k_pe,
+        kv_cache,
+        idx_cache,
+        q_idx,
+        k_idx,
+        idx_weights,
+        is_full,
+        dsa_topk_in,
+        dsa_topk_pages_in,
+        dsa_topk_reuse,
+        sm_scale,
+        dpa,
+        md,
+    ):
+        """W7: TARGET_VERIFY / DRAFT_EXTEND through the decode path (see _SPEC_AS_DECODE)."""
+        num_tokens = q.shape[0]
+        pmd = self._spec_metadata_as_decode(md, num_tokens, dpa)
+        kv_cache = self._prewrite_spec_kv(new_kv_c, new_k_pe, kv_cache, dpa, md)
+        # IndexShare on the draft side threads page-topk only; either form counts as reuse.
+        reuse = (
+            is_full
+            and dsa_topk_reuse
+            and (dsa_topk_in is not None or dsa_topk_pages_in is not None)
+        )
+        idx_cache, topk, topk_pages = self._maybe_index(
+            is_full,
+            q_idx,
+            k_idx,
+            idx_weights,
+            idx_cache,
+            dpa,
+            pmd,
+            compute_topk=not reuse,
+            compute_pages=not reuse,
+        )
+        if not is_full or reuse:
+            assert (
+                dsa_topk_in is not None or dsa_topk_pages_in is not None
+            ), "shared layer requires dsa_topk_in / dsa_topk_pages_in from a preceding full layer"
+            topk_use = dsa_topk_in
+            topk_pages_use = dsa_topk_pages_in
+        else:
+            topk_use = topk
+            topk_pages_use = topk_pages
+        if topk_use is None:
+            topk_use = jnp.full((num_tokens, 1), -1, jnp.int32)
+        o, kv_cache = self._run_sparse(
+            q, q_rope, new_kv_c, new_k_pe, kv_cache, topk_use, topk_pages_use, sm_scale, dpa, pmd
+        )
+        return o, DSAFusedCache(
+            kv=kv_cache,
+            idx=idx_cache,
+            topk=topk if (is_full and not reuse) else None,
+            topk_pages=topk_pages if (is_full and not reuse) else None,
+        )
+
     def _run_sparse_prefill(
         self, ql, qpe, kvc, kpe, cache, topk_pages, sm_scale, dpa, md, forward_batch
     ):
@@ -836,6 +984,54 @@ def _spec_token_slots(
         & (kv_pos >= 0)
     )
     return jnp.where(valid, slot, -1).astype(jnp.int32)
+
+
+def _spec_pseudo_decode_metadata(
+    seq_lens: jax.Array,
+    cu_q_lens: jax.Array,
+    cu_kv_lens: jax.Array,
+    page_indices: jax.Array,
+    num_tokens: int,
+    page_size: int,
+):
+    """View every spec token as its own one-query decode sequence (rank-local).
+
+    Token ``i`` (origin sequence ``s``, query offset ``t``) becomes pseudo-sequence
+    ``i`` with ``kv_len = seq_lens[s] - q_len[s] + t + 1`` (its own slot + 1, so
+    the decode causal bound ``pos < kv_len`` equals the prefill bound
+    ``pos <= abs_q``), a fixed-stride copy of ``s``'s page segment of width
+    ``W = len(page_indices) // num_seqs`` (the ``pages_per_seq`` bound the decode
+    path already assumes), ``cu_q = arange``, ``cu_kv = i * W * page_size``.
+    Padding tokens and empty sequences get ``kv_len 0`` and point at page 0.
+    Returns ``(kv_len, cu_q_lens, cu_kv_lens, page_indices, distribution)``.
+    """
+    num_seqs = seq_lens.shape[0]
+    width = max(page_indices.shape[0] // num_seqs, 1)
+    tok = jnp.arange(num_tokens, dtype=jnp.int32)
+    seg = jnp.searchsorted(cu_q_lens, tok, side="right").astype(jnp.int32) - 1
+    seg_c = jnp.clip(seg, 0, num_seqs - 1)
+    q_start = cu_q_lens[seg_c]
+    q_len = cu_q_lens[seg_c + 1] - q_start
+    valid = (
+        (tok < cu_q_lens[num_seqs])
+        & (seg >= 0)
+        & (seg < num_seqs)
+        & (seq_lens[seg_c] > 0)
+        & (q_len > 0)
+    )
+    kv_len = jnp.where(valid, seq_lens[seg_c] - q_len + (tok - q_start) + 1, 0).astype(jnp.int32)
+    seg_start = cu_kv_lens[seg_c] // page_size
+    src = jnp.clip(
+        seg_start[:, None] + jnp.arange(width, dtype=jnp.int32)[None, :],
+        0,
+        page_indices.shape[0] - 1,
+    )
+    pi = jnp.where(valid[:, None], page_indices[src], 0).astype(jnp.int32).reshape(-1)
+    cu_q = jnp.arange(num_tokens + 1, dtype=jnp.int32)
+    cu_kv = (jnp.arange(num_tokens + 1, dtype=jnp.int32) * (width * page_size)).astype(jnp.int32)
+    n_valid = jnp.sum(valid).astype(jnp.int32)
+    dist = jnp.stack([n_valid, n_valid, n_valid]).astype(jnp.int32)
+    return kv_len, cu_q, cu_kv, pi, dist
 
 
 def _fixed_stride_pages(
