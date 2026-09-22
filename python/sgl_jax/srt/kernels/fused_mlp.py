@@ -128,13 +128,17 @@ def apply_fused_mlp_sharded(
     b_inter: int = 128,
 ) -> jax.Array:
     in_specs = (
-        x.sharding.spec if hasattr(x, "sharding") else P(None, None),  # dynamically infer x sharding
+        (
+            x.sharding.spec if hasattr(x, "sharding") else P(None, None)
+        ),  # dynamically infer x sharding
         P(None, "tensor"),  # w_gu (combined gate/up weight, sharded along tensor axis)
         P("tensor", None),  # wd (down weight, sharded along tensor axis)
     )
     in_specs = (
         jax.sharding.PartitionSpec("data", None),  # x
-        jax.sharding.PartitionSpec(None, "tensor"),  # w_gu (combined gate/up weight, sharded along tensor axis)
+        jax.sharding.PartitionSpec(
+            None, "tensor"
+        ),  # w_gu (combined gate/up weight, sharded along tensor axis)
         jax.sharding.PartitionSpec("tensor", None),  # wd (down weight, sharded along tensor axis)
     )
     out_specs = jax.sharding.PartitionSpec("data", None)
