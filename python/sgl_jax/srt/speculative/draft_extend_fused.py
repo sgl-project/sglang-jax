@@ -461,6 +461,17 @@ def _build_chain_verify_arrays(
         token_chain = jax.sharding.reshard(token_chain, verified_sharding)
     draft_tokens = jnp.concatenate([verified_column, token_chain], axis=1).reshape(bs * n)
     positions = (seq_lens.astype(jnp.int32)[:, None] + tid_range[None, :]).reshape(bs * n)
+    # Pin the token-dim arrays to the batch's data placement. Under explicit
+    # sharding the (bs, n) -> (bs * n) reshape above drops a size-1 "data" axis
+    # (dp=1 gives P(None)), but the attention backends shard_map positions /
+    # input_ids with P("data") exactly like the host-built extend batch
+    # (_make_forward_batch), so a verify step must hand them over the same way.
+    seq_sharding = jax.typeof(seq_lens).sharding
+    if isinstance(seq_sharding, NamedSharding) and not seq_sharding.mesh.empty:
+        if jax.typeof(positions).sharding != seq_sharding:
+            positions = jax.sharding.reshard(positions, seq_sharding)
+        if jax.typeof(draft_tokens).sharding != seq_sharding:
+            draft_tokens = jax.sharding.reshard(draft_tokens, seq_sharding)
     retrive_index = jnp.arange(bs * n, dtype=jnp.int32)
     retrive_next_token = jnp.broadcast_to(
         jnp.concatenate([jnp.arange(1, n, dtype=jnp.int32), jnp.array([-1], dtype=jnp.int32)]),
