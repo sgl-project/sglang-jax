@@ -38,6 +38,7 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.dsa.ref import streamindex_page_topk_ref
 from sgl_jax.srt.layers.attention.dsa_sparse_backend import (
+    _pad_topk_pages,
     _placeholder_topk_like,
     _scatter_paged,
     _spec_pseudo_decode_metadata,
@@ -192,6 +193,15 @@ class SpecAsDecodeTest(unittest.TestCase):
             self.assertEqual(out.sharding.spec, pages_sh.spec)
             self.assertEqual(out.shape, (4 * dp, 1))
             self.assertTrue(bool((np.asarray(out) == -1).all()))
+
+    def test_pad_topk_pages_to_page_level_width(self):
+        # prefill-form page-topk is index_topk/page_size (32) wide; page_level wants k_pages_max-1 (128)
+        tp = jnp.arange(4 * 32, dtype=jnp.int32).reshape(4, 32)
+        out = _pad_topk_pages(tp, 128)
+        self.assertEqual(out.shape, (4, 128))
+        np.testing.assert_array_equal(np.asarray(out)[:, :32], np.asarray(tp))
+        self.assertTrue(bool((np.asarray(out)[:, 32:] == -1).all()))
+        self.assertIs(_pad_topk_pages(out, 128), out)  # already wide enough: untouched
 
     def test_bs1_T4(self):
         self._check_case(base_lens=[9], pages_per_req=4)  # 9 + 4 tokens straddle pages
