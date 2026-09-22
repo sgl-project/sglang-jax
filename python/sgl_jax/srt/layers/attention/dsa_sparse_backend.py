@@ -100,6 +100,9 @@ _PREFILL_QBLOCK_QB = int(os.environ.get("DSA_PREFILL_QBLOCK_QB", "256"))
 # extend-shaped prefill path costs ~10 ms/step at T=4 (bq_512 indexer blocks +
 # qblock machinery); this trades it for n decode queries. Default OFF.
 _SPEC_AS_DECODE = os.environ.get("DSA_SPEC_AS_DECODE", "0") == "1"
+# Query block for the page-topk indexer kernel on spec batches (T = a few tokens
+# per request; the prefill default of 512 pads 4 queries to a 512 block).
+_SPEC_INDEXER_QB = int(os.environ.get("DSA_SPEC_INDEXER_QB", "16"))
 
 
 @register_pytree_node_class
@@ -577,7 +580,17 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         )
 
     def _maybe_index_prefill_pages(
-        self, is_full, q_idx, k_idx, idx_weights, idx_cache, dpa, md, *, compute_pages=True
+        self,
+        is_full,
+        q_idx,
+        k_idx,
+        idx_weights,
+        idx_cache,
+        dpa,
+        md,
+        *,
+        compute_pages=True,
+        num_queries_per_block=None,
     ):
         """Prefill page-topk: scatter ``k_idx`` into the paged indexer cache and,
         on full layers, compute per-query **causal** page-level top-k via the
@@ -637,6 +650,11 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                     cuq_,
                     dist_[2],
                     k_pages=k_pages,
+                    **(
+                        {}
+                        if num_queries_per_block is None
+                        else {"num_queries_per_block": num_queries_per_block}
+                    ),
                 )
             else:
                 topk_pages = streamindex_page_topk_ref(
@@ -752,17 +770,22 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             and dsa_topk_reuse
             and (dsa_topk_in is not None or dsa_topk_pages_in is not None)
         )
-        idx_cache, topk, topk_pages = self._maybe_index(
+        # Indexer: one vectorised page-topk over the request's T query rows on the
+        # ORIGINAL metadata (the prefill-form path; k_pages = index_topk/page_size),
+        # not T one-query decode passes -- the ref decode loop cost ~9 ms/step at
+        # T=4 (dpa40nap). Only the query block shrinks (512 -> _SPEC_INDEXER_QB).
+        idx_cache, topk_pages = self._maybe_index_prefill_pages(
             is_full,
             q_idx,
             k_idx,
             idx_weights,
             idx_cache,
             dpa,
-            pmd,
-            compute_topk=not reuse,
+            md,
             compute_pages=not reuse,
+            num_queries_per_block=_SPEC_INDEXER_QB,
         )
+        topk = None
         if not is_full or reuse:
             assert (
                 dsa_topk_in is not None or dsa_topk_pages_in is not None
@@ -770,7 +793,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             topk_use = dsa_topk_in
             topk_pages_use = dsa_topk_pages_in
         else:
-            topk_use = topk
+            topk_use = None
             topk_pages_use = topk_pages
         if topk_use is None:
             topk_use = _placeholder_topk_like(topk_pages_use)
