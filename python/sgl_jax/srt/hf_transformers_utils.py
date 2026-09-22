@@ -116,6 +116,16 @@ def get_hf_text_config(config: PretrainedConfig):
         return config
 
 
+def apply_model_config_overrides(config: PretrainedConfig, overrides: dict) -> None:
+    """Apply overrides without replacing nested HF configs with plain dicts."""
+    for key, value in overrides.items():
+        current = getattr(config, key, None)
+        if isinstance(value, dict) and isinstance(current, PretrainedConfig):
+            current.update(value)
+        else:
+            setattr(config, key, value)
+
+
 @lru_cache_frozenset(maxsize=32)
 def get_config(
     model: str,
@@ -154,7 +164,7 @@ def get_config(
         config.update({"architectures": ["MultiModalityCausalLM"]})
 
     if model_override_args:
-        config.update(model_override_args)
+        apply_model_config_overrides(config, model_override_args)
 
     # Special architecture mapping check for GGUF models
     if is_gguf:
