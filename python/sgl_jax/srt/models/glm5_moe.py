@@ -1424,12 +1424,42 @@ class GlmMoeDsaForCausalLM(Glm5ForCausalLM):
         mc.hf_config._sgl_use_fused_mlp = mc.quantization_config is None
 
 
+_NEXTN_TOP_LEVEL_MODULES = ("eh_proj", "enorm", "hnorm", "shared_head", "embed_tokens", "lm_head")
+
+
+def nextn_ignored_layers(ignored_layers, nextn_layer_idx: int) -> list[str]:
+    """Translate the checkpoint's ``modules_to_not_convert`` for the MTP layer.
+
+    The FP8 checkpoint lists the unquantized MTP modules under
+    ``model.layers.{num_hidden_layers}.*`` (e.g. ``eh_proj``, ``mlp.gate``), but
+    :class:`GlmMoeDsaForCausalLMNextN` hosts them at ``eh_proj`` / ``mtp_block.*``.
+    ``quantize_model`` matches module paths against these entries, so without the
+    translation ``eh_proj`` is converted to a ``QuantizedLinear`` and the bf16
+    checkpoint weight has no ``.weight`` to load into.
+    """
+    ignored = list(ignored_layers or [])
+    prefix = f"model.layers.{nextn_layer_idx}."
+    extra = []
+    for ig in ignored:
+        if not ig.startswith(prefix):
+            continue
+        rest = ig[len(prefix) :]
+        mapped = rest if rest.split(".")[0] in _NEXTN_TOP_LEVEL_MODULES else f"mtp_block.{rest}"
+        if mapped not in ignored and mapped not in extra:
+            extra.append(mapped)
+    return ignored + extra
+
+
 class GlmMoeDsaForCausalLMNextN(nnx.Module):
     load_lm_head_from_target = True
 
     @classmethod
     def patch_model_config(cls, mc: ModelConfig) -> None:
-        return GlmMoeDsaForCausalLM.patch_model_config(mc)
+        GlmMoeDsaForCausalLM.patch_model_config(mc)
+        qc = mc.quantization_config
+        if qc is not None and qc.is_static_checkpoint:
+            idx = getattr(mc.hf_config, "num_hidden_layers", 78)
+            qc.ignored_layers = nextn_ignored_layers(qc.ignored_layers, idx)
 
     def __init__(
         self,
