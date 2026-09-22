@@ -137,7 +137,17 @@ def test_composite_config_preserves_shared_fields(field):
 
 
 @pytest.mark.parametrize("tokenizer_class", ["LlamaTokenizerFast", "Qwen2TokenizerFast"])
-def test_checkpoint_bytelevel_tokenizer(tokenizer_class, tmp_path):
+@pytest.mark.parametrize(
+    "revision_kwargs",
+    [
+        {},
+        {"revision": None},
+        {"revision": "checkpoint-revision"},
+        {"tokenizer_revision": "tokenizer-revision"},
+        {"revision": "checkpoint-revision", "tokenizer_revision": "tokenizer-revision"},
+    ],
+)
+def test_checkpoint_bytelevel_tokenizer(tokenizer_class, revision_kwargs, tmp_path):
     import json
 
     from tokenizers import decoders, models, pre_tokenizers, processors, trainers
@@ -167,12 +177,14 @@ def test_checkpoint_bytelevel_tokenizer(tokenizer_class, tmp_path):
             }
         )
     )
-    tokenizer = get_tokenizer(str(tmp_path), local_files_only=True)
+    tokenizer = get_tokenizer(str(tmp_path), local_files_only=True, **revision_kwargs)
     prefix = [raw.token_to_id("<s>")] if tokenizer_class == "LlamaTokenizerFast" else []
     for text in texts:
         ids = raw.encode(text).ids
         assert tokenizer.encode(text, add_special_tokens=False) == ids
         assert tokenizer.encode(text) == prefix + ids
         assert tokenizer.decode(ids) == text
-    without_bos = get_tokenizer(str(tmp_path), local_files_only=True, add_bos_token=False)
+    without_bos = get_tokenizer(
+        str(tmp_path), local_files_only=True, add_bos_token=False, **revision_kwargs
+    )
     assert without_bos.encode(texts[0]) == raw.encode(texts[0]).ids

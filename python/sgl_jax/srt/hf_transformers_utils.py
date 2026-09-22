@@ -285,6 +285,7 @@ def get_tokenizer(
 ) -> PreTrainedTokenizer | PreTrainedTokenizerFast | TiktokenTokenizer:
     """Gets a tokenizer for the given model name via Huggingface."""
     _validate_tokenizer_backend(tokenizer_backend)
+    revision = kwargs.pop("revision", tokenizer_revision)
 
     if tokenizer_name.endswith(".json"):
         # Tiktoken JSON files use their own backend and do not go through transformers.
@@ -324,7 +325,7 @@ def get_tokenizer(
             tokenizer_name,
             *args,
             trust_remote_code=trust_remote_code,
-            tokenizer_revision=tokenizer_revision,
+            revision=revision,
             clean_up_tokenization_spaces=False,
             **kwargs,
         )
@@ -367,7 +368,7 @@ def get_tokenizer(
             stacklevel=2,
         )
 
-    _restore_checkpoint_tokenizer(tokenizer, tokenizer_name, tokenizer_revision, **kwargs)
+    _restore_checkpoint_tokenizer(tokenizer, tokenizer_name, revision, **kwargs)
     attach_additional_stop_token_ids(tokenizer)
     return tokenizer
 
