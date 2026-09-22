@@ -773,7 +773,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             topk_use = topk
             topk_pages_use = topk_pages
         if topk_use is None:
-            topk_use = jnp.full((num_tokens, 1), -1, jnp.int32)
+            topk_use = _placeholder_topk_like(topk_pages_use)
         o, kv_cache = self._run_sparse(
             q, q_rope, new_kv_c, new_k_pe, kv_cache, topk_use, topk_pages_use, sm_scale, dpa, pmd
         )
@@ -1032,6 +1032,16 @@ def _spec_pseudo_decode_metadata(
     n_valid = jnp.sum(valid).astype(jnp.int32)
     dist = jnp.stack([n_valid, n_valid, n_valid]).astype(jnp.int32)
     return kv_len, cu_q, cu_kv, pi, dist
+
+
+def _placeholder_topk_like(topk_pages: jax.Array) -> jax.Array:
+    """``[T, 1]`` all -1 token-topk placeholder in ``topk_pages``' placement.
+
+    ``_run_sparse`` shard_maps the token topk with ``P(dpa, None)``; a fresh
+    ``jnp.full`` inside the JIT is replicated on the explicit mesh and fails the
+    in_specs check, so derive the placeholder from the data-sharded page topk.
+    """
+    return jnp.full_like(topk_pages[:, :1], -1, dtype=jnp.int32)
 
 
 def _fixed_stride_pages(

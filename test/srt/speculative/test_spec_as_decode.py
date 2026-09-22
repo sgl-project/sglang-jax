@@ -23,19 +23,27 @@ within +-0.05 and gsm8k 5/5 on the W7 arm.
 import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
+if "--xla_force_host_platform_device_count" not in os.environ.get("XLA_FLAGS", ""):
+    os.environ["XLA_FLAGS"] = (
+        os.environ.get("XLA_FLAGS", "") + " --xla_force_host_platform_device_count=4"
+    ).strip()
 
 import unittest
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.dsa.ref import streamindex_page_topk_ref
 from sgl_jax.srt.layers.attention.dsa_sparse_backend import (
+    _placeholder_topk_like,
     _scatter_paged,
     _spec_pseudo_decode_metadata,
     _spec_token_slots,
 )
+from sgl_jax.srt.utils.jax_utils import device_array
 
 PAGE_SIZE = 4
 IDX_DIM = 8
@@ -154,6 +162,36 @@ class SpecAsDecodeTest(unittest.TestCase):
                 sorted(int(x) for x in decode_pages[i] if x >= 0),
                 f"token {i}: prefill {prefill_pages[i]} vs decode {decode_pages[i]}",
             )
+
+    def test_placeholder_topk_keeps_data_placement(self):
+        # IndexShare reuse hands the backend page-topk only; the token-topk
+        # placeholder must carry the same P("data", None) placement or the
+        # _run_sparse shard_map rejects it (dpa39nap, 2026-09-22).
+        for dp in (1, 2):
+            mesh = jax.sharding.Mesh(
+                np.array(jax.devices()[:4]).reshape(dp, 4 // dp),
+                axis_names=("data", "tensor"),
+                axis_types=(jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit),
+            )
+            pages_sh = NamedSharding(mesh, P("data", None))
+            with jax.set_mesh(mesh):
+                pages = device_array(np.zeros((4 * dp, 3), np.int32), sharding=pages_sh)
+
+                @jax.jit
+                def f(p):
+                    ph = _placeholder_topk_like(p)
+                    (ph,) = jax.shard_map(
+                        lambda a: (a,),
+                        in_specs=(P("data", None),),
+                        out_specs=(P("data", None),),
+                        check_vma=False,
+                    )(ph)
+                    return ph
+
+                out = f(pages)
+            self.assertEqual(out.sharding.spec, pages_sh.spec)
+            self.assertEqual(out.shape, (4 * dp, 1))
+            self.assertTrue(bool((np.asarray(out) == -1).all()))
 
     def test_bs1_T4(self):
         self._check_case(base_lens=[9], pages_per_req=4)  # 9 + 4 tokens straddle pages
