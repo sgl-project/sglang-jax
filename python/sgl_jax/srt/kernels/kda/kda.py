@@ -129,6 +129,27 @@ def get_interpret() -> bool:
     return env.strip().lower() in ("1", "true")
 
 
+def _aligned_chunk_input(x, chunk_size, num_chunks):
+    """View _align_seqs output as [B, H, NC, BT, D], padding only NC."""
+    B, T, H, D = x.shape
+    assert T % chunk_size == 0
+    physical_chunks = T // chunk_size
+    assert num_chunks >= physical_chunks
+    chunks = x.reshape(B, physical_chunks, chunk_size, H, D).transpose(0, 3, 1, 2, 4)
+    if num_chunks > physical_chunks:
+        chunks = jnp.pad(
+            chunks, ((0, 0), (0, 0), (0, num_chunks - physical_chunks), (0, 0), (0, 0))
+        )
+    return chunks
+
+
+def _aligned_chunk_output(chunks, chunk_valid, length):
+    """Restore contiguous tokens, zeroing the metadata-defined invalid tail."""
+    B, H, NC, BT, D = chunks.shape
+    chunks = jnp.where(chunk_valid[None, None, :, None, None], chunks, 0)
+    return chunks.transpose(0, 2, 3, 1, 4).reshape(B, NC * BT, H, D)[:, :length]
+
+
 # ============================================================================
 # Chunk-local cumulative sum (varlen Pallas kernel only)
 # ============================================================================
@@ -176,6 +197,7 @@ def chunk_local_cumsum_vector(
     head_first: bool = False,
     output_dtype: jnp.dtype | None = jnp.float32,
     chunk_indices: jax.Array | None = None,
+    _aligned_contiguous: bool = False,
 ) -> jax.Array:
     assert g.ndim == 4, f"g must be 4-D, got {g.ndim}-D"
     assert chunk_size == 2 ** (chunk_size.bit_length() - 1), "chunk_size must be power of 2"
@@ -210,39 +232,47 @@ def chunk_local_cumsum_vector(
         g_flat = jnp.pad(g_flat, ((0, pad_BH), (0, 0), (0, 0)))
     BH_padded = BH + pad_BH
 
-    if chunk_indices is None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
-    NC_max = len(chunk_indices)
-
-    g_flat = jnp.pad(g_flat, ((0, 0), (0, BT), (0, 0)))
-    T_alloc = T + BT
-
     cu_i32 = cu_seqlens.astype(jnp.int32)
-    chunk_indices_i32 = chunk_indices.astype(jnp.int32)
-    N = cu_i32.shape[0] - 1
-    chunks_per_seq = (jnp.diff(cu_i32) + BT - 1) // BT
+    if _aligned_contiguous:
+        # _align_seqs starts at zero and pads every sequence to a BT multiple.
+        # Its allocation can exceed cu_i32[-1]; shape alone is not validity.
+        assert T % BT == 0
+        NC_max = T // BT
+        token_valid = (jnp.arange(T, dtype=jnp.int32) < cu_i32[-1]).reshape(NC_max, BT)
+        g_chunks = g_flat.reshape(BH_padded, NC_max, BT, S_padded)
+    else:
+        if chunk_indices is None:
+            chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+        NC_max = len(chunk_indices)
 
-    seq_id = chunk_indices_i32[:, 0]
-    local_ci = chunk_indices_i32[:, 1]
-    safe_seq_id = jnp.clip(seq_id, 0, N - 1)
-    chunk_valid = (
-        (seq_id == safe_seq_id) & (local_ci >= 0) & (local_ci < chunks_per_seq[safe_seq_id])
-    )
+        g_flat = jnp.pad(g_flat, ((0, 0), (0, BT), (0, 0)))
+        T_alloc = T + BT
 
-    bos = cu_i32[safe_seq_id]
-    eos = cu_i32[safe_seq_id + 1]
-    chunk_starts = jnp.where(chunk_valid, bos + local_ci * BT, 0)
-    positions = chunk_starts[:, None] + jnp.arange(BT, dtype=jnp.int32)[None, :]
-    token_valid = chunk_valid[:, None] & (positions < eos[:, None]) & (positions < T)
+        chunk_indices_i32 = chunk_indices.astype(jnp.int32)
+        N = cu_i32.shape[0] - 1
+        chunks_per_seq = (jnp.diff(cu_i32) + BT - 1) // BT
 
-    def _gather_chunk(start):
-        return jax.lax.dynamic_slice(
-            g_flat,
-            (0, start, 0),
-            (BH_padded, BT, S_padded),
+        seq_id = chunk_indices_i32[:, 0]
+        local_ci = chunk_indices_i32[:, 1]
+        safe_seq_id = jnp.clip(seq_id, 0, N - 1)
+        chunk_valid = (
+            (seq_id == safe_seq_id) & (local_ci >= 0) & (local_ci < chunks_per_seq[safe_seq_id])
         )
 
-    g_chunks = jax.vmap(_gather_chunk)(chunk_starts).transpose(1, 0, 2, 3)
+        bos = cu_i32[safe_seq_id]
+        eos = cu_i32[safe_seq_id + 1]
+        chunk_starts = jnp.where(chunk_valid, bos + local_ci * BT, 0)
+        positions = chunk_starts[:, None] + jnp.arange(BT, dtype=jnp.int32)[None, :]
+        token_valid = chunk_valid[:, None] & (positions < eos[:, None]) & (positions < T)
+
+        def _gather_chunk(start):
+            return jax.lax.dynamic_slice(
+                g_flat,
+                (0, start, 0),
+                (BH_padded, BT, S_padded),
+            )
+
+        g_chunks = jax.vmap(_gather_chunk)(chunk_starts).transpose(1, 0, 2, 3)
     g_chunks = jnp.where(token_valid[None, :, :, None], g_chunks, 0)
 
     elem_bytes = 4
@@ -280,12 +310,15 @@ def chunk_local_cumsum_vector(
     )(g_chunks)
 
     o_chunks = jnp.where(token_valid[None, :, :, None], o_chunks, 0)
-    sentinel = jnp.minimum(cu_i32[-1], T)
-    scatter_positions = jnp.where(token_valid, positions, sentinel).reshape(-1)
-    scatter_values = o_chunks.reshape(BH_padded, NC_max * BT, S_padded)
+    if _aligned_contiguous:
+        o_flat = o_chunks.reshape(BH_padded, T, S_padded)
+    else:
+        sentinel = jnp.minimum(cu_i32[-1], T)
+        scatter_positions = jnp.where(token_valid, positions, sentinel).reshape(-1)
+        scatter_values = o_chunks.reshape(BH_padded, NC_max * BT, S_padded)
 
-    o_flat = jnp.zeros((BH_padded, T_alloc, S_padded), dtype=o_chunks.dtype)
-    o_flat = o_flat.at[:, scatter_positions, :].add(scatter_values)
+        o_flat = jnp.zeros((BH_padded, T_alloc, S_padded), dtype=o_chunks.dtype)
+        o_flat = o_flat.at[:, scatter_positions, :].add(scatter_values)
 
     o_flat = o_flat[:BH, :T, :S]
 
@@ -436,6 +469,7 @@ def _kda_fwd_intra_kernel(
         "scale",
         "safe_gate",
         "disable_recompute",
+        "_aligned_contiguous",
     ],
 )
 def kda_fwd_intra(
@@ -450,6 +484,7 @@ def kda_fwd_intra(
     chunk_indices=None,
     safe_gate=True,
     disable_recompute=False,
+    _aligned_contiguous=False,
 ):
     assert cu_seqlens is not None, "cu_seqlens must be provided for varlen"
     B, T, H, K = q.shape
@@ -465,53 +500,60 @@ def kda_fwd_intra(
     assert_shape(beta, (B, T, H), "beta")
 
     N = cu_seqlens.shape[0] - 1
-    T_alloc = T + BT
-
-    pad4d = lambda x: jnp.pad(x, ((0, 0), (0, BT), (0, 0), (0, 0)))
-    q_pad, k_pad, gk_pad, v_pad = pad4d(q), pad4d(k), pad4d(gk), pad4d(v)
-    beta_pad = jnp.pad(beta.reshape(B, T, H, 1), ((0, 0), (0, BT), (0, 0), (0, 0)))
-
     cu_i32 = cu_seqlens.astype(jnp.int32)
-    seq_lens = jnp.diff(cu_i32)
-    chunks_per_seq = (seq_lens + BT - 1) // BT
-    cum_chunks = jnp.pad(jnp.cumsum(chunks_per_seq), (1, 0))
-    total_chunks = cum_chunks[-1]
-
-    NC_max = len(chunk_indices) if chunk_indices is not None else T // BT + N
+    if _aligned_contiguous:
+        assert T % BT == 0
+        NC_real = T // BT
+        total_chunks = cu_i32[-1] // BT
+    else:
+        seq_lens = jnp.diff(cu_i32)
+        chunks_per_seq = (seq_lens + BT - 1) // BT
+        cum_chunks = jnp.pad(jnp.cumsum(chunks_per_seq), (1, 0))
+        total_chunks = cum_chunks[-1]
+        NC_real = len(chunk_indices) if chunk_indices is not None else T // BT + N
+    NC_max = NC_real
     flat_idx = jnp.arange(NC_max, dtype=jnp.int32)
     is_valid = flat_idx < total_chunks
 
-    seq_id = jnp.minimum(jnp.searchsorted(cum_chunks[1:], flat_idx, side="right"), N - 1)
-    local_ci = flat_idx - cum_chunks[seq_id]
-    bos = cu_i32[seq_id]
-    # After _align_seqs, every sequence is BT-aligned, so all chunks are full.
-    # No partial-chunk masking needed.
-    chunk_starts = jnp.where(is_valid, bos + local_ci * BT, 0)
+    if _aligned_contiguous:
+        q_r, k_r, g_r, beta_r, v_r = (
+            _aligned_chunk_input(x, BT, NC_max) for x in (q, k, gk, beta.reshape(B, T, H, 1), v)
+        )
+    else:
+        T_alloc = T + BT
+        pad4d = lambda x: jnp.pad(x, ((0, 0), (0, BT), (0, 0), (0, 0)))
+        q_pad, k_pad, gk_pad, v_pad = pad4d(q), pad4d(k), pad4d(gk), pad4d(v)
+        beta_pad = pad4d(beta.reshape(B, T, H, 1))
 
-    def gather(x_pad, D):
-        def extract(start):
-            return jax.lax.dynamic_slice(x_pad, (0, start, 0, 0), (1, BT, H, D))[0]
+        seq_id = jnp.minimum(jnp.searchsorted(cum_chunks[1:], flat_idx, side="right"), N - 1)
+        local_ci = flat_idx - cum_chunks[seq_id]
+        bos = cu_i32[seq_id]
+        chunk_starts = jnp.where(is_valid, bos + local_ci * BT, 0)
 
-        return jax.vmap(extract)(chunk_starts)
+        def gather(x_pad, D):
+            def extract(start):
+                return jax.lax.dynamic_slice(x_pad, (0, start, 0, 0), (1, BT, H, D))[0]
 
-    q_c, k_c, gk_c, beta_c, v_c = (
-        gather(q_pad, K),
-        gather(k_pad, K),
-        gather(gk_pad, K),
-        gather(beta_pad, 1),
-        gather(v_pad, V),
-    )
+            return jax.vmap(extract)(chunk_starts)
 
-    def _to_bhnd(x):
-        return x.transpose(2, 0, 1, 3)[None]
+        q_c, k_c, gk_c, beta_c, v_c = (
+            gather(q_pad, K),
+            gather(k_pad, K),
+            gather(gk_pad, K),
+            gather(beta_pad, 1),
+            gather(v_pad, V),
+        )
 
-    q_r, k_r, g_r, beta_r, v_r = (
-        _to_bhnd(q_c),
-        _to_bhnd(k_c),
-        _to_bhnd(gk_c),
-        _to_bhnd(beta_c),
-        _to_bhnd(v_c),
-    )
+        def _to_bhnd(x):
+            return x.transpose(2, 0, 1, 3)[None]
+
+        q_r, k_r, g_r, beta_r, v_r = (
+            _to_bhnd(q_c),
+            _to_bhnd(k_c),
+            _to_bhnd(gk_c),
+            _to_bhnd(beta_c),
+            _to_bhnd(v_c),
+        )
 
     grid = (B, H, NC_max)
 
@@ -554,20 +596,23 @@ def kda_fwd_intra(
         ),
     )(q_r, k_r, g_r, beta_r, v_r)
 
-    pos = chunk_starts[:, None] + jnp.arange(BT)[None, :]
-    pos = jnp.where(is_valid[:, None], pos, T_alloc - 1)
-    flat_pos = pos.reshape(-1)
+    if not _aligned_contiguous:
+        pos = chunk_starts[:, None] + jnp.arange(BT)[None, :]
+        pos = jnp.where(is_valid[:, None], pos, T_alloc - 1)
+        flat_pos = pos.reshape(-1)
 
-    def _scatter(chunks_r, D):
+    def _restore(chunks_r, D):
+        if _aligned_contiguous:
+            return _aligned_chunk_output(chunks_r, is_valid, T)
         chunks = chunks_r[0].transpose(1, 2, 0, 3)
         flat_chunks = chunks.reshape(-1, H, D)
         out = jnp.zeros((T_alloc, H, D), dtype=chunks.dtype)
         out = out.at[flat_pos].add(flat_chunks)
         return out[:T][None]
 
-    w_out, u_out, kg_out = _scatter(w_r, K), _scatter(u_r, V), _scatter(kg_r, K)
-    Aqk_out, Akk_out = _scatter(Aqk_r, BT), _scatter(Akk_inv_r, BT)
-    qg_out = _scatter(qg_r, K) if disable_recompute else None
+    w_out, u_out, kg_out = _restore(w_r, K), _restore(u_r, V), _restore(kg_r, K)
+    Aqk_out, Akk_out = _restore(Aqk_r, BT), _restore(Akk_inv_r, BT)
+    qg_out = _restore(qg_r, K) if disable_recompute else None
 
     return w_out, u_out, qg_out, kg_out, Aqk_out, Akk_out
 
@@ -623,6 +668,11 @@ def _chunk_gated_delta_rule_fwd_kernel(
         scratch_ref[...] = jnp.zeros([K, V], dtype=jnp.float32)
         if USE_INITIAL_STATE:
             scratch_ref[...] = h0_ref[0, 0].astype(jnp.float32)
+        if STORE_FINAL_STATE:
+            # Empty sequences never enter the recurrence or its final store.
+            @pl.when(real_NT == 0)
+            def _():
+                ht_ref[0, 0] = scratch_ref[...].astype(ht_ref.dtype)
 
     @pl.when(idx_nt < real_NT)
     def _():
@@ -713,6 +763,21 @@ def chunk_gated_delta_rule_fwd_h(
     NT_max = T // BT
     chunk_offsets = _prepare_chunk_offsets(cu_seqlens, BT)
     assert initial_state is None or initial_state.shape == (N, H, K, V)
+
+    # A direct zero-token call has no grid iterations to initialize its state.
+    if T == 0:
+        ht = None
+        if output_final_state:
+            ht = (
+                initial_state.astype(jnp.float32)
+                if initial_state is not None
+                else jnp.zeros((N, H, K, V), dtype=jnp.float32)
+            )
+        return (
+            jnp.zeros((B, NT, H, K, V), dtype=jnp.float32),
+            u_f32 if save_new_value else None,
+            ht,
+        )
 
     T_alloc = T + BT
 
@@ -915,6 +980,7 @@ def chunk_kda_fwd_o_gk(
     chunk_indices=None,
     chunk_size=64,
     use_exp2=False,
+    _aligned_contiguous=False,
 ):
     assert cu_seqlens is not None, "This varlen-only module requires cu_seqlens"
     B, T, H, K = q.shape
@@ -925,39 +991,51 @@ def chunk_kda_fwd_o_gk(
     assert T % BT == 0
 
     N = cu_seqlens.shape[0] - 1
-    T_alloc = T + BT
-
-    pad4d = lambda x: jnp.pad(x, ((0, 0), (0, BT), (0, 0), (0, 0)))
-    q_pad, v_pad, g_pad, A_pad = pad4d(q), pad4d(v), pad4d(g), pad4d(A)
-
     cu_i32 = cu_seqlens.astype(jnp.int32)
-    seq_lens = jnp.diff(cu_i32)
-    chunks_per_seq = (seq_lens + BT - 1) // BT
-    cum_chunks = jnp.pad(jnp.cumsum(chunks_per_seq), (1, 0))
-    total_chunks = cum_chunks[-1]
-
-    NC_max = len(chunk_indices) if chunk_indices is not None else T // BT + N
+    if _aligned_contiguous:
+        NC_real = T // BT
+        total_chunks = cu_i32[-1] // BT
+    else:
+        seq_lens = jnp.diff(cu_i32)
+        chunks_per_seq = (seq_lens + BT - 1) // BT
+        cum_chunks = jnp.pad(jnp.cumsum(chunks_per_seq), (1, 0))
+        total_chunks = cum_chunks[-1]
+        NC_real = len(chunk_indices) if chunk_indices is not None else T // BT + N
+    NC_max = NC_real
     flat_idx = jnp.arange(NC_max, dtype=jnp.int32)
     is_valid = flat_idx < total_chunks
 
-    seq_id = jnp.minimum(jnp.searchsorted(cum_chunks[1:], flat_idx, side="right"), N - 1)
-    local_ci = flat_idx - cum_chunks[seq_id]
-    bos = cu_i32[seq_id]
-    # After _align_seqs, every sequence is BT-aligned — no partial chunks.
-    chunk_starts = jnp.where(is_valid, bos + local_ci * BT, 0)
+    if _aligned_contiguous:
+        _q = _aligned_chunk_input(q, BT, NC_max)[0]
+        _g = _aligned_chunk_input(g, BT, NC_max)[0]
+        _v = _aligned_chunk_input(v, BT, NC_max)[0]
+        _A = _aligned_chunk_input(A, BT, NC_max)[0]
+    else:
+        T_alloc = T + BT
+        pad4d = lambda x: jnp.pad(x, ((0, 0), (0, BT), (0, 0), (0, 0)))
+        v_pad, A_pad = pad4d(v), pad4d(A)
+        q_pad = pad4d(q)
+        g_pad = pad4d(g)
 
-    def gather(x_pad, D):
-        def extract(start):
-            return jax.lax.dynamic_slice(x_pad, (0, start, 0, 0), (1, BT, H, D))[0]
+        seq_id = jnp.minimum(jnp.searchsorted(cum_chunks[1:], flat_idx, side="right"), N - 1)
+        local_ci = flat_idx - cum_chunks[seq_id]
+        bos = cu_i32[seq_id]
+        chunk_starts = jnp.where(is_valid, bos + local_ci * BT, 0)
 
-        return jax.vmap(extract)(chunk_starts)
+        def gather(x_pad, D):
+            def extract(start):
+                return jax.lax.dynamic_slice(x_pad, (0, start, 0, 0), (1, BT, H, D))[0]
 
-    q_c, v_c, g_c, A_c = gather(q_pad, K), gather(v_pad, V), gather(g_pad, K), gather(A_pad, BT)
+            return jax.vmap(extract)(chunk_starts)
 
-    _q = q_c.transpose(2, 0, 1, 3)
-    _v = v_c.transpose(2, 0, 1, 3)
-    _g = g_c.transpose(2, 0, 1, 3)
-    _A = A_c.transpose(2, 0, 1, 3)
+        q_c = gather(q_pad, K)
+        g_c = gather(g_pad, K)
+        v_c, A_c = gather(v_pad, V), gather(A_pad, BT)
+
+        _q = q_c.transpose(2, 0, 1, 3)
+        _v = v_c.transpose(2, 0, 1, 3)
+        _g = g_c.transpose(2, 0, 1, 3)
+        _A = A_c.transpose(2, 0, 1, 3)
 
     _h = h[0].transpose(1, 0, 2, 3)
     if NC_max > NT_h:
@@ -982,6 +1060,9 @@ def chunk_kda_fwd_o_gk(
         compiler_params=pltpu.CompilerParams(disable_bounds_checks=True),
         interpret=get_interpret(),
     )(_q, _v, _g, _h, _A)
+
+    if _aligned_contiguous:
+        return _aligned_chunk_output(o_r[None], is_valid, T)
 
     pos = chunk_starts[:, None] + jnp.arange(BT)[None, :]
     pos = jnp.where(is_valid[:, None], pos, T_alloc - 1)
@@ -1010,6 +1091,7 @@ def kda_gate_chunk_cumsum(
     output_dtype=jnp.float32,
     chunk_indices=None,
     lower_bound=None,
+    _aligned_contiguous=False,
 ):
     B, T, H, K = g.shape
     assert_shape(g, (B, T, H, K), "g")
@@ -1033,6 +1115,7 @@ def kda_gate_chunk_cumsum(
         head_first=False,
         output_dtype=output_dtype or jnp.float32,
         chunk_indices=chunk_indices,
+        _aligned_contiguous=_aligned_contiguous,
     )
 
 
@@ -1045,6 +1128,7 @@ def pallas_kda_gate_cumsum(
     head_first=False,
     output_dtype=jnp.float32,
     chunk_indices=None,
+    _aligned_contiguous=False,
 ):
     B, T, H, K = g.shape
     assert_shape(g, (B, T, H, K), "g")
@@ -1058,6 +1142,7 @@ def pallas_kda_gate_cumsum(
         chunk_indices=chunk_indices,
         head_first=False,
         output_dtype=jnp.float32,
+        _aligned_contiguous=_aligned_contiguous,
     )
 
 
@@ -1199,12 +1284,15 @@ def chunk_kda_fwd(
     # Varlen alignment
     _orig_cu_seqlens = cu_seqlens
     T_input = T
+    # The alignment producer guarantees contiguous full chunks in canonical order.
+    # Standalone consumers retain their generic mapping by default.
     [q, k, v, g], [beta], cu_seqlens, _ = _align_seqs(
         [q, k, v, g],
         [beta],
         cu_seqlens,
         align=BT,
     )
+    _aligned_contiguous = True
     T = q.shape[1]
     chunk_indices = prepare_chunk_indices(cu_seqlens, BT, max_T=T)
 
@@ -1237,6 +1325,7 @@ def chunk_kda_fwd(
             lower_bound=lower_bound,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
+            _aligned_contiguous=_aligned_contiguous,
         )
     else:
         g_cumsum = pallas_kda_gate_cumsum(
@@ -1245,6 +1334,7 @@ def chunk_kda_fwd(
             chunk_size=chunk_size,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
+            _aligned_contiguous=_aligned_contiguous,
         )
 
     # Step 2: Intra-chunk solve
@@ -1259,6 +1349,7 @@ def chunk_kda_fwd(
         chunk_size=BT,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        _aligned_contiguous=_aligned_contiguous,
     )
 
     # Step 3: Inter-chunk state propagation
@@ -1287,6 +1378,7 @@ def chunk_kda_fwd(
         use_exp2=True,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        _aligned_contiguous=_aligned_contiguous,
     )
 
     # Cast output back to input dtype (e.g. bfloat16)
