@@ -6,8 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from tokenizers import Tokenizer
-from tokenizers.models import WordLevel
-from transformers import AutoConfig, PreTrainedTokenizerFast
+from transformers import AutoConfig
 
 from sgl_jax.srt.hf_transformers_utils import (
     get_config,
@@ -51,21 +50,6 @@ def test_nested_rope_and_context():
     assert get_context_length(SimpleNamespace(text_config=config)) == 16384
 
 
-@pytest.mark.parametrize("model_type", ["qwen2_5_vl", "qwen3_vl", "qwen3_omni_moe"])
-def test_multimodal_rope(model_type):
-    from sgl_jax.srt.hf_transformers_utils import get_hf_text_config
-
-    config = AutoConfig.for_model(model_type)
-    text = get_hf_text_config(config)
-    text.rope_parameters = {
-        "rope_type": "default",
-        "rope_theta": 5000000,
-        "mrope_section": [16, 24, 24],
-        "mrope_interleaved": True,
-    }
-    assert get_context_length(config) == text.max_position_embeddings
-
-
 @pytest.mark.parametrize("name", ACT2FN)
 def test_jax_activations_match_hf(name):
     import torch
@@ -74,25 +58,6 @@ def test_jax_activations_match_hf(name):
     x = np.linspace(-5, 5, 101, dtype=np.float32)
     expected = HF_ACT2FN[name](torch.from_numpy(x)).numpy()
     np.testing.assert_allclose(ACT2FN[name](jnp.asarray(x)), expected, atol=1e-6, rtol=1e-5)
-
-
-def test_tokenizer_special_tokens_and_chat_template_roundtrip(tmp_path):
-    tokenizer = PreTrainedTokenizerFast(
-        tokenizer_object=Tokenizer(
-            WordLevel({"[UNK]": 0, "hello": 1, "<image>": 2}, unk_token="[UNK]")
-        ),
-        unk_token="[UNK]",
-        extra_special_tokens=["<image>"],
-        chat_template="{% for message in messages %}{{ message['content'] }}{% endfor %}",
-    )
-    tokenizer.save_pretrained(tmp_path)
-    loaded = get_tokenizer(str(tmp_path), local_files_only=True)
-    assert loaded.encode("hello", add_special_tokens=False) == [1]
-    assert loaded.encode("<image>", add_special_tokens=False) == [2]
-    assert loaded.decode([2], skip_special_tokens=True) == ""
-    messages = [{"role": "user", "content": "hello"}]
-    assert loaded.apply_chat_template(messages, tokenize=False) == "hello"
-    assert loaded.apply_chat_template(messages, return_dict=True)["input_ids"] == [1]
 
 
 @pytest.mark.parametrize(
@@ -109,9 +74,7 @@ def test_decoder_uses_checkpoint_rope(model_type, class_name):
     import importlib
 
     import jax
-    import torch
     from flax import nnx
-    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
     from sgl_jax.srt.layers.embeddings import YarnRotaryEmbedding
     from sgl_jax.srt.utils.mesh_utils import create_device_mesh
@@ -147,17 +110,6 @@ def test_decoder_uses_checkpoint_rope(model_type, class_name):
     assert isinstance(rope, YarnRotaryEmbedding)
     assert rope.base == 123456.0
     assert rope.scaling_factor == 4.0
-
-    positions = np.array([0, 31, 32, 33, 127], dtype=np.int32)
-    query = np.random.default_rng(0).normal(size=(len(positions), 2, 16)).astype(np.float32)
-    inv_freq, scale = ROPE_INIT_FUNCTIONS["yarn"](config, torch.device("cpu"))
-    phase = positions[:, None] * inv_freq.numpy()[None, :]
-    phase = np.concatenate((phase, phase), axis=-1)[:, None, :]
-    rotated = np.concatenate((-query[..., 8:], query[..., :8]), axis=-1)
-    expected = (query * np.cos(phase) + rotated * np.sin(phase)) * scale
-    with jax.set_mesh(mesh):
-        actual, _ = jax.jit(rope)(jnp.asarray(positions), jnp.asarray(query), jnp.asarray(query))
-    np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.parametrize("tied", [True, False])

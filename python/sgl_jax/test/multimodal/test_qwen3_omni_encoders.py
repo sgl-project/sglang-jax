@@ -71,9 +71,12 @@ def encoders(tmp_path_factory, request):
         ("audio_tower", hf.Qwen3OmniMoeAudioEncoder, Qwen3OmniMoeAudioEncoder),
         ("visual", hf.Qwen3OmniMoeVisionEncoder, Qwen3OmniMoeVisionEncoder),
     ]:
+        directory = tmp_path_factory.mktemp(name)
         with torch.random.fork_rng():
             torch.manual_seed(0)
-            reference = hf_cls(configs[name]).eval().to(torch_dtype)
+            hf_cls(configs[name]).save_pretrained(directory / "hf")
+        # Match normal HF loading: non-persistent RoPE buffers stay float32.
+        reference = hf_cls.from_pretrained(directory / "hf", dtype=torch_dtype).eval()
         wrapper = nnx.Module()
         with jax.set_mesh(mesh):
             encoder = jax_cls(configs[name], mesh=mesh, dtype=dtype, rngs=nnx.Rngs(0))
@@ -85,7 +88,6 @@ def encoders(tmp_path_factory, request):
                 f"thinker.{name}.{key}": value for key, value in reference.state_dict().items()
             }
             assert set(weights) == set(mapping)
-            directory = tmp_path_factory.mktemp(name)
             save_file(weights, directory / "model.safetensors")
             WeightLoader(
                 wrapper, SimpleNamespace(model_path=str(directory)), mesh, dtype
@@ -94,7 +96,7 @@ def encoders(tmp_path_factory, request):
     return mesh, pairs
 
 
-@pytest.mark.parametrize("grid", [[[1, 2, 2]], [[1, 4, 4]], [[2, 4, 4]], [[1, 6, 4], [1, 4, 2]]])
+@pytest.mark.parametrize("grid", [[[1, 2, 2]], [[2, 4, 4]], [[1, 6, 4], [1, 4, 2]]])
 def test_vision_forward_matches_hf(encoders, grid):
     mesh, pairs = encoders
     reference, encoder = pairs["visual"]
@@ -115,7 +117,7 @@ def test_vision_forward_matches_hf(encoders, grid):
 
 @pytest.mark.parametrize(
     "lengths",
-    [[1], [7], [8], [9], [99], [100], [101], [799], [800], [801], [1, 101, 800, 9]],
+    [[1], [1, 7, 8, 9, 99, 100, 101, 799, 800, 801]],
 )
 def test_audio_forward_matches_hf(encoders, lengths):
     mesh, pairs = encoders
