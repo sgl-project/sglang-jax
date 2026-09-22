@@ -99,11 +99,7 @@ class _Qwen3_5TextConfig(PretrainedConfig):
         # ``rope_parameters`` (5.x) or ships flat (4.x).
         self.rope_parameters = rope_parameters
         if rope_parameters is not None:
-            self.rope_scaling = {
-                "rope_type": rope_parameters["rope_type"],
-                "mrope_section": rope_parameters["mrope_section"],
-                "mrope_interleaved": rope_parameters["mrope_interleaved"],
-            }
+            self.rope_scaling = dict(rope_parameters)
             self.rope_theta = rope_parameters["rope_theta"]
             self.partial_rotary_factor = rope_parameters["partial_rotary_factor"]
         else:
@@ -251,6 +247,8 @@ class Qwen3_5DenseConfig(Qwen3_5HybridConfig):
     """
 
     model_type = "qwen3_5"
+    # HF v5 generates an initializer for each subclass unless one is explicit.
+    __init__ = Qwen3_5HybridConfig.__init__
 
 
 def get_qwen3_5_hybrid_config(hf_config: Any) -> Qwen3_5HybridConfig | None:

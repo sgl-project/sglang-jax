@@ -142,14 +142,7 @@ class LlamaEagleModel(LlamaModel):
         super().__init__(config=config, dtype=dtype, is_draft_model=True, mesh=mesh)
         self.config = config
 
-        self.is_mrope_enabled = (
-            hasattr(config, "rope_scaling")
-            and config.rope_scaling is not None
-            and "mrope_section" in config.rope_scaling
-        )
-        # fix rope_scaling for qwen2.5-vl
-        if self.is_mrope_enabled:
-            config.rope_scaling["rope_type"] = "default"
+        self.is_mrope_enabled = "mrope_section" in config.rope_parameters
 
         self.vocab_size = config.vocab_size
         self.embed_tokens = Embed(

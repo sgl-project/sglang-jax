@@ -178,7 +178,7 @@ class Gemma2DecoderLayer(nnx.Module):
             config.num_key_value_heads,
             config.head_dim,
             config.max_position_embeddings,
-            rope_theta=config.rope_theta,
+            rope_theta=config.rope_parameters["rope_theta"],
             query_pre_attn_scalar=config.query_pre_attn_scalar,
             sliding_window_size=config.sliding_window if use_sliding_window else 0,
             logit_cap=config.attn_logit_softcapping,

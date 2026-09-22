@@ -403,6 +403,7 @@ class VisionPatchMerger(nnx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = None,
     ):
+        self.mesh = mesh
         self.hidden_size = config.hidden_size
         self.spatial_merge_size = config.spatial_merge_size
         self.out_hidden_size = config.out_hidden_size
@@ -448,12 +449,15 @@ class VisionPatchMerger(nnx.Module):
         """
         merged_hidden_size = self.hidden_size * (self.spatial_merge_size**2)
 
+        if not self.use_postshuffle_norm:
+            hidden_states = self.ln_q(hidden_states)
+        hidden_states = jax.lax.reshape(
+            hidden_states,
+            (hidden_states.shape[0] // self.spatial_merge_size**2, merged_hidden_size),
+            out_sharding=NamedSharding(self.mesh, P("data", None)),
+        )
         if self.use_postshuffle_norm:
-            hidden_states = hidden_states.reshape(-1, merged_hidden_size)
             hidden_states = self.ln_q(hidden_states)
-        else:
-            hidden_states = self.ln_q(hidden_states)
-            hidden_states = hidden_states.reshape(-1, merged_hidden_size)
 
         hidden_states, _ = self.mlp_fc1(hidden_states)
         hidden_states = jax.nn.gelu(hidden_states, approximate=False)
@@ -598,43 +602,22 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
             idx_bl = base_h_ceil[:, None] + w_idxs_floor[None, :]  # Bottom-left
             idx_br = base_h_ceil[:, None] + w_idxs_ceil[None, :]  # Bottom-right
 
-            # Flatten indices
-            idx_tl = idx_tl.reshape(-1)
-            idx_tr = idx_tr.reshape(-1)
-            idx_bl = idx_bl.reshape(-1)
-            idx_br = idx_br.reshape(-1)
-
-            # Fetch embeddings
-            emb_tl = self.pos_embed(idx_tl)  # (h*w, hidden_size)
-            emb_tr = self.pos_embed(idx_tr)
-            emb_bl = self.pos_embed(idx_bl)
-            emb_br = self.pos_embed(idx_br)
-
-            # Bilinear interpolation weights
-            dh_2d = dh[:, None]
-            dw_2d = dw[None, :]
-            w_tl = ((1 - dh_2d) * (1 - dw_2d)).reshape(-1, 1)
-            w_tr = ((1 - dh_2d) * dw_2d).reshape(-1, 1)
-            w_bl = (dh_2d * (1 - dw_2d)).reshape(-1, 1)
-            w_br = (dh_2d * dw_2d).reshape(-1, 1)
-
-            pos_embed = emb_tl * w_tl + emb_tr * w_tr + emb_bl * w_bl + emb_br * w_br
-
-            # Repeat for temporal and apply spatial-merge permutation
-            pos_embed = jnp.broadcast_to(
-                pos_embed[None, :, :], (t_val, h_val * w_val, pos_embed.shape[-1])
+            indices = jnp.stack([idx_tl, idx_tr, idx_bl, idx_br], axis=-1)
+            dh, dw = dh[:, None], dw[None, :]
+            weights = jnp.stack(
+                [(1 - dh) * (1 - dw), (1 - dh) * dw, dh * (1 - dw), dh * dw],
+                axis=-1,
             )
-            merge_size = self.config.spatial_merge_size
-            pos_embed = pos_embed.reshape(
-                t_val,
-                h_val // merge_size,
-                merge_size,
-                w_val // merge_size,
-                merge_size,
-                self.config.hidden_size,
-            )
-            pos_embed = jnp.transpose(pos_embed, (0, 1, 3, 2, 4, 5))
-            pos_embed = pos_embed.reshape(-1, self.config.hidden_size)
+
+            # Reorder the replicated lookup metadata before Embed shards tokens
+            # over data. Reordering embeddings would move a sharded spatial axis.
+            merge_size = self.spatial_merge_size
+            shape = (h_val // merge_size, merge_size, w_val // merge_size, merge_size, 4)
+            indices = indices.reshape(shape).transpose(0, 2, 1, 3, 4).reshape(-1, 4)
+            weights = weights.reshape(shape).transpose(0, 2, 1, 3, 4).reshape(-1, 4)
+            indices = jnp.tile(indices, (t_val, 1))
+            weights = jnp.tile(weights, (t_val, 1))
+            pos_embed = (self.pos_embed(indices) * weights[..., None]).sum(axis=1)
 
             all_pos_embeds.append(pos_embed)
 
@@ -807,7 +790,7 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
 
         # 2. Add Position Embeddings
         pos_embeds = self.interpolate_pos_embed(grid_thw)
-        hidden_states = hidden_states + pos_embeds
+        hidden_states = hidden_states + pos_embeds.astype(hidden_states.dtype)
 
         # 3. Compute 2D position IDs for RoPE
         position_ids = self.compute_2d_position_ids(grid_thw)

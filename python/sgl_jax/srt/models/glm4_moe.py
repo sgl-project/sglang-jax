@@ -211,15 +211,15 @@ class Glm4MoeDecoderLayer(nnx.Module):
     ):
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 1000000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = config.rope_parameters["rope_theta"]
+        rope_scaling = config.rope_parameters
         max_position_embeddings = getattr(config, "max_position_embeddings", 131072)
         self.head_dim = getattr(config, "head_dim", None) or (
             config.hidden_size // config.num_attention_heads
         )
         use_qk_norm = getattr(config, "use_qk_norm", True)
 
-        partial_rotary_factor = getattr(config, "partial_rotary_factor", 0.5)
+        partial_rotary_factor = rope_scaling.get("partial_rotary_factor", 0.5)
         rotary_dim = int(self.head_dim * partial_rotary_factor)
 
         self.self_attn = Glm4MoeAttention(

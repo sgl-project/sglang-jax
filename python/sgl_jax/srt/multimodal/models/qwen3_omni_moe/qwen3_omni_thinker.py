@@ -194,8 +194,8 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nnx.Module):
         self, config, mesh: jax.sharding.Mesh, layer_id: int = 0, dtype: jnp.dtype = jnp.bfloat16
     ):
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 1000000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = config.rope_parameters["rope_theta"]
+        rope_scaling = config.rope_parameters
         max_position_embeddings = getattr(config, "max_position_embeddings", 40960)
         head_dim = getattr(config, "head_dim", None)
         self.self_attn = self.self_attn = QWen3OmniMoeAttention(
@@ -334,7 +334,7 @@ class Qwen3OmniMoeThinkerTextModel(nnx.Module):
         config.ep_size = getattr(config, "ep_size", 1)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        rope_scaling = getattr(config, "rope_scaling", None) or {}
+        rope_scaling = config.rope_parameters
         self._mrope_section = rope_scaling.get("mrope_section")
         self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,

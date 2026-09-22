@@ -430,8 +430,8 @@ class DeepseekV3DecoderLayer(nnx.Module):
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
 
-        rope_theta = getattr(config, "rope_theta", 10000.0)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = config.rope_parameters["rope_theta"]
+        rope_scaling = config.rope_parameters
         max_position_embeddings = getattr(config, "max_position_embeddings", 163840)
 
         # MLA attention

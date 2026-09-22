@@ -14,7 +14,7 @@ from transformers import (
     AutoConfig,
     AutoModel,
     AutoModelForCausalLM,
-    AutoModelForVision2Seq,
+    AutoModelForImageTextToText,
     AutoProcessor,
     GenerationConfig,
 )
@@ -106,19 +106,19 @@ class HFRunner:
         **kwargs,
     ) -> torch.Tensor:
         if inputs_embeds is None:
-            inputs_embeds = self.model.model.embed_tokens(input_ids)
+            inputs_embeds = self.model.get_input_embeddings()(input_ids)
             if pixel_values is not None:
-                pixel_values = pixel_values.type(self.model.visual.get_dtype())
-                image_embeds = self.model.visual(pixel_values, grid_thw=image_grid_thw).to(
-                    inputs_embeds.device
+                image_features = self.model.get_image_features(
+                    pixel_values, image_grid_thw, return_dict=True
                 )
+                image_embeds = torch.cat(image_features.pooler_output).to(inputs_embeds)
                 image_mask = input_ids == self.model.config.image_token_id
                 inputs_embeds[image_mask] = image_embeds
             if attention_mask is not None:
                 attention_mask = attention_mask.to(inputs_embeds.device)
 
         outputs = self.model(
-            input_ids=input_ids,
+            input_ids=None,
             position_ids=position_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
@@ -140,9 +140,6 @@ class HFRunner:
         torch_dtype,
         matryoshka_dim: Optional[int] = None,
     ):
-        # Apply model-specific patches
-        monkey_patch_gemma2_sdpa()
-
         # Determine device
         device = "cpu" if self.use_cpu else "cuda"
 
@@ -164,7 +161,7 @@ class HFRunner:
             ).to(device)
         elif self.model_type == "embedding":
             if "gme-qwen2-vl" in model_path.lower():
-                self.model = AutoModelForVision2Seq.from_pretrained(
+                self.model = AutoModelForImageTextToText.from_pretrained(
                     model_path,
                     torch_dtype=torch_dtype,
                     trust_remote_code=False,
@@ -429,21 +426,6 @@ class HFRunner:
             last_token_logits_list=last_token_logits_list,
             last_layer_hidden_states_list=last_layer_hidden_states_list,
         )
-
-
-def monkey_patch_gemma2_sdpa():
-    """
-    Use sdpa by default to fix the OOM issue.
-    Revert this commit:
-    https://github.com/huggingface/transformers/commit/975b988bfe6e7ebb47390cd9a1556c6888804883#diff-5f76eac6f18f4b491521314c318a9692318feb4d19228e9576cce7bde4240834R660
-    """
-    from transformers.models.gemma2.modeling_gemma2 import Gemma2PreTrainedModel
-
-    def _check_and_enable_sdpa(config, hard_check_only: bool = False):
-        config._attn_implementation = "sdpa"
-        return config
-
-    setattr(Gemma2PreTrainedModel, "_check_and_enable_sdpa", _check_and_enable_sdpa)
 
 
 def get_dtype_str(torch_dtype):
