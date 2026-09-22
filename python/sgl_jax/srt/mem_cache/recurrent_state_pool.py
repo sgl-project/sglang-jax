@@ -12,6 +12,8 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
+from sgl_jax.srt.kernels.h0_clone import clone_slots_inplace
+
 # Module-level cache for jitted zero-allocators (recurrent/conv buffers).
 _RECURRENT_ZERO_ALLOCATOR_CACHE: dict = {}
 
@@ -233,20 +235,16 @@ class RecurrentStatePool:
         mesh = self.mesh
         data_axis = self.data_partition_axis
 
-        def _temporal(buf, src, dst):
-            # Donated-buffer aliasing barriers: without them the scatter races the
-            # gather under multi-host SPMD -> NaN. Value-preserving; do not remove.
+        def _clone(buf, src, dst):
+            # The outer forward donates the pool. Keep these barriers around the
+            # Pallas read/write alias boundary: without them a later recurrent
+            # gather can race this clone under multi-host SPMD.
             buf = jax.lax.optimization_barrier(buf)
-            val = jnp.where((src == 0).reshape(-1, 1, 1, 1), buf[dst], buf[src])
-            return jax.lax.optimization_barrier(buf.at[dst].set(val))
-
-        def _conv(buf, src, dst):
-            buf = jax.lax.optimization_barrier(buf)  # see _temporal
-            val = jnp.where((src == 0).reshape(-1, 1, 1), buf[dst], buf[src])
-            return jax.lax.optimization_barrier(buf.at[dst].set(val))
+            cloned = clone_slots_inplace(buf, src, dst)
+            return jax.lax.optimization_barrier(cloned)
 
         copy_temporal = jax.shard_map(
-            _temporal,
+            _clone,
             mesh=mesh,
             in_specs=(
                 P(data_axis, self.recurrent_partition_axis, None, None),
@@ -257,7 +255,7 @@ class RecurrentStatePool:
             check_vma=False,
         )
         copy_conv = jax.shard_map(
-            _conv,
+            _clone,
             mesh=mesh,
             in_specs=(
                 P(data_axis, self.conv_partition_axis, None),
