@@ -38,6 +38,7 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.dsa.ref import streamindex_page_topk_ref
 from sgl_jax.srt.layers.attention.dsa_sparse_backend import (
+    _gather_cache_rows,
     _pad_topk_pages,
     _placeholder_topk_like,
     _scatter_paged,
@@ -202,6 +203,21 @@ class SpecAsDecodeTest(unittest.TestCase):
         np.testing.assert_array_equal(np.asarray(out)[:, :32], np.asarray(tp))
         self.assertTrue(bool((np.asarray(out)[:, 32:] == -1).all()))
         self.assertIs(_pad_topk_pages(out, 128), out)  # already wide enough: untouched
+
+    def test_gather_cache_rows_matches_slots(self):
+        # KVShare read-only steps hand the kernel the rows already at their slots.
+        pk, pages, dv = 2, 6, 8
+        cache = jnp.arange(pages * PAGE_SIZE * dv, dtype=jnp.float32).reshape(
+            pages, PAGE_SIZE // pk, pk, dv
+        )
+        loc = jnp.array([3 * PAGE_SIZE + 1, 4 * PAGE_SIZE + 3, -1, 5 * PAGE_SIZE], jnp.int32)
+        rows = np.asarray(_gather_cache_rows(cache, loc, PAGE_SIZE))
+        flat = np.asarray(cache).reshape(-1, dv)
+        for i, l in enumerate(np.asarray(loc)):
+            if l < 0:
+                self.assertTrue((rows[i] == 0).all())
+            else:
+                np.testing.assert_array_equal(rows[i], flat[l])
 
     def test_bs1_T4(self):
         self._check_case(base_lens=[9], pages_per_req=4)  # 9 + 4 tokens straddle pages

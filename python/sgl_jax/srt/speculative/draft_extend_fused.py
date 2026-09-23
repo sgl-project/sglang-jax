@@ -31,6 +31,11 @@ from sgl_jax.srt.utils.common_utils import get_bool_env_var
 logger = logging.getLogger(__name__)
 
 
+# GLM-5.2 KVShare: draft steps >= 1 reuse step 0's selection AND KV; they must not
+# write their own KV / indexer keys (opt-in A/B, see dsa_sparse_backend readonly).
+_KVSHARE = os.environ.get("SGLANG_JAX_MTP_KVSHARE", "0") == "1"
+
+
 def _spec_decode_compiler_options():
     """Per-executable XLA options for the decode-shaped speculative executables.
 
@@ -693,6 +698,7 @@ def _build_draft_extend(num_layers: int, topk: int, index_share: bool = False):
 
             forward_batch.spec_info.hidden_states = target_hidden
             forward_batch.input_ids = input_ids
+            forward_batch.spec_kvshare_readonly = bool(_KVSHARE and i >= 1)
 
             if index_share:
                 output, pool_updates, _, _, step_topk_pages = model(
@@ -727,6 +733,7 @@ def _build_draft_extend(num_layers: int, topk: int, index_share: bool = False):
                 ext_lens = forward_batch.extend_seq_lens
                 input_ids = _rotate_input_ids(input_ids, ext_lens, sel_pos, topk_idx[:, 0])
 
+        forward_batch.spec_kvshare_readonly = False
         last_idx = draft_logits_indices
         if logits_metadata.accept_lens is not None:
             last_idx = last_idx - (forward_batch.extend_seq_lens - logits_metadata.accept_lens)
@@ -1617,6 +1624,7 @@ def _build_prefill(num_layers: int, topk: int):
             model = nnx.merge(draft_model_def, state)
 
             draft_forward_batch.input_ids = input_ids
+            draft_forward_batch.spec_kvshare_readonly = bool(_KVSHARE and i >= 1)
             draft_forward_batch.spec_info.hidden_states = target_hidden
             output, pool_updates, _, _ = model(
                 draft_forward_batch, all_memory_pools[pool_idx], draft_logits_metadata
