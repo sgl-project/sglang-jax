@@ -56,8 +56,8 @@ PYTHONPATH=python python -m sgl_jax.compile \
   --target cpu --stage compiled --output /tmp/qwen3-cpu-ir
 ```
 
-CPU-target IR uses CPU kernel paths. Omit `--topology` and `--dump-llo` for this
-command.
+CPU-target IR uses CPU kernel paths. Omit the TPU topology options and `--dump-llo`
+for this command.
 
 ## Use a model configuration
 
@@ -83,9 +83,9 @@ reproduce quantized checkpoint computation. The original config is saved as
 ## Choose a TPU topology and parallelism
 
 `--topology` accepts `v6e-1`, `v6e-4`, `v6e-8`, `v6e-16`, `v6e-32`, `v6e-64`,
-`v7x-8`, `v7x-16`, `v7x-32`, and `v7x-64`. The suffix counts JAX-visible devices:
-v6e has one device per chip, and v7x has two. For example, `v7x-32` describes
-16 chips with 32 devices.
+`v7x-8`, `v7x-16`, `v7x-32`, and `v7x-64` as presets. The suffix counts JAX-visible
+devices: v6e has one device per chip, and v7x has two. For example, `v7x-32`
+describes 16 chips with 32 devices.
 
 The topology presets passed to libtpu are:
 
@@ -102,15 +102,33 @@ The topology presets passed to libtpu are:
 | `v7x-32` | `TPU7x:2x2x4` | 16 | 4 |
 | `v7x-64` | `TPU7x:2x4x4` | 32 | 8 |
 
-Each preset uses one slice, no wraparound, and chips-per-host bounds `(2, 2, 1)`
-except `v6e-1`, which uses `(1, 1, 1)`. These hosts describe the target topology;
-the export itself runs in one CPU process. The logical mesh axis order is
-`(data, tensor)` with shape `(dp-size, tp-size / dp-size)`, using JAX's topology-aware
-mapping with physical-axis splitting allowed. Check `mesh`, `mesh_device_ids`
+To specify a topology directly, replace `--topology` with `--topology-name` and
+`--host-bounds X Y Z`. For example, the explicit equivalent of `--topology v7x-8` is:
+
+```bash
+PYTHONPATH=python python -m sgl_jax.compile \
+  --target tpu --topology-name TPU7x:2x2x1 --host-bounds 2 2 1 --tp-size 8 \
+  --dp-size 2 --batch-size 2 \
+  --stage compiled --dump-llo --output /tmp/custom-topology-ir
+```
+
+The name is passed directly to libtpu, so its supported topologies do not need an
+exporter preset. `--topology` and `--topology-name` are mutually exclusive.
+`--host-bounds` specifies positive chip counts along the three physical axes per
+host; it is required with `--topology-name` and can also override a preset's bounds.
+For example, `--topology v6e-8 --host-bounds 1 1 1 --tp-size 8` describes eight
+logical hosts with one chip each. libtpu validates the topology and host layout.
+
+The default chips-per-host bounds are `(2, 2, 1)` for every preset except `v6e-1`,
+which uses `(1, 1, 1)`. TPU targets use one slice and no wraparound. These hosts
+describe the target topology; the export itself runs in one CPU process. The
+logical mesh axis order is `(data, tensor)` with shape `(dp-size, tp-size / dp-size)`,
+using JAX's topology-aware mapping with physical-axis splitting allowed. Check `mesh`, `mesh_device_ids`
 (flattened in mesh axis order), and `target_topology` in the manifest when comparing
 collectives: device count alone does not identify the physical mapping.
 
-- `--tp-size`: total device count; it must match the topology suffix.
+- `--tp-size`: total device count; it must match the devices returned by libtpu
+  (the topology suffix when using a preset).
 - `--dp-size`: attention data parallelism. Attention TP is `tp-size / dp-size`.
 - `--ep-size`: expert parallelism. With `--moe-backend fused_v2`, set it equal
   to `--tp-size`.

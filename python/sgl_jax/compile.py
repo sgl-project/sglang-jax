@@ -14,11 +14,23 @@ def parse_args():
     )
     parser.add_argument("--model-config", help="Local config.json; omitted: built-in tiny Qwen3")
     parser.add_argument("--target", choices=("cpu", "tpu"), default="tpu")
-    parser.add_argument(
+    topology = parser.add_mutually_exclusive_group()
+    topology.add_argument(
         "--topology",
         choices=tuple(f"v6e-{n}" for n in (1, 4, 8, 16, 32, 64))
         + tuple(f"v7x-{n}" for n in (8, 16, 32, 64)),
-        help="Target TPU topology; the suffix counts JAX devices, not chips",
+        help="TPU topology preset; the suffix counts JAX devices, not chips",
+    )
+    topology.add_argument(
+        "--topology-name",
+        help="Raw libtpu topology name (e.g. TPU7x:2x2x1); requires --host-bounds",
+    )
+    parser.add_argument(
+        "--host-bounds",
+        type=int,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        help="Chips per host along each physical axis; overrides the preset's host bounds",
     )
     parser.add_argument("--tp-size", type=int, default=1, help="Total devices, as in serving")
     parser.add_argument(
@@ -98,10 +110,18 @@ def parse_args():
     padded_context = -(-options.context_length // options.page_size) * options.page_size
     if options.batch_size * padded_context > options.kv_capacity:
         parser.error("kv_capacity must cover every request's page-aligned context")
-    if options.target == "tpu" and not options.topology:
-        parser.error("--topology is required for TPU cross-compilation")
-    if options.target == "cpu" and options.topology:
-        parser.error("--topology is only valid with --target=tpu")
+    if options.target == "tpu" and not (options.topology or options.topology_name):
+        parser.error("--topology or --topology-name is required for TPU cross-compilation")
+    if options.target == "cpu" and (
+        options.topology or options.topology_name or options.host_bounds is not None
+    ):
+        parser.error(
+            "--topology, --topology-name, and --host-bounds are only valid with --target=tpu"
+        )
+    if options.topology_name and options.host_bounds is None:
+        parser.error("--topology-name requires --host-bounds X Y Z")
+    if options.host_bounds is not None and any(bound <= 0 for bound in options.host_bounds):
+        parser.error("--host-bounds dimensions must be positive")
     if options.dump_llo and (options.target != "tpu" or options.stage != "compiled"):
         parser.error("--dump-llo requires --target=tpu --stage=compiled")
     compiler_options = {}

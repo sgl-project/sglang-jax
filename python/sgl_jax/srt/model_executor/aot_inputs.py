@@ -33,25 +33,28 @@ def build_mesh(options):
     else:
         from jax.experimental.topologies import get_topology_desc
 
-        # Follow MaxText's compile-only topology and host-bounds approach.
-        # User-facing suffixes count JAX devices: v7x exposes two per chip.
-        topology_name, host_bounds = {
-            "v6e-1": ("v6e:1x1", (1, 1, 1)),
-            "v6e-4": ("v6e:2x2", (2, 2, 1)),
-            "v6e-8": ("v6e:2x4", (2, 2, 1)),
-            "v6e-16": ("v6e:4x4", (2, 2, 1)),
-            "v6e-32": ("v6e:4x8", (2, 2, 1)),
-            "v6e-64": ("v6e:8x8", (2, 2, 1)),
-            "v7x-8": ("TPU7x:2x2x1", (2, 2, 1)),
-            "v7x-16": ("TPU7x:2x2x2", (2, 2, 1)),
-            "v7x-32": ("TPU7x:2x2x4", (2, 2, 1)),
-            "v7x-64": ("TPU7x:2x4x4", (2, 2, 1)),
-        }[options.topology]
+        topology_name, host_bounds = options.topology_name, options.host_bounds
+        if options.topology:
+            # Follow MaxText's compile-only topology and host-bounds approach.
+            # Preset suffixes count JAX devices: v7x exposes two per chip.
+            topology_name, preset_host_bounds = {
+                "v6e-1": ("v6e:1x1", (1, 1, 1)),
+                "v6e-4": ("v6e:2x2", (2, 2, 1)),
+                "v6e-8": ("v6e:2x4", (2, 2, 1)),
+                "v6e-16": ("v6e:4x4", (2, 2, 1)),
+                "v6e-32": ("v6e:4x8", (2, 2, 1)),
+                "v6e-64": ("v6e:8x8", (2, 2, 1)),
+                "v7x-8": ("TPU7x:2x2x1", (2, 2, 1)),
+                "v7x-16": ("TPU7x:2x2x2", (2, 2, 1)),
+                "v7x-32": ("TPU7x:2x2x4", (2, 2, 1)),
+                "v7x-64": ("TPU7x:2x4x4", (2, 2, 1)),
+            }[options.topology]
+            host_bounds = host_bounds or preset_host_bounds
         devices = get_topology_desc(
             platform="tpu",
             topology_name=topology_name,
             chip_config_name="default",
-            chips_per_host_bounds=host_bounds,
+            chips_per_host_bounds=tuple(host_bounds),
             num_slices=1,
             wrap=(False, False, False),
         ).devices
