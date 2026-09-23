@@ -93,6 +93,12 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
     scheduler.disagg_kv_manager.start_reaper()
     scheduler.disagg_use_d2h_staging = scheduler.disagg_kv_manager.requires_host_staging
 
+    from sgl_jax.srt.mem_cache.recurrent_state_pool import get_recurrent_state_spec
+
+    req_to_token_pool = getattr(scheduler, "req_to_token_pool", None)
+    recurrent_state_pool = getattr(req_to_token_pool, "recurrent_state_pool", None)
+    recurrent_state_spec = get_recurrent_state_spec(recurrent_state_pool)
+
     if mode == "prefill":
         import jax
 
@@ -121,6 +127,7 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
                 transport_metadata=(
                     scheduler.disagg_kv_manager.prefill_transport_metadata(dp_rank)
                 ),
+                recurrent_state_spec=recurrent_state_spec,
             )
             bootstrap_keys.append(bootstrap_key)
         scheduler.disagg_heartbeat = HeartbeatDaemon(

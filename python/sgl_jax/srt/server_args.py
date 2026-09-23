@@ -585,7 +585,11 @@ class ServerArgs:
                 )
 
         if self.dp_schedule_policy is None:
-            use_no_radix_default = self.disable_radix_cache or bool(self.pd_disaggregation)
+            use_no_radix_default = (
+                self.disable_radix_cache
+                or bool(self.pd_disaggregation)
+                or self.disaggregation_mode != "null"
+            )
             self.dp_schedule_policy = "min_running_queue" if use_no_radix_default else "cache_aware"
 
         if self.nnodes > 1 and self.device_indexes is not None:
@@ -644,6 +648,25 @@ class ServerArgs:
                     f"deployments (the validated bucket; see "
                     f"docs/operations/pd_e2e_matrix.md)."
                 )
+            # PD disaggregation transfers a single running recurrent state slot
+            # per request (1:1 slot ownership with radix cache disabled) and does
+            # not synchronize ping-pong track snapshot buffers across P/D nodes.
+            if self.enable_recurrent_extra_buffer:
+                raise ValueError(
+                    "--enable-recurrent-extra-buffer is not supported when "
+                    "--disaggregation-mode is not 'null'"
+                )
+            if self.max_recurrent_state_size is not None:
+                if self.max_recurrent_state_size <= 0:
+                    raise ValueError(
+                        "--max-recurrent-state-size must be positive when "
+                        f"--disaggregation-mode is set; got {self.max_recurrent_state_size}"
+                    )
+                if self.max_recurrent_state_size % self.dp_size != 0:
+                    raise ValueError(
+                        f"--max-recurrent-state-size ({self.max_recurrent_state_size}) "
+                        f"must be divisible by --dp-size ({self.dp_size})"
+                    )
             # PD-mode warmup is one-sided (the dummy warmup request
             # has no peer counterpart), so it gets stuck and the
             # allocator memory-leak check trips. Auto-skip unless

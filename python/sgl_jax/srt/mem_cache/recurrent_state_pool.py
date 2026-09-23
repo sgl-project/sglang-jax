@@ -367,3 +367,49 @@ class RecurrentStatePool:
         obj.recurrent_buffers = list(new_recurrent)
         obj.conv_buffers = [list(inner) for inner in new_conv]
         return obj
+
+
+def _resolve_dtype_str(dtype: object) -> str:
+    if dtype is None:
+        return ""
+    try:
+        return str(jnp.dtype(dtype).name)
+    except Exception:
+        return str(dtype)
+
+
+def get_recurrent_state_spec(recurrent_state_pool: object | None) -> dict[str, object] | None:
+    """Extract per-slot shape and dtype metadata from a ``RecurrentStatePool``."""
+    if recurrent_state_pool is None:
+        return None
+
+    recurrent_buffers = getattr(recurrent_state_pool, "recurrent_buffers", None)
+    conv_buffers = getattr(recurrent_state_pool, "conv_buffers", None)
+    if not recurrent_buffers or not conv_buffers or not conv_buffers[0]:
+        return None
+
+    num_layers = int(
+        getattr(recurrent_state_pool, "num_linear_recurrent_layers", len(recurrent_buffers))
+    )
+    rec_slot_shape = [int(d) for d in recurrent_buffers[0].shape[1:]]
+    conv_slot_shape = [int(d) for d in conv_buffers[0][0].shape[1:]]
+    temporal_dtype = _resolve_dtype_str(
+        getattr(
+            recurrent_state_pool, "temporal_dtype", getattr(recurrent_buffers[0], "dtype", None)
+        )
+    )
+    conv_dtype = _resolve_dtype_str(
+        getattr(recurrent_state_pool, "conv_dtype", getattr(conv_buffers[0][0], "dtype", None))
+    )
+
+    return {
+        "num_layers": num_layers,
+        "recurrent_shape": rec_slot_shape,
+        "conv_shape": conv_slot_shape,
+        "temporal_dtype": temporal_dtype,
+        "conv_dtype": conv_dtype,
+        "size": int(getattr(recurrent_state_pool, "size", 0) or 0),
+        "dp_size": int(getattr(recurrent_state_pool, "dp_size", 1) or 1),
+        "slots_per_rank": int(getattr(recurrent_state_pool, "slots_per_rank", 0) or 0),
+        "total_slots": int(getattr(recurrent_state_pool, "total_slots", 0) or 0),
+    }

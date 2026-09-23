@@ -687,6 +687,82 @@ def test_prefill_decode_chunk_transfer_flag_must_match(prefill_enabled, decode_e
         )
 
 
+def _mock_recurrent_pool(
+    *,
+    size=6,
+    dp_size=2,
+    num_layers=4,
+    num_heads=4,
+    head_dim=64,
+    proj_size=768,
+    conv_kernel_size=4,
+    temporal_dtype="float32",
+    conv_dtype="bfloat16",
+):
+    total_slots = size + dp_size
+    slots_per_rank = size // dp_size
+    rec_buf = SimpleNamespace(
+        shape=(total_slots, num_heads, head_dim, head_dim),
+        dtype=temporal_dtype,
+    )
+    conv_buf = SimpleNamespace(
+        shape=(total_slots, proj_size, conv_kernel_size - 1),
+        dtype=conv_dtype,
+    )
+    return SimpleNamespace(
+        size=size,
+        dp_size=dp_size,
+        slots_per_rank=slots_per_rank,
+        total_slots=total_slots,
+        num_linear_recurrent_layers=num_layers,
+        recurrent_buffers=[rec_buf for _ in range(num_layers)],
+        conv_buffers=[[conv_buf] for _ in range(num_layers)],
+        temporal_dtype=temporal_dtype,
+        conv_dtype=conv_dtype,
+    )
+
+
+def test_validate_recurrent_state_compat():
+    from sgl_jax.srt.disaggregation.bootstrap import validate_recurrent_state_compat
+    from sgl_jax.srt.mem_cache.recurrent_state_pool import get_recurrent_state_spec
+
+    prefill_rsp = _mock_recurrent_pool(size=6, dp_size=2, num_layers=4, num_heads=4, head_dim=64)
+    decode_rsp = _mock_recurrent_pool(size=12, dp_size=2, num_layers=4, num_heads=4, head_dim=64)
+
+    prefill_spec = get_recurrent_state_spec(prefill_rsp)
+    decode_spec = get_recurrent_state_spec(decode_rsp)
+    assert prefill_spec["total_slots"] == 8
+    assert decode_spec["total_slots"] == 14
+    # Different pool capacities (slots_per_rank=3 vs 6) with identical per-slot shapes are compatible
+    validate_recurrent_state_compat(prefill_spec, decode_spec)
+
+    # Mismatched head_dim or num_layers must raise ValueError
+    bad_decode_rsp = _mock_recurrent_pool(
+        size=6, dp_size=2, num_layers=4, num_heads=4, head_dim=128
+    )
+    with pytest.raises(ValueError, match="recurrent_state shape mismatch"):
+        validate_recurrent_state_compat(prefill_rsp, bad_decode_rsp)
+
+    # One side having recurrent state and the other not must raise ValueError
+    with pytest.raises(ValueError, match="recurrent state mode mismatch"):
+        validate_recurrent_state_compat(prefill_rsp, None)
+    with pytest.raises(ValueError, match="recurrent state mode mismatch"):
+        validate_recurrent_state_compat(None, decode_rsp)
+
+    # Partial/empty shape or invalid buffer sizing must raise ValueError
+    empty_shape_spec = dict(decode_spec, recurrent_shape=[])
+    with pytest.raises(ValueError, match="recurrent_state shape mismatch"):
+        validate_recurrent_state_compat(prefill_spec, empty_shape_spec)
+
+    bad_size_spec = dict(decode_spec, size=0, slots_per_rank=0)
+    with pytest.raises(ValueError, match="invalid size=0"):
+        validate_recurrent_state_compat(prefill_spec, bad_size_spec)
+
+    bad_total_slots_spec = dict(decode_spec, total_slots=decode_spec["size"])
+    with pytest.raises(ValueError, match="invalid total_slots"):
+        validate_recurrent_state_compat(prefill_spec, bad_total_slots_spec)
+
+
 # ---- register retry (ref: upstream test_register_to_bootstrap.py) -----------
 
 

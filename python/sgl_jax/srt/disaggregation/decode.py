@@ -448,9 +448,18 @@ class SchedulerDisaggregationDecodeMixin:
                     check_prefill_compat,
                     resolve_kv_dtype_name,
                 )
+                from sgl_jax.srt.mem_cache.recurrent_state_pool import (
+                    get_recurrent_state_spec,
+                )
 
                 local_kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
                 manager = getattr(self, "disagg_kv_manager", None)
+                local_rsp = getattr(
+                    getattr(self, "req_to_token_pool", None),
+                    "recurrent_state_pool",
+                    None,
+                )
+                local_recurrent_spec = get_recurrent_state_spec(local_rsp)
                 check_prefill_compat(
                     p_info,
                     local_page_size=self.server_args.page_size,
@@ -465,6 +474,7 @@ class SchedulerDisaggregationDecodeMixin:
                             False,
                         )
                     ),
+                    local_recurrent_state_spec=local_recurrent_spec,
                 )
             except ValueError as exc:
                 logger.error(
