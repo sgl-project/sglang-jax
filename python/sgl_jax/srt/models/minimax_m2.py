@@ -346,9 +346,14 @@ class MiniMaxM2ForCausalLM(nnx.Module):
             config.hidden_size,
             dtype=dtype,
             param_dtype=dtype,
-            kernel_axes=("tensor", None),
+            mesh=mesh,
+            enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
         )
-        self.logits_processor = LogitsProcessor(config.vocab_size, mesh=mesh)
+        self.logits_processor = LogitsProcessor(
+            config.vocab_size,
+            mesh=mesh,
+            enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
+        )
 
     def __call__(
         self,
@@ -402,9 +407,7 @@ class MiniMaxM2ForCausalLM(nnx.Module):
             "model.norm.weight": WeightMapping(
                 target_path="model.norm.scale", sharding=(None,), transpose=False
             ),
-            "lm_head.weight": WeightMapping(
-                target_path="lm_head.embedding", sharding=("tensor", None), transpose=False
-            ),
+            "lm_head.weight": self.lm_head.weight_mapping("lm_head.embedding"),
         }
         for i in range(self.config.num_hidden_layers):
             mappings.update(self._create_layer_mappings(i, is_static_quant, moe_backend, use_fused))

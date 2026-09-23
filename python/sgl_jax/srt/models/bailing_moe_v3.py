@@ -627,9 +627,14 @@ class BailingMoeV3ForCausalLM(nnx.Module):
                 config.hidden_size,
                 dtype=dtype,
                 param_dtype=dtype,
-                kernel_axes=("tensor", None),
+                mesh=mesh,
+                enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
             )
-        self.logits_processor = LogitsProcessor(config.vocab_size, mesh=mesh)
+        self.logits_processor = LogitsProcessor(
+            config.vocab_size,
+            mesh=mesh,
+            enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
+        )
 
     def __call__(
         self,
@@ -685,11 +690,7 @@ class BailingMoeV3ForCausalLM(nnx.Module):
             ),
         }
         if not getattr(self.config, "tie_word_embeddings", False):
-            mappings["lm_head.weight"] = WeightMapping(
-                target_path="lm_head.embedding",
-                sharding=("tensor", None),
-                transpose=False,
-            )
+            mappings["lm_head.weight"] = self.lm_head.weight_mapping("lm_head.embedding")
 
         num_layers = self.config.num_hidden_layers
         first_k_dense_replace = self.config.first_k_dense_replace

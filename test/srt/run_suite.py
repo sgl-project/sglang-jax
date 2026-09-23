@@ -21,6 +21,7 @@ class TestFile:
     )
     runner: str = "python"
     extra_deps: list[str] | None = None
+    env: dict[str, str] | None = None
 
 
 def run_with_timeout(
@@ -97,6 +98,7 @@ def run_unittest_files(
 
             filename = os.path.join(os.getcwd(), filename)
             tic = time.perf_counter()
+            env = {**os.environ, **(file_entry.env or {})}
 
             # Check if specific test methods are specified
             if file_entry.test_methods:
@@ -118,7 +120,7 @@ def run_unittest_files(
                         [sys.executable, "-m", "unittest", test_path],
                         stdout=sys.stdout,
                         stderr=sys.stderr,
-                        env=os.environ,
+                        env=env,
                         cwd=os.path.dirname(filename),
                     )
                     process.wait()
@@ -175,7 +177,7 @@ def run_unittest_files(
                     cmd,
                     stdout=sys.stdout,
                     stderr=sys.stderr,
-                    env=os.environ,
+                    env=env,
                 )
                 process.wait()
 
@@ -307,6 +309,12 @@ suites = {
     # have a conditional CPU pin gated on USE_DEVICE_TYPE=cpu — the
     # cpu-test CI job sets that env var.
     "unit-test-cpu": [
+        TestFile(
+            "test/srt/layers/test_lm_head_parallel.py",
+            0.3,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "8"},
+        ),
         TestFile("test/srt/multimodal/test_engine_multimodal.py", 0.1, runner="pytest"),
         TestFile("python/sgl_jax/test/layers/test_hyperconnection.py", 0.1),
         TestFile(
@@ -390,6 +398,7 @@ suites = {
             "python/sgl_jax/test/multimodal/test_kimi_k25_weight_mapping.py",
             0.2,
             runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "8"},
         ),
         TestFile(
             "python/sgl_jax/test/multimodal/test_stage_config_routing.py",

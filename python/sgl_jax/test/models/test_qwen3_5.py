@@ -52,6 +52,18 @@ _ROPE_PARAMETERS = {
 }
 
 
+def _mapping_head(config):
+    from flax import nnx
+
+    from sgl_jax.srt.layers.embeddings import ParallelLMHead
+
+    if config.tie_word_embeddings:
+        return None
+    return nnx.eval_shape(
+        lambda: ParallelLMHead(config.text_config.vocab_size, config.text_config.hidden_size)
+    )
+
+
 def _make_config(*, num_layers: int, is_moe: bool, tie: bool = False):
     """Build a Qwen3.5 config with the real layout but small dims.
 
@@ -175,10 +187,36 @@ class TestQwen3_5(unittest.TestCase):
         )
         # Catch assigning a vision module to an attribute NNX already marked static.
         with jax.set_mesh(self.mesh):
-            model = nnx.eval_shape(lambda: Qwen3_5ForConditionalGeneration(cfg, self.mesh))
+            model = nnx.eval_shape(lambda cfg=cfg: Qwen3_5ForConditionalGeneration(cfg, self.mesh))
         self.assertIsInstance(model.visual, Qwen3VLVisionModel)
         self.assertIs(model.get_input_embeddings(), model.language_model.model.embed_tokens)
         self.assertEqual(model.get_multimodal_embedding_packed_capacities(), (16,))
+
+    def test_lm_head_policy_comes_from_outer_config(self):
+        from flax import nnx
+
+        from sgl_jax.srt.layers.lm_head_parallel import weight_spec
+        from sgl_jax.srt.models.qwen3_5 import (
+            Qwen3_5ForConditionalGeneration,
+            _create_qwen3_5_weight_mappings,
+        )
+
+        for enabled in (False, True):
+            with self.subTest(enable_dp_lm_head=enabled):
+                cfg = Qwen3_5DenseConfig(
+                    text_config={"hidden_size": 32, "vocab_size": 64, "num_hidden_layers": 0},
+                    vision_config=None,
+                    tie_word_embeddings=False,
+                )
+                cfg.enable_dp_lm_head = enabled
+                with jax.set_mesh(self.mesh):
+                    model = nnx.eval_shape(
+                        lambda cfg=cfg: Qwen3_5ForConditionalGeneration(cfg, self.mesh)
+                    )
+                self.assertEqual(model.logits_processor.enable_dp_lm_head, enabled)
+                self.assertEqual(model.lm_head.kernel_axes, tuple(weight_spec(enabled)))
+                mappings, _, _ = _create_qwen3_5_weight_mappings(cfg, model.lm_head)
+                self.assertEqual(mappings["lm_head.weight"].sharding, model.lm_head.kernel_axes)
 
     def test_config_flattens_rope_parameters(self):
         tc = self.cfg.text_config
@@ -362,7 +400,7 @@ class TestQwen3_5(unittest.TestCase):
         from sgl_jax.srt.models.qwen3_5 import _create_qwen3_5_weight_mappings
 
         cfg = _make_config(num_layers=40, is_moe=True)  # 35B-A3B layer count
-        mapping, _, _ = _create_qwen3_5_weight_mappings(cfg)
+        mapping, _, _ = _create_qwen3_5_weight_mappings(cfg, _mapping_head(cfg))
         expected = _expected_ckpt_keys(num_layers=40, is_moe=True, tie=False)
         self.assertEqual(len(expected), 693)  # 692 text keys + lm_head.weight
         self.assertEqual(set(mapping), expected)
@@ -371,7 +409,9 @@ class TestQwen3_5(unittest.TestCase):
     def test_visual_and_mtp_keys_are_skipped(self):
         from sgl_jax.srt.models.qwen3_5 import _create_qwen3_5_weight_mappings
 
-        _, visual_skip, mtp_skip = _create_qwen3_5_weight_mappings(self.cfg)
+        _, visual_skip, mtp_skip = _create_qwen3_5_weight_mappings(
+            self.cfg, _mapping_head(self.cfg)
+        )
         self.assertTrue(
             any(re.match(p, "model.visual.blocks.0.attn.qkv.weight") for p in visual_skip)
         )
@@ -468,7 +508,7 @@ class TestQwen3_5Dense(unittest.TestCase):
         from sgl_jax.srt.models.qwen3_5 import _create_qwen3_5_weight_mappings
 
         cfg = _make_config(num_layers=64, is_moe=False)  # 27B layer count
-        mapping, _, _ = _create_qwen3_5_weight_mappings(cfg)
+        mapping, _, _ = _create_qwen3_5_weight_mappings(cfg, _mapping_head(cfg))
         expected = _expected_ckpt_keys(num_layers=64, is_moe=False, tie=False)
         self.assertEqual(len(expected), 851)  # 850 text keys + lm_head.weight
         self.assertEqual(set(mapping), expected)
@@ -484,7 +524,7 @@ class TestQwen3_5Dense(unittest.TestCase):
 
         cfg = _make_config(num_layers=24, is_moe=False, tie=True)  # 2B layer count
         self.assertTrue(cfg.tie_word_embeddings)
-        mapping, _, _ = _create_qwen3_5_weight_mappings(cfg)
+        mapping, _, _ = _create_qwen3_5_weight_mappings(cfg, _mapping_head(cfg))
         self.assertNotIn("lm_head.weight", mapping)
         self.assertEqual(set(mapping), _expected_ckpt_keys(num_layers=24, is_moe=False, tie=True))
 

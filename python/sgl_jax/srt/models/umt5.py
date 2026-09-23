@@ -626,10 +626,14 @@ class UMT5ForConditionalGeneration(nnx.Module):
             config.d_model,
             dtype=dtype,
             param_dtype=dtype,
-            kernel_axes=("tensor", None),
             mesh=mesh,
+            enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
         )
-        self.logits_processor = LogitsProcessor(config.vocab_size, mesh=mesh)
+        self.logits_processor = LogitsProcessor(
+            config.vocab_size,
+            mesh=mesh,
+            enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
+        )
 
     def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(self, model_config, self.mesh, self.dtype)
@@ -644,7 +648,7 @@ class UMT5ForConditionalGeneration(nnx.Module):
             "decoder.final_layer_norm.weight": WeightMapping(
                 "decoder.final_ln.scale", (None,), False
             ),
-            "lm_head.weight": WeightMapping("lm_head.embedding", ("tensor", None), False),
+            "lm_head.weight": self.lm_head.weight_mapping("lm_head.embedding"),
         }
         for i in range(self.config.num_layers):
             m.update(_block_mappings(self.config, i, False, "encoder.block", "encoder.blocks"))

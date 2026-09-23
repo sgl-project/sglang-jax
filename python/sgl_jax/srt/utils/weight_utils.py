@@ -84,6 +84,7 @@ class WeightMapping:
     concat_axis: int | None = None
     is_eagle3: bool = False
     physical_to_logical_map: np.ndarray | None = None
+    pad_width: tuple[tuple[int, int], ...] | None = None
 
     def __post_init__(self):
         if self.sharding is None:
@@ -2013,6 +2014,7 @@ class WeightLoader:
                     isinstance(mapping.target_path, str)
                     and not mapping.target_path.startswith("__FUSED_QKV_")
                     and not mapping.target_path.startswith("__KV_")
+                    and mapping.pad_width is None
                     and mapping.reshape is None
                     and mapping.repeat is None  # Check repeat here too!
                     and not mapping.kv_head_padding
@@ -2610,6 +2612,9 @@ class WeightLoader:
             processed_weight = jnp.repeat(processed_weight, times, axis=axis)
         if mapping.kv_head_padding:
             processed_weight = self._apply_kv_head_padding(processed_weight, hf_key)
+
+        if mapping.pad_width is not None:
+            processed_weight = jnp.pad(processed_weight, mapping.pad_width)
 
         assert mapping.sharding is not None
         sharded_weight = self._shard_weight(processed_weight, mapping.sharding)
