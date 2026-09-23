@@ -564,7 +564,7 @@ def _build_write_runs(loc, *, kv_packing: int, r_cap: int):
     return table, n_raw
 
 
-def _write_back_kernel(tbl_ref, row_ref, cache_in_ref, out_ref, wdst_ref, wsrc_ref, sem):
+def _write_back_kernel(n_ref, tbl_ref, row_ref, cache_in_ref, out_ref, wdst_ref, wsrc_ref, sem):
     del cache_in_ref  # aliased with out_ref; all access goes through out_ref
     Pn, pspk, pk, D = out_ref.shape
     # word view: dim0 (words) is untiled, so dynamic word offsets are legal.
@@ -572,7 +572,12 @@ def _write_back_kernel(tbl_ref, row_ref, cache_in_ref, out_ref, wdst_ref, wsrc_r
     # tile on dim0 and single-token slices at odd offsets fail Mosaic
     # alignment. Edge tokens therefore go through a word-granular RMW below.
     cache_w = out_ref.reshape(Pn * pspk, pk, D)
-    E = tbl_ref.shape[0]
+    # Only the first n_ref[0] = 3 * n_runs table entries can be non-empty (the
+    # builder zero-fills the rows of unused run ids), so the scalar loop stops
+    # there instead of walking all 3 * r_cap entries: at 4 draft tokens x 64
+    # requests the table has 768 entries but ~64-192 runs, and the loop is
+    # scalar-bound (~0.17 us per entry).
+    E = n_ref[0]
 
     def entry(e, carry):
         kind = tbl_ref[e, 0]
@@ -682,11 +687,13 @@ def paged_write_back(
         r_cap = default_run_capacity(Tp, ps)
     table, n_raw = _build_write_runs(loc, kv_packing=pk, r_cap=r_cap)
     row_w = row.reshape(Tp // pk, pk, D)
+    n_ent = (3 * jnp.minimum(n_raw, r_cap)).reshape(1).astype(jnp.int32)  # live table entries
 
-    def _pallas(cache, row_w, table):
+    def _pallas(cache, row_w, table, n_ent):
         return pl.pallas_call(
             _write_back_kernel,
             in_specs=[
+                pl.BlockSpec(memory_space=pltpu.SMEM),  # live entry count [1]
                 pl.BlockSpec(memory_space=pltpu.SMEM),  # run table
                 pl.BlockSpec(memory_space=pltpu.HBM),  # row (word view)
                 pl.BlockSpec(memory_space=pltpu.HBM),  # cache (aliased)
@@ -698,12 +705,12 @@ def paged_write_back(
                 pltpu.VMEM((1, pk, D), cache.dtype),
                 pltpu.SemaphoreType.DMA,
             ],
-            input_output_aliases={2: 0},
+            input_output_aliases={3: 0},
             interpret=interpret,
-        )(table, row_w, cache)
+        )(n_ent, table, row_w, cache)
 
-    def _scatter(cache, row_w, table):
-        del table
+    def _scatter(cache, row_w, table, n_ent):
+        del table, n_ent
         # 4D-native scatter: same slot semantics as the flat-view version but
         # without cache.reshape(Pn*ps, D), which on jax 0.11.1 materializes a
         # full retile of the pool inside this cond branch (branch_1_fun,
@@ -717,12 +724,12 @@ def paged_write_back(
     if interpret:
         # interpret cannot lower dynamic-size DMAs; the scatter is the
         # bit-identical reference semantics anyway.
-        return _scatter(cache, row_w, table)
+        return _scatter(cache, row_w, table, n_ent)
     if pallas_always_fits(Tp, r_cap):
         # Static dispatch: the run table cannot overflow, so the lax.cond is
         # not needed. It is also expensive: both branches hand back a whole
         # pool, XLA cannot alias the pool in place across the conditional
         # (spec verify: 2 x ~0.02 ms per layer; draft-extend: three 372 MB
         # pool copies per step on GLM-5.2 tp16).
-        return _pallas(cache, row_w, table)
-    return jax.lax.cond(n_raw <= r_cap, _pallas, _scatter, cache, row_w, table)
+        return _pallas(cache, row_w, table, n_ent)
+    return jax.lax.cond(n_raw <= r_cap, _pallas, _scatter, cache, row_w, table, n_ent)

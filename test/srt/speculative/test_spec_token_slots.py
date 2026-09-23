@@ -304,7 +304,7 @@ class SpecTokenSlotsTest(unittest.TestCase):
 
         def fake_pallas_call(*a, **k):
             calls["pallas"] += 1
-            return lambda table, row_w, cache_: ref  # stand-in for the TPU kernel
+            return lambda n_ent, table, row_w, cache_: ref  # stand-in for the TPU kernel
 
         real_cond = qb.jax.lax.cond
 
@@ -347,7 +347,7 @@ class SpecTokenSlotsTest(unittest.TestCase):
 
             def fake_pallas_call(*a, _ref=ref, **k):
                 calls["pallas"] += 1
-                return lambda table, row_w, cache_: _ref
+                return lambda n_ent, table, row_w, cache_: _ref
 
             def counting_cond(pred, tb, fb, *ops):
                 calls["cond"] += 1
