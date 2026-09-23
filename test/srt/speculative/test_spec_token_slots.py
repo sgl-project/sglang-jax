@@ -365,6 +365,47 @@ class SpecTokenSlotsTest(unittest.TestCase):
             )
             self.assertEqual(int(n_raw), T)  # worst case really is one run per row
 
+    def test_small_rows_scatter_skips_kernel_and_matches_reference(self):
+        # Spec pre-write opts into the 4D-native scatter for <= SCATTER_ROWS_MAX
+        # rows: no pallas_call, no lax.cond, bit-identical to the flat reference.
+        import sgl_jax.srt.kernels.dsa.sparse_mla_prefill_qblock as qb
+
+        pk, dv = 2, 8
+        real_cond = qb.jax.lax.cond
+        for T in (4, 256, 1024):
+            pages = 2 * T // PAGE_SIZE + 2
+            cache = jnp.zeros((pages, PAGE_SIZE // pk, pk, dv), jnp.float32)
+            rows = jnp.arange(T * dv, dtype=jnp.float32).reshape(T, dv) + 1.0
+            loc = jnp.arange(T, dtype=jnp.int32) * 2
+            loc = loc.at[-1].set(-1)
+            ref = (
+                cache.reshape(-1, dv)
+                .at[loc]
+                .set(rows, mode="drop", wrap_negative_indices=False)
+                .reshape(cache.shape)
+            )
+            calls = {"cond": 0, "pallas": 0}
+
+            def fake_pallas_call(*a, **k):
+                calls["pallas"] += 1
+                raise AssertionError("pallas_call must not be used on the scatter path")
+
+            def counting_cond(pred, tb, fb, *ops):
+                calls["cond"] += 1
+                return real_cond(pred, tb, fb, *ops)
+
+            with (
+                mock.patch.object(qb.pl, "pallas_call", fake_pallas_call),
+                mock.patch.object(qb.jax.lax, "cond", counting_cond),
+            ):
+                out = paged_write_back(
+                    cache, rows, loc, page_size=PAGE_SIZE, small_rows_scatter=True
+                )
+            self.assertEqual(calls, {"cond": 0, "pallas": 0}, T)
+            np.testing.assert_array_equal(np.asarray(out), np.asarray(ref))
+        # above the bound the flag is inert (kernel/cond path as before)
+        self.assertGreater(4096, qb.SCATTER_ROWS_MAX)
+
 
 if __name__ == "__main__":
     unittest.main()

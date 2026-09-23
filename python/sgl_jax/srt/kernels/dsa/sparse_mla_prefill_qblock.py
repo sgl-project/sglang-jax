@@ -633,6 +633,9 @@ def _write_back_kernel(n_ref, tbl_ref, row_ref, cache_in_ref, out_ref, wdst_ref,
 # (2 * pages + 130 = 134) did not cover it and cost two whole-pool copies per
 # layer (~0.15 ms each on GLM-5.2 tp16).
 STATIC_DISPATCH_MAX_ROWS = 1024
+# Row counts up to this size take the 4D-native scatter when the caller opts in
+# (speculative verify / draft-extend pre-write); see paged_write_back.
+SCATTER_ROWS_MAX = 1024
 
 
 def default_run_capacity(num_rows: int, page_size: int) -> int:
@@ -661,8 +664,16 @@ def paged_write_back(
     page_size: int,
     r_cap: int | None = None,
     interpret: bool = False,
+    small_rows_scatter: bool = False,
 ):
     """In-place paged self-write: ``cache[loc[t]] = row[t]`` for ``loc >= 0``.
+
+    ``small_rows_scatter``: for row counts up to ``SCATTER_ROWS_MAX`` skip the
+    run table and the Pallas kernel and issue the 4D-native XLA scatter
+    directly. Measured on v7x with the production pool (2274 pages): 0.03 ms
+    at 4 rows and 0.065 ms at 256 rows versus 0.04 / 0.27 ms for the kernel,
+    whose per-run DMAs are latency-bound at those sizes. Opt-in so the
+    prefill path is unchanged.
 
     Bit-identical to ``cache.reshape(-1, D).at[loc].set(row, mode="drop",
     wrap_negative_indices=False)`` but without the scatter's flat-view
@@ -683,6 +694,12 @@ def paged_write_back(
     if Tp != T:
         row = jnp.pad(row, ((0, Tp - T), (0, 0)))
         loc = jnp.pad(loc, ((0, Tp - T),), constant_values=-1)
+    if small_rows_scatter and Tp <= SCATTER_ROWS_MAX:
+        page = jnp.where(loc >= 0, loc // ps, -1)
+        rem = jnp.where(loc >= 0, loc % ps, 0)
+        return cache.at[page, rem // pk, rem % pk].set(
+            row.astype(cache.dtype), mode="drop", wrap_negative_indices=False
+        )
     if r_cap is None:
         r_cap = default_run_capacity(Tp, ps)
     table, n_raw = _build_write_runs(loc, kv_packing=pk, r_cap=r_cap)

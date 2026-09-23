@@ -779,7 +779,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             row = row.at[:, kv_lora_rank : kv_lora_rank + rope].set(
                 kpe_.reshape(t, rope).astype(cache_.dtype)
             )
-            return paged_write_back(cache_, row, loc, page_size=page_size)
+            return paged_write_back(cache_, row, loc, page_size=page_size, small_rows_scatter=True)
 
         return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(
             kvc, kpe, cache, md.seq_lens, md.cu_q_lens, md.cu_kv_lens, md.page_indices
