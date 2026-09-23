@@ -318,8 +318,10 @@ and cache capacities as the server. For example, export prefill and decode into
 --aot-model-dir /models/aot
 ```
 
-to the corresponding `python -m sgl_jax.launch_server` command. The directory is
-searched recursively. Configure `--precompile-token-paddings` and
+to the corresponding `python -m sgl_jax.launch_server` command. Stage each
+bucket's `executable.bin` and `executable.json` in a local subdirectory before
+starting the server to keep artifact I/O out of warmup. The directory is searched
+recursively. Configure `--precompile-token-paddings` and
 `--precompile-bs-paddings` to match the exported buckets. An unseen or incompatible
 model forward fails with a mismatch diagnostic; it does not silently compile.
 Omit `--aot-model-dir` to use normal serving compilation.
