@@ -1,28 +1,11 @@
-"""Abstract serving cache layouts and attention metadata for offline forwards."""
+"""Serving backend and abstract cache factories for offline forwards."""
 
 from types import SimpleNamespace
 
-import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax.sharding import NamedSharding
-from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.model_config import AttentionArch
-from sgl_jax.srt.layers.attention.flashattention_backend import (
-    FlashAttention,
-    FlashAttentionMetadata,
-)
-from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
-    HybridLinearAttnBackend,
-    HybridLinearAttnBackendMetadata,
-    LinearRecurrentAttnBackendMetadata,
-)
-from sgl_jax.srt.layers.attention.mla_backend import (
-    MLAAttentionBackend,
-    MLAAttentionMetadata,
-)
-from sgl_jax.srt.layers.attention.native_backend import NativeAttention
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
 from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
@@ -82,44 +65,9 @@ class _ResourceContext(ModelRunnerKVCacheMixin):
         return self.model_config.num_hidden_layers
 
 
-def _decode_metadata(backend, options, mesh):
-    def vector(length, dtype=jnp.int32):
-        return jax.ShapeDtypeStruct((length,), dtype, sharding=NamedSharding(mesh, P("data")))
-
-    bs, dp = options.batch_size, options.dp_size
-    if isinstance(backend, HybridLinearAttnBackend):
-        return HybridLinearAttnBackendMetadata(
-            full_attn_metadata=_decode_metadata(backend.full_attn_backend, options, mesh),
-            linear_attn_metadata=LinearRecurrentAttnBackendMetadata(
-                cu_q_lens=vector(bs + dp),
-                recurrent_indices=vector(bs),
-                has_initial_state=vector(bs, jnp.bool_),
-            ),
-        )
-    if isinstance(backend, NativeAttention):
-        return None
-    pages = bs * -(-options.context_length // options.page_size)
-    kwargs = {
-        "cu_q_lens": vector(bs + dp),
-        "cu_kv_lens": vector(bs + dp),
-        "page_indices": vector(pages),
-        "seq_lens": vector(bs),
-        "distribution": vector(3 * dp),
-    }
-    if isinstance(backend, FlashAttention):
-        return FlashAttentionMetadata(**kwargs, swa_page_indices=vector(pages))
-    if isinstance(backend, MLAAttentionBackend):
-        return MLAAttentionMetadata(**kwargs)
-    raise ValueError(f"No offline decode metadata constructor for backend {type(backend).__name__}")
-
-
 def build_resources(model_config, model, options, mesh):
     context = _ResourceContext(model_config, model, options, mesh)
     backend = context.attn_backend
-    if options.workload != "decode" and not isinstance(backend, FlashAttention):
-        raise ValueError(
-            "Speculative export requires the FlashAttention speculative metadata interface"
-        )
     pool = context._create_token_to_kv_pool(options.dp_size, abstract=True)
     recurrent_pool = None
     if context.linear_recurrent_config is not None:
@@ -140,5 +88,4 @@ def build_resources(model_config, model, options, mesh):
         )
     elif options.recurrent_capacity is not None:
         raise ValueError("recurrent_capacity requires a recurrent-state cache")
-    backend.forward_metadata = _decode_metadata(backend, options, mesh)
     return backend, MemoryPools(token_to_kv_pool=pool, recurrent_state_pool=recurrent_pool)

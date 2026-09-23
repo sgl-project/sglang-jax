@@ -8,6 +8,7 @@ import re
 import subprocess
 import time
 import traceback
+from dataclasses import asdict
 from pathlib import Path
 
 import jax
@@ -130,7 +131,7 @@ def export(options):
         jax.config.update("jax_enable_compilation_cache", False)
         mesh = build_mesh(options)
         with compilation_target(mesh):
-            fn, args, config = build_inputs(options, mesh)
+            fn, args, config, workload = build_inputs(options, mesh)
             manifest["model_config"] = config.to_dict()
             manifest["model_config"]["model_type"] = config.model_type
             if options.model_config:
@@ -138,7 +139,9 @@ def export(options):
                 (output / "source_config.json").write_bytes(original)
                 manifest["source_config_sha256"] = hashlib.sha256(original).hexdigest()
             manifest["workload"] = {
-                "name": options.workload,
+                **asdict(workload),
+                "requests_per_dp": workload.request_count // workload.dp_size,
+                "input_tokens_per_dp": workload.input_token_count // workload.dp_size,
                 "model_class": config.architectures[0] if config.architectures else None,
                 "model_type": config.model_type,
                 "num_hidden_layers": config.num_hidden_layers,
@@ -147,11 +150,6 @@ def export(options):
                 "attention_tp_size": options.tp_size // options.dp_size,
                 "ep_size": options.ep_size,
                 "weights": "synthetic_bfloat16",
-                "tokens_per_request": options.draft_token_num or 1,
-                "input_token_count": args[3].input_ids.shape[0],
-                "mtp_layer_idx": (
-                    config.mtp_layer_idx if options.workload.startswith("mtp-draft") else None
-                ),
             }
             manifest["input_signature"] = _array_signature(args[2:])
             manifest["target_devices"] = [str(device) for device in mesh.devices.flat]

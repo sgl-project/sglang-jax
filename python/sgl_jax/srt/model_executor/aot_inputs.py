@@ -5,25 +5,17 @@ import tempfile
 from pathlib import Path
 
 import jax
-import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import NamedSharding
-from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.layers.logits_processor import LogitsMetadata
 from sgl_jax.srt.model_executor.aot_resources import build_resources
-from sgl_jax.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sgl_jax.srt.model_executor.aot_workloads import InputContext, get_input_builder
 from sgl_jax.srt.model_executor.model_forward import make_jitted_run_model
 from sgl_jax.srt.model_loader.loader import get_model_loader
-from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 
 
@@ -120,11 +112,8 @@ def load_config(options, model_path, *, is_draft=False):
     model_config.configure_for_tensor_parallel(attention_tp)
     if options.context_length > model_config.context_len:
         raise ValueError("context_length exceeds the model's context limit")
-    if options.moe_backend == "fused_v2":
-        if options.ep_size != options.tp_size:
-            raise ValueError("fused_v2 requires ep_size=tp_size")
-        if options.batch_size * (options.draft_token_num or 1) % options.ep_size:
-            raise ValueError("fused_v2 requires the input token count divisible by ep_size")
+    if options.moe_backend == "fused_v2" and options.ep_size != options.tp_size:
+        raise ValueError("fused_v2 requires ep_size=tp_size")
     model_config._abstract_mode = True
     return model_config
 
@@ -148,8 +137,9 @@ def _bind_concrete_sharding(value, mesh):
 
 
 def build_inputs(options, mesh):
+    builder = get_input_builder(options)
     with tempfile.TemporaryDirectory() as empty_checkpoint, jax.set_mesh(mesh):
-        is_draft = options.workload.startswith("mtp-draft")
+        is_draft = builder.model_role == "draft"
         model_config = load_config(options, empty_checkpoint, is_draft=is_draft)
         loader = get_model_loader(LoadConfig(load_format="dummy"), mesh)
         model = loader.load_model(model_config=model_config)
@@ -168,37 +158,7 @@ def build_inputs(options, mesh):
         model_leaves = [_bind_concrete_sharding(value, mesh) for value in model_leaves]
         backend, memory_pools = build_resources(model_config, model, options, mesh)
 
-    def vector(length):
-        return jax.ShapeDtypeStruct((length,), jnp.int32, sharding=NamedSharding(mesh, P("data")))
-
-    batch_size = options.batch_size
-    padded_context = -(-options.context_length // options.page_size) * options.page_size
-    recurrent_indices = None
-    if memory_pools.recurrent_state_pool is not None:
-        recurrent_indices = backend.linear_attn_backend.forward_metadata.recurrent_indices
-    batch = ForwardBatch(
-        bid=0,
-        forward_mode=ForwardMode.DECODE,
-        batch_size=batch_size,
-        input_ids=vector(batch_size),
-        req_pool_indices=vector(batch_size),
-        seq_lens=vector(batch_size),
-        out_cache_loc=vector(batch_size),
-        positions=vector(batch_size),
-        attn_backend=backend,
-        cache_loc=vector(batch_size * padded_context),
-        recurrent_indices=recurrent_indices,
-        spec_algorithm=SpeculativeAlgorithm.NONE,
-        capture_hidden_mode=CaptureHiddenMode.NULL,
-    )
-    logits = LogitsMetadata(
-        forward_mode=ForwardMode.DECODE,
-        capture_hidden_mode=CaptureHiddenMode.NULL,
-        logits_indices=vector(batch_size),
-    )
-    if options.workload != "decode":
-        from sgl_jax.srt.model_executor.aot_spec_inputs import configure_batch
-
-        configure_batch(model_config.hf_config, options, mesh, batch, logits)
-    args = (model_def, model_state_def, model_leaves, batch, memory_pools, logits)
-    return make_jitted_run_model(backend), args, model_config.hf_config
+    inputs = builder.build(InputContext(model_config, mesh, backend, memory_pools))
+    backend.forward_metadata = inputs.attention_metadata
+    args = (model_def, model_state_def, model_leaves, inputs.batch, memory_pools, inputs.logits)
+    return make_jitted_run_model(backend), args, model_config.hf_config, builder.spec

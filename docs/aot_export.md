@@ -16,8 +16,11 @@ PYTHONPATH=python python -m sgl_jax.compile --help
 ```
 
 Use compatible JAX/jaxlib and libtpu versions. The examples below were checked with
-JAX/jaxlib 0.11.1, Flax 0.12.9, and libtpu 0.0.46.1. The command selects a CPU host
-backend automatically; `--target tpu` selects the compilation target.
+JAX/jaxlib 0.11.1, Flax 0.12.9, and libtpu 0.0.46.1. The compilation target defaults
+to `tpu`. The command sets `JAX_PLATFORMS=cpu` for the host and constructs a
+compile-only TPU mesh from the requested topology. Model tracing, kernel selection,
+and compilation use that TPU target; running on a CPU host does not select CPU
+kernels.
 
 For CPU-target exports, install `python[cpu]` instead and use the CPU command below.
 TPU cross-compilation requires Linux; installing CPU JAX on macOS does not provide
@@ -49,15 +52,17 @@ Choose the amount of compilation to perform:
 For StableHLO only, replace `--stage compiled --dump-llo` in the command with
 `--stage stablehlo`. Keep `--target tpu` when generating IR for TPU optimization.
 
-To try the workflow with a CPU target:
+To explicitly generate CPU IR for a local smoke check:
 
 ```bash
 PYTHONPATH=python python -m sgl_jax.compile \
   --target cpu --stage compiled --output /tmp/qwen3-cpu-ir
 ```
 
-CPU-target IR uses CPU kernel paths. Omit the TPU topology options and `--dump-llo`
-for this command.
+Only the explicit `--target cpu` command above selects CPU kernel paths. It does
+not validate TPU kernels or produce TPU LLO. Omit the TPU topology options and
+`--dump-llo` for this command. For TPU graph analysis, use the default TPU target
+and inspect `options.target`, `target_topology`, and `custom_calls` in the manifest.
 
 ## Use a model configuration
 
@@ -75,10 +80,15 @@ PYTHONPATH=python python -m sgl_jax.compile \
   --stage compiled --dump-llo --output /tmp/model-ir
 ```
 
-If the config contains quantization metadata, add `--bf16-model` to explicitly
-export a synthetic BF16 variant. This preserves the architecture but does not
-reproduce quantized checkpoint computation. The original config is saved as
-`source_config.json`; the effective config is recorded in `manifest.json`.
+The exporter currently constructs synthetic BF16 parameters. If the config
+contains quantization metadata, add `--bf16-model` only when you want a BF16
+variant: it removes that metadata from the effective config, without reading or
+converting checkpoint tensors. Quantized weight and scale construction is not
+yet wired into this abstract loader; this is independent of the compilation
+target. An FP8 graph needs its quantized parameter structure and kernel path, so
+BF16 IR cannot represent its compute or memory requirements. The original config
+is saved as `source_config.json`; the effective config and synthetic weight format
+are recorded in `manifest.json`.
 
 ## Choose a TPU topology and parallelism
 
@@ -145,13 +155,16 @@ per request. `--stage` independently selects how far compilation proceeds.
 | `--workload` | Model inputs and outputs |
 | --- | --- |
 | `decode` | One token per request, target model |
+| `prefill` | A token chunk shared by the requests on each DP rank, target model |
 | `mtp-draft` | One token and one hidden-state row per request, one MTP block |
 | `mtp-draft-extend` | A token/hidden-state block per request plus accepted lengths |
 | `target-verify` | A candidate-token block per request; logits and hidden states for every row |
 
 | Argument | Meaning |
 | --- | --- |
-| `--batch-size` | Number of requests |
+| `--batch-size` | Global request count for this forward, divisible by DP |
+| `--chunked-prefill-size` | Prefill token budget **per DP rank**, shared by that rank's requests; a positive multiple of page size |
+| `--num-tokens` | Global prefill token shape; defaults to `chunked-prefill-size * dp-size` |
 | `--draft-token-num` | Verify/draft-extend tokens per request, including the seed; at least 2 |
 | `--mtp-layer-idx` | MTP weight-set index, starting at 0 |
 | `--context-length` | Total KV context capacity per request, including the current token block; rounded up to a page boundary |
@@ -159,11 +172,41 @@ per request. `--stage` independently selects how far compilation proceeds.
 | `--page-size` | Tokens per KV page |
 | `--recurrent-capacity` | Valid recurrent-state slots for linear attention; defaults to batch size |
 
+For prefill, select the chunk budget independently of the request count:
+
+```bash
+PYTHONPATH=python python -m sgl_jax.compile \
+  --model-config /path/to/config.json \
+  --target tpu --topology v6e-4 --tp-size 4 --attention-backend fa \
+  --workload prefill --batch-size 4 --chunked-prefill-size 4096 \
+  --context-length 8192 --kv-capacity 32768 --page-size 128 \
+  --stage compiled --dump-llo --output /tmp/prefill-ir
+```
+
+With DP=1, these four requests share 4096 input tokens. With DP=2, each rank has
+two request slots and a 4096-token budget, so the default global input shape is
+8192 tokens. Individual extend lengths, prefix lengths, and last-token logits
+indices remain dynamic inputs; requests need not contribute equal token counts.
+The context capacity includes the cached prefix and current chunk, so it can be
+larger than the chunk budget.
+
+Use `--num-tokens` to export a smaller prefill bucket. It selects the exact global
+compiled token shape, must be divisible by DP, and must lie between `batch-size`
+and both `chunked-prefill-size * dp-size` and `batch-size * context-length`.
+Choose the matching serving token bucket when comparing IR; this command does
+not simulate scheduler packing or silently round to another bucket. The manifest
+records the original options and resolved global/per-DP request and token shapes.
+
 For draft/verify exports, use the target model config and `--attention-backend fa`.
 `--draft-token-num` includes the seed token; for example, batch 16 with width 4
 has 64 input positions. These are NEXTN causal-chain forwards (`topk=1`); sampling
 and token acceptance happen outside the exported graph. Export each desired MTP
 weight set separately with `--mtp-layer-idx`.
+
+For example, `--workload target-verify --batch-size 32 --draft-token-num 8` has
+256 input tokens. At DP=4, each rank has eight requests and 64 input tokens.
+Both request count and verification width are retained in the input metadata;
+another workload with the same total token count can have a different graph.
 
 For linear attention, `--recurrent-capacity` must cover the batch and be divisible
 by DP. Recurrent states default to FP32 and convolution states to BF16, following
