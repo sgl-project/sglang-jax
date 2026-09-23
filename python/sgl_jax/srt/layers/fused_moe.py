@@ -232,12 +232,12 @@ class FusedEPMoE(nnx.Module):
         )
         with mesh_context:
             if is_static:
-                if abstract:
-                    names = ["w1", "w3", "w2"]
-                    if self.num_shared_experts > 0:
-                        names += ["w1_shared", "w3_shared", "w2_shared"]
-                    for name in names:
-                        param = getattr(self, name)
+                names = ["w1", "w3", "w2"]
+                if self.num_shared_experts > 0:
+                    names += ["w1_shared", "w3_shared", "w2_shared"]
+                for name in names:
+                    param = getattr(self, name)
+                    if isinstance(param.value, jax.ShapeDtypeStruct):
                         param.value = jax.ShapeDtypeStruct(
                             param.value.shape, self.quantized_dtype, sharding=param.value.sharding
                         )

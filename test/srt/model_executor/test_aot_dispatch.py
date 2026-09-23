@@ -1,8 +1,11 @@
 """Unit tests for AotDispatcher (CPU)."""
 
 import os
+import tempfile
 import unittest
 from functools import partial
+from pathlib import Path
+from unittest.mock import patch
 
 os.environ["SGLANG_JAX_AOT_DISPATCH"] = "1"  # force-on regardless of arg count
 
@@ -48,6 +51,58 @@ class TestAotDispatcher(unittest.TestCase):
             self.assertEqual(result.dtype, expected.dtype)
             np.testing.assert_array_equal(np.asarray(result), np.asarray(expected))
 
+    def test_saved_executable_shares_dispatch_cache_without_compiling(self):
+        from sgl_jax.srt.model_executor.aot_executable import ExecutableStore
+        from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
+
+        @partial(jax.jit, static_argnums=(1,), donate_argnums=(3,))
+        def f(weights, scale, batch, pool, unused):
+            return {"output": weights["w"] * scale + batch, "pool": pool + 1}
+
+        mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), ("x",))
+        weights = {"unused": jnp.zeros(3), "w": jnp.arange(4.0)}
+        batch = jnp.ones(4)
+        unused = jnp.zeros(7)
+        pools = [jnp.zeros(4) for _ in range(3)]
+        lowered = f.lower(weights, 2, batch, pools[0], unused)
+        with tempfile.TemporaryDirectory() as directory:
+            CompilationManager.get_executable(lowered, mesh, output=Path(directory))
+            store = ExecutableStore(directory, mesh)
+            dispatcher = AotDispatcher(
+                f,
+                stable_call_args=(weights, 2),
+                stable_flat_args=(weights,),
+                name="offline",
+                executable_store=store,
+            )
+            # Explicit loading works with optional fast dispatch disabled too.
+            with (
+                patch("sgl_jax.srt.model_executor.aot_dispatch._ENV", "0"),
+                patch(
+                    "jax._src.compiler.backend_compile_and_load",
+                    side_effect=AssertionError,
+                ),
+                patch.object(store, "load", wraps=store.load) as load,
+            ):
+                for pool in pools:
+                    result = dispatcher(batch, pool, unused)
+                    np.testing.assert_array_equal(result["output"], np.arange(4.0) * 2 + 1)
+                    np.testing.assert_array_equal(result["pool"], np.ones(4))
+                self.assertEqual(load.call_count, 1)
+                self.assertEqual(len(dispatcher._cache), 1)
+                with patch("sgl_jax.srt.model_executor.aot_dispatch._ENV", "1"):
+                    dispatcher.invalidate()
+                    for _ in range(2):
+                        result = dispatcher(batch, result["pool"], unused)
+                        np.testing.assert_array_equal(result["output"], np.arange(4.0) * 2 + 1)
+                self.assertEqual(load.call_count, 2)
+                # A distinct model/static value must never fall back to compilation.
+                incompatible = AotDispatcher(
+                    f, (weights, 3), (weights,), "mismatch", executable_store=store
+                )
+                with self.assertRaisesRegex(ValueError, "No matching AOT"):
+                    incompatible(batch, result["pool"], unused)
+
     def _make(self):
         @partial(jax.jit, static_argnames=["state_def", "flag"], donate_argnames=["pool"])
         def f(weights_def, state_def, leaves, flag, batch, pool, meta):
@@ -63,7 +118,10 @@ class TestAotDispatcher(unittest.TestCase):
             stable_flat_args=(weights_def, leaves),
             name="test",
         )
-        ref = lambda batch, pool, meta: f(weights_def, "STATE", leaves, True, batch, pool, meta)
+
+        def ref(batch, pool, meta):
+            return f(weights_def, "STATE", leaves, True, batch, pool, meta)
+
         return disp, ref
 
     def test_matches_checked_path_across_calls(self):

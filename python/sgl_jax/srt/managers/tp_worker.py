@@ -147,85 +147,17 @@ class ModelWorker:
         # Profile number of tokens
         self.max_total_num_tokens = self.model_runner.max_total_num_tokens
 
-        # Calculate max_running_requests from different constraints
-        attn_backend_limit = (
-            self.model_runner.attn_backend.get_max_running_reqests(
-                self.model_config.context_len,
-                self.page_size,
-            )
-            * self.dp_size
-        )
-        server_limit = (
-            self.max_total_num_tokens // 2
-            if server_args.max_running_requests is None
-            else server_args.max_running_requests
-        )
-        pool_limit = self.model_runner.req_to_token_pool.size
-        constraints = [server_limit, pool_limit, attn_backend_limit]
-        self.max_running_requests = min(constraints)
-        # Log each constraint for debugging
-        logger.info("Max running requests constraints:")
-        logger.info(
-            "  - Server limit: %s %s",
-            server_limit,
-            (
-                "(max_total_tokens//2)"
-                if server_args.max_running_requests is None
-                else "(configured)"
-            ),
-        )
-        logger.info("  - Token pool size: %s", pool_limit)
-        logger.info(
-            "  - Attention backend: %s (context_len=%s, page_size=%s)",
-            attn_backend_limit,
+        from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
+
+        effective_moe_backend = self.model_config.moe_backend.value
+        self.max_running_requests = CompilationManager.resolve_max_running_requests(
+            server_args,
             self.model_config.context_len,
-            self.page_size,
+            self.model_runner.attn_backend,
+            self.max_total_num_tokens,
+            self.model_runner.req_to_token_pool.size,
+            effective_moe_backend,
         )
-        logger.info("  → Final max_running_requests: %s", self.max_running_requests)
-
-        # Validate and adjust max_running_requests for Data Parallelism
-        dp_size = server_args.dp_size
-        if self.max_running_requests < dp_size:
-            raise ValueError(
-                f"max_running_requests ({self.max_running_requests}) is less than dp_size ({dp_size}). "
-                f"Please increase memory allocation or reduce dp_size."
-            )
-        if self.max_running_requests % dp_size != 0:
-            original_value = self.max_running_requests
-            self.max_running_requests = (self.max_running_requests // dp_size) * dp_size
-            logger.warning(
-                "Adjusted max_running_requests from %s to %s to be divisible by dp_size (%s)",
-                original_value,
-                self.max_running_requests,
-                dp_size,
-            )
-
-        # fused_ep_moe derives its EP group from the mesh (get_ep_size(mesh) =
-        # mesh['data'] * mesh['tensor']), not from --ep-size, so align against
-        # the actual mesh shape. Use the *resolved* backend from ModelConfig so
-        # architectures that hard-code FusedEPMoE (e.g. Qwen3.5 MoE) are
-        # covered even when the raw server_args string stays at "epmoe".
-        effective_moe_backend = self.model_runner.model_config.moe_backend.value
-        mesh_ep_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
-        if effective_moe_backend in ("fused", "fused_v2") and mesh_ep_size > 1:
-            from sgl_jax.srt.utils.common_utils import align_bs_for_fused_ep
-
-            assert mesh_ep_size % dp_size == 0, (
-                f"fused MoE requires mesh_ep_size ({mesh_ep_size}) to be a multiple "
-                f"of dp_size ({dp_size}) so the ep-aligned cap stays dp-aligned"
-            )
-            aligned = align_bs_for_fused_ep(self.max_running_requests, mesh_ep_size)
-            if aligned != self.max_running_requests:
-                logger.warning(
-                    "Adjusted max_running_requests from %s to %s for fused MoE "
-                    "(mesh_ep_size=%s, bt must be in {2,4,8k})",
-                    self.max_running_requests,
-                    aligned,
-                    mesh_ep_size,
-                )
-                self.max_running_requests = aligned
-
-        assert self.max_running_requests > 0, "max_running_request is zero"
 
         # Same-shape dummy for callers without a real future map (precompile,
         # non-overlap) so the fused jit variant matches the overlap-thread shape.
@@ -354,31 +286,9 @@ class ModelWorker:
         )
 
     def get_max_padded_size(self):
-        """Calculate the max padded batch size and token nums.
+        from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
 
-        Returns:
-            tuple: (max_padded_batch_size, max_padded_num_tokens)
-                - max_padded_batch_size: Maximum batch size, constrained by max_running_requests
-                - max_padded_num_tokens: Maximum tokens for all DP ranks (multiplied by dp_size for prefill)
-        """
-        # Use chunked prefill size if enabled (> 0), otherwise use max prefill tokens
-        # Take minimum with max_prefill_tokens as upper bound
-        per_dp_num_tokens = self.max_prefill_tokens
-        if self.chunked_prefill_size > 0 and per_dp_num_tokens > self.chunked_prefill_size:
-            per_dp_num_tokens = self.chunked_prefill_size
-
-        # For prefill, total tokens = per_dp_tokens * dp_size
-        max_padded_num_tokens = per_dp_num_tokens * self.dp_size
-
-        # Batch size is constrained by both max_running_requests and available tokens divide by page_size
-        max_padded_batch_size = min(self.max_running_requests, max_padded_num_tokens)
-
-        assert max_padded_batch_size % self.dp_size == 0, (
-            "max_padded_batch_size must be divisible by dp_size, "
-            f"but got max_padded_batch_size={max_padded_batch_size}, dp_size={self.dp_size}"
-        )
-
-        return max_padded_batch_size, max_padded_num_tokens
+        return CompilationManager.get_max_padded_size(self.server_args, self.max_running_requests)
 
     def get_precompile_paddings(self):
         return (

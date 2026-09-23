@@ -204,7 +204,7 @@ larger than the chunk budget.
 
 Use `--num-tokens` to export a smaller prefill bucket. It selects the exact global
 compiled token shape, must be divisible by DP, and must lie between `batch-size`
-and both `chunked-prefill-size * dp-size` and `batch-size * context-length`.
+and `chunked-prefill-size * dp-size`. Padded positions do not consume KV slots.
 Choose the matching serving token bucket when comparing IR; this command does
 not simulate scheduler packing or silently round to another bucket. The manifest
 records the original options and resolved global/per-DP request and token shapes.
@@ -276,7 +276,8 @@ settings still select their debug implementations in kernels that honor them.
 Start with `manifest.json` and check for `status: complete` and the requested stages.
 For LLO inspection, look for `*-final_bundles.txt`; intermediate pass snapshots are
 also retained. Static memory reports describe compiler allocations, not measured
-runtime memory peaks. The output contains compiler IR, not a serialized executable.
+runtime memory peaks. By default the output contains compiler IR. Add `--save-executable` to also
+retain a serialized executable.
 
 Inspect `custom_calls` in the manifest to check which kernels actually reached
 optimized HLO. Each entry records a custom-call target, HLO instruction, and source
@@ -308,23 +309,67 @@ tar -czf /tmp/model-ir.tar.gz -C /tmp model-ir
 
 ## Run an offline executable in serving
 
-Add `--save-executable` to a compiled export to also write `executable.bin` and
-`executable.json`. Export each serving workload and shape bucket into its own
-subdirectory, using the same model, quantization, backends, parallelism, page size,
-and cache capacities as the server. For example, export prefill and decode into
-`/models/aot/prefill-128` and `/models/aot/decode-8`, then add:
+Use the serving entrypoint to compile its complete prefill/decode bucket plan on
+CPU, save the executables, and exit. Pass the same model and execution options as
+serving, plus an output directory and target topology:
 
 ```bash
---aot-model-dir /models/aot
+python -m sgl_jax.launch_server \
+  --model-path /models/my-model \
+  --tp-size 8 --attention-backend fa --dtype bfloat16 \
+  --page-size 128 --context-length 8192 \
+  --max-total-tokens 32768 --max-running-requests 32 \
+  --save-aot /tmp/model-aot --aot-topology v7x-8
 ```
 
-to the corresponding `python -m sgl_jax.launch_server` command. Stage each
-bucket's `executable.bin` and `executable.json` in a local subdirectory before
-starting the server to keep artifact I/O out of warmup. The directory is searched
-recursively. Configure `--precompile-token-paddings` and
-`--precompile-bs-paddings` to match the exported buckets. An unseen or incompatible
-model forward fails with a mismatch diagnostic; it does not silently compile.
-Omit `--aot-model-dir` to use normal serving compilation.
+This command loads configuration files and builds abstract weights and caches.
+It does not read checkpoint tensors, initialize physical TPUs, start an HTTP
+server, or run inference. A local directory containing `config.json` can be used
+for compilation; include configuration Python files and `--trust-remote-code`
+when required by the model. The model is constructed once and reused for every bucket.
+
+Omit `--precompile-token-paddings`, `--precompile-bs-paddings`, and
+`--chunked-prefill-size` to use serving's defaults. If you normally override these
+options, use the same overrides for export and serving. For example,
+`--chunked-prefill-size 2048 --precompile-token-paddings 128 512 2048
+--precompile-bs-paddings 1 8 32` selects those buckets, with serving's usual
+capacity filtering and inclusion of the maximum bucket. No `--workload` or shell
+loop is needed.
+
+Set `--max-total-tokens` explicitly: serving normally derives this capacity from
+available TPU memory, which the CPU host cannot query. This serving option is a
+**per-DP-rank** cap; the single-graph compiler's `--kv-capacity` is global. Linear
+attention also needs a fixed `--max-recurrent-state-size`, unless it follows from
+`--disable-radix-cache --max-running-requests`. The export uses serving's cache
+alignment, SWA capacity split, recurrent-state constraints, and parallelism rules.
+
+The output contains `serving.json` with the resolved bucket plan, plus one
+subdirectory per bucket containing `executable.bin` and `executable.json`. Copy
+the complete directory onto the TPU host's local disk. Then replace the two
+export options with `--aot-model-dir`:
+
+```bash
+python -m sgl_jax.launch_server \
+  --model-path /models/my-model \
+  --tp-size 8 --attention-backend fa --dtype bfloat16 \
+  --page-size 128 --context-length 8192 \
+  --max-total-tokens 32768 --max-running-requests 32 \
+  --aot-model-dir /models/model-aot
+```
+
+The runtime model path must include real weights (and tokenizer files when
+used). Unspecified cache/request capacities are restored from `serving.json`;
+explicit values remain unchanged and must match the exported program. Both
+processes must use the same quantization and model options. For example, add
+`--quantization-config-path fp8_w8a8.yaml` to both commands for online FP8.
+
+Automatic bucket export follows the regular prefill/decode warmup plan. For
+individual workload/IR inspection or speculative draft/verify forwards,
+`sgl_jax.compile --stage compiled --save-executable` remains available. Put each workload and shape in a separate
+subdirectory and point `--aot-model-dir` at their parent. This also keeps the
+individual draft/verify export workflow available. The loader searches recursively.
+An unseen or incompatible model forward fails with a mismatch diagnostic; it does
+not silently compile. Omit `--aot-model-dir` to use normal serving compilation.
 
 The server still loads real weights and creates its caches. For each new input
 signature, it traces and lowers the real serving forward, checks the canonical

@@ -168,35 +168,3 @@ class ExecutableStore:
         )
         logger.info("[aot-model] loaded %s in %.3fs", directory, time.monotonic() - started)
         return compiled
-
-
-class AotModelForward:
-    """Serving adapter for the shared forward, with one load per input signature."""
-
-    def __init__(self, jit_fn, store, compiler_options=None):
-        self.jit_fn = jit_fn
-        self.store = store
-        self.compiler_options = compiler_options or {}
-        self._cache = {}
-
-    def __call__(self, model_def, model_state_def, weights, batch, pools, logits):
-        from sgl_jax.srt.model_executor.aot_dispatch import (
-            decode_no_sc_gather_compiler_options_fn,
-        )
-
-        args = (model_def, weights, batch, pools, logits)
-        leaves, tree = jax.tree_util.tree_flatten(args)
-        avals = [jax.typeof(value) for value in leaves]
-        key = (model_state_def, tree, tuple((a.shape, a.dtype, a.weak_type) for a in avals))
-        entry = self._cache.get(key)
-        if entry is None:
-            options = dict(self.compiler_options)
-            decode_options = decode_no_sc_gather_compiler_options_fn()
-            if decode_options is not None:
-                options.update(decode_options((batch,)) or {})
-            lowered = self.jit_fn.lower(model_def, model_state_def, weights, batch, pools, logits)
-            compiled = self.store.load(lowered, options)
-            entry = (compiled, _kept_inputs(lowered))
-            self._cache[key] = entry
-        compiled, kept = entry
-        return compiled(*(leaves[i] for i in kept))

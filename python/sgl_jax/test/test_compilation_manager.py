@@ -1,4 +1,7 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -307,6 +310,42 @@ class TestBucketComputation(unittest.TestCase):
             vocab_size=32000,
         )
         assert cm.token_buckets == [256, 512, 1024, 131072]
+
+    def test_export_plan_matches_online_warmup(self):
+        for dp_size in (1, 2):
+            cm = CompilationManager(
+                _make_server_args(), 8, 256 * dp_size, dp_size, 8, 128, 255, 256
+            )
+            for mode in (ForwardMode.EXTEND, ForwardMode.DECODE):
+                batches = _collect_precompile_batches(cm, mode)
+                observed = [(b.real_bs, len(b.input_ids), len(b.cache_loc)) for b in batches]
+                self.assertEqual(list(cm.iter_model_shapes(mode)), observed)
+            self.assertEqual(cm.token_buckets[-1], 256 * dp_size)
+            self.assertEqual(cm.bs_buckets[-1], 8)
+
+    def test_aot_capacity_defaults_and_incomplete_bundle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "serving.json"
+            manifest = dict(
+                status="complete",
+                max_total_tokens=4096,
+                max_running_requests=8,
+                max_recurrent_state_size=None,
+            )
+            path.write_text(json.dumps(manifest))
+            args = SimpleNamespace(
+                aot_model_dir=directory,
+                max_total_tokens=None,
+                max_running_requests=4,
+                max_recurrent_state_size=None,
+            )
+            CompilationManager.restore_aot_defaults(args)
+            self.assertEqual(args.max_total_tokens, 4096)
+            self.assertEqual(args.max_running_requests, 4)
+            manifest["status"] = "failed"
+            path.write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, "incomplete"):
+                CompilationManager.restore_aot_defaults(args)
 
 
 class TestLazyCompilation(unittest.TestCase):

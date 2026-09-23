@@ -8,30 +8,34 @@ import sys
 from pathlib import Path
 
 
+def add_topology_args(parser, prefix=""):
+    topology = parser.add_mutually_exclusive_group()
+    topology.add_argument(
+        f"--{prefix}topology",
+        choices=tuple(f"v6e-{n}" for n in (1, 4, 8, 16, 32, 64))
+        + tuple(f"v7x-{n}" for n in (8, 16, 32, 64)),
+        help="TPU topology preset; the suffix counts JAX devices, not chips",
+    )
+    topology.add_argument(
+        f"--{prefix}topology-name",
+        help="Raw libtpu topology name (e.g. TPU7x:2x2x1); requires --host-bounds",
+    )
+    parser.add_argument(
+        f"--{prefix}host-bounds",
+        type=int,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        help="Chips per host along each physical axis; overrides the preset's host bounds",
+    )
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Offline AOT compiler IR export (StableHLO, optimized HLO, and TPU LLO)"
     )
     parser.add_argument("--model-config", help="Local config.json; omitted: built-in tiny Qwen3")
     parser.add_argument("--target", choices=("cpu", "tpu"), default="tpu")
-    topology = parser.add_mutually_exclusive_group()
-    topology.add_argument(
-        "--topology",
-        choices=tuple(f"v6e-{n}" for n in (1, 4, 8, 16, 32, 64))
-        + tuple(f"v7x-{n}" for n in (8, 16, 32, 64)),
-        help="TPU topology preset; the suffix counts JAX devices, not chips",
-    )
-    topology.add_argument(
-        "--topology-name",
-        help="Raw libtpu topology name (e.g. TPU7x:2x2x1); requires --host-bounds",
-    )
-    parser.add_argument(
-        "--host-bounds",
-        type=int,
-        nargs=3,
-        metavar=("X", "Y", "Z"),
-        help="Chips per host along each physical axis; overrides the preset's host bounds",
-    )
+    add_topology_args(parser)
     parser.add_argument("--tp-size", type=int, default=1, help="Total devices, as in serving")
     parser.add_argument(
         "--dp-size", type=int, default=1, help="Attention DP; attention TP=tp_size/dp_size"
