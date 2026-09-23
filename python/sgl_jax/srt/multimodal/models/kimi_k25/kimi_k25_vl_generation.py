@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import functools
 import logging
 from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import nnx
 
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -15,10 +13,16 @@ from sgl_jax.srt.models.deepseek_v3 import DeepseekV3ForCausalLM
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
 from sgl_jax.srt.multimodal.configs.kimi.kimi_k25_config import KimiK25ModelVitConfig
 from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
+from sgl_jax.srt.multimodal.in_model.lane_packing import (
+    encoder_num_lanes,
+    run_mrope_vision_model,
+)
+from sgl_jax.srt.multimodal.layers.vision_sharding import resolve_encoder_tp
 from sgl_jax.srt.multimodal.models.kimi_k25.kimi_k25_vit import (
     Kimi_K25_VisionModel,
     create_kimi_vision_weight_mappings,
 )
+from sgl_jax.srt.utils.common_utils import resolve_vision_patch_buckets
 from sgl_jax.srt.utils.weight_utils import WeightLoader
 
 logger = logging.getLogger(__name__)
@@ -59,13 +63,25 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM, InModelMultimodalCo
         self.hf_weight_prefix = "language_model."
 
         self.vision_config = KimiK25ModelVitConfig()
+        # Head-parallel encoder. Lane packing makes the data-parallel mode
+        # representable too, but it is left off until validated on hardware.
+        # resolve_encoder_tp returns False on meshes without a usable tensor
+        # axis, where the tower simply stays replicated.
+        vision_tp = resolve_encoder_tp(self.mesh, "tp") if self.mesh is not None else False
         self.visual = Kimi_K25_VisionModel(
             self.vision_config,
             dtype=self.dtype,
             rngs=rngs or nnx.Rngs(0),
             mesh=self.mesh,
+            vision_tp=vision_tp,
         )
-        self._encode_vision_fn: Callable | None = None
+        # Lane-packing compile buckets. _bucket_capacity silently skips buckets
+        # that are not a multiple of the merge unit, so filter them out here to
+        # keep the effective bucket list explicit.
+        merge_unit = self.visual.merge_unit
+        self.vision_buckets = tuple(
+            bucket for bucket in resolve_vision_patch_buckets(None) if bucket % merge_unit == 0
+        )
 
     def get_input_embeddings(self) -> Callable[[jax.Array], jax.Array]:
         return self.model.embed_tokens
@@ -85,104 +101,27 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM, InModelMultimodalCo
     def encode_vision_items(self, items: list[MultimodalDataItem]) -> jax.Array:
         """Encode media items into one item-ordered [tokens, hidden] array.
 
-        Row i of the result is the i-th visual token in item order, which
-        is exactly what host_orchestration._gather_merge expects. The tower's
-        temporal pooling means each item contributes h*w/merge_area rows
-        regardless of its frame count.
+        Runs through the shared lane-packing orchestrator, which balances items
+        over the encoder lanes, pads to a compile bucket, runs the tower, and
+        restores item order. Kimi declares its own output length via
+        ``Kimi_K25_VisionModel.vision_output_length`` because ``sd2_tpool``
+        pools the temporal axis away.
         """
         if not items:
             return jnp.zeros((0, self.vision_config.text_hidden_size), dtype=self.dtype)
 
-        grids, features = self._collect_grids_and_features(items)
-        pixel_values = np.concatenate(features, axis=0)
-
-        encode = self._ensure_encoder()
-        (
-            rope_freqs_cis,
-            cu_seqlens,
-            abs_pos_embs,
-            merge_indices,
-            merge_weights,
-        ) = self.visual.vision_tower.compute_aux_arrays(grids)
-
-        return encode(
-            pixel_values.astype(self.dtype),
-            abs_pos_embs,
-            rope_freqs_cis,
-            cu_seqlens,
-            merge_indices,
-            merge_weights,
+        specs = self.visual.vision_tower.specs
+        return run_mrope_vision_model(
+            self.visual,
+            items,
+            mesh=self.mesh,
+            num_lanes=encoder_num_lanes(self.mesh, self.visual.vision_tower.vision_tp),
+            buckets=self.vision_buckets,
+            merge_unit=self.visual.merge_unit,
+            rope_type="rope_2d",
+            input_sharding=specs.sharding(specs.batch_axis),
+            output_sharding=specs.sharding(),
         )
-
-    @staticmethod
-    def _collect_grids_and_features(
-        items: list[MultimodalDataItem],
-    ) -> tuple[tuple[tuple[int, int, int], ...], list[np.ndarray]]:
-        grids: list[tuple[int, int, int]] = []
-        features: list[np.ndarray] = []
-        for item in items:
-            grid = item.get("image_grid_thw")
-            if grid is None:
-                raise ValueError("Kimi-K2.5 multimodal item is missing image_grid_thw.")
-            grid_rows = np.asarray(grid, dtype=np.int32).reshape(-1, 3)
-            if grid_rows.shape[0] != 1:
-                raise ValueError(
-                    "Kimi-K2.5 expects exactly one grid per multimodal item, got "
-                    f"{grid_rows.shape[0]}. The processor must split media per grid."
-                )
-            feature = np.asarray(item.feature)
-            expected = int(grid_rows[0].prod())
-            if feature.shape[0] != expected:
-                raise ValueError(
-                    "Kimi-K2.5 item feature rows do not match its grid: "
-                    f"{feature.shape[0]} != {expected}."
-                )
-            grids.append(tuple(int(value) for value in grid_rows[0]))
-            features.append(feature)
-        return tuple(grids), features
-
-    def _ensure_encoder(self) -> Callable:
-        """Build the jitted tower + projector, once.
-
-        nnx.split captures parameter values, so this cannot run before
-        load_weights -- which is why load_weights calls it at the end.
-        The guard makes the per-request call a no-op.
-        """
-        if self._encode_vision_fn is not None:
-            return self._encode_vision_fn
-
-        model_def, model_state = nnx.split(self.visual)
-        model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
-
-        def _encode_vision_impl(
-            model_def,
-            model_state_def,
-            model_state_leaves,
-            pixel_values,
-            abs_pos_embs,
-            rope_freqs_cis,
-            cu_seqlens,
-            merge_indices,
-            merge_weights,
-        ):
-            state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
-            visual = nnx.merge(model_def, state)
-            hidden_states = visual.vision_tower.compute_hidden_states(
-                pixel_values,
-                abs_pos_embs,
-                rope_freqs_cis,
-                cu_seqlens,
-                merge_indices,
-                merge_weights,
-            )
-            return visual.mm_projector(hidden_states)
-
-        jitted = jax.jit(_encode_vision_impl, static_argnames=["model_state_def"])
-
-        encode = functools.partial(jitted, model_def, model_state_def, model_state_leaves)
-
-        self._encode_vision_fn = encode
-        return encode
 
     def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(
@@ -203,7 +142,6 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM, InModelMultimodalCo
 
         for layer in self.model.layers:
             layer.self_attn.post_load_weights()
-        self._ensure_encoder()
         logger.info("Kimi K2.5 language model and vision tower weights loaded successfully!")
 
 

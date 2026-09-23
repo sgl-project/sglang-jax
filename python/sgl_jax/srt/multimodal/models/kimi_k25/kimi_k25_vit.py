@@ -2,17 +2,20 @@ import logging
 import math
 
 import jax
-import jax.experimental.pallas as pl
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
+from sgl_jax.srt.multimodal.common.modality_enum import MultimodalDataItem
 from sgl_jax.srt.multimodal.configs.kimi.kimi_k25_config import KimiK25ModelVitConfig
-from sgl_jax.srt.multimodal.kernels.flash_attention import (
-    BlockSizes,
-    SegmentIds,
-    flash_attention,
+from sgl_jax.srt.multimodal.in_model.lane_packing import get_grid_thw
+from sgl_jax.srt.multimodal.layers.attention.flash_attention_backend import (
+    make_vision_attention_backend,
+)
+from sgl_jax.srt.multimodal.layers.vision_sharding import (
+    VisionShardSpecs,
+    apply_data_sharding,
 )
 from sgl_jax.srt.utils.weight_utils import WeightMapping
 
@@ -150,43 +153,6 @@ class KimiK25VisionPatchEmbed(nnx.Module):
         return x
 
 
-def align_to(x, a):
-    return pl.cdiv(x, a) * a
-
-
-# The Pallas kernel's smallest addressable tile along the KV axis.
-_KV_MIN_BLOCK = 128
-
-# Cost of one KV token inside the kernel's VMEM window: the 72-wide heads pad up
-# to a full 128-lane register, the window is f32, and Pallas double-buffers it.
-_KV_WINDOW_BYTES_PER_TOKEN = 128 * 4 * 2
-
-# Q, the output tile and the softmax scratch all have to share VMEM with the KV
-# window, so only a fraction of the 64 MB budget is spent here.
-_KV_WINDOW_BUDGET_BYTES = 8 * 1024 * 1024
-
-
-def _vmem_safe_kv_block(kv_seq_len: int) -> int:
-    """Largest KV block the flash-attention kernel can hold in VMEM.
-
-    The kernel walks the KV axis in kv_seq_len // block_k_major steps, so the
-    block has to divide the sequence exactly, and it must also be a multiple of
-    the kernel's 128-lane minimum. kv_seq_len is returned unchanged when the
-    whole sequence already fits, which keeps short items -- images and brief
-    clips -- on the kernel's single-step fast path.
-    """
-    max_block = _KV_WINDOW_BUDGET_BYTES // _KV_WINDOW_BYTES_PER_TOKEN
-    if kv_seq_len <= max_block:
-        return kv_seq_len
-
-    # Callers align the sequence to 256, so 128 always divides it and the loop
-    # is guaranteed to terminate on a valid block.
-    for block in range(max_block - max_block % _KV_MIN_BLOCK, 0, -_KV_MIN_BLOCK):
-        if kv_seq_len % block == 0:
-            return block
-    return _KV_MIN_BLOCK
-
-
 def apply_2d_rope(x: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
     x_real = x[..., 0::2]
     x_imag = x[..., 1::2]
@@ -202,6 +168,7 @@ class KimiK25VisionAttention(nnx.Module):
         dtype: jnp.dtype,
         mesh: Mesh,
         rngs: nnx.Rngs | None = None,
+        vision_tp: bool = True,
     ):
         assert mesh is not None, "KimiK25VisionAttention requires a sharding Mesh"
         self.mesh = mesh
@@ -209,6 +176,19 @@ class KimiK25VisionAttention(nnx.Module):
         self.num_heads = config.vt_num_attention_heads
         self.head_dim = self.hidden_size // self.num_heads
         self.scale = 1.0 / math.sqrt(self.head_dim)
+        self.specs = VisionShardSpecs(mesh, vision_tp)
+
+        # ``head_tp`` keeps every token on every shard and splits the heads. The
+        # data-parallel alternative shards the token axis instead, which lane
+        # packing now makes representable because a shard holds whole items;
+        # it is left off until it has been validated on hardware.
+        self.attn_backend = make_vision_attention_backend(
+            mesh,
+            sm_scale=self.scale,
+            causal=False,
+            head_tp=vision_tp,
+            use_varlen=True,
+        )
 
         _rngs = rngs or nnx.Rngs(0)
 
@@ -239,77 +219,27 @@ class KimiK25VisionAttention(nnx.Module):
         q = apply_2d_rope(q, cos_emb, sin_emb)
         k = apply_2d_rope(k, cos_emb, sin_emb)
 
-        indices = jnp.arange(sum_seq_len)
-        item_ids = jnp.sum(indices[:, None] >= cu_seqlens[1:][None, :], axis=-1) + 1
-
-        output = self._flash_attention(q, k, v, item_ids)
-
-        return output.reshape(sum_seq_len, D)
-
-    def _flash_attention(
-        self,
-        q: jax.Array,
-        k: jax.Array,
-        v: jax.Array,
-        item_ids: jax.Array,
-    ) -> jax.Array:
-        seq_len = q.shape[0]
-        align_seq_len = align_to(seq_len, 256)
-        pad_len = align_seq_len - seq_len
-
-        if pad_len:
-            padding = ((0, pad_len), (0, 0), (0, 0))
-            q = jnp.pad(q, padding)
-            k = jnp.pad(k, padding)
-            v = jnp.pad(v, padding)
-
-        seg = jnp.pad(item_ids, (0, pad_len))
-        segment_ids = SegmentIds(q=seg[None, :], kv=seg[None, :])
-
-        pad_q = jnp.transpose(q, (1, 0, 2))[None, ...]
-        pad_k = jnp.transpose(k, (1, 0, 2))[None, ...]
-        pad_v = jnp.transpose(v, (1, 0, 2))[None, ...]
-
-        # For any kv_seq_len <= 92800 the kernel forces
-        # block_k_major = block_k = kv_seq_len to reach its single-step fast
-        # path, which asks for a VMEM window of kv_seq_len * 128 lanes * 4 B * 2 buffers.
-        block_sizes = None
-        kv_block = _vmem_safe_kv_block(align_seq_len)
-        if kv_block < align_seq_len:
-            block_sizes = BlockSizes(
-                block_q=min(256, align_seq_len),
-                block_k_major=kv_block,
-                block_k=kv_block,
-                block_b=1,
-            )
-
-        def local_flash_attention(q, k, v, segment_ids):
-            return flash_attention(
-                q,
-                k,
-                v,
-                segment_ids=segment_ids,
-                causal=False,
-                sm_scale=self.scale,
-                block_sizes=block_sizes,
-            )
-
-        in_specs = (
-            jax.sharding.PartitionSpec(None, None, None, None),
-            jax.sharding.PartitionSpec(None, None, None, None),
-            jax.sharding.PartitionSpec(None, None, None, None),
-            jax.sharding.PartitionSpec(),
+        # The backend's shard_map declares P(batch_axis, head_axis, None); an
+        # explicit-axis mesh rejects replicated inputs against that spec, so the
+        # layout is stated here rather than inferred.
+        qkv_spec = PartitionSpec(self.specs.batch_axis, self.specs.tensor_axis, None)
+        q = apply_data_sharding(q, self.mesh, qkv_spec)
+        k = apply_data_sharding(k, self.mesh, qkv_spec)
+        v = apply_data_sharding(v, self.mesh, qkv_spec)
+        cu_seqlens = apply_data_sharding(
+            cu_seqlens, self.mesh, PartitionSpec(self.specs.batch_axis)
         )
 
-        output = jax.shard_map(
-            local_flash_attention,
-            mesh=self.mesh,
-            in_specs=in_specs,
-            out_specs=jax.sharding.PartitionSpec(None, None, None, None),
-            check_vma=False,
-        )(pad_q, pad_k, pad_v, segment_ids)
+        # The varlen kernel consumes cumulative lengths directly, so the dense
+        # kernel's per-token segment ids are no longer built here.
+        output = self.attn_backend(q, k, v, cu_seqlens)
 
-        return jnp.transpose(output[0], (1, 0, 2))[:seq_len, :, :]
+        # Head sharding is internal to the attention step. Downstream ops -- in
+        # particular the temporal-merge gather -- cannot infer an output sharding
+        # from a partitioned operand, so the layout is collapsed back here.
+        output = apply_data_sharding(output, self.mesh, PartitionSpec())
+
+        return output.reshape(sum_seq_len, D)
 
 
 class KimiK25VisionMLP(nnx.Module):
@@ -355,10 +285,11 @@ class KimiK25VisionBlock(nnx.Module):
         mesh: Mesh | None = None,
         norm_eps: float = 1e-6,
         rngs: nnx.Rngs | None = None,
+        vision_tp: bool = True,
     ):
         assert mesh is not None, "KimiK25VisionBlock requires a sharding Mesh"
 
-        self.attn = KimiK25VisionAttention(config, dtype, mesh, rngs)
+        self.attn = KimiK25VisionAttention(config, dtype, mesh, rngs, vision_tp)
         self.mlp = KimiK25VisionMLP(config, dtype, rngs)
 
         _rngs = rngs or nnx.Rngs(0)
@@ -408,6 +339,7 @@ class VisionTowerEncoder(nnx.Module):
         mesh: Mesh | None = None,
         rngs: nnx.Rngs | None = None,
         video_attn_type: str = "spatial_temporal",
+        vision_tp: bool = True,
     ):
         self.config = config
         self.dtype = dtype
@@ -423,6 +355,7 @@ class VisionTowerEncoder(nnx.Module):
                     dtype=dtype,
                     rngs=rngs,
                     mesh=mesh,
+                    vision_tp=vision_tp,
                 )
                 for _ in range(config.vt_num_hidden_layers)
             ]
@@ -451,72 +384,75 @@ class VisionTowerEncoder(nnx.Module):
         return hidden_states
 
 
-def build_temporal_merge_plan(
+def build_lane_merge_plan(
     grid_thws,
     merge_kernel_size,
+    *,
+    base_offset: int,
+    output_cap: int,
+    max_t: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Plan the sd2_tpool merge for a batch of image and/or video items.
+    """Lane-local sd2_tpool merge plan, padded to a fixed ``output_cap``.
 
-    The merger groups merge_h * merge_w neighboring patches and averages over
-    the temporal axis. Items in a batch can have different frame counts (an image
-    has t == 1, a video has t > 1), so the temporal axis is padded to the
-    batch-wide maximum with duplicated, zero-weighted slots. That keeps a single
-    static-shaped gather for the whole batch while leaving each item's mean exact,
-    including when t does not divide max_t.
+    The merger groups ``merge_h * merge_w`` neighbouring patches and averages
+    over the temporal axis, so a ``t``-frame item collapses to the same token
+    count as a single frame.
 
-    Args:
-        grid_thws: Sequence of (t, h, w) patch grids, one per item, matching
-            the order of the flattened patch sequence.
-        merge_kernel_size: (merge_h, merge_w) spatial merge kernel.
+    Three properties are required by ``lane_packing``:
 
-    Returns:
-        merge_indices shaped [num_output_tokens, merge_h * merge_w, max_t]
-        with indices into the flat patch sequence, and merge_weights shaped
-        [num_output_tokens, max_t] holding 1 / t for real frames and 0 for
-        padded slots.
+    * Patch indices are offset by ``base_offset`` (``lane_index * capacity``)
+      because the encoder sees one flat ``[num_lanes * capacity, hidden]``
+      buffer rather than a dense per-batch concatenation.
+    * Exactly ``output_cap`` rows are emitted so every lane has the same shape
+      and the lanes can be concatenated. Padding rows gather index
+      ``base_offset`` with weight 0, so they stay in bounds and contribute
+      nothing; ``restore_encoder_output`` discards them.
+    * ``max_t`` is supplied by the caller rather than derived, so that lanes
+      holding different frame counts still agree on the temporal axis. Items
+      with ``t < max_t`` duplicate their first frame into the padded slots,
+      which carry weight 0, keeping each item's mean exact.
     """
-    if len(grid_thws) == 0:
-        raise ValueError("grid_thws must contain at least one (t, h, w) grid")
-
     merge_h, merge_w = merge_kernel_size
-    grids = [(int(t), int(h), int(w)) for t, h, w in grid_thws]
-    max_t = max(t for t, _, _ in grids)
+    merge_unit = merge_h * merge_w
 
-    all_merge_indices = []
-    all_merge_weights = []
+    indices = np.full((output_cap, merge_unit, max_t), base_offset, dtype=np.int32)
+    weights = np.zeros((output_cap, max_t), dtype=np.float32)
+
+    patch_offset = 0
     token_offset = 0
-
-    for t, h, w in grids:
+    for t, h, w in grid_thws:
         if h % merge_h or w % merge_w:
             raise ValueError(
-                f"grid_thw {(t, h, w)} is not divisible by merge kernel " f"{(merge_h, merge_w)}"
+                f"grid_thw {(t, h, w)} is not divisible by merge kernel {(merge_h, merge_w)}"
+            )
+        new_h, new_w = h // merge_h, w // merge_w
+        rows = new_h * new_w
+        if token_offset + rows > output_cap:
+            raise ValueError(
+                f"lane merge plan overflow: {token_offset + rows} output rows "
+                f"exceed capacity {output_cap}."
             )
 
-        new_h, new_w = h // merge_h, w // merge_w
+        item = np.arange(
+            base_offset + patch_offset,
+            base_offset + patch_offset + t * h * w,
+            dtype=np.int32,
+        )
+        item = item.reshape(t, new_h, merge_h, new_w, merge_w)
+        item = item.transpose(1, 3, 2, 4, 0).reshape(rows, merge_unit, t)
 
-        indices = np.arange(token_offset, token_offset + t * h * w, dtype=np.int32)
-        indices = indices.reshape(t, new_h, merge_h, new_w, merge_w)
-        indices = indices.transpose(1, 3, 2, 4, 0)
-        indices = indices.reshape(new_h * new_w, merge_h * merge_w, t)
-
+        indices[token_offset : token_offset + rows, :, :t] = item
         if t < max_t:
-            # Duplicate the first frame into the padded slots. They carry weight 0,
-            # so they never contribute; duplicating a valid index just keeps the
-            # gather in bounds.
-            padding = np.repeat(indices[:, :, :1], max_t - t, axis=2)
-            indices = np.concatenate([indices, padding], axis=2)
+            # Duplicate the first frame into the padded slots. They carry weight
+            # 0, so they never contribute; a valid index keeps the gather in
+            # bounds.
+            indices[token_offset : token_offset + rows, :, t:] = item[:, :, :1]
+        weights[token_offset : token_offset + rows, :t] = 1.0 / t
 
-        weights = np.zeros((new_h * new_w, max_t), dtype=np.float32)
-        weights[:, :t] = 1.0 / t
+        patch_offset += t * h * w
+        token_offset += rows
 
-        all_merge_indices.append(indices)
-        all_merge_weights.append(weights)
-        token_offset += t * h * w
-
-    return (
-        np.concatenate(all_merge_indices, axis=0),
-        np.concatenate(all_merge_weights, axis=0),
-    )
+    return indices, weights
 
 
 class VisionTower(nnx.Module):
@@ -527,9 +463,12 @@ class VisionTower(nnx.Module):
         dtype: jnp.dtype,
         rngs: nnx.Rngs | None = None,
         mesh: Mesh | None = None,
+        vision_tp: bool = True,
     ):
         self.config = config
         self.dtype = dtype
+        self.vision_tp = vision_tp
+        self.specs = VisionShardSpecs(mesh, vision_tp) if mesh is not None else None
 
         self.merge_kernel_size = config.merge_kernel_size
 
@@ -551,40 +490,7 @@ class VisionTower(nnx.Module):
             dtype,
         )
 
-        self.encoder = VisionTowerEncoder(config, dtype, mesh, rngs)
-
-    def compute_aux_arrays(
-        self,
-        grid_thws,
-    ):
-        """Build the host-side arrays the ViT body needs for one batch.
-
-        Args:
-            grid_thws: Sequence of (t, h, w) patch grids, one per item.
-                t == 1 is a still image; t > 1 is a video.
-
-        Returns:
-            (rope_freqs_cis, cu_seqlens, abs_pos_embs, merge_indices,
-            merge_weights). The last two are consumed by compute_hidden_states
-            to pool merge_h * merge_w patches spatially and t frames temporally.
-        """
-        merge_indices, merge_weights = build_temporal_merge_plan(grid_thws, self.merge_kernel_size)
-
-        rope_freqs_cis = self.rope_2d._get_freqs_cis(grid_thws=grid_thws)
-
-        grid_thws = np.array(grid_thws)
-        lengths = jnp.concatenate(
-            (
-                jnp.zeros(1, dtype=jnp.int32),
-                grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2],
-            )
-        )
-
-        cu_seqlens = lengths.cumsum(axis=0, dtype=jnp.int32)
-
-        abs_pos_embs = self.patch_embed.pos_emb(grid_thws)
-
-        return rope_freqs_cis, cu_seqlens, abs_pos_embs, merge_indices, merge_weights
+        self.encoder = VisionTowerEncoder(config, dtype, mesh, rngs, vision_tp=vision_tp)
 
     def compute_hidden_states(
         self,
@@ -609,7 +515,15 @@ class VisionTower(nnx.Module):
 
         hidden_states = self.encoder(hidden_states, rope_freq_cis, cu_seqlens)
 
-        merged_states = hidden_states[merge_indices]
+        # Both operand and indices are sharded along the batch axis once the
+        # inputs are lane-packed. Every lane's indices are confined to that
+        # lane's own slice of the buffer (build_lane_merge_plan offsets them by
+        # ``lane_index * capacity``), so the gather is shard-local -- but that
+        # is a property of the index values, which JAX cannot see, so it
+        # refuses to infer an output sharding. State it explicitly.
+        merged_states = hidden_states.at[merge_indices].get(
+            out_sharding=self.specs.sharding(self.specs.batch_axis) if self.specs else None
+        )
 
         if merge_weights is None:
             merged_states = merged_states.mean(axis=2)
@@ -678,12 +592,131 @@ class Kimi_K25_VisionModel(nnx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs | None = None,
         mesh: Mesh | None = None,
+        vision_tp: bool = True,
     ) -> None:
 
-        self.vision_tower = VisionTower(config, dtype, rngs, mesh)
+        self.vision_tower = VisionTower(config, dtype, rngs, mesh, vision_tp)
         self.mm_projector = Kimi_K25_MultiModalProjector(config, dtype, rngs)
+        self.merge_kernel_size = config.merge_kernel_size
+        self.merge_unit = config.merge_kernel_size[0] * config.merge_kernel_size[1]
+        self.in_channels = config.in_channels
+        self.patch_size = config.patch_size
 
         logger.info("Kimi K2.5 Vision Model initialized with dtype %s", dtype)
+
+    @staticmethod
+    def vision_output_length(item: MultimodalDataItem, merge_unit: int) -> int:
+        """Encoder output tokens for one item, as required by ``lane_packing``.
+
+        The ``sd2_tpool`` merge averages over the temporal axis, so a ``t``-frame
+        item collapses to the same token count as a single frame. The shared
+        default (``t*h*w // merge_unit``) would over-count by a factor of ``t``.
+        """
+        _, height, width = get_grid_thw(item)
+        return (height * width) // merge_unit
+
+    def prepare_metadata(
+        self,
+        grid_thw: np.ndarray,
+        capacity: int,
+        *,
+        sharding,
+    ) -> dict:
+        """Build the lane-padded aux arrays the tower needs, on the host.
+
+        ``grid_thw`` arrives lane-major as ``[lanes, items, 3]`` from
+        ``lane_packing``; all-zero rows are padding. Every array is allocated at
+        ``capacity`` (or ``capacity // merge_unit`` on the output side) so the
+        encoder sees one static shape per bucket and compiles once.
+        """
+        grid_thw = np.asarray(grid_thw, dtype=np.int32)
+        if grid_thw.ndim == 2:
+            grid_thw = grid_thw[None]
+        if grid_thw.ndim != 3 or grid_thw.shape[-1] != 3:
+            raise ValueError("grid_thw must have shape [items, 3] or [lanes, items, 3]")
+
+        tower = self.vision_tower
+        output_cap = capacity // self.merge_unit
+        lane_grids = [
+            [tuple(int(v) for v in grid) for grid in lane if np.any(grid)] for lane in grid_thw
+        ]
+        # A single temporal axis is shared by every lane once they are
+        # concatenated, so max_t must be taken across the whole batch.
+        max_t = max((t for lane in lane_grids for t, _, _ in lane), default=1)
+
+        rope_lanes, pos_lanes, cu_lanes, index_lanes, weight_lanes = [], [], [], [], []
+        for lane_index, grids in enumerate(lane_grids):
+            base_offset = lane_index * capacity
+            patches = sum(t * h * w for t, h, w in grids)
+            if patches > capacity:
+                raise ValueError(f"lane {lane_index} holds {patches} patches > capacity {capacity}")
+
+            rope = np.zeros((2, capacity, tower.rope_2d.dim // 2), dtype=np.float32)
+            pos = np.zeros((capacity, tower.config.vt_hidden_size), dtype=np.float32)
+            if grids:
+                rope[:, :patches] = np.asarray(tower.rope_2d._get_freqs_cis(grid_thws=grids))
+                pos[:patches] = np.asarray(tower.patch_embed.pos_emb(np.asarray(grids)))
+
+            # One segment per item, lane-local. The tail repeats the final
+            # offset so the padding slots form zero-length segments and are
+            # never attended to.
+            cu = np.zeros(output_cap + 1, dtype=np.int32)
+            offset = 0
+            for item_index, (t, h, w) in enumerate(grids):
+                offset += t * h * w
+                cu[item_index + 1] = offset
+            cu[len(grids) + 1 :] = offset
+
+            indices, weights = build_lane_merge_plan(
+                grids,
+                self.merge_kernel_size,
+                base_offset=base_offset,
+                output_cap=output_cap,
+                max_t=max_t,
+            )
+
+            rope_lanes.append(rope)
+            pos_lanes.append(pos)
+            cu_lanes.append(cu)
+            index_lanes.append(indices)
+            weight_lanes.append(weights)
+
+        lane_major = {
+            "abs_pos_embs": np.concatenate(pos_lanes, axis=0),
+            "cu_seqlens": np.concatenate(cu_lanes),
+            "merge_indices": np.concatenate(index_lanes, axis=0),
+            "merge_weights": np.concatenate(weight_lanes, axis=0),
+        }
+        metadata = jax.device_put(lane_major, sharding)
+        # rope_freq_cis is [2, tokens, dim/2] -- axis 0 selects cos/sin, so the
+        # token axis is 1 and the lane-major spec has to be shifted right.
+        rope_sharding = NamedSharding(sharding.mesh, PartitionSpec(None, *tuple(sharding.spec)))
+        metadata["rope_freq_cis"] = jax.device_put(
+            np.concatenate(rope_lanes, axis=1), rope_sharding
+        )
+        return metadata
+
+    def __call__(self, patches: jax.Array, **metadata: jax.Array) -> jax.Array:
+        """Encode lane-packed patches into projected multimodal tokens."""
+        # lane_packing hands over one flat buffer; Kimi's patch embed consumes
+        # [patches, channels, patch, patch] rather than a flattened patch_dim.
+        specs = self.vision_tower.specs
+        patches = patches.reshape(
+            -1,
+            self.in_channels,
+            self.patch_size,
+            self.patch_size,
+            out_sharding=specs.sharding(specs.batch_axis),
+        )
+        hidden_states = self.vision_tower.compute_hidden_states(
+            patches.astype(self.vision_tower.dtype),
+            metadata["abs_pos_embs"],
+            metadata["rope_freq_cis"],
+            metadata["cu_seqlens"],
+            metadata["merge_indices"],
+            metadata["merge_weights"],
+        )
+        return self.mm_projector(hidden_states)
 
 
 def create_kimi_vision_weight_mappings(
