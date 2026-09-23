@@ -842,6 +842,34 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 attention_data_partition_axis="data",
             )
 
+        elif backend == "qsa_sparse":
+            from sgl_jax.srt.layers.attention.qsa_sparse_backend import (
+                QSASparseAttentionBackend,
+            )
+
+            cfg = self.model_config.hf_text_config
+            if getattr(cfg, "indexer_budget", None) is None:
+                raise ValueError(
+                    "attention_backend='qsa_sparse' needs a model with indexer_* "
+                    "config (Qwen3.8-Flash-Next); this one has none"
+                )
+            # Every full-attention layer carries its own indexer -- upstream
+            # builds it per layer with its own prefix and there is no sharing
+            # switch, unlike DSA's IndexShare.
+            full_slot = {
+                layer_id: slot for slot, layer_id in enumerate(cfg.full_attention_layer_ids)
+            }
+            full_attn_backend = QSASparseAttentionBackend(
+                self.num_attn_heads,
+                self.num_kv_heads,
+                self.model_config.head_dim,
+                page_size=self.page_size,
+                mesh=self.mesh,
+                compress_ratio=cfg.indexer_compress_ratio,
+                block_topk=cfg.indexer_budget // cfg.indexer_compress_ratio,
+                full_slot=full_slot,
+            )
+
         elif backend in ("fa", "fa_mha"):
             from sgl_jax.srt.layers.attention.flashattention_backend import (
                 FlashAttention,
