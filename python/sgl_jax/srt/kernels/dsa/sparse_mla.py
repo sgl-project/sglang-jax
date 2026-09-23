@@ -68,6 +68,7 @@ def compute_topk_pages(
         "num_kv_pages_per_block",
         "num_queries_per_block",
         "vmem_limit_bytes",
+        "page_share_group",
     ),
 )
 def sparse_mla_page_level(
