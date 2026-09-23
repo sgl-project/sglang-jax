@@ -219,6 +219,18 @@ class SpecAsDecodeTest(unittest.TestCase):
             else:
                 np.testing.assert_array_equal(rows[i], flat[l])
 
+    def test_decode_form_verify_buckets_have_tuned_blocks(self):
+        # Decode-form verify feeds bs * num_draft_tokens queries to the MLA decode
+        # kernel; every bucket the server can hit (up to cc128 x 4) must resolve
+        # without the LOOKUP MISS fallback on the GLM-5.2 tp16 shard shape.
+        from sgl_jax.srt.kernels.mla.v2.tuned_block_sizes import TUNED_BLOCK_SIZES_MLA
+
+        table = TUNED_BLOCK_SIZES_MLA["TPU v7"]
+        for bs in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512):
+            key = ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, bs)
+            self.assertIn(key, table, f"missing MLA decode tuned entry for bucket {bs}")
+            self.assertEqual(len(table[key]), 3)
+
     def test_bs1_T4(self):
         self._check_case(base_lens=[9], pages_per_req=4)  # 9 + 4 tokens straddle pages
 
