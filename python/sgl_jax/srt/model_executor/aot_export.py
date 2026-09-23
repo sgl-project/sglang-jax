@@ -194,6 +194,13 @@ def export(options):
             save_manifest()
             if options.stage == "compiled":
                 compiled = lowered.compile(compiler_options=compiler_options or None)
+                if options.save_executable:
+                    from sgl_jax.srt.model_executor.aot_executable import save_executable
+
+                    manifest["executable"] = save_executable(
+                        compiled, lowered, mesh, compiler_options, output
+                    )
+                    manifest["stages"]["executable"] = "complete"
                 hlo = compiled.as_text()
                 if not hlo or "HloModule" not in hlo:
                     raise RuntimeError("Backend did not expose optimized HLO text")

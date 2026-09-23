@@ -86,6 +86,11 @@ def parse_args():
         help="Global recurrent-state slots for linear attention; defaults to batch size",
     )
     parser.add_argument("--stage", choices=("stablehlo", "compiled"), default="compiled")
+    parser.add_argument(
+        "--save-executable",
+        action="store_true",
+        help="Save a loadable model executable alongside IR",
+    )
     parser.add_argument("--dump-llo", action="store_true", help="Require TPU LLO text artifacts")
     parser.add_argument("--output", type=Path, required=True, help="New or empty output directory")
     parser.add_argument("--compiler-option", action="append", default=[], metavar="NAME=JSON_VALUE")
@@ -129,6 +134,8 @@ def parse_args():
         parser.error("--host-bounds dimensions must be positive")
     if options.dump_llo and (options.target != "tpu" or options.stage != "compiled"):
         parser.error("--dump-llo requires --target=tpu --stage=compiled")
+    if options.save_executable and options.stage != "compiled":
+        parser.error("--save-executable requires --stage=compiled")
     compiler_options = {}
     for item in options.compiler_option:
         try:

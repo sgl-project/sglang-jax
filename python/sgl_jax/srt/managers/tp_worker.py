@@ -75,6 +75,8 @@ class ModelWorker:
         self._pd_fuse_sample = (
             server_args.pd_disaggregation == "pathways"
             and os.getenv("SGLANG_PD_FUSE_SAMPLE") == "1"
+            # AOT artifacts contain the model forward; sampling remains separate.
+            and not server_args.aot_model_dir
         )
         from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 

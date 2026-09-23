@@ -355,6 +355,14 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         def jitted_compute_logprobs(mesh, logits, next_tokens):
             return compute_logprobs(mesh, logits, next_tokens)
 
+        aot_model_dir = self.server_args.aot_model_dir
+        if aot_model_dir:
+            from sgl_jax.srt.model_executor.aot_executable import AotModelForward, ExecutableStore
+
+            jitted_run_model = AotModelForward(
+                jitted_run_model, ExecutableStore(aot_model_dir, self.mesh), jit_compiler_options
+            )
+
         # Opt-in (SGLANG_JAX_AOT_DISPATCH=auto|1): weights enter jit as
         # ~thousands of flat args; AotDispatcher skips pjit's per-arg Python
         # dispatch (O(n_args) checks + shard_args) by caching an AOT
@@ -363,7 +371,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         # so precompiled deployments start fully warm. Off by default; the
         # stock pjit path below is untouched. Speculative decoding always
         # uses the stock path (interaction not yet supported).
-        use_aot_dispatch = aot_dispatch_requested()
+        use_aot_dispatch = aot_dispatch_requested() and not aot_model_dir
         if use_aot_dispatch and self.server_args.speculative_algorithm:
             logger.warning(
                 "SGLANG_JAX_AOT_DISPATCH is set but speculative decoding is "

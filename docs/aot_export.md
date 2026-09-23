@@ -305,3 +305,50 @@ tar -czf /tmp/model-ir.tar.gz -C /tmp model-ir
 - **Requested LLO is missing:** check the libtpu version and recorded dump flags in
   the manifest. Compilation caching is disabled so code generation runs on each
   invocation; missing requested LLO makes the export fail.
+
+## Run an offline executable in serving
+
+Add `--save-executable` to a compiled export to also write `executable.bin` and
+`executable.json`. Export each serving workload and shape bucket into its own
+subdirectory, using the same model, quantization, backends, parallelism, page size,
+and cache capacities as the server. For example, export prefill and decode into
+`/models/aot/prefill-128` and `/models/aot/decode-8`, then add:
+
+```bash
+--aot-model-dir /models/aot
+```
+
+to the corresponding `python -m sgl_jax.launch_server` command. The directory is
+searched recursively. Configure `--precompile-token-paddings` and
+`--precompile-bs-paddings` to match the exported buckets. An unseen or incompatible
+model forward fails with a mismatch diagnostic; it does not silently compile.
+Omit `--aot-model-dir` to use normal serving compilation.
+
+The server still loads real weights and creates its caches. For each new input
+signature, it traces and lowers the real serving forward, checks the canonical
+IR, retained input/donation signature, mesh/device assignment, compiler flags and
+runtime versions, then loads the matching binary. Later forwards reuse that
+callable. Inputs eliminated by the compiler do not participate in the binary interface.
+This skips backend model compilation; sampling and other functions outside the
+exported model forward retain their normal compilation behavior. The expected
+benefit is reduced startup/warmup time, not a change to steady-state kernel speed.
+
+Keep JAX, jaxlib, libtpu, Flax and Python versions compatible with the recorded
+signature; the loader requires exact recorded versions. Use the same compilation
+flags on the export and serving hosts, including flags set by the container image.
+For CPU-host export, explicitly set the serving flags; JAX can add TPU-host
+initialization flags that a CPU host does not receive automatically. For example:
+
+```bash
+export LIBTPU_INIT_ARGS="--xla_tpu_use_enhanced_launch_barrier=true"
+```
+
+An `ir_sha256` mismatch can also indicate different host-generated constants.
+For x86 hosts with different NumPy SIMD implementations, use
+`NPY_DISABLE_CPU_FEATURES=AVX512F,AVX2,FMA3` on both export and serving processes
+before Python starts to make the tested RoPE frequency construction agree.
+The loader keeps checking the entire graph, including those constants.
+
+Executables are specific to their target and are not portable from v6e to v7x.
+Only load artifacts from a trusted producer: JAX executable deserialization can execute code. Checksums
+check file integrity, not producer identity.

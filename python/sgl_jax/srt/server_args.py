@@ -227,6 +227,7 @@ class ServerArgs:
     vision_encoder_parallel: str = "dp"
 
     disable_precompile: bool = False
+    aot_model_dir: str | None = None
 
     # Speculative decoding
     speculative_algorithm: str | None = None
@@ -1537,6 +1538,10 @@ class ServerArgs:
             "--disable-precompile",
             action="store_true",
             help="whether disable precompile",
+        )
+        parser.add_argument(
+            "--aot-model-dir",
+            help="Directory of trusted offline model executables; fail if a workload has no matching artifact",
         )
         # Kernel backend
         parser.add_argument(
