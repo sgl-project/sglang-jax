@@ -598,25 +598,10 @@ class Qwen3VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         self.config = config
         self.text_config = get_hf_text_config(config) or config
         self.dtype = dtype or jnp.bfloat16
-        rope = getattr(self.text_config, "rope_parameters", None)
-        if rope:
-            self.text_config.rope_theta = rope.get(
-                "rope_theta", getattr(self.text_config, "rope_theta", 5_000_000)
-            )
-            self.text_config.rope_scaling = {
-                "rope_type": rope.get("rope_type", "default"),
-                "mrope_section": rope.get("mrope_section", [24, 20, 20]),
-                "mrope_interleaved": True,
-            }
-        elif not getattr(self.text_config, "rope_scaling", None):
-            self.text_config.rope_scaling = {
-                "rope_type": "default",
-                "mrope_section": [24, 20, 20],
-                "mrope_interleaved": True,
-            }
-        self.is_mrope_enabled = "mrope_section" in (
-            getattr(self.text_config, "rope_scaling", None) or {}
-        )
+        rope = self.text_config.rope_parameters
+        rope.setdefault("mrope_section", [24, 20, 20])
+        rope.setdefault("mrope_interleaved", True)
+        self.is_mrope_enabled = "mrope_section" in rope
         self.model = QWen3Model(self.text_config, mesh=mesh, dtype=self.dtype)
         if not getattr(self.text_config, "tie_word_embeddings", False):
             self.lm_head = ParallelLMHead(

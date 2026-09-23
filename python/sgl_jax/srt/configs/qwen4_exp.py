@@ -140,11 +140,7 @@ class _Qwen4ExpTextConfig(PretrainedConfig):
         # ``rope_parameters`` (5.x) or ships it flat (4.x).
         self.rope_parameters = rope_parameters
         if rope_parameters is not None:
-            self.rope_scaling = {
-                "rope_type": rope_parameters["rope_type"],
-                "mrope_section": rope_parameters["mrope_section"],
-                "mrope_interleaved": rope_parameters["mrope_interleaved"],
-            }
+            self.rope_scaling = dict(rope_parameters)
             self.rope_theta = rope_parameters["rope_theta"]
             self.partial_rotary_factor = rope_parameters["partial_rotary_factor"]
         else:

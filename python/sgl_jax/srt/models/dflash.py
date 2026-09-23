@@ -95,7 +95,7 @@ class DFlashAttention(nnx.Module):
             head_size=self.head_dim,
             rotary_dim=self.head_dim,
             max_position_embeddings=int(getattr(config, "max_position_embeddings", 32768)),
-            base=float(getattr(config, "rope_theta", 1000000)),
+            base=float(config.rope_parameters["rope_theta"]),
             is_neox_style=True,
             dtype=dtype,
         )

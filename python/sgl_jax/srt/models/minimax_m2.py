@@ -140,7 +140,7 @@ class MiniMaxM2Attention(nnx.Module):
             head_size=self.head_dim,
             rotary_dim=getattr(config, "rotary_dim", self.head_dim),
             max_position_embeddings=getattr(config, "max_position_embeddings", 196608),
-            base=getattr(config, "rope_theta", 5000000),
+            base=config.rope_parameters["rope_theta"],
             is_neox_style=True,
             dtype=dtype,
         )

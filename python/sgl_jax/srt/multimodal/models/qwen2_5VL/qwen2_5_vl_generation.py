@@ -26,11 +26,11 @@ class Qwen2_5_VL_Model(Qwen2Model):
         dtype=jnp.bfloat16,
     ):
         super().__init__(config=config, mesh=mesh, dtype=dtype)
-        rope_scaling = getattr(config, "rope_scaling", None) or {}
+        rope_scaling = config.rope_parameters
         self._mrope_section = rope_scaling.get("mrope_section")
         self._mrope_interleaved = rope_scaling.get("mrope_interleaved", False)
         if self._mrope_section:
-            rope_theta = getattr(config, "rope_theta", 1000000)
+            rope_theta = config.rope_parameters["rope_theta"]
             max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
             for layer in self.layers:
                 head_dim = layer.self_attn.head_dim
