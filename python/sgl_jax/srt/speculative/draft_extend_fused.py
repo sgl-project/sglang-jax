@@ -44,6 +44,111 @@ _HIDDEN_RELAY_ENV = os.environ.get("SGLANG_JAX_MTP_HIDDEN_RELAY")
 # gsm8k p1 acceptance 3.34 vs 3.33, position-3 conditional 0.774 vs 0.763);
 # SGLANG_JAX_MTP_RELAY_POS=0 keeps the step-0 positions.
 _RELAY_POS = os.environ.get("SGLANG_JAX_MTP_RELAY_POS", "1") != "0"
+# Single-block chain, pool versions. The caller keeps only step 0's pool
+# version (steps j >= 1 write the rotated window back into the same slots, so
+# their versions are throwaway), but every step used to start from the input
+# pool and every version was returned: XLA had to keep three versions of a
+# donated pool = two whole-pool copies per draft-extend step. Now step 0 runs
+# on the input pool and is the only version returned; step 1 still starts from
+# the input pool (unchanged semantics) and step 2 continues on step 1's version.
+# Step 2 only reads the window slots it rewrites itself first, so its inputs
+# are identical either way; XLA keeps two versions = one copy.
+# (Threading ONE version through all steps was measured NOT idempotent: the
+# window slots follow seq_lens, not the shifted positions, so step 1 overwrote
+# step 0's KV; gsm8k acceptance fell 3.34 -> 3.21. Do not do that.)
+# SGLANG_JAX_MTP_CHAIN_POOL=0 restores three separate versions.
+_CHAIN_POOL = os.environ.get("SGLANG_JAX_MTP_CHAIN_POOL", "1") != "0"
+
+
+# Debug assertion: copy step 0's pool version and, after the later steps ran on
+# their scratch version, report per pool leaf how many KV slots differ between
+# that copy and the version handed back, plus the step-0 window slots. Must be
+# 0 everywhere (the caller keeps exactly step 0's version).
+_CHAIN_POOL_CHECK = os.environ.get("SGLANG_JAX_MTP_CHAIN_POOL_CHECK", "0") == "1"
+
+
+def _chain_pool_leaf_names(tree):
+    """Host-side names for the leaves compared by _chain_pool_diff_arrays."""
+    from jax.tree_util import keystr, tree_flatten_with_path
+
+    leaves, _ = tree_flatten_with_path(tree)
+    return [f"{keystr(path)} shape={tuple(a.shape)}" for path, a in leaves]
+
+
+def _chain_pool_diff_arrays(v0, vN, loc0, rep_sharding=None):
+    """Per pool leaf (in tree_leaves order): #slots whose contents differ between
+    two pool versions and the first 32 differing slot ids; plus the step-0 window
+    slots. Arrays only (JIT outputs); names come from _chain_pool_leaf_names.
+    Under an explicit-sharding mesh the reductions run as auto-sharded regions
+    with a replicated result."""
+
+    def _diff(a0, aN):
+        rows0 = a0.reshape(-1, a0.shape[-1]) if a0.ndim >= 2 else a0.reshape(-1, 1)
+        rowsN = aN.reshape(-1, aN.shape[-1]) if aN.ndim >= 2 else aN.reshape(-1, 1)
+        d = jnp.any(rows0 != rowsN, axis=-1)
+        return d.sum().astype(jnp.int32), jnp.nonzero(d, size=32, fill_value=-1)[0].astype(
+            jnp.int32
+        )
+
+    diff = _diff
+    if rep_sharding is not None:
+        diff = jax.sharding.auto_axes(_diff, out_sharding=(rep_sharding, rep_sharding))
+    counts, firsts = [], []
+    for a0, aN in zip(jax.tree_util.tree_leaves(v0), jax.tree_util.tree_leaves(vN)):
+        if a0.shape != aN.shape:
+            counts.append(jnp.int32(-1))
+            firsts.append(jnp.full((32,), -1, jnp.int32))
+            continue
+        n, f = diff(a0, aN)
+        counts.append(n)
+        firsts.append(f)
+    return jnp.stack(counts), jnp.stack(firsts), loc0
+
+
+def log_chain_pool_check(report, pool_updates):
+    """Log the arrays produced by _chain_pool_diff_arrays (host side)."""
+    import numpy as np
+
+    counts, firsts, loc0 = report
+    names = _chain_pool_leaf_names(pool_updates)
+    loc0 = np.asarray(loc0)
+    live = set(int(x) for x in loc0 if x >= 0)
+    logger.info("[CHAIN_POOL_CHECK] step0 window slots (loc0, -1 = dropped): %s", loc0.tolist())
+    for name, n, f in zip(names, np.asarray(counts), np.asarray(firsts)):
+        rows = [int(x) for x in f if x >= 0]
+        logger.info(
+            "[CHAIN_POOL_CHECK] %s rows_differ=%d first_rows=%s overlap_with_loc0=%s",
+            name,
+            int(n),
+            rows,
+            sorted(set(rows) & live),
+        )
+
+
+def _chain_pool_report(v0, vN, md, num_tokens, page_size, like):
+    """CHECK report inside the fused JIT: step-0 window slots (auto-sharded
+    lookup, replicated result) + per-leaf slot diffs between two pool versions.
+    Returns arrays only."""
+    from sgl_jax.srt.layers.attention.dsa_sparse_backend import _spec_token_slots
+
+    sh = jax.typeof(like).sharding
+    rep = None
+    if isinstance(sh, NamedSharding) and not sh.mesh.empty:
+        rep = NamedSharding(sh.mesh, P())
+
+    def _loc0(sl, cq, ck, pi):
+        return _spec_token_slots(sl, cq, ck, pi, num_tokens, page_size)
+
+    loc0_fn = _loc0 if rep is None else jax.sharding.auto_axes(_loc0, out_sharding=rep)
+    loc0 = loc0_fn(md.seq_lens, md.cu_q_lens, md.cu_kv_lens, md.page_indices)
+    return _chain_pool_diff_arrays(v0, vN, loc0, rep_sharding=rep)
+
+
+def _chain_pool_enabled(num_pools: int, relay_on: bool) -> bool:
+    """Single-block chain: return step 0's pool version only, share one scratch
+    version between the later steps (see _CHAIN_POOL)."""
+    del relay_on
+    return bool(_CHAIN_POOL and num_pools == 1)
 
 
 def mtp_hidden_relay_enabled(hf_config=None):
@@ -787,6 +892,8 @@ def _build_draft_extend(
         step_hidden = target_hidden
         positions0 = forward_batch.positions
         relay_on = _chained_relay(hidden_relay, num_layers, len(all_leaves))
+        chain_pool = _chain_pool_enabled(len(all_memory_pools), relay_on)
+        chain_check_report = None
         for i in range(num_layers):
             leaf_idx = i if i < len(all_leaves) else -1
             pool_idx = i if i < len(all_memory_pools) else -1
@@ -816,7 +923,28 @@ def _build_draft_extend(
                 output, pool_updates, _, _ = model(
                     forward_batch, all_memory_pools[pool_idx], logits_metadata
                 )
-            all_pool_updates.append(pool_updates)
+            if chain_pool:
+                # step 0's version is the one the caller keeps; steps >= 1 share
+                # one scratch version (step 2 continues on step 1's), see _CHAIN_POOL
+                if i == 0:
+                    all_pool_updates.append(pool_updates)
+                    if _CHAIN_POOL_CHECK:
+                        check_v0 = jax.tree_util.tree_map(lambda x: x + 0, pool_updates)
+                else:
+                    all_memory_pools[pool_idx].replace_all(pool_updates)
+                    if _CHAIN_POOL_CHECK and i == num_layers - 1:
+                        # assertion data: the version handed back must still be
+                        # step 0's (rows_differ must be 0 everywhere, loc0 included)
+                        chain_check_report = _chain_pool_report(
+                            check_v0,
+                            all_pool_updates[0],
+                            forward_batch.attn_backend.forward_metadata,
+                            input_ids.shape[0],
+                            forward_batch.attn_backend.page_size,
+                            input_ids,
+                        )
+            else:
+                all_pool_updates.append(pool_updates)
 
             sh = jax.typeof(output.next_token_logits).sharding
             mesh = sh.mesh if isinstance(sh, NamedSharding) else None
@@ -878,12 +1006,15 @@ def _build_draft_extend(
                 dp_size=dp_size,
             )
 
-        return (
+        outs = (
             selected_layer0_hidden,
             stacked_idx,
             tuple(all_pool_updates),
             updated_relay_buffers,
         )
+        if _CHAIN_POOL_CHECK:
+            outs = outs + (chain_check_report,)
+        return outs
 
     return fused_draft_extend
 
@@ -2192,12 +2323,7 @@ def launch_fused_draft_extend_for_decode(
         )
 
     with jax.set_mesh(draft_worker.mesh):
-        (
-            selected_layer0_hidden,
-            topk_index_stacked,
-            all_pool_updates,
-            updated_relay_buffers,
-        ) = draft_worker._fused_jit_fn(
+        _fused_out = draft_worker._fused_jit_fn(
             mr0._model_def,
             mr0._model_state_def,
             tuple(all_leaves),
@@ -2218,6 +2344,16 @@ def launch_fused_draft_extend_for_decode(
             update_relay=update_relay,
             dp_size=model_worker_batch.dp_size,
         )
+        if _CHAIN_POOL_CHECK and len(_fused_out) == 5:
+            *_fused_out, _chain_report = _fused_out
+            if _chain_report is not None:
+                log_chain_pool_check(_chain_report, _fused_out[2][0])
+        (
+            selected_layer0_hidden,
+            topk_index_stacked,
+            all_pool_updates,
+            updated_relay_buffers,
+        ) = _fused_out
 
     for i, w in enumerate([draft_worker._worker]):
         w.model_runner.memory_pools.replace_all(all_pool_updates[i])
