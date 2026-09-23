@@ -36,6 +36,7 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.dsa.sparse_mla_prefill_qblock import (
     _build_write_runs,
+    default_run_capacity,
     paged_write_back,
     pallas_always_fits,
 )
@@ -274,6 +275,13 @@ class SpecTokenSlotsTest(unittest.TestCase):
         self.assertTrue(pallas_always_fits(4, 130))
         self.assertTrue(pallas_always_fits(130, 130))
         self.assertFalse(pallas_always_fits(131, 130))
+        # Default capacity covers every decode-form spec batch up to 1024 rows
+        # (64 requests x 4 draft tokens = 256 was the cc64 gap), while large
+        # prefill row counts keep the runtime cond + scatter fallback.
+        for rows in (4, 32, 256, 1024):
+            self.assertTrue(pallas_always_fits(rows, default_run_capacity(rows, PAGE_SIZE)), rows)
+        self.assertFalse(pallas_always_fits(8192, default_run_capacity(8192, PAGE_SIZE)))
+        self.assertEqual(default_run_capacity(8192, PAGE_SIZE), 2 * (8192 // PAGE_SIZE) + 130)
 
     def test_spec_rows_skip_cond_large_T_keeps_cond(self):
         # Spec verify / draft-extend rows (T=4, r_cap=130 by default) must not go
@@ -315,6 +323,47 @@ class SpecTokenSlotsTest(unittest.TestCase):
             out2 = paged_write_back(cache, rows, loc, page_size=PAGE_SIZE, r_cap=2)
             self.assertEqual(calls["cond"], 1)
             np.testing.assert_array_equal(np.asarray(out2), np.asarray(ref))
+
+    def test_default_capacity_static_dispatch_by_rows(self):
+        # Decode-form spec verify rows (T = requests x draft tokens: 256 at cc64,
+        # up to 1024) must dispatch statically with the default r_cap even when
+        # every row starts its own run (n_raw == T); 4096 rows keep the cond.
+        import sgl_jax.srt.kernels.dsa.sparse_mla_prefill_qblock as qb
+
+        pk, dv = 2, 8
+        real_cond = qb.jax.lax.cond
+        for T, want_cond in ((256, 0), (512, 0), (1024, 0), (4096, 1)):
+            pages = 2 * T // PAGE_SIZE + 2
+            cache = jnp.zeros((pages, PAGE_SIZE // pk, pk, dv), jnp.float32)
+            rows = jnp.arange(T * dv, dtype=jnp.float32).reshape(T, dv) + 1.0
+            loc = jnp.arange(T, dtype=jnp.int32) * 2  # stride-2 slots: one run per row
+            ref = (
+                cache.reshape(-1, dv)
+                .at[loc]
+                .set(rows, mode="drop", wrap_negative_indices=False)
+                .reshape(cache.shape)
+            )
+            calls = {"cond": 0, "pallas": 0}
+
+            def fake_pallas_call(*a, _ref=ref, **k):
+                calls["pallas"] += 1
+                return lambda table, row_w, cache_: _ref
+
+            def counting_cond(pred, tb, fb, *ops):
+                calls["cond"] += 1
+                return real_cond(pred, tb, fb, *ops)
+
+            with (
+                mock.patch.object(qb.pl, "pallas_call", fake_pallas_call),
+                mock.patch.object(qb.jax.lax, "cond", counting_cond),
+            ):
+                out = paged_write_back(cache, rows, loc, page_size=PAGE_SIZE)
+            self.assertEqual(calls["cond"], want_cond, T)
+            np.testing.assert_array_equal(np.asarray(out), np.asarray(ref))
+            _, n_raw = qb._build_write_runs(
+                loc, kv_packing=pk, r_cap=default_run_capacity(T, PAGE_SIZE)
+            )
+            self.assertEqual(int(n_raw), T)  # worst case really is one run per row
 
 
 if __name__ == "__main__":

@@ -621,6 +621,23 @@ def _write_back_kernel(tbl_ref, row_ref, cache_in_ref, out_ref, wdst_ref, wsrc_r
     jax.lax.fori_loop(0, E, entry, 0)
 
 
+# Row counts up to this size get a run table of at least ``num_rows`` entries by
+# default, so ``pallas_always_fits`` holds and the runtime cond is dropped. The
+# table is ``[3 * r_cap, 4]`` int32 in SMEM (48 KB at 1024 rows). Decode-form
+# speculative verify at 64 requests x 4 draft tokens is 256 rows; the old default
+# (2 * pages + 130 = 134) did not cover it and cost two whole-pool copies per
+# layer (~0.15 ms each on GLM-5.2 tp16).
+STATIC_DISPATCH_MAX_ROWS = 1024
+
+
+def default_run_capacity(num_rows: int, page_size: int) -> int:
+    """Default ``r_cap`` of ``paged_write_back`` for ``num_rows`` (pk-padded) rows."""
+    r_cap = 2 * (num_rows // page_size) + 130
+    if num_rows <= STATIC_DISPATCH_MAX_ROWS:
+        r_cap = max(r_cap, num_rows)
+    return r_cap
+
+
 def pallas_always_fits(num_rows: int, r_cap: int) -> bool:
     """True when the run table of ``paged_write_back`` cannot overflow.
 
@@ -662,7 +679,7 @@ def paged_write_back(
         row = jnp.pad(row, ((0, Tp - T), (0, 0)))
         loc = jnp.pad(loc, ((0, Tp - T),), constant_values=-1)
     if r_cap is None:
-        r_cap = 2 * (Tp // ps) + 130
+        r_cap = default_run_capacity(Tp, ps)
     table, n_raw = _build_write_runs(loc, kv_packing=pk, r_cap=r_cap)
     row_w = row.reshape(Tp // pk, pk, D)
 
