@@ -16,6 +16,8 @@ if "--xla_force_host_platform_device_count" not in os.environ.get("XLA_FLAGS", "
     ).strip()
 
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -23,6 +25,7 @@ import numpy as np
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.speculative import draft_extend_fused as def_mod
 from sgl_jax.srt.speculative.draft_extend_fused import (
     _rotate_hidden,
     _rotate_input_ids,
@@ -158,6 +161,30 @@ class RotatePrefillHiddenTest(unittest.TestCase):
 
     def test_dp2(self):
         self._case(2)
+
+
+class RelayGateTest(unittest.TestCase):
+    def test_default_follows_single_block_config(self):
+        with mock.patch.object(def_mod, "_HIDDEN_RELAY_ENV", None):
+            self.assertTrue(
+                def_mod.mtp_hidden_relay_enabled(SimpleNamespace(num_nextn_predict_layers=1))
+            )
+            self.assertFalse(
+                def_mod.mtp_hidden_relay_enabled(SimpleNamespace(num_nextn_predict_layers=3))
+            )
+            self.assertFalse(
+                def_mod.mtp_hidden_relay_enabled(SimpleNamespace())
+            )  # MiMo-style: no field
+            self.assertFalse(def_mod.mtp_hidden_relay_enabled(None))
+
+    def test_env_override(self):
+        cfg = SimpleNamespace(num_nextn_predict_layers=1)
+        with mock.patch.object(def_mod, "_HIDDEN_RELAY_ENV", "0"):
+            self.assertFalse(def_mod.mtp_hidden_relay_enabled(cfg))
+        with mock.patch.object(def_mod, "_HIDDEN_RELAY_ENV", "1"):
+            self.assertTrue(
+                def_mod.mtp_hidden_relay_enabled(SimpleNamespace(num_nextn_predict_layers=3))
+            )
 
 
 if __name__ == "__main__":

@@ -37,7 +37,24 @@ _KVSHARE = os.environ.get("SGLANG_JAX_MTP_KVSHARE", "0") == "1"
 # Single-layer MTP chain (GLM-5.2: num_nextn_predict_layers=1 applied num_steps times):
 # feed draft step j >= 1 the previous step's output hidden (sglang EAGLE draft loop:
 # hidden_states = logits_output.hidden_states) instead of reusing the target hidden.
-_HIDDEN_RELAY = os.environ.get("SGLANG_JAX_MTP_HIDDEN_RELAY", "0") == "1"
+_HIDDEN_RELAY_ENV = os.environ.get("SGLANG_JAX_MTP_HIDDEN_RELAY")
+# Companion knob: also advance the RoPE positions of the rotated window by one per
+# draft step (slot k holds tok_{k+j} at step j), like the EAGLE decode loop's
+# positions = seq_lens + step. Opt-in for the A/B run.
+_RELAY_POS = os.environ.get("SGLANG_JAX_MTP_RELAY_POS", "0") == "1"
+
+
+def mtp_hidden_relay_enabled(hf_config) -> bool:
+    """Whether draft steps >= 1 take the previous step's output hidden.
+
+    Default: on for single-block MTP checkpoints (``num_nextn_predict_layers == 1``,
+    GLM-5.2 / DeepSeek-style), whose block is chained ``num_steps`` times and was
+    trained on ``(h^{k-1}, tok)`` pairs; off for multi-block MTP (every block reads
+    the target hidden). ``SGLANG_JAX_MTP_HIDDEN_RELAY=0/1`` forces it for A/B runs.
+    """
+    if _HIDDEN_RELAY_ENV is not None:
+        return _HIDDEN_RELAY_ENV.strip() not in ("", "0", "false", "False")
+    return int(getattr(hf_config, "num_nextn_predict_layers", 0) or 0) == 1
 
 
 def _spec_decode_compiler_options():
@@ -697,7 +714,9 @@ def mtp_index_share_enabled(hf_config, topk: int) -> bool:
     return bool(getattr(hf_config, "index_share_for_mtp_iteration", False)) and topk == 1
 
 
-def _build_draft_extend(num_layers: int, topk: int, index_share: bool = False):
+def _build_draft_extend(
+    num_layers: int, topk: int, index_share: bool = False, hidden_relay: bool = False
+):
     """Build the fused JIT. Called once, result cached on draft_worker."""
     assert topk == 1, "Fused draft extend only supports topk=1"
 
@@ -751,6 +770,7 @@ def _build_draft_extend(num_layers: int, topk: int, index_share: bool = False):
             )
 
         step_hidden = target_hidden
+        positions0 = forward_batch.positions
         for i in range(num_layers):
             leaf_idx = i if i < len(all_leaves) else -1
             pool_idx = i if i < len(all_memory_pools) else -1
@@ -759,6 +779,8 @@ def _build_draft_extend(num_layers: int, topk: int, index_share: bool = False):
 
             forward_batch.spec_info.hidden_states = step_hidden
             forward_batch.input_ids = input_ids
+            if hidden_relay and _RELAY_POS and i > 0:
+                forward_batch.positions = positions0 + i
             forward_batch.spec_kvshare_readonly = bool(_KVSHARE and i >= 1)
 
             if index_share:
@@ -793,12 +815,13 @@ def _build_draft_extend(num_layers: int, topk: int, index_share: bool = False):
             if i < num_layers - 1:
                 ext_lens = forward_batch.extend_seq_lens
                 input_ids = _rotate_input_ids(input_ids, ext_lens, sel_pos, topk_idx[:, 0])
-                if _HIDDEN_RELAY:
+                if hidden_relay:
                     step_hidden = _rotate_hidden(
                         step_hidden, ext_lens, sel_pos, output.hidden_states
                     )
 
         forward_batch.spec_kvshare_readonly = False
+        forward_batch.positions = positions0
         last_idx = draft_logits_indices
         if logits_metadata.accept_lens is not None:
             last_idx = last_idx - (forward_batch.extend_seq_lens - logits_metadata.accept_lens)
@@ -1618,7 +1641,7 @@ def _build_verify(topk: int):
     return fused_verify
 
 
-def _build_prefill(num_layers: int, topk: int):
+def _build_prefill(num_layers: int, topk: int, hidden_relay: bool = False):
     """Build prefill JIT: target extend + all MTP draft-extend layers."""
     assert topk == 1, "Fused greedy prefill only supports topk=1"
 
@@ -1683,6 +1706,7 @@ def _build_prefill(num_layers: int, topk: int):
 
         step_hidden = target_hidden
         draft_forward_batch.spec_info.hidden_states = step_hidden
+        draft_positions0 = draft_forward_batch.positions
         for i in range(num_layers):
             leaf_idx = i if i < len(draft_all_leaves) else -1
             pool_idx = i if i < len(all_memory_pools) else -1
@@ -1692,6 +1716,8 @@ def _build_prefill(num_layers: int, topk: int):
             draft_forward_batch.input_ids = input_ids
             draft_forward_batch.spec_kvshare_readonly = bool(_KVSHARE and i >= 1)
             draft_forward_batch.spec_info.hidden_states = step_hidden
+            if hidden_relay and _RELAY_POS and i > 0:
+                draft_forward_batch.positions = draft_positions0 + i
             output, pool_updates, _, _ = model(
                 draft_forward_batch, all_memory_pools[pool_idx], draft_logits_metadata
             )
@@ -1711,7 +1737,7 @@ def _build_prefill(num_layers: int, topk: int):
                     dp_size,
                     per_dp_bs,
                 )
-                if _HIDDEN_RELAY:
+                if hidden_relay:
                     step_hidden = _rotate_prefill_hidden(
                         step_hidden,
                         draft_forward_batch.extend_seq_lens,
@@ -1720,6 +1746,7 @@ def _build_prefill(num_layers: int, topk: int):
                         per_dp_bs,
                     )
 
+        draft_forward_batch.positions = draft_positions0
         last_idx = draft_logits_indices
         if dp_size > 1:
             per_dp_tokens = layer0_hidden.shape[0] // dp_size
@@ -2128,11 +2155,18 @@ def launch_fused_draft_extend_for_decode(
     if not hasattr(draft_worker, "_fused_jit_fn"):
         hf_config = getattr(getattr(mr0, "model_config", None), "hf_config", None)
         index_share = mtp_index_share_enabled(hf_config, draft_worker.topk)
-        logger.info("Fused draft extend: MTP IndexShare %s", "on" if index_share else "off")
+        hidden_relay = mtp_hidden_relay_enabled(hf_config)
+        logger.info(
+            "Fused draft extend: MTP IndexShare %s, hidden relay %s%s",
+            "on" if index_share else "off",
+            "on" if hidden_relay else "off",
+            " (+positions)" if hidden_relay and _RELAY_POS else "",
+        )
         draft_worker._fused_jit_fn = _build_draft_extend(
             num_layers=draft_worker.speculative_num_steps,
             topk=draft_worker.topk,
             index_share=index_share,
+            hidden_relay=hidden_relay,
         )
 
     with jax.set_mesh(draft_worker.mesh):
@@ -2463,9 +2497,13 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
         all_leaves.append(tuple(mr.model_state_leaves))
 
     if not hasattr(draft_worker, "_fused_greedy_prefill_jit_fn"):
+        hf_config = getattr(
+            getattr(draft_worker._worker.model_runner, "model_config", None), "hf_config", None
+        )
         draft_worker._fused_greedy_prefill_jit_fn = _build_prefill(
             num_layers=draft_worker.speculative_num_steps,
             topk=draft_worker.topk,
+            hidden_relay=mtp_hidden_relay_enabled(hf_config),
         )
 
     data_sharding = NamedSharding(draft_worker.mesh, P("data"))
