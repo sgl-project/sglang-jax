@@ -212,6 +212,9 @@ class ForwardBatch:
     recurrent_track_indices: jax.Array | None = None
     recurrent_track_mask: jax.Array | None = None
 
+    # [num_tokens, ple_embed_dim], gathered on the host.
+    ple_embeddings: jax.Array | None = None
+
     # Host-only multimodal batch consumed before the backbone JIT.
     multimodal_batch: object | None = None
 
@@ -240,6 +243,7 @@ class ForwardBatch:
             self.recurrent_cow_src_indices,
             self.recurrent_track_indices,
             self.recurrent_track_mask,
+            self.ple_embeddings,
         )
 
         aux_data = {
@@ -291,6 +295,7 @@ class ForwardBatch:
         obj.recurrent_cow_src_indices = children[20]
         obj.recurrent_track_indices = children[21]
         obj.recurrent_track_mask = children[22]
+        obj.ple_embeddings = children[23]
         # Host-only attribute, never a pytree child; reset so attribute access on
         # an unflattened ForwardBatch never raises (the routine that consumes it
         # runs on the original, pre-jit ForwardBatch).
@@ -471,6 +476,13 @@ class ForwardBatch:
                 sharding=NamedSharding(model_runner.mesh, PartitionSpec("data")),
             )
 
+        ple_embeddings = None
+        if batch.ple_embeddings is not None:  # [T, ple_embed_dim]
+            (ple_embeddings,) = device_array(
+                (batch.ple_embeddings,),
+                sharding=NamedSharding(model_runner.mesh, PartitionSpec("data")),
+            )
+
         multimodal_batch = getattr(batch, "multimodal_batch", None)
 
         obj = cls(
@@ -502,6 +514,7 @@ class ForwardBatch:
             recurrent_cow_src_indices=recurrent_cow_src_indices,
             recurrent_track_indices=recurrent_track_indices,
             recurrent_track_mask=recurrent_track_mask,
+            ple_embeddings=ple_embeddings,
         )
         obj.multimodal_batch = multimodal_batch
 

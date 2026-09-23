@@ -317,6 +317,9 @@ suites = {
         ),
         TestFile("test/srt/multimodal/test_engine_multimodal.py", 0.1, runner="pytest"),
         TestFile("python/sgl_jax/test/layers/test_hyperconnection.py", 0.1),
+        TestFile("python/sgl_jax/test/layers/test_ngram_embedding.py", 0.1),
+        TestFile("python/sgl_jax/test/layers/test_ngram_table.py", 0.1),
+        TestFile("python/sgl_jax/test/mem_cache/test_recurrent_short_conv.py", 0.1),
         TestFile(
             "python/sgl_jax/test/test_embedding_pool.py",
             0.1,

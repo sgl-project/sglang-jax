@@ -120,12 +120,13 @@ def jax_causal_conv1d_prefill(
     weight: jax.Array,  # [D, kernel_size]  depthwise weight
     bias: jax.Array | None = None,  # [D] optional
     cu_seqlens: jax.Array | None = None,  # [B+1]
-    conv_state: jax.Array | None = None,  # [num_blocks, D, kernel_size-1] full per-layer table
+    conv_state: jax.Array | None = None,  # [num_blocks, D, S] full per-layer table
     state_indices: jax.Array | None = None,  # [B] req → slot
     has_initial_state: jax.Array | None = None,  # [B] bool
     activation: str | None = None,
     track_indices: jax.Array | None = None,  # [B] req → track slot (None = OFF)
     track_mask: jax.Array | None = None,  # [B] bool boundary mask
+    dilation: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
     """Depthwise causal conv1d over a ragged-batched packed sequence.
 
@@ -146,21 +147,30 @@ def jax_causal_conv1d_prefill(
     behavior is "all True" (existing-state mode) to preserve backward
     compatibility with callers that don't track this.
 
+    ``dilation``: spacing between taps. The lookback offsets become
+    ``o * dilation`` for ``o`` in ``[0, K-1]``, so the state holds
+    ``S = (K-1) * dilation`` positions instead of ``K-1``. Qwen4Exp's N-gram
+    short conv uses ``dilation=ngram_size``; GDN uses the default 1. The
+    weight stays ``[D, K]`` either way.
+
     Returns ``(y [D, T], new_conv_state)``. ``new_conv_state`` holds the
-    last ``K-1`` logical tokens of each request, scattered back into the
+    last ``S`` logical tokens of each request, scattered back into the
     full pool table at ``state_indices`` — its shape is
-    ``[num_blocks, D, K-1]`` (the input ``conv_state``'s shape) and its
+    ``[num_blocks, D, S]`` (the input ``conv_state``'s shape) and its
     dtype matches the pool. When ``conv_state`` is ``None`` (test
     fixture mode with no pool), ``new_conv_state`` falls back to the
-    per-request ``[B, D, K-1]`` slice. The scatter happens inside the
-    kernel so the same shape contract holds when this ref is later
-    replaced by a Pallas kernel that writes directly into pool buffers.
+    per-request ``[B, D, S]`` slice. Here, ``S = (K - 1) * dilation``.
+    The scatter happens inside the kernel so the same shape contract
+    holds when this ref is later replaced by a Pallas kernel that writes
+    directly into pool buffers.
     """
     if activation not in (None, "silu"):
         raise ValueError(f"Unsupported causal conv1d activation: {activation}")
 
     D, T = x.shape
     K = int(weight.shape[1])
+    assert dilation >= 1, f"dilation must be >= 1, got {dilation}"
+    S = (K - 1) * dilation  # state length
     assert cu_seqlens is not None, "cu_seqlens is required"
     B = int(cu_seqlens.shape[0]) - 1
     assert weight.shape == (D, K), f"weight {weight.shape} vs x {x.shape}"
@@ -171,8 +181,8 @@ def jax_causal_conv1d_prefill(
     if conv_state is not None:
         assert conv_state.shape[1:] == (
             D,
-            K - 1,
-        ), f"conv_state {conv_state.shape} channels/kernel != ({D}, {K - 1})"
+            S,
+        ), f"conv_state {conv_state.shape} channels/state_len != ({D}, {S})"
         assert state_indices.shape == (
             B,
         ), f"state_indices {state_indices.shape} != expected ({B},)"
@@ -181,12 +191,12 @@ def jax_causal_conv1d_prefill(
         conv_state = jax.lax.optimization_barrier(conv_state)
         # Gather per-seq prior state once up front; later lookups index by
         # local seq id rather than walking the full table per token.
-        state = conv_state[state_indices]  # [B, D, K-1]
+        state = conv_state[state_indices]  # [B, D, S]
         # Brand-new prefills (has_initial_state=False) must not read stale
         # slot contents — the slot was previously owned by another request
         # before allocation. Zero them out so both the per-token lookback
         # gather AND the final-state left-pad treat them as fresh.
-        if has_initial_state is not None and K > 1:
+        if has_initial_state is not None and S > 0:
             assert has_initial_state.shape == (
                 B,
             ), f"has_initial_state {has_initial_state.shape} != expected ({B},)"
@@ -207,34 +217,34 @@ def jax_causal_conv1d_prefill(
     seq_idx = jnp.searchsorted(cu_seqlens, t_idx, side="right") - 1  # [T]
     pos = t_idx - starts[seq_idx]  # [T]
 
-    # Build the depthwise window. For each lookback o in [0, K-1] the source
-    # logical position is p' = pos[t] - o; in-request when p' >= 0, otherwise
-    # the lookback predates this batch and must come from the saved
-    # `conv_state`. The state holds the K-1 most-recent pre-batch tokens
-    # with newest at index K-2, so logical position p' (negative when
-    # pre-batch) maps to state slot (K-1) + p'.
-    o = jnp.arange(K)
+    # Build the depthwise window. For each tap o in [0, K-1] the source
+    # logical position is p' = pos[t] - o*dilation; in-request when p' >= 0,
+    # otherwise the lookback predates this batch and must come from the saved
+    # `conv_state`. The state holds the S most-recent pre-batch tokens
+    # with newest at index S-1, so logical position p' (negative when
+    # pre-batch) maps to state slot S + p'.
+    o = jnp.arange(K) * dilation
     src_t = t_idx[:, None] - o[None, :]  # [T, K]
     in_seq = src_t >= starts[seq_idx][:, None]  # [T, K]
     src_t_safe = jnp.clip(src_t, 0, T - 1)
     x_gathered = x[:, src_t_safe]  # [D, T, K]
 
-    if state is not None and K > 1:
+    if state is not None and S > 0:
         p_prime = pos[:, None] - o[None, :]  # [T, K]
-        is_idx = jnp.clip((K - 1) + p_prime, 0, K - 2)  # [T, K]
-        # Advanced indexing into [B, D, K-1] with two index arrays of shape
+        is_idx = jnp.clip(S + p_prime, 0, S - 1)  # [T, K]
+        # Advanced indexing into [B, D, S] with two index arrays of shape
         # [T, K] (seq_idx broadcast and is_idx) plus a full slice on D
         # yields [T, K, D] (the slice axis trails the advanced ones per
         # numpy rules). Transpose back to [D, T, K] to match `x_gathered`.
         init_pulled = state[seq_idx[:, None], :, is_idx]  # [T, K, D]
         init_pulled = jnp.transpose(init_pulled, (2, 0, 1))  # [D, T, K]
         x_gathered = jnp.where(in_seq[None], x_gathered, init_pulled)
-    elif K > 1:
+    elif S > 0:
         x_gathered = jnp.where(in_seq[None], x_gathered, jnp.zeros_like(x_gathered))
-    # K == 1: no lookback, `src_t == t_idx` and `in_seq` is all-True; no
-    # masking needed.
+    # S == 0 (K == 1): no lookback, `src_t == t_idx` and `in_seq` is all-True;
+    # no masking needed.
 
-    # weight[d, K-1-o] is the coefficient for lookback o.
+    # weight[d, K-1-o] is the coefficient for tap o.
     w_flipped = weight[:, ::-1].astype(x.dtype)  # [D, K]
     y = jnp.einsum("dtk,dk->dt", x_gathered, w_flipped)
     if bias is not None:
@@ -242,24 +252,24 @@ def jax_causal_conv1d_prefill(
     if activation == "silu":
         y = jax.nn.silu(y)
 
-    # Final state: the K-1 most-recent logical tokens of each request.
-    # logical_idx[b, j] = (seq_lens[b] - (K-1)) + j, indexing into the per-
+    # Final state: the S most-recent logical tokens of each request.
+    # logical_idx[b, j] = (seq_lens[b] - S) + j, indexing into the per-
     # request "logical token stream" (state-padding ++ in-batch tokens).
     # When >= 0 the token came from x; when < 0 the token came from the
     # prior conv_state (or zero pad).
-    if K > 1:
-        j = jnp.arange(K - 1)[None, :]  # [1, K-1]
-        logical_idx = seq_lens[:, None] - (K - 1) + j  # [B, K-1]
+    if S > 0:
+        j = jnp.arange(S)[None, :]  # [1, S]
+        logical_idx = seq_lens[:, None] - S + j  # [B, S]
         take_from_x = logical_idx >= 0
         src_t_end_safe = jnp.clip(starts[:, None] + logical_idx, 0, T - 1)
-        from_x = jnp.transpose(x[:, src_t_end_safe], (1, 0, 2))  # [B, D, K-1]
+        from_x = jnp.transpose(x[:, src_t_end_safe], (1, 0, 2))  # [B, D, S]
         if state is not None:
-            is_slot = jnp.clip((K - 1) + logical_idx, 0, K - 2)  # [B, K-1]
+            is_slot = jnp.clip(S + logical_idx, 0, S - 1)  # [B, S]
             b_idx = jnp.arange(B)[:, None]
             # Same advanced-indexing-with-slice trick as the per-token
-            # gather above: result is [B, K-1, D]; transpose to [B, D, K-1].
-            from_init = state[b_idx, :, is_slot]  # [B, K-1, D]
-            from_init = jnp.transpose(from_init, (0, 2, 1))  # [B, D, K-1]
+            # gather above: result is [B, S, D]; transpose to [B, D, S].
+            from_init = state[b_idx, :, is_slot]  # [B, S, D]
+            from_init = jnp.transpose(from_init, (0, 2, 1))  # [B, D, S]
             final_state = jnp.where(take_from_x[:, None, :], from_x, from_init)
         else:
             final_state = jnp.where(take_from_x[:, None, :], from_x, jnp.zeros_like(from_x))
@@ -281,7 +291,7 @@ def jax_causal_conv1d_prefill(
 
 def jax_causal_conv1d_update(
     x: jax.Array,  # [B, D]  one new token per batch element
-    conv_state: jax.Array,  # [num_blocks, D, kernel_size-1]  full per-layer table
+    conv_state: jax.Array,  # [num_blocks, D, S]  full per-layer table
     state_indices: jax.Array,  # [B]  req → slot
     weight: jax.Array,  # [D, kernel_size]
     bias: jax.Array | None = None,  # [D]
@@ -289,6 +299,7 @@ def jax_causal_conv1d_update(
     has_initial_state: jax.Array | None = None,  # [B] bool
     track_indices: jax.Array | None = None,  # [B] req → track slot (None = OFF)
     track_mask: jax.Array | None = None,  # [B] bool boundary mask
+    dilation: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
     """Single-token causal conv1d update.
 
@@ -297,9 +308,10 @@ def jax_causal_conv1d_update(
     the per-request slice is gathered, updated, and scattered back inside
     the kernel. Returns ``(y [B, D], new_conv_state)`` where
     ``new_conv_state`` is the full pool table
-    ``[num_blocks, D, kernel_size-1]`` with the per-request slots
-    updated. Doing the scatter inside the kernel keeps the same shape
-    contract when this ref is later replaced by a Pallas kernel.
+    ``[num_blocks, D, S]``, where ``S = (kernel_size - 1) * dilation``,
+    with the per-request slots updated. Doing the scatter inside the
+    kernel keeps the same shape contract when this ref is later replaced
+    by a Pallas kernel.
 
     ``has_initial_state``: ``[B]`` bool, optional. ``True`` when the
     slot already holds valid conv state, ``False`` for brand-new
@@ -312,25 +324,28 @@ def jax_causal_conv1d_update(
     assert x.ndim == 2, f"x must be [B, D], got shape {x.shape}"
     B, D = x.shape
     kernel = int(weight.shape[1])
+    assert dilation >= 1, f"dilation must be >= 1, got {dilation}"
+    S = (kernel - 1) * dilation  # state length
     assert conv_state.shape[1:] == (
         D,
-        kernel - 1,
-    ), f"conv_state {conv_state.shape} channels/kernel != ({D}, {kernel - 1})"
+        S,
+    ), f"conv_state {conv_state.shape} channels/state_len != ({D}, {S})"
     assert state_indices.shape == (B,), f"state_indices {state_indices.shape} != expected ({B},)"
 
     # Donated-pool aliasing barrier: conv_state is donated, so under multi-host
     # SPMD the scatter below can race this gather and corrupt reused slots
     # (decode NaN). optimization_barrier is value-preserving -- do not remove.
     conv_state = jax.lax.optimization_barrier(conv_state)
-    state = conv_state[state_indices]  # [B, D, K-1]
-    if has_initial_state is not None and kernel > 1:
+    state = conv_state[state_indices]  # [B, D, S]
+    if has_initial_state is not None and S > 0:
         assert has_initial_state.shape == (
             B,
         ), f"has_initial_state {has_initial_state.shape} != expected ({B},)"
         state = jnp.where(has_initial_state[:, None, None], state, jnp.zeros_like(state))
-    # Rolling buffer: [state(kernel-1), x_new] → window of length kernel.
-    window = jnp.concatenate([state, x[..., None]], axis=-1)  # [B, D, K]
-    y = jnp.einsum("bdk,dk->bd", window, weight.astype(x.dtype))
+
+    # Rolling buffer x[t-S .. t]; taps are every `dilation`-th column of it.
+    window = jnp.concatenate([state, x[..., None]], axis=-1)  # [B, D, S+1]
+    y = jnp.einsum("bdk,dk->bd", window[..., ::dilation], weight.astype(x.dtype))  # [B, D]
     if bias is not None:
         y = y + bias.astype(x.dtype)[None, :]
     if activation == "silu":
@@ -339,7 +354,7 @@ def jax_causal_conv1d_update(
         pass
     else:
         raise ValueError(f"Unsupported causal conv1d activation: {activation}")
-    new_state = window[..., 1:]  # drop oldest
+    new_state = window[..., 1:]  # [B, D, S]  drop oldest
 
     # Scatter the per-request new state back into the full pool table.
     new_conv_state = _scatter_idx0_safe(conv_state, state_indices, new_state)
