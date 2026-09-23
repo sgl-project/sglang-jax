@@ -337,7 +337,9 @@ class ServerArgs:
 
     def __post_init__(self):
         if self.aot_model_dir:
-            from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
+            from sgl_jax.srt.model_executor.compilation_manager import (
+                CompilationManager,
+            )
 
             CompilationManager.restore_aot_defaults(self)
         self._check_disaggregation_overlap_args()
