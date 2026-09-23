@@ -193,7 +193,7 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         # blocks (128 pages split into 43 grid steps). Seed them with the
         # validated 4-head bs1 value (16, 1, 2) pending a proper sweep.
         ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 2): (16, 1, 2),
-        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 4): (16, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 4): (4, 1, 4),
         ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 1): (16, 1, 2),
         ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 2): (16, 1, 2),
         ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 4): (16, 1, 2),
