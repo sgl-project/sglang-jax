@@ -89,15 +89,21 @@ class SpecAsDecodeTest(unittest.TestCase):
                     tok += 1
         np.testing.assert_array_equal(kv_len, want_kv)
         np.testing.assert_array_equal(pcu_q, np.arange(T + 1))
-        np.testing.assert_array_equal(pcu_kv, np.arange(T + 1) * W * PAGE_SIZE)
-        self.assertEqual(ppi.shape, (T * W,))
+        # Stride view: the page table is passed through unchanged and every pseudo
+        # sequence points at its origin sequence's segment start. What the page-level
+        # kernel gathers (page_indices[cu_kv[i] // ps + local]) must equal the pages
+        # of the origin sequence, i.e. the same selection the old per-token copy gave.
+        np.testing.assert_array_equal(ppi, pi)
+        self.assertEqual(pcu_kv.shape, (T + 1,))
         for i in range(T):
             if kv_len[i] == 0:
-                np.testing.assert_array_equal(ppi[i * W : (i + 1) * W], 0)
+                self.assertEqual(pcu_kv[i], 0)
                 continue
             s = int(np.searchsorted(cu_q, i, side="right") - 1)
+            self.assertEqual(pcu_kv[i], cu_kv[s])
             seg = pi[cu_kv[s] // PAGE_SIZE : cu_kv[s] // PAGE_SIZE + W]
-            np.testing.assert_array_equal(ppi[i * W : (i + 1) * W], seg)
+            got = ppi[pcu_kv[i] // PAGE_SIZE : pcu_kv[i] // PAGE_SIZE + W]
+            np.testing.assert_array_equal(got, seg)
         np.testing.assert_array_equal(pdist, [int((want_kv > 0).sum())] * 3)
 
         # indexer-cache write under pseudo metadata == prefill-form slots

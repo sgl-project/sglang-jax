@@ -1069,14 +1069,19 @@ def _spec_pseudo_decode_metadata(
     Token ``i`` (origin sequence ``s``, query offset ``t``) becomes pseudo-sequence
     ``i`` with ``kv_len = seq_lens[s] - q_len[s] + t + 1`` (its own slot + 1, so
     the decode causal bound ``pos < kv_len`` equals the prefill bound
-    ``pos <= abs_q``), a fixed-stride copy of ``s``'s page segment of width
-    ``W = len(page_indices) // num_seqs`` (the ``pages_per_seq`` bound the decode
-    path already assumes), ``cu_q = arange``, ``cu_kv = i * W * page_size``.
-    Padding tokens and empty sequences get ``kv_len 0`` and point at page 0.
+    ``pos <= abs_q``) and ``cu_q = arange``.
+
+    Page table: a stride view, not a copy. The page-level decode kernel locates a
+    sequence's pages as ``page_indices[cu_kv_lens[seq] // page_size + local]`` and
+    never assumes the segments are disjoint, so every pseudo-sequence simply
+    points at its origin sequence's segment: ``cu_kv[i] = cu_kv_lens[s]`` and
+    ``page_indices`` is passed through unchanged. (The previous per-token copy of
+    the full ``pages_per_seq`` window was a ``[T, W]`` gather per layer: 256 x 1056
+    int32 at cc64, ~40 ms of a 168 ms verify step.) Padding tokens and empty
+    sequences get ``kv_len 0`` and point at segment 0.
     Returns ``(kv_len, cu_q_lens, cu_kv_lens, page_indices, distribution)``.
     """
     num_seqs = seq_lens.shape[0]
-    width = max(page_indices.shape[0] // num_seqs, 1)
     tok = jnp.arange(num_tokens, dtype=jnp.int32)
     seg = jnp.searchsorted(cu_q_lens, tok, side="right").astype(jnp.int32) - 1
     seg_c = jnp.clip(seg, 0, num_seqs - 1)
@@ -1090,18 +1095,12 @@ def _spec_pseudo_decode_metadata(
         & (q_len > 0)
     )
     kv_len = jnp.where(valid, seq_lens[seg_c] - q_len + (tok - q_start) + 1, 0).astype(jnp.int32)
-    seg_start = cu_kv_lens[seg_c] // page_size
-    src = jnp.clip(
-        seg_start[:, None] + jnp.arange(width, dtype=jnp.int32)[None, :],
-        0,
-        page_indices.shape[0] - 1,
-    )
-    pi = jnp.where(valid[:, None], page_indices[src], 0).astype(jnp.int32).reshape(-1)
+    cu_kv = jnp.where(valid, cu_kv_lens[seg_c], 0).astype(jnp.int32)
+    cu_kv = jnp.concatenate([cu_kv, cu_kv[-1:]])  # [T + 1]: the kernel indexes cu_kv[seq_id] only
     cu_q = jnp.arange(num_tokens + 1, dtype=jnp.int32)
-    cu_kv = (jnp.arange(num_tokens + 1, dtype=jnp.int32) * (width * page_size)).astype(jnp.int32)
-    n_valid = jnp.sum(valid).astype(jnp.int32)
+    n_valid = valid.sum().astype(jnp.int32)
     dist = jnp.stack([n_valid, n_valid, n_valid]).astype(jnp.int32)
-    return kv_len, cu_q, cu_kv, pi, dist
+    return kv_len, cu_q, cu_kv, page_indices.astype(jnp.int32), dist
 
 
 def _gather_cache_rows(cache: jax.Array, loc: jax.Array, page_size: int) -> jax.Array:
