@@ -164,27 +164,21 @@ class RotatePrefillHiddenTest(unittest.TestCase):
 
 
 class RelayGateTest(unittest.TestCase):
-    def test_default_follows_single_block_config(self):
+    def test_auto_by_chaining(self):
+        # single block chained 3 times (GLM-5.2) -> relay; one block per step -> no relay
         with mock.patch.object(def_mod, "_HIDDEN_RELAY_ENV", None):
-            self.assertTrue(
+            self.assertIsNone(
                 def_mod.mtp_hidden_relay_enabled(SimpleNamespace(num_nextn_predict_layers=1))
             )
-            self.assertFalse(
-                def_mod.mtp_hidden_relay_enabled(SimpleNamespace(num_nextn_predict_layers=3))
-            )
-            self.assertFalse(
-                def_mod.mtp_hidden_relay_enabled(SimpleNamespace())
-            )  # MiMo-style: no field
-            self.assertFalse(def_mod.mtp_hidden_relay_enabled(None))
+            self.assertTrue(def_mod._chained_relay(None, num_steps=3, num_blocks=1))
+            self.assertFalse(def_mod._chained_relay(None, num_steps=3, num_blocks=3))
+            self.assertFalse(def_mod._chained_relay(None, num_steps=1, num_blocks=1))
 
     def test_env_override(self):
-        cfg = SimpleNamespace(num_nextn_predict_layers=1)
         with mock.patch.object(def_mod, "_HIDDEN_RELAY_ENV", "0"):
-            self.assertFalse(def_mod.mtp_hidden_relay_enabled(cfg))
+            self.assertFalse(def_mod._chained_relay(def_mod.mtp_hidden_relay_enabled(None), 3, 1))
         with mock.patch.object(def_mod, "_HIDDEN_RELAY_ENV", "1"):
-            self.assertTrue(
-                def_mod.mtp_hidden_relay_enabled(SimpleNamespace(num_nextn_predict_layers=3))
-            )
+            self.assertTrue(def_mod._chained_relay(def_mod.mtp_hidden_relay_enabled(None), 3, 3))
 
 
 if __name__ == "__main__":

@@ -44,17 +44,30 @@ _HIDDEN_RELAY_ENV = os.environ.get("SGLANG_JAX_MTP_HIDDEN_RELAY")
 _RELAY_POS = os.environ.get("SGLANG_JAX_MTP_RELAY_POS", "0") == "1"
 
 
-def mtp_hidden_relay_enabled(hf_config) -> bool:
-    """Whether draft steps >= 1 take the previous step's output hidden.
-
-    Default: on for single-block MTP checkpoints (``num_nextn_predict_layers == 1``,
-    GLM-5.2 / DeepSeek-style), whose block is chained ``num_steps`` times and was
-    trained on ``(h^{k-1}, tok)`` pairs; off for multi-block MTP (every block reads
-    the target hidden). ``SGLANG_JAX_MTP_HIDDEN_RELAY=0/1`` forces it for A/B runs.
+def mtp_hidden_relay_enabled(hf_config=None):
+    """Env override for the hidden relay: True/False when SGLANG_JAX_MTP_HIDDEN_RELAY is
+    set, else None = decide by chaining (see ``_chained_relay``). ``hf_config`` is
+    accepted for symmetry with the IndexShare gate, but the draft runner's config
+    does not reliably carry ``num_nextn_predict_layers`` (dpa47nap read False on
+    GLM-5.2), so the structural rule is the default.
     """
     if _HIDDEN_RELAY_ENV is not None:
         return _HIDDEN_RELAY_ENV.strip() not in ("", "0", "false", "False")
-    return int(getattr(hf_config, "num_nextn_predict_layers", 0) or 0) == 1
+    return None
+
+
+def _chained_relay(hidden_relay, num_steps: int, num_blocks: int) -> bool:
+    """Resolve the relay flag inside the fused loop.
+
+    ``num_blocks`` = number of distinct draft blocks handed to the loop
+    (``len(all_leaves)``); when it is smaller than ``num_steps`` the last block is
+    applied again (``leaf_idx = -1``), i.e. a single-block MTP chain (GLM-5.2,
+    DeepSeek-style) whose later steps must see the previous step's output hidden.
+    Multi-block MTP (one block per step) keeps the target hidden for every block.
+    """
+    if hidden_relay is not None:
+        return bool(hidden_relay)
+    return num_blocks < num_steps
 
 
 def _spec_decode_compiler_options():
@@ -771,6 +784,7 @@ def _build_draft_extend(
 
         step_hidden = target_hidden
         positions0 = forward_batch.positions
+        relay_on = _chained_relay(hidden_relay, num_layers, len(all_leaves))
         for i in range(num_layers):
             leaf_idx = i if i < len(all_leaves) else -1
             pool_idx = i if i < len(all_memory_pools) else -1
@@ -779,7 +793,7 @@ def _build_draft_extend(
 
             forward_batch.spec_info.hidden_states = step_hidden
             forward_batch.input_ids = input_ids
-            if hidden_relay and _RELAY_POS and i > 0:
+            if relay_on and _RELAY_POS and i > 0:
                 forward_batch.positions = positions0 + i
             forward_batch.spec_kvshare_readonly = bool(_KVSHARE and i >= 1)
 
@@ -815,7 +829,7 @@ def _build_draft_extend(
             if i < num_layers - 1:
                 ext_lens = forward_batch.extend_seq_lens
                 input_ids = _rotate_input_ids(input_ids, ext_lens, sel_pos, topk_idx[:, 0])
-                if hidden_relay:
+                if relay_on:
                     step_hidden = _rotate_hidden(
                         step_hidden, ext_lens, sel_pos, output.hidden_states
                     )
@@ -1641,7 +1655,7 @@ def _build_verify(topk: int):
     return fused_verify
 
 
-def _build_prefill(num_layers: int, topk: int, hidden_relay: bool = False):
+def _build_prefill(num_layers: int, topk: int, hidden_relay=None):
     """Build prefill JIT: target extend + all MTP draft-extend layers."""
     assert topk == 1, "Fused greedy prefill only supports topk=1"
 
@@ -1707,6 +1721,7 @@ def _build_prefill(num_layers: int, topk: int, hidden_relay: bool = False):
         step_hidden = target_hidden
         draft_forward_batch.spec_info.hidden_states = step_hidden
         draft_positions0 = draft_forward_batch.positions
+        relay_on = _chained_relay(hidden_relay, num_layers, len(draft_all_leaves))
         for i in range(num_layers):
             leaf_idx = i if i < len(draft_all_leaves) else -1
             pool_idx = i if i < len(all_memory_pools) else -1
@@ -1716,7 +1731,7 @@ def _build_prefill(num_layers: int, topk: int, hidden_relay: bool = False):
             draft_forward_batch.input_ids = input_ids
             draft_forward_batch.spec_kvshare_readonly = bool(_KVSHARE and i >= 1)
             draft_forward_batch.spec_info.hidden_states = step_hidden
-            if hidden_relay and _RELAY_POS and i > 0:
+            if relay_on and _RELAY_POS and i > 0:
                 draft_forward_batch.positions = draft_positions0 + i
             output, pool_updates, _, _ = model(
                 draft_forward_batch, all_memory_pools[pool_idx], draft_logits_metadata
@@ -1737,7 +1752,7 @@ def _build_prefill(num_layers: int, topk: int, hidden_relay: bool = False):
                     dp_size,
                     per_dp_bs,
                 )
-                if hidden_relay:
+                if relay_on:
                     step_hidden = _rotate_prefill_hidden(
                         step_hidden,
                         draft_forward_batch.extend_seq_lens,
@@ -2156,11 +2171,16 @@ def launch_fused_draft_extend_for_decode(
         hf_config = getattr(getattr(mr0, "model_config", None), "hf_config", None)
         index_share = mtp_index_share_enabled(hf_config, draft_worker.topk)
         hidden_relay = mtp_hidden_relay_enabled(hf_config)
+        n_blocks = len([draft_worker._worker])
+        relay_resolved = _chained_relay(hidden_relay, draft_worker.speculative_num_steps, n_blocks)
         logger.info(
-            "Fused draft extend: MTP IndexShare %s, hidden relay %s%s",
+            "Fused draft extend: MTP IndexShare %s, hidden relay %s (%s; steps=%d blocks=%d)%s",
             "on" if index_share else "off",
-            "on" if hidden_relay else "off",
-            " (+positions)" if hidden_relay and _RELAY_POS else "",
+            "on" if relay_resolved else "off",
+            "forced by env" if hidden_relay is not None else "auto by chaining",
+            draft_worker.speculative_num_steps,
+            n_blocks,
+            " (+positions)" if relay_resolved and _RELAY_POS else "",
         )
         draft_worker._fused_jit_fn = _build_draft_extend(
             num_layers=draft_worker.speculative_num_steps,
