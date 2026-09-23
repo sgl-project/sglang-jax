@@ -507,6 +507,8 @@ class MHATokenToKVPool(KVCache):
         dp_size: int = 1,
         start_layer: int | None = None,
         end_layer: int | None = None,
+        *,
+        abstract: bool = False,
     ):
         super().__init__(size, page_size, dtype, layer_num, mesh, start_layer, end_layer)
         self.head_num = head_num
@@ -515,7 +517,7 @@ class MHATokenToKVPool(KVCache):
         self.kv_partition_axis = "tensor"
         self.attention_data_partition_axis = "data"
 
-        self._create_buffers()
+        self._create_buffers(abstract=abstract)
         self._calculate_memory_usage()
 
     def tree_flatten(self):
@@ -564,7 +566,7 @@ class MHATokenToKVPool(KVCache):
 
         return obj
 
-    def _create_buffers(self):
+    def _create_buffers(self, *, abstract: bool = False):
         """Create sharded fused KV cache buffers with proper distributed allocation"""
         self.kv_sharding = NamedSharding(
             self.mesh,
@@ -587,6 +589,12 @@ class MHATokenToKVPool(KVCache):
             packing,
             self.head_dim,
         )
+        if abstract:
+            self.kv_buffer = [
+                jax.ShapeDtypeStruct(fused_buffer_shape, self.dtype, sharding=self.kv_sharding)
+                for _ in range(self.layer_num)
+            ]
+            return
         total_memory_per_layer = (
             fused_buffer_shape[0]
             * fused_buffer_shape[1]
@@ -1328,6 +1336,7 @@ class MLATokenToKVPool(KVCache):
         end_layer: int | None = None,
         indexer_key_dim: int = 0,
         num_indexer_layers: int = 0,
+        abstract: bool = False,
     ):
         super().__init__(size, page_size, dtype, layer_num, mesh, start_layer, end_layer)
         self.kv_lora_rank = kv_lora_rank
@@ -1340,7 +1349,7 @@ class MLATokenToKVPool(KVCache):
         self.indexer_key_dim = self._aligned_indexer_dim(indexer_key_dim)
         self.num_indexer_layers = num_indexer_layers
 
-        self._create_buffers()
+        self._create_buffers(abstract=abstract)
         self._calculate_memory_usage()
 
     def tree_flatten(self):
@@ -1398,7 +1407,7 @@ class MLATokenToKVPool(KVCache):
 
         return obj
 
-    def _create_buffers(self):
+    def _create_buffers(self, *, abstract: bool = False):
         """Allocate replicated 4D paged KV buffers for the MLA v2 kernel.
 
         Layout matches the kernel ABI (`get_kv_cache_shape`):
@@ -1436,11 +1445,17 @@ class MLATokenToKVPool(KVCache):
             per_layer_bytes / GB,
         )
 
+        def allocate_buffers(shape, count):
+            if abstract:
+                return [
+                    jax.ShapeDtypeStruct(shape, self.dtype, sharding=self.kv_sharding)
+                    for _ in range(count)
+                ]
+            allocate = _get_kv_zero_allocator(shape, self.dtype, self.kv_sharding)
+            return [allocate() for _ in range(count)]
+
         with jax.set_mesh(self.mesh):
-            self.kv_buffer = []
-            allocate = _get_kv_zero_allocator(buffer_shape, self.dtype, self.kv_sharding)
-            for _ in range(self.layer_num):
-                self.kv_buffer.append(allocate())
+            self.kv_buffer = allocate_buffers(buffer_shape, self.layer_num)
 
             self.indexer_key_buffer = []
             if self.indexer_key_dim > 0 and self.num_indexer_layers > 0:
@@ -1457,9 +1472,7 @@ class MLATokenToKVPool(KVCache):
                     idx_shape,
                     self.num_indexer_layers * indexer_bytes / GB,
                 )
-                allocate_indexer = _get_kv_zero_allocator(idx_shape, self.dtype, self.kv_sharding)
-                for _ in range(self.num_indexer_layers):
-                    self.indexer_key_buffer.append(allocate_indexer())
+                self.indexer_key_buffer = allocate_buffers(idx_shape, self.num_indexer_layers)
 
     def get_indexer_key_buffer(self, slot_id: int) -> jax.Array:
         return self.indexer_key_buffer[slot_id]

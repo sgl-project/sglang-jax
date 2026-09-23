@@ -384,6 +384,7 @@ class KimiDecoderLayer(nnx.Module):
                     top_k_groups=config.topk_group,
                     num_shared_experts=config.num_shared_experts,
                     moe_shared_expert_intermediate_size=config.moe_intermediate_size,
+                    quantization_config=getattr(config, "quantization_config", None),
                 )
             else:
                 self.block_sparse_moe = EPMoE(
@@ -396,6 +397,7 @@ class KimiDecoderLayer(nnx.Module):
                     dtype=dtype,
                     layer_id=layer_idx,
                     ep_size=config.ep_size,
+                    quantization_config=getattr(config, "quantization_config", None),
                 )
 
             # Shared experts

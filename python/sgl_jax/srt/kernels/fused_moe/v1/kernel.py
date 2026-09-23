@@ -14,6 +14,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sgl_jax.srt.utils.jax_utils import get_compilation_target, get_device_hbm_limit
+
 P = jax.sharding.PartitionSpec
 
 cdiv = pl.cdiv
@@ -23,8 +25,15 @@ cdiv = pl.cdiv
 _A2A_HBM_FRACTION = 0.03
 
 
-@functools.lru_cache(maxsize=1)
 def _device_hbm_bytes() -> int:
+    target = get_compilation_target()
+    if target is not None and target.platform == "tpu":
+        return get_device_hbm_limit()
+    return _runtime_hbm_bytes()
+
+
+@functools.lru_cache(maxsize=1)
+def _runtime_hbm_bytes() -> int:
     """Total HBM bytes on the local device (cached, queried once)."""
     try:
         return jax.local_devices()[0].memory_stats()["bytes_limit"]

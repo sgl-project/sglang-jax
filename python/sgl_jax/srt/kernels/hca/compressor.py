@@ -15,12 +15,13 @@ import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 from sgl_jax.srt.kernels.hca.tuned_block_sizes import HCAKernelSchedule
+from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 
 
 def _interpret_pallas() -> bool:
     return (
         os.environ.get("PALLAS_INTERPRET", "").strip().lower() in ("1", "true")
-        or jax.default_backend() != "tpu"
+        or not is_tpu_runtime()
     )
 
 

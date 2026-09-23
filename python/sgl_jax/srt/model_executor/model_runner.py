@@ -41,6 +41,10 @@ from sgl_jax.srt.model_executor.aot_dispatch import (
 )
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sgl_jax.srt.model_executor.model_forward import (
+    _maybe_apply_recurrent_cow as _maybe_apply_recurrent_cow,  # DFlash imports this helper.
+)
+from sgl_jax.srt.model_executor.model_forward import make_jitted_run_model
 from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
     _build_non_hybrid_memory_pools,
@@ -86,21 +90,6 @@ def _embedding_pool_bytes(
     capacity = -(-server_args.max_prefill_tokens // page_size) * page_size
     packed_hidden = _packed_embedding_hidden(model_config, multimodal_model)
     return capacity * packed_hidden * jnp.dtype(model_config.dtype).itemsize
-
-
-def _maybe_apply_recurrent_cow(forward_batch, memory_pools):
-    """One-shot CoW: clone matched tree slots (src, 0 = skip) into running slots
-    before any recurrent read; no-op when nothing is pending."""
-    src = getattr(forward_batch, "recurrent_cow_src_indices", None)
-    if src is None or forward_batch.recurrent_indices is None:
-        return memory_pools
-    rsp = memory_pools.recurrent_state_pool
-    new_recurrent, new_conv = rsp.copy_slots(src, forward_batch.recurrent_indices)
-    _, aux = rsp.tree_flatten()
-    new_rsp = type(rsp).tree_unflatten(aux, (new_recurrent, new_conv))
-    pools = dict(memory_pools._pools)
-    pools["recurrent_state_pool"] = new_rsp
-    return type(memory_pools)(**pools)
 
 
 class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
@@ -328,28 +317,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 **(jit_compiler_options or {}),
             }
 
-        @partial(
-            jax.jit,
-            donate_argnames=["memory_pools"],
-            static_argnames=["model_state_def"],
-            compiler_options=jit_compiler_options,
-        )
-        def jitted_run_model(
-            model_def,
-            model_state_def,
-            model_state_leaves,
-            forward_batch,
-            memory_pools,
-            logits_metadata,
-        ):
-            prepare_model_state = getattr(self.attn_backend, "prepare_model_state", None)
-            if prepare_model_state is not None:
-                model_state_leaves = prepare_model_state(model_state_leaves)
-            model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
-            model = nnx.merge(model_def, model_state)
-            memory_pools = _maybe_apply_recurrent_cow(forward_batch, memory_pools)
-            with LoraBatchContext.set_batch(forward_batch):
-                return model(forward_batch, memory_pools, logits_metadata)
+        jitted_run_model = make_jitted_run_model(self.attn_backend, jit_compiler_options)
 
         # Capture the base RNG key as a constant in the JIT closure. The sampler
         # folds in the dynamic step inside its regular-sampling cond branch, so
@@ -644,22 +612,10 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             if not is_static:
                 logger.info("Applying DYNAMIC (online) quantization...")
                 from sgl_jax.srt.utils.quantization.quantization_utils import (
-                    apply_linear_quantization,
-                    apply_moe_quantization,
+                    apply_quantization,
                 )
 
-                # Apply MoE quantization first
-                if self.model_config.quantization_config.has_moe_quantization():
-                    self.model = apply_moe_quantization(
-                        self.model_config, self.model, is_static_input=False
-                    )
-
-                # Apply quantization for linear layers
-                linear_rules = self.model_config.quantization_config.get_linear_rules()
-                if linear_rules:
-                    self.model = apply_linear_quantization(
-                        self.model_config, self.model, is_static_input=False
-                    )
+                self.model = apply_quantization(self.model_config, self.model)
             else:
                 logger.info("Static quantization detected. Skipping online requantization.")
         # Parse other args

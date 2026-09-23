@@ -6,7 +6,7 @@ import logging
 import re
 from typing import NamedTuple
 
-import jax
+from sgl_jax.srt.utils.jax_utils import get_device_kind
 
 logger = logging.getLogger(__name__)
 
@@ -701,7 +701,7 @@ def get_device_vmem_limit() -> int:
 
 def get_tpu_version() -> int:
     """Returns the numeric version of the TPU, or -1 if not on TPU."""
-    kind = jax.devices()[0].device_kind
+    kind = get_device_kind()
     match = re.match(r"^TPU[^\d]*(\d+)", kind)
     if match is None:
         return -1

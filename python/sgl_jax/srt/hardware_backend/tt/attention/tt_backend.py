@@ -36,7 +36,7 @@ def prepare_weight(tensor):
 class TTTokenToKVPool(MHATokenToKVPool):
     """Separate K/V pages in the layout consumed by TTNN attention."""
 
-    def _create_buffers(self):
+    def _create_buffers(self, *, abstract: bool = False):
         self.kv_sharding = NamedSharding(self.mesh, P("data", "tensor", None, None))
         shape = (
             (self.size + self.page_size * self.dp_size) // self.page_size,
@@ -44,6 +44,15 @@ class TTTokenToKVPool(MHATokenToKVPool):
             self.page_size,
             self.head_dim,
         )
+        if abstract:
+            self.kv_buffer = [
+                tuple(
+                    jax.ShapeDtypeStruct(shape, self.dtype, sharding=self.kv_sharding)
+                    for _ in range(2)
+                )
+                for _ in range(self.layer_num)
+            ]
+            return
         zeros = np.zeros(shape, dtype=np.dtype(self.dtype))
         start = time.time()
         with self.mesh:
