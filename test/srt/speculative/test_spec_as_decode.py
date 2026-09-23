@@ -251,8 +251,10 @@ class PageLevelWrapperTraceTest(unittest.TestCase):
     """The page-level wrapper must trace (make_jaxpr) for every page_share_group
     the backend can pass; the group is a Python int and has to stay static."""
 
-    def _args(self, T=8, S=2, kp=8, ps=128, pages_per_seq=16, rank=16, rope=8, heads=4):
-        cache = jnp.zeros((S * pages_per_seq + 1, ps, rank + rope), jnp.bfloat16)
+    def _args(self, T=8, S=2, kp=8, ps=128, pages_per_seq=16, rank=512, rope=64, heads=4):
+        cache = jnp.zeros(
+            (S * pages_per_seq + 1, ps // 2, 2, rank + 128), jnp.bfloat16
+        )  # [Pn, ps//pk, pk, D]; rope padded to 128
         ql = jnp.zeros((T, heads, rank), jnp.bfloat16)
         qpe = jnp.zeros((T, heads, rope), jnp.bfloat16)
         kv = jnp.zeros((T, rank), jnp.bfloat16)
@@ -276,7 +278,7 @@ class PageLevelWrapperTraceTest(unittest.TestCase):
                 sm_scale=1.0,
                 page_size=128,
                 pages_per_seq=16,
-                kv_lora_rank=16,
+                kv_lora_rank=512,
                 k_pages_max=8,
                 page_share_group=g,
             )
