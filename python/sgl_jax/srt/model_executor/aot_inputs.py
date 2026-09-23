@@ -78,11 +78,9 @@ def load_config(options, model_path, *, is_draft=False):
             "max_position_embeddings": 256,
             "tie_word_embeddings": False,
         }
-    if raw.get("quantization_config") and not options.bf16_model:
-        raise ValueError(
-            "Use --bf16-model to explicitly export a synthetic BF16 variant of a quantized config"
-        )
-    raw.pop("quantization_config", None)
+    if options.bf16_model:
+        raw.pop("quantization_config", None)
+        raw.pop("compression_config", None)
     # ModelConfig imports the serving custom config registrations. Unknown HF
     # model_type values can still name a registered SGLang architecture, whose
     # constructor consumes the fields of a generic PretrainedConfig.
@@ -98,7 +96,12 @@ def load_config(options, model_path, *, is_draft=False):
         dtype="bfloat16",
         is_draft_model=is_draft,
         moe_backend=options.moe_backend or "epmoe",
+        quantization_config_path=options.quantization_config_path,
     )
+    if (raw.get("quantization_config") or raw.get("compression_config")) and (
+        model_config.quantization_config is None
+    ):
+        raise ValueError("Serving could not resolve the model's quantization configuration")
     if is_draft:
         count = getattr(hf_config, "num_nextn_predict_layers", None)
         if count is not None and options.mtp_layer_idx >= count:

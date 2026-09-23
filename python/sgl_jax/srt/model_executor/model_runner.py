@@ -611,22 +611,10 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             if not is_static:
                 logger.info("Applying DYNAMIC (online) quantization...")
                 from sgl_jax.srt.utils.quantization.quantization_utils import (
-                    apply_linear_quantization,
-                    apply_moe_quantization,
+                    apply_quantization,
                 )
 
-                # Apply MoE quantization first
-                if self.model_config.quantization_config.has_moe_quantization():
-                    self.model = apply_moe_quantization(
-                        self.model_config, self.model, is_static_input=False
-                    )
-
-                # Apply quantization for linear layers
-                linear_rules = self.model_config.quantization_config.get_linear_rules()
-                if linear_rules:
-                    self.model = apply_linear_quantization(
-                        self.model_config, self.model, is_static_input=False
-                    )
+                self.model = apply_quantization(self.model_config, self.model)
             else:
                 logger.info("Static quantization detected. Skipping online requantization.")
         # Parse other args

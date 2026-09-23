@@ -39,10 +39,15 @@ def parse_args():
     parser.add_argument("--ep-size", type=int, default=1)
     parser.add_argument("--attention-backend", choices=("native", "fa"), default="native")
     parser.add_argument("--moe-backend", choices=("epmoe", "fused_v2"))
-    parser.add_argument(
+    quantization = parser.add_mutually_exclusive_group()
+    quantization.add_argument(
         "--bf16-model",
         action="store_true",
         help="Explicitly replace checkpoint quantization with synthetic BF16 weights",
+    )
+    quantization.add_argument(
+        "--quantization-config-path",
+        help="Serving quantization YAML path or built-in filename (e.g. fp8_w8a8.yaml)",
     )
     parser.add_argument(
         "--batch-size", type=int, default=1, help="Global request count for this forward"

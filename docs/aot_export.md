@@ -80,15 +80,27 @@ PYTHONPATH=python python -m sgl_jax.compile \
   --stage compiled --dump-llo --output /tmp/model-ir
 ```
 
-The exporter currently constructs synthetic BF16 parameters. If the config
-contains quantization metadata, add `--bf16-model` only when you want a BF16
-variant: it removes that metadata from the effective config, without reading or
-converting checkpoint tensors. Quantized weight and scale construction is not
-yet wired into this abstract loader; this is independent of the compilation
-target. An FP8 graph needs its quantized parameter structure and kernel path, so
-BF16 IR cannot represent its compute or memory requirements. The original config
-is saved as `source_config.json`; the effective config and synthetic weight format
-are recorded in `manifest.json`.
+Quantization metadata in the model config is honored by default through serving's
+configuration resolver. To apply online quantization to an unquantized config,
+add `--quantization-config-path fp8_w8a8.yaml` (or `int8_w8a8.yaml`). This option
+also accepts a local YAML path, with the same rules, block sizes, activation
+dtypes, and ignored layers as serving. For a static quantized checkpoint config,
+it overrides the quantization rules while retaining static weight loading.
+
+The exporter constructs abstract low-precision weights and scales without reading
+checkpoint tensors. It follows serving's initialization order: static structure
+preparation before loading, model-specific post-load transformations, then online
+weight quantization for non-static configs. The resulting parameters are inputs
+to the exported forward; load-time conversions are outside that graph. Dynamic
+activation quantization remains inside the forward. Parameters that serving
+keeps or converts to BF16 remain BF16 in the export.
+
+Use `--bf16-model` only to explicitly export an unquantized BF16 variant; it cannot
+be combined with `--quantization-config-path`. The original model config is saved
+as `source_config.json`. Inspect `quantization`, `parameter_dtypes`, and input
+signatures in `manifest.json` for the resolved configuration, parameter formats,
+and scale shapes. Parameter byte counts are global logical sizes, not per-device
+HBM peaks.
 
 ## Choose a TPU topology and parallelism
 

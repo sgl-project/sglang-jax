@@ -3,6 +3,7 @@
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 import re
 import subprocess
@@ -99,7 +100,7 @@ def export(options):
     manifest = {
         "schema_version": 1,
         "status": "running",
-        "scope": f"Synthetic BF16 model forward, {options.workload}, no checkpoint loading or execution",
+        "scope": f"Synthetic model forward, {options.workload}, no checkpoint loading or execution",
         "executed": False,
         "options": {
             key: str(value) if isinstance(value, Path) else value
@@ -134,6 +135,18 @@ def export(options):
             fn, args, config, workload = build_inputs(options, mesh)
             manifest["model_config"] = config.to_dict()
             manifest["model_config"]["model_type"] = config.model_type
+            quantization = getattr(config, "quantization_config", None)
+            manifest["quantization"] = quantization.to_dict() if quantization is not None else None
+            manifest["parameter_dtypes"] = {}
+            for value in args[2]:
+                dtype = str(value.dtype)
+                stats = manifest["parameter_dtypes"].setdefault(
+                    dtype, {"tensors": 0, "elements": 0, "bytes": 0}
+                )
+                elements = math.prod(value.shape)
+                stats["tensors"] += 1
+                stats["elements"] += elements
+                stats["bytes"] += elements * value.dtype.itemsize
             if options.model_config:
                 original = Path(options.model_config).read_bytes()
                 (output / "source_config.json").write_bytes(original)
@@ -149,7 +162,7 @@ def export(options):
                 "moe_backend": options.moe_backend,
                 "attention_tp_size": options.tp_size // options.dp_size,
                 "ep_size": options.ep_size,
-                "weights": "synthetic_bfloat16",
+                "weights": "synthetic",
             }
             manifest["input_signature"] = _array_signature(args[2:])
             manifest["target_devices"] = [str(device) for device in mesh.devices.flat]

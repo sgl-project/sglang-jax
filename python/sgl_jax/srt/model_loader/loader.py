@@ -302,15 +302,10 @@ class JAXModelLoader(DefaultModelLoader):
             if is_static:
                 logger.info("Applying STATIC quantization structure preparation...")
                 from sgl_jax.srt.utils.quantization.quantization_utils import (
-                    apply_linear_quantization,
-                    apply_moe_quantization,
+                    apply_quantization,
                 )
 
-                if model_config.quantization_config.has_moe_quantization():
-                    model = apply_moe_quantization(model_config, model, is_static_input=True)
-
-                if model_config.quantization_config.get_linear_rules():
-                    model = apply_linear_quantization(model_config, model, is_static_input=True)
+                model = apply_quantization(model_config, model, is_static_input=True)
             else:
                 logger.info("Dynamic quantization detected. Skipping structure change in loader.")
         else:
@@ -355,11 +350,27 @@ class JAXDummyModelLoader(BaseModelLoader):
             kwargs["dtype_config"] = getattr(model_config, "dtype_config", None)
 
         if getattr(model_config, "_abstract_mode", False):
+            from sgl_jax.srt.utils.quantization.quantization_utils import (
+                apply_quantization,
+            )
+
             model_config._dummy_mode = True
+            quant_config = model_config.quantization_config
+            is_static = quant_config is not None and quant_config.is_static_checkpoint
 
             def init_and_load():
-                model = model_class(model_config.hf_config, **kwargs)
+                def initialize():
+                    return model_class(model_config.hf_config, **kwargs)
+
+                # Static preparation consumes shape descriptors, just as the
+                # checkpoint loader does. Trace loading/post-load transforms
+                # and online quantization without allocating parameter arrays.
+                model = nnx.eval_shape(initialize) if is_static else initialize()
+                if is_static:
+                    model = apply_quantization(model_config, model, is_static_input=True)
                 model.load_weights(model_config)
+                if not is_static:
+                    model = apply_quantization(model_config, model)
                 return model
 
             with jax.set_mesh(self.mesh):

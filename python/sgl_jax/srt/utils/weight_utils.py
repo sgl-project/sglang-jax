@@ -231,7 +231,12 @@ class WeightLoader:
         from sgl_jax.srt.layers.linear import LinearBase
 
         in_features, out_features = weight.shape
-        with jax.set_mesh(mesh):
+        mesh_context = (
+            jax.sharding.use_abstract_mesh(mesh.abstract_mesh)
+            if isinstance(weight, jax.core.Tracer)
+            else jax.set_mesh(mesh)
+        )
+        with mesh_context:
             new_linear = LinearBase(
                 input_size=in_features,
                 output_size=out_features,
@@ -257,6 +262,10 @@ class WeightLoader:
         """
         weight_q = ql.weight_q.value
         weight_scale = ql.weight_scale.value
+        if self.dummy_mode:
+            # QuantizedLinear placeholders use [out, in]. Normalize explicitly
+            # so square projections do not rely on ambiguous shape inference.
+            weight_q = weight_q.T
 
         if weight_scale.ndim == 3:
             weight_bf16 = self._block_dequant(weight_q, weight_scale, head_dim=head_dim)
@@ -479,6 +488,18 @@ class WeightLoader:
 
         from jax.sharding import NamedSharding
 
+        if self.dummy_mode:
+            # Dummy weights already have the final projection shapes. There
+            # are no raw checkpoint buffers, but serving still consumes BF16
+            # K/V projections after this post-load hook.
+            self.dequant_fp8_layers(
+                layers,
+                specs=[
+                    ("self_attn.k_proj", config.head_dim),
+                    ("self_attn.v_proj", getattr(config, "v_head_dim", config.head_dim)),
+                ],
+            )
+            return
         if not kv_buffers:
             return
 
@@ -582,6 +603,16 @@ class WeightLoader:
             layers: model.layers list
             config: model config with head_dim, v_head_dim, num_attention_heads, etc.
         """
+        if self.dummy_mode:
+            self.dequant_fp8_layers(
+                layers,
+                specs=[
+                    ("self_attn.q_proj", config.head_dim),
+                    ("self_attn.k_proj", config.head_dim),
+                    ("self_attn.v_proj", getattr(config, "v_head_dim", config.head_dim)),
+                ],
+            )
+            return
         if not fused_qkv_buffers:
             return
 
@@ -2435,6 +2466,10 @@ class WeightLoader:
             dtype = model_param.value.dtype
 
             sharding_spec = P(*mapping.sharding) if mapping.sharding else P()
+            if self.is_static_quant and target_path.endswith(("weight_q", "weight_scale")):
+                # Quantized placeholders already describe the transposed
+                # weight and expanded scale consumed by the runtime kernel.
+                sharding_spec = model_param.value.sharding.spec
             sharding = jax.sharding.NamedSharding(self.mesh, sharding_spec)
             # jit(zeros) compiles to a device-side XLA constant -> 0 H2D. The
             # original make_array_from_callback path serializes ndev host
