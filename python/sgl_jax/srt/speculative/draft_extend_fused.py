@@ -34,6 +34,10 @@ logger = logging.getLogger(__name__)
 # GLM-5.2 KVShare: draft steps >= 1 reuse step 0's selection AND KV; they must not
 # write their own KV / indexer keys (opt-in A/B, see dsa_sparse_backend readonly).
 _KVSHARE = os.environ.get("SGLANG_JAX_MTP_KVSHARE", "0") == "1"
+# Single-layer MTP chain (GLM-5.2: num_nextn_predict_layers=1 applied num_steps times):
+# feed draft step j >= 1 the previous step's output hidden (sglang EAGLE draft loop:
+# hidden_states = logits_output.hidden_states) instead of reusing the target hidden.
+_HIDDEN_RELAY = os.environ.get("SGLANG_JAX_MTP_HIDDEN_RELAY", "0") == "1"
 
 
 def _spec_decode_compiler_options():
@@ -561,6 +565,62 @@ def _rotate_prefill_input_ids(input_ids, extend_seq_lens, verified_id, dp_size, 
     return jax.vmap(rotate_rank)(ids, ext, verified).reshape(input_ids.shape)
 
 
+def _rotate_hidden(hidden, ext_lens, sel_pos, prev_out_hidden):
+    """Hidden-state relay for draft step j >= 1 of the single-layer chain.
+
+    Mirrors ``_rotate_input_ids``: each request's ``[tokens_per_req, H]`` window
+    shifts left by one so row k stays paired with the rotated ``input_ids`` row k
+    (the MTP block consumes ``(h_i, tok_{i+1})`` pairs), and the last valid slot
+    takes the previous step's output hidden at that slot -- the draft's own
+    ``h_{t+j}``, which the target never produced. Padding requests keep their rows.
+    """
+    bs = ext_lens.shape[0]
+    tokens_per_req = hidden.shape[0] // bs
+
+    def _rot(hidden, ext_lens, sel_pos, prev):
+        h2 = hidden.reshape(bs, tokens_per_req, -1)
+        p2 = prev.reshape(bs, tokens_per_req, -1)
+        shifted = jnp.concatenate([h2[:, 1:], h2[:, -1:]], axis=1)
+        rows = jnp.arange(bs)
+        shifted = shifted.at[rows, sel_pos].set(p2[rows, sel_pos])
+        pad_mask = (ext_lens == 0)[:, None, None]
+        return jnp.where(pad_mask, h2, shifted).reshape(hidden.shape)
+
+    return _auto_sharded(_rot, hidden)(hidden, ext_lens, sel_pos, prev_out_hidden)
+
+
+def _rotate_prefill_hidden(hidden, extend_seq_lens, prev_out_hidden, dp_size, per_dp_bs):
+    """Prefill-time counterpart of ``_rotate_hidden`` for the ragged per-rank layout
+    used by ``_rotate_prefill_input_ids`` (rows shift left inside each request's
+    segment; the segment's last row takes the previous step's output at that row).
+    Every index array is built inside the auto-sharded region (an explicit-mesh
+    ``arange`` closed over from outside fails the region's mesh check).
+    """
+    per_dp_tokens = hidden.shape[0] // dp_size
+
+    def rotate_rank(h_rank, ext_rank, prev_rank):
+        n_req = ext_rank.shape[0]
+        tok = jnp.arange(per_dp_tokens, dtype=jnp.int32)
+        idx = jnp.arange(n_req)
+        tri = (idx[:, None] >= idx[None, :]).astype(jnp.int32)
+        ends = jnp.dot(tri, ext_rank)  # inclusive cumsum
+        starts = ends - ext_rank
+        in_req = (tok[None, :] >= starts[:, None]) & (tok[None, :] < ends[:, None])
+        has_req = jnp.any(in_req, axis=0)
+        is_last = jnp.any(in_req & (tok[None, :] == (ends - 1)[:, None]), axis=0)
+        shifted = jnp.take(h_rank, jnp.minimum(tok + 1, per_dp_tokens - 1), axis=0)
+        out = jnp.where(is_last[:, None], prev_rank, shifted)
+        return jnp.where(has_req[:, None], out, h_rank)
+
+    def _rot(hidden, ext_flat, prev):
+        h3 = hidden.reshape(dp_size, per_dp_tokens, -1)
+        p3 = prev.reshape(dp_size, per_dp_tokens, -1)
+        ext = ext_flat.reshape(dp_size, per_dp_bs)
+        return jax.vmap(rotate_rank)(h3, ext, p3).reshape(hidden.shape)
+
+    return _auto_sharded(_rot, hidden)(hidden, extend_seq_lens, prev_out_hidden)
+
+
 def _gather_rows_preserve_sharding(values, index):
     sharding = jax.typeof(values).sharding
     if isinstance(sharding, NamedSharding):
@@ -690,13 +750,14 @@ def _build_draft_extend(num_layers: int, topk: int, index_share: bool = False):
                 dp_size=dp_size,
             )
 
+        step_hidden = target_hidden
         for i in range(num_layers):
             leaf_idx = i if i < len(all_leaves) else -1
             pool_idx = i if i < len(all_memory_pools) else -1
             state = jax.tree_util.tree_unflatten(model_state_def, all_leaves[leaf_idx])
             model = nnx.merge(model_def, state)
 
-            forward_batch.spec_info.hidden_states = target_hidden
+            forward_batch.spec_info.hidden_states = step_hidden
             forward_batch.input_ids = input_ids
             forward_batch.spec_kvshare_readonly = bool(_KVSHARE and i >= 1)
 
@@ -732,6 +793,10 @@ def _build_draft_extend(num_layers: int, topk: int, index_share: bool = False):
             if i < num_layers - 1:
                 ext_lens = forward_batch.extend_seq_lens
                 input_ids = _rotate_input_ids(input_ids, ext_lens, sel_pos, topk_idx[:, 0])
+                if _HIDDEN_RELAY:
+                    step_hidden = _rotate_hidden(
+                        step_hidden, ext_lens, sel_pos, output.hidden_states
+                    )
 
         forward_batch.spec_kvshare_readonly = False
         last_idx = draft_logits_indices
@@ -1616,7 +1681,8 @@ def _build_prefill(num_layers: int, topk: int):
         layer0_hidden = None
         mesh = None
 
-        draft_forward_batch.spec_info.hidden_states = target_hidden
+        step_hidden = target_hidden
+        draft_forward_batch.spec_info.hidden_states = step_hidden
         for i in range(num_layers):
             leaf_idx = i if i < len(draft_all_leaves) else -1
             pool_idx = i if i < len(all_memory_pools) else -1
@@ -1625,7 +1691,7 @@ def _build_prefill(num_layers: int, topk: int):
 
             draft_forward_batch.input_ids = input_ids
             draft_forward_batch.spec_kvshare_readonly = bool(_KVSHARE and i >= 1)
-            draft_forward_batch.spec_info.hidden_states = target_hidden
+            draft_forward_batch.spec_info.hidden_states = step_hidden
             output, pool_updates, _, _ = model(
                 draft_forward_batch, all_memory_pools[pool_idx], draft_logits_metadata
             )
@@ -1645,6 +1711,14 @@ def _build_prefill(num_layers: int, topk: int):
                     dp_size,
                     per_dp_bs,
                 )
+                if _HIDDEN_RELAY:
+                    step_hidden = _rotate_prefill_hidden(
+                        step_hidden,
+                        draft_forward_batch.extend_seq_lens,
+                        output.hidden_states,
+                        dp_size,
+                        per_dp_bs,
+                    )
 
         last_idx = draft_logits_indices
         if dp_size > 1:
