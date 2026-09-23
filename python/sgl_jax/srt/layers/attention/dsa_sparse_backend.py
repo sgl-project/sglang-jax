@@ -285,6 +285,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 sm_scale,
                 dpa,
                 md,
+                forward_batch,
             )
 
         # ── prefill/mixed ─────────────────────────────────────────────────
@@ -299,16 +300,19 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         if not is_decode:
             if _PREFILL_SPARSE:
                 reuse_pages = is_full and dsa_topk_reuse and dsa_topk_pages_in is not None
-                idx_cache, topk_pages = self._maybe_index_prefill_pages(
-                    is_full,
-                    q_idx,
-                    k_idx,
-                    idx_weights,
-                    idx_cache,
-                    dpa,
-                    md,
-                    compute_pages=not reuse_pages,
-                )
+                if reuse_pages and bool(getattr(forward_batch, "spec_kvshare_readonly", False)):
+                    topk_pages = None  # KVShare: no indexer-key write for draft steps >= 1
+                else:
+                    idx_cache, topk_pages = self._maybe_index_prefill_pages(
+                        is_full,
+                        q_idx,
+                        k_idx,
+                        idx_weights,
+                        idx_cache,
+                        dpa,
+                        md,
+                        compute_pages=not reuse_pages,
+                    )
                 # Page selection for the sparse-prefill attend. A FULL (indexer)
                 # layer just produced [T, k_pages] page-topk; a SHARED layer gets
                 # None from `_maybe_index_prefill_pages` and reuses the preceding
@@ -712,6 +716,23 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             cu_q_lens=cu_q, cu_kv_lens=cu_kv, page_indices=pi, seq_lens=kv_len, distribution=dist
         )
 
+    def _gather_spec_kv(self, cache, dpa, md, num_tokens, rope):
+        """Current latent rows at each spec token's slot: (kv_c [T, lkv], k_pe [T, rope])."""
+        page_size = self.page_size
+        kv_lora_rank = self.kv_lora_rank
+        t_local = num_tokens // self.mesh.shape[dpa]
+        in_specs = (P(dpa, None, None, None), P(dpa), P(dpa), P(dpa), P(dpa))
+        out_specs = (P(dpa, None), P(dpa, None))
+
+        def _run(cache_, sl_, cuq_, cukv_, pi_):
+            loc = _spec_token_slots(sl_, cuq_, cukv_, pi_, t_local, page_size)
+            row = _gather_cache_rows(cache_, loc, page_size)
+            return row[:, :kv_lora_rank], row[:, kv_lora_rank : kv_lora_rank + rope]
+
+        return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(
+            cache, md.seq_lens, md.cu_q_lens, md.cu_kv_lens, md.page_indices
+        )
+
     def _prewrite_spec_kv(self, kvc, kpe, cache, dpa, md):
         """Write every spec token's latent KV row to its slot before attention.
 
@@ -765,11 +786,21 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         sm_scale,
         dpa,
         md,
+        forward_batch=None,
     ):
         """W7: TARGET_VERIFY / DRAFT_EXTEND through the decode path (see _SPEC_AS_DECODE)."""
         num_tokens = q.shape[0]
         pmd = self._spec_metadata_as_decode(md, num_tokens, dpa)
-        kv_cache = self._prewrite_spec_kv(new_kv_c, new_k_pe, kv_cache, dpa, md)
+        readonly = bool(getattr(forward_batch, "spec_kvshare_readonly", False))
+        if readonly:
+            # KVShare: no new KV for draft steps >= 1. The page-level kernel always
+            # rewrites its own row, so hand it the row currently in the cache
+            # (step 0's) -- an idempotent write. No pre-write, no indexer-key write.
+            new_kv_c, new_k_pe = self._gather_spec_kv(
+                kv_cache, dpa, md, num_tokens, new_k_pe.shape[-1]
+            )
+        else:
+            kv_cache = self._prewrite_spec_kv(new_kv_c, new_k_pe, kv_cache, dpa, md)
         # IndexShare on the draft side threads page-topk only; either form counts as reuse.
         reuse = (
             is_full
@@ -780,17 +811,20 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         # ORIGINAL metadata (the prefill-form path; k_pages = index_topk/page_size),
         # not T one-query decode passes -- the ref decode loop cost ~9 ms/step at
         # T=4 (dpa40nap). Only the query block shrinks (512 -> _SPEC_INDEXER_QB).
-        idx_cache, topk_pages = self._maybe_index_prefill_pages(
-            is_full,
-            q_idx,
-            k_idx,
-            idx_weights,
-            idx_cache,
-            dpa,
-            md,
-            compute_pages=not reuse,
-            num_queries_per_block=_SPEC_INDEXER_QB,
-        )
+        if readonly and reuse:
+            topk_pages = None
+        else:
+            idx_cache, topk_pages = self._maybe_index_prefill_pages(
+                is_full,
+                q_idx,
+                k_idx,
+                idx_weights,
+                idx_cache,
+                dpa,
+                md,
+                compute_pages=not reuse,
+                num_queries_per_block=_SPEC_INDEXER_QB,
+            )
         topk = None
         if not is_full or reuse:
             assert (
@@ -838,7 +872,13 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         # inside the shard_map) so both paths write the same cells.
         mode = forward_batch.forward_mode
         derive_loc = mode.is_target_verify() or mode.is_draft_extend()
-        if derive_loc:
+        # KVShare (GLM-5.2 MTP): draft steps >= 1 must not add their own KV to the
+        # cache -- they attend the step-0 selection over step-0's KV. A loc of -1
+        # makes paged_write_back drop every row (the attend is unchanged).
+        readonly = bool(getattr(forward_batch, "spec_kvshare_readonly", False))
+        if readonly:
+            loc = jnp.full((ql.shape[0],), -1, jnp.int32)
+        elif derive_loc:
             loc = None
         else:
             loc = forward_batch.out_cache_loc.astype(jnp.int32)
@@ -1061,6 +1101,16 @@ def _spec_pseudo_decode_metadata(
     n_valid = jnp.sum(valid).astype(jnp.int32)
     dist = jnp.stack([n_valid, n_valid, n_valid]).astype(jnp.int32)
     return kv_len, cu_q, cu_kv, pi, dist
+
+
+def _gather_cache_rows(cache: jax.Array, loc: jax.Array, page_size: int) -> jax.Array:
+    """Rows ``cache[loc[t]]`` of a ``[P, ps//pk, pk, D]`` paged cache; loc < 0 -> zeros."""
+    pk = cache.shape[2]
+    safe = jnp.maximum(loc, 0)
+    page = safe // page_size
+    off = safe % page_size
+    rows = cache[page, off // pk, off % pk]
+    return jnp.where((loc >= 0)[:, None], rows, jnp.zeros_like(rows))
 
 
 def _pad_topk_pages(topk_pages: jax.Array, width: int) -> jax.Array:
