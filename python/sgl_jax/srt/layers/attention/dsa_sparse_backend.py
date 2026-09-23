@@ -876,10 +876,8 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         # cache -- they attend the step-0 selection over step-0's KV. A loc of -1
         # makes paged_write_back drop every row (the attend is unchanged).
         readonly = bool(getattr(forward_batch, "spec_kvshare_readonly", False))
-        if readonly:
-            loc = jnp.full((ql.shape[0],), -1, jnp.int32)
-        elif derive_loc:
-            loc = None
+        if readonly or derive_loc:
+            loc = None  # built rank-locally inside the shard_map (see _run)
         else:
             loc = forward_batch.out_cache_loc.astype(jnp.int32)
             if loc.shape[0] != ql.shape[0]:
@@ -922,6 +920,9 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         def _run(ql_, qpe_, kvc_, kpe_, cache_, tp_, pos_, sl_, cuq_, cukv_, pi_, *rest):
             if rest:
                 loc_ = rest[0]
+            elif readonly:
+                # KVShare read-only draft step: all rows dropped by paged_write_back.
+                loc_ = jnp.full((ql_.shape[0],), -1, jnp.int32)
             else:
                 loc_ = _spec_token_slots(sl_, cuq_, cukv_, pi_, ql_.shape[0], page_size)
             if _PREFILL_QBLOCK:
