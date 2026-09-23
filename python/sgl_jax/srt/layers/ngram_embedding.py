@@ -8,16 +8,17 @@ conv kernel=4, dilation=ngram_size=3, conv state len=(4-1)*3=9.
     device E [T, 2560]        -> K [T, 10240], V [T, 2560]
            g = Gate(Norm(K), Norm(R))              -> [T, HC]
            U = g * V                               -> [T, 10240]
-           out = R + U + SiLU(DWConv(Norm(U)))     -> [T, 10240]
+           delta = U + SiLU(DWConv(Norm(U)))       -> [T, 10240]
 
-The hash is numpy because it is int64: multipliers reach ~3.7e13 and XOR does
-not commute with the modulus, so the 64-bit product must be materialized.
-The table lookup forces a host round trip anyway -- XLA:TPU cannot gather
-across memory spaces. See ngram_table.py.
+The default hash is numpy: multipliers reach ~3.7e13 and XOR requires the
+full 64-bit product. A two-uint32-limb TPU alternative is prototyped under
+benchmark/kernels/ngram; native Pallas int64 is unsupported on the pinned
+stack. TPU hashing must return ids to the host table. See ngram_table.py.
 """
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass
 
@@ -316,6 +317,7 @@ class NGramEmbedding(nnx.Module):
         self.dilation = int(config.ngram_size)
         self.conv_state_len = (self.conv_kernel_size - 1) * self.dilation
         self.params_dtype = params_dtype
+        self.norm_eps = float(config.rms_norm_eps)
         self.mesh = mesh
         self.name = scope_name
 
@@ -424,7 +426,19 @@ class NGramEmbedding(nnx.Module):
         state_indices: jax.Array,  # [B]
         cu_seqlens: jax.Array,  # [B+1]
         has_initial_state: jax.Array | None = None,  # [B] bool
+        *,
+        use_pallas: bool = False,
     ) -> tuple[jax.Array, jax.Array]:
+        """PLE delta and state; use_pallas is a static, opt-in JIT argument."""
+        if use_pallas:
+            return self._fused_forward(
+                hyper_input,
+                ple_embeddings,
+                conv_state,
+                state_indices,
+                has_initial_state,
+                cu_seqlens,
+            )
         gated = self.gate(hyper_input, ple_embeddings)
         if has_initial_state is None:
             has_initial_state = jnp.ones(state_indices.shape[0], dtype=bool)
@@ -460,7 +474,14 @@ class NGramEmbedding(nnx.Module):
         conv_state: jax.Array,  # [num_slots, HC*HS, (kernel-1)*dilation]
         state_indices: jax.Array,  # [B]
         has_initial_state: jax.Array | None = None,  # [B] bool
+        *,
+        use_pallas: bool = False,
     ) -> tuple[jax.Array, jax.Array]:
+        """PLE delta and state; use_pallas is a static, opt-in JIT argument."""
+        if use_pallas:
+            return self._fused_forward(
+                hyper_input, ple_embeddings, conv_state, state_indices, has_initial_state
+            )
         gated = self.gate(hyper_input, ple_embeddings)
         if has_initial_state is None:
             has_initial_state = jnp.ones(state_indices.shape[0], dtype=bool)
@@ -484,6 +505,77 @@ class NGramEmbedding(nnx.Module):
             has_initial_state,
         )
         return gated + conv_out, new_conv_state  # [B, HC*HS]
+
+    def _fused_forward(
+        self, hyper_input, ple_embeddings, conv_state, state_indices, has_init, cu=None
+    ):
+        from sgl_jax.srt.kernels.ngram_fused import (
+            ngram_decode_pallas,
+            ngram_extend_pallas,
+        )
+
+        if self.hc_count % self.mesh.shape["tensor"]:
+            raise ValueError("Fused PLE tensor shards must own complete RMSNorm groups")
+        if self.mesh.shape["data"] != 1:
+            raise NotImplementedError("Opt-in Pallas PLE currently supports one data shard")
+        if hyper_input.shape[-1] != self.hyper_hidden_size:
+            raise ValueError(f"hyper_input last dim must be {self.hyper_hidden_size}")
+        # A custom-call boundary must materialize the key. Keep the MXU's
+        # FP32 accumulator here: the compiled XLA gate can retain that precision
+        # through normalization. Rounding the key early can flip tiny gate dots.
+        key = jax.lax.dot_general(
+            ple_embeddings,
+            jnp.asarray(self.key_proj.weight),
+            (((ple_embeddings.ndim - 1,), (0,)), ((), ())),
+            preferred_element_type=jnp.float32,
+            out_sharding=jax.sharding.NamedSharding(self.mesh, P("data", None)),
+        )
+        value, _ = self.value_proj(ple_embeddings)
+        if has_init is None:
+            has_init = jnp.ones(state_indices.shape, dtype=bool)
+        local_fn = functools.partial(
+            ngram_decode_pallas if cu is None else ngram_extend_pallas,
+            hidden_size=self.hidden_size,
+            dilation=self.dilation,
+            eps=self.norm_eps,
+        )
+
+        def norm_weight(param):
+            return jax.sharding.reshard(
+                jnp.asarray(param), jax.sharding.NamedSharding(self.mesh, P("tensor"))
+            )
+
+        return jax.shard_map(
+            local_fn,
+            mesh=self.mesh,
+            in_specs=(
+                P("data", "tensor"),
+                P("data", "tensor"),
+                P("data", None),
+                P("tensor"),
+                P("tensor"),
+                P("tensor"),
+                P("tensor", None),
+                P("data", "tensor", None),
+                P("data"),
+                P("data"),
+                *((P("data"),) if cu is not None else ()),
+            ),
+            out_specs=(P("data", "tensor"), P("data", "tensor", None)),
+            check_vma=False,
+        )(
+            self._to_conv_layout(key),
+            self._to_conv_layout(hyper_input),
+            value,
+            norm_weight(self.norm_key.weight),
+            norm_weight(self.norm_query.weight),
+            norm_weight(self.norm_conv.weight),
+            self._conv_weight(hyper_input.dtype),
+            conv_state,
+            state_indices,
+            has_init,
+            *((cu,) if cu is not None else ()),
+        )
 
 
 __all__ = [
