@@ -38,10 +38,12 @@ _KVSHARE = os.environ.get("SGLANG_JAX_MTP_KVSHARE", "0") == "1"
 # feed draft step j >= 1 the previous step's output hidden (sglang EAGLE draft loop:
 # hidden_states = logits_output.hidden_states) instead of reusing the target hidden.
 _HIDDEN_RELAY_ENV = os.environ.get("SGLANG_JAX_MTP_HIDDEN_RELAY")
-# Companion knob: also advance the RoPE positions of the rotated window by one per
-# draft step (slot k holds tok_{k+j} at step j), like the EAGLE decode loop's
-# positions = seq_lens + step. Opt-in for the A/B run.
-_RELAY_POS = os.environ.get("SGLANG_JAX_MTP_RELAY_POS", "0") == "1"
+# Companion to the relay: advance the RoPE positions of the rotated window by one
+# per draft step (slot k holds tok_{k+j} at step j), like the EAGLE decode loop's
+# positions = seq_lens + step. On by default with the relay (measured not worse:
+# gsm8k p1 acceptance 3.34 vs 3.33, position-3 conditional 0.774 vs 0.763);
+# SGLANG_JAX_MTP_RELAY_POS=0 keeps the step-0 positions.
+_RELAY_POS = os.environ.get("SGLANG_JAX_MTP_RELAY_POS", "1") != "0"
 
 
 def mtp_hidden_relay_enabled(hf_config=None):
