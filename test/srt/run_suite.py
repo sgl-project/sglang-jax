@@ -447,6 +447,24 @@ suites = {
         TestFile("python/sgl_jax/test/mem_cache/test_unified_swa_component.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_unified_radix_tree_flag.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_paged_allocator_multi_dp.py", 1),
+        TestFile(
+            "python/sgl_jax/test/mem_cache/test_deepseek_v4_pool.py",
+            1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "2"},
+        ),
+        TestFile(
+            "python/sgl_jax/test/mem_cache/test_deepseek_v4_allocator.py",
+            1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "2"},
+        ),
+        TestFile(
+            "python/sgl_jax/test/mem_cache/test_deepseek_v4_lifecycle.py",
+            1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "2"},
+        ),
         TestFile("python/sgl_jax/test/mem_cache/test_host_kv_pool.py", 1, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/mem_cache/test_hicache_controller.py",
