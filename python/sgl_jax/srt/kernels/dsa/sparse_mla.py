@@ -92,8 +92,16 @@ def sparse_mla_page_level(
     num_kv_pages_per_block=None,
     num_queries_per_block=None,
     vmem_limit_bytes: int | None = None,
+    page_share_group: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
     """Page-level sparse MLA: dense kernel over only the topk-touched pages.
+
+    ``page_share_group`` > 1 (opt-in A/B for decode-form speculative verify,
+    where every group of ``page_share_group`` consecutive tokens belongs to one
+    request): all tokens of a group use the LAST token's page list, so the
+    ``page_indices[start + local]`` physical-page gather runs once per group
+    instead of once per token. Changes the attention page set of the earlier
+    tokens in the group; not for default use.
 
     Decode-only (each seq contributes exactly one query token). Builds a
     per-seq page list of length ``k_pages_max``:
@@ -158,11 +166,23 @@ def sparse_mla_page_level(
         jnp.pad(hit_pages, ((0, 0), (0, 1))),
         jnp.where(col == n_hit_c[:, None], new_page_local[:, None], 0),
     )
-    sp_phys = jnp.where(
-        (col < n_used[:, None]) & tok_valid[:, None],
-        page_indices[seq_page_start[:, None] + sp_local],
-        cache_kv.shape[0] - 1,
-    )
+    if page_share_group > 1 and T % page_share_group == 0:
+        G = page_share_group
+        rep = slice(G - 1, None, G)  # last token of every group
+        sp_local_g = sp_local[rep]
+        phys_g = page_indices[seq_page_start[rep][:, None] + sp_local_g]  # [T/G, kp]
+        sp_phys = jnp.where(
+            (col < jnp.repeat(n_used[rep], G)[:, None]) & tok_valid[:, None],
+            jnp.repeat(phys_g, G, axis=0),
+            cache_kv.shape[0] - 1,
+        )
+        n_hit_c = jnp.repeat(n_hit_c[rep], G)
+    else:
+        sp_phys = jnp.where(
+            (col < n_used[:, None]) & tok_valid[:, None],
+            page_indices[seq_page_start[:, None] + sp_local],
+            cache_kv.shape[0] - 1,
+        )
 
     # Metadata for the dense kernel: T "sequences", each kv_len positions.
     sp_kv_len = (n_hit_c * page_size + new_off + 1).astype(jnp.int32)  # [T]

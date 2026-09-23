@@ -103,6 +103,9 @@ _SPEC_AS_DECODE = os.environ.get("DSA_SPEC_AS_DECODE", "0") == "1"
 # Query block for the page-topk indexer kernel on spec batches (T = a few tokens
 # per request; the prefill default of 512 pads 4 queries to a 512 block).
 _SPEC_INDEXER_QB = int(os.environ.get("DSA_SPEC_INDEXER_QB", "16"))
+# A/B knob (opt-in): decode-form verify tokens of one request share the last token's page list
+# (see sparse_mla_page_level page_share_group). Default 1 = per-token pages.
+_SPEC_VERIFY_PAGE_SHARE = int(os.environ.get("DSA_SPEC_VERIFY_PAGE_SHARE", "1") or "1")
 
 
 @register_pytree_node_class
@@ -522,7 +525,20 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         )
         return idx_cache, topk, (topk_pages if compute_pages else None)
 
-    def _run_sparse(self, ql, qpe, kvc, kpe, cache, topk, topk_pages, sm_scale, dpa, md):
+    def _run_sparse(
+        self,
+        ql,
+        qpe,
+        kvc,
+        kpe,
+        cache,
+        topk,
+        topk_pages,
+        sm_scale,
+        dpa,
+        md,
+        page_share_group: int = 1,
+    ):
         has_pages = topk_pages is not None
         if not has_pages:
             topk_pages = jnp.full((topk.shape[0], 1), -1, jnp.int32)
@@ -572,6 +588,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 kv_lora_rank=self.kv_lora_rank,
                 k_pages_max=k_pages_max,
                 vmem_limit_bytes=self.vmem_limit_bytes,
+                page_share_group=page_share_group,
             )
 
         return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(
@@ -838,7 +855,19 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         if topk_use is None:
             topk_use = _placeholder_topk_like(topk_pages_use)
         o, kv_cache = self._run_sparse(
-            q, q_rope, new_kv_c, new_k_pe, kv_cache, topk_use, topk_pages_use, sm_scale, dpa, pmd
+            q,
+            q_rope,
+            new_kv_c,
+            new_k_pe,
+            kv_cache,
+            topk_use,
+            topk_pages_use,
+            sm_scale,
+            dpa,
+            pmd,
+            page_share_group=(
+                _SPEC_VERIFY_PAGE_SHARE if forward_batch.forward_mode.is_target_verify() else 1
+            ),
         )
         return o, DSAFusedCache(
             kv=kv_cache,
