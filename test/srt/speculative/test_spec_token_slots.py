@@ -26,6 +26,7 @@ if "--xla_force_host_platform_device_count" not in os.environ.get("XLA_FLAGS", "
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -33,7 +34,11 @@ import numpy as np
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.kernels.dsa.sparse_mla_prefill_qblock import paged_write_back
+from sgl_jax.srt.kernels.dsa.sparse_mla_prefill_qblock import (
+    _build_write_runs,
+    paged_write_back,
+    pallas_always_fits,
+)
 from sgl_jax.srt.layers.attention.dsa_sparse_backend import _spec_token_slots
 from sgl_jax.srt.layers.attention.mla_backend import (
     MLAAttentionBackend,
@@ -250,6 +255,66 @@ class SpecTokenSlotsTest(unittest.TestCase):
                 page_size=PAGE_SIZE,
                 interpret=True,
             )
+
+    def test_write_runs_never_exceed_rows(self):
+        # Justifies the static dispatch: every row starts at most one run, so
+        # n_raw <= number of valid rows <= T for any loc pattern.
+        rng = np.random.default_rng(0)
+        pk = 2
+        for T in (1, 4, 8, 32, 128):
+            for _ in range(20):
+                loc = rng.integers(0, 6 * PAGE_SIZE, size=T).astype(np.int32)
+                drop = rng.random(T) < 0.3
+                loc[drop] = -1
+                if rng.random() < 0.5:  # runs of consecutive slots
+                    loc = np.where(drop, -1, 3 * PAGE_SIZE + np.arange(T)).astype(np.int32)
+                _, n_raw = _build_write_runs(jnp.asarray(loc), kv_packing=pk, r_cap=4 * T + 130)
+                self.assertLessEqual(int(n_raw), int((loc >= 0).sum()))
+                self.assertLessEqual(int(n_raw), T)
+        self.assertTrue(pallas_always_fits(4, 130))
+        self.assertTrue(pallas_always_fits(130, 130))
+        self.assertFalse(pallas_always_fits(131, 130))
+
+    def test_spec_rows_skip_cond_large_T_keeps_cond(self):
+        # Spec verify / draft-extend rows (T=4, r_cap=130 by default) must not go
+        # through lax.cond (both branches hand back a whole pool: the branch_1_fun
+        # pool copies seen in fused_verify / fused_draft_extend); a T that exceeds
+        # r_cap must still reach the runtime cond + scatter fallback.
+        import sgl_jax.srt.kernels.dsa.sparse_mla_prefill_qblock as qb
+
+        pk, pages, dv = 2, 6, 8
+        cache = jnp.zeros((pages, PAGE_SIZE // pk, pk, dv), jnp.float32)
+        rows = jnp.arange(4 * dv, dtype=jnp.float32).reshape(4, dv) + 1.0
+        loc = jnp.array([3 * PAGE_SIZE + 5, 3 * PAGE_SIZE + 6, 4 * PAGE_SIZE + 127, -1], jnp.int32)
+        ref = (
+            cache.reshape(-1, dv)
+            .at[loc]
+            .set(rows, mode="drop", wrap_negative_indices=False)
+            .reshape(cache.shape)
+        )
+        calls = {"cond": 0, "pallas": 0}
+
+        def fake_pallas_call(*a, **k):
+            calls["pallas"] += 1
+            return lambda table, row_w, cache_: ref  # stand-in for the TPU kernel
+
+        real_cond = qb.jax.lax.cond
+
+        def counting_cond(pred, tb, fb, *ops):
+            calls["cond"] += 1
+            return real_cond(pred, tb, fb, *ops)
+
+        with (
+            mock.patch.object(qb.pl, "pallas_call", fake_pallas_call),
+            mock.patch.object(qb.jax.lax, "cond", counting_cond),
+        ):
+            out = paged_write_back(cache, rows, loc, page_size=PAGE_SIZE)
+            self.assertEqual(calls, {"cond": 0, "pallas": 1})
+            np.testing.assert_array_equal(np.asarray(out), np.asarray(ref))
+            # T=4 rows but r_cap=2: static guarantee gone -> runtime cond (scatter branch taken).
+            out2 = paged_write_back(cache, rows, loc, page_size=PAGE_SIZE, r_cap=2)
+            self.assertEqual(calls["cond"], 1)
+            np.testing.assert_array_equal(np.asarray(out2), np.asarray(ref))
 
 
 if __name__ == "__main__":

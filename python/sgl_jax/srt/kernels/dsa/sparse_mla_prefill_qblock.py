@@ -621,6 +621,16 @@ def _write_back_kernel(tbl_ref, row_ref, cache_in_ref, out_ref, wdst_ref, wsrc_r
     jax.lax.fori_loop(0, E, entry, 0)
 
 
+def pallas_always_fits(num_rows: int, r_cap: int) -> bool:
+    """True when the run table of ``paged_write_back`` cannot overflow.
+
+    Every row starts at most one run (``n_raw = is_start.sum() <= num_rows``),
+    so ``num_rows <= r_cap`` makes the Pallas branch always valid and the
+    runtime ``lax.cond`` against the scatter fallback unnecessary.
+    """
+    return int(num_rows) <= int(r_cap)
+
+
 def paged_write_back(
     cache,  # [Pn, ps//pk, pk, D] paged pool
     row,  # [T, D] new rows (already cache dtype / padded feature dim)
@@ -691,4 +701,11 @@ def paged_write_back(
         # interpret cannot lower dynamic-size DMAs; the scatter is the
         # bit-identical reference semantics anyway.
         return _scatter(cache, row_w, table)
+    if pallas_always_fits(Tp, r_cap):
+        # Static dispatch: the run table cannot overflow, so the lax.cond is
+        # not needed. It is also expensive: both branches hand back a whole
+        # pool, XLA cannot alias the pool in place across the conditional
+        # (spec verify: 2 x ~0.02 ms per layer; draft-extend: three 372 MB
+        # pool copies per step on GLM-5.2 tp16).
+        return _pallas(cache, row_w, table)
     return jax.lax.cond(n_raw <= r_cap, _pallas, _scatter, cache, row_w, table)
