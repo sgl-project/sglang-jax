@@ -242,16 +242,19 @@ def test_packed_encoder_matches_individual_images_with_padding_and_empty_lanes(
     visual = _vision(model_type, mesh, parallel == "tp")
     lanes = encoder_num_lanes(mesh, visual.vision_tp)
     items = [_vision_item((1, 2, 2), 1), _vision_item((2, 2, 4), 2)]
-    # Keep empty lanes even though other lanes have multiple images.
-    packed = np.asarray(_encode(visual, [items] + [[] for _ in range(lanes - 1)]))
-    expected = np.concatenate(
-        [
-            np.asarray(_encode(visual, [[item]] + [[] for _ in range(lanes - 1)]))[
-                : len(item.feature) // 4
+    # Different input shapes can select different default matmul precision on
+    # TPU. Compare packing semantics with consistent FP32 multiplication.
+    with jax.default_matmul_precision("highest"):
+        # Keep empty lanes even though other lanes have multiple images.
+        packed = np.asarray(_encode(visual, [items] + [[] for _ in range(lanes - 1)]))
+        expected = np.concatenate(
+            [
+                np.asarray(_encode(visual, [[item]] + [[] for _ in range(lanes - 1)]))[
+                    : len(item.feature) // 4
+                ]
+                for item in items
             ]
-            for item in items
-        ]
-    )
+        )
     np.testing.assert_allclose(packed[: len(expected)], expected, rtol=2e-5, atol=2e-5)
     np.testing.assert_array_equal(packed[len(expected) :], 0)
     assert packed.shape[1] == (16 if model_type == "qwen3" else 8)
