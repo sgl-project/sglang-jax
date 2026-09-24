@@ -112,8 +112,10 @@ _SPEC_CACHE_LOC_FIT = os.environ.get("SGLANG_JAX_SPEC_CACHE_LOC_FIT", "1") != "0
 def fit_cache_loc_padding(cache_loc_paddings, per_rank_needs, dp_size: int) -> int:
     """Smallest padding whose per-DP segment holds every rank's packed cache_loc.
 
-    ``per_rank_needs`` are the page-aligned token counts each DP rank packs into
-    its segment (``sum(aligned_seq_lens)``); ``cache_loc_paddings`` is ascending.
+    ``per_rank_needs`` are the token counts each DP rank's segment must hold:
+    the packed length ``sum(aligned_seq_lens)`` and, because several kernels take
+    a fixed-stride view (``pages_per_seq = len(page_indices) // bs``), also
+    ``bs_padded * max(aligned_seq_lens)``. ``cache_loc_paddings`` is ascending.
     Falls back to the largest padding when none fits (the caller asserts the
     host buffer against it as before).
     """
@@ -2441,7 +2443,11 @@ class ScheduleBatch:
                         needs.append(0)
                         continue
                     sl = np.asarray(info.seq_lens)
-                    needs.append(int((((sl + page_size - 1) // page_size) * page_size).sum()))
+                    aligned = ((sl + page_size - 1) // page_size) * page_size
+                    # packed length, and the fixed-stride view some kernels
+                    # take (pages_per_seq = len // bs) must still hold the
+                    # longest request.
+                    needs.append(max(int(aligned.sum()), int(per_dp_bs_size) * int(aligned.max())))
                 total_cache_loc_size = fit_cache_loc_padding(
                     cache_loc_paddings, needs, self.dp_size
                 )
