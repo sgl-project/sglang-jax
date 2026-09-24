@@ -446,31 +446,56 @@ class QuantizedLinear(nnx.Module):
         """Pad the quantized weight / block scale along the output dim once.
 
         The block-wise matmul wrapper pads ``w_q`` / ``w_scale`` to a multiple
-        of the tuned out block on *every* call when ``n_out`` is not aligned
-        (e.g. GLM-5.2 kv_a_proj 576 -> 768, indexer wk 128 -> 256, weights_proj
-        32 -> 256: three weight copies per layer per step). Doing it here at load
-        time removes that per-step traffic; the call path keeps using the logical
+        of the tuned out block on *every* call when the (per-shard) ``n_out`` is
+        not aligned (e.g. GLM-5.2 kv_a_proj 576 -> 768 replicated, or the
+        shared-expert gate/up 2048 / tp16 = 128 -> 256 per shard: two weight
+        copies per layer per step). Doing it here at load time removes that
+        per-step traffic; the call path keeps using the logical (per-shard)
         width for the tuned-block lookup and slices the output back.
 
-        Only replicated-N block-quant layers are handled (a tensor-sharded N would
-        need the padding per shard). Returns True when the weight was padded.
+        Replicated N is padded directly; a tensor-sharded N is padded inside a
+        shard_map so every shard grows by the same rows. Returns True when the
+        weight was padded.
         """
         if self.n_out_valid is not None:
             return False
-        if self.kernel_axes[1] is not None:
-            return False
         scale = self.weight_scale.value
-        if scale is None or scale.ndim != 3:
+        if scale is None or getattr(scale, "ndim", 0) != 3:
             return False
         weight = self.weight_q.value
+        out_axis = self.kernel_axes[1]
+        shards = int(self.mesh.shape[out_axis]) if out_axis is not None else 1
         n_out = int(weight.shape[0])
-        padded = ((n_out + multiple - 1) // multiple) * multiple
-        if padded == n_out:
+        if n_out % shards != 0:
             return False
-        pad = padded - n_out
-        self.weight_q.value = jnp.pad(weight, ((0, pad), (0, 0)))
-        self.weight_scale.value = jnp.pad(scale, ((0, 0), (0, 0), (0, pad)))
-        self.n_out_valid = n_out
+        n_local = n_out // shards
+        padded_local = ((n_local + multiple - 1) // multiple) * multiple
+        if padded_local == n_local:
+            return False
+        pad = padded_local - n_local
+        if out_axis is None:
+            self.weight_q.value = jnp.pad(weight, ((0, pad), (0, 0)))
+            self.weight_scale.value = jnp.pad(scale, ((0, 0), (0, 0), (0, pad)))
+        else:
+            w_spec = P(out_axis, None)
+            s_spec = P(None, None, out_axis)
+            weight = jax.sharding.reshard(weight, NamedSharding(self.mesh, w_spec))
+            scale = jax.sharding.reshard(scale, NamedSharding(self.mesh, s_spec))
+            self.weight_q.value = shard_map(
+                lambda w: jnp.pad(w, ((0, pad), (0, 0))),
+                mesh=self.mesh,
+                in_specs=w_spec,
+                out_specs=w_spec,
+                check_vma=False,
+            )(weight)
+            self.weight_scale.value = shard_map(
+                lambda sc: jnp.pad(sc, ((0, 0), (0, 0), (0, pad))),
+                mesh=self.mesh,
+                in_specs=s_spec,
+                out_specs=s_spec,
+                check_vma=False,
+            )(scale)
+        self.n_out_valid = n_local
         return True
 
     def __call__(
@@ -577,7 +602,7 @@ class QuantizedLinear(nnx.Module):
 
 
 def prepad_replicated_quantized_linears(module: nnx.Module, multiple: int = 256) -> int:
-    """Pad every replicated-N QuantizedLinear under ``module`` once (see
+    """Pad every block-quant QuantizedLinear under ``module`` once (see
     QuantizedLinear.pad_out_rows). Disabled with SGLANG_JAX_QMM_PREPAD_N=0.
     Returns the number of layers padded."""
     if os.environ.get("SGLANG_JAX_QMM_PREPAD_N", "1") == "0":
@@ -593,18 +618,15 @@ def prepad_replicated_quantized_linears(module: nnx.Module, multiple: int = 256)
         if not isinstance(sub, QuantizedLinear):
             continue
         leaf = str(path[-1]) if path else type(sub).__name__
-        n_out = int(sub.weight_q.value.shape[0])
+        out_axis = sub.kernel_axes[1]
+        shards = int(sub.mesh.shape[out_axis]) if out_axis is not None else 1
+        n_local = int(sub.weight_q.value.shape[0]) // max(shards, 1)
         if sub.pad_out_rows(multiple):
             count += 1
             padded[leaf] = padded.get(leaf, 0) + 1
-        elif n_out % multiple != 0 and sub.n_out_valid is None:
+        elif n_local % multiple != 0 and sub.n_out_valid is None:
             scale = sub.weight_scale.value
-            why = (
-                "sharded-N"
-                if sub.kernel_axes[1] is not None
-                else f"scale-ndim-{getattr(scale, 'ndim', -1)}"
-            )
-            key = f"{leaf}:{why}"
+            key = f"{leaf}:scale-ndim-{getattr(scale, 'ndim', -1)}"
             skipped[key] = skipped.get(key, 0) + 1
     if count or skipped:
         logger.info(

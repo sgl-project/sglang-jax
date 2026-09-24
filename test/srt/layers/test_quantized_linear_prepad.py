@@ -139,9 +139,14 @@ class QuantizedLinearPrepadTest(unittest.TestCase):
             )
             self.assertFalse(layer.pad_out_rows(MULT))  # idempotent
 
+            # tensor-sharded N: every shard is padded by the same rows (40 / 4
+            # shards = 10 per shard -> 64), the logical width is per shard
             sharded = self._layer(mesh, (None, "tensor"))
+            self.assertTrue(sharded.pad_out_rows(MULT))
+            self.assertEqual(sharded.weight_q.value.shape, (4 * MULT, N_IN))
+            self.assertEqual(sharded.weight_scale.value.shape, (N_IN // BLOCK, 1, 4 * MULT))
+            self.assertEqual(sharded.n_out_valid, N_OUT // 4)
             self.assertFalse(sharded.pad_out_rows(MULT))
-            self.assertIsNone(sharded.n_out_valid)
 
             per_channel = self._layer(mesh, (None, None), scale_3d=False)
             self.assertFalse(per_channel.pad_out_rows(MULT))
@@ -167,6 +172,27 @@ class QuantizedLinearPrepadTest(unittest.TestCase):
         self.assertEqual(after.shape, (4, N_OUT))
         np.testing.assert_array_equal(np.asarray(after), np.asarray(before))
 
+    def test_forward_unchanged_after_prepad_sharded_n(self):
+        mesh = _mesh()
+        x = jnp.asarray(np.random.default_rng(4).standard_normal((4, N_IN)), jnp.bfloat16)
+        with (
+            jax.set_mesh(mesh),
+            mock.patch.object(
+                qmm_kernel, "get_blockwise_kernel", return_value=_reference_blockwise
+            ),
+            mock.patch.object(qmm_kernel, "get_safe_blockwise_tuned_value", return_value=None),
+        ):
+            xs = jax.device_put(x, NamedSharding(mesh, P("data", None)))
+            layer = self._layer(mesh, (None, "tensor"))
+            before, _ = layer(xs)
+            self.assertTrue(layer.pad_out_rows(MULT))
+            after, _ = layer(xs)
+        self.assertEqual(after.shape, (4, N_OUT))
+        # the reference dot sees a different N and may round one bf16 ulp differently
+        np.testing.assert_allclose(
+            np.asarray(after, np.float32), np.asarray(before, np.float32), rtol=1e-2, atol=1e-2
+        )
+
     def test_prepad_helper_walks_module_and_honours_env_switch(self):
         mesh = _mesh()
 
@@ -179,9 +205,9 @@ class QuantizedLinearPrepadTest(unittest.TestCase):
             holder = Holder(self._layer(mesh, (None, None)), self._layer(mesh, (None, "tensor")))
             with mock.patch.dict(os.environ, {"SGLANG_JAX_QMM_PREPAD_N": "0"}):
                 self.assertEqual(prepad_replicated_quantized_linears(holder, MULT), 0)
-            self.assertEqual(prepad_replicated_quantized_linears(holder, MULT), 1)
+            self.assertEqual(prepad_replicated_quantized_linears(holder, MULT), 2)
             self.assertEqual(holder.a.n_out_valid, N_OUT)
-            self.assertIsNone(holder.b.n_out_valid)
+            self.assertEqual(holder.b.n_out_valid, N_OUT // 4)
 
 
 if __name__ == "__main__":
