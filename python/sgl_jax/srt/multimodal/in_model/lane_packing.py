@@ -24,30 +24,8 @@ def get_grid_thw(item: MultimodalDataItem) -> tuple[int, int, int]:
     return tuple(int(entry) for entry in np.asarray(value).reshape(3))
 
 
-def default_vision_output_length(item: MultimodalDataItem, merge_unit: int) -> int:
-    """Output tokens for a pure spatial merge: merge_unit patches per token."""
-    return int(np.asarray(item.feature).shape[0]) // merge_unit
-
-
-def resolve_vision_output_lengths(
-    vision_model, items: list[MultimodalDataItem], merge_unit: int
-) -> np.ndarray:
-    """Per-item encoder output lengths, as declared by the model.
-
-    Models whose merge collapses a variable number of input patches per output
-    token expose vision_output_length. Kimi-K2.5's sd2_tpool merge also
-    pools over time, so an item of grid (t, h, w) yields h*w/merge_unit
-    tokens rather than t*h*w/merge_unit. Models without the hook keep the
-    fixed spatial ratio.
-    """
-    output_length = getattr(vision_model, "vision_output_length", None)
-    if output_length is None:
-        output_length = default_vision_output_length
-    return np.asarray([int(output_length(item, merge_unit)) for item in items], dtype=np.int32)
-
-
 def _validate_vision_items(
-    items: list[MultimodalDataItem], merge_unit: int, output_lengths: np.ndarray
+    items: list[MultimodalDataItem], merge_unit: int, output_lengths: np.ndarray | None = None
 ) -> None:
     for item_index, item in enumerate(items):
         feature = item.feature
@@ -58,26 +36,26 @@ def _validate_vision_items(
         feature_patches = int(feature.shape[0])
         grid_patches = math.prod(get_grid_thw(item))
         placeholder_tokens = sum(end - start for start, end in item.placeholder_ranges or ())
-        output_length = int(output_lengths[item_index])
+        output_length = (
+            feature_patches // merge_unit
+            if output_lengths is None
+            else int(output_lengths[item_index])
+        )
 
-        # Input-side: the feature rows must describe exactly the declared grid.
-        if feature_patches != grid_patches:
+        if feature_patches != grid_patches or feature_patches % merge_unit:
             raise ValueError(
                 f"Vision item {item_index} patch counts must match: "
                 f"feature rows={feature_patches}, grid_thw product={grid_patches}."
             )
-        # Output-side: how many tokens the encoder emits is model-defined.
         if placeholder_tokens != output_length:
             raise ValueError(
                 f"Vision item {item_index} placeholder tokens={placeholder_tokens} do not "
                 f"match the encoder output length={output_length} declared by the model."
             )
-        # A merge may only reduce the token count; pack_lanes sizes the output
-        # buffer as ``cap // merge_unit`` and would overflow if this were violated.
-        if output_length > feature_patches // merge_unit:
+        if not 0 < output_length <= feature_patches // merge_unit:
             raise ValueError(
-                f"Vision item {item_index} output length={output_length} exceeds the "
-                f"maximum {feature_patches // merge_unit} implied by merge_unit={merge_unit}."
+                f"Vision item {item_index} output length={output_length} must be in "
+                f"[1, {feature_patches // merge_unit}]."
             )
 
 
@@ -156,7 +134,7 @@ def pack_lanes(
     *,
     buckets: tuple[int, ...],
     merge_unit: int,
-    output_lengths: np.ndarray,
+    output_lengths: np.ndarray | None = None,
     input_sharding: NamedSharding,
     dtype: np.dtype | type | None = None,
 ) -> tuple[jax.Array, jax.Array, list[list[int]]]:
@@ -166,7 +144,15 @@ def pack_lanes(
             raise ValueError("cannot pack an empty multimodal batch")
         item_features = [np.asarray(item.feature) for item in items]
         lengths = np.asarray([feature.shape[0] for feature in item_features], dtype=np.int32)
-        output_lengths = np.ascontiguousarray(output_lengths, dtype=np.int32)
+        output_lengths = (
+            lengths // merge_unit
+            if output_lengths is None
+            else np.ascontiguousarray(output_lengths, dtype=np.int32)
+        )
+        if output_lengths.shape != lengths.shape or np.any(
+            (output_lengths <= 0) | (output_lengths > lengths // merge_unit)
+        ):
+            raise ValueError("Each item must declare 1..patch_count/merge_unit output tokens")
         lanes = balance_lanes(lengths.tolist(), num_lanes)
         lane_loads = [sum(int(lengths[index]) for index in lane) for lane in lanes]
         cap = _bucket_capacity(max(lane_loads), buckets, merge_unit)
@@ -175,18 +161,8 @@ def pack_lanes(
             dtype = np.result_type(*(feature.dtype for feature in item_features))
 
     with jax.profiler.TraceAnnotation("encoder_pack_allocate"):
-        # Zero-initialised, not np.empty: only the real item slices are written
-        # below, so padding patches keep whatever the allocator handed back.
-        # cu_seqlens leaves those patches outside every segment, but the
-        # attention kernel still evaluates q @ k.T across the whole padded block
-        # and masks multiplicatively -- and NaN * 0 is NaN, so a recycled page
-        # containing non-finite bytes corrupts *real* rows. Finite garbage is
-        # harmless, which is why this reproduced only intermittently.
-        # np.zeros is calloc-backed, so the pages cost nothing until touched.
+        # Keep padding finite: attention may multiply masked values by zero.
         features = np.zeros((num_lanes, cap, *feature_shape), dtype=dtype)
-        # ``cap // merge_unit`` stays a valid output capacity: a merge scheme can
-        # only collapse further than the spatial unit (Kimi additionally pools over
-        # time), never expand, so no lane can exceed this bound.
         output_cap = cap // merge_unit
         output_starts = np.empty(len(items), dtype=np.int32)
 
@@ -227,7 +203,7 @@ def pack_vision_inputs(
     num_lanes: int,
     buckets: tuple[int, ...],
     merge_unit: int,
-    output_lengths: np.ndarray,
+    output_lengths: np.ndarray | None = None,
     input_sharding: NamedSharding,
     dtype: np.dtype | type | None = None,
 ) -> tuple[jax.Array, jax.Array, np.ndarray]:
@@ -259,7 +235,6 @@ def pack_2d_position_inputs(
     num_lanes: int,
     buckets: tuple[int, ...],
     merge_unit: int,
-    output_lengths: np.ndarray,
     input_sharding: NamedSharding,
     dtype: np.dtype | type | None = None,
 ) -> tuple[jax.Array, jax.Array, np.ndarray, np.ndarray]:
@@ -298,7 +273,6 @@ def pack_2d_position_inputs(
         num_lanes,
         buckets=buckets,
         merge_unit=merge_unit,
-        output_lengths=output_lengths,
         input_sharding=input_sharding,
         dtype=dtype,
     )
@@ -376,6 +350,7 @@ def run_mrope_vision_model(
     rope_type: Literal["rope_3d", "rope_2d", "rope_2d_packed"],
     input_sharding: NamedSharding,
     output_sharding: NamedSharding,
+    pool_temporal_dimension: bool = False,
 ) -> jax.Array:
     """Prepare sharded patches and metadata, run the model, and restore order.
 
@@ -384,20 +359,27 @@ def run_mrope_vision_model(
     Patches are flat; metadata arrays retain their field shapes. Both use
     contiguous lane slices following ``input_sharding``.
     The restored encoder output uses ``output_sharding``.
+    Temporal pooling removes t from each item's output length, but not its input length.
     Patches retain their input dtype; the model casts them inside its encode JIT.
     """
-    output_lengths = resolve_vision_output_lengths(vision_model, items, merge_unit)
+    if pool_temporal_dimension and rope_type == "rope_2d_packed":
+        raise ValueError("Temporal pooling requires grid_thw metadata")
     if rope_type == "rope_2d_packed":
         patches, output_indices, position_ids, patch_counts = pack_2d_position_inputs(
             items,
             num_lanes=num_lanes,
             buckets=buckets,
             merge_unit=merge_unit,
-            output_lengths=output_lengths,
             input_sharding=input_sharding,
         )
         metadata_args = (position_ids, patch_counts)
     elif rope_type in ("rope_3d", "rope_2d"):
+        output_lengths = None
+        if pool_temporal_dimension:
+            output_lengths = np.asarray(
+                [math.prod(get_grid_thw(item)[1:]) // merge_unit for item in items],
+                dtype=np.int32,
+            )
         patches, output_indices, grid_thw = pack_vision_inputs(
             items,
             num_lanes=num_lanes,

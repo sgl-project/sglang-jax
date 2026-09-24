@@ -105,9 +105,8 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM, InModelMultimodalCo
 
         Runs through the shared lane-packing orchestrator, which balances items
         over the encoder lanes, pads to a compile bucket, runs the tower, and
-        restores item order. Kimi declares its own output length via
-        ``Kimi_K25_VisionModel.vision_output_length`` because ``sd2_tpool``
-        pools the temporal axis away.
+        restores item order. ``sd2_tpool`` pools away the temporal axis,
+        so each item emits h*w/merge_unit tokens regardless of its frame count.
         """
         if not items:
             return jnp.zeros((0, self.vision_config.text_hidden_size), dtype=self.dtype)
@@ -121,6 +120,7 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM, InModelMultimodalCo
             buckets=self.vision_buckets,
             merge_unit=self.visual.merge_unit,
             rope_type="rope_2d",
+            pool_temporal_dimension=True,
             input_sharding=specs.sharding(specs.batch_axis),
             output_sharding=specs.sharding(),
         )

@@ -7,9 +7,7 @@ import numpy as np
 from flax import nnx
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
-from sgl_jax.srt.multimodal.common.modality_enum import MultimodalDataItem
 from sgl_jax.srt.multimodal.configs.kimi.kimi_k25_config import KimiK25ModelVitConfig
-from sgl_jax.srt.multimodal.in_model.lane_packing import get_grid_thw
 from sgl_jax.srt.multimodal.layers.attention.flash_attention_backend import (
     make_vision_attention_backend,
 )
@@ -601,17 +599,6 @@ class Kimi_K25_VisionModel(nnx.Module):
         self.patch_size = config.patch_size
 
         logger.info("Kimi K2.5 Vision Model initialized with dtype %s", dtype)
-
-    @staticmethod
-    def vision_output_length(item: MultimodalDataItem, merge_unit: int) -> int:
-        """Encoder output tokens for one item, as required by ``lane_packing``.
-
-        The ``sd2_tpool`` merge averages over the temporal axis, so a ``t``-frame
-        item collapses to the same token count as a single frame. The shared
-        default (``t*h*w // merge_unit``) would over-count by a factor of ``t``.
-        """
-        _, height, width = get_grid_thw(item)
-        return (height * width) // merge_unit
 
     def prepare_metadata(
         self,

@@ -26,7 +26,6 @@ from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
 from sgl_jax.srt.multimodal.in_model.lane_packing import (
     encoder_num_lanes,
     pack_vision_inputs,
-    resolve_vision_output_lengths,
     run_mrope_vision_model,
 )
 from sgl_jax.srt.multimodal.processors.qwen_vl import QwenVLProcessor
@@ -134,7 +133,6 @@ def _pack_qwen2(visual, items):
         num_lanes=num_lanes,
         buckets=visual.input_buckets,
         merge_unit=visual.spatial_merge_unit,
-        output_lengths=resolve_vision_output_lengths(visual, items, visual.spatial_merge_unit),
         input_sharding=batch_sharding,
     )
     # Tests inspecting per-lane metadata use the host planning layout.
@@ -791,4 +789,55 @@ def test_packed_vision_matches_individual_images_with_empty_lanes(encoder_tp):
     )
     actual = np.asarray(_run_grid_vision(visual, items))
     np.testing.assert_allclose(actual[: len(expected)], expected, rtol=2e-5, atol=2e-5)
+    np.testing.assert_array_equal(actual[len(expected) :], 0)
+
+
+@pytest.mark.parametrize("num_lanes", [1, 2, 4])
+@pytest.mark.parametrize("grids", [[(4, 2, 4), (1, 2, 2)], [(1, 2, 2), (3, 2, 4), (1, 4, 4)]])
+def test_temporal_pooling_restores_item_order(grids, num_lanes):
+    # An independent, per-item mean encoder isolates packing from attention.
+    class MeanEncoder:
+        def prepare_metadata(self, grid_thw, capacity, *, sharding):
+            return dict(grids=grid_thw, capacity=capacity)
+
+        def __call__(self, patches, *, grids, capacity):
+            patches = np.asarray(patches).reshape(num_lanes, capacity, 1)
+            output = np.zeros((num_lanes, capacity // 4, 1), dtype=np.float32)
+            for lane, lane_grids in enumerate(grids):
+                src = dst = 0
+                for t, h, w in lane_grids:
+                    if not t:
+                        continue
+                    count = t * h * w
+                    values = patches[lane, src : src + count].reshape(t, h // 2, 2, w // 2, 2)
+                    values = values.mean(axis=(0, 2, 4)).reshape(-1, 1)
+                    output[lane, dst : dst + len(values)] = values
+                    src += count
+                    dst += len(values)
+            return jax.device_put(output, NamedSharding(mesh, PartitionSpec("data")))
+
+    mesh = _mesh(dp=num_lanes)
+    ranges = [(0, h * w // 4) for _, h, w in grids]
+    items = _items(grids, ranges)
+    expected = np.concatenate(
+        [
+            item.feature.reshape(t, h // 2, 2, w // 2, 2).mean(axis=(0, 2, 4)).reshape(-1, 1)
+            for item, (t, h, w) in zip(items, grids)
+        ]
+    )
+    kwargs = dict(
+        mesh=mesh,
+        num_lanes=num_lanes,
+        buckets=(64,),
+        merge_unit=4,
+        rope_type="rope_2d",
+        input_sharding=NamedSharding(mesh, PartitionSpec("data")),
+        output_sharding=NamedSharding(mesh, PartitionSpec()),
+    )
+    with pytest.raises(ValueError, match="placeholder tokens"):
+        run_mrope_vision_model(MeanEncoder(), items, **kwargs)
+    actual = np.asarray(
+        run_mrope_vision_model(MeanEncoder(), items, pool_temporal_dimension=True, **kwargs)
+    )
+    np.testing.assert_allclose(actual[: len(expected)], expected)
     np.testing.assert_array_equal(actual[len(expected) :], 0)
