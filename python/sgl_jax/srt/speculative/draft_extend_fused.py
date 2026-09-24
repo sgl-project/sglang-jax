@@ -163,6 +163,21 @@ def _chain_pool_report(v0, vN, md, num_tokens, page_size, like, ext_lens=None):
     return _chain_pool_diff_arrays(v0, vN, loc0, rep_sharding=rep)
 
 
+def chain_all_headroom_ok(allocate_lens, verify_seq_lens, num_steps: int) -> bool:
+    """Host-side guard for SGLANG_JAX_MTP_CHAIN_POOL=all: every live request must
+    have num_steps - 1 allocated slots past its step-0 draft window
+    (verify_seq_lens + num_steps). False -> the caller falls back to the
+    two-version mode instead of writing past the allocation."""
+    import numpy as np
+
+    alloc = np.asarray(allocate_lens)
+    vsl = np.asarray(verify_seq_lens)
+    live = vsl > 0
+    if not live.any():
+        return True
+    return bool(np.all(alloc[live] >= vsl[live] + 2 * num_steps - 1))
+
+
 def _shift_draft_extend_metadata(
     md_orig, base_seq_lens, allocate_lens, step, *, page_size, dp_size
 ):
@@ -876,7 +891,13 @@ def _build_draft_extend(
         jax.jit,
         compiler_options=_SPEC_DECODE_COMPILER_OPTIONS,
         donate_argnames=["all_memory_pools"],
-        static_argnames=["model_state_def", "num_layers", "update_relay", "dp_size"],
+        static_argnames=[
+            "model_state_def",
+            "num_layers",
+            "update_relay",
+            "dp_size",
+            "chain_all_ok",
+        ],
     )
     def fused_draft_extend(
         model_def,
@@ -899,6 +920,7 @@ def _build_draft_extend(
         num_layers,
         update_relay,
         dp_size,
+        chain_all_ok=False,
     ):
         all_topk_index = []
         all_pool_updates = []
@@ -929,6 +951,7 @@ def _build_draft_extend(
         chain_pool = _chain_pool_enabled(len(all_memory_pools), relay_on)
         chain_all = bool(
             _CHAIN_ALL
+            and chain_all_ok
             and chain_pool
             and relay_on
             and _RELAY_POS
@@ -2360,10 +2383,21 @@ def launch_fused_draft_extend_for_decode(
     if draft_allocate_lens is None:
         draft_allocate_lens = np.zeros_like(model_worker_batch.seq_lens, dtype=np.int32)
         draft_allocate_lens[sel] = np.asarray(batch_output.next_draft_input.allocate_lens)
+    draft_verify_seq_lens = getattr(batch_output.next_draft_input, "verify_seq_lens", None)
+    chain_all_ok = False
+    if _CHAIN_ALL and draft_verify_seq_lens is not None:
+        chain_all_ok = chain_all_headroom_ok(
+            draft_allocate_lens, draft_verify_seq_lens, draft_worker.speculative_num_steps
+        )
+        if not chain_all_ok and not getattr(draft_worker, "_chain_all_fallback_logged", False):
+            draft_worker._chain_all_fallback_logged = True
+            logger.warning(
+                "SGLANG_JAX_MTP_CHAIN_POOL=all: allocation headroom below num_steps - 1 slots "
+                "for some request; falling back to the two-version draft pool for this batch"
+            )
     draft_allocate_lens = _prepare_device_array(
         draft_allocate_lens, data_sharding, "draft_extend.allocate_lens"
     )
-    draft_verify_seq_lens = getattr(batch_output.next_draft_input, "verify_seq_lens", None)
     draft_verify_seq_lens = _prepare_device_array(
         draft_verify_seq_lens, data_sharding, "draft_extend.verify_seq_lens"
     )
@@ -2420,6 +2454,7 @@ def launch_fused_draft_extend_for_decode(
             num_layers=draft_worker.speculative_num_steps,
             update_relay=update_relay,
             dp_size=model_worker_batch.dp_size,
+            chain_all_ok=chain_all_ok,
         )
         if _CHAIN_POOL_CHECK and len(_fused_out) == 5:
             *_fused_out, _chain_report = _fused_out
