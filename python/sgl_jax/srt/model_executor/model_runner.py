@@ -52,7 +52,10 @@ from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
 from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.models.registry import ModelRegistry
 from sgl_jax.srt.multimodal.in_model.embedding_pool import EmbeddingPool
-from sgl_jax.srt.multimodal.in_model.host_orchestration import embed_multimodal_inputs
+from sgl_jax.srt.multimodal.in_model.host_orchestration import (
+    MultimodalBatch,
+    embed_multimodal_inputs,
+)
 from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
@@ -970,6 +973,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self,
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
+        multimodal_batch: MultimodalBatch | None = None,
     ) -> tuple[LogitsProcessorOutput, int]:
         self.forward_pass_id += 1
         precision_tracer.start_batch_trace(forward_batch.bid)
@@ -979,7 +983,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             ForwardMode.MIXED,
         ):
             input_embedding, deepstack, apply_for_deepstack = embed_multimodal_inputs(
-                multimodal_batch=forward_batch.multimodal_batch,
+                multimodal_batch=multimodal_batch,
                 input_ids=forward_batch.input_ids,
                 multimodal_model=self.model,
                 embedding_pool=self.embedding_pool,

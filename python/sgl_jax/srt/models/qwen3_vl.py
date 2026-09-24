@@ -17,10 +17,12 @@ from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.qwen3 import QWen3Model
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
-from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
+from sgl_jax.srt.multimodal.in_model.interface import (
+    InModelMultimodalContract,
+    VisionInputSpec,
+)
 from sgl_jax.srt.multimodal.in_model.lane_packing import (
     encoder_num_lanes,
-    precompile_mrope_vision_model,
     run_mrope_vision_model,
 )
 from sgl_jax.srt.multimodal.layers.attention.flash_attention_backend import (
@@ -31,7 +33,6 @@ from sgl_jax.srt.multimodal.layers.vision_sharding import (
     apply_data_sharding,
     resolve_encoder_tp,
 )
-from sgl_jax.srt.utils.common_utils import resolve_vision_patch_buckets
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
@@ -367,20 +368,14 @@ class Qwen3VLVisionModel(nnx.Module):
         rngs=None,
         mesh=None,
         tp=False,
-        input_buckets: tuple[int, ...] | None = None,
     ):
         rngs = rngs or nnx.Rngs(0)
         self.mesh = mesh
         self.dtype = dtype
         self.vision_tp = tp
         self.specs = VisionShardSpecs(mesh, tp)
-        self.input_buckets = input_buckets or tuple(resolve_vision_patch_buckets(None))
         self.merge = int(config.spatial_merge_size)
         self.spatial_merge_unit = self.merge**2
-        if any(bucket <= 0 or bucket % self.spatial_merge_unit for bucket in self.input_buckets):
-            raise ValueError(
-                f"vision patch buckets must be positive multiples of {self.spatial_merge_unit}"
-            )
         self.num_grid = int(config.num_position_embeddings**0.5)
         self.rotary_dim = int(config.hidden_size) // int(config.num_heads) // 2
         self.patch_embed = Qwen3VLPatchEmbed(config, dtype, rngs, mesh, tp)
@@ -543,19 +538,6 @@ class Qwen3VLVisionModel(nnx.Module):
             )
         return output
 
-    def precompile(self) -> None:
-        precompile_mrope_vision_model(
-            self,
-            mesh=self.mesh,
-            num_lanes=encoder_num_lanes(self.mesh, self.vision_tp),
-            buckets=self.input_buckets,
-            patch_dim=self.patch_dim,
-            merge_unit=self.spatial_merge_unit,
-            rope_type="rope_3d",
-            input_sharding=self.specs.sharding(self.specs.batch_axis),
-            output_sharding=self.specs.sharding(),
-        )
-
     def prepare_metadata(
         self,
         grid_thw: np.ndarray,
@@ -624,39 +606,31 @@ class Qwen3VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
             rngs,
             mesh,
             encoder_tp,
-            tuple(
-                resolve_vision_patch_buckets(
-                    getattr(config, "precompile_vision_patch_paddings", None)
-                )
-            ),
         )
         self.deepstack_visual_layers = len(self.visual.deepstack_indexes)
+
+        self.vision_input_spec = VisionInputSpec(
+            patch_dim=self.visual.patch_dim,
+            spatial_merge_size=int(config.vision_config.spatial_merge_size),
+            dtype=np.dtype("float32"),
+        )
 
     def get_input_embeddings(self) -> Callable[[jax.Array], jax.Array]:
         return self.model.embed_tokens
 
-    def precompile_multimodal(self) -> None:
-        self.visual.precompile()
+    def get_image_feature(self, items_per_lane: list[list[MultimodalDataItem]]) -> jax.Array:
+        return self._get_visual_feature(items_per_lane)
 
-    def get_multimodal_embedding_packed_capacities(self) -> tuple[int, ...]:
-        rows = encoder_num_lanes(self.mesh, self.visual.vision_tp)
-        unit = self.visual.spatial_merge_unit
-        return tuple(rows * bucket // unit for bucket in self.visual.input_buckets)
+    def get_video_feature(self, items_per_lane: list[list[MultimodalDataItem]]) -> jax.Array:
+        return self._get_visual_feature(items_per_lane)
 
-    def get_image_feature(self, items: list[MultimodalDataItem]) -> jax.Array:
-        return self._get_visual_feature(items)
-
-    def get_video_feature(self, items: list[MultimodalDataItem]) -> jax.Array:
-        return self._get_visual_feature(items)
-
-    def _get_visual_feature(self, items: list[MultimodalDataItem]) -> jax.Array:
+    def _get_visual_feature(self, items_per_lane: list[list[MultimodalDataItem]]) -> jax.Array:
         num_lanes = encoder_num_lanes(self.mesh, self.visual.vision_tp)
         return run_mrope_vision_model(
             self.visual,
-            items,
+            items_per_lane,
             mesh=self.mesh,
             num_lanes=num_lanes,
-            buckets=self.visual.input_buckets,
             merge_unit=self.visual.spatial_merge_unit,
             rope_type="rope_3d",
             input_sharding=self.visual.specs.sharding(self.visual.specs.batch_axis),

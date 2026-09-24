@@ -511,6 +511,7 @@ class Scheduler(
             dp_size=self.dp_size,
             spec_algorithm=self.spec_algorithm,
             mesh=self.mesh,
+            embedding_pool=self.embedding_pool,
         )
         if self.pd == "pathways":
             self._pd_init_decode_extras()
@@ -723,6 +724,7 @@ class Scheduler(
         server_args = self.server_args
         self.model_config = ModelConfig.from_server_args(server_args)
         apply_multimodal_model_defaults(server_args, self.model_config)
+        self.model_config.hf_config.vision_encoder_parallel = server_args.vision_encoder_parallel
         self.is_generation = self.model_config.is_generation
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
@@ -745,6 +747,7 @@ class Scheduler(
         from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = self.tp_worker.get_memory_pool()
+        self.embedding_pool = self.tp_worker.get_embedding_pool()
         self.tree_cache = build_kv_cache(
             server_args=self.server_args,
             model_config=self.model_config,
@@ -1591,6 +1594,7 @@ class Scheduler(
             dp_size=self.dp_size,
             spec_algorithm=self.spec_algorithm,
             mesh=self.mesh,
+            embedding_pool=self.embedding_pool,
         )
         self.pending_dp_reqs = []
         self.chunked_reqs = [None] * self.dp_size
@@ -2283,6 +2287,7 @@ class Scheduler(
             chunked_reqs=chunked_reqs_per_dp,
             mesh=self.mesh,
             spec_algorithm=self.spec_algorithm,
+            embedding_pool=self.embedding_pool,
         )
 
         new_batch.prepare_for_extend()
@@ -2314,6 +2319,7 @@ class Scheduler(
                 dp_size=self.dp_size,
                 spec_algorithm=self.spec_algorithm,
                 mesh=self.mesh,
+                embedding_pool=self.embedding_pool,
             )
 
         new_batch.bid = acc_global_bid()
