@@ -5,6 +5,7 @@ from typing import Any
 import jax
 from flax import nnx
 from jax import numpy as jnp
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
@@ -725,6 +726,21 @@ class Glm5MLP(nnx.Module):
         a1, _ = self.gate_proj(hidden_states)
         a2, _ = self.up_proj(hidden_states)
         intermediate_parallel = a2 * self.act_fn(a1)
+        if getattr(self.down_proj, "kernel_axes", (None, None))[0] is None:
+            # Block-quantized down_proj whose reduce dim does not split into whole
+            # blocks across TP (e.g. the 2048-wide shared expert at tp32: 64 per
+            # shard < 128-block) runs with a replicated reduce axis; gate/up still
+            # emit the tensor-sharded activation, so gather it first.
+            sh = jax.typeof(intermediate_parallel).sharding
+            if (
+                isinstance(sh, NamedSharding)
+                and sh.spec
+                and len(sh.spec) > 1
+                and sh.spec[1] is not None
+            ):
+                intermediate_parallel = jax.sharding.reshard(
+                    intermediate_parallel, NamedSharding(sh.mesh, P(sh.spec[0], None))
+                )
         output, _ = self.down_proj(intermediate_parallel)
         return output
 
