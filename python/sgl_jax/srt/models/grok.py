@@ -927,10 +927,16 @@ class Grok1ForCausalLM(nnx.Module):
                 num_embeddings=config.vocab_size,
                 features=config.hidden_size,
                 param_dtype=jnp.bfloat16,
-                kernel_axes=("tensor", None),
+                mesh=mesh,
+                enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
             )
         soft_cap = getattr(config, "final_logit_softcapping", 0.0) if config else 0.0
-        self.logits_processor = LogitsProcessor(config.vocab_size, mesh=mesh, soft_cap=soft_cap)
+        self.logits_processor = LogitsProcessor(
+            config.vocab_size,
+            mesh=mesh,
+            soft_cap=soft_cap,
+            enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
+        )
 
         self.loaded_param_names: set[str] = set()
 
@@ -1023,8 +1029,10 @@ class Grok1ForCausalLM(nnx.Module):
             "model.norm.weight": WeightMapping(
                 target_path="model.norm.scale", sharding=(None,), transpose=False
             ),
-            "lm_head.weight": WeightMapping(
-                target_path="lm_head.embedding", sharding=("tensor", None), transpose=False
+            "lm_head.weight": (
+                self.lm_head.weight_mapping("lm_head.embedding")
+                if isinstance(self.lm_head, ParallelLMHead)
+                else WeightMapping("lm_head.embedding", sharding=("tensor", None))
             ),
         }
 

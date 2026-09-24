@@ -10,10 +10,10 @@ import numpy as np
 from flax import nnx
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from numba import njit, types
-from transformers import modeling_flax_utils
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.hf_transformers_utils import get_hf_text_config
+from sgl_jax.srt.layers.activation import ACT2FN
 from sgl_jax.srt.layers.embeddings import ParallelLMHead
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -24,10 +24,12 @@ from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalData
 from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
     QwenVLModelVitConfig,
 )
-from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
+from sgl_jax.srt.multimodal.in_model.interface import (
+    InModelMultimodalContract,
+    VisionInputSpec,
+)
 from sgl_jax.srt.multimodal.in_model.lane_packing import (
     encoder_num_lanes,
-    precompile_mrope_vision_model,
     run_mrope_vision_model,
 )
 from sgl_jax.srt.multimodal.layers.attention.flash_attention_backend import (
@@ -38,7 +40,6 @@ from sgl_jax.srt.multimodal.layers.vision_sharding import (
     apply_data_sharding,
     resolve_encoder_tp,
 )
-from sgl_jax.srt.utils.common_utils import resolve_vision_patch_buckets
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
@@ -121,7 +122,7 @@ class Qwen2_5_VLMLP(nnx.Module):
         vision_tp: bool = False,
     ):
         self.specs = VisionShardSpecs(mesh, vision_tp)
-        self.act_fn = modeling_flax_utils.ACT2FN[config.hidden_act]
+        self.act_fn = ACT2FN[config.hidden_act]
 
         self.gate_proj = LinearBase(
             config.hidden_size,
@@ -331,7 +332,7 @@ class Qwen2_5_VisionPatchMerger(nnx.Module):
             kernel_axes=self.specs.col_kernel_axes,
             params_dtype=dtype,
         )
-        self.mlp_act = modeling_flax_utils.ACT2FN["gelu"]
+        self.mlp_act = ACT2FN["gelu"]
         self.mlp_fc2 = LinearBase(
             self.hidden_size,
             d_model,
@@ -363,19 +364,13 @@ class Qwen2_5_VisionTransformer(nnx.Module):
         rngs: nnx.Rngs = None,
         norm_eps: float = 1e-6,
         vision_tp: bool = False,
-        input_buckets: tuple[int, ...] | None = None,
     ):
         self.mesh = mesh
         self.dtype = dtype
         self.vision_tp = vision_tp
         self.specs = VisionShardSpecs(mesh, vision_tp)
-        self.input_buckets = input_buckets or tuple(resolve_vision_patch_buckets(None))
         self.spatial_merge_size = config.spatial_merge_size
         self.spatial_merge_unit = self.spatial_merge_size**2
-        if any(bucket <= 0 or bucket % self.spatial_merge_unit for bucket in self.input_buckets):
-            raise ValueError(
-                f"vision patch buckets must be positive multiples of {self.spatial_merge_unit}"
-            )
 
         self.patch_embed = Qwen2_5_VisionPatchEmbed(
             patch_size=config.patch_size,
@@ -527,6 +522,8 @@ class Qwen2_5_VisionTransformer(nnx.Module):
     def _reorder(self, x: jax.Array, indices: jax.Array) -> jax.Array:
         """Gather within each device's lane, using lane-local unit indices."""
         spec = PartitionSpec(self.specs.batch_axis)
+        x = apply_data_sharding(x, self.mesh, spec)
+        indices = apply_data_sharding(indices, self.mesh, spec)
         return jax.shard_map(
             lambda values, order: values[order],
             mesh=self.mesh,
@@ -604,19 +601,6 @@ class Qwen2_5_VisionTransformer(nnx.Module):
             full_cu_seqlens,
         )
 
-    def precompile(self) -> None:
-        precompile_mrope_vision_model(
-            self,
-            mesh=self.mesh,
-            num_lanes=encoder_num_lanes(self.mesh, self.vision_tp),
-            buckets=self.input_buckets,
-            patch_dim=self.patch_dim,
-            merge_unit=self.spatial_merge_unit,
-            rope_type="rope_3d",
-            input_sharding=self.specs.sharding(self.specs.batch_axis),
-            output_sharding=self.specs.sharding(),
-        )
-
 
 class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
     """Qwen2.5-VL: vision tower + Qwen2 backbone (+ MRoPE) + lm_head.
@@ -633,9 +617,7 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         self.config = config
         self.text_config = get_hf_text_config(config) or config
         self.dtype = dtype or jnp.bfloat16
-        self.is_mrope_enabled = "mrope_section" in (
-            getattr(self.text_config, "rope_scaling", None) or {}
-        )
+        self.is_mrope_enabled = "mrope_section" in self.text_config.rope_parameters
 
         # Language backbone.
         self.model = Qwen2Model(self.text_config, mesh=mesh, dtype=self.dtype)
@@ -645,9 +627,14 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
                 self.text_config.hidden_size,
                 dtype=self.dtype,
                 param_dtype=self.dtype,
-                kernel_axes=("tensor", None),
+                mesh=mesh,
+                enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
             )
-        self.logits_processor = LogitsProcessor(self.text_config.vocab_size, mesh=self.mesh)
+        self.logits_processor = LogitsProcessor(
+            self.text_config.vocab_size,
+            mesh=self.mesh,
+            enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
+        )
         self.image_token_id = getattr(self.config, "image_token_id", None)
         self.video_token_id = getattr(self.config, "video_token_id", None)
 
@@ -662,40 +649,32 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
             mesh=mesh,
             norm_eps=getattr(self.visual_config, "rms_norm_eps", 1e-6),
             vision_tp=vision_tp,
-            input_buckets=tuple(
-                resolve_vision_patch_buckets(
-                    getattr(config, "precompile_vision_patch_paddings", None)
-                )
-            ),
+        )
+
+        self.vision_input_spec = VisionInputSpec(
+            patch_dim=self.visual.patch_dim,
+            spatial_merge_size=int(config.vision_config.spatial_merge_size),
+            dtype=np.dtype("float32"),
         )
 
     def get_input_embeddings(self) -> Callable[[jax.Array], jax.Array]:
         return self.model.embed_tokens
 
-    def precompile_multimodal(self) -> None:
-        self.visual.precompile()
-
-    def get_multimodal_embedding_packed_capacities(self) -> tuple[int, ...]:
-        rows = encoder_num_lanes(self.mesh, self.visual.vision_tp)
-        unit = self.visual.spatial_merge_unit
-        return tuple(rows * bucket // unit for bucket in self.visual.input_buckets)
-
-    def get_image_feature(self, items: list[MultimodalDataItem]) -> jax.Array:
+    def get_image_feature(self, items_per_lane: list[list[MultimodalDataItem]]) -> jax.Array:
         num_lanes = encoder_num_lanes(self.mesh, self.visual.vision_tp)
         return run_mrope_vision_model(
             self.visual,
-            items,
+            items_per_lane,
             mesh=self.mesh,
             num_lanes=num_lanes,
-            buckets=self.visual.input_buckets,
             merge_unit=self.visual.spatial_merge_unit,
             rope_type="rope_3d",
             input_sharding=self.visual.specs.sharding(self.visual.specs.batch_axis),
             output_sharding=self.visual.specs.sharding(),
         )
 
-    def get_video_feature(self, items: list[MultimodalDataItem]) -> jax.Array:
-        return self.get_image_feature(items)
+    def get_video_feature(self, items_per_lane: list[list[MultimodalDataItem]]) -> jax.Array:
+        return self.get_image_feature(items_per_lane)
 
     def get_multimodal_encode_funcs(self):
         return {
@@ -735,9 +714,7 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         }
 
         if not getattr(self.text_config, "tie_word_embeddings", False):
-            mappings["lm_head.weight"] = WeightMapping(
-                target_path="lm_head.embedding", sharding=("tensor", None), transpose=False
-            )
+            mappings["lm_head.weight"] = self.lm_head.weight_mapping("lm_head.embedding")
 
         for layer_idx in range(self.text_config.num_hidden_layers):
             mappings.update(self._language_layer_mappings(layer_idx))

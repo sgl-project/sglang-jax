@@ -217,12 +217,8 @@ class LlamaDecoderLayer(nnx.Module):
         if dtype_config is None:
             dtype_config = DtypeConfig(default_dtype=dtype)
 
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
-        if rope_scaling is not None and getattr(config, "original_max_position_embeddings", None):
-            rope_scaling["original_max_position_embeddings"] = (
-                config.original_max_position_embeddings
-            )
+        rope_theta = config.rope_parameters["rope_theta"]
+        rope_scaling = config.rope_parameters
         rope_is_neox_style = getattr(config, "rope_is_neox_style", True)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         # Support llamafy/Qwen-Qwen2.5-7B-Instruct-llamafied with attention_bias
@@ -238,6 +234,7 @@ class LlamaDecoderLayer(nnx.Module):
             layer_id=layer_id,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
+            partial_rotary_factor=rope_scaling.get("partial_rotary_factor", 1.0),
             rope_is_neox_style=rope_is_neox_style,
             max_position_embeddings=max_position_embeddings,
             attention_bias=attention_bias,
@@ -422,9 +419,14 @@ class LlamaForCausalLM(nnx.Module):
                 config.hidden_size,
                 dtype=self.dtype,
                 param_dtype=dtype_config.get_dtype("lm_head"),
-                kernel_axes=("tensor", None),
+                mesh=mesh,
+                enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
             )
-        self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
+        self.logits_processor = LogitsProcessor(
+            config.vocab_size,
+            mesh=self.mesh,
+            enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
+        )
         self.capture_aux_hidden_states = False
 
     def load_weights(self, model_config: ModelConfig):
@@ -453,9 +455,7 @@ class LlamaForCausalLM(nnx.Module):
         }
 
         if not getattr(self.config, "tie_word_embeddings", False):
-            mappings["lm_head.weight"] = WeightMapping(
-                target_path="lm_head.embedding", sharding=("tensor", None), transpose=False
-            )
+            mappings["lm_head.weight"] = self.lm_head.weight_mapping("lm_head.embedding")
 
         num_layers = self.config.num_hidden_layers
         for layer_idx in range(num_layers):

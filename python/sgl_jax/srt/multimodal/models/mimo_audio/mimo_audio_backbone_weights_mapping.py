@@ -1,5 +1,6 @@
 from transformers import PretrainedConfig
 
+from sgl_jax.srt.layers.embeddings import ParallelLMHead
 from sgl_jax.srt.utils.weight_utils import WeightMapping
 
 
@@ -57,7 +58,7 @@ def _create_qwen2_layer_mappings(prefix: str, target_prefix: str) -> dict[str, W
     return mappings
 
 
-def to_mappings(config: PretrainedConfig) -> dict[str, WeightMapping]:
+def to_mappings(config: PretrainedConfig, lm_head: ParallelLMHead) -> dict[str, WeightMapping]:
     mappings = {}
     mappings["model.embed_tokens.weight"] = WeightMapping(
         target_path="model.embed_tokens.embedding",
@@ -83,10 +84,7 @@ def to_mappings(config: PretrainedConfig) -> dict[str, WeightMapping]:
     mappings.update(
         _create_qwen2_layer_mappings("input_local_transformer.layers.*", "patch_encoder.layers.*")
     )
-    mappings["lm_head.weight"] = WeightMapping(
-        target_path="lm_head.embedding",
-        transpose=False,
-    )
+    mappings["lm_head.weight"] = lm_head.weight_mapping("lm_head.embedding")
     mappings["hidden_states_downcast.weight"] = WeightMapping(
         target_path="hidden_states_downcast.weight",
         transpose=True,

@@ -18,6 +18,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.hca.tuned_block_sizes import HCAKernelSchedule
+from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 
 
 def _align(value: int, multiple: int) -> int:
@@ -31,7 +32,7 @@ INERT_QUERY_OFFSET = 1 << 30
 
 def _get_interpret() -> bool:
     requested = os.environ.get("PALLAS_INTERPRET", "").strip().lower()
-    return requested in ("1", "true") or jax.default_backend() != "tpu"
+    return requested in ("1", "true") or not is_tpu_runtime()
 
 
 def _data_out_sharding(rank: int):
@@ -1077,7 +1078,7 @@ def ragged_attention(
     )
     # HCA emits at most one value for each absolute compression boundary, so
     # compressed destinations are unique inside a forward call.
-    if jax.default_backend() == "tpu":
+    if is_tpu_runtime():
         compressed_cache = _write_cache_rows(
             compressed_cache,
             compressed_write_locs,

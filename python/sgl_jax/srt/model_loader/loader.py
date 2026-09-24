@@ -24,6 +24,17 @@ from sgl_jax.srt.utils.debug_utils import print_parameter_shardings
 logger = logging.getLogger(__name__)
 
 
+def _prepare_static_quantization(model_config, model):
+    """Use the same quantized module structure for checkpoint and synthetic weights."""
+    config = getattr(model_config, "quantization_config", None)
+    if config is not None and config.is_static_checkpoint:
+        from sgl_jax.srt.utils.quantization.quantization_utils import apply_quantization
+
+        logger.info("Applying STATIC quantization structure preparation...")
+        return apply_quantization(model_config, model, is_static_input=True)
+    return model
+
+
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
 
@@ -291,30 +302,7 @@ class JAXModelLoader(DefaultModelLoader):
         with jax.set_mesh(self.mesh):
             model = nnx.eval_shape(lambda: model_class(config, **kwargs))
 
-        # Quantization config is already unified in model_config
-        # No need for any conversion logic here
-        if (
-            hasattr(model_config, "quantization_config")
-            and model_config.quantization_config is not None
-        ):
-            is_static = model_config.quantization_config.is_static_checkpoint
-
-            if is_static:
-                logger.info("Applying STATIC quantization structure preparation...")
-                from sgl_jax.srt.utils.quantization.quantization_utils import (
-                    apply_linear_quantization,
-                    apply_moe_quantization,
-                )
-
-                if model_config.quantization_config.has_moe_quantization():
-                    model = apply_moe_quantization(model_config, model, is_static_input=True)
-
-                if model_config.quantization_config.get_linear_rules():
-                    model = apply_linear_quantization(model_config, model, is_static_input=True)
-            else:
-                logger.info("Dynamic quantization detected. Skipping structure change in loader.")
-        else:
-            logger.info("No quantization config found. Skipping quantization.")
+        model = _prepare_static_quantization(model_config, model)
         model.load_weights(model_config)
 
         print_parameter_shardings(model)
@@ -354,8 +342,36 @@ class JAXDummyModelLoader(BaseModelLoader):
         if "dtype_config" in inspect.signature(model_class.__init__).parameters:
             kwargs["dtype_config"] = getattr(model_config, "dtype_config", None)
 
+        if getattr(model_config, "_abstract_mode", False):
+            from sgl_jax.srt.utils.quantization.quantization_utils import (
+                apply_quantization,
+            )
+
+            model_config._dummy_mode = True
+            quant_config = model_config.quantization_config
+            is_static = quant_config is not None and quant_config.is_static_checkpoint
+
+            def init_and_load():
+                def initialize():
+                    return model_class(model_config.hf_config, **kwargs)
+
+                # Static preparation consumes shape descriptors, just as the
+                # checkpoint loader does. Trace loading/post-load transforms
+                # and online quantization without allocating parameter arrays.
+                model = nnx.eval_shape(initialize) if is_static else initialize()
+                model = _prepare_static_quantization(model_config, model)
+                model.load_weights(model_config)
+                if not is_static:
+                    model = apply_quantization(model_config, model)
+                return model
+
+            with jax.set_mesh(self.mesh):
+                return nnx.eval_shape(init_and_load)
+
         with jax.set_mesh(self.mesh):
             model = nnx.eval_shape(lambda: model_class(model_config.hf_config, **kwargs))
+
+        model = _prepare_static_quantization(model_config, model)
 
         # Use model's load_weights with dummy mode to ensure correct sharding
         # Set a marker in model_config to indicate dummy mode

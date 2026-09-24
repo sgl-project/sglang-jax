@@ -53,9 +53,11 @@ from sgl_jax.srt.models.qwen3_vl import (
     Qwen3VLForConditionalGeneration,
     Qwen3VLVisionModel,
 )
-from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
+from sgl_jax.srt.multimodal.in_model.interface import (
+    InModelMultimodalContract,
+    VisionInputSpec,
+)
 from sgl_jax.srt.multimodal.layers.vision_sharding import resolve_encoder_tp
-from sgl_jax.srt.utils.common_utils import resolve_vision_patch_buckets
 from sgl_jax.srt.utils.weight_utils import WeightMapping
 
 logger = logging.getLogger(__name__)
@@ -598,11 +600,6 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
     get_video_feature = Qwen3VLForConditionalGeneration.get_video_feature
     _get_visual_feature = Qwen3VLForConditionalGeneration._get_visual_feature
 
-    def get_multimodal_embedding_packed_capacities(self):
-        if self.visual is None:
-            return ()
-        return Qwen3VLForConditionalGeneration.get_multimodal_embedding_packed_capacities(self)
-
     def get_multimodal_encode_funcs(self):
         if self.visual is None:
             return {}
@@ -610,10 +607,6 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
 
     def get_input_embeddings(self):
         return self.language_model.model.embed_tokens
-
-    def precompile_multimodal(self):
-        if self.visual is not None:
-            self.visual.precompile()
 
     def __init__(
         self,
@@ -634,11 +627,10 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
                 dtype,
                 mesh=mesh,
                 tp=encoder_tp,
-                input_buckets=tuple(
-                    resolve_vision_patch_buckets(
-                        getattr(config, "precompile_vision_patch_paddings", None)
-                    )
-                ),
+            )
+            self.vision_input_spec = VisionInputSpec(
+                patch_dim=self.visual.patch_dim,
+                spatial_merge_size=int(config.vision_config.spatial_merge_size),
             )
         else:
             self.visual = None
@@ -651,10 +643,14 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
                 text_cfg.hidden_size,
                 dtype=dtype,
                 param_dtype=dtype,
-                kernel_axes=("tensor", None),
                 mesh=mesh,
+                enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
             )
-        self.logits_processor = LogitsProcessor(text_cfg.vocab_size, mesh=mesh)
+        self.logits_processor = LogitsProcessor(
+            text_cfg.vocab_size,
+            mesh=mesh,
+            enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
+        )
 
     def __call__(
         self,
@@ -771,7 +767,9 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         gdn_layers = list(tc.linear_layer_ids)
         is_moe = tc.is_moe
 
-        mappings, visual_skip, mtp_skip = _create_qwen3_5_weight_mappings(hf_config)
+        mappings, visual_skip, mtp_skip = _create_qwen3_5_weight_mappings(
+            hf_config, getattr(self, "lm_head", None)
+        )
 
         # Keys handled manually (concat / stripe / split) — excluded from the
         # shared loader, which handles every other (simple) weight.
@@ -862,7 +860,7 @@ _VISUAL_SKIP_PATTERNS = [r"^model\.visual\..+"]
 _MTP_SKIP_PATTERNS = [r"^mtp\..+"]
 
 
-def _create_qwen3_5_weight_mappings(hf_config):
+def _create_qwen3_5_weight_mappings(hf_config, lm_head: ParallelLMHead | None = None):
     """Return (mappings, visual_skip_patterns, mtp_skip_patterns).
 
     Source keys mirror the 35B-A3B safetensors layout: full-attn layers use
@@ -896,11 +894,8 @@ def _create_qwen3_5_weight_mappings(hf_config):
     # Tied variants (0.8B / 2B / 4B) ship no ``lm_head.weight`` and reuse the
     # embedding; the wrapper omits the lm_head module, so omit its mapping too.
     if not tie_word_embeddings:
-        mappings["lm_head.weight"] = WeightMapping(
-            target_path="lm_head.embedding",
-            sharding=("tensor", None),
-            transpose=False,
-        )
+        assert lm_head is not None
+        mappings["lm_head.weight"] = lm_head.weight_mapping("lm_head.embedding")
 
     for i in range(num_layers):
         is_full = i in full_attn_ids

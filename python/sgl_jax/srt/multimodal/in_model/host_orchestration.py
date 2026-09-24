@@ -22,10 +22,14 @@ from sgl_jax.srt.multimodal.in_model.embedding_pool import (
     EmbeddingPoolEntry,
 )
 from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
+from sgl_jax.srt.multimodal.in_model.lane_packing import (
+    balance_lanes,
+    mrope_vision_dummy_inputs,
+)
 
 
 @dataclass(frozen=True)
-class _MergeMapping:
+class MergeMapping:
     source_start: int
     destination_start: int
     length: int
@@ -35,7 +39,7 @@ class _MergeMapping:
 class ItemTask:
     item: MultimodalDataItem
     output_len: int
-    merge_mappings: tuple[_MergeMapping, ...]
+    merge_mappings: list[MergeMapping]
 
     @property
     def has_unmerged_tail(self) -> bool:
@@ -43,7 +47,10 @@ class ItemTask:
         return last.source_start + last.length < self.output_len
 
 
-_MultimodalBatch = dict[Modality, tuple[ItemTask, ...]]
+@dataclass
+class MultimodalBatch:
+    per_lane_tasks: list[dict[Modality, list[ItemTask]]]
+    cached_tasks: list[ItemTask]
 
 
 def _build_item_task(
@@ -52,21 +59,21 @@ def _build_item_task(
     chunk_start: int,
     chunk_end: int,
 ) -> ItemTask | None:
-    mappings: list[_MergeMapping] = []
+    mappings: list[MergeMapping] = []
     output_len = 0
-    for start, end in item.placeholder_ranges or ():
+    for start, end in item.placeholder_ranges or []:
         overlap_start = max(start, chunk_start)
         overlap_end = min(end, chunk_end)
         if overlap_start < overlap_end:
             mappings.append(
-                _MergeMapping(
+                MergeMapping(
                     source_start=output_len + overlap_start - start,
                     destination_start=token_base + overlap_start - chunk_start,
                     length=overlap_end - overlap_start,
                 )
             )
         output_len += end - start
-    return ItemTask(item, output_len, tuple(mappings)) if mappings else None
+    return ItemTask(item, output_len, mappings) if mappings else None
 
 
 def build_multimodal_batch(
@@ -74,19 +81,25 @@ def build_multimodal_batch(
     dp_size: int,
     model_config: ModelConfig,
     per_dp_token: int,
-) -> _MultimodalBatch | None:
-    """Build tasks for placeholders visible in this prefill chunk."""
-    if not ModelRegistry.is_in_model_multimodal(model_config.hf_config.architectures):
+    embedding_pool: EmbeddingPool | None = None,
+    num_encoder_lanes: int = 1,
+) -> MultimodalBatch | None:
+    """Check cache presence and balance expected misses for this prefill chunk."""
+    if num_encoder_lanes < 1:
+        raise ValueError("num_encoder_lanes must be positive")
+    if reqs_info is None or not ModelRegistry.is_in_model_multimodal(
+        model_config.hf_config.architectures
+    ):
         return None
 
     grouped: dict[Modality, list[ItemTask]] = {}
-    for dp_rank, info in enumerate((reqs_info or ())[:dp_size]):
+    for dp_rank, info in enumerate(reqs_info[:dp_size]):
         request_base = dp_rank * per_dp_token
-        for req_index, req in enumerate(info.reqs or ()):
+        for req_index, req in enumerate(info.reqs or []):
             prefix_len = (
                 info.prefix_lens[req_index]
                 if info.prefix_lens is not None
-                else len(getattr(req, "prefix_indices", ()))
+                else len(getattr(req, "prefix_indices", []))
             )
             extend_len = (
                 info.extend_lens[req_index]
@@ -107,10 +120,27 @@ def build_multimodal_batch(
 
     if not grouped:
         return None
-    return {modality: tuple(tasks) for modality, tasks in grouped.items()}
+    result = MultimodalBatch([{} for _ in range(num_encoder_lanes)], [])
+    for modality, tasks in grouped.items():
+        misses = []
+        for task in tasks:
+            item = task.item
+            if item.hash is None:
+                item.set_pad_value()
+            if embedding_pool is not None and embedding_pool.contains(item.hash):
+                result.cached_tasks.append(task)
+            else:
+                misses.append(task)
+        if misses:
+            lengths = [int(task.item.feature.shape[0]) for task in misses]
+            lanes = balance_lanes(lengths, num_encoder_lanes)
+            for lane_id, indices in enumerate(lanes):
+                if indices:
+                    result.per_lane_tasks[lane_id][modality] = [misses[i] for i in sorted(indices)]
+    return result
 
 
-@partial(jax.jit, static_argnames=("out_sharding",))
+@partial(jax.jit, static_argnames="out_sharding")
 def _gather_overlay(
     running: jax.Array,
     source: jax.Array,
@@ -127,7 +157,7 @@ def _gather_overlay(
 
 
 def _build_gather_indices(
-    tasks: tuple[ItemTask, ...],
+    tasks: list[ItemTask],
     num_tokens: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Map each destination token to its item-ordered packed source row."""
@@ -182,7 +212,7 @@ def _apply_gather(
 def _gather_merge(
     running: jax.Array,
     packed: jax.Array,
-    tasks: tuple[ItemTask, ...],
+    tasks: list[ItemTask],
     mesh: Mesh | None,
 ) -> jax.Array:
     expected_width = running.shape[-1]
@@ -197,8 +227,8 @@ def _gather_merge(
 
 
 def _build_pool_gather_indices(
-    tasks: Sequence[ItemTask],
-    entries: Sequence[EmbeddingPoolEntry],
+    tasks: list[ItemTask],
+    entries: list[EmbeddingPoolEntry],
     page_size: int,
     num_tokens: int,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -221,8 +251,8 @@ def _build_pool_gather_indices(
 def _gather_from_pool(
     running: jax.Array,
     pool: EmbeddingPool,
-    tasks: Sequence[ItemTask],
-    entries: Sequence[EmbeddingPoolEntry],
+    tasks: list[ItemTask],
+    entries: list[EmbeddingPoolEntry],
     mesh: Mesh | None,
 ) -> jax.Array:
     """Overlay cache hits by gathering from the pool's paged buffers."""
@@ -237,18 +267,20 @@ def _gather_from_pool(
     )
 
 
-def _write_misses_to_pool(
-    pool: EmbeddingPool,
+def _cache_unfinished_items(
+    pool: EmbeddingPool | None,
     packed: jax.Array,
-    tasks: Sequence[ItemTask],
+    tasks: list[ItemTask],
 ) -> None:
-    write_mask = tuple(task.has_unmerged_tail for task in tasks)
+    if pool is None:
+        return
+    write_mask = [task.has_unmerged_tail for task in tasks]
     if not any(write_mask):
         return
     pool.write_packed(
-        tuple(task.item.hash for task in tasks),
+        [task.item.hash for task in tasks],
         packed,
-        tuple(task.output_len for task in tasks),
+        [task.output_len for task in tasks],
         write_mask=write_mask,
     )
 
@@ -261,7 +293,7 @@ def _split_embeddings(
 ) -> tuple[jax.Array, jax.Array | None]:
     if not deepstack_dim:
         return running, None
-    running, deepstack = jnp.split(running, (hidden,), axis=-1)
+    running, deepstack = jnp.split(running, [hidden], axis=-1)
     deepstack = deepstack.reshape(running.shape[0], deepstack_dim, hidden).transpose(1, 0, 2)
     if isinstance(running.sharding, NamedSharding):
         token_spec = running.sharding.spec[0] if running.sharding.spec else None
@@ -272,57 +304,75 @@ def _split_embeddings(
     return running, deepstack
 
 
-def precompile_multimodal_inputs(
-    input_ids: jax.Array,
+def precompile_multimodal_encoder(
     multimodal_model: InModelMultimodalContract,
     embedding_pool: EmbeddingPool | None = None,
-) -> tuple[jax.Array, jax.Array | None, bool]:
-    """Warm merge kernels and return a multimodal-shaped forward input."""
-    capacities = tuple(map(int, multimodal_model.get_multimodal_embedding_packed_capacities()))
+    token_buckets: Sequence[int] = (),
+    *,
+    num_lanes: int = 1,
+    patch_paddings=None,
+) -> tuple[int, ...]:
+    """Warm encoders, merge and cache kernels; return observed output capacities."""
+    encode_funcs = multimodal_model.get_multimodal_encode_funcs()
+    observed_capacities = set()
+    for modality, encode in encode_funcs.items():
+        if modality in (Modality.IMAGE, Modality.MULTI_IMAGES, Modality.VIDEO):
+            spec = multimodal_model.vision_input_spec
+            if spec is None:
+                raise ValueError(f"Missing input spec for registered encoder {modality}")
+            dummy_inputs = mrope_vision_dummy_inputs(
+                spec, patch_paddings, num_lanes=num_lanes, modality=modality
+            )
+        else:
+            raise NotImplementedError(f"No dummy input builder for {modality}")
+
+        for _, items_per_lane in dummy_inputs:
+            output = jax.block_until_ready(encode(items_per_lane))
+            observed_capacities.add(output.shape[0])
+    capacities = tuple(sorted(observed_capacities))
     if any(capacity <= 0 for capacity in capacities):
         raise ValueError(f"invalid multimodal packed capacities: {capacities}")
+    if embedding_pool is not None:
+        for capacity in capacities:
+            embedding_pool.precompile_packed_write(capacity)
 
     mesh = multimodal_model.mesh
     with jax.set_mesh(mesh) if mesh is not None else nullcontext():
-        running = multimodal_model.get_input_embeddings()(input_ids)
-        num_tokens, hidden = running.shape
-        deepstack_dim = multimodal_model.deepstack_visual_layers
-        if deepstack_dim:
-            running = jnp.pad(running, ((0, 0), (0, hidden * deepstack_dim)))
+        for num_tokens in token_buckets:
+            input_ids = jnp.zeros(
+                num_tokens,
+                jnp.int32,
+                device=(NamedSharding(mesh, PartitionSpec("data")) if mesh is not None else None),
+            )
+            running = multimodal_model.get_input_embeddings()(input_ids)
+            num_tokens, hidden = running.shape
+            deepstack_dim = multimodal_model.deepstack_visual_layers
+            if deepstack_dim:
+                running = jnp.pad(running, ((0, 0), (0, hidden * deepstack_dim)))
 
-        item = MultimodalDataItem(modality=Modality.IMAGE)
-        for capacity in capacities or (num_tokens,):
-            length = min(num_tokens, capacity)
-            task = ItemTask(item, length, (_MergeMapping(0, 0, length),))
-            packed = jnp.zeros((capacity, running.shape[-1]), running.dtype)
-            if mesh is not None:
-                packed = jax.device_put(packed, NamedSharding(mesh, PartitionSpec()))
-            running = _gather_merge(running, packed, (task,), mesh)
-            jax.block_until_ready(running)
+            item = MultimodalDataItem(modality=Modality.IMAGE)
+            for capacity in capacities or [num_tokens]:
+                length = min(num_tokens, capacity)
+                task = ItemTask(item, length, [MergeMapping(0, 0, length)])
+                packed = jnp.zeros((capacity, running.shape[-1]), running.dtype)
+                if mesh is not None:
+                    packed = jax.device_put(packed, NamedSharding(mesh, PartitionSpec()))
+                running = _gather_merge(running, packed, [task], mesh)
+                jax.block_until_ready(running)
 
-        if embedding_pool is not None:
-            length = min(num_tokens, embedding_pool.page_size)
-            task = ItemTask(item, length, (_MergeMapping(0, 0, length),))
-            entry = EmbeddingPoolEntry(np.asarray([0], dtype=np.int32), length)
-            running = _gather_from_pool(running, embedding_pool, (task,), (entry,), mesh)
-            jax.block_until_ready(running)
+            if embedding_pool is not None:
+                length = min(num_tokens, embedding_pool.page_size)
+                task = ItemTask(item, length, [MergeMapping(0, 0, length)])
+                entry = EmbeddingPoolEntry(np.asarray([0], dtype=np.int32), length)
+                running = _gather_from_pool(running, embedding_pool, [task], [entry], mesh)
+                jax.block_until_ready(running)
 
-    input_embedding, deepstack = _split_embeddings(running, hidden, deepstack_dim, mesh)
-    return input_embedding, deepstack, deepstack_dim > 0
-
-
-def precompile_multimodal_components(
-    multimodal_model: InModelMultimodalContract,
-    embedding_pool: EmbeddingPool | None = None,
-) -> None:
-    multimodal_model.precompile_multimodal()
-    if embedding_pool is not None:
-        for capacity in multimodal_model.get_multimodal_embedding_packed_capacities():
-            embedding_pool.precompile_packed_write(capacity)
+            jax.block_until_ready(_split_embeddings(running, hidden, deepstack_dim, mesh))
+    return capacities
 
 
 def embed_multimodal_inputs(
-    multimodal_batch: _MultimodalBatch | None,
+    multimodal_batch: MultimodalBatch | None,
     input_ids: jax.Array,
     multimodal_model: InModelMultimodalContract,
     embedding_pool: EmbeddingPool | None = None,
@@ -346,43 +396,48 @@ def embed_multimodal_inputs(
         if deepstack_dim:
             running = jnp.pad(running, ((0, 0), (0, hidden * deepstack_dim)))
 
-        encode_funcs = multimodal_model.get_multimodal_encode_funcs()
-        for modality, tasks in (multimodal_batch or {}).items():
-            encode_func = encode_funcs.get(modality)
-            if encode_func is None:
-                raise ValueError(
-                    f"no embedding function for modality {modality}; "
-                    "in-model multimodal models must expose one"
+        if multimodal_batch is not None:
+            per_lane_tasks = [dict(lane) for lane in multimodal_batch.per_lane_tasks]
+            hits, entries = [], []
+            expired: dict[Modality, list[ItemTask]] = {}
+            for task in multimodal_batch.cached_tasks:
+                entry = (
+                    embedding_pool.lookup(task.item.hash) if embedding_pool is not None else None
                 )
-
-            if embedding_pool is None:
-                packed = encode_func([task.item for task in tasks])
-                running = _gather_merge(running, packed, tasks, mesh)
-                continue
-
-            # Pool present: split hits from misses by item hash. Misses run the
-            # encoder and merge from its packed output (same cost as the no-pool
-            # path) then are written back for reuse; hits merge straight from the
-            # pool's paged buffers.
-            hit_tasks: list[ItemTask] = []
-            hit_entries: list[EmbeddingPoolEntry] = []
-            miss_tasks: list[ItemTask] = []
-            for task in tasks:
-                if task.item.hash is None:
-                    task.item.set_pad_value()
-                entry = embedding_pool.lookup(task.item.hash)
-                if entry is not None:
-                    hit_tasks.append(task)
-                    hit_entries.append(entry)
+                if entry is None:
+                    expired.setdefault(task.item.modality, []).append(task)
                 else:
-                    miss_tasks.append(task)
-            # Consume hits before a miss write is allowed to evict their pages.
-            if hit_tasks:
-                running = _gather_from_pool(running, embedding_pool, hit_tasks, hit_entries, mesh)
-            if miss_tasks:
-                packed = encode_func([task.item for task in miss_tasks])
-                running = _gather_merge(running, packed, tuple(miss_tasks), mesh)
-                _write_misses_to_pool(embedding_pool, packed, miss_tasks)
+                    hits.append(task)
+                    entries.append(entry)
+            # Dispatch all cache reads before encoder outputs can overwrite pool pages.
+            if hits:
+                running = _gather_from_pool(running, embedding_pool, hits, entries, mesh)
+
+            # Scheduling only checks presence. Rebalance misses if those entries were evicted.
+            for modality, tasks in expired.items():
+                tasks = [task for lane in per_lane_tasks for task in lane.get(modality, [])] + tasks
+                lanes = balance_lanes(
+                    [int(task.item.feature.shape[0]) for task in tasks],
+                    len(per_lane_tasks),
+                )
+                for lane, indices in zip(per_lane_tasks, lanes, strict=True):
+                    lane[modality] = [tasks[i] for i in sorted(indices)]
+
+            encode_funcs = multimodal_model.get_multimodal_encode_funcs()
+            modalities = dict.fromkeys(modality for lane in per_lane_tasks for modality in lane)
+            for modality in modalities:
+                tasks = []
+                items_per_lane = []
+                for lane in per_lane_tasks:
+                    lane_tasks = lane.get(modality, [])
+                    items_per_lane.append([task.item for task in lane_tasks])
+                    tasks.extend(lane_tasks)
+                encode = encode_funcs.get(modality)
+                if encode is None:
+                    raise ValueError(f"no embedding function for modality {modality}")
+                packed = encode(items_per_lane)
+                running = _gather_merge(running, packed, tasks, mesh)
+                _cache_unfinished_items(embedding_pool, packed, tasks)
 
         input_embedding, deepstack = _split_embeddings(running, hidden, deepstack_dim, mesh)
         apply_for_deepstack = deepstack_dim > 0 and multimodal_batch is not None

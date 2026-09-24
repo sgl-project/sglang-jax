@@ -21,14 +21,16 @@ from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
-from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
+from sgl_jax.srt.multimodal.in_model.interface import (
+    InModelMultimodalContract,
+    VisionInputSpec,
+)
 from sgl_jax.srt.multimodal.in_model.lane_packing import (
     encoder_num_lanes,
     run_mrope_vision_model,
 )
 from sgl_jax.srt.multimodal.layers.vision_sharding import resolve_encoder_tp
 from sgl_jax.srt.precision_tracer import precision_tracer
-from sgl_jax.srt.utils.common_utils import resolve_vision_patch_buckets
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
@@ -598,12 +600,14 @@ class Gemma4ForCausalLM(nnx.Module):
                 self.config.hidden_size,
                 dtype=self.dtype,
                 param_dtype=self.dtype,
-                kernel_axes=("tensor", None),
+                mesh=mesh,
+                enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
             )
         self.logits_processor = LogitsProcessor(
             self.config.vocab_size,
             soft_cap=getattr(self.config, "final_logit_softcapping", 0.0),
             mesh=self.mesh,
+            enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
         )
         self.capture_aux_hidden_states = False
 
@@ -740,9 +744,7 @@ class Gemma4ForCausalLM(nnx.Module):
         }
 
         if hasattr(self, "lm_head"):
-            mappings["lm_head.weight"] = WeightMapping(
-                target_path="lm_head.embedding", sharding=("tensor", None), transpose=False
-            )
+            mappings["lm_head.weight"] = self.lm_head.weight_mapping("lm_head.embedding")
 
         num_layers = self.config.num_hidden_layers
         for layer_idx in range(num_layers):
@@ -955,17 +957,9 @@ class Gemma4ForConditionalGeneration(Gemma4ForCausalLM, InModelMultimodalContrac
         self.root_config = config
         super().__init__(config, mesh, dtype)
 
-        from sgl_jax.srt.managers.schedule_batch import global_server_args_dict
         from sgl_jax.srt.models.gemma4_vision import Gemma4VisionModel
 
-        encoder_tp = resolve_encoder_tp(
-            mesh,
-            global_server_args_dict.get("vision_encoder_parallel", "dp"),
-        )
-        configured_buckets = global_server_args_dict.get("precompile_vision_patch_paddings")
-        input_buckets = (
-            tuple(resolve_vision_patch_buckets(configured_buckets)) if configured_buckets else None
-        )
+        encoder_tp = resolve_encoder_tp(mesh, getattr(config, "vision_encoder_parallel", "dp"))
         self.visual = Gemma4VisionModel(
             config.vision_config,
             self.config.hidden_size,
@@ -973,7 +967,10 @@ class Gemma4ForConditionalGeneration(Gemma4ForCausalLM, InModelMultimodalContrac
             None,
             mesh,
             encoder_tp,
-            input_buckets,
+        )
+        self.vision_input_spec = VisionInputSpec(
+            patch_dim=self.visual.patch_dim,
+            spatial_merge_size=self.visual.pooling_kernel_size,
         )
 
     def get_input_embeddings(self):
@@ -986,22 +983,15 @@ class Gemma4ForConditionalGeneration(Gemma4ForCausalLM, InModelMultimodalContrac
 
         return embed
 
-    def precompile_multimodal(self) -> None:
-        self.visual.precompile()
+    def get_image_feature(self, items_per_lane: list[list[MultimodalDataItem]]) -> jax.Array:
+        return self._get_visual_feature(items_per_lane)
 
-    def get_multimodal_embedding_packed_capacities(self) -> tuple[int, ...]:
-        return self.visual.get_packed_capacities()
-
-    def get_image_feature(self, items: list[MultimodalDataItem]) -> jax.Array:
-        return self._get_visual_feature(items)
-
-    def _get_visual_feature(self, items: list[MultimodalDataItem]) -> jax.Array:
+    def _get_visual_feature(self, items_per_lane: list[list[MultimodalDataItem]]) -> jax.Array:
         return run_mrope_vision_model(
             self.visual,
-            items,
+            items_per_lane,
             mesh=self.mesh,
             num_lanes=encoder_num_lanes(self.mesh, self.visual.vision_tp),
-            buckets=self.visual.input_buckets,
             merge_unit=self.visual.pooling_unit,
             rope_type="rope_2d_packed",
             input_sharding=self.visual.specs.sharding(self.visual.specs.batch_axis),

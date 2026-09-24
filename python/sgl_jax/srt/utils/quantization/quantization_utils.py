@@ -19,6 +19,22 @@ from sgl_jax.srt.configs.quantization_config import (
 logger = logging.getLogger(__name__)
 
 
+def apply_quantization(model_config, model, *, is_static_input=False):
+    """Prepare static checkpoint structure or quantize loaded weights, MoE first."""
+    config = model_config.quantization_config
+    if config is not None:
+        if config.has_moe_quantization():
+            model = apply_moe_quantization(model_config, model, is_static_input=is_static_input)
+        if config.get_linear_rules():
+            model = apply_linear_quantization(model_config, model, is_static_input=is_static_input)
+    return model
+
+
+def _array_sharding(tensor):
+    # Tracers carry explicit sharding on their aval, not on the array object.
+    return getattr(tensor, "sharding", None) or jax.typeof(tensor).sharding
+
+
 def _get_block_reshape_sharding(
     tensor: jax.Array,
     quantized_axes: list[int],
@@ -32,7 +48,7 @@ def _get_block_reshape_sharding(
     - keep the original sharding on the new ``num_blocks`` axis
     - mark the inner ``block`` axis as replicated
     """
-    input_sharding = getattr(tensor, "sharding", None)
+    input_sharding = _array_sharding(tensor)
     if not isinstance(input_sharding, NamedSharding):
         return None
 
@@ -58,7 +74,7 @@ def _get_safe_block_quant_input_sharding(
     axis replicated, perform the block quantization reshape/reduction, and let
     callers restore a suitable sharding afterwards.
     """
-    input_sharding = getattr(tensor, "sharding", None)
+    input_sharding = _array_sharding(tensor)
     if not isinstance(input_sharding, NamedSharding):
         return None
 
@@ -273,7 +289,10 @@ def apply_moe_quantization(
                 logger.info("Skipping MoE quantization for %s (matched ignored_layers)", log_path)
                 return
             logger.debug("Quantizing MoE weights path=%s", log_path)
-            obj.quantize_weights(is_static=is_static_input)
+            obj.quantize_weights(
+                is_static=is_static_input,
+                abstract=getattr(model_config, "_abstract_mode", False),
+            )
             return
 
         # Try to iterate through attributes
@@ -345,7 +364,7 @@ def quantize_tensor(
         axis = [axis]
 
     orig_shape = tensor.shape
-    original_input_sharding = getattr(tensor, "sharding", None)
+    original_input_sharding = _array_sharding(tensor)
     mask = None
 
     if block_size is not None:

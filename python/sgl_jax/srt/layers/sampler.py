@@ -1,3 +1,5 @@
+from functools import partial
+
 import jax
 import numpy as np
 from flax import nnx
@@ -393,3 +395,26 @@ def compute_logprobs(
     batch_idx = jnp.arange(logprobs.shape[0])
     token_logprobs = logprobs.at[batch_idx, token_ids].get(out_sharding=out_sharding)
     return token_logprobs
+
+
+def make_jitted_sampler(base_rng_key, compiler_options=None):
+    """Share the serving sampler program with offline executable export."""
+
+    @partial(
+        jax.jit,
+        static_argnames=["sampler_state_def"],
+        compiler_options=compiler_options,
+    )
+    def jitted_sampler(sampler_def, sampler_state_def, sampler_state_leaves, rng_step, *args):
+        state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
+        sampler = nnx.merge(sampler_def, state)
+        rng_step = rng_step + jnp.int32(1)
+        result = sampler(*args, rng_override=base_rng_key, rng_step=rng_step)
+        return result, rng_step
+
+    return jitted_sampler
+
+
+@partial(jax.jit, static_argnames=["mesh"])
+def jitted_compute_logprobs(mesh, logits, next_tokens):
+    return compute_logprobs(mesh, logits, next_tokens)

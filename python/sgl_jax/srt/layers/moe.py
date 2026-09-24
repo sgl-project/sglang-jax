@@ -292,7 +292,7 @@ class EPMoE(nnx.Module):
             "or offline block format [E, out_blocks, k_blocks]."
         )
 
-    def quantize_weights(self, is_static: bool = False):
+    def quantize_weights(self, is_static: bool = False, *, abstract: bool = False):
         """Quantize MoE weights in-place or initialize params for static loading."""
         if self.quantized_dtype is None:
             return
@@ -330,8 +330,21 @@ class EPMoE(nnx.Module):
                 )
             return block_size_k
 
-        with jax.set_mesh(self.moe_mesh):
+        mesh_context = (
+            jax.sharding.use_abstract_mesh(self.moe_mesh.abstract_mesh)
+            if abstract
+            else jax.set_mesh(self.moe_mesh)
+        )
+        with mesh_context:
             if is_static:
+                # Both checkpoint and dummy loaders need placeholders with the
+                # quantized dtype before loading or generating the weights.
+                for name in ("wi_0", "wi_1", "wo"):
+                    param = getattr(self, name)
+                    if isinstance(param.value, jax.ShapeDtypeStruct):
+                        param.value = jax.ShapeDtypeStruct(
+                            param.value.shape, self.quantized_dtype, sharding=param.value.sharding
+                        )
                 # Static checkpoints will load real scale tensors later, but the
                 # placeholders must already satisfy expert sharding shape rules.
                 num_experts = self.wi_0.value.shape[0]

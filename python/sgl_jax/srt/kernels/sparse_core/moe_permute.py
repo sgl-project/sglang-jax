@@ -13,7 +13,6 @@ unavailable or the problem is too small for the offload to pay off, so callers
 can use them unconditionally once the opt-in is on.
 """
 
-import functools
 import logging
 
 import jax
@@ -21,6 +20,7 @@ import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
+from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -37,10 +37,10 @@ def moe_sc_permute_enabled_by_env() -> bool:
     return get_bool_env_var(ENV_FLAG, "false")
 
 
-@functools.lru_cache(maxsize=1)
 def sparse_core_available() -> bool:
+    # Pallas caches hardware info by trace context; do not cache a host result here.
     try:
-        if jax.devices()[0].platform != "tpu":
+        if not is_tpu_runtime():
             return False
         return pltpu.get_tpu_info().sparse_core is not None
     except Exception as e:  # noqa: BLE001 - any probe failure means "not available"

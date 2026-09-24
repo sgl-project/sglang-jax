@@ -26,7 +26,6 @@ After obtaining a seed, the final tile sizes are clamped and snapped to
 the actual local matrix dimensions so that the kernel launch is always valid.
 """
 
-import functools
 import importlib
 import logging
 import math
@@ -34,6 +33,8 @@ import re
 
 import jax
 import jax.numpy as jnp
+
+from sgl_jax.srt.utils.jax_utils import get_device_kind
 
 logger = logging.getLogger(__name__)
 
@@ -150,11 +151,10 @@ def _nearest_power_of_two_multiple(x: int, base: int, upper_bound: int) -> int:
     return min(candidates, key=lambda value: (abs(value - x), -value))
 
 
-@functools.lru_cache(maxsize=1)
 def _get_current_tpu_version() -> int:
     """Return the current TPU major version, or ``-1`` when unavailable."""
     try:
-        kind = jax.devices()[0].device_kind
+        kind = get_device_kind()
     except Exception:
         return -1
     match = re.match(r"^TPU[^\d]*(\d+)", kind)

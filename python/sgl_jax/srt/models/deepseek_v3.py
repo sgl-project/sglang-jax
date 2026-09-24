@@ -430,8 +430,8 @@ class DeepseekV3DecoderLayer(nnx.Module):
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
 
-        rope_theta = getattr(config, "rope_theta", 10000.0)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = config.rope_parameters["rope_theta"]
+        rope_scaling = config.rope_parameters
         max_position_embeddings = getattr(config, "max_position_embeddings", 163840)
 
         # MLA attention
@@ -757,9 +757,14 @@ class DeepseekV3ForCausalLM(nnx.Module):
             config.hidden_size,
             dtype=dtype,
             param_dtype=dtype,
-            kernel_axes=("tensor", None),
+            mesh=mesh,
+            enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
         )
-        self.logits_processor = LogitsProcessor(config.vocab_size, mesh=mesh)
+        self.logits_processor = LogitsProcessor(
+            config.vocab_size,
+            mesh=mesh,
+            enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
+        )
 
     def __call__(
         self,
@@ -802,10 +807,8 @@ class DeepseekV3ForCausalLM(nnx.Module):
                 sharding=(None,),
                 transpose=False,
             ),
-            f"{self.hf_weight_prefix}lm_head.weight": WeightMapping(
-                target_path="lm_head.embedding",
-                sharding=("tensor", None),
-                transpose=False,
+            f"{self.hf_weight_prefix}lm_head.weight": self.lm_head.weight_mapping(
+                "lm_head.embedding"
             ),
         }
 
