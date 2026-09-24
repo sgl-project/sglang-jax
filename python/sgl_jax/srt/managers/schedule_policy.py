@@ -618,9 +618,9 @@ class PrefillAdder:
             return self.add_one_req_ignore_eos(req)
 
         dp_rank = req.dp_rank if req.dp_rank is not None else 0
-        total_tokens = req.extend_input_len + min(
-            req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION
-        )
+        max_new_tokens = min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION)
+        recompute_total_tokens = req.extend_input_len + max_new_tokens
+        total_tokens = recompute_total_tokens
 
         # adjusting the input_tokens based on host_hit_length and page_size
         real_input_tokens = req.extend_input_len - req.host_hit_length
@@ -633,7 +633,11 @@ class PrefillAdder:
         )
         swa_restore = 0
         if hybrid_restore:
-            _, swa_restore = self.tree_cache.get_load_back_sizes(req.last_host_node)
+            full_restore, swa_restore = self.tree_cache.get_load_back_sizes(req.last_host_node)
+            # A host hit can heal SWA while FULL already resides on device.
+            total_tokens = (
+                full_restore + req.extend_input_len - req.host_hit_length + max_new_tokens
+            )
             req.swa_host_hit_length = swa_restore
         swa_extend = real_input_tokens if hybrid_restore else req.extend_input_len
 
@@ -669,9 +673,12 @@ class PrefillAdder:
             if self.is_hybrid:
                 swa_needed = swa_restore + self._swa_budget_for_req(swa_extend, dp_rank)
                 if swa_needed >= self.rem_swa_tokens_for_dp(dp_rank):
-                    if not hybrid_restore or self._swa_budget_for_req(
-                        req.extend_input_len, dp_rank
-                    ) >= self.rem_swa_tokens_for_dp(dp_rank):
+                    if (
+                        not hybrid_restore
+                        or recompute_total_tokens >= self.rem_total_tokens_for_dp(dp_rank)
+                        or self._swa_budget_for_req(req.extend_input_len, dp_rank)
+                        >= self.rem_swa_tokens_for_dp(dp_rank)
+                    ):
                         return AddReqResult.NO_TOKEN
                     # A whole host node may overhang the SWA window. Do not
                     # indefinitely retry this restore when recompute fits.
@@ -692,6 +699,13 @@ class PrefillAdder:
                     )
                     if trunc_est <= 0:
                         return AddReqResult.OTHER
+
+            if hybrid_restore:
+                # Resident FULL pages in the host candidate will become request-
+                # protected. They cannot also fund the restore/extend budget.
+                with self._lock_node(req.last_host_node):
+                    if total_tokens >= self.rem_total_tokens_for_dp(dp_rank):
+                        return AddReqResult.NO_TOKEN
 
             # HiCache: after budget gate, pull host-only prefix back to device.
             # Must happen after NO_TOKEN check so rejected reqs never trigger H2D.
@@ -729,9 +743,13 @@ class PrefillAdder:
 
                 elif hybrid_restore:
                     # Failed all-or-nothing restore leaves no reservations. Recompute
-                    # needs the original SWA allocation budget, not the L2 estimate.
-                    if self._swa_budget_for_req(req.extend_input_len, dp_rank) >= (
-                        self.rem_swa_tokens_for_dp(dp_rank)
+                    # needs the original FULL/SWA budgets, not the L2 estimates.
+                    if recompute_total_tokens >= self.rem_total_tokens_for_dp(
+                        dp_rank
+                    ) or self._swa_budget_for_req(
+                        req.extend_input_len, dp_rank
+                    ) >= self.rem_swa_tokens_for_dp(
+                        dp_rank
                     ):
                         return AddReqResult.NO_TOKEN
 

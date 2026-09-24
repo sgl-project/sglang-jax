@@ -68,8 +68,8 @@ def capture(manifest, evidence, post):
         events = evidence.get(rid)
         if not isinstance(events, list):
             raise TypeError(f"{rid}: evidence must be event list")
-        if case.get("l2_components") and not events:
-            raise ValueError(f"{rid}: missing L2 evidence")
+        # The checker enforces L2 evidence for on/on_repeat; off captures
+        # legitimately use the same manifest with empty transfer evidence.
         for event in events:
             if (
                 not isinstance(event, dict)
