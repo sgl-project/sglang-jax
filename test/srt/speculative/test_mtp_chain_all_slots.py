@@ -117,5 +117,21 @@ class ChainAllSlotContractTest(unittest.TestCase):
             self.assertTrue((slots(md_p)[1] == -1).all())
 
 
+class ChainAllHeadroomGuardTest(unittest.TestCase):
+    def test_guard(self):
+        from sgl_jax.srt.speculative.draft_extend_fused import chain_all_headroom_ok
+
+        vsl = np.array([641, 300, 0], np.int32)  # third slot is padding
+        # overlap scheduling: allocated >= committed + 8 -> plenty for 3 steps
+        self.assertTrue(chain_all_headroom_ok(vsl + 8, vsl, 3))
+        # exactly enough: window end (vsl + 3) + 2 more slots
+        self.assertTrue(chain_all_headroom_ok(vsl + 5, vsl, 3))
+        # one short on a live request -> fall back
+        self.assertFalse(chain_all_headroom_ok(np.array([641 + 4, 300 + 8, 0], np.int32), vsl, 3))
+        # padding request's allocation is ignored
+        self.assertTrue(chain_all_headroom_ok(np.array([649, 308, 0], np.int32), vsl, 3))
+        self.assertTrue(chain_all_headroom_ok(np.zeros(3, np.int32), np.zeros(3, np.int32), 3))
+
+
 if __name__ == "__main__":
     unittest.main()
