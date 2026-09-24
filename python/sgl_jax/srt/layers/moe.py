@@ -357,13 +357,17 @@ class EPMoE(nnx.Module):
         )
         with mesh_context:
             if is_static:
-                if abstract:
-                    # The checkpoint loader preserves the incoming quantized
-                    # dtype. Dummy loading must use that same weight contract.
+                if abstract or isinstance(self.wi_0.value, jax.ShapeDtypeStruct):
+                    # Prepare quantized placeholders for checkpoint and dummy
+                    # loading without replacing already loaded concrete weights.
                     for name in ("wi_0", "wi_1", "wo"):
                         param = getattr(self, name)
                         param.value = jax.ShapeDtypeStruct(
-                            param.value.shape, self.quantized_dtype, sharding=param.value.sharding
+                            param.value.shape,
+                            self.quantized_dtype,
+                            sharding=jax.sharding.NamedSharding(
+                                self.moe_mesh, param.value.sharding.spec
+                            ),
                         )
                 # Static checkpoints will load real scale tensors later, but the
                 # placeholders must already satisfy expert sharding shape rules.
@@ -385,9 +389,6 @@ class EPMoE(nnx.Module):
                 k_blocks_wo = (intermediate_dim // block_size_k) if block_size_k else 1
                 wi_scale_sharding = P("expert", None, None, "tensor")
                 wo_scale_sharding = self._get_wo_scale_sharding(is_block=(k_blocks_wo > 1))
-                wi_sharding = P("expert", None, "tensor")
-                wo_sharding = P("expert", "tensor", None)
-
                 is_abstract = isinstance(self.wi_0.value, jax.ShapeDtypeStruct)
                 scale_dtype = self.dtype if is_int4_dtype(self.quantized_dtype) else jnp.float32
 
@@ -429,25 +430,6 @@ class EPMoE(nnx.Module):
                     wo_scale_sharding,
                 )
 
-                # The loader needs quantized abstract placeholders to recognize
-                # packed weights. Concrete weights may already contain checkpoint
-                # data (e.g. the FP8 parity tool); do not replace that data.
-                if is_abstract:
-                    self.wi_0 = _make_param(
-                        (num_experts, hidden_size, intermediate_dim),
-                        self.quantized_dtype,
-                        wi_sharding,
-                    )
-                    self.wi_1 = _make_param(
-                        (num_experts, hidden_size, intermediate_dim),
-                        self.quantized_dtype,
-                        wi_sharding,
-                    )
-                    self.wo = _make_param(
-                        (num_experts, intermediate_dim, hidden_size),
-                        self.quantized_dtype,
-                        wo_sharding,
-                    )
                 return
 
             # Quantize weights along k-dim (axis=1 in [g, k, n] layout)
