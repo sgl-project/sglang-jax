@@ -46,19 +46,26 @@ class Learnable2DInterPosEmbDivided_fixed(nnx.Module):
 
         pos_embs = []
         for t, h, w in grid_thws:
+            if not 1 <= t <= self.num_frames:
+                raise ValueError(f"Frame count {t} must be in [1, {self.num_frames}]")
             if (h, w) == self.weight.shape[:-1]:
                 pos_emb_2d = self.weight.reshape(-1, self.weight.shape[-1])
             else:
                 pos_emb_2d = jax.image.resize(
                     self.weight,
                     shape=(h, w, self.dim),
-                    method="bicubic",
+                    method="bicubic-pytorch",
+                    antialias=False,
                 ).reshape(-1, self.dim)
 
             if t == 1:
                 pos_emb_3d = pos_emb_2d
             else:
-                pos_emb_3d = jnp.tile(jnp.expand_dims(pos_emb_2d, axis=0), (t, 1, 1))
+                # Fixed temporal sin/cos positions are not checkpoint parameters.
+                omega = 1.0 / 10000 ** (np.arange(self.dim // 2, dtype=np.float32) / (self.dim / 2))
+                phase = np.outer(np.arange(t, dtype=np.float32), omega)
+                time_weight = jnp.asarray(np.concatenate([np.sin(phase), np.cos(phase)], axis=-1))
+                pos_emb_3d = pos_emb_2d[None, :, :] + time_weight[:, None, :]
 
             pos_embs.append(pos_emb_3d.reshape(-1, pos_emb_3d.shape[-1]))
 
@@ -156,7 +163,7 @@ def apply_2d_rope(x: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
     x_imag = x[..., 1::2]
     x_rot_real = x_real * cos[:, None, :] - x_imag * sin[:, None, :]
     x_rot_imag = x_real * sin[:, None, :] + x_imag * cos[:, None, :]
-    return jnp.stack([x_rot_real, x_rot_imag], axis=-1).reshape(x.shape)
+    return jnp.stack([x_rot_real, x_rot_imag], axis=-1).reshape(x.shape).astype(x.dtype)
 
 
 class KimiK25VisionAttention(nnx.Module):
@@ -279,7 +286,7 @@ class KimiK25VisionBlock(nnx.Module):
         config: KimiK25ModelVitConfig,
         dtype: jnp.dtype,
         mesh: Mesh | None = None,
-        norm_eps: float = 1e-6,
+        norm_eps: float = 1e-5,
         rngs: nnx.Rngs | None = None,
         vision_tp: bool = True,
     ):
@@ -290,7 +297,9 @@ class KimiK25VisionBlock(nnx.Module):
 
         _rngs = rngs or nnx.Rngs(0)
 
-        self.pre_norm = nnx.LayerNorm(config.vt_hidden_size, param_dtype=dtype, rngs=_rngs)
+        self.pre_norm = nnx.LayerNorm(
+            config.vt_hidden_size, epsilon=norm_eps, param_dtype=dtype, rngs=_rngs
+        )
 
         self.proj = nnx.Linear(
             config.vt_hidden_size,
@@ -300,7 +309,9 @@ class KimiK25VisionBlock(nnx.Module):
             rngs=_rngs,
         )
 
-        self.post_norm = nnx.LayerNorm(config.vt_hidden_size, param_dtype=dtype, rngs=_rngs)
+        self.post_norm = nnx.LayerNorm(
+            config.vt_hidden_size, epsilon=norm_eps, param_dtype=dtype, rngs=_rngs
+        )
 
     def __call__(
         self,
@@ -359,7 +370,9 @@ class VisionTowerEncoder(nnx.Module):
 
         _rngs = rngs or nnx.Rngs(0)
 
-        self.final_layernorm = nnx.LayerNorm(config.vt_hidden_size, param_dtype=dtype, rngs=_rngs)
+        self.final_layernorm = nnx.LayerNorm(
+            config.vt_hidden_size, epsilon=1e-5, param_dtype=dtype, rngs=_rngs
+        )
 
     def __call__(
         self,
@@ -507,7 +520,7 @@ class VisionTower(nnx.Module):
         """
 
         hidden_states = self.patch_embed(pixel_values)
-        hidden_states = hidden_states + abs_pos_embs
+        hidden_states = hidden_states + abs_pos_embs.astype(hidden_states.dtype)
 
         hidden_states = self.encoder(hidden_states, rope_freq_cis, cu_seqlens)
 
