@@ -352,6 +352,11 @@ class HybridHiCache:
                         # Preserve the original stage/flush exception.
                         with suppress(Exception):
                             controller.drain_loads()
+                    # A failed scatter can leave completed staging arrays in
+                    # the host pool. Drop only this transaction's sources after
+                    # every worker has stopped publishing; keep the L2 data.
+                    for _, ct, transfer in transfers:
+                        cache.hicache_controllers[ct].discard_load(transfer.host_handles)
                 if not committed:
                     for ct, indices in reserved.items():
                         if indices is not None:

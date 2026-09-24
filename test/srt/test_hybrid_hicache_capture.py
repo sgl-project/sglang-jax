@@ -1,6 +1,7 @@
 """Capture input validation does not need a server."""
 
 import pytest
+from hybrid_hicache_acceptance import check
 from hybrid_hicache_capture import capture
 
 
@@ -68,15 +69,26 @@ def test_missing_evidence_or_input_fails():
     assert len(sent) == 1
 
 
-def test_l2_capture_needs_supplied_events():
+def test_capture_allows_off_without_l2_events_but_checker_rejects_on():
     data = manifest()
+    data["cases"] = data["cases"][:1]
     data["cases"][0]["l2_components"] = ["SWA"]
-    with pytest.raises(ValueError, match="L2 evidence"):
-        capture(
-            data,
-            {"cold": []},
-            lambda _: {"output_ids": [7], "meta_info": {"id": "cold"}},
-        )
+    response = {
+        "output_ids": [7, 8, 9],
+        "meta_info": {
+            "id": "cold",
+            "dp_rank": 0,
+            "completion_tokens": 3,
+            "finish_reason": {"type": "length"},
+        },
+    }
+    results = capture(data, {"cold": []}, lambda _: response)
+    errors = check(
+        data, {name: {"results": results} for name in ("off", "off_repeat", "on", "on_repeat")}
+    )
+    assert len(errors) == 8
+    assert all(error.startswith(("on/", "on_repeat/")) for error in errors)
+    assert any("missing SWA h2d evidence" in error for error in errors)
 
 
 def test_duplicate_rid_fails_before_network():

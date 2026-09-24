@@ -86,6 +86,62 @@ def test_second_component_failure_rolls_back_all_destinations(monkeypatch):
         assert (alloc.full_available_size(), alloc.swa_available_size()) == before
         assert all(cd.lock_ref == cd.host_lock_ref == 0 for cd in node.component_data)
         assert not alloc.full_to_swa_index_mapping.any()
+        assert all(not pool._pending_load for pool in cache.host_pools.values())
+    finally:
+        shutdown(cache)
+
+
+@pytest.mark.parametrize("failure", ["first_scatter", "stage_submit", "stage_worker"])
+def test_failed_restore_discards_only_its_staging(monkeypatch, failure):
+    cache, alloc, _ = make_cache(window=8)
+    try:
+        _, unrelated = insert(cache, alloc, range(20, 28))
+        _, node = insert(cache, alloc, range(8))
+        settle(cache)
+        cache.evict(EvictParams(num_tokens=16))
+        before = (alloc.full_available_size(), alloc.swa_available_size())
+        retained = {}
+        for ct, pool in cache.host_pools.items():
+            handles = list(unrelated.component_data[ct].host_value)
+            pool.stage_load(handles)
+            retained[ct] = dict(pool._pending_load)
+
+        def fail(*args):
+            raise RuntimeError("injected restore failure")
+
+        with monkeypatch.context() as patch:
+            if failure == "first_scatter":
+                patch.setattr(cache.hicache_controllers[CT.FULL], "flush_load", fail)
+            elif failure == "stage_submit":
+                patch.setattr(cache.hicache_controllers[CT.SWA], "stage_load", fail)
+            else:
+                pool = cache.host_pools[CT.SWA]
+                stage = pool.stage_load
+
+                def stage_then_fail(handles):
+                    stage(handles)
+                    fail()
+
+                patch.setattr(pool, "stage_load", stage_then_fail)
+            with pytest.raises(RuntimeError, match="injected restore failure"):
+                cache.init_load_back(node, 8)
+
+        assert (alloc.full_available_size(), alloc.swa_available_size()) == before
+        assert all(cd.value is None for cd in node.component_data)
+        assert all(cd.lock_ref == cd.host_lock_ref == 0 for cd in node.component_data)
+        assert not alloc.full_to_swa_index_mapping.any()
+        for ct, pool in cache.host_pools.items():
+            assert set(pool._pending_load) == set(retained[ct])
+            for handle, entry in retained[ct].items():
+                assert pool._pending_load[handle] is entry
+            assert not cache.hicache_controllers[ct].has_inflight(
+                list(node.component_data[ct].host_value)
+            )
+        # Cleanup preserves the host data, so a subsequent restore can succeed.
+        restored, _, _ = cache.init_load_back(node, 8)
+        assert len(restored) == 8
+        for ct, pool in cache.host_pools.items():
+            assert set(pool._pending_load) == set(retained[ct])
     finally:
         shutdown(cache)
 

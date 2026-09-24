@@ -638,6 +638,16 @@ class LRUHostKVPool(HostKVPool):
                         loaded[buffer_id],
                     )
 
+    def discard_load(self, host_buffer_ids: list[int]) -> None:
+        """Drop completed H2D staging for these pages, retaining their host data.
+
+        The caller must wait for the corresponding stage_load workers first.
+        Those workers block_until_ready before publishing the staging arrays.
+        """
+        with self._pending_load_lock:
+            for buffer_id in host_buffer_ids:
+                self._pending_load.pop(buffer_id, None)
+
     def flush_load(self, host_buffer_ids: list[int], device_indices: list[int]) -> None:
         """H2D phase 2: scatter the staged pages into the KV buffer via the
         in-place aliased Pallas kernel (``write_kv_layer``).

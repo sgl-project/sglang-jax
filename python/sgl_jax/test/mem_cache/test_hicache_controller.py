@@ -105,6 +105,7 @@ class _FakeLoadPool:
         self.raise_on_stage = raise_on_stage
         self.staged = []
         self.flushed = []
+        self.discarded = []
 
     def stage_load(self, host_buffer_ids):
         if self.stage_gate is not None:
@@ -115,6 +116,9 @@ class _FakeLoadPool:
 
     def flush_load(self, host_buffer_ids, device_indices):
         self.flushed.append((list(host_buffer_ids), list(device_indices)))
+
+    def discard_load(self, host_buffer_ids):
+        self.discarded.extend(host_buffer_ids)
 
     def free(self, host_buffer_ids):
         pass
@@ -223,6 +227,23 @@ class TestHiCacheControllerLoadAsync(unittest.TestCase):
             ctrl.flush_load([0], [3])  # now allowed
             self.assertEqual(pool.staged, [[0]])
             self.assertEqual(pool.flushed, [([0], [3])])
+        finally:
+            gate.set()
+            ctrl.shutdown()
+
+    def test_discard_rejects_inflight_stage_until_drain(self):
+        gate = threading.Event()
+        pool = _FakeLoadPool(stage_gate=gate)
+        ctrl = HiCacheController(pool, device_pool=None)
+        try:
+            ctrl.stage_load([0])
+            with self.assertRaisesRegex(RuntimeError, "in-flight stage_load"):
+                ctrl.discard_load([0])
+            self.assertEqual(pool.discarded, [])
+            gate.set()
+            ctrl.drain_loads()
+            ctrl.discard_load([0])
+            self.assertEqual(pool.discarded, [0])
         finally:
             gate.set()
             ctrl.shutdown()

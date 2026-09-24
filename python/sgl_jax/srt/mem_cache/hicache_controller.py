@@ -97,6 +97,18 @@ class HiCacheController:
             )
         self._host_pool.flush_load(host_buffer_ids, list(device_indices))
 
+    def discard_load(self, host_buffer_ids: list[int]) -> None:
+        """Discard a finished transaction's H2D staging without evicting L2."""
+        host_buffer_ids = list(host_buffer_ids)
+        with self._inflight_load_lock:
+            busy = [b for b in host_buffer_ids if b in self._inflight_load]
+        if busy:
+            raise RuntimeError(
+                f"discard_load of page id(s) {busy} with in-flight stage_load; "
+                f"call drain_loads() before discarding"
+            )
+        self._host_pool.discard_load(host_buffer_ids)
+
     def _do_d2h(self, host_buffer_ids: list[int]) -> None:
         try:
             self._host_pool.flush_backup(host_buffer_ids)

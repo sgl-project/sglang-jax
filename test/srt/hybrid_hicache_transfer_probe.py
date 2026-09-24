@@ -51,7 +51,32 @@ def _read_pages(subpool, indices, rank):
     ]
 
 
-def _write_marker(subpool, indices, rank, marker):
+def _marker_dimensions(pool, token_count):
+    subpools = (pool.full_kv_pool, pool.swa_kv_pool)
+    buffers = [buf for subpool in subpools for buf in subpool.kv_buffer]
+    return (
+        max(len(p.kv_buffer) for p in subpools),
+        token_count,
+        *(max(buf.shape[axis] for buf in buffers) for axis in (2, 3, 4)),
+    )
+
+
+def _marker_values(shape, marker, layer, digit, dimensions):
+    """Encode each coordinate in base 256; every byte is exact in BF16.
+
+    Across all digits, the signature identifies rank/component (marker), layer,
+    page/token (flattened token axis), head, K/V, and head dimension. A single
+    global float arange would lose these distinctions when cast to BF16.
+    """
+    code = np.uint64(marker * dimensions[0] + layer)
+    for axis, (size, extent) in enumerate(zip(shape, dimensions[1:], strict=True)):
+        coordinate_shape = [1] * len(shape)
+        coordinate_shape[axis] = size
+        code = code * np.uint64(extent) + np.arange(size, dtype=np.uint64).reshape(coordinate_shape)
+    return ((code >> (8 * digit)) & 255).astype(np.uint8)
+
+
+def _write_marker(subpool, indices, rank, marker, *, digit=0, dimensions=None):
     """Use the existing in-place KV scatter, preserving Raiden registrations."""
     _pages(indices, subpool.page_size)
     # write_kv_layer splits loc/data over the DP axis and addresses each
@@ -64,8 +89,18 @@ def _write_marker(subpool, indices, rank, marker):
         NamedSharding(subpool.mesh, PartitionSpec(subpool.attention_data_partition_axis)),
     )
     for layer, buf in enumerate(subpool.kv_buffer):
+        shape = (per_rank_tokens,) + tuple(buf.shape[2:])
+        if marker < 0:
+            active = np.full(shape, marker, dtype=buf.dtype)
+        else:
+            bounds = dimensions or (len(subpool.kv_buffer),) + shape
+            pattern = _marker_values(shape, marker, layer, digit, bounds)
+            active = pattern.astype(buf.dtype)
+            np.testing.assert_array_equal(active, pattern, err_msg="KV dtype loses marker bytes")
+        data = np.zeros((len(loc), 1) + tuple(buf.shape[2:]), dtype=buf.dtype)
+        data[rank * per_rank_tokens : (rank + 1) * per_rank_tokens, 0] = active
         values = jax.device_put(
-            jnp.full((len(loc), 1) + tuple(buf.shape[2:]), marker + layer, dtype=buf.dtype),
+            data,
             NamedSharding(
                 subpool.mesh,
                 PartitionSpec(
@@ -96,6 +131,8 @@ def _verify_component(subpool, indices, rank, expected, layer_ids):
     rows = []
     pages = _pages(indices, subpool.page_size)
     for local_layer, (got, want) in enumerate(zip(actual, expected, strict=True)):
+        if got.shape != want.shape:
+            raise AssertionError(f"layer {local_layer}: page layout {got.shape} != {want.shape}")
         for ordinal, page in enumerate(pages):
             np.testing.assert_array_equal(got[ordinal], want[ordinal])
             rows.append(
@@ -155,7 +192,7 @@ def _assert_addresses(cache, baseline):
             raise RuntimeError(f"{ct.name} Raiden KV buffer address changed; transfer unsafe")
 
 
-def _case(cache, allocator, pool, rank, mode, page_count, addresses):
+def _case(cache, allocator, pool, rank, mode, page_count, addresses, *, digit=0, dimensions=None):
     count = page_count * pool.page_size
     tokens = list(
         range(
@@ -190,13 +227,24 @@ def _case(cache, allocator, pool, rank, mode, page_count, addresses):
     expected = {}
     overwritten = {}
     for ct in (CT.FULL, CT.SWA):
-        _write_marker(subpools[ct], original[ct], rank, 10 + rank * 40 + int(ct) * 10)
+        _write_marker(
+            subpools[ct],
+            original[ct],
+            rank,
+            rank * 2 + int(ct),
+            digit=digit,
+            dimensions=dimensions or _marker_dimensions(pool, count),
+        )
         expected[ct] = _read_pages(subpools[ct], original[ct], rank)
     _assert_addresses(cache, addresses)
     cache.insert(InsertParams(key=key, value=full))
     _settle(cache)
     match = cache.match_prefix(MatchPrefixParams(key=key))
     node = match.last_device_node
+    evicted = {
+        CT.FULL: full,
+        CT.SWA: swa if mode == "dual" else node.component_data[CT.SWA].value.copy(),
+    }
     if mode == "dual":
         cache.evict(EvictParams(num_tokens=count, dp_rank=rank))
     else:
@@ -209,39 +257,61 @@ def _case(cache, allocator, pool, rank, mode, page_count, addresses):
         if mode == "dual" or ct == CT.SWA:
             if node.component_data[ct].value is not None:
                 raise AssertionError(f"{mode}: {ct.name} device value not evicted")
-            _write_marker(subpools[ct], original[ct], rank, -70 - rank * 10 - int(ct))
-            observed = _read_pages(subpools[ct], original[ct], rank)
-            for layer, (before, after) in enumerate(zip(expected[ct], observed, strict=True)):
+            before_overwrite = _read_pages(subpools[ct], evicted[ct], rank)
+            _write_marker(subpools[ct], evicted[ct], rank, -1)
+            observed = _read_pages(subpools[ct], evicted[ct], rank)
+            for layer, (before, after) in enumerate(zip(before_overwrite, observed, strict=True)):
                 for page in range(len(before)):
                     if np.array_equal(before[page], after[page]):
                         raise AssertionError(
                             f"{mode}: {ct.name} layer {layer} page {page} not overwritten"
                         )
-            overwritten[ct.name] = len(_pages(original[ct], pool.page_size))
+            overwritten[ct.name] = len(_pages(evicted[ct], pool.page_size))
     _assert_addresses(cache, addresses)
     match = cache.match_prefix(MatchPrefixParams(key=key))
-    if match.host_hit_length != count or (
-        mode == "swa_only" and match.swa_host_hit_length != count
+    if (
+        match.host_hit_length <= 0
+        or len(match.device_indices) + match.host_hit_length != count
+        or (mode == "swa_only" and match.swa_host_hit_length != len(evicted[CT.SWA]))
     ):
         raise AssertionError(f"{mode}: expected complete host hit, got {match.host_hit_length}")
+    missing_full, missing_swa = cache.get_load_back_sizes(match.last_host_node)
     restored, _, plan = cache.init_load_back(match.last_host_node, match.host_hit_length)
     cache.finish_load_back(plan)
     _assert_addresses(cache, addresses)
     # SWA healing returns the resident FULL addresses from the newly valid
     # boundary, even though it did not allocate replacement FULL pages.
-    if len(restored) != count:
-        raise AssertionError(f"{mode}: wrong valid-prefix length {len(restored)}")
-    full_after = np.asarray(node.component_data[CT.FULL].value)
-    swa_after = np.asarray(node.component_data[CT.SWA].value)
-    np.testing.assert_array_equal(
-        allocator.translate_full_to_swa(full_after, dp_rank=rank), swa_after
-    )
+    if len(restored) != match.host_hit_length:
+        raise AssertionError(f"{mode}: wrong restored-prefix length {len(restored)}")
+    healed = cache.match_prefix(MatchPrefixParams(key=key))
+    full_after = np.asarray(healed.device_indices)
+    if len(full_after) != count:
+        raise AssertionError(f"{mode}: incomplete valid prefix after restore")
+    mapped = allocator.translate_full_to_swa(full_after, dp_rank=rank, require_mapped=False)
+    swa_present = mapped > 0
+    swa_after = mapped[swa_present]
+    resident_swa = []
+    current = healed.last_device_node
+    while current is not cache.root_node:
+        value = current.component_data[CT.SWA].value
+        if value is not None:
+            resident_swa.append(value)
+        current = current.parent
+    np.testing.assert_array_equal(swa_after, np.concatenate(resident_swa[::-1]))
+    # A short SWA window may restore only the suffix while FULL spans several
+    # split nodes. Verify every resident mapped SWA page, and every FULL page.
+    expected[CT.SWA] = [
+        values.reshape((count,) + values.shape[2:])[swa_present].reshape(
+            (-1, pool.page_size) + values.shape[2:]
+        )
+        for values in expected[CT.SWA]
+    ]
     if mode == "swa_only":
         np.testing.assert_array_equal(full_after, original[CT.FULL])
-        np.testing.assert_array_equal(restored, original[CT.FULL])
+        np.testing.assert_array_equal(restored, original[CT.FULL][-len(restored) :])
     rows = {
         ct.name: _verify_component(
-            subpools[ct], node.component_data[ct].value, rank, expected[ct], layout[ct]
+            subpools[ct], full_after if ct == CT.FULL else swa_after, rank, expected[ct], layout[ct]
         )
         for ct in (CT.FULL, CT.SWA)
     }
@@ -252,6 +322,9 @@ def _case(cache, allocator, pool, rank, mode, page_count, addresses):
     return {
         "rank": rank,
         "mode": mode,
+        "marker_digit": digit,
+        "restored_prefix_tokens": len(restored),
+        "restored_component_tokens": {"FULL": missing_full, "SWA": missing_swa},
         "tokens": count,
         "full_indices_before": original[CT.FULL].tolist(),
         "swa_indices_before": original[CT.SWA].tolist(),
@@ -264,13 +337,15 @@ def _case(cache, allocator, pool, rank, mode, page_count, addresses):
     }
 
 
-def run_transfer_probe(scheduler, *, destructive_opt_in=False, report_path=None, page_count=1):
+def run_transfer_probe(scheduler, *, destructive_opt_in=False, report_path=None, page_count=2):
     """Probe an actual loaded scheduler; call synchronously on its own thread.
 
     The caller must use a dedicated fresh test process, not a serving instance.
     The entire cache is flushed between cases and on exit. A failed native
     transfer may quarantine resources, in which case flush is deliberately
-    skipped and the process must be discarded.
+    skipped and the process must be discarded. Two pages are probed by default;
+    a short SWA window may only restore its tail page, recorded per component.
+    Every coordinate byte gets an independent backup/overwrite/restore cycle.
     """
     if destructive_opt_in is not True:
         raise ValueError("explicit destructive_opt_in=True is required")
@@ -318,6 +393,9 @@ def run_transfer_probe(scheduler, *, destructive_opt_in=False, report_path=None,
     ):
         raise RuntimeError("FULL and SWA controllers use different transfer backends")
     addresses = _registered_addresses(cache)
+    dimensions = _marker_dimensions(pool, page_count * pool.page_size)
+    highest_code = allocator.dp_size * 2 * int(np.prod(dimensions)) - 1
+    marker_digits = max(1, (highest_code.bit_length() + 7) // 8)
     report = {
         "status": "running",
         "backend": backend,
@@ -337,21 +415,37 @@ def run_transfer_probe(scheduler, *, destructive_opt_in=False, report_path=None,
                 (CT.SWA, pool.swa_kv_pool),
             )
         },
+        "marker_encoding": "base256 coordinate bytes, exact in BF16",
+        "marker_digits": marker_digits,
+        "marker_dimensions": list(dimensions),
         "cases": [],
         "cleanup": None,
     }
     error = None
     try:
-        for rank in range(allocator.dp_size):
-            for mode in ("dual", "swa_only"):
-                report["cases"].append(
-                    _case(cache, allocator, pool, rank, mode, page_count, addresses)
-                )
-                success, message, _ = scheduler.flush_cache()
-                if not success:
-                    raise RuntimeError(f"flush after {mode}/rank{rank} failed: {message}")
-                if not _pristine(cache, allocator):
-                    raise RuntimeError(f"flush after {mode}/rank{rank} left cache state")
+        for digit in range(marker_digits):
+            for rank in range(allocator.dp_size):
+                for mode in ("dual", "swa_only"):
+                    report["cases"].append(
+                        _case(
+                            cache,
+                            allocator,
+                            pool,
+                            rank,
+                            mode,
+                            page_count,
+                            addresses,
+                            digit=digit,
+                            dimensions=dimensions,
+                        )
+                    )
+                    # Each digit must get its own fresh backup, not reuse the
+                    # previous digit's host pages or resident device prefix.
+                    success, message, _ = scheduler.flush_cache()
+                    if not success:
+                        raise RuntimeError(f"flush after {mode}/rank{rank} failed: {message}")
+                    if not _pristine(cache, allocator):
+                        raise RuntimeError(f"flush after {mode}/rank{rank} left cache state")
         report["status"] = "passed"
     except Exception as exc:  # noqa: BLE001 - record probe failures before cleanup
         error = exc
