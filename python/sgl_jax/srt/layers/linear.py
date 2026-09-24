@@ -490,6 +490,23 @@ class QuantizedLinear(nnx.Module):
         # when it is already correctly sharded.
         scale_val = jax.sharding.reshard(scale_val, NamedSharding(self.mesh, w_scale_spec))
         in_specs = (P("data", input_axis), P(output_axis, input_axis), w_scale_spec)
+        weight_val = self.weight_q.value
+        if input_axis is None:
+            # Reduce axis replicated for this layer (block scale does not tile
+            # across TP, see from_linear) while the loader may still have placed
+            # the weight row-parallel: bring it to the replicated in_spec. Only
+            # narrow-K block-quant layers (e.g. a 2048-wide shared expert at
+            # tp32) take this path; tp16 layers are unaffected.
+            w_sh = jax.typeof(weight_val).sharding
+            if (
+                isinstance(w_sh, NamedSharding)
+                and w_sh.spec
+                and len(w_sh.spec) > 1
+                and w_sh.spec[1] is not None
+            ):
+                weight_val = jax.sharding.reshard(
+                    weight_val, NamedSharding(self.mesh, P(output_axis, None))
+                )
 
         target = out_sharding or NamedSharding(self.mesh, P("data", output_axis))
         output_partition_dim = _shard_map_output_partition_dim(target, input_axis)
@@ -509,7 +526,7 @@ class QuantizedLinear(nnx.Module):
             in_specs=in_specs,
             out_specs=target.spec,
             check_vma=False,
-        )(x_2d, self.weight_q.value, scale_val)
+        )(x_2d, weight_val, scale_val)
 
         # Reshape back to original batch dimensions.
         if x.ndim > 2:
