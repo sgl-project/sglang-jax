@@ -200,6 +200,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self.hicache_enabled: bool = False
         self.hicache_controller = None
         self.host_pool = None
+        self.host_pools = {}
+        self.hicache_controllers = {}
+        self._hybrid_state = None
         self.write_through_threshold: int = 1
         self.write_policy: str = "write_through"
         # Injected by the overlap scheduler so write_back's eviction-time D2H
@@ -212,10 +215,12 @@ class UnifiedRadixCache(BasePrefixCache):
         # Drain in-flight transfers and free old-tree host pages before
         # dropping the tree, otherwise the host pool leaks allocated pages
         # that have no tree owner left to free them.
-        if self.hicache_controller is not None:
+        if self._hybrid_hicache:
+            self._hybrid_coordinator.reset()
+        elif self.hicache_controller is not None:
             self.hicache_controller.drain_pending()
             self.hicache_controller.drain_loads()
-        if self.hicache_enabled and self.host_pool is not None:
+        if self.hicache_enabled and self.host_pool is not None and not self._hybrid_hicache:
             self._free_host_pages(self.root_node)
         self.root_node = UnifiedTreeNode(self.tree_components)
         self.root_node.key = RadixKey(token_ids=[], extra_key=None, dp_rank=None)
@@ -239,6 +244,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.ongoing_write: dict = {}
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+        if self._hybrid_hicache:
+            self._hybrid_coordinator.settle()
         key = params.key
 
         if self.disable or len(key) == 0:
@@ -748,11 +755,13 @@ class UnifiedRadixCache(BasePrefixCache):
             nonlocal best_host_node, best_host_tokens, device_broken
             if not base_device_validator(candidate):
                 device_broken = True
-            if not device_broken and all(v(candidate) for v in device_validators):
+            device_valid = [v(candidate) for v in device_validators]
+            host_valid = [v(candidate) for v in host_validators]
+            if not device_broken and all(device_valid):
                 best_device_node = candidate
                 best_value_len = len(value)
                 best_device_tokens = cur_tokens
-            if all(v(candidate) for v in host_validators):
+            if all(host_valid):
                 best_host_node = candidate
                 best_host_tokens = cur_tokens
 
@@ -829,6 +838,8 @@ class UnifiedRadixCache(BasePrefixCache):
         return result
 
     def _split_node(self, key: RadixKey, child: UnifiedTreeNode, split_len: int) -> UnifiedTreeNode:
+        if self._hybrid_hicache:
+            self._hybrid_coordinator.settle(wait=True)
         new_node = UnifiedTreeNode(self.tree_components)
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
@@ -988,6 +999,8 @@ class UnifiedRadixCache(BasePrefixCache):
         if target_node is not self.root_node:
             self._refresh_component_lru(target_node, LRURefreshPhase.INSERT_END)
 
+        if self._hybrid_hicache and is_new_leaf:
+            self._inc_hit_count(target_node)
         return result
 
     ##### HiCache (L1<->L2) Write Path #####
@@ -996,11 +1009,34 @@ class UnifiedRadixCache(BasePrefixCache):
         """Bump hit counter; back up to host on threshold (write_through only)."""
         if self.write_policy == "write_back":
             return
-        if node is self.root_node or node.backuped:
+        if node is self.root_node or (node.backuped and not self._hybrid_hicache):
             return
         node.hit_count += 1
         if node.hit_count >= self.write_through_threshold:
             self.write_backup(node)
+
+    @property
+    def _hybrid_hicache(self) -> bool:
+        return self.hicache_enabled and ComponentType.SWA in self.host_pools
+
+    @property
+    def _hybrid_coordinator(self):
+        if self._hybrid_state is None:
+            from sgl_jax.srt.mem_cache.hybrid_hicache import HybridHiCache
+
+            self._hybrid_state = HybridHiCache(self)
+        return self._hybrid_state
+
+    def get_load_back_sizes(self, last_host_node) -> tuple[int, int]:
+        """Actual component token reservations, including window boundary nodes."""
+        if self._hybrid_hicache:
+            return self._hybrid_coordinator.sizes(last_host_node)
+        total = 0
+        node = last_host_node
+        while node is not self.root_node and node.evicted and node.backuped:
+            total += len(node.key)
+            node = node.parent
+        return total, 0
 
     @property
     def _direct_hicache(self) -> bool:
@@ -1052,6 +1088,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
         Token->page folding: cd.value is token-level; take every page_size-th
         element and divide by page_size to get local device page ids."""
+        if self._hybrid_hicache:
+            return self._hybrid_coordinator.backup(node, write_back)
         if node is self.root_node or node.backuped:
             return 0
 
@@ -1121,7 +1159,11 @@ class UnifiedRadixCache(BasePrefixCache):
         """Precompile host<->device transfer kernels at startup (no-op if disabled)."""
         if not self.hicache_enabled or self.host_pool is None:
             return
-        self.host_pool.precompile_transfers()
+        if self._hybrid_hicache:
+            for pool in self.host_pools.values():
+                pool.precompile_transfers()
+        else:
+            self.host_pool.precompile_transfers()
 
     def writing_check(self) -> None:
         """Settle completed async D2H writes (non-blocking).
@@ -1129,6 +1171,9 @@ class UnifiedRadixCache(BasePrefixCache):
         Rolls back host_value on failed futures so the node does not point at a
         stale or empty host slot if the exception is handled non-fatally.
         """
+        if self._hybrid_hicache:
+            self._hybrid_coordinator.settle()
+            return
         if not self.ongoing_write:
             return
         done = [f for f in self.ongoing_write if f.done()]
@@ -1192,7 +1237,11 @@ class UnifiedRadixCache(BasePrefixCache):
         # the gather would read reclaimed pages. _donation_barrier is only set
         # by the overlap scheduler; in non-overlap mode it's None, which is safe
         # because no forward is in flight during get_next_batch_to_run.
-        if self.hicache_enabled and self.write_policy == "write_back" and not node.backuped:
+        if (
+            self.hicache_enabled
+            and self.write_policy == "write_back"
+            and (not node.backuped or self._hybrid_hicache)
+        ):
             if self._donation_barrier is not None:
                 self._donation_barrier()
             self.write_backup(node, write_back=True)
@@ -1206,6 +1255,10 @@ class UnifiedRadixCache(BasePrefixCache):
         self._cascade_evict(node)
         self.evictable_device_leaves.discard(node)
 
+        if self._hybrid_hicache and self._hybrid_coordinator.retained(node):
+            self._update_evictable_leaf_sets(node)
+            self._update_evictable_leaf_sets(node.parent)
+            return
         if self.hicache_enabled and node.backuped:
             # Demote to host tier: keep the tombstone in-tree.
             self._update_evictable_leaf_sets(node)
@@ -1258,8 +1311,12 @@ class UnifiedRadixCache(BasePrefixCache):
 
     ##### HiCache (L1<->L2) Host Eviction #####
 
-    def evict_host(self, num_pages: int, dp_rank: int | None = None) -> int:
+    def evict_host(
+        self, num_pages: int, dp_rank: int | None = None, component_type=BASE_COMPONENT_TYPE
+    ) -> int:
         """Free at least num_pages host slots by evicting host-tier LRU leaves."""
+        if self._hybrid_hicache:
+            return self._hybrid_coordinator.evict_host(num_pages, dp_rank, component_type)
         if not self.hicache_enabled:
             return 0
         num_freed = 0
@@ -1306,6 +1363,7 @@ class UnifiedRadixCache(BasePrefixCache):
         last_host_node: UnifiedTreeNode,
         host_hit_length: int,
         mem_quota: int | None = None,
+        swa_mem_quota: int | None = None,
     ) -> tuple[np.ndarray, UnifiedTreeNode, list[tuple[list[int], list[int]]]]:
         """Reload a host-only prefix onto device (H2D).
 
@@ -1318,6 +1376,10 @@ class UnifiedRadixCache(BasePrefixCache):
         must hand flush_plan to finish_load_back in a donation-safe window to
         complete the kernel scatter into kv_buffer.
         """
+        if self._hybrid_hicache:
+            return self._hybrid_coordinator.restore(
+                last_host_node, host_hit_length, mem_quota, swa_mem_quota
+            )
         if not self.hicache_enabled or host_hit_length <= 0:
             return np.empty((0,), dtype=np.int32), last_host_node, []
 
