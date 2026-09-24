@@ -1176,7 +1176,7 @@ def _prefill_page_topk(
     pages_per_seq: int,
     num_queries_per_block,
     q_group,
-    kernel_cache_shape=None,
+    kernel_cache_shape: tuple[int, ...] | None = None,
 ):
     """Per-query causal page-topk over ``cache3d`` [P, page_size, D] for one
     shard of a prefill-form batch; ``i32[T, k_pages]`` (-1 padded).

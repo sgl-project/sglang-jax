@@ -381,6 +381,7 @@ def streamindex_page_topk_ref_grouped(
     # Padded requests all alias row cu_q[-1] (== T when there are no pad rows);
     # route them to a sentinel row T so the scatter never has two writers.
     row_valid = jnp.broadcast_to(valid[:, None], (S, G)).reshape(-1)
+    pidx = jnp.where(row_valid[:, None], pidx, -1)  # invalid rows write a uniform -1
     dest = jnp.where(row_valid, rows.reshape(-1), T)
     out = jnp.full((T + 1, k_pages), -1, dtype=jnp.int32)
     return out.at[dest].set(pidx)[:T]

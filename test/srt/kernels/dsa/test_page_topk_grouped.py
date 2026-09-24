@@ -128,3 +128,25 @@ def test_head_chunk_boundary_and_unroll_modes(unroll_heads):
         unroll_heads=unroll_heads,
     )
     assert _sets(got) == _sets(ref)
+
+
+def test_head_chunking_is_invariant_on_same_input():
+    T, seq_lens, cu_q, cu_kv, pi, dist = _meta([11, 26, 3])
+    q, w, cache = _inputs(jax.random.PRNGKey(5), T, 3)
+    outs = [
+        streamindex_page_topk_ref_grouped(
+            q,
+            w,
+            cache,
+            seq_lens,
+            pi,
+            cu_q,
+            cu_kv,
+            k_pages=K,
+            pages_per_seq=PPS,
+            q_group=G,
+            head_chunk=hc,
+        )
+        for hc in (1, 4, 8)
+    ]
+    assert _sets(outs[0]) == _sets(outs[1]) == _sets(outs[2])
