@@ -174,8 +174,10 @@ def chain_all_headroom_ok(allocate_lens, verify_seq_lens, num_steps: int) -> boo
     two-version mode instead of writing past the allocation."""
     import numpy as np
 
-    alloc = np.asarray(allocate_lens)
-    vsl = np.asarray(verify_seq_lens)
+    if not isinstance(allocate_lens, np.ndarray) or not isinstance(verify_seq_lens, np.ndarray):
+        raise TypeError("chain_all_headroom_ok expects host numpy arrays (no device sync here)")
+    alloc = allocate_lens
+    vsl = verify_seq_lens
     live = vsl > 0
     if not live.any():
         return True
@@ -2412,8 +2414,14 @@ def launch_fused_draft_extend_for_decode(
     draft_verify_seq_lens = getattr(batch_output.next_draft_input, "verify_seq_lens", None)
     chain_all_ok = False
     if _CHAIN_ALL and draft_verify_seq_lens is not None:
+        # Host-side arrays only: verify_seq_lens on the draft input is a device
+        # array (the verify batch's seq_lens); reading it here would force a
+        # device-to-host sync every draft step (measured +1.5 ms per cycle at
+        # batch 1). model_worker_batch.seq_lens is the same value on the host.
         chain_all_ok = chain_all_headroom_ok(
-            draft_allocate_lens, draft_verify_seq_lens, draft_worker.speculative_num_steps
+            np.asarray(draft_allocate_lens),
+            np.asarray(model_worker_batch.seq_lens),
+            draft_worker.speculative_num_steps,
         )
         if not chain_all_ok and not getattr(draft_worker, "_chain_all_fallback_logged", False):
             draft_worker._chain_all_fallback_logged = True
