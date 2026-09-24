@@ -246,6 +246,68 @@ class TestBucketComputation(unittest.TestCase):
         assert 256 in cm.token_buckets
         assert 512 in cm.token_buckets
 
+    def test_default_token_buckets_fill_gap_above_8192(self):
+        # Default paddings top out at 8192; with a larger token budget the
+        # bucket list must keep doubling instead of jumping straight to max.
+        cm = CompilationManager(
+            server_args=_make_server_args(),
+            max_padded_batch_size=128,
+            max_padded_num_tokens=131072,
+            dp_size=1,
+            tp_size=4,
+            page_size=128,
+            max_req_len=262144,
+            vocab_size=32000,
+        )
+        for expected in (8192, 16384, 32768, 65536):
+            assert expected in cm.token_buckets, f"missing gap-fill bucket {expected}"
+        assert cm.token_buckets[-1] == 131072
+
+    def test_default_token_buckets_gap_fill_respects_dp_size(self):
+        cm = CompilationManager(
+            server_args=_make_server_args(),
+            max_padded_batch_size=64,
+            max_padded_num_tokens=100000,
+            dp_size=4,
+            tp_size=4,
+            page_size=128,
+            max_req_len=262144,
+            vocab_size=32000,
+        )
+        for b in cm.token_buckets:
+            assert b % 4 == 0, f"bucket {b} not divisible by dp_size=4"
+        assert cm.token_buckets[-1] == 100000
+        # 8192 * dp_size doubled: 65536, 131072(> max, excluded)
+        assert 65536 in cm.token_buckets
+
+    def test_default_token_buckets_unchanged_when_max_at_or_below_8192(self):
+        cm = CompilationManager(
+            server_args=_make_server_args(),
+            max_padded_batch_size=128,
+            max_padded_num_tokens=8192,
+            dp_size=1,
+            tp_size=4,
+            page_size=128,
+            max_req_len=16384,
+            vocab_size=32000,
+        )
+        assert cm.token_buckets == [128, 256, 512, 1024, 2048, 4096, 8192]
+
+    def test_user_specified_paddings_get_no_gap_fill(self):
+        cm = CompilationManager(
+            server_args=_make_server_args(
+                precompile_token_paddings=[256, 512, 1024],
+            ),
+            max_padded_batch_size=128,
+            max_padded_num_tokens=131072,
+            dp_size=1,
+            tp_size=4,
+            page_size=128,
+            max_req_len=262144,
+            vocab_size=32000,
+        )
+        assert cm.token_buckets == [256, 512, 1024, 131072]
+
 
 class TestLazyCompilation(unittest.TestCase):
     def test_register_variant_if_new_first_time(self):

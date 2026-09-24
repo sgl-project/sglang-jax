@@ -72,6 +72,14 @@ class CompilationManager:
         dp_size = self.dp_size
         if user_paddings is None:
             user_paddings = [item * dp_size for item in PRECOMPILE_DEFAULT_TOKEN_PADDINGS]
+            # The static defaults top out at 8192 * dp_size. When the token
+            # budget is larger, keep doubling so the final max-size bucket is
+            # not the only one above 8192 (every mid-size prefill would pad to
+            # max otherwise). No-op when max_padded_num_tokens <= 8192 * dp_size.
+            item = user_paddings[-1] * 2
+            while item < self.max_padded_num_tokens:
+                user_paddings.append(item)
+                item *= 2
 
         buckets = []
         for item in user_paddings:
