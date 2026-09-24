@@ -1,4 +1,5 @@
 import logging
+import os
 from collections.abc import Sequence
 from functools import partial
 
@@ -277,6 +278,9 @@ class QuantizedLinear(nnx.Module):
         self.weight_block_size = weight_block_size
         self.allow_narrow_n_blockwise = allow_narrow_n_blockwise
         self.name = scope_name
+        # Logical output width when the weight rows were pre-padded to a block
+        # multiple at load time (pad_out_rows); None = weight is not padded.
+        self.n_out_valid: int | None = None
 
     @classmethod
     def from_linear(
@@ -438,6 +442,37 @@ class QuantizedLinear(nnx.Module):
         )
 
     @named_scope
+    def pad_out_rows(self, multiple: int = 256) -> bool:
+        """Pad the quantized weight / block scale along the output dim once.
+
+        The block-wise matmul wrapper pads ``w_q`` / ``w_scale`` to a multiple
+        of the tuned out block on *every* call when ``n_out`` is not aligned
+        (e.g. GLM-5.2 kv_a_proj 576 -> 768, indexer wk 128 -> 256, weights_proj
+        32 -> 256: three weight copies per layer per step). Doing it here at load
+        time removes that per-step traffic; the call path keeps using the logical
+        width for the tuned-block lookup and slices the output back.
+
+        Only replicated-N block-quant layers are handled (a tensor-sharded N would
+        need the padding per shard). Returns True when the weight was padded.
+        """
+        if self.n_out_valid is not None:
+            return False
+        if self.kernel_axes[1] is not None:
+            return False
+        scale = self.weight_scale.value
+        if scale is None or scale.ndim != 3:
+            return False
+        weight = self.weight_q.value
+        n_out = int(weight.shape[0])
+        padded = ((n_out + multiple - 1) // multiple) * multiple
+        if padded == n_out:
+            return False
+        pad = padded - n_out
+        self.weight_q.value = jnp.pad(weight, ((0, pad), (0, 0)))
+        self.weight_scale.value = jnp.pad(scale, ((0, 0), (0, 0), (0, pad)))
+        self.n_out_valid = n_out
+        return True
+
     def __call__(
         self,
         x: jax.Array,
@@ -521,6 +556,7 @@ class QuantizedLinear(nnx.Module):
                 activation_quant_dtype=self.activation_dtype,
                 allow_narrow_n_blockwise=self.allow_narrow_n_blockwise,
                 output_scatter_dimension=output_partition_dim,
+                n_out_valid=self.n_out_valid,
             ),
             mesh=self.mesh,
             in_specs=in_specs,
@@ -538,3 +574,23 @@ class QuantizedLinear(nnx.Module):
         if self.bias is not None:
             output = output + self.bias.value
         return output, None
+
+
+def prepad_replicated_quantized_linears(module: nnx.Module, multiple: int = 256) -> int:
+    """Pad every replicated-N QuantizedLinear under ``module`` once (see
+    QuantizedLinear.pad_out_rows). Disabled with SGLANG_JAX_QMM_PREPAD_N=0.
+    Returns the number of layers padded."""
+    if os.environ.get("SGLANG_JAX_QMM_PREPAD_N", "1") == "0":
+        return 0
+    count = 0
+    for _, sub in module.iter_modules():
+        if isinstance(sub, QuantizedLinear) and sub.pad_out_rows(multiple):
+            count += 1
+    if count:
+        logger.info(
+            "Pre-padded %d replicated-N block-quant linears to a multiple of %d "
+            "output rows (removes per-step weight padding)",
+            count,
+            multiple,
+        )
+    return count

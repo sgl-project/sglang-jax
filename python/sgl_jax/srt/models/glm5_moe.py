@@ -15,7 +15,7 @@ from sgl_jax.srt.eplb.expert_location import ExpertLocationMetadata
 from sgl_jax.srt.kernels.fused_mlp import apply_fused_mlp_with_padding
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
-from sgl_jax.srt.layers.linear import LinearBase
+from sgl_jax.srt.layers.linear import LinearBase, prepad_replicated_quantized_linears
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import (
     EPMoE,
@@ -1169,6 +1169,7 @@ class Glm5ForCausalLM(nnx.Module):
         )
         weight_mappings = self._create_glm5_weight_mappings(model_config)
         loader.load_weights_from_safetensors(weight_mappings)
+        prepad_replicated_quantized_linears(self)
 
         for layer in self.model.layers:
             layer.self_attn.post_load_weights()
@@ -1598,6 +1599,7 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
         )
         mappings = self._create_weight_mappings(model_config)
         self.loader.load_weights_from_safetensors(mappings)
+        prepad_replicated_quantized_linears(self)
 
         # Apply post_load_weights logic for Draft
         self.mtp_block.self_attn.post_load_weights()
