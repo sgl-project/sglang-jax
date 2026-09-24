@@ -2418,8 +2418,13 @@ def launch_fused_draft_extend_for_decode(
         # array (the verify batch's seq_lens); reading it here would force a
         # device-to-host sync every draft step (measured +1.5 ms per cycle at
         # batch 1). model_worker_batch.seq_lens is the same value on the host.
+        # allocate_lens_for_draft_extend is a device array too (prepared during
+        # verify); rebuild the padded host copy from the host-side allocate_lens
+        # like the fallback above does, so the guard never touches device memory.
+        alloc_host = np.zeros_like(np.asarray(model_worker_batch.seq_lens), dtype=np.int32)
+        alloc_host[sel] = np.asarray(batch_output.next_draft_input.allocate_lens)
         chain_all_ok = chain_all_headroom_ok(
-            np.asarray(draft_allocate_lens),
+            alloc_host,
             np.asarray(model_worker_batch.seq_lens),
             draft_worker.speculative_num_steps,
         )
