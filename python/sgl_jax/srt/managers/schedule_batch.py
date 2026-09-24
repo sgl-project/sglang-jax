@@ -108,9 +108,13 @@ logger = logging.getLogger(__name__)
 # once per layer, so at cc64 / 135k context that is 67584 int32 per layer for a
 # batch that needs ~1k entries. cache_loc is packed (request i occupies
 # [cum_aligned_len[i], cum_aligned_len[i+1])), so any padding >= the packed
-# length is valid: pick the smallest one. SGLANG_JAX_SPEC_CACHE_LOC_FIT=0 restores
-# the largest padding.
-_SPEC_CACHE_LOC_FIT = os.environ.get("SGLANG_JAX_SPEC_CACHE_LOC_FIT", "1") != "0"
+# length is valid: pick the smallest one. Opt-in (SGLANG_JAX_SPEC_CACHE_LOC_FIT=1):
+# the fitted padding follows (padded bs x longest request in the batch), so a
+# long-running server compiles one verify + one draft executable per distinct
+# bucket it wanders through (a cc64 1k/1k run touched 8 of each, ~3 min per
+# verify compile) until the ladder is precompiled at startup. Default OFF keeps
+# the single largest padding.
+_SPEC_CACHE_LOC_FIT = os.environ.get("SGLANG_JAX_SPEC_CACHE_LOC_FIT", "0") == "1"
 
 
 def spec_cache_loc_needs(per_rank_lens, per_dp_bs: int, page_size: int) -> list[int]:
