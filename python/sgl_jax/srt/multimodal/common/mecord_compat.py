@@ -92,7 +92,9 @@ def _materialize_to_path(video_src: Any) -> tuple[str, bool]:
         if video_src.startswith("file://"):
             return video_src[len("file://") :], False
         if video_src.startswith(("http://", "https://")):
-            from sgl_jax.srt.multimodal.processors.base_processor import fetch_remote_bytes
+            from sgl_jax.srt.multimodal.processors.base_processor import (
+                fetch_remote_bytes,
+            )
 
             return _write_temp_video(fetch_remote_bytes(video_src)), True
         if video_src.startswith("data:") and _DATA_URI_MARKER in video_src:

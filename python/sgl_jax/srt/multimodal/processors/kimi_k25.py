@@ -6,7 +6,10 @@ from contextlib import ExitStack
 
 import numpy as np
 
-from sgl_jax.srt.multimodal.common.mecord_compat import install_mecord_shim, materialize_video
+from sgl_jax.srt.multimodal.common.mecord_compat import (
+    install_mecord_shim,
+    materialize_video,
+)
 from sgl_jax.srt.multimodal.common.modality_enum import (
     Modality,
     MultimodalDataItem,
