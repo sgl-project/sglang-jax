@@ -98,6 +98,33 @@ global_server_args_dict = {k: getattr(ServerArgs, k) for k in GLOBAL_SERVER_ARGS
 logger = logging.getLogger(__name__)
 
 
+# Speculative TARGET_VERIFY / DRAFT_EXTEND batches are extend-shaped, and extend
+# batches take the largest cache_loc padding (max_running_requests x context).
+# Their page table (cache_loc[::page_size]) is copied into kernel scalar memory
+# once per layer, so at cc64 / 135k context that is 67584 int32 per layer for a
+# batch that needs ~1k entries. cache_loc is packed (request i occupies
+# [cum_aligned_len[i], cum_aligned_len[i+1])), so any padding >= the packed
+# length is valid: pick the smallest one. SGLANG_JAX_SPEC_CACHE_LOC_FIT=0 restores
+# the largest padding.
+_SPEC_CACHE_LOC_FIT = os.environ.get("SGLANG_JAX_SPEC_CACHE_LOC_FIT", "1") != "0"
+
+
+def fit_cache_loc_padding(cache_loc_paddings, per_rank_needs, dp_size: int) -> int:
+    """Smallest padding whose per-DP segment holds every rank's packed cache_loc.
+
+    ``per_rank_needs`` are the page-aligned token counts each DP rank packs into
+    its segment (``sum(aligned_seq_lens)``); ``cache_loc_paddings`` is ascending.
+    Falls back to the largest padding when none fits (the caller asserts the
+    host buffer against it as before).
+    """
+    need = int(max(per_rank_needs)) if len(per_rank_needs) else 0
+    for padding in cache_loc_paddings:
+        padding = int(padding)
+        if padding % dp_size == 0 and padding // dp_size >= need:
+            return padding
+    return int(cache_loc_paddings[-1])
+
+
 class BaseFinishReason:
     def __init__(self, is_error: bool = False):
         self.is_error = is_error
@@ -2404,6 +2431,20 @@ class ScheduleBatch:
         total_cache_loc_size = 0
         if self.forward_mode.is_extend():
             total_cache_loc_size = cache_loc_paddings[-1]  # Use largest padding
+            if len(cache_loc_paddings) > 1 and self.forward_mode.is_spec_extend():
+                # spec verify / draft-extend: smallest padding that holds the
+                # packed layout (see fit_cache_loc_padding).
+                needs = []
+                for dp_rank in range(self.dp_size):
+                    info = self.reqs_info[dp_rank]
+                    if info.seq_lens is None or len(info.seq_lens) == 0:
+                        needs.append(0)
+                        continue
+                    sl = np.asarray(info.seq_lens)
+                    needs.append(int((((sl + page_size - 1) // page_size) * page_size).sum()))
+                total_cache_loc_size = fit_cache_loc_padding(
+                    cache_loc_paddings, needs, self.dp_size
+                )
         else:
             # For decode mode, use the cache_loc_padding that corresponds to the bs bucket.
             total_bs = per_dp_bs_size * self.dp_size
@@ -3076,7 +3117,8 @@ class ScheduleBatch:
             token_paddings = bs_paddings
         else:
             bs_paddings = bs_paddings[-1:]
-            cache_loc_paddings = cache_loc_paddings[-1:]
+            if not (_SPEC_CACHE_LOC_FIT and self.forward_mode.is_spec_extend()):
+                cache_loc_paddings = cache_loc_paddings[-1:]
 
         bid = acc_global_bid()
 
