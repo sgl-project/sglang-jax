@@ -109,6 +109,25 @@ logger = logging.getLogger(__name__)
 _SPEC_CACHE_LOC_FIT = os.environ.get("SGLANG_JAX_SPEC_CACHE_LOC_FIT", "1") != "0"
 
 
+def spec_cache_loc_needs(per_rank_lens, per_dp_bs: int, page_size: int) -> list[int]:
+    """Per-DP-rank token count a speculative batch's cache_loc segment must hold.
+
+    ``per_rank_lens`` is one array of per-request lengths (already including the
+    speculative allocation) per DP rank. Each segment must hold the packed
+    page-aligned layout AND, because several kernels take a fixed-stride view
+    (``pages_per_seq = len(page_indices) // bs_padded``), ``bs_padded`` times the
+    longest request.
+    """
+    needs = []
+    for lens in per_rank_lens:
+        if lens is None or len(lens) == 0:
+            needs.append(0)
+            continue
+        aligned = ((np.asarray(lens) + page_size - 1) // page_size) * page_size
+        needs.append(max(int(aligned.sum()), int(per_dp_bs) * int(aligned.max())))
+    return needs
+
+
 def fit_cache_loc_padding(cache_loc_paddings, per_rank_needs, dp_size: int) -> int:
     """Smallest padding whose per-DP segment holds every rank's packed cache_loc.
 
@@ -2436,18 +2455,11 @@ class ScheduleBatch:
             if len(cache_loc_paddings) > 1 and self.forward_mode.is_spec_extend():
                 # spec verify / draft-extend: smallest padding that holds the
                 # packed layout (see fit_cache_loc_padding).
-                needs = []
-                for dp_rank in range(self.dp_size):
-                    info = self.reqs_info[dp_rank]
-                    if info.seq_lens is None or len(info.seq_lens) == 0:
-                        needs.append(0)
-                        continue
-                    sl = np.asarray(info.seq_lens)
-                    aligned = ((sl + page_size - 1) // page_size) * page_size
-                    # packed length, and the fixed-stride view some kernels
-                    # take (pages_per_seq = len // bs) must still hold the
-                    # longest request.
-                    needs.append(max(int(aligned.sum()), int(per_dp_bs_size) * int(aligned.max())))
+                needs = spec_cache_loc_needs(
+                    [self.reqs_info[r].seq_lens for r in range(self.dp_size)],
+                    per_dp_bs_size,
+                    page_size,
+                )
                 total_cache_loc_size = fit_cache_loc_padding(
                     cache_loc_paddings, needs, self.dp_size
                 )
@@ -2456,6 +2468,25 @@ class ScheduleBatch:
             total_bs = per_dp_bs_size * self.dp_size
             _, bs_index = pad_to_bucket(total_bs, bs_paddings)
             total_cache_loc_size = cache_loc_paddings[bs_index]
+            if (
+                _SPEC_CACHE_LOC_FIT
+                and self.spec_algorithm is not None
+                and not self.spec_algorithm.is_none()
+                and len(cache_loc_paddings) > 1
+            ):
+                # Speculative decode batches become the TARGET_VERIFY batch
+                # (prepare_for_verify only flips the mode), so their page table
+                # feeds every verify layer: size it to the batch, not to the
+                # bs bucket x context.
+                needs = spec_cache_loc_needs(
+                    [self.reqs_info[r].seq_lens for r in range(self.dp_size)],
+                    per_dp_bs_size,
+                    page_size,
+                )
+                total_cache_loc_size = min(
+                    total_cache_loc_size,
+                    fit_cache_loc_padding(cache_loc_paddings, needs, self.dp_size),
+                )
 
         per_dp_cache_loc_size = total_cache_loc_size // self.dp_size
         # View into the persistent buffer; intentionally NOT re-zeroed per step.

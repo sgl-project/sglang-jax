@@ -7,7 +7,10 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import unittest
 
-from sgl_jax.srt.managers.schedule_batch import fit_cache_loc_padding
+from sgl_jax.srt.managers.schedule_batch import (
+    fit_cache_loc_padding,
+    spec_cache_loc_needs,
+)
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
 CTX = 135168
@@ -39,6 +42,11 @@ class FitCacheLocPaddingTest(unittest.TestCase):
     def test_falls_back_to_the_largest_padding(self):
         self.assertEqual(fit_cache_loc_padding(PADDINGS, [PADDINGS[-1] + 1], 1), PADDINGS[-1])
         self.assertEqual(fit_cache_loc_padding(PADDINGS, [], 1), CTX)
+
+    def test_spec_cache_loc_needs_per_rank(self):
+        # rank 0: 3 requests, padded bs 4 -> max(sum aligned, 4 x longest)
+        needs = spec_cache_loc_needs([[1000, 2050, 130], None, []], 4, 128)
+        self.assertEqual(needs, [max(1024 + 2176 + 256, 4 * 2176), 0, 0])
 
     def test_spec_extend_predicate(self):
         self.assertTrue(ForwardMode.TARGET_VERIFY.is_spec_extend())
