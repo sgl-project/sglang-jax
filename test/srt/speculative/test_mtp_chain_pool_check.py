@@ -84,6 +84,20 @@ class ChainPoolCheckTest(unittest.TestCase):
                 return _chain_pool_report(v0, vN, md_, bs * N, PS, like)
 
             counts, firsts, loc0 = run(v0, vN, seq_lens, cu_q, cu_kv, page_indices, like)
+
+            # verified-row mask: with sel_pos = 1 only rows 0..1 of each request count
+            @jax.jit
+            def run_masked(v0, vN, seq_lens, cu_q, cu_kv, page_indices, like, sp):
+                md_ = SimpleNamespace(
+                    seq_lens=seq_lens, cu_q_lens=cu_q, cu_kv_lens=cu_kv, page_indices=page_indices
+                )
+                return _chain_pool_report(v0, vN, md_, bs * N, PS, like, sel_pos=sp)
+
+            sp = jax.device_put(jnp.ones((bs,), jnp.int32), data)
+            _, _, loc0_m = run_masked(v0, vN, seq_lens, cu_q, cu_kv, page_indices, like, sp)
+            loc0_m = np.asarray(loc0_m).reshape(bs, N)
+            self.assertTrue((loc0_m[:, 2:] == -1).all(), loc0_m)
+            self.assertTrue((loc0_m[:, :2] >= 0).all(), loc0_m)
             for a in (counts, firsts, loc0):
                 self.assertIsInstance(a, jax.Array)  # arrays only, no Python objects
             self.assertEqual(int(counts[0]), 2)

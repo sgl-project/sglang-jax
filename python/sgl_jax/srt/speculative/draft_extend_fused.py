@@ -133,7 +133,7 @@ def log_chain_pool_check(report, pool_updates):
         )
 
 
-def _chain_pool_report(v0, vN, md, num_tokens, page_size, like, ext_lens=None):
+def _chain_pool_report(v0, vN, md, num_tokens, page_size, like, sel_pos=None):
     """CHECK report inside the fused JIT: step-0 window slots (auto-sharded
     lookup, replicated result) + per-leaf slot diffs between two pool versions.
     Returns arrays only."""
@@ -149,17 +149,18 @@ def _chain_pool_report(v0, vN, md, num_tokens, page_size, like, ext_lens=None):
 
     loc0_fn = _loc0 if rep is None else jax.sharding.auto_axes(_loc0, out_sharding=rep)
     loc0 = loc0_fn(md.seq_lens, md.cu_q_lens, md.cu_kv_lens, md.page_indices)
-    if ext_lens is not None:
-        # window row k of request r is a verified token iff k < ext_lens[r]; only
-        # those slots must be untouched by the later steps
-        bs = ext_lens.shape[0]
+    if sel_pos is not None:
+        # window rows 0..sel_pos[r] hold request r's verified tokens (sel_pos =
+        # accept_length - 1); the rows after it are padding whose slots the later
+        # steps legitimately overwrite. Only the verified rows must stay untouched.
+        bs = sel_pos.shape[0]
         n = num_tokens // bs
 
-        def _valid(ext):
-            return (jnp.arange(n)[None, :] < ext[:, None]).reshape(-1)
+        def _valid(sp):
+            return (jnp.arange(n)[None, :] <= sp[:, None]).reshape(-1)
 
         valid_fn = _valid if rep is None else jax.sharding.auto_axes(_valid, out_sharding=rep)
-        loc0 = jnp.where(valid_fn(ext_lens), loc0, -1)
+        loc0 = jnp.where(valid_fn(sel_pos), loc0, -1)
     return _chain_pool_diff_arrays(v0, vN, loc0, rep_sharding=rep)
 
 
@@ -1018,7 +1019,7 @@ def _build_draft_extend(
                             input_ids.shape[0],
                             forward_batch.attn_backend.page_size,
                             input_ids,
-                            ext_lens=forward_batch.extend_seq_lens,
+                            sel_pos=sel_pos,
                         )
             elif chain_pool:
                 # step 0's version is the one the caller keeps; steps >= 1 share
