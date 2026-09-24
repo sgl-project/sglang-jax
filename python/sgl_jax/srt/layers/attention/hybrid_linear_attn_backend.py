@@ -197,6 +197,24 @@ class HybridLinearAttnBackend(AttentionBackend):
         )
 
     @property
+    def token_to_kv_pool_class(self):
+        from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        return getattr(self.full_attn_backend, "token_to_kv_pool_class", MHATokenToKVPool)
+
+    @property
+    def compiler_options(self):
+        return getattr(self.linear_attn_backend, "compiler_options", None)
+
+    @property
+    def sampler_compiler_options(self):
+        return getattr(self.full_attn_backend, "sampler_compiler_options", None)
+
+    def prepare_model_state(self, leaves):
+        prepare = getattr(self.full_attn_backend, "prepare_model_state", None)
+        return prepare(leaves) if prepare is not None else leaves
+
+    @property
     def forward_metadata(self):
         return self._forward_metadata
 
@@ -271,10 +289,20 @@ def attn_backend_wrapper(
         from sgl_jax.srt.layers.attention.linear.kda_backend import KDAAttnBackend
 
         linear_attn_backend = KDAAttnBackend(mesh=runner.mesh)
-    elif runner.qwen3_5_hybrid_config is not None:
+    elif runner.qwen3_5_hybrid_config is not None or runner.qwen4_exp_config is not None:
         from sgl_jax.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 
-        text_cfg = runner.qwen3_5_hybrid_config.text_config
+        if getattr(runner.server_args, "device", None) == "tt":
+            from sgl_jax.srt.hardware_backend.tt.attention.gdn_backend import (
+                TTGDNAttnBackend,
+            )
+
+            GDNAttnBackend = TTGDNAttnBackend
+
+        # Qwen3.5 and Qwen4Exp share the GDN stack; the backend reads only
+        # linear_* fields, which both text configs expose.
+        root_cfg = runner.qwen3_5_hybrid_config or runner.qwen4_exp_config
+        text_cfg = root_cfg.text_config
         linear_attn_backend = GDNAttnBackend(
             num_k_heads=text_cfg.linear_num_key_heads,
             num_v_heads=text_cfg.linear_num_value_heads,

@@ -37,6 +37,7 @@ import jax
 from jax._src.lib import xla_client as _xc
 
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
+from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -74,10 +75,7 @@ def decode_no_sc_gather_compiler_options_fn():
     SGLANG_JAX_AOT_DISPATCH since it hooks the per-shape AOT compile path.
     Remove once the upstream cost-model fix ships.
     """
-    if not (
-        jax.default_backend() == "tpu"
-        and get_bool_env_var("SGLANG_JAX_DECODE_DISABLE_SC_GATHER_OFFLOAD")
-    ):
+    if not (is_tpu_runtime() and get_bool_env_var("SGLANG_JAX_DECODE_DISABLE_SC_GATHER_OFFLOAD")):
         return None
     logger.info(
         "SGLANG_JAX_DECODE_DISABLE_SC_GATHER_OFFLOAD: decode executables "

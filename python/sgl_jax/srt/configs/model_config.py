@@ -5,11 +5,12 @@ import os
 from enum import Enum, IntEnum, auto
 
 import jax.numpy as jnp
-from transformers import PretrainedConfig
+from transformers import GenerationConfig, PretrainedConfig
 
 from sgl_jax.srt.configs.dtype_config import STR_DTYPE_TO_JAX_DTYPE, DtypeConfig
 from sgl_jax.srt.configs.quantization_config import QuantizationConfig
 from sgl_jax.srt.hf_transformers_utils import (
+    apply_model_config_overrides,
     download_from_hf,
     get_config,
     get_context_length,
@@ -111,6 +112,7 @@ class ModelConfig:
         moe_backend: str | MoEBackend = MoEBackend.AUTO,
         moe_dp_size: int = 1,
         model_sub_dir: str | None = None,
+        hf_config: PretrainedConfig | None = None,
     ) -> None:
         self.model_path = model_path
         self.model_sub_dir = model_sub_dir
@@ -133,33 +135,20 @@ class ModelConfig:
             # If ep_size > 1, use EPMoE (expert parallelism across devices)
             # Otherwise use Fused kernel (single-device TPU optimization)
             self.moe_backend = MoEBackend.EPMOE if self.ep_size > 1 else MoEBackend.FUSED
-        # Parse args
-        self.maybe_pull_model_tokenizer_from_remote()
         self.model_override_args = json.loads(model_override_args)
-        kwargs = {}
-        if override_config_file and override_config_file.strip():
-            kwargs["_configuration_file"] = override_config_file.strip()
-        if multimodal:
-            self.model_path = download_from_hf(self.model_path, allow_patterns=None)
-        if multimodal and self.model_sub_dir is not None:
-            if self.model_sub_dir:
-                self.model_path = os.path.join(self.model_path, self.model_sub_dir)
-            config_path = self.model_path
-
-        config_path = self.model_path
-
-        # get_config is lru_cached; configure_for_tensor_parallel mutates
-        # hf_text_config in-place, so deepcopy to avoid cross-ModelConfig
-        # pollution (e.g. PD disaggregation creates two ModelConfigs).
-        self.hf_config = copy.deepcopy(
-            get_config(
-                config_path,
+        self.hf_generation_config = None
+        if hf_config is None:
+            self.hf_config, self.hf_generation_config = self._load_hf_configs(
                 trust_remote_code=trust_remote_code,
-                revision=revision,
-                model_override_args=self.model_override_args,
-                **kwargs,
+                override_config_file=override_config_file,
+                multimodal=multimodal,
             )
-        )
+        else:
+            # Overrides and draft/TP rewrites must not mutate caller-owned configs.
+            self.hf_config = copy.deepcopy(hf_config)
+            apply_model_config_overrides(self.hf_config, self.model_override_args)
+            if multimodal and self.model_sub_dir:
+                self.model_path = os.path.join(self.model_path, self.model_sub_dir)
 
         if not getattr(self.hf_config, "architectures", None):
             raise ValueError(
@@ -206,26 +195,79 @@ class ModelConfig:
         if self.quantization_config is not None:
             self.hf_config.quantization_config = self.quantization_config
 
-        self.hf_generation_config = get_generation_config(
-            config_path,
-            trust_remote_code=trust_remote_code,
-            revision=revision,
-            **kwargs,
-        )
-
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.sliding_window = getattr(self.hf_text_config, "sliding_window", None)
 
-        if is_draft_model and self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
+        if is_draft_model:
+            self._config_draft_model()
+
+        # Check model type
+        self.is_generation = is_generation_model(self.hf_config.architectures, is_embedding)
+        self.is_multimodal = any(
+            architecture in multimodal_model_archs for architecture in self.hf_config.architectures
+        )
+        self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
+
+        if not isinstance(dtype_config, DtypeConfig):
+            self.dtype_config = DtypeConfig(dtype_config, default_dtype=self.dtype)
+        else:
+            self.dtype_config = dtype_config
+            # The global dtype must be the same as the default dtype provided in dtype_config
+            if self.dtype != self.dtype_config.default_dtype:
+                raise ValueError(
+                    f"Global dtype ({self.dtype}) is not the same as the default dtype provided in dtype_config ({self.dtype_config.default_dtype})."
+                )
+
+        self._derive_context_length(context_length)
+        self._derive_model_shapes(model_layer_nums)
+
+        # Cache attributes
+        self.hf_eos_token_id = self.get_hf_eos_token_id()
+
+        config = self.hf_config
+
+        # multimodal
+        self.image_token_id = getattr(config, "image_token_id", None) or getattr(
+            config, "image_token_index", None
+        )
+
+    def _load_hf_configs(
+        self,
+        *,
+        trust_remote_code: bool,
+        override_config_file: str | None,
+        multimodal: bool,
+    ) -> tuple[PretrainedConfig, GenerationConfig | None]:
+        """Load model and generation files only for path-based construction."""
+        self.maybe_pull_model_tokenizer_from_remote()
+        if multimodal:
+            self.model_path = download_from_hf(self.model_path, allow_patterns=None)
+            if self.model_sub_dir:
+                self.model_path = os.path.join(self.model_path, self.model_sub_dir)
+
+        kwargs = {"trust_remote_code": trust_remote_code, "revision": self.revision}
+        if override_config_file and override_config_file.strip():
+            kwargs["_configuration_file"] = override_config_file.strip()
+
+        # get_config is cached; each instance owns its draft/TP config mutations.
+        return (
+            copy.deepcopy(
+                get_config(self.model_path, model_override_args=self.model_override_args, **kwargs)
+            ),
+            get_generation_config(self.model_path, **kwargs),
+        )
+
+    def _config_draft_model(self) -> None:
+        if self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
-        if is_draft_model and self.hf_config.architectures[0] == "LlamaForCausalLM":
+        elif self.hf_config.architectures[0] == "LlamaForCausalLM":
             self.hf_config.architectures[0] = "LlamaForCausalLMEagle3"
 
-        if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
+        elif self.hf_config.architectures[0] == "MiMoForCausalLM":
             self.hf_config.architectures[0] = "MiMoMTPForCausalLM"
 
-        if is_draft_model and self.hf_config.architectures[0] in (
+        elif self.hf_config.architectures[0] in (
             "MiMoV2ForCausalLM",
             "MiMoV2FlashForCausalLM",
         ):
@@ -252,23 +294,8 @@ class ModelConfig:
                 ignored = list(self.quantization_config.ignored_layers or [])
                 ignored.extend(["model.eh_proj", "model.mtp_block.self_attn.o_proj"])
                 self.quantization_config.ignored_layers = ignored
-        # Check model type
-        self.is_generation = is_generation_model(self.hf_config.architectures, is_embedding)
-        self.is_multimodal = any(
-            architecture in multimodal_model_archs for architecture in self.hf_config.architectures
-        )
-        self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
-        if not isinstance(dtype_config, DtypeConfig):
-            self.dtype_config = DtypeConfig(dtype_config, default_dtype=self.dtype)
-        else:
-            self.dtype_config = dtype_config
-            # The global dtype must be the same as the default dtype provided in dtype_config
-            if self.dtype != self.dtype_config.default_dtype:
-                raise ValueError(
-                    f"Global dtype ({self.dtype}) is not the same as the default dtype provided in dtype_config ({self.dtype_config.default_dtype})."
-                )
-
+    def _derive_context_length(self, context_length: int | None) -> None:
         # Derive context length
         derived_context_len = get_context_length(self.hf_text_config)
         if context_length is not None:
@@ -289,6 +316,7 @@ class ModelConfig:
         else:
             self.context_len = derived_context_len
 
+    def _derive_model_shapes(self, model_layer_nums: int | None) -> None:
         # Unify the config keys for hf_text_config
         self.head_dim = getattr(
             self.hf_text_config,
@@ -330,16 +358,6 @@ class ModelConfig:
                 self.hf_config.num_hidden_layers = model_layer_nums
                 if hasattr(self, "hf_text_config") and self.hf_text_config is not None:
                     self.hf_text_config.num_hidden_layers = model_layer_nums
-
-        # Cache attributes
-        self.hf_eos_token_id = self.get_hf_eos_token_id()
-
-        config = self.hf_config
-
-        # multimodal
-        self.image_token_id = getattr(config, "image_token_id", None) or getattr(
-            config, "image_token_index", None
-        )
 
     def _get_hf_quant_config(self):
         hf_quant_config = getattr(self.hf_config, "quantization_config", None)
@@ -982,6 +1000,7 @@ multimodal_model_archs = [
     "DeepseekVL2ForCausalLM",
     "Gemma3ForConditionalGeneration",
     "Gemma3nForConditionalGeneration",
+    "Gemma4ForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
     "LlavaLlamaForCausalLM",
@@ -999,6 +1018,8 @@ multimodal_model_archs = [
     "Qwen2VLForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",
     "Qwen3VLForConditionalGeneration",
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForConditionalGeneration",
     "KimiVLForConditionalGeneration",
     "InternVLChatModel",
     "Phi4MMForCausalLM",

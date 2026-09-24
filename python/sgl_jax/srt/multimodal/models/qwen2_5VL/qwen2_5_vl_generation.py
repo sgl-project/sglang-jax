@@ -26,11 +26,11 @@ class Qwen2_5_VL_Model(Qwen2Model):
         dtype=jnp.bfloat16,
     ):
         super().__init__(config=config, mesh=mesh, dtype=dtype)
-        rope_scaling = getattr(config, "rope_scaling", None) or {}
+        rope_scaling = config.rope_parameters
         self._mrope_section = rope_scaling.get("mrope_section")
         self._mrope_interleaved = rope_scaling.get("mrope_interleaved", False)
         if self._mrope_section:
-            rope_theta = getattr(config, "rope_theta", 1000000)
+            rope_theta = config.rope_parameters["rope_theta"]
             max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
             for layer in self.layers:
                 head_dim = layer.self_attn.head_dim
@@ -118,9 +118,14 @@ class Qwen2_5_VL_Generation(nnx.Module):
                 self.text_config.hidden_size,
                 dtype=self.dtype,
                 param_dtype=self.dtype,
-                kernel_axes=("tensor", None),
+                mesh=mesh,
+                enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
             )
-        self.logits_processor = LogitsProcessor(self.text_config.vocab_size, mesh=self.mesh)
+        self.logits_processor = LogitsProcessor(
+            self.text_config.vocab_size,
+            mesh=self.mesh,
+            enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
+        )
 
         # Multimodal token ids (from full config, if available)
         self.image_token_id = getattr(self.config, "image_token_id", None)
@@ -150,9 +155,7 @@ class Qwen2_5_VL_Generation(nnx.Module):
         }
 
         if not getattr(self.text_config, "tie_word_embeddings", False):
-            mappings["lm_head.weight"] = WeightMapping(
-                target_path="lm_head.embedding", sharding=("tensor", None), transpose=False
-            )
+            mappings["lm_head.weight"] = self.lm_head.weight_mapping("lm_head.embedding")
 
         num_layers = self.text_config.num_hidden_layers
         for layer_idx in range(num_layers):

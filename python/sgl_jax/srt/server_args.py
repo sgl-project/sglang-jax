@@ -150,6 +150,7 @@ class ServerArgs:
 
     # Data parallel
     dp_size: int = 1
+    enable_dp_lm_head: bool = False
     moe_dp_size: int = 1
     dp_schedule_policy: str | None = None
 
@@ -243,9 +244,6 @@ class ServerArgs:
     enable_single_process: bool = False
     enable_nan_detection: bool = False
 
-    # For sampling
-    use_sort_for_toppk_minp: bool = False
-
     # LoRA
     enable_lora: bool | None = None
     max_lora_rank: int | None = None
@@ -285,6 +283,8 @@ class ServerArgs:
     # ``RuntimeError("use_d2h_staging=True requires a host_pool")``.
     disaggregation_enable_d2h: bool = False
     disaggregation_use_raiden: bool = False
+    # Experimental CPU scheduling / device execution overlap, per PD role.
+    disaggregation_enable_overlap_schedule: bool = False
     # Stream each completed prefill chunk through Raiden instead of waiting
     # for the whole prompt. Opt-in while the v5 protocol is validated.
     disaggregation_enable_chunk_prefill_transfer: bool = False
@@ -331,6 +331,7 @@ class ServerArgs:
     disaggregation_max_inflight_transfers: int = 8
 
     def __post_init__(self):
+        self._check_disaggregation_overlap_args()
         # Set missing default values
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
@@ -659,6 +660,32 @@ class ServerArgs:
                     "--disaggregation-mode=null ignores PD options: %s",
                     ", ".join(non_default),
                 )
+
+    def _check_disaggregation_overlap_args(self):
+        """Validate raw fields before startup can initialize unsupported features."""
+        if not self.disaggregation_enable_overlap_schedule:
+            return
+        option = "--disaggregation-enable-overlap-schedule"
+        if self.disaggregation_mode not in ("prefill", "decode"):
+            raise ValueError(f"{option} requires --disaggregation-mode prefill or decode")
+        if not self.disaggregation_use_raiden:
+            raise ValueError(f"{option} requires --disaggregation-use-raiden")
+        if not self.disable_radix_cache:
+            raise ValueError(f"{option} requires --disable-radix-cache")
+        if self.nnodes != 1:
+            raise ValueError(f"{option} requires --nnodes=1 per serving instance")
+        if self.pd_disaggregation:
+            raise ValueError(f"{option} does not support --pd-disaggregation (Pathways)")
+        if self.disable_overlap_schedule:
+            raise ValueError(f"{option} conflicts with --disable-overlap-schedule")
+        if self.speculative_algorithm and self.speculative_algorithm.strip():
+            raise ValueError(f"{option} does not support --speculative-algorithm")
+        if self.enable_lora or self.enable_static_lora or self.lora_paths:
+            raise ValueError(f"{option} does not support LoRA")
+        if self.hicache_storage != "disable":
+            raise ValueError(f"{option} does not support HiCache")
+        if self.multimodal:
+            raise ValueError(f"{option} does not support multimodal serving")
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -1282,6 +1309,15 @@ class ServerArgs:
 
         # Data parallelism
         parser.add_argument(
+            "--enable-dp-lm-head",
+            action="store_true",
+            default=ServerArgs.enable_dp_lm_head,
+            help=(
+                "Run the LM head within each data-parallel group (TP/DP). "
+                "By default the LM head shards vocabulary over the full TP group."
+            ),
+        )
+        parser.add_argument(
             "--data-parallel-size",
             "--dp-size",
             type=int,
@@ -1313,6 +1349,8 @@ class ServerArgs:
             default=ServerArgs.dp_schedule_policy,
             help=(
                 "DP scheduling policy for assigning dp_rank to new requests. "
+                "Load-based routing defers unassigned requests when no rank has room; "
+                "prefill admission also checks execution and memory capacity. "
                 "When unset, defaults to 'cache_aware' with radix cache enabled "
                 "and 'min_running_queue' with radix cache disabled or Pathways PD. "
                 "'cache_aware' routes by cache affinity with soft load balancing: "
@@ -1652,13 +1690,6 @@ class ServerArgs:
             help="Enable run the engine with single process.",
         )
 
-        # For sampling
-        parser.add_argument(
-            "--use-sort-for-toppk-minp",
-            action="store_true",
-            help="Use jnp.sort to deal with top_k, top_p and min_p, which improves the grades for math-500 but increase precompile time a lot",
-        )
-
         parser.add_argument(
             "--multimodal",
             action="store_true",
@@ -1763,6 +1794,13 @@ class ServerArgs:
             action=argparse.BooleanOptionalAction,
             default=ServerArgs.disaggregation_use_raiden,
             help="Use tpu-raiden for direct block transfer into decode KV pages.",
+        )
+        parser.add_argument(
+            "--disaggregation-enable-overlap-schedule",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.disaggregation_enable_overlap_schedule,
+            help="Enable experimental scheduler overlap on this Raiden PD role. "
+            "Requires ChunkCache and one host per serving instance. Default OFF.",
         )
         parser.add_argument(
             "--disaggregation-enable-chunk-prefill-transfer",

@@ -6,14 +6,16 @@ import re
 import jax
 import jax.numpy as jnp
 
+from sgl_jax.srt.utils.jax_utils import get_device_kind
+
 
 def is_tpu() -> bool:
-    return "TPU" in jax.devices()[0].device_kind
+    return "TPU" in get_device_kind()
 
 
 def tpu_kind() -> str:
     """Query identification string for the currently attached TPU."""
-    return jax.devices()[0].device_kind
+    return get_device_kind()
 
 
 # Ex: VPU v5; TPU v5 lite; TPU7x

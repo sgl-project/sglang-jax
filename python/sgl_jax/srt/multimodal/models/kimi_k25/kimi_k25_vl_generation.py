@@ -44,6 +44,7 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM, InModelMultimodalCo
         rngs: nnx.Rngs | None = None,
     ):
         self.text_config = get_hf_text_config(config) or config
+        # The server policy lives on the outer config; the base model reads the text config.
         self.text_config.enable_dp_lm_head = getattr(config, "enable_dp_lm_head", False)
         self.dtype = dtype or jnp.bfloat16
         self.mesh = mesh

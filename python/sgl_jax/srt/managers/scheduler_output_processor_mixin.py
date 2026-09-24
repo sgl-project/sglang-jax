@@ -872,7 +872,9 @@ class SchedulerOutputProcessorMixin:
 
             if should_output:
                 send_token_offset = req.send_token_offset
-                send_output_token_logprobs_offset = req.send_output_token_logprobs_offset
+                output_logprob_slice = slice(
+                    req.send_output_token_logprobs_offset, req.finished_len
+                )
                 if isinstance(req.rid, list):
                     # if rid is a list, extend the list to rids
                     rids.extend(req.rid)
@@ -906,13 +908,6 @@ class SchedulerOutputProcessorMixin:
                     spec_verify_ct.append(req.spec_verify_ct)
                     spec_accepted_tokens.append(req.spec_accepted_tokens)
 
-                if req.return_output_logprob_only:
-                    output_token_logprobs_val.append(
-                        req.output_token_logprobs_val[send_output_token_logprobs_offset:]
-                    )
-                    output_token_logprobs_idx.append(
-                        req.output_token_logprobs_idx[send_output_token_logprobs_offset:]
-                    )
                 if return_logprob:
                     if req.return_logprob and not req.input_logprob_sent:
                         input_token_logprobs_val.append(req.input_token_logprobs_val)
@@ -930,24 +925,32 @@ class SchedulerOutputProcessorMixin:
                         input_token_ids_logprobs_val.append([])
                         input_token_ids_logprobs_idx.append([])
 
-                    if req.return_logprob:
+                    if req.return_logprob or req.return_output_logprob_only:
                         output_token_logprobs_val.append(
-                            req.output_token_logprobs_val[send_output_token_logprobs_offset:]
+                            req.output_token_logprobs_val[output_logprob_slice]
                         )
                         output_token_logprobs_idx.append(
-                            req.output_token_logprobs_idx[send_output_token_logprobs_offset:]
+                            req.output_token_logprobs_idx[output_logprob_slice]
                         )
                         output_top_logprobs_val.append(
-                            req.output_top_logprobs_val[send_output_token_logprobs_offset:]
+                            req.output_top_logprobs_val[output_logprob_slice]
+                            if req.return_logprob
+                            else []
                         )
                         output_top_logprobs_idx.append(
-                            req.output_top_logprobs_idx[send_output_token_logprobs_offset:]
+                            req.output_top_logprobs_idx[output_logprob_slice]
+                            if req.return_logprob
+                            else []
                         )
                         output_token_ids_logprobs_val.append(
-                            req.output_token_ids_logprobs_val[send_output_token_logprobs_offset:]
+                            req.output_token_ids_logprobs_val[output_logprob_slice]
+                            if req.return_logprob
+                            else []
                         )
                         output_token_ids_logprobs_idx.append(
-                            req.output_token_ids_logprobs_idx[send_output_token_logprobs_offset:]
+                            req.output_token_ids_logprobs_idx[output_logprob_slice]
+                            if req.return_logprob
+                            else []
                         )
                         req.send_output_token_logprobs_offset = len(req.output_token_logprobs_val)
                     else:
@@ -957,6 +960,18 @@ class SchedulerOutputProcessorMixin:
                         output_top_logprobs_idx.append([])
                         output_token_ids_logprobs_val.append([])
                         output_token_ids_logprobs_idx.append([])
+                elif return_output_logprob_only:
+                    # Tokenizer accumulates deltas; resending the whole history
+                    # duplicates logprobs and makes long SSE streams enormous.
+                    for target, values in (
+                        (output_token_logprobs_val, req.output_token_logprobs_val),
+                        (output_token_logprobs_idx, req.output_token_logprobs_idx),
+                    ):
+                        target.append(
+                            values[output_logprob_slice] if req.return_output_logprob_only else []
+                        )
+                    if req.return_output_logprob_only:
+                        req.send_output_token_logprobs_offset = len(req.output_token_logprobs_val)
                 if req.return_hidden_states:
                     if output_hidden_states_for_mm is None:
                         output_hidden_states_for_mm = []

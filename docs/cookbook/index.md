@@ -50,7 +50,7 @@ Status prefix: ✅ validated · 🧪 partially validated · 🚧 starter (not ye
 
 | TPU | Topology | Recipes |
 |---|---|---|
-| v6e-4 | 2x2 | ✅ [Qwen-7B-Chat](./autoregressive/Qwen/Qwen.md) · ✅ [Qwen3-8B / 32B](./autoregressive/Qwen/Qwen3.md) · ✅ [Qwen2.5-VL 3B / 7B candidates](./autoregressive/Qwen/Qwen2.5-VL.md) (`--tp-size 1`) · ✅ [Qwen2.5-VL 32B](./autoregressive/Qwen/Qwen2.5-VL.md) (`--tp-size 4`) · ✅ [Llama 3.1 8B-Instruct](./autoregressive/Llama/Llama3.1.md) · ✅ [Gemma 2 27B-it](./autoregressive/Google/Gemma2.md) · ✅ [MiMo-7B-RL](./autoregressive/Xiaomi/MiMo-7B.md) · ✅ [DeepSeek-V2-Lite](./autoregressive/DeepSeek/DeepSeek-V2.md) |
+| v6e-4 | 2x2 | ✅ [Qwen-7B-Chat](./autoregressive/Qwen/Qwen.md) · ✅ [Qwen3-8B / 32B](./autoregressive/Qwen/Qwen3.md) · ✅ [Qwen3.8-27B text-only](./autoregressive/Qwen/Qwen3.8.md) · ✅ [Qwen2.5-VL 3B / 7B candidates](./autoregressive/Qwen/Qwen2.5-VL.md) (`--tp-size 1`) · ✅ [Qwen2.5-VL 32B](./autoregressive/Qwen/Qwen2.5-VL.md) (`--tp-size 4`) · ✅ [Llama 3.1 8B-Instruct](./autoregressive/Llama/Llama3.1.md) · ✅ [Gemma 2 27B-it](./autoregressive/Google/Gemma2.md) · ✅ [MiMo-7B-RL](./autoregressive/Xiaomi/MiMo-7B.md) · ✅ [DeepSeek-V2-Lite](./autoregressive/DeepSeek/DeepSeek-V2.md) |
 | v7x-8 | single host (4 chips × 2 devices) | ✅ [Qwen2.5-VL-32B](./autoregressive/Qwen/Qwen2.5-VL.md) (`--tp-size 8 --dp-size 4`) · ✅ [Qwen3-VL-32B](./autoregressive/Qwen/Qwen3-VL.md) (`--tp-size 8 --dp-size 4`) · ✅ [MiMo-V2-Flash](./autoregressive/Xiaomi/MiMo-V2-Flash.md) |
 
 ### Multi-host

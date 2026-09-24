@@ -10,10 +10,10 @@ import numpy as np
 from flax import nnx
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from numba import njit, types
-from transformers import modeling_flax_utils
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.hf_transformers_utils import get_hf_text_config
+from sgl_jax.srt.layers.activation import ACT2FN
 from sgl_jax.srt.layers.embeddings import ParallelLMHead
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -121,7 +121,7 @@ class Qwen2_5_VLMLP(nnx.Module):
         vision_tp: bool = False,
     ):
         self.specs = VisionShardSpecs(mesh, vision_tp)
-        self.act_fn = modeling_flax_utils.ACT2FN[config.hidden_act]
+        self.act_fn = ACT2FN[config.hidden_act]
 
         self.gate_proj = LinearBase(
             config.hidden_size,
@@ -331,7 +331,7 @@ class Qwen2_5_VisionPatchMerger(nnx.Module):
             kernel_axes=self.specs.col_kernel_axes,
             params_dtype=dtype,
         )
-        self.mlp_act = modeling_flax_utils.ACT2FN["gelu"]
+        self.mlp_act = ACT2FN["gelu"]
         self.mlp_fc2 = LinearBase(
             self.hidden_size,
             d_model,
@@ -633,9 +633,7 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         self.config = config
         self.text_config = get_hf_text_config(config) or config
         self.dtype = dtype or jnp.bfloat16
-        self.is_mrope_enabled = "mrope_section" in (
-            getattr(self.text_config, "rope_scaling", None) or {}
-        )
+        self.is_mrope_enabled = "mrope_section" in self.text_config.rope_parameters
 
         # Language backbone.
         self.model = Qwen2Model(self.text_config, mesh=mesh, dtype=self.dtype)
@@ -645,9 +643,14 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
                 self.text_config.hidden_size,
                 dtype=self.dtype,
                 param_dtype=self.dtype,
-                kernel_axes=("tensor", None),
+                mesh=mesh,
+                enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
             )
-        self.logits_processor = LogitsProcessor(self.text_config.vocab_size, mesh=self.mesh)
+        self.logits_processor = LogitsProcessor(
+            self.text_config.vocab_size,
+            mesh=self.mesh,
+            enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
+        )
         self.image_token_id = getattr(self.config, "image_token_id", None)
         self.video_token_id = getattr(self.config, "video_token_id", None)
 
@@ -735,9 +738,7 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         }
 
         if not getattr(self.text_config, "tie_word_embeddings", False):
-            mappings["lm_head.weight"] = WeightMapping(
-                target_path="lm_head.embedding", sharding=("tensor", None), transpose=False
-            )
+            mappings["lm_head.weight"] = self.lm_head.weight_mapping("lm_head.embedding")
 
         for layer_idx in range(self.text_config.num_hidden_layers):
             mappings.update(self._language_layer_mappings(layer_idx))

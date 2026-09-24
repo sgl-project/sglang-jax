@@ -40,6 +40,8 @@ FPS_MAX_FRAMES = 768
 _QWEN3VL_ARCHITECTURES = frozenset(
     {
         "Qwen3VLForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
     }
 )
 
@@ -226,11 +228,12 @@ def preprocess_video(source, video_config: dict) -> np.ndarray:
 class QwenVLProcessor(BaseMultimodalProcessor):
     auto_mm_processor_worker_num = 2
     supports_mm_processor_concurrency = True
-    use_torchcodec_image_decode = True
     models = (
         "Qwen2VLForConditionalGeneration",
         "Qwen2_5_VLForConditionalGeneration",
         "Qwen3VLForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
     )
 
     async def process_mm_data_async(

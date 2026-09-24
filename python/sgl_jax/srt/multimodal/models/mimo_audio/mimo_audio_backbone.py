@@ -507,8 +507,8 @@ class MiMoAudioForCausalLM(nnx.Module):
             features=config.hidden_size,
             dtype=dtype,
             param_dtype=dtype,
-            kernel_axes=("tensor", None),
             mesh=mesh,
+            enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
         )
 
         self.patch_decoder_lm_heads = nnx.List(
@@ -557,7 +557,11 @@ class MiMoAudioForCausalLM(nnx.Module):
             mesh=mesh,
         )
 
-        self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
+        self.logits_processor = LogitsProcessor(
+            config.vocab_size,
+            mesh=self.mesh,
+            enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
+        )
 
     def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(
@@ -566,7 +570,7 @@ class MiMoAudioForCausalLM(nnx.Module):
             mesh=self.mesh,
             dtype=self.dtype,
         )
-        loader.load_weights_from_safetensors(to_mappings(self.config))
+        loader.load_weights_from_safetensors(to_mappings(self.config, self.lm_head))
 
     def apply_patch_encoder(self, speech_embeddings: jax.Array) -> jax.Array:
         B, T_groups, group_size, hidden_size = speech_embeddings.shape

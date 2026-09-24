@@ -592,20 +592,22 @@ class Req:
             self.to_finish = None
             return
 
+        # An accepted block may cross both EOS and the length limit.
+        new_accepted_tokens = self.output_ids[-new_accepted_len:]
+        if (
+            self._check_token_based_finish(new_accepted_tokens=new_accepted_tokens)
+            and self.finished_len < self.sampling_params.max_new_tokens
+        ):
+            return
+
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
             self.finished_reason = FINISH_LENGTH(length=self.sampling_params.max_new_tokens)
+            self.finished_len = self.sampling_params.max_new_tokens
             return
 
         # Check grammar termination
         if self.grammar is not None and self.grammar.is_terminated():
             self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
-            return
-
-        new_accepted_tokens = self.output_ids[-new_accepted_len:]
-        # if hasattr(last_token_id, "item"):
-        #     last_token_id = last_token_id.item()
-        # last_token_id = int(last_token_id)
-        if self._check_token_based_finish(new_accepted_tokens=new_accepted_tokens):
             return
 
         if self._check_vocab_boundary_finish(new_accepted_tokens):
@@ -2550,10 +2552,20 @@ class ScheduleBatch:
                     has_sampling_seeds = True
                 sampling_seeds[offset_bs : offset_bs + dp_bs] = dp_sampling.sampling_seeds[:dp_bs]
 
-            # Compute per-DP penalties (no-op if not required) and stitch into the
-            # merged buffer using the same per-DP slot offset as the other arrays.
-            dp_sampling.update_penalties()
-            if dp_sampling.linear_penalty is not None and dp_sampling.linear_penalty.size > 0:
+            # Write directly into a fresh merged buffer. Never reuse storage
+            # across steps: the previous batch may still be transferring to TPU.
+            orchestrator = dp_sampling.penalizer_orchestrator
+            if orchestrator is not None:
+                penalty_out = None
+                if orchestrator.is_required:
+                    if linear_penalty is None:
+                        linear_penalty = np.zeros(
+                            (total_bs, dp_sampling.vocab_size), dtype=np.float32
+                        )
+                    penalty_out = linear_penalty[offset_bs : offset_bs + dp_bs]
+                dp_sampling.update_penalties(out=penalty_out)
+            elif dp_sampling.linear_penalty is not None and dp_sampling.linear_penalty.size:
+                # Worker-side sampling info may already contain computed penalties.
                 if linear_penalty is None:
                     linear_penalty = np.zeros(
                         (total_bs, dp_sampling.linear_penalty.shape[1]),
@@ -3699,6 +3711,10 @@ class ModelWorkerBatch:
     # `arr[selector]` once after device_get to put per-req outputs back
     # into original order, removing the need for per-rank index math.
     logits_indices_selector: np.ndarray | None = None
+
+    # Batch-owned immutable page IDs for supported speculative relay backends.
+    allocated_page_indices: np.ndarray | None = None
+    eagle_page_indices_device_cache: tuple | None = None
 
     # Pre-bucketed per-token gather indices for the padded logprob path; None on
     # the legacy variable-shape path and on non-extend batches.

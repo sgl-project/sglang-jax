@@ -25,7 +25,7 @@ def _tiny_config(**overrides):
         num_key_value_heads=2,
         head_dim=4,
         max_position_embeddings=128,
-        rope_theta=1000000,
+        rope_parameters={"rope_type": "default", "rope_theta": 1000000},
         rms_norm_eps=1e-6,
         attention_bias=False,
         block_size=4,

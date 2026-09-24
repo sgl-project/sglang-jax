@@ -59,6 +59,13 @@ def _semaphore_kwargs(disable_semaphore_checks: bool) -> dict:
     return {}
 
 
+def _swa_subblock_has_visible_keys(q_start, kv_start, bkv_csz, sliding_window):
+    # SWA keeps k > q - window. The earliest query has the leftmost window,
+    # so skip only if even the last key is masked for that query. Using the
+    # nominal end is conservative for a partial KV tile; keep this in int32.
+    return kv_start + bkv_csz - 1 > q_start - sliding_window
+
+
 class RpaCase(Enum):
     """Represents the different cases for Ragged Paged Attention.
 
@@ -1060,13 +1067,31 @@ def _ragged_paged_attention_kernel_loop(
                 @pl.loop(0, max_num_loops, unroll=False)
                 def attention_loop(idx):
                     bkv_start = idx * bkv_csz
-
-                    @pl.when(
-                        jnp.logical_and(
-                            bkv_start < effective_bkv_sz,
-                            bkv_idx >= attention_start_bkv_idx,
-                        )
+                    should_compute = jnp.logical_and(
+                        bkv_start < effective_bkv_sz,
+                        bkv_idx >= attention_start_bkv_idx,
                     )
+                    if (
+                        sliding_window is not None
+                        and causal
+                        and custom_mask_ref is None
+                        and mask_value == DEFAULT_MASK_VALUE
+                    ):
+                        # Guard all Q subblocks together, using their earliest
+                        # query. Custom masks can have fully masked rows, and
+                        # nondefault mask values can carry softmax weight.
+                        # DMA and complete new-KV writeback stay outside this.
+                        should_compute = jnp.logical_and(
+                            should_compute,
+                            _swa_subblock_has_visible_keys(
+                                processed_q_len,
+                                processed_kv_len + bkv_start,
+                                bkv_csz,
+                                sliding_window,
+                            ),
+                        )
+
+                    @pl.when(should_compute)
                     def _():
                         for bq_start in range(0, actual_bq_sz, actual_bq_csz):
                             # Slice custom mask for this compute sub-block

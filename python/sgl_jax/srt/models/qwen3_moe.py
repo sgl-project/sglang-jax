@@ -11,7 +11,7 @@ from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.eplb.expert_location import ExpertLocationMetadata
-from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
+from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, get_rope
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
@@ -100,11 +100,12 @@ class QWen3MoeAttention(nnx.Module):
             params_dtype=dtype,
             mesh=mesh,
         )
-        self.rotary_emb = RotaryEmbedding(
+        self.rotary_emb = get_rope(
             head_size=self.head_dim,
             rotary_dim=self.head_dim,
-            max_position_embeddings=max_position_embeddings,
+            max_position=max_position_embeddings,
             base=rope_theta,
+            rope_scaling=rope_scaling,
             is_neox_style=True,
             dtype=dtype,
         )
@@ -170,8 +171,8 @@ class QWen3MoeDecoderLayer(nnx.Module):
         self.hidden_size = config.hidden_size
         self.mesh = mesh
         self.enable_sequence_parallel = getattr(config, "enable_sequence_parallel", False)
-        rope_theta = getattr(config, "rope_theta", 1000000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = config.rope_parameters["rope_theta"]
+        rope_scaling = config.rope_parameters
         max_position_embeddings = getattr(config, "max_position_embeddings", 40960)
         head_dim = getattr(config, "head_dim", None)
 
@@ -411,9 +412,14 @@ class Qwen3MoeForCausalLM(nnx.Module):
                 config.hidden_size,
                 dtype=self.dtype,
                 param_dtype=self.dtype,
-                kernel_axes=("tensor", None),
+                mesh=mesh,
+                enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
             )
-        self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
+        self.logits_processor = LogitsProcessor(
+            config.vocab_size,
+            mesh=self.mesh,
+            enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
+        )
 
     def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(
@@ -439,9 +445,7 @@ class Qwen3MoeForCausalLM(nnx.Module):
         }
 
         if not getattr(self.config, "tie_word_embeddings", False):
-            mappings["lm_head.weight"] = WeightMapping(
-                target_path="lm_head.embedding", sharding=("tensor", None), transpose=False
-            )
+            mappings["lm_head.weight"] = self.lm_head.weight_mapping("lm_head.embedding")
 
         quant_config = getattr(self.config, "quantization_config", None)
         is_static_quant = quant_config is not None and getattr(

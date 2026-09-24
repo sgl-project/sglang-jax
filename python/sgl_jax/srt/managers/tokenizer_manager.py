@@ -66,6 +66,7 @@ from sgl_jax.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
+from sgl_jax.srt.managers.mm_utils import send_mm_request
 from sgl_jax.srt.multimodal.common.modality_enum import build_radix_input_ids
 from sgl_jax.srt.multimodal.manager.multimodal_processor import (
     get_mm_processor_cls,
@@ -595,7 +596,7 @@ class TokenizerManager:
         tokenized_obj: TokenizedGenerateReqInput | TokenizedEmbeddingReqInput,
         created_time: float | None = None,
     ):
-        self.send_to_scheduler.send_pyobj(tokenized_obj)
+        send_mm_request(self.send_to_scheduler, tokenized_obj)
         # Capture the caller's event loop so that _notify_state_event can use
         # call_soon_threadsafe when handle_loop runs on a different thread
         # (e.g. enable_engine_loop_run_forever_daemon mode).
@@ -1405,8 +1406,12 @@ class TokenizerManager:
             self.crash_dump_request_list.popleft()
 
     def _handle_abort_req(self, recv_obj):
-        state = self.rid_to_state[recv_obj.rid]
+        # A late or repeated cancellation can race the final model output.
+        state = self.rid_to_state.pop(recv_obj.rid, None)
+        if state is None:
+            return
         state.finished = True
+        state.finished_time = time.time()
         state.out_list.append(
             {
                 "text": "",
@@ -1421,7 +1426,7 @@ class TokenizerManager:
                 },
             }
         )
-        state.event.set()
+        self._notify_state_event(state)
 
     def _handle_open_session_req_output(self, recv_obj):
         self.session_futures[recv_obj.session_id].set_result(

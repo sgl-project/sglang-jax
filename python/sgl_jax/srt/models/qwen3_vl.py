@@ -41,6 +41,8 @@ def create_qwen3_weight_mappings(
     config,
     source_prefix: str = "model",
     target_prefix: str = "model",
+    *,
+    lm_head: ParallelLMHead | None = None,
 ) -> dict:
     mappings = {
         f"{source_prefix}.embed_tokens.weight": WeightMapping(
@@ -53,9 +55,8 @@ def create_qwen3_weight_mappings(
         ),
     }
     if not getattr(config, "tie_word_embeddings", False):
-        mappings["lm_head.weight"] = WeightMapping(
-            target_path="lm_head.embedding", sharding=("tensor", None), transpose=False
-        )
+        assert lm_head is not None
+        mappings["lm_head.weight"] = lm_head.weight_mapping("lm_head.embedding")
     for layer_idx in range(config.num_hidden_layers):
         mappings.update(
             create_qwen3_layer_mappings(config, layer_idx, source_prefix, target_prefix)
@@ -597,25 +598,10 @@ class Qwen3VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         self.config = config
         self.text_config = get_hf_text_config(config) or config
         self.dtype = dtype or jnp.bfloat16
-        rope = getattr(self.text_config, "rope_parameters", None)
-        if rope:
-            self.text_config.rope_theta = rope.get(
-                "rope_theta", getattr(self.text_config, "rope_theta", 5_000_000)
-            )
-            self.text_config.rope_scaling = {
-                "rope_type": rope.get("rope_type", "default"),
-                "mrope_section": rope.get("mrope_section", [24, 20, 20]),
-                "mrope_interleaved": True,
-            }
-        elif not getattr(self.text_config, "rope_scaling", None):
-            self.text_config.rope_scaling = {
-                "rope_type": "default",
-                "mrope_section": [24, 20, 20],
-                "mrope_interleaved": True,
-            }
-        self.is_mrope_enabled = "mrope_section" in (
-            getattr(self.text_config, "rope_scaling", None) or {}
-        )
+        rope = self.text_config.rope_parameters
+        rope.setdefault("mrope_section", [24, 20, 20])
+        rope.setdefault("mrope_interleaved", True)
+        self.is_mrope_enabled = "mrope_section" in rope
         self.model = QWen3Model(self.text_config, mesh=mesh, dtype=self.dtype)
         if not getattr(self.text_config, "tie_word_embeddings", False):
             self.lm_head = ParallelLMHead(
@@ -623,10 +609,14 @@ class Qwen3VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
                 self.text_config.hidden_size,
                 dtype=self.dtype,
                 param_dtype=self.dtype,
-                kernel_axes=("tensor", None),
                 mesh=mesh,
+                enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
             )
-        self.logits_processor = LogitsProcessor(self.text_config.vocab_size, mesh=mesh)
+        self.logits_processor = LogitsProcessor(
+            self.text_config.vocab_size,
+            mesh=mesh,
+            enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
+        )
         encoder_tp = resolve_encoder_tp(mesh, getattr(config, "vision_encoder_parallel", "dp"))
         self.visual = Qwen3VLVisionModel(
             config.vision_config,
@@ -684,7 +674,10 @@ class Qwen3VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         text_loader = WeightLoader(self, model_config, self.mesh, self.dtype)
         text_loader.load_weights_from_safetensors(
             create_qwen3_weight_mappings(
-                self.text_config, source_prefix="model.language_model", target_prefix="model"
+                self.text_config,
+                source_prefix="model.language_model",
+                target_prefix="model",
+                lm_head=getattr(self, "lm_head", None),
             )
         )
         config = self.config.vision_config

@@ -7,8 +7,8 @@ import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
-from transformers import modeling_flax_utils
 
+from sgl_jax.srt.layers.activation import ACT2FN
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.multimodal.configs.dits.flux_model_config import FluxModelConfig
@@ -362,7 +362,7 @@ class FluxSingleTransformerBlock(nnx.Module):
             params_dtype=params_dtype,
             kernel_axes=("tensor", None),
         )
-        self.act_mlp = modeling_flax_utils.ACT2FN["gelu_pytorch_tanh"]
+        self.act_mlp = ACT2FN["gelu_pytorch_tanh"]
         self.attn = FluxAttention(
             query_dim=dim,
             dim_head=attention_head_dim,

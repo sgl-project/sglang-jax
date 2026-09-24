@@ -384,6 +384,7 @@ class KimiDecoderLayer(nnx.Module):
                     top_k_groups=config.topk_group,
                     num_shared_experts=config.num_shared_experts,
                     moe_shared_expert_intermediate_size=config.moe_intermediate_size,
+                    quantization_config=getattr(config, "quantization_config", None),
                 )
             else:
                 self.block_sparse_moe = EPMoE(
@@ -396,6 +397,7 @@ class KimiDecoderLayer(nnx.Module):
                     dtype=dtype,
                     layer_id=layer_idx,
                     ep_size=config.ep_size,
+                    quantization_config=getattr(config, "quantization_config", None),
                 )
 
             # Shared experts
@@ -593,10 +595,15 @@ class KimiLinearForCausalLM(nnx.Module):
                 config.hidden_size,
                 dtype=dtype,
                 param_dtype=dtype,
-                kernel_axes=("tensor", None),
+                mesh=mesh,
+                enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
             )
 
-        self.logits_processor = LogitsProcessor(config.vocab_size, mesh=mesh)
+        self.logits_processor = LogitsProcessor(
+            config.vocab_size,
+            mesh=mesh,
+            enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
+        )
 
     def __call__(
         self,
@@ -651,11 +658,7 @@ class KimiLinearForCausalLM(nnx.Module):
         }
 
         if not getattr(self.config, "tie_word_embeddings", False):
-            mappings["lm_head.weight"] = WeightMapping(
-                target_path="lm_head.embedding",
-                sharding=("tensor", None),
-                transpose=False,
-            )
+            mappings["lm_head.weight"] = self.lm_head.weight_mapping("lm_head.embedding")
 
         num_layers = self.config.num_hidden_layers
         first_k_dense_replace = self.config.first_k_dense_replace

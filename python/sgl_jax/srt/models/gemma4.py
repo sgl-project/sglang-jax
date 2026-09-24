@@ -20,7 +20,15 @@ from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
+from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
+from sgl_jax.srt.multimodal.in_model.lane_packing import (
+    encoder_num_lanes,
+    run_mrope_vision_model,
+)
+from sgl_jax.srt.multimodal.layers.vision_sharding import resolve_encoder_tp
 from sgl_jax.srt.precision_tracer import precision_tracer
+from sgl_jax.srt.utils.common_utils import resolve_vision_patch_buckets
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
@@ -590,12 +598,14 @@ class Gemma4ForCausalLM(nnx.Module):
                 self.config.hidden_size,
                 dtype=self.dtype,
                 param_dtype=self.dtype,
-                kernel_axes=("tensor", None),
+                mesh=mesh,
+                enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
             )
         self.logits_processor = LogitsProcessor(
             self.config.vocab_size,
             soft_cap=getattr(self.config, "final_logit_softcapping", 0.0),
             mesh=self.mesh,
+            enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
         )
         self.capture_aux_hidden_states = False
 
@@ -732,9 +742,7 @@ class Gemma4ForCausalLM(nnx.Module):
         }
 
         if hasattr(self, "lm_head"):
-            mappings["lm_head.weight"] = WeightMapping(
-                target_path="lm_head.embedding", sharding=("tensor", None), transpose=False
-            )
+            mappings["lm_head.weight"] = self.lm_head.weight_mapping("lm_head.embedding")
 
         num_layers = self.config.num_hidden_layers
         for layer_idx in range(num_layers):
@@ -930,8 +938,170 @@ class Gemma4ForCausalLM(nnx.Module):
         return output, {"token_to_kv_pool": layers_kv_fused}, layers_callback_flag, layers_topk_ids
 
 
-class Gemma4ForConditionalGeneration(Gemma4ForCausalLM):
-    pass
+class Gemma4ForConditionalGeneration(Gemma4ForCausalLM, InModelMultimodalContract):
+    """Gemma 4 text decoder with the native in-model vision tower."""
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        mesh: jax.sharding.Mesh,
+        dtype: jnp.dtype = jnp.bfloat16,
+    ):
+        if getattr(config, "vision_config", None) is None:
+            raise ValueError(
+                "Gemma4ForConditionalGeneration requires config.vision_config; "
+                "the encoder-free Gemma 4 12B architecture is not supported by this class."
+            )
+        self.root_config = config
+        super().__init__(config, mesh, dtype)
+
+        from sgl_jax.srt.managers.schedule_batch import global_server_args_dict
+        from sgl_jax.srt.models.gemma4_vision import Gemma4VisionModel
+
+        encoder_tp = resolve_encoder_tp(
+            mesh,
+            global_server_args_dict.get("vision_encoder_parallel", "dp"),
+        )
+        configured_buckets = global_server_args_dict.get("precompile_vision_patch_paddings")
+        input_buckets = (
+            tuple(resolve_vision_patch_buckets(configured_buckets)) if configured_buckets else None
+        )
+        self.visual = Gemma4VisionModel(
+            config.vision_config,
+            self.config.hidden_size,
+            self.dtype,
+            None,
+            mesh,
+            encoder_tp,
+            input_buckets,
+        )
+
+    def get_input_embeddings(self):
+        def embed(input_ids: jax.Array) -> jax.Array:
+            hidden_states = self.model.embed_tokens(input_ids)
+            return hidden_states * jnp.asarray(
+                self.config.hidden_size**0.5,
+                dtype=hidden_states.dtype,
+            )
+
+        return embed
+
+    def precompile_multimodal(self) -> None:
+        self.visual.precompile()
+
+    def get_multimodal_embedding_packed_capacities(self) -> tuple[int, ...]:
+        return self.visual.get_packed_capacities()
+
+    def get_image_feature(self, items: list[MultimodalDataItem]) -> jax.Array:
+        return self._get_visual_feature(items)
+
+    def _get_visual_feature(self, items: list[MultimodalDataItem]) -> jax.Array:
+        return run_mrope_vision_model(
+            self.visual,
+            items,
+            mesh=self.mesh,
+            num_lanes=encoder_num_lanes(self.mesh, self.visual.vision_tp),
+            buckets=self.visual.input_buckets,
+            merge_unit=self.visual.pooling_unit,
+            rope_type="rope_2d_packed",
+            input_sharding=self.visual.specs.sharding(self.visual.specs.batch_axis),
+            output_sharding=self.visual.specs.sharding(),
+        )
+
+    def get_multimodal_encode_funcs(self):
+        return {
+            Modality.IMAGE: self.get_image_feature,
+            Modality.MULTI_IMAGES: self.get_image_feature,
+        }
+
+    def load_weights(self, model_config: ModelConfig):
+        super().load_weights(model_config)
+        loader = WeightLoader(self, model_config, self.mesh, self.dtype)
+        mappings = self._create_vision_weight_mappings()
+        if not loader.dummy_mode:
+            weight_info = loader._scan_weight_info()
+            mappings = {key: value for key, value in mappings.items() if key in weight_info}
+        loader.load_weights_from_safetensors(mappings)
+        logger.info("Gemma 4 vision tower weights loaded successfully!")
+
+    def _create_vision_weight_mappings(self) -> dict[str, WeightMapping]:
+        specs = self.visual.specs
+        col, row = specs.col_kernel_axes, specs.row_kernel_axes
+        mappings: dict[str, WeightMapping] = {
+            "model.vision_tower.patch_embedder.input_proj.weight": WeightMapping(
+                target_path="visual.patch_embedder.input_proj.weight",
+                sharding=col,
+                transpose=True,
+            ),
+            "model.vision_tower.patch_embedder.position_embedding_table": WeightMapping(
+                target_path="visual.patch_embedder.position_embedding_table",
+                sharding=(None, None, specs.tensor_axis),
+                transpose=False,
+            ),
+            "model.embed_vision.embedding_projection.weight": WeightMapping(
+                target_path="visual.projector.embedding_projection.weight",
+                sharding=col,
+                transpose=True,
+            ),
+        }
+        if self.visual.standardize:
+            mappings.update(
+                {
+                    "model.vision_tower.std_bias": WeightMapping(
+                        target_path="visual.std_bias",
+                        sharding=(None,),
+                        transpose=False,
+                    ),
+                    "model.vision_tower.std_scale": WeightMapping(
+                        target_path="visual.std_scale",
+                        sharding=(None,),
+                        transpose=False,
+                    ),
+                }
+            )
+        for index in range(int(self.root_config.vision_config.num_hidden_layers)):
+            source = f"model.vision_tower.encoder.layers.{index}"
+            target = f"visual.layers.{index}"
+            for name in (
+                "input_layernorm",
+                "post_attention_layernorm",
+                "pre_feedforward_layernorm",
+                "post_feedforward_layernorm",
+            ):
+                mappings[f"{source}.{name}.weight"] = WeightMapping(
+                    target_path=f"{target}.{name}.weight",
+                    sharding=(None,),
+                    transpose=False,
+                )
+            for projection in ("q_proj", "k_proj", "v_proj"):
+                mappings[f"{source}.self_attn.{projection}.linear.weight"] = WeightMapping(
+                    target_path=f"{target}.self_attn.{projection}.weight",
+                    sharding=col,
+                    transpose=True,
+                )
+            mappings[f"{source}.self_attn.o_proj.linear.weight"] = WeightMapping(
+                target_path=f"{target}.self_attn.o_proj.weight",
+                sharding=row,
+                transpose=True,
+            )
+            for norm in ("q_norm", "k_norm"):
+                mappings[f"{source}.self_attn.{norm}.weight"] = WeightMapping(
+                    target_path=f"{target}.self_attn.{norm}.weight",
+                    sharding=(None,),
+                    transpose=False,
+                )
+            for projection in ("gate_proj", "up_proj"):
+                mappings[f"{source}.mlp.{projection}.linear.weight"] = WeightMapping(
+                    target_path=f"{target}.mlp.{projection}.weight",
+                    sharding=col,
+                    transpose=True,
+                )
+            mappings[f"{source}.mlp.down_proj.linear.weight"] = WeightMapping(
+                target_path=f"{target}.mlp.down_proj.weight",
+                sharding=row,
+                transpose=True,
+            )
+        return mappings
 
 
 EntryClass = [Gemma4ForCausalLM, Gemma4ForConditionalGeneration]

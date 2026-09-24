@@ -84,6 +84,7 @@ class WeightMapping:
     concat_axis: int | None = None
     is_eagle3: bool = False
     physical_to_logical_map: np.ndarray | None = None
+    pad_width: tuple[tuple[int, int], ...] | None = None
 
     def __post_init__(self):
         if self.sharding is None:
@@ -215,6 +216,8 @@ class WeightLoader:
 
     def has_weight_on_disk(self, hf_key: str) -> bool:
         """Return whether a concrete HF weight key exists in the safetensors files."""
+        if self.dummy_mode:
+            return False
         return hf_key in self._scan_weight_info()
 
     # ------------------------------------------------------------------
@@ -229,7 +232,12 @@ class WeightLoader:
         from sgl_jax.srt.layers.linear import LinearBase
 
         in_features, out_features = weight.shape
-        with jax.set_mesh(mesh):
+        mesh_context = (
+            jax.sharding.use_abstract_mesh(mesh.abstract_mesh)
+            if isinstance(weight, jax.core.Tracer)
+            else jax.set_mesh(mesh)
+        )
+        with mesh_context:
             new_linear = LinearBase(
                 input_size=in_features,
                 output_size=out_features,
@@ -255,6 +263,10 @@ class WeightLoader:
         """
         weight_q = ql.weight_q.value
         weight_scale = ql.weight_scale.value
+        if self.dummy_mode:
+            # QuantizedLinear placeholders use [out, in]. Normalize explicitly
+            # so square projections do not rely on ambiguous shape inference.
+            weight_q = weight_q.T
 
         if weight_scale.ndim == 3:
             weight_bf16 = self._block_dequant(weight_q, weight_scale, head_dim=head_dim)
@@ -477,6 +489,18 @@ class WeightLoader:
 
         from jax.sharding import NamedSharding
 
+        if self.dummy_mode:
+            # Dummy weights already have the final projection shapes. There
+            # are no raw checkpoint buffers, but serving still consumes BF16
+            # K/V projections after this post-load hook.
+            self.dequant_fp8_layers(
+                layers,
+                specs=[
+                    ("self_attn.k_proj", config.head_dim),
+                    ("self_attn.v_proj", getattr(config, "v_head_dim", config.head_dim)),
+                ],
+            )
+            return
         if not kv_buffers:
             return
 
@@ -580,6 +604,16 @@ class WeightLoader:
             layers: model.layers list
             config: model config with head_dim, v_head_dim, num_attention_heads, etc.
         """
+        if self.dummy_mode:
+            self.dequant_fp8_layers(
+                layers,
+                specs=[
+                    ("self_attn.q_proj", config.head_dim),
+                    ("self_attn.k_proj", config.head_dim),
+                    ("self_attn.v_proj", getattr(config, "v_head_dim", config.head_dim)),
+                ],
+            )
+            return
         if not fused_qkv_buffers:
             return
 
@@ -2013,6 +2047,7 @@ class WeightLoader:
                     isinstance(mapping.target_path, str)
                     and not mapping.target_path.startswith("__FUSED_QKV_")
                     and not mapping.target_path.startswith("__KV_")
+                    and mapping.pad_width is None
                     and mapping.reshape is None
                     and mapping.repeat is None  # Check repeat here too!
                     and not mapping.kv_head_padding
@@ -2386,6 +2421,15 @@ class WeightLoader:
         nnx.update(self.model, params)
         logger.info("All weights loaded successfully.")
 
+    def _dummy_array(self, shape, dtype, sharding):
+        if getattr(self.model_config, "_abstract_mode", False):
+            # Used only inside eval_shape. Specify the aval's sharding directly:
+            # nested jit out_shardings are not propagated through shape tracing.
+            # This also lets post-load reshapes/splits infer their true layout.
+            with jax.sharding.use_abstract_mesh(sharding.mesh.abstract_mesh):
+                return jnp.zeros(shape, dtype, out_sharding=sharding)
+        return jax.jit(lambda: jnp.zeros(shape, dtype), out_shardings=sharding)()
+
     def _load_dummy_weights(
         self,
         params: nnx.State,
@@ -2424,14 +2468,16 @@ class WeightLoader:
             dtype = model_param.value.dtype
 
             sharding_spec = P(*mapping.sharding) if mapping.sharding else P()
+            if self.is_static_quant and target_path.endswith(("weight_q", "weight_scale")):
+                # Quantized placeholders already describe the transposed
+                # weight and expanded scale consumed by the runtime kernel.
+                sharding_spec = model_param.value.sharding.spec
             sharding = jax.sharding.NamedSharding(self.mesh, sharding_spec)
             # jit(zeros) compiles to a device-side XLA constant -> 0 H2D. The
             # original make_array_from_callback path serializes ndev host
             # callbacks per param under Pathways IFRT (ocean_remote_python.py
             # iterates devices synchronously) -> ~27K RPCs for a 78L MoE.
-            model_param.value = jax.jit(
-                lambda s=shape, d=dtype: jnp.zeros(s, dtype=d), out_shardings=sharding
-            )()
+            model_param.value = self._dummy_array(shape, dtype, sharding)
             logger.debug(
                 "Generated dummy weight for %s, shape=%s, sharding=%s",
                 target_path,
@@ -2475,10 +2521,7 @@ class WeightLoader:
                 spec = P(*mapping.sharding) if mapping.sharding else P()
                 final_sharding = jax.sharding.NamedSharding(self.mesh, spec)
 
-            model_param.value = jax.jit(
-                lambda s=full_shape, d=dtype: jnp.zeros(s, dtype=d),
-                out_shardings=final_sharding,
-            )()
+            model_param.value = self._dummy_array(full_shape, dtype, final_sharding)
 
             logger.debug(
                 "Generated dummy MOE weight for %s, shape=%s, num_experts=%s, sharding=%s",
@@ -2514,10 +2557,9 @@ class WeightLoader:
                 if any(x not in mesh_axes for x in names):
                     spec = P()
                     break
-            leaf.value = jax.jit(
-                lambda s=v.shape, d=v.dtype: jnp.zeros(s, d),
-                out_shardings=jax.sharding.NamedSharding(self.mesh, spec),
-            )()
+            leaf.value = self._dummy_array(
+                v.shape, v.dtype, jax.sharding.NamedSharding(self.mesh, spec)
+            )
             n_fallback += 1
         if n_fallback:
             logger.info("Dummy fallback filled %d params missed by mappings", n_fallback)
@@ -2610,6 +2652,9 @@ class WeightLoader:
             processed_weight = jnp.repeat(processed_weight, times, axis=axis)
         if mapping.kv_head_padding:
             processed_weight = self._apply_kv_head_padding(processed_weight, hf_key)
+
+        if mapping.pad_width is not None:
+            processed_weight = jnp.pad(processed_weight, mapping.pad_width)
 
         assert mapping.sharding is not None
         sharded_weight = self._shard_weight(processed_weight, mapping.sharding)

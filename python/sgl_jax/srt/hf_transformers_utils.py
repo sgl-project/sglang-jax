@@ -1,6 +1,6 @@
 """Utilities for Huggingface Transformers."""
 
-import contextlib
+import json
 import logging
 import os
 import threading
@@ -18,23 +18,17 @@ from transformers import (
     PreTrainedTokenizerBase,
     PreTrainedTokenizerFast,
 )
-from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from sgl_jax.srt.configs.bailing_hybrid import BailingHybridConfig
 from sgl_jax.srt.configs.gemma4 import Gemma4Config
 from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
 from sgl_jax.srt.configs.qwen3_5 import Qwen3_5DenseConfig, Qwen3_5HybridConfig
+from sgl_jax.srt.configs.qwen4_exp import Qwen4ExpConfig
 from sgl_jax.srt.managers.tiktoken_tokenizer import TiktokenTokenizer
 from sgl_jax.srt.utils.common_utils import is_remote_url, lru_cache_frozenset
 
 logger = logging.getLogger(__name__)
-
-
-class GlmMoeDsaConfig(PretrainedConfig):
-    # Empty stub (PR #1037): just claims the model_type; real fields live with
-    # the model / stock HF config.
-    model_type = "glm_moe_dsa"
 
 
 _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
@@ -42,31 +36,17 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     for cls in [
         BailingHybridConfig,
         KimiLinearConfig,
-        GlmMoeDsaConfig,
         Qwen3_5HybridConfig,
         Qwen3_5DenseConfig,
+        Qwen4ExpConfig,
         Gemma4Config,
     ]
 }
 
-if "glm_moe_dsa" not in CONFIG_MAPPING:
-    with contextlib.suppress(Exception):
-        from transformers.models.auto.tokenization_auto import TOKENIZER_MAPPING
-
-        TOKENIZER_MAPPING._reverse_config_mapping["GlmMoeDsaConfig"] = "gpt2"
-
-# Register local configs; suppress() defers to stock on a name clash (fine for
-# bailing/kimi which don't clash, and for the glm stub where stock is preferable).
+# These configs expose runner-specific fields (hybrid state and head layouts).
+# GLM uses the native v5 config; it no longer needs a local placeholder.
 for name, cls in _CONFIG_REGISTRY.items():
-    with contextlib.suppress(ValueError):
-        AutoConfig.register(name, cls)
-
-# Qwen3.5 is the exception: stock transformers >=5.3 owns ``qwen3_5_moe`` /
-# ``qwen3_5`` so the loop skips ours, but ours isn't interchangeable (flattens
-# rope_parameters + exposes the hybrid/GDN interface the runner needs). Force
-# ours to win for both the MoE and dense root model types.
-AutoConfig.register("qwen3_5_moe", Qwen3_5HybridConfig, exist_ok=True)
-AutoConfig.register("qwen3_5", Qwen3_5DenseConfig, exist_ok=True)
+    AutoConfig.register(name, cls, exist_ok=True)
 
 
 _UNSET = object()
@@ -87,25 +67,37 @@ def get_hf_text_config(config: PretrainedConfig):
     """Get the "sub" config relevant to llm for multi modal models.
     No op for pure text models.
     """
-    if hasattr(config, "text_config"):
-        # The code operates under the assumption that text_config should have
-        # `num_attention_heads` (among others). Assert here to fail early
-        # if transformers config doesn't align with this assumption.
-        assert hasattr(config.text_config, "num_attention_heads")
-        return config.text_config
-    if hasattr(config, "language_config"):
-        return config.language_config
     if hasattr(config, "thinker_config"):
-        # qwen2.5 omni
-        thinker_config = config.thinker_config
-        if hasattr(thinker_config, "text_config"):
-            thinker_config.text_config.torch_dtype = getattr(
-                thinker_config, "dtype", getattr(thinker_config, "torch_dtype", None)
-            )
-            return thinker_config.text_config
-        return thinker_config
+        text_config = get_hf_text_config(config.thinker_config)
     else:
+        text_config = next(
+            (
+                getattr(config, name)
+                for name in ("text_config", "llm_config", "language_config")
+                if getattr(config, name, None) is not None
+            ),
+            config,
+        )
+    if text_config is config:
         return config
+    assert hasattr(text_config, "num_attention_heads")
+    # v5 no longer inherits these fields between composite and text configs.
+    for name in ("pad_token_id", "bos_token_id", "eos_token_id", "tie_word_embeddings", "dtype"):
+        if hasattr(config, name) and not hasattr(text_config, name):
+            setattr(text_config, name, getattr(config, name))
+        elif hasattr(text_config, name) and not hasattr(config, name):
+            setattr(config, name, getattr(text_config, name))
+    return text_config
+
+
+def apply_model_config_overrides(config: PretrainedConfig, overrides: dict) -> None:
+    """Apply overrides without replacing nested HF configs with plain dicts."""
+    for key, value in overrides.items():
+        current = getattr(config, key, None)
+        if isinstance(value, dict) and isinstance(current, PretrainedConfig):
+            current.update(value)
+        else:
+            setattr(config, key, value)
 
 
 @lru_cache_frozenset(maxsize=32)
@@ -131,12 +123,6 @@ def get_config(
             if not hasattr(config, key) and getattr(text_config, key, None) is not None:
                 setattr(config, key, val)
 
-    if config.model_type in _CONFIG_REGISTRY:
-        config_class = _CONFIG_REGISTRY[config.model_type]
-        config = config_class.from_pretrained(model, revision=revision)
-        # NOTE(HandH1998): Qwen2VL requires `_name_or_path` attribute in `config`.
-        config._name_or_path = model
-
     if isinstance(model, str) and config.model_type == "internvl_chat":
         for key, val in config.llm_config.__dict__.items():
             if not hasattr(config, key):
@@ -146,7 +132,7 @@ def get_config(
         config.update({"architectures": ["MultiModalityCausalLM"]})
 
     if model_override_args:
-        config.update(model_override_args)
+        apply_model_config_overrides(config, model_override_args)
 
     # Special architecture mapping check for GGUF models
     if is_gguf:
@@ -188,8 +174,9 @@ CONTEXT_LENGTH_KEYS = [
 
 def get_context_length(config):
     """Get the context length of a model from a huggingface model configs."""
-    text_config = config
-    rope_scaling = getattr(text_config, "rope_scaling", None)
+    text_config = get_hf_text_config(config)
+    rope_scaling = getattr(text_config, "rope_parameters", None) or {}
+    rope_scaling = rope_scaling.get("full_attention", rope_scaling)
     if rope_scaling:
         rope_scaling_factor = rope_scaling.get("factor", 1)
         if "original_max_position_embeddings" in rope_scaling:
@@ -252,6 +239,49 @@ def _raise_fastokens_load_error(tokenizer_name: str, error: Exception):
     ) from error
 
 
+def _restore_checkpoint_tokenizer(tokenizer, model_path, revision=None, **overrides):
+    """Preserve checkpoint tokenization when v5 reconstructs a legacy tokenizer."""
+    from tokenizers import Tokenizer
+    from transformers.utils.hub import cached_file
+
+    if not isinstance(tokenizer, PreTrainedTokenizerFast):
+        return
+    files = [
+        cached_file(
+            model_path,
+            name,
+            revision=revision,
+            local_files_only=True,
+            _raise_exceptions_for_missing_entries=False,
+            _raise_exceptions_for_connection_errors=False,
+        )
+        for name in ("tokenizer.json", "tokenizer_config.json")
+    ]
+    if not all(files):
+        return
+    with open(files[1]) as f:
+        config = json.load(f)
+    # These v4 classes accepted BOS/EOS flags; Qwen tokenizers did not.
+    legacy_class = config.get("tokenizer_class", "").removesuffix("Fast")
+    if legacy_class not in {
+        "LlamaTokenizer",
+        "CodeLlamaTokenizer",
+        "GemmaTokenizer",
+        "CohereTokenizer",
+    }:
+        return
+    raw = Tokenizer.from_file(files[0])
+    backend = tokenizer.backend_tokenizer
+    if type(backend.pre_tokenizer) is not type(raw.pre_tokenizer):
+        backend.pre_tokenizer = raw.pre_tokenizer
+        backend.decoder = raw.decoder
+    for name, default in (("add_bos_token", True), ("add_eos_token", False)):
+        value = overrides.get(name, config.get(name))
+        # The public setters rebuild the post-processor, including when the
+        # default False flag already matches but the saved processor differs.
+        setattr(tokenizer, name, default if value is None else value)
+
+
 def get_tokenizer(
     tokenizer_name: str,
     *args,
@@ -265,6 +295,7 @@ def get_tokenizer(
 ) -> PreTrainedTokenizer | PreTrainedTokenizerFast | TiktokenTokenizer:
     """Gets a tokenizer for the given model name via Huggingface."""
     _validate_tokenizer_backend(tokenizer_backend)
+    revision = kwargs.pop("revision", tokenizer_revision)
 
     if tokenizer_name.endswith(".json"):
         # Tiktoken JSON files use their own backend and do not go through transformers.
@@ -292,20 +323,6 @@ def get_tokenizer(
             f"Please use a local path or HuggingFace model name instead: {tokenizer_name}"
         )
     tokenizer_name = download_from_hf(tokenizer_name, cache_dir=download_dir)
-    # Workaround: older versions of the transformers library (like ~=4.57.1) will crash when
-    # loading tokenizers containing list-format extra_special_tokens (e.g. google/gemma-4).
-    # Overriding it to an empty dict avoids the validation crash while keeping all vocab tokens intact.
-    try:
-        config_path = os.path.join(tokenizer_name, "config.json")
-        if os.path.exists(config_path):
-            with open(config_path) as f:
-                import json
-
-                model_config_data = json.load(f)
-                if model_config_data.get("model_type") == "gemma4":
-                    kwargs.setdefault("extra_special_tokens", {})
-    except Exception as e:
-        logger.debug("Failed to inspect config.json for extra_special_tokens workaround: %s", e)
     if sub_dir:
         # Only append sub_dir if it actually exists
         sub_dir_path = tokenizer_name + "/" + sub_dir
@@ -313,119 +330,15 @@ def get_tokenizer(
             tokenizer_name = sub_dir_path
         # else: use the root path, tokenizer might be in model root
 
-    # Workaround: Intercept TokenizersBackend and list-type extra_special_tokens
-    # to prevent loading failure in transformers < 5.0.
-    # TODO(notabee): Clean this workaround up when transformers 5.0 is the minimum version.
-    import json
-    import tempfile
-
-    import transformers
-    from packaging.version import Version
-
-    need_patch = Version(transformers.__version__) < Version("5.0.0")
-    tokenizer_config_path = os.path.join(tokenizer_name, "tokenizer_config.json")
-    tokenizer_load_path = tokenizer_name
-    temp_dir_obj = None
-
-    if need_patch and os.path.exists(tokenizer_config_path):
-        try:
-            with open(tokenizer_config_path, encoding="utf-8") as f:
-                config_data = json.load(f)
-            is_patched = False
-            if config_data.get("tokenizer_class") == "TokenizersBackend":
-                config_data.pop("tokenizer_class", None)
-                is_patched = True
-            if "extra_special_tokens" in config_data:
-                config_data.pop("extra_special_tokens", None)
-                is_patched = True
-
-            # Simplify dict-valued special tokens to strings to avoid transformers TypeError
-            special_token_keys = [
-                "bos_token",
-                "eos_token",
-                "unk_token",
-                "pad_token",
-                "sep_token",
-                "cls_token",
-                "mask_token",
-            ]
-            for key in special_token_keys:
-                if (
-                    key in config_data
-                    and isinstance(config_data[key], dict)
-                    and "content" in config_data[key]
-                ):
-                    config_data[key] = config_data[key]["content"]
-                    is_patched = True
-
-            if "additional_special_tokens" in config_data and isinstance(
-                config_data["additional_special_tokens"], list
-            ):
-                new_additional = []
-                for token in config_data["additional_special_tokens"]:
-                    if isinstance(token, dict) and "content" in token:
-                        new_additional.append(token["content"])
-                        is_patched = True
-                    else:
-                        new_additional.append(token)
-                config_data["additional_special_tokens"] = new_additional
-
-            if is_patched:
-                # Create a temporary directory and symlink all files from tokenizer_name,
-                # writing the patched config inside the temporary directory.
-                temp_dir_obj = tempfile.TemporaryDirectory()
-                temp_dir = temp_dir_obj.name
-                try:
-                    for item in os.listdir(tokenizer_name):
-                        src_path = os.path.join(tokenizer_name, item)
-                        dst_path = os.path.join(temp_dir, item)
-                        if item == "tokenizer_config.json":
-                            continue
-                        os.symlink(src_path, dst_path)
-
-                    patched_config_path = os.path.join(temp_dir, "tokenizer_config.json")
-                    with open(patched_config_path, "w", encoding="utf-8") as f:
-                        json.dump(config_data, f, indent=2)
-
-                    tokenizer_load_path = temp_dir
-                    warnings.warn(
-                        f"Created patched tokenizer config workaround in temporary directory: {temp_dir} "
-                        "to maintain compatibility with your transformers library version.",
-                        stacklevel=2,
-                    )
-                except Exception as symlink_err:
-                    tokenizer_load_path = tokenizer_name
-                    temp_dir_obj.cleanup()
-                    temp_dir_obj = None
-                    warnings.warn(
-                        f"Failed to create temporary directory for patched tokenizer config: {symlink_err}. "
-                        "Falling back to default tokenizer directory.",
-                        stacklevel=2,
-                    )
-        except Exception as e:
-            warnings.warn(
-                f"Failed to dynamically patch tokenizer_config.json: {e}",
-                stacklevel=2,
-            )
-
     try:
         tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_load_path,
+            tokenizer_name,
             *args,
             trust_remote_code=trust_remote_code,
-            tokenizer_revision=tokenizer_revision,
+            revision=revision,
             clean_up_tokenization_spaces=False,
             **kwargs,
         )
-        # Workaround: older transformers versions only read chat_template from tokenizer_config.json
-        # and do not search for chat_template.jinja files. Explicitly load it if present in model files.
-        try:
-            jinja_template_path = os.path.join(tokenizer_name, "chat_template.jinja")
-            if os.path.exists(jinja_template_path):
-                with open(jinja_template_path) as f:
-                    tokenizer.chat_template = f.read()
-        except Exception as e:
-            logger.debug("Failed to load chat_template.jinja: %s", e)
 
     except Exception as e:
         if tokenizer_backend == "fastokens":
@@ -458,9 +371,6 @@ def get_tokenizer(
             )
             raise RuntimeError(err_msg) from e
         raise e
-    finally:
-        if temp_dir_obj is not None:
-            temp_dir_obj.cleanup()
 
     if not isinstance(tokenizer, PreTrainedTokenizerFast):
         warnings.warn(
@@ -468,6 +378,7 @@ def get_tokenizer(
             stacklevel=2,
         )
 
+    _restore_checkpoint_tokenizer(tokenizer, tokenizer_name, revision, **kwargs)
     attach_additional_stop_token_ids(tokenizer)
     return tokenizer
 
@@ -515,6 +426,7 @@ def get_processor(
 
     tokenizer = get_tokenizer_from_processor(processor)
 
+    _restore_checkpoint_tokenizer(tokenizer, tokenizer_name, revision, **kwargs)
     attach_additional_stop_token_ids(tokenizer)
     return processor
 

@@ -211,15 +211,15 @@ class Glm4MoeDecoderLayer(nnx.Module):
     ):
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 1000000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = config.rope_parameters["rope_theta"]
+        rope_scaling = config.rope_parameters
         max_position_embeddings = getattr(config, "max_position_embeddings", 131072)
         self.head_dim = getattr(config, "head_dim", None) or (
             config.hidden_size // config.num_attention_heads
         )
         use_qk_norm = getattr(config, "use_qk_norm", True)
 
-        partial_rotary_factor = getattr(config, "partial_rotary_factor", 0.5)
+        partial_rotary_factor = rope_scaling.get("partial_rotary_factor", 0.5)
         rotary_dim = int(self.head_dim * partial_rotary_factor)
 
         self.self_attn = Glm4MoeAttention(
@@ -490,9 +490,14 @@ class Glm4MoeForCausalLM(nnx.Module):
                 config.hidden_size,
                 dtype=self.dtype,
                 param_dtype=self.dtype,
-                kernel_axes=("tensor", None),
+                mesh=mesh,
+                enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
             )
-        self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
+        self.logits_processor = LogitsProcessor(
+            config.vocab_size,
+            mesh=self.mesh,
+            enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
+        )
 
     def __call__(
         self,
@@ -535,9 +540,7 @@ class Glm4MoeForCausalLM(nnx.Module):
         }
 
         if not getattr(self.config, "tie_word_embeddings", False):
-            mappings["lm_head.weight"] = WeightMapping(
-                target_path="lm_head.embedding", sharding=("tensor", None), transpose=False
-            )
+            mappings["lm_head.weight"] = self.lm_head.weight_mapping("lm_head.embedding")
 
         num_layers = self.config.num_hidden_layers
         first_k_dense_replace = getattr(self.config, "first_k_dense_replace", 0)

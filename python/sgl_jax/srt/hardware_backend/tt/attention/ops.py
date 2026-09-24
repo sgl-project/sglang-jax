@@ -82,3 +82,53 @@ def annotate_weight_dtype(tensor, dtype):
         **{"ttcore.weight_dtype": dtype},
     )
     return jnp.reshape(tensor, original_shape)
+
+
+def _recurrent_call(name, state, output_shape, *operands):
+    return jax.ffi.ffi_call(
+        name,
+        (jax.ShapeDtypeStruct(state.shape, state.dtype), output_shape),
+        input_output_aliases={0: 0},
+        vmap_method="sequential",
+    )(state, *operands)
+
+
+def causal_conv1d_update(state, value, weight, indices, initial):
+    return _recurrent_call(
+        "tt.causal_conv1d_update",
+        state,
+        jax.ShapeDtypeStruct(value.shape, value.dtype),
+        value,
+        weight,
+        indices,
+        initial.astype(jnp.bfloat16),
+    )
+
+
+def gated_delta_decode(state, q, k, v, b, a, A_log, dt_bias, indices, initial):
+    return _recurrent_call(
+        "tt.gated_delta_decode",
+        state,
+        jax.ShapeDtypeStruct(v.shape, jnp.float32),
+        q,
+        k,
+        v,
+        b.astype(jnp.float32),
+        a.astype(jnp.float32),
+        A_log.astype(jnp.float32),
+        dt_bias.astype(jnp.float32),
+        indices,
+        initial.astype(jnp.bfloat16),
+    )
+
+
+def state_pool_update(state, indices, updates):
+    return _call("tt.state_pool_update", state, indices, updates, input_output_aliases={0: 0})
+
+
+def gated_delta_rule(q, k, v, gate, beta, state):
+    return jax.ffi.ffi_call(
+        "tt.gated_delta_rule",
+        (jax.ShapeDtypeStruct(state.shape, state.dtype), jax.ShapeDtypeStruct(v.shape, v.dtype)),
+        vmap_method="sequential",
+    )(q, k, v, gate, beta, state)

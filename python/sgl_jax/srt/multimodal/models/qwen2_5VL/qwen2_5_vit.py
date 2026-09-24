@@ -9,8 +9,8 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from jax.sharding import Mesh
-from transformers import modeling_flax_utils
 
+from sgl_jax.srt.layers.activation import ACT2FN
 from sgl_jax.srt.layers.embeddings import Embed
 from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
     QwenVLModelVitConfig,
@@ -191,7 +191,7 @@ class Qwen2_5_VisionMLP(nnx.Module):
     def __init__(self, config: QwenVLModelVitConfig, dtype: jnp.dtype, rngs: nnx.Rngs = None):
         in_features = config.hidden_size
         hidden_features = config.intermediate_size
-        act_fn = modeling_flax_utils.ACT2FN[config.hidden_act]
+        act_fn = ACT2FN[config.hidden_act]
 
         # Use dummy rngs if None (for eval_shape)
         _rngs = rngs or nnx.Rngs(0)
@@ -358,7 +358,7 @@ class Qwen2_5_VisionPatchMerger(nnx.Module):
             param_dtype=dtype,
             rngs=_rngs,
         )
-        self.mlp_act = modeling_flax_utils.ACT2FN["gelu"]
+        self.mlp_act = ACT2FN["gelu"]
         self.mlp_fc2 = nnx.Linear(
             self.hidden_size,
             d_model,
