@@ -1523,14 +1523,20 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
         self.shared_head.norm = RMSNorm(
             config.hidden_size, epsilon=config.rms_norm_eps, param_dtype=dtype, scope_name="norm"
         )
+        # Same call face as Glm5ForCausalLM: load_lm_head_from_target copies the
+        # target's lm_head array, so the DP lm-head layout must match on both sides.
+        enable_dp_lm_head = getattr(config, "enable_dp_lm_head", False)
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
             dtype=dtype,
             param_dtype=dtype,
-            kernel_axes=("tensor", None),
+            mesh=mesh,
+            enable_dp_lm_head=enable_dp_lm_head,
         )
-        self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
+        self.logits_processor = LogitsProcessor(
+            config.vocab_size, mesh=self.mesh, enable_dp_lm_head=enable_dp_lm_head
+        )
         self.hot_token_ids = None
 
     def __call__(
