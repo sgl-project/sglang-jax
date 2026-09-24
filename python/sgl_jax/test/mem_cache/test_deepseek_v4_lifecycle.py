@@ -10,6 +10,7 @@ from jax.sharding import Mesh
 
 from sgl_jax.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sgl_jax.srt.mem_cache.chunk_cache import DeepseekV4ChunkCache
+from sgl_jax.srt.mem_cache.common import reclaim_completed_v4_swa
 from sgl_jax.srt.mem_cache.deepseek_v4.allocator import DeepseekV4TokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.deepseek_v4.pool import (
     DeepseekV4CacheSpec,
@@ -138,20 +139,20 @@ class TestDeepseekV4Lifecycle(unittest.TestCase):
         self.assertTrue(np.all(np.isneginf(empty[score_slice(empty.shape)])))
         cache.release_req(replacement)
 
-    def test_reclaim_only_after_completed_forward_and_keep_history(self):
+    def test_reclaim_completed_boundary_and_keep_history(self):
         cache = make_cache()
         req = new_request(cache)
         locations = append(cache, req, 400)
         allocator = cache.token_to_kv_pool_allocator
         self.assertEqual(allocator.count_swa_mapped(locations), 400)
-        # R invokes this method only when the forward producing committed_len
+        # R invokes this helper only when the forward producing committed_len
         # has completed. The next query still needs its containing SWA page.
-        cache.reclaim_completed_swa(req)
+        reclaim_completed_v4_swa(req, cache)
         self.assertEqual(req.swa_evicted_seqlen, 256)
         self.assertEqual(allocator.count_swa_mapped(locations[:256]), 0)
         self.assertEqual(allocator.count_swa_mapped(locations[256:]), 144)
         self.assertEqual(allocator.full_available_size(), 2 * 128)
-        cache.reclaim_completed_swa(req)
+        reclaim_completed_v4_swa(req, cache)
         self.assertEqual(allocator.swa_available_size(), 4 * 128)
         cache.release_req(req)
         self.assertEqual(allocator.full_available_size(), 6 * 128)
@@ -162,11 +163,11 @@ class TestDeepseekV4Lifecycle(unittest.TestCase):
         req = new_request(cache)
         locations = append(cache, req, 400, committed=127)
         allocator = cache.token_to_kv_pool_allocator
-        cache.reclaim_completed_swa(req)
+        reclaim_completed_v4_swa(req, cache)
         self.assertEqual(req.swa_evicted_seqlen, 0)
         self.assertEqual(allocator.count_swa_mapped(locations), 400)
         req.kv_committed_len = 400
-        cache.reclaim_completed_swa(req)
+        reclaim_completed_v4_swa(req, cache)
         self.assertEqual(req.swa_evicted_seqlen, 256)
         self.assertEqual(allocator.count_swa_mapped(locations[256:]), 144)
         cache.release_req(req)

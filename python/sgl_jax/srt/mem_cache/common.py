@@ -2,7 +2,7 @@ import logging
 
 from sgl_jax.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
-from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
+from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache, DeepseekV4ChunkCache
 from sgl_jax.srt.utils.common_utils import cdiv
 
 logger = logging.getLogger(__name__)
@@ -153,3 +153,22 @@ def release_kv_cache(
         tree_cache.token_to_kv_pool_allocator.free(indices_to_free, dp_rank=dp_rank)
 
     tree_cache.req_to_token_pool.free(req)
+
+
+def reclaim_completed_v4_swa(req, tree_cache: BasePrefixCache) -> None:
+    """Reclaim only after every query in the submitted chunk has consumed KV."""
+    if not isinstance(tree_cache, DeepseekV4ChunkCache) or req.req_pool_idx is None:
+        return
+    # The next query is at committed_len and needs [L-W+1, L]. Keep the
+    # containing page (including a partial append page) for its next consumer.
+    end = max(0, req.kv_committed_len - tree_cache.sliding_window_size + 1)
+    end = end // tree_cache.page_size * tree_cache.page_size
+    if end <= req.swa_evicted_seqlen:
+        return
+    indices = tree_cache.req_to_token_pool.req_to_token[
+        req.req_pool_idx, req.swa_evicted_seqlen : end
+    ]
+    tree_cache.token_to_kv_pool_allocator.free_swa(
+        indices, dp_rank=req.dp_rank if req.dp_rank is not None else 0
+    )
+    req.swa_evicted_seqlen = end

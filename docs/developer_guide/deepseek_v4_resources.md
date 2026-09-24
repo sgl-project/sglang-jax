@@ -91,12 +91,17 @@ page with committed tokens, clears its mapping, and returns its request slot.
 Completion, cancellation, and retraction use this same release contract;
 retracted requests recompute from position zero.
 
-`reclaim_completed_swa(req)` may run only **after** the forward producing
-`req.kv_committed_len` has completed. For completed length `L` and window `W`,
-it releases whole SWA pages before `floor(max(0, L-W+1)/P) * P`, preserving the
-page needed by the next query. R supplies the execution-completion boundary
-and invokes this C interface at the safe point. Releasing SWA does not reset
-compressor state or release compressed history.
+`reclaim_completed_v4_swa(req, tree_cache)` in `mem_cache/common.py` follows the
+[epic lifecycle contract](https://github.com/primatrix/sglang-jax/blob/ce1ebb6375c5ed0fc5eec6aa360adb22c49ed32d/docs/developer_guide/deepseek_v4_lifecycle.md):
+R calls it from prefill/decode result processing only **after** the submitted
+forward completes. At that point `req.kv_committed_len` is the completed length
+`L`; for window `W`, the helper releases whole SWA pages before
+`floor(max(0, L-W+1)/P) * P`, preserving the page needed by the next query.
+Releasing SWA does not reset compressor state or release compressed history.
+The R port must retain the `DeepseekV4ChunkCache` early return in
+`ScheduleBatch.maybe_evict_swa`; its preparation-time `pre_len-W-P` path does
+not reclaim V4 pages or update V4's `req.swa_evicted_seqlen`. R owns the
+result-processing call sites and this scheduler guard.
 
 Releasing a request drops ownership, not the old device-state contents. On
 the next zero-prefix forward, B must initialize a new or recycled slot before
@@ -112,8 +117,25 @@ The KV pool implements the `KVCache` resource contract and exposes
 buffers and request-slot indices. Both owners are PyTrees. Operators receive
 arrays and metadata, not allocator objects.
 
-B prepares read/page tables, masks, positions, and write locations from C's
-address and ownership mappings. B packages semantic per-layer updates using
+B's `get_forward_metadata(...)` remains the single host entry point for
+building per-DP read/page tables, masks, positions, request slots, and write
+locations from C's address and ownership mappings. C supplies no second
+read-table builder. The epic backend packs per-rank metadata into one host
+int32 vector. It uploads the vector under mesh `data` sharding when lazy host
+arguments are disabled; with the default lazy host arguments, the vector
+enters the jit replicated and the HCA view is resharded to `data`.
+The native `c128` KV pool is handed to HCA kernels in its 4-D
+`[pages, 1, P/128, D]` layout; the optional flat view does not change the
+pool's physical layout. See the epic
+[read-table and write-ownership contract](https://github.com/primatrix/sglang-jax/blob/ce1ebb6375c5ed0fc5eec6aa360adb22c49ed32d/docs/developer_guide/deepseek_v4_resources.md#who-writes-pages-and-who-builds-read-tables)
+and [per-step metadata contract](https://github.com/primatrix/sglang-jax/blob/ce1ebb6375c5ed0fc5eec6aa360adb22c49ed32d/docs/developer_guide/deepseek_v4_resources.md#per-step-metadata-and-its-sharding).
+
+For the selected A/B paths in [#1693](https://github.com/sgl-project/sglang-jax/issues/1693),
+write ownership is all or nothing per family: the CSA compressor owns KV
+`c4`/`indexer` and state `c4`/`indexer`; `hca_step` owns KV `c128` and state
+`c128`; CSA joint attention or `hca_step` owns KV `swa` for its layer path.
+Each writer returns complete replacement arrays for its families, and B skips
+the corresponding backend writes. B packages semantic per-layer updates using
 `swa`, `compressed`, `indexer`, and `compressor`. Each pool's
 `build_buffer_updates` merges these into a complete family payload without
 mutating the owner and checks shape/dtype. R commits both complete owners via
