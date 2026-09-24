@@ -583,14 +583,32 @@ def prepad_replicated_quantized_linears(module: nnx.Module, multiple: int = 256)
     if os.environ.get("SGLANG_JAX_QMM_PREPAD_N", "1") == "0":
         return 0
     count = 0
-    for _, sub in module.iter_modules():
-        if isinstance(sub, QuantizedLinear) and sub.pad_out_rows(multiple):
+    padded: dict[str, int] = {}
+    skipped: dict[str, int] = {}
+    for path, sub in module.iter_modules():
+        if not isinstance(sub, QuantizedLinear):
+            continue
+        leaf = str(path[-1]) if path else type(sub).__name__
+        n_out = int(sub.weight_q.value.shape[0])
+        if sub.pad_out_rows(multiple):
             count += 1
-    if count:
+            padded[leaf] = padded.get(leaf, 0) + 1
+        elif n_out % multiple != 0 and sub.n_out_valid is None:
+            scale = sub.weight_scale.value
+            why = (
+                "sharded-N"
+                if sub.kernel_axes[1] is not None
+                else f"scale-ndim-{getattr(scale, 'ndim', -1)}"
+            )
+            key = f"{leaf}:{why}"
+            skipped[key] = skipped.get(key, 0) + 1
+    if count or skipped:
         logger.info(
             "Pre-padded %d replicated-N block-quant linears to a multiple of %d "
-            "output rows (removes per-step weight padding)",
+            "output rows (removes per-step weight padding): padded=%s skipped=%s",
             count,
             multiple,
+            dict(sorted(padded.items())),
+            dict(sorted(skipped.items())),
         )
     return count
