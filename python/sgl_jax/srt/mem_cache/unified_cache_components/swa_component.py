@@ -1,4 +1,4 @@
-"""Device-only sliding-window-attention component for ``UnifiedRadixCache``."""
+"""Sliding-window-attention device and host component for UnifiedRadixCache."""
 
 from __future__ import annotations
 
@@ -78,20 +78,45 @@ class SWAComponent(TreeComponent):
     def create_match_validator(
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
-        del match_device_only  # The first device-only implementation has no host tier.
         live_since_gap: float = float("inf")
         ct = self.component_type
 
         def validate(node: UnifiedTreeNode) -> bool:
             nonlocal live_since_gap
             value = node.component_data[ct].value
-            if value is None:
+            cd = node.component_data[ct]
+            if value is None and (match_device_only or cd.host_value is None):
                 live_since_gap = 0
                 return False
-            live_since_gap += len(value)
+            live_since_gap += len(node.key)
             return live_since_gap >= self.sliding_window_size
 
         return validate
+
+    def finalize_match_result(self, result, **kwargs):
+        if self.cache._hybrid_hicache:
+            result = result._replace(
+                swa_host_hit_length=self.cache.get_load_back_sizes(result.last_host_node)[1]
+            )
+        return result
+
+    def build_hicache_transfers(self, node, phase, *, device_indices=None, **kwargs):
+        # Both components use the same page descriptor, but tokens are raw
+        # indices into their own device pool; host handles stay pool-scoped.
+        from sgl_jax.srt.mem_cache.unified_cache_components.full_component import (
+            FullComponent,
+        )
+
+        return FullComponent.build_hicache_transfers(
+            self, node, phase, device_indices=device_indices, **kwargs
+        )
+
+    def commit_hicache_transfer(self, node, phase, transfers=(), **kwargs):
+        from sgl_jax.srt.mem_cache.unified_cache_components.full_component import (
+            FullComponent,
+        )
+
+        FullComponent.commit_hicache_transfer(self, node, phase, transfers=transfers, **kwargs)
 
     def refresh_lru(
         self,
@@ -173,6 +198,28 @@ class SWAComponent(TreeComponent):
         # The entire node lies in the request's already released SWA prefix.
         return prefix_len
 
+    def recover_after_unevict(
+        self,
+        node: UnifiedTreeNode,
+        prefix_len: int,
+        total_prefix_len: int,
+        params: InsertParams,
+    ) -> None:
+        """Adopt the still-live SWA suffix of recomputed FULL tombstones."""
+        if node.component_data[self.component_type].value is not None:
+            return
+        boundary = max(params.swa_evicted_seqlen, params.prev_prefix_len)
+        if boundary >= total_prefix_len + prefix_len:
+            return
+        if boundary > total_prefix_len:
+            split_at = boundary - total_prefix_len
+            assert split_at % self.cache.page_size == 0
+            # The original node becomes the suffix and already owns its fresh
+            # FULL indices. Do not heal by allocating/replacing them a second time.
+            self.cache._split_node(node.key, node, split_at)
+        self._set_swa_value(node)
+        self.cache._update_aux_evictable_node_sets(node)
+
     def should_skip_leaf_creation(
         self, total_prefix_len: int, key_len: int, params: InsertParams
     ) -> bool:
@@ -216,6 +263,19 @@ class SWAComponent(TreeComponent):
         parent_cd = new_parent.component_data[self.component_type]
         child_cd = child.component_data[self.component_type]
         parent_cd.lock_ref = child_cd.lock_ref
+        parent_cd.host_lock_ref = child_cd.host_lock_ref
+        # Only receipts acquired before this split inherit the new prefix.
+        # The lists are shared with IncLockRefResult/to_dec_params and Req;
+        # static split ancestry would incorrectly skip locks acquired later.
+        receipts = child_cd.metadata.get("skip_lock_receipts", {})
+        if receipts:
+            parent_cd.metadata["skip_lock_receipts"] = receipts.copy()
+            for skipped_ids in receipts.values():
+                skipped_ids.append(new_parent.id)
+        if child_cd.host_value is not None:
+            split_pages = len(new_parent.key) // self.cache.page_size
+            parent_cd.host_value = child_cd.host_value[:split_pages].copy()
+            child_cd.host_value = child_cd.host_value[split_pages:].copy()
         if "component_uuid" in child_cd.metadata:
             parent_cd.metadata["component_uuid"] = child_cd.metadata.pop("component_uuid")
         if child_cd.value is None:
@@ -238,6 +298,8 @@ class SWAComponent(TreeComponent):
     ) -> tuple[int, int]:
         if EvictLayer.DEVICE not in target:
             return 0, 0
+        if self.cache._hybrid_hicache and self.cache.write_policy == "write_back":
+            self.cache._hybrid_coordinator.backup_component(node, self.component_type)
         freed = self._clear_swa_value(node)
         self.cache._update_aux_evictable_node_sets(node)
         return freed, 0
@@ -280,10 +342,18 @@ class SWAComponent(TreeComponent):
         remaining = self.sliding_window_size
         current = node
         skips = result.skip_lock_node_ids.setdefault(ct, [])
+
+        def skip_fragment(fragment):
+            skips.append(fragment.id)
+            receipts = fragment.component_data[ct].metadata.setdefault("skip_lock_receipts", {})
+            receipts[id(skips)] = skips
+
         while current is not self.cache.root_node and remaining > 0:
             cd = current.component_data[ct]
             if cd.value is None:
-                skips.append(current.id)
+                skip_fragment(current)
+                if self.cache._hybrid_hicache:
+                    remaining -= len(current.key)
                 current = current.parent
                 continue
             dp_rank = _node_dp_rank(self.cache, current)
@@ -298,6 +368,12 @@ class SWAComponent(TreeComponent):
                 result.swa_uuid_for_lock = cd.metadata["component_uuid"]
                 return result
             current = current.parent
+        if self.cache._hybrid_hicache:
+            # A missing boundary has no component UUID. Preserve an exact
+            # receipt so release never visits live nodes above this window.
+            while current is not self.cache.root_node:
+                skip_fragment(current)
+                current = current.parent
         return result
 
     def release_component_lock(
@@ -309,21 +385,26 @@ class SWAComponent(TreeComponent):
         if lock_host:
             return
         ct = self.component_type
-        skip = set(params.skip_lock_node_ids.get(ct, ())) if params else set()
+        skipped_ids = params.skip_lock_node_ids.get(ct, ()) if params else ()
+        skip = set(skipped_ids)
         uuid = params.swa_uuid_for_lock if params else None
         current = node
         while current is not self.cache.root_node:
-            if current.id not in skip:
-                cd = current.component_data[ct]
-                if cd.value is not None:
-                    assert cd.lock_ref > 0
-                    dp_rank = _node_dp_rank(self.cache, current)
-                    if cd.lock_ref == 1:
-                        self.cache.component_evictable_size_[ct][dp_rank] += len(cd.value)
-                        self.cache.component_protected_size_[ct][dp_rank] -= len(cd.value)
-                    cd.lock_ref -= 1
-                    if uuid is not None and cd.metadata.get("component_uuid") == uuid:
-                        return
+            cd = current.component_data[ct]
+            receipts = cd.metadata.get("skip_lock_receipts")
+            if receipts is not None:
+                receipts.pop(id(skipped_ids), None)
+                if not receipts:
+                    cd.metadata.pop("skip_lock_receipts")
+            if current.id not in skip and cd.value is not None:
+                assert cd.lock_ref > 0
+                dp_rank = _node_dp_rank(self.cache, current)
+                if cd.lock_ref == 1:
+                    self.cache.component_evictable_size_[ct][dp_rank] += len(cd.value)
+                    self.cache.component_protected_size_[ct][dp_rank] -= len(cd.value)
+                cd.lock_ref -= 1
+                if uuid is not None and cd.metadata.get("component_uuid") == uuid:
+                    return
             current = current.parent
 
     def prepare_for_caching_req(

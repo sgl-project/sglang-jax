@@ -342,6 +342,46 @@ class TestUnifiedRadixTreeFlag(CustomTestCase):
         self.assertNotIsInstance(cache, UnifiedRadixCache)
         self.assertTrue(cache.disable)
 
+    def test_factory_unified_hybrid_accepts_l2_for_both_backends(self):
+        for backend in ("jax", "raiden"):
+            with self.subTest(backend=backend):
+                args = _make_server_args(enable_unified_radix_tree=True)
+                args.hicache_storage = "none"
+                args.hicache_transfer_backend = backend
+                req_pool, allocator = self._create_swa_pools()
+                ctx = self._build_ctx(
+                    args,
+                    req_pool,
+                    allocator,
+                    is_hybrid_swa=True,
+                    sliding_window_size=64,
+                )
+                cache = default_radix_cache_factory(ctx)
+                self.assertIsInstance(cache, UnifiedRadixCache)
+                self.assertEqual(cache.tree_components, (ComponentType.FULL, ComponentType.SWA))
+
+    def test_factory_hybrid_l2_rejects_unsupported_routes(self):
+        for override, message in (
+            ({"enable_unified_radix_tree": False}, "requires.*Unified"),
+            ({"nnodes": 2}, "single.host"),
+            ({"hicache_storage": "file"}, "L2"),
+        ):
+            with self.subTest(override=override):
+                args = _make_server_args(enable_unified_radix_tree=True)
+                args.hicache_storage = "none"
+                for name, value in override.items():
+                    setattr(args, name, value)
+                req_pool, allocator = self._create_swa_pools()
+                ctx = self._build_ctx(
+                    args,
+                    req_pool,
+                    allocator,
+                    is_hybrid_swa=True,
+                    sliding_window_size=64,
+                )
+                with self.assertRaisesRegex(ValueError, message):
+                    default_radix_cache_factory(ctx)
+
 
 if __name__ == "__main__":
     unittest.main()

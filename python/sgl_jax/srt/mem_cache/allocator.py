@@ -496,6 +496,108 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def get_kvcache(self):
         return self._kvcache
 
+    def _validate_restore_rank(self, dp_rank: int) -> None:
+        if not isinstance(dp_rank, (int, np.integer)) or not 0 <= dp_rank < self.dp_size:
+            raise ValueError(f"Invalid dp_rank={dp_rank}")
+
+    def _validate_restore_indices(
+        self, indices: np.ndarray, allocator, dp_rank: int, component: str
+    ) -> np.ndarray:
+        """Require complete, currently allocated rank-local pages or slots."""
+        indices = np.asarray(indices)
+        if indices.ndim != 1 or not np.issubdtype(indices.dtype, np.integer):
+            raise ValueError(f"{component} indices must be a one-dimensional integer array")
+        if self.page_size == 1:
+            if (
+                np.any(indices < 1)
+                or np.any(indices > allocator.size_per_rank)
+                or len(np.unique(indices)) != len(indices)
+                or np.intersect1d(indices, allocator.free_slots[dp_rank]).size
+            ):
+                raise ValueError(f"{component} indices must be distinct allocated slots")
+        else:
+            page_size = self.page_size
+            if len(indices) % page_size:
+                raise ValueError(f"{component} indices must contain complete pages")
+            pages = indices[::page_size] // page_size
+            expected = (pages[:, None] * page_size + np.arange(page_size)).reshape(-1)
+            if (
+                np.any(pages < 1)
+                or np.any(pages > allocator.pages_per_rank)
+                or len(np.unique(pages)) != len(pages)
+                or not np.array_equal(indices, expected)
+                or np.intersect1d(pages, allocator.free_pages[dp_rank]).size
+                or np.intersect1d(pages, allocator.release_pages[dp_rank]).size
+            ):
+                raise ValueError(f"{component} indices must be distinct allocated complete pages")
+        queued = (
+            self._free_group_full_seen[dp_rank]
+            if component == "FULL"
+            else self._free_group_swa_seen[dp_rank]
+        )
+        if any(int(index) in queued for index in indices):
+            raise ValueError(f"{component} indices are queued for release")
+        return indices.astype(np.int32, copy=False)
+
+    def alloc_full(self, need_size: int, dp_rank: int = 0) -> np.ndarray | None:
+        """Reserve complete FULL pages without allocating or mapping SWA pages."""
+        self._validate_restore_rank(dp_rank)
+        if need_size < 0 or need_size % self.page_size:
+            raise ValueError("FULL reservation size must be nonnegative and page-aligned")
+        return self.full_attn_allocator.alloc(need_size, dp_rank=dp_rank)
+
+    def alloc_swa(self, need_size: int, dp_rank: int = 0) -> np.ndarray | None:
+        """Reserve complete raw SWA pages without assigning FULL mappings."""
+        self._validate_restore_rank(dp_rank)
+        if need_size < 0 or need_size % self.page_size:
+            raise ValueError("SWA reservation size must be nonnegative and page-aligned")
+        return self.swa_attn_allocator.alloc(need_size, dp_rank=dp_rank)
+
+    def commit_swa_mapping(
+        self, full_indices: np.ndarray, swa_indices: np.ndarray, dp_rank: int = 0
+    ) -> None:
+        """Map reserved SWA pages to allocated FULL pages after all validation."""
+        self._validate_restore_rank(dp_rank)
+        full_indices = self._validate_restore_indices(
+            full_indices, self.full_attn_allocator, dp_rank, "FULL"
+        )
+        swa_indices = self._validate_restore_indices(
+            swa_indices, self.swa_attn_allocator, dp_rank, "SWA"
+        )
+        if full_indices.shape != swa_indices.shape:
+            raise ValueError("FULL and SWA mappings require equal shapes")
+        mapping = (
+            self.full_to_swa_index_mapping
+            if self.dp_size == 1
+            else self.full_to_swa_index_mapping[dp_rank]
+        )
+        if np.any(mapping[full_indices] != 0):
+            raise ValueError("FULL indices already have SWA mappings")
+        if np.intersect1d(swa_indices, mapping[mapping > 0]).size:
+            raise ValueError("SWA indices are already mapped")
+        mapping[full_indices] = swa_indices
+
+    def free_swa_indices(self, indices: np.ndarray, dp_rank: int = 0) -> None:
+        """Release uncommitted raw SWA indices; mapped SWA uses free_swa(FULL)."""
+        self._validate_restore_rank(dp_rank)
+        indices = self._validate_restore_indices(indices, self.swa_attn_allocator, dp_rank, "SWA")
+        mapping = (
+            self.full_to_swa_index_mapping
+            if self.dp_size == 1
+            else self.full_to_swa_index_mapping[dp_rank]
+        )
+        if np.intersect1d(indices, mapping[mapping > 0]).size:
+            raise ValueError("Mapped SWA indices must be released via free_swa(FULL indices)")
+        if self.is_not_in_free_group:
+            self.swa_attn_allocator.free(indices, dp_rank=dp_rank)
+        else:
+            self._queue_group_free(
+                indices,
+                dp_rank=dp_rank,
+                queues=self._free_group_swa,
+                seen=self._free_group_swa_seen,
+            )
+
     def alloc(self, need_size: int, dp_rank: int = 0):
         if need_size > self.full_attn_allocator.available_size(dp_rank=dp_rank):
             return None

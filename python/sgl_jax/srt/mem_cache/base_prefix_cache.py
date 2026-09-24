@@ -119,6 +119,8 @@ class MatchResult(NamedTuple):
     # Always None in the base path (clones the full match); branch truncation is
     # a follow-up.
     recurrent_branching_seqlen: int | None = None
+    # Actual missing SWA window-node tokens, not FULL prefix length.
+    swa_host_hit_length: int = 0
 
 
 class BasePrefixCache(abc.ABC):
