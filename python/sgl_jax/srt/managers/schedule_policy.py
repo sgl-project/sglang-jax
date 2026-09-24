@@ -706,8 +706,22 @@ class PrefillAdder:
                 with self._lock_node(req.last_host_node):
                     if total_tokens >= self.rem_total_tokens_for_dp(dp_rank):
                         return AddReqResult.NO_TOKEN
-                    if swa_needed >= self.rem_swa_tokens_for_dp(dp_rank):
+                    restore_fits = swa_needed < self.rem_swa_tokens_for_dp(dp_rank)
+                if not restore_fits:
+                    # The host candidate is optional. Release its temporary
+                    # locks before checking a full recompute (possibly one
+                    # chunk), so its resident pages are evictable again.
+                    if recompute_total_tokens >= self.rem_total_tokens_for_dp(
+                        dp_rank
+                    ) or self._swa_budget_for_req(
+                        req.extend_input_len, dp_rank
+                    ) >= self.rem_swa_tokens_for_dp(
+                        dp_rank
+                    ):
                         return AddReqResult.NO_TOKEN
+                    req.host_hit_length = req.swa_host_hit_length = 0
+                    req.last_host_node = req.last_node
+                    hybrid_restore = False
 
             # HiCache: after budget gate, pull host-only prefix back to device.
             # Must happen after NO_TOKEN check so rejected reqs never trigger H2D.

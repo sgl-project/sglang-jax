@@ -343,3 +343,102 @@ def test_mixed_swa_window_admission_reaches_real_allocation(
         if req is not None and req.cache_lock_params is not None:
             cache.dec_lock_ref(req.last_node, req.cache_lock_params)
         shutdown(cache)
+
+
+@pytest.mark.parametrize("backend", ["jax", "raiden"])
+@pytest.mark.parametrize("page", [1, 128])
+@pytest.mark.parametrize("swa_pages,admitted", [(25, True), (18, False)])
+def test_locked_swa_shortage_recomputes_a_chunk_without_retry_stall(
+    backend, page, swa_pages, admitted
+):
+    from sgl_jax.srt.mem_cache.common import (
+        alloc_paged_token_slots_extend,
+        alloc_token_slots,
+    )
+    from sgl_jax.srt.sampling.sampling_params import SamplingParams
+    from sgl_jax.test.mem_cache.test_hybrid_hicache import (
+        insert,
+        make_cache,
+        settle,
+        shutdown,
+    )
+
+    cache, allocator, _ = make_cache(
+        page=page, window=8 * page, full_pages=100, swa_pages=swa_pages, backend=backend
+    )
+    req = None
+    allocated = None
+    try:
+        full, node = insert(cache, allocator, range(8 * page))
+        settle(cache)
+        parent = cache._split_node(node.key, node, 4 * page)
+        cache.components[CT.SWA].evict_component(parent)
+        cache._update_aux_evictable_node_sets(parent)
+        before = (allocator.full_available_size(), allocator.swa_available_size())
+        mapping_before = allocator.full_to_swa_index_mapping.copy()
+        host_before = [pool.available_size() for pool in cache.host_pools.values()]
+        req = Req(
+            "mixed-swa-recompute",
+            "",
+            list(range(28 * page)),
+            SamplingParams(max_new_tokens=1),
+            dp_rank=0,
+        )
+        # Re-matching the same idle candidate on another scheduling round must
+        # still make progress through recompute, rather than retry NO_TOKEN.
+        for _ in range(2):
+            req.init_next_round_input(cache)
+            assert req.host_hit_length == 8 * page and len(req.prefix_indices) == 0
+            adder = PrefillAdder(
+                page_size=page,
+                tree_cache=cache,
+                token_to_kv_pool_allocator=allocator,
+                running_batch=None,
+                new_token_ratio=1,
+                rem_input_tokens=100 * page,
+                rem_chunk_tokens=16 * page,
+            )
+            result = adder.add_one_req(req)
+            if admitted:
+                assert result is AddReqResult.CONTINUE
+                assert adder.can_run_list[0] == [req]
+                assert req.host_hit_length == req.swa_host_hit_length == 0
+                assert req.last_host_node is req.last_node is cache.root_node
+                assert len(req.prefix_indices) == 0
+                assert req.extend_input_len == len(req.fill_ids) == 16 * page
+                assert cache.full_protected_size() == cache.swa_protected_size() == 0
+                if page == 1:
+                    allocated = alloc_token_slots(cache, req.extend_input_len, dp_rank=0)
+                else:
+                    allocated = alloc_paged_token_slots_extend(
+                        cache, [0], [len(req.fill_ids)], [-1], req.extend_input_len, dp_rank=0
+                    )
+                assert len(allocated) == len(np.unique(allocated)) == 16 * page
+                assert not np.intersect1d(full, allocated).size
+                assert allocator.count_swa_mapped(allocated, dp_rank=0) == 16 * page
+                assert adder.rem_swa_token_offset == [18 * page]
+                allocator.free(allocated, dp_rank=0)
+                allocated = None
+                cache.dec_lock_ref(req.last_node, req.cache_lock_params)
+                req.cache_lock_params = None
+            else:
+                assert result is AddReqResult.NO_TOKEN
+                assert not adder.can_run_list[0]
+                assert req.cache_lock_params is None
+                assert req.host_hit_length == 8 * page
+                assert adder.rem_swa_token_offset == adder.rem_total_token_offset == [0]
+            assert not adder.pending_h2d
+            assert parent.component_data[CT.SWA].value is None
+            assert before == (allocator.full_available_size(), allocator.swa_available_size())
+            assert host_before == [pool.available_size() for pool in cache.host_pools.values()]
+            np.testing.assert_array_equal(allocator.full_to_swa_index_mapping, mapping_before)
+            for fragment in (parent, node):
+                for cd in fragment.component_data:
+                    assert cd.lock_ref == cd.host_lock_ref == 0
+                    assert "skip_lock_receipts" not in cd.metadata
+    finally:
+        if allocated is not None:
+            allocator.free(allocated, dp_rank=0)
+        if req is not None and req.cache_lock_params is not None:
+            cache.dec_lock_ref(req.last_node, req.cache_lock_params)
+        shutdown(cache)

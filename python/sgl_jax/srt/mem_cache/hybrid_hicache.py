@@ -25,6 +25,9 @@ class HybridHiCache:
         self.cache = cache
         # Pending host reservations are not published in ComponentData.
         self.pending = {}
+        # A transfer without recoverable transaction ownership requires process
+        # restart, even if its untracked worker eventually finishes.
+        self._quarantined = False
 
     def path(self, node):
         nodes = []
@@ -153,6 +156,8 @@ class HybridHiCache:
             if not getattr(pool, "failed", False) and not controller.has_inflight(handles):
                 pool.free(handles)
                 self.cache.dec_lock_ref(node, lock.to_dec_params())
+            else:
+                self._quarantined = True
             raise
         self.cache.dec_lock_ref(node, lock.to_dec_params())
         return len(handles)
@@ -358,6 +363,8 @@ class HybridHiCache:
             stopped = cache._direct_hicache or not any(
                 cache.hicache_controllers[ct].has_inflight(handles) for ct, _, handles in pins
             )
+            if not healthy or not stopped:
+                self._quarantined = True
             if healthy:
                 if not cache._direct_hicache:
                     # Discard only finished staging for this transaction. One
@@ -403,6 +410,10 @@ class HybridHiCache:
                     raise cleanup_errors[0]
 
     def reset(self):
+        if self._quarantined or any(
+            getattr(pool, "failed", False) for pool in self.cache.host_pools.values()
+        ):
+            raise RuntimeError("Hybrid HiCache memory is quarantined until process exit")
         self.settle(wait=True)
         for controller in self.cache.hicache_controllers.values():
             controller.drain_pending()
