@@ -106,6 +106,11 @@ _SPEC_INDEXER_QB = int(os.environ.get("DSA_SPEC_INDEXER_QB", "16"))
 # A/B knob (opt-in): decode-form verify tokens of one request share the last token's page list
 # (see sparse_mla_page_level page_share_group). Default 1 = per-token pages.
 _SPEC_VERIFY_PAGE_SHARE = int(os.environ.get("DSA_SPEC_VERIFY_PAGE_SHARE", "1") or "1")
+# Opt-in: decode-form verify runs each request's draft tokens as ONE ragged
+# sequence (G query rows over the shared page list) instead of G one-query
+# pseudo-sequences -- the request's KV is read once (see sparse_mla_page_level
+# group_queries). Implies the page-share page set. Default OFF.
+_SPEC_VERIFY_QGROUP = os.environ.get("DSA_SPEC_VERIFY_QGROUP", "0") == "1"
 
 
 @register_pytree_node_class
@@ -538,6 +543,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         dpa,
         md,
         page_share_group: int = 1,
+        group_queries: bool = False,
     ):
         has_pages = topk_pages is not None
         if not has_pages:
@@ -589,6 +595,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 k_pages_max=k_pages_max,
                 vmem_limit_bytes=self.vmem_limit_bytes,
                 page_share_group=page_share_group,
+                group_queries=group_queries,
             )
 
         return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(
@@ -860,6 +867,14 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             topk_pages_use = topk_pages
         if topk_use is None:
             topk_use = _placeholder_topk_like(topk_pages_use)
+        is_verify = forward_batch.forward_mode.is_target_verify()
+        page_share_group = _SPEC_VERIFY_PAGE_SHARE if is_verify else 1
+        group_queries = False
+        if is_verify and _SPEC_VERIFY_QGROUP:
+            dtn = getattr(getattr(forward_batch, "spec_info", None), "draft_token_num", None)
+            if dtn and dtn > 1 and num_tokens % int(dtn) == 0:
+                page_share_group = int(dtn)
+                group_queries = True
         o, kv_cache = self._run_sparse(
             q,
             q_rope,
@@ -871,9 +886,8 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             sm_scale,
             dpa,
             pmd,
-            page_share_group=(
-                _SPEC_VERIFY_PAGE_SHARE if forward_batch.forward_mode.is_target_verify() else 1
-            ),
+            page_share_group=page_share_group,
+            group_queries=group_queries,
         )
         return o, DSAFusedCache(
             kv=kv_cache,
