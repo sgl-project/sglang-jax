@@ -28,7 +28,7 @@ from sgl_jax.srt.layers.attention.dsa_sparse_backend import _spec_token_slots
 from sgl_jax.srt.layers.attention.mla_backend import MLAAttentionBackend
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.speculative.draft_extend_fused import (
-    _make_draft_extend_metadata,
+    _pack_draft_extend_metadata,
     _shift_draft_extend_metadata,
 )
 
@@ -88,13 +88,17 @@ class ChainAllSlotContractTest(unittest.TestCase):
                     )
                 ).reshape(bs, N)
 
-            md0 = _make_draft_extend_metadata(md_orig, base, alloc, page_size=PS, dp_size=1)
+            md_pack = _pack_draft_extend_metadata(
+                md_orig, base, alloc, STEPS, page_size=PS, dp_size=1
+            )
+            seq0, md0 = _shift_draft_extend_metadata(md_pack, base, 0)
+            np.testing.assert_array_equal(np.asarray(seq0), base_np)
             loc0 = slots(md0)
             self.assertTrue((loc0 >= 0).all(), loc0)
             for i in range(1, STEPS):
-                seq_i, md_i = _shift_draft_extend_metadata(
-                    md_orig, base, alloc, i, page_size=PS, dp_size=1
-                )
+                seq_i, md_i = _shift_draft_extend_metadata(md_pack, base, i)
+                # shared packing: the page table is the same object for every step
+                self.assertIs(md_i.page_indices, md_pack.page_indices)
                 np.testing.assert_array_equal(np.asarray(seq_i), base_np + i)
                 loc_i = slots(md_i)
                 self.assertTrue((loc_i >= 0).all(), (i, loc_i))
@@ -110,9 +114,10 @@ class ChainAllSlotContractTest(unittest.TestCase):
                     self.assertTrue((page_of < np.sum((alloc_np + PS - 1) // PS)).all())
             # padding request (seq_len 0) stays 0 / dropped
             base_pad = jax.device_put(jnp.asarray(np.array([base_np[0], 0], np.int32)), data)
-            seq_p, md_p = _shift_draft_extend_metadata(
-                md_orig, base_pad, alloc, 2, page_size=PS, dp_size=1
+            md_pack_p = _pack_draft_extend_metadata(
+                md_orig, base_pad, alloc, STEPS, page_size=PS, dp_size=1
             )
+            seq_p, md_p = _shift_draft_extend_metadata(md_pack_p, base_pad, 2)
             self.assertEqual(int(np.asarray(seq_p)[1]), 0)
             self.assertTrue((slots(md_p)[1] == -1).all())
 

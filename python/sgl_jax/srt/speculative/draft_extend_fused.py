@@ -182,17 +182,34 @@ def chain_all_headroom_ok(allocate_lens, verify_seq_lens, num_steps: int) -> boo
     return bool(np.all(alloc[live] >= vsl[live] + 2 * num_steps - 1))
 
 
-def _shift_draft_extend_metadata(
-    md_orig, base_seq_lens, allocate_lens, step, *, page_size, dp_size
+_DRAFT_MD_FIELDS = ("cu_q_lens", "cu_kv_lens", "page_indices", "seq_lens", "distribution")
+
+
+def _pack_draft_extend_metadata(
+    md_orig, base_seq_lens, allocate_lens, num_steps, *, page_size, dp_size
 ):
-    """Draft-extend metadata for chained step ``step``: every sequence length
-    (and with it the window slots and the kv span) advanced by ``step``, so the
-    rotated window lands one slot further per step. Padding sequences stay 0."""
-    seq_lens = jnp.where(base_seq_lens > 0, base_seq_lens + step, 0).astype(base_seq_lens.dtype)
-    md = _make_draft_extend_metadata(
-        md_orig, seq_lens, allocate_lens, page_size=page_size, dp_size=dp_size
+    """Draft-extend metadata whose page table already covers the last chained
+    step (base + num_steps - 1) for every live sequence. Built once per
+    draft-extend call; the per-step variants only swap ``seq_lens`` (see
+    _shift_draft_extend_metadata), so no page-table repack runs per step."""
+    span = jnp.where(base_seq_lens > 0, base_seq_lens + (num_steps - 1), 0).astype(
+        base_seq_lens.dtype
     )
-    return seq_lens, md
+    return _make_draft_extend_metadata(
+        md_orig, span, allocate_lens, page_size=page_size, dp_size=dp_size
+    )
+
+
+def _shift_draft_extend_metadata(md_pack, base_seq_lens, step):
+    """Metadata of chained step ``step`` on the shared packing: sequence lengths
+    (window slots and kv span) advanced by ``step``; padding sequences stay 0."""
+    seq_lens = jnp.where(base_seq_lens > 0, base_seq_lens + step, 0).astype(base_seq_lens.dtype)
+    kwargs = {f: getattr(md_pack, f) for f in _DRAFT_MD_FIELDS}
+    kwargs["seq_lens"] = seq_lens
+    for f in ("swa_page_indices", "custom_mask"):
+        if hasattr(md_pack, f):
+            kwargs[f] = getattr(md_pack, f)
+    return seq_lens, type(md_pack)(**kwargs)
 
 
 def _chain_pool_enabled(num_pools: int, relay_on: bool) -> bool:
@@ -964,6 +981,18 @@ def _build_draft_extend(
         )
         base_seq_lens = forward_batch.seq_lens
         md_base = forward_batch.attn_backend.forward_metadata
+        if chain_all:
+            # one page table for all steps (covers base + num_layers - 1), step 0 included
+            md_pack = _pack_draft_extend_metadata(
+                md_orig,
+                base_seq_lens,
+                draft_allocate_lens,
+                num_layers,
+                page_size=forward_batch.attn_backend.page_size,
+                dp_size=dp_size,
+            )
+            _, md_base = _shift_draft_extend_metadata(md_pack, base_seq_lens, 0)
+            forward_batch.attn_backend.forward_metadata = md_base
         chain_check_report = None
         for i in range(num_layers):
             leaf_idx = i if i < len(all_leaves) else -1
@@ -977,14 +1006,7 @@ def _build_draft_extend(
                 forward_batch.positions = positions0 + i
             if chain_all and i > 0:
                 forward_batch.seq_lens, forward_batch.attn_backend.forward_metadata = (
-                    _shift_draft_extend_metadata(
-                        md_orig,
-                        base_seq_lens,
-                        draft_allocate_lens,
-                        i,
-                        page_size=forward_batch.attn_backend.page_size,
-                        dp_size=dp_size,
-                    )
+                    _shift_draft_extend_metadata(md_pack, base_seq_lens, i)
                 )
             forward_batch.spec_kvshare_readonly = bool(_KVSHARE and i >= 1)
 
