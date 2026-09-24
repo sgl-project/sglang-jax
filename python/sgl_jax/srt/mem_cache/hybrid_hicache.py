@@ -238,18 +238,18 @@ class HybridHiCache:
                         n.component_data[ct].host_lock_ref += 1
                     pins.append((ct, nodes, handles))
             lock = cache.inc_lock_ref(node)
-            if cache._direct_hicache:
-                if cache._donation_barrier is not None:
-                    cache._donation_barrier()
-                cache.evict(
-                    EvictParams(
-                        num_tokens=max(0, sizes[CT.FULL] - allocator.full_available_size(rank)),
-                        swa_num_tokens=max(0, sizes[CT.SWA] - allocator.swa_available_size(rank)),
-                        dp_rank=rank,
-                    )
+            # Protect host sources and the resident window before reclaiming
+            # other cache entries. JAX write-back gathers must also wait until
+            # the prior forward has replaced its donated device buffers.
+            if cache._donation_barrier is not None:
+                cache._donation_barrier()
+            cache.evict(
+                EvictParams(
+                    num_tokens=max(0, sizes[CT.FULL] - allocator.full_available_size(rank)),
+                    swa_num_tokens=max(0, sizes[CT.SWA] - allocator.swa_available_size(rank)),
+                    dp_rank=rank,
                 )
-            # JAX restores only into free slots; it never initiates eviction
-            # while a prior forward may still own donated device buffers.
+            )
             for ct, allocate in ((CT.FULL, allocator.alloc_full), (CT.SWA, allocator.alloc_swa)):
                 if sizes[ct]:
                     reserved[ct] = allocate(sizes[ct], dp_rank=rank)

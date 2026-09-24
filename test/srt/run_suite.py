@@ -484,6 +484,12 @@ suites = {
             runner="pytest",
             env={"JAX_PLATFORMS": "cpu", "XLA_FLAGS": "--xla_force_host_platform_device_count=4"},
         ),
+        TestFile(
+            "test/manual/test_hybrid_hicache_tools.py",
+            0.1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "XLA_FLAGS": "--xla_force_host_platform_device_count=4"},
+        ),
         TestFile("python/sgl_jax/test/test_kv_cache_builder.py", 0.1, runner="pytest"),
         TestFile("test/srt/test_dp_schedule_policy.py", 0.2, runner="pytest"),
         TestFile("test/srt/test_dp_schedule_shape_aware.py", 0.2, runner="pytest"),
