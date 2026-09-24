@@ -57,7 +57,10 @@ _RELAY_POS = os.environ.get("SGLANG_JAX_MTP_RELAY_POS", "1") != "0"
 # window slots follow seq_lens, not the shifted positions, so step 1 overwrote
 # step 0's KV; gsm8k acceptance fell 3.34 -> 3.21. Do not do that.)
 # SGLANG_JAX_MTP_CHAIN_POOL=0 restores three separate versions.
-_CHAIN_POOL_MODE = os.environ.get("SGLANG_JAX_MTP_CHAIN_POOL", "1")
+# Default "all" (measured on GLM-5.2 tp16, v7x: draft-extend 1.90 -> 1.22 ms at
+# batch 1, gsm8k acceptance unchanged 3.34); "1" = keep step 0's version and one
+# shared scratch version (one copy); "0" = one version per step (two copies).
+_CHAIN_POOL_MODE = os.environ.get("SGLANG_JAX_MTP_CHAIN_POOL", "all")
 _CHAIN_POOL = _CHAIN_POOL_MODE != "0"
 # "all": additionally shift the draft-extend metadata by the step index, so
 # step j >= 1 writes its rotated window into the slots of the SAME tokens /
