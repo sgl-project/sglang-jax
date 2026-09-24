@@ -57,7 +57,15 @@ _RELAY_POS = os.environ.get("SGLANG_JAX_MTP_RELAY_POS", "1") != "0"
 # window slots follow seq_lens, not the shifted positions, so step 1 overwrote
 # step 0's KV; gsm8k acceptance fell 3.34 -> 3.21. Do not do that.)
 # SGLANG_JAX_MTP_CHAIN_POOL=0 restores three separate versions.
-_CHAIN_POOL = os.environ.get("SGLANG_JAX_MTP_CHAIN_POOL", "1") != "0"
+_CHAIN_POOL_MODE = os.environ.get("SGLANG_JAX_MTP_CHAIN_POOL", "1")
+_CHAIN_POOL = _CHAIN_POOL_MODE != "0"
+# "all": additionally shift the draft-extend metadata by the step index, so
+# step j >= 1 writes its rotated window into the slots of the SAME tokens /
+# positions step 0 wrote (idempotent) and its new draft token into the next
+# free slot; one pool version is then threaded through all steps (no copy).
+# Needs the relay + position shift and allocation slack of num_steps - 1 slots
+# past the step-0 window (overlap scheduling keeps >= 2 * ALLOC_LEN_PER_DECODE).
+_CHAIN_ALL = _CHAIN_POOL_MODE == "all"
 
 
 # Debug assertion: copy step 0's pool version and, after the later steps ran on
@@ -125,7 +133,7 @@ def log_chain_pool_check(report, pool_updates):
         )
 
 
-def _chain_pool_report(v0, vN, md, num_tokens, page_size, like):
+def _chain_pool_report(v0, vN, md, num_tokens, page_size, like, ext_lens=None):
     """CHECK report inside the fused JIT: step-0 window slots (auto-sharded
     lookup, replicated result) + per-leaf slot diffs between two pool versions.
     Returns arrays only."""
@@ -141,7 +149,31 @@ def _chain_pool_report(v0, vN, md, num_tokens, page_size, like):
 
     loc0_fn = _loc0 if rep is None else jax.sharding.auto_axes(_loc0, out_sharding=rep)
     loc0 = loc0_fn(md.seq_lens, md.cu_q_lens, md.cu_kv_lens, md.page_indices)
+    if ext_lens is not None:
+        # window row k of request r is a verified token iff k < ext_lens[r]; only
+        # those slots must be untouched by the later steps
+        bs = ext_lens.shape[0]
+        n = num_tokens // bs
+
+        def _valid(ext):
+            return (jnp.arange(n)[None, :] < ext[:, None]).reshape(-1)
+
+        valid_fn = _valid if rep is None else jax.sharding.auto_axes(_valid, out_sharding=rep)
+        loc0 = jnp.where(valid_fn(ext_lens), loc0, -1)
     return _chain_pool_diff_arrays(v0, vN, loc0, rep_sharding=rep)
+
+
+def _shift_draft_extend_metadata(
+    md_orig, base_seq_lens, allocate_lens, step, *, page_size, dp_size
+):
+    """Draft-extend metadata for chained step ``step``: every sequence length
+    (and with it the window slots and the kv span) advanced by ``step``, so the
+    rotated window lands one slot further per step. Padding sequences stay 0."""
+    seq_lens = jnp.where(base_seq_lens > 0, base_seq_lens + step, 0).astype(base_seq_lens.dtype)
+    md = _make_draft_extend_metadata(
+        md_orig, seq_lens, allocate_lens, page_size=page_size, dp_size=dp_size
+    )
+    return seq_lens, md
 
 
 def _chain_pool_enabled(num_pools: int, relay_on: bool) -> bool:
@@ -874,7 +906,9 @@ def _build_draft_extend(
         mesh = None
         seed_topk_pages = None
         input_ids = forward_batch.input_ids
+        md_orig = None
         if draft_verify_seq_lens is not None:
+            md_orig = forward_batch.attn_backend.forward_metadata
             valid_draft_slots = draft_verify_seq_lens > 0
             forward_batch.seq_lens = jnp.where(
                 valid_draft_slots,
@@ -893,6 +927,16 @@ def _build_draft_extend(
         positions0 = forward_batch.positions
         relay_on = _chained_relay(hidden_relay, num_layers, len(all_leaves))
         chain_pool = _chain_pool_enabled(len(all_memory_pools), relay_on)
+        chain_all = bool(
+            _CHAIN_ALL
+            and chain_pool
+            and relay_on
+            and _RELAY_POS
+            and draft_verify_seq_lens is not None
+            and md_orig is not None
+        )
+        base_seq_lens = forward_batch.seq_lens
+        md_base = forward_batch.attn_backend.forward_metadata
         chain_check_report = None
         for i in range(num_layers):
             leaf_idx = i if i < len(all_leaves) else -1
@@ -904,6 +948,17 @@ def _build_draft_extend(
             forward_batch.input_ids = input_ids
             if relay_on and _RELAY_POS and i > 0:
                 forward_batch.positions = positions0 + i
+            if chain_all and i > 0:
+                forward_batch.seq_lens, forward_batch.attn_backend.forward_metadata = (
+                    _shift_draft_extend_metadata(
+                        md_orig,
+                        base_seq_lens,
+                        draft_allocate_lens,
+                        i,
+                        page_size=forward_batch.attn_backend.page_size,
+                        dp_size=dp_size,
+                    )
+                )
             forward_batch.spec_kvshare_readonly = bool(_KVSHARE and i >= 1)
 
             if index_share:
@@ -923,7 +978,26 @@ def _build_draft_extend(
                 output, pool_updates, _, _ = model(
                     forward_batch, all_memory_pools[pool_idx], logits_metadata
                 )
-            if chain_pool:
+            if chain_all:
+                # one version through all steps (slots shifted per step, see _CHAIN_ALL)
+                if _CHAIN_POOL_CHECK and i == 0:
+                    check_v0 = jax.tree_util.tree_map(lambda x: x + 0, pool_updates)
+                all_memory_pools[pool_idx].replace_all(pool_updates)
+                if i == num_layers - 1:
+                    all_pool_updates.append(pool_updates)
+                    if _CHAIN_POOL_CHECK:
+                        # assertion data vs step 0: differing slots must all lie at or
+                        # past each request's first non-verified slot (valid rows unchanged)
+                        chain_check_report = _chain_pool_report(
+                            check_v0,
+                            pool_updates,
+                            md_base,
+                            input_ids.shape[0],
+                            forward_batch.attn_backend.page_size,
+                            input_ids,
+                            ext_lens=forward_batch.extend_seq_lens,
+                        )
+            elif chain_pool:
                 # step 0's version is the one the caller keeps; steps >= 1 share
                 # one scratch version (step 2 continues on step 1's), see _CHAIN_POOL
                 if i == 0:
@@ -938,7 +1012,7 @@ def _build_draft_extend(
                         chain_check_report = _chain_pool_report(
                             check_v0,
                             all_pool_updates[0],
-                            forward_batch.attn_backend.forward_metadata,
+                            md_base,
                             input_ids.shape[0],
                             forward_batch.attn_backend.page_size,
                             input_ids,
@@ -966,6 +1040,9 @@ def _build_draft_extend(
 
         forward_batch.spec_kvshare_readonly = False
         forward_batch.positions = positions0
+        if chain_all:
+            forward_batch.seq_lens = base_seq_lens
+            forward_batch.attn_backend.forward_metadata = md_base
         last_idx = draft_logits_indices
         if logits_metadata.accept_lens is not None:
             last_idx = last_idx - (forward_batch.extend_seq_lens - logits_metadata.accept_lens)
