@@ -18,6 +18,13 @@ from sgl_jax.srt.configs.quantization_config import (
 
 logger = logging.getLogger(__name__)
 
+INT4_DTYPES = tuple(getattr(jnp, t) for t in ("int4", "uint4", "float4_e2m1fn") if hasattr(jnp, t))
+
+
+def is_int4_dtype(dtype) -> bool:
+    """Return True if dtype is a 4-bit integer or float type."""
+    return dtype in INT4_DTYPES
+
 
 def apply_quantization(model_config, model, *, is_static_input=False):
     """Prepare static checkpoint structure or quantize loaded weights, MoE first."""
@@ -33,6 +40,17 @@ def apply_quantization(model_config, model, *, is_static_input=False):
 def _array_sharding(tensor):
     # Tracers carry explicit sharding on their aval, not on the array object.
     return getattr(tensor, "sharding", None) or jax.typeof(tensor).sharding
+
+
+def is_linear_quantization_ignored(path: str, ignored_layers: list[str] | None) -> bool:
+    """Match linear paths using the model walker's exact/suffix semantics."""
+    dot_path = path.replace("/", ".")
+    dot_path = re.sub(r"\.(\d+)\.", r"[\1].", dot_path)
+    for ignored in ignored_layers or []:
+        ignored = re.sub(r"\.(\d+)\.", r"[\1].", ignored)
+        if dot_path == ignored or dot_path.endswith(f".{ignored}"):
+            return True
+    return False
 
 
 def _get_block_reshape_sharding(
@@ -157,13 +175,6 @@ def apply_linear_quantization(
 
     ignored_layers = quant_config.ignored_layers or []
 
-    # Normalize ignored layer patterns: convert HF dot-index (layers.0.) to
-    # bracket-index (layers[0].) since the model walk uses bracket notation.
-    normalized_ignored = []
-    for ig in ignored_layers:
-        normalized_ignored.append(re.sub(r"\.(\d+)\.", r"[\1].", ig))
-    ignored_layers = normalized_ignored
-
     def _find_matching_rule(path: str):
         """Find the first rule that matches the given module path."""
         for rule in compiled_rules:
@@ -189,10 +200,7 @@ def apply_linear_quantization(
                 if isinstance(attr_value, LinearBase):
                     # Check if this path matches any rule
                     dot_path = child_path.replace("/", ".")
-                    if any(
-                        dot_path == ignored or dot_path.endswith(f".{ignored}")
-                        for ignored in ignored_layers
-                    ):
+                    if is_linear_quantization_ignored(child_path, ignored_layers):
                         logger.info("Skipping %s - in ignored_layers", dot_path)
                         continue
 
@@ -289,6 +297,10 @@ def apply_moe_quantization(
                 logger.info("Skipping MoE quantization for %s (matched ignored_layers)", log_path)
                 return
             logger.debug("Quantizing MoE weights path=%s", log_path)
+            if hasattr(obj, "quantized_dtype") and obj.quantized_dtype is None:
+                obj.quantized_dtype = quant_config.get_moe_weight_dtype()
+                obj.activation_quantized_dtype = quant_config.get_moe_activation_dtype()
+                obj.weight_block_size = getattr(quant_config, "weight_block_size", None)
             obj.quantize_weights(
                 is_static=is_static_input,
                 abstract=getattr(model_config, "_abstract_mode", False),

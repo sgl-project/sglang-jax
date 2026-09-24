@@ -9,6 +9,7 @@ reusing existing modules: RadixAttention, GateLogit, TopK, EPMoE/FusedEPMoE.
 """
 
 import logging
+import re
 
 import jax
 import numpy as np
@@ -38,6 +39,10 @@ from sgl_jax.srt.layers.moe import (
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.utils.quantization.quantization_utils import (
+    is_int4_dtype,
+    is_linear_quantization_ignored,
+)
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
@@ -818,6 +823,8 @@ class DeepseekV3ForCausalLM(nnx.Module):
         moe_backend = getattr(self.config, "moe_backend", "epmoe")
         use_fused = moe_backend == "fused"
 
+        quant_config = getattr(model_config, "quantization_config", None)
+
         for layer_idx in range(self.config.num_hidden_layers):
             is_moe = (
                 n_routed_experts is not None
@@ -825,7 +832,12 @@ class DeepseekV3ForCausalLM(nnx.Module):
                 and layer_idx % moe_layer_freq == 0
             )
             layer_mappings = self._create_layer_mappings(
-                layer_idx, is_moe, moe_backend, use_fused, is_static_quant
+                layer_idx,
+                is_moe,
+                moe_backend,
+                use_fused,
+                is_static_quant,
+                quant_config=quant_config,
             )
             mappings.update(layer_mappings)
 
@@ -838,10 +850,23 @@ class DeepseekV3ForCausalLM(nnx.Module):
         moe_backend: str,
         use_fused: bool,
         is_static_quant: bool = False,
+        quant_config=None,
     ) -> dict:
         prefix = f"{self.hf_weight_prefix}model.layers.{layer_idx}"
         target = f"model.layers.{layer_idx}"
         mappings: dict = {}
+
+        ignored_layers = getattr(quant_config, "ignored_layers", None) or []
+
+        def _is_linear_quantized(subpath: str) -> bool:
+            if not is_static_quant:
+                return False
+            if is_linear_quantization_ignored(subpath, ignored_layers):
+                return False
+            linear_rules = quant_config.get_linear_rules() if quant_config else []
+            # Use the same slash/bracket path as apply_linear_quantization.
+            walker_path = re.sub(r"\.(\d+)\.", r"[\1].", subpath).replace(".", "/")
+            return any(re.match(rule["module_path"], walker_path) for rule in linear_rules)
 
         def add_linear(hf_prefix: str, target_prefix: str, sharding_std: tuple):
             # HF weights are `[out, in]`.
@@ -850,7 +875,7 @@ class DeepseekV3ForCausalLM(nnx.Module):
             #   Static FP8: loaded into QuantizedLinear.weight_q `[out, in]`
             #   directly; sharding is kernel_axes swapped. Also register the
             #   `weight_scale_inv` sidecar into `weight_scale`.
-            if not is_static_quant:
+            if not _is_linear_quantized(target_prefix):
                 mappings[f"{hf_prefix}.weight"] = WeightMapping(
                     target_path=f"{target_prefix}.weight",
                     sharding=sharding_std,
@@ -921,7 +946,7 @@ class DeepseekV3ForCausalLM(nnx.Module):
                 add_linear(f"{prefix}.mlp.{proj}", f"{target}.mlp.{proj}", sharding)
             return mappings
 
-        # MoE gate (router) — NOT quantized in HF FP8 checkpoint.
+        # MoE Gate
         mappings[f"{prefix}.mlp.gate.weight"] = WeightMapping(
             target_path=f"{target}.moe_gate.kernel",
             sharding=(None, None),
@@ -943,6 +968,14 @@ class DeepseekV3ForCausalLM(nnx.Module):
             physical_to_logical_map = np.array(jax.device_get(metadata.physical_to_logical_map))
             phy_to_log = physical_to_logical_map[layer_idx]
 
+        is_static_int4_moe = is_static_quant and is_int4_dtype(
+            getattr(quant_config, "moe_weight_dtype", None)
+        )
+        if is_static_int4_moe and moe_backend != "epmoe":
+            raise ValueError("Static INT4 checkpoints require moe_backend='epmoe'.")
+        weight_suffix = "weight_packed" if is_static_int4_moe else "weight"
+        scale_suffix = ".weight_scale" if is_static_int4_moe else ".weight_scale_inv"
+
         moe_mappings = create_moe_weights_mapping(
             prefix=prefix,
             target_prefix=target,
@@ -950,10 +983,11 @@ class DeepseekV3ForCausalLM(nnx.Module):
             expert_type_names=("gate_proj", "up_proj", "down_proj"),
             moe_backend=moe_backend,
             physical_to_logical_map=phy_to_log,
+            weight_suffix=weight_suffix,
         )
         mappings.update(moe_mappings)
 
-        # Routed expert weight-scale sidecars (static FP8, non-fused only).
+        # Routed expert weight-scale sidecars (static FP8 / INT4, non-fused only).
         # Fused MoE static-FP8 placeholder shapes are (1,) today — loading
         # block scales would need a dedicated fix in fused_moe.py. Skip.
         #
@@ -970,17 +1004,25 @@ class DeepseekV3ForCausalLM(nnx.Module):
                     continue
                 target_base = wm.target_path[0]
                 expert_scale_keys = [
-                    k.replace(".weight", ".weight_scale_inv") for k in wm.target_path[1:]
+                    k.replace(f".{weight_suffix}", scale_suffix) for k in wm.target_path[1:]
                 ]
                 scale_target = f"{target_base}_scale"
-                # Stacked checkpoint scale is `[E, out_blocks, in_blocks]`. Load
-                # replicated on the block dims; _maybe_convert_epmoe_scale_for_kernel
-                # expands via jnp.take, which fails if the gathered axis is
-                # tensor-sharded (ambiguous output sharding). The converter reshards
-                # to model_param.value.sharding at the end.
+                # Stacked checkpoint scale is `[E, out_blocks, in_blocks]`.
+                # For FP8 checkpoints, load replicated on the block dims so
+                # _maybe_convert_epmoe_scale_for_kernel's jnp.take avoids
+                # ambiguous sharding errors. For static INT4 checkpoints,
+                # shard directly along the partitioned dimension.
+                if is_static_int4_moe:
+                    scale_sharding = (
+                        ("expert", None, "tensor")
+                        if "wo" in target_base
+                        else ("expert", "tensor", None)
+                    )
+                else:
+                    scale_sharding = ("expert", None, None)
                 mappings[f"__MOE_EXPERTS__{scale_target}"] = WeightMapping(
                     target_path=[scale_target] + expert_scale_keys,
-                    sharding=("expert", None, None),
+                    sharding=scale_sharding,
                     transpose=False,
                     physical_to_logical_map=wm.physical_to_logical_map,
                 )

@@ -505,10 +505,27 @@ class ModelRunnerKVCacheMixin:
             token_capacity = min(token_capacity, max_total_tokens)
 
         # Page alignment
-        token_capacity = token_capacity // self.server_args.page_size * self.server_args.page_size
+        token_capacity = (token_capacity // self.server_args.page_size) * self.server_args.page_size
 
         # DP scale
         token_capacity = token_capacity * dp_size
+
+        # Data mesh sharding alignment on total allocated pages (including dp_size reserved pages)
+        if hasattr(self, "mesh") and self.mesh is not None and "data" in self.mesh.shape:
+            data_mesh_dim = self.mesh.shape["data"]
+            if data_mesh_dim > 1:
+                usable_pages = token_capacity // self.server_args.page_size
+                allocated_pages = usable_pages + dp_size
+                step = math.lcm(dp_size, data_mesh_dim)
+                allocated_pages = (allocated_pages // step) * step
+                usable_pages = allocated_pages - dp_size
+                if usable_pages <= 0:
+                    raise RuntimeError(
+                        "Not enough KV cache capacity to align allocated pages "
+                        f"to data={data_mesh_dim} with dp_size={dp_size} reserved pages."
+                    )
+                token_capacity = usable_pages * self.server_args.page_size
+
         logger.info(
             "ModelRunner per dp max_total_num_tokens after dp_size %s: %s",
             dp_size,
