@@ -592,20 +592,22 @@ class Req:
             self.to_finish = None
             return
 
+        # An accepted block may cross both EOS and the length limit.
+        new_accepted_tokens = self.output_ids[-new_accepted_len:]
+        if (
+            self._check_token_based_finish(new_accepted_tokens=new_accepted_tokens)
+            and self.finished_len < self.sampling_params.max_new_tokens
+        ):
+            return
+
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
             self.finished_reason = FINISH_LENGTH(length=self.sampling_params.max_new_tokens)
+            self.finished_len = self.sampling_params.max_new_tokens
             return
 
         # Check grammar termination
         if self.grammar is not None and self.grammar.is_terminated():
             self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
-            return
-
-        new_accepted_tokens = self.output_ids[-new_accepted_len:]
-        # if hasattr(last_token_id, "item"):
-        #     last_token_id = last_token_id.item()
-        # last_token_id = int(last_token_id)
-        if self._check_token_based_finish(new_accepted_tokens=new_accepted_tokens):
             return
 
         if self._check_vocab_boundary_finish(new_accepted_tokens):

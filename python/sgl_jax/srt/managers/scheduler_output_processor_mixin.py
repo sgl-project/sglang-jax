@@ -872,7 +872,9 @@ class SchedulerOutputProcessorMixin:
 
             if should_output:
                 send_token_offset = req.send_token_offset
-                send_output_token_logprobs_offset = req.send_output_token_logprobs_offset
+                output_logprob_slice = slice(
+                    req.send_output_token_logprobs_offset, req.finished_len
+                )
                 if isinstance(req.rid, list):
                     # if rid is a list, extend the list to rids
                     rids.extend(req.rid)
@@ -925,28 +927,28 @@ class SchedulerOutputProcessorMixin:
 
                     if req.return_logprob or req.return_output_logprob_only:
                         output_token_logprobs_val.append(
-                            req.output_token_logprobs_val[send_output_token_logprobs_offset:]
+                            req.output_token_logprobs_val[output_logprob_slice]
                         )
                         output_token_logprobs_idx.append(
-                            req.output_token_logprobs_idx[send_output_token_logprobs_offset:]
+                            req.output_token_logprobs_idx[output_logprob_slice]
                         )
                         output_top_logprobs_val.append(
-                            req.output_top_logprobs_val[send_output_token_logprobs_offset:]
+                            req.output_top_logprobs_val[output_logprob_slice]
                             if req.return_logprob
                             else []
                         )
                         output_top_logprobs_idx.append(
-                            req.output_top_logprobs_idx[send_output_token_logprobs_offset:]
+                            req.output_top_logprobs_idx[output_logprob_slice]
                             if req.return_logprob
                             else []
                         )
                         output_token_ids_logprobs_val.append(
-                            req.output_token_ids_logprobs_val[send_output_token_logprobs_offset:]
+                            req.output_token_ids_logprobs_val[output_logprob_slice]
                             if req.return_logprob
                             else []
                         )
                         output_token_ids_logprobs_idx.append(
-                            req.output_token_ids_logprobs_idx[send_output_token_logprobs_offset:]
+                            req.output_token_ids_logprobs_idx[output_logprob_slice]
                             if req.return_logprob
                             else []
                         )
@@ -966,9 +968,7 @@ class SchedulerOutputProcessorMixin:
                         (output_token_logprobs_idx, req.output_token_logprobs_idx),
                     ):
                         target.append(
-                            values[send_output_token_logprobs_offset:]
-                            if req.return_output_logprob_only
-                            else []
+                            values[output_logprob_slice] if req.return_output_logprob_only else []
                         )
                     if req.return_output_logprob_only:
                         req.send_output_token_logprobs_offset = len(req.output_token_logprobs_val)
