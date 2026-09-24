@@ -136,6 +136,12 @@ class ChainAllHeadroomGuardTest(unittest.TestCase):
         # padding request's allocation is ignored
         self.assertTrue(chain_all_headroom_ok(np.array([649, 308, 0], np.int32), vsl, 3))
         self.assertTrue(chain_all_headroom_ok(np.zeros(3, np.int32), np.zeros(3, np.int32), 3))
+        # device arrays are refused: the guard sits on the draft dispatch path and
+        # must never force a device-to-host sync (measured +1.5 ms per cycle)
+        with self.assertRaises(TypeError):
+            chain_all_headroom_ok(jnp.asarray(vsl + 8), vsl, 3)
+        with self.assertRaises(TypeError):
+            chain_all_headroom_ok(vsl + 8, jnp.asarray(vsl), 3)
 
 
 if __name__ == "__main__":
