@@ -7,7 +7,6 @@ finishes at the donation barrier before the scheduler builds SWA request indices
 
 from __future__ import annotations
 
-from contextlib import suppress
 from dataclasses import replace
 
 import numpy as np
@@ -151,7 +150,7 @@ class HybridHiCache:
                 cd.metadata["host_pending"] = True
                 self.pending[future] = (node, ct, transfer)
         except Exception:
-            if not getattr(pool, "failed", False):
+            if not getattr(pool, "failed", False) and not controller.has_inflight(handles):
                 pool.free(handles)
                 self.cache.dec_lock_ref(node, lock.to_dec_params())
             raise
@@ -224,6 +223,7 @@ class HybridHiCache:
         operations = []
         lock = None
         committed = False
+        original_error = None
         try:
             for ct, nodes in selected.items():
                 handles = [int(h) for n in nodes for h in n.component_data[ct].host_value]
@@ -332,46 +332,75 @@ class HybridHiCache:
                 node,
                 [],
             )
+        except BaseException as exc:
+            original_error = exc
+            raise
         finally:
             # Submission/validation can fail after an earlier component was
             # submitted. Await every submitted operation before deciding whether
             # its destinations can return to the allocator.
-            cleanup_error = None
+            cleanup_errors = []
             if cache._direct_hicache:
                 for operation in operations:
                     try:
                         operation.wait()
                     except Exception as exc:
-                        cleanup_error = cleanup_error or exc
+                        cleanup_errors.append(exc)
+            else:
+                for controller in cache.hicache_controllers.values():
+                    try:
+                        controller.drain_loads()
+                    except Exception as exc:
+                        cleanup_errors.append(exc)
             healthy = not any(getattr(pool, "failed", False) for pool in cache.host_pools.values())
+            # A submit exception need not mean the worker was never queued. No
+            # returned Future means draining alone cannot establish completion.
+            stopped = cache._direct_hicache or not any(
+                cache.hicache_controllers[ct].has_inflight(handles) for ct, _, handles in pins
+            )
             if healthy:
-                # Drain even when submission failed partway, before releasing
-                # destinations that an earlier stage may still be writing.
                 if not cache._direct_hicache:
-                    for controller in cache.hicache_controllers.values():
-                        # Preserve the original stage/flush exception.
-                        with suppress(Exception):
-                            controller.drain_loads()
-                    # A failed scatter can leave completed staging arrays in
-                    # the host pool. Drop only this transaction's sources after
-                    # every worker has stopped publishing; keep the L2 data.
+                    # Discard only finished staging for this transaction. One
+                    # discard error must not skip another component's cleanup.
                     for _, ct, transfer in transfers:
-                        cache.hicache_controllers[ct].discard_load(transfer.host_handles)
-                if not committed:
-                    for ct, indices in reserved.items():
-                        if indices is not None:
-                            free = (
-                                allocator.free_full if ct == CT.FULL else allocator.free_swa_indices
-                            )
-                            free(indices, dp_rank=rank)
-                if lock is not None:
-                    cache.dec_lock_ref(node, lock.to_dec_params())
-                for ct, nodes, handles in pins:
-                    cache.host_pools[ct].unpin(handles)
-                    for n in nodes:
-                        n.component_data[ct].host_lock_ref -= 1
-            if cleanup_error is not None:
-                raise cleanup_error
+                        controller = cache.hicache_controllers[ct]
+                        if not controller.has_inflight(transfer.host_handles):
+                            try:
+                                controller.discard_load(transfer.host_handles)
+                            except Exception as exc:
+                                cleanup_errors.append(exc)
+                if stopped:
+                    if not committed:
+                        for ct, indices in reserved.items():
+                            if indices is not None:
+                                free = (
+                                    allocator.free_full
+                                    if ct == CT.FULL
+                                    else allocator.free_swa_indices
+                                )
+                                try:
+                                    free(indices, dp_rank=rank)
+                                except Exception as exc:
+                                    cleanup_errors.append(exc)
+                    if lock is not None:
+                        try:
+                            cache.dec_lock_ref(node, lock.to_dec_params())
+                        except Exception as exc:
+                            cleanup_errors.append(exc)
+                    for ct, nodes, handles in pins:
+                        try:
+                            cache.host_pools[ct].unpin(handles)
+                        except Exception as exc:
+                            cleanup_errors.append(exc)
+                        else:
+                            for n in nodes:
+                                n.component_data[ct].host_lock_ref -= 1
+            if cleanup_errors:
+                if original_error is not None:
+                    for exc in cleanup_errors:
+                        original_error.add_note(f"HiCache restore cleanup also failed: {exc!r}")
+                else:
+                    raise cleanup_errors[0]
 
     def reset(self):
         self.settle(wait=True)

@@ -220,3 +220,126 @@ def test_swa_only_admission_preserves_resident_full_pages(
         if resident_lock is not None:
             cache.dec_lock_ref(node, resident_lock.to_dec_params())
         shutdown(cache)
+
+
+@pytest.mark.parametrize("backend", ["jax", "raiden"])
+@pytest.mark.parametrize("page", [1, 128])
+@pytest.mark.parametrize(
+    "swa_pages,chunk_pages,admitted", [(25, None, False), (29, None, True), (27, 16, True)]
+)
+def test_mixed_swa_window_admission_reaches_real_allocation(
+    backend, page, swa_pages, chunk_pages, admitted
+):
+    from sgl_jax.srt.mem_cache.common import (
+        alloc_paged_token_slots_extend,
+        alloc_token_slots,
+    )
+    from sgl_jax.srt.sampling.sampling_params import SamplingParams
+    from sgl_jax.test.mem_cache.test_hybrid_hicache import (
+        insert,
+        make_cache,
+        settle,
+        shutdown,
+    )
+
+    cache, allocator, _ = make_cache(
+        page=page, window=8 * page, full_pages=100, swa_pages=swa_pages, backend=backend
+    )
+    req = None
+    allocated = None
+    try:
+        full, node = insert(cache, allocator, range(8 * page))
+        settle(cache)
+        parent = cache._split_node(node.key, node, 4 * page)
+        cache.components[CT.SWA].evict_component(parent)
+        cache._update_aux_evictable_node_sets(parent)
+        req = Req(
+            "mixed-swa", "", list(range(28 * page)), SamplingParams(max_new_tokens=1), dp_rank=0
+        )
+        req.init_next_round_input(cache)
+        assert len(req.prefix_indices) == 0
+        assert req.host_hit_length == 8 * page
+        assert cache.get_load_back_sizes(req.last_host_node) == (0, 4 * page)
+        assert cache.swa_evictable_size() == 4 * page
+        mapping_before = allocator.full_to_swa_index_mapping.copy()
+        capacity_before = (allocator.full_available_size(), allocator.swa_available_size())
+        host_before = [pool.available_size() for pool in cache.host_pools.values()]
+        adder = PrefillAdder(
+            page_size=page,
+            tree_cache=cache,
+            token_to_kv_pool_allocator=allocator,
+            running_batch=None,
+            new_token_ratio=1,
+            # An accepted request may exhaust the input budget and return OTHER.
+            rem_input_tokens=100,
+            rem_chunk_tokens=None if chunk_pages is None else chunk_pages * page,
+        )
+        result = adder.add_one_req(req)
+        remaining_swa = adder.rem_swa_tokens_for_dp(0)
+        if adder.can_run_list[0]:
+            # Exercise the same allocator entrypoint as prepare_for_extend.
+            # A return-code-only assertion missed the original post-admission OOM.
+            if page > 1:
+                allocated = alloc_paged_token_slots_extend(
+                    cache,
+                    [len(req.prefix_indices)],
+                    [len(req.fill_ids)],
+                    [int(req.prefix_indices[-1])],
+                    req.extend_input_len,
+                    dp_rank=0,
+                )
+            else:
+                allocated = alloc_token_slots(cache, req.extend_input_len, dp_rank=0)
+
+        if not admitted:
+            assert result is AddReqResult.NO_TOKEN
+            assert not adder.can_run_list[0] and allocated is None
+            assert not adder.pending_h2d
+            assert req.cache_lock_params is None
+            assert adder.rem_swa_token_offset == adder.rem_total_token_offset == [0]
+            assert capacity_before == (
+                allocator.full_available_size(),
+                allocator.swa_available_size(),
+            )
+            assert host_before == [pool.available_size() for pool in cache.host_pools.values()]
+            np.testing.assert_array_equal(allocator.full_to_swa_index_mapping, mapping_before)
+            assert parent.component_data[CT.SWA].value is None
+            assert len(req.prefix_indices) == 0 and req.host_hit_length == 8 * page
+            assert cache.full_evictable_size() == 8 * page
+            assert cache.swa_evictable_size() == 4 * page
+            assert cache.full_protected_size() == cache.swa_protected_size() == 0
+            for fragment in (parent, node):
+                for cd in fragment.component_data:
+                    assert cd.lock_ref == cd.host_lock_ref == 0
+                    assert "skip_lock_receipts" not in cd.metadata
+            return
+
+        assert adder.can_run_list[0] == [req]
+        expected_extend = (20 if chunk_pages is None else chunk_pages) * page
+        assert len(allocated) == req.extend_input_len == expected_extend
+        assert len(np.unique(allocated)) == len(allocated)
+        assert not np.intersect1d(full, allocated).size
+        np.testing.assert_array_equal(req.prefix_indices, full)
+        assert cache.swa_protected_size() == 8 * page
+        # The admitted prefix and actual new allocation coexist in the SWA pool.
+        mapping = allocator.translate_full_to_swa(np.concatenate([full, allocated]), dp_rank=0)
+        assert len(np.unique(mapping)) == len(mapping)
+        assert allocator.swa_available_size() == (swa_pages - 8) * page - expected_extend
+        expected_budget = max(expected_extend, adder._swa_decode_peak_tokens())
+        assert adder.rem_swa_token_offset == [expected_budget]
+        assert remaining_swa == (swa_pages - 8) * page - expected_budget
+        assert remaining_swa > 0
+        allocator.free(allocated, dp_rank=0)
+        allocated = None
+        cache.dec_lock_ref(req.last_node, req.cache_lock_params)
+        req.cache_lock_params = None
+        assert cache.full_protected_size() == cache.swa_protected_size() == 0
+        assert allocator.full_available_size() + cache.full_evictable_size() == allocator.size_full
+        assert allocator.swa_available_size() + cache.swa_evictable_size() == allocator.size_swa
+        assert np.count_nonzero(allocator.full_to_swa_index_mapping) == 8 * page
+    finally:
+        if allocated is not None:
+            allocator.free(allocated, dp_rank=0)
+        if req is not None and req.cache_lock_params is not None:
+            cache.dec_lock_ref(req.last_node, req.cache_lock_params)
+        shutdown(cache)

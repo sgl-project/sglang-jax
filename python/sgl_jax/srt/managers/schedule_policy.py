@@ -707,10 +707,12 @@ class PrefillAdder:
                         return AddReqResult.DP_BUDGET_EXHAUSTED
 
             if hybrid_restore:
-                # Resident FULL pages in the host candidate will become request-
-                # protected. They cannot also fund the restore/extend budget.
+                # Resident FULL/SWA in the candidate will become request-protected;
+                # neither component can also fund restore/extend allocations.
                 with self._lock_node(req.last_host_node):
                     if total_tokens >= self.rem_total_tokens_for_dp(dp_rank):
+                        return AddReqResult.NO_TOKEN
+                    if swa_needed >= self.rem_swa_tokens_for_dp(dp_rank):
                         return AddReqResult.NO_TOKEN
 
             # HiCache: after budget gate, pull host-only prefix back to device.
