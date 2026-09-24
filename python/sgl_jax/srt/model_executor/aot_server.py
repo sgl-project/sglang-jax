@@ -6,10 +6,15 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import jax
+import numpy as np
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.eplb.expert_location import set_global_server_args
-from sgl_jax.srt.model_executor.aot_inputs import AbstractModel, build_mesh
+from sgl_jax.srt.model_executor.aot_inputs import (
+    AbstractModel,
+    AbstractSampler,
+    build_mesh,
+)
 from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.utils.jax_utils import compilation_target
@@ -87,7 +92,7 @@ def export_server(server_args):
     )
     mesh = build_mesh(options)
     output.mkdir(parents=True, exist_ok=True)
-    manifest = {"status": "running", "buckets": []}
+    manifest = {"status": "running", "buckets": [], "sampling": []}
     manifest_path = output / "serving.json"
     try:
         with compilation_target(mesh), jax.set_mesh(mesh):
@@ -130,6 +135,8 @@ def export_server(server_args):
                 max_running_requests=max_running,
                 max_req_len=max_req_len,
             )
+            sampler_options = getattr(resources.attn_backend, "sampler_compiler_options", None)
+            sampler = AbstractSampler(mesh, server_args.random_seed, sampler_options)
             for mode, workload in ((ForwardMode.EXTEND, "prefill"), (ForwardMode.DECODE, "decode")):
                 for bs, tokens, cache_loc in manager.iter_model_shapes(mode):
                     options.workload = workload
@@ -146,9 +153,15 @@ def export_server(server_args):
                     directory = output / f"{workload}-bs{bs}-tokens{tokens}"
                     directory.mkdir()
                     logger.info("[aot-model] compiling %s", directory.name)
-                    CompilationManager.get_executable(
-                        fn.lower(*args), mesh, compiler_options, output=directory
+                    lowered = fn.lower(*args)
+                    compiled = CompilationManager.get_executable(
+                        lowered, mesh, compiler_options, output=directory
                     )
+                    if mode.is_decode():
+                        logits = _abstract_outputs(lowered, compiled)[0]
+                        _export_sampling(
+                            sampler, logits, manager, mesh, sampler_options, output, manifest
+                        )
                     manifest["buckets"].append(
                         {
                             "workload": workload,
@@ -170,3 +183,42 @@ def export_server(server_args):
         ),
         flush=True,
     )
+
+
+def _abstract_outputs(lowered, compiled):
+    return jax.tree.map(
+        lambda value, sharding: jax.ShapeDtypeStruct(value.shape, value.dtype, sharding=sharding),
+        lowered.out_info,
+        compiled.output_shardings,
+    )
+
+
+def _export_sampling(sampler, logits, manager, mesh, compiler_options, output, manifest):
+    from sgl_jax.srt.layers.sampler import jitted_compute_logprobs
+
+    bs = logits.next_token_logits.shape[0]
+    batch = manager._make_dummy_batch(bs, bs, ForwardMode.DECODE, bs)
+    # ModelRunner.sample runs outside the explicit model mesh. Match that
+    # context; input arrays still carry their concrete TPU shardings.
+    with jax.set_mesh(None):
+        for seeded in (False, True):
+            batch.sampling_info.sampling_seeds = np.zeros(bs, dtype=np.int32) if seeded else None
+            fn, args = sampler.build_inputs(logits, batch)
+            directory = output / f"sampler-bs{bs}-{'seeded' if seeded else 'unseeded'}"
+            directory.mkdir()
+            logger.info("[aot-model] compiling %s", directory.name)
+            lowered = fn.lower(*args)
+            compiled = CompilationManager.get_executable(
+                lowered, mesh, compiler_options, output=directory
+            )
+            manifest["sampling"].append({"batch_size": bs, "directory": directory.name})
+            if not seeded:
+                (next_tokens, logprobs, _), _ = _abstract_outputs(lowered, compiled)
+                directory = output / f"compute-logprobs-bs{bs}"
+                directory.mkdir()
+                CompilationManager.get_executable(
+                    jitted_compute_logprobs.lower(mesh, logprobs, next_tokens),
+                    mesh,
+                    output=directory,
+                )
+                manifest["sampling"].append({"batch_size": bs, "directory": directory.name})

@@ -1554,11 +1554,11 @@ class ServerArgs:
         )
         parser.add_argument(
             "--aot-model-dir",
-            help="Directory of trusted offline model executables; fail if a workload has no matching artifact",
+            help="Directory of trusted offline model and sampling executables; fail on missing artifacts",
         )
         parser.add_argument(
             "--save-aot",
-            help="Compile serving's model buckets on CPU, save executables to this directory, and exit",
+            help="Compile serving's model and sampling buckets on CPU, save executables, and exit",
         )
         from sgl_jax.compile import add_topology_args
 

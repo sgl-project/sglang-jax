@@ -5,8 +5,9 @@ import tempfile
 from pathlib import Path
 
 import jax
+import numpy as np
 from flax import nnx
-from jax.sharding import NamedSharding
+from jax.sharding import NamedSharding, PartitionSpec
 from transformers import PretrainedConfig
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
@@ -203,3 +204,39 @@ def build_inputs(options, mesh):
         target_config = load_config(options, empty_checkpoint) if is_draft else None
         model = AbstractModel(model_config, options, mesh, target_config=target_config)
     return model.build_inputs(options)
+
+
+class AbstractSampler:
+    """Use serving metadata and model output layouts for offline sampling."""
+
+    def __init__(self, mesh, random_seed, compiler_options=None):
+        from sgl_jax.srt.layers.sampler import Sampler, make_jitted_sampler
+
+        with jax.set_mesh(mesh):
+            sampler = nnx.eval_shape(lambda: Sampler(nnx.Rngs(random_seed), mesh=mesh))
+        self.sampler_def, state = nnx.split(sampler)
+        leaves, self.state_def = jax.tree_util.tree_flatten(state)
+        self.leaves = [_bind_concrete_sharding(value, mesh) for value in leaves]
+        self.mesh = mesh
+        self.step = jax.ShapeDtypeStruct(
+            (), np.int32, sharding=NamedSharding(mesh, PartitionSpec())
+        )
+        # PRNGKey is a small closed-over constant, exactly as in ModelRunner.
+        # Construct it on the host, outside the compile-only device mesh.
+        with jax.set_mesh(None):
+            self.fn = make_jitted_sampler(jax.random.PRNGKey(random_seed), compiler_options)
+
+    def build_inputs(self, logits, batch):
+        from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
+
+        metadata = SamplingMetadata.from_model_worker_batch(
+            batch, 0, self.mesh, logits.next_token_logits.shape[-1], abstract=True
+        )
+        return self.fn, (
+            self.sampler_def,
+            self.state_def,
+            self.leaves,
+            self.step,
+            logits,
+            metadata,
+        )

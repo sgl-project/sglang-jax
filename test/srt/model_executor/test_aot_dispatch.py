@@ -51,6 +51,104 @@ class TestAotDispatcher(unittest.TestCase):
             self.assertEqual(result.dtype, expected.dtype)
             np.testing.assert_array_equal(np.asarray(result), np.asarray(expected))
 
+    def test_saved_sampler_and_logprobs_without_compiling(self):
+        from flax import nnx
+
+        from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
+        from sgl_jax.srt.layers.sampler import (
+            Sampler,
+            jitted_compute_logprobs,
+            make_jitted_sampler,
+        )
+        from sgl_jax.srt.model_executor.aot_executable import ExecutableStore
+        from sgl_jax.srt.model_executor.aot_inputs import AbstractSampler
+        from sgl_jax.srt.model_executor.aot_server import _export_sampling
+        from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
+        from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+        from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
+        from sgl_jax.srt.utils.mesh_utils import create_device_mesh
+
+        mesh = create_device_mesh([1, 1], [1, 1], devices=jax.devices()[:1])
+        manager = object.__new__(CompilationManager)
+        manager.vocab_size = 128
+        manager.enable_static_lora = False
+        manager.capture_hidden_states = False
+        manager.has_recurrent_state = False
+        manager.supports_recurrent_cow = False
+        manager.supports_recurrent_track = False
+        batch = manager._make_dummy_batch(4, 4, ForwardMode.DECODE, 4)
+        logits = LogitsProcessorOutput(
+            jax.device_put(
+                np.random.default_rng(7).normal(size=(4, 128)).astype(np.float32),
+                jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data", "tensor")),
+            )
+        )
+        graph, state = nnx.split(Sampler(nnx.Rngs(42), mesh=mesh))
+        leaves, state_def = jax.tree_util.tree_flatten(state)
+        fn = make_jitted_sampler(jax.random.PRNGKey(42))
+        stable = (graph, state_def, leaves)
+        step = jax.device_put(
+            np.int32(0), jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = {"sampling": []}
+            _export_sampling(
+                AbstractSampler(mesh, 42),
+                jax.tree.map(
+                    lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding), logits
+                ),
+                manager,
+                mesh,
+                None,
+                Path(directory),
+                manifest,
+            )
+            self.assertEqual(len(manifest["sampling"]), 3)
+            store = ExecutableStore(directory, mesh)
+            cases = []
+            for seeded in (False, True):
+                batch.sampling_info.sampling_seeds = (
+                    np.arange(4, dtype=np.int32) if seeded else None
+                )
+                for greedy in (False, True):
+                    batch.sampling_info.is_all_greedy = greedy
+                    batch.sampling_info.linear_penalty = np.full((4, 128), 0.25, dtype=np.float32)
+                    metadata = SamplingMetadata.from_model_worker_batch(batch, 0, mesh, 128)
+                    metadata.update_vocab_mask(np.full((4, 4), -1, dtype=np.int32), mesh, 128)
+                    result = fn(*stable, step, logits, metadata)
+                    (tokens, logprobs, _), next_step = result
+                    selected = jitted_compute_logprobs(mesh, logprobs, tokens)
+                    cases.append((metadata, result, selected))
+                    self.assertEqual(int(next_step), 1)
+            jax.clear_caches()
+            for fast in (False, True):
+                sample = AotDispatcher(
+                    fn,
+                    stable,
+                    (graph, leaves),
+                    "sampler",
+                    executable_store=store,
+                    allow_fast_dispatch=fast,
+                )
+                logprob = AotDispatcher(
+                    jitted_compute_logprobs,
+                    (mesh,),
+                    (),
+                    "logprobs",
+                    executable_store=store,
+                    allow_fast_dispatch=fast,
+                )
+                with patch(
+                    "jax._src.compiler.backend_compile_and_load",
+                    side_effect=AssertionError("Unexpected JIT"),
+                ):
+                    for metadata, expected, selected in cases:
+                        actual = sample(step, logits, metadata)
+                        for a, b in zip(jax.tree.leaves(actual), jax.tree.leaves(expected)):
+                            np.testing.assert_array_equal(a, b)
+                        (tokens, logprobs, _), _ = actual
+                        np.testing.assert_array_equal(logprob(logprobs, tokens), selected)
+
     def test_saved_executable_shares_dispatch_cache_without_compiling(self):
         from sgl_jax.srt.model_executor.aot_executable import ExecutableStore
         from sgl_jax.srt.model_executor.compilation_manager import CompilationManager

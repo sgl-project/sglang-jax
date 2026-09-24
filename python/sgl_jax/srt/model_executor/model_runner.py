@@ -26,7 +26,11 @@ from sgl_jax.srt.layers.routed_experts_capturer import (
     get_routed_expert_count,
     set_global_experts_capturer,
 )
-from sgl_jax.srt.layers.sampler import Sampler, compute_logprobs
+from sgl_jax.srt.layers.sampler import (
+    Sampler,
+    jitted_compute_logprobs,
+    make_jitted_sampler,
+)
 from sgl_jax.srt.lora.context_manager import LoraBatchContext
 from sgl_jax.srt.managers.schedule_batch import (
     GLOBAL_SERVER_ARGS_KEYS,
@@ -314,31 +318,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         base_rng_key = self._sampler_base_rng
         _fused_mesh = self.mesh
 
-        @partial(
-            jax.jit,
-            static_argnames=["sampler_state_def"],
-            compiler_options=sampler_compiler_options,
-        )
-        def jitted_sampler(
-            sampler_def,
-            sampler_state_def,
-            sampler_state_leaves,
-            rng_step,
-            *args,
-        ):
-            model_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
-            sampler = nnx.merge(sampler_def, model_state)
-            rng_step = rng_step + jnp.int32(1)
-            result = sampler(
-                *args,
-                rng_override=base_rng_key,
-                rng_step=rng_step,
-            )
-            return result, rng_step
-
-        @partial(jax.jit, static_argnames=["mesh"])
-        def jitted_compute_logprobs(mesh, logits, next_tokens):
-            return compute_logprobs(mesh, logits, next_tokens)
+        jitted_sampler = make_jitted_sampler(base_rng_key, sampler_compiler_options)
 
         aot_model_dir = self.server_args.aot_model_dir
         executable_store = None
@@ -400,7 +380,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
             self.jitted_run_model = run_model_wrapper
 
-        if use_aot_dispatch:
+        if use_aot_dispatch or executable_store is not None:
             self._sampler_dispatcher = AotDispatcher(
                 jitted_sampler,
                 stable_call_args=(
@@ -410,6 +390,9 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 ),
                 stable_flat_args=(sampler_def, sampler_state_leaves),
                 name="sampler",
+                compiler_options_fn=lambda _: sampler_compiler_options,
+                executable_store=executable_store,
+                allow_fast_dispatch=use_aot_dispatch,
             )
 
             self.jitted_sampler = self._sampler_dispatcher
@@ -421,7 +404,17 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 sampler_state_leaves,
             )
 
-        self.jitted_compute_logprobs = partial(jitted_compute_logprobs, self.mesh)
+        if executable_store is not None:
+            self.jitted_compute_logprobs = AotDispatcher(
+                jitted_compute_logprobs,
+                stable_call_args=(self.mesh,),
+                stable_flat_args=(),
+                name="compute_logprobs",
+                executable_store=executable_store,
+                allow_fast_dispatch=use_aot_dispatch,
+            )
+        else:
+            self.jitted_compute_logprobs = partial(jitted_compute_logprobs, self.mesh)
 
         # Pathways-PD: fuse resolve_future_token_ids + run_model + sampler +
         # async_gather + set_future_token_ids into one jit so a decode tick is

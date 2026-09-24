@@ -310,7 +310,8 @@ tar -czf /tmp/model-ir.tar.gz -C /tmp model-ir
 ## Run an offline executable in serving
 
 Use the serving entrypoint to compile its complete prefill/decode bucket plan on
-CPU, save the executables, and exit. Pass the same model and execution options as
+CPU, save the model, sampler, and selected-token logprob executables, and exit.
+Pass the same model and execution options as
 serving, plus an output directory and target topology:
 
 ```bash
@@ -344,7 +345,11 @@ attention also needs a fixed `--max-recurrent-state-size`, unless it follows fro
 alignment, SWA capacity split, recurrent-state constraints, and parallelism rules.
 
 The output contains `serving.json` with the resolved bucket plan, plus one
-subdirectory per bucket containing `executable.bin` and `executable.json`. Copy
+subdirectory per model bucket and sampling variant containing `executable.bin`
+and `executable.json`. Sampling uses the same batch buckets, with both seeded and
+unseeded variants; temperature, top-k/top-p/min-p, penalties, and grammar masks
+remain dynamic inputs. Use the same `--random-seed` for export and serving.
+Copy
 the complete directory onto the TPU host's local disk. Then replace the two
 export options with `--aot-model-dir`:
 
@@ -366,9 +371,10 @@ processes must use the same quantization and model options. For example, add
 Automatic bucket export follows the regular prefill/decode warmup plan. For
 individual workload/IR inspection or speculative draft/verify forwards,
 `sgl_jax.compile --stage compiled --save-executable` remains available. Put each workload and shape in a separate
-subdirectory and point `--aot-model-dir` at their parent. This also keeps the
-individual draft/verify export workflow available. The loader searches recursively.
-An unseen or incompatible model forward fails with a mismatch diagnostic; it does
+subdirectory. For a complete serving bundle, use `--save-aot` so sampling artifacts
+are included too; older model-only bundles need to be exported again.
+The loader searches recursively. An unseen or incompatible model or sampling
+signature fails with a mismatch diagnostic; it does
 not silently compile. Omit `--aot-model-dir` to use normal serving compilation.
 
 The server still loads real weights and creates its caches. For each new input
@@ -376,9 +382,11 @@ signature, it traces and lowers the real serving forward, checks the canonical
 IR, retained input/donation signature, mesh/device assignment, compiler flags and
 runtime versions, then loads the matching binary. Later forwards reuse that
 callable. Inputs eliminated by the compiler do not participate in the binary interface.
-This skips backend model compilation; sampling and other functions outside the
-exported model forward retain their normal compilation behavior. The expected
-benefit is reduced startup/warmup time, not a change to steady-state kernel speed.
+This skips backend compilation for the exported model, sampler, and selected-token
+logprob functions. Other helpers outside this bundle can still compile. Export
+follows the standard warmup signatures; request-specific static logprob layouts
+(such as top-logprobs) need matching artifacts. The expected benefit is reduced
+startup/warmup time, not a change to steady-state kernel speed.
 
 Keep JAX, jaxlib, libtpu, Flax and Python versions compatible with the recorded
 signature; the loader requires exact recorded versions. Use the same compilation
