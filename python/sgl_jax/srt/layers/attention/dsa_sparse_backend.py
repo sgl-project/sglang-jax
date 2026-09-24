@@ -22,7 +22,11 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
-from sgl_jax.srt.kernels.dsa.ref import streamindex_page_topk_ref, streamindex_topk_ref
+from sgl_jax.srt.kernels.dsa.ref import (
+    streamindex_page_topk_ref,
+    streamindex_page_topk_ref_grouped,
+    streamindex_topk_ref,
+)
 from sgl_jax.srt.kernels.dsa.sparse_mla import compute_topk_pages, sparse_mla_page_level
 from sgl_jax.srt.kernels.dsa.sparse_mla_prefill import prefill_write_and_attend_ragged
 from sgl_jax.srt.kernels.dsa.sparse_mla_prefill_qblock import (
@@ -111,6 +115,17 @@ _SPEC_VERIFY_PAGE_SHARE = int(os.environ.get("DSA_SPEC_VERIFY_PAGE_SHARE", "1") 
 # pseudo-sequences -- the request's KV is read once (see sparse_mla_page_level
 # group_queries). Implies the page-share page set. Default OFF.
 _SPEC_VERIFY_QGROUP = os.environ.get("DSA_SPEC_VERIFY_QGROUP", "0") == "1"
+# Opt-in: on decode-form verify batches (S requests x G draft tokens) run the
+# indexer page-topk as ONE batched XLA op over all requests
+# (``streamindex_page_topk_ref_grouped``) instead of the per-sequence kernel
+# grid, whose per-seq launch/DMA fixed cost dominates at cc64 (14.5 ms/step,
+# 64 grid steps x ~21 full layers). Gated by a min batch (below it the kernel
+# wins) and a max kv span (the batched gather materialises
+# [S, pages_per_seq*page_size, D] keys; the kernel only DMAs up to kv_len).
+# Default OFF.
+_IDX_VERIFY_BATCHED = os.environ.get("DSA_IDX_VERIFY_BATCHED", "0") == "1"
+_IDX_VERIFY_BATCHED_MIN_BS = int(os.environ.get("DSA_IDX_VERIFY_BATCHED_MIN_BS", "8"))
+_IDX_VERIFY_BATCHED_MAX_KV = int(os.environ.get("DSA_IDX_VERIFY_BATCHED_MAX_KV", "8192"))
 
 
 @register_pytree_node_class
@@ -625,6 +640,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         *,
         compute_pages=True,
         num_queries_per_block=None,
+        q_group=None,
     ):
         """Prefill page-topk: scatter ``k_idx`` into the paged indexer cache and,
         on full layers, compute per-query **causal** page-level top-k via the
@@ -632,6 +648,10 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
 
         ``compute_pages=False`` (MTP IndexShare reuse steps) only performs the
         indexer-key cache write and returns ``topk_pages=None``.
+
+        ``q_group`` (spec verify: draft tokens per request, every valid request
+        has exactly that many query rows) enables the opt-in batched grouped
+        page-topk, see ``_IDX_VERIFY_BATCHED``.
 
         Returns ``(idx_cache, topk_pages)`` where ``topk_pages`` is ``[T, k_pages]``
         seq-local page ids (-1 padded) — exactly the sparse kernel's per-query
@@ -664,52 +684,21 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 return cache3d.reshape(cache_.shape), jnp.full(
                     (q_.shape[0], k_pages), -1, jnp.int32
                 )
-            if _INDEXER_KERNEL_PREFILL:
-                # dist_[2] == number of real (seq_len > 0) sequences in this
-                # EXTEND batch: mla_backend builds distribution = [0, 0, N] for
-                # ForwardMode.EXTEND (decode runs as a separate forward), so the
-                # kernel's per-seq grid over [0, N) matches the ref's masked
-                # full-batch loop exactly; padded seqs stay -1 on both paths.
-                # The page budget may exceed the (now batch-sized) page table
-                # width; top_k needs k <= pages_per_seq. Clamp and right-pad
-                # back to the [T, k_pages] contract the consumers expect.
-                k_eff = min(k_pages, pages_per_seq)
-                topk_pages = streamindex_page_topk(
-                    q_,
-                    w_,
-                    cache3d.reshape(cache_.shape),
-                    seq_lens_,
-                    # the kernel indexes page_indices[seq_id * pages_per_seq + p]
-                    # (fixed stride), but sglang packs seq i's pages at
-                    # cu_kv_lens[i]//page_size (variable stride) — repack, same
-                    # as the decode call site, or a multi-request EXTEND batch
-                    # with unequal lengths reads another sequence's pages.
-                    _fixed_stride_pages(pi_, cukv_, page_size, pages_per_seq),
-                    cuq_,
-                    dist_[2],
-                    k_pages=k_eff,
-                    **(
-                        {}
-                        if num_queries_per_block is None
-                        else {"num_queries_per_block": num_queries_per_block}
-                    ),
-                )
-            else:
-                topk_pages = streamindex_page_topk_ref(
-                    q_,
-                    w_,
-                    cache3d,
-                    seq_lens_,
-                    pi_,
-                    cuq_,
-                    cukv_,
-                    dist_,
-                    k_pages=k_eff,
-                    pages_per_seq=pages_per_seq,
-                    one_token_per_seq=False,  # prefill: T>1 tokens/seq, per-query causal
-                )
-            if k_eff < k_pages:
-                topk_pages = _pad_topk_pages(topk_pages, k_pages)
+            topk_pages = _prefill_page_topk(
+                q_,
+                w_,
+                cache3d,
+                seq_lens_,
+                pi_,
+                cuq_,
+                cukv_,
+                dist_,
+                k_pages=k_pages,
+                pages_per_seq=pages_per_seq,
+                num_queries_per_block=num_queries_per_block,
+                q_group=q_group,
+                kernel_cache_shape=cache_.shape,
+            )
             return cache3d.reshape(cache_.shape), topk_pages
 
         idx_cache, topk_pages = jax.shard_map(
@@ -841,6 +830,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         # ORIGINAL metadata (the prefill-form path; k_pages = index_topk/page_size),
         # not T one-query decode passes -- the ref decode loop cost ~9 ms/step at
         # T=4 (dpa40nap). Only the query block shrinks (512 -> _SPEC_INDEXER_QB).
+        draft_group = _spec_draft_group(forward_batch, num_tokens)
         if readonly and reuse:
             topk_pages = None
         else:
@@ -854,6 +844,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 md,
                 compute_pages=not reuse,
                 num_queries_per_block=_SPEC_INDEXER_QB,
+                q_group=draft_group,
             )
         topk = None
         if not is_full or reuse:
@@ -870,11 +861,9 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         is_verify = forward_batch.forward_mode.is_target_verify()
         page_share_group = _SPEC_VERIFY_PAGE_SHARE if is_verify else 1
         group_queries = False
-        if is_verify and _SPEC_VERIFY_QGROUP:
-            dtn = getattr(getattr(forward_batch, "spec_info", None), "draft_token_num", None)
-            if dtn and dtn > 1 and num_tokens % int(dtn) == 0:
-                page_share_group = int(dtn)
-                group_queries = True
+        if is_verify and _SPEC_VERIFY_QGROUP and draft_group is not None:
+            page_share_group = draft_group
+            group_queries = True
         o, kv_cache = self._run_sparse(
             q,
             q_rope,
@@ -1160,6 +1149,109 @@ def _gather_cache_rows(cache: jax.Array, loc: jax.Array, page_size: int) -> jax.
     off = safe % page_size
     rows = cache[page, off // pk, off % pk]
     return jnp.where((loc >= 0)[:, None], rows, jnp.zeros_like(rows))
+
+
+def _spec_draft_group(forward_batch, num_tokens: int) -> int | None:
+    """Draft tokens per request (G) on a decode-form TARGET_VERIFY batch whose
+    token count is a whole number of requests; ``None`` otherwise."""
+    if not forward_batch.forward_mode.is_target_verify():
+        return None
+    dtn = getattr(getattr(forward_batch, "spec_info", None), "draft_token_num", None)
+    if dtn and int(dtn) > 1 and num_tokens % int(dtn) == 0:
+        return int(dtn)
+    return None
+
+
+def _prefill_page_topk(
+    q_,
+    w_,
+    cache3d,
+    seq_lens_,
+    pi_,
+    cuq_,
+    cukv_,
+    dist_,
+    *,
+    k_pages: int,
+    pages_per_seq: int,
+    num_queries_per_block,
+    q_group,
+    kernel_cache_shape=None,
+):
+    """Per-query causal page-topk over ``cache3d`` [P, page_size, D] for one
+    shard of a prefill-form batch; ``i32[T, k_pages]`` (-1 padded).
+    ``kernel_cache_shape`` is the paged 4-D cache shape the Pallas kernel takes.
+
+    Path order: batched grouped XLA op (opt-in, verify batches only) ->
+    per-sequence Pallas kernel (``DSA_INDEXER_KERNEL_PREFILL``) -> loop ref.
+    The page budget may exceed the (batch-sized) page table width; top_k needs
+    k <= pages_per_seq. Clamp and right-pad back to the [T, k_pages] contract.
+    """
+    page_size = cache3d.shape[1]
+    k_eff = min(k_pages, pages_per_seq)
+    grouped = (
+        q_group is not None
+        and _IDX_VERIFY_BATCHED
+        and seq_lens_.shape[0] >= _IDX_VERIFY_BATCHED_MIN_BS
+        and pages_per_seq * page_size <= _IDX_VERIFY_BATCHED_MAX_KV
+    )
+    if grouped:
+        topk_pages = streamindex_page_topk_ref_grouped(
+            q_,
+            w_,
+            cache3d,
+            seq_lens_,
+            pi_,
+            cuq_,
+            cukv_,
+            k_pages=k_eff,
+            pages_per_seq=pages_per_seq,
+            q_group=int(q_group),
+        )
+    elif _INDEXER_KERNEL_PREFILL:
+        # dist_[2] == number of real (seq_len > 0) sequences in this
+        # EXTEND batch: mla_backend builds distribution = [0, 0, N] for
+        # ForwardMode.EXTEND (decode runs as a separate forward), so the
+        # kernel's per-seq grid over [0, N) matches the ref's masked
+        # full-batch loop exactly; padded seqs stay -1 on both paths.
+        assert kernel_cache_shape is not None, "kernel path needs the paged 4-D cache shape"
+        topk_pages = streamindex_page_topk(
+            q_,
+            w_,
+            cache3d.reshape(kernel_cache_shape),
+            seq_lens_,
+            # the kernel indexes page_indices[seq_id * pages_per_seq + p]
+            # (fixed stride), but sglang packs seq i's pages at
+            # cu_kv_lens[i]//page_size (variable stride) — repack, same
+            # as the decode call site, or a multi-request EXTEND batch
+            # with unequal lengths reads another sequence's pages.
+            _fixed_stride_pages(pi_, cukv_, page_size, pages_per_seq),
+            cuq_,
+            dist_[2],
+            k_pages=k_eff,
+            **(
+                {}
+                if num_queries_per_block is None
+                else {"num_queries_per_block": num_queries_per_block}
+            ),
+        )
+    else:
+        topk_pages = streamindex_page_topk_ref(
+            q_,
+            w_,
+            cache3d,
+            seq_lens_,
+            pi_,
+            cuq_,
+            cukv_,
+            dist_,
+            k_pages=k_eff,
+            pages_per_seq=pages_per_seq,
+            one_token_per_seq=False,  # prefill: T>1 tokens/seq, per-query causal
+        )
+    if k_eff < k_pages:
+        topk_pages = _pad_topk_pages(topk_pages, k_pages)
+    return topk_pages
 
 
 def _pad_topk_pages(topk_pages: jax.Array, width: int) -> jax.Array:

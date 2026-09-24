@@ -296,6 +296,96 @@ def streamindex_page_topk_ref(
     return jax.lax.fori_loop(0, num_seqs, body, out)
 
 
+@functools.partial(
+    jax.jit,
+    static_argnames=("k_pages", "pages_per_seq", "q_group", "head_chunk", "unroll_heads"),
+)
+def streamindex_page_topk_ref_grouped(
+    q: jax.Array,
+    weights: jax.Array,
+    cache_kv: jax.Array,
+    seq_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    cu_kv_lens: jax.Array,
+    *,
+    k_pages: int,
+    pages_per_seq: int,
+    q_group: int,
+    head_chunk: int = 8,
+    unroll_heads: bool = True,
+) -> jax.Array:
+    """Page-topk for batches of S requests x ``q_group`` query tokens each
+    (spec verify: every valid request contributes exactly G draft tokens, so
+    ``cu_q_lens[s+1] - cu_q_lens[s] == G``), vectorized over requests.
+
+    Same selection semantics as ``streamindex_page_topk_ref`` (general causal
+    path) but without the per-sequence ``fori_loop``: one flat gather of every
+    request's ``pages_per_seq`` pages, one batched ``[S, G, H, max_kv]`` score
+    accumulated over head chunks, one batched page max-pool and one top_k.
+    Draft token i of a request sits at absolute position ``kv_len - G + i`` and
+    only sees keys at positions ``<= kv_len - G + i`` (intra-request causal).
+
+    Rows of padded requests (``seq_lens == 0``) and rows past ``cu_q_lens[-1]``
+    are -1. Requests whose q_len != ``q_group`` are treated as padding.
+
+    Returns:
+      i32[T, k_pages]  seq-local page ids per query token; -1 for padding.
+    """
+    T, H, D = q.shape
+    page_size = cache_kv.shape[1]
+    max_kv = pages_per_seq * page_size
+    S = seq_lens.shape[0]
+    G = q_group
+
+    q_len = cu_q_lens[1 : S + 1] - cu_q_lens[:S]
+    valid = (seq_lens > 0) & (q_len == G)  # [S]
+    rows = jnp.minimum(cu_q_lens[:S, None] + jnp.arange(G)[None, :], T - 1)  # [S, G]
+
+    starts = cu_kv_lens[:S] // page_size
+    gidx = starts[:, None] + jnp.arange(pages_per_seq)[None, :]
+    gidx = jnp.minimum(gidx, page_indices.shape[0] - 1)
+    pages = page_indices[gidx]  # [S, pps]
+    keys = cache_kv[pages.reshape(-1)].reshape(S, max_kv, D)
+
+    qg = q[rows]  # [S, G, H, D]
+    wg = weights[rows].astype(jnp.float32)  # [S, G, H]
+    nchunks = -(-H // head_chunk)
+    h_pad = nchunks * head_chunk - H
+    q_pad = jnp.pad(qg, ((0, 0), (0, 0), (0, h_pad), (0, 0)))
+    w_pad = jnp.pad(wg, ((0, 0), (0, 0), (0, h_pad)))
+
+    def h_step(c, acc):
+        h0 = c * head_chunk
+        q_c = jax.lax.dynamic_slice_in_dim(q_pad, h0, head_chunk, axis=2)  # [S, G, hc, D]
+        w_c = jax.lax.dynamic_slice_in_dim(w_pad, h0, head_chunk, axis=2)  # [S, G, hc]
+        s_c = jnp.einsum("sghd,skd->sghk", q_c, keys, preferred_element_type=jnp.float32)
+        return acc + jnp.einsum("sgh,sghk->sgk", w_c, jax.nn.relu(s_c))
+
+    zeros = jnp.zeros((S, G, max_kv), jnp.float32)
+    if unroll_heads:
+        scores = zeros
+        for c in range(nchunks):
+            scores = h_step(c, scores)
+    else:
+        scores = jax.lax.fori_loop(0, nchunks, h_step, zeros)
+
+    kv_pos = jnp.arange(max_kv)[None, None, :]
+    abs_q = (seq_lens[:, None] - G + jnp.arange(G)[None, :])[:, :, None]  # [S, G, 1]
+    mask = valid[:, None, None] & (kv_pos < seq_lens[:, None, None]) & (kv_pos <= abs_q)
+    scores = jnp.where(mask, scores, _NEG_INF)
+    page_scores = scores.reshape(S * G, pages_per_seq, page_size).max(axis=-1)
+    vals, pidx = jax.lax.top_k(page_scores, k_pages)
+    pidx = jnp.where(vals > _NEG_INF, pidx, -1)  # [S*G, k]
+
+    # Padded requests all alias row cu_q[-1] (== T when there are no pad rows);
+    # route them to a sentinel row T so the scatter never has two writers.
+    row_valid = jnp.broadcast_to(valid[:, None], (S, G)).reshape(-1)
+    dest = jnp.where(row_valid, rows.reshape(-1), T)
+    out = jnp.full((T + 1, k_pages), -1, dtype=jnp.int32)
+    return out.at[dest].set(pidx)[:T]
+
+
 @functools.partial(jax.jit, static_argnames=("sm_scale", "pages_per_seq", "v_dim"))
 def sparse_mla_ref(
     q: jax.Array,
