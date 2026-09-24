@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import asyncio
 import logging
+import re
+from contextlib import ExitStack
 
 import numpy as np
 
-from sgl_jax.srt.multimodal.common.mecord_compat import install_mecord_shim
+from sgl_jax.srt.multimodal.common.mecord_compat import install_mecord_shim, materialize_video
 from sgl_jax.srt.multimodal.common.modality_enum import (
     Modality,
     MultimodalDataItem,
@@ -58,35 +59,37 @@ class KimiK25Processor(BaseMultimodalProcessor):
 
         image_sources = self.normalize_data(image_data)
         video_sources = self.normalize_data(getattr(request_obj, "video_data", None))
-        # Kimi decodes and frame-samples videos inside its remote processor code,
-        # which is slow and blocking. Hand the whole thing to a worker thread
-        # rather than the base class's executor: the executor clones the HF
-        # processor, and Kimi's carries unpicklable remote-code state.
-        return await asyncio.to_thread(
+        return await self.mm_processor_executor.run(
             self._process_mm_data, input_text, image_sources, video_sources
         )
 
-    def _process_mm_data(
-        self,
-        input_text,
-        image_sources,
-        video_sources,
-    ) -> MultimodalInputs:
-        # Images are decoded here because the remote code expects PIL objects,
-        # but video sources stay raw: the processor samples them itself.
-        medias = [{"type": "image", "image": self.load_image(source)} for source in image_sources]
-        medias.extend(
-            {"type": "video", "video": self.unwrap_source(source), "first_frame_timestamp": 0.0}
-            for source in video_sources
+    def _process_mm_data(self, input_text, image_sources, video_sources, *, processor):
+        input_text = self._ensure_video_placeholders(input_text, len(video_sources)) or ""
+        image_placeholder = processor.tokenizer.decode([self._media_placeholder_token_id()])
+        video_placeholder = self._video_placeholder()
+        markers = re.findall(
+            f"{re.escape(video_placeholder)}|{re.escape(image_placeholder)}", input_text
         )
-        input_text = self._ensure_video_placeholders(input_text, len(video_sources))
+        if markers.count(image_placeholder) != len(image_sources) or markers.count(
+            video_placeholder
+        ) != len(video_sources):
+            raise ValueError("Kimi-K2.5 media sources must match image/video placeholders.")
 
-        processor_output = self.processor(
-            text=input_text or "",
-            medias=medias,
-            return_tensors="pt",
-        )
-        return self.collect_mm_items_from_processor_output(processor_output)
+        images, videos = iter(image_sources), iter(video_sources)
+        with ExitStack() as sources:
+            medias = []
+            for marker in markers:
+                if marker == image_placeholder:
+                    medias.append({"type": "image", "image": self.load_image(next(images))})
+                else:
+                    # Metadata probing and resampling reuse this path. Cleanup
+                    # runs in the worker even if processing fails or is cancelled.
+                    path = sources.enter_context(
+                        materialize_video(self.unwrap_source(next(videos)))
+                    )
+                    medias.append({"type": "video", "video": path, "first_frame_timestamp": 0.0})
+            output = processor(text=input_text, medias=medias, return_tensors="pt")
+            return self.collect_mm_items_from_processor_output(output)
 
     def collect_mm_items_from_processor_output(
         self,
@@ -233,16 +236,19 @@ class KimiK25Processor(BaseMultimodalProcessor):
         if num_videos <= 0:
             return text
 
-        placeholder = (
-            getattr(self.processor, "video_placeholder", None)
-            or getattr(self.hf_config, "video_placeholder", None)
-            or DEFAULT_VIDEO_PLACEHOLDER
-        )
+        placeholder = self._video_placeholder()
         text = text or ""
         missing = num_videos - text.count(placeholder)
         if missing > 0:
             text = placeholder * missing + text
         return text
+
+    def _video_placeholder(self) -> str:
+        return (
+            getattr(self.processor, "video_placeholder", None)
+            or getattr(self.hf_config, "video_placeholder", None)
+            or DEFAULT_VIDEO_PLACEHOLDER
+        )
 
     def _media_placeholder_token_id(self) -> int | None:
         return getattr(self.hf_config, "media_placeholder_token_id", None) or getattr(

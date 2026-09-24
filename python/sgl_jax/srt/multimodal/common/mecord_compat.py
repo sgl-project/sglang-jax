@@ -53,12 +53,20 @@ _DATA_URI_MARKER = "base64,"
 
 
 def _write_temp_video(payload: bytes) -> str:
-    fd, path = tempfile.mkstemp(suffix=".mp4")
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as stream:
+        stream.write(payload)
+        return stream.name
+
+
+@contextlib.contextmanager
+def materialize_video(video_src: Any):
+    """Keep one local source alive for both metadata probing and frame decoding."""
+    path, temporary = _materialize_to_path(video_src)
     try:
-        os.write(fd, payload)
+        yield path
     finally:
-        os.close(fd)
-    return path
+        if temporary:
+            os.unlink(path)
 
 
 def _materialize_to_path(video_src: Any) -> tuple[str, bool]:
@@ -84,11 +92,9 @@ def _materialize_to_path(video_src: Any) -> tuple[str, bool]:
         if video_src.startswith("file://"):
             return video_src[len("file://") :], False
         if video_src.startswith(("http://", "https://")):
-            import requests
+            from sgl_jax.srt.multimodal.processors.base_processor import fetch_remote_bytes
 
-            resp = requests.get(video_src, timeout=30)
-            resp.raise_for_status()
-            return _write_temp_video(resp.content), True
+            return _write_temp_video(fetch_remote_bytes(video_src)), True
         if video_src.startswith("data:") and _DATA_URI_MARKER in video_src:
             payload = video_src.split(_DATA_URI_MARKER, 1)[1]
             return _write_temp_video(base64.b64decode(payload)), True

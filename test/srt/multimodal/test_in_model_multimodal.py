@@ -26,6 +26,7 @@ from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
 from sgl_jax.srt.multimodal.in_model.lane_packing import (
     encoder_num_lanes,
     pack_vision_inputs,
+    resolve_vision_output_lengths,
     run_mrope_vision_model,
 )
 from sgl_jax.srt.multimodal.processors.qwen_vl import QwenVLProcessor
@@ -133,6 +134,7 @@ def _pack_qwen2(visual, items):
         num_lanes=num_lanes,
         buckets=visual.input_buckets,
         merge_unit=visual.spatial_merge_unit,
+        output_lengths=resolve_vision_output_lengths(visual, items, visual.spatial_merge_unit),
         input_sharding=batch_sharding,
     )
     # Tests inspecting per-lane metadata use the host planning layout.

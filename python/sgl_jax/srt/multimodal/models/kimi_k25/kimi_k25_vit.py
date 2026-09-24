@@ -234,10 +234,8 @@ class KimiK25VisionAttention(nnx.Module):
         # kernel's per-token segment ids are no longer built here.
         output = self.attn_backend(q, k, v, cu_seqlens)
 
-        # Head sharding is internal to the attention step. Downstream ops -- in
-        # particular the temporal-merge gather -- cannot infer an output sharding
-        # from a partitioned operand, so the layout is collapsed back here.
-        output = apply_data_sharding(output, self.mesh, PartitionSpec())
+        # Gather heads for the output projection, retaining the token lanes.
+        output = apply_data_sharding(output, self.mesh, PartitionSpec(self.specs.batch_axis))
 
         return output.reshape(sum_seq_len, D)
 
