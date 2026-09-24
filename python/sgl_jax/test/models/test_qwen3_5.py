@@ -190,7 +190,8 @@ class TestQwen3_5(unittest.TestCase):
             model = nnx.eval_shape(lambda cfg=cfg: Qwen3_5ForConditionalGeneration(cfg, self.mesh))
         self.assertIsInstance(model.visual, Qwen3VLVisionModel)
         self.assertIs(model.get_input_embeddings(), model.language_model.model.embed_tokens)
-        self.assertEqual(model.get_multimodal_embedding_packed_capacities(), (16,))
+        self.assertEqual(model.vision_input_spec.patch_dim, 24)
+        self.assertEqual(model.vision_input_spec.spatial_merge_size, 2)
 
     def test_lm_head_policy_comes_from_outer_config(self):
         from flax import nnx

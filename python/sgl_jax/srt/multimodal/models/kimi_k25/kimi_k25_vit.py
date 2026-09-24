@@ -183,10 +183,7 @@ class KimiK25VisionAttention(nnx.Module):
         self.scale = 1.0 / math.sqrt(self.head_dim)
         self.specs = VisionShardSpecs(mesh, vision_tp)
 
-        # ``head_tp`` keeps every token on every shard and splits the heads. The
-        # data-parallel alternative shards the token axis instead, which lane
-        # packing now makes representable because a shard holds whole items;
-        # it is left off until it has been validated on hardware.
+        # TP splits heads within each data lane; DP assigns whole items to token lanes.
         self.attn_backend = make_vision_attention_backend(
             mesh,
             sm_scale=self.scale,

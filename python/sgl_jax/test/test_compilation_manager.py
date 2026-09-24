@@ -246,6 +246,68 @@ class TestBucketComputation(unittest.TestCase):
         assert 256 in cm.token_buckets
         assert 512 in cm.token_buckets
 
+    def test_default_token_buckets_fill_gap_above_8192(self):
+        # Default paddings top out at 8192; with a larger token budget the
+        # bucket list must keep doubling instead of jumping straight to max.
+        cm = CompilationManager(
+            server_args=_make_server_args(),
+            max_padded_batch_size=128,
+            max_padded_num_tokens=131072,
+            dp_size=1,
+            tp_size=4,
+            page_size=128,
+            max_req_len=262144,
+            vocab_size=32000,
+        )
+        for expected in (8192, 16384, 32768, 65536):
+            assert expected in cm.token_buckets, f"missing gap-fill bucket {expected}"
+        assert cm.token_buckets[-1] == 131072
+
+    def test_default_token_buckets_gap_fill_respects_dp_size(self):
+        cm = CompilationManager(
+            server_args=_make_server_args(),
+            max_padded_batch_size=64,
+            max_padded_num_tokens=100000,
+            dp_size=4,
+            tp_size=4,
+            page_size=128,
+            max_req_len=262144,
+            vocab_size=32000,
+        )
+        for b in cm.token_buckets:
+            assert b % 4 == 0, f"bucket {b} not divisible by dp_size=4"
+        assert cm.token_buckets[-1] == 100000
+        # 8192 * dp_size doubled: 65536, 131072(> max, excluded)
+        assert 65536 in cm.token_buckets
+
+    def test_default_token_buckets_unchanged_when_max_at_or_below_8192(self):
+        cm = CompilationManager(
+            server_args=_make_server_args(),
+            max_padded_batch_size=128,
+            max_padded_num_tokens=8192,
+            dp_size=1,
+            tp_size=4,
+            page_size=128,
+            max_req_len=16384,
+            vocab_size=32000,
+        )
+        assert cm.token_buckets == [128, 256, 512, 1024, 2048, 4096, 8192]
+
+    def test_user_specified_paddings_get_no_gap_fill(self):
+        cm = CompilationManager(
+            server_args=_make_server_args(
+                precompile_token_paddings=[256, 512, 1024],
+            ),
+            max_padded_batch_size=128,
+            max_padded_num_tokens=131072,
+            dp_size=1,
+            tp_size=4,
+            page_size=128,
+            max_req_len=262144,
+            vocab_size=32000,
+        )
+        assert cm.token_buckets == [256, 512, 1024, 131072]
+
 
 class TestLazyCompilation(unittest.TestCase):
     def test_register_variant_if_new_first_time(self):
@@ -443,7 +505,7 @@ class TestDummyBatch(unittest.TestCase):
         batch = cm._make_dummy_batch(32, 128, ForwardMode.EXTEND, 512)
         assert batch.capture_hidden_mode == CaptureHiddenMode.FULL
 
-    def test_precompile_extend_uses_one_unified_multimodal_signature(self):
+    def test_precompile_extend_leaves_multimodal_embedding_to_forward(self):
         cm = CompilationManager(
             server_args=_make_server_args(
                 precompile_token_paddings=[4],
@@ -459,8 +521,6 @@ class TestDummyBatch(unittest.TestCase):
             precompile_in_model_multimodal=True,
         )
         model_runner = MagicMock()
-        input_embedding = object()
-        deepstack = object()
         calls = []
 
         def forward_fn(batch, **kwargs):
@@ -484,11 +544,6 @@ class TestDummyBatch(unittest.TestCase):
         with (
             patch.object(ForwardBatch, "init_new", return_value=forward_batch),
             patch.object(
-                host_orchestration,
-                "precompile_multimodal_inputs",
-                return_value=(input_embedding, deepstack, True),
-            ) as precompile_multimodal_inputs,
-            patch.object(
                 SamplingMetadata,
                 "from_model_worker_batch",
                 return_value=MagicMock(),
@@ -502,16 +557,10 @@ class TestDummyBatch(unittest.TestCase):
                 future_token_ids_map=None,
             )
 
-        assert calls == [(input_embedding, deepstack, True, False)]
+        assert calls == [(None, None, False, False)]
         assert cm._compiled_variants == {(ForwardMode.EXTEND, 4, 2, False)}
-        assert cm._compiled_multimodal_extend_shapes == {(4, 2)}
-        precompile_multimodal_inputs.assert_called_once_with(
-            forward_batch.input_ids,
-            model_runner.model,
-            model_runner.embedding_pool,
-        )
 
-    def test_precompile_all_warms_multimodal_encoder_between_model_modes(self):
+    def test_precompile_all_warms_multimodal_encoder_before_model_modes(self):
         cm = CompilationManager(
             server_args=_make_server_args(),
             max_padded_batch_size=2,
@@ -525,18 +574,29 @@ class TestDummyBatch(unittest.TestCase):
         )
         events = []
         model_runner = MagicMock()
-        model_runner.model.precompile_multimodal.side_effect = lambda: events.append("vision")
-        model_runner.model.get_multimodal_embedding_packed_capacities.return_value = (6, 10)
+        model_runner.mesh = None
+        model_runner.model_config.hf_config = SimpleNamespace(
+            vision_encoder_parallel="dp", precompile_vision_patch_paddings=[4, 8]
+        )
         with (
+            patch.object(
+                host_orchestration,
+                "precompile_multimodal_encoder",
+                side_effect=lambda *args, **kwargs: events.append("vision"),
+            ) as precompile_encoder,
             patch.object(cm, "_precompile_extend", side_effect=lambda *_: events.append("extend")),
             patch.object(cm, "_precompile_decode", side_effect=lambda *_: events.append("decode")),
         ):
             cm.precompile_all(MagicMock(), model_runner, MagicMock())
 
-        assert events == ["extend", "vision", "decode"]
-        assert [
-            call.args for call in model_runner.embedding_pool.precompile_packed_write.call_args_list
-        ] == [(6,), (10,)]
+        assert events == ["vision", "extend", "decode"]
+        precompile_encoder.assert_called_once_with(
+            model_runner.model,
+            model_runner.embedding_pool,
+            [4],
+            num_lanes=1,
+            patch_paddings=[4, 8],
+        )
 
     def test_invalid_cache_loc_raises(self):
         with self.assertRaises(ValueError):

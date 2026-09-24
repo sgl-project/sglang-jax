@@ -185,6 +185,12 @@ class TestHyperConnectionBase(CustomTestCase):
 class TestGatedResidual(CustomTestCase):
     """mix/combine numerics and the invariants the backbone relies on."""
 
+    def setUp(self):
+        super().setUp()
+        # Match the independent FP64 reference without TPU default matmul
+        # precision changing the meaning of these strict FP32 comparisons.
+        self.enterContext(jax.default_matmul_precision("highest"))
+
     def test_weight_shapes_match_the_checkpoint(self):
         """Qwen3.8-Flash-Next ships hc_norm.weight at [HC*HS], i.e. per branch;
         the mixer instance ships without block_inject_weight at all."""

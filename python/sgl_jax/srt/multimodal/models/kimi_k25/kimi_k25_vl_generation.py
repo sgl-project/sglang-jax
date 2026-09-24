@@ -12,7 +12,10 @@ from sgl_jax.srt.hf_transformers_utils import get_hf_text_config
 from sgl_jax.srt.models.deepseek_v3 import DeepseekV3ForCausalLM
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
 from sgl_jax.srt.multimodal.configs.kimi.kimi_k25_config import KimiK25ModelVitConfig
-from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
+from sgl_jax.srt.multimodal.in_model.interface import (
+    InModelMultimodalContract,
+    VisionInputSpec,
+)
 from sgl_jax.srt.multimodal.in_model.lane_packing import (
     encoder_num_lanes,
     run_mrope_vision_model,
@@ -22,7 +25,6 @@ from sgl_jax.srt.multimodal.models.kimi_k25.kimi_k25_vit import (
     Kimi_K25_VisionModel,
     create_kimi_vision_weight_mappings,
 )
-from sgl_jax.srt.utils.common_utils import resolve_vision_patch_buckets
 from sgl_jax.srt.utils.weight_utils import WeightLoader
 
 logger = logging.getLogger(__name__)
@@ -65,11 +67,7 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM, InModelMultimodalCo
         self.hf_weight_prefix = "language_model."
 
         self.vision_config = KimiK25ModelVitConfig()
-        # Head-parallel encoder. Lane packing makes the data-parallel mode
-        # representable too, but it is left off until validated on hardware.
-        # resolve_encoder_tp returns False on meshes without a usable tensor
-        # axis, where the tower simply stays replicated.
-        vision_tp = resolve_encoder_tp(self.mesh, "tp") if self.mesh is not None else False
+        vision_tp = resolve_encoder_tp(self.mesh, getattr(config, "vision_encoder_parallel", "dp"))
         self.visual = Kimi_K25_VisionModel(
             self.vision_config,
             dtype=self.dtype,
@@ -77,12 +75,9 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM, InModelMultimodalCo
             mesh=self.mesh,
             vision_tp=vision_tp,
         )
-        # Lane-packing compile buckets. _bucket_capacity silently skips buckets
-        # that are not a multiple of the merge unit, so filter them out here to
-        # keep the effective bucket list explicit.
-        merge_unit = self.visual.merge_unit
-        self.vision_buckets = tuple(
-            bucket for bucket in resolve_vision_patch_buckets(None) if bucket % merge_unit == 0
+        self.vision_input_spec = VisionInputSpec(
+            patch_dim=self.visual.in_channels * self.visual.patch_size**2,
+            spatial_merge_size=self.visual.merge_kernel_size[0],
         )
 
     def get_input_embeddings(self) -> Callable[[jax.Array], jax.Array]:
@@ -100,24 +95,14 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM, InModelMultimodalCo
             Modality.VIDEO: self.encode_vision_items,
         }
 
-    def encode_vision_items(self, items: list[MultimodalDataItem]) -> jax.Array:
-        """Encode media items into one item-ordered [tokens, hidden] array.
-
-        Runs through the shared lane-packing orchestrator, which balances items
-        over the encoder lanes, pads to a compile bucket, runs the tower, and
-        restores item order. ``sd2_tpool`` pools away the temporal axis,
-        so each item emits h*w/merge_unit tokens regardless of its frame count.
-        """
-        if not items:
-            return jnp.zeros((0, self.vision_config.text_hidden_size), dtype=self.dtype)
-
+    def encode_vision_items(self, items_per_lane: list[list[MultimodalDataItem]]) -> jax.Array:
+        """Encode scheduler-assigned lanes; sd2_tpool emits h*w/merge_unit tokens per item."""
         specs = self.visual.vision_tower.specs
         return run_mrope_vision_model(
             self.visual,
-            items,
+            items_per_lane,
             mesh=self.mesh,
             num_lanes=encoder_num_lanes(self.mesh, self.visual.vision_tower.vision_tp),
-            buckets=self.vision_buckets,
             merge_unit=self.visual.merge_unit,
             rope_type="rope_2d",
             pool_temporal_dimension=True,

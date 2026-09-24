@@ -66,12 +66,19 @@ class CompilationManager:
         self.bs_buckets = self._compute_bs_buckets(server_args.precompile_bs_paddings)
         self.cache_loc_buckets = self._compute_cache_loc_buckets()
         self._compiled_variants: set[tuple] = set()
-        self._compiled_multimodal_extend_shapes: set[tuple[int, int]] = set()
 
     def _compute_token_buckets(self, user_paddings: list[int] | None) -> list[int]:
         dp_size = self.dp_size
         if user_paddings is None:
             user_paddings = [item * dp_size for item in PRECOMPILE_DEFAULT_TOKEN_PADDINGS]
+            # The static defaults top out at 8192 * dp_size. When the token
+            # budget is larger, keep doubling so the final max-size bucket is
+            # not the only one above 8192 (every mid-size prefill would pad to
+            # max otherwise). No-op when max_padded_num_tokens <= 8192 * dp_size.
+            item = user_paddings[-1] * 2
+            while item < self.max_padded_num_tokens:
+                user_paddings.append(item)
+                item *= 2
 
         buckets = []
         for item in user_paddings:
@@ -139,17 +146,33 @@ class CompilationManager:
         prepare_lora_fn: Callable | None = None,
         future_token_ids_map=None,
     ):
+        self._precompile_encode(model_runner)
         self._precompile_extend(
-            forward_fn, model_runner, mesh, prepare_lora_fn, future_token_ids_map
+            forward_fn,
+            model_runner,
+            mesh,
+            prepare_lora_fn,
+            future_token_ids_map,
         )
-        if self.precompile_in_model_multimodal:
-            from sgl_jax.srt.multimodal.in_model.host_orchestration import (
-                precompile_multimodal_components,
-            )
-
-            precompile_multimodal_components(model_runner.model, model_runner.embedding_pool)
         self._precompile_decode(
             forward_fn, model_runner, mesh, prepare_lora_fn, future_token_ids_map
+        )
+
+    def _precompile_encode(self, model_runner) -> None:
+        if not self.precompile_in_model_multimodal:
+            return
+        from sgl_jax.srt.multimodal.in_model.host_orchestration import (
+            precompile_multimodal_encoder,
+        )
+        from sgl_jax.srt.multimodal.in_model.lane_packing import encoder_num_lanes
+
+        config = model_runner.model_config.hf_config
+        precompile_multimodal_encoder(
+            model_runner.model,
+            model_runner.embedding_pool,
+            [t for t in self.token_buckets if t >= self.max_padded_batch_size],
+            num_lanes=encoder_num_lanes(model_runner.mesh, config.vision_encoder_parallel == "tp"),
+            patch_paddings=config.precompile_vision_patch_paddings,
         )
 
     def _precompile_extend(
@@ -166,19 +189,17 @@ class CompilationManager:
 
         start_time = time.perf_counter()
         bs = self.max_padded_batch_size
-        multimodal_options = (True,) if self.precompile_in_model_multimodal else (False,)
         logger.info(
-            "[EXTEND] Begin to precompile bs_paddings=%s token_paddings=%s multimodal=%s",
+            "[EXTEND] Begin to precompile bs_paddings=%s token_paddings=%s",
             [bs],
             self.token_buckets,
-            self.precompile_in_model_multimodal,
         )
 
-        pairs = list(itertools.product(multimodal_options, [bs], self.token_buckets))
+        pairs = list(itertools.product([bs], self.token_buckets))
         with tqdm(pairs, desc="[EXTEND] PRECOMPILE", leave=False) as pbar:
             for pair in pbar:
-                use_multimodal_input, bs_val, num_tokens = pair
-                pbar.set_postfix(multimodal=use_multimodal_input, bs=bs_val, tokens=num_tokens)
+                bs_val, num_tokens = pair
+                pbar.set_postfix(bs=bs_val, tokens=num_tokens)
                 if bs_val > num_tokens:
                     logger.warning("bs=%s > num_tokens=%s, skip this pair", bs_val, num_tokens)
                     continue
@@ -196,19 +217,6 @@ class CompilationManager:
                     batch, 0, mesh, self.vocab_size
                 )
                 batch.forward_batch = ForwardBatch.init_new(batch, model_runner)
-                if use_multimodal_input:
-                    from sgl_jax.srt.multimodal.in_model.host_orchestration import (
-                        precompile_multimodal_inputs,
-                    )
-
-                    input_embedding, deepstack, apply_for_deepstack = precompile_multimodal_inputs(
-                        batch.forward_batch.input_ids,
-                        model_runner.model,
-                        model_runner.embedding_pool,
-                    )
-                    batch.forward_batch.input_embedding = input_embedding
-                    batch.forward_batch.deepstack_visual_embedding = deepstack
-                    batch.forward_batch.apply_for_deepstack = apply_for_deepstack
                 if future_token_ids_map is not None:
                     from sgl_jax.srt.managers.utils import resolve_future_token_ids
 
@@ -222,8 +230,6 @@ class CompilationManager:
                     sampling_metadata=sampling_metadata,
                 )
                 self._compiled_variants.add((ForwardMode.EXTEND, num_tokens, bs_val, False))
-                if use_multimodal_input:
-                    self._compiled_multimodal_extend_shapes.add((num_tokens, bs_val))
 
         end_time = time.perf_counter()
         logger.info("[EXTEND] Precompile finished in %.0f secs", end_time - start_time)

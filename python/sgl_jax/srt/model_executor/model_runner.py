@@ -52,7 +52,10 @@ from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
 from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.models.registry import ModelRegistry
 from sgl_jax.srt.multimodal.in_model.embedding_pool import EmbeddingPool
-from sgl_jax.srt.multimodal.in_model.host_orchestration import embed_multimodal_inputs
+from sgl_jax.srt.multimodal.in_model.host_orchestration import (
+    MultimodalBatch,
+    embed_multimodal_inputs,
+)
 from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
@@ -205,6 +208,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             total_device_memory,
             dp_size=server_args.dp_size,
         )
+        self._maybe_warn_dsa_sparse_prefill_temporaries()
         self._build_embedding_pool()
 
         # Init routed experts capturer
@@ -520,6 +524,68 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             return tuple(result)
 
         self.jitted_run_and_sample = run_and_sample_wrapper
+
+    def _maybe_warn_dsa_sparse_prefill_temporaries(self):
+        """Predict the DSA sparse-prefill score-buffer OOM at startup.
+
+        With ``DSA_PREFILL_SPARSE=1`` and the default jnp reference scorer,
+        every full indexer layer materializes an f32 ``[chunk, ctx]`` score
+        buffer during prefill and XLA keeps them alive together, so the HLO
+        temporaries scale as ``num_full_layers * chunk * ctx * 4B``. Today
+        that cliff only surfaces as RESOURCE_EXHAUSTED on the first long
+        prefill. Called after the KV pool is allocated so the free-HBM
+        reading matches the budget XLA reports in the OOM message; log-only.
+        """
+        if self.server_args.attention_backend != "dsa_sparse" or not self.use_mla_backend:
+            return
+        if os.environ.get("DSA_PREFILL_SPARSE", "0") != "1":
+            return
+        if os.environ.get("DSA_INDEXER_KERNEL_PREFILL", "0") == "1":
+            return  # the streaming kernel never materializes [chunk, ctx]
+
+        from sgl_jax.srt.kernels.dsa.ref import (
+            build_index_share_map,
+            prefill_score_temp_bytes,
+            suggest_chunked_prefill_size,
+        )
+
+        sa = self.server_args
+        cfg = self.model_config.hf_text_config
+        _, _, num_full = build_index_share_map(
+            getattr(cfg, "indexer_types", None),
+            getattr(cfg, "index_skip_topk_offset", 0),
+            cfg.num_hidden_layers,
+        )
+        chunk_tokens = (
+            sa.chunked_prefill_size if sa.chunked_prefill_size > 0 else sa.max_prefill_tokens
+        )
+        ctx_len = self.model_config.context_len
+        est = prefill_score_temp_bytes(num_full, chunk_tokens, ctx_len)
+        try:
+            free_bytes = get_available_device_memory(
+                self.device, device_indexes=sa.device_indexes, empty_cache=False
+            )
+        except Exception:  # never block startup on a diagnostics probe
+            return
+        # 0.9: the score buffers dominate the temporaries but are not all of
+        # them (the observed report runs ~1% above the formula).
+        if est > 0.9 * free_bytes:
+            suggested = suggest_chunked_prefill_size(num_full, ctx_len, int(0.9 * free_bytes))
+            logger.warning(
+                "DSA sparse prefill reference scorer needs ~%.1f GiB of HLO "
+                "temporaries (%d full layers x chunk %d x ctx %d x 4B) but only "
+                "~%.1f GiB HBM is free after weights and KV cache: the first "
+                "long prefill will likely fail with RESOURCE_EXHAUSTED. Reduce "
+                "--chunked-prefill-size (largest power of two that fits: %s) or "
+                "set DSA_INDEXER_KERNEL_PREFILL=1 to stream the scores instead "
+                "of materializing them.",
+                est / (1 << 30),
+                num_full,
+                chunk_tokens,
+                ctx_len,
+                free_bytes / (1 << 30),
+                suggested,
+            )
 
     def get_available_device_memory(self):
         distributed = jax.process_count() != 1
@@ -907,6 +973,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self,
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
+        multimodal_batch: MultimodalBatch | None = None,
     ) -> tuple[LogitsProcessorOutput, int]:
         self.forward_pass_id += 1
         precision_tracer.start_batch_trace(forward_batch.bid)
@@ -916,7 +983,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             ForwardMode.MIXED,
         ):
             input_embedding, deepstack, apply_for_deepstack = embed_multimodal_inputs(
-                multimodal_batch=forward_batch.multimodal_batch,
+                multimodal_batch=multimodal_batch,
                 input_ids=forward_batch.input_ids,
                 multimodal_model=self.model,
                 embedding_pool=self.embedding_pool,
