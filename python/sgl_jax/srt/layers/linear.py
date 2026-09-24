@@ -585,7 +585,11 @@ def prepad_replicated_quantized_linears(module: nnx.Module, multiple: int = 256)
     count = 0
     padded: dict[str, int] = {}
     skipped: dict[str, int] = {}
+    seen: dict[str, int] = {}
     for path, sub in module.iter_modules():
+        if isinstance(sub, (QuantizedLinear, LinearBase)):
+            k = f"{str(path[-1]) if path else '?'}:{type(sub).__name__}"
+            seen[k] = seen.get(k, 0) + 1
         if not isinstance(sub, QuantizedLinear):
             continue
         leaf = str(path[-1]) if path else type(sub).__name__
@@ -605,10 +609,11 @@ def prepad_replicated_quantized_linears(module: nnx.Module, multiple: int = 256)
     if count or skipped:
         logger.info(
             "Pre-padded %d replicated-N block-quant linears to a multiple of %d "
-            "output rows (removes per-step weight padding): padded=%s skipped=%s",
+            "output rows (removes per-step weight padding): padded=%s skipped=%s seen=%s",
             count,
             multiple,
             dict(sorted(padded.items())),
             dict(sorted(skipped.items())),
+            dict(sorted(seen.items())),
         )
     return count
