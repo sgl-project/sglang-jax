@@ -2083,8 +2083,7 @@ class ServerArgs:
             )
             if not (supports_nextn_overlap or supports_eagle3_overlap or supports_dflash_overlap):
                 raise ValueError(
-                    "Speculative overlap scheduler only supports DFLASH/DSPARK without TT "
-                    "attention, EAGLE3+FA, "
+                    "Speculative overlap scheduler only supports DFLASH/DSPARK, EAGLE3+FA, "
                     "or NEXTN with --speculative-eagle-topk=1 and "
                     "--speculative-num-draft-tokens == --speculative-num-steps + 1. "
                     "Please pass --disable-overlap-schedule for other speculative configs."
