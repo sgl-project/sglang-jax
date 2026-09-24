@@ -37,6 +37,14 @@ def _uses_unified_hybrid_swa(ctx: TreeCacheBuildContext) -> bool:
 
 def validate_unified_hybrid_swa_route(ctx: TreeCacheBuildContext) -> None:
     """Reject combinations that have no safe unified FULL+SWA implementation."""
+    hicache = getattr(ctx.server_args, "hicache_storage", "disable")
+    if ctx.is_hybrid_swa and hicache != "disable":
+        if not _uses_unified_hybrid_swa(ctx):
+            raise ValueError("Hybrid SWA HiCache requires UnifiedRadixCache with radix enabled")
+        if hicache != "none":
+            raise ValueError("Hybrid SWA HiCache supports L2 only (--hicache-storage none)")
+        if getattr(ctx.server_args, "nnodes", 1) != 1:
+            raise ValueError("Hybrid SWA HiCache requires single-host serving")
     if not _uses_unified_hybrid_swa(ctx):
         return
 
@@ -44,10 +52,6 @@ def validate_unified_hybrid_swa_route(ctx: TreeCacheBuildContext) -> None:
         raise ValueError(
             "--enable-unified-radix-tree cannot activate FULL+SWA+RECURRENT "
             "for a hybrid SWA recurrent model"
-        )
-    if getattr(ctx.server_args, "hicache_storage", "disable") != "disable":
-        raise ValueError(
-            "--enable-unified-radix-tree does not support hybrid SWA with " "--hicache-storage"
         )
     if ctx.has_speculative:
         raise ValueError(

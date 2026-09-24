@@ -160,6 +160,7 @@ class SchedulePolicy:
             r.last_node = match_result.last_device_node
             r.last_host_node = match_result.last_host_node
             r.host_hit_length = match_result.host_hit_length
+            r.swa_host_hit_length = match_result.swa_host_hit_length
 
             # NOTE(sang): This logic is for in-batch prefix caching;
             # If there are more than 1 request that have small matching prefix from
@@ -457,7 +458,8 @@ class PrefillAdder:
     def add_chunked_req(self, req: Req):
         dp_rank = req.dp_rank if req.dp_rank is not None else 0
         _rem_tokens = min(
-            self.rem_chunk_tokens_list[dp_rank], int(self.rem_total_tokens_for_dp(dp_rank))
+            self.rem_chunk_tokens_list[dp_rank],
+            int(self.rem_total_tokens_for_dp(dp_rank)),
         )
         if self.is_hybrid:
             _rem_tokens = min(
@@ -624,13 +626,27 @@ class PrefillAdder:
         real_input_tokens = req.extend_input_len - req.host_hit_length
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
+        hybrid_restore = (
+            self.is_hybrid
+            and getattr(self.tree_cache, "hicache_enabled", False)
+            and req.host_hit_length > 0
+        )
+        swa_restore = 0
+        if hybrid_restore:
+            _, swa_restore = self.tree_cache.get_load_back_sizes(req.last_host_node)
+            req.swa_host_hit_length = swa_restore
+        swa_extend = real_input_tokens if hybrid_restore else req.extend_input_len
 
         if total_tokens >= self.rem_total_tokens_for_dp(dp_rank):
             return AddReqResult.NO_TOKEN
 
         if self.is_hybrid:
-            swa_needed = self._swa_budget_for_req(req.extend_input_len, dp_rank)
-            if swa_needed >= self.rem_swa_tokens_for_dp(dp_rank):
+            swa_needed = swa_restore + self._swa_budget_for_req(swa_extend, dp_rank)
+            if swa_needed >= self.rem_swa_tokens_for_dp(dp_rank) and (
+                not hybrid_restore
+                or self._swa_budget_for_req(req.extend_input_len, dp_rank)
+                >= self.rem_swa_tokens_for_dp(dp_rank)
+            ):
                 return AddReqResult.NO_TOKEN
 
         total_can_run = sum(len(v) for v in self.can_run_list.values())
@@ -651,9 +667,17 @@ class PrefillAdder:
                 return AddReqResult.NO_TOKEN
 
             if self.is_hybrid:
-                swa_needed = self._swa_budget_for_req(req.extend_input_len, dp_rank)
+                swa_needed = swa_restore + self._swa_budget_for_req(swa_extend, dp_rank)
                 if swa_needed >= self.rem_swa_tokens_for_dp(dp_rank):
-                    return AddReqResult.NO_TOKEN
+                    if not hybrid_restore or self._swa_budget_for_req(
+                        req.extend_input_len, dp_rank
+                    ) >= self.rem_swa_tokens_for_dp(dp_rank):
+                        return AddReqResult.NO_TOKEN
+                    # A whole host node may overhang the SWA window. Do not
+                    # indefinitely retry this restore when recompute fits.
+                    req.host_hit_length = req.swa_host_hit_length = 0
+                    req.last_host_node = req.last_node
+                    hybrid_restore = False
 
             # HiCache: if chunked prefill would reject (trunc_len <= 0), bail
             # before init_load_back — it allocates device pages, un-tombstones
@@ -675,11 +699,23 @@ class PrefillAdder:
                 # Only the direct backend pins host sources across device
                 # eviction. JAX must stay within free capacity: write-back
                 # eviction could otherwise evict the prefix being restored.
-                mem_quota = self.token_to_kv_pool_allocator.available_size(dp_rank)
+                allocator = self.token_to_kv_pool_allocator
+                mem_quota = allocator.available_size(dp_rank)
+                restore_kwargs = {}
+                if hybrid_restore:
+                    mem_quota = allocator.full_available_size(dp_rank)
+                    restore_kwargs["swa_mem_quota"] = allocator.swa_available_size(dp_rank)
                 if getattr(self.tree_cache, "_direct_hicache", False):
                     mem_quota = self.rem_total_tokens_for_dp(dp_rank)
+                    if hybrid_restore:
+                        restore_kwargs["swa_mem_quota"] = self.rem_swa_tokens_for_dp(
+                            dp_rank
+                        ) - self._swa_budget_for_req(swa_extend, dp_rank)
                 new_indices, last_node, flush_plan = self.tree_cache.init_load_back(
-                    req.last_host_node, req.host_hit_length, mem_quota=mem_quota
+                    req.last_host_node,
+                    req.host_hit_length,
+                    mem_quota=mem_quota,
+                    **restore_kwargs,
                 )
                 if len(new_indices) > 0:
                     self.pending_h2d.extend(flush_plan)
@@ -687,8 +723,17 @@ class PrefillAdder:
                     req.last_node = last_node
                     req.last_host_node = last_node
                     req.host_hit_length = max(0, req.host_hit_length - len(new_indices))
+                    req.swa_host_hit_length = 0
                     prefix_len = len(req.prefix_indices)
                     req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
+
+                elif hybrid_restore:
+                    # Failed all-or-nothing restore leaves no reservations. Recompute
+                    # needs the original SWA allocation budget, not the L2 estimate.
+                    if self._swa_budget_for_req(req.extend_input_len, dp_rank) >= (
+                        self.rem_swa_tokens_for_dp(dp_rank)
+                    ):
+                        return AddReqResult.NO_TOKEN
 
             req.last_matched_prefix_len = prefix_len
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)

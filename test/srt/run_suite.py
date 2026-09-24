@@ -21,6 +21,7 @@ class TestFile:
     )
     runner: str = "python"
     extra_deps: list[str] | None = None
+    env: dict[str, str] | None = None
 
 
 def run_with_timeout(
@@ -118,7 +119,7 @@ def run_unittest_files(
                         [sys.executable, "-m", "unittest", test_path],
                         stdout=sys.stdout,
                         stderr=sys.stderr,
-                        env=os.environ,
+                        env={**os.environ, **(file_entry.env or {})},
                         cwd=os.path.dirname(filename),
                     )
                     process.wait()
@@ -175,7 +176,7 @@ def run_unittest_files(
                     cmd,
                     stdout=sys.stdout,
                     stderr=sys.stderr,
-                    env=os.environ,
+                    env={**os.environ, **(file_entry.env or {})},
                 )
                 process.wait()
 
@@ -444,6 +445,40 @@ suites = {
             runner="pytest",
         ),
         TestFile("python/sgl_jax/test/mem_cache/test_hicache_e2e.py", 5, runner="pytest"),
+        TestFile(
+            "python/sgl_jax/test/mem_cache/test_host_kv_pool_rank.py",
+            0.1,
+            runner="pytest",
+        ),
+        TestFile(
+            "python/sgl_jax/test/mem_cache/test_hybrid_hicache.py",
+            0.2,
+            runner="pytest",
+            env={
+                "JAX_PLATFORMS": "cpu",
+                "XLA_FLAGS": "--xla_force_host_platform_device_count=4",
+            },
+        ),
+        TestFile(
+            "python/sgl_jax/test/mem_cache/test_hybrid_hicache_core.py",
+            0.2,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "XLA_FLAGS": "--xla_force_host_platform_device_count=1"},
+        ),
+        TestFile(
+            "python/sgl_jax/test/mem_cache/test_hybrid_hicache_core_dp.py",
+            0.1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "XLA_FLAGS": "--xla_force_host_platform_device_count=4"},
+        ),
+        TestFile(
+            "python/sgl_jax/test/mem_cache/test_hybrid_hicache_scheduler.py",
+            0.1,
+            runner="pytest",
+        ),
+        TestFile("test/srt/test_hybrid_hicache_acceptance.py", 0.1, runner="pytest"),
+        TestFile("test/srt/test_hybrid_hicache_capture.py", 0.1, runner="pytest"),
+        TestFile("test/srt/test_hybrid_hicache_transfer_probe.py", 0.1, runner="pytest"),
         TestFile("python/sgl_jax/test/test_kv_cache_builder.py", 0.1, runner="pytest"),
         TestFile("test/srt/test_dp_schedule_policy.py", 0.2, runner="pytest"),
         TestFile("test/srt/test_dp_schedule_shape_aware.py", 0.2, runner="pytest"),

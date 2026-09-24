@@ -53,6 +53,7 @@ class FullComponent(TreeComponent):
     def redistribute_on_node_split(self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode):
         ct = self.component_type
         new_parent.component_data[ct].lock_ref = child.component_data[ct].lock_ref
+        new_parent.component_data[ct].host_lock_ref = child.component_data[ct].host_lock_ref
         child_cd = child.component_data[ct]
         split_len = len(new_parent.key)
         if child_cd.value is not None:

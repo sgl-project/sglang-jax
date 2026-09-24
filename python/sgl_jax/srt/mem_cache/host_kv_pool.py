@@ -296,11 +296,24 @@ class LRUHostKVPool(HostKVPool):
         partition_spec: PartitionSpec,
         *,
         pool_name: str = "hicache",
+        dp_size: int = 1,
     ) -> None:
         if pool_size <= 0:
             raise ValueError(f"pool_size must be positive, got {pool_size}")
+        if dp_size <= 0:
+            raise ValueError(f"dp_size must be positive, got {dp_size}")
+        if dp_size > 1 and int(device_pool.dp_size) != dp_size:
+            raise ValueError("host dp_size must match device pool dp_size")
         self._device_pool = device_pool
         self._pool_size = pool_size
+        self._dp_size = dp_size
+        # Stable, disjoint handle intervals; any remainder belongs to lower
+        # ranks. Freeing a slot never moves capacity to another rank.
+        base, extra = divmod(pool_size, dp_size)
+        self._rank_capacity = [base + (rank < extra) for rank in range(dp_size)]
+        self._handle_rank = [
+            rank for rank, capacity in enumerate(self._rank_capacity) for _ in range(capacity)
+        ]
         self._page_size = page_size
         self._layer_num = layer_num
         self._per_layer_shape = tuple(per_layer_shape)
@@ -370,7 +383,8 @@ class LRUHostKVPool(HostKVPool):
         # evict (only the tree cache knows which buffer_id a node points at), so
         # the tree cache must release an LRU slot before retrying.
         with self._lock:
-            if not self._free_ids:
+            free_rank0 = next((pid for pid in self._free_ids if self._handle_rank[pid] == 0), None)
+            if free_rank0 is None:
                 self._exhaust_count += 1
                 now = time.time()
                 if now - self._last_exhaust_log >= 1.0:
@@ -384,7 +398,8 @@ class LRUHostKVPool(HostKVPool):
                         self._exhaust_count,
                     )
                 return None
-            buffer_id = self._free_ids.pop(0)
+            buffer_id = free_rank0
+            self._free_ids.remove(buffer_id)
             self._allocated[buffer_id] = True
             self._generation[buffer_id] += 1
             used = self._pool_size - len(self._free_ids)
@@ -412,7 +427,7 @@ class LRUHostKVPool(HostKVPool):
     # reserve/release. The control plane speaks PAGE ids; each slot holds exactly
     # one device page. These map 1:1 onto a future raiden d2h/h2d block interface.
 
-    def alloc(self, need_pages: int) -> np.ndarray | None:
+    def alloc(self, need_pages: int, dp_rank: int = 0) -> np.ndarray | None:
         """Pop ``need_pages`` free page slots, returning their ids.
 
         All-or-nothing: returns ``None`` if the request can't be satisfied in
@@ -421,8 +436,10 @@ class LRUHostKVPool(HostKVPool):
         """
         if need_pages <= 0:
             raise ValueError(f"need_pages must be positive, got {need_pages}")
+        self._validate_rank(dp_rank)
         with self._lock:
-            if len(self._free_ids) < need_pages:
+            free_rank = [pid for pid in self._free_ids if self._handle_rank[pid] == dp_rank]
+            if len(free_rank) < need_pages:
                 self._exhaust_count += 1
                 now = time.time()
                 if now - self._last_exhaust_log >= 1.0:
@@ -432,12 +449,14 @@ class LRUHostKVPool(HostKVPool):
                         "exhaust_count=%d); tree cache must evict before retry",
                         self._pool_name,
                         need_pages,
-                        len(self._free_ids),
-                        self._pool_size,
+                        len(free_rank),
+                        self._rank_capacity[dp_rank],
                         self._exhaust_count,
                     )
                 return None
-            pages = [self._free_ids.pop(0) for _ in range(need_pages)]
+            pages = free_rank[:need_pages]
+            for pid in pages:
+                self._free_ids.remove(pid)
             for pid in pages:
                 self._allocated[pid] = True
                 self._generation[pid] += 1
@@ -466,6 +485,7 @@ class LRUHostKVPool(HostKVPool):
                     raise RuntimeError(
                         f"free of locked page id={pid} (lock_ref={self._lock_ref[pid]})"
                     )
+            for pid in unique:
                 self._drop_pending(pid)
                 self._slots[pid] = None
                 self._allocated[pid] = False
@@ -494,6 +514,7 @@ class LRUHostKVPool(HostKVPool):
                 self._require_allocated(buffer_id)
             gens = {bid: self._generation[bid] for bid in host_buffer_ids}
         self._require_device_pages(device_indices)
+        self._require_matching_ranks(device_indices, host_buffer_ids)
         buffers = self._device_pool.kv_buffer
         n = len(device_indices)
         # Bucket the page count so each layer's gather compiles once per bucket
@@ -634,6 +655,7 @@ class LRUHostKVPool(HostKVPool):
         if not host_buffer_ids:
             return
         self._require_device_pages(device_indices)
+        self._require_matching_ranks(device_indices, host_buffer_ids)
         from sgl_jax.srt.mem_cache.memory_pool import write_kv_layer
 
         PS = self._page_size
@@ -757,13 +779,18 @@ class LRUHostKVPool(HostKVPool):
         """
         from sgl_jax.srt.disaggregation.prefill import _KV_GATHER_PAGE_BUCKETS
 
-        # Largest single transfer serving can do = min(host slots, device pages).
+        # Largest single-rank transfer serving can do = min(rank host slots,
+        # rank device pages). Rank 0 warms the shared compiled shapes.
         # ``device_pool.size`` is token capacity, so // page_size. A transfer of
         # ``r`` real pages compiles shape ``_pad_to_page_bucket(r)``; warm by REAL
         # count (never more than ``cap_real`` slots, so alloc always fits) and let
         # the transfer pad internally — covering the top partial bucket too.
         dev_pages_total = int(self._device_pool.size) // self._page_size
-        cap_real = min(self._pool_size, dev_pages_total)
+        cap_real = min(
+            self._rank_capacity[0],
+            dev_pages_total // self._dp_size,
+            int(self._device_pool.kv_buffer[0].shape[0]) // self._dp_size,
+        )
         if max_pages is not None:
             cap_real = min(cap_real, int(max_pages))
         if cap_real <= 0:
@@ -811,14 +838,21 @@ class LRUHostKVPool(HostKVPool):
             time.perf_counter() - t0,
         )
 
-    def available_size(self) -> int:
+    def available_size(self, dp_rank: int | None = None) -> int:
         """Free page slots (HiCache control plane counts in pages)."""
+        if dp_rank is not None:
+            self._validate_rank(dp_rank)
         with self._lock:
-            return len(self._free_ids)
+            if dp_rank is None:
+                return len(self._free_ids)
+            return sum(self._handle_rank[pid] == dp_rank for pid in self._free_ids)
 
-    def total_size(self) -> int:
+    def total_size(self, dp_rank: int | None = None) -> int:
         """Total page slots in the pool (free + in-use)."""
-        return self._pool_size
+        if dp_rank is None:
+            return self._pool_size
+        self._validate_rank(dp_rank)
+        return self._rank_capacity[dp_rank]
 
     # ------------------------------------------------------------------
     # LRU / lock_ref mechanism (private to this class, not in the ABC).
@@ -859,6 +893,45 @@ class LRUHostKVPool(HostKVPool):
         for idx in device_indices:
             if not (0 <= int(idx) < n_dev):
                 raise ValueError(f"device page id={idx} outside range [0, {n_dev})")
+
+    def _validate_rank(self, dp_rank: int) -> None:
+        if not isinstance(dp_rank, (int, np.integer)) or not 0 <= dp_rank < self._dp_size:
+            raise ValueError(f"DP rank {dp_rank} outside range [0, {self._dp_size})")
+
+    def _require_matching_ranks(self, device_indices, host_buffer_ids) -> None:
+        if self._dp_size == 1:
+            return
+        n_dev = int(self._device_pool.kv_buffer[0].shape[0])
+        if n_dev % self._dp_size:
+            raise ValueError("device page axis must divide evenly across DP ranks")
+        pages_per_rank = n_dev // self._dp_size
+        for device_page, host_id in zip(device_indices, host_buffer_ids):
+            if not 0 <= int(host_id) < self._pool_size:
+                raise ValueError(f"buffer_id={host_id} outside pool range [0, {self._pool_size})")
+            if int(device_page) // pages_per_rank != self._handle_rank[int(host_id)]:
+                raise ValueError("Host and device DP ranks differ")
+
+    def pin(self, host_buffer_ids) -> None:
+        ids = [int(pid) for pid in host_buffer_ids]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Duplicate host page handles")
+        with self._lock:
+            for pid in ids:
+                self._require_allocated(pid)
+            for pid in ids:
+                self._lock_ref[pid] += 1
+
+    def unpin(self, host_buffer_ids) -> None:
+        ids = [int(pid) for pid in host_buffer_ids]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Duplicate host page handles")
+        with self._lock:
+            for pid in ids:
+                self._require_allocated(pid)
+                if self._lock_ref[pid] <= 0:
+                    raise RuntimeError(f"unpin underflow on buffer_id={pid}")
+            for pid in ids:
+                self._lock_ref[pid] -= 1
 
     def inc_lock_ref(self, buffer_id: int) -> None:
         with self._lock:

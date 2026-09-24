@@ -12,6 +12,7 @@ def _make_server_args(**overrides):
     args.max_seq_len = 4096
     args.enable_unified_radix_tree = False
     args.hicache_storage = "disable"
+    args.nnodes = 1
     args.pd_disaggregation = ""
     args.disaggregation_mode = "null"
     for k, v in overrides.items():
@@ -126,7 +127,6 @@ class TestBuildKVCache(unittest.TestCase):
                 r"FULL\+SWA\+RECURRENT",
                 {"is_hybrid_recurrent": True},
             ),
-            ("HiCache", {"hicache_storage": "none"}, None, "--hicache-storage", {}),
             (
                 "speculative decoding",
                 {},
