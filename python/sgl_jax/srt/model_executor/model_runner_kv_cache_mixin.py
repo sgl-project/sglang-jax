@@ -517,10 +517,14 @@ class ModelRunnerKVCacheMixin:
                 usable_pages = token_capacity // self.server_args.page_size
                 allocated_pages = usable_pages + dp_size
                 step = math.lcm(dp_size, data_mesh_dim)
-                if allocated_pages >= step + dp_size:
-                    allocated_pages = (allocated_pages // step) * step
-                    usable_pages = allocated_pages - dp_size
-                    token_capacity = usable_pages * self.server_args.page_size
+                allocated_pages = (allocated_pages // step) * step
+                usable_pages = allocated_pages - dp_size
+                if usable_pages <= 0:
+                    raise RuntimeError(
+                        "Not enough KV cache capacity to align allocated pages "
+                        f"to data={data_mesh_dim} with dp_size={dp_size} reserved pages."
+                    )
+                token_capacity = usable_pages * self.server_args.page_size
 
         logger.info(
             "ModelRunner per dp max_total_num_tokens after dp_size %s: %s",

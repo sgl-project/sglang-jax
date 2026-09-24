@@ -447,8 +447,6 @@ def test_embedding_pool_capacity_and_pages_follow_lm_limits():
 
 
 def test_apply_token_constraints_aligns_allocated_pages_with_reserved_dp_pages():
-    from sgl_jax.srt.model_executor.model_runner import ModelRunner
-
     page_size = 64
 
     # Case 1: data=2, dp_size=1 with 780 initial usable pages.
@@ -459,7 +457,7 @@ def test_apply_token_constraints_aligns_allocated_pages_with_reserved_dp_pages()
         server_args=types.SimpleNamespace(page_size=page_size),
         mesh=types.SimpleNamespace(shape={"data": 2, "tensor": 4}),
     )
-    cap_dp1 = ModelRunner._apply_token_constraints(
+    cap_dp1 = ModelRunnerKVCacheMixin._apply_token_constraints(
         runner_dp1,
         token_capacity=780 * page_size,
         max_total_tokens=None,
@@ -476,7 +474,7 @@ def test_apply_token_constraints_aligns_allocated_pages_with_reserved_dp_pages()
         server_args=types.SimpleNamespace(page_size=page_size),
         mesh=types.SimpleNamespace(shape={"data": 4, "tensor": 2}),
     )
-    cap_dp4 = ModelRunner._apply_token_constraints(
+    cap_dp4 = ModelRunnerKVCacheMixin._apply_token_constraints(
         runner_dp4,
         token_capacity=195 * page_size,
         max_total_tokens=None,
@@ -487,3 +485,18 @@ def test_apply_token_constraints_aligns_allocated_pages_with_reserved_dp_pages()
     assert allocated_pages_dp4 == 784
     assert allocated_pages_dp4 % 4 == 0
 
+
+@pytest.mark.parametrize("pages,expected_pages", [(2, None), (3, 3), (4, 3)])
+def test_apply_token_constraints_small_capacity(pages, expected_pages, monkeypatch):
+    monkeypatch.delenv("SGLANG_CI_SMALL_KV_SIZE", raising=False)
+    runner = types.SimpleNamespace(
+        server_args=types.SimpleNamespace(page_size=64),
+        mesh=types.SimpleNamespace(shape={"data": 4, "tensor": 1}),
+    )
+    if expected_pages is None:
+        with pytest.raises(RuntimeError, match="Not enough KV cache capacity"):
+            ModelRunnerKVCacheMixin._apply_token_constraints(runner, pages * 64, None, 1)
+    else:
+        cap = ModelRunnerKVCacheMixin._apply_token_constraints(runner, pages * 64, None, 1)
+        assert cap == expected_pages * 64
+        assert (cap // 64 + 1) % 4 == 0
