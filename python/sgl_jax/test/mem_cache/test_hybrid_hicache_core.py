@@ -16,6 +16,33 @@ from sgl_jax.test.mem_cache.test_hybrid_hicache import (
 )
 
 
+def assert_quarantined_reset_preserves_ownership(cache, alloc, node):
+    def snapshot():
+        return (
+            cache.root_node,
+            tuple(cache.root_node.children.items()),
+            alloc.full_available_size(),
+            alloc.swa_available_size(),
+            alloc.full_to_swa_index_mapping.tobytes(),
+            tuple(
+                (
+                    cd.lock_ref,
+                    cd.host_lock_ref,
+                    None if cd.value is None else tuple(cd.value),
+                    None if cd.host_value is None else tuple(cd.host_value),
+                )
+                for cd in node.component_data
+            ),
+            tuple(pool.available_size() for pool in cache.host_pools.values()),
+            tuple(tuple(pool._lock_ref) for pool in cache.host_pools.values()),
+        )
+
+    before = snapshot()
+    with pytest.raises(RuntimeError, match="quarantined"):
+        cache.reset()
+    assert snapshot() == before
+
+
 def test_pending_backup_is_not_host_hit_and_split_settles(monkeypatch):
     cache, alloc, _ = make_cache(window=8, policy="write_back")
     try:
@@ -281,6 +308,13 @@ def test_submit_error_after_enqueue_keeps_restore_resources_protected(monkeypatc
         )
         assert all(any(pool._lock_ref) for pool in cache.host_pools.values())
         assert node.component_data[CT.SWA].metadata["skip_lock_receipts"]
+        assert_quarantined_reset_preserves_ownership(cache, alloc, node)
+        gate.set()
+        controller._executor.shutdown(wait=True)
+        assert not controller._inflight_load
+        # Worker completion does not recover the abandoned transaction's
+        # destination ownership or source pins.
+        assert_quarantined_reset_preserves_ownership(cache, alloc, node)
     finally:
         gate.set()
         shutdown(cache)
@@ -376,10 +410,12 @@ def test_backup_submit_failure_releases_only_definitely_unsubmitted_work(monkeyp
             assert pool.available_size() == before - 8
             assert len(controller._inflight) == 8
             assert all(node.component_data[ct].lock_ref == 1 for ct in (CT.FULL, CT.SWA))
+            assert_quarantined_reset_preserves_ownership(cache, alloc, node)
             # Start the real queued worker only after checking its reservation
             # remains held despite submit returning no Future.
             controller._executor.submit(lambda: None).result(timeout=5)
             assert not controller._inflight
+            assert_quarantined_reset_preserves_ownership(cache, alloc, node)
     finally:
         shutdown(cache)
 
@@ -491,8 +527,14 @@ def test_native_uncertain_failure_quarantines_both_component_reservations(monkey
     )
     assert node.component_data[CT.FULL].lock_ref > 0
     assert all(node.component_data[ct].host_lock_ref > 0 for ct in (CT.FULL, CT.SWA))
+    root = cache.root_node
+    host_handles = tuple(tuple(p._pages) for p in cache.host_pools.values())
+    full_host = node.component_data[CT.FULL].host_value.copy()
     with pytest.raises(RuntimeError, match="quarantined"):
         cache.reset()
+    assert cache.root_node is root and node in root.children.values()
+    assert tuple(tuple(p._pages) for p in cache.host_pools.values()) == host_handles
+    np.testing.assert_array_equal(node.component_data[CT.FULL].host_value, full_host)
 
 
 def test_mixed_device_and_host_window_only_allocates_missing_swa():
