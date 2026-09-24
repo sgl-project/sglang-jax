@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from pydantic import Field as PydanticField
 
 from sgl_jax.srt.disaggregation.base.transfer import (
+    RecurrentStateSpec,
     chunk_transfer_id,
     parse_chunk_transfer_id,
 )
@@ -68,7 +69,7 @@ class PrefillInfo:
     kv_dtype: str = ""
     chunk_prefill_transfer: bool = False
     transport_metadata: dict[str, object] = field(default_factory=lambda: {"engine": "jax"})
-    recurrent_state_spec: dict[str, object] | None = None
+    recurrent_state_spec: RecurrentStateSpec | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -110,7 +111,9 @@ def resolve_kv_dtype_name(dtype: object) -> str:
         return str(dtype)
 
 
-def _coerce_recurrent_spec(spec_or_pool: object | None) -> dict[str, object] | None:
+def _coerce_recurrent_spec(
+    spec_or_pool: object | None,
+) -> RecurrentStateSpec | None:
     if spec_or_pool is None:
         return None
     if isinstance(spec_or_pool, dict):
@@ -120,7 +123,7 @@ def _coerce_recurrent_spec(spec_or_pool: object | None) -> dict[str, object] | N
     return get_recurrent_state_spec(spec_or_pool)
 
 
-def _validate_recurrent_pool_sizing(role: str, spec: dict[str, object]) -> None:
+def _validate_recurrent_pool_sizing(role: str, spec: RecurrentStateSpec) -> None:
     has_sizing = any(
         k in spec and spec.get(k) is not None
         for k in ("size", "dp_size", "slots_per_rank", "total_slots")
@@ -225,7 +228,7 @@ def check_prefill_compat(
     expected_dp_rank: int | None = None,
     expected_dp_size: int | None = None,
     expected_chunk_prefill_transfer: bool | None = None,
-    local_recurrent_state_spec: dict[str, object] | None = None,
+    local_recurrent_state_spec: RecurrentStateSpec | None = None,
 ) -> None:
     """Raise ``ValueError`` if the prefill peer's KV layout is incompatible.
 
@@ -298,7 +301,7 @@ class RegisterPrefillRequest(BaseModel):
     kv_dtype: str = ""
     chunk_prefill_transfer: bool = False
     transport_metadata: dict[str, object] = PydanticField(default_factory=lambda: {"engine": "jax"})
-    recurrent_state_spec: dict[str, object] | None = None
+    recurrent_state_spec: RecurrentStateSpec | None = None
 
 
 class RegisterTransferRequest(BaseModel):
@@ -814,7 +817,7 @@ class BootstrapClient:
         kv_dtype: str = "",
         chunk_prefill_transfer: bool = False,
         transport_metadata: dict[str, object] | None = None,
-        recurrent_state_spec: dict[str, object] | None = None,
+        recurrent_state_spec: RecurrentStateSpec | None = None,
     ) -> None:
         payload = {
             "bootstrap_key": bootstrap_key,

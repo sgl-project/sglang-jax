@@ -20,7 +20,9 @@ from sgl_jax.srt.disaggregation.base.transfer import (
     AdmissionState,
     DecodeMetadataContext,
     DecodeTransferContext,
+    RecurrentStateSpec,
     TransferBackend,
+    TransferPayload,
 )
 from sgl_jax.srt.disaggregation.bootstrap import BootstrapClient, PrefillInfoCache
 from sgl_jax.srt.disaggregation.common.capacity import per_rank_inflight_limit
@@ -89,6 +91,7 @@ class DecodeBookkeeping:
     # Prefill-side info from bootstrap, stashed at intake so KV alloc +
     # receiver setup can be deferred to the capacity-gated admission step.
     p_info: dict | None = None
+    recurrent_state_spec: RecurrentStateSpec | None = None
     cancelled: bool = False
     created_at: float = field(default_factory=time.monotonic)
 
@@ -494,6 +497,7 @@ class SchedulerDisaggregationDecodeMixin:
                 req_id=req.rid,
                 req=req,
                 p_info=p_info,
+                recurrent_state_spec=local_recurrent_spec,
             )
             self._pd_mark_time(req, "prealloc_entry")
             self.disagg_prealloc_queue.add(entry)
@@ -538,8 +542,8 @@ class SchedulerDisaggregationDecodeMixin:
             if state == KVPoll.SUCCESS:
                 try:
                     entry.receiver.commit(
-                        lambda kv, req=entry.req, indices=entry.kv_indices: (
-                            self._install_received_kv(req, indices, kv)
+                        lambda payload, req=entry.req, indices=entry.kv_indices: (
+                            self._install_received_kv(req, indices, payload)
                         )
                     )
                     # D recomputes the last prompt token. If that token alone
@@ -712,6 +716,7 @@ class SchedulerDisaggregationDecodeMixin:
                     bootstrap_room=entry.req.bootstrap_room,
                     prefill_dp_rank=prefill_dp_rank,
                     peer_info=entry.p_info or {},
+                    recurrent_state_spec=entry.recurrent_state_spec,
                 )
             )
             if not metadata_ready:
@@ -747,6 +752,7 @@ class SchedulerDisaggregationDecodeMixin:
                         direct_commit=lambda expected, req=entry.req, indices=kv_indices: (
                             self._commit_direct_received_kv(req, indices, expected)
                         ),
+                        recurrent_state_spec=entry.recurrent_state_spec,
                     )
                 )
             except Exception:
@@ -839,7 +845,13 @@ class SchedulerDisaggregationDecodeMixin:
             for _ in range(kv_pool.layer_num)
         ]
 
-    def _install_received_kv(self: Scheduler, req: Req, kv_indices, kv) -> None:
+    def _install_received_kv(
+        self: Scheduler,
+        req: Req,
+        kv_indices,
+        payload: TransferPayload,
+    ) -> None:
+        kv = payload["kv"]
         self._maybe_log_decode_pull_debug(req, kv)
         self._write_kv_to_pool(req, kv_indices, kv)
         self._record_decode_transfer_bytes(kv)

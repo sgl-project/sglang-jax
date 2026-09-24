@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from functools import partial
+from typing import TypedDict
 
 import jax
 import jax.numpy as jnp
@@ -378,7 +379,23 @@ def _resolve_dtype_str(dtype: object) -> str:
         return str(dtype)
 
 
-def get_recurrent_state_spec(recurrent_state_pool: object | None) -> dict[str, object] | None:
+class RecurrentStateSpec(TypedDict, total=False):
+    """Per-slot recurrent state shape and pool metadata for PD validation."""
+
+    num_layers: int
+    recurrent_shape: list[int] | tuple[int, ...]
+    conv_shape: list[int] | tuple[int, ...]
+    temporal_dtype: str
+    conv_dtype: str
+    size: int
+    dp_size: int
+    slots_per_rank: int
+    total_slots: int
+
+
+def get_recurrent_state_spec(
+    recurrent_state_pool: object | None,
+) -> RecurrentStateSpec | None:
     """Extract per-slot shape and dtype metadata from a ``RecurrentStatePool``."""
     if recurrent_state_pool is None:
         return None

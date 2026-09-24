@@ -36,6 +36,9 @@ from sgl_jax.srt.disaggregation.base.transfer import (
     DecodeTransferContext,
     PrefillTransfer,
     PrefillTransferContext,
+    TransferPayload,
+    normalize_decode_specs,
+    validate_transfer_payload,
 )
 from sgl_jax.srt.disaggregation.common.core import (
     CommonKVManager,
@@ -208,7 +211,10 @@ class JaxTransferKVManager(CommonKVManager):
     def start_prefill(self, context: PrefillTransferContext) -> PrefillTransfer:
         sender = self.create_sender(context.req_id)
         try:
-            payload = context.payload_factory()
+            payload = validate_transfer_payload(
+                context.payload_factory(),
+                recurrent_state_spec=context.recurrent_state_spec,
+            )
             if context.on_payload is not None:
                 context.on_payload(payload)
             sender.init(None, transfer_id=context.transfer_id)
@@ -237,11 +243,12 @@ class JaxTransferKVManager(CommonKVManager):
         receiver = self.create_receiver(context.req_id)
         try:
             peer = context.peer_info
+            specs = normalize_decode_specs(context.spec_factory())
             receiver.init(
                 PMetadata(
                     remote_addr=f"{peer['host']}:{peer['transfer_port']}",
                     uuid=context.transfer_id,
-                    specs={"kv": context.spec_factory()},
+                    specs=specs,
                     p_side_channel_host=str(peer["host"]),
                     p_side_channel_port=int(peer["side_channel_port"]),
                 )
@@ -274,7 +281,7 @@ class JaxTransferKVManager(CommonKVManager):
     def producer_handoff(
         self,
         uuid: str,
-        payload: dict[str, jax.Array],
+        payload: TransferPayload,
         *,
         use_d2h_staging: bool,
         buffer_id: int | None = None,
@@ -368,7 +375,7 @@ class JaxTransferKVSender(KVSender, StateHolder):
         self._mgr = mgr
         self._req_id = req_id
         self._transfer_id: str | None = None
-        self._payload: dict[str, jax.Array] | None = None
+        self._payload: TransferPayload | None = None
         self._use_d2h_staging: bool | None = None
         self._buffer_id: int | None = None
         self._status: TransferStatus | None = None
@@ -395,7 +402,7 @@ class JaxTransferKVSender(KVSender, StateHolder):
             self._transition_to(KVPoll.WAITING_FOR_INPUT)
 
     def attach_payload(
-        self, payload: dict[str, jax.Array], *, use_d2h_staging: bool, buffer_id: int | None = None
+        self, payload: TransferPayload, *, use_d2h_staging: bool, buffer_id: int | None = None
     ) -> None:
         if self._payload is not None:
             raise RuntimeError(f"sender {self._req_id!r} payload already attached")
@@ -569,7 +576,7 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
         self._mgr = mgr
         self._req_id = req_id
         self._metadata: PMetadata | None = None
-        self._results: dict[str, jax.Array] | None = None
+        self._results: TransferPayload | None = None
         self._pull_timer: object | None = None
         self._transfer_started_at: float | None = None
         self._state_lock = threading.Lock()
@@ -579,7 +586,7 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
         return self._req_id
 
     @property
-    def result(self) -> dict[str, jax.Array] | None:
+    def result(self) -> TransferPayload | None:
         return self._results
 
     @property
@@ -589,10 +596,10 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
     def clear(self) -> None:
         self._mgr._clear_terminal_record(self._req_id, role="decode")
 
-    def commit(self, install: Callable[[object], None]) -> None:
+    def commit(self, install: Callable[[TransferPayload], None]) -> None:
         if self.state != KVPoll.SUCCESS or self._results is None:
             raise RuntimeError("cannot commit an incomplete JAX transfer")
-        install(self._results["kv"])
+        install(self._results)
 
     def abort(self) -> None:
         self.fail(reason="abort")
