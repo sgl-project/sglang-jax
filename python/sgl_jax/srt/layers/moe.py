@@ -337,11 +337,11 @@ class EPMoE(nnx.Module):
         )
         with mesh_context:
             if is_static:
-                if abstract:
-                    # The checkpoint loader preserves the incoming quantized
-                    # dtype. Dummy loading must use that same weight contract.
-                    for name in ("wi_0", "wi_1", "wo"):
-                        param = getattr(self, name)
+                # Both checkpoint and dummy loaders need placeholders with the
+                # quantized dtype before loading or generating the weights.
+                for name in ("wi_0", "wi_1", "wo"):
+                    param = getattr(self, name)
+                    if isinstance(param.value, jax.ShapeDtypeStruct):
                         param.value = jax.ShapeDtypeStruct(
                             param.value.shape, self.quantized_dtype, sharding=param.value.sharding
                         )

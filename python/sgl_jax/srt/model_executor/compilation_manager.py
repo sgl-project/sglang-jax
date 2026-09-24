@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import itertools
 import logging
 import time
 from collections.abc import Callable
@@ -22,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 class CompilationManager:
-    """Owns bucket computation, dummy batch construction, and pre-compilation."""
+    """Owns serving compile plans and executable compilation, loading, and storage."""
 
     def __init__(
         self,
@@ -138,6 +137,164 @@ class CompilationManager:
 
     # ---- Pre-compilation ----
 
+    @staticmethod
+    def restore_aot_defaults(server_args):
+        """Reuse resolved capacity defaults when loading an offline serving bundle."""
+        import json
+        from pathlib import Path
+
+        path = Path(server_args.aot_model_dir) / "serving.json"
+        if not path.exists():
+            return  # Individual IR exports contain executable.json only.
+        manifest = json.loads(path.read_text())
+        if manifest["status"] != "complete":
+            raise ValueError(f"AOT serving export is incomplete: {path}")
+        for name in ("max_running_requests", "max_total_tokens", "max_recurrent_state_size"):
+            if getattr(server_args, name) is None:
+                setattr(server_args, name, manifest[name])
+
+    @staticmethod
+    def resolve_max_running_requests(
+        server_args, context_len, attn_backend, token_capacity, pool_limit, moe_backend
+    ):
+        # Calculate max_running_requests from different constraints
+        attn_backend_limit = (
+            attn_backend.get_max_running_reqests(
+                context_len,
+                server_args.page_size,
+            )
+            * server_args.dp_size
+        )
+        server_limit = (
+            token_capacity // 2
+            if server_args.max_running_requests is None
+            else server_args.max_running_requests
+        )
+        constraints = [server_limit, pool_limit, attn_backend_limit]
+        max_running_requests = min(constraints)
+        # Log each constraint for debugging
+        logger.info("Max running requests constraints:")
+        logger.info(
+            "  - Server limit: %s %s",
+            server_limit,
+            (
+                "(max_total_tokens//2)"
+                if server_args.max_running_requests is None
+                else "(configured)"
+            ),
+        )
+        logger.info("  - Token pool size: %s", pool_limit)
+        logger.info(
+            "  - Attention backend: %s (context_len=%s, page_size=%s)",
+            attn_backend_limit,
+            context_len,
+            server_args.page_size,
+        )
+        logger.info("  → Final max_running_requests: %s", max_running_requests)
+
+        # Validate and adjust max_running_requests for Data Parallelism
+        dp_size = server_args.dp_size
+        if max_running_requests < dp_size:
+            raise ValueError(
+                f"max_running_requests ({max_running_requests}) is less than dp_size ({dp_size}). "
+                f"Please increase memory allocation or reduce dp_size."
+            )
+        if max_running_requests % dp_size != 0:
+            original_value = max_running_requests
+            max_running_requests = (max_running_requests // dp_size) * dp_size
+            logger.warning(
+                "Adjusted max_running_requests from %s to %s to be divisible by dp_size (%s)",
+                original_value,
+                max_running_requests,
+                dp_size,
+            )
+
+        # fused_ep_moe derives its EP group from the mesh (get_ep_size(mesh) =
+        # mesh['data'] * mesh['tensor']), not from --ep-size, so align against
+        # the actual mesh shape. Use the *resolved* backend from ModelConfig so
+        # architectures that hard-code FusedEPMoE (e.g. Qwen3.5 MoE) are
+        # covered even when the raw server_args string stays at "epmoe".
+        mesh_ep_size = server_args.tp_size
+        if moe_backend in ("fused", "fused_v2") and mesh_ep_size > 1:
+            from sgl_jax.srt.utils.common_utils import align_bs_for_fused_ep
+
+            assert mesh_ep_size % dp_size == 0, (
+                f"fused MoE requires mesh_ep_size ({mesh_ep_size}) to be a multiple "
+                f"of dp_size ({dp_size}) so the ep-aligned cap stays dp-aligned"
+            )
+            aligned = align_bs_for_fused_ep(max_running_requests, mesh_ep_size)
+            if aligned != max_running_requests:
+                logger.warning(
+                    "Adjusted max_running_requests from %s to %s for fused MoE "
+                    "(mesh_ep_size=%s, bt must be in {2,4,8k})",
+                    max_running_requests,
+                    aligned,
+                    mesh_ep_size,
+                )
+                max_running_requests = aligned
+
+        assert max_running_requests > 0, "max_running_request is zero"
+
+        return max_running_requests
+
+    @staticmethod
+    def get_max_padded_size(server_args, max_running_requests):
+        per_dp_tokens = server_args.max_prefill_tokens
+        if server_args.chunked_prefill_size > 0:
+            per_dp_tokens = min(per_dp_tokens, server_args.chunked_prefill_size)
+        num_tokens = per_dp_tokens * server_args.dp_size
+        batch_size = min(max_running_requests, num_tokens)
+        if batch_size % server_args.dp_size:
+            raise ValueError("max_padded_batch_size must be divisible by dp_size")
+        return batch_size, num_tokens
+
+    def iter_model_shapes(self, mode):
+        """The model shapes used by both serving warmup and offline export."""
+        if mode.is_extend():
+            for tokens in self.token_buckets:
+                yield self.max_padded_batch_size, tokens, self.cache_loc_buckets[-1]
+        elif mode.is_decode():
+            for bs, cache_loc in zip(self.bs_buckets, self.cache_loc_buckets):
+                yield bs, bs, cache_loc
+        else:
+            raise ValueError(f"No serving precompile shapes for {mode}")
+
+    @staticmethod
+    def compiler_options(backend, batch=None, overrides=None):
+        from sgl_jax.srt.model_executor.aot_dispatch import (
+            decode_no_sc_gather_compiler_options_fn,
+        )
+        from sgl_jax.srt.utils.common_utils import get_bool_env_var
+        from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
+
+        options = dict(getattr(backend, "compiler_options", None) or {})
+        if is_tpu_runtime() and get_bool_env_var("SGLANG_JAX_ENABLE_KERNEL_LOG_RECORDER"):
+            options["xla_tpu_enable_log_recorder"] = "true"
+        if batch is not None:
+            decode_options = decode_no_sc_gather_compiler_options_fn()
+            if decode_options is not None:
+                options.update(decode_options((batch,)) or {})
+        options.update(overrides or {})
+        return options
+
+    @staticmethod
+    def get_executable(lowered, mesh=None, compiler_options=None, *, store=None, output=None):
+        """Acquire an executable for a lowering, optionally persisting it.
+
+        A store selects strict offline loading: a miss never invokes the compiler.
+        Shape caching and dispatch remain in AotDispatcher for both sources.
+        """
+        if store is not None:
+            if output is not None:
+                raise ValueError("Choose executable loading or export, not both")
+            return store.load(lowered, compiler_options)
+        compiled = lowered.compile(compiler_options=compiler_options or None)
+        if output is not None:
+            from sgl_jax.srt.model_executor.aot_executable import save_executable
+
+            save_executable(compiled, lowered, mesh, compiler_options, output)
+        return compiled
+
     def precompile_all(
         self,
         forward_fn: Callable,
@@ -195,10 +352,13 @@ class CompilationManager:
             self.token_buckets,
         )
 
-        pairs = list(itertools.product([bs], self.token_buckets))
-        with tqdm(pairs, desc="[EXTEND] PRECOMPILE", leave=False) as pbar:
-            for pair in pbar:
-                bs_val, num_tokens = pair
+        with tqdm(
+            self.iter_model_shapes(ForwardMode.EXTEND),
+            desc="[EXTEND] PRECOMPILE",
+            leave=False,
+            total=len(self.token_buckets),
+        ) as pbar:
+            for bs_val, num_tokens, cache_loc_size in pbar:
                 pbar.set_postfix(bs=bs_val, tokens=num_tokens)
                 if bs_val > num_tokens:
                     logger.warning("bs=%s > num_tokens=%s, skip this pair", bs_val, num_tokens)
@@ -207,7 +367,7 @@ class CompilationManager:
                     bs_val,
                     num_tokens,
                     ForwardMode.EXTEND,
-                    self.cache_loc_buckets[-1],
+                    cache_loc_size,
                     dp_size=self.dp_size,
                     per_dp_bs_size=bs_val // self.dp_size,
                 )
@@ -253,17 +413,16 @@ class CompilationManager:
         )
 
         with tqdm(
-            enumerate(self.bs_buckets),
+            self.iter_model_shapes(ForwardMode.DECODE),
             desc="[DECODE] PRECOMPILE",
             leave=False,
             total=len(self.bs_buckets),
         ) as pbar:
-            for i, bs_val in pbar:
+            for bs_val, num_tokens, aligned_cache_loc_size in pbar:
                 pbar.set_postfix(bs=bs_val)
-                aligned_cache_loc_size = self.cache_loc_buckets[i]
                 batch = self._make_dummy_batch(
                     bs_val,
-                    bs_val,
+                    num_tokens,
                     ForwardMode.DECODE,
                     aligned_cache_loc_size,
                     dp_size=self.dp_size,

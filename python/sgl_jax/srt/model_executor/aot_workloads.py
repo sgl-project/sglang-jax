@@ -46,6 +46,7 @@ class WorkloadSpec:
     tokens_per_request: int | None
     chunked_prefill_size: int | None
     mtp_layer_idx: int | None
+    cache_loc_size: int | None = None
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,7 @@ class InputContext:
     mesh: jax.sharding.Mesh
     backend: AttentionBackend
     memory_pools: MemoryPools
+    supports_recurrent_cow: bool = False
 
     def shaped(self, shape, dtype=jnp.int32):
         return jax.ShapeDtypeStruct(shape, dtype, sharding=NamedSharding(self.mesh, P("data")))
@@ -85,7 +87,11 @@ def _attention_metadata(backend, context, spec, *, page_count=None, swa=True):
     if isinstance(backend, NativeAttention):
         return None
     if page_count is None:
-        page_count = bs * -(-spec.context_length // spec.page_size)
+        page_count = (
+            spec.cache_loc_size // spec.page_size
+            if spec.cache_loc_size is not None
+            else bs * -(-spec.context_length // spec.page_size)
+        )
     fields = {
         "cu_q_lens": vector(bs + dp),
         "cu_kv_lens": vector(bs + dp),
@@ -137,6 +143,7 @@ class WorkloadInputBuilder(ABC):
             tokens_per_request=width,
             chunked_prefill_size=options.chunked_prefill_size,
             mtp_layer_idx=options.mtp_layer_idx if self.model_role == "draft" else None,
+            cache_loc_size=getattr(options, "cache_loc_size", None),
         )
 
     def _token_shape(self, options):
@@ -165,8 +172,13 @@ class WorkloadInputBuilder(ABC):
             out_cache_loc=vector(spec.input_token_count),
             positions=vector(spec.input_token_count),
             attn_backend=context.backend,
-            cache_loc=vector(spec.request_count * padded_context),
+            cache_loc=vector(spec.cache_loc_size or spec.request_count * padded_context),
             recurrent_indices=recurrent_indices,
+            recurrent_cow_src_indices=(
+                vector(spec.request_count)
+                if context.supports_recurrent_cow and self.forward_mode.is_extend()
+                else None
+            ),
             spec_algorithm=self.spec_algorithm,
             capture_hidden_mode=self.capture_hidden_mode,
             **fields,
@@ -205,8 +217,6 @@ class PrefillInputBuilder(WorkloadInputBuilder):
             raise ValueError(
                 "num_tokens exceeds the global chunk budget (chunked_prefill_size * dp_size)"
             )
-        if tokens > options.batch_size * options.context_length:
-            raise ValueError("num_tokens exceeds batch_size * context_length")
         return tokens, None
 
     def build(self, context):

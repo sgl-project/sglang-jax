@@ -624,6 +624,35 @@ class ModelConfig:
             **kwargs,
         )
 
+    def configure_for_serving(self, server_args: ServerArgs):
+        """Apply the same model construction settings to online and offline forwards."""
+        attention_tp_size = server_args.tp_size // server_args.dp_size
+        self.validate_tensor_parallel_config(attention_tp_size)
+        self.configure_for_tensor_parallel(attention_tp_size)
+        self.log_kv_heads_info(attention_tp_size)
+        self.hf_config.enable_dp_lm_head = server_args.enable_dp_lm_head
+        self.hf_config.ep_size = server_args.ep_size
+        self.hf_config.moe_dp_size = server_args.moe_dp_size
+        self.hf_config.ep_num_redundant_experts = server_args.ep_num_redundant_experts
+        self.hf_config.moe_backend = self.moe_backend.value
+        self.hf_config.use_jax_allreduce_metadata = not server_args.disable_jax_allreduce_metadata
+        # Pick MLA forward path at server start. Only `fa` selects absorbed
+        # (the MLA Pallas kernel); `fa_mha` and `native` both decompress latent
+        # KV via kv_b_proj and run standard attention. Read by
+        # DeepseekV3DecoderLayer to construct DeepseekV3Attention; harmless on
+        # non-MLA models that ignore the attribute.
+        self.hf_config.use_absorbed_mla = server_args.attention_backend in (
+            "fa",
+            "dsa_sparse",
+        )
+        self.hf_config.use_dsa_sparse = server_args.attention_backend == "dsa_sparse"
+        self.hf_config.enable_sequence_parallel = server_args.enable_sequence_parallel
+        self.hf_config.vision_encoder_parallel = server_args.vision_encoder_parallel
+
+        self.hf_config.precompile_vision_patch_paddings = (
+            server_args.precompile_vision_patch_paddings
+        )
+
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
     def get_total_num_kv_heads(self) -> int:
         """Returns the total number of KV heads (original, not replicated)."""

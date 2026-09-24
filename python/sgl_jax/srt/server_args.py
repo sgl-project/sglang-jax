@@ -227,6 +227,11 @@ class ServerArgs:
     vision_encoder_parallel: str = "dp"
 
     disable_precompile: bool = False
+    aot_model_dir: str | None = None
+    save_aot: str | None = None
+    aot_topology: str | None = None
+    aot_topology_name: str | None = None
+    aot_host_bounds: list[int] | None = None
 
     # Speculative decoding
     speculative_algorithm: str | None = None
@@ -331,6 +336,12 @@ class ServerArgs:
     disaggregation_max_inflight_transfers: int = 8
 
     def __post_init__(self):
+        if self.aot_model_dir:
+            from sgl_jax.srt.model_executor.compilation_manager import (
+                CompilationManager,
+            )
+
+            CompilationManager.restore_aot_defaults(self)
         self._check_disaggregation_overlap_args()
         # Set missing default values
         if self.tokenizer_path is None:
@@ -345,7 +356,10 @@ class ServerArgs:
             )
 
         # update device
-        if self.device:
+        if self.save_aot:
+            # CPU is the compiler host; device continues to describe the target.
+            self.device = self.device or "tpu"
+        elif self.device:
             platform_env = os.environ.get("JAX_PLATFORMS", self.device)
             assert (
                 self.device == platform_env
@@ -545,7 +559,7 @@ class ServerArgs:
         if self.nnodes > 1 and self.device_indexes is not None:
             logger.warning("In a multi-machine scenario, device_indexes will be set to None.")
             self.device_indexes = None
-        if self.multimodal:
+        if self.multimodal and not self.save_aot:
             self.model_path = download_from_hf(self.model_path, allow_patterns=None)
             if self.limit_mm_data_per_request is None:
                 self.limit_mm_data_per_request = {"image": 16}
@@ -1538,6 +1552,17 @@ class ServerArgs:
             action="store_true",
             help="whether disable precompile",
         )
+        parser.add_argument(
+            "--aot-model-dir",
+            help="Directory of trusted offline model and sampling executables; fail on missing artifacts",
+        )
+        parser.add_argument(
+            "--save-aot",
+            help="Compile serving's model and sampling buckets on CPU, save executables, and exit",
+        )
+        from sgl_jax.compile import add_topology_args
+
+        add_topology_args(parser, prefix="aot-")
         # Kernel backend
         parser.add_argument(
             "--attention-backend",

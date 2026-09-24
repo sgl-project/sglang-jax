@@ -204,7 +204,7 @@ larger than the chunk budget.
 
 Use `--num-tokens` to export a smaller prefill bucket. It selects the exact global
 compiled token shape, must be divisible by DP, and must lie between `batch-size`
-and both `chunked-prefill-size * dp-size` and `batch-size * context-length`.
+and `chunked-prefill-size * dp-size`. Padded positions do not consume KV slots.
 Choose the matching serving token bucket when comparing IR; this command does
 not simulate scheduler packing or silently round to another bucket. The manifest
 records the original options and resolved global/per-DP request and token shapes.
@@ -276,7 +276,8 @@ settings still select their debug implementations in kernels that honor them.
 Start with `manifest.json` and check for `status: complete` and the requested stages.
 For LLO inspection, look for `*-final_bundles.txt`; intermediate pass snapshots are
 also retained. Static memory reports describe compiler allocations, not measured
-runtime memory peaks. The output contains compiler IR, not a serialized executable.
+runtime memory peaks. By default the output contains compiler IR. Add `--save-executable` to also
+retain a serialized executable.
 
 Inspect `custom_calls` in the manifest to check which kernels actually reached
 optimized HLO. Each entry records a custom-call target, HLO instruction, and source
@@ -305,3 +306,104 @@ tar -czf /tmp/model-ir.tar.gz -C /tmp model-ir
 - **Requested LLO is missing:** check the libtpu version and recorded dump flags in
   the manifest. Compilation caching is disabled so code generation runs on each
   invocation; missing requested LLO makes the export fail.
+
+## Run an offline executable in serving
+
+Use the serving entrypoint to compile its complete prefill/decode bucket plan on
+CPU, save the model, sampler, and selected-token logprob executables, and exit.
+Pass the same model and execution options as
+serving, plus an output directory and target topology:
+
+```bash
+python -m sgl_jax.launch_server \
+  --model-path /models/my-model \
+  --tp-size 8 --attention-backend fa --dtype bfloat16 \
+  --page-size 128 --context-length 8192 \
+  --max-total-tokens 32768 --max-running-requests 32 \
+  --save-aot /tmp/model-aot --aot-topology v7x-8
+```
+
+This command loads configuration files and builds abstract weights and caches.
+It does not read checkpoint tensors, initialize physical TPUs, start an HTTP
+server, or run inference. A local directory containing `config.json` can be used
+for compilation; include configuration Python files and `--trust-remote-code`
+when required by the model. The model is constructed once and reused for every bucket.
+
+Omit `--precompile-token-paddings`, `--precompile-bs-paddings`, and
+`--chunked-prefill-size` to use serving's defaults. If you normally override these
+options, use the same overrides for export and serving. For example,
+`--chunked-prefill-size 2048 --precompile-token-paddings 128 512 2048
+--precompile-bs-paddings 1 8 32` selects those buckets, with serving's usual
+capacity filtering and inclusion of the maximum bucket. No `--workload` or shell
+loop is needed.
+
+Set `--max-total-tokens` explicitly: serving normally derives this capacity from
+available TPU memory, which the CPU host cannot query. This serving option is a
+**per-DP-rank** cap; the single-graph compiler's `--kv-capacity` is global. Linear
+attention also needs a fixed `--max-recurrent-state-size`, unless it follows from
+`--disable-radix-cache --max-running-requests`. The export uses serving's cache
+alignment, SWA capacity split, recurrent-state constraints, and parallelism rules.
+
+The output contains `serving.json` with the resolved bucket plan, plus one
+subdirectory per model bucket and sampling variant containing `executable.bin`
+and `executable.json`. Sampling uses the same batch buckets, with both seeded and
+unseeded variants; temperature, top-k/top-p/min-p, penalties, and grammar masks
+remain dynamic inputs. Use the same `--random-seed` for export and serving.
+Copy
+the complete directory onto the TPU host's local disk. Then replace the two
+export options with `--aot-model-dir`:
+
+```bash
+python -m sgl_jax.launch_server \
+  --model-path /models/my-model \
+  --tp-size 8 --attention-backend fa --dtype bfloat16 \
+  --page-size 128 --context-length 8192 \
+  --max-total-tokens 32768 --max-running-requests 32 \
+  --aot-model-dir /models/model-aot
+```
+
+The runtime model path must include real weights (and tokenizer files when
+used). Unspecified cache/request capacities are restored from `serving.json`;
+explicit values remain unchanged and must match the exported program. Both
+processes must use the same quantization and model options. For example, add
+`--quantization-config-path fp8_w8a8.yaml` to both commands for online FP8.
+
+Automatic bucket export follows the regular prefill/decode warmup plan. For
+individual workload/IR inspection or speculative draft/verify forwards,
+`sgl_jax.compile --stage compiled --save-executable` remains available. Put each workload and shape in a separate
+subdirectory. For a complete serving bundle, use `--save-aot` so sampling artifacts
+are included too; older model-only bundles need to be exported again.
+The loader searches recursively. An unseen or incompatible model or sampling
+signature fails with a mismatch diagnostic; it does
+not silently compile. Omit `--aot-model-dir` to use normal serving compilation.
+
+The server still loads real weights and creates its caches. For each new input
+signature, it traces and lowers the real serving forward, checks the canonical
+IR, retained input/donation signature, mesh/device assignment, compiler flags and
+runtime versions, then loads the matching binary. Later forwards reuse that
+callable. Inputs eliminated by the compiler do not participate in the binary interface.
+This skips backend compilation for the exported model, sampler, and selected-token
+logprob functions. Other helpers outside this bundle can still compile. Export
+follows the standard warmup signatures; request-specific static logprob layouts
+(such as top-logprobs) need matching artifacts. The expected benefit is reduced
+startup/warmup time, not a change to steady-state kernel speed.
+
+Keep JAX, jaxlib, libtpu, Flax and Python versions compatible with the recorded
+signature; the loader requires exact recorded versions. Use the same compilation
+flags on the export and serving hosts, including flags set by the container image.
+For CPU-host export, explicitly set the serving flags; JAX can add TPU-host
+initialization flags that a CPU host does not receive automatically. For example:
+
+```bash
+export LIBTPU_INIT_ARGS="--xla_tpu_use_enhanced_launch_barrier=true"
+```
+
+An `ir_sha256` mismatch can also indicate different host-generated constants.
+For x86 hosts with different NumPy SIMD implementations, use
+`NPY_DISABLE_CPU_FEATURES=AVX512F,AVX2,FMA3` on both export and serving processes
+before Python starts to make the tested RoPE frequency construction agree.
+The loader keeps checking the entire graph, including those constants.
+
+Executables are specific to their target and are not portable from v6e to v7x.
+Only load artifacts from a trusted producer: JAX executable deserialization can execute code. Checksums
+check file integrity, not producer identity.
