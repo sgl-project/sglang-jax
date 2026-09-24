@@ -9,6 +9,7 @@ reusing existing modules: RadixAttention, GateLogit, TopK, EPMoE/FusedEPMoE.
 """
 
 import logging
+import re
 
 import jax
 import numpy as np
@@ -38,7 +39,10 @@ from sgl_jax.srt.layers.moe import (
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.utils.quantization.quantization_utils import is_int4_dtype
+from sgl_jax.srt.utils.quantization.quantization_utils import (
+    is_int4_dtype,
+    is_linear_quantization_ignored,
+)
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
@@ -828,7 +832,12 @@ class DeepseekV3ForCausalLM(nnx.Module):
                 and layer_idx % moe_layer_freq == 0
             )
             layer_mappings = self._create_layer_mappings(
-                layer_idx, is_moe, moe_backend, use_fused, is_static_quant, quant_config=quant_config
+                layer_idx,
+                is_moe,
+                moe_backend,
+                use_fused,
+                is_static_quant,
+                quant_config=quant_config,
             )
             mappings.update(layer_mappings)
 
@@ -852,11 +861,12 @@ class DeepseekV3ForCausalLM(nnx.Module):
         def _is_linear_quantized(subpath: str) -> bool:
             if not is_static_quant:
                 return False
-            for ig in ignored_layers:
-                if subpath == ig or subpath.startswith(f"{ig}.") or subpath.endswith(f".{ig}"):
-                    return False
+            if is_linear_quantization_ignored(subpath, ignored_layers):
+                return False
             linear_rules = quant_config.get_linear_rules() if quant_config else []
-            return bool(linear_rules)
+            # Use the same slash/bracket path as apply_linear_quantization.
+            walker_path = re.sub(r"\.(\d+)\.", r"[\1].", subpath).replace(".", "/")
+            return any(re.match(rule["module_path"], walker_path) for rule in linear_rules)
 
         def add_linear(hf_prefix: str, target_prefix: str, sharding_std: tuple):
             # HF weights are `[out, in]`.
@@ -961,6 +971,8 @@ class DeepseekV3ForCausalLM(nnx.Module):
         is_static_int4_moe = is_static_quant and is_int4_dtype(
             getattr(quant_config, "moe_weight_dtype", None)
         )
+        if is_static_int4_moe and moe_backend != "epmoe":
+            raise ValueError("Static INT4 checkpoints require moe_backend='epmoe'.")
         weight_suffix = "weight_packed" if is_static_int4_moe else "weight"
         scale_suffix = ".weight_scale" if is_static_int4_moe else ".weight_scale_inv"
 

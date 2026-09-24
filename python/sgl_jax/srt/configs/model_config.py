@@ -556,22 +556,49 @@ class ModelConfig:
                     )
                     return quant_config
                 elif format_type == "pack-quantized":
+                    groups = hf_quant_config.get("config_groups")
+                    if not isinstance(groups, dict) or not groups:
+                        raise ValueError("pack-quantized requires non-empty config_groups.")
+                    group_sizes = set()
+                    for name, group in groups.items():
+                        weights = group.get("weights") if isinstance(group, dict) else None
+                        if not isinstance(weights, dict) or not (
+                            weights.get("num_bits") == 4
+                            and weights.get("type") == "int"
+                            and weights.get("symmetric") is True
+                            and weights.get("strategy") == "group"
+                            and not weights.get("dynamic", False)
+                            and weights.get("actorder") is None
+                            and weights.get("block_structure") is None
+                        ):
+                            raise ValueError(
+                                "pack-quantized currently supports only static symmetric "
+                                "INT4 group quantization without actorder or block_structure; "
+                                f"unsupported weights in config group {name!r}: {weights}"
+                            )
+                        if any(
+                            group.get(key) is not None
+                            for key in ("input_activations", "output_activations")
+                        ):
+                            raise ValueError(
+                                "pack-quantized activation quantization is not supported."
+                            )
+                        group_size = weights.get("group_size")
+                        if type(group_size) is not int or group_size <= 0:
+                            raise ValueError(
+                                "pack-quantized requires a positive integer group_size."
+                            )
+                        group_sizes.add(group_size)
+                    if len(group_sizes) != 1:
+                        raise ValueError(
+                            "pack-quantized config groups must use the same group_size."
+                        )
+                    group_size = group_sizes.pop()
                     logger.info(
                         "Auto-detected compressed-tensors INT4 pack-quantized model. "
                         "Creating QuantizationConfig for static int4."
                     )
-                    weight_block_size = None
-                    if "config_groups" in hf_quant_config and isinstance(
-                        hf_quant_config["config_groups"], dict
-                    ):
-                        for group in hf_quant_config["config_groups"].values():
-                            weights_cfg = group.get("weights") if isinstance(group, dict) else None
-                            if not weights_cfg:
-                                continue
-                            group_size = weights_cfg.get("group_size")
-                            if group_size is not None:
-                                weight_block_size = (int(group_size), int(group_size))
-                            break
+                    weight_block_size = (group_size, group_size)
 
                     ignored_layers = hf_quant_config.get("ignore") or []
                     quant_config = QuantizationConfig(

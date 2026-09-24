@@ -2138,7 +2138,12 @@ class WeightLoader:
                         target_path = mapping.target_path
                         model_param = self._get_param(params, target_path)
 
-                        if is_int4_dtype(model_param.value.dtype) and lazy_weight.dtype in [jnp.int32, jnp.uint32, jnp.int8, jnp.uint8]:
+                        if is_int4_dtype(model_param.value.dtype) and lazy_weight.dtype in [
+                            jnp.int32,
+                            jnp.uint32,
+                            jnp.int8,
+                            jnp.uint8,
+                        ]:
                             lazy_weight = unpack_4bit_jax(lazy_weight, model_param.value.dtype)
 
                         # Expand 2D block-quant scale to 3D kernel-ready layout.
@@ -2280,7 +2285,9 @@ class WeightLoader:
                         pspec = final_sharding.spec
                         if len(pspec) == 3:
                             load_pspec = jax.sharding.PartitionSpec(pspec[0], pspec[2], pspec[1])
-                            load_sharding = jax.sharding.NamedSharding(final_sharding.mesh, load_pspec)
+                            load_sharding = jax.sharding.NamedSharding(
+                                final_sharding.mesh, load_pspec
+                            )
 
                     # 2. Call creator
                     _t_load_start = time.monotonic()
@@ -2303,7 +2310,12 @@ class WeightLoader:
                         stacked_weight = jnp.repeat(stacked_weight, times, axis=axis)
 
                     # Unpack 4-bit weights if needed (e.g. MoE int4)
-                    if is_int4_weight and stacked_weight.dtype in [jnp.int32, jnp.uint32, jnp.int8, jnp.uint8]:
+                    if is_int4_weight and stacked_weight.dtype in [
+                        jnp.int32,
+                        jnp.uint32,
+                        jnp.int8,
+                        jnp.uint8,
+                    ]:
                         stacked_weight = unpack_4bit_jax(
                             stacked_weight,
                             model_param.value.dtype,
@@ -2346,8 +2358,6 @@ class WeightLoader:
                         if _pd_cache:
                             _PD_WEIGHT_CACHE[target_path] = model_param.value
                         del stacked_weight
-                        import gc
-                        gc.collect()
                         logger.info(
                             "MoE group %s: load=%.2fs conv=%.2fs assign=%.2fs total=%.2fs "
                             "shape=%s sharding=%s",

@@ -5,7 +5,11 @@ import pytest
 
 
 def _make_stub(
-    num_hidden_layers, first_k_dense_replace, n_routed_experts, quant_config=None
+    num_hidden_layers,
+    first_k_dense_replace,
+    n_routed_experts,
+    quant_config=None,
+    moe_backend="epmoe",
 ):
     from flax import nnx
 
@@ -22,7 +26,7 @@ def _make_stub(
             n_routed_experts=n_routed_experts,
             n_shared_experts=1,
             moe_layer_freq=1,
-            moe_backend="epmoe",
+            moe_backend=moe_backend,
         ),
         hf_weight_prefix="language_model.",
         loader=SimpleNamespace(
@@ -132,6 +136,7 @@ def test_nested_config_preserves_lm_head_policy(monkeypatch, enable_dp_lm_head, 
 
 def test_int4_moe_weight_mappings():
     import jax.numpy as jnp
+
     from sgl_jax.srt.configs.quantization_config import QuantizationConfig
 
     quant_config = QuantizationConfig(
@@ -167,6 +172,7 @@ def test_int4_moe_weight_mappings():
 
 def test_dynamic_int4_and_static_fp8_moe_weight_mappings():
     import jax.numpy as jnp
+
     from sgl_jax.srt.configs.quantization_config import QuantizationConfig
 
     # 1. Dynamic INT4 (is_static_checkpoint=False) must load ordinary .weight tensors
@@ -202,3 +208,71 @@ def test_dynamic_int4_and_static_fp8_moe_weight_mappings():
     assert scale_group_fp8.sharding == ("expert", None, None)
 
 
+def test_static_int4_fused_mapping_rejected():
+    import jax.numpy as jnp
+
+    from sgl_jax.srt.configs.quantization_config import QuantizationConfig
+
+    config = QuantizationConfig(is_static_checkpoint=True, moe_weight_dtype=jnp.int4)
+    with pytest.raises(ValueError, match="require moe_backend='epmoe'"):
+        _make_stub(2, 1, 16, config, moe_backend="fused")
+
+
+@pytest.mark.parametrize(
+    "ignored,rule,quantized",
+    [
+        (["model.layers.0.mlp"], ".*", True),
+        (["model.layers.0.mlp.gate_proj"], ".*", False),
+        (["gate_proj"], ".*", False),
+        ([], r"model/layers\[0\]/mlp/gate_proj", True),
+        ([], r"model/layers\[0\]/self_attn/.*", False),
+    ],
+)
+def test_linear_mapping_matches_quantized_model(ignored, rule, quantized):
+    import jax
+    import numpy as np
+    from flax import nnx
+    from jax.sharding import AxisType, Mesh
+
+    from sgl_jax.srt.configs.quantization_config import QuantizationConfig
+    from sgl_jax.srt.layers.linear import LinearBase, QuantizedLinear
+    from sgl_jax.srt.utils.quantization.quantization_utils import (
+        apply_linear_quantization,
+    )
+
+    mesh = Mesh(
+        np.array(jax.devices()[:1]).reshape(1, 1),
+        ("data", "tensor"),
+        axis_types=(AxisType.Explicit, AxisType.Explicit),
+    )
+
+    class MLP(nnx.Module):
+        def __init__(self):
+            self.gate_proj = LinearBase(64, 64, mesh, use_bias=False, kernel_axes=(None, "tensor"))
+
+    class Layer(nnx.Module):
+        def __init__(self):
+            self.mlp = MLP()
+
+    class Body(nnx.Module):
+        def __init__(self):
+            self.layers = nnx.data([Layer()])
+
+    class Model(nnx.Module):
+        def __init__(self):
+            self.model = Body()
+
+    config = QuantizationConfig(
+        is_static_checkpoint=True,
+        linear_rules=[{"module_path": rule, "weight_dtype": "float8_e4m3fn"}],
+        ignored_layers=ignored,
+    )
+    with jax.set_mesh(mesh):
+        model = nnx.eval_shape(Model)
+        apply_linear_quantization(SimpleNamespace(quantization_config=config), model, True)
+    layer = model.model.layers[0].mlp.gate_proj
+    assert isinstance(layer, QuantizedLinear) is quantized
+    mapping = _make_stub(1, 1, None, config)["language_model.model.layers.0.mlp.gate_proj.weight"]
+    suffix = mapping.target_path.rsplit(".", 1)[1]
+    assert suffix == ("weight_q" if quantized else "weight")
+    assert hasattr(layer, suffix)

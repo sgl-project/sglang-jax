@@ -389,9 +389,7 @@ class EPMoE(nnx.Module):
                 wo_sharding = P("expert", "tensor", None)
 
                 is_abstract = isinstance(self.wi_0.value, jax.ShapeDtypeStruct)
-                scale_dtype = (
-                    self.dtype if is_int4_dtype(self.quantized_dtype) else jnp.float32
-                )
+                scale_dtype = self.dtype if is_int4_dtype(self.quantized_dtype) else jnp.float32
 
                 def _make_param(shape, dtype, sharding_spec):
                     if is_abstract:
@@ -403,7 +401,7 @@ class EPMoE(nnx.Module):
                             )
                         )
                     return nnx.Param(
-                        jnp.zeros(shape, dtype=dtype),
+                        jnp.zeros(shape, dtype=dtype, out_sharding=sharding_spec),
                         out_sharding=sharding_spec,
                     )
 
@@ -431,21 +429,25 @@ class EPMoE(nnx.Module):
                     wo_scale_sharding,
                 )
 
-                self.wi_0 = _make_param(
-                    (num_experts, hidden_size, intermediate_dim),
-                    self.quantized_dtype,
-                    wi_sharding,
-                )
-                self.wi_1 = _make_param(
-                    (num_experts, hidden_size, intermediate_dim),
-                    self.quantized_dtype,
-                    wi_sharding,
-                )
-                self.wo = _make_param(
-                    (num_experts, intermediate_dim, hidden_size),
-                    self.quantized_dtype,
-                    wo_sharding,
-                )
+                # The loader needs quantized abstract placeholders to recognize
+                # packed weights. Concrete weights may already contain checkpoint
+                # data (e.g. the FP8 parity tool); do not replace that data.
+                if is_abstract:
+                    self.wi_0 = _make_param(
+                        (num_experts, hidden_size, intermediate_dim),
+                        self.quantized_dtype,
+                        wi_sharding,
+                    )
+                    self.wi_1 = _make_param(
+                        (num_experts, hidden_size, intermediate_dim),
+                        self.quantized_dtype,
+                        wi_sharding,
+                    )
+                    self.wo = _make_param(
+                        (num_experts, intermediate_dim, hidden_size),
+                        self.quantized_dtype,
+                        wo_sharding,
+                    )
                 return
 
             # Quantize weights along k-dim (axis=1 in [g, k, n] layout)
