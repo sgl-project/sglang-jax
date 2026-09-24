@@ -663,6 +663,10 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 # ForwardMode.EXTEND (decode runs as a separate forward), so the
                 # kernel's per-seq grid over [0, N) matches the ref's masked
                 # full-batch loop exactly; padded seqs stay -1 on both paths.
+                # The page budget may exceed the (now batch-sized) page table
+                # width; top_k needs k <= pages_per_seq. Clamp and right-pad
+                # back to the [T, k_pages] contract the consumers expect.
+                k_eff = min(k_pages, pages_per_seq)
                 topk_pages = streamindex_page_topk(
                     q_,
                     w_,
@@ -676,7 +680,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                     _fixed_stride_pages(pi_, cukv_, page_size, pages_per_seq),
                     cuq_,
                     dist_[2],
-                    k_pages=k_pages,
+                    k_pages=k_eff,
                     **(
                         {}
                         if num_queries_per_block is None
@@ -693,10 +697,12 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                     cuq_,
                     cukv_,
                     dist_,
-                    k_pages=k_pages,
+                    k_pages=k_eff,
                     pages_per_seq=pages_per_seq,
                     one_token_per_seq=False,  # prefill: T>1 tokens/seq, per-query causal
                 )
+            if k_eff < k_pages:
+                topk_pages = _pad_topk_pages(topk_pages, k_pages)
             return cache3d.reshape(cache_.shape), topk_pages
 
         idx_cache, topk_pages = jax.shard_map(
