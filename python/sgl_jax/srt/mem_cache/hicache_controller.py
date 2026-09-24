@@ -19,6 +19,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class _TransferSubmissionRejected(RuntimeError):
+    """The executor rejected a transfer before it could be queued."""
+
+
+class _TransferExecutor(ThreadPoolExecutor):
+    def submit(self, fn, /, *args, **kwargs):
+        with self._shutdown_lock:
+            if self._shutdown:
+                raise _TransferSubmissionRejected("cannot schedule new futures after shutdown")
+        # Only the preflight rejection proves that nothing was queued. A later
+        # shutdown race is conservatively unknown, as are submit failures after
+        # CPython queues work but before _adjust_thread_count returns a Future.
+        return super().submit(fn, *args, **kwargs)
+
+
 class HiCacheController:
     """Schedules L1<->L2 KV transfers over a HostKVPool."""
 
@@ -31,7 +46,7 @@ class HiCacheController:
         self._host_pool = host_pool
         self._device_pool = device_pool
         self._device_allocator = device_allocator
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hicache-d2h")
+        self._executor = _TransferExecutor(max_workers=1, thread_name_prefix="hicache-d2h")
         self._pending: list[Future] = []
         # Guards against freeing a host page while the worker is still writing it.
         self._inflight_lock = threading.Lock()
@@ -56,7 +71,12 @@ class HiCacheController:
         # registration, its cleanup has nothing to remove and the ids leak.
         with self._inflight_lock:
             self._inflight.update(host_buffer_ids)
-        future = self._executor.submit(self._do_d2h, host_buffer_ids)
+        try:
+            future = self._executor.submit(self._do_d2h, host_buffer_ids)
+        except _TransferSubmissionRejected:
+            with self._inflight_lock:
+                self._inflight.difference_update(host_buffer_ids)
+            raise
         self._pending.append(future)
         return future
 
@@ -81,7 +101,12 @@ class HiCacheController:
         # Register in-flight ids before submit (same race-window fix as write).
         with self._inflight_load_lock:
             self._inflight_load.update(host_buffer_ids)
-        future = self._executor.submit(self._do_stage_load, host_buffer_ids)
+        try:
+            future = self._executor.submit(self._do_stage_load, host_buffer_ids)
+        except _TransferSubmissionRejected:
+            with self._inflight_load_lock:
+                self._inflight_load.difference_update(host_buffer_ids)
+            raise
         self._pending_load.append(future)
         return future
 

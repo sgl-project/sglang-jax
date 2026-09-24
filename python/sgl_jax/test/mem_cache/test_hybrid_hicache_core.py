@@ -146,6 +146,146 @@ def test_failed_restore_discards_only_its_staging(monkeypatch, failure):
         shutdown(cache)
 
 
+@pytest.mark.parametrize("component", [CT.FULL, CT.SWA])
+def test_executor_rejection_restores_capacity_and_releases_all_locks(component):
+    cache, alloc, _ = make_cache(window=8)
+    try:
+        _, unrelated = insert(cache, alloc, range(20, 28))
+        _, node = insert(cache, alloc, range(8))
+        settle(cache)
+        cache.evict(EvictParams(num_tokens=16))
+        before = (alloc.full_available_size(), alloc.swa_available_size())
+        retained = {}
+        for ct, pool in cache.host_pools.items():
+            pool.stage_load(list(unrelated.component_data[ct].host_value))
+            retained[ct] = dict(pool._pending_load)
+        # Exercise the real executor's rejection, after inflight registration.
+        cache.hicache_controllers[component]._executor.shutdown(wait=True)
+        with pytest.raises(RuntimeError, match="cannot schedule new futures after shutdown"):
+            cache.init_load_back(node, 8)
+        assert (alloc.full_available_size(), alloc.swa_available_size()) == before
+        assert not alloc.full_to_swa_index_mapping.any()
+        for ct, pool in cache.host_pools.items():
+            cd = node.component_data[ct]
+            assert cd.value is None and cd.lock_ref == cd.host_lock_ref == 0
+            assert not any(pool._lock_ref)
+            controller = cache.hicache_controllers[ct]
+            assert not controller._inflight_load
+            assert not controller._pending_load
+            assert set(pool._pending_load) == set(retained[ct])
+            for handle, entry in retained[ct].items():
+                assert pool._pending_load[handle] is entry
+    finally:
+        shutdown(cache)
+
+
+def test_cleanup_error_preserves_original_and_continues_safe_cleanup(monkeypatch):
+    cache, alloc, _ = make_cache(window=8)
+    try:
+        _, node = insert(cache, alloc, range(8))
+        settle(cache)
+        cache.evict(EvictParams(num_tokens=8))
+        before = (alloc.full_available_size(), alloc.swa_available_size())
+        original = RuntimeError("original scatter error")
+
+        def fail_scatter(*args):
+            raise original
+
+        def fail_discard(*args):
+            raise RuntimeError("secondary discard error")
+
+        full = cache.hicache_controllers[CT.FULL]
+        monkeypatch.setattr(full, "flush_load", fail_scatter)
+        monkeypatch.setattr(full, "discard_load", fail_discard)
+        with pytest.raises(RuntimeError, match="original scatter error") as caught:
+            cache.init_load_back(node, 8)
+        assert caught.value is original
+        assert any("secondary discard error" in note for note in original.__notes__)
+        assert (alloc.full_available_size(), alloc.swa_available_size()) == before
+        assert all(cd.lock_ref == cd.host_lock_ref == 0 for cd in node.component_data)
+        assert all(not any(pool._lock_ref) for pool in cache.host_pools.values())
+        assert not cache.host_pools[CT.SWA]._pending_load
+        # The failed FULL discard is visible in the error note; its independent
+        # temporary arrays can still be discarded after all workers have stopped.
+        cache.host_pools[CT.FULL].discard_load(list(node.component_data[CT.FULL].host_value))
+    finally:
+        shutdown(cache)
+
+
+def test_successful_restore_cleanup_error_does_not_attach_to_callers_exception(monkeypatch):
+    cache, alloc, _ = make_cache(window=8)
+    try:
+        _, node = insert(cache, alloc, range(8))
+        settle(cache)
+        cache.evict(EvictParams(num_tokens=8))
+        cleanup_error = RuntimeError("discard after successful restore failed")
+
+        def fail_discard(*args):
+            raise cleanup_error
+
+        monkeypatch.setattr(cache.hicache_controllers[CT.FULL], "discard_load", fail_discard)
+        try:
+            raise ValueError("unrelated caller exception")
+        except ValueError as caller_error:
+            with pytest.raises(RuntimeError, match="discard after successful restore") as caught:
+                cache.init_load_back(node, 8)
+            assert caught.value is cleanup_error
+            assert not hasattr(caller_error, "__notes__")
+        assert all(cd.lock_ref == cd.host_lock_ref == 0 for cd in node.component_data)
+        assert all(not any(pool._lock_ref) for pool in cache.host_pools.values())
+    finally:
+        shutdown(cache)
+
+
+def test_submit_error_after_enqueue_keeps_restore_resources_protected(monkeypatch):
+    import threading
+
+    cache, alloc, _ = make_cache(window=8)
+    gate = threading.Event()
+    entered = threading.Event()
+    try:
+        _, node = insert(cache, alloc, range(8))
+        settle(cache)
+        cache.evict(EvictParams(num_tokens=8))
+        before = (alloc.full_available_size(), alloc.swa_available_size())
+        controller = cache.hicache_controllers[CT.SWA]
+        pool = cache.host_pools[CT.SWA]
+        stage = pool.stage_load
+        original = RuntimeError("thread adjustment failed after enqueue")
+
+        def blocked_stage(handles):
+            entered.set()
+            assert gate.wait(10)
+            stage(handles)
+
+        def fail_adjust():
+            raise original
+
+        monkeypatch.setattr(pool, "stage_load", blocked_stage)
+        monkeypatch.setattr(controller._executor, "_adjust_thread_count", fail_adjust)
+        with pytest.raises(RuntimeError) as caught:
+            cache.init_load_back(node, 8)
+        assert caught.value is original
+        assert entered.wait(5)
+        # submit already queued the job, but returned no Future. drain_loads
+        # cannot prove it stopped; destinations and source pins must stay held.
+        assert controller.has_inflight(list(node.component_data[CT.SWA].host_value))
+        assert (alloc.full_available_size(), alloc.swa_available_size()) == (
+            before[0] - 8,
+            before[1] - 8,
+        )
+        assert not alloc.full_to_swa_index_mapping.any()
+        assert all(
+            node.component_data[ct].value is None and node.component_data[ct].host_lock_ref == 1
+            for ct in (CT.FULL, CT.SWA)
+        )
+        assert all(any(pool._lock_ref) for pool in cache.host_pools.values())
+        assert node.component_data[CT.SWA].metadata["skip_lock_receipts"]
+    finally:
+        gate.set()
+        shutdown(cache)
+
+
 def test_independent_capacity_rejection_and_reset():
     cache, alloc, _ = make_cache(window=8)
     try:
@@ -200,6 +340,46 @@ def test_failed_backup_releases_reservation_without_exposing_host(monkeypatch):
         assert pool.available_size() == available
         assert not node.component_data[CT.SWA].metadata.get("host_pending")
         assert len(node.key) == 8
+    finally:
+        shutdown(cache)
+
+
+@pytest.mark.parametrize("rejected", [True, False])
+def test_backup_submit_failure_releases_only_definitely_unsubmitted_work(monkeypatch, rejected):
+    cache, alloc, _ = make_cache(window=8, policy="write_back")
+    try:
+        _, node = insert(cache, alloc, range(8))
+        controller = cache.hicache_controllers[CT.SWA]
+        pool = cache.host_pools[CT.SWA]
+        before = pool.available_size()
+        with monkeypatch.context() as patch:
+            if rejected:
+                controller._executor.shutdown(wait=True)
+                message = "cannot schedule new futures after shutdown"
+            else:
+                message = "backup submit failed after enqueue"
+
+                def fail_adjust():
+                    raise RuntimeError(message)
+
+                patch.setattr(controller._executor, "_adjust_thread_count", fail_adjust)
+            with pytest.raises(RuntimeError, match=message):
+                cache._hybrid_coordinator.backup_component(node, CT.SWA)
+        assert node.component_data[CT.SWA].host_value is None
+        assert not cache._hybrid_coordinator.pending
+        if rejected:
+            assert pool.available_size() == before
+            assert not controller._inflight
+            assert all(cd.lock_ref == 0 for cd in node.component_data)
+            assert not pool._pending_gather
+        else:
+            assert pool.available_size() == before - 8
+            assert len(controller._inflight) == 8
+            assert all(node.component_data[ct].lock_ref == 1 for ct in (CT.FULL, CT.SWA))
+            # Start the real queued worker only after checking its reservation
+            # remains held despite submit returning no Future.
+            controller._executor.submit(lambda: None).result(timeout=5)
+            assert not controller._inflight
     finally:
         shutdown(cache)
 
@@ -434,16 +614,25 @@ def test_skipped_tombstone_receipt_survives_split_and_healing(fresh_healing):
         parent = cache._split_node(node.key, node, 4)
         # Repeated splitting must preserve the original skipped fragment too.
         grandparent = cache._split_node(parent.key, parent, 2)
+        request_full = alloc.alloc_full(4)
         if fresh_healing:
             from sgl_jax.srt.mem_cache.base_prefix_cache import InsertParams
 
             fresh = alloc.alloc(8)
             cache.insert(InsertParams(key=key(range(8)), value=fresh))
-            # Existing FULL slots were protected, so only the new SWA mapping
-            # transfers into tree ownership; dispose of unused fresh FULL slots.
-            alloc.free_full(fresh, dp_rank=0)
         else:
             cache.init_load_back(node, 8)
+        # Healing must leave each free slot unique and disjoint from both tree
+        # ownership and an unrelated request's still-live FULL reservation.
+        free_full = alloc.full_attn_allocator.free_slots[0]
+        live_full = np.concatenate((full, request_full))
+        assert len(np.unique(free_full)) == len(free_full)
+        assert not np.intersect1d(free_full, live_full).size
+        assert len(free_full) + len(live_full) == alloc.full_attn_allocator.size_per_rank
+        assert not alloc.full_to_swa_index_mapping[free_full].any()
+        if fresh_healing:
+            assert np.isin(fresh, free_full).all()
+        alloc.free_full(request_full, dp_rank=0)
         # A newer request genuinely owns all healed SWA fragments. Releasing
         # the old skipped receipt must neither assert nor steal these locks.
         newer_receipt = cache.inc_lock_ref(node)
