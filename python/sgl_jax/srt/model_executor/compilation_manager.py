@@ -236,14 +236,18 @@ class CompilationManager:
         prepare_lora_fn: Callable | None,
         future_token_ids_map,
     ):
-        from sgl_jax.srt.managers.schedule_batch import ForwardMode
+        from sgl_jax.srt.managers.schedule_batch import (
+            ForwardMode,
+            _decode_kv_ladder_steps,
+        )
         from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
         from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 
         start_time = time.perf_counter()
         logger.info(
-            "[DECODE] Begin to precompile bs_paddings=%s",
+            "[DECODE] Begin to precompile bs_paddings=%s decode_kv_ladder=%s",
             self.bs_buckets,
+            _decode_kv_ladder_steps(self.page_size) or "off",
         )
 
         with tqdm(
@@ -254,47 +258,56 @@ class CompilationManager:
         ) as pbar:
             for i, bs_val in pbar:
                 pbar.set_postfix(bs=bs_val)
-                aligned_cache_loc_size = self.cache_loc_buckets[i]
-                batch = self._make_dummy_batch(
-                    bs_val,
-                    bs_val,
-                    ForwardMode.DECODE,
-                    aligned_cache_loc_size,
-                    dp_size=self.dp_size,
-                    per_dp_bs_size=bs_val // self.dp_size,
-                )
-                if prepare_lora_fn is not None:
-                    prepare_lora_fn(batch)
-                sampling_metadata = SamplingMetadata.from_model_worker_batch(
-                    batch, 0, mesh, self.vocab_size
-                )
-                batch.forward_batch = ForwardBatch.init_new(batch, model_runner)
-                if future_token_ids_map is not None:
-                    from sgl_jax.srt.managers.utils import (
-                        get_token_ids_gather,
-                        resolve_future_token_ids,
-                        set_future_token_ids,
+                # Precompile the max-capacity cache_loc bucket, plus one shape
+                # per enabled decode KV ladder step (see _decode_kv_ladder_steps
+                # in schedule_batch.py); ladder shapes must be precompiled here
+                # because cache_loc length is part of the jit cache key.
+                cache_loc_sizes = [self.cache_loc_buckets[i]]
+                for step in _decode_kv_ladder_steps(self.page_size):
+                    ladder_size = bs_val * step
+                    if ladder_size < self.cache_loc_buckets[i]:
+                        cache_loc_sizes.append(ladder_size)
+                for aligned_cache_loc_size in cache_loc_sizes:
+                    batch = self._make_dummy_batch(
+                        bs_val,
+                        bs_val,
+                        ForwardMode.DECODE,
+                        aligned_cache_loc_size,
+                        dp_size=self.dp_size,
+                        per_dp_bs_size=bs_val // self.dp_size,
                     )
+                    if prepare_lora_fn is not None:
+                        prepare_lora_fn(batch)
+                    sampling_metadata = SamplingMetadata.from_model_worker_batch(
+                        batch, 0, mesh, self.vocab_size
+                    )
+                    batch.forward_batch = ForwardBatch.init_new(batch, model_runner)
+                    if future_token_ids_map is not None:
+                        from sgl_jax.srt.managers.utils import (
+                            get_token_ids_gather,
+                            resolve_future_token_ids,
+                            set_future_token_ids,
+                        )
 
-                    batch.forward_batch.input_ids = resolve_future_token_ids(
-                        batch.forward_batch.input_ids, future_token_ids_map, mesh
+                        batch.forward_batch.input_ids = resolve_future_token_ids(
+                            batch.forward_batch.input_ids, future_token_ids_map, mesh
+                        )
+                    result = forward_fn(
+                        batch,
+                        launch_done=None,
+                        skip_sample=False,
+                        sampling_metadata=sampling_metadata,
                     )
-                result = forward_fn(
-                    batch,
-                    launch_done=None,
-                    skip_sample=False,
-                    sampling_metadata=sampling_metadata,
-                )
-                if future_token_ids_map is not None:
-                    _, next_token_ids, _ = result
-                    set_future_token_ids(
-                        future_token_ids_map,
-                        batch.forward_batch.seq_lens,
-                        batch.forward_batch.req_pool_indices,
-                        next_token_ids,
-                        mesh,
-                    )
-                    get_token_ids_gather(mesh)(next_token_ids).block_until_ready()
+                    if future_token_ids_map is not None:
+                        _, next_token_ids, _ = result
+                        set_future_token_ids(
+                            future_token_ids_map,
+                            batch.forward_batch.seq_lens,
+                            batch.forward_batch.req_pool_indices,
+                            next_token_ids,
+                            mesh,
+                        )
+                        get_token_ids_gather(mesh)(next_token_ids).block_until_ready()
                 self._compiled_variants.add((ForwardMode.DECODE, bs_val, bs_val, False))
 
         end_time = time.perf_counter()
