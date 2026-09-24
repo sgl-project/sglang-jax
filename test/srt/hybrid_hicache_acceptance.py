@@ -3,16 +3,31 @@
 import argparse
 import hashlib
 import json
+import math
 from collections import Counter
 from pathlib import Path
 
 RUNS = ("off", "off_repeat", "on", "on_repeat")
 TRANSFER = ("d2h", "device_evict", "slot_overwrite", "h2d")
+OUTPUT_TOKEN_PARAMS = {"no_stop_trim": True, "skip_special_tokens": False}
 
 
-def check(manifest, runs):
-    """Return all contract violations; an empty list is PASS."""
+def preserves_output_tokens(params):
+    return isinstance(params, dict) and all(
+        params.get(name) is value for name, value in OUTPUT_TOKEN_PARAMS.items()
+    )
+
+
+def check(manifest, runs, *, report=None):
+    """Return violations; optionally record logprob differences without a tolerance."""
     errors = []
+    details = {}
+    if report is not None:
+        report["logprobs"] = details
+    if manifest.get("return_logprob") is not True:
+        errors.append("manifest must freeze return_logprob: true")
+    if not preserves_output_tokens(manifest.get("sampling_params")):
+        errors.append(f"manifest sampling_params must freeze {OUTPUT_TOKEN_PARAMS}")
     cases = manifest.get("cases", [])
     expected = [case.get("rid") for case in cases]
     if not expected or any(not isinstance(rid, str) or not rid for rid in expected):
@@ -26,6 +41,10 @@ def check(manifest, runs):
         if not isinstance(run, dict) or not isinstance(run.get("results"), list):
             errors.append(f"{run_name}: missing results list")
             continue
+        if run.get("return_logprob") is not True:
+            errors.append(f"{run_name}: return_logprob must match frozen manifest true")
+        if not preserves_output_tokens(run.get("sampling_params")):
+            errors.append(f"{run_name}: sampling_params must preserve {OUTPUT_TOKEN_PARAMS}")
         found = [r.get("meta_info", {}).get("id") for r in run["results"] if isinstance(r, dict)]
         counts = Counter(found)
         for rid in expected:
@@ -56,9 +75,12 @@ def check(manifest, runs):
             errors.append(f"manifest {rid}: invalid max_new_tokens")
             continue
         outputs = {}
+        logprobs = {}
+        detail = details[rid] = {"runs": {}, "comparisons": {}}
         for run_name in RUNS:
             result = indexed.get(run_name, {}).get(rid)
             if result is None:
+                detail["runs"][run_name] = {"status": "invalid", "reason": "missing RID"}
                 continue
             label = f"{run_name}/{rid}"
             meta = result.get("meta_info", {})
@@ -73,7 +95,15 @@ def check(manifest, runs):
                 isinstance(v, bool) or not isinstance(v, int) for v in ids
             ):
                 errors.append(f"{label}: output_ids must be complete integer list")
+                detail["runs"][run_name] = {"status": "invalid", "reason": "invalid output_ids"}
                 continue
+            values, error = _output_logprobs(meta.get("output_token_logprobs"), ids)
+            if error:
+                errors.append(f"{label}: {error}")
+                detail["runs"][run_name] = {"status": "invalid", "reason": error}
+            else:
+                logprobs[run_name] = values
+                detail["runs"][run_name] = {"status": "valid", "token_count": len(values)}
             reason = meta.get("finish_reason")
             reason_type = reason.get("type") if isinstance(reason, dict) else None
             if kind == "abort":
@@ -114,7 +144,48 @@ def check(manifest, runs):
         for a, b in (("off", "off_repeat"), ("on", "on_repeat"), ("off", "on")):
             if a in outputs and b in outputs and outputs[a] != outputs[b]:
                 errors.append(f"{rid}: {a} differs from {b} in full output_ids or terminal reason")
+            comparison = {"status": "not_compared"}
+            if kind == "abort":
+                comparison["reason"] = "abort outputs may differ"
+            elif a not in logprobs or b not in logprobs:
+                comparison["reason"] = "missing or invalid logprobs"
+            elif outputs[a][0] != outputs[b][0]:
+                comparison["reason"] = "output_ids differ"
+            else:
+                differences = [abs(x - y) for x, y in zip(logprobs[a], logprobs[b], strict=True)]
+                changed = [i for i, value in enumerate(differences) if value != 0]
+                comparison = {
+                    "status": "compared",
+                    "token_count": len(differences),
+                    "different_count": len(changed),
+                    "max_abs_diff": max(differences, default=0),
+                    "mean_abs_diff": sum(differences) / len(differences) if differences else 0,
+                    "first_different_index": changed[0] if changed else None,
+                }
+            detail["comparisons"][f"{a}/{b}"] = comparison
     return errors
+
+
+def _output_logprobs(entries, ids):
+    if not isinstance(entries, list):
+        return None, "missing output_token_logprobs list"
+    if len(entries) != len(ids):
+        return None, "output_token_logprobs length differs from output_ids"
+    values = []
+    for index, (entry, token) in enumerate(zip(entries, ids, strict=True)):
+        if not isinstance(entry, (list, tuple)) or len(entry) != 3:
+            return None, f"invalid output_token_logprobs entry at index {index}"
+        value, token_id, _text = entry
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
+            return None, f"output_token_logprobs must be finite at index {index}"
+        if isinstance(token_id, bool) or not isinstance(token_id, int) or token_id != token:
+            return None, f"output_token_logprobs token_id differs from output_ids at index {index}"
+        values.append(value)
+    return values, None
 
 
 def _has_event(result, event_type, rank, component=None):
@@ -134,6 +205,9 @@ def main():
     parser.add_argument("--manifest", type=Path, required=True)
     for name in RUNS:
         parser.add_argument(f"--{name.replace('_', '-')}", type=Path, required=True)
+    parser.add_argument(
+        "--report", type=Path, help="Write per-RID validity and logprob differences"
+    )
     args = parser.parse_args()
     manifest_bytes = args.manifest.read_bytes()
     manifest_hash = hashlib.sha256(manifest_bytes).hexdigest()
@@ -144,7 +218,15 @@ def main():
         if run.get("manifest_sha256") != manifest_hash:
             parser.error(f"{name}: manifest_sha256 does not match frozen manifest")
         runs[name] = run
-    errors = check(manifest, runs)
+    report = {}
+    errors = check(manifest, runs, report=report)
+    report.update(manifest_sha256=manifest_hash, errors=errors, status="FAIL" if errors else "PASS")
+    if args.report:
+        args.report.write_text(json.dumps(report, indent=2) + "\n")
+        print(f"Per-RID logprob report: {args.report}")
+    else:
+        for rid, detail in report["logprobs"].items():
+            print(f"logprobs {rid}: {json.dumps(detail, sort_keys=True)}")
     if errors:
         print("FAIL")
         for error in errors:

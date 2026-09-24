@@ -74,7 +74,8 @@ def admission(
 def test_long_full_restore_does_not_require_equal_swa_capacity():
     adder, req, calls = admission(swa_capacity=24)
     assert adder.add_one_req(req) is AddReqResult.CONTINUE
-    assert calls == [{"mem_quota": 100, "swa_mem_quota": 24}]
+    # Reclaimable SWA quota still leaves room for this request's next steps.
+    assert calls == [{"mem_quota": 100, "swa_mem_quota": 24 - adder._swa_budget_for_req(1, 0)}]
     assert req.swa_host_hit_length == 0
     assert req.extend_input_len == 1
     assert adder.rem_swa_token_offset[0] == adder._swa_budget_for_req(1, 0)

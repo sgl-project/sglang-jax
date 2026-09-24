@@ -1,12 +1,18 @@
 """Offline contract tests for the manual FULL+SWA L2 serving acceptance."""
 
 import copy
+import hashlib
+import json
+import sys
 
-from hybrid_hicache_acceptance import check
+import pytest
+from hybrid_hicache_acceptance import check, main
 
 
 def fixture():
     manifest = {
+        "return_logprob": True,
+        "sampling_params": {"no_stop_trim": True, "skip_special_tokens": False},
         "cases": [
             {
                 "rid": "reuse-r0",
@@ -24,7 +30,7 @@ def fixture():
                 "expected_finish_reason": "length",
             },
             {"rid": "abort-r0", "kind": "abort", "dp_rank": 0, "max_new_tokens": 2},
-        ]
+        ],
     }
     results = [
         {
@@ -67,8 +73,16 @@ def fixture():
             ],
         },
     ]
-    off = {"results": copy.deepcopy(results)}
-    on = {"results": copy.deepcopy(results)}
+    for result in results:
+        result["meta_info"]["output_token_logprobs"] = [
+            [-0.25, token, None] for token in result["output_ids"]
+        ]
+    off = {
+        "return_logprob": True,
+        "sampling_params": copy.deepcopy(manifest["sampling_params"]),
+        "results": copy.deepcopy(results),
+    }
+    on = copy.deepcopy(off)
     return manifest, {
         "off": off,
         "off_repeat": copy.deepcopy(off),
@@ -141,6 +155,7 @@ def test_retract_requires_resume_and_normal_completion():
 def test_abort_is_separate_from_normal_output_comparison():
     manifest, runs = fixture()
     runs["on"]["results"][2]["output_ids"] = [99]
+    runs["on"]["results"][2]["meta_info"]["output_token_logprobs"] = [[-0.5, 99, None]]
     assert check(manifest, runs) == []
 
 
@@ -148,3 +163,107 @@ def test_abort_requires_cleanup_evidence():
     manifest, runs = fixture()
     runs["on"]["results"][2]["events"].pop()
     assert any("cleanup" in error for error in check(manifest, runs))
+
+
+@pytest.mark.parametrize("run_name", ["off", "off_repeat", "on", "on_repeat"])
+def test_all_four_runs_must_freeze_logprob_collection(run_name):
+    manifest, runs = fixture()
+    runs[run_name]["return_logprob"] = False
+    assert any(f"{run_name}: return_logprob" in error for error in check(manifest, runs))
+
+
+def test_manifest_requires_explicit_logprob_collection():
+    manifest, runs = fixture()
+    manifest.pop("return_logprob")
+    assert any("manifest" in error and "return_logprob" in error for error in check(manifest, runs))
+
+
+@pytest.mark.parametrize("run_name", ["off", "off_repeat", "on", "on_repeat"])
+@pytest.mark.parametrize("name, value", [("no_stop_trim", False), ("skip_special_tokens", True)])
+def test_all_runs_must_preserve_full_output_tokens(run_name, name, value):
+    manifest, runs = fixture()
+    runs[run_name]["sampling_params"][name] = value
+    assert any(f"{run_name}: sampling_params" in error for error in check(manifest, runs))
+
+
+@pytest.mark.parametrize(
+    "entries, expected_error",
+    [
+        (None, "missing output_token_logprobs"),
+        ([], "length"),
+        ([[float("nan"), 11, None], [-0.2, 12, None]], "finite"),
+        ([[float("inf"), 11, None], [-0.2, 12, None]], "finite"),
+        ([[None, 11, None], [-0.2, 12, None]], "finite"),
+        ([[True, 11, None], [-0.2, 12, None]], "finite"),
+        ([[-0.2, 12, None], [-0.2, 11, None]], "token_id"),
+        ([[-0.2, 11.0, None], [-0.2, 12, None]], "token_id"),
+        ([[-0.2], [-0.2, 12, None]], "entry"),
+    ],
+)
+def test_logprob_payload_must_be_complete_finite_and_token_aligned(entries, expected_error):
+    manifest, runs = fixture()
+    runs["on"]["results"][0]["meta_info"]["output_token_logprobs"] = entries
+    report = {}
+    errors = check(manifest, runs, report=report)
+    assert any("on/reuse-r0" in error and expected_error in error for error in errors)
+    assert report["logprobs"]["reuse-r0"]["runs"]["on"]["status"] == "invalid"
+
+
+def test_logprob_differences_are_reported_without_an_invented_tolerance():
+    manifest, runs = fixture()
+    for name in ("on", "on_repeat"):
+        runs[name]["results"][0]["meta_info"]["output_token_logprobs"][1][0] = -1.0
+    report = {}
+    assert check(manifest, runs, report=report) == []
+    comparisons = report["logprobs"]["reuse-r0"]["comparisons"]
+    assert comparisons["off/on"] == {
+        "status": "compared",
+        "token_count": 2,
+        "different_count": 1,
+        "max_abs_diff": 0.75,
+        "mean_abs_diff": 0.375,
+        "first_different_index": 1,
+    }
+    assert comparisons["off/off_repeat"]["different_count"] == 0
+    assert comparisons["on/on_repeat"]["different_count"] == 0
+    assert report["logprobs"]["abort-r0"]["comparisons"]["off/on"]["status"] == "not_compared"
+
+
+def test_output_ids_remain_a_hard_gate_even_with_valid_logprobs():
+    manifest, runs = fixture()
+    runs["on"]["results"][0]["output_ids"][1] = 99
+    runs["on"]["results"][0]["meta_info"]["output_token_logprobs"][1][1] = 99
+    report = {}
+    assert any("full output_ids" in error for error in check(manifest, runs, report=report))
+    comparison = report["logprobs"]["reuse-r0"]["comparisons"]["off/on"]
+    assert comparison == {"status": "not_compared", "reason": "output_ids differ"}
+
+
+@pytest.mark.parametrize("tokens_differ", [False, True])
+def test_cli_writes_logprob_report_on_pass_and_token_failure(tmp_path, monkeypatch, tokens_differ):
+    manifest, runs = fixture()
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest))
+    digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    runs["on"]["results"][0]["meta_info"]["output_token_logprobs"][1][0] = -1.0
+    if tokens_differ:
+        runs["on"]["results"][0]["output_ids"][1] = 99
+        runs["on"]["results"][0]["meta_info"]["output_token_logprobs"][1][1] = 99
+    report_path = tmp_path / "report.json"
+    argv = ["checker", "--manifest", str(manifest_path), "--report", str(report_path)]
+    for name, run in runs.items():
+        run_path = tmp_path / f"{name}.json"
+        run_path.write_text(json.dumps({**run, "manifest_sha256": digest}))
+        argv.extend((f"--{name.replace('_', '-')}", str(run_path)))
+    monkeypatch.setattr(sys, "argv", argv)
+    assert main() == int(tokens_differ)
+    report = json.loads(report_path.read_text())
+    assert report["status"] == ("FAIL" if tokens_differ else "PASS")
+    assert report["manifest_sha256"] == digest
+    assert bool(report["errors"]) is tokens_differ
+    comparison = report["logprobs"]["reuse-r0"]["comparisons"]["off/on"]
+    if tokens_differ:
+        assert comparison["reason"] == "output_ids differ"
+    else:
+        assert comparison["different_count"] == 1
+        assert comparison["max_abs_diff"] == 0.75

@@ -6,10 +6,15 @@ import json
 from pathlib import Path
 
 import requests
+from hybrid_hicache_acceptance import OUTPUT_TOKEN_PARAMS, preserves_output_tokens
 
 
 def capture(manifest, evidence, post):
     """Submit only normal cases; keep each server response unchanged except events."""
+    if manifest.get("return_logprob") is not True:
+        raise ValueError("manifest must freeze return_logprob: true")
+    if not preserves_output_tokens(manifest.get("sampling_params")):
+        raise ValueError(f"manifest sampling_params must freeze {OUTPUT_TOKEN_PARAMS}")
     cases = manifest.get("cases", [])
     if not cases:
         raise ValueError("manifest has no cases")
@@ -45,7 +50,9 @@ def capture(manifest, evidence, post):
             "input_ids": case["input_ids"],
             "dp_rank": case["dp_rank"],
             "stream": False,
+            "return_logprob": True,
             "sampling_params": {
+                **OUTPUT_TOKEN_PARAMS,
                 "temperature": 0,
                 "max_new_tokens": case["max_new_tokens"],
                 "sampling_seed": 3,
@@ -107,6 +114,10 @@ def main():
         raw_file = json.loads(args.from_raw.read_text())
         if raw_file.get("manifest_sha256") != digest:
             parser.error("raw capture manifest_sha256 mismatch")
+        if raw_file.get("return_logprob") is not True:
+            parser.error("raw capture return_logprob must be true")
+        if not preserves_output_tokens(raw_file.get("sampling_params")):
+            parser.error(f"raw capture sampling_params must preserve {OUTPUT_TOKEN_PARAMS}")
         raw_iter = iter(raw_file.get("results", []))
 
         def post(_payload):
@@ -129,13 +140,31 @@ def main():
             data = response.json()
             raw.append(data)
             args.raw_output.write_text(
-                json.dumps({"manifest_sha256": digest, "results": raw}, indent=2) + "\n"
+                json.dumps(
+                    {
+                        "manifest_sha256": digest,
+                        "return_logprob": True,
+                        "sampling_params": OUTPUT_TOKEN_PARAMS,
+                        "results": raw,
+                    },
+                    indent=2,
+                )
+                + "\n"
             )
             return data
 
     results = capture(manifest, lambda: json.loads(args.evidence.read_text()), post)
     args.output.write_text(
-        json.dumps({"manifest_sha256": digest, "results": results}, indent=2) + "\n"
+        json.dumps(
+            {
+                "manifest_sha256": digest,
+                "return_logprob": True,
+                "sampling_params": OUTPUT_TOKEN_PARAMS,
+                "results": results,
+            },
+            indent=2,
+        )
+        + "\n"
     )
     print(
         f"Captured {len(results)} ordinary requests; add manual retract/abort results before checking"
