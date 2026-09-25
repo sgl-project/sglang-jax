@@ -114,3 +114,24 @@ class SpecDraftGroupTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VerifyQgroupGateTest(unittest.TestCase):
+    """Grouped verify attention needs the opt-in, a decode-form verify batch and
+    at least DSA_SPEC_VERIFY_QGROUP_MIN_BS requests (bs1 gains nothing)."""
+
+    def test_gate(self):
+        import sgl_jax.srt.layers.attention.dsa_sparse_backend as be
+
+        with (
+            mock.patch.object(be, "_SPEC_VERIFY_QGROUP", True),
+            mock.patch.object(be, "_SPEC_VERIFY_QGROUP_MIN_BS", 8),
+        ):
+            self.assertTrue(be._use_verify_qgroup(True, 4, 64 * 4))
+            self.assertTrue(be._use_verify_qgroup(True, 4, 8 * 4))
+            self.assertFalse(be._use_verify_qgroup(True, 4, 7 * 4))
+            self.assertFalse(be._use_verify_qgroup(True, 4, 4))  # bs1
+            self.assertFalse(be._use_verify_qgroup(False, 4, 64 * 4))
+            self.assertFalse(be._use_verify_qgroup(True, None, 64 * 4))
+        with mock.patch.object(be, "_SPEC_VERIFY_QGROUP", False):
+            self.assertFalse(be._use_verify_qgroup(True, 4, 64 * 4))

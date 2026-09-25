@@ -115,6 +115,21 @@ _SPEC_VERIFY_PAGE_SHARE = int(os.environ.get("DSA_SPEC_VERIFY_PAGE_SHARE", "1") 
 # pseudo-sequences -- the request's KV is read once (see sparse_mla_page_level
 # group_queries). Implies the page-share page set. Default OFF.
 _SPEC_VERIFY_QGROUP = os.environ.get("DSA_SPEC_VERIFY_QGROUP", "0") == "1"
+# Grouped verify only pays off when many requests share a step: at bs1 the one
+# grouped sequence on the mixed kernel matches the four one-query pseudo
+# sequences on the batched decode kernel (12.4 vs 12.9 ms attention) while the
+# step lost ~0.8 ms elsewhere, so keep the per-token path below this batch.
+_SPEC_VERIFY_QGROUP_MIN_BS = int(os.environ.get("DSA_SPEC_VERIFY_QGROUP_MIN_BS", "8"))
+
+
+def _use_verify_qgroup(is_verify: bool, draft_group: int | None, num_tokens: int) -> bool:
+    """Grouped (G queries per request) verify attention: opt-in, decode-form
+    verify batches only, and at least ``_SPEC_VERIFY_QGROUP_MIN_BS`` requests."""
+    if not (is_verify and _SPEC_VERIFY_QGROUP and draft_group):
+        return False
+    return num_tokens // int(draft_group) >= _SPEC_VERIFY_QGROUP_MIN_BS
+
+
 # Opt-in: on decode-form verify batches (S requests x G draft tokens) run the
 # indexer page-topk as ONE batched XLA op over all requests
 # (``streamindex_page_topk_ref_grouped``) instead of the per-sequence kernel
@@ -861,7 +876,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         is_verify = forward_batch.forward_mode.is_target_verify()
         page_share_group = _SPEC_VERIFY_PAGE_SHARE if is_verify else 1
         group_queries = False
-        if is_verify and _SPEC_VERIFY_QGROUP and draft_group is not None:
+        if _use_verify_qgroup(is_verify, draft_group, num_tokens):
             page_share_group = draft_group
             group_queries = True
         o, kv_cache = self._run_sparse(
