@@ -266,6 +266,7 @@ suites = {
         TestFile("python/sgl_jax/test/kernels/kda_test.py", 10, runner="pytest"),
         TestFile("test/srt/kernels/hca/test_hca.py", 8, runner="pytest"),
         TestFile("test/srt/kernels/mhc/test_mhc.py", 2, runner="pytest"),
+        TestFile("test/srt/kernels/csa_attention/test_attention.py", 3, runner="pytest"),
         # Pytest tears down the shared FlashAttention mesh cleanly on JAX 0.10.2.
         TestFile("python/sgl_jax/test/test_flashattention_mha.py", 11, runner="pytest"),
         TestFile("python/sgl_jax/test/test_flashattention_gqa.py", 11, runner="pytest"),
