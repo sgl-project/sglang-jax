@@ -505,7 +505,9 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 vmem_limit_bytes=self.vmem_limit_bytes,
             )
 
-        return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(
+        return jax.shard_map(
+            _run, mesh=self.mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False
+        )(
             ql,
             qpe,
             kvc,
@@ -731,7 +733,9 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 vmem_limit_bytes=self.vmem_limit_bytes,
             )
 
-        return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(
+        return jax.shard_map(
+            _run, mesh=self.mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False
+        )(
             ql,
             qpe,
             kvc,
