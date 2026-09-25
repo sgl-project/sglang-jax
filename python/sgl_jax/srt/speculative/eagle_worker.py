@@ -9,6 +9,10 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from tqdm import tqdm
 
+from sgl_jax.srt.managers.schedule_batch import (
+    _SPEC_CACHE_LOC_FIT,
+    spec_cache_loc_precompile_sizes,
+)
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.speculative.base_worker import BaseSpecWorker
@@ -56,13 +60,29 @@ class EAGLEWorker(BaseSpecWorker):
         )
 
         bs, _ = self.draft_worker.get_max_padded_size()
-        pairs = list(itertools.product([bs], self.precompile_token_paddings))
+        # extend-shaped spec batches pad bs to the largest bucket; with the
+        # fitted cache_loc padding on, their page table may land on any rung
+        # of that bucket, so compile each rung.
+        cache_loc_sizes = (
+            spec_cache_loc_precompile_sizes(
+                len(self.precompile_bs_paddings) - 1,
+                self.precompile_bs_paddings,
+                self.precompile_cache_loc_paddings,
+                self.page_size,
+                fit_enabled=True,
+            )
+            if _SPEC_CACHE_LOC_FIT
+            else [self.precompile_cache_loc_paddings[-1]]
+        )
+        pairs = list(itertools.product([bs], self.precompile_token_paddings, cache_loc_sizes))
 
         with tqdm(pairs, desc="[SPEC_EXTEND] PRECOMPILE", leave=False) as pbar:
             for pair in pbar:
                 pair = list(pair)
-                bs, num_tokens = pair[0], pair[1]
-                pbar.set_postfix(bs=bs, tokens=num_tokens, dp_size=dp_size)
+                bs, num_tokens, cache_loc_size = pair[0], pair[1], pair[2]
+                pbar.set_postfix(
+                    bs=bs, tokens=num_tokens, cache_loc=cache_loc_size, dp_size=dp_size
+                )
                 if bs > num_tokens:
                     logger.warning("bs=%s > num_tokens=%s, skip this pair", bs, num_tokens)
                     continue
@@ -76,7 +96,7 @@ class EAGLEWorker(BaseSpecWorker):
                     bs,
                     num_tokens,
                     ForwardMode.EXTEND,
-                    self.precompile_cache_loc_paddings[-1],
+                    cache_loc_size,
                     speculative_algorithm=self.speculative_algorithm,
                     dp_size=dp_size,
                     per_dp_bs_size=per_dp_bs,
@@ -103,22 +123,37 @@ class EAGLEWorker(BaseSpecWorker):
             dp_size,
         )
 
-        with tqdm(
-            self.precompile_bs_paddings, desc="[SPEC_DECODE] PRECOMPILE", leave=False
-        ) as pbar:
-            for bs in pbar:
-                pbar.set_postfix(bs=bs, dp_size=dp_size)
+        # One (bs, cache_loc) shape per bs bucket, or every rung of the bucket
+        # when the fitted spec cache_loc padding is on (the runtime fit may
+        # only land on those rungs, so this precompile covers all of them).
+        shapes = []
+        for i, bs in enumerate(self.precompile_bs_paddings):
+            legacy = (
+                (bs * self.draft_worker.max_req_len + self.page_size - 1)
+                // self.page_size
+                * self.page_size
+            )
+            sizes = (
+                spec_cache_loc_precompile_sizes(
+                    i,
+                    self.precompile_bs_paddings,
+                    self.precompile_cache_loc_paddings,
+                    self.page_size,
+                    fit_enabled=True,
+                )
+                if _SPEC_CACHE_LOC_FIT
+                else [legacy]
+            )
+            shapes.extend((bs, size) for size in sizes)
+        with tqdm(shapes, desc="[SPEC_DECODE] PRECOMPILE", leave=False) as pbar:
+            for bs, aligned_cache_loc_size in pbar:
+                pbar.set_postfix(bs=bs, cache_loc=aligned_cache_loc_size, dp_size=dp_size)
                 if bs % dp_size != 0:
                     logger.warning(
                         "[SPEC_DECODE] skip bs=%d (not divisible by dp_size=%d)", bs, dp_size
                     )
                     continue
                 per_dp_bs = bs // dp_size
-                aligned_cache_loc_size = (
-                    (bs * self.draft_worker.max_req_len + self.page_size - 1)
-                    // self.page_size
-                    * self.page_size
-                )
 
                 def _make_decode_batch(
                     *,
@@ -135,6 +170,8 @@ class EAGLEWorker(BaseSpecWorker):
                         dp_size=dp_size,
                         per_dp_bs_size=per_dp_bs,
                     )
+                    if _SPEC_CACHE_LOC_FIT:
+                        batch.spec_cache_loc_size = aligned_cache_loc_size
                     # Pad out_cache_loc to the conservative decode allocation
                     # bucket used by runtime _get_spec_decode_mwb_dp.
                     ocl_target = bs * self.speculative_num_draft_tokens * 2

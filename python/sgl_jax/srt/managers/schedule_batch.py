@@ -115,6 +115,42 @@ logger = logging.getLogger(__name__)
 # verify compile) until the ladder is precompiled at startup. Default OFF keeps
 # the single largest padding.
 _SPEC_CACHE_LOC_FIT = os.environ.get("SGLANG_JAX_SPEC_CACHE_LOC_FIT", "0") == "1"
+# Per-request token caps that define the short cache_loc ladder ("rungs") a
+# fitted speculative batch may land on, below the bs bucket's own padding
+# (bs x max context). Each rung is one more (bs, cache_loc) shape to
+# precompile per bs bucket, so keep the list short.
+_SPEC_CACHE_LOC_LADDER = tuple(
+    int(x) for x in os.environ.get("SGLANG_JAX_SPEC_CACHE_LOC_LADDER", "8192").split(",") if x
+)
+
+
+def spec_cache_loc_rungs(
+    bs_paddings, cache_loc_paddings, page_size: int, caps=None
+) -> list[list[int]]:
+    """Per bs bucket, the ascending cache_loc paddings a fitted speculative
+    batch may use: ``align(bs * cap)`` for every cap in the ladder that is
+    below the bucket's own padding, plus that padding itself (last)."""
+    caps = _SPEC_CACHE_LOC_LADDER if caps is None else tuple(caps)
+    out = []
+    for bs, big in zip(bs_paddings, cache_loc_paddings):
+        big = int(big)
+        rungs = {big}
+        for cap in caps:
+            rung = (int(bs) * int(cap) + page_size - 1) // page_size * page_size
+            if 0 < rung < big:
+                rungs.add(rung)
+        out.append(sorted(rungs))
+    return out
+
+
+def spec_cache_loc_precompile_sizes(
+    bs_index: int, bs_paddings, cache_loc_paddings, page_size: int, *, fit_enabled: bool, caps=None
+) -> list[int]:
+    """cache_loc sizes the speculative precompile must cover for bs bucket
+    ``bs_index``: the bucket's own padding, plus every rung when the fit is on."""
+    if not fit_enabled:
+        return [int(cache_loc_paddings[bs_index])]
+    return spec_cache_loc_rungs(bs_paddings, cache_loc_paddings, page_size, caps)[bs_index]
 
 
 def spec_cache_loc_needs(per_rank_lens, per_dp_bs: int, page_size: int) -> list[int]:
@@ -2475,8 +2511,12 @@ class ScheduleBatch:
                     per_dp_bs_size,
                     page_size,
                 )
+                # extend-shaped spec batches pad bs to the largest bucket: only
+                # that bucket's rungs are precompiled.
                 total_cache_loc_size = fit_cache_loc_padding(
-                    cache_loc_paddings, needs, self.dp_size
+                    spec_cache_loc_rungs(bs_paddings[-1:], cache_loc_paddings[-1:], page_size)[0],
+                    needs,
+                    self.dp_size,
                 )
         else:
             # For decode mode, use the cache_loc_padding that corresponds to the bs bucket.
@@ -2500,7 +2540,11 @@ class ScheduleBatch:
                 )
                 total_cache_loc_size = min(
                     total_cache_loc_size,
-                    fit_cache_loc_padding(cache_loc_paddings, needs, self.dp_size),
+                    fit_cache_loc_padding(
+                        spec_cache_loc_rungs(bs_paddings, cache_loc_paddings, page_size)[bs_index],
+                        needs,
+                        self.dp_size,
+                    ),
                 )
 
         per_dp_cache_loc_size = total_cache_loc_size // self.dp_size
@@ -3846,6 +3890,9 @@ class ModelWorkerBatch:
     # returning a fresh EagleDraftInput. Scheduler-persisted per-rank spec
     # state lives on ScheduleBatch.reqs_info[r].spec_info.
     spec_info_padded: EagleDraftInput | EagleVerifyInput | None = None
+    # Precompile only: pin the draft worker's fitted cache_loc padding to this
+    # rung instead of deriving it from the dummy batch's lengths.
+    spec_cache_loc_size: int | None = None
     spec_algorithm: SpeculativeAlgorithm = None
     speculative_num_steps: int = 0
     speculative_eagle_topk: int = 0

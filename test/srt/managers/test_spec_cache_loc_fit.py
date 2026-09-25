@@ -10,6 +10,8 @@ import unittest
 from sgl_jax.srt.managers.schedule_batch import (
     fit_cache_loc_padding,
     spec_cache_loc_needs,
+    spec_cache_loc_precompile_sizes,
+    spec_cache_loc_rungs,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -57,3 +59,51 @@ class FitCacheLocPaddingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+BS = [1, 2, 4, 8, 16, 32, 64]
+PAGE = 128
+
+
+class SpecCacheLocRungsTest(unittest.TestCase):
+    """The fitted padding may only land on a short per-bs-bucket ladder (the
+    "rungs"), so startup can precompile exactly those (bs, cache_loc) shapes
+    instead of the n(n+1)/2 pairs the full ladder would allow (each verify
+    executable is a ~3 min cold compile)."""
+
+    def test_default_ladder_adds_one_rung_below_the_bucket(self):
+        rungs = spec_cache_loc_rungs(BS, PADDINGS, PAGE, caps=(8192,))
+        self.assertEqual(len(rungs), len(BS))
+        self.assertEqual(rungs[-1], [64 * 8192, 64 * CTX])
+        self.assertEqual(rungs[0], [8192, CTX])
+        # ascending, last entry is always the bucket's own padding
+        for bs, r, big in zip(BS, rungs, PADDINGS):
+            self.assertEqual(r, sorted(r))
+            self.assertEqual(r[-1], big)
+
+    def test_custom_ladder_and_page_alignment(self):
+        rungs = spec_cache_loc_rungs(BS, PADDINGS, PAGE, caps=(2000, 16384))
+        # 2000 is not page aligned: bs x 2000 rounds up to a page multiple
+        self.assertEqual(rungs[2], [((4 * 2000 + PAGE - 1) // PAGE) * PAGE, 4 * 16384, 4 * CTX])
+
+    def test_caps_at_or_above_the_bucket_are_dropped(self):
+        rungs = spec_cache_loc_rungs(BS, PADDINGS, PAGE, caps=(CTX, 2 * CTX))
+        self.assertEqual(rungs, [[p] for p in PADDINGS])
+
+    def test_fit_over_rungs_picks_the_small_rung_for_short_requests(self):
+        rungs = spec_cache_loc_rungs(BS, PADDINGS, PAGE, caps=(8192,))
+        # cc64 1k/1k (bs padded 64 x longest 2176) fits the 64 x 8k rung
+        self.assertEqual(fit_cache_loc_padding(rungs[-1], [64 * 2176], 1), 64 * 8192)
+        # 64 x 110k context needs the bucket's own padding
+        self.assertEqual(fit_cache_loc_padding(rungs[-1], [64 * 110592], 1), 64 * CTX)
+
+    def test_precompile_sizes_follow_the_switch(self):
+        # fit off: the single legacy size; fit on: every rung of the bucket
+        self.assertEqual(
+            spec_cache_loc_precompile_sizes(6, BS, PADDINGS, PAGE, fit_enabled=False, caps=(8192,)),
+            [64 * CTX],
+        )
+        self.assertEqual(
+            spec_cache_loc_precompile_sizes(6, BS, PADDINGS, PAGE, fit_enabled=True, caps=(8192,)),
+            [64 * 8192, 64 * CTX],
+        )
