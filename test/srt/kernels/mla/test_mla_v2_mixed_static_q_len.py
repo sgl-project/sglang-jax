@@ -78,17 +78,15 @@ def test_mixed_static_q_len_sizes_mixed_query_block():
     assert decode and all(_bq(n) == 1 for n in decode), names
 
 
-def test_mixed_static_q_len_kept_off_for_sub_tile_heads_when_illegal():
-    # 4 bf16 heads/shard: a token spans 4 of the 16 tile rows, so bq*heads must
-    # cover whole 16x16 tile groups (256 rows); G=4 -> 16 rows is not in the
-    # validated family and the tuned block must stay.
+def _sub_tile_dispatch(G, h):
+    """4 bf16 heads/shard (GLM-5.2 tp16): a token spans h of the 16 tile rows."""
     names = []
 
     def fake_pallas_call(kernel, *, out_shape, name=None, **_):
         names.append(name)
         return lambda *a: [jnp.zeros(s.shape, s.dtype) for s in out_shape]
 
-    S, G, h = 2, 4, 4
+    S = 2
     T = S * G
     args = (
         jnp.zeros((T, h, LKV), jnp.bfloat16),
@@ -110,4 +108,16 @@ def test_mixed_static_q_len_kept_off_for_sub_tile_heads_when_illegal():
             mixed_static_q_len=G,
         )
     mixed = [n for n in names if n.startswith("MLA-m-")]
-    assert len(mixed) == 1 and _bq(mixed[0]) == 64, names
+    assert len(mixed) == 1, names
+    return _bq(mixed[0])
+
+
+def test_mixed_static_q_len_allowed_when_the_block_fills_whole_tiles():
+    # G=4 x 4 heads = 16 rows = exactly one bf16 sublane tile: legal, use bq=4
+    assert _sub_tile_dispatch(4, 4) == 4
+
+
+def test_mixed_static_q_len_kept_off_for_sub_tile_heads_when_illegal():
+    # G=2 x 4 heads = 8 rows does not fill the 16-row bf16 tile (E2002): keep
+    # the tuned block.
+    assert _sub_tile_dispatch(2, 4) == 64

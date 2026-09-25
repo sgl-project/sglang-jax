@@ -1536,15 +1536,15 @@ def mla_ragged_paged_attention(
     num_q_heads = num_q_heads_per_q_packing * q_packing
 
     if mixed_static_q_len is not None:
-        # Same tiling rule as get_fallback_block_sizes_mla("mixed"): with
-        # fewer than a sublane tile of padded heads per token, the query block
-        # must cover whole sublane_tile**2 row groups.
+        # Mosaic rejects a q/o window whose packed rows do not fill whole
+        # sublane tiles (E2002, see get_fallback_block_sizes_mla): the block
+        # must span a multiple of sublane_tile rows, i.e. bq * padded heads
+        # per token divisible by 8 * q_packing (16 for bf16). With >= 16
+        # padded heads any bq is fine; with 4 heads/shard bq=4 is exactly one
+        # tile.
         sublane_tile = 8 * q_packing
         heads_padded = align_to(actual_num_q_heads, q_packing)
-        if (
-            heads_padded % sublane_tile != 0
-            and (mixed_static_q_len * heads_padded) % (sublane_tile * sublane_tile) != 0
-        ):
+        if (mixed_static_q_len * heads_padded) % sublane_tile != 0:
             mixed_static_q_len = None
 
     def run_mla_kernel(
