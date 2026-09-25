@@ -231,6 +231,8 @@ class EPMoE(nnx.Module):
         # Weight layout is [E, k, n] where k=contraction dim, n=output dim.
         num_experts, in_dim, out_dim = weight.shape
 
+        scale_gmm: jax.Array | None = None
+
         if scale.ndim == 4:
             if scale.shape[0] != num_experts or scale.shape[2] != 1 or scale.shape[3] != out_dim:
                 raise ValueError(
@@ -251,23 +253,17 @@ class EPMoE(nnx.Module):
                         f"Unsupported {scale_name} shape {scale.shape} for weight shape {weight.shape}. "
                         f"Expected k_blocks dimension to be 1 or {expected_k_blocks}."
                     )
-            final_scale_sharding = (
-                self._get_wo_scale_sharding(scale)
-                if scale_name == "wo_scale"
-                else P("expert", None, None, "tensor")
-            )
-            return jax.sharding.reshard(scale, final_scale_sharding)
+            scale_gmm = scale
 
-        if scale.ndim == 2 and scale.shape == (num_experts, out_dim):
-            return scale[:, None, None, :]
+        elif scale.ndim == 2 and scale.shape == (num_experts, out_dim):
+            scale_gmm = scale[:, None, None, :]
 
-        if scale.ndim == 3:
+        elif scale.ndim == 3:
             if scale.shape == (num_experts, 1, out_dim):
-                return scale[:, :, None, :]
-
+                scale_gmm = scale[:, :, None, :]
             # Support offline 2D block quant checkpoints whose scales are stored as
             # [num_experts, out_blocks, in_blocks]. GMM expects [E, k_blocks, 1, out_dim].
-            if (
+            elif (
                 self.weight_block_size is not None
                 and isinstance(self.weight_block_size, (list, tuple))
                 and len(self.weight_block_size) == 2
@@ -278,15 +274,8 @@ class EPMoE(nnx.Module):
                 expected_k_blocks = (in_dim + block_size_k - 1) // block_size_k
 
                 if scale.shape == (num_experts, out_dim, expected_k_blocks):
-                    final_scale_sharding = (
-                        self._get_wo_scale_sharding(is_block=(expected_k_blocks > 1))
-                        if scale_name == "wo_scale"
-                        else P("expert", None, None, "tensor")
-                    )
                     scale_gmm = jnp.transpose(scale, (0, 2, 1))[:, :, None, :]
-                    return jax.sharding.reshard(scale_gmm, final_scale_sharding)
-
-                if scale.shape == (num_experts, expected_out_blocks, expected_k_blocks):
+                elif scale.shape == (num_experts, expected_out_blocks, expected_k_blocks):
                     scale_per_out_sharding = (
                         P("expert", None, None)
                         if scale_name == "wo_scale"
@@ -296,21 +285,22 @@ class EPMoE(nnx.Module):
                         :, jnp.arange(out_dim, dtype=jnp.int32) // block_size_out, :
                     ].get(out_sharding=scale_per_out_sharding)
                     scale_gmm = jnp.transpose(scale_per_out, (0, 2, 1))[:, :, None, :]
-                    final_scale_sharding = (
-                        self._get_wo_scale_sharding(is_block=(expected_k_blocks > 1))
-                        if scale_name == "wo_scale"
-                        else P("expert", None, None, "tensor")
-                    )
-                    return jax.sharding.reshard(scale_gmm, final_scale_sharding)
+                elif scale.shape == (num_experts, expected_k_blocks, out_dim):
+                    scale_gmm = scale[:, :, None, :]
 
-                if scale.shape == (num_experts, expected_k_blocks, out_dim):
-                    return scale[:, :, None, :]
+        if scale_gmm is None:
+            raise ValueError(
+                f"Unsupported {scale_name} shape {scale.shape} for weight shape {weight.shape}. "
+                "Expected one of: [E, out_dim], [E, 1, out_dim], [E, k_blocks, 1, out_dim], "
+                "or offline block format [E, out_blocks, k_blocks]."
+            )
 
-        raise ValueError(
-            f"Unsupported {scale_name} shape {scale.shape} for weight shape {weight.shape}. "
-            "Expected one of: [E, out_dim], [E, 1, out_dim], [E, k_blocks, 1, out_dim], "
-            "or offline block format [E, out_blocks, k_blocks]."
+        final_scale_sharding = (
+            self._get_wo_scale_sharding(scale_gmm)
+            if scale_name == "wo_scale"
+            else P("expert", None, None, "tensor")
         )
+        return jax.sharding.reshard(scale_gmm, final_scale_sharding)
 
     def quantize_weights(self, is_static: bool = False, *, abstract: bool = False):
         """Quantize MoE weights in-place or initialize params for static loading."""
