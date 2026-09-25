@@ -26,7 +26,9 @@ def get_grid_thw(item: MultimodalDataItem) -> tuple[int, int, int]:
     return tuple(int(entry) for entry in np.asarray(value).reshape(3))
 
 
-def _validate_vision_items(items: list[MultimodalDataItem], merge_unit: int) -> None:
+def _validate_vision_items(
+    items: list[MultimodalDataItem], merge_unit: int, output_lengths: np.ndarray | None = None
+) -> None:
     for item_index, item in enumerate(items):
         feature = item.feature
         # When the Processor creates an Item, if the feature is None, it should not create the Item.
@@ -35,14 +37,27 @@ def _validate_vision_items(items: list[MultimodalDataItem], merge_unit: int) -> 
 
         feature_patches = int(feature.shape[0])
         grid_patches = math.prod(get_grid_thw(item))
-        placeholder_patches = (
-            sum(end - start for start, end in item.placeholder_ranges or ()) * merge_unit
+        placeholder_tokens = sum(end - start for start, end in item.placeholder_ranges or ())
+        output_length = (
+            feature_patches // merge_unit
+            if output_lengths is None
+            else int(output_lengths[item_index])
         )
-        if not feature_patches == grid_patches == placeholder_patches:
+
+        if feature_patches != grid_patches or feature_patches % merge_unit:
             raise ValueError(
                 f"Vision item {item_index} patch counts must match: "
-                f"feature rows={feature_patches}, grid_thw product={grid_patches}, "
-                f"placeholder tokens * merge_unit={placeholder_patches}."
+                f"feature rows={feature_patches}, grid_thw product={grid_patches}."
+            )
+        if placeholder_tokens != output_length:
+            raise ValueError(
+                f"Vision item {item_index} placeholder tokens={placeholder_tokens} do not "
+                f"match the encoder output length={output_length} declared by the model."
+            )
+        if not 0 < output_length <= feature_patches // merge_unit:
+            raise ValueError(
+                f"Vision item {item_index} output length={output_length} must be in "
+                f"[1, {feature_patches // merge_unit}]."
             )
 
 
@@ -101,16 +116,15 @@ def _bucket_capacity(length: int, unit: int) -> int:
         types.Array(types.int32, 1, "C", readonly=True),
         types.Array(types.int32, 1, "C", readonly=True),
         types.int32,
-        types.int32,
     ),
     nogil=True,
     cache=True,
 )
-def _build_output_indices(lengths, output_starts, output_size, merge_unit):
+def _build_output_indices(output_lengths, output_starts, output_size):
     output_indices = np.full(output_size, -1, dtype=np.int32)
     cursor = 0
-    for item_index in range(lengths.size):
-        output_len = lengths[item_index] // merge_unit
+    for item_index in range(output_lengths.size):
+        output_len = output_lengths[item_index]
         source_start = output_starts[item_index]
         for index in range(output_len):
             output_indices[cursor + index] = source_start + index
@@ -122,6 +136,7 @@ def pack_lanes(
     items_per_lane: list[list[MultimodalDataItem]],
     *,
     merge_unit: int,
+    output_lengths: np.ndarray | None = None,
     input_sharding: NamedSharding,
     dtype: np.dtype | type | None = None,
 ) -> tuple[jax.Array, jax.Array, list[list[int]]]:
@@ -138,6 +153,15 @@ def pack_lanes(
             raise ValueError("cannot pack an empty multimodal batch")
         item_features = [np.asarray(item.feature) for item in items]
         lengths = np.asarray([feature.shape[0] for feature in item_features], dtype=np.int32)
+        output_lengths = (
+            lengths // merge_unit
+            if output_lengths is None
+            else np.ascontiguousarray(output_lengths, dtype=np.int32)
+        )
+        if output_lengths.shape != lengths.shape or np.any(
+            (output_lengths <= 0) | (output_lengths > lengths // merge_unit)
+        ):
+            raise ValueError("Each item must declare 1..patch_count/merge_unit output tokens")
         lane_loads = [sum(int(lengths[index]) for index in lane) for lane in lanes]
         cap = _bucket_capacity(max(lane_loads), merge_unit)
         feature_shape = item_features[0].shape[1:]
@@ -145,7 +169,8 @@ def pack_lanes(
             dtype = np.result_type(*(feature.dtype for feature in item_features))
 
     with jax.profiler.TraceAnnotation("encoder_pack_allocate"):
-        features = np.empty((num_lanes, cap, *feature_shape), dtype=dtype)
+        # Keep padding finite: attention may multiply masked values by zero.
+        features = np.zeros((num_lanes, cap, *feature_shape), dtype=dtype)
         output_cap = cap // merge_unit
         output_starts = np.empty(len(items), dtype=np.int32)
 
@@ -158,11 +183,11 @@ def pack_lanes(
                 features[lane_index, input_offset:end] = feature
                 output_starts[item_index] = lane_index * output_cap + output_offset
                 input_offset = end
-                output_offset += feature.shape[0] // merge_unit
+                output_offset += int(output_lengths[item_index])
 
     with jax.profiler.TraceAnnotation("encoder_pack_output_indices"):
         output_indices = _build_output_indices(
-            lengths, output_starts, num_lanes * output_cap, merge_unit
+            output_lengths, output_starts, num_lanes * output_cap
         )
 
     shard_shape = input_sharding.shard_shape(features.shape)
@@ -184,16 +209,18 @@ def pack_vision_inputs(
     items_per_lane: list[list[MultimodalDataItem]],
     *,
     merge_unit: int,
+    output_lengths: np.ndarray | None = None,
     input_sharding: NamedSharding,
     dtype: np.dtype | type | None = None,
 ) -> tuple[jax.Array, jax.Array, np.ndarray]:
     num_lanes = len(items_per_lane)
     items = [item for lane in items_per_lane for item in lane]
     with jax.profiler.TraceAnnotation("encoder_pack_validate"):
-        _validate_vision_items(items, merge_unit)
+        _validate_vision_items(items, merge_unit, output_lengths)
     features, output_indices, lanes = pack_lanes(
         items_per_lane,
         merge_unit=merge_unit,
+        output_lengths=output_lengths,
         input_sharding=input_sharding,
         dtype=dtype,
     )
@@ -330,6 +357,7 @@ def run_mrope_vision_model(
     rope_type: Literal["rope_3d", "rope_2d", "rope_2d_packed"],
     input_sharding: NamedSharding,
     output_sharding: NamedSharding,
+    pool_temporal_dimension: bool = False,
 ) -> jax.Array:
     """Pack vision items into lanes, run the encoder, and restore item order.
 
@@ -348,6 +376,7 @@ def run_mrope_vision_model(
         rope_type: Selects the positional metadata format for the encoder.
         input_sharding: Input layout, sharded only along the lane dimension.
         output_sharding: Layout of the restored encoder output.
+        pool_temporal_dimension: Pool away t when computing per-item output lengths.
 
     Returns:
         Embeddings shaped ``[num_lanes * capacity // merge_unit, hidden_size]``,
@@ -358,6 +387,8 @@ def run_mrope_vision_model(
 
     if len(items_per_lane) != num_lanes:
         raise ValueError("item lane count does not match the encoder topology")
+    if pool_temporal_dimension and rope_type == "rope_2d_packed":
+        raise ValueError("Temporal pooling requires grid_thw metadata")
     if rope_type == "rope_2d_packed":
         patches, output_indices, position_ids, patch_counts = pack_2d_position_inputs(
             items_per_lane,
@@ -366,9 +397,20 @@ def run_mrope_vision_model(
         )
         metadata_args = (position_ids, patch_counts)
     elif rope_type in ("rope_3d", "rope_2d"):
+        output_lengths = None
+        if pool_temporal_dimension:
+            output_lengths = np.asarray(
+                [
+                    math.prod(get_grid_thw(item)[1:]) // merge_unit
+                    for lane in items_per_lane
+                    for item in lane
+                ],
+                dtype=np.int32,
+            )
         patches, output_indices, grid_thw = pack_vision_inputs(
             items_per_lane,
             merge_unit=merge_unit,
+            output_lengths=output_lengths,
             input_sharding=input_sharding,
         )
         metadata_args = (grid_thw,)

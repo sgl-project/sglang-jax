@@ -354,3 +354,66 @@ def test_retracted_prefill_continues_mrope_positions_past_prompt():
         result["mrope_positions"],
         [[30, 31, 3, 4, 5], [40, 41, 3, 4, 5], [50, 51, 3, 4, 5]],
     )
+
+
+@pytest.mark.parametrize("num_lanes", [1, 2, 4])
+@pytest.mark.parametrize("grids", [[(4, 2, 4), (1, 2, 2)], [(1, 2, 2), (3, 2, 4), (1, 4, 4)]])
+def test_temporal_pooling_restores_item_order(grids, num_lanes):
+    # An independent, per-item mean encoder isolates packing from attention.
+    class MeanEncoder:
+        def prepare_metadata(self, grid_thw, capacity, *, sharding):
+            return dict(grids=grid_thw, capacity=capacity)
+
+        def __call__(self, patches, *, grids, capacity):
+            patches = np.asarray(patches).reshape(num_lanes, capacity, 1)
+            output = np.zeros((num_lanes, capacity // 4, 1), dtype=np.float32)
+            for lane, lane_grids in enumerate(grids):
+                src = dst = 0
+                for t, h, w in lane_grids:
+                    if not t:
+                        continue
+                    count = t * h * w
+                    values = patches[lane, src : src + count].reshape(t, h // 2, 2, w // 2, 2)
+                    values = values.mean(axis=(0, 2, 4)).reshape(-1, 1)
+                    output[lane, dst : dst + len(values)] = values
+                    src += count
+                    dst += len(values)
+            return jax.device_put(output, NamedSharding(mesh, PartitionSpec("data")))
+
+    mesh = _mesh(dp=num_lanes)
+    ranges = [(0, h * w // 4) for _, h, w in grids]
+    items = [
+        MultimodalDataItem(
+            modality=Modality.IMAGE,
+            feature=(np.arange(t * h * w, dtype=np.float32) + index * 100).reshape(-1, 1),
+            placeholder_ranges=[span],
+            model_specific_data={"image_grid_thw": np.array([t, h, w])},
+        )
+        for index, ((t, h, w), span) in enumerate(zip(grids, ranges))
+    ]
+    items_per_lane = [items[lane::num_lanes] for lane in range(num_lanes)]
+    ordered_items = [item for lane in items_per_lane for item in lane]
+    expected = np.concatenate(
+        [
+            item.feature.reshape(t, h // 2, 2, w // 2, 2).mean(axis=(0, 2, 4)).reshape(-1, 1)
+            for item in ordered_items
+            for t, h, w in [item.image_grid_thw]
+        ]
+    )
+    kwargs = dict(
+        mesh=mesh,
+        num_lanes=num_lanes,
+        merge_unit=4,
+        rope_type="rope_2d",
+        input_sharding=NamedSharding(mesh, PartitionSpec("data")),
+        output_sharding=NamedSharding(mesh, PartitionSpec()),
+    )
+    with pytest.raises(ValueError, match="placeholder tokens"):
+        run_mrope_vision_model(MeanEncoder(), items_per_lane, **kwargs)
+    actual = np.asarray(
+        run_mrope_vision_model(
+            MeanEncoder(), items_per_lane, pool_temporal_dimension=True, **kwargs
+        )
+    )
+    np.testing.assert_allclose(actual[: len(expected)], expected)
+    np.testing.assert_array_equal(actual[len(expected) :], 0)

@@ -1,27 +1,50 @@
-import logging
+from __future__ import annotations
 
+import logging
+from collections.abc import Callable
+
+import jax
 import jax.numpy as jnp
+from flax import nnx
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.hf_transformers_utils import get_hf_text_config
-from sgl_jax.srt.layers.logits_processor import LogitsMetadata
-from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
-from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.deepseek_v3 import DeepseekV3ForCausalLM
+from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
+from sgl_jax.srt.multimodal.configs.kimi.kimi_k25_config import KimiK25ModelVitConfig
+from sgl_jax.srt.multimodal.in_model.interface import (
+    InModelMultimodalContract,
+    VisionInputSpec,
+)
+from sgl_jax.srt.multimodal.in_model.lane_packing import (
+    encoder_num_lanes,
+    run_mrope_vision_model,
+)
+from sgl_jax.srt.multimodal.layers.vision_sharding import resolve_encoder_tp
+from sgl_jax.srt.multimodal.models.kimi_k25.kimi_k25_vit import (
+    Kimi_K25_VisionModel,
+    create_kimi_vision_weight_mappings,
+)
 from sgl_jax.srt.utils.weight_utils import WeightLoader
 
 logger = logging.getLogger(__name__)
 
 
-class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM):
+class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM, InModelMultimodalContract):
+    """Kimi-K2.5 on the in-model multimodal path.
+
+    The vision tower lives inside this class as self.visual. The engine calls
+    get_input_embeddings() to embed text and get_multimodal_encode_funcs() to
+    encode media, then merges the two itself.
+    """
 
     def __init__(
         self,
         config=None,
         dtype=None,
         mesh=None,
+        rngs: nnx.Rngs | None = None,
     ):
-        self.config = config
         self.text_config = get_hf_text_config(config) or config
         # The server policy lives on the outer config; the base model reads the text config.
         self.text_config.enable_dp_lm_head = getattr(config, "enable_dp_lm_head", False)
@@ -43,19 +66,49 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM):
         )
         self.hf_weight_prefix = "language_model."
 
-    def __call__(
-        self,
-        forward_batch: ForwardBatch,
-        memory_pools: MemoryPools,
-        logits_metadata: LogitsMetadata,
-    ):
-        token_to_kv_pool = memory_pools.token_to_kv_pool
-        hidden_states, layers_kv_fused, layers_topk_ids = self.model(
-            forward_batch, token_to_kv_pool
+        self.vision_config = KimiK25ModelVitConfig()
+        vision_tp = resolve_encoder_tp(self.mesh, getattr(config, "vision_encoder_parallel", "dp"))
+        self.visual = Kimi_K25_VisionModel(
+            self.vision_config,
+            dtype=self.dtype,
+            rngs=rngs or nnx.Rngs(0),
+            mesh=self.mesh,
+            vision_tp=vision_tp,
+        )
+        self.vision_input_spec = VisionInputSpec(
+            patch_dim=self.visual.in_channels * self.visual.patch_size**2,
+            spatial_merge_size=self.visual.merge_kernel_size[0],
         )
 
-        output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
-        return output, {"token_to_kv_pool": layers_kv_fused}, True, layers_topk_ids
+    def get_input_embeddings(self) -> Callable[[jax.Array], jax.Array]:
+        return self.model.embed_tokens
+
+    def get_multimodal_encode_funcs(self):
+        # Kimi's processor reports images and video chunks in one grid_thws
+        # tensor and routes both through the same tower, so every visual
+        # modality maps to the same encoder. IMAGE is what the processor tags
+        # today; the other two are registered so a future tagging change cannot
+        # silently drop embeddings.
+        return {
+            Modality.IMAGE: self.encode_vision_items,
+            Modality.MULTI_IMAGES: self.encode_vision_items,
+            Modality.VIDEO: self.encode_vision_items,
+        }
+
+    def encode_vision_items(self, items_per_lane: list[list[MultimodalDataItem]]) -> jax.Array:
+        """Encode scheduler-assigned lanes; sd2_tpool emits h*w/merge_unit tokens per item."""
+        specs = self.visual.vision_tower.specs
+        return run_mrope_vision_model(
+            self.visual,
+            items_per_lane,
+            mesh=self.mesh,
+            num_lanes=encoder_num_lanes(self.mesh, self.visual.vision_tower.vision_tp),
+            merge_unit=self.visual.merge_unit,
+            rope_type="rope_2d",
+            pool_temporal_dimension=True,
+            input_sharding=specs.sharding(specs.batch_axis),
+            output_sharding=specs.sharding(),
+        )
 
     def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(
@@ -65,11 +118,18 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM):
             dtype=self.dtype,
         )
         weight_mappings = self._create_weight_mappings(model_config)
+
+        weight_mappings.update(
+            create_kimi_vision_weight_mappings(
+                self.vision_config.vt_num_hidden_layers,
+                target_prefix="visual.",
+            )
+        )
         loader.load_weights_from_safetensors(weight_mappings)
 
         for layer in self.model.layers:
             layer.self_attn.post_load_weights()
-        logger.info("Kimi K2.5 Language model weights loaded successfully!")
+        logger.info("Kimi K2.5 language model and vision tower weights loaded successfully!")
 
 
 EntryClass = KimiK25ForConditionalGeneration
