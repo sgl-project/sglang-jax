@@ -79,6 +79,7 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
         scheduler.is_hybrid = False
         scheduler.is_mixed_chunk = False
         scheduler.waiting_queue = []
+        scheduler.encoder_waiting = {}
         scheduler.grammar_queue = []
         scheduler.disagg_prefill_queue = None
         scheduler.disagg_prealloc_queue = None

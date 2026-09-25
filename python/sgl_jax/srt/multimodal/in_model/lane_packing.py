@@ -118,6 +118,25 @@ def _build_output_indices(lengths, output_starts, output_size, merge_unit):
     return output_indices
 
 
+def plan_encoder_lanes(item_lengths, num_lanes, *, merge_unit):
+    """Map logical tokens to lane-local encoder output without device work."""
+    lengths = np.asarray(item_lengths, dtype=np.int32)
+    lanes = balance_lanes(lengths.tolist(), num_lanes)
+    capacity = (
+        _bucket_capacity(
+            max(sum(int(lengths[index]) for index in lane) for lane in lanes), merge_unit
+        )
+        // merge_unit
+    )
+    starts = np.empty(len(lengths), dtype=np.int32)
+    for rank, lane in enumerate(lanes):
+        offset = rank * capacity
+        for index in lane:
+            starts[index] = offset
+            offset += int(lengths[index]) // merge_unit
+    return lanes, _build_output_indices(lengths, starts, num_lanes * capacity, merge_unit)
+
+
 def pack_lanes(
     items_per_lane: list[list[MultimodalDataItem]],
     *,

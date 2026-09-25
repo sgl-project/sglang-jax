@@ -16,6 +16,14 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.configs.model_config import AttentionArch, MockModelConfig, ModelConfig
+from sgl_jax.srt.disaggregation.encoder.embedding_data import (
+    ReceivedEmbeddingBatch,
+    embed_received_inputs,
+)
+from sgl_jax.srt.disaggregation.encoder.transfer_layout import (
+    ENCODER_PAGE_SIZE,
+    encoder_transfer_nbytes,
+)
 from sgl_jax.srt.eplb.expert_location import (
     init_expert_location_metadata,
     set_global_server_args,
@@ -82,6 +90,17 @@ def _embedding_pool_bytes(
     multimodal_model=None,
 ) -> int:
     """Per-device byte budget reserved for the multimodal embedding pool."""
+    if getattr(server_args, "language_only", False) and not is_draft_worker:
+        vision = getattr(model_config.hf_config, "vision_config", None)
+        width = model_config.hidden_size * (
+            1 + len(getattr(vision, "deepstack_visual_indexes", ()))
+        )
+        target = getattr(multimodal_model, "thinker", multimodal_model)
+        shards = target.mesh.size if target is not None else server_args.tp_size
+        # Match the per-shard page rounding in create_encoder_pool.
+        unit = ENCODER_PAGE_SIZE * shards
+        tokens = -(-server_args.encoder_transfer_max_tokens // unit) * ENCODER_PAGE_SIZE
+        return encoder_transfer_nbytes((tokens, width), model_config.dtype)
     enabled = (
         getattr(model_config, "is_multimodal", False)
         and ModelRegistry.is_in_model_multimodal(model_config.hf_config.architectures)
@@ -234,7 +253,8 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         are known); its byte budget was already withheld from the KV cache in
         :meth:`_profile_available_bytes`.
         """
-        if not self.embedding_pool_bytes:
+        # EPD keeps its byte budget but allocates the receive pool in the scheduler.
+        if getattr(self.server_args, "language_only", False) or not self.embedding_pool_bytes:
             return
         page_size = self.server_args.page_size
         packed_hidden = _packed_embedding_hidden(self.model_config, self.model)
@@ -935,7 +955,8 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self,
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
-        multimodal_batch: MultimodalBatch | None = None,
+        *,
+        multimodal_batch: MultimodalBatch | ReceivedEmbeddingBatch | None = None,
     ) -> tuple[LogitsProcessorOutput, int]:
         self.forward_pass_id += 1
         precision_tracer.start_batch_trace(forward_batch.bid)
@@ -944,12 +965,17 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             ForwardMode.EXTEND,
             ForwardMode.MIXED,
         ):
-            input_embedding, deepstack, apply_for_deepstack = embed_multimodal_inputs(
-                multimodal_batch=multimodal_batch,
-                input_ids=forward_batch.input_ids,
-                multimodal_model=self.model,
-                embedding_pool=self.embedding_pool,
-            )
+            if isinstance(multimodal_batch, ReceivedEmbeddingBatch):
+                input_embedding, deepstack, apply_for_deepstack = embed_received_inputs(
+                    multimodal_batch, forward_batch.input_ids, self.model
+                )
+            else:
+                input_embedding, deepstack, apply_for_deepstack = embed_multimodal_inputs(
+                    multimodal_batch=multimodal_batch,
+                    input_ids=forward_batch.input_ids,
+                    multimodal_model=self.model,
+                    embedding_pool=self.embedding_pool,
+                )
             forward_batch.input_embedding = input_embedding
             forward_batch.deepstack_visual_embedding = deepstack
             forward_batch.apply_for_deepstack = apply_for_deepstack

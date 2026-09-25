@@ -236,6 +236,37 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         "Qwen3_5MoeForConditionalGeneration",
     )
 
+    # Qwen-VL EPD reconstruction adapted from SGLang:
+    # https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/multimodal/processors/qwen_vl.py
+    # for PD node
+    def get_mm_data(self, prompt, embeddings, **metadata) -> MultimodalInputs:
+        """Add Qwen MRoPE metadata to the generic disaggregated output."""
+        hf_config = self.hf_config
+        mm_inputs = super().get_mm_data(prompt, embeddings, **metadata)
+        image_grids = self._to_grid_list(metadata.get("image_grid_thw"))
+        video_grids = self._to_grid_list(metadata.get("video_grid_thw"))
+        second_per_grid_ts = metadata.get("second_per_grid_ts")
+        second_per_grid_ts = (
+            []
+            if second_per_grid_ts is None
+            else np.asarray(second_per_grid_ts).reshape(-1).tolist()
+        )
+        mrope_positions, mrope_position_delta = compute_mrope_positions(
+            input_ids=mm_inputs.input_ids,
+            image_grid_thw=image_grids or None,
+            video_grid_thw=video_grids or None,
+            second_per_grid_ts=second_per_grid_ts or None,
+            vision_start_token_id=hf_config.vision_start_token_id,
+            image_token_id=hf_config.image_token_id,
+            video_token_id=getattr(hf_config, "video_token_id", None),
+            spatial_merge_size=self.spatial_merge_size,
+            tokens_per_second=getattr(hf_config.vision_config, "tokens_per_second", None),
+        )
+        mm_inputs.mrope_positions = mrope_positions
+        mm_inputs.mrope_position_delta = np.asarray([[mrope_position_delta]], dtype=np.int32)
+        return mm_inputs
+
+    # for E node
     async def process_mm_data_async(
         self,
         image_data,

@@ -30,6 +30,8 @@ import zmq.asyncio
 from fastapi import BackgroundTasks
 
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.disaggregation.encoder.bootstrap import EncoderBootstrapServer
+from sgl_jax.srt.disaggregation.encoder.dispatcher import EncoderRequestDispatcher
 from sgl_jax.srt.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -230,7 +232,6 @@ class TokenizerManager:
         self.rid_to_state: dict[str, ReqState] = {}
         self.health_check_failed = False
         self.gracefully_exit = False
-        self._shutdown = False
         self.last_receive_tstamp = 0
         self.dump_requests_folder = ""  # By default do not dump
         self.dump_requests_threshold = 1000
@@ -240,6 +241,21 @@ class TokenizerManager:
         self.session_futures = {}  # session_id -> asyncio event
         self.max_req_input_len = None
         self.asyncio_tasks = set()
+
+        # The local bootstrap and the request path share this list by reference.
+        # Static URLs remain available and dynamic registrations are added in place.
+        self.encoder_urls = list(server_args.encoder_urls)
+        timeout = server_args.encoder_control_timeout_seconds
+        self.encoder_request_dispatcher = EncoderRequestDispatcher(
+            None if timeout <= 0 else timeout
+        )
+        self.encoder_bootstrap_server: EncoderBootstrapServer | None = None
+        if server_args.encoder_bootstrap_port is not None:
+            self.encoder_bootstrap_server = EncoderBootstrapServer(
+                host=server_args.host,
+                port=server_args.encoder_bootstrap_port,
+                urls=self.encoder_urls,
+            )
 
         # For load balancing
         self.current_load = 0
@@ -297,25 +313,25 @@ class TokenizerManager:
         )
         self.wait_timeout = int(os.environ.get("SGLANG_WAIT_TIMEOUT", "4"))
 
-    def shutdown(self):
-        if self._shutdown:
-            return
-        self._shutdown = True
-        if self.mm_processor is not None:
-            self.mm_processor.shutdown()
-
     async def generate_request(
         self,
         obj: GenerateReqInput | EmbeddingReqInput,
         request: fastapi.Request | None = None,
     ):
-
         created_time = time.time()
         async with self.is_pause_cond:
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
+
+        if (
+            isinstance(obj, GenerateReqInput)
+            and self._encoder_disaggregation_enabled()
+            and obj.contains_mm_input()
+            and getattr(obj, "parallel_sample_num", 1) > 1
+        ):
+            raise ValueError("encoder disaggregation does not support parallel sampling yet")
 
         # Acquire LoRA ID if lora_path is provided
         if isinstance(obj, GenerateReqInput) and self.server_args.enable_lora and obj.lora_path:
@@ -353,12 +369,18 @@ class TokenizerManager:
         input_text = obj.text
         input_ids = obj.input_ids
         mm_inputs = None
+        use_remote_encoder = (
+            isinstance(obj, GenerateReqInput)
+            and self._encoder_disaggregation_enabled()
+            and obj.contains_mm_input()
+        )
         if isinstance(obj, GenerateReqInput) and obj.contains_mm_input():
+            self._validate_mm_limits(obj)
+        if isinstance(obj, GenerateReqInput) and obj.contains_mm_input() and not use_remote_encoder:
             if self.mm_processor is None:
                 raise ValueError(
                     "Multimodal input was provided, but the model has no multimodal processor."
                 )
-            self._validate_mm_limits(obj)
             mm_inputs = await self.mm_processor.process_mm_data_async(
                 image_data=obj.image_data,
                 input_text=input_text or input_ids,
@@ -377,7 +399,27 @@ class TokenizerManager:
             input_ids = encoded["input_ids"]
 
         self._validate_one_request(obj, input_ids)
-        return self._create_tokenized_object(obj, input_text, input_ids, mm_inputs)
+        tokenized_obj = self._create_tokenized_object(obj, input_text, input_ids, mm_inputs)
+
+        if use_remote_encoder:
+            tokenized_obj.encoder_urls = await self._get_encoder_urls()
+            tokenized_obj.need_wait_for_mm_inputs = True
+
+        return tokenized_obj
+
+
+    def _encoder_disaggregation_enabled(self) -> bool:
+        return self.server_args.language_only
+
+    async def _get_encoder_urls(self) -> list[str]:
+        encoder_urls = (
+            self.encoder_bootstrap_server.list_urls()
+            if self.encoder_bootstrap_server is not None
+            else list(self.encoder_urls)
+        )
+        if not encoder_urls:
+            raise RuntimeError("no Encoder workers are registered")
+        return encoder_urls
 
     def _validate_one_request(
         self, obj: GenerateReqInput | EmbeddingReqInput, input_ids: list[int]
@@ -596,6 +638,12 @@ class TokenizerManager:
         tokenized_obj: TokenizedGenerateReqInput | TokenizedEmbeddingReqInput,
         created_time: float | None = None,
     ):
+        dispatch_task = None
+        if getattr(tokenized_obj, "need_wait_for_mm_inputs", False):
+            assignments, dispatch_task = self.encoder_request_dispatcher.dispatch(
+                obj, tokenized_obj.encoder_urls
+            )
+            tokenized_obj.num_items_assigned = assignments
         send_mm_request(self.send_to_scheduler, tokenized_obj)
         # Capture the caller's event loop so that _notify_state_event can use
         # call_soon_threadsafe when handle_loop runs on a different thread
@@ -610,7 +658,23 @@ class TokenizerManager:
         # Handle rid being a list (single element) or string
         rid_key = obj.rid[0] if isinstance(obj.rid, list) else obj.rid
         self.rid_to_state[rid_key] = state
+        if dispatch_task is not None:
+            self.asyncio_tasks.add(dispatch_task)
+
+            def finish_dispatch(task):
+                self.asyncio_tasks.discard(task)
+                if task.cancelled():
+                    return
+                error = task.exception()
+                if error is not None and rid_key in self.rid_to_state:
+                    logger.error("Encoder dispatch failed. rid=%s error=%r", rid_key, error)
+                    self.send_to_scheduler.send_pyobj(
+                        AbortReq(rid=rid_key, aborted_message=f"Encoder dispatch failed: {error!r}")
+                    )
+
+            dispatch_task.add_done_callback(finish_dispatch)
         return state
+
 
     def _notify_state_event(self, state: ReqState) -> None:
         """Wake the consumer waiting on ``state.event``.
@@ -1122,7 +1186,8 @@ class TokenizerManager:
                 self.dump_requests_before_crash()
                 break
 
-        self.shutdown()
+        if self.encoder_bootstrap_server is not None:
+            self.encoder_bootstrap_server.close()
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(0)
 
