@@ -145,6 +145,11 @@ class EAGLEWorker(BaseSpecWorker):
                 else [legacy]
             )
             shapes.extend((bs, size) for size in sizes)
+        logger.info(
+            "[SPEC_DECODE] cache_loc_fit=%s precompile shapes (bs, cache_loc)=%s",
+            _SPEC_CACHE_LOC_FIT,
+            shapes,
+        )
         with tqdm(shapes, desc="[SPEC_DECODE] PRECOMPILE", leave=False) as pbar:
             for bs, aligned_cache_loc_size in pbar:
                 pbar.set_postfix(bs=bs, cache_loc=aligned_cache_loc_size, dp_size=dp_size)
