@@ -272,6 +272,8 @@ def sparse_mla_page_level(
         num_kv_pages_per_block=num_kv_pages_per_block,
         num_queries_per_block=num_queries_per_block,
         vmem_limit_bytes=vmem_limit_bytes,
+        # grouped: every pseudo-sequence has exactly G query rows.
+        mixed_static_q_len=page_share_group if grouped else None,
     )
     return o[..., :kv_lora_rank], cache_out
 

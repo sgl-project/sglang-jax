@@ -47,7 +47,7 @@ def _meta(base_lens):
     return seq_lens, cu_q, cu_kv, page_indices, dist
 
 
-def _run_grouped(base_lens):
+def _run_grouped(base_lens, group_queries=True):
     S = len(base_lens)
     T = S * G
     seq_lens, cu_q, cu_kv, page_indices, dist = _meta(base_lens)
@@ -70,6 +70,7 @@ def _run_grouped(base_lens):
             page_indices=np.asarray(pi).reshape(-1, KPM),
             cu_q=np.asarray(cu_q_),
             dist=np.asarray(dist_),
+            kw=kw,
         )
         return ql_, cache_
 
@@ -95,8 +96,8 @@ def _run_grouped(base_lens):
             pages_per_seq=PPS,
             kv_lora_rank=LKV,
             k_pages_max=KPM,
-            page_share_group=G,
-            group_queries=True,
+            page_share_group=G if group_queries else 1,
+            group_queries=group_queries,
         )
     return captured
 
@@ -124,3 +125,11 @@ def test_valid_groups_unchanged_by_padding():
     padded = _run_grouped([20, 37, 0, 0])
     np.testing.assert_array_equal(dense["kv_lens"], padded["kv_lens"][:2])
     np.testing.assert_array_equal(dense["page_indices"], padded["page_indices"][:2])
+
+
+def test_grouped_requests_static_mixed_q_len_g():
+    # G query rows per pseudo-sequence: the mixed kernel must size its query
+    # block by G instead of the tuned-table block (bq 256 for a 4-row block
+    # multiplies the flash-attention work by 64x and hides the KV-read win).
+    assert _run_grouped([20, 37, 0, 0])["kw"]["mixed_static_q_len"] == G
+    assert _run_grouped([20, 37, 0, 0], group_queries=False)["kw"].get("mixed_static_q_len") is None
