@@ -217,8 +217,13 @@ def sparse_mla_page_level(
             page_indices[seq_page_start[rep][:, None] + sp_local_g],
             cache_kv.shape[0] - 1,
         )
+        # bs-padding groups (kv_len == 0) still carry G query rows, and the mixed
+        # kernel sizes its KV loop by kv_len: kv_len == 0 skips the loop, so the
+        # query-block DMA is never waited (semaphore non-zero at kernel exit) or
+        # the next sequence is never prefetched (hang). Give them G all-new
+        # positions on the sentinel page, like the per-token path's kv_len == 1.
         sp_kv_len = jnp.where(
-            valid_g, n_hit_g * page_size + s_i * page_size + new_of + 1, 0
+            valid_g, n_hit_g * page_size + s_i * page_size + new_of + 1, G
         ).astype(jnp.int32)
         sp_page_indices = sp_phys.reshape(-1)  # [Ng * k_pages_max]
         sp_cu_q = jnp.arange(Ng + 1, dtype=jnp.int32) * G
