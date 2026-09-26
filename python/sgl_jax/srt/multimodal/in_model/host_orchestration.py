@@ -11,7 +11,6 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.models.registry import ModelRegistry
 from sgl_jax.srt.multimodal.common.modality_enum import (
     Modality,
     MultimodalDataItem,
@@ -21,7 +20,10 @@ from sgl_jax.srt.multimodal.in_model.embedding_pool import (
     EmbeddingPool,
     EmbeddingPoolEntry,
 )
-from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
+from sgl_jax.srt.multimodal.in_model.interface import (
+    AudioCodeInputSpec,
+    InModelMultimodalContract,
+)
 from sgl_jax.srt.multimodal.in_model.lane_packing import (
     balance_lanes,
     mrope_vision_dummy_inputs,
@@ -87,9 +89,7 @@ def build_multimodal_batch(
     """Check cache presence and balance expected misses for this prefill chunk."""
     if num_encoder_lanes < 1:
         raise ValueError("num_encoder_lanes must be positive")
-    if reqs_info is None or not ModelRegistry.is_in_model_multimodal(
-        model_config.hf_config.architectures
-    ):
+    if reqs_info is None or not model_config.is_in_model_multimodal:
         return None
 
     grouped: dict[Modality, list[ItemTask]] = {}
@@ -311,6 +311,7 @@ def precompile_multimodal_encoder(
     *,
     num_lanes: int = 1,
     patch_paddings=None,
+    audio_token_buckets: Sequence[int] = (16, 64, 256, 1024),
 ) -> tuple[int, ...]:
     """Warm encoders, merge and cache kernels; return observed output capacities."""
     encode_funcs = multimodal_model.get_multimodal_encode_funcs()
@@ -323,6 +324,18 @@ def precompile_multimodal_encoder(
             dummy_inputs = mrope_vision_dummy_inputs(
                 spec, patch_paddings, num_lanes=num_lanes, modality=modality
             )
+        elif modality == Modality.AUDIO and isinstance(
+            multimodal_model.audio_input_spec, AudioCodeInputSpec
+        ):
+            spec = multimodal_model.audio_input_spec
+            dummy_inputs = []
+            for tokens in audio_token_buckets:
+                item = MultimodalDataItem(
+                    modality=modality,
+                    feature=np.zeros((tokens * spec.group_size, spec.channels), np.int32),
+                    placeholder_ranges=[(0, tokens)],
+                )
+                dummy_inputs.append((modality, [[item]] + [[] for _ in range(num_lanes - 1)]))
         else:
             raise NotImplementedError(f"No dummy input builder for {modality}")
 

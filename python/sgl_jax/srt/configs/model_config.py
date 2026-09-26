@@ -50,6 +50,7 @@ _FUSED_MOE_V2_SUPPORTED_ARCHITECTURES = frozenset(
         "BailingMoeV2ForCausalLM",
         "BailingMoeV2_5ForCausalLM",
         "MiMoV2ForCausalLM",
+        "MiMoV2ForConditionalGeneration",
         "MiMoV2FlashForCausalLM",
         "GlmMoeDsaForCausalLM",
     }
@@ -584,14 +585,16 @@ class ModelConfig:
         `attention_arch` for backend selection — so patches land in time.
         Import is lazy because model modules import ModelConfig back.
         """
-        from sgl_jax.srt.models.registry import ModelRegistry
+        from sgl_jax.srt.model_loader.arch import get_model_architecture
         from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
 
+        self.is_in_model_multimodal = False
         try:
-            model_cls, _ = ModelRegistry.resolve_model_cls(self.hf_config.architectures)
+            model_cls, _ = get_model_architecture(self)
         except ValueError:
             return
-        self.is_multimodal |= issubclass(model_cls, InModelMultimodalContract)
+        self.is_in_model_multimodal = issubclass(model_cls, InModelMultimodalContract)
+        self.is_multimodal |= self.is_in_model_multimodal
         patch = getattr(model_cls, "patch_model_config", None)
         if patch is not None:
             patch(self)
@@ -1038,6 +1041,7 @@ multimodal_model_archs = [
     "LlavaQwenForCausalLM",
     "LlavaForConditionalGeneration",
     "LlavaVidForCausalLM",
+    "MiMoV2ForConditionalGeneration",
     "MiniCPMO",
     "MiniCPMV",
     "Mistral3ForConditionalGeneration",

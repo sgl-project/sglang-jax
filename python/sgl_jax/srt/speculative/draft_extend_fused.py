@@ -1761,6 +1761,11 @@ def prepare_forward_batch_for_prefill(spec_worker, model_worker_batch):
     )
     model_worker_batch.forward_batch = _make_forward_batch(model_worker_batch, target_mr)
     model_worker_batch.forward_batch.bid = model_worker_batch.bid
+    # Fused prefill calls the target model directly, bypassing ModelRunner.forward.
+    # Encode and merge this chunk's multimodal inputs before entering the JIT.
+    target_mr.prepare_multimodal_inputs(
+        model_worker_batch.forward_batch, model_worker_batch.multimodal_batch
+    )
     return model_worker_batch.forward_batch
 
 
@@ -2170,6 +2175,12 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
         )
         target_forward_batch = model_worker_batch.forward_batch
         target_forward_batch.bid = model_worker_batch.bid
+        # Some callers supply an already-built ForwardBatch. Preserve prepared
+        # embeddings, but do not assume batch construction encoded the images.
+        if target_forward_batch.input_embedding is None:
+            target_mr.prepare_multimodal_inputs(
+                target_forward_batch, model_worker_batch.multimodal_batch
+            )
     target_logits_metadata = _prepare_logits_metadata(model_worker_batch, spec_worker.mesh)
 
     hidden_size = target_worker.model_config.hidden_size

@@ -29,6 +29,12 @@ class MelInputSpec:
 
 
 @dataclass(frozen=True)
+class AudioCodeInputSpec:
+    channels: int
+    group_size: int
+
+
+@dataclass(frozen=True)
 class VisionInputSpec:
     patch_dim: int
     spatial_merge_size: int
@@ -42,7 +48,7 @@ class InModelMultimodalContract(ABC):
 
     vision_input_spec: VisionInputSpec | None = None
 
-    audio_input_spec = None
+    audio_input_spec: WaveformInputSpec | MelInputSpec | AudioCodeInputSpec | None = None
 
     @abstractmethod
     def get_input_embeddings(self) -> Callable[[jax.Array], jax.Array]:

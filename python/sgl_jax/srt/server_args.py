@@ -35,11 +35,7 @@ def apply_multimodal_model_defaults(server_args, model_config) -> None:
     if not model_config.is_multimodal:
         return
 
-    from sgl_jax.srt.models.registry import ModelRegistry
-
-    hf_config = getattr(model_config, "hf_config", None)
-    architectures = list(getattr(hf_config, "architectures", None) or [])
-    in_model = ModelRegistry.is_in_model_multimodal(architectures)
+    in_model = model_config.is_in_model_multimodal
 
     if not in_model and not server_args.disable_radix_cache:
         logger.info("Multimodal model detected, disabling radix cache")
