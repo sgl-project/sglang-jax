@@ -61,9 +61,7 @@ def _info(items, prefix, length):
 
 
 def _batch(infos, tokens, pool=None, lanes=1):
-    config = SimpleNamespace(
-        hf_config=SimpleNamespace(architectures=["Qwen2_5_VLForConditionalGeneration"])
-    )
+    config = SimpleNamespace(is_in_model_multimodal=True)
     return orchestration.build_multimodal_batch(
         infos, len(infos), config, tokens, embedding_pool=pool, num_encoder_lanes=lanes
     )

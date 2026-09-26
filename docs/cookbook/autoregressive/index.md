@@ -80,6 +80,7 @@ End-to-end serving recipes for autoregressive models on SGL-JAX, organized by ve
 | Status | Model | Recipe | Min TPU | Backend |
 |---|---|---|---|---|
 | ✅ | MiMo-V2-Flash | [`Xiaomi/MiMo-V2-Flash.md`](./Xiaomi/MiMo-V2-Flash.md) | v7x-8 or v6e-16 | MoE + reasoning/tool (`mimo`) |
+| 🧪 | MiMo-V2.5 | [`Xiaomi/MiMo-V2.5.md`](./Xiaomi/MiMo-V2.5.md) | v7x-8 | image/audio/video; accuracy evaluated, throughput pending |
 | ✅ | MiMo-V2.5-Pro | [`Xiaomi/MiMo-V2.5-Pro.md`](./Xiaomi/MiMo-V2.5-Pro.md) | v6e-64 (v7x-16 alternative) | MoE + reasoning/tool (`mimo`) |
 | ✅ | MiMo-7B-RL | [`Xiaomi/MiMo-7B.md`](./Xiaomi/MiMo-7B.md) | v6e-4 | dense + reasoning/tool (`mimo`) |
 

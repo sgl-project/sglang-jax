@@ -53,7 +53,6 @@ from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     _build_non_hybrid_memory_pools,
 )
 from sgl_jax.srt.model_loader.loader import get_model_loader
-from sgl_jax.srt.models.registry import ModelRegistry
 from sgl_jax.srt.multimodal.in_model.embedding_pool import EmbeddingPool
 from sgl_jax.srt.multimodal.in_model.host_orchestration import (
     MultimodalBatch,
@@ -84,7 +83,7 @@ def _embedding_pool_bytes(
     """Per-device byte budget reserved for the multimodal embedding pool."""
     enabled = (
         getattr(model_config, "is_multimodal", False)
-        and ModelRegistry.is_in_model_multimodal(model_config.hf_config.architectures)
+        and model_config.is_in_model_multimodal
         and not is_draft_worker
         and not server_args.multimodal
         and not server_args.enable_lora
@@ -931,15 +930,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
     ) -> tuple[LogitsProcessorOutput, int]:
         raise NotImplementedError("forward_idle is not implemented")
 
-    def forward(
+    def prepare_multimodal_inputs(
         self,
         forward_batch: ForwardBatch,
-        logits_metadata: LogitsMetadata,
         multimodal_batch: MultimodalBatch | None = None,
-    ) -> tuple[LogitsProcessorOutput, int]:
-        self.forward_pass_id += 1
-        precision_tracer.start_batch_trace(forward_batch.bid)
-        precision_tracer.set_current_forward_pass_id(self.forward_pass_id)
+    ) -> None:
+        """Prepare encoder embeddings before ordinary or fused model calls."""
         if isinstance(self.model, InModelMultimodalContract) and forward_batch.forward_mode in (
             ForwardMode.EXTEND,
             ForwardMode.MIXED,
@@ -953,6 +949,17 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             forward_batch.input_embedding = input_embedding
             forward_batch.deepstack_visual_embedding = deepstack
             forward_batch.apply_for_deepstack = apply_for_deepstack
+
+    def forward(
+        self,
+        forward_batch: ForwardBatch,
+        logits_metadata: LogitsMetadata,
+        multimodal_batch: MultimodalBatch | None = None,
+    ) -> tuple[LogitsProcessorOutput, int]:
+        self.forward_pass_id += 1
+        precision_tracer.start_batch_trace(forward_batch.bid)
+        precision_tracer.set_current_forward_pass_id(self.forward_pass_id)
+        self.prepare_multimodal_inputs(forward_batch, multimodal_batch)
         with jax.profiler.TraceAnnotation("_forward_raw"):
             ret = self._forward_raw(forward_batch, logits_metadata)
         return ret
