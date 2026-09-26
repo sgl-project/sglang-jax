@@ -507,6 +507,80 @@ def prefill_write_and_attend_ragged_qblock(
     return out.reshape(T, H, Dv), cache_new
 
 
+def prefill_write_and_attend_ragged_qblock_tsa(
+    ql,  # [q_tokens, H, kv_lora_rank]      local token slice, FULL heads
+    qpe,  # [q_tokens, H, rope]
+    kvc,  # [total_tokens, kv_lora_rank]     full chunk's new c_kv to write
+    kpe,  # [total_tokens, rope]
+    cache,  # [P, ps//pk, pk, Dk_pad]        paged fused latent cache
+    topk_pages,  # [q_tokens, K] int32       seq-local page ids for local queries
+    positions,  # [q_tokens] int32           absolute positions of local queries
+    loc,  # [total_tokens] int32             physical flat slot per chunk token
+    seq_lens,  # [num_seqs] int32
+    cu_q_lens,  # [num_seqs+1] int32         GLOBAL per-request query offsets
+    cu_kv_lens,  # [num_seqs+1] int32
+    page_indices,  # [total_pages] int32
+    *,
+    kv_lora_rank: int,
+    page_size: int,
+    sm_scale: float,
+    query_block: int = 16,
+    q_token_offset=0,  # int or traced scalar: global index of ql's first row
+    interpret: bool = False,
+):
+    """Token-sharded-attention variant of the ragged qblock wrapper.
+
+    The write side covers the FULL chunk (``kvc``/``kpe``/``loc``, replicated
+    per device — the latent pool is num_kv_heads=1 so every device keeps a
+    complete cache copy), while the attend side runs only this device's
+    contiguous query slice with ALL heads. ``q_token_offset`` maps local query
+    rows back to global chunk positions for the per-request causal metadata.
+    """
+    Tq, H, Dv = ql.shape
+    rope = qpe.shape[-1]
+    Tkv = kvc.shape[0]
+    ps = page_size
+    _, _, _, Dk_pad = cache.shape
+    S = seq_lens.shape[0]
+
+    q_sparse = jnp.concatenate([ql, qpe], axis=-1)  # [Tq, H, Dv+rope]
+
+    row = jnp.zeros((Tkv, Dk_pad), cache.dtype)
+    row = row.at[:, :Dv].set(kvc.astype(cache.dtype))
+    row = row.at[:, Dv : Dv + rope].set(kpe.reshape(Tkv, rope).astype(cache.dtype))
+    cache_new = paged_write_back(
+        cache,
+        row,
+        loc.astype(jnp.int32),
+        page_size=ps,
+        r_cap=Tkv // ps + S + 34,
+        interpret=interpret,
+    )
+
+    t = q_token_offset + jnp.arange(Tq, dtype=jnp.int32)
+    q_seq_id = jnp.clip(jnp.searchsorted(cu_q_lens[1:], t, side="right"), 0, S - 1).astype(
+        jnp.int32
+    )
+
+    out = sparse_mla_attention_qblock(
+        q_sparse.reshape(1, Tq, H, q_sparse.shape[2]),
+        cache_new,
+        topk_pages.reshape(1, Tq, -1),
+        positions.reshape(1, Tq),
+        kv_lora_rank=Dv,
+        read_block=ps,
+        query_block=query_block,
+        sm_scale=float(sm_scale),
+        page_size=ps,
+        q_seq_id=q_seq_id,
+        seq_lens=seq_lens,
+        cu_kv_lens=cu_kv_lens,
+        page_indices=page_indices,
+        interpret=interpret,
+    )
+    return out.reshape(Tq, H, Dv), cache_new
+
+
 # ── pallas paged write-back (self-write without the XLA scatter) ─────────────
 #
 # ``flat.at[loc].set(row)`` (and its 4D-index form) makes XLA canonicalise the

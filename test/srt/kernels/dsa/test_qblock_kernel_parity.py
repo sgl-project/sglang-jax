@@ -317,6 +317,73 @@ def test_ragged_qblock_vs_deployed(seq_lens_list, qb):
     assert d_o < 2e-3, f"ragged qblock vs deployed ragged drifted: {d_o}"
 
 
+# ── TSA (token-sharded attention): sharded slices vs one full-chunk call ────
+
+prefill_write_and_attend_ragged_qblock_tsa = qb_mod.prefill_write_and_attend_ragged_qblock_tsa
+
+
+@pytest.mark.parametrize(
+    "seq_lens_list, shards, qb",
+    [
+        # varlen incl. 1-token row; shard boundaries straddle request
+        # boundaries AND qblock boundaries
+        ([200, 512, 1, 129], 4, 16),
+        # short seqs: shards dominated by padded rows (tail-group coverage)
+        ([130, 70], 4, 16),
+    ],
+)
+def test_tsa_sharded_vs_full(seq_lens_list, shards, qb):
+    c = _ragged_case(seq_lens_list, K=4, seed=13)
+    kw = dict(kv_lora_rank=_KV_LORA, page_size=_PS, sm_scale=_SC, interpret=True)
+    o_full, cache_full = prefill_write_and_attend_ragged_qblock(
+        c["ql"],
+        c["qpe"],
+        c["kvc"],
+        c["kpe"],
+        c["cache"],
+        c["topk_pages"],
+        c["positions"],
+        c["loc"],
+        c["seq_lens"],
+        c["cu_q_lens"],
+        c["cu_kv_lens"],
+        c["page_indices"],
+        query_block=qb,
+        **kw,
+    )
+    T = c["ql"].shape[0]
+    assert T % shards == 0
+    n = T // shards
+    outs, d_c = [], 0.0
+    for s in range(shards):
+        sl = slice(s * n, (s + 1) * n)
+        o_s, cache_s = prefill_write_and_attend_ragged_qblock_tsa(
+            c["ql"][sl],
+            c["qpe"][sl],
+            c["kvc"],
+            c["kpe"],
+            c["cache"],
+            c["topk_pages"][sl],
+            c["positions"][sl],
+            c["loc"],
+            c["seq_lens"],
+            c["cu_q_lens"],
+            c["cu_kv_lens"],
+            c["page_indices"],
+            query_block=qb,
+            q_token_offset=s * n,
+            **kw,
+        )
+        outs.append(np.asarray(o_s))
+        d_c = max(d_c, np.abs(np.asarray(cache_s) - np.asarray(cache_full)).max())
+    o_tsa = np.concatenate(outs, 0)
+    real = c["real"]
+    d_o = np.abs(o_tsa[real] - np.asarray(o_full)[real]).max()
+    print(f"[tsa shards={shards} qb={qb}] |o_tsa-o_full|={d_o:.3e} |cache diff|={d_c:.3e}")
+    assert d_c == 0.0, "every shard must self-write the identical full-chunk cache"
+    assert d_o < 2e-3, f"TSA sharded attend drifted from full-chunk qblock: {d_o}"
+
+
 # ── argument validation: ragged page-size guard, u_max truncation warning ───
 
 

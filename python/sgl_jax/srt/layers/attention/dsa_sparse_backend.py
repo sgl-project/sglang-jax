@@ -27,6 +27,7 @@ from sgl_jax.srt.kernels.dsa.sparse_mla import compute_topk_pages, sparse_mla_pa
 from sgl_jax.srt.kernels.dsa.sparse_mla_prefill import prefill_write_and_attend_ragged
 from sgl_jax.srt.kernels.dsa.sparse_mla_prefill_qblock import (
     prefill_write_and_attend_ragged_qblock,
+    prefill_write_and_attend_ragged_qblock_tsa,
 )
 from sgl_jax.srt.kernels.dsa.streamindex_topk import (
     streamindex_page_topk,
@@ -91,6 +92,19 @@ _PREFILL_QBLOCK = os.environ.get("DSA_PREFILL_QBLOCK", "1") == "1"
 # 512 projects <2% further and grows the per-block union tail, so 256 is the
 # sweet spot. Override per deployment via DSA_PREFILL_QBLOCK_QB.
 _PREFILL_QBLOCK_QB = int(os.environ.get("DSA_PREFILL_QBLOCK_QB", "256"))
+# TSA (token-sharded attention) prefill, opt-in via DSA_TSA_PREFILL=1: inside
+# the sparse-prefill shard_map, an all_to_all reshards queries from head-TP
+# ([T, H/tp] per device) to token-sharded ([T/tp, H] per device), each device
+# attends only its contiguous token slice's page union, and a second
+# all_to_all reshards the output back. Head-TP makes QB queries span 4-head
+# fragments of 64 unrelated positions, so a 256-row MXU group unions ~177
+# pages; 16 ADJACENT tokens x all 64 heads union ~66 pages at the same M.
+# QB=16 from the P0 shape sweep on real 110k indices: QB=4 x1.90 / QB=8
+# x2.32 / QB=16 x2.72 vs head-TP at the same depth (smaller groups have
+# denser unions but pay per-block launch/DMA overhead). The two all_to_alls
+# move ~71MB/device/layer/chunk — well under the attend time they unlock.
+_TSA_PREFILL = os.environ.get("DSA_TSA_PREFILL", "0") == "1"
+_TSA_PREFILL_QB = int(os.environ.get("DSA_TSA_PREFILL_QB", "16"))
 
 
 @register_pytree_node_class
@@ -269,7 +283,15 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 # before any full layer) ⇒ fall through to the dense attend below.
                 topk_pages_use = topk_pages if is_full else dsa_topk_pages_in
                 if topk_pages_use is not None:
-                    o, kv_cache = self._run_sparse_prefill(
+                    # TSA needs the (padded) chunk length divisible by tp so the
+                    # all_to_all tiles evenly; shapes are static at trace time,
+                    # odd buckets just keep the head-TP layout.
+                    tp_size = self.mesh.shape["tensor"]
+                    use_tsa = _TSA_PREFILL and q.shape[0] % tp_size == 0 and tp_size > 1
+                    run_prefill = (
+                        self._run_sparse_prefill_tsa if use_tsa else self._run_sparse_prefill
+                    )
+                    o, kv_cache = run_prefill(
                         q,
                         q_rope,
                         new_kv_c,
@@ -677,6 +699,93 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                     sm_scale=sm,
                 )
             return o.astype(ql_.dtype), cache_new
+
+        return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(
+            ql,
+            qpe,
+            kvc,
+            kpe,
+            cache,
+            topk_pages,
+            positions,
+            loc,
+            md.seq_lens,
+            md.cu_q_lens,
+            md.cu_kv_lens,
+            md.page_indices,
+        )
+
+    def _run_sparse_prefill_tsa(
+        self, ql, qpe, kvc, kpe, cache, topk_pages, sm_scale, dpa, md, forward_batch
+    ):
+        """Token-sharded-attention sparse prefill (same call contract as
+        :meth:`_run_sparse_prefill`).
+
+        Inside the shard_map an ``all_to_all`` reshards the queries from
+        head-TP ([T, H/tp] per device) to token-sharded ([T/tp, H] per device),
+        each device attends only its contiguous token slice — whose page union
+        is ~2.7x denser than a head-TP query block's — and a second
+        ``all_to_all`` reshards the output back to head-TP for the unchanged
+        w_uv/o_proj epilogue. The write side keeps the replicated full-chunk
+        behaviour, so every device's cache copy stays complete. Projections,
+        weights and the decode path are untouched."""
+        loc = forward_batch.out_cache_loc.astype(jnp.int32)
+        positions = forward_batch.positions.astype(jnp.int32)
+        page_size = self.page_size
+        kv_lora_rank = self.kv_lora_rank
+        sm = float(sm_scale)
+        tp_size = self.mesh.shape["tensor"]
+
+        in_specs = (
+            P(dpa, "tensor", None),  # ql   [T, H, kv_lora_rank]
+            P(dpa, "tensor", None),  # qpe  [T, H, rope]
+            P(dpa, None),  # kvc  [T, kv_lora_rank]
+            P(dpa, None),  # kpe  [T, rope]
+            P(dpa, None, None, None),  # cache
+            P(dpa, None),  # topk_pages [T, K]
+            P(dpa),  # positions [T]
+            P(dpa),  # loc [T]
+            P(dpa),  # seq_lens [S]
+            P(dpa),  # cu_q_lens [S+1]
+            P(dpa),  # cu_kv_lens [S+1]
+            P(dpa),  # page_indices [total_pages]
+        )
+        out_specs = (P(dpa, "tensor", None), P(dpa, None, None, None))
+
+        def _run(ql_, qpe_, kvc_, kpe_, cache_, tp_, pos_, loc_, sl_, cuq_, cukv_, pi_):
+            t_local = ql_.shape[0] // tp_size
+            # head-TP -> token-sharded: [T, H/tp, D] -> [T/tp, H, D]; ranks hold
+            # contiguous token slices in rank order, heads concat in rank order
+            # (matching the contiguous head-block sharding of q_b_proj).
+            ql_t = jax.lax.all_to_all(ql_, "tensor", split_axis=0, concat_axis=1, tiled=True)
+            qpe_t = jax.lax.all_to_all(qpe_, "tensor", split_axis=0, concat_axis=1, tiled=True)
+            off = jax.lax.axis_index("tensor") * t_local
+            tp_loc = jax.lax.dynamic_slice_in_dim(tp_, off, t_local, axis=0)
+            pos_loc = jax.lax.dynamic_slice_in_dim(pos_, off, t_local, axis=0)
+            o_t, cache_new = prefill_write_and_attend_ragged_qblock_tsa(
+                ql_t,
+                qpe_t,
+                kvc_,
+                kpe_,
+                cache_,
+                tp_loc,
+                pos_loc,
+                loc_,
+                sl_,
+                cuq_,
+                cukv_,
+                pi_,
+                kv_lora_rank=kv_lora_rank,
+                page_size=page_size,
+                sm_scale=sm,
+                query_block=_TSA_PREFILL_QB,
+                q_token_offset=off,
+            )
+            # token-sharded -> head-TP: [T/tp, H, Dv] -> [T, H/tp, Dv]
+            o = jax.lax.all_to_all(
+                o_t.astype(ql_.dtype), "tensor", split_axis=1, concat_axis=0, tiled=True
+            )
+            return o, cache_new
 
         return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(
             ql,
