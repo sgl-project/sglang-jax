@@ -2073,7 +2073,10 @@ class ServerArgs:
                 and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
                 and self.attention_backend == "fa"
             )
-            supports_dflash_overlap = self.speculative_algorithm in ("DFLASH", "DSPARK")
+            supports_dflash_overlap = (
+                self.speculative_algorithm in ("DFLASH", "DSPARK")
+                and self.attention_backend != "tt"
+            )
             if not (supports_nextn_overlap or supports_eagle3_overlap or supports_dflash_overlap):
                 raise ValueError(
                     "Speculative overlap scheduler only supports DFLASH/DSPARK, EAGLE3+FA, "
@@ -2096,6 +2099,8 @@ class ServerArgs:
         if self.speculative_algorithm in ("DFLASH", "DSPARK"):
             if self.tp_size < 1:
                 raise ValueError("DFLASH requires --tp-size>=1.")
+            if self.attention_backend == "tt" and self.speculative_sample_from_anchor:
+                raise ValueError("TT attention does not support DFLASH anchor sampling.")
             if self.speculative_eagle_topk != 1:
                 raise ValueError(
                     "DFLASH requires --speculative-eagle-topk=1 (linear chain, no tree)."
