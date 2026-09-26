@@ -5,6 +5,7 @@ from typing import Any
 import jax
 from flax import nnx
 from jax import numpy as jnp
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
@@ -14,7 +15,7 @@ from sgl_jax.srt.eplb.expert_location import ExpertLocationMetadata
 from sgl_jax.srt.kernels.fused_mlp import apply_fused_mlp_with_padding
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
-from sgl_jax.srt.layers.linear import LinearBase
+from sgl_jax.srt.layers.linear import LinearBase, prepad_replicated_quantized_linears
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import (
     EPMoE,
@@ -535,6 +536,7 @@ class Glm5Attention(nnx.Module):
         token_to_kv_pool: KVCache,
         dsa_topk_in: jax.Array | None = None,
         dsa_topk_pages_in: jax.Array | None = None,
+        dsa_topk_reuse: bool = False,
     ) -> tuple[jax.Array, jax.Array]:
         q_compressed, _ = self.q_a_proj(hidden_states)
         q_compressed = self.q_a_layernorm(q_compressed)
@@ -546,6 +548,7 @@ class Glm5Attention(nnx.Module):
             dsa_kwargs["indexer_type"] = self.indexer_type
             dsa_kwargs["dsa_topk_in"] = dsa_topk_in
             dsa_kwargs["dsa_topk_pages_in"] = dsa_topk_pages_in
+            dsa_kwargs["dsa_topk_reuse"] = dsa_topk_reuse
             if self.indexer is not None:
                 q_idx, k_idx, idx_w = self.indexer.project(
                     hidden_states, q_compressed, positions, self.rotary_emb
@@ -723,6 +726,21 @@ class Glm5MLP(nnx.Module):
         a1, _ = self.gate_proj(hidden_states)
         a2, _ = self.up_proj(hidden_states)
         intermediate_parallel = a2 * self.act_fn(a1)
+        if getattr(self.down_proj, "kernel_axes", (None, None))[0] is None:
+            # Block-quantized down_proj whose reduce dim does not split into whole
+            # blocks across TP (e.g. the 2048-wide shared expert at tp32: 64 per
+            # shard < 128-block) runs with a replicated reduce axis; gate/up still
+            # emit the tensor-sharded activation, so gather it first.
+            sh = jax.typeof(intermediate_parallel).sharding
+            if (
+                isinstance(sh, NamedSharding)
+                and sh.spec
+                and len(sh.spec) > 1
+                and sh.spec[1] is not None
+            ):
+                intermediate_parallel = jax.sharding.reshard(
+                    intermediate_parallel, NamedSharding(sh.mesh, P(sh.spec[0], None))
+                )
         output, _ = self.down_proj(intermediate_parallel)
         return output
 
@@ -734,6 +752,7 @@ class Glm5DecoderLayer(nnx.Module):
         mesh: jax.sharding.Mesh,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
+        force_moe: bool = False,
     ):
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
@@ -750,7 +769,11 @@ class Glm5DecoderLayer(nnx.Module):
         # layer's top-k and ship no indexer weights. Dense MLA discards indexer
         # output anyway, so just skip building the module on shared layers.
         indexer_types = getattr(config, "indexer_types", None)
-        indexer_type = "full" if indexer_types is None else indexer_types[layer_id]
+        indexer_type = (
+            "full"
+            if (indexer_types is None or layer_id >= len(indexer_types))
+            else indexer_types[layer_id]
+        )
         has_indexer = indexer_type == "full"
         use_dsa_sparse = getattr(config, "use_dsa_sparse", False)
 
@@ -778,7 +801,7 @@ class Glm5DecoderLayer(nnx.Module):
         first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
         use_fused_mlp = getattr(config, "_sgl_use_fused_mlp", True)
 
-        if layer_id < first_k_dense_replace:
+        if layer_id < first_k_dense_replace and not force_moe:
             self.mlp = Glm5MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -953,6 +976,7 @@ class Glm5DecoderLayer(nnx.Module):
         dispatch_info: ExpertLocationMetadata | None = None,
         dsa_topk_in: jax.Array | None = None,
         dsa_topk_pages_in: jax.Array | None = None,
+        dsa_topk_reuse: bool = False,
     ) -> tuple[jax.Array, jax.Array]:
         if residual is None:
             residual = hidden_states
@@ -969,6 +993,7 @@ class Glm5DecoderLayer(nnx.Module):
             token_to_kv_pool=token_to_kv_pool,
             dsa_topk_in=dsa_topk_in,
             dsa_topk_pages_in=dsa_topk_pages_in,
+            dsa_topk_reuse=dsa_topk_reuse,
         )
         hidden_states += residual
         residual = hidden_states
@@ -1126,6 +1151,16 @@ class Glm5ForCausalLM(nnx.Module):
         kv_update = (layers_kv_fused, layers_idx_fused) if layers_idx_fused else layers_kv_fused
         return output, {"token_to_kv_pool": kv_update}, True, layers_topk_ids
 
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.embedding.value, self.lm_head.embedding.value
+
+    def set_embed_and_head(self, embed, head) -> None:
+        self.model.embed_tokens.embedding.value = embed
+        self.lm_head.embedding.value = head
+
+    def set_embed(self, embed) -> None:
+        self.model.embed_tokens.embedding.value = embed
+
     def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(
             model=self,
@@ -1135,6 +1170,7 @@ class Glm5ForCausalLM(nnx.Module):
         )
         weight_mappings = self._create_glm5_weight_mappings(model_config)
         loader.load_weights_from_safetensors(weight_mappings)
+        prepad_replicated_quantized_linears(self)
 
         for layer in self.model.layers:
             layer.self_attn.post_load_weights()
@@ -1402,7 +1438,239 @@ class GlmMoeDsaForCausalLM(Glm5ForCausalLM):
         # become QuantizedLinear (no .weight), so post_load_weights cannot
         # populate w_gu/w_d and the abstract ShapeDtypeStruct placeholders
         # leak into jit inputs. Keep fused for bf16-only.
-        mc.hf_config._sgl_use_fused_mlp = mc.quantization_config is None
+        # The fused MLP is a TPU Pallas kernel; CPU (interpret/smoke) runs keep the plain path.
+        mc.hf_config._sgl_use_fused_mlp = (
+            mc.quantization_config is None and jax.default_backend() == "tpu"
+        )
 
 
-EntryClass = [Glm5ForCausalLM, GlmMoeDsaForCausalLM]
+_NEXTN_TOP_LEVEL_MODULES = ("eh_proj", "enorm", "hnorm", "shared_head", "embed_tokens", "lm_head")
+
+
+def nextn_ignored_layers(ignored_layers, nextn_layer_idx: int) -> list[str]:
+    """Translate the checkpoint's ``modules_to_not_convert`` for the MTP layer.
+
+    The FP8 checkpoint lists the unquantized MTP modules under
+    ``model.layers.{num_hidden_layers}.*`` (e.g. ``eh_proj``, ``mlp.gate``), but
+    :class:`GlmMoeDsaForCausalLMNextN` hosts them at ``eh_proj`` / ``mtp_block.*``.
+    ``quantize_model`` matches module paths against these entries, so without the
+    translation ``eh_proj`` is converted to a ``QuantizedLinear`` and the bf16
+    checkpoint weight has no ``.weight`` to load into.
+    """
+    ignored = list(ignored_layers or [])
+    prefix = f"model.layers.{nextn_layer_idx}."
+    extra = []
+    for ig in ignored:
+        if not ig.startswith(prefix):
+            continue
+        rest = ig[len(prefix) :]
+        mapped = rest if rest.split(".")[0] in _NEXTN_TOP_LEVEL_MODULES else f"mtp_block.{rest}"
+        if mapped not in ignored and mapped not in extra:
+            extra.append(mapped)
+    return ignored + extra
+
+
+class GlmMoeDsaForCausalLMNextN(nnx.Module):
+    load_lm_head_from_target = True
+
+    @classmethod
+    def patch_model_config(cls, mc: ModelConfig) -> None:
+        GlmMoeDsaForCausalLM.patch_model_config(mc)
+        qc = mc.quantization_config
+        if qc is not None and qc.is_static_checkpoint:
+            idx = getattr(mc.hf_config, "num_hidden_layers", 78)
+            qc.ignored_layers = nextn_ignored_layers(qc.ignored_layers, idx)
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        mesh: jax.sharding.Mesh | None = None,
+        dtype: jnp.dtype = jnp.bfloat16,
+    ):
+        self.config = config
+        self.mesh = mesh
+        self.dtype = dtype
+        # The Draft Worker only passes its own isolated memory pool (which inherits model_config.num_hidden_layers length)
+        # We must index layer_id=0 so it does not exceed the KV buffer array bounds!
+        self.mtp_layer_idx = 0
+
+        self.embed_tokens = Embed(
+            num_embeddings=config.vocab_size,
+            features=config.hidden_size,
+            dtype=dtype,
+            kernel_axes=("tensor", None),
+            param_dtype=dtype,
+            mesh=mesh,
+        )
+        self.enorm = RMSNorm(
+            config.hidden_size, epsilon=config.rms_norm_eps, param_dtype=dtype, scope_name="enorm"
+        )
+        self.hnorm = RMSNorm(
+            config.hidden_size, epsilon=config.rms_norm_eps, param_dtype=dtype, scope_name="hnorm"
+        )
+        self.eh_proj = LinearBase(
+            input_size=2 * config.hidden_size,
+            output_size=config.hidden_size,
+            use_bias=False,
+            kernel_axes=(None, None),
+            params_dtype=dtype,
+            mesh=mesh,
+        )
+        self.mtp_block = Glm5DecoderLayer(
+            config, layer_id=self.mtp_layer_idx, dtype=dtype, mesh=mesh, force_moe=True
+        )
+        self.shared_head = nnx.Module()
+        self.shared_head.norm = RMSNorm(
+            config.hidden_size, epsilon=config.rms_norm_eps, param_dtype=dtype, scope_name="norm"
+        )
+        # Same call face as Glm5ForCausalLM: load_lm_head_from_target copies the
+        # target's lm_head array, so the DP lm-head layout must match on both sides.
+        enable_dp_lm_head = getattr(config, "enable_dp_lm_head", False)
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            dtype=dtype,
+            param_dtype=dtype,
+            mesh=mesh,
+            enable_dp_lm_head=enable_dp_lm_head,
+        )
+        self.logits_processor = LogitsProcessor(
+            config.vocab_size, mesh=self.mesh, enable_dp_lm_head=enable_dp_lm_head
+        )
+        self.hot_token_ids = None
+
+    def __call__(
+        self,
+        forward_batch: ForwardBatch,
+        memory_pools,
+        logits_metadata: LogitsMetadata,
+        dsa_topk_pages_in: jax.Array | None = None,
+        dsa_topk_reuse: bool = False,
+        return_dsa_topk_pages: bool = False,
+    ):
+        """One MTP step.
+
+        GLM-5.2 IndexShare across MTP iterations (``index_share_for_mtp_iteration``):
+        the fused draft loop passes ``return_dsa_topk_pages=True`` to receive the
+        page-topk this step's indexer selected, and on later steps hands it back via
+        ``dsa_topk_pages_in`` with ``dsa_topk_reuse=True`` so the block attends over
+        the reused selection instead of re-running the indexer.
+        """
+        from sgl_jax.srt.layers.attention.dsa_sparse_backend import DSAFusedCache
+
+        embed = self.embed_tokens(forward_batch.input_ids)
+        hidden_in = forward_batch.spec_info.hidden_states
+        emb_sh = jax.typeof(embed).sharding
+        if isinstance(emb_sh, jax.sharding.NamedSharding):
+            hidden_in = jax.sharding.reshard(hidden_in, emb_sh)
+
+        concat_in = jnp.concatenate((self.enorm(embed), self.hnorm(hidden_in)), axis=-1)
+        hidden_states, _ = self.eh_proj(concat_in)
+
+        token_to_kv_pool = (
+            memory_pools.token_to_kv_pool
+            if hasattr(memory_pools, "token_to_kv_pool")
+            else memory_pools
+        )
+        hidden_states, residual, kv_fused, _ = self.mtp_block(
+            forward_batch.positions,
+            hidden_states,
+            forward_batch,
+            token_to_kv_pool,
+            None,
+            dispatch_info=forward_batch.expert_location_metadata,
+            dsa_topk_in=None,
+            dsa_topk_pages_in=dsa_topk_pages_in,
+            dsa_topk_reuse=dsa_topk_reuse,
+        )
+
+        if residual is not None:
+            hidden_states = hidden_states + residual
+
+        hidden_states = self.shared_head.norm(hidden_states)
+        output = self.logits_processor(
+            hidden_states, self.lm_head, logits_metadata, aux_hidden_states=None
+        )
+
+        is_dsa = isinstance(kv_fused, DSAFusedCache)
+        kv_cache_list = [kv_fused.kv] if is_dsa else [kv_fused]
+        if return_dsa_topk_pages:
+            return output, kv_cache_list, True, None, (kv_fused.topk_pages if is_dsa else None)
+        return output, kv_cache_list, True, None
+
+    def load_weights(self, model_config: ModelConfig):
+        self.loader = WeightLoader(
+            model=self, model_config=model_config, mesh=self.mesh, dtype=self.dtype
+        )
+        mappings = self._create_weight_mappings(model_config)
+        self.loader.load_weights_from_safetensors(mappings)
+        prepad_replicated_quantized_linears(self)
+
+        # Apply post_load_weights logic for Draft
+        self.mtp_block.self_attn.post_load_weights()
+        if hasattr(self.mtp_block, "mlp") and hasattr(self.mtp_block.mlp, "post_load_weights"):
+            self.mtp_block.mlp.post_load_weights()
+        if (
+            hasattr(self.mtp_block, "shared_experts")
+            and self.mtp_block.shared_experts is not None
+            and hasattr(self.mtp_block.shared_experts, "post_load_weights")
+        ):
+            self.mtp_block.shared_experts.post_load_weights()
+
+    @classmethod
+    def _create_weight_mappings(cls, model_config: ModelConfig) -> dict[str, WeightMapping]:
+        mappings = {}
+        idx = getattr(model_config.hf_config, "num_hidden_layers", 78)
+        prefix = f"model.layers.{idx}"
+
+        mappings[f"{prefix}.enorm.weight"] = WeightMapping(
+            target_path="enorm.scale", sharding=(None,), transpose=False
+        )
+        mappings[f"{prefix}.hnorm.weight"] = WeightMapping(
+            target_path="hnorm.scale", sharding=(None,), transpose=False
+        )
+        mappings[f"{prefix}.eh_proj.weight"] = WeightMapping(
+            target_path="eh_proj.weight", sharding=(None, None), transpose=True
+        )
+        mappings[f"{prefix}.shared_head.norm.weight"] = WeightMapping(
+            target_path="shared_head.norm.scale", sharding=(None,), transpose=False
+        )
+
+        class MockConfig:
+            pass
+
+        mock_self = MockConfig()
+        mock_self.config = model_config.hf_config
+        is_static_quant = getattr(model_config, "quantization_config", None) is not None
+
+        decoder_mappings = Glm5ForCausalLM._create_moe_layer_mappings(
+            mock_self,
+            layer_idx=idx,
+            target_idx=idx,
+            is_mlp_layer=False,
+            is_static_quant=is_static_quant,
+            has_indexer=True,
+        )
+        for k, v in decoder_mappings.items():
+            if isinstance(v.target_path, str):
+                v.target_path = v.target_path.replace(f"model.layers.{idx}", "mtp_block")
+            elif isinstance(v.target_path, list):
+                new_path = [v.target_path[0].replace(f"model.layers.{idx}", "mtp_block")]
+                new_path.extend(v.target_path[1:])
+                v.target_path = new_path
+            mappings[k] = v
+
+        return mappings
+
+    def get_embed_and_head(self):
+        return self.embed_tokens.embedding.value, self.lm_head.embedding.value
+
+    def set_embed_and_head(self, embed: jax.Array, head: jax.Array) -> None:
+        self.embed_tokens.embedding.value = embed
+        self.lm_head.embedding.value = head
+
+    def set_embed(self, embed: jax.Array) -> None:
+        self.embed_tokens.embedding.value = embed
+
+
+EntryClass = [Glm5ForCausalLM, GlmMoeDsaForCausalLM, GlmMoeDsaForCausalLMNextN]

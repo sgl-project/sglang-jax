@@ -1342,6 +1342,7 @@ def prepare_outputs(
         "num_queries_per_block",
         "vmem_limit_bytes",
         "decode_batch_size",
+        "mixed_static_q_len",
         "debug_mode",
     ),
     donate_argnames=("cache_kv",),
@@ -1373,6 +1374,13 @@ def mla_ragged_paged_attention(
     num_queries_per_block: tuple[int, int, int] | int | None = None,
     vmem_limit_bytes: int | None = None,
     decode_batch_size: int = 1,
+    # Every MIXED sequence has exactly this many query rows (e.g. G draft
+    # tokens per request in grouped speculative verify): size the mixed
+    # kernel's query block by it instead of the tuned/fallback block, so the
+    # flash-attention work covers G rows rather than a 64..256-row block.
+    # Ignored (tuned block kept) when the resulting block is not in the
+    # validated sub-tile family for the shard's head count.
+    mixed_static_q_len: int | None = None,
     # Debug params.
     debug_mode: bool = False,
 ) -> tuple[
@@ -1526,6 +1534,18 @@ def mla_ragged_paged_attention(
     page_size = page_size_per_kv_packing * kv_packing
     _, num_q_heads_per_q_packing, q_packing, _ = ql_nope.shape
     num_q_heads = num_q_heads_per_q_packing * q_packing
+
+    if mixed_static_q_len is not None:
+        # Mosaic rejects a q/o window whose packed rows do not fill whole
+        # sublane tiles (E2002, see get_fallback_block_sizes_mla): the block
+        # must span a multiple of sublane_tile rows, i.e. bq * padded heads
+        # per token divisible by 8 * q_packing (16 for bf16). With >= 16
+        # padded heads any bq is fine; with 4 heads/shard bq=4 is exactly one
+        # tile.
+        sublane_tile = 8 * q_packing
+        heads_padded = align_to(actual_num_q_heads, q_packing)
+        if (mixed_static_q_len * heads_padded) % sublane_tile != 0:
+            mixed_static_q_len = None
 
     def run_mla_kernel(
         ql_nope: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_lkv_dim]
@@ -1751,7 +1771,7 @@ def mla_ragged_paged_attention(
         num_queries_per_block=num_queries_per_blocks[2],
         start_seq_idx=distribution[1],
         end_seq_idx=distribution[2],
-        static_q_len=None,
+        static_q_len=mixed_static_q_len,
         case=MlaCase.MIXED,
     )
     output = prepare_outputs(

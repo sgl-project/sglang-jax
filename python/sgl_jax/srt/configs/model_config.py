@@ -261,6 +261,9 @@ class ModelConfig:
         if self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
+        elif self.hf_config.architectures[0] == "GlmMoeDsaForCausalLM":
+            self.hf_config.architectures[0] = "GlmMoeDsaForCausalLMNextN"
+
         elif self.hf_config.architectures[0] == "LlamaForCausalLM":
             self.hf_config.architectures[0] = "LlamaForCausalLMEagle3"
 

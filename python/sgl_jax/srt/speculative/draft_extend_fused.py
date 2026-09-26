@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from contextlib import contextmanager
 from dataclasses import replace
 from functools import partial
@@ -26,6 +28,252 @@ from sgl_jax.srt.speculative.spec_utils import (
     SIMULATED_ACCEPTANCE_CONFIG,
     apply_simulated_acceptance,
 )
+from sgl_jax.srt.utils.common_utils import get_bool_env_var
+
+logger = logging.getLogger(__name__)
+
+
+# GLM-5.2 KVShare: draft steps >= 1 reuse step 0's selection AND KV; they must not
+# write their own KV / indexer keys (opt-in A/B, see dsa_sparse_backend readonly).
+_KVSHARE = os.environ.get("SGLANG_JAX_MTP_KVSHARE", "0") == "1"
+# Single-layer MTP chain (GLM-5.2: num_nextn_predict_layers=1 applied num_steps times):
+# feed draft step j >= 1 the previous step's output hidden (sglang EAGLE draft loop:
+# hidden_states = logits_output.hidden_states) instead of reusing the target hidden.
+_HIDDEN_RELAY_ENV = os.environ.get("SGLANG_JAX_MTP_HIDDEN_RELAY")
+# Companion to the relay: advance the RoPE positions of the rotated window by one
+# per draft step (slot k holds tok_{k+j} at step j), like the EAGLE decode loop's
+# positions = seq_lens + step. On by default with the relay (measured not worse:
+# gsm8k p1 acceptance 3.34 vs 3.33, position-3 conditional 0.774 vs 0.763);
+# SGLANG_JAX_MTP_RELAY_POS=0 keeps the step-0 positions.
+_RELAY_POS = os.environ.get("SGLANG_JAX_MTP_RELAY_POS", "1") != "0"
+# Single-block chain, pool versions. The caller keeps only step 0's pool
+# version (steps j >= 1 write the rotated window back into the same slots, so
+# their versions are throwaway), but every step used to start from the input
+# pool and every version was returned: XLA had to keep three versions of a
+# donated pool = two whole-pool copies per draft-extend step. Now step 0 runs
+# on the input pool and is the only version returned; step 1 still starts from
+# the input pool (unchanged semantics) and step 2 continues on step 1's version.
+# Step 2 only reads the window slots it rewrites itself first, so its inputs
+# are identical either way; XLA keeps two versions = one copy.
+# (Threading ONE version through all steps was measured NOT idempotent: the
+# window slots follow seq_lens, not the shifted positions, so step 1 overwrote
+# step 0's KV; gsm8k acceptance fell 3.34 -> 3.21. Do not do that.)
+# SGLANG_JAX_MTP_CHAIN_POOL=0 restores three separate versions.
+# Default "all" (measured on GLM-5.2 tp16, v7x: draft-extend 1.90 -> 1.22 ms at
+# batch 1, gsm8k acceptance unchanged 3.34); "1" = keep step 0's version and one
+# shared scratch version (one copy); "0" = one version per step (two copies).
+_CHAIN_POOL_MODE = os.environ.get("SGLANG_JAX_MTP_CHAIN_POOL", "all")
+_CHAIN_POOL = _CHAIN_POOL_MODE != "0"
+# "all": additionally shift the draft-extend metadata by the step index, so
+# step j >= 1 writes its rotated window into the slots of the SAME tokens /
+# positions step 0 wrote (idempotent) and its new draft token into the next
+# free slot; one pool version is then threaded through all steps (no copy).
+# Needs the relay + position shift and allocation slack of num_steps - 1 slots
+# past the step-0 window (overlap scheduling keeps >= 2 * ALLOC_LEN_PER_DECODE).
+_CHAIN_ALL = _CHAIN_POOL_MODE == "all"
+
+
+# Debug assertion: copy step 0's pool version and, after the later steps ran on
+# their scratch version, report per pool leaf how many KV slots differ between
+# that copy and the version handed back, plus the step-0 window slots. Must be
+# 0 everywhere (the caller keeps exactly step 0's version).
+_CHAIN_POOL_CHECK = os.environ.get("SGLANG_JAX_MTP_CHAIN_POOL_CHECK", "0") == "1"
+
+
+def _chain_pool_leaf_names(tree):
+    """Host-side names for the leaves compared by _chain_pool_diff_arrays."""
+    from jax.tree_util import keystr, tree_flatten_with_path
+
+    leaves, _ = tree_flatten_with_path(tree)
+    return [f"{keystr(path)} shape={tuple(a.shape)}" for path, a in leaves]
+
+
+def _chain_pool_diff_arrays(v0, vN, loc0, rep_sharding=None):
+    """Per pool leaf (in tree_leaves order): #slots whose contents differ between
+    two pool versions and the first 32 differing slot ids; plus the step-0 window
+    slots. Arrays only (JIT outputs); names come from _chain_pool_leaf_names.
+    Under an explicit-sharding mesh the reductions run as auto-sharded regions
+    with a replicated result."""
+
+    def _diff(a0, aN):
+        rows0 = a0.reshape(-1, a0.shape[-1]) if a0.ndim >= 2 else a0.reshape(-1, 1)
+        rowsN = aN.reshape(-1, aN.shape[-1]) if aN.ndim >= 2 else aN.reshape(-1, 1)
+        d = jnp.any(rows0 != rowsN, axis=-1)
+        return d.sum().astype(jnp.int32), jnp.nonzero(d, size=32, fill_value=-1)[0].astype(
+            jnp.int32
+        )
+
+    diff = _diff
+    if rep_sharding is not None:
+        diff = jax.sharding.auto_axes(_diff, out_sharding=(rep_sharding, rep_sharding))
+    counts, firsts = [], []
+    for a0, aN in zip(jax.tree_util.tree_leaves(v0), jax.tree_util.tree_leaves(vN)):
+        if a0.shape != aN.shape:
+            counts.append(jnp.int32(-1))
+            firsts.append(jnp.full((32,), -1, jnp.int32))
+            continue
+        n, f = diff(a0, aN)
+        counts.append(n)
+        firsts.append(f)
+    return jnp.stack(counts), jnp.stack(firsts), loc0
+
+
+def log_chain_pool_check(report, pool_updates):
+    """Log the arrays produced by _chain_pool_diff_arrays (host side)."""
+    import numpy as np
+
+    counts, firsts, loc0 = report
+    names = _chain_pool_leaf_names(pool_updates)
+    loc0 = np.asarray(loc0)
+    live = set(int(x) for x in loc0 if x >= 0)
+    logger.info("[CHAIN_POOL_CHECK] step0 window slots (loc0, -1 = dropped): %s", loc0.tolist())
+    for name, n, f in zip(names, np.asarray(counts), np.asarray(firsts)):
+        rows = [int(x) for x in f if x >= 0]
+        logger.info(
+            "[CHAIN_POOL_CHECK] %s rows_differ=%d first_rows=%s overlap_with_loc0=%s",
+            name,
+            int(n),
+            rows,
+            sorted(set(rows) & live),
+        )
+
+
+def _chain_pool_report(v0, vN, md, num_tokens, page_size, like, sel_pos=None):
+    """CHECK report inside the fused JIT: step-0 window slots (auto-sharded
+    lookup, replicated result) + per-leaf slot diffs between two pool versions.
+    Returns arrays only."""
+    from sgl_jax.srt.layers.attention.dsa_sparse_backend import _spec_token_slots
+
+    sh = jax.typeof(like).sharding
+    rep = None
+    if isinstance(sh, NamedSharding) and not sh.mesh.empty:
+        rep = NamedSharding(sh.mesh, P())
+
+    def _loc0(sl, cq, ck, pi):
+        return _spec_token_slots(sl, cq, ck, pi, num_tokens, page_size)
+
+    loc0_fn = _loc0 if rep is None else jax.sharding.auto_axes(_loc0, out_sharding=rep)
+    loc0 = loc0_fn(md.seq_lens, md.cu_q_lens, md.cu_kv_lens, md.page_indices)
+    if sel_pos is not None:
+        # window rows 0..sel_pos[r] hold request r's verified tokens (sel_pos =
+        # accept_length - 1); the rows after it are padding whose slots the later
+        # steps legitimately overwrite. Only the verified rows must stay untouched.
+        bs = sel_pos.shape[0]
+        n = num_tokens // bs
+
+        def _valid(sp):
+            return (jnp.arange(n)[None, :] <= sp[:, None]).reshape(-1)
+
+        valid_fn = _valid if rep is None else jax.sharding.auto_axes(_valid, out_sharding=rep)
+        loc0 = jnp.where(valid_fn(sel_pos), loc0, -1)
+    return _chain_pool_diff_arrays(v0, vN, loc0, rep_sharding=rep)
+
+
+def chain_all_headroom_ok(allocate_lens, verify_seq_lens, num_steps: int) -> bool:
+    """Host-side guard for SGLANG_JAX_MTP_CHAIN_POOL=all: every live request must
+    have num_steps - 1 allocated slots past its step-0 draft window
+    (verify_seq_lens + num_steps). False -> the caller falls back to the
+    two-version mode instead of writing past the allocation."""
+    import numpy as np
+
+    if not isinstance(allocate_lens, np.ndarray) or not isinstance(verify_seq_lens, np.ndarray):
+        raise TypeError("chain_all_headroom_ok expects host numpy arrays (no device sync here)")
+    alloc = allocate_lens
+    vsl = verify_seq_lens
+    live = vsl > 0
+    if not live.any():
+        return True
+    return bool(np.all(alloc[live] >= vsl[live] + 2 * num_steps - 1))
+
+
+_DRAFT_MD_FIELDS = ("cu_q_lens", "cu_kv_lens", "page_indices", "seq_lens", "distribution")
+
+
+def _pack_draft_extend_metadata(
+    md_orig, base_seq_lens, allocate_lens, num_steps, *, page_size, dp_size
+):
+    """Draft-extend metadata whose page table already covers the last chained
+    step (base + num_steps - 1) for every live sequence. Built once per
+    draft-extend call; the per-step variants only swap ``seq_lens`` (see
+    _shift_draft_extend_metadata), so no page-table repack runs per step."""
+    span = jnp.where(base_seq_lens > 0, base_seq_lens + (num_steps - 1), 0).astype(
+        base_seq_lens.dtype
+    )
+    return _make_draft_extend_metadata(
+        md_orig, span, allocate_lens, page_size=page_size, dp_size=dp_size
+    )
+
+
+def _shift_draft_extend_metadata(md_pack, base_seq_lens, step):
+    """Metadata of chained step ``step`` on the shared packing: sequence lengths
+    (window slots and kv span) advanced by ``step``; padding sequences stay 0."""
+    seq_lens = jnp.where(base_seq_lens > 0, base_seq_lens + step, 0).astype(base_seq_lens.dtype)
+    kwargs = {f: getattr(md_pack, f) for f in _DRAFT_MD_FIELDS}
+    kwargs["seq_lens"] = seq_lens
+    for f in ("swa_page_indices", "custom_mask"):
+        if hasattr(md_pack, f):
+            kwargs[f] = getattr(md_pack, f)
+    return seq_lens, type(md_pack)(**kwargs)
+
+
+def _chain_pool_enabled(num_pools: int, relay_on: bool) -> bool:
+    """Single-block chain: return step 0's pool version only, share one scratch
+    version between the later steps (see _CHAIN_POOL)."""
+    del relay_on
+    return bool(_CHAIN_POOL and num_pools == 1)
+
+
+def mtp_hidden_relay_enabled(hf_config=None):
+    """Env override for the hidden relay: True/False when SGLANG_JAX_MTP_HIDDEN_RELAY is
+    set, else None = decide by chaining (see ``_chained_relay``). ``hf_config`` is
+    accepted for symmetry with the IndexShare gate, but the draft runner's config
+    does not reliably carry ``num_nextn_predict_layers`` (dpa47nap read False on
+    GLM-5.2), so the structural rule is the default.
+    """
+    if _HIDDEN_RELAY_ENV is not None:
+        return _HIDDEN_RELAY_ENV.strip() not in ("", "0", "false", "False")
+    return None
+
+
+def _chained_relay(hidden_relay, num_steps: int, num_blocks: int) -> bool:
+    """Resolve the relay flag inside the fused loop.
+
+    ``num_blocks`` = number of distinct draft blocks handed to the loop
+    (``len(all_leaves)``); when it is smaller than ``num_steps`` the last block is
+    applied again (``leaf_idx = -1``), i.e. a single-block MTP chain (GLM-5.2,
+    DeepSeek-style) whose later steps must see the previous step's output hidden.
+    Multi-block MTP (one block per step) keeps the target hidden for every block.
+    """
+    if hidden_relay is not None:
+        return bool(hidden_relay)
+    return num_blocks < num_steps
+
+
+def _spec_decode_compiler_options():
+    """Per-executable XLA options for the decode-shaped speculative executables.
+
+    The non-speculative decode path compiles its executables with the
+    SparseCore gather offload disabled when
+    ``SGLANG_JAX_DECODE_DISABLE_SC_GATHER_OFFLOAD`` is set (jax 0.11.1 TPU
+    regression, see ``aot_dispatch.decode_no_sc_gather_compiler_options_fn``).
+    The speculative draft-extend / fused-verify executables are decode-shaped
+    too but were compiled with plain ``jax.jit`` and therefore kept the
+    offload; on v7x tp16 that left ~2/3 of a fused-verify step in offloaded
+    small collectives. Mirror the same opt-in here so both paths agree; the
+    prefill-phase speculative executable keeps the default (large prefill
+    gathers profit from the offload).
+    """
+    if jax.default_backend() != "tpu" or not get_bool_env_var(
+        "SGLANG_JAX_DECODE_DISABLE_SC_GATHER_OFFLOAD"
+    ):
+        return None
+    return {
+        "xla_tpu_offload_gather_to_sparsecore": "false",
+        "xla_tpu_offload_all_supported_gathers_to_sparsecore": "false",
+    }
+
+
+_SPEC_DECODE_COMPILER_OPTIONS = _spec_decode_compiler_options()
 
 
 class GreedyDraftInputs(NamedTuple):
@@ -431,6 +679,17 @@ def _build_chain_verify_arrays(
         token_chain = jax.sharding.reshard(token_chain, verified_sharding)
     draft_tokens = jnp.concatenate([verified_column, token_chain], axis=1).reshape(bs * n)
     positions = (seq_lens.astype(jnp.int32)[:, None] + tid_range[None, :]).reshape(bs * n)
+    # Pin the token-dim arrays to the batch's data placement. Under explicit
+    # sharding the (bs, n) -> (bs * n) reshape above drops a size-1 "data" axis
+    # (dp=1 gives P(None)), but the attention backends shard_map positions /
+    # input_ids with P("data") exactly like the host-built extend batch
+    # (_make_forward_batch), so a verify step must hand them over the same way.
+    seq_sharding = jax.typeof(seq_lens).sharding
+    if isinstance(seq_sharding, NamedSharding) and not seq_sharding.mesh.empty:
+        if jax.typeof(positions).sharding != seq_sharding:
+            positions = jax.sharding.reshard(positions, seq_sharding)
+        if jax.typeof(draft_tokens).sharding != seq_sharding:
+            draft_tokens = jax.sharding.reshard(draft_tokens, seq_sharding)
     retrive_index = jnp.arange(bs * n, dtype=jnp.int32)
     retrive_next_token = jnp.broadcast_to(
         jnp.concatenate([jnp.arange(1, n, dtype=jnp.int32), jnp.array([-1], dtype=jnp.int32)]),
@@ -450,15 +709,21 @@ def _rotate_input_ids(input_ids, ext_lens, sel_pos, new_tokens):
     """Mirror MultiLayerDraftWorker._rotate_ids on device for topk=1."""
     bs = ext_lens.shape[0]
     tokens_per_req = input_ids.shape[0] // bs
-    ids_2d = input_ids.reshape(bs, tokens_per_req)
-    shifted_2d = jnp.concatenate([ids_2d[:, 1:], ids_2d[:, -1:]], axis=1)
-    shifted_2d = shifted_2d.at[jnp.arange(bs), sel_pos].set(
-        new_tokens,
-        out_sharding=jax.typeof(shifted_2d).sharding,
-    )
-    pad_mask = (ext_lens == 0)[:, None]
-    shifted_2d = jnp.where(pad_mask, ids_2d, shifted_2d)
-    return shifted_2d.reshape(-1)
+
+    def _rotate(input_ids, ext_lens, sel_pos, new_tokens):
+        ids_2d = input_ids.reshape(bs, tokens_per_req)
+        shifted_2d = jnp.concatenate([ids_2d[:, 1:], ids_2d[:, -1:]], axis=1)
+        shifted_2d = shifted_2d.at[jnp.arange(bs), sel_pos].set(new_tokens)
+        pad_mask = (ext_lens == 0)[:, None]
+        shifted_2d = jnp.where(pad_mask, ids_2d, shifted_2d)
+        return shifted_2d.reshape(-1)
+
+    # Auto-sharded region: with an explicit mesh the [bs*n] -> [bs, n] split
+    # hangs a size-1 "data" axis (dp=1) on the n dim and the two slices no
+    # longer agree (concatenate raises ShardingTypeError). Let XLA infer the
+    # interior and pin only the output to the input's placement (it feeds the
+    # next draft layer's embedding).
+    return _auto_sharded(_rotate, input_ids)(input_ids, ext_lens, sel_pos, new_tokens)
 
 
 def _rotate_prefill_input_ids(input_ids, extend_seq_lens, verified_id, dp_size, per_dp_bs):
@@ -469,21 +734,100 @@ def _rotate_prefill_input_ids(input_ids, extend_seq_lens, verified_id, dp_size, 
     tok = jnp.arange(per_dp_tokens, dtype=jnp.int32)
 
     def rotate_rank(ids_rank, ext_rank, verified_rank):
-        starts = jnp.cumsum(ext_rank, axis=0) - ext_rank
+        # We can implement a cumsum as a matrix multiplication!
+        # A lower triangular matrix of ones multiplied by ext_rank gives the cumsum!
+        import jax
+        import jax.numpy as jnp
+
+        N = ext_rank.shape[0]
+        idx = jnp.arange(N)
+        mask = (idx[:, None] >= idx[None, :]).astype(jnp.int32)
+
+        # This is exactly the inclusive cumsum!
+        ext_rank_cumsum = jnp.dot(mask, ext_rank)
+
+        starts = ext_rank_cumsum - ext_rank
         ends = starts + ext_rank
         in_req = (tok[None, :] >= starts[:, None]) & (tok[None, :] < ends[:, None])
         has_req = jnp.any(in_req, axis=0)
         slot = jnp.argmax(in_req.astype(jnp.int32), axis=0)
-        req_starts = starts.at[slot].get()
-        req_lens = ext_rank.at[slot].get()
-        req_verified = verified_rank.at[slot].get()
+
+        # Matrix multiply bypassing JAX gather layout check
+        one_hot_slot = jax.nn.one_hot(slot, N, dtype=starts.dtype)
+        req_starts = jnp.dot(one_hot_slot, starts)
+        req_lens = jnp.dot(one_hot_slot, ext_rank)
+        req_verified = jnp.dot(one_hot_slot, verified_rank)
+
         shifted_index = jnp.minimum(tok + 1, per_dp_tokens - 1)
-        shifted = ids_rank.at[shifted_index].get()
+        one_hot_shifted = jax.nn.one_hot(shifted_index, per_dp_tokens, dtype=starts.dtype)
+        shifted = jnp.dot(one_hot_shifted, ids_rank)
+
+        # Bypass jnp.where ShardingTypeError by using algebraic boolean masks!
+        # Multiplication automatically promotes sharding constraints!
         is_last = has_req & ((tok - req_starts) == (req_lens - 1))
-        rotated = jnp.where(is_last, req_verified, shifted)
-        return jnp.where(has_req, rotated, ids_rank)
+        is_last_int = is_last.astype(jnp.int32)
+        rotated = is_last_int * req_verified + (1 - is_last_int) * shifted
+
+        has_req_int = has_req.astype(jnp.int32)
+        return has_req_int * rotated + (1 - has_req_int) * ids_rank
 
     return jax.vmap(rotate_rank)(ids, ext, verified).reshape(input_ids.shape)
+
+
+def _rotate_hidden(hidden, ext_lens, sel_pos, prev_out_hidden):
+    """Hidden-state relay for draft step j >= 1 of the single-layer chain.
+
+    Mirrors ``_rotate_input_ids``: each request's ``[tokens_per_req, H]`` window
+    shifts left by one so row k stays paired with the rotated ``input_ids`` row k
+    (the MTP block consumes ``(h_i, tok_{i+1})`` pairs), and the last valid slot
+    takes the previous step's output hidden at that slot -- the draft's own
+    ``h_{t+j}``, which the target never produced. Padding requests keep their rows.
+    """
+    bs = ext_lens.shape[0]
+    tokens_per_req = hidden.shape[0] // bs
+
+    def _rot(hidden, ext_lens, sel_pos, prev):
+        h2 = hidden.reshape(bs, tokens_per_req, -1)
+        p2 = prev.reshape(bs, tokens_per_req, -1)
+        shifted = jnp.concatenate([h2[:, 1:], h2[:, -1:]], axis=1)
+        rows = jnp.arange(bs)
+        shifted = shifted.at[rows, sel_pos].set(p2[rows, sel_pos])
+        pad_mask = (ext_lens == 0)[:, None, None]
+        return jnp.where(pad_mask, h2, shifted).reshape(hidden.shape)
+
+    return _auto_sharded(_rot, hidden)(hidden, ext_lens, sel_pos, prev_out_hidden)
+
+
+def _rotate_prefill_hidden(hidden, extend_seq_lens, prev_out_hidden, dp_size, per_dp_bs):
+    """Prefill-time counterpart of ``_rotate_hidden`` for the ragged per-rank layout
+    used by ``_rotate_prefill_input_ids`` (rows shift left inside each request's
+    segment; the segment's last row takes the previous step's output at that row).
+    Every index array is built inside the auto-sharded region (an explicit-mesh
+    ``arange`` closed over from outside fails the region's mesh check).
+    """
+    per_dp_tokens = hidden.shape[0] // dp_size
+
+    def rotate_rank(h_rank, ext_rank, prev_rank):
+        n_req = ext_rank.shape[0]
+        tok = jnp.arange(per_dp_tokens, dtype=jnp.int32)
+        idx = jnp.arange(n_req)
+        tri = (idx[:, None] >= idx[None, :]).astype(jnp.int32)
+        ends = jnp.dot(tri, ext_rank)  # inclusive cumsum
+        starts = ends - ext_rank
+        in_req = (tok[None, :] >= starts[:, None]) & (tok[None, :] < ends[:, None])
+        has_req = jnp.any(in_req, axis=0)
+        is_last = jnp.any(in_req & (tok[None, :] == (ends - 1)[:, None]), axis=0)
+        shifted = jnp.take(h_rank, jnp.minimum(tok + 1, per_dp_tokens - 1), axis=0)
+        out = jnp.where(is_last[:, None], prev_rank, shifted)
+        return jnp.where(has_req[:, None], out, h_rank)
+
+    def _rot(hidden, ext_flat, prev):
+        h3 = hidden.reshape(dp_size, per_dp_tokens, -1)
+        p3 = prev.reshape(dp_size, per_dp_tokens, -1)
+        ext = ext_flat.reshape(dp_size, per_dp_bs)
+        return jax.vmap(rotate_rank)(h3, ext, p3).reshape(hidden.shape)
+
+    return _auto_sharded(_rot, hidden)(hidden, extend_seq_lens, prev_out_hidden)
 
 
 def _gather_rows_preserve_sharding(values, index):
@@ -497,19 +841,88 @@ def _reshard_values(sharding, *values):
     return tuple(jax.sharding.reshard(value, sharding) for value in values)
 
 
+def _auto_sharded(fn, out_like):
+    """Run ``fn`` as an auto-sharded region whose result takes ``out_like``'s placement.
+
+    The fused spec JITs run on an explicit-sharding mesh, where in-JIT shape
+    plumbing (reshape / slice / concatenate / where on ``[bs*n]`` <-> ``[bs, n]``
+    views) must type-check shardings and a size-1 ``data`` axis (dp=1) makes the
+    inferred specs disagree. Inside ``jax.sharding.auto_axes`` XLA infers the
+    interior freely; only the exit placement is pinned. Without an explicit
+    mesh (plain CPU tests) ``fn`` is returned unchanged.
+    """
+    sharding = jax.typeof(out_like).sharding
+    if isinstance(sharding, NamedSharding) and not sharding.mesh.empty:
+        return jax.sharding.auto_axes(fn, out_sharding=sharding)
+    return fn
+
+
 def _topk1_index_from_logits(logits):
     topk_idx = argmax_with_dp_sharding(logits)[:, None]
     return topk_idx
 
 
-def _build_draft_extend(num_layers: int, topk: int):
+def _seed_topk_pages_from_step0(topk_pages, ext_lens, sel_pos):
+    """GLM-5.2 MTP IndexShare: broadcast each request's step-0 selection.
+
+    ``topk_pages`` is the draft layer's ``[T, k_pages]`` per-query page-topk from
+    draft step 0, whose window rows are packed ``[bs, tokens_per_req]`` (same
+    layout ``_rotate_input_ids`` assumes). Row ``sel_pos[b]`` of request ``b`` is
+    its last verified token; every later draft step reuses that row for all of
+    the request's window rows, mirroring the reference implementation which
+    seeds the draft iterations from the draft-extend top-k of the last verified
+    token. Padding requests (``ext_lens == 0``) keep their step-0 rows.
+    """
+    bs = ext_lens.shape[0]
+    tokens_per_req = topk_pages.shape[0] // bs
+
+    def _seed(topk_pages, ext_lens, sel_pos):
+        pages_3d = topk_pages.reshape(bs, tokens_per_req, topk_pages.shape[1])
+        onehot = jnp.arange(tokens_per_req, dtype=jnp.int32)[None, :] == sel_pos[:, None]
+        seed = jnp.sum(jnp.where(onehot[:, :, None], pages_3d, 0), axis=1, dtype=pages_3d.dtype)
+        seeded = jnp.broadcast_to(seed[:, None, :], pages_3d.shape)
+        keep_step0 = (ext_lens == 0)[:, None, None]
+        seeded = jnp.where(keep_step0, pages_3d, seeded)
+        return seeded.reshape(topk_pages.shape)
+
+    # Auto-sharded region: with an explicit mesh the [T, k] -> [bs, tpr, k]
+    # split hangs a size-1 "data" axis (dp=1) on the tpr dim while ext_lens /
+    # sel_pos keep it on dim 0, and the where() broadcast becomes an illegal
+    # P("data", "data", None). Let XLA infer the interior and pin only the
+    # output to the input's placement (the backend shard_maps it P("data", None)).
+    return _auto_sharded(_seed, topk_pages)(topk_pages, ext_lens, sel_pos)
+
+
+def mtp_index_share_enabled(hf_config, topk: int) -> bool:
+    """Whether draft steps reuse the step-0 indexer selection (IndexShare).
+
+    Default follows the checkpoint's ``index_share_for_mtp_iteration`` (GLM-5.2
+    sets it); ``SGLANG_JAX_MTP_INDEX_SHARE=0/1`` forces it for A/B runs. Only the
+    topk=1 chain is supported (rows are not reordered between steps).
+    """
+    forced = os.environ.get("SGLANG_JAX_MTP_INDEX_SHARE")
+    if forced is not None:
+        return forced.strip() not in ("", "0", "false", "False") and topk == 1
+    return bool(getattr(hf_config, "index_share_for_mtp_iteration", False)) and topk == 1
+
+
+def _build_draft_extend(
+    num_layers: int, topk: int, index_share: bool = False, hidden_relay: bool = False
+):
     """Build the fused JIT. Called once, result cached on draft_worker."""
     assert topk == 1, "Fused draft extend only supports topk=1"
 
     @partial(
         jax.jit,
+        compiler_options=_SPEC_DECODE_COMPILER_OPTIONS,
         donate_argnames=["all_memory_pools"],
-        static_argnames=["model_state_def", "num_layers", "update_relay", "dp_size"],
+        static_argnames=[
+            "model_state_def",
+            "num_layers",
+            "update_relay",
+            "dp_size",
+            "chain_all_ok",
+        ],
     )
     def fused_draft_extend(
         model_def,
@@ -532,14 +945,18 @@ def _build_draft_extend(num_layers: int, topk: int):
         num_layers,
         update_relay,
         dp_size,
+        chain_all_ok=False,
     ):
         logits_metadata = replace(logits_metadata, preserve_vocab_sharding=True)
         all_topk_index = []
         all_pool_updates = []
         layer0_hidden = None
         mesh = None
+        seed_topk_pages = None
         input_ids = forward_batch.input_ids
+        md_orig = None
         if draft_verify_seq_lens is not None:
+            md_orig = forward_batch.attn_backend.forward_metadata
             valid_draft_slots = draft_verify_seq_lens > 0
             forward_batch.seq_lens = jnp.where(
                 valid_draft_slots,
@@ -554,15 +971,108 @@ def _build_draft_extend(num_layers: int, topk: int):
                 dp_size=dp_size,
             )
 
+        step_hidden = target_hidden
+        positions0 = forward_batch.positions
+        relay_on = _chained_relay(hidden_relay, num_layers, len(all_leaves))
+        chain_pool = _chain_pool_enabled(len(all_memory_pools), relay_on)
+        chain_all = bool(
+            _CHAIN_ALL
+            and chain_all_ok
+            and chain_pool
+            and relay_on
+            and _RELAY_POS
+            and draft_verify_seq_lens is not None
+            and md_orig is not None
+        )
+        base_seq_lens = forward_batch.seq_lens
+        md_base = forward_batch.attn_backend.forward_metadata
+        if chain_all:
+            # one page table for all steps (covers base + num_layers - 1), step 0 included
+            md_pack = _pack_draft_extend_metadata(
+                md_orig,
+                base_seq_lens,
+                draft_allocate_lens,
+                num_layers,
+                page_size=forward_batch.attn_backend.page_size,
+                dp_size=dp_size,
+            )
+            _, md_base = _shift_draft_extend_metadata(md_pack, base_seq_lens, 0)
+            forward_batch.attn_backend.forward_metadata = md_base
+        chain_check_report = None
         for i in range(num_layers):
-            state = jax.tree_util.tree_unflatten(model_state_def, all_leaves[i])
+            leaf_idx = i if i < len(all_leaves) else -1
+            pool_idx = i if i < len(all_memory_pools) else -1
+            state = jax.tree_util.tree_unflatten(model_state_def, all_leaves[leaf_idx])
             model = nnx.merge(model_def, state)
 
-            forward_batch.spec_info.hidden_states = target_hidden
+            forward_batch.spec_info.hidden_states = step_hidden
             forward_batch.input_ids = input_ids
+            if relay_on and _RELAY_POS and i > 0:
+                forward_batch.positions = positions0 + i
+            if chain_all and i > 0:
+                forward_batch.seq_lens, forward_batch.attn_backend.forward_metadata = (
+                    _shift_draft_extend_metadata(md_pack, base_seq_lens, i)
+                )
+            forward_batch.spec_kvshare_readonly = bool(_KVSHARE and i >= 1)
 
-            output, pool_updates, _, _ = model(forward_batch, all_memory_pools[i], logits_metadata)
-            all_pool_updates.append(pool_updates)
+            if index_share:
+                output, pool_updates, _, _, step_topk_pages = model(
+                    forward_batch,
+                    all_memory_pools[pool_idx],
+                    logits_metadata,
+                    dsa_topk_pages_in=seed_topk_pages,
+                    dsa_topk_reuse=seed_topk_pages is not None,
+                    return_dsa_topk_pages=True,
+                )
+                if i == 0 and step_topk_pages is not None:
+                    seed_topk_pages = _seed_topk_pages_from_step0(
+                        step_topk_pages, forward_batch.extend_seq_lens, sel_pos
+                    )
+            else:
+                output, pool_updates, _, _ = model(
+                    forward_batch, all_memory_pools[pool_idx], logits_metadata
+                )
+            if chain_all:
+                # one version through all steps (slots shifted per step, see _CHAIN_ALL)
+                if _CHAIN_POOL_CHECK and i == 0:
+                    check_v0 = jax.tree_util.tree_map(lambda x: x + 0, pool_updates)
+                all_memory_pools[pool_idx].replace_all(pool_updates)
+                if i == num_layers - 1:
+                    all_pool_updates.append(pool_updates)
+                    if _CHAIN_POOL_CHECK:
+                        # assertion data vs step 0: differing slots must all lie at or
+                        # past each request's first non-verified slot (valid rows unchanged)
+                        chain_check_report = _chain_pool_report(
+                            check_v0,
+                            pool_updates,
+                            md_base,
+                            input_ids.shape[0],
+                            forward_batch.attn_backend.page_size,
+                            input_ids,
+                            sel_pos=sel_pos,
+                        )
+            elif chain_pool:
+                # step 0's version is the one the caller keeps; steps >= 1 share
+                # one scratch version (step 2 continues on step 1's), see _CHAIN_POOL
+                if i == 0:
+                    all_pool_updates.append(pool_updates)
+                    if _CHAIN_POOL_CHECK:
+                        check_v0 = jax.tree_util.tree_map(lambda x: x + 0, pool_updates)
+                else:
+                    all_memory_pools[pool_idx].replace_all(pool_updates)
+                    if _CHAIN_POOL_CHECK and i == num_layers - 1:
+                        # assertion data: the version handed back must still be
+                        # step 0's (rows_differ must be 0 everywhere, loc0 included)
+                        chain_check_report = _chain_pool_report(
+                            check_v0,
+                            all_pool_updates[0],
+                            md_base,
+                            input_ids.shape[0],
+                            forward_batch.attn_backend.page_size,
+                            input_ids,
+                        )
+            else:
+                all_pool_updates.append(pool_updates)
 
             sh = jax.typeof(output.next_token_logits).sharding
             mesh = sh.mesh if isinstance(sh, NamedSharding) else None
@@ -572,11 +1082,21 @@ def _build_draft_extend(num_layers: int, topk: int):
 
             topk_idx = _topk1_index_from_logits(output.next_token_logits)
             all_topk_index.append(topk_idx)
+            # jax.debug.print("[SPEC_DRAFT_EXTEND] Step {step} predicted draft token IDs: {tok}", step=i, tok=topk_idx[:, 0])
 
             if i < num_layers - 1:
                 ext_lens = forward_batch.extend_seq_lens
                 input_ids = _rotate_input_ids(input_ids, ext_lens, sel_pos, topk_idx[:, 0])
+                if relay_on:
+                    step_hidden = _rotate_hidden(
+                        step_hidden, ext_lens, sel_pos, output.hidden_states
+                    )
 
+        forward_batch.spec_kvshare_readonly = False
+        forward_batch.positions = positions0
+        if chain_all:
+            forward_batch.seq_lens = base_seq_lens
+            forward_batch.attn_backend.forward_metadata = md_base
         last_idx = draft_logits_indices
         if logits_metadata.accept_lens is not None:
             last_idx = last_idx - (forward_batch.extend_seq_lens - logits_metadata.accept_lens)
@@ -617,12 +1137,15 @@ def _build_draft_extend(num_layers: int, topk: int):
                 dp_size=dp_size,
             )
 
-        return (
+        outs = (
             selected_layer0_hidden,
             stacked_idx,
             tuple(all_pool_updates),
             updated_relay_buffers,
         )
+        if _CHAIN_POOL_CHECK:
+            outs = outs + (chain_check_report,)
+        return outs
 
     return fused_draft_extend
 
@@ -721,9 +1244,6 @@ def _make_target_verify_metadata(
     page_size: int,
     dp_size: int,
 ):
-    from sgl_jax.srt.layers.attention.flashattention_backend import (
-        FlashAttentionMetadata,
-    )
 
     valid = verify_seq_lens > 0
     extend_seq_lens = jnp.where(
@@ -743,7 +1263,7 @@ def _make_target_verify_metadata(
         dp_size=dp_size,
     )
     swa_page_indices = None
-    if old_metadata.swa_page_indices is not None:
+    if getattr(old_metadata, "swa_page_indices", None) is not None:
         swa_page_indices = _repack_page_indices(
             old_metadata.swa_page_indices,
             allocated_lens,
@@ -754,10 +1274,16 @@ def _make_target_verify_metadata(
 
     valid_rows = _reshape_per_dp_rows(valid, dp_size)
     local_num_seqs = jnp.sum(valid_rows.astype(jnp.int32), axis=1)
-    distribution = jnp.stack(
-        [jnp.zeros_like(local_num_seqs), local_num_seqs, local_num_seqs],
-        axis=1,
-    ).reshape((dp_size * 3,))
+    if type(old_metadata).__name__ == "MLAAttentionMetadata":
+        distribution = jnp.stack(
+            [jnp.zeros_like(local_num_seqs), jnp.zeros_like(local_num_seqs), local_num_seqs],
+            axis=1,
+        ).reshape((dp_size * 3,))
+    else:
+        distribution = jnp.stack(
+            [jnp.zeros_like(local_num_seqs), local_num_seqs, local_num_seqs],
+            axis=1,
+        ).reshape((dp_size * 3,))
 
     data_sharding = jax.typeof(verify_seq_lens).sharding
     if isinstance(data_sharding, NamedSharding) and not data_sharding.mesh.empty:
@@ -769,15 +1295,18 @@ def _make_target_verify_metadata(
         if swa_page_indices is not None:
             swa_page_indices = jax.sharding.reshard(swa_page_indices, data_sharding)
 
-    return FlashAttentionMetadata(
-        cu_q_lens=cu_q_lens,
-        cu_kv_lens=cu_kv_lens,
-        page_indices=page_indices,
-        swa_page_indices=swa_page_indices,
-        seq_lens=metadata_seq_lens,
-        distribution=distribution,
-        custom_mask=old_metadata.custom_mask,
-    )
+    kwargs = {
+        "cu_q_lens": cu_q_lens,
+        "cu_kv_lens": cu_kv_lens,
+        "page_indices": page_indices,
+        "seq_lens": metadata_seq_lens,
+        "distribution": distribution,
+    }
+    if hasattr(old_metadata, "swa_page_indices"):
+        kwargs["swa_page_indices"] = swa_page_indices
+    if hasattr(old_metadata, "custom_mask"):
+        kwargs["custom_mask"] = old_metadata.custom_mask
+    return type(old_metadata)(**kwargs)
 
 
 def _make_draft_extend_metadata(
@@ -789,9 +1318,6 @@ def _make_draft_extend_metadata(
     page_size: int,
     dp_size: int,
 ):
-    from sgl_jax.srt.layers.attention.flashattention_backend import (
-        FlashAttentionMetadata,
-    )
 
     valid = draft_seq_lens > 0
     # Fused EAGLE3 passes device query lengths so this cumsum remains in the
@@ -809,7 +1335,7 @@ def _make_draft_extend_metadata(
         dp_size=dp_size,
     )
     swa_page_indices = None
-    if old_metadata.swa_page_indices is not None:
+    if getattr(old_metadata, "swa_page_indices", None) is not None:
         swa_page_indices = _repack_page_indices(
             old_metadata.swa_page_indices,
             allocated_lens,
@@ -820,10 +1346,16 @@ def _make_draft_extend_metadata(
 
     valid_rows = _reshape_per_dp_rows(valid, dp_size)
     local_num_seqs = jnp.sum(valid_rows.astype(jnp.int32), axis=1)
-    distribution = jnp.stack(
-        [jnp.zeros_like(local_num_seqs), local_num_seqs, local_num_seqs],
-        axis=1,
-    ).reshape((dp_size * 3,))
+    if type(old_metadata).__name__ == "MLAAttentionMetadata":
+        distribution = jnp.stack(
+            [jnp.zeros_like(local_num_seqs), jnp.zeros_like(local_num_seqs), local_num_seqs],
+            axis=1,
+        ).reshape((dp_size * 3,))
+    else:
+        distribution = jnp.stack(
+            [jnp.zeros_like(local_num_seqs), local_num_seqs, local_num_seqs],
+            axis=1,
+        ).reshape((dp_size * 3,))
 
     data_sharding = jax.typeof(draft_seq_lens).sharding
     if isinstance(data_sharding, NamedSharding) and not data_sharding.mesh.empty:
@@ -835,15 +1367,18 @@ def _make_draft_extend_metadata(
         if swa_page_indices is not None:
             swa_page_indices = jax.sharding.reshard(swa_page_indices, data_sharding)
 
-    return FlashAttentionMetadata(
-        cu_q_lens=cu_q_lens,
-        cu_kv_lens=cu_kv_lens,
-        page_indices=page_indices,
-        swa_page_indices=swa_page_indices,
-        seq_lens=draft_seq_lens,
-        distribution=distribution,
-        custom_mask=old_metadata.custom_mask,
-    )
+    kwargs = {
+        "cu_q_lens": cu_q_lens,
+        "cu_kv_lens": cu_kv_lens,
+        "page_indices": page_indices,
+        "seq_lens": draft_seq_lens,
+        "distribution": distribution,
+    }
+    if hasattr(old_metadata, "swa_page_indices"):
+        kwargs["swa_page_indices"] = swa_page_indices
+    if hasattr(old_metadata, "custom_mask"):
+        kwargs["custom_mask"] = old_metadata.custom_mask
+    return type(old_metadata)(**kwargs)
 
 
 def _make_eagle3_decode_metadata(
@@ -937,6 +1472,7 @@ def _build_eagle3_recurrent_draft_extend(num_steps: int, topk: int):
 
     @partial(
         jax.jit,
+        compiler_options=_SPEC_DECODE_COMPILER_OPTIONS,
         donate_argnames=["memory_pools"],
         static_argnames=["model_state_def", "num_steps", "update_relay", "dp_size"],
     )
@@ -1093,6 +1629,7 @@ def _build_verify(topk: int):
 
     @partial(
         jax.jit,
+        compiler_options=_SPEC_DECODE_COMPILER_OPTIONS,
         donate_argnames=["target_memory_pools"],
         static_argnames=[
             "target_model_state_def",
@@ -1146,11 +1683,15 @@ def _build_verify(topk: int):
                 relay_future_indices,
                 dp_size=dp_size,
             )
+            # Force explicit P("data") without mesh using PartitionSpec
             valid_seq_lens = target_forward_batch.seq_lens > 0
+            zeros = jnp.zeros_like(target_forward_batch.seq_lens)
+            b = relay_new_seq_lens - 1 + zeros
+
             target_forward_batch.seq_lens = jnp.where(
                 valid_seq_lens,
-                relay_new_seq_lens - 1,
-                jnp.zeros_like(target_forward_batch.seq_lens),
+                b,
+                zeros,
             )
             previous_verified_id = relay_verified_id
             previous_token_list = relay_topk_index
@@ -1298,6 +1839,14 @@ def _build_verify(topk: int):
         prepared_sel_pos = prepared.sel_pos
         prepared_sel_pos_data = prepared.sel_pos
         prepared_predict = prepared.predict
+
+        # jax.debug.print(
+        #     "\n[SPEC_VERIFY]\n  Draft tokens: {d}\n  Target predicted: {t}\n  Accept length: {a}\n  Verified tokens: {v}",
+        #     d=draft_tokens,
+        #     t=prepared.predict,
+        #     a=prepared.accept_lens,
+        #     v=prepared.verified_id,
+        # )
         prepared_positions = prepared.positions
         prepared_positions_data = prepared.positions
         prepared_verify_seq_lens = target_forward_batch.seq_lens
@@ -1375,7 +1924,7 @@ def _build_verify(topk: int):
     return fused_verify
 
 
-def _build_prefill(num_layers: int, topk: int):
+def _build_prefill(num_layers: int, topk: int, hidden_relay=None):
     """Build prefill JIT: target extend + all MTP draft-extend layers."""
     assert topk == 1, "Fused greedy prefill only supports topk=1"
 
@@ -1440,15 +1989,23 @@ def _build_prefill(num_layers: int, topk: int):
         layer0_hidden = None
         mesh = None
 
-        draft_forward_batch.spec_info.hidden_states = target_hidden
+        step_hidden = target_hidden
+        draft_forward_batch.spec_info.hidden_states = step_hidden
+        draft_positions0 = draft_forward_batch.positions
+        relay_on = _chained_relay(hidden_relay, num_layers, len(draft_all_leaves))
         for i in range(num_layers):
-            state = jax.tree_util.tree_unflatten(draft_model_state_def, draft_all_leaves[i])
+            leaf_idx = i if i < len(draft_all_leaves) else -1
+            pool_idx = i if i < len(all_memory_pools) else -1
+            state = jax.tree_util.tree_unflatten(draft_model_state_def, draft_all_leaves[leaf_idx])
             model = nnx.merge(draft_model_def, state)
 
             draft_forward_batch.input_ids = input_ids
-            draft_forward_batch.spec_info.hidden_states = target_hidden
+            draft_forward_batch.spec_kvshare_readonly = bool(_KVSHARE and i >= 1)
+            draft_forward_batch.spec_info.hidden_states = step_hidden
+            if relay_on and _RELAY_POS and i > 0:
+                draft_forward_batch.positions = draft_positions0 + i
             output, pool_updates, _, _ = model(
-                draft_forward_batch, all_memory_pools[i], draft_logits_metadata
+                draft_forward_batch, all_memory_pools[pool_idx], draft_logits_metadata
             )
             all_pool_updates.append(pool_updates)
 
@@ -1466,7 +2023,16 @@ def _build_prefill(num_layers: int, topk: int):
                     dp_size,
                     per_dp_bs,
                 )
+                if relay_on:
+                    step_hidden = _rotate_prefill_hidden(
+                        step_hidden,
+                        draft_forward_batch.extend_seq_lens,
+                        output.hidden_states,
+                        dp_size,
+                        per_dp_bs,
+                    )
 
+        draft_forward_batch.positions = draft_positions0
         last_idx = draft_logits_indices
         if dp_size > 1:
             per_dp_tokens = layer0_hidden.shape[0] // dp_size
@@ -1826,14 +2392,14 @@ def launch_fused_draft_extend_for_decode(
     else:
         sel_pos = jnp.clip(batch_output.accept_lens - 1, 0, None).astype(jnp.int32)
 
-    mr0 = draft_worker._workers[0].model_runner
+    mr0 = draft_worker._worker.model_runner
     mwb.spec_info_padded.hidden_states = target_hidden
     shared_fb = _make_forward_batch(mwb, mr0)
     shared_fb.bid = model_worker_batch.bid
 
     all_memory_pools = []
     all_leaves = []
-    for w in draft_worker._workers:
+    for w in [draft_worker._worker]:
         mr = w.model_runner
         all_memory_pools.append(mr.memory_pools)
         all_leaves.append(tuple(mr.model_state_leaves))
@@ -1855,10 +2421,32 @@ def launch_fused_draft_extend_for_decode(
     if draft_allocate_lens is None:
         draft_allocate_lens = np.zeros_like(model_worker_batch.seq_lens, dtype=np.int32)
         draft_allocate_lens[sel] = np.asarray(batch_output.next_draft_input.allocate_lens)
+    draft_verify_seq_lens = getattr(batch_output.next_draft_input, "verify_seq_lens", None)
+    chain_all_ok = False
+    if _CHAIN_ALL and draft_verify_seq_lens is not None:
+        # Host-side arrays only: verify_seq_lens on the draft input is a device
+        # array (the verify batch's seq_lens); reading it here would force a
+        # device-to-host sync every draft step (measured +1.5 ms per cycle at
+        # batch 1). model_worker_batch.seq_lens is the same value on the host.
+        # allocate_lens_for_draft_extend is a device array too (prepared during
+        # verify); rebuild the padded host copy from the host-side allocate_lens
+        # like the fallback above does, so the guard never touches device memory.
+        alloc_host = np.zeros_like(np.asarray(model_worker_batch.seq_lens), dtype=np.int32)
+        alloc_host[sel] = np.asarray(batch_output.next_draft_input.allocate_lens)
+        chain_all_ok = chain_all_headroom_ok(
+            alloc_host,
+            np.asarray(model_worker_batch.seq_lens),
+            draft_worker.speculative_num_steps,
+        )
+        if not chain_all_ok and not getattr(draft_worker, "_chain_all_fallback_logged", False):
+            draft_worker._chain_all_fallback_logged = True
+            logger.warning(
+                "SGLANG_JAX_MTP_CHAIN_POOL=all: allocation headroom below num_steps - 1 slots "
+                "for some request; falling back to the two-version draft pool for this batch"
+            )
     draft_allocate_lens = _prepare_device_array(
         draft_allocate_lens, data_sharding, "draft_extend.allocate_lens"
     )
-    draft_verify_seq_lens = getattr(batch_output.next_draft_input, "verify_seq_lens", None)
     draft_verify_seq_lens = _prepare_device_array(
         draft_verify_seq_lens, data_sharding, "draft_extend.verify_seq_lens"
     )
@@ -1873,18 +2461,29 @@ def launch_fused_draft_extend_for_decode(
         relay_valid_mask, data_sharding, "draft_extend.relay_valid_mask"
     )
     if not hasattr(draft_worker, "_fused_jit_fn"):
+        hf_config = getattr(getattr(mr0, "model_config", None), "hf_config", None)
+        index_share = mtp_index_share_enabled(hf_config, draft_worker.topk)
+        hidden_relay = mtp_hidden_relay_enabled(hf_config)
+        n_blocks = len([draft_worker._worker])
+        relay_resolved = _chained_relay(hidden_relay, draft_worker.speculative_num_steps, n_blocks)
+        logger.info(
+            "Fused draft extend: MTP IndexShare %s, hidden relay %s (%s; steps=%d blocks=%d)%s",
+            "on" if index_share else "off",
+            "on" if relay_resolved else "off",
+            "forced by env" if hidden_relay is not None else "auto by chaining",
+            draft_worker.speculative_num_steps,
+            n_blocks,
+            " (+positions)" if relay_resolved and _RELAY_POS else "",
+        )
         draft_worker._fused_jit_fn = _build_draft_extend(
             num_layers=draft_worker.speculative_num_steps,
             topk=draft_worker.topk,
+            index_share=index_share,
+            hidden_relay=hidden_relay,
         )
 
     with jax.set_mesh(draft_worker.mesh):
-        (
-            selected_layer0_hidden,
-            topk_index_stacked,
-            all_pool_updates,
-            updated_relay_buffers,
-        ) = draft_worker._fused_jit_fn(
+        _fused_out = draft_worker._fused_jit_fn(
             mr0._model_def,
             mr0._model_state_def,
             tuple(all_leaves),
@@ -1904,9 +2503,20 @@ def launch_fused_draft_extend_for_decode(
             num_layers=draft_worker.speculative_num_steps,
             update_relay=update_relay,
             dp_size=model_worker_batch.dp_size,
+            chain_all_ok=chain_all_ok,
         )
+        if _CHAIN_POOL_CHECK and len(_fused_out) == 5:
+            *_fused_out, _chain_report = _fused_out
+            if _chain_report is not None:
+                log_chain_pool_check(_chain_report, _fused_out[2][0])
+        (
+            selected_layer0_hidden,
+            topk_index_stacked,
+            all_pool_updates,
+            updated_relay_buffers,
+        ) = _fused_out
 
-    for i, w in enumerate(draft_worker._workers):
+    for i, w in enumerate([draft_worker._worker]):
         w.model_runner.memory_pools.replace_all(all_pool_updates[i])
 
     return FusedDraftExtendPendingResult(
@@ -2184,7 +2794,7 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
     model_worker_batch.spec_info_padded.capture_hidden_mode = CaptureHiddenMode.FULL
     model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
 
-    draft_mr0 = draft_worker._workers[0].model_runner
+    draft_mr0 = draft_worker._worker.model_runner
     draft_mr0.attn_backend.forward_metadata = draft_mr0.attn_backend.get_eagle_forward_metadata(
         model_worker_batch
     )
@@ -2200,15 +2810,19 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
 
     all_memory_pools = []
     all_leaves = []
-    for w in draft_worker._workers:
+    for w in [draft_worker._worker]:
         mr = w.model_runner
         all_memory_pools.append(mr.memory_pools)
         all_leaves.append(tuple(mr.model_state_leaves))
 
     if not hasattr(draft_worker, "_fused_greedy_prefill_jit_fn"):
+        hf_config = getattr(
+            getattr(draft_worker._worker.model_runner, "model_config", None), "hf_config", None
+        )
         draft_worker._fused_greedy_prefill_jit_fn = _build_prefill(
             num_layers=draft_worker.speculative_num_steps,
             topk=draft_worker.topk,
+            hidden_relay=mtp_hidden_relay_enabled(hf_config),
         )
 
     data_sharding = NamedSharding(draft_worker.mesh, P("data"))
@@ -2273,7 +2887,7 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
         launch_done.set()
 
     target_mr.memory_pools.replace_all(target_pool_updates)
-    for i, w in enumerate(draft_worker._workers):
+    for i, w in enumerate([draft_worker._worker]):
         w.model_runner.memory_pools.replace_all(all_pool_updates[i])
     if update_relay:
         spec_worker.spec_relay_buffers = updated_relay_buffers
@@ -2386,7 +3000,10 @@ def spec_decode_verify(
         target_mr.attn_backend.forward_metadata = target_mr.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
         )
-    if use_relay_state and target_mr.attn_backend.forward_metadata.custom_mask is not None:
+    if (
+        use_relay_state
+        and getattr(target_mr.attn_backend.forward_metadata, "custom_mask", None) is not None
+    ):
         raise NotImplementedError("Spec decode overlap relay path does not support custom_mask.")
     target_forward_batch = _make_forward_batch(model_worker_batch, target_mr)
     if rebuild_verify_metadata:

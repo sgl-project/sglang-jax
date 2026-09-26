@@ -460,6 +460,21 @@ class ModelRunnerKVCacheMixin:
         available_kv_cache_bytes = self._profile_available_bytes(total_device_memory)
 
         cell_size = self._compute_cell_size()
+
+        # Accommodate Draft KV Cache Memory Footprint + Spec Headroom
+        if (
+            not self.is_draft_worker
+            and self.spec_algorithm is not None
+            and not self.spec_algorithm.is_none()
+        ):
+            # Reserve 2 GB entirely for the Draft Worker's KV buffer and XLA fragmentation.
+            overhead_bytes = 1 * 1024 * 1024 * 1024
+            logger.info(
+                "Deducting %d bytes from available KV cache for draft memory overhead",
+                overhead_bytes,
+            )
+            available_kv_cache_bytes -= overhead_bytes
+
         max_tokens = max(1, int(available_kv_cache_bytes // cell_size))
 
         logger.info(
@@ -922,6 +937,10 @@ class ModelRunnerKVCacheMixin:
 
         For hybrid recurrent models, only full-attention layers need KV cache.
         """
+
+        if getattr(self, "is_draft_worker", False):
+            return 1
+
         cfg = self.linear_recurrent_config
         if cfg is not None:
             return len(cfg.full_attention_layer_ids)
