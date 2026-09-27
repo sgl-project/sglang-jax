@@ -5,6 +5,7 @@ import dataclasses
 import json
 import struct
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import jax
@@ -69,6 +70,7 @@ def sdk(monkeypatch, tmp_path):
         instances=instances,
     )
     monkeypatch.setattr(runai_utils, "_sdk", lambda: fake)
+    monkeypatch.setattr(runai_utils, "_list_safetensors", fake.list_safetensors)
     monkeypatch.setenv("RUNAI_STREAMER_MEMORY_LIMIT", "31")
     return fake
 
@@ -279,29 +281,90 @@ def test_shared_weight_loader_matches_local_sharding(sdk, tmp_path, monkeypatch)
 def test_metadata_cache_is_source_specific_and_excludes_weights(monkeypatch, tmp_path):
     calls = []
 
-    class ObjectStorageModel:
-        def __init__(self, model_path, dst):
-            self.uri, self.dst = model_path, dst
+    class Blob:
+        def __init__(self, name):
+            self.name = name
 
-        def __enter__(self):
-            return self
+        def download_to_filename(self, target):
+            calls.append(self.name)
+            Path(target).write_text("{}")
 
-        def __exit__(self, *_):
-            pass
-
-        def pull_files(self, ignore_pattern):
-            calls.append((self.uri, self.dst, ignore_pattern))
-
+    monkeypatch.setattr(runai_utils, "_sdk", lambda: None)
     monkeypatch.setattr(
-        runai_utils, "_sdk", lambda: SimpleNamespace(ObjectStorageModel=ObjectStorageModel)
+        runai_utils,
+        "_gcs_blobs",
+        lambda uri: [
+            Blob(uri.split("/", 3)[3].rstrip("/") + "/" + name)
+            for name in ("config.json", "nested/tokenizer.json", "model.safetensors", "model.bin")
+        ],
     )
     main = runai_utils.download_metadata("gs://bucket/model", str(tmp_path))
     draft = runai_utils.download_metadata("gs://bucket/draft", str(tmp_path))
     assert main != draft
     assert runai_utils.download_metadata("gs://bucket/model/", str(tmp_path)) == main
-    assert all(
-        "*.safetensors" in exclusions and "*.bin" in exclusions for _, _, exclusions in calls
+    assert calls == [
+        "model/config.json",
+        "model/nested/tokenizer.json",
+        "draft/config.json",
+        "draft/nested/tokenizer.json",
+    ]
+
+
+def test_gcs_listing_never_fetches_bucket_metadata(monkeypatch):
+    calls = []
+
+    class Client:
+        def __init__(self, **kwargs):
+            pass
+
+        def bucket(self, name):
+            return name
+
+        def get_bucket(self, name):
+            raise AssertionError("storage.buckets.get is not required")
+
+        def list_blobs(self, bucket, **kwargs):
+            calls.append((bucket, kwargs))
+            return [
+                SimpleNamespace(name="model/weights.safetensors"),
+                SimpleNamespace(name="model/config.json"),
+            ]
+
+    monkeypatch.setitem(
+        sys.modules, "google.cloud", SimpleNamespace(storage=SimpleNamespace(Client=Client))
     )
+    monkeypatch.setitem(
+        sys.modules,
+        "runai_model_streamer_gcs.credentials.credentials",
+        SimpleNamespace(get_credentials=lambda: SimpleNamespace(gcp_credentials=lambda: None)),
+    )
+    assert runai_utils._list_safetensors("gs://bucket/model") == [
+        "gs://bucket/model/weights.safetensors"
+    ]
+    assert calls == [("bucket", {"prefix": "model/", "delimiter": "/"})]
+
+
+def test_failed_metadata_download_is_retried_and_path_escape_rejected(monkeypatch, tmp_path):
+    monkeypatch.setattr(runai_utils, "_sdk", lambda: None)
+    state = {"fail": True, "calls": 0}
+
+    def download(target):
+        state["calls"] += 1
+        Path(target).write_text("partial" if state["fail"] else "complete")
+        if state["fail"]:
+            raise OSError("network failure")
+
+    blob = SimpleNamespace(name="model/config.json", download_to_filename=download)
+    monkeypatch.setattr(runai_utils, "_gcs_blobs", lambda uri: [blob])
+    with pytest.raises(OSError, match="network failure"):
+        runai_utils.download_metadata("gs://bucket/model", str(tmp_path))
+    state["fail"] = False
+    result = runai_utils.download_metadata("gs://bucket/model", str(tmp_path))
+    assert (Path(result) / "config.json").read_text() == "complete"
+    assert state["calls"] == 2
+    blob.name = "escape/../../outside.json"
+    with pytest.raises(ValueError, match="escapes metadata"):
+        runai_utils.download_metadata("gs://bucket/escape", str(tmp_path))
 
 
 @pytest.mark.parametrize(

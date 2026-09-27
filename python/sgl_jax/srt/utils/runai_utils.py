@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from filelock import FileLock
 
 _DTYPES: dict[str, np.dtype] = {
     "F32": np.dtype("float32"),
@@ -76,11 +77,59 @@ def download_metadata(uri: str, download_dir: str | None = None) -> str:
     root = root / "sglang-jax-runai"
     root.mkdir(parents=True, exist_ok=True)
     destination = root / hashlib.sha256(uri.rstrip("/").encode()).hexdigest()
-    # ObjectStorageModel owns the process lock and completion sentinel. Failed
-    # downloads must not be marked complete; different sources have distinct dirs.
-    with _sdk().ObjectStorageModel(model_path=uri, dst=str(destination)) as model:
-        model.pull_files(ignore_pattern=["*.safetensors", "*.bin", "*.pt", "*.pth", "*.tensors"])
+    _sdk()
+    # The SDK's GCS metadata helpers call get_bucket(), which unnecessarily
+    # requires storage.buckets.get. Object readers may only have list/get.
+    # Keep the same source-specific, process-safe cache without that extra RPC.
+    sentinel = destination / ".sglang_complete"
+    with FileLock(str(destination) + ".lock"):
+        if sentinel.exists():
+            return str(destination)
+        destination.mkdir(parents=True, exist_ok=True)
+        _, prefix = _gcs_location(uri)
+        count = 0
+        for blob in _gcs_blobs(uri):
+            if blob.name.endswith(("/", ".safetensors", ".bin", ".pt", ".pth", ".tensors")):
+                continue
+            if not blob.name.startswith(prefix):
+                raise ValueError(f"Object is outside model prefix: {blob.name!r}")
+            target = (destination / blob.name[len(prefix) :]).resolve()
+            if not target.is_relative_to(destination.resolve()):
+                raise ValueError(f"Object escapes metadata directory: {blob.name!r}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            blob.download_to_filename(str(target))
+            count += 1
+        if not count:
+            raise ValueError(f"No metadata files found at {uri!r}")
+        sentinel.touch()
     return str(destination)
+
+
+def _gcs_location(uri: str):
+    bucket, _, prefix = uri[5:].partition("/")
+    return bucket, prefix.rstrip("/") + "/" if prefix.strip("/") else ""
+
+
+def _gcs_blobs(uri: str, *, delimiter=None):
+    from google.cloud import storage
+    from runai_model_streamer_gcs.credentials.credentials import get_credentials
+
+    bucket, prefix = _gcs_location(uri)
+    # Reuse the SDK's credential selection; bucket() constructs a resource
+    # without fetching bucket metadata, unlike get_bucket().
+    client = storage.Client(credentials=get_credentials().gcp_credentials())
+    return client.list_blobs(client.bucket(bucket), prefix=prefix, delimiter=delimiter)
+
+
+def _list_safetensors(path: str):
+    if not is_gcs_path(path):
+        return _sdk().list_safetensors(path)
+    bucket, _ = _gcs_location(path)
+    return [
+        f"gs://{bucket}/{blob.name}"
+        for blob in _gcs_blobs(path, delimiter="/")
+        if blob.name.endswith(".safetensors")
+    ]
 
 
 def _slice_ranges(shape: tuple[int, ...], index, itemsize: int):
@@ -171,7 +220,7 @@ class RunaiWeightSource:
 
     def __enter__(self):
         sdk = _sdk()
-        paths = sorted(sdk.list_safetensors(self.path))
+        paths = sorted(_list_safetensors(self.path))
         index_path = Path(self.metadata_dir) / "model.safetensors.index.json"
         if index_path.exists():
             with index_path.open() as f:

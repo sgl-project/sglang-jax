@@ -40,8 +40,10 @@ The loader copies each received chunk into an owned host buffer before asking
 the SDK for another chunk. Allow memory for those host shards and any JAX
 transfers in addition to the SDK staging limit.
 
-The cache lives in `sglang-jax-runai/<URI hash>` beneath the cache root. RunAI
-locks metadata downloads and marks completed downloads for reuse. Treat the
+The cache lives in `sglang-jax-runai/<URI hash>` beneath the cache root. The loader
+locks metadata downloads and marks completed downloads for reuse. Listing and
+metadata downloads use object read/list permissions without fetching bucket metadata.
+Treat the
 GCS prefix as immutable: use a new prefix for a new checkpoint, or remove its
 metadata cache directory while serving processes are stopped. Primary and draft
 model URIs use separate cache entries. Metadata is cached separately on each host.
