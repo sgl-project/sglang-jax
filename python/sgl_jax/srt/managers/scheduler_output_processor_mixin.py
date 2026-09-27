@@ -8,6 +8,9 @@ from typing import TYPE_CHECKING
 import jax
 import numpy as np
 
+from sgl_jax.srt.disaggregation.encoder.embedding_data import (
+    release_received_embeddings,
+)
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.layers.routed_experts_capturer import get_global_experts_capturer
 from sgl_jax.srt.managers.io_struct import AbortReq, BatchTokenIDOut
@@ -111,6 +114,7 @@ class SchedulerOutputProcessorMixin:
         assert req.is_chunked == 0
         req.check_finished()
         assert req.finished(), f"Chunked abort did not finish request {req.rid}"
+        release_received_embeddings(req.mm_inputs)
         _complete_precision_trace(req)
         self._release_prefill_host_buffer(req)
         release_kv_cache(
@@ -853,6 +857,7 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             if req.finished():
+                release_received_embeddings(getattr(req, "mm_inputs", None))
                 if req.finished_output:
                     # With the overlap schedule, a request will try to output twice and hit this line twice
                     # because of the one additional delayed token. This "continue" prevented the dummy output.
