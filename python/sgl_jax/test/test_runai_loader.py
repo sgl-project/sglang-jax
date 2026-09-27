@@ -45,6 +45,7 @@ def sdk(monkeypatch, tmp_path):
         def stream_files(self, files, device):
             assert device == "cpu"
             requests.extend(files)
+            batches.append(files)
             self.files = files
 
         def get_chunks(self):
@@ -62,11 +63,13 @@ def sdk(monkeypatch, tmp_path):
                         buffer.fill(255)
                         offset += size
 
+    batches = []
     fake = SimpleNamespace(
         FileChunks=FileChunks,
         FileStreamer=FileStreamer,
         list_safetensors=lambda root: [f"{root}/{p.name}" for p in tmp_path.glob("*.safetensors")],
         requests=requests,
+        batches=batches,
         instances=instances,
     )
     monkeypatch.setattr(runai_utils, "_sdk", lambda: fake)
@@ -447,3 +450,53 @@ def test_truncated_tensor_does_not_return_partial_weights(sdk, tmp_path):
         pytest.raises(ValueError, match="truncated chunk"),
     ):
         source.get_handle(str(path)).get_slice("weight")[:]
+
+
+@pytest.mark.parametrize("transpose", [False, True])
+@pytest.mark.parametrize("storage_dtype", ["F32", "F8_E4M3"])
+def test_runai_batches_cross_file_experts_and_scales(sdk, tmp_path, transpose, storage_dtype):
+    """Real JAX assembly, duplicate expert placement, and one native I/O batch."""
+    if len(jax.devices()) < 4:
+        pytest.skip("Run with JAX_NUM_CPU_DEVICES=4")
+    mesh = Mesh(np.asarray(jax.devices()[:4]), ("expert",), axis_types=(AxisType.Explicit,))
+    sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("expert", None, None))
+    import ml_dtypes
+
+    dtype = np.float32 if storage_dtype == "F32" else ml_dtypes.float8_e4m3fn
+    weights = [(np.arange(12).reshape(3, 4) + i * 20).astype(dtype) for i in range(3)]
+    for i, weight in enumerate(weights):
+        header = json.dumps(
+            {
+                f"expert.{i}": {
+                    "dtype": storage_dtype,
+                    "shape": [3, 4],
+                    "data_offsets": [0, weight.nbytes],
+                }
+            }
+        ).encode()
+        header += b" " * (-len(header) % 8)
+        (tmp_path / f"{i}.safetensors").write_bytes(
+            struct.pack("<Q", len(header)) + header + weight.tobytes()
+        )
+    with RunaiWeightSource("gs://bucket/model", str(tmp_path)) as source, jax.set_mesh(mesh):
+        config = SimpleNamespace(_runai_weight_source=source, quantization_config=None)
+        loader = WeightLoader(nnx.Module(), config, mesh, jnp.float32)
+        sdk.requests.clear()
+        sdk.batches.clear()
+        actual = loader._create_stacked_moe_lazy_tensor(
+            [f"expert.{i}" for i in range(3)],
+            source.weight_info,
+            source,
+            do_transpose=transpose,
+            target_sharding=sharding,
+            physical_to_logical_map=np.array([2, 0, 2, 1]),
+        )
+        actual.block_until_ready()
+    expected = np.stack([weights[i] for i in [2, 0, 2, 1]])
+    if transpose:
+        expected = expected.transpose(0, 2, 1)
+    np.testing.assert_array_equal(actual, expected)
+    assert actual.sharding == sharding
+    assert len(sdk.batches) == 1
+    assert len(sdk.batches[0]) == 3  # Duplicate logical expert is read once.
+    assert sum(sum(f.chunks) for f in sdk.requests) == sum(w.nbytes for w in weights)

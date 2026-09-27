@@ -257,7 +257,13 @@ class RunaiWeightSource:
                         raise ValueError(f"Invalid safetensors metadata for {key}")
                     meta["offset"] = 8 + size + begin
                     self.weight_info.setdefault(key, []).append(
-                        {"file": path, "shape": tuple(shape), "dtype": meta["dtype"]}
+                        {
+                            "file": path,
+                            "shape": tuple(shape),
+                            "dtype": meta["dtype"],
+                            "byte_offset": meta["offset"],
+                            "byte_size": end - begin,
+                        }
                     )
                 self.handles[path] = _File(self, path, metadata)
         except BaseException:
