@@ -156,6 +156,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             load_config=LoadConfig(
                 load_format=server_args.load_format,
                 download_dir=server_args.download_dir,
+                model_loader_extra_config=server_args.model_loader_extra_config,
                 model_class=model_class,
             ),
             mesh=self.mesh,

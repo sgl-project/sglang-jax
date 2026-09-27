@@ -10,6 +10,7 @@ import struct
 import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -163,6 +164,7 @@ class WeightLoader:
         self.mesh = mesh
         self.dtype = dtype
         self.dummy_mode = getattr(model_config, "_dummy_mode", False)
+        self._runai_weight_source = getattr(model_config, "_runai_weight_source", None)
         self._weight_info_cache: dict[str, list[dict]] | None = None
         if hasattr(model_config, "num_attention_heads"):
             self.num_heads = model_config.num_attention_heads
@@ -1069,6 +1071,10 @@ class WeightLoader:
         Scan all safetensors files to build a mapping from HF key to file info.
         """
         if self._weight_info_cache is not None:
+            return self._weight_info_cache
+
+        if self._runai_weight_source is not None:
+            self._weight_info_cache = self._runai_weight_source.weight_info
             return self._weight_info_cache
 
         # 1. Host 0 does the heavy lifting (Scanning)
@@ -2020,7 +2026,12 @@ class WeightLoader:
         quant_cfg = getattr(self.model_config, "quantization_config", None)
         is_static_quant = quant_cfg is not None and quant_cfg.is_static_checkpoint
 
-        with SequentialSafetensorManager() as file_manager:
+        source_context = (
+            nullcontext(self._runai_weight_source)
+            if self._runai_weight_source is not None
+            else SequentialSafetensorManager()
+        )
+        with source_context as file_manager:
             # 2. Process Regular Weights (Lazy Pull)
             for hf_key, mapping in tqdm(regular_mappings.items(), desc="Loading Regular Weights"):
                 if hf_key not in weight_info:
