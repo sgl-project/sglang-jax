@@ -175,11 +175,10 @@ def test_msa_decode_shard_map_traces(mesh, rpa_stub):
         jax.block_until_ready(out)
 
     assert isinstance(out, tuple) and len(out) == 3, f"expected 3-tuple, got {type(out)}"
-    attn_out, kv_upd, (ik_buf_upd, ikp_upd) = out
+    attn_out, kv_upd, ik_buf_upd = out
     assert attn_out.shape == (BS, Q_HEADS * HEAD_DIM), attn_out.shape
     assert kv_upd.ndim == 5 and kv_upd.shape == pool.kv_buffer[SPARSE_LAYER].shape, kv_upd.shape
     assert ik_buf_upd.shape == pool.index_k_buffer[0].shape, ik_buf_upd.shape
-    assert ikp_upd.shape == pool.index_k_pooled[0].shape, ikp_upd.shape
     # sparse top-k branch rewrites page_indices to (bs_per_dp * TOPK); the
     # dense/skip branch leaves it at (bs_per_dp * PAGES_PER_SEQ). Asserting the
     # former proves the einsum→top_k→sort subgraph was actually traced.
@@ -225,9 +224,8 @@ def test_msa_prefill_shard_map_traces(mesh, rpa_stub):
         jax.block_until_ready(out)
 
     assert len(out) == 3
-    ik_buf_upd, ikp_upd = out[2]
+    ik_buf_upd = out[2]
     assert ik_buf_upd.shape == pool.index_k_buffer[0].shape
-    assert ikp_upd.shape == pool.index_k_pooled[0].shape
 
 
 # ---------------------------------------------------------------------------
@@ -311,9 +309,7 @@ def test_msa_full_integration_trace(mesh, rpa_stub):
         o, kv_upd, ik_upd = out
         assert o.shape == (BS, HIDDEN_SIZE), o.shape
         assert kv_upd.shape == pool.kv_buffer[SPARSE_LAYER].shape, kv_upd.shape
-        assert isinstance(ik_upd, tuple) and len(ik_upd) == 2
-        assert ik_upd[0].shape == pool.index_k_buffer[0].shape
-        assert ik_upd[1].shape == pool.index_k_pooled[0].shape
+        assert ik_upd.shape == pool.index_k_buffer[0].shape
 
         # 2. MemoryPools wrapper: pytree-registered, contains msa_index_k proxy
         mp = _build_non_hybrid_memory_pools(pool)
@@ -331,5 +327,148 @@ def test_msa_full_integration_trace(mesh, rpa_stub):
                 "msa_index_k": [ik_upd],
             }
         )
-        assert pool.index_k_buffer[0] is ik_upd[0]
-        assert pool.index_k_pooled[0] is ik_upd[1]
+        assert pool.index_k_buffer[0] is ik_upd
+
+
+# ---------------------------------------------------------------------------
+# Per-head selection through the real backend path: tensor rank t owns KV head t
+# and must build its page table from index head t only (M3 contract).
+# ---------------------------------------------------------------------------
+PH_POOL_SIZE = 128 * 40  # 42 pages total -> 21 per data shard; enough distinct pages
+PH_SEQ_LENS = np.array([900, 1000, 950, 1020], dtype=np.int32)  # 8 blocks each
+PH_A, PH_B = 1, 5  # logical blocks head0 / head1 prefer
+
+
+def _ph_phys(b_local, j):
+    """Physical (per-data-shard) page for local req b, logical block j; avoids page 0."""
+    return 1 + b_local * PAGES_PER_SEQ + j
+
+
+@pytest.fixture
+def rpa_stub_pages(monkeypatch):
+    """RPA stub that smuggles this rank's page_indices out through the attention
+    output (row 0, local head 0, first columns) so the test can read the
+    per-rank selection after shard_map."""
+    from sgl_jax.srt.layers.attention import flashattention_backend as fab
+
+    def _stub(q, k, v, kv_cache, kv_lens, page_indices, *_args, **_kwargs):
+        out = jnp.zeros_like(q)
+        n = page_indices.shape[0]
+        return out.at[0, 0, :n].set(page_indices.astype(q.dtype)), kv_cache
+
+    monkeypatch.setattr(fab, "ragged_paged_attention_v3", _stub)
+    yield
+
+
+def _ph_metadata(mesh):
+    from sgl_jax.srt.layers.attention.flashattention_backend import (
+        FlashAttentionMetadata,
+    )
+
+    dp, per_dp_bs = 2, BS // 2
+    md = FlashAttentionMetadata()
+    md.seq_lens = _shard(mesh, PH_SEQ_LENS, P("data"))
+    md.cu_q_lens = _shard(mesh, np.tile(np.arange(per_dp_bs + 1, dtype=np.int32), dp), P("data"))
+    aligned = ((PH_SEQ_LENS + PAGE_SIZE - 1) // PAGE_SIZE) * PAGE_SIZE
+    cu_kv = np.zeros((dp, per_dp_bs + 1), dtype=np.int32)
+    cu_kv[:, 1:] = np.cumsum(aligned.reshape(dp, per_dp_bs), axis=1)
+    md.cu_kv_lens = _shard(mesh, cu_kv.ravel(), P("data"))
+    pi = np.zeros((dp, per_dp_bs * PAGES_PER_SEQ), dtype=np.int32)
+    for d in range(dp):
+        for b in range(per_dp_bs):
+            for j in range(PAGES_PER_SEQ):
+                pi[d, b * PAGES_PER_SEQ + j] = _ph_phys(b, j)
+    md.page_indices = _shard(mesh, pi.ravel(), P("data"))
+    md.swa_page_indices = None
+    md.distribution = _shard(mesh, np.full(dp * 3, per_dp_bs, dtype=np.int32), P("data"))
+    md.custom_mask = None
+    return md
+
+
+@pytest.mark.unit
+def test_msa_decode_per_rank_head_selection(mesh, rpa_stub_pages):
+    from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
+    from sgl_jax.srt.layers.radix_attention import RadixAttention
+    from sgl_jax.srt.mem_cache.memory_pool import MSATokenToKVPool
+    from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+
+    dp, per_dp_bs, tp = 2, BS // 2, 2
+    with jax.set_mesh(mesh):
+        pool = MSATokenToKVPool(
+            sparse_layer_ids=[SPARSE_LAYER],
+            index_head_dim=IDX_DIM,
+            size=PH_POOL_SIZE,
+            page_size=PAGE_SIZE,
+            dtype=jnp.bfloat16,
+            head_num=KV_HEADS,
+            head_dim=HEAD_DIM,
+            layer_num=LAYER_NUM,
+            mesh=mesh,
+            dp_size=dp,
+        )
+        n_pages_local = pool.index_k_buffer[0].shape[0] // dp
+        # index_k for physical page p (same on both data shards): unit vector along dim p
+        ik_np = np.zeros((dp * n_pages_local, PAGE_SIZE, 1, IDX_DIM), np.float32)
+        for d in range(dp):
+            for p in range(n_pages_local):
+                ik_np[d * n_pages_local + p, :, 0, p % IDX_DIM] = 1.0
+        pool.index_k_buffer[0] = _shard(
+            mesh, ik_np.astype(np.dtype("bfloat16")), P("data", None, None, None)
+        )
+        # index_q: head0 likes block A / dislikes B, head1 the opposite (per local req)
+        iq_np = np.zeros((BS, IDX_HEADS, IDX_DIM), np.float32)
+        for d in range(dp):
+            for b in range(per_dp_bs):
+                g = d * per_dp_bs + b
+                a, bb = _ph_phys(b, PH_A) % IDX_DIM, _ph_phys(b, PH_B) % IDX_DIM
+                iq_np[g, 0, a], iq_np[g, 0, bb] = 1.0, -1.0
+                iq_np[g, 1, bb], iq_np[g, 1, a] = 1.0, -1.0
+        backend = FlashAttention(Q_HEADS, KV_HEADS, HEAD_DIM, page_size=PAGE_SIZE, mesh=mesh)
+        backend.forward_metadata = _ph_metadata(mesh)
+        layer = RadixAttention(Q_HEADS, HEAD_DIM, HEAD_DIM**-0.5, KV_HEADS, layer_id=SPARSE_LAYER)
+        # decode token slot = last token of each req, inside its own (local) page
+        out_loc = np.array(
+            [
+                _ph_phys(g % per_dp_bs, (PH_SEQ_LENS[g] - 1) // PAGE_SIZE) * PAGE_SIZE
+                + (PH_SEQ_LENS[g] - 1) % PAGE_SIZE
+                for g in range(BS)
+            ],
+            dtype=np.int32,
+        )
+        fb = ForwardBatch(
+            bid=0,
+            forward_mode=ForwardMode.DECODE,
+            batch_size=BS,
+            input_ids=jnp.zeros((BS,), dtype=jnp.int32),
+            req_pool_indices=jnp.arange(BS, dtype=jnp.int32),
+            seq_lens=_shard(mesh, PH_SEQ_LENS, P("data")),
+            out_cache_loc=_shard(mesh, out_loc, P("data")),
+        )
+        q = _shard(mesh, np.zeros((BS, Q_HEADS, HEAD_DIM), np.float32), P("data", "tensor"))
+        k = _shard(mesh, np.zeros((BS, KV_HEADS, HEAD_DIM), np.float32), P("data", "tensor"))
+        v = _shard(mesh, np.zeros((BS, KV_HEADS, HEAD_DIM), np.float32), P("data", "tensor"))
+        ik = _shard(mesh, np.zeros((BS, 1, IDX_DIM), np.float32), P("data", None, None))
+        iq = _shard(mesh, iq_np, P("data", None, None))
+        attn_out, _, _ = backend(
+            q, k, v, layer, fb, pool, index_q=iq, index_k=ik, msa_topk=TOPK, msa_local_blocks=1
+        )
+        attn_out = np.asarray(jax.block_until_ready(attn_out))  # [BS, Q_HEADS*HEAD_DIM]
+
+    heads_per_rank = Q_HEADS // tp
+    n_pi = per_dp_bs * TOPK
+    for d in range(dp):
+        for t in range(tp):
+            pages = attn_out[d * per_dp_bs, t * heads_per_rank * HEAD_DIM :][:n_pi].astype(int)
+            pages = pages.reshape(per_dp_bs, TOPK)
+            for b in range(per_dp_bs):
+                want, avoid = (PH_A, PH_B) if t == 0 else (PH_B, PH_A)
+                sel = set(pages[b].tolist())
+                assert (
+                    _ph_phys(b, want) in sel
+                ), f"dp{d} rank{t} req{b}: head{t} lost block {want}: {sel}"
+                assert (
+                    _ph_phys(b, avoid) not in sel
+                ), f"dp{d} rank{t} req{b}: got other head's block: {sel}"
+                assert (
+                    _ph_phys(b, (PH_SEQ_LENS[d * per_dp_bs + b] - 1) // PAGE_SIZE) in sel
+                ), "local block"

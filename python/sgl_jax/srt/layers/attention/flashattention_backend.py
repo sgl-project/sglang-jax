@@ -1,5 +1,4 @@
 import logging
-import os
 from dataclasses import dataclass
 
 import jax
@@ -864,8 +863,7 @@ class FlashAttention(AttentionBackend):
             attention_sink,
         )
 
-        _MSA_POOLED = os.environ.get("SGLANG_MSA_POOLED", "0") == "1"
-        is_msa = index_k is not None and hasattr(token_to_kv_pool, "get_index_k_buffer")
+        is_msa = index_k is not None and hasattr(token_to_kv_pool, "sparse_layer_ids")
         if not is_msa:
             attn_output, updated_kv_cache_fused = jax.shard_map(
                 _ragged_paged_attention_with_fused_kv,
@@ -877,18 +875,16 @@ class FlashAttention(AttentionBackend):
 
         # --- MSA layer: per-DP-local index_k write + (decode) topk page selection ---
         ik_buf = token_to_kv_pool.get_index_k_buffer(layer.layer_id)
-        ik_pooled = token_to_kv_pool.get_index_k_pooled(layer.layer_id)
         is_decode = forward_batch.forward_mode.is_decode()
         page_size = self.page_size
         data = self.attention_data_partition_axis
         msa_in_specs = in_specs + (
             P(data, None, None, None),  # ik_buf [pages, ps, 1, d_idx]
-            P(data, None, None),  # ik_pooled [pages, 1, d_idx]
             P(data, None, None),  # index_q [bs, H_idx, d_idx]
             P(data, None, None),  # index_k [bs, 1, d_idx]
             P(data),  # out_cache_loc [bs]
         )
-        msa_out_specs = out_specs + (P(data, None, None, None), P(data, None, None))
+        msa_out_specs = out_specs + (P(data, None, None, None),)
 
         def _msa_inner(*args):
             (
@@ -904,7 +900,6 @@ class FlashAttention(AttentionBackend):
                 custom_mask,
                 attn_sink,
                 ik_buf_l,
-                ikp_l,
                 iq_l,
                 ik_new_l,
                 out_loc_l,
@@ -943,18 +938,6 @@ class FlashAttention(AttentionBackend):
                     unique_indices=False,
                     mode="promise_in_bounds",
                 ).reshape(ik_buf_l.shape)
-            # 1b. update per-block element-wise-max pool. slot==0 means this token
-            #     opens a fresh page (possibly reused from a freed req) so the
-            #     stale pooled value must be discarded, not max-ed against.
-            if is_decode:
-                ikp_prev = ikp_l[q_page, 0]
-                ikp_new = jnp.where(
-                    (slot_in_page == 0)[:, None], ik_cast, jnp.maximum(ikp_prev, ik_cast)
-                )
-                ikp_upd = ikp_l.at[q_page, 0].set(ikp_new)
-            else:
-                neg_inf = jnp.finfo(ikp_l.dtype).min
-                ikp_upd = ikp_l.at[q_page, 0].set(neg_inf).at[q_page, 0].max(ik_cast)
             bs_l = kv_lens.shape[0]
             assert page_indices.shape[0] % bs_l == 0
             pages_per_seq = page_indices.shape[0] // bs_l
@@ -971,22 +954,27 @@ class FlashAttention(AttentionBackend):
                 gidx = jnp.minimum(cu_pages[:, None] + col[None, :], page_indices.shape[0] - 1)
                 pi_2d = page_indices[gidx]
                 n_blocks_v = (kv_lens + page_size - 1) // page_size
-                if _MSA_POOLED:
-                    # P0a approximate: gather pooled ik (O(n_blocks))
-                    ikp_seq = ikp_upd[pi_2d][:, :, 0]
-                    bscores = jnp.einsum(
-                        "bhd,bnd->bhn", iq_l.astype(jnp.float32), ikp_seq.astype(jnp.float32)
-                    ).max(1)
-                else:
-                    # v2 exact: page-level einsum, bf16 in / f32 accum (no f32
-                    # materialization of ik_hist). The last (q_block) block's
-                    # zero-padded tail contributes score=0 to its max, but that
-                    # block is force-selected as local anyway.
-                    ik_pages = ik_buf_upd[pi_2d][:, :, :, 0]  # [bs, n_pages, ps, d] bf16
-                    s_tok = jnp.einsum(
-                        "bhd,bnpd->bhnp", iq_l, ik_pages, preferred_element_type=jnp.float32
-                    )
-                    bscores = s_tok.max(-1).max(1)
+                # Per-head selection (M3 contract; cf. HF transformers #46719): each
+                # index head selects its own top-k blocks for its KV/GQA group. On
+                # this backend every tensor rank owns exactly one KV head (startup
+                # validation enforces tp % n_kv == 0, tp >= n_kv), KV heads are
+                # repeat-replicated across the tensor axis (weight_utils.
+                # replicate_kv_heads) and q heads are sharded contiguously, so
+                # tensor rank r <-> original KV/index head (r * n_idx) // tp. Scoring
+                # with that head alone makes this rank's page table the per-head
+                # selection, and RPA runs unchanged on it.
+                n_idx = iq_l.shape[1]
+                tp_n = self.mesh.shape[self.kv_partition_axis]
+                head = (jax.lax.axis_index(self.kv_partition_axis) * n_idx) // tp_n
+                iq_h = jax.lax.dynamic_index_in_dim(iq_l, head, axis=1, keepdims=False)
+                # Exact page-level scores, bf16 in / f32 accum. The last (q_block)
+                # block's zero-padded tail contributes score=0 to its max, but that
+                # block is force-selected as local anyway.
+                ik_pages = ik_buf_upd[pi_2d][:, :, :, 0]  # [bs, n_pages, ps, d] bf16
+                s_tok = jnp.einsum(
+                    "bd,bnpd->bnp", iq_h, ik_pages, preferred_element_type=jnp.float32
+                )
+                bscores = s_tok.max(-1)  # [bs, n_pages], per-head (no head collapse)
                 block_mask = jnp.arange(pages_per_seq)[None, :] < n_blocks_v[:, None]
                 bscores = jnp.where(block_mask, bscores, -jnp.inf)
                 q_block = (kv_lens - 1) // page_size
@@ -1028,16 +1016,16 @@ class FlashAttention(AttentionBackend):
                     layer.xai_temperature_len if layer.xai_temperature_len > 0 else None
                 ),
             )
-            return result, kv_upd, ik_buf_upd, ikp_upd
+            return result, kv_upd, ik_buf_upd
 
-        attn_output, updated_kv_cache_fused, updated_ik, updated_ikp = jax.shard_map(
+        attn_output, updated_kv_cache_fused, updated_ik = jax.shard_map(
             _msa_inner, in_specs=msa_in_specs, out_specs=msa_out_specs, check_vma=False
-        )(*rpa_args, ik_buf, ik_pooled, index_q, index_k, forward_batch.out_cache_loc)
+        )(*rpa_args, ik_buf, index_q, index_k, forward_batch.out_cache_loc)
 
         return (
             attn_output.reshape(q.shape[0], -1),
             updated_kv_cache_fused,
-            (updated_ik, updated_ikp),
+            updated_ik,
         )
 
     def _get_fused_kv_cache(

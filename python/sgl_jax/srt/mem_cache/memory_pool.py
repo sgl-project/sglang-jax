@@ -798,10 +798,8 @@ class MSATokenToKVPool(MHATokenToKVPool):
         super()._create_buffers(abstract=abstract)
         num_pages = (self.size + self.page_size * self.dp_size) // self.page_size
         ik_shape = (num_pages, self.page_size, 1, self.index_head_dim)
-        ikp_shape = (num_pages, 1, self.index_head_dim)
         data = self.attention_data_partition_axis
         ik_sharding = NamedSharding(self.mesh, P(data, None, None, None))
-        ikp_sharding = NamedSharding(self.mesh, P(data, None, None))
         n_sparse = len(self.sparse_layer_ids)
         if abstract:
             # Offline/AOT descriptor path (mirrors MHATokenToKVPool): shapes only.
@@ -809,24 +807,10 @@ class MSATokenToKVPool(MHATokenToKVPool):
                 jax.ShapeDtypeStruct(ik_shape, self.dtype, sharding=ik_sharding)
                 for _ in range(n_sparse)
             ]
-            self.index_k_pooled = [
-                jax.ShapeDtypeStruct(ikp_shape, self.dtype, sharding=ikp_sharding)
-                for _ in range(n_sparse)
-            ]
             return
         with self.mesh:
             self.index_k_buffer = [
                 jax.jit(lambda: jnp.zeros(ik_shape, dtype=self.dtype), out_shardings=ik_sharding)()
-                for _ in range(len(self.sparse_layer_ids))
-            ]
-            # Per-block element-wise-max pooled ik. Reset to -inf so first token's
-            # ik becomes the pool value (scatter-max). Approximates max_t(iq·ik_t)
-            # by iq·max_t(ik_t); exact when iq>=0, approximate post-RoPE.
-            self.index_k_pooled = [
-                jax.jit(
-                    lambda: jnp.full(ikp_shape, -jnp.inf, dtype=self.dtype),
-                    out_shardings=ikp_sharding,
-                )()
                 for _ in range(len(self.sparse_layer_ids))
             ]
         ik_gb = num_pages * self.page_size * self.index_head_dim * jnp.dtype(self.dtype).itemsize
@@ -850,19 +834,13 @@ class MSATokenToKVPool(MHATokenToKVPool):
     def get_index_k_buffer(self, layer_id: int) -> jax.Array:
         return self.index_k_buffer[self._ik_idx(layer_id)]
 
-    def get_index_k_pooled(self, layer_id: int) -> jax.Array:
-        return self.index_k_pooled[self._ik_idx(layer_id)]
-
     def replace_index_k_buffer(self, ik_updates: list) -> None:
         for i, upd in enumerate(ik_updates):
-            if isinstance(upd, tuple):
-                self.index_k_buffer[i], self.index_k_pooled[i] = upd
-            else:
-                self.index_k_buffer[i] = upd
+            self.index_k_buffer[i] = upd
 
     def tree_flatten(self):
         children, aux = super().tree_flatten()
-        children = (self.index_k_buffer, self.index_k_pooled) + children
+        children = (self.index_k_buffer,) + children
         aux = {
             **aux,
             "sparse_layer_ids": self.sparse_layer_ids,
@@ -872,11 +850,10 @@ class MSATokenToKVPool(MHATokenToKVPool):
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
-        index_k_buffer, index_k_pooled = children[0], children[1]
-        obj = super().tree_unflatten(aux_data, children[2:])
+        index_k_buffer = children[0]
+        obj = super().tree_unflatten(aux_data, children[1:])
         obj.__class__ = cls
         obj.index_k_buffer = index_k_buffer
-        obj.index_k_pooled = index_k_pooled
         obj.sparse_layer_ids = aux_data["sparse_layer_ids"]
         obj.index_head_dim = aux_data["index_head_dim"]
         obj._sparse_map = {g: i for i, g in enumerate(obj.sparse_layer_ids)}

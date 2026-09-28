@@ -7,47 +7,89 @@ from sgl_jax.srt.models.minimax_m3 import msa_block_topk
 
 
 def _ref_msa_block_topk(iq, ik_hist, seq_len, q_pos, block_size, topk, local_blocks):
-    """NumPy reference matching HF modular_minimax_m3_vl.py Indexer.forward
-    (single query, single batch). Returns sorted topk block indices."""
+    """NumPy reference of the corrected M3 indexer (per index head; HF
+    transformers #46719, MiniMax MSA reference): block max-pool over tokens,
+    local-block boost, top-k per head. Returns (list of per-head index arrays,
+    n_valid)."""
     H, D = iq.shape
     L = ik_hist.shape[0]
     n_blocks = L // block_size
     scores = iq.astype(np.float64) @ ik_hist.astype(np.float64).T  # [H, L]
     scores[:, seq_len:] = -np.inf  # causal: only past tokens
-    block_scores = scores.reshape(H, n_blocks, block_size).max(-1).max(0)  # [n_blocks]
+    block_scores = scores.reshape(H, n_blocks, block_size).max(-1)  # [H, n_blocks]
     q_block = q_pos // block_size
     for j in range(local_blocks):
-        block_scores[max(q_block - j, 0)] = np.inf
+        block_scores[:, max(q_block - j, 0)] = np.inf
     k = min(topk, n_blocks)
-    idx = np.argpartition(-block_scores, k - 1)[:k]
-    idx = idx[np.argsort(-block_scores[idx])]
     n_valid = min((seq_len + block_size - 1) // block_size, topk)
-    return idx[:n_valid], n_valid
+    out = []
+    for h in range(H):
+        idx = np.argpartition(-block_scores[h], k - 1)[:k]
+        idx = idx[np.argsort(-block_scores[h][idx])]
+        out.append(idx[:n_valid])
+    return out, n_valid
+
+
+def _run(iq, ik, seq_len, q_pos, B, K, LB):
+    return jax.jit(msa_block_topk, static_argnames=("block_size", "topk", "local_blocks"))(
+        jnp.asarray(iq), jnp.asarray(ik), seq_len, q_pos, block_size=B, topk=K, local_blocks=LB
+    )
 
 
 @pytest.mark.unit
 @pytest.mark.parametrize("seq_len,q_pos", [(384, 383), (1024, 1023), (130, 129)])
-def test_msa_block_topk_matches_ref(seq_len, q_pos):
+def test_msa_block_topk_matches_ref_per_head(seq_len, q_pos):
     rng = np.random.default_rng(42 + seq_len)
     H, D, L_pad, B, K, LB = 4, 128, 1024, 128, 16, 1
     iq = rng.standard_normal((H, D)).astype(np.float32)
     ik = rng.standard_normal((L_pad, D)).astype(np.float32)
     ik[seq_len:] = 0
-
-    out_idx, out_nv = jax.jit(
-        msa_block_topk, static_argnames=("block_size", "topk", "local_blocks")
-    )(jnp.asarray(iq), jnp.asarray(ik), seq_len, q_pos, block_size=B, topk=K, local_blocks=LB)
-    ref_idx, ref_nv = _ref_msa_block_topk(iq, ik, seq_len, q_pos, B, K, LB)
-
+    out_idx, out_nv = _run(iq, ik, seq_len, q_pos, B, K, LB)
+    ref, ref_nv = _ref_msa_block_topk(iq, ik, seq_len, q_pos, B, K, LB)
+    assert out_idx.shape == (H, K)
     assert int(out_nv) == ref_nv
-    out_valid = sorted(np.asarray(out_idx)[:ref_nv].tolist())
-    ref_valid = sorted(ref_idx.tolist())
-    assert out_valid == ref_valid, f"jax={out_valid} ref={ref_valid}"
+    for h in range(H):
+        got = sorted(np.asarray(out_idx)[h, :ref_nv].tolist())
+        assert got == sorted(ref[h].tolist()), f"head {h}: jax={got} ref={sorted(ref[h].tolist())}"
+
+
+@pytest.mark.unit
+def test_msa_per_head_selection_not_shared():
+    """Heads with distinct preferences must get distinct block sets; a
+    head-collapsed (max over heads) selection would hand every head the same
+    list and drop each head's own preferred blocks (HF #46762 symptom)."""
+    H, D, B, LB = 4, 64, 128, 1
+    n_blocks, K = 18, 16
+    L = n_blocks * B
+    ik = np.zeros((L, D), np.float32)
+    # block b carries a unit key along dim b (b < D); block 0..17 -> dims 0..17
+    for b in range(n_blocks):
+        ik[b * B : (b + 1) * B, b] = 1.0
+    # head h strongly prefers blocks {h, h+4, h+8, h+12} (disjoint across heads)
+    # and mildly dislikes everything else, so the sets cannot coincide.
+    iq = np.full((H, D), -0.1, np.float32)
+    for h in range(H):
+        iq[h, [h, h + 4, h + 8, h + 12]] = 1.0
+    seq_len, q_pos = L, L - 1
+    out_idx, out_nv = _run(iq, ik, seq_len, q_pos, B, K, LB)
+    ref, ref_nv = _ref_msa_block_topk(iq, ik, seq_len, q_pos, B, K, LB)
+    assert int(out_nv) == ref_nv == K
+    sel = [set(np.asarray(out_idx)[h, :K].tolist()) for h in range(H)]
+    for h in range(H):
+        assert sel[h] == set(ref[h].tolist()), f"head {h}"
+        assert {h, h + 4, h + 8, h + 12} <= sel[h], f"head {h} lost its preferred blocks"
+    # distinct heads, distinct selections (K=16 of 18 blocks leaves room to differ)
+    assert len({frozenset(x) for x in sel}) > 1
+    # and the head-collapsed variant is NOT what per-head selection produces
+    shared = set(np.argsort(-(iq @ ik.T).reshape(H, n_blocks, B).max(-1).max(0))[:K].tolist()) | {
+        q_pos // B
+    }
+    assert any(sel[h] != shared for h in range(H))
 
 
 @pytest.mark.unit
 def test_msa_degenerate_selects_all():
-    """seq_len <= topk*block_size: topk should select all valid blocks (= dense)."""
+    """seq_len <= topk*block_size: topk should select all valid blocks (= dense), every head."""
     rng = np.random.default_rng(7)
     iq = rng.standard_normal((4, 128)).astype(np.float32)
     ik = rng.standard_normal((2048, 128)).astype(np.float32)
@@ -62,38 +104,22 @@ def test_msa_degenerate_selects_all():
         local_blocks=1,
     )
     assert int(out_nv) == 5
-    assert sorted(np.asarray(out_idx)[:5].tolist()) == [0, 1, 2, 3, 4]
+    for h in range(4):
+        assert sorted(np.asarray(out_idx)[h, :5].tolist()) == [0, 1, 2, 3, 4]
 
 
 @pytest.mark.unit
 def test_msa_local_block_always_selected():
-    rng = np.random.default_rng(9)
-    iq = rng.standard_normal((4, 128)).astype(np.float32) * 0.01  # tiny scores
+    rng = np.random.default_rng(11)
+    iq = rng.standard_normal((4, 128)).astype(np.float32)
     ik = rng.standard_normal((4096, 128)).astype(np.float32)
-    ik[3800:3900] *= 1000  # one block dominates
-    seq_len, q_pos = 4096, 4095
+    ik[3000:] = 0
+    q_pos = 2999
     out_idx, _ = msa_block_topk(
-        jnp.asarray(iq),
-        jnp.asarray(ik),
-        seq_len,
-        q_pos,
-        block_size=128,
-        topk=16,
-        local_blocks=1,
+        jnp.asarray(iq), jnp.asarray(ik), 3000, q_pos, block_size=128, topk=16, local_blocks=1
     )
-    assert (q_pos // 128) in np.asarray(out_idx).tolist()
-
-
-def _pooled_topk(iq, ik_hist, seq_len, *, block_size, topk, local_blocks):
-    n_blocks = ik_hist.shape[0] // block_size
-    ik_pooled = ik_hist.reshape(n_blocks, block_size, -1).max(1)
-    bscores = np.einsum("hd,nd->hn", iq, ik_pooled).max(0)
-    n_valid = (seq_len + block_size - 1) // block_size
-    bscores[n_valid:] = -np.inf
-    q_block = (seq_len - 1) // block_size
-    for j in range(local_blocks):
-        bscores[max(q_block - j, 0)] = np.inf
-    return set(np.argsort(-bscores)[:topk].tolist())
+    for h in range(4):
+        assert (q_pos // 128) in np.asarray(out_idx)[h].tolist(), f"head {h}"
 
 
 @pytest.mark.unit
@@ -141,33 +167,3 @@ def test_pi_2d_ragged_layout(seq_lens):
         assert not np.array_equal(
             broken[1, : aligned[1] // page_size], np.arange(1600, 1600 + aligned[1] // page_size)
         ), "reshape should be wrong for bs>1 ragged (regression sentinel)"
-
-
-def test_pooled_topk_recovers_outlier_block():
-    """P0 approximation: element-wise-max-pooled ik must still rank a block
-    containing one strongly-correlated outlier token (the needle) into topk.
-    This is the property needle@64K relies on, not mean-overlap."""
-    rng = np.random.default_rng(42)
-    H, D, BS, L, TOPK = 4, 128, 128, 8192, 16
-    for trial in range(10):
-        iq = rng.standard_normal((H, D)).astype(np.float32)
-        ik = rng.standard_normal((L, D)).astype(np.float32) * 0.3
-        needle_tok = int(rng.integers(0, L - BS))
-        ik[needle_tok] = iq[0] * 5.0  # strongly correlated with q (the needle)
-        exact_idx, _ = msa_block_topk(
-            jnp.asarray(iq),
-            jnp.asarray(ik),
-            jnp.int32(L),
-            jnp.int32(L - 1),
-            block_size=BS,
-            topk=TOPK,
-            local_blocks=1,
-        )
-        exact = set(np.asarray(exact_idx).tolist())
-        pooled = _pooled_topk(iq, ik, L, block_size=BS, topk=TOPK, local_blocks=1)
-        needle_block = needle_tok // BS
-        assert needle_block in exact, f"trial {trial}: exact missed needle (sanity)"
-        assert needle_block in pooled, (
-            f"trial {trial}: pooled approx missed needle block {needle_block}, "
-            f"overlap={len(exact & pooled)}/{TOPK}"
-        )

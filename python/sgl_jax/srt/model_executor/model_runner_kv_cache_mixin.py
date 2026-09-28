@@ -383,7 +383,7 @@ class ModelRunnerKVCacheMixin:
         sa = getattr(self.model_config.hf_text_config, "sparse_attention_config", None)
         if isinstance(sa, dict) and sa.get("use_sparse_attention"):
             n_sparse = sum(1 for f in sa["sparse_attention_freq"] if f)
-            # ik_buf: 1 head, not tensor-sharded; ik_pooled: same shape per-page (1/page_size per-token)
+            # ik_buf: 1 index-k head per token, not tensor-sharded
             main_kv += n_sparse * align128(sa["sparse_index_dim"]) * dtype_size
         return main_kv
 
@@ -764,6 +764,15 @@ class ModelRunnerKVCacheMixin:
                     raise ValueError(
                         "MSA models require --attention-backend fa; "
                         f"got {self.server_args.attention_backend!r}."
+                    )
+                n_idx = int(sa["sparse_num_index_heads"])
+                n_kv = int(self.model_config.get_total_num_kv_heads())
+                tp_attn = int(self.attention_tp_size)
+                if n_idx != n_kv or tp_attn < n_idx or tp_attn % n_idx != 0:
+                    raise ValueError(
+                        "MSA per-head block selection requires one KV/GQA group per "
+                        f"tensor rank: sparse_num_index_heads={n_idx}, num_kv_heads={n_kv}, "
+                        f"attention tp={tp_attn}. Use a tp that is a multiple of {n_kv}."
                     )
                 from sgl_jax.srt.mem_cache.memory_pool import MSATokenToKVPool
 
