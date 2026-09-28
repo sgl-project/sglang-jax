@@ -110,7 +110,8 @@ def test_nested_config_preserves_lm_head_policy(monkeypatch, enable_dp_lm_head, 
         ("data", "tensor"),
         axis_types=(AxisType.Explicit, AxisType.Explicit),
     )
-    model = nnx.eval_shape(lambda: KimiK25ForConditionalGeneration(config=config, mesh=mesh))
+    with jax.set_mesh(mesh):
+        model = nnx.eval_shape(lambda: KimiK25ForConditionalGeneration(config=config, mesh=mesh))
 
     enabled = bool(enable_dp_lm_head)
     axes = ("tensor", None) if enabled else (("data", "tensor"), None)

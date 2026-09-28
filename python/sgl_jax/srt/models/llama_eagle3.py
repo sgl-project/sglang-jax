@@ -17,7 +17,9 @@ import logging
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
+from jax.sharding import PartitionSpec as P
 from transformers import LlamaConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -27,13 +29,13 @@ from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsProcessor
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.model_loader.weights import WeightLoader, WeightSpec
 from sgl_jax.srt.models.llama import (
     LlamaDecoderLayer,
     LlamaForCausalLM,
     LlamaMLP,
     LlamaModel,
 )
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 # Adapted from
 # https://github.com/SafeAILab/EAGLE/blob/main/eagle/model/cnets.py
@@ -214,7 +216,12 @@ class LlamaEagleModel(LlamaModel):
         layers_kv_fused = [kv_fused] if kv_fused is not None else []
         layers_callback_flag: list = []
 
-        return hidden_states_to_logits, [residual], layers_kv_fused, layers_callback_flag
+        return (
+            hidden_states_to_logits,
+            [residual],
+            layers_kv_fused,
+            layers_callback_flag,
+        )
 
 
 class LlamaForCausalLMEagle3(LlamaForCausalLM):
@@ -264,83 +271,88 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
 
         weight_mappings = self._create_llama_ealge3_weight_mappings()
 
-        loader.load_weights_from_safetensors(weight_mappings)
+        loader.load(weight_mappings)
         logger.info("llama EAGLE3 weights loaded successfully!")
 
     def _create_llama_ealge3_weight_mappings(self):
         # mappings = super()._create_llama_weight_mappings()
         mappings = {}
-        mappings["d2t"] = WeightMapping(
+        mappings["d2t"] = WeightSpec(
             target_path="hot_token_ids",
+            sources=("d2t",),
+            optional=True,
+            recipe=lambda inputs: (
+                jax.device_put(
+                    (inputs[0] + np.arange(inputs[0].shape[0])).astype(np.int32),
+                    jax.sharding.NamedSharding(self.mesh, P(None)),
+                ),
+            ),
             sharding=(None,),
             transpose=False,
         )
-        mappings["fc.weight"] = WeightMapping(
+        mappings["fc.weight"] = WeightSpec(
             target_path="model.fc.weight",
             sharding=(None, None),
             transpose=True,
         )
         mappings["lm_head.weight"] = self.lm_head.weight_mapping("lm_head.embedding")
-        mappings["norm.weight"] = WeightMapping(
+        mappings["norm.weight"] = WeightSpec(
             target_path="model.norm.scale",
             sharding=(None,),
             transpose=False,
         )
-        mappings["midlayer.hidden_norm.weight"] = WeightMapping(
+        mappings["midlayer.hidden_norm.weight"] = WeightSpec(
             target_path="model.midlayer.hidden_norm.scale",
             sharding=(None,),
             transpose=False,
         )
-        mappings["midlayer.input_layernorm.weight"] = WeightMapping(
+        mappings["midlayer.input_layernorm.weight"] = WeightSpec(
             target_path="model.midlayer.input_layernorm.scale",
             sharding=(None,),
             transpose=False,
         )
-        mappings["midlayer.mlp.down_proj.weight"] = WeightMapping(
+        mappings["midlayer.mlp.down_proj.weight"] = WeightSpec(
             target_path="model.midlayer.mlp.down_proj.weight",
             sharding=(None, None),
             transpose=True,
         )
-        mappings["midlayer.mlp.gate_proj.weight"] = WeightMapping(
+        mappings["midlayer.mlp.gate_proj.weight"] = WeightSpec(
             target_path="model.midlayer.mlp.gate_proj.weight",
             sharding=(None, None),
             transpose=True,
         )
-        mappings["midlayer.mlp.up_proj.weight"] = WeightMapping(
+        mappings["midlayer.mlp.up_proj.weight"] = WeightSpec(
             target_path="model.midlayer.mlp.up_proj.weight",
             sharding=(None, None),
             transpose=True,
         )
-        mappings["midlayer.post_attention_layernorm.weight"] = WeightMapping(
+        mappings["midlayer.post_attention_layernorm.weight"] = WeightSpec(
             target_path="model.midlayer.post_attention_layernorm.scale",
             sharding=(None,),
             transpose=False,
         )
-        mappings["midlayer.self_attn.q_proj.weight"] = WeightMapping(
+        mappings["midlayer.self_attn.q_proj.weight"] = WeightSpec(
             target_path="model.midlayer.self_attn.q_proj.weight",
             sharding=(None, "tensor"),
             transpose=True,
             head_dim_padding=False,
             kv_head_padding=False,
-            is_eagle3=True,
         )
-        mappings["midlayer.self_attn.k_proj.weight"] = WeightMapping(
+        mappings["midlayer.self_attn.k_proj.weight"] = WeightSpec(
             target_path="model.midlayer.self_attn.k_proj.weight",
             sharding=(None, "tensor"),
             transpose=True,
             head_dim_padding=False,
             kv_head_padding=True,
-            is_eagle3=True,
         )
-        mappings["midlayer.self_attn.v_proj.weight"] = WeightMapping(
+        mappings["midlayer.self_attn.v_proj.weight"] = WeightSpec(
             target_path="model.midlayer.self_attn.v_proj.weight",
             sharding=(None, "tensor"),
             transpose=True,
             head_dim_padding=False,
             kv_head_padding=True,
-            is_eagle3=True,
         )
-        mappings["midlayer.self_attn.o_proj.weight"] = WeightMapping(
+        mappings["midlayer.self_attn.o_proj.weight"] = WeightSpec(
             target_path="model.midlayer.self_attn.o_proj.weight",
             sharding=("tensor", None),
             transpose=True,
@@ -348,7 +360,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
             kv_head_padding=False,
         )
         if getattr(self.config, "bias", False):
-            mappings["model.fc.bias"] = WeightMapping(
+            mappings["model.fc.bias"] = WeightSpec(
                 target_path="model.fc.value.bias",
                 sharding=(None,),
             )

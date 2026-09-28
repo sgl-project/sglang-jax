@@ -4,10 +4,8 @@ import glob
 import inspect
 import logging
 import os
-import time
 from abc import ABC, abstractmethod
 from collections.abc import Generator
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import huggingface_hub
@@ -200,55 +198,6 @@ class JAXModelLoader(DefaultModelLoader):
         hf_folder = self._prepare_weights(source.model_or_path, source.revision)
         return hf_folder
 
-    @staticmethod
-    def _warmup_safetensors_cache(model_config: ModelConfig):
-        """Pre-read safetensors files to warm GCSFuse cache."""
-        model_path = model_config.model_path
-        try:
-            with open("/proc/mounts") as fp:
-                mounts = [line.split() for line in fp]
-            mount = max(
-                (
-                    mount
-                    for mount in mounts
-                    if model_path == mount[1] or model_path.startswith(mount[1].rstrip("/") + "/")
-                ),
-                key=lambda mount: len(mount[1]),
-            )
-            if "fuse" not in mount[2]:
-                logger.info("model_path on %s mount, skipping GCSFuse warm-up", mount[2])
-                return
-        except Exception:
-            logger.warning("Failed to detect model_path mount type; skipping GCSFuse warm-up")
-            return
-
-        st_files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
-        if not st_files:
-            return
-
-        total_size = sum(os.path.getsize(path) for path in st_files)
-        logger.info(
-            "Warming up GCSFuse cache: %d files, %.1f GB",
-            len(st_files),
-            total_size / 1024**3,
-        )
-
-        def _read_file(path):
-            buf = bytearray(4 * 1024 * 1024)
-            with open(path, "rb") as fp:
-                while fp.readinto(buf):
-                    pass
-
-        t0 = time.time()
-        with ThreadPoolExecutor(max_workers=min(8, len(st_files))) as executor:
-            list(executor.map(_read_file, st_files))
-        t1 = time.time()
-        logger.info(
-            "GCSFuse cache warm-up done: %.1fs (%.0f MB/s)",
-            t1 - t0,
-            total_size / 1024**2 / (t1 - t0) if t1 > t0 else 0,
-        )
-
     def load_model(
         self,
         model_config: ModelConfig,
@@ -262,14 +211,15 @@ class JAXModelLoader(DefaultModelLoader):
             model_config = copy.copy(model_config)
 
         model_config.model_path = hf_folder
-        self._warmup_safetensors_cache(model_config)
         # Initialize JAX model
         model = self._initialize_model(model_config)
 
-        # Load weights
-        jit_model = self._get_model(model, model_config)
+        from sgl_jax.srt.model_loader.weights import LocalSource
 
-        return jit_model
+        config = copy.copy(model_config)
+        with LocalSource(config, warmup=True) as source:
+            config._weight_source = source
+            return self._get_model(model, config)
 
     def _initialize_model(self, model_config: ModelConfig) -> Any:
         if not isinstance(model_config, ModelConfig) or self.load_config.model_class is not None:
@@ -305,6 +255,18 @@ class JAXModelLoader(DefaultModelLoader):
         model = _prepare_static_quantization(model_config, model)
         model.load_weights(model_config)
 
+        missing = [
+            jax.tree_util.keystr(path)
+            for path, value in jax.tree_util.tree_flatten_with_path(nnx.state(model, nnx.Param))[0]
+            if isinstance(value, jax.ShapeDtypeStruct)
+        ]
+        from sgl_jax.srt.model_loader.weights.source import coordinate_error
+
+        coordinate_error(
+            (ValueError(f"Unloaded model parameters: {missing[:20]}") if missing else None),
+            "final parameter validation",
+        )
+
         print_parameter_shardings(model)
 
         return model
@@ -332,15 +294,16 @@ class RunaiModelLoader(JAXModelLoader):
         return self._prepare_weights(model_config.model_path, model_config.revision)
 
     def load_model(self, model_config: ModelConfig) -> Any:
-        from sgl_jax.srt.utils.runai_utils import RunaiWeightSource, is_gcs_path
+        from sgl_jax.srt.model_loader.weights.source import RunaiWeightSource
+        from sgl_jax.srt.utils.runai_utils import is_gcs_path
 
         model_type = getattr(getattr(model_config, "hf_config", None), "model_type", "")
-        if getattr(model_config, "is_multimodal", False) or model_type.startswith(
+        if getattr(model_config, "is_multimodal", False) and not model_type.startswith(
             ("gemma4", "qwen3_5")
         ):
             raise ValueError(
-                "runai_streamer currently supports text models using the shared WeightLoader. "
-                "Multimodal, Gemma4 and Qwen3.5 models have additional local-file loaders; "
+                "runai_streamer supports text models and the shared Gemma4/Qwen3.5 loaders. "
+                "Other multimodal models may have additional local-file loaders; "
                 "use a local checkpoint with --load-format auto for these models."
             )
         source = getattr(model_config, "model_weights", None) or model_config.model_path
@@ -356,11 +319,11 @@ class RunaiModelLoader(JAXModelLoader):
         # Skip filesystem warmup: only metadata is local, and callbacks read
         # addressable tensor ranges directly from the original source.
         with RunaiWeightSource(source, local_path) as weight_source:
-            config._runai_weight_source = weight_source
+            config._weight_source = weight_source
             try:
                 return self._get_model(model_class, config)
             finally:
-                del config._runai_weight_source
+                del config._weight_source
 
 
 class JAXDummyModelLoader(BaseModelLoader):

@@ -11,7 +11,8 @@ the same way when set.
 import jax.numpy as jnp
 import pytest
 
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
+from sgl_jax.srt.model_loader.weights import WeightSpec
+from sgl_jax.srt.model_loader.weights.recipes import TensorLayout
 
 
 class _CaptureParam:
@@ -39,7 +40,7 @@ def _make_loader(
 ):
     """Construct a WeightLoader bypassing __init__, with just enough state to
     drive _split_qkv_weight; mock the assignment-side helpers to identity."""
-    loader = object.__new__(WeightLoader)
+    loader = object.__new__(TensorLayout)
     loader.num_heads = num_heads
     loader.num_kv_heads = num_kv_heads
     loader.head_dim_original = head_dim_original
@@ -65,8 +66,8 @@ def _make_loader(
     return loader, captured
 
 
-def _qkv_mapping(suffix: str, *, head_dim_padding: bool = False) -> WeightMapping:
-    return WeightMapping(
+def _qkv_mapping(suffix: str, *, head_dim_padding: bool = False) -> WeightSpec:
+    return WeightSpec(
         target_path=[
             f"model.layers.0.self_attn.q_proj.{suffix}",
             f"model.layers.0.self_attn.k_proj.{suffix}",
@@ -164,7 +165,7 @@ def test_pre_fix_else_branch_still_handles_2d_weight():
     A 2-D weight (transpose=False) with shape [Q+K+V, hidden] should split
     along axis 0."""
     loader, captured = _make_loader(num_heads=4, num_kv_heads=4, head_dim_original=8)
-    mapping = WeightMapping(
+    mapping = WeightSpec(
         target_path=[
             "model.layers.0.self_attn.q_proj.weight_q",
             "model.layers.0.self_attn.k_proj.weight_q",

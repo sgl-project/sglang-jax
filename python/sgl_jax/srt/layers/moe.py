@@ -22,12 +22,12 @@ from sgl_jax.srt.kernels.sparse_core.moe_permute import (
 # Re-export for backward compatibility: external code imports from this module.
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE, FusedEPMoEV2  # noqa: F401
 from sgl_jax.srt.layers.gate import GateLogit, TopK  # noqa: F401
+from sgl_jax.srt.model_loader.weights import WeightSpec
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import (
     quantize_tensor,
     quantize_tensor_simple,
 )
-from sgl_jax.srt.utils.weight_utils import WeightMapping
 
 
 class EPMoE(nnx.Module):
@@ -495,7 +495,7 @@ class EPMoE(nnx.Module):
         # irrelevant inside the per-expert shard_map context.
         out_specs = P(
             *[
-                "tensor" if (s == "tensor" or (isinstance(s, tuple) and "tensor" in s)) else None
+                ("tensor" if (s == "tensor" or (isinstance(s, tuple) and "tensor" in s)) else None)
                 for s in out_sharding.spec
             ]
         )
@@ -994,9 +994,10 @@ def create_moe_weights_mapping(
 
         concat_axis = expert_concat_axis_map.get(source_name)
 
-        # Use __MOE_EXPERTS__ prefix to indicate aggregated MoE weight loading
-        mappings[f"__MOE_EXPERTS__{target_path_base}"] = WeightMapping(
-            target_path=[target_path_base] + expert_keys,
+        # Use  prefix to indicate aggregated MoE weight loading
+        mappings[f"{target_path_base}"] = WeightSpec(
+            target_path=target_path_base,
+            sources=tuple(expert_keys),
             sharding=sharding,
             transpose=transpose,
             concat_axis=concat_axis,

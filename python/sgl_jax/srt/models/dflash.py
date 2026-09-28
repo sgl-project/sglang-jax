@@ -18,8 +18,8 @@ from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.layers.radix_attention import AttentionType, RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.model_loader.weights import WeightLoader, WeightSpec
 from sgl_jax.srt.utils.profiling_utils import named_scope
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
@@ -406,22 +406,22 @@ class DFlashDraftModel(nnx.Module):
             mesh=self.mesh,
             dtype=self.dtype,
         )
-        loader.load_weights_from_safetensors(self._create_weight_mappings())
+        loader.load(self._create_weight_mappings())
         logger.info("DFlash draft weights loaded successfully.")
 
-    def _create_weight_mappings(self) -> dict[str, WeightMapping]:
-        mappings: dict[str, WeightMapping] = {
-            "fc.weight": WeightMapping(
+    def _create_weight_mappings(self) -> dict[str, WeightSpec]:
+        mappings: dict[str, WeightSpec] = {
+            "fc.weight": WeightSpec(
                 target_path="fc.weight",
                 sharding=(None, None),
                 transpose=True,
             ),
-            "hidden_norm.weight": WeightMapping(
+            "hidden_norm.weight": WeightSpec(
                 target_path="hidden_norm.scale",
                 sharding=(None,),
                 transpose=False,
             ),
-            "norm.weight": WeightMapping(
+            "norm.weight": WeightSpec(
                 target_path="model.norm.scale",
                 sharding=(None,),
                 transpose=False,
@@ -433,59 +433,59 @@ class DFlashDraftModel(nnx.Module):
             target = f"model.layers.{layer_idx}"
             mappings.update(
                 {
-                    f"{prefix}.input_layernorm.weight": WeightMapping(
+                    f"{prefix}.input_layernorm.weight": WeightSpec(
                         target_path=f"{target}.input_layernorm.scale",
                         sharding=(None,),
                         transpose=False,
                     ),
-                    f"{prefix}.post_attention_layernorm.weight": WeightMapping(
+                    f"{prefix}.post_attention_layernorm.weight": WeightSpec(
                         target_path=f"{target}.post_attention_layernorm.scale",
                         sharding=(None,),
                         transpose=False,
                     ),
-                    f"{prefix}.self_attn.q_proj.weight": WeightMapping(
+                    f"{prefix}.self_attn.q_proj.weight": WeightSpec(
                         target_path=f"{target}.self_attn.q_proj.weight",
                         sharding=(None, "tensor"),
                         transpose=True,
                     ),
-                    f"{prefix}.self_attn.k_proj.weight": WeightMapping(
+                    f"{prefix}.self_attn.k_proj.weight": WeightSpec(
                         target_path=f"{target}.self_attn.k_proj.weight",
                         sharding=(None, "tensor"),
                         transpose=True,
                         kv_head_padding=True,
                     ),
-                    f"{prefix}.self_attn.v_proj.weight": WeightMapping(
+                    f"{prefix}.self_attn.v_proj.weight": WeightSpec(
                         target_path=f"{target}.self_attn.v_proj.weight",
                         sharding=(None, "tensor"),
                         transpose=True,
                         kv_head_padding=True,
                     ),
-                    f"{prefix}.self_attn.o_proj.weight": WeightMapping(
+                    f"{prefix}.self_attn.o_proj.weight": WeightSpec(
                         target_path=f"{target}.self_attn.o_proj.weight",
                         sharding=("tensor", None),
                         transpose=True,
                     ),
-                    f"{prefix}.self_attn.q_norm.weight": WeightMapping(
+                    f"{prefix}.self_attn.q_norm.weight": WeightSpec(
                         target_path=f"{target}.self_attn.q_norm.scale",
                         sharding=(None,),
                         transpose=False,
                     ),
-                    f"{prefix}.self_attn.k_norm.weight": WeightMapping(
+                    f"{prefix}.self_attn.k_norm.weight": WeightSpec(
                         target_path=f"{target}.self_attn.k_norm.scale",
                         sharding=(None,),
                         transpose=False,
                     ),
-                    f"{prefix}.mlp.gate_proj.weight": WeightMapping(
+                    f"{prefix}.mlp.gate_proj.weight": WeightSpec(
                         target_path=f"{target}.mlp.gate_proj.weight",
                         sharding=(None, "tensor"),
                         transpose=True,
                     ),
-                    f"{prefix}.mlp.up_proj.weight": WeightMapping(
+                    f"{prefix}.mlp.up_proj.weight": WeightSpec(
                         target_path=f"{target}.mlp.up_proj.weight",
                         sharding=(None, "tensor"),
                         transpose=True,
                     ),
-                    f"{prefix}.mlp.down_proj.weight": WeightMapping(
+                    f"{prefix}.mlp.down_proj.weight": WeightSpec(
                         target_path=f"{target}.mlp.down_proj.weight",
                         sharding=("tensor", None),
                         transpose=True,
@@ -493,14 +493,18 @@ class DFlashDraftModel(nnx.Module):
                 }
             )
             if getattr(self.config, "attention_bias", False):
-                for proj, kv_padding in (("q_proj", False), ("k_proj", True), ("v_proj", True)):
-                    mappings[f"{prefix}.self_attn.{proj}.bias"] = WeightMapping(
+                for proj, kv_padding in (
+                    ("q_proj", False),
+                    ("k_proj", True),
+                    ("v_proj", True),
+                ):
+                    mappings[f"{prefix}.self_attn.{proj}.bias"] = WeightSpec(
                         target_path=f"{target}.self_attn.{proj}.bias",
                         sharding=(None,),
                         transpose=False,
                         kv_head_padding=kv_padding,
                     )
-                mappings[f"{prefix}.self_attn.o_proj.bias"] = WeightMapping(
+                mappings[f"{prefix}.self_attn.o_proj.bias"] = WeightSpec(
                     target_path=f"{target}.self_attn.o_proj.bias",
                     sharding=(None,),
                     transpose=False,

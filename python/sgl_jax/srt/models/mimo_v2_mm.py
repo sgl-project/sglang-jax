@@ -14,6 +14,7 @@ from flax import nnx
 from jax.sharding import Mesh
 
 from sgl_jax.srt.configs.mimo import config_value
+from sgl_jax.srt.model_loader.weights import WeightLoader, WeightSpec
 from sgl_jax.srt.models.mimo_v2_audio import MiMoAudioEncoder
 from sgl_jax.srt.models.mimo_v2_pro import MiMoV2ForCausalLM
 from sgl_jax.srt.models.mimo_v2_vision import MiMoVisionTransformer
@@ -30,7 +31,6 @@ from sgl_jax.srt.multimodal.in_model.lane_packing import (
     run_mrope_vision_model,
 )
 from sgl_jax.srt.multimodal.layers.vision_sharding import resolve_encoder_tp
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 if TYPE_CHECKING:
     from sgl_jax.srt.configs.model_config import ModelConfig
@@ -164,7 +164,7 @@ class MiMoV2ForConditionalGeneration(InModelMultimodalContract, MiMoV2ForCausalL
         if self.visual is not None:
             loader = WeightLoader(self.visual, tower_config, self.mesh, self.dtype)
             with self.mesh:
-                loader.load_weights_from_safetensors(self._vision_weight_mappings())
+                loader.load(self._vision_weight_mappings())
             logger.info("MiMoV2 vision tower weights loaded.")
         if self.audio_encoder is not None:
             audio_config = SimpleNamespace(
@@ -174,40 +174,40 @@ class MiMoV2ForConditionalGeneration(InModelMultimodalContract, MiMoV2ForCausalL
             )
             loader = WeightLoader(self.audio_encoder, audio_config, self.mesh, self.dtype)
             with self.mesh:
-                loader.load_weights_from_safetensors(self._audio_weight_mappings())
+                loader.load(self._audio_weight_mappings())
             logger.info("MiMoV2 audio tower weights loaded.")
 
     @staticmethod
     def _linear_mappings(
         source, target, sharding=(None, None), *, bias=True
-    ) -> dict[str, WeightMapping]:
+    ) -> dict[str, WeightSpec]:
         mappings = {
-            f"{source}.weight": WeightMapping(
+            f"{source}.weight": WeightSpec(
                 target_path=f"{target}.weight", sharding=sharding, transpose=True
             ),
         }
         if bias:
-            mappings[f"{source}.bias"] = WeightMapping(
+            mappings[f"{source}.bias"] = WeightSpec(
                 target_path=f"{target}.bias", sharding=(sharding[-1],), transpose=False
             )
         return mappings
 
-    def _vision_weight_mappings(self) -> dict[str, WeightMapping]:
+    def _vision_weight_mappings(self) -> dict[str, WeightSpec]:
         specs = self.visual.specs
         col, row = specs.col_kernel_axes, specs.row_kernel_axes
-        mappings: dict[str, WeightMapping] = {
-            "visual.patch_embed.proj.weight": WeightMapping(
+        mappings: dict[str, WeightSpec] = {
+            "visual.patch_embed.proj.weight": WeightSpec(
                 target_path="patch_embed.proj.kernel",
                 sharding=(None, None, None, None, None),
                 transpose_axes=(2, 3, 4, 1, 0),
             ),
-            "visual.merger.ln_q.weight": WeightMapping(
+            "visual.merger.ln_q.weight": WeightSpec(
                 target_path="merger.ln_q.scale", sharding=(None,), transpose=False
             ),
-            "visual.merger.mlp.0.weight": WeightMapping(
+            "visual.merger.mlp.0.weight": WeightSpec(
                 target_path="merger.mlp_fc1.weight", sharding=col, transpose=True
             ),
-            "visual.merger.mlp.2.weight": WeightMapping(
+            "visual.merger.mlp.2.weight": WeightSpec(
                 target_path="merger.mlp_fc2.weight", sharding=row, transpose=True
             ),
         }
@@ -215,15 +215,15 @@ class MiMoV2ForConditionalGeneration(InModelMultimodalContract, MiMoV2ForCausalL
             src = f"visual.blocks.{index}"
             tgt = f"blocks.{index}"
             for norm in ("norm1", "norm2"):
-                mappings[f"{src}.{norm}.weight"] = WeightMapping(
+                mappings[f"{src}.{norm}.weight"] = WeightSpec(
                     target_path=f"{tgt}.{norm}.scale", sharding=(None,), transpose=False
                 )
-            mappings[f"{src}.attn.qkv.weight"] = WeightMapping(
+            mappings[f"{src}.attn.qkv.weight"] = WeightSpec(
                 target_path=[f"{tgt}.attn.{n}_proj.weight" for n in ("q", "k", "v")],
                 sharding=col,
                 transpose=True,
             )
-            mappings[f"{src}.attn.qkv.bias"] = WeightMapping(
+            mappings[f"{src}.attn.qkv.bias"] = WeightSpec(
                 target_path=[f"{tgt}.attn.{n}_proj.bias" for n in ("q", "k", "v")],
                 sharding=(col[-1],),
                 transpose=False,
@@ -237,19 +237,19 @@ class MiMoV2ForConditionalGeneration(InModelMultimodalContract, MiMoV2ForCausalL
                 self._linear_mappings(f"{src}.mlp.down_proj", f"{tgt}.mlp.down_proj", row)
             )
             if block.attn.sinks is not None:
-                mappings[f"{src}.attn.sinks"] = WeightMapping(
+                mappings[f"{src}.attn.sinks"] = WeightSpec(
                     target_path=f"{tgt}.attn.sinks",
                     sharding=(specs.tensor_axis,),
                     transpose=False,
                 )
         return mappings
 
-    def _audio_weight_mappings(self) -> dict[str, WeightMapping]:
+    def _audio_weight_mappings(self) -> dict[str, WeightSpec]:
         encoder = self.audio_encoder
-        mappings: dict[str, WeightMapping] = {}
+        mappings: dict[str, WeightSpec] = {}
         # Per-channel speech code embeddings live at top level in the checkpoint.
         for index in range(encoder.channels):
-            mappings[f"speech_embeddings.{index}.weight"] = WeightMapping(
+            mappings[f"speech_embeddings.{index}.weight"] = WeightSpec(
                 target_path=f"speech_embeddings.{index}.embedding",
                 sharding=(None, None),
                 transpose=False,
@@ -257,14 +257,14 @@ class MiMoV2ForConditionalGeneration(InModelMultimodalContract, MiMoV2ForCausalL
         src_root = "audio_encoder.input_local_transformer"
         tgt_root = "transformer"
         if encoder.transformer.norm is not None:
-            mappings[f"{src_root}.norm.weight"] = WeightMapping(
+            mappings[f"{src_root}.norm.weight"] = WeightSpec(
                 target_path=f"{tgt_root}.norm.scale", sharding=(None,), transpose=False
             )
         for index in range(len(encoder.transformer.layers)):
             src = f"{src_root}.layers.{index}"
             tgt = f"{tgt_root}.layers.{index}"
             for norm in ("input_layernorm", "post_attention_layernorm"):
-                mappings[f"{src}.{norm}.weight"] = WeightMapping(
+                mappings[f"{src}.{norm}.weight"] = WeightSpec(
                     target_path=f"{tgt}.{norm}.scale", sharding=(None,), transpose=False
                 )
             for name, bias in (

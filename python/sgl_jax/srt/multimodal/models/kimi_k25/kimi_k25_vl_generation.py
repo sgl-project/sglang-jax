@@ -9,6 +9,7 @@ from flax import nnx
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.hf_transformers_utils import get_hf_text_config
+from sgl_jax.srt.model_loader.weights import WeightLoader
 from sgl_jax.srt.models.deepseek_v3 import DeepseekV3ForCausalLM
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
 from sgl_jax.srt.multimodal.configs.kimi.kimi_k25_config import KimiK25ModelVitConfig
@@ -25,7 +26,6 @@ from sgl_jax.srt.multimodal.models.kimi_k25.kimi_k25_vit import (
     Kimi_K25_VisionModel,
     create_kimi_vision_weight_mappings,
 )
-from sgl_jax.srt.utils.weight_utils import WeightLoader
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +125,7 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM, InModelMultimodalCo
                 target_prefix="visual.",
             )
         )
-        loader.load_weights_from_safetensors(weight_mappings)
+        loader.load(weight_mappings)
 
         for layer in self.model.layers:
             layer.self_attn.post_load_weights()

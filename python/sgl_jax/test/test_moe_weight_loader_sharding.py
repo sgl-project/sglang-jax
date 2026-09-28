@@ -9,7 +9,7 @@ from jax.sharding import AxisType, Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.moe import EPMoE
-from sgl_jax.srt.utils.weight_utils import WeightLoader
+from sgl_jax.srt.model_loader.weights import WeightLoader
 
 
 class _ArraySlice:
@@ -48,7 +48,7 @@ def test_deferred_moe_transpose_preserves_target_sharding():
     key = "model.layers.0.mlp.experts.0.gate_proj.weight"
 
     loader = WeightLoader(nnx.Module(), SimpleNamespace(), mesh)
-    result = loader._create_stacked_moe_lazy_tensor(
+    result = loader.reader._create_stacked_moe_lazy_tensor(
         expected_hf_keys=[key],
         weight_info={
             key: [
@@ -65,7 +65,7 @@ def test_deferred_moe_transpose_preserves_target_sharding():
     )
 
     assert result.shape == (1, 3, 2)
-    np.testing.assert_array_equal(np.asarray(result[0]), hf_weight.T)
+    np.testing.assert_array_equal(np.asarray(result)[0], hf_weight.T)
     assert result.sharding == target_sharding
 
 

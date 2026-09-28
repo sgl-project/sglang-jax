@@ -2,7 +2,6 @@ import logging
 import math
 from collections.abc import Callable
 from functools import partial
-from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -19,6 +18,7 @@ from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.model_loader.weights import WeightLoader, WeightSpec
 from sgl_jax.srt.models.qwen2 import Qwen2Model
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
 from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
@@ -40,7 +40,6 @@ from sgl_jax.srt.multimodal.layers.vision_sharding import (
     apply_data_sharding,
     resolve_encoder_tp,
 )
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -684,31 +683,19 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         }
 
     def load_weights(self, model_config: ModelConfig) -> None:
-        # Text backbone + lm_head.
-        loader = WeightLoader(
-            model=self, model_config=model_config, mesh=self.mesh, dtype=self.dtype
-        )
-        loader.load_weights_from_safetensors(self._language_weight_mappings())
-        logger.info("Qwen2.5-VL (LLM) weights loaded.")
-        # ViT weights — carry vision head info so _split_qkv_weight can slice the
-        # fused ``qkv.weight`` / ``qkv.bias`` into q_proj, k_proj, v_proj.
-        vc = self.visual_config
-        vision_model_config = SimpleNamespace(
-            model_path=model_config.model_path,
-            num_attention_heads=vc.num_heads,
-            hidden_size=vc.hidden_size,
-            get_total_num_kv_heads=lambda: vc.num_heads,  # no GQA in ViT
-        )
-        self._load_vision_weights(vision_model_config)
+        mappings = self._language_weight_mappings()
+        mappings.update(self._vision_weight_mappings())
+        WeightLoader(self, model_config, self.mesh, self.dtype).load(mappings)
+        logger.info("Qwen2.5-VL weights loaded.")
 
     def _language_weight_mappings(self) -> dict:
         mappings = {
-            "model.embed_tokens.weight": WeightMapping(
+            "model.embed_tokens.weight": WeightSpec(
                 target_path="model.embed_tokens.embedding",
                 sharding=("tensor", None),
                 transpose=False,
             ),
-            "model.norm.weight": WeightMapping(
+            "model.norm.weight": WeightSpec(
                 target_path="model.norm.scale", sharding=(None,), transpose=False
             ),
         }
@@ -726,55 +713,55 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         target_prefix = f"model.layers.{layer_idx}"
 
         mappings = {
-            f"{prefix}.input_layernorm.weight": WeightMapping(
+            f"{prefix}.input_layernorm.weight": WeightSpec(
                 target_path=f"{target_prefix}.input_layernorm.scale",
                 sharding=(None,),
                 transpose=False,
             ),
-            f"{prefix}.post_attention_layernorm.weight": WeightMapping(
+            f"{prefix}.post_attention_layernorm.weight": WeightSpec(
                 target_path=f"{target_prefix}.post_attention_layernorm.scale",
                 sharding=(None,),
                 transpose=False,
             ),
-            f"{prefix}.self_attn.q_proj.weight": WeightMapping(
+            f"{prefix}.self_attn.q_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.self_attn.q_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
                 head_dim_padding=True,
                 kv_head_padding=False,
             ),
-            f"{prefix}.self_attn.k_proj.weight": WeightMapping(
+            f"{prefix}.self_attn.k_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.self_attn.k_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
                 head_dim_padding=True,
                 kv_head_padding=True,
             ),
-            f"{prefix}.self_attn.v_proj.weight": WeightMapping(
+            f"{prefix}.self_attn.v_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.self_attn.v_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
                 head_dim_padding=True,
                 kv_head_padding=True,
             ),
-            f"{prefix}.self_attn.o_proj.weight": WeightMapping(
+            f"{prefix}.self_attn.o_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.self_attn.o_proj.weight",
                 sharding=("tensor", None),
                 transpose=True,
                 head_dim_padding=True,
                 kv_head_padding=False,
             ),
-            f"{prefix}.mlp.gate_proj.weight": WeightMapping(
+            f"{prefix}.mlp.gate_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.mlp.gate_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             ),
-            f"{prefix}.mlp.up_proj.weight": WeightMapping(
+            f"{prefix}.mlp.up_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.mlp.up_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             ),
-            f"{prefix}.mlp.down_proj.weight": WeightMapping(
+            f"{prefix}.mlp.down_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.mlp.down_proj.weight",
                 sharding=("tensor", None),
                 transpose=True,
@@ -784,28 +771,28 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         if getattr(self.text_config, "attention_bias", True):
             mappings.update(
                 {
-                    f"{prefix}.self_attn.q_proj.bias": WeightMapping(
+                    f"{prefix}.self_attn.q_proj.bias": WeightSpec(
                         target_path=f"{target_prefix}.self_attn.q_proj.bias",
                         sharding=(None,),
                         transpose=False,
                         head_dim_padding=True,
                         kv_head_padding=False,
                     ),
-                    f"{prefix}.self_attn.k_proj.bias": WeightMapping(
+                    f"{prefix}.self_attn.k_proj.bias": WeightSpec(
                         target_path=f"{target_prefix}.self_attn.k_proj.bias",
                         sharding=(None,),
                         transpose=False,
                         head_dim_padding=True,
                         kv_head_padding=True,
                     ),
-                    f"{prefix}.self_attn.v_proj.bias": WeightMapping(
+                    f"{prefix}.self_attn.v_proj.bias": WeightSpec(
                         target_path=f"{target_prefix}.self_attn.v_proj.bias",
                         sharding=(None,),
                         transpose=False,
                         head_dim_padding=True,
                         kv_head_padding=True,
                     ),
-                    f"{prefix}.self_attn.o_proj.bias": WeightMapping(
+                    f"{prefix}.self_attn.o_proj.bias": WeightSpec(
                         target_path=f"{target_prefix}.self_attn.o_proj.bias",
                         sharding=(None,),
                         transpose=False,
@@ -815,15 +802,6 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
 
         return mappings
 
-    def _load_vision_weights(self, model_config) -> None:
-        loader = WeightLoader(
-            model=self, model_config=model_config, mesh=self.mesh, dtype=self.dtype
-        )
-        mappings = self._vision_weight_mappings()
-        with self.mesh:
-            loader.load_weights_from_safetensors(mappings)
-        logger.info("Qwen2.5-VL ViT weights loaded.")
-
     def _vision_weight_mappings(self) -> dict:
         tp = self.visual.specs.tp
         col = (None, "tensor") if tp else (None, None)
@@ -831,12 +809,12 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
 
         mappings = {
             # Patch embed Conv3D: PyTorch [out,in,kd,kh,kw] → JAX [kd,kh,kw,in,out].
-            "visual.patch_embed.proj.weight": WeightMapping(
+            "visual.patch_embed.proj.weight": WeightSpec(
                 target_path="visual.patch_embed.proj.kernel",
                 sharding=(None, None, None, None, None),
                 transpose_axes=(2, 3, 4, 1, 0),
             ),
-            "visual.merger.ln_q.weight": WeightMapping(
+            "visual.merger.ln_q.weight": WeightSpec(
                 target_path="visual.merger.ln_q.scale",
                 sharding=(None,),
                 transpose=False,
@@ -844,29 +822,33 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
             **self._merger_mlp_mappings(col, row),
         }
         for i in range(getattr(self.visual_config, "depth", 0)):
-            mappings.update(self._block_mappings(i, col, row))
+            mappings.update(self._block_mappings(i, col, row, self.visual_config.hidden_size))
         return mappings
 
     @staticmethod
     def _merger_mlp_mappings(col, row) -> dict:
         """Weight mappings for the patch merger MLP (mlp.0 / mlp.2 in HF)."""
         return {
-            "visual.merger.mlp.0.weight": WeightMapping(
+            "visual.merger.mlp.0.weight": WeightSpec(
                 target_path="visual.merger.mlp_fc1.weight", sharding=col, transpose=True
             ),
-            "visual.merger.mlp.0.bias": WeightMapping(
-                target_path="visual.merger.mlp_fc1.bias", sharding=(None,), transpose=False
+            "visual.merger.mlp.0.bias": WeightSpec(
+                target_path="visual.merger.mlp_fc1.bias",
+                sharding=(None,),
+                transpose=False,
             ),
-            "visual.merger.mlp.2.weight": WeightMapping(
+            "visual.merger.mlp.2.weight": WeightSpec(
                 target_path="visual.merger.mlp_fc2.weight", sharding=row, transpose=True
             ),
-            "visual.merger.mlp.2.bias": WeightMapping(
-                target_path="visual.merger.mlp_fc2.bias", sharding=(None,), transpose=False
+            "visual.merger.mlp.2.bias": WeightSpec(
+                target_path="visual.merger.mlp_fc2.bias",
+                sharding=(None,),
+                transpose=False,
             ),
         }
 
     @staticmethod
-    def _block_mappings(layer_idx: int, col, row) -> dict:
+    def _block_mappings(layer_idx: int, col, row, hidden_size: int) -> dict:
         """Weight mappings for one ViT block (``visual.blocks.{i}.*``).
 
         The fused ``qkv.weight`` / ``qkv.bias`` are split into separate
@@ -875,13 +857,13 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         """
         p = f"visual.blocks.{layer_idx}"
         return {
-            f"{p}.norm1.weight": WeightMapping(
+            f"{p}.norm1.weight": WeightSpec(
                 target_path=f"{p}.norm1.scale", sharding=(None,), transpose=False
             ),
-            f"{p}.norm2.weight": WeightMapping(
+            f"{p}.norm2.weight": WeightSpec(
                 target_path=f"{p}.norm2.scale", sharding=(None,), transpose=False
             ),
-            f"{p}.attn.qkv.weight": WeightMapping(
+            f"{p}.attn.qkv.weight": WeightSpec(
                 target_path=[
                     f"{p}.attn.q_proj.weight",
                     f"{p}.attn.k_proj.weight",
@@ -889,8 +871,9 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
                 ],
                 sharding=col,
                 transpose=True,
+                split_sizes=(hidden_size,) * 3,
             ),
-            f"{p}.attn.qkv.bias": WeightMapping(
+            f"{p}.attn.qkv.bias": WeightSpec(
                 target_path=[
                     f"{p}.attn.q_proj.bias",
                     f"{p}.attn.k_proj.bias",
@@ -898,29 +881,30 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
                 ],
                 sharding=(None,),
                 transpose=False,
+                split_sizes=(hidden_size,) * 3,
             ),
-            f"{p}.attn.proj.weight": WeightMapping(
+            f"{p}.attn.proj.weight": WeightSpec(
                 target_path=f"{p}.attn.proj.weight", sharding=row, transpose=True
             ),
-            f"{p}.attn.proj.bias": WeightMapping(
+            f"{p}.attn.proj.bias": WeightSpec(
                 target_path=f"{p}.attn.proj.bias", sharding=(None,), transpose=False
             ),
-            f"{p}.mlp.gate_proj.weight": WeightMapping(
+            f"{p}.mlp.gate_proj.weight": WeightSpec(
                 target_path=f"{p}.mlp.gate_proj.weight", sharding=col, transpose=True
             ),
-            f"{p}.mlp.gate_proj.bias": WeightMapping(
+            f"{p}.mlp.gate_proj.bias": WeightSpec(
                 target_path=f"{p}.mlp.gate_proj.bias", sharding=(None,), transpose=False
             ),
-            f"{p}.mlp.up_proj.weight": WeightMapping(
+            f"{p}.mlp.up_proj.weight": WeightSpec(
                 target_path=f"{p}.mlp.up_proj.weight", sharding=col, transpose=True
             ),
-            f"{p}.mlp.up_proj.bias": WeightMapping(
+            f"{p}.mlp.up_proj.bias": WeightSpec(
                 target_path=f"{p}.mlp.up_proj.bias", sharding=(None,), transpose=False
             ),
-            f"{p}.mlp.down_proj.weight": WeightMapping(
+            f"{p}.mlp.down_proj.weight": WeightSpec(
                 target_path=f"{p}.mlp.down_proj.weight", sharding=row, transpose=True
             ),
-            f"{p}.mlp.down_proj.bias": WeightMapping(
+            f"{p}.mlp.down_proj.bias": WeightSpec(
                 target_path=f"{p}.mlp.down_proj.bias", sharding=(None,), transpose=False
             ),
         }

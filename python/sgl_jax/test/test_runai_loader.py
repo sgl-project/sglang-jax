@@ -17,9 +17,9 @@ from flax import nnx
 from jax.sharding import AxisType, Mesh
 from safetensors.numpy import save_file
 
+from sgl_jax.srt.model_loader.weights import WeightLoader, WeightSpec
+from sgl_jax.srt.model_loader.weights.source import RunaiWeightSource
 from sgl_jax.srt.utils import runai_utils
-from sgl_jax.srt.utils.runai_utils import RunaiWeightSource
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 
 @pytest.fixture
@@ -106,9 +106,7 @@ def test_shared_weight_loader_matches_local_sharding(sdk, tmp_path, monkeypatch)
                 setattr(self, name, nnx.Param(jnp.zeros(shape, dtype=dtype)))
 
         def load_weights(self, config):
-            WeightLoader(self, config, self.mesh, jnp.float32).load_weights_from_safetensors(
-                mappings
-            )
+            WeightLoader(self, config, self.mesh, jnp.float32).load(mappings)
 
     config = SimpleNamespace(
         model_path=str(tmp_path),
@@ -122,21 +120,24 @@ def test_shared_weight_loader_matches_local_sharding(sdk, tmp_path, monkeypatch)
         revision=None,
     )
     mappings = {
-        "dense": WeightMapping("dense", sharding=(None, "tensor"), transpose=True),
-        "qkv": WeightMapping(["q", "k", "v"], sharding=("tensor", None)),
-        "__MOE_EXPERTS__": WeightMapping(
-            ["experts", "expert.0", "expert.1"], sharding=("data", None, "tensor"), transpose=True
+        "dense": WeightSpec("dense", sharding=(None, "tensor"), transpose=True),
+        "qkv": WeightSpec(["q", "k", "v"], sharding=("tensor", None)),
+        "": WeightSpec(
+            "experts",
+            sources=("expert.0", "expert.1"),
+            sharding=("data", None, "tensor"),
+            transpose=True,
         ),
     }
     with jax.set_mesh(mesh):
         baseline = Model()
-        WeightLoader(baseline, config, mesh, jnp.float32).load_weights_from_safetensors(mappings)
+        WeightLoader(baseline, config, mesh, jnp.float32).load(mappings)
         config.model_weights = "gs://bucket/model"
         config.model_path = str(tmp_path / "metadata-only")
         monkeypatch.setattr(runai_utils, "download_metadata", lambda *_: config.model_path)
         load_config = LoadConfig(load_format="runai_streamer", model_class=Model)
         streamed = RunaiModelLoader(load_config, mesh).load_model(config)
-        assert not hasattr(config, "_runai_weight_source")
+        assert not hasattr(config, "_weight_source")
     for name in ("dense", "q", "k", "v", "experts"):
         expected, actual = getattr(baseline, name).value, getattr(streamed, name).value
         np.testing.assert_array_equal(actual, expected)
@@ -177,10 +178,10 @@ def test_low_precision_bytes_are_reinterpreted_before_jax_transfer(
     with RunaiWeightSource("gs://bucket/model", str(tmp_path)) as source, jax.set_mesh(mesh):
         model = Model()
         config = SimpleNamespace(
-            model_path=str(tmp_path), _runai_weight_source=source, quantization_config=None
+            model_path=str(tmp_path), _weight_source=source, quantization_config=None
         )
-        WeightLoader(model, config, mesh).load_weights_from_safetensors(
-            {"weight": WeightMapping("weight", sharding=(None, "tensor"), transpose=True)}
+        WeightLoader(model, config, mesh).load(
+            {"weight": WeightSpec("weight", sharding=(None, "tensor"), transpose=True)}
         )
     np.testing.assert_array_equal(np.asarray(model.weight[...]), value.T.astype(ml_dtypes.bfloat16))
 
@@ -212,12 +213,12 @@ def test_runai_batches_cross_file_experts_and_scales(sdk, tmp_path, transpose, s
             struct.pack("<Q", len(header)) + header + weight.tobytes()
         )
     with RunaiWeightSource("gs://bucket/model", str(tmp_path)) as source, jax.set_mesh(mesh):
-        config = SimpleNamespace(_runai_weight_source=source, quantization_config=None)
+        config = SimpleNamespace(_weight_source=source, quantization_config=None)
         loader = WeightLoader(nnx.Module(), config, mesh, jnp.float32)
         sdk.batches.clear()
-        actual = loader._create_stacked_moe_lazy_tensor(
+        actual = loader.reader._create_stacked_moe_lazy_tensor(
             [f"expert.{i}" for i in range(3)],
-            source.weight_info,
+            source.metadata,
             source,
             do_transpose=transpose,
             target_sharding=sharding,

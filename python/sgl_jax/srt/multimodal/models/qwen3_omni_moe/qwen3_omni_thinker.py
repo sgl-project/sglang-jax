@@ -17,8 +17,8 @@ from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK, create_moe_weights_ma
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.model_loader.weights import WeightLoader, WeightSpec
 from sgl_jax.srt.models.qwen3 import Qwen3MLP
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +103,7 @@ class QWen3OmniMoeAttention(nnx.Module):
             is_neox_style=True,
             dtype=dtype,
             mrope_section=rope_scaling.get("mrope_section") if rope_scaling else None,
-            mrope_interleaved=rope_scaling.get("mrope_interleaved") if rope_scaling else False,
+            mrope_interleaved=(rope_scaling.get("mrope_interleaved") if rope_scaling else False),
         )
         self.attn = RadixAttention(
             num_heads=num_heads,
@@ -455,17 +455,17 @@ class Qwen3OmniMoeThinkerTextForConditionalGeneration(nnx.Module):
             dtype=self.dtype,
         )
         weight_mappings = self._create_qwen3_omni_moe_weight_mappings()
-        loader.load_weights_from_safetensors(weight_mappings)
+        loader.load(weight_mappings)
         logger.info("Qwen3OmniMoeThinker weights loaded successfully!")
 
     def _create_qwen3_omni_moe_weight_mappings(self) -> dict:
         mappings = {
-            "thinker.model.embed_tokens.weight": WeightMapping(
+            "thinker.model.embed_tokens.weight": WeightSpec(
                 target_path="model.embed_tokens.embedding",
                 sharding=("tensor", None),
                 transpose=False,
             ),
-            "thinker.model.norm.weight": WeightMapping(
+            "thinker.model.norm.weight": WeightSpec(
                 target_path="model.norm.scale", sharding=(None,), transpose=False
             ),
         }
@@ -489,44 +489,44 @@ class Qwen3OmniMoeThinkerTextForConditionalGeneration(nnx.Module):
         target_prefix = f"model.layers.{layer_idx}"
 
         mappings = {
-            f"{prefix}.input_layernorm.weight": WeightMapping(
+            f"{prefix}.input_layernorm.weight": WeightSpec(
                 target_path=f"{target_prefix}.input_layernorm.scale",
                 sharding=(None,),
                 transpose=False,
             ),
-            f"{prefix}.post_attention_layernorm.weight": WeightMapping(
+            f"{prefix}.post_attention_layernorm.weight": WeightSpec(
                 target_path=f"{target_prefix}.post_attention_layernorm.scale",
                 sharding=(None,),
                 transpose=False,
             ),
-            f"{prefix}.self_attn.q_proj.weight": WeightMapping(
+            f"{prefix}.self_attn.q_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.self_attn.q_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             ),
-            f"{prefix}.self_attn.k_proj.weight": WeightMapping(
+            f"{prefix}.self_attn.k_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.self_attn.k_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
                 kv_head_padding=True,
             ),
-            f"{prefix}.self_attn.v_proj.weight": WeightMapping(
+            f"{prefix}.self_attn.v_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.self_attn.v_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
                 kv_head_padding=True,
             ),
-            f"{prefix}.self_attn.o_proj.weight": WeightMapping(
+            f"{prefix}.self_attn.o_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.self_attn.c_proj.weight",
                 sharding=("tensor", None),
                 transpose=True,
             ),
-            f"{prefix}.self_attn.q_norm.weight": WeightMapping(
+            f"{prefix}.self_attn.q_norm.weight": WeightSpec(
                 target_path=f"{target_prefix}.self_attn.q_norm.scale",
                 sharding=(None,),
                 transpose=False,
             ),
-            f"{prefix}.self_attn.k_norm.weight": WeightMapping(
+            f"{prefix}.self_attn.k_norm.weight": WeightSpec(
                 target_path=f"{target_prefix}.self_attn.k_norm.scale",
                 sharding=(None,),
                 transpose=False,
@@ -535,24 +535,24 @@ class Qwen3OmniMoeThinkerTextForConditionalGeneration(nnx.Module):
 
         if getattr(self.config, "attention_bias", False):
             bias_mappings = {
-                f"{prefix}.self_attn.q_proj.bias": WeightMapping(
+                f"{prefix}.self_attn.q_proj.bias": WeightSpec(
                     target_path=f"{target_prefix}.self_attn.q_proj.bias",
                     sharding=(None,),
                     transpose=False,
                 ),
-                f"{prefix}.self_attn.k_proj.bias": WeightMapping(
+                f"{prefix}.self_attn.k_proj.bias": WeightSpec(
                     target_path=f"{target_prefix}.self_attn.k_proj.bias",
                     sharding=(None,),
                     transpose=False,
                     kv_head_padding=True,
                 ),
-                f"{prefix}.self_attn.v_proj.bias": WeightMapping(
+                f"{prefix}.self_attn.v_proj.bias": WeightSpec(
                     target_path=f"{target_prefix}.self_attn.v_proj.bias",
                     sharding=(None,),
                     transpose=False,
                     kv_head_padding=True,
                 ),
-                f"{prefix}.self_attn.o_proj.bias": WeightMapping(
+                f"{prefix}.self_attn.o_proj.bias": WeightSpec(
                     target_path=f"{target_prefix}.self_attn.c_proj.bias",
                     sharding=(None,),
                     transpose=False,
@@ -562,17 +562,17 @@ class Qwen3OmniMoeThinkerTextForConditionalGeneration(nnx.Module):
 
         if is_mlp_layer:
             mlp_mappings = {
-                f"{prefix}.mlp.gate_proj.weight": WeightMapping(
+                f"{prefix}.mlp.gate_proj.weight": WeightSpec(
                     target_path=f"{target_prefix}.mlp.gate_proj.weight",
                     sharding=(None, "tensor"),
                     transpose=True,
                 ),
-                f"{prefix}.mlp.up_proj.weight": WeightMapping(
+                f"{prefix}.mlp.up_proj.weight": WeightSpec(
                     target_path=f"{target_prefix}.mlp.up_proj.weight",
                     sharding=(None, "tensor"),
                     transpose=True,
                 ),
-                f"{prefix}.mlp.down_proj.weight": WeightMapping(
+                f"{prefix}.mlp.down_proj.weight": WeightSpec(
                     target_path=f"{target_prefix}.mlp.down_proj.weight",
                     sharding=("tensor", None),
                     transpose=True,
@@ -580,7 +580,7 @@ class Qwen3OmniMoeThinkerTextForConditionalGeneration(nnx.Module):
             }
             mappings.update(mlp_mappings)
         else:
-            mappings[f"{prefix}.mlp.gate.weight"] = WeightMapping(
+            mappings[f"{prefix}.mlp.gate.weight"] = WeightSpec(
                 target_path=f"{target_prefix}.moe_gate.kernel",
                 sharding=(None, None),
                 transpose=True,
