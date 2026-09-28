@@ -165,6 +165,7 @@ class GenerationBatchResult:
     bid: int
     cache_miss_count: int
     worker_batch: ModelWorkerBatch | None = None
+    launch_result: futures.Future | None = None
     # relay path: forward stream -> next step forward
     next_draft_input: EagleDraftInput | DFlashDraftInput | None = None
     spec_relay_buffers: object | None = None
@@ -1127,7 +1128,13 @@ class Scheduler(
                     )
 
     def event_loop_overlap_v2(self):
-        """Single-threaded normal overlap loop."""
+        """Single-owner scheduling with ordered asynchronous device submission."""
+        try:
+            self._event_loop_overlap_v2()
+        finally:
+            self.tp_worker.shutdown()
+
+    def _event_loop_overlap_v2(self):
         self.result_queue = deque()
         while True:
             recv_reqs = (
@@ -1144,19 +1151,18 @@ class Scheduler(
             self.cur_batch = batch
 
             if self._pending_h2d:
+                self._wait_donation_safe()
                 self._flush_pending_h2d()
 
             context = None
             if batch:
                 batch.launch_done = threading.Event()
-                with jax.profiler.TraceAnnotation("run_batch_forward"):
+                with jax.profiler.TraceAnnotation("submit_batch_forward"):
                     context = self._launch_batch_forward(batch)
+                batch.launch_done = context
 
             if self.last_batch:
                 last_batch, last_result = self.result_queue.popleft()
-                last_batch.next_batch_sampling_info = (
-                    context.batch.sampling_info if context is not None else None
-                )
                 self.process_batch_result(
                     last_batch,
                     last_result,
@@ -1164,7 +1170,7 @@ class Scheduler(
                 )
 
             if context is not None:
-                with jax.profiler.TraceAnnotation("run_batch_sample"):
+                with jax.profiler.TraceAnnotation("submit_batch_sample"):
                     result = self._launch_batch_sample(batch, context)
                 self.result_queue.append((batch.copy(), result))
             elif self.last_batch is None:
@@ -2587,7 +2593,7 @@ class Scheduler(
         return self.tp_worker.launch_forward(worker_batch)
 
     def _launch_batch_sample(self, batch, context):
-        logits_output, next_token_ids, cache_miss_count = self.tp_worker.launch_sample(context)
+        launch_result = self.tp_worker.launch_sample(context)
         worker_batch = context.batch
         placeholders = np.zeros(len(worker_batch.seq_lens), dtype=np.int32)
         self._extract_dp_output_ids(placeholders, worker_batch, batch)
@@ -2605,13 +2611,14 @@ class Scheduler(
             ]
 
         return GenerationBatchResult(
-            logits_output=logits_output,
-            next_token_ids=next_token_ids,
+            logits_output=None,
+            next_token_ids=None,
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             bid=worker_batch.bid,
-            cache_miss_count=cache_miss_count,
+            cache_miss_count=0,
             worker_batch=worker_batch,
+            launch_result=launch_result,
         )
 
     def run_batch(self, batch: ScheduleBatch) -> GenerationBatchResult:
