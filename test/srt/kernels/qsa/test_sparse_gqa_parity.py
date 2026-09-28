@@ -139,6 +139,18 @@ class TestSparseGQAParity(CustomTestCase):
         case = _build(dtype=jnp.bfloat16, t_count=2, k_blocks=512, pages_per_seq=24)
         self.assertLess(_rel_err(_run(case, block_units=128), _reference(case)), 2e-2)
 
+    @unittest.skipIf(INTERPRET, "SMEM capacity is a property of the TPU core")
+    def test_block_ids_beyond_smem_capacity(self):
+        """1024 queries of 512 block ids are 2 MiB, twice a core's SMEM. The index
+        tables reach SMEM one query at a time, so this compiles and every row
+        still attends correctly. Three rows are checked against the reference,
+        which materialises every selected key."""
+        case = _build(dtype=jnp.bfloat16, t_count=1024, k_blocks=512, pages_per_seq=24)
+        got = _run(case, block_units=128)
+        rows = jnp.asarray([0, 511, 1023])
+        sub = {**case, **{name: case[name][rows] for name in ("q", "blk", "pos", "req")}}
+        self.assertLess(_rel_err(got[rows], _reference(sub)), 2e-2)
+
     def test_partial_selection_and_padding(self):
         """Short sequences leave -1 padding in block_ids; those lanes must not
         reach the softmax even though their DMA is clamped to a real address."""

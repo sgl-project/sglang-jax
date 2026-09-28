@@ -181,7 +181,11 @@ class _Fixture:
                 compress_ratio=self.indexer.compress_ratio,
                 use_kernel=False,
             )
-        return block_ids, groups
+        # The attention kernel runs on a shard_map's local view in production.
+        # An array made under an explicit mesh keeps the mesh in its type even
+        # when replicated, and interpret mode cannot mix it with the kernel's
+        # own buffers, so the selection crosses back as a plain array.
+        return jnp.asarray(np.asarray(block_ids)), groups
 
     def attend(self, block_ids):
         return sparse_gqa_attention(

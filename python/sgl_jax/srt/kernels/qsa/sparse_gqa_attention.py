@@ -38,12 +38,12 @@ def _align(x: int, a: int) -> int:
 
 def _kernel(
     # scalar prefetch (SMEM)
-    blk_ref,  # i32[T, K]  selected block ids, -1 padded
     pos_ref,  # i32[T]     query position within its request
-    req_ref,  # i32[T]     query -> request
-    pt_ref,  # i32[S * pages_per_seq]  logical page -> physical page, flattened
+    req_ref,  # i32[T]     query -> request; picks pt_ref's row, unread in the body
     # inputs
     q_ref,  # [1, H, D]
+    blk_ref,  # SMEM i32[1, 1, K]  this query's block ids, -1 padded
+    pt_ref,  # SMEM i32[1, 1, pages_per_seq]  this query's request's page row
     cache_hbm,  # [num_pages * page_size, head_axis, packing, D]
     # output
     o_ref,  # [1, H, D]
@@ -65,7 +65,6 @@ def _kernel(
     heads, head_dim = q_ref.shape[1], q_ref.shape[2]
     q = q_ref[0]  # [H, D]
     qpos = pos_ref[t]
-    pt_base = req_ref[t] * pages_per_seq
     lane = jnp.arange(CBR, dtype=jnp.int32)
 
     def _src(unit):
@@ -78,7 +77,7 @@ def _kernel(
         first = unit * ratio
         page = first // page_size
         offset = first - page * page_size
-        phys = pt_ref[jnp.minimum(pt_base + page, pt_ref.shape[0] - 1)]
+        phys = pt_ref[0, 0, jnp.minimum(page, pages_per_seq - 1)]
         return cache_hbm.at[pl.ds(phys * page_size + offset, ratio)]
 
     def _copy(unit, slot):
@@ -148,7 +147,7 @@ def _kernel(
         def unit_at(g):
             # Clamp the column (the last chunk may run past K) and the block id
             # (top-k pads with -1); both lanes are masked out below.
-            return jnp.maximum(blk_ref[t, jnp.minimum(first + g, K - 1)], 0)
+            return jnp.maximum(blk_ref[0, 0, jnp.minimum(first + g, K - 1)], 0)
 
         for g in range(G):
             _copy(unit_at(g), g).start()
@@ -164,7 +163,7 @@ def _kernel(
         for g in range(G):
             lo = g * ratio
             sel = (lane >= lo) & (lane < lo + ratio)
-            u_g = blk_ref[t, jnp.minimum(first + g, K - 1)]
+            u_g = blk_ref[0, 0, jnp.minimum(first + g, K - 1)]
             inr = ((first + g) < K).astype(jnp.int32)
             u_vec = jnp.where(sel, u_g, u_vec)
             row_vec = jnp.where(sel, lane - lo, row_vec)
@@ -221,6 +220,13 @@ def sparse_gqa_attention(
     ceiling, not a knob with an open top: 512 blocks at 128 per chunk is four
     chunks with room left for the query and output semaphores.
 
+    The index tables reach SMEM one query at a time: its row of ``block_ids``
+    and its request's row of ``page_table``, as blocks the pipeline fetches
+    while the previous query runs. SMEM is 1 MiB per core, and scalar-prefetching
+    the tables whole would put ``T * K`` block ids there -- 4 MiB for a
+    2048-token chunk at 512 blocks -- plus every request's page row. Only the
+    per-query scalars, 8 bytes each, are prefetched whole.
+
     Returns f32[T, H, D].
     """
     t_count, n_heads, head_dim = q.shape
@@ -268,10 +274,16 @@ def sparse_gqa_attention(
             pages_per_seq=page_table.shape[1],
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=4,
+            num_scalar_prefetch=2,
             grid=(t_count,),
             in_specs=[
                 pl.BlockSpec((1, n_heads, head_dim), lambda i, *_: (i, 0, 0)),
+                pl.BlockSpec((1, 1, k_blocks), lambda i, *_: (i, 0, 0), memory_space=pltpu.SMEM),
+                pl.BlockSpec(
+                    (1, 1, page_table.shape[1]),
+                    lambda i, pos, req: (req[i], 0, 0),
+                    memory_space=pltpu.SMEM,
+                ),
                 pl.BlockSpec(memory_space=pltpu.HBM),
             ],
             out_specs=pl.BlockSpec((1, n_heads, head_dim), lambda i, *_: (i, 0, 0)),
@@ -284,10 +296,10 @@ def sparse_gqa_attention(
         interpret=interpret,
     )
     return kernel(
-        block_ids,
         positions,
         token_to_req,
-        page_table.reshape(-1),
         q,
+        block_ids.reshape(t_count, 1, k_blocks),
+        page_table.reshape(page_table.shape[0], 1, page_table.shape[1]),
         cache.reshape(num_pages * page_size, head_axis, packing, head_dim),
     )
