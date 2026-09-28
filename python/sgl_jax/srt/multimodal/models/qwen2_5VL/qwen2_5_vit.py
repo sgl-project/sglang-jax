@@ -12,11 +12,11 @@ from jax.sharding import Mesh
 
 from sgl_jax.srt.layers.activation import ACT2FN
 from sgl_jax.srt.layers.embeddings import Embed
+from sgl_jax.srt.model_loader.weights import WeightLoader, WeightSpec
 from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
     QwenVLModelVitConfig,
 )
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 _FLASH_MHA = None
 
@@ -509,7 +509,12 @@ class Qwen2_5_VL_VisionTransformer(nnx.Module):
         rotary_pos_emb_thw = rotary_pos_emb_thw.reshape(-1, rotary_pos_emb_thw.shape[-1])
         cu_seq_lens_thw = jnp.full(t, h * w, dtype=jnp.int32)
 
-        return rotary_pos_emb_thw, window_index_thw, cu_seq_lens_window_thw, cu_seq_lens_thw
+        return (
+            rotary_pos_emb_thw,
+            window_index_thw,
+            cu_seq_lens_window_thw,
+            cu_seq_lens_thw,
+        )
 
     def compute_aux_arrays(self, grid_thw: tuple[tuple[int, int, int]]):
         num_grids = len(grid_thw)
@@ -665,16 +670,16 @@ class Qwen2_5_VL_VisionModel(nnx.Module):
 
         if self.mesh is not None:
             with jax.set_mesh(self.mesh):
-                loader.load_weights_from_safetensors(weight_mappings)
+                loader.load(weight_mappings)
         else:
-            loader.load_weights_from_safetensors(weight_mappings)
+            loader.load(weight_mappings)
 
         logger.info("Qwen2.5 VL - ViT Stage weights loaded successfully!")
 
     def _create_qwen2_5_vl_vision_weight_mappings(self) -> dict:
         mappings = {}
 
-        mappings["model.embed_tokens.weight"] = WeightMapping(
+        mappings["model.embed_tokens.weight"] = WeightSpec(
             target_path="text_embed.embedding",
             sharding=(None, None),
             transpose=False,
@@ -687,34 +692,34 @@ class Qwen2_5_VL_VisionModel(nnx.Module):
                     # Patch embedding (Conv layer)
                     # PyTorch: [out_ch, in_ch, kd, kh, kw] -> JAX: [kd, kh, kw, in_ch, out_ch]
                     # Vision layers use replicated weights (no tensor parallelism)
-                    "visual.patch_embed.proj.weight": WeightMapping(
+                    "visual.patch_embed.proj.weight": WeightSpec(
                         target_path="visual.patch_embed.proj.kernel",
                         sharding=(None, None, None, None, None),
                         transpose_axes=(2, 3, 4, 1, 0),
                         # transpose=(2, 3, 4, 1, 0),  # Permute axes for Conv3D
                     ),
                     # Merger layers
-                    "visual.merger.ln_q.weight": WeightMapping(
+                    "visual.merger.ln_q.weight": WeightSpec(
                         target_path="visual.merger.ln_q.scale",
                         sharding=(None,),
                         transpose=False,
                     ),
-                    "visual.merger.mlp.0.weight": WeightMapping(
+                    "visual.merger.mlp.0.weight": WeightSpec(
                         target_path="visual.merger.mlp_fc1.kernel",
                         sharding=(None, None),
                         transpose=True,
                     ),
-                    "visual.merger.mlp.0.bias": WeightMapping(
+                    "visual.merger.mlp.0.bias": WeightSpec(
                         target_path="visual.merger.mlp_fc1.bias",
                         sharding=(None,),
                         transpose=False,
                     ),
-                    "visual.merger.mlp.2.weight": WeightMapping(
+                    "visual.merger.mlp.2.weight": WeightSpec(
                         target_path="visual.merger.mlp_fc2.kernel",
                         sharding=(None, None),
                         transpose=True,
                     ),
-                    "visual.merger.mlp.2.bias": WeightMapping(
+                    "visual.merger.mlp.2.bias": WeightSpec(
                         target_path="visual.merger.mlp_fc2.bias",
                         sharding=(None,),
                         transpose=False,
@@ -738,65 +743,65 @@ class Qwen2_5_VL_VisionModel(nnx.Module):
 
         mappings = {
             # Layer norms
-            f"{prefix}.norm1.weight": WeightMapping(
+            f"{prefix}.norm1.weight": WeightSpec(
                 target_path=f"{target_prefix}.norm1.scale",
                 sharding=(None,),
                 transpose=False,
             ),
-            f"{prefix}.norm2.weight": WeightMapping(
+            f"{prefix}.norm2.weight": WeightSpec(
                 target_path=f"{target_prefix}.norm2.scale",
                 sharding=(None,),
                 transpose=False,
             ),
             # QKV projection (single layer) - replicated, no sharding
-            f"{prefix}.attn.qkv.weight": WeightMapping(
+            f"{prefix}.attn.qkv.weight": WeightSpec(
                 target_path=f"{target_prefix}.attn.qkv_proj.kernel",
                 sharding=(None, None),
                 transpose=True,
             ),
-            f"{prefix}.attn.qkv.bias": WeightMapping(
+            f"{prefix}.attn.qkv.bias": WeightSpec(
                 target_path=f"{target_prefix}.attn.qkv_proj.bias",
                 sharding=(None,),
                 transpose=False,
             ),
             # Output projection - replicated, no sharding
-            f"{prefix}.attn.proj.weight": WeightMapping(
+            f"{prefix}.attn.proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.attn.proj.kernel",
                 sharding=(None, None),
                 transpose=True,
             ),
-            f"{prefix}.attn.proj.bias": WeightMapping(
+            f"{prefix}.attn.proj.bias": WeightSpec(
                 target_path=f"{target_prefix}.attn.proj.bias",
                 sharding=(None,),
                 transpose=False,
             ),
             # MLP layers - replicated, no sharding
-            f"{prefix}.mlp.gate_proj.weight": WeightMapping(
+            f"{prefix}.mlp.gate_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.mlp.gate_proj.kernel",
                 sharding=(None, None),
                 transpose=True,
             ),
-            f"{prefix}.mlp.gate_proj.bias": WeightMapping(
+            f"{prefix}.mlp.gate_proj.bias": WeightSpec(
                 target_path=f"{target_prefix}.mlp.gate_proj.bias",
                 sharding=(None,),
                 transpose=False,
             ),
-            f"{prefix}.mlp.up_proj.weight": WeightMapping(
+            f"{prefix}.mlp.up_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.mlp.up_proj.kernel",
                 sharding=(None, None),
                 transpose=True,
             ),
-            f"{prefix}.mlp.up_proj.bias": WeightMapping(
+            f"{prefix}.mlp.up_proj.bias": WeightSpec(
                 target_path=f"{target_prefix}.mlp.up_proj.bias",
                 sharding=(None,),
                 transpose=False,
             ),
-            f"{prefix}.mlp.down_proj.weight": WeightMapping(
+            f"{prefix}.mlp.down_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.mlp.down_proj.kernel",
                 sharding=(None, None),
                 transpose=True,
             ),
-            f"{prefix}.mlp.down_proj.bias": WeightMapping(
+            f"{prefix}.mlp.down_proj.bias": WeightSpec(
                 target_path=f"{target_prefix}.mlp.down_proj.bias",
                 sharding=(None,),
                 transpose=False,

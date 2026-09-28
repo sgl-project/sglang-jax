@@ -19,7 +19,7 @@ from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK, create_moe_weights_ma
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
+from sgl_jax.srt.model_loader.weights import WeightLoader, WeightSpec
 
 logger = logging.getLogger(__name__)
 
@@ -491,17 +491,17 @@ class Qwen2MoeForCausalLM(nnx.Module):
 
         weight_mappings = self._create_qwen2_moe_weight_mappings()
 
-        loader.load_weights_from_safetensors(weight_mappings)
+        loader.load(weight_mappings)
         logger.info("Qwen2Moe weights loaded successfully!")
 
     def _create_qwen2_moe_weight_mappings(self) -> dict:
         mappings = {
-            "model.embed_tokens.weight": WeightMapping(
+            "model.embed_tokens.weight": WeightSpec(
                 target_path="model.embed_tokens.embedding",
                 sharding=("tensor", None),
                 transpose=False,
             ),
-            "model.norm.weight": WeightMapping(
+            "model.norm.weight": WeightSpec(
                 target_path="model.norm.scale", sharding=(None,), transpose=False
             ),
         }
@@ -522,38 +522,38 @@ class Qwen2MoeForCausalLM(nnx.Module):
         target_prefix = f"model.layers.{layer_idx}"
 
         mappings = {
-            f"{prefix}.input_layernorm.weight": WeightMapping(
+            f"{prefix}.input_layernorm.weight": WeightSpec(
                 target_path=f"{target_prefix}.input_layernorm.scale",
                 sharding=(None,),
                 transpose=False,
             ),
-            f"{prefix}.post_attention_layernorm.weight": WeightMapping(
+            f"{prefix}.post_attention_layernorm.weight": WeightSpec(
                 target_path=f"{target_prefix}.post_attention_layernorm.scale",
                 sharding=(None,),
                 transpose=False,
             ),
-            f"{prefix}.self_attn.q_proj.weight": WeightMapping(
+            f"{prefix}.self_attn.q_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.self_attn.q_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
                 head_dim_padding=True,
                 kv_head_padding=False,
             ),
-            f"{prefix}.self_attn.k_proj.weight": WeightMapping(
+            f"{prefix}.self_attn.k_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.self_attn.k_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
                 head_dim_padding=True,
                 kv_head_padding=True,
             ),
-            f"{prefix}.self_attn.v_proj.weight": WeightMapping(
+            f"{prefix}.self_attn.v_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.self_attn.v_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
                 head_dim_padding=True,
                 kv_head_padding=True,
             ),
-            f"{prefix}.self_attn.o_proj.weight": WeightMapping(
+            f"{prefix}.self_attn.o_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.self_attn.o_proj.weight",
                 sharding=("tensor", None),
                 transpose=True,
@@ -565,28 +565,28 @@ class Qwen2MoeForCausalLM(nnx.Module):
         # Add bias mappings if attention_bias is True
         if getattr(self.config, "attention_bias", True):
             bias_mappings = {
-                f"{prefix}.self_attn.q_proj.bias": WeightMapping(
+                f"{prefix}.self_attn.q_proj.bias": WeightSpec(
                     target_path=f"{target_prefix}.self_attn.q_proj.bias",
                     sharding=(None,),
                     transpose=False,
                     head_dim_padding=True,
                     kv_head_padding=False,
                 ),
-                f"{prefix}.self_attn.k_proj.bias": WeightMapping(
+                f"{prefix}.self_attn.k_proj.bias": WeightSpec(
                     target_path=f"{target_prefix}.self_attn.k_proj.bias",
                     sharding=(None,),
                     transpose=False,
                     head_dim_padding=True,
                     kv_head_padding=True,
                 ),
-                f"{prefix}.self_attn.v_proj.bias": WeightMapping(
+                f"{prefix}.self_attn.v_proj.bias": WeightSpec(
                     target_path=f"{target_prefix}.self_attn.v_proj.bias",
                     sharding=(None,),
                     transpose=False,
                     head_dim_padding=True,
                     kv_head_padding=True,
                 ),
-                f"{prefix}.self_attn.o_proj.bias": WeightMapping(
+                f"{prefix}.self_attn.o_proj.bias": WeightSpec(
                     target_path=f"{target_prefix}.self_attn.o_proj.bias",
                     sharding=(None,),
                     transpose=False,
@@ -595,7 +595,7 @@ class Qwen2MoeForCausalLM(nnx.Module):
             mappings.update(bias_mappings)
 
         # MoE mappings for expert layers
-        mappings[f"{prefix}.mlp.gate.weight"] = WeightMapping(
+        mappings[f"{prefix}.mlp.gate.weight"] = WeightSpec(
             target_path=f"{target_prefix}.moe_gate.kernel",
             sharding=(None, None),
             transpose=True,
@@ -607,22 +607,22 @@ class Qwen2MoeForCausalLM(nnx.Module):
             and getattr(self.config, "shared_expert_intermediate_size", 0) > 0
         ):
             shared_expert_mappings = {
-                f"{prefix}.mlp.shared_expert.gate_proj.weight": WeightMapping(
+                f"{prefix}.mlp.shared_expert.gate_proj.weight": WeightSpec(
                     target_path=f"{target_prefix}.shared_experts.gate_proj.weight",
                     sharding=(None, "tensor"),
                     transpose=True,
                 ),
-                f"{prefix}.mlp.shared_expert.up_proj.weight": WeightMapping(
+                f"{prefix}.mlp.shared_expert.up_proj.weight": WeightSpec(
                     target_path=f"{target_prefix}.shared_experts.up_proj.weight",
                     sharding=(None, "tensor"),
                     transpose=True,
                 ),
-                f"{prefix}.mlp.shared_expert.down_proj.weight": WeightMapping(
+                f"{prefix}.mlp.shared_expert.down_proj.weight": WeightSpec(
                     target_path=f"{target_prefix}.shared_experts.down_proj.weight",
                     sharding=("tensor", None),
                     transpose=True,
                 ),
-                f"{prefix}.mlp.shared_expert_gate.weight": WeightMapping(
+                f"{prefix}.mlp.shared_expert_gate.weight": WeightSpec(
                     target_path=f"{target_prefix}.shared_expert_gate.weight",
                     sharding=(None, None),
                     transpose=True,

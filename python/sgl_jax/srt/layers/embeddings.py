@@ -30,7 +30,7 @@ from sgl_jax.srt.environ import envs as _envs
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
 if TYPE_CHECKING:
-    from sgl_jax.srt.utils.weight_utils import WeightMapping
+    from sgl_jax.srt.model_loader.weights import WeightSpec
 
 
 class Embed(nnx.Module):
@@ -111,11 +111,11 @@ class Embed(nnx.Module):
         output = embedding.at[inputs].get(out_sharding=output_sharding)
         return output
 
-    def weight_mapping(self, target_path: str) -> "WeightMapping":
+    def weight_mapping(self, target_path: str) -> "WeightSpec":
         """Declare the checkpoint layout without changing tied embedding storage."""
-        from sgl_jax.srt.utils.weight_utils import WeightMapping
+        from sgl_jax.srt.model_loader.weights import WeightSpec
 
-        return WeightMapping(target_path, sharding=self.kernel_axes)
+        return WeightSpec(target_path, sharding=self.kernel_axes)
 
     def attend(self, query: jax.Array) -> jax.Array:
         """Attend over the embedding using a query array.
@@ -201,7 +201,7 @@ class ParallelLMHead(Embed):
         else:
             self.bias = None
 
-    def weight_mapping(self, target_path: str) -> "WeightMapping":
+    def weight_mapping(self, target_path: str) -> "WeightSpec":
         mapping = super().weight_mapping(target_path)
         if self.vocab_padding:
             mapping.pad_width = ((0, self.vocab_padding), (0, 0))

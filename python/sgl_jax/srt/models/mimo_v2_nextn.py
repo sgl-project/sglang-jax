@@ -8,7 +8,6 @@ fused-QKV per-shard FP8 layout as the V2.5-Pro target.
 """
 
 import logging
-from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -22,8 +21,9 @@ from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.model_loader.weights import WeightLoader, WeightSpec
 from sgl_jax.srt.models.mimo_v2_flash import MiMoV2Attention, MiMoV2MLP
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
+from sgl_jax.srt.models.mimo_weight_loading import fused_qkv_spec, prepare_mimo
 
 logger = logging.getLogger(__name__)
 
@@ -187,7 +187,7 @@ class MiMoV2MTPForCausalLM(nnx.Module):
             mesh=self.mesh,
             enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
         )
-        self._fused_qkv_buffers: dict[int, dict] = {}
+
         self._uses_fused_mtp_qkv = False
         self.hot_token_ids = None
 
@@ -208,85 +208,59 @@ class MiMoV2MTPForCausalLM(nnx.Module):
             model=self, model_config=model_config, mesh=self.mesh, dtype=self.dtype
         )
         mappings = self._create_weight_mappings()
-        self.loader.load_weights_from_safetensors(mappings)
+        self.loader.load(mappings)
 
-        if self.loader.is_static_quant:
-            attn = self.model.mtp_block.self_attn
-            head_dim, v_head_dim = attn.head_dim, attn.v_head_dim
-            if self._uses_fused_mtp_qkv:
-                # dequant_fused_qkv reads full-attn config fields; the MTP block uses
-                # SWA dims, so derive the split config from the actual layer.
-                mtp_qkv_config = SimpleNamespace(
-                    head_dim=head_dim,
-                    v_head_dim=v_head_dim,
-                    num_attention_heads=attn.q_head_num,
-                    num_key_value_heads=attn.k_head_num,
-                )
-                self.loader.dequant_fused_qkv(
-                    self._fused_qkv_buffers, [self.model.mtp_block], mtp_qkv_config
-                )
-            else:
-                self.loader.dequant_fp8_layers(
-                    [self.model.mtp_block],
-                    specs=[
-                        ("self_attn.q_proj", head_dim),
-                        ("self_attn.k_proj", head_dim),
-                        ("self_attn.v_proj", v_head_dim),
-                    ],
-                )
-            self.loader.dequant_fp8_layers(
-                [self.model.mtp_block],
-                specs=[
-                    ("mlp.gate_proj", None),
-                    ("mlp.up_proj", None),
-                    ("mlp.down_proj", None),
-                ],
-            )
-            self.loader.replicate_kv_heads(
-                [self.model.mtp_block],
-                specs=[("self_attn.k_proj", head_dim), ("self_attn.v_proj", v_head_dim)],
-                target_kv_heads_fn=lambda attn: attn.k_head_num,
-            )
         logger.info(
             "MiMoV2 MTP layer %d weights loaded (fused-qkv FP8=%s)",
             self.mtp_layer_idx,
             self.loader.is_static_quant,
         )
 
-    def _create_weight_mappings(self) -> dict[str, WeightMapping]:
+    def prepare_weight_loading(self, loader, mappings):
+        return prepare_mimo(
+            self, loader, mappings, [("model.mtp_block", self.model.mtp_block, True)]
+        )
+
+    def _create_weight_mappings(self) -> dict[str, WeightSpec]:
         idx = self.mtp_layer_idx
         prefix = f"model.mtp.layers.{idx}"
         block = "model.mtp_block"
         is_fp8 = self.loader.is_static_quant
 
-        mappings: dict[str, WeightMapping] = {
-            f"{prefix}.enorm.weight": WeightMapping(
+        mappings: dict[str, WeightSpec] = {
+            f"{prefix}.enorm.weight": WeightSpec(
                 target_path="model.enorm.scale", sharding=(None,), transpose=False
             ),
-            f"{prefix}.hnorm.weight": WeightMapping(
+            f"{prefix}.hnorm.weight": WeightSpec(
                 target_path="model.hnorm.scale", sharding=(None,), transpose=False
             ),
-            f"{prefix}.eh_proj.weight": WeightMapping(
-                target_path="model.eh_proj.weight", sharding=(None, None), transpose=True
+            f"{prefix}.eh_proj.weight": WeightSpec(
+                target_path="model.eh_proj.weight",
+                sharding=(None, None),
+                transpose=True,
             ),
-            f"{prefix}.final_layernorm.weight": WeightMapping(
-                target_path="model.final_layernorm.scale", sharding=(None,), transpose=False
+            f"{prefix}.final_layernorm.weight": WeightSpec(
+                target_path="model.final_layernorm.scale",
+                sharding=(None,),
+                transpose=False,
             ),
-            f"{prefix}.input_layernorm.weight": WeightMapping(
-                target_path=f"{block}.input_layernorm.scale", sharding=(None,), transpose=False
+            f"{prefix}.input_layernorm.weight": WeightSpec(
+                target_path=f"{block}.input_layernorm.scale",
+                sharding=(None,),
+                transpose=False,
             ),
-            f"{prefix}.pre_mlp_layernorm.weight": WeightMapping(
+            f"{prefix}.pre_mlp_layernorm.weight": WeightSpec(
                 target_path=f"{block}.post_attention_layernorm.scale",
                 sharding=(None,),
                 transpose=False,
             ),
-            f"{prefix}.self_attn.o_proj.weight": WeightMapping(
+            f"{prefix}.self_attn.o_proj.weight": WeightSpec(
                 target_path=f"{block}.self_attn.o_proj.weight",
                 sharding=("tensor", None),
                 transpose=True,
                 head_dim_padding=True,
             ),
-            f"{prefix}.self_attn.attention_sink_bias": WeightMapping(
+            f"{prefix}.self_attn.attention_sink_bias": WeightSpec(
                 target_path=f"{block}.self_attn.attention_sink_bias",
                 sharding=("tensor",),
                 transpose=False,
@@ -302,14 +276,15 @@ class MiMoV2MTPForCausalLM(nnx.Module):
         self._uses_fused_mtp_qkv = has_fused_qkv
 
         if has_fused_qkv and is_fp8 and not self.loader.is_quant_ignored(qkv_key):
-            mappings[f"{qkv_key}.weight"] = WeightMapping(
-                target_path="__FUSED_QKV_WEIGHT__0", sharding=(None, None), transpose=False
-            )
-            mappings[f"{qkv_key}.weight_scale_inv"] = WeightMapping(
-                target_path="__FUSED_QKV_SCALE__0", sharding=(None, None), transpose=False
+            mappings[qkv_key] = fused_qkv_spec(
+                qkv_key,
+                f"{block}.self_attn",
+                self.model.mtp_block.self_attn,
+                self.mesh,
+                self.loader.model_config.quantization_config.weight_block_size[0],
             )
         elif has_fused_qkv:
-            mappings[f"{qkv_key}.weight"] = WeightMapping(
+            mappings[f"{qkv_key}.weight"] = WeightSpec(
                 target_path=[
                     f"{block}.self_attn.q_proj.weight",
                     f"{block}.self_attn.k_proj.weight",
@@ -329,7 +304,7 @@ class MiMoV2MTPForCausalLM(nnx.Module):
                 hf_key = f"{prefix}.self_attn.{proj}"
                 ignored = self.loader.is_quant_ignored(hf_key)
                 weight_suffix = "weight" if (not is_fp8 or ignored) else "weight_q"
-                mappings[f"{hf_key}.weight"] = WeightMapping(
+                mappings[f"{hf_key}.weight"] = WeightSpec(
                     target_path=f"{block}.self_attn.{proj}.{weight_suffix}",
                     sharding=(None, "tensor"),
                     transpose=True,
@@ -337,7 +312,7 @@ class MiMoV2MTPForCausalLM(nnx.Module):
                     kv_head_padding=not is_fp8,
                 )
                 if is_fp8 and not ignored:
-                    mappings[f"{hf_key}.weight_scale_inv"] = WeightMapping(
+                    mappings[f"{hf_key}.weight_scale_inv"] = WeightSpec(
                         target_path=f"{block}.self_attn.{proj}.weight_scale",
                         sharding=(None, None),
                         transpose=False,
@@ -350,13 +325,13 @@ class MiMoV2MTPForCausalLM(nnx.Module):
         ]:
             hf_key = f"{prefix}.mlp.{proj}"
             suffix = "weight_q" if is_fp8 else "weight"
-            mappings[f"{hf_key}.weight"] = WeightMapping(
+            mappings[f"{hf_key}.weight"] = WeightSpec(
                 target_path=f"{block}.mlp.{proj}.{suffix}",
                 sharding=sharding,
                 transpose=True,
             )
             if is_fp8:
-                mappings[f"{hf_key}.weight_scale_inv"] = WeightMapping(
+                mappings[f"{hf_key}.weight_scale_inv"] = WeightSpec(
                     target_path=f"{block}.mlp.{proj}.weight_scale",
                     sharding=(None, None),
                     transpose=False,

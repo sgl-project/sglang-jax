@@ -23,8 +23,8 @@ from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import EPMoE
 from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.model_loader.weights import WeightLoader, WeightSpec
 from sgl_jax.srt.models.deepseek_v3 import DeepseekV3Attention
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
@@ -667,23 +667,20 @@ class BailingMoeV3ForCausalLM(nnx.Module):
             dtype=self.dtype,
         )
         weight_mappings = self._create_weight_mappings()
-        loader.load_weights_from_safetensors(
+        loader.load(
             weight_mappings,
             validate_checkpoint_coverage=True,
         )
-        for layer in self.model.layers:
-            if not layer.is_kda:
-                layer.self_attn.post_load_weights()
         logger.info("Ling-3.0-tiny weights loaded successfully.")
 
     def _create_weight_mappings(self) -> dict:
-        mappings: dict[str, WeightMapping] = {
-            "model.word_embeddings.weight": WeightMapping(
+        mappings: dict[str, WeightSpec] = {
+            "model.word_embeddings.weight": WeightSpec(
                 target_path="model.embed_tokens.embedding",
                 sharding=("tensor", None),
                 transpose=False,
             ),
-            "model.norm.weight": WeightMapping(
+            "model.norm.weight": WeightSpec(
                 target_path="model.norm.scale",
                 sharding=(None,),
                 transpose=False,
@@ -711,13 +708,13 @@ class BailingMoeV3ForCausalLM(nnx.Module):
     def _create_layer_mappings(self, layer_idx: int, *, is_dense: bool, is_kda: bool) -> dict:
         prefix = f"model.layers.{layer_idx}"
         target_prefix = f"model.layers.{layer_idx}"
-        mappings: dict[str, WeightMapping] = {
-            f"{prefix}.input_layernorm.weight": WeightMapping(
+        mappings: dict[str, WeightSpec] = {
+            f"{prefix}.input_layernorm.weight": WeightSpec(
                 target_path=f"{target_prefix}.input_layernorm.scale",
                 sharding=(None,),
                 transpose=False,
             ),
-            f"{prefix}.post_attention_layernorm.weight": WeightMapping(
+            f"{prefix}.post_attention_layernorm.weight": WeightSpec(
                 target_path=f"{target_prefix}.post_attention_layernorm.scale",
                 sharding=(None,),
                 transpose=False,
@@ -730,12 +727,12 @@ class BailingMoeV3ForCausalLM(nnx.Module):
 
         if is_kda:
             for proj in ("q_proj", "k_proj", "v_proj", "f_proj", "g_proj", "b_proj"):
-                mappings[f"{attn_src}.{proj}.weight"] = WeightMapping(
+                mappings[f"{attn_src}.{proj}.weight"] = WeightSpec(
                     target_path=f"{attn_target}.{proj}.weight",
                     sharding=(None, "tensor"),
                     transpose=True,
                 )
-            mappings[f"{attn_src}.o_proj.weight"] = WeightMapping(
+            mappings[f"{attn_src}.o_proj.weight"] = WeightSpec(
                 target_path=f"{attn_target}.o_proj.weight",
                 sharding=("tensor", None),
                 transpose=True,
@@ -745,65 +742,65 @@ class BailingMoeV3ForCausalLM(nnx.Module):
             head_dim = self.config.linear_attn_config["head_dim"]
             projection_size = num_heads * head_dim
             for conv_name in ("q_conv1d", "k_conv1d", "v_conv1d"):
-                mappings[f"{attn_src}.{conv_name}.weight"] = WeightMapping(
+                mappings[f"{attn_src}.{conv_name}.weight"] = WeightSpec(
                     target_path=f"{attn_target}.attn.{conv_name}.weight",
                     sharding=("tensor", None),
                     transpose=False,
                     reshape=(projection_size, conv_size),
                 )
-            mappings[f"{attn_src}.o_norm.weight"] = WeightMapping(
+            mappings[f"{attn_src}.o_norm.weight"] = WeightSpec(
                 target_path=f"{attn_target}.o_norm.weight",
                 sharding=(None,),
                 transpose=False,
             )
-            mappings[f"{attn_src}.dt_bias"] = WeightMapping(
+            mappings[f"{attn_src}.dt_bias"] = WeightSpec(
                 target_path=f"{attn_target}.attn.dt_bias",
                 sharding=("tensor",),
                 transpose=False,
             )
-            mappings[f"{attn_src}.A_log"] = WeightMapping(
+            mappings[f"{attn_src}.A_log"] = WeightSpec(
                 target_path=f"{attn_target}.A_log",
                 sharding=(None, None, "tensor", None),
                 transpose=False,
                 reshape=(1, 1, self.config.num_attention_heads, 1),
             )
         else:
-            mappings[f"{attn_src}.q_a_proj.weight"] = WeightMapping(
+            mappings[f"{attn_src}.q_a_proj.weight"] = WeightSpec(
                 target_path=f"{attn_target}.q_a_proj.weight",
                 sharding=(None, None),
                 transpose=True,
             )
-            mappings[f"{attn_src}.q_a_layernorm.weight"] = WeightMapping(
+            mappings[f"{attn_src}.q_a_layernorm.weight"] = WeightSpec(
                 target_path=f"{attn_target}.q_a_layernorm.scale",
                 sharding=(None,),
                 transpose=False,
             )
-            mappings[f"{attn_src}.q_b_proj.weight"] = WeightMapping(
+            mappings[f"{attn_src}.q_b_proj.weight"] = WeightSpec(
                 target_path=f"{attn_target}.q_b_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             )
-            mappings[f"{attn_src}.kv_a_proj_with_mqa.weight"] = WeightMapping(
+            mappings[f"{attn_src}.kv_a_proj_with_mqa.weight"] = WeightSpec(
                 target_path=f"{attn_target}.kv_a_proj.weight",
                 sharding=(None, None),
                 transpose=True,
             )
-            mappings[f"{attn_src}.kv_a_layernorm.weight"] = WeightMapping(
+            mappings[f"{attn_src}.kv_a_layernorm.weight"] = WeightSpec(
                 target_path=f"{attn_target}.kv_a_layernorm.scale",
                 sharding=(None,),
                 transpose=False,
             )
-            mappings[f"{attn_src}.kv_b_proj.weight"] = WeightMapping(
+            mappings[f"{attn_src}.kv_b_proj.weight"] = WeightSpec(
                 target_path=f"{attn_target}.kv_b_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             )
-            mappings[f"{attn_src}.g_proj.weight"] = WeightMapping(
+            mappings[f"{attn_src}.g_proj.weight"] = WeightSpec(
                 target_path=f"{attn_target}.g_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             )
-            mappings[f"{attn_src}.dense.weight"] = WeightMapping(
+            mappings[f"{attn_src}.dense.weight"] = WeightSpec(
                 target_path=f"{attn_target}.o_proj.weight",
                 sharding=("tensor", None),
                 transpose=True,
@@ -815,18 +812,18 @@ class BailingMoeV3ForCausalLM(nnx.Module):
                 ("up_proj", (None, "tensor")),
                 ("down_proj", ("tensor", None)),
             ]:
-                mappings[f"{prefix}.mlp.{proj_name}.weight"] = WeightMapping(
+                mappings[f"{prefix}.mlp.{proj_name}.weight"] = WeightSpec(
                     target_path=f"{target_prefix}.mlp.{proj_name}.weight",
                     sharding=sharding,
                     transpose=True,
                 )
         else:
-            mappings[f"{prefix}.mlp.gate.weight"] = WeightMapping(
+            mappings[f"{prefix}.mlp.gate.weight"] = WeightSpec(
                 target_path=f"{target_prefix}.moe_gate.kernel",
                 sharding=(None, None),
                 transpose=True,
             )
-            mappings[f"{prefix}.mlp.gate.expert_bias"] = WeightMapping(
+            mappings[f"{prefix}.mlp.gate.expert_bias"] = WeightSpec(
                 target_path=f"{target_prefix}.moe_gate.bias",
                 sharding=(None,),
             )
@@ -862,8 +859,9 @@ class BailingMoeV3ForCausalLM(nnx.Module):
                     f"{prefix}.mlp.experts.{i}.{source_name}.weight"
                     for i in range(self.config.num_experts)
                 ]
-                mappings[f"__MOE_EXPERTS__{target_path_base}"] = WeightMapping(
-                    target_path=[target_path_base] + expert_keys,
+                mappings[f"{target_path_base}"] = WeightSpec(
+                    target_path=target_path_base,
+                    sources=tuple(expert_keys),
                     sharding=sharding,
                     transpose=True,
                     physical_to_logical_map=phy_to_log,
@@ -875,7 +873,7 @@ class BailingMoeV3ForCausalLM(nnx.Module):
                     ("up_proj", (None, "tensor")),
                     ("down_proj", ("tensor", None)),
                 ]:
-                    mappings[f"{prefix}.mlp.shared_experts.{proj_name}.weight"] = WeightMapping(
+                    mappings[f"{prefix}.mlp.shared_experts.{proj_name}.weight"] = WeightSpec(
                         target_path=f"{target_prefix}.shared_experts.{proj_name}.weight",
                         sharding=sharding,
                         transpose=True,
