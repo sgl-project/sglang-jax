@@ -371,6 +371,15 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             )
             use_aot_dispatch = False
 
+        # Match the exact compile options used by the selected serving path so
+        # both ordinary JIT and AOT dispatch reuse JAX's compiled-executable cache.
+        self.model_compile_options = lambda batch: (
+            CompilationManager.compiler_options(self.attn_backend, batch.forward_batch)
+            if use_aot_dispatch
+            else None
+        )
+        self.sampler_compile_options = sampler_compiler_options if use_aot_dispatch else None
+
         if use_aot_dispatch or executable_store is not None:
             self._run_model_dispatcher = AotDispatcher(
                 jitted_run_model,
@@ -892,42 +901,11 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
         return attn_backend_wrapper(self, full_attn_backend)
 
-    def precompile_model(self, pool, batch, on_compiled):
-        """Prepare the ordinary forward's metadata and lower it without donation."""
+    def lower_model(self, batch):
+        """Prepare forward metadata and lower under the caller's model mesh."""
         self.attn_backend.forward_metadata = self.attn_backend.get_forward_metadata(batch)
         logits_metadata = LogitsMetadata.from_model_worker_batch(batch, self.mesh)
-        with jax.set_mesh(self.mesh):
-            dispatcher = getattr(self, "_run_model_dispatcher", None)
-            if dispatcher is not None:
-                dispatcher.precompile(
-                    pool,
-                    batch.forward_batch,
-                    self.memory_pools,
-                    logits_metadata,
-                    on_compiled=on_compiled,
-                )
-            else:
-                pool.submit(
-                    lambda: self._lower_model(batch.forward_batch, logits_metadata),
-                    on_compiled=on_compiled,
-                )
-
-    def precompile_sampling(self, pool, logits, sampling_metadata, on_compiled):
-        # Match sample() without entering a mesh context. Even set_mesh(None)
-        # changes JAX's trace cache key relative to an ordinary serving call.
-        dispatcher = getattr(self, "_sampler_dispatcher", None)
-        if dispatcher is not None:
-            dispatcher.precompile(
-                pool, self._sampler_step, logits, sampling_metadata, on_compiled=on_compiled
-            )
-        else:
-            pool.submit(
-                lambda: self._lower_sampler(logits, sampling_metadata),
-                on_compiled=on_compiled,
-            )
-
-    def precompile_logprobs(self, pool, logprobs, tokens):
-        pool.submit(lambda: self._lower_compute_logprobs(logprobs, tokens))
+        return self._lower_model(batch.forward_batch, logits_metadata)
 
     def _forward(
         self,

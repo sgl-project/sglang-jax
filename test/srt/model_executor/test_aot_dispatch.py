@@ -5,7 +5,6 @@ import tempfile
 import unittest
 from functools import partial
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ["SGLANG_JAX_AOT_DISPATCH"] = "1"  # force-on regardless of arg count
@@ -20,7 +19,6 @@ from sgl_jax.srt.model_executor.aot_dispatch import AotDispatcher
 class TestAotDispatcher(unittest.TestCase):
     def test_helper_precompile_matches_serving_mesh_context(self):
         from sgl_jax.srt.model_executor.compilation_manager import CompilationPool
-        from sgl_jax.srt.model_executor.model_runner import ModelRunner
 
         mesh = jax.sharding.Mesh(
             np.array(jax.devices()[:1]),
@@ -34,22 +32,12 @@ class TestAotDispatcher(unittest.TestCase):
         model = jax.jit(lambda x: x * 2)
         sampler = jax.jit(lambda x: x + 1)
         logprob = jax.jit(lambda x, y: x + y)
-        runner = SimpleNamespace(
-            _lower_sampler=lambda logits, _: sampler.lower(logits),
-            _lower_compute_logprobs=logprob.lower,
-        )
-        outputs = []
-
-        def ready(_, compiled):
-            outputs.append(compiled.out_info)
-
         with CompilationPool(2) as pool:
-            with jax.set_mesh(mesh):
-                pool.submit(lambda: model.lower(value), on_compiled=ready)
-            pool.flush()
-            ModelRunner.precompile_sampling(runner, pool, outputs[0], None, ready)
-            pool.flush()
-            ModelRunner.precompile_logprobs(runner, pool, outputs[1], outputs[1])
+            outputs = [
+                compiled.out_info for _, _, compiled in pool.map(model.lower, [value], mesh=mesh)
+            ]
+            samples = [compiled.out_info for _, _, compiled in pool.map(sampler.lower, outputs)]
+            list(pool.map(lambda x: logprob.lower(x, x), samples))
         with patch(
             "jax._src.compiler.backend_compile_and_load",
             side_effect=AssertionError("Helper recompiled during serving warmup"),
@@ -68,8 +56,7 @@ class TestAotDispatcher(unittest.TestCase):
 
         inputs = [(jnp.arange(n, dtype=jnp.float32), jnp.zeros(n)) for n in (4, 8, 16)]
         with CompilationPool(2) as pool:
-            for value, buffer in inputs:
-                pool.submit(lambda value=value, buffer=buffer: f.lower(value, buffer))
+            list(pool.map(lambda args: f.lower(*args), inputs))
         with patch(
             "jax._src.compiler.backend_compile_and_load",
             side_effect=AssertionError("Unexpected compilation after precompile"),
@@ -88,13 +75,22 @@ class TestAotDispatcher(unittest.TestCase):
             return weight * value, pool + 1
 
         weight = jnp.array(2.0, dtype=jnp.float32)
-        dispatcher = AotDispatcher(f, (weight,), (weight,), "precompile", allow_fast_dispatch=False)
+        options = {"xla_cpu_enable_fast_math": False}
+        dispatcher = AotDispatcher(
+            f,
+            (weight,),
+            (weight,),
+            "precompile",
+            compiler_options_fn=lambda _: options,
+            allow_fast_dispatch=False,
+        )
         inputs = [(jnp.arange(n, dtype=jnp.float32), jnp.zeros(n)) for n in (4, 8, 16)]
         with patch("sgl_jax.srt.model_executor.aot_dispatch._ENV", "1"):
             with CompilationPool(2) as pool:
-                for value, buffer in inputs:
-                    dispatcher.precompile(pool, value, buffer)
-            self.assertEqual(len(dispatcher._precompiled), 3)
+                list(
+                    pool.map(lambda args: f.lower(weight, *args), inputs, compiler_options=options)
+                )
+            self.assertFalse(dispatcher._cache)
             with patch(
                 "jax._src.compiler.backend_compile_and_load",
                 side_effect=AssertionError("Unexpected compilation after precompile"),
@@ -105,7 +101,6 @@ class TestAotDispatcher(unittest.TestCase):
                         np.testing.assert_array_equal(result, np.asarray(value) * 2)
                         np.testing.assert_array_equal(buffer, np.full(value.shape, step))
             self.assertEqual(len(dispatcher._cache), 3)
-            self.assertFalse(dispatcher._precompiled)
 
     def test_batch_metadata_selects_distinct_executable(self):
         @jax.tree_util.register_pytree_node_class
@@ -187,17 +182,19 @@ class TestAotDispatcher(unittest.TestCase):
             manifest = {"sampling": []}
             with CompilationPool(2) as pool:
                 _export_sampling(
+                    pool,
                     AbstractSampler(mesh, 42),
-                    jax.tree.map(
-                        lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding),
-                        logits,
-                    ),
+                    [
+                        jax.tree.map(
+                            lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding),
+                            logits,
+                        )
+                    ],
                     manager,
                     mesh,
                     None,
                     Path(directory),
                     manifest,
-                    compilation_pool=pool,
                 )
             self.assertEqual(len(manifest["sampling"]), 3)
             store = ExecutableStore(directory, mesh)

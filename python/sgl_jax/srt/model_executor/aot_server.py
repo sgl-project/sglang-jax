@@ -2,7 +2,7 @@
 
 import json
 import logging
-from contextlib import nullcontext
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +11,7 @@ import numpy as np
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.eplb.expert_location import set_global_server_args
+from sgl_jax.srt.model_executor.aot_executable import save_executable
 from sgl_jax.srt.model_executor.aot_inputs import (
     AbstractModel,
     AbstractSampler,
@@ -141,8 +142,8 @@ def export_server(server_args):
             )
             sampler_options = getattr(resources.attn_backend, "sampler_compiler_options", None)
             sampler = AbstractSampler(mesh, server_args.random_seed, sampler_options)
-            sampling_inputs = []
-            with CompilationPool(server_args.precompile_num_threads) as pool:
+
+            def model_jobs():
                 for mode, workload in (
                     (ForwardMode.EXTEND, "prefill"),
                     (ForwardMode.DECODE, "decode"),
@@ -156,53 +157,34 @@ def export_server(server_args):
                         )
                         options.cache_loc_size = cache_loc
                         fn, args, _, _ = model.build_inputs(options)
-                        compiler_options = CompilationManager.compiler_options(
+                        entry = dict(
+                            workload=workload,
+                            batch_size=bs,
+                            num_tokens=tokens,
+                            directory=f"{workload}-bs{bs}-tokens{tokens}",
+                        )
+                        yield entry, partial(fn.lower, *args), CompilationManager.compiler_options(
                             args[3].attn_backend, args[3]
                         )
-                        directory = output / f"{workload}-bs{bs}-tokens{tokens}"
-                        directory.mkdir()
-                        logger.info("[aot-model] compiling %s", directory.name)
 
-                        def ready(
-                            lowered,
-                            compiled,
-                            mode=mode,
-                            workload=workload,
-                            bs=bs,
-                            tokens=tokens,
-                            directory=directory,
-                        ):
-                            if mode.is_decode():
-                                sampling_inputs.append(_abstract_outputs(lowered, compiled)[0])
-                            manifest["buckets"].append(
-                                {
-                                    "workload": workload,
-                                    "batch_size": bs,
-                                    "num_tokens": tokens,
-                                    "directory": directory.name,
-                                }
-                            )
-                            manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
-
-                        pool.submit(
-                            lambda fn=fn, args=args: fn.lower(*args),
-                            mesh=mesh,
-                            compiler_options=compiler_options,
-                            output=directory,
-                            on_compiled=ready,
-                        )
-                pool.flush()
-                for logits in sampling_inputs:
-                    _export_sampling(
-                        sampler,
-                        logits,
-                        manager,
-                        mesh,
-                        sampler_options,
-                        output,
-                        manifest,
-                        compilation_pool=pool,
-                    )
+            with CompilationPool(server_args.precompile_num_threads) as pool:
+                logits = []
+                for entry, outputs in _export(
+                    pool, model_jobs(), mesh, output, manifest["buckets"]
+                ):
+                    if entry["workload"] == "decode":
+                        logits.append(outputs[0])
+                    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+                _export_sampling(
+                    pool,
+                    sampler,
+                    logits,
+                    manager,
+                    mesh,
+                    sampler_options,
+                    output,
+                    manifest,
+                )
         manifest["status"] = "complete"
     except Exception as error:
         manifest.update(status="failed", error=str(error))
@@ -225,53 +207,50 @@ def _abstract_outputs(lowered, compiled):
     )
 
 
-def _export_sampling(
-    sampler, logits, manager, mesh, compiler_options, output, manifest, compilation_pool=None
-):
+def _export(pool, jobs, mesh, output, entries):
+    """Compile (manifest entry, lower, options) jobs; save results on the caller."""
+    for (entry, _, options), lowered, compiled in pool.map(
+        lambda job: job[1](), jobs, compiler_options=lambda job: job[2]
+    ):
+        directory = output / entry["directory"]
+        directory.mkdir()
+        save_executable(compiled, lowered, mesh, options, directory)
+        entries.append(entry)
+        logger.info("[aot-model] exported %s", directory.name)
+        yield entry, _abstract_outputs(lowered, compiled)
+
+
+def _export_sampling(pool, sampler, logits, manager, mesh, compiler_options, output, manifest):
     from sgl_jax.srt.layers.sampler import jitted_compute_logprobs
 
-    bs = logits.next_token_logits.shape[0]
-    batch = manager._make_dummy_batch(bs, bs, ForwardMode.DECODE, bs)
-    # ModelRunner.sample runs outside the explicit model mesh. Match that
-    # context; input arrays still carry their concrete TPU shardings.
-    with (
-        jax.set_mesh(None),
-        (
-            nullcontext(compilation_pool) if compilation_pool is not None else CompilationPool()
-        ) as pool,
-    ):
-        logprob_inputs = []
-        for seeded in (False, True):
-            batch.sampling_info.sampling_seeds = np.zeros(bs, dtype=np.int32) if seeded else None
-            fn, args = sampler.build_inputs(logits, batch)
-            directory = output / f"sampler-bs{bs}-{'seeded' if seeded else 'unseeded'}"
-            directory.mkdir()
-            logger.info("[aot-model] compiling %s", directory.name)
+    def sampler_jobs():
+        for value in logits:
+            bs = value.next_token_logits.shape[0]
+            batch = manager._make_dummy_batch(bs, bs, ForwardMode.DECODE, bs)
+            for seeded in (False, True):
+                batch.sampling_info.sampling_seeds = (
+                    np.zeros(bs, dtype=np.int32) if seeded else None
+                )
+                fn, args = sampler.build_inputs(value, batch)
+                entry = dict(
+                    batch_size=bs, directory=f"sampler-bs{bs}-{'seeded' if seeded else 'unseeded'}"
+                )
+                yield entry, partial(fn.lower, *args), compiler_options
 
-            def ready(lowered, compiled, seeded=seeded, directory=directory):
-                manifest["sampling"].append({"batch_size": bs, "directory": directory.name})
-                if not seeded:
-                    (next_tokens, logprobs, _), _ = _abstract_outputs(lowered, compiled)
-                    logprob_inputs.append((logprobs, next_tokens))
-
-            pool.submit(
-                lambda fn=fn, args=args: fn.lower(*args),
-                mesh=mesh,
-                compiler_options=compiler_options,
-                output=directory,
-                on_compiled=ready,
-            )
-        pool.flush()
-        for logprobs, next_tokens in logprob_inputs:
-            directory = output / f"compute-logprobs-bs{bs}"
-            directory.mkdir()
-            pool.submit(
-                lambda logprobs=logprobs, next_tokens=next_tokens: jitted_compute_logprobs.lower(
-                    mesh, logprobs, next_tokens
+    # Match serving helper lowering outside the explicit model mesh.
+    with jax.set_mesh(None):
+        samples = list(_export(pool, sampler_jobs(), mesh, output, manifest["sampling"]))
+        logprob_jobs = (
+            (
+                dict(
+                    batch_size=entry["batch_size"],
+                    directory=f"compute-logprobs-bs{entry['batch_size']}",
                 ),
-                mesh=mesh,
-                output=directory,
-                on_compiled=lambda *_, directory=directory: manifest["sampling"].append(
-                    {"batch_size": bs, "directory": directory.name}
-                ),
+                partial(jitted_compute_logprobs.lower, mesh, values[0][1], values[0][0]),
+                None,
             )
+            for entry, values in samples
+            if entry["directory"].endswith("-unseeded")
+        )
+        for _ in _export(pool, logprob_jobs, mesh, output, manifest["sampling"]):
+            pass

@@ -44,13 +44,10 @@ class TestCompilationPool(unittest.TestCase):
 
             return SimpleNamespace(compile=compile)
 
-        def ready(lowered, compiled):
-            self.assertEqual(threading.get_ident(), caller)
-            finished.append(compiled)
-
         with CompilationPool(2) as pool:
-            for index in range(5):
-                pool.submit(lambda index=index: lower(index), on_compiled=ready)
+            for _, _, compiled in pool.map(lower, range(5)):
+                self.assertEqual(threading.get_ident(), caller)
+                finished.append(compiled)
         self.assertEqual(lowered_ids, list(range(5)))
         self.assertEqual(finished, list(range(5)))
         self.assertEqual(len(compile_threads), 2)
@@ -60,31 +57,31 @@ class TestCompilationPool(unittest.TestCase):
         caller = threading.get_ident()
         compiled_on = []
         with CompilationPool(1) as pool:
-            pool.submit(
-                lambda: SimpleNamespace(
-                    compile=lambda **_: compiled_on.append(threading.get_ident())
+            list(
+                pool.map(
+                    lambda _: SimpleNamespace(
+                        compile=lambda **_: compiled_on.append(threading.get_ident())
+                    ),
+                    [None],
                 )
             )
             self.assertEqual(compiled_on, [caller])
 
     def test_failure_stops_lowering_and_joins_workers(self):
-        callbacks = []
-        with (
-            self.assertRaisesRegex(RuntimeError, "compile failed"),
-            CompilationPool(2) as pool,
-        ):
-            pool.submit(
-                lambda: SimpleNamespace(
-                    compile=MagicMock(side_effect=RuntimeError("compile failed"))
-                ),
-                on_compiled=lambda *_: callbacks.append(0),
+        def lower(index):
+            if index == 2:
+                self.fail("Lowered past the failed bounded window")
+            return SimpleNamespace(
+                compile=(
+                    MagicMock(side_effect=RuntimeError("compile failed"))
+                    if index == 0
+                    else lambda **_: 1
+                )
             )
-            pool.submit(
-                lambda: SimpleNamespace(compile=lambda **_: 1),
-                on_compiled=lambda *_: callbacks.append(1),
-            )
-            pool.submit(lambda: self.fail("Lowered past the failed bounded window"))
-        self.assertEqual(callbacks, [])
+
+        with self.assertRaisesRegex(RuntimeError, "compile failed"), CompilationPool(2) as pool:
+            for _ in pool.map(lower, range(3)):
+                self.fail("Returned a result past the failed compilation")
         self.assertFalse(pool._pending)
         self.assertIsNone(pool._executor)
 

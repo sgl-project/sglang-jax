@@ -6,6 +6,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from contextvars import copy_context
 from typing import TYPE_CHECKING
 
@@ -27,8 +28,8 @@ logger = logging.getLogger(__name__)
 class CompilationPool:
     """Bound retained lowerings; only XLA compilation runs on worker threads.
 
-    Lowering, saving artifacts, and completion callbacks run on the caller.
-    Callbacks must not execute donated buffers: device warmup follows flush().
+    Lowering and result handling run on the caller. Device warmup follows
+    compilation so donated buffers are never executed concurrently.
     """
 
     def __init__(self, num_threads=1):
@@ -57,60 +58,59 @@ class CompilationPool:
             )
         return self
 
-    def submit(self, lower, *, compiler_options=None, mesh=None, output=None, on_compiled=None):
-        # Apply backpressure BEFORE lowering the next graph, not just before
-        # submitting it to ThreadPoolExecutor's otherwise unbounded queue.
-        while len(self._pending) >= self.num_threads:
-            self._finish_one()
-        lowered = lower()
-        if self._executor is None:
-            compiled = CompilationManager.get_executable(lowered, compiler_options=compiler_options)
-            self._finish(lowered, compiled, mesh, compiler_options, output, on_compiled)
-            return
+    def map(self, lower, inputs, *, compiler_options=None, mesh=None):
+        """Yield (input, lowered, compiled) in order with bounded work in flight.
 
+        Consume this iterator before starting another map. Lowering and result
+        handling stay on the caller; only compile() runs on worker threads.
+        compiler_options may be a dict or a function of the input.
+        """
         import jax
 
-        context = copy_context()
-        compile_mesh = jax.sharding.get_mesh()
-
-        def compile_lowered():
-            with jax.set_mesh(compile_mesh):
-                return CompilationManager.get_executable(lowered, compiler_options=compiler_options)
-
-        future = self._executor.submit(context.run, compile_lowered)
-        self._pending.append((future, lowered, mesh, compiler_options, output, on_compiled))
+        for item in inputs:
+            # Backpressure precedes lowering, bounding retained compiler graphs.
+            if len(self._pending) >= self.num_threads:
+                yield self._finish_one()
+            # Helpers must keep the ambient context: even set_mesh(None) can
+            # change JAX's trace cache key relative to ordinary serving calls.
+            with jax.set_mesh(mesh) if mesh is not None else nullcontext():
+                lowered = lower(item)
+                options = compiler_options(item) if callable(compiler_options) else compiler_options
+                if self._executor is None:
+                    compiled = CompilationManager.get_executable(lowered, compiler_options=options)
+                else:
+                    future = self._executor.submit(
+                        copy_context().run, self._compile, lowered, options, jax.sharding.get_mesh()
+                    )
+                    self._pending.append((item, lowered, future))
+            if self._executor is None:
+                yield item, lowered, compiled
+        while self._pending:
+            yield self._finish_one()
 
     @staticmethod
-    def _finish(lowered, compiled, mesh, compiler_options, output, on_compiled):
-        if output is not None:
-            from sgl_jax.srt.model_executor.aot_executable import save_executable
+    def _compile(lowered, options, mesh):
+        import jax
 
-            save_executable(compiled, lowered, mesh, compiler_options, output)
-        if on_compiled is not None:
-            on_compiled(lowered, compiled)
+        with jax.set_mesh(mesh):
+            return CompilationManager.get_executable(lowered, compiler_options=options)
 
     def _finish_one(self):
-        future, lowered, mesh, options, output, callback = self._pending.popleft()
-        self._finish(lowered, future.result(), mesh, options, output, callback)
-
-    def flush(self):
-        while self._pending:
-            self._finish_one()
+        item, lowered, future = self._pending.popleft()
+        return item, lowered, future.result()
 
     def __exit__(self, exc_type, exc_value, traceback):
         try:
-            if exc_type is None:
-                self.flush()
-        finally:
-            for future, *_ in self._pending:
+            for _, _, future in self._pending:
                 future.cancel()
             if self._executor is not None:
                 self._executor.shutdown(wait=True, cancel_futures=True)
                 self._executor = None
+        finally:
+            self._pending.clear()
             if self._previous_stack_size is not None:
                 threading.stack_size(self._previous_stack_size)
                 self._previous_stack_size = None
-            self._pending.clear()
 
 
 class CompilationManager:
@@ -438,9 +438,8 @@ class CompilationManager:
         logger.info(
             "[%s] Compiling buckets with %d XLA workers", mode.name, self.precompile_num_threads
         )
-        sampling_inputs = []
-        sampling_signatures = set()
-        with CompilationPool(self.precompile_num_threads) as pool:
+
+        def batches():
             for bs, tokens, cache_loc in dict.fromkeys(self.iter_model_shapes(mode)):
                 batch = self._make_dummy_batch(
                     bs,
@@ -451,29 +450,32 @@ class CompilationManager:
                     per_dp_bs_size=bs // self.dp_size,
                 )
                 batch.forward_batch = ForwardBatch.init_new(batch, model_runner)
+                yield batch
 
-                def ready(lowered, compiled, bs=bs):
-                    # Include the concrete output layouts, not just shardings.
-                    # Otherwise JAX lowers the helper again for real arrays
-                    # during warmup, even when the StableHLO is identical.
-                    logits = compiled.out_info[0]
-                    leaves, tree = jax.tree_util.tree_flatten(logits)
-                    signature = (bs, tree, tuple(leaves))
-                    # Prefill token buckets often share one sampler shape.
-                    # Do not compile the same cached JAX lowering concurrently.
-                    if signature not in sampling_signatures:
-                        sampling_signatures.add(signature)
-                        sampling_inputs.append((bs, logits))
+        def unique(values):
+            # Keep concrete output layouts in the key and in helper inputs;
+            # omitting them makes the first serving warmup compile again.
+            seen = set()
+            for value in values:
+                leaves, tree = jax.tree_util.tree_flatten(value)
+                key = (tree, tuple(leaves))
+                if key not in seen:
+                    seen.add(key)
+                    yield value
 
-                model_runner.precompile_model(pool, batch, ready)
-            pool.flush()
-            logprob_inputs = []
+        with CompilationPool(self.precompile_num_threads) as pool:
+            logits = [
+                compiled.out_info[0]
+                for _, _, compiled in pool.map(
+                    model_runner.lower_model,
+                    batches(),
+                    mesh=model_runner.mesh,
+                    compiler_options=model_runner.model_compile_options,
+                )
+            ]
 
-            def sampler_ready(lowered, compiled):
-                (tokens, logprobs, _), _ = compiled.out_info
-                logprob_inputs.append((logprobs, tokens))
-
-            for bs, logits in sampling_inputs:
+            def lower_sampler(logits):
+                bs = logits.next_token_logits.shape[0]
                 batch = self._make_dummy_batch(bs, bs, mode, bs)
                 metadata = SamplingMetadata.from_model_worker_batch(
                     batch, 0, model_runner.mesh, self.vocab_size
@@ -481,16 +483,21 @@ class CompilationManager:
                 metadata.update_vocab_mask(
                     batch.sampling_info.vocab_mask, model_runner.mesh, self.vocab_size
                 )
-                model_runner.precompile_sampling(pool, logits, metadata, sampler_ready)
-            pool.flush()
-            logprob_signatures = set()
-            for logprobs, tokens in logprob_inputs:
-                leaves, tree = jax.tree_util.tree_flatten((logprobs, tokens))
-                signature = (tree, tuple(leaves))
-                if signature in logprob_signatures:
-                    continue
-                logprob_signatures.add(signature)
-                model_runner.precompile_logprobs(pool, logprobs, tokens)
+                return model_runner._lower_sampler(logits, metadata)
+
+            samples = [
+                compiled.out_info[0][:2]
+                for _, _, compiled in pool.map(
+                    lower_sampler,
+                    unique(logits),
+                    compiler_options=model_runner.sampler_compile_options,
+                )
+            ]
+            for _ in pool.map(
+                lambda sample: model_runner._lower_compute_logprobs(sample[1], sample[0]),
+                unique(samples),
+            ):
+                pass
 
     def _precompile_extend(
         self,
