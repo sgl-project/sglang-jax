@@ -1,3 +1,9 @@
+import os
+
+# 4 CPU devices for the dp=2 metadata-shape comparison below (before any jax import).
+os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=4")
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
 import json
 import tempfile
 import threading
@@ -417,6 +423,90 @@ class TestBucketComputation(unittest.TestCase):
         self.assertEqual([s[3] for s in decode], [1, 2] * len(cm.bs_buckets))
         self.assertEqual(decode, observed_shapes(cm, ForwardMode.DECODE))
         self.assertTrue(all(s[3] is None for s in cm.iter_model_shapes(ForwardMode.EXTEND)))
+
+    def test_export_decode_page_table_matches_serving_metadata(self):
+        """Actual metadata shapes: the page table serving builds for each warmup
+        batch (FlashAttention.get_forward_metadata, bounded by the MSA bucket and by
+        cache_loc) must equal what offline export constructs from the same shape
+        (``decode_page_count`` -> ``_attention_metadata(page_count=...)``)."""
+        import jax
+
+        from sgl_jax.srt.layers.attention.msa_backend import MSAAttentionBackend
+        from sgl_jax.srt.model_executor.aot_workloads import (
+            InputContext,
+            WorkloadSpec,
+            _attention_metadata,
+        )
+
+        dp, bs, page_size, context_len, max_req_len = 2, 4, 128, 65536, 4095
+        mesh = jax.make_mesh(
+            (dp, 1),
+            ("data", "tensor"),
+            devices=jax.devices()[:dp],
+            axis_types=(jax.sharding.AxisType.Explicit,) * 2,
+        )
+        backend = MSAAttentionBackend(
+            1,
+            1,
+            128,
+            page_size=page_size,
+            mesh=mesh,
+            sparse_config={
+                "sparse_block_size": page_size,
+                "sparse_topk_blocks": 16,
+                "sparse_num_index_heads": 1,
+                "sparse_index_dim": 128,
+                "sparse_attention_freq": [1],
+            },
+            context_len=context_len,
+            total_num_kv_heads=1,
+        )
+        self.assertEqual(backend.decode_page_buckets, [16, 64, 512])
+        cm = CompilationManager(
+            _make_server_args(precompile_bs_paddings=[bs]),
+            bs,
+            256 * dp,
+            dp,
+            dp,
+            page_size,
+            max_req_len,
+            256,
+            attn_backend=backend,
+        )
+        shapes = list(cm.iter_model_shapes(ForwardMode.DECODE))
+        batches = _collect_precompile_batches(cm, ForwardMode.DECODE)
+        self.assertEqual(len(shapes), len(batches))
+        context = InputContext(
+            model_config=MagicMock(), mesh=mesh, backend=backend, memory_pools=MagicMock()
+        )
+        served, exported = [], []
+        for (bs_val, tokens, cache_loc, pages), batch in zip(shapes, batches):
+            with jax.set_mesh(mesh):
+                served.append(int(backend.get_forward_metadata(batch).page_indices.shape[0]))
+            spec = WorkloadSpec(
+                name="decode",
+                request_count=bs_val,
+                input_token_count=tokens,
+                dp_size=dp,
+                context_length=context_len,
+                page_size=page_size,
+                tokens_per_request=1,
+                chunked_prefill_size=None,
+                mtp_layer_idx=None,
+                cache_loc_size=cache_loc,
+                page_count=cm.decode_page_count(bs_val, cache_loc, pages),
+            )
+            exported.append(
+                int(
+                    _attention_metadata(
+                        backend, context, spec, page_count=spec.page_count
+                    ).page_indices.shape[0]
+                )
+            )
+        # cache_loc = bs * 4096 tokens = 128 pages: bucket 16 -> 64 pages; 64 and 512 are
+        # capped by cache_loc (256 / 2048 without the bound).
+        self.assertEqual(served, [64, 128, 128])
+        self.assertEqual(exported, served)
 
     def test_aot_capacity_defaults_and_incomplete_bundle(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -365,6 +365,17 @@ class CompilationManager:
         else:
             raise ValueError(f"No serving precompile shapes for {mode}")
 
+    def decode_page_count(self, bs: int, cache_loc: int, decode_pages: int | None) -> int | None:
+        """Decode page-table length for a ``(bs, cache_loc, decode_pages)`` shape.
+
+        Mirrors serving: FlashAttention.get_forward_metadata bounds the per-DP page
+        table by the backend's bucket but never grows it past the cache_loc pages,
+        so both warmup and offline export see ``min(bs * pages, cache_loc / page)``.
+        None means the backend does not bound the page table (plain shape)."""
+        if decode_pages is None:
+            return None
+        return min(bs * decode_pages, cache_loc // self.page_size)
+
     def decode_dummy_seq_len(self, decode_pages: int | None) -> int:
         """Warmup seq_len for a decode page bucket: fills ``decode_pages`` pages so the
         backend's page-table bound (FlashAttention._decode_page_limit) lands exactly

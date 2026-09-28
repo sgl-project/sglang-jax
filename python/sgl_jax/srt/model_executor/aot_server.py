@@ -157,7 +157,7 @@ def export_server(server_args):
                             max_tokens // server_args.dp_size if mode.is_extend() else None
                         )
                         options.cache_loc_size = cache_loc
-                        options.decode_page_count = None if pages is None else bs * pages
+                        options.decode_page_count = manager.decode_page_count(bs, cache_loc, pages)
                         fn, args, _, _ = model.build_inputs(options)
                         entry = dict(
                             workload=workload,
