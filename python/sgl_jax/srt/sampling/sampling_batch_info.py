@@ -11,7 +11,7 @@ from jax.tree_util import register_pytree_node_class
 from sgl_jax.srt.sampling import penaltylib
 from sgl_jax.srt.sampling.sampling_params import DEFAULT_SAMPLING_SEED, TOP_K_ALL
 from sgl_jax.srt.utils import get_bool_env_var
-from sgl_jax.srt.utils.jax_utils import device_array
+from sgl_jax.srt.utils.jax_utils import device_array, packed_device_array
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import (
@@ -134,28 +134,40 @@ class SamplingMetadata:
         pad_size: int = 0,
         mesh: Mesh = None,
         vocab_size: int = 32000,
+        *,
+        abstract: bool = False,
     ) -> SamplingMetadata:
-        sharding = NamedSharding(mesh, PartitionSpec("data"))
-        if batch.sampling_info.sampling_seeds is not None:
-            sampling_seeds_device = device_array(
-                batch.sampling_info.sampling_seeds, sharding=sharding
+        def array(shape, dtype, placement):
+            return jax.ShapeDtypeStruct(
+                shape, jax.dtypes.canonicalize_dtype(dtype), sharding=placement
             )
-        else:
-            sampling_seeds_device = None
 
+        def to_device(data, sharding):
+            if abstract:
+                return jax.tree.map(lambda x: array(x.shape, x.dtype, sharding), data)
+            upload = packed_device_array if len(sharding.spec) <= 1 else device_array
+            return upload(data, sharding=sharding)
+
+        sharding = NamedSharding(mesh, PartitionSpec("data"))
         positions = batch.positions if batch.forward_mode.is_decode() else batch.seq_lens - 1
 
-        (temperatures_device, top_ps_device, top_ks_device, min_ps_device, positions_device) = (
-            device_array(
-                (
-                    batch.sampling_info.temperatures,
-                    batch.sampling_info.top_ps,
-                    batch.sampling_info.top_ks,
-                    batch.sampling_info.min_ps,
-                    positions,
-                ),
-                sharding=sharding,
-            )
+        (
+            temperatures_device,
+            top_ps_device,
+            top_ks_device,
+            min_ps_device,
+            positions_device,
+            sampling_seeds_device,
+        ) = to_device(
+            (
+                batch.sampling_info.temperatures,
+                batch.sampling_info.top_ps,
+                batch.sampling_info.top_ks,
+                batch.sampling_info.min_ps,
+                positions,
+                batch.sampling_info.sampling_seeds,
+            ),
+            sharding=sharding,
         )
 
         # Extract penalty information from penalizer orchestrator
@@ -180,7 +192,7 @@ class SamplingMetadata:
             else:
                 padded_linear_penalty = original_linear_penalty
 
-            linear_penalty_device = device_array(
+            linear_penalty_device = to_device(
                 padded_linear_penalty,
                 sharding=linear_penalty_sharding,
             )
@@ -204,18 +216,24 @@ class SamplingMetadata:
             else:
                 padded_linear_penalty = original_linear_penalty
 
-            linear_penalty_device = device_array(
+            linear_penalty_device = to_device(
                 padded_linear_penalty,
                 sharding=linear_penalty_sharding,
             )
         if linear_penalty_device is None:
             target_shape = (batch.sampling_info.temperatures.shape[0], vocab_size)
-            linear_penalty_device = _get_or_create_zero_penalty_device(
-                target_shape, linear_penalty_sharding
+            linear_penalty_device = (
+                array(target_shape, np.float32, linear_penalty_sharding)
+                if abstract
+                else _get_or_create_zero_penalty_device(target_shape, linear_penalty_sharding)
             )
 
         replicated_sharding = NamedSharding(mesh, PartitionSpec())
-        bools = _sampler_bools(replicated_sharding)
+        bools = (
+            (array((), np.bool_, replicated_sharding),) * 2
+            if abstract
+            else _sampler_bools(replicated_sharding)
+        )
         return cls(
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
@@ -232,8 +250,16 @@ class SamplingMetadata:
             do_penalties=bools[do_penalties],
             # The worker installs the current grammar mask after its update completes.
             apply_vocab_mask=bools[False],
-            vocab_mask=_empty_vocab_mask(
-                temperatures_device.shape[0], vocab_size, replicated_sharding
+            vocab_mask=(
+                array(
+                    (temperatures_device.shape[0], (vocab_size + 31) // 32),
+                    np.int32,
+                    replicated_sharding,
+                )
+                if abstract
+                else _empty_vocab_mask(
+                    temperatures_device.shape[0], vocab_size, replicated_sharding
+                )
             ),
         )
 

@@ -15,10 +15,7 @@ from jax.sharding import Mesh
 
 from sgl_jax.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
-from sgl_jax.srt.multimodal.in_model.lane_packing import (
-    encoder_num_lanes,
-    precompile_mrope_vision_model,
-)
+from sgl_jax.srt.multimodal.in_model.lane_packing import encoder_num_lanes
 from sgl_jax.srt.multimodal.layers.attention.flash_attention_backend import (
     make_vision_attention_backend,
 )
@@ -404,7 +401,6 @@ class Gemma4VisionModel(nnx.Module):
         rngs,
         mesh: Mesh,
         vision_tp: bool,
-        input_buckets: tuple[int, ...] | None = None,
     ):
         if mesh is None:
             raise ValueError("Gemma 4 vision requires a device mesh")
@@ -415,22 +411,6 @@ class Gemma4VisionModel(nnx.Module):
         self.dtype = dtype
         self.pooling_kernel_size = int(config.pooling_kernel_size)
         self.pooling_unit = self.pooling_kernel_size**2
-        default_capacity = int(config.default_output_length) * self.pooling_unit
-        # Prefill batches can place two images on one vision lane. Warm both
-        # capacities so the first such batch does not compile an oversized
-        # power-of-two fallback while requests are waiting.
-        buckets = input_buckets or (default_capacity, 2 * default_capacity)
-        self.input_buckets = tuple(
-            sorted(
-                {
-                    math.ceil(int(capacity) / self.pooling_unit) * self.pooling_unit
-                    for capacity in buckets
-                    if int(capacity) > 0
-                }
-            )
-        )
-        if not self.input_buckets:
-            raise ValueError("Gemma 4 vision requires at least one positive input bucket")
         self.patch_dim = 3 * int(config.patch_size) ** 2
         self.patch_embedder = Gemma4VisionPatchEmbedder(
             config,
@@ -600,20 +580,3 @@ class Gemma4VisionModel(nnx.Module):
             raise ValueError("Gemma 4 position capacity does not match packed patches")
         metadata = self._build_metadata(position_ids, patch_counts)
         return {"metadata": jax.device_put(metadata, sharding)}
-
-    def get_packed_capacities(self) -> tuple[int, ...]:
-        rows = encoder_num_lanes(self.mesh, self.vision_tp)
-        return tuple(rows * capacity // self.pooling_unit for capacity in self.input_buckets)
-
-    def precompile(self) -> None:
-        precompile_mrope_vision_model(
-            self,
-            mesh=self.mesh,
-            num_lanes=encoder_num_lanes(self.mesh, self.vision_tp),
-            buckets=self.input_buckets,
-            patch_dim=self.patch_dim,
-            merge_unit=self.pooling_unit,
-            rope_type="rope_2d_packed",
-            input_sharding=self.specs.sharding(self.specs.batch_axis),
-            output_sharding=self.specs.sharding(),
-        )

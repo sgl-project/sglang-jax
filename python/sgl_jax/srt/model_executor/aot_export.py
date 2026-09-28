@@ -14,12 +14,9 @@ from pathlib import Path
 
 import jax
 
-from sgl_jax.srt.model_executor.aot_dispatch import (
-    decode_no_sc_gather_compiler_options_fn,
-)
 from sgl_jax.srt.model_executor.aot_inputs import build_inputs, build_mesh
-from sgl_jax.srt.utils.common_utils import get_bool_env_var
-from sgl_jax.srt.utils.jax_utils import compilation_target, is_tpu_runtime
+from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
+from sgl_jax.srt.utils.jax_utils import compilation_target
 
 
 def _versions():
@@ -60,19 +57,6 @@ def _array_signature(tree):
                     "sharding": str(getattr(value, "sharding", None)),
                 }
             )
-    return result
-
-
-def _compiler_options(options, batch):
-    # Reuse serving backend options and the per-forward decode workaround. CLI
-    # options override these defaults and the manifest records the final values.
-    result = dict(getattr(batch.attn_backend, "compiler_options", None) or {})
-    if is_tpu_runtime() and get_bool_env_var("SGLANG_JAX_ENABLE_KERNEL_LOG_RECORDER"):
-        result["xla_tpu_enable_log_recorder"] = "true"
-    decode_options = decode_no_sc_gather_compiler_options_fn()
-    if decode_options is not None:
-        result.update(decode_options((batch,)) or {})
-    result.update(options.compiler_options)
     return result
 
 
@@ -185,7 +169,9 @@ def export(options):
                 "spec_algorithm": args[3].spec_algorithm.name,
             }
             manifest["donate_argnames"] = ["memory_pools"]
-            compiler_options = _compiler_options(options, args[3])
+            compiler_options = CompilationManager.compiler_options(
+                args[3].attn_backend, args[3], options.compiler_options
+            )
             manifest["compiler_options"] = compiler_options
             lowered = fn.lower(*args)
             manifest["output_signature"] = _array_signature(lowered.out_info)
@@ -193,7 +179,15 @@ def export(options):
             manifest["stages"]["stablehlo"] = "complete"
             save_manifest()
             if options.stage == "compiled":
-                compiled = lowered.compile(compiler_options=compiler_options or None)
+                compiled = CompilationManager.get_executable(
+                    lowered,
+                    mesh,
+                    compiler_options,
+                    output=output if options.save_executable else None,
+                )
+                if options.save_executable:
+                    manifest["executable"] = json.loads((output / "executable.json").read_text())
+                    manifest["stages"]["executable"] = "complete"
                 hlo = compiled.as_text()
                 if not hlo or "HloModule" not in hlo:
                     raise RuntimeError("Backend did not expose optimized HLO text")

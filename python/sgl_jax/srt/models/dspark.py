@@ -7,8 +7,8 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.linear import LinearBase
+from sgl_jax.srt.model_loader.weights import WeightLoader, WeightSpec
 from sgl_jax.srt.models.dflash import DFlashDraftModel
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 
 class VanillaMarkovHead(nnx.Module):
@@ -94,10 +94,12 @@ class DSparkDraftModel(DFlashDraftModel):
         mappings = DFlashDraftModel._create_weight_mappings(self)
         mappings.update(
             {
-                "markov_head.markov_w1.weight": WeightMapping(
-                    target_path="markov_head.markov_w1", sharding=(None, None), transpose=False
+                "markov_head.markov_w1.weight": WeightSpec(
+                    target_path="markov_head.markov_w1",
+                    sharding=(None, None),
+                    transpose=False,
                 ),
-                "markov_head.markov_w2.weight": WeightMapping(
+                "markov_head.markov_w2.weight": WeightSpec(
                     target_path="markov_head.markov_w2.weight",
                     sharding=(None, "tensor"),
                     transpose=True,
@@ -114,7 +116,7 @@ class DSparkDraftModel(DFlashDraftModel):
         )
         mappings = self._create_weight_mappings()
         if not loader.dummy_mode:
-            keys = set(loader._scan_weight_info())
+            keys = set(loader.metadata)
             missing = set(mappings) - keys
             if missing:
                 raise ValueError(
@@ -124,7 +126,7 @@ class DSparkDraftModel(DFlashDraftModel):
                 logging.getLogger(__name__).info(
                     "DSPARK stage1 ignores confidence head weights; verifies all proposals."
                 )
-        loader.load_weights_from_safetensors(mappings)
+        loader.load(mappings)
 
 
 class Qwen3DSparkModel(DSparkDraftModel):

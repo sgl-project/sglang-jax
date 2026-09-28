@@ -459,6 +459,7 @@ class TokenizerManager:
             lora_id=obj.lora_id,
             extra_key=obj.extra_key,
             return_routed_experts=obj.return_routed_experts,
+            return_hidden_states=obj.return_hidden_states,
             mm_inputs=mm_inputs,
         )
 

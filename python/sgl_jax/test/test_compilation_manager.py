@@ -1,10 +1,17 @@
+import json
+import tempfile
+import threading
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 
-from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
+from sgl_jax.srt.model_executor.compilation_manager import (
+    CompilationManager,
+    CompilationPool,
+)
 from sgl_jax.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -13,6 +20,75 @@ from sgl_jax.srt.model_executor.forward_batch_info import (
 from sgl_jax.srt.multimodal.in_model import host_orchestration
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.utils.common_utils import align_bs_for_fused_ep, pad_to_bucket
+
+
+class TestCompilationPool(unittest.TestCase):
+    def test_parallel_compile_with_serial_lowering_and_bounded_backpressure(self):
+        caller = threading.get_ident()
+        barrier = threading.Barrier(2)
+        finished = []
+        lowered_ids = []
+        compile_threads = set()
+
+        def lower(index):
+            self.assertEqual(threading.get_ident(), caller)
+            if index >= 2:
+                self.assertGreaterEqual(len(finished), index - 1)
+            lowered_ids.append(index)
+
+            def compile(**kwargs):
+                compile_threads.add(threading.get_ident())
+                if index < 2:
+                    barrier.wait(timeout=10)
+                return index
+
+            return SimpleNamespace(compile=compile)
+
+        with CompilationPool(2) as pool:
+            for _, _, compiled in pool.map(lower, range(5)):
+                self.assertEqual(threading.get_ident(), caller)
+                finished.append(compiled)
+        self.assertEqual(lowered_ids, list(range(5)))
+        self.assertEqual(finished, list(range(5)))
+        self.assertEqual(len(compile_threads), 2)
+        self.assertNotIn(caller, compile_threads)
+
+    def test_serial_fallback_runs_on_caller(self):
+        caller = threading.get_ident()
+        compiled_on = []
+        with CompilationPool(1) as pool:
+            list(
+                pool.map(
+                    lambda _: SimpleNamespace(
+                        compile=lambda **_: compiled_on.append(threading.get_ident())
+                    ),
+                    [None],
+                )
+            )
+            self.assertEqual(compiled_on, [caller])
+
+    def test_failure_stops_lowering_and_joins_workers(self):
+        def lower(index):
+            if index == 2:
+                self.fail("Lowered past the failed bounded window")
+            return SimpleNamespace(
+                compile=(
+                    MagicMock(side_effect=RuntimeError("compile failed"))
+                    if index == 0
+                    else lambda **_: 1
+                )
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "compile failed"), CompilationPool(2) as pool:
+            for _ in pool.map(lower, range(3)):
+                self.fail("Returned a result past the failed compilation")
+        self.assertFalse(pool._pending)
+        self.assertIsNone(pool._executor)
+
+    def test_invalid_thread_count(self):
+        for threads in (0, -1):
+            with self.assertRaisesRegex(ValueError, "at least 1"):
+                CompilationPool(threads)
 
 
 class TestAlignBsForFusedEp(unittest.TestCase):
@@ -45,6 +121,7 @@ def _make_server_args(**overrides):
     args = MagicMock()
     args.precompile_token_paddings = None
     args.precompile_bs_paddings = None
+    args.precompile_num_threads = 1
     args.moe_backend = "none"
     args.enable_static_lora = False
     args.multimodal = False
@@ -308,6 +385,42 @@ class TestBucketComputation(unittest.TestCase):
         )
         assert cm.token_buckets == [256, 512, 1024, 131072]
 
+    def test_export_plan_matches_online_warmup(self):
+        for dp_size in (1, 2):
+            cm = CompilationManager(
+                _make_server_args(), 8, 256 * dp_size, dp_size, 8, 128, 255, 256
+            )
+            for mode in (ForwardMode.EXTEND, ForwardMode.DECODE):
+                batches = _collect_precompile_batches(cm, mode)
+                observed = [(b.real_bs, len(b.input_ids), len(b.cache_loc)) for b in batches]
+                self.assertEqual(list(cm.iter_model_shapes(mode)), observed)
+            self.assertEqual(cm.token_buckets[-1], 256 * dp_size)
+            self.assertEqual(cm.bs_buckets[-1], 8)
+
+    def test_aot_capacity_defaults_and_incomplete_bundle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "serving.json"
+            manifest = dict(
+                status="complete",
+                max_total_tokens=4096,
+                max_running_requests=8,
+                max_recurrent_state_size=None,
+            )
+            path.write_text(json.dumps(manifest))
+            args = SimpleNamespace(
+                aot_model_dir=directory,
+                max_total_tokens=None,
+                max_running_requests=4,
+                max_recurrent_state_size=None,
+            )
+            CompilationManager.restore_aot_defaults(args)
+            self.assertEqual(args.max_total_tokens, 4096)
+            self.assertEqual(args.max_running_requests, 4)
+            manifest["status"] = "failed"
+            path.write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, "incomplete"):
+                CompilationManager.restore_aot_defaults(args)
+
 
 class TestLazyCompilation(unittest.TestCase):
     def test_register_variant_if_new_first_time(self):
@@ -505,7 +618,7 @@ class TestDummyBatch(unittest.TestCase):
         batch = cm._make_dummy_batch(32, 128, ForwardMode.EXTEND, 512)
         assert batch.capture_hidden_mode == CaptureHiddenMode.FULL
 
-    def test_precompile_extend_uses_one_unified_multimodal_signature(self):
+    def test_precompile_extend_leaves_multimodal_embedding_to_forward(self):
         cm = CompilationManager(
             server_args=_make_server_args(
                 precompile_token_paddings=[4],
@@ -521,8 +634,6 @@ class TestDummyBatch(unittest.TestCase):
             precompile_in_model_multimodal=True,
         )
         model_runner = MagicMock()
-        input_embedding = object()
-        deepstack = object()
         calls = []
 
         def forward_fn(batch, **kwargs):
@@ -546,11 +657,6 @@ class TestDummyBatch(unittest.TestCase):
         with (
             patch.object(ForwardBatch, "init_new", return_value=forward_batch),
             patch.object(
-                host_orchestration,
-                "precompile_multimodal_inputs",
-                return_value=(input_embedding, deepstack, True),
-            ) as precompile_multimodal_inputs,
-            patch.object(
                 SamplingMetadata,
                 "from_model_worker_batch",
                 return_value=MagicMock(),
@@ -564,16 +670,10 @@ class TestDummyBatch(unittest.TestCase):
                 future_token_ids_map=None,
             )
 
-        assert calls == [(input_embedding, deepstack, True, False)]
+        assert calls == [(None, None, False, False)]
         assert cm._compiled_variants == {(ForwardMode.EXTEND, 4, 2, False)}
-        assert cm._compiled_multimodal_extend_shapes == {(4, 2)}
-        precompile_multimodal_inputs.assert_called_once_with(
-            forward_batch.input_ids,
-            model_runner.model,
-            model_runner.embedding_pool,
-        )
 
-    def test_precompile_all_warms_multimodal_encoder_between_model_modes(self):
+    def test_precompile_all_warms_multimodal_encoder_before_model_modes(self):
         cm = CompilationManager(
             server_args=_make_server_args(),
             max_padded_batch_size=2,
@@ -587,18 +687,29 @@ class TestDummyBatch(unittest.TestCase):
         )
         events = []
         model_runner = MagicMock()
-        model_runner.model.precompile_multimodal.side_effect = lambda: events.append("vision")
-        model_runner.model.get_multimodal_embedding_packed_capacities.return_value = (6, 10)
+        model_runner.mesh = None
+        model_runner.model_config.hf_config = SimpleNamespace(
+            vision_encoder_parallel="dp", precompile_vision_patch_paddings=[4, 8]
+        )
         with (
+            patch.object(
+                host_orchestration,
+                "precompile_multimodal_encoder",
+                side_effect=lambda *args, **kwargs: events.append("vision"),
+            ) as precompile_encoder,
             patch.object(cm, "_precompile_extend", side_effect=lambda *_: events.append("extend")),
             patch.object(cm, "_precompile_decode", side_effect=lambda *_: events.append("decode")),
         ):
             cm.precompile_all(MagicMock(), model_runner, MagicMock())
 
-        assert events == ["extend", "vision", "decode"]
-        assert [
-            call.args for call in model_runner.embedding_pool.precompile_packed_write.call_args_list
-        ] == [(6,), (10,)]
+        assert events == ["vision", "extend", "decode"]
+        precompile_encoder.assert_called_once_with(
+            model_runner.model,
+            model_runner.embedding_pool,
+            [4],
+            num_lanes=1,
+            patch_paddings=[4, 8],
+        )
 
     def test_invalid_cache_loc_raises(self):
         with self.assertRaises(ValueError):

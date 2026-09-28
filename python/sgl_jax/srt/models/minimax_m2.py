@@ -29,8 +29,8 @@ from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK, create_moe_weights_ma
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.model_loader.weights import WeightLoader, WeightSpec
 from sgl_jax.srt.utils.profiling_utils import named_scope
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
@@ -266,7 +266,12 @@ class MiniMaxM2DecoderLayer(nnx.Module):
             topk_ids = jnp.where(mask[:, None], topk_ids, -1)
         hidden_states = self.block_sparse_moe(hidden_states, topk_weights, topk_ids)
 
-        return hidden_states, residual, kv_fused, jax.sharding.reshard(topk_ids, P(None))
+        return (
+            hidden_states,
+            residual,
+            kv_fused,
+            jax.sharding.reshard(topk_ids, P(None)),
+        )
 
 
 class MiniMaxM2Model(nnx.Module):
@@ -371,7 +376,7 @@ class MiniMaxM2ForCausalLM(nnx.Module):
         loader = WeightLoader(
             model=self, model_config=model_config, mesh=self.mesh, dtype=self.dtype
         )
-        loader.load_weights_from_safetensors(self._create_weight_mappings(model_config))
+        loader.load(self._create_weight_mappings(model_config))
         self._maybe_pad_k_norm_scale()
         logger.info("MiniMaxM2 weights loaded successfully!")
 
@@ -399,12 +404,12 @@ class MiniMaxM2ForCausalLM(nnx.Module):
         use_fused = moe_backend == "fused"
 
         mappings = {
-            "model.embed_tokens.weight": WeightMapping(
+            "model.embed_tokens.weight": WeightSpec(
                 target_path="model.embed_tokens.embedding",
                 sharding=("tensor", None),
                 transpose=False,
             ),
-            "model.norm.weight": WeightMapping(
+            "model.norm.weight": WeightSpec(
                 target_path="model.norm.scale", sharding=(None,), transpose=False
             ),
             "lm_head.weight": self.lm_head.weight_mapping("lm_head.embedding"),
@@ -421,7 +426,7 @@ class MiniMaxM2ForCausalLM(nnx.Module):
 
         def add_linear(hf: str, tgt: str, sharding_std: tuple, kv_head_padding: bool = False):
             if not is_static_quant:
-                mappings[f"{hf}.weight"] = WeightMapping(
+                mappings[f"{hf}.weight"] = WeightSpec(
                     target_path=f"{tgt}.weight",
                     sharding=sharding_std,
                     transpose=True,
@@ -429,13 +434,13 @@ class MiniMaxM2ForCausalLM(nnx.Module):
                 )
                 return
             sharding_quant = (sharding_std[1], sharding_std[0])
-            mappings[f"{hf}.weight"] = WeightMapping(
+            mappings[f"{hf}.weight"] = WeightSpec(
                 target_path=f"{tgt}.weight_q",
                 sharding=sharding_quant,
                 transpose=False,
                 kv_head_padding=kv_head_padding,
             )
-            mappings[f"{hf}.weight_scale_inv"] = WeightMapping(
+            mappings[f"{hf}.weight_scale_inv"] = WeightSpec(
                 target_path=f"{tgt}.weight_scale",
                 sharding=sharding_quant,
                 transpose=False,
@@ -443,7 +448,7 @@ class MiniMaxM2ForCausalLM(nnx.Module):
             )
 
         for ln in ("input_layernorm", "post_attention_layernorm"):
-            mappings[f"{prefix}.{ln}.weight"] = WeightMapping(
+            mappings[f"{prefix}.{ln}.weight"] = WeightSpec(
                 target_path=f"{target}.{ln}.scale", sharding=(None,), transpose=False
             )
 
@@ -453,22 +458,24 @@ class MiniMaxM2ForCausalLM(nnx.Module):
         add_linear(f"{ap}.v_proj", f"{tp}.v_proj", (None, "tensor"), kv_head_padding=True)
         add_linear(f"{ap}.o_proj", f"{tp}.o_proj", ("tensor", None))
         if getattr(self.config, "use_qk_norm", False):
-            mappings[f"{ap}.q_norm.weight"] = WeightMapping(
+            mappings[f"{ap}.q_norm.weight"] = WeightSpec(
                 target_path=f"{tp}.q_norm.scale", sharding=("tensor",), transpose=False
             )
             # Load replicated so _maybe_pad_k_norm_scale can np.asarray it on
             # every host (sharded multi-host arrays are non-addressable).
-            mappings[f"{ap}.k_norm.weight"] = WeightMapping(
+            mappings[f"{ap}.k_norm.weight"] = WeightSpec(
                 target_path=f"{tp}.k_norm.scale",
                 sharding=(None,),
                 transpose=False,
             )
 
-        mappings[f"{prefix}.block_sparse_moe.gate.weight"] = WeightMapping(
-            target_path=f"{target}.moe_gate.kernel", sharding=(None, None), transpose=True
+        mappings[f"{prefix}.block_sparse_moe.gate.weight"] = WeightSpec(
+            target_path=f"{target}.moe_gate.kernel",
+            sharding=(None, None),
+            transpose=True,
         )
         if getattr(self.config, "use_routing_bias", True):
-            mappings[f"{prefix}.block_sparse_moe.e_score_correction_bias"] = WeightMapping(
+            mappings[f"{prefix}.block_sparse_moe.e_score_correction_bias"] = WeightSpec(
                 target_path=f"{target}.moe_gate.bias", sharding=(None,), transpose=False
             )
 
@@ -493,14 +500,13 @@ class MiniMaxM2ForCausalLM(nnx.Module):
 
         if is_static_quant and not use_fused:
             for moe_key, wm in moe_mappings.items():
-                if not moe_key.startswith("__MOE_EXPERTS__"):
+                if not wm.sources:
                     continue
-                target_base = wm.target_path[0]
-                expert_scale_keys = [
-                    k.replace(".weight", ".weight_scale_inv") for k in wm.target_path[1:]
-                ]
-                mappings[f"__MOE_EXPERTS__{target_base}_scale"] = WeightMapping(
-                    target_path=[f"{target_base}_scale"] + expert_scale_keys,
+                target_base = wm.target_path
+                expert_scale_keys = [k.replace(".weight", ".weight_scale_inv") for k in wm.sources]
+                mappings[f"{target_base}_scale"] = WeightSpec(
+                    target_path=f"{target_base}_scale",
+                    sources=tuple(expert_scale_keys),
                     sharding=("expert", None, None),
                     transpose=False,
                     physical_to_logical_map=wm.physical_to_logical_map,

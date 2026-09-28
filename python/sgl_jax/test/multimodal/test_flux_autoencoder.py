@@ -39,6 +39,14 @@ FLUX1_VAE_ROOT = Path(os.environ.get("FLUX1_VAE_ROOT", "/models/FLUX1.0/vae"))
     "torch/diffusers/jax/flax not installed",
 )
 class TestFluxAutoencoder(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        # These tests compare against a Torch CPU reference, even when the
+        # host also has accelerators. Keep the device choice local to each test.
+        device = jax.devices("cpu")[0]
+        self.enterContext(jax.default_device(device))
+        self.cpu_mesh = jax.sharding.Mesh(np.asarray([device]), ("tensor",))
+
     @staticmethod
     def _make_image_like_input(
         *,
@@ -187,7 +195,7 @@ class TestFluxAutoencoder(unittest.TestCase):
         # compare outputs on CPU without going through a checkpoint file.
         config = FluxVAEConfig.from_pretrained(FLUX1_VAE_ROOT)
         hf_model = self._build_hf_model(config)
-        jax_model = AutoencoderKL(config)
+        jax_model = AutoencoderKL(config, mesh=self.cpu_mesh)
         self._copy_hf_weights_to_jax(hf_model, jax_model, config)
         x = self._make_image_like_input()
         self._assert_jax_matches_hf(jax_model, hf_model, x)
@@ -201,7 +209,7 @@ class TestFluxAutoencoder(unittest.TestCase):
         # and reconstruction when fed the same input.
         config = FluxVAEConfig.from_pretrained(FLUX1_VAE_ROOT)
         config.model_path = str(FLUX1_VAE_ROOT)
-        jax_model = AutoencoderKL(config)
+        jax_model = AutoencoderKL(config, mesh=self.cpu_mesh)
         jax_model.load_weights(config)
         hf_model = HFAutoencoderKL.from_pretrained(FLUX1_VAE_ROOT).eval()
 

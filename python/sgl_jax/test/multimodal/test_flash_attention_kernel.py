@@ -4,7 +4,6 @@ import jax
 import jax.experimental.pallas as pl
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.multimodal.kernels.flash_attention import SegmentIds, flash_attention
 
@@ -59,10 +58,7 @@ class TestFlashAttentionKernel(unittest.TestCase):
 
     def test_accuracy(self):
         """Test flash attention accuracy"""
-        mesh = jax.make_mesh(
-            (1, 1, 1, 1), axis_names=("x", "y", "z", "p"), devices=[jax.devices()[0]]
-        )
-        sharding = jax.sharding.NamedSharding(mesh, P(None, None, None, None))
+        device = jax.devices()[0]
         q_shape = (2, 12, 120, 128)
         kv_shape = (2, 12, 60, 128)
         key = jax.random.PRNGKey(1)
@@ -71,12 +67,15 @@ class TestFlashAttentionKernel(unittest.TestCase):
         k = jax.random.normal(key1, kv_shape)
         v = jax.random.normal(key2, kv_shape)
 
-        q = jax.device_put(q, sharding)
-        k = jax.device_put(k, sharding)
-        v = jax.device_put(v, sharding)
+        q = jax.device_put(q, device)
+        k = jax.device_put(k, device)
+        v = jax.device_put(v, device)
 
-        flash_output = jit_flash_attention(q, k, v)
-        simple_output = simple_attention(q, k, v)
+        # Padding changes the matmul shapes; use the same FP32 precision for
+        # the Pallas kernel and the unpadded reference.
+        with jax.default_matmul_precision("highest"):
+            flash_output = jit_flash_attention(q, k, v)
+            simple_output = simple_attention(q, k, v)
         print(flash_output.shape, simple_output.shape)
         np.testing.assert_allclose(np.array(flash_output), np.array(simple_output), 1e-5, 1e-5)
 

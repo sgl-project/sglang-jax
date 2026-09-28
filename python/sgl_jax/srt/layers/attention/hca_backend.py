@@ -23,7 +23,11 @@ from sgl_jax.srt.layers.attention.base_attn_backend import (
     AttentionBackendMetadata,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
-from sgl_jax.srt.utils.jax_utils import device_array, is_tpu_runtime
+from sgl_jax.srt.utils.jax_utils import (
+    device_array,
+    is_tpu_runtime,
+    packed_device_array,
+)
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
@@ -283,7 +287,11 @@ class HCABackend(AttentionBackend):
             0,
         )
         max_queries = _bucket_max_queries(int(q_lens.max()), schedule.query_block_size)
-        arrays = device_array(
+        sharding = NamedSharding(self.mesh, P("data"))
+        window_pages, compressed_pages = device_array(
+            (window_pages, compressed_pages), sharding=sharding
+        )
+        arrays = packed_device_array(
             (
                 state_slots,
                 query_seq_ids.astype(np.int32),
@@ -300,7 +308,7 @@ class HCABackend(AttentionBackend):
                 block_offsets,
                 decode_requests,
             ),
-            sharding=NamedSharding(self.mesh, P("data")),
+            sharding=sharding,
         )
         kernel_metadata = HCAMetadata(
             *arrays,

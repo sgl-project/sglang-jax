@@ -19,11 +19,9 @@ import numpy as np
 import pytest
 
 from sgl_jax.srt.managers.schedule_batch import ScheduleBatch, ScheduleReqsInfo
-from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
-    SchedulerOutputProcessorMixin,
-)
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
+from sgl_jax.srt.speculative.overlap_utils import resolve_spec_decode_token_ids
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 HIDDEN = 8
@@ -138,7 +136,7 @@ def test_get_spec_decode_mwb_dp_shapes(dp, bs_per_rank):
     sb = _mk_batch(dp, bs_per_rank)
     real_bs = sum(bs_per_rank)
     buckets = [b for b in BS_BUCKETS if b >= dp]
-    mwb = sb._get_spec_decode_mwb_dp(buckets, enable_static_lora=False)
+    mwb = sb._get_spec_decode_mwb_dp(buckets, enable_static_lora=False, draft_token_num=DRAFT_N)
 
     assert mwb.dp_size == dp
     assert mwb.real_bs == real_bs
@@ -240,7 +238,7 @@ def test_filter_batch_then_decode_mwb_round_trip():
     assert list(np.asarray(sb.reqs_info[1].spec_info.allocate_lens)) == [120]
 
     buckets = [b for b in BS_BUCKETS if b >= dp]
-    mwb = sb._get_spec_decode_mwb_dp(buckets, enable_static_lora=False)
+    mwb = sb._get_spec_decode_mwb_dp(buckets, enable_static_lora=False, draft_token_num=DRAFT_N)
     assert mwb.real_bs == 1
     assert mwb.real_bs_per_dp == [0, 1]
     assert len(mwb.seq_lens) % dp == 0
@@ -287,7 +285,7 @@ def test_spec_info_aligns_with_dp_padded_slots(dp, bs_per_rank):
         )
         flat_base += bs
     buckets = [b for b in BS_BUCKETS if b >= dp]
-    mwb = sb._get_spec_decode_mwb_dp(buckets, enable_static_lora=False)
+    mwb = sb._get_spec_decode_mwb_dp(buckets, enable_static_lora=False, draft_token_num=DRAFT_N)
     per_dp = mwb.per_dp_bs_size
     total_bs = per_dp * dp
 
@@ -338,7 +336,7 @@ def test_draft_page_indices_dp_segmented(dp, bs_per_rank):
         )
         flat_base += bs
     buckets = [b for b in BS_BUCKETS if b >= dp]
-    mwb = sb._get_spec_decode_mwb_dp(buckets, enable_static_lora=False)
+    mwb = sb._get_spec_decode_mwb_dp(buckets, enable_static_lora=False, draft_token_num=DRAFT_N)
     per_dp = mwb.per_dp_bs_size
     sel = np.asarray(mwb.logits_indices_selector)
     assert sel.shape == (real_bs,)
@@ -398,7 +396,7 @@ def test_draft_page_indices_dp_segmented(dp, bs_per_rank):
     ],
 )
 def test_resolve_spec_decode_token_ids(dp, bs_per_rank, accept_per_slot):
-    """`_resolve_spec_decode_token_ids` must slice next_token_ids by DP-padded
+    """`resolve_spec_decode_token_ids` must slice next_token_ids by DP-padded
     slot (not contiguous req index) and return a (total_bs,)-length list with
     [] at padding slots so the per-rank slice in process_batch_result_decode
     lands on the right reqs."""
@@ -414,8 +412,8 @@ def test_resolve_spec_decode_token_ids(dp, bs_per_rank, accept_per_slot):
         accept_lens=np.asarray(accept_per_slot, dtype=np.int32),
         num_accepted_tokens=None,
     )
-    sched = SimpleNamespace(draft_worker=SimpleNamespace(speculative_num_draft_tokens=DRAFT_N))
-    out = SchedulerOutputProcessorMixin._resolve_spec_decode_token_ids(sched, result, sb)
+    out, accept_lens = resolve_spec_decode_token_ids(result, sb, DRAFT_N)
+    assert accept_lens == accept_per_slot
     assert len(out) == total_bs
     per_dp = sb.per_dp_bs_size
     for r, bs in enumerate(bs_per_rank):
@@ -426,7 +424,6 @@ def test_resolve_spec_decode_token_ids(dp, bs_per_rank, accept_per_slot):
                 assert out[slot] == list(
                     range(slot * 1000, slot * 1000 + a)
                 ), f"slot {slot}: got {out[slot]}, want {a} tokens from {slot*1000}"
-                assert sb.reqs_info[r].reqs[j].spec_accepted_tokens == a
             else:
                 assert out[slot] == [], f"pad slot {slot} should be []"
 

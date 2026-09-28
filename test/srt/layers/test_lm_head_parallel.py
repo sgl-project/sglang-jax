@@ -115,7 +115,7 @@ def test_weight_loader(mesh, dp_head, vocab, dummy, tmp_path):
 
     from safetensors.numpy import save_file
 
-    from sgl_jax.srt.utils.weight_utils import WeightLoader
+    from sgl_jax.srt.model_loader.weights import WeightLoader
 
     original = np.arange(vocab * 12, dtype=np.float32).reshape(vocab, 12) / 100
     save_file({"lm_head.weight": original}, tmp_path / "model.safetensors")
@@ -127,9 +127,7 @@ def test_weight_loader(mesh, dp_head, vocab, dummy, tmp_path):
     with jax.set_mesh(mesh):
         model = nnx.eval_shape(lambda: _HeadModel(mesh, vocab, dp_head))
         loader = WeightLoader(model, config, mesh, dtype=jnp.float32)
-        loader.load_weights_from_safetensors(
-            {"lm_head.weight": model.lm_head.weight_mapping("lm_head.embedding")}
-        )
+        loader.load({"lm_head.weight": model.lm_head.weight_mapping("lm_head.embedding")})
         # Divisible heads must already be sharded directly by the loader.
         if vocab == 32:
             assert model.lm_head.embedding.value.sharding.spec == weight_spec(dp_head)
@@ -253,8 +251,8 @@ def test_multimodal_config_without_hf_config_loads_weights(tmp_path, dummy):
 
     from sgl_jax.srt.configs.load_config import LoadConfig
     from sgl_jax.srt.model_loader.loader import JAXModelLoader
+    from sgl_jax.srt.model_loader.weights import WeightLoader, WeightSpec
     from sgl_jax.srt.multimodal.configs.vaes.wan_vae_config import WanVAEConfig
-    from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
     class Encoder(nnx.Module):
         def __init__(self, config, dtype, mesh):
@@ -262,8 +260,8 @@ def test_multimodal_config_without_hf_config_loads_weights(tmp_path, dummy):
             self.weight = nnx.Param(jnp.zeros((4, 4), dtype=dtype))
 
         def load_weights(self, config):
-            WeightLoader(self, config, self.mesh, dtype=config.dtype).load_weights_from_safetensors(
-                {"weight": WeightMapping("weight", sharding=(None, None))}, dummy=dummy
+            WeightLoader(self, config, self.mesh, dtype=config.dtype).load(
+                {"weight": WeightSpec("weight", sharding=(None, None))}, dummy=dummy
             )
 
     original = np.arange(16, dtype=np.float32).reshape(4, 4)
@@ -340,7 +338,7 @@ def test_tensor_only_mesh_loading_and_projection(tp_size, dp_head, vocab, dummy,
     from safetensors.numpy import save_file
 
     from sgl_jax.srt.layers.lm_head_parallel import argmax_with_dp_sharding
-    from sgl_jax.srt.utils.weight_utils import WeightLoader
+    from sgl_jax.srt.model_loader.weights import WeightLoader
 
     if len(jax.devices()) < tp_size:
         pytest.skip("Requires multiple devices; set JAX_NUM_CPU_DEVICES=8")
@@ -356,7 +354,7 @@ def test_tensor_only_mesh_loading_and_projection(tp_size, dp_head, vocab, dummy,
         model = nnx.eval_shape(lambda: _HeadModel(mesh, vocab=vocab, dp_head=dp_head))
         mapping = model.lm_head.weight_mapping("lm_head.embedding")
         assert mapping.sharding == ("tensor", None)
-        WeightLoader(model, config, mesh, dtype=jnp.float32).load_weights_from_safetensors(
+        WeightLoader(model, config, mesh, dtype=jnp.float32).load(
             {"lm_head.weight": mapping}, dummy=dummy
         )
         loaded = model.lm_head.embedding.value
@@ -369,7 +367,7 @@ def test_tensor_only_mesh_loading_and_projection(tp_size, dp_head, vocab, dummy,
         expected = hidden @ expected_weight.T
         for preserve in (False, True):
             logits = jax.jit(
-                lambda x, head: model.logits_processor._get_logits(
+                lambda x, head, preserve=preserve: model.logits_processor._get_logits(
                     x, head, preserve_vocab_sharding=preserve
                 )
             )(h, model.lm_head)

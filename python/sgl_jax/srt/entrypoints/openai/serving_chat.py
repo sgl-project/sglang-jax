@@ -92,6 +92,7 @@ class OpenAIServingChat(OpenAIServingBase):
             video_data=processed_messages.video_data,
             audio_data=processed_messages.audio_data,
             sampling_params=sampling_params,
+            return_hidden_states=request.return_hidden_states,
             return_logprob=request.logprobs,
             logprob_start_len=-1,
             top_logprobs_num=request.top_logprobs or 0,
@@ -596,9 +597,7 @@ Assistant: {% endif %}"""
             if request.return_hidden_states and hidden_states:
                 for index, choice_hidden_states in hidden_states.items():
                     if choice_hidden_states:
-                        last_token_hidden_states = (
-                            choice_hidden_states[-1] if len(choice_hidden_states) > 1 else []
-                        )
+                        last_token_hidden_states = choice_hidden_states[-1]
                         hidden_states_chunk = ChatCompletionStreamResponse(
                             id=content["meta_info"]["id"],
                             created=int(time.time()),

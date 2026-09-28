@@ -26,6 +26,7 @@ from sgl_jax.srt.speculative.spec_utils import (
     SIMULATED_ACCEPTANCE_CONFIG,
     apply_simulated_acceptance,
 )
+from sgl_jax.srt.utils.jax_utils import packed_device_array
 
 
 class GreedyDraftInputs(NamedTuple):
@@ -1629,29 +1630,29 @@ def _prepare_logits_metadata(batch, mesh, *, include_accept_lens: bool = True):
         if include_accept_lens and batch.forward_mode.is_draft_extend() and spec_info is not None
         else None
     )
+    metadata = packed_device_array(
+        dict(
+            extend_seq_lens=batch.extend_seq_lens,
+            logits_indices=batch.logits_indices,
+            accept_lens=accept_lens,
+            extend_input_logprob_token_ids_device=getattr(
+                batch, "extend_input_logprob_token_ids", None
+            ),
+        ),
+        sharding=sharding,
+    )
     return LogitsMetadata(
+        **metadata,
         forward_mode=batch.forward_mode,
         capture_hidden_mode=batch.capture_hidden_mode,
         extend_return_logprob=False,
         extend_return_top_logprob=False,
         extend_token_ids_logprob=False,
-        extend_seq_lens=_prepare_device_array(
-            batch.extend_seq_lens, sharding, "logits.extend_seq_lens"
-        ),
-        logits_indices=_prepare_device_array(
-            batch.logits_indices, sharding, "logits.logits_indices"
-        ),
-        accept_lens=_prepare_device_array(accept_lens, sharding, "logits.accept_lens"),
         extend_seq_lens_cpu=None,
         extend_logprob_start_lens_cpu=None,
         extend_logprob_pruned_lens_cpu=None,
         top_logprobs_nums=getattr(batch, "top_logprobs_nums", None),
         token_ids_logprobs=getattr(batch, "token_ids_logprobs", None),
-        extend_input_logprob_token_ids_device=_prepare_device_array(
-            getattr(batch, "extend_input_logprob_token_ids", None),
-            sharding,
-            "logits.extend_input_logprob_token_ids",
-        ),
     )
 
 
@@ -1696,46 +1697,33 @@ def _make_forward_batch(batch, model_runner):
         if deepstack_visual_embedding is not None:
             deepstack_visual_embedding = deepstack_visual_embedding.astype(jnp.bfloat16)
 
-    if batch.lora_scalings is not None:
-        lora_scalings = _prepare_device_array(
-            batch.lora_scalings, data_sharding, "forward.lora_scalings"
-        )
-        lora_token_indices = _prepare_device_array(
-            batch.lora_token_indices, data_sharding, "forward.lora_token_indices"
-        )
-        lora_ranks = _prepare_device_array(batch.lora_ranks, data_sharding, "forward.lora_ranks")
-    else:
-        lora_scalings = batch.lora_scalings
-        lora_token_indices = batch.lora_token_indices
-        lora_ranks = batch.lora_ranks
+    metadata = packed_device_array(
+        dict(
+            input_ids=input_ids,
+            seq_lens=batch.seq_lens,
+            out_cache_loc=batch.out_cache_loc,
+            positions=positions,
+            req_pool_indices=batch.req_pool_indices,
+            extend_prefix_lens=batch.extend_prefix_lens,
+            extend_seq_lens=extend_seq_lens,
+            lora_scalings=batch.lora_scalings,
+            lora_token_indices=batch.lora_token_indices,
+            lora_ranks=batch.lora_ranks,
+            recurrent_indices=batch.recurrent_indices,
+        ),
+        sharding=data_sharding,
+    )
 
     return ForwardBatch(
+        **metadata,
         bid=batch.bid,
         forward_mode=batch.forward_mode,
         batch_size=len(batch.seq_lens),
-        input_ids=_prepare_device_array(input_ids, data_sharding, "forward.input_ids"),
-        seq_lens=_prepare_device_array(batch.seq_lens, data_sharding, "forward.seq_lens"),
-        out_cache_loc=_prepare_device_array(
-            batch.out_cache_loc, data_sharding, "forward.out_cache_loc"
-        ),
-        positions=_prepare_device_array(positions, data_sharding, "forward.positions"),
         mrope_positions=_prepare_device_array(
             batch.mrope_positions, replicated_2d, "forward.mrope_positions"
         ),
-        req_pool_indices=_prepare_device_array(
-            batch.req_pool_indices, data_sharding, "forward.req_pool_indices"
-        ),
         cache_loc=_prepare_device_array(batch.cache_loc, data_sharding, "forward.cache_loc"),
-        extend_prefix_lens=_prepare_device_array(
-            batch.extend_prefix_lens, data_sharding, "forward.extend_prefix_lens"
-        ),
-        extend_seq_lens=_prepare_device_array(
-            extend_seq_lens, data_sharding, "forward.extend_seq_lens"
-        ),
         lora_ids=batch.lora_ids,
-        lora_scalings=lora_scalings,
-        lora_token_indices=lora_token_indices,
-        lora_ranks=lora_ranks,
         attn_backend=model_runner.attn_backend,
         spec_info=batch.spec_info_padded,
         spec_algorithm=batch.spec_algorithm,
@@ -1744,9 +1732,6 @@ def _make_forward_batch(batch, model_runner):
         apply_for_deepstack=batch.apply_for_deepstack,
         deepstack_visual_embedding=deepstack_visual_embedding,
         expert_location_metadata=get_global_expert_location_metadata(),
-        recurrent_indices=_prepare_device_array(
-            batch.recurrent_indices, data_sharding, "forward.recurrent_indices"
-        ),
     )
 
 
@@ -1761,6 +1746,11 @@ def prepare_forward_batch_for_prefill(spec_worker, model_worker_batch):
     )
     model_worker_batch.forward_batch = _make_forward_batch(model_worker_batch, target_mr)
     model_worker_batch.forward_batch.bid = model_worker_batch.bid
+    # Fused prefill calls the target model directly, bypassing ModelRunner.forward.
+    # Encode and merge this chunk's multimodal inputs before entering the JIT.
+    target_mr.prepare_multimodal_inputs(
+        model_worker_batch.forward_batch, model_worker_batch.multimodal_batch
+    )
     return model_worker_batch.forward_batch
 
 
@@ -1839,15 +1829,11 @@ def launch_fused_draft_extend_for_decode(
         all_leaves.append(tuple(mr.model_state_leaves))
 
     data_sharding = NamedSharding(draft_worker.mesh, P("data"))
-    sel_pos_device = _prepare_device_array(sel_pos, data_sharding, "draft_extend.sel_pos")
-    draft_logits_indices = _prepare_device_array(
-        (
-            getattr(mwb.spec_info_padded, "logits_indices_for_draft_extend", None)
-            if getattr(mwb.spec_info_padded, "logits_indices_for_draft_extend", None) is not None
-            else mwb.logits_indices
-        ),
-        data_sharding,
-        "draft_extend.logits_indices",
+    sel_pos_device = sel_pos
+    draft_logits_indices = (
+        getattr(mwb.spec_info_padded, "logits_indices_for_draft_extend", None)
+        if getattr(mwb.spec_info_padded, "logits_indices_for_draft_extend", None) is not None
+        else mwb.logits_indices
     )
     draft_allocate_lens = getattr(
         batch_output.next_draft_input, "allocate_lens_for_draft_extend", None
@@ -1855,22 +1841,28 @@ def launch_fused_draft_extend_for_decode(
     if draft_allocate_lens is None:
         draft_allocate_lens = np.zeros_like(model_worker_batch.seq_lens, dtype=np.int32)
         draft_allocate_lens[sel] = np.asarray(batch_output.next_draft_input.allocate_lens)
-    draft_allocate_lens = _prepare_device_array(
-        draft_allocate_lens, data_sharding, "draft_extend.allocate_lens"
-    )
     draft_verify_seq_lens = getattr(batch_output.next_draft_input, "verify_seq_lens", None)
-    draft_verify_seq_lens = _prepare_device_array(
-        draft_verify_seq_lens, data_sharding, "draft_extend.verify_seq_lens"
-    )
     if relay_future_indices is None:
         relay_future_indices = np.zeros(model_worker_batch.req_pool_indices.shape, dtype=np.int32)
     if relay_valid_mask is None:
         relay_valid_mask = np.zeros(model_worker_batch.req_pool_indices.shape, dtype=np.bool_)
-    relay_future_indices = _prepare_device_array(
-        relay_future_indices, data_sharding, "draft_extend.relay_future_indices"
-    )
-    relay_valid_mask = _prepare_device_array(
-        relay_valid_mask, data_sharding, "draft_extend.relay_valid_mask"
+    (
+        sel_pos_device,
+        draft_logits_indices,
+        draft_allocate_lens,
+        draft_verify_seq_lens,
+        relay_future_indices,
+        relay_valid_mask,
+    ) = packed_device_array(
+        (
+            sel_pos_device,
+            draft_logits_indices,
+            draft_allocate_lens,
+            draft_verify_seq_lens,
+            relay_future_indices,
+            relay_valid_mask,
+        ),
+        sharding=data_sharding,
     )
     if not hasattr(draft_worker, "_fused_jit_fn"):
         draft_worker._fused_jit_fn = _build_draft_extend(
@@ -2031,14 +2023,10 @@ def launch_eagle3_recurrent_draft_extend_for_decode(
     forward_batch.bid = model_worker_batch.bid
 
     data_sharding = NamedSharding(draft_worker.mesh, P("data"))
-    draft_logits_indices = _prepare_device_array(
-        (
-            getattr(mwb.spec_info_padded, "logits_indices_for_draft_extend", None)
-            if getattr(mwb.spec_info_padded, "logits_indices_for_draft_extend", None) is not None
-            else mwb.logits_indices
-        ),
-        data_sharding,
-        "eagle3_draft_extend.logits_indices",
+    draft_logits_indices = (
+        getattr(mwb.spec_info_padded, "logits_indices_for_draft_extend", None)
+        if getattr(mwb.spec_info_padded, "logits_indices_for_draft_extend", None) is not None
+        else mwb.logits_indices
     )
     draft_allocate_lens = getattr(
         batch_output.next_draft_input,
@@ -2049,41 +2037,32 @@ def launch_eagle3_recurrent_draft_extend_for_decode(
         sel = np.asarray(model_worker_batch.logits_indices_selector)
         draft_allocate_lens = np.zeros_like(model_worker_batch.seq_lens, dtype=np.int32)
         draft_allocate_lens[sel] = np.asarray(batch_output.next_draft_input.allocate_lens)
-    draft_allocate_lens = _prepare_device_array(
-        draft_allocate_lens,
-        data_sharding,
-        "eagle3_draft_extend.allocate_lens",
-    )
-    draft_verify_seq_lens = _prepare_device_array(
-        batch_output.next_draft_input.verify_seq_lens,
-        data_sharding,
-        "eagle3_draft_extend.verify_seq_lens",
-    )
+    draft_verify_seq_lens = batch_output.next_draft_input.verify_seq_lens
     # Verify provides a device-sharded copy separately from the scheduler copy.
     # Host device_put(P() -> P("data")) can materialize the array on CPU and
     # block draft submission until verify finishes.
-    next_new_seq_lens = _prepare_device_array(
-        batch_output.next_draft_input.new_seq_lens_for_draft_extend,
-        data_sharding,
-        "eagle3_draft_extend.new_seq_lens",
-    )
-    next_verified_id = _prepare_device_array(
-        batch_output.next_draft_input.next_verified_id,
-        data_sharding,
-        "eagle3_draft_extend.next_verified_id",
-    )
-    if update_relay:
-        relay_future_indices = _prepare_device_array(
+    next_new_seq_lens = batch_output.next_draft_input.new_seq_lens_for_draft_extend
+    next_verified_id = batch_output.next_draft_input.next_verified_id
+    (
+        draft_logits_indices,
+        draft_allocate_lens,
+        draft_verify_seq_lens,
+        next_new_seq_lens,
+        next_verified_id,
+        relay_future_indices,
+        relay_valid_mask,
+    ) = packed_device_array(
+        (
+            draft_logits_indices,
+            draft_allocate_lens,
+            draft_verify_seq_lens,
+            next_new_seq_lens,
+            next_verified_id,
             relay_future_indices,
-            data_sharding,
-            "eagle3_draft_extend.relay_future_indices",
-        )
-        relay_valid_mask = _prepare_device_array(
             relay_valid_mask,
-            data_sharding,
-            "eagle3_draft_extend.relay_valid_mask",
-        )
-
+        ),
+        sharding=data_sharding,
+    )
     if not hasattr(draft_worker, "_fused_eagle3_recurrent_draft_extend_jit_fn"):
         draft_worker._fused_eagle3_recurrent_draft_extend_jit_fn = (
             _build_eagle3_recurrent_draft_extend(
@@ -2170,6 +2149,12 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
         )
         target_forward_batch = model_worker_batch.forward_batch
         target_forward_batch.bid = model_worker_batch.bid
+        # Some callers supply an already-built ForwardBatch. Preserve prepared
+        # embeddings, but do not assume batch construction encoded the images.
+        if target_forward_batch.input_embedding is None:
+            target_mr.prepare_multimodal_inputs(
+                target_forward_batch, model_worker_batch.multimodal_batch
+            )
     target_logits_metadata = _prepare_logits_metadata(model_worker_batch, spec_worker.mesh)
 
     hidden_size = target_worker.model_config.hidden_size
@@ -2191,12 +2176,8 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
     draft_forward_batch = ForwardBatch.init_new(model_worker_batch, draft_mr0)
     draft_forward_batch.input_ids = target_forward_batch.input_ids
     draft_forward_batch.bid = model_worker_batch.bid
-    draft_logits_indices = _prepare_device_array(
-        model_worker_batch.logits_indices,
-        NamedSharding(draft_worker.mesh, P("data")),
-        "prefill.logits_indices",
-    )
     draft_logits_metadata = _prepare_logits_metadata(model_worker_batch, draft_worker.mesh)
+    draft_logits_indices = draft_logits_metadata.logits_indices
 
     all_memory_pools = []
     all_leaves = []
@@ -2434,10 +2415,13 @@ def spec_decode_verify(
         sampling_key = ("greedy_sampling", _sv_tbs)
         sampling_inputs = constant_cache.get(sampling_key)
         if sampling_inputs is None:
-            sampling_inputs = (
-                _prepare_device_array(np.ones((_sv_tbs, 1), np.float32), data_sharding),
-                _prepare_device_array(np.full((_sv_tbs,), TOP_K_ALL, np.int32), data_sharding),
-                _prepare_device_array(np.ones((_sv_tbs,), np.float32), data_sharding),
+            sampling_inputs = packed_device_array(
+                (
+                    np.ones((_sv_tbs, 1), np.float32),
+                    np.full((_sv_tbs,), TOP_K_ALL, np.int32),
+                    np.ones((_sv_tbs,), np.float32),
+                ),
+                sharding=data_sharding,
             )
             constant_cache[sampling_key] = sampling_inputs
         _sv_temps, _sv_topks, _sv_topps = sampling_inputs
@@ -2454,9 +2438,9 @@ def spec_decode_verify(
             _sv_tbs,
             int(target_worker.model_config.vocab_size),
         )
-        _sv_temps = _prepare_device_array(_sv_temps_host, data_sharding)
-        _sv_topks = _prepare_device_array(_sv_topks_host, data_sharding)
-        _sv_topps = _prepare_device_array(_sv_topps_host, data_sharding)
+        _sv_temps, _sv_topks, _sv_topps = packed_device_array(
+            (_sv_temps_host, _sv_topks_host, _sv_topps_host), sharding=data_sharding
+        )
     _sv_thr_single = float(
         getattr(spec_worker.server_args, "speculative_accept_threshold_single", 1.0)
     )

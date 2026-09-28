@@ -309,6 +309,19 @@ suites = {
     # have a conditional CPU pin gated on USE_DEVICE_TYPE=cpu — the
     # cpu-test CI job sets that env var.
     "unit-test-cpu": [
+        TestFile("python/sgl_jax/test/constrained/test_grammar_backend.py", 0.1),
+        TestFile(
+            "python/sgl_jax/test/test_dp_feature_parity.py",
+            0.1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "python/sgl_jax/test/speculative/test_spec_dp_shapes.py",
+            0.1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
         TestFile(
             "test/srt/layers/test_lm_head_parallel.py",
             0.3,
@@ -439,6 +452,24 @@ suites = {
             0.2,
             runner="pytest",
         ),
+        TestFile(
+            "python/sgl_jax/test/test_runai_loader.py",
+            0.5,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "4"},
+        ),
+        TestFile(
+            "python/sgl_jax/test/test_weight_loading_distributed.py",
+            0.5,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "python/sgl_jax/test/test_weight_loading_recipes.py",
+            0.5,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "4"},
+        ),
         TestFile("python/sgl_jax/test/mem_cache/test_req_to_token_pool.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_hybrid_req_to_token_pool.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_swa_allocator.py", 1),
@@ -448,6 +479,24 @@ suites = {
         TestFile("python/sgl_jax/test/mem_cache/test_unified_swa_component.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_unified_radix_tree_flag.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_paged_allocator_multi_dp.py", 1),
+        TestFile(
+            "python/sgl_jax/test/mem_cache/test_deepseek_v4_pool.py",
+            1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "2"},
+        ),
+        TestFile(
+            "python/sgl_jax/test/mem_cache/test_deepseek_v4_allocator.py",
+            1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "2"},
+        ),
+        TestFile(
+            "python/sgl_jax/test/mem_cache/test_deepseek_v4_lifecycle.py",
+            1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "2"},
+        ),
         TestFile("python/sgl_jax/test/mem_cache/test_host_kv_pool.py", 1, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/mem_cache/test_hicache_controller.py",

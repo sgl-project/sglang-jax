@@ -58,6 +58,7 @@ def _flush_scheduler(tree):
     scheduler.model_config = object()
     scheduler.spec_algorithm = None
     scheduler.mesh = None
+    scheduler.embedding_pool = None
     scheduler.grammar_backend = None
     scheduler.tp_worker = None
     scheduler.tp_worker_p = None

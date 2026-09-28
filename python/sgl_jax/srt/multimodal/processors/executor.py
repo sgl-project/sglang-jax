@@ -14,7 +14,13 @@ class _WorkerState(threading.local):
 
 class MultimodalProcessorExecutor:
     def __init__(self, processor: Any, max_workers: int):
-        self._processors = [copy.deepcopy(processor) for _ in range(max_workers)]
+        # A single worker owns the original instance, including remote
+        # processors that cannot be deep-copied. Concurrent workers need clones.
+        self._processors = (
+            [processor]
+            if max_workers == 1
+            else [copy.deepcopy(processor) for _ in range(max_workers)]
+        )
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=max_workers,
             thread_name_prefix="sgl-jax-mm-processor",

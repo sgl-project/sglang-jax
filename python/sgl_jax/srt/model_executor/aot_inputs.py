@@ -5,14 +5,15 @@ import tempfile
 from pathlib import Path
 
 import jax
+import numpy as np
 from flax import nnx
-from jax.sharding import NamedSharding
+from jax.sharding import NamedSharding, PartitionSpec
 from transformers import PretrainedConfig
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.model_executor.aot_resources import build_resources
+from sgl_jax.srt.model_executor.aot_resources import AbstractResources
 from sgl_jax.srt.model_executor.aot_workloads import InputContext, get_input_builder
 from sgl_jax.srt.model_executor.model_forward import make_jitted_run_model
 from sgl_jax.srt.model_loader.loader import get_model_loader
@@ -139,29 +140,103 @@ def _bind_concrete_sharding(value, mesh):
     )
 
 
+class AbstractModel:
+    """Construct weights and caches once, then lower any number of workload buckets."""
+
+    def __init__(self, model_config, options, mesh, *, target_config=None, server_args=None):
+        self.model_config = model_config
+        self.mesh = mesh
+        model_config._abstract_mode = True
+        with jax.set_mesh(mesh):
+            loader = get_model_loader(LoadConfig(load_format="dummy"), mesh)
+            model = loader.load_model(model_config=model_config)
+            if target_config is not None:
+                # Match the serving draft worker: shared embedding/head layouts come
+                # from the target loader, never from an AOT-specific parameter table.
+                target = loader.load_model(model_config=target_config)
+                if not hasattr(model, "set_embed_and_head") or not hasattr(
+                    target, "get_embed_and_head"
+                ):
+                    raise ValueError(
+                        "Draft export requires the serving embed/head sharing interface"
+                    )
+                model.set_embed_and_head(*target.get_embed_and_head())
+            self.model_def, model_state = nnx.split(model)
+            model_leaves, self.model_state_def = jax.tree_util.tree_flatten(model_state)
+            self.model_leaves = [_bind_concrete_sharding(value, mesh) for value in model_leaves]
+            self.resources = AbstractResources(model_config, model, options, mesh, server_args)
+            self.memory_pools = self.resources.create_pools(options)
+
+    def build_inputs(self, options):
+        builder = get_input_builder(options)
+        backend = self.resources.attn_backend
+        server_args = self.resources.server_args
+        inputs = builder.build(
+            InputContext(
+                self.model_config,
+                self.mesh,
+                backend,
+                self.memory_pools,
+                supports_recurrent_cow=(
+                    self.memory_pools.recurrent_state_pool is not None
+                    and getattr(server_args, "enable_unified_radix_tree", False)
+                    and not server_args.disable_radix_cache
+                ),
+            )
+        )
+        backend.forward_metadata = inputs.attention_metadata
+        args = (
+            self.model_def,
+            self.model_state_def,
+            self.model_leaves,
+            inputs.batch,
+            self.memory_pools,
+            inputs.logits,
+        )
+        return make_jitted_run_model(backend), args, self.model_config.hf_config, builder.spec
+
+
 def build_inputs(options, mesh):
     builder = get_input_builder(options)
-    with tempfile.TemporaryDirectory() as empty_checkpoint, jax.set_mesh(mesh):
+    with tempfile.TemporaryDirectory() as empty_checkpoint:
         is_draft = builder.model_role == "draft"
         model_config = load_config(options, empty_checkpoint, is_draft=is_draft)
-        loader = get_model_loader(LoadConfig(load_format="dummy"), mesh)
-        model = loader.load_model(model_config=model_config)
-        if is_draft:
-            # Match the serving draft worker: shared embedding/head layouts come
-            # from the target loader, never from an AOT-specific parameter table.
-            target_config = load_config(options, empty_checkpoint)
-            target = loader.load_model(model_config=target_config)
-            if not hasattr(model, "set_embed_and_head") or not hasattr(
-                target, "get_embed_and_head"
-            ):
-                raise ValueError("Draft export requires the serving embed/head sharing interface")
-            model.set_embed_and_head(*target.get_embed_and_head())
-        model_def, model_state = nnx.split(model)
-        model_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
-        model_leaves = [_bind_concrete_sharding(value, mesh) for value in model_leaves]
-        backend, memory_pools = build_resources(model_config, model, options, mesh)
+        target_config = load_config(options, empty_checkpoint) if is_draft else None
+        model = AbstractModel(model_config, options, mesh, target_config=target_config)
+    return model.build_inputs(options)
 
-    inputs = builder.build(InputContext(model_config, mesh, backend, memory_pools))
-    backend.forward_metadata = inputs.attention_metadata
-    args = (model_def, model_state_def, model_leaves, inputs.batch, memory_pools, inputs.logits)
-    return make_jitted_run_model(backend), args, model_config.hf_config, builder.spec
+
+class AbstractSampler:
+    """Use serving metadata and model output layouts for offline sampling."""
+
+    def __init__(self, mesh, random_seed, compiler_options=None):
+        from sgl_jax.srt.layers.sampler import Sampler, make_jitted_sampler
+
+        with jax.set_mesh(mesh):
+            sampler = nnx.eval_shape(lambda: Sampler(nnx.Rngs(random_seed), mesh=mesh))
+        self.sampler_def, state = nnx.split(sampler)
+        leaves, self.state_def = jax.tree_util.tree_flatten(state)
+        self.leaves = [_bind_concrete_sharding(value, mesh) for value in leaves]
+        self.mesh = mesh
+        self.step = jax.ShapeDtypeStruct(
+            (), np.int32, sharding=NamedSharding(mesh, PartitionSpec())
+        )
+        # PRNGKey is a small closed-over constant, exactly as in ModelRunner.
+        # Construct it on the host, outside the compile-only device mesh.
+        with jax.set_mesh(None):
+            self.fn = make_jitted_sampler(jax.random.PRNGKey(random_seed), compiler_options)
+
+    def build_inputs(self, logits, batch):
+        from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
+
+        metadata = SamplingMetadata.from_model_worker_batch(
+            batch, 0, self.mesh, logits.next_token_logits.shape[-1], abstract=True
+        )
+        return self.fn, (
+            self.sampler_def,
+            self.state_def,
+            self.leaves,
+            self.step,
+            logits,
+            metadata,
+        )

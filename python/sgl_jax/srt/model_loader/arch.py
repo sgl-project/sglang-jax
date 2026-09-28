@@ -66,13 +66,20 @@ def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str
 def get_model_architecture(model_config: ModelConfig) -> tuple[Any, str]:
     from sgl_jax.srt.models.registry import ModelRegistry
 
-    architectures = getattr(model_config.hf_config, "architectures", [])
+    architectures = list(getattr(model_config.hf_config, "architectures", []))
     supported_archs = ModelRegistry.get_supported_archs()
     is_native_supported = any(arch in supported_archs for arch in architectures)
     if not is_native_supported or model_config.model_impl == ModelImpl.TRANSFORMERS:
         architectures = resolve_transformers_arch(model_config, architectures)
 
-    return ModelRegistry.resolve_model_cls(architectures)
+    model_cls, arch = ModelRegistry.resolve_model_cls(architectures)
+    # MiMo text and multimodal checkpoints share the same architecture name.
+    if arch == "MiMoV2ForCausalLM" and (
+        getattr(model_config.hf_config, "vision_config", None) is not None
+        or getattr(model_config.hf_config, "audio_config", None) is not None
+    ):
+        model_cls, _ = ModelRegistry.resolve_model_cls(["MiMoV2ForConditionalGeneration"])
+    return model_cls, arch
 
 
 def get_architecture_class_name(model_config: ModelConfig) -> str:

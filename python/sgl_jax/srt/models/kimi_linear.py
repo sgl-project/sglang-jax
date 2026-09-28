@@ -21,8 +21,8 @@ from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import EPMoE, create_moe_weights_mapping
 from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.model_loader.weights import WeightLoader, WeightSpec
 from sgl_jax.srt.models.deepseek_v3 import DeepseekV3Attention as KimiMLAAttention
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
@@ -637,20 +637,17 @@ class KimiLinearForCausalLM(nnx.Module):
             dtype=self.dtype,
         )
         weight_mappings = self._create_weight_mappings()
-        loader.load_weights_from_safetensors(weight_mappings)
-        for layer in self.model.layers:
-            if not layer.is_kda:
-                layer.self_attn.post_load_weights()
+        loader.load(weight_mappings)
         logger.info("Weights loaded successfully!")
 
     def _create_weight_mappings(self) -> dict:
         mappings = {
-            "model.embed_tokens.weight": WeightMapping(
+            "model.embed_tokens.weight": WeightSpec(
                 target_path="model.embed_tokens.embedding",
                 sharding=("tensor", None),
                 transpose=False,
             ),
-            "model.norm.weight": WeightMapping(
+            "model.norm.weight": WeightSpec(
                 target_path="model.norm.scale",
                 sharding=(None,),
                 transpose=False,
@@ -685,12 +682,12 @@ class KimiLinearForCausalLM(nnx.Module):
 
         mappings = {
             # Layer norms (all layers)
-            f"{prefix}.input_layernorm.weight": WeightMapping(
+            f"{prefix}.input_layernorm.weight": WeightSpec(
                 target_path=f"{target_prefix}.input_layernorm.scale",
                 sharding=(None,),
                 transpose=False,
             ),
-            f"{prefix}.post_attention_layernorm.weight": WeightMapping(
+            f"{prefix}.post_attention_layernorm.weight": WeightSpec(
                 target_path=f"{target_prefix}.post_attention_layernorm.scale",
                 sharding=(None,),
                 transpose=False,
@@ -700,19 +697,26 @@ class KimiLinearForCausalLM(nnx.Module):
         # --- Attention mappings ---
         if is_kda:
             attn_target = f"{target_prefix}.self_attn"
-            for proj_name in ("q_proj", "k_proj", "v_proj", "f_b_proj", "b_proj", "g_b_proj"):
-                mappings[f"{prefix}.self_attn.{proj_name}.weight"] = WeightMapping(
+            for proj_name in (
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "f_b_proj",
+                "b_proj",
+                "g_b_proj",
+            ):
+                mappings[f"{prefix}.self_attn.{proj_name}.weight"] = WeightSpec(
                     target_path=f"{attn_target}.{proj_name}.weight",
                     sharding=(None, "tensor"),
                     transpose=True,
                 )
             for proj_name in ("f_a_proj", "g_a_proj"):
-                mappings[f"{prefix}.self_attn.{proj_name}.weight"] = WeightMapping(
+                mappings[f"{prefix}.self_attn.{proj_name}.weight"] = WeightSpec(
                     target_path=f"{attn_target}.{proj_name}.weight",
                     sharding=(None, None),
                     transpose=True,
                 )
-            mappings[f"{prefix}.self_attn.o_proj.weight"] = WeightMapping(
+            mappings[f"{prefix}.self_attn.o_proj.weight"] = WeightSpec(
                 target_path=f"{attn_target}.o_proj.weight",
                 sharding=("tensor", None),
                 transpose=True,
@@ -724,24 +728,24 @@ class KimiLinearForCausalLM(nnx.Module):
             head_dim = self.config.linear_attn_config["head_dim"]
             projection_size = num_heads * head_dim
             for conv_name in ("q_conv1d", "k_conv1d", "v_conv1d"):
-                mappings[f"{prefix}.self_attn.{conv_name}.weight"] = WeightMapping(
+                mappings[f"{prefix}.self_attn.{conv_name}.weight"] = WeightSpec(
                     target_path=f"{attn_target}.attn.{conv_name}.weight",
                     sharding=("tensor", None),
                     transpose=False,
                     # transpose_axes=(2, 0, 1),
                     reshape=(projection_size, conv_size),
                 )
-            mappings[f"{prefix}.self_attn.o_norm.weight"] = WeightMapping(
+            mappings[f"{prefix}.self_attn.o_norm.weight"] = WeightSpec(
                 target_path=f"{attn_target}.o_norm.weight",
                 sharding=(None,),
                 transpose=False,
             )
-            mappings[f"{prefix}.self_attn.dt_bias"] = WeightMapping(
+            mappings[f"{prefix}.self_attn.dt_bias"] = WeightSpec(
                 target_path=f"{attn_target}.attn.dt_bias",
                 sharding=("tensor",),
                 transpose=False,
             )
-            mappings[f"{prefix}.self_attn.A_log"] = WeightMapping(
+            mappings[f"{prefix}.self_attn.A_log"] = WeightSpec(
                 target_path=f"{attn_target}.A_log",
                 sharding=(None, None, "tensor", None),
                 transpose=False,
@@ -749,27 +753,27 @@ class KimiLinearForCausalLM(nnx.Module):
         else:
             # MLA layer — MLAAttention is directly self.self_attn
             attn_target = f"{target_prefix}.self_attn"
-            mappings[f"{prefix}.self_attn.q_proj.weight"] = WeightMapping(
+            mappings[f"{prefix}.self_attn.q_proj.weight"] = WeightSpec(
                 target_path=f"{attn_target}.q_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             )
-            mappings[f"{prefix}.self_attn.o_proj.weight"] = WeightMapping(
+            mappings[f"{prefix}.self_attn.o_proj.weight"] = WeightSpec(
                 target_path=f"{attn_target}.o_proj.weight",
                 sharding=("tensor", None),
                 transpose=True,
             )
-            mappings[f"{prefix}.self_attn.kv_a_proj_with_mqa.weight"] = WeightMapping(
+            mappings[f"{prefix}.self_attn.kv_a_proj_with_mqa.weight"] = WeightSpec(
                 target_path=f"{attn_target}.kv_a_proj.weight",
                 sharding=(None, None),
                 transpose=True,
             )
-            mappings[f"{prefix}.self_attn.kv_a_layernorm.weight"] = WeightMapping(
+            mappings[f"{prefix}.self_attn.kv_a_layernorm.weight"] = WeightSpec(
                 target_path=f"{attn_target}.kv_a_layernorm.scale",
                 sharding=(None,),
                 transpose=False,
             )
-            mappings[f"{prefix}.self_attn.kv_b_proj.weight"] = WeightMapping(
+            mappings[f"{prefix}.self_attn.kv_b_proj.weight"] = WeightSpec(
                 target_path=f"{attn_target}.kv_b_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
@@ -783,7 +787,7 @@ class KimiLinearForCausalLM(nnx.Module):
                 ("up_proj", (None, "tensor")),
                 ("down_proj", ("tensor", None)),
             ]:
-                mappings[f"{prefix}.mlp.{proj_name}.weight"] = WeightMapping(
+                mappings[f"{prefix}.mlp.{proj_name}.weight"] = WeightSpec(
                     target_path=f"{target_prefix}.mlp.{proj_name}.weight",
                     sharding=sharding,
                     transpose=True,
@@ -792,12 +796,12 @@ class KimiLinearForCausalLM(nnx.Module):
             # MoE — gate/topk are flat on decoder layer, experts in block_sparse_moe
 
             # Gate
-            mappings[f"{prefix}.block_sparse_moe.gate.weight"] = WeightMapping(
+            mappings[f"{prefix}.block_sparse_moe.gate.weight"] = WeightSpec(
                 target_path=f"{target_prefix}.moe_gate.kernel",
                 sharding=(None, None),
                 transpose=True,
             )
-            mappings[f"{prefix}.block_sparse_moe.gate.e_score_correction_bias"] = WeightMapping(
+            mappings[f"{prefix}.block_sparse_moe.gate.e_score_correction_bias"] = WeightSpec(
                 target_path=f"{target_prefix}.moe_gate.bias",
                 sharding=(None,),
             )
@@ -833,7 +837,7 @@ class KimiLinearForCausalLM(nnx.Module):
                 ("down_proj", ("tensor", None)),
             ]:
                 mappings[f"{prefix}.block_sparse_moe.shared_experts.{proj_name}.weight"] = (
-                    WeightMapping(
+                    WeightSpec(
                         target_path=f"{target_prefix}.shared_experts.{proj_name}.weight",
                         sharding=sharding,
                         transpose=True,

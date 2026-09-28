@@ -14,7 +14,7 @@ from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
+from sgl_jax.srt.model_loader.weights import WeightLoader, WeightSpec
 
 logger = logging.getLogger(__name__)
 
@@ -323,17 +323,17 @@ class QWenLMHeadModel(nnx.Module):
 
         weight_mappings = self._create_qwen_weight_mappings()
 
-        loader.load_weights_from_safetensors(weight_mappings)
+        loader.load(weight_mappings)
         logger.info("Qwen weights loaded successfully!")
 
     def _create_qwen_weight_mappings(self) -> dict:
         mappings = {
-            "transformer.wte.weight": WeightMapping(
+            "transformer.wte.weight": WeightSpec(
                 target_path="model.embed_tokens.embedding",
                 sharding=("tensor", None),
                 transpose=False,
             ),
-            "transformer.ln_f.weight": WeightMapping(
+            "transformer.ln_f.weight": WeightSpec(
                 target_path="model.ln_f.scale", sharding=(None,), transpose=False
             ),
         }
@@ -353,13 +353,17 @@ class QWenLMHeadModel(nnx.Module):
         target_prefix = f"model.layers.{layer_idx}"
 
         return {
-            f"{prefix}.ln_1.weight": WeightMapping(
-                target_path=f"{target_prefix}.ln_1.scale", sharding=(None,), transpose=False
+            f"{prefix}.ln_1.weight": WeightSpec(
+                target_path=f"{target_prefix}.ln_1.scale",
+                sharding=(None,),
+                transpose=False,
             ),
-            f"{prefix}.ln_2.weight": WeightMapping(
-                target_path=f"{target_prefix}.ln_2.scale", sharding=(None,), transpose=False
+            f"{prefix}.ln_2.weight": WeightSpec(
+                target_path=f"{target_prefix}.ln_2.scale",
+                sharding=(None,),
+                transpose=False,
             ),
-            f"{prefix}.attn.c_attn.weight": WeightMapping(
+            f"{prefix}.attn.c_attn.weight": WeightSpec(
                 target_path=[
                     f"{target_prefix}.attn.q_proj.weight",
                     f"{target_prefix}.attn.k_proj.weight",
@@ -370,7 +374,7 @@ class QWenLMHeadModel(nnx.Module):
                 head_dim_padding=True,
                 kv_head_padding=True,
             ),
-            f"{prefix}.attn.c_attn.bias": WeightMapping(
+            f"{prefix}.attn.c_attn.bias": WeightSpec(
                 target_path=[
                     f"{target_prefix}.attn.q_proj.bias",
                     f"{target_prefix}.attn.k_proj.bias",
@@ -381,22 +385,22 @@ class QWenLMHeadModel(nnx.Module):
                 head_dim_padding=True,
                 kv_head_padding=True,
             ),
-            f"{prefix}.attn.c_proj.weight": WeightMapping(
+            f"{prefix}.attn.c_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.attn.c_proj.weight",
                 sharding=("tensor", None),
                 transpose=True,
             ),
-            f"{prefix}.mlp.w1.weight": WeightMapping(
+            f"{prefix}.mlp.w1.weight": WeightSpec(
                 target_path=f"{target_prefix}.mlp.w1.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             ),
-            f"{prefix}.mlp.w2.weight": WeightMapping(
+            f"{prefix}.mlp.w2.weight": WeightSpec(
                 target_path=f"{target_prefix}.mlp.w2.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             ),
-            f"{prefix}.mlp.c_proj.weight": WeightMapping(
+            f"{prefix}.mlp.c_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.mlp.c_proj.weight",
                 sharding=("tensor", None),
                 transpose=True,

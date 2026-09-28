@@ -35,9 +35,9 @@ from sgl_jax.srt.layers.moe import EPMoE, create_moe_weights_mapping
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.model_loader.weights import WeightLoader, WeightSpec
 from sgl_jax.srt.utils.debug_utils import log_shardings
 from sgl_jax.srt.utils.parallel_utils import make_reduce_sharding
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
@@ -1013,26 +1013,26 @@ class Grok1ForCausalLM(nnx.Module):
 
         weight_mappings = self._create_grok_weight_mappings()
 
-        loader.load_weights_from_safetensors(
+        loader.load(
             weight_mappings,
             safetensors_partition=8,
         )
         logger.info("Grok weights loaded successfully!")
 
-    def _create_grok_weight_mappings(self) -> dict[str, WeightMapping]:
+    def _create_grok_weight_mappings(self) -> dict[str, WeightSpec]:
         mappings = {
-            "model.embed_tokens.weight": WeightMapping(
+            "model.embed_tokens.weight": WeightSpec(
                 target_path="model.embed_tokens.embedding",
                 sharding=("tensor", None),
                 transpose=False,
             ),
-            "model.norm.weight": WeightMapping(
+            "model.norm.weight": WeightSpec(
                 target_path="model.norm.scale", sharding=(None,), transpose=False
             ),
             "lm_head.weight": (
                 self.lm_head.weight_mapping("lm_head.embedding")
                 if isinstance(self.lm_head, ParallelLMHead)
-                else WeightMapping("lm_head.embedding", sharding=("tensor", None))
+                else WeightSpec("lm_head.embedding", sharding=("tensor", None))
             ),
         }
 
@@ -1043,76 +1043,76 @@ class Grok1ForCausalLM(nnx.Module):
 
         return mappings
 
-    def _create_layer_mappings(self, layer_idx: int) -> dict[str, WeightMapping]:
+    def _create_layer_mappings(self, layer_idx: int) -> dict[str, WeightSpec]:
         prefix = f"model.layers.{layer_idx}"
         target_prefix = f"model.layers.{layer_idx}"
 
         mappings = {
             # self_attn - separate q, k, v projections
-            f"{prefix}.self_attn.q_proj.weight": WeightMapping(
+            f"{prefix}.self_attn.q_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.self_attn.q_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
                 head_dim_padding=True,
                 kv_head_padding=False,
             ),
-            f"{prefix}.self_attn.k_proj.weight": WeightMapping(
+            f"{prefix}.self_attn.k_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.self_attn.k_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
                 head_dim_padding=True,
                 kv_head_padding=True,
             ),
-            f"{prefix}.self_attn.v_proj.weight": WeightMapping(
+            f"{prefix}.self_attn.v_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.self_attn.v_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
                 head_dim_padding=True,
                 kv_head_padding=True,
             ),
-            f"{prefix}.self_attn.o_proj.weight": WeightMapping(
+            f"{prefix}.self_attn.o_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.self_attn.o_proj.weight",
                 sharding=("tensor", None),
                 transpose=True,
                 head_dim_padding=True,
                 kv_head_padding=False,
             ),
-            f"{prefix}.pre_attn_norm.weight": WeightMapping(
+            f"{prefix}.pre_attn_norm.weight": WeightSpec(
                 target_path=f"{target_prefix}.pre_attn_norm.scale",
                 sharding=(None,),
                 transpose=False,
             ),
-            f"{prefix}.post_attn_norm.weight": WeightMapping(
+            f"{prefix}.post_attn_norm.weight": WeightSpec(
                 target_path=f"{target_prefix}.post_attn_norm.scale",
                 sharding=(None,),
                 transpose=False,
             ),
-            f"{prefix}.pre_moe_norm.weight": WeightMapping(
+            f"{prefix}.pre_moe_norm.weight": WeightSpec(
                 target_path=f"{target_prefix}.pre_moe_norm.scale",
                 sharding=(None,),
                 transpose=False,
             ),
-            f"{prefix}.post_moe_norm.weight": WeightMapping(
+            f"{prefix}.post_moe_norm.weight": WeightSpec(
                 target_path=f"{target_prefix}.post_moe_norm.scale",
                 sharding=(None,),
                 transpose=False,
             ),
-            f"{prefix}.mlp.gate_proj.weight": WeightMapping(
+            f"{prefix}.mlp.gate_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.mlp.gate_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             ),
-            f"{prefix}.mlp.up_proj.weight": WeightMapping(
+            f"{prefix}.mlp.up_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.mlp.up_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             ),
-            f"{prefix}.mlp.down_proj.weight": WeightMapping(
+            f"{prefix}.mlp.down_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.mlp.down_proj.weight",
                 sharding=("tensor", None),
                 transpose=True,
             ),
-            f"{prefix}.block_sparse_moe.gate.weight": WeightMapping(
+            f"{prefix}.block_sparse_moe.gate.weight": WeightSpec(
                 target_path=f"{target_prefix}.block_sparse_moe.gate.weight",
                 sharding=(None, None),
                 transpose=True,
