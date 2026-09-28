@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest import mock
 
 import jax
@@ -46,8 +47,7 @@ def test_deferred_moe_transpose_preserves_target_sharding():
     hf_weight = np.arange(6, dtype=np.float32).reshape(2, 3)
     key = "model.layers.0.mlp.experts.0.gate_proj.weight"
 
-    loader = object.__new__(WeightLoader)
-    loader.mesh = mesh
+    loader = WeightLoader(nnx.Module(), SimpleNamespace(), mesh)
     result = loader._create_stacked_moe_lazy_tensor(
         expected_hf_keys=[key],
         weight_info={
