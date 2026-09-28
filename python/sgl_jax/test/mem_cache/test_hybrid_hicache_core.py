@@ -84,8 +84,7 @@ def test_swa_internal_writeback_and_short_window_restore():
         settle(cache)
         result = cache.match_prefix(MatchPrefixParams(key=key(range(12))))
         assert result.host_hit_length == 12
-        assert result.swa_host_hit_length == 4
-        assert cache.get_load_back_sizes(tail) == (12, 4)
+        assert cache.get_load_back_sizes(result.last_host_node) == (12, 4)
         restored, _, _ = cache.init_load_back(tail, 12)
         assert len(restored) == 12
         assert alloc.count_swa_mapped(restored, dp_rank=0) == 4
@@ -550,7 +549,7 @@ def test_mixed_device_and_host_window_only_allocates_missing_swa():
         match = cache.match_prefix(MatchPrefixParams(key=key(range(12))))
         assert len(match.device_indices) == 4
         assert match.host_hit_length == 8
-        assert match.swa_host_hit_length == 4
+        assert cache.get_load_back_sizes(match.last_host_node) == (0, 4)
         restored, _, _ = cache.init_load_back(tail, 8)
         np.testing.assert_array_equal(restored, full[4:])
         assert alloc.swa_available_size() == before - 4
@@ -582,8 +581,9 @@ def test_host_splits_use_page_handles_and_boundary_nodes(page, window):
                 assert len(node.component_data[ct].host_value) == len(node.key) // page
         cache.components[CT.SWA].evict_component(tail)
         match = cache.match_prefix(MatchPrefixParams(key=key(range(page * 4))))
-        assert match.swa_host_hit_length == len(tail.key)
-        assert match.swa_host_hit_length >= min(window, len(tail.key))
+        missing_swa = cache.get_load_back_sizes(match.last_host_node)[1]
+        assert missing_swa == len(tail.key)
+        assert missing_swa >= min(window, len(tail.key))
     finally:
         shutdown(cache)
 

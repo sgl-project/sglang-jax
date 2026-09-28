@@ -130,10 +130,13 @@ class HybridHiCache:
         pool = self.cache.host_pools[ct]
         controller = self.cache.hicache_controllers[ct]
         rank = transfer.device.dp_rank
-        handles = pool.alloc(len(transfer.device.pages), dp_rank=rank)
+        need_pages = len(transfer.device.pages)
+        handles = pool.alloc(need_pages, dp_rank=rank)
         if handles is None:
-            self.evict_host(len(transfer.device.pages), rank, ct)
-            handles = pool.alloc(len(transfer.device.pages), dp_rank=rank)
+            missing_pages = max(0, need_pages - pool.available_size(rank))
+            if missing_pages:
+                self.evict_host(missing_pages, rank, ct)
+            handles = pool.alloc(need_pages, dp_rank=rank)
         if handles is None:
             return 0
         handles = list(map(int, handles))
@@ -194,7 +197,7 @@ class HybridHiCache:
             return 0, 0
         return tuple(sum(len(n.key) for n in selected[ct]) for ct in (CT.FULL, CT.SWA))
 
-    def restore(self, node, host_hit_length, mem_quota=None, swa_mem_quota=None):
+    def restore(self, node, mem_quota=None, swa_mem_quota=None):
         empty = (np.empty(0, dtype=np.int32), node, [])
         selected = self.selection(node)
         if selected is None:
@@ -286,8 +289,6 @@ class HybridHiCache:
                 if first_error is not None:
                     raise first_error
             else:
-                if cache._donation_barrier is not None:
-                    cache._donation_barrier()
                 first_error = None
                 for controller in cache.hicache_controllers.values():
                     try:

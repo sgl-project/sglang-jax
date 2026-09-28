@@ -24,6 +24,65 @@ from sgl_jax.test.mem_cache.test_hybrid_hicache_core import (
 )
 
 
+@pytest.mark.parametrize("backend", ["jax", "raiden"])
+@pytest.mark.parametrize("component", [CT.FULL, CT.SWA])
+def test_host_backup_evicts_only_rank_local_shortfall(backend, component):
+    cache, alloc, _ = make_cache(
+        window=1024,
+        policy="write_back",
+        full_pages=32,
+        swa_pages=32,
+        backend=backend,
+        dp_size=2,
+    )
+    try:
+        _, quiet = insert(cache, alloc, range(8), rank=0)
+        cache.evict(EvictParams(num_tokens=8, dp_rank=0))
+        settle(cache)
+        nodes = []
+        for start in (100, 200, 300):
+            _, node = insert(cache, alloc, range(start, start + 8), rank=1)
+            cache.evict(EvictParams(num_tokens=8, dp_rank=1))
+            settle(cache)
+            nodes.append(node)
+        pool = cache.host_pools[component]
+        assert pool.available_size(1) == 8
+        saved = {
+            (node, ct): node.component_data[ct].host_value.copy()
+            for node in [quiet, *nodes]
+            for ct in (CT.FULL, CT.SWA)
+        }
+        quiet_before = (
+            alloc.full_available_size(0),
+            alloc.swa_available_size(0),
+            tuple(p.available_size(0) for p in cache.host_pools.values()),
+        )
+        _, incoming = insert(cache, alloc, range(400, 412), rank=1)
+        mapping_before = [mapping.copy() for mapping in alloc.full_to_swa_index_mapping]
+        assert cache._hybrid_coordinator.backup_component(incoming, component) == 12
+        settle(cache)
+
+        # Twelve new pages need only four beyond the eight already free.
+        # Evict one eight-page node; keep the other reusable host prefixes.
+        assert nodes[0].component_data[component].host_value is None
+        for (node, ct), handles in saved.items():
+            if node is not nodes[0] or ct != component:
+                np.testing.assert_array_equal(node.component_data[ct].host_value, handles)
+        assert len(incoming.component_data[component].host_value) == 12
+        assert pool.available_size(1) == 4
+        other = CT.SWA if component == CT.FULL else CT.FULL
+        assert incoming.component_data[other].host_value is None
+        assert cache.host_pools[other].available_size(1) == 8
+        assert quiet_before == (
+            alloc.full_available_size(0),
+            alloc.swa_available_size(0),
+            tuple(p.available_size(0) for p in cache.host_pools.values()),
+        )
+        np.testing.assert_array_equal(alloc.full_to_swa_index_mapping, mapping_before)
+    finally:
+        shutdown(cache)
+
+
 @pytest.mark.parametrize("policy", ["write_through", "write_back"])
 @pytest.mark.parametrize("page", [1, 128])
 @pytest.mark.parametrize("mode", ["dual", "swa_only", "mixed"])

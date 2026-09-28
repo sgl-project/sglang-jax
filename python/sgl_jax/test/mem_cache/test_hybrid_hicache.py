@@ -195,7 +195,7 @@ def test_component_pools_and_swa_only_restore_preserve_full_addresses(backend):
         cache._update_aux_evictable_node_sets(node)
         result = cache.match_prefix(MatchPrefixParams(key=key(range(8))))
         assert result.host_hit_length == 8
-        assert result.swa_host_hit_length == 8
+        assert cache.get_load_back_sizes(result.last_host_node) == (0, 8)
         restored, last, plan = cache.init_load_back(result.last_host_node, result.host_hit_length)
         cache.finish_load_back(plan)
         np.testing.assert_array_equal(restored, full)

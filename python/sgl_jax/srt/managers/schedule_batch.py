@@ -302,7 +302,6 @@ class Req:
         self.last_node: Any = None
         self.last_host_node: Any = None
         self.host_hit_length = 0
-        self.swa_host_hit_length = 0
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: int | None = None
         # Exact acquire receipt.  The UUID is only the legacy compatibility
@@ -449,7 +448,6 @@ class Req:
         self,
         tree_cache: BasePrefixCache | None = None,
     ):
-        self.swa_host_hit_length = 0
         # Reset so a non-admitted re-match never clones from a stale/evicted slot.
         self.recurrent_cow_src_index = None
         self.fill_ids = (
@@ -517,7 +515,6 @@ class Req:
                 self.last_node = match_result.last_device_node
                 self.last_host_node = match_result.last_host_node
                 self.host_hit_length = match_result.host_hit_length
-                self.swa_host_hit_length = match_result.swa_host_hit_length
             self.last_matched_prefix_len = len(self.prefix_indices)
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
@@ -684,7 +681,6 @@ class Req:
     def reset_for_retract(self):
         self.last_host_node = None
         self.host_hit_length = 0
-        self.swa_host_hit_length = 0
         self.prefix_indices = []
         self.last_node = None
         self.swa_uuid_for_lock = None
