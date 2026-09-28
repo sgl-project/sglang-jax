@@ -1358,7 +1358,10 @@ class Scheduler(
                 req.grammar = req.grammar.result(timeout=0.03)
                 # Cache the compiled grammar
                 if self.grammar_backend and req.grammar_key:
-                    self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
+                    cached_grammar = (
+                        req.grammar if req.grammar is INVALID_GRAMMAR_OBJ else req.grammar.copy()
+                    )
+                    self.grammar_backend.set_cache(req.grammar_key, cached_grammar)
 
                 # Check if compilation resulted in invalid grammar
                 if req.grammar is INVALID_GRAMMAR_OBJ:
