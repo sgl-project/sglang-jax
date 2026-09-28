@@ -450,6 +450,31 @@ class TestCompressBatch(unittest.TestCase):
             _, _, _, rings_out = layer.compress_batch(raw, positions, cu, slots, rings, rotary)
         np.testing.assert_array_equal(np.asarray(rings_out[slots[1]]), np.asarray(rings[slots[1]]))
 
+    def test_a_padded_request_leaves_the_last_slot_alone(self):
+        """Batch padding carries slot -1. Its ring must not land on the last
+        slot, where a live request's new ring would be overwritten."""
+        mesh = _make_mesh()
+        layer = _make_indexer(mesh)
+        rotary = _make_rotary()
+        rng = np.random.default_rng(4)
+        raw, positions, cu, _, rings = self._inputs(rng, layer, mesh, [5], [2])
+        last = rings.shape[0] - 1
+
+        with jax.set_mesh(mesh):
+            _, _, _, alone = layer.compress_batch(
+                raw, positions, cu, jnp.asarray([last], jnp.int32), rings, rotary
+            )
+            _, _, _, padded = layer.compress_batch(
+                raw,
+                positions,
+                jnp.concatenate([cu, cu[-1:]]),
+                jnp.asarray([last, -1], jnp.int32),
+                rings,
+                rotary,
+            )
+        self.assertFalse(np.array_equal(np.asarray(alone[last]), np.asarray(rings[last])))
+        np.testing.assert_array_equal(np.asarray(padded), np.asarray(alone))
+
     def test_jit(self):
         """Shapes are static under jit even though the boundaries are traced."""
         mesh = _make_mesh()

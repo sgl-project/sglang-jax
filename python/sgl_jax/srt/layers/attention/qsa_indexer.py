@@ -180,7 +180,7 @@ class QSAIndexer(nnx.Module):
           raw_keys:  [T, D]              un-normed, un-rotated keys, packed
           positions: [T] i32             each token's position in its request
           cu_q_lens: [S + 1] i32         request boundaries within the stream
-          req_slots: [S] i32             batch index -> ReqToTokenPool slot
+          req_slots: [S] i32             batch index -> ReqToTokenPool slot, -1 if padded
           rings:     [max_reqs, compress_ratio, D]
           rotary_emb: applied at each group's FIRST position, derived as
             ``group * compress_ratio`` rather than read back from the tokens.
@@ -235,7 +235,7 @@ class QSAIndexer(nnx.Module):
         )
         ring_new = jnp.where(keep[:, :, None], window[last], 0).astype(rings.dtype)
         ring_new = jnp.where(has_tokens[:, None, None], ring_new, rings[req_slots])
-        rings_out = rings.at[req_slots].set(ring_new)
+        rings_out = write_ring_rows(rings, req_slots, ring_new)
 
         return compressed, groups, seq_ids, rings_out
 
@@ -279,6 +279,16 @@ class QSAIndexer(nnx.Module):
     def indexer_weights_shape(self) -> tuple[int, ...]:
         """QSA has no ``weights_proj``; feed ``streamindex_topk`` ones of this shape."""
         return (self.n_heads,)
+
+
+def write_ring_rows(rings: jax.Array, slots: jax.Array, rows: jax.Array) -> jax.Array:
+    """``rings[slots] = rows``, skipping padded requests.
+
+    A padded request's slot is -1, which indexing wraps to the last row, a slot
+    a live request can hold. Steered out of range, the padding row is dropped.
+    """
+    in_range = jnp.where(slots >= 0, slots, rings.shape[0])
+    return rings.at[in_range].set(rows, mode="drop")
 
 
 _SELECT_BLOCK_ENTRIES = 1024
