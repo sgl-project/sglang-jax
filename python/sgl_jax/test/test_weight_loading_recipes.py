@@ -143,6 +143,8 @@ def test_mimo_flash_kv_and_head_replication(tmp_path, mesh, per_head):
 
 
 def test_split_file_dense_and_explicit_alias(tmp_path, mesh):
+    from sgl_jax.srt.model_loader.weights import JaxShardReader, LocalSource
+
     original = np.arange(128, dtype=np.float32).reshape(16, 8)
     for i, part in enumerate(np.split(original, 2)):
         save_file({"weight": part}, tmp_path / f"{i}.safetensors")
@@ -152,8 +154,8 @@ def test_split_file_dense_and_explicit_alias(tmp_path, mesh):
     )
     model.tied = model.weight
     config = SimpleNamespace(model_path=str(tmp_path))
-    with jax.set_mesh(mesh):
-        WeightLoader(model, config, mesh).load(
+    with LocalSource(config) as source, jax.set_mesh(mesh):
+        WeightLoader(model, config, mesh, source=source, reader=JaxShardReader(mesh)).load(
             {"weight": WeightSpec("weight", transpose=True, concat_axis=0)}
         )
     assert model.tied is model.weight
@@ -174,6 +176,27 @@ def test_invalid_plan_fails_before_assignment(tmp_path, mesh, kind):
     with pytest.raises(ValueError, match="Missing|Duplicate"):
         WeightLoader(model, SimpleNamespace(model_path=str(tmp_path)), mesh).load(specs)
     assert model.weight.value is original
+
+
+@pytest.mark.parametrize("invalid", ["shape", "dtype"])
+def test_recipe_output_rejected_before_parameter_write(tmp_path, mesh, invalid):
+    save_file({"w": np.ones((8, 8), np.float32)}, tmp_path / "model.safetensors")
+    model = nnx.Module()
+    model.weight = nnx.Param(jax.ShapeDtypeStruct((8, 8), jnp.float32))
+    parameter = model.weight
+
+    def recipe(inputs):
+        value = jnp.asarray(inputs[0])
+        return (value[:4] if invalid == "shape" else value.astype(jnp.bfloat16),)
+
+    with jax.set_mesh(mesh), pytest.raises(ValueError, match="Loaded target weight"):
+        WeightLoader(model, SimpleNamespace(model_path=str(tmp_path)), mesh).load(
+            {"group": WeightSpec("weight", sources=("w",), recipe=recipe)}
+        )
+    assert model.weight is parameter
+    assert isinstance(parameter.value, jax.ShapeDtypeStruct)
+    assert parameter.value.shape == (8, 8)
+    assert parameter.value.dtype == jnp.float32
 
 
 def test_pd_cache_tracks_checkpoint_and_expert_placement(tmp_path, mesh, monkeypatch):
@@ -384,7 +407,7 @@ def test_experts_tp_slices_transpose_and_redundant_placement(tmp_path, split):
 
 def test_bulk_experts_reads_real_offsets_and_bounds_merged_ranges(tmp_path, monkeypatch):
     from sgl_jax.srt.model_loader.weights import LocalSource
-    from sgl_jax.srt.model_loader.weights.reader import ShardReader
+    from sgl_jax.srt.model_loader.weights.reader import JaxShardReader
 
     mesh = Mesh(
         np.asarray(jax.devices()[:1]).reshape(1, 1),
@@ -402,17 +425,17 @@ def test_bulk_experts_reads_real_offsets_and_bounds_merged_ranges(tmp_path, monk
     cfg = SimpleNamespace(model_path=str(tmp_path))
     monkeypatch.setenv("SGLANG_MOE_BULK_READ", "1")
     source = LocalSource(cfg)
-    reader = ShardReader(nnx.Module(), cfg, mesh)
-    value = reader._create_stacked_moe_lazy_tensor(
-        ["e.0", "e.1"],
-        source.metadata,
+    reader = JaxShardReader(mesh)
+    value = reader.read(
         source,
-        do_transpose=True,
-        target_sharding=NamedSharding(mesh, P("expert", None, "tensor")),
-        physical_to_logical_map=np.array([1, 0, 1]),
+        "experts",
+        WeightSpec(
+            "w", sources=("e.0", "e.1"), transpose=True, physical_to_logical_map=np.array([1, 0, 1])
+        ),
+        NamedSharding(mesh, P("expert", None, "tensor")),
     )
     np.testing.assert_array_equal(value, np.stack([weights[k].T for k in ("e.1", "e.0", "e.1")]))
-    source.close_all()
+    source.close()
 
 
 @pytest.mark.parametrize("is_moe", [False, True])

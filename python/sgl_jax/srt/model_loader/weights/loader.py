@@ -19,9 +19,14 @@ from tqdm import tqdm
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 
-from .reader import ShardReader
+from .reader import JaxShardReader, WeightReader
 from .recipes import TensorLayout
-from .source import _SAFETENSORS_DTYPE_TO_JAX, LocalSource, _reinterpret_dtype_if_needed
+from .source import (
+    _SAFETENSORS_DTYPE_TO_JAX,
+    LocalSource,
+    WeightSource,
+    coordinate_error,
+)
 from .specs import WeightSpec
 
 logger = logging.getLogger(__name__)
@@ -36,17 +41,21 @@ class WeightLoader:
         model_config: ModelConfig,
         mesh: Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
+        *,
+        source: WeightSource | None = None,
+        reader: WeightReader | None = None,
     ):
         self.model = model
         self.model_config = model_config
         self.mesh = mesh
         self.dtype = dtype
         self.dummy_mode = getattr(model_config, "_dummy_mode", False)
-        source = getattr(model_config, "_weight_source", None)
+        if source is None:
+            source = getattr(model_config, "_weight_source", None)
         self._owns_source = source is None
-        self.source = source or LocalSource(model_config)
-        self.reader = ShardReader(model, model_config, mesh, dtype)
-        self.layout = TensorLayout(model, model_config, mesh, dtype)
+        self.source: WeightSource = source if source is not None else LocalSource(model_config)
+        self.reader: WeightReader = reader if reader is not None else JaxShardReader(mesh)
+        self.layout = TensorLayout(model_config, mesh)
 
     @property
     def is_static_quant(self) -> bool:
@@ -191,7 +200,7 @@ class WeightLoader:
                 raise error
             self._load_dummy(nnx.state(self.model), mappings)
             return
-        self.reader.coordinate_error(error, "preparation")
+        coordinate_error(error, "preparation")
         error = None
         try:
             planned = self._plan(
@@ -199,23 +208,21 @@ class WeightLoader:
             )
         except Exception as exc:
             error = exc
-        self.reader.coordinate_error(error, "planning")
+        coordinate_error(error, "planning")
         active, writers, skipped, unexpected, schemas = planned
         self._check_plan(active, schemas)
         error = None
         try:
-            prefetch = getattr(self.source, "prefetch", None)
-            if prefetch is not None:
-                prefetch()
+            self.source.prefetch()
         except Exception as exc:
             error = exc
-        self.reader.coordinate_error(error, "prefetch")
+        coordinate_error(error, "prefetch")
         for name, spec in active:
             paths = (spec.target_path,) if isinstance(spec.target_path, str) else spec.target_path
             for path, schema in zip(paths, schemas[name]):
-                param = self.layout._get_param(params, path)
+                param = self._get_param(params, path)
                 if isinstance(param.value, jax.ShapeDtypeStruct):
-                    param.value = schema
+                    self._assign(param, schema, schema, path)
         # One global order, independent of local I/O completion. Budget waits
         # only drain already-submitted work, never insert an ad-hoc collective.
         pending, pending_owners, pending_bytes = [], [], 0
@@ -226,14 +233,15 @@ class WeightLoader:
             for name, spec in active
         }
         remaining_files = Counter(filename for files in group_files.values() for filename in files)
-        release = getattr(self.source, "release", None)
         budget = int(os.environ.get("SGLANG_WEIGHT_LOAD_MAX_INFLIGHT_BYTES", str(4 << 30)))
         if budget <= 0:
             raise ValueError("SGLANG_WEIGHT_LOAD_MAX_INFLIGHT_BYTES must be positive")
         try:
             for name, spec in tqdm(active, desc="Loading weights"):
                 if spec.host_recipe is not None:
-                    self._load_host_group(params, spec)
+                    outputs = self.reader.read_host_group(
+                        self.source, spec, schemas[name], self._sharding(spec)
+                    )
                 elif spec.recipe is not None:
                     source_bytes = sum(
                         info.get("byte_size", 0)
@@ -255,35 +263,24 @@ class WeightLoader:
                         inputs = [self._read_group_input(source) for source in spec.sources]
                     except Exception as exc:
                         error = exc
-                    self.reader.coordinate_error(error, "recipe read")
+                    coordinate_error(error, "recipe read")
                     outputs = spec.recipe(inputs)
                     pending_owners.extend(inputs)
                     inputs = None
                     pending_bytes += source_bytes
-                    targets = (
-                        (spec.target_path,)
-                        if isinstance(spec.target_path, str)
-                        else spec.target_path
-                    )
-                    if len(outputs) != len(targets):
-                        raise ValueError(f"Recipe output count mismatch: {name}")
-                    for path, value in zip(targets, outputs):
-                        param = self.layout._get_param(params, path)
-                        param.value = value
                 elif spec.sources:
-                    self._load_experts(params, name, spec)
+                    outputs = self._load_experts(params, name, spec)
                 else:
-                    self._load_tensor(params, name, spec)
+                    outputs = self._load_tensor(params, name, spec)
                 targets = (
                     (spec.target_path,) if isinstance(spec.target_path, str) else spec.target_path
                 )
-                values = [self.layout._get_param(params, path).value for path in targets]
-                for path, value, expected in zip(targets, values, schemas[name]):
-                    if (value.shape, value.dtype) != (expected.shape, expected.dtype):
-                        raise ValueError(
-                            f"Loaded target {path}: got {value.shape}/{value.dtype}, expected {expected.shape}/{expected.dtype}"
-                        )
+                values = list(outputs)
                 pending.extend(values)
+                if len(values) != len(targets):
+                    raise ValueError(f"Recipe output count mismatch: {name}")
+                for path, value, expected in zip(targets, values, schemas[name]):
+                    self._assign(self._get_param(params, path), value, expected, path)
                 pending_bytes += sum(
                     sum(s.data.nbytes for s in v.addressable_shards) for v in values
                 )
@@ -295,17 +292,17 @@ class WeightLoader:
                     remaining_files[filename] -= 1
                     if not remaining_files[filename]:
                         completed.append(filename)
-                if completed and release is not None:
+                if completed and self.source.retains_views:
                     jax.block_until_ready(pending)
                     pending, pending_owners, pending_bytes = [], [], 0
-                    release(completed)
+                    self.source.release(completed)
             jax.block_until_ready(pending)
             pending_owners.clear()
         finally:
             # A Source may own mmap or SDK memory needed by an outstanding H2D.
             jax.block_until_ready(pending)
             if self._owns_source:
-                self.source.close_all()
+                self.source.close()
         report = {
             "seconds": time.monotonic() - start,
             "loaded": tuple(writers),
@@ -357,70 +354,14 @@ class WeightLoader:
         if not np.all(digests == digests[0]):
             raise ValueError("Weight plans differ across processes; no tensor reads were submitted")
 
-    def _load_host_group(self, params, spec):
-        """Prefused experts: read local expert intervals, convert on host once,
-        and upload every output's local shards without a full-model host copy.
-        """
-        paths = (spec.target_path,) if isinstance(spec.target_path, str) else spec.target_path
-        targets = [self.layout._get_param(params, path) for path in paths]
-        sharding = self._sharding(spec)
-        groups = {}
-        for output, param in enumerate(targets):
-            for device, index in sharding.addressable_devices_indices_map(
-                param.value.shape
-            ).items():
-                expert = index[0]
-                key = (expert.start, expert.stop, expert.step)
-                groups.setdefault(key, []).append((output, device, index))
-        uploaded = [{} for _ in targets]
-        error = None
-        try:
-            budget = int(os.environ.get("SGLANG_WEIGHT_LOAD_MAX_INFLIGHT_BYTES", str(4 << 30)))
-            for key, assignments in groups.items():
-                expert = slice(*key)
-                input_bytes = sum(
-                    len(range(*expert.indices(self.metadata[source][0]["shape"][0])))
-                    * int(np.prod(self.metadata[source][0]["shape"][1:]))
-                    * np.dtype(
-                        _SAFETENSORS_DTYPE_TO_JAX[self.metadata[source][0]["dtype"]]
-                    ).itemsize
-                    for source in spec.sources
-                )
-                # Input, conversion copies and all outputs. Prefused gate/up
-                # splits preserve total element count; dtype conversion may double it.
-                required = input_bytes * 8
-                if required > budget:
-                    raise ValueError(f"Host recipe needs up to {required} bytes, budget={budget}")
-                inputs = [self._read_group_input(source, (expert,)) for source in spec.sources]
-                outputs = spec.host_recipe(inputs)
-                if len(outputs) != len(targets):
-                    raise ValueError("Host recipe output count does not match targets")
-                local = []
-                for output, device, index in assignments:
-                    value = outputs[output][(slice(None), *index[1:])]
-                    value = np.asarray(value, dtype=targets[output].value.dtype)
-                    local.append(jax.device_put(value, device))
-                    uploaded[output][device] = local[-1]
-                jax.block_until_ready(local)
-        except Exception as exc:
-            error = exc
-        self.reader.coordinate_error(error, "host recipe")
-        for param, arrays in zip(targets, uploaded):
-            devices = [d for d in sharding.mesh.devices.flat if d in arrays]
-            param.value = jax.make_array_from_single_device_arrays(
-                param.value.shape, sharding, [arrays[d] for d in devices]
-            )
-
     def _read_group_input(self, source, index=slice(None)):
         infos = self.metadata[source]
         if len(infos) != 1:
             raise ValueError(f"Recipe must explicitly handle split input: {source}")
         info = infos[0]
-        raw = self.source.get_handle(info["file"]).get_slice(source)[index]
-        return _reinterpret_dtype_if_needed(raw, _SAFETENSORS_DTYPE_TO_JAX[info["dtype"]])
+        return self.source.read_tensor(info["file"], source, index)
 
     def _load_tensor(self, params, name, spec):
-        infos = self.metadata[name]
         direct = (
             isinstance(spec.target_path, str)
             and all(x is None for x in (spec.pad_width, spec.reshape, spec.repeat))
@@ -434,15 +375,10 @@ class WeightLoader:
             elif spec.transpose:
                 axes = axes[::-1]
             sharding = jax.sharding.NamedSharding(self.mesh, P(*axes))
-        if spec.concat_axis is not None and len(infos) > 1:
-            value = self.reader._create_split_lazy_tensor(
-                name, infos, self.source, spec.concat_axis, sharding
-            )
-        else:
-            if len(infos) != 1:
-                raise ValueError(f"Multiple checkpoint fragments need concat_axis: {name}")
-            value = self.reader._create_lazy_tensors(name, infos, self.source, sharding)[0]
-        self.layout._process_and_assign_weight(params, name, value, spec)
+        value = self.reader.read(self.source, name, spec, sharding)
+        paths = (spec.target_path,) if isinstance(spec.target_path, str) else spec.target_path
+        targets = {path: self._get_param(params, path).value for path in paths}
+        return self.layout.transform(name, value, spec, targets)
 
     def _load_experts(self, params, name, spec):
         target = spec.target_path
@@ -455,7 +391,7 @@ class WeightLoader:
                 self._source_identity = self.source.identity
             except Exception as exc:
                 error = exc
-            self.reader.coordinate_error(error, "cache identity")
+            coordinate_error(error, "cache identity")
         cache_key = (
             (
                 self._source_identity,
@@ -467,7 +403,7 @@ class WeightLoader:
             if cache_enabled
             else None
         )
-        param = self.layout._get_param(params, target)
+        param = self._get_param(params, target)
         cache_hit = cache_enabled and cache_key in _PD_WEIGHT_CACHE
         if cache_enabled and jax.process_count() > 1:
             from jax.experimental import multihost_utils
@@ -477,41 +413,13 @@ class WeightLoader:
             )
         if cache_hit:
             value = _PD_WEIGHT_CACHE[cache_key]
-            param.value = jax.device_put(value, self._pd_remap_sharding(value.sharding))
-            return
-        if spec.concat_axis is not None:
-            value = self.reader._create_stacked_split_moe_lazy_tensor(
-                list(spec.sources),
-                self.metadata,
-                self.source,
-                spec.concat_axis,
-                spec.transpose,
-                sharding,
-                spec.physical_to_logical_map,
-            )
-        else:
-            value = self.reader._create_stacked_moe_lazy_tensor(
-                list(spec.sources),
-                self.metadata,
-                self.source,
-                spec.transpose,
-                sharding,
-                spec.physical_to_logical_map,
-            )
+            return (jax.device_put(value, self._pd_remap_sharding(value.sharding)),)
+        value = self.reader.read(self.source, name, spec, sharding)
         with jax.set_mesh(sharding.mesh):
-            if spec.reshape is not None:
-                value = jnp.reshape(value, spec.reshape)
-            if spec.repeat is not None:
-                axis, count = spec.repeat
-                value = jnp.repeat(value, count, axis=axis)
-            value = self.layout._maybe_convert_epmoe_scale_for_kernel(value, param, target)
-            param.value = (
-                value
-                if value.dtype in (jnp.float8_e4m3fn, jnp.float8_e5m2)
-                else value.astype(param.value.dtype)
-            )
+            value = self.layout.transform_experts(value, spec, param.value)
         if cache_enabled:
-            _PD_WEIGHT_CACHE[cache_key] = param.value
+            _PD_WEIGHT_CACHE[cache_key] = value
+        return (value,)
 
     def _load_dummy(self, params, mappings):
         # Final parameter schema is sufficient: no checkpoint scan or fake I/O.
@@ -524,7 +432,7 @@ class WeightLoader:
                 for path in paths:
                     if not (self.is_static_quant and path.endswith(("weight_q", "weight_scale"))):
                         with contextlib.suppress(ValueError):
-                            overrides[id(self.layout._get_param(params, path))] = P(*spec.sharding)
+                            overrides[id(self._get_param(params, path))] = P(*spec.sharding)
         for _, leaf in jax.tree_util.tree_flatten_with_path(
             params, is_leaf=lambda x: isinstance(x, nnx.VariableState)
         )[0]:
@@ -556,23 +464,19 @@ class WeightLoader:
                     ("expert", "tensor"),
                     axis_types=(jax.sharding.AxisType.Explicit,) * 2,
                 )
-            leaf.value = self._dummy_array(
-                value.shape, value.dtype, jax.sharding.NamedSharding(mesh, spec)
+            self._assign(
+                leaf,
+                self._dummy_array(value.shape, value.dtype, jax.sharding.NamedSharding(mesh, spec)),
+                value,
+                "dummy parameter",
             )
         nnx.update(self.model, params)
 
     def _target_schema(self, params, name, spec, cache):
-        from types import SimpleNamespace
-
         paths = (spec.target_path,) if isinstance(spec.target_path, str) else spec.target_path
-        targets = {
-            path: SimpleNamespace(value=self.layout._get_param(params, path).value)
-            for path in paths
-        }
+        targets = {path: self._get_param(params, path).value for path in paths}
         if spec.recipe is not None or spec.host_recipe is not None:
-            return tuple(
-                jax.ShapeDtypeStruct(p.value.shape, p.value.dtype) for p in targets.values()
-            )
+            return tuple(jax.ShapeDtypeStruct(p.shape, p.dtype) for p in targets.values())
         source = spec.sources[0] if spec.sources else name
         infos = self.metadata[source]
         shape = list(infos[0]["shape"])
@@ -594,7 +498,7 @@ class WeightLoader:
             tuple(shape),
             str(dtype),
             tuple(
-                (re.sub(r"\.\d+(?=\.|$)", ".*", p), v.value.shape, str(v.value.dtype))
+                (re.sub(r"\.\d+(?=\.|$)", ".*", p), v.shape, str(v.dtype))
                 for p, v in targets.items()
             ),
             spec.transpose,
@@ -614,22 +518,8 @@ class WeightLoader:
 
             def infer(value):
                 if spec.sources:
-                    param = targets[paths[0]]
-                    if spec.reshape is not None:
-                        value = value.reshape(spec.reshape)
-                    if spec.repeat is not None:
-                        value = jnp.repeat(value, spec.repeat[1], axis=spec.repeat[0])
-                    value = self.layout._maybe_convert_epmoe_scale_for_kernel(
-                        value, param, paths[0]
-                    )
-                    param.value = (
-                        value
-                        if value.dtype in (jnp.float8_e4m3fn, jnp.float8_e5m2)
-                        else value.astype(param.value.dtype)
-                    )
-                else:
-                    self.layout._process_and_assign_weight(targets, name, value, spec)
-                return tuple(v.value for v in targets.values())
+                    return (self.layout.transform_experts(value, spec, targets[paths[0]]),)
+                return self.layout.transform(name, value, spec, targets)
 
             with jax.set_mesh(self.mesh):
                 cache[key] = jax.eval_shape(infer, jax.ShapeDtypeStruct(tuple(shape), dtype))
@@ -671,11 +561,11 @@ class WeightLoader:
             if spec.sharding is None:
                 from dataclasses import replace
 
-                value = self.layout._get_param(params, targets[0]).value
+                value = self._get_param(params, targets[0]).value
                 axes = getattr(getattr(value, "sharding", None), "spec", P())
                 spec = replace(spec, sharding=tuple(axes))
             for target in targets:
-                variable = self.layout._get_param(params, target)
+                variable = self._get_param(params, target)
                 if id(variable) in identities:
                     raise ValueError(
                         f"Duplicate writer for shared parameter {target}: {identities[id(variable)]} and {name}"
@@ -686,7 +576,7 @@ class WeightLoader:
                 writers[target] = name
             schemas[name] = self._target_schema(params, name, spec, shape_cache)
             for target, schema in zip(targets, schemas[name]):
-                expected = self.layout._get_param(params, target).value
+                expected = self._get_param(params, target).value
                 if schema.shape != expected.shape:
                     raise ValueError(
                         f"Target shape mismatch for {target}: checkpoint layout produces "
@@ -710,3 +600,33 @@ class WeightLoader:
         if validate_checkpoint_coverage and unexpected:
             raise ValueError(f"Unmapped checkpoint tensors: {unexpected[:10]}")
         return active, writers, skipped, unexpected, schemas
+
+    @staticmethod
+    def _get_param(params, path: str):
+        if isinstance(params, dict) and path in params:
+            return params[path]
+        keys = path.split(".")
+        current_level = params
+
+        for key in keys:
+            if key.isdigit():
+                current_level = current_level[int(key)]
+            else:
+                if hasattr(current_level, "__contains__") and key in current_level:
+                    current_level = current_level[key]
+                elif hasattr(current_level, key):
+                    current_level = getattr(current_level, key)
+                else:
+                    raise ValueError(f"{path} is not a valid param path")
+
+        return current_level
+
+    @staticmethod
+    def _assign(param, value, expected, path):
+        """The only parameter write: preserve identity and enforce the planned schema."""
+        if (value.shape, value.dtype) != (expected.shape, expected.dtype):
+            raise ValueError(
+                f"Loaded target {path}: got {value.shape}/{value.dtype}, "
+                f"expected {expected.shape}/{expected.dtype}"
+            )
+        param.value = value

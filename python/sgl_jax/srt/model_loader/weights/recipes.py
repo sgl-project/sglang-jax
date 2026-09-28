@@ -1,11 +1,9 @@
 import logging
 from dataclasses import replace
-from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from flax import nnx
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
@@ -17,14 +15,13 @@ logger = logging.getLogger(__name__)
 
 
 class TensorLayout:
+    """Pure layout conversions: accept target schemas, return arrays, never assign NNX state."""
+
     def __init__(
         self,
-        model: nnx.Module,
         model_config: ModelConfig,
         mesh: Mesh,
-        dtype: jnp.dtype = jnp.bfloat16,
     ):
-        self.model = model
         self.model_config = model_config
         self.mesh = mesh
         if hasattr(model_config, "num_attention_heads"):
@@ -51,7 +48,7 @@ class TensorLayout:
     def _maybe_convert_epmoe_scale_for_kernel(
         self,
         weight: jax.Array,
-        model_param: nnx.Variable,
+        target: jax.ShapeDtypeStruct,
         target_path: str,
     ) -> jax.Array:
         """Convert offline EPMoE/FusedEPMoE scales into kernel-ready 4D layout.
@@ -75,10 +72,10 @@ class TensorLayout:
         ):
             return weight
 
-        if weight.ndim == 4 or model_param.value.ndim != 4:
+        if weight.ndim == 4 or target.ndim != 4:
             return weight
 
-        param_shape = model_param.value.shape
+        param_shape = target.shape
         num_experts = param_shape[0]
 
         # Compressed-tensors per-channel checkpoints (e.g. Ling-2.6-1T) emit
@@ -118,7 +115,7 @@ class TensorLayout:
                     "Expanding fused MoE 2D scale %s from %s to fast kernel layout %s",
                     target_path,
                     weight.shape,
-                    model_param.value.shape,
+                    target.shape,
                 )
                 idx = jnp.arange(out_dim) // block_size_out
                 return jnp.take(weight, idx, axis=2)[:, :, None, :]
@@ -127,7 +124,7 @@ class TensorLayout:
                     "Transposing+expanding fused MoE 2D scale %s from %s to fast kernel layout %s",
                     target_path,
                     weight.shape,
-                    model_param.value.shape,
+                    target.shape,
                 )
                 weight = jnp.transpose(weight, (0, 2, 1))
                 idx = jnp.arange(out_dim) // block_size_out
@@ -151,7 +148,7 @@ class TensorLayout:
                             "Padding fused MoE scale %s from %s to kernel layout %s",
                             target_path,
                             weight.shape,
-                            model_param.value.shape,
+                            target.shape,
                         )
                         weight = jnp.pad(weight, ((0, 0), (0, 0), (0, out_dim - n_groups)))
                     return weight[:, :, None, :]
@@ -162,7 +159,7 @@ class TensorLayout:
                         "Transposing fused MoE scale %s from %s to kernel layout %s",
                         target_path,
                         weight.shape,
-                        model_param.value.shape,
+                        target.shape,
                     )
                     weight = jnp.transpose(weight, (0, 2, 1))
                     if n_groups < out_dim:
@@ -184,7 +181,7 @@ class TensorLayout:
             "Converting offline EPMoE scale %s from shape %s to GMM layout %s",
             target_path,
             weight.shape,
-            model_param.value.shape,
+            target.shape,
         )
         out_block_ids = np.arange(out_dim, dtype=np.int32) // block_size_out
         scale_per_out = jnp.take(weight, jnp.asarray(out_block_ids), axis=1)
@@ -193,7 +190,7 @@ class TensorLayout:
     def _maybe_expand_linear_block_scale(
         self,
         weight: jax.Array,
-        model_param: nnx.Variable,
+        target: jax.ShapeDtypeStruct,
         target_path: str,
     ) -> jax.Array:
         """Expand 2D block-quant scale [out_blocks, in_blocks] to 3D [in_blocks, 1, n_out] at load time."""
@@ -208,17 +205,17 @@ class TensorLayout:
         if (
             weight.ndim == 2
             and weight.shape[-1] == 1
-            and model_param.value.ndim == 1
-            and model_param.value.shape[0] == weight.shape[0]
+            and target.ndim == 1
+            and target.shape[0] == weight.shape[0]
         ):
             return jnp.squeeze(weight, axis=-1)
 
         # Only convert when checkpoint has 2D scale and model expects 3D.
-        if weight.ndim != 2 or model_param.value.ndim != 3:
+        if weight.ndim != 2 or target.ndim != 3:
             return weight
 
         # Model param shape: [in_blocks, 1, n_out]
-        if model_param.value.shape[1] != 1:
+        if target.shape[1] != 1:
             return weight
 
         quant_cfg = getattr(self.model_config, "quantization_config", None)
@@ -234,7 +231,7 @@ class TensorLayout:
             expand_block_scale,
         )
 
-        n_out = int(model_param.value.shape[2])
+        n_out = int(target.shape[2])
         logger.info(
             "Expanding linear block-quant scale %s from %s to kernel-ready layout [%d, 1, %d]",
             target_path,
@@ -248,35 +245,53 @@ class TensorLayout:
         # (e.g. P(None, None, "tensor")). jax 0.8.x shard_map silently reshards on
         # this textual mismatch; jax 0.10.x checks strictly and raises. Same class
         # of fix as the MoE/MLA boundaries in #1493.
-        target_sharding = getattr(model_param.value, "sharding", None)
+        target_sharding = getattr(target, "sharding", None)
         if target_sharding is not None and expanded.ndim == len(
             getattr(target_sharding, "spec", ())
         ):
             expanded = jax.sharding.reshard(expanded, target_sharding)
         return expanded
 
-    def _process_and_assign_weight(
+    def transform(
         self,
-        params: nnx.State,
         hf_key: str,
-        hf_weight: jax.Array,
+        weight: jax.Array,
         mapping: WeightSpec,
-    ):
-        processed_weight = hf_weight
-
-        # Handle multi-dimensional transpose (transpose_axes) or 2D transpose
+        targets: dict[str, jax.ShapeDtypeStruct],
+    ) -> tuple[jax.Array, ...]:
+        """Return converted values in target_path order, preserving FP8 storage."""
         if mapping.transpose_axes is not None and not hf_key.endswith(".bias"):
-            processed_weight = jnp.transpose(processed_weight, mapping.transpose_axes)
+            weight = jnp.transpose(weight, mapping.transpose_axes)
         elif mapping.transpose and not hf_key.endswith(".bias"):
-            processed_weight = jnp.transpose(processed_weight, (1, 0))
-
+            weight = jnp.transpose(weight, (1, 0))
         if isinstance(mapping.target_path, list):
-            self._handle_split_weight(params, hf_key, processed_weight, mapping)
-        else:
-            self._handle_single_weight(params, hf_key, processed_weight, mapping)
+            return self._split_weight(targets, hf_key, weight, mapping)
+        return (self._single_weight(targets, hf_key, weight, mapping),)
 
-    def _handle_single_weight(
-        self, params: nnx.State, hf_key: str, weight: jax.Array, mapping: WeightSpec
+    def transform_experts(self, weight, mapping, target):
+        """Finish an already-stacked expert tensor using the same path during tracing."""
+        if mapping.reshape is not None:
+            weight = jnp.reshape(weight, mapping.reshape)
+        if mapping.repeat is not None:
+            axis, count = mapping.repeat
+            weight = jnp.repeat(weight, count, axis=axis)
+        weight = self._maybe_convert_epmoe_scale_for_kernel(weight, target, mapping.target_path)
+        return self._cast(weight, target)
+
+    @staticmethod
+    def _cast(weight, target):
+        return (
+            weight
+            if weight.dtype in (jnp.float8_e4m3fn, jnp.float8_e5m2)
+            else weight.astype(target.dtype)
+        )
+
+    def _single_weight(
+        self,
+        targets: dict[str, jax.ShapeDtypeStruct],
+        hf_key: str,
+        weight: jax.Array,
+        mapping: WeightSpec,
     ):
         assert isinstance(mapping.target_path, str)
         jax_path: str = mapping.target_path
@@ -311,12 +326,10 @@ class TensorLayout:
         sharded_weight = self._shard_weight(processed_weight, mapping.sharding)
 
         try:
-            model_param = self._get_param(params, jax_path)
+            target = targets[jax_path]
 
             # Expand 2D block-quant scale to 3D kernel-ready layout.
-            sharded_weight = self._maybe_expand_linear_block_scale(
-                sharded_weight, model_param, jax_path
-            )
+            sharded_weight = self._maybe_expand_linear_block_scale(sharded_weight, target, jax_path)
 
             logger.debug(
                 "Loading %s -> %s, shape: %s, transpose: %s",
@@ -325,16 +338,17 @@ class TensorLayout:
                 processed_weight.shape,
                 mapping.transpose,
             )
-            if sharded_weight.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
-                model_param.value = sharded_weight
-            else:
-                model_param.value = sharded_weight.astype(model_param.value.dtype)
+            return self._cast(sharded_weight, target)
         except Exception as e:
             logger.error("Failed to load %s -> %s: %s", hf_key, jax_path, str(e))
             raise
 
-    def _handle_split_weight(
-        self, params: nnx.State, hf_key: str, weight: jax.Array, mapping: WeightSpec
+    def _split_weight(
+        self,
+        targets: dict[str, jax.ShapeDtypeStruct],
+        hf_key: str,
+        weight: jax.Array,
+        mapping: WeightSpec,
     ):
         if mapping.split_sizes is not None:
             if (
@@ -349,12 +363,13 @@ class TensorLayout:
                 np.cumsum(mapping.split_sizes)[:-1].tolist(),
                 axis=mapping.split_axis,
             )
-            for part, path in zip(parts, mapping.target_path):
-                self._handle_single_weight(params, hf_key, part, replace(mapping, target_path=path))
-            return
-        self._split_qkv_weight(params, hf_key, weight, mapping)
+            return tuple(
+                self._single_weight(targets, hf_key, part, replace(mapping, target_path=path))
+                for part, path in zip(parts, mapping.target_path)
+            )
+        return self._split_qkv_weight(targets, hf_key, weight, mapping)
 
-    def _split_qkv_weight(self, params, hf_key, weight, mapping):
+    def _split_qkv_weight(self, targets, hf_key, weight, mapping):
         import math
 
         v_dim = self.v_head_dim
@@ -375,6 +390,7 @@ class TensorLayout:
         if sum(sizes) != weight.shape[axis]:
             raise ValueError(f"QKV shape mismatch for {hf_key}: {weight.shape}, expected {sizes}")
         splits = jnp.split(weight, np.cumsum(sizes)[:-1].tolist(), axis=axis)
+        outputs = []
         for part, path, nheads, dim in zip(splits, mapping.target_path, heads, dims):
             pad = (-dim) % 128
             if mapping.head_dim_padding and pad and not block_scale:
@@ -389,13 +405,10 @@ class TensorLayout:
             if mapping.kv_head_padding and ("k_proj" in path or "v_proj" in path):
                 part = self._apply_kv_head_padding(part, path)
             part = self._shard_weight(part, mapping.sharding)
-            param = self._get_param(params, path)
-            part = self._maybe_expand_linear_block_scale(part, param, path)
-            param.value = (
-                part
-                if part.dtype in (jnp.float8_e4m3fn, jnp.float8_e5m2)
-                else part.astype(param.value.dtype)
-            )
+            target = targets[path]
+            part = self._maybe_expand_linear_block_scale(part, target, path)
+            outputs.append(self._cast(part, target))
+        return tuple(outputs)
 
     def _shard_weight(
         self,
@@ -406,30 +419,8 @@ class TensorLayout:
         if mesh is None:
             mesh = self.mesh
         target_sharding = jax.sharding.NamedSharding(mesh, P(*sharding_spec))
-        # Since 'weight' is already a Lazy JAX Array (backed by a callback),
-        # using device_put here is necessary when we are NOT using the "Global Loading"
-        # optimization path. It will trigger the slice/distribute logic lazily.
-        # However, for the optimized path, we skip this method entirely.
+        # Reads may use checkpoint axes; enforce the final parameter layout.
         return jax.device_put(weight, target_sharding)
-
-    def _get_param(self, params: nnx.State, path: str) -> nnx.Variable[jax.Array]:
-        if isinstance(params, dict) and path in params:
-            return params[path]
-        keys = path.split(".")
-        current_level: Any = params
-
-        for key in keys:
-            if key.isdigit():
-                current_level = current_level[int(key)]
-            else:
-                if hasattr(current_level, "__contains__") and key in current_level:
-                    current_level = current_level[key]
-                elif hasattr(current_level, key):
-                    current_level = getattr(current_level, key)
-                else:
-                    raise ValueError(f"{path} is not a valid param path")
-
-        return cast(nnx.Variable[jax.Array], current_level)
 
     def _apply_kv_head_padding(self, weight: jax.Array, hf_key: str) -> jax.Array:
         """Apply KV head padding/replication when tp_size > total_kv_heads.

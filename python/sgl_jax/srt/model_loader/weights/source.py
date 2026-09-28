@@ -9,6 +9,7 @@ import pickle
 import struct
 import threading
 import time
+from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -101,7 +102,58 @@ def coordinate_error(error, phase):
         raise error
 
 
-class LocalSource:
+class WeightSource(ABC):
+    """One checkpoint session, independent of models and device placement.
+
+    All ranks access metadata in the same order; implementations coordinate
+    header discovery. Tensor slices use checkpoint dtypes and may borrow file
+    storage until ``release``/``close``. Byte ranges return owned uint8 arrays
+    in request order, safe across subsequent reads. Reads can run on threads;
+    they must not perform collectives. The caller retains returned arrays until
+    H2D completes and closes only sessions it owns.
+    """
+
+    prefers_bulk = False
+    retains_views = False  # Drain H2D before releasing completed file mappings.
+
+    @property
+    @abstractmethod
+    def metadata(self) -> dict[str, list[dict[str, Any]]]:
+        """Tensor fragments with file, shape, dtype and absolute byte ranges."""
+
+    @property
+    @abstractmethod
+    def identity(self) -> str:
+        """Checkpoint identity for process-local parameter reuse."""
+
+    @abstractmethod
+    def read_tensor(self, filename: str, name: str, index) -> np.ndarray:
+        """Read a tensor slice from one checkpoint fragment."""
+
+    @abstractmethod
+    def read_ranges(self, ranges: list[tuple[str, int, int]]) -> list[np.ndarray]:
+        """Read (file, byte offset, byte count) requests into owned buffers."""
+
+    def prefetch(self):
+        """Optionally warm storage once per session, after plan validation."""
+        return None
+
+    def release(self, filenames):
+        """Optionally release files after their last group and H2D completion."""
+        return None
+
+    @abstractmethod
+    def close(self):
+        """Release session resources; safe to call more than once."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+
+class LocalSource(WeightSource):
     """
     Manages open file handles during a weight loading session to prevent
     repeated opening/parsing of safetensors headers.
@@ -115,11 +167,19 @@ class LocalSource:
         self._weight_info_cache = None
         self._lock = threading.Lock()
 
-    def get_handle(self, filename):
+    def _get_handle(self, filename):
         with self._lock:
             if filename not in self.handles:
                 self.handles[filename] = safe_open(filename, framework="np", device="cpu")
             return self.handles[filename]
+
+    retains_views = True
+
+    def read_tensor(self, filename, name, index):
+        tensor = self._get_handle(filename).get_slice(name)
+        return _reinterpret_dtype_if_needed(
+            tensor[index], _SAFETENSORS_DTYPE_TO_JAX[tensor.get_dtype()]
+        )
 
     @property
     def identity(self):
@@ -221,7 +281,7 @@ class LocalSource:
             total_size / 1024**2 / (t1 - t0) if t1 > t0 else 0,
         )
 
-    def close_all(self):
+    def close(self):
         # safe_open objects don't strictly require close() as they rely on RAII/GC,
         # but clearing references ensures we don't hold descriptors.
         self.handles.clear()
@@ -231,12 +291,6 @@ class LocalSource:
         with self._lock:
             for filename in filenames:
                 self.handles.pop(filename, None)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close_all()
 
     def _scan(self):
         root = self.model_config.model_path
@@ -358,7 +412,7 @@ class _File:
         return _TensorSlice(self.source, self.path, self.metadata[key])
 
 
-class RunaiWeightSource:
+class RunaiWeightSource(WeightSource):
     """Safetensors-compatible reader with owned buffers and serialized SDK access."""
 
     prefers_bulk = True
@@ -367,9 +421,16 @@ class RunaiWeightSource:
         self.path = path
         self.metadata_dir = metadata_dir
         self.handles: dict[str, _File] = {}
-        self.metadata: dict[str, list[dict[str, Any]]] = {}
+        self._metadata: dict[str, list[dict[str, Any]]] = {}
         self._lock = threading.Lock()
         self._streamer = None
+
+    @property
+    def metadata(self):
+        return self._metadata
+
+    def close(self):
+        self.__exit__(None, None, None)
 
     def __enter__(self):
         from sgl_jax.srt.utils import runai_utils
@@ -456,8 +517,8 @@ class RunaiWeightSource:
             )
         return hashlib.sha256(json.dumps(signature).encode()).hexdigest()
 
-    def get_handle(self, filename):
-        return self.handles[filename]
+    def read_tensor(self, filename, name, index):
+        return self.handles[filename].get_slice(name)[index]
 
     def read_ranges(self, ranges, *, buffer=None):
         # A FileStreamer has one active request. MoE loading invokes readers

@@ -1,42 +1,142 @@
 import logging
 import math
 import os
+from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from flax import nnx
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.configs.model_config import ModelConfig
-
 from .source import (
     _SAFETENSORS_DTYPE_TO_JAX,
-    LocalSource,
+    WeightSource,
     _reinterpret_dtype_if_needed,
     coordinate_error,
 )
+from .specs import WeightSpec
 
 logger = logging.getLogger(__name__)
 
 
-class ShardReader:
-    def __init__(
-        self,
-        model: nnx.Module,
-        model_config: ModelConfig,
-        mesh: Mesh,
-        dtype: jnp.dtype = jnp.bfloat16,
-    ):
-        self.model = model
-        self.model_config = model_config
-        self.mesh = mesh
-        self.dtype = dtype
-        self.dummy_mode = getattr(model_config, "_dummy_mode", False)
+class WeightReader(ABC):
+    """Materialize declared reads without binding or modifying model parameters.
 
-    coordinate_error = staticmethod(coordinate_error)
+    All ranks call these methods in plan order. Implementations read only
+    addressable shards, retain host buffers through H2D completion, and coordinate
+    read failures before global array assembly, never inside I/O callbacks.
+    Returned arrays have completed their local transfers. Later layout transforms
+    and parameter assignment belong to TensorLayout and WeightLoader.
+    """
+
+    @abstractmethod
+    def read(
+        self,
+        source: WeightSource,
+        name: str,
+        spec: WeightSpec,
+        sharding: jax.sharding.NamedSharding | None = None,
+    ) -> jax.Array:
+        """Read one tensor, or stack experts (including their declared transpose).
+
+        Ordinary tensor layout transforms run after this read. ``concat_axis``
+        joins checkpoint fragments before either kind of output is assembled.
+        """
+
+    @abstractmethod
+    def read_host_group(
+        self,
+        source: WeightSource,
+        spec: WeightSpec,
+        targets: tuple[jax.ShapeDtypeStruct, ...],
+        sharding: jax.sharding.NamedSharding,
+    ) -> tuple[jax.Array, ...]:
+        """Apply a host recipe to local expert intervals and place its outputs."""
+
+
+class JaxShardReader(WeightReader):
+    def __init__(self, mesh: Mesh):
+        self.mesh = mesh
+
+    def read(self, source, name, spec, sharding=None):
+        if spec.sources:
+            args = (list(spec.sources), source.metadata, source)
+            kwargs = dict(
+                do_transpose=spec.transpose,
+                target_sharding=sharding,
+                physical_to_logical_map=spec.physical_to_logical_map,
+            )
+            if spec.concat_axis is not None:
+                return self._read_split_experts(*args, spec.concat_axis, **kwargs)
+            return self._read_experts(*args, **kwargs)
+        infos = source.metadata[name]
+        if spec.concat_axis is not None and len(infos) > 1:
+            return self._read_split_tensor(name, infos, source, spec.concat_axis, sharding)
+        if len(infos) != 1:
+            raise ValueError(f"Multiple checkpoint fragments need concat_axis: {name}")
+        return self._read_tensor(name, infos[0], source, sharding)
+
+    def read_host_group(self, source, spec, targets, sharding):
+        """Prefused experts: read local expert intervals, convert on host once,
+        and upload every output's local shards without a full-model host copy.
+        """
+        groups = {}
+        for output, param in enumerate(targets):
+            for device, index in sharding.addressable_devices_indices_map(param.shape).items():
+                expert = index[0]
+                key = (expert.start, expert.stop, expert.step)
+                groups.setdefault(key, []).append((output, device, index))
+        uploaded = [{} for _ in targets]
+        error = None
+        try:
+            budget = int(os.environ.get("SGLANG_WEIGHT_LOAD_MAX_INFLIGHT_BYTES", str(4 << 30)))
+            for key, assignments in groups.items():
+                expert = slice(*key)
+                input_bytes = sum(
+                    len(range(*expert.indices(source.metadata[name][0]["shape"][0])))
+                    * int(np.prod(source.metadata[name][0]["shape"][1:]))
+                    * np.dtype(
+                        _SAFETENSORS_DTYPE_TO_JAX[source.metadata[name][0]["dtype"]]
+                    ).itemsize
+                    for name in spec.sources
+                )
+                # Input, conversion copies and all outputs. Prefused gate/up
+                # splits preserve total element count; dtype conversion may double it.
+                required = input_bytes * 8
+                if required > budget:
+                    raise ValueError(f"Host recipe needs up to {required} bytes, budget={budget}")
+                inputs = [self._read_host_input(source, name, (expert,)) for name in spec.sources]
+                outputs = spec.host_recipe(inputs)
+                if len(outputs) != len(targets):
+                    raise ValueError("Host recipe output count does not match targets")
+                local = []
+                for output, device, index in assignments:
+                    value = outputs[output][(slice(None), *index[1:])]
+                    value = np.asarray(value, dtype=targets[output].dtype)
+                    local.append(jax.device_put(value, device))
+                    uploaded[output][device] = local[-1]
+                jax.block_until_ready(local)
+        except Exception as exc:
+            error = exc
+        coordinate_error(error, "host recipe")
+        outputs = []
+        for param, arrays in zip(targets, uploaded):
+            devices = [d for d in sharding.mesh.devices.flat if d in arrays]
+            outputs.append(
+                jax.make_array_from_single_device_arrays(
+                    param.shape, sharding, [arrays[d] for d in devices]
+                )
+            )
+        return tuple(outputs)
+
+    @staticmethod
+    def _read_host_input(source, name, index):
+        infos = source.metadata[name]
+        if len(infos) != 1:
+            raise ValueError(f"Recipe must explicitly handle split input: {name}")
+        return source.read_tensor(infos[0]["file"], name, index)
 
     def _assemble(self, shape, sharding, callback):
         # Read and upload only addressable shards. Single-device uploads cannot
@@ -60,7 +160,7 @@ class ShardReader:
             arrays = [uploaded[d] for d in sharding.mesh.devices.flat if d in assignments]
         except Exception as exc:
             error = exc
-        self.coordinate_error(error, "read")
+        coordinate_error(error, "read")
         return jax.make_array_from_single_device_arrays(shape, sharding, arrays)
 
     def _normalize_physical_to_logical_map(
@@ -88,11 +188,8 @@ class ShardReader:
                 f"for num_logical_experts={num_logical_experts}"
             )
 
-        quant_cfg = getattr(self.model_config, "quantization_config", None)
-        is_static_quant = quant_cfg is not None and quant_cfg.is_static_checkpoint
-        log_fn = logger.info if is_static_quant else logger.debug
         sample = map_np[: min(10, map_np.size)].tolist()
-        log_fn(
+        logger.debug(
             "%s: p2l_map physical=%d logical=%d unique=%d sample=%s",
             context,
             map_np.size,
@@ -102,59 +199,23 @@ class ShardReader:
         )
         return map_np
 
-    def _create_lazy_tensors(
+    def _read_tensor(self, name, info, source, sharding):
+        if sharding is None:
+            sharding = jax.sharding.NamedSharding(self.mesh, P())
+        return self._assemble(
+            info["shape"], sharding, lambda index: source.read_tensor(info["file"], name, index)
+        )
+
+    def _read_split_tensor(
         self,
         hf_key: str,
         infos: list[dict],
-        file_manager: LocalSource,
-        target_sharding: jax.sharding.NamedSharding | None = None,
-    ) -> list[jax.Array]:
-        """
-        Create a list of JAX arrays that lazy load data from safetensors via callback.
-        Supports 'Global Loading' via target_sharding to avoid redundant I/O.
-        """
-        lazy_arrays = []
-
-        for info in infos:
-            shape = info["shape"]
-            st_dtype = info["dtype"]
-            target_dtype = _SAFETENSORS_DTYPE_TO_JAX.get(st_dtype, jnp.float32)
-
-            filename = info["file"]
-
-            if target_sharding is not None:
-                # Load only what this host needs (Global Loading)
-                sharding = target_sharding
-            else:
-                # Fallback: Load full tensor on every host (Replicated)
-                sharding = jax.sharding.NamedSharding(self.mesh, P())
-
-            def _make_load_slice(
-                fname=filename, fm=file_manager, target_dtype=target_dtype, key=hf_key
-            ):
-                def _load_slice(index):
-                    f = fm.get_handle(fname)
-                    data = f.get_slice(key)[index]
-                    return _reinterpret_dtype_if_needed(data, target_dtype)
-
-                return _load_slice
-
-            lazy_array = self._assemble(shape, sharding, _make_load_slice()).astype(target_dtype)
-
-            lazy_arrays.append(lazy_array)
-
-        return lazy_arrays
-
-    def _create_split_lazy_tensor(
-        self,
-        hf_key: str,
-        infos: list[dict],
-        file_manager: LocalSource,
+        file_manager: WeightSource,
         concat_axis: int,
         target_sharding: jax.sharding.NamedSharding | None = None,
     ) -> jax.Array:
         """
-        Lazy loader for TP-Split weights (e.g., Grok Attention/MLP).
+        Read TP-split weights (e.g., Grok Attention/MLP).
         Instead of loading ALL shards on EVERY host, it calculates overlap
         and only reads the specific file(s) containing the requested slice.
         """
@@ -216,8 +277,7 @@ class ShardReader:
                     file_read_index = tuple(file_read_index)
 
                     # Read directly
-                    f = file_manager.get_handle(info["file"])
-                    chunk = f.get_slice(hf_key)[file_read_index]
+                    chunk = file_manager.read_tensor(info["file"], hf_key, file_read_index)
                     collected_chunks.append(chunk)
 
             if not collected_chunks:
@@ -233,11 +293,11 @@ class ShardReader:
 
         return self._assemble(global_shape, sharding, _smart_load_slice).astype(target_dtype)
 
-    def _create_stacked_split_moe_lazy_tensor(
+    def _read_split_experts(
         self,
         expected_hf_keys: list[str],
         weight_infos: dict[str, list[dict]],
-        file_manager: LocalSource,
+        file_manager: WeightSource,
         concat_axis: int,
         do_transpose: bool = False,
         target_sharding: jax.sharding.NamedSharding | None = None,
@@ -310,8 +370,7 @@ class ShardReader:
                     file_read_index[concat_axis] = slice(
                         intersect_start - f_start, intersect_end - f_start
                     )
-                    f = file_manager.get_handle(info["file"])
-                    chunk = f.get_slice(hf_key)[tuple(file_read_index)]
+                    chunk = file_manager.read_tensor(info["file"], hf_key, tuple(file_read_index))
                     collected_chunks.append(chunk)
             if not collected_chunks:
                 return np.zeros((0,) * len(expert_shape), dtype=target_dtype)
@@ -396,7 +455,7 @@ class ShardReader:
             result = result.astype(target_dtype)
         return result
 
-    def _create_stacked_moe_lazy_tensor(
+    def _read_experts(
         self,
         expected_hf_keys,
         weight_info,
@@ -438,7 +497,7 @@ class ShardReader:
             unsharded
             and (not do_transpose or deferred)
             and (
-                getattr(file_manager, "prefers_bulk", False)
+                file_manager.prefers_bulk
                 or (
                     (deferred or os.environ.get("SGLANG_MOE_BULK_READ") == "1")
                     and expert_bytes >= 1 << 20
@@ -450,9 +509,7 @@ class ShardReader:
         def read_expert(logical, index):
             info = infos[logical]
             source_index = index[::-1] if do_transpose and not deferred else index
-            value = file_manager.get_handle(info["file"]).get_slice(expected_hf_keys[logical])[
-                source_index
-            ]
+            value = file_manager.read_tensor(info["file"], expected_hf_keys[logical], source_index)
             value = _reinterpret_dtype_if_needed(value, dtype)
             return value.T if do_transpose and not deferred else value
 
@@ -535,7 +592,7 @@ class ShardReader:
                     arrays.extend(uploaded)
             except Exception as exc:
                 error = exc
-            self.coordinate_error(error, "expert read")
+            coordinate_error(error, "expert read")
             result = jax.make_array_from_single_device_arrays(stacked_shape, read_sharding, arrays)
         if deferred:
             with jax.set_mesh(sharding.mesh):

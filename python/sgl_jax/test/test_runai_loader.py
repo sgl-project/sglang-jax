@@ -213,16 +213,19 @@ def test_runai_batches_cross_file_experts_and_scales(sdk, tmp_path, transpose, s
             struct.pack("<Q", len(header)) + header + weight.tobytes()
         )
     with RunaiWeightSource("gs://bucket/model", str(tmp_path)) as source, jax.set_mesh(mesh):
-        config = SimpleNamespace(_weight_source=source, quantization_config=None)
-        loader = WeightLoader(nnx.Module(), config, mesh, jnp.float32)
+        config = SimpleNamespace(quantization_config=None)
+        loader = WeightLoader(nnx.Module(), config, mesh, jnp.float32, source=source)
         sdk.batches.clear()
-        actual = loader.reader._create_stacked_moe_lazy_tensor(
-            [f"expert.{i}" for i in range(3)],
-            source.metadata,
+        actual = loader.reader.read(
             source,
-            do_transpose=transpose,
-            target_sharding=sharding,
-            physical_to_logical_map=np.array([2, 0, 2, 1]),
+            "experts",
+            WeightSpec(
+                "w",
+                sources=tuple(f"expert.{i}" for i in range(3)),
+                transpose=transpose,
+                physical_to_logical_map=np.array([2, 0, 2, 1]),
+            ),
+            sharding,
         )
         actual.block_until_ready()
     expected = np.stack([weights[i] for i in [2, 0, 2, 1]])

@@ -2,8 +2,10 @@
 
 These are **intermediate-candidate measurements**, not final-head performance
 acceptance. Baseline: `47684fa729b73d8cac0ecbfa5e9fcd169552c3b1`.
-Runtime refactor commit: `a63c591a7e12b5240a905b74da2e611fd0a8048b`.
-The measured candidates predate that commit's final mmap-lifetime changes.
+Earlier runtime refactor snapshot: `a63c591a7e12b5240a905b74da2e611fd0a8048b`.
+The measured candidates predate that snapshot's final mmap-lifetime changes
+and the subsequent Source/Reader interface revision. This report contains no
+full-checkpoint TPU timings for the current PR head.
 
 ## Completed load-only pairs
 
@@ -33,7 +35,7 @@ at every compared position. Fingerprint D2H/hash time is outside the load timer.
   and 332.5/6.9 s for Gemma4 (baseline/candidate). Cache order explains much of
   the apparent wall-time reduction; the raw times must not be attributed
   entirely to the refactor.
-- Qwen3.5 peak RSS increased from 50.24 to 58.30 GiB. The final runtime commit
+- Qwen3.5 peak RSS increased from 50.24 to 58.30 GiB. The mmap-lifetime revision
   orders independent groups by file and releases completed mmap handles after
   transfers finish. That change still needs large-model memory remeasurement.
 - Gemma4's complete text and vision weights matched. The same matrix then

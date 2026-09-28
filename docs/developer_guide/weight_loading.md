@@ -24,6 +24,33 @@ output axes. If omitted, it comes from the prepared parameter. `transpose_axes`,
 For fused visual QKV, declare `split_sizes` explicitly so vision and text towers
 can use different head configurations.
 
+## Interfaces and implementations
+
+`WeightSource` is the storage interface. `LocalSource` handles safetensors files
+and `RunaiWeightSource` handles streamed byte ranges. Both expose metadata,
+checkpoint identity, tensor slices, bulk ranges, and session lifetime. Consumers
+do not use file handles or SDK objects. `prefetch` and `release` have default
+no-op implementations; `retains_views` tells the loader to wait for outstanding
+transfers before releasing completed file mappings. RunAI owns its returned
+buffers and does not add those file-release waits.
+
+`WeightReader` is the device materialization interface. `JaxShardReader` implements
+`read` for ordinary, split and stacked expert tensors, and `read_host_group` for
+prefused experts. It reads addressable slices, retains host buffers until local
+H2D completes, coordinates read errors, and assembles JAX arrays. It does not
+hold a model or model configuration, bind NNX parameters, or assign them.
+
+`TensorLayout` takes target shapes/dtypes/shardings and returns transformed
+arrays. The same conversion functions run during schema tracing and execution.
+`WeightLoader` owns preparation, planning, source lifetime, cache reuse, and the
+single validated parameter-assignment path. It remains a concrete orchestrator;
+model-specific prepare hooks and recipes do not require a loader subclass.
+
+The model entry above supplies default implementations. Tools and integrations
+can instead pass `source=` and `reader=` to `WeightLoader`. An explicitly supplied
+source must already be open; its caller owns closing it. The outer model-loading
+session shares one source across nested model loads through the model config.
+
 ## Grouped inputs
 
 Use `sources` when an output depends on multiple checkpoint tensors. A device
@@ -40,7 +67,7 @@ WeightSpec(
 
 A spec with `sources` and no recipe stacks separate expert tensors. It supports
 explicit physical-to-logical expert placement, TP slices, split files, and bulk
-reads. `host_recipe` handles prefused expert tensors: the loader reads local
+reads. `host_recipe` handles prefused expert tensors: the reader reads local
 expert intervals, applies the NumPy conversion, and uploads each output's local
 shards. This avoids materializing all global experts on each process.
 
