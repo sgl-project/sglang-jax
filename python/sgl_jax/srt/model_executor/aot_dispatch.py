@@ -125,21 +125,26 @@ class AotDispatcher:
         compiler_options_fn=None,
         executable_store=None,
         allow_fast_dispatch=True,
+        precompile=False,
     ):
         self._jit_fn = jit_fn
         self._stable_call_args = stable_call_args
         self._stable_flat_args = stable_flat_args
         self._stable_ids = tuple(id(a) for a in stable_flat_args)
         self._cache = {}
+        self._precompiled = {}
+        self._precompile_keys = set()
         self._name = name
         self._compiler_options_fn = compiler_options_fn
         self._store = executable_store
         self._allow_fast_dispatch = allow_fast_dispatch
         # Loading is explicit even when the optional dispatch optimization is off.
-        self._enabled = True if executable_store is not None else None
+        self._enabled = True if executable_store is not None or precompile else None
 
     def invalidate(self) -> None:
         self._cache.clear()
+        self._precompiled.clear()
+        self._precompile_keys.clear()
 
     def ensure_stable_args(self, stable_call_args: tuple, stable_flat_args: tuple) -> None:
         """Rebind the stable containers if the caller replaced them.
@@ -159,7 +164,35 @@ class AotDispatcher:
         self._stable_call_args = stable_call_args
         self._stable_flat_args = stable_flat_args
         self._stable_ids = tuple(id(a) for a in stable_flat_args)
-        self._cache.clear()
+        self.invalidate()
+
+    @staticmethod
+    def _shape_key(leaves, tree):
+        avals = [jax.typeof(a) for a in leaves]
+        return (tree, tuple((a.shape, a.dtype, a.weak_type) for a in avals))
+
+    def precompile(self, pool, *dyn_args, on_compiled=None):
+        """Lower on the caller and cache a compiled executable without executing it."""
+        if self._store is not None:
+            raise ValueError("Offline executable loading must not submit compilation")
+        leaves, tree = jax.tree_util.tree_flatten(dyn_args)
+        key = self._shape_key(leaves, tree)
+        if key in self._precompile_keys or key in self._cache:
+            return
+        self._enabled = True
+        self._precompile_keys.add(key)
+        options = self._compiler_options_fn(dyn_args) if self._compiler_options_fn else None
+
+        def ready(lowered, compiled):
+            self._precompiled[key] = compiled
+            if on_compiled is not None:
+                on_compiled(lowered, compiled)
+
+        pool.submit(
+            lambda: self._jit_fn.lower(*self._stable_call_args, *dyn_args),
+            compiler_options=options,
+            on_compiled=ready,
+        )
 
     def __call__(self, *dyn_args):
         if self._enabled is False:
@@ -169,13 +202,12 @@ class AotDispatcher:
                 "[aot-dispatch:%s] stable args replaced; invalidating executables", self._name
             )
             self._stable_ids = tuple(id(a) for a in self._stable_flat_args)
-            self._cache.clear()
+            self.invalidate()
 
         dyn_leaves, dyn_tree = jax.tree_util.tree_flatten(dyn_args)
         # Batch mode and other pytree metadata can change the program even
         # when all array shapes match. Scalar types also affect compilation.
-        avals = [jax.typeof(a) for a in dyn_leaves]
-        key = (dyn_tree, tuple((a.shape, a.dtype, a.weak_type) for a in avals))
+        key = self._shape_key(dyn_leaves, dyn_tree)
         entry = self._cache.get(key)
         if entry is None:
             return self._acquire_and_first_call(key, dyn_args)
@@ -216,13 +248,19 @@ class AotDispatcher:
                 )
                 return self._jit_fn(*self._stable_call_args, *dyn_args)
 
-        compile_opts = self._compiler_options_fn(dyn_args) if self._compiler_options_fn else None
-        lowered = self._jit_fn.lower(*self._stable_call_args, *dyn_args)
-        from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
+        compiled = self._precompiled.pop(key, None)
+        if compiled is None:
+            compile_opts = (
+                self._compiler_options_fn(dyn_args) if self._compiler_options_fn else None
+            )
+            lowered = self._jit_fn.lower(*self._stable_call_args, *dyn_args)
+            from sgl_jax.srt.model_executor.compilation_manager import (
+                CompilationManager,
+            )
 
-        compiled = CompilationManager.get_executable(
-            lowered, compiler_options=compile_opts, store=self._store
-        )
+            compiled = CompilationManager.get_executable(
+                lowered, compiler_options=compile_opts, store=self._store
+            )
         # Saved binaries have a flat ABI containing only DCE-surviving inputs.
         # Keep original input indices for both checked calls and fast dispatch.
         if self._store is not None:

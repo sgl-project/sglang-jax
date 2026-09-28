@@ -17,6 +17,35 @@ from sgl_jax.srt.model_executor.aot_dispatch import AotDispatcher
 
 
 class TestAotDispatcher(unittest.TestCase):
+    def test_parallel_precompile_then_serial_donation_without_compiling(self):
+        from sgl_jax.srt.model_executor.compilation_manager import CompilationPool
+
+        @partial(jax.jit, donate_argnums=(2,))
+        def f(weight, value, pool):
+            return weight * value, pool + 1
+
+        weight = jnp.array(2.0, dtype=jnp.float32)
+        dispatcher = AotDispatcher(
+            f, (weight,), (weight,), "precompile", allow_fast_dispatch=False, precompile=True
+        )
+        inputs = [(jnp.arange(n, dtype=jnp.float32), jnp.zeros(n)) for n in (4, 8, 16)]
+        with patch("sgl_jax.srt.model_executor.aot_dispatch._ENV", "0"):
+            with CompilationPool(2) as pool:
+                for value, buffer in inputs:
+                    dispatcher.precompile(pool, value, buffer)
+            self.assertEqual(len(dispatcher._precompiled), 3)
+            with patch(
+                "jax._src.compiler.backend_compile_and_load",
+                side_effect=AssertionError("Unexpected compilation after precompile"),
+            ):
+                for value, buffer in inputs:
+                    for step in range(1, 4):
+                        result, buffer = dispatcher(value, buffer)
+                        np.testing.assert_array_equal(result, np.asarray(value) * 2)
+                        np.testing.assert_array_equal(buffer, np.full(value.shape, step))
+            self.assertEqual(len(dispatcher._cache), 3)
+            self.assertFalse(dispatcher._precompiled)
+
     def test_batch_metadata_selects_distinct_executable(self):
         @jax.tree_util.register_pytree_node_class
         class Batch:
@@ -63,7 +92,10 @@ class TestAotDispatcher(unittest.TestCase):
         from sgl_jax.srt.model_executor.aot_executable import ExecutableStore
         from sgl_jax.srt.model_executor.aot_inputs import AbstractSampler
         from sgl_jax.srt.model_executor.aot_server import _export_sampling
-        from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
+        from sgl_jax.srt.model_executor.compilation_manager import (
+            CompilationManager,
+            CompilationPool,
+        )
         from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
         from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
         from sgl_jax.srt.utils.mesh_utils import create_device_mesh
@@ -92,17 +124,20 @@ class TestAotDispatcher(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             manifest = {"sampling": []}
-            _export_sampling(
-                AbstractSampler(mesh, 42),
-                jax.tree.map(
-                    lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding), logits
-                ),
-                manager,
-                mesh,
-                None,
-                Path(directory),
-                manifest,
-            )
+            with CompilationPool(2) as pool:
+                _export_sampling(
+                    AbstractSampler(mesh, 42),
+                    jax.tree.map(
+                        lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding),
+                        logits,
+                    ),
+                    manager,
+                    mesh,
+                    None,
+                    Path(directory),
+                    manifest,
+                    compilation_pool=pool,
+                )
             self.assertEqual(len(manifest["sampling"]), 3)
             store = ExecutableStore(directory, mesh)
             cases = []

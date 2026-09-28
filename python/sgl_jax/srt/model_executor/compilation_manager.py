@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
+from collections import deque
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -18,6 +22,95 @@ if TYPE_CHECKING:
     from sgl_jax.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+class CompilationPool:
+    """Bound retained lowerings; only XLA compilation runs on worker threads.
+
+    Lowering, saving artifacts, and completion callbacks run on the caller.
+    Callbacks must not execute donated buffers: device warmup follows flush().
+    """
+
+    def __init__(self, num_threads=1):
+        if num_threads < 1:
+            raise ValueError("--precompile-num-threads must be at least 1")
+        self.num_threads = num_threads
+        self._executor = None
+        self._pending = deque()
+        self._previous_stack_size = None
+
+    def __enter__(self):
+        if self.num_threads > 1:
+            # XLA can exhaust a worker's small default stack on large models.
+            # Match tpu-inference's 64 MiB stacks; restore the process default
+            # when this startup-only pool closes.
+            try:
+                previous_stack_size = threading.stack_size()
+                threading.stack_size(64 * 1024 * 1024)
+                self._previous_stack_size = previous_stack_size
+            except (RuntimeError, ValueError):
+                logger.warning(
+                    "Cannot increase XLA worker stack size; use --precompile-num-threads 1 if compilation overflows"
+                )
+            self._executor = ThreadPoolExecutor(
+                max_workers=self.num_threads, thread_name_prefix="xla-compile"
+            )
+        return self
+
+    def submit(self, lower, *, compiler_options=None, mesh=None, output=None, on_compiled=None):
+        # Apply backpressure BEFORE lowering the next graph, not just before
+        # submitting it to ThreadPoolExecutor's otherwise unbounded queue.
+        while len(self._pending) >= self.num_threads:
+            self._finish_one()
+        lowered = lower()
+        if self._executor is None:
+            compiled = CompilationManager.get_executable(lowered, compiler_options=compiler_options)
+            self._finish(lowered, compiled, mesh, compiler_options, output, on_compiled)
+            return
+
+        import jax
+
+        context = copy_context()
+        compile_mesh = jax.sharding.get_mesh()
+
+        def compile_lowered():
+            with jax.set_mesh(compile_mesh):
+                return CompilationManager.get_executable(lowered, compiler_options=compiler_options)
+
+        future = self._executor.submit(context.run, compile_lowered)
+        self._pending.append((future, lowered, mesh, compiler_options, output, on_compiled))
+
+    @staticmethod
+    def _finish(lowered, compiled, mesh, compiler_options, output, on_compiled):
+        if output is not None:
+            from sgl_jax.srt.model_executor.aot_executable import save_executable
+
+            save_executable(compiled, lowered, mesh, compiler_options, output)
+        if on_compiled is not None:
+            on_compiled(lowered, compiled)
+
+    def _finish_one(self):
+        future, lowered, mesh, options, output, callback = self._pending.popleft()
+        self._finish(lowered, future.result(), mesh, options, output, callback)
+
+    def flush(self):
+        while self._pending:
+            self._finish_one()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            if exc_type is None:
+                self.flush()
+        finally:
+            for future, *_ in self._pending:
+                future.cancel()
+            if self._executor is not None:
+                self._executor.shutdown(wait=True, cancel_futures=True)
+                self._executor = None
+            if self._previous_stack_size is not None:
+                threading.stack_size(self._previous_stack_size)
+                self._previous_stack_size = None
+            self._pending.clear()
 
 
 class CompilationManager:
@@ -60,6 +153,7 @@ class CompilationManager:
         # server_args string for callers that don't have a ModelConfig yet.
         self.moe_backend = moe_backend if moe_backend is not None else server_args.moe_backend
         self.enable_static_lora = server_args.enable_static_lora
+        self.precompile_num_threads = server_args.precompile_num_threads
 
         self.token_buckets = self._compute_token_buckets(server_args.precompile_token_paddings)
         self.bs_buckets = self._compute_bs_buckets(server_args.precompile_bs_paddings)
@@ -332,6 +426,69 @@ class CompilationManager:
             patch_paddings=config.precompile_vision_patch_paddings,
         )
 
+    def _compile_model_buckets(self, model_runner, mode):
+        """Compile independent shapes first; the existing forward loop warms them."""
+        if self.precompile_num_threads == 1 or not model_runner.parallel_precompile:
+            return
+        import jax
+
+        from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+        from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
+
+        logger.info(
+            "[%s] Compiling buckets with %d XLA workers", mode.name, self.precompile_num_threads
+        )
+        sampling_inputs = []
+        with CompilationPool(self.precompile_num_threads) as pool:
+            for bs, tokens, cache_loc in self.iter_model_shapes(mode):
+                batch = self._make_dummy_batch(
+                    bs,
+                    tokens,
+                    mode,
+                    cache_loc,
+                    dp_size=self.dp_size,
+                    per_dp_bs_size=bs // self.dp_size,
+                )
+                batch.forward_batch = ForwardBatch.init_new(batch, model_runner)
+
+                def ready(lowered, compiled, bs=bs):
+                    logits = jax.tree.map(
+                        lambda value, sharding: jax.ShapeDtypeStruct(
+                            value.shape, value.dtype, sharding=sharding
+                        ),
+                        lowered.out_info,
+                        compiled.output_shardings,
+                    )[0]
+                    sampling_inputs.append((bs, logits))
+
+                model_runner.precompile_model(pool, batch, ready)
+            pool.flush()
+            logprob_inputs = []
+
+            def sampler_ready(lowered, compiled):
+                (tokens, logprobs, _), _ = jax.tree.map(
+                    lambda value, sharding: jax.ShapeDtypeStruct(
+                        value.shape, value.dtype, sharding=sharding
+                    ),
+                    lowered.out_info,
+                    compiled.output_shardings,
+                )
+                logprob_inputs.append((logprobs, tokens))
+
+            for bs, logits in sampling_inputs:
+                batch = self._make_dummy_batch(bs, bs, mode, bs)
+                metadata = SamplingMetadata.from_model_worker_batch(
+                    batch, 0, model_runner.mesh, self.vocab_size
+                )
+                metadata.update_vocab_mask(
+                    batch.sampling_info.vocab_mask, model_runner.mesh, self.vocab_size
+                )
+                model_runner.precompile_sampling(pool, logits, metadata, sampler_ready)
+            pool.flush()
+            with jax.set_mesh(None):
+                for logprobs, tokens in logprob_inputs:
+                    model_runner.jitted_compute_logprobs.precompile(pool, logprobs, tokens)
+
     def _precompile_extend(
         self,
         forward_fn: Callable,
@@ -346,6 +503,7 @@ class CompilationManager:
 
         start_time = time.perf_counter()
         bs = self.max_padded_batch_size
+        self._compile_model_buckets(model_runner, ForwardMode.EXTEND)
         logger.info(
             "[EXTEND] Begin to precompile bs_paddings=%s token_paddings=%s",
             [bs],
@@ -383,12 +541,16 @@ class CompilationManager:
                     batch.forward_batch.input_ids = resolve_future_token_ids(
                         batch.forward_batch.input_ids, future_token_ids_map, mesh
                     )
-                forward_fn(
+                result = forward_fn(
                     batch,
                     launch_done=None,
                     skip_sample=False,
                     sampling_metadata=sampling_metadata,
                 )
+                if self.precompile_num_threads > 1:
+                    import jax
+
+                    jax.block_until_ready(result)
                 self._compiled_variants.add((ForwardMode.EXTEND, num_tokens, bs_val, False))
 
         end_time = time.perf_counter()
@@ -407,6 +569,7 @@ class CompilationManager:
         from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 
         start_time = time.perf_counter()
+        self._compile_model_buckets(model_runner, ForwardMode.DECODE)
         logger.info(
             "[DECODE] Begin to precompile bs_paddings=%s",
             self.bs_buckets,
@@ -450,6 +613,10 @@ class CompilationManager:
                     skip_sample=False,
                     sampling_metadata=sampling_metadata,
                 )
+                if self.precompile_num_threads > 1:
+                    import jax
+
+                    jax.block_until_ready(result)
                 if future_token_ids_map is not None:
                     _, next_token_ids, _ = result
                     set_future_token_ids(

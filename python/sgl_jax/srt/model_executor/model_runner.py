@@ -330,6 +330,20 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         # Explicit offline loading and opt-in online compilation share one
         # per-shape executable cache. The default pjit path is unchanged.
         use_aot_dispatch = aot_dispatch_requested()
+        self.parallel_precompile = (
+            self.server_args.precompile_num_threads > 1
+            and not self.server_args.disable_precompile
+            and executable_store is None
+            and not self.server_args.speculative_algorithm
+            and not self.server_args.enable_lora
+            and not self.server_args.enable_static_lora
+            and not self.model_config.is_multimodal
+            and not self.server_args.multimodal
+        )
+        if self.server_args.precompile_num_threads > 1 and not self.parallel_precompile:
+            logger.info(
+                "Parallel precompile is unavailable for this configuration; using serial warmup"
+            )
         if use_aot_dispatch and self.server_args.speculative_algorithm:
             logger.warning(
                 "SGLANG_JAX_AOT_DISPATCH is set but speculative decoding is "
@@ -337,7 +351,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             )
             use_aot_dispatch = False
 
-        if use_aot_dispatch or executable_store is not None:
+        if use_aot_dispatch or executable_store is not None or self.parallel_precompile:
             self._run_model_dispatcher = AotDispatcher(
                 jitted_run_model,
                 stable_call_args=(model_def, model_state_def, self.model_state_leaves),
@@ -348,6 +362,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 ),
                 executable_store=executable_store,
                 allow_fast_dispatch=use_aot_dispatch,
+                precompile=self.parallel_precompile,
             )
 
             def run_model_wrapper(forward_batch, logits_metadata):
@@ -380,7 +395,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
             self.jitted_run_model = run_model_wrapper
 
-        if use_aot_dispatch or executable_store is not None:
+        if use_aot_dispatch or executable_store is not None or self.parallel_precompile:
             self._sampler_dispatcher = AotDispatcher(
                 jitted_sampler,
                 stable_call_args=(
@@ -393,6 +408,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 compiler_options_fn=lambda _: sampler_compiler_options,
                 executable_store=executable_store,
                 allow_fast_dispatch=use_aot_dispatch,
+                precompile=self.parallel_precompile,
             )
 
             self.jitted_sampler = self._sampler_dispatcher
@@ -404,7 +420,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 sampler_state_leaves,
             )
 
-        if executable_store is not None:
+        if executable_store is not None or self.parallel_precompile:
             self.jitted_compute_logprobs = AotDispatcher(
                 jitted_compute_logprobs,
                 stable_call_args=(self.mesh,),
@@ -412,6 +428,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 name="compute_logprobs",
                 executable_store=executable_store,
                 allow_fast_dispatch=use_aot_dispatch,
+                precompile=self.parallel_precompile,
             )
         else:
             self.jitted_compute_logprobs = partial(jitted_compute_logprobs, self.mesh)
@@ -857,6 +874,26 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         )
 
         return attn_backend_wrapper(self, full_attn_backend)
+
+    def precompile_model(self, pool, batch, on_compiled):
+        """Prepare the ordinary forward's metadata and lower it without donation."""
+        self.attn_backend.forward_metadata = self.attn_backend.get_forward_metadata(batch)
+        logits_metadata = LogitsMetadata.from_model_worker_batch(batch, self.mesh)
+        with jax.set_mesh(self.mesh):
+            self._run_model_dispatcher.precompile(
+                pool,
+                batch.forward_batch,
+                self.memory_pools,
+                logits_metadata,
+                on_compiled=on_compiled,
+            )
+
+    def precompile_sampling(self, pool, logits, sampling_metadata, on_compiled):
+        # Match sample(), which executes outside the explicit model mesh.
+        with jax.set_mesh(None):
+            self._sampler_dispatcher.precompile(
+                pool, self._sampler_step, logits, sampling_metadata, on_compiled=on_compiled
+            )
 
     def _forward(
         self,
