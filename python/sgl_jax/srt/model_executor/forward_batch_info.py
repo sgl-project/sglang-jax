@@ -34,7 +34,7 @@ from sgl_jax.srt.eplb.expert_location import (
     get_global_expert_location_metadata,
 )
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
-from sgl_jax.srt.utils.jax_utils import device_array
+from sgl_jax.srt.utils.jax_utils import device_array, packed_device_array
 
 logger = logging.getLogger(__name__)
 
@@ -351,28 +351,45 @@ class ForwardBatch:
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
     ):
+        data_sharding = NamedSharding(model_runner.mesh, PartitionSpec("data"))
         (
             input_ids,
             seq_lens,
             out_cache_loc,
             positions,
             req_pool_indices,
-            cache_loc,
             extend_prefix_lens,
             extend_seq_lens,
-        ) = device_array(
+            lora_scalings,
+            lora_token_indices,
+            lora_ranks,
+            recurrent_indices,
+            recurrent_cow_src_indices,
+            recurrent_track_indices,
+            recurrent_track_mask,
+        ) = packed_device_array(
             (
                 batch.input_ids,
                 batch.seq_lens,
                 batch.out_cache_loc,
                 batch.positions,
                 batch.req_pool_indices,
-                batch.cache_loc,
                 batch.extend_prefix_lens,
                 batch.extend_seq_lens,
+                batch.lora_scalings,
+                batch.lora_token_indices,
+                batch.lora_ranks,
+                batch.recurrent_indices,
+                batch.recurrent_cow_src_indices,
+                batch.recurrent_track_indices,
+                batch.recurrent_track_mask,
             ),
-            sharding=NamedSharding(model_runner.mesh, PartitionSpec("data")),
+            sharding=data_sharding,
         )
+        # cache_loc is already built directly into a host buffer. Packing this
+        # potentially very large array adds a full host copy and device unpack;
+        # keeping its existing transfer avoids regressing long-context batches.
+        cache_loc = device_array(batch.cache_loc, sharding=data_sharding)
         mrope_positions = batch.mrope_positions
         mrope_position_axes = getattr(
             getattr(model_runner, "model", None),
@@ -402,26 +419,6 @@ class ForwardBatch:
         if input_embedding is not None:
             input_embedding = input_embedding.astype(jnp.bfloat16)
 
-        if batch.lora_scalings is not None:
-            (
-                lora_scalings,
-                lora_token_indices,
-                lora_ranks,
-            ) = device_array(
-                (
-                    batch.lora_scalings,
-                    batch.lora_token_indices,
-                    batch.lora_ranks,
-                ),
-                sharding=NamedSharding(model_runner.mesh, PartitionSpec("data")),
-            )
-        else:
-            lora_scalings, lora_token_indices, lora_ranks = (
-                batch.lora_scalings,
-                batch.lora_token_indices,
-                batch.lora_ranks,
-            )
-
         deepstack_visual_embedding = None
         if batch.apply_for_deepstack:
             (deepstack_visual_embedding,) = device_array(
@@ -435,34 +432,6 @@ class ForwardBatch:
             deepstack_visual_embedding = deepstack_visual_embedding.astype(jnp.bfloat16)
 
         expert_location_metadata = get_global_expert_location_metadata()
-
-        recurrent_indices = None
-        if batch.recurrent_indices is not None:
-            (recurrent_indices,) = device_array(
-                (batch.recurrent_indices,),
-                sharding=NamedSharding(model_runner.mesh, PartitionSpec("data")),
-            )
-
-        recurrent_cow_src_indices = None
-        if batch.recurrent_cow_src_indices is not None:
-            (recurrent_cow_src_indices,) = device_array(
-                (batch.recurrent_cow_src_indices,),
-                sharding=NamedSharding(model_runner.mesh, PartitionSpec("data")),
-            )
-
-        recurrent_track_indices = None
-        if batch.recurrent_track_indices is not None:
-            (recurrent_track_indices,) = device_array(
-                (batch.recurrent_track_indices,),
-                sharding=NamedSharding(model_runner.mesh, PartitionSpec("data")),
-            )
-
-        recurrent_track_mask = None
-        if batch.recurrent_track_mask is not None:
-            (recurrent_track_mask,) = device_array(
-                (batch.recurrent_track_mask,),
-                sharding=NamedSharding(model_runner.mesh, PartitionSpec("data")),
-            )
 
         obj = cls(
             bid=batch.bid,
