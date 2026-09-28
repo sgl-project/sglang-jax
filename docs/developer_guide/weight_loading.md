@@ -118,3 +118,6 @@ fingerprints for correctness, then `--fingerprint none` for additional timing
 runs. Keep Local/GCSFuse and RunAI comparisons separate. Report uncontrolled
 cache state explicitly; restarting Python or a pod does not prove a cold GCS
 cache. RunAI range counters measure requested bytes, not wire traffic.
+
+Measured results and outstanding acceptance work are recorded in
+[Weight loading benchmark results](weight_loading_benchmarks.md).
