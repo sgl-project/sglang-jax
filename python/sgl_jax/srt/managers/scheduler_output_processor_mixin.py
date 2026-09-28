@@ -148,6 +148,11 @@ class SchedulerOutputProcessorMixin:
     def _resolve_overlap_v2_result(self, result, launch_done=None):
         assert self.enable_overlap_v2
         assert result.worker_batch is not None
+        if result.launch_result is not None:
+            result.logits_output, result.next_token_ids, result.cache_miss_count = (
+                result.launch_result.result()
+            )
+            result.launch_result = None
         return self.tp_worker.resolve_last_batch_result(
             result.logits_output,
             result.next_token_ids,

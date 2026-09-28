@@ -1,6 +1,7 @@
-"""Single-threaded worker for normal overlap scheduling."""
+"""Ordered asynchronous device submission for the single-owner overlap scheduler."""
 
 import dataclasses
+from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 
 import jax
@@ -11,6 +12,7 @@ from jax.sharding import PartitionSpec as P
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.managers.tp_worker import ModelWorker
+from sgl_jax.srt.managers.utils import get_token_ids_gather
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
@@ -30,6 +32,17 @@ class ForwardContext:
     cache_miss_count: int
 
 
+@dataclasses.dataclass(frozen=True)
+class ForwardSubmission:
+    batch: ModelWorkerBatch
+    future: Future[ForwardContext]
+
+    def wait(self):
+        # A donation barrier must also surface submission failures, rather than
+        # waiting forever for an Event that the failed forward never set.
+        self.future.result()
+
+
 class ModelWorkerOverlap(ModelWorker):
     def __init__(
         self,
@@ -45,7 +58,6 @@ class ModelWorkerOverlap(ModelWorker):
             precompile_params=precompile_params,
         )
         self.need_prepare_lora_batch = False
-        self.cur_sampling_info = None
         self.relay_buffers = create_relay_buffers(
             mesh,
             self.model_runner.req_to_token_pool,
@@ -78,14 +90,46 @@ class ModelWorkerOverlap(ModelWorker):
                 output_sharding=relay_sharding,
             )
         )
+        self._gather_token_ids = get_token_ids_gather(mesh)
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="overlap-v2")
+        self._last_submission = None
+
+    def shutdown(self):
+        self._executor.shutdown(wait=True)
+
+    def _submit(self, fn, *args):
+        previous = self._last_submission
+
+        def run():
+            # FIFO execution owns all device-side state. Propagate an earlier
+            # failure before a later submission can consume stale relay/KV state.
+            if previous is not None:
+                previous.result()
+            return fn(*args)
+
+        result = self._executor.submit(run)
+        self._last_submission = result
+        return result
 
     def launch_forward(
         self,
         batch: ModelWorkerBatch,
         sampling_metadata: SamplingMetadata | None = None,
+    ) -> ForwardSubmission:
+        # ScheduleBatch._merge_cache_loc returns a view of a reusable host
+        # buffer. The scheduler can prepare its next batch before this upload.
+        batch.cache_loc = batch.cache_loc.copy()
+        return ForwardSubmission(
+            batch, self._submit(self._launch_forward, batch, sampling_metadata)
+        )
+
+    @partial(jax.profiler.annotate_function, name="run_batch_forward")
+    def _launch_forward(
+        self,
+        batch: ModelWorkerBatch,
+        sampling_metadata: SamplingMetadata | None = None,
     ) -> ForwardContext:
         batch.sampling_info.update_penalties()
-        self.cur_sampling_info = batch.sampling_info
 
         if sampling_metadata is None:
             sampling_metadata = SamplingMetadata.from_model_worker_batch(
@@ -133,15 +177,32 @@ class ModelWorkerOverlap(ModelWorker):
 
     def launch_sample(
         self,
+        submission: ForwardSubmission,
+    ) -> Future:
+        # Grammar objects belong to the scheduler. Snapshot the mask after it
+        # retires the previous result; the submission thread only uploads it.
+        sampling_info = submission.batch.sampling_info
+        if sampling_info.grammars:
+            sampling_info.update_grammar_vocab_mask()
+        return self._submit(self._sample_after_forward, submission)
+
+    def _sample_after_forward(self, submission):
+        return self._launch_sample(submission.future.result())
+
+    @partial(jax.profiler.annotate_function, name="run_batch_sample")
+    def _launch_sample(
+        self,
         context: ForwardContext,
-    ) -> tuple[LogitsProcessorOutput, jax.Array | np.ndarray, int]:
+    ) -> tuple[LogitsProcessorOutput, jax.Array, int]:
         import jax._src.test_util as jtu
 
         batch = context.batch
         logits_output = context.logits_output
         sampling_metadata = context.sampling_metadata
 
-        self._update_grammar_vocab_mask(batch, sampling_metadata)
+        sampling_metadata.update_vocab_mask(
+            batch.sampling_info.vocab_mask, self.mesh, self.model_config.vocab_size
+        )
         with jtu.count_pjit_cpp_cache_miss() as count:
             next_token_ids, token_logprobs, sampled_output = self.model_runner.sample(
                 logits_output,
@@ -163,13 +224,9 @@ class ModelWorkerOverlap(ModelWorker):
 
         output_ids = next_token_ids
         if self.dp_size > 1:
-            from jax.experimental.multihost_utils import process_allgather
+            output_ids = self._gather_token_ids(output_ids)
 
-            output_ids = process_allgather(output_ids, tiled=True)
-
-        # process_allgather returns a host ndarray for fully addressable inputs.
-        if isinstance(output_ids, jax.Array):
-            output_ids.copy_to_host_async()
+        output_ids.copy_to_host_async()
         for value in (
             logits_output.next_token_logprobs,
             logits_output.input_token_logprobs,
