@@ -23,6 +23,7 @@ class DeepseekV4CacheSpec:
     compress_ratios: tuple[int, ...]
     head_dim: int = 512
     index_head_dim: int = 128
+    sliding_window_size: int | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "compress_ratios", tuple(self.compress_ratios))
@@ -36,7 +37,12 @@ class DeepseekV4CacheSpec:
         n = config.num_hidden_layers
         if n <= 0 or len(config.compress_ratios) < n:
             raise ValueError("compress_ratios must cover all backbone layers")
-        return cls(tuple(config.compress_ratios[:n]), config.head_dim, config.index_head_dim)
+        return cls(
+            tuple(config.compress_ratios[:n]),
+            config.head_dim,
+            config.index_head_dim,
+            sliding_window_size=getattr(config, "sliding_window", None),
+        )
 
     def layers(self, ratio):
         return tuple(i for i, r in enumerate(self.compress_ratios) if r == ratio)

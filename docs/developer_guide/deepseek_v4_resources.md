@@ -55,6 +55,15 @@ per SWA token, and per request-state slot. `plan_deepseek_v4_pools` sizes
 history and SWA separately from an available **per-device** budget after
 model weights and execution headroom. The plan includes BF16 KV, FP32 state,
 page rounding, page-zero padding, state padding, and TP/EP replication.
+`DeepseekV4CacheSpec.from_config(hf_config)` copies the HF config's
+`sliding_window` field (128 in the DeepSeek V4 Flash config) into the spec's
+`sliding_window_size`. Planning requires that value to be positive. The runtime
+passes the spec to the planner; this resource PR does not yet wire the planner
+into `ModelRunner`.
+It rejects a plan unless usable SWA tokens **per DP rank** exceed
+`sliding_window_size + page_size`; the page-zero padding is not usable capacity.
+This is the upstream minimum prefill admission floor. The runtime integrator
+must also align the check with its final scheduler headroom rule.
 `build_deepseek_v4_pools` constructs `ReqToTokenPool`, `MemoryPools`, and the
 allocator, and rejects a mismatch between planned and allocated array bytes.
 

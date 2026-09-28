@@ -23,6 +23,19 @@ class DeepseekV4PoolBudget:
         return self.state_bytes_per_device + self.kv_bytes_per_device
 
 
+def validate_swa_pool_size(swa_tokens: int, sliding_window_size: int, page_size: int) -> None:
+    """Reject a per-DP SWA pool below the upstream prefill admission floor."""
+    if sliding_window_size is None or sliding_window_size <= 0:
+        raise ValueError("V4 requires a positive sliding_window_size")
+    if swa_tokens <= sliding_window_size + page_size:
+        raise ValueError(
+            f"V4 SWA pool ({swa_tokens} usable tokens per DP rank) cannot admit "
+            f"a request: sliding_window_size ({sliding_window_size}) + "
+            f"page_size ({page_size}) must be smaller. Increase "
+            "--swa-full-tokens-ratio or the total KV budget."
+        )
+
+
 def plan_deepseek_v4_pools(
     spec,
     available_bytes,
@@ -40,6 +53,7 @@ def plan_deepseek_v4_pools(
     padding position per rank. The caller already subtracts mem_fraction_static
     execution headroom; it must not pass total device HBM as available_bytes.
     max_total_tokens follows the existing runner's per-DP-rank cap convention.
+    The spec carries the model's sliding window for the SWA admission check.
     """
     if page_size not in (128, 256) or dp_size <= 0:
         raise ValueError("V4 requires page_size 128/256 and positive dp_size")
@@ -76,6 +90,7 @@ def plan_deepseek_v4_pools(
     if lo < 1:
         raise ValueError("V4 budget cannot fit request state, padding and one history/SWA page")
     swa_pages, kv_bytes = size_for(lo)
+    validate_swa_pool_size(swa_pages * page_size, spec.sliding_window_size, page_size)
     if (swa_pages + 1) * page_size > 2**31 - 1:
         raise ValueError("V4 SWA capacity exceeds int32 address space")
     return DeepseekV4PoolBudget(

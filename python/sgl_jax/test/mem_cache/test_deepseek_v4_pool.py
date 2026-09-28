@@ -2,6 +2,7 @@
 
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 if os.environ.get("USE_DEVICE_TYPE") == "cpu":
@@ -31,7 +32,7 @@ from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 class TestDeepseekV4Pool(unittest.TestCase):
     def make_pools(self, ratios=(0, 4, 128, 4), page_size=128, dp=1):
         mesh = Mesh(np.array(jax.devices()[:dp]), ("data",))
-        spec = DeepseekV4CacheSpec(ratios, head_dim=8, index_head_dim=4)
+        spec = DeepseekV4CacheSpec(ratios, head_dim=8, index_head_dim=4, sliding_window_size=128)
         kv = DeepseekV4TokenToKVPool(2 * page_size * dp, page_size * dp, page_size, spec, mesh, dp)
         state = DeepseekV4CompressStatePool(2, spec, mesh, dp)
         return kv, state
@@ -264,14 +265,25 @@ class TestDeepseekV4Pool(unittest.TestCase):
                 )
 
     def test_capacity_rounding_bounds_and_budget_errors(self):
-        spec = DeepseekV4CacheSpec((0, 4, 128), head_dim=8, index_head_dim=4)
         for page_size in (128, 256):
             with self.subTest(page_size=page_size):
-                budget = plan_deepseek_v4_pools(
-                    spec, 1 << 20, 3, page_size, dp_size=2, max_total_tokens=page_size
+                spec = DeepseekV4CacheSpec(
+                    (0, 4, 128),
+                    head_dim=8,
+                    index_head_dim=4,
+                    sliding_window_size=page_size,
                 )
-                self.assertEqual(budget.history_tokens, 2 * page_size)
-                self.assertEqual(budget.swa_tokens, 2 * page_size)
+                budget = plan_deepseek_v4_pools(
+                    spec,
+                    1 << 20,
+                    3,
+                    page_size,
+                    dp_size=2,
+                    swa_full_tokens_ratio=1.0,
+                    max_total_tokens=3 * page_size,
+                )
+                self.assertEqual(budget.history_tokens, 6 * page_size)
+                self.assertEqual(budget.swa_tokens, 6 * page_size)
                 self.assertLessEqual(budget.allocated_bytes_per_device, 1 << 20)
                 if len(jax.devices()) >= 2:
                     mesh = Mesh(np.asarray(jax.devices()[:2]), ("data",))
@@ -280,15 +292,22 @@ class TestDeepseekV4Pool(unittest.TestCase):
                     )
                     self.assertEqual(req.size, 3)
                     self.assertEqual(pools.compressor_state_pool.get_buffer("c4", 1).shape[0], 8)
-                    self.assertEqual(allocator.full_available_size(0), page_size)
-                    self.assertEqual(allocator.full_available_size(1), page_size)
+                    self.assertEqual(allocator.full_available_size(0), 3 * page_size)
+                    self.assertEqual(allocator.full_available_size(1), 3 * page_size)
                 minimum = (
                     budget.state_bytes_per_device
-                    + spec.history_bytes_per_page(page_size) * 2
-                    + spec.swa_bytes_per_token * page_size * 2
+                    + spec.history_bytes_per_page(page_size) * 4
+                    + spec.swa_bytes_per_token * page_size * 4
                 )
-                with self.assertRaises(ValueError):
-                    plan_deepseek_v4_pools(spec, minimum - 1, 3, page_size, dp_size=2)
+                with self.assertRaisesRegex(ValueError, "usable tokens per DP rank"):
+                    plan_deepseek_v4_pools(
+                        spec,
+                        minimum - 1,
+                        3,
+                        page_size,
+                        dp_size=2,
+                        swa_full_tokens_ratio=1.0,
+                    )
         for args, kwargs in (
             ((1 << 20, 3, 64), {}),
             ((1 << 20, 3, 128), {"dp_size": 0}),
@@ -296,6 +315,50 @@ class TestDeepseekV4Pool(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 plan_deepseek_v4_pools(spec, *args, **kwargs)
+
+    def test_swa_pool_admission_floor_is_per_dp_rank(self):
+        config = SimpleNamespace(
+            num_hidden_layers=3,
+            compress_ratios=(0, 4, 128),
+            head_dim=8,
+            index_head_dim=4,
+            sliding_window=128,
+        )
+        spec = DeepseekV4CacheSpec.from_config(config)
+        self.assertEqual(spec.sliding_window_size, config.sliding_window)
+        page_size = 128
+        for usable_pages in (1, 2):
+            with (
+                self.subTest(usable_pages=usable_pages),
+                self.assertRaisesRegex(ValueError, "usable tokens per DP rank"),
+            ):
+                plan_deepseek_v4_pools(
+                    spec,
+                    1 << 20,
+                    3,
+                    page_size,
+                    dp_size=2,
+                    swa_full_tokens_ratio=1.0,
+                    max_total_tokens=usable_pages * page_size,
+                )
+        budget = plan_deepseek_v4_pools(
+            spec,
+            1 << 20,
+            3,
+            page_size,
+            dp_size=2,
+            swa_full_tokens_ratio=1.0,
+            max_total_tokens=3 * page_size,
+        )
+        self.assertEqual(budget.swa_tokens // 2, 3 * page_size)
+        config.sliding_window = 0
+        with self.assertRaisesRegex(ValueError, "positive sliding_window_size"):
+            plan_deepseek_v4_pools(
+                DeepseekV4CacheSpec.from_config(config),
+                1 << 20,
+                3,
+                page_size,
+            )
 
 
 if __name__ == "__main__":
