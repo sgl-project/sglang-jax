@@ -534,6 +534,11 @@ class Req:
         if self.return_logprob:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
 
+        if self.return_hidden_states:
+            # KV prefix hits do not contain hidden states. Reuse only positions
+            # already captured for this request (including completed chunks).
+            max_prefix_len = min(max_prefix_len, len(self.hidden_states))
+
         max_prefix_len = max(max_prefix_len, 0)
         return self.fill_ids[:max_prefix_len]
 
@@ -989,6 +994,7 @@ class ScheduleBatch:
             is_hybrid_recurrent=is_hybrid_recurrent,
             model_config=model_config,
             return_logprob=return_logprob,
+            return_hidden_states=any(req.return_hidden_states for req in all_reqs),
             return_output_logprob_only=return_output_logprob_only,
             enable_overlap=enable_overlap,
             has_stream=any(req.stream for req in all_reqs),
@@ -1952,6 +1958,7 @@ class ScheduleBatch:
 
         if len(all_reqs) > 0:
             self.return_logprob = any(req.return_logprob for req in all_reqs)
+            self.return_hidden_states = any(req.return_hidden_states for req in all_reqs)
             self.return_output_logprob_only = all(
                 req.return_output_logprob_only for req in all_reqs
             )
@@ -1959,6 +1966,7 @@ class ScheduleBatch:
             self.has_grammar = any(req.grammar for req in all_reqs)
         else:
             self.return_logprob = False
+            self.return_hidden_states = False
             self.return_output_logprob_only = False
             self.has_stream = False
             self.has_grammar = False
@@ -2515,13 +2523,8 @@ class ScheduleBatch:
         Returns:
             Merged SamplingBatchInfo
         """
-        # Collect all requests for grammar support
-        all_reqs = []
-        for info in self.reqs_info:
-            if info.reqs:
-                all_reqs.extend(info.reqs)
-
         # Initialize merged arrays (with padding)
+        grammars = [None] * total_bs if self.has_grammar else None
         temperatures = np.ones((total_bs, 1), dtype=np.float32)
         top_ps = np.ones(total_bs, dtype=np.float32)
         top_ks = np.ones(total_bs, dtype=np.int32)
@@ -2536,6 +2539,10 @@ class ScheduleBatch:
 
         for dp_rank in range(self.dp_size):
             info = self.reqs_info[dp_rank]
+
+            if grammars is not None:
+                for i, req in enumerate(info.reqs or []):
+                    grammars[offset_bs + i] = req.grammar
 
             if info.sampling_info is None or info.seq_lens is None or len(info.seq_lens) == 0:
                 offset_bs += per_dp_bs_size
@@ -2594,8 +2601,19 @@ class ScheduleBatch:
             is_all_greedy=is_all_greedy,
             sampling_seeds=sampling_seeds if has_sampling_seeds else None,
             linear_penalty=linear_penalty,
-            grammars=[req.grammar for req in all_reqs] if self.has_grammar else None,
+            grammars=grammars,
         )
+
+    def _merge_lora_ids(
+        self, per_dp_bs_size: int, total_bs: int, enable_static_lora: bool
+    ) -> list[str]:
+        """Place adapters in the same DP-padded request slots as seq_lens."""
+        lora_ids = ["0"] * total_bs
+        if not enable_static_lora:
+            for rank, info in enumerate(self.reqs_info):
+                for i, req in enumerate(info.reqs or []):
+                    lora_ids[rank * per_dp_bs_size + i] = req.lora_id
+        return lora_ids
 
     def _get_spec_decode_mwb_dp(
         self, bs_paddings: list, enable_static_lora: bool, draft_token_num: int = 1
@@ -2724,12 +2742,7 @@ class ScheduleBatch:
             extend_logprob_start_lens=None,
             extend_input_logprob_token_ids=None,
             logits_indices=None,
-            lora_ids=(
-                ["0"] * total_bs
-                if enable_static_lora
-                else [r.lora_id for i in self.reqs_info for r in (i.reqs or [])]
-                + ["0"] * (total_bs - real_bs)
-            ),
+            lora_ids=self._merge_lora_ids(per_dp_bs, total_bs, enable_static_lora),
             real_bs=real_bs,
             real_bs_per_dp=real_bs_per_dp,
             dp_size=self.dp_size,
@@ -3199,18 +3212,8 @@ class ScheduleBatch:
         if precision_tracer.get_trace_active():
             self._generate_trace_info(real_bs, bid)
 
-        # Step 7: Collect lora_ids from all requests
-        all_reqs = []
-        for info in self.reqs_info:
-            if info.reqs:
-                all_reqs.extend(info.reqs)
-
-        if enable_static_lora:
-            lora_ids = ["0"] * total_bs
-        else:
-            lora_ids = [req.lora_id for req in all_reqs[:real_bs]]
-            # Pad to total_bs
-            lora_ids = lora_ids + ["0"] * (total_bs - real_bs)
+        # Step 7: Align adapters with the DP-padded request metadata.
+        lora_ids = self._merge_lora_ids(per_dp_bs_padding, total_bs, enable_static_lora)
 
         # Assemble all per-token multimodal tensors (input_embedding,
         # mrope_positions, deepstack) in a single DP-interleaved pass over
@@ -3257,11 +3260,9 @@ class ScheduleBatch:
             top_logprobs_nums = None
             token_ids_logprobs = None
 
-        # extend+logprob always uses the padded path: the legacy fallback slices
-        # hidden_states per req under P("data","tensor") and crashes when the row
-        # count isn't divisible by dp (dp>1). The padded path supports top_logprobs /
-        # token_ids / overlap at any dp. return_hidden_states still falls back.
-        use_padded_input_logprob = self.forward_mode.is_extend() and not self.return_hidden_states
+        # Hidden-state capture retains the original tensor independently of
+        # logprob selection, so it also uses the DP-padded logprob path.
+        use_padded_input_logprob = self.forward_mode.is_extend()
         input_logprob_indices = None
         merged_extend_input_logprob_token_ids = None
         if self.return_logprob:
@@ -3412,6 +3413,15 @@ class ScheduleBatch:
             new_info = ScheduleReqsInfo()
             new_info.reqs = list(info.reqs) if info.reqs else info.reqs
             new_info.out_cache_loc = info.out_cache_loc
+            # Output collection must use the submitted positions, even when
+            # overlap scheduling advances the live request's next batch.
+            if self.return_hidden_states:
+                new_info.seq_lens = (
+                    np.array(info.seq_lens, copy=True) if info.seq_lens is not None else None
+                )
+                new_info.prefix_lens = (
+                    list(info.prefix_lens) if info.prefix_lens is not None else None
+                )
             new_info.decoding_reqs = (
                 list(info.decoding_reqs) if info.decoding_reqs else info.decoding_reqs
             )
@@ -3433,6 +3443,7 @@ class ScheduleBatch:
             return_logprob=self.return_logprob,
             return_output_logprob_only=self.return_output_logprob_only,
             is_prefill_only=self.is_prefill_only,
+            return_hidden_states=self.return_hidden_states,
             bid=self.bid,
             dp_size=self.dp_size,
             per_dp_bs_size=self.per_dp_bs_size,
@@ -3669,13 +3680,19 @@ class ModelWorkerSamplingInfo:
             self.vocab_mask = None
             return
 
-        self.vocab_mask = first_grammar.allocate_vocab_mask(
-            vocab_size=self.vocab_size,
-            batch_size=len(self.temperatures),
+        # Unconstrained and padding rows allow every token. Keep this batch's
+        # mask independent of the grammar backend's reusable host buffer.
+        self.vocab_mask = np.full_like(
+            first_grammar.allocate_vocab_mask(
+                vocab_size=self.vocab_size,
+                batch_size=len(self.temperatures),
+            ),
+            -1,
         )
 
         for i, grammar in enumerate(self.grammars):
             if grammar and not grammar.finished and not grammar.is_terminated():
+                self.vocab_mask[i].fill(0)
                 grammar.fill_vocab_mask(self.vocab_mask, i)
 
 

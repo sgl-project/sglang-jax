@@ -31,6 +31,27 @@ logger = logging.getLogger(__name__)
 DEFAULT_FORCE_STREAM_INTERVAL = 50
 
 
+def _collect_hidden_states(batch: ScheduleBatch, hidden_states) -> None:
+    """Collect evaluated rows using the submitted DP layout and token positions."""
+    if hidden_states is None or not batch.return_hidden_states:
+        return
+    hidden_states = np.asarray(jax.device_get(hidden_states))
+    per_dp_tokens = hidden_states.shape[0] // batch.dp_size
+    is_extend = batch.forward_mode.is_extend()
+    for rank, info in enumerate(batch.reqs_info):
+        offset = rank * per_dp_tokens
+        for i, req in enumerate(info.reqs or []):
+            length = int(info.extend_lens[i]) if is_extend else 1
+            rows = hidden_states[offset : offset + length]
+            offset += length
+            if not req.return_hidden_states or req.finished() or req.is_retracted:
+                continue
+            prefix = int(info.prefix_lens[i]) if is_extend else int(info.seq_lens[i]) - 1
+            # Retract/re-prefill may recompute an existing suffix. Replace it
+            # by position instead of duplicating it; chunked prefill appends.
+            req.hidden_states[prefix : prefix + length] = rows.astype(float).tolist()
+
+
 def _complete_precision_trace(req: Req) -> None:
     if not precision_tracer.get_trace_active():
         return
@@ -191,7 +212,7 @@ class SchedulerOutputProcessorMixin:
                 logits_output.input_token_logprobs,
                 _input_logprob_lens_per_dp(batch),
             )
-        hidden_state_offset = 0
+        _collect_hidden_states(batch, logits_output.hidden_states)
         per_dp_bs_size = batch.per_dp_bs_size
 
         logprob_pt = 0
@@ -264,18 +285,6 @@ class SchedulerOutputProcessorMixin:
                             local_idx=i,
                         )
                         logprob_pt += num_input_logprobs
-
-                    if req.return_hidden_states and logits_output.hidden_states is not None:
-                        req.hidden_states.append(
-                            jax.device_get(
-                                logits_output.hidden_states[
-                                    hidden_state_offset : (
-                                        hidden_state_offset := hidden_state_offset
-                                        + len(req.origin_input_ids)
-                                    )
-                                ]
-                            ).astype(float)
-                        )
 
                     # Update grammar state after token sampling
                     if req.grammar is not None:
@@ -463,6 +472,7 @@ class SchedulerOutputProcessorMixin:
                     float
                 )
 
+        _collect_hidden_states(batch, logits_output.hidden_states)
         self.token_to_kv_pool_allocator.free_group_begin()
 
         # Process each DP rank's requests (unified for all dp_size >= 1)
@@ -572,12 +582,6 @@ class SchedulerOutputProcessorMixin:
 
                         self.abort_request(AbortReq(rid=req.rid))
                     req.grammar.finished = req.finished()
-                if req.return_hidden_states and logits_output.hidden_states is not None:
-                    # NOTE: hidden_states is not yet reordered through
-                    # logits_indices_selector. Decode-mode hidden_states is
-                    # DP-interleaved like the raw next_token_logprobs were.
-                    # Tracking as a follow-up; not in scope for this fix.
-                    req.hidden_states.append(logits_output.hidden_states[i])
                 req_idx += 1
 
         # Collect all requests from all DP ranks for stream output
@@ -814,10 +818,10 @@ class SchedulerOutputProcessorMixin:
         cached_tokens = []
         spec_verify_ct = []
         spec_accepted_tokens = []
-        output_hidden_states = None
+        output_hidden_states = [] if any(req.return_hidden_states for req in reqs) else None
         output_routed_experts = None
 
-        output_hidden_states_for_mm = None
+        output_hidden_states_for_mm = [] if output_hidden_states is not None else None
         if return_logprob:
             input_token_logprobs_val = []
             input_token_logprobs_idx = []
@@ -972,10 +976,16 @@ class SchedulerOutputProcessorMixin:
                         )
                     if req.return_output_logprob_only:
                         req.send_output_token_logprobs_offset = len(req.output_token_logprobs_val)
-                if req.return_hidden_states:
-                    if output_hidden_states_for_mm is None:
-                        output_hidden_states_for_mm = []
-                    output_hidden_states_for_mm.append(req.hidden_states)
+                if output_hidden_states_for_mm is not None:
+                    output_hidden_states.append(
+                        list(req.hidden_states) if req.return_hidden_states else None
+                    )
+                    # The diffusion text-encoder consumer expects [prompt_rows].
+                    output_hidden_states_for_mm.append(
+                        [req.hidden_states[: len(req.origin_input_ids)]]
+                        if req.return_hidden_states
+                        else None
+                    )
 
                 # if req.return_routed_experts:
                 if output_routed_experts is None:

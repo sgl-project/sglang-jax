@@ -310,6 +310,18 @@ suites = {
     # cpu-test CI job sets that env var.
     "unit-test-cpu": [
         TestFile(
+            "python/sgl_jax/test/test_dp_feature_parity.py",
+            0.1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "python/sgl_jax/test/speculative/test_spec_dp_shapes.py",
+            0.1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
             "test/srt/layers/test_lm_head_parallel.py",
             0.3,
             runner="pytest",
