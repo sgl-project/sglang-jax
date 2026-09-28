@@ -910,6 +910,9 @@ def make_gmm_configs(
         # rescaled by its own rhs scale before accumulation, so the lhs quant
         # granularity must match the rhs block grid exactly.
         lhs_quant_block_size = block_size
+    elif lhs_q_dtype is not None and envs.SGLANG_JAX_GMM_LHS_QBLOCK.get() > 0:
+        # Per-channel (or unscaled) rhs: the lhs block is free to choose.
+        lhs_quant_block_size = envs.SGLANG_JAX_GMM_LHS_QBLOCK.get()
     elif (
         lhs_q_dtype is not None
         and rhs_quant_dtype is not None
