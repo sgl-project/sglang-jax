@@ -380,11 +380,10 @@ class ModelRunnerKVCacheMixin:
             * num_layers
             * dtype_size
         )
-        sa = getattr(self.model_config.hf_text_config, "sparse_attention_config", None)
-        if isinstance(sa, dict) and sa.get("use_sparse_attention"):
-            n_sparse = sum(1 for f in sa["sparse_attention_freq"] if f)
-            # ik_buf: 1 index-k head per token, not tensor-sharded
-            main_kv += n_sparse * align128(sa["sparse_index_dim"]) * dtype_size
+        # Backends may keep extra per-token cache (e.g. MSA index_k, not tensor-sharded).
+        extra = getattr(self.attn_backend, "extra_kv_bytes_per_token", None)
+        if extra is not None:
+            main_kv += extra(dtype_size)
         return main_kv
 
     def _profile_available_bytes(self: ModelRunner, total_device_memory: int) -> int:
@@ -750,41 +749,9 @@ class ModelRunnerKVCacheMixin:
                 dp_size=dp_size,
                 abstract=abstract,
             )
-            sa = getattr(self.model_config.hf_text_config, "sparse_attention_config", None)
-            self._is_msa = isinstance(sa, dict) and sa.get("use_sparse_attention")
-            if self._is_msa:
-                bsz = int(sa["sparse_block_size"])
-                if self.server_args.page_size != bsz:
-                    raise ValueError(
-                        f"MSA models require --page-size {bsz} (== sparse_block_size); "
-                        f"got --page-size {self.server_args.page_size}. The decode top-k "
-                        "selection uses page granularity as the block granularity."
-                    )
-                if self.server_args.attention_backend != "fa":
-                    raise ValueError(
-                        "MSA models require --attention-backend fa; "
-                        f"got {self.server_args.attention_backend!r}."
-                    )
-                n_idx = int(sa["sparse_num_index_heads"])
-                n_kv = int(self.model_config.get_total_num_kv_heads())
-                tp_attn = int(self.attention_tp_size)
-                if n_idx != n_kv or tp_attn < n_idx or tp_attn % n_idx != 0:
-                    raise ValueError(
-                        "MSA per-head block selection requires one KV/GQA group per "
-                        f"tensor rank: sparse_num_index_heads={n_idx}, num_kv_heads={n_kv}, "
-                        f"attention tp={tp_attn}. Use a tp that is a multiple of {n_kv}."
-                    )
-                from sgl_jax.srt.mem_cache.memory_pool import MSATokenToKVPool
-
-                freq = sa["sparse_attention_freq"]
-                return self._maybe_wrap_hybrid_kv_pool(
-                    MSATokenToKVPool,
-                    sparse_layer_ids=[i for i, f in enumerate(freq) if f],
-                    index_head_dim=sa["sparse_index_dim"],
-                    **mha_kwargs,
-                )
             pool_class = getattr(self.attn_backend, "token_to_kv_pool_class", MHATokenToKVPool)
-            return self._maybe_wrap_hybrid_kv_pool(pool_class, **mha_kwargs)
+            pool_kwargs = dict(getattr(self.attn_backend, "token_to_kv_pool_kwargs", None) or {})
+            return self._maybe_wrap_hybrid_kv_pool(pool_class, **pool_kwargs, **mha_kwargs)
 
     def _init_pools(self: ModelRunner, max_num_reqs: int, dp_size: int):
         """Create ReqToTokenPool, KV pool, allocator, and MemoryPools."""

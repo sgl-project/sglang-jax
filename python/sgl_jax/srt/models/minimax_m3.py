@@ -49,39 +49,6 @@ def _text_config(config: PretrainedConfig) -> PretrainedConfig:
     return getattr(config, "text_config", config)
 
 
-def msa_block_topk(
-    iq: jax.Array,
-    ik_hist: jax.Array,
-    seq_len: jax.Array,
-    q_pos: jax.Array,
-    *,
-    block_size: int,
-    topk: int,
-    local_blocks: int,
-) -> tuple[jax.Array, jax.Array]:
-    """Pure MSA indexer reference (single query): iq [H_idx, D], ik_hist [L_pad, D]
-    (zero-padded past seq_len). Returns (topk_block_idx [H_idx, topk], n_valid).
-    Per-head selection as in the M3 reference / HF transformers #46719: block
-    max-pool over tokens, +inf boost on local blocks, top-k *per index head*
-    (no max over heads), -inf-padded top-k left-aligned. In serving, head h's
-    selection is used by the q heads of KV/GQA group h."""
-    n_blocks = ik_hist.shape[0] // block_size
-    scores = jnp.einsum("hd,ld->hl", iq.astype(jnp.float32), ik_hist.astype(jnp.float32))
-    valid = jnp.arange(ik_hist.shape[0]) < seq_len
-    scores = jnp.where(valid[None, :], scores, -jnp.inf)
-    block_scores = scores.reshape(iq.shape[0], n_blocks, block_size).max(-1)  # [H, n_blocks]
-    q_block = q_pos // block_size
-    for j in range(local_blocks):
-        block_scores = block_scores.at[:, jnp.maximum(q_block - j, 0)].set(jnp.inf)
-    k = min(topk, n_blocks)
-    topk_score, topk_idx = jax.lax.top_k(block_scores, k)  # [H, k]
-    n_valid = jnp.minimum((seq_len + block_size - 1) // block_size, k)
-    topk_idx = jnp.where(topk_score > -jnp.inf, topk_idx, 0)
-    if k < topk:
-        topk_idx = jnp.pad(topk_idx, ((0, 0), (0, topk - k)))
-    return topk_idx, n_valid
-
-
 def swigluoai(gate: jax.Array, up: jax.Array, alpha: float, limit: float) -> jax.Array:
     gate = jnp.clip(gate, max=limit)
     up = jnp.clip(up, -limit, limit)
@@ -518,6 +485,16 @@ class MiniMaxM3SparseForCausalLM(nnx.Module):
         if layers_ik:
             pool_updates["msa_index_k"] = layers_ik
         return output, pool_updates, True, layers_topk_ids
+
+    @classmethod
+    def get_expert_location_config(cls, hf_config) -> dict:
+        """EPLB fields for the text model (MoE config lives under ``text_config``)."""
+        cfg = _text_config(hf_config)
+        return {
+            "num_experts": int(getattr(cfg, "num_local_experts", 0)),
+            "num_layers": int(getattr(cfg, "num_hidden_layers", 0)),
+            "num_groups": int(getattr(cfg, "num_expert_group", 1)),
+        }
 
     def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(

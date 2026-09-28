@@ -229,11 +229,10 @@ class FlashAttention(AttentionBackend):
         #
         # MSA ctx-bucket precompile (G3): when set to a sorted page-count list
         # (e.g. [16, 64, 512]) by model_runner for MSA models, decode-time
-        # page_indices is truncated to the smallest bucket >= max(seq_pages) so
-        # the traced graph's pages_per_seq — and hence _msa_inner's ik_buf
-        # gather — scales with actual context instead of max_context_len.
-        # None → original behaviour (single max_ctx-sized page_indices).
-        self.msa_ctx_page_buckets: list[int] | None = None
+
+    def _decode_page_limit(self, batch) -> int | None:
+        """Optional per-DP page-table bound for decode (subclasses override)."""
+        return None
 
     def get_forward_metadata(
         self,
@@ -272,12 +271,12 @@ class FlashAttention(AttentionBackend):
         # RPA indexes via cu_kv_lens (unaffected); _msa_inner derives
         # pages_per_seq from the truncated shape (the point of this opt).
         # DECODE only — EXTEND uses the largest cache_loc bucket unconditionally.
-        if self.msa_ctx_page_buckets is not None and batch.forward_mode == ForwardMode.DECODE:
-            seq_pages = (np.asarray(batch.seq_lens) + self.page_size - 1) // self.page_size
-            max_pages = int(seq_pages.max(initial=0))
-            bucket = next((b for b in self.msa_ctx_page_buckets if b >= max_pages), None)
-            if bucket is not None:
-                n_keep = batch.per_dp_bs_size * bucket
+        # Backends may bound the decode page table (e.g. MSA context buckets);
+        # the per-request page count still follows kv_lens/cu_kv_lens.
+        if batch.forward_mode == ForwardMode.DECODE:
+            limit = self._decode_page_limit(batch)
+            if limit is not None:
+                n_keep = batch.per_dp_bs_size * limit
                 if n_keep < strided_2d.shape[1]:
                     strided_2d = strided_2d[:, :n_keep]
 
@@ -958,8 +957,10 @@ class FlashAttention(AttentionBackend):
                 # index head selects its own top-k blocks for its KV/GQA group. On
                 # this backend every tensor rank owns exactly one KV head (startup
                 # validation enforces tp % n_kv == 0, tp >= n_kv), KV heads are
-                # repeat-replicated across the tensor axis (weight_utils.
-                # replicate_kv_heads) and q heads are sharded contiguously, so
+                # replicated contiguously across the tensor axis (loader
+                # kv_head_padding, "replicate" strategy: each original head is
+                # repeated num_replicas times in place) and q heads are sharded
+                # contiguously, so
                 # tensor rank r <-> original KV/index head (r * n_idx) // tp. Scoring
                 # with that head alone makes this rank's page table the per-head
                 # selection, and RPA runs unchanged on it.

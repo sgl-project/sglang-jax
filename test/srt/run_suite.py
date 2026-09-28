@@ -427,6 +427,12 @@ suites = {
         ),
         TestFile("python/sgl_jax/test/multimodal/test_encoder_scheduler_kwargs.py", 0.1),
         TestFile("python/sgl_jax/test/models/test_qwen3_5.py", 2, runner="pytest"),
+        TestFile(
+            "python/sgl_jax/test/models/test_minimax_m3_msa.py",
+            3,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "4"},
+        ),
         TestFile("python/sgl_jax/test/test_transformers_compat.py", 2, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/kernels/test_gdn_fused_chunk_parallel_provenance.py",
@@ -465,9 +471,6 @@ suites = {
             runner="pytest",
             env={"JAX_PLATFORMS": "cpu"},
         ),
-        TestFile("python/sgl_jax/test/models/test_minimax_m3.py", 1, runner="pytest"),
-        TestFile("python/sgl_jax/test/models/test_minimax_m3_msa.py", 2, runner="pytest"),
-        TestFile("python/sgl_jax/test/models/test_minimax_m3_msa_trace.py", 2, runner="pytest"),
         TestFile("python/sgl_jax/test/mem_cache/test_req_to_token_pool.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_hybrid_req_to_token_pool.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_swa_allocator.py", 1),

@@ -386,16 +386,37 @@ class TestBucketComputation(unittest.TestCase):
         assert cm.token_buckets == [256, 512, 1024, 131072]
 
     def test_export_plan_matches_online_warmup(self):
+        def observed_shapes(cm, mode):
+            # (bs, tokens, cache_loc, decode_pages): the warmup batch encodes the
+            # decode page bucket as seq_len = pages * page_size - 1 (plain shape: 1).
+            shapes = []
+            for b in _collect_precompile_batches(cm, mode):
+                seq_len = int(b.seq_lens[0])
+                pages = None if seq_len == 1 else (seq_len + 1) // cm.page_size
+                shapes.append((b.real_bs, len(b.input_ids), len(b.cache_loc), pages))
+            return shapes
+
         for dp_size in (1, 2):
             cm = CompilationManager(
                 _make_server_args(), 8, 256 * dp_size, dp_size, 8, 128, 255, 256
             )
             for mode in (ForwardMode.EXTEND, ForwardMode.DECODE):
-                batches = _collect_precompile_batches(cm, mode)
-                observed = [(b.real_bs, len(b.input_ids), len(b.cache_loc)) for b in batches]
-                self.assertEqual(list(cm.iter_model_shapes(mode)), observed)
+                self.assertEqual(list(cm.iter_model_shapes(mode)), observed_shapes(cm, mode))
             self.assertEqual(cm.token_buckets[-1], 256 * dp_size)
             self.assertEqual(cm.bs_buckets[-1], 8)
+
+        # Backends may bound the decode page table per bucket (e.g. MSA); the
+        # shared enumeration crosses every decode shape with those buckets so
+        # export and warmup agree, and extend shapes are unaffected.
+        backend = MagicMock()
+        backend.decode_page_buckets = [1, 2]
+        cm = CompilationManager(
+            _make_server_args(), 8, 256, 1, 8, 128, 255, 256, attn_backend=backend
+        )
+        decode = list(cm.iter_model_shapes(ForwardMode.DECODE))
+        self.assertEqual([s[3] for s in decode], [1, 2] * len(cm.bs_buckets))
+        self.assertEqual(decode, observed_shapes(cm, ForwardMode.DECODE))
+        self.assertTrue(all(s[3] is None for s in cm.iter_model_shapes(ForwardMode.EXTEND)))
 
     def test_aot_capacity_defaults_and_incomplete_bundle(self):
         with tempfile.TemporaryDirectory() as directory:

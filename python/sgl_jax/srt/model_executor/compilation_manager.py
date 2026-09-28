@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import itertools
 import logging
 import threading
 import time
@@ -136,7 +135,7 @@ class CompilationManager:
         supports_recurrent_cow: bool = False,
         supports_recurrent_track: bool = False,
         moe_backend: str | None = None,
-        msa_ctx_page_buckets: list[int] | None = None,
+        attn_backend=None,
     ):
         self.dp_size = dp_size
         self.tp_size = tp_size
@@ -158,9 +157,9 @@ class CompilationManager:
         self.moe_backend = moe_backend if moe_backend is not None else server_args.moe_backend
         self.enable_static_lora = server_args.enable_static_lora
         self.precompile_num_threads = server_args.precompile_num_threads
-        # MSA G3: per-seq page-count buckets for decode precompile. None for
-        # non-MSA models → single ctx variant per bs (original behaviour).
-        self.msa_ctx_page_buckets = msa_ctx_page_buckets
+        # Backends may request decode variants per pages-per-seq bucket (MSA);
+        # None keeps one decode shape per bs. Shared by warmup and AOT export.
+        self.decode_page_buckets = getattr(attn_backend, "decode_page_buckets", None)
 
         self.token_buckets = self._compute_token_buckets(server_args.precompile_token_paddings)
         self.bs_buckets = self._compute_bs_buckets(server_args.precompile_bs_paddings)
@@ -350,15 +349,29 @@ class CompilationManager:
         return batch_size, num_tokens
 
     def iter_model_shapes(self, mode):
-        """The model shapes used by both serving warmup and offline export."""
+        """The model shapes used by both serving warmup and offline export.
+
+        Yields ``(bs, tokens, cache_loc, decode_pages)``. ``decode_pages`` is the
+        per-request page-table bucket a backend traces decode at (None = the
+        plain shape; see ``decode_dummy_seq_len``).
+        """
         if mode.is_extend():
             for tokens in self.token_buckets:
-                yield self.max_padded_batch_size, tokens, self.cache_loc_buckets[-1]
+                yield self.max_padded_batch_size, tokens, self.cache_loc_buckets[-1], None
         elif mode.is_decode():
             for bs, cache_loc in zip(self.bs_buckets, self.cache_loc_buckets):
-                yield bs, bs, cache_loc
+                for pages in self.decode_page_buckets or [None]:
+                    yield bs, bs, cache_loc, pages
         else:
             raise ValueError(f"No serving precompile shapes for {mode}")
+
+    def decode_dummy_seq_len(self, decode_pages: int | None) -> int:
+        """Warmup seq_len for a decode page bucket: fills ``decode_pages`` pages so the
+        backend's page-table bound (FlashAttention._decode_page_limit) lands exactly
+        on that bucket; the plain shape keeps the historical seq_len=1."""
+        if decode_pages is None:
+            return 1
+        return decode_pages * self.page_size - 1
 
     @staticmethod
     def compiler_options(backend, batch=None, overrides=None):
@@ -447,7 +460,7 @@ class CompilationManager:
         )
 
         def batches():
-            for bs, tokens, cache_loc in dict.fromkeys(self.iter_model_shapes(mode)):
+            for bs, tokens, cache_loc, pages in dict.fromkeys(self.iter_model_shapes(mode)):
                 batch = self._make_dummy_batch(
                     bs,
                     tokens,
@@ -455,6 +468,7 @@ class CompilationManager:
                     cache_loc,
                     dp_size=self.dp_size,
                     per_dp_bs_size=bs // self.dp_size,
+                    dummy_seq_len=self.decode_dummy_seq_len(pages),
                 )
                 batch.forward_batch = ForwardBatch.init_new(batch, model_runner)
                 yield batch
@@ -533,7 +547,7 @@ class CompilationManager:
             leave=False,
             total=len(self.token_buckets),
         ) as pbar:
-            for bs_val, num_tokens, cache_loc_size in pbar:
+            for bs_val, num_tokens, cache_loc_size, _ in pbar:
                 pbar.set_postfix(bs=bs_val, tokens=num_tokens)
                 if bs_val > num_tokens:
                     logger.warning("bs=%s > num_tokens=%s, skip this pair", bs_val, num_tokens)
@@ -587,25 +601,16 @@ class CompilationManager:
 
         start_time = time.perf_counter()
         self._compile_model_buckets(model_runner, ForwardMode.DECODE)
-        # MSA G3: cross bs_buckets × ctx_page_buckets so each (bs, pages_per_seq)
-        # decode shape is pre-traced. dummy_seq_len = bucket*page_size - 1 lands
-        # max(seq_pages) exactly on `bucket`, so fa_backend.get_forward_metadata
-        # truncates page_indices to that bucket. ctx=[None] → seq_len=1 (legacy).
-        # (Parallel _compile_model_buckets above only covers the ctx=None shapes;
-        # the ctx variants are compiled by this loop.)
-        ctx_buckets = self.msa_ctx_page_buckets or [None]
         logger.info(
-            "[DECODE] Begin to precompile bs_paddings=%s ctx_page_buckets=%s",
+            "[DECODE] Begin to precompile bs_paddings=%s decode_page_buckets=%s",
             self.bs_buckets,
-            self.msa_ctx_page_buckets,
+            self.decode_page_buckets,
         )
 
-        # Cross main's serving shapes with MSA ctx_page_buckets (None → legacy seq_len=1).
-        shapes = list(itertools.product(self.iter_model_shapes(ForwardMode.DECODE), ctx_buckets))
+        shapes = list(self.iter_model_shapes(ForwardMode.DECODE))
         with tqdm(shapes, desc="[DECODE] PRECOMPILE", leave=False) as pbar:
-            for (bs_val, num_tokens, aligned_cache_loc_size), ctx_pages in pbar:
-                pbar.set_postfix(bs=bs_val, ctx_pages=ctx_pages)
-                dummy_seq_len = 1 if ctx_pages is None else ctx_pages * self.page_size - 1
+            for bs_val, num_tokens, aligned_cache_loc_size, pages in pbar:
+                pbar.set_postfix(bs=bs_val, pages=pages)
                 batch = self._make_dummy_batch(
                     bs_val,
                     num_tokens,
@@ -613,7 +618,7 @@ class CompilationManager:
                     aligned_cache_loc_size,
                     dp_size=self.dp_size,
                     per_dp_bs_size=bs_val // self.dp_size,
-                    dummy_seq_len=dummy_seq_len,
+                    dummy_seq_len=self.decode_dummy_seq_len(pages),
                 )
                 if prepare_lora_fn is not None:
                     prepare_lora_fn(batch)
