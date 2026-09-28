@@ -42,6 +42,7 @@ class TestAotDispatcher(unittest.TestCase):
 
         def ready(_, compiled):
             outputs.append(compiled.out_info)
+
         with CompilationPool(2) as pool:
             with jax.set_mesh(mesh):
                 pool.submit(lambda: model.lower(value), on_compiled=ready)
