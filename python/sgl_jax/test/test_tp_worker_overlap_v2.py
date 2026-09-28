@@ -93,14 +93,8 @@ def test_v2_resolver_matches_legacy_host_output_contract():
         v2_logits.input_token_logprobs,
         legacy_logits.input_token_logprobs,
     )
-    assert (
-        v2_logits.next_token_top_logprobs_val
-        == legacy_logits.next_token_top_logprobs_val
-    )
-    assert (
-        v2_logits.next_token_top_logprobs_idx
-        == legacy_logits.next_token_top_logprobs_idx
-    )
+    assert v2_logits.next_token_top_logprobs_val == legacy_logits.next_token_top_logprobs_val
+    assert v2_logits.next_token_top_logprobs_idx == legacy_logits.next_token_top_logprobs_idx
     assert (
         v2_logits.next_token_token_ids_logprobs_val
         == legacy_logits.next_token_token_ids_logprobs_val
