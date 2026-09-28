@@ -24,7 +24,6 @@ from jax.sharding import AxisType, Mesh
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.qsa.paging import as_4d, scatter_compressed
-from sgl_jax.srt.kernels.qsa.ref import sparse_gqa_attention_ref
 from sgl_jax.srt.kernels.qsa.sparse_gqa_attention import sparse_gqa_attention
 from sgl_jax.srt.layers.attention.qsa_indexer import QSAIndexer, select_blocks
 from sgl_jax.srt.layers.embeddings import RotaryEmbedding
@@ -213,38 +212,6 @@ class TestQSAPipeline(CustomTestCase):
         )
         err = float(jnp.max(jnp.abs(got - want))) / float(jnp.max(jnp.abs(want)))
         self.assertLess(err, 1e-5, "sparse-with-everything-selected != dense")
-
-    def test_selection_covers_every_visible_block(self):
-        """The same claim from the other side: nothing visible was dropped, and
-        nothing past the causal bound was picked."""
-        fx = _Fixture(budget=PAGES_PER_SEQ * PAGE_SIZE)
-        block_ids, _ = fx.run_selection()
-        for t in range(block_ids.shape[0]):
-            pos = int(fx.positions[t])
-            visible = set(range((pos + 1) // RATIO))
-            picked = {int(b) for b in block_ids[t] if int(b) >= 0}
-            self.assertEqual(picked, visible, f"token {t} at pos {pos}")
-
-    def test_narrow_budget_matches_the_kernel_reference(self):
-        """With a real selection in play, fall back to checking the kernel does
-        what the reference says about those blocks."""
-        fx = _Fixture(budget=8)  # block_topk == 2
-        block_ids, _ = fx.run_selection()
-        self.assertTrue(bool(jnp.any(block_ids < 0)) or block_ids.shape[1] == 2)
-        got = fx.attend(block_ids)
-        want = sparse_gqa_attention_ref(
-            fx.q,
-            block_ids,
-            fx.positions,
-            fx.k_cache,
-            fx.v_cache,
-            fx.page_table,
-            fx.token_to_req,
-            compress_ratio=RATIO,
-            sm_scale=HEAD_DIM**-0.5,
-        )
-        err = float(jnp.max(jnp.abs(got - want))) / float(jnp.max(jnp.abs(want)))
-        self.assertLess(err, 1e-5)
 
 
 if __name__ == "__main__":

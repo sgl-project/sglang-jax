@@ -1,10 +1,13 @@
 """QSA sparse attention backend (Qwen3.8-Flash-Next).
 
 GQA plus an indexer, the way ``DSASparseAttentionBackend`` is MLA plus an
-indexer -- so this subclasses ``FlashAttention`` and inherits its metadata, its
-page-table construction and its dense path unchanged. What it adds is the
-sparse route: compress the step's indexer keys and scatter them, pick the
-blocks, and attend over only those.
+indexer -- so this subclasses ``FlashAttention`` and inherits its metadata and
+page-table construction, and its dense path for layers without an indexer. What
+it adds is the sparse route: compress the step's indexer keys and scatter them,
+pick the blocks, and attend over only those. A QSA layer takes that route in
+every forward mode, prefill included: the model is trained to attend over the
+selected blocks, and once a context outgrows the selection budget dense
+attention computes something else.
 
 The indexer's weights stay in the model, as they do upstream and in DSA: the
 attention module calls ``QSAIndexer.project`` and hands down the projections
@@ -23,7 +26,6 @@ kernel is handed.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -44,12 +46,6 @@ if TYPE_CHECKING:
     from sgl_jax.srt.layers.radix_attention import RadixAttention
     from sgl_jax.srt.mem_cache.memory_pool import KVCache
     from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-
-# Sparse prefill is opt in, matching DSA_PREFILL_SPARSE: per-query selection
-# pays off in decode, where each query comes from a different sequence and
-# there is nothing to amortise, and loses in prefill, where neighbouring
-# queries select almost the same blocks.
-QSA_PREFILL_SPARSE = os.environ.get("QSA_PREFILL_SPARSE", "0") == "1"
 
 # What a QSA layer must be called with; see QSASparseAttentionBackend.__call__.
 _INDEXER_INPUTS = ("indexer_q", "indexer_k", "indexer", "indexer_rotary_emb")
@@ -144,7 +140,7 @@ class QSASparseAttentionBackend(FlashAttention):
         attention_sink: jax.Array = None,
         **qsa_kwargs,
     ):
-        """Dense unless this layer has an indexer and the mode wants sparse.
+        """Sparse for a layer with an indexer, dense for any other.
 
         ``qsa_kwargs`` carries the model's indexer outputs for this step,
         ``indexer_q`` (scoring queries) and ``indexer_k`` (raw keys, before
@@ -168,18 +164,14 @@ class QSASparseAttentionBackend(FlashAttention):
             token_to_kv_pool, slot, forward_batch, qsa_kwargs
         )
 
-        is_decode = forward_batch.forward_mode.is_decode()
-        if not is_decode and not QSA_PREFILL_SPARSE:
-            # Dense still has to happen, and it writes the KV cache on the way.
-            out, kv_fused = super().__call__(
-                q, k, v, layer, forward_batch, token_to_kv_pool, causal, attention_sink
-            )
-            return out, QSAFusedCache(kv_fused, compressed_cache, ring)
-
-        # Sparse: the step's own keys must be in the cache before the gather,
-        # because a query attends to its own position and to its open group.
+        # The step's own keys must be in the cache before the gather, because a
+        # query attends to its own position and to its open group.
         token_to_kv_pool.set_kv_buffer(
-            layer.layer_id, forward_batch.out_cache_loc, k, v, is_decode=is_decode
+            layer.layer_id,
+            forward_batch.out_cache_loc,
+            k,
+            v,
+            is_decode=forward_batch.forward_mode.is_decode(),
         )
         kv_fused = token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
 
@@ -294,6 +286,11 @@ class QSASparseAttentionBackend(FlashAttention):
                 0,
                 n_seqs - 1,
             )
+            # FlashAttention marks an extend batch's requests prefill-only,
+            # (0, n, n). The selector runs that middle segment as decode, one
+            # query per request, and scores every query of a request only in
+            # the last segment, so all requests past the decode ones move there.
+            distribution_ = distribution_.at[1].set(distribution_[0])
             block_ids = select_blocks(
                 indexer_q_,
                 compressed_,

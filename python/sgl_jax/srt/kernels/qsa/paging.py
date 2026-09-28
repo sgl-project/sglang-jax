@@ -23,8 +23,8 @@ SENTINEL_PAGE = 0
 def compressed_slot(token: jax.Array | int, *, compressed_page_size: int, compress_ratio: int):
     """(logical page, in-page offset) of the entry covering ``token``.
 
-    The identity the shared page table rests on, in one place so tests and the
-    backend cannot drift apart on it.
+    The identity the shared page table rests on: the entry lands on the same
+    logical page as the token it covers.
     """
     entry = token // compress_ratio
     return entry // compressed_page_size, entry % compressed_page_size

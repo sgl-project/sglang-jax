@@ -74,19 +74,6 @@ def _make_indexer(mesh):
         )
 
 
-def _ref_pool(raw_keys):
-    """fp64 mean over each complete group, one group at a time."""
-    x = np.asarray(raw_keys, dtype=np.float64)
-    n_full = x.shape[0] // RATIO
-    out = np.empty((n_full, x.shape[1]), dtype=np.float64)
-    for g in range(n_full):
-        acc = np.zeros(x.shape[1], dtype=np.float64)
-        for j in range(RATIO):
-            acc += x[g * RATIO + j]
-        out[g] = acc / RATIO
-    return out
-
-
 def _ref_compress_batch(raw_keys, positions, cu_q_lens, slots, rings):
     """fp64 oracle for a packed batch, by explicit loops.
 
@@ -303,38 +290,6 @@ class TestCompressBatch(unittest.TestCase):
             jnp.asarray(rings),
         )
 
-    def test_pools_then_norms_then_rotates(self):
-        """Order is pool -> norm -> RoPE, the mean is fp32, and the rotation
-        uses the group's FIRST position. Any of the three is silent if wrong."""
-        mesh = _make_mesh()
-        layer = _make_indexer(mesh)
-        rotary = _make_rotary()
-        rng = np.random.default_rng(SEED)
-        raw = jnp.array(rng.standard_normal((8, HEAD_DIM)).astype(np.float32))
-        ring = jnp.zeros((RATIO, HEAD_DIM), jnp.float32)
-
-        with jax.set_mesh(mesh):
-            compressed, groups, ring_out = _batch_of_one(layer, raw, 0, ring, rotary)
-            # Oracle: pool in fp64 one group at a time, then norm, then rotate
-            # the leading rotary dims at the group's first position.
-            pooled = layer.k_layernorm(jnp.array(_ref_pool(raw).astype(np.float32)))
-            rot, _ = rotary(
-                jnp.array([0, RATIO], jnp.int32),
-                pooled[:, None, :ROTARY_DIM],
-                pooled[:, None, :ROTARY_DIM],
-            )
-            expected = jnp.concatenate([rot[:, 0, :], pooled[:, ROTARY_DIM:]], axis=-1)
-
-        # One output slot per token; only the tokens closing a group are live.
-        rows = _closing_rows(groups)
-        self.assertEqual(rows, [RATIO - 1, 2 * RATIO - 1])
-        self.assertEqual([int(groups[i]) for i in rows], [0, 1])
-        np.testing.assert_allclose(
-            np.asarray(compressed)[rows], np.asarray(expected), atol=1e-5, rtol=1e-5
-        )
-        # 8 tokens is exactly two groups, so nothing is carried.
-        np.testing.assert_allclose(np.asarray(ring_out), 0.0, atol=0)
-
     def test_carries_the_open_group_across_steps(self):
         """Six tokens in two steps must compress identically to one step of six.
 
@@ -370,31 +325,38 @@ class TestCompressBatch(unittest.TestCase):
         np.testing.assert_allclose(np.asarray(ring_a)[-3:], np.asarray(raw)[:3], atol=0)
 
     def test_matches_an_fp64_oracle(self):
-        """Ragged batch against explicit fp64 loops: which tokens close a group,
-        what each group pools, where it is rotated, and each request's new ring.
+        """Ragged batch under jit against explicit fp64 loops: which tokens
+        close a group, what each group pools, where it is rotated, and each
+        request's new ring.
 
         The oracle rebuilds every request's logical key run and indexes it by
         absolute position, so it reaches the answer by a different route than
-        the implementation's backwards walk.
+        the implementation's backwards walk. It pools, then norms, then rotates
+        at the group's first position; each of the three is silent if wrong.
         """
         mesh = _make_mesh()
         layer = _make_indexer(mesh)
         rotary = _make_rotary()
         rng = np.random.default_rng(0)
 
-        q_lens = [7, 1, 4, 5, 3]
+        q_lens = [7, 1, 4, 5, 3, 1, 0]
         # A mix of group-aligned and mid-group starts, so the ring matters, and
-        # between them the four possible carry offsets all occur. The one-token
-        # request holds less than a group, so most of the group it closes has to
-        # come out of the ring rather than this step's keys.
-        start_positions = [0, 13, 8, 6, 2]
-        raw, positions, cu, slots, rings = self._inputs(rng, layer, mesh, q_lens, start_positions)
+        # between them the four possible carry offsets all occur. The two
+        # one-token requests are decode steps: the one at 11 closes a group
+        # almost entirely out of the ring, the one at 13 closes none. The empty
+        # request has no tokens this step and must keep its ring.
+        start_positions = [0, 13, 8, 6, 2, 11, 5]
+        raw, positions, cu, slots, rings = self._inputs(
+            rng, layer, mesh, q_lens, start_positions, max_reqs=8
+        )
         want_pooled, want_rings = _ref_compress_batch(raw, positions, cu, slots, rings)
 
+        @jax.jit
+        def compress(raw, positions, cu, slots, rings):
+            return layer.compress_batch(raw, positions, cu, slots, rings, rotary)
+
         with jax.set_mesh(mesh):
-            compressed, groups, seq_ids, rings_out = layer.compress_batch(
-                raw, positions, cu, slots, rings, rotary
-            )
+            compressed, groups, seq_ids, rings_out = compress(raw, positions, cu, slots, rings)
             rows = _closing_rows(groups)
             normed = layer.k_layernorm(
                 jnp.asarray(np.stack([want_pooled[i][1] for i in rows]).astype(np.float32))
@@ -420,36 +382,6 @@ class TestCompressBatch(unittest.TestCase):
                 err_msg=f"ring for slot {slot}",
             )
 
-    def test_decode_step_closes_at_most_one_group(self):
-        """Every request contributes one token; only those landing on the last
-        slot of a group produce a compressed key."""
-        mesh = _make_mesh()
-        layer = _make_indexer(mesh)
-        rotary = _make_rotary()
-        rng = np.random.default_rng(1)
-
-        start_positions = [RATIO - 1, RATIO, 2 * RATIO + 2, 4 * RATIO - 1]
-        raw, positions, cu, slots, rings = self._inputs(
-            rng, layer, mesh, [1, 1, 1, 1], start_positions
-        )
-        with jax.set_mesh(mesh):
-            _, groups, _, _ = layer.compress_batch(raw, positions, cu, slots, rings, rotary)
-
-        closed = [int(g) >= 0 for g in groups]
-        self.assertEqual(closed, [True, False, False, True])
-
-    def test_untouched_requests_keep_their_ring(self):
-        """A request with no tokens this step must not have its ring cleared."""
-        mesh = _make_mesh()
-        layer = _make_indexer(mesh)
-        rotary = _make_rotary()
-        rng = np.random.default_rng(2)
-
-        raw, positions, cu, slots, rings = self._inputs(rng, layer, mesh, [4, 0, 3], [0, 5, 0])
-        with jax.set_mesh(mesh):
-            _, _, _, rings_out = layer.compress_batch(raw, positions, cu, slots, rings, rotary)
-        np.testing.assert_array_equal(np.asarray(rings_out[slots[1]]), np.asarray(rings[slots[1]]))
-
     def test_a_padded_request_leaves_the_last_slot_alone(self):
         """Batch padding carries slot -1. Its ring must not land on the last
         slot, where a live request's new ring would be overwritten."""
@@ -474,24 +406,6 @@ class TestCompressBatch(unittest.TestCase):
             )
         self.assertFalse(np.array_equal(np.asarray(alone[last]), np.asarray(rings[last])))
         np.testing.assert_array_equal(np.asarray(padded), np.asarray(alone))
-
-    def test_jit(self):
-        """Shapes are static under jit even though the boundaries are traced."""
-        mesh = _make_mesh()
-        layer = _make_indexer(mesh)
-        rotary = _make_rotary()
-        rng = np.random.default_rng(3)
-        raw, positions, cu, slots, rings = self._inputs(rng, layer, mesh, [5, 3], [0, 2])
-
-        @jax.jit
-        def run(raw, positions, cu, slots, rings):
-            return layer.compress_batch(raw, positions, cu, slots, rings, rotary)
-
-        with jax.set_mesh(mesh):
-            eager = layer.compress_batch(raw, positions, cu, slots, rings, rotary)
-            jitted = run(raw, positions, cu, slots, rings)
-        for a, b in zip(eager, jitted):
-            np.testing.assert_allclose(np.asarray(a), np.asarray(b), rtol=1e-5, atol=1e-5)
 
 
 if __name__ == "__main__":

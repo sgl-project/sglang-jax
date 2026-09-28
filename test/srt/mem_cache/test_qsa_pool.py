@@ -9,13 +9,21 @@ of it. The page walk itself is checked in ``test/srt/kernels/qsa/test_paging.py`
 
 import os
 import unittest
+from types import SimpleNamespace
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import jax
 import jax.numpy as jnp
 
-from sgl_jax.srt.mem_cache.memory_pool import QSATokenToKVPool
+from sgl_jax.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
+    MLATokenToKVPool,
+    QSATokenToKVPool,
+)
+from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
+    ModelRunnerKVCacheMixin,
+)
 from sgl_jax.test.test_utils import CustomTestCase
 
 PAGE_SIZE = 128
@@ -121,6 +129,70 @@ class TestQSAPoolBuffers(CustomTestCase):
         # The plain list form still works, and leaves the indexer state alone.
         pool.replace_buffer(list(pool.kv_buffer))
         self.assertEqual(float(pool.get_compressed_key_buffer(1)[0, 0, 0, 0]), 2.0)
+
+
+class TestQSAPoolInsideTheHybridWrapper(CustomTestCase):
+    """Flash-Next is hybrid, GDN plus full attention, so its QSA pool sits inside
+    HybridLinearKVPool, which has to hand the backend the indexer state and take
+    the triple back."""
+
+    FULL_LAYERS = [3, 7]
+    QSA_KWARGS = dict(
+        head_num=1,
+        head_dim=128,
+        indexer_key_dim=IDX_DIM,
+        num_indexer_layers=2,
+        compress_ratio=RATIO,
+        max_reqs=8,
+    )
+
+    def _hybrid(self):
+        return HybridLinearKVPool(
+            size=PAGE_SIZE * 8,
+            page_size=PAGE_SIZE,
+            dtype=jnp.bfloat16,
+            full_attention_layer_ids=self.FULL_LAYERS,
+            mesh=_mesh(),
+            token_to_kv_pool_class=QSATokenToKVPool,
+            **self.QSA_KWARGS,
+        )
+
+    def test_the_indexer_state_passes_through(self):
+        hybrid = self._hybrid()
+        inner = hybrid.full_kv_pool
+        self.assertIs(hybrid.get_compressed_key_buffer(1), inner.get_compressed_key_buffer(1))
+        self.assertIs(hybrid.get_open_group_buffer(0), inner.get_open_group_buffer(0))
+
+        hybrid.replace_buffer(
+            (
+                list(inner.kv_buffer),
+                [jnp.full_like(b, 2) for b in inner.compressed_key_buffer],
+                [jnp.full_like(b, 3) for b in inner.open_group_buffer],
+            )
+        )
+        self.assertEqual(float(hybrid.get_compressed_key_buffer(1)[0, 0, 0, 0]), 2.0)
+        self.assertEqual(float(hybrid.get_open_group_buffer(0)[0, 0, 0]), 3.0)
+
+    def test_the_kv_list_in_the_triple_is_still_length_checked(self):
+        hybrid = self._hybrid()
+        with self.assertRaisesRegex(ValueError, "compacted list"):
+            hybrid.replace_buffer((list(hybrid.full_kv_pool.kv_buffer)[:1], [], []))
+
+    def test_the_factory_wraps_qsa_but_not_dsa(self):
+        """The hybrid wrapper forwards QSA's accessors, not the DSA indexer's."""
+        runner = SimpleNamespace(
+            linear_recurrent_config=SimpleNamespace(full_attention_layer_ids=self.FULL_LAYERS),
+            max_total_num_tokens=PAGE_SIZE * 8,
+            page_size=PAGE_SIZE,
+            kv_cache_dtype=jnp.bfloat16,
+            mesh=_mesh(),
+        )
+        wrap = ModelRunnerKVCacheMixin._maybe_wrap_hybrid_kv_pool
+        pool = wrap(runner, QSATokenToKVPool, **self.QSA_KWARGS)
+        self.assertIsInstance(pool, HybridLinearKVPool)
+        self.assertIsInstance(pool.full_kv_pool, QSATokenToKVPool)
+        with self.assertRaisesRegex(AssertionError, "dsa_sparse"):
+            wrap(runner, MLATokenToKVPool, num_indexer_layers=1)
 
 
 if __name__ == "__main__":

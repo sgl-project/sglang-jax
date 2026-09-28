@@ -3,7 +3,10 @@
 Runs in the ``unit-test-cpu`` suite. The indexer, the paging and the kernels
 are pinned by their own tests; these pin what the backend adds around them --
 which inputs a QSA layer requires, what each data-parallel rank reads, and the
-cache layout and page table each kernel is handed.
+cache layout, page table and batch segmentation each kernel is handed.
+
+The selection goes through the real ``streamindex_topk`` dispatcher. Only its
+Pallas launch, which cannot run on CPU, is replaced (``_scores_launch``).
 
 Two CPU devices, so that a data-parallel batch can run on two ranks.
 
@@ -26,14 +29,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
+from jax.experimental import pallas as pl
 from jax.sharding import AxisType, Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.kernels.dsa import streamindex_topk
 from sgl_jax.srt.kernels.qsa.ref import sparse_gqa_attention_ref
 from sgl_jax.srt.kernels.qsa.sparse_gqa_attention import sparse_gqa_attention
 from sgl_jax.srt.layers.attention import qsa_sparse_backend
 from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
-from sgl_jax.srt.layers.attention.qsa_indexer import QSAIndexer, select_blocks
+from sgl_jax.srt.layers.attention.qsa_indexer import QSAIndexer
 from sgl_jax.srt.layers.attention.qsa_sparse_backend import QSASparseAttentionBackend
 from sgl_jax.srt.layers.embeddings import RotaryEmbedding
 from sgl_jax.srt.mem_cache.memory_pool import QSATokenToKVPool
@@ -46,6 +51,7 @@ SPECS = {
     "q": P("data", "tensor", None),
     "indexer_q": P("data", None, None),
     "indexer_k": P("data", None),
+    "kv_new": P("data", "tensor", None),
     "compressed": P("data", None, None, None),
     "kv": P("data", None, "tensor", None, None),
     "ring": P(None, None, None),
@@ -69,13 +75,15 @@ def _abstract(mesh, shape, spec, dtype=jnp.bfloat16):
     return jax.ShapeDtypeStruct(shape, dtype, sharding=NamedSharding(mesh, spec))
 
 
-def _rank_metadata(seq_lens, page_size, pages_per_seq, rng):
-    """One rank's FlashAttention decode metadata, and the table it encodes.
+def _rank_metadata(seq_lens, q_lens, page_size, pages_per_seq, rng):
+    """One rank's FlashAttention metadata, and the table it encodes.
 
     The metadata's page list is packed: request ``i`` holds only the pages it
     needs, from ``cu_kv_lens[i] // page_size``. The returned ``i32[S,
     pages_per_seq]`` table is the fixed-stride view of the same pages. Page ids
-    are the rank's own, starting after the reserved page 0.
+    are the rank's own, starting after the reserved page 0. ``distribution`` is
+    what FlashAttention builds: ``(n, n, n)`` for decode, ``(0, n, n)`` for an
+    extend.
     """
     n_seqs = len(seq_lens)
     physical = rng.permutation(np.arange(1, 1 + n_seqs * pages_per_seq)).astype(np.int32)
@@ -86,12 +94,13 @@ def _rank_metadata(seq_lens, page_size, pages_per_seq, rng):
         start, n = cu_kv[i] // page_size, -(-n_tokens // page_size)
         packed[start : start + n] = table[i, :n] = physical[start : start + n]
         cu_kv[i + 1] = cu_kv[i] + n * page_size
+    decode = all(n == 1 for n in q_lens)
     metadata = {
         "seq_lens": np.asarray(seq_lens, np.int32),
         "page_indices": packed,
         "cu_kv_lens": cu_kv,
-        "cu_q_lens": np.arange(n_seqs + 1, dtype=np.int32),
-        "distribution": np.full((3,), n_seqs, np.int32),
+        "cu_q_lens": np.concatenate([[0], np.cumsum(q_lens)]).astype(np.int32),
+        "distribution": np.asarray([n_seqs if decode else 0, n_seqs, n_seqs], np.int32),
     }
     return metadata, table
 
@@ -145,21 +154,140 @@ def _rotary():
     )
 
 
-def _reference_selection(*args, **kwargs):
-    return select_blocks(*args, **{**kwargs, "use_kernel": False})
+def _scores_launch(kernel, *, out_shape, **_):
+    """What one ``_scores_kernel`` launch computes, in JAX.
+
+    ``streamindex_topk`` splits the batch into segments and launches its
+    kernel once per segment. A launch scores the requests in ``[start, end)``:
+    the first ``static_q_len`` queries of each, or all of them when that is
+    None. Each query sees the entries its position has closed, read through the
+    fixed-stride page table. Rows the launch does not reach keep what the
+    previous launch left, which starts as ``-inf``.
+    """
+    static_q_len = kernel.keywords["static_q_len"]
+    ratio = kernel.keywords["compression_ratio"]
+
+    def launch(
+        seq_lens, page_indices, cu_q_lens, start_end, _sems, _rows, q, weights, cache, scores
+    ):
+        n_seqs = seq_lens.shape[0]
+        n_pages, rows_per_page, packing, dim = cache.shape
+        pages_per_seq = page_indices.shape[0] // n_seqs
+        keys = cache.reshape(n_pages, rows_per_page * packing, dim)[
+            page_indices.reshape(n_seqs, pages_per_seq)
+        ].reshape(n_seqs, -1, dim)
+
+        token = jnp.arange(q.shape[0])
+        seq = jnp.clip(jnp.searchsorted(cu_q_lens[1:], token, side="right"), 0, n_seqs - 1)
+        q_len = cu_q_lens[seq + 1] - cu_q_lens[seq]
+        offset = token - cu_q_lens[seq]
+        n_scored = q_len if static_q_len is None else jnp.minimum(q_len, static_q_len)
+        launched = (seq >= start_end[0]) & (seq < start_end[1]) & (offset < n_scored)
+
+        q_pos = seq_lens[seq] - q_len + offset
+        s = jnp.einsum(
+            "thd,ted->the",
+            q.astype(jnp.float32),
+            keys[seq].astype(jnp.float32),
+            precision=jax.lax.Precision.HIGHEST,
+        )
+        s = (jnp.maximum(s, 0.0) * weights[:, :, None]).sum(axis=1)
+        entry = jnp.arange(s.shape[1])[None, :]
+        visible = (entry < (seq_lens[seq] // ratio)[:, None]) & (
+            entry < ((q_pos + 1) // ratio)[:, None]
+        )
+        s = jnp.where(visible, s, -jnp.inf)
+        width = out_shape.shape[1] * out_shape.shape[2]
+        s = jnp.pad(s, ((0, 0), (0, width - s.shape[1])), constant_values=-jnp.inf)
+        return jnp.where(launched[:, None, None], s.reshape(out_shape.shape), scores)
+
+    return launch
+
+
+class _PallasWithoutLaunch:
+    """``pallas`` as the selector module sees it, with the launch replaced."""
+
+    pallas_call = staticmethod(_scores_launch)
+
+    def __getattr__(self, name):
+        return getattr(pl, name)
 
 
 def _cpu_kernels():
-    """The selection kernel cannot run on CPU, so it becomes the reference,
-    which walks the same table the same way; attention runs interpreted."""
+    """The selector's dispatch runs for real; attention runs interpreted."""
     return (
-        mock.patch.object(qsa_sparse_backend, "select_blocks", _reference_selection),
+        mock.patch.object(streamindex_topk, "pl", _PallasWithoutLaunch()),
         mock.patch.object(
             qsa_sparse_backend,
             "sparse_gqa_attention",
             functools.partial(sparse_gqa_attention, interpret=True),
         ),
     )
+
+
+class _Rank:
+    """One data-parallel rank's step: its requests, its pages, its tokens.
+
+    ``q_lens`` defaults to one token per request, a decode step.
+    """
+
+    PAGE_SIZE, PAGES_PER_SEQ = 16, 5
+    HEADS, HEAD_DIM, IDX_HEADS, IDX_DIM = 2, 128, 4, 128
+    N_PAGES = 1 + 2 * PAGES_PER_SEQ
+
+    def __init__(self, seq_lens, slots, rng, q_lens=None):
+        q_lens = q_lens or [1] * len(seq_lens)
+        self.metadata, self.table = _rank_metadata(
+            seq_lens, q_lens, self.PAGE_SIZE, self.PAGES_PER_SEQ, rng
+        )
+        n = sum(q_lens)
+        self.positions = np.concatenate(
+            [np.arange(s - q, s, dtype=np.int32) for s, q in zip(seq_lens, q_lens)]
+        )
+        self.token_to_req = np.repeat(np.arange(len(q_lens), dtype=np.int32), q_lens)
+        self.slots = np.asarray(slots, np.int32)
+        self.q = rng.standard_normal((n, self.HEADS, self.HEAD_DIM), np.float32)
+        self.indexer_q = rng.standard_normal((n, self.IDX_HEADS, self.IDX_DIM), np.float32)
+        self.indexer_k = rng.standard_normal((n, self.IDX_DIM), np.float32)
+        self.compressed = rng.standard_normal(
+            (self.N_PAGES, self.PAGE_SIZE // RATIO, 1, self.IDX_DIM), np.float32
+        )
+        self.kv = rng.standard_normal(
+            (self.N_PAGES, self.PAGE_SIZE, 2, 1, self.HEAD_DIM), np.float32
+        )
+
+    def slots_of_tokens(self):
+        """Each token's KV cache slot, ``page * PAGE_SIZE + offset``."""
+        page = self.table[self.token_to_req, self.positions // self.PAGE_SIZE]
+        return page * self.PAGE_SIZE + self.positions % self.PAGE_SIZE
+
+    def expected_selection(self, compressed, block_topk):
+        """Each query's top blocks among those its position has closed."""
+        keys = compressed.reshape(self.N_PAGES, -1, self.IDX_DIM)
+        ids = np.full((len(self.positions), block_topk), -1, np.int32)
+        for t, (req, pos) in enumerate(zip(self.token_to_req, self.positions)):
+            visible = keys[self.table[req]].reshape(-1, self.IDX_DIM)[: (pos + 1) // RATIO]
+            scores = np.maximum(self.indexer_q[t] @ visible.T, 0.0).sum(axis=0)
+            top = np.argsort(-scores)[:block_topk]
+            ids[t, : len(top)] = top
+        return ids
+
+    def expected_attention(self, block_ids, kv):
+        return sparse_gqa_attention_ref(
+            jnp.asarray(self.q),
+            jnp.asarray(block_ids),
+            jnp.asarray(self.positions),
+            jnp.asarray(kv[:, :, 0]),
+            jnp.asarray(kv[:, :, 1]),
+            jnp.asarray(self.table),
+            jnp.asarray(self.token_to_req),
+            compress_ratio=RATIO,
+            sm_scale=self.HEAD_DIM**-0.5,
+        )
+
+
+def _relative_error(got, want):
+    return float(jnp.max(jnp.abs(got - want))) / float(jnp.max(jnp.abs(want)))
 
 
 class TestIndexerInputs(unittest.TestCase):
@@ -185,56 +313,6 @@ class TestIndexerInputs(unittest.TestCase):
         result, dense = self._call(1)
         self.assertEqual(result, "dense")
         dense.assert_called_once()
-
-    def test_dense_prefill_still_writes_the_indexer_cache(self):
-        """Prefill is dense by default, but the decode steps after it select
-        from the compressed keys it leaves behind, so it must write them."""
-        mesh = _mesh()
-        page_size, idx_dim = 16, _Rank.IDX_DIM
-        backend = _backend(mesh, num_heads=2, head_dim=128, page_size=page_size, block_topk=2)
-        metadata = {
-            "seq_lens": np.asarray([8], np.int32),
-            "page_indices": np.asarray([1], np.int32),
-            "cu_kv_lens": np.asarray([0, page_size], np.int32),
-            "cu_q_lens": np.asarray([0, 8], np.int32),
-            "distribution": np.asarray([0, 1, 1], np.int32),
-        }
-        backend.forward_metadata = _metadata(mesh, [metadata])
-        compressed = _put(
-            mesh, np.zeros((2, page_size // RATIO, 1, idx_dim), np.float32), SPECS["compressed"]
-        )
-        pool = SimpleNamespace(
-            get_compressed_key_buffer=lambda slot: compressed,
-            get_open_group_buffer=lambda slot: _put(
-                mesh, np.zeros((4, RATIO, idx_dim), np.float32), SPECS["ring"]
-            ),
-        )
-        forward_batch = SimpleNamespace(
-            forward_mode=SimpleNamespace(is_decode=lambda: False),
-            positions=_put(mesh, np.arange(8, dtype=np.int32), SPECS["per_token"]),
-            req_pool_indices=_put(mesh, np.asarray([2], np.int32), SPECS["per_token"]),
-        )
-        layer = SimpleNamespace(layer_id=0, head_dim=128, scaling=None)
-        rng = np.random.default_rng(0)
-        dense = mock.MagicMock(return_value=("out", "kv"))
-        with mock.patch.object(FlashAttention, "__call__", dense), jax.set_mesh(mesh):
-            out, fused = backend(
-                None,
-                None,
-                None,
-                layer,
-                forward_batch,
-                pool,
-                indexer_q=_put(mesh, rng.standard_normal((8, 4, idx_dim)), SPECS["indexer_q"]),
-                indexer_k=_put(mesh, rng.standard_normal((8, idx_dim)), SPECS["indexer_k"]),
-                indexer=_indexer(mesh),
-                indexer_rotary_emb=_rotary(),
-            )
-
-        self.assertEqual((out, fused.kv), ("out", "kv"))
-        written = np.abs(np.asarray(fused.compressed)[1, :, 0]).sum(axis=-1) > 0
-        # Eight tokens close groups 0 and 1, the first two entries of page 1.
-        np.testing.assert_array_equal(written, [True, True, False, False])
 
 
 class TestSparsePath(unittest.TestCase):
@@ -267,7 +345,7 @@ class TestSparsePath(unittest.TestCase):
                     block_topk=512,
                 )
                 metadata, _ = _rank_metadata(
-                    seq_lens, page_size, pages_per_seq, np.random.default_rng(0)
+                    seq_lens, [1] * n_seqs, page_size, pages_per_seq, np.random.default_rng(0)
                 )
                 backend.forward_metadata = _metadata(mesh, [metadata])
                 compressed_shape = QSATokenToKVPool._compressed_cache_shape(
@@ -296,83 +374,111 @@ class TestSparsePath(unittest.TestCase):
         reads another request's pages.
         """
         mesh = _mesh()
-        rng = np.random.default_rng(0)
-        page_size, pages_per_seq, block_topk = 16, 5, 2
-        num_heads, head_dim, idx_heads, idx_dim = 2, 128, 4, 16
-        seq_lens = [40, 72]
-        n_seqs, n_pages = len(seq_lens), 1 + len(seq_lens) * pages_per_seq
-        metadata, table = _rank_metadata(seq_lens, page_size, pages_per_seq, rng)
-
-        # fp32, so packing is 1 and K and V sit on separate head-axis entries.
-        compressed = rng.standard_normal((n_pages, page_size // RATIO, 1, idx_dim), np.float32)
-        kv = rng.standard_normal((n_pages, page_size, 2, 1, head_dim), np.float32)
-        q = rng.standard_normal((n_seqs, num_heads, head_dim), np.float32)
-        indexer_q = rng.standard_normal((n_seqs, idx_heads, idx_dim), np.float32)
-        positions = np.asarray(seq_lens, np.int32) - 1
-
-        want_ids = np.zeros((n_seqs, block_topk), np.int32)
-        for r, n_tokens in enumerate(seq_lens):
-            keys = compressed[table[r]].reshape(-1, idx_dim)[: n_tokens // RATIO]
-            scores = np.maximum(indexer_q[r] @ keys.T, 0.0).sum(axis=0)
-            want_ids[r] = np.argsort(-scores)[:block_topk]
-        want = sparse_gqa_attention_ref(
-            jnp.asarray(q),
-            jnp.asarray(want_ids),
-            jnp.asarray(positions),
-            jnp.asarray(kv[:, :, 0]),
-            jnp.asarray(kv[:, :, 1]),
-            jnp.asarray(table),
-            jnp.arange(n_seqs, dtype=jnp.int32),
-            compress_ratio=RATIO,
-            sm_scale=head_dim**-0.5,
+        rank = _Rank([40, 72], [0, 1], np.random.default_rng(0))
+        block_topk = 2
+        want = rank.expected_attention(
+            rank.expected_selection(rank.compressed, block_topk), rank.kv
         )
 
         backend = _backend(
             mesh,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            page_size=page_size,
+            num_heads=_Rank.HEADS,
+            head_dim=_Rank.HEAD_DIM,
+            page_size=_Rank.PAGE_SIZE,
             block_topk=block_topk,
         )
-        backend.forward_metadata = _metadata(mesh, [metadata])
-        layer = SimpleNamespace(layer_id=0, head_dim=head_dim, scaling=None)
-        forward_batch = SimpleNamespace(positions=_put(mesh, positions, SPECS["per_token"]))
+        backend.forward_metadata = _metadata(mesh, [rank.metadata])
+        layer = SimpleNamespace(layer_id=0, head_dim=_Rank.HEAD_DIM, scaling=None)
+        forward_batch = SimpleNamespace(positions=_put(mesh, rank.positions, SPECS["per_token"]))
         select_patch, attend_patch = _cpu_kernels()
         with select_patch, attend_patch, jax.set_mesh(mesh):
             got = backend._run_sparse(
-                _put(mesh, q, SPECS["q"]),
-                _put(mesh, indexer_q, SPECS["indexer_q"]),
-                _put(mesh, compressed, SPECS["compressed"]),
-                _put(mesh, kv, SPECS["kv"]),
+                _put(mesh, rank.q, SPECS["q"]),
+                _put(mesh, rank.indexer_q, SPECS["indexer_q"]),
+                _put(mesh, rank.compressed, SPECS["compressed"]),
+                _put(mesh, rank.kv, SPECS["kv"]),
                 layer,
                 forward_batch,
             )
 
-        err = float(jnp.max(jnp.abs(got - want))) / float(jnp.max(jnp.abs(want)))
-        self.assertLess(err, 1e-5)
+        self.assertLess(_relative_error(got, want), 1e-5)
 
+    def test_prefill_beyond_the_budget_attends_over_the_selection(self):
+        """An extend batch whose requests see more blocks than they may select.
 
-class _Rank:
-    """One data-parallel rank's decode step: its requests, its pages, its tokens."""
+        Request 0 is a fresh 24-token prompt, request 1 extends a 20-token
+        prefix by 9, and the budget is 2 blocks, so most queries have more
+        visible blocks than that. Every query must attend over its own top 2,
+        chosen from the compressed keys this step leaves in the cache, plus
+        its open group; the KV cache the gather reads must already hold the
+        step's own keys.
+        """
+        mesh = _mesh()
+        block_topk = 2
+        rank = _Rank([24, 29], [0, 1], np.random.default_rng(0), q_lens=[24, 9])
+        self.assertGreater(int(np.max((rank.positions + 1) // RATIO)), block_topk)
+        n_tokens = len(rank.positions)
+        rng = np.random.default_rng(1)
+        k = rng.standard_normal((n_tokens, 1, _Rank.HEAD_DIM), np.float32)
+        v = rng.standard_normal((n_tokens, 1, _Rank.HEAD_DIM), np.float32)
+        slots = rank.slots_of_tokens()
 
-    PAGE_SIZE, PAGES_PER_SEQ = 16, 5
-    HEADS, HEAD_DIM, IDX_HEADS, IDX_DIM = 2, 128, 4, 16
-    N_PAGES = 1 + 2 * PAGES_PER_SEQ
-
-    def __init__(self, seq_lens, slots, rng):
-        self.metadata, _ = _rank_metadata(seq_lens, self.PAGE_SIZE, self.PAGES_PER_SEQ, rng)
-        n = len(seq_lens)
-        self.positions = np.asarray(seq_lens, np.int32) - 1
-        self.slots = np.asarray(slots, np.int32)
-        self.q = rng.standard_normal((n, self.HEADS, self.HEAD_DIM), np.float32)
-        self.indexer_q = rng.standard_normal((n, self.IDX_HEADS, self.IDX_DIM), np.float32)
-        self.indexer_k = rng.standard_normal((n, self.IDX_DIM), np.float32)
-        self.compressed = rng.standard_normal(
-            (self.N_PAGES, self.PAGE_SIZE // RATIO, 1, self.IDX_DIM), np.float32
+        backend = _backend(
+            mesh,
+            num_heads=_Rank.HEADS,
+            head_dim=_Rank.HEAD_DIM,
+            page_size=_Rank.PAGE_SIZE,
+            block_topk=block_topk,
         )
-        self.kv = rng.standard_normal(
-            (self.N_PAGES, self.PAGE_SIZE, 2, 1, self.HEAD_DIM), np.float32
+        backend.forward_metadata = _metadata(mesh, [rank.metadata])
+        kv = {"buffer": _put(mesh, rank.kv, SPECS["kv"])}
+
+        def set_kv_buffer(layer_id, loc, k, v, is_decode):
+            self.assertFalse(is_decode)
+            buffer = np.array(kv["buffer"])
+            loc = np.asarray(loc)
+            page, offset = loc // _Rank.PAGE_SIZE, loc % _Rank.PAGE_SIZE
+            buffer[page, offset, 0, 0] = np.asarray(k)[:, 0]
+            buffer[page, offset, 1, 0] = np.asarray(v)[:, 0]
+            kv["buffer"] = _put(mesh, buffer, SPECS["kv"])
+
+        compressed = _put(mesh, rank.compressed, SPECS["compressed"])
+        rings = _put(mesh, np.zeros((4, RATIO, _Rank.IDX_DIM), np.float32), SPECS["ring"])
+        pool = SimpleNamespace(
+            get_compressed_key_buffer=lambda slot: compressed,
+            get_open_group_buffer=lambda slot: rings,
+            set_kv_buffer=set_kv_buffer,
+            get_fused_kv_buffer=lambda layer_id: kv["buffer"],
         )
+        forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_decode=lambda: False),
+            positions=_put(mesh, rank.positions, SPECS["per_token"]),
+            req_pool_indices=_put(mesh, rank.slots, SPECS["per_token"]),
+            out_cache_loc=_put(mesh, slots, SPECS["per_token"]),
+        )
+        layer = SimpleNamespace(layer_id=0, head_dim=_Rank.HEAD_DIM, scaling=None)
+        select_patch, attend_patch = _cpu_kernels()
+        with select_patch, attend_patch, jax.set_mesh(mesh):
+            out, fused = backend(
+                _put(mesh, rank.q, SPECS["q"]),
+                _put(mesh, k, SPECS["kv_new"]),
+                _put(mesh, v, SPECS["kv_new"]),
+                layer,
+                forward_batch,
+                pool,
+                indexer_q=_put(mesh, rank.indexer_q, SPECS["indexer_q"]),
+                indexer_k=_put(mesh, rank.indexer_k, SPECS["indexer_k"]),
+                indexer=_indexer(mesh),
+                indexer_rotary_emb=_rotary(),
+            )
+
+        want_kv = rank.kv.copy()
+        want_kv[slots // _Rank.PAGE_SIZE, slots % _Rank.PAGE_SIZE, 0, 0] = k[:, 0]
+        want_kv[slots // _Rank.PAGE_SIZE, slots % _Rank.PAGE_SIZE, 1, 0] = v[:, 0]
+        np.testing.assert_array_equal(np.asarray(fused.kv), want_kv)
+        want_ids = rank.expected_selection(np.asarray(fused.compressed), block_topk)
+        want = rank.expected_attention(want_ids, want_kv).reshape(n_tokens, -1)
+        self.assertLess(_relative_error(out, want), 1e-5)
 
 
 def _decode_step(ranks, rings, indexer, rotary):

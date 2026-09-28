@@ -670,8 +670,10 @@ class ModelRunnerKVCacheMixin:
             # `_validate_kv_pool_compatibility` owns the user-facing check at
             # dispatch. Keep this assertion as a defensive invariant in case a
             # future caller constructs a hybrid pool through this lower seam.
-            assert not kvcache_kwargs.get(
-                "num_indexer_layers"
+            # QSA's indexer cache is fine: the wrapper forwards its accessors.
+            assert not (
+                kvcache_kwargs.get("num_indexer_layers")
+                and token_to_kv_pool_class is MLATokenToKVPool
             ), "hybrid-recurrent models do not support --attention-backend dsa_sparse"
 
             return HybridLinearKVPool(

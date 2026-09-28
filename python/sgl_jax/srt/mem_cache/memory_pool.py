@@ -1996,20 +1996,32 @@ class HybridLinearKVPool(KVCache):
             self._to_physical(layer_id), loc, cache_k, cache_v, is_decode
         )
 
-    def replace_buffer(self, kv_buffer: list[jax.Array]) -> None:
+    def replace_buffer(self, kv_buffer) -> None:
         """Accept COMPACTED list (length L_full, in full_attention_layer_ids order).
 
         Differs from SWAKVPool.replace_buffer which expects full-length input —
         KDA layers don't write KV pool, so the model emits a compacted list.
+        An inner pool that also keeps an indexer cache takes a tuple led by that
+        list; it is passed through whole.
         """
-        if len(kv_buffer) != self.full_layer_nums:
+        kv = kv_buffer[0] if isinstance(kv_buffer, tuple) else kv_buffer
+        if len(kv) != self.full_layer_nums:
             raise ValueError(
                 f"HybridLinearKVPool.replace_buffer expects compacted list of "
                 f"length {self.full_layer_nums} "
                 f"(= len(full_attention_layer_ids)={self.full_attention_layer_ids}), "
-                f"got {len(kv_buffer)}"
+                f"got {len(kv)}"
             )
         self.full_kv_pool.replace_buffer(kv_buffer)
+
+    # QSA's compressed indexer cache and open-group ring. Both are indexed by
+    # indexer slot, not layer id, so they pass through untranslated.
+
+    def get_compressed_key_buffer(self, slot_id: int) -> jax.Array:
+        return self.full_kv_pool.get_compressed_key_buffer(slot_id)
+
+    def get_open_group_buffer(self, slot_id: int) -> jax.Array:
+        return self.full_kv_pool.get_open_group_buffer(slot_id)
 
     def get_kv_size_bytes(self):
         return self.full_kv_pool.get_kv_size_bytes()
