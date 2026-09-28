@@ -1,5 +1,5 @@
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from queue import Queue
 from types import SimpleNamespace
 
@@ -8,10 +8,17 @@ import numpy as np
 import pytest
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
-from sgl_jax.srt.managers.schedule_batch import ModelWorkerSamplingInfo
+from sgl_jax.srt.managers import scheduler_output_processor_mixin as output_processor
+from sgl_jax.srt.managers.schedule_batch import (
+    FINISH_ABORT,
+    ModelWorkerSamplingInfo,
+    Req,
+)
 from sgl_jax.srt.managers.scheduler import GenerationBatchResult, Scheduler
 from sgl_jax.srt.managers.tp_worker_overlap_thread import ModelWorkerClient
 from sgl_jax.srt.managers.tp_worker_overlap_v2 import ModelWorkerOverlap
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+from sgl_jax.srt.sampling.sampling_params import SamplingParams
 
 
 @pytest.fixture
@@ -165,7 +172,7 @@ def test_scheduler_can_prepare_placeholder_outputs_before_sampling_finishes(subm
 
     worker._launch_forward = forward
     worker._launch_sample = lambda context: ("logits", [11, 0, 22, 0], 7)
-    worker.resolve_last_batch_result = lambda logits, ids, batch, misses, barrier: (
+    worker.resolve_last_batch_result = lambda logits, ids, batch, misses: (
         logits,
         ids,
         misses,
@@ -186,6 +193,230 @@ def test_scheduler_can_prepare_placeholder_outputs_before_sampling_finishes(subm
         release.set()
     assert scheduler._resolve_overlap_v2_result(result) == ("logits", [11, 0, 22, 0], 7)
     assert result.launch_result is None
+
+
+def _make_result_processor(monkeypatch, *, prefill, terminal):
+    reqs = [
+        Req(
+            rid=f"rank-{rank}",
+            origin_input_text="",
+            origin_input_ids=[1],
+            sampling_params=SamplingParams(max_new_tokens=8),
+            dp_rank=rank,
+            eos_token_ids={2},
+            vocab_size=100,
+            return_output_logprob_only=True,
+        )
+        for rank in range(2)
+    ]
+    grammar_tokens = []
+    for rank, req in enumerate(reqs):
+        req.req_pool_idx = rank + 1
+        req.grammar = SimpleNamespace(
+            finished=False,
+            is_terminated=lambda: False,
+            accept_token=lambda token, rank=rank: grammar_tokens.append((rank, token)),
+        )
+    if terminal == "abort":
+        reqs[0].to_finish = FINISH_ABORT()
+    tokens = [2 if terminal == "eos" else 5, 6]
+    batch = SimpleNamespace(
+        dp_size=2,
+        per_dp_bs_size=1,
+        forward_mode=ForwardMode.EXTEND if prefill else ForwardMode.DECODE,
+        reqs_info=[SimpleNamespace(reqs=[req], decoding_reqs=[]) for req in reqs],
+        return_hidden_states=False,
+        return_logprob=False,
+        return_output_logprob_only=True,
+        batch_size=lambda: 2,
+        next_batch_sampling_info=None,
+    )
+    result = GenerationBatchResult(
+        logits_output=SimpleNamespace(
+            next_token_logprobs=[-0.1, -0.2], input_token_logprobs=None, hidden_states=None
+        ),
+        next_token_ids=tokens,
+        extend_input_len_per_req=None,
+        extend_logprob_start_len_per_req=None,
+        bid=42,
+        cache_miss_count=0,
+    )
+    scheduler = object.__new__(Scheduler)
+    scheduler.enable_overlap = scheduler.enable_overlap_v2 = True
+    scheduler.spec_algorithm = None
+    scheduler.is_generation = True
+    scheduler.pd = ""
+    scheduler.num_generated_tokens = scheduler.forward_ct_decode = 0
+    scheduler.server_args = SimpleNamespace(decode_log_interval=100)
+    scheduler._resolve_overlap_v2_result = lambda result: (
+        result.logits_output,
+        result.next_token_ids,
+        result.cache_miss_count,
+    )
+    resources = []
+    scheduler.tree_cache = SimpleNamespace(
+        cache_unfinished_req=lambda req: resources.append(("cache", req.rid))
+    )
+    scheduler.maybe_collect_routed_experts = lambda req: resources.append(("experts", req.rid))
+    scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+        free_group_begin=lambda: None, free_group_end=lambda: None
+    )
+    monkeypatch.setattr(
+        output_processor,
+        "_complete_precision_trace",
+        lambda req: resources.append(("trace", req.rid)),
+    )
+    monkeypatch.setattr(
+        output_processor,
+        "release_kv_cache",
+        lambda req, *args, **kwargs: resources.append(("release", req.rid)),
+    )
+    streamed = []
+    scheduler.stream_output = lambda *args, **kwargs: streamed.append(True)
+    return scheduler, batch, result, reqs, grammar_tokens, resources, streamed
+
+
+@pytest.mark.parametrize("prefill", [False, True])
+@pytest.mark.parametrize("terminal", ["eos", "abort"])
+@pytest.mark.parametrize("submission_fails", [False, True])
+def test_cpu_results_precede_resource_barrier(monkeypatch, prefill, terminal, submission_fails):
+    scheduler, batch, result, reqs, grammar, resources, streamed = _make_result_processor(
+        monkeypatch, prefill=prefill, terminal=terminal
+    )
+    reached_barrier = threading.Event()
+    submitted = Future()
+
+    def wait():
+        reached_barrier.set()
+        submitted.result(timeout=5)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        processing = executor.submit(
+            scheduler.process_batch_result, batch, result, SimpleNamespace(wait=wait)
+        )
+        try:
+            assert reached_barrier.wait(5)
+            # A terminal request on the first DP rank must not delay CPU work
+            # on the second rank, but shared resources and outputs stay fenced.
+            assert [req.output_ids for req in reqs] == [[result.next_token_ids[0]], [6]]
+            assert [req.output_token_logprobs_val for req in reqs] == [[-0.1], [-0.2]]
+            assert grammar == [(0, result.next_token_ids[0]), (1, 6)]
+            assert reqs[0].finished() and not reqs[1].finished()
+            assert not processing.done()
+            assert resources == streamed == []
+        finally:
+            if submission_fails:
+                submitted.set_exception(RuntimeError("submission failed"))
+            else:
+                submitted.set_result(None)
+        if submission_fails:
+            with pytest.raises(RuntimeError, match="submission failed"):
+                processing.result(timeout=5)
+            assert resources == streamed == []
+        else:
+            processing.result(timeout=5)
+            assert resources == [
+                ("experts", "rank-0"),
+                ("trace", "rank-0"),
+                ("release", "rank-0"),
+            ] + ([("cache", "rank-1")] if prefill else [])
+            assert streamed == [True]
+
+
+def test_live_decode_does_not_wait_for_current_submission(monkeypatch):
+    scheduler, batch, result, reqs, grammar, resources, streamed = _make_result_processor(
+        monkeypatch, prefill=False, terminal=None
+    )
+
+    def unexpected_wait():
+        pytest.fail("CPU-only result processing waited for current forward submission")
+
+    scheduler.process_batch_result(batch, result, SimpleNamespace(wait=unexpected_wait))
+    assert [req.output_ids for req in reqs] == [[5], [6]]
+    assert grammar == [(0, 5), (1, 6)]
+    assert resources == []
+    assert streamed == [True]
+
+
+def test_chunk_abort_keeps_resources_owned_until_after_cpu_bookkeeping(monkeypatch):
+    scheduler, batch, result, reqs, grammar, resources, streamed = _make_result_processor(
+        monkeypatch, prefill=True, terminal="abort"
+    )
+    reqs[0].is_chunked = 1
+    scheduler.chunked_reqs = [reqs[0], None]
+    scheduler._pending_chunked_abort_reqs = [reqs[0], None]
+    scheduler._release_prefill_host_buffer = lambda req: resources.append(("host", req.rid))
+
+    def wait():
+        assert reqs[0].is_chunked == 0
+        assert not reqs[0].finished()
+        assert scheduler.chunked_reqs[0] is reqs[0]
+        assert scheduler._pending_chunked_abort_reqs[0] is reqs[0]
+        assert reqs[1].output_ids == [6]
+        assert reqs[1].output_token_logprobs_val == [-0.2]
+        assert grammar == [(1, 6)]
+        assert resources == streamed == []
+
+    scheduler.process_batch_result(batch, result, SimpleNamespace(wait=wait))
+    assert reqs[0].finished()
+    assert scheduler.chunked_reqs == scheduler._pending_chunked_abort_reqs == [None, None]
+    assert resources == [
+        ("trace", "rank-0"),
+        ("host", "rank-0"),
+        ("release", "rank-0"),
+        ("cache", "rank-1"),
+    ]
+    assert streamed == [True]
+
+
+def test_sample_enqueues_before_barrier_and_next_round_waits():
+    scheduler = object.__new__(Scheduler)
+    calls = []
+    waited = False
+    batch = SimpleNamespace(copy=lambda: batch)
+
+    def wait():
+        nonlocal waited
+        assert calls == ["receive", "input", "prepare", "forward", "result", "sample"]
+        calls.append("barrier")
+        waited = True
+
+    def receive():
+        if waited:
+            raise StopIteration
+        calls.append("receive")
+        return []
+
+    scheduler._comm_backend = None
+    scheduler.recv_requests = receive
+    scheduler.select_dp_for_request = lambda reqs: reqs
+    scheduler.process_input_requests = lambda reqs: calls.append("input")
+    scheduler._engine_paused = False
+    scheduler.get_next_batch_to_run = lambda: (calls.append("prepare"), batch)[1]
+    scheduler._pending_h2d = []
+    scheduler._launch_batch_forward = lambda batch: (
+        calls.append("forward"),
+        SimpleNamespace(wait=wait),
+    )[1]
+    scheduler.last_batch = object()
+
+    def process(batch, result, barrier):
+        calls.append("result")
+        assert not waited
+
+    # The loop owns the deque; seed one previous result at the forward boundary.
+    forward = scheduler._launch_batch_forward
+
+    def launch(batch):
+        scheduler.result_queue.append((scheduler.last_batch, object()))
+        return forward(batch)
+
+    scheduler._launch_batch_forward = launch
+    scheduler.process_batch_result = process
+    scheduler._launch_batch_sample = lambda batch, context: calls.append("sample")
+    with pytest.raises(StopIteration):
+        scheduler._event_loop_overlap_v2()
+    assert calls[-1] == "barrier"
 
 
 def _make_logits_output():
@@ -239,14 +470,11 @@ def _resolve_with_legacy_path(logits_output, next_token_ids, batch):
 
 def _resolve_with_v2_path(logits_output, next_token_ids, batch):
     worker = object.__new__(ModelWorkerOverlap)
-    launch_done = threading.Event()
-    launch_done.set()
     return worker.resolve_last_batch_result(
         logits_output,
         next_token_ids,
         batch,
         7,
-        launch_done,
     )
 
 

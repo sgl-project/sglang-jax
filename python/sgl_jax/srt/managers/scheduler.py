@@ -1182,6 +1182,12 @@ class Scheduler(
 
             self.last_batch = batch
 
+            if context is not None:
+                # Result CPU work and sample enqueue can overlap forward submission.
+                # The next iteration may release/allocate slots or touch donated
+                # pools during request handling and batch preparation.
+                context.wait()
+
     def run_publisher(self, recv_reqs):
         retry_count = 0
         while retry_count < 3:
@@ -2766,7 +2772,7 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
                 if self.enable_overlap_v2:
-                    self._resolve_overlap_v2_result(result, launch_done)
+                    self._resolve_overlap_v2_result(result)
                 else:
                     self.tp_worker.resolve_last_batch_result(launch_done)
                 self.set_next_batch_sampling_info_done(batch)
