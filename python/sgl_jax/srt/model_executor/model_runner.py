@@ -320,6 +320,26 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
         jitted_sampler = make_jitted_sampler(base_rng_key, sampler_compiler_options)
 
+        # Retain the serving JIT definitions for compile-only preparation.
+        # Warmup still calls the ordinary wrappers and threads donated pools.
+        self._lower_model = lambda batch, metadata: jitted_run_model.lower(
+            model_def,
+            model_state_def,
+            self.model_state_leaves,
+            batch,
+            self.memory_pools,
+            metadata,
+        )
+        self._lower_sampler = lambda logits, metadata: jitted_sampler.lower(
+            sampler_def,
+            sampler_state_def,
+            sampler_state_leaves,
+            self._sampler_step,
+            logits,
+            metadata,
+        )
+        self._lower_compute_logprobs = partial(jitted_compute_logprobs.lower, self.mesh)
+
         aot_model_dir = self.server_args.aot_model_dir
         executable_store = None
         if aot_model_dir:
@@ -327,9 +347,8 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
             executable_store = ExecutableStore(aot_model_dir, self.mesh)
 
-        # Offline loading and parallel precompile share a per-shape executable
-        # cache. Serial compilation retains the ordinary pjit path unless the
-        # user also requests the optional fast dispatch optimization.
+        # Offline loading and opt-in AOT dispatch share an executable cache.
+        # Parallel precompile also warms JAX's cache for the ordinary pjit path.
         use_aot_dispatch = aot_dispatch_requested()
         self.parallel_precompile = (
             self.server_args.precompile_num_threads > 1
@@ -352,7 +371,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             )
             use_aot_dispatch = False
 
-        if use_aot_dispatch or executable_store is not None or self.parallel_precompile:
+        if use_aot_dispatch or executable_store is not None:
             self._run_model_dispatcher = AotDispatcher(
                 jitted_run_model,
                 stable_call_args=(model_def, model_state_def, self.model_state_leaves),
@@ -363,7 +382,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 ),
                 executable_store=executable_store,
                 allow_fast_dispatch=use_aot_dispatch,
-                precompile=self.parallel_precompile,
             )
 
             def run_model_wrapper(forward_batch, logits_metadata):
@@ -396,7 +414,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
             self.jitted_run_model = run_model_wrapper
 
-        if use_aot_dispatch or executable_store is not None or self.parallel_precompile:
+        if use_aot_dispatch or executable_store is not None:
             self._sampler_dispatcher = AotDispatcher(
                 jitted_sampler,
                 stable_call_args=(
@@ -409,7 +427,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 compiler_options_fn=lambda _: sampler_compiler_options,
                 executable_store=executable_store,
                 allow_fast_dispatch=use_aot_dispatch,
-                precompile=self.parallel_precompile,
             )
 
             self.jitted_sampler = self._sampler_dispatcher
@@ -421,7 +438,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 sampler_state_leaves,
             )
 
-        if executable_store is not None or self.parallel_precompile:
+        if executable_store is not None:
             self.jitted_compute_logprobs = AotDispatcher(
                 jitted_compute_logprobs,
                 stable_call_args=(self.mesh,),
@@ -429,7 +446,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 name="compute_logprobs",
                 executable_store=executable_store,
                 allow_fast_dispatch=use_aot_dispatch,
-                precompile=self.parallel_precompile,
             )
         else:
             self.jitted_compute_logprobs = partial(jitted_compute_logprobs, self.mesh)
@@ -881,20 +897,37 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.attn_backend.forward_metadata = self.attn_backend.get_forward_metadata(batch)
         logits_metadata = LogitsMetadata.from_model_worker_batch(batch, self.mesh)
         with jax.set_mesh(self.mesh):
-            self._run_model_dispatcher.precompile(
-                pool,
-                batch.forward_batch,
-                self.memory_pools,
-                logits_metadata,
+            dispatcher = getattr(self, "_run_model_dispatcher", None)
+            if dispatcher is not None:
+                dispatcher.precompile(
+                    pool,
+                    batch.forward_batch,
+                    self.memory_pools,
+                    logits_metadata,
+                    on_compiled=on_compiled,
+                )
+            else:
+                pool.submit(
+                    lambda: self._lower_model(batch.forward_batch, logits_metadata),
+                    on_compiled=on_compiled,
+                )
+
+    def precompile_sampling(self, pool, logits, sampling_metadata, on_compiled):
+        # Match sample() without entering a mesh context. Even set_mesh(None)
+        # changes JAX's trace cache key relative to an ordinary serving call.
+        dispatcher = getattr(self, "_sampler_dispatcher", None)
+        if dispatcher is not None:
+            dispatcher.precompile(
+                pool, self._sampler_step, logits, sampling_metadata, on_compiled=on_compiled
+            )
+        else:
+            pool.submit(
+                lambda: self._lower_sampler(logits, sampling_metadata),
                 on_compiled=on_compiled,
             )
 
-    def precompile_sampling(self, pool, logits, sampling_metadata, on_compiled):
-        # Match sample(), which executes outside the explicit model mesh.
-        with jax.set_mesh(None):
-            self._sampler_dispatcher.precompile(
-                pool, self._sampler_step, logits, sampling_metadata, on_compiled=on_compiled
-            )
+    def precompile_logprobs(self, pool, logprobs, tokens):
+        pool.submit(lambda: self._lower_compute_logprobs(logprobs, tokens))
 
     def _forward(
         self,

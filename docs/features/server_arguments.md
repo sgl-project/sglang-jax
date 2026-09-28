@@ -183,8 +183,8 @@ For the compiled model path, see [Global JIT Compile](global_jit_compile.md). Fo
 Parallel precompile keeps JAX lowering and device warmup serial. At most
 `--precompile-num-threads` lowered graphs are queued or compiling, and all required
 executables finish before warmup. Compilation errors fail startup. Online
-precompile uses the shared executable dispatcher; the optional
-`SGLANG_JAX_AOT_DISPATCH` fast dispatch setting is unchanged. Speculative decoding,
+precompile warms the existing JIT cache; the optional `SGLANG_JAX_AOT_DISPATCH`
+setting and serving dispatch path are unchanged. Speculative decoding,
 LoRA, multimodal models, and offline executable loading retain serial warmup.
 More workers can increase peak host memory; measure cold startup with the same
 buckets before increasing this limit.

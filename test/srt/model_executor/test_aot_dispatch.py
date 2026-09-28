@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ["SGLANG_JAX_AOT_DISPATCH"] = "1"  # force-on regardless of arg count
@@ -17,6 +18,67 @@ from sgl_jax.srt.model_executor.aot_dispatch import AotDispatcher
 
 
 class TestAotDispatcher(unittest.TestCase):
+    def test_helper_precompile_matches_serving_mesh_context(self):
+        from sgl_jax.srt.model_executor.compilation_manager import CompilationPool
+        from sgl_jax.srt.model_executor.model_runner import ModelRunner
+
+        mesh = jax.sharding.Mesh(
+            np.array(jax.devices()[:1]),
+            ("x",),
+            axis_types=(jax.sharding.AxisType.Explicit,),
+        )
+        value = jax.device_put(
+            np.arange(4, dtype=np.float32),
+            jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("x")),
+        )
+        model = jax.jit(lambda x: x * 2)
+        sampler = jax.jit(lambda x: x + 1)
+        logprob = jax.jit(lambda x, y: x + y)
+        runner = SimpleNamespace(
+            _lower_sampler=lambda logits, _: sampler.lower(logits),
+            _lower_compute_logprobs=logprob.lower,
+        )
+        outputs = []
+
+        def ready(_, compiled):
+            outputs.append(compiled.out_info)
+        with CompilationPool(2) as pool:
+            with jax.set_mesh(mesh):
+                pool.submit(lambda: model.lower(value), on_compiled=ready)
+            pool.flush()
+            ModelRunner.precompile_sampling(runner, pool, outputs[0], None, ready)
+            pool.flush()
+            ModelRunner.precompile_logprobs(runner, pool, outputs[1], outputs[1])
+        with patch(
+            "jax._src.compiler.backend_compile_and_load",
+            side_effect=AssertionError("Helper recompiled during serving warmup"),
+        ):
+            with jax.set_mesh(mesh):
+                logits = model(value)
+            tokens = sampler(logits)
+            np.testing.assert_array_equal(logprob(tokens, tokens), np.arange(4) * 4 + 2)
+
+    def test_parallel_precompile_preserves_jit_dispatch(self):
+        from sgl_jax.srt.model_executor.compilation_manager import CompilationPool
+
+        @partial(jax.jit, donate_argnums=(1,))
+        def f(value, buffer):
+            return value * 2, buffer + 1
+
+        inputs = [(jnp.arange(n, dtype=jnp.float32), jnp.zeros(n)) for n in (4, 8, 16)]
+        with CompilationPool(2) as pool:
+            for value, buffer in inputs:
+                pool.submit(lambda value=value, buffer=buffer: f.lower(value, buffer))
+        with patch(
+            "jax._src.compiler.backend_compile_and_load",
+            side_effect=AssertionError("Unexpected compilation after precompile"),
+        ):
+            for value, buffer in inputs:
+                for step in range(1, 4):
+                    result, buffer = f(value, buffer)
+                    np.testing.assert_array_equal(result, np.asarray(value) * 2)
+                    np.testing.assert_array_equal(buffer, np.full(value.shape, step))
+
     def test_parallel_precompile_then_serial_donation_without_compiling(self):
         from sgl_jax.srt.model_executor.compilation_manager import CompilationPool
 
@@ -25,11 +87,9 @@ class TestAotDispatcher(unittest.TestCase):
             return weight * value, pool + 1
 
         weight = jnp.array(2.0, dtype=jnp.float32)
-        dispatcher = AotDispatcher(
-            f, (weight,), (weight,), "precompile", allow_fast_dispatch=False, precompile=True
-        )
+        dispatcher = AotDispatcher(f, (weight,), (weight,), "precompile", allow_fast_dispatch=False)
         inputs = [(jnp.arange(n, dtype=jnp.float32), jnp.zeros(n)) for n in (4, 8, 16)]
-        with patch("sgl_jax.srt.model_executor.aot_dispatch._ENV", "0"):
+        with patch("sgl_jax.srt.model_executor.aot_dispatch._ENV", "1"):
             with CompilationPool(2) as pool:
                 for value, buffer in inputs:
                     dispatcher.precompile(pool, value, buffer)

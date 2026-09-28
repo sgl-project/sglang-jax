@@ -439,8 +439,9 @@ class CompilationManager:
             "[%s] Compiling buckets with %d XLA workers", mode.name, self.precompile_num_threads
         )
         sampling_inputs = []
+        sampling_signatures = set()
         with CompilationPool(self.precompile_num_threads) as pool:
-            for bs, tokens, cache_loc in self.iter_model_shapes(mode):
+            for bs, tokens, cache_loc in dict.fromkeys(self.iter_model_shapes(mode)):
                 batch = self._make_dummy_batch(
                     bs,
                     tokens,
@@ -452,27 +453,24 @@ class CompilationManager:
                 batch.forward_batch = ForwardBatch.init_new(batch, model_runner)
 
                 def ready(lowered, compiled, bs=bs):
-                    logits = jax.tree.map(
-                        lambda value, sharding: jax.ShapeDtypeStruct(
-                            value.shape, value.dtype, sharding=sharding
-                        ),
-                        lowered.out_info,
-                        compiled.output_shardings,
-                    )[0]
-                    sampling_inputs.append((bs, logits))
+                    # Include the concrete output layouts, not just shardings.
+                    # Otherwise JAX lowers the helper again for real arrays
+                    # during warmup, even when the StableHLO is identical.
+                    logits = compiled.out_info[0]
+                    leaves, tree = jax.tree_util.tree_flatten(logits)
+                    signature = (bs, tree, tuple(leaves))
+                    # Prefill token buckets often share one sampler shape.
+                    # Do not compile the same cached JAX lowering concurrently.
+                    if signature not in sampling_signatures:
+                        sampling_signatures.add(signature)
+                        sampling_inputs.append((bs, logits))
 
                 model_runner.precompile_model(pool, batch, ready)
             pool.flush()
             logprob_inputs = []
 
             def sampler_ready(lowered, compiled):
-                (tokens, logprobs, _), _ = jax.tree.map(
-                    lambda value, sharding: jax.ShapeDtypeStruct(
-                        value.shape, value.dtype, sharding=sharding
-                    ),
-                    lowered.out_info,
-                    compiled.output_shardings,
-                )
+                (tokens, logprobs, _), _ = compiled.out_info
                 logprob_inputs.append((logprobs, tokens))
 
             for bs, logits in sampling_inputs:
@@ -485,9 +483,14 @@ class CompilationManager:
                 )
                 model_runner.precompile_sampling(pool, logits, metadata, sampler_ready)
             pool.flush()
-            with jax.set_mesh(None):
-                for logprobs, tokens in logprob_inputs:
-                    model_runner.jitted_compute_logprobs.precompile(pool, logprobs, tokens)
+            logprob_signatures = set()
+            for logprobs, tokens in logprob_inputs:
+                leaves, tree = jax.tree_util.tree_flatten((logprobs, tokens))
+                signature = (tree, tuple(leaves))
+                if signature in logprob_signatures:
+                    continue
+                logprob_signatures.add(signature)
+                model_runner.precompile_logprobs(pool, logprobs, tokens)
 
     def _precompile_extend(
         self,

@@ -109,8 +109,6 @@ class AotDispatcher:
       executable_store: optional trusted offline artifacts; a miss is an error.
       allow_fast_dispatch: allow the environment-controlled execute_sharded path.
         Loading still works through checked compiled calls when disabled.
-      precompile: use checked compiled calls even when fast dispatch is disabled,
-        so startup can populate the executable cache without executing buffers.
 
     If the caller ever replaces the stable containers (LoRA / EPLB reload),
     it must call :meth:`invalidate` (or construct a new dispatcher); the
@@ -127,7 +125,6 @@ class AotDispatcher:
         compiler_options_fn=None,
         executable_store=None,
         allow_fast_dispatch=True,
-        precompile=False,
     ):
         self._jit_fn = jit_fn
         self._stable_call_args = stable_call_args
@@ -141,7 +138,7 @@ class AotDispatcher:
         self._store = executable_store
         self._allow_fast_dispatch = allow_fast_dispatch
         # Loading is explicit even when the optional dispatch optimization is off.
-        self._enabled = True if executable_store is not None or precompile else None
+        self._enabled = True if executable_store is not None else None
 
     def invalidate(self) -> None:
         self._cache.clear()
@@ -181,7 +178,6 @@ class AotDispatcher:
         key = self._shape_key(leaves, tree)
         if key in self._precompile_keys or key in self._cache:
             return
-        self._enabled = True
         self._precompile_keys.add(key)
         options = self._compiler_options_fn(dyn_args) if self._compiler_options_fn else None
 
