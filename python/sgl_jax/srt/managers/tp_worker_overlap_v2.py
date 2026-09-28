@@ -134,7 +134,7 @@ class ModelWorkerOverlap(ModelWorker):
     def launch_sample(
         self,
         context: ForwardContext,
-    ) -> tuple[LogitsProcessorOutput, jax.Array, int]:
+    ) -> tuple[LogitsProcessorOutput, jax.Array | np.ndarray, int]:
         import jax._src.test_util as jtu
 
         batch = context.batch
@@ -167,7 +167,9 @@ class ModelWorkerOverlap(ModelWorker):
 
             output_ids = process_allgather(output_ids, tiled=True)
 
-        output_ids.copy_to_host_async()
+        # process_allgather returns a host ndarray for fully addressable inputs.
+        if isinstance(output_ids, jax.Array):
+            output_ids.copy_to_host_async()
         for value in (
             logits_output.next_token_logprobs,
             logits_output.input_token_logprobs,
@@ -187,7 +189,7 @@ class ModelWorkerOverlap(ModelWorker):
     def resolve_last_batch_result(
         self,
         logits_output: LogitsProcessorOutput,
-        next_token_ids: jax.Array,
+        next_token_ids: jax.Array | np.ndarray,
         batch: ModelWorkerBatch,
         cache_miss_count: int,
         launch_done=None,
