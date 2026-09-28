@@ -340,17 +340,21 @@ def packed_device_array(data, sharding):
     groups = defaultdict(list)
     for index, leaf in enumerate(leaves):
         array = np.asarray(leaf)
-        groups[array.dtype].append((index, array))
+        # Warmup may supply int64 where serving supplies int32. Match JAX's
+        # upload dtype before grouping so both reuse the same unpack program.
+        groups[jax.dtypes.canonicalize_dtype(array.dtype)].append((index, array))
 
     result = [None] * len(leaves)
-    for group in groups.values():
+    for dtype, group in groups.items():
         indices, arrays = zip(*group)
         shapes = tuple(array.shape for array in arrays)
         num_shards, sizes, buffer_sharding, unpack = _metadata_unpacker(shapes, sharding)
         if any(not shape or shape[0] % num_shards for shape in shapes):
             raise ValueError("Metadata leading dimensions must be divisible by the shard count")
         buffer = np.concatenate(
-            [array.reshape(num_shards, size) for array, size in zip(arrays, sizes)], axis=1
+            [array.reshape(num_shards, size) for array, size in zip(arrays, sizes)],
+            axis=1,
+            dtype=dtype,
         )
         buffer.flags.writeable = False
         outputs = unpack(device_array(buffer, sharding=buffer_sharding))

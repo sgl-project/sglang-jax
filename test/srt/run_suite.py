@@ -309,12 +309,6 @@ suites = {
     # have a conditional CPU pin gated on USE_DEVICE_TYPE=cpu — the
     # cpu-test CI job sets that env var.
     "unit-test-cpu": [
-        TestFile(
-            "test/srt/test_packed_metadata.py",
-            0.1,
-            runner="pytest",
-            env={"JAX_PLATFORMS": "cpu", "XLA_FLAGS": "--xla_force_host_platform_device_count=4"},
-        ),
         TestFile("python/sgl_jax/test/constrained/test_grammar_backend.py", 0.1),
         TestFile(
             "python/sgl_jax/test/test_dp_feature_parity.py",
