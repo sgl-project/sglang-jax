@@ -310,6 +310,59 @@ class JAXModelLoader(DefaultModelLoader):
         return model
 
 
+class RunaiModelLoader(JAXModelLoader):
+    """Keep JAX's existing mapping/sharding logic and replace only checkpoint I/O."""
+
+    def __init__(self, load_config: LoadConfig, mesh: jax.sharding.Mesh):
+        from sgl_jax.srt.utils.runai_utils import configure_runai
+
+        BaseModelLoader.__init__(self, load_config)
+        if load_config.decryption_key_file:
+            raise ValueError("runai_streamer does not support encrypted checkpoints")
+        extra = load_config.model_loader_extra_config
+        configure_runai({} if extra is None else extra)
+        self.mesh = mesh
+
+    def download_model(self, model_config: ModelConfig) -> str:
+        from sgl_jax.srt.utils.runai_utils import download_metadata, is_gcs_path
+
+        source = getattr(model_config, "model_weights", None) or model_config.model_path
+        if is_gcs_path(source):
+            return download_metadata(source, self.load_config.download_dir)
+        return self._prepare_weights(model_config.model_path, model_config.revision)
+
+    def load_model(self, model_config: ModelConfig) -> Any:
+        from sgl_jax.srt.utils.runai_utils import RunaiWeightSource, is_gcs_path
+
+        model_type = getattr(getattr(model_config, "hf_config", None), "model_type", "")
+        if getattr(model_config, "is_multimodal", False) or model_type.startswith(
+            ("gemma4", "qwen3_5")
+        ):
+            raise ValueError(
+                "runai_streamer currently supports text models using the shared WeightLoader. "
+                "Multimodal, Gemma4 and Qwen3.5 models have additional local-file loaders; "
+                "use a local checkpoint with --load-format auto for these models."
+            )
+        source = getattr(model_config, "model_weights", None) or model_config.model_path
+        local_path = self.download_model(model_config)
+        if not is_gcs_path(source):
+            source = local_path
+        if self.load_config.sub_dir:
+            source = os.path.join(source, self.load_config.sub_dir)
+            local_path = os.path.join(local_path, self.load_config.sub_dir)
+        config = copy.copy(model_config)
+        config.model_path = local_path
+        model_class = self._initialize_model(config)
+        # Skip filesystem warmup: only metadata is local, and callbacks read
+        # addressable tensor ranges directly from the original source.
+        with RunaiWeightSource(source, local_path) as weight_source:
+            config._runai_weight_source = weight_source
+            try:
+                return self._get_model(model_class, config)
+            finally:
+                del config._runai_weight_source
+
+
 class JAXDummyModelLoader(BaseModelLoader):
     """Model loader that will set model weights to random values for JAX models."""
 
@@ -388,6 +441,9 @@ def get_model_loader(load_config: LoadConfig, mesh: jax.sharding.Mesh) -> BaseMo
 
     if load_config.load_format == LoadFormat.DUMMY:
         return JAXDummyModelLoader(load_config, mesh)
+
+    if load_config.load_format == LoadFormat.RUNAI_STREAMER:
+        return RunaiModelLoader(load_config, mesh)
 
     if load_config.load_format == LoadFormat.JAX:
         return JAXModelLoader(load_config, mesh)

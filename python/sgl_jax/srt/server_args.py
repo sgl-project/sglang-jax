@@ -80,6 +80,10 @@ class ServerArgs:
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
+    # Local metadata directories -> original GCS checkpoint URIs. Kept on the
+    # arguments so spawned workers and separately configured draft models retain
+    # their weight source after config/tokenizer staging.
+    runai_model_paths: dict[str, str] = dataclasses.field(default_factory=dict, repr=False)
     trust_remote_code: bool = False
     context_length: int | None = None
     is_embedding: bool = False
@@ -331,6 +335,35 @@ class ServerArgs:
     # (deferral, never abort). 0 disables the cap (unbounded).
     disaggregation_max_inflight_transfers: int = 8
 
+    def _prepare_runai_paths(self):
+        from sgl_jax.srt.utils.runai_utils import (
+            configure_runai,
+            download_metadata,
+            is_gcs_path,
+        )
+
+        # Do not mutate argparse's reusable default or a caller's source map.
+        self.runai_model_paths = dict(self.runai_model_paths)
+        model_paths = [self.model_path, self.speculative_draft_model_path]
+        if any(path and is_gcs_path(path) for path in model_paths):
+            if self.load_format not in ("auto", "runai_streamer"):
+                raise ValueError("GCS model paths require --load-format runai_streamer (or auto)")
+            self.load_format = "runai_streamer"
+        if self.load_format != "runai_streamer":
+            return
+        extra = self.model_loader_extra_config
+        configure_runai(json.loads(extra) if isinstance(extra, str) else (extra or {}))
+        resolved = {}
+        for field in ("model_path", "tokenizer_path", "speculative_draft_model_path"):
+            path = getattr(self, field)
+            if path and is_gcs_path(path):
+                if path not in resolved:
+                    resolved[path] = download_metadata(path, self.download_dir)
+                local_path = resolved[path]
+                if field != "tokenizer_path":
+                    self.runai_model_paths[local_path] = path
+                setattr(self, field, local_path)
+
     def __post_init__(self):
         if self.aot_model_dir:
             from sgl_jax.srt.model_executor.compilation_manager import (
@@ -369,6 +402,8 @@ class ServerArgs:
 
         if self.served_model_name is None:
             self.served_model_name = self.model_path
+
+        self._prepare_runai_paths()
 
         if self.random_seed is None:
             self.random_seed = 42
@@ -699,6 +734,8 @@ class ServerArgs:
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
+        # Internal state is serialized to workers, but is not a user-facing flag.
+        parser.set_defaults(runai_model_paths={})
         # Model and tokenizer
         parser.add_argument(
             "--model-path",
@@ -753,6 +790,7 @@ class ServerArgs:
                 "bitsandbytes",
                 "layered",
                 "remote",
+                "runai_streamer",
             ],
             help="The format of the model weights to load. "
             '"auto" will try to load the weights in the safetensors format '
@@ -769,7 +807,8 @@ class ServerArgs:
             "quantization."
             '"layered" loads weights layer by layer so that one can quantize a '
             "layer before loading another to make the peak memory envelope "
-            "smaller.",
+            "smaller. "
+            '"runai_streamer" reads GCS or local safetensors shards using RunAI I/O.',
         )
         parser.add_argument(
             "--model-loader-extra-config",

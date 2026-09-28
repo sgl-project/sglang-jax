@@ -51,7 +51,7 @@ For reusable Docker, GKE, and SkyPilot launchers, see [Deployment](../deployment
 | `--tokenizer-mode` | Select `auto` fast-tokenizer usage or force `slow` tokenization. |
 | `--tokenizer-backend` | Select the tokenizer implementation, such as Hugging Face or `fastokens`. |
 | `--skip-tokenizer-init` | Skip tokenizer initialization; requests must provide `input_ids`. |
-| `--load-format` | Select checkpoint loading format, such as `auto`, `safetensors`, `dummy`, `gguf`, or `layered`. |
+| `--load-format` | Select checkpoint loading format, such as `auto`, `safetensors`, `dummy`, `gguf`, `layered`, or [`runai_streamer`](../deployment/runai-gcs.md) for direct GCS loading. |
 | `--model-loader-extra-config` | Pass load-format-specific JSON config through to the selected model loader. |
 | `--trust-remote-code` | Allow model-specific code from the model repository. Common for Qwen-derived and MiMo recipes. |
 | `--context-length` | Override the model context length from config. |

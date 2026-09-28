@@ -451,6 +451,12 @@ suites = {
             0.2,
             runner="pytest",
         ),
+        TestFile(
+            "python/sgl_jax/test/test_runai_loader.py",
+            0.5,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "4"},
+        ),
         TestFile("python/sgl_jax/test/mem_cache/test_req_to_token_pool.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_hybrid_req_to_token_pool.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_swa_allocator.py", 1),

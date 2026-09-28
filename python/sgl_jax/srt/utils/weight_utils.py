@@ -10,6 +10,7 @@ import struct
 import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -163,6 +164,7 @@ class WeightLoader:
         self.mesh = mesh
         self.dtype = dtype
         self.dummy_mode = getattr(model_config, "_dummy_mode", False)
+        self._runai_weight_source = getattr(model_config, "_runai_weight_source", None)
         self._weight_info_cache: dict[str, list[dict]] | None = None
         if hasattr(model_config, "num_attention_heads"):
             self.num_heads = model_config.num_attention_heads
@@ -1071,6 +1073,10 @@ class WeightLoader:
         if self._weight_info_cache is not None:
             return self._weight_info_cache
 
+        if self._runai_weight_source is not None:
+            self._weight_info_cache = self._runai_weight_source.weight_info
+            return self._weight_info_cache
+
         # 1. Host 0 does the heavy lifting (Scanning)
         if jax.process_index() == 0:
             model_path = self.model_config.model_path
@@ -1514,7 +1520,15 @@ class WeightLoader:
         _expert_bytes_est = _expert_elems * (1 if st_dtype.startswith("F8_") else 4)
         _BULK_READ_MIN_BYTES = 1024 * 1024  # 1 MB per expert
         _bulk_nontranspose = os.environ.get("SGLANG_MOE_BULK_READ", "0") == "1"
-        bulk_read = (
+        # A single-expert SDK submission serializes remote requests across
+        # callbacks. Batch this host's experts (including small scales) so the
+        # streamer's native I/O workers can actually run concurrently.
+        runai_bulk = (
+            self._runai_weight_source is not None
+            and weight_dims_unsharded
+            and (not do_transpose or defer_transpose)
+        )
+        bulk_read = runai_bulk or (
             (defer_transpose or (_bulk_nontranspose and not do_transpose and weight_dims_unsharded))
             and _expert_bytes_est >= _BULK_READ_MIN_BYTES
             and all(
@@ -1796,7 +1810,21 @@ class WeightLoader:
                 return result
 
             t_io_start = time.monotonic()
-            if len(file_groups) > 1:
+            if runai_bulk:
+                assert self._runai_weight_source is not None
+                entries = [
+                    (log_idx, fname, byte_off)
+                    for fname, group in sorted(file_groups.items())
+                    for log_idx, byte_off, _ in sorted(group, key=lambda entry: entry[1])
+                ]
+                buffers = self._runai_weight_source.read_ranges(
+                    [(fname, byte_off, expert_nbytes) for _, fname, byte_off in entries]
+                )
+                expert_data_map = {
+                    log_idx: raw.view(np_read_dtype).reshape(single_expert_shape)
+                    for (log_idx, _, _), raw in zip(entries, buffers)
+                }
+            elif len(file_groups) > 1:
                 with ThreadPoolExecutor(max_workers=len(file_groups)) as ex:
                     futs = {
                         ex.submit(_bulk_read_file, fn, ents): fn for fn, ents in file_groups.items()
@@ -2020,7 +2048,12 @@ class WeightLoader:
         quant_cfg = getattr(self.model_config, "quantization_config", None)
         is_static_quant = quant_cfg is not None and quant_cfg.is_static_checkpoint
 
-        with SequentialSafetensorManager() as file_manager:
+        source_context = (
+            nullcontext(self._runai_weight_source)
+            if self._runai_weight_source is not None
+            else SequentialSafetensorManager()
+        )
+        with source_context as file_manager:
             # 2. Process Regular Weights (Lazy Pull)
             for hf_key, mapping in tqdm(regular_mappings.items(), desc="Loading Regular Weights"):
                 if hf_key not in weight_info:
