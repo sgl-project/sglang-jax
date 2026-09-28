@@ -755,13 +755,11 @@ class UnifiedRadixCache(BasePrefixCache):
             nonlocal best_host_node, best_host_tokens, device_broken
             if not base_device_validator(candidate):
                 device_broken = True
-            device_valid = [v(candidate) for v in device_validators]
-            host_valid = [v(candidate) for v in host_validators]
-            if not device_broken and all(device_valid):
+            if not device_broken and all(v(candidate) for v in device_validators):
                 best_device_node = candidate
                 best_value_len = len(value)
                 best_device_tokens = cur_tokens
-            if all(host_valid):
+            if all(v(candidate) for v in host_validators):
                 best_host_node = candidate
                 best_host_tokens = cur_tokens
 
@@ -1029,14 +1027,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def get_load_back_sizes(self, last_host_node) -> tuple[int, int]:
         """Actual component token reservations, including window boundary nodes."""
-        if self._hybrid_hicache:
-            return self._hybrid_coordinator.sizes(last_host_node)
-        total = 0
-        node = last_host_node
-        while node is not self.root_node and node.evicted and node.backuped:
-            total += len(node.key)
-            node = node.parent
-        return total, 0
+        return self._hybrid_coordinator.sizes(last_host_node)
 
     @property
     def _direct_hicache(self) -> bool:
@@ -1377,9 +1368,7 @@ class UnifiedRadixCache(BasePrefixCache):
         complete the kernel scatter into kv_buffer.
         """
         if self._hybrid_hicache:
-            return self._hybrid_coordinator.restore(
-                last_host_node, host_hit_length, mem_quota, swa_mem_quota
-            )
+            return self._hybrid_coordinator.restore(last_host_node, mem_quota, swa_mem_quota)
         if not self.hicache_enabled or host_hit_length <= 0:
             return np.empty((0,), dtype=np.int32), last_host_node, []
 

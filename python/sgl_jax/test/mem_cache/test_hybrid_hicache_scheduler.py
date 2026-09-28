@@ -59,7 +59,6 @@ def admission(
         dp_rank=0,
         extend_input_len=33,
         host_hit_length=32,
-        swa_host_hit_length=restored_swa,
         prefix_indices=[],
         last_node=object(),
         last_host_node=object(),
@@ -76,7 +75,7 @@ def test_long_full_restore_does_not_require_equal_swa_capacity():
     assert adder.add_one_req(req) is AddReqResult.CONTINUE
     # Reclaimable SWA quota still leaves room for this request's next steps.
     assert calls == [{"mem_quota": 100, "swa_mem_quota": 24 - adder._swa_budget_for_req(1, 0)}]
-    assert req.swa_host_hit_length == 0
+    assert req.host_hit_length == 0
     assert req.extend_input_len == 1
     assert adder.rem_swa_token_offset[0] == adder._swa_budget_for_req(1, 0)
 
@@ -87,7 +86,7 @@ def test_restore_window_overhang_falls_back_to_recompute(restored_swa):
     assert adder.add_one_req(req) is AddReqResult.CONTINUE
     assert not calls
     assert req.extend_input_len == 33
-    assert req.host_hit_length == req.swa_host_hit_length == 0
+    assert req.host_hit_length == 0
     assert req.last_host_node is req.last_node
 
 
@@ -97,7 +96,7 @@ def test_restore_overhang_can_recompute_one_chunk():
     assert not calls
     assert adder.can_run_list[0] == [req]
     assert req.extend_input_len == 8
-    assert req.host_hit_length == req.swa_host_hit_length == 0
+    assert req.host_hit_length == 0
 
 
 def test_restore_overhang_rejects_when_recompute_also_exceeds_capacity():
@@ -120,14 +119,13 @@ def test_failed_restore_rechecks_recompute_swa_budget():
     assert not adder.can_run_list[0]
 
 
-def test_retract_discards_both_host_candidates():
+def test_retract_discards_host_candidate():
     req = Req.__new__(Req)
     req.last_host_node = object()
     req.host_hit_length = 32
-    req.swa_host_hit_length = 8
     req.reset_for_retract()
     assert req.last_host_node is None
-    assert req.host_hit_length == req.swa_host_hit_length == 0
+    assert req.host_hit_length == 0
 
 
 @pytest.mark.parametrize("restored_full", [0, 4])
@@ -403,7 +401,7 @@ def test_locked_swa_shortage_recomputes_a_chunk_without_retry_stall(
             if admitted:
                 assert result is AddReqResult.CONTINUE
                 assert adder.can_run_list[0] == [req]
-                assert req.host_hit_length == req.swa_host_hit_length == 0
+                assert req.host_hit_length == 0
                 assert req.last_host_node is req.last_node is cache.root_node
                 assert len(req.prefix_indices) == 0
                 assert req.extend_input_len == len(req.fill_ids) == 16 * page

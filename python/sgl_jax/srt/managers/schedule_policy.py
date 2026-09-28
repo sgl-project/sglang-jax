@@ -160,7 +160,6 @@ class SchedulePolicy:
             r.last_node = match_result.last_device_node
             r.last_host_node = match_result.last_host_node
             r.host_hit_length = match_result.host_hit_length
-            r.swa_host_hit_length = match_result.swa_host_hit_length
 
             # NOTE(sang): This logic is for in-batch prefix caching;
             # If there are more than 1 request that have small matching prefix from
@@ -458,8 +457,7 @@ class PrefillAdder:
     def add_chunked_req(self, req: Req):
         dp_rank = req.dp_rank if req.dp_rank is not None else 0
         _rem_tokens = min(
-            self.rem_chunk_tokens_list[dp_rank],
-            int(self.rem_total_tokens_for_dp(dp_rank)),
+            self.rem_chunk_tokens_list[dp_rank], int(self.rem_total_tokens_for_dp(dp_rank))
         )
         if self.is_hybrid:
             _rem_tokens = min(
@@ -638,7 +636,6 @@ class PrefillAdder:
             total_tokens = (
                 full_restore + req.extend_input_len - req.host_hit_length + max_new_tokens
             )
-            req.swa_host_hit_length = swa_restore
         swa_extend = real_input_tokens if hybrid_restore else req.extend_input_len
 
         if total_tokens >= self.rem_total_tokens_for_dp(dp_rank):
@@ -682,7 +679,7 @@ class PrefillAdder:
                         return AddReqResult.NO_TOKEN
                     # A whole host node may overhang the SWA window. Do not
                     # indefinitely retry this restore when recompute fits.
-                    req.host_hit_length = req.swa_host_hit_length = 0
+                    req.host_hit_length = 0
                     req.last_host_node = req.last_node
                     hybrid_restore = False
 
@@ -719,7 +716,7 @@ class PrefillAdder:
                         dp_rank
                     ):
                         return AddReqResult.NO_TOKEN
-                    req.host_hit_length = req.swa_host_hit_length = 0
+                    req.host_hit_length = 0
                     req.last_host_node = req.last_node
                     hybrid_restore = False
 
@@ -732,9 +729,6 @@ class PrefillAdder:
                 allocator = self.token_to_kv_pool_allocator
                 mem_quota = allocator.available_size(dp_rank)
                 restore_kwargs = {}
-                if hybrid_restore:
-                    mem_quota = allocator.full_available_size(dp_rank)
-                    restore_kwargs["swa_mem_quota"] = allocator.swa_available_size(dp_rank)
                 if hybrid_restore or getattr(self.tree_cache, "_direct_hicache", False):
                     mem_quota = self.rem_total_tokens_for_dp(dp_rank)
                     if hybrid_restore:
@@ -753,7 +747,6 @@ class PrefillAdder:
                     req.last_node = last_node
                     req.last_host_node = last_node
                     req.host_hit_length = max(0, req.host_hit_length - len(new_indices))
-                    req.swa_host_hit_length = 0
                     prefix_len = len(req.prefix_indices)
                     req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
 

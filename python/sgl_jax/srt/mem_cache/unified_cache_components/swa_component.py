@@ -93,13 +93,6 @@ class SWAComponent(TreeComponent):
 
         return validate
 
-    def finalize_match_result(self, result, **kwargs):
-        if self.cache._hybrid_hicache:
-            result = result._replace(
-                swa_host_hit_length=self.cache.get_load_back_sizes(result.last_host_node)[1]
-            )
-        return result
-
     def build_hicache_transfers(self, node, phase, *, device_indices=None, **kwargs):
         # Both components use the same page descriptor, but tokens are raw
         # indices into their own device pool; host handles stay pool-scoped.
@@ -263,7 +256,6 @@ class SWAComponent(TreeComponent):
         parent_cd = new_parent.component_data[self.component_type]
         child_cd = child.component_data[self.component_type]
         parent_cd.lock_ref = child_cd.lock_ref
-        parent_cd.host_lock_ref = child_cd.host_lock_ref
         # Only receipts acquired before this split inherit the new prefix.
         # The lists are shared with IncLockRefResult/to_dec_params and Req;
         # static split ancestry would incorrectly skip locks acquired later.

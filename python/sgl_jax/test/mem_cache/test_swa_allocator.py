@@ -612,6 +612,7 @@ class TestSWAAllocatorIndependentRestore(CustomTestCase):
         np.testing.assert_array_equal(full0, full1)
         allocator.commit_swa_mapping(full0, swa0, dp_rank=0)
         allocator.commit_swa_mapping(full1, swa1, dp_rank=1)
+        np.testing.assert_array_equal(allocator.translate_full_to_swa(full0, dp_rank=0), swa0)
         np.testing.assert_array_equal(allocator.translate_full_to_swa(full1, dp_rank=1), swa1)
         allocator.free_swa_indices(reserved1, dp_rank=1)
         self.assertEqual(allocator.swa_available_size(dp_rank=0), 2)
