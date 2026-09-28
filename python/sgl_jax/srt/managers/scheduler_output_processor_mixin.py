@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from functools import partial
 from typing import TYPE_CHECKING
 
 import jax
@@ -120,6 +121,30 @@ def _materialize_input_token_logprobs(input_token_logprobs, lens_per_dp: list[in
     return tuple(values)
 
 
+class _ResultResourceUpdates:
+    """Keep shared-resource updates behind submission without delaying CPU bookkeeping."""
+
+    def __init__(self, launch_done):
+        self.launch_done = launch_done
+        self.pending = []
+
+    def run(self, fn, *args, **kwargs):
+        if self.launch_done is None:
+            # Preserve the existing order outside asynchronous overlap v2.
+            fn(*args, **kwargs)
+        else:
+            self.pending.append(partial(fn, *args, **kwargs))
+
+    def flush(self):
+        if not self.pending:
+            return
+        # Also propagates failed submissions before any shared state is released.
+        self.launch_done.wait()
+        for update in self.pending:
+            update()
+        self.pending.clear()
+
+
 class SchedulerOutputProcessorMixin:
     """
     This class implements the output processing logic for Scheduler.
@@ -145,7 +170,7 @@ class SchedulerOutputProcessorMixin:
         self.chunked_reqs[dp_rank] = None
         self._pending_chunked_abort_reqs[dp_rank] = None
 
-    def _resolve_overlap_v2_result(self, result, launch_done=None):
+    def _resolve_overlap_v2_result(self, result):
         assert self.enable_overlap_v2
         assert result.worker_batch is not None
         if result.launch_result is not None:
@@ -158,7 +183,6 @@ class SchedulerOutputProcessorMixin:
             result.next_token_ids,
             result.worker_batch,
             result.cache_miss_count,
-            launch_done,
         )
 
     def maybe_collect_routed_experts(self: Scheduler, req: Req):
@@ -185,6 +209,9 @@ class SchedulerOutputProcessorMixin:
         # (the pre-DP design) silently leaked unchunked reqs into stream_output
         # with `input_token_logprobs_val` still None, crashing the consumer.
         skip_stream_reqs: set = set()
+        resources = _ResultResourceUpdates(
+            launch_done if self.enable_overlap and self.enable_overlap_v2 else None
+        )
 
         assert self.is_generation
         (
@@ -207,7 +234,7 @@ class SchedulerOutputProcessorMixin:
                     launch_done.wait()
             else:
                 if self.enable_overlap_v2:
-                    resolved_result = self._resolve_overlap_v2_result(result, launch_done)
+                    resolved_result = self._resolve_overlap_v2_result(result)
                 else:
                     resolved_result = self.tp_worker.resolve_last_batch_result(launch_done)
                 logits_output, next_token_ids, cache_miss_count = resolved_result
@@ -267,9 +294,10 @@ class SchedulerOutputProcessorMixin:
                     req.output_ids.append(next_token_id)
                     req.check_finished()
                     if req.finished():
-                        self.maybe_collect_routed_experts(req)
-                        _complete_precision_trace(req)
-                        release_kv_cache(
+                        resources.run(self.maybe_collect_routed_experts, req)
+                        resources.run(_complete_precision_trace, req)
+                        resources.run(
+                            release_kv_cache,
                             req,
                             self.tree_cache,
                             allow_overallocated=(
@@ -279,7 +307,7 @@ class SchedulerOutputProcessorMixin:
                         )
                     elif not info.decoding_reqs or req not in info.decoding_reqs:
                         # This updates radix so others can match
-                        self.tree_cache.cache_unfinished_req(req)
+                        resources.run(self.tree_cache.cache_unfinished_req, req)
 
                     if req.return_output_logprob_only:
                         req.output_token_logprobs_val.append(
@@ -335,7 +363,7 @@ class SchedulerOutputProcessorMixin:
                             )
                             if num_input_logprobs > 0:
                                 logprob_pt += num_input_logprobs
-                        self._finalize_chunked_abort(req, dp_rank)
+                        resources.run(self._finalize_chunked_abort, req, dp_rank)
                     else:
                         # On dp>1, multiple reqs (one per dp rank) can be chunked
                         # in the same batch; collect all so stream_output skips them.
@@ -372,6 +400,9 @@ class SchedulerOutputProcessorMixin:
             if info.reqs:
                 all_reqs.extend(info.reqs)
 
+        # Finish the whole batch's CPU work before waiting, even when its first
+        # request terminates. Resource-derived outputs must be ready for streaming.
+        resources.flush()
         self.set_next_batch_sampling_info_done(batch)
 
         self.stream_output(
@@ -428,6 +459,9 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
         launch_done: threading.Event | None = None,
     ):
+        resources = _ResultResourceUpdates(
+            launch_done if self.enable_overlap and self.enable_overlap_v2 else None
+        )
         logits_output, next_token_ids, cache_miss_count = (
             result.logits_output,
             result.next_token_ids,
@@ -480,7 +514,7 @@ class SchedulerOutputProcessorMixin:
                 next_token_logprobs = None
             else:
                 if self.enable_overlap_v2:
-                    resolved_result = self._resolve_overlap_v2_result(result, launch_done)
+                    resolved_result = self._resolve_overlap_v2_result(result)
                 else:
                     resolved_result = self.tp_worker.resolve_last_batch_result(launch_done)
                 logits_output, next_token_ids, cache_miss_count = resolved_result
@@ -539,7 +573,7 @@ class SchedulerOutputProcessorMixin:
                 req.check_finished(new_accepted_len)
 
                 if req.finished():
-                    self.maybe_collect_routed_experts(req)
+                    resources.run(self.maybe_collect_routed_experts, req)
                     if legacy_eagle3_non_overlap:
                         actual_token_len = len(req.origin_input_ids) + max(
                             len(req.output_ids) - 1, 0
@@ -550,8 +584,9 @@ class SchedulerOutputProcessorMixin:
                         # kv_allocated_len as the allocation upper bound and let
                         # release_kv_cache free the overallocated tail.
                         req.kv_committed_len -= 1
-                    _complete_precision_trace(req)
-                    release_kv_cache(
+                    resources.run(_complete_precision_trace, req)
+                    resources.run(
+                        release_kv_cache,
                         req,
                         self.tree_cache,
                         allow_overallocated=is_spec_decode,
@@ -610,6 +645,7 @@ class SchedulerOutputProcessorMixin:
             if info.reqs:
                 all_reqs.extend(info.reqs)
 
+        resources.flush()
         self.set_next_batch_sampling_info_done(batch)
         self.stream_output(
             all_reqs,
