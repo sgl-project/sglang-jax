@@ -320,6 +320,26 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
         jitted_sampler = make_jitted_sampler(base_rng_key, sampler_compiler_options)
 
+        # Retain the serving JIT definitions for compile-only preparation.
+        # Warmup still calls the ordinary wrappers and threads donated pools.
+        self._lower_model = lambda batch, metadata: jitted_run_model.lower(
+            model_def,
+            model_state_def,
+            self.model_state_leaves,
+            batch,
+            self.memory_pools,
+            metadata,
+        )
+        self._lower_sampler = lambda logits, metadata: jitted_sampler.lower(
+            sampler_def,
+            sampler_state_def,
+            sampler_state_leaves,
+            self._sampler_step,
+            logits,
+            metadata,
+        )
+        self._lower_compute_logprobs = partial(jitted_compute_logprobs.lower, self.mesh)
+
         aot_model_dir = self.server_args.aot_model_dir
         executable_store = None
         if aot_model_dir:
@@ -327,15 +347,38 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
             executable_store = ExecutableStore(aot_model_dir, self.mesh)
 
-        # Explicit offline loading and opt-in online compilation share one
-        # per-shape executable cache. The default pjit path is unchanged.
+        # Offline loading and opt-in AOT dispatch share an executable cache.
+        # Parallel precompile also warms JAX's cache for the ordinary pjit path.
         use_aot_dispatch = aot_dispatch_requested()
+        self.parallel_precompile = (
+            self.server_args.precompile_num_threads > 1
+            and not self.server_args.disable_precompile
+            and executable_store is None
+            and not self.server_args.speculative_algorithm
+            and not self.server_args.enable_lora
+            and not self.server_args.enable_static_lora
+            and not self.model_config.is_multimodal
+            and not self.server_args.multimodal
+        )
+        if self.server_args.precompile_num_threads > 1 and not self.parallel_precompile:
+            logger.info(
+                "Parallel precompile is unavailable for this configuration; using serial warmup"
+            )
         if use_aot_dispatch and self.server_args.speculative_algorithm:
             logger.warning(
                 "SGLANG_JAX_AOT_DISPATCH is set but speculative decoding is "
                 "enabled; disabling the fast execute_sharded dispatch path."
             )
             use_aot_dispatch = False
+
+        # Match the exact compile options used by the selected serving path so
+        # both ordinary JIT and AOT dispatch reuse JAX's compiled-executable cache.
+        self.model_compile_options = lambda batch: (
+            CompilationManager.compiler_options(self.attn_backend, batch.forward_batch)
+            if use_aot_dispatch
+            else None
+        )
+        self.sampler_compile_options = sampler_compiler_options if use_aot_dispatch else None
 
         if use_aot_dispatch or executable_store is not None:
             self._run_model_dispatcher = AotDispatcher(
@@ -857,6 +900,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         )
 
         return attn_backend_wrapper(self, full_attn_backend)
+
+    def lower_model(self, batch):
+        """Prepare forward metadata and lower under the caller's model mesh."""
+        self.attn_backend.forward_metadata = self.attn_backend.get_forward_metadata(batch)
+        logits_metadata = LogitsMetadata.from_model_worker_batch(batch, self.mesh)
+        return self._lower_model(batch.forward_batch, logits_metadata)
 
     def _forward(
         self,

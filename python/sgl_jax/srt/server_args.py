@@ -227,6 +227,7 @@ class ServerArgs:
     vision_encoder_parallel: str = "dp"
 
     disable_precompile: bool = False
+    precompile_num_threads: int = 2
     aot_model_dir: str | None = None
     save_aot: str | None = None
     aot_topology: str | None = None
@@ -1583,6 +1584,13 @@ class ServerArgs:
             "data-parallel groups (requires tp_size > 1).",
         )
         parser.add_argument(
+            "--precompile-num-threads",
+            type=int,
+            default=ServerArgs.precompile_num_threads,
+            help="Maximum concurrent XLA compilations during precompile or --save-aot; "
+            "1 keeps serial compilation. Lowering and warmup remain serial.",
+        )
+        parser.add_argument(
             "--disable-precompile",
             action="store_true",
             help="whether disable precompile",
@@ -2065,6 +2073,8 @@ class ServerArgs:
         return hf_config
 
     def check_server_args(self):
+        if self.precompile_num_threads < 1:
+            raise ValueError("--precompile-num-threads must be at least 1")
         assert (self.tp_size) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
 
         if self.moe_dp_size < 1:

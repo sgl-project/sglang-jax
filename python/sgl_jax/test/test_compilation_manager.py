@@ -1,5 +1,6 @@
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,7 +8,10 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 
-from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
+from sgl_jax.srt.model_executor.compilation_manager import (
+    CompilationManager,
+    CompilationPool,
+)
 from sgl_jax.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -16,6 +20,75 @@ from sgl_jax.srt.model_executor.forward_batch_info import (
 from sgl_jax.srt.multimodal.in_model import host_orchestration
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.utils.common_utils import align_bs_for_fused_ep, pad_to_bucket
+
+
+class TestCompilationPool(unittest.TestCase):
+    def test_parallel_compile_with_serial_lowering_and_bounded_backpressure(self):
+        caller = threading.get_ident()
+        barrier = threading.Barrier(2)
+        finished = []
+        lowered_ids = []
+        compile_threads = set()
+
+        def lower(index):
+            self.assertEqual(threading.get_ident(), caller)
+            if index >= 2:
+                self.assertGreaterEqual(len(finished), index - 1)
+            lowered_ids.append(index)
+
+            def compile(**kwargs):
+                compile_threads.add(threading.get_ident())
+                if index < 2:
+                    barrier.wait(timeout=10)
+                return index
+
+            return SimpleNamespace(compile=compile)
+
+        with CompilationPool(2) as pool:
+            for _, _, compiled in pool.map(lower, range(5)):
+                self.assertEqual(threading.get_ident(), caller)
+                finished.append(compiled)
+        self.assertEqual(lowered_ids, list(range(5)))
+        self.assertEqual(finished, list(range(5)))
+        self.assertEqual(len(compile_threads), 2)
+        self.assertNotIn(caller, compile_threads)
+
+    def test_serial_fallback_runs_on_caller(self):
+        caller = threading.get_ident()
+        compiled_on = []
+        with CompilationPool(1) as pool:
+            list(
+                pool.map(
+                    lambda _: SimpleNamespace(
+                        compile=lambda **_: compiled_on.append(threading.get_ident())
+                    ),
+                    [None],
+                )
+            )
+            self.assertEqual(compiled_on, [caller])
+
+    def test_failure_stops_lowering_and_joins_workers(self):
+        def lower(index):
+            if index == 2:
+                self.fail("Lowered past the failed bounded window")
+            return SimpleNamespace(
+                compile=(
+                    MagicMock(side_effect=RuntimeError("compile failed"))
+                    if index == 0
+                    else lambda **_: 1
+                )
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "compile failed"), CompilationPool(2) as pool:
+            for _ in pool.map(lower, range(3)):
+                self.fail("Returned a result past the failed compilation")
+        self.assertFalse(pool._pending)
+        self.assertIsNone(pool._executor)
+
+    def test_invalid_thread_count(self):
+        for threads in (0, -1):
+            with self.assertRaisesRegex(ValueError, "at least 1"):
+                CompilationPool(threads)
 
 
 class TestAlignBsForFusedEp(unittest.TestCase):
@@ -48,6 +121,7 @@ def _make_server_args(**overrides):
     args = MagicMock()
     args.precompile_token_paddings = None
     args.precompile_bs_paddings = None
+    args.precompile_num_threads = 1
     args.moe_backend = "none"
     args.enable_static_lora = False
     args.multimodal = False
