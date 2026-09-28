@@ -249,7 +249,6 @@ class ModelWorkerOverlap(ModelWorker):
         next_token_ids: jax.Array | np.ndarray,
         batch: ModelWorkerBatch,
         cache_miss_count: int,
-        launch_done=None,
     ) -> tuple[LogitsProcessorOutput, list[int], int]:
         next_token_ids = jax.device_get(next_token_ids).tolist()
         if batch.return_logprob or batch.return_output_logprob_only:
@@ -268,6 +267,4 @@ class ModelWorkerOverlap(ModelWorker):
             ).tolist()
         if isinstance(logits_output.hidden_states, jax.Array):
             logits_output.hidden_states = np.asarray(jax.device_get(logits_output.hidden_states))
-        if launch_done is not None:
-            launch_done.wait()
         return logits_output, next_token_ids, cache_miss_count
