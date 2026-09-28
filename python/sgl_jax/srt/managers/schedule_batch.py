@@ -297,6 +297,7 @@ class Req:
         self.extend_logprob_start_len = 0
         self.last_node: Any = None
         self.last_host_node: Any = None
+        self.host_hit_length = 0
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: int | None = None
         # Exact acquire receipt.  The UUID is only the legacy compatibility
@@ -667,6 +668,8 @@ class Req:
         return False
 
     def reset_for_retract(self):
+        self.last_host_node = None
+        self.host_hit_length = 0
         self.prefix_indices = []
         self.last_node = None
         self.swa_uuid_for_lock = None
