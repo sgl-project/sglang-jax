@@ -22,7 +22,7 @@ from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
 from sgl_jax.srt.utils import cdiv
-from sgl_jax.srt.utils.jax_utils import device_array
+from sgl_jax.srt.utils.jax_utils import device_array, packed_device_array
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
 logger = logging.getLogger(__name__)
@@ -310,13 +310,14 @@ class FlashAttention(AttentionBackend):
         (
             metadata.cu_q_lens,
             metadata.cu_kv_lens,
-            metadata.page_indices,
-            metadata.swa_page_indices,
             metadata.seq_lens,
             metadata.distribution,
-        ) = device_array(
-            (cu_q_lens, cu_kv_lens, page_indices, swa_page_indices, seq_lens, distribution),
+        ) = packed_device_array(
+            (cu_q_lens, cu_kv_lens, seq_lens, distribution),
             sharding=(NamedSharding(self.mesh, P("data"))),
+        )
+        metadata.page_indices, metadata.swa_page_indices = device_array(
+            (page_indices, swa_page_indices), sharding=NamedSharding(self.mesh, P("data"))
         )
         return metadata
 
@@ -405,10 +406,6 @@ class FlashAttention(AttentionBackend):
             extend_seq_lens = batch.extend_seq_lens
         if cu_q_lens is None:
             cu_q_lens = _per_dp_cumsum(extend_seq_lens, dp_size, per_dp_bs)
-            cu_q_lens = device_array(
-                cu_q_lens,
-                sharding=NamedSharding(self.mesh, P("data")),
-            )
 
         seq_lens = np.copy(batch.seq_lens)
 
@@ -499,36 +496,18 @@ class FlashAttention(AttentionBackend):
         )
 
         seq_lens = np.array(seq_lens)
-        metadata.cu_q_lens = cu_q_lens
         data_sharding = NamedSharding(self.mesh, P("data"))
-        if reuse_allocated_pages:
-            metadata.page_indices = _upload_eagle_pages(
-                batch, page_indices, data_sharding, cacheable=True
-            )
-            if isinstance(distribution, jax.Array):
-                metadata.distribution = distribution
-                metadata.cu_kv_lens, metadata.seq_lens = device_array(
-                    (cu_kv_lens, seq_lens), sharding=data_sharding
-                )
-            else:
-                metadata.cu_kv_lens, metadata.seq_lens, metadata.distribution = device_array(
-                    (cu_kv_lens, seq_lens, distribution), sharding=data_sharding
-                )
-        elif isinstance(distribution, jax.Array):
-            metadata.distribution = distribution
-            metadata.cu_kv_lens, metadata.page_indices, metadata.seq_lens = device_array(
-                (cu_kv_lens, page_indices, seq_lens), sharding=data_sharding
-            )
-        else:
-            (
-                metadata.cu_kv_lens,
-                metadata.page_indices,
-                metadata.seq_lens,
-                metadata.distribution,
-            ) = device_array(
-                (cu_kv_lens, page_indices, seq_lens, distribution),
-                sharding=data_sharding,
-            )
+        metadata.page_indices = _upload_eagle_pages(
+            batch, page_indices, data_sharding, cacheable=reuse_allocated_pages
+        )
+        (
+            metadata.cu_q_lens,
+            metadata.cu_kv_lens,
+            metadata.seq_lens,
+            metadata.distribution,
+        ) = packed_device_array(
+            (cu_q_lens, cu_kv_lens, seq_lens, distribution), sharding=data_sharding
+        )
         # Hybrid SWA targets need swa_page_indices for TARGET_VERIFY too,
         # otherwise SWA layers index the swa sub-pool with full-pool page ids.
         swa_mapping = getattr(self, "swa_index_mapping", None)
@@ -640,18 +619,19 @@ class FlashAttention(AttentionBackend):
             (
                 metadata_tmp.cu_q_lens,
                 metadata_tmp.cu_kv_lens,
-                metadata_tmp.page_indices,
                 metadata_tmp.seq_lens,
                 metadata_tmp.distribution,
-            ) = device_array(
+            ) = packed_device_array(
                 (
                     cu_q_lens,
                     cu_kv_lens[i],
-                    page_indices[i],
                     seq_lens_list[i],
                     distribution,
                 ),
                 sharding=(NamedSharding(self.mesh, P("data"))),
+            )
+            metadata_tmp.page_indices = device_array(
+                page_indices[i], sharding=NamedSharding(self.mesh, P("data"))
             )
             metadata.append(metadata_tmp)
         return metadata
