@@ -327,8 +327,9 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
             executable_store = ExecutableStore(aot_model_dir, self.mesh)
 
-        # Explicit offline loading and opt-in online compilation share one
-        # per-shape executable cache. The default pjit path is unchanged.
+        # Offline loading and parallel precompile share a per-shape executable
+        # cache. Serial compilation retains the ordinary pjit path unless the
+        # user also requests the optional fast dispatch optimization.
         use_aot_dispatch = aot_dispatch_requested()
         self.parallel_precompile = (
             self.server_args.precompile_num_threads > 1

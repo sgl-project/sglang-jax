@@ -109,6 +109,8 @@ class AotDispatcher:
       executable_store: optional trusted offline artifacts; a miss is an error.
       allow_fast_dispatch: allow the environment-controlled execute_sharded path.
         Loading still works through checked compiled calls when disabled.
+      precompile: use checked compiled calls even when fast dispatch is disabled,
+        so startup can populate the executable cache without executing buffers.
 
     If the caller ever replaces the stable containers (LoRA / EPLB reload),
     it must call :meth:`invalidate` (or construct a new dispatcher); the
