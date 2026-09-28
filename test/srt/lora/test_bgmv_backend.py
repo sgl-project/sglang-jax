@@ -20,7 +20,8 @@ from sgl_jax.srt.lora.utils import (
     get_lora_b_output_sharding,
 )
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
-from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sgl_jax.srt.model_executor.batch_inputs import BatchInputs
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sgl_jax.srt.utils.jax_utils import device_array
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
@@ -351,22 +352,24 @@ class TestBgmvLoRABackend(CustomTestCase):
         forward_mode = ForwardMode.EXTEND if batch_mode == BatchMode.PREFILL else ForwardMode.DECODE
 
         return ModelWorkerBatch(
+            inputs=BatchInputs.from_arrays(
+                input_ids=np.arange(total_tokens, dtype=jnp.int32),
+                seq_lens=np.array(seq_lengths, dtype=jnp.int32),
+                out_cache_loc=np.arange(total_tokens, dtype=jnp.int32),
+                req_pool_indices=np.arange(batch_size, dtype=jnp.int32),
+                positions=None,
+                extend_seq_lens=np.array(seq_lengths, dtype=np.int32),
+                extend_prefix_lens=None,
+            ),
             bid=0,
             forward_mode=forward_mode,
-            input_ids=np.arange(total_tokens, dtype=jnp.int32),
             real_input_ids_len=total_tokens,
-            seq_lens=np.array(seq_lengths, dtype=jnp.int32),
-            out_cache_loc=np.arange(total_tokens, dtype=jnp.int32),
-            req_pool_indices=np.arange(batch_size, dtype=jnp.int32),
             sampling_info=SamplingBatchInfo.generate_for_precompile(batch_size, 32000),
-            positions=None,
             cache_loc=None,
             return_logprob=False,
             return_output_logprob_only=False,
             top_logprobs_nums=1,
             token_ids_logprobs=None,
-            extend_seq_lens=np.array(seq_lengths, dtype=np.int32),
-            extend_prefix_lens=None,
             extend_logprob_start_lens=None,
             extend_input_logprob_token_ids=None,
             logits_indices=np.array(seq_lengths, dtype=np.int32),

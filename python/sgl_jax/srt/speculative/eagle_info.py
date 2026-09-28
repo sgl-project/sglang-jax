@@ -196,6 +196,7 @@ class EagleDraftInput:
         total_tok = len(model_worker_batch.input_ids)
         per_dp_tok = total_tok // dp_size
         extend_seq_lens = model_worker_batch.extend_seq_lens
+        model_worker_batch.input_ids = model_worker_batch.input_ids.copy()
         flat_idx = 0  # index into self.verified_id (cross-rank flat)
         for dp_rank in range(dp_size):
             pt = dp_rank * per_dp_tok
@@ -231,6 +232,7 @@ class EagleDraftInput:
         )
         model_worker_batch.spec_info_padded = self
         sel = model_worker_batch.logits_indices_selector
+        model_worker_batch.seq_lens = model_worker_batch.seq_lens.copy()
         model_worker_batch.seq_lens[sel] = (
             model_worker_batch.seq_lens[sel] + speculative_num_draft_tokens - 1
         )
@@ -607,6 +609,7 @@ class EagleVerifyInput:
 
     def prepare_for_verify(self, model_worker_batch: ModelWorkerBatch):
         sel = model_worker_batch.logits_indices_selector
+        model_worker_batch.seq_lens = model_worker_batch.seq_lens.copy()
         model_worker_batch.seq_lens[sel] = model_worker_batch.seq_lens[sel] - 1
         model_worker_batch.input_ids = self.draft_token
         model_worker_batch.positions = self.positions

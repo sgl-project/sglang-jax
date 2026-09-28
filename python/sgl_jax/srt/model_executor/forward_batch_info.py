@@ -34,7 +34,7 @@ from sgl_jax.srt.eplb.expert_location import (
     get_global_expert_location_metadata,
 )
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
-from sgl_jax.srt.utils.jax_utils import device_array, packed_device_array
+from sgl_jax.srt.utils.jax_utils import device_array
 
 logger = logging.getLogger(__name__)
 
@@ -367,25 +367,7 @@ class ForwardBatch:
             recurrent_cow_src_indices,
             recurrent_track_indices,
             recurrent_track_mask,
-        ) = packed_device_array(
-            (
-                batch.input_ids,
-                batch.seq_lens,
-                batch.out_cache_loc,
-                batch.positions,
-                batch.req_pool_indices,
-                batch.extend_prefix_lens,
-                batch.extend_seq_lens,
-                batch.lora_scalings,
-                batch.lora_token_indices,
-                batch.lora_ranks,
-                batch.recurrent_indices,
-                batch.recurrent_cow_src_indices,
-                batch.recurrent_track_indices,
-                batch.recurrent_track_mask,
-            ),
-            sharding=data_sharding,
-        )
+        ) = batch.inputs.to_device(data_sharding)
         # cache_loc is already built directly into a host buffer. Packing this
         # potentially very large array adds a full host copy and device unpack;
         # keeping its existing transfer avoids regressing long-context batches.
@@ -436,7 +418,7 @@ class ForwardBatch:
         obj = cls(
             bid=batch.bid,
             forward_mode=batch.forward_mode,
-            batch_size=len(batch.seq_lens),
+            batch_size=seq_lens.shape[0],
             input_ids=input_ids,
             seq_lens=seq_lens,
             out_cache_loc=out_cache_loc,

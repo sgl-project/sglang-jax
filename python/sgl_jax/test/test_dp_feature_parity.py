@@ -18,6 +18,8 @@ from sgl_jax.srt.managers.io_struct import GenerateReqInput
 from sgl_jax.srt.managers.schedule_batch import Req, ScheduleBatch
 from sgl_jax.srt.managers.scheduler_output_processor_mixin import _collect_hidden_states
 from sgl_jax.srt.managers.tokenizer_manager import TokenizerManager
+from sgl_jax.srt.model_executor.batch_input_builder import BatchInputBuilder
+from sgl_jax.srt.model_executor.batch_layout import BatchLayoutPlan
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 
@@ -109,12 +111,15 @@ def test_lora_adapter_and_token_slots(counts, mode):
     reqs = [[make_req(f"{r}-{i}", lora=str(r + 1)) for i in range(n)] for r, n in enumerate(counts)]
     batch = make_batch(reqs, mode)
     per_dp_bs, per_dp_tokens = 3, 8 if mode.is_extend() else 3
-    ids = batch._merge_lora_ids(per_dp_bs, len(counts) * per_dp_bs, False)
+    builder = BatchInputBuilder(
+        batch, BatchLayoutPlan(tuple(counts), (0,) * len(counts), len(counts) * per_dp_bs, 0)
+    )
+    ids = builder._merge_lora_ids(False)
     expected_ids = [
         str(r + 1) if i < n else "0" for r, n in enumerate(counts) for i in range(per_dp_bs)
     ]
     assert ids == expected_ids
-    assert batch._merge_lora_ids(per_dp_bs, len(ids), True) == ["0"] * len(ids)
+    assert builder._merge_lora_ids(True) == ["0"] * len(ids)
     lengths = [i + 1 if i < n else 0 for n in counts for i in range(per_dp_bs)]
     mwb = SimpleNamespace(
         forward_mode=mode,
@@ -176,7 +181,9 @@ def test_grammar_masks_follow_dp_slots_and_preserve_unconstrained_rows(counts):
         if group:
             group[0].grammar = SingleTokenGrammar(r + 1)
     batch = make_batch(reqs)
-    merged = batch._merge_sampling_info(3, len(counts) * 3)
+    merged = BatchInputBuilder(
+        batch, BatchLayoutPlan(tuple(counts), (0,) * len(counts), len(counts) * 3, 0)
+    )._merge_sampling_info()
     merged.vocab_size = 64
     merged.update_grammar_vocab_mask()
     original = merged.vocab_mask.copy()
