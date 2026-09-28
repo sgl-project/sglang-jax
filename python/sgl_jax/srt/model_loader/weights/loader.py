@@ -370,9 +370,12 @@ class WeightLoader:
         sharding = None
         if direct:
             axes = tuple(spec.sharding or ())
+            # PartitionSpec may omit trailing replicated axes.
             if spec.transpose_axes is not None:
+                axes += (None,) * (len(spec.transpose_axes) - len(axes))
                 axes = tuple(axes[i] for i in np.argsort(spec.transpose_axes))
             elif spec.transpose:
+                axes += (None,) * (2 - len(axes))
                 axes = axes[::-1]
             sharding = jax.sharding.NamedSharding(self.mesh, P(*axes))
         value = self.reader.read(self.source, name, spec, sharding)
