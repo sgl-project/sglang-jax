@@ -92,7 +92,9 @@ class CompilationPool:
     def _compile(lowered, options, mesh):
         import jax
 
-        with jax.set_mesh(mesh):
+        # Entering an empty mesh changes JAX's compilation-cache context.
+        # Helpers compile in the ordinary ambient context, just as they run.
+        with jax.set_mesh(mesh) if not mesh.empty else nullcontext():
             return CompilationManager.get_executable(lowered, compiler_options=options)
 
     def _finish_one(self):
