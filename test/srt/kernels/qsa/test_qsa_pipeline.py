@@ -23,7 +23,7 @@ import numpy as np
 from jax.sharding import AxisType, Mesh
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.kernels.qsa.paging import scatter_compressed
+from sgl_jax.srt.kernels.qsa.paging import as_4d, scatter_compressed
 from sgl_jax.srt.kernels.qsa.ref import sparse_gqa_attention_ref
 from sgl_jax.srt.kernels.qsa.sparse_gqa_attention import sparse_gqa_attention
 from sgl_jax.srt.layers.attention.qsa_indexer import QSAIndexer, select_blocks
@@ -105,16 +105,24 @@ class _Fixture:
 
         self.seq_lens = jnp.asarray(np.asarray(seq_lens, np.int32))
         self.cu_q_lens = jnp.asarray(np.concatenate([[0], np.cumsum(seq_lens)]).astype(np.int32))
-        # Packed page table: every request gets exactly PAGES_PER_SEQ pages, so
-        # cu_kv_lens strides by PAGES_PER_SEQ * PAGE_SIZE. Physical pages are
-        # shuffled and page 0 is the reserved sentinel.
-        self.cu_kv_lens = jnp.asarray(
-            (np.arange(self.n_seqs + 1) * PAGES_PER_SEQ * PAGE_SIZE).astype(np.int32)
-        )
+        # Two views of the same pages, as in the attention metadata. The packed
+        # list gives a request only the pages it needs, starting at
+        # cu_kv_lens[i] // PAGE_SIZE, and the compressed-key scatter reads it.
+        # The kernels walk the fixed-stride table instead. With lengths (24, 13)
+        # request 1 starts at slot 2 of one and slot PAGES_PER_SEQ of the other.
+        # Physical pages are shuffled and page 0 is the reserved sentinel.
         n_pages = self.n_seqs * PAGES_PER_SEQ + 1
-        table = rng.permutation(np.arange(1, n_pages))[: self.n_seqs * PAGES_PER_SEQ]
-        self.page_indices = jnp.asarray(table.astype(np.int32))
-        self.page_table = self.page_indices.reshape(self.n_seqs, PAGES_PER_SEQ)
+        physical = rng.permutation(np.arange(1, n_pages)).astype(np.int32)
+        packed = np.zeros(self.n_seqs * PAGES_PER_SEQ, np.int32)
+        table = np.zeros((self.n_seqs, PAGES_PER_SEQ), np.int32)
+        cu_kv = np.zeros(self.n_seqs + 1, np.int32)
+        for i, n_tokens in enumerate(seq_lens):
+            start, n = cu_kv[i] // PAGE_SIZE, -(-n_tokens // PAGE_SIZE)
+            packed[start : start + n] = table[i, :n] = physical[start : start + n]
+            cu_kv[i + 1] = cu_kv[i] + n * PAGE_SIZE
+        self.page_indices = jnp.asarray(packed)
+        self.cu_kv_lens = jnp.asarray(cu_kv)
+        self.page_table = jnp.asarray(table)
         self.distribution = jnp.asarray(np.asarray([0, 0, self.n_seqs], np.int32))
 
         t_count = int(self.cu_q_lens[-1])
@@ -164,13 +172,11 @@ class _Fixture:
             )
             block_ids = select_blocks(
                 indexer_q,
-                cache,
+                as_4d(cache, 1),
                 self.seq_lens,
-                self.page_indices,
+                self.page_table,
                 self.cu_q_lens,
-                self.cu_kv_lens,
                 self.distribution,
-                pages_per_seq=PAGES_PER_SEQ,
                 block_topk=self.indexer.block_topk,
                 compress_ratio=self.indexer.compress_ratio,
                 use_kernel=False,

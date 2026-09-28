@@ -14,9 +14,9 @@ kernels, not the parameters.
 Every piece of arithmetic here is covered by a test somewhere else --
 ``test_qsa_pool`` for the page geometry, ``test_paging`` for the scatter,
 ``test_qsa_indexer`` for the compression, ``test_qsa_pipeline`` for the whole
-chain, ``test_sparse_gqa_parity`` for the kernel. What is **not** covered is
-this file's own assembly: no test in the repo constructs an attention backend,
-DSA's included. It is first exercised end to end when a model wires it up.
+chain, ``test_sparse_gqa_parity`` for the kernel. ``test_qsa_sparse_backend``
+covers this file's own sparse path: the cache layout and page table it hands
+each kernel.
 """
 
 from __future__ import annotations
@@ -201,11 +201,8 @@ class QSASparseAttentionBackend(FlashAttention):
         page_table = _fixed_stride_pages(
             md.page_indices, md.cu_kv_lens, self.page_size, pages_per_seq
         ).reshape(n_seqs, pages_per_seq)
-        scale = (
-            1.0 / jnp.sqrt(layer.head_dim)
-            if (layer is None or layer.scaling is None)
-            else layer.scaling
-        )
+        # A Python float: the attention kernel takes its scale as a static argument.
+        scale = layer.head_dim**-0.5 if layer.scaling is None else layer.scaling
         token_to_req = jnp.clip(
             jnp.searchsorted(md.cu_q_lens[1:], jnp.arange(q.shape[0]), side="right"),
             0,
@@ -222,21 +219,18 @@ class QSASparseAttentionBackend(FlashAttention):
             token_to_req_,
             page_table_,
             seq_lens_,
-            page_indices_,
             cu_q_lens_,
             distribution_,
         ):
             block_ids = select_blocks(
                 indexer_q_,
-                as_3d(compressed_),
+                compressed_,
                 seq_lens_,
-                page_indices_,
+                page_table_,
                 cu_q_lens_,
-                cu_q_lens_,  # unused on the kernel path, which walks the fixed-stride table
                 distribution_,
                 block_topk=self.block_topk,
                 compress_ratio=self.compress_ratio,
-                pages_per_seq=pages_per_seq,
                 use_kernel=True,
             )
             return sparse_gqa_attention(
@@ -261,7 +255,6 @@ class QSASparseAttentionBackend(FlashAttention):
                 P(dpa),  # token -> request
                 P(dpa, None),  # page table
                 P(dpa),  # seq_lens
-                P(dpa),  # page_indices
                 P(dpa),  # cu_q_lens
                 P(dpa),  # distribution
             ),
@@ -276,7 +269,6 @@ class QSASparseAttentionBackend(FlashAttention):
             token_to_req,
             page_table,
             md.seq_lens,
-            md.page_indices,
             md.cu_q_lens,
             md.distribution,
         )

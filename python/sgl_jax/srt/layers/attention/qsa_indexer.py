@@ -30,6 +30,7 @@ Four things are silently wrong if changed, all matching upstream SGLang's
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import jax
@@ -38,6 +39,7 @@ from flax import nnx
 
 from sgl_jax.srt.kernels.dsa.ref import streamindex_topk_ref
 from sgl_jax.srt.kernels.dsa.streamindex_topk import streamindex_topk
+from sgl_jax.srt.kernels.qsa.paging import as_3d
 from sgl_jax.srt.layers.layernorm import GemmaRMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 
@@ -279,18 +281,33 @@ class QSAIndexer(nnx.Module):
         return (self.n_heads,)
 
 
+_SELECT_BLOCK_ENTRIES = 1024
+# Decode clamps this to one query per sequence; it only shapes prefill blocks.
+_SELECT_QUERIES_PER_BLOCK = 128
+
+
+def _select_kv_pages_per_block(entries_per_page: int) -> int:
+    """Compressed pages ``streamindex_topk`` streams per block.
+
+    The kernel needs a block to hold a multiple of 128 entries. Within that, a
+    block of about ``_SELECT_BLOCK_ENTRIES`` keeps the bf16 double buffer for a
+    four-sequence decode batch of 128-wide keys at 2 MiB of VMEM. Not tuned on
+    hardware.
+    """
+    step = 128 // math.gcd(entries_per_page, 128)
+    return max(_SELECT_BLOCK_ENTRIES // (entries_per_page * step), 1) * step
+
+
 def select_blocks(
     query: jax.Array,
     compressed_cache: jax.Array,
     seq_lens: jax.Array,
-    page_indices: jax.Array,
+    page_table: jax.Array,
     cu_q_lens: jax.Array,
-    cu_kv_lens: jax.Array,
     distribution: jax.Array,
     *,
     block_topk: int,
     compress_ratio: int,
-    pages_per_seq: int,
     use_kernel: bool = True,
     one_token_per_seq: bool = False,
 ) -> jax.Array:
@@ -304,38 +321,41 @@ def select_blocks(
     weights reduce one to the other exactly -- QSA simply has no
     ``weights_proj`` to supply.
 
-    ``seq_lens`` and ``cu_kv_lens`` both arrive in uncompressed tokens; this
-    function converts what needs converting. As in ``DSASparseAttentionBackend``
-    the two implementations want different page tables: the Pallas kernel takes
-    a fixed-stride one and walks it as ``seq * pages_per_seq``, while the
-    reference takes the packed table and finds a sequence's first page at
-    ``cu_kv_lens[seq] // cache.shape[1]``. That divisor is the *cache's* page
-    size, which for the compressed cache is ``page_size // compress_ratio``, so
-    the reference needs ``cu_kv_lens`` in compressed entries or it lands that
-    many times too far into the table. Every term of ``cu_kv_lens`` is a
-    page-aligned token count, so the division is exact.
+    Both paths take the pool's own cache layout,
+    ``[pages, entries_per_page // packing, packing, dim]``, and the same
+    fixed-stride ``i32[S, pages_per_seq]`` page table ``sparse_gqa_attention``
+    walks, so selection and attention read a request's keys from the same
+    pages. ``seq_lens`` is in uncompressed tokens.
     """
     weights = jnp.ones(query.shape[:2], dtype=query.dtype)
+    num_seqs, pages_per_seq = page_table.shape
+    entries_per_page = compressed_cache.shape[1] * compressed_cache.shape[2]
     if use_kernel:
         return streamindex_topk(
             query,
             weights,
             compressed_cache,
             seq_lens,
-            page_indices,
+            page_table.reshape(-1),
             cu_q_lens,
             distribution,
             k=block_topk,
             compression_ratio=compress_ratio,
+            num_kv_pages_per_block=_select_kv_pages_per_block(entries_per_page),
+            num_queries_per_block=_SELECT_QUERIES_PER_BLOCK,
         )
+    # The reference finds a sequence's first page at
+    # ``cu_kv_lens[seq] // entries_per_page``. These offsets put it at
+    # ``seq * pages_per_seq``, which is the fixed stride.
+    fixed_stride = jnp.arange(num_seqs + 1, dtype=jnp.int32) * (pages_per_seq * entries_per_page)
     return streamindex_topk_ref(
         query,
         weights,
-        compressed_cache,
+        as_3d(compressed_cache),
         seq_lens,
-        page_indices,
+        page_table.reshape(-1),
         cu_q_lens,
-        cu_kv_lens // compress_ratio,
+        fixed_stride,
         distribution,
         k=block_topk,
         pages_per_seq=pages_per_seq,

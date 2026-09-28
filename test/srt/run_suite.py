@@ -334,6 +334,7 @@ suites = {
         TestFile("test/srt/multimodal/test_engine_multimodal.py", 0.1, runner="pytest"),
         TestFile("python/sgl_jax/test/layers/test_hyperconnection.py", 0.1),
         TestFile("python/sgl_jax/test/layers/test_qsa_indexer.py", 0.1),
+        TestFile("python/sgl_jax/test/layers/test_qsa_sparse_backend.py", 0.1),
         TestFile("test/srt/kernels/qsa/test_sparse_gqa_ref.py", 0.1),
         TestFile("test/srt/kernels/qsa/test_paging.py", 0.1),
         TestFile("test/srt/kernels/qsa/test_qsa_pipeline.py", 0.5),

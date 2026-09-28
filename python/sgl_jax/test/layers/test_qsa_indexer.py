@@ -235,16 +235,15 @@ class TestQSAIndexer(unittest.TestCase):
         keys = np.zeros((max_kv, HEAD_DIM), np.float32)
         for e in range(n_entries):
             keys[e] = direction * (e + 1)
-        cache = jnp.array(keys.reshape(pages_per_seq, page_size, HEAD_DIM))
+        # The pool's layout; fp32 packs one entry per row.
+        cache = jnp.array(keys.reshape(pages_per_seq, page_size, 1, HEAD_DIM))
         query = jnp.array(np.tile(direction, (n_tokens, N_HEADS, 1)))
 
         meta = dict(
             seq_lens=jnp.array([n_tokens], jnp.int32),  # uncompressed tokens
-            page_indices=jnp.arange(pages_per_seq, dtype=jnp.int32),
+            page_table=jnp.arange(pages_per_seq, dtype=jnp.int32).reshape(1, pages_per_seq),
             cu_q_lens=jnp.array([0, n_tokens], jnp.int32),
-            cu_kv_lens=jnp.array([0, max_kv], jnp.int32),
             distribution=jnp.array([0, 1, 1], jnp.int32),
-            pages_per_seq=pages_per_seq,
         )
         return query, cache, meta, n_entries
 
