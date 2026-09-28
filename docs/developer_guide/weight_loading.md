@@ -132,19 +132,3 @@ text/vision/GDN, Gemma experts, split checkpoints, aliases, and P/D cache identi
 checks rank-local roots, inconsistent plans, read failures, and asymmetric
 cache state. SDK fakes in `test_runai_loader.py` specifically exercise borrowed
 buffer reuse; they do not establish native SDK or GCS performance.
-
-For actual checkpoint validation, run `scripts/benchmark_weight_loading.py` in
-separate baseline and candidate processes with matching dependencies and
-TP/DP/EP topology. It loads weights without serving or allocating inference KV
-cache, waits for all arrays, records per-process timing/RSS and device memory,
-then hashes every addressable shard. D2H hashing is outside the loading timer.
-The script does not gather the entire model onto one host.
-
-Alternate baseline/candidate order for repeated timing pairs. Use full
-fingerprints for correctness, then `--fingerprint none` for additional timing
-runs. Keep Local/GCSFuse and RunAI comparisons separate. Report uncontrolled
-cache state explicitly; restarting Python or a pod does not prove a cold GCS
-cache. RunAI range counters measure requested bytes, not wire traffic.
-
-Measured results and outstanding acceptance work are recorded in
-[Weight loading benchmark results](weight_loading_benchmarks.md).
