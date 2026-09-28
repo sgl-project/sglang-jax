@@ -50,5 +50,11 @@ class Envs:
     # identical; escape hatch only.
     SGLANG_JAX_INDEXER_ROPE_CONCAT = EnvBool(True)
 
+    # gmm_v2 with int4 weights on chips that have an fp8 MXU but no int8 MXU
+    # (v7x): quantize activations to e4m3 and upcast the int4 weight tile
+    # in-kernel (W4A8) instead of running bf16 activations on the bf16 MXU
+    # (W4A16). Escape hatch only; chips with an int8 MXU always use it.
+    SGLANG_JAX_GMM_INT4_A8 = EnvBool(True)
+
 
 envs = Envs()

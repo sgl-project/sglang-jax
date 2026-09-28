@@ -10,6 +10,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sgl_jax.srt.environ import envs
 from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.tuned_tile_sizes import (
     get_tuned_gmm_v2_tile_sizes,
 )
@@ -298,6 +299,13 @@ def inner_kernel(
                     # Convert lhs into quantized dtype.
                     block_lhs_q = (block_lhs / block_scale).astype(lhs_q_dtype)
 
+                    if jnp.issubdtype(lhs_q_dtype, jnp.floating) and not jnp.issubdtype(
+                        block_rhs.dtype, jnp.floating
+                    ):
+                        # Integer weights on the fp8 MXU (W4A8 on chips without an
+                        # int8 MXU): int4 values are exact in e4m3, so upcast the
+                        # weight tile in-kernel. See select_lhs_quant_dtype.
+                        block_rhs = block_rhs.astype(lhs_q_dtype)
                     block_acc = jnp.matmul(
                         block_lhs_q,
                         block_rhs,
@@ -821,6 +829,37 @@ def get_scope_name(dims: Dimensions, tiles: TileSizes) -> str:
     )
 
 
+def select_lhs_quant_dtype(rhs_quant_dtype: jnp.dtype, tpu_info: pltpu.TpuInfo) -> jnp.dtype | None:
+    """Picks the activation (lhs) quant dtype for a quantized rhs on this chip.
+
+    Returns None when the chip has no MXU mode that can consume the rhs dtype
+    group directly; the kernel then runs unquantized (bf16) activations.
+
+      * float rhs (fp8): e4m3 on chips with an fp8 MXU.
+      * int8 rhs: int8 on chips with an int8 MXU.
+      * int4 rhs: int8 on chips with an int8 MXU; otherwise e4m3 on chips with
+        an fp8 MXU (W4A8). Every int4 value is exactly representable in e4m3,
+        so the kernel upcasts the weight tile and the result matches an int8
+        MXU bit-for-bit up to the activation rounding, which is the same e4m3
+        rounding the fp8 checkpoints already use. ``SGLANG_JAX_GMM_INT4_A8=0``
+        disables this fallback and keeps bf16 activations (W4A16).
+    """
+    rhs_quant_dtype = jnp.dtype(rhs_quant_dtype)
+    if jnp.issubdtype(rhs_quant_dtype, jnp.floating):
+        if tpu_info.fp8_ops_per_second > 0:
+            return jnp.dtype(jnp.float8_e4m3fn)
+        return None
+    if tpu_info.int8_ops_per_second > 0:
+        return jnp.dtype(jnp.int8)
+    if (
+        rhs_quant_dtype == jnp.dtype(jnp.int4)
+        and tpu_info.fp8_ops_per_second > 0
+        and envs.SGLANG_JAX_GMM_INT4_A8.get()
+    ):
+        return jnp.dtype(jnp.float8_e4m3fn)
+    return None
+
+
 def make_gmm_configs(
     lhs: jax.Array,
     rhs: jax.Array,
@@ -859,16 +898,7 @@ def make_gmm_configs(
 
     lhs_q_dtype = None
     if maybe_quantize_lhs and rhs_quant_dtype is not None:
-        # Choose lhs quantization dtype based on TPU hardware support.
-        is_rhs_float = jnp.issubdtype(rhs_quant_dtype, jnp.floating)
-        tpu_info = pltpu.get_tpu_info()
-        # Check if there is hardware compute support for rhs dtype group.
-        if is_rhs_float:
-            if tpu_info.fp8_ops_per_second > 0:
-                lhs_q_dtype = jnp.float8_e4m3fn.dtype
-        else:
-            if tpu_info.int8_ops_per_second > 0:
-                lhs_q_dtype = jnp.int8.dtype
+        lhs_q_dtype = select_lhs_quant_dtype(rhs_quant_dtype, pltpu.get_tpu_info())
 
     # Default lhs quantization block: input quantization involves reading all
     # elements in a block to compute the scale value. Since this operation is

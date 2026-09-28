@@ -330,7 +330,7 @@ class GmmTest(jtu.JaxTestCase):
         in_size=[512, 1024],
         out_size=[512, 1024],
         num_groups=[16, 32],
-        weight_dtype=[jnp.int8, jnp.float8_e4m3fn],
+        weight_dtype=[jnp.int8, jnp.float8_e4m3fn, jnp.int4],
         group_offset=[0, 2, 3],
         block_size=[128, None],
     )
@@ -346,6 +346,8 @@ class GmmTest(jtu.JaxTestCase):
     ):
         # block_size=None -> per-channel; block_size=128 -> sub-channel
         # (W8A8 + block-wise rhs_scale, e.g. DeepSeek/GLM static FP8 ckpts).
+        # int4 weights run W4A8: int8 activations on chips with an int8 MXU,
+        # e4m3 activations + in-kernel int4->e4m3 weight upcast otherwise (v7x).
         if block_size is None:
             block_size = in_size
         num_local_groups = num_groups - group_offset
