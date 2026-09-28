@@ -49,6 +49,11 @@ class DeepseekV4TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_swa_index_mapping = self._mapping[0] if self.dp_size == 1 else self._mapping
         self._ends = [np.zeros(self.pages_per_rank + 1, np.int32) for _ in range(self.dp_size)]
         self._swa_page = [np.zeros(self.pages_per_rank + 1, np.int32) for _ in range(self.dp_size)]
+        # After reclaiming a partial page, later appends can map only its tail.
+        # _ends therefore cannot stand in for the number of live SWA slots.
+        self._swa_live_count = [
+            np.zeros(self.pages_per_rank + 1, np.int32) for _ in range(self.dp_size)
+        ]
         self.free_pages = [None] * self.dp_size
         self._swa_free = [None] * self.dp_size
         self.free_group = [[] for _ in range(self.dp_size)]
@@ -156,6 +161,10 @@ class DeepseekV4TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_pages[dp_rank] = self.free_pages[dp_rank][demand.history_pages :]
         self._swa_free[dp_rank] = self._swa_free[dp_rank][demand.swa_pages :]
         for page, swa, end, loc, swa_loc in writes:
+            if self._swa_page[dp_rank][page] == 0:
+                self._swa_live_count[dp_rank][page] = len(loc)
+            else:
+                self._swa_live_count[dp_rank][page] += len(loc)
             self._ends[dp_rank][page] = end
             self._swa_page[dp_rank][page] = swa
             self._mapping[dp_rank][loc] = swa_loc
@@ -178,20 +187,27 @@ class DeepseekV4TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             raise ValueError("free indices must be a one-dimensional integer array")
         if np.any(indices < self.page_size) or np.any(indices >= len(self._mapping[dp_rank])):
             raise ValueError("cannot free padding or out-of-range locations")
-        pages = np.unique(indices // self.page_size).astype(np.int32)
+        if not indices.size:
+            return np.empty(0, np.int32)
+        # Sort/deduplicate once, then visit only the locations belonging to
+        # each touched page. A free group can split a page across many calls.
+        unique_indices = np.unique(indices)
+        page_ids = unique_indices // self.page_size
+        starts = np.r_[0, np.flatnonzero(page_ids[1:] != page_ids[:-1]) + 1]
+        pages = page_ids[starts].astype(np.int32)
         # Validate the entire release before changing either ledger. A repeated
         # release before reuse is harmless. Stale addresses after reuse are not
         # handles: the lifecycle caller must clear the request owner.
-        for page in pages:
-            end = self._ends[dp_rank][page]
+        for i, page in enumerate(pages):
+            stop = starts[i + 1] if i + 1 < len(starts) else len(unique_indices)
+            requested = unique_indices[starts[i] : stop]
             if swa_only:
-                occupied = np.flatnonzero(
-                    self._mapping[dp_rank][page * self.page_size : (page + 1) * self.page_size]
-                )
+                expected = self._swa_live_count[dp_rank][page]
+                covered = np.count_nonzero(self._mapping[dp_rank][requested])
             else:
-                occupied = np.arange(end)
-            requested = np.unique(indices[indices // self.page_size == page] % self.page_size)
-            if not np.all(np.isin(occupied, requested)):
+                expected = self._ends[dp_rank][page]
+                covered = np.searchsorted(requested, page * self.page_size + expected)
+            if covered != expected:
                 raise ValueError("partial page release would free live tokens")
         return pages
 
@@ -201,11 +217,21 @@ class DeepseekV4TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def _free_swa_pages(self, pages, rank):
         physical = self._swa_page[rank][pages]
-        physical = physical[physical != 0]
-        self._swa_free[rank] = np.sort(np.concatenate((self._swa_free[rank], physical)))
+        mapped = physical != 0
+        if np.any(mapped):
+            self._swa_free[rank] = np.sort(np.concatenate((self._swa_free[rank], physical[mapped])))
+            for page in pages[mapped]:
+                self._mapping[rank][page * self.page_size : (page + 1) * self.page_size] = 0
         self._swa_page[rank][pages] = 0
-        for page in pages:
-            self._mapping[rank][page * self.page_size : (page + 1) * self.page_size] = 0
+        self._swa_live_count[rank][pages] = 0
+
+    def _free_full_pages(self, pages, rank):
+        live = pages[self._ends[rank][pages] != 0]
+        if not live.size:
+            return
+        self._free_swa_pages(live, rank)
+        self._ends[rank][live] = 0
+        self.free_pages[rank] = np.sort(np.concatenate((self.free_pages[rank], live)))
 
     def free(self, free_index, dp_rank=0):
         if not self.is_not_in_free_group:
@@ -213,10 +239,7 @@ class DeepseekV4TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.free_group[dp_rank].append(np.asarray(free_index).copy())
             return
         pages = self._release_pages(free_index, dp_rank, False)
-        live = pages[self._ends[dp_rank][pages] != 0]
-        self._free_swa_pages(live, dp_rank)
-        self._ends[dp_rank][live] = 0
-        self.free_pages[dp_rank] = np.sort(np.concatenate((self.free_pages[dp_rank], live)))
+        self._free_full_pages(pages, dp_rank)
 
     def count_swa_mapped(self, indices, dp_rank=0):
         self._rank(dp_rank)
@@ -231,6 +254,7 @@ class DeepseekV4TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self._mapping[rank].fill(0)
             self._ends[rank].fill(0)
             self._swa_page[rank].fill(0)
+            self._swa_live_count[rank].fill(0)
             self.free_group[rank] = []
         self.is_not_in_free_group = True
 
@@ -242,18 +266,19 @@ class DeepseekV4TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 self._mapping,
                 self._ends,
                 self._swa_page,
+                self._swa_live_count,
                 self.free_group,
                 self.is_not_in_free_group,
             )
         )
 
     def restore_state(self, state):
-        free, swa_free, mapping, ends, swa_page, group, outside_group = deepcopy(state)
+        free, swa_free, mapping, ends, swa_page, swa_count, group, outside_group = deepcopy(state)
         self.free_pages, self._swa_free = free, swa_free
         # Keep mapping references held by runtime consumers valid across a rollback.
         for old, saved in zip(self._mapping, mapping):
             old[:] = saved
-        self._ends, self._swa_page = ends, swa_page
+        self._ends, self._swa_page, self._swa_live_count = ends, swa_page, swa_count
         self.free_group, self.is_not_in_free_group = group, outside_group
 
     def free_group_begin(self):
@@ -263,11 +288,12 @@ class DeepseekV4TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def free_group_end(self):
         groups = [np.concatenate(g) if g else np.empty(0, np.int32) for g in self.free_group]
-        for rank, indices in enumerate(groups):
-            self._release_pages(indices, rank, False)
+        pages_per_rank = [
+            self._release_pages(indices, rank, False) for rank, indices in enumerate(groups)
+        ]
         self.is_not_in_free_group = True
-        for rank, indices in enumerate(groups):
-            self.free(indices, rank)
+        for rank, pages in enumerate(pages_per_rank):
+            self._free_full_pages(pages, rank)
         self.free_group = [[] for _ in range(self.dp_size)]
 
     def debug_print(self):

@@ -1,6 +1,7 @@
 """Resource-level contracts for V4 history and SWA page ownership."""
 
 import unittest
+from unittest import mock
 
 import jax
 import numpy as np
@@ -28,10 +29,12 @@ def make_allocator(page_size=128, history_pages=4, swa_pages=4, dp_size=1):
 
 
 def assert_snapshot_equal(test, actual, expected):
-    for current_family, saved_family in zip(actual[:6], expected[:6]):
+    test.assertEqual(len(actual), len(expected))
+    for current_family, saved_family in zip(actual[:7], expected[:7]):
+        test.assertEqual(len(current_family), len(saved_family))
         for current, saved in zip(current_family, saved_family):
             np.testing.assert_array_equal(current, saved)
-    test.assertEqual(actual[6], expected[6])
+    test.assertEqual(actual[7], expected[7])
 
 
 class TestDeepseekV4Allocator(unittest.TestCase):
@@ -71,6 +74,27 @@ class TestDeepseekV4Allocator(unittest.TestCase):
         self.assertEqual(allocator.count_swa_mapped(indices[:128]), 0)
         self.assertEqual(allocator.count_swa_mapped(indices[128:]), 128)
         allocator.free(indices)
+        self.assertEqual(allocator.full_available_size(), 4 * 128)
+        self.assertEqual(allocator.swa_available_size(), 4 * 128)
+
+    def test_swa_reallocation_in_partial_history_page(self):
+        allocator = make_allocator()
+        prefix = allocator.alloc_extend([0], [127], [-1], 127)
+        allocator.free_swa(prefix)
+        tail = allocator.alloc_decode([128], [int(prefix[-1])])
+        self.assertEqual(allocator.count_swa_mapped(prefix), 0)
+        self.assertEqual(allocator.count_swa_mapped(tail), 1)
+
+        before = allocator.backup_state()
+        with self.assertRaisesRegex(ValueError, "partial page"):
+            allocator.free_swa(prefix)
+        assert_snapshot_equal(self, allocator.backup_state(), before)
+        allocator.free_swa(np.repeat(tail, 2))
+        self.assertEqual(allocator.swa_available_size(), 4 * 128)
+        allocator.restore_state(before)
+        self.assertEqual(allocator.count_swa_mapped(tail), 1)
+        allocator.free_swa(tail)
+        allocator.free(np.concatenate((prefix, tail)))
         self.assertEqual(allocator.full_available_size(), 4 * 128)
         self.assertEqual(allocator.swa_available_size(), 4 * 128)
 
@@ -132,11 +156,29 @@ class TestDeepseekV4Allocator(unittest.TestCase):
         allocator.free(first)
         allocator.free(second)
         self.assertEqual(allocator.full_available_size(), 2 * 128)
-        allocator.free_group_end()
+        with mock.patch.object(
+            allocator, "_release_pages", wraps=allocator._release_pages
+        ) as release:
+            allocator.free_group_end()
+        self.assertEqual(release.call_count, 1)
         self.assertEqual(allocator.full_available_size(), 4 * 128)
         allocator.restore_state(before)
         self.assertIs(allocator.full_to_swa_index_mapping, original_mapping)
         assert_snapshot_equal(self, allocator.backup_state(), before)
+
+    def test_grouped_release_accepts_split_pages_and_duplicate_indices(self):
+        allocator = make_allocator()
+        first = allocator.alloc_extend([0], [129], [-1], 129)
+        second = allocator.alloc_extend([0], [17], [-1], 17)
+        allocator.free_group_begin()
+        allocator.free(np.concatenate((second[::2], first[::2], first[::2])))
+        allocator.free(np.concatenate((first[1::2], second[1::2])))
+        self.assertEqual(allocator.full_available_size(), 128)
+        allocator.free_group_end()
+        self.assertEqual(allocator.full_available_size(), 4 * 128)
+        self.assertEqual(allocator.swa_available_size(), 4 * 128)
+        allocator.free(first)
+        self.assertEqual(allocator.full_available_size(), 4 * 128)
 
     def test_dp_rank_ledgers_are_isolated(self):
         if len(jax.devices()) < 2:
@@ -201,6 +243,25 @@ class TestDeepseekV4Allocator(unittest.TestCase):
         allocator.free(first[-1:])
         allocator.free_group_end()
         self.assertEqual(allocator.full_available_size(), 4 * 128)
+
+    def test_invalid_cross_rank_group_does_not_commit(self):
+        if len(jax.devices()) < 2:
+            self.skipTest("requires two JAX devices")
+        allocator = make_allocator(dp_size=2)
+        first = allocator.alloc_extend([0], [128], [-1], 128, dp_rank=0)
+        second = allocator.alloc_extend([0], [128], [-1], 128, dp_rank=1)
+        allocator.free_group_begin()
+        allocator.free(first, dp_rank=0)
+        allocator.free(second[:-1], dp_rank=1)
+        before = allocator.backup_state()
+        with self.assertRaisesRegex(ValueError, "partial page"):
+            allocator.free_group_end()
+        assert_snapshot_equal(self, allocator.backup_state(), before)
+        allocator.free(second[-1:], dp_rank=1)
+        allocator.free_group_end()
+        for rank in range(2):
+            self.assertEqual(allocator.full_available_size(rank), 4 * 128)
+            self.assertEqual(allocator.swa_available_size(rank), 4 * 128)
 
 
 if __name__ == "__main__":
