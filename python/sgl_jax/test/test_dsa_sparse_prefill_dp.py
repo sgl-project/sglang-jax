@@ -309,9 +309,6 @@ def _build(workload: _Workload, mesh: jax.sharding.Mesh, cache_loc=None):
     def put(x, spec):
         return jax.device_put(jnp.asarray(x, dtype=DTYPE), NamedSharding(mesh, spec))
 
-    def put_i32(x, spec):
-        return jax.device_put(jnp.asarray(x, dtype=jnp.int32), NamedSharding(mesh, spec))
-
     inputs = {
         "ql": put(ql, P("data", "tensor", None)),
         "qpe": put(qpe, P("data", "tensor", None)),
@@ -321,12 +318,12 @@ def _build(workload: _Workload, mesh: jax.sharding.Mesh, cache_loc=None):
         "k_idx": put(k_idx, P("data", None)),
         "idx_w": put(idx_w, P("data", None)),
     }
+    # get_forward_metadata commits these itself. Check rather than re-put, so a
+    # sharding regression there fails here instead of being papered over.
+    want = NamedSharding(mesh, P("data"))
     for field in ("seq_lens", "page_indices", "cu_q_lens", "cu_kv_lens", "distribution"):
-        setattr(
-            backend.forward_metadata,
-            field,
-            put_i32(getattr(backend.forward_metadata, field), P("data")),
-        )
+        got = getattr(backend.forward_metadata, field).sharding
+        assert got.is_equivalent_to(want, 1), f"metadata {field} sharded {got}, want {want}"
 
     # ForwardBatch.init_new is the production entrypoint (see test_flashattention_dp.py).
     # It device_puts every per-token/per-request array under
