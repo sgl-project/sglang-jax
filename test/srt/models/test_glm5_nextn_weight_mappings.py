@@ -118,7 +118,9 @@ class TestGlm5NextNWeightMappings(unittest.TestCase):
                     )
                     for target in targets:
                         loader._get_param(model, target)
-                loader.load(mappings, dummy=True)
+                # Full entry point the draft worker calls (dummy mode: same hooks, no I/O); a stale
+                # post-load call or loader API drift fails here instead of at server boot.
+                model.load_weights(model_config)
                 validate_model_parameters(model, allow_shared=True)
                 self.assertEqual(
                     model.get_shared_weight_paths(), ("embed_tokens.embedding", "lm_head.embedding")

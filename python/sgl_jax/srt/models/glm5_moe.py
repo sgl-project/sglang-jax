@@ -1591,19 +1591,10 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
             model=self, model_config=model_config, mesh=self.mesh, dtype=self.dtype
         )
         mappings = self._create_weight_mappings(model_config)
+        # MLA absorption and fused-MLP packing run inside loader.load via the
+        # modules' prepare_weight_loading hooks (#1716); no post-load pass.
         self.loader.load(mappings)
         prepad_replicated_quantized_linears(self)
-
-        # Apply post_load_weights logic for Draft
-        self.mtp_block.self_attn.post_load_weights()
-        if hasattr(self.mtp_block, "mlp") and hasattr(self.mtp_block.mlp, "post_load_weights"):
-            self.mtp_block.mlp.post_load_weights()
-        if (
-            hasattr(self.mtp_block, "shared_experts")
-            and self.mtp_block.shared_experts is not None
-            and hasattr(self.mtp_block.shared_experts, "post_load_weights")
-        ):
-            self.mtp_block.shared_experts.post_load_weights()
 
     def get_shared_weight_paths(self):
         # Filled from the target model by EagleDraftWorker._share_embed_head.
