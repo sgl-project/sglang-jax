@@ -33,8 +33,8 @@ _SMALL_INPUT_VMEM_FRACTION = 0.6
 _SUPPORTED_GATHER_BITS = (8, 16, 32)
 
 
-def moe_sc_permute_enabled_by_env() -> bool:
-    return get_bool_env_var(ENV_FLAG, "false")
+def moe_sc_permute_enabled_by_env(default: str = "false") -> bool:
+    return get_bool_env_var(ENV_FLAG, default)
 
 
 def sparse_core_available() -> bool:
