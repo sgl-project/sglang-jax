@@ -915,10 +915,12 @@ def make_gmm_configs(
         and rhs_quant_dtype is not None
         and not jnp.issubdtype(rhs_quant_dtype, jnp.floating)
     ):
-        # Per-channel integer weights (int4 W4A8): the activation quantization
-        # block is free to choose. 512 costs accuracy against the FP8 block-128
-        # baseline (GLM-5.2 gsm8k p1-200: 0.930 at 512 vs 0.955 at 128, same
-        # weights, 2026-09-29), so match the FP8 path's 128-element granularity.
+        # Per-channel integer weights (int4 W4A8): default to the FP8 W8A8 path's
+        # 128-element activation granularity so the only numerical difference
+        # from the FP8 baseline is the weight quantization itself. Larger blocks
+        # trade accuracy for throughput (GLM-5.2 tp8, 2026-09-29: 512 -> gsm8k
+        # p1-200 0.930 vs 0.955, cc64 +44%); set SGLANG_JAX_GMM_LHS_QBLOCK to
+        # opt into 256/512 when throughput matters more than parity.
         lhs_quant_block_size = 128
 
     lhs_cfgs = InputConfigs(
