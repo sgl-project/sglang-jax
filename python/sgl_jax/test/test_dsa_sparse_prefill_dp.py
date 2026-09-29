@@ -184,17 +184,14 @@ def _build(workload: _Workload, mesh: jax.sharding.Mesh, cache_loc=None):
     # MLA's get_forward_metadata strides it by page_size to get page_indices.
     per_dp_loc = PAGES_PER_RANK * PAGE_SIZE
     if cache_loc is None:
-        cache_loc = np.zeros(dp * per_dp_loc, dtype=np.int32)
-        _fill_default_cache_loc = True
+        # Slot ids are RANK-LOCAL: the KV page axis is sharded P("data"), so
+        # each rank indexes its own window. Like the paged allocator, hand out
+        # pages 1..PAGES_PER_RANK and never page 0, which it reserves (padding
+        # writes are routed there). Using page 0 would hide any bug that
+        # clobbers the reserved page or the last allocatable one.
+        cache_loc = np.tile(np.arange(PAGE_SIZE, PAGE_SIZE + per_dp_loc, dtype=np.int32), dp)
     else:
         cache_loc = np.asarray(cache_loc, dtype=np.int32)
-        _fill_default_cache_loc = False
-    # Slot ids are RANK-LOCAL: the KV page axis is sharded P("data"), so each
-    # rank indexes its own [PAGES_PER_RANK] window. This mirrors the allocator,
-    # which hands out rank-local ids from a `size_per_rank` free list.
-    for r in range(dp):
-        if _fill_default_cache_loc:
-            cache_loc[r * per_dp_loc : (r + 1) * per_dp_loc] = np.arange(per_dp_loc, dtype=np.int32)
 
     # Track where each request's rows landed so callers can slice outputs back
     # out per request rather than reasoning about the padded layout.
@@ -230,7 +227,11 @@ def _build(workload: _Workload, mesh: jax.sharding.Mesh, cache_loc=None):
             idx_w[lo:hi] = payload["idx_w"]
 
             positions[lo:hi] = np.arange(q_len)
-            out_cache_loc[lo:hi] = np.arange(cum_kv, cum_kv + q_len, dtype=np.int32)
+            # The kernel self-writes through out_cache_loc and reads through
+            # page_indices (strided from cache_loc), so both must name the same
+            # slots.
+            rank_loc = cache_loc[r * per_dp_loc : (r + 1) * per_dp_loc]
+            out_cache_loc[lo:hi] = rank_loc[cum_kv : cum_kv + q_len]
             seq_lens[slot] = q_len
             extend_seq_lens[slot] = q_len
 
@@ -562,10 +563,11 @@ class TestDSASparsePrefillDP(CustomTestCase):
         """
         dp = 2
         per_dp_loc = PAGES_PER_RANK * PAGE_SIZE
-        # Rank r's window rotated by r pages. Still entirely rank-local — every
-        # id < per_dp_loc — but distinguishable between ranks.
+        # Rank r's window rotated by r pages. Still entirely rank-local — pages
+        # 1..PAGES_PER_RANK, as the allocator hands out — but distinguishable
+        # between ranks.
         cache_loc = np.concatenate(
-            [(np.arange(per_dp_loc) + r * PAGE_SIZE) % per_dp_loc for r in range(dp)]
+            [(np.arange(per_dp_loc) + r * PAGE_SIZE) % per_dp_loc + PAGE_SIZE for r in range(dp)]
         ).astype(np.int32)
 
         workload = _Workload([[96], [64]])
@@ -581,12 +583,13 @@ class TestDSASparsePrefillDP(CustomTestCase):
                 "ranks are being mixed or offset",
             )
         # A global (rather than rank-local) id space would push ids past the
-        # per-rank window.
-        self.assertLess(
+        # per-rank window; page 0 is the allocator's reserved page.
+        self.assertLessEqual(
             int(pages.max()),
             PAGES_PER_RANK,
             "a page id reaches past its rank's own window — ids are not rank-local",
         )
+        self.assertGreaterEqual(int(pages.min()), 1, "a page id hits the reserved page 0")
         # Sensitivity control: the per-rank checks above must be able to fail.
         self.assertFalse(
             np.array_equal(pages[0], pages[1]),
