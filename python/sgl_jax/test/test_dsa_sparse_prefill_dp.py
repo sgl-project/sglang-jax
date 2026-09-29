@@ -24,14 +24,20 @@ tensor half of every spec would go unverified.
 from __future__ import annotations
 
 import os
+import re
 
-# Must precede the first jax import: the DP meshes below need >1 CPU device.
+# Must precede the first jax import: the DP meshes below need 8 CPU devices.
 # Append rather than setdefault — XLA_FLAGS set for any unrelated reason
-# (--xla_dump_to=..., a profiling flag) would otherwise drop the device count,
-# leaving one device, and this file is the DP gate in unit-test-cpu.
-if "xla_force_host_platform_device_count" not in os.environ.get("XLA_FLAGS", ""):
+# (--xla_dump_to=..., a profiling flag) would otherwise drop the device count.
+# An existing count below 8 is dropped first rather than kept: with 2-7 devices
+# every DP case but the smallest would skip, and pytest would report the gate
+# green. Only os.environ assignments, which ruff's E402 allows before imports.
+os.environ["XLA_FLAGS"] = re.sub(
+    r"--xla_force_host_platform_device_count=[0-7]\b", "", os.environ.get("XLA_FLAGS", "")
+)
+if "xla_force_host_platform_device_count" not in os.environ["XLA_FLAGS"]:
     os.environ["XLA_FLAGS"] = (
-        os.environ.get("XLA_FLAGS", "") + " --xla_force_host_platform_device_count=8"
+        os.environ["XLA_FLAGS"] + " --xla_force_host_platform_device_count=8"
     ).strip()
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
@@ -57,9 +63,10 @@ from sgl_jax.test.test_utils import CustomTestCase
 # Fail at import rather than skip: on CPU the device count is forced above, so
 # too few devices means the flag did not take effect, not that the machine is
 # small. Skipping there would report a green run with zero DP coverage.
-if jax.default_backend() == "cpu" and jax.device_count() < 2:
+_MIN_CPU_DEVICES = 8
+if jax.default_backend() == "cpu" and jax.device_count() < _MIN_CPU_DEVICES:
     raise RuntimeError(
-        f"expected >=2 simulated CPU devices, got {jax.device_count()}; "
+        f"expected >={_MIN_CPU_DEVICES} simulated CPU devices, got {jax.device_count()}; "
         f"XLA_FLAGS={os.environ.get('XLA_FLAGS')!r} did not take effect"
     )
 
