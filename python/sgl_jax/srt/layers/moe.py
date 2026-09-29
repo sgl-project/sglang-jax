@@ -1,6 +1,7 @@
 """GMM-based Expert-Parallel MoE layer and weight mapping utilities."""
 
 import math
+import os
 from functools import partial
 
 import jax
@@ -29,6 +30,34 @@ from sgl_jax.srt.utils.quantization.quantization_utils import (
     quantize_tensor_simple,
 )
 
+_INVERSE_BY_SORT_ENV = os.environ.get("SGL_JAX_MOE_INVERSE_BY_SORT")
+_GMM2_NO_ZERO_INIT = os.environ.get("SGL_JAX_MOE_GMM2_NO_ZERO_INIT", "1") == "1"
+_RANK_SORT_MAX_ENTRIES = int(os.environ.get("SGL_JAX_MOE_RANK_SORT_MAX_ENTRIES", "1024"))
+
+
+def _stable_argsort_small(keys):
+    """Match stable argsort for a short expert-ID vector without a sort."""
+    n = int(keys.shape[0])
+    if n > _RANK_SORT_MAX_ENTRIES:
+        return jnp.argsort(keys, stable=True)
+    keys = jnp.asarray(keys, jnp.int32)
+    index = jnp.arange(n, dtype=jnp.int32)
+    before = (keys[None, :] < keys[:, None]) | (
+        (keys[None, :] == keys[:, None]) & (index[None, :] < index[:, None])
+    )
+    rank = jnp.sum(before.astype(jnp.int32), axis=1)
+    return jnp.sum(jnp.where(rank[:, None] == index[None, :], index[:, None], 0), axis=0)
+
+
+def _inverse_permutation_small(perm):
+    """Match argsort for a short permutation vector without a sort."""
+    n = int(perm.shape[0])
+    if n > _RANK_SORT_MAX_ENTRIES:
+        return jnp.argsort(perm).astype(jnp.int32)
+    index = jnp.arange(n, dtype=jnp.int32)
+    perm = jnp.asarray(perm, jnp.int32)
+    return jnp.sum(jnp.where(perm[None, :] == index[:, None], index[None, :], 0), axis=1)
+
 
 class EPMoE(nnx.Module):
     def __init__(
@@ -50,8 +79,15 @@ class EPMoE(nnx.Module):
         pre_gather_quant_dtype=None,
         moe_dp_size: int = 1,
         use_sc_permute: bool | None = None,
+        sort_free_permute: bool = False,
     ):
         self.num_experts_per_tok = num_experts_per_tok
+        self.sort_free_permute = bool(sort_free_permute)
+        self.inverse_by_sort = (
+            _INVERSE_BY_SORT_ENV == "1"
+            if _INVERSE_BY_SORT_ENV is not None
+            else self.sort_free_permute
+        )
         # Opt-in SparseCore permute/unpermute kernels; ``None`` defers to the env flag.
         self.use_sc_permute = (
             moe_sc_permute_enabled_by_env() if use_sc_permute is None else bool(use_sc_permute)
@@ -187,6 +223,42 @@ class EPMoE(nnx.Module):
             return can_use_ragged, primary_device
         except Exception as _:
             return False, "cpu"
+
+    def _apply_activation(self, layer_w0: jax.Array, layer_w1: jax.Array) -> jax.Array:
+        """Gated activation between the two GEMMs. Overridable for gates this one lacks.
+
+        ``layer_w0`` is the gate branch (``wi_0``/``w1``), ``layer_w1`` the up branch
+        (``wi_1``/``w3``). Kimi-K3 overrides this with SITU, which is not expressible as
+        ``f(gate) * up`` with an elementwise ``f`` -- it consumes both branches together.
+        """
+        if self.activation == "silu":
+            return jax.nn.silu(layer_w0) * layer_w1
+        if self.activation == "gelu":
+            return jax.nn.gelu(layer_w0) * layer_w1
+        if self.activation == "swigluoai":
+            gate = jnp.clip(layer_w0, max=self.swiglu_limit)
+            up = jnp.clip(layer_w1, -self.swiglu_limit, self.swiglu_limit)
+            return (up + 1.0) * gate * jax.nn.sigmoid(gate * self.swiglu_alpha)
+        raise ValueError(f"Unsupported activation function {self.activation}")
+
+    def _call_gmm(self, **kwargs):
+        """The GMM this MoE runs on. Overridable so a subclass can swap the kernel.
+
+        A method rather than an attribute on purpose: nnx traverses module *state*, and a callable
+        stored on the instance would be walked by split/jit. Class-level methods are not state.
+
+        Default is the module-level `gmm`, so every existing model is unchanged. Kimi-K3 overrides
+        it with the fp4-capable megablox kernel -- this backend has no sub-byte path.
+        """
+        return gmm(**kwargs)
+
+    def _apply_activation_with_context(self, layer_w0, layer_w1, *, local_range=None):
+        """Pass execution context without changing the two-input activation hook.
+
+        Subclasses that only override ``_apply_activation`` (including Kimi-K3)
+        inherit this adapter. Models with row-restricted kernels can override it.
+        """
+        return self._apply_activation(layer_w0, layer_w1)
 
     def _normalize_scale_for_gmm(
         self,
@@ -504,6 +576,16 @@ class EPMoE(nnx.Module):
             ]
         )
         scatter_on_tensor = "tensor" in out_specs
+        # In pure expert parallelism, the model mesh's tensor axis covers the
+        # same devices as this mesh's expert axis. Match the epic V4 sequence-
+        # parallel path by reducing directly into token-sharded output rows.
+        scatter_on_expert = False
+        if self.tp_size == 1 and self.ep_size > 1 and len(out_sharding.spec) > 0:
+            token_axis = out_sharding.spec[0]
+            if token_axis == "tensor" or (isinstance(token_axis, tuple) and "tensor" in token_axis):
+                scatter_on_expert = True
+                out_specs = P("expert", *out_specs[1:])
+                scatter_on_tensor = False
 
         # Run MoE computation on the expert-parallel mesh
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
@@ -529,7 +611,11 @@ class EPMoE(nnx.Module):
             )
 
             result = shard_map(
-                partial(self._forward, scatter_on_tensor=scatter_on_tensor),
+                partial(
+                    self._forward,
+                    scatter_on_tensor=scatter_on_tensor,
+                    scatter_on_expert=scatter_on_expert,
+                ),
                 mesh=self.moe_mesh,
                 in_specs=(
                     P(None),
@@ -633,6 +719,7 @@ class EPMoE(nnx.Module):
         wo_kernel_bias=None,
         *,
         scatter_on_tensor: bool = False,
+        scatter_on_expert: bool = False,
     ):
         expert_shard_id = (
             jnp.array(0, dtype=jnp.int32)
@@ -700,7 +787,10 @@ class EPMoE(nnx.Module):
             else:
                 output = jax.lax.psum(output, "tensor")
         if self.ep_size > 1:
-            output = self._combine(output)
+            if scatter_on_expert:
+                output = jax.lax.psum_scatter(output, "expert", scatter_dimension=0, tiled=True)
+            else:
+                output = self._combine(output)
 
         return output
 
@@ -761,7 +851,7 @@ class EPMoE(nnx.Module):
         )
 
         # === GEMM1: x @ w0 and x @ w1 ===
-        layer_w0 = gmm(
+        layer_w0 = self._call_gmm(
             lhs=x,
             rhs=w0_kernel,
             rhs_scale=w0_kernel_scale,
@@ -770,7 +860,7 @@ class EPMoE(nnx.Module):
             activation_quantized_dtype=act_q_dtype,
             **gmm_kwargs,
         )
-        layer_w1 = gmm(
+        layer_w1 = self._call_gmm(
             lhs=x,
             rhs=w1_kernel,
             rhs_scale=w1_kernel_scale,
@@ -781,24 +871,18 @@ class EPMoE(nnx.Module):
         )
 
         # === Activation ===
-        if self.activation == "silu":
-            intermediate_layer = jax.nn.silu(layer_w0) * layer_w1
-        elif self.activation == "gelu":
-            intermediate_layer = jax.nn.gelu(layer_w0) * layer_w1
-        elif self.activation == "swigluoai":
-            gate = jnp.clip(layer_w0, max=self.swiglu_limit)
-            up = jnp.clip(layer_w1, -self.swiglu_limit, self.swiglu_limit)
-            intermediate_layer = (up + 1.0) * gate * jax.nn.sigmoid(gate * self.swiglu_alpha)
-        else:
-            raise ValueError(f"Unsupported activation function {self.activation}")
+        intermediate_layer = self._apply_activation_with_context(
+            layer_w0, layer_w1, local_range=local_range
+        )
 
         # === GEMM2: intermediate @ wo ===
-        return gmm(
+        zero_init = not (_GMM2_NO_ZERO_INIT and local_range is not None and self.use_sc_permute)
+        return self._call_gmm(
             lhs=intermediate_layer,
             rhs=wo_kernel,
             rhs_scale=wo_kernel_scale,
             rhs_bias=wo_kernel_bias,
-            zero_initialize=True,
+            zero_initialize=zero_init,
             activation_quantized_dtype=act_q_dtype,
             **gmm_kwargs,
         )
@@ -845,7 +929,11 @@ class EPMoE(nnx.Module):
             )
 
         flatten_selected_experts = jnp.ravel(top_k_indices)
-        sorted_selected_experts = jnp.argsort(flatten_selected_experts, stable=True)
+        sorted_selected_experts = (
+            _stable_argsort_small(flatten_selected_experts)
+            if self.sort_free_permute
+            else jnp.argsort(flatten_selected_experts, stable=True)
+        )
         # token_indices: maps each sorted position to the original token index.
         # Pass to _gmm_compute so the gather happens there (indexed_gmm pattern),
         # avoiding a full [M*top_k, D] materialization in _permute.
@@ -886,7 +974,9 @@ class EPMoE(nnx.Module):
                 intermediate = jnp.concatenate([intermediate, padding], axis=0)
 
         argsort_indices = (
-            jnp.zeros(expected_tokens, dtype=jnp.int32)
+            _inverse_permutation_small(sorted_selected_experts)
+            if self.inverse_by_sort
+            else jnp.zeros(expected_tokens, dtype=jnp.int32)
             .at[sorted_selected_experts]
             .set(jnp.arange(expected_tokens, dtype=jnp.int32))
         )
