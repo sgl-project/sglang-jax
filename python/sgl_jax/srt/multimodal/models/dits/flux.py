@@ -7,10 +7,11 @@ import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
-from transformers import modeling_flax_utils
 
+from sgl_jax.srt.layers.activation import ACT2FN
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
+from sgl_jax.srt.model_loader.weights import WeightLoader
 from sgl_jax.srt.multimodal.configs.dits.flux_model_config import FluxModelConfig
 from sgl_jax.srt.multimodal.layers.adalayernorm import (
     FluxAdaLayerNormContinuous,
@@ -26,7 +27,6 @@ from sgl_jax.srt.multimodal.layers.visual_embedding import (
     _apply_flux_rotary_emb,
 )
 from sgl_jax.srt.multimodal.models.dits.flux_dit_weights_mapping import to_mappings
-from sgl_jax.srt.utils.weight_utils import WeightLoader
 
 logger = logging.getLogger(__name__)
 _SUPPORTED_ATTENTION_IMPLS = ("usp", "sdpa")
@@ -59,6 +59,14 @@ def _sdpa_attention(
     q = query.astype(jnp.float32)
     k = key.astype(jnp.float32)
     v = value.astype(jnp.float32)
+
+    if query.shape[0] == 1:
+        sharding = jax.typeof(q).sharding
+        if isinstance(sharding, NamedSharding) and not sharding.mesh.empty:
+            # JAX's grouped-query reshape drops the singleton batch sharding
+            # from Q. Match K/V at the boundary while preserving head sharding.
+            sharding = NamedSharding(sharding.mesh, P(None, *sharding.spec[1:]))
+            q, k, v = (jax.sharding.reshard(x, sharding) for x in (q, k, v))
 
     output = jax.nn.dot_product_attention(
         q,
@@ -354,7 +362,7 @@ class FluxSingleTransformerBlock(nnx.Module):
             params_dtype=params_dtype,
             kernel_axes=("tensor", None),
         )
-        self.act_mlp = modeling_flax_utils.ACT2FN["gelu_pytorch_tanh"]
+        self.act_mlp = ACT2FN["gelu_pytorch_tanh"]
         self.attn = FluxAttention(
             query_dim=dim,
             dim_head=attention_head_dim,
@@ -769,9 +777,7 @@ class FluxTransformer2DModel(nnx.Module):
             mesh=self.mesh,
             dtype=self.model_config.weights_dtype,
         )
-        loader.load_weights_from_safetensors(
-            to_mappings(has_guidance_embeds=self.model_config.guidance_embeds)
-        )
+        loader.load(to_mappings(has_guidance_embeds=self.model_config.guidance_embeds))
 
 
 EntryClass = FluxTransformer2DModel

@@ -37,6 +37,7 @@ from sgl_jax.srt.mem_cache.allocator import (
 )
 from sgl_jax.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    DecLockRefParams,
     EvictParams,
     MatchPrefixParams,
 )
@@ -48,9 +49,17 @@ from sgl_jax.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sgl_jax.srt.mem_cache.radix_cache import RadixKey
+from sgl_jax.srt.mem_cache.radix_cache import RadixKey, build_radix_key
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
+from sgl_jax.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sgl_jax.srt.multimodal.common.modality_enum import MultimodalInputs
+from sgl_jax.srt.multimodal.in_model.embedding_pool import EmbeddingPool
+from sgl_jax.srt.multimodal.in_model.host_orchestration import (
+    MultimodalBatch,
+    build_multimodal_batch,
+)
+from sgl_jax.srt.multimodal.in_model.lane_packing import encoder_num_lanes
 from sgl_jax.srt.precision_tracer import (
     PrecisionTracerRequestMetadata,
     precision_tracer,
@@ -77,6 +86,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "speculative_accept_threshold_acc",
     "enable_deterministic_sampling",
     "pd_disaggregation",
+    "precompile_vision_patch_paddings",
 ]
 
 
@@ -189,6 +199,7 @@ class Req:
         multimodal_embedding: list[list[float]] | None = None,
         deepstack_visual_embedding: list[list[float]] | None = None,
         deepstack_visual_pos_mask: list[int] | None = None,
+        radix_input_ids: list[int] | None = None,
     ):
         # Input and output info
         self.rid = rid
@@ -200,13 +211,12 @@ class Req:
             else origin_input_ids  # Before image padding
         )
         self.origin_input_ids = origin_input_ids
-
-        # Cache input IDs with hash-based values for multimodal placeholder tokens
-        # Used for radix cache matching to differentiate different images/videos
-        # If None, origin_input_ids is used for cache matching
-        self.cache_input_ids: list[int] | None = None
-        # Multimodal inputs (e.g., mrope positions) from tokenizer
-        self.mm_inputs: dict | None = None
+        self.radix_input_ids = (
+            radix_input_ids if radix_input_ids is not None else list(origin_input_ids)
+        )
+        assert len(self.origin_input_ids) == len(self.radix_input_ids)
+        # Multimodal inputs (e.g., image items and mrope positions) from tokenizer.
+        self.mm_inputs: MultimodalInputs | dict | None = None
 
         # Each decode stage's output ids
         self.output_ids = []
@@ -293,6 +303,9 @@ class Req:
         self.last_host_node: Any = None
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: int | None = None
+        # Exact acquire receipt.  The UUID is only the legacy compatibility
+        # mirror; component releases also need their skip-node set.
+        self.cache_lock_params: DecLockRefParams | None = None
         # SWA eviction: sequence positions [0, swa_evicted_seqlen) have had
         # their SWA pool slots freed (no longer in the sliding window).
         self.swa_evicted_seqlen: int = 0
@@ -489,7 +502,7 @@ class Req:
                 )
                 match_result = tree_cache.match_prefix(
                     MatchPrefixParams(
-                        key=RadixKey(self.adjust_max_prefix_ids(), self.extra_key, self.dp_rank),
+                        key=self.match_key(),
                         cow_recurrent=(
                             tree_cache.supports_recurrent() and not is_running_recurrent
                         ),
@@ -521,8 +534,17 @@ class Req:
         if self.return_logprob:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
 
+        if self.return_hidden_states:
+            # KV prefix hits do not contain hidden states. Reuse only positions
+            # already captured for this request (including completed chunks).
+            max_prefix_len = min(max_prefix_len, len(self.hidden_states))
+
         max_prefix_len = max(max_prefix_len, 0)
         return self.fill_ids[:max_prefix_len]
+
+    def match_key(self) -> RadixKey:
+        real_prefix = self.adjust_max_prefix_ids()
+        return build_radix_key(self, len(real_prefix))
 
     def pop_committed_kv_cache(self) -> int:
         # Idempotent: the PD prefill abort path can run release a second time
@@ -579,20 +601,22 @@ class Req:
             self.to_finish = None
             return
 
+        # An accepted block may cross both EOS and the length limit.
+        new_accepted_tokens = self.output_ids[-new_accepted_len:]
+        if (
+            self._check_token_based_finish(new_accepted_tokens=new_accepted_tokens)
+            and self.finished_len < self.sampling_params.max_new_tokens
+        ):
+            return
+
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
             self.finished_reason = FINISH_LENGTH(length=self.sampling_params.max_new_tokens)
+            self.finished_len = self.sampling_params.max_new_tokens
             return
 
         # Check grammar termination
         if self.grammar is not None and self.grammar.is_terminated():
             self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
-            return
-
-        new_accepted_tokens = self.output_ids[-new_accepted_len:]
-        # if hasattr(last_token_id, "item"):
-        #     last_token_id = last_token_id.item()
-        # last_token_id = int(last_token_id)
-        if self._check_token_based_finish(new_accepted_tokens=new_accepted_tokens):
             return
 
         if self._check_vocab_boundary_finish(new_accepted_tokens):
@@ -657,6 +681,7 @@ class Req:
         self.prefix_indices = []
         self.last_node = None
         self.swa_uuid_for_lock = None
+        self.cache_lock_params = None
         self.extend_input_len = 0
         self.is_retracted = True
         self.input_token_logprobs = None
@@ -691,6 +716,7 @@ class Req:
     def set_finish_with_abort(self, error_msg: str):
         # set it to one token to skip the long prefill
         self.origin_input_ids = [0]
+        self.radix_input_ids = [0]
         self.grammar = None
         self.return_logprob = False
         self.to_finish = FINISH_ABORT(error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError")
@@ -847,6 +873,9 @@ class ScheduleBatch:
 
     # Memory pool and cache (shared across all DP ranks)
     req_to_token_pool: ReqToTokenPool = None
+
+    embedding_pool: EmbeddingPool | None = None
+
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
     tree_cache: BasePrefixCache = None
     is_hybrid: bool = False
@@ -920,6 +949,7 @@ class ScheduleBatch:
             list[Req | None] | None
         ) = None,  # Per-DP chunked requests: list of length dp_size
         mesh: mesh_lib.Mesh = None,
+        embedding_pool: EmbeddingPool | None = None,
     ):
         # Validate input
         assert len(reqs) == dp_size, f"reqs length {len(reqs)} != dp_size {dp_size}"
@@ -938,8 +968,10 @@ class ScheduleBatch:
         is_hybrid = False
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
             assert tree_cache is None or isinstance(
-                tree_cache, (SWARadixCache, ChunkCache)
-            ), "SWARadixCache or ChunkCache is required for SWATokenToKVPoolAllocator"
+                tree_cache, (SWARadixCache, ChunkCache, UnifiedRadixCache)
+            ), "An SWA cache is required for SWATokenToKVPoolAllocator"
+            if isinstance(tree_cache, UnifiedRadixCache) and not tree_cache.supports_swa():
+                raise ValueError("UnifiedRadixCache requires its SWA component")
             is_hybrid = True
 
         is_hybrid_recurrent = isinstance(req_to_token_pool, HybridReqToTokenPool)
@@ -955,12 +987,14 @@ class ScheduleBatch:
         return cls(
             reqs_info=reqs_info,
             req_to_token_pool=req_to_token_pool,
+            embedding_pool=embedding_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
             is_hybrid=is_hybrid,
             is_hybrid_recurrent=is_hybrid_recurrent,
             model_config=model_config,
             return_logprob=return_logprob,
+            return_hidden_states=any(req.return_hidden_states for req in all_reqs),
             return_output_logprob_only=return_output_logprob_only,
             enable_overlap=enable_overlap,
             has_stream=any(req.stream for req in all_reqs),
@@ -1586,6 +1620,14 @@ class ScheduleBatch:
                 if not info.reqs:
                     continue
                 for req in info.reqs:
+                    if isinstance(self.tree_cache, UnifiedRadixCache):
+                        safe_offset = 1 if self.enable_overlap else 0
+                        if (
+                            req.decode_batch_idx >= safe_offset
+                            and (req.decode_batch_idx - safe_offset) % evict_interval == 0
+                        ):
+                            self.tree_cache.evict_req_swa(req, req.seqlen - 1, dp_rank=dp_rank)
+                        continue
                     if isinstance(self.tree_cache, ChunkCache):
                         # ChunkCache/SWAChunkCache: no tree-node overlap concern,
                         # evict on every decode step to prevent SWA exhaustion.
@@ -1606,6 +1648,21 @@ class ScheduleBatch:
             return
 
         if self.forward_mode is None or not self.forward_mode.is_extend():
+            return
+
+        if isinstance(self.tree_cache, UnifiedRadixCache):
+            chunked_prefill_size = global_server_args_dict["chunked_prefill_size"]
+            for dp_rank, info in enumerate(self.reqs_info):
+                if not info.reqs or not info.prefix_lens:
+                    continue
+                for idx, req in enumerate(info.reqs):
+                    pre_len = info.prefix_lens[idx]
+                    if self.enable_overlap:
+                        if req.extend_batch_idx < 2:
+                            continue
+                        if chunked_prefill_size is not None and chunked_prefill_size > 0:
+                            pre_len -= chunked_prefill_size
+                    self.tree_cache.evict_req_swa(req, pre_len, dp_rank=dp_rank)
             return
 
         # For SWARadixCache with active tree, extend-time SWA ownership stays
@@ -1667,7 +1724,7 @@ class ScheduleBatch:
         # (asserts shape[0] == batch_size); rebuild via _concat, run it, then
         # split allocate_lens back to per-rank.
         if self.spec_algorithm is not None and (
-            self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash()
+            self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash_family()
         ):
             for info in self.reqs_info:
                 if not info.reqs:
@@ -1901,6 +1958,7 @@ class ScheduleBatch:
 
         if len(all_reqs) > 0:
             self.return_logprob = any(req.return_logprob for req in all_reqs)
+            self.return_hidden_states = any(req.return_hidden_states for req in all_reqs)
             self.return_output_logprob_only = all(
                 req.return_output_logprob_only for req in all_reqs
             )
@@ -1908,6 +1966,7 @@ class ScheduleBatch:
             self.has_grammar = any(req.grammar for req in all_reqs)
         else:
             self.return_logprob = False
+            self.return_hidden_states = False
             self.return_output_logprob_only = False
             self.has_stream = False
             self.has_grammar = False
@@ -2128,9 +2187,8 @@ class ScheduleBatch:
         is_decode = self.forward_mode.is_decode()
 
         has_mrope = any(
-            _extract_mm_value(getattr(req, "mm_inputs", None), "mrope_positions") is not None
-            or _extract_mm_value(getattr(req, "mm_inputs", None), "mrope_position_delta")
-            is not None
+            _extract_mm_value(req.mm_inputs, "mrope_positions") is not None
+            or _extract_mm_value(req.mm_inputs, "mrope_position_delta") is not None
             for info in self.reqs_info
             if info.reqs
             for req in info.reqs
@@ -2163,9 +2221,7 @@ class ScheduleBatch:
                 if mrope is not None:
                     for req, seq_len in zip(info.reqs, info.seq_lens):
                         base_pos = int(seq_len) - 1
-                        delta = _extract_mm_value(
-                            getattr(req, "mm_inputs", None), "mrope_position_delta"
-                        )
+                        delta = _extract_mm_value(req.mm_inputs, "mrope_position_delta")
                         if delta is not None:
                             base_pos += _as_int_scalar(delta)
                         mrope[:, offset + local] = base_pos
@@ -2192,9 +2248,7 @@ class ScheduleBatch:
 
                 # mrope_positions: 3-D positions, slice with fallback.
                 if mrope is not None:
-                    mm_positions = _extract_mm_value(
-                        getattr(req, "mm_inputs", None), "mrope_positions"
-                    )
+                    mm_positions = _extract_mm_value(req.mm_inputs, "mrope_positions")
                     if mm_positions is None:
                         # Text-only req in a mixed mrope batch: 1-D positions
                         # broadcast to 3 rows (T==H==W), matching the model's
@@ -2202,15 +2256,27 @@ class ScheduleBatch:
                         base = np.arange(start, start + ext_len, dtype=np.int32)
                         mchunk = np.broadcast_to(base.reshape(1, -1), (3, ext_len))
                     else:
-                        mchunk = np.asarray(mm_positions)[:, start : start + ext_len]
-                        if mchunk.size == 0:
-                            delta = _extract_mm_value(
-                                getattr(req, "mm_inputs", None), "mrope_position_delta"
-                            )
-                            base = np.arange(start, start + ext_len, dtype=np.int32)
+                        mm_positions = np.asarray(mm_positions)
+                        positions_len = mm_positions.shape[1]
+                        known_end = min(end, positions_len)
+                        known_len = max(known_end - start, 0)
+                        mchunk = np.empty((3, ext_len), dtype=np.int32)
+                        if known_len:
+                            mchunk[:, :known_len] = mm_positions[:, start:known_end]
+
+                        # mRoPE positions only cover the original multimodal
+                        # prompt.  A retracted decode request is re-prefilled
+                        # with ``origin_input_ids + output_ids``, so its extend
+                        # window can straddle the end of that array.  Continue
+                        # generated-token positions exactly like decode mode
+                        # instead of assigning a short slice into ``ext_len``.
+                        if known_len < ext_len:
+                            delta = _extract_mm_value(req.mm_inputs, "mrope_position_delta")
+                            tail_start = start + known_len
+                            base = np.arange(tail_start, end, dtype=np.int32)
                             if delta is not None:
                                 base = base + _as_int_scalar(delta)
-                            mchunk = np.broadcast_to(base.reshape(1, -1), (3, ext_len))
+                            mchunk[:, known_len:] = base
                     mrope[:, offset + local : offset + local + ext_len] = mchunk
 
                 # deepstack: densify sparse visual rows into batched layout,
@@ -2457,13 +2523,8 @@ class ScheduleBatch:
         Returns:
             Merged SamplingBatchInfo
         """
-        # Collect all requests for grammar support
-        all_reqs = []
-        for info in self.reqs_info:
-            if info.reqs:
-                all_reqs.extend(info.reqs)
-
         # Initialize merged arrays (with padding)
+        grammars = [None] * total_bs if self.has_grammar else None
         temperatures = np.ones((total_bs, 1), dtype=np.float32)
         top_ps = np.ones(total_bs, dtype=np.float32)
         top_ks = np.ones(total_bs, dtype=np.int32)
@@ -2478,6 +2539,10 @@ class ScheduleBatch:
 
         for dp_rank in range(self.dp_size):
             info = self.reqs_info[dp_rank]
+
+            if grammars is not None:
+                for i, req in enumerate(info.reqs or []):
+                    grammars[offset_bs + i] = req.grammar
 
             if info.sampling_info is None or info.seq_lens is None or len(info.seq_lens) == 0:
                 offset_bs += per_dp_bs_size
@@ -2503,10 +2568,20 @@ class ScheduleBatch:
                     has_sampling_seeds = True
                 sampling_seeds[offset_bs : offset_bs + dp_bs] = dp_sampling.sampling_seeds[:dp_bs]
 
-            # Compute per-DP penalties (no-op if not required) and stitch into the
-            # merged buffer using the same per-DP slot offset as the other arrays.
-            dp_sampling.update_penalties()
-            if dp_sampling.linear_penalty is not None and dp_sampling.linear_penalty.size > 0:
+            # Write directly into a fresh merged buffer. Never reuse storage
+            # across steps: the previous batch may still be transferring to TPU.
+            orchestrator = dp_sampling.penalizer_orchestrator
+            if orchestrator is not None:
+                penalty_out = None
+                if orchestrator.is_required:
+                    if linear_penalty is None:
+                        linear_penalty = np.zeros(
+                            (total_bs, dp_sampling.vocab_size), dtype=np.float32
+                        )
+                    penalty_out = linear_penalty[offset_bs : offset_bs + dp_bs]
+                dp_sampling.update_penalties(out=penalty_out)
+            elif dp_sampling.linear_penalty is not None and dp_sampling.linear_penalty.size:
+                # Worker-side sampling info may already contain computed penalties.
                 if linear_penalty is None:
                     linear_penalty = np.zeros(
                         (total_bs, dp_sampling.linear_penalty.shape[1]),
@@ -2526,8 +2601,19 @@ class ScheduleBatch:
             is_all_greedy=is_all_greedy,
             sampling_seeds=sampling_seeds if has_sampling_seeds else None,
             linear_penalty=linear_penalty,
-            grammars=[req.grammar for req in all_reqs] if self.has_grammar else None,
+            grammars=grammars,
         )
+
+    def _merge_lora_ids(
+        self, per_dp_bs_size: int, total_bs: int, enable_static_lora: bool
+    ) -> list[str]:
+        """Place adapters in the same DP-padded request slots as seq_lens."""
+        lora_ids = ["0"] * total_bs
+        if not enable_static_lora:
+            for rank, info in enumerate(self.reqs_info):
+                for i, req in enumerate(info.reqs or []):
+                    lora_ids[rank * per_dp_bs_size + i] = req.lora_id
+        return lora_ids
 
     def _get_spec_decode_mwb_dp(
         self, bs_paddings: list, enable_static_lora: bool, draft_token_num: int = 1
@@ -2656,12 +2742,7 @@ class ScheduleBatch:
             extend_logprob_start_lens=None,
             extend_input_logprob_token_ids=None,
             logits_indices=None,
-            lora_ids=(
-                ["0"] * total_bs
-                if enable_static_lora
-                else [r.lora_id for i in self.reqs_info for r in (i.reqs or [])]
-                + ["0"] * (total_bs - real_bs)
-            ),
+            lora_ids=self._merge_lora_ids(per_dp_bs, total_bs, enable_static_lora),
             real_bs=real_bs,
             real_bs_per_dp=real_bs_per_dp,
             dp_size=self.dp_size,
@@ -3131,18 +3212,8 @@ class ScheduleBatch:
         if precision_tracer.get_trace_active():
             self._generate_trace_info(real_bs, bid)
 
-        # Step 7: Collect lora_ids from all requests
-        all_reqs = []
-        for info in self.reqs_info:
-            if info.reqs:
-                all_reqs.extend(info.reqs)
-
-        if enable_static_lora:
-            lora_ids = ["0"] * total_bs
-        else:
-            lora_ids = [req.lora_id for req in all_reqs[:real_bs]]
-            # Pad to total_bs
-            lora_ids = lora_ids + ["0"] * (total_bs - real_bs)
+        # Step 7: Align adapters with the DP-padded request metadata.
+        lora_ids = self._merge_lora_ids(per_dp_bs_padding, total_bs, enable_static_lora)
 
         # Assemble all per-token multimodal tensors (input_embedding,
         # mrope_positions, deepstack) in a single DP-interleaved pass over
@@ -3154,6 +3225,21 @@ class ScheduleBatch:
         mrope_positions = _mm["mrope_positions"]
         apply_for_deepstack = _mm["apply_for_deepstack"]
         deepstack_visual_embedding = _mm["deepstack_visual_embedding"]
+        # Keep items whose placeholder rows intersect the current prefill window.
+        if self.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
+            multimodal_batch = build_multimodal_batch(
+                self.reqs_info,
+                self.dp_size,
+                self.model_config,
+                per_dp_token_padding,
+                embedding_pool=self.embedding_pool,
+                num_encoder_lanes=encoder_num_lanes(
+                    self.mesh,
+                    tensor_parallel=self.model_config.hf_config.vision_encoder_parallel == "tp",
+                ),
+            )
+        else:
+            multimodal_batch = None
 
         # Merge per-DP top_logprobs_nums / token_ids_logprobs with the same
         # offset_bs += per_dp_bs_padding padding scheme used in _merge_batch_metadata.
@@ -3174,11 +3260,9 @@ class ScheduleBatch:
             top_logprobs_nums = None
             token_ids_logprobs = None
 
-        # extend+logprob always uses the padded path: the legacy fallback slices
-        # hidden_states per req under P("data","tensor") and crashes when the row
-        # count isn't divisible by dp (dp>1). The padded path supports top_logprobs /
-        # token_ids / overlap at any dp. return_hidden_states still falls back.
-        use_padded_input_logprob = self.forward_mode.is_extend() and not self.return_hidden_states
+        # Hidden-state capture retains the original tensor independently of
+        # logprob selection, so it also uses the DP-padded logprob path.
+        use_padded_input_logprob = self.forward_mode.is_extend()
         input_logprob_indices = None
         merged_extend_input_logprob_token_ids = None
         if self.return_logprob:
@@ -3258,6 +3342,7 @@ class ScheduleBatch:
             per_dp_bs_size=per_dp_bs_padding,
             launch_done=self.launch_done,
             input_embedding=input_embedding,
+            multimodal_batch=multimodal_batch,
             apply_for_deepstack=apply_for_deepstack,
             deepstack_visual_embedding=deepstack_visual_embedding,
             recurrent_indices=recurrent_indices_cpu,
@@ -3328,6 +3413,15 @@ class ScheduleBatch:
             new_info = ScheduleReqsInfo()
             new_info.reqs = list(info.reqs) if info.reqs else info.reqs
             new_info.out_cache_loc = info.out_cache_loc
+            # Output collection must use the submitted positions, even when
+            # overlap scheduling advances the live request's next batch.
+            if self.return_hidden_states:
+                new_info.seq_lens = (
+                    np.array(info.seq_lens, copy=True) if info.seq_lens is not None else None
+                )
+                new_info.prefix_lens = (
+                    list(info.prefix_lens) if info.prefix_lens is not None else None
+                )
             new_info.decoding_reqs = (
                 list(info.decoding_reqs) if info.decoding_reqs else info.decoding_reqs
             )
@@ -3349,6 +3443,7 @@ class ScheduleBatch:
             return_logprob=self.return_logprob,
             return_output_logprob_only=self.return_output_logprob_only,
             is_prefill_only=self.is_prefill_only,
+            return_hidden_states=self.return_hidden_states,
             bid=self.bid,
             dp_size=self.dp_size,
             per_dp_bs_size=self.per_dp_bs_size,
@@ -3585,13 +3680,19 @@ class ModelWorkerSamplingInfo:
             self.vocab_mask = None
             return
 
-        self.vocab_mask = first_grammar.allocate_vocab_mask(
-            vocab_size=self.vocab_size,
-            batch_size=len(self.temperatures),
+        # Unconstrained and padding rows allow every token. Keep this batch's
+        # mask independent of the grammar backend's reusable host buffer.
+        self.vocab_mask = np.full_like(
+            first_grammar.allocate_vocab_mask(
+                vocab_size=self.vocab_size,
+                batch_size=len(self.temperatures),
+            ),
+            -1,
         )
 
         for i, grammar in enumerate(self.grammars):
             if grammar and not grammar.finished and not grammar.is_terminated():
+                self.vocab_mask[i].fill(0)
                 grammar.fill_vocab_mask(self.vocab_mask, i)
 
 
@@ -3642,6 +3743,10 @@ class ModelWorkerBatch:
     # into original order, removing the need for per-rank index math.
     logits_indices_selector: np.ndarray | None = None
 
+    # Batch-owned immutable page IDs for supported speculative relay backends.
+    allocated_page_indices: np.ndarray | None = None
+    eagle_page_indices_device_cache: tuple | None = None
+
     # Pre-bucketed per-token gather indices for the padded logprob path; None on
     # the legacy variable-shape path and on non-extend batches.
     input_logprob_indices: np.ndarray | None = None
@@ -3685,7 +3790,11 @@ class ModelWorkerBatch:
     tree_cache: BasePrefixCache = None
 
     input_embedding: np.ndarray | None = None
+
+    multimodal_batch: MultimodalBatch | None = None
+
     apply_for_deepstack: bool = False
+
     deepstack_visual_embedding: np.ndarray | None = None
 
     # MRoPE position information [3, total_tokens]

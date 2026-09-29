@@ -19,9 +19,7 @@ Qwen2.5-VL vision shapes: BF16 MHA, 16 heads, head_dim 80 (padded to 128).
 
 import logging
 
-import jax
-
-from sgl_jax.srt.utils.jax_utils import get_device_name
+from sgl_jax.srt.utils.jax_utils import get_device_kind, get_device_name
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +79,7 @@ def get_tuned_block_sizes(
 
     # The tuned table is TPU-only; other backends fall back without probing for
     # a TPU device name.
-    if "TPU" not in jax.devices()[0].device_kind:
+    if "TPU" not in get_device_kind():
         return DEFAULT_Q_BLOCK, DEFAULT_KV_BLOCK
 
     device_name = get_device_name()

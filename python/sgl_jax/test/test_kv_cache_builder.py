@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import MagicMock
 
 from sgl_jax.srt.mem_cache.kv_cache_builder import build_kv_cache
+from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
 def _make_server_args(**overrides):
@@ -11,6 +12,8 @@ def _make_server_args(**overrides):
     args.max_seq_len = 4096
     args.enable_unified_radix_tree = False
     args.hicache_storage = "disable"
+    args.pd_disaggregation = ""
+    args.disaggregation_mode = "null"
     for k, v in overrides.items():
         setattr(args, k, v)
     return args
@@ -90,12 +93,12 @@ class TestBuildKVCache(unittest.TestCase):
 
         self.assertIsInstance(cache, ChunkCache)
 
-    def test_hybrid_returns_swa_radix_cache(self):
+    def test_hybrid_unified_returns_full_and_swa_unified_radix_cache(self):
         from sgl_jax.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 
         mock_allocator = MagicMock(spec=SWATokenToKVPoolAllocator)
         cache = build_kv_cache(
-            server_args=_make_server_args(),
+            server_args=_make_server_args(enable_unified_radix_tree=True),
             model_config=_make_model_config(),
             req_to_token_pool=MagicMock(),
             token_to_kv_pool_allocator=mock_allocator,
@@ -105,9 +108,80 @@ class TestBuildKVCache(unittest.TestCase):
             tp_size=1,
             spec_algorithm=None,
         )
-        from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
+        from sgl_jax.srt.mem_cache.unified_cache_components import ComponentType
+        from sgl_jax.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
-        self.assertIsInstance(cache, SWARadixCache)
+        self.assertIsInstance(cache, UnifiedRadixCache)
+        self.assertEqual(cache.tree_components, (ComponentType.FULL, ComponentType.SWA))
+
+    def test_unified_hybrid_rejects_unsupported_combinations_before_cache_creation(self):
+        from sgl_jax.srt.mem_cache import kv_cache_builder
+        from sgl_jax.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
+
+        unsupported = (
+            (
+                "recurrent",
+                {},
+                None,
+                r"FULL\+SWA\+RECURRENT",
+                {"is_hybrid_recurrent": True},
+            ),
+            ("HiCache", {"hicache_storage": "none"}, None, "--hicache-storage", {}),
+            (
+                "speculative decoding",
+                {},
+                SpeculativeAlgorithm.EAGLE,
+                "--speculative-algorithm",
+                {},
+            ),
+            (
+                "PD",
+                {"pd_disaggregation": "pathways"},
+                None,
+                "--pd-disaggregation",
+                {},
+            ),
+            (
+                "disaggregation mode",
+                {"disaggregation_mode": "decode"},
+                None,
+                "--disaggregation-mode",
+                {},
+            ),
+        )
+        for name, server_overrides, spec_algorithm, conflict_flag, build_overrides in unsupported:
+            with self.subTest(name=name):
+                allocator = MagicMock(spec=SWATokenToKVPoolAllocator)
+                req_pool = MagicMock()
+                with (
+                    self.assertRaisesRegex(
+                        ValueError,
+                        rf"--enable-unified-radix-tree.*{conflict_flag}",
+                    ),
+                    unittest.mock.patch.object(
+                        kv_cache_builder, "create_tree_cache"
+                    ) as create_tree,
+                    unittest.mock.patch.object(kv_cache_builder, "init_hicache") as init_hicache,
+                ):
+                    build_kv_cache(
+                        server_args=_make_server_args(
+                            enable_unified_radix_tree=True, **server_overrides
+                        ),
+                        model_config=_make_model_config(),
+                        req_to_token_pool=req_pool,
+                        token_to_kv_pool_allocator=allocator,
+                        page_size=1,
+                        is_hybrid=True,
+                        sliding_window_size=4096,
+                        tp_size=1,
+                        spec_algorithm=spec_algorithm,
+                        **build_overrides,
+                    )
+
+                create_tree.assert_not_called()
+                init_hicache.assert_not_called()
+                self.assertEqual(allocator.mock_calls, [])
+                self.assertEqual(req_pool.mock_calls, [])
 
     def test_hybrid_disable_radix_returns_swa_chunk_cache(self):
         cache = build_kv_cache(

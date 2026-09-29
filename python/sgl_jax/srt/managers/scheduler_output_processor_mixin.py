@@ -31,6 +31,27 @@ logger = logging.getLogger(__name__)
 DEFAULT_FORCE_STREAM_INTERVAL = 50
 
 
+def _collect_hidden_states(batch: ScheduleBatch, hidden_states) -> None:
+    """Collect evaluated rows using the submitted DP layout and token positions."""
+    if hidden_states is None or not batch.return_hidden_states:
+        return
+    hidden_states = np.asarray(jax.device_get(hidden_states))
+    per_dp_tokens = hidden_states.shape[0] // batch.dp_size
+    is_extend = batch.forward_mode.is_extend()
+    for rank, info in enumerate(batch.reqs_info):
+        offset = rank * per_dp_tokens
+        for i, req in enumerate(info.reqs or []):
+            length = int(info.extend_lens[i]) if is_extend else 1
+            rows = hidden_states[offset : offset + length]
+            offset += length
+            if not req.return_hidden_states or req.finished() or req.is_retracted:
+                continue
+            prefix = int(info.prefix_lens[i]) if is_extend else int(info.seq_lens[i]) - 1
+            # Retract/re-prefill may recompute an existing suffix. Replace it
+            # by position instead of duplicating it; chunked prefill appends.
+            req.hidden_states[prefix : prefix + length] = rows.astype(float).tolist()
+
+
 def _complete_precision_trace(req: Req) -> None:
     if not precision_tracer.get_trace_active():
         return
@@ -191,7 +212,7 @@ class SchedulerOutputProcessorMixin:
                 logits_output.input_token_logprobs,
                 _input_logprob_lens_per_dp(batch),
             )
-        hidden_state_offset = 0
+        _collect_hidden_states(batch, logits_output.hidden_states)
         per_dp_bs_size = batch.per_dp_bs_size
 
         logprob_pt = 0
@@ -264,18 +285,6 @@ class SchedulerOutputProcessorMixin:
                             local_idx=i,
                         )
                         logprob_pt += num_input_logprobs
-
-                    if req.return_hidden_states and logits_output.hidden_states is not None:
-                        req.hidden_states.append(
-                            jax.device_get(
-                                logits_output.hidden_states[
-                                    hidden_state_offset : (
-                                        hidden_state_offset := hidden_state_offset
-                                        + len(req.origin_input_ids)
-                                    )
-                                ]
-                            ).astype(float)
-                        )
 
                     # Update grammar state after token sampling
                     if req.grammar is not None:
@@ -370,6 +379,31 @@ class SchedulerOutputProcessorMixin:
                             and getattr(info.spec_info, "future_indices", None) is not None
                         ), "spec relay prefill output must carry future_indices"
 
+    def account_spec_decode_tokens(self: Scheduler, batch: ScheduleBatch, next_token_ids):
+        """Token counters for one speculative verify step.
+
+        Moves the per-interval pair log_decode_stats prints and resets, and the
+        cumulative pair get_internal_state reports; the two must stay in step.
+        Split out of process_batch_result_decode so a CPU test can reach it.
+        """
+        active_spec_reqs = 0
+        per_dp_bs = batch.per_dp_bs_size
+        for dp_rank, info in enumerate(batch.reqs_info):
+            base = dp_rank * per_dp_bs
+            for j, req in enumerate(info.reqs or []):
+                if self.enable_overlap and (req.finished() or req.is_retracted):
+                    continue
+                if req.is_retracted:
+                    continue
+                accepted = len(next_token_ids[base + j])
+                self.num_generated_tokens += accepted
+                self.accept_token += accepted
+                self.cum_spec_accept_length += accepted
+                active_spec_reqs += 1
+        self.spec_num_forward_ct += active_spec_reqs
+        self.cum_spec_accept_count += active_spec_reqs
+        self.draft_token += active_spec_reqs * self.draft_worker.speculative_num_draft_tokens
+
     def process_batch_result_decode(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -420,21 +454,7 @@ class SchedulerOutputProcessorMixin:
         if not is_spec_decode:
             self.num_generated_tokens += batch.batch_size()
         else:
-            active_spec_reqs = 0
-            per_dp_bs = batch.per_dp_bs_size
-            for dp_rank, info in enumerate(batch.reqs_info):
-                base = dp_rank * per_dp_bs
-                for j, req in enumerate(info.reqs or []):
-                    if self.enable_overlap and (req.finished() or req.is_retracted):
-                        continue
-                    if req.is_retracted:
-                        continue
-                    accepted = len(next_token_ids[base + j])
-                    self.num_generated_tokens += accepted
-                    self.accept_token += accepted
-                    active_spec_reqs += 1
-            self.spec_num_forward_ct += active_spec_reqs
-            self.draft_token += active_spec_reqs * self.draft_worker.speculative_num_draft_tokens
+            self.account_spec_decode_tokens(batch, next_token_ids)
         # FIXME(pc) add spec decode metrics
 
         if self.enable_overlap:
@@ -452,6 +472,7 @@ class SchedulerOutputProcessorMixin:
                     float
                 )
 
+        _collect_hidden_states(batch, logits_output.hidden_states)
         self.token_to_kv_pool_allocator.free_group_begin()
 
         # Process each DP rank's requests (unified for all dp_size >= 1)
@@ -491,7 +512,7 @@ class SchedulerOutputProcessorMixin:
                 new_accepted_len = 1
                 if not is_spec_decode:
                     req.output_ids.append(next_token_id)
-                elif self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash():
+                elif self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash_family():
                     req.output_ids.extend([int(t) for t in next_token_id])
                     new_accepted_len = len(next_token_id)
 
@@ -517,7 +538,7 @@ class SchedulerOutputProcessorMixin:
                     )
                 elif (
                     is_spec_decode
-                    and (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash())
+                    and (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash_family())
                     and not legacy_eagle3_non_overlap
                 ):
                     req.kv_committed_len += new_accepted_len - 1
@@ -561,12 +582,6 @@ class SchedulerOutputProcessorMixin:
 
                         self.abort_request(AbortReq(rid=req.rid))
                     req.grammar.finished = req.finished()
-                if req.return_hidden_states and logits_output.hidden_states is not None:
-                    # NOTE: hidden_states is not yet reordered through
-                    # logits_indices_selector. Decode-mode hidden_states is
-                    # DP-interleaved like the raw next_token_logprobs were.
-                    # Tracking as a follow-up; not in scope for this fix.
-                    req.hidden_states.append(logits_output.hidden_states[i])
                 req_idx += 1
 
         # Collect all requests from all DP ranks for stream output
@@ -803,10 +818,10 @@ class SchedulerOutputProcessorMixin:
         cached_tokens = []
         spec_verify_ct = []
         spec_accepted_tokens = []
-        output_hidden_states = None
+        output_hidden_states = [] if any(req.return_hidden_states for req in reqs) else None
         output_routed_experts = None
 
-        output_hidden_states_for_mm = None
+        output_hidden_states_for_mm = [] if output_hidden_states is not None else None
         if return_logprob:
             input_token_logprobs_val = []
             input_token_logprobs_idx = []
@@ -861,7 +876,9 @@ class SchedulerOutputProcessorMixin:
 
             if should_output:
                 send_token_offset = req.send_token_offset
-                send_output_token_logprobs_offset = req.send_output_token_logprobs_offset
+                output_logprob_slice = slice(
+                    req.send_output_token_logprobs_offset, req.finished_len
+                )
                 if isinstance(req.rid, list):
                     # if rid is a list, extend the list to rids
                     rids.extend(req.rid)
@@ -895,13 +912,6 @@ class SchedulerOutputProcessorMixin:
                     spec_verify_ct.append(req.spec_verify_ct)
                     spec_accepted_tokens.append(req.spec_accepted_tokens)
 
-                if req.return_output_logprob_only:
-                    output_token_logprobs_val.append(
-                        req.output_token_logprobs_val[send_output_token_logprobs_offset:]
-                    )
-                    output_token_logprobs_idx.append(
-                        req.output_token_logprobs_idx[send_output_token_logprobs_offset:]
-                    )
                 if return_logprob:
                     if req.return_logprob and not req.input_logprob_sent:
                         input_token_logprobs_val.append(req.input_token_logprobs_val)
@@ -919,24 +929,32 @@ class SchedulerOutputProcessorMixin:
                         input_token_ids_logprobs_val.append([])
                         input_token_ids_logprobs_idx.append([])
 
-                    if req.return_logprob:
+                    if req.return_logprob or req.return_output_logprob_only:
                         output_token_logprobs_val.append(
-                            req.output_token_logprobs_val[send_output_token_logprobs_offset:]
+                            req.output_token_logprobs_val[output_logprob_slice]
                         )
                         output_token_logprobs_idx.append(
-                            req.output_token_logprobs_idx[send_output_token_logprobs_offset:]
+                            req.output_token_logprobs_idx[output_logprob_slice]
                         )
                         output_top_logprobs_val.append(
-                            req.output_top_logprobs_val[send_output_token_logprobs_offset:]
+                            req.output_top_logprobs_val[output_logprob_slice]
+                            if req.return_logprob
+                            else []
                         )
                         output_top_logprobs_idx.append(
-                            req.output_top_logprobs_idx[send_output_token_logprobs_offset:]
+                            req.output_top_logprobs_idx[output_logprob_slice]
+                            if req.return_logprob
+                            else []
                         )
                         output_token_ids_logprobs_val.append(
-                            req.output_token_ids_logprobs_val[send_output_token_logprobs_offset:]
+                            req.output_token_ids_logprobs_val[output_logprob_slice]
+                            if req.return_logprob
+                            else []
                         )
                         output_token_ids_logprobs_idx.append(
-                            req.output_token_ids_logprobs_idx[send_output_token_logprobs_offset:]
+                            req.output_token_ids_logprobs_idx[output_logprob_slice]
+                            if req.return_logprob
+                            else []
                         )
                         req.send_output_token_logprobs_offset = len(req.output_token_logprobs_val)
                     else:
@@ -946,10 +964,28 @@ class SchedulerOutputProcessorMixin:
                         output_top_logprobs_idx.append([])
                         output_token_ids_logprobs_val.append([])
                         output_token_ids_logprobs_idx.append([])
-                if req.return_hidden_states:
-                    if output_hidden_states_for_mm is None:
-                        output_hidden_states_for_mm = []
-                    output_hidden_states_for_mm.append(req.hidden_states)
+                elif return_output_logprob_only:
+                    # Tokenizer accumulates deltas; resending the whole history
+                    # duplicates logprobs and makes long SSE streams enormous.
+                    for target, values in (
+                        (output_token_logprobs_val, req.output_token_logprobs_val),
+                        (output_token_logprobs_idx, req.output_token_logprobs_idx),
+                    ):
+                        target.append(
+                            values[output_logprob_slice] if req.return_output_logprob_only else []
+                        )
+                    if req.return_output_logprob_only:
+                        req.send_output_token_logprobs_offset = len(req.output_token_logprobs_val)
+                if output_hidden_states_for_mm is not None:
+                    output_hidden_states.append(
+                        list(req.hidden_states) if req.return_hidden_states else None
+                    )
+                    # The diffusion text-encoder consumer expects [prompt_rows].
+                    output_hidden_states_for_mm.append(
+                        [req.hidden_states[: len(req.origin_input_ids)]]
+                        if req.return_hidden_states
+                        else None
+                    )
 
                 # if req.return_routed_experts:
                 if output_routed_experts is None:

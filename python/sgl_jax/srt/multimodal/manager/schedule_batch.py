@@ -93,7 +93,7 @@ class Req:
     input_embeds: jax.Array | None = None
     image_grid_thw: tuple | None = None
     video_grid_thw: tuple | None = None
-    cache_input_ids: list[int] | None = None
+    radix_input_ids: list[int] = field(default_factory=list)
 
     # Batch info
     num_outputs_per_prompt: int = 1
@@ -243,13 +243,15 @@ class Req:
                         max_new_tokens=1,
                         stop=self.extra.get("stop"),
                     )
+                model_input_ids = self.input_ids or self.origin_input_ids
                 tokenized_req = TokenizedGenerateReqInput(
                     rid=self.rid,
-                    input_ids=self.input_ids or self.origin_input_ids,
+                    input_ids=model_input_ids,
+                    radix_input_ids=self.radix_input_ids or list(model_input_ids or []),
                     sampling_params=sampling_params,
                     stream=bool(self.extra.get("stream", False)),
+                    mm_inputs=self.omni_inputs,
                 )
-                tokenized_req.mm_inputs = self.omni_inputs
                 return [tokenized_req]
             return [
                 TokenizedGenerateReqInput(

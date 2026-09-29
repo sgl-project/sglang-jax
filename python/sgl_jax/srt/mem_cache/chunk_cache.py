@@ -104,3 +104,42 @@ class SWAChunkCache(ChunkCache):
 
     def swa_protected_size(self, dp_rank: int = 0) -> int:
         return 0
+
+
+class DeepseekV4ChunkCache(SWAChunkCache):
+    """Own V4 history and SWA pages for one live request, without prefix reuse.
+
+    R calls the SWA reclamation helper only after the submitted forward has
+    finished. Releasing a request drops its ownership; the next zero-prefix
+    forward must initialize any recycled compressor-state slot before use.
+    """
+
+    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+        result = super().match_prefix(params)
+        req = params.req
+        if req is not None and req.req_pool_idx is not None:
+            result = result._replace(
+                device_indices=self.req_to_token_pool.read(req.req_pool_idx, req.kv_committed_len)
+            )
+        return result
+
+    def cache_unfinished_req(self, req: Req):
+        req.prefix_indices = self.req_to_token_pool.read(req.req_pool_idx, req.kv_committed_len)
+
+    def release_req(self, req: Req) -> None:
+        """Release the committed prefix and allocated tail as one page extent."""
+        if req.req_pool_idx is None:
+            return
+        slot = req.req_pool_idx
+        indices = self.req_to_token_pool.read(slot, req.kv_allocated_len)
+        self.token_to_kv_pool_allocator.free(
+            indices[indices != 0], req.dp_rank if req.dp_rank is not None else 0
+        )
+        self.req_to_token_pool.req_to_token[slot].fill(0)
+        req.prefix_indices = np.empty(0, dtype=np.int32)
+        req.last_node = req.last_host_node = None
+        req.cache_protected_len = 0
+        req.kv_committed_freed = req.kv_overallocated_freed = True
+        req.kv_committed_len = req.kv_allocated_len = 0
+        req.swa_evicted_seqlen = 0
+        self.req_to_token_pool.free(req)

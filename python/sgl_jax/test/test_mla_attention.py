@@ -597,6 +597,27 @@ class TestMLAAttention(CustomTestCase):
         # Single-sequence prefill, pure q_len == kv_len, spans many pages.
         self.run_test("prefill", [(1024, 1024)], page_size=32)
 
+    def test_prefill_fallback_subtile_heads_page128(self):
+        # 4 q-heads/shard, page 128, mnt >= 256: the geometry that crashed
+        # Mosaic (E2002) with the historical hardcoded (1, 16) mixed fallback
+        # (#1546). The table is emptied so the lookup always misses and the
+        # derived fallback block sizes are what actually compiles. Total head
+        # count scales with the mesh so the per-shard count stays 4.
+        from sgl_jax.srt.kernels.mla.v2 import tuned_block_sizes as tbs
+
+        with mock.patch.dict(
+            tbs.TUNED_BLOCK_SIZES_MLA,
+            {device: {} for device in tbs.TUNED_BLOCK_SIZES_MLA},
+            clear=True,
+        ):
+            self.run_test(
+                "prefill",
+                [(300, 300), (200, 500)],
+                num_heads=4 * mesh.shape["tensor"],
+                page_size=128,
+                max_total_token_size=204800,  # divisible by page_size=128
+            )
+
     # ---------------- decode -----------------
     # Batch of single-token decodes with diverse kv_lens around page boundaries
     # (e.g. 127 vs 128 vs 129 for page_size=64 stresses aligned vs. partial

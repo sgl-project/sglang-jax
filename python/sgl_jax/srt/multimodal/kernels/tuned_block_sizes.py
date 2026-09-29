@@ -4,7 +4,7 @@ import logging
 
 import jax.numpy as jnp
 
-from sgl_jax.srt.utils.jax_utils import get_device_name
+from sgl_jax.srt.utils.jax_utils import get_device_kind, get_device_name
 
 logger = logging.getLogger(__name__)
 # key
@@ -45,6 +45,11 @@ def get_tuned_block_sizes(
     head_dim,
 ) -> tuple[int, int]:
     """Look up for the best (num_queries_per_blk,) from auto-tuned table."""
+
+    # The tuned table is TPU-only; off-TPU (e.g. CPU interpret) fall back to the
+    # default block_q rather than probing for a TPU device name.
+    if "TPU" not in get_device_kind():
+        return 256
 
     keys = get_simplified_key(
         q_dtype,

@@ -19,8 +19,10 @@ from sgl_jax.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
+    InsertResult,
     MatchPrefixParams,
 )
+from sgl_jax.srt.mem_cache.cache_init_params import CacheInitParams
 from sgl_jax.srt.mem_cache.common import release_kv_cache
 from sgl_jax.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
@@ -29,8 +31,19 @@ from sgl_jax.srt.mem_cache.memory_pool import (
 )
 from sgl_jax.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
-from sgl_jax.srt.mem_cache.unified_cache_components import ComponentType
-from sgl_jax.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sgl_jax.srt.mem_cache.unified_cache_components import ComponentType, FullComponent
+from sgl_jax.srt.mem_cache.unified_cache_components import (
+    InsertResult as ComponentInsertResult,
+)
+from sgl_jax.srt.mem_cache.unified_cache_components import (
+    LRURefreshPhase,
+    TreeComponent,
+    get_and_increase_time_counter,
+)
+from sgl_jax.srt.mem_cache.unified_radix_cache import (
+    COMPONENT_REGISTRY,
+    UnifiedRadixCache,
+)
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.test.test_utils import CustomTestCase
 
@@ -556,6 +569,7 @@ class MockRequest:
     ):
         self.req_pool_idx = req_pool_idx
         self.origin_input_ids = origin_input_ids
+        self.radix_input_ids = list(origin_input_ids)
         self.output_ids = output_ids
         self.fill_ids = fill_ids
         self.prefix_indices = prefix_indices
@@ -573,6 +587,8 @@ class MockRequest:
         # so default to len(prefix_indices) (== matched prefix in the simple
         # mock setup; no unaligned tail because tests use page_size=1).
         self.cache_protected_len = len(prefix_indices)
+        # Mirrors init_next_round_input.
+        self.last_matched_prefix_len = len(prefix_indices)
 
     def pop_committed_kv_cache(self) -> int:
         assert not self.kv_committed_freed
@@ -646,6 +662,7 @@ class TestUnifiedRadixCacheWithRequests(CustomTestCase):
 
         # --- chunked prefill: cache_unfinished_req ---
         prefill_ids = list(range(1, 13))  # 12 tokens
+        cache_prefill_ids = list(range(-101, -113, -1))
         reqs = []
         for cache, pool, alloc in stacks:
             kv_indices = alloc.alloc(len(prefill_ids), dp_rank=0)
@@ -659,6 +676,7 @@ class TestUnifiedRadixCacheWithRequests(CustomTestCase):
                 prefix_indices=np.empty((0,), dtype=np.int32),
                 last_node=cache.root_node,
             )
+            req.radix_input_ids = list(cache_prefill_ids)
             req.last_matched_prefix_len = 0
             cache.cache_unfinished_req(req)
             reqs.append(req)
@@ -679,6 +697,21 @@ class TestUnifiedRadixCacheWithRequests(CustomTestCase):
         self.assertEqual(unified.total_size(), 12)
         # The unified req now points at the locked path, not root.
         self.assertIsNot(unified_req.last_node, unified.root_node)
+        for cache, _, _ in stacks:
+            self.assertEqual(
+                len(
+                    cache.match_prefix(MatchPrefixParams(key=RadixKey(prefill_ids))).device_indices
+                ),
+                0,
+            )
+            self.assertEqual(
+                len(
+                    cache.match_prefix(
+                        MatchPrefixParams(key=RadixKey(cache_prefill_ids))
+                    ).device_indices
+                ),
+                12,
+            )
 
         # --- completion: cache_finished_req on the same req objects ---
         # Production flow: cache_unfinished during chunked prefill, then
@@ -707,7 +740,7 @@ class TestUnifiedRadixCacheWithRequests(CustomTestCase):
         self.assertEqual(unified.evictable_size(0), 16)
         self.assertEqual(unified.total_size(), 16)
 
-        full_sequence = prefill_ids + output_ids
+        full_sequence = cache_prefill_ids + output_ids
         radix_match = radix.match_prefix(MatchPrefixParams(key=RadixKey(full_sequence)))
         unified_match = unified.match_prefix(MatchPrefixParams(key=RadixKey(full_sequence)))
         self.assertEqual(len(radix_match.device_indices), len(unified_match.device_indices))
@@ -754,6 +787,81 @@ class TestUnifiedRadixCacheWithRequests(CustomTestCase):
             disabled_cache.cache_unfinished_req(mock_req)
         except Exception as e:
             self.fail(f"cache_unfinished_req raised an exception: {e}")
+
+    # HiCache tombstone revive via cache_finished_req / cache_unfinished_req
+    # (test_hicache_e2e*.py only reach revive through cache.insert()).
+
+    def _tombstone_with_host_copy(self, cache, allocator, tokens):
+        """Insert ``tokens`` and evict the leaf to a host-backed tombstone."""
+        indices = allocator.alloc(len(tokens), dp_rank=0)
+        self.assertIsNotNone(indices)
+        cache.insert(InsertParams(key=RadixKey(tokens), value=indices))
+        node = cache.match_prefix(MatchPrefixParams(key=RadixKey(tokens))).last_device_node
+        self.assertEqual(len(node.key), len(tokens))
+        cache.hicache_enabled = True
+        cache.write_policy = "write_through"
+        node.component_data[ComponentType.FULL].host_value = np.arange(len(tokens), dtype=np.int32)
+        cache._evict_device_leaf(node, {ct: 0 for ct in cache.tree_components})
+        self.assertTrue(node.evicted and node.backuped)
+        return node
+
+    def _recomputed_request(self, pool, allocator, cache, tokens):
+        """Request that recomputed ``tokens`` on fresh slots."""
+        fresh = allocator.alloc(len(tokens), dp_rank=0)
+        self.assertIsNotNone(fresh)
+        pool.write((0, slice(0, len(tokens))), fresh)
+        req = MockRequest(
+            req_pool_idx=0,
+            origin_input_ids=list(tokens),
+            output_ids=[],
+            fill_ids=list(tokens),
+            prefix_indices=np.empty((0,), dtype=np.int32),
+            last_node=cache.root_node,
+        )
+        return req, fresh
+
+    def _assert_tree_owns_its_slots(self, cache, allocator, node):
+        value = node.component_data[ComponentType.FULL].value
+        self.assertIsNotNone(value, "tombstone should have been revived in place")
+        free = set(int(i) for i in allocator.free_slots[0])
+        leaked = sorted(int(i) for i in value if int(i) in free)
+        self.assertEqual(leaked, [], f"revived node references freed slots: {leaked}")
+        # Scheduler.check_memory invariant.
+        self.assertEqual(
+            allocator.available_size(0) + cache.evictable_size(0) + cache.protected_size(0),
+            self.pool_size,
+        )
+
+    def test_hicache_revive_through_cache_finished_req_keeps_adopted_slots(self):
+        pool, allocator, cache = self._create_stack(UnifiedRadixCache)
+        node = self._tombstone_with_host_copy(cache, allocator, [100, 200, 300, 400])
+        req, fresh = self._recomputed_request(
+            pool, allocator, cache, [100, 200, 300, 400, 500, 600]
+        )
+
+        cache.cache_finished_req(req)
+
+        self._assert_tree_owns_its_slots(cache, allocator, node)
+        np.testing.assert_array_equal(node.component_data[ComponentType.FULL].value, fresh[:4])
+        self.assertEqual(cache.total_size(), 6)
+
+    def test_hicache_revive_through_cache_unfinished_req_keeps_adopted_slots(self):
+        pool, allocator, cache = self._create_stack(UnifiedRadixCache)
+        node = self._tombstone_with_host_copy(cache, allocator, [100, 200, 300, 400])
+        req, fresh = self._recomputed_request(
+            pool, allocator, cache, [100, 200, 300, 400, 500, 600]
+        )
+
+        cache.cache_unfinished_req(req)
+
+        self._assert_tree_owns_its_slots(cache, allocator, node)
+        np.testing.assert_array_equal(node.component_data[ComponentType.FULL].value, fresh[:4])
+        self.assertEqual(req.cache_protected_len, 6)
+        np.testing.assert_array_equal(pool.read(0, 6), req.prefix_indices)
+        self.assertEqual(cache.protected_size(0), 6)
+        cache.dec_lock_ref(req.last_node, req.cache_lock_params)
+        self.assertEqual(cache.protected_size(0), 0)
+        self.assertEqual(cache.evictable_size(0), 6)
 
 
 class TestUnifiedRadixCacheEffectiveCacheLen(CustomTestCase):
@@ -1054,6 +1162,7 @@ class _ReleaseReq:
         self.req_pool_idx = req_pool_idx
         self.recurrent_pool_idx = recurrent_pool_idx
         self.origin_input_ids = list(origin_input_ids)
+        self.radix_input_ids = list(origin_input_ids)
         self.output_ids = []
         self.fill_ids = list(origin_input_ids)
         self.dp_rank = dp_rank
@@ -1085,6 +1194,7 @@ class _RunningRecurrentReq:
         self.req_pool_idx = req_pool_idx
         self.recurrent_pool_idx = recurrent_pool_idx
         self.origin_input_ids = list(fill_ids)
+        self.radix_input_ids = list(fill_ids)
         self.output_ids = []
         self.fill_ids = list(fill_ids)
         self.dp_rank = dp_rank
@@ -1286,8 +1396,12 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
         recurrent validator collapses its cached FULL prefix to root."""
         state_pool, pool, allocator, cache = self._create_recurrent_setup()
 
-        chunk1 = list(range(1, 9))
+        full_prompt = list(range(1, 13))
+        chunk1 = full_prompt[:8]
+        chunk2 = full_prompt[8:]
         req = _RunningRecurrentReq(req_pool_idx=None, recurrent_pool_idx=None, fill_ids=chunk1)
+        req.origin_input_ids = full_prompt
+        req.radix_input_ids = list(full_prompt)
         pool.alloc([req])  # assigns req_pool_idx + a running recurrent slot
         self.assertIsNotNone(req.recurrent_pool_idx)
         running_slot = req.recurrent_pool_idx
@@ -1328,7 +1442,6 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
         self.assertIsNone(wrong_probe.recurrent_cow_src_index)
 
         # (c) second continuation
-        chunk2 = list(range(9, 13))
         req.fill_ids = chunk1 + chunk2
         kv2 = allocator.alloc(len(chunk2), dp_rank=0)
         self.assertIsNotNone(kv2)
@@ -2090,6 +2203,273 @@ class TestUnifiedRadixCacheRecurrentExtraBuffer(CustomTestCase):
             req, is_finished=False, insert_result=None, insert_params=params
         )
         self.assertEqual(req.recurrent_ping_pong_track_buffer, buffer_before)
+
+
+class _RecordingAllocator:
+    """Minimal ownership spy for component-seam tests."""
+
+    def __init__(self):
+        self.free_calls = []
+
+    def free(self, indices, dp_rank=0):
+        values = np.asarray(indices, dtype=np.int32).copy()
+        if len(values):
+            self.free_calls.append((values, dp_rank))
+
+    def free_full(self, indices, dp_rank=0):
+        self.free(indices, dp_rank=dp_rank)
+
+
+class _RecordingReqToTokenPool:
+    def __init__(self):
+        self.rows = {0: np.zeros(64, dtype=np.int32)}
+
+    def read(self, req_pool_idx, length):
+        return self.rows[req_pool_idx][:length].copy()
+
+    def write(self, location, values):
+        req_pool_idx, target = location
+        self.rows[req_pool_idx][target] = np.asarray(values, dtype=np.int32)
+
+
+class _RecordingAuxComponent(TreeComponent):
+    component_type = ComponentType.RECURRENT
+
+    def __init__(self, cache, params=None):
+        super().__init__(cache, params)
+        self.received_params = params
+        self.hook_log = []
+        self.overlap_boundary = None
+
+    def create_match_validator(self, match_device_only=False):
+        return lambda node: True
+
+    def refresh_lru(self, phase, node, root_node):
+        self.hook_log.append(("refresh", phase, node.id, root_node.id))
+        node.component_data[self.component_type].metadata[
+            "last_access_time"
+        ] = get_and_increase_time_counter()
+
+    def update_component_on_insert_overlap(
+        self, node, prefix_len, total_prefix_len, value_slice, params
+    ):
+        self.hook_log.append(("overlap", node.id))
+        if self.overlap_boundary is None:
+            return prefix_len
+        return self.overlap_boundary
+
+    def commit_insert_component_data(self, node, is_new_leaf, params, result):
+        component_data = node.component_data[self.component_type]
+        if component_data.value is None:
+            component_data.value = np.array([node.id], dtype=np.int32)
+
+    def redistribute_on_node_split(self, new_parent, child):
+        self.hook_log.append(("split", new_parent.id, child.id))
+        parent_data = new_parent.component_data[self.component_type]
+        child_data = child.component_data[self.component_type]
+        if child_data.value is not None:
+            parent_data.value = child_data.value.copy()
+
+    def evict_component(self, node, target=None):
+        raise AssertionError("component-seam tests do not exercise component eviction")
+
+    def drive_eviction(self, params, tracker):
+        raise AssertionError("component-seam tests do not exercise component eviction")
+
+    def acquire_component_lock(self, node, result, lock_host=False):
+        return result
+
+    def release_component_lock(self, node, params, lock_host=False):
+        return None
+
+
+class _RecordingFullComponent(FullComponent):
+    def __init__(self, cache, params=None):
+        super().__init__(cache, params)
+        self.received_params = params
+
+
+class TestUnifiedRadixCacheComponentSeams(unittest.TestCase):
+    def setUp(self):
+        self.original_registry = dict(COMPONENT_REGISTRY)
+        COMPONENT_REGISTRY[ComponentType.RECURRENT] = _RecordingAuxComponent
+        self.addCleanup(self._restore_registry)
+
+    def _restore_registry(self):
+        COMPONENT_REGISTRY.clear()
+        COMPONENT_REGISTRY.update(self.original_registry)
+
+    def _create_cache(self, *, tree_components=(ComponentType.FULL, ComponentType.RECURRENT)):
+        req_pool = _RecordingReqToTokenPool()
+        allocator = _RecordingAllocator()
+        cache = UnifiedRadixCache(
+            req_to_token_pool=req_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            tree_components=tree_components,
+        )
+        return req_pool, allocator, cache
+
+    def test_insert_result_is_base_contract_with_recurrent_extension(self):
+        self.assertIs(ComponentInsertResult, InsertResult)
+        result = InsertResult(
+            prefix_len=4,
+            recurrent_exist=True,
+            recurrent_committed=True,
+        )
+        self.assertEqual(result.prefix_len, 4)
+        self.assertTrue(result.recurrent_exist)
+        self.assertTrue(result.recurrent_committed)
+
+    def test_cache_init_params_are_scoped_to_swa_component(self):
+        COMPONENT_REGISTRY[ComponentType.FULL] = _RecordingFullComponent
+        req_pool = _RecordingReqToTokenPool()
+        allocator = _RecordingAllocator()
+        params = CacheInitParams(
+            req_to_token_pool=req_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            sliding_window_size=4,
+        )
+
+        cache = UnifiedRadixCache(
+            req_to_token_pool=req_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            tree_components=(ComponentType.FULL, ComponentType.SWA),
+            component_init_params=params,
+        )
+
+        self.assertIsNone(cache.components[ComponentType.FULL].received_params)
+        self.assertEqual(cache.components[ComponentType.SWA].sliding_window_size, 4)
+
+    def test_multi_node_overlap_preserves_tree_owned_prefix(self):
+        _, allocator, cache = self._create_cache()
+        key = RadixKey([1, 2, 3, 4], None, 1)
+        cache.insert(InsertParams(key=key, value=np.arange(10, 14, dtype=np.int32)))
+        cache.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 9, 10], None, 1),
+                value=np.arange(20, 24, dtype=np.int32),
+            )
+        )
+        allocator.free_calls.clear()
+
+        result = cache.insert(
+            InsertParams(
+                key=key,
+                value=np.arange(100, 104, dtype=np.int32),
+                prev_prefix_len=3,
+            )
+        )
+
+        self.assertEqual(result.prefix_len, 4)
+        self.assertEqual(len(allocator.free_calls), 1)
+        np.testing.assert_array_equal(allocator.free_calls[0][0], [103])
+        self.assertEqual(allocator.free_calls[0][1], 1)
+
+    def test_overlap_boundary_consumes_slots_without_request_cache_double_free(self):
+        req_pool, allocator, cache = self._create_cache()
+        key = RadixKey([1, 2, 3, 4], None, 1)
+        cache.insert(InsertParams(key=key, value=np.arange(10, 14, dtype=np.int32)))
+        allocator.free_calls.clear()
+        component = cache.components[ComponentType.RECURRENT]
+        component.overlap_boundary = 2
+        component.hook_log.clear()
+        req_pool.write((0, slice(0, 4)), np.arange(100, 104, dtype=np.int32))
+        req = MockRequest(
+            req_pool_idx=0,
+            origin_input_ids=[1, 2, 3, 4],
+            output_ids=[],
+            fill_ids=[1, 2, 3, 4],
+            prefix_indices=np.empty((0,), dtype=np.int32),
+            last_node=cache.root_node,
+            dp_rank=1,
+        )
+
+        cache.cache_finished_req(req)
+
+        self.assertEqual([entry[0] for entry in component.hook_log].count("overlap"), 1)
+        self.assertEqual(len(allocator.free_calls), 1)
+        np.testing.assert_array_equal(allocator.free_calls[0][0], [100, 101])
+        self.assertEqual(allocator.free_calls[0][1], 1)
+
+    def test_split_invokes_component_hook_and_keeps_metadata_independent(self):
+        _, _, cache = self._create_cache()
+        cache.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 3, 4]),
+                value=np.arange(10, 14, dtype=np.int32),
+            )
+        )
+        child = next(iter(cache.root_node.children.values()))
+        child_data = child.component_data[ComponentType.RECURRENT]
+        child_data.metadata["child_only"] = 1
+        component = cache.components[ComponentType.RECURRENT]
+        component.hook_log.clear()
+
+        cache.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 9, 10]),
+                value=np.arange(20, 24, dtype=np.int32),
+            )
+        )
+
+        new_parent = next(iter(cache.root_node.children.values()))
+        parent_data = new_parent.component_data[ComponentType.RECURRENT]
+        self.assertEqual(
+            [entry[0] for entry in component.hook_log].count("split"),
+            1,
+        )
+        self.assertIsNot(parent_data.metadata, child_data.metadata)
+        self.assertNotIn("child_only", parent_data.metadata)
+        parent_data.metadata["parent_only"] = 2
+        self.assertNotIn("parent_only", child_data.metadata)
+        candidates = cache.aux_evictable_device_nodes[ComponentType.RECURRENT]
+        self.assertIn(new_parent, candidates)
+        self.assertIn(child, candidates)
+
+    def test_component_lru_refresh_uses_upstream_contract_and_is_range_scoped(self):
+        _, _, cache = self._create_cache()
+        cache.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 3, 4]),
+                value=np.arange(10, 14, dtype=np.int32),
+            )
+        )
+        cache.insert(
+            InsertParams(
+                key=RadixKey([9, 10, 11, 12]),
+                value=np.arange(20, 24, dtype=np.int32),
+            )
+        )
+        node_a = cache.root_node.children[cache.get_child_key_fn(RadixKey([1]))]
+        node_b = cache.root_node.children[cache.get_child_key_fn(RadixKey([9]))]
+        aux = cache.components[ComponentType.RECURRENT]
+        self.assertEqual(
+            cache.aux_evictable_device_nodes[ComponentType.RECURRENT],
+            {node_a, node_b},
+        )
+        data_a = node_a.component_data[ComponentType.RECURRENT]
+        data_b = node_b.component_data[ComponentType.RECURRENT]
+        timestamp_a = getattr(data_a, "metadata", {}).get("last_access_time")
+        timestamp_b = getattr(data_b, "metadata", {}).get("last_access_time")
+        aux.hook_log.clear()
+
+        cache.match_prefix(MatchPrefixParams(key=RadixKey([1, 2, 3, 4])))
+
+        phases = [entry[1] for entry in aux.hook_log if entry[0] == "refresh"]
+        self.assertEqual(phases, [LRURefreshPhase.WALKDOWN, LRURefreshPhase.MATCH_END])
+        root_ids = [entry[3] for entry in aux.hook_log if entry[0] == "refresh"]
+        self.assertEqual(root_ids, [cache.root_node.id, cache.root_node.id])
+        self.assertGreater(
+            data_a.metadata["last_access_time"],
+            timestamp_a,
+        )
+        self.assertEqual(
+            data_b.metadata["last_access_time"],
+            timestamp_b,
+        )
 
 
 if __name__ == "__main__":

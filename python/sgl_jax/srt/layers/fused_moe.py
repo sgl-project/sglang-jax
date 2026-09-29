@@ -208,7 +208,7 @@ class FusedEPMoE(nnx.Module):
             self.quant_block_k = None
             self.quant_block_n = None
 
-    def quantize_weights(self, is_static: bool = False):
+    def quantize_weights(self, is_static: bool = False, *, abstract: bool = False):
         """Quantize MoE weights in-place. Call once after model loading."""
         if self.quantized_dtype is None:
             return
@@ -225,8 +225,22 @@ class FusedEPMoE(nnx.Module):
             del self.quant_block_k
         self.quant_block_k = wsz
 
-        with jax.set_mesh(self.mesh):
+        mesh_context = (
+            jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh)
+            if abstract
+            else jax.set_mesh(self.mesh)
+        )
+        with mesh_context:
             if is_static:
+                names = ["w1", "w3", "w2"]
+                if self.num_shared_experts > 0:
+                    names += ["w1_shared", "w3_shared", "w2_shared"]
+                for name in names:
+                    param = getattr(self, name)
+                    if isinstance(param.value, jax.ShapeDtypeStruct):
+                        param.value = jax.ShapeDtypeStruct(
+                            param.value.shape, self.quantized_dtype, sharding=param.value.sharding
+                        )
                 ep_scale_sharding = P(("data", "tensor"), None, None, None)
 
                 if wsz is None:

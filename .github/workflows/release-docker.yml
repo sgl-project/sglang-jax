@@ -64,7 +64,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: Dockerfile
+          file: docker/Dockerfile.runtime
           platforms: linux/amd64
           push: false
           load: true
@@ -83,7 +83,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: Dockerfile
+          file: docker/Dockerfile.runtime
           platforms: linux/amd64
           push: true
           tags: ${{ steps.tags.outputs.tags }}

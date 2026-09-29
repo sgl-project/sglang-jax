@@ -170,7 +170,7 @@ The additional `jax.tree_util.tree_flatten(model_state)` step is not the minimum
 | JIT Function | Use | Key Parameters |
 |---------|------|---------|
 | `jitted_run_model` | Model forward inference | `donate_argnames=["memory_pools"]`, `static_argnames=["model_state_def"]` |
-| `jitted_sampler` | Sampling | `static_argnames=["sampler_state_def", "use_sort_for_toppk_minp"]` |
+| `jitted_sampler` | Sampling | `static_argnames=["sampler_state_def"]` |
 | `jitted_compute_logprobs` | Logprob computation | `static_argnames=["mesh"]` |
 
 `jitted_run_model` internal flow: unflatten `model_state_leaves` into a state tree → rebuild the model via `nnx.merge(model_def, state)` → call `model(forward_batch, memory_pools, logits_metadata)`. The model fetches sub-pools by name from `memory_pools` (such as `token_to_kv_pool`, `swa_kv_pool`, recurrent pool, etc.); the returned updated arrays are passed back to ModelRunner as a `{"token_to_kv_pool": layers_kv_fused, ...}` dict, and `self.memory_pools.replace_all(pool_updates)` writes them back.
@@ -340,7 +340,13 @@ The standard tuple structure returned by the model forward:
 
 ## 4.9 Memory Profiling and KV Cache Allocation
 
-`cell_size` is the byte size that a single token occupies across all layers and KV heads — the basic unit for converting "available HBM" into "number of tokens that can be held". `max_total_num_tokens = available_kv_cache_bytes // cell_size` directly determines the capacity of `ReqToTokenPool` and `TokenToKVPoolAllocator`, as well as the total budget of `PrefillAdder`. The exact formula depends on the model architecture: standard MHA/GQA uses `num_kv_heads × align128(head_dim) × 2 × num_layers × dtype_size` (`×2` accounts for K/V; `align128` matches TPU MXU/VMEM tile boundaries); Absorbed MLA (DeepSeek V3) only caches the latent representation, so there is no `×2`, and the latent segments are aligned to 128 independently and the pool is fully replicated.
+`cell_size` is the byte size that a single token occupies across all layers and KV heads — the basic unit for converting "available HBM" into "number of tokens that can be held". `max_total_num_tokens = available_kv_cache_bytes // cell_size` directly determines the capacity of `ReqToTokenPool` and `TokenToKVPoolAllocator`, as well as the total budget of `PrefillAdder`. The exact formula depends on the model architecture:
+
+- **Standard MHA/GQA** — `num_kv_heads × align128(head_dim) × 2 × num_layers × dtype_size` (`×2` accounts for K/V; `align128` matches TPU MXU/VMEM tile boundaries)
+- **Absorbed MLA (DeepSeek V3)** — only the latent representation is cached, so there is no `×2`; the latent segments are aligned to 128 independently (`align128(kv_lora_rank) + align128(qk_rope_head_dim)`) and the pool is fully replicated
+- **Absorbed MLA + DSA (`--attention-backend dsa_sparse`)** — the latent term above **plus** a second term for the DSA indexer key buffer: `align128(index_head_dim) × num_indexer_layers × dtype_size`. The two terms use different layer counts on purpose — latent per KV-pool layer, indexer per "full" indexer layer over the whole model (`build_index_share_map`). On GLM-5.2 the indexer adds ~5% to the per-token cost, so sizing `--max-total-num-tokens` from the MLA formula alone over-provisions the pool
+
+All three omit the page-packing pad (`align(page_size, 32 // dtype_bits)`), which only bites when `page_size` is below the packing factor; `_compute_cell_size()` applies it.
 
 ### 4.9.1 Memory Pool Initialization
 
@@ -350,6 +356,7 @@ The standard tuple structure returned by the model forward:
 |---------|---------|-----------|
 | Standard MHA/GQA | `MHATokenToKVPool` | `TokenToKVPoolAllocator` (page_size=1) or `PagedTokenToKVPoolAllocator` |
 | Absorbed MLA | `MLATokenToKVPool` | Same as above |
+| Absorbed MLA + DSA sparse | `MLATokenToKVPool` (+ `num_indexer_layers` indexer key buffers) | Same as above |
 | Hybrid SWA | `SWAKVPool` (dual pool) | `SWATokenToKVPoolAllocator` (dual allocator) |
 
 Hybrid SWA models allocate Full-Attention and SWA pool sizes proportionally via `set_num_token_hybrid()`:

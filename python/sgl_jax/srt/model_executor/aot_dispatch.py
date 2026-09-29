@@ -19,13 +19,16 @@ tp16 for GLM-5.2 753B — device-independent).
    and only the small dynamic tail (forward batch, donated pools, metadata)
    goes through ``shard_args``.
 3. Executables with ordered/unordered effects, host callbacks, or mutation
-   permanently fall back to the checked path for that key.
+   stay on the checked compiled path for that key.
+
+An executable store uses the same cache and dispatch path, loading binaries
+through CompilationManager instead of compiling. Missing binaries are errors.
 
 Donation is unaffected: XLA input-output aliasing is baked into the
 executable, and ``ExecuteReplicated`` adds no Python-side donation logic.
 
-Enabling: ``SGLANG_JAX_AOT_DISPATCH`` = ``auto`` (default: on when the
-function sees >= ``_AUTO_MIN_ARGS`` flat args), ``1`` (always), ``0`` (off).
+Enabling: ``SGLANG_JAX_AOT_DISPATCH`` = ``auto`` (on when the function sees
+>= ``_AUTO_MIN_ARGS`` flat args), ``1`` (always), ``0`` (default, off).
 """
 
 from __future__ import annotations
@@ -36,12 +39,13 @@ import os
 import jax
 from jax._src.lib import xla_client as _xc
 
+from sgl_jax.srt.utils.common_utils import get_bool_env_var
+from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
+
 logger = logging.getLogger(__name__)
 
 _ENV = os.environ.get("SGLANG_JAX_AOT_DISPATCH", "0")
 _AUTO_MIN_ARGS = 512
-
-_FALLBACK = object()
 
 
 def aot_dispatch_requested() -> bool:
@@ -59,6 +63,38 @@ def aot_dispatch_enabled(num_flat_args: int) -> bool:
     return _ENV == "1"
 
 
+def decode_no_sc_gather_compiler_options_fn():
+    """Temporary XLA workaround for the jax 0.11.1 SparseCore gather-offload
+    decode regression on TPU v7x (#1613, jax-ml/jax#40553).
+
+    When SGLANG_JAX_DECODE_DISABLE_SC_GATHER_OFFLOAD is set on TPU, returns a
+    ``compiler_options_fn`` that compiles decode-shaped executables with the
+    offload pass disabled while prefill keeps the default (the offload is
+    profitable for large prefill gathers, and a process-global
+    LIBTPU_INIT_ARGS disable costs ~+12% on 110k prefill). Returns ``None``
+    when the workaround is not requested. Only effective together with
+    SGLANG_JAX_AOT_DISPATCH since it hooks the per-shape AOT compile path.
+    Remove once the upstream cost-model fix ships.
+    """
+    if not (is_tpu_runtime() and get_bool_env_var("SGLANG_JAX_DECODE_DISABLE_SC_GATHER_OFFLOAD")):
+        return None
+    logger.info(
+        "SGLANG_JAX_DECODE_DISABLE_SC_GATHER_OFFLOAD: decode executables "
+        "will be compiled with SparseCore gather offload disabled."
+    )
+
+    def _compiler_options_fn(dyn_args):
+        forward_batch = dyn_args[0]
+        if forward_batch.forward_mode.is_decode():
+            return {
+                "xla_tpu_offload_gather_to_sparsecore": "false",
+                "xla_tpu_offload_all_supported_gathers_to_sparsecore": "false",
+            }
+        return None
+
+    return _compiler_options_fn
+
+
 class AotDispatcher:
     """Dispatch ``jit_fn(*stable_call_args, *dyn_args)`` via cached AOT executables.
 
@@ -70,6 +106,9 @@ class AotDispatcher:
         exactly the prefix pytrees that appear in the executable's flat input
         list. Their leaves must be the same arrays every call (weights).
       name: label for logs.
+      executable_store: optional trusted offline artifacts; a miss is an error.
+      allow_fast_dispatch: allow the environment-controlled execute_sharded path.
+        Loading still works through checked compiled calls when disabled.
 
     If the caller ever replaces the stable containers (LoRA / EPLB reload),
     it must call :meth:`invalidate` (or construct a new dispatcher); the
@@ -77,14 +116,27 @@ class AotDispatcher:
     containers between calls.
     """
 
-    def __init__(self, jit_fn, stable_call_args: tuple, stable_flat_args: tuple, name: str):
+    def __init__(
+        self,
+        jit_fn,
+        stable_call_args: tuple,
+        stable_flat_args: tuple,
+        name: str,
+        compiler_options_fn=None,
+        executable_store=None,
+        allow_fast_dispatch=True,
+    ):
         self._jit_fn = jit_fn
         self._stable_call_args = stable_call_args
         self._stable_flat_args = stable_flat_args
         self._stable_ids = tuple(id(a) for a in stable_flat_args)
         self._cache = {}
         self._name = name
-        self._enabled = None  # decided on first call from flat arg count
+        self._compiler_options_fn = compiler_options_fn
+        self._store = executable_store
+        self._allow_fast_dispatch = allow_fast_dispatch
+        # Loading is explicit even when the optional dispatch optimization is off.
+        self._enabled = True if executable_store is not None else None
 
     def invalidate(self) -> None:
         self._cache.clear()
@@ -113,17 +165,22 @@ class AotDispatcher:
         if self._enabled is False:
             return self._jit_fn(*self._stable_call_args, *dyn_args)
         if tuple(id(a) for a in self._stable_flat_args) != self._stable_ids:
-            logger.info("[aot-dispatch:%s] stable args replaced; recompiling", self._name)
+            logger.info(
+                "[aot-dispatch:%s] stable args replaced; invalidating executables", self._name
+            )
             self._stable_ids = tuple(id(a) for a in self._stable_flat_args)
             self._cache.clear()
 
-        dyn_leaves = jax.tree_util.tree_leaves(dyn_args)
-        key = tuple((getattr(a, "shape", None), getattr(a, "dtype", None)) for a in dyn_leaves)
+        dyn_leaves, dyn_tree = jax.tree_util.tree_flatten(dyn_args)
+        # Batch mode and other pytree metadata can change the program even
+        # when all array shapes match. Scalar types also affect compilation.
+        avals = [jax.typeof(a) for a in dyn_leaves]
+        key = (dyn_tree, tuple((a.shape, a.dtype, a.weak_type) for a in avals))
         entry = self._cache.get(key)
         if entry is None:
-            return self._compile_and_first_call(key, dyn_args)
-        if entry is _FALLBACK:
-            return self._jit_fn(*self._stable_call_args, *dyn_args)
+            return self._acquire_and_first_call(key, dyn_args)
+        if callable(entry):
+            return entry(*dyn_args)
 
         (
             xla_exec,
@@ -135,17 +192,16 @@ class AotDispatcher:
             dyn_layouts,
             dyn_copy,
         ) = entry
-        args_flat, _ = jax.tree_util.tree_flatten((self._stable_flat_args + dyn_args, {}))
         from jax._src.interpreters import pxla
 
         dyn_bufs = pxla.shard_args(
-            dyn_shardings, dyn_layouts, dyn_copy, [args_flat[i] for i in dyn_kept]
+            dyn_shardings, dyn_layouts, dyn_copy, [dyn_leaves[i] for i in dyn_kept]
         )
         results = xla_exec.execute_sharded(static_bufs + list(dyn_bufs))
         out_flat = results.consume_with_handlers(out_handlers)
         return jax.tree_util.tree_unflatten(out_tree, out_flat)
 
-    def _compile_and_first_call(self, key, dyn_args):
+    def _acquire_and_first_call(self, key, dyn_args):
         from jax._src.interpreters import pxla
 
         if self._enabled is None:
@@ -160,7 +216,34 @@ class AotDispatcher:
                 )
                 return self._jit_fn(*self._stable_call_args, *dyn_args)
 
-        compiled = self._jit_fn.lower(*self._stable_call_args, *dyn_args).compile()
+        compile_opts = self._compiler_options_fn(dyn_args) if self._compiler_options_fn else None
+        lowered = self._jit_fn.lower(*self._stable_call_args, *dyn_args)
+        from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
+
+        compiled = CompilationManager.get_executable(
+            lowered, compiler_options=compile_opts, store=self._store
+        )
+        # Saved binaries have a flat ABI containing only DCE-surviving inputs.
+        # Keep original input indices for both checked calls and fast dispatch.
+        if self._store is not None:
+            from sgl_jax.srt.model_executor.aot_executable import _kept_inputs
+
+            kept = _kept_inputs(lowered)
+        else:
+            kept = sorted(compiled._executable.unsafe_call.kept_var_idx)
+
+        def checked_call(*args):
+            values = self._stable_flat_args + args
+            if self._store is not None:
+                leaves = jax.tree_util.tree_leaves(values)
+                values = tuple(leaves[i] for i in kept)
+            return compiled(*values)
+
+        n_flat = len(jax.tree_util.tree_leaves(self._stable_flat_args + dyn_args))
+        if not self._allow_fast_dispatch or not aot_dispatch_enabled(n_flat):
+            self._cache[key] = checked_call
+            return checked_call(*dyn_args)
+
         unsafe = compiled._executable.unsafe_call
         if (
             unsafe.ordered_effects
@@ -173,13 +256,12 @@ class AotDispatcher:
                 "checked dispatch for this shape",
                 self._name,
             )
-            self._cache[key] = _FALLBACK
-            return self._jit_fn(*self._stable_call_args, *dyn_args)
+            self._cache[key] = checked_call
+            return checked_call(*dyn_args)
 
         # Flat layout: [stable leaves][dyn leaves]; kept_var_idx is the
         # DCE-surviving subset, in order, matching in_handler's shardings.
         n_stable = len(jax.tree_util.tree_leaves(self._stable_flat_args))
-        kept = sorted(unsafe.kept_var_idx)
         n_static = sum(1 for i in kept if i < n_stable)
         dyn_kept = [i for i in kept if i >= n_stable]
         shardings = unsafe.in_handler.in_shardings
@@ -200,17 +282,17 @@ class AotDispatcher:
             unsafe.out_handler.handlers,
             compiled._params.out_tree,
             static_bufs,
-            dyn_kept,
+            [i - n_stable for i in dyn_kept],
             shardings[n_static:],
             layouts[n_static:],
             [_xc.ArrayCopySemantics.REUSE_INPUT] * len(dyn_kept),
         )
         logger.info(
-            "[aot-dispatch:%s] compiled shape key (%d stable + %d dyn kept args)",
+            "[aot-dispatch:%s] cached shape key (%d stable + %d dyn kept args)",
             self._name,
             n_static,
             len(dyn_kept),
         )
         # First call goes through the checked path: validates that every
         # input's sharding/layout matches what the executable expects.
-        return compiled(*self._stable_flat_args, *dyn_args)
+        return checked_call(*dyn_args)

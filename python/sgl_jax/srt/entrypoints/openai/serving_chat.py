@@ -92,6 +92,7 @@ class OpenAIServingChat(OpenAIServingBase):
             video_data=processed_messages.video_data,
             audio_data=processed_messages.audio_data,
             sampling_params=sampling_params,
+            return_hidden_states=request.return_hidden_states,
             return_logprob=request.logprobs,
             logprob_start_len=-1,
             top_logprobs_num=request.top_logprobs or 0,
@@ -159,6 +160,7 @@ class OpenAIServingChat(OpenAIServingBase):
         """Apply Jinja chat template"""
         prompt = ""
         prompt_ids = []
+        prompt_from_mm_template = False
         openai_compatible_messages = []
         image_data = []
         video_data = []
@@ -237,7 +239,10 @@ Assistant: {% endif %}"""
                     tools=tools,
                     **chat_template_kwargs,
                 )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt)
+                # The multimodal processor consumes this string and tokenizes it
+                # together with the image inputs later. Avoid encoding it here
+                # only to immediately decode it below.
+                prompt_from_mm_template = True
             else:
                 prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
                     openai_compatible_messages,
@@ -265,12 +270,17 @@ Assistant: {% endif %}"""
             prompt_ids = prompt_ids["input_ids"]
 
         if assistant_prefix:
+            # Preserve the existing token-level concatenation semantics for the
+            # uncommon continue_final_message path.
+            if prompt_from_mm_template:
+                prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt)
+                prompt_from_mm_template = False
             encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
             if encoded and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id:
                 encoded = encoded[1:]
             prompt_ids += encoded
 
-        if is_multimodal:
+        if is_multimodal and not prompt_from_mm_template:
             prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
 
         stop = request.stop
@@ -587,9 +597,7 @@ Assistant: {% endif %}"""
             if request.return_hidden_states and hidden_states:
                 for index, choice_hidden_states in hidden_states.items():
                     if choice_hidden_states:
-                        last_token_hidden_states = (
-                            choice_hidden_states[-1] if len(choice_hidden_states) > 1 else []
-                        )
+                        last_token_hidden_states = choice_hidden_states[-1]
                         hidden_states_chunk = ChatCompletionStreamResponse(
                             id=content["meta_info"]["id"],
                             created=int(time.time()),
@@ -889,7 +897,7 @@ Assistant: {% endif %}"""
         if not parser:
             return False
         kwargs = request.chat_template_kwargs or {}
-        if parser == "qwen3":
+        if parser in ("qwen3", "ling3"):
             return kwargs.get("enable_thinking") is not False
         if parser == "mimo":
             return kwargs.get("enable_thinking") is True

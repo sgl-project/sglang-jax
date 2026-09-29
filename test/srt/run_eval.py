@@ -1,6 +1,7 @@
 """
 Usage:
 python3 test/srt/run_eval.py --port 30000 --eval-name mmlu --num-examples 10
+python3 test/srt/run_eval.py --port 30000 --eval-name sglang_mmlu_chat --num-examples 500
 """
 
 import argparse
@@ -51,6 +52,11 @@ def run_eval(args):
 
     base_url = f"{args.base_url}/v1" if args.base_url else f"http://{args.host}:{args.port}/v1"
 
+    if args.eval_name == "mmbench_v11":
+        from eval.simple_eval_mmbench import run_mmbench
+
+        return run_mmbench(args)
+
     if args.eval_name == "mmlu":
         from eval.simple_eval_mmlu import MMLUEval
 
@@ -61,6 +67,11 @@ def run_eval(args):
 
         filename = "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
         eval_obj = SglangMMLUEval(filename, args.num_examples, args.num_threads)
+    elif args.eval_name == "sglang_mmlu_chat":
+        from eval.sglang_mmlu_chat import SglangMMLUChatEval
+
+        filename = "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
+        eval_obj = SglangMMLUChatEval(filename, args.num_examples, args.num_threads)
     elif args.eval_name == "math":
         from eval.simple_eval_math import MathEval
 

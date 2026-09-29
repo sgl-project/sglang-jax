@@ -101,6 +101,29 @@ def create_custom_mask(lens):
     return jnp.concatenate(custom_masks)
 
 
+def create_custom_mask_rank3(lens, flat_mask):
+    """Rank-3 `[total_q_rows, 1, W]` int32 view of `create_custom_mask`'s output.
+
+    The kernel takes the mask as a rectangle with kv on the lane axis; the flat
+    bool form stays as-is and is fed to `ref_ragged_paged_attention`, which
+    recomputes its own `cumsum(q_len * kv_len)` offsets. Keeping the two
+    representations independent is the point: if the oracle also learned about
+    rectangles, the tests would compare a padding bug against itself.
+    """
+    q_lens = [q_len for q_len, _ in lens]
+    kv_lens = [kv_len for _, kv_len in lens]
+    width = max(128, 1 << max(max(kv_lens) - 1, 1).bit_length())
+    out = np.zeros((int(sum(q_lens)), 1, width), dtype=np.int32)
+    flat = np.asarray(flat_mask).astype(np.int32)
+    off = row = 0
+    for q_len, kv_len in zip(q_lens, kv_lens):
+        out[row : row + q_len, 0, :kv_len] = flat[off : off + q_len * kv_len].reshape(q_len, kv_len)
+        off += q_len * kv_len
+        row += q_len
+    assert off == flat.size, f"flat mask has {flat.size} entries, consumed {off}"
+    return jnp.asarray(out)
+
+
 def write_prefix_tokens_for_kv(forward_batch, token_to_kv_pool: KVCache, lens, k, v):
     """Write prefix tokens to KV cache and return extend tokens.
 
@@ -344,8 +367,10 @@ def create_test_data(
     if fb.spec_info is not None:
         from sgl_jax.srt.utils.jax_utils import device_array
 
+        # spec_info keeps the flat form (the reference implementation's input);
+        # the kernel gets the rank-3 rectangle.
         fb.attn_backend.forward_metadata.custom_mask = device_array(
-            (fb.spec_info.custom_mask),
+            create_custom_mask_rank3(lens, fb.spec_info.custom_mask),
             sharding=(NamedSharding(attention_backend.mesh, P("data"))),
         )
     return fb, current_kv_cache, q, k, v

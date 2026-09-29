@@ -39,6 +39,7 @@ class _MockTokenizerManager:
         self.tokenizer.decode.return_value = "Test response"
         self.tokenizer.chat_template = None
         self.tokenizer.bos_token_id = 1
+        self.mm_processor = None
 
         # async generator stub for generate_request
         async def _mock_generate():
@@ -171,6 +172,47 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertEqual(result2.stop, initial_stop_str)
             self.assertNotIn("CUSTOM_STOP", result2.stop)
             self.assertEqual(conv_ins.stop_str, initial_stop_str)
+
+    def test_multimodal_jinja_prompt_skips_encode_decode_round_trip(self):
+        self.template_manager.chat_template_name = None
+        self.tm.mm_processor = Mock()
+        self.tm.mm_processor.apply_chat_template.return_value = "<image>Test prompt"
+        self.tm.tokenizer.encode.reset_mock()
+        self.tm.tokenizer.decode.reset_mock()
+
+        result = self.chat._apply_jinja_template(self.basic_req, tools=None, is_multimodal=True)
+
+        self.assertEqual(result.prompt, "<image>Test prompt")
+        self.assertEqual(result.prompt_ids, [])
+        self.tm.tokenizer.encode.assert_not_called()
+        self.tm.tokenizer.decode.assert_not_called()
+
+    def test_multimodal_jinja_assistant_prefix_preserves_token_round_trip(self):
+        self.template_manager.chat_template_name = None
+        self.tm.mm_processor = Mock()
+        self.tm.mm_processor.apply_chat_template.return_value = "<image>Test prompt"
+        self.tm.tokenizer.encode.reset_mock()
+        self.tm.tokenizer.encode.side_effect = ([1, 2], [1, 3])
+        self.tm.tokenizer.decode.reset_mock()
+        self.tm.tokenizer.decode.return_value = "<image>Test prompt partial"
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Hi?"},
+                {"role": "assistant", "content": "partial"},
+            ],
+            continue_final_message=True,
+        )
+
+        result = self.chat._apply_jinja_template(request, tools=None, is_multimodal=True)
+
+        self.assertEqual(result.prompt, "<image>Test prompt partial")
+        self.assertEqual(result.prompt_ids, [1, 2, 3])
+        self.assertEqual(
+            self.tm.tokenizer.encode.call_args_list,
+            [unittest.mock.call("<image>Test prompt"), unittest.mock.call("partial")],
+        )
+        self.tm.tokenizer.decode.assert_called_once_with([1, 2, 3])
 
     # ------------- sampling-params -------------
     def test_sampling_param_build(self):

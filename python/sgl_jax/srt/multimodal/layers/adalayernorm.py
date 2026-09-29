@@ -3,8 +3,8 @@ import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
-from transformers import modeling_flax_utils
 
+from sgl_jax.srt.layers.activation import ACT2FN
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.multimodal.layers.layernorm import FP32LayerNorm
@@ -110,7 +110,7 @@ class FluxAdaLayerNormZero(nnx.Module):
         )
         self.norm_type = norm_type
         self.norm = _build_zero_norm(dim, eps, norm_type, rngs=_rngs)
-        self.act = modeling_flax_utils.ACT2FN["silu"]
+        self.act = ACT2FN["silu"]
         self.linear = LinearBase(
             input_size=dim,
             output_size=6 * dim,
@@ -160,7 +160,7 @@ class FluxAdaLayerNormZeroSingle(nnx.Module):
         self.mesh = mesh
         self.norm_type = norm_type
         self.norm = _build_zero_norm(dim, eps, norm_type, rngs=_rngs)
-        self.act = modeling_flax_utils.ACT2FN["silu"]
+        self.act = ACT2FN["silu"]
         self.linear = LinearBase(
             input_size=dim,
             output_size=3 * dim,
@@ -203,7 +203,7 @@ class FluxAdaLayerNormContinuous(nnx.Module):
             norm_type=norm_type,
             rngs=_rngs,
         )
-        self.act = modeling_flax_utils.ACT2FN["silu"]
+        self.act = ACT2FN["silu"]
         self.linear = LinearBase(
             input_size=conditioning_embedding_dim,
             output_size=2 * embedding_dim,

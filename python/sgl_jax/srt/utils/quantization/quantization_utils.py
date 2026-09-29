@@ -19,6 +19,22 @@ from sgl_jax.srt.configs.quantization_config import (
 logger = logging.getLogger(__name__)
 
 
+def apply_quantization(model_config, model, *, is_static_input=False):
+    """Prepare static checkpoint structure or quantize loaded weights, MoE first."""
+    config = model_config.quantization_config
+    if config is not None:
+        if config.has_moe_quantization():
+            model = apply_moe_quantization(model_config, model, is_static_input=is_static_input)
+        if config.get_linear_rules():
+            model = apply_linear_quantization(model_config, model, is_static_input=is_static_input)
+    return model
+
+
+def _array_sharding(tensor):
+    # Tracers carry explicit sharding on their aval, not on the array object.
+    return getattr(tensor, "sharding", None) or jax.typeof(tensor).sharding
+
+
 def _get_block_reshape_sharding(
     tensor: jax.Array,
     quantized_axes: list[int],
@@ -32,7 +48,7 @@ def _get_block_reshape_sharding(
     - keep the original sharding on the new ``num_blocks`` axis
     - mark the inner ``block`` axis as replicated
     """
-    input_sharding = getattr(tensor, "sharding", None)
+    input_sharding = _array_sharding(tensor)
     if not isinstance(input_sharding, NamedSharding):
         return None
 
@@ -58,7 +74,7 @@ def _get_safe_block_quant_input_sharding(
     axis replicated, perform the block quantization reshape/reduction, and let
     callers restore a suitable sharding afterwards.
     """
-    input_sharding = getattr(tensor, "sharding", None)
+    input_sharding = _array_sharding(tensor)
     if not isinstance(input_sharding, NamedSharding):
         return None
 
@@ -167,7 +183,11 @@ def apply_linear_quantization(
 
         # Try to iterate through attributes
         if hasattr(obj, "__dict__"):
+            # Models can keep named child modules in their original precision.
+            unquantized_modules = getattr(obj, "unquantized_modules", ())
             for attr_name, attr_value in list(obj.__dict__.items()):
+                if attr_name in unquantized_modules:
+                    continue
                 child_path = f"{path}/{attr_name}" if path else attr_name
 
                 if isinstance(attr_value, LinearBase):
@@ -273,12 +293,19 @@ def apply_moe_quantization(
                 logger.info("Skipping MoE quantization for %s (matched ignored_layers)", log_path)
                 return
             logger.debug("Quantizing MoE weights path=%s", log_path)
-            obj.quantize_weights(is_static=is_static_input)
+            obj.quantize_weights(
+                is_static=is_static_input,
+                abstract=getattr(model_config, "_abstract_mode", False),
+            )
             return
 
         # Try to iterate through attributes
         if hasattr(obj, "__dict__"):
+            # Models can keep named child modules in their original precision.
+            unquantized_modules = getattr(obj, "unquantized_modules", ())
             for attr_name, attr_value in obj.__dict__.items():
+                if attr_name in unquantized_modules:
+                    continue
                 child_path = f"{path}/{attr_name}" if path else attr_name
                 if isinstance(attr_value, nnx.Module):
                     _quantize_moe_recursive(attr_value, child_path, visited)
@@ -310,7 +337,12 @@ def quantize_tensor_simple(
     scale = x_abs_max / max_val
     # Guard all-zero slices to avoid 0/0 -> NaN.
     scale_safe = scale + (scale == 0).astype(scale.dtype)
-    x_q = jnp.clip(x / scale_safe, min_val, max_val).astype(dtype)
+    x_scaled = x / scale_safe
+    if jnp.issubdtype(dtype, jnp.integer):
+        # float->int casts truncate toward zero; integer quantization needs
+        # round-to-nearest. Float targets (fp8) round in the cast itself.
+        x_scaled = jnp.round(x_scaled)
+    x_q = jnp.clip(x_scaled, min_val, max_val).astype(dtype)
     return x_q, scale.astype(out_dtype)
 
 
@@ -340,7 +372,7 @@ def quantize_tensor(
         axis = [axis]
 
     orig_shape = tensor.shape
-    original_input_sharding = getattr(tensor, "sharding", None)
+    original_input_sharding = _array_sharding(tensor)
     mask = None
 
     if block_size is not None:
@@ -405,7 +437,11 @@ def quantize_tensor(
 
     # Guard all-zero blocks/tensors: scale==0 would produce 0/0 -> NaN.
     scale_safe = scale + (scale == 0).astype(scale.dtype)
-    tensor_q = jnp.clip(tensor / scale_safe, dtype_min, dtype_max)
+    tensor_scaled = tensor / scale_safe
+    if jnp.issubdtype(dtype, jnp.integer):
+        # Round to nearest before the integer cast below.
+        tensor_scaled = jnp.round(tensor_scaled)
+    tensor_q = jnp.clip(tensor_scaled, dtype_min, dtype_max)
     if block_size is not None and isinstance(original_input_sharding, NamedSharding):
         tensor_q = jax.lax.reshape(tensor_q, orig_shape, out_sharding=original_input_sharding)
     else:

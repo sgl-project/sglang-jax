@@ -6,6 +6,7 @@ import numpy as np
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.managers.scheduler import GenerationBatchResult
@@ -380,7 +381,24 @@ class EagleDraftWorker(BaseDraftWorker):
         per_dp_bs = model_worker_batch.per_dp_bs_size if dp_size > 1 else len(seq_lens_cpu)
         assert total_cache_loc_size % dp_size == 0
         per_dp_cache_len = total_cache_loc_size // dp_size
-        cache_loc_cpu = self._get_decode_cache_loc_buffer(total_cache_loc_size)
+        # Relay verify consumes page IDs directly. Keep token locations only
+        # for legacy consumers or attention backends that still require them.
+        use_page_indices = False
+        if not legacy_non_overlap and spec_info.future_indices is not None:
+            target_backend = self.target_worker_ref.model_runner.attn_backend
+            draft_backend = self.draft_model_runner.attn_backend
+            use_page_indices = (
+                isinstance(target_backend, FlashAttention)
+                and isinstance(draft_backend, FlashAttention)
+                and target_backend.page_size == draft_backend.page_size == page_size
+                and per_dp_cache_len % page_size == 0
+            )
+        if use_page_indices:
+            cache_loc_cpu = np.zeros(total_cache_loc_size // page_size, dtype=np.int32)
+        else:
+            cache_loc_cpu = self._get_decode_cache_loc_buffer(total_cache_loc_size)
+        model_worker_batch.allocated_page_indices = None
+        model_worker_batch.eagle_page_indices_device_cache = None
         valid_mask = seq_lens_cpu > 0
         if np.any(valid_mask):
             valid_indices = np.where(valid_mask)[0]
@@ -399,6 +417,16 @@ class EagleDraftWorker(BaseDraftWorker):
                     cache_loc_cpu[base : base + allocate_len] = token_indices_with_all_reqs[
                         seq_idx, :allocate_len
                     ]
+                elif use_page_indices:
+                    num_pages = int(aligned_len // page_size)
+                    page_base = int(base // page_size)
+                    cache_loc_cpu[page_base : page_base + num_pages] = (
+                        req_to_token_pool.req_to_token[
+                            model_worker_batch.req_pool_indices[seq_idx],
+                            :aligned_len:page_size,
+                        ]
+                        // page_size
+                    )
                 else:
                     page_offsets = np.arange(0, aligned_len, page_size)
                     cache_loc_cpu[base + page_offsets] = req_to_token_pool.req_to_token[
@@ -406,7 +434,12 @@ class EagleDraftWorker(BaseDraftWorker):
                     ]
                 intra_rank_off[r] += aligned_len
 
-        model_worker_batch.cache_loc = cache_loc_cpu
+        if use_page_indices:
+            cache_loc_cpu.setflags(write=False)
+            model_worker_batch.allocated_page_indices = cache_loc_cpu
+            model_worker_batch.cache_loc = np.empty(0, dtype=np.int32)
+        else:
+            model_worker_batch.cache_loc = cache_loc_cpu
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
 
         topk_index = spec_info.topk_index

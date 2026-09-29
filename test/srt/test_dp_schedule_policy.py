@@ -1,7 +1,7 @@
 """Unit tests for DP scheduling policy selection.
 
-Covers the pure ``pick_cache_aware_dp`` decision logic,
-``req_prefix_match_key`` probe-key extraction, and ServerArgs default policy
+Covers the pure soft and forced cache-aware decision logic,
+``req_prefix_match_key`` probe-key extraction, and ServerArgs policy
 normalization.
 """
 
@@ -11,6 +11,9 @@ import argparse
 from types import SimpleNamespace
 
 from sgl_jax.srt.managers.dp_schedule_policy import pick_cache_aware_dp as pick
+from sgl_jax.srt.managers.dp_schedule_policy import (
+    pick_force_cache_aware_dp as force_pick,
+)
 from sgl_jax.srt.managers.dp_schedule_policy import req_prefix_match_key as match_key
 from sgl_jax.srt.server_args import ServerArgs
 
@@ -26,8 +29,9 @@ def _pick(
     output_counts=None,
     item_input=0,
     item_output=0,
+    picker=pick,
 ):
-    return pick(
+    return picker(
         eligible,
         counts,
         tokens,
@@ -148,9 +152,68 @@ def test_all_full_returns_none():
     assert _pick([], [0, 0], [0, 0], {}, prompt_len=4) is None
 
 
-def _req(input_ids, extra_key=None, lora_id=None, return_logprob=False, logprob_start_len=-1):
+def test_force_cache_aware_differs_from_soft_under_large_load_skew():
+    counts = [40, 0]
+    tokens = [400, 0]
+    matches = {0: 512, 1: 400}
+
+    # Soft affinity yields to the large load skew and selects the idle rank,
+    # while forced affinity keeps the request on the longest-prefix rank.
+    assert _pick([0, 1], counts, tokens, matches, prompt_len=512) == 1
+    assert _pick([0, 1], counts, tokens, matches, prompt_len=512, picker=force_pick) == 0
+
+
+def test_force_cache_aware_breaks_equal_match_ties_by_load():
+    counts = [3, 1, 0]
+    tokens = [30, 10, 0]
+    matches = {0: 512, 1: 512, 2: 0}
+    assert _pick([0, 1, 2], counts, tokens, matches, prompt_len=512, picker=force_pick) == 1
+
+
+def test_force_cache_aware_full_miss_falls_back_to_shape_aware():
+    counts = [0, 1]
+    tokens = [0, 1]
+    assert (
+        _pick(
+            [0, 1],
+            counts,
+            tokens,
+            matches={0: 0, 1: 0},
+            prompt_len=512,
+            input_counts=[0, 900],
+            output_counts=[900, 0],
+            item_output=700,
+            picker=force_pick,
+        )
+        == 1
+    )
+
+
+def test_force_cache_aware_defers_for_ineligible_longest_holder():
+    counts = [8, 0]
+    tokens = [800, 0]
+    matches = {0: 1024, 1: 512}
+    assert _pick([1], counts, tokens, matches, prompt_len=1200, picker=force_pick) is None
+
+
+def test_force_cache_aware_defers_when_only_holder_is_ineligible():
+    counts = [8, 0]
+    tokens = [800, 0]
+    matches = {0: 1024, 1: 0}
+    assert _pick([1], counts, tokens, matches, prompt_len=1200, picker=force_pick) is None
+
+
+def _req(
+    input_ids,
+    extra_key=None,
+    lora_id=None,
+    return_logprob=False,
+    logprob_start_len=-1,
+    radix_input_ids=None,
+):
     return SimpleNamespace(
         input_ids=input_ids,
+        radix_input_ids=input_ids if radix_input_ids is None else radix_input_ids,
         extra_key=extra_key,
         lora_id=lora_id,
         return_logprob=return_logprob,
@@ -162,6 +225,14 @@ def test_match_key_uses_reusable_prefix_not_full():
     # The real radix lookup keeps >=1 token to generate, so the probe uses the
     # reusable prefix (input_len - 1), not the full prompt.
     assert match_key(_req([1, 2, 3, 4], extra_key="lora-a")) == ([1, 2, 3], "lora-a")
+
+
+def test_match_key_uses_canonical_multimodal_radix_input_ids():
+    req = _req([1, 99, 99, 4], radix_input_ids=[1, 123456, 123456, 4])
+    assert match_key(req) == (
+        [1, 123456, 123456],
+        None,
+    )
 
 
 def test_match_key_appends_lora_id():
@@ -237,6 +308,10 @@ def test_explicit_dp_schedule_policy_is_preserved():
         ).dp_schedule_policy
         == "shape_aware"
     )
+    assert (
+        _server_args(dp_schedule_policy="force_cache_aware").dp_schedule_policy
+        == "force_cache_aware"
+    )
 
 
 def test_cli_default_keeps_unset_policy_distinct_from_explicit_min_running_queue():
@@ -247,9 +322,13 @@ def test_cli_default_keeps_unset_policy_distinct_from_explicit_min_running_queue
     explicit = parser.parse_args(
         ["--model-path", "dummy", "--dp-schedule-policy", "min_running_queue"]
     )
+    forced = parser.parse_args(
+        ["--model-path", "dummy", "--dp-schedule-policy", "force_cache_aware"]
+    )
 
     assert unset.dp_schedule_policy is None
     assert explicit.dp_schedule_policy == "min_running_queue"
+    assert forced.dp_schedule_policy == "force_cache_aware"
 
 
 if __name__ == "__main__":

@@ -76,6 +76,8 @@ CONFIGS = [
     (256, 8, 4, 8, "A_E256_G8_Gtop4_k8"),  # sgl-jax DeepSeek-V3 / Ling
     (512, 8, 4, 8, "B_E512_G8_Gtop4_k8"),  # MaxText
     (128, 4, 2, 6, "small_E128_G4_Gtop2_k6"),
+    (896, 1, 1, 16, "all_E896_G1_Gtop1_k16"),
+    (128, 4, 4, 8, "all_E128_G4_Gtop4_k8"),
 ]
 BATCHES = [256, 512, 1024]
 
@@ -207,6 +209,33 @@ def test_matches_ref_on_flat_ties():
     )
     np.testing.assert_array_equal(np.array(ids_pal), np.array(ids_ref))
     np.testing.assert_allclose(np.array(w_pal), np.array(w_ref), rtol=0, atol=1e-6)
+
+
+@pytest.mark.parametrize("groups", [1, 4])
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("flat", [False, True])
+def test_all_groups_preserves_exact_weights_and_tie_breaking(groups, packed, flat):
+    experts, tokens, topk = 128, 128, 8
+    values = jnp.full((experts,), 0.5) if flat else (jnp.arange(experts) % 17) / 32.0
+    logits = jnp.broadcast_to(values, (tokens, experts)).astype(jnp.float32)
+    bias = jnp.zeros((experts,), dtype=jnp.float32)
+    if packed:
+        logits, bias = logits.astype(jnp.bfloat16), bias.astype(jnp.bfloat16)
+    reference = ref_biased_grouped_topk_bf16 if packed else ref_biased_grouped_topk
+    expected_weights, expected_ids = reference(
+        logits, bias, num_expert_group=groups, topk_group=groups, topk=topk
+    )
+    weights, ids = grouped_topk_pallas(
+        logits,
+        bias,
+        num_expert_group=groups,
+        topk_group=groups,
+        topk=topk,
+        packed=packed,
+        interpret=True,
+    )
+    np.testing.assert_array_equal(np.array(ids), np.array(expected_ids))
+    np.testing.assert_array_equal(np.array(weights), np.array(expected_weights))
 
 
 # --- bf16 packed-key final-select path (packed=True; caller enables it when logits are bf16) -------

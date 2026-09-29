@@ -3,7 +3,7 @@ import unittest
 from sgl_jax.srt.entrypoints.engine import Engine
 from sgl_jax.test.test_utils import DEEPSEEK_R1_DISTILL_QWEN_1_5B
 
-# python3 -u -m sgl_jax.launch_server --model-path deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --trust-remote-code --dist-init-addr=0.0.0.0:10011 --nnodes=1 --tp-size=1 --device=tpu --random-seed=27 --node-rank=0 --mem-fraction-static=0.8 --chunked-prefill-size=8192 --download-dir=/tmp --dtype=bfloat16 --precompile-bs-paddings 1 64 --max-running-requests 64 --max-total-tokens 257536 --skip-server-warmup --attention-backend=fa --precompile-token-paddings 8192 --page-size=64 --disable-overlap-schedule --log-requests --log-requests-level=3 --enable-precision-tracer --use-sort-for-toppk-minp
+# python3 -u -m sgl_jax.launch_server --model-path deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --trust-remote-code --dist-init-addr=0.0.0.0:10011 --nnodes=1 --tp-size=1 --device=tpu --random-seed=27 --node-rank=0 --mem-fraction-static=0.8 --chunked-prefill-size=8192 --download-dir=/tmp --dtype=bfloat16 --precompile-bs-paddings 1 64 --max-running-requests 64 --max-total-tokens 257536 --skip-server-warmup --attention-backend=fa --precompile-token-paddings 8192 --page-size=64 --disable-overlap-schedule --log-requests --log-requests-level=3 --enable-precision-tracer
 
 print("Running on Google TPU")
 # Default engine configuration
@@ -18,7 +18,6 @@ DEFAULT_ENGINE_CONFIG = {
     "max_total_tokens": 257536,
     "precompile_token_paddings": [8192],
     "precompile_bs_paddings": [1, 64],
-    "use_sort_for_toppk_minp": True,
     "mem_fraction_static": 0.8,
     "disable_overlap_schedule": True,
     "trust_remote_code": True,
@@ -122,12 +121,13 @@ class TestLogprobsDense(unittest.TestCase):
             "output_token_ids_logprobs is invalid",
         )
 
-        expected_output_logprobs = [
-            [-0.921875, 32313, "Okay"],
+        # Input+output and output-only requests have distinct bf16 baselines on JAX 0.11.1.
+        expected_with_input_logprobs = [
+            [-0.9453125, 32313, "Okay"],
             [0.0, 11, ","],
             [-0.3515625, 773, " so"],
         ]
-        self.check_output(output_meta, "output_token_logprobs", expected_output_logprobs)
+        self.check_output(output_meta, "output_token_logprobs", expected_with_input_logprobs)
 
         output = self.engine.generate(
             input_ids=input_ids,
@@ -136,7 +136,12 @@ class TestLogprobsDense(unittest.TestCase):
         )
         output_meta = output["meta_info"]
         self.assertEqual(output_meta["cache_miss_count"], 0, "occur cache_miss")
-        self.check_output(output_meta, "output_token_logprobs", expected_output_logprobs)
+        expected_output_only_logprobs = [
+            [-0.921875, 32313, "Okay"],
+            [0.0, 11, ","],
+            [-0.3515625, 773, " so"],
+        ]
+        self.check_output(output_meta, "output_token_logprobs", expected_output_only_logprobs)
 
         sampling_params = {"n": 1, "temperature": 0.6, "top_p": 0.95, "max_new_tokens": 3}
 

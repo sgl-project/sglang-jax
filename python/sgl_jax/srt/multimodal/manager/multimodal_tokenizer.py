@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import dataclasses
 import hashlib
 import io
@@ -20,6 +19,7 @@ import imageio.v3 as iio
 import librosa
 import numpy as np
 import psutil
+import pybase64
 import requests
 import setproctitle
 from PIL import Image
@@ -32,6 +32,7 @@ from sgl_jax.srt.managers.io_struct import (
     BatchTokenIDOut,
     ProfileReqOutput,
 )
+from sgl_jax.srt.managers.mm_utils import send_mm_request
 from sgl_jax.srt.managers.tokenizer_manager import ReqState, TokenizerManager
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
 from sgl_jax.srt.multimodal.manager.io_struct import (
@@ -670,10 +671,10 @@ class MultimodalTokenizer(TokenizerManager):
                     vr = VideoReader(tmp_path, ctx=ctx)
                 elif source.startswith("data:") and "base64," in source:
                     payload = source.split("base64,", 1)[1]
-                    tmp_path = self._write_temp_video(base64.b64decode(payload))
+                    tmp_path = self._write_temp_video(pybase64.b64decode(payload))
                     vr = VideoReader(tmp_path, ctx=ctx)
                 else:
-                    tmp_path = self._write_temp_video(base64.b64decode(source, validate=True))
+                    tmp_path = self._write_temp_video(pybase64.b64decode(source, validate=True))
                     vr = VideoReader(tmp_path, ctx=ctx)
             else:
                 raise ValueError(f"Unsupported video input type: {type(source)}")
@@ -762,9 +763,9 @@ class MultimodalTokenizer(TokenizerManager):
             return Image.open(io.BytesIO(resp.content)).convert("RGB")
         if source.startswith("data:") and "base64," in source:
             payload = source.split("base64,", 1)[1]
-            return Image.open(io.BytesIO(base64.b64decode(payload))).convert("RGB")
+            return Image.open(io.BytesIO(pybase64.b64decode(payload))).convert("RGB")
         try:
-            return Image.open(io.BytesIO(base64.b64decode(source, validate=True))).convert("RGB")
+            return Image.open(io.BytesIO(pybase64.b64decode(source, validate=True))).convert("RGB")
         except Exception as exc:
             raise ValueError("Unsupported image source format") from exc
 
@@ -911,7 +912,7 @@ class MultimodalTokenizer(TokenizerManager):
         Constructs an `MMReqState` to wait for results and stores it in
         `rid_to_state` keyed by the request id.
         """
-        self.send_to_scheduler.send_pyobj(tokenized_obj)
+        send_mm_request(self.send_to_scheduler, tokenized_obj)
         try:
             caller_loop = asyncio.get_running_loop()
         except RuntimeError:

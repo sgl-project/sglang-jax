@@ -5,8 +5,8 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import Mesh
-from transformers import modeling_flax_utils
 
+from sgl_jax.srt.layers.activation import ACT2FN
 from sgl_jax.srt.layers.embeddings import Embed
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.multimodal.layers.mlp import MLP, get_act_fn
@@ -301,8 +301,8 @@ class FluxTimestepEmbedding(nnx.Module):
             params_dtype=params_dtype,
             kernel_axes=("tensor", None),
         )
-        self.act = modeling_flax_utils.ACT2FN[act_fn] if act_fn is not None else None
-        self.post_act = modeling_flax_utils.ACT2FN[post_act_fn] if post_act_fn is not None else None
+        self.act = ACT2FN[act_fn] if act_fn is not None else None
+        self.post_act = ACT2FN[post_act_fn] if post_act_fn is not None else None
 
     def __call__(
         self,
@@ -362,7 +362,7 @@ class PixArtAlphaTextProjection(nnx.Module):
         )
         self.act_fn = act_fn
         if act_fn == "silu":
-            self.act_1 = modeling_flax_utils.ACT2FN["silu"]
+            self.act_1 = ACT2FN["silu"]
         else:
             raise ValueError(f"Unknown activation function: {act_fn}")
 

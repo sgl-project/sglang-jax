@@ -1,7 +1,8 @@
 """Utility functions for ragged paged attention."""
 
-import jax
 from jax._src import dtypes
+
+from sgl_jax.srt.utils.jax_utils import get_device_kind
 
 
 def cdiv(a, b):
@@ -20,7 +21,7 @@ def get_dtype_packing(dtype):
 
 def get_tpu_version() -> int:
     """Returns the numeric version of the TPU, or -1 if not on TPU."""
-    kind = jax.devices()[0].device_kind
+    kind = get_device_kind()
     if "TPU" not in kind:
         return -1
     if kind.endswith(" lite"):

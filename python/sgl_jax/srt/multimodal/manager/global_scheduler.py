@@ -18,6 +18,7 @@ from sgl_jax.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqOutput,
 )
+from sgl_jax.srt.managers.mm_utils import unwrap_shm_features
 from sgl_jax.srt.multimodal.common.modality_enum import (
     MultimodalDataItem,
     pad_input_tokens,
@@ -291,6 +292,7 @@ class GlobalScheduler:
         )
         req.origin_input_text = input.prompt
         req.origin_input_ids = input.input_ids
+        req.radix_input_ids = list(input.input_ids or [])
         req.omni_inputs = input.mm_inputs
         if input.mm_inputs:
             mm_items = input.mm_inputs.get("mm_items", [])
@@ -366,7 +368,7 @@ class GlobalScheduler:
             video_token_id = input.mm_inputs.get("video_token_id")
             audio_token_id = input.mm_inputs.get("audio_token_id")
             if req.input_ids:
-                req.cache_input_ids = pad_input_tokens(
+                req.radix_input_ids = pad_input_tokens(
                     input_ids=list(req.input_ids),
                     mm_items=all_mm_items,
                     im_token_id=im_token_id,
@@ -414,7 +416,7 @@ class GlobalScheduler:
                 recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
             except zmq.ZMQError:
                 break
-            recv_reqs.append(recv_req)
+            recv_reqs.append(unwrap_shm_features(recv_req))
         return recv_reqs
 
     def event_loop(self):

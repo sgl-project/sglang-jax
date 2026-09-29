@@ -670,12 +670,23 @@ def _mla_ragged_paged_attention_kernel(
                 q_end = cu_q_lens_ref[seq_idx + 1]
                 kv_len = kv_lens_ref[seq_idx]
 
-                update_kv_packing_iters = cdiv_on_kv_packing(
-                    (offset % kv_packing) + update_sz, kv_packing
-                )
                 kv_packing_offset = offset % kv_packing
                 new_kv_len_start = q_end - kv_len + offset
                 new_kv_packing_offset = new_kv_len_start % kv_packing
+
+                # _fetch_bkv appends the new KV words right after the last word holding
+                # cached KV. If both the destination and the source token offsets are
+                # word-aligned (e.g. a prefill without cached prefix), those words are
+                # already in their final position and each merge_loop_body iteration
+                # would store a word back unchanged, so merge no words at all.
+                new_kv_in_place = jnp.logical_and(
+                    kv_packing_offset == 0, new_kv_packing_offset == 0
+                )
+                update_kv_packing_iters = jnp.where(
+                    new_kv_in_place,
+                    0,
+                    cdiv_on_kv_packing(kv_packing_offset + update_sz, kv_packing),
+                )
 
                 token_offset_in_bkv = offset % bkv_sz
                 kv_packing_idx = floor_div_on_kv_packing(token_offset_in_bkv, kv_packing)
@@ -1412,6 +1423,7 @@ def mla_ragged_paged_attention(
         # placeholder. The "decode" tuned entry also carries
         # `decode_batch_size`, which overrides the caller's value if hit.
         from sgl_jax.srt.kernels.mla.v2.tuned_block_sizes import (
+            get_fallback_block_sizes_mla,
             get_tuned_block_sizes_mla,
         )
 
@@ -1442,18 +1454,23 @@ def mla_ragged_paged_attention(
             page_size_lookup,
             max_num_tokens_lookup,
         )
-        # Fallback hardcoded defaults match the historical
-        # mla_backend.py:97-106 defaults — same numbers that prod was using
-        # before the tuned table existed.
+        # Fallback defaults are derived from the dtype tiling and per-shard
+        # head count so a table miss always yields a Mosaic-legal block
+        # (#1546); for >=16-head bf16 shards they reduce to the historical
+        # mla_backend.py:97-106 numbers.
         if tuned_d is not None:
             bkv_p_d, bq_d, dbs_lookup = tuned_d
             decode_batch_size = dbs_lookup
         else:
-            bkv_p_d, bq_d = 3, 1
+            bkv_p_d, bq_d = get_fallback_block_sizes_mla(
+                "decode", ql_nope.dtype, actual_num_q_heads, page_size_lookup
+            )
         if tuned_m is not None:
             bkv_p_m, bq_m = tuned_m
         else:
-            bkv_p_m, bq_m = 1, 16
+            bkv_p_m, bq_m = get_fallback_block_sizes_mla(
+                "mixed", ql_nope.dtype, actual_num_q_heads, page_size_lookup
+            )
 
         num_kv_pages_per_blocks = (bkv_p_d, 1, bkv_p_m)  # slot[1] is dead
         num_queries_per_blocks = (bq_d, 1, bq_m)

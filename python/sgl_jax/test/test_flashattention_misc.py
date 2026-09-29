@@ -32,6 +32,32 @@ class TestFlashAttentionMisc(AttentionTestBase):
             logit_cap=logit_cap,
         )
 
+    def test_sliding_window_narrower_than_sequence_prefill_accuracy(self):
+        """A sliding window that cuts, reached through the production metadata path.
+
+        Both sliding-window tests in this file use a 512-token window against
+        sequences of at most 400, so their window predicate is uniformly true
+        across every tile the kernel visits -- they would pass with the
+        sliding-window arm deleted outright. test_rpa_v3_kv_writeback.py does
+        cut its window, but it calls ragged_paged_attention directly with a
+        hand-built page table. This case reaches the kernel through
+        RadixAttention and the FlashAttention backend instead, so page_indices
+        and cu_kv_lens are built by _pad_page_indices the way they are in
+        production. GQA (32 q / 8 kv) also makes the query row index a
+        floor-divide rather than a plain iota.
+        """
+        num_heads = 32
+        num_kv_heads = 8
+        head_dim = 128
+        lens = [(512, 512), (256, 256), (130, 130)]
+
+        self.run_test(
+            "prefill",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 16, jnp.bfloat16),
+            sliding_window=128,
+        )
+
     def test_sliding_window_and_soft_cap_decode_accuracy(self):
         """Test combined sliding window and soft cap attention accuracy in decode mode"""
         # Parameters

@@ -300,7 +300,7 @@ class ToolCall(BaseModel):
 
 class ChatCompletionMessageGenericParam(BaseModel):
     role: Literal["system", "assistant", "tool"]
-    content: str | list[ChatCompletionMessageContentTextPart] | None
+    content: str | list[ChatCompletionMessageContentTextPart] | None = None
     tool_call_id: str | None = None
     name: str | None = None
     reasoning_content: str | None = None

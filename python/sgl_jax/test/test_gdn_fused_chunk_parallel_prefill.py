@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import jax
 import jax.numpy as jnp
@@ -50,7 +50,7 @@ class _Fixture:
     dt_bias: jax.Array
     cu_seqlens: jax.Array
     state_indices: jax.Array
-    track_indices: jax.Array
+    track_indices: jax.Array | None
     has_initial_state: jax.Array
     seq_lens: jax.Array
 
@@ -224,8 +224,11 @@ def test_real_vendor_matches_reference_for_packed_ragged_prefill(monkeypatch):
         _assert_unchanged(value, snapshot)
 
 
-def test_real_vendor_prefill_preserves_reference_decode_continuity(monkeypatch):
+@pytest.mark.parametrize("tracking", [False, True])
+def test_real_vendor_prefill_preserves_reference_decode_continuity(monkeypatch, tracking):
     fixture = _make_fixture(seed=312)
+    if not tracking:
+        fixture = replace(fixture, track_indices=None)
     expected_prefill = _reference_prefill(fixture)
     calls, actual_prefill = _vendor_prefill(monkeypatch, fixture)
     assert calls == ["actual-v3"]
@@ -277,4 +280,35 @@ def test_real_vendor_prefill_preserves_reference_decode_continuity(monkeypatch):
             rtol=2e-2,
             atol=5e-2,
             err_msg=name,
+        )
+
+
+@pytest.mark.parametrize("empty_has_initial", [False, True])
+def test_real_vendor_no_tracking_matches_reference_and_resets_empty_slot(
+    monkeypatch, empty_has_initial
+):
+    fixture = _make_fixture(seed=314)
+    fixture = replace(
+        fixture,
+        track_indices=None,
+        has_initial_state=fixture.has_initial_state.at[-1].set(empty_has_initial),
+        # Explicitly reset the first slot despite a positive kernel prefix.
+        seq_lens=fixture.seq_lens.at[0].add(17),
+    )
+    # The direct no-tracking path lets the vendor consume its donated inputs.
+    original_pools = tuple(
+        np.asarray(pool).copy() for pool in (fixture.conv_state, fixture.recurrent_state)
+    )
+    expected = _reference_prefill(fixture)
+    calls, actual = _vendor_prefill(monkeypatch, fixture)
+    assert calls == ["actual-v3"]
+    for result, reference in zip(actual, expected, strict=True):
+        assert np.isfinite(np.asarray(result)).all()
+        np.testing.assert_allclose(result, reference, rtol=2e-2, atol=5e-2)
+    for result, original in zip(actual[1:], original_pools, strict=True):
+        _assert_unchanged(result[0], original[0])
+        _assert_unchanged(result[NUM_REQUESTS + 1 :], original[NUM_REQUESTS + 1 :])
+        _assert_unchanged(
+            result[STATE_INDICES[-1]],
+            original[STATE_INDICES[-1]] if empty_has_initial else jnp.zeros_like(original[0]),
         )

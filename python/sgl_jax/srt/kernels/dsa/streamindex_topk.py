@@ -20,12 +20,15 @@
 
 import enum
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
+from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 
 Enum = enum.Enum
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
@@ -97,6 +100,8 @@ def _scores_kernel(
     bkv_p: int,
     bq_sz: int,
     seq_batch_size: int,
+    page_pool_size: int | None = None,
+    num_bkv_max: int | None = None,
 ):
     _, num_q_heads, head_dim = q_hbm_ref.shape
     lkv_dim = cache_kv_hbm_ref.shape[-1]
@@ -160,6 +165,21 @@ def _scores_kernel(
             wait=False,
         )
 
+    def start_send_page_scores(bo_sem_idx, sz, token_start):
+        # Page mode: one DMA per bq block covering ALL page columns (the
+        # accumulator already holds the max over every bkv block).
+        bo_sz_ref[bo_sem_idx] = sz
+        num_page_sublanes = scores_hbm_ref.shape[1]
+        _async_copy(
+            scores_block_x2_ref.at[bo_sem_idx, pl.ds(0, seq_batch_size * sz)],
+            scores_hbm_ref.at[
+                pl.ds(token_start, seq_batch_size * sz),
+                pl.ds(0, num_page_sublanes),
+            ],
+            sems.at[2, bo_sem_idx, 0],
+            wait=False,
+        )
+
     def _async_copy(src, dst, sem, wait):
         cp = pltpu.make_async_copy(src, dst, sem)
         if wait:
@@ -183,20 +203,42 @@ def _scores_kernel(
             page_indices_offset = (seq_idx + batch_idx) * pages_per_seq + kv_p_start
 
             if not wait:
-                for i in range(bkv_p):
-                    sz_per_kv_packing = page_size_per_kv_packing
+
+                def _start_fetch_page(
+                    i,
+                    carry,
+                    page_indices_offset=page_indices_offset,
+                    bkv_vmem_ref=bkv_vmem_ref,
+                    sem=sem,
+                ):
                     page_idx = jnp.minimum(page_indices_offset + i, num_page_indices - 1)
                     safe_page_offset = jnp.minimum(
                         page_indices_ref[page_idx] * page_size_per_kv_packing,
                         jnp.maximum(0, max_hbm_pages - page_size_per_kv_packing),
                     )
-
                     _async_copy(
-                        reshaped_cache_hbm_ref.at[pl.ds(safe_page_offset, sz_per_kv_packing)],
-                        bkv_vmem_ref.at[pl.ds(i * page_size_per_kv_packing, sz_per_kv_packing)],
+                        reshaped_cache_hbm_ref.at[
+                            pl.ds(safe_page_offset, page_size_per_kv_packing)
+                        ],
+                        bkv_vmem_ref.at[
+                            pl.ds(i * page_size_per_kv_packing, page_size_per_kv_packing)
+                        ],
                         sem,
                         wait=False,
                     )
+                    return carry
+
+                if bkv_p > 64:
+                    # Large page blocks (page mode, bkv_p=128): a python-unrolled
+                    # per-page DMA loop bloats the Mosaic program and costs ~40s
+                    # of compile per kernel instance (measured v7x, T=8192); a
+                    # fori_loop compiles in <1s with identical steady-state
+                    # performance (DMA issue rate is not the bottleneck).
+                    lax.fori_loop(0, bkv_p, _start_fetch_page, None, unroll=False)
+                else:
+                    # Keep the merged decode path (bkv_p<=64) byte-identical.
+                    for i in range(bkv_p):
+                        _start_fetch_page(i, None)
             else:
                 dma_bkv_sz = bkv_p * page_size_per_kv_packing
                 dst_kv = bkv_vmem_ref.at[pl.ds(0, dma_bkv_sz)]
@@ -355,7 +397,14 @@ def _scores_kernel(
                 causal_mask = k_span <= bq_pos_compressed[:, None]
                 mask = jnp.logical_and(valid_mask, causal_mask)
                 s_summed = jnp.where(mask, s_summed, -jnp.inf)
-                ret.append(s_summed.reshape(-1, num_sublanes_bkv, 128))
+                if page_pool_size is not None:
+                    # Page mode: max-pool token scores within each page. Columns
+                    # are linear (compressed) kv positions, and bkv_sz is a whole
+                    # number of pages, so pooling groups are exact pages.
+                    cols_per_page = page_pool_size // compression_ratio
+                    ret.append(s_summed.reshape(-1, bkv_p, cols_per_page).max(axis=-1))
+                else:
+                    ret.append(s_summed.reshape(-1, num_sublanes_bkv, 128))
             return jnp.concatenate(ret, axis=0)
 
         def compute_with_bq(bq_idx, _):
@@ -379,7 +428,10 @@ def _scores_kernel(
                     + bq_idx * bq_sz
                     + jnp.arange(bq_sz, dtype=jnp.int32)
                 )
-                bq_pos_compressed_vec.append(q_pos // compression_ratio)
+                # Last visible compressed entry: the one whose final token
+                # (entry+1)*ratio-1 is at or before q_pos, i.e. entries
+                # [0, (q_pos+1)//ratio). Identity for ratio == 1.
+                bq_pos_compressed_vec.append((q_pos + 1) // compression_ratio - 1)
 
             # Wait for cur bq if not ready yet
             wait_fetch_bq(batch_start_seq_idx, bq_idx, bq_sem_idx)
@@ -427,7 +479,91 @@ def _scores_kernel(
 
             lax.fori_loop(0, num_bkv, compute_with_bkv, None, unroll=False)
 
-        lax.fori_loop(0, num_bq, compute_with_bq, None, unroll=False)
+        def compute_with_bq_paged(bq_idx, _):
+            # Page-mode twin of compute_with_bq: pooled page scores accumulate in
+            # a fori carry ([rows, num_bkv_max, bkv_p], untouched blocks stay
+            # -inf) and are written back with ONE DMA per bq block — no
+            # [T, max_kv] token-score materialization ever reaches HBM.
+            bq_sem_idx = sem_ids_ref[0]
+            next_seq_idx, next_bq_idx, next_bq_sem_idx = get_next_bq_ids(
+                batch_start_seq_idx, bq_idx, bq_sem_idx
+            )
+
+            @pl.when(next_seq_idx < end_seq_idx)
+            def prefetch_next_bq():
+                sem_ids_ref[0] = next_bq_sem_idx
+                start_fetch_bq(next_seq_idx, next_bq_idx, next_bq_sem_idx)
+
+            bq_pos_compressed_vec = []
+            for batch_idx in range(seq_batch_size):
+                q_pos = (
+                    seq_lens[batch_idx]
+                    - q_lens[batch_idx]
+                    + bq_idx * bq_sz
+                    + jnp.arange(bq_sz, dtype=jnp.int32)
+                )
+                # Last visible compressed entry: the one whose final token
+                # (entry+1)*ratio-1 is at or before q_pos, i.e. entries
+                # [0, (q_pos+1)//ratio). Identity for ratio == 1.
+                bq_pos_compressed_vec.append((q_pos + 1) // compression_ratio - 1)
+
+            wait_fetch_bq(batch_start_seq_idx, bq_idx, bq_sem_idx)
+            bq_vec = load_bq(bq_sem_idx)
+            bq_weights_vec = load_bq_weights(bq_sem_idx)
+
+            token_start = cu_q_lens_ref[batch_start_seq_idx] + bq_idx * bq_sz
+            curr_q_end = cu_q_lens_ref[batch_start_seq_idx + 1]
+            sz = jnp.maximum(0, jnp.minimum(bq_sz, curr_q_end - token_start))
+
+            assert bkv_p == 128, "page mode requires bkv_p == 128 (one lane row per block)"
+
+            # Acquire the output buffer up-front: wait_send_scores waits on the
+            # DMA issued for this buffer TWO bq iterations ago (buffers
+            # alternate), so the -inf fill below can never race an in-flight
+            # read. Each bkv block then stores its pooled lane-row [rows, 128]
+            # at sublane index bkv_idx; untouched trailing blocks (dynamic
+            # num_bkv < num_bkv_max, which only sizes the output layout) stay
+            # -inf and are masked to -1 after top_k.
+            bo_sem_idx = sem_ids_ref[2]
+            wait_send_scores(bo_sem_idx)
+            scores_block_x2_ref[bo_sem_idx, ...] = jnp.full(
+                scores_block_x2_ref.shape[1:], -jnp.inf, dtype=jnp.float32
+            )
+
+            def compute_with_bkv_paged(bkv_idx, _):
+                bkv_sem_idx = sem_ids_ref[1]
+                next_seq_idx, _u, next_bkv_idx, next_bkv_sem_idx = get_next_bkv_ids(
+                    batch_start_seq_idx, bq_idx, bkv_idx, bkv_sem_idx
+                )
+
+                @pl.when(next_seq_idx < end_seq_idx)
+                def prefetch_next_bkv():
+                    sem_ids_ref[1] = next_bkv_sem_idx
+                    start_fetch_bkv(next_seq_idx, next_bkv_idx, next_bkv_sem_idx)
+
+                wait_fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx)
+                bkv_vec, scale_val_vec = load_bkv(bkv_sem_idx)
+
+                page_scores = compute_scores(
+                    bq_vec,
+                    bkv_vec,
+                    scale_val_vec,
+                    bq_weights_vec,
+                    bq_pos_compressed_vec,
+                    bkv_idx,
+                )  # [rows, 128] — one pooled lane row per block
+                scores_block_x2_ref[bo_sem_idx, :, bkv_idx, :] = page_scores
+                return None
+
+            lax.fori_loop(0, num_bkv, compute_with_bkv_paged, None, unroll=False)
+
+            start_send_page_scores(bo_sem_idx, sz, token_start)
+            sem_ids_ref[2] = lax.select(bo_sem_idx == 0, 1, 0)
+
+        if page_pool_size is None:
+            lax.fori_loop(0, num_bq, compute_with_bq, None, unroll=False)
+        else:
+            lax.fori_loop(0, num_bq, compute_with_bq_paged, None, unroll=False)
 
     ### ------- Kernel start ------- ###
 
@@ -489,6 +625,138 @@ def prepare_outputs(out):
     return out
 
 
+# ----------------------------------------------------------------------------
+# Exit-stage selection: SparseCore radix select (exact) vs XLA approx_max_k.
+#
+# ``jax.lax.approx_max_k(recall_target=1.0)`` lowers to a full sort of every row on
+# TPU (XLA short-circuits recall_target == 1.0 to log2_reduction=0), which at
+# DeepSeek-V4 scale (E = 262144 compressed entries per query, k=512) is 56% (decode
+# B=64) to 84% (prefill T=2048) of this kernel's wall time on v7x. The vendored
+# SparseCore MSB radix-select kernel (``sc_topk``) is exact and 4-6x faster on that
+# stage on both v6e and v7x. Small rows are cheaper on the XLA path (fixed SC launch
+# cost), so the policy below keeps them there.
+# ----------------------------------------------------------------------------
+
+# Rows shorter than this stay on the XLA path. Measured: E=256 rows are ~30% slower on
+# SparseCore, E=25000 rows are ~2.3x faster; tokamax switches to cooperative subcores
+# above 4096 entries. Override with DSA_SC_TOPK_MIN_ENTRIES. Both env vars are read
+# when the calling function is traced (jit-cached afterwards).
+SC_TOPK_MIN_ENTRIES = int(os.environ.get("DSA_SC_TOPK_MIN_ENTRIES", "8192"))
+# Fraction of one SparseCore subcore's VMEM the kernel may use for its per-subcore
+# key + value slice (the rest holds histograms, output buffers and the carry-forward).
+_SC_TOPK_VMEM_BUDGET = 0.5
+# Above this many entries the vendored kernel splits each row across all subcores of a
+# core (``num_cooperating_tiles = mesh.num_subcores``); at or below it one subcore
+# owns the whole row.
+_SC_TOPK_COOPERATIVE_ABOVE = 4096
+_SC_TOPK_KEY_VALUE_BYTES = 8  # f32 key + int32 value per candidate
+
+
+def _sparse_core_info():
+    """Target SparseCore geometry; Pallas caches TPU info by trace context."""
+    if not is_tpu_runtime():
+        return None
+    try:
+        info = pltpu.get_tpu_info()
+    except (RuntimeError, ValueError):
+        return None
+    if getattr(info, "generation", 0) < 6 or getattr(info, "sparse_core", None) is None:
+        return None
+    return info.sparse_core
+
+
+def sc_topk_available() -> bool:
+    """True when the SparseCore radix-select kernel can run on this device.
+
+    DSA_SC_TOPK=0 disables the path; the check runs at trace time of the caller.
+    """
+    return os.environ.get("DSA_SC_TOPK", "1") != "0" and _sparse_core_info() is not None
+
+
+def _sc_topk_max_entries(info) -> int:
+    """Largest row whose per-subcore key+value slice fits the VMEM budget."""
+    per_subcore = int(info.vmem_capacity_bytes * _SC_TOPK_VMEM_BUDGET)
+    per_subcore //= _SC_TOPK_KEY_VALUE_BYTES
+    per_subcore -= per_subcore % info.num_lanes
+    return per_subcore * info.num_subcores
+
+
+def should_use_sc_topk(num_entries: int, batch: int) -> bool:
+    """Routing policy for the exit-stage top-k: pure function of shape and device.
+
+    Evaluated on the device the caller is traced on; off-TPU it is always False.
+    """
+    del batch  # the kernel handles any batch; kept in the signature for future tuning
+    info = _sparse_core_info()
+    if info is None or num_entries < SC_TOPK_MIN_ENTRIES:
+        return False
+    return num_entries <= _sc_topk_max_entries(info)
+
+
+def _sc_padded_width(n: int, info) -> int:
+    """Smallest width >= n satisfying the kernel's layout constraints: the row is split
+    into ``num_subcores`` tiles above the cooperative threshold (one tile below it), and
+    each tile must be a whole number of ``num_lanes``-wide vectors."""
+    tiles = 1 if n <= _SC_TOPK_COOPERATIVE_ABOVE else info.num_subcores
+    unit = tiles * info.num_lanes
+    padded = -(-n // unit) * unit
+    if n <= _SC_TOPK_COOPERATIVE_ABOVE < padded:  # padding crossed the threshold
+        unit = info.num_subcores * info.num_lanes
+        padded = -(-n // unit) * unit
+    return padded
+
+
+def _sc_select(scores: jax.Array, k: int) -> jax.Array:
+    from sgl_jax.srt.kernels.dsa import sc_topk
+
+    info = _sparse_core_info()
+    if info is None:
+        raise ValueError(
+            "SparseCore top-k requested but no SparseCore is available on backend "
+            f"{jax.default_backend()!r}; use topk_backend='xla' or 'auto'."
+        )
+    n = scores.shape[-1]
+    padded = _sc_padded_width(n, info)
+    if padded != n:
+        scores = jnp.pad(scores, ((0, 0), (0, padded - n)), constant_values=-jnp.inf)
+    vals, idxs = sc_topk.top_k(keys=scores, k=k, num_seq_windows=1, digit_width=4, num_digits=8)
+    # The kernel does not order its output; the indexer contract is descending values
+    # with -1 (from -inf) packed at the tail.
+    vals, idxs = jax.lax.sort((vals, idxs), dimension=-1)
+    vals, idxs = jnp.flip(vals, axis=-1), jnp.flip(idxs, axis=-1)
+    return jnp.where(vals == -jnp.inf, -1, idxs)
+
+
+def _xla_select(scores: jax.Array, k: int) -> jax.Array:
+    # jax.lax.approx_max_k(recall_target=1.0) is equivalent to jax.lax.top_k
+    # but faster.
+    top_vals, top_idxs = jax.lax.approx_max_k(scores, k, reduction_dimension=-1, recall_target=1.0)
+    return jnp.where(top_vals == -jnp.inf, -1, top_idxs)
+
+
+def select_topk_indices(scores: jax.Array, k: int, *, backend: str = "auto") -> jax.Array:
+    """Exact top-k indices of ``scores`` ([T, E] f32, -inf = invalid), descending, -1 tail.
+
+    backend: "auto" routes by ``should_use_sc_topk``; "sc" / "xla" force a path.
+    """
+    if scores.shape[-1] < k:
+        scores = jnp.pad(scores, ((0, 0), (0, k - scores.shape[-1])), constant_values=-jnp.inf)
+    if backend == "auto":
+        use_sc = sc_topk_available() and should_use_sc_topk(scores.shape[-1], scores.shape[0])
+    elif backend == "sc":
+        if not sc_topk_available():
+            raise ValueError(
+                "topk_backend='sc' requires a TPU with a SparseCore (v6e or newer) and "
+                "DSA_SC_TOPK unset or != '0'."
+            )
+        use_sc = True
+    elif backend == "xla":
+        use_sc = False
+    else:
+        raise ValueError(f"unknown top-k backend {backend!r}; expected auto | sc | xla")
+    return _sc_select(scores, k) if use_sc else _xla_select(scores, k)
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -498,6 +766,7 @@ def prepare_outputs(out):
         "num_queries_per_block",
         "vmem_limit_bytes",
         "decode_req_batch_size",
+        "topk_backend",
     ),
 )
 def streamindex_topk(
@@ -515,6 +784,7 @@ def streamindex_topk(
     num_queries_per_block: tuple[int, int, int] | int | None = None,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     decode_req_batch_size: int = 4,
+    topk_backend: str = "auto",
 ) -> jax.Array:
     """StreamIndex Top-K retrieval.
 
@@ -530,12 +800,17 @@ def streamindex_topk(
         sequences[i:j] are chunked-prefill-only, and sequences[j:k] are mixed. The
         k is also the total number of sequences.
       k: Number of top-K elements to retrieve.
-      compression_ratio: KV cache compression ratio.
+      compression_ratio: KV cache compression ratio. Compressed entry ``e``
+        covers original positions ``[e*ratio, (e+1)*ratio-1]`` and is visible
+        to a query only once its last token is at or before the query
+        position (``e < (q_pos+1)//ratio``, the DeepSeek-V4 indexer rule).
       num_kv_pages_per_block: number of kv pages to be processed in one block in
         the pallas kernel. This is a tuple of (decode, prefill, mixed) cases.
       num_queries_per_block: number of queries to be processed in one block in the
         pallas kernel. This is a tuple of (decode, prefill, mixed) cases.
       vmem_limit_bytes: the vmem limit for the pallas kernel.
+      topk_backend: exit-stage selector: "auto" (SparseCore radix select when
+        available and the row is large enough, else XLA), "sc" or "xla".
 
     Returns:
       Top-K indices (in compressed space).
@@ -776,20 +1051,132 @@ def streamindex_topk(
     )
 
     scores = scores.reshape(q.shape[0], -1)
-    if scores.shape[1] < k:
-        scores = jnp.pad(
-            scores,
-            ((0, 0), (0, k - scores.shape[1])),
-            constant_values=-jnp.inf,
+    topk_idxs = select_topk_indices(scores, k, backend=topk_backend)
+    return topk_idxs[: q.shape[0], :k]
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "k_pages",
+        "compression_ratio",
+        "num_kv_pages_per_block",
+        "num_queries_per_block",
+        "vmem_limit_bytes",
+    ),
+)
+def streamindex_page_topk(
+    q: jax.Array,  # [max_num_tokens, num_q_heads, head_dim]
+    indexer_weights: jax.Array,  # [max_num_tokens, num_q_heads]
+    cache_kv: jax.Array,  # [total_pages, page_size_per_kv_packing, kv_packing, lkv]
+    seq_lens: jax.Array,  # i32[max_num_seqs]
+    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    num_seqs: jax.Array,  # i32[] number of valid sequences
+    *,
+    k_pages: int,
+    compression_ratio: int = 1,
+    num_kv_pages_per_block: int = 128,
+    num_queries_per_block: int = 512,
+    vmem_limit_bytes: int | None = 64 * 1024 * 1024,
+) -> jax.Array:
+    """Page-level lightning-indexer top-k (prefill/extend form).
+
+    Pallas twin of ``ref.streamindex_page_topk_ref(one_token_per_seq=False)``:
+    scores are max-pooled to page granularity inside the kernel (only
+    ``[T, pages_per_seq]`` ever reaches HBM — no ``[T, max_kv]`` token-score
+    materialization), then a cheap ``top_k`` over pages selects the budget.
+
+    Returns:
+      i32[T, k_pages] seq-local page ids per query token; -1 for padding.
+    """
+    max_num_seqs = seq_lens.shape[0]
+    original_dtype = q.dtype
+    prepared_indexer_weights = prepare_index_weights(indexer_weights, original_dtype)
+    q = prepare_q_inputs(q)
+    _, num_q_heads, head_dim = q.shape
+    lkv_dim = cache_kv.shape[-1]
+    _, page_size_per_kv_packing, kv_packing, _ = cache_kv.shape
+    page_size = page_size_per_kv_packing * kv_packing
+    pages_per_seq = page_indices.shape[0] // max_num_seqs
+    if compression_ratio != 1:
+        raise NotImplementedError(
+            "page mode is validated for compression_ratio=1 only (GLM); the"
+            " compressed causal bound interacts with page pooling and needs its"
+            " own parity gate before enabling."
         )
 
-    # TODO: Re-evaluate replacing this with the sparsecore_topk kernel
-    # once SparseCore supports direct VMEM access (e.g., on TPU v8).
-    # Currently, jax.lax.approx_max_k wins due to the HBM read/write tax, but
-    # direct VMEM streaming will allow SC to beat TensorCore performance.
+    bkv_p = num_kv_pages_per_block
+    if bkv_p != 128:
+        raise ValueError("page mode requires num_kv_pages_per_block == 128")
+    bq_sz = num_queries_per_block
+    num_bkv_max = cdiv(pages_per_seq, bkv_p)
+    num_page_cols = align_to(num_bkv_max * bkv_p, 128)
+    num_page_sublanes = num_page_cols // 128
+    bkv_sz = page_size * bkv_p // compression_ratio
+    if bkv_sz % 128 != 0:
+        raise ValueError(f"bkv block token span ({bkv_sz}) must be a multiple of 128.")
 
-    # jax.lax.approx_max_k(recall_target=1.0) is equivalent to jax.lax.top_k
-    # but faster.
-    top_vals, top_idxs = jax.lax.approx_max_k(scores, k, reduction_dimension=-1, recall_target=1.0)
-    topk_idxs = jnp.where(top_vals == -jnp.inf, -1, top_idxs)
-    return topk_idxs[: q.shape[0], :k]
+    T = q.shape[0]
+    scores_init = jnp.full((T, num_page_sublanes, 128), -jnp.inf, dtype=jnp.float32)
+
+    in_specs = [
+        pl.BlockSpec(memory_space=pltpu.HBM),
+        pl.BlockSpec(memory_space=pltpu.HBM),
+        pl.BlockSpec(memory_space=pltpu.HBM),
+        pl.BlockSpec(memory_space=pltpu.HBM),
+    ]
+    out_specs = pl.BlockSpec(memory_space=pltpu.HBM)
+
+    scratch_shapes = [
+        pltpu.VMEM((2, 1, bkv_p * page_size_per_kv_packing, kv_packing, lkv_dim), cache_kv.dtype),
+        pltpu.VMEM((2, 1, bq_sz, num_q_heads, head_dim), q.dtype),
+        pltpu.VMEM((2, 1, bq_sz, num_q_heads), prepared_indexer_weights.dtype),
+        pltpu.VMEM((2, bq_sz, num_page_sublanes, 128), jnp.float32),
+        pltpu.SemaphoreType.DMA((4, 2, 1)),
+    ]
+
+    scalar_prefetches = (
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        jnp.stack([jnp.int32(0), num_seqs.astype(jnp.int32)]),
+        jnp.zeros((3,), jnp.int32),
+        jnp.full((2,), -1, jnp.int32),
+    )
+
+    scope_name = f"StreamIdxPageTC-bq_{bq_sz}-bkvp_{bkv_p}"
+    kernel = jax.named_scope(scope_name)(
+        pl.pallas_call(
+            functools.partial(
+                _scores_kernel,
+                compression_ratio=compression_ratio,
+                static_q_len=None,
+                bq_sz=bq_sz,
+                bkv_p=bkv_p,
+                seq_batch_size=1,
+                page_pool_size=page_size,
+                num_bkv_max=num_bkv_max,
+            ),
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=len(scalar_prefetches),
+                in_specs=in_specs,
+                out_specs=out_specs,
+                grid=(num_seqs.astype(jnp.int32),),
+                scratch_shapes=scratch_shapes,
+            ),
+            compiler_params=pltpu.CompilerParams(
+                dimension_semantics=("arbitrary",),
+                vmem_limit_bytes=vmem_limit_bytes,
+                disable_bounds_checks=True,
+            ),
+            out_shape=jax.ShapeDtypeStruct(shape=(T, num_page_sublanes, 128), dtype=jnp.float32),
+            input_output_aliases={len(scalar_prefetches) + 3: 0},
+            name=scope_name,
+        )
+    )
+    page_scores = kernel(*scalar_prefetches, q, prepared_indexer_weights, cache_kv, scores_init)
+
+    page_scores = page_scores.reshape(T, num_page_cols)[:, :pages_per_seq]
+    top_vals, top_idxs = jax.lax.top_k(page_scores, k_pages)
+    return jnp.where(top_vals > -jnp.inf, top_idxs, -1)

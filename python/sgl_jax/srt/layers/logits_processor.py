@@ -11,6 +11,7 @@ from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.layers.embeddings import Embed
+from sgl_jax.srt.layers.lm_head_parallel import compute_lm_head_logits
 from sgl_jax.srt.utils.jax_utils import device_array
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
@@ -118,6 +119,9 @@ class LogitsMetadata:
     top_p_normalized_logprobs: bool = False
     top_p: jax.Array = None
 
+    # Opt-in for fused callers that immediately reduce logits to greedy IDs.
+    preserve_vocab_sharding: bool = False
+
     def tree_flatten(self):
         children = (
             self.extend_seq_lens,
@@ -133,6 +137,7 @@ class LogitsMetadata:
         aux_data = {
             "forward_mode": self.forward_mode,
             "capture_hidden_mode": self.capture_hidden_mode,
+            "preserve_vocab_sharding": self.preserve_vocab_sharding,
             "extend_return_logprob": self.extend_return_logprob,
             "extend_return_top_logprob": self.extend_return_top_logprob,
             "extend_token_ids_logprob": self.extend_token_ids_logprob,
@@ -167,6 +172,7 @@ class LogitsMetadata:
 
         obj.forward_mode = aux_data["forward_mode"]
         obj.capture_hidden_mode = aux_data["capture_hidden_mode"]
+        obj.preserve_vocab_sharding = aux_data["preserve_vocab_sharding"]
         obj.extend_return_logprob = aux_data["extend_return_logprob"]
         obj.extend_return_top_logprob = aux_data["extend_return_top_logprob"]
         obj.extend_token_ids_logprob = aux_data["extend_token_ids_logprob"]
@@ -249,9 +255,17 @@ class LogitsMetadata:
 class LogitsProcessor(nnx.Module):
     """Logits processor for the model."""
 
-    def __init__(self, vocab_size: int, mesh: Mesh, soft_cap: float | None = None):
+    def __init__(
+        self,
+        vocab_size: int,
+        mesh: Mesh,
+        soft_cap: float | None = None,
+        *,
+        enable_dp_lm_head: bool = False,
+    ):
         self.vocab_size = vocab_size
         self.soft_cap = soft_cap
+        self.enable_dp_lm_head = enable_dp_lm_head
         self.mesh = mesh
 
     def _select_hidden_states(self, hidden_states: jax.Array, indices: jax.Array) -> jax.Array:
@@ -283,11 +297,16 @@ class LogitsProcessor(nnx.Module):
         def select_local_fn(local_logits, local_indices):
             return local_logits[local_indices]
 
+        spec = (
+            P("data", "tensor")
+            if self.vocab_size % self.mesh.shape["tensor"] == 0
+            else P("data", None)
+        )
         return jax.shard_map(
             select_local_fn,
             mesh=self.mesh,
-            in_specs=(P("data", "tensor"), P("data")),
-            out_specs=P("data", "tensor"),
+            in_specs=(spec, P("data")),
+            out_specs=spec,
         )(logits, indices)
 
     def _select_input_token_logprobs(
@@ -395,7 +414,15 @@ class LogitsProcessor(nnx.Module):
                 )
 
         # Compute logits for both input and sampled tokens.
-        logits = self._get_logits(pruned_states, lm_head)
+        logits = self._get_logits(
+            pruned_states,
+            lm_head,
+            preserve_vocab_sharding=(
+                logits_metadata.preserve_vocab_sharding
+                and not logits_metadata.extend_return_logprob
+                and sample_indices is None
+            ),
+        )
         sampled_logits = (
             self._select_logits(logits, sample_indices) if sample_indices is not None else logits
         )
@@ -524,6 +551,8 @@ class LogitsProcessor(nnx.Module):
         self,
         hidden_states: jax.Array,
         lm_head: Embed,
+        *,
+        preserve_vocab_sharding: bool = False,
     ) -> jax.Array:
         """Get logits from hidden_states.
 
@@ -535,16 +564,14 @@ class LogitsProcessor(nnx.Module):
             (hidden_states, lm_head.embedding.value),
             dtype=lm_head.dtype,
         )
-        hidden_states = jax.sharding.reshard(
+        logits = compute_lm_head_logits(
             hidden_states,
-            NamedSharding(self.mesh, P("data", None)),
+            embedding,
+            self.mesh,
+            self.vocab_size,
+            self.enable_dp_lm_head,
+            preserve_vocab_sharding=preserve_vocab_sharding,
         )
-
-        logits = jnp.dot(
-            hidden_states, embedding.T, out_sharding=NamedSharding(self.mesh, P("data", "tensor"))
-        )
-
-        logits = logits[:, : self.vocab_size] if logits.ndim > 1 else logits[: self.vocab_size]
 
         if self.soft_cap:
             logits = self.soft_cap * jnp.tanh(logits / self.soft_cap)

@@ -31,11 +31,32 @@ GRAMMAR_BACKEND_CHOICES = ["llguidance", "none"]
 _REJECTED_PD_HOST_ALIASES = frozenset({"localhost"})
 
 
+def apply_multimodal_model_defaults(server_args, model_config) -> None:
+    if not model_config.is_multimodal:
+        return
+
+    in_model = model_config.is_in_model_multimodal
+
+    if not in_model and not server_args.disable_radix_cache:
+        logger.info("Multimodal model detected, disabling radix cache")
+        server_args.disable_radix_cache = True
+
+    if not in_model and (
+        server_args.chunked_prefill_size is None or server_args.chunked_prefill_size > 0
+    ):
+        logger.info("Multimodal model detected, disabling chunked prefill")
+        server_args.chunked_prefill_size = -1
+    if server_args.enable_mixed_chunk and not in_model:
+        logger.info("Multimodal model does not support mixed chunk; disabling it")
+        server_args.enable_mixed_chunk = False
+    if server_args.limit_mm_data_per_request is None:
+        server_args.limit_mm_data_per_request = {"image": 16}
+
+
 def _validate_disaggregation_host_ip(host_ip: str) -> str:
     if host_ip in _REJECTED_PD_HOST_ALIASES:
         raise ValueError(
-            "--disaggregation-host-ip must be a routable address; "
-            f"got loopback alias {host_ip!r}"
+            f"--disaggregation-host-ip must be a routable address; got loopback alias {host_ip!r}"
         )
     try:
         addr = ipaddress.ip_address(host_ip)
@@ -44,8 +65,7 @@ def _validate_disaggregation_host_ip(host_ip: str) -> str:
     if addr.is_loopback or addr.is_unspecified:
         kind = "loopback" if addr.is_loopback else "bind/unspecified"
         raise ValueError(
-            "--disaggregation-host-ip must be a routable address; "
-            f"got {kind} address {host_ip!r}"
+            f"--disaggregation-host-ip must be a routable address; got {kind} address {host_ip!r}"
         )
     return host_ip
 
@@ -60,6 +80,10 @@ class ServerArgs:
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
+    # Local metadata directories -> original GCS checkpoint URIs. Kept on the
+    # arguments so spawned workers and separately configured draft models retain
+    # their weight source after config/tokenizer staging.
+    runai_model_paths: dict[str, str] = dataclasses.field(default_factory=dict, repr=False)
     trust_remote_code: bool = False
     context_length: int | None = None
     is_embedding: bool = False
@@ -126,6 +150,8 @@ class ServerArgs:
 
     # Data parallel
     dp_size: int = 1
+    enable_dp_lm_head: bool = False
+    moe_dp_size: int = 1
     dp_schedule_policy: str | None = None
 
     # Logging
@@ -194,8 +220,19 @@ class ServerArgs:
 
     precompile_token_paddings: list[int] | None = None
     precompile_bs_paddings: list[int] | None = None
+    precompile_vision_patch_paddings: list[int] | None = None
+
+    # "dp" load-balances images over all mesh devices; "tp" shards ViT weights
+    # over the tensor axis and load-balances images over data-parallel groups.
+    vision_encoder_parallel: str = "dp"
 
     disable_precompile: bool = False
+    precompile_num_threads: int = 2
+    aot_model_dir: str | None = None
+    save_aot: str | None = None
+    aot_topology: str | None = None
+    aot_topology_name: str | None = None
+    aot_host_bounds: list[int] | None = None
 
     # Speculative decoding
     speculative_algorithm: str | None = None
@@ -204,6 +241,7 @@ class ServerArgs:
     speculative_num_steps: int = 4
     speculative_eagle_topk: int = 5
     speculative_num_draft_tokens: int = 4
+    speculative_sample_from_anchor: bool = False
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
 
@@ -211,9 +249,6 @@ class ServerArgs:
     enable_deterministic_sampling: bool = False
     enable_single_process: bool = False
     enable_nan_detection: bool = False
-
-    # For sampling
-    use_sort_for_toppk_minp: bool = False
 
     # LoRA
     enable_lora: bool | None = None
@@ -231,6 +266,8 @@ class ServerArgs:
 
     # Multimodal
     multimodal: bool = False
+    limit_mm_data_per_request: dict[str, int] | None = None
+    mm_processor_worker_num: int = 0
 
     enable_return_routed_experts: bool = False
     enable_expert_balance_debug: bool = False
@@ -252,6 +289,8 @@ class ServerArgs:
     # ``RuntimeError("use_d2h_staging=True requires a host_pool")``.
     disaggregation_enable_d2h: bool = False
     disaggregation_use_raiden: bool = False
+    # Experimental CPU scheduling / device execution overlap, per PD role.
+    disaggregation_enable_overlap_schedule: bool = False
     # Stream each completed prefill chunk through Raiden instead of waiting
     # for the whole prompt. Opt-in while the v5 protocol is validated.
     disaggregation_enable_chunk_prefill_transfer: bool = False
@@ -297,7 +336,43 @@ class ServerArgs:
     # (deferral, never abort). 0 disables the cap (unbounded).
     disaggregation_max_inflight_transfers: int = 8
 
+    def _prepare_runai_paths(self):
+        from sgl_jax.srt.utils.runai_utils import (
+            configure_runai,
+            download_metadata,
+            is_gcs_path,
+        )
+
+        # Do not mutate argparse's reusable default or a caller's source map.
+        self.runai_model_paths = dict(self.runai_model_paths)
+        model_paths = [self.model_path, self.speculative_draft_model_path]
+        if any(path and is_gcs_path(path) for path in model_paths):
+            if self.load_format not in ("auto", "runai_streamer"):
+                raise ValueError("GCS model paths require --load-format runai_streamer (or auto)")
+            self.load_format = "runai_streamer"
+        if self.load_format != "runai_streamer":
+            return
+        extra = self.model_loader_extra_config
+        configure_runai(json.loads(extra) if isinstance(extra, str) else (extra or {}))
+        resolved = {}
+        for field in ("model_path", "tokenizer_path", "speculative_draft_model_path"):
+            path = getattr(self, field)
+            if path and is_gcs_path(path):
+                if path not in resolved:
+                    resolved[path] = download_metadata(path, self.download_dir)
+                local_path = resolved[path]
+                if field != "tokenizer_path":
+                    self.runai_model_paths[local_path] = path
+                setattr(self, field, local_path)
+
     def __post_init__(self):
+        if self.aot_model_dir:
+            from sgl_jax.srt.model_executor.compilation_manager import (
+                CompilationManager,
+            )
+
+            CompilationManager.restore_aot_defaults(self)
+        self._check_disaggregation_overlap_args()
         # Set missing default values
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
@@ -311,7 +386,10 @@ class ServerArgs:
             )
 
         # update device
-        if self.device:
+        if self.save_aot:
+            # CPU is the compiler host; device continues to describe the target.
+            self.device = self.device or "tpu"
+        elif self.device:
             platform_env = os.environ.get("JAX_PLATFORMS", self.device)
             assert (
                 self.device == platform_env
@@ -326,6 +404,8 @@ class ServerArgs:
         if self.served_model_name is None:
             self.served_model_name = self.model_path
 
+        self._prepare_runai_paths()
+
         if self.random_seed is None:
             self.random_seed = 42
 
@@ -339,6 +419,24 @@ class ServerArgs:
         # Set chunked prefill size
         if self.chunked_prefill_size is None:
             self.chunked_prefill_size = 4096
+
+        if 0 < self.max_prefill_tokens < self.chunked_prefill_size:
+            clamped_size = self.max_prefill_tokens // self.page_size * self.page_size
+
+            if clamped_size <= 0:
+                raise ValueError(
+                    f"max_prefill_tokens ({self.max_prefill_tokens}) must be at least "
+                    f"page_size ({self.page_size}) when chunked prefill is enabled."
+                )
+
+            logger.warning(
+                "chunked_prefill_size (%d) > max_prefill_tokens (%d); clamping "
+                "chunked_prefill_size to %d to fit the prefill limit and page size.",
+                self.chunked_prefill_size,
+                self.max_prefill_tokens,
+                clamped_size,
+            )
+            self.chunked_prefill_size = clamped_size
 
         # GGUF
         if (self.load_format == "auto" or self.load_format == "gguf") and check_gguf_file(
@@ -493,8 +591,12 @@ class ServerArgs:
         if self.nnodes > 1 and self.device_indexes is not None:
             logger.warning("In a multi-machine scenario, device_indexes will be set to None.")
             self.device_indexes = None
-        if self.multimodal:
+        if self.multimodal and not self.save_aot:
             self.model_path = download_from_hf(self.model_path, allow_patterns=None)
+            if self.limit_mm_data_per_request is None:
+                self.limit_mm_data_per_request = {"image": 16}
+        if self.mm_processor_worker_num < 0:
+            raise ValueError("--mm-processor-worker-num must be non-negative")
 
         if self.ep_num_redundant_experts < 0:
             raise ValueError("ep_num_redundant_experts must be non-negative")
@@ -605,8 +707,36 @@ class ServerArgs:
                     ", ".join(non_default),
                 )
 
+    def _check_disaggregation_overlap_args(self):
+        """Validate raw fields before startup can initialize unsupported features."""
+        if not self.disaggregation_enable_overlap_schedule:
+            return
+        option = "--disaggregation-enable-overlap-schedule"
+        if self.disaggregation_mode not in ("prefill", "decode"):
+            raise ValueError(f"{option} requires --disaggregation-mode prefill or decode")
+        if not self.disaggregation_use_raiden:
+            raise ValueError(f"{option} requires --disaggregation-use-raiden")
+        if not self.disable_radix_cache:
+            raise ValueError(f"{option} requires --disable-radix-cache")
+        if self.nnodes != 1:
+            raise ValueError(f"{option} requires --nnodes=1 per serving instance")
+        if self.pd_disaggregation:
+            raise ValueError(f"{option} does not support --pd-disaggregation (Pathways)")
+        if self.disable_overlap_schedule:
+            raise ValueError(f"{option} conflicts with --disable-overlap-schedule")
+        if self.speculative_algorithm and self.speculative_algorithm.strip():
+            raise ValueError(f"{option} does not support --speculative-algorithm")
+        if self.enable_lora or self.enable_static_lora or self.lora_paths:
+            raise ValueError(f"{option} does not support LoRA")
+        if self.hicache_storage != "disable":
+            raise ValueError(f"{option} does not support HiCache")
+        if self.multimodal:
+            raise ValueError(f"{option} does not support multimodal serving")
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
+        # Internal state is serialized to workers, but is not a user-facing flag.
+        parser.set_defaults(runai_model_paths={})
         # Model and tokenizer
         parser.add_argument(
             "--model-path",
@@ -661,6 +791,7 @@ class ServerArgs:
                 "bitsandbytes",
                 "layered",
                 "remote",
+                "runai_streamer",
             ],
             help="The format of the model weights to load. "
             '"auto" will try to load the weights in the safetensors format '
@@ -677,7 +808,8 @@ class ServerArgs:
             "quantization."
             '"layered" loads weights layer by layer so that one can quantize a '
             "layer before loading another to make the peak memory envelope "
-            "smaller.",
+            "smaller. "
+            '"runai_streamer" reads GCS or local safetensors shards using RunAI I/O.',
         )
         parser.add_argument(
             "--model-loader-extra-config",
@@ -1227,6 +1359,15 @@ class ServerArgs:
 
         # Data parallelism
         parser.add_argument(
+            "--enable-dp-lm-head",
+            action="store_true",
+            default=ServerArgs.enable_dp_lm_head,
+            help=(
+                "Run the LM head within each data-parallel group (TP/DP). "
+                "By default the LM head shards vocabulary over the full TP group."
+            ),
+        )
+        parser.add_argument(
             "--data-parallel-size",
             "--dp-size",
             type=int,
@@ -1234,18 +1375,41 @@ class ServerArgs:
             help="The data parallelism size.",
         )
         parser.add_argument(
+            "--moe-data-parallel-size",
+            "--moe-dp-size",
+            dest="moe_dp_size",
+            type=int,
+            default=ServerArgs.moe_dp_size,
+            help=(
+                "The MoE data parallelism size. The default (1) preserves the "
+                "existing EP/TP layout. Replicated MoE currently requires this "
+                "to equal --dp-size with --ep-size 1."
+            ),
+        )
+        parser.add_argument(
             "--dp-schedule-policy",
             type=str,
-            choices=["round_robin", "min_running_queue", "cache_aware", "shape_aware"],
+            choices=[
+                "round_robin",
+                "min_running_queue",
+                "cache_aware",
+                "force_cache_aware",
+                "shape_aware",
+            ],
             default=ServerArgs.dp_schedule_policy,
             help=(
                 "DP scheduling policy for assigning dp_rank to new requests. "
+                "Load-based routing defers unassigned requests when no rank has room; "
+                "prefill admission also checks execution and memory capacity. "
                 "When unset, defaults to 'cache_aware' with radix cache enabled "
                 "and 'min_running_queue' with radix cache disabled or Pathways PD. "
                 "'cache_aware' routes by cache affinity with soft load balancing: "
                 "it balances on large load skew, else picks the least-loaded rank "
                 "among those holding a substantial cached prefix, so a hot prefix "
                 "spreads across its holders. Improves prefix reuse under DP. "
+                "'force_cache_aware' always chooses the longest eligible cached "
+                "prefix, breaking equal-prefix ties by load, and falls back to "
+                "shape-aware scheduling only on a full cache miss. "
                 "'shape_aware' balances input (prefill) and output (decode) "
                 "token load jointly, routing to the replica whose bottleneck "
                 "dimension stays smallest: score = max(sum_input, sum_output)."
@@ -1404,10 +1568,44 @@ class ServerArgs:
             help="Set the list of batch sizes buckets for jax jit",
         )
         parser.add_argument(
+            "--precompile-vision-patch-paddings",
+            type=int,
+            nargs="+",
+            default=ServerArgs.precompile_vision_patch_paddings,
+            help="Vision warmup patch counts, rounded up to power-of-two merge-unit counts.",
+        )
+        parser.add_argument(
+            "--vision-encoder-parallel",
+            type=str,
+            choices=["dp", "tp"],
+            default=ServerArgs.vision_encoder_parallel,
+            help="'dp' (default) load-balances images over all mesh devices; 'tp' "
+            "shards ViT weights over the tensor axis and load-balances images over "
+            "data-parallel groups (requires tp_size > 1).",
+        )
+        parser.add_argument(
+            "--precompile-num-threads",
+            type=int,
+            default=ServerArgs.precompile_num_threads,
+            help="Maximum concurrent XLA compilations during precompile or --save-aot; "
+            "1 keeps serial compilation. Lowering and warmup remain serial.",
+        )
+        parser.add_argument(
             "--disable-precompile",
             action="store_true",
             help="whether disable precompile",
         )
+        parser.add_argument(
+            "--aot-model-dir",
+            help="Directory of trusted offline model and sampling executables; fail on missing artifacts",
+        )
+        parser.add_argument(
+            "--save-aot",
+            help="Compile serving's model and sampling buckets on CPU, save executables, and exit",
+        )
+        from sgl_jax.compile import add_topology_args
+
+        add_topology_args(parser, prefix="aot-")
         # Kernel backend
         parser.add_argument(
             "--attention-backend",
@@ -1417,6 +1615,7 @@ class ServerArgs:
                 "fa",
                 "fa_mha",
                 "dsa_sparse",
+                "tt",
             ],
             default=ServerArgs.attention_backend,
             help=(
@@ -1426,7 +1625,8 @@ class ServerArgs:
                 "(decompress latent KV per-forward via kv_b_proj; ~70x more KV cache than 'fa', "
                 "intended for kernel A/B on short contexts). "
                 "'dsa_sparse' = DeepSeek Sparse Attention (lightning-indexer top-k + sparse MLA) "
-                "with IndexShare cross-layer reuse; MLA models with index_* config only."
+                "with IndexShare cross-layer reuse; MLA models with index_* config only. "
+                "'tt' = TTNN prefill and paged decode."
             ),
         )
         parser.add_argument(
@@ -1487,7 +1687,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "DFLASH"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "DFLASH", "DSPARK"],
             help="Speculative algorithm.",
             default=ServerArgs.speculative_algorithm,
         )
@@ -1525,6 +1725,14 @@ class ServerArgs:
             default=ServerArgs.speculative_num_draft_tokens,
         )
         parser.add_argument(
+            "--speculative-sample-from-anchor",
+            action="store_true",
+            help="Sample draft candidates starting at the anchor output position "
+            "(DFLASH or DSPARK). "
+            "Draft query length is --speculative-num-draft-tokens minus one; "
+            "the latter remains the target verify length including the seed.",
+        )
+        parser.add_argument(
             "--speculative-accept-threshold-single",
             type=float,
             help="Accept a draft token if its probability in the target model is greater than this threshold.",
@@ -1550,17 +1758,25 @@ class ServerArgs:
             help="Enable run the engine with single process.",
         )
 
-        # For sampling
-        parser.add_argument(
-            "--use-sort-for-toppk-minp",
-            action="store_true",
-            help="Use jnp.sort to deal with top_k, top_p and min_p, which improves the grades for math-500 but increase precompile time a lot",
-        )
-
         parser.add_argument(
             "--multimodal",
             action="store_true",
-            help="Enable multimodal HTTP server.",
+            help=(
+                "Enable the standalone multi-stage multimodal HTTP server. "
+                "This flag is not required for multimodal models using the regular SRT runtime."
+            ),
+        )
+        parser.add_argument(
+            "--limit-mm-data-per-request",
+            type=json.loads,
+            default=ServerArgs.limit_mm_data_per_request,
+            help="JSON object that limits the number of multimodal items per request, e.g. '{\"image\": 16}'.",
+        )
+        parser.add_argument(
+            "--mm-processor-worker-num",
+            type=int,
+            default=ServerArgs.mm_processor_worker_num,
+            help="Number of multimodal processor workers. 0 uses the model default.",
         )
 
         # LoRA
@@ -1648,6 +1864,13 @@ class ServerArgs:
             help="Use tpu-raiden for direct block transfer into decode KV pages.",
         )
         parser.add_argument(
+            "--disaggregation-enable-overlap-schedule",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.disaggregation_enable_overlap_schedule,
+            help="Enable experimental scheduler overlap on this Raiden PD role. "
+            "Requires ChunkCache and one host per serving instance. Default OFF.",
+        )
+        parser.add_argument(
             "--disaggregation-enable-chunk-prefill-transfer",
             action=argparse.BooleanOptionalAction,
             default=ServerArgs.disaggregation_enable_chunk_prefill_transfer,
@@ -1723,7 +1946,7 @@ class ServerArgs:
             "--disaggregation-bootstrap-timeout-seconds",
             type=float,
             default=ServerArgs.disaggregation_bootstrap_timeout_seconds,
-            help="Bootstrap-server query timeout in seconds. <=0 to " "disable.",
+            help="Bootstrap-server query timeout in seconds. <=0 to disable.",
         )
         parser.add_argument(
             "--disaggregation-pull-timeout-seconds",
@@ -1748,7 +1971,7 @@ class ServerArgs:
             "--disaggregation-orphan-reaper-interval-seconds",
             type=float,
             default=ServerArgs.disaggregation_orphan_reaper_interval_seconds,
-            help="How often the background reaper scans for orphan " "senders/receivers.",
+            help="How often the background reaper scans for orphan senders/receivers.",
         )
         parser.add_argument(
             "--disaggregation-decode-watchdog-seconds",
@@ -1850,7 +2073,30 @@ class ServerArgs:
         return hf_config
 
     def check_server_args(self):
+        if self.precompile_num_threads < 1:
+            raise ValueError("--precompile-num-threads must be at least 1")
         assert (self.tp_size) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+
+        if self.moe_dp_size < 1:
+            raise ValueError("--moe-dp-size must be at least 1")
+
+        # moe_dp_size=1 is the compatibility path and deliberately keeps all
+        # existing recipes under their previous EP/TP validation rules.
+        if self.moe_dp_size > 1:
+            if self.moe_dp_size != self.dp_size:
+                raise ValueError(
+                    "replicated MoE currently requires --moe-dp-size to equal --dp-size"
+                )
+            if self.tp_size % self.dp_size != 0:
+                raise ValueError("replicated MoE requires --tp-size to be divisible by --dp-size")
+            if self.ep_size != 1:
+                raise ValueError("replicated MoE currently requires --ep-size 1")
+            if self.moe_backend != "epmoe":
+                raise ValueError("replicated MoE currently requires --moe-backend epmoe")
+            if self.ep_num_redundant_experts != 0:
+                raise ValueError("replicated MoE does not support --ep-num-redundant-experts")
+            if self.ep_dispatch_algorithm is not None:
+                raise ValueError("replicated MoE does not support --ep-dispatch-algorithm")
 
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
@@ -1876,19 +2122,34 @@ class ServerArgs:
                 and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
                 and self.attention_backend == "fa"
             )
-            supports_dflash_overlap = self.speculative_algorithm == "DFLASH"
+            supports_dflash_overlap = (
+                self.speculative_algorithm in ("DFLASH", "DSPARK")
+                and self.attention_backend != "tt"
+            )
             if not (supports_nextn_overlap or supports_eagle3_overlap or supports_dflash_overlap):
                 raise ValueError(
-                    "Speculative overlap scheduler only supports DFLASH, EAGLE3+FA, "
+                    "Speculative overlap scheduler only supports DFLASH/DSPARK, EAGLE3+FA, "
                     "or NEXTN with --speculative-eagle-topk=1 and "
                     "--speculative-num-draft-tokens == --speculative-num-steps + 1. "
                     "Please pass --disable-overlap-schedule for other speculative configs."
                 )
 
+        if self.speculative_algorithm == "DSPARK":
+            self.speculative_sample_from_anchor = True
+        if self.speculative_sample_from_anchor and self.speculative_algorithm not in (
+            "DFLASH",
+            "DSPARK",
+        ):
+            raise ValueError(
+                "--speculative-sample-from-anchor requires --speculative-algorithm DFLASH or DSPARK."
+            )
+
         # DFLASH: non-causal one-shot diffusion draft + linear-chain greedy verify.
-        if self.speculative_algorithm == "DFLASH":
+        if self.speculative_algorithm in ("DFLASH", "DSPARK"):
             if self.tp_size < 1:
                 raise ValueError("DFLASH requires --tp-size>=1.")
+            if self.attention_backend == "tt" and self.speculative_sample_from_anchor:
+                raise ValueError("TT attention does not support DFLASH anchor sampling.")
             if self.speculative_eagle_topk != 1:
                 raise ValueError(
                     "DFLASH requires --speculative-eagle-topk=1 (linear chain, no tree)."
@@ -1918,14 +2179,17 @@ class ServerArgs:
                     revision=self.speculative_draft_model_revision,
                     trust_remote_code=self.trust_remote_code,
                 )
-                if draft_config.block_size != self.speculative_num_draft_tokens:
+                verify_tokens = draft_config.block_size + int(self.speculative_sample_from_anchor)
+                if verify_tokens != self.speculative_num_draft_tokens:
                     logger.info(
-                        "DFLASH: using draft config block_size=%d for "
+                        "DFLASH: using inferred verify length=%d for "
                         "--speculative-num-draft-tokens (default was %d).",
-                        draft_config.block_size,
+                        verify_tokens,
                         self.speculative_num_draft_tokens,
                     )
-                    self.speculative_num_draft_tokens = draft_config.block_size
+                    self.speculative_num_draft_tokens = verify_tokens
+            if self.speculative_num_draft_tokens < 2:
+                raise ValueError("DFLASH requires at least two verify tokens (seed + candidate).")
             if self.enable_lora or self.enable_static_lora or self.lora_paths:
                 raise ValueError("DFLASH does not support LoRA.")
             if self.grammar_backend not in (None, "none"):

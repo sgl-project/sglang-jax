@@ -81,7 +81,9 @@ def build_accuracy_result(
     if case.score_threshold is None or score is None:
         passed = None
     else:
-        passed = score >= case.score_threshold
+        passed = score >= case.score_threshold and (
+            case.score_upper_threshold is None or score <= case.score_upper_threshold
+        )
 
     return {
         "schema_version": ACCURACY_RESULT_SCHEMA_VERSION,
@@ -93,6 +95,11 @@ def build_accuracy_result(
         "target": target,
         "score": score,
         "score_threshold": case.score_threshold,
+        **(
+            {"score_upper_threshold": case.score_upper_threshold}
+            if case.score_upper_threshold is not None
+            else {}
+        ),
         "passed": passed,
         "metrics": metrics if isinstance(metrics, dict) else {},
         "started_at": _utc_iso(started_at),

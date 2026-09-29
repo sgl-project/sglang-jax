@@ -83,6 +83,19 @@ def _gsm8k_case(name: str, model_id: str, threshold: float, eval_batch_size: int
     )
 
 
+def _mmbench_case(name: str, limit: int | None, threshold: float) -> AccuracyCase:
+    return AccuracyCase(
+        name=name,
+        dataset="mmbench_v11",
+        model_id="Qwen/Qwen3-VL-2B-Instruct",
+        limit=limit,
+        eval_batch_size=4,
+        generation_config={"temperature": 0.0, "max_tokens": 32, "seed": 42},
+        score_threshold=threshold,
+        score_upper_threshold=0.80,
+    )
+
+
 SUITES: dict[str, SingleHostSuite] = {
     "accuracy-text-models-v6e-4": SingleHostSuite(
         name="accuracy-text-models-v6e-4",
@@ -147,6 +160,19 @@ SUITES: dict[str, SingleHostSuite] = {
             SingleHostRun(
                 launch_profile="qwen3-moe-fp8-fused-v6e-4.yaml",
                 cases=[_gsm8k_case("qwen3-moe-fp8-fused", "Qwen/Qwen3-30B-A3B-FP8", 0.93, 64)],
+            ),
+            SingleHostRun(
+                launch_profile="qwen3-vl-2b-v6e-4.yaml",
+                cases=[_mmbench_case("qwen3-vl-2b-mmbench-v11", 200, 0.70)],
+            ),
+        ],
+    ),
+    "vlm-weekly-v6e-4": SingleHostSuite(
+        name="vlm-weekly-v6e-4",
+        runs=[
+            SingleHostRun(
+                launch_profile="qwen3-vl-2b-v6e-4.yaml",
+                cases=[_mmbench_case("qwen3-vl-2b-mmbench-v11-full", None, 0.74)],
             ),
         ],
     ),
@@ -215,6 +241,12 @@ def _gate_accuracy(case: AccuracyCase, result: dict) -> tuple[str, str] | None:
         return None
     if result["score"] is None:
         return ("case", f"{case.name}: eval produced no score")
+    if case.score_upper_threshold is not None and result["score"] > case.score_upper_threshold:
+        return (
+            "threshold",
+            f"{case.name}: score={result['score']:.4f} above "
+            f"upper threshold={case.score_upper_threshold:.4f}",
+        )
     if not result["passed"]:
         return (
             "threshold",

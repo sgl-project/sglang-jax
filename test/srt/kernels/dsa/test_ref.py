@@ -5,9 +5,11 @@ import pytest
 
 from sgl_jax.srt.kernels.dsa.ref import (
     build_index_share_map,
+    prefill_score_temp_bytes,
     sparse_mla_ref,
     streamindex_page_topk_ref,
     streamindex_topk_ref,
+    suggest_chunked_prefill_size,
 )
 
 jax.config.update("jax_platform_name", "cpu")
@@ -172,15 +174,16 @@ def test_scatter_paged_padding_seq_no_leak():
     seq_lens = jnp.asarray([3, 0], jnp.int32)  # seq1 = padding
     cu_q_lens = jnp.asarray([0, 1, 2], jnp.int32)  # DECODE arange
     cu_kv_lens = jnp.asarray([0, ps, ps], jnp.int32)  # seq0 aligned=4, seq1 aligned=0
-    page_indices = jnp.asarray([0, 1, 2, 3], jnp.int32)
+    # Production allocator convention: real pages start at 1, page 0 reserved.
+    page_indices = jnp.asarray([1, 2, 3, 0], jnp.int32)
     new_tokens = jnp.asarray([[1.0] * D, [99.0] * D], jnp.float32)
 
     out = np.asarray(
         _scatter_paged(cache, new_tokens, seq_lens, page_indices, cu_q_lens, cu_kv_lens, pps)
     )
-    assert out[0, 2, 0] == 1.0  # real seq0 write
-    # padding seq1 must NOT leak into any non-sentinel page
-    assert not np.any(out[: P - 1] == 99.0), f"leaked: {np.argwhere(out[:P-1]==99.0)}"
+    assert out[1, 2, 0] == 1.0  # real seq0 write (page 1)
+    # padding seq1 may only land on the reserved page 0 — never a live page
+    assert not np.any(out[1:] == 99.0), f"leaked: {np.argwhere(out[1:]==99.0)}"
 
 
 def test_sparse_mla_multi_seq_packed_layout():
@@ -431,3 +434,25 @@ def test_page_topk_decode_fast_path_matches_general():
         )
         np.testing.assert_array_equal(general, fast)
         assert (fast[2] == -1).all()  # padding seq selects nothing
+
+
+class TestPrefillScoreTempBytes:
+    def test_matches_observed_135k_oom(self):
+        # RESULTS baseline: 22 full layers, chunk 8192, ctx 135168 reported
+        # ~98.5G HLO temporaries; the formula must land within 2%.
+        est = prefill_score_temp_bytes(22, 8192, 135168)
+        assert est == 22 * 8192 * 135168 * 4
+        assert abs(est - 98.54e9) / 98.54e9 < 0.02
+
+    def test_suggest_chunk_picks_largest_fitting_power_of_two(self):
+        # Same 135k case with a 0.8 * 94.75G budget: 8192 overflows (97.4G),
+        # 4096 fits (48.7G) -> suggest 4096.
+        budget = int(0.8 * 94.75e9)
+        assert suggest_chunked_prefill_size(22, 135168, budget) == 4096
+
+    def test_suggest_chunk_none_when_nothing_fits(self):
+        assert suggest_chunked_prefill_size(22, 135168, 1) is None
+
+    def test_suggest_chunk_unbounded_budget_stops_at_context(self):
+        # Never suggest a chunk larger than the context itself.
+        assert suggest_chunked_prefill_size(22, 4096, 10**18) == 4096

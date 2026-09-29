@@ -1,3 +1,5 @@
+from functools import partial
+
 import jax
 import numpy as np
 from flax import nnx
@@ -11,8 +13,11 @@ from sgl_jax.srt.constrained.bitmask_ops import apply_token_bitmask
 from sgl_jax.srt.layers.binary_search import topk_mask, topp_mask
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
-from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 from sgl_jax.srt.utils.profiling_utils import named_scope
+
+# Rejection value for the mask sampling path. Low enough that `softmax` flushes
+# it to 0.0, and shared by every filter in that path -- they have to agree.
+_MASK_FILL_VALUE = -1e12
 
 
 class Sampler(nnx.Module):
@@ -29,7 +34,7 @@ class Sampler(nnx.Module):
 
     def _regular_sampling(self, operands):
         """Regular sampling branch"""
-        logits, sampling_metadata, rng, use_sort_for_toppk_minp = operands
+        logits, sampling_metadata, rng = operands
 
         logits = jax.sharding.reshard(logits, NamedSharding(self.mesh, P("data", None)))
 
@@ -59,10 +64,7 @@ class Sampler(nnx.Module):
             sampling_metadata.need_min_p_sampling,
             rng,
         )
-        batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_jax(
-            args,
-            use_sort_for_toppk_minp,
-        )
+        batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_jax_with_mask(args)
 
         log_probs = jnp.log(probs).clip(min=jnp.finfo(probs.dtype).min)
         return (
@@ -167,15 +169,16 @@ class Sampler(nnx.Module):
         self,
         logits_output: LogitsProcessorOutput,
         sampling_metadata: SamplingMetadata,
-        use_sort_for_toppk_minp: bool,
         rng_override: jax.Array | None = None,
+        rng_step: int | jax.Array | None = None,
     ):
         """Run a sampler & compute logprobs and update logits_output accordingly.
 
         Args:
             logits_output: The logits from the model forward
             sampling_metadata: Metadata for sampling
-            use_sort_for_toppk_minp: whether use sort when dealing with top_k, top_k and min_p.
+            rng_override: Base RNG key to use instead of the module RNG.
+            rng_step: Optional step folded into the RNG key inside the regular-sampling branch.
         """
 
         # Apply penalties before sampling
@@ -194,12 +197,19 @@ class Sampler(nnx.Module):
             (logits, sampling_metadata.vocab_mask),
         )
 
-        _, rng = jax.random.split(rng_override if rng_override is not None else self.rngs.params())
-        operands = (logits, sampling_metadata, rng)
-        regular_fn = lambda op: self._regular_sampling((*op, use_sort_for_toppk_minp))
+        operands = (logits, sampling_metadata)
+        greedy_fn = lambda op: self._greedy_sampling((*op, None))
+
+        def regular_fn(op):
+            rng = rng_override if rng_override is not None else self.rngs.params()
+            if rng_step is not None:
+                rng = jax.random.fold_in(rng, rng_step)
+            _, rng = jax.random.split(rng)
+            return self._regular_sampling((*op, rng))
+
         batch_next_token_ids, logprobs = lax.cond(
             sampling_metadata.is_all_greedy,
-            self._greedy_sampling,
+            greedy_fn,
             regular_fn,
             operands,
         )
@@ -292,17 +302,6 @@ def multinomial_with_seed(
     return jnp.argmax(perturbed_log_probs, axis=1, keepdims=True)
 
 
-def _get_sorted_indices_np(probs_np: np.ndarray) -> np.ndarray:
-    """
-    CPU-side NumPy sorting index that is robust to NaNs/Infs.
-    Always returns descending order indices with int32 dtype.
-    """
-    # 1) Map NaN -> -inf, +inf -> +inf, -inf -> -inf for stable descending order
-    scores_np = np.nan_to_num(probs_np, nan=-np.inf, posinf=np.inf, neginf=-np.inf)
-    # 2) argsort ascending then flip for descending
-    return np.argsort(scores_np, axis=-1)[:, ::-1].astype(np.int32)
-
-
 def top_p_normalize_probs_jax(
     probs: jax.Array,
     top_ps: jax.Array,
@@ -331,83 +330,17 @@ def top_p_normalize_probs_jax(
 
 
 def _apply_min_p_filter(operands):
-    """Apply min_p filtering when need_min_p_sampling=True"""
-    inputs, min_ps, use_probs = operands
-    max_per_bs = jnp.max(inputs, axis=1)
-    min_p_thresholds = max_per_bs * min_ps
-    min_p_mask = inputs < min_p_thresholds.reshape(-1, 1)
-    return jnp.where(min_p_mask, 0.0, inputs)
+    """Keep logits within `log(min_p)` of the row maximum.
 
-
-def top_k_top_p_min_p_sampling_from_probs_jax(
-    args,
-    use_sort_for_toppk_minp,
-):
-    if use_sort_for_toppk_minp:
-        return top_k_top_p_min_p_sampling_from_probs_jax_with_sort(args)
-    return top_k_top_p_min_p_sampling_from_probs_jax_with_mask(args)
-
-
-def top_k_top_p_min_p_sampling_from_probs_jax_with_sort(args):
-    (
-        _,
-        probs,
-        top_ks,
-        top_ps,
-        min_ps,
-        positions,
-        _,
-        sampling_seeds,
-        need_min_p_sampling,
-        rng,
-    ) = args
-
-    if is_tpu_runtime():
-        probs_sort = jnp.sort(probs, axis=-1)[:, ::-1]  # Sort and reverse for descending order
-        probs_idx = jnp.argsort(probs, axis=-1)[:, ::-1]
-    else:
-        # 1) Use jax.pure_callback to compute robust descending indices on CPU
-        out_spec = jnp.empty(probs.shape, dtype=jnp.int32)
-        probs_idx = jax.pure_callback(
-            _get_sorted_indices_np,
-            out_spec,
-            probs,
-            vmap_method="legacy_vectorized",
-        )
-        # 2) Gather with sanitized probabilities (map NaNs/Infs to 0)
-        sanitized_probs = jnp.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
-        assert probs_idx.shape == sanitized_probs.shape and probs_idx.dtype == jnp.int32
-
-        probs_sort = jnp.take_along_axis(sanitized_probs, probs_idx, axis=-1)
-
-    probs_sum = jnp.cumsum(probs_sort, axis=-1)
-
-    top_k_mask = jnp.arange(0, probs.shape[-1]).reshape(1, -1) >= top_ks.reshape(-1, 1)
-    probs_sort = jnp.where(top_k_mask, 0.0, probs_sort)
-
-    top_p_mask = (probs_sum - probs_sort) > top_ps.reshape(-1, 1)
-    probs_sort = jnp.where(top_p_mask, 0.0, probs_sort)
-
-    # Use lax.cond to avoid recompilation due to need_min_p_sampling changes
-    min_p_operands = (probs_sort, min_ps)
-    apply_min_p_filter_fn = lambda op: _apply_min_p_filter((*op, True))
-    probs_sort = lax.cond(
-        need_min_p_sampling,
-        apply_min_p_filter_fn,
-        lambda operands: operands[0],  # No min_p filtering, just return probs_sort
-        min_p_operands,
-    )
-
-    # Static predicate (None vs array changes the input pytree): use `if`, not
-    # lax.cond -- the branches' output shardings differ and cannot be unified.
-    multinomial_operands = (probs_sort, sampling_seeds, positions, rng)
-    if sampling_seeds is not None:
-        sampled_index = multinomial_with_seed((*multinomial_operands, True))
-    else:
-        sampled_index = multinomial((*multinomial_operands, True))
-
-    probs_idx = probs_idx.astype(jnp.int32)
-    return jnp.take_along_axis(probs_idx, axis=1, indices=sampled_index).flatten()
+    `inputs` are logits, so the probability-space rule `p_i >= max(p) * min_p`
+    becomes `z_i >= max(z) + log(min_p)`: the softmax denominator cancels on
+    both sides. Rejected entries take `_MASK_FILL_VALUE`, not `0.0`, which is
+    an ordinary logit rather than a rejection.
+    """
+    inputs, min_ps = operands
+    # log(0) = -inf, so min_p=0 (the "disabled" encoding) rejects nothing.
+    min_p_thresholds = jnp.max(inputs, axis=1) + jnp.log(min_ps)
+    return jnp.where(inputs < min_p_thresholds.reshape(-1, 1), _MASK_FILL_VALUE, inputs)
 
 
 def top_k_top_p_min_p_sampling_from_probs_jax_with_mask(args):
@@ -424,22 +357,28 @@ def top_k_top_p_min_p_sampling_from_probs_jax_with_mask(args):
         rng,
     ) = args
     logits = logits.astype(jnp.float32)
-    logits = topk_mask(logits, top_ks, replace_val=-1e12)
-    logits = topp_mask(logits, top_ps, replace_val=-1e12)
 
+    # Before the masks: the cutoffs below have to be measured on the scaled
+    # distribution, which is what the sort path samples from.
     temperatures = temperatures.astype(logits.dtype)
     logits = jnp.divide(logits, temperatures)
 
+    # top-p first: `topp_mask` softmaxes internally, so after top-k it would
+    # measure the nucleus on the renormalized tail. `topk_mask` ranks by value,
+    # so it is unaffected by the sentinels top-p leaves behind.
+    logits = topp_mask(logits, top_ps, replace_val=_MASK_FILL_VALUE)
+    logits = topk_mask(logits, top_ks, replace_val=_MASK_FILL_VALUE)
+
     min_p_operands = (logits, min_ps)
-    apply_min_p_filter_fn = lambda op: _apply_min_p_filter((*op, False))
     logits = lax.cond(
         need_min_p_sampling,
-        apply_min_p_filter_fn,
+        _apply_min_p_filter,
         lambda operands: operands[0],
         min_p_operands,
     )
 
-    # Static predicate -- use `if`, not lax.cond (see sort path).
+    # Static predicate (None vs array changes the input pytree): use `if`,
+    # not lax.cond -- the branches' output shardings differ and cannot be unified.
     multinomial_operands = (logits, sampling_seeds, positions, rng)
     if sampling_seeds is not None:
         sampled_index = multinomial_with_seed((*multinomial_operands, False))
@@ -456,3 +395,26 @@ def compute_logprobs(
     batch_idx = jnp.arange(logprobs.shape[0])
     token_logprobs = logprobs.at[batch_idx, token_ids].get(out_sharding=out_sharding)
     return token_logprobs
+
+
+def make_jitted_sampler(base_rng_key, compiler_options=None):
+    """Share the serving sampler program with offline executable export."""
+
+    @partial(
+        jax.jit,
+        static_argnames=["sampler_state_def"],
+        compiler_options=compiler_options,
+    )
+    def jitted_sampler(sampler_def, sampler_state_def, sampler_state_leaves, rng_step, *args):
+        state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
+        sampler = nnx.merge(sampler_def, state)
+        rng_step = rng_step + jnp.int32(1)
+        result = sampler(*args, rng_override=base_rng_key, rng_step=rng_step)
+        return result, rng_step
+
+    return jitted_sampler
+
+
+@partial(jax.jit, static_argnames=["mesh"])
+def jitted_compute_logprobs(mesh, logits, next_tokens):
+    return compute_logprobs(mesh, logits, next_tokens)

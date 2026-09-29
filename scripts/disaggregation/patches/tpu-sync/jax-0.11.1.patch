@@ -1,0 +1,78 @@
+diff --git a/MODULE.bazel b/MODULE.bazel
+index caa34b9..182ae52 100644
+--- a/MODULE.bazel
++++ b/MODULE.bazel
+@@ -27,3 +27,3 @@ git_override(
+     module_name = "jax",
+-    commit = "a1521744c6dc074443fe549f19f48d7197abf759",
++    commit = "2d66622450e2c8633cda2307688ef7aa294bd6eb",
+     patch_strip = 1,
+@@ -43,3 +43,3 @@ git_override(
+     module_name = "xla",
+-    commit = "131bf41acb4650e4391a640c3f1859c1c86ad74b",
++    commit = "dcf304bc5dca1932b99f740b911dbd73631a1a69",
+     patch_strip = 1,
+diff --git a/ci/wheel/BUILD.bazel b/ci/wheel/BUILD.bazel
+index f3e6bbc..a311f16 100644
+--- a/ci/wheel/BUILD.bazel
++++ b/ci/wheel/BUILD.bazel
+@@ -56,5 +56,5 @@ COMMON_REQUIRES = [
+ JAX_REQUIRES = COMMON_REQUIRES + [
+-    "jax==0.11.0",
+-    "jaxlib==0.11.0",
+-    "libtpu==0.0.47",
++    "jax==0.11.1",
++    "jaxlib==0.11.1",
++    "libtpu==0.0.46.1",
+ ]
+diff --git a/requirements.txt b/requirements.txt
+index a52ff8e..f61ccc6 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -6,5 +6,5 @@ absl-py
+ numpy
+-jax==0.11.0
+-jaxlib==0.11.0
+-libtpu==0.0.47
++jax==0.11.1
++jaxlib==0.11.1
++libtpu==0.0.46.1
+ grpcio-tools
+diff --git a/third_party/py/jax_remove_local_wheels.patch b/third_party/py/jax_remove_local_wheels.patch
+index d586683..e1bdb80 100644
+--- a/third_party/py/jax_remove_local_wheels.patch
++++ b/third_party/py/jax_remove_local_wheels.patch
+@@ -2,5 +2,5 @@
+ +++ b/MODULE.bazel
+-@@ -140,7 +140,7 @@
+- python.toolchain(python_version = "3.14")
+-
++@@ -145,7 +145,7 @@
++ python.toolchain(python_version = "3.15")
++
+  ### Pypi
+@@ -8,6 +8,6 @@
+ +pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+-
++
+  [pip.parse(
+      download_only = True,
+-@@ -149,9 +149,6 @@
++@@ -154,18 +154,6 @@
+          "numpy": ["numpy_headers"],
+@@ -16,3 +16,12 @@
+ -    local_wheels = {
++-        "jax": "dist/jax-*.whl",
++-        "jaxlib": "dist/jaxlib-*.whl",
++-        "jax-cuda12-pjrt": "dist/jax_cuda12_pjrt-*.whl",
++-        "jax-cuda12-plugin": "dist/jax_cuda12_plugin-*.whl",
++-        "jax-cuda13-pjrt": "dist/jax_cuda13_pjrt-*.whl",
++-        "jax-cuda13-plugin": "dist/jax_cuda13_plugin-*.whl",
+ -        "libtpu": "dist/libtpu-*.whl",  # On CI, we use the downloaded nightly version of libtpu.
++-        "ml_dtypes": "dist/ml_dtypes-*.whl",
++-        "numpy": "dist/numpy-*.whl",  # On TSAN CI, we use a custom TSAN-instrumented NumPy wheel.
++-        "scipy": "dist/scipy-*.whl",
+ -    },
+@@ -21,2 +30 @@
+          "3.12",
+-</content>

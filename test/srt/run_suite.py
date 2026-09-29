@@ -21,6 +21,7 @@ class TestFile:
     )
     runner: str = "python"
     extra_deps: list[str] | None = None
+    env: dict[str, str] | None = None
 
 
 def run_with_timeout(
@@ -97,6 +98,7 @@ def run_unittest_files(
 
             filename = os.path.join(os.getcwd(), filename)
             tic = time.perf_counter()
+            env = {**os.environ, **(file_entry.env or {})}
 
             # Check if specific test methods are specified
             if file_entry.test_methods:
@@ -118,7 +120,7 @@ def run_unittest_files(
                         [sys.executable, "-m", "unittest", test_path],
                         stdout=sys.stdout,
                         stderr=sys.stderr,
-                        env=os.environ,
+                        env=env,
                         cwd=os.path.dirname(filename),
                     )
                     process.wait()
@@ -175,7 +177,7 @@ def run_unittest_files(
                     cmd,
                     stdout=sys.stdout,
                     stderr=sys.stderr,
-                    env=os.environ,
+                    env=env,
                 )
                 process.wait()
 
@@ -262,20 +264,25 @@ suites = {
         TestFile("python/sgl_jax/test/kernels/quantized_linear_test.py", 0.3, runner="pytest"),
         TestFile("python/sgl_jax/test/kernels/moe_block_quant_test.py", 0.2, runner="pytest"),
         TestFile("python/sgl_jax/test/kernels/kda_test.py", 10, runner="pytest"),
+        TestFile("test/srt/kernels/hca/test_hca.py", 8, runner="pytest"),
+        TestFile("test/srt/kernels/mhc/test_mhc.py", 2, runner="pytest"),
         # Pytest tears down the shared FlashAttention mesh cleanly on JAX 0.10.2.
         TestFile("python/sgl_jax/test/test_flashattention_mha.py", 11, runner="pytest"),
         TestFile("python/sgl_jax/test/test_flashattention_gqa.py", 11, runner="pytest"),
         TestFile("python/sgl_jax/test/test_flashattention_misc.py", 7, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_rpa_v3_kv_writeback.py", 1, runner="pytest"),
         TestFile("python/sgl_jax/test/test_mla_attention.py", 2.5),
+        TestFile("test/srt/kernels/hca/test_backend.py", 15, runner="pytest"),
         TestFile("python/sgl_jax/test/test_moe_topk.py", 0.3),
         TestFile("python/sgl_jax/test/kernels/fused_moe_v1_test.py", 9),
         TestFile("python/sgl_jax/test/kernels/fused_moe_v2_test.py", 3),
         TestFile("python/sgl_jax/test/kernels/biased_topk_test.py", 1, runner="pytest"),
         TestFile("python/sgl_jax/test/kernels/grouped_topk_test.py", 1, runner="pytest"),
-        TestFile("python/sgl_jax/test/test_sampler.py", 0.2),
+        TestFile("python/sgl_jax/test/test_sampler.py", 0.5),
         TestFile("python/sgl_jax/test/test_sampler_deterministic_cond.py", 0.3),
         TestFile("python/sgl_jax/test/test_utils.py", 0.1),
         TestFile("python/sgl_jax/test/mem_cache/test_kv_cache.py", 0.7),
+        TestFile("test/srt/kernels/hca/test_cache.py", 3, runner="pytest"),
         TestFile("python/sgl_jax/test/mem_cache/test_hicache_e2e_tpu.py", 1, runner="pytest"),
         TestFile("python/sgl_jax/test/speculative/test_eagle_tree_build.py", 0.2),
         TestFile("python/sgl_jax/test/speculative/test_eagle_utils.py", 0.2),
@@ -302,7 +309,50 @@ suites = {
     # have a conditional CPU pin gated on USE_DEVICE_TYPE=cpu — the
     # cpu-test CI job sets that env var.
     "unit-test-cpu": [
+        TestFile("python/sgl_jax/test/constrained/test_grammar_backend.py", 0.1),
+        TestFile(
+            "python/sgl_jax/test/test_dp_feature_parity.py",
+            0.1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "python/sgl_jax/test/speculative/test_spec_dp_shapes.py",
+            0.1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "test/srt/layers/test_lm_head_parallel.py",
+            0.3,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "8"},
+        ),
+        TestFile("test/srt/multimodal/test_engine_multimodal.py", 0.1, runner="pytest"),
+        TestFile("python/sgl_jax/test/layers/test_hyperconnection.py", 0.1),
+        TestFile(
+            "python/sgl_jax/test/test_embedding_pool.py",
+            0.1,
+            runner="pytest",
+        ),
+        TestFile(
+            "python/sgl_jax/test/test_verify_mask_packing.py",
+            0.1,
+            runner="pytest",
+        ),
+        TestFile(
+            "python/sgl_jax/test/multimodal/test_qwen_vl_processor.py",
+            0.1,
+            runner="pytest",
+        ),
+        TestFile("python/sgl_jax/test/multimodal/test_rotary_embedding.py", 0.1),
+        TestFile("test/srt/test_radix_input_ids.py", 0.1, runner="pytest"),
         TestFile("test/srt/test_tokenizer_manager_event.py", 0.1),
+        TestFile(
+            "python/sgl_jax/test/mem_cache/test_unified_swa_scheduler.py",
+            0.2,
+            runner="pytest",
+        ),
         TestFile("test/srt/disaggregation/test_pd_auth.py", 0.3, runner="pytest"),
         TestFile("test/srt/disaggregation/test_pd_bootstrap.py", 0.5, runner="pytest"),
         TestFile("test/srt/disaggregation/test_pd_decode.py", 0.5, runner="pytest"),
@@ -312,6 +362,12 @@ suites = {
         TestFile("test/srt/disaggregation/test_pd_raiden.py", 0.5, runner="pytest"),
         TestFile("test/srt/disaggregation/test_pd_router.py", 0.5, runner="pytest"),
         TestFile("test/srt/disaggregation/test_pd_transfer.py", 0.5, runner="pytest"),
+        TestFile("test/srt/disaggregation/test_pd_decode_overlap.py", 0.1, runner="pytest"),
+        TestFile("test/srt/disaggregation/test_pd_prefill_overlap.py", 0.1, runner="pytest"),
+        TestFile("test/srt/disaggregation/test_pd_overlap_args.py", 0.1, runner="pytest"),
+        TestFile("test/srt/disaggregation/test_pd_logprob_stream.py", 0.1, runner="pytest"),
+        TestFile("test/srt/disaggregation/test_raiden_loader.py", 0.1, runner="pytest"),
+        TestFile("test/srt/test_generate_stream_numpy.py", 0.1, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/test_model_runner_kv_cache_mixin.py",
             0.2,
@@ -327,10 +383,12 @@ suites = {
             0.2,
             runner="pytest",
         ),
+        TestFile("python/sgl_jax/test/test_prometheus_import_order.py", 0.2, runner="pytest"),
         TestFile("python/sgl_jax/test/test_scheduler_idle_check.py", 0.1),
         TestFile("python/sgl_jax/test/test_scheduler_chunked_ownership.py", 0.1),
-        TestFile("python/sgl_jax/test/test_scheduler_dp_load.py", 0.1, runner="pytest"),
         TestFile("python/sgl_jax/test/test_scheduler_retraction.py", 0.1),
+        TestFile("python/sgl_jax/test/test_spec_accept_metrics.py", 0.1),
+        TestFile("python/sgl_jax/test/test_req_finish.py", 0.1, runner="pytest"),
         TestFile("python/sgl_jax/test/test_swa_schedule_budget.py", 0.1),
         TestFile("test/srt/test_dtype_config_llama.py", 1),
         TestFile("test/srt/test_dtype_config_consistency.py", 10),
@@ -355,6 +413,7 @@ suites = {
             "python/sgl_jax/test/multimodal/test_kimi_k25_weight_mapping.py",
             0.2,
             runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "8"},
         ),
         TestFile(
             "python/sgl_jax/test/multimodal/test_stage_config_routing.py",
@@ -366,7 +425,9 @@ suites = {
             0.2,
             runner="pytest",
         ),
+        TestFile("python/sgl_jax/test/multimodal/test_encoder_scheduler_kwargs.py", 0.1),
         TestFile("python/sgl_jax/test/models/test_qwen3_5.py", 2, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_transformers_compat.py", 2, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/kernels/test_gdn_fused_chunk_parallel_provenance.py",
             0.1,
@@ -392,14 +453,51 @@ suites = {
             0.2,
             runner="pytest",
         ),
+        TestFile(
+            "python/sgl_jax/test/test_runai_loader.py",
+            0.5,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "4"},
+        ),
+        TestFile(
+            "python/sgl_jax/test/test_weight_loading_distributed.py",
+            0.5,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "python/sgl_jax/test/test_weight_loading_recipes.py",
+            0.5,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "4"},
+        ),
         TestFile("python/sgl_jax/test/mem_cache/test_req_to_token_pool.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_hybrid_req_to_token_pool.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_swa_allocator.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_swa_radix_cache.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_radix_cache.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_unified_radix_cache.py", 1),
+        TestFile("python/sgl_jax/test/mem_cache/test_unified_swa_component.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_unified_radix_tree_flag.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_paged_allocator_multi_dp.py", 1),
+        TestFile(
+            "python/sgl_jax/test/mem_cache/test_deepseek_v4_pool.py",
+            1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "2"},
+        ),
+        TestFile(
+            "python/sgl_jax/test/mem_cache/test_deepseek_v4_allocator.py",
+            1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "2"},
+        ),
+        TestFile(
+            "python/sgl_jax/test/mem_cache/test_deepseek_v4_lifecycle.py",
+            1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "2"},
+        ),
         TestFile("python/sgl_jax/test/mem_cache/test_host_kv_pool.py", 1, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/mem_cache/test_hicache_controller.py",
@@ -419,6 +517,7 @@ suites = {
         TestFile("test/srt/function_call/test_qwen25_detector.py", 0.1),
         TestFile("test/srt/function_call/test_mimo_detector.py", 0.1),
         TestFile("test/srt/function_call/test_glm47_detector.py", 0.1),
+        TestFile("test/srt/function_call/test_ling3_detector.py", 0.1),
         TestFile("test/srt/openai_server/basic/test_protocol.py", 0.1),
         TestFile("test/srt/openai_server/basic/test_serving_chat.py", 0.1),
         TestFile("test/srt/openai_server/basic/test_serving_completions.py", 0.1),
@@ -432,13 +531,34 @@ suites = {
         TestFile("test/srt/test_recurrent_track_scatter.py", 0.3),
         TestFile("test/srt/test_recurrent_split_equivalence.py", 0.3),
         TestFile("test/srt/test_prepare_for_extend_protected_len.py", 0.2),
+        TestFile("test/srt/test_native_attention_paged_decode.py", 1),
     ],
     "unit-test-tpu-v6e-4": [
+        TestFile(
+            "python/sgl_jax/test/multimodal/test_flux_attention.py",
+            0.1,
+            runner="pytest",
+        ),
+        TestFile(
+            "python/sgl_jax/test/speculative/test_draft_extend_fused.py",
+            0.1,
+            runner="pytest",
+        ),
+        TestFile(
+            "test/srt/multimodal/test_in_model_multimodal.py",
+            1,
+            runner="pytest",
+        ),
         TestFile("python/sgl_jax/test/test_mesh.py", 0.4),
         TestFile("python/sgl_jax/test/test_linear_tp.py", 0.3, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/layers/test_lightning_backend_dp.py",
             1,
+            runner="pytest",
+        ),
+        TestFile(
+            "python/sgl_jax/test/test_flashattention_custom_mask_dp.py",
+            2,
             runner="pytest",
         ),
         TestFile("python/sgl_jax/test/test_kda_attention.py", 6.5),
@@ -491,6 +611,7 @@ suites = {
         ),
     ],
     "e2e-test-tpu-v6e-1": [
+        TestFile("test/srt/multimodal/test_vlm_models.py", 15),
         # openai_server e2e test
         TestFile("test/srt/openai_server/basic/test_openai_server.py", 1),
         TestFile("test/srt/openai_server/features/test_ebnf.py", 2),

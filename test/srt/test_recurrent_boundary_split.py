@@ -221,6 +221,7 @@ class TestSchedulerSingleChunkedPerRankPerRound(unittest.TestCase):
             log_prefill_stats=lambda *a, **k: None,
             model_config=None,
             mesh=None,
+            embedding_pool=None,
         )
 
         with patch.object(scheduler_mod.ScheduleBatch, "init_new", return_value=MagicMock()):

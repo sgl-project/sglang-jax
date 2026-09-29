@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+from functools import cache
 from typing import TYPE_CHECKING
 
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
@@ -28,6 +29,16 @@ logger = logging.getLogger(__name__)
 
 _zero_linear_penalty_cache: dict[tuple[int, int], jax.Array] = {}
 _zero_linear_penalty_lock = threading.Lock()
+
+
+@cache
+def _sampler_bools(sharding):
+    return tuple(jax.device_put(np.bool_(value), sharding) for value in (False, True))
+
+
+@cache
+def _empty_vocab_mask(batch_size, vocab_size, sharding):
+    return jax.device_put(np.zeros((batch_size, (vocab_size + 31) // 32), dtype=np.int32), sharding)
 
 
 @register_pytree_node_class
@@ -59,6 +70,16 @@ class SamplingMetadata:
     # Grammar vocab mask
     vocab_mask: jax.Array | None = None
     apply_vocab_mask: bool = False
+
+    def update_vocab_mask(self, mask, mesh, vocab_size):
+        sharding = NamedSharding(mesh, PartitionSpec())
+        self.apply_vocab_mask = _sampler_bools(sharding)[mask is not None]
+        # Grammar masks are mutable: upload current contents after the grammar update.
+        self.vocab_mask = (
+            jax.device_put(mask, sharding)
+            if mask is not None
+            else _empty_vocab_mask(self.temperatures.shape[0], vocab_size, sharding)
+        )
 
     def tree_flatten(self):
         children = (
@@ -113,19 +134,29 @@ class SamplingMetadata:
         pad_size: int = 0,
         mesh: Mesh = None,
         vocab_size: int = 32000,
+        *,
+        abstract: bool = False,
     ) -> SamplingMetadata:
+        def array(shape, dtype, placement):
+            return jax.ShapeDtypeStruct(
+                shape, jax.dtypes.canonicalize_dtype(dtype), sharding=placement
+            )
+
+        def to_device(data, sharding):
+            if abstract:
+                return jax.tree.map(lambda x: array(x.shape, x.dtype, sharding), data)
+            return device_array(data, sharding=sharding)
+
         sharding = NamedSharding(mesh, PartitionSpec("data"))
         if batch.sampling_info.sampling_seeds is not None:
-            sampling_seeds_device = device_array(
-                batch.sampling_info.sampling_seeds, sharding=sharding
-            )
+            sampling_seeds_device = to_device(batch.sampling_info.sampling_seeds, sharding=sharding)
         else:
             sampling_seeds_device = None
 
         positions = batch.positions if batch.forward_mode.is_decode() else batch.seq_lens - 1
 
         (temperatures_device, top_ps_device, top_ks_device, min_ps_device, positions_device) = (
-            device_array(
+            to_device(
                 (
                     batch.sampling_info.temperatures,
                     batch.sampling_info.top_ps,
@@ -159,7 +190,7 @@ class SamplingMetadata:
             else:
                 padded_linear_penalty = original_linear_penalty
 
-            linear_penalty_device = device_array(
+            linear_penalty_device = to_device(
                 padded_linear_penalty,
                 sharding=linear_penalty_sharding,
             )
@@ -183,16 +214,24 @@ class SamplingMetadata:
             else:
                 padded_linear_penalty = original_linear_penalty
 
-            linear_penalty_device = device_array(
+            linear_penalty_device = to_device(
                 padded_linear_penalty,
                 sharding=linear_penalty_sharding,
             )
         if linear_penalty_device is None:
             target_shape = (batch.sampling_info.temperatures.shape[0], vocab_size)
-            linear_penalty_device = _get_or_create_zero_penalty_device(
-                target_shape, linear_penalty_sharding
+            linear_penalty_device = (
+                array(target_shape, np.float32, linear_penalty_sharding)
+                if abstract
+                else _get_or_create_zero_penalty_device(target_shape, linear_penalty_sharding)
             )
 
+        replicated_sharding = NamedSharding(mesh, PartitionSpec())
+        bools = (
+            (array((), np.bool_, replicated_sharding),) * 2
+            if abstract
+            else _sampler_bools(replicated_sharding)
+        )
         return cls(
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
@@ -202,12 +241,24 @@ class SamplingMetadata:
             top_ks=top_ks_device,
             min_ps=min_ps_device,
             sampling_seeds=sampling_seeds_device,
-            is_all_greedy=batch.sampling_info.is_all_greedy,
+            is_all_greedy=bools[bool(batch.sampling_info.is_all_greedy)],
             positions=positions_device,
-            need_min_p_sampling=batch.sampling_info.need_min_p_sampling,
+            need_min_p_sampling=bools[bool(batch.sampling_info.need_min_p_sampling)],
             linear_penalty=linear_penalty_device,
-            do_penalties=do_penalties,
-            vocab_mask=batch.sampling_info.vocab_mask,
+            do_penalties=bools[do_penalties],
+            # The worker installs the current grammar mask after its update completes.
+            apply_vocab_mask=bools[False],
+            vocab_mask=(
+                array(
+                    (temperatures_device.shape[0], (vocab_size + 31) // 32),
+                    np.int32,
+                    replicated_sharding,
+                )
+                if abstract
+                else _empty_vocab_mask(
+                    temperatures_device.shape[0], vocab_size, replicated_sharding
+                )
+            ),
         )
 
 
@@ -397,10 +448,10 @@ class SamplingBatchInfo:
     def __len__(self):
         return len(self.temperatures)
 
-    def update_penalties(self):
+    def update_penalties(self, out: np.ndarray | None = None):
         if self.penalizer_orchestrator.is_required:
             # Get penalty array directly from orchestrator - no np.zeros() needed!
-            self.linear_penalty = self.penalizer_orchestrator.apply()
+            self.linear_penalty = self.penalizer_orchestrator.apply(out=out)
         else:
             self.linear_penalty = None
 

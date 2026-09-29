@@ -11,13 +11,13 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.embeddings import Embed
+from sgl_jax.srt.model_loader.weights import WeightLoader, WeightSpec
 from sgl_jax.srt.multimodal.models.qwen3_omni_moe.audio_encoder import (
     Qwen3OmniMoeAudioEncoder,
 )
 from sgl_jax.srt.multimodal.models.qwen3_omni_moe.vision_encoder import (
     Qwen3OmniMoeVisionEncoder,
 )
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
@@ -66,29 +66,31 @@ class Qwen3OmniMoeThinkerEmbedding(nnx.Module):
             **self._create_text_embed_tokens_mappings(self.config.text_config),
         }
 
-        loader.load_weights_from_safetensors(weight_mappings)
+        loader.load(weight_mappings)
         logger.info("Qwen3OmniMoeThinkerEmbedding weights loaded successfully!")
 
     @staticmethod
-    def _create_audio_tower_weight_mappings(config: Qwen3OmniMoeAudioEncoderConfig) -> dict:
+    def _create_audio_tower_weight_mappings(
+        config: Qwen3OmniMoeAudioEncoderConfig,
+    ) -> dict:
         mappings = {}
         prefix = "thinker.audio_tower"
         target_prefix = "audio_tower"
 
         # 1. conv2d layer: (conv2d1, conv2d2, conv2d3)
         for i in range(1, 4):
-            mappings[f"{prefix}.conv2d{i}.weight"] = WeightMapping(
+            mappings[f"{prefix}.conv2d{i}.weight"] = WeightSpec(
                 target_path=f"{target_prefix}.conv2d{i}.kernel",
                 transpose_axes=(2, 3, 1, 0),  # PT [O, I, H, W] -> JAX [H, W, I, O]
                 sharding=(None, None, None, None),
             )
-            mappings[f"{prefix}.conv2d{i}.bias"] = WeightMapping(
+            mappings[f"{prefix}.conv2d{i}.bias"] = WeightSpec(
                 target_path=f"{target_prefix}.conv2d{i}.bias",
                 sharding=(None,),
             )
 
         # 2. conv_out layer:
-        mappings[f"{prefix}.conv_out.weight"] = WeightMapping(
+        mappings[f"{prefix}.conv_out.weight"] = WeightSpec(
             target_path=f"{target_prefix}.conv_out.weight",
             transpose=True,  # PT [O, I] -> JAX [I, O]
             sharding=(None, None),
@@ -101,67 +103,67 @@ class Qwen3OmniMoeThinkerEmbedding(nnx.Module):
 
             # Self Attention: q_proj, k_proj, v_proj, out_proj
             for proj in ["q_proj", "k_proj", "v_proj", "out_proj"]:
-                mappings[f"{l_pre}.self_attn.{proj}.weight"] = WeightMapping(
+                mappings[f"{l_pre}.self_attn.{proj}.weight"] = WeightSpec(
                     target_path=f"{l_targ}.self_attn.{proj}.weight",
                     transpose=True,  # PT [O, I] -> JAX [I, O]
                     sharding=(None, None),
                 )
-                mappings[f"{l_pre}.self_attn.{proj}.bias"] = WeightMapping(
+                mappings[f"{l_pre}.self_attn.{proj}.bias"] = WeightSpec(
                     target_path=f"{l_targ}.self_attn.{proj}.bias",
                     sharding=(None,),
                 )
 
             # Attention LayerNorm (weight -> scale)
-            mappings[f"{l_pre}.self_attn_layer_norm.weight"] = WeightMapping(
+            mappings[f"{l_pre}.self_attn_layer_norm.weight"] = WeightSpec(
                 target_path=f"{l_targ}.self_attn_layer_norm.scale",
                 sharding=(None,),
             )
-            mappings[f"{l_pre}.self_attn_layer_norm.bias"] = WeightMapping(
+            mappings[f"{l_pre}.self_attn_layer_norm.bias"] = WeightSpec(
                 target_path=f"{l_targ}.self_attn_layer_norm.bias",
                 sharding=(None,),
             )
 
             # MLP layer: (fc1, fc2)
             for fc in ["fc1", "fc2"]:
-                mappings[f"{l_pre}.{fc}.weight"] = WeightMapping(
+                mappings[f"{l_pre}.{fc}.weight"] = WeightSpec(
                     target_path=f"{l_targ}.{fc}.weight",
                     transpose=True,  # PT [O, I] -> JAX [I, O]
                     sharding=(None, None),
                 )
-                mappings[f"{l_pre}.{fc}.bias"] = WeightMapping(
+                mappings[f"{l_pre}.{fc}.bias"] = WeightSpec(
                     target_path=f"{l_targ}.{fc}.bias",
                     sharding=(None,),
                 )
 
             # Final LayerNorm (weight -> scale)
-            mappings[f"{l_pre}.final_layer_norm.weight"] = WeightMapping(
+            mappings[f"{l_pre}.final_layer_norm.weight"] = WeightSpec(
                 target_path=f"{l_targ}.final_layer_norm.scale",
                 sharding=(None,),
             )
-            mappings[f"{l_pre}.final_layer_norm.bias"] = WeightMapping(
+            mappings[f"{l_pre}.final_layer_norm.bias"] = WeightSpec(
                 target_path=f"{l_targ}.final_layer_norm.bias",
                 sharding=(None,),
             )
 
         # 4. post process: (ln_post, proj1, proj2)
         # ln_post (weight -> scale)
-        mappings[f"{prefix}.ln_post.weight"] = WeightMapping(
+        mappings[f"{prefix}.ln_post.weight"] = WeightSpec(
             target_path=f"{target_prefix}.ln_post.scale",
             sharding=(None,),
         )
-        mappings[f"{prefix}.ln_post.bias"] = WeightMapping(
+        mappings[f"{prefix}.ln_post.bias"] = WeightSpec(
             target_path=f"{target_prefix}.ln_post.bias",
             sharding=(None,),
         )
 
         # proj1 & proj2
         for p in ["proj1", "proj2"]:
-            mappings[f"{prefix}.{p}.weight"] = WeightMapping(
+            mappings[f"{prefix}.{p}.weight"] = WeightSpec(
                 target_path=f"{target_prefix}.{p}.weight",
                 transpose=True,  # PT [O, I] -> JAX [I, O]
                 sharding=(None, None),
             )
-            mappings[f"{prefix}.{p}.bias"] = WeightMapping(
+            mappings[f"{prefix}.{p}.bias"] = WeightSpec(
                 target_path=f"{target_prefix}.{p}.bias",
                 sharding=(None,),
             )
@@ -181,36 +183,46 @@ class Qwen3OmniMoeThinkerEmbedding(nnx.Module):
                 (None, "tensor") if tp_col else ("tensor", None) if tp_row else (None, None)
             )
             b_sharding = ("tensor",) if tp_col else (None,)
-            mappings[f"{prefix}{src}.weight"] = WeightMapping(
-                target_path=f"{target_prefix}{dst}.weight", sharding=w_sharding, transpose=True
+            mappings[f"{prefix}{src}.weight"] = WeightSpec(
+                target_path=f"{target_prefix}{dst}.weight",
+                sharding=w_sharding,
+                transpose=True,
             )
-            mappings[f"{prefix}{src}.bias"] = WeightMapping(
-                target_path=f"{target_prefix}{dst}.bias", sharding=b_sharding, transpose=False
+            mappings[f"{prefix}{src}.bias"] = WeightSpec(
+                target_path=f"{target_prefix}{dst}.bias",
+                sharding=b_sharding,
+                transpose=False,
             )
 
         def add_layernorm(src: str, dst: str):
             """Add layernorm mapping."""
-            mappings[f"{prefix}{src}.weight"] = WeightMapping(
-                target_path=f"{target_prefix}{dst}.scale", sharding=(None,), transpose=False
+            mappings[f"{prefix}{src}.weight"] = WeightSpec(
+                target_path=f"{target_prefix}{dst}.scale",
+                sharding=(None,),
+                transpose=False,
             )
-            mappings[f"{prefix}{src}.bias"] = WeightMapping(
-                target_path=f"{target_prefix}{dst}.bias", sharding=(None,), transpose=False
+            mappings[f"{prefix}{src}.bias"] = WeightSpec(
+                target_path=f"{target_prefix}{dst}.bias",
+                sharding=(None,),
+                transpose=False,
             )
 
         # ==================== Patch Embedding ====================
         # Conv3d: PyTorch (out, in, T, H, W) -> JAX (T, H, W, in, out)
-        mappings[f"{prefix}patch_embed.proj.weight"] = WeightMapping(
+        mappings[f"{prefix}patch_embed.proj.weight"] = WeightSpec(
             target_path=f"{target_prefix}patch_embed.proj.kernel",
             sharding=(None, None, None, None, None),
             transpose=False,
             transpose_axes=(2, 3, 4, 1, 0),
         )
-        mappings[f"{prefix}patch_embed.proj.bias"] = WeightMapping(
-            target_path=f"{target_prefix}patch_embed.proj.bias", sharding=(None,), transpose=False
+        mappings[f"{prefix}patch_embed.proj.bias"] = WeightSpec(
+            target_path=f"{target_prefix}patch_embed.proj.bias",
+            sharding=(None,),
+            transpose=False,
         )
 
         # ==================== Position Embedding ====================
-        mappings[f"{prefix}pos_embed.weight"] = WeightMapping(
+        mappings[f"{prefix}pos_embed.weight"] = WeightSpec(
             target_path=f"{target_prefix}pos_embed.embedding",
             sharding=(None, None),
             transpose=False,
@@ -251,12 +263,14 @@ class Qwen3OmniMoeThinkerEmbedding(nnx.Module):
         return mappings
 
     @staticmethod
-    def _create_text_embed_tokens_mappings(config: Qwen3OmniMoeAudioEncoderConfig) -> dict:
+    def _create_text_embed_tokens_mappings(
+        config: Qwen3OmniMoeAudioEncoderConfig,
+    ) -> dict:
         mappings = {}
         prefix = "thinker.model"
         target_prefix = "text_embed_tokens"
 
-        mappings[f"{prefix}.embed_tokens.weight"] = WeightMapping(
+        mappings[f"{prefix}.embed_tokens.weight"] = WeightSpec(
             target_path=f"{target_prefix}.embedding",
             sharding=("tensor", None),
         )

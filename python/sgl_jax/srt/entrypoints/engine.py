@@ -42,6 +42,7 @@ from sgl_jax.srt.managers.io_struct import (
     ContinueGenerationReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
+    MultimodalDataInputFormat,
     PauseGenerationReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -110,6 +111,10 @@ class Engine(EngineBase):
 
             require_raiden_preloaded()
 
+        self.server_args = server_args
+        self.tokenizer_manager = None
+        self.send_to_rpc = None
+
         # Shutdown the subprocesses automatically when the program exits
         atexit.register(self.shutdown)
 
@@ -122,7 +127,6 @@ class Engine(EngineBase):
             server_args=server_args,
             port_args=self.port_args,
         )
-        self.server_args = server_args
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
         self.scheduler_info = scheduler_info
@@ -160,6 +164,10 @@ class Engine(EngineBase):
         stream: bool = False,
         lora_path: list[str] | str | None = None,
         return_routed_experts: list[bool] | bool | None = False,
+        *,
+        return_hidden_states: bool = False,
+        image_data: MultimodalDataInputFormat | None = None,
+        video_data: MultimodalDataInputFormat | None = None,
     ) -> dict | Iterator[dict]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -180,6 +188,9 @@ class Engine(EngineBase):
             stream=stream,
             lora_path=lora_path,
             return_routed_experts=return_routed_experts,
+            return_hidden_states=return_hidden_states,
+            image_data=image_data,
+            video_data=video_data,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -211,6 +222,10 @@ class Engine(EngineBase):
         stream: bool = False,
         lora_path: list[str] | str | None = None,
         return_routed_experts: list[bool] | bool | None = False,
+        *,
+        return_hidden_states: bool = False,
+        image_data: MultimodalDataInputFormat | None = None,
+        video_data: MultimodalDataInputFormat | None = None,
     ) -> dict | AsyncIterator[dict]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -231,6 +246,9 @@ class Engine(EngineBase):
             stream=stream,
             lora_path=lora_path,
             return_routed_experts=return_routed_experts,
+            return_hidden_states=return_hidden_states,
+            image_data=image_data,
+            video_data=video_data,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -302,8 +320,10 @@ class Engine(EngineBase):
 
     def shutdown(self):
         """Shutdown the engine"""
+        if self.tokenizer_manager is not None:
+            self.tokenizer_manager.shutdown()
         kill_process_tree(os.getpid(), include_parent=False)
-        if self.server_args.enable_single_process:
+        if self.server_args.enable_single_process and self.send_to_rpc is not None:
             self.send_to_rpc.close()
 
     def __enter__(self):

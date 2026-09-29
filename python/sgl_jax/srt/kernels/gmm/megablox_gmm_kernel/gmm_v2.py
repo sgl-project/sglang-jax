@@ -10,6 +10,10 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sgl_jax.srt.kernels.gmm.megablox_gmm_kernel.tuned_tile_sizes import (
+    get_tuned_gmm_v2_tile_sizes,
+)
+
 # Util.
 
 
@@ -665,6 +669,17 @@ def calculate_tiling(
     vmem_limit_bytes: int,
 ) -> TileSizes:
     """Calculate optimal tile sizes for GMM kernel."""
+
+    tuned_tiles = get_tuned_gmm_v2_tile_sizes(
+        lhs_dtype=lhs_dtype,
+        rhs_dtype=rhs_dtype,
+        num_groups=dims.size_group,
+        size_m=dims.size_m,
+        size_k=dims.size_k,
+        size_n=dims.size_n,
+    )
+    if tuned_tiles is not None:
+        return TileSizes(*tuned_tiles)
 
     lhs_bits = jax.dtypes.itemsize_bits(lhs_dtype)
     rhs_bits = jax.dtypes.itemsize_bits(rhs_dtype)

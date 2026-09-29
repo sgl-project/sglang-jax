@@ -94,7 +94,7 @@ class TestMiniMaxM2AttentionShapes(unittest.TestCase):
             use_qk_norm=True,
             rms_norm_eps=1e-6,
             rotary_dim=64,
-            rope_theta=10000,
+            rope_parameters={"rope_type": "default", "rope_theta": 10000},
             max_position_embeddings=2048,
         )
         with jax.set_mesh(mesh):

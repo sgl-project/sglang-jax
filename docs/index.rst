@@ -43,6 +43,7 @@ the model cookbook is maintained as a Mintlify-style recipe collection.
    features/attention_backend
    features/chunked_prefill
    features/global_jit_compile
+   features/lora
    features/quantization
    features/radix_cache
    features/run_in_pathways

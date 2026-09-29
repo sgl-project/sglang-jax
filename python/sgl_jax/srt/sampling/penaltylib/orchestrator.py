@@ -52,7 +52,7 @@ class BatchedPenalizerOrchestrator:
         for penalizer in self.penalizers.values():
             penalizer.cumulate_output_tokens(output_ids=output_ids)
 
-    def apply(self) -> np.ndarray | None:
+    def apply(self, out: np.ndarray | None = None) -> np.ndarray | None:
         """
         Apply the penalizers and return the penalty array.
         Optimized to avoid np.zeros() allocation by computing penalties on-demand.
@@ -73,6 +73,21 @@ class BatchedPenalizerOrchestrator:
 
         # Get active penalizers
         active_penalizers = [(type(p), p) for p in self.penalizers.values() if p.is_prepared()]
+
+        if out is not None and active_penalizers:
+            # The caller owns a fresh, zero-initialized slice of the merged batch.
+            if len(active_penalizers) == 1:
+                active_penalizers[0][1].add_to(out)
+                return out
+            for penalty_type in (
+                BatchedPresencePenalizer,
+                BatchedFrequencyPenalizer,
+                BatchedMinNewTokensPenalizer,
+            ):
+                penalizer = self.penalizers.get(penalty_type)
+                if penalizer is not None and penalizer.is_prepared():
+                    penalizer.add_to(out)
+            return out
 
         if len(active_penalizers) == 0:
             return None
@@ -148,6 +163,10 @@ class _BatchedPenalizer(abc.ABC):
     """
     An abstract class for a batched penalizer.
     """
+
+    def add_to(self, out: np.ndarray):
+        """Add penalties to a caller-owned batch slice."""
+        out += self.compute_penalty()
 
     def is_prepared(self) -> bool:
         return self._is_prepared

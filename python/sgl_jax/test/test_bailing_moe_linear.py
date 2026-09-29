@@ -12,6 +12,7 @@ from sgl_jax.srt.models.bailing_moe_linear import (
     BailingMoELinearDecoderLayer,
     BailingMoeV2_5ForCausalLM,
 )
+from sgl_jax.srt.models.bailing_moe_v3 import BailingMLA
 from sgl_jax.srt.models.deepseek_v3 import DeepseekV3Attention
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 
@@ -37,6 +38,47 @@ def _tiny_config(**overrides):
     )
     defaults.update(overrides)
     return BailingHybridConfig(**defaults)
+
+
+def test_deepseek_mla_pre_o_proj_hook_is_noop():
+    attn_output = jnp.arange(12, dtype=jnp.float32).reshape(2, 6)
+
+    actual = DeepseekV3Attention._pre_o_proj(None, attn_output, jnp.zeros((2, 4)))
+
+    assert actual is attn_output
+
+
+def test_bailing_mla_applies_head_gate_before_o_proj():
+    gate_logits = jnp.array([[0.0, jnp.log(3.0)], [0.0, jnp.log(3.0)]])
+
+    class _GateProjection:
+        def __call__(self, hidden_states, *, out_sharding=None):
+            del hidden_states
+            del out_sharding
+            return gate_logits, None
+
+    mesh = create_device_mesh(
+        ici_parallelism=[1, -1],
+        dcn_parallelism=[1, 1],
+        devices=[jax.devices()[0]],
+    )
+    attention = type(
+        "FakeBailingMLA",
+        (),
+        {
+            "g_proj": _GateProjection(),
+            "mesh": mesh,
+            "num_heads": 2,
+            "v_head_dim": 3,
+        },
+    )()
+    attn_output = jnp.ones((2, 6), dtype=jnp.float32)
+
+    with jax.set_mesh(mesh):
+        actual = BailingMLA._pre_o_proj(attention, attn_output, jnp.zeros((2, 4)))
+    expected = jnp.tile(jnp.array([[0.5] * 3 + [0.75] * 3]), (2, 1))
+
+    assert jnp.allclose(actual, expected)
 
 
 def test_layer_group_size_builds_upstream_linear_and_full_ids():
@@ -98,7 +140,9 @@ def test_bailing_moe_v2_5_resolves_from_bailing_moe_linear_file():
 
 
 def test_decoder_layer_selects_linear_attention_and_full_mla():
-    mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
+    mesh = create_device_mesh(
+        ici_parallelism=[1, 1], dcn_parallelism=[1, 1], devices=[jax.devices()[0]]
+    )
     cfg = _tiny_config(layer_group_size=2, full_attention_type="mla")
 
     with jax.set_mesh(mesh):
@@ -110,7 +154,9 @@ def test_decoder_layer_selects_linear_attention_and_full_mla():
 
 
 def test_decoder_layer_selects_gqa_fallback_for_non_mla_full_attention():
-    mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
+    mesh = create_device_mesh(
+        ici_parallelism=[1, 1], dcn_parallelism=[1, 1], devices=[jax.devices()[0]]
+    )
     cfg = _tiny_config(layer_group_size=2, full_attention_type="gqa")
 
     with jax.set_mesh(mesh):
@@ -123,6 +169,17 @@ def test_weight_mapping_contains_linear_mla_dense_and_shared_mlp_keys():
     cfg = _tiny_config(num_hidden_layers=2, layer_group_size=2, full_attention_type="mla")
     model = object.__new__(BailingMoeV2_5ForCausalLM)
     object.__setattr__(model, "config", cfg)
+    from flax import nnx
+
+    from sgl_jax.srt.layers.embeddings import ParallelLMHead
+
+    mesh = create_device_mesh([1, 1], [1, 1], devices=[jax.devices()[0]])
+    with jax.set_mesh(mesh):
+        object.__setattr__(
+            model,
+            "lm_head",
+            nnx.eval_shape(lambda: ParallelLMHead(cfg.vocab_size, cfg.hidden_size, mesh=mesh)),
+        )
     object.__setattr__(
         model,
         "model",
@@ -164,6 +221,17 @@ def test_weight_mapping_static_quant_gla_splits_into_weight_q_and_scale():
     cfg = _tiny_config(num_hidden_layers=2, layer_group_size=2, full_attention_type="mla")
     model = object.__new__(BailingMoeV2_5ForCausalLM)
     object.__setattr__(model, "config", cfg)
+    from flax import nnx
+
+    from sgl_jax.srt.layers.embeddings import ParallelLMHead
+
+    mesh = create_device_mesh([1, 1], [1, 1], devices=[jax.devices()[0]])
+    with jax.set_mesh(mesh):
+        object.__setattr__(
+            model,
+            "lm_head",
+            nnx.eval_shape(lambda: ParallelLMHead(cfg.vocab_size, cfg.hidden_size, mesh=mesh)),
+        )
     object.__setattr__(
         model,
         "model",
@@ -210,6 +278,17 @@ def test_weight_mapping_contains_moe_shared_expert_and_gqa_fallback_keys():
     )
     model = object.__new__(BailingMoeV2_5ForCausalLM)
     object.__setattr__(model, "config", cfg)
+    from flax import nnx
+
+    from sgl_jax.srt.layers.embeddings import ParallelLMHead
+
+    mesh = create_device_mesh([1, 1], [1, 1], devices=[jax.devices()[0]])
+    with jax.set_mesh(mesh):
+        object.__setattr__(
+            model,
+            "lm_head",
+            nnx.eval_shape(lambda: ParallelLMHead(cfg.vocab_size, cfg.hidden_size, mesh=mesh)),
+        )
     object.__setattr__(
         model,
         "model",
@@ -235,4 +314,4 @@ def test_weight_mapping_contains_moe_shared_expert_and_gqa_fallback_keys():
         mappings["model.layers.1.mlp.shared_experts.gate_proj.weight"].target_path
         == "model.layers.1.shared_experts.gate_proj.weight"
     )
-    assert "__MOE_EXPERTS__model.layers.1.mlp.wi_0" in mappings
+    assert "model.layers.1.mlp.wi_0" in mappings

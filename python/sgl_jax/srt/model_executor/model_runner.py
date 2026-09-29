@@ -26,7 +26,11 @@ from sgl_jax.srt.layers.routed_experts_capturer import (
     get_routed_expert_count,
     set_global_experts_capturer,
 )
-from sgl_jax.srt.layers.sampler import Sampler, compute_logprobs
+from sgl_jax.srt.layers.sampler import (
+    Sampler,
+    jitted_compute_logprobs,
+    make_jitted_sampler,
+)
 from sgl_jax.srt.lora.context_manager import LoraBatchContext
 from sgl_jax.srt.managers.schedule_batch import (
     GLOBAL_SERVER_ARGS_KEYS,
@@ -39,12 +43,22 @@ from sgl_jax.srt.model_executor.aot_dispatch import (
     aot_dispatch_requested,
 )
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
-from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sgl_jax.srt.model_executor.model_forward import (
+    _maybe_apply_recurrent_cow as _maybe_apply_recurrent_cow,  # DFlash imports this helper.
+)
+from sgl_jax.srt.model_executor.model_forward import make_jitted_run_model
 from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
     _build_non_hybrid_memory_pools,
 )
 from sgl_jax.srt.model_loader.loader import get_model_loader
+from sgl_jax.srt.multimodal.in_model.embedding_pool import EmbeddingPool
+from sgl_jax.srt.multimodal.in_model.host_orchestration import (
+    MultimodalBatch,
+    embed_multimodal_inputs,
+)
+from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
@@ -55,19 +69,32 @@ from sgl_jax.srt.utils.jax_utils import get_available_device_memory
 logger = logging.getLogger(__name__)
 
 
-def _maybe_apply_recurrent_cow(forward_batch, memory_pools):
-    """One-shot CoW: clone matched tree slots (src, 0 = skip) into running slots
-    before any recurrent read; no-op when nothing is pending."""
-    src = getattr(forward_batch, "recurrent_cow_src_indices", None)
-    if src is None or forward_batch.recurrent_indices is None:
-        return memory_pools
-    rsp = memory_pools.recurrent_state_pool
-    new_recurrent, new_conv = rsp.copy_slots(src, forward_batch.recurrent_indices)
-    _, aux = rsp.tree_flatten()
-    new_rsp = type(rsp).tree_unflatten(aux, (new_recurrent, new_conv))
-    pools = dict(memory_pools._pools)
-    pools["recurrent_state_pool"] = new_rsp
-    return type(memory_pools)(**pools)
+def _packed_embedding_hidden(model_config, multimodal_model=None) -> int:
+    deepstack_dim = int(getattr(multimodal_model, "deepstack_visual_layers", 0))
+    return int(model_config.hidden_size) * (1 + deepstack_dim)
+
+
+def _embedding_pool_bytes(
+    model_config: ModelConfig | MockModelConfig,
+    server_args: ServerArgs,
+    is_draft_worker: bool = False,
+    multimodal_model=None,
+) -> int:
+    """Per-device byte budget reserved for the multimodal embedding pool."""
+    enabled = (
+        getattr(model_config, "is_multimodal", False)
+        and model_config.is_in_model_multimodal
+        and not is_draft_worker
+        and not server_args.multimodal
+        and not server_args.enable_lora
+        and server_args.disaggregation_mode != "decode"
+    )
+    if not enabled:
+        return 0
+    page_size = server_args.page_size
+    capacity = -(-server_args.max_prefill_tokens // page_size) * page_size
+    packed_hidden = _packed_embedding_hidden(model_config, multimodal_model)
+    return capacity * packed_hidden * jnp.dtype(model_config.dtype).itemsize
 
 
 class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
@@ -105,7 +132,9 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             self.attention_tp_size
         )
         self.ep_size = server_args.ep_size
+        self.moe_dp_size = server_args.moe_dp_size
         self.server_args = server_args
+        self.embedding_pool: EmbeddingPool | None = None
         self.is_generation = model_config.is_generation
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
@@ -115,9 +144,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
 
         self.forward_pass_id = 0
-
-        # For sampling
-        self.use_sort_for_toppk_minp = server_args.use_sort_for_toppk_minp
 
         self.max_padding = max_padding
 
@@ -130,6 +156,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             load_config=LoadConfig(
                 load_format=server_args.load_format,
                 download_dir=server_args.download_dir,
+                model_loader_extra_config=server_args.model_loader_extra_config,
                 model_class=model_class,
             ),
             mesh=self.mesh,
@@ -173,7 +200,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             self.init_lora_manager()
 
         self._sampler_base_rng = jax.random.PRNGKey(server_args.random_seed)
-        self._sampler_step = 0
+        self._sampler_step = jax.device_put(np.int32(0), NamedSharding(self.mesh, P()))
         if not self.is_draft_worker:
             self.initialize_jit()
 
@@ -184,9 +211,44 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             total_device_memory,
             dp_size=server_args.dp_size,
         )
+        self._maybe_warn_dsa_sparse_prefill_temporaries()
+        self._build_embedding_pool()
 
         # Init routed experts capturer
         self.init_routed_experts_capturer()
+
+    @property
+    def embedding_pool_bytes(self) -> int:
+        """Per-device bytes reserved for the multimodal embedding pool (derived)."""
+        return _embedding_pool_bytes(
+            self.model_config,
+            self.server_args,
+            getattr(self, "is_draft_worker", False),
+            getattr(self, "model", None),
+        )
+
+    def _build_embedding_pool(self):
+        """Allocate the paged multimodal embedding pool from the reserved bytes.
+
+        Sized after the model is loaded (hidden size / deepstack depth / dtype
+        are known); its byte budget was already withheld from the KV cache in
+        :meth:`_profile_available_bytes`.
+        """
+        if not self.embedding_pool_bytes:
+            return
+        page_size = self.server_args.page_size
+        packed_hidden = _packed_embedding_hidden(self.model_config, self.model)
+        per_page = page_size * packed_hidden * jnp.dtype(self.dtype).itemsize
+        num_pages = int(self.embedding_pool_bytes // per_page)
+        if num_pages <= 0:
+            return
+        self.embedding_pool = EmbeddingPool(
+            num_pages=num_pages,
+            page_size=page_size,
+            hidden=packed_hidden,
+            dtype=self.dtype,
+            mesh=self.mesh,
+        )
 
     def init_routed_experts_capturer(self):
         set_global_experts_capturer(
@@ -243,87 +305,92 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         sampler_def, sampler_state = nnx.split(self.sampler)
         sampler_state_leaves, sampler_state_def = jax.tree_util.tree_flatten(sampler_state)
 
-        enable_tpu_log_recorder = jax.default_backend() == "tpu" and (
-            get_bool_env_var("SGLANG_JAX_ENABLE_KERNEL_LOG_RECORDER")
-        )
-        jit_compiler_options = (
-            {"xla_tpu_enable_log_recorder": "true"} if enable_tpu_log_recorder else None
-        )
-        if enable_tpu_log_recorder:
-            logger.info(
-                "Enabling TPU log recorder for JIT compilation "
-                "(compiler_options: xla_tpu_enable_log_recorder=true)."
-            )
+        from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
 
-        @partial(
-            jax.jit,
-            donate_argnames=["memory_pools"],
-            static_argnames=["model_state_def"],
-            compiler_options=jit_compiler_options,
-        )
-        def jitted_run_model(
-            model_def,
-            model_state_def,
-            model_state_leaves,
-            forward_batch,
-            memory_pools,
-            logits_metadata,
-        ):
-            model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
-            model = nnx.merge(model_def, model_state)
-            memory_pools = _maybe_apply_recurrent_cow(forward_batch, memory_pools)
-            with LoraBatchContext.set_batch(forward_batch):
-                return model(forward_batch, memory_pools, logits_metadata)
+        jit_compiler_options = CompilationManager.compiler_options(self.attn_backend)
+        sampler_compiler_options = getattr(self.attn_backend, "sampler_compiler_options", None)
 
-        # Capture base RNG key as a constant in the JIT closure.
-        # fold_in(constant, dynamic_step) is computed inside JIT, avoiding
-        # the eager jax.random.split that would serialize the host-device pipeline.
+        jitted_run_model = make_jitted_run_model(self.attn_backend, jit_compiler_options)
+
+        # Capture the base RNG key as a constant in the JIT closure. The sampler
+        # folds in the dynamic step inside its regular-sampling cond branch, so
+        # greedy decoding does not execute PRNG operations.
         base_rng_key = self._sampler_base_rng
         _fused_mesh = self.mesh
 
-        @partial(jax.jit, static_argnames=["sampler_state_def", "use_sort_for_toppk_minp"])
-        def jitted_sampler(
+        jitted_sampler = make_jitted_sampler(base_rng_key, sampler_compiler_options)
+
+        # Retain the serving JIT definitions for compile-only preparation.
+        # Warmup still calls the ordinary wrappers and threads donated pools.
+        self._lower_model = lambda batch, metadata: jitted_run_model.lower(
+            model_def,
+            model_state_def,
+            self.model_state_leaves,
+            batch,
+            self.memory_pools,
+            metadata,
+        )
+        self._lower_sampler = lambda logits, metadata: jitted_sampler.lower(
             sampler_def,
             sampler_state_def,
             sampler_state_leaves,
-            use_sort_for_toppk_minp,
-            rng_step,
-            *args,
-        ):
+            self._sampler_step,
+            logits,
+            metadata,
+        )
+        self._lower_compute_logprobs = partial(jitted_compute_logprobs.lower, self.mesh)
 
-            model_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
-            sampler = nnx.merge(sampler_def, model_state)
-            rng_key = jax.random.fold_in(base_rng_key, rng_step)
-            return sampler(
-                *args, use_sort_for_toppk_minp=use_sort_for_toppk_minp, rng_override=rng_key
-            )
+        aot_model_dir = self.server_args.aot_model_dir
+        executable_store = None
+        if aot_model_dir:
+            from sgl_jax.srt.model_executor.aot_executable import ExecutableStore
 
-        @partial(jax.jit, static_argnames=["mesh"])
-        def jitted_compute_logprobs(mesh, logits, next_tokens):
-            return compute_logprobs(mesh, logits, next_tokens)
+            executable_store = ExecutableStore(aot_model_dir, self.mesh)
 
-        # Opt-in (SGLANG_JAX_AOT_DISPATCH=auto|1): weights enter jit as
-        # ~thousands of flat args; AotDispatcher skips pjit's per-arg Python
-        # dispatch (O(n_args) checks + shard_args) by caching an AOT
-        # executable per batch-shape and pre-sharding the weight buffers
-        # once. See aot_dispatch.py. run_precompile drives the same wrapper,
-        # so precompiled deployments start fully warm. Off by default; the
-        # stock pjit path below is untouched. Speculative decoding always
-        # uses the stock path (interaction not yet supported).
+        # Offline loading and opt-in AOT dispatch share an executable cache.
+        # Parallel precompile also warms JAX's cache for the ordinary pjit path.
         use_aot_dispatch = aot_dispatch_requested()
+        self.parallel_precompile = (
+            self.server_args.precompile_num_threads > 1
+            and not self.server_args.disable_precompile
+            and executable_store is None
+            and not self.server_args.speculative_algorithm
+            and not self.server_args.enable_lora
+            and not self.server_args.enable_static_lora
+            and not self.model_config.is_multimodal
+            and not self.server_args.multimodal
+        )
+        if self.server_args.precompile_num_threads > 1 and not self.parallel_precompile:
+            logger.info(
+                "Parallel precompile is unavailable for this configuration; using serial warmup"
+            )
         if use_aot_dispatch and self.server_args.speculative_algorithm:
             logger.warning(
                 "SGLANG_JAX_AOT_DISPATCH is set but speculative decoding is "
-                "enabled; falling back to the stock pjit dispatch path."
+                "enabled; disabling the fast execute_sharded dispatch path."
             )
             use_aot_dispatch = False
 
-        if use_aot_dispatch:
+        # Match the exact compile options used by the selected serving path so
+        # both ordinary JIT and AOT dispatch reuse JAX's compiled-executable cache.
+        self.model_compile_options = lambda batch: (
+            CompilationManager.compiler_options(self.attn_backend, batch.forward_batch)
+            if use_aot_dispatch
+            else None
+        )
+        self.sampler_compile_options = sampler_compiler_options if use_aot_dispatch else None
+
+        if use_aot_dispatch or executable_store is not None:
             self._run_model_dispatcher = AotDispatcher(
                 jitted_run_model,
                 stable_call_args=(model_def, model_state_def, self.model_state_leaves),
                 stable_flat_args=(model_def, self.model_state_leaves),
                 name="run_model",
+                compiler_options_fn=lambda args: CompilationManager.compiler_options(
+                    self.attn_backend, args[0]
+                ),
+                executable_store=executable_store,
+                allow_fast_dispatch=use_aot_dispatch,
             )
 
             def run_model_wrapper(forward_batch, logits_metadata):
@@ -342,19 +409,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
             self.jitted_run_model = run_model_wrapper
 
-            self._sampler_dispatcher = AotDispatcher(
-                jitted_sampler,
-                stable_call_args=(
-                    sampler_def,
-                    sampler_state_def,
-                    sampler_state_leaves,
-                    self.use_sort_for_toppk_minp,
-                ),
-                stable_flat_args=(sampler_def, sampler_state_leaves),
-                name="sampler",
-            )
-
-            self.jitted_sampler = self._sampler_dispatcher
         else:
 
             def run_model_wrapper(forward_batch, logits_metadata):
@@ -369,15 +423,41 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
             self.jitted_run_model = run_model_wrapper
 
+        if use_aot_dispatch or executable_store is not None:
+            self._sampler_dispatcher = AotDispatcher(
+                jitted_sampler,
+                stable_call_args=(
+                    sampler_def,
+                    sampler_state_def,
+                    sampler_state_leaves,
+                ),
+                stable_flat_args=(sampler_def, sampler_state_leaves),
+                name="sampler",
+                compiler_options_fn=lambda _: sampler_compiler_options,
+                executable_store=executable_store,
+                allow_fast_dispatch=use_aot_dispatch,
+            )
+
+            self.jitted_sampler = self._sampler_dispatcher
+        else:
             self.jitted_sampler = partial(
                 jitted_sampler,
                 sampler_def,
                 sampler_state_def,
                 sampler_state_leaves,
-                self.use_sort_for_toppk_minp,
             )
 
-        self.jitted_compute_logprobs = partial(jitted_compute_logprobs, self.mesh)
+        if executable_store is not None:
+            self.jitted_compute_logprobs = AotDispatcher(
+                jitted_compute_logprobs,
+                stable_call_args=(self.mesh,),
+                stable_flat_args=(),
+                name="compute_logprobs",
+                executable_store=executable_store,
+                allow_fast_dispatch=use_aot_dispatch,
+            )
+        else:
+            self.jitted_compute_logprobs = partial(jitted_compute_logprobs, self.mesh)
 
         # Pathways-PD: fuse resolve_future_token_ids + run_model + sampler +
         # async_gather + set_future_token_ids into one jit so a decode tick is
@@ -385,7 +465,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         @partial(
             jax.jit,
             donate_argnames=["memory_pools"],
-            static_argnames=["model_state_def", "sampler_state_def", "use_sort_for_toppk_minp"],
+            static_argnames=["model_state_def", "sampler_state_def"],
             compiler_options=jit_compiler_options,
         )
         def jitted_run_and_sample(
@@ -398,7 +478,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             sampler_def,
             sampler_state_def,
             sampler_state_leaves,
-            use_sort_for_toppk_minp,
             rng_step,
             sampling_metadata,
             future_token_ids_map,
@@ -426,12 +505,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 )
             s_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
             sampler = nnx.merge(sampler_def, s_state)
-            rng_key = jax.random.fold_in(base_rng_key, rng_step)
+            rng_step = rng_step + jnp.int32(1)
             next_ids, token_logprobs, _new_output = sampler(
                 output,
                 sampling_metadata,
-                use_sort_for_toppk_minp=use_sort_for_toppk_minp,
-                rng_override=rng_key,
+                rng_override=base_rng_key,
+                rng_step=rng_step,
             )
             # async_gather + set_future_token_ids inlined. Per-request slot
             # scatter (req_pool_idx + 1); padding rows (seq_lens == 0) go out
@@ -452,11 +531,11 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 layers_topk_ids,
                 token_logprobs,
                 new_future_map,
+                rng_step,
             )
 
         def run_and_sample_wrapper(forward_batch, logits_metadata, sampling_metadata, future_map):
-            self._sampler_step += 1
-            return jitted_run_and_sample(
+            *result, self._sampler_step = jitted_run_and_sample(
                 model_def,
                 model_state_def,
                 self.model_state_leaves,
@@ -466,18 +545,82 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 sampler_def,
                 sampler_state_def,
                 sampler_state_leaves,
-                self.use_sort_for_toppk_minp,
                 self._sampler_step,
                 sampling_metadata,
                 future_map,
             )
+            return tuple(result)
 
         self.jitted_run_and_sample = run_and_sample_wrapper
+
+    def _maybe_warn_dsa_sparse_prefill_temporaries(self):
+        """Predict the DSA sparse-prefill score-buffer OOM at startup.
+
+        With ``DSA_PREFILL_SPARSE=1`` and the default jnp reference scorer,
+        every full indexer layer materializes an f32 ``[chunk, ctx]`` score
+        buffer during prefill and XLA keeps them alive together, so the HLO
+        temporaries scale as ``num_full_layers * chunk * ctx * 4B``. Today
+        that cliff only surfaces as RESOURCE_EXHAUSTED on the first long
+        prefill. Called after the KV pool is allocated so the free-HBM
+        reading matches the budget XLA reports in the OOM message; log-only.
+        """
+        if self.server_args.attention_backend != "dsa_sparse" or not self.use_mla_backend:
+            return
+        if os.environ.get("DSA_PREFILL_SPARSE", "0") != "1":
+            return
+        if os.environ.get("DSA_INDEXER_KERNEL_PREFILL", "0") == "1":
+            return  # the streaming kernel never materializes [chunk, ctx]
+
+        from sgl_jax.srt.kernels.dsa.ref import (
+            build_index_share_map,
+            prefill_score_temp_bytes,
+            suggest_chunked_prefill_size,
+        )
+
+        sa = self.server_args
+        cfg = self.model_config.hf_text_config
+        _, _, num_full = build_index_share_map(
+            getattr(cfg, "indexer_types", None),
+            getattr(cfg, "index_skip_topk_offset", 0),
+            cfg.num_hidden_layers,
+        )
+        chunk_tokens = (
+            sa.chunked_prefill_size if sa.chunked_prefill_size > 0 else sa.max_prefill_tokens
+        )
+        ctx_len = self.model_config.context_len
+        est = prefill_score_temp_bytes(num_full, chunk_tokens, ctx_len)
+        try:
+            free_bytes = get_available_device_memory(
+                self.device, device_indexes=sa.device_indexes, empty_cache=False
+            )
+        except Exception:  # never block startup on a diagnostics probe
+            return
+        # 0.9: the score buffers dominate the temporaries but are not all of
+        # them (the observed report runs ~1% above the formula).
+        if est > 0.9 * free_bytes:
+            suggested = suggest_chunked_prefill_size(num_full, ctx_len, int(0.9 * free_bytes))
+            logger.warning(
+                "DSA sparse prefill reference scorer needs ~%.1f GiB of HLO "
+                "temporaries (%d full layers x chunk %d x ctx %d x 4B) but only "
+                "~%.1f GiB HBM is free after weights and KV cache: the first "
+                "long prefill will likely fail with RESOURCE_EXHAUSTED. Reduce "
+                "--chunked-prefill-size (largest power of two that fits: %s) or "
+                "set DSA_INDEXER_KERNEL_PREFILL=1 to stream the scores instead "
+                "of materializing them.",
+                est / (1 << 30),
+                num_full,
+                chunk_tokens,
+                ctx_len,
+                free_bytes / (1 << 30),
+                suggested,
+            )
 
     def get_available_device_memory(self):
         distributed = jax.process_count() != 1
         min_available_device_memory = get_available_device_memory(
-            self.device, distributed=distributed, device_indexes=self.server_args.device_indexes
+            self.device,
+            distributed=distributed,
+            device_indexes=self.server_args.device_indexes,
         )
 
         # Check memory for tensor parallelism
@@ -502,32 +645,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
     def load_model(self):
         set_global_server_args(self.server_args)
 
-        self.model_config.validate_tensor_parallel_config(self.attention_tp_size)
-        self.model_config.configure_for_tensor_parallel(self.attention_tp_size)
-        self.model_config.log_kv_heads_info(self.attention_tp_size)
-        self.model_config.hf_config.ep_size = self.ep_size
-        self.model_config.hf_config.ep_num_redundant_experts = (
-            self.server_args.ep_num_redundant_experts
-        )
-        self.model_config.hf_config.moe_backend = self.model_config.moe_backend.value
-        self.model_config.hf_config.use_jax_allreduce_metadata = (
-            not self.server_args.disable_jax_allreduce_metadata
-        )
-        # Pick MLA forward path at server start. Only `fa` selects absorbed
-        # (the MLA Pallas kernel); `fa_mha` and `native` both decompress latent
-        # KV via kv_b_proj and run standard attention. Read by
-        # DeepseekV3DecoderLayer to construct DeepseekV3Attention; harmless on
-        # non-MLA models that ignore the attribute.
-        self.model_config.hf_config.use_absorbed_mla = self.server_args.attention_backend in (
-            "fa",
-            "dsa_sparse",
-        )
-        self.model_config.hf_config.use_dsa_sparse = (
-            self.server_args.attention_backend == "dsa_sparse"
-        )
-        self.model_config.hf_config.enable_sequence_parallel = (
-            self.server_args.enable_sequence_parallel
-        )
+        self.model_config.configure_for_serving(self.server_args)
 
         if self.server_args.ep_dispatch_algorithm:
             with jax.set_mesh(self.mesh):
@@ -539,7 +657,9 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         if self.is_draft_worker:
             # if draft model and target model share same safetensor files, we should hack here to avoid create redundant layer kv cache
             self.model_config.num_hidden_layers = getattr(
-                self.model_config, "num_nextn_predict_layers", self.model_config.num_hidden_layers
+                self.model_config,
+                "num_nextn_predict_layers",
+                self.model_config.num_hidden_layers,
             )
 
         # Apply quantization if quantization config is set
@@ -556,22 +676,10 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             if not is_static:
                 logger.info("Applying DYNAMIC (online) quantization...")
                 from sgl_jax.srt.utils.quantization.quantization_utils import (
-                    apply_linear_quantization,
-                    apply_moe_quantization,
+                    apply_quantization,
                 )
 
-                # Apply MoE quantization first
-                if self.model_config.quantization_config.has_moe_quantization():
-                    self.model = apply_moe_quantization(
-                        self.model_config, self.model, is_static_input=False
-                    )
-
-                # Apply quantization for linear layers
-                linear_rules = self.model_config.quantization_config.get_linear_rules()
-                if linear_rules:
-                    self.model = apply_linear_quantization(
-                        self.model_config, self.model, is_static_input=False
-                    )
+                self.model = apply_quantization(self.model_config, self.model)
             else:
                 logger.info("Static quantization detected. Skipping online requantization.")
         # Parse other args
@@ -590,7 +698,10 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 # if there is no aux layer, set to None
                 eagle_aux_hidden_state_layer_ids = None
             self.model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
-        elif self.server_args.speculative_algorithm == "DFLASH" and not self.is_draft_worker:
+        elif (
+            self.server_args.speculative_algorithm in ("DFLASH", "DSPARK")
+            and not self.is_draft_worker
+        ):
             # The captured layers must match the draft checkpoint's projection input.
             from sgl_jax.srt.speculative.dflash_util import parse_dflash_draft_config
 
@@ -772,6 +883,14 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 mesh=self.mesh,
             )
 
+        elif backend == "tt":
+            from sgl_jax.srt.hardware_backend.tt.attention.tt_backend import TTAttention
+
+            full_attn_backend = TTAttention(
+                page_size=self.page_size,
+                mesh=self.mesh,
+            )
+
         else:
             raise ValueError(f"Unsupported attention backend: {self.server_args.attention_backend}")
 
@@ -781,6 +900,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         )
 
         return attn_backend_wrapper(self, full_attn_backend)
+
+    def lower_model(self, batch):
+        """Prepare forward metadata and lower under the caller's model mesh."""
+        self.attn_backend.forward_metadata = self.attn_backend.get_forward_metadata(batch)
+        logits_metadata = LogitsMetadata.from_model_worker_batch(batch, self.mesh)
+        return self._lower_model(batch.forward_batch, logits_metadata)
 
     def _forward(
         self,
@@ -839,7 +964,14 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 target_sharding = self.token_to_kv_pool.kv_sharding
                 pool_updates = [jax.device_put(kv, target_sharding) for kv in pool_updates]
             self.memory_pools.replace_all(pool_updates)
-        return next_ids, output, token_logprobs, cache_miss_count, layers_topk_ids, new_future_map
+        return (
+            next_ids,
+            output,
+            token_logprobs,
+            cache_miss_count,
+            layers_topk_ids,
+            new_future_map,
+        )
 
     def forward_idle(
         self,
@@ -848,14 +980,36 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
     ) -> tuple[LogitsProcessorOutput, int]:
         raise NotImplementedError("forward_idle is not implemented")
 
+    def prepare_multimodal_inputs(
+        self,
+        forward_batch: ForwardBatch,
+        multimodal_batch: MultimodalBatch | None = None,
+    ) -> None:
+        """Prepare encoder embeddings before ordinary or fused model calls."""
+        if isinstance(self.model, InModelMultimodalContract) and forward_batch.forward_mode in (
+            ForwardMode.EXTEND,
+            ForwardMode.MIXED,
+        ):
+            input_embedding, deepstack, apply_for_deepstack = embed_multimodal_inputs(
+                multimodal_batch=multimodal_batch,
+                input_ids=forward_batch.input_ids,
+                multimodal_model=self.model,
+                embedding_pool=self.embedding_pool,
+            )
+            forward_batch.input_embedding = input_embedding
+            forward_batch.deepstack_visual_embedding = deepstack
+            forward_batch.apply_for_deepstack = apply_for_deepstack
+
     def forward(
         self,
         forward_batch: ForwardBatch,
         logits_metadata: LogitsMetadata,
+        multimodal_batch: MultimodalBatch | None = None,
     ) -> tuple[LogitsProcessorOutput, int]:
         self.forward_pass_id += 1
         precision_tracer.start_batch_trace(forward_batch.bid)
         precision_tracer.set_current_forward_pass_id(self.forward_pass_id)
+        self.prepare_multimodal_inputs(forward_batch, multimodal_batch)
         with jax.profiler.TraceAnnotation("_forward_raw"):
             ret = self._forward_raw(forward_batch, logits_metadata)
         return ret
@@ -898,15 +1052,13 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         Returns:
             A list of next_token_ids
         """
-        # Advance step counter (pure Python, zero device overhead).
-        # fold_in(base_key, step) inside JIT produces a unique RNG per step.
-        self._sampler_step += 1
-        # Penalty application has been moved to the Sampler for better JIT performance
-        return self.jitted_sampler(
+        # Advance the device counter inside JIT; fold_in uses steps 1, 2, ... .
+        result, self._sampler_step = self.jitted_sampler(
             self._sampler_step,
             logits_output,
             sampling_metadata,
         )
+        return result
 
     def compute_logprobs(self, logits, token_ids: jax.Array) -> jax.Array:
         return self.jitted_compute_logprobs(logits, token_ids)
@@ -1027,6 +1179,7 @@ class MockModelRunner(ModelRunner):
         server_args: ServerArgs = None,
     ):
         self.server_args = server_args
+        self.embedding_pool: EmbeddingPool | None = None
         self.tp_size = server_args.tp_size
         self.dp_size = server_args.dp_size
         self.attention_tp_size = self.tp_size // self.dp_size

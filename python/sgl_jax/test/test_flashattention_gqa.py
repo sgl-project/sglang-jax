@@ -52,6 +52,55 @@ class TestFlashAttentionGQA(AttentionTestBase):
         ]
         self.run_test("prefill", lens, (num_heads, head_dim, num_kv_heads, 64, jnp.bfloat16))
 
+    def test_gqa_prefill_accuracy_beyond_int16_span(self):
+        """Absolute token positions past 32767 must not corrupt the causal mask.
+
+        On TPU v6+ the kernel narrows its span arithmetic to int16
+        (ragged_paged_attention_v3.py). Mosaic lowers that cast to a wrapping
+        truncation rather than a saturation, so an *absolute* position above
+        32767 silently wraps negative and drops -- or zeroes -- part of the
+        attended prefix. Decode is immune because it forces use_causal_mask off.
+
+        Two long sequences straddle the cliff: 32768 lands a tile's
+        effective_kv_len exactly on the int16 floor (whole-tile zero output),
+        and 40960 wraps ordinarily (prefix silently lost). The batch is
+        deliberately skewed -- one long sequence beside several short ones --
+        so that a bound derived from the batch's average pages-per-sequence
+        would not catch it.
+        """
+        num_heads = 4
+        num_kv_heads = 1
+        head_dim = 128
+        lens = [(64, 32768), (64, 40960)] + [(8, 100)] * 6
+        self.run_test_on_single_device(
+            "prefill",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 16, jnp.bfloat16),
+            max_total_token_size=200000,
+        )
+
+    def test_gqa_sliding_window_beyond_int16_span(self):
+        """Sliding window on a sequence whose absolute positions exceed 32767.
+
+        The window predicate reduces to (delta - sliding_window) + i < j, so it
+        rides on the same narrowed span arithmetic as the causal mask. No other
+        test pairs a non-None sliding window with a sequence past the int16
+        cliff; every other flashattention case tops out near 1K tokens. The
+        boundary key tile -- the one straddling the far edge of the window --
+        is where the predicate does real work.
+        """
+        num_heads = 4
+        num_kv_heads = 1
+        head_dim = 128
+        lens = [(128, 40960)] + [(8, 100)] * 3
+        self.run_test_on_single_device(
+            "prefill",
+            lens,
+            (num_heads, head_dim, num_kv_heads, 16, jnp.bfloat16),
+            max_total_token_size=200000,
+            sliding_window=1024,
+        )
+
     def test_gqa_decode_accuracy_page_size_64(self):
         """Test JAX attention accuracy against native fa"""
         # Parameters

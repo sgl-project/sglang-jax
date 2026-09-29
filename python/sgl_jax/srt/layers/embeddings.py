@@ -15,7 +15,7 @@
 """Embedding Layers."""
 
 import math
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
@@ -26,7 +26,11 @@ from flax.typing import PromoteDtypeFn
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.environ import envs as _envs
 from sgl_jax.srt.utils.profiling_utils import named_scope
+
+if TYPE_CHECKING:
+    from sgl_jax.srt.model_loader.weights import WeightSpec
 
 
 class Embed(nnx.Module):
@@ -107,6 +111,12 @@ class Embed(nnx.Module):
         output = embedding.at[inputs].get(out_sharding=output_sharding)
         return output
 
+    def weight_mapping(self, target_path: str) -> "WeightSpec":
+        """Declare the checkpoint layout without changing tied embedding storage."""
+        from sgl_jax.srt.model_loader.weights import WeightSpec
+
+        return WeightSpec(target_path, sharding=self.kernel_axes)
+
     def attend(self, query: jax.Array) -> jax.Array:
         """Attend over the embedding using a query array.
 
@@ -139,9 +149,9 @@ class ParallelLMHead(Embed):
         dtype: jnp.dtype | None = None,
         param_dtype: jnp.dtype = jnp.bfloat16,
         promote_dtype: PromoteDtypeFn = dtypes.promote_dtype,
-        kernel_axes: tuple[str | None, ...] = ("tensor", None),
         mesh: jax.sharding.Mesh | None = None,
         use_bias: bool = False,
+        enable_dp_lm_head: bool = False,
     ):
         """
         Initialize the language model head.
@@ -154,11 +164,22 @@ class ParallelLMHead(Embed):
             param_dtype: Data type for parameter storage (weights and bias).
             promote_dtype: Function to handle dtype promotion during logits computation.
                           Controls how hidden_states and embedding tensors are promoted.
+            enable_dp_lm_head: Use attention TP within each DP group instead of global TP.
             use_bias: Whether to include bias parameters. Note: bias is currently
                      not used in logits computation, reserved for future extension.
         """
+        from sgl_jax.srt.layers.lm_head_parallel import weight_spec
+
+        self.enable_dp_lm_head = enable_dp_lm_head
+        kernel_axes = tuple(weight_spec(enable_dp_lm_head, mesh))
+        partitions = (
+            1
+            if mesh is None
+            else mesh.shape["tensor"] * (1 if enable_dp_lm_head else mesh.shape.get("data", 1))
+        )
+        self.vocab_padding = -num_embeddings % partitions
         super().__init__(
-            num_embeddings=num_embeddings,
+            num_embeddings=num_embeddings + self.vocab_padding,
             features=features,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -166,6 +187,7 @@ class ParallelLMHead(Embed):
             kernel_axes=kernel_axes,
             mesh=mesh,
         )
+        self.num_embeddings = num_embeddings
         if use_bias:
             bias_sharding = NamedSharding(mesh, P(None, "tensor")) if mesh is not None else None
             self.bias = nnx.Param(
@@ -179,9 +201,17 @@ class ParallelLMHead(Embed):
         else:
             self.bias = None
 
+    def weight_mapping(self, target_path: str) -> "WeightSpec":
+        mapping = super().weight_mapping(target_path)
+        if self.vocab_padding:
+            mapping.pad_width = ((0, self.vocab_padding), (0, 0))
+        return mapping
+
     def tie_weights(self, embed_tokens: Embed):
         """Tie the weights with word embeddings."""
         self.embedding = embed_tokens.embedding
+        self.kernel_axes = embed_tokens.kernel_axes
+        self.vocab_padding = 0
         return self
 
     def __call__(self, input_):
@@ -567,6 +597,9 @@ def rotary_embedding_forward(
     return query, key
 
 
+_ROTARY_INTERLEAVED = _envs.SGLANG_JAX_ROTARY_INTERLEAVED.get()
+
+
 # @partial(jax.jit, static_argnames=["is_neox_style"])
 def apply_rotary_emb(
     x: jax.Array,
@@ -587,6 +620,15 @@ def apply_rotary_emb(
     if is_neox_style:
         x1, x2 = jnp.split(x, 2, axis=-1)
     else:
+        if _ROTARY_INTERLEAVED:
+            # GPT-J rotary computed directly in the interleaved domain:
+            # avoids the strided even/odd slices and the stack+reshape
+            # re-interleave; bit-identical to the slice formulation.
+            cos_il = jnp.repeat(cos, 2, axis=-1)
+            sin_il = jnp.repeat(sin, 2, axis=-1)
+            sign = jnp.tile(jnp.array([-1, 1], dtype=x.dtype), x.shape[-1] // 2)
+            x_swap = jnp.flip(x.reshape(*x.shape[:-1], -1, 2), axis=-1).reshape(x.shape)
+            return x * cos_il + x_swap * (sin_il * sign)
         x1 = x[..., ::2]
         x2 = x[..., 1::2]
     o1 = x1 * cos - x2 * sin
@@ -659,11 +701,27 @@ def get_rope(
             raise ValueError("Unknown RoPE scaling type")
 
         if scaling_type == "default":
-            # HF transformers uses rope_type="default" to mean "no scaling",
-            # equivalent to rope_scaling=None.  Fall back to plain RotaryEmbedding.
-            rotary_emb = RotaryEmbedding(
-                head_size, rotary_dim, max_position, base, is_neox_style, dtype
-            )
+            if "mrope_section" in rope_scaling:
+                # Qwen2.5-VL / Omni: HF config is rope_type="default" plus an
+                # mrope_section -> multimodal sectioned RoPE. Aligns upstream
+                # get_rope (the model/attention stay mrope-agnostic; the 3D
+                # positions come from forward_batch.mrope_positions).
+                rotary_emb = MRotaryEmbedding(
+                    head_size,
+                    rotary_dim,
+                    max_position,
+                    base,
+                    is_neox_style,
+                    dtype,
+                    mrope_section=rope_scaling["mrope_section"],
+                    mrope_interleaved=rope_scaling.get("mrope_interleaved", False),
+                )
+            else:
+                # HF transformers uses rope_type="default" to mean "no scaling",
+                # equivalent to rope_scaling=None.  Fall back to plain RotaryEmbedding.
+                rotary_emb = RotaryEmbedding(
+                    head_size, rotary_dim, max_position, base, is_neox_style, dtype
+                )
         elif scaling_type == "proportional":
             rotary_emb = ProportionalRotaryEmbedding(
                 head_size,

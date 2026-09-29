@@ -283,7 +283,7 @@ class PrecisionTracer:
 
     def jit_pure_callback_record(
         self, tensor: Any, name: str, stage: str, layer_id: int | None = None
-    ) -> bool:
+    ) -> jax.Array | None:
         if self._enable_precision_tracer:
             full_stage = f"{stage}_layer_id_{layer_id}" if layer_id is not None else stage
 
@@ -304,7 +304,8 @@ class PrecisionTracer:
 
             return callback_flag
         else:
-            return jnp.bool_(True)
+            # None is an empty pytree: disabled tracing adds no device outputs.
+            return None
 
     def record(
         self,

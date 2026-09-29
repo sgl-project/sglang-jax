@@ -71,30 +71,19 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
         Returns:
             np.ndarray: The min new tokens penalty values (negative for orchestrator)
         """
-        # Create mask for requests that haven't reached min_new_tokens
-        mask = self.len_output_tokens < self.min_new_tokens
-
-        # Create stop token penalties on-demand
-        stop_token_penalties = self._create_stop_token_penalties()
-
-        mask_expanded = np.broadcast_to(mask, stop_token_penalties.shape)
-        penalty_values = np.where(mask_expanded, stop_token_penalties, 0.0)
-
-        return penalty_values
-
-    def _create_stop_token_penalties(self):
-        # Create stop token penalties on-demand to avoid storing large arrays
-        stop_token_penalties = np.zeros(
+        result = np.zeros(
             (len(self.orchestrator.reqs()), self.orchestrator.vocab_size),
             dtype=np.float32,
         )
+        self.add_to(result)
+        return result
 
-        for i, stop_tokens in enumerate(self.stop_token_sequences):
-            if len(stop_tokens) > 0:
-                valid_tokens = stop_tokens[stop_tokens < self.orchestrator.vocab_size]
-                stop_token_penalties[i, valid_tokens] = float("-inf")
-
-        return stop_token_penalties
+    def add_to(self, out: np.ndarray):
+        # Only stop-token positions change; do not scan the full vocabulary.
+        for row in np.flatnonzero((self.len_output_tokens < self.min_new_tokens).ravel()):
+            tokens = self.stop_token_sequences[row]
+            valid_tokens = tokens[tokens < self.orchestrator.vocab_size]
+            out[row, valid_tokens] += float("-inf")
 
     def _filter(self, keep_indices: np.ndarray):
         self.min_new_tokens = self.min_new_tokens[keep_indices]

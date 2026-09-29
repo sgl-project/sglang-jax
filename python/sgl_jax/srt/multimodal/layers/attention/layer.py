@@ -15,7 +15,7 @@ def align_to(x, a):
     return pl.cdiv(x, a) * a
 
 
-def simple_attention(query, key, value, scale=None, causal=False):
+def simple_attention(query, key, value, scale=None, causal=False, mask=None):
     """Simple dot-product attention for diffusion models (no KV cache).
 
     Args:
@@ -24,6 +24,7 @@ def simple_attention(query, key, value, scale=None, causal=False):
         value: [B, S, H, D]
         scale: softmax scale, default 1/sqrt(D)
         causal: whether to apply causal mask
+        mask: optional boolean mask broadcastable to [B, H, S, S]
     Returns:
         output: [B, S, H, D]
     """
@@ -40,8 +41,11 @@ def simple_attention(query, key, value, scale=None, causal=False):
 
     if causal:
         seq_len = query.shape[1]
-        mask = jnp.tril(jnp.ones((seq_len, seq_len)))
-        attn_weights = jnp.where(mask == 0, float("-inf"), attn_weights)
+        causal_mask = jnp.tril(jnp.ones((seq_len, seq_len)))
+        attn_weights = jnp.where(causal_mask == 0, float("-inf"), attn_weights)
+
+    if mask is not None:
+        attn_weights = jnp.where(mask, attn_weights, float("-inf"))
 
     attn_weights = jax.nn.softmax(attn_weights, axis=-1)
 

@@ -127,7 +127,10 @@ async def lifespan(fast_api_app: FastAPI):
     warmup_thread = getattr(fast_api_app, "warmup_thread", None)
     if warmup_thread is not None:
         warmup_thread.start()
-    yield
+    try:
+        yield
+    finally:
+        _global_state.tokenizer_manager.shutdown()
 
 
 # Fast API
@@ -288,7 +291,13 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         async def stream_results() -> AsyncIterator[bytes]:
             try:
                 async for out in _global_state.tokenizer_manager.generate_request(obj, request):
-                    yield (b"data: " + orjson.dumps(out, option=orjson.OPT_NON_STR_KEYS) + b"\n\n")
+                    yield (
+                        b"data: "
+                        + orjson.dumps(
+                            out, option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY
+                        )
+                        + b"\n\n"
+                    )
             except ValueError as e:
                 out = {"error": {"message": str(e)}}
                 logger.error("[http_server] Error: %s", e)

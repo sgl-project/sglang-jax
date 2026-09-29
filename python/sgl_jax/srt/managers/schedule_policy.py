@@ -20,7 +20,8 @@ from sgl_jax.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
-from sgl_jax.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sgl_jax.srt.mem_cache.radix_cache import RadixCache, TreeNode
+from sgl_jax.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 if TYPE_CHECKING:
     from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -152,14 +153,9 @@ class SchedulePolicy:
         self.waiting_queue_radix_tree.reset()
 
         for r in waiting_queue:
-            prefix_ids = r.adjust_max_prefix_ids()
-            extra_key = r.extra_key
+            match_key = r.match_key()
             # NOTE: the prefix_indices must always be aligned with last_node
-            match_result = self.tree_cache.match_prefix(
-                MatchPrefixParams(
-                    key=RadixKey(token_ids=prefix_ids, extra_key=extra_key, dp_rank=r.dp_rank)
-                )
-            )
+            match_result = self.tree_cache.match_prefix(MatchPrefixParams(key=match_key))
             r.prefix_indices = match_result.device_indices
             r.last_node = match_result.last_device_node
             r.last_host_node = match_result.last_host_node
@@ -174,9 +170,7 @@ class SchedulePolicy:
             # It is kind of common when the engine is long running (e.g., imagine the prefix "the").
             if len(r.prefix_indices) <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
                 in_batch_match = self.waiting_queue_radix_tree.match_prefix(
-                    MatchPrefixParams(
-                        key=RadixKey(token_ids=prefix_ids, extra_key=extra_key, dp_rank=r.dp_rank)
-                    )
+                    MatchPrefixParams(key=match_key)
                 )
                 in_batch_matching_prefixes = in_batch_match.device_indices
                 if (
@@ -188,10 +182,8 @@ class SchedulePolicy:
                     # Insert with a dummy key
                     self.waiting_queue_radix_tree.insert(
                         InsertParams(
-                            key=RadixKey(
-                                token_ids=prefix_ids, extra_key=extra_key, dp_rank=r.dp_rank
-                            ),
-                            value=np.empty(len(prefix_ids), dtype=np.bool_),
+                            key=match_key,
+                            value=np.empty(len(match_key), dtype=np.bool_),
                         )
                     )
         return temporary_deprioritized
@@ -260,6 +252,7 @@ class SchedulePolicy:
 class AddReqResult(Enum):
     CONTINUE = auto()  # Continue to add requests
     NO_TOKEN = auto()  # No token left
+    DP_BUDGET_EXHAUSTED = auto()  # Only this DP's chunk budget is exhausted
     OTHER = auto()  # Other reasons to stop adding requests
 
 
@@ -606,7 +599,7 @@ class PrefillAdder:
             )
         else:
             if self.rem_chunk_tokens_list[dp_rank] <= 0:
-                return AddReqResult.OTHER
+                return AddReqResult.DP_BUDGET_EXHAUSTED
 
             # Chunked prefill
             trunc_len = self.rem_chunk_tokens_list[dp_rank]
@@ -620,10 +613,15 @@ class PrefillAdder:
         return self._budget_state_after_add(dp_rank)
 
     def add_one_req(self, req: Req):
+        dp_rank = req.dp_rank if req.dp_rank is not None else 0
+        # Reject before ignore-eos admission adds the candidate to req_states.
+        # A caller may continue trying other DP ranks after this rejection.
+        if self.rem_chunk_tokens_list is not None and self.rem_chunk_tokens_list[dp_rank] <= 0:
+            return AddReqResult.DP_BUDGET_EXHAUSTED
+
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
 
-        dp_rank = req.dp_rank if req.dp_rank is not None else 0
         total_tokens = req.extend_input_len + min(
             req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION
         )
@@ -675,7 +673,7 @@ class PrefillAdder:
                         self.rem_chunk_tokens_list[dp_rank] // self.page_size * self.page_size
                     )
                     if trunc_est <= 0:
-                        return AddReqResult.OTHER
+                        return AddReqResult.DP_BUDGET_EXHAUSTED
 
             # HiCache: after budget gate, pull host-only prefix back to device.
             # Must happen after NO_TOKEN check so rejected reqs never trigger H2D.
@@ -722,6 +720,8 @@ class PrefillAdder:
                 # Non-chunked prefill
                 self.can_run_list[dp_rank].append(req)
                 res = self.tree_cache.inc_lock_ref(req.last_node)
+                if isinstance(self.tree_cache, UnifiedRadixCache):
+                    req.cache_lock_params = res.to_dec_params()
                 req.swa_uuid_for_lock = res.swa_uuid_for_lock
                 self._update_prefill_budget(
                     prefix_len,
@@ -736,13 +736,15 @@ class PrefillAdder:
                 self.can_run_list[dp_rank].append(req)
                 self.new_chunked_reqs[dp_rank] = req
                 res = self.tree_cache.inc_lock_ref(req.last_node)
+                if isinstance(self.tree_cache, UnifiedRadixCache):
+                    req.cache_lock_params = res.to_dec_params()
                 req.swa_uuid_for_lock = res.swa_uuid_for_lock
                 self._update_prefill_budget(prefix_len, input_tokens, 0, dp_rank)
             else:
                 # Make sure at least one page is available
                 trunc_len = self.rem_chunk_tokens_list[dp_rank] // self.page_size * self.page_size
                 if trunc_len <= 0:
-                    return AddReqResult.OTHER
+                    return AddReqResult.DP_BUDGET_EXHAUSTED
 
                 # Chunk budget tighter than the boundary cap: min of the two.
                 req.extend_input_len = trunc_len
@@ -751,6 +753,8 @@ class PrefillAdder:
                 self.can_run_list[dp_rank].append(req)
                 self.new_chunked_reqs[dp_rank] = req
                 res = self.tree_cache.inc_lock_ref(req.last_node)
+                if isinstance(self.tree_cache, UnifiedRadixCache):
+                    req.cache_lock_params = res.to_dec_params()
                 req.swa_uuid_for_lock = res.swa_uuid_for_lock
                 self._update_prefill_budget(prefix_len, trunc_len, 0, dp_rank)
 

@@ -48,6 +48,33 @@ def build_index_share_map(
     return full_slot, src_slot, len(full_slot)
 
 
+def prefill_score_temp_bytes(num_full_layers: int, chunk_tokens: int, context_len: int) -> int:
+    """Estimated HLO temporaries for the jnp reference indexer scorer.
+
+    The reference scorer materializes one f32 ``[chunk_tokens, context_len]``
+    token-score buffer per full layer during sparse prefill, and XLA keeps
+    them alive together. Observed within ~2% of the RESOURCE_EXHAUSTED report
+    at 135k context (22 full layers x chunk 8192 -> ~98.5G).
+    """
+    return num_full_layers * chunk_tokens * context_len * 4
+
+
+def suggest_chunked_prefill_size(
+    num_full_layers: int, context_len: int, budget_bytes: int
+) -> int | None:
+    """Largest power-of-two ``chunked_prefill_size`` (capped at the context
+    length) whose reference-scorer temporaries fit ``budget_bytes``. Returns
+    ``None`` when even the smallest chunk (256) does not fit."""
+    chunk, best = 256, None
+    while (
+        chunk <= context_len
+        and prefill_score_temp_bytes(num_full_layers, chunk, context_len) <= budget_bytes
+    ):
+        best = chunk
+        chunk *= 2
+    return best
+
+
 @functools.partial(jax.jit, static_argnames=("k", "pages_per_seq", "one_token_per_seq"))
 def streamindex_topk_ref(
     q: jax.Array,

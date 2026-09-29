@@ -208,6 +208,8 @@ Shape: (total_num_pages,
 
 **Key design**: `kv_dim = align128(kv_lora_rank) + align128(qk_rope_head_dim)`, with the two segments **independently aligned** (not `align128(lora + rope)`). E.g., `lora=192, rope=64` → `256 + 128 = 384`, not `align(256, 128) = 256`.
 
+**DSA indexer key buffers** (`--attention-backend dsa_sparse`): a *second* set of paged buffers in the same layout with `kv_dim = align128(index_head_dim)`, one per "full" indexer layer (`num_indexer_layers`, from `build_index_share_map`). Reached via `get_indexer_key_buffer(slot)` — indexed by indexer **slot**, not by layer id, so it does not go through the usual layer-id translation. Counted by both `get_kv_size_bytes()` and `_compute_cell_size()` (§4.9).
+
 | Feature | MHA Pool | MLA Pool |
 |---------|----------|----------|
 | Buffer dimensions | 5D | 4D |
@@ -233,6 +235,8 @@ The current SWA uses a Full + SWA dual-pool structure, with `SWATokenToKVPoolAll
 #### 7.2.4.5 HybridLinearKVPool
 
 Used by **hybrid models** that mix attention with linear-recurrent layers (e.g., Kimi-Linear: MLA + KDA). Wraps **one** inner `MHA`/`MLATokenToKVPool` sized only to the full-attention layers; linear-recurrent layers don't allocate KV slots — their state lives in `RecurrentStatePool` (§7.2.5), and req-pool slot coordination uses `HybridReqToTokenPool` (§7.2.3). The three classes together form the complete hybrid configuration.
+
+Combining this with `dsa_sparse` is rejected at startup: the DSA indexer slot space spans every layer while this wrapper indexes full-attention layers only, and nothing reconciles the two.
 
 **Core fields**:
 
