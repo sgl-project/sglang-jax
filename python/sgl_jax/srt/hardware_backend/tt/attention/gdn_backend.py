@@ -116,9 +116,18 @@ class TTGDNAttnBackend(GDNAttnBackend):
             new_conv, conv_out = ops.causal_conv1d_update(
                 conv_state, mixed_qkv, weight, indices, initial
             )
-            q, k, v = self._qkv(conv_out)
+            # The kernel reads q, k and v as heads of the flat convolution
+            # output, normalizes and scales q and k like _qkv does, and lets
+            # each key head serve its group of value heads.
+            num_k_heads = self.num_k_heads // self.mesh.shape["tensor"]
+            mixed = conv_out.astype(jnp.float32)
             new_rec, out = ops.gated_delta_decode(
-                recurrent_state, q, k, v, b, a, A_log, dt_bias, indices, initial
+                recurrent_state, mixed, mixed, mixed, b, a, A_log, dt_bias, indices, initial,
+                key_head_offset=num_k_heads,
+                value_head_offset=2 * num_k_heads,
+                num_key_heads=num_k_heads,
+                normalize_eps=1e-6,
+                query_scale=self.head_k_dim**-0.5,
             )
             return out.astype(mixed_qkv.dtype), new_conv, new_rec
 

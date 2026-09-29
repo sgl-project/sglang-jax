@@ -87,13 +87,13 @@ def annotate_weight_dtype(tensor, dtype):
     return jnp.reshape(tensor, original_shape)
 
 
-def _recurrent_call(name, state, output_shape, *operands):
+def _recurrent_call(name, state, output_shape, *operands, **attributes):
     return jax.ffi.ffi_call(
         name,
         (jax.ShapeDtypeStruct(state.shape, state.dtype), output_shape),
         input_output_aliases={0: 0},
         vmap_method="sequential",
-    )(state, *operands)
+    )(state, *operands, **attributes)
 
 
 def causal_conv1d_update(state, value, weight, indices, initial):
@@ -108,11 +108,45 @@ def causal_conv1d_update(state, value, weight, indices, initial):
     )
 
 
-def gated_delta_decode(state, q, k, v, b, a, A_log, dt_bias, indices, initial):
+def gated_delta_decode(
+    state,
+    q,
+    k,
+    v,
+    b,
+    a,
+    A_log,
+    dt_bias,
+    indices,
+    initial,
+    *,
+    query_head_offset=0,
+    key_head_offset=0,
+    value_head_offset=0,
+    num_key_heads=0,
+    normalize_eps=None,
+    query_scale=1.0,
+):
+    """One recurrent step; returns the new state and the [T, H, D] output.
+
+    q, k and v are [T, heads, D], or flat [T, heads * D], possibly one tensor,
+    starting at the given head offsets. Value head h uses query/key head
+    h // (H // num_key_heads); num_key_heads 0 means all heads of q. With
+    normalize_eps, the kernel L2-normalizes q and k and scales q by query_scale.
+    """
+    attributes = {
+        "query_head_offset": np.uint32(query_head_offset),
+        "key_head_offset": np.uint32(key_head_offset),
+        "value_head_offset": np.uint32(value_head_offset),
+        "num_key_heads": np.uint32(num_key_heads),
+        "query_scale": np.float32(query_scale),
+    }
+    if normalize_eps is not None:
+        attributes["normalize_eps"] = np.float32(normalize_eps)
     return _recurrent_call(
         "tt.gated_delta_decode",
         state,
-        jax.ShapeDtypeStruct(v.shape, jnp.float32),
+        jax.ShapeDtypeStruct((*b.shape, state.shape[-1]), jnp.float32),
         q,
         k,
         v,
@@ -122,6 +156,7 @@ def gated_delta_decode(state, q, k, v, b, a, A_log, dt_bias, indices, initial):
         dt_bias.astype(jnp.float32),
         indices,
         initial.astype(jnp.bfloat16),
+        **attributes,
     )
 
 
