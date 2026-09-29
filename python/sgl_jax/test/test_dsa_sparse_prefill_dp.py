@@ -403,25 +403,33 @@ class TestDSASparsePrefillDP(CustomTestCase):
         # untouched. A wrapper class in the style of KDAAttnBackendForTest
         # cannot reach it, because the seam is a module-level function rather
         # than a method on the backend.
-        self.enterContext(
-            mock.patch.object(
-                dsa_mod,
-                self.KERNEL,
-                functools.partial(getattr(dsa_mod, self.KERNEL), interpret=True),
-            )
+        #
+        # The Mock records calls so `_run` can assert the sparse kernel was
+        # reached. Without that, a refactor that moves the env read or the call
+        # site would turn this file into a dense-path test that still passes.
+        self.kernel = mock.Mock(
+            wraps=functools.partial(getattr(dsa_mod, self.KERNEL), interpret=True),
+            name=self.KERNEL,
         )
+        self.enterContext(mock.patch.object(dsa_mod, self.KERNEL, self.kernel))
+
+    def _run(self, workload: _Workload, mesh: jax.sharding.Mesh):
+        self.kernel.reset_mock()
+        out = _run(workload, mesh)
+        self.kernel.assert_called()
+        return out
 
     def _assert_dp_invariant(self, q_lens_per_rank, attn_tp, num_heads=NUM_HEADS):
         """Each rank's requests must give the same answer alone at dp=1 as they
         do inside the dp=D batch. Attention TP is identical in both runs."""
         dp = len(q_lens_per_rank)
         full = _Workload(q_lens_per_rank, num_heads=num_heads)
-        got = _run(full, _mesh(dp, attn_tp))
+        got = self._run(full, _mesh(dp, attn_tp))
 
         solos = {}
         for r in range(dp):
             solo = full.subset([r])
-            want = _run(solo, _mesh(1, attn_tp))
+            want = self._run(solo, _mesh(1, attn_tp))
             solos[r] = want
             for i in range(len(q_lens_per_rank[r])):
                 # A request whose rows land outside every cu_q_lens segment
@@ -501,8 +509,8 @@ class TestDSASparsePrefillDP(CustomTestCase):
         other = _Workload([[96], [96]], seed=99)
         other.payloads[(0, 0)] = base.payloads[(0, 0)]
 
-        a = _run(base, mesh)
-        b = _run(other, mesh)
+        a = self._run(base, mesh)
+        b = self._run(other, mesh)
 
         # Positive control: the two runs must genuinely differ somewhere, else
         # the assertion below is comparing two identical computations.
