@@ -21,6 +21,7 @@ from transformers import (
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from sgl_jax.srt.configs.bailing_hybrid import BailingHybridConfig
+from sgl_jax.srt.configs.deepseek_v4 import DeepseekV4Config
 from sgl_jax.srt.configs.gemma4 import Gemma4Config
 from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
 from sgl_jax.srt.configs.qwen3_5 import Qwen3_5DenseConfig, Qwen3_5HybridConfig
@@ -35,6 +36,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     cls.model_type: cls
     for cls in [
         BailingHybridConfig,
+        DeepseekV4Config,
         KimiLinearConfig,
         Qwen3_5HybridConfig,
         Qwen3_5DenseConfig,
