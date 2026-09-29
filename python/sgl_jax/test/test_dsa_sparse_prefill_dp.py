@@ -468,10 +468,11 @@ class TestDSASparsePrefillDP(CustomTestCase):
             for b in range(a + 1, len(refs)):
                 r_a, i_a, x = refs[a]
                 r_b, i_b, y = refs[b]
-                if x.shape != y.shape:
-                    continue
+                # Compare the overlapping prefix: lengths usually differ, and
+                # skipping those pairs would leave the control checking nothing.
+                n = min(len(x), len(y))
                 self.assertGreater(
-                    np.abs(x - y).max(),
+                    np.abs(x[:n] - y[:n]).max(),
                     1e-3,
                     f"references for rank {r_a} req {i_a} and rank {r_b} req {i_b} "
                     "are indistinguishable — the invariance assertion cannot fail",
