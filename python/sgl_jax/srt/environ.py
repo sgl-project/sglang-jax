@@ -63,8 +63,8 @@ class Envs:
 
     # gmm_v2 activation (lhs) quantization block along K when the weight scale
     # is per-channel (block-scaled weights always use the weight block). 0 =
-    # kernel default (512). Experiment knob: 128 matches the granularity of the
-    # FP8 block-128 production path.
+    # kernel default (512; 128 for int4 weights, matching the granularity of
+    # the FP8 block-128 production path).
     SGLANG_JAX_GMM_LHS_QBLOCK = EnvInt(0)
 
 
