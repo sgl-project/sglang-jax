@@ -6,6 +6,8 @@ or
     python -m unittest discover -s tests -p "test_*unit.py" -v
 """
 
+import asyncio
+import json
 import unittest
 import uuid
 from typing import Optional
@@ -359,6 +361,220 @@ class ServingChatTestCase(unittest.TestCase):
 
         # Should return None since there's no parser data
         self.assertIsNone(result, "Should return None when parser has no tool call data")
+
+
+_KIMI_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+        },
+    }
+]
+_KIMI_CALL_HEAD = (
+    "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0"
+    "<|tool_call_argument_begin|>"
+)
+_KIMI_CALL_TAIL = "<|tool_call_end|><|tool_calls_section_end|>"
+_KIMI_SECTION = _KIMI_CALL_HEAD + '{"city": "Paris"}' + _KIMI_CALL_TAIL
+
+
+def _kimi_ret(text: str, finish_type: str | None = "stop") -> dict:
+    return {
+        "text": text,
+        "meta_info": {
+            "id": "chatcmpl-kimi",
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "cached_tokens": 0,
+            "finish_reason": {"type": finish_type, "matched": None} if finish_type else None,
+        },
+        "index": 0,
+    }
+
+
+class ServingChatKimiK2TestCase(unittest.TestCase):
+    """`--reasoning-parser kimi_k2 --tool-call-parser kimi_k2` serving behavior."""
+
+    def setUp(self):
+        self.tm = _MockTokenizerManager()
+        self.tm.server_args.reasoning_parser = "kimi_k2"
+        self.tm.server_args.tool_call_parser = "kimi_k2"
+        self.chat = OpenAIServingChat(self.tm, _MockTemplateManager())
+
+    def _request(self, **kwargs) -> ChatCompletionRequest:
+        kwargs.setdefault("messages", [{"role": "user", "content": "Weather in Paris?"}])
+        return ChatCompletionRequest(model="x", tools=_KIMI_TOOLS, **kwargs)
+
+    def _stream(self, request: ChatCompletionRequest, deltas: list[str]):
+        """Run _generate_chat_stream over cumulative outputs; reassemble the client view."""
+
+        async def _generate():
+            text = ""
+            for i, delta in enumerate(deltas):
+                text += delta
+                yield _kimi_ret(text, "stop" if i == len(deltas) - 1 else None)
+
+        async def _collect():
+            self.tm.generate_request = Mock(return_value=_generate())
+            return [c async for c in self.chat._generate_chat_stream(Mock(), request, Mock())]
+
+        reasoning, content, calls = "", "", {}
+        for line in asyncio.run(_collect()):
+            if not line.startswith("data: {"):
+                continue
+            for choice in json.loads(line[len("data: ") :])["choices"]:
+                delta = choice["delta"]
+                reasoning += delta.get("reasoning_content") or ""
+                content += delta.get("content") or ""
+                for tc in delta.get("tool_calls") or []:
+                    call = calls.setdefault(
+                        tc["index"], {"id": None, "name": None, "arguments": ""}
+                    )
+                    call["id"] = call["id"] or tc["id"]
+                    call["name"] = call["name"] or tc["function"]["name"]
+                    call["arguments"] += tc["function"]["arguments"] or ""
+        return reasoning, content, [calls[i] for i in sorted(calls)]
+
+    # ------------- reasoning gate / chat_template_kwargs -------------
+    def test_reasoning_gate_reads_thinking_not_enable_thinking(self):
+        gate = self.chat._get_reasoning_from_request
+        self.assertTrue(gate(self._request()))
+        self.assertFalse(gate(self._request(chat_template_kwargs={"thinking": False})))
+        self.assertTrue(gate(self._request(chat_template_kwargs={"enable_thinking": False})))
+
+    def test_forced_tool_choice_defaults_thinking_off(self):
+        result = MessageProcessingResult("p", [1], None, None, None, [], [])
+        with patch.object(self.chat, "_apply_conversation_template", return_value=result):
+            required = self._request(tool_choice="required")
+            self.chat._process_messages(required, is_multimodal=False)
+            self.assertEqual(required.chat_template_kwargs, {"thinking": False})
+
+            explicit = self._request(
+                tool_choice="required", chat_template_kwargs={"thinking": True}
+            )
+            self.chat._process_messages(explicit, is_multimodal=False)
+            self.assertEqual(explicit.chat_template_kwargs, {"thinking": True})
+
+            auto = self._request(tool_choice="auto")
+            self.chat._process_messages(auto, is_multimodal=False)
+            self.assertIsNone(auto.chat_template_kwargs)
+
+            self.tm.server_args.reasoning_parser = "qwen3"
+            other = self._request(tool_choice="required")
+            self.chat._process_messages(other, is_multimodal=False)
+            self.assertIsNone(other.chat_template_kwargs)
+
+    # ------------- tool-call IDs -------------
+    def test_history_tool_calls_cnt(self):
+        call = {"id": "functions.get_weather:0", "type": "function"}
+        call["function"] = {"name": "get_weather", "arguments": "{}"}
+        request = self._request(
+            messages=[
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": None, "tool_calls": [call, call]},
+                {"role": "tool", "content": "sunny", "tool_call_id": "functions.get_weather:0"},
+                {"role": "assistant", "content": None, "tool_calls": [call]},
+                {"role": "user", "content": "again"},
+            ]
+        )
+        self.assertEqual(self.chat._get_history_tool_calls_cnt(request), 3)
+
+    def test_tool_call_ids_continue_history_counter(self):
+        text = (
+            "<|tool_calls_section_begin|>"
+            '<|tool_call_begin|>functions.get_weather:7<|tool_call_argument_begin|>{"city": "A"}'
+            '<|tool_call_end|><|tool_call_begin|>get_weather:8<|tool_call_argument_begin|>{"city": "B"}'
+            "<|tool_call_end|><|tool_calls_section_end|>"
+        )
+        tools = self._request().tools
+        calls, _, finish = self.chat._process_tool_calls(
+            text, tools, "kimi_k2", {"type": "stop"}, history_tool_calls_cnt=2
+        )
+        self.assertEqual(
+            [c.id for c in calls], ["functions.get_weather:2", "functions.get_weather:3"]
+        )
+        self.assertEqual(finish["type"], "tool_calls")
+
+        self.tm.server_args.tool_call_parser = "qwen25"
+        calls, _, _ = self.chat._process_tool_calls(
+            '<tool_call>\n{"name": "get_weather", "arguments": {}}\n</tool_call>',
+            tools,
+            "qwen25",
+            {"type": "stop"},
+        )
+        self.assertTrue(calls[0].id.startswith("call_"))
+
+    # ------------- non-streaming end to end -------------
+    def test_non_streaming_think_end_after_tool_section(self):
+        request = self._request()
+        response = self.chat._build_chat_response(
+            request, [_kimi_ret("plan" + _KIMI_SECTION + "</think>")], 0
+        )
+        choice = response.choices[0]
+        self.assertEqual(choice.message.reasoning_content, "plan")
+        self.assertIsNone(choice.message.content)
+        self.assertEqual(choice.finish_reason, "tool_calls")
+        self.assertEqual(choice.message.tool_calls[0].id, "functions.get_weather:0")
+        self.assertEqual(
+            json.loads(choice.message.tool_calls[0].function.arguments), {"city": "Paris"}
+        )
+
+    def test_non_streaming_forced_json_fallback(self):
+        # _process_messages already set thinking=False for tool_choice="required".
+        request = self._request(tool_choice="required", chat_template_kwargs={"thinking": False})
+        response = self.chat._build_chat_response(
+            request, [_kimi_ret('[{"name": "get_weather", "parameters": {"city": "Paris"}}]')], 0
+        )
+        choice = response.choices[0]
+        self.assertIsNone(choice.message.reasoning_content)
+        self.assertEqual(choice.finish_reason, "tool_calls")
+        self.assertEqual(choice.message.tool_calls[0].id, "functions.get_weather:0")
+
+    # ------------- streaming end to end -------------
+    def test_streaming_think_end_after_tool_section_per_token(self):
+        deltas = ["pl", "an", "<|tool_calls_section_begin|>", "<|tool_call_begin|>"]
+        deltas += ["functions.get_weather:0", "<|tool_call_argument_begin|>", '{"city": ']
+        deltas += ['"Paris"}', "<|tool_call_end|>", "<|tool_calls_section_end|>", "</think>"]
+        reasoning, content, calls = self._stream(self._request(stream=True), deltas)
+        self.assertEqual((reasoning, content), ("plan", ""))
+        self.assertEqual(
+            calls,
+            [
+                {
+                    "id": "functions.get_weather:0",
+                    "name": "get_weather",
+                    "arguments": '{"city": "Paris"}',
+                }
+            ],
+        )
+
+    def test_streaming_argument_tail_in_final_chunk_is_not_corrupted(self):
+        deltas = ["plan", _KIMI_CALL_HEAD + '{"city": ', '"Paris"}' + _KIMI_CALL_TAIL]
+        _, _, calls = self._stream(self._request(stream=True), deltas)
+        self.assertEqual(json.loads(calls[0]["arguments"]), {"city": "Paris"})
+
+    def test_streaming_whole_call_in_final_chunk_is_not_corrupted(self):
+        _, _, calls = self._stream(self._request(stream=True), ["plan", _KIMI_SECTION])
+        self.assertEqual(json.loads(calls[0]["arguments"]), {"city": "Paris"})
+
+    def test_streaming_thinking_off_and_history_offset(self):
+        call = {"id": "functions.get_weather:0", "type": "function"}
+        call["function"] = {"name": "get_weather", "arguments": '{"city": "Oslo"}'}
+        request = self._request(
+            stream=True,
+            chat_template_kwargs={"thinking": False},
+            messages=[
+                {"role": "user", "content": "Oslo?"},
+                {"role": "assistant", "content": None, "tool_calls": [call]},
+                {"role": "tool", "content": "rain", "tool_call_id": "functions.get_weather:0"},
+                {"role": "user", "content": "Paris?"},
+            ],
+        )
+        reasoning, content, calls = self._stream(request, ["Sure.", _KIMI_SECTION, ""])
+        self.assertEqual((reasoning, content), ("", "Sure."))
+        self.assertEqual(calls[0]["id"], "functions.get_weather:1")
 
 
 if __name__ == "__main__":
