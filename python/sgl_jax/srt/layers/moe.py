@@ -1,6 +1,7 @@
 """GMM-based Expert-Parallel MoE layer and weight mapping utilities."""
 
 import math
+import os
 from functools import partial
 
 import jax
@@ -18,6 +19,7 @@ from sgl_jax.srt.kernels.sparse_core.moe_permute import (
     sc_dispatch_gather,
     should_use_sparse_core,
 )
+from sgl_jax.srt.layers.activation import silu_and_mul_with_clamp
 
 # Re-export for backward compatibility: external code imports from this module.
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE, FusedEPMoEV2  # noqa: F401
@@ -28,6 +30,35 @@ from sgl_jax.srt.utils.quantization.quantization_utils import (
     quantize_tensor,
     quantize_tensor_simple,
 )
+
+_INVERSE_BY_SORT_ENV = os.environ.get("SGL_JAX_MOE_INVERSE_BY_SORT")
+_ACT_ROWS = os.environ.get("SGL_JAX_MOE_ACT_ROWS", "1") == "1"
+_GMM2_NO_ZERO_INIT = os.environ.get("SGL_JAX_MOE_GMM2_NO_ZERO_INIT", "1") == "1"
+_RANK_SORT_MAX_ENTRIES = int(os.environ.get("SGL_JAX_MOE_RANK_SORT_MAX_ENTRIES", "1024"))
+
+
+def _stable_argsort_small(keys):
+    """Match stable argsort for a short expert-ID vector without a sort."""
+    n = int(keys.shape[0])
+    if n > _RANK_SORT_MAX_ENTRIES:
+        return jnp.argsort(keys, stable=True)
+    keys = jnp.asarray(keys, jnp.int32)
+    index = jnp.arange(n, dtype=jnp.int32)
+    before = (keys[None, :] < keys[:, None]) | (
+        (keys[None, :] == keys[:, None]) & (index[None, :] < index[:, None])
+    )
+    rank = jnp.sum(before.astype(jnp.int32), axis=1)
+    return jnp.sum(jnp.where(rank[:, None] == index[None, :], index[:, None], 0), axis=0)
+
+
+def _inverse_permutation_small(perm):
+    """Match argsort for a short permutation vector without a sort."""
+    n = int(perm.shape[0])
+    if n > _RANK_SORT_MAX_ENTRIES:
+        return jnp.argsort(perm).astype(jnp.int32)
+    index = jnp.arange(n, dtype=jnp.int32)
+    perm = jnp.asarray(perm, jnp.int32)
+    return jnp.sum(jnp.where(perm[None, :] == index[:, None], index[None, :], 0), axis=1)
 
 
 class EPMoE(nnx.Module):
@@ -48,8 +79,16 @@ class EPMoE(nnx.Module):
         pre_gather_quant_dtype=None,
         moe_dp_size: int = 1,
         use_sc_permute: bool | None = None,
+        swiglu_limit: float | None = None,
+        sort_free_permute: bool = False,
     ):
         self.num_experts_per_tok = num_experts_per_tok
+        self.sort_free_permute = bool(sort_free_permute)
+        self.inverse_by_sort = (
+            _INVERSE_BY_SORT_ENV == "1"
+            if _INVERSE_BY_SORT_ENV is not None
+            else self.sort_free_permute
+        )
         # Opt-in SparseCore permute/unpermute kernels; ``None`` defers to the env flag.
         self.use_sc_permute = (
             moe_sc_permute_enabled_by_env() if use_sc_permute is None else bool(use_sc_permute)
@@ -73,6 +112,11 @@ class EPMoE(nnx.Module):
         self.original_mesh = mesh
         self.mesh = mesh
         self.activation = activation
+        if swiglu_limit is not None and (
+            activation != "silu" or not math.isfinite(swiglu_limit) or swiglu_limit <= 0
+        ):
+            raise ValueError("swiglu_limit requires silu and a finite positive limit")
+        self.swiglu_limit = swiglu_limit
         self.hidden_size = hidden_size
 
         # Get quantization settings from config
@@ -500,6 +544,16 @@ class EPMoE(nnx.Module):
             ]
         )
         scatter_on_tensor = "tensor" in out_specs
+        # In pure expert parallelism, the model mesh's tensor axis covers the
+        # same devices as this mesh's expert axis. Match the epic V4 sequence-
+        # parallel path by reducing directly into token-sharded output rows.
+        scatter_on_expert = False
+        if self.tp_size == 1 and self.ep_size > 1 and len(out_sharding.spec) > 0:
+            token_axis = out_sharding.spec[0]
+            if token_axis == "tensor" or (isinstance(token_axis, tuple) and "tensor" in token_axis):
+                scatter_on_expert = True
+                out_specs = P("expert", *out_specs[1:])
+                scatter_on_tensor = False
 
         # Run MoE computation on the expert-parallel mesh
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
@@ -525,7 +579,11 @@ class EPMoE(nnx.Module):
             )
 
             result = shard_map(
-                partial(self._forward, scatter_on_tensor=scatter_on_tensor),
+                partial(
+                    self._forward,
+                    scatter_on_tensor=scatter_on_tensor,
+                    scatter_on_expert=scatter_on_expert,
+                ),
                 mesh=self.moe_mesh,
                 in_specs=(
                     P(None),
@@ -629,6 +687,7 @@ class EPMoE(nnx.Module):
         wo_kernel_bias=None,
         *,
         scatter_on_tensor: bool = False,
+        scatter_on_expert: bool = False,
     ):
         expert_shard_id = (
             jnp.array(0, dtype=jnp.int32)
@@ -696,7 +755,10 @@ class EPMoE(nnx.Module):
             else:
                 output = jax.lax.psum(output, "tensor")
         if self.ep_size > 1:
-            output = self._combine(output)
+            if scatter_on_expert:
+                output = jax.lax.psum_scatter(output, "expert", scatter_dimension=0, tiled=True)
+            else:
+                output = self._combine(output)
 
         return output
 
@@ -777,21 +839,36 @@ class EPMoE(nnx.Module):
         )
 
         # === Activation ===
-        if self.activation == "silu":
-            layer_act = jax.nn.silu(layer_w0)
-        elif self.activation == "gelu":
-            layer_act = jax.nn.gelu(layer_w0)
+        if self.swiglu_limit is not None and _ACT_ROWS and local_range is not None:
+            from sgl_jax.srt.kernels.dsv4.moe_act import silu_mul_rows
+
+            intermediate_layer = silu_mul_rows(
+                layer_w0,
+                layer_w1,
+                local_range[0],
+                local_range[1],
+                limit=self.swiglu_limit,
+                interpret=os.environ.get("PALLAS_INTERPRET", "0") == "1",
+            )
+        elif self.swiglu_limit is not None:
+            intermediate_layer = silu_and_mul_with_clamp(layer_w0, layer_w1, self.swiglu_limit)
         else:
-            raise ValueError(f"Unsupported activation function {self.activation}")
-        intermediate_layer = jnp.multiply(layer_act, layer_w1)
+            if self.activation == "silu":
+                layer_act = jax.nn.silu(layer_w0)
+            elif self.activation == "gelu":
+                layer_act = jax.nn.gelu(layer_w0)
+            else:
+                raise ValueError(f"Unsupported activation function {self.activation}")
+            intermediate_layer = jnp.multiply(layer_act, layer_w1)
 
         # === GEMM2: intermediate @ wo ===
+        zero_init = not (_GMM2_NO_ZERO_INIT and local_range is not None and self.use_sc_permute)
         return gmm(
             lhs=intermediate_layer,
             rhs=wo_kernel,
             rhs_scale=wo_kernel_scale,
             rhs_bias=wo_kernel_bias,
-            zero_initialize=True,
+            zero_initialize=zero_init,
             activation_quantized_dtype=act_q_dtype,
             **gmm_kwargs,
         )
@@ -838,7 +915,11 @@ class EPMoE(nnx.Module):
             )
 
         flatten_selected_experts = jnp.ravel(top_k_indices)
-        sorted_selected_experts = jnp.argsort(flatten_selected_experts, stable=True)
+        sorted_selected_experts = (
+            _stable_argsort_small(flatten_selected_experts)
+            if self.sort_free_permute
+            else jnp.argsort(flatten_selected_experts, stable=True)
+        )
         # token_indices: maps each sorted position to the original token index.
         # Pass to _gmm_compute so the gather happens there (indexed_gmm pattern),
         # avoiding a full [M*top_k, D] materialization in _permute.
@@ -879,7 +960,9 @@ class EPMoE(nnx.Module):
                 intermediate = jnp.concatenate([intermediate, padding], axis=0)
 
         argsort_indices = (
-            jnp.zeros(expected_tokens, dtype=jnp.int32)
+            _inverse_permutation_small(sorted_selected_experts)
+            if self.inverse_by_sort
+            else jnp.zeros(expected_tokens, dtype=jnp.int32)
             .at[sorted_selected_experts]
             .set(jnp.arange(expected_tokens, dtype=jnp.int32))
         )

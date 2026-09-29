@@ -359,7 +359,9 @@ def _topk_ids_logical_to_physical_static(
     info: ExpertLocationMetadata,
     layer_id: int = 0,
 ) -> jax.Array:
-    return info.logical_to_rank_dispatch_physical_map[layer_id, topk_ids]
+    return info.logical_to_rank_dispatch_physical_map.at[layer_id, topk_ids].get(
+        out_sharding=topk_ids.sharding
+    )
 
 
 def _topk_ids_logical_to_physical_dynamic(
@@ -367,9 +369,14 @@ def _topk_ids_logical_to_physical_dynamic(
     info: ExpertLocationMetadata,
     layer_id: int = 0,
 ) -> jax.Array:
-    num_valid, selected_expert_replicas = (
-        info.logical_to_all_physical_map_num_valid[layer_id, topk_ids],
-        info.logical_to_all_physical_map[layer_id, topk_ids],
+    replica_sharding = topk_ids.sharding
+    if isinstance(replica_sharding, jax.sharding.NamedSharding):
+        replica_sharding = replica_sharding.update(spec=(*replica_sharding.spec, None))
+    num_valid = info.logical_to_all_physical_map_num_valid.at[layer_id, topk_ids].get(
+        out_sharding=topk_ids.sharding
+    )
+    selected_expert_replicas = info.logical_to_all_physical_map.at[layer_id, topk_ids].get(
+        out_sharding=replica_sharding
     )
 
     rng_key = jax.random.key(0)
