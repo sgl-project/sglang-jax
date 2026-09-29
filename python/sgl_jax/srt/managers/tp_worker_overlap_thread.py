@@ -61,6 +61,9 @@ class ModelWorkerClient:
         # Launch threads
         self.input_queue = Queue()
         self.output_queue = Queue()
+        self._submission_done = threading.Event() if jax.process_count() > 1 else None
+        if self._submission_done is not None:
+            self._submission_done.set()
         # JAX handles device execution automatically, no need for explicit streams
         self.forward_thread = threading.Thread(
             target=self.forward_thread_func,
@@ -144,6 +147,8 @@ class ModelWorkerClient:
                     )
                 self.future_token_ids_map = new_future_map
                 self._wait_pd_prefill_kv_ready()
+                if self._submission_done is not None:
+                    self._submission_done.set()
                 self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
                 continue
 
@@ -182,6 +187,8 @@ class ModelWorkerClient:
             if hasattr(next_token_ids, "copy_to_host_async"):
                 next_token_ids.copy_to_host_async()
             self._wait_pd_prefill_kv_ready()
+            if self._submission_done is not None:
+                self._submission_done.set()
             self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
 
     def _wait_pd_prefill_kv_ready(self):
@@ -297,6 +304,15 @@ class ModelWorkerClient:
             sampling_info_done=threading.Event(),
             penalizer_orchestrator=None,
         )
+
+        # Packed metadata dispatches an unpack JIT on the scheduler thread.
+        # Multi-host JAX requires the same dispatch order on every process, so
+        # do not race the previous batch's model, sampler, future-map, or gather
+        # submissions. launch_done only covers the model forward. This waits
+        # for host submission, not device completion; CPU preparation stays above.
+        if self._submission_done is not None:
+            self._submission_done.wait()
+            self._submission_done.clear()
 
         if sampling_metadata is None:
             sampling_metadata = SamplingMetadata.from_model_worker_batch(
