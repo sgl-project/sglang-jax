@@ -88,8 +88,8 @@ grep -n 'add_argument' python/sgl_jax/srt/server_args.py
 
 | Flag | Default | Choices | Notes |
 |---|---|---|---|
-| `--reasoning-parser` | `None` | `deepseek-r1` / `qwen3` / `mimo` / `kimi` / `glm45` | Splits `<think>` blocks into `reasoning_content` on the OpenAI-compatible response (`ReasoningParser.DetectorMap` in `python/sgl_jax/srt/reasoning_parser.py`). |
-| `--tool-call-parser` | `None` | `qwen25` / `qwen3_coder` / `mimo` / `glm47` / `glm45` | Parses tool/function-call output into `tool_calls` (`FunctionCallParser.ToolCallParserEnum` in `python/sgl_jax/srt/function_call/function_call_parser.py`). |
+| `--reasoning-parser` | `None` | `deepseek-r1` / `qwen3` / `mimo` / `kimi` / `kimi_k2` / `glm45` | Splits `<think>` blocks into `reasoning_content` on the OpenAI-compatible response (`ReasoningParser.DetectorMap` in `python/sgl_jax/srt/reasoning_parser.py`). |
+| `--tool-call-parser` | `None` | `qwen25` / `qwen3_coder` / `mimo` / `glm47` / `glm45` / `kimi_k2` | Parses tool/function-call output into `tool_calls` (`FunctionCallParser.ToolCallParserEnum` in `python/sgl_jax/srt/function_call/function_call_parser.py`). |
 
 **Parser → recipe mapping** (current cookbook coverage):
 
@@ -100,6 +100,7 @@ grep -n 'add_argument' python/sgl_jax/srt/server_args.py
 | `glm45` (reasoning + tool) | [`glm4-moe.md`](../autoregressive/GLM/GLM-4.5.md) (GLM-4.5 / 4.6) |
 | `qwen3` (reasoning), `qwen25` / `qwen3_coder` (tool) | _no Qwen recipe currently sets these — pick by model card on a per-checkpoint basis_ |
 | `kimi` (reasoning) | _no Kimi recipe currently sets this_ |
+| `kimi_k2` (reasoning + tool) | _no Kimi-K2.5 recipe yet_ — launch with `--reasoning-parser kimi_k2 --tool-call-parser kimi_k2`; disable thinking per request with `chat_template_kwargs: {"thinking": false}` |
 
 For complete request/response examples see [`mimo-v2.5-pro.md` §3.2](../autoregressive/Xiaomi/MiMo-V2.5-Pro.md#reasoning-modes) (reasoning streaming) and [§3.3](../autoregressive/Xiaomi/MiMo-V2.5-Pro.md#tool-calling) (tool calling).
 
