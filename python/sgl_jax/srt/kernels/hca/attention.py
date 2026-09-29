@@ -17,6 +17,7 @@ import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.kernels.hca.common import searchsorted_right
 from sgl_jax.srt.kernels.hca.tuned_block_sizes import HCAKernelSchedule
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 
@@ -46,13 +47,66 @@ def _data_out_sharding(rank: int):
     return P("data", *(None for _ in range(rank - 1)))
 
 
-def _cache_layout(cache, head_dim):
+def _cache_layout(cache, head_dim, page_size=None):
+    """Return ``(flat_rows, page_size)`` for a paged cache.
+
+    SWA uses flat rows with an explicit page size. Compressed cache retains its
+    physical 4-D storage; this flat view is used only where row indexing is needed.
+    """
+    if cache.ndim == 2 and page_size is not None:
+        if cache.shape[-1] < head_dim or cache.shape[0] % page_size:
+            raise ValueError(f"flat cache must be [rows*page_size,head_dim], got {cache.shape}")
+        return cache, int(page_size)
     if cache.ndim != 4 or cache.shape[-1] < head_dim:
         raise ValueError(
             f"paged cache must be [pages,page_size/packing,packing,head_dim], got {cache.shape}"
         )
-    page_size = cache.shape[1] * cache.shape[2]
-    return cache.reshape(-1, cache.shape[-1]), page_size
+    shape_page_size = cache.shape[1] * cache.shape[2]
+    if page_size is not None and int(page_size) != shape_page_size:
+        raise ValueError(f"page_size {page_size} disagrees with cache shape {cache.shape}")
+    return cache.reshape(-1, cache.shape[-1]), shape_page_size
+
+
+def _flat_tile_rows(dtype) -> int:
+    """Rows of a flat ``[rows, D]`` HBM cache that share one native tile (8 x 32-bit)."""
+    return 8 * max(1, 4 // jnp.dtype(dtype).itemsize)
+
+
+def _small_page_scratch(cache, page_size: int, head_dim: int):
+    """VMEM staging for one small compressed page.
+
+    A physical 4-D cache stores each page as its own tile, so one page is DMA'd
+    whole. The internal flat staging path must instead load an aligned tile
+    and select the requested rows in VMEM.
+    """
+    if cache.ndim == 4:
+        return pltpu.VMEM((min(page_size, 2), head_dim), jnp.bfloat16)
+    rows = _flat_tile_rows(cache.dtype)
+    if cache.shape[0] < rows or cache.shape[0] % rows:
+        raise ValueError(f"flat compressed cache requires a row count divisible by {rows}")
+    return pltpu.VMEM((rows, head_dim), cache.dtype)
+
+
+def _load_small_page(cache_ref, physical_page, page_ref, semaphore, *, page_size):
+    """Fetch one small page into VMEM and return its ``[page_size, D]`` rows."""
+    if len(cache_ref.shape) == 4:
+        transfer = pltpu.make_async_copy(cache_ref.at[physical_page, 0], page_ref, semaphore)
+        transfer.start()
+        transfer.wait()
+        return page_ref[...]
+    rows = page_ref.shape[0]
+    first = physical_page * page_size
+    # The flat-cache contract guarantees a full aligned tile, including at the tail.
+    start = pl.multiple_of((first // rows) * rows, rows)
+    transfer = pltpu.make_async_copy(cache_ref.at[pl.ds(start, rows)], page_ref, semaphore)
+    transfer.start()
+    transfer.wait()
+    offset = first - start
+    out_rows = jax.lax.broadcasted_iota(jnp.int32, (page_size, rows), 0)
+    in_rows = jax.lax.broadcasted_iota(jnp.int32, (page_size, rows), 1)
+    select = (in_rows == out_rows + offset).astype(jnp.float32)
+    picked = jnp.dot(select, page_ref[...].astype(jnp.float32), preferred_element_type=jnp.float32)
+    return picked.astype(page_ref.dtype)
 
 
 def _page_table_locations(
@@ -113,19 +167,95 @@ def _gather_physical_rows(flat_cache, locations, valid, head_dim):
     return jnp.where(valid[..., None], selected, 0)
 
 
-def _scatter_physical_rows(flat_cache, locations, values, valid):
-    safe = jnp.where(valid, locations, flat_cache.shape[0]).astype(jnp.int32).reshape(-1)
+def _prepare_cache_updates(cache, locations, values, valid, max_rows, invalid_location):
+    """Compact live updates before writing, without changing the cache layout."""
+    valid = jnp.asarray(valid, jnp.bool_).reshape(-1)
+    locations = jnp.asarray(locations).reshape(-1)
     values = values.reshape(-1, values.shape[-1])
+    if max_rows is not None and max_rows < valid.shape[0]:
+        (picked,) = jnp.nonzero(valid, size=int(max_rows), fill_value=valid.shape[0])
+        keep = picked < valid.shape[0]
+        picked = jnp.minimum(picked, valid.shape[0] - 1)
+        locations = jnp.where(keep, locations[picked], invalid_location)
+        values = values[picked]
+        valid = keep
     padded = jnp.pad(
-        values.astype(flat_cache.dtype),
-        ((0, 0), (0, flat_cache.shape[-1] - values.shape[-1])),
+        values.astype(cache.dtype),
+        ((0, 0), (0, cache.shape[-1] - values.shape[-1])),
     )
+    return locations, padded, valid
+
+
+def _scatter_physical_rows(flat_cache, locations, values, valid, *, schedule, max_rows=None):
+    """Masked row scatter. ``max_rows``: a static bound on the number of valid rows;
+    when it is well below the candidate count the valid rows are compacted first,
+    so the scatter only carries rows that will land (XLA's scatter cost follows the
+    update count, not the mask; a ragged 8K chunk commits about 128 window rows and
+    64 compressed records out of 8192 candidates each)."""
+    locations, padded, valid = _prepare_cache_updates(
+        flat_cache, locations, values, valid, max_rows, flat_cache.shape[0]
+    )
+    if (
+        flat_cache.ndim == 2
+        and flat_cache.dtype == jnp.bfloat16
+        and _data_out_sharding(flat_cache.ndim) is None
+    ):
+        # Use run DMA for contiguous rows and tile read-modify-write for scattered rows.
+        from sgl_jax.srt.kernels.dsv4.paged_row_write import paged_row_write
+
+        return paged_row_write(
+            flat_cache,
+            padded,
+            locations.astype(jnp.int32),
+            valid,
+            run=schedule.row_write_run,
+            interpret=_get_interpret(),
+        )
+    safe = jnp.where(valid, locations, flat_cache.shape[0]).astype(jnp.int32)
     update = flat_cache.at[safe]
     kwargs = {"mode": "drop", "wrap_negative_indices": False}
     out_sharding = _data_out_sharding(flat_cache.ndim)
     if out_sharding is not None:
         kwargs["out_sharding"] = out_sharding
     return update.set(padded, **kwargs)
+
+
+def _packed_swa_start(query_start, request, window_size, row_alignment):
+    # Reserve one alignment tile per request so rounding cannot overlap segments.
+    return (query_start // row_alignment) * row_alignment + request * (window_size + row_alignment)
+
+
+def _pack_chunk_kv(history, new_kv, cu_q_lens, query_seq_ids, valid_token_mask):
+    """Stage history and packed queries in O(T + B * window) rows, not O(B * T)."""
+    from sgl_jax.srt.kernels.dsv4.paged_row_write import paged_row_write
+
+    batch, window_size, head_dim = history.shape
+    alignment = _flat_tile_rows(jnp.bfloat16)
+    tokens = new_kv.shape[0]
+    rows = _align(tokens + batch * (window_size + alignment), alignment)
+    if batch == 1:
+        # No request routing is needed for one contiguous segment.
+        return jnp.concatenate(
+            (
+                history[0],
+                jnp.where(valid_token_mask[:, None], new_kv, 0),
+                jnp.zeros((rows - window_size - tokens, head_dim), new_kv.dtype),
+            )
+        )
+    starts = _packed_swa_start(
+        cu_q_lens[:-1], jnp.arange(batch, dtype=jnp.int32), window_size, alignment
+    )
+    history_rows = (starts[:, None] + jnp.arange(window_size, dtype=jnp.int32)).reshape(-1)
+    local = jnp.arange(tokens, dtype=jnp.int32) - cu_q_lens[query_seq_ids]
+    destinations = starts[query_seq_ids] + window_size + local
+    return paged_row_write(
+        jnp.zeros((rows, head_dim), jnp.bfloat16),
+        jnp.concatenate((history.reshape(-1, head_dim), new_kv)),
+        jnp.concatenate((history_rows, destinations)),
+        jnp.concatenate((jnp.ones(history_rows.shape, jnp.bool_), valid_token_mask)),
+        run=window_size,
+        interpret=_get_interpret(),
+    )
 
 
 def _commit_window_rows(
@@ -140,6 +270,7 @@ def _commit_window_rows(
     *,
     window_size,
     page_size,
+    schedule,
 ):
     """Write each token's KV into its sliding-window ring slot.
 
@@ -157,7 +288,14 @@ def _commit_window_rows(
         sequence_ids=query_seq_ids,
     )
     final_window = valid & (positions >= seq_lens[query_seq_ids] - window_size)
-    return _scatter_physical_rows(window_flat, locations, new_kv, final_window)
+    return _scatter_physical_rows(
+        window_flat,
+        locations,
+        new_kv,
+        final_window,
+        max_rows=int(seq_lens.shape[0]) * int(window_size),
+        schedule=schedule,
+    )
 
 
 def _write_cache_rows_kernel(
@@ -205,6 +343,25 @@ def _write_cache_rows_kernel(
             store.wait()
 
 
+def _scatter_compressed_pages(cache, locations, values, valid, *, max_rows=None):
+    """`_scatter_physical_rows` straight into a physical ``[pages, 1, k, D]`` cache.
+
+    Flattening the physical cache to ``[rows, D]`` and back changes its tile layout,
+    so XLA copied the whole compressed pool twice per layer around the scatter (the
+    second copy is the ``compressed_cache_hbm_ref`` operand copy in profiles). The
+    same rows land at ``[loc // k, 0, loc % k, :]`` with no relayout.
+    """
+    records = cache.shape[1] * cache.shape[2]
+    locations, padded, valid = _prepare_cache_updates(cache, locations, values, valid, max_rows, 0)
+    page = jnp.where(valid, locations // records, cache.shape[0]).astype(jnp.int32)
+    record = jnp.where(valid, locations % records, 0).astype(jnp.int32)
+    kwargs = {"mode": "drop"}
+    sharding = _data_out_sharding(cache.ndim)
+    if sharding is not None:
+        kwargs["out_sharding"] = sharding
+    return cache.at[page, 0, record, :].set(padded, **kwargs)
+
+
 @functools.partial(jax.jit, static_argnames=("schedule",))
 def _write_cache_rows(cache, locations, values, valid, *, schedule: HCAKernelSchedule):
     """Return ``cache`` after aliased writes, without copying untouched pages."""
@@ -247,6 +404,126 @@ def _write_cache_rows(cache, locations, values, valid, *, schedule: HCAKernelSch
     )(locations, valid, values, cache)
 
 
+def _gather_small_compressed_pages(
+    cache_ref,
+    page_indices_ref,
+    page_start,
+    record_count,
+    block,
+    destination,
+    page_ref,
+    semaphore,
+    *,
+    page_size,
+    compressed_tile,
+):
+    """Load C1's 1/2-record pages through a whole-page VMEM scratch buffer.
+
+    Mosaic cannot DMA a one-row slice of a normally tiled attention matrix.
+    A whole small buffer has its own padded tile layout; insert its values
+    with VPU operations after the DMA rather than slicing the larger VMEM
+    tile. No request-major compressed-history staging is written to HBM.
+    """
+    destination[...] = jnp.zeros(destination.shape, destination.dtype)
+    pages_per_tile = compressed_tile // page_size
+    count = jnp.minimum(
+        pl.cdiv(jnp.maximum(record_count - block * compressed_tile, 0), page_size),
+        pages_per_tile,
+    )
+
+    def copy_page(page, _):
+        physical_page = page_indices_ref[page_start + block * pages_per_tile + page]
+        page_rows = _load_small_page(
+            cache_ref, physical_page, page_ref, semaphore, page_size=page_size
+        )
+        rows = jax.lax.broadcasted_iota(jnp.int32, destination.shape, 0)
+        values = jnp.tile(page_rows, (pages_per_tile, 1))
+        destination[...] = jnp.where(rows // page_size == page, values, destination[...])
+        return ()
+
+    jax.lax.fori_loop(0, count, copy_page, ())
+
+
+def _gather_small_incremental(
+    cache_ref,
+    page_indices_ref,
+    page_start,
+    record_count,
+    destination,
+    page_ref,
+    semaphore,
+    state_ref,
+    request,
+    *,
+    page_size,
+    compressed_tile,
+):
+    """Single-tile ``_gather_small_compressed_pages`` that persists across grid steps.
+
+    ``state_ref`` is SMEM ``[request, rows_loaded]``.  For a query block of the
+    same request only records ``[rows_loaded, count)`` are fetched; the caller
+    zeroes the tile and this resets the counter when the request changes.
+    """
+    pages_per_tile = compressed_tile // page_size
+
+    @pl.when(state_ref[0] != request)
+    def _reset():
+        state_ref[0] = request
+        state_ref[1] = jnp.int32(0)
+
+    loaded = state_ref[1]
+    count = jnp.minimum(pl.cdiv(record_count, page_size), pages_per_tile)
+
+    def copy_page(page, _):
+        physical_page = page_indices_ref[page_start + page]
+        page_rows = _load_small_page(
+            cache_ref, physical_page, page_ref, semaphore, page_size=page_size
+        )
+        rows = jax.lax.broadcasted_iota(jnp.int32, destination.shape, 0)
+        values = jnp.tile(page_rows, (pages_per_tile, 1))
+        destination[...] = jnp.where(rows // page_size == page, values, destination[...])
+        return ()
+
+    jax.lax.fori_loop(loaded, count, copy_page, ())
+    state_ref[1] = jnp.maximum(loaded, count)
+
+
+def _dense_compressed_view(
+    compressed_flat,
+    page_indices,
+    page_starts,
+    lens,
+    *,
+    head_dim,
+    page_size,
+    tile,
+    sublanes,
+):
+    """Stage small pages as request-major tiles to amortize per-page DMA.
+
+    Returns ``(cache, page_indices, page_starts, page_size)``; sublane-sized pages
+    pass through. The backend sizes ``tile`` to cover each request's record count.
+    """
+    if page_size >= sublanes:
+        return compressed_flat, page_indices, page_starts, page_size
+    batch = page_starts.shape[0]
+    record = jnp.arange(tile, dtype=jnp.int32)[None, :]
+    table_locs = page_starts.astype(jnp.int32)[:, None] + record // page_size
+    valid = (record < lens.astype(jnp.int32)[:, None]) & (table_locs < page_indices.shape[0])
+    safe_locs = jnp.where(valid, table_locs, 0)
+    page_ref = page_indices.at[safe_locs]
+    out_sharding = _data_out_sharding(2)
+    if out_sharding is None:
+        pages = page_ref.get(mode="promise_in_bounds")
+    else:
+        pages = page_ref.get(mode="promise_in_bounds", out_sharding=out_sharding)
+    rows = pages.astype(jnp.int32) * page_size + record % page_size
+    valid = valid & (pages > 0) & (rows < compressed_flat.shape[0])
+    dense = _gather_physical_rows(compressed_flat, rows, valid, head_dim)
+    requests = jnp.arange(batch, dtype=jnp.int32)
+    return dense.reshape(batch * tile, head_dim), requests, requests, tile
+
+
 def _streaming_attention_kernel(
     compressed_page_indices_ref,
     compressed_page_starts_ref,
@@ -262,25 +539,26 @@ def _streaming_attention_kernel(
     m_ref,
     l_ref,
     acc_ref,
+    small_page_ref,
+    small_page_semaphore,
     *,
     pages_per_block: int,
     page_size: int,
     tile_k: int,
     compressed_tile: int,
     softmax_scale: float,
+    rows_per_step: int,
 ):
-    """One FlashAttention-style program over SWA then compressed HCA tiles."""
+    """FlashAttention-style programs over SWA then compressed HCA tiles, ``rows_per_step``
+    decode rows per grid step with all rows' compressed DMAs in flight together."""
     head_dim = q_ref.shape[2]
-    q = q_ref[0, ...].astype(jnp.bfloat16)
     sink = attention_sink_ref[...].astype(jnp.float32)[:, None]
     # Compute SWA without the virtual sink, round its unnormalised numerator to BF16
     # at the SWA/compressed-cache boundary, and add the sink to the final denominator.
     negative_finite = jnp.finfo(jnp.float32).min
-    m_ref[...] = jnp.full(m_ref.shape, negative_finite, jnp.float32)
-    l_ref[...] = jnp.zeros(l_ref.shape, jnp.float32)
-    acc_ref[...] = jnp.zeros(acc_ref.shape, jnp.float32)
 
-    def consume(kv, valid):
+    def consume(r, q, kv, valid):
+        m_row, l_row, acc_row = m_ref.at[r], l_ref.at[r], acc_ref.at[r]
         scores = jax.lax.dot_general(
             q,
             kv.astype(jnp.bfloat16),
@@ -289,39 +567,52 @@ def _streaming_attention_kernel(
         ) * jnp.float32(softmax_scale)
         scores = jnp.where(valid[None, :], scores, negative_finite)
         block_maximum = jnp.max(scores, axis=1, keepdims=True)
-        previous_maximum = m_ref[...][:, :1]
+        previous_maximum = m_row[...][:, :1]
         next_maximum = jnp.maximum(previous_maximum, block_maximum)
         alpha = jnp.exp(previous_maximum - next_maximum)
         probabilities = jnp.exp(scores - next_maximum)
-        next_denominator = alpha * l_ref[...][:, :1] + jnp.sum(probabilities, axis=1, keepdims=True)
+        next_denominator = alpha * l_row[...][:, :1] + jnp.sum(probabilities, axis=1, keepdims=True)
         value = jax.lax.dot_general(
             probabilities,
             kv.astype(jnp.bfloat16),
             (((1,), (0,)), ((), ())),
             preferred_element_type=jnp.float32,
         )
-        acc_ref[...] = alpha * acc_ref[...] + value
-        m_ref[...] = jnp.broadcast_to(next_maximum, m_ref.shape)
-        l_ref[...] = jnp.broadcast_to(next_denominator, l_ref.shape)
+        acc_row[...] = alpha * acc_row[...] + value
+        m_row[...] = jnp.broadcast_to(next_maximum, m_row.shape)
+        l_row[...] = jnp.broadcast_to(next_denominator, l_row.shape)
 
-    token = pl.program_id(0)
-    window_len = window_len_ref[0, 0, 0]
-    # Decode splits its ring by lane width, independently of the chunk path's
-    # ``swa_compute_tile``; two 64-row blocks fix the reduction order.
-    swa_tile = tile_k // 2
-    window_valid = jnp.arange(tile_k, dtype=jnp.int32) < window_len
-    consume(window_kv_ref[0, :swa_tile], window_valid[:swa_tile])
-    consume(window_kv_ref[0, swa_tile:], window_valid[swa_tile:])
-    acc_ref[...] = acc_ref[...].astype(jnp.bfloat16).astype(jnp.float32)
+    step = pl.program_id(0)
+    tokens = [step * rows_per_step + r for r in range(rows_per_step)]
+    compressed_lens = [compressed_lens_ref[token] for token in tokens]
+    compressed_page_starts = [compressed_page_starts_ref[token] for token in tokens]
+    num_blocks = [pl.cdiv(length, compressed_tile) for length in compressed_lens]
+    max_blocks = functools.reduce(jnp.maximum, num_blocks)
+    if page_size < 8:
+        cache_rows = None
+    elif len(compressed_cache_hbm_ref.shape) == 2:
+        cache_rows = compressed_cache_hbm_ref
+    else:
+        cache_rows = compressed_cache_hbm_ref.reshape(-1, head_dim)
 
-    compressed_len = compressed_lens_ref[token]
-    compressed_page_start = compressed_page_starts_ref[token]
-    num_blocks = pl.cdiv(compressed_len, compressed_tile)
-    cache_rows = compressed_cache_hbm_ref.reshape(-1, head_dim)
-
-    def fetch(block, buffer, *, wait):
-        semaphore = dma_semaphores.at[buffer]
-        kv_buffer = compressed_kv_x2_ref.at[buffer]
+    def fetch(r, block, buffer, *, wait):
+        if page_size < 8:
+            if not wait:
+                _gather_small_compressed_pages(
+                    compressed_cache_hbm_ref,
+                    compressed_page_indices_ref,
+                    compressed_page_starts[r],
+                    compressed_lens[r],
+                    block,
+                    compressed_kv_x2_ref.at[r, buffer],
+                    small_page_ref,
+                    small_page_semaphore,
+                    page_size=page_size,
+                    compressed_tile=compressed_tile,
+                )
+            return
+        semaphore = dma_semaphores.at[r, buffer]
+        kv_buffer = compressed_kv_x2_ref.at[r, buffer]
         if wait:
             destination = kv_buffer.at[pl.ds(0, compressed_tile)]
             pltpu.make_async_copy(destination, destination, semaphore).wait()
@@ -329,7 +620,7 @@ def _streaming_attention_kernel(
         for page_in_block in range(pages_per_block):
             logical_page = block * pages_per_block + page_in_block
             table_location = jnp.minimum(
-                compressed_page_start + logical_page,
+                compressed_page_starts[r] + logical_page,
                 compressed_page_indices_ref.shape[0] - 1,
             )
             physical_page = compressed_page_indices_ref[table_location]
@@ -339,35 +630,70 @@ def _streaming_attention_kernel(
                 semaphore,
             ).start()
 
-    @pl.when(num_blocks > 0)
-    def _start_first_block():
-        fetch(0, 0, wait=False)
+    # Every row's first compressed tile is in flight before any SWA math or wait.
+    for r in range(rows_per_step):
 
-    def consume_compressed(block, buffer):
-        fetch(block, buffer, wait=True)
+        @pl.when(num_blocks[r] > 0)
+        def _start_first_block(r=r):
+            fetch(r, 0, 0, wait=False)
+
+    # Decode splits its ring by lane width, independently of the chunk path's
+    # ``swa_compute_tile``; two 64-row blocks fix the reduction order.
+    swa_tile = tile_k // 2
+    for r in range(rows_per_step):
+        m_ref[r] = jnp.full(m_ref.shape[1:], negative_finite, jnp.float32)
+        l_ref[r] = jnp.zeros(l_ref.shape[1:], jnp.float32)
+        acc_ref[r] = jnp.zeros(acc_ref.shape[1:], jnp.float32)
+        q = q_ref[r].astype(jnp.bfloat16)
+        window_len = window_len_ref[r, 0, 0]
+        window_valid = jnp.arange(tile_k, dtype=jnp.int32) < window_len
+        consume(r, q, window_kv_ref[r, :swa_tile], window_valid[:swa_tile])
+        consume(r, q, window_kv_ref[r, swa_tile:], window_valid[swa_tile:])
+        acc_ref[r] = acc_ref[r].astype(jnp.bfloat16).astype(jnp.float32)
+
+    def consume_compressed(block, carry):
+        buffer = block % 2
         next_block = block + 1
         next_buffer = jnp.bitwise_xor(buffer, 1)
+        # Waits and prefetches stay per-row scalar branches; the tile maths is
+        # branch-free straight-line code over the rows so the scheduler can overlap
+        # one row's MXU passes with another's softmax bookkeeping. A row without this
+        # block consumes its (stale, finite-or-not) buffer fully masked: the keys are
+        # zeroed where invalid so nothing reaches the accumulator.
+        for r in range(rows_per_step):
 
-        @pl.when(next_block < num_blocks)
-        def _start_next_block():
-            fetch(next_block, next_buffer, wait=False)
+            @pl.when(block < num_blocks[r])
+            def _wait_row(r=r):
+                fetch(r, block, buffer, wait=True)
 
-        valid = block * compressed_tile + jnp.arange(compressed_tile, dtype=jnp.int32)
-        consume(compressed_kv_x2_ref[buffer, ...], valid < compressed_len)
-        return next_buffer
+            @pl.when(next_block < num_blocks[r])
+            def _start_next_block(r=r):
+                fetch(r, next_block, next_buffer, wait=False)
 
-    jax.lax.fori_loop(0, num_blocks, consume_compressed, jnp.int32(0), unroll=False)
+        for r in range(rows_per_step):
+            valid = (
+                block * compressed_tile + jnp.arange(compressed_tile, dtype=jnp.int32)
+            ) < compressed_lens[r]
+            kv = compressed_kv_x2_ref[r, buffer]
+            # 2-D mask from a 2-D iota: Mosaic cannot reshape a 1-D i1 vector to [tile, 1].
+            row_ids = jax.lax.broadcasted_iota(jnp.int32, kv.shape, 0)
+            kv_valid = (block * compressed_tile + row_ids) < compressed_lens[r]
+            kv = jnp.where(kv_valid, kv, jnp.zeros_like(kv))
+            consume(r, q_ref[r].astype(jnp.bfloat16), kv, valid)
 
-    sink_term = jnp.exp(sink - m_ref[...][:, :1])
-    denominator = l_ref[...][:, :1] + sink_term
-    out_ref[...] = (acc_ref[...] * pl.reciprocal(denominator, approx=True)).astype(jnp.bfloat16)[
-        None, ...
-    ]
+        return carry
+
+    jax.lax.fori_loop(0, max_blocks, consume_compressed, jnp.int32(0), unroll=False)
+
+    for r in range(rows_per_step):
+        sink_term = jnp.exp(sink - m_ref[r][:, :1])
+        denominator = l_ref[r][:, :1] + sink_term
+        out_ref[r] = (acc_ref[r] * pl.reciprocal(denominator, approx=True)).astype(jnp.bfloat16)
 
 
 @functools.partial(
     jax.jit,
-    static_argnames=("softmax_scale", "interpret", "schedule"),
+    static_argnames=("softmax_scale", "interpret", "compressed_page_size", "schedule"),
 )
 def _streaming_attention(
     q,
@@ -382,10 +708,20 @@ def _streaming_attention(
     schedule: HCAKernelSchedule,
     softmax_scale: float,
     interpret: bool | None = None,
+    compressed_page_size: int | None = None,
 ):
-    """Stream both HCA segments through one Pallas online-softmax program."""
-    if q.ndim != 3 or window_rows.ndim != 3 or compressed_cache.ndim != 4:
-        raise ValueError("q/window/cache must be [T,H,D]/[T,K,D]/physical 4D")
+    """Stream both HCA segments through one Pallas online-softmax program.
+
+    ``compressed_cache`` is the physical 4D cache, or a flat ``[rows, D]`` cache
+    with ``compressed_page_size`` rows per page for internal dense staging.
+    """
+    if q.ndim != 3 or window_rows.ndim != 3:
+        raise ValueError("q/window must be [T,H,D]/[T,K,D]")
+    if compressed_cache.ndim == 2:
+        if compressed_page_size is None or compressed_page_size < 1:
+            raise ValueError("a flat compressed cache needs compressed_page_size")
+    elif compressed_cache.ndim != 4:
+        raise ValueError("compressed cache must be physical 4D or flat [rows, D]")
     tokens, heads, head_dim = q.shape
     if q.dtype != jnp.bfloat16:
         raise ValueError("HCA streaming query must be BF16")
@@ -409,18 +745,42 @@ def _streaming_attention(
         raise ValueError("SWA rows must fit one reduction tile")
 
     padded_heads = _align(heads, schedule.sublanes)
-    page_size = compressed_cache.shape[1] * compressed_cache.shape[2]
+    if compressed_cache.ndim == 2:
+        page_size = int(compressed_page_size)
+    else:
+        page_size = compressed_cache.shape[1] * compressed_cache.shape[2]
     if compressed_tile % page_size:
         raise ValueError("physical cache page_size must divide the compressed tile")
     pages_per_block = compressed_tile // page_size
-    q = jnp.pad(q, ((0, 0), (0, padded_heads - heads), (0, 0)))
-    # The native 128-row path pads the final reduction block on the right.
-    if window_rows.shape[1] < tile_k:
-        window_rows = jnp.pad(
-            window_rows,
-            ((0, 0), (0, tile_k - window_rows.shape[1]), (0, 0)),
+    # The small-page gather keeps its single whole-page scratch: one row per step.
+    rows_per_step = (
+        1
+        if page_size < 8
+        else schedule.stream_rows_per_step(
+            tokens,
+            head_dim,
+            jnp.dtype(compressed_cache.dtype).itemsize,
+            padded_heads,
+            max(tile_k, window_rows.shape[1]),
+            (
+                min(page_size, 2)
+                if compressed_cache.ndim == 4
+                else _flat_tile_rows(compressed_cache.dtype)
+            ),
         )
+    )
+    padded_tokens = -(-tokens // rows_per_step) * rows_per_step
+    q = jnp.pad(q, ((0, padded_tokens - tokens), (0, padded_heads - heads), (0, 0)))
+    # The native 128-row path pads the final reduction block on the right.
+    window_rows = jnp.pad(
+        window_rows,
+        ((0, padded_tokens - tokens), (0, max(0, tile_k - window_rows.shape[1])), (0, 0)),
+    )
     swa_rows = window_rows.shape[1]
+    row_pad = (0, padded_tokens - tokens)
+    window_lens = jnp.pad(window_lens.astype(jnp.int32), row_pad)
+    compressed_lens = jnp.pad(compressed_lens.astype(jnp.int32), row_pad)
+    compressed_page_starts = jnp.pad(compressed_page_starts.astype(jnp.int32), row_pad)
     attention_sink = jnp.pad(
         attention_sink.astype(jnp.float32),
         (0, padded_heads - heads),
@@ -431,8 +791,8 @@ def _streaming_attention(
 
     scalar_prefetches = (
         compressed_page_indices.astype(jnp.int32),
-        compressed_page_starts.astype(jnp.int32),
-        compressed_lens.astype(jnp.int32),
+        compressed_page_starts,
+        compressed_lens,
     )
     output = pl.pallas_call(
         functools.partial(
@@ -442,51 +802,59 @@ def _streaming_attention(
             tile_k=tile_k,
             compressed_tile=compressed_tile,
             softmax_scale=float(softmax_scale),
+            rows_per_step=rows_per_step,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=len(scalar_prefetches),
-            grid=(tokens,),
+            grid=(padded_tokens // rows_per_step,),
             in_specs=(
-                pl.BlockSpec((1, padded_heads, head_dim), lambda token, *_: (token, 0, 0)),
-                pl.BlockSpec((1, swa_rows, head_dim), lambda token, *_: (token, 0, 0)),
                 pl.BlockSpec(
-                    (1, schedule.sublanes, schedule.mxu_lanes),
-                    lambda token, *_: (token, 0, 0),
+                    (rows_per_step, padded_heads, head_dim), lambda step, *_: (step, 0, 0)
+                ),
+                pl.BlockSpec((rows_per_step, swa_rows, head_dim), lambda step, *_: (step, 0, 0)),
+                pl.BlockSpec(
+                    (rows_per_step, schedule.sublanes, schedule.mxu_lanes),
+                    lambda step, *_: (step, 0, 0),
                 ),
                 pl.BlockSpec(memory_space=pltpu.HBM),
-                pl.BlockSpec((padded_heads,), lambda token, *_: (0,)),
+                pl.BlockSpec((padded_heads,), lambda step, *_: (0,)),
             ),
-            out_specs=pl.BlockSpec((1, padded_heads, head_dim), lambda token, *_: (token, 0, 0)),
+            out_specs=pl.BlockSpec(
+                (rows_per_step, padded_heads, head_dim), lambda step, *_: (step, 0, 0)
+            ),
             scratch_shapes=(
-                pltpu.VMEM((2, compressed_tile, head_dim), compressed_cache.dtype),
-                pltpu.SemaphoreType.DMA((2,)),
-                pltpu.VMEM((padded_heads, schedule.mxu_lanes), jnp.float32),
-                pltpu.VMEM((padded_heads, schedule.mxu_lanes), jnp.float32),
-                pltpu.VMEM((padded_heads, head_dim), jnp.float32),
+                pltpu.VMEM((rows_per_step, 2, compressed_tile, head_dim), compressed_cache.dtype),
+                pltpu.SemaphoreType.DMA((rows_per_step, 2)),
+                pltpu.VMEM((rows_per_step, padded_heads, schedule.mxu_lanes), jnp.float32),
+                pltpu.VMEM((rows_per_step, padded_heads, schedule.mxu_lanes), jnp.float32),
+                pltpu.VMEM((rows_per_step, padded_heads, head_dim), jnp.float32),
+                _small_page_scratch(compressed_cache, page_size, head_dim),
+                pltpu.SemaphoreType.DMA,
             ),
         ),
-        out_shape=jax.ShapeDtypeStruct((tokens, padded_heads, head_dim), jnp.bfloat16),
+        out_shape=jax.ShapeDtypeStruct((padded_tokens, padded_heads, head_dim), jnp.bfloat16),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel",),
             disable_bounds_checks=True,
+            vmem_limit_bytes=schedule.vmem_budget_bytes,
         ),
         interpret=interpret,
         name=(
             f"hca-paged-stream-swa{tile_k}-hca{compressed_tile}"
-            f"-p{page_size}-h{padded_heads}-d{head_dim}"
+            f"-p{page_size}-h{padded_heads}-d{head_dim}-r{rows_per_step}"
         ),
     )(
         *scalar_prefetches,
         q,
         window_rows,
         jnp.broadcast_to(
-            window_lens.astype(jnp.int32)[:, None, None],
-            (tokens, schedule.sublanes, schedule.mxu_lanes),
+            window_lens[:, None, None],
+            (padded_tokens, schedule.sublanes, schedule.mxu_lanes),
         ),
         compressed_cache,
         attention_sink,
     )
-    return output[:, :heads]
+    return output[:tokens, :heads]
 
 
 def _chunk_attention_kernel(
@@ -513,6 +881,10 @@ def _chunk_attention_kernel(
     m_ref,
     l_ref,
     acc_ref,
+    small_page_ref,
+    small_page_semaphore,
+    small_page_state_ref,
+    swa_state_ref,
     *,
     queries_per_block: int,
     compressed_tile: int,
@@ -524,6 +896,7 @@ def _chunk_attention_kernel(
     swa_compute_tile: int,
     sublanes: int,
     may_cross_end: bool,
+    packed_swa: bool = False,
 ):
     """Request-level ragged HCA using TPU's production q/KV tile schedule."""
     # dma_semaphores: [0,1] SWA double buffer, [2] compressed, [3] output,
@@ -634,6 +1007,9 @@ def _chunk_attention_kernel(
     # ``combined_kv`` holds the previous 128 logical rows then the current chunk.
     # Start at the first real row: masking leading rows would shift reduction bounds.
     swa_start = jnp.maximum(query_base + 1, 128 - prefix_len)
+    swa_alignment = _flat_tile_rows(jnp.bfloat16)
+    # Align the BF16 source; the window mask drops any extra leading rows.
+    swa_start = (swa_start // swa_alignment) * swa_alignment
     swa_end = jnp.minimum(128 + query_base + queries_per_block, 128 + q_len)
     num_half_blocks = jnp.where(
         valid_query_block,
@@ -642,36 +1018,44 @@ def _chunk_attention_kernel(
     )
     num_swa_blocks = pl.cdiv(num_half_blocks, 2)
 
-    def fetch_swa(block, buffer, *, wait):
-        semaphore = dma_semaphores.at[buffer]
-        destination = swa_kv_x2_ref.at[buffer]
-        if wait:
-            pltpu.make_async_copy(destination, destination, semaphore).wait()
-        else:
-            row = swa_start + block * swa_dma_tile
-            pltpu.make_async_copy(
-                combined_kv_hbm_ref.at[request, pl.ds(row, swa_dma_tile)],
-                destination,
-                semaphore,
-            ).start()
+    # A single compute tile can slide inside a larger resident DMA slab.
+    reuse_swa = 128 + queries_per_block + swa_alignment - 1 <= swa_compute_tile
 
-    @pl.when(num_swa_blocks > 0)
+    def start_swa_slab(owner, row, buffer):
+        row = pl.multiple_of(row, swa_alignment)
+        if packed_swa:
+            start = _packed_swa_start(cu_q_lens_ref[owner], owner, 128, swa_alignment)
+            source = combined_kv_hbm_ref.at[pl.ds(start + row, swa_dma_tile)]
+        else:
+            source = combined_kv_hbm_ref.at[owner, pl.ds(row, swa_dma_tile)]
+        pltpu.make_async_copy(source, swa_kv_x2_ref.at[buffer], dma_semaphores.at[buffer]).start()
+
+    def wait_swa_slab(buffer):
+        destination = swa_kv_x2_ref.at[buffer]
+        pltpu.make_async_copy(destination, destination, dma_semaphores.at[buffer]).wait()
+
+    def swa_hit(owner, row):
+        return (
+            (swa_state_ref[0] == owner)
+            & (row >= swa_state_ref[1])
+            & (row + swa_compute_tile <= swa_state_ref[1] + swa_dma_tile)
+        )
+
+    @pl.when((num_swa_blocks > 0) & (not reuse_swa))
     def _start_swa():
-        fetch_swa(0, 0, wait=False)
+        start_swa_slab(request, swa_start, 0)
 
     def consume_swa(block, buffer):
-        fetch_swa(block, buffer, wait=True)
+        wait_swa_slab(buffer)
         next_block = block + 1
         next_buffer = jnp.bitwise_xor(buffer, 1)
 
         @pl.when(next_block < num_swa_blocks)
         def _prefetch():
-            fetch_swa(next_block, next_buffer, wait=False)
+            start_swa_slab(request, swa_start + next_block * swa_dma_tile, next_buffer)
 
         key_positions = swa_start + block * swa_dma_tile + jnp.arange(swa_dma_tile, dtype=jnp.int32)
-        swa_kv = pltpu.bitcast(swa_kv_x2_ref[buffer, ...], jnp.bfloat16).reshape(
-            swa_dma_tile, head_dim
-        )
+        swa_kv = swa_kv_x2_ref[buffer, ...]
         consume(
             swa_kv[:swa_compute_tile],
             key_positions[:swa_compute_tile],
@@ -688,7 +1072,58 @@ def _chunk_attention_kernel(
 
         return next_buffer
 
-    jax.lax.fori_loop(0, num_swa_blocks, consume_swa, jnp.int32(0), unroll=False)
+    if reuse_swa:
+        # SMEM: request, slab start, buffer, outstanding DMA; persists across grid steps.
+        @pl.when(query_block == 0)
+        def _init_swa_state():
+            swa_state_ref[0] = jnp.int32(-1)
+            swa_state_ref[1] = jnp.int32(0)
+            swa_state_ref[2] = jnp.int32(0)
+            swa_state_ref[3] = jnp.int32(0)
+
+        @pl.when(swa_state_ref[3] != 0)
+        def _wait_swa_prefetch():
+            wait_swa_slab(swa_state_ref[2])
+            swa_state_ref[3] = jnp.int32(0)
+
+        @pl.when(num_half_blocks > 0)
+        def _consume_resident_swa():
+            @pl.when(jnp.logical_not(swa_hit(request, swa_start)))
+            def _load_swa_miss():
+                buffer = jnp.bitwise_xor(swa_state_ref[2], 1)
+                start_swa_slab(request, swa_start, buffer)
+                wait_swa_slab(buffer)
+                swa_state_ref[0] = request
+                swa_state_ref[1] = swa_start
+                swa_state_ref[2] = buffer
+
+            offset = pl.multiple_of(swa_start - swa_state_ref[1], swa_alignment)
+            kv = swa_kv_x2_ref[swa_state_ref[2], pl.ds(offset, swa_compute_tile), :]
+            keys = swa_start + jnp.arange(swa_compute_tile, dtype=jnp.int32)
+            consume(kv, keys, compressed=False)
+
+        @pl.when(query_block + 1 < pl.num_programs(0))
+        def _prefetch_next_swa():
+            next_request = query_block_request_ids_ref[query_block + 1]
+            next_base = query_block_offsets_ref[query_block + 1]
+            next_start = (
+                jnp.maximum(next_base + 1, 128 - prefix_lens_ref[next_request]) // swa_alignment
+            ) * swa_alignment
+            needs_load = (next_base < q_lens_ref[next_request]) & jnp.logical_not(
+                swa_hit(next_request, next_start)
+            )
+
+            @pl.when(needs_load)
+            def _start_next_slab():
+                buffer = jnp.bitwise_xor(swa_state_ref[2], 1)
+                start_swa_slab(next_request, next_start, buffer)
+                swa_state_ref[0] = next_request
+                swa_state_ref[1] = next_start
+                swa_state_ref[2] = buffer
+                swa_state_ref[3] = jnp.int32(1)
+
+    else:
+        jax.lax.fori_loop(0, num_swa_blocks, consume_swa, jnp.int32(0), unroll=False)
     acc_ref[...] = acc_ref[...].astype(jnp.bfloat16).astype(jnp.float32)
 
     query_end = jnp.minimum(query_base + queries_per_block, q_len)
@@ -701,16 +1136,48 @@ def _chunk_attention_kernel(
         0,
     )
     num_compressed_blocks = pl.cdiv(max_compressed, compressed_tile)
-    cache_rows = compressed_cache_hbm_ref.reshape(-1, head_dim)
+    cache_rows = compressed_cache_hbm_ref.reshape(-1, head_dim) if page_size >= 8 else None
     compressed_start = compressed_page_starts_ref[request]
 
-    @pl.when(num_compressed_blocks > 0)
+    small_pages = page_size < sublanes
+    if small_pages:
+        # One-record pages are gathered row by row.  Consecutive query blocks of
+        # one request see the same records plus at most a few new ones, so the
+        # gathered tile persists across grid steps and only the new rows are
+        # fetched; SMEM tracks (request, rows loaded).  Only single-tile
+        # requests reuse the tile; multi-tile ones re-gather every block.
+        @pl.when(query_block == 0)
+        def _init_small_state():
+            small_page_state_ref[0] = jnp.int32(-1)
+            small_page_state_ref[1] = jnp.int32(0)
+
+        reuse_small_tile = (num_compressed_blocks == 1) & (small_page_state_ref[0] == request)
+        zero_tile = (num_compressed_blocks > 0) & jnp.logical_not(reuse_small_tile)
+    else:
+        zero_tile = num_compressed_blocks > 0
+
+    @pl.when(zero_tile)
     def _zero_compressed_tile():
         # Preserve TPU's 2048-wide reduction ABI without reading nonexistent
         # pages: masked tail rows are finite zeros, as in the block-KV prologue.
         compressed_kv_ref[...] = jnp.zeros(compressed_kv_ref.shape, compressed_kv_ref.dtype)
 
     def fetch_compressed(block, *, wait):
+        if page_size < sublanes:
+            if not wait:
+                _gather_small_compressed_pages(
+                    compressed_cache_hbm_ref,
+                    compressed_page_indices_ref,
+                    compressed_start,
+                    max_compressed,
+                    block,
+                    compressed_kv_ref.at[0],
+                    small_page_ref,
+                    small_page_semaphore,
+                    page_size=page_size,
+                    compressed_tile=compressed_tile,
+                )
+            return
         # One buffer, unlike the double-buffered SWA and q fetches: the tile is
         # large and the loop short enough that VMEM is better spent elsewhere.
         semaphore = dma_semaphores.at[2]
@@ -721,27 +1188,10 @@ def _chunk_attention_kernel(
         )
         transfer_rows = valid_pages * page_size
         if wait:
-            if page_size < sublanes:
-                # A Mosaic DMA wait slice must be tile-aligned, so small pages
-                # issue a full tile below; query masking hides the padded rows.
-                pltpu.make_async_copy(destination, destination, semaphore).wait()
-            else:
-                transferred = destination.at[pl.ds(0, transfer_rows)]
-                pltpu.make_async_copy(transferred, transferred, semaphore).wait()
+            transferred = destination.at[pl.ds(0, transfer_rows)]
+            pltpu.make_async_copy(transferred, transferred, semaphore).wait()
         else:
             for page in range(compressed_pages_per_tile):
-                if page_size < sublanes:
-                    table_location = jnp.minimum(
-                        compressed_start + block * compressed_pages_per_tile + page,
-                        compressed_page_indices_ref.shape[0] - 1,
-                    )
-                    physical_page = compressed_page_indices_ref[table_location]
-                    pltpu.make_async_copy(
-                        cache_rows.at[pl.ds(physical_page * page_size, page_size)],
-                        destination.at[pl.ds(page * page_size, page_size)],
-                        semaphore,
-                    ).start()
-                    continue
 
                 @pl.when(page < valid_pages)
                 def _copy_valid_page(page=page):
@@ -753,9 +1203,34 @@ def _chunk_attention_kernel(
                         semaphore,
                     ).start()
 
-    @pl.when(num_compressed_blocks > 0)
-    def _start_compressed():
-        fetch_compressed(0, wait=False)
+    if small_pages:
+
+        @pl.when(num_compressed_blocks == 1)
+        def _gather_small_single_tile():
+            _gather_small_incremental(
+                compressed_cache_hbm_ref,
+                compressed_page_indices_ref,
+                compressed_start,
+                max_compressed,
+                compressed_kv_ref.at[0],
+                small_page_ref,
+                small_page_semaphore,
+                small_page_state_ref,
+                request,
+                page_size=page_size,
+                compressed_tile=compressed_tile,
+            )
+
+        @pl.when(num_compressed_blocks > 1)
+        def _gather_small_multi_tile():
+            small_page_state_ref[0] = jnp.int32(-1)
+            fetch_compressed(0, wait=False)
+
+    else:
+
+        @pl.when(num_compressed_blocks > 0)
+        def _start_compressed():
+            fetch_compressed(0, wait=False)
 
     # Issue the next block's q fetch once the latency-critical SWA chain is
     # done; the compressed stage, epilogue, and step boundary hide it.
@@ -777,11 +1252,18 @@ def _chunk_attention_kernel(
     jax.lax.fori_loop(0, num_compressed_blocks, consume_compressed, None, unroll=False)
 
     sink = attention_sink_ref[...].astype(jnp.float32)
+
+    # Keep the preceding output DMA in flight during this block's attention;
+    # wait only before reusing its staging buffer.
+    @pl.when(query_block > 0)
+    def _wait_previous_output():
+        pltpu.make_async_copy(out_stage_ref, out_stage_ref, dma_semaphores.at[3]).wait()
+
+    # Stage into a dedicated buffer: writing back into the q slots would
+    # order these stores against the in-flight next-block q prefetch.
     for query in range(queries_per_block):
         head_slice = pl.ds(query * heads, heads)
         denominator = l_ref[head_slice, ...] + jnp.exp(sink[:, None] - m_ref[head_slice, ...])
-        # Stage into a dedicated buffer: writing back into the q slots would
-        # order these stores against the in-flight next-block q prefetch.
         out_stage_ref[query, ...] = (
             acc_ref[head_slice] * pl.reciprocal(broadcast_minor(denominator, head_dim), approx=True)
         ).astype(jnp.bfloat16)
@@ -812,7 +1294,18 @@ def _chunk_attention_kernel(
                 dma_semaphores.at[3],
             ).start()
 
-    pltpu.make_async_copy(out_stage_ref, out_stage_ref, dma_semaphores.at[3]).wait()
+    @pl.when(query_block + 1 == pl.num_programs(0))
+    def _drain_output():
+        pltpu.make_async_copy(out_stage_ref, out_stage_ref, dma_semaphores.at[3]).wait()
+
+
+def _prepare_chunk_kv(combined_kv, schedule):
+    """Pad BF16 rows for aligned, overlapping SWA DMA reads."""
+    leading_pad = ((0, 0),) * (combined_kv.ndim - 2)
+    return jnp.pad(
+        jnp.asarray(combined_kv, jnp.bfloat16),
+        (*leading_pad, (0, schedule.swa_dma_tile + _flat_tile_rows(jnp.bfloat16)), (0, 0)),
+    )
 
 
 @functools.partial(
@@ -823,6 +1316,7 @@ def _chunk_attention_kernel(
         "may_cross_end",
         "interpret",
         "schedule",
+        "compressed_page_size",
     ),
 )
 def _chunk_attention(
@@ -844,14 +1338,19 @@ def _chunk_attention(
     queries_per_block: int | None = None,
     may_cross_end: bool = True,
     interpret: bool | None = None,
+    compressed_page_size: int | None = None,
 ):
     if queries_per_block is None:
         queries_per_block = schedule.query_block_size
     tokens, heads, head_dim = q.shape
     num_query_blocks = query_block_request_ids.shape[0]
-    batch = combined_kv.shape[0]
     padded_heads = _align(heads, schedule.sublanes)
-    page_size = compressed_cache.shape[1] * compressed_cache.shape[2]
+    if compressed_cache.ndim == 2:
+        if compressed_page_size is None:
+            raise ValueError("a flat compressed cache needs compressed_page_size")
+        page_size = int(compressed_page_size)
+    else:
+        page_size = compressed_cache.shape[1] * compressed_cache.shape[2]
     if padded_heads != heads:
         # Only sublane-unaligned head counts pay a staging pad.
         q = jnp.pad(q, ((0, 0), (0, padded_heads - heads), (0, 0)))
@@ -865,23 +1364,6 @@ def _chunk_attention(
         )
     else:
         q_tail = jnp.zeros((2 * queries_per_block, padded_heads, head_dim), q.dtype)
-    # Each window DMA reads ``swa_dma_tile`` rows from an arbitrary start, so
-    # the buffer needs a tile of slack behind the last query row.
-    combined_kv = jnp.pad(combined_kv, ((0, 0), (0, schedule.swa_dma_tile), (0, 0)))
-    packed_u16 = jax.lax.bitcast_convert_type(combined_kv, jnp.uint16).reshape(
-        batch,
-        combined_kv.shape[1],
-        head_dim // schedule.mxu_lanes,
-        schedule.mxu_lanes,
-    )
-    low = jnp.bitwise_and(packed_u16, jnp.uint16(0xFF)).astype(jnp.uint8)
-    high = jnp.right_shift(packed_u16, jnp.uint16(8)).astype(jnp.uint8)
-    combined_kv = jnp.stack((low, high), axis=3).reshape(
-        batch,
-        combined_kv.shape[1],
-        2 * head_dim // schedule.mxu_lanes,  # two bytes per bf16, lane-major
-        schedule.mxu_lanes,
-    )
     attention_sink = jnp.pad(
         attention_sink.astype(jnp.float32),
         (0, padded_heads - heads),
@@ -905,6 +1387,7 @@ def _chunk_attention(
             swa_compute_tile=schedule.swa_compute_tile,
             sublanes=schedule.sublanes,
             may_cross_end=may_cross_end,
+            packed_swa=combined_kv.ndim == 2,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=8,
@@ -923,20 +1406,16 @@ def _chunk_attention(
             scratch_shapes=(
                 pltpu.VMEM((2, queries_per_block, padded_heads, head_dim), jnp.bfloat16),
                 pltpu.VMEM((queries_per_block, padded_heads, head_dim), jnp.bfloat16),
-                pltpu.VMEM(
-                    (
-                        2,
-                        schedule.swa_dma_tile,
-                        2 * head_dim // schedule.mxu_lanes,
-                        schedule.mxu_lanes,
-                    ),
-                    jnp.uint8,
-                ),
+                pltpu.VMEM((2, schedule.swa_dma_tile, head_dim), jnp.bfloat16),
                 pltpu.VMEM((1, compressed_tile, head_dim), jnp.bfloat16),
                 pltpu.SemaphoreType.DMA((6,)),
                 pltpu.VMEM((queries_per_block * padded_heads, schedule.mxu_lanes), jnp.float32),
                 pltpu.VMEM((queries_per_block * padded_heads, schedule.mxu_lanes), jnp.float32),
                 pltpu.VMEM((queries_per_block * padded_heads, head_dim), jnp.float32),
+                _small_page_scratch(compressed_cache, page_size, head_dim),
+                pltpu.SemaphoreType.DMA,
+                pltpu.SMEM((2,), jnp.int32),
+                pltpu.SMEM((4,), jnp.int32),
             ),
         ),
         out_shape=(
@@ -973,15 +1452,20 @@ def _chunk_attention(
     lo = max(tokens - queries_per_block, 0)
     rows = lo + jnp.arange(tokens - lo, dtype=jnp.int32)
     row_request = jnp.clip(
-        jnp.searchsorted(cu_q_lens, rows, side="right").astype(jnp.int32) - 1,
+        searchsorted_right(cu_q_lens, rows).astype(jnp.int32) - 1,
         0,
         cu_q_lens.shape[0] - 2,
     )
     starts = cu_q_lens[row_request]
     owner_base = starts + ((rows - starts) // queries_per_block) * queries_per_block
     tail_owned = owner_base + queries_per_block > tokens
-    output = output.at[lo:].set(
-        jnp.where(tail_owned[:, None, None], output_tail[: tokens - lo], output[lo:])
+    output = jax.lax.cond(
+        jnp.any(tail_owned),
+        lambda values: values.at[lo:].set(
+            jnp.where(tail_owned[:, None, None], output_tail[: tokens - lo], values[lo:])
+        ),
+        lambda values: values,
+        output,
     )
     return output[:, :heads]
 
@@ -993,6 +1477,8 @@ def _chunk_attention(
         "window_size",
         "compress_ratio",
         "schedule",
+        "page_size",
+        "compressed_page_size",
     ),
     donate_argnums=(2, 3),
 )
@@ -1011,15 +1497,13 @@ def ragged_attention(
     softmax_scale: float,
     window_size: int = 128,
     compress_ratio: int = 128,
+    page_size: int | None = None,
+    compressed_page_size: int | None = None,
 ):
-    """Cache-aware ragged HCA for fresh/chunked prefill, decode, and mixed batches.
+    """Request-major HCA for fresh/chunked prefill, decode, and mixed batches.
 
-    Queries and new KV are flattened in request-major order. Historical SWA rows
-    are read through the framework page table while current-chunk rows are consumed
-    directly, so updating a wrapped ring cannot corrupt an early query in the same
-    chunk. One Pallas program consumes SWA first and then double-buffered physical
-    compressed pages while retaining the same online-softmax state. Neither scores,
-    ``[SWA | compressed]``, nor request-major compressed KV is built in HBM.
+    Consume current-chunk KV before committing the SWA ring. SWA and compressed
+    records share one online-softmax state; decode may stage small compressed pages.
     """
     window_page_indices = metadata.window_page_indices
     window_cu_kv_lens = metadata.window_cu_kv_lens
@@ -1056,10 +1540,14 @@ def ragged_attention(
 
     query_seq_ids = query_seq_ids.astype(jnp.int32)
     valid_token_mask = valid_token_mask.astype(jnp.bool_)
-    window_flat, window_page_size = _cache_layout(window_cache, head_dim)
-    compressed_flat, compressed_page_size = _cache_layout(compressed_cache, head_dim)
-    if window_page_size != compressed_page_size:
-        raise ValueError("window and compressed cache page sizes must match")
+    window_flat, window_page_size = _cache_layout(window_cache, head_dim, page_size)
+    compressed_flat, compressed_page_size = _cache_layout(
+        compressed_cache, head_dim, compressed_page_size
+    )
+    if compressed_cache.ndim == 2 and compressed_flat.shape[0] < _flat_tile_rows(
+        compressed_cache.dtype
+    ):
+        raise ValueError("a flat compressed pool must hold at least one row tile")
     # The q-block DMA path slices VMEM/HBM on TPU's eight-row tile boundary.
     if window_page_size % schedule.sublanes:
         raise ValueError(f"HCA page_size must be a multiple of {schedule.sublanes}")
@@ -1078,7 +1566,9 @@ def ragged_attention(
     )
     # HCA emits at most one value for each absolute compression boundary, so
     # compressed destinations are unique inside a forward call.
-    if is_tpu_runtime():
+    # C1 stores one or two compressed records per original-token page. Its
+    # unpacked view cannot use the legacy two-lane read/modify/write DMA.
+    if is_tpu_runtime() and compressed_page_size >= schedule.sublanes:
         compressed_cache = _write_cache_rows(
             compressed_cache,
             compressed_write_locs,
@@ -1087,12 +1577,24 @@ def ragged_attention(
             schedule=schedule,
         )
         compressed_flat = compressed_cache.reshape(-1, compressed_cache.shape[-1])
+    elif compressed_cache.ndim == 4 and compressed_cache.shape[1] == 1:
+        compressed_cache = _scatter_compressed_pages(
+            compressed_cache,
+            compressed_write_locs,
+            compressed_write_values,
+            compressed_write_valid,
+            max_rows=tokens // compress_ratio + batch,
+        )
+        # Only the decode shortcut below reads the flat view; XLA drops it otherwise.
+        compressed_flat = compressed_cache.reshape(-1, compressed_cache.shape[-1])
     else:
         compressed_flat = _scatter_physical_rows(
             compressed_flat,
             compressed_write_locs,
             compressed_write_values,
             compressed_write_valid,
+            max_rows=tokens // compress_ratio + batch,
+            schedule=schedule,
         )
         compressed_cache = compressed_flat.reshape(compressed_cache.shape)
 
@@ -1105,7 +1607,10 @@ def ragged_attention(
         compressed_page_size
     )
 
-    if max_queries == 1:
+    if max_queries == 1 and tokens == batch:
+        # The per-request decode shortcut requires one token buffer row per
+        # request. Runtime token buckets may be padded independently; those
+        # use the general gather/scatter path below.
         # Row ``j`` holds absolute position ``window_start + j``: below
         # ``prefix_lens`` from the ring, the decode token from ``new_kv``.
         window_start = jnp.maximum(seq_lens.astype(jnp.int32) - window_size, 0)
@@ -1125,17 +1630,32 @@ def ragged_attention(
         window_rows = jnp.where(is_new[..., None], new_kv[:, None, :], cache_rows)
         # TPU's 2048-row reduction contains the same first 128-row subtree;
         # use it only once multiple 128-row groups can affect online softmax.
+        compressed_lens = jnp.minimum(seq_lens // compress_ratio, compressed_kv_lens)
+        stream_cache, stream_pages, stream_starts, stream_page_size = _dense_compressed_view(
+            compressed_flat,
+            compressed_page_indices,
+            compressed_page_starts_by_request,
+            compressed_lens,
+            head_dim=head_dim,
+            page_size=compressed_page_size,
+            tile=schedule.compressed_tile,
+            sublanes=schedule.sublanes,
+        )
+        if stream_cache is compressed_flat:
+            stream_cache = compressed_cache
+            stream_page_size = None if compressed_cache.ndim == 4 else compressed_page_size
         output = _streaming_attention(
             q,
             window_rows,
             jnp.minimum(seq_lens, window_size),
-            compressed_cache,
-            compressed_page_indices,
-            compressed_page_starts_by_request,
-            jnp.minimum(seq_lens // compress_ratio, compressed_kv_lens),
+            stream_cache,
+            stream_pages,
+            stream_starts,
+            compressed_lens,
             attention_sink,
             schedule=schedule,
             softmax_scale=softmax_scale,
+            compressed_page_size=stream_page_size,
         )
         window_flat = _commit_window_rows(
             window_flat,
@@ -1148,6 +1668,7 @@ def ragged_attention(
             seq_lens,
             window_size=window_size,
             page_size=window_page_size,
+            schedule=schedule,
         )
         return (
             output,
@@ -1167,13 +1688,8 @@ def ragged_attention(
     history_valid = (history_positions >= 0) & (history_pages > 0)
     history = _gather_physical_rows(window_flat, history_locs, history_valid, head_dim)
 
-    local_queries = jnp.arange(tokens, dtype=jnp.int32) - cu_q_lens[query_seq_ids]
-    kv_padded = (
-        jnp.zeros((batch, max_queries, head_dim), new_kv.dtype)
-        .at[query_seq_ids, local_queries]
-        .set(new_kv)
-    )
-    combined_kv = jnp.concatenate((history, kv_padded), axis=1)
+    combined_kv = _pack_chunk_kv(history, new_kv, cu_q_lens, query_seq_ids, valid_token_mask)
+    combined_kv = _prepare_chunk_kv(combined_kv, schedule)
     if query_block_request_ids.shape[0]:
         mixed_output = _chunk_attention(
             q,
@@ -1190,6 +1706,7 @@ def ragged_attention(
             attention_sink,
             schedule=schedule,
             softmax_scale=softmax_scale,
+            compressed_page_size=compressed_page_size,
         )
     else:
         mixed_output = jnp.zeros_like(q)
@@ -1198,29 +1715,42 @@ def ragged_attention(
         # and an out-of-bounds scatter target that ``mode="drop"`` discards.
         decode_valid = decode_request_ids >= 0
         safe_decode_ids = jnp.maximum(decode_request_ids, 0)
-        decode_output = _chunk_attention(
-            q,
-            cu_q_lens,
-            combined_kv,
-            q_lens,
-            prefix_lens,
-            compressed_kv_lens,
-            safe_decode_ids,
-            jnp.where(decode_valid, 0, jnp.int32(INERT_QUERY_OFFSET)),
-            compressed_cache,
-            compressed_page_indices,
-            compressed_page_starts_by_request,
-            attention_sink,
-            schedule=schedule,
-            softmax_scale=softmax_scale,
-            queries_per_block=1,
+
+        def merge_decode(values):
+            decode_output = _chunk_attention(
+                q,
+                cu_q_lens,
+                combined_kv,
+                q_lens,
+                prefix_lens,
+                compressed_kv_lens,
+                safe_decode_ids,
+                jnp.where(decode_valid, 0, jnp.int32(INERT_QUERY_OFFSET)),
+                compressed_cache,
+                compressed_page_indices,
+                compressed_page_starts_by_request,
+                attention_sink,
+                schedule=schedule,
+                softmax_scale=softmax_scale,
+                queries_per_block=1,
+                compressed_page_size=compressed_page_size,
+            )
+            decode_scatter_indices = jnp.where(decode_valid, cu_q_lens[safe_decode_ids], tokens)
+            decode_rows = decode_output[jnp.clip(decode_scatter_indices, 0, tokens - 1)]
+            return values.at[decode_scatter_indices].set(decode_rows, mode="drop")
+
+        output = jax.lax.cond(
+            jnp.any(decode_valid), merge_decode, lambda values: values, mixed_output
         )
-        decode_scatter_indices = jnp.where(decode_valid, cu_q_lens[safe_decode_ids], tokens)
-        decode_rows = decode_output[jnp.clip(decode_scatter_indices, 0, tokens - 1)]
-        output = mixed_output.at[decode_scatter_indices].set(decode_rows, mode="drop")
     else:
         output = mixed_output
-    output = jnp.where(valid_token_mask[:, None, None], output, 0.0)
+    # Packed batches need no full-output read/write pass; padding stays masked.
+    output = jax.lax.cond(
+        jnp.all(valid_token_mask),
+        lambda values: values,
+        lambda values: jnp.where(valid_token_mask[:, None, None], values, 0.0),
+        output,
+    )
     window_flat = _commit_window_rows(
         window_flat,
         window_page_indices,
@@ -1232,6 +1762,7 @@ def ragged_attention(
         seq_lens,
         window_size=window_size,
         page_size=window_page_size,
+        schedule=schedule,
     )
     return (
         output,
@@ -1242,7 +1773,14 @@ def ragged_attention(
 
 @functools.partial(
     jax.jit,
-    static_argnames=("softmax_scale", "window_size", "compress_ratio", "schedule"),
+    static_argnames=(
+        "softmax_scale",
+        "window_size",
+        "compress_ratio",
+        "schedule",
+        "page_size",
+        "compressed_page_size",
+    ),
     donate_argnums=(2, 3),
 )
 def uniform_prefill_attention(
@@ -1258,6 +1796,8 @@ def uniform_prefill_attention(
     softmax_scale: float,
     window_size: int = 128,
     compress_ratio: int = 128,
+    page_size: int | None = None,
+    compressed_page_size: int | None = None,
 ):
     """Run fresh-prompt HCA over physical SGLang pages.
 
@@ -1292,10 +1832,10 @@ def uniform_prefill_attention(
     compressed_page_indices = metadata.compressed_page_indices
     compressed_cu_kv_lens = metadata.compressed_cu_kv_lens
 
-    window_flat, window_page_size = _cache_layout(window_cache, head_dim)
-    compressed_flat, compressed_page_size = _cache_layout(compressed_cache, head_dim)
-    if window_page_size != compressed_page_size:
-        raise ValueError("window and compressed cache page sizes must match")
+    window_flat, window_page_size = _cache_layout(window_cache, head_dim, page_size)
+    compressed_flat, compressed_page_size = _cache_layout(
+        compressed_cache, head_dim, compressed_page_size
+    )
 
     # Only the last window survives in serving state; limiting the scatter to
     # those rows also avoids duplicate destinations when the prompt wraps the ring.
@@ -1317,6 +1857,7 @@ def uniform_prefill_attention(
         window_locs,
         new_kv[:, window_start:],
         window_valid,
+        schedule=schedule,
     )
 
     compressed_locs, resolved_write_valid = _page_table_locations(
@@ -1327,12 +1868,19 @@ def uniform_prefill_attention(
         page_size=compressed_page_size,
         physical_rows=compressed_flat.shape[0],
     )
-    compressed_flat = _scatter_physical_rows(
-        compressed_flat,
-        compressed_locs,
-        compressed_write_values,
-        resolved_write_valid,
-    )
+    if compressed_cache.ndim == 4 and compressed_cache.shape[1] == 1:
+        compressed_cache = _scatter_compressed_pages(
+            compressed_cache, compressed_locs, compressed_write_values, resolved_write_valid
+        )
+    else:
+        compressed_flat = _scatter_physical_rows(
+            compressed_flat,
+            compressed_locs,
+            compressed_write_values,
+            resolved_write_valid,
+            schedule=schedule,
+        )
+        compressed_cache = compressed_flat.reshape(compressed_cache.shape)
     compressed_page_starts = compressed_cu_kv_lens[:-1] // jnp.int32(compressed_page_size)
     queries_per_block = schedule.query_block_size
     padded_sequence = _align(sequence, queries_per_block)
@@ -1346,6 +1894,7 @@ def uniform_prefill_attention(
         (jnp.zeros((batch, window_size, head_dim), new_kv.dtype), new_kv),
         axis=1,
     )
+    combined_kv = _prepare_chunk_kv(combined_kv, schedule)
     output = _chunk_attention(
         q.reshape(batch * sequence, heads, head_dim),
         jnp.arange(batch + 1, dtype=jnp.int32) * sequence,
@@ -1355,7 +1904,7 @@ def uniform_prefill_attention(
         compressed_write_lens,
         request_ids,
         block_offsets,
-        compressed_flat.reshape(compressed_cache.shape),
+        compressed_cache,
         compressed_page_indices,
         compressed_page_starts,
         attention_sink,
@@ -1363,11 +1912,12 @@ def uniform_prefill_attention(
         softmax_scale=softmax_scale,
         queries_per_block=queries_per_block,
         may_cross_end=sequence % queries_per_block != 0,
+        compressed_page_size=compressed_page_size,
     )
     return (
         output,
         window_flat.reshape(window_cache.shape),
-        compressed_flat.reshape(compressed_cache.shape),
+        compressed_cache,
     )
 
 

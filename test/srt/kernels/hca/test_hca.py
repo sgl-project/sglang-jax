@@ -1,15 +1,6 @@
-"""Whole-operator HCA tests against the independent numpy reference.
+"""Stateful HCA tests against independent NumPy math with BF16-rounded inputs.
 
-One stateful HCA step is compared end to end with ``oracle.py`` across the
-three request shapes the backend dispatches: uniform prefill, decode, and
-ragged EXTEND. This is the only numerical coverage the kernels need — a
-composite that agrees with dense fp32 math cannot have a wrong compressor,
-cache write, page-table resolution, or attention stage hiding inside it.
-
-fp32 dense math and bf16 tiled math cannot agree bit for bit, so the gate is a
-tolerance -- ``rtol=2e-2, atol=1e-2``, the same one every bf16 attention kernel
-in this repo uses (flash, paged, MLA, GDN, KDA). These shapes clear it using
-18-32% of the budget.
+Compare outputs and cache updates across uniform prefill, decode and ragged EXTEND.
 """
 
 from __future__ import annotations
@@ -53,13 +44,13 @@ def _bf16_master(array):
     return np.asarray(array, np.float32).astype(ml_dtypes.bfloat16).astype(np.float32)
 
 
-def _weights(seed: int) -> dict:
+def _weights(seed: int, hidden: int = HIDDEN) -> dict:
     rng = np.random.default_rng(seed)
     rope_rows = 8192
     angle = np.arange(rope_rows * 32, dtype=np.float32).reshape(rope_rows, 32) * 1e-4
     return {
-        "wkv": _bf16_master(rng.standard_normal((HEAD_DIM, HIDDEN)) * 0.05),
-        "wgate": _bf16_master(rng.standard_normal((HEAD_DIM, HIDDEN)) * 0.05),
+        "wkv": _bf16_master(rng.standard_normal((HEAD_DIM, hidden)) * 0.05),
+        "wgate": _bf16_master(rng.standard_normal((HEAD_DIM, hidden)) * 0.05),
         "ape": np.asarray(rng.standard_normal((RATIO, HEAD_DIM)), np.float32),
         "norm": _bf16_master(rng.standard_normal((HEAD_DIM,)) * 0.02 + 1.0),
         "cos": np.cos(angle).astype(np.float32),
@@ -68,11 +59,11 @@ def _weights(seed: int) -> dict:
     }
 
 
-def _stream(batch: int, length: int, seed: int) -> dict:
+def _stream(batch: int, length: int, seed: int, hidden: int = HIDDEN) -> dict:
     """Per-request tensors indexed by absolute position, shared with the oracle."""
     rng = np.random.default_rng(seed)
     return {
-        "hidden": _bf16_master(rng.standard_normal((batch, length, HIDDEN)) * 0.05),
+        "hidden": _bf16_master(rng.standard_normal((batch, length, hidden)) * 0.05),
         "q": _bf16_master(rng.standard_normal((batch, length, HEADS, HEAD_DIM))),
         "kv": _bf16_master(rng.standard_normal((batch, length, HEAD_DIM))),
     }
