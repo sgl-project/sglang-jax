@@ -41,6 +41,7 @@ from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
 from sgl_jax.srt.layers.attention.qsa_indexer import QSAIndexer
 from sgl_jax.srt.layers.attention.qsa_sparse_backend import QSASparseAttentionBackend
 from sgl_jax.srt.layers.embeddings import RotaryEmbedding
+from sgl_jax.srt.layers.radix_attention import AttentionType
 from sgl_jax.srt.mem_cache.memory_pool import QSATokenToKVPool
 
 RATIO = 4
@@ -108,10 +109,11 @@ def _rank_metadata(seq_lens, q_lens, page_size, pages_per_seq, rng):
 def _metadata(mesh, ranks):
     """Concatenate per-rank metadata the way FlashAttention does under DP."""
     return SimpleNamespace(
+        custom_mask=None,
         **{
             name: _put(mesh, np.concatenate([r[name] for r in ranks]), SPECS["per_token"])
             for name in ranks[0]
-        }
+        },
     )
 
 
@@ -152,6 +154,32 @@ def _rotary():
         is_neox_style=True,
         dtype=jnp.float32,
     )
+
+
+class _DeviceStateRotary:
+    """A plain rotary that keeps some of its state on the device."""
+
+    def __init__(self, mesh):
+        self._host = _rotary()
+        self.head_size = self._host.head_size
+        with jax.set_mesh(mesh):
+            self.scale = _put(mesh, jnp.ones(()), P())
+
+    def __call__(self, positions, query, key):
+        query, key = self._host(positions, query, key)
+        return query * self.scale, key * self.scale
+
+
+class _NnxRotary(nnx.Module):
+    """A rotary built as an nnx module, its state a parameter."""
+
+    def __init__(self):
+        self.head_size = 8
+        self.scale = nnx.Param(jnp.ones(()))
+
+    def __call__(self, positions, query, key):
+        query, key = _rotary()(positions, query, key)
+        return query * self.scale[...], key * self.scale[...]
 
 
 def _scores_launch(kernel, *, out_shape, **_):
@@ -313,6 +341,38 @@ class TestIndexerInputs(unittest.TestCase):
         result, dense = self._call(1)
         self.assertEqual(result, "dense")
         dense.assert_called_once()
+
+    def test_a_qsa_layer_refuses_what_its_kernel_would_ignore(self):
+        """The sparse kernel's only mask is the causal one, so inputs the dense
+        path honours on top of it must fail rather than be dropped."""
+        backend = _backend(_mesh(), num_heads=2, head_dim=128, page_size=16, block_topk=2)
+        inputs = dict(indexer_q=1, indexer_k=1, indexer=1, indexer_rotary_emb=1)
+        cases = {
+            "non-causal": dict(causal=0),
+            "encoder-only": dict(attn_type=AttentionType.ENCODER_ONLY),
+            "sinks": dict(attention_sink=1),
+            "custom mask": dict(custom_mask=1),
+            "sliding window": dict(sliding_window_size=128),
+            "logit cap": dict(logit_cap=30.0),
+            "temperature": dict(xai_temperature_len=128),
+        }
+        for name, case in cases.items():
+            backend.forward_metadata = SimpleNamespace(custom_mask=case.pop("custom_mask", None))
+            causal = case.pop("causal", 1)
+            attention_sink = case.pop("attention_sink", None)
+            layer = SimpleNamespace(layer_id=0, head_dim=128, scaling=None, **case)
+            with self.subTest(name), self.assertRaises(NotImplementedError):
+                backend(
+                    None,
+                    None,
+                    None,
+                    layer,
+                    SimpleNamespace(),
+                    None,
+                    causal,
+                    attention_sink,
+                    **inputs,
+                )
 
 
 class TestSparsePath(unittest.TestCase):
@@ -560,6 +620,24 @@ class TestDataParallel(unittest.TestCase):
                 )
         untouched = np.setdiff1d(np.arange(len(rings)), np.concatenate([r.slots for r in ranks]))
         np.testing.assert_array_equal(rings_out[untouched], rings[untouched])
+
+    def test_a_rotary_with_device_state_compresses_like_a_host_one(self):
+        """The compression shard_map cannot close over arrays on explicit mesh
+        axes, so a rotary's device state enters it as an argument. Position 39
+        closes a group, so the rotation is exercised."""
+        rng = np.random.default_rng(0)
+        mesh = _mesh()
+        indexer = _indexer(mesh)
+        ranks = [_Rank([40, 23], [3, 5], rng)]
+        rings = rng.standard_normal((8, RATIO, _Rank.IDX_DIM)).astype(np.float32)
+        want = _decode_step(ranks, rings, indexer, _rotary())
+        with jax.set_mesh(mesh):
+            nnx_rotary = _NnxRotary()
+        for name, rotary in (("plain", _DeviceStateRotary(mesh)), ("nnx", nnx_rotary)):
+            with self.subTest(name):
+                got = _decode_step(ranks, rings, indexer, rotary)
+                for g, w in zip(got, want):
+                    np.testing.assert_array_equal(g, w)
 
 
 if __name__ == "__main__":

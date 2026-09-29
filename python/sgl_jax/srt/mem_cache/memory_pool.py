@@ -926,6 +926,11 @@ class QSATokenToKVPool(MHATokenToKVPool):
         self.num_indexer_layers = num_indexer_layers
         self.compress_ratio = compress_ratio
         self.max_reqs = max_reqs
+        if indexer_key_dim > 0 and num_indexer_layers > 0 and not (max_reqs and max_reqs > 0):
+            raise ValueError(
+                f"max_reqs must be the request limit, one ring row per ReqToTokenPool "
+                f"slot; got {max_reqs}"
+            )
         self._validate_compressed_geometry(page_size, compress_ratio, dtype)
         super().__init__(
             size,
@@ -1071,7 +1076,8 @@ class QSATokenToKVPool(MHATokenToKVPool):
         return per_slot * self.num_indexer_layers
 
     def replace_buffer(self, buffers) -> None:
-        """Accept the plain KV list, or the (kv, compressed, ring) triple."""
+        """Accept the plain KV list, or the (kv, compressed, ring) triple a QSA
+        model returns as its ``token_to_kv_pool`` update."""
         if isinstance(buffers, tuple):
             buffers, compressed, ring = buffers
             if compressed:

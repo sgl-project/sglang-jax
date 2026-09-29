@@ -26,6 +26,7 @@ kernel is handed.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -54,7 +55,13 @@ _INDEXER_INPUTS = ("indexer_q", "indexer_k", "indexer", "indexer_rotary_emb")
 @register_pytree_node_class
 @dataclass
 class QSAFusedCache:
-    """What a QSA layer hands back for the pool to absorb."""
+    """What a QSA layer hands back for the pool to absorb.
+
+    The model collects the layers' fields into ``(kv list, compressed list,
+    ring list)`` and returns that triple as the ``token_to_kv_pool`` entry of
+    its pool-update dict; ``MemoryPools.replace_all`` hands it to the pool's
+    ``replace_buffer``.
+    """
 
     kv: jax.Array
     compressed: jax.Array | None = None
@@ -86,6 +93,7 @@ class QSASparseAttentionBackend(FlashAttention):
         compress_ratio: int = 4,
         block_topk: int = 512,
         full_slot: dict[int, int] | None = None,
+        indexer_key_dim: int = 0,
     ):
         super().__init__(
             num_attn_heads,
@@ -100,6 +108,31 @@ class QSASparseAttentionBackend(FlashAttention):
         self.block_topk = block_topk
         # layer id -> indexer slot; only full-attention layers have one.
         self.full_slot = full_slot or {}
+        self.indexer_key_dim = indexer_key_dim
+
+    @property
+    def token_to_kv_pool_kwargs(self) -> dict:
+        """What ``QSATokenToKVPool`` needs on top of the GQA pool.
+
+        ``max_reqs`` sizes the open-group ring, one row per ``ReqToTokenPool``
+        slot. The request limit is resolved only when the pools are built, so
+        it is left for the runner to fill in.
+        """
+        if not self.full_slot:
+            return {}
+        return dict(
+            indexer_key_dim=self.indexer_key_dim,
+            num_indexer_layers=len(self.full_slot),
+            compress_ratio=self.compress_ratio,
+            max_reqs=None,
+        )
+
+    def extra_kv_bytes_per_token(self, dtype_size: int) -> int:
+        """Compressed-key cache bytes per token: one 128-aligned key per
+        ``compress_ratio`` tokens in each QSA layer. The ring is per request,
+        not per token, so it is not charged here."""
+        padded = (self.indexer_key_dim + 127) // 128 * 128
+        return padded * dtype_size * len(self.full_slot) // self.compress_ratio
 
     def tree_flatten(self):
         children, aux_data = super().tree_flatten()
@@ -108,6 +141,7 @@ class QSASparseAttentionBackend(FlashAttention):
             "compress_ratio": self.compress_ratio,
             "block_topk": self.block_topk,
             "full_slot": self.full_slot,
+            "indexer_key_dim": self.indexer_key_dim,
         }
         return (children, aux_data)
 
@@ -124,6 +158,7 @@ class QSASparseAttentionBackend(FlashAttention):
             compress_ratio=aux_data["compress_ratio"],
             block_topk=aux_data["block_topk"],
             full_slot=aux_data["full_slot"],
+            indexer_key_dim=aux_data["indexer_key_dim"],
         )
         obj.forward_metadata = children[0]
         return obj
@@ -159,6 +194,29 @@ class QSASparseAttentionBackend(FlashAttention):
                 f"layer {layer.layer_id} has a QSA indexer but was called without "
                 f"{', '.join(missing)}; the model must pass every indexer output"
             )
+        # The sparse kernel's only mask is the causal one, so the inputs below,
+        # which the dense path would honour, are refused rather than dropped.
+        attn_type = getattr(layer, "attn_type", None)
+        unsupported = [
+            name
+            for name, present in (
+                ("non-causal attention", causal != 1),
+                (
+                    "encoder-only attention",
+                    getattr(attn_type, "value", attn_type) == "encoder_only",
+                ),
+                ("attention sinks", attention_sink is not None),
+                ("a custom mask", self.forward_metadata.custom_mask is not None),
+                ("a sliding window", bool(getattr(layer, "sliding_window_size", None))),
+                ("logit soft-capping", bool(getattr(layer, "logit_cap", None))),
+                ("temperature scaling", (getattr(layer, "xai_temperature_len", None) or -1) > 0),
+            )
+            if present
+        ]
+        if unsupported:
+            raise NotImplementedError(
+                f"QSA layer {layer.layer_id} does not support {', '.join(unsupported)}"
+            )
 
         compressed_cache, ring = self._absorb_indexer_step(
             token_to_kv_pool, slot, forward_batch, qsa_kwargs
@@ -191,15 +249,17 @@ class QSASparseAttentionBackend(FlashAttention):
         """
         md = self.forward_metadata
         dpa = self.attention_data_partition_axis
-        # The indexer's parameters enter the shard_map as an argument: it cannot
-        # close over arrays placed on explicit mesh axes.
+        # The indexer's parameters and the rotary's device state enter the
+        # shard_map as arguments: it cannot close over arrays placed on
+        # explicit mesh axes.
         graphdef, params = nnx.split(qsa_kwargs["indexer"])
-        rotary_emb = qsa_kwargs["indexer_rotary_emb"]
+        rotary_state, rebuild_rotary = _split_rotary(qsa_kwargs["indexer_rotary_emb"])
         cache = token_to_kv_pool.get_compressed_key_buffer(slot)
         packing = get_dtype_packing(cache.dtype)
 
         def _absorb(
             params,
+            rotary_state,
             raw_keys,
             positions,
             req_slots,
@@ -211,7 +271,7 @@ class QSASparseAttentionBackend(FlashAttention):
         ):
             indexer = nnx.merge(graphdef, params)
             compressed, groups, seq_ids, local_rings = indexer.compress_batch(
-                raw_keys, positions, cu_q_lens, req_slots, rings, rotary_emb
+                raw_keys, positions, cu_q_lens, req_slots, rings, rebuild_rotary(rotary_state)
             )
             cache3d = scatter_compressed(
                 as_3d(cache_),
@@ -230,6 +290,7 @@ class QSASparseAttentionBackend(FlashAttention):
             _absorb,
             in_specs=(
                 P(),  # indexer parameters, replicated
+                P(),  # rotary device state, replicated
                 P(dpa, None),  # raw indexer keys
                 P(dpa),  # positions
                 P(dpa),  # request slots
@@ -243,6 +304,7 @@ class QSASparseAttentionBackend(FlashAttention):
             check_vma=False,
         )(
             params,
+            rotary_state,
             qsa_kwargs["indexer_k"],
             forward_batch.positions,
             forward_batch.req_pool_indices,
@@ -341,6 +403,27 @@ class QSASparseAttentionBackend(FlashAttention):
             md.cu_kv_lens,
             md.distribution,
         )
+
+
+def _split_rotary(rotary):
+    """``(device state, rebuild)`` for a rotary a shard_map is about to call.
+
+    The state enters the shard_map as an argument and ``rebuild`` makes a
+    rotary around its local view. An nnx module splits the way the indexer
+    does. Any other object hands over its device-array attributes and keeps the
+    rest, such as NumPy constants, which a shard_map may close over.
+    """
+    if isinstance(rotary, nnx.Module):
+        graphdef, state = nnx.split(rotary)
+        return state, lambda local: nnx.merge(graphdef, local)
+    arrays = {name: value for name, value in vars(rotary).items() if isinstance(value, jax.Array)}
+
+    def rebuild(local):
+        view = copy.copy(rotary)
+        vars(view).update(local)
+        return view
+
+    return arrays, rebuild
 
 
 def _resolve_pool_class():

@@ -270,7 +270,7 @@ Two conditions are checked at construction: `compress_ratio` must divide `page_s
 | `compressed_key_buffer` | `(num_pages, (page_size // ratio) // packing, packing, align128(indexer_key_dim))` | `P(data, None, None, None)` — page axis only; one indexer KV head, so no head axis to TP-shard |
 | `open_group_buffer` | `(max_reqs, compress_ratio, indexer_key_dim)` | Replicated; indexed by `ReqToTokenPool` slot, which says nothing about which shard holds the request's pages |
 
-`ModelRunnerKVCacheMixin._qsa_indexer_cache_params()` is the single source for the indexer dimensions, read by both `_compute_cell_size` and this pool's construction, which must agree. The ring is per-request rather than per-token, so it is not part of the cell size.
+`QSASparseAttentionBackend` is the single source for the indexer dimensions: its `token_to_kv_pool_kwargs` and `extra_kv_bytes_per_token` hooks are read by `_create_token_to_kv_pool` and `_compute_cell_size`, which must agree. The ring is per-request rather than per-token, so it is not part of the cell size; its row count is the request limit, which the runner fills in when it builds the pools and checks against `ReqToTokenPool`. The model returns the `(kv, compressed, ring)` triple as the `token_to_kv_pool` entry of its pool-update dict, and `replace_buffer` absorbs it.
 
 ### 7.2.5 RecurrentStatePool
 

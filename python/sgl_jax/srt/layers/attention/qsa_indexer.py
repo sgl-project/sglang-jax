@@ -286,6 +286,9 @@ def write_ring_rows(rings: jax.Array, slots: jax.Array, rows: jax.Array) -> jax.
 
     A padded request's slot is -1, which indexing wraps to the last row, a slot
     a live request can hold. Steered out of range, the padding row is dropped.
+    ``mode="drop"`` also drops a genuine out-of-range slot, as JAX's default
+    scatter mode would, so the ring must have a row for every
+    ``ReqToTokenPool`` slot; the runner checks that when it builds the pools.
     """
     in_range = jnp.where(slots >= 0, slots, rings.shape[0])
     return rings.at[in_range].set(rows, mode="drop")

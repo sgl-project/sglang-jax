@@ -1,6 +1,8 @@
 import types
 
+import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from sgl_jax.srt.mem_cache.memory_pool import MLATokenToKVPool
@@ -333,23 +335,29 @@ def test_pool_initialization_rejects_hybrid_dsa():
         runner._init_pools(max_num_reqs=1, dp_size=1)
 
 
-class _QSACellSizeRunner(ModelRunnerKVCacheMixin):
-    """Minimal stand-in for the plain-GQA branch of `_compute_cell_size`.
+class _QSARunner(ModelRunnerKVCacheMixin):
+    """Stand-in runner with a real `Qwen4ExpConfig` whose attention backend is
+    built by `model_runner`'s own arm. Hybrid, as Flash-Next is, the backend
+    comes wrapped in `HybridLinearAttnBackend`, so the pool hooks reach the
+    mixin through its forwarding."""
 
-    The text config is a real `Qwen4ExpConfig` one, not a namespace, so the
-    tests pin that the budget reads the config's own `full_attention_layer_ids`
-    rather than a predicate of its own.
-    """
+    is_hybrid = False
+    num_attn_heads, num_kv_heads = 2, 1
+    max_total_num_tokens = 128 * 8
+    req_to_token_pool = None
+    token_to_kv_pool_allocator = None
 
-    def __init__(self, attention_backend, *, num_layers=8):
+    def __init__(self, attention_backend, *, hybrid=True, num_layers=8):
         from sgl_jax.srt.configs.qwen4_exp import Qwen4ExpConfig
+        from sgl_jax.srt.model_executor.model_runner import ModelRunner
 
         self.kv_cache_dtype = jnp.bfloat16
         self.page_size = 128
         self.use_mla_backend = False
         self.attention_tp_size = 2
         self.server_args = ServerArgs(model_path="dummy", attention_backend=attention_backend)
-        text = Qwen4ExpConfig(
+        self.server_args.gdn_prefill_impl = "chunked_jax"
+        config = Qwen4ExpConfig(
             text_config=dict(
                 num_hidden_layers=num_layers,
                 full_attention_interval=4,
@@ -360,14 +368,20 @@ class _QSACellSizeRunner(ModelRunnerKVCacheMixin):
                 indexer_n_heads=4,
                 indexer_kv_heads=1,
             )
-        ).text_config
+        )
+        text = config.text_config
         self.model_config = types.SimpleNamespace(
-            hf_config=types.SimpleNamespace(),
+            hf_config=config if hybrid else types.SimpleNamespace(),
             hf_text_config=text,
             head_dim=256,
+            dtype=jnp.bfloat16,
+            context_len=64,
             get_num_kv_heads=lambda _tp: 1,
+            get_total_num_kv_heads_with_replication=lambda _tp: 1,
         )
+        self.mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]).reshape(1, 1), ("data", "tensor"))
         self._num_full = len(text.full_attention_layer_ids)
+        self.attn_backend = ModelRunner._get_attention_backend(self)
 
     def _kv_pool_layer_count(self):
         return self._num_full
@@ -384,11 +398,34 @@ def test_cell_size_charges_for_the_qsa_compressed_cache_only_on_qsa():
     for each full-attention layer. Budgeting only the GQA cache over-provisions
     the pool and the excess comes out of the activation reserve; charging a
     non-QSA backend for it wastes capacity on every other model."""
-    assert _QSACellSizeRunner("fa")._compute_cell_size() == _QSA_GQA_BYTES_PER_TOKEN
+    assert _QSARunner("fa")._compute_cell_size() == _QSA_GQA_BYTES_PER_TOKEN
     assert (
-        _QSACellSizeRunner("qsa_sparse")._compute_cell_size()
+        _QSARunner("qsa_sparse")._compute_cell_size()
         == _QSA_GQA_BYTES_PER_TOKEN + _QSA_INDEXER_BYTES_PER_TOKEN
     )
+
+
+@pytest.mark.parametrize("max_num_reqs", [None, 16])
+def test_aot_sizes_the_ring_by_the_request_limit(max_num_reqs):
+    """The ring has one row per request. AOT export takes the request limit
+    serving resolved from its args, and without args the batch."""
+    from sgl_jax.srt.model_executor.aot_resources import AbstractResources
+
+    runner = _QSARunner("qsa_sparse", hybrid=False)
+    if max_num_reqs is not None:
+        runner.max_num_reqs = max_num_reqs
+    options = types.SimpleNamespace(dp_size=1, batch_size=4, recurrent_capacity=None)
+    pools = AbstractResources.create_pools(runner, options)
+    assert pools.token_to_kv_pool.get_open_group_buffer(0).shape[0] == (max_num_reqs or 4)
+
+
+def test_init_pools_refuses_a_ring_smaller_than_the_request_pool():
+    """Ring writes drop out-of-range rows, so a request slot without a row
+    would lose its open group silently."""
+    runner = _QSARunner("qsa_sparse", hybrid=False)
+    runner.req_to_token_pool = types.SimpleNamespace(size=32)
+    with pytest.raises(ValueError, match="per-request rows"):
+        runner._init_pools(max_num_reqs=16, dp_size=1)
 
 
 @pytest.mark.parametrize(("embedding_pool_bytes", "expected"), [(0, 700), (100, 600)])

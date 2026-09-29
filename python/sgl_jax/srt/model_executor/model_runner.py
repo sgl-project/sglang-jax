@@ -893,6 +893,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 compress_ratio=cfg.indexer_compress_ratio,
                 block_topk=cfg.indexer_budget // cfg.indexer_compress_ratio,
                 full_slot=full_slot,
+                indexer_key_dim=cfg.indexer_head_dim,
             )
 
         elif backend in ("fa", "fa_mha"):

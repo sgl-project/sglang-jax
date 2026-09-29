@@ -18,6 +18,7 @@ import jax.numpy as jnp
 
 from sgl_jax.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
+    MemoryPools,
     MLATokenToKVPool,
     QSATokenToKVPool,
 )
@@ -56,15 +57,19 @@ def _pool(**kw):
 
 
 class TestQSAPoolBuffers(CustomTestCase):
-    def test_geometry_gates(self):
-        """Both conditions are refused at construction: a ratio that does not divide
-        page_size, and a compressed page that is not a whole number of sublanes."""
+    def test_construction_gates(self):
+        """Refused at construction: a ratio that does not divide page_size, a
+        compressed page that is not a whole number of sublanes, and a ring with
+        no request limit to size it."""
         with self.assertRaisesRegex(ValueError, "must divide page_size"):
             _pool(compress_ratio=5)
         # page_size // ratio == 1 is odd, so get_kv_cache_shape would round the
         # compressed page up to 2 and the two caches would stop sharing a page.
         with self.assertRaisesRegex(ValueError, "multiple of the dtype packing"):
             _pool(page_size=4, size=4 * 8, compress_ratio=4)
+        for max_reqs in (0, None):
+            with self.subTest(max_reqs=max_reqs), self.assertRaisesRegex(ValueError, "max_reqs"):
+                _pool(max_reqs=max_reqs)
 
     def test_buffer_shapes(self):
         """The compressed page holds page_size // ratio entries -- the divisor the
@@ -158,17 +163,21 @@ class TestQSAPoolInsideTheHybridWrapper(CustomTestCase):
         )
 
     def test_the_indexer_state_passes_through(self):
+        """The model returns the triple as the pool-update dict's
+        ``token_to_kv_pool`` entry; ``replace_all`` must land all three."""
         hybrid = self._hybrid()
         inner = hybrid.full_kv_pool
         self.assertIs(hybrid.get_compressed_key_buffer(1), inner.get_compressed_key_buffer(1))
         self.assertIs(hybrid.get_open_group_buffer(0), inner.get_open_group_buffer(0))
 
-        hybrid.replace_buffer(
-            (
-                list(inner.kv_buffer),
-                [jnp.full_like(b, 2) for b in inner.compressed_key_buffer],
-                [jnp.full_like(b, 3) for b in inner.open_group_buffer],
-            )
+        MemoryPools(token_to_kv_pool=hybrid).replace_all(
+            {
+                "token_to_kv_pool": (
+                    list(inner.kv_buffer),
+                    [jnp.full_like(b, 2) for b in inner.compressed_key_buffer],
+                    [jnp.full_like(b, 3) for b in inner.open_group_buffer],
+                )
+            }
         )
         self.assertEqual(float(hybrid.get_compressed_key_buffer(1)[0, 0, 0, 0]), 2.0)
         self.assertEqual(float(hybrid.get_open_group_buffer(0)[0, 0, 0]), 3.0)
