@@ -11,7 +11,7 @@ def _call(name, *operands, input_output_aliases=None, **attributes):
     result = operands[0]
     return jax.ffi.ffi_call(
         name,
-        jax.ShapeDtypeStruct(result.shape, result.dtype),
+        jax.ShapeDtypeStruct(result.shape, result.dtype, sharding=jax.typeof(result).sharding),
         vmap_method="sequential",
         input_output_aliases=input_output_aliases,
     )(*operands, **attributes)
