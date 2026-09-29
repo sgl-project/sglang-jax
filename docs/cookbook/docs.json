@@ -93,6 +93,7 @@
                     "group": "Xiaomi",
                     "pages": [
                       "autoregressive/Xiaomi/MiMo-V2-Flash",
+                      "autoregressive/Xiaomi/MiMo-V2.5",
                       "autoregressive/Xiaomi/MiMo-V2.5-Pro",
                       "autoregressive/Xiaomi/MiMo-7B"
                     ]

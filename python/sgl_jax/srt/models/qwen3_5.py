@@ -26,7 +26,6 @@ Key conventions confirmed against the upstream torch reference
 from __future__ import annotations
 
 import logging
-from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -48,6 +47,7 @@ from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
 from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.model_loader.weights import WeightSpec
 from sgl_jax.srt.models.qwen2_moe import Qwen2MoeMLP
 from sgl_jax.srt.models.qwen3_vl import (
     Qwen3VLForConditionalGeneration,
@@ -58,7 +58,6 @@ from sgl_jax.srt.multimodal.in_model.interface import (
     VisionInputSpec,
 )
 from sgl_jax.srt.multimodal.layers.vision_sharding import resolve_encoder_tp
-from sgl_jax.srt.utils.weight_utils import WeightMapping
 
 logger = logging.getLogger(__name__)
 
@@ -682,8 +681,7 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         Uses make_array_from_callback so each host uploads only its local
         shard; jax.device_put on a host-replicated array triggers a
         multihost assert_equal -> process_allgather (16 hosts * 1.5G MoE
-        gate_up = 24G per device -> OOM on 122B/v6e-64). Matches the
-        pattern in weight_utils.py (see comment at :678).
+        gate_up = 24G per device -> OOM on 122B/v6e-64).
         """
         sharding = NamedSharding(self.mesh, P(*spec))
         arr = np.asarray(arr)
@@ -691,40 +689,15 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
             self.dtype
         )
 
-    @staticmethod
-    def _read_host(fm, weight_info, hf_key):
-        """Read a full HF tensor to a host numpy array (no device replication)."""
-        info = weight_info[hf_key][0]
-        return np.asarray(fm.get_handle(info["file"]).get_slice(hf_key)[:])
-
-    def _load_gdn_layer(self, fm, weight_info, layer_idx, tp):
-        """GDN fused projections + conv1d stripe (the only TP>1-sensitive path).
-
-        in_proj_qkvz / in_proj_ba are stored component-major ([Q|K|V|Z], [B|A]);
-        the model layer reshards the sliced q/k/v/z/a/b at runtime. The conv1d
-        weight is stripe-rearranged to rank-major [q_d|k_d|v_d] so the GDN
-        backend's contiguous P("tensor", None) shard_map sees its head shard.
-        """
-        src = f"model.language_model.layers.{layer_idx}.linear_attn"
+    def _gdn_weights(self, inputs, layer_idx, tp):
+        qkv, z, b, a, conv = inputs
         gdn = self.language_model.model.layers[layer_idx].self_attn
-
-        # in_proj_qkvz = concat([in_proj_qkv=[Q|K|V], in_proj_z]) -> [hidden, 2k+2v]
-        qkv = self._read_host(fm, weight_info, f"{src}.in_proj_qkv.weight")  # [2k+v, hidden]
-        z = self._read_host(fm, weight_info, f"{src}.in_proj_z.weight")  # [v, hidden]
-        qkvz = np.concatenate([qkv, z], axis=0).T  # [hidden, 2k+2v], component-major
-        gdn.in_proj_qkvz.weight.value = self._put(qkvz, (None, "tensor"))
-
-        # in_proj_ba = concat([in_proj_b, in_proj_a]) -> [hidden, 2*n_v]
-        b = self._read_host(fm, weight_info, f"{src}.in_proj_b.weight")  # [n_v, hidden]
-        a = self._read_host(fm, weight_info, f"{src}.in_proj_a.weight")
-        ba = np.concatenate([b, a], axis=0).T  # [hidden, 2*n_v]
-        gdn.in_proj_ba.weight.value = self._put(ba, (None, "tensor"))
-
-        # conv1d: HF [conv_dim, 1, K] -> [conv_dim, K] -> rank-major stripe.
-        conv = self._read_host(fm, weight_info, f"{src}.conv1d.weight")
-        conv = conv.reshape(conv.shape[0], conv.shape[-1])  # [conv_dim, K]
-        conv = self._stripe_conv(conv, gdn, tp)
-        gdn.conv1d.weight.value = self._put(conv, ("tensor", None))
+        conv = self._stripe_conv(conv.reshape(conv.shape[0], conv.shape[-1]), gdn, tp)
+        return (
+            self._put(np.concatenate((qkv, z), axis=0).T, (None, "tensor")),
+            self._put(np.concatenate((b, a), axis=0).T, (None, "tensor")),
+            self._put(conv, ("tensor", None)),
+        )
 
     @staticmethod
     def _stripe_conv(conv, gdn, tp):
@@ -742,24 +715,12 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
             blocks.append(v_blk[r * v_tp : (r + 1) * v_tp])
         return np.concatenate(blocks, axis=0)
 
-    def _load_moe_gate_up(self, fm, weight_info, layer_idx):
-        """experts.gate_up_proj [E, 2*inter, hidden] -> w1/w3 [E, hidden, inter]."""
-        src = f"model.language_model.layers.{layer_idx}.mlp.experts.gate_up_proj"
-        block = self.language_model.model.layers[layer_idx].mlp
-        gu = self._read_host(fm, weight_info, src)  # [E, 2*inter, hidden]
-        inter = gu.shape[1] // 2
-        gate = gu[:, :inter, :]  # [E, inter, hidden]  (w1)
-        up = gu[:, inter:, :]  # [E, inter, hidden]   (w3)
-        w1 = np.transpose(gate, (0, 2, 1))  # [E, hidden, inter]
-        w3 = np.transpose(up, (0, 2, 1))
-        block.experts.w1.value = self._put(w1, (("data", "tensor"), None, None))
-        block.experts.w3.value = self._put(w3, (("data", "tensor"), None, None))
+    @staticmethod
+    def _moe_gate_up(inputs):
+        return tuple(value.transpose(0, 2, 1) for value in np.split(inputs[0], 2, axis=1))
 
     def load_weights(self, model_config: ModelConfig):
-        from sgl_jax.srt.utils.weight_utils import (
-            SequentialSafetensorManager,
-            WeightLoader,
-        )
+        from sgl_jax.srt.model_loader.weights import WeightLoader
 
         hf_config = model_config.hf_config
         tc = hf_config.text_config
@@ -771,67 +732,54 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
             hf_config, getattr(self, "lm_head", None)
         )
 
-        # Keys handled manually (concat / stripe / split) — excluded from the
-        # shared loader, which handles every other (simple) weight.
-        special = set()
+        tp = self.mesh.shape.get("tensor", 1)
         for i in gdn_layers:
-            s = f"model.language_model.layers.{i}.linear_attn"
-            special.update(
-                {
-                    f"{s}.in_proj_qkv.weight",
-                    f"{s}.in_proj_z.weight",
-                    f"{s}.in_proj_b.weight",
-                    f"{s}.in_proj_a.weight",
-                    f"{s}.conv1d.weight",
-                }
+            source = f"model.language_model.layers.{i}.linear_attn"
+            target = f"language_model.model.layers.{i}.self_attn"
+            keys = tuple(
+                f"{source}.{name}.weight"
+                for name in (
+                    "in_proj_qkv",
+                    "in_proj_z",
+                    "in_proj_b",
+                    "in_proj_a",
+                    "conv1d",
+                )
             )
-        # Pre-fused experts exist only in MoE variants; dense FFN weights are
-        # simple column/row-parallel and go through the shared loader.
+            for key in keys:
+                mappings.pop(key)
+            mappings[source] = WeightSpec(
+                [f"{target}.{name}.weight" for name in ("in_proj_qkvz", "in_proj_ba", "conv1d")],
+                sources=keys,
+                recipe=lambda inputs, i=i: self._gdn_weights(inputs, i, tp),
+            )
         if is_moe:
             for i in range(num_layers):
-                special.add(f"model.language_model.layers.{i}.mlp.experts.gate_up_proj")
-
-        simple = {k: v for k, v in mappings.items() if k not in special}
-
+                source = f"model.language_model.layers.{i}.mlp.experts.gate_up_proj"
+                mappings[source].sources = (source,)
+                mappings[source].host_recipe = self._moe_gate_up
         loader = WeightLoader(self, model_config, self.mesh, dtype=self.dtype)
-        loader.load_weights_from_safetensors(simple)
-
-        weight_info = loader._scan_weight_info()
-        tp = self.mesh.shape.get("tensor", 1)
-        with SequentialSafetensorManager() as fm:
-            for i in gdn_layers:
-                self._load_gdn_layer(fm, weight_info, i, tp)
-            if is_moe:
-                for i in range(num_layers):
-                    self._load_moe_gate_up(fm, weight_info, i)
-
         if self.visual is not None:
             vision_mappings = Qwen3VLForConditionalGeneration.create_vision_weight_mappings(
                 self.config, self.visual
             )
-            missing_vision = vision_mappings.keys() - weight_info.keys()
-            if missing_vision:
-                raise RuntimeError(f"Missing Qwen3.5 vision weights: {sorted(missing_vision)}")
-            vc = self.config.vision_config
-            vision_config = SimpleNamespace(
-                model_path=model_config.model_path,
-                num_attention_heads=vc.num_heads,
-                hidden_size=vc.hidden_size,
-                get_total_num_kv_heads=lambda: vc.num_heads,
-            )
-            WeightLoader(self, vision_config, self.mesh, self.dtype).load_weights_from_safetensors(
-                vision_mappings
-            )
             mappings.update(vision_mappings)
             visual_skip = []
-        self._log_load_summary(mappings, weight_info, visual_skip, mtp_skip)
+        loader.load(mappings)
+        if not loader.dummy_mode:
+            self._log_load_summary(mappings, loader.metadata, visual_skip, mtp_skip)
 
     @staticmethod
     def _log_load_summary(mappings, weight_info, visual_skip, mtp_skip):
         import re as _re
 
         ckpt = set(weight_info.keys())
-        consumed = {k for k in mappings if k in ckpt}
+        consumed = {
+            source
+            for key, spec in mappings.items()
+            for source in (spec.sources or (key,))
+            if source in ckpt
+        }
         skip_pats = list(visual_skip) + list(mtp_skip)
         skipped = {k for k in ckpt if any(_re.match(p, k) for p in skip_pats)}
         unexpected = ckpt - consumed - skipped
@@ -839,7 +787,14 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
             "WeightLoader summary: consumed=%d, skipped=%d, missing=%d, unexpected=%d",
             len(consumed),
             len(skipped),
-            len([k for k in mappings if k not in ckpt]),
+            len(
+                [
+                    source
+                    for key, spec in mappings.items()
+                    for source in (spec.sources or (key,))
+                    if source not in ckpt
+                ]
+            ),
             len(unexpected),
         )
         if unexpected:
@@ -852,7 +807,7 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
 # =============================================================================
 # Weight mapping table (HF source key -> JAX target). "Simple" entries are
 # consumed by the shared WeightLoader; the 5 GDN-fused / conv1d / MoE gate_up
-# keys are handled manually in load_weights (concat / stripe / split) and their
+# keys form explicit loading groups (concat / stripe / split); their
 # target_path here is only a marker. Every HF text key is a mapping key so the
 # coverage test + load summary account for all of them.
 # =============================================================================
@@ -878,15 +833,15 @@ def _create_qwen3_5_weight_mappings(hf_config, lm_head: ParallelLMHead | None = 
     conv_dim = 2 * key_dim + value_dim
     conv_k = int(tc.linear_conv_kernel_dim)
 
-    mappings: dict[str, WeightMapping] = {}
+    mappings: dict[str, WeightSpec] = {}
 
     # Top-level
-    mappings["model.language_model.embed_tokens.weight"] = WeightMapping(
+    mappings["model.language_model.embed_tokens.weight"] = WeightSpec(
         target_path="language_model.model.embed_tokens.embedding",
         sharding=("tensor", None),
         transpose=False,
     )
-    mappings["model.language_model.norm.weight"] = WeightMapping(
+    mappings["model.language_model.norm.weight"] = WeightSpec(
         target_path="language_model.model.norm.weight",
         sharding=(None,),
         transpose=False,
@@ -903,95 +858,95 @@ def _create_qwen3_5_weight_mappings(hf_config, lm_head: ParallelLMHead | None = 
         dst = f"language_model.model.layers.{i}"
 
         # GemmaRMSNorm -> .weight (both layer types)
-        mappings[f"{src}.input_layernorm.weight"] = WeightMapping(
+        mappings[f"{src}.input_layernorm.weight"] = WeightSpec(
             target_path=f"{dst}.input_layernorm.weight",
             sharding=(None,),
             transpose=False,
         )
-        mappings[f"{src}.post_attention_layernorm.weight"] = WeightMapping(
+        mappings[f"{src}.post_attention_layernorm.weight"] = WeightSpec(
             target_path=f"{dst}.post_attention_layernorm.weight",
             sharding=(None,),
             transpose=False,
         )
 
         if is_full:
-            mappings[f"{src}.self_attn.q_proj.weight"] = WeightMapping(
+            mappings[f"{src}.self_attn.q_proj.weight"] = WeightSpec(
                 target_path=f"{dst}.self_attn.q_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             )
-            mappings[f"{src}.self_attn.k_proj.weight"] = WeightMapping(
+            mappings[f"{src}.self_attn.k_proj.weight"] = WeightSpec(
                 target_path=f"{dst}.self_attn.k_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
                 kv_head_padding=True,
             )
-            mappings[f"{src}.self_attn.v_proj.weight"] = WeightMapping(
+            mappings[f"{src}.self_attn.v_proj.weight"] = WeightSpec(
                 target_path=f"{dst}.self_attn.v_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
                 kv_head_padding=True,
             )
-            mappings[f"{src}.self_attn.o_proj.weight"] = WeightMapping(
+            mappings[f"{src}.self_attn.o_proj.weight"] = WeightSpec(
                 target_path=f"{dst}.self_attn.o_proj.weight",
                 sharding=("tensor", None),
                 transpose=True,
             )
-            mappings[f"{src}.self_attn.q_norm.weight"] = WeightMapping(
+            mappings[f"{src}.self_attn.q_norm.weight"] = WeightSpec(
                 target_path=f"{dst}.self_attn.q_norm.weight",
                 sharding=(None,),
                 transpose=False,
             )
-            mappings[f"{src}.self_attn.k_norm.weight"] = WeightMapping(
+            mappings[f"{src}.self_attn.k_norm.weight"] = WeightSpec(
                 target_path=f"{dst}.self_attn.k_norm.weight",
                 sharding=(None,),
                 transpose=False,
             )
         else:
-            # GDN: 4 HF in-proj keys -> 2 fused JAX params via __FUSED_* sentinels.
-            mappings[f"{src}.linear_attn.in_proj_qkv.weight"] = WeightMapping(
-                target_path=f"__FUSED_QKVZ_QKV_WEIGHT__{i}",
+            # GDN source declarations are combined into one explicit recipe before binding.
+            mappings[f"{src}.linear_attn.in_proj_qkv.weight"] = WeightSpec(
+                target_path=f"{dst}.self_attn.in_proj_qkvz.weight",
                 sharding=(None, None),
                 transpose=False,
             )
-            mappings[f"{src}.linear_attn.in_proj_z.weight"] = WeightMapping(
-                target_path=f"__FUSED_QKVZ_Z_WEIGHT__{i}",
+            mappings[f"{src}.linear_attn.in_proj_z.weight"] = WeightSpec(
+                target_path=f"{dst}.self_attn.in_proj_qkvz.weight",
                 sharding=(None, None),
                 transpose=False,
             )
-            mappings[f"{src}.linear_attn.in_proj_b.weight"] = WeightMapping(
-                target_path=f"__FUSED_BA_B_WEIGHT__{i}",
+            mappings[f"{src}.linear_attn.in_proj_b.weight"] = WeightSpec(
+                target_path=f"{dst}.self_attn.in_proj_ba.weight",
                 sharding=(None, None),
                 transpose=False,
             )
-            mappings[f"{src}.linear_attn.in_proj_a.weight"] = WeightMapping(
-                target_path=f"__FUSED_BA_A_WEIGHT__{i}",
+            mappings[f"{src}.linear_attn.in_proj_a.weight"] = WeightSpec(
+                target_path=f"{dst}.self_attn.in_proj_ba.weight",
                 sharding=(None, None),
                 transpose=False,
             )
             # conv1d HF shape [conv_dim, 1, K] -> [conv_dim, K]; loader stripes it.
-            mappings[f"{src}.linear_attn.conv1d.weight"] = WeightMapping(
+            mappings[f"{src}.linear_attn.conv1d.weight"] = WeightSpec(
                 target_path=f"{dst}.self_attn.conv1d.weight",
                 sharding=("tensor", None),
                 transpose=False,
                 reshape=(conv_dim, conv_k),
             )
-            mappings[f"{src}.linear_attn.A_log"] = WeightMapping(
+            mappings[f"{src}.linear_attn.A_log"] = WeightSpec(
                 target_path=f"{dst}.self_attn.A_log",
                 sharding=("tensor",),
                 transpose=False,
             )
-            mappings[f"{src}.linear_attn.dt_bias"] = WeightMapping(
+            mappings[f"{src}.linear_attn.dt_bias"] = WeightSpec(
                 target_path=f"{dst}.self_attn.dt_bias",
                 sharding=("tensor",),
                 transpose=False,
             )
-            mappings[f"{src}.linear_attn.norm.weight"] = WeightMapping(
+            mappings[f"{src}.linear_attn.norm.weight"] = WeightSpec(
                 target_path=f"{dst}.self_attn.norm.scale",
                 sharding=(None,),
                 transpose=False,
             )
-            mappings[f"{src}.linear_attn.out_proj.weight"] = WeightMapping(
+            mappings[f"{src}.linear_attn.out_proj.weight"] = WeightSpec(
                 target_path=f"{dst}.self_attn.out_proj.weight",
                 sharding=("tensor", None),
                 transpose=True,
@@ -1000,17 +955,17 @@ def _create_qwen3_5_weight_mappings(hf_config, lm_head: ParallelLMHead | None = 
         # FFN. Dense layers carry a plain SwiGLU (mlp.{gate,up,down}_proj); MoE
         # layers carry the pre-fused routed experts + sigmoid-gated shared expert.
         if not is_moe:
-            mappings[f"{src}.mlp.gate_proj.weight"] = WeightMapping(
+            mappings[f"{src}.mlp.gate_proj.weight"] = WeightSpec(
                 target_path=f"{dst}.mlp.gate_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             )
-            mappings[f"{src}.mlp.up_proj.weight"] = WeightMapping(
+            mappings[f"{src}.mlp.up_proj.weight"] = WeightSpec(
                 target_path=f"{dst}.mlp.up_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             )
-            mappings[f"{src}.mlp.down_proj.weight"] = WeightMapping(
+            mappings[f"{src}.mlp.down_proj.weight"] = WeightSpec(
                 target_path=f"{dst}.mlp.down_proj.weight",
                 sharding=("tensor", None),
                 transpose=True,
@@ -1018,39 +973,39 @@ def _create_qwen3_5_weight_mappings(hf_config, lm_head: ParallelLMHead | None = 
             continue
 
         # MoE (all layers when is_moe). Experts are pre-fused on disk.
-        mappings[f"{src}.mlp.gate.weight"] = WeightMapping(
+        mappings[f"{src}.mlp.gate.weight"] = WeightSpec(
             target_path=f"{dst}.mlp.moe_gate.kernel",
             sharding=(None, None),
             transpose=True,
         )
-        mappings[f"{src}.mlp.experts.gate_up_proj"] = WeightMapping(
+        mappings[f"{src}.mlp.experts.gate_up_proj"] = WeightSpec(
             target_path=[f"{dst}.mlp.experts.w1", f"{dst}.mlp.experts.w3"],
             sharding=(("data", "tensor"), None, None),
             transpose=False,
         )
         # HF down_proj [E, hidden, inter] -> w2 [E, inter, hidden] (transpose last 2).
-        mappings[f"{src}.mlp.experts.down_proj"] = WeightMapping(
+        mappings[f"{src}.mlp.experts.down_proj"] = WeightSpec(
             target_path=f"{dst}.mlp.experts.w2",
             sharding=(("data", "tensor"), None, None),
             transpose=False,
             transpose_axes=(0, 2, 1),
         )
-        mappings[f"{src}.mlp.shared_expert.gate_proj.weight"] = WeightMapping(
+        mappings[f"{src}.mlp.shared_expert.gate_proj.weight"] = WeightSpec(
             target_path=f"{dst}.mlp.shared_experts.gate_proj.weight",
             sharding=(None, "tensor"),
             transpose=True,
         )
-        mappings[f"{src}.mlp.shared_expert.up_proj.weight"] = WeightMapping(
+        mappings[f"{src}.mlp.shared_expert.up_proj.weight"] = WeightSpec(
             target_path=f"{dst}.mlp.shared_experts.up_proj.weight",
             sharding=(None, "tensor"),
             transpose=True,
         )
-        mappings[f"{src}.mlp.shared_expert.down_proj.weight"] = WeightMapping(
+        mappings[f"{src}.mlp.shared_expert.down_proj.weight"] = WeightSpec(
             target_path=f"{dst}.mlp.shared_experts.down_proj.weight",
             sharding=("tensor", None),
             transpose=True,
         )
-        mappings[f"{src}.mlp.shared_expert_gate.weight"] = WeightMapping(
+        mappings[f"{src}.mlp.shared_expert_gate.weight"] = WeightSpec(
             target_path=f"{dst}.mlp.shared_expert_gate.weight",
             sharding=(None, None),
             transpose=True,

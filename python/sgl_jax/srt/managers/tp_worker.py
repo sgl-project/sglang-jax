@@ -192,13 +192,12 @@ class ModelWorker:
 
         # precompile
         from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
-        from sgl_jax.srt.models.registry import ModelRegistry
 
         has_recurrent_state = self.model_runner.linear_recurrent_config is not None
         use_multistage_multimodal = server_args.multimodal
         use_in_model_multimodal = (
             self.model_config.is_multimodal
-            and ModelRegistry.is_in_model_multimodal(self.model_config.hf_config.architectures)
+            and self.model_config.is_in_model_multimodal
             and not use_multistage_multimodal
         )
         self.compilation_manager = CompilationManager(

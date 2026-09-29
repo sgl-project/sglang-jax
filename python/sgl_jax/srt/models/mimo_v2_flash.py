@@ -20,8 +20,9 @@ from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK, create_moe_weights_ma
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.model_loader.weights import WeightLoader, WeightSpec
+from sgl_jax.srt.models.mimo_weight_loading import fused_kv_spec, prepare_mimo
 from sgl_jax.srt.utils.parallel_utils import make_reduce_sharding
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
@@ -337,7 +338,7 @@ class MiMoV2Attention(nnx.Module):
             v,
             forward_batch,
             token_to_kv_pool,
-            attention_sink=self.attention_sink_bias.value if self.attention_sink_bias else None,
+            attention_sink=(self.attention_sink_bias.value if self.attention_sink_bias else None),
         )
 
         # V was padded to head_dim for fused KV cache; slice back to v_head_dim
@@ -530,7 +531,17 @@ class MiMoV2Model(nnx.Module):
 
     def __call__(self, forward_batch: ForwardBatch, token_to_kv_pool: KVCache):
         residual = None
-        hidden_states = self.embed_tokens(forward_batch.input_ids)
+        # Multimodal path seeds merged token + vision/audio embeddings via
+        # ``forward_batch.input_embedding`` (set by ``embed_multimodal_inputs``
+        # during extend); text-only batches leave it None and embed input_ids.
+        input_embeds = (
+            forward_batch.input_embedding
+            if forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            else None
+        )
+        hidden_states = (
+            self.embed_tokens(forward_batch.input_ids) if input_embeds is None else input_embeds
+        )
 
         layers_kv_fused = []
         layers_topk_ids = []
@@ -567,7 +578,6 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         self.model = MiMoV2Model(config, dtype=self.dtype, mesh=mesh)
         # Buffer to hold raw FP8 K/V weights+scales for per-head fused dequant.
         # Populated during weight loading, consumed by WeightLoader.dequant_fused_kv().
-        self._kv_buffers: dict[int, dict] = {}
 
         if not getattr(self.config, "tie_word_embeddings", True):
             self.lm_head = ParallelLMHead(
@@ -586,10 +596,6 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         )
 
     def load_weights(self, model_config: ModelConfig):
-        # Pre-warm GCSFuse cache: sequential read of large safetensors files
-        # dramatically speeds up subsequent random-access MoE expert loading.
-        self._warmup_safetensors_cache(model_config)
-
         self.loader = WeightLoader(
             model=self,
             model_config=model_config,
@@ -598,97 +604,28 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         )
         self._quant_config = model_config.quantization_config
         weight_mappings = self._create_weight_mappings()
-        self.loader.load_weights_from_safetensors(weight_mappings)
+        self.loader.load(weight_mappings)
         logger.info("MiMoV2Flash weights loaded successfully!")
 
-        # Post-load: dequantize FP8 attention + layer-0 MLP to bf16.
-        if self.loader.is_static_quant:
-            head_dim = self.config.head_dim
-            v_head_dim = getattr(self.config, "v_head_dim", head_dim)
-            # 1. Dequant Q only (K/V go through fused KV path via _kv_buffers)
-            self.loader.dequant_fp8_layers(
-                self.model.layers,
-                specs=[("self_attn.q_proj", head_dim)],
-            )
-            # 2. Fused KV per-head dequant (cross K/V boundary blocks)
-            self.loader.dequant_fused_kv(self._kv_buffers, self.model.layers, self.config)
-            # 3. Layer-0 dense MLP
-            self.loader.dequant_fp8_layers(
-                self.model.layers,
-                specs=[
-                    ("mlp.gate_proj", None),
-                    ("mlp.up_proj", None),
-                    ("mlp.down_proj", None),
-                ],
-                layer_filter=lambda idx, layer: idx == 0 and not layer.is_layer_sparse,
-            )
-            # 4. KV head replication for TP alignment
-            self.loader.replicate_kv_heads(
-                self.model.layers,
-                specs=[("self_attn.k_proj", head_dim), ("self_attn.v_proj", v_head_dim)],
-                target_kv_heads_fn=lambda attn: attn.k_head_num,
-            )
-
-    @staticmethod
-    def _warmup_safetensors_cache(model_config: ModelConfig):
-        """Pre-read safetensors files to warm GCSFuse cache.
-
-        GCSFuse random reads are ~400ms per tensor (cold) vs ~1ms (warm).
-        Sequential bulk read fills the cache so MoE loading uses warm reads.
-        """
-        import glob
-        import os
-        from concurrent.futures import ThreadPoolExecutor
-
-        model_path = model_config.model_path
-        # Only useful on GCSFuse (cold random reads ~400ms); skip on block-device mounts.
-        try:
-            with open("/proc/mounts") as fp:
-                ms = [ln.split() for ln in fp]
-            mp = max((m for m in ms if model_path.startswith(m[1])), key=lambda m: len(m[1]))
-            if "fuse" not in mp[2]:
-                logger.info("model_path on %s mount, skipping GCSFuse warm-up", mp[2])
-                return
-        except Exception:  # noqa: BLE001
-            pass
-        st_files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
-        if not st_files:
-            return
-
-        total_size = sum(os.path.getsize(f) for f in st_files)
-        logger.info(
-            "Warming up GCSFuse cache: %d files, %.1f GB",
-            len(st_files),
-            total_size / 1024**3,
-        )
-
-        def _read_file(path):
-            """Read file sequentially to populate GCSFuse cache."""
-            buf = bytearray(4 * 1024 * 1024)  # 4MB buffer
-            with open(path, "rb") as f:
-                while f.readinto(buf):
-                    pass
-
-        import time
-
-        t0 = time.time()
-        with ThreadPoolExecutor(max_workers=min(8, len(st_files))) as executor:
-            list(executor.map(_read_file, st_files))
-        t1 = time.time()
-        logger.info(
-            "GCSFuse cache warm-up done: %.1fs (%.0f MB/s)",
-            t1 - t0,
-            total_size / 1024**2 / (t1 - t0) if t1 > t0 else 0,
+    def prepare_weight_loading(self, loader, mappings):
+        return prepare_mimo(
+            self,
+            loader,
+            mappings,
+            [
+                (f"model.layers.{i}", layer, i == 0 and not layer.is_layer_sparse)
+                for i, layer in enumerate(self.model.layers)
+            ],
         )
 
     def _create_weight_mappings(self) -> dict:
         mappings = {
-            "model.embed_tokens.weight": WeightMapping(
+            "model.embed_tokens.weight": WeightSpec(
                 target_path="model.embed_tokens.embedding",
                 sharding=("tensor", None),
                 transpose=False,
             ),
-            "model.norm.weight": WeightMapping(
+            "model.norm.weight": WeightSpec(
                 target_path="model.norm.scale",
                 sharding=(None,),
                 transpose=False,
@@ -720,25 +657,20 @@ class MiMoV2FlashForCausalLM(nnx.Module):
             hf_key = f"{prefix}.self_attn.{proj}"
             ignored = self.loader.is_quant_ignored(hf_key)
 
-            # FP8 K/V: bypass QuantizedLinear, store raw FP8 data for fused
-            # per-head dequant (cross K/V boundary blocks).
             if is_fp8 and not ignored and proj in ("k_proj", "v_proj"):
-                kv_key = "K" if proj == "k_proj" else "V"
-                mappings[f"{hf_key}.weight"] = WeightMapping(
-                    target_path=f"__KV_{kv_key}_WEIGHT__{layer_idx}",
-                    sharding=(None, None),
-                    transpose=False,
-                )
-                mappings[f"{hf_key}.weight_scale_inv"] = WeightMapping(
-                    target_path=f"__KV_{kv_key}_SCALE__{layer_idx}",
-                    sharding=(None, None),
-                    transpose=False,
-                )
+                if proj == "k_proj":
+                    mappings[f"{prefix}.self_attn.kv"] = fused_kv_spec(
+                        f"{prefix}.self_attn",
+                        f"{target}.self_attn",
+                        self.model.layers[layer_idx].self_attn,
+                        self.mesh,
+                        self._quant_config.weight_block_size[0],
+                    )
                 continue
 
             weight_suffix = "weight" if (not is_fp8 or ignored) else "weight_q"
 
-            mappings[f"{hf_key}.weight"] = WeightMapping(
+            mappings[f"{hf_key}.weight"] = WeightSpec(
                 target_path=f"{target}.self_attn.{proj}.{weight_suffix}",
                 sharding=sharding,
                 transpose=True,
@@ -747,7 +679,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
             )
 
             if is_fp8 and not ignored:
-                mappings[f"{hf_key}.weight_scale_inv"] = WeightMapping(
+                mappings[f"{hf_key}.weight_scale_inv"] = WeightSpec(
                     target_path=f"{target}.self_attn.{proj}.weight_scale",
                     sharding=(None, None),
                     transpose=False,
@@ -763,19 +695,19 @@ class MiMoV2FlashForCausalLM(nnx.Module):
             not is_swa and getattr(self.config, "add_full_attention_sink_bias", False)
         )
         if has_sink_bias:
-            mappings[f"{prefix}.self_attn.attention_sink_bias"] = WeightMapping(
+            mappings[f"{prefix}.self_attn.attention_sink_bias"] = WeightSpec(
                 target_path=f"{target}.self_attn.attention_sink_bias",
                 sharding=("tensor",),
                 transpose=False,
             )
 
         # Layernorms
-        mappings[f"{prefix}.input_layernorm.weight"] = WeightMapping(
+        mappings[f"{prefix}.input_layernorm.weight"] = WeightSpec(
             target_path=f"{target}.input_layernorm.scale",
             sharding=(None,),
             transpose=False,
         )
-        mappings[f"{prefix}.post_attention_layernorm.weight"] = WeightMapping(
+        mappings[f"{prefix}.post_attention_layernorm.weight"] = WeightSpec(
             target_path=f"{target}.post_attention_layernorm.scale",
             sharding=(None,),
             transpose=False,
@@ -791,7 +723,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
 
         if is_sparse:
             # MoE gate
-            mappings[f"{prefix}.mlp.gate.weight"] = WeightMapping(
+            mappings[f"{prefix}.mlp.gate.weight"] = WeightSpec(
                 target_path=f"{target}.mlp.moe_gate.kernel",
                 sharding=(None, None),
                 transpose=True,
@@ -799,7 +731,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
 
             # Correction bias for noaux_tc
             if getattr(self.config, "topk_method", "greedy") == "noaux_tc":
-                mappings[f"{prefix}.mlp.gate.e_score_correction_bias"] = WeightMapping(
+                mappings[f"{prefix}.mlp.gate.e_score_correction_bias"] = WeightSpec(
                     target_path=f"{target}.mlp.correction_bias",
                     sharding=(None,),
                     transpose=False,
@@ -831,8 +763,8 @@ class MiMoV2FlashForCausalLM(nnx.Module):
                 for key, mapping in moe_mappings.items():
                     augmented[key] = mapping
                     # Add scale mapping for each MoE group
-                    target_param = mapping.target_path[0]
-                    src_paths = mapping.target_path[1:]
+                    target_param = mapping.target_path
+                    src_paths = mapping.sources
                     scale_key = key + "_scale"
                     scale_target = target_param + "_scale"
                     scale_srcs = [p.replace(".weight", ".weight_scale_inv") for p in src_paths]
@@ -841,8 +773,9 @@ class MiMoV2FlashForCausalLM(nnx.Module):
                         if use_model_mesh_for_scale
                         else ("expert", None, None)
                     )
-                    augmented[scale_key] = WeightMapping(
-                        target_path=[scale_target] + scale_srcs,
+                    augmented[scale_key] = WeightSpec(
+                        target_path=scale_target,
+                        sources=tuple(scale_srcs),
                         sharding=scale_sharding,
                         transpose=use_model_mesh_for_scale,
                         concat_axis=mapping.concat_axis,
@@ -860,13 +793,13 @@ class MiMoV2FlashForCausalLM(nnx.Module):
             ]:
                 hf_key = f"{prefix}.mlp.{proj}"
                 weight_suffix = "weight_q" if is_fp8 else "weight"
-                mappings[f"{hf_key}.weight"] = WeightMapping(
+                mappings[f"{hf_key}.weight"] = WeightSpec(
                     target_path=f"{target}.mlp.{proj}.{weight_suffix}",
                     sharding=sharding,
                     transpose=True,
                 )
                 if is_fp8:
-                    mappings[f"{hf_key}.weight_scale_inv"] = WeightMapping(
+                    mappings[f"{hf_key}.weight_scale_inv"] = WeightSpec(
                         target_path=f"{target}.mlp.{proj}.weight_scale",
                         sharding=(None, None),
                         transpose=False,

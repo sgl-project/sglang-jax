@@ -11,6 +11,7 @@ from jax.sharding import PartitionSpec as P
 from sgl_jax.srt.layers.activation import ACT2FN
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
+from sgl_jax.srt.model_loader.weights import WeightLoader
 from sgl_jax.srt.multimodal.configs.dits.flux_model_config import FluxModelConfig
 from sgl_jax.srt.multimodal.layers.adalayernorm import (
     FluxAdaLayerNormContinuous,
@@ -26,7 +27,6 @@ from sgl_jax.srt.multimodal.layers.visual_embedding import (
     _apply_flux_rotary_emb,
 )
 from sgl_jax.srt.multimodal.models.dits.flux_dit_weights_mapping import to_mappings
-from sgl_jax.srt.utils.weight_utils import WeightLoader
 
 logger = logging.getLogger(__name__)
 _SUPPORTED_ATTENTION_IMPLS = ("usp", "sdpa")
@@ -777,9 +777,7 @@ class FluxTransformer2DModel(nnx.Module):
             mesh=self.mesh,
             dtype=self.model_config.weights_dtype,
         )
-        loader.load_weights_from_safetensors(
-            to_mappings(has_guidance_embeds=self.model_config.guidance_embeds)
-        )
+        loader.load(to_mappings(has_guidance_embeds=self.model_config.guidance_embeds))
 
 
 EntryClass = FluxTransformer2DModel

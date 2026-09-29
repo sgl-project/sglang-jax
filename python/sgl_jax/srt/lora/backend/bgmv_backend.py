@@ -231,33 +231,27 @@ class BgmvLoRABackend(BaseLoRABackend):
         target_len = model_worker_batch.input_ids.shape[0]
 
         if model_worker_batch.forward_mode == ForwardMode.EXTEND:
-            scalings_cpu = np.repeat(
-                np.array(scalings_bs, dtype=np.float32), model_worker_batch.extend_seq_lens
-            )
-
-            lora_token_indices_cpu = np.repeat(
-                np.array(weight_indices, dtype=np.int32), model_worker_batch.extend_seq_lens
-            )
-            lora_ranks_cpu = np.repeat(
-                np.array(lora_ranks_bs, dtype=np.int32), model_worker_batch.extend_seq_lens
-            )
-
-            num_to_pad = target_len - np.sum(model_worker_batch.extend_seq_lens)
-
-            padded_scalings_cpu = scalings_cpu
-            padded_lora_token_indices_cpu = lora_token_indices_cpu
-            padded_lora_ranks_cpu = lora_ranks_cpu
-
-            if num_to_pad > 0:
-                padded_scalings_cpu = np.pad(
-                    scalings_cpu, [0, num_to_pad], mode="constant", constant_values=0.0
+            # Requests and tokens both have independent fixed-size DP slots.
+            # Repeating globally would place rank 1's adapters in rank 0's
+            # token padding whenever the ranks have different prefill lengths.
+            dp_size = model_worker_batch.dp_size
+            assert len(weight_indices) % dp_size == 0 and target_len % dp_size == 0
+            per_dp_bs = len(weight_indices) // dp_size
+            per_dp_tokens = target_len // dp_size
+            padded_scalings_cpu = np.zeros(target_len, dtype=np.float32)
+            padded_lora_token_indices_cpu = np.zeros(target_len, dtype=np.int32)
+            padded_lora_ranks_cpu = np.zeros(target_len, dtype=np.int32)
+            for rank in range(dp_size):
+                req_slice = slice(rank * per_dp_bs, (rank + 1) * per_dp_bs)
+                lengths = model_worker_batch.extend_seq_lens[req_slice]
+                num_tokens = int(np.sum(lengths))
+                assert num_tokens <= per_dp_tokens
+                token_slice = slice(rank * per_dp_tokens, rank * per_dp_tokens + num_tokens)
+                padded_scalings_cpu[token_slice] = np.repeat(scalings_bs[req_slice], lengths)
+                padded_lora_token_indices_cpu[token_slice] = np.repeat(
+                    weight_indices[req_slice], lengths
                 )
-                padded_lora_token_indices_cpu = np.pad(
-                    lora_token_indices_cpu, [0, num_to_pad], mode="constant", constant_values=0
-                )
-                padded_lora_ranks_cpu = np.pad(
-                    lora_ranks_cpu, [0, num_to_pad], mode="constant", constant_values=0
-                )
+                padded_lora_ranks_cpu[token_slice] = np.repeat(lora_ranks_bs[req_slice], lengths)
         elif model_worker_batch.forward_mode == ForwardMode.DECODE:
             padded_scalings_cpu = np.array(scalings_bs, dtype=np.float32)
             padded_lora_token_indices_cpu = np.array(weight_indices, dtype=np.int32)

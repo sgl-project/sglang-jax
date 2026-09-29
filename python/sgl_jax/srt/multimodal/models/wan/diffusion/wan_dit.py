@@ -8,6 +8,7 @@ from flax import nnx
 from sgl_jax.srt.layers.embeddings import apply_rotary_emb
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
+from sgl_jax.srt.model_loader.weights import WeightLoader
 from sgl_jax.srt.multimodal.configs.dits.wan_model_config import WanModelConfig
 from sgl_jax.srt.multimodal.layers.attention.layer import USPAttention
 from sgl_jax.srt.multimodal.layers.layernorm import (
@@ -26,7 +27,6 @@ from sgl_jax.srt.multimodal.models.wan.diffusion.wan_dit_weights_mapping import 
     to_i2v_mappings,
     to_mappings,
 )
-from sgl_jax.srt.utils.weight_utils import WeightLoader
 
 logger = logging.getLogger(__name__)
 
@@ -781,7 +781,7 @@ class WanTransformer3DModel(nnx.Module):
                 model_config=self.model_config,
                 mesh=self.mesh,
             )
-            loader.load_weights_from_safetensors(weight_mappings)
+            loader.load(weight_mappings)
             logger.info("Weights loaded successfully for WanTransformer3DModel")
         finally:
             if original_path is not None:

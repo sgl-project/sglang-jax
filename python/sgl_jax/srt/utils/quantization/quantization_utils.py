@@ -183,7 +183,11 @@ def apply_linear_quantization(
 
         # Try to iterate through attributes
         if hasattr(obj, "__dict__"):
+            # Models can keep named child modules in their original precision.
+            unquantized_modules = getattr(obj, "unquantized_modules", ())
             for attr_name, attr_value in list(obj.__dict__.items()):
+                if attr_name in unquantized_modules:
+                    continue
                 child_path = f"{path}/{attr_name}" if path else attr_name
 
                 if isinstance(attr_value, LinearBase):
@@ -297,7 +301,11 @@ def apply_moe_quantization(
 
         # Try to iterate through attributes
         if hasattr(obj, "__dict__"):
+            # Models can keep named child modules in their original precision.
+            unquantized_modules = getattr(obj, "unquantized_modules", ())
             for attr_name, attr_value in obj.__dict__.items():
+                if attr_name in unquantized_modules:
+                    continue
                 child_path = f"{path}/{attr_name}" if path else attr_name
                 if isinstance(attr_value, nnx.Module):
                     _quantize_moe_recursive(attr_value, child_path, visited)

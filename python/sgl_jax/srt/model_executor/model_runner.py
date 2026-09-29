@@ -52,8 +52,7 @@ from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
     _build_non_hybrid_memory_pools,
 )
-from sgl_jax.srt.model_loader.loader import get_model_loader
-from sgl_jax.srt.models.registry import ModelRegistry
+from sgl_jax.srt.model_loader.loader import get_model_loader, validate_model_parameters
 from sgl_jax.srt.multimodal.in_model.embedding_pool import EmbeddingPool
 from sgl_jax.srt.multimodal.in_model.host_orchestration import (
     MultimodalBatch,
@@ -84,7 +83,7 @@ def _embedding_pool_bytes(
     """Per-device byte budget reserved for the multimodal embedding pool."""
     enabled = (
         getattr(model_config, "is_multimodal", False)
-        and ModelRegistry.is_in_model_multimodal(model_config.hf_config.architectures)
+        and model_config.is_in_model_multimodal
         and not is_draft_worker
         and not server_args.multimodal
         and not server_args.enable_lora
@@ -157,6 +156,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             load_config=LoadConfig(
                 load_format=server_args.load_format,
                 download_dir=server_args.download_dir,
+                model_loader_extra_config=server_args.model_loader_extra_config,
                 model_class=model_class,
             ),
             mesh=self.mesh,
@@ -271,6 +271,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         )
 
     def initialize_jit(self):
+        validate_model_parameters(self.model)
         model_def, model_state = nnx.split(self.model)
         # note export for external modification
         self.model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
@@ -320,6 +321,26 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
         jitted_sampler = make_jitted_sampler(base_rng_key, sampler_compiler_options)
 
+        # Retain the serving JIT definitions for compile-only preparation.
+        # Warmup still calls the ordinary wrappers and threads donated pools.
+        self._lower_model = lambda batch, metadata: jitted_run_model.lower(
+            model_def,
+            model_state_def,
+            self.model_state_leaves,
+            batch,
+            self.memory_pools,
+            metadata,
+        )
+        self._lower_sampler = lambda logits, metadata: jitted_sampler.lower(
+            sampler_def,
+            sampler_state_def,
+            sampler_state_leaves,
+            self._sampler_step,
+            logits,
+            metadata,
+        )
+        self._lower_compute_logprobs = partial(jitted_compute_logprobs.lower, self.mesh)
+
         aot_model_dir = self.server_args.aot_model_dir
         executable_store = None
         if aot_model_dir:
@@ -327,15 +348,38 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
             executable_store = ExecutableStore(aot_model_dir, self.mesh)
 
-        # Explicit offline loading and opt-in online compilation share one
-        # per-shape executable cache. The default pjit path is unchanged.
+        # Offline loading and opt-in AOT dispatch share an executable cache.
+        # Parallel precompile also warms JAX's cache for the ordinary pjit path.
         use_aot_dispatch = aot_dispatch_requested()
+        self.parallel_precompile = (
+            self.server_args.precompile_num_threads > 1
+            and not self.server_args.disable_precompile
+            and executable_store is None
+            and not self.server_args.speculative_algorithm
+            and not self.server_args.enable_lora
+            and not self.server_args.enable_static_lora
+            and not self.model_config.is_multimodal
+            and not self.server_args.multimodal
+        )
+        if self.server_args.precompile_num_threads > 1 and not self.parallel_precompile:
+            logger.info(
+                "Parallel precompile is unavailable for this configuration; using serial warmup"
+            )
         if use_aot_dispatch and self.server_args.speculative_algorithm:
             logger.warning(
                 "SGLANG_JAX_AOT_DISPATCH is set but speculative decoding is "
                 "enabled; disabling the fast execute_sharded dispatch path."
             )
             use_aot_dispatch = False
+
+        # Match the exact compile options used by the selected serving path so
+        # both ordinary JIT and AOT dispatch reuse JAX's compiled-executable cache.
+        self.model_compile_options = lambda batch: (
+            CompilationManager.compiler_options(self.attn_backend, batch.forward_batch)
+            if use_aot_dispatch
+            else None
+        )
+        self.sampler_compile_options = sampler_compiler_options if use_aot_dispatch else None
 
         if use_aot_dispatch or executable_store is not None:
             self._run_model_dispatcher = AotDispatcher(
@@ -858,6 +902,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
         return attn_backend_wrapper(self, full_attn_backend)
 
+    def lower_model(self, batch):
+        """Prepare forward metadata and lower under the caller's model mesh."""
+        self.attn_backend.forward_metadata = self.attn_backend.get_forward_metadata(batch)
+        logits_metadata = LogitsMetadata.from_model_worker_batch(batch, self.mesh)
+        return self._lower_model(batch.forward_batch, logits_metadata)
+
     def _forward(
         self,
         forward_batch: ForwardBatch,
@@ -931,15 +981,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
     ) -> tuple[LogitsProcessorOutput, int]:
         raise NotImplementedError("forward_idle is not implemented")
 
-    def forward(
+    def prepare_multimodal_inputs(
         self,
         forward_batch: ForwardBatch,
-        logits_metadata: LogitsMetadata,
         multimodal_batch: MultimodalBatch | None = None,
-    ) -> tuple[LogitsProcessorOutput, int]:
-        self.forward_pass_id += 1
-        precision_tracer.start_batch_trace(forward_batch.bid)
-        precision_tracer.set_current_forward_pass_id(self.forward_pass_id)
+    ) -> None:
+        """Prepare encoder embeddings before ordinary or fused model calls."""
         if isinstance(self.model, InModelMultimodalContract) and forward_batch.forward_mode in (
             ForwardMode.EXTEND,
             ForwardMode.MIXED,
@@ -953,6 +1000,17 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             forward_batch.input_embedding = input_embedding
             forward_batch.deepstack_visual_embedding = deepstack
             forward_batch.apply_for_deepstack = apply_for_deepstack
+
+    def forward(
+        self,
+        forward_batch: ForwardBatch,
+        logits_metadata: LogitsMetadata,
+        multimodal_batch: MultimodalBatch | None = None,
+    ) -> tuple[LogitsProcessorOutput, int]:
+        self.forward_pass_id += 1
+        precision_tracer.start_batch_trace(forward_batch.bid)
+        precision_tracer.set_current_forward_pass_id(self.forward_pass_id)
+        self.prepare_multimodal_inputs(forward_batch, multimodal_batch)
         with jax.profiler.TraceAnnotation("_forward_raw"):
             ret = self._forward_raw(forward_batch, logits_metadata)
         return ret

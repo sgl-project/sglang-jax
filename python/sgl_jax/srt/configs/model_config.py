@@ -50,6 +50,7 @@ _FUSED_MOE_V2_SUPPORTED_ARCHITECTURES = frozenset(
         "BailingMoeV2ForCausalLM",
         "BailingMoeV2_5ForCausalLM",
         "MiMoV2ForCausalLM",
+        "MiMoV2ForConditionalGeneration",
         "MiMoV2FlashForCausalLM",
         "GlmMoeDsaForCausalLM",
     }
@@ -113,8 +114,10 @@ class ModelConfig:
         moe_dp_size: int = 1,
         model_sub_dir: str | None = None,
         hf_config: PretrainedConfig | None = None,
+        model_weights: str | None = None,
     ) -> None:
         self.model_path = model_path
+        self.model_weights = model_weights
         self.model_sub_dir = model_sub_dir
         self.revision = revision
         self.model_impl = model_impl
@@ -587,14 +590,16 @@ class ModelConfig:
         `attention_arch` for backend selection — so patches land in time.
         Import is lazy because model modules import ModelConfig back.
         """
-        from sgl_jax.srt.models.registry import ModelRegistry
+        from sgl_jax.srt.model_loader.arch import get_model_architecture
         from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
 
+        self.is_in_model_multimodal = False
         try:
-            model_cls, _ = ModelRegistry.resolve_model_cls(self.hf_config.architectures)
+            model_cls, _ = get_model_architecture(self)
         except ValueError:
             return
-        self.is_multimodal |= issubclass(model_cls, InModelMultimodalContract)
+        self.is_in_model_multimodal = issubclass(model_cls, InModelMultimodalContract)
+        self.is_multimodal |= self.is_in_model_multimodal
         patch = getattr(model_cls, "patch_model_config", None)
         if patch is not None:
             patch(self)
@@ -609,6 +614,9 @@ class ModelConfig:
         model_sub_dir = getattr(server_args, "model_sub_dir", None)
         return ModelConfig(
             model_path=model_path or server_args.model_path,
+            model_weights=getattr(server_args, "runai_model_paths", {}).get(
+                model_path or server_args.model_path
+            ),
             trust_remote_code=server_args.trust_remote_code,
             revision=model_revision or server_args.revision,
             context_length=server_args.context_length,
@@ -945,6 +953,15 @@ class ModelConfig:
 
         """
         from sgl_jax.srt.utils.common_utils import is_remote_url
+        from sgl_jax.srt.utils.runai_utils import download_metadata, is_gcs_path
+
+        # A serialized config can reach a worker with a separate host-local cache.
+        if (
+            self.model_weights
+            and is_gcs_path(self.model_weights)
+            and not os.path.isdir(self.model_path)
+        ):
+            self.model_path = download_metadata(self.model_weights)
 
         if is_remote_url(self.model_path):
             raise ValueError(
@@ -1041,6 +1058,7 @@ multimodal_model_archs = [
     "LlavaQwenForCausalLM",
     "LlavaForConditionalGeneration",
     "LlavaVidForCausalLM",
+    "MiMoV2ForConditionalGeneration",
     "MiniCPMO",
     "MiniCPMV",
     "Mistral3ForConditionalGeneration",

@@ -4,7 +4,6 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import numpy as np
-import safetensors
 from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -20,6 +19,7 @@ from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.model_loader.weights import WeightLoader, WeightSpec
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
 from sgl_jax.srt.multimodal.in_model.interface import (
     InModelMultimodalContract,
@@ -32,7 +32,6 @@ from sgl_jax.srt.multimodal.in_model.lane_packing import (
 from sgl_jax.srt.multimodal.layers.vision_sharding import resolve_encoder_tp
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.utils.profiling_utils import named_scope
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
@@ -622,123 +621,58 @@ class Gemma4ForCausalLM(nnx.Module):
         weight_mappings = self._create_gemma4_weight_mappings()
         if not loader.dummy_mode:
             # Filter weight mappings to match exact safetensors index keys, preventing false-positive "weight not found" errors
-            weight_info = loader._scan_weight_info()
+            weight_info = loader.metadata
             weight_mappings = {k: v for k, v in weight_mappings.items() if k in weight_info}
-
-        loader.load_weights_from_safetensors(weight_mappings)
+            if hasattr(self, "lm_head") and not any(
+                spec.target_path == "lm_head.embedding" for spec in weight_mappings.values()
+            ):
+                self.lm_head.embedding = self.model.embed_tokens.embedding
 
         if getattr(self.config, "enable_moe_block", False) and not loader.dummy_mode:
-            weight_info = loader._scan_weight_info()
-            for layer_idx, layer in enumerate(self.model.layers):
-                if layer.enable_moe_block and layer.experts is not None:
-                    key_gu = f"model.language_model.layers.{layer_idx}.experts.gate_up_proj"
-                    if key_gu not in weight_info:
-                        key_gu = (
-                            f"model.language_model.layers.{layer_idx}.experts.gate_up_proj.weight"
+            for i, layer in enumerate(self.model.layers):
+                if not layer.enable_moe_block or layer.experts is None:
+                    continue
+                for source_name, targets in (
+                    ("gate_up_proj", ("wi_0", "wi_1")),
+                    ("down_proj", ("wo",)),
+                ):
+                    candidates = (
+                        f"model.language_model.layers.{i}.experts.{source_name}",
+                        f"model.language_model.layers.{i}.experts.{source_name}.weight",
+                        f"model.layers.{i}.experts.{source_name}",
+                    )
+                    source = next((key for key in candidates if key in loader.metadata), None)
+                    if source is None:
+                        raise ValueError(f"Missing Gemma expert input: {candidates}")
+                    axes = (
+                        ("expert", "tensor", None)
+                        if source_name == "down_proj"
+                        else ("expert", None, "tensor")
+                    )
+
+                    def convert(inputs, count=len(targets)):
+                        return tuple(
+                            value.transpose(0, 2, 1) for value in np.split(inputs[0], count, axis=1)
                         )
-                    if key_gu not in weight_info:
-                        key_gu = f"model.layers.{layer_idx}.experts.gate_up_proj"
-                    if key_gu in weight_info:
-                        fn = weight_info[key_gu][0]["file"]
-                        with safetensors.safe_open(fn, framework="np", device="cpu") as f:
-                            tensor = f.get_tensor(key_gu)
-                            F = tensor.shape[1] // 2
-                            w0 = np.transpose(tensor[:, :F, :], (0, 2, 1))
-                            w1 = np.transpose(tensor[:, F:, :], (0, 2, 1))
-                            sharding_w0 = (
-                                jax.sharding.NamedSharding(
-                                    layer.experts.moe_mesh, P("expert", None, "tensor")
-                                )
-                                if hasattr(layer.experts, "moe_mesh")
-                                else None
-                            )
-                            layer.experts.wi_0.value = (
-                                jax.device_put(w0.astype(jnp.float32), sharding_w0).astype(
-                                    self.dtype
-                                )
-                                if sharding_w0
-                                else jnp.array(w0, dtype=self.dtype)
-                            )
-                            layer.experts.wi_1.value = (
-                                jax.device_put(w1.astype(jnp.float32), sharding_w0).astype(
-                                    self.dtype
-                                )
-                                if sharding_w0
-                                else jnp.array(w1, dtype=self.dtype)
-                            )
 
-                    key_down = f"model.language_model.layers.{layer_idx}.experts.down_proj"
-                    if key_down not in weight_info:
-                        key_down = (
-                            f"model.language_model.layers.{layer_idx}.experts.down_proj.weight"
-                        )
-                    if key_down not in weight_info:
-                        key_down = f"model.layers.{layer_idx}.experts.down_proj"
-                    if key_down in weight_info:
-                        fn = weight_info[key_down][0]["file"]
-                        with safetensors.safe_open(fn, framework="np", device="cpu") as f:
-                            tensor = f.get_tensor(key_down)
-                            wo = np.transpose(tensor, (0, 2, 1))
-                            sharding_wo = (
-                                jax.sharding.NamedSharding(
-                                    layer.experts.moe_mesh, P("expert", "tensor", None)
-                                )
-                                if hasattr(layer.experts, "moe_mesh")
-                                else None
-                            )
-                            layer.experts.wo.value = (
-                                jax.device_put(wo.astype(jnp.float32), sharding_wo).astype(
-                                    self.dtype
-                                )
-                                if sharding_wo
-                                else jnp.array(wo, dtype=self.dtype)
-                            )
-
-        if getattr(self.config, "enable_moe_block", False) and loader.dummy_mode:
-            ep_size = getattr(self.config, "ep_size", 1)
-            world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
-            tp_size = world_size // ep_size
-            devices = self.mesh.devices.flatten()
-            moe_mesh = jax.sharding.Mesh(
-                devices.reshape(ep_size, tp_size),
-                axis_names=("expert", "tensor"),
-                axis_types=(jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit),
-            )
-            for layer in self.model.layers:
-                if layer.enable_moe_block and layer.experts is not None:
-                    sharding_wi = jax.sharding.NamedSharding(moe_mesh, P("expert", None, "tensor"))
-                    sharding_wo = jax.sharding.NamedSharding(moe_mesh, P("expert", "tensor", None))
-
-                    shape_wi0 = layer.experts.wi_0.value.shape
-                    shape_wi1 = layer.experts.wi_1.value.shape
-                    shape_wo = layer.experts.wo.value.shape
-
-                    layer.experts.wi_0.value = jax.device_put(
-                        jnp.zeros(shape_wi0, dtype=self.dtype), sharding_wi
+                    weight_mappings[source] = WeightSpec(
+                        [f"model.layers.{i}.experts.{name}" for name in targets],
+                        sources=(source,),
+                        host_recipe=convert,
+                        sharding=axes,
                     )
-                    layer.experts.wi_1.value = jax.device_put(
-                        jnp.zeros(shape_wi1, dtype=self.dtype), sharding_wi
-                    )
-                    layer.experts.wo.value = jax.device_put(
-                        jnp.zeros(shape_wo, dtype=self.dtype), sharding_wo
-                    )
-
-        if hasattr(self, "lm_head") and isinstance(
-            self.lm_head.embedding.value, jax.ShapeDtypeStruct
-        ):
-            logger.info("Tying lm_head weights to embed_tokens (lm_head not in safetensors)")
-            self.lm_head.embedding = self.model.embed_tokens.embedding
+        loader.load(weight_mappings)
 
         logger.info("Gemma4 weights loaded successfully!")
 
     def _create_gemma4_weight_mappings(self) -> dict:
         mappings = {
-            "model.embed_tokens.weight": WeightMapping(
+            "model.embed_tokens.weight": WeightSpec(
                 target_path="model.embed_tokens.embedding",
                 sharding=("tensor", None),
                 transpose=False,
             ),
-            "model.norm.weight": WeightMapping(
+            "model.norm.weight": WeightSpec(
                 target_path="model.norm.weight", sharding=(None,), transpose=False
             ),
         }
@@ -773,70 +707,70 @@ class Gemma4ForCausalLM(nnx.Module):
         use_k_eq_v = (not is_sliding) and getattr(self.config, "attention_k_eq_v", False)
 
         mappings = {
-            f"{prefix}.layer_scalar": WeightMapping(
+            f"{prefix}.layer_scalar": WeightSpec(
                 target_path=f"{target_prefix}.layer_scalar",
                 sharding=(None,),
                 transpose=False,
             ),
-            f"{prefix}.input_layernorm.weight": WeightMapping(
+            f"{prefix}.input_layernorm.weight": WeightSpec(
                 target_path=f"{target_prefix}.input_layernorm.weight",
                 sharding=(None,),
                 transpose=False,
             ),
-            f"{prefix}.post_attention_layernorm.weight": WeightMapping(
+            f"{prefix}.post_attention_layernorm.weight": WeightSpec(
                 target_path=f"{target_prefix}.post_attention_layernorm.weight",
                 sharding=(None,),
                 transpose=False,
             ),
-            f"{prefix}.pre_feedforward_layernorm.weight": WeightMapping(
+            f"{prefix}.pre_feedforward_layernorm.weight": WeightSpec(
                 target_path=f"{target_prefix}.pre_feedforward_layernorm.weight",
                 sharding=(None,),
                 transpose=False,
             ),
-            f"{prefix}.post_feedforward_layernorm.weight": WeightMapping(
+            f"{prefix}.post_feedforward_layernorm.weight": WeightSpec(
                 target_path=f"{target_prefix}.post_feedforward_layernorm.weight",
                 sharding=(None,),
                 transpose=False,
             ),
-            f"{prefix}.self_attn.q_proj.weight": WeightMapping(
+            f"{prefix}.self_attn.q_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.self_attn.q_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
                 kv_head_padding=False,
             ),
-            f"{prefix}.self_attn.k_proj.weight": WeightMapping(
+            f"{prefix}.self_attn.k_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.self_attn.k_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
                 kv_head_padding=use_k_eq_v,
             ),
-            f"{prefix}.self_attn.o_proj.weight": WeightMapping(
+            f"{prefix}.self_attn.o_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.self_attn.o_proj.weight",
                 sharding=("tensor", None),
                 transpose=True,
                 kv_head_padding=False,
             ),
-            f"{prefix}.self_attn.q_norm.weight": WeightMapping(
+            f"{prefix}.self_attn.q_norm.weight": WeightSpec(
                 target_path=f"{target_prefix}.self_attn.q_norm.weight",
                 sharding=(None,),
                 transpose=False,
             ),
-            f"{prefix}.self_attn.k_norm.weight": WeightMapping(
+            f"{prefix}.self_attn.k_norm.weight": WeightSpec(
                 target_path=f"{target_prefix}.self_attn.k_norm.weight",
                 sharding=(None,),
                 transpose=False,
             ),
-            f"{prefix}.mlp.gate_proj.weight": WeightMapping(
+            f"{prefix}.mlp.gate_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.mlp.gate_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             ),
-            f"{prefix}.mlp.up_proj.weight": WeightMapping(
+            f"{prefix}.mlp.up_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.mlp.up_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             ),
-            f"{prefix}.mlp.down_proj.weight": WeightMapping(
+            f"{prefix}.mlp.down_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.mlp.down_proj.weight",
                 sharding=("tensor", None),
                 transpose=True,
@@ -844,7 +778,7 @@ class Gemma4ForCausalLM(nnx.Module):
         }
 
         if not use_k_eq_v:
-            mappings[f"{prefix}.self_attn.v_proj.weight"] = WeightMapping(
+            mappings[f"{prefix}.self_attn.v_proj.weight"] = WeightSpec(
                 target_path=f"{target_prefix}.self_attn.v_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
@@ -853,30 +787,32 @@ class Gemma4ForCausalLM(nnx.Module):
 
         if getattr(self.config, "enable_moe_block", False):
             moe_norm_mappings = {
-                f"{prefix}.router.scale": WeightMapping(
-                    target_path=f"{target_prefix}.router.scale", sharding=(None,), transpose=False
+                f"{prefix}.router.scale": WeightSpec(
+                    target_path=f"{target_prefix}.router.scale",
+                    sharding=(None,),
+                    transpose=False,
                 ),
-                f"{prefix}.router.per_expert_scale": WeightMapping(
+                f"{prefix}.router.per_expert_scale": WeightSpec(
                     target_path=f"{target_prefix}.router.per_expert_scale",
                     sharding=(None,),
                     transpose=False,
                 ),
-                f"{prefix}.router.proj.weight": WeightMapping(
+                f"{prefix}.router.proj.weight": WeightSpec(
                     target_path=f"{target_prefix}.router.proj.kernel",
                     sharding=(None, None),
                     transpose=True,
                 ),
-                f"{prefix}.post_feedforward_layernorm_1.weight": WeightMapping(
+                f"{prefix}.post_feedforward_layernorm_1.weight": WeightSpec(
                     target_path=f"{target_prefix}.post_feedforward_layernorm_1.weight",
                     sharding=(None,),
                     transpose=False,
                 ),
-                f"{prefix}.post_feedforward_layernorm_2.weight": WeightMapping(
+                f"{prefix}.post_feedforward_layernorm_2.weight": WeightSpec(
                     target_path=f"{target_prefix}.post_feedforward_layernorm_2.weight",
                     sharding=(None,),
                     transpose=False,
                 ),
-                f"{prefix}.pre_feedforward_layernorm_2.weight": WeightMapping(
+                f"{prefix}.pre_feedforward_layernorm_2.weight": WeightSpec(
                     target_path=f"{target_prefix}.pre_feedforward_layernorm_2.weight",
                     sharding=(None,),
                     transpose=False,
@@ -886,26 +822,26 @@ class Gemma4ForCausalLM(nnx.Module):
 
         if getattr(self.config, "attention_bias", False):
             bias_mappings = {
-                f"{prefix}.self_attn.q_proj.bias": WeightMapping(
+                f"{prefix}.self_attn.q_proj.bias": WeightSpec(
                     target_path=f"{target_prefix}.self_attn.q_proj.bias",
                     sharding=(None,),
                     transpose=False,
                     kv_head_padding=False,
                 ),
-                f"{prefix}.self_attn.k_proj.bias": WeightMapping(
+                f"{prefix}.self_attn.k_proj.bias": WeightSpec(
                     target_path=f"{target_prefix}.self_attn.k_proj.bias",
                     sharding=(None,),
                     transpose=False,
                     kv_head_padding=use_k_eq_v,
                 ),
-                f"{prefix}.self_attn.o_proj.bias": WeightMapping(
+                f"{prefix}.self_attn.o_proj.bias": WeightSpec(
                     target_path=f"{target_prefix}.self_attn.o_proj.bias",
                     sharding=(None,),
                     transpose=False,
                 ),
             }
             if not use_k_eq_v:
-                bias_mappings[f"{prefix}.self_attn.v_proj.bias"] = WeightMapping(
+                bias_mappings[f"{prefix}.self_attn.v_proj.bias"] = WeightSpec(
                     target_path=f"{target_prefix}.self_attn.v_proj.bias",
                     sharding=(None,),
                     transpose=False,
@@ -922,12 +858,19 @@ class Gemma4ForCausalLM(nnx.Module):
         logits_metadata: LogitsMetadata,
     ):
         kv_pool = memory_pools.token_to_kv_pool
-        hidden_states, aux_hidden_states, layers_kv_fused, layers_callback_flag, layers_topk_ids = (
-            self.model(forward_batch, kv_pool)
-        )
+        (
+            hidden_states,
+            aux_hidden_states,
+            layers_kv_fused,
+            layers_callback_flag,
+            layers_topk_ids,
+        ) = self.model(forward_batch, kv_pool)
         if not getattr(self.config, "tie_word_embeddings", True):
             output = self.logits_processor(
-                hidden_states, self.lm_head, logits_metadata, aux_hidden_states=aux_hidden_states
+                hidden_states,
+                self.lm_head,
+                logits_metadata,
+                aux_hidden_states=aux_hidden_states,
             )
         else:
             output = self.logits_processor(
@@ -937,7 +880,12 @@ class Gemma4ForCausalLM(nnx.Module):
                 aux_hidden_states=aux_hidden_states,
             )
 
-        return output, {"token_to_kv_pool": layers_kv_fused}, layers_callback_flag, layers_topk_ids
+        return (
+            output,
+            {"token_to_kv_pool": layers_kv_fused},
+            layers_callback_flag,
+            layers_topk_ids,
+        )
 
 
 class Gemma4ForConditionalGeneration(Gemma4ForCausalLM, InModelMultimodalContract):
@@ -1009,26 +957,26 @@ class Gemma4ForConditionalGeneration(Gemma4ForCausalLM, InModelMultimodalContrac
         loader = WeightLoader(self, model_config, self.mesh, self.dtype)
         mappings = self._create_vision_weight_mappings()
         if not loader.dummy_mode:
-            weight_info = loader._scan_weight_info()
+            weight_info = loader.metadata
             mappings = {key: value for key, value in mappings.items() if key in weight_info}
-        loader.load_weights_from_safetensors(mappings)
+        loader.load(mappings)
         logger.info("Gemma 4 vision tower weights loaded successfully!")
 
-    def _create_vision_weight_mappings(self) -> dict[str, WeightMapping]:
+    def _create_vision_weight_mappings(self) -> dict[str, WeightSpec]:
         specs = self.visual.specs
         col, row = specs.col_kernel_axes, specs.row_kernel_axes
-        mappings: dict[str, WeightMapping] = {
-            "model.vision_tower.patch_embedder.input_proj.weight": WeightMapping(
+        mappings: dict[str, WeightSpec] = {
+            "model.vision_tower.patch_embedder.input_proj.weight": WeightSpec(
                 target_path="visual.patch_embedder.input_proj.weight",
                 sharding=col,
                 transpose=True,
             ),
-            "model.vision_tower.patch_embedder.position_embedding_table": WeightMapping(
+            "model.vision_tower.patch_embedder.position_embedding_table": WeightSpec(
                 target_path="visual.patch_embedder.position_embedding_table",
                 sharding=(None, None, specs.tensor_axis),
                 transpose=False,
             ),
-            "model.embed_vision.embedding_projection.weight": WeightMapping(
+            "model.embed_vision.embedding_projection.weight": WeightSpec(
                 target_path="visual.projector.embedding_projection.weight",
                 sharding=col,
                 transpose=True,
@@ -1037,12 +985,12 @@ class Gemma4ForConditionalGeneration(Gemma4ForCausalLM, InModelMultimodalContrac
         if self.visual.standardize:
             mappings.update(
                 {
-                    "model.vision_tower.std_bias": WeightMapping(
+                    "model.vision_tower.std_bias": WeightSpec(
                         target_path="visual.std_bias",
                         sharding=(None,),
                         transpose=False,
                     ),
-                    "model.vision_tower.std_scale": WeightMapping(
+                    "model.vision_tower.std_scale": WeightSpec(
                         target_path="visual.std_scale",
                         sharding=(None,),
                         transpose=False,
@@ -1058,35 +1006,35 @@ class Gemma4ForConditionalGeneration(Gemma4ForCausalLM, InModelMultimodalContrac
                 "pre_feedforward_layernorm",
                 "post_feedforward_layernorm",
             ):
-                mappings[f"{source}.{name}.weight"] = WeightMapping(
+                mappings[f"{source}.{name}.weight"] = WeightSpec(
                     target_path=f"{target}.{name}.weight",
                     sharding=(None,),
                     transpose=False,
                 )
             for projection in ("q_proj", "k_proj", "v_proj"):
-                mappings[f"{source}.self_attn.{projection}.linear.weight"] = WeightMapping(
+                mappings[f"{source}.self_attn.{projection}.linear.weight"] = WeightSpec(
                     target_path=f"{target}.self_attn.{projection}.weight",
                     sharding=col,
                     transpose=True,
                 )
-            mappings[f"{source}.self_attn.o_proj.linear.weight"] = WeightMapping(
+            mappings[f"{source}.self_attn.o_proj.linear.weight"] = WeightSpec(
                 target_path=f"{target}.self_attn.o_proj.weight",
                 sharding=row,
                 transpose=True,
             )
             for norm in ("q_norm", "k_norm"):
-                mappings[f"{source}.self_attn.{norm}.weight"] = WeightMapping(
+                mappings[f"{source}.self_attn.{norm}.weight"] = WeightSpec(
                     target_path=f"{target}.self_attn.{norm}.weight",
                     sharding=(None,),
                     transpose=False,
                 )
             for projection in ("gate_proj", "up_proj"):
-                mappings[f"{source}.mlp.{projection}.linear.weight"] = WeightMapping(
+                mappings[f"{source}.mlp.{projection}.linear.weight"] = WeightSpec(
                     target_path=f"{target}.mlp.{projection}.weight",
                     sharding=col,
                     transpose=True,
                 )
-            mappings[f"{source}.mlp.down_proj.linear.weight"] = WeightMapping(
+            mappings[f"{source}.mlp.down_proj.linear.weight"] = WeightSpec(
                 target_path=f"{target}.mlp.down_proj.weight",
                 sharding=row,
                 transpose=True,

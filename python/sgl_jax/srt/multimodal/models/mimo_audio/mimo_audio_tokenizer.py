@@ -10,10 +10,10 @@ from transformers import PretrainedConfig
 
 from sgl_jax.srt.layers.embeddings import Embed
 from sgl_jax.srt.layers.linear import LinearBase
+from sgl_jax.srt.model_loader.weights import WeightLoader
 from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_tokenizer_weights_mapping import (
     to_mappings,
 )
-from sgl_jax.srt.utils.weight_utils import WeightLoader
 
 
 @dataclass
@@ -846,7 +846,7 @@ class MiMoAudioTokenizer(nnx.Module):
 
     def load_weights(self, model_config):
         loader = WeightLoader(self, model_config, self.mesh, self.dtype)
-        loader.load_weights_from_safetensors(to_mappings(self.config))
+        loader.load(to_mappings(self.config))
         self._load_codebook_weights(model_config)
         self._init_rope_inv_freq()
 

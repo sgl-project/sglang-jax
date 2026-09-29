@@ -678,6 +678,27 @@ TUNED_BLOCK_SIZES_RAW = {
     (7, 8, 4096, 2048, "bfloat16", "float8_e4m3fn"): (8, 2048, 2048),
     (7, 32, 4096, 2048, "bfloat16", "float8_e4m3fn"): (32, 2048, 2048),
     (7, 64, 4096, 2048, "bfloat16", "float8_e4m3fn"): (64, 2048, 2048),
+    # GLM-5.2 v7x tp16 prefill shapes, m=8192 (chunk) and m=1024 (short
+    # prompts). Before these rows the closest-n_batch fallback resolved both
+    # to the n_batch=64 rows above (batch_block 64, reloading every weight
+    # tile m/64 times). Swept on v7x 2026-09-19; best passing config per
+    # shape, VMEM-safe. The 576-wide kv_a projection runs as 768 wide at
+    # runtime and is covered by the 768x6144 rows; no 576-wide rows are
+    # added.
+    (7, 1024, 1024, 2048, "bfloat16", "float8_e4m3fn"): (128, 1024, 2048),
+    (7, 1024, 2048, 6144, "bfloat16", "float8_e4m3fn"): (128, 2048, 6144),
+    (7, 1024, 4096, 2048, "bfloat16", "float8_e4m3fn"): (512, 2048, 2048),
+    (7, 1024, 6144, 1024, "bfloat16", "float8_e4m3fn"): (512, 2048, 1024),
+    (7, 1024, 6144, 128, "bfloat16", "float8_e4m3fn"): (512, 2048, 128),
+    (7, 1024, 6144, 768, "bfloat16", "float8_e4m3fn"): (1024, 2048, 768),
+    (7, 1024, 768, 6144, "bfloat16", "float8_e4m3fn"): (256, 768, 6144),
+    (7, 8192, 1024, 2048, "bfloat16", "float8_e4m3fn"): (1024, 1024, 2048),
+    (7, 8192, 2048, 6144, "bfloat16", "float8_e4m3fn"): (256, 2048, 6144),
+    (7, 8192, 4096, 2048, "bfloat16", "float8_e4m3fn"): (512, 2048, 2048),
+    (7, 8192, 6144, 1024, "bfloat16", "float8_e4m3fn"): (1024, 2048, 1024),
+    (7, 8192, 6144, 128, "bfloat16", "float8_e4m3fn"): (2048, 2048, 128),
+    (7, 8192, 6144, 768, "bfloat16", "float8_e4m3fn"): (1024, 2048, 768),
+    (7, 8192, 768, 6144, "bfloat16", "float8_e4m3fn"): (256, 768, 6144),
     # go/keep-sorted end
 }
 

@@ -16,7 +16,7 @@ from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.hardware_backend.tt.attention import ops as tt_ops
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
-from sgl_jax.srt.layers.radix_attention import RadixAttention
+from sgl_jax.srt.layers.radix_attention import AttentionType, RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -25,6 +25,10 @@ from sgl_jax.srt.utils.jax_utils import device_array
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
 logger = logging.getLogger(__name__)
+
+# TTNN paged decode kernels assign each user to its own core(s), so launches
+# over many tokens are split into groups of at most this many users.
+MAX_DECODE_USERS = 32
 
 
 def prepare_weight(tensor):
@@ -64,6 +68,29 @@ class TTTokenToKVPool(MHATokenToKVPool):
                 for _ in range(self.layer_num)
             ]
         logger.info("Created TT KV buffers in %.2f seconds", time.time() - start)
+
+    def set_kv_buffer(self, layer_id, loc, k, v, is_decode=False):
+        """Write each K/V row to its cache slot; negative slots are skipped."""
+        caches = self.get_kv_buffer(layer_id)
+        # Write each row as a decode user whose page table holds only the
+        # slot's page. Rows may share a page, which share_cache serializes.
+        for start in range(0, loc.shape[0], MAX_DECODE_USERS):
+            slots = loc[start : start + MAX_DECODE_USERS]
+            positions = jnp.where(slots >= 0, slots % self.page_size, -1)
+            pages = jnp.broadcast_to((slots // self.page_size)[:, None], (slots.shape[0], 16))
+            caches = tuple(
+                tt_ops.paged_update_cache(
+                    cache,
+                    TTAttention._decode_cache_value(
+                        value[start : start + MAX_DECODE_USERS], self.head_dim
+                    ),
+                    positions,
+                    pages,
+                    share_cache=True,
+                )
+                for cache, value in zip(caches, (k, v))
+            )
+        self.kv_buffer[layer_id - self.start_layer] = caches
 
 
 @jax.tree_util.register_dataclass
@@ -124,7 +151,7 @@ class TTAttention(AttentionBackend):
     token_to_kv_pool_class = TTTokenToKVPool
     compiler_options = {
         "experimental_enable_permute_matmul_fusion": "true",
-        "optimization_level": "1",
+        "optimization_level": "O1",
         "experimental_weight_dtype": "bfp_bf8",
         "enable_trace": "true",
     }
@@ -168,6 +195,37 @@ class TTAttention(AttentionBackend):
         if batch.forward_mode == ForwardMode.DECODE:
             return self._decode_metadata(batch)
         raise ValueError(f"TT attention does not support {batch.forward_mode}")
+
+    def get_eagle_forward_metadata(self, batch: ModelWorkerBatch, *, page_indices, **_):
+        """Metadata for linear-chain verification and DFlash draft blocks.
+
+        Every query token is a decode user holding its request's page table.
+        The positions attend over the whole block; causal layers narrow them
+        to each token's own position in `_verify`.
+        """
+        if batch.forward_mode != ForwardMode.TARGET_VERIFY:
+            raise ValueError(f"TT speculative attention does not support {batch.forward_mode}")
+        if batch.spec_info_padded.custom_mask is not None:
+            raise ValueError("TT speculative attention requires a linear draft chain")
+        tokens = batch.spec_info_padded.draft_token_num
+        active = np.zeros(len(batch.seq_lens), dtype=bool)
+        active[batch.logits_indices_selector] = True
+        lengths = np.where(active, np.asarray(batch.seq_lens, dtype=np.int32) + tokens, 0)
+
+        # page_indices packs the pages of the active requests in batch order.
+        page_counts = cdiv(lengths, self.page_size)
+        page_ends = np.cumsum(page_counts)
+        page_table = np.zeros((len(lengths), max(16, len(page_indices))), dtype=np.int32)
+        for row, (count, end) in enumerate(zip(page_counts, page_ends)):
+            page_table[row, :count] = page_indices[end - count : end]
+        positions = np.where(active, lengths - 1, -1).astype(np.int32)
+
+        metadata = TTAttentionMetadata()
+        metadata.page_table, metadata.positions = device_array(
+            (np.repeat(page_table, tokens, axis=0), np.repeat(positions, tokens)),
+            sharding=NamedSharding(self.mesh, P("data")),
+        )
+        return metadata
 
     def _decode_metadata(self, batch: ModelWorkerBatch) -> TTAttentionMetadata:
         sequence_lengths = np.asarray(batch.seq_lens, dtype=np.int32)[: batch.real_bs]
@@ -286,6 +344,8 @@ class TTAttention(AttentionBackend):
             return self._prefill(q, k, v, layer, token_to_kv_pool)
         if forward_batch.forward_mode == ForwardMode.DECODE:
             return self._decode(q, k, v, layer, token_to_kv_pool)
+        if forward_batch.forward_mode == ForwardMode.TARGET_VERIFY:
+            return self._verify(q, k, v, layer, forward_batch, token_to_kv_pool)
         raise ValueError(f"TT attention does not support {forward_batch.forward_mode}")
 
     def _prefill(self, q, k, v, layer, token_to_kv_pool):
@@ -359,6 +419,28 @@ class TTAttention(AttentionBackend):
         )
         output_sharding = NamedSharding(self.mesh, P("data", "tensor"))
         return output.reshape(num_tokens, -1, out_sharding=output_sharding), (k_cache, v_cache)
+
+    def _verify(self, q, k, v, layer, forward_batch, token_to_kv_pool):
+        metadata = self.forward_metadata
+        token_to_kv_pool.set_kv_buffer(layer.layer_id, forward_batch.out_cache_loc, k, v)
+        k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        positions = metadata.positions
+        if layer.attn_type == AttentionType.DECODER:
+            positions = jnp.where(positions >= 0, forward_batch.positions, -1)
+
+        outputs = [
+            tt_ops.paged_scaled_dot_product_attention_decode(
+                q[None, start : start + MAX_DECODE_USERS],
+                k_cache,
+                v_cache,
+                metadata.page_table[start : start + MAX_DECODE_USERS],
+                positions[start : start + MAX_DECODE_USERS],
+            )
+            for start in range(0, q.shape[0], MAX_DECODE_USERS)
+        ]
+        output = jnp.concatenate(outputs, axis=1) if len(outputs) > 1 else outputs[0]
+        output_sharding = NamedSharding(self.mesh, P("data", "tensor"))
+        return output.reshape(q.shape[0], -1, out_sharding=output_sharding), (k_cache, v_cache)
 
     def _prefill_cache_value(self, value, head_dim):
         value = value.at[self.forward_metadata.prefill_input_indices].get(

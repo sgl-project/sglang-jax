@@ -11,6 +11,7 @@ Launcher and orchestrator templates for SGL-JAX serving. Model cookbook recipes 
 | [`single-host-docker.md`](single-host-docker.md) | One TPU host (v6e-4, v6e-8, v7x-8). Lowest-friction starting point. |
 | [`gke-indexed-job.md`](gke-indexed-job.md) | Multi-host TPU slice on GKE. Stable pod DNS via Indexed Job + headless Service. |
 | [`skypilot.md`](skypilot.md) | Advanced multi-host v6e experiments via SkyPilot. v6e-only today (template hardcodes `v2-alpha-tpuv6e`). |
+| [`runai-gcs.md`](runai-gcs.md) | Direct GCS safetensors loading through RunAI, without staging weight files locally. |
 
 ## Common conventions across all three
 

@@ -27,7 +27,7 @@ from sgl_jax.srt.layers.logits_processor import LogitsProcessor, LogitsProcessor
 from sgl_jax.srt.layers.radix_attention import AttentionType, RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
+from sgl_jax.srt.model_loader.weights import WeightLoader, WeightSpec
 
 # =============================================================================
 # Utilities
@@ -460,14 +460,12 @@ class UMT5EncoderModel(nnx.Module):
             model_config.model_path = os.path.join(path, "text_encoder")
 
         loader = WeightLoader(self, model_config, self.mesh, self.dtype)
-        loader.load_weights_from_safetensors(self._weight_mappings())
+        loader.load(self._weight_mappings())
 
     def _weight_mappings(self):
         m = {
-            "shared.weight": WeightMapping("shared.embedding", ("tensor", None), False),
-            "encoder.final_layer_norm.weight": WeightMapping(
-                "encoder.final_ln.scale", (None,), False
-            ),
+            "shared.weight": WeightSpec("shared.embedding", ("tensor", None), False),
+            "encoder.final_layer_norm.weight": WeightSpec("encoder.final_ln.scale", (None,), False),
         }
         for i in range(self.config.num_layers):
             m.update(_block_mappings(self.config, i, False, "encoder.block", "encoder.blocks"))
@@ -488,7 +486,12 @@ class UMT5EncoderModel(nnx.Module):
         bs = forward_batch.seq_lens.shape[0]
         dummy = jnp.zeros((bs, self.config.vocab_size), dtype=self.dtype)
         dummy = jax.sharding.reshard(dummy, NamedSharding(self.mesh, P("data", "tensor")))
-        return LogitsProcessorOutput(next_token_logits=dummy, hidden_states=hidden), [], [], None
+        return (
+            LogitsProcessorOutput(next_token_logits=dummy, hidden_states=hidden),
+            [],
+            [],
+            None,
+        )
 
 
 class UMT5DecoderModel(nnx.Module):
@@ -511,14 +514,12 @@ class UMT5DecoderModel(nnx.Module):
 
     def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(self, model_config, self.mesh, self.dtype)
-        loader.load_weights_from_safetensors(self._weight_mappings())
+        loader.load(self._weight_mappings())
 
     def _weight_mappings(self):
         m = {
-            "shared.weight": WeightMapping("shared.embedding", ("tensor", None), False),
-            "decoder.final_layer_norm.weight": WeightMapping(
-                "decoder.final_ln.scale", (None,), False
-            ),
+            "shared.weight": WeightSpec("shared.embedding", ("tensor", None), False),
+            "decoder.final_layer_norm.weight": WeightSpec("decoder.final_ln.scale", (None,), False),
         }
         for i in range(self.config.num_decoder_layers):
             m.update(_block_mappings(self.config, i, True, "decoder.block", "decoder.blocks"))
@@ -556,17 +557,13 @@ class UMT5Model(nnx.Module):
 
     def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(self, model_config, self.mesh, self.dtype)
-        loader.load_weights_from_safetensors(self._weight_mappings())
+        loader.load(self._weight_mappings())
 
     def _weight_mappings(self):
         m = {
-            "shared.weight": WeightMapping("shared.embedding", ("tensor", None), False),
-            "encoder.final_layer_norm.weight": WeightMapping(
-                "encoder.final_ln.scale", (None,), False
-            ),
-            "decoder.final_layer_norm.weight": WeightMapping(
-                "decoder.final_ln.scale", (None,), False
-            ),
+            "shared.weight": WeightSpec("shared.embedding", ("tensor", None), False),
+            "encoder.final_layer_norm.weight": WeightSpec("encoder.final_ln.scale", (None,), False),
+            "decoder.final_layer_norm.weight": WeightSpec("decoder.final_ln.scale", (None,), False),
         }
         for i in range(self.config.num_layers):
             m.update(_block_mappings(self.config, i, False, "encoder.block", "encoder.blocks"))
@@ -637,17 +634,13 @@ class UMT5ForConditionalGeneration(nnx.Module):
 
     def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(self, model_config, self.mesh, self.dtype)
-        loader.load_weights_from_safetensors(self._weight_mappings())
+        loader.load(self._weight_mappings())
 
     def _weight_mappings(self):
         m = {
-            "shared.weight": WeightMapping("shared.embedding", ("tensor", None), False),
-            "encoder.final_layer_norm.weight": WeightMapping(
-                "encoder.final_ln.scale", (None,), False
-            ),
-            "decoder.final_layer_norm.weight": WeightMapping(
-                "decoder.final_ln.scale", (None,), False
-            ),
+            "shared.weight": WeightSpec("shared.embedding", ("tensor", None), False),
+            "encoder.final_layer_norm.weight": WeightSpec("encoder.final_ln.scale", (None,), False),
+            "decoder.final_layer_norm.weight": WeightSpec("decoder.final_ln.scale", (None,), False),
             "lm_head.weight": self.lm_head.weight_mapping("lm_head.embedding"),
         }
         for i in range(self.config.num_layers):
@@ -699,20 +692,20 @@ def _block_mappings(config, idx, is_decoder, src_prefix, tgt_prefix):
     """Generate weight mappings for a transformer block."""
     s, t = f"{src_prefix}.{idx}", f"{tgt_prefix}.{idx}"
     m = {
-        f"{s}.layer.0.layer_norm.weight": WeightMapping(f"{t}.ln1.scale", (None,), False),
-        f"{s}.layer.0.SelfAttention.q.weight": WeightMapping(
+        f"{s}.layer.0.layer_norm.weight": WeightSpec(f"{t}.ln1.scale", (None,), False),
+        f"{s}.layer.0.SelfAttention.q.weight": WeightSpec(
             f"{t}.self_attn.q.weight", (None, "tensor"), True
         ),
-        f"{s}.layer.0.SelfAttention.k.weight": WeightMapping(
+        f"{s}.layer.0.SelfAttention.k.weight": WeightSpec(
             f"{t}.self_attn.k.weight", (None, "tensor"), True
         ),
-        f"{s}.layer.0.SelfAttention.v.weight": WeightMapping(
+        f"{s}.layer.0.SelfAttention.v.weight": WeightSpec(
             f"{t}.self_attn.v.weight", (None, "tensor"), True
         ),
-        f"{s}.layer.0.SelfAttention.o.weight": WeightMapping(
+        f"{s}.layer.0.SelfAttention.o.weight": WeightSpec(
             f"{t}.self_attn.o.weight", ("tensor", None), True
         ),
-        f"{s}.layer.0.SelfAttention.relative_attention_bias.weight": WeightMapping(
+        f"{s}.layer.0.SelfAttention.relative_attention_bias.weight": WeightSpec(
             f"{t}.self_attn.rel_bias.embedding", (None, "tensor"), False
         ),
     }
@@ -720,19 +713,17 @@ def _block_mappings(config, idx, is_decoder, src_prefix, tgt_prefix):
     if is_decoder:
         m.update(
             {
-                f"{s}.layer.1.layer_norm.weight": WeightMapping(
-                    f"{t}.ln_cross.scale", (None,), False
-                ),
-                f"{s}.layer.1.EncDecAttention.q.weight": WeightMapping(
+                f"{s}.layer.1.layer_norm.weight": WeightSpec(f"{t}.ln_cross.scale", (None,), False),
+                f"{s}.layer.1.EncDecAttention.q.weight": WeightSpec(
                     f"{t}.cross_attn.q.weight", (None, "tensor"), True
                 ),
-                f"{s}.layer.1.EncDecAttention.k.weight": WeightMapping(
+                f"{s}.layer.1.EncDecAttention.k.weight": WeightSpec(
                     f"{t}.cross_attn.k.weight", (None, "tensor"), True
                 ),
-                f"{s}.layer.1.EncDecAttention.v.weight": WeightMapping(
+                f"{s}.layer.1.EncDecAttention.v.weight": WeightSpec(
                     f"{t}.cross_attn.v.weight", (None, "tensor"), True
                 ),
-                f"{s}.layer.1.EncDecAttention.o.weight": WeightMapping(
+                f"{s}.layer.1.EncDecAttention.o.weight": WeightSpec(
                     f"{t}.cross_attn.o.weight", ("tensor", None), True
                 ),
             }
@@ -741,18 +732,18 @@ def _block_mappings(config, idx, is_decoder, src_prefix, tgt_prefix):
     else:
         ffn_idx = 1
 
-    m[f"{s}.layer.{ffn_idx}.layer_norm.weight"] = WeightMapping(f"{t}.ln2.scale", (None,), False)
+    m[f"{s}.layer.{ffn_idx}.layer_norm.weight"] = WeightSpec(f"{t}.ln2.scale", (None,), False)
 
     if config.is_gated_act:
         m.update(
             {
-                f"{s}.layer.{ffn_idx}.DenseReluDense.wi_0.weight": WeightMapping(
+                f"{s}.layer.{ffn_idx}.DenseReluDense.wi_0.weight": WeightSpec(
                     f"{t}.mlp.wi_0.weight", (None, "tensor"), True
                 ),
-                f"{s}.layer.{ffn_idx}.DenseReluDense.wi_1.weight": WeightMapping(
+                f"{s}.layer.{ffn_idx}.DenseReluDense.wi_1.weight": WeightSpec(
                     f"{t}.mlp.wi_1.weight", (None, "tensor"), True
                 ),
-                f"{s}.layer.{ffn_idx}.DenseReluDense.wo.weight": WeightMapping(
+                f"{s}.layer.{ffn_idx}.DenseReluDense.wo.weight": WeightSpec(
                     f"{t}.mlp.wo.weight", ("tensor", None), True
                 ),
             }
@@ -760,10 +751,10 @@ def _block_mappings(config, idx, is_decoder, src_prefix, tgt_prefix):
     else:
         m.update(
             {
-                f"{s}.layer.{ffn_idx}.DenseReluDense.wi.weight": WeightMapping(
+                f"{s}.layer.{ffn_idx}.DenseReluDense.wi.weight": WeightSpec(
                     f"{t}.mlp.wi.weight", (None, "tensor"), True
                 ),
-                f"{s}.layer.{ffn_idx}.DenseReluDense.wo.weight": WeightMapping(
+                f"{s}.layer.{ffn_idx}.DenseReluDense.wo.weight": WeightSpec(
                     f"{t}.mlp.wo.weight", ("tensor", None), True
                 ),
             }

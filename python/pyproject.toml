@@ -51,6 +51,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+runai = [
+    "runai-model-streamer[gcs]==0.16.1",
+]
 dev = [
 ]
 fastokens = [

@@ -341,6 +341,9 @@ class GenerateReqInput:
 
     return_routed_experts: list[bool] | bool | None = None
 
+    # Return one hidden-state row per evaluated input token.
+    return_hidden_states: bool = False
+
     # Decode DP rank selected by request routing.
     dp_rank: list[int] | int | None = None
 
@@ -596,6 +599,7 @@ class GenerateReqInput:
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
             lora_id=self.lora_id[i] if self.lora_id is not None else None,
             return_routed_experts=self.return_routed_experts[i],
+            return_hidden_states=self.return_hidden_states,
             dp_rank=self.dp_rank[i] if isinstance(self.dp_rank, list) else self.dp_rank,
             # PD disaggregation passthrough.
             # Supports both scalar and list shapes.

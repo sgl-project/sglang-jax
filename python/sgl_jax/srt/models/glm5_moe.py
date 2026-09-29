@@ -3,6 +3,7 @@ from functools import partial
 from typing import Any
 
 import jax
+import numpy as np
 from flax import nnx
 from jax import numpy as jnp
 from jax.sharding import NamedSharding
@@ -28,11 +29,11 @@ from sgl_jax.srt.layers.moe import (
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.model_loader.weights import WeightLoader, WeightSpec
 from sgl_jax.srt.utils.quantization.quantization_utils import (
     dequantize_tensor,
     quantize_tensor,
 )
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
@@ -64,48 +65,20 @@ def _requantize_blockwise_shared_weight(
     return quantize_tensor(quantized_dtype, weight, axis=0)
 
 
-def _requantize_glm5_shared_expert(mlp: FusedEPMoEV2) -> None:
-    """Finish loading GLM-5.2 static block-wise shared-expert weights.
-
-    TODO: This is a temporary checkpoint-compatibility bridge. GLM-5.2 stores
-    shared-expert FP8 weights with 2D block-wise scales, while the fused-v2
-    in-kernel shared-expert path currently accepts only one scale per output
-    channel. Dequantizing and requantizing introduces a second FP8 rounding;
-    remove this conversion once that kernel consumes block-wise scales directly.
-    """
-    if not hasattr(mlp, "w1_shared_block_scale"):
-        return
-
-    if mlp.quantized_dtype is None:
-        raise ValueError("GLM-5.2 block-wise shared-expert conversion requires FP8 weights")
-
-    with jax.set_mesh(mlp.mesh):
-        for weight_name in ("w1_shared", "w3_shared", "w2_shared"):
-            scale_name = f"{weight_name}_scale"
-            block_scale_name = f"{weight_name}_block_scale"
-            weight_q, scale = _requantize_blockwise_shared_weight(
-                getattr(mlp, weight_name).value,
-                getattr(mlp, block_scale_name).value,
-                quantized_dtype=mlp.quantized_dtype,
-            )
-            # Model loading runs once per layer. Drain each conversion before
-            # dropping the block-scale input so 75 layers do not queue all
-            # dequant/requant temporaries in device memory at once.
-            weight_q.block_until_ready()
-            scale.block_until_ready()
-            setattr(
-                mlp,
-                weight_name,
-                nnx.Param(weight_q, out_sharding=P(None, None)),
-            )
-            setattr(
-                mlp,
-                scale_name,
-                nnx.Param(scale.reshape(1, 1, -1), out_sharding=P(None, None, None)),
-            )
-            delattr(mlp, block_scale_name)
-
-    logger.info("Requantized GLM-5.2 shared expert from block-wise to per-channel FP8")
+def _load_shared_expert(inputs, *, mesh, quantized_dtype):
+    arrays = [
+        jax.make_array_from_callback(
+            value.shape,
+            jax.sharding.NamedSharding(mesh, P()),
+            lambda index, value=value: value[index],
+        )
+        for value in inputs
+    ]
+    with jax.set_mesh(mesh):
+        weight, scale = _requantize_blockwise_shared_weight(
+            arrays[0].T, arrays[1], quantized_dtype=quantized_dtype
+        )
+        return weight, scale.reshape(1, 1, -1)
 
 
 # No-op: FP32 accumulation logic removed to keep native BF16 execution.
@@ -427,33 +400,10 @@ class Glm5Attention(nnx.Module):
             layer_id=layer_id,
         )
 
-    def post_load_weights(self):
-        if not self.use_absorbed:
-            return
-        if self.kv_b_proj is None:
-            return
-        if hasattr(self.kv_b_proj, "weight"):
-            raw_weight = self.kv_b_proj.weight.value
-        else:
-            wq = self.kv_b_proj.weight_q.value
-            ws = self.kv_b_proj.weight_scale.value
-            wq_f32 = wq.T.astype(jnp.float32)
-            if ws.ndim == 3:
-                in_blocks, _, n_out = ws.shape
-                block_k = wq.shape[1] // in_blocks
-                wq_f32 = wq_f32.reshape(in_blocks, block_k, n_out)
-                wq_f32 = (wq_f32 * ws.astype(jnp.float32)).reshape(in_blocks * block_k, n_out)
-            else:
-                wq_f32 = wq_f32 * ws.astype(jnp.float32)[None, :]
-            raw_weight = wq_f32.astype(jnp.bfloat16)
-        w_kv = raw_weight.reshape(
-            self.kv_lora_rank,
-            self.num_heads,
-            self.qk_nope_head_dim + self.v_head_dim,
-        )
-        self.w_uk.value = w_kv[:, :, : self.qk_nope_head_dim]
-        self.w_uv.value = w_kv[:, :, self.qk_nope_head_dim :]
-        self.kv_b_proj = None
+    def prepare_weight_loading(self, loader, mappings, prefix):
+        from sgl_jax.srt.layers.weight_loading import prepare_absorbed_mla
+
+        return prepare_absorbed_mla(self, loader, mappings, prefix)
 
     def _forward_mqa(
         self,
@@ -656,57 +606,47 @@ class Glm5MLP(nnx.Module):
                 out_sharding=P("tensor", None),
             )
 
-    def post_load_weights(self):
-        if not self.use_fused:
-            return
-        if not hasattr(self.gate_proj, "weight"):
-            # static fp8 checkpoint: gate_proj is already QuantizedLinear
-            # (weight_q/weight_scale), fused-merge path from #1344 only
-            # handles bf16 LinearBase. Fall back to unfused (forward checks
-            # hasattr(self, "w_gu")).
-            return
-
-        wg = self.gate_proj.weight.value
-        wu = self.up_proj.weight.value
-        wd = self.down_proj.weight.value
-
-        # Use dynamically chosen block size
-        b_inter = self.b_inter
-        hidden_size, local_inter_size = wg.shape
-
-        # Pad local intermediate dimension to a multiple of b_inter
-        pad_inter = (b_inter - (local_inter_size % b_inter)) % b_inter
-        if pad_inter > 0:
-            wg = jnp.pad(wg, ((0, 0), (0, pad_inter)), mode="constant")
-            wu = jnp.pad(wu, ((0, 0), (0, pad_inter)), mode="constant")
-            wd = jnp.pad(wd, ((0, pad_inter), (0, 0)), mode="constant")
-            local_inter_size += pad_inter
-
-        # Combine wg and wu block-by-block using jax.lax.reshape to explicitly
-        # specify the sharding for the split/merged dimensions under JAX SPMD.
-        num_blocks = local_inter_size // b_inter
-        sharding_3d = jax.sharding.NamedSharding(self.mesh, P(None, "tensor", None))
-        wg_reshaped = jax.lax.reshape(
-            wg, (hidden_size, num_blocks, b_inter), out_sharding=sharding_3d
+    def prepare_weight_loading(self, loader, mappings, prefix):
+        if not self.use_fused or not hasattr(self.gate_proj, "weight"):
+            return mappings
+        targets = tuple(
+            prefix + "." + name + ".weight" for name in ("gate_proj", "up_proj", "down_proj")
         )
-        wu_reshaped = jax.lax.reshape(
-            wu, (hidden_size, num_blocks, b_inter), out_sharding=sharding_3d
+        by_target = {
+            spec.target_path: source
+            for source, spec in mappings.items()
+            if isinstance(spec.target_path, str)
+        }
+        if not any(target in by_target for target in targets):
+            return mappings
+        sources = tuple(by_target[target] for target in targets)
+        mappings = {key: spec for key, spec in mappings.items() if key not in sources}
+        mappings[sources[0]] = WeightSpec(
+            [prefix + ".w_gu", prefix + ".w_d"],
+            sources=sources,
+            recipe=self._pack_weights,
         )
+        self.gate_proj = self.up_proj = self.down_proj = None
+        return mappings
 
-        # Concat along block dimension and flatten
-        w_gu = jnp.concatenate([wg_reshaped, wu_reshaped], axis=-1)
-
-        sharding_2d = jax.sharding.NamedSharding(self.mesh, P(None, "tensor"))
-        w_gu = jax.lax.reshape(w_gu, (hidden_size, local_inter_size * 2), out_sharding=sharding_2d)
-
-        # Assign values directly to pre-allocated sharded parameters
-        self.w_gu.value = w_gu
-        self.w_d.value = wd
-
-        # Free original projection modules to save HBM
-        self.gate_proj = None
-        self.up_proj = None
-        self.down_proj = None
+    def _pack_weights(self, inputs):
+        wg, wu, wd = (weight.T.astype(self.w_gu.value.dtype) for weight in inputs)
+        hidden, intermediate = wg.shape
+        pad = self.w_gu.value.shape[1] // 2 - intermediate
+        wg, wu = (np.pad(weight, ((0, 0), (0, pad))) for weight in (wg, wu))
+        wd = np.pad(wd, ((0, pad), (0, 0)))
+        wg, wu = (weight.reshape(hidden, -1, self.b_inter) for weight in (wg, wu))
+        packed = np.concatenate((wg, wu), axis=-1).reshape(hidden, -1)
+        result = []
+        for weight, axes in ((packed, (None, "tensor")), (wd, ("tensor", None))):
+            result.append(
+                jax.make_array_from_callback(
+                    weight.shape,
+                    jax.sharding.NamedSharding(self.mesh, P(*axes)),
+                    lambda index, weight=weight: weight[index],
+                )
+            )
+        return tuple(result)
 
     def __call__(self, hidden_states: jax.Array):
         if self.use_fused and hasattr(self, "w_gu"):
@@ -760,7 +700,10 @@ class Glm5DecoderLayer(nnx.Module):
         rope_scaling = config.rope_parameters
         max_position_embeddings = getattr(config, "max_position_embeddings", 131072)
         self.head_dim = getattr(config, "head_dim", None) or 128
-        use_qk_norm = getattr(config, "use_qk_norm", True)
+        # GLM-5.x checkpoints carry no self_attn.q_norm/k_norm tensors and the
+        # attention forward never applies them; creating the params only leaves
+        # unloaded parameters behind (the loader's final validation rejects them).
+        use_qk_norm = getattr(config, "use_qk_norm", False)
 
         partial_rotary_factor = rope_scaling.get("partial_rotary_factor", 0.5)
         rotary_dim = int(self.head_dim * partial_rotary_factor)
@@ -1104,6 +1047,46 @@ class Glm5Model(nnx.Module):
         return hidden_states, layers_kv_fused, layers_idx_fused, layers_topk_ids
 
 
+def _prepare_fused_shared_experts(mappings, blocks):
+    """Regroup FusedEPMoEV2 shared-expert weight + block scale into one recipe.
+
+    ``blocks`` lists ``(target_prefix, decoder_layer)`` pairs; the target model
+    passes ``model.layers.{i}`` and the NextN draft passes ``mtp_block``.
+    """
+    mappings = dict(mappings)
+    by_target = {
+        spec.target_path: source
+        for source, spec in mappings.items()
+        if isinstance(spec.target_path, str)
+    }
+    for block_prefix, layer in blocks:
+        mlp = getattr(layer, "mlp", None)
+        if not isinstance(mlp, FusedEPMoEV2) or not hasattr(mlp, "w1_shared_block_scale"):
+            continue
+        for name in ("w1_shared", "w3_shared", "w2_shared"):
+            path = f"{block_prefix}.mlp.{name}"
+            wk, sk = by_target[path], by_target[path + "_block_scale"]
+            mappings.pop(wk)
+            mappings.pop(sk)
+            mappings[wk] = WeightSpec(
+                [path, path + "_scale"],
+                sources=(wk, sk),
+                recipe=partial(
+                    _load_shared_expert,
+                    mesh=mlp.mesh,
+                    quantized_dtype=mlp.quantized_dtype,
+                ),
+            )
+            shape = getattr(mlp, name).value.shape
+            getattr(mlp, name + "_scale").value = jax.ShapeDtypeStruct(
+                (1, 1, shape[-1]),
+                jnp.float32,
+                sharding=jax.sharding.NamedSharding(mlp.mesh, P(None, None, None)),
+            )
+            delattr(mlp, name + "_block_scale")
+    return mappings
+
+
 class Glm5ForCausalLM(nnx.Module):
     def __init__(
         self,
@@ -1169,34 +1152,27 @@ class Glm5ForCausalLM(nnx.Module):
             dtype=self.dtype,
         )
         weight_mappings = self._create_glm5_weight_mappings(model_config)
-        loader.load_weights_from_safetensors(weight_mappings)
+        loader.load(weight_mappings)
         prepad_replicated_quantized_linears(self)
 
-        for layer in self.model.layers:
-            layer.self_attn.post_load_weights()
-            if isinstance(getattr(layer, "mlp", None), FusedEPMoEV2):
-                _requantize_glm5_shared_expert(layer.mlp)
-            if hasattr(layer, "mlp") and hasattr(layer.mlp, "post_load_weights"):
-                layer.mlp.post_load_weights()
-            if (
-                hasattr(layer, "shared_experts")
-                and layer.shared_experts is not None
-                and hasattr(layer.shared_experts, "post_load_weights")
-            ):
-                layer.shared_experts.post_load_weights()
         logger.info("Absorbed MLA weights and Fused MLP weights processed successfully!")
 
         # Skipping scale inversion for BF16
         logger.info("Skipping scale inversion for BF16 model.")
 
+    def prepare_weight_loading(self, loader, mappings):
+        return _prepare_fused_shared_experts(
+            mappings, [(f"model.layers.{i}", layer) for i, layer in enumerate(self.model.layers)]
+        )
+
     def _create_glm5_weight_mappings(self, model_config: ModelConfig) -> dict:
         mappings = {
-            "model.embed_tokens.weight": WeightMapping(
+            "model.embed_tokens.weight": WeightSpec(
                 target_path="model.embed_tokens.embedding",
                 sharding=("tensor", None),
                 transpose=False,
             ),
-            "model.norm.weight": WeightMapping(
+            "model.norm.weight": WeightSpec(
                 target_path="model.norm.scale", sharding=(None,), transpose=False
             ),
         }
@@ -1237,12 +1213,12 @@ class Glm5ForCausalLM(nnx.Module):
         target_prefix = f"model.layers.{layer_idx}"
 
         mappings = {
-            f"{prefix}.input_layernorm.weight": WeightMapping(
+            f"{prefix}.input_layernorm.weight": WeightSpec(
                 target_path=f"{target_prefix}.input_layernorm.scale",
                 sharding=(None,),
                 transpose=False,
             ),
-            f"{prefix}.post_attention_layernorm.weight": WeightMapping(
+            f"{prefix}.post_attention_layernorm.weight": WeightSpec(
                 target_path=f"{target_prefix}.post_attention_layernorm.scale",
                 sharding=(None,),
                 transpose=False,
@@ -1259,12 +1235,12 @@ class Glm5ForCausalLM(nnx.Module):
             the FP8 checkpoint's modules_to_not_convert (indexer.weights_proj).
             """
             if force_unquant or not is_static_quant:
-                mappings[f"{hf}.weight"] = WeightMapping(
+                mappings[f"{hf}.weight"] = WeightSpec(
                     target_path=f"{tgt}.weight", sharding=sharding_std, transpose=True
                 )
                 return
             sharding_q = (sharding_std[1], sharding_std[0])
-            mappings[f"{hf}.weight"] = WeightMapping(
+            mappings[f"{hf}.weight"] = WeightSpec(
                 target_path=f"{tgt}.weight_q", sharding=sharding_q, transpose=False
             )
             # Load 2D block scale [out_blocks, in_blocks] replicated: GLM-5.1 head_dim
@@ -1272,19 +1248,21 @@ class Glm5ForCausalLM(nnx.Module):
             # _maybe_expand_linear_block_scale runs after _shard_weight and expands to
             # [in_blocks, 1, n_out]; assignment into model_param then reshards to the
             # QuantizedLinear placeholder's 3D sharding.
-            mappings[f"{hf}.weight_scale_inv"] = WeightMapping(
-                target_path=f"{tgt}.weight_scale", sharding=(None, None), transpose=False
+            mappings[f"{hf}.weight_scale_inv"] = WeightSpec(
+                target_path=f"{tgt}.weight_scale",
+                sharding=(None, None),
+                transpose=False,
             )
 
         ap = f"{prefix}.self_attn"
         tp = f"{target_prefix}.self_attn"
         add_linear(f"{ap}.q_a_proj", f"{tp}.q_a_proj", (None, None))
-        mappings[f"{ap}.q_a_layernorm.weight"] = WeightMapping(
+        mappings[f"{ap}.q_a_layernorm.weight"] = WeightSpec(
             target_path=f"{tp}.q_a_layernorm.scale", sharding=(None,)
         )
         add_linear(f"{ap}.q_b_proj", f"{tp}.q_b_proj", (None, "tensor"))
         add_linear(f"{ap}.kv_a_proj_with_mqa", f"{tp}.kv_a_proj_with_mqa", (None, None))
-        mappings[f"{ap}.kv_a_layernorm.weight"] = WeightMapping(
+        mappings[f"{ap}.kv_a_layernorm.weight"] = WeightSpec(
             target_path=f"{tp}.kv_a_layernorm.scale", sharding=(None,)
         )
         add_linear(f"{ap}.kv_b_proj", f"{tp}.kv_b_proj", (None, "tensor"))
@@ -1300,29 +1278,37 @@ class Glm5ForCausalLM(nnx.Module):
                 (None, None),
                 force_unquant=True,
             )
-            mappings[f"{ap}.indexer.k_norm.weight"] = WeightMapping(
+            mappings[f"{ap}.indexer.k_norm.weight"] = WeightSpec(
                 target_path=f"{tp}.indexer.k_norm.weight", sharding=(None,)
             )
-            mappings[f"{ap}.indexer.k_norm.bias"] = WeightMapping(
+            mappings[f"{ap}.indexer.k_norm.bias"] = WeightSpec(
                 target_path=f"{tp}.indexer.k_norm.bias", sharding=(None,)
             )
 
         if is_mlp_layer:
             add_linear(
-                f"{prefix}.mlp.gate_proj", f"{target_prefix}.mlp.gate_proj", (None, "tensor")
+                f"{prefix}.mlp.gate_proj",
+                f"{target_prefix}.mlp.gate_proj",
+                (None, "tensor"),
             )
-            add_linear(f"{prefix}.mlp.up_proj", f"{target_prefix}.mlp.up_proj", (None, "tensor"))
             add_linear(
-                f"{prefix}.mlp.down_proj", f"{target_prefix}.mlp.down_proj", ("tensor", None)
+                f"{prefix}.mlp.up_proj",
+                f"{target_prefix}.mlp.up_proj",
+                (None, "tensor"),
+            )
+            add_linear(
+                f"{prefix}.mlp.down_proj",
+                f"{target_prefix}.mlp.down_proj",
+                ("tensor", None),
             )
         else:
-            mappings[f"{prefix}.mlp.gate.weight"] = WeightMapping(
+            mappings[f"{prefix}.mlp.gate.weight"] = WeightSpec(
                 target_path=f"{target_prefix}.moe_gate.kernel",
                 sharding=(None, None),
                 transpose=True,
             )
             # GLM-4 uses e_score_correction_bias
-            mappings[f"{prefix}.mlp.gate.e_score_correction_bias"] = WeightMapping(
+            mappings[f"{prefix}.mlp.gate.e_score_correction_bias"] = WeightSpec(
                 target_path=f"{target_prefix}.moe_gate.bias", sharding=(None,)
             )
 
@@ -1342,11 +1328,12 @@ class Glm5ForCausalLM(nnx.Module):
                 new_moe_mappings = {}
 
                 for key, mapping in moe_mappings.items():
-                    target_param = mapping.target_path[0]
-                    src_paths = mapping.target_path[1:]
+                    target_param = mapping.target_path
+                    src_paths = mapping.sources
 
-                    new_moe_mappings[key] = WeightMapping(
-                        target_path=[target_param] + src_paths,
+                    new_moe_mappings[key] = WeightSpec(
+                        target_path=target_param,
+                        sources=tuple(src_paths),
                         sharding=mapping.sharding,
                         transpose=True,
                         concat_axis=mapping.concat_axis,
@@ -1366,8 +1353,9 @@ class Glm5ForCausalLM(nnx.Module):
                     # fused/fused_v2 run shard_map on the main mesh with
                     # P(("data","tensor")) — a hardcoded "expert" here makes
                     # shard_map reject the scale under fused_v2 static FP8.
-                    new_moe_mappings[scale_key] = WeightMapping(
-                        target_path=[target_scale_param] + scale_src_paths,
+                    new_moe_mappings[scale_key] = WeightSpec(
+                        target_path=target_scale_param,
+                        sources=tuple(scale_src_paths),
                         sharding=(mapping.sharding[0], None, None),
                         transpose=False,
                         concat_axis=mapping.concat_axis,
@@ -1387,13 +1375,13 @@ class Glm5ForCausalLM(nnx.Module):
                         ("down_proj", "w2_shared"),
                     ):
                         target_path = f"{target_prefix}.mlp.{target_name}"
-                        mappings[f"{sp}.{hf_name}.weight"] = WeightMapping(
+                        mappings[f"{sp}.{hf_name}.weight"] = WeightSpec(
                             target_path=target_path,
                             sharding=(None, None),
                             transpose=True,
                         )
                         if is_static_quant:
-                            mappings[f"{sp}.{hf_name}.weight_scale_inv"] = WeightMapping(
+                            mappings[f"{sp}.{hf_name}.weight_scale_inv"] = WeightSpec(
                                 target_path=f"{target_path}_block_scale",
                                 sharding=(None, None),
                                 transpose=False,
@@ -1603,7 +1591,7 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
             model=self, model_config=model_config, mesh=self.mesh, dtype=self.dtype
         )
         mappings = self._create_weight_mappings(model_config)
-        self.loader.load_weights_from_safetensors(mappings)
+        self.loader.load(mappings)
         prepad_replicated_quantized_linears(self)
 
         # Apply post_load_weights logic for Draft
@@ -1617,22 +1605,29 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
         ):
             self.mtp_block.shared_experts.post_load_weights()
 
+    def get_shared_weight_paths(self):
+        # Filled from the target model by EagleDraftWorker._share_embed_head.
+        return ("embed_tokens.embedding", "lm_head.embedding")
+
+    def prepare_weight_loading(self, loader, mappings):
+        return _prepare_fused_shared_experts(mappings, [("mtp_block", self.mtp_block)])
+
     @classmethod
-    def _create_weight_mappings(cls, model_config: ModelConfig) -> dict[str, WeightMapping]:
+    def _create_weight_mappings(cls, model_config: ModelConfig) -> dict[str, WeightSpec]:
         mappings = {}
         idx = getattr(model_config.hf_config, "num_hidden_layers", 78)
         prefix = f"model.layers.{idx}"
 
-        mappings[f"{prefix}.enorm.weight"] = WeightMapping(
+        mappings[f"{prefix}.enorm.weight"] = WeightSpec(
             target_path="enorm.scale", sharding=(None,), transpose=False
         )
-        mappings[f"{prefix}.hnorm.weight"] = WeightMapping(
+        mappings[f"{prefix}.hnorm.weight"] = WeightSpec(
             target_path="hnorm.scale", sharding=(None,), transpose=False
         )
-        mappings[f"{prefix}.eh_proj.weight"] = WeightMapping(
+        mappings[f"{prefix}.eh_proj.weight"] = WeightSpec(
             target_path="eh_proj.weight", sharding=(None, None), transpose=True
         )
-        mappings[f"{prefix}.shared_head.norm.weight"] = WeightMapping(
+        mappings[f"{prefix}.shared_head.norm.weight"] = WeightSpec(
             target_path="shared_head.norm.scale", sharding=(None,), transpose=False
         )
 
@@ -1641,7 +1636,8 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
 
         mock_self = MockConfig()
         mock_self.config = model_config.hf_config
-        is_static_quant = getattr(model_config, "quantization_config", None) is not None
+        quant_config = getattr(model_config, "quantization_config", None)
+        is_static_quant = quant_config is not None and quant_config.is_static_checkpoint
 
         decoder_mappings = Glm5ForCausalLM._create_moe_layer_mappings(
             mock_self,

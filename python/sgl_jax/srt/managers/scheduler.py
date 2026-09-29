@@ -1212,6 +1212,18 @@ class Scheduler(
             return_hidden_states=recv_req.return_hidden_states,
         )
         req.tokenizer = self.tokenizer
+        if (
+            req.return_hidden_states
+            and self.spec_algorithm is not None
+            and not self.spec_algorithm.is_none()
+        ):
+            req.set_finish_with_abort(
+                "return_hidden_states is not supported with speculative decoding: "
+                "verify rows require accepted-token selection."
+            )
+            req.check_finished()
+            self.stream_output([req], req.return_logprob, req.return_output_logprob_only)
+            return
         # PD disaggregation routing keys.
         req.bootstrap_host = recv_req.bootstrap_host
         req.bootstrap_port = recv_req.bootstrap_port
@@ -1346,7 +1358,10 @@ class Scheduler(
                 req.grammar = req.grammar.result(timeout=0.03)
                 # Cache the compiled grammar
                 if self.grammar_backend and req.grammar_key:
-                    self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
+                    cached_grammar = (
+                        req.grammar if req.grammar is INVALID_GRAMMAR_OBJ else req.grammar.copy()
+                    )
+                    self.grammar_backend.set_cache(req.grammar_key, cached_grammar)
 
                 # Check if compilation resulted in invalid grammar
                 if req.grammar is INVALID_GRAMMAR_OBJ:
@@ -2140,12 +2155,16 @@ class Scheduler(
                         lora_set.update([req.lora_id for req in info.reqs])
 
         # Get requests from the waiting queue to a new prefill batch
+        chunk_exhausted_dps = set()
         for req in () if admissions_paused else self.waiting_queue:
             # Get DP rank for this request
             dp_rank = req.dp_rank
             assert (
                 dp_rank is not None
             ), "dp_rank is None in waiting_queue; dp should be assigned before enqueue."
+
+            if dp_rank in chunk_exhausted_dps:
+                continue
 
             # Check whether dp is full load
             if self.running_batch.reqs_info[dp_rank].batch_is_full or (
@@ -2225,6 +2244,12 @@ class Scheduler(
             if res != AddReqResult.CONTINUE:
                 if _reserved_bid is not None and _host_pool is not None:
                     _host_pool.release(_reserved_bid)
+                if res == AddReqResult.DP_BUDGET_EXHAUSTED:
+                    # Stop admission only for this round, without marking KV capacity full.
+                    chunk_exhausted_dps.add(dp_rank)
+                    if len(chunk_exhausted_dps) == self.dp_size:
+                        break
+                    continue
                 if res == AddReqResult.NO_TOKEN:
                     # Mark this specific DP rank as exhausted
                     self.running_batch.reqs_info[dp_rank].batch_is_full = True

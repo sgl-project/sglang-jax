@@ -35,11 +35,7 @@ def apply_multimodal_model_defaults(server_args, model_config) -> None:
     if not model_config.is_multimodal:
         return
 
-    from sgl_jax.srt.models.registry import ModelRegistry
-
-    hf_config = getattr(model_config, "hf_config", None)
-    architectures = list(getattr(hf_config, "architectures", None) or [])
-    in_model = ModelRegistry.is_in_model_multimodal(architectures)
+    in_model = model_config.is_in_model_multimodal
 
     if not in_model and not server_args.disable_radix_cache:
         logger.info("Multimodal model detected, disabling radix cache")
@@ -84,6 +80,10 @@ class ServerArgs:
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
+    # Local metadata directories -> original GCS checkpoint URIs. Kept on the
+    # arguments so spawned workers and separately configured draft models retain
+    # their weight source after config/tokenizer staging.
+    runai_model_paths: dict[str, str] = dataclasses.field(default_factory=dict, repr=False)
     trust_remote_code: bool = False
     context_length: int | None = None
     is_embedding: bool = False
@@ -227,6 +227,7 @@ class ServerArgs:
     vision_encoder_parallel: str = "dp"
 
     disable_precompile: bool = False
+    precompile_num_threads: int = 2
     aot_model_dir: str | None = None
     save_aot: str | None = None
     aot_topology: str | None = None
@@ -335,6 +336,35 @@ class ServerArgs:
     # (deferral, never abort). 0 disables the cap (unbounded).
     disaggregation_max_inflight_transfers: int = 8
 
+    def _prepare_runai_paths(self):
+        from sgl_jax.srt.utils.runai_utils import (
+            configure_runai,
+            download_metadata,
+            is_gcs_path,
+        )
+
+        # Do not mutate argparse's reusable default or a caller's source map.
+        self.runai_model_paths = dict(self.runai_model_paths)
+        model_paths = [self.model_path, self.speculative_draft_model_path]
+        if any(path and is_gcs_path(path) for path in model_paths):
+            if self.load_format not in ("auto", "runai_streamer"):
+                raise ValueError("GCS model paths require --load-format runai_streamer (or auto)")
+            self.load_format = "runai_streamer"
+        if self.load_format != "runai_streamer":
+            return
+        extra = self.model_loader_extra_config
+        configure_runai(json.loads(extra) if isinstance(extra, str) else (extra or {}))
+        resolved = {}
+        for field in ("model_path", "tokenizer_path", "speculative_draft_model_path"):
+            path = getattr(self, field)
+            if path and is_gcs_path(path):
+                if path not in resolved:
+                    resolved[path] = download_metadata(path, self.download_dir)
+                local_path = resolved[path]
+                if field != "tokenizer_path":
+                    self.runai_model_paths[local_path] = path
+                setattr(self, field, local_path)
+
     def __post_init__(self):
         if self.aot_model_dir:
             from sgl_jax.srt.model_executor.compilation_manager import (
@@ -373,6 +403,8 @@ class ServerArgs:
 
         if self.served_model_name is None:
             self.served_model_name = self.model_path
+
+        self._prepare_runai_paths()
 
         if self.random_seed is None:
             self.random_seed = 42
@@ -703,6 +735,8 @@ class ServerArgs:
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
+        # Internal state is serialized to workers, but is not a user-facing flag.
+        parser.set_defaults(runai_model_paths={})
         # Model and tokenizer
         parser.add_argument(
             "--model-path",
@@ -757,6 +791,7 @@ class ServerArgs:
                 "bitsandbytes",
                 "layered",
                 "remote",
+                "runai_streamer",
             ],
             help="The format of the model weights to load. "
             '"auto" will try to load the weights in the safetensors format '
@@ -773,7 +808,8 @@ class ServerArgs:
             "quantization."
             '"layered" loads weights layer by layer so that one can quantize a '
             "layer before loading another to make the peak memory envelope "
-            "smaller.",
+            "smaller. "
+            '"runai_streamer" reads GCS or local safetensors shards using RunAI I/O.',
         )
         parser.add_argument(
             "--model-loader-extra-config",
@@ -1548,6 +1584,13 @@ class ServerArgs:
             "data-parallel groups (requires tp_size > 1).",
         )
         parser.add_argument(
+            "--precompile-num-threads",
+            type=int,
+            default=ServerArgs.precompile_num_threads,
+            help="Maximum concurrent XLA compilations during precompile or --save-aot; "
+            "1 keeps serial compilation. Lowering and warmup remain serial.",
+        )
+        parser.add_argument(
             "--disable-precompile",
             action="store_true",
             help="whether disable precompile",
@@ -2030,6 +2073,8 @@ class ServerArgs:
         return hf_config
 
     def check_server_args(self):
+        if self.precompile_num_threads < 1:
+            raise ValueError("--precompile-num-threads must be at least 1")
         assert (self.tp_size) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
 
         if self.moe_dp_size < 1:
@@ -2077,7 +2122,10 @@ class ServerArgs:
                 and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
                 and self.attention_backend == "fa"
             )
-            supports_dflash_overlap = self.speculative_algorithm in ("DFLASH", "DSPARK")
+            supports_dflash_overlap = (
+                self.speculative_algorithm in ("DFLASH", "DSPARK")
+                and self.attention_backend != "tt"
+            )
             if not (supports_nextn_overlap or supports_eagle3_overlap or supports_dflash_overlap):
                 raise ValueError(
                     "Speculative overlap scheduler only supports DFLASH/DSPARK, EAGLE3+FA, "
@@ -2100,6 +2148,8 @@ class ServerArgs:
         if self.speculative_algorithm in ("DFLASH", "DSPARK"):
             if self.tp_size < 1:
                 raise ValueError("DFLASH requires --tp-size>=1.")
+            if self.attention_backend == "tt" and self.speculative_sample_from_anchor:
+                raise ValueError("TT attention does not support DFLASH anchor sampling.")
             if self.speculative_eagle_topk != 1:
                 raise ValueError(
                     "DFLASH requires --speculative-eagle-topk=1 (linear chain, no tree)."

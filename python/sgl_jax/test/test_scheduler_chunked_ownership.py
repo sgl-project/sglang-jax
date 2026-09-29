@@ -8,6 +8,7 @@ from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
 from sgl_jax.srt.disaggregation.prefill import PrefillBootstrapQueue
 from sgl_jax.srt.managers.io_struct import AbortReq, PauseGenerationReqInput
 from sgl_jax.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
+from sgl_jax.srt.managers.schedule_policy import AddReqResult
 from sgl_jax.srt.managers.scheduler import GenerationBatchResult, Scheduler
 from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
@@ -371,6 +372,43 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
 
         scheduler.continue_generation(SimpleNamespace())
         self.assertFalse(scheduler._engine_paused)
+
+    def test_chunk_budget_skips_only_exhausted_dp_for_current_round(self):
+        for dp_size in (1, 2):
+            with self.subTest(dp_size=dp_size):
+                scheduler, _ = self._make_scheduler([[] for _ in range(dp_size)])
+                scheduler.per_dp_max_running_requests = 256
+                scheduler.tree_cache.supports_recurrent = lambda: False
+                first = self._make_req("first", [1], [], dp_rank=0)
+                skipped = self._make_req("skipped", [2], [], dp_rank=0)
+                scheduler.waiting_queue = [first, skipped]
+                if dp_size == 2:
+                    scheduler.waiting_queue.append(self._make_req("other-dp", [3], [], dp_rank=1))
+                for req in scheduler.waiting_queue:
+                    req.init_next_round_input = Mock()
+                adder = SimpleNamespace(
+                    can_run_list={dp: [] for dp in range(dp_size)},
+                    pending_h2d=[],
+                    new_chunked_reqs=[None] * dp_size,
+                    add_one_req=Mock(return_value=AddReqResult.DP_BUDGET_EXHAUSTED),
+                )
+                with patch("sgl_jax.srt.managers.scheduler.PrefillAdder", return_value=adder):
+                    self.assertIsNone(scheduler.get_new_batch_prefill())
+                    self.assertEqual(adder.add_one_req.call_count, dp_size)
+                    skipped.init_next_round_input.assert_not_called()
+                    if dp_size == 2:
+                        scheduler.waiting_queue[-1].init_next_round_input.assert_called_once()
+                    self.assertFalse(scheduler.running_batch.batch_is_full)
+                    self.assertTrue(
+                        all(not info.batch_is_full for info in scheduler.running_batch.reqs_info)
+                    )
+                    # Exhaustion is local to one pass; every queued request is retried
+                    # when the next adder has budget again.
+                    adder.add_one_req.reset_mock()
+                    adder.add_one_req.return_value = AddReqResult.CONTINUE
+                    self.assertIsNone(scheduler.get_new_batch_prefill())
+                    self.assertEqual(adder.add_one_req.call_count, len(scheduler.waiting_queue))
+                    skipped.init_next_round_input.assert_called_once()
 
     def test_pending_abort_chunk_is_not_rescheduled(self):
         req = self._make_req("inflight", [1, 2], [10, 11])
