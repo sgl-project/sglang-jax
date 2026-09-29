@@ -372,7 +372,15 @@ def _run(workload: _Workload, mesh: jax.sharding.Mesh):
 
 
 class TestDSASparsePrefillDP(CustomTestCase):
-    """DP parity gates for the packed-ragged DSA sparse prefill."""
+    """DP parity gates for the packed-ragged DSA sparse prefill.
+
+    Runs the query-block kernel, the production default under
+    DSA_PREFILL_SPARSE; the subclass below reruns everything on the per-query
+    kernel that ``DSA_PREFILL_QBLOCK=0`` falls back to.
+    """
+
+    QBLOCK = True
+    KERNEL = "prefill_write_and_attend_ragged_qblock"
 
     def setUp(self):
         # CPU is covered by the import-time check; a real accelerator with too
@@ -381,9 +389,13 @@ class TestDSASparsePrefillDP(CustomTestCase):
             self.skipTest(f"needs >=2 devices, have {jax.device_count()}")
         # The sparse prefill path is opt-in behind DSA_PREFILL_SPARSE; the
         # module reads it at import time into a constant.
-        # Both patches are torn down by addCleanup, so a failure part-way
+        # All patches are torn down by addCleanup, so a failure part-way
         # through setUp cannot leak module state into the next test.
         self.enterContext(mock.patch.object(dsa_mod, "_PREFILL_SPARSE", 1))
+        self.enterContext(mock.patch.object(dsa_mod, "_PREFILL_QBLOCK", self.QBLOCK))
+        # Below the production 256, so each rank's queries span several blocks
+        # and block boundaries fall inside requests, not only at the rank edge.
+        self.enterContext(mock.patch.object(dsa_mod, "_PREFILL_QBLOCK_QB", 32))
         # Run the Pallas sparse kernel under the CPU interpreter. This is the
         # only stub in the test: the backend calls the kernel directly with no
         # hook, and `interpret` is a documented parameter of that same entry
@@ -394,8 +406,8 @@ class TestDSASparsePrefillDP(CustomTestCase):
         self.enterContext(
             mock.patch.object(
                 dsa_mod,
-                "prefill_write_and_attend_ragged",
-                functools.partial(dsa_mod.prefill_write_and_attend_ragged, interpret=True),
+                self.KERNEL,
+                functools.partial(getattr(dsa_mod, self.KERNEL), interpret=True),
             )
         )
 
@@ -573,6 +585,13 @@ class TestDSASparsePrefillDP(CustomTestCase):
             "the two ranks were given identical layouts — the per-rank assertions "
             "would hold for any implementation",
         )
+
+
+class TestDSASparsePrefillDPPerQuery(TestDSASparsePrefillDP):
+    """The same gates on the per-query kernel (``DSA_PREFILL_QBLOCK=0``)."""
+
+    QBLOCK = False
+    KERNEL = "prefill_write_and_attend_ragged"
 
 
 if __name__ == "__main__":
