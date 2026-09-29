@@ -37,7 +37,6 @@ from sgl_jax.srt.speculative.relay_buffer import (
     update_dflash_relay_buffers,
 )
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
-from sgl_jax.srt.utils.jax_utils import packed_device_array
 
 logger = logging.getLogger(__name__)
 
@@ -428,9 +427,11 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             0,
         )
         data_sharding = NamedSharding(self.mesh, P("data"))
-        relay_indices, relay_valid_mask, relay_new_seq_lens = packed_device_array(
-            (safe_indices, valid_mask, np.asarray(seq_lens, dtype=np.int32) + 1),
-            sharding=data_sharding,
+        relay_indices = jax.device_put(safe_indices, data_sharding)
+        relay_valid_mask = jax.device_put(valid_mask, data_sharding)
+        relay_new_seq_lens = jax.device_put(
+            np.asarray(seq_lens, dtype=np.int32) + 1,
+            data_sharding,
         )
         self._update_relay(
             next_token_ids,
@@ -600,22 +601,16 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         )
         relay_future_indices = np.where(active_mask, relay_future_indices, 0)
         data_sharding = NamedSharding(self.mesh, P("data"))
-        allocated_lens, reservation_base_lens, relay_future_indices, active_mask = (
-            packed_device_array(
-                (allocated_lens, reservation_base_lens, relay_future_indices, active_mask),
-                sharding=data_sharding,
-            )
-        )
         return DraftForwardPlan(
             forward_batch=forward_batch,
             forward_metadata=metadata,
             seq_lens=np.asarray(model_worker_batch.seq_lens, dtype=np.int32),
             target_prefix_lens=np.asarray(target_prefix_lens, dtype=np.int32),
             positions_host=positions_flat,
-            allocated_lens=allocated_lens,
-            reservation_base_lens=reservation_base_lens,
-            relay_future_indices=relay_future_indices,
-            relay_valid_mask=active_mask,
+            allocated_lens=jax.device_put(allocated_lens, data_sharding),
+            reservation_base_lens=jax.device_put(reservation_base_lens, data_sharding),
+            relay_future_indices=jax.device_put(relay_future_indices, data_sharding),
+            relay_valid_mask=jax.device_put(active_mask, data_sharding),
             use_relay_state=use_relay_state,
             dp_size=int(model_worker_batch.dp_size),
             bs=bs,
@@ -1486,14 +1481,11 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         local_n = active_host.reshape(dp_size, per_dp_bs).sum(axis=1, dtype=np.int32)
         distribution = np.column_stack([np.zeros_like(local_n), local_n, local_n]).reshape(-1)
         data_sharding = NamedSharding(self.mesh, P("data"))
-        cu_q_lens, active_mask, distribution = packed_device_array(
-            (cu_q_lens.reshape(-1), active_host, distribution), sharding=data_sharding
-        )
         cached = DFlashVerifyBucketTemplate(
             extend_seq_lens=extend_seq_lens,
-            cu_q_lens=cu_q_lens,
-            active_mask=active_mask,
-            distribution=distribution,
+            cu_q_lens=jax.device_put(cu_q_lens.reshape(-1), data_sharding),
+            active_mask=jax.device_put(active_host, data_sharding),
+            distribution=jax.device_put(distribution, data_sharding),
         )
         self._verify_bucket_templates[key] = cached
         return cached
@@ -1655,18 +1647,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 np.arange(per_dp_bs, dtype=np.int32),
                 int(draft_batch.dp_size),
             )
-            relay_future_indices = future_indices
+            relay_future_indices = jax.device_put(future_indices, data_sharding)
             allocated_lens = prefix_lens + 2 * self.block_size
-        else:
-            relay_future_indices = np.zeros(bs, dtype=np.int32)
-            allocated_lens = prefix_lens + self.block_size
-        allocated_lens, reservation_base_lens, relay_future_indices, active_mask = (
-            packed_device_array(
-                (allocated_lens, prefix_lens, relay_future_indices, active_mask),
-                sharding=data_sharding,
-            )
-        )
-        if use_relay_state:
             self.init_spec_relay_buffers()
             self._update_relay(
                 jnp.ones((bs,), dtype=jnp.int32),
@@ -1675,14 +1657,17 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 active_mask,
                 dp_size=int(draft_batch.dp_size),
             )
+        else:
+            relay_future_indices = jax.device_put(np.zeros(bs, dtype=np.int32), data_sharding)
+            allocated_lens = prefix_lens + self.block_size
         draft_plan = DraftForwardPlan(
             forward_batch=forward_batch,
             forward_metadata=draft_metadata,
             seq_lens=prefix_lens + 1,
             target_prefix_lens=prefix_lens,
             positions_host=np.asarray(draft_batch.positions, dtype=np.int32),
-            allocated_lens=allocated_lens,
-            reservation_base_lens=reservation_base_lens,
+            allocated_lens=jax.device_put(allocated_lens, data_sharding),
+            reservation_base_lens=jax.device_put(prefix_lens, data_sharding),
             relay_future_indices=relay_future_indices,
             relay_valid_mask=active_mask,
             use_relay_state=use_relay_state,
