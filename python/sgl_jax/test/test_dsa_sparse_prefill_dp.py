@@ -491,11 +491,16 @@ class TestDSASparsePrefillDP(CustomTestCase):
 
     def test_dp_invariance_dp4(self):
         """Four ranks, all different lengths — cu_q_lens/cu_kv_lens diverge per shard."""
-        self._assert_dp_invariant([[96], [64], [112], [80]], attn_tp=2)
+        self._assert_dp_invariant([[90], [64], [112], [81]], attn_tp=2)
 
     def test_dp_invariance_dp2_with_batching(self):
-        """Several requests per rank, on top of the packed-ragged batching."""
-        self._assert_dp_invariant([[64, 48], [80, 32]], attn_tp=2)
+        """Several requests per rank, on top of the packed-ragged batching.
+
+        The leading requests are not page-aligned, so each second request's KV
+        base (``cu_kv_lens``, page-aligned) differs from its query offset
+        (``cu_q_lens``, packed) — the two offsets are indistinguishable otherwise.
+        """
+        self._assert_dp_invariant([[58, 48], [75, 32]], attn_tp=2)
 
     def test_dp_invariance_dp2_tp2_wide_heads(self):
         """DP and TP together, with a head block wider than the default.
