@@ -341,7 +341,11 @@ def _build(workload: _Workload, mesh: jax.sharding.Mesh, cache_loc=None):
 
 
 def _run(workload: _Workload, mesh: jax.sharding.Mesh):
-    """Run one sparse-prefill EXTEND pass; return {(rank, req): output rows}."""
+    """Run one sparse-prefill EXTEND pass.
+
+    Returns ``{(rank, req): output rows}``, the updated ``DSAFusedCache``, and
+    ``{(rank, req): rank-local cache slot of each row}``.
+    """
     backend, fb, pool, inputs, row_spans = _build(workload, mesh)
 
     layer = RadixAttention(
@@ -354,7 +358,7 @@ def _run(workload: _Workload, mesh: jax.sharding.Mesh):
     )
 
     with jax.set_mesh(mesh):
-        o, _ = backend(
+        o, fused = backend(
             inputs["ql"],
             inputs["kvc"],
             inputs["kvc"],
@@ -369,7 +373,12 @@ def _run(workload: _Workload, mesh: jax.sharding.Mesh):
             idx_weights=inputs["idx_w"],
         )
     o = np.asarray(jax.device_get(o), dtype=np.float64)
-    return {key: o[lo:hi] for key, (lo, hi) in row_spans.items()}
+    loc = np.asarray(jax.device_get(fb.out_cache_loc))
+    return (
+        {key: o[lo:hi] for key, (lo, hi) in row_spans.items()},
+        fused,
+        {key: loc[lo:hi] for key, (lo, hi) in row_spans.items()},
+    )
 
 
 class TestDSASparsePrefillDP(CustomTestCase):
@@ -414,11 +423,11 @@ class TestDSASparsePrefillDP(CustomTestCase):
         )
         self.enterContext(mock.patch.object(dsa_mod, self.KERNEL, self.kernel))
 
-    def _run(self, workload: _Workload, mesh: jax.sharding.Mesh):
+    def _run(self, workload: _Workload, mesh: jax.sharding.Mesh, with_cache=False):
         self.kernel.reset_mock()
-        out = _run(workload, mesh)
+        out, fused, slots = _run(workload, mesh)
         self.kernel.assert_called()
-        return out
+        return (out, fused, slots) if with_cache else out
 
     def _assert_dp_invariant(self, q_lens_per_rank, attn_tp, num_heads=NUM_HEADS):
         """Each rank's requests must give the same answer alone at dp=1 as they
@@ -525,6 +534,51 @@ class TestDSASparsePrefillDP(CustomTestCase):
             atol=1e-6,
             err_msg="rank 0 output changed when only rank 1's tokens changed",
         )
+
+    def test_cache_writes_land_on_own_slots(self):
+        """Every token's KV and indexer key land in its own rank-local slot, and
+        nothing else in the rank's pages 1..PAGES_PER_RANK is written.
+
+        The parity gates cannot see a misplaced write: single-shot prefill
+        attends and scores the fresh inputs, so a clobbered slot is only read
+        back by a later pass (decode, the next chunk) — and the dp=1 reference
+        would clobber it identically. This checks the caches directly.
+
+        Rank 0 fills its whole window, including the last page, with
+        non-aligned lengths so the rank still carries padding rows: the shape
+        that exposed padding writes routed to the last allocatable page (#1585).
+        Page 0 is the allocator's reserved page and is left unchecked.
+        """
+        workload = _Workload([[122, 120], [90, 100]])
+        dp = workload.dp_size
+        _, fused, slots = self._run(workload, _mesh(dp, 2), with_cache=True)
+
+        pages_total = PAGES_PER_RANK + 1  # + the reserved page 0
+        for name, cache, width, expected in (
+            ("indexer", fused.idx, INDEX_HEAD_DIM, lambda p: p["k_idx"]),
+            (
+                "kv",
+                fused.kv,
+                KV_LORA_RANK + QK_ROPE_DIM,
+                lambda p: np.concatenate([p["kvc"], p["kpe"]], -1),
+            ),
+        ):
+            flat = np.asarray(jax.device_get(cache))
+            flat = flat.reshape(dp, pages_total * PAGE_SIZE, flat.shape[-1])[..., :width]
+            written = np.zeros(flat.shape[:2], dtype=bool)
+            for (r, i), loc in slots.items():
+                np.testing.assert_array_equal(
+                    flat[r, loc],
+                    expected(workload.payloads[(r, i)]).astype(np.float32),
+                    err_msg=f"{name} cache: rank {r} req {i} rows are not in their own slots",
+                )
+                written[r, loc] = True
+            written[:, :PAGE_SIZE] = True  # page 0: padding writes are allowed here
+            self.assertEqual(
+                np.abs(flat[~written]).max(initial=0.0),
+                0.0,
+                f"{name} cache: a slot outside every request's rows was written",
+            )
 
     def test_metadata_shards_evenly(self):
         """`pages_per_seq` is derived from LOCAL shard shapes inside shard_map
