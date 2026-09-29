@@ -162,6 +162,71 @@ def test_split_file_dense_and_explicit_alias(tmp_path, mesh):
     np.testing.assert_array_equal(model.weight.value, original.T)
 
 
+def test_qwen2_checkpoint_without_output_projection_bias(tmp_path, mesh):
+    from transformers import Qwen2Config
+
+    from sgl_jax.srt.models.qwen2 import Qwen2ForCausalLM
+
+    config = Qwen2Config(
+        vocab_size=32,
+        hidden_size=512,
+        intermediate_size=512,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=32,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+        tie_word_embeddings=False,
+    )
+    prefix = "model.layers.0"
+    shapes = {
+        "model.embed_tokens.weight": (32, 512),
+        "model.norm.weight": (512,),
+        "lm_head.weight": (32, 512),
+        f"{prefix}.input_layernorm.weight": (512,),
+        f"{prefix}.post_attention_layernorm.weight": (512,),
+    }
+    for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+        shapes[f"{prefix}.self_attn.{name}.weight"] = (512, 512)
+    # Qwen2 checkpoints have Q/K/V biases, but no output projection bias.
+    for name in ("q_proj", "k_proj", "v_proj"):
+        shapes[f"{prefix}.self_attn.{name}.bias"] = (512,)
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        shapes[f"{prefix}.mlp.{name}.weight"] = (512, 512)
+    rng = np.random.default_rng(0)
+    weights = {
+        name: rng.normal(size=shape).astype(ml_dtypes.bfloat16) for name, shape in shapes.items()
+    }
+    save_weights(tmp_path / "model.safetensors", weights)
+    mesh = Mesh(
+        mesh.devices.reshape(1, -1),
+        ("data", "tensor"),
+        axis_types=(AxisType.Explicit,) * 2,
+    )
+    model_config = SimpleNamespace(
+        model_path=str(tmp_path),
+        num_attention_heads=4,
+        hidden_size=512,
+        get_total_num_kv_heads=lambda: 4,
+        needs_kv_head_replication=lambda tp_size: tp_size > 4,
+        hf_text_config=config,
+    )
+    with jax.set_mesh(mesh):
+        model = nnx.eval_shape(lambda: Qwen2ForCausalLM(config, mesh))
+        model.load_weights(model_config)
+    attention = model.model.layers[0].self_attn
+    assert attention.o_proj.bias is None
+    for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+        projection = getattr(attention, name)
+        np.testing.assert_array_equal(
+            projection.weight.value, weights[f"{prefix}.self_attn.{name}.weight"].T
+        )
+        if name != "o_proj":
+            np.testing.assert_array_equal(
+                projection.bias.value, weights[f"{prefix}.self_attn.{name}.bias"]
+            )
+
+
 @pytest.mark.parametrize("kind", ["missing", "duplicate"])
 def test_invalid_plan_fails_before_assignment(tmp_path, mesh, kind):
     save_file(
