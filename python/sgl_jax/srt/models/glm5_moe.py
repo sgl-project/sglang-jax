@@ -681,7 +681,10 @@ class Glm5DecoderLayer(nnx.Module):
         rope_scaling = config.rope_parameters
         max_position_embeddings = getattr(config, "max_position_embeddings", 131072)
         self.head_dim = getattr(config, "head_dim", None) or 128
-        use_qk_norm = getattr(config, "use_qk_norm", True)
+        # GLM-5.x checkpoints carry no self_attn.q_norm/k_norm tensors and the
+        # attention forward never applies them; creating the params only leaves
+        # unloaded parameters behind (the loader's final validation rejects them).
+        use_qk_norm = getattr(config, "use_qk_norm", False)
 
         partial_rotary_factor = rope_scaling.get("partial_rotary_factor", 0.5)
         rotary_dim = int(self.head_dim * partial_rotary_factor)
