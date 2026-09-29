@@ -753,11 +753,22 @@ class KimiLinearForCausalLM(nnx.Module):
         else:
             # MLA layer — MLAAttention is directly self.self_attn
             attn_target = f"{target_prefix}.self_attn"
-            mappings[f"{prefix}.self_attn.q_proj.weight"] = WeightSpec(
-                target_path=f"{attn_target}.q_proj.weight",
-                sharding=(None, "tensor"),
-                transpose=True,
-            )
+            if self.config.q_lora_rank is None:
+                mappings[f"{prefix}.self_attn.q_proj.weight"] = WeightSpec(
+                    target_path=f"{attn_target}.q_proj.weight",
+                    sharding=(None, "tensor"),
+                    transpose=True,
+                )
+            else:
+                for proj, sharding in (("q_a_proj", (None, None)), ("q_b_proj", (None, "tensor"))):
+                    mappings[f"{prefix}.self_attn.{proj}.weight"] = WeightSpec(
+                        target_path=f"{attn_target}.{proj}.weight",
+                        sharding=sharding,
+                        transpose=True,
+                    )
+                mappings[f"{prefix}.self_attn.q_a_layernorm.weight"] = WeightSpec(
+                    target_path=f"{attn_target}.q_a_layernorm.scale", sharding=(None,)
+                )
             mappings[f"{prefix}.self_attn.o_proj.weight"] = WeightSpec(
                 target_path=f"{attn_target}.o_proj.weight",
                 sharding=("tensor", None),
@@ -830,19 +841,20 @@ class KimiLinearForCausalLM(nnx.Module):
             )
             mappings.update(moe_mappings)
 
-            # Shared experts
-            for proj_name, sharding in [
-                ("gate_proj", (None, "tensor")),
-                ("up_proj", (None, "tensor")),
-                ("down_proj", ("tensor", None)),
-            ]:
-                mappings[f"{prefix}.block_sparse_moe.shared_experts.{proj_name}.weight"] = (
-                    WeightSpec(
-                        target_path=f"{target_prefix}.shared_experts.{proj_name}.weight",
-                        sharding=sharding,
-                        transpose=True,
+            if self.config.num_shared_experts > 0:
+                # Shared experts
+                for proj_name, sharding in [
+                    ("gate_proj", (None, "tensor")),
+                    ("up_proj", (None, "tensor")),
+                    ("down_proj", ("tensor", None)),
+                ]:
+                    mappings[f"{prefix}.block_sparse_moe.shared_experts.{proj_name}.weight"] = (
+                        WeightSpec(
+                            target_path=f"{target_prefix}.shared_experts.{proj_name}.weight",
+                            sharding=sharding,
+                            transpose=True,
+                        )
                     )
-                )
 
         return mappings
 

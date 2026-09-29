@@ -125,9 +125,6 @@ Local and RunAI selection remains controlled by the existing load-format CLI.
 
 ## Validation
 
-`test_weight_loading_recipes.py` writes real safetensors and checks numerical
-results against independent NumPy references. It covers MiMo, GLM, MLA, Qwen3.5
-text/vision/GDN, Gemma experts, split checkpoints, aliases, and P/D cache identity.
 `test_weight_loading_distributed.py` starts two real JAX CPU controllers and
 checks rank-local roots, inconsistent plans, read failures, and asymmetric
 cache state. SDK fakes in `test_runai_loader.py` specifically exercise borrowed

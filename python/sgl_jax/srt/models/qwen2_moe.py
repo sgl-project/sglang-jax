@@ -562,37 +562,18 @@ class Qwen2MoeForCausalLM(nnx.Module):
             ),
         }
 
-        # Add bias mappings if attention_bias is True
-        if getattr(self.config, "attention_bias", True):
-            bias_mappings = {
-                f"{prefix}.self_attn.q_proj.bias": WeightSpec(
-                    target_path=f"{target_prefix}.self_attn.q_proj.bias",
+        if getattr(self.config, "qkv_bias", True):
+            for proj in ("q_proj", "k_proj", "v_proj"):
+                mappings[f"{prefix}.self_attn.{proj}.bias"] = WeightSpec(
+                    target_path=f"{target_prefix}.self_attn.{proj}.bias",
                     sharding=(None,),
-                    transpose=False,
                     head_dim_padding=True,
-                    kv_head_padding=False,
-                ),
-                f"{prefix}.self_attn.k_proj.bias": WeightSpec(
-                    target_path=f"{target_prefix}.self_attn.k_proj.bias",
-                    sharding=(None,),
-                    transpose=False,
-                    head_dim_padding=True,
-                    kv_head_padding=True,
-                ),
-                f"{prefix}.self_attn.v_proj.bias": WeightSpec(
-                    target_path=f"{target_prefix}.self_attn.v_proj.bias",
-                    sharding=(None,),
-                    transpose=False,
-                    head_dim_padding=True,
-                    kv_head_padding=True,
-                ),
-                f"{prefix}.self_attn.o_proj.bias": WeightSpec(
-                    target_path=f"{target_prefix}.self_attn.o_proj.bias",
-                    sharding=(None,),
-                    transpose=False,
-                ),
-            }
-            mappings.update(bias_mappings)
+                    kv_head_padding=proj in ("k_proj", "v_proj"),
+                )
+        if getattr(self.config, "o_bias", False):
+            mappings[f"{prefix}.self_attn.o_proj.bias"] = WeightSpec(
+                target_path=f"{target_prefix}.self_attn.o_proj.bias", sharding=(None,)
+            )
 
         # MoE mappings for expert layers
         mappings[f"{prefix}.mlp.gate.weight"] = WeightSpec(
