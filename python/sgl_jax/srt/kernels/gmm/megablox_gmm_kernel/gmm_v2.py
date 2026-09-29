@@ -910,6 +910,16 @@ def make_gmm_configs(
         # rescaled by its own rhs scale before accumulation, so the lhs quant
         # granularity must match the rhs block grid exactly.
         lhs_quant_block_size = block_size
+    elif (
+        lhs_q_dtype is not None
+        and rhs_quant_dtype is not None
+        and not jnp.issubdtype(rhs_quant_dtype, jnp.floating)
+    ):
+        # Per-channel integer weights (int4 W4A8): the activation quantization
+        # block is free to choose. 512 costs accuracy against the FP8 block-128
+        # baseline (GLM-5.2 gsm8k p1-200: 0.930 at 512 vs 0.955 at 128, same
+        # weights, 2026-09-29), so match the FP8 path's 128-element granularity.
+        lhs_quant_block_size = 128
 
     lhs_cfgs = InputConfigs(
         quant_dtype=lhs_q_dtype,
