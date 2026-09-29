@@ -459,11 +459,6 @@ class Qwen2ForCausalLM(nnx.Module):
                     head_dim_padding=True,
                     kv_head_padding=True,
                 ),
-                f"{prefix}.self_attn.o_proj.bias": WeightSpec(
-                    target_path=f"{target_prefix}.self_attn.o_proj.bias",
-                    sharding=(None,),
-                    transpose=False,
-                ),
             }
             mappings.update(bias_mappings)
 
