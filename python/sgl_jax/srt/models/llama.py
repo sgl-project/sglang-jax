@@ -524,7 +524,7 @@ class LlamaForCausalLM(nnx.Module):
             ),
         }
 
-        if getattr(self.config, "attention_bias", False):
+        if getattr(self.config, "attention_bias", False) or getattr(self.config, "bias", False):
             bias_mappings = {
                 f"{prefix}.self_attn.q_proj.bias": WeightSpec(
                     target_path=f"{target_prefix}.self_attn.q_proj.bias",
@@ -635,7 +635,28 @@ class LlamaForCausalLM(nnx.Module):
 
 
 class Phi3ForCausalLM(LlamaForCausalLM):
-    pass
+    def _create_layer_mappings(self, layer_idx: int) -> dict:
+        mappings = super()._create_layer_mappings(layer_idx)
+        prefix = f"model.layers.{layer_idx}"
+        qkv_paths = [f"{prefix}.self_attn.{proj}.weight" for proj in ("q_proj", "k_proj", "v_proj")]
+        mlp_paths = [f"{prefix}.mlp.{proj}.weight" for proj in ("gate_proj", "up_proj")]
+        for path in qkv_paths + mlp_paths:
+            del mappings[path]
+        mappings[f"{prefix}.self_attn.qkv_proj.weight"] = WeightSpec(
+            target_path=qkv_paths,
+            sharding=(None, "tensor"),
+            transpose=True,
+            head_dim_padding=True,
+            kv_head_padding=True,
+        )
+        mappings[f"{prefix}.mlp.gate_up_proj.weight"] = WeightSpec(
+            target_path=mlp_paths,
+            sharding=(None, "tensor"),
+            transpose=True,
+            split_sizes=(self.config.intermediate_size, self.config.intermediate_size),
+            split_axis=1,
+        )
+        return mappings
 
 
 class InternLM3ForCausalLM(LlamaForCausalLM):

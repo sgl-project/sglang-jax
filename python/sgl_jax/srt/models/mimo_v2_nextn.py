@@ -191,6 +191,9 @@ class MiMoV2MTPForCausalLM(nnx.Module):
         self._uses_fused_mtp_qkv = False
         self.hot_token_ids = None
 
+    def get_shared_weight_paths(self):
+        return ("model.embed_tokens.embedding", "lm_head.embedding")
+
     def __call__(
         self,
         forward_batch: ForwardBatch,

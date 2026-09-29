@@ -789,3 +789,401 @@ def test_gemma4_prefused_experts_and_missing_head_alias(tmp_path):
         actual = getattr(model.model.layers[0].experts, name).value
         np.testing.assert_array_equal(actual, value.transpose(0, 2, 1).astype(ml_dtypes.bfloat16))
         assert actual.sharding.mesh.shape["expert"] == 2
+
+
+@pytest.fixture
+def model_mesh():
+    return Mesh(
+        np.array(jax.devices()).reshape(1, -1),
+        ("data", "tensor"),
+        axis_types=(AxisType.Explicit, AxisType.Explicit),
+    )
+
+
+def small_model_config(model_type, **kwargs):
+    from transformers import AutoConfig
+
+    return AutoConfig.for_model(
+        model_type,
+        **(
+            dict(
+                vocab_size=32,
+                hidden_size=512,
+                intermediate_size=512,
+                num_hidden_layers=1,
+                num_attention_heads=4,
+                num_key_value_heads=4,
+                head_dim=128,
+                max_position_embeddings=128,
+                rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+                tie_word_embeddings=False,
+            )
+            | kwargs
+        ),
+    )
+
+
+def checkpoint_config(config, tmp_path):
+    # Use the original checkpoint head counts, as ModelConfig does in serving.
+    config.model_path = str(tmp_path)
+    config.dtype = jnp.bfloat16
+    config.quantization_config = None
+    checkpoint_kv_heads = config.num_key_value_heads
+    config.get_total_num_kv_heads = lambda: checkpoint_kv_heads
+    config.needs_kv_head_replication = lambda tp: tp > checkpoint_kv_heads
+    config.get_num_kv_head_replicas = lambda tp: tp // checkpoint_kv_heads
+    config.get_kv_padding_strategy = lambda: "replicate"
+    config.hf_text_config = SimpleNamespace(head_dim=128)
+    return config
+
+
+@pytest.mark.parametrize(
+    "kind,qkv_bias,o_bias",
+    [
+        ("llama", True, True),
+        ("gemma2", True, True),
+        ("qwen2_moe", True, False),
+        ("qwen2_moe", False, True),
+        ("qwen2_5_vl", True, False),
+        ("qwen2_5_vl", False, False),
+    ],
+)
+def test_model_attention_bias_checkpoint_contract(tmp_path, model_mesh, kind, qkv_bias, o_bias):
+    from transformers import AutoConfig
+
+    from sgl_jax.srt.models.gemma2 import Gemma2ForCausalLM
+    from sgl_jax.srt.models.llama import LlamaForCausalLM
+    from sgl_jax.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
+    from sgl_jax.srt.models.qwen2_moe import Qwen2MoeForCausalLM
+
+    config = small_model_config(
+        kind if kind != "qwen2_5_vl" else "qwen2",
+        attention_bias=False if kind == "llama" else qkv_bias,
+        bias=kind == "llama",
+        qkv_bias=qkv_bias,
+        o_bias=o_bias,
+        num_experts=4,
+        num_experts_per_tok=1,
+        moe_intermediate_size=512,
+        shared_expert_intermediate_size=512,
+        ep_size=1,
+    )
+    classes = {
+        "llama": LlamaForCausalLM,
+        "gemma2": Gemma2ForCausalLM,
+        "qwen2_moe": Qwen2MoeForCausalLM,
+        "qwen2_5_vl": Qwen2_5_VLForConditionalGeneration,
+    }
+    text_config = config.to_dict()
+    mc = checkpoint_config(config, tmp_path)
+    if kind == "qwen2_5_vl":
+        config = AutoConfig.for_model(
+            "qwen2_5_vl",
+            text_config=text_config,
+            vision_config=dict(
+                depth=1,
+                hidden_size=128,
+                intermediate_size=128,
+                num_heads=4,
+                in_channels=3,
+                out_hidden_size=512,
+                patch_size=2,
+                spatial_merge_size=2,
+                temporal_patch_size=2,
+                window_size=8,
+                fullatt_block_indexes=[0],
+            ),
+            tie_word_embeddings=False,
+        )
+        # Qwen2Model always creates Q/K/V biases, irrespective of attention_bias.
+        qkv_bias = True
+    prefix = "model.layers.0.self_attn."
+    weights = {
+        prefix + proj + ".weight": np.full((512, 512), i + 1, np.float32)
+        for i, proj in enumerate(("q_proj", "k_proj", "v_proj", "o_proj"))
+    }
+    for i, proj in enumerate(("q_proj", "k_proj", "v_proj", "o_proj")):
+        if o_bias if proj == "o_proj" else qkv_bias:
+            weights[prefix + proj + ".bias"] = np.arange(512, dtype=np.float32) + i
+    save_file(weights, tmp_path / "model.safetensors")
+    with jax.set_mesh(model_mesh):
+        model = nnx.eval_shape(lambda: classes[kind](config, mesh=model_mesh))
+        if kind == "qwen2_5_vl":
+            mappings = model._language_layer_mappings(0)
+        elif kind == "qwen2_moe":
+            mappings = model._create_moe_layer_mappings(0)
+        else:
+            mappings = model._create_layer_mappings(0)
+        mappings = {key: spec for key, spec in mappings.items() if ".self_attn." in key}
+        assert set(mappings) == set(weights)
+        WeightLoader(model, mc, model_mesh).load(mappings)
+    for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+        bias = getattr(model.model.layers[0].self_attn, proj).bias
+        if prefix + proj + ".bias" in weights:
+            np.testing.assert_array_equal(
+                bias.value, weights[prefix + proj + ".bias"].astype(ml_dtypes.bfloat16)
+            )
+        else:
+            assert bias is None
+
+
+@pytest.mark.parametrize("kv_heads", [2, 4])
+def test_phi3_packed_checkpoint(tmp_path, model_mesh, kv_heads):
+    from sgl_jax.srt.model_loader.loader import JAXModelLoader
+    from sgl_jax.srt.models.llama import Phi3ForCausalLM
+
+    config = checkpoint_config(small_model_config("phi3", num_key_value_heads=kv_heads), tmp_path)
+    # Serving expands runtime KV heads before constructing the model.
+    config.num_key_value_heads = max(kv_heads, model_mesh.size)
+    prefix = "model.layers.0."
+    shapes = {
+        "model.embed_tokens.weight": (32, 512),
+        "lm_head.weight": (32, 512),
+        "model.norm.weight": (512,),
+        prefix + "input_layernorm.weight": (512,),
+        prefix + "post_attention_layernorm.weight": (512,),
+        prefix + "self_attn.qkv_proj.weight": ((4 + 2 * kv_heads) * 128, 512),
+        prefix + "self_attn.o_proj.weight": (512, 512),
+        prefix + "mlp.gate_up_proj.weight": (1024, 512),
+        prefix + "mlp.down_proj.weight": (512, 512),
+    }
+    rng = np.random.default_rng(42)
+    weights = {key: rng.normal(size=shape).astype(np.float32) for key, shape in shapes.items()}
+    save_file(weights, tmp_path / "model.safetensors")
+    with jax.set_mesh(model_mesh):
+        model = JAXModelLoader._get_model(SimpleNamespace(mesh=model_mesh), Phi3ForCausalLM, config)
+    layer = model.model.layers[0]
+    q, k, v = np.split(weights[prefix + "self_attn.qkv_proj.weight"], [512, 512 + kv_heads * 128])
+    for proj, expected in zip(("q_proj", "k_proj", "v_proj"), (q, k, v)):
+        if proj != "q_proj" and model_mesh.size > kv_heads:
+            expected = np.repeat(
+                expected.reshape(kv_heads, 128, 512), model_mesh.size // kv_heads, axis=0
+            ).reshape(-1, 512)
+        np.testing.assert_array_equal(
+            getattr(layer.self_attn, proj).weight.value, expected.T.astype(ml_dtypes.bfloat16)
+        )
+    gate, up = np.split(weights[prefix + "mlp.gate_up_proj.weight"], 2)
+    for proj, expected in (("gate_proj", gate), ("up_proj", up)):
+        np.testing.assert_array_equal(
+            getattr(layer.mlp, proj).weight.value, expected.T.astype(ml_dtypes.bfloat16)
+        )
+
+
+@pytest.mark.parametrize(
+    "kind,draft_vocab,tied,bias,d2t",
+    [
+        ("eagle3", 32, False, False, True),
+        ("eagle3", None, False, False, False),
+        ("eagle3", None, True, False, False),
+        ("eagle3", 32, False, True, False),
+        ("mimo_v2", None, False, False, False),
+    ],
+)
+def test_draft_checkpoint_then_target_weight_sharing(
+    tmp_path, model_mesh, kind, draft_vocab, tied, bias, d2t
+):
+    from sgl_jax.srt.model_executor.model_runner import ModelRunner
+    from sgl_jax.srt.model_loader.loader import (
+        JAXModelLoader,
+        validate_model_parameters,
+    )
+    from sgl_jax.srt.models.llama_eagle3 import LlamaForCausalLMEagle3
+    from sgl_jax.srt.models.mimo_v2_nextn import MiMoV2MTPForCausalLM
+
+    if kind == "eagle3":
+        cls = LlamaForCausalLMEagle3
+        config = small_model_config(
+            "llama", draft_vocab_size=draft_vocab, tie_word_embeddings=tied, bias=bias
+        )
+        shapes = {"fc.weight": (512, 1536), "norm.weight": (512,)}
+        if draft_vocab is not None and not tied:
+            shapes["lm_head.weight"] = (32, 512)
+        for name in ("hidden_norm", "input_layernorm", "post_attention_layernorm"):
+            shapes[f"midlayer.{name}.weight"] = (512,)
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            shapes[f"midlayer.mlp.{proj}.weight"] = (512, 512)
+        for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            shapes[f"midlayer.self_attn.{proj}.weight"] = (512, 512 if proj == "o_proj" else 1024)
+            if bias:
+                shapes[f"midlayer.self_attn.{proj}.bias"] = (512,)
+        if bias:
+            shapes["fc.bias"] = (512,)
+    else:
+        cls = MiMoV2MTPForCausalLM
+        config = small_model_config(
+            "qwen2",
+            layernorm_epsilon=1e-6,
+            swa_head_dim=128,
+            swa_num_attention_heads=4,
+            swa_num_key_value_heads=4,
+            add_swa_attention_sink_bias=True,
+        )
+        prefix = "model.mtp.layers.0."
+        shapes = {
+            prefix + name + ".weight": (512,)
+            for name in (
+                "enorm",
+                "hnorm",
+                "final_layernorm",
+                "input_layernorm",
+                "pre_mlp_layernorm",
+            )
+        }
+        shapes[prefix + "eh_proj.weight"] = (512, 1024)
+        for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            shapes[prefix + "self_attn." + proj + ".weight"] = (512, 512)
+        shapes[prefix + "self_attn.attention_sink_bias"] = (4,)
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            shapes[prefix + "mlp." + proj + ".weight"] = (512, 512)
+    weights = {key: np.ones(shape, np.float32) for key, shape in shapes.items()}
+    if d2t:
+        weights["d2t"] = np.arange(32, dtype=np.int32)
+    save_file(weights, tmp_path / "model.safetensors")
+    config = checkpoint_config(config, tmp_path)
+    with jax.set_mesh(model_mesh):
+        model = JAXModelLoader._get_model(SimpleNamespace(mesh=model_mesh), cls, config)
+        # The real pre-JIT boundary must reject draft models before sharing.
+        with pytest.raises(ValueError, match="Unloaded model parameters"):
+            ModelRunner.initialize_jit(SimpleNamespace(model=model))
+        embed = jnp.full((32, 512), 3, jnp.bfloat16)
+        head = jnp.full((32, 512), 5, jnp.bfloat16)
+        if model.load_lm_head_from_target:
+            model.set_embed_and_head(embed, head)
+        else:
+            model.set_embed(embed)
+        validate_model_parameters(model)
+        if kind == "eagle3":
+            np.testing.assert_array_equal(
+                model.hot_token_ids.value, np.arange(32) * (2 if d2t else 1)
+            )
+            np.testing.assert_array_equal(
+                model.lm_head.embedding.value,
+                embed if tied else head if draft_vocab is None else np.ones((32, 512)),
+            )
+        # Only explicitly shared parameters may be deferred; a broken ordinary
+        # parameter must still fail load-time validation.
+        param = (
+            model.model.midlayer.hidden_norm.scale if kind == "eagle3" else model.model.enorm.scale
+        )
+        param.value = jax.ShapeDtypeStruct(param.value.shape, param.value.dtype)
+        with pytest.raises(ValueError, match="Unloaded model parameters"):
+            validate_model_parameters(model, allow_shared=True)
+
+
+@pytest.mark.parametrize("residual_moe", [False, True])
+def test_grok_optional_residual_mlp_checkpoint(tmp_path, model_mesh, residual_moe):
+    from sgl_jax.srt.model_loader.loader import JAXModelLoader
+    from sgl_jax.srt.models.grok import Grok1ForCausalLM
+
+    config = small_model_config(
+        "qwen2",
+        residual_moe=residual_moe,
+        num_local_experts=4,
+        num_experts_per_tok=1,
+        moe_intermediate_size=512,
+        ep_size=1,
+        rms_norm_eps=1e-6,
+    )
+    shapes = {
+        "model.embed_tokens.weight": (32, 512),
+        "lm_head.weight": (32, 512),
+        "model.norm.weight": (512,),
+    }
+    prefix = "model.layers.0."
+    for norm in ("pre_attn_norm", "post_attn_norm", "pre_moe_norm", "post_moe_norm"):
+        shapes[prefix + norm + ".weight"] = (512,)
+    for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+        shapes[prefix + "self_attn." + proj + ".weight"] = (512, 512)
+    shapes[prefix + "block_sparse_moe.gate.weight"] = (4, 512)
+    for expert in range(4):
+        for proj in ("w1", "w2", "w3"):
+            shapes[prefix + f"block_sparse_moe.experts.{expert}.{proj}.weight"] = (512, 512)
+    if residual_moe:
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            shapes[prefix + "mlp." + proj + ".weight"] = (512, 512)
+    # Grok checkpoints partition each expert across eight safetensors files.
+    for shard in range(8):
+        weights = {}
+        for key, shape in shapes.items():
+            if ".experts." in key:
+                shape = (512, 64) if ".w2." in key else (64, 512)
+            elif shard:
+                continue
+            weights[key] = np.ones(shape, np.float32)
+        save_file(weights, tmp_path / f"model-{shard}.safetensors")
+    with jax.set_mesh(model_mesh):
+        model = JAXModelLoader._get_model(
+            SimpleNamespace(mesh=model_mesh), Grok1ForCausalLM, checkpoint_config(config, tmp_path)
+        )
+    assert hasattr(model.model.layers[0], "mlp") == residual_moe
+
+
+@pytest.mark.parametrize("q_lora_rank,shared_experts", [(None, 1), (128, 0)])
+def test_kimi_mla_and_optional_shared_experts_checkpoint(
+    tmp_path, model_mesh, q_lora_rank, shared_experts
+):
+    from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
+    from sgl_jax.srt.model_loader.loader import JAXModelLoader
+    from sgl_jax.srt.models.kimi_linear import KimiLinearForCausalLM
+
+    config = KimiLinearConfig(
+        vocab_size=32,
+        hidden_size=512,
+        intermediate_size=512,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        head_dim=128,
+        max_position_embeddings=128,
+        q_lora_rank=q_lora_rank,
+        kv_lora_rank=128,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        num_experts=4,
+        num_experts_per_token=1,
+        moe_intermediate_size=512,
+        num_shared_experts=shared_experts,
+        ep_size=1,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+        linear_attn_config={"kda_layers": [], "full_attn_layers": [0]},
+    )
+    prefix = "model.layers.0."
+    shapes = {
+        "model.embed_tokens.weight": (32, 512),
+        "lm_head.weight": (32, 512),
+        "model.norm.weight": (512,),
+        prefix + "input_layernorm.weight": (512,),
+        prefix + "post_attention_layernorm.weight": (512,),
+        prefix + "self_attn.kv_a_proj_with_mqa.weight": (192, 512),
+        prefix + "self_attn.kv_a_layernorm.weight": (128,),
+        prefix + "self_attn.kv_b_proj.weight": (1024, 128),
+        prefix + "self_attn.o_proj.weight": (512, 512),
+        prefix + "block_sparse_moe.gate.weight": (4, 512),
+        prefix + "block_sparse_moe.gate.e_score_correction_bias": (4,),
+    }
+    if q_lora_rank is None:
+        shapes[prefix + "self_attn.q_proj.weight"] = (768, 512)
+    else:
+        shapes[prefix + "self_attn.q_a_proj.weight"] = (128, 512)
+        shapes[prefix + "self_attn.q_a_layernorm.weight"] = (128,)
+        shapes[prefix + "self_attn.q_b_proj.weight"] = (768, 128)
+    for expert in range(4):
+        for proj in ("w1", "w2", "w3"):
+            shapes[prefix + f"block_sparse_moe.experts.{expert}.{proj}.weight"] = (512, 512)
+    if shared_experts:
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            shapes[prefix + "block_sparse_moe.shared_experts." + proj + ".weight"] = (512, 512)
+    save_file(
+        {key: np.ones(shape, np.float32) for key, shape in shapes.items()},
+        tmp_path / "model.safetensors",
+    )
+    with jax.set_mesh(model_mesh):
+        model = JAXModelLoader._get_model(
+            SimpleNamespace(mesh=model_mesh),
+            KimiLinearForCausalLM,
+            checkpoint_config(config, tmp_path),
+        )
+    layer = model.model.layers[0]
+    assert (layer.shared_experts is not None) == bool(shared_experts)
+    assert hasattr(layer.self_attn, "q_a_proj") == (q_lora_rank is not None)
