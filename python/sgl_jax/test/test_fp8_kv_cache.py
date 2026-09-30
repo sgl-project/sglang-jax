@@ -1,5 +1,6 @@
 """Tests for FP8 KV cache support in sglang-jax."""
 
+import logging
 import types
 from unittest.mock import patch
 
@@ -330,6 +331,53 @@ def test_fp8_vs_bf16_pool_sizes(actual_kv_heads):
     else:
         # For 2, 4, 8 heads: FP8 achieves exactly 50% memory consumption of BF16.
         assert fp8_cell_size == bf16_cell_size // 2
+
+
+def test_fp8_1head_padding_warning(caplog):
+    """Verify warning is emitted when FP8 KV cache gives no memory savings (1 KV head/shard)."""
+    # 1. Warning fires for 1 head/shard FP8 (e4m3 and e5m2)
+    with caplog.at_level(logging.WARNING):
+        caplog.clear()
+        runner_1head_e4m3 = _DummyRunner(kv_cache_dtype_str="fp8_e4m3", actual_num_kv_heads=1)
+        runner_1head_e4m3._compute_cell_size()
+        warning_records = [
+            r.message
+            for r in caplog.records
+            if "FP8 KV cache gives no memory savings with 1 KV head(s) per device" in r.message
+        ]
+        assert len(warning_records) == 1
+        assert "K/V are padded to the 32-bit packing width (4)" in warning_records[0]
+
+    with caplog.at_level(logging.WARNING):
+        caplog.clear()
+        runner_1head_e5m2 = _DummyRunner(kv_cache_dtype_str="fp8_e5m2", actual_num_kv_heads=1)
+        runner_1head_e5m2._compute_cell_size()
+        assert any(
+            "FP8 KV cache gives no memory savings with 1 KV head(s) per device" in r.message
+            for r in caplog.records
+        )
+
+    # 2. Warning does NOT fire for 2 heads/shard FP8
+    with caplog.at_level(logging.WARNING):
+        caplog.clear()
+        runner_2head_fp8 = _DummyRunner(kv_cache_dtype_str="fp8_e4m3", actual_num_kv_heads=2)
+        runner_2head_fp8._compute_cell_size()
+        assert not any("FP8 KV cache gives no memory savings" in r.message for r in caplog.records)
+
+    # 3. Warning does NOT fire for 1 head/shard BF16
+    with caplog.at_level(logging.WARNING):
+        caplog.clear()
+        runner_1head_bf16 = _DummyRunner(kv_cache_dtype_str="bf16", actual_num_kv_heads=1)
+        runner_1head_bf16._compute_cell_size()
+        assert not any("FP8 KV cache gives no memory savings" in r.message for r in caplog.records)
+
+    # 4. MLA is unaffected (packs along page axis) and emits no warning
+    with caplog.at_level(logging.WARNING):
+        caplog.clear()
+        runner_mla = _DummyRunner(kv_cache_dtype_str="fp8_e4m3", actual_num_kv_heads=1)
+        runner_mla.use_mla_backend = True
+        runner_mla._compute_cell_size()
+        assert not any("FP8 KV cache gives no memory savings" in r.message for r in caplog.records)
 
 
 def test_merge_kv_padding():

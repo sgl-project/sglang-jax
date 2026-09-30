@@ -93,7 +93,7 @@ For reusable Docker, GKE, and SkyPilot launchers, see [Deployment](../deployment
 | `--dtype-config` | JSON string or JSON file path for submodule-specific dtype overrides. |
 | `--quantization` | Weight quantization method. Supported choices include `awq`, `fp8`, `gptq`, `bitsandbytes`, and related variants. |
 | `--quantization-config-path` | YAML quantization config path or built-in config name. |
-| `--kv-cache-dtype` | KV cache dtype: `auto`, `bf16`, `bfloat16`, `fp8`, `fp8_e4m3`, or `fp8_e5m2`. `fp8` defaults to `fp8_e4m3`. Validated on TPU v6e/v7x with DeepSeek/Kimi MLA architectures. `fp8_e5m2` has lower precision than `fp8_e4m3`. Models with large activation outliers (e.g., Qwen2.5 without QK-norm) may require calibrated scales to avoid quality degradation. |
+| `--kv-cache-dtype` | KV cache dtype: `auto`, `bf16`, `bfloat16`, `fp8`, `fp8_e4m3`, or `fp8_e5m2`. `fp8` defaults to `fp8_e4m3`. Validated on TPU v7x with DeepSeek/Kimi MLA architectures. `fp8_e5m2` has lower precision than `fp8_e4m3`. Models with large activation outliers (e.g., Qwen2.5 without QK-norm) may require calibrated scales to avoid quality degradation. **Limitation**: For MHA/GQA pools with 1 KV head per attention-TP shard (e.g. Qwen3-8B / Llama-3.1-8B at TP=8), 32-bit packing pads K/V from 2 to 4 slots, yielding identical cell size to BF16 (zero memory savings; emits a warning). MLA is unaffected as it packs along the page axis. *Follow-up idea*: pack MHA/GQA along the token/page axis to eliminate this padding. |
 
 `--dtype-config` is an advanced escape hatch. It only affects model code paths that explicitly consume `DtypeConfig`; model-level `--dtype` remains the normal user-facing control.
 

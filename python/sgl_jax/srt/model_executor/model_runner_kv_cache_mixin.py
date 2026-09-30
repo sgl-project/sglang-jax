@@ -368,11 +368,21 @@ class ModelRunnerKVCacheMixin:
             )
 
         packing = get_dtype_packing(self.kv_cache_dtype)
+        kv_heads_per_shard = self.model_config.get_num_kv_heads(self.attention_tp_size)
+        if is_fp8_dtype(self.kv_cache_dtype) and kv_heads_per_shard * 2 < packing:
+            logger.warning(
+                "FP8 KV cache gives no memory savings with %d KV head(s) per device: "
+                "K/V are padded to the 32-bit packing width (%d). "
+                "Consider a smaller attention TP size or --kv-cache-dtype bf16.",
+                kv_heads_per_shard,
+                packing,
+            )
+
         swa_num_kv_heads = getattr(self.model_config.hf_config, "swa_num_key_value_heads", None)
         if swa_num_kv_heads is not None:
             from sgl_jax.srt.utils.jax_utils import get_num_kv_heads_by_tp
 
-            full_heads_per_device = self.model_config.get_num_kv_heads(self.attention_tp_size)
+            full_heads_per_device = kv_heads_per_shard
             swa_heads_per_device = get_num_kv_heads_by_tp(swa_num_kv_heads, self.attention_tp_size)
             swa_layers, full_layers = self.model_config.get_hybrid_layer_counts()
 
@@ -392,9 +402,7 @@ class ModelRunnerKVCacheMixin:
             )
             return int(full_cost + swa_cost)
 
-        padded_heads_x2 = align_to(
-            self.model_config.get_num_kv_heads(self.attention_tp_size) * 2, packing
-        )
+        padded_heads_x2 = align_to(kv_heads_per_shard * 2, packing)
         main_kv = padded_heads_x2 * align128(self.model_config.head_dim) * num_layers * dtype_size
         # Backends may keep extra per-token cache (e.g. MSA index_k, not tensor-sharded).
         extra = getattr(self.attn_backend, "extra_kv_bytes_per_token", None)
