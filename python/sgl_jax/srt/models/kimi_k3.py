@@ -54,6 +54,20 @@ logger = logging.getLogger(__name__)
 _TOKAMAX_FP4_MIN_TPU_GENERATION = 7
 
 
+def checkpoint_has_mxfp4_experts(config) -> bool:
+    """Whether the checkpoint ships its routed experts as MXFP4 (packed e2m1 + e8m0 scales).
+
+    The released K3 declares ``quantization_config.format = "mxfp4-pack-quantized"``; a bf16
+    checkpoint loaded through this class (e.g. Kimi-Linear) declares none. A thin local
+    checkpoint whose experts stream from ``KIMI_K3_WEIGHTS_URI`` is MXFP4 by construction.
+    """
+    quant = getattr(config, "quantization_config", None)
+    if quant is not None and not isinstance(quant, dict):
+        quant = getattr(quant, "to_dict", lambda: vars(quant))()
+    fmt = str((quant or {}).get("format", ""))
+    return fmt.startswith("mxfp4") or bool(os.environ.get("KIMI_K3_WEIGHTS_URI"))
+
+
 def _tokamax_fp4_gmm():
     """Return tokamax's ``gmm_v2`` when installed, else ``None``."""
     try:
@@ -361,7 +375,13 @@ class KimiK3EPMoE(EPMoE):
             k_blocks_wi = self.hidden_size // MXFP4_GROUP_SIZE
             k_blocks_wo = self.intermediate_dim // MXFP4_GROUP_SIZE
             wi_spec = _P("expert", None, None, "tensor")
-            wo_spec = _P("expert", None, None, None)
+            # wo shards K over "tensor"; its block scales are split the same way (a single
+            # block, i.e. tp larger than the block count, is rejected in EPMoE).
+            wo_spec = (
+                _P("expert", "tensor", None, None)
+                if self.tp_size > 1
+                else _P("expert", None, None, None)
+            )
             # Under EPMoE's OWN abstract mesh: the "expert" axis exists only there. The model mesh
             # is ("data", "tensor"), so creating these outside the context raises
             #   ValueError: Resource axis: expert ... is not found in mesh: ('data', 'tensor')
@@ -555,9 +575,11 @@ class KimiK3DecoderLayer(nnx.Module):
                     else None
                 ),
                 situ_linear_beta=getattr(config, "activation_situ_linear_beta", None),
-                # fp4 is the default; KIMI_K3_MOE_FP4=0 falls back to bf16 experts, which is how
-                # the two paths are A/B'd and an escape hatch if the fp4 kernel misbehaves.
-                fp4=os.environ.get("KIMI_K3_MOE_FP4", "1") != "0",
+                # fp4 when the checkpoint ships MXFP4 experts; KIMI_K3_MOE_FP4=0 dequantizes them
+                # to bf16 at load instead (the A/B switch and escape hatch). A bf16 checkpoint
+                # never gets fp4 params.
+                fp4=checkpoint_has_mxfp4_experts(config)
+                and os.environ.get("KIMI_K3_MOE_FP4", "1") != "0",
                 hidden_size=expert_hidden_size,
                 num_experts=config.num_experts,
                 num_experts_per_tok=config.num_experts_per_token,
@@ -1212,16 +1234,16 @@ class KimiK3ForCausalLM(nnx.Module):
         }
         # K3's routed experts ship as MXFP4 (``weight_packed`` + ``weight_scale``), not the bf16
         # ``w1/w2/w3`` the inherited expert groups read; _fixup_moe_mxfp4 loads them. The shared
-        # loader plans every declared input and fails on an absent one, so drop those groups.
+        # loader plans every declared input and fails on an absent one, so drop those groups --
+        # but only then: a bf16 checkpoint (e.g. Kimi-Linear through this class) loads its
+        # experts through exactly these groups.
+        drop_expert_groups = checkpoint_has_mxfp4_experts(self.config)
         for key in [
             k
             for k, v in mappings.items()
-            if any(".block_sparse_moe.experts." in x for x in v.sources)
+            if drop_expert_groups and any(".block_sparse_moe.experts." in x for x in v.sources)
         ]:
             del mappings[key]
-
-        if not cfg_uses_attn_res(self.config):
-            return mappings
 
         def _pair(ckpt_stem: str, target_stem: str):
             # norm: [hidden] RMSNorm scale, replicated. proj: [hidden, 1] scorer, replicated --
@@ -1233,10 +1255,15 @@ class KimiK3ForCausalLM(nnx.Module):
                 target_path=f"{target_stem}.proj.weight", sharding=(None, None), transpose=True
             )
 
-        for i in range(self.config.num_hidden_layers):
-            _pair(f"model.layers.{i}.self_attention_res", f"model.layers.{i}.self_attention_res")
-            _pair(f"model.layers.{i}.mlp_res", f"model.layers.{i}.mlp_res")
-        _pair("model.output_attn_res", "model.output_attn_res")
+        # AttnRes pairs exist only when AttnRes is on; the K3 mappings below are independent of it.
+        if cfg_uses_attn_res(self.config):
+            for i in range(self.config.num_hidden_layers):
+                _pair(
+                    f"model.layers.{i}.self_attention_res",
+                    f"model.layers.{i}.self_attention_res",
+                )
+                _pair(f"model.layers.{i}.mlp_res", f"model.layers.{i}.mlp_res")
+            _pair("model.output_attn_res", "model.output_attn_res")
 
         # --- KDA full-rank output gate ------------------------------------------------------
         # K3 has g_proj [12288, 7168]; Kimi-Linear has g_a_proj/g_b_proj. Drop the low-rank keys
