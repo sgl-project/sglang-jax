@@ -36,13 +36,27 @@ def _per_device(forward):
     """Runs forward on each device's heads, like GDNAttnBackend, passing it
     the forward metadata after self."""
 
+    heads = P("data", "tensor", None)
+    state = P("data", "tensor", None, None)
+    in_specs = (
+        P("data"),  # forward metadata
+        P("data", "tensor"),  # mixed_qkv
+        heads,  # conv_state
+        state,  # recurrent_state
+        P("data", "tensor"),  # b
+        P("data", "tensor"),  # a
+        P("tensor", None),  # conv1d weight
+        P("tensor"),  # A_log
+        P("tensor"),  # dt_bias
+    )
+
     @functools.wraps(forward)
     def run(self, *args, **kwargs):
-        heads = P("data", "tensor", None)
         return jax.shard_map(
             lambda *args: forward(self, *args, **kwargs),
             mesh=self.mesh,
-            out_specs=(heads, heads, P("data", "tensor", None, None)),
+            in_specs=in_specs,
+            out_specs=(heads, heads, state),
         )(self.forward_metadata, *args)
 
     return run

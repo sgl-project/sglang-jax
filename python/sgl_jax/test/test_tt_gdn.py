@@ -16,6 +16,7 @@ from sgl_jax.srt.hardware_backend.tt.attention.gdn_backend import (
 from sgl_jax.srt.hardware_backend.tt.attention.tt_backend import TTAttention
 from sgl_jax.srt.kernels.gdn.gated_delta import (
     _gated_delta_step,
+    _l2norm,
     _scatter_idx0_safe,
     jax_causal_conv1d_update,
 )
@@ -66,7 +67,15 @@ def test_weight_precision_policy(monkeypatch):
     assert "experimental_weight_dtype" not in backend.compiler_options
 
 
+def _repeat_heads(q, k, v):
+    # Like the TT kernels, each q/k head serves its group of value heads.
+    group = v.shape[-2] // q.shape[-2]
+    return jnp.repeat(q, group, axis=-2), jnp.repeat(k, group, axis=-2)
+
+
 def reference_chunk(q, k, v, gate, beta, state):
+    q, k = _repeat_heads(q, k, v)
+
     def step(state, inputs):
         return _gated_delta_step(state, *inputs)
 
@@ -74,7 +83,33 @@ def reference_chunk(q, k, v, gate, beta, state):
     return state, out.swapaxes(0, 1)
 
 
-def reference_decode(state, q, k, v, b, a, A_log, dt_bias, indices, initial):
+def reference_decode(
+    state,
+    q,
+    k,
+    v,
+    b,
+    a,
+    A_log,
+    dt_bias,
+    indices,
+    initial,
+    key_head_offset=0,
+    value_head_offset=0,
+    num_key_heads=0,
+    normalize_eps=None,
+    query_scale=1.0,
+):
+    # Like the TT kernel, q, k and v may be heads of one flat tensor, and the
+    # kernel may normalize q and k and scale q.
+    if q.ndim == 2:
+        heads = q.reshape(q.shape[0], -1, state.shape[-2])
+        q = heads[:, :num_key_heads]
+        k = heads[:, key_head_offset : key_head_offset + num_key_heads]
+        v = heads[:, value_head_offset:]
+    if normalize_eps is not None:
+        q, k = _l2norm(q, normalize_eps), _l2norm(k, normalize_eps)
+    q, k = _repeat_heads(q * query_scale, k, v)
     active = jnp.where(initial[:, None, None, None], state[indices], 0)
     gate = -jnp.exp(A_log.astype(jnp.float32)) * jax.nn.softplus(
         a.astype(jnp.float32) + dt_bias.astype(jnp.float32)
@@ -258,7 +293,7 @@ def test_device_state_handoff(tt_device, trace, heads, batch):
         return jax.jit(
             forward,
             donate_argnums=(2, 3),
-            compiler_options={"optimization_level": "1", "enable_trace": str(trace).lower()},
+            compiler_options={"optimization_level": "O1", "enable_trace": str(trace).lower()},
         )
 
     compiled = {decode: compile_forward(decode) for decode in (False, True)}
