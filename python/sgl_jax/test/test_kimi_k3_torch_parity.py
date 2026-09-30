@@ -91,7 +91,7 @@ def _read_real_weights(*suffixes: str) -> dict:
     out: dict = {}
     for path in files:
         with safe_open(path, "numpy") as handle:
-            for key in handle.keys():
+            for key in handle.keys():  # noqa: SIM118 - safe_open handles are not iterable
                 for suffix in suffixes:
                     if key.endswith(suffix) and suffix not in out:
                         out[suffix] = handle.get_tensor(key)
@@ -177,9 +177,7 @@ def test_attn_res_matches_official_on_real_weights(num_blocks):
         variance_epsilon = eps
 
     expected = (
-        ns["_apply_attn_res"](
-            torch.from_numpy(prefix), torch.from_numpy(blocks), _Proj(), _Norm()
-        )
+        ns["_apply_attn_res"](torch.from_numpy(prefix), torch.from_numpy(blocks), _Proj(), _Norm())
         .float()
         .numpy()
     )
@@ -278,7 +276,9 @@ def test_latent_moe_output_transform_matches_official_on_real_weights():
     normed = y32 * jax.lax.rsqrt(jnp.mean(jnp.square(y32), axis=-1, keepdims=True) + eps)
     got_out = np.asarray(_f32_matmul(normed * jnp.asarray(norm_w), jnp.asarray(up_w.T)))
 
-    assert _norm_err(got_down, expected_down) < 1e-5, f"down {_norm_err(got_down, expected_down):.3e}"
+    assert (
+        _norm_err(got_down, expected_down) < 1e-5
+    ), f"down {_norm_err(got_down, expected_down):.3e}"
     assert _norm_err(got_out, expected_out) < 1e-5, f"out {_norm_err(got_out, expected_out):.3e}"
 
 
@@ -304,6 +304,7 @@ def test_mxfp4_dequant_matches_torch_reference_on_real_expert():
     E2M1 = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=np.float32)
     low = packed & 0x0F
     high = packed >> 4
+
     def _decode(nib: np.ndarray) -> np.ndarray:
         sign = np.where(nib >= 8, -1.0, 1.0).astype(np.float32)
         return sign * E2M1[(nib & 0x07).astype(np.int64)]
@@ -317,7 +318,7 @@ def test_mxfp4_dequant_matches_torch_reference_on_real_expert():
     exp = scale.astype(np.int32) - 127
     scales = np.where(scale == 0, 0.0, np.ldexp(np.ones_like(exp, dtype=np.float32), exp))
     groups = vals.shape[-1] // scales.shape[-1]
-    expected = (vals.reshape(vals.shape[:-1] + (scales.shape[-1], groups)) * scales[..., None])
+    expected = vals.reshape(vals.shape[:-1] + (scales.shape[-1], groups)) * scales[..., None]
     expected = expected.reshape(vals.shape)
 
     got = np.asarray(

@@ -10,7 +10,9 @@ Getting this wrong does not raise: the kernel indexes A_log per head
 (A_log.reshape(H,1,1,1,1); -exp(A)[:,None,None]*softplus(g)), so a wrong slice silently mis-gates
 every head.
 """
-import numpy as np, pytest
+
+import numpy as np
+import pytest
 
 NUM_HEADS, HEAD_DIM = 96, 128
 
@@ -32,7 +34,8 @@ def test_narrow_takes_the_first_num_heads_entries():
 
 def test_padding_beyond_num_heads_is_discarded():
     """Entries 96..127 are padding and must not reach the gate."""
-    raw = np.zeros(HEAD_DIM, np.float32); raw[NUM_HEADS:] = 999.0
+    raw = np.zeros(HEAD_DIM, np.float32)
+    raw[NUM_HEADS:] = 999.0
     assert not (_narrow(raw, NUM_HEADS) == 999.0).any()
 
 
@@ -48,8 +51,7 @@ def test_tp_shards_partition_the_first_num_heads(tp):
 def test_old_four_dim_layout_is_accepted():
     """The reference accepts either [1,1,H,1] or [H]."""
     raw4 = np.arange(HEAD_DIM, dtype=np.float32).reshape(1, 1, HEAD_DIM, 1)
-    np.testing.assert_array_equal(_narrow(raw4, NUM_HEADS),
-                                  np.arange(NUM_HEADS, dtype=np.float32))
+    np.testing.assert_array_equal(_narrow(raw4, NUM_HEADS), np.arange(NUM_HEADS, dtype=np.float32))
 
 
 def test_geometry_is_consistent_with_the_rest_of_the_checkpoint():

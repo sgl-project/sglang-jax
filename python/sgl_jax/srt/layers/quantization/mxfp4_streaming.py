@@ -24,6 +24,7 @@ it for both the fetch plan and the device placement.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import struct
@@ -194,7 +195,7 @@ class FetchPlan(NamedTuple):
 def plan_fetch(
     reader: ShardReader,
     local_ids: set[int] | None = None,
-    want: "callable | None" = None,
+    want: callable | None = None,
 ) -> FetchPlan:
     """Decide which of a shard's tensors this rank reads.
 
@@ -216,7 +217,7 @@ def plan_fetch(
 def stream_shard(
     reader: ShardReader,
     local_ids: set[int] | None = None,
-    want: "callable | None" = None,
+    want: callable | None = None,
 ) -> Iterator[tuple[str, np.ndarray]]:
     """Yield ``(name, array)`` for the tensors this rank keeps, one at a time.
 
@@ -233,7 +234,7 @@ def parse_gs_uri(uri: str) -> tuple[str, str]:
     """``gs://bucket/prefix`` -> ``(bucket, prefix)``; prefix has no leading or trailing slash."""
     if not uri.startswith("gs://"):
         raise ValueError(f"not a gs:// URI: {uri!r}")
-    bucket, _, prefix = uri[len("gs://"):].partition("/")
+    bucket, _, prefix = uri[len("gs://") :].partition("/")
     return bucket, prefix.strip("/")
 
 
@@ -256,20 +257,20 @@ def list_shards(bucket: str, prefix: str, client=None) -> list[str]:
 class LocalSource:
     """safetensors files already on disk."""
 
-    def __init__(self, files: list[str], keep: "callable | None" = None):
+    def __init__(self, files: list[str], keep: callable | None = None):
         from safetensors import safe_open
 
         self._handles = {f: safe_open(f, framework="np") for f in files}
         self._where: dict[str, str] = {}
         for path, handle in self._handles.items():
-            for key in handle.keys():
+            for key in handle.keys():  # noqa: SIM118 - safe_open handles are not iterable
                 if keep is None or keep(key):
                     self._where[key] = path
 
     def has(self, key: str) -> bool:
         return key in self._where
 
-    def prefetch(self, keys: "list[str]") -> None:
+    def prefetch(self, keys: list[str]) -> None:
         """No-op: local reads are mmap'd, so there is no round trip to hide."""
         return None
 
@@ -278,10 +279,8 @@ class LocalSource:
 
     def close(self) -> None:
         for handle in self._handles.values():
-            try:
+            with contextlib.suppress(Exception):  # closing is best-effort
                 handle.__exit__(None, None, None)
-            except Exception:  # noqa: BLE001 - closing is best-effort
-                pass
 
 
 def _size_http_pool(client, workers: int) -> None:
@@ -322,7 +321,7 @@ class GcsSource:
       the access pattern sequential.
     """
 
-    def __init__(self, uri: str, keep: "callable | None" = None, client=None, workers: int = 0):
+    def __init__(self, uri: str, keep: callable | None = None, client=None, workers: int = 0):
         import os
         from concurrent.futures import ThreadPoolExecutor
 
@@ -364,7 +363,7 @@ class GcsSource:
     # one sequential read is far cheaper than the round trip a split costs.
     COALESCE_GAP = 8 << 20
 
-    def prefetch(self, keys: "list[str]") -> None:
+    def prefetch(self, keys: list[str]) -> None:
         """Fetch these tensors into the cache, coalescing adjacent ranges into single GETs.
 
         Requests dominate: K3 asks 1,792 tensors per (layer, projection) group, and one GET each
@@ -433,7 +432,7 @@ class GcsSource:
         self._cache.clear()
 
 
-def open_source(path: str, keep: "callable | None" = None):
+def open_source(path: str, keep: callable | None = None):
     """A LocalSource or GcsSource depending on what ``path`` is."""
     if str(path).startswith("gs://"):
         return GcsSource(path, keep=keep)
@@ -465,9 +464,11 @@ def build_sharded_expert_param(global_shape, sharding, fetch_expert):
     shards = []
     for device, index in index_map.items():
         expert_slice = index[0] if isinstance(index, tuple) else index
-        expert_ids = range(*expert_slice.indices(global_shape[0])) if isinstance(
-            expert_slice, slice
-        ) else [int(expert_slice)]
+        expert_ids = (
+            range(*expert_slice.indices(global_shape[0]))
+            if isinstance(expert_slice, slice)
+            else [int(expert_slice)]
+        )
         local = _np.stack([_np.asarray(fetch_expert(e)) for e in expert_ids], axis=0)
         # honour any non-expert slicing this device also carries (e.g. a tensor-parallel split)
         rest = index[1:] if isinstance(index, tuple) else ()

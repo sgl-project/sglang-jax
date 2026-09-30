@@ -5,9 +5,15 @@ model_type "kimi_linear" / architectures ["KimiLinearForCausalLM"], so any routi
 the text config loads a model with NO AttnRes and NO SITU. It would load K3's weights, run, and
 produce fluent output with two architectural components missing.
 """
-import json, pathlib, pytest
-from sgl_jax.srt.models.registry import ModelRegistry
+
+import json
+import pathlib
+
+import pytest
+
 from sgl_jax.srt.models.kimi_k3 import KimiK3ForCausalLM, KimiK3ForConditionalGeneration
+from sgl_jax.srt.models.registry import ModelRegistry
+
 
 def _resolve_config() -> pathlib.Path:
     """The released config, from wherever the checkpoint is staged."""
@@ -50,4 +56,5 @@ def test_text_config_would_misroute_if_used():
 
 def test_k3_class_is_not_kimi_linear():
     from sgl_jax.srt.models.kimi_linear import KimiLinearForCausalLM
+
     assert not issubclass(KimiK3ForConditionalGeneration, KimiLinearForCausalLM)

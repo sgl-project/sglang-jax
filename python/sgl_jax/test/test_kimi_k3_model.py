@@ -1,9 +1,15 @@
 """KimiK3DecoderLayer / KimiK3MLP construction and SITU numerics on a real mesh."""
+
 import contextlib
-import jax, jax.numpy as jnp, numpy as np, pytest
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
 from jax.sharding import Mesh
+
 from sgl_jax.srt.configs.kimi_k3 import KimiK3Config
-from sgl_jax.srt.models.kimi_k3 import KimiK3MLP, KimiK3DecoderLayer
+from sgl_jax.srt.models.kimi_k3 import KimiK3MLP
 
 
 def _mesh():
@@ -32,32 +38,52 @@ def _in_mesh():
 def _tiny_cfg(n_layers=4, attn_res=2):
     """A 4-layer K3 with the released model's real hyper-parameters where they matter."""
     return KimiK3Config(
-        num_hidden_layers=n_layers, hidden_size=128, intermediate_size=256,
-        moe_intermediate_size=64, num_attention_heads=4,
-        num_experts=8, num_experts_per_token=2, num_shared_experts=1,
-        first_k_dense_replace=1, moe_layer_freq=1,
-        kv_lora_rank=32, qk_nope_head_dim=16, qk_rope_head_dim=8, v_head_dim=16,
-        mla_use_nope=True, rms_norm_eps=1e-6,
+        num_hidden_layers=n_layers,
+        hidden_size=128,
+        intermediate_size=256,
+        moe_intermediate_size=64,
+        num_attention_heads=4,
+        num_experts=8,
+        num_experts_per_token=2,
+        num_shared_experts=1,
+        first_k_dense_replace=1,
+        moe_layer_freq=1,
+        kv_lora_rank=32,
+        qk_nope_head_dim=16,
+        qk_rope_head_dim=8,
+        v_head_dim=16,
+        mla_use_nope=True,
+        rms_norm_eps=1e-6,
         # Mirrors the released config's shape: BOTH lists are required (kimi_linear.py asserts
         # full_attn_layers is present), 1-based, and partition the layer range.
         linear_attn_config={
-            "kda_layers": [1, 2, 3], "full_attn_layers": [4],
-            "gate_lower_bound": -5.0, "head_dim": 32, "num_heads": 4,
-            "short_conv_kernel_size": 4, "use_full_rank_gate": True,
+            "kda_layers": [1, 2, 3],
+            "full_attn_layers": [4],
+            "gate_lower_bound": -5.0,
+            "head_dim": 32,
+            "num_heads": 4,
+            "short_conv_kernel_size": 4,
+            "use_full_rank_gate": True,
         },
-        hidden_act="situ", activation_situ_beta=4.0, activation_situ_linear_beta=25.0,
-        attn_res_block_size=attn_res, mla_use_output_gate=True, latent_moe_use_norm=True,
+        hidden_act="situ",
+        activation_situ_beta=4.0,
+        activation_situ_linear_beta=25.0,
+        attn_res_block_size=attn_res,
+        mla_use_output_gate=True,
+        latent_moe_use_norm=True,
     )
 
 
 def test_situ_mlp_matches_the_reference_activation():
     """KimiK3MLP must apply SITU, not SiLU -- K3 ships hidden_act='situ'."""
     from sgl_jax.srt.models.kimi_k3_layers import situ_and_mul
+
     with _in_mesh() as mesh:
         m = KimiK3MLP(64, 128, mesh, situ_beta=4.0, situ_linear_beta=25.0, dtype=jnp.float32)
         x = jnp.asarray(np.random.default_rng(0).normal(size=(3, 64)).astype(np.float32))
         got = np.asarray(m(x), dtype=np.float64)
-        g, _ = m.gate_proj(x); u, _ = m.up_proj(x)
+        g, _ = m.gate_proj(x)
+        u, _ = m.up_proj(x)
         act = situ_and_mul(jnp.concatenate([g, u], axis=-1), 4.0, 25.0)
         want, _ = m.down_proj(act)
     np.testing.assert_allclose(got, np.asarray(want, dtype=np.float64), rtol=1e-5, atol=1e-5)
@@ -68,7 +94,8 @@ def test_situ_differs_from_silu():
     with _in_mesh() as mesh:
         situ = KimiK3MLP(64, 128, mesh, situ_beta=4.0, situ_linear_beta=25.0, dtype=jnp.float32)
         x = jnp.asarray(np.random.default_rng(1).normal(size=(3, 64)).astype(np.float32) * 3)
-        g, _ = situ.gate_proj(x); u, _ = situ.up_proj(x)
+        g, _ = situ.gate_proj(x)
+        u, _ = situ.up_proj(x)
         silu_out, _ = situ.down_proj(jax.nn.silu(g) * u)
         got = np.asarray(situ(x))
     assert not np.allclose(got, np.asarray(silu_out), rtol=1e-3, atol=1e-3)
@@ -93,5 +120,7 @@ def test_dense_layer_zero_is_not_moe():
     """first_k_dense_replace=1 means layer 0 is dense, the rest MoE."""
     cfg = _tiny_cfg()
     for i in range(cfg.num_hidden_layers):
-        is_moe = bool(cfg.num_experts) and i >= cfg.first_k_dense_replace and i % cfg.moe_layer_freq == 0
+        is_moe = (
+            bool(cfg.num_experts) and i >= cfg.first_k_dense_replace and i % cfg.moe_layer_freq == 0
+        )
         assert is_moe == (i >= 1), i

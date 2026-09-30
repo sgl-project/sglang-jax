@@ -98,9 +98,7 @@ def attention_residual_apply(
     Kept separate so the numerics can be tested without constructing an nnx module or a device
     mesh, and so a parity oracle can drive exactly the same code path the module uses.
     """
-    values = jnp.concatenate(
-        (block_residuals, jnp.expand_dims(prefix_sum, axis=-2)), axis=-2
-    )
+    values = jnp.concatenate((block_residuals, jnp.expand_dims(prefix_sum, axis=-2)), axis=-2)
     v32 = values.astype(jnp.float32)
     var = jnp.mean(jnp.square(v32), axis=-1, keepdims=True)
     normed = v32 * jax.lax.rsqrt(var + eps) * norm_scale.astype(jnp.float32)
@@ -181,6 +179,6 @@ class AttentionResidual(nnx.Module):
             prefix_sum,
             block_residuals,
             self.norm.scale.value,
-            self.proj.weight.value,   # LinearBase names its param `weight`, not `kernel`
+            self.proj.weight.value,  # LinearBase names its param `weight`, not `kernel`
             self.eps,
         )

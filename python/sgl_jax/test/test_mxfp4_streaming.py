@@ -60,7 +60,8 @@ def _local_shard(*, with_experts: bool = False) -> str:
 
     for path in files:
         with safe_open(path, "numpy") as h:
-            if any(parse_expert_id(k) is not None for k in h.keys()):
+            keys = list(h.keys())  # safe_open handles are not iterable
+            if any(parse_expert_id(k) is not None for k in keys):
                 return path
     pytest.skip("no staged shard carries expert tensors")
 

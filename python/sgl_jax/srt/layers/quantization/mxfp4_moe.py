@@ -26,12 +26,11 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 
 from sgl_jax.srt.layers.quantization.mxfp4 import (
-    e8m0_to_fp32,
     MXFP4_GROUP_SIZE,
     dequantize_tensor_from_mxfp4_packed,
+    e8m0_to_fp32,
 )
 
 # checkpoint projection name -> EPMoE parameter name
@@ -111,11 +110,9 @@ def build_epmoe_weights(
 # The functions below keep the released weights in their packed e2m1 form with e8m0 block scales,
 # so the MoE can widen per block at matmul time rather than materializing bf16 experts at load.
 #
-# TODO(vlasenkoalexey): consume these packed operands from a sub-byte fp4 GMM kernel instead of
-# widening them in the MoE forward. The layouts here are already what such a kernel wants --
-# K-major e2m1 weights and (group, num_k_blocks, 1, n) fp32 scales -- so the substitution is at
-# the matmul call site
-# (see the TODO in KimiK3 MoE `_call_gmm`), not in this load path.
+# These layouts are the operand contract of tokamax's gmm_v2 -- K-major e2m1 weights and
+# (group, num_k_blocks, 1, n) fp32 scales -- which the K3 MoE calls directly when tokamax is
+# installed on a TPU with fp4 matmul (see ``KimiK3EPMoE._call_gmm``).
 
 
 def unpack_fp4_to_e2m1(packed: jax.Array) -> jax.Array:

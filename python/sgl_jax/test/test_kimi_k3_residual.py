@@ -1,8 +1,15 @@
 """Tests for K3's AttnRes depth protocol, against a numpy transcription of KimiDecoderLayer.forward."""
-import jax.numpy as jnp, numpy as np, pytest
-from sgl_jax.srt.models.kimi_k3_residual import (
-    initial_block_residuals, residual_state_transition, n_candidates_at_depth)
+
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
 from sgl_jax.srt.models.kimi_k3_layers import attention_residual_apply
+from sgl_jax.srt.models.kimi_k3_residual import (
+    initial_block_residuals,
+    n_candidates_at_depth,
+    residual_state_transition,
+)
 
 
 def _run_depth_numpy(n_layers, block_size, hidden, attn_out, nscale, pk, eps):
@@ -13,7 +20,7 @@ def _run_depth_numpy(n_layers, block_size, hidden, attn_out, nscale, pk, eps):
     seen = []
     for i in range(n_layers):
         if br.shape[-2] > 0:
-            seen.append(br.shape[-2])          # candidates AttnRes#1 sees
+            seen.append(br.shape[-2])  # candidates AttnRes#1 sees
         else:
             seen.append(0)
         if i % block_size == 0:
@@ -29,10 +36,10 @@ def test_checkpoint_resets_prefix_sum():
     hidden, toks = 8, 3
     br = initial_block_residuals(toks, hidden, jnp.float32)
     ps = jnp.ones((toks, hidden), jnp.float32)
-    br2, ps2 = residual_state_transition(0, 4, ps, br)      # 0 % 4 == 0 -> checkpoint
+    br2, ps2 = residual_state_transition(0, 4, ps, br)  # 0 % 4 == 0 -> checkpoint
     assert ps2 is None, "prefix_sum must be reset at a checkpoint boundary"
     assert br2.shape[-2] == 1, br2.shape
-    br3, ps3 = residual_state_transition(1, 4, ps, br2)     # not a boundary
+    br3, ps3 = residual_state_transition(1, 4, ps, br2)  # not a boundary
     assert ps3 is not None and br3.shape[-2] == 1
 
 
@@ -63,7 +70,8 @@ def test_state_transition_matches_reference_over_full_depth():
     for i in range(n_layers):
         br_j, ps_j = residual_state_transition(i, block_size, ps_j, br_j)
         if i % block_size == 0:
-            br_n = np.concatenate((br_n, ps_n[:, None, :]), axis=-2); ps_n = None
+            br_n = np.concatenate((br_n, ps_n[:, None, :]), axis=-2)
+            ps_n = None
         a = attn[i]
         ps_j = jnp.asarray(a) if ps_j is None else ps_j + jnp.asarray(a)
         ps_n = a if ps_n is None else ps_n + a

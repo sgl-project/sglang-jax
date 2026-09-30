@@ -1,9 +1,17 @@
 """MXFP4 -> EPMoE weight assembly."""
-import jax.numpy as jnp, numpy as np, pytest
-from sgl_jax.srt.layers.quantization.mxfp4_moe import (
-    dequant_expert_weight, stack_experts, build_epmoe_weights, EXPERT_PROJ_TO_EPMOE)
 
-E2M1 = [0.0,0.5,1.0,1.5,2.0,3.0,4.0,6.0,-0.0,-0.5,-1.0,-1.5,-2.0,-3.0,-4.0,-6.0]
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
+from sgl_jax.srt.layers.quantization.mxfp4_moe import (
+    EXPERT_PROJ_TO_EPMOE,
+    build_epmoe_weights,
+    dequant_expert_weight,
+    stack_experts,
+)
+
+E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
 
 
 def _mk(out_dim, in_dim, seed=0, exp=127):
@@ -30,7 +38,7 @@ def test_dequant_happens_before_transpose():
     out_dim, in_dim = 4, 64
     idx = rng.integers(1, 8, size=(out_dim, in_dim)).astype(np.uint8)
     packed = (idx[:, 0::2] | (idx[:, 1::2] << 4)).astype(np.uint8)
-    exps = np.array([[127, 130]] * out_dim, np.uint8)          # differs per group
+    exps = np.array([[127, 130]] * out_dim, np.uint8)  # differs per group
     got = np.asarray(dequant_expert_weight(jnp.asarray(packed), jnp.asarray(exps), jnp.float32))
     vals = np.array(E2M1, np.float32)[idx]
     want = np.concatenate([vals[:, :32] * 1.0, vals[:, 32:] * 8.0], axis=1).T
@@ -39,7 +47,7 @@ def test_dequant_happens_before_transpose():
 
 def test_scale_group_count_is_validated():
     packed, _, _ = _mk(4, 64)
-    bad = np.full((4, 3), 127, np.uint8)                        # should be 2 groups
+    bad = np.full((4, 3), 127, np.uint8)  # should be 2 groups
     with pytest.raises(ValueError, match="scale groups"):
         dequant_expert_weight(jnp.asarray(packed), jnp.asarray(bad), jnp.float32)
 
@@ -51,8 +59,11 @@ def test_missing_expert_raises_rather_than_stacking_short():
 
 
 def test_packed_without_scale_raises():
-    t = {"language_model.model.layers.0.block_sparse_moe.experts.0.w1.weight_packed":
-         jnp.asarray(_mk(4, 64)[0])}
+    t = {
+        "language_model.model.layers.0.block_sparse_moe.experts.0.w1.weight_packed": jnp.asarray(
+            _mk(4, 64)[0]
+        )
+    }
     with pytest.raises(KeyError, match="weight_scale missing|missing -- dequant"):
         build_epmoe_weights(t, 0, 1)
 
@@ -69,7 +80,8 @@ def test_builds_stacked_weights_for_all_three_projections():
         for proj, (o, i) in (("w1", (inter, hid)), ("w3", (inter, hid)), ("w2", (hid, inter))):
             p, s, _ = _mk(o, i, seed=e)
             b = f"language_model.model.layers.0.block_sparse_moe.experts.{e}.{proj}"
-            t[f"{b}.weight_packed"] = jnp.asarray(p); t[f"{b}.weight_scale"] = jnp.asarray(s)
+            t[f"{b}.weight_packed"] = jnp.asarray(p)
+            t[f"{b}.weight_scale"] = jnp.asarray(s)
     out = build_epmoe_weights(t, 0, n_exp, out_dtype=jnp.float32)
     assert set(out) == {"wi_0", "wi_1", "wo"}
     assert out["wi_0"].shape == (n_exp, hid, inter)

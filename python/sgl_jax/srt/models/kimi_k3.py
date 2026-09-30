@@ -16,24 +16,25 @@ Architecture (from the released config.json): 93 layers, ``kda_layers`` lists 69
 
 from __future__ import annotations
 
-import os
-
 import logging
+import os
+import re
 
 import jax
-import numpy as np
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as _P
 
 from sgl_jax.srt.configs.kimi_k3 import KimiK3Config
 from sgl_jax.srt.layers.gate import GateLogit, TopK
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.moe import EPMoE
-from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from jax.sharding import NamedSharding
-from jax.sharding import PartitionSpec as _P
 from sgl_jax.srt.layers.quantization.mxfp4 import MXFP4_GROUP_SIZE
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.models.deepseek_v3 import DeepseekV3Attention as KimiMLAAttention
 from sgl_jax.srt.models.kimi_k3_layers import (
     AttentionResidual,
     mla_output_gate,
@@ -41,9 +42,39 @@ from sgl_jax.srt.models.kimi_k3_layers import (
 )
 from sgl_jax.srt.models.kimi_k3_residual import initial_block_residuals
 from sgl_jax.srt.models.kimi_linear import KimiDeltaAttention
-from sgl_jax.srt.models.deepseek_v3 import DeepseekV3Attention as KimiMLAAttention
+from sgl_jax.srt.utils.jax_utils import get_device_kind
 
 logger = logging.getLogger(__name__)
+
+# tokamax's public gmm_v2 (tokamax>=0.0.14) consumes sub-byte RHS operands natively, including
+# float4_e2m1fn with fp32 block scales, which it supports on TPU v7 and later. It is an optional
+# dependency (the ``fp4`` extra): without it, or on an older generation, the K3 MoE falls back to
+# the dequant reference path in ``KimiK3EPMoE._call_gmm``.
+_TOKAMAX_FP4_MIN_TPU_GENERATION = 7
+
+
+def _tokamax_fp4_gmm():
+    """Return tokamax's ``gmm_v2`` when installed, else ``None``."""
+    try:
+        from tokamax._src.ops.experimental.gmm_v2.gmm_v2 import gmm_v2
+    except ImportError:
+        return None
+    return gmm_v2
+
+
+def _tpu_generation() -> int | None:
+    """TPU generation of the compilation target (``"TPU v6 lite"`` -> 6, ``"TPU7x"`` -> 7)."""
+    match = re.match(r"TPU( v)?(\d+)", get_device_kind())
+    return int(match.group(2)) if match else None
+
+
+def _use_tokamax_fp4_gmm() -> bool:
+    generation = _tpu_generation()
+    return (
+        generation is not None
+        and generation >= _TOKAMAX_FP4_MIN_TPU_GENERATION
+        and _tokamax_fp4_gmm() is not None
+    )
 
 
 # ---------------------------------------------------------------------------------------------
@@ -55,6 +86,7 @@ logger = logging.getLogger(__name__)
 # methods (observed: "'KimiK3Config' object has no attribute 'is_kda_layer'"). Reading fields
 # works for both, and for a plain PretrainedConfig.
 # ---------------------------------------------------------------------------------------------
+
 
 def cfg_is_kda_layer(config, layer_idx: int) -> bool:
     """kda_layers is 1-BASED in the checkpoint, hence the +1.
@@ -233,8 +265,14 @@ class KimiK3MLP(nnx.Module):
         self.situ_beta = situ_beta
         self.situ_linear_beta = situ_linear_beta
         mk = lambda i, o, ax, name: LinearBase(  # noqa: E731
-            input_size=i, output_size=o, kernel_axes=ax, use_bias=False,
-            params_dtype=dtype, mesh=mesh, scope_name=name)
+            input_size=i,
+            output_size=o,
+            kernel_axes=ax,
+            use_bias=False,
+            params_dtype=dtype,
+            mesh=mesh,
+            scope_name=name,
+        )
         self.gate_proj = mk(hidden_size, intermediate_size, (None, "tensor"), "gate_proj")
         self.up_proj = mk(hidden_size, intermediate_size, (None, "tensor"), "up_proj")
         self.down_proj = mk(intermediate_size, hidden_size, ("tensor", None), "down_proj")
@@ -296,7 +334,8 @@ class KimiK3EPMoE(EPMoE):
     reference path widens them to bf16 with their block scales and runs the standard grouped
     matmul; correct and portable. Keeping the experts sub-byte end to end through a fused GMM
     kernel (~4x less resident expert memory: 4 bits per value against bf16's 16) is a separate
-    optimization -- see the TODO at :meth:`_call_gmm`.
+    optimization: :meth:`_call_gmm` routes to tokamax's public ``gmm_v2`` when it is installed and
+    the chip supports fp4 matmul, and to this reference path otherwise.
     """
 
     def __init__(self, *args, situ_beta=None, situ_linear_beta=None, fp4: bool = False, **kwargs):
@@ -333,11 +372,20 @@ class KimiK3EPMoE(EPMoE):
                 ):
                     # nnx.data is required: EPMoE.__init__ has already set these to None, which
                     # marks them STATIC on the pytree, and nnx then refuses a Param over them.
-                    setattr(self, name, nnx.data(nnx.Param(
-                        jnp.zeros((self.num_experts, blocks, 1, out_dim),
-                                  dtype=jnp.float32, out_sharding=spec),
-                        out_sharding=spec,
-                    )))
+                    setattr(
+                        self,
+                        name,
+                        nnx.data(
+                            nnx.Param(
+                                jnp.zeros(
+                                    (self.num_experts, blocks, 1, out_dim),
+                                    dtype=jnp.float32,
+                                    out_sharding=spec,
+                                ),
+                                out_sharding=spec,
+                            )
+                        ),
+                    )
 
     def _apply_activation(self, layer_w0, layer_w1):
         if self.situ_beta is None:
@@ -353,20 +401,18 @@ class KimiK3EPMoE(EPMoE):
     def _call_gmm(self, **kwargs):
         if not self.fp4:
             return super()._call_gmm(**kwargs)
-        # TODO(vlasenkoalexey): replace this dequant-to-bf16 path with a sub-byte fp4 GMM
-        # kernel. Widening here materializes bf16 experts for every matmul (~4x their packed
-        # size) and is the memory
-        # wall at full depth; a kernel that consumes e2m1 operands with e8m0 block scales
-        # directly would keep them packed end to end. Until then this path is the correct,
-        # portable reference.
-        #
-        # Reference MXFP4 path: widen the e2m1 expert weights to bf16 with their per-32 e8m0 block
-        # scales, then run the standard grouped matmul. `rhs` is native float4_e2m1fn [E, K, N] and
-        # `rhs_scale` is fp32 [E, num_k_blocks, 1, N] (one scale per MXFP4_GROUP_SIZE along K).
+        # `rhs` is native float4_e2m1fn [E, K, N] and `rhs_scale` is fp32 [E, num_k_blocks, 1, N]
+        # (one e8m0-decoded scale per MXFP4_GROUP_SIZE along K) -- the operand layout tokamax's
+        # gmm_v2 declares, so on the kernel path the experts stay packed end to end.
+        kwargs.pop("activation_quantized_dtype", None)
+        if _use_tokamax_fp4_gmm():
+            return _tokamax_fp4_gmm()(**kwargs)
+        # Reference path (no tokamax, or a TPU generation without fp4 matmul): widen the e2m1
+        # weights to bf16 with their block scales and run the standard grouped matmul. Correct and
+        # portable, but materializes bf16 experts (~4x their packed size) for every matmul.
         rhs = kwargs.pop("rhs")
         scale = kwargs.pop("rhs_scale", None)
         kwargs.pop("rhs_bias", None)
-        kwargs.pop("activation_quantized_dtype", None)
         w = rhs.astype(jnp.bfloat16)
         if scale is not None:
             num_experts, size_k, size_n = w.shape
@@ -394,7 +440,7 @@ class KimiK3DecoderLayer(nnx.Module):
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.is_kda = cfg_is_kda_layer(config, layer_idx)
-        self.attn_res_block_size = getattr(config, 'attn_res_block_size', None)
+        self.attn_res_block_size = getattr(config, "attn_res_block_size", None)
 
         if self.is_kda:
             self.self_attn = KimiK3DeltaAttention(
@@ -419,15 +465,20 @@ class KimiK3DecoderLayer(nnx.Module):
 
         is_moe = (
             getattr(config, "num_experts", None)
-            and layer_idx >= getattr(config, 'first_k_dense_replace', 0)
-            and layer_idx % getattr(config, 'moe_layer_freq', 1) == 0
+            and layer_idx >= getattr(config, "first_k_dense_replace", 0)
+            and layer_idx % getattr(config, "moe_layer_freq", 1) == 0
         )
         self.is_moe_layer = bool(is_moe)
 
         if not self.is_moe_layer:
             self.mlp = KimiK3MLP(
-                config.hidden_size, config.intermediate_size, mesh,
-                getattr(config, 'activation_situ_beta', None), getattr(config, 'activation_situ_linear_beta', None), dtype)
+                config.hidden_size,
+                config.intermediate_size,
+                mesh,
+                getattr(config, "activation_situ_beta", None),
+                getattr(config, "activation_situ_linear_beta", None),
+                dtype,
+            )
             self.moe_gate = None
             self.shared_experts = None
         else:
@@ -437,14 +488,14 @@ class KimiK3DecoderLayer(nnx.Module):
                 num_experts=config.num_experts,
                 enable_expert_bias=True,
                 weight_dtype=dtype,
-                score_func=getattr(config, 'moe_router_activation_func', "sigmoid"),
+                score_func=getattr(config, "moe_router_activation_func", "sigmoid"),
             )
             self.topk = TopK(
                 topk=config.num_experts_per_token,
-                renormalize=getattr(config, 'moe_renormalize', True),
-                num_expert_group=getattr(config, 'num_expert_group', 1),
-                topk_group=getattr(config, 'topk_group', 1),
-                routed_scaling_factor=getattr(config, 'routed_scaling_factor', 1.0),
+                renormalize=getattr(config, "moe_renormalize", True),
+                num_expert_group=getattr(config, "num_expert_group", 1),
+                topk_group=getattr(config, "topk_group", 1),
+                routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
                 layer_id=layer_idx,
                 mesh=mesh,
             )
@@ -460,8 +511,7 @@ class KimiK3DecoderLayer(nnx.Module):
             #
             # Both projections are ReplicatedLinear in the reference (no TP), and their I/O is
             # replicated on both sides here too (residual stream in, EPMoE's P(None) x out).
-            self.routed_expert_hidden_size = getattr(
-                config, "routed_expert_hidden_size", None)
+            self.routed_expert_hidden_size = getattr(config, "routed_expert_hidden_size", None)
             expert_hidden_size = self.routed_expert_hidden_size or config.hidden_size
             if self.routed_expert_hidden_size is not None:
                 self.routed_expert_down_proj = LinearBase(
@@ -483,9 +533,14 @@ class KimiK3DecoderLayer(nnx.Module):
                     scope_name="routed_expert_up_proj",
                 )
                 self.routed_expert_norm = (
-                    RMSNorm(expert_hidden_size, epsilon=config.rms_norm_eps,
-                            param_dtype=dtype, scope_name="routed_expert_norm")
-                    if getattr(config, "latent_moe_use_norm", False) else None
+                    RMSNorm(
+                        expert_hidden_size,
+                        epsilon=config.rms_norm_eps,
+                        param_dtype=dtype,
+                        scope_name="routed_expert_norm",
+                    )
+                    if getattr(config, "latent_moe_use_norm", False)
+                    else None
                 )
             else:
                 self.routed_expert_down_proj = None
@@ -493,8 +548,11 @@ class KimiK3DecoderLayer(nnx.Module):
                 self.routed_expert_norm = None
 
             self.block_sparse_moe = KimiK3EPMoE(
-                situ_beta=(getattr(config, "activation_situ_beta", None)
-                           if getattr(config, "hidden_act", "silu") == "situ" else None),
+                situ_beta=(
+                    getattr(config, "activation_situ_beta", None)
+                    if getattr(config, "hidden_act", "silu") == "situ"
+                    else None
+                ),
                 situ_linear_beta=getattr(config, "activation_situ_linear_beta", None),
                 # fp4 is the default; KIMI_K3_MOE_FP4=0 falls back to bf16 experts, which is how
                 # the two paths are A/B'd and an escape hatch if the fp4 kernel misbehaves.
@@ -512,23 +570,36 @@ class KimiK3DecoderLayer(nnx.Module):
             self.shared_experts = (
                 KimiK3MLP(
                     config.hidden_size,
-                    config.moe_intermediate_size * getattr(config, 'num_shared_experts', 0),
-                    mesh, getattr(config, 'activation_situ_beta', None), getattr(config, 'activation_situ_linear_beta', None), dtype)
-                if getattr(config, 'num_shared_experts', 0) > 0 else None
+                    config.moe_intermediate_size * getattr(config, "num_shared_experts", 0),
+                    mesh,
+                    getattr(config, "activation_situ_beta", None),
+                    getattr(config, "activation_situ_linear_beta", None),
+                    dtype,
+                )
+                if getattr(config, "num_shared_experts", 0) > 0
+                else None
             )
 
         self.input_layernorm = RMSNorm(
-            config.hidden_size, epsilon=config.rms_norm_eps, param_dtype=dtype,
-            scope_name="input_layernorm")
+            config.hidden_size,
+            epsilon=config.rms_norm_eps,
+            param_dtype=dtype,
+            scope_name="input_layernorm",
+        )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, epsilon=config.rms_norm_eps, param_dtype=dtype,
-            scope_name="post_attention_layernorm")
+            config.hidden_size,
+            epsilon=config.rms_norm_eps,
+            param_dtype=dtype,
+            scope_name="post_attention_layernorm",
+        )
 
         if cfg_uses_attn_res(config):
             self.self_attention_res = AttentionResidual(
-                config.hidden_size, config.rms_norm_eps, mesh, dtype, "self_attention_res")
+                config.hidden_size, config.rms_norm_eps, mesh, dtype, "self_attention_res"
+            )
             self.mlp_res = AttentionResidual(
-                config.hidden_size, config.rms_norm_eps, mesh, dtype, "mlp_res")
+                config.hidden_size, config.rms_norm_eps, mesh, dtype, "mlp_res"
+            )
         else:
             self.self_attention_res = None
             self.mlp_res = None
@@ -577,14 +648,16 @@ class KimiK3DecoderLayer(nnx.Module):
         it from ``hidden_states`` at the top of every layer, and only ``block_residuals`` carries
         across. Passing it in would silently change what every AttnRes mixes.
         """
-        kv_pool = (memory_pools.recurrent_state_pool if self.is_kda
-                   else memory_pools.token_to_kv_pool)
+        kv_pool = (
+            memory_pools.recurrent_state_pool if self.is_kda else memory_pools.token_to_kv_pool
+        )
 
         if self.attn_res_block_size is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
             hidden_states, kv_fused = self.self_attn(
-                positions, hidden_states, forward_batch, kv_pool)
+                positions, hidden_states, forward_batch, kv_pool
+            )
             hidden_states = residual + hidden_states
             residual = hidden_states
             hidden_states = self.post_attention_layernorm(hidden_states)
@@ -597,12 +670,12 @@ class KimiK3DecoderLayer(nnx.Module):
             hidden_states = self.self_attention_res(prefix_sum, block_residuals)
         if self.layer_idx % self.attn_res_block_size == 0:
             block_residuals = jnp.concatenate(
-                (block_residuals, jnp.expand_dims(prefix_sum, axis=-2)), axis=-2)
+                (block_residuals, jnp.expand_dims(prefix_sum, axis=-2)), axis=-2
+            )
             prefix_sum = None
 
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states, kv_fused = self.self_attn(
-            positions, hidden_states, forward_batch, kv_pool)
+        hidden_states, kv_fused = self.self_attn(positions, hidden_states, forward_batch, kv_pool)
         # prefix_sum is None exactly at a checkpoint boundary -- the running sum restarts from
         # this layer's attention output rather than continuing across the boundary.
         prefix_sum = hidden_states if prefix_sum is None else prefix_sum + hidden_states
@@ -632,21 +705,35 @@ class KimiK3Model(nnx.Module):
 
         self.config = config
         self.vocab_size = config.vocab_size
-        self.attn_res_block_size = getattr(config, 'attn_res_block_size', None)
+        self.attn_res_block_size = getattr(config, "attn_res_block_size", None)
         self.embed_tokens = Embed(
-            num_embeddings=config.vocab_size, features=config.hidden_size,
-            dtype=dtype, param_dtype=dtype, kernel_axes=("tensor", None), mesh=mesh)
-        self.layers = nnx.data([
-            KimiK3DecoderLayer(config=config, mesh=mesh, layer_idx=i, dtype=dtype)
-            for i in range(config.num_hidden_layers)
-        ])
+            num_embeddings=config.vocab_size,
+            features=config.hidden_size,
+            dtype=dtype,
+            param_dtype=dtype,
+            kernel_axes=("tensor", None),
+            mesh=mesh,
+        )
+        self.layers = nnx.data(
+            [
+                KimiK3DecoderLayer(config=config, mesh=mesh, layer_idx=i, dtype=dtype)
+                for i in range(config.num_hidden_layers)
+            ]
+        )
         self.norm = RMSNorm(
-            config.hidden_size, epsilon=config.rms_norm_eps, dtype=dtype,
-            param_dtype=dtype, scope_name="norm")
+            config.hidden_size,
+            epsilon=config.rms_norm_eps,
+            dtype=dtype,
+            param_dtype=dtype,
+            scope_name="norm",
+        )
         self.output_attn_res = (
-            AttentionResidual(config.hidden_size, config.rms_norm_eps, mesh, dtype,
-                              "output_attn_res")
-            if cfg_uses_attn_res(config) else None)
+            AttentionResidual(
+                config.hidden_size, config.rms_norm_eps, mesh, dtype, "output_attn_res"
+            )
+            if cfg_uses_attn_res(config)
+            else None
+        )
 
     def __call__(self, forward_batch: ForwardBatch, memory_pools):
         hidden_states = self.embed_tokens(forward_batch.input_ids)
@@ -657,17 +744,23 @@ class KimiK3Model(nnx.Module):
         #   ShardingTypeError: All operands should have the same sharding
         # Slicing to zero width inherits both the sharding and the dtype.
         block_residuals = (
-            hidden_states[:, None, :][:, :0, :]
-            if self.attn_res_block_size is not None else None)
+            hidden_states[:, None, :][:, :0, :] if self.attn_res_block_size is not None else None
+        )
 
         kv_fused_list, rec_bufs, conv_bufs, topk_list = [], [], [], []
         for layer in self.layers:
             hidden_states, block_residuals, attn_state, topk_ids = layer(
-                forward_batch.positions, hidden_states, forward_batch, memory_pools,
-                block_residuals, dispatch_info=forward_batch.expert_location_metadata)
+                forward_batch.positions,
+                hidden_states,
+                forward_batch,
+                memory_pools,
+                block_residuals,
+                dispatch_info=forward_batch.expert_location_metadata,
+            )
             if layer.is_kda:
                 rec, conv = attn_state
-                rec_bufs.append(rec); conv_bufs.append(conv)
+                rec_bufs.append(rec)
+                conv_bufs.append(conv)
             else:
                 kv_fused_list.append(attn_state)
             topk_list.append(topk_ids)
@@ -701,19 +794,28 @@ class KimiK3ForCausalLM(nnx.Module):
         self.model = KimiK3Model(config=config, mesh=mesh, dtype=dtype)
         if not getattr(config, "tie_word_embeddings", False):
             self.lm_head = ParallelLMHead(
-                config.vocab_size, config.hidden_size, dtype=dtype,
-                param_dtype=dtype, kernel_axes=("tensor", None))
+                config.vocab_size,
+                config.hidden_size,
+                dtype=dtype,
+                param_dtype=dtype,
+                kernel_axes=("tensor", None),
+            )
         self.logits_processor = LogitsProcessor(config.vocab_size, mesh=mesh)
 
     def __call__(self, forward_batch: ForwardBatch, memory_pools, logits_metadata):
-        hidden_states, kv_fused, recurrent_state, topk_ids = self.model(
-            forward_batch, memory_pools)
-        head = (self.model.embed_tokens
-                if getattr(self.config, "tie_word_embeddings", False) else self.lm_head)
+        hidden_states, kv_fused, recurrent_state, topk_ids = self.model(forward_batch, memory_pools)
+        head = (
+            self.model.embed_tokens
+            if getattr(self.config, "tie_word_embeddings", False)
+            else self.lm_head
+        )
         output = self.logits_processor(hidden_states, head, logits_metadata)
-        return (output,
-                {"token_to_kv_pool": kv_fused, "recurrent_state_pool": recurrent_state},
-                True, topk_ids)
+        return (
+            output,
+            {"token_to_kv_pool": kv_fused, "recurrent_state_pool": recurrent_state},
+            True,
+            topk_ids,
+        )
 
     def load_weights(self, model_config):
         from sgl_jax.srt.utils.weight_utils import WeightLoader
@@ -721,8 +823,9 @@ class KimiK3ForCausalLM(nnx.Module):
         # must run BEFORE the mappings are built -- every key in them is prefixed
         self._detect_text_prefix(model_config)
 
-        loader = WeightLoader(model=self, model_config=model_config,
-                              mesh=self.mesh, dtype=self.dtype)
+        loader = WeightLoader(
+            model=self, model_config=model_config, mesh=self.mesh, dtype=self.dtype
+        )
         loader.load_weights_from_safetensors(self._create_weight_mappings())
         self._fixup_kda_a_log(model_config)
         self._fixup_moe_mxfp4(model_config)
@@ -782,7 +885,8 @@ class KimiK3ForCausalLM(nnx.Module):
         source = open_source(path, keep=_wanted)
         logger.info(
             "MoE MXFP4 fixup: reading experts from %s (%s)",
-            path, "streamed byte ranges" if str(path).startswith("gs://") else "local files",
+            path,
+            "streamed byte ranges" if str(path).startswith("gs://") else "local files",
         )
         try:
             n_done = 0
@@ -805,12 +909,14 @@ class KimiK3ForCausalLM(nnx.Module):
                 # Measured on this fleet: one GET per tensor = 46 s/group (~3.5 h for the model);
                 # per-projection coalescing = 25 s; whole-layer = 15.4 s for 3.9 GB (~24 min).
                 stem = f"{self.TEXT_PREFIX}model.layers.{li}.block_sparse_moe.experts"
-                source.prefetch([
-                    f"{stem}.{e}.{proj}.{suffix}"
-                    for e in wanted_experts
-                    for proj in EXPERT_PROJ_TO_EPMOE
-                    for suffix in ("weight_packed", "weight_scale")
-                ])
+                source.prefetch(
+                    [
+                        f"{stem}.{e}.{proj}.{suffix}"
+                        for e in wanted_experts
+                        for proj in EXPERT_PROJ_TO_EPMOE
+                        for suffix in ("weight_packed", "weight_scale")
+                    ]
+                )
 
                 for proj, target in EXPERT_PROJ_TO_EPMOE.items():
                     param = getattr(moe, target, None)
@@ -833,7 +939,10 @@ class KimiK3ForCausalLM(nnx.Module):
                     _expert_cache: dict = {}
 
                     def _expert(e, _fmt=base_fmt, _fp4=use_fp4, _cache=_expert_cache):
-                        pk, sk = f"{_fmt.format(e=e)}.weight_packed", f"{_fmt.format(e=e)}.weight_scale"
+                        pk, sk = (
+                            f"{_fmt.format(e=e)}.weight_packed",
+                            f"{_fmt.format(e=e)}.weight_scale",
+                        )
                         if not source.has(sk):
                             raise KeyError(f"{pk} present but {sk} missing")
                         if e in _cache:
@@ -845,7 +954,10 @@ class KimiK3ForCausalLM(nnx.Module):
                             return unpack_fp4_to_e2m1(jnp.asarray(w)), e8m0_scale_to_kernel_layout(
                                 jnp.asarray(sc)
                             )
-                        return dequant_expert_weight(jnp.asarray(w), jnp.asarray(sc), jnp.bfloat16), None
+                        return (
+                            dequant_expert_weight(jnp.asarray(w), jnp.asarray(sc), jnp.bfloat16),
+                            None,
+                        )
 
                     # EPMoE's OWN mesh: it builds `moe_mesh` with axis_names ("expert", "tensor")
                     # (moe.py:84-88) and creates its params under that. The model mesh is
@@ -853,7 +965,7 @@ class KimiK3ForCausalLM(nnx.Module):
                     #   ValueError: Resource axis: expert ... is not found in mesh
                     target_mesh = getattr(moe, "moe_mesh", None) or self.mesh
 
-                    def _build(param_obj, pick):
+                    def _build(param_obj, pick, target_mesh=target_mesh):
                         """Assemble one sharded param, fetching ONLY this host's slices.
 
                         make_array_from_callback is what the shared loader uses for exactly this
@@ -897,17 +1009,23 @@ class KimiK3ForCausalLM(nnx.Module):
                         if scale_built is not None:
                             scale_param.value = scale_built
 
-                    _expert_cache.clear()   # bounded to one projection, never the model
+                    _expert_cache.clear()  # bounded to one projection, never the model
                     n_done += 1
                     if n_done % 12 == 0 or li <= 1:
                         # 92 MoE layers x 3 projections = 276 groups and one line at the end:
                         # without progress a stall and a silent death look identical from outside.
                         logger.info(
                             "MoE MXFP4 fixup: %d groups done (layer %d/%d, %s)",
-                            n_done, li, len(self.model.layers), target)
+                            n_done,
+                            li,
+                            len(self.model.layers),
+                            target,
+                        )
             logger.info(
                 "MoE MXFP4 fixup: loaded %d expert groups as %s",
-                n_done, "native fp4 + block scales" if use_fp4 else "bf16")
+                n_done,
+                "native fp4 + block scales" if use_fp4 else "bf16",
+            )
         finally:
             source.close()
 
@@ -937,7 +1055,6 @@ class KimiK3ForCausalLM(nnx.Module):
         import os
 
         import numpy as np
-
         from safetensors import safe_open
 
         cfg = self.config
@@ -965,7 +1082,7 @@ class KimiK3ForCausalLM(nnx.Module):
                     if key not in keys:
                         continue
                     raw = h.get_tensor(key)
-                    if raw.ndim == 4:            # old [1, 1, H, 1] layout
+                    if raw.ndim == 4:  # old [1, 1, H, 1] layout
                         raw = raw.reshape(-1)
                     if raw.shape[0] < num_heads:
                         raise ValueError(
@@ -980,17 +1097,13 @@ class KimiK3ForCausalLM(nnx.Module):
                     from jax.sharding import NamedSharding
                     from jax.sharding import PartitionSpec as _P
 
-                    a = jnp.asarray(raw[:num_heads], dtype=jnp.float32).reshape(
-                        1, 1, num_heads, 1
-                    )
+                    a = jnp.asarray(raw[:num_heads], dtype=jnp.float32).reshape(1, 1, num_heads, 1)
                     # count on the HOST copy, before placement: reading it back afterwards is a
                     # cross-process fetch ("Fetching value for `jax.Array` that spans
                     # non-addressable devices") because the tensor axis is sharded. A debug log
                     # line is not worth an all-gather, and on 4 hosts it is fatal rather than slow.
                     nonzero = int((np.asarray(a) != 0).sum())
-                    a = jax.device_put(
-                        a, NamedSharding(self.mesh, _P(None, None, "tensor", None))
-                    )
+                    a = jax.device_put(a, NamedSharding(self.mesh, _P(None, None, "tensor", None)))
                     attn = self.model.layers[layer_idx].self_attn
                     before = getattr(getattr(attn, "A_log", None), "value", None)
                     # Mutate the EXISTING Param in place. RadixLinearAttention captures a
@@ -1002,7 +1115,9 @@ class KimiK3ForCausalLM(nnx.Module):
                         attn.A_log = nnx.Param(a)
                     logger.info(
                         "A_log L%d: raw%s -> %s (was %s), nonzero=%d",
-                        layer_idx, tuple(raw.shape), tuple(a.shape),
+                        layer_idx,
+                        tuple(raw.shape),
+                        tuple(a.shape),
                         tuple(before.shape) if before is not None else None,
                         nonzero,
                     )
@@ -1092,13 +1207,14 @@ class KimiK3ForCausalLM(nnx.Module):
             # norm: [hidden] RMSNorm scale, replicated. proj: [hidden, 1] scorer, replicated --
             # sharding it would need an all-reduce to produce a single scalar per candidate.
             mappings[f"{self.TEXT_PREFIX}{ckpt_stem}_norm.weight"] = WeightMapping(
-                target_path=f"{target_stem}.norm.scale", sharding=(None,), transpose=False)
+                target_path=f"{target_stem}.norm.scale", sharding=(None,), transpose=False
+            )
             mappings[f"{self.TEXT_PREFIX}{ckpt_stem}_proj.weight"] = WeightMapping(
-                target_path=f"{target_stem}.proj.weight", sharding=(None, None), transpose=True)
+                target_path=f"{target_stem}.proj.weight", sharding=(None, None), transpose=True
+            )
 
         for i in range(self.config.num_hidden_layers):
-            _pair(f"model.layers.{i}.self_attention_res",
-                  f"model.layers.{i}.self_attention_res")
+            _pair(f"model.layers.{i}.self_attention_res", f"model.layers.{i}.self_attention_res")
             _pair(f"model.layers.{i}.mlp_res", f"model.layers.{i}.mlp_res")
         _pair("model.output_attn_res", "model.output_attn_res")
 
@@ -1111,7 +1227,9 @@ class KimiK3ForCausalLM(nnx.Module):
                 if not cfg_is_kda_layer(self.config, i):
                     continue
                 for gone in ("g_a_proj", "g_b_proj"):
-                    mappings.pop(f"{self.TEXT_PREFIX}model.layers.{i}.self_attn.{gone}.weight", None)
+                    mappings.pop(
+                        f"{self.TEXT_PREFIX}model.layers.{i}.self_attn.{gone}.weight", None
+                    )
                 mappings[f"{self.TEXT_PREFIX}model.layers.{i}.self_attn.g_proj.weight"] = (
                     WeightMapping(
                         target_path=f"model.layers.{i}.self_attn.g_proj.weight",
@@ -1214,6 +1332,7 @@ class KimiK3ForCausalLM(nnx.Module):
             )
         """
         return {}
+
 
 class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
     """Registry entry for K3's declared architecture.

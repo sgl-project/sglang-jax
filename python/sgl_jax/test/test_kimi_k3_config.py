@@ -3,7 +3,10 @@
 The reference json is vendored next to this test so the expectations are grounded in the actual
 model rather than in a guess about K3's layer pattern.
 """
-import json, pathlib, pytest
+
+import json
+import pathlib
+
 from sgl_jax.srt.configs.kimi_k3 import KimiK3Config
 
 REF = json.loads((pathlib.Path(__file__).parent / "kimi_k3_config_reference.json").read_text())

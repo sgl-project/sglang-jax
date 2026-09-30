@@ -68,6 +68,11 @@ gpu = [
 cpu = [
     "jax[cpu]==0.11.1",
 ]
+# Sub-byte (MXFP4) MoE matmul for Kimi-K3 via tokamax's public gmm_v2; without it the model
+# runs a dequant-to-bf16 reference path.
+fp4 = [
+    "tokamax>=0.0.14",
+]
 all = [
     "jax[tpu]==0.11.1",
     "fastokens>=0.1.1,<0.2.0",

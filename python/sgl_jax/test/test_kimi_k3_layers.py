@@ -6,13 +6,17 @@ executable torch-vs-jax cross-check lives in ``test_kimi_k3_torch_parity.py``, w
 reference functions directly when torch is installed. The math here is small enough that
 transcription is a defensible oracle.
 """
-import jax, jax.numpy as jnp, numpy as np, pytest
-from sgl_jax.srt.models.kimi_k3_layers import situ_and_mul, attention_residual_apply
+
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
+from sgl_jax.srt.models.kimi_k3_layers import attention_residual_apply, situ_and_mul
 
 
 def _oracle_situ(x, beta, linear_beta):
     """torch: gate,up = x.chunk(2,-1); gate = beta*tanh(gate/beta)*sigmoid(gate);
-              up = linear_beta*tanh(up/linear_beta) if linear_beta else up; return gate*up"""
+    up = linear_beta*tanh(up/linear_beta) if linear_beta else up; return gate*up"""
     gate, up = np.split(x.astype(np.float64), 2, axis=-1)
     g = beta * np.tanh(gate / beta) * (1.0 / (1.0 + np.exp(-gate)))
     u = linear_beta * np.tanh(up / linear_beta) if linear_beta is not None else up
@@ -21,7 +25,7 @@ def _oracle_situ(x, beta, linear_beta):
 
 def _oracle_attnres(prefix_sum, block_residuals, norm_scale, proj_kernel, eps):
     """torch: values=cat((blocks, prefix[...,None,:]),-2); scores=proj(norm(values));
-              p=softmax(scores.float(),-2); return (p*values.float()).sum(-2)"""
+    p=softmax(scores.float(),-2); return (p*values.float()).sum(-2)"""
     v = np.concatenate(
         (block_residuals.astype(np.float64), prefix_sum.astype(np.float64)[..., None, :]), axis=-2
     )
@@ -58,8 +62,11 @@ def test_attention_residual_matches_pytorch_reference(n_blocks):
     nscale = rng.normal(size=(hidden,)).astype(np.float32)
     pk = rng.normal(size=(hidden, 1)).astype(np.float32) * 0.05
     got = np.asarray(
-        attention_residual_apply(jnp.asarray(prefix), jnp.asarray(blocks),
-                                 jnp.asarray(nscale), jnp.asarray(pk), eps), dtype=np.float64)
+        attention_residual_apply(
+            jnp.asarray(prefix), jnp.asarray(blocks), jnp.asarray(nscale), jnp.asarray(pk), eps
+        ),
+        dtype=np.float64,
+    )
     want = _oracle_attnres(prefix, blocks, nscale, pk, eps)
     np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-4)
 
@@ -70,9 +77,15 @@ def test_attention_residual_is_a_convex_combination():
     hidden = 64
     prefix = rng.normal(size=(3, hidden)).astype(np.float32)
     blocks = rng.normal(size=(3, 4, hidden)).astype(np.float32)
-    out = np.asarray(attention_residual_apply(
-        jnp.asarray(prefix), jnp.asarray(blocks),
-        jnp.ones((hidden,), jnp.float32), jnp.zeros((hidden, 1), jnp.float32), 1e-6))
+    out = np.asarray(
+        attention_residual_apply(
+            jnp.asarray(prefix),
+            jnp.asarray(blocks),
+            jnp.ones((hidden,), jnp.float32),
+            jnp.zeros((hidden, 1), jnp.float32),
+            1e-6,
+        )
+    )
     allv = np.concatenate([blocks, prefix[:, None, :]], axis=-2)
     assert np.all(out <= allv.max(axis=-2) + 1e-4) and np.all(out >= allv.min(axis=-2) - 1e-4)
     # zero projection => uniform softmax => plain mean
@@ -93,9 +106,12 @@ def test_attnres_scoring_needs_highest_precision_on_tpu():
     blocks = rng.normal(size=(4, 3, hidden)).astype(np.float32)
     ns = rng.normal(size=(hidden,)).astype(np.float32)
     pk = (rng.normal(size=(hidden, 1)) * 0.05).astype(np.float32)
-    got = np.asarray(attention_residual_apply(
-        jnp.asarray(prefix), jnp.asarray(blocks), jnp.asarray(ns), jnp.asarray(pk), eps),
-        dtype=np.float64)
+    got = np.asarray(
+        attention_residual_apply(
+            jnp.asarray(prefix), jnp.asarray(blocks), jnp.asarray(ns), jnp.asarray(pk), eps
+        ),
+        dtype=np.float64,
+    )
     want = _oracle_attnres(prefix, blocks, ns, pk, eps)
     rel = np.abs(got - want) / (np.abs(want) + 1e-9)
     assert rel.max() < 1e-4, f"max rel err {rel.max():.3e} -- scoring einsum lost precision"

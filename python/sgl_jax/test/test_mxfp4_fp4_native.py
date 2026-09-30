@@ -5,8 +5,8 @@ value against 4), which is what makes the difference between a truncated bring-u
 So the load path keeps the weights native fp4 in HBM, and the MoE widens per block scale at
 matmul time.
 
-TODO(vlasenkoalexey): once a sub-byte fp4 GMM kernel lands, these invariants become its operand
-contract and the MoE's dequant-at-matmul step goes away.
+These invariants are the operand contract of tokamax's gmm_v2, which the K3 MoE calls directly
+when tokamax is installed on a TPU with fp4 matmul support.
 
 These tests pin the three things that make that substitution safe:
 
@@ -51,7 +51,7 @@ def _real_expert(proj: str = "w1"):
 
     for path in files:
         with safe_open(path, "numpy") as h:
-            for key in h.keys():
+            for key in h.keys():  # noqa: SIM118 - safe_open handles are not iterable
                 if key.endswith(f".{proj}.weight_packed"):
                     scale_key = key.replace("weight_packed", "weight_scale")
                     return h.get_tensor(key), h.get_tensor(scale_key)
@@ -106,9 +106,9 @@ def test_unpacked_weight_is_sub_byte_in_hbm():
     per_value = fp4_bytes / count
     # 0.5 exactly, plus whatever the allocator rounds up on a single array
     assert per_value < 0.75, f"fp4 is {per_value:.3f} B/value -- XLA did not pack it"
-    assert fp4_bytes * 3 < bf16_bytes, (
-        f"fp4 {fp4_bytes} B vs bf16 {bf16_bytes} B -- expected roughly a 4x saving"
-    )
+    assert (
+        fp4_bytes * 3 < bf16_bytes
+    ), f"fp4 {fp4_bytes} B vs bf16 {bf16_bytes} B -- expected roughly a 4x saving"
 
 
 def test_layout_is_k_major_as_gmm_v2_declares():
@@ -130,9 +130,7 @@ def test_fp4_path_carries_the_same_values_as_the_bf16_path():
     packed_j, scale_j = jnp.asarray(packed), jnp.asarray(scale)
 
     # bf16 path (validated elsewhere against an independent oracle), as [K, N] fp32
-    ref = dequantize_tensor_from_mxfp4_packed(
-        packed_j, scale_j, axis=-1, out_dtype=jnp.float32
-    ).T
+    ref = dequantize_tensor_from_mxfp4_packed(packed_j, scale_j, axis=-1, out_dtype=jnp.float32).T
 
     # fp4-native path: values stay fp4; the scale is applied by the kernel, so apply it here
     w4 = unpack_fp4_to_e2m1(packed_j)

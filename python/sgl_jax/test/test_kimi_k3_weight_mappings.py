@@ -4,7 +4,12 @@ An unmapped tensor is silently dropped by the loader, which yields a model that 
 computes wrong -- the same silent-failure class as the other bugs on this port. So this test
 diffs the mapping keys against the shipped index rather than asserting a hand-written list.
 """
-import json, os, pathlib, re, pytest
+
+import json
+import os
+import pathlib
+
+import pytest
 
 
 def _resolve_index() -> pathlib.Path:
@@ -51,8 +56,9 @@ def test_model_level_output_attn_res_exists():
     p = _index_text_params()
     assert "language_model.model.output_attn_res_norm.weight" in p
     assert "language_model.model.output_attn_res_proj.weight" in p
-    assert not any(k.startswith("language_model.model.layers.") for k in p
-                   if "output_attn_res" in k)
+    assert not any(
+        k.startswith("language_model.model.layers.") for k in p if "output_attn_res" in k
+    )
 
 
 def test_moe_experts_are_mxfp4_packed_with_scales():
@@ -60,8 +66,9 @@ def test_moe_experts_are_mxfp4_packed_with_scales():
     wm = json.loads(IDX.read_text())["weight_map"]
     packed = {k for k in wm if k.endswith("weight_packed")}
     assert len(packed) > 100000, len(packed)
-    missing = [k for k in list(packed)[:2000]
-               if k.replace("weight_packed", "weight_scale") not in wm]
+    missing = [
+        k for k in list(packed)[:2000] if k.replace("weight_packed", "weight_scale") not in wm
+    ]
     assert not missing, missing[:3]
 
 
