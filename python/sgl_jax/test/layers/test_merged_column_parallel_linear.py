@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from types import SimpleNamespace
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
@@ -34,6 +35,7 @@ from jax.experimental import mesh_utils
 from jax.sharding import AxisType, Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.configs.quantization_config import QuantizationConfig
 from sgl_jax.srt.layers.linear import (
     MergedColumnParallelLinear,
     QuantizedLinear,
@@ -148,20 +150,11 @@ class MergedColumnParallelSplitTest(unittest.TestCase):
                     input_size=8, output_sizes=sizes, mesh=mesh, params_dtype=jnp.float32
                 )
 
-        config = type("ModelConfig", (), {})()
-        config.quantization_config = type(
-            "QuantConfig",
-            (),
-            {
-                "get_linear_rules": staticmethod(
-                    lambda: [
-                        {"module_path": ".*", "weight_dtype": "int8", "activation_dtype": None}
-                    ]
-                ),
-                "ignored_layers": [],
-                "weight_block_size": None,
-            },
-        )()
+        config = SimpleNamespace(
+            quantization_config=QuantizationConfig(
+                linear_rules=[{"module_path": ".*", "weight_dtype": "int8"}]
+            )
+        )
         with jax.set_mesh(mesh):
             block = Block()
             block.proj.weight.value = jax.device_put(
