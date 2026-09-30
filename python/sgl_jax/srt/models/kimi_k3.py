@@ -798,7 +798,8 @@ class KimiK3ForCausalLM(nnx.Module):
                 config.hidden_size,
                 dtype=dtype,
                 param_dtype=dtype,
-                kernel_axes=("tensor", None),
+                mesh=mesh,
+                enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
             )
         self.logits_processor = LogitsProcessor(config.vocab_size, mesh=mesh)
 
@@ -818,7 +819,7 @@ class KimiK3ForCausalLM(nnx.Module):
         )
 
     def load_weights(self, model_config):
-        from sgl_jax.srt.utils.weight_utils import WeightLoader
+        from sgl_jax.srt.model_loader.weights import WeightLoader
 
         # must run BEFORE the mappings are built -- every key in them is prefixed
         self._detect_text_prefix(model_config)
@@ -826,12 +827,11 @@ class KimiK3ForCausalLM(nnx.Module):
         loader = WeightLoader(
             model=self, model_config=model_config, mesh=self.mesh, dtype=self.dtype
         )
-        loader.load_weights_from_safetensors(self._create_weight_mappings())
+        # MLA absorption (kv_b_proj -> w_uk / w_uv) runs inside load(), through
+        # DeepseekV3Attention.prepare_weight_loading.
+        loader.load(self._create_weight_mappings())
         self._fixup_kda_a_log(model_config)
         self._fixup_moe_mxfp4(model_config)
-        for layer in self.model.layers:
-            if not layer.is_kda:
-                layer.self_attn.post_load_weights()
 
     def _fixup_moe_mxfp4(self, model_config):
         """Load the MXFP4 MoE experts, which the inherited mapping cannot see.
@@ -969,7 +969,7 @@ class KimiK3ForCausalLM(nnx.Module):
                         """Assemble one sharded param, fetching ONLY this host's slices.
 
                         make_array_from_callback is what the shared loader uses for exactly this
-                        (weight_utils.py:1253). Building the global array host-side and then
+                        for sharded expert params. Building the global array host-side and then
                         device_put'ing it -- what this did before -- works on one host and fails
                         on four with
                           RuntimeError: Fetching value for `jax.Array` that spans non-addressable
@@ -1185,8 +1185,8 @@ class KimiK3ForCausalLM(nnx.Module):
         (`...layers.N.self_attention_res_norm.weight`), not a nested module, and there is a
         model-level pair (`model.output_attn_res_{norm,proj}.weight`) on top of the two per layer.
         """
+        from sgl_jax.srt.model_loader.weights import WeightSpec
         from sgl_jax.srt.models.kimi_linear import KimiLinearForCausalLM
-        from sgl_jax.srt.utils.weight_utils import WeightMapping
 
         # Kimi-Linear's mapping builder calls self.config.is_kda_layer(i) directly
         # (kimi_linear.py:665). With --trust-remote-code the config is the CHECKPOINT's
@@ -1206,10 +1206,10 @@ class KimiK3ForCausalLM(nnx.Module):
         def _pair(ckpt_stem: str, target_stem: str):
             # norm: [hidden] RMSNorm scale, replicated. proj: [hidden, 1] scorer, replicated --
             # sharding it would need an all-reduce to produce a single scalar per candidate.
-            mappings[f"{self.TEXT_PREFIX}{ckpt_stem}_norm.weight"] = WeightMapping(
+            mappings[f"{self.TEXT_PREFIX}{ckpt_stem}_norm.weight"] = WeightSpec(
                 target_path=f"{target_stem}.norm.scale", sharding=(None,), transpose=False
             )
-            mappings[f"{self.TEXT_PREFIX}{ckpt_stem}_proj.weight"] = WeightMapping(
+            mappings[f"{self.TEXT_PREFIX}{ckpt_stem}_proj.weight"] = WeightSpec(
                 target_path=f"{target_stem}.proj.weight", sharding=(None, None), transpose=True
             )
 
@@ -1231,7 +1231,7 @@ class KimiK3ForCausalLM(nnx.Module):
                         f"{self.TEXT_PREFIX}model.layers.{i}.self_attn.{gone}.weight", None
                     )
                 mappings[f"{self.TEXT_PREFIX}model.layers.{i}.self_attn.g_proj.weight"] = (
-                    WeightMapping(
+                    WeightSpec(
                         target_path=f"model.layers.{i}.self_attn.g_proj.weight",
                         sharding=(None, "tensor"),
                         transpose=True,
@@ -1250,17 +1250,17 @@ class KimiK3ForCausalLM(nnx.Module):
                 stem = f"{self.TEXT_PREFIX}model.layers.{i}.self_attn"
                 tgt = f"model.layers.{i}.self_attn"
                 mappings.pop(f"{stem}.q_proj.weight", None)
-                mappings[f"{stem}.q_a_proj.weight"] = WeightMapping(
+                mappings[f"{stem}.q_a_proj.weight"] = WeightSpec(
                     target_path=f"{tgt}.q_a_proj.weight",
                     sharding=(None, None),
                     transpose=True,
                 )
-                mappings[f"{stem}.q_a_layernorm.weight"] = WeightMapping(
+                mappings[f"{stem}.q_a_layernorm.weight"] = WeightSpec(
                     target_path=f"{tgt}.q_a_layernorm.scale",
                     sharding=(None,),
                     transpose=False,
                 )
-                mappings[f"{stem}.q_b_proj.weight"] = WeightMapping(
+                mappings[f"{stem}.q_b_proj.weight"] = WeightSpec(
                     target_path=f"{tgt}.q_b_proj.weight",
                     sharding=(None, "tensor"),
                     transpose=True,
@@ -1271,7 +1271,7 @@ class KimiK3ForCausalLM(nnx.Module):
                 if cfg_is_kda_layer(self.config, i):
                     continue
                 mappings[f"{self.TEXT_PREFIX}model.layers.{i}.self_attn.g_proj.weight"] = (
-                    WeightMapping(
+                    WeightSpec(
                         target_path=f"model.layers.{i}.self_attn.g_proj.weight",
                         sharding=(None, "tensor"),
                         transpose=True,
@@ -1286,20 +1286,20 @@ class KimiK3ForCausalLM(nnx.Module):
                 # DECODER LAYER (next to block_sparse_moe), so the target stem is one level up.
                 tgt = f"model.layers.{i}"
                 for proj in ("routed_expert_down_proj", "routed_expert_up_proj"):
-                    mappings[f"{stem}.{proj}.weight"] = WeightMapping(
+                    mappings[f"{stem}.{proj}.weight"] = WeightSpec(
                         target_path=f"{tgt}.{proj}.weight",
                         sharding=(None, None),
                         transpose=True,
                     )
                 if getattr(self.config, "latent_moe_use_norm", False):
-                    mappings[f"{stem}.routed_expert_norm.weight"] = WeightMapping(
+                    mappings[f"{stem}.routed_expert_norm.weight"] = WeightSpec(
                         target_path=f"{tgt}.routed_expert_norm.scale",
                         sharding=(None,),
                         transpose=False,
                     )
 
         # --- KDA A_log: EXCLUDED from the mapping, see _fixup_kda_a_log ---------------------
-        # A_log needs a narrow (slice) that WeightMapping cannot express, so it is dropped here
+        # A_log needs a narrow (slice) that WeightSpec cannot express, so it is dropped here
         # and loaded by hand after the main pass.
         for i in range(self.config.num_hidden_layers):
             if cfg_is_kda_layer(self.config, i):
@@ -1324,7 +1324,7 @@ class KimiK3ForCausalLM(nnx.Module):
         for i in range(self.config.num_hidden_layers):
             if not cfg_is_kda_layer(self.config, i):
                 continue
-            mappings[f"{self.TEXT_PREFIX}model.layers.{i}.self_attn.A_log"] = WeightMapping(
+            mappings[f"{self.TEXT_PREFIX}model.layers.{i}.self_attn.A_log"] = WeightSpec(
                 target_path=f"model.layers.{i}.self_attn.A_log",
                 sharding=(None, None, "tensor", None),
                 transpose=False,
