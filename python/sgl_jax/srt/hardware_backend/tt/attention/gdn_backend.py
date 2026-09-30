@@ -43,7 +43,6 @@ def _per_device(forward):
             lambda *args: forward(self, *args, **kwargs),
             mesh=self.mesh,
             out_specs=(heads, heads, P("data", "tensor", None, None)),
-            check_vma=False,
         )(self.forward_metadata, *args)
 
     return run

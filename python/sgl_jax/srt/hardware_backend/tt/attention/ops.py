@@ -7,11 +7,22 @@ import jax.numpy as jnp
 import numpy as np
 
 
+def _like(value, shape=None, dtype=None):
+    """An FFI result typed like value: its sharding and, inside shard_map, the
+    mesh axes it varies over."""
+    aval = jax.typeof(value)
+    return jax.ShapeDtypeStruct(
+        value.shape if shape is None else shape,
+        value.dtype if dtype is None else dtype,
+        sharding=aval.sharding,
+        manual_axis_type=aval.manual_axis_type,
+    )
+
+
 def _call(name, *operands, input_output_aliases=None, **attributes):
-    result = operands[0]
     return jax.ffi.ffi_call(
         name,
-        jax.ShapeDtypeStruct(result.shape, result.dtype, sharding=jax.typeof(result).sharding),
+        _like(operands[0]),
         vmap_method="sequential",
         input_output_aliases=input_output_aliases,
     )(*operands, **attributes)
@@ -90,7 +101,7 @@ def annotate_weight_dtype(tensor, dtype):
 def _recurrent_call(name, state, output_shape, *operands, **attributes):
     return jax.ffi.ffi_call(
         name,
-        (jax.ShapeDtypeStruct(state.shape, state.dtype), output_shape),
+        (_like(state), output_shape),
         input_output_aliases={0: 0},
         vmap_method="sequential",
     )(state, *operands, **attributes)
@@ -100,7 +111,7 @@ def causal_conv1d_update(state, value, weight, indices, initial):
     return _recurrent_call(
         "tt.causal_conv1d_update",
         state,
-        jax.ShapeDtypeStruct(value.shape, value.dtype),
+        _like(value),
         value,
         weight,
         indices,
@@ -112,7 +123,7 @@ def gated_delta_decode(state, q, k, v, b, a, A_log, dt_bias, indices, initial, *
     return _recurrent_call(
         "tt.gated_delta_decode",
         state,
-        jax.ShapeDtypeStruct((*b.shape, state.shape[-1]), jnp.float32),
+        _like(b, (*b.shape, state.shape[-1]), jnp.float32),
         q,
         k,
         v,
@@ -133,6 +144,6 @@ def state_pool_update(state, indices, updates):
 def gated_delta_rule(q, k, v, gate, beta, state):
     return jax.ffi.ffi_call(
         "tt.gated_delta_rule",
-        (jax.ShapeDtypeStruct(state.shape, state.dtype), jax.ShapeDtypeStruct(v.shape, v.dtype)),
+        (_like(state), _like(v)),
         vmap_method="sequential",
     )(q, k, v, gate, beta, state)
