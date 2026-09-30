@@ -305,10 +305,14 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
             dt_bias=self.dt_bias,
         )
 
-    def _shard_dt(self, x):
-        # Reshard a sliced [T, C] tensor so its channel axis is head-striped
-        # across "tensor" (each TP rank gets its head shard). No-op at TP=1.
-        return jax.sharding.reshard(x, P("data", "tensor"))
+    def _split_rank_major(self, x, sizes):
+        """Split a rank-major [T, C0|C1|...] projection (each "tensor" shard holds
+        [c0_d|c1_d|...] of its own heads) into head-striped [T, Ci], locally."""
+        tp = self.mesh.shape["tensor"]
+        x = x.reshape(x.shape[0], tp, -1, out_sharding=NamedSharding(self.mesh, P("data", "tensor", None)))
+        parts = jnp.split(x, np.cumsum([size // tp for size in sizes])[:-1], axis=-1)
+        heads = NamedSharding(self.mesh, P("data", "tensor"))
+        return [part.reshape(x.shape[0], -1, out_sharding=heads) for part in parts]
 
     def _norm_gate(self, core_out, z):
         """Per-head RMSNorm over head_v_dim, then a silu(z) gate (silu, NOT the
@@ -334,25 +338,9 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         qkvz, _ = self.in_proj_qkvz(hidden_states)  # [T, 2*key_dim + 2*value_dim]
         ba, _ = self.in_proj_ba(hidden_states)  # [T, 2*num_v_heads]
 
-        # The projections are stored rank-major: each "tensor" shard holds the
-        # [q|k|v|z] and [b|a] of its own heads, so slicing them is local.
-        tp = self.mesh.shape["tensor"]
-        T = hidden_states.shape[0]
-        kd, vd, nv = self.key_dim // tp, self.value_dim // tp, self.num_v_heads // tp
-        blocks = NamedSharding(self.mesh, P("data", "tensor", None))
-        qkvz = qkvz.reshape(T, tp, 2 * kd + 2 * vd, out_sharding=blocks)
-        ba = ba.reshape(T, tp, 2 * nv, out_sharding=blocks)
-
-        def take(x, start, size):
-            return self._shard_dt(
-                x[..., start : start + size].reshape(
-                    T, tp * size, out_sharding=NamedSharding(self.mesh, P("data", "tensor"))
-                )
-            )
-
-        q, k = take(qkvz, 0, kd), take(qkvz, kd, kd)
-        v, z = take(qkvz, 2 * kd, vd), take(qkvz, 2 * kd + vd, vd)
-        b, a = take(ba, 0, nv), take(ba, nv, nv)
+        kd, vd = self.key_dim, self.value_dim
+        q, k, v, z = self._split_rank_major(qkvz, (kd, kd, vd, vd))
+        b, a = self._split_rank_major(ba, (self.num_v_heads,) * 2)
 
         core_out, attn_state = self.self_attn(forward_batch, q, k, v, a, b, recurrent_state_pool)
         # core_out: [T, value_dim] -> per-head RMSNorm + silu(z) gate.
@@ -718,8 +706,6 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
     @staticmethod
     def _rank_major(weight, sizes, tp):
         """[hidden, C0|C1|...] component-major -> rank-major [c0_d|c1_d|...] per rank d."""
-        if tp <= 1:
-            return weight
         parts = [np.split(p, tp, axis=1) for p in np.split(weight, np.cumsum(sizes)[:-1], axis=1)]
         return np.concatenate([part[r] for r in range(tp) for part in parts], axis=1)
 
