@@ -130,6 +130,7 @@ def export_server(server_args):
                     resources.max_total_num_tokens if server_args.attention_backend == "tt" else 0
                 ),
                 moe_backend=config.moe_backend.value,
+                attn_backend=resources.attn_backend,
             )
             manifest.update(
                 token_buckets=manager.token_buckets,
@@ -148,7 +149,7 @@ def export_server(server_args):
                     (ForwardMode.EXTEND, "prefill"),
                     (ForwardMode.DECODE, "decode"),
                 ):
-                    for bs, tokens, cache_loc in manager.iter_model_shapes(mode):
+                    for bs, tokens, cache_loc, pages in manager.iter_model_shapes(mode):
                         options.workload = workload
                         options.batch_size = bs
                         options.num_tokens = tokens if mode.is_extend() else None
@@ -156,12 +157,14 @@ def export_server(server_args):
                             max_tokens // server_args.dp_size if mode.is_extend() else None
                         )
                         options.cache_loc_size = cache_loc
+                        options.decode_page_count = manager.decode_page_count(bs, cache_loc, pages)
                         fn, args, _, _ = model.build_inputs(options)
                         entry = dict(
                             workload=workload,
                             batch_size=bs,
                             num_tokens=tokens,
-                            directory=f"{workload}-bs{bs}-tokens{tokens}",
+                            directory=f"{workload}-bs{bs}-tokens{tokens}"
+                            + ("" if pages is None else f"-pages{pages}"),
                         )
                         yield entry, partial(fn.lower, *args), CompilationManager.compiler_options(
                             args[3].attn_backend, args[3]

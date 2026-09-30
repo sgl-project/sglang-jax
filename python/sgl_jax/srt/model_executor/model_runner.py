@@ -769,6 +769,10 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             return False
 
         backend = self.server_args.attention_backend
+        from sgl_jax.srt.layers.attention.msa_backend import msa_sparse_config
+
+        if msa_sparse_config(self.model_config) is not None and backend != "fa":
+            raise ValueError(f"MSA models require --attention-backend fa; got {backend!r}.")
         if self.server_args.device == "cpu" and backend in ("fa", "fa_mha"):
             logger.warning(
                 "FlashAttention backend is not supported on CPU; falling back to native."
@@ -876,13 +880,28 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 head_dim = self.model_config.head_dim
                 num_kv_heads = self.num_kv_heads
 
-            full_attn_backend = FlashAttention(
-                self.num_attn_heads,
-                num_kv_heads,
-                head_dim,
-                page_size=self.page_size,
-                mesh=self.mesh,
-            )
+            sparse_config = msa_sparse_config(self.model_config)
+            if sparse_config is not None:
+                from sgl_jax.srt.layers.attention.msa_backend import MSAAttentionBackend
+
+                full_attn_backend = MSAAttentionBackend(
+                    self.num_attn_heads,
+                    num_kv_heads,
+                    head_dim,
+                    page_size=self.page_size,
+                    mesh=self.mesh,
+                    sparse_config=sparse_config,
+                    context_len=self.model_config.context_len,
+                    total_num_kv_heads=self.model_config.get_total_num_kv_heads(),
+                )
+            else:
+                full_attn_backend = FlashAttention(
+                    self.num_attn_heads,
+                    num_kv_heads,
+                    head_dim,
+                    page_size=self.page_size,
+                    mesh=self.mesh,
+                )
 
         elif backend == "tt":
             from sgl_jax.srt.hardware_backend.tt.attention.tt_backend import TTAttention
