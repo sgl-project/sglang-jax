@@ -17,9 +17,10 @@ Key conventions confirmed against the upstream torch reference
 * MoE mirrors qwen2_moe: ``GateLogit`` + ``TopK`` + ``FusedEPMoE`` routed path,
   plus a dense ``Qwen2MoeMLP`` shared expert gated by ``sigmoid(shared_gate)``.
 * GDN fuses HF's 4 in-proj keys into 2 JAX projections
-  (``in_proj_qkvz`` = [Q|K|V|Z], ``in_proj_ba`` = [B|A]); the model reshards
-  the sliced q/k/v/z/a/b to ``P("data","tensor")`` so each TP rank sees its
-  head-striped shard (the GDN backend's ``shard_map`` contract). The conv1d
+  (``in_proj_qkvz`` = [Q|K|V|Z], ``in_proj_ba`` = [B|A]), stored rank-major
+  so each TP rank's column shard holds its own heads' [q|k|v|z] and [b|a];
+  slicing q/k/v/z/a/b to ``P("data","tensor")`` is then local (the GDN
+  backend's ``shard_map`` contract). The conv1d
   weight is stripe-rearranged at load time (see the weight loader in P3).
 """
 
@@ -333,13 +334,25 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         qkvz, _ = self.in_proj_qkvz(hidden_states)  # [T, 2*key_dim + 2*value_dim]
         ba, _ = self.in_proj_ba(hidden_states)  # [T, 2*num_v_heads]
 
-        kd, vd = self.key_dim, self.value_dim
-        q = self._shard_dt(qkvz[:, :kd])
-        k = self._shard_dt(qkvz[:, kd : 2 * kd])
-        v = self._shard_dt(qkvz[:, 2 * kd : 2 * kd + vd])
-        z = self._shard_dt(qkvz[:, 2 * kd + vd :])
-        b = self._shard_dt(ba[:, : self.num_v_heads])
-        a = self._shard_dt(ba[:, self.num_v_heads :])
+        # The projections are stored rank-major: each "tensor" shard holds the
+        # [q|k|v|z] and [b|a] of its own heads, so slicing them is local.
+        tp = self.mesh.shape["tensor"]
+        T = hidden_states.shape[0]
+        kd, vd, nv = self.key_dim // tp, self.value_dim // tp, self.num_v_heads // tp
+        blocks = NamedSharding(self.mesh, P("data", "tensor", None))
+        qkvz = qkvz.reshape(T, tp, 2 * kd + 2 * vd, out_sharding=blocks)
+        ba = ba.reshape(T, tp, 2 * nv, out_sharding=blocks)
+
+        def take(x, start, size):
+            return self._shard_dt(
+                x[..., start : start + size].reshape(
+                    T, tp * size, out_sharding=NamedSharding(self.mesh, P("data", "tensor"))
+                )
+            )
+
+        q, k = take(qkvz, 0, kd), take(qkvz, kd, kd)
+        v, z = take(qkvz, 2 * kd, vd), take(qkvz, 2 * kd + vd, vd)
+        b, a = take(ba, 0, nv), take(ba, nv, nv)
 
         core_out, attn_state = self.self_attn(forward_batch, q, k, v, a, b, recurrent_state_pool)
         # core_out: [T, value_dim] -> per-head RMSNorm + silu(z) gate.
@@ -693,11 +706,22 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         qkv, z, b, a, conv = inputs
         gdn = self.language_model.model.layers[layer_idx].self_attn
         conv = self._stripe_conv(conv.reshape(conv.shape[0], conv.shape[-1]), gdn, tp)
+        kd, vd, nv = gdn.key_dim, gdn.value_dim, gdn.num_v_heads
+        qkvz = self._rank_major(np.concatenate((qkv, z), axis=0).T, (kd, kd, vd, vd), tp)
+        ba = self._rank_major(np.concatenate((b, a), axis=0).T, (nv, nv), tp)
         return (
-            self._put(np.concatenate((qkv, z), axis=0).T, (None, "tensor")),
-            self._put(np.concatenate((b, a), axis=0).T, (None, "tensor")),
+            self._put(qkvz, (None, "tensor")),
+            self._put(ba, (None, "tensor")),
             self._put(conv, ("tensor", None)),
         )
+
+    @staticmethod
+    def _rank_major(weight, sizes, tp):
+        """[hidden, C0|C1|...] component-major -> rank-major [c0_d|c1_d|...] per rank d."""
+        if tp <= 1:
+            return weight
+        parts = [np.split(p, tp, axis=1) for p in np.split(weight, np.cumsum(sizes)[:-1], axis=1)]
+        return np.concatenate([part[r] for r in range(tp) for part in parts], axis=1)
 
     @staticmethod
     def _stripe_conv(conv, gdn, tp):
