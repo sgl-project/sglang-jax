@@ -7,15 +7,12 @@ import jax.numpy as jnp
 import numpy as np
 
 
-def _like(value, shape=None, dtype=None):
+def _like(value):
     """An FFI result typed like value: its sharding and, inside shard_map, the
     mesh axes it varies over."""
     aval = jax.typeof(value)
     return jax.ShapeDtypeStruct(
-        value.shape if shape is None else shape,
-        value.dtype if dtype is None else dtype,
-        sharding=aval.sharding,
-        manual_axis_type=aval.manual_axis_type,
+        value.shape, value.dtype, sharding=aval.sharding, manual_axis_type=aval.manual_axis_type
     )
 
 
@@ -123,7 +120,7 @@ def gated_delta_decode(state, q, k, v, b, a, A_log, dt_bias, indices, initial, *
     return _recurrent_call(
         "tt.gated_delta_decode",
         state,
-        _like(b, (*b.shape, state.shape[-1]), jnp.float32),
+        _like(b).update(shape=(*b.shape, state.shape[-1]), dtype=jnp.float32),
         q,
         k,
         v,
