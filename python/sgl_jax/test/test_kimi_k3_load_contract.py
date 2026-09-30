@@ -11,6 +11,7 @@ its target paths do not match).
 from types import SimpleNamespace
 
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from flax import nnx
 
@@ -136,3 +137,56 @@ def test_every_checkpoint_name_carries_the_text_prefix(quantization_config):
         if not src.startswith(prefix)
     ]
     assert not unprefixed, unprefixed[:4]
+
+
+def test_a_log_fixup_raises_without_a_checkpoint(tmp_path):
+    """No safetensors under --model-path used to log a warning and leave every KDA A_log at 0."""
+    model, _ = _build()
+    with pytest.raises(FileNotFoundError):
+        model._fixup_kda_a_log(SimpleNamespace(model_path=str(tmp_path)))
+
+
+def test_mla_output_gate_is_applied_through_the_parent_hook():
+    """K3 gates the MLA output via DeepseekV3Attention._pre_o_proj, not a copied forward."""
+    from sgl_jax.srt.models.kimi_k3 import KimiK3MLAAttention
+    from sgl_jax.srt.models.kimi_k3_layers import mla_output_gate
+
+    assert "__call__" not in KimiK3MLAAttention.__dict__
+    model, _ = _build()
+    attn = next(
+        layer.self_attn
+        for layer in model.model.layers
+        if isinstance(layer.self_attn, KimiK3MLAAttention)
+    )
+    assert attn.use_output_gate
+    rng = np.random.default_rng(0)
+    with _in_mesh():
+        h = jnp.asarray(rng.standard_normal((3, attn.g_proj.weight.value.shape[0])), jnp.float32)
+        x = jnp.asarray(rng.standard_normal((3, attn.g_proj.weight.value.shape[1])), jnp.float32)
+        got = attn._pre_o_proj(x, h)
+        want = mla_output_gate(x, attn.g_proj(h)[0])
+    np.testing.assert_allclose(np.asarray(got), np.asarray(want), rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "p2l, ok",
+    [(None, True), ("identity", True), ("permuted", False), ("wrong_width", False)],
+)
+def test_streamed_expert_load_requires_trivial_expert_placement(monkeypatch, p2l, ok):
+    import sgl_jax.srt.eplb.expert_location as loc
+    from sgl_jax.srt.models.kimi_k3 import _assert_identity_expert_placement
+
+    num_experts, layers = 8, 3
+    maps = {
+        None: None,
+        "identity": np.tile(np.arange(num_experts), (layers, 1)),
+        "permuted": np.tile(np.arange(num_experts)[::-1], (layers, 1)),
+        "wrong_width": np.tile(np.arange(num_experts + 2) % num_experts, (layers, 1)),
+    }
+    meta = None if maps[p2l] is None else SimpleNamespace(physical_to_logical_map=maps[p2l])
+    monkeypatch.setattr(loc, "get_global_expert_location_metadata", lambda: meta)
+    if ok:
+        _assert_identity_expert_placement(num_experts)
+    else:
+        with pytest.raises(ValueError, match="trivial expert placement"):
+            _assert_identity_expert_placement(num_experts)

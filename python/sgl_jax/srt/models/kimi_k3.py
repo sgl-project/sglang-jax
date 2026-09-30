@@ -33,7 +33,10 @@ from sgl_jax.srt.layers.gate import GateLogit, TopK
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.moe import EPMoE
-from sgl_jax.srt.layers.quantization.mxfp4 import MXFP4_GROUP_SIZE
+from sgl_jax.srt.layers.quantization.mxfp4 import (
+    MXFP4_GROUP_SIZE,
+    is_mxfp4_packed_config,
+)
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.deepseek_v3 import DeepseekV3Attention as KimiMLAAttention
 from sgl_jax.srt.models.kimi_k3_layers import (
@@ -57,15 +60,14 @@ _TOKAMAX_FP4_MIN_TPU_GENERATION = 7
 def checkpoint_has_mxfp4_experts(config) -> bool:
     """Whether the checkpoint ships its routed experts as MXFP4 (packed e2m1 + e8m0 scales).
 
-    The released K3 declares ``quantization_config.format = "mxfp4-pack-quantized"``; a bf16
-    checkpoint loaded through this class (e.g. Kimi-Linear) declares none. A thin local
-    checkpoint whose experts stream from ``KIMI_K3_WEIGHTS_URI`` is MXFP4 by construction.
+    The released K3 declares ``mxfp4-pack-quantized`` in ``quantization_config``; a bf16 checkpoint
+    loaded through this class (e.g. Kimi-Linear) declares none. A thin local checkpoint whose
+    experts stream from ``KIMI_K3_WEIGHTS_URI`` is MXFP4 by construction.
     """
     quant = getattr(config, "quantization_config", None)
     if quant is not None and not isinstance(quant, dict):
         quant = getattr(quant, "to_dict", lambda: vars(quant))()
-    fmt = str((quant or {}).get("format", ""))
-    return fmt.startswith("mxfp4") or bool(os.environ.get("KIMI_K3_WEIGHTS_URI"))
+    return is_mxfp4_packed_config(quant) or bool(os.environ.get("KIMI_K3_WEIGHTS_URI"))
 
 
 def _tokamax_fp4_gmm():
@@ -218,44 +220,12 @@ class KimiK3MLAAttention(KimiMLAAttention):
                 scope_name="g_proj",
             )
 
-    def __call__(self, positions, hidden_states, forward_batch, token_to_kv_pool):
-        """Mirrors DeepseekV3Attention.__call__, gating attn_output before o_proj."""
+    def _pre_o_proj(self, attn_output, hidden_states):
+        """The parent applies this right before ``o_proj``; K3 gates the attention output there."""
         if not self.use_output_gate:
-            return super().__call__(positions, hidden_states, forward_batch, token_to_kv_pool)
-
-        if self.q_lora_rank is None:
-            q, _ = self.q_proj(hidden_states)
-        else:
-            q_compressed, _ = self.q_a_proj(hidden_states)
-            q_compressed = self.q_a_layernorm(q_compressed)
-            q, _ = self.q_b_proj(q_compressed)
-        q = q.reshape(-1, self.num_heads, self.qk_head_dim)
-        q_nope = q[:, :, : self.qk_nope_head_dim]
-        q_rope = q[:, :, self.qk_nope_head_dim :]
-
-        kv_a_out, _ = self.kv_a_proj(hidden_states)
-        compressed = kv_a_out[:, : self.kv_lora_rank]
-        k_rope_raw = kv_a_out[:, self.kv_lora_rank :]
-        compressed = self.kv_a_layernorm(compressed)
-
-        k_rope = k_rope_raw.reshape(-1, 1, self.qk_rope_head_dim)
-        if self.rotary_emb is not None:
-            q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
-
-        if self.use_absorbed:
-            attn_output, kv_fused = self._forward_mqa(
-                q_nope, q_rope, compressed, k_rope, forward_batch, token_to_kv_pool
-            )
-        else:
-            attn_output, kv_fused = self._forward_mha(
-                q_nope, q_rope, compressed, k_rope, forward_batch, token_to_kv_pool
-            )
-
+            return attn_output
         gate, _ = self.g_proj(hidden_states)
-        attn_output = mla_output_gate(attn_output, gate)
-
-        output, _ = self.o_proj(attn_output)
-        return output, kv_fused
+        return mla_output_gate(attn_output, gate)
 
 
 class KimiK3MLP(nnx.Module):
@@ -303,6 +273,32 @@ class KimiK3MLP(nnx.Module):
             act = jax.nn.silu(gate) * up
         out, _ = self.down_proj(act)
         return out
+
+
+def _assert_identity_expert_placement(num_experts: int) -> None:
+    """The streamed expert load fetches each process's CONTIGUOUS expert range off the mesh.
+
+    Under a non-trivial EPLB placement (``--init-expert-location`` other than ``trivial``) the
+    physical-to-logical map permutes experts across devices, so the block this loader fetches is
+    not the block the dispatcher addresses -- and a mismatch loads cleanly and leaves the missing
+    experts as zeros. Refuse rather than serve a wrong model that runs.
+    """
+    from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
+
+    metadata = get_global_expert_location_metadata()
+    p2l = getattr(metadata, "physical_to_logical_map", None) if metadata is not None else None
+    if p2l is None:
+        return
+    p2l = np.asarray(p2l)
+    identity = np.arange(p2l.shape[-1]) % num_experts
+    if p2l.shape[-1] != num_experts or not np.array_equal(
+        p2l, np.broadcast_to(identity, p2l.shape)
+    ):
+        raise ValueError(
+            "Kimi-K3 streamed expert loading requires the trivial expert placement (each process "
+            "owns a contiguous expert range); got a non-identity physical-to-logical map "
+            f"of shape {p2l.shape}. Launch with --init-expert-location trivial."
+        )
 
 
 def _local_expert_range(moe, num_experts: int) -> range:
@@ -924,6 +920,7 @@ class KimiK3ForCausalLM(nnx.Module):
                 # them -- every device is addressable, so nothing is saved there. Across hosts at
                 # ep_size=32 a process owns 8 of 32 expert groups (224 of 896) and never requests
                 # the other 672.
+                _assert_identity_expert_placement(num_experts)
                 wanted_experts = _local_expert_range(moe, num_experts)
 
                 # Prefetch the WHOLE LAYER -- all three projections at once. A shard stores each
@@ -1078,7 +1075,8 @@ class KimiK3ForCausalLM(nnx.Module):
         import os
 
         import numpy as np
-        from safetensors import safe_open
+
+        from sgl_jax.srt.layers.quantization.mxfp4_streaming import open_source
 
         cfg = self.config
         la = getattr(cfg, "linear_attn_config", None) or {}
@@ -1086,11 +1084,14 @@ class KimiK3ForCausalLM(nnx.Module):
         if not num_heads:
             return
 
+        # Read through the same source interface as the expert load, so a gs:// --model-path or
+        # a checkpoint split between local files and a streamed remote both work. A missing
+        # source is an error: every KDA layer would otherwise keep A_log = 0 and serve.
         path = getattr(model_config, "model_path", None) or getattr(cfg, "_name_or_path", None)
-        files = sorted(glob.glob(os.path.join(path, "*.safetensors"))) if path else []
-        if not files:
-            logger.warning("A_log fixup skipped: no safetensors under %r", path)
-            return
+        if not path or (
+            not str(path).startswith("gs://") and not glob.glob(os.path.join(path, "*.safetensors"))
+        ):
+            raise FileNotFoundError(f"A_log fixup: no safetensors under {path!r}")
 
         wanted = {
             f"{self.TEXT_PREFIX}model.layers.{i}.self_attn.A_log": i
@@ -1098,54 +1099,55 @@ class KimiK3ForCausalLM(nnx.Module):
             if cfg_is_kda_layer(cfg, i)
         }
         found = 0
-        for f in files:
-            with safe_open(f, framework="np") as h:
-                keys = set(h.keys())
-                for key, layer_idx in list(wanted.items()):
-                    if key not in keys:
-                        continue
-                    raw = h.get_tensor(key)
-                    if raw.ndim == 4:  # old [1, 1, H, 1] layout
-                        raw = raw.reshape(-1)
-                    if raw.shape[0] < num_heads:
-                        raise ValueError(
-                            f"{key}: A_log has {raw.shape[0]} entries, fewer than "
-                            f"num_heads={num_heads}"
-                        )
-                    # Place with the SAME sharding the param was declared with
-                    # (kimi_linear.py: out_sharding=P(None, None, "tensor", None)). Assigning a
-                    # plain unsharded array leaves the per-rank view empty, and the backend then
-                    # fails on `layer.A_log.value.reshape(H)` with shape (0,) -- H there is the
-                    # PER-RANK head count (q.shape[-2]), not the global 96.
-                    from jax.sharding import NamedSharding
-                    from jax.sharding import PartitionSpec as _P
-
-                    a = jnp.asarray(raw[:num_heads], dtype=jnp.float32).reshape(1, 1, num_heads, 1)
-                    # count on the HOST copy, before placement: reading it back afterwards is a
-                    # cross-process fetch ("Fetching value for `jax.Array` that spans
-                    # non-addressable devices") because the tensor axis is sharded. A debug log
-                    # line is not worth an all-gather, and on 4 hosts it is fatal rather than slow.
-                    nonzero = int((np.asarray(a) != 0).sum())
-                    a = jax.device_put(a, NamedSharding(self.mesh, _P(None, None, "tensor", None)))
-                    attn = self.model.layers[layer_idx].self_attn
-                    before = getattr(getattr(attn, "A_log", None), "value", None)
-                    # Mutate the EXISTING Param in place. RadixLinearAttention captures a
-                    # reference to A_log at construction, so replacing the Param object leaves
-                    # the backend holding the old one.
-                    if getattr(attn, "A_log", None) is not None:
-                        attn.A_log.value = a
-                    else:
-                        attn.A_log = nnx.Param(a)
-                    logger.info(
-                        "A_log L%d: raw%s -> %s (was %s), nonzero=%d",
-                        layer_idx,
-                        tuple(raw.shape),
-                        tuple(a.shape),
-                        tuple(before.shape) if before is not None else None,
-                        nonzero,
+        source = open_source(path, keep=lambda key: key in wanted)
+        try:
+            for key, layer_idx in list(wanted.items()):
+                if not source.has(key):
+                    continue
+                raw = source.get(key)
+                if raw.ndim == 4:  # old [1, 1, H, 1] layout
+                    raw = raw.reshape(-1)
+                if raw.shape[0] < num_heads:
+                    raise ValueError(
+                        f"{key}: A_log has {raw.shape[0]} entries, fewer than "
+                        f"num_heads={num_heads}"
                     )
-                    del wanted[key]
-                    found += 1
+                # Place with the SAME sharding the param was declared with
+                # (kimi_linear.py: out_sharding=P(None, None, "tensor", None)). Assigning a
+                # plain unsharded array leaves the per-rank view empty, and the backend then
+                # fails on `layer.A_log.value.reshape(H)` with shape (0,) -- H there is the
+                # PER-RANK head count (q.shape[-2]), not the global 96.
+                from jax.sharding import NamedSharding
+                from jax.sharding import PartitionSpec as _P
+
+                a = jnp.asarray(raw[:num_heads], dtype=jnp.float32).reshape(1, 1, num_heads, 1)
+                # count on the HOST copy, before placement: reading it back afterwards is a
+                # cross-process fetch ("Fetching value for `jax.Array` that spans
+                # non-addressable devices") because the tensor axis is sharded. A debug log
+                # line is not worth an all-gather, and on 4 hosts it is fatal rather than slow.
+                nonzero = int((np.asarray(a) != 0).sum())
+                a = jax.device_put(a, NamedSharding(self.mesh, _P(None, None, "tensor", None)))
+                attn = self.model.layers[layer_idx].self_attn
+                before = getattr(getattr(attn, "A_log", None), "value", None)
+                # Mutate the EXISTING Param in place. RadixLinearAttention captures a
+                # reference to A_log at construction, so replacing the Param object leaves
+                # the backend holding the old one.
+                if getattr(attn, "A_log", None) is not None:
+                    attn.A_log.value = a
+                else:
+                    attn.A_log = nnx.Param(a)
+                logger.info(
+                    "A_log L%d: raw%s -> %s (was %s), nonzero=%d",
+                    layer_idx,
+                    tuple(raw.shape),
+                    tuple(a.shape),
+                    tuple(before.shape) if before is not None else None,
+                    nonzero,
+                )
+                del wanted[key]
+                found += 1
+        finally:
+            source.close()
         if wanted:
             raise KeyError(f"A_log missing for {len(wanted)} KDA layers: {list(wanted)[:3]}")
         logger.info("A_log fixup: loaded %d KDA layers, narrowed to %d heads", found, num_heads)
