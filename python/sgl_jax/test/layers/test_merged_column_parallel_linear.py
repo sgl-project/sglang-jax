@@ -101,23 +101,28 @@ class MergedColumnParallelSplitTest(unittest.TestCase):
         expected = np.split(x @ weight, np.cumsum(sizes)[:-1], axis=-1)
         for tp in (1, 2, 4):
             with self.subTest(tp=tp):
-                mesh = _mesh_1xN(tp)
-                with jax.set_mesh(mesh):
-                    layer = MergedColumnParallelLinear(
-                        input_size=8, output_sizes=sizes, mesh=mesh, params_dtype=jnp.float32
-                    )
-                    layer.weight.value = jax.device_put(
-                        layer.stripe(weight), NamedSharding(mesh, P(None, "tensor"))
-                    )
-                    run = jax.jit(lambda x: layer.split(layer(x)[0]))
-                    x_dev = jax.device_put(x, NamedSharding(mesh, P("data", None)))
-                    hlo = run.lower(x_dev).compile().as_text()
-                    parts = run(x_dev)
+                parts, hlo = self._split_on_mesh(tp, sizes, weight, x)
                 for part, want in zip(parts, expected):
                     self.assertEqual(part.sharding.spec, P("data", "tensor"))
                     np.testing.assert_allclose(np.asarray(part), want, rtol=1e-5, atol=1e-5)
                 for collective in ("all-gather", "all-to-all", "collective-permute"):
                     self.assertNotIn(collective, hlo)
+
+    @staticmethod
+    def _split_on_mesh(tp, sizes, weight, x):
+        """Runs the layer with a striped weight on a 1 x tp mesh and splits its
+        output; returns the parts and the compiled HLO text."""
+        mesh = _mesh_1xN(tp)
+        with jax.set_mesh(mesh):
+            layer = MergedColumnParallelLinear(
+                input_size=weight.shape[0], output_sizes=sizes, mesh=mesh, params_dtype=jnp.float32
+            )
+            layer.weight.value = jax.device_put(
+                layer.stripe(weight), NamedSharding(mesh, P(None, "tensor"))
+            )
+            run = jax.jit(lambda x: layer.split(layer(x)[0]))
+            x = jax.device_put(x, NamedSharding(mesh, P("data", None)))
+            return run(x), run.lower(x).compile().as_text()
 
 
 if __name__ == "__main__":

@@ -681,7 +681,9 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         gdn = self.language_model.model.layers[layer_idx].self_attn
         conv = self._stripe_conv(conv.reshape(conv.shape[0], conv.shape[-1]), gdn, tp)
         return (
-            self._put(gdn.in_proj_qkvz.stripe(np.concatenate((qkv, z), axis=0).T), (None, "tensor")),
+            self._put(
+                gdn.in_proj_qkvz.stripe(np.concatenate((qkv, z), axis=0).T), (None, "tensor")
+            ),
             self._put(gdn.in_proj_ba.stripe(np.concatenate((b, a), axis=0).T), (None, "tensor")),
             self._put(conv, ("tensor", None)),
         )
