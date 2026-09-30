@@ -35,6 +35,8 @@ from jax.experimental.pallas import triton as plgpu
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.kernels.ragged_paged_attention.util import is_fp8_dtype
+
 DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)
 
 
@@ -411,7 +413,7 @@ def paged_attention(
             f"k_pages and v_pages must have the same shape. Got {k_pages.shape} and"
             f" {v_pages.shape}"  # pytype: disable=attribute-error
         )
-    if k_pages.dtype in (jnp.float8_e4m3fn, jnp.float8_e5m2):
+    if is_fp8_dtype(k_pages.dtype):
         raise ValueError(
             f"paged_attention Triton kernel does not support FP8 KV cache ({k_pages.dtype})."
         )

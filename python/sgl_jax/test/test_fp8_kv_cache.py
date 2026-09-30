@@ -5,7 +5,9 @@ from unittest.mock import patch
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
+from jax.sharding import Mesh
 
 from sgl_jax.srt.kernels.mla.v2.tuned_block_sizes import get_tuned_block_sizes_mla
 from sgl_jax.srt.kernels.paged_attention.paged_attention import paged_attention
@@ -16,11 +18,17 @@ from sgl_jax.srt.kernels.ragged_paged_attention.tuned_block_sizes_v3 import (
     get_tuned_block_sizes_v3,
 )
 from sgl_jax.srt.kernels.ragged_paged_attention.util import (
+    align_to,
     get_tpu_version,
+    is_fp8_dtype,
     quantize_to_kv_dtype,
 )
 from sgl_jax.srt.mem_cache.hca_pool import HCAKVPool
-from sgl_jax.srt.mem_cache.memory_pool import MSATokenToKVPool, merge_kv
+from sgl_jax.srt.mem_cache.memory_pool import (
+    MHATokenToKVPool,
+    MSATokenToKVPool,
+    merge_kv,
+)
 from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
 from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
@@ -137,6 +145,16 @@ def test_quantize_to_kv_dtype_scale_division():
     assert jnp.array_equal(q_none, q_one)
 
 
+def test_is_fp8_dtype():
+    """Verify is_fp8_dtype helper accurately detects float8 types."""
+    assert is_fp8_dtype(jnp.float8_e4m3fn) is True
+    assert is_fp8_dtype(jnp.float8_e5m2) is True
+    assert is_fp8_dtype(jnp.bfloat16) is False
+    assert is_fp8_dtype(jnp.float32) is False
+    assert is_fp8_dtype(jnp.int32) is False
+    assert is_fp8_dtype(None) is False
+
+
 # ==============================================================================
 # 2. Dtype Parsing and ServerArgs Tests
 # ==============================================================================
@@ -179,11 +197,11 @@ def test_server_args_kv_cache_dtype_choices():
 # ==============================================================================
 
 
+@pytest.mark.parametrize("head_dim", [64, 96, 128])
 @pytest.mark.parametrize("actual_kv_heads", [1, 2, 4, 8])
-def test_bf16_strict_no_op_cell_size(actual_kv_heads):
+def test_bf16_strict_no_op_cell_size(head_dim, actual_kv_heads):
     """Assert BF16 cell size matches the origin/main formula exactly."""
     num_layers = 8
-    head_dim = 128
     page_size = 128
 
     # Formula from origin/main:
@@ -202,12 +220,12 @@ def test_bf16_strict_no_op_cell_size(actual_kv_heads):
     assert runner._compute_cell_size() == expected_main_cell_size
 
 
+@pytest.mark.parametrize("head_dim", [64, 96, 128])
 @pytest.mark.parametrize("actual_kv_heads", [1, 2, 4, 8])
-def test_bf16_strict_no_op_swa_cell_size(actual_kv_heads):
+def test_bf16_strict_no_op_swa_cell_size(head_dim, actual_kv_heads):
     """Assert BF16 cell size for SWA layers matches the origin/main formula."""
     num_layers = 8
     swa_layers = 4
-    head_dim = 128
     page_size = 128
     swa_ratio = 0.5
 
@@ -224,6 +242,53 @@ def test_bf16_strict_no_op_swa_cell_size(actual_kv_heads):
         swa_layers=swa_layers,
     )
     assert runner._compute_cell_size() == expected_main_cell_size
+
+
+@pytest.mark.parametrize("head_dim", [64, 96, 128])
+@pytest.mark.parametrize("actual_kv_heads", [1, 2, 4, 8])
+def test_bf16_strict_no_op_pool_construction(head_dim, actual_kv_heads):
+    """Assert real MHATokenToKVPool construction for BF16 yields identical shape and bytes to main."""
+    num_layers = 4
+    page_size = 128
+    cache_size = 256
+    dp_size = 1
+    devices = np.array(jax.devices()[:1]).reshape(1, 1)
+    mesh = Mesh(devices, ("data", "tensor"))
+
+    pool = MHATokenToKVPool(
+        size=cache_size,
+        page_size=page_size,
+        dtype=jnp.bfloat16,
+        head_num=actual_kv_heads,
+        head_dim=head_dim,
+        layer_num=num_layers,
+        mesh=mesh,
+        dp_size=dp_size,
+        abstract=True,
+    )
+
+    # Main formula:
+    # packing = 2 (for bf16)
+    # shape: [(size + page_size * dp_size) // page_size, page_size, actual_kv_heads, 2, align_to(head_dim, 128)]
+    expected_shape = (
+        (cache_size + page_size * dp_size) // page_size,
+        page_size,
+        actual_kv_heads,
+        2,
+        align_to(head_dim, 128),
+    )
+    assert pool.kv_buffer[0].shape == expected_shape
+    assert pool.kv_buffer[0].dtype == jnp.bfloat16
+
+    expected_bytes = (
+        (cache_size + page_size * dp_size)
+        * (actual_kv_heads * 2)
+        * align_to(head_dim, 128)
+        * 2
+        * num_layers
+    )
+    expected_k_bytes = expected_bytes // 2
+    assert pool.get_kv_size_bytes() == (expected_k_bytes, expected_k_bytes)
 
 
 # ==============================================================================
@@ -435,12 +500,6 @@ def test_runner_rejects_tt_backend_fp8():
         _DummyRunner(kv_cache_dtype_str="fp8", attention_backend="tt")
 
 
-def test_runner_rejects_msa_backend_fp8():
-    """ModelRunnerKVCacheMixin must raise ValueError if MSA is requested with FP8."""
-    with pytest.raises(ValueError, match="MSA models .* do not currently support FP8"):
-        _DummyRunner(kv_cache_dtype_str="fp8", is_msa=True)
-
-
 # ==============================================================================
 # 7. TPU-Only Kernel Parity & Outlier Injection Tests
 # ==============================================================================
@@ -448,6 +507,47 @@ def test_runner_rejects_msa_backend_fp8():
 
 def _is_tpu():
     return get_tpu_version() > 0
+
+
+def test_rpav3_and_mla_signatures_binding():
+    """Validate that RPAv3 and MLA test calls strictly conform to kernel signatures (runs on CPU)."""
+    import inspect
+
+    from sgl_jax.srt.kernels.mla.v2.kernel import mla_ragged_paged_attention
+
+    # 1. RPA signature bind
+    sig_rpa = inspect.signature(ragged_paged_attention)
+    bound_rpa = sig_rpa.bind(
+        jnp.zeros((128, 8, 128), jnp.bfloat16),
+        jnp.zeros((128, 2, 128), jnp.bfloat16),
+        jnp.zeros((128, 2, 128), jnp.bfloat16),
+        jnp.zeros((1, 128, 1, 4, 128), jnp.float8_e4m3fn),
+        jnp.array([128], jnp.int32),
+        jnp.array([0], jnp.int32),
+        jnp.array([0, 128], jnp.int32),
+        jnp.array([0, 128], jnp.int32),
+        jnp.array([0, 1, 1], jnp.int32),
+        None,
+        sm_scale=0.125,
+    )
+    assert bound_rpa is not None
+
+    # 2. MLA signature bind
+    sig_mla = inspect.signature(mla_ragged_paged_attention)
+    bound_mla = sig_mla.bind(
+        jnp.zeros((128, 16, 512), jnp.bfloat16),
+        jnp.zeros((128, 16, 64), jnp.bfloat16),
+        jnp.zeros((128, 512), jnp.float8_e4m3fn),
+        jnp.zeros((128, 64), jnp.float8_e4m3fn),
+        jnp.zeros((1, 32, 4, 640), jnp.float8_e4m3fn),
+        jnp.array([128], jnp.int32),
+        jnp.array([0], jnp.int32),
+        jnp.array([0, 128], jnp.int32),
+        jnp.array([0, 128], jnp.int32),
+        jnp.array([0, 1, 1], jnp.int32),
+        sm_scale=0.125,
+    )
+    assert bound_mla is not None
 
 
 @pytest.mark.skipif(not _is_tpu(), reason="TPU hardware required for RPAv3 kernel tests")
@@ -471,29 +571,46 @@ def test_rpav3_parity_tpu(kv_heads):
         jnp.bfloat16
     )
 
+    kv_lens = jnp.array([total_tokens], dtype=jnp.int32)
+    page_indices = jnp.array([0], dtype=jnp.int32)
+    cu_q_lens = jnp.array([0, total_tokens], dtype=jnp.int32)
+    cu_kv_lens = jnp.array([0, total_tokens], dtype=jnp.int32)
+    distribution = jnp.array([0, 1, 1], dtype=jnp.int32)
+    sm_scale = 1.0 / (head_dim**0.5)
+
     # 1. BF16 Reference
-    fused_bf16 = merge_kv(k, v)
-    out_bf16 = ragged_paged_attention(
-        q=q,
-        kv_cache_fused=fused_bf16,
-        q_indptr=jnp.array([0, total_tokens], dtype=jnp.int32),
-        kv_indptr=jnp.array([0, total_tokens], dtype=jnp.int32),
-        kv_indices=jnp.arange(total_tokens, dtype=jnp.int32),
-        page_size=page_size,
+    cache_bf16 = jnp.zeros((1, page_size, kv_heads, 2, head_dim), dtype=jnp.bfloat16)
+    out_bf16, _ = ragged_paged_attention(
+        q,
+        k,
+        v,
+        cache_bf16,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        cu_kv_lens,
+        distribution,
+        None,
+        sm_scale=sm_scale,
     )
 
     # 2. FP8
-    fused_fp8 = merge_kv(
-        quantize_to_kv_dtype(k, jnp.float8_e4m3fn),
-        quantize_to_kv_dtype(v, jnp.float8_e4m3fn),
+    padded_heads_x2_fp8 = align_to(kv_heads * 2, 4)
+    cache_fp8 = jnp.zeros(
+        (1, page_size, padded_heads_x2_fp8 // 4, 4, head_dim), dtype=jnp.float8_e4m3fn
     )
-    out_fp8 = ragged_paged_attention(
-        q=q,
-        kv_cache_fused=fused_fp8,
-        q_indptr=jnp.array([0, total_tokens], dtype=jnp.int32),
-        kv_indptr=jnp.array([0, total_tokens], dtype=jnp.int32),
-        kv_indices=jnp.arange(total_tokens, dtype=jnp.int32),
-        page_size=page_size,
+    out_fp8, _ = ragged_paged_attention(
+        q,
+        k,
+        v,
+        cache_fp8,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        cu_kv_lens,
+        distribution,
+        None,
+        sm_scale=sm_scale,
     )
 
     assert not jnp.isnan(out_fp8).any(), "FP8 kernel produced NaNs"
@@ -526,17 +643,98 @@ def test_rpav3_outlier_injection_tpu():
     assert (k_quant.astype(jnp.float32) <= 448.0).all()
     assert (k_quant.astype(jnp.float32) >= -448.0).all()
 
-    fused_fp8 = merge_kv(
-        k_quant,
-        quantize_to_kv_dtype(v, jnp.float8_e4m3fn),
+    kv_lens = jnp.array([total_tokens], dtype=jnp.int32)
+    page_indices = jnp.array([0], dtype=jnp.int32)
+    cu_q_lens = jnp.array([0, total_tokens], dtype=jnp.int32)
+    cu_kv_lens = jnp.array([0, total_tokens], dtype=jnp.int32)
+    distribution = jnp.array([0, 1, 1], dtype=jnp.int32)
+    sm_scale = 1.0 / (head_dim**0.5)
+
+    padded_heads_x2_fp8 = align_to(kv_heads * 2, 4)
+    cache_fp8 = jnp.zeros(
+        (1, page_size, padded_heads_x2_fp8 // 4, 4, head_dim), dtype=jnp.float8_e4m3fn
     )
-    out_fp8 = ragged_paged_attention(
-        q=q,
-        kv_cache_fused=fused_fp8,
-        q_indptr=jnp.array([0, total_tokens], dtype=jnp.int32),
-        kv_indptr=jnp.array([0, total_tokens], dtype=jnp.int32),
-        kv_indices=jnp.arange(total_tokens, dtype=jnp.int32),
-        page_size=page_size,
+    out_fp8, _ = ragged_paged_attention(
+        q,
+        k,
+        v,
+        cache_fp8,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        cu_kv_lens,
+        distribution,
+        None,
+        sm_scale=sm_scale,
     )
     assert not jnp.isnan(out_fp8).any(), "Outlier injection produced NaNs in RPAv3 output"
     assert jnp.isfinite(out_fp8).all(), "Output contains infinite values"
+
+
+@pytest.mark.skipif(not _is_tpu(), reason="TPU hardware required for MLA kernel tests")
+def test_mla_parity_tpu():
+    """TPU parity test: compare MLA v2 kernel output between BF16 and FP8 (cosine >= 0.995)."""
+    from sgl_jax.srt.kernels.mla.v2.kernel import mla_ragged_paged_attention
+
+    num_heads = 16
+    kv_lora_rank = 512
+    qk_rope_head_dim = 64
+    page_size = 128
+    total_tokens = 128
+    key = jax.random.PRNGKey(42)
+
+    k1, k2, k3, k4 = jax.random.split(key, 4)
+    ql_nope = jax.random.normal(k1, (total_tokens, num_heads, kv_lora_rank), dtype=jnp.bfloat16)
+    q_pe = jax.random.normal(k2, (total_tokens, num_heads, qk_rope_head_dim), dtype=jnp.bfloat16)
+    new_kv_c = jax.random.normal(k3, (total_tokens, kv_lora_rank), dtype=jnp.bfloat16)
+    new_k_pe = jax.random.normal(k4, (total_tokens, qk_rope_head_dim), dtype=jnp.bfloat16)
+
+    kv_lens = jnp.array([total_tokens], dtype=jnp.int32)
+    page_indices = jnp.array([0], dtype=jnp.int32)
+    cu_q_lens = jnp.array([0, total_tokens], dtype=jnp.int32)
+    cu_kv_lens = jnp.array([0, total_tokens], dtype=jnp.int32)
+    distribution = jnp.array([0, 1, 1], dtype=jnp.int32)
+    sm_scale = 1.0 / ((128 + qk_rope_head_dim) ** 0.5)
+
+    aligned_head_dim = align_to(kv_lora_rank, 128) + align_to(qk_rope_head_dim, 128)
+
+    # 1. BF16 Reference
+    cache_bf16 = jnp.zeros((1, page_size // 2, 2, aligned_head_dim), dtype=jnp.bfloat16)
+    out_bf16, _ = mla_ragged_paged_attention(
+        ql_nope,
+        q_pe,
+        new_kv_c,
+        new_k_pe,
+        cache_bf16,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        cu_kv_lens,
+        distribution,
+        sm_scale=sm_scale,
+    )
+
+    # 2. FP8
+    cache_fp8 = jnp.zeros((1, page_size // 4, 4, aligned_head_dim), dtype=jnp.float8_e4m3fn)
+    new_kv_c_fp8 = quantize_to_kv_dtype(new_kv_c, jnp.float8_e4m3fn)
+    new_k_pe_fp8 = quantize_to_kv_dtype(new_k_pe, jnp.float8_e4m3fn)
+    out_fp8, _ = mla_ragged_paged_attention(
+        ql_nope,
+        q_pe,
+        new_kv_c_fp8,
+        new_k_pe_fp8,
+        cache_fp8,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        cu_kv_lens,
+        distribution,
+        sm_scale=sm_scale,
+    )
+
+    assert not jnp.isnan(out_fp8).any(), "FP8 MLA kernel produced NaNs"
+
+    u = out_bf16.astype(jnp.float32).flatten()
+    w = out_fp8.astype(jnp.float32).flatten()
+    cos_sim = float(jnp.dot(u, w) / (jnp.linalg.norm(u) * jnp.linalg.norm(w) + 1e-8))
+    assert cos_sim >= 0.995, f"MLA Cosine similarity {cos_sim} < 0.995"

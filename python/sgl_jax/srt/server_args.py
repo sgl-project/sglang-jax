@@ -961,7 +961,7 @@ class ServerArgs:
             type=str,
             default=ServerArgs.kv_cache_dtype,
             choices=["auto", "bf16", "bfloat16", "fp8", "fp8_e4m3", "fp8_e5m2"],
-            help='Data type for kv cache storage. "auto" will use model data type. "fp8_e4m3" and "fp8_e5m2" (or alias "fp8") are supported on TPU v6e/v7x and CUDA 11.8+.',
+            help='Data type for kv cache storage. "auto" will use model data type. "fp8_e4m3" and "fp8_e5m2" (or alias "fp8") are validated on TPU v7x, with fp8_e4m3 recommended.',
         )
 
         # Memory and scheduling
