@@ -1,9 +1,11 @@
 """TT recurrent attention: explicit kernels with scheduler-owned state slots."""
 
+import functools
 from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.hardware_backend.tt.attention import ops
@@ -69,74 +71,41 @@ class TTGDNAttnBackend(GDNAttnBackend):
             raise NotImplementedError("TT GDN recurrent snapshots are not yet supported")
         return meta, meta.recurrent_indices, meta.has_initial_state
 
-    def _qkv(self, mixed):
-        # Runs on one device's heads inside shard_map.
+    def _local_heads(self):
         tp = self.mesh.shape["tensor"]
-        key_dim, num_k_heads, num_v_heads = (
-            self.key_dim // tp,
-            self.num_k_heads // tp,
-            self.num_v_heads // tp,
-        )
+        return self.num_k_heads // tp, self.num_v_heads // tp
+
+    def _qkv(self, mixed):
+        # Runs on one device's heads. The kernels let each key head serve its
+        # group of value heads, so q and k are not repeated.
+        num_k_heads, num_v_heads = self._local_heads()
         shape = mixed.shape[:-1]
-        # Q and K use the same normalization and head expansion. Process them
-        # together to avoid launching the identical operation chain twice.
+        key_dim = num_k_heads * self.head_k_dim
         qk = mixed[..., : 2 * key_dim].reshape(*shape, 2 * num_k_heads, self.head_k_dim)
         v = mixed[..., 2 * key_dim :].reshape(*shape, num_v_heads, self.head_v_dim)
-        qk = jnp.repeat(_l2norm(qk.astype(jnp.float32)), num_v_heads // num_k_heads, axis=-2)
-        q, k = qk[..., :num_v_heads, :], qk[..., num_v_heads:, :]
+        qk = _l2norm(qk.astype(jnp.float32))
+        q, k = qk[..., :num_k_heads, :], qk[..., num_k_heads:, :]
         return q * self.head_k_dim**-0.5, k, v.astype(jnp.float32)
 
-    def _per_device(self, local, extra_specs):
-        # Like GDNAttnBackend: each device runs the kernels on its heads.
-        in_specs = (
-            P("data", "tensor"),  # mixed_qkv
-            P("data", "tensor", None),  # conv_state
-            P("data", "tensor", None, None),  # recurrent_state
-            P("data", "tensor"),  # b
-            P("data", "tensor"),  # a
-            P("tensor", None),  # conv1d weight
-            P("tensor"),  # A_log
-            P("tensor"),  # dt_bias
-        ) + extra_specs
-        out_specs = (
-            P("data", "tensor", None),  # out
-            P("data", "tensor", None),  # new_conv_state
-            P("data", "tensor", None, None),  # new_rec_state
-        )
+    def _per_device(self, fn, *args):
+        # Like GDNAttnBackend: the kernels run on each device's heads. The
+        # first eight arguments are mixed_qkv, the two state pools, b, a, the
+        # conv1d weight, A_log and dt_bias; the rest are per request.
+        heads = (P("data", "tensor"), P("data", "tensor", None), P("data", "tensor", None, None))
+        heads += (P("data", "tensor"),) * 2 + (P("tensor", None), P("tensor"), P("tensor"))
         return jax.shard_map(
-            local, mesh=self.mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False
-        )
+            fn,
+            mesh=self.mesh,
+            in_specs=heads + (P("data"),) * (len(args) - len(heads)),
+            out_specs=heads[:1] + (P("data", "tensor", None),) + heads[2:3],
+            check_vma=False,
+        )(*args)
 
-    def forward_decode(
-        self, mixed_qkv, conv_state_in, recurrent_state_in, b, a, conv1d_weight, A_log, dt_bias
-    ):
+    def forward_decode(self, *args):
         _, indices, initial = self._metadata()
+        return self._per_device(self._decode, *args, indices, initial)
 
-        def local(mixed_qkv, conv_state, recurrent_state, b, a, weight, A_log, dt_bias, indices, initial):
-            new_conv, conv_out = ops.causal_conv1d_update(
-                conv_state, mixed_qkv, weight, indices, initial
-            )
-            # The kernel reads q, k and v as heads of the flat convolution
-            # output, normalizes and scales q and k like _qkv does, and lets
-            # each key head serve its group of value heads.
-            num_k_heads = self.num_k_heads // self.mesh.shape["tensor"]
-            mixed = conv_out.astype(jnp.float32)
-            new_rec, out = ops.gated_delta_decode(
-                recurrent_state, mixed, mixed, mixed, b, a, A_log, dt_bias, indices, initial,
-                key_head_offset=num_k_heads,
-                value_head_offset=2 * num_k_heads,
-                num_key_heads=num_k_heads,
-                normalize_eps=1e-6,
-                query_scale=self.head_k_dim**-0.5,
-            )
-            return out.astype(mixed_qkv.dtype), new_conv, new_rec
-
-        return self._per_device(local, (P("data"), P("data")))(
-            mixed_qkv, conv_state_in, recurrent_state_in, b, a, conv1d_weight, A_log, dt_bias,
-            indices, initial,
-        )
-
-    def forward_extend(
+    def _decode(
         self,
         mixed_qkv,
         conv_state_in,
@@ -146,25 +115,50 @@ class TTGDNAttnBackend(GDNAttnBackend):
         conv1d_weight,
         A_log,
         dt_bias,
-        seq_lens,
+        indices,
+        initial,
     ):
+        new_conv, conv_out = ops.causal_conv1d_update(
+            conv_state_in, mixed_qkv, conv1d_weight, indices, initial
+        )
+        # The kernel reads q, k and v as heads of the flat convolution output
+        # and normalizes and scales q and k like _qkv does.
+        num_k_heads, _ = self._local_heads()
+        mixed = conv_out.astype(jnp.float32)
+        new_rec, out = ops.gated_delta_decode(
+            recurrent_state_in, mixed, mixed, mixed, b, a, A_log, dt_bias, indices, initial,
+            key_head_offset=np.uint32(num_k_heads),
+            value_head_offset=np.uint32(2 * num_k_heads),
+            num_key_heads=np.uint32(num_k_heads),
+            normalize_eps=np.float32(1e-6),
+            query_scale=np.float32(self.head_k_dim**-0.5),
+        )
+        return out.astype(mixed_qkv.dtype), new_conv, new_rec
+
+    def forward_extend(self, *args, seq_lens):
         del seq_lens
         meta, indices, initial = self._metadata()
         batch = meta.cu_q_lens.shape[0] - 1
-        max_prefill_len = getattr(meta, "max_prefill_len", 0)
-        return self._per_device(
-            lambda *args: self._extend_local(batch, max_prefill_len, *args),
-            (P("data"), P("data"), P("data")),
-        )(
-            mixed_qkv, conv_state_in, recurrent_state_in, b, a, conv1d_weight, A_log, dt_bias,
-            meta.cu_q_lens, indices[:batch], initial[:batch],
-        )
+        extend = functools.partial(self._extend, getattr(meta, "max_prefill_len", 0))
+        return self._per_device(extend, *args, indices[:batch], initial[:batch], meta.cu_q_lens)
 
-    def _extend_local(
-        self, batch, max_prefill_len, mixed_qkv, conv_state_in, recurrent_state_in, b, a,
-        conv1d_weight, A_log, dt_bias, cu_q_lens, indices, initial,
+    def _extend(
+        self,
+        max_prefill_len,
+        mixed_qkv,
+        conv_state_in,
+        recurrent_state_in,
+        b,
+        a,
+        conv1d_weight,
+        A_log,
+        dt_bias,
+        indices,
+        initial,
+        cu_q_lens,
     ):
         count = mixed_qkv.shape[0]
+        batch = cu_q_lens.shape[0] - 1
         starts = cu_q_lens[:-1]
         lengths = jnp.diff(cu_q_lens)
         width = max_prefill_len or count
@@ -214,7 +208,7 @@ class TTGDNAttnBackend(GDNAttnBackend):
         beta, gate = (jnp.where(valid[..., None], x, 0) for x in (beta, gate))
         state, out = ops.gated_delta_rule(q, k, v, gate, beta, gather(recurrent_state_in))
         new_rec = ops.state_pool_update(recurrent_state_in, indices, state)
-        out = out.reshape(-1, self.num_v_heads // self.mesh.shape["tensor"], self.head_v_dim)
+        out = out.reshape(-1, *out.shape[-2:])
         if batch > 1:
             token = jnp.arange(count)
             sequence = jnp.searchsorted(cu_q_lens[1:], token, side="right")

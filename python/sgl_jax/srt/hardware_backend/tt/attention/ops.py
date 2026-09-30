@@ -108,41 +108,13 @@ def causal_conv1d_update(state, value, weight, indices, initial):
     )
 
 
-def gated_delta_decode(
-    state,
-    q,
-    k,
-    v,
-    b,
-    a,
-    A_log,
-    dt_bias,
-    indices,
-    initial,
-    *,
-    query_head_offset=0,
-    key_head_offset=0,
-    value_head_offset=0,
-    num_key_heads=0,
-    normalize_eps=None,
-    query_scale=1.0,
-):
+def gated_delta_decode(state, q, k, v, b, a, A_log, dt_bias, indices, initial, **attributes):
     """One recurrent step; returns the new state and the [T, H, D] output.
 
-    q, k and v are [T, heads, D], or flat [T, heads * D], possibly one tensor,
-    starting at the given head offsets. Value head h uses query/key head
-    h // (H // num_key_heads); num_key_heads 0 means all heads of q. With
-    normalize_eps, the kernel L2-normalizes q and k and scales q by query_scale.
+    q, k and v are [T, heads, D], or heads of flat [T, heads * D] tensors,
+    selected by the kernel's optional attributes (head offsets, num_key_heads,
+    normalize_eps and query_scale).
     """
-    attributes = {
-        "query_head_offset": np.uint32(query_head_offset),
-        "key_head_offset": np.uint32(key_head_offset),
-        "value_head_offset": np.uint32(value_head_offset),
-        "num_key_heads": np.uint32(num_key_heads),
-        "query_scale": np.float32(query_scale),
-    }
-    if normalize_eps is not None:
-        attributes["normalize_eps"] = np.float32(normalize_eps)
     return _recurrent_call(
         "tt.gated_delta_decode",
         state,
