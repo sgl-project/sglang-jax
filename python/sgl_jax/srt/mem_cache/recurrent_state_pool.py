@@ -104,6 +104,14 @@ class RecurrentStatePool:
             temporal_dtype = state_dtype.temporal
         if conv_dtype is None:
             conv_dtype = state_dtype.conv
+        if temporal_dtype in (jnp.float8_e4m3fn, jnp.float8_e5m2) or conv_dtype in (
+            jnp.float8_e4m3fn,
+            jnp.float8_e5m2,
+        ):
+            raise ValueError(
+                f"RecurrentStatePool does not support FP8 state ({temporal_dtype=}, {conv_dtype=}). "
+                "State must remain BF16/FP32."
+            )
         self.temporal_dtype = temporal_dtype
         self.conv_dtype = conv_dtype
 
