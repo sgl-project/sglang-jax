@@ -5,7 +5,6 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.hardware_backend.tt.attention import ops
@@ -111,11 +110,11 @@ class TTGDNAttnBackend(GDNAttnBackend):
         qkv = conv_out.astype(jnp.float32)
         new_rec, out = ops.gated_delta_decode(
             recurrent_state_in, qkv, qkv, qkv, b, a, A_log, dt_bias, indices, initial,
-            key_head_offset=np.uint32(heads),
-            value_head_offset=np.uint32(2 * heads),
-            num_key_heads=np.uint32(heads),
-            normalize_eps=np.float32(1e-6),
-            query_scale=np.float32(self.head_k_dim**-0.5),
+            key_head_offset=heads,
+            value_head_offset=2 * heads,
+            num_key_heads=heads,
+            normalize_eps=1e-6,
+            query_scale=self.head_k_dim**-0.5,
         )
         return out.astype(mixed_qkv.dtype), new_conv, new_rec
 
