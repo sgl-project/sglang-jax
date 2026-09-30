@@ -10,7 +10,8 @@ just ``LinearBase``'s matmul, so tests focus on:
 * default no-bias behaviour matches ``LinearBase``;
 * construction rejects component sizes that don't divide TP — the
   divisibility guard the per-rank block-concat layout depends on;
-* ``stripe`` + ``split`` recover each component's output, locally.
+* ``stripe_merged_weight`` + ``split_merged_output`` recover each
+  component's output locally, also after quantization replaces the layer.
 
 Run with:
     JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=8 \\
@@ -28,11 +29,18 @@ os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import nnx
 from jax.experimental import mesh_utils
 from jax.sharding import AxisType, Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.layers.linear import MergedColumnParallelLinear
+from sgl_jax.srt.layers.linear import (
+    MergedColumnParallelLinear,
+    QuantizedLinear,
+    split_merged_output,
+    stripe_merged_weight,
+)
+from sgl_jax.srt.utils.quantization.quantization_utils import apply_linear_quantization
 
 
 def _mesh_1x1():
@@ -118,11 +126,53 @@ class MergedColumnParallelSplitTest(unittest.TestCase):
                 input_size=weight.shape[0], output_sizes=sizes, mesh=mesh, params_dtype=jnp.float32
             )
             layer.weight.value = jax.device_put(
-                layer.stripe(weight), NamedSharding(mesh, P(None, "tensor"))
+                stripe_merged_weight(weight, sizes, tp), NamedSharding(mesh, P(None, "tensor"))
             )
-            run = jax.jit(lambda x: layer.split(layer(x)[0]))
+            run = jax.jit(lambda x: split_merged_output(layer(x)[0], sizes, mesh))
             x = jax.device_put(x, NamedSharding(mesh, P("data", None)))
             return run(x), run.lower(x).compile().as_text()
+
+    def test_split_after_quantization(self):
+        """Quantization replaces the layer with a ``QuantizedLinear``; its
+        output keeps the striped layout and splits the same way."""
+        sizes = [16, 16, 32]
+        rng = np.random.default_rng(0)
+        weight = rng.normal(size=(8, sum(sizes))).astype(np.float32)
+        x = rng.normal(size=(4, 8)).astype(np.float32)
+        expected = np.split(x @ weight, np.cumsum(sizes)[:-1], axis=-1)
+        mesh = _mesh_1xN(2)
+
+        class Block(nnx.Module):
+            def __init__(self):
+                self.proj = MergedColumnParallelLinear(
+                    input_size=8, output_sizes=sizes, mesh=mesh, params_dtype=jnp.float32
+                )
+
+        config = type("ModelConfig", (), {})()
+        config.quantization_config = type(
+            "QuantConfig",
+            (),
+            {
+                "get_linear_rules": staticmethod(
+                    lambda: [
+                        {"module_path": ".*", "weight_dtype": "int8", "activation_dtype": None}
+                    ]
+                ),
+                "ignored_layers": [],
+                "weight_block_size": None,
+            },
+        )()
+        with jax.set_mesh(mesh):
+            block = Block()
+            block.proj.weight.value = jax.device_put(
+                stripe_merged_weight(weight, sizes, 2), NamedSharding(mesh, P(None, "tensor"))
+            )
+            apply_linear_quantization(config, block)
+            self.assertIsInstance(block.proj, QuantizedLinear)
+            x = jax.device_put(x, NamedSharding(mesh, P("data", None)))
+            parts = jax.jit(lambda x: split_merged_output(block.proj(x)[0], sizes, mesh))(x)
+        for part, want in zip(parts, expected):
+            np.testing.assert_allclose(np.asarray(part, np.float32), want, rtol=0.05, atol=0.1)
 
 
 if __name__ == "__main__":

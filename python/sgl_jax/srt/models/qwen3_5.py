@@ -41,7 +41,12 @@ from sgl_jax.srt.eplb.expert_location import ExpertLocationMetadata
 from sgl_jax.srt.layers.embeddings import Embed, MRotaryEmbedding, ParallelLMHead
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 from sgl_jax.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
-from sgl_jax.srt.layers.linear import LinearBase, MergedColumnParallelLinear
+from sgl_jax.srt.layers.linear import (
+    LinearBase,
+    MergedColumnParallelLinear,
+    split_merged_output,
+    stripe_merged_weight,
+)
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import GateLogit, TopK
 from sgl_jax.srt.layers.radix_attention import RadixAttention
@@ -236,10 +241,12 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         self.key_dim = self.num_k_heads * self.head_k_dim  # 2048
         self.value_dim = self.num_v_heads * self.head_v_dim  # 4096
         conv_dim = 2 * self.key_dim + self.value_dim  # 8192 = [Q|K|V]
+        self.qkvz_sizes = (self.key_dim, self.key_dim, self.value_dim, self.value_dim)
+        self.ba_sizes = (self.num_v_heads, self.num_v_heads)
 
         self.in_proj_qkvz = MergedColumnParallelLinear(
             input_size=self.hidden_size,
-            output_sizes=(self.key_dim, self.key_dim, self.value_dim, self.value_dim),
+            output_sizes=self.qkvz_sizes,
             mesh=mesh,
             use_bias=False,
             params_dtype=dtype,
@@ -247,7 +254,7 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         )
         self.in_proj_ba = MergedColumnParallelLinear(
             input_size=self.hidden_size,
-            output_sizes=(self.num_v_heads, self.num_v_heads),
+            output_sizes=self.ba_sizes,
             mesh=mesh,
             use_bias=False,
             params_dtype=dtype,
@@ -325,8 +332,8 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         qkvz, _ = self.in_proj_qkvz(hidden_states)  # [T, 2*key_dim + 2*value_dim]
         ba, _ = self.in_proj_ba(hidden_states)  # [T, 2*num_v_heads]
 
-        q, k, v, z = self.in_proj_qkvz.split(qkvz)
-        b, a = self.in_proj_ba.split(ba)
+        q, k, v, z = split_merged_output(qkvz, self.qkvz_sizes, self.mesh)
+        b, a = split_merged_output(ba, self.ba_sizes, self.mesh)
 
         core_out, attn_state = self.self_attn(forward_batch, q, k, v, a, b, recurrent_state_pool)
         # core_out: [T, value_dim] -> per-head RMSNorm + silu(z) gate.
@@ -682,9 +689,13 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         conv = self._stripe_conv(conv.reshape(conv.shape[0], conv.shape[-1]), gdn, tp)
         return (
             self._put(
-                gdn.in_proj_qkvz.stripe(np.concatenate((qkv, z), axis=0).T), (None, "tensor")
+                stripe_merged_weight(np.concatenate((qkv, z), axis=0).T, gdn.qkvz_sizes, tp),
+                (None, "tensor"),
             ),
-            self._put(gdn.in_proj_ba.stripe(np.concatenate((b, a), axis=0).T), (None, "tensor")),
+            self._put(
+                stripe_merged_weight(np.concatenate((b, a), axis=0).T, gdn.ba_sizes, tp),
+                (None, "tensor"),
+            ),
             self._put(conv, ("tensor", None)),
         )
 
