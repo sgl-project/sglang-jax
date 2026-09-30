@@ -17,10 +17,10 @@ Key conventions confirmed against the upstream torch reference
 * MoE mirrors qwen2_moe: ``GateLogit`` + ``TopK`` + ``FusedEPMoE`` routed path,
   plus a dense ``Qwen2MoeMLP`` shared expert gated by ``sigmoid(shared_gate)``.
 * GDN fuses HF's 4 in-proj keys into 2 JAX projections
-  (``in_proj_qkvz`` = [Q|K|V|Z], ``in_proj_ba`` = [B|A]), stored rank-major
-  so each TP rank's column shard holds its own heads' [q|k|v|z] and [b|a];
-  slicing q/k/v/z/a/b to ``P("data","tensor")`` is then local (the GDN
-  backend's ``shard_map`` contract). The conv1d
+  (``in_proj_qkvz`` = [Q|K|V|Z], ``in_proj_ba`` = [B|A]) as
+  ``MergedColumnParallelLinear``s, so each TP rank holds its own heads of each
+  component and splits q/k/v/z/a/b locally (the GDN backend's ``shard_map``
+  contract). The conv1d
   weight is stripe-rearranged at load time (see the weight loader in P3).
 """
 
@@ -41,7 +41,7 @@ from sgl_jax.srt.eplb.expert_location import ExpertLocationMetadata
 from sgl_jax.srt.layers.embeddings import Embed, MRotaryEmbedding, ParallelLMHead
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 from sgl_jax.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
-from sgl_jax.srt.layers.linear import LinearBase
+from sgl_jax.srt.layers.linear import LinearBase, MergedColumnParallelLinear
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import GateLogit, TopK
 from sgl_jax.srt.layers.radix_attention import RadixAttention
@@ -235,26 +235,22 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
 
         self.key_dim = self.num_k_heads * self.head_k_dim  # 2048
         self.value_dim = self.num_v_heads * self.head_v_dim  # 4096
-        qkvz_out = 2 * self.key_dim + 2 * self.value_dim  # 12288 = [Q|K|V|Z]
-        ba_out = 2 * self.num_v_heads  # 64 = [B|A]
         conv_dim = 2 * self.key_dim + self.value_dim  # 8192 = [Q|K|V]
 
-        self.in_proj_qkvz = LinearBase(
+        self.in_proj_qkvz = MergedColumnParallelLinear(
             input_size=self.hidden_size,
-            output_size=qkvz_out,
+            output_sizes=(self.key_dim, self.key_dim, self.value_dim, self.value_dim),
             mesh=mesh,
             use_bias=False,
             params_dtype=dtype,
-            kernel_axes=(None, "tensor"),
             scope_name="in_proj_qkvz",
         )
-        self.in_proj_ba = LinearBase(
+        self.in_proj_ba = MergedColumnParallelLinear(
             input_size=self.hidden_size,
-            output_size=ba_out,
+            output_sizes=(self.num_v_heads, self.num_v_heads),
             mesh=mesh,
             use_bias=False,
             params_dtype=dtype,
-            kernel_axes=(None, "tensor"),
             scope_name="in_proj_ba",
         )
         # conv1d is a parameter container only (never called); weight laid out
@@ -305,15 +301,6 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
             dt_bias=self.dt_bias,
         )
 
-    def _split_rank_major(self, x, sizes):
-        """Split a rank-major [T, C0|C1|...] projection (each "tensor" shard holds
-        [c0_d|c1_d|...] of its own heads) into head-striped [T, Ci], locally."""
-        tp = self.mesh.shape["tensor"]
-        x = x.reshape(x.shape[0], tp, -1, out_sharding=NamedSharding(self.mesh, P("data", "tensor", None)))
-        parts = jnp.split(x, np.cumsum([size // tp for size in sizes])[:-1], axis=-1)
-        heads = NamedSharding(self.mesh, P("data", "tensor"))
-        return [part.reshape(x.shape[0], -1, out_sharding=heads) for part in parts]
-
     def _norm_gate(self, core_out, z):
         """Per-head RMSNorm over head_v_dim, then a silu(z) gate (silu, NOT the
         sigmoid of torch RMSNormGated). A method so the activation is unit-tested.
@@ -338,9 +325,8 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         qkvz, _ = self.in_proj_qkvz(hidden_states)  # [T, 2*key_dim + 2*value_dim]
         ba, _ = self.in_proj_ba(hidden_states)  # [T, 2*num_v_heads]
 
-        kd, vd = self.key_dim, self.value_dim
-        q, k, v, z = self._split_rank_major(qkvz, (kd, kd, vd, vd))
-        b, a = self._split_rank_major(ba, (self.num_v_heads,) * 2)
+        q, k, v, z = self.in_proj_qkvz.split(qkvz)
+        b, a = self.in_proj_ba.split(ba)
 
         core_out, attn_state = self.self_attn(forward_batch, q, k, v, a, b, recurrent_state_pool)
         # core_out: [T, value_dim] -> per-head RMSNorm + silu(z) gate.
@@ -694,20 +680,11 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         qkv, z, b, a, conv = inputs
         gdn = self.language_model.model.layers[layer_idx].self_attn
         conv = self._stripe_conv(conv.reshape(conv.shape[0], conv.shape[-1]), gdn, tp)
-        kd, vd, nv = gdn.key_dim, gdn.value_dim, gdn.num_v_heads
-        qkvz = self._rank_major(np.concatenate((qkv, z), axis=0).T, (kd, kd, vd, vd), tp)
-        ba = self._rank_major(np.concatenate((b, a), axis=0).T, (nv, nv), tp)
         return (
-            self._put(qkvz, (None, "tensor")),
-            self._put(ba, (None, "tensor")),
+            self._put(gdn.in_proj_qkvz.stripe(np.concatenate((qkv, z), axis=0).T), (None, "tensor")),
+            self._put(gdn.in_proj_ba.stripe(np.concatenate((b, a), axis=0).T), (None, "tensor")),
             self._put(conv, ("tensor", None)),
         )
-
-    @staticmethod
-    def _rank_major(weight, sizes, tp):
-        """[hidden, C0|C1|...] component-major -> rank-major [c0_d|c1_d|...] per rank d."""
-        parts = [np.split(p, tp, axis=1) for p in np.split(weight, np.cumsum(sizes)[:-1], axis=1)]
-        return np.concatenate([part[r] for r in range(tp) for part in parts], axis=1)
 
     @staticmethod
     def _stripe_conv(conv, gdn, tp):

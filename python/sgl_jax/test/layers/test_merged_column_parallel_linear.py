@@ -9,7 +9,8 @@ just ``LinearBase``'s matmul, so tests focus on:
 * the merged weight has shape ``[input_size, sum(output_sizes)]``;
 * default no-bias behaviour matches ``LinearBase``;
 * construction rejects component sizes that don't divide TP — the
-  divisibility guard the per-rank block-concat layout depends on.
+  divisibility guard the per-rank block-concat layout depends on;
+* ``stripe`` + ``split`` recover each component's output, locally.
 
 Run with:
     JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=8 \\
@@ -25,8 +26,11 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
 
 import jax
+import jax.numpy as jnp
+import numpy as np
 from jax.experimental import mesh_utils
-from jax.sharding import AxisType, Mesh
+from jax.sharding import AxisType, Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.linear import MergedColumnParallelLinear
 
@@ -84,6 +88,36 @@ class MergedColumnParallelInitTest(unittest.TestCase):
                     mesh=mesh,  # 3 % 2 == 1
                 )
             self.assertIn("divisible by TP=2", str(ctx.exception))
+
+
+class MergedColumnParallelSplitTest(unittest.TestCase):
+    def test_stripe_then_split_recovers_components(self):
+        """With a striped weight, ``split`` returns each component's output,
+        sharded over ``"tensor"``, without moving data between devices."""
+        sizes = [16, 16, 32]
+        rng = np.random.default_rng(0)
+        weight = rng.normal(size=(8, sum(sizes))).astype(np.float32)
+        x = rng.normal(size=(4, 8)).astype(np.float32)
+        expected = np.split(x @ weight, np.cumsum(sizes)[:-1], axis=-1)
+        for tp in (1, 2, 4):
+            with self.subTest(tp=tp):
+                mesh = _mesh_1xN(tp)
+                with jax.set_mesh(mesh):
+                    layer = MergedColumnParallelLinear(
+                        input_size=8, output_sizes=sizes, mesh=mesh, params_dtype=jnp.float32
+                    )
+                    layer.weight.value = jax.device_put(
+                        layer.stripe(weight), NamedSharding(mesh, P(None, "tensor"))
+                    )
+                    run = jax.jit(lambda x: layer.split(layer(x)[0]))
+                    x_dev = jax.device_put(x, NamedSharding(mesh, P("data", None)))
+                    hlo = run.lower(x_dev).compile().as_text()
+                    parts = run(x_dev)
+                for part, want in zip(parts, expected):
+                    self.assertEqual(part.sharding.spec, P("data", "tensor"))
+                    np.testing.assert_allclose(np.asarray(part), want, rtol=1e-5, atol=1e-5)
+                for collective in ("all-gather", "all-to-all", "collective-permute"):
+                    self.assertNotIn(collective, hlo)
 
 
 if __name__ == "__main__":

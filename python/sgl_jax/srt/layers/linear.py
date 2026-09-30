@@ -3,6 +3,7 @@ from collections.abc import Sequence
 from functools import partial
 
 import jax
+import numpy as np
 from flax import nnx
 from jax import lax
 from jax import numpy as jnp
@@ -193,6 +194,30 @@ class MergedColumnParallelLinear(LinearBase):
             kernel_axes=(None, "tensor"),
             scope_name=scope_name,
         )
+
+    def split(self, out: jax.Array) -> list[jax.Array]:
+        """Split a merged output into its components, each sharded over
+        ``"tensor"`` like the output of a separate column-parallel layer.
+
+        Each device splits its own block, so no data moves between devices.
+        """
+        tp = self._mesh_tp_size(self.mesh)
+        lead = out.shape[:-1]
+        spec = ("data", *([None] * (out.ndim - 2)))
+        out = out.reshape(
+            *lead, tp, -1, out_sharding=NamedSharding(self.mesh, P(*spec, "tensor", None))
+        )
+        parts = jnp.split(out, np.cumsum([size // tp for size in self.output_sizes])[:-1], axis=-1)
+        sharding = NamedSharding(self.mesh, P(*spec, "tensor"))
+        return [part.reshape(*lead, -1, out_sharding=sharding) for part in parts]
+
+    def stripe(self, weight: np.ndarray) -> np.ndarray:
+        """Rearrange a host ``[input_size, sum(output_sizes)]`` weight from
+        ``[comp_0 | comp_1 | ...]`` into the per-device block-concat layout."""
+        tp = self._mesh_tp_size(self.mesh)
+        splits = np.cumsum(self.output_sizes)[:-1]
+        parts = [np.split(part, tp, axis=1) for part in np.split(weight, splits, axis=1)]
+        return np.concatenate([part[rank] for rank in range(tp) for part in parts], axis=1)
 
 
 class QuantizedLinear(nnx.Module):
