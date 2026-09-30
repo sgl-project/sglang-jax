@@ -10,126 +10,35 @@ import numpy as np
 from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
-from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.kernels.hca.attention import INERT_QUERY_OFFSET
-from sgl_jax.srt.kernels.hca.hca import HCAMetadata, fused_projection_weight, hca_step
-from sgl_jax.srt.kernels.hca.tuned_block_sizes import (
-    HCAKernelSchedule,
-    get_hca_kernel_schedule,
-)
-from sgl_jax.srt.layers.attention.base_attn_backend import (
-    AttentionBackend,
-    AttentionBackendMetadata,
+from sgl_jax.srt.kernels.hca.hca import HCAMetadata
+from sgl_jax.srt.kernels.hca.tuned_block_sizes import get_hca_kernel_schedule
+from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
+from sgl_jax.srt.layers.attention.dsv4.hca import DeepseekV4HCABackendMixin
+from sgl_jax.srt.layers.attention.hca_execution import run_hca
+from sgl_jax.srt.layers.attention.hca_metadata import (
+    _BOUNDARY_FLOOR,
+    _COMPRESSED_TABLE_FLOOR,
+    _DECODE_IDS_FLOOR,
+    _WINDOW_TABLE_FLOOR,
+    HCABackendMetadata,
+    _bucket_capacity,
+    _bucket_max_queries,
+    _pad_capacity,
+    _query_schedule,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
-from sgl_jax.srt.utils.jax_utils import (
-    device_array,
-    is_tpu_runtime,
-    packed_device_array,
-)
+from sgl_jax.srt.utils.jax_utils import device_array
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
     from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-@register_pytree_node_class
 @dataclass
-class HCABackendMetadata(AttentionBackendMetadata):
-    """Per-forward HCA metadata plus static framework/optimization choices."""
-
-    kernel: HCAMetadata | None = None
-    schedule: HCAKernelSchedule | None = None
-    use_uniform_prefill_fast_path: bool = False
-
-    def tree_flatten(self):
-        return (self.kernel,), (self.schedule, self.use_uniform_prefill_fast_path)
-
-    @classmethod
-    def tree_unflatten(cls, static_options, children):
-        schedule, use_uniform_prefill_fast_path = static_options
-        return cls(
-            kernel=children[0],
-            schedule=schedule,
-            use_uniform_prefill_fast_path=use_uniform_prefill_fast_path,
-        )
-
-
-# Minimum padded capacities: small floors stop tiny batches re-bucketing every
-# few steps, and the page-table floors hold one large batch's tables.
-_DECODE_IDS_FLOOR = 8
-_BOUNDARY_FLOOR = 8
-_WINDOW_TABLE_FLOOR = 512
-_COMPRESSED_TABLE_FLOOR = 64
-
-
-def _query_schedule(cu_q_lens: np.ndarray, query_block_size: int):
-    """Build execution-only query blocks after the platform schedule is known.
-
-    Returns possibly-empty arrays; ``get_forward_metadata`` pads them to stable
-    capacities."""
-    q_lens = np.diff(cu_q_lens).astype(np.int32)
-    block_counts = np.where(
-        q_lens == 1,
-        0,
-        (q_lens + query_block_size - 1) // query_block_size,
-    )
-    request_ids = np.repeat(np.arange(q_lens.size, dtype=np.int32), block_counts)
-    offsets = np.concatenate(
-        [
-            (
-                np.arange(0, int(q_len), query_block_size, dtype=np.int32)
-                if q_len != 1
-                else np.empty((0,), np.int32)
-            )
-            for q_len in q_lens
-        ]
-    )
-    return request_ids, offsets.astype(np.int32), np.flatnonzero(q_lens == 1).astype(np.int32)
-
-
-def _pad_capacity(values: np.ndarray, capacity: int, fill) -> np.ndarray:
-    """Right-pad to an exact batch-shape-derived capacity with an inert fill."""
-    values = np.asarray(values, np.int32)
-    if values.shape[0] > capacity:
-        raise ValueError(f"HCA metadata length {values.shape[0]} exceeds capacity {capacity}")
-    return np.pad(values, (0, capacity - values.shape[0]), constant_values=fill)
-
-
-def _bucket_capacity(length: int, floor: int, bound: int | None = None) -> int:
-    """Smallest power-of-two capacity covering ``length``, capped at ``bound``."""
-    capacity = floor
-    while capacity < length:
-        capacity *= 2
-    return capacity if bound is None else min(capacity, bound)
-
-
-def _bucket_max_queries(max_queries: int, floor: int) -> int:
-    """Bucket the per-request query capacity to a bounded ladder.
-
-    Decode (1) keeps its dedicated value; longer chunks round up onto powers of
-    two interleaved with 1.5x steps (..., 128, 192, 256, 384, ...), so a chunk
-    just past a power of two pays 1.5x KV staging instead of 2x.
-    """
-    if max_queries <= 1:
-        return max_queries
-    power = 1 << max((max_queries - 1).bit_length() - 1, 0)
-    bucket = power * 3 // 2 if max_queries <= power * 3 // 2 else power * 2
-    return max(floor, bucket)
-
-
-def _metadata_partition_spec(metadata: HCAMetadata) -> HCAMetadata:
-    """Every metadata leaf rides the leading data axis, like SGLang batch fields.
-
-    Derived rather than hand-listed so a new field cannot silently miss a spec.
-    """
-    return jax.tree.map(lambda _: P("data"), metadata)
-
-
-@dataclass
-class HCABackend(AttentionBackend):
-    """Run cache-aware HCA through the SGLang-JAX attention interface."""
+class HCABackend(AttentionBackend, DeepseekV4HCABackendMixin):
+    """HCA execution with legacy pools or request-owned V4 resources."""
 
     def __init__(
         self,
@@ -141,20 +50,23 @@ class HCABackend(AttentionBackend):
         compress_ratio: int = 128,
         window_size: int = 128,
         mesh: jax.sharding.Mesh,
+        max_context_len: int | None = None,
     ):
         if mesh is None:
             raise ValueError("production HCABackend requires the SGLang device mesh")
-        if page_size < 2 or window_size % page_size:
+        if max_context_len is not None and (max_context_len <= 0 or page_size not in (128, 256)):
+            raise ValueError("V4 HCA requires a positive context capacity and page size 128 or 256")
+        if max_context_len is None and (page_size < 2 or window_size % page_size):
             raise ValueError("HCA page_size must be >=2 and divide window_size")
         if (
             num_attn_heads != 64
             or head_dim != 512
-            or compressor_hidden_size != 4096
+            or compressor_hidden_size not in (4096, 7168)
             or compress_ratio != 128
             or window_size != 128
         ):
             raise ValueError(
-                "production HCA requires H=64, D=512, hidden=4096, ratio=128, and window=128"
+                "production HCA requires H=64, D=512, hidden in (4096,7168), ratio=128, and window=128"
             )
         self.num_heads = num_attn_heads
         self.head_dim = head_dim
@@ -163,18 +75,32 @@ class HCABackend(AttentionBackend):
         self.compress_ratio = compress_ratio
         self.window_size = window_size
         self.mesh = mesh
+        self.max_context_len = max_context_len
+        self.request_capacity = None
         self.forward_metadata = nnx.data(HCABackendMetadata())
         # HCA page ownership: set by model_runner after pool creation, read on
         # host during metadata construction, like FlashAttention's swa_index_mapping.
         self.allocator = None
 
-    def get_forward_metadata(self, batch: ModelWorkerBatch):
-        """Derive HCA metadata from the worker batch and place it on the data mesh.
+    def bind_resources(self, request_pool, allocator):
+        """Bind resource geometry without capturing host owners in the model graph."""
+        if self.max_context_len is None:
+            raise ValueError("V4 resources require max_context_len")
+        if allocator.dp_size != self.mesh.shape["data"] or allocator.page_size != self.page_size:
+            raise ValueError("HCA and V4 resource geometry disagree")
+        self.request_capacity = request_pool.size
 
-        Reads only standard batch fields plus the attached allocator's page
-        tables; the scheduler must already have grown the compressed tier via
-        ``ensure_compressed_capacity``.
+    def get_forward_metadata(self, batch: ModelWorkerBatch, *, request_pool=None, allocator=None):
+        """Build read/write tables from caller-owned allocations; never allocate.
+
+        V4 callers supply request_pool and allocator; legacy callers attach self.allocator.
         """
+        if request_pool is not None or allocator is not None:
+            if request_pool is None or allocator is None or self.request_capacity is None:
+                raise ValueError("bind V4 resources and supply both request_pool and allocator")
+            return self._get_hca_metadata(batch, request_pool=request_pool, allocator=allocator)
+        if self.request_capacity is not None:
+            raise ValueError("V4 metadata requires request_pool and allocator")
         if self.allocator is None:
             raise RuntimeError("model_runner must attach an HCAKVPoolAllocator first")
         req_pool_indices = np.asarray(batch.req_pool_indices, np.int32)
@@ -287,11 +213,7 @@ class HCABackend(AttentionBackend):
             0,
         )
         max_queries = _bucket_max_queries(int(q_lens.max()), schedule.query_block_size)
-        sharding = NamedSharding(self.mesh, P("data"))
-        window_pages, compressed_pages = device_array(
-            (window_pages, compressed_pages), sharding=sharding
-        )
-        arrays = packed_device_array(
+        arrays = device_array(
             (
                 state_slots,
                 query_seq_ids.astype(np.int32),
@@ -308,7 +230,7 @@ class HCABackend(AttentionBackend):
                 block_offsets,
                 decode_requests,
             ),
-            sharding=sharding,
+            sharding=NamedSharding(self.mesh, P("data")),
         )
         kernel_metadata = HCAMetadata(
             *arrays,
@@ -330,58 +252,19 @@ class HCABackend(AttentionBackend):
             "compress_ratio": self.compress_ratio,
             "window_size": self.window_size,
             "mesh": self.mesh,
+            "max_context_len": self.max_context_len,
+            "request_capacity": self.request_capacity,
         }
         return children, aux
 
     @classmethod
     def tree_unflatten(cls, aux, children):
+        aux = dict(aux)
+        request_capacity = aux.pop("request_capacity", None)
         obj = cls(**aux)
+        obj.request_capacity = request_capacity
         obj.forward_metadata = children[0]
         return obj
-
-    def _check_constants(
-        self,
-        wkv,
-        wgate,
-        ape,
-        norm_weight,
-        cos,
-        sin,
-        attention_sink,
-        fused_weight,
-        max_context_len,
-    ) -> None:
-        """Validate the shapes that cannot change between steps.
-
-        Factored out of the hot path for readability; under jit these run at
-        trace time only. Must not mutate ``self`` -- nnx forbids it in a trace.
-        """
-        if not is_tpu_runtime():
-            raise RuntimeError("production HCABackend requires a TPU backend")
-        weight_shape = (self.head_dim, self.compressor_hidden_size)
-        if wkv.shape != weight_shape or wgate.shape != weight_shape:
-            raise ValueError("wkv and wgate must both be [512,4096]")
-        if ape.shape != (self.compress_ratio, self.head_dim):
-            raise ValueError("ape must be [128,512]")
-        if norm_weight.shape != (self.head_dim,):
-            raise ValueError("norm_weight must be [512]")
-        if attention_sink.shape != (self.num_heads,):
-            raise ValueError("attention_sink must be [64]")
-        if cos.ndim != 2 or cos.shape[1] != 32 or sin.shape != cos.shape:
-            raise ValueError("production HCA RoPE tables must both be [positions,32]")
-        # Boundary emission gathers the row at each group start; a shorter table
-        # would silently rotate records with clamped or filled frequencies.
-        min_rope_rows = max(1, max_context_len - self.compress_ratio + 1)
-        if cos.shape[0] < min_rope_rows:
-            raise ValueError(
-                f"RoPE tables cover {cos.shape[0]} positions but max_context_len="
-                f"{max_context_len} requires at least {min_rope_rows}"
-            )
-        if fused_weight is not None and fused_weight.shape != (
-            self.compressor_hidden_size,
-            2 * self.head_dim,
-        ):
-            raise ValueError("fused_weight must be [4096,1024]")
 
     def __call__(
         self,
@@ -392,7 +275,8 @@ class HCABackend(AttentionBackend):
         forward_batch: ForwardBatch,
         token_to_kv_pool,
         *,
-        recurrent_state_pool,
+        recurrent_state_pool=None,
+        compressor_state_pool=None,
         compressor_input: jax.Array,
         wkv: jax.Array,
         wgate: jax.Array,
@@ -402,158 +286,92 @@ class HCABackend(AttentionBackend):
         sin: jax.Array,
         attention_sink: jax.Array,
         fused_weight: jax.Array | None = None,
+        norm_eps: float = 1e-6,
+        metadata=None,
         **_kwargs,
-    ) -> tuple[jax.Array, tuple[jax.Array, jax.Array, jax.Array]]:
+    ) -> tuple[jax.Array, tuple[jax.Array, jax.Array, jax.Array] | dict[str, jax.Array]]:
         """Run complete cache-aware HCA and return explicit pool updates."""
-        metadata = self.forward_metadata
-        if metadata.kernel is None:
-            raise RuntimeError("HCABackend.forward_metadata has not been prepared")
-        if metadata.schedule is None:
-            raise RuntimeError("HCABackend has no HCA kernel schedule")
-        # Only the per-token shapes can change between steps; the model
-        # constants are validated in _check_constants below.
-        if q.ndim != 3 or q.shape[1:] != (self.num_heads, self.head_dim):
-            raise ValueError("q must be [T,num_attn_heads,head_dim]")
-        if k.ndim == 3 and k.shape[1] == 1:
-            new_kv = k[:, 0]
-        elif k.ndim == 2:
-            new_kv = k
-        else:
-            raise ValueError("HCA k/v must be [T,D] or [T,1,D]")
-        if v.shape != k.shape or new_kv.shape != (q.shape[0], self.head_dim):
-            raise ValueError("HCA k and v must share the same KV shape")
-        if compressor_input.shape != (q.shape[0], self.compressor_hidden_size):
-            raise ValueError("compressor_input must be [T,4096]")
-        self._check_constants(
-            wkv,
-            wgate,
-            ape,
-            norm_weight,
-            cos,
-            sin,
-            attention_sink,
-            fused_weight,
-            token_to_kv_pool.max_context_len,
-        )
-
-        layer_index = token_to_kv_pool._layer_index(int(layer.layer_id))
-        recurrent_state_pool._layer_index(int(layer.layer_id))
-
-        kernel_options = {
-            "softmax_scale": (
-                self.head_dim**-0.5
-                if getattr(layer, "scaling", None) is None
-                else float(layer.scaling)
-            ),
-            "compress_ratio": self.compress_ratio,
-            "head_dim": self.head_dim,
-            "window_size": self.window_size,
-            "schedule": metadata.schedule,
-        }
-        fused_weight = fused_projection_weight(wkv, wgate, fused_weight)
-
-        forward_mode = forward_batch.forward_mode
-        if forward_mode.is_decode():
-            kernel_options["mode"] = "decode"
-        elif forward_mode.is_extend():
-            kernel_options["mode"] = (
-                "uniform" if metadata.use_uniform_prefill_fast_path else "ragged"
+        metadata = self.forward_metadata if metadata is None else metadata
+        if compressor_state_pool is not None:
+            if recurrent_state_pool is not None or self.request_capacity is None:
+                raise ValueError(
+                    "V4 execution requires bound resources and only compressor_state_pool"
+                )
+            output, (state, window, compressed) = self._forward_hca(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                token_to_kv_pool,
+                compressor_state_pool=compressor_state_pool,
+                metadata=metadata,
+                compressor_input=compressor_input,
+                wkv=wkv,
+                wgate=wgate,
+                ape=ape,
+                norm_weight=norm_weight,
+                cos=cos,
+                sin=sin,
+                attention_sink=attention_sink,
+                fused_weight=fused_weight,
+                norm_eps=norm_eps,
             )
-        else:
-            raise ValueError(f"unsupported HCA forward mode: {forward_mode}")
-
-        # Built inline like the MLA and GDN backends: under the model's outer
-        # jit this is traced once, so a cached callable buys nothing.
-        def rank_local(
-            x,
-            q_,
-            new_kv_,
-            state,
-            window,
-            compressed,
-            wkv_,
-            wgate_,
-            ape_,
-            norm_,
-            cos_,
-            sin_,
-            positions_,
-            sink_,
-            md,
-            fused,
-        ):
-            output, state, window, compressed = hca_step(
-                x,
-                q_,
-                new_kv_,
-                state,
-                window,
-                compressed,
-                wkv_,
-                wgate_,
-                ape_,
-                norm_,
-                cos_,
-                sin_,
-                positions_,
-                sink_,
-                md,
-                fused_weight=fused,
-                **kernel_options,
-            )
-            return output.reshape(output.shape[0], -1), state, window, compressed
-
-        output, state, window, compressed = jax.shard_map(
-            rank_local,
-            mesh=self.mesh,
-            in_specs=(
-                P("data", None),  # compressor_input [T, hidden]
-                P("data", "tensor", None),  # q                [T, H/tp, D]
-                P("data", None),  # new_kv           [T, D]
-                P("data", None, None, None),  # recurrent state pool
-                P("data", None, None, None),  # window cache
-                P("data", None, None, None),  # compressed cache
-                P(None, None),  # wkv
-                P(None, None),  # wgate
-                P(None, None),  # ape
-                P(None),  # norm_weight
-                P(None, None),  # cos
-                P(None, None),  # sin
-                P("data"),  # positions        [T]
-                P("tensor"),  # attention_sink   [H/tp]
-                _metadata_partition_spec(metadata.kernel),
-                P(None, None),  # fused_weight
-            ),
-            out_specs=(
-                P("data", "tensor"),  # output [T, H/tp*D]
-                P("data", None, None, None),  # state pool
-                P("data", None, None, None),  # window cache
-                P("data", None, None, None),  # compressed cache
-            ),
-            check_vma=False,
-        )(
-            compressor_input,
+            return output.reshape(q.shape), {
+                "state": state,
+                "swa": window,
+                "compressed": compressed,
+            }
+        if self.request_capacity is not None or recurrent_state_pool is None:
+            raise ValueError("supply the state pool matching the bound HCA resources")
+        layer_id = int(layer.layer_id)
+        layer_index = token_to_kv_pool._layer_index(layer_id)
+        recurrent_state_pool._layer_index(layer_id)
+        return run_hca(
             q,
-            new_kv,
-            recurrent_state_pool.get_hca_state(int(layer.layer_id)),
-            token_to_kv_pool.window_buffer[layer_index],
-            token_to_kv_pool.compressed_buffer[layer_index],
-            wkv,
-            wgate,
-            ape,
-            norm_weight,
-            cos,
-            sin,
-            forward_batch.positions,
-            attention_sink,
-            metadata.kernel,
-            fused_weight,
+            k,
+            v,
+            mesh=self.mesh,
+            compressor_hidden_size=self.compressor_hidden_size,
+            page_size=self.page_size,
+            max_context_len=token_to_kv_pool.max_context_len,
+            positions=forward_batch.positions,
+            forward_mode=forward_batch.forward_mode,
+            state_arg=recurrent_state_pool.get_hca_state(layer_id),
+            window_arg=token_to_kv_pool.window_buffer[layer_index],
+            compressed_arg=token_to_kv_pool.compressed_buffer[layer_index],
+            metadata=metadata,
+            compressor_input=compressor_input,
+            wkv=wkv,
+            wgate=wgate,
+            ape=ape,
+            norm_weight=norm_weight,
+            cos=cos,
+            sin=sin,
+            attention_sink=attention_sink,
+            fused_weight=fused_weight,
+            softmax_scale=getattr(layer, "scaling", None),
+            norm_eps=norm_eps,
         )
-        return output.astype(q.dtype), (state, window, compressed)
 
     @staticmethod
-    def pack_pool_updates(layer_updates) -> dict:
-        """Regroup per-layer ``(state, window, compressed)`` for their owning pools."""
+    def pack_pool_updates(layer_updates, token_to_kv_pool=None, compressor_state_pool=None) -> dict:
+        """Pack complete family replacements; only the runtime commits the updates."""
+        if token_to_kv_pool is not None or compressor_state_pool is not None:
+            if token_to_kv_pool is None or compressor_state_pool is None:
+                raise ValueError("V4 updates require both KV and compressor-state pools")
+            kv_updates, state_updates = {}, {}
+            for layer_id, updates in layer_updates.items():
+                if set(updates) != {"state", "swa", "compressed"}:
+                    raise ValueError(
+                        "each HCA layer must return complete swa, c128 and state updates"
+                    )
+                kv_updates[layer_id] = {key: updates[key] for key in ("swa", "compressed")}
+                state_updates[layer_id] = {"compressor": updates["state"]}
+            return {
+                "token_to_kv_pool": token_to_kv_pool.build_buffer_updates(kv_updates),
+                "compressor_state_pool": compressor_state_pool.build_buffer_updates(state_updates),
+            }
         states, windows, compressed = zip(*layer_updates, strict=True)
         return {
             "token_to_kv_pool": {

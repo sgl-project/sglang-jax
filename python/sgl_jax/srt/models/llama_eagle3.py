@@ -239,13 +239,14 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         self.model = LlamaEagleModel(config, dtype=dtype, mesh=mesh)
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
         # Llama 3.1 8B Instruct set tie_word_embeddings to False
-        self.load_lm_head_from_target = False
+        self.load_lm_head_from_target = (
+            not config.tie_word_embeddings and config.draft_vocab_size is None
+        )
+        if config.draft_vocab_size is None:
+            config.draft_vocab_size = config.vocab_size
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
-            if config.draft_vocab_size is None:
-                self.load_lm_head_from_target = True
-                config.draft_vocab_size = config.vocab_size
             self.lm_head = ParallelLMHead(
                 config.draft_vocab_size,
                 config.hidden_size,
@@ -261,6 +262,12 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         self.capture_aux_hidden_states = True
         self.hot_token_ids = nnx.Param(jnp.arange(config.draft_vocab_size))
 
+    def get_shared_weight_paths(self):
+        paths = ["model.embed_tokens.embedding"]
+        if self.load_lm_head_from_target or self.config.tie_word_embeddings:
+            paths.append("lm_head.embedding")
+        return paths
+
     def load_weights(self, model_config: ModelConfig) -> None:
         loader = WeightLoader(
             model=self,
@@ -272,6 +279,11 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         weight_mappings = self._create_llama_ealge3_weight_mappings()
 
         loader.load(weight_mappings)
+        if isinstance(self.hot_token_ids.value, jax.ShapeDtypeStruct):
+            self.hot_token_ids.value = jax.device_put(
+                np.arange(self.config.draft_vocab_size, dtype=np.int32),
+                jax.sharding.NamedSharding(self.mesh, P(None)),
+            )
         logger.info("llama EAGLE3 weights loaded successfully!")
 
     def _create_llama_ealge3_weight_mappings(self):
@@ -295,7 +307,8 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
             sharding=(None, None),
             transpose=True,
         )
-        mappings["lm_head.weight"] = self.lm_head.weight_mapping("lm_head.embedding")
+        if not (self.load_lm_head_from_target or self.config.tie_word_embeddings):
+            mappings["lm_head.weight"] = self.lm_head.weight_mapping("lm_head.embedding")
         mappings["norm.weight"] = WeightSpec(
             target_path="model.norm.scale",
             sharding=(None,),
@@ -360,10 +373,18 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
             kv_head_padding=False,
         )
         if getattr(self.config, "bias", False):
-            mappings["model.fc.bias"] = WeightSpec(
-                target_path="model.fc.value.bias",
+            mappings["fc.bias"] = WeightSpec(
+                target_path="model.fc.bias",
                 sharding=(None,),
             )
+
+        if getattr(self.config, "attention_bias", False) or getattr(self.config, "bias", False):
+            for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                mappings[f"midlayer.self_attn.{proj}.bias"] = WeightSpec(
+                    target_path=f"model.midlayer.self_attn.{proj}.bias",
+                    sharding=(None,),
+                    kv_head_padding=proj in ("k_proj", "v_proj"),
+                )
 
         return mappings
 

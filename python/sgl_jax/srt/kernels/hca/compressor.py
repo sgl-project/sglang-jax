@@ -14,6 +14,7 @@ import jax.experimental.pallas as pl
 import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
+from sgl_jax.srt.kernels.hca.common import searchsorted_right
 from sgl_jax.srt.kernels.hca.tuned_block_sizes import HCAKernelSchedule
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 
@@ -23,16 +24,6 @@ def _interpret_pallas() -> bool:
         os.environ.get("PALLAS_INTERPRET", "").strip().lower() in ("1", "true")
         or not is_tpu_runtime()
     )
-
-
-def _projection_tile_k(hidden: int, schedule: HCAKernelSchedule) -> int:
-    """Choose the largest platform-aligned projection tile dividing hidden."""
-    if hidden <= 0 or hidden % schedule.mxu_lanes:
-        raise ValueError(f"hidden={hidden} must be a positive multiple of {schedule.mxu_lanes}")
-    tile_k = min(schedule.projection_k_tile, hidden)
-    while hidden % tile_k:
-        tile_k -= schedule.mxu_lanes
-    return tile_k
 
 
 def _pool_normalize_rotate(kv, score, norm_weight, cos, sin, *, norm_eps: float):
@@ -46,10 +37,17 @@ def _pool_normalize_rotate(kv, score, norm_weight, cos, sin, *, norm_eps: float)
     flat FP32 ``[entries, head_dim]``.
     """
     entries = kv.shape[0]
-    head_dim = kv.shape[2] * kv.shape[3]
-    pooled = jnp.sum(kv * jax.nn.softmax(score, axis=1), axis=1)
-    pooled *= jax.lax.rsqrt(jnp.mean(jnp.square(pooled), axis=(1, 2), keepdims=True) + norm_eps)
-    pooled = (pooled * norm_weight).reshape(entries, head_dim)
+    if kv.ndim == 3:
+        # ``[entries, ratio, head_dim]`` rows straight from the state pool's layout.
+        head_dim = kv.shape[2]
+        pooled = jnp.sum(kv * jax.nn.softmax(score, axis=1), axis=1)
+        pooled *= jax.lax.rsqrt(jnp.mean(jnp.square(pooled), axis=1, keepdims=True) + norm_eps)
+        pooled = pooled * norm_weight.reshape(1, head_dim)
+    else:
+        head_dim = kv.shape[2] * kv.shape[3]
+        pooled = jnp.sum(kv * jax.nn.softmax(score, axis=1), axis=1)
+        pooled *= jax.lax.rsqrt(jnp.mean(jnp.square(pooled), axis=(1, 2), keepdims=True) + norm_eps)
+        pooled = (pooled * norm_weight).reshape(entries, head_dim)
 
     rope = pooled[:, head_dim - 64 :]
     pairs = rope.reshape(entries, 32, 2)
@@ -155,7 +153,7 @@ def token_compress_prefill_pallas(
     if cos_strided.shape != (num_entries, 32) or sin_strided.shape != cos_strided.shape:
         raise ValueError("RoPE tables must both be [entries,32]")
 
-    tile_k = _projection_tile_k(hidden, schedule)
+    tile_k = schedule.projection_tile_k(hidden)
     k_steps = hidden // tile_k
     token_tile = entries_per_step * compress_ratio
     # ``entries_per_step`` need not divide ``num_entries``: reductions are
@@ -234,8 +232,9 @@ def _hca_projection_fused_kernel(
     acc_ref,
     *,
     k_steps: int,
+    native_output: bool = False,
 ):
-    """Project one output half while reducing hidden-dimension tiles in order."""
+    """Reduce hidden tiles in order; assemble native output inside VMEM."""
     k_step = pl.program_id(2)
     output_half = pl.program_id(1)
     product = jax.lax.dot_general(
@@ -248,6 +247,12 @@ def _hca_projection_fused_kernel(
 
     @pl.when(k_step == k_steps - 1)
     def _finish():
+        if native_output:
+            kv, score = jnp.split(acc_ref[...], 2, axis=1)
+            projected_ref[...] = jnp.stack(
+                (kv, score + ape_selected_ref[...].astype(jnp.float32)), axis=1
+            )
+            return
         projected_ref[...] = acc_ref[...]
 
         @pl.when(output_half == 1)
@@ -269,8 +274,53 @@ def hca_project_fused_pallas(
     compress_ratio: int = 128,
     head_dim: int = 512,
 ):
-    """Return FP32 ``[KV, score + APE]`` rows for each token.
+    """Return FP32 ``[KV, score + APE]`` rows for each token as ``[T, 2, head_dim]``.
     This function does not read or update recurrent state."""
+    return _hca_project_fused(
+        x_t,
+        fused_weight,
+        ape,
+        positions,
+        schedule=schedule,
+        compress_ratio=compress_ratio,
+        head_dim=head_dim,
+        native_output=True,
+    )
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("compress_ratio", "head_dim", "schedule"),
+)
+def hca_project_fused_halves(
+    x_t,
+    fused_weight,
+    ape,
+    positions,
+    *,
+    schedule: HCAKernelSchedule,
+    compress_ratio: int = 128,
+    head_dim: int = 512,
+):
+    """``(kv [T, head_dim], score + APE [T, head_dim])`` in FP32.
+
+    Keep lane-aligned halves for callers that do not need the native state layout.
+    """
+    return _hca_project_fused(
+        x_t,
+        fused_weight,
+        ape,
+        positions,
+        schedule=schedule,
+        compress_ratio=compress_ratio,
+        head_dim=head_dim,
+        native_output=False,
+    )
+
+
+def _hca_project_fused(
+    x_t, fused_weight, ape, positions, *, schedule, compress_ratio, head_dim, native_output
+):
     # Weight/APE shapes and the r128/d512 constants are the backend's
     # contract; what varies per call is the token count, checked below.
     if x_t.ndim != 2:
@@ -280,14 +330,13 @@ def hca_project_fused_pallas(
         raise ValueError("ape must be FP32 [128,512]")
     if positions.shape != (batch,):
         raise ValueError("positions must be [T]")
-
     tile_b = min(
         schedule.projection_batch_tile_max,
         ((batch + schedule.sublanes - 1) // schedule.sublanes) * schedule.sublanes,
     )
     padded_batch = ((batch + tile_b - 1) // tile_b) * tile_b
     batch_steps = padded_batch // tile_b
-    tile_k = schedule.projection_k_tile
+    tile_k = schedule.projection_tile_k(hidden)
     k_steps = hidden // tile_k
     pad = padded_batch - batch
     x_padded = jnp.pad(x_t.astype(jnp.bfloat16), ((0, pad), (0, 0)))
@@ -296,27 +345,43 @@ def hca_project_fused_pallas(
         jnp.float32
     )
 
+    # A native-output program owns both halves, including their shared physical tiles.
+    output_width = 2 * head_dim if native_output else head_dim
+    output_shape = (padded_batch, 2, head_dim) if native_output else (padded_batch, 2 * head_dim)
+    output_spec = (
+        pl.BlockSpec((tile_b, 2, head_dim), lambda bi, m, k: (bi, 0, 0))
+        if native_output
+        else pl.BlockSpec((tile_b, head_dim), lambda bi, m, k: (bi, m))
+    )
+    projection_weight = fused_weight.astype(jnp.bfloat16)
+    if native_output and not _interpret_pallas():
+        # Reuse weights across token tiles instead of reloading them from HBM.
+        projection_weight = pltpu.with_memory_space_constraint(projection_weight, pltpu.VMEM)
     projected = pl.pallas_call(
-        functools.partial(_hca_projection_fused_kernel, k_steps=k_steps),
+        functools.partial(
+            _hca_projection_fused_kernel, k_steps=k_steps, native_output=native_output
+        ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
-            grid=(batch_steps, 2, k_steps),
+            grid=(batch_steps, 1 if native_output else 2, k_steps),
             in_specs=(
                 pl.BlockSpec((tile_b, tile_k), lambda bi, m, k: (bi, k)),
-                pl.BlockSpec((tile_k, head_dim), lambda bi, m, k: (k, m)),
+                pl.BlockSpec((tile_k, output_width), lambda bi, m, k: (k, m)),
                 pl.BlockSpec((tile_b, head_dim), lambda bi, m, k: (bi, 0)),
             ),
-            out_specs=pl.BlockSpec((tile_b, head_dim), lambda bi, m, k: (bi, m)),
-            scratch_shapes=(pltpu.VMEM((tile_b, head_dim), jnp.float32),),
+            out_specs=output_spec,
+            scratch_shapes=(pltpu.VMEM((tile_b, output_width), jnp.float32),),
         ),
-        out_shape=jax.ShapeDtypeStruct((padded_batch, 2 * head_dim), jnp.float32),
+        out_shape=jax.ShapeDtypeStruct(output_shape, jnp.float32),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel", "arbitrary")
         ),
         interpret=_interpret_pallas(),
-        name=f"hca-state-project-b{tile_b}-k{tile_k}-n{head_dim}",
-    )(x_padded, fused_weight.astype(jnp.bfloat16), ape_selected)
-    return projected[:batch].reshape(batch, 2, head_dim)
+        name=f"hca-state-project-b{tile_b}-k{tile_k}-n{output_width}",
+    )(x_padded, projection_weight, ape_selected)
+    if native_output:
+        return projected[:batch]
+    return projected[:batch, :head_dim], projected[:batch, head_dim:]
 
 
 @functools.partial(
@@ -378,24 +443,198 @@ def hca_state_pool_update_fused_pallas(
 
 
 def _hca_emit_values(selected, valid, norm_weight, cos_sin, *, norm_eps: float):
-    """Mask invalid rows, then pool/normalize/rotate the selected state."""
-    tile_n, _, _, head_tiles, lanes = selected.shape
-    live = valid[:, None, None, None]
-    kv = jnp.where(live, selected[:, :, 0, ...].astype(jnp.float32), 0.0)
-    score = jnp.where(live, selected[:, :, 1, ...].astype(jnp.float32), -jnp.inf)
+    """Pool native ``[tile_n, 128, 2, head_dim]`` state rows."""
+    live = valid[:, None, None]
+    kv = jnp.where(live, selected[:, :, 0, :].astype(jnp.float32), 0.0)
+    score = jnp.where(live, selected[:, :, 1, :].astype(jnp.float32), -jnp.inf)
     cos_sin = cos_sin.astype(jnp.float32)
     normed = _pool_normalize_rotate(
         kv,
         score,
-        norm_weight.astype(jnp.float32)[None, ...],
+        norm_weight.astype(jnp.float32),
         cos_sin[:, :32],
         cos_sin[:, 32:64],
         norm_eps=norm_eps,
-    ).reshape(tile_n, head_tiles, lanes)
-    return jnp.where(valid[:, None, None], normed, 0.0).astype(jnp.bfloat16)
+    )
+    return jnp.where(valid[:, None], normed, 0.0).astype(jnp.bfloat16)
 
 
-def _hca_emit_pool_kernel(
+def _hca_emit_boundary_native_kernel(
+    slot_ref,
+    start_ref,
+    shift_ref,
+    ncur_ref,
+    ring_ref,
+    valid_ref,
+    state_pool_hbm_ref,
+    projected_hbm_ref,
+    norm_weight_ref,
+    cos_sin_ref,
+    output_ref,
+    state_slab,
+    cur_slab,
+    dma_semaphores,
+    *,
+    tile_n: int,
+    norm_eps: float,
+):
+    """Boundary snapshots without the gathers: pool over the 128 ring rows plus the
+    128 chunk rows of each window with per-row validity masks.
+
+    The softmax pool is permutation-invariant over the window, so the ring rows can
+    stay in slot order and the chunk rows in token order; a row is live when its
+    position falls on the right side of the request's prefix (ring row ``s`` holds
+    position ``end - ((r - s) mod 128)``, chunk slab row ``i`` holds window index
+    ``i + shift``).
+    """
+    block = pl.program_id(0)
+    first = block * tile_n
+    state_slab[...] = jnp.zeros(state_slab.shape, state_slab.dtype)
+    cur_slab[...] = jnp.zeros(cur_slab.shape, cur_slab.dtype)
+    for row in range(tile_n):
+        live = valid_ref[first + row] != 0
+
+        @pl.when(live)
+        def _start(row=row):
+            pltpu.make_async_copy(
+                state_pool_hbm_ref.at[slot_ref[first + row]],
+                state_slab.at[row],
+                dma_semaphores.at[0, row],
+            ).start()
+            start = pl.multiple_of(start_ref[first + row], 1)
+            pltpu.make_async_copy(
+                projected_hbm_ref.at[pl.ds(start, 128)],
+                cur_slab.at[row],
+                dma_semaphores.at[1, row],
+            ).start()
+
+    for row in range(tile_n):
+        live = valid_ref[first + row] != 0
+
+        @pl.when(live)
+        def _wait(row=row):
+            d0 = state_slab.at[row]
+            pltpu.make_async_copy(d0, d0, dma_semaphores.at[0, row]).wait()
+            d1 = cur_slab.at[row]
+            pltpu.make_async_copy(d1, d1, dma_semaphores.at[1, row]).wait()
+
+    # Masks are built in the full [tile_n, 256, D] shape: Mosaic rejects reshaping a
+    # bool (or lane-major int) vector into a trailing unit dim, so per-boundary
+    # scalars are spread with iota selects instead of [:, None] broadcasts.
+    head_dim = state_slab.shape[-1]
+    shape3 = (tile_n, 256, head_dim)
+    row3 = jax.lax.broadcasted_iota(jnp.int32, shape3, 0)
+    win3 = jax.lax.broadcasted_iota(jnp.int32, shape3, 1)
+    ring3 = jnp.zeros(shape3, jnp.int32)
+    ncur3 = jnp.zeros(shape3, jnp.int32)
+    shift3 = jnp.zeros(shape3, jnp.int32)
+    valid3 = jnp.zeros(shape3, jnp.int32)
+    for row in range(tile_n):
+        sel = row3 == row
+        ring3 = jnp.where(sel, ring_ref[first + row], ring3)
+        ncur3 = jnp.where(sel, ncur_ref[first + row], ncur3)
+        shift3 = jnp.where(sel, shift_ref[first + row], shift3)
+        valid3 = jnp.where(sel, valid_ref[first + row], valid3)
+    is_state = win3 < 128
+    state_live = is_state & (((ring3 - win3) & 127) >= ncur3)
+    widx = win3 - 128 + shift3
+    cur_live = (~is_state) & (widx >= 128 - ncur3) & (widx < 128)
+    live = (state_live | cur_live) & (valid3 != 0)
+    kv = jnp.concatenate(
+        [state_slab[:, :, 0, :].astype(jnp.float32), cur_slab[:, :, 0, :].astype(jnp.float32)],
+        axis=1,
+    )
+    score = jnp.concatenate(
+        [state_slab[:, :, 1, :].astype(jnp.float32), cur_slab[:, :, 1, :].astype(jnp.float32)],
+        axis=1,
+    )
+    kv = jnp.where(live, kv, 0.0)
+    score = jnp.where(live, score, -jnp.inf)
+    cos_sin = cos_sin_ref[...].astype(jnp.float32)
+    normed = _pool_normalize_rotate(
+        kv,
+        score,
+        norm_weight_ref[...].astype(jnp.float32),
+        cos_sin[:, :32],
+        cos_sin[:, 32:64],
+        norm_eps=norm_eps,
+    )
+    out_row = jax.lax.broadcasted_iota(jnp.int32, normed.shape, 0)
+    out_valid = jnp.zeros(normed.shape, jnp.int32)
+    for row in range(tile_n):
+        out_valid = jnp.where(out_row == row, valid_ref[first + row], out_valid)
+    output_ref[...] = jnp.where(out_valid != 0, normed, 0.0).astype(output_ref.dtype)
+
+
+@functools.partial(jax.jit, static_argnames=("norm_eps", "schedule"))
+def _hca_emit_boundary_native_pallas(
+    state_pool,
+    projected,
+    slot,
+    start,
+    shift,
+    ncur,
+    ring,
+    valid_mask,
+    norm_weight,
+    cos_sin_selected,
+    *,
+    norm_eps: float,
+    schedule: HCAKernelSchedule,
+):
+    """``_hca_emit_selected_pallas`` fed straight from the pool and the chunk rows."""
+    packed = slot.shape[0]
+    tile_n = schedule.boundary_rows(state_pool.shape[1], state_pool.shape[-1])
+    padded = ((packed + tile_n - 1) // tile_n) * tile_n
+    pad = padded - packed
+    i32 = lambda a: jnp.pad(jnp.asarray(a, jnp.int32), (0, pad))
+    valid_i = i32(jnp.asarray(valid_mask, jnp.bool_).astype(jnp.int32))
+    cos_sin = jnp.pad(jnp.asarray(cos_sin_selected, jnp.float32), ((0, pad), (0, 64)))
+    head_dim = state_pool.shape[-1]
+    out = pl.pallas_call(
+        functools.partial(
+            _hca_emit_boundary_native_kernel, tile_n=tile_n, norm_eps=float(norm_eps)
+        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=6,
+            grid=(padded // tile_n,),
+            in_specs=(
+                pl.BlockSpec(memory_space=pltpu.HBM),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+                pl.BlockSpec((1, head_dim), lambda block, *_: (0, 0)),
+                pl.BlockSpec((tile_n, 128), lambda block, *_: (block, 0)),
+            ),
+            out_specs=pl.BlockSpec((tile_n, head_dim), lambda block, *_: (block, 0)),
+            scratch_shapes=(
+                pltpu.VMEM((tile_n, 128, 2, head_dim), state_pool.dtype),
+                pltpu.VMEM((tile_n, 128, 2, head_dim), projected.dtype),
+                pltpu.SemaphoreType.DMA((2, tile_n)),
+            ),
+        ),
+        out_shape=jax.ShapeDtypeStruct((padded, head_dim), jnp.bfloat16),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",),
+            vmem_limit_bytes=schedule.vmem_budget_bytes,
+            disable_bounds_checks=True,
+        ),
+        interpret=_interpret_pallas(),
+        name=f"hca-boundary-native-n{tile_n}-r128-d{head_dim}",
+    )(
+        i32(slot),
+        i32(start),
+        i32(shift),
+        i32(ncur),
+        i32(ring),
+        valid_i,
+        state_pool,
+        projected,
+        jnp.asarray(norm_weight, jnp.float32).reshape(1, head_dim),
+        cos_sin,
+    )
+    return out[:packed]
+
+
+def _hca_emit_pool_native_kernel(
     request_slots_ref,
     valid_scalar_ref,
     state_pool_hbm_ref,
@@ -409,43 +648,44 @@ def _hca_emit_pool_kernel(
     tile_n: int,
     norm_eps: float,
 ):
-    """DMA selected state rows and emit one compressed record per valid row."""
+    """Read native state slabs; skip DMA and pooling for tiles without boundaries."""
     block = pl.program_id(0)
     first = block * tile_n
-    selected_ref[...] = jnp.zeros(selected_ref.shape, selected_ref.dtype)
+    valid_rows = [valid_scalar_ref[first + row] for row in range(tile_n)]
+    any_valid = functools.reduce(jnp.logical_or, [v != 0 for v in valid_rows])
 
-    for row in range(tile_n):
-        valid = valid_scalar_ref[first + row]
+    @pl.when(jnp.logical_not(any_valid))
+    def _empty_tile():
+        output_ref[...] = jnp.zeros(output_ref.shape, output_ref.dtype)
 
-        @pl.when(valid)
-        def _start_state_row_dma(row=row):
-            request = request_slots_ref[first + row]
-            transfer = pltpu.make_async_copy(
-                state_pool_hbm_ref.at[request],
-                selected_ref.at[row],
-                dma_semaphores.at[row],
-            )
-            transfer.start()
+    @pl.when(any_valid)
+    def _pool_tile():
+        selected_ref[...] = jnp.zeros(selected_ref.shape, selected_ref.dtype)
+        for row in range(tile_n):
 
-    for row in range(tile_n):
-        valid = valid_scalar_ref[first + row]
+            @pl.when(valid_rows[row])
+            def _start_state_row_dma(row=row):
+                request = request_slots_ref[first + row]
+                pltpu.make_async_copy(
+                    state_pool_hbm_ref.at[request],
+                    selected_ref.at[row],
+                    dma_semaphores.at[row],
+                ).start()
 
-        @pl.when(valid)
-        def _wait_state_row_dma(row=row):
-            destination = selected_ref.at[row]
-            pltpu.make_async_copy(
-                destination,
-                destination,
-                dma_semaphores.at[row],
-            ).wait()
+        for row in range(tile_n):
 
-    output_ref[...] = _hca_emit_values(
-        selected_ref[...],
-        valid_storage_ref[:, 0, 0],
-        norm_weight_ref[...],
-        cos_sin_ref[...],
-        norm_eps=norm_eps,
-    )
+            @pl.when(valid_rows[row])
+            def _wait_state_row_dma(row=row):
+                destination = selected_ref.at[row]
+                pltpu.make_async_copy(destination, destination, dma_semaphores.at[row]).wait()
+
+        output_ref[...] = _hca_emit_values(
+            selected_ref[...],
+            valid_storage_ref[:, 0, 0],
+            norm_weight_ref[...],
+            cos_sin_ref[...],
+            norm_eps=norm_eps,
+        )
 
 
 def _hca_emit_selected_kernel(
@@ -502,7 +742,6 @@ def _hca_emit_selected_pallas(
         packed, valid_mask, cos_sin_selected, schedule
     )
     selected = jnp.pad(selected, ((0, pad), (0, 0), (0, 0), (0, 0)))
-    selected = selected.reshape(padded, 128, 2, 4, 128)
     output = pl.pallas_call(
         functools.partial(_hca_emit_selected_kernel, norm_eps=float(norm_eps)),
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -510,16 +749,16 @@ def _hca_emit_selected_pallas(
             grid=(padded // tile_n,),
             in_specs=(
                 pl.BlockSpec(
-                    (tile_n, 128, 2, 4, 128),
-                    lambda block: (block, 0, 0, 0, 0),
+                    (tile_n, 128, 2, 512),
+                    lambda block: (block, 0, 0, 0),
                 ),
                 pl.BlockSpec((tile_n, 8, 128), lambda block: (block, 0, 0)),
-                pl.BlockSpec((4, 128), lambda block: (0, 0)),
+                pl.BlockSpec((1, 512), lambda block: (0, 0)),
                 pl.BlockSpec((tile_n, 128), lambda block: (block, 0)),
             ),
-            out_specs=pl.BlockSpec((tile_n, 4, 128), lambda block: (block, 0, 0)),
+            out_specs=pl.BlockSpec((tile_n, 512), lambda block: (block, 0)),
         ),
-        out_shape=jax.ShapeDtypeStruct((padded, 4, 128), jnp.bfloat16),
+        out_shape=jax.ShapeDtypeStruct((padded, 512), jnp.bfloat16),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel",), disable_bounds_checks=True
         ),
@@ -528,10 +767,10 @@ def _hca_emit_selected_pallas(
     )(
         selected,
         valid_storage,
-        norm_weight.reshape(4, 128),
+        norm_weight.reshape(1, 512),
         cos_sin_selected,
     )
-    return output[:packed].reshape(packed, 512)
+    return output[:packed]
 
 
 @functools.partial(jax.jit, static_argnames=("norm_eps", "schedule"))
@@ -550,10 +789,9 @@ def _hca_emit_pool_pallas(
         packed, valid_mask, cos_sin_selected, schedule
     )
     request_slots = jnp.pad(request_slots.astype(jnp.int32), (0, pad))
-    packed_state_pool = state_pool.reshape(state_pool.shape[0], 128, 2, 4, 128)
     output = pl.pallas_call(
         functools.partial(
-            _hca_emit_pool_kernel,
+            _hca_emit_pool_native_kernel,
             tile_n=tile_n,
             norm_eps=float(norm_eps),
         ),
@@ -563,30 +801,30 @@ def _hca_emit_pool_pallas(
             in_specs=(
                 pl.BlockSpec(memory_space=pltpu.HBM),
                 pl.BlockSpec((tile_n, 8, 128), lambda block, *_: (block, 0, 0)),
-                pl.BlockSpec((4, 128), lambda block, *_: (0, 0)),
+                pl.BlockSpec((1, 512), lambda block, *_: (0, 0)),
                 pl.BlockSpec((tile_n, 128), lambda block, *_: (block, 0)),
             ),
-            out_specs=pl.BlockSpec((tile_n, 4, 128), lambda block, *_: (block, 0, 0)),
+            out_specs=pl.BlockSpec((tile_n, 512), lambda block, *_: (block, 0)),
             scratch_shapes=(
-                pltpu.VMEM((tile_n, 128, 2, 4, 128), jnp.float32),
+                pltpu.VMEM((tile_n, 128, 2, 512), jnp.float32),
                 pltpu.SemaphoreType.DMA((tile_n,)),
             ),
         ),
-        out_shape=jax.ShapeDtypeStruct((padded, 4, 128), jnp.bfloat16),
+        out_shape=jax.ShapeDtypeStruct((padded, 512), jnp.bfloat16),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel",), disable_bounds_checks=True
         ),
         interpret=_interpret_pallas(),
-        name=f"hca-boundary-pool-n{tile_n}-r128-d512",
+        name=f"hca-boundary-pool-native-n{tile_n}-r128-d512",
     )(
         request_slots,
         valid_mask,
-        packed_state_pool,
+        state_pool,
         valid_storage,
-        norm_weight.reshape(4, 128),
+        norm_weight.reshape(1, 512),
         cos_sin_selected,
     )
-    return output[:packed].reshape(packed, 512)
+    return output[:packed]
 
 
 @functools.partial(
@@ -686,8 +924,14 @@ def hca_state_pool_update_ragged_fused_pallas(
 
     # Resolve each request's physical recurrent row once: after arbitrary alloc,
     # free and reuse, slots are neither dense nor request-major in the pool.
-    request_rows = request_slots[query_starts].astype(jnp.int32)
-    selected_state = state_pool.at[request_rows].get(mode="promise_in_bounds")
+    active_requests = seq_lens > prefix_lens
+    safe_starts = jnp.minimum(query_starts, tokens - 1)
+    request_rows = jnp.where(
+        active_requests,
+        request_slots[safe_starts],
+        state_pool.shape[0] + jnp.arange(batch, dtype=jnp.int32),
+    ).astype(jnp.int32)
+    selected_state = state_pool.at[request_rows].get(mode="fill", fill_value=0.0)
 
     projected = hca_project_fused_pallas(
         x,
@@ -707,9 +951,9 @@ def hca_state_pool_update_ragged_fused_pallas(
         # emit zeros through ``boundary_valid``, and drop their scatters.
         boundary_valid = boundary_tokens < tokens
         safe_boundary_tokens = jnp.minimum(boundary_tokens, tokens - 1)
-        boundary_request_ids = (
-            jnp.searchsorted(query_starts, safe_boundary_tokens, side="right") - 1
-        ).astype(jnp.int32)
+        boundary_request_ids = (searchsorted_right(query_starts, safe_boundary_tokens) - 1).astype(
+            jnp.int32
+        )
         boundary_rows = request_slots[safe_boundary_tokens].astype(jnp.int32)
         boundary_positions = positions[safe_boundary_tokens].astype(jnp.int32)
         group_positions = (
@@ -717,29 +961,55 @@ def hca_state_pool_update_ragged_fused_pallas(
             - jnp.arange(compress_ratio - 1, -1, -1, dtype=jnp.int32)[None, :]
         )
         group_slots = jnp.mod(group_positions, compress_ratio)
-        historical = state_pool.at[boundary_rows[:, None], group_slots].get(
-            mode="promise_in_bounds"
-        )
         current_indices = (
             query_starts[boundary_request_ids, None]
             + group_positions
             - prefix_lens[boundary_request_ids, None]
         )
         current_valid = group_positions >= prefix_lens[boundary_request_ids, None]
-        safe_current = jnp.clip(current_indices, 0, tokens - 1)
-        current = projected[safe_current]
-        snapshots = jnp.where(current_valid[:, :, None, None], current, historical)
         group_starts = jnp.clip(boundary_positions + 1 - compress_ratio, 0, cos.shape[0] - 1)
         cos_selected = cos.at[group_starts].get(mode="promise_in_bounds")
         sin_selected = sin.at[group_starts].get(mode="promise_in_bounds")
-        pooled = _hca_emit_selected_pallas(
-            snapshots,
-            boundary_valid,
-            norm_weight,
-            jnp.concatenate((cos_selected, sin_selected), axis=-1),
-            schedule=schedule,
-            norm_eps=norm_eps,
-        )
+        if compress_ratio == 128 and state_pool.shape[1:] == (128, 2, head_dim) and tokens >= 128:
+            # No [N, 128, 2, D] gathers: the kernel DMAs each boundary's ring slab and
+            # its 128 chunk rows and masks by position (see the kernel docstring).
+            prefix_b = prefix_lens[boundary_request_ids]
+            n_cur = jnp.clip(boundary_positions + 1 - prefix_b, 0, compress_ratio)
+            first_cur = (
+                query_starts[boundary_request_ids]
+                + (boundary_positions - (compress_ratio - 1))
+                - prefix_b
+            )
+            start = jnp.clip(first_cur, 0, tokens - compress_ratio)
+            pooled = _hca_emit_boundary_native_pallas(
+                state_pool,
+                projected,
+                boundary_rows,
+                start,
+                start - first_cur,
+                n_cur,
+                jnp.mod(boundary_positions, compress_ratio),
+                boundary_valid,
+                norm_weight,
+                jnp.concatenate((cos_selected, sin_selected), axis=-1),
+                norm_eps=norm_eps,
+                schedule=schedule,
+            )
+        else:
+            historical = state_pool.at[boundary_rows[:, None], group_slots].get(
+                mode="promise_in_bounds"
+            )
+            safe_current = jnp.clip(current_indices, 0, tokens - 1)
+            current = projected[safe_current]
+            snapshots = jnp.where(current_valid[:, :, None, None], current, historical)
+            pooled = _hca_emit_selected_pallas(
+                snapshots,
+                boundary_valid,
+                norm_weight,
+                jnp.concatenate((cos_selected, sin_selected), axis=-1),
+                schedule=schedule,
+                norm_eps=norm_eps,
+            )
         emitted = emitted.at[boundary_tokens].set(pooled, mode="drop")
         emit_mask = emit_mask.at[boundary_tokens].set(True, mode="drop")
 
@@ -751,11 +1021,12 @@ def hca_state_pool_update_ragged_fused_pallas(
     safe_current = jnp.clip(current_indices, 0, tokens - 1)
     current = projected[safe_current]
     updated_selected = jnp.where(current_valid[:, :, None, None], current, selected_state)
-    # The batch contract (one live request per row) keeps ``request_rows``
-    # unique; padded requests, if ever added, must use dropped rows as above.
+    # Empty request rows can have query_start == tokens. Never let a clamped
+    # gather resolve these to the last live slot and overwrite its new state.
+    # Distinct dropped rows also keep unique_indices true with several pads.
     updated_pool = state_pool.at[request_rows].set(
         updated_selected,
-        mode="promise_in_bounds",
+        mode="drop",
         indices_are_sorted=False,
         unique_indices=True,
     )

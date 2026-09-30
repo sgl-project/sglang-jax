@@ -33,6 +33,26 @@ def _prepare_static_quantization(model_config, model):
     return model
 
 
+def validate_model_parameters(model, *, allow_shared: bool = False) -> None:
+    """Reject unfilled parameters, optionally deferring explicit target-shared weights."""
+    shared = (
+        set(model.get_shared_weight_paths())
+        if allow_shared and hasattr(model, "get_shared_weight_paths")
+        else set()
+    )
+    missing = [
+        ".".join(map(str, path))
+        for path, param in nnx.state(model, nnx.Param).flat_state()
+        if isinstance(param.value, jax.ShapeDtypeStruct) and ".".join(map(str, path)) not in shared
+    ]
+    from sgl_jax.srt.model_loader.weights.source import coordinate_error
+
+    coordinate_error(
+        ValueError(f"Unloaded model parameters: {missing[:20]}") if missing else None,
+        "final parameter validation",
+    )
+
+
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
 
@@ -255,17 +275,7 @@ class JAXModelLoader(DefaultModelLoader):
         model = _prepare_static_quantization(model_config, model)
         model.load_weights(model_config)
 
-        missing = [
-            jax.tree_util.keystr(path)
-            for path, value in jax.tree_util.tree_flatten_with_path(nnx.state(model, nnx.Param))[0]
-            if isinstance(value, jax.ShapeDtypeStruct)
-        ]
-        from sgl_jax.srt.model_loader.weights.source import coordinate_error
-
-        coordinate_error(
-            (ValueError(f"Unloaded model parameters: {missing[:20]}") if missing else None),
-            "final parameter validation",
-        )
+        validate_model_parameters(model, allow_shared=True)
 
         print_parameter_shardings(model)
 

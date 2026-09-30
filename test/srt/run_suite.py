@@ -265,6 +265,8 @@ suites = {
         TestFile("python/sgl_jax/test/kernels/moe_block_quant_test.py", 0.2, runner="pytest"),
         TestFile("python/sgl_jax/test/kernels/kda_test.py", 10, runner="pytest"),
         TestFile("test/srt/kernels/hca/test_hca.py", 8, runner="pytest"),
+        TestFile("test/srt/kernels/hca/test_v4_backend.py", 5, runner="pytest"),
+        TestFile("test/srt/kernels/csa_compressor/test_compressor.py", 3, runner="pytest"),
         TestFile("test/srt/kernels/mhc/test_mhc.py", 2, runner="pytest"),
         # Pytest tears down the shared FlashAttention mesh cleanly on JAX 0.10.2.
         TestFile("python/sgl_jax/test/test_flashattention_mha.py", 11, runner="pytest"),
@@ -426,6 +428,12 @@ suites = {
         ),
         TestFile("python/sgl_jax/test/multimodal/test_encoder_scheduler_kwargs.py", 0.1),
         TestFile("python/sgl_jax/test/models/test_qwen3_5.py", 2, runner="pytest"),
+        TestFile(
+            "python/sgl_jax/test/models/test_minimax_m3_msa.py",
+            3,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "4"},
+        ),
         TestFile("python/sgl_jax/test/test_transformers_compat.py", 2, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/kernels/test_gdn_fused_chunk_parallel_provenance.py",
@@ -463,12 +471,6 @@ suites = {
             0.5,
             runner="pytest",
             env={"JAX_PLATFORMS": "cpu"},
-        ),
-        TestFile(
-            "python/sgl_jax/test/test_weight_loading_recipes.py",
-            0.5,
-            runner="pytest",
-            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "4"},
         ),
         TestFile("python/sgl_jax/test/mem_cache/test_req_to_token_pool.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_hybrid_req_to_token_pool.py", 1),

@@ -286,6 +286,13 @@ def _build_hybrid_pools(
 
 def _build_non_hybrid_memory_pools(token_to_kv_pool) -> MemoryPools:
     """Wrap a single KV pool in MemoryPools."""
+    from sgl_jax.srt.mem_cache.memory_pool import MSAIndexKProxy, MSATokenToKVPool
+
+    if isinstance(token_to_kv_pool, MSATokenToKVPool):
+        return MemoryPools(
+            token_to_kv_pool=token_to_kv_pool,
+            msa_index_k=MSAIndexKProxy(token_to_kv_pool),
+        )
     return MemoryPools(token_to_kv_pool=token_to_kv_pool)
 
 
@@ -366,13 +373,18 @@ class ModelRunnerKVCacheMixin:
             )
             return int(full_cost + swa_cost)
 
-        return (
+        main_kv = (
             self.model_config.get_num_kv_heads(self.attention_tp_size)
             * align128(self.model_config.head_dim)
             * 2
             * num_layers
             * dtype_size
         )
+        # Backends may keep extra per-token cache (e.g. MSA index_k, not tensor-sharded).
+        extra = getattr(self.attn_backend, "extra_kv_bytes_per_token", None)
+        if extra is not None:
+            main_kv += extra(dtype_size)
+        return main_kv
 
     def _profile_available_bytes(self: ModelRunner, total_device_memory: int) -> int:
         """Profile available bytes for KV cache (+ recurrent state)."""
@@ -729,9 +741,7 @@ class ModelRunnerKVCacheMixin:
                 **dsa_kwargs,
             )
         else:
-            pool_class = getattr(self.attn_backend, "token_to_kv_pool_class", MHATokenToKVPool)
-            return self._maybe_wrap_hybrid_kv_pool(
-                pool_class,
+            mha_kwargs = dict(
                 head_num=self.model_config.get_total_num_kv_heads_with_replication(
                     self.attention_tp_size
                 ),
@@ -739,6 +749,9 @@ class ModelRunnerKVCacheMixin:
                 dp_size=dp_size,
                 abstract=abstract,
             )
+            pool_class = getattr(self.attn_backend, "token_to_kv_pool_class", MHATokenToKVPool)
+            pool_kwargs = dict(getattr(self.attn_backend, "token_to_kv_pool_kwargs", None) or {})
+            return self._maybe_wrap_hybrid_kv_pool(pool_class, **pool_kwargs, **mha_kwargs)
 
     def _init_pools(self: ModelRunner, max_num_reqs: int, dp_size: int):
         """Create ReqToTokenPool, KV pool, allocator, and MemoryPools."""
