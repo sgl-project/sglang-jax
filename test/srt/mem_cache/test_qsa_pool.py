@@ -17,8 +17,10 @@ import jax
 import jax.numpy as jnp
 
 from sgl_jax.srt.mem_cache.memory_pool import (
+    GB,
     HybridLinearKVPool,
     MemoryPools,
+    MHATokenToKVPool,
     MLATokenToKVPool,
     QSATokenToKVPool,
 )
@@ -102,6 +104,24 @@ class TestQSAPoolBuffers(CustomTestCase):
             b.size * b.dtype.itemsize for b in pool.compressed_key_buffer + pool.open_group_buffer
         )
         self.assertEqual(pool.get_indexer_size_bytes(), counted)
+
+    def test_reported_size_includes_the_indexer(self):
+        """``mem_usage``, which the scheduler reports, and ``get_kv_size_bytes``
+        are the GQA pool's figures plus the compressed cache and the ring."""
+        pool = _pool()
+        plain = MHATokenToKVPool(
+            size=pool.size,
+            page_size=PAGE_SIZE,
+            dtype=pool.dtype,
+            head_num=pool.head_num,
+            head_dim=pool.head_dim,
+            layer_num=pool.layer_num,
+            mesh=_mesh(),
+        )
+        indexer = pool.get_indexer_size_bytes()
+        self.assertGreater(indexer, 0)
+        self.assertEqual(sum(pool.get_kv_size_bytes()), sum(plain.get_kv_size_bytes()) + indexer)
+        self.assertAlmostEqual(pool.mem_usage, plain.mem_usage + indexer / GB)
 
     def test_pytree_round_trip_preserves_the_indexer_state(self):
         """Flatten/unflatten keeps both new buffers and the geometry fields, so the

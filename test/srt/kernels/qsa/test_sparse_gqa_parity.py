@@ -189,6 +189,24 @@ class TestSparseGQAParity(CustomTestCase):
         still = _rel_err(_run({**case, "cache": _repack(case, bump(pos + 1))}), base)
         self.assertLess(still, 1e-6)
 
+    def test_a_closed_group_reads_nothing_past_the_query(self):
+        """When the query closes its group there is no open tail, and the unit
+        after it may not be written yet: NaN there leaves the output unchanged."""
+        case = _build(dtype=jnp.float32, t_count=1, k_blocks=32, n_reqs=1, seed=13)
+        pos = 71  # 71 = 17*4 + 3, so the group [68, 72) is closed
+        case["pos"] = jnp.asarray([pos], jnp.int32)
+        blocks = np.full((1, 32), -1, np.int32)
+        blocks[0, :18] = np.arange(18, dtype=np.int32)  # tokens 0..71
+        case["blk"] = jnp.asarray(blocks)
+        base = _run(case)
+
+        page = int(case["page_table"][0, (pos + 1) // PAGE_SIZE])
+        row = (pos + 1) % PAGE_SIZE
+        poisoned = case["v_log"].at[page, row : row + RATIO].set(jnp.nan)
+        got = _run({**case, "cache": _repack(case, poisoned)})
+        self.assertTrue(bool(jnp.all(jnp.isfinite(got))))
+        self.assertLess(_rel_err(got, base), 1e-6)
+
     def test_swapped_kv_is_rejected(self):
         """Reading V where K lives is an O(1) error, well clear of the bf16
         rounding the parity threshold allows."""

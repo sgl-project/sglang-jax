@@ -1075,6 +1075,16 @@ class QSATokenToKVPool(MHATokenToKVPool):
         ) + self._shape_bytes(self._ring_shape(), self.dtype)
         return per_slot * self.num_indexer_layers
 
+    def _calculate_memory_usage(self):
+        super()._calculate_memory_usage()
+        self.mem_usage += self.get_indexer_size_bytes() / GB
+
+    def get_kv_size_bytes(self):
+        """The fused KV sizes, with the compressed cache and the ring counted on
+        the K side: the ``(k, v)`` pair has no slot of its own for them."""
+        k_size, v_size = super().get_kv_size_bytes()
+        return k_size + self.get_indexer_size_bytes(), v_size
+
     def replace_buffer(self, buffers) -> None:
         """Accept the plain KV list, or the (kv, compressed, ring) triple a QSA
         model returns as its ``token_to_kv_pool`` update."""

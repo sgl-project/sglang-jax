@@ -185,12 +185,19 @@ def _kernel(
 
     # The open group: tokens after the last complete block. They never entered
     # the compressed cache, so they never competed in the top-k, but they are
-    # causally visible. One more unit, with the future lanes masked off; the
-    # step is inert when the group happens to be closed.
+    # causally visible. One more unit, with the future lanes masked off.
     tail_unit = (qpos + 1) // ratio
-    _copy(tail_unit, 0).start()
+
+    # A closed group leaves no open tokens, and the unit past it may not be
+    # written yet, so it is not fetched. The step then masks every lane over
+    # rows the last chunk already attended, and contributes nothing.
+    @pl.when(tail_unit * ratio <= qpos)
+    def _():
+        copy = _copy(tail_unit, 0)
+        copy.start()
+        copy.wait()
+
     tail_valid = (lane < ratio) & (tail_unit * ratio + lane <= qpos)
-    _copy(tail_unit, 0).wait()
     m_i, l_i, acc = _attend(jnp.where(tail_valid, 0.0, float("-inf")), carry)
 
     o_ref[0] = (acc / jnp.where(l_i == 0.0, 1.0, l_i)[:, None]).astype(o_ref.dtype)
