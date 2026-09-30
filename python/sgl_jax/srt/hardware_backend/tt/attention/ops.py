@@ -109,12 +109,6 @@ def causal_conv1d_update(state, value, weight, indices, initial):
 
 
 def gated_delta_decode(state, q, k, v, b, a, A_log, dt_bias, indices, initial, **attributes):
-    """One recurrent step; returns the new state and the [T, H, D] output.
-
-    q, k and v are [T, heads, D], or heads of flat [T, heads * D] tensors,
-    selected by the kernel's optional attributes (head offsets, num_key_heads,
-    normalize_eps and query_scale).
-    """
     return _recurrent_call(
         "tt.gated_delta_decode",
         state,
