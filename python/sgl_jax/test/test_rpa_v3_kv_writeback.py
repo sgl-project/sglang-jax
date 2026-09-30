@@ -98,3 +98,66 @@ def test_kv_writeback(sequences, page_size, window, chunk_size, sink):
     )
     # Includes all new KV, the unchanged prefix, page tails and guard pages.
     np.testing.assert_array_equal(updated_cache.astype(np.float32), expected_cache)
+
+
+@pytest.mark.skipif(jax.default_backend() != "tpu", reason="Requires TPU DMA support")
+@pytest.mark.parametrize("kv_len,window", [(128, None), (129, 64)])
+def test_read_only_attention_uses_only_committed_cache(kv_len, window):
+    """Query-only attention must ignore supplied K/V and preserve the cache."""
+    page_size = 128
+    num_pages = (kv_len + page_size - 1) // page_size
+    num_heads, head_dim = 4, 128
+    rng = np.random.default_rng(7)
+    cache = rng.uniform(
+        -0.25,
+        0.25,
+        (num_pages + 1, page_size, 1, 2, head_dim),
+    ).astype(np.float32)
+    cache_bf16 = jnp.asarray(cache, jnp.bfloat16)
+    expected_cache = np.asarray(jax.device_get(cache_bf16), np.float32)
+    query = jnp.asarray(rng.uniform(-0.25, 0.25, (1, num_heads, head_dim)), jnp.bfloat16)
+    page_indices = jnp.arange(num_pages, dtype=jnp.int32)
+    reference_pages = page_indices[None, :]
+    kv_lens = jnp.array([kv_len], dtype=jnp.int32)
+    cu_q_lens = jnp.array([0, 1], dtype=jnp.int32)
+    attention_args = dict(sm_scale=head_dim**-0.5, sliding_window=window)
+    expected_output = ref_ragged_paged_attention(
+        query,
+        cache_bf16[:, :, :, 0, :],
+        cache_bf16[:, :, :, 1, :],
+        kv_lens,
+        reference_pages,
+        cu_q_lens,
+        jnp.array([1], dtype=jnp.int32),
+        **attention_args,
+    )
+
+    outputs = []
+    for fill in (3.0, -5.0):
+        dummy = jnp.full((1, 1, head_dim), fill, dtype=jnp.bfloat16)
+        output, updated_cache = ragged_paged_attention(
+            query,
+            dummy,
+            -dummy,
+            jnp.asarray(cache, jnp.bfloat16),
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            jnp.array([0, num_pages * page_size], dtype=jnp.int32),
+            jnp.array([1, 1, 1], dtype=jnp.int32),
+            None,
+            append_kv=False,
+            d_block_sizes=(1, 256, 1, 256),
+            **attention_args,
+        )
+        output, updated_cache = jax.device_get((output, updated_cache))
+        outputs.append(output)
+        np.testing.assert_array_equal(updated_cache.astype(np.float32), expected_cache)
+
+    np.testing.assert_allclose(
+        outputs[0].astype(np.float32),
+        np.asarray(expected_output, np.float32),
+        atol=0.03,
+        rtol=0.03,
+    )
+    np.testing.assert_array_equal(outputs[0], outputs[1])

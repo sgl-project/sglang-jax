@@ -26,6 +26,7 @@ from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.managers.tp_worker import ModelWorker
+from sgl_jax.srt.speculative.draft_extend_fused import _make_eagle3_decode_metadata
 from sgl_jax.srt.speculative.eagle_draft_worker import EagleDraftWorkerBase
 from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
 from sgl_jax.srt.speculative.eagle_util import build_chain_verify_inputs_device
@@ -40,6 +41,11 @@ from sgl_jax.srt.speculative.relay_buffer import (
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
+
+
+def _frozen_kv_positions(seq_lens):
+    """Position every assistant query at the final committed target token."""
+    return jnp.maximum(seq_lens - 1, 0)
 
 
 def _frozen_kv_verify_and_publish(
@@ -280,7 +286,6 @@ def _build_frozen_kv_fused_draft_extend(num_steps: int):
         forward_batch,
         memory_pools,
         logits_metadata,
-        metadata_per_step,
         seed_relay_buffers,
         relay_future_indices,
         relay_seed_mask,
@@ -290,6 +295,20 @@ def _build_frozen_kv_fused_draft_extend(num_steps: int):
     ):
         state = jax.tree_util.tree_unflatten(model_state_def, model_leaves)
         model = nnx.merge(model_def, state)
+        # The assistant is query-only. Build one decode view of the committed
+        # target prefix on device and reuse it for the seed call and every
+        # recurrent proposal. Allocated-but-uncommitted rows must never become
+        # visible merely because the draft depth advances.
+        frozen_metadata = _make_eagle3_decode_metadata(
+            forward_batch.attn_backend.forward_metadata,
+            forward_batch.seq_lens,
+            forward_batch.spec_info.allocate_lens,
+            page_size=forward_batch.attn_backend.page_size,
+            dp_size=dp_size,
+        )
+        frozen_positions = _frozen_kv_positions(forward_batch.seq_lens)
+        forward_batch.positions = frozen_positions
+        forward_batch.attn_backend.forward_metadata = frozen_metadata
         (
             relay_verified_id,
             relay_draft_token,
@@ -305,9 +324,7 @@ def _build_frozen_kv_fused_draft_extend(num_steps: int):
         # assistant-state transition. This call also runs for padded rows so
         # the executable shape is independent of the live request count.
         forward_batch.input_ids = relay_verified_id
-        forward_batch.positions = forward_batch.seq_lens - 1
         forward_batch.spec_info.hidden_states = relay_hidden
-        forward_batch.attn_backend.forward_metadata = metadata_per_step[0]
         output, pool_updates, _, _ = model(
             forward_batch,
             memory_pools,
@@ -325,13 +342,11 @@ def _build_frozen_kv_fused_draft_extend(num_steps: int):
         proposal_token_sharding = jax.typeof(token).sharding
 
         # The seed call produced proposal zero.  Each remaining call consumes
-        # the previous assistant token/hidden state at the same target-KV view
-        # used by the legacy Frozen recurrence for that speculative position.
-        for step in range(num_steps - 1):
+        # the previous assistant token/hidden state while retaining the same
+        # committed target-KV view and target position.
+        for _step in range(num_steps - 1):
             forward_batch.input_ids = token
-            forward_batch.positions = forward_batch.seq_lens + step
             forward_batch.spec_info.hidden_states = hidden
-            forward_batch.attn_backend.forward_metadata = metadata_per_step[step]
             output, pool_updates, _, _ = model(
                 forward_batch,
                 memory_pools,
@@ -1056,8 +1071,12 @@ class FrozenKvMtpDraftWorker(EagleDraftWorkerBase):
         )
 
         runner = self.draft_model_runner
-        metadata_per_step = runner.attn_backend.get_eagle_multi_step_metadata(model_worker_batch)
-        runner.attn_backend.forward_metadata = metadata_per_step[0]
+        # Upload the scheduler-owned allocated page table once. The fused
+        # program compacts it to the committed Frozen-KV prefix on device and
+        # reuses that metadata for every proposal step.
+        runner.attn_backend.forward_metadata = runner.attn_backend.get_eagle_base_metadata(
+            model_worker_batch
+        )
         forward_batch = _make_forward_batch(model_worker_batch, runner)
         forward_batch.bid = model_worker_batch.bid
         logits_metadata = _prepare_logits_metadata(model_worker_batch, self.mesh)
@@ -1092,7 +1111,6 @@ class FrozenKvMtpDraftWorker(EagleDraftWorkerBase):
                 forward_batch,
                 runner.memory_pools,
                 logits_metadata,
-                tuple(metadata_per_step),
                 self.seed_relay_buffers,
                 relay_future_indices,
                 relay_seed_mask,

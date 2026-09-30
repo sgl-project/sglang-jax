@@ -59,6 +59,7 @@ class NativeAttention(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
+        save_kv_cache: bool = True,
         **kwargs,
     ):
         """
@@ -71,7 +72,12 @@ class NativeAttention(AttentionBackend):
         """
         # TODO(pc) support tree based native attention backend
         k_buffer, v_buffer, kv_fused = self._get_and_update_kv_cache(
-            k, v, forward_batch, token_to_kv_pool, layer.layer_id
+            k,
+            v,
+            forward_batch,
+            token_to_kv_pool,
+            layer.layer_id,
+            save_kv_cache=save_kv_cache,
         )
 
         scale = 1.0 / jnp.sqrt(layer.head_dim) if layer.scaling is None else layer.scaling
@@ -123,6 +129,8 @@ class NativeAttention(AttentionBackend):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         layer_id: int,
+        *,
+        save_kv_cache: bool = True,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """
         Update KV cache and return (k_3d, v_3d, fused_5d).
@@ -131,19 +139,22 @@ class NativeAttention(AttentionBackend):
         used by forward_attention for the actual attention computation.
         """
         if is_tpu_runtime():
-            if forward_batch.forward_mode.is_extend():
-                token_to_kv_pool.set_kv_buffer(
-                    layer_id, forward_batch.out_cache_loc, k, v, is_decode=False
-                )
-            else:
-                token_to_kv_pool.set_kv_buffer(
-                    layer_id, forward_batch.out_cache_loc, k, v, is_decode=True
-                )
+            if save_kv_cache:
+                if forward_batch.forward_mode.is_extend():
+                    token_to_kv_pool.set_kv_buffer(
+                        layer_id, forward_batch.out_cache_loc, k, v, is_decode=False
+                    )
+                else:
+                    token_to_kv_pool.set_kv_buffer(
+                        layer_id, forward_batch.out_cache_loc, k, v, is_decode=True
+                    )
             fused_5d = token_to_kv_pool.get_fused_kv_buffer(layer_id)
-        else:
+        elif save_kv_cache:
             fused_5d = token_to_kv_pool.set_kv_buffer_legacy(
                 layer_id, forward_batch.out_cache_loc, k, v
             )
+        else:
+            fused_5d = token_to_kv_pool.get_fused_kv_buffer(layer_id)
 
         # Flatten 5D -> 3D: [pages, page_size, heads_x2_per_pack, pack, hdim] -> [tokens, heads_x2, hdim]
         num_pages, page_size, heads_x2_per_pack, packing, head_dim = fused_5d.shape

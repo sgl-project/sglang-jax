@@ -376,6 +376,7 @@ def _ragged_paged_attention_kernel_loop(
     bkv_csz,  # bkv compute size
     case: RpaCase = RpaCase.MIXED,
     skip_kv_mask: bool = False,
+    append_kv: bool = True,
     tpu_version: int = 6,
     debug_mode: bool = False,
 ):
@@ -657,8 +658,17 @@ def _ragged_paged_attention_kernel_loop(
         q_len = q_end - q_start
 
         kv_left = kv_len - kv_len_start
-        kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
-        kv_left_frm_new = kv_left - kv_left_frm_cache
+        # Ordinary autoregressive attention treats each query row as one new
+        # K/V row. Query-only models such as Gemma 4's Frozen-KV assistant do
+        # not own K/V: every visible row is already committed in the target
+        # cache, and the supplied shape-only K/V tensors must not participate
+        # in either attention or cache write-back.
+        if append_kv:
+            kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
+            kv_left_frm_new = kv_left - kv_left_frm_cache
+        else:
+            kv_left_frm_cache = kv_left
+            kv_left_frm_new = jnp.zeros_like(kv_left)
 
         bkv_sz_frm_cache = jnp.minimum(kv_left_frm_cache, bkv_sz)
         bkv_sz_frm_new = jnp.minimum(bkv_sz - bkv_sz_frm_cache, kv_left_frm_new)
@@ -680,13 +690,14 @@ def _ragged_paged_attention_kernel_loop(
                     wait=False,
                 )
 
-            new_kv_len_start = q_end - kv_left_frm_new
-            _async_copy(
-                kv_hbm_ref.at[pl.ds(new_kv_len_start, bkv_sz_frm_new)],
-                vmem_ref.at[pl.ds(bkv_sz_frm_cache, bkv_sz_frm_new)],
-                sem,
-                wait,
-            )
+            if append_kv:
+                new_kv_len_start = q_end - kv_left_frm_new
+                _async_copy(
+                    kv_hbm_ref.at[pl.ds(new_kv_len_start, bkv_sz_frm_new)],
+                    vmem_ref.at[pl.ds(bkv_sz_frm_cache, bkv_sz_frm_new)],
+                    sem,
+                    wait,
+                )
         else:
             dst = vmem_ref.at[pl.ds(0, bkv_sz_frm_cache + bkv_sz_frm_new)]
             _async_copy(
@@ -1042,9 +1053,11 @@ def _ragged_paged_attention_kernel_loop(
 
                 # Start updating bkv to kv cache if applicable.
                 # Only needed in last bq loop.
-                @pl.when(jnp.logical_and(update_sz > 0, bq_idx == num_bq - 1))
-                def update_cur_bkv_to_cache():
-                    start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz)
+                if append_kv:
+
+                    @pl.when(jnp.logical_and(update_sz > 0, bq_idx == num_bq - 1))
+                    def update_cur_bkv_to_cache():
+                        start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz)
 
                 if debug_mode:
                     return
@@ -1704,6 +1717,7 @@ def get_vmem_limit():
         "vmem_limit_bytes",
         "out_dtype",
         "skip_kv_mask",
+        "append_kv",
         "disable_semaphore_checks",
         "debug_mode",
     ),
@@ -1739,6 +1753,7 @@ def ragged_paged_attention(
     vmem_limit_bytes: int | None = None,
     out_dtype=None,
     skip_kv_mask: bool = False,
+    append_kv: bool = True,
     disable_semaphore_checks: bool = True,
     debug_mode: bool = False,
 ):
@@ -1775,6 +1790,9 @@ def ragged_paged_attention(
       p_block_sizes: block sizes for prefill.
       m_block_sizes: block sizes for mixed.
       vmem_limit_bytes: vmem limit for the pallas kernel.
+      append_kv: whether supplied K/V rows participate in attention and are
+        appended to the cache. Set false for query-only attention over an
+        already-committed cache.
       debug_mode: if true, skip DMAs and flash attention.
 
     Returns:
@@ -1992,6 +2010,7 @@ def ragged_paged_attention(
                 bkv_csz=bkv_csz,
                 case=case,
                 skip_kv_mask=skip_kv_mask,
+                append_kv=append_kv,
                 tpu_version=tpu_version,
                 debug_mode=debug_mode,
             ),

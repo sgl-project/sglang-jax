@@ -687,6 +687,7 @@ class FlashAttention(AttentionBackend):
         token_to_kv_pool: KVCache,
         causal: int = 1,
         attention_sink: jax.Array = None,
+        save_kv_cache: bool = True,
     ):
         """
         Args:
@@ -799,6 +800,7 @@ class FlashAttention(AttentionBackend):
                 ),
                 softmax_dtype=layer.softmax_dtype,
                 m_block_sizes=target_verify_m_block_sizes,
+                append_kv=save_kv_cache,
             )
 
             return result, updated_kv_cache_fused

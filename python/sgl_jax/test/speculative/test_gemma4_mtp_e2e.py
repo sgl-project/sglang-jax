@@ -37,6 +37,7 @@ from sgl_jax.srt.layers.attention.native_backend import NativeAttention
 from sgl_jax.srt.layers.embeddings import Embed
 from sgl_jax.srt.layers.kv_share import compute_mtp_kv_share_map
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import MemoryPools, MHATokenToKVPool
 from sgl_jax.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -45,7 +46,9 @@ from sgl_jax.srt.model_executor.forward_batch_info import (
 )
 from sgl_jax.srt.models.gemma4_mtp import Gemma4AssistantForCausalLM
 from sgl_jax.srt.speculative.base_worker import replicate_to_mesh
+from sgl_jax.srt.speculative.draft_extend_fused import _make_eagle3_decode_metadata
 from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
+from sgl_jax.srt.speculative.frozen_kv_mtp_worker import _frozen_kv_positions
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 # Pinned to a single device rather than create_device_mesh's "use everything":
@@ -161,6 +164,42 @@ def test_frozen_draft_steps_remap_target_pages_to_swa_pool():
             np.asarray(step_metadata.swa_page_indices)[:2],
             np.array([100, 200], dtype=np.int32),
         )
+
+
+def test_frozen_fused_metadata_keeps_committed_prefix_across_dp_and_padding():
+    """Frozen recurrence compacts once without exposing reserved pages."""
+    from sgl_jax.srt.layers.attention.flashattention_backend import (
+        FlashAttentionMetadata,
+    )
+
+    base = FlashAttentionMetadata(
+        page_indices=jnp.array([10, 11, 20, 21, 30, 31, 40, 41], dtype=jnp.int32),
+        swa_page_indices=jnp.array([110, 111, 120, 121, 130, 131, 140, 141], dtype=jnp.int32),
+    )
+    metadata = _make_eagle3_decode_metadata(
+        base,
+        seq_lens=jnp.array([7, 8, 9, 0], dtype=jnp.int32),
+        allocated_lens=jnp.array([16, 16, 16, 16], dtype=jnp.int32),
+        page_size=8,
+        dp_size=2,
+    )
+
+    np.testing.assert_array_equal(metadata.seq_lens, [7, 8, 9, 0])
+    np.testing.assert_array_equal(metadata.cu_q_lens, [0, 1, 2, 0, 1, 2])
+    np.testing.assert_array_equal(metadata.cu_kv_lens, [0, 8, 16, 0, 16, 16])
+    np.testing.assert_array_equal(metadata.distribution, [0, 0, 2, 0, 0, 1])
+    np.testing.assert_array_equal(metadata.page_indices, [10, 20, 0, 0, 30, 31, 0, 0])
+    np.testing.assert_array_equal(
+        metadata.swa_page_indices,
+        [110, 120, 0, 0, 130, 131, 0, 0],
+    )
+
+
+def test_frozen_positions_stay_at_final_committed_token():
+    np.testing.assert_array_equal(
+        _frozen_kv_positions(jnp.array([0, 1, 8, 9], dtype=jnp.int32)),
+        [0, 0, 7, 8],
+    )
 
 
 def _draft_config() -> PretrainedConfig:
@@ -418,6 +457,66 @@ class TestFrozenKvContract:
                 f"target KV layer {layer_id} contains zeros — the draft's dummy "
                 "K/V reached the shared pool"
             )
+
+    def test_native_read_only_attention_ignores_shape_only_kv(self):
+        """CPU guard for the same query-only contract used by TPU RPA."""
+        pool = _make_pool()
+        before = np.asarray(pool.kv_buffer[0]).copy()
+        hidden = jnp.zeros((1, BACKBONE_HIDDEN), dtype=DTYPE)
+        forward_batch = _make_forward_batch(1, 8, hidden)
+        layer = RadixAttention(
+            num_heads=NUM_HEADS,
+            head_dim=HEAD_DIM,
+            scaling=HEAD_DIM**-0.5,
+            num_kv_heads=NUM_KV_HEADS,
+            layer_id=0,
+        )
+        q = jnp.ones((1, NUM_HEADS, HEAD_DIM), dtype=DTYPE) * 0.25
+
+        outputs = []
+        with jax.set_mesh(MESH):
+            for fill in (3.0, -5.0):
+                shape_only_k = jnp.full((1, NUM_KV_HEADS, HEAD_DIM), fill, dtype=DTYPE)
+                shape_only_v = -shape_only_k
+                output, updated = forward_batch.attn_backend(
+                    q,
+                    shape_only_k,
+                    shape_only_v,
+                    layer,
+                    forward_batch,
+                    pool,
+                    save_kv_cache=False,
+                )
+                outputs.append(np.asarray(output))
+                np.testing.assert_array_equal(np.asarray(updated), before)
+
+        np.testing.assert_array_equal(outputs[0], outputs[1])
+
+    def test_model_reads_final_committed_target_kv_row(self, wired):
+        """Changing the final target row must change the assistant output.
+
+        Before the read-only attention path, the model replaced this row with
+        its zero dummy K/V before computing attention, so both outputs were
+        identical even though the target cache differed.
+        """
+        model, share_map = wired
+        pools = [_make_pool(), _make_pool()]
+        target_layers = {int(name.split(".")[-1]) for name in share_map.values()}
+        with jax.set_mesh(MESH):
+            for value, pool in zip((2.0, 9.0), pools, strict=True):
+                for layer_id in target_layers:
+                    buffer = pool.kv_buffer[layer_id]
+                    pool.kv_buffer[layer_id] = buffer.at[7].set(
+                        value,
+                        out_sharding=jax.typeof(buffer).sharding,
+                    )
+
+        hidden = jnp.ones((1, BACKBONE_HIDDEN), dtype=DTYPE) * 0.1
+        outputs = [
+            _run_draft(model, pool, num_tokens=1, seq_len=8, hidden=hidden)[0].hidden_states
+            for pool in pools
+        ]
+        assert not np.allclose(np.asarray(outputs[0]), np.asarray(outputs[1]))
 
 
 class TestHiddenStateSpace:

@@ -175,7 +175,9 @@ class Gemma4MTPAttention(nnx.Module):
         dummy_k = jnp.zeros_like(q)
         q, _ = self.rotary_emb(positions, q, dummy_k)
 
-        # Dummy K/V — real K/V from target KV cache via redirected layer_id.
+        # Shape-only K/V — real K/V comes entirely from the redirected target
+        # cache. ``save_kv_cache=False`` makes the attention backend ignore
+        # these values in both softmax and cache write-back.
         # Name the sharding: a bare jnp.zeros() is REPLICATED under an explicit
         # mesh, whereas real projected K/V (and q above) are head-sharded on
         # "tensor". The attention backend's shard_map in_specs expect the latter,
@@ -193,7 +195,14 @@ class Gemma4MTPAttention(nnx.Module):
             out_sharding=kv_sharding,
         )
 
-        attn_output, kv_fused = self.attn(q, dummy_k, dummy_v, forward_batch, token_to_kv_pool)
+        attn_output, kv_fused = self.attn(
+            q,
+            dummy_k,
+            dummy_v,
+            forward_batch,
+            token_to_kv_pool,
+            save_kv_cache=False,
+        )
         output, _ = self.o_proj(attn_output)
         return output, kv_fused
 
