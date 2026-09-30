@@ -54,3 +54,28 @@ def test_mla_absorption_hook_rewrites_kv_b_proj():
         targets = {t for spec in mappings.values() for t in _targets(spec)}
         assert not any(t.startswith(prefix + ".kv_b_proj.") for t in targets), prefix
         assert prefix + ".w_uk" in targets and prefix + ".w_uv" in targets, prefix
+
+
+def test_no_mapping_reads_the_bf16_expert_weights_k3_does_not_ship():
+    """The routed experts are MXFP4 and loaded by _fixup_moe_mxfp4. A spec reading bf16
+    experts.N.w{1,2,3}.weight makes the shared loader's planning step fail on every rank."""
+    _, mappings = _build()
+    readers = [
+        k
+        for k, spec in mappings.items()
+        for src in (k, *spec.sources)
+        if ".block_sparse_moe.experts." in src
+    ]
+    assert not readers, readers[:4]
+
+
+def test_every_checkpoint_name_carries_the_text_prefix():
+    model, mappings = _build()
+    prefix = model.TEXT_PREFIX
+    unprefixed = [
+        src
+        for k, spec in mappings.items()
+        for src in (k, *spec.sources)
+        if not src.startswith(prefix)
+    ]
+    assert not unprefixed, unprefixed[:4]

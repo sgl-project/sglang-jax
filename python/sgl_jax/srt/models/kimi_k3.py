@@ -16,6 +16,7 @@ Architecture (from the released config.json): 93 layers, ``kda_layers`` lists 69
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import re
@@ -1198,7 +1199,26 @@ class KimiK3ForCausalLM(nnx.Module):
             cfg.is_kda_layer = lambda i, _c=cfg: cfg_is_kda_layer(_c, i)
 
         base = KimiLinearForCausalLM._create_weight_mappings(self)
-        mappings = {self.TEXT_PREFIX + k: v for k, v in base.items()}
+        # The prefix applies to every checkpoint name a spec reads: the mapping key, and for
+        # grouped specs their ``sources`` too.
+        mappings = {
+            self.TEXT_PREFIX
+            + k: (
+                dataclasses.replace(v, sources=tuple(self.TEXT_PREFIX + x for x in v.sources))
+                if v.sources
+                else v
+            )
+            for k, v in base.items()
+        }
+        # K3's routed experts ship as MXFP4 (``weight_packed`` + ``weight_scale``), not the bf16
+        # ``w1/w2/w3`` the inherited expert groups read; _fixup_moe_mxfp4 loads them. The shared
+        # loader plans every declared input and fails on an absent one, so drop those groups.
+        for key in [
+            k
+            for k, v in mappings.items()
+            if any(".block_sparse_moe.experts." in x for x in v.sources)
+        ]:
+            del mappings[key]
 
         if not cfg_uses_attn_res(self.config):
             return mappings
@@ -1281,6 +1301,10 @@ class KimiK3ForCausalLM(nnx.Module):
         # --- LatentMoE down/norm/up ---------------------------------------------------------
         if getattr(self.config, "routed_expert_hidden_size", None) is not None:
             for i in range(self.config.num_hidden_layers):
+                # Only MoE layers carry the latent projections (dense layers, i <
+                # first_k_dense_replace, do not), in the checkpoint and in the built model.
+                if not hasattr(self.model.layers[i], "routed_expert_down_proj"):
+                    continue
                 stem = f"{self.TEXT_PREFIX}model.layers.{i}.block_sparse_moe"
                 # checkpoint nests these under `block_sparse_moe.`; the JAX modules hang off the
                 # DECODER LAYER (next to block_sparse_moe), so the target stem is one level up.
