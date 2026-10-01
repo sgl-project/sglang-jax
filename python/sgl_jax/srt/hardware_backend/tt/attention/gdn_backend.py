@@ -85,7 +85,8 @@ class TTGDNAttnBackend(GDNAttnBackend):
         if batch.forward_mode.is_extend():
             # Prefill packs each live sequence; exclude the scheduler's dummy rows.
             size = batch.real_bs
-            meta.cu_q_lens = meta.cu_q_lens[: size + 1]
+            cu_q_lens = meta.cu_q_lens
+            meta.cu_q_lens = cu_q_lens.at[: size + 1].get(out_sharding=cu_q_lens.sharding)
             # The native kernel needs dense sequences. Bucket the longest one
             # instead of padding every sequence to the entire batch length.
             length = int(batch.extend_seq_lens[:size].max())
