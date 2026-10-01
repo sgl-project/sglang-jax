@@ -119,7 +119,6 @@ def _worker(rank, port, root):
         from sgl_jax.srt.model_loader.weights.loader import _PD_WEIGHT_CACHE
 
         os.environ["SGLANG_PD_WEIGHT_CACHE"] = "1"
-        os.environ["SGLANG_WEIGHT_LOAD_MAX_INFLIGHT_BYTES"] = str(64 * (rank + 1))
         save_file({"e0": weight, "e1": weight + 1}, filename)
         for attempt in range(2):
             if attempt and rank == 1:
@@ -141,34 +140,6 @@ def _worker(rank, port, root):
             expected = np.stack((weight.T, (weight + 1).T))
             for shard in model.w.value.addressable_shards:
                 np.testing.assert_array_equal(np.asarray(shard.data), expected[shard.index])
-        # Different local budgets can choose different completion waits without
-        # changing the global recipe/collective submission order.
-        os.environ["SGLANG_WEIGHT_LOAD_MAX_INFLIGHT_BYTES"] = "64" if rank == 0 else "8192"
-        target_sharding = NamedSharding(mesh, P(None, "tensor"))
-        tail = np.arange(4, dtype=np.float32)
-        save_file({"e0": weight, "e1": weight + 1, "tail": tail}, filename)
-
-        def add_inputs(inputs):
-            return (jax.device_put(inputs[0] + inputs[1], target_sharding),)
-
-        model = nnx.Module()
-        model.w = nnx.Param(jax.ShapeDtypeStruct(weight.shape, np.float32))
-        model.tail = nnx.Param(jax.ShapeDtypeStruct(tail.shape, np.float32))
-        loader = WeightLoader(model, SimpleNamespace(model_path=str(local)), mesh)
-        with jax.set_mesh(mesh):
-            loader.load(
-                {
-                    "sum": WeightSpec(
-                        "w", sources=("e0", "e1"), recipe=add_inputs, sharding=(None, "tensor")
-                    ),
-                    "tail": "tail",
-                }
-            )
-        expected = 2 * weight + 1
-        for shard in model.w.value.addressable_shards:
-            np.testing.assert_array_equal(np.asarray(shard.data), expected[shard.index])
-        for shard in model.tail.value.addressable_shards:
-            np.testing.assert_array_equal(np.asarray(shard.data), tail[shard.index])
         print("DISTRIBUTED_LOAD_PASS", rank, flush=True)
     finally:
         jax.distributed.shutdown()

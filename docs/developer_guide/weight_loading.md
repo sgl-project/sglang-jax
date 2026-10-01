@@ -151,10 +151,5 @@ Local and RunAI selection remains controlled by the existing load-format CLI.
 
 `test_weight_loading_distributed.py` starts two real JAX CPU controllers and
 checks rank-local roots, inconsistent plans, read failures, and asymmetric
-cache state. `test_weight_loading_mapping.py` checks checkpoint aliases, absent
-targets, shared parameters, and rejection of incomplete or conflicting loads
-using small safetensors files on CPU. `test_weight_loading_budget.py` uses small
-byte targets to exercise serial large-group loading, wait ordering, and expert
-read concurrency on CPU. SDK fakes in `test_runai_loader.py`
-specifically exercise borrowed buffer reuse; they do not establish native SDK
-or GCS performance.
+cache state. SDK fakes in `test_runai_loader.py` specifically exercise borrowed
+buffer reuse; they do not establish native SDK or GCS performance.
