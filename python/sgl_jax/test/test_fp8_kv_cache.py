@@ -13,6 +13,8 @@ from jax.sharding import Mesh
 from sgl_jax.srt.kernels.mla.v2.tuned_block_sizes import get_tuned_block_sizes_mla
 from sgl_jax.srt.kernels.paged_attention.paged_attention import paged_attention
 from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import (
+    RpaCase,
+    get_default_block_sizes,
     ragged_paged_attention,
 )
 from sgl_jax.srt.kernels.ragged_paged_attention.tuned_block_sizes_v3 import (
@@ -479,6 +481,67 @@ def test_tuned_block_sizes_mla_fallback(mock_dev, mock_ver):
         max_num_tokens=1,
     )
     assert hit == (16, 1, 2)
+
+
+@patch(
+    "sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3.get_tpu_version",
+    return_value=7,
+)
+def test_default_block_sizes_fp8_matches_bf16(mock_ver):
+    """Verify FP8 default block sizes match BF16 defaults (preventing oversized padded tiles).
+
+    For Qwen3-8B at TP=4 (8 Q heads, 2 KV heads, head_dim=128, page_size=64), both FP8 and
+    BF16 must yield identical decode tiles (bkv_sz=2048, bkv_csz=2048).
+    """
+    vmem_limit_bytes = 32 * 1024 * 1024  # 32MB v7x scoped VMEM limit
+
+    bf16_defaults = get_default_block_sizes(
+        q_dtype=jnp.bfloat16,
+        kv_dtype=jnp.bfloat16,
+        actual_num_q_heads=8,
+        actual_num_kv_heads=2,
+        head_dim=128,
+        page_size=64,
+        max_num_tokens=1,
+        max_num_seqs=32,
+        pages_per_seq=64,
+        case=RpaCase.DECODE,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
+    # Expected baseline for BF16 on v7x for this shape
+    assert bf16_defaults == {"bq_sz": 1, "bkv_sz": 2048, "bq_csz": 1, "bkv_csz": 2048}
+
+    # FP8 (e4m3fn) must match BF16 exactly
+    fp8_e4m3_defaults = get_default_block_sizes(
+        q_dtype=jnp.bfloat16,
+        kv_dtype=jnp.float8_e4m3fn,
+        actual_num_q_heads=8,
+        actual_num_kv_heads=2,
+        head_dim=128,
+        page_size=64,
+        max_num_tokens=1,
+        max_num_seqs=32,
+        pages_per_seq=64,
+        case=RpaCase.DECODE,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
+    assert fp8_e4m3_defaults == bf16_defaults
+
+    # FP8 (e5m2) must also match BF16 exactly
+    fp8_e5m2_defaults = get_default_block_sizes(
+        q_dtype=jnp.bfloat16,
+        kv_dtype=jnp.float8_e5m2,
+        actual_num_q_heads=8,
+        actual_num_kv_heads=2,
+        head_dim=128,
+        page_size=64,
+        max_num_tokens=1,
+        max_num_seqs=32,
+        pages_per_seq=64,
+        case=RpaCase.DECODE,
+        vmem_limit_bytes=vmem_limit_bytes,
+    )
+    assert fp8_e5m2_defaults == bf16_defaults
 
 
 # ==============================================================================
