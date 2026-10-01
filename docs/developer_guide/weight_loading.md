@@ -89,10 +89,20 @@ arrays, transfer data, or issue collectives. For example, MiMo replaces an
 abstract quantized projection with its final BF16 projection here; its recipe
 later performs the original FP32 dequantization and BF16 rounding.
 
-After preparation, target identity is fixed. Missing inputs, duplicate writers
-(including two paths to one shared parameter), and ordinary layout shape
-mismatches fail during planning. Group outputs are checked against the prepared
-schema. The outer model loader rejects remaining abstract parameters.
+After preparation, target identity is fixed. A mapping with no checkpoint inputs,
+or with targets absent from the current model, is skipped and reported with a
+warning. This lets a shared mapping cover checkpoint aliases and model variants.
+Missing inputs on optional entries or excluded layers do not produce warnings.
+Skipped entries appear in the load report; their declared sources do not count as
+unexpected checkpoint keys. Unmapped checkpoint keys remain in `unexpected` and
+only fail when `validate_checkpoint_coverage=True`.
+
+A partially present input group still fails unless it is explicitly optional:
+loading only some inputs would change a fused conversion or expert stack.
+Duplicate writers (including two paths to one shared parameter) and ordinary
+layout shape mismatches also fail during planning. Group outputs are checked
+against the prepared schema. The outer model loader rejects remaining abstract
+parameters, so skipping a mapping cannot make an incomplete model ready to serve.
 
 A model-loading session owns one source. Local mmap handles are released after
 the last group using a file completes. Groups have deterministic file ordering
@@ -115,7 +125,13 @@ a hit can bypass reads only when all processes agree.
 
 `SGLANG_WEIGHT_LOAD_MAX_INFLIGHT_BYTES` defaults to 4 GiB and bounds estimated
 owned working sets and pending groups. An indivisible group that cannot fit
-fails explicitly. `SGLANG_MOE_LOAD_WORKERS` defaults to 16. The budget is not an
+fails explicitly. Device recipes estimate their working set as eight times the
+total checkpoint input bytes; host recipes apply that estimate to each local
+expert interval. This reserves space for inputs, conversion copies and outputs,
+but is a conservative estimate rather than a measured peak. With the default
+budget, a device recipe with more than 512 MiB of checkpoint inputs is rejected.
+The budget can be raised through the environment variable when the host has
+enough memory. `SGLANG_MOE_LOAD_WORKERS` defaults to 16. The budget is not an
 RSS cap: mmap pages, allocator retention, SDK staging, and device buffers are
 separate. GCSFuse prefetch keeps the existing policy and runs once per source
 session after planning.
@@ -127,5 +143,8 @@ Local and RunAI selection remains controlled by the existing load-format CLI.
 
 `test_weight_loading_distributed.py` starts two real JAX CPU controllers and
 checks rank-local roots, inconsistent plans, read failures, and asymmetric
-cache state. SDK fakes in `test_runai_loader.py` specifically exercise borrowed
-buffer reuse; they do not establish native SDK or GCS performance.
+cache state. `test_weight_loading_mapping.py` checks checkpoint aliases, absent
+targets, shared parameters, and rejection of incomplete or conflicting loads
+using small safetensors files on CPU. SDK fakes in `test_runai_loader.py`
+specifically exercise borrowed buffer reuse; they do not establish native SDK
+or GCS performance.

@@ -478,6 +478,12 @@ suites = {
             runner="pytest",
             env={"JAX_PLATFORMS": "cpu"},
         ),
+        TestFile(
+            "python/sgl_jax/test/test_weight_loading_mapping.py",
+            0.2,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
         TestFile("python/sgl_jax/test/mem_cache/test_req_to_token_pool.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_hybrid_req_to_token_pool.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_swa_allocator.py", 1),

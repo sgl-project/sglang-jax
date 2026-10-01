@@ -540,15 +540,40 @@ class WeightLoader:
         identities = {}
         shape_cache = {}
         schemas = {}
-        # Fail before reads. A partial model may intentionally provide only a
-        # subset of targets, but each declared group must be complete.
+        unmatched_inputs, unmatched_targets = [], []
+        # Shared mappings may describe other checkpoint/model variants. Skip
+        # unmatched entries; the outer loader still rejects unfilled parameters.
         for name, spec in entries:
             sources = spec.sources or (name,)
+            targets = (spec.target_path,) if isinstance(spec.target_path, str) else spec.target_path
+            variables, missing_targets = [], []
+            for target in targets:
+                try:
+                    variable = self._get_param(params, target)
+                except (AttributeError, IndexError, KeyError, ValueError):
+                    missing_targets.append(target)
+                else:
+                    if isinstance(variable, nnx.Variable):
+                        variables.append(variable)
+                    else:
+                        missing_targets.append(target)
+            if missing_targets:
+                skipped.extend(sources)
+                used.update(sources)
+                unmatched_targets.append((name, missing_targets))
+                continue
             missing = [s for s in sources if s not in self.metadata]
             if missing:
-                if spec.optional or all(self._is_excluded_layer_weight(s) for s in missing):
-                    skipped.extend(missing)
+                expected_skip = spec.optional or all(
+                    self._is_excluded_layer_weight(s) for s in missing
+                )
+                if expected_skip or len(missing) == len(sources):
+                    skipped.extend(sources)
+                    used.update(sources)
+                    if not expected_skip:
+                        unmatched_inputs.append((name, missing))
                     continue
+                # An existing fused/stacked group cannot be loaded partially.
                 raise ValueError(f"Missing checkpoint inputs for {name}: {missing}")
             if spec.concat_axis is not None:
                 for source in sources:
@@ -562,15 +587,13 @@ class WeightLoader:
                     raise ValueError(
                         f"Recipe {name} needs up to {required} host bytes, budget={budget}"
                     )
-            targets = (spec.target_path,) if isinstance(spec.target_path, str) else spec.target_path
             if spec.sharding is None:
                 from dataclasses import replace
 
-                value = self._get_param(params, targets[0]).value
+                value = variables[0].value
                 axes = getattr(getattr(value, "sharding", None), "spec", P())
                 spec = replace(spec, sharding=tuple(axes))
-            for target in targets:
-                variable = self._get_param(params, target)
+            for target, variable in zip(targets, variables):
                 if id(variable) in identities:
                     raise ValueError(
                         f"Duplicate writer for shared parameter {target}: {identities[id(variable)]} and {name}"
@@ -604,6 +627,17 @@ class WeightLoader:
         )
         if validate_checkpoint_coverage and unexpected:
             raise ValueError(f"Unmapped checkpoint tensors: {unexpected[:10]}")
+        for reason, unmatched in (
+            ("checkpoint inputs", unmatched_inputs),
+            ("model targets", unmatched_targets),
+        ):
+            if unmatched:
+                logger.warning(
+                    "Skipped %d weight mappings with missing %s (showing up to 10): %s",
+                    len(unmatched),
+                    reason,
+                    unmatched[:10],
+                )
         return active, writers, skipped, unexpected, schemas
 
     @staticmethod
