@@ -83,33 +83,15 @@ def reference_chunk(q, k, v, gate, beta, state):
     return state, out.swapaxes(0, 1)
 
 
-def reference_decode(
-    state,
-    q,
-    k,
-    v,
-    b,
-    a,
-    A_log,
-    dt_bias,
-    indices,
-    initial,
-    key_head_offset=0,
-    value_head_offset=0,
-    num_key_heads=0,
-    normalize_eps=None,
-    query_scale=1.0,
-):
-    # Like the TT kernel, q, k and v may be heads of one flat tensor, and the
-    # kernel may normalize q and k and scale q.
-    if q.ndim == 2:
-        heads = q.reshape(q.shape[0], -1, state.shape[-2])
-        q = heads[:, :num_key_heads]
-        k = heads[:, key_head_offset : key_head_offset + num_key_heads]
-        v = heads[:, value_head_offset:]
-    if normalize_eps is not None:
-        q, k = _l2norm(q, normalize_eps), _l2norm(k, normalize_eps)
-    q, k = _repeat_heads(q * query_scale, k, v)
+def reference_decode(state, qkv, _k, _v, b, a, A_log, dt_bias, indices, initial, **kernel):
+    # Like the TT kernel: q, k and v are heads of the flat convolution output,
+    # and the kernel normalizes q and k and scales q.
+    heads = qkv.reshape(qkv.shape[0], -1, state.shape[-2])
+    count, eps = kernel["num_key_heads"], kernel["normalize_eps"]
+    q = _l2norm(heads[:, :count], eps) * kernel["query_scale"]
+    k = _l2norm(heads[:, kernel["key_head_offset"] :][:, :count], eps)
+    v = heads[:, kernel["value_head_offset"] :]
+    q, k = _repeat_heads(q, k, v)
     active = jnp.where(initial[:, None, None, None], state[indices], 0)
     gate = -jnp.exp(A_log.astype(jnp.float32)) * jax.nn.softplus(
         a.astype(jnp.float32) + dt_bias.astype(jnp.float32)
