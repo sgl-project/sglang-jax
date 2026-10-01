@@ -111,7 +111,16 @@ class TTGDNAttnBackend(GDNAttnBackend):
 
     @_per_device
     def forward_decode(
-        self, meta, mixed_qkv, conv_state_in, recurrent_state_in, b, a, conv1d_weight, A_log, dt_bias
+        self,
+        meta,
+        mixed_qkv,
+        conv_state_in,
+        recurrent_state_in,
+        b,
+        a,
+        conv1d_weight,
+        A_log,
+        dt_bias,
     ):
         _, indices, initial = self._metadata(meta)
         new_conv, conv_out = ops.causal_conv1d_update(
@@ -122,7 +131,16 @@ class TTGDNAttnBackend(GDNAttnBackend):
         heads = self.key_dim // self.mesh.shape["tensor"] // self.head_k_dim
         qkv = conv_out.astype(jnp.float32)
         new_rec, out = ops.gated_delta_decode(
-            recurrent_state_in, qkv, qkv, qkv, b, a, A_log, dt_bias, indices, initial,
+            recurrent_state_in,
+            qkv,
+            qkv,
+            qkv,
+            b,
+            a,
+            A_log,
+            dt_bias,
+            indices,
+            initial,
             key_head_offset=heads,
             value_head_offset=2 * heads,
             num_key_heads=heads,
@@ -183,11 +201,7 @@ class TTGDNAttnBackend(GDNAttnBackend):
         convolved = jax.nn.silu(convolved)
         tail_indices = lengths[..., None] + jnp.arange(self.conv_kernel_size - 1)
         tail_indices += jnp.arange(batch)[:, None] * history.shape[-2]
-        tail = (
-            history.reshape((-1, history.shape[-1]))
-            .at[tail_indices]
-            .get(mode="clip")
-        )
+        tail = history.reshape((-1, history.shape[-1])).at[tail_indices].get(mode="clip")
         new_conv = ops.state_pool_update(conv_state_in, indices, tail.swapaxes(-1, -2))
 
         q, k, v = self._qkv(convolved)
