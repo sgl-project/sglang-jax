@@ -183,15 +183,17 @@ class WeightLoader:
         start = time.monotonic()
         error = None
         try:
-            prepare = getattr(self.model, "prepare_weight_loading", None)
+            # Graph nodes such as nnx.Rngs synthesize arbitrary attributes in
+            # __getattr__. Only class-defined methods are preparation hooks.
+            prepare = getattr(type(self.model), "prepare_weight_loading", None)
             if prepare is not None:
-                mappings = prepare(self, mappings)
+                mappings = prepare(self.model, self, mappings)
             for path, module in list(nnx.iter_graph(self.model)):
                 if module is self.model:
                     continue
-                prepare = getattr(module, "prepare_weight_loading", None)
+                prepare = getattr(type(module), "prepare_weight_loading", None)
                 if prepare is not None:
-                    mappings = prepare(self, mappings, ".".join(map(str, path)))
+                    mappings = prepare(module, self, mappings, ".".join(map(str, path)))
         except Exception as exc:
             error = exc
         params = self.model
