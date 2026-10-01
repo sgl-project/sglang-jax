@@ -28,10 +28,7 @@ import numpy as np
 from flax import nnx
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.kernels.gdn.gated_delta import (
-    jax_causal_conv1d_prefill,
-    jax_causal_conv1d_update,
-)
+from sgl_jax.srt.kernels.ngram_conv import ngram_conv_prefill, ngram_conv_update
 from sgl_jax.srt.layers.hyperconnection import GroupedGemmaRMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.utils.profiling_utils import named_scope
@@ -444,14 +441,13 @@ class NGramEmbedding(nnx.Module):
             has_initial_state = jnp.ones(state_indices.shape[0], dtype=bool)
 
         def _local(x_l, state_l, weight_l, indices_l, init_l, cu_l):
-            y, new_state = jax_causal_conv1d_prefill(
+            y, new_state = ngram_conv_prefill(
                 x=x_l.T,  # [T, C] -> [C, T], the kernels are channel-first
                 weight=weight_l,
                 cu_seqlens=cu_l,
                 conv_state=state_l,
                 state_indices=indices_l,
                 has_initial_state=init_l,
-                activation="silu",
                 dilation=self.dilation,
             )
             return y.T, new_state  # [T, C], [num_slots, C, S]
@@ -487,12 +483,11 @@ class NGramEmbedding(nnx.Module):
             has_initial_state = jnp.ones(state_indices.shape[0], dtype=bool)
 
         def _local(x_l, state_l, weight_l, indices_l, init_l):
-            return jax_causal_conv1d_update(
+            return ngram_conv_update(
                 x=x_l,
                 conv_state=state_l,
                 state_indices=indices_l,
                 weight=weight_l,
-                activation="silu",
                 has_initial_state=init_l,
                 dilation=self.dilation,
             )

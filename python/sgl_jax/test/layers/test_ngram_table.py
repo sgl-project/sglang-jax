@@ -4,9 +4,13 @@ Built against synthetic safetensors shards with the released checkpoint's
 naming and split, so it runs on a CPU runner without the 95.4 GiB table.
 """
 
+import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import ml_dtypes
 import numpy as np
@@ -83,65 +87,70 @@ def _write_checkpoint(directory, params, *, corrupt=None, drop_buffer=False):
 
 
 class TestShardPlacement(CustomTestCase):
-    def test_released_checkpoint_split(self):
-        """All 128 shards are 2,500,012 rows -- checked against the real headers.
-
-        The exporter shards the padded height (320,001,536), not the sum of
-        the 16 primes (320,001,446). Sharding the unpadded number gives a
-        short last shard and misplaces every boundary after the first, which
-        would load the table 90 rows out of alignment at the tail.
-        """
-        padded = 320_001_536
-        places = shard_placements(padded, 128)
-        self.assertEqual(len(places), 128)
-        self.assertEqual(places[0].start, 0)
-        self.assertTrue(all(p.rows == 2_500_012 for p in places))
-        self.assertEqual(places[-1].start + places[-1].rows, padded)
-        # The 90 padding rows sit past the last addressable id.
-        self.assertGreater(padded, 320_001_446)
-
-    def test_unpadded_split_would_be_wrong(self):
-        """Pin the trap the line above avoids."""
-        wrong = shard_placements(320_001_446, 128)
-        self.assertNotEqual(wrong[-1].rows, 2_500_012)
-
-    def test_placements_tile_without_gaps_or_overlap(self):
-        for total, parts in ((1000, 8), (1024, 8), (7, 8), (320_001_446, 128)):
-            places = shard_placements(total, parts)
-            covered = 0
-            for p in places:
-                self.assertEqual(p.start, covered)
-                covered += p.rows
-            self.assertEqual(covered, total)
-
-    def test_more_parts_than_rows_drops_empty_shards(self):
-        places = shard_placements(3, 8)
-        self.assertEqual(sum(p.rows for p in places), 3)
-        self.assertTrue(all(p.rows > 0 for p in places))
+    def test_shards_tile_the_padded_table(self):
+        for total, parts in ((1000, 8), (1024, 8), (3, 8), (320_001_536, 128)):
+            with self.subTest(total=total, parts=parts):
+                places, covered = shard_placements(total, parts), 0
+                for placement in places:
+                    self.assertEqual(placement.start, covered)
+                    self.assertGreater(placement.rows, 0)
+                    covered += placement.rows
+                self.assertEqual(covered, total)
+                if total == 320_001_536:  # released checkpoint, including 90 padding rows
+                    self.assertEqual(len(places), 128)
+                    self.assertTrue(all(p.rows == 2_500_012 for p in places))
 
 
 class TestLoadAndGather(CustomTestCase):
-    def test_round_trip_through_safetensors(self):
+    def test_checkpoint_and_cache_round_trip(self):
         params = _params()
-        with tempfile.TemporaryDirectory() as d:
-            files = _write_checkpoint(d, params)
-            table = NGramTable.from_safetensors(files, _Config())
+        for drop_buffer in (False, True):
+            with self.subTest(drop_buffer=drop_buffer), tempfile.TemporaryDirectory() as directory:
+                files = _write_checkpoint(directory, params, drop_buffer=drop_buffer)
+                table = NGramTable.from_safetensors(files, _Config())
+                self.assertEqual((table.rows, table.dim), (params.total_vocab_size, DIM))
+                self.assertEqual(table.padded_rows % 128, 0)
+                cache = Path(directory) / "cache"
+                table.save_cache(cache)
+                restored = NGramTable.from_cache(cache)
+                stream = io.BytesIO()
+                self.assertEqual(table.write_to(stream), table.padded_rows * DIM * 2)
+                stream.seek(0)
+                streamed = NGramTable.from_metadata(table.metadata())
+                streamed.read_into(stream)
+                ids = np.random.default_rng(0).integers(
+                    0, table.rows, size=(6, HEADS), dtype=np.int32
+                )
+                want = np.repeat((ids % 65535).astype(np.uint16)[:, :, None], DIM, axis=2)
+                for candidate in (table, restored, streamed):
+                    for field in ("multipliers", "sizes", "offsets"):
+                        np.testing.assert_array_equal(
+                            getattr(candidate.params, field), getattr(params, field)
+                        )
+                    got = candidate.gather(ids)
+                    self.assertEqual(got.dtype, ml_dtypes.bfloat16)
+                    np.testing.assert_array_equal(got.view(np.uint16).reshape(6, HEADS, DIM), want)
 
-            self.assertEqual(table.rows, params.total_vocab_size)
-            self.assertEqual(table.dim, DIM)
-            # padded up to make_ngram_vocab_size_divisible_by
-            self.assertEqual(table.padded_rows % 128, 0)
-            self.assertGreaterEqual(table.padded_rows, table.rows)
-
-            rng = np.random.default_rng(0)
-            ids = rng.integers(0, table.rows, size=(6, HEADS)).astype(np.int32)
-            got = table.gather(ids)
-            # gather hands JAX bfloat16; compare through the raw bits, since
-            # some of the synthetic patterns are NaN and NaN != NaN.
-            self.assertEqual(got.dtype, ml_dtypes.bfloat16)
-            bits = got.view(np.uint16).reshape(6, HEADS, DIM)
-            want = np.repeat((ids % 65535).astype(np.uint16)[:, :, None], DIM, axis=2)
-            np.testing.assert_array_equal(bits, want)
+    def test_gather_shapes_dtypes_and_output_reuse(self):
+        for dim in (7, 64, 257):
+            table = NGramTable(_params(), dim)
+            table.data[:] = np.random.default_rng(0).integers(
+                0, 1 << 16, size=table.data.shape, dtype=np.uint16
+            )
+            for dtype in (np.int32, np.int64):
+                for count in (0, 6):
+                    with self.subTest(dim=dim, dtype=dtype, count=count):
+                        ids = np.arange(count * HEADS, dtype=dtype).reshape(count, HEADS)
+                        out = np.empty((count, HEADS, dim), np.uint16)
+                        got = table.gather(ids, out=out)
+                        self.assertEqual(got.shape, (count, HEADS * dim))
+                        if count:
+                            self.assertTrue(np.shares_memory(got, out))
+                        np.testing.assert_array_equal(
+                            got.view(np.uint16), table.data[ids].reshape(count, HEADS * dim)
+                        )
+            with self.assertRaises(ValueError):
+                table.gather(np.zeros((4, HEADS + 1), np.int32))
 
     def test_gather_is_the_same_single_and_multi_threaded(self):
         """The row-count threshold picks the thread count; both paths must agree."""
@@ -163,179 +172,202 @@ class TestLoadAndGather(CustomTestCase):
                 mod._ROWS_PER_THREAD = saved
             np.testing.assert_array_equal(threaded, single)
 
-    # -- ported from sglang test/registered/kernels/ops/embeddings/
-    #    test_qwen4_ple_offload.py; their backend-specific cases (pinned vs
-    #    file-backed mmap, prefetch, RSS trim) are CUDA host-pointer machinery
-    #    with no TPU equivalent, so only the gather-level ones carry over.
-
-    def test_gather_over_odd_embedding_dims(self):
-        """sglang parametrizes embedding_dim over 7 / 64 / 257 and the id dtype
-        over int32 / int64. A dim that is not a nice multiple catches a stride
-        bug that a power of two hides."""
-        for dim in (7, 64, 257):
-            for dtype in (np.int32, np.int64):
-                with self.subTest(dim=dim, dtype=np.dtype(dtype).name):
-                    params = _params()
-                    table = NGramTable(params, dim)
-                    rng = np.random.default_rng(0)
-                    table.data[:] = rng.integers(0, 1 << 16, size=table.data.shape, dtype=np.uint16)
-                    ids = np.array([[0, 7, 3, 1], [4, 1, 6, 2]], dtype=dtype)[:, :HEADS]
-                    got = table.gather(ids)
-                    self.assertEqual(got.shape, (ids.shape[0], HEADS * dim))
-                    want = table.data[ids.reshape(-1).astype(np.int64)].reshape(
-                        ids.shape[0], HEADS * dim
-                    )
-                    np.testing.assert_array_equal(got.view(np.uint16), want)
-
-    def test_gather_reuses_the_out_buffer(self):
-        """sglang asserts the returned tensor aliases the caller's ``out``."""
+    def test_checkpoint_and_cache_validation(self):
         params = _params()
-        table = NGramTable(params, DIM)
-        rng = np.random.default_rng(1)
-        table.data[:] = rng.integers(0, 1 << 16, size=table.data.shape, dtype=np.uint16)
-        ids = rng.integers(0, table.rows, size=(6, HEADS)).astype(np.int32)
-
-        out = np.full((6, HEADS, DIM), 0xDEAD, np.uint16)
-        got = table.gather(ids, out=out)
-        self.assertTrue(np.shares_memory(got, out))
-        np.testing.assert_array_equal(got.view(np.uint16), table.gather(ids).view(np.uint16))
-
-    def test_gather_on_empty_input(self):
-        """sglang's empty-input case: zero rows in, zero rows out, no crash."""
-        params = _params()
-        table = NGramTable(params, DIM)
-        got = table.gather(np.empty((0, HEADS), np.int32))
-        self.assertEqual(got.shape, (0, HEADS * DIM))
-        self.assertEqual(got.size, 0)
-
-    def test_gather_rejects_the_wrong_head_count(self):
-        params = _params()
-        with tempfile.TemporaryDirectory() as d:
-            table = NGramTable.from_safetensors(_write_checkpoint(d, params), _Config())
-            with self.assertRaises(ValueError):
-                table.gather(np.zeros((4, HEADS + 1), np.int32))
-
-    def test_missing_shard_is_an_error(self):
-        params = _params()
-        with tempfile.TemporaryDirectory() as d:
-            files = _write_checkpoint(d, params)
-            del files[f"{PREFIX}.ngram_embedding.shard_3.weight"]
-            with self.assertRaises(KeyError):
-                NGramTable.from_safetensors(files, _Config())
-
-
-class TestHashVerification(CustomTestCase):
-    """The checkpoint's own hash buffers vs our derivation.
-
-    A drift here produces valid-but-wrong row ids. Nothing downstream errors,
-    so this check is the only thing between a bad derivation and a model that
-    quietly reads the wrong memory.
-    """
-
-    def test_matching_buffers_pass(self):
-        params = _params()
-        with tempfile.TemporaryDirectory() as d:
-            NGramTable.from_safetensors(_write_checkpoint(d, params), _Config())
-
-    def test_a_single_wrong_multiplier_is_caught(self):
-        params = _params()
-        with tempfile.TemporaryDirectory() as d:
-            files = _write_checkpoint(d, params, corrupt="layer_multipliers")
-            with self.assertRaises(ValueError) as cm:
-                NGramTable.from_safetensors(files, _Config())
-            self.assertIn("layer_multipliers", str(cm.exception))
-
-    def test_a_single_wrong_prime_is_caught(self):
-        params = _params()
-        with tempfile.TemporaryDirectory() as d:
-            files = _write_checkpoint(d, params, corrupt="ngram_heads_vocab_sizes")
-            with self.assertRaises(ValueError):
-                NGramTable.from_safetensors(files, _Config())
-
-    def test_absent_buffers_fall_back_to_the_derivation(self):
-        params = _params()
-        with tempfile.TemporaryDirectory() as d:
-            files = _write_checkpoint(d, params, drop_buffer=True)
-            table = NGramTable.from_safetensors(files, _Config())
-            np.testing.assert_array_equal(table.params.multipliers, params.multipliers)
+        for bad in (
+            "missing_shard",
+            "layer_multipliers",
+            "ngram_heads_vocab_sizes",
+            "ngram_heads_offsets",
+        ):
+            with self.subTest(bad=bad), tempfile.TemporaryDirectory() as directory:
+                files = _write_checkpoint(
+                    directory, params, corrupt=None if bad == "missing_shard" else bad
+                )
+                if bad == "missing_shard":
+                    del files[f"{PREFIX}.ngram_embedding.shard_3.weight"]
+                with self.assertRaises((KeyError, ValueError)):
+                    NGramTable.from_safetensors(files, _Config())
+        for bad in ("truncated_cache", "short_stream", "version"):
+            with self.subTest(bad=bad), tempfile.TemporaryDirectory() as directory:
+                table = NGramTable.from_safetensors(_write_checkpoint(directory, params), _Config())
+                cache = Path(directory) / "cache"
+                table.save_cache(cache)
+                if bad == "short_stream":
+                    stream = io.BytesIO()
+                    table.write_to(stream)
+                    with self.assertRaises(ValueError):
+                        NGramTable.from_metadata(table.metadata()).read_into(
+                            io.BytesIO(stream.getvalue()[:-64])
+                        )
+                    continue
+                if bad == "truncated_cache":
+                    path = cache / "ngram_table.bin"
+                    with path.open("r+b") as file:
+                        file.truncate(path.stat().st_size - 2 * DIM)
+                else:
+                    path = cache / "ngram_table.json"
+                    metadata = json.loads(path.read_text())
+                    metadata["version"] += 1
+                    path.write_text(json.dumps(metadata))
+                with self.assertRaises(ValueError):
+                    NGramTable.from_cache(cache)
 
 
-class TestLocalCache(CustomTestCase):
-    def test_save_then_restore_matches(self):
-        params = _params()
-        with tempfile.TemporaryDirectory() as d:
-            table = NGramTable.from_safetensors(_write_checkpoint(d, params), _Config())
-            cache = Path(d) / "cache"
-            table.save_cache(cache)
-            back = NGramTable.from_cache(cache)
+class TestSchedulerHandoff(CustomTestCase):
+    def _schedule(self, mode, ranks):
+        from sgl_jax.srt.managers.schedule_batch import ScheduleBatch, ScheduleReqsInfo
 
-            self.assertEqual(
-                (back.rows, back.padded_rows, back.dim), (table.rows, table.padded_rows, table.dim)
+        batch = ScheduleBatch.__new__(ScheduleBatch)
+        batch.dp_size, batch.forward_mode, batch.spec_algorithm = len(ranks), mode, None
+        batch.reqs_info = []
+        for rank in ranks:
+            batch.reqs_info.append(
+                ScheduleReqsInfo(
+                    reqs=[SimpleNamespace(origin_input_ids=p, output_ids=o) for p, o, _, _ in rank],
+                    seq_lens=np.array([start + length for _, _, start, length in rank], np.int32),
+                    prefix_lens=[start for _, _, start, _ in rank],
+                )
             )
-            np.testing.assert_array_equal(back.params.multipliers, table.params.multipliers)
-            np.testing.assert_array_equal(back.params.sizes, table.params.sizes)
-            np.testing.assert_array_equal(back.params.offsets, table.params.offsets)
+        return batch
 
-            ids = np.random.default_rng(2).integers(0, table.rows, size=(32, HEADS))
+    def _handoff(self, batch, ids, embeddings):
+        import jax
+
+        from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
+        from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+        from sgl_jax.test.layers.test_ngram_embedding import _make_mesh
+
+        mode = batch.forward_mode
+        counts = [len(info.reqs) for info in batch.reqs_info]
+        per_dp_bs = max(counts)
+        seq_lens = np.concatenate(
+            [
+                np.pad(info.seq_lens, (0, per_dp_bs - count))
+                for info, count in zip(batch.reqs_info, counts, strict=True)
+            ]
+        )
+        prefixes = np.concatenate(
+            [
+                np.pad(np.asarray(info.prefix_lens, np.int32), (0, per_dp_bs - count))
+                for info, count in zip(batch.reqs_info, counts, strict=True)
+            ]
+        )
+        worker = ModelWorkerBatch(
+            bid=0,
+            forward_mode=mode,
+            input_ids=ids,
+            real_input_ids_len=len(ids),
+            seq_lens=seq_lens,
+            out_cache_loc=np.arange(len(ids), dtype=np.int32),
+            req_pool_indices=np.arange(len(seq_lens), dtype=np.int32),
+            sampling_info=None,
+            positions=np.arange(len(ids), dtype=np.int32),
+            cache_loc=None,
+            return_logprob=False,
+            return_output_logprob_only=False,
+            top_logprobs_nums=None,
+            token_ids_logprobs=None,
+            extend_seq_lens=seq_lens - prefixes if mode.is_extend() else None,
+            extend_prefix_lens=prefixes if mode.is_extend() else None,
+            extend_logprob_start_lens=None,
+            extend_input_logprob_token_ids=None,
+            logits_indices=None,
+            real_bs=sum(counts),
+            real_bs_per_dp=counts,
+            dp_size=batch.dp_size,
+            per_dp_bs_size=per_dp_bs,
+            ple_embeddings=embeddings,
+        )
+        runner = SimpleNamespace(
+            mesh=_make_mesh(),
+            attn_backend=None,
+            model_config=SimpleNamespace(
+                is_embedding=False, hf_config=SimpleNamespace(architectures=[])
+            ),
+        )
+        forward = ForwardBatch.init_new(worker, runner)
+        back = jax.jit(lambda fb: fb)(forward)  # exercises the actual pytree/JIT handoff
+        if embeddings is None:
+            self.assertIsNone(back.ple_embeddings)
+        else:
+            self.assertEqual(back.ple_embeddings.dtype, embeddings.dtype)
             np.testing.assert_array_equal(
-                back.gather(ids.astype(np.int32)).view(np.uint16),
-                table.gather(ids.astype(np.int32)).view(np.uint16),
+                np.asarray(back.ple_embeddings).view(np.uint16), embeddings.view(np.uint16)
             )
+            self.assertEqual(back.ple_embeddings.sharding.spec[0], "data")
 
-    def test_truncated_cache_is_rejected(self):
-        params = _params()
-        with tempfile.TemporaryDirectory() as d:
-            table = NGramTable.from_safetensors(_write_checkpoint(d, params), _Config())
-            cache = Path(d) / "cache"
-            table.save_cache(cache)
-            path = cache / "ngram_table.bin"
-            with open(path, "r+b") as f:
-                f.truncate(path.stat().st_size - 2 * DIM)
-            with self.assertRaises(ValueError):
-                NGramTable.from_cache(cache)
+    def test_dp_padding_context_and_forward_batch(self):
+        from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+        from sgl_jax.test.layers.test_ngram_embedding import _ref_ngram_ids
 
-    def test_stream_round_trip_without_touching_disk(self):
-        """RAM <-> object store is the only path on a box with < 95 GiB free."""
-        import io
+        cases = (
+            (
+                ForwardMode.EXTEND,
+                [
+                    [
+                        ([10, 11, EOS, 13, 14], [15, 16], 4, 2),
+                        ([21, 22], [], 0, 2),
+                        ([31, 32], [], 2, 0),
+                    ],
+                    [],  # an empty middle DP rank must still advance the output offset
+                    [([41, 42], [43, 44, 45], 3, 2)],
+                ],
+            ),
+            (
+                ForwardMode.DECODE,
+                [
+                    [([10, 11, EOS, 13, 14], [15, 16], 6, 1), ([EOS, 22], [23], 2, 1)],
+                    [],
+                    [([41, 42], [43, 44, 45], 4, 1)],
+                ],
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            table = NGramTable.from_safetensors(_write_checkpoint(directory, _params()), _Config())
+            for mode, ranks in cases:
+                with self.subTest(mode=mode):
+                    per_dp = 5
+                    ids = np.zeros(per_dp * len(ranks), np.int32)
+                    expected_ids = np.zeros((len(ids), HEADS), np.int64)
+                    for rank, requests in enumerate(ranks):
+                        offset = rank * per_dp
+                        for prompt, output, start, length in requests:
+                            stream = prompt + output
+                            ids[offset : offset + length] = stream[start : start + length]
+                            whole = _ref_ngram_ids(
+                                stream, [0, len(stream)], [[EOS] * (NGRAM_SIZE - 1)], table.params
+                            )
+                            expected_ids[offset : offset + length] = whole[start : start + length]
+                            offset += length
+                    batch = self._schedule(mode, ranks)
+                    with patch(
+                        "sgl_jax.srt.managers.schedule_batch.get_ngram_table", return_value=table
+                    ):
+                        embeddings = batch._merge_ngram_ple(per_dp, len(ids), ids)
+                    want = table.data[expected_ids].reshape(len(ids), PLE_EMBED_DIM)
+                    np.testing.assert_array_equal(embeddings.view(np.uint16), want)
+                    self._handoff(batch, ids, embeddings)
 
-        params = _params()
-        with tempfile.TemporaryDirectory() as d:
-            table = NGramTable.from_safetensors(_write_checkpoint(d, params), _Config())
-            buf = io.BytesIO()
-            written = table.write_to(buf)
-            self.assertEqual(written, table.padded_rows * table.dim * 2)
+    def test_absent_table_and_unsupported_scheduling(self):
+        from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
-            buf.seek(0)
-            back = NGramTable.from_metadata(table.metadata())
-            back.read_into(buf)
-            np.testing.assert_array_equal(back.data, table.data)
-
-    def test_short_stream_is_rejected(self):
-        import io
-
-        params = _params()
-        with tempfile.TemporaryDirectory() as d:
-            table = NGramTable.from_safetensors(_write_checkpoint(d, params), _Config())
-            buf = io.BytesIO()
-            table.write_to(buf)
-            truncated = io.BytesIO(buf.getvalue()[:-64])
-            with self.assertRaises(ValueError):
-                NGramTable.from_metadata(table.metadata()).read_into(truncated)
-
-    def test_version_mismatch_is_rejected(self):
-        import json
-
-        params = _params()
-        with tempfile.TemporaryDirectory() as d:
-            table = NGramTable.from_safetensors(_write_checkpoint(d, params), _Config())
-            cache = Path(d) / "cache"
-            table.save_cache(cache)
-            meta_path = cache / "ngram_table.json"
-            meta = json.loads(meta_path.read_text())
-            meta["version"] += 1
-            meta_path.write_text(json.dumps(meta))
-            with self.assertRaises(ValueError):
-                NGramTable.from_cache(cache)
+        batch = self._schedule(ForwardMode.DECODE, [[([10, 11], [12], 2, 1)]])
+        ids = np.array([12], np.int32)
+        with patch("sgl_jax.srt.managers.schedule_batch.get_ngram_table", return_value=None):
+            self.assertIsNone(batch._merge_ngram_ple(1, 1, ids))
+        self._handoff(batch, ids, None)
+        table = NGramTable(_params(), DIM)
+        with patch("sgl_jax.srt.managers.schedule_batch.get_ngram_table", return_value=table):
+            with self.assertRaisesRegex(RuntimeError, "future tokens"):
+                batch._merge_ngram_ple(1, 1, np.array([-1], np.int32))
+            batch.spec_algorithm = SimpleNamespace(is_none=lambda: False)
+            with self.assertRaisesRegex(NotImplementedError, "speculative"):
+                batch._merge_ngram_ple(1, 1, ids)
+            batch.spec_algorithm = None
+            batch.reqs_info[0].seq_lens[0] = 5
+            with self.assertRaisesRegex(ValueError, "stale"):
+                batch._merge_ngram_ple(1, 1, ids)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,9 @@
 # N-gram PLE: can the hash be a kernel, and where does the time go
 
+For the 2026-09-23 opt-in Pallas fusion, exact limb hash, corrected int64
+conclusions and overlap scope, see [FUSION_REVIEW.md](FUSION_REVIEW.md).
+The measurements below are the earlier 2026-09-20 investigation.
+
 `compute_ngram_ids` turns each token's n-grams into PLE table row ids
 (`python/sgl_jax/srt/layers/ngram_embedding.py`, called from
 `ScheduleBatch._merge_ngram_ple`). vLLM and SGLang both do this in one fused
@@ -41,7 +45,12 @@ Sources: [vLLM engram API docs](https://docs.vllm.ai/en/latest/api/vllm/models/d
 [SGLang DeepSeek-V4.1 Flash kernel optimization](https://www.sglang.io/blog/deepseek-v4.1-flash-kernel-optimization),
 [LMSYS day-0 DeepSeek-V4.1 post](https://www.lmsys.org/blog/2026-09-10-deepseek-v41).
 
-## Can our hash be a Pallas kernel? No — two independent blockers
+## Native int64 is blocked; limb emulation works
+
+**2026-09-23 correction:** native int64 is blocked, but exact two-uint32-limb
+hashing works. `bench_ngram_hash_limb.py` measures the full hash plus ids D2H;
+the host consumer is a communication cost, not a correctness blocker. The
+historical 16-nibble probe below is not a lower bound on emulation cost.
 
 ### Blocker 1: Pallas TPU has no working int64
 
@@ -62,7 +71,7 @@ types, XLA encountered an HLO for which this rewriting is not implemented:
 
 That one is arguably self-inflicted — the hash only needs int32 at the boundary
 (token ids in, row ids out, both < 2^31) and int64 as an *intermediate*. So
-`probe_i64_inside.py` tests exactly that: int32 in, int32 out, int64 only
+the same probe also tests exactly that: int32 in, int32 out, int64 only
 inside, and it checks the result against numpy rather than only checking that it
 compiles. Both the pinned and the latest release behave identically:
 
@@ -83,16 +92,17 @@ A probe that only asserts "it compiled" concludes the opposite of the truth.
 
 The Pallas TPU docs list `jnp.int*` (all precisions except int4) as supported;
 on this stack Mosaic lowering does not implement int64. Re-run
-`probe_i64_inside.py` after any jax/libtpu bump — if x64-on turns green *and*
+`probe_pallas_i64.py` after any jax/libtpu bump — if x64-on turns green *and*
 prints `numeric match: YES`, this blocker is gone.
 
 ### What 32-bit emulation would cost
 
 Carrying the 64-bit value as limbs makes the reduce the expensive part. `x mod p`
-with `p ~ 2e7 < 2^25` needs progressive reduction, and `acc < p` forces the step
-size to `k <= 4` to keep `acc * 2^k + chunk` inside int32 — so a 64-bit value
-takes 16 nibble steps, each with an int32 modulo, and the TPU VPU has no
-hardware integer divide. `probe_pallas_mod_cost.py`, at `[8192, 16]`:
+with `p ~ 2e7 < 2^25` needs progressive reduction. The original probe used
+16 nibble steps, each with an int32 modulo. This was unnecessarily narrow:
+6-bit steps fit signed int32 and 7-bit steps fit uint32. The new prototype
+also replaces integer modulo with an FP32 quotient estimate plus exact
+integer corrections. Historical `probe_pallas_mod_cost.py`, at `[8192, 16]`:
 
 | | ms |
 |---|---|
@@ -101,12 +111,12 @@ hardware integer divide. `probe_pallas_mod_cost.py`, at `[8192, 16]`:
 | one native int32 mod (for scale) | 0.123 |
 | **host numpy, the entire hash** | **0.910** |
 
-The emulated reduce **alone** eats 95% of the whole host hash, before the 64-bit
+That particular emulated reduce **alone** eats 95% of the whole host hash, before the 64-bit
 multiply emulation (~20–30 int32 ops per term, two terms), before the position
 machinery, and before the round trip below. Hand-written Pallas is also 2x
 slower than just letting XLA do it.
 
-### Blocker 2: the ids are consumed on the host
+### Communication cost: the ids are consumed on the host
 
 Independent of int64. The hash lives where the table lives. vLLM's engram table
 is on the accelerator (`ParallelEngramEmbedding`, TP-sharded, FP8 rows), so
@@ -194,7 +204,7 @@ Median of 200 reps after 20 warm-up. Released Qwen4Exp shape: `ngram_size=3`,
 | prefill T=8192 | 8192 | 4 | 1.2154 | 0.9104 | **1.33x** |
 | prefill T=32768 | 32768 | 8 | 4.6444 | 3.4433 | **1.35x** |
 
-Per change — `python benchmark/kernels/ngram/ablate_hash_fusion.py`:
+Per change — `python benchmark/kernels/ngram/bench_ngram_hash.py --ablation`:
 
 | case | base | + `[T]` prefix XOR | + uint64 reduce | + decode fast path |
 |---|---|---|---|---|
@@ -237,56 +247,19 @@ the dilated conv, the state write-back, and the two residual adds.
 | extend T=8192 | 1024 | 180 | 20.620 | 6.007 | 14.613 | 71% |
 | extend T=8192 | 4096 | 720 | 22.705 | 6.048 | 16.657 | 73% |
 
-**SGLang's gate/norm/conv/residual kernel is not worth reproducing here.** The
+**Historical hypothesis, superseded by the opt-in fusion results linked above.** The
 gate is 5–11% of decode, and XLA already folds the elementwise chain into its
 surrounding fusions — 30 fusion instructions for the whole decode forward, 0
 separate dots. And the cost tracks `num_slots`, not the batch: at fixed B=256 it
 goes 1.27 → 1.71 → 3.90 ms as the pool grows 45 → 180 → 720 MiB, while the batch
 touches 256 slots throughout.
 
-### Where the post-gate time goes
+### Shared GDN follow-up
 
-`python benchmark/kernels/ngram/bench_conv_state_writeback.py` splits
-`jax_causal_conv1d_update` into the three things that can each cost a pass over
-the pool, `shard_map`'d exactly as the layer does it. Two independent runs agreed
-to within 0.02 ms on every cell.
-
-| B | slots | pool MiB | as shipped | no barrier | no barrier/keep | no write-back |
-|---|---|---|---|---|---|---|
-| 256 | 256 | 45 | 1.186 | 1.243 | 1.231 | 0.326 |
-| 256 | 1024 | 180 | 1.776 | 1.453 | 1.452 | 0.334 |
-| 256 | 2048 | 360 | 2.500 | 1.453 | 1.443 | 0.344 |
-| 512 | 1024 | 180 | 3.016 | 2.785 | 2.779 | 0.520 |
-| 512 | 2048 | 360 | 3.752 | 2.780 | 2.779 | 0.516 |
-
-- **gather + conv math is 0.33 ms** and flat in `slots` — the arithmetic is not
-  the problem.
-- **`jax.lax.optimization_barrier(conv_state)` is what makes the cost scale with
-  the pool.** Drop it and 1024 → 2048 stops moving (1.453 → 1.453); keep it and
-  the same step costs 1.776 → 2.500. The barrier forces the donated pool to be
-  materialized as a separate value, so XLA copies the whole table: +0.32 ms at
-  180 MiB, +1.05 ms at 360 MiB. **Measured, not removed** — it guards a real
-  donated-pool aliasing race under multi-host SPMD (decode NaN; see the comment
-  in `gated_delta.py`), in code every linear-attention model in the repo shares.
-- **the scatter is ~1.12 ms at B=256** and flat in `slots`, so donation works and
-  it updates 256 slots in place — at ~4.4 µs per 184 KiB row. Latency-bound: a
-  loop of dynamic updates, not one wide write.
-- **the `_scatter_idx0_safe` keep-mask is free** (1.453 vs 1.452).
-
-Decode budget at B=256, 1024 slots: 0.22 ms gate, 0.33 ms conv math, 1.12 ms
-scatter, 0.32 ms barrier copy.
-
-## The Pallas kernel that is actually available
-
-Not the hash — the conv-state write-back. It is 75% of the decode forward, it is
-all bf16 and int32 so none of the int64 problem applies, and both levers are
-mechanical: fuse gather + conv + in-place scatter into one kernel so the barrier's
-whole-table copy is unnecessary, and write contiguous slot ranges instead of 256
-separate dynamic updates. Target is the 1.44 ms.
-
-It lives in `kernels/gdn/gated_delta.py`, shared by every linear-attention model
-in the repo, and the barrier is load-bearing for a multi-host correctness bug —
-so it is its own change with its own correctness argument, not a drive-by.
+The shared GDN dilation change and its state-writeback benchmark are excluded
+from this PLE PR for separate API review, GDN regression testing, and performance
+validation. PLE's reference convolution now lives in `kernels/ngram_conv.py`;
+the opt-in fused path is in `kernels/ngram_fused.py`.
 
 ## Reproducing
 
@@ -297,21 +270,22 @@ instead of a git rev.
 rsync -az benchmark/kernels/ngram/ v6e-1:~/sglang-jax/benchmark/kernels/ngram/
 rsync -az python/sgl_jax/srt/layers/ngram_embedding.py \
     v6e-1:~/sglang-jax/python/sgl_jax/srt/layers/ngram_embedding.py
+rsync -az python/sgl_jax/srt/kernels/ngram_conv.py python/sgl_jax/srt/kernels/ngram_fused.py \
+    v6e-1:~/sglang-jax/python/sgl_jax/srt/kernels/
 git show a1c7923:python/sgl_jax/srt/layers/ngram_embedding.py \
     | ssh v6e-1 'cat > ~/ngram_embedding_base.py'
 
 R="cd ~/sglang-jax/python && ~/venv-sgl/bin/python -u ../benchmark/kernels/ngram"
 ssh v6e-1 "$R/bench_ngram_hash.py ~/ngram_embedding_base.py"
-ssh v6e-1 "$R/ablate_hash_fusion.py ~/ngram_embedding_base.py"
+ssh v6e-1 "$R/bench_ngram_hash.py --ablation ~/ngram_embedding_base.py"
 ssh v6e-1 "$R/bench_ngram_device.py"
-ssh v6e-1 "$R/bench_conv_state_writeback.py"
 ssh v6e-1 "$R/probe_pallas_i64.py"
-ssh v6e-1 "$R/probe_i64_inside.py --x64"     # and without --x64: it lies
+ssh v6e-1 "$R/probe_pallas_i64.py --x64"     # both runs compare every compiled result with NumPy
 ssh v6e-1 "$R/probe_host_gather.py"          # aborts the process on purpose
 ```
 
 The device benchmarks hold the TPU — one at a time, and `-u` because Python
 block-buffers stdout over ssh. To re-test int64 on a newer jax, build a throwaway
 venv (`uv venv ~/venv-probe && uv pip install --python ~/venv-probe/bin/python
-"jax[tpu]==<ver>"`) and run `probe_i64_inside.py` under it; leave `venv-sgl`
+"jax[tpu]==<ver>"`) and run `probe_pallas_i64.py` under it; leave `venv-sgl`
 alone.

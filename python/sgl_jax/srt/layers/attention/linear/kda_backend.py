@@ -17,6 +17,7 @@ from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     LinearRecurrentAttnBackend,
 )
 from sgl_jax.srt.layers.attention.linear.short_convolution import short_convolution
+from sgl_jax.srt.mem_cache.recurrent_state_pool import LINEAR_CONV
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
@@ -145,7 +146,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         new_ssm_full = self.set_ssm_state(
             recurrent_state_pool, layer.layer_id, recurrent_indices, new_recurrent
         )
-        new_conv_full_list = self.set_conv_state(
+        new_conv_full = self.set_conv_state(
             recurrent_state_pool, layer.layer_id, recurrent_indices, new_conv_packed
         )
 
@@ -158,23 +159,19 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             new_ssm_full = self.set_ssm_track_state(
                 new_ssm_full, track_indices, track_mask, new_recurrent
             )
-            new_conv_full_list = self.set_conv_track_state(
-                new_conv_full_list, track_indices, track_mask, new_conv_packed
+            new_conv_full = self.set_conv_track_state(
+                new_conv_full, track_indices, track_mask, new_conv_packed
             )
 
-        return output.reshape(output.shape[0], -1), (new_ssm_full, new_conv_full_list)
+        return output.reshape(output.shape[0], -1), (
+            new_ssm_full,
+            recurrent_state_pool.with_conv_state(layer.layer_id, LINEAR_CONV, new_conv_full),
+        )
 
     def get_state(self, recurrent_state_pool, layer_id, recurrent_indices):
         """Return per-request views of (ssm, conv) state for this layer."""
-        recurrent_buffer, conv_buffer_list = self.get_layer_cache(
-            recurrent_state_pool,
-            layer_id,
-        )
-        assert len(conv_buffer_list) == 1, (
-            f"KDA expects exactly 1 conv buffer per layer "
-            f"(reserved RecurrentStatePool inner-list length); got {len(conv_buffer_list)}"
-        )
-        conv_buffer = conv_buffer_list[0]
+        recurrent_buffer, _ = self.get_layer_cache(recurrent_state_pool, layer_id)
+        conv_buffer = recurrent_state_pool.get_linear_conv_state(layer_id)
 
         ssm = jax.shard_map(
             lambda buf, idx: buf[idx],
@@ -226,9 +223,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
 
     def set_conv_state(self, recurrent_state_pool, layer_id, recurrent_indices, new_conv_packed):
         """Scatter per-request packed conv state. Same idx==0 guard as set_ssm_state."""
-        _, conv_buffer_list = self.get_layer_cache(recurrent_state_pool, layer_id)
-        assert len(conv_buffer_list) == 1
-        full_conv = conv_buffer_list[0]
+        full_conv = recurrent_state_pool.get_linear_conv_state(layer_id)
 
         def _scatter(buf, idx, val):
             keep_mask = (idx == 0).reshape(-1, 1, 1)
@@ -246,7 +241,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             out_specs=P("data", "tensor", None),
             check_vma=False,
         )(full_conv, recurrent_indices, new_conv_packed)
-        return [new_conv_full]
+        return new_conv_full
 
     def set_ssm_track_state(self, full_recurrent, track_indices, track_mask, new_recurrent):
         """Scatter ``new_recurrent`` into the request track slots.
@@ -277,12 +272,12 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         )(full_recurrent, track_indices, track_mask, new_recurrent)
         return jax.lax.optimization_barrier(new_full)
 
-    def set_conv_track_state(self, new_conv_full_list, track_indices, track_mask, new_conv_packed):
+    def set_conv_track_state(self, new_conv_full, track_indices, track_mask, new_conv_packed):
         """Scatter ``new_conv_packed`` into the request track slots.
 
         Conv variant of :meth:`set_ssm_track_state` (3D keep-mask reshape).
         """
-        full_conv = new_conv_full_list[0]
+        full_conv = new_conv_full
 
         def _scatter(buf, tidx, tmask, val):
             keep = ((tidx == 0) | (tmask == 0)).reshape(-1, 1, 1)
@@ -301,7 +296,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             out_specs=P("data", "tensor", None),
             check_vma=False,
         )(full_conv, track_indices, track_mask, new_conv_packed)
-        return [jax.lax.optimization_barrier(new_full)]
+        return jax.lax.optimization_barrier(new_full)
 
     # ------------------------------------------------------------------
     # Forward mode implementations

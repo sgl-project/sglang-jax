@@ -7,10 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from sgl_jax.srt.kernels.gdn.gated_delta import (
-    jax_causal_conv1d_prefill,
-    jax_causal_conv1d_update,
-)
+from sgl_jax.srt.kernels.ngram_conv import ngram_conv_prefill, ngram_conv_update
 from sgl_jax.srt.kernels.ngram_fused import ngram_decode_pallas, ngram_extend_pallas
 
 pytestmark = pytest.mark.skipif(jax.default_backend() != "tpu", reason="TPU Pallas lowering")
@@ -30,23 +27,21 @@ def _reference(
     gate = jax.nn.sigmoid(jnp.sign(dot) * jnp.sqrt(jnp.maximum(jnp.abs(dot), 1e-6)))
     u = (gate * value[:, None, :].astype(jnp.float32)).reshape(query.shape).astype(query.dtype)
     if cu is None:
-        y, state = jax_causal_conv1d_update(
+        y, state = ngram_conv_update(
             norm(u, nc),
             pool,
             slots,
             weight,
-            activation="silu",
             has_initial_state=init,
             dilation=dilation,
         )
     else:
-        y, state = jax_causal_conv1d_prefill(
+        y, state = ngram_conv_prefill(
             norm(u, nc).T,
             weight,
             cu_seqlens=cu,
             conv_state=pool,
             state_indices=slots,
-            activation="silu",
             has_initial_state=init,
             dilation=dilation,
         )
