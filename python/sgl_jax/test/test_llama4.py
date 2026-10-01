@@ -23,12 +23,7 @@ from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import
     ref_ragged_paged_attention,
     same_attention_chunk,
 )
-from sgl_jax.srt.models.llama4 import (
-    Llama4ForCausalLM,
-    Llama4ForConditionalGeneration,
-    moe_layer_indices,
-    route_tokens,
-)
+from sgl_jax.srt.models.llama4 import Llama4ForCausalLM, Llama4ForConditionalGeneration
 
 
 def tiny_config(**kwargs):
@@ -64,7 +59,7 @@ def parameter(model, path):
 def random_checkpoint(model):
     rng = np.random.default_rng(42)
     tensors = {}
-    for key, spec in model.weight_mappings().items():
+    for key, spec in model._create_llama_weight_mappings().items():
         paths = spec.target_path if isinstance(spec.target_path, list) else [spec.target_path]
         values = []
         for path in paths:
@@ -179,7 +174,7 @@ class TestLlama4(unittest.TestCase):
                 self.load(model, tensors)
                 prefix = model.checkpoint_prefix + "model.layers.1.feed_forward.experts."
                 fused = tensors[prefix + "gate_up_proj"]
-                experts = model.model.layers[1].feed_forward.experts
+                experts = model.model.layers[1].mlp.experts
                 np.testing.assert_array_equal(experts.wi_0.value, fused[:, :, :128])
                 np.testing.assert_array_equal(experts.wi_1.value, fused[:, :, 128:])
                 np.testing.assert_array_equal(experts.wo.value, tensors[prefix + "down_proj"])
@@ -198,10 +193,11 @@ class TestLlama4(unittest.TestCase):
     def test_router_and_input_scaled_moe(self):
         model = self.model(tiny_config(num_experts_per_tok=2))
         self.load(model, random_checkpoint(model))
-        moe = model.model.layers[1].feed_forward
+        moe = model.model.layers[1].mlp
         x = jnp.asarray(np.random.default_rng(7).normal(size=(128, 128)), jnp.float32)
         logits = x @ moe.router.weight.value
-        weights, ids = route_tokens(logits, 2)
+        scores, ids = moe.topk(logits)
+        weights = jax.nn.sigmoid(scores)
         np.testing.assert_array_equal(ids, np.argsort(-np.asarray(logits), axis=-1)[:, :2])
         np.testing.assert_allclose(
             weights,
@@ -253,16 +249,8 @@ class TestLlama4(unittest.TestCase):
                 self.assertIsNone(attn.attn.attention_chunk_size)
             np.testing.assert_allclose(q, ref, rtol=2e-4, atol=2e-4)
         self.assertFalse(self.model().model.layers[0].self_attn.use_qk_norm)
-        with self.assertRaisesRegex(ValueError, "positive"):
-            moe_layer_indices(
-                SimpleNamespace(moe_layers=None, interleave_moe_layer_step=0, num_hidden_layers=4)
-            )
-        self.assertEqual(
-            moe_layer_indices(
-                SimpleNamespace(moe_layers=None, interleave_moe_layer_step=2, num_hidden_layers=4)
-            ),
-            {1, 3},
-        )
+        self.assertEqual(tiny_config(moe_layers=None, interleave_moe_layer_step=2).moe_layers, [1])
+        self.assertEqual(tiny_config(moe_layers=[]).moe_layers, [])
 
     def test_chunk_mask_long_positions(self):
         for chunk in (4, 8192):
@@ -332,22 +320,44 @@ class TestLlama4(unittest.TestCase):
     @unittest.skipUnless(importlib.util.find_spec("torch"), "Optional HF PyTorch reference")
     def test_huggingface_logits(self):
         import torch
+        from transformers import LlamaConfig
         from transformers.models.llama4.modeling_llama4 import (
             Llama4ForCausalLM as HFModel,
         )
+        from transformers.models.llama.modeling_llama import LlamaForCausalLM as HFLlama
 
-        torch.manual_seed(31)
-        config = tiny_config()
-        config._attn_implementation = "eager"
-        hf = HFModel(config).eval()
-        native = self.model(config)
-        weights = {key: value.detach().numpy().copy() for key, value in hf.state_dict().items()}
-        self.load(native, weights)
+        from sgl_jax.srt.models.llama import LlamaForCausalLM
+
+        llama_config = LlamaConfig(
+            vocab_size=32,
+            hidden_size=128,
+            intermediate_size=256,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=64,
+        )
         ids = [1, 7, 2, 9, 3, 5, 4, 6, 8]
-        with torch.no_grad():
-            expected = hf(torch.tensor([ids]), use_cache=False).logits[0].numpy()
-        actual = self.logits(native, ids, ReferencePagedAttention())
-        np.testing.assert_allclose(actual, expected, atol=3e-5, rtol=3e-5)
+        for config, hf_class, native_class in (
+            (tiny_config(), HFModel, Llama4ForCausalLM),
+            (tiny_config(use_qk_norm=True), HFModel, Llama4ForCausalLM),
+            (llama_config, HFLlama, LlamaForCausalLM),
+        ):
+            with self.subTest(
+                model=config.model_type, qk_norm=getattr(config, "use_qk_norm", False)
+            ):
+                torch.manual_seed(31)
+                config._attn_implementation = "eager"
+                hf = hf_class(config).eval()
+                native = native_class(config, self.mesh, dtype=jnp.float32)
+                self.load(
+                    native,
+                    {key: value.detach().numpy().copy() for key, value in hf.state_dict().items()},
+                )
+                with torch.no_grad():
+                    expected = hf(torch.tensor([ids]), use_cache=False).logits[0].numpy()
+                actual = self.logits(native, ids, ReferencePagedAttention())
+                np.testing.assert_allclose(actual, expected, atol=3e-5, rtol=3e-5)
 
 
 if __name__ == "__main__":
