@@ -1,7 +1,7 @@
 """Measure NGramEmbedding gate and post-gate time on TPU.
 
 The sweep uses the runner's bf16 donated conv state and varies `num_slots` to
-expose state-pool costs. `bench_conv_state_writeback.py` isolates them further.
+expose PLE state-pool costs.
 
     python benchmark/kernels/ngram/bench_ngram_device.py [--hlo]
 """

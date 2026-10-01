@@ -265,6 +265,19 @@ class RecurrentStatePool:
         """[total_slots, C, state_len] -- the N-gram short conv's state."""
         return self.get_conv_state(layer_id, SHORT_CONV)
 
+    def with_conv_state(self, layer_id: int, name: str, state: jax.Array) -> list[jax.Array]:
+        """Return this layer's buffers with one named state replaced.
+
+        Backends return this list to the model runner; keep peer states and
+        the pool's layout intact without mutating the input pool during jit.
+        """
+        current = self.get_conv_state(layer_id, name)
+        if state.shape != current.shape:
+            raise ValueError(f"{name} state shape {state.shape} != {current.shape}")
+        buffers = list(self.conv_buffers[self.layers_mapping[layer_id]])
+        buffers[self.conv_buffer_index(layer_id, name)] = state
+        return buffers
+
     def get_conv_state(self, layer_id: int, name: str):
         """[total_slots, channels, state_len] for one named conv state."""
         if layer_id not in self.layers_mapping:

@@ -4,11 +4,12 @@ Loads the host-side hash section out of both copies of ngram_embedding.py and
 execs it standalone, so what is measured is the shipped source, not a
 transcription of it. No jax/flax needed -- that section is pure numpy.
 
-    python benchmark/kernels/ngram/bench_ngram_hash.py [base-rev]
+    python benchmark/kernels/ngram/bench_ngram_hash.py [base-rev-or-path] [--ablation]
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import pathlib
 import statistics
@@ -21,7 +22,7 @@ import numpy as np
 
 REPO = str(pathlib.Path(__file__).resolve().parents[3])
 REL = "python/sgl_jax/srt/layers/ngram_embedding.py"
-BASE_REV = sys.argv[1] if len(sys.argv) > 1 else "a1c7923"  # last commit before the fusion
+BASE_REV = "a1c7923"  # last commit before the fusion
 
 
 def _load(src: str, name: str):
@@ -37,15 +38,15 @@ def _load(src: str, name: str):
     return mod
 
 
-def load_versions():
-    """`BASE_REV` is a git rev, or a path to a copy of the file for checkouts
+def load_versions(base_rev=BASE_REV):
+    """`base_rev` is a git rev, or a path to a copy of the file for checkouts
     that have no .git (the TPU VMs are rsync'd, not cloned)."""
     tree = pathlib.Path(REPO, REL).read_text()
-    if pathlib.Path(BASE_REV).is_file():
-        base = pathlib.Path(BASE_REV).read_text()
+    if pathlib.Path(base_rev).is_file():
+        base = pathlib.Path(base_rev).read_text()
     else:
         base = subprocess.run(
-            ["git", "-C", REPO, "show", f"{BASE_REV}:{REL}"],
+            ["git", "-C", REPO, "show", f"{base_rev}:{REL}"],
             capture_output=True,
             text=True,
             check=True,
@@ -124,8 +125,73 @@ def bench(fn, reps=200, warm=20):
     return statistics.median(ts)
 
 
+def prefix_xor_int64_reduce(input_ids, cu, context, p):
+    """Change 1 only: mix in [T], reduce still signed."""
+    input_ids = np.asarray(input_ids, np.int64).reshape(-1)
+    cu = np.asarray(cu, np.int64)
+    context = np.asarray(context, np.int64)
+    L = p.ngram_context_len
+    T = input_ids.shape[0]
+    B = cu.shape[0] - 1
+    hpn = p.heads_per_ngram
+    sizes = p.sizes.reshape(L, hpn)
+    offs = p.offsets.reshape(L, hpn)
+    t = np.arange(T, dtype=np.int64)
+    req = np.clip(np.searchsorted(cu, t, side="right") - 1, 0, B - 1)
+    pos = t - cu[req]
+    rolling = input_ids * p.multipliers[0]
+    ids = np.empty((T, L, hpn), np.int32)
+    res = np.empty((T, hpn), np.int64)
+    crossed = np.zeros(T, bool)
+    for s in range(1, L + 1):
+        step = input_ids[np.clip(t - s, 0, T - 1)]
+        col = np.clip(L - s + pos, 0, L - 1)
+        tok = np.where(pos >= s, step, context[req, col])
+        np.copyto(tok, p.eos_token_id, where=crossed)
+        crossed |= tok == p.eos_token_id
+        rolling ^= tok * p.multipliers[s]
+        np.mod(rolling[:, None], sizes[s - 1][None, :], out=res)
+        res += offs[s - 1][None, :]
+        ids[:, s - 1, :] = res
+    return ids.reshape(T, L * hpn)
+
+
+ABLATION_CASES = [
+    ("decode B=256", 256, 256),
+    ("prefill T=2048", 2048, 4),
+    ("prefill T=8192", 8192, 4),
+    ("prefill T=32768", 32768, 8),
+]
+
+
+def run_ablation(base, tree):
+    """Attribute prefix-XOR separately from the remaining shipped changes."""
+    bp, tp = base.build_hash_params(**CFG), tree.build_hash_params(**CFG)
+    rng = np.random.default_rng(0)
+    print(f"{'case':<17}{'base ms':>10}{'prefix XOR ms':>15}{'shipped ms':>12}")
+    for name, tokens, batch in ABLATION_CASES:
+        args = make(tokens, batch, tp, rng, eos_rate=0.05)
+        want = ref_ngram_ids(*args, tp)
+        versions = (
+            lambda: base.compute_ngram_ids(*args, bp),
+            lambda: prefix_xor_int64_reduce(*args, tp),
+            lambda: tree.compute_ngram_ids(*args, tp),
+        )
+        for fn in versions:
+            np.testing.assert_array_equal(fn(), want, err_msg=name)
+        times = [bench(fn) for fn in versions]
+        print(f"{name:<17}{times[0]:>10.4f}{times[1]:>15.4f}{times[2]:>12.4f}")
+
+
 def main():
-    base, tree = load_versions()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("base_rev", nargs="?", default=BASE_REV, help="git revision or source file")
+    parser.add_argument("--ablation", action="store_true", help="time the prefix-XOR intermediate")
+    args = parser.parse_args()
+    base, tree = load_versions(args.base_rev)
+    if args.ablation:
+        run_ablation(base, tree)
+        return
     params = tree.build_hash_params(**CFG)
     bparams = base.build_hash_params(**CFG)
     assert params.total_vocab_size == 320_001_446, params.total_vocab_size

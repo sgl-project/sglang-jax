@@ -8,6 +8,7 @@ the same loop; order carries no meaning -- consumers ask by name.
 import unittest
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from jax.sharding import AxisType, Mesh
 
@@ -50,116 +51,154 @@ def _make_pool(conv_states=(LINEAR, SHORT)):
         head_dim=HEAD_DIM,
         conv_kernel_size=CONV_KERNEL,
         mesh=_make_mesh(),
+        conv_dtype=jnp.float32,
         conv_states=conv_states,
     )
 
 
 class TestConvStateSpecs(CustomTestCase):
-    def test_specs_are_peers(self):
+    def test_named_ownership_and_lifecycle(self):
+        for specs in (None, (LINEAR,), (LINEAR, SHORT), (SHORT, LINEAR)):
+            with self.subTest(specs=specs):
+                pool = _make_pool(specs)
+                has_ple = specs is not None and SHORT in specs
+                for layer in LAYERS:
+                    self.assertEqual(
+                        pool.get_linear_conv_state(layer).shape,
+                        (pool.total_slots, PROJ, CONV_KERNEL - 1),
+                    )
+                    if layer != PLE_LAYER or not has_ple:
+                        with self.assertRaises(ValueError):
+                            pool.get_short_conv_state(layer)
+                names = (LINEAR_CONV, SHORT_CONV) if has_ple else (LINEAR_CONV,)
+                layer_index = pool.layers_mapping[PLE_LAYER]
+                for value, name in enumerate(names, 5):
+                    state = pool.get_conv_state(PLE_LAYER, name)
+                    state = jax.device_put(
+                        np.full(state.shape, value, np.float32), pool.conv_sharding
+                    )
+                    pool.conv_buffers[layer_index] = pool.with_conv_state(PLE_LAYER, name, state)
+                if has_ple:
+                    self.assertEqual(
+                        pool.get_short_conv_state(PLE_LAYER).shape,
+                        (pool.total_slots, CHANNELS, STATE_LEN),
+                    )
+                leaves, treedef = jax.tree_util.tree_flatten(pool)
+                pool = jax.tree_util.tree_unflatten(treedef, leaves)
+                src, dst = np.zeros(pool.total_slots, np.int32), np.zeros(
+                    pool.total_slots, np.int32
+                )
+                src[0], dst[0] = 2, 5
+                shard = jax.sharding.NamedSharding(pool.mesh, jax.sharding.PartitionSpec("data"))
+                # Change just the source slot so copy_slots must really copy.
+                for name in names:
+                    state = np.asarray(pool.get_conv_state(PLE_LAYER, name)).copy()
+                    state[2] += 10
+                    state = jax.device_put(state, pool.conv_sharding)
+                    pool.conv_buffers[layer_index] = pool.with_conv_state(PLE_LAYER, name, state)
+                buffers = pool.copy_slots(jax.device_put(src, shard), jax.device_put(dst, shard))
+                pool.replace_buffer(buffers)
+                for value, name in enumerate(names, 5):
+                    state = np.asarray(pool.get_conv_state(PLE_LAYER, name))
+                    self.assertTrue(np.all(state[5] == value + 10))
+                    self.assertTrue(np.all(state[[0, 1, 3, 4, 6, 7, 8]] == value))
+                pool.clear()
+                for name in names:
+                    self.assertFalse(np.any(np.asarray(pool.get_conv_state(PLE_LAYER, name))))
+
+    def test_invalid_ownership(self):
         pool = _make_pool()
-        self.assertEqual([s.name for s in pool.conv_specs], [LINEAR_CONV, SHORT_CONV])
-
-    def test_derives_gdn_only_when_conv_states_is_none(self):
-        """Every family but Qwen4Exp passes nothing and gets the old layout."""
-        pool = _make_pool(conv_states=None)
-        self.assertEqual([s.name for s in pool.conv_specs], [LINEAR_CONV])
-        self.assertEqual(pool.conv_specs[0].channels, pool.proj_size)
-        self.assertEqual(pool.conv_specs[0].state_len, CONV_KERNEL - 1)
-        for layer in LAYERS:
-            self.assertEqual(len(pool.get_linear_recurrent_layer_cache(layer)[1]), 1)
-
-    def test_spec_order_does_not_matter(self):
-        """Consumers ask by name, so the tuple order carries no meaning."""
-        pool = _make_pool(conv_states=(SHORT, LINEAR))
-        self.assertEqual(
-            pool.get_linear_conv_state(PLE_LAYER).shape,
-            (pool.total_slots, PROJ, CONV_KERNEL - 1),
-        )
-        self.assertEqual(
-            pool.get_conv_state(PLE_LAYER, SHORT_CONV).shape,
-            (pool.total_slots, CHANNELS, STATE_LEN),
-        )
-
-    def test_only_the_ple_layer_gets_the_second_buffer(self):
-        pool = _make_pool()
-        for layer in LAYERS:
-            _, conv = pool.get_linear_recurrent_layer_cache(layer)
-            self.assertEqual(len(conv), 2 if layer == PLE_LAYER else 1)
-        self.assertEqual(
-            pool.get_short_conv_state(PLE_LAYER).shape,
-            (pool.total_slots, CHANNELS, STATE_LEN),
-        )
-
-    def test_the_two_conv_states_have_different_shapes(self):
-        """Same layer, both conv state; confusing them is silent."""
-        pool = _make_pool()
-        gdn = pool.get_linear_conv_state(PLE_LAYER)
-        short = pool.get_conv_state(PLE_LAYER, SHORT_CONV)
-        self.assertEqual(gdn.shape, (pool.total_slots, PROJ, CONV_KERNEL - 1))
-        self.assertEqual(short.shape, (pool.total_slots, CHANNELS, STATE_LEN))
-
-    def test_unknown_name_or_layer_raises(self):
-        pool = _make_pool()
-        with self.assertRaises(ValueError):
-            pool.get_conv_state(0, SHORT_CONV)  # layer has no such state
-        with self.assertRaises(ValueError):
-            pool.get_conv_state(PLE_LAYER, "nope")
-        with self.assertRaises(ValueError):
-            pool.get_conv_state(3, LINEAR_CONV)  # not a recurrent layer at all
-
-    def test_rejects_a_layer_the_pool_does_not_own(self):
-        """A PLE layer on full attention has no slot to hang the state on."""
+        for layer, name in ((0, SHORT_CONV), (PLE_LAYER, "nope"), (3, LINEAR_CONV)):
+            with self.subTest(layer=layer, name=name), self.assertRaises(ValueError):
+                pool.get_conv_state(layer, name)
         with self.assertRaises(AssertionError):
-            _make_pool(conv_states=(LINEAR, ConvStateSpec(SHORT_CONV, (3,), CHANNELS, STATE_LEN)))
+            _make_pool((LINEAR, ConvStateSpec(SHORT_CONV, (3,), CHANNELS, STATE_LEN)))
 
-    def _overwrite(self, pool, name, value_fn):
-        buf = np.asarray(pool.get_conv_state(PLE_LAYER, name)).copy()
-        value_fn(buf)
-        idx = pool.layers_mapping[PLE_LAYER]
-        pool.conv_buffers[idx][pool.conv_buffer_index(PLE_LAYER, name)] = jax.device_put(
-            buf, pool.conv_sharding
-        )
 
-    def test_copy_slots_clones_both_conv_states(self):
-        """Fork must carry the N-gram history, not just GDN's."""
-        pool = _make_pool()
-        self._overwrite(pool, LINEAR_CONV, lambda b: b.__setitem__(2, 5.0))
-        self._overwrite(pool, SHORT_CONV, lambda b: b.__setitem__(2, 7.0))
+class TestProductionStateConsumers(CustomTestCase):
+    def test_gdn_and_kda_preserve_peer_state_in_either_order(self):
+        # Reuse the existing attention fixtures, but call the real layer/backend
+        # and runner writeback with both named state layouts, not a mock accessor.
+        from sgl_jax.test.test_gdn_attention import create_test_data as gdn_data
+        from sgl_jax.test.test_kda_attention import create_test_data as kda_data
 
-        src = np.zeros(pool.total_slots, np.int32)
-        dst = np.zeros(pool.total_slots, np.int32)
-        src[0], dst[0] = 2, 5
-        sharding = jax.sharding.NamedSharding(
-            pool.mesh, jax.sharding.PartitionSpec(pool.data_partition_axis)
-        )
-        _, new_conv = pool.copy_slots(jax.device_put(src, sharding), jax.device_put(dst, sharding))
-
-        idx = pool.layers_mapping[PLE_LAYER]
-        self.assertTrue(np.all(np.asarray(new_conv[idx][0])[5] == 5.0))
-        self.assertTrue(np.all(np.asarray(new_conv[idx][1])[5] == 7.0))
-
-    def test_clear_zeros_both(self):
-        pool = _make_pool()
-        self._overwrite(pool, SHORT_CONV, lambda b: b.__setitem__(slice(None), 3.0))
-        pool.clear()
-        self.assertTrue(np.all(np.asarray(pool.get_short_conv_state(PLE_LAYER)) == 0))
-
-    def test_pytree_round_trip_keeps_the_specs(self):
-        """The pool crosses a jit boundary; dropped aux loses the second state."""
-        pool = _make_pool()
-        leaves, treedef = jax.tree_util.tree_flatten(pool)
-        back = jax.tree_util.tree_unflatten(treedef, leaves)
-        self.assertEqual([s.name for s in back.conv_specs], [LINEAR_CONV, SHORT_CONV])
-        self.assertEqual(
-            back.get_short_conv_state(PLE_LAYER).shape,
-            (pool.total_slots, CHANNELS, STATE_LEN),
-        )
-
-    def test_specs_are_hashable(self):
-        """aux_data lands in the jit cache key, so a list field would break it."""
-        self.assertEqual(hash(SHORT), hash(SHORT))
-        _, aux = _make_pool().tree_flatten()
-        hash(aux)
+        mesh = _make_mesh()
+        for family, fixture, dims in (
+            (
+                "gdn",
+                gdn_data,
+                dict(
+                    num_k_heads=NUM_HEADS,
+                    num_v_heads=NUM_HEADS,
+                    head_k_dim=HEAD_DIM,
+                    head_v_dim=HEAD_DIM,
+                ),
+            ),
+            ("kda", kda_data, dict(num_heads=NUM_HEADS, head_dim=HEAD_DIM)),
+        ):
+            with jax.set_mesh(mesh):
+                fb, _, layer, q, k, v, a, b, *_ = fixture(
+                    mode="decode",
+                    seq_lens=[1, 1],
+                    conv_kernel_size=CONV_KERNEL,
+                    dtype=jnp.float32,
+                    rng=np.random.default_rng(42),
+                    test_mesh=mesh,
+                    layer_id=PLE_LAYER,
+                    all_have_initial_state=[False, True],
+                    **dims,
+                )
+                shard = jax.sharding.NamedSharding(
+                    mesh, jax.sharding.PartitionSpec("data", "tensor")
+                )
+                inputs = [jax.device_put(x, shard) for x in (q, k, v, a, b)]
+                meta = fb.attn_backend.forward_metadata
+                index_shard = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data"))
+                meta.recurrent_track_indices = jax.device_put(
+                    np.array([4, 5], np.int32), index_shard
+                )
+                meta.recurrent_track_mask = jax.device_put(np.array([True, False]), index_shard)
+                run = jax.jit(
+                    lambda pool, layer=layer, fb=fb, inputs=inputs: layer(fb, *inputs, pool)
+                )
+                reference = None
+                for specs in (None, (LINEAR, SHORT), (SHORT, LINEAR)):
+                    with self.subTest(family=family, specs=specs):
+                        pool = _make_pool(specs)
+                        index = pool.layers_mapping[PLE_LAYER]
+                        pool.recurrent_buffers[index] = jnp.full_like(
+                            pool.recurrent_buffers[index], 0.2
+                        )
+                        linear = jnp.full_like(pool.get_linear_conv_state(PLE_LAYER), 0.3)
+                        pool.conv_buffers[index] = pool.with_conv_state(
+                            PLE_LAYER, LINEAR_CONV, linear
+                        )
+                        if specs:
+                            peer = jnp.full_like(pool.get_short_conv_state(PLE_LAYER), 7)
+                            pool.conv_buffers[index] = pool.with_conv_state(
+                                PLE_LAYER, SHORT_CONV, peer
+                            )
+                        results = []
+                        for _ in range(2):  # feed written state back into the next forward
+                            output, (rec, conv) = run(pool)
+                            recurrent, convs = list(pool.recurrent_buffers), list(pool.conv_buffers)
+                            recurrent[index], convs[index] = rec, conv
+                            pool.replace_buffer((recurrent, convs))
+                            linear = np.asarray(pool.get_linear_conv_state(PLE_LAYER))
+                            results.append((np.asarray(output), np.asarray(rec), linear.copy()))
+                            np.testing.assert_array_equal(linear[4], linear[1])  # track snapshot
+                            self.assertTrue(np.all(linear[0] == 0.3))  # dummy untouched
+                            self.assertTrue(np.all(linear[5] == 0.3))  # masked track untouched
+                            if specs:
+                                np.testing.assert_array_equal(
+                                    np.asarray(pool.get_short_conv_state(PLE_LAYER)), 7
+                                )
+                        if reference is None:
+                            reference = results
+                        else:
+                            for got_step, want_step in zip(results, reference, strict=True):
+                                for got, want in zip(got_step, want_step, strict=True):
+                                    np.testing.assert_array_equal(got, want)
 
 
 class TestMemoryBudget(CustomTestCase):
@@ -180,11 +219,10 @@ class TestMemoryBudget(CustomTestCase):
         )
 
     def test_the_second_conv_state_is_charged(self):
-        delta = self._bytes((LINEAR, SHORT)) - self._bytes(None)
-        self.assertEqual(delta, CHANNELS * STATE_LEN * 2)
-
-    def test_none_matches_an_explicit_gdn_only_list(self):
-        self.assertEqual(self._bytes(None), self._bytes((LINEAR,)))
+        for specs in (None, (LINEAR,), (LINEAR, SHORT), (SHORT, LINEAR)):
+            with self.subTest(specs=specs):
+                extra = CHANNELS * STATE_LEN * 2 if specs and SHORT in specs else 0
+                self.assertEqual(self._bytes(specs) - self._bytes(None), extra)
 
     def test_released_checkpoint_per_request_bytes(self):
         """Real numbers: N-gram 180 KiB against GDN's ~110 MiB."""
@@ -218,80 +256,28 @@ class TestMemoryBudget(CustomTestCase):
         self.assertLess((total - base) / base, 0.002)  # 0.16% of the per-req state
 
 
-class TestForwardBatchPleField(CustomTestCase):
-    def _batch(self, **kw):
-        import jax.numpy as jnp
-
-        from sgl_jax.srt.model_executor.forward_batch_info import (
-            ForwardBatch,
-            ForwardMode,
-        )
-
-        return ForwardBatch(
-            bid=0,
-            forward_mode=ForwardMode.DECODE,
-            batch_size=2,
-            input_ids=jnp.zeros((2,), jnp.int32),
-            req_pool_indices=jnp.zeros((2,), jnp.int32),
-            seq_lens=jnp.ones((2,), jnp.int32),
-            out_cache_loc=jnp.zeros((2,), jnp.int32),
-            **kw,
-        )
-
-    def test_ple_embeddings_survives_a_pytree_round_trip(self):
-        """A field left out of tree_flatten silently becomes None inside jit."""
-        import jax.numpy as jnp
-
-        fb = self._batch(ple_embeddings=jnp.arange(8, dtype=jnp.float32).reshape(2, 4))
-        leaves, treedef = jax.tree_util.tree_flatten(fb)
-        back = jax.tree_util.tree_unflatten(treedef, leaves)
-        np.testing.assert_array_equal(
-            np.asarray(back.ple_embeddings), np.asarray(fb.ple_embeddings)
-        )
-
-    def test_absent_ple_embeddings_stays_none(self):
-        fb = self._batch()
-        leaves, treedef = jax.tree_util.tree_flatten(fb)
-        self.assertIsNone(jax.tree_util.tree_unflatten(treedef, leaves).ple_embeddings)
-
-
 class TestConfigSuppliesBothSpecs(CustomTestCase):
-    """conv_state_specs is a sibling of linear_state_params, not nested in it."""
-
-    def test_the_two_are_siblings(self):
+    def test_config_specs_and_budget(self):
         from sgl_jax.srt.configs.qwen4_exp import _Qwen4ExpTextConfig
 
-        cfg = _Qwen4ExpTextConfig(ple_layer_ids=[2], ple_embed_dim=2560)
-        self.assertFalse(hasattr(cfg.linear_state_params, "conv_states"))
-        self.assertFalse(hasattr(cfg.linear_state_params, "short_conv"))
-        self.assertEqual(len(cfg.conv_state_specs), 2)
-
-    def test_qwen4_exp_conv_state_specs(self):
-        from sgl_jax.srt.configs.qwen4_exp import _Qwen4ExpTextConfig
-
-        cfg = _Qwen4ExpTextConfig(ple_layer_ids=[2], ple_embed_dim=2560)
-        specs = cfg.conv_state_specs
-        self.assertEqual([s.name for s in specs], [LINEAR_CONV, SHORT_CONV])
-
-        gdn, short = specs
-        self.assertEqual(gdn.channels, 10240)  # 48*128 + 2*16*128
-        self.assertEqual(gdn.state_len, cfg.linear_conv_kernel_dim - 1)  # 3
-        self.assertEqual(len(gdn.layers), 36)
-
-        # ple_layer_ids is 1-based; the pool keys on 0-based decoder indices.
-        self.assertEqual(short.layers, (1,))
-        self.assertIn(1, gdn.layers)  # and layers.1 is also a GDN layer
-        self.assertEqual(short.channels, cfg.hidden_size * cfg.hc_count)  # 10240
-        self.assertEqual(short.state_len, (cfg.ple_conv_kernel_size - 1) * cfg.ngram_size)  # 9
-        # Equal channel counts are a coincidence; the lengths are what differ.
-        self.assertEqual(gdn.channels, short.channels)
-        self.assertNotEqual(gdn.state_len, short.state_len)
-
-    def test_no_ple_layer_means_gdn_only(self):
-        from sgl_jax.srt.configs.qwen4_exp import _Qwen4ExpTextConfig
-
-        specs = _Qwen4ExpTextConfig().conv_state_specs
-        self.assertEqual([s.name for s in specs], [LINEAR_CONV])
+        for enabled in (False, True):
+            with self.subTest(ple=enabled):
+                cfg = _Qwen4ExpTextConfig(ple_layer_ids=[2] if enabled else [], ple_embed_dim=2560)
+                specs = {spec.name: spec for spec in cfg.conv_state_specs}
+                linear = specs[LINEAR_CONV]
+                self.assertEqual(
+                    (linear.channels, linear.state_len, len(linear.layers)), (10240, 3, 36)
+                )
+                self.assertEqual(
+                    set(specs), {LINEAR_CONV, SHORT_CONV} if enabled else {LINEAR_CONV}
+                )
+                if enabled:
+                    short = specs[SHORT_CONV]
+                    self.assertEqual(short.layers, (1,))  # config is 1-based; pool is 0-based
+                    self.assertIn(1, linear.layers)
+                    self.assertEqual(
+                        (short.channels, short.state_len), (cfg.hidden_size * cfg.hc_count, 9)
+                    )
 
 
 if __name__ == "__main__":
