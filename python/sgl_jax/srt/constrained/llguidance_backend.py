@@ -5,6 +5,7 @@ import logging
 import os
 
 import numpy as np
+import tiktoken
 from llguidance import LLMatcher, LLTokenizer, StructTag, grammar_from
 from transformers import PreTrainedTokenizerFast
 
@@ -121,6 +122,20 @@ def get_guidance_backend(
 
         llguidance_tokenizer = lltokenizer_from_encoding(
             encoding,
+            n_vocab=n_vocab,
+            eos_token=eos_id,
+        )
+    elif isinstance(getattr(tokenizer, "model", None), tiktoken.Encoding):
+        from llguidance.tiktoken import lltokenizer_from_encoding
+
+        # HF slow tokenizers built on tiktoken (e.g. Kimi-K2's remote-code
+        # TikTokenTokenizer) keep the tiktoken.Encoding on `.model`.
+        eos_id = tokenizer.eos_token_id
+        if eos_id is None:
+            eos_id = getattr(tokenizer, "eos_id", None)
+
+        llguidance_tokenizer = lltokenizer_from_encoding(
+            tokenizer.model,
             n_vocab=n_vocab,
             eos_token=eos_id,
         )
