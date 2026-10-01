@@ -238,8 +238,15 @@ class WeightLoader:
         budget = int(os.environ.get("SGLANG_WEIGHT_LOAD_MAX_INFLIGHT_BYTES", str(4 << 30)))
         if budget <= 0:
             raise ValueError("SGLANG_WEIGHT_LOAD_MAX_INFLIGHT_BYTES must be positive")
+        warned_oversized = False
         try:
             for name, spec in tqdm(active, desc="Loading weights"):
+                oversized = False
+                if pending_owners and spec.recipe is None:
+                    # Reader groups manage their own scratch space and wait for
+                    # local uploads. Release preceding recipe inputs first.
+                    jax.block_until_ready(pending)
+                    pending, pending_owners, pending_bytes = [], [], 0
                 if spec.host_recipe is not None:
                     outputs = self.reader.read_host_group(
                         self.source, spec, schemas[name], self._sharding(spec)
@@ -250,13 +257,20 @@ class WeightLoader:
                         for source in spec.sources
                         for info in self.metadata[source]
                     )
-                    # The declared full-group recipes (dequantization, QKV and
-                    # fused MLP) are bounded independently of model layer count.
+                    # Budget concurrent groups, not the size of an indivisible
+                    # conversion. Large recipes run between completion waits.
                     required = 8 * source_bytes
-                    if required > budget:
-                        raise ValueError(
-                            f"Recipe {name} needs up to {required} host bytes, budget={budget}"
+                    oversized = required > budget
+                    if oversized and not warned_oversized:
+                        logger.warning(
+                            "Recipe %s has an estimated working set of %d bytes above the "
+                            "weight-loading target of %d bytes; loading it alone. "
+                            "This target is not a hard memory limit.",
+                            name,
+                            required,
+                            budget,
                         )
+                        warned_oversized = True
                     if pending_bytes + required > budget:
                         jax.block_until_ready(pending)
                         pending, pending_owners, pending_bytes = [], [], 0
@@ -286,7 +300,7 @@ class WeightLoader:
                 pending_bytes += sum(
                     sum(s.data.nbytes for s in v.addressable_shards) for v in values
                 )
-                if pending_bytes >= budget:
+                if oversized or pending_bytes >= budget:
                     jax.block_until_ready(pending)
                     pending, pending_owners, pending_bytes = [], [], 0
                 completed = []
@@ -579,14 +593,6 @@ class WeightLoader:
                 for source in sources:
                     if len(self.metadata[source]) < safetensors_partition:
                         raise ValueError(f"Incomplete checkpoint partitions: {source}")
-            if spec.recipe is not None:
-                required = 8 * sum(
-                    info["byte_size"] for source in sources for info in self.metadata[source]
-                )
-                if required > budget:
-                    raise ValueError(
-                        f"Recipe {name} needs up to {required} host bytes, budget={budget}"
-                    )
             if spec.sharding is None:
                 from dataclasses import replace
 

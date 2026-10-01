@@ -123,18 +123,26 @@ threads and callbacks. Global layout operations follow the same group order.
 P/D cache identity includes checkpoint identity, mapping, dtype and mesh shape;
 a hit can bypass reads only when all processes agree.
 
-`SGLANG_WEIGHT_LOAD_MAX_INFLIGHT_BYTES` defaults to 4 GiB and bounds estimated
-owned working sets and pending groups. An indivisible group that cannot fit
-fails explicitly. Device recipes estimate their working set as eight times the
-total checkpoint input bytes; host recipes apply that estimate to each local
-expert interval. This reserves space for inputs, conversion copies and outputs,
-but is a conservative estimate rather than a measured peak. With the default
-budget, a device recipe with more than 512 MiB of checkpoint inputs is rejected.
-The budget can be raised through the environment variable when the host has
-enough memory. `SGLANG_MOE_LOAD_WORKERS` defaults to 16. The budget is not an
-RSS cap: mmap pages, allocator retention, SDK staging, and device buffers are
-separate. GCSFuse prefetch keeps the existing policy and runs once per source
-session after planning.
+`SGLANG_WEIGHT_LOAD_MAX_INFLIGHT_BYTES` defaults to 4 GiB and is a concurrency
+target for estimated owned working sets and pending groups. It must be positive.
+An indivisible group larger than the target is allowed with a warning. Device
+recipes estimate their working set as eight times the total checkpoint input
+bytes; oversized recipes drain pending work before reading and wait for their
+own outputs before continuing. This reserves space for inputs, conversion copies
+and outputs, but is a conservative estimate rather than a measured peak.
+
+Host recipes process local expert intervals one at a time. Expert readers reduce
+worker counts or split device batches to fit the target where possible, falling
+back to one worker or one device batch for an oversized shard. Host owners are
+released after their uploads finish, before reading the next group. Recipe input
+owners are also drained before handing off to another reader group.
+`SGLANG_MOE_LOAD_WORKERS` defaults to 16 and remains an upper bound on expert read
+concurrency. A larger byte target can allow more overlap when memory permits.
+
+This target does not cap individual tensor size or process RSS: an oversized
+group still needs enough actual memory, and mmap pages, allocator retention, SDK
+staging, and device buffers are separate. GCSFuse prefetch keeps the existing
+policy and runs once per source session after planning.
 
 Dummy loading uses the final abstract schema without opening a checkpoint.
 Local and RunAI selection remains controlled by the existing load-format CLI.
@@ -145,6 +153,8 @@ Local and RunAI selection remains controlled by the existing load-format CLI.
 checks rank-local roots, inconsistent plans, read failures, and asymmetric
 cache state. `test_weight_loading_mapping.py` checks checkpoint aliases, absent
 targets, shared parameters, and rejection of incomplete or conflicting loads
-using small safetensors files on CPU. SDK fakes in `test_runai_loader.py`
+using small safetensors files on CPU. `test_weight_loading_budget.py` uses small
+byte targets to exercise serial large-group loading, wait ordering, and expert
+read concurrency on CPU. SDK fakes in `test_runai_loader.py`
 specifically exercise borrowed buffer reuse; they do not establish native SDK
 or GCS performance.
