@@ -47,6 +47,10 @@ For more features and usage details, please read the Sphinx-style documents in t
 
 ## Supported Models
 
+An experimental [Llama 4 text-only implementation](docs/features/llama4_text.md)
+is under development. It is not a validated Maverick 400B deployment recipe;
+vision and accelerator/checkpoint validation remain outstanding.
+
 SGL-JAX is designed for easy extension to new model architectures. It currently provides first-class support for:
 
 -   **Qwen**
