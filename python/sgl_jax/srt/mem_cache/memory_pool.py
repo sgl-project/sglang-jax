@@ -881,6 +881,253 @@ class MSAIndexKProxy:
 
 
 @register_pytree_node_class
+class QSATokenToKVPool(MHATokenToKVPool):
+    """GQA pool plus QSA's compressed indexer-key cache and its open-group ring.
+
+    The compressed cache holds one entry per ``compress_ratio`` tokens. Giving
+    it a page size of ``page_size // compress_ratio`` makes the **same** page
+    table address both caches: token ``t``'s compressed entry is ``t // ratio``,
+    whose logical page is
+
+        (t // ratio) // (page_size // ratio) == t // page_size
+
+    at in-page offset ``(t % page_size) // ratio``. So there is no second
+    allocator and no second page table -- ``streamindex_topk`` derives the
+    compressed page size from the buffer's own shape (its ``shape[1]*shape[2]``)
+    and bounds the run at ``seq_len // compression_ratio``.
+
+    The ring holds the keys of each request's open group -- the tokens that have
+    not yet completed a group, so they are not in the compressed cache. It is
+    indexed by the request's ``ReqToTokenPool`` slot, which is stable for the
+    request's lifetime, unlike its position in a batch.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: jnp.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        mesh: Mesh,
+        dp_size: int = 1,
+        start_layer: int | None = None,
+        end_layer: int | None = None,
+        *,
+        indexer_key_dim: int = 0,
+        num_indexer_layers: int = 0,
+        compress_ratio: int = 1,
+        max_reqs: int = 0,
+        abstract: bool = False,
+    ):
+        self.indexer_key_dim_raw = indexer_key_dim
+        self.indexer_key_dim = MLATokenToKVPool._aligned_indexer_dim(indexer_key_dim)
+        self.num_indexer_layers = num_indexer_layers
+        self.compress_ratio = compress_ratio
+        self.max_reqs = max_reqs
+        if indexer_key_dim > 0 and num_indexer_layers > 0 and not (max_reqs and max_reqs > 0):
+            raise ValueError(
+                f"max_reqs must be the request limit, one ring row per ReqToTokenPool "
+                f"slot; got {max_reqs}"
+            )
+        self._validate_compressed_geometry(page_size, compress_ratio, dtype)
+        super().__init__(
+            size,
+            page_size,
+            dtype,
+            head_num,
+            head_dim,
+            layer_num,
+            mesh,
+            dp_size,
+            start_layer,
+            end_layer,
+            abstract=abstract,
+        )
+
+    @staticmethod
+    def _validate_compressed_geometry(page_size: int, ratio: int, dtype: jnp.dtype) -> None:
+        """Both conditions the shared-page-table trick rests on.
+
+        ``ratio`` must divide ``page_size`` so a group never straddles a page,
+        and the resulting compressed page size must be a whole number of packed
+        sublanes -- otherwise ``get_kv_cache_shape`` rounds it up and the
+        compressed page stops lining up with the token page.
+        """
+        if ratio < 1:
+            raise ValueError(f"compress_ratio must be positive, got {ratio}")
+        if ratio == 1:
+            return
+        if page_size % ratio:
+            raise ValueError(f"compress_ratio ({ratio}) must divide page_size ({page_size})")
+        packing = get_dtype_packing(dtype)
+        if (page_size // ratio) % packing:
+            raise ValueError(
+                f"page_size // compress_ratio ({page_size // ratio}) must be a "
+                f"multiple of the dtype packing ({packing}) so the compressed "
+                "page keeps lining up with the token page"
+            )
+
+    @classmethod
+    def _compressed_cache_shape(
+        cls,
+        *,
+        total_num_pages: int,
+        page_size: int,
+        compress_ratio: int,
+        dtype: jnp.dtype,
+        indexer_key_dim: int,
+    ) -> tuple[int, ...]:
+        from sgl_jax.srt.kernels.mla.v2.kernel import get_kv_cache_shape
+
+        return get_kv_cache_shape(
+            total_num_pages=total_num_pages,
+            page_size=page_size // compress_ratio,
+            kv_dim=MLATokenToKVPool._aligned_indexer_dim(indexer_key_dim),
+            kv_dtype=dtype,
+        )
+
+    def _ring_shape(self) -> tuple[int, ...]:
+        return (self.max_reqs, self.compress_ratio, self.indexer_key_dim)
+
+    def _has_indexer(self) -> bool:
+        return self.indexer_key_dim > 0 and self.num_indexer_layers > 0
+
+    def _create_buffers(self, *, abstract: bool = False):
+        super()._create_buffers(abstract=abstract)
+
+        self.compressed_key_buffer = []
+        self.open_group_buffer = []
+        if not self._has_indexer():
+            return
+
+        total_num_pages = (self.size + self.page_size * self.dp_size) // self.page_size
+        compressed_shape = self._compressed_cache_shape(
+            total_num_pages=total_num_pages,
+            page_size=self.page_size,
+            compress_ratio=self.compress_ratio,
+            dtype=self.dtype,
+            indexer_key_dim=self.indexer_key_dim_raw,
+        )
+        # The compressed cache has no head axis (QSA runs one indexer KV head),
+        # so it is sharded on the page axis only, like the DSA indexer cache.
+        self.compressed_sharding = NamedSharding(
+            self.mesh, P(self.attention_data_partition_axis, None, None, None)
+        )
+        # The ring is indexed by request slot, and a request's slot says nothing
+        # about which shard holds its pages, so it stays replicated. It is
+        # kilobytes: max_reqs * ratio * indexer_key_dim per layer.
+        self.ring_sharding = NamedSharding(self.mesh, P(None, None, None))
+
+        logger.info(
+            "QSA compressed-key cache: %d slots x %s, ring %s (%.3f GB total)",
+            self.num_indexer_layers,
+            compressed_shape,
+            self._ring_shape(),
+            self.num_indexer_layers
+            * (
+                self._shape_bytes(compressed_shape, self.dtype)
+                + self._shape_bytes(self._ring_shape(), self.dtype)
+            )
+            / GB,
+        )
+
+        def allocate_buffers(shape, sharding):
+            if abstract:
+                return [
+                    jax.ShapeDtypeStruct(shape, self.dtype, sharding=sharding)
+                    for _ in range(self.num_indexer_layers)
+                ]
+            allocate = _get_kv_zero_allocator(shape, self.dtype, sharding)
+            return [allocate() for _ in range(self.num_indexer_layers)]
+
+        with jax.set_mesh(self.mesh):
+            self.compressed_key_buffer = allocate_buffers(
+                compressed_shape, self.compressed_sharding
+            )
+            self.open_group_buffer = allocate_buffers(self._ring_shape(), self.ring_sharding)
+
+    @staticmethod
+    def _shape_bytes(shape: tuple[int, ...], dtype: jnp.dtype) -> int:
+        return math.prod(shape) * jnp.dtype(dtype).itemsize
+
+    def get_compressed_key_buffer(self, slot_id: int) -> jax.Array:
+        return self.compressed_key_buffer[slot_id]
+
+    def get_open_group_buffer(self, slot_id: int) -> jax.Array:
+        return self.open_group_buffer[slot_id]
+
+    def get_indexer_size_bytes(self) -> int:
+        """Resident bytes of the compressed cache and the ring, across slots."""
+        if not self._has_indexer():
+            return 0
+        total_num_pages = (self.size + self.page_size * self.dp_size) // self.page_size
+        per_slot = self._shape_bytes(
+            self._compressed_cache_shape(
+                total_num_pages=total_num_pages,
+                page_size=self.page_size,
+                compress_ratio=self.compress_ratio,
+                dtype=self.dtype,
+                indexer_key_dim=self.indexer_key_dim_raw,
+            ),
+            self.dtype,
+        ) + self._shape_bytes(self._ring_shape(), self.dtype)
+        return per_slot * self.num_indexer_layers
+
+    def _calculate_memory_usage(self):
+        super()._calculate_memory_usage()
+        self.mem_usage += self.get_indexer_size_bytes() / GB
+
+    def get_kv_size_bytes(self):
+        """The fused KV sizes, with the compressed cache and the ring counted on
+        the K side: the ``(k, v)`` pair has no slot of its own for them."""
+        k_size, v_size = super().get_kv_size_bytes()
+        return k_size + self.get_indexer_size_bytes(), v_size
+
+    def replace_buffer(self, buffers) -> None:
+        """Accept the plain KV list, or the (kv, compressed, ring) triple a QSA
+        model returns as its ``token_to_kv_pool`` update."""
+        if isinstance(buffers, tuple):
+            buffers, compressed, ring = buffers
+            if compressed:
+                self.compressed_key_buffer[: len(compressed)] = compressed
+            if ring:
+                self.open_group_buffer[: len(ring)] = ring
+        super().replace_buffer(buffers)
+
+    def tree_flatten(self):
+        children, aux_data = super().tree_flatten()
+        children = (
+            children[0],
+            self.compressed_key_buffer,
+            self.open_group_buffer,
+        ) + children[1:]
+        aux_data = {
+            **aux_data,
+            "indexer_key_dim_raw": self.indexer_key_dim_raw,
+            "indexer_key_dim": self.indexer_key_dim,
+            "num_indexer_layers": self.num_indexer_layers,
+            "compress_ratio": self.compress_ratio,
+            "max_reqs": self.max_reqs,
+        }
+        return (children, aux_data)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        compressed, ring = children[1], children[2]
+        obj = super().tree_unflatten(aux_data, (children[0],) + children[3:])
+        obj.indexer_key_dim_raw = aux_data["indexer_key_dim_raw"]
+        obj.indexer_key_dim = aux_data["indexer_key_dim"]
+        obj.num_indexer_layers = aux_data["num_indexer_layers"]
+        obj.compress_ratio = aux_data["compress_ratio"]
+        obj.max_reqs = aux_data["max_reqs"]
+        obj.compressed_key_buffer = compressed
+        obj.open_group_buffer = ring
+        return obj
+
+
+@register_pytree_node_class
 class SWAKVPool(KVCache):
     """KV cache with separate pools for full and SWA attention layers."""
 
@@ -1765,20 +2012,32 @@ class HybridLinearKVPool(KVCache):
             self._to_physical(layer_id), loc, cache_k, cache_v, is_decode
         )
 
-    def replace_buffer(self, kv_buffer: list[jax.Array]) -> None:
+    def replace_buffer(self, kv_buffer) -> None:
         """Accept COMPACTED list (length L_full, in full_attention_layer_ids order).
 
         Differs from SWAKVPool.replace_buffer which expects full-length input —
         KDA layers don't write KV pool, so the model emits a compacted list.
+        An inner pool that also keeps an indexer cache takes a tuple led by that
+        list; it is passed through whole.
         """
-        if len(kv_buffer) != self.full_layer_nums:
+        kv = kv_buffer[0] if isinstance(kv_buffer, tuple) else kv_buffer
+        if len(kv) != self.full_layer_nums:
             raise ValueError(
                 f"HybridLinearKVPool.replace_buffer expects compacted list of "
                 f"length {self.full_layer_nums} "
                 f"(= len(full_attention_layer_ids)={self.full_attention_layer_ids}), "
-                f"got {len(kv_buffer)}"
+                f"got {len(kv)}"
             )
         self.full_kv_pool.replace_buffer(kv_buffer)
+
+    # QSA's compressed indexer cache and open-group ring. Both are indexed by
+    # indexer slot, not layer id, so they pass through untranslated.
+
+    def get_compressed_key_buffer(self, slot_id: int) -> jax.Array:
+        return self.full_kv_pool.get_compressed_key_buffer(slot_id)
+
+    def get_open_group_buffer(self, slot_id: int) -> jax.Array:
+        return self.full_kv_pool.get_open_group_buffer(slot_id)
 
     def get_kv_size_bytes(self):
         return self.full_kv_pool.get_kv_size_bytes()
