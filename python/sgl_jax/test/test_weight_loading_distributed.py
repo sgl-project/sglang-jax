@@ -69,6 +69,14 @@ def _worker(rank, port, root):
     local = root / f"checkpoint-{rank}"
     local.mkdir()
     weight = np.arange(128, dtype=np.float32).reshape(16, 8)
+
+    class Hooked(nnx.Module):
+        prefixes = []
+
+        def prepare_weight_loading(self, loader, mappings, prefix):
+            self.prefixes.append(prefix)
+            return mappings
+
     filename = local / "model.safetensors"
     try:
         for case in ("success", "plan_mismatch", "missing_file", "bad_header"):
@@ -81,6 +89,10 @@ def _worker(rank, port, root):
                     (8, 16), np.float32, sharding=NamedSharding(mesh, P(None, "tensor"))
                 )
             )
+            # nnx.Rngs answers any attribute with an RngStream; only the module's
+            # prepare_weight_loading hook may run.
+            model.rngs = nnx.Rngs(0)
+            model.hooked = Hooked()
             loader = WeightLoader(model, SimpleNamespace(model_path=str(local)), mesh)
             if case == "missing_file":
                 assert "w" in loader.metadata
@@ -107,6 +119,7 @@ def _worker(rank, port, root):
                 error = str(exc)
             if case == "success":
                 assert error is None, error
+                assert Hooked.prefixes == ["hooked"], Hooked.prefixes
                 for shard in model.w.value.addressable_shards:
                     np.testing.assert_array_equal(np.asarray(shard.data), weight.T[shard.index])
             else:

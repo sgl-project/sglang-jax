@@ -187,7 +187,9 @@ class WeightLoader:
             if prepare is not None:
                 mappings = prepare(self, mappings)
             for path, module in list(nnx.iter_graph(self.model)):
-                if module is self.model:
+                # Only modules define hooks; other graph nodes such as nnx.Rngs
+                # answer any unknown attribute with an RngStream.
+                if module is self.model or not isinstance(module, nnx.Module):
                     continue
                 prepare = getattr(module, "prepare_weight_loading", None)
                 if prepare is not None:
