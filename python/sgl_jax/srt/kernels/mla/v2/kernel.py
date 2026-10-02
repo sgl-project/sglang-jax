@@ -55,7 +55,21 @@ def floor_div_on_kv_packing(a, kv_packing):
 
 def cdiv(a, b):
     assert b != 0
+    if isinstance(b, int) and b > 0 and (b & (b - 1)) == 0:
+        return (a + b - 1) >> (b.bit_length() - 1)
     return (a + b - 1) // b
+
+
+def floor_div_pow2(a, b):
+    if isinstance(b, int) and b > 0 and (b & (b - 1)) == 0:
+        return a >> (b.bit_length() - 1)
+    return a // b
+
+
+def mod_pow2(a, b):
+    if isinstance(b, int) and b > 0 and (b & (b - 1)) == 0:
+        return a & (b - 1)
+    return a % b
 
 
 def align_to(x, a):
@@ -368,13 +382,19 @@ def _mla_ragged_paged_attention_kernel(
         s = jnp.einsum(
             "bnd,bmd->bnm", ql_nope, kv_c, preferred_element_type=jnp.float32
         ) + jnp.einsum("bnd,bmd->bnm", q_pe, k_pe, preferred_element_type=jnp.float32)
-        s *= sm_scale
+        log2_e = 1.4426950408889634 if soft_cap is None else 1.0
+        s *= sm_scale * log2_e
         if k_scale is not None:
             s *= k_scale
         if q_scale is not None:
             s *= q_scale
 
         k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(jnp.int32, s.shape[1:], 1)
+        q_row_offset = (
+            0
+            if s.shape[1] == num_q_heads
+            else floor_div_pow2(lax.broadcasted_iota(jnp.int32, s.shape[1:], 0), num_q_heads)
+        )
 
         mask_list = []
         for b in range(batch_size):
@@ -383,12 +403,7 @@ def _mla_ragged_paged_attention_kernel(
             q_end = cu_q_lens_ref[seq_idx + 1]
             q_len = q_end - q_start
             kv_len = kv_lens_ref[seq_idx]
-            q_span = (
-                kv_len
-                - q_len
-                + bq_idx * bq_sz
-                + lax.broadcasted_iota(jnp.int32, s.shape[1:], 0) // num_q_heads
-            )
+            q_span = kv_len - q_len + bq_idx * bq_sz + q_row_offset
             mask = q_span < k_span
             if sliding_window is not None:
                 mask = jnp.logical_or(mask, q_span - sliding_window >= k_span)
@@ -397,12 +412,16 @@ def _mla_ragged_paged_attention_kernel(
 
         if soft_cap is not None:
             s = soft_cap * jnp.tanh(s / soft_cap)
-        s = jnp.where(mask, mask_value, s)
+        scaled_mask_value = (
+            mask_value * log2_e if (soft_cap is None and mask_value > -1e30) else mask_value
+        )
+        s = jnp.where(mask, scaled_mask_value, s)
         s_rowmax = jnp.max(s, axis=2, keepdims=True)
         m_prev = load_with_init(head_m_ref, -jnp.inf)
         m_curr = jnp.maximum(m_prev, s_rowmax)
         head_m_ref[...] = m_curr
-        p = jnp.exp(s - broadcast_minor(m_curr, s.shape))
+        exp_fn = lax.exp2 if soft_cap is None else jnp.exp
+        p = exp_fn(s - broadcast_minor(m_curr, s.shape))
         p_rowsum = jnp.sum(p, axis=2, keepdims=True)
         if q_dtype == jnp.bfloat16 and kv_dtype == jnp.bfloat16:
             p = p.astype(jnp.bfloat16)
@@ -410,7 +429,7 @@ def _mla_ragged_paged_attention_kernel(
         pv = jnp.einsum("bnm,bmd->bnd", p, kv_c, preferred_element_type=jnp.float32)
         if v_scale is not None:
             pv *= v_scale
-        exp_m_diff = jnp.exp(m_prev - m_curr)
+        exp_m_diff = exp_fn(m_prev - m_curr)
         l_prev = load_with_init(head_l_ref, 0.0)
         l_curr = exp_m_diff * l_prev + p_rowsum
         head_l_ref[...] = l_curr
@@ -468,7 +487,7 @@ def _mla_ragged_paged_attention_kernel(
             bkv_sz_frm_new_per_kv_packing = cdiv_on_kv_packing(bkv_sz_frm_new, kv_packing)
             # Ragged page_indices: each seq's pages are tightly concatenated.
             # cu_kv_lens is page-aligned so cdiv == //; cdiv mirrors RPA v3 for parity.
-            start_kv_page_idx = cdiv(cu_kv_lens_ref[seq_idx], page_size)
+            start_kv_page_idx = floor_div_pow2(cu_kv_lens_ref[seq_idx], page_size)
             page_indices_offset = start_kv_page_idx + kv_p_start
 
             new_kv_len_start = q_end - kv_left_frm_new
@@ -668,9 +687,9 @@ def _mla_ragged_paged_attention_kernel(
                 q_end = cu_q_lens_ref[seq_idx + 1]
                 kv_len = kv_lens_ref[seq_idx]
 
-                kv_packing_offset = offset % kv_packing
+                kv_packing_offset = mod_pow2(offset, kv_packing)
                 new_kv_len_start = q_end - kv_len + offset
-                new_kv_packing_offset = new_kv_len_start % kv_packing
+                new_kv_packing_offset = mod_pow2(new_kv_len_start, kv_packing)
 
                 @pl.when(
                     jnp.logical_or(
@@ -688,13 +707,13 @@ def _mla_ragged_paged_attention_kernel(
                         kv_packing_offset + update_sz, kv_packing
                     )
 
-                    token_offset_in_bkv = offset % bkv_sz
+                    token_offset_in_bkv = mod_pow2(offset, bkv_sz)
                     kv_packing_idx = floor_div_on_kv_packing(token_offset_in_bkv, kv_packing)
 
                     # Compute the shift amount for each word in bits
                     shift_amount = kv_packing_offset - new_kv_packing_offset
                     bits_per_element = get_dtype_bitwidth(bkvc_vmem_ref.dtype)
-                    shift_bits = bits_per_element * (shift_amount % kv_packing)
+                    shift_bits = bits_per_element * mod_pow2(shift_amount, kv_packing)
                     shift_bits = shift_bits.astype(jnp.uint32)
 
                     # Calculate the starting index in the KV buffer corresponding to the new KV
@@ -822,7 +841,9 @@ def _mla_ragged_paged_attention_kernel(
         # shape: [bkv_sz_per_kv_packing + 2, kv_packing, r_dim]
         bkvpe_vmem_ref = bkpe_x2_ref.at[bkv_sem_idx, b]
 
-        update_kv_packing_iters = cdiv_on_kv_packing((offset % kv_packing) + update_sz, kv_packing)
+        update_kv_packing_iters = cdiv_on_kv_packing(
+            mod_pow2(offset, kv_packing) + update_sz, kv_packing
+        )
 
         # Expected shape:
         # [total_num_pages, page_size_per_kv_packing, kv_packing,
@@ -835,12 +856,12 @@ def _mla_ragged_paged_attention_kernel(
 
         if not wait:
             # Issue DMA copy for the updated parts, page by page.
-            kv_p_start = offset // page_size
+            kv_p_start = floor_div_pow2(offset, page_size)
             kv_p_end = cdiv(offset + update_sz, page_size)
-            start_word_in_page = floor_div_on_kv_packing(offset % page_size, kv_packing)
-            start_word_in_vmem = floor_div_on_kv_packing(offset % bkv_sz, kv_packing)
+            start_word_in_page = floor_div_on_kv_packing(mod_pow2(offset, page_size), kv_packing)
+            start_word_in_vmem = floor_div_on_kv_packing(mod_pow2(offset, bkv_sz), kv_packing)
             words_to_transfer = update_kv_packing_iters
-            start_kv_page_idx = cdiv(cu_kv_lens_ref[seq_idx], page_size)
+            start_kv_page_idx = floor_div_pow2(cu_kv_lens_ref[seq_idx], page_size)
             page_indices_offset = start_kv_page_idx + kv_p_start
 
             def loop_body(i, states):
