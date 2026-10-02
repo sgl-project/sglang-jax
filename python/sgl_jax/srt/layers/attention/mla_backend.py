@@ -358,6 +358,7 @@ class MLAAttentionBackend(AttentionBackend):
 
         o_latent, updated_cache = jax.shard_map(
             _run,
+            mesh=self.mesh,
             in_specs=in_specs,
             out_specs=out_specs,
             check_vma=False,
