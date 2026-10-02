@@ -116,21 +116,22 @@ def causal_conv1d_update(state, value, weight, indices, initial):
     )
 
 
-def gated_delta_decode(state, q, k, v, b, a, A_log, dt_bias, indices, initial, **attributes):
+def gated_delta_decode(state, qkv, b, a, A_log, dt_bias, indices, initial):
+    # qkv is the flat convolution output: the query, key and value heads in
+    # turn. The kernel takes it as each of q, k and v.
     return _recurrent_call(
         "tt.gated_delta_decode",
         state,
         _like(b).update(shape=(*b.shape, state.shape[-1]), dtype=jnp.float32),
-        q,
-        k,
-        v,
+        qkv,
+        qkv,
+        qkv,
         b.astype(jnp.float32),
         a.astype(jnp.float32),
         A_log.astype(jnp.float32),
         dt_bias.astype(jnp.float32),
         indices,
         initial.astype(jnp.bfloat16),
-        **attributes,
     )
 
 

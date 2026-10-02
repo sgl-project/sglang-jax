@@ -129,24 +129,15 @@ class TTGDNAttnBackend(GDNAttnBackend):
         )
         # The kernel reads q, k and v as heads of the convolution output, and
         # normalizes and scales q and k like _qkv.
-        heads = self.key_dim // self.mesh.shape["tensor"] // self.head_k_dim
-        qkv = conv_out.astype(jnp.float32)
         new_rec, out = ops.gated_delta_decode(
             recurrent_state_in,
-            qkv,
-            qkv,
-            qkv,
+            conv_out.astype(jnp.float32),
             b,
             a,
             A_log,
             dt_bias,
             indices,
             initial,
-            key_head_offset=heads,
-            value_head_offset=2 * heads,
-            num_key_heads=heads,
-            normalize_eps=1e-6,
-            query_scale=self.head_k_dim**-0.5,
         )
         return out.astype(mixed_qkv.dtype), new_conv, new_rec
 

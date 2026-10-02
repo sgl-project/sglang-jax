@@ -83,14 +83,15 @@ def reference_chunk(q, k, v, gate, beta, state):
     return state, out.swapaxes(0, 1)
 
 
-def reference_decode(state, qkv, _k, _v, b, a, A_log, dt_bias, indices, initial, **kernel):
+def reference_decode(state, qkv, b, a, A_log, dt_bias, indices, initial):
     # Like the TT kernel: q, k and v are heads of the flat convolution output,
     # and the kernel normalizes q and k and scales q.
-    heads = qkv.reshape(qkv.shape[0], -1, state.shape[-2])
-    count, eps = kernel["num_key_heads"], kernel["normalize_eps"]
-    q = _l2norm(heads[:, :count], eps) * kernel["query_scale"]
-    k = _l2norm(heads[:, kernel["key_head_offset"] :][:, :count], eps)
-    v = heads[:, kernel["value_head_offset"] :]
+    dim = state.shape[-2]
+    heads = qkv.reshape(qkv.shape[0], -1, dim)
+    count = (heads.shape[1] - b.shape[-1]) // 2
+    q = _l2norm(heads[:, :count]) * dim**-0.5
+    k = _l2norm(heads[:, count : 2 * count])
+    v = heads[:, 2 * count :]
     q, k = _repeat_heads(q, k, v)
     active = jnp.where(initial[:, None, None, None], state[indices], 0)
     gate = -jnp.exp(A_log.astype(jnp.float32)) * jax.nn.softplus(
