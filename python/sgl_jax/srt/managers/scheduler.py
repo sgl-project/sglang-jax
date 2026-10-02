@@ -54,6 +54,7 @@ from sgl_jax.srt.managers.io_struct import (
 from sgl_jax.srt.managers.mm_utils import unwrap_shm_features
 from sgl_jax.srt.managers.schedule_batch import (
     FINISH_ABORT,
+    ModelWorkerBatch,
     Req,
     ScheduleBatch,
     _extract_mm_value,
@@ -77,6 +78,7 @@ from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
 from sgl_jax.srt.managers.scheduler_profiler_mixing import SchedulerProfilerMixin
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.managers.tp_worker_overlap_thread import ModelWorkerClient
+from sgl_jax.srt.managers.tp_worker_overlap_v2 import ModelWorkerOverlap
 from sgl_jax.srt.managers.utils import validate_input_length
 from sgl_jax.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
@@ -162,6 +164,8 @@ class GenerationBatchResult:
     extend_logprob_start_len_per_req: list[int]
     bid: int
     cache_miss_count: int
+    worker_batch: ModelWorkerBatch | None = None
+    launch_result: futures.Future | None = None
     # relay path: forward stream -> next step forward
     next_draft_input: EagleDraftInput | DFlashDraftInput | None = None
     spec_relay_buffers: object | None = None
@@ -370,6 +374,17 @@ class Scheduler(
             install()
 
         self.pd = server_args.pd_disaggregation
+        requested_overlap_v2 = get_bool_env_var("SGLANG_JAX_OVERLAP_V2")
+        self.enable_overlap_v2 = (
+            requested_overlap_v2
+            and self.enable_overlap
+            and not self.pd
+            and (self.spec_algorithm is None or self.spec_algorithm.is_none())
+        )
+        if requested_overlap_v2 and not self.enable_overlap_v2:
+            logger.warning("Overlap v2 only supports non-PD normal generation.")
+        elif self.enable_overlap_v2:
+            logger.info("Normal overlap v2 enabled.")
         if mesh is not None:
             self.mesh = mesh
         elif self.pd == "pathways":
@@ -394,7 +409,10 @@ class Scheduler(
                     server_args.tp_size,
                 )
 
-        TpWorkerClass = ModelWorkerClient if self.enable_overlap else ModelWorker
+        if self.enable_overlap_v2:
+            TpWorkerClass = ModelWorkerOverlap
+        else:
+            TpWorkerClass = ModelWorkerClient if self.enable_overlap else ModelWorker
 
         self.tp_worker_p = None
         if self.pd:
@@ -1108,6 +1126,67 @@ class Scheduler(
                         sum(len(i.reqs) for i in self.running_batch.reqs_info),
                         len(getattr(self, "_pd_inflight", ())),
                     )
+
+    def event_loop_overlap_v2(self):
+        """Single-owner scheduling with ordered asynchronous device submission."""
+        try:
+            self._event_loop_overlap_v2()
+        finally:
+            self.tp_worker.shutdown()
+
+    def _event_loop_overlap_v2(self):
+        self.result_queue = deque()
+        while True:
+            recv_reqs = (
+                self._comm_backend.recv_requests()
+                if self._comm_backend is not None
+                else self.recv_requests()
+            )
+            recv_reqs = self.select_dp_for_request(recv_reqs)
+            self.process_input_requests(recv_reqs)
+            if self._engine_paused:
+                continue
+
+            batch = self.get_next_batch_to_run()
+            self.cur_batch = batch
+
+            if self._pending_h2d:
+                self._wait_donation_safe()
+                self._flush_pending_h2d()
+
+            context = None
+            if batch:
+                batch.launch_done = threading.Event()
+                with jax.profiler.TraceAnnotation("submit_batch_forward"):
+                    context = self._launch_batch_forward(batch)
+                batch.launch_done = context
+
+            if self.last_batch:
+                last_batch, last_result = self.result_queue.popleft()
+                self.process_batch_result(
+                    last_batch,
+                    last_result,
+                    batch.launch_done if batch else None,
+                )
+
+            if context is not None:
+                with jax.profiler.TraceAnnotation("submit_batch_sample"):
+                    result = self._launch_batch_sample(batch, context)
+                self.result_queue.append((batch.copy(), result))
+            elif self.last_batch is None:
+                self.check_memory()
+                self.check_tree_cache()
+                self.new_token_ratio = self.init_new_token_ratio
+                if self._comm_backend is not None:
+                    self._comm_backend.wait_for_new_requests(0.001)
+
+            self.last_batch = batch
+
+            if context is not None:
+                # Result CPU work and sample enqueue can overlap forward submission.
+                # The next iteration may release/allocate slots or touch donated
+                # pools during request handling and batch preparation.
+                context.wait()
 
     def run_publisher(self, recv_reqs):
         retry_count = 0
@@ -2477,6 +2556,77 @@ class Scheduler(
                     dp_rank * per_dp_bs_size : dp_rank * per_dp_bs_size + num_real_reqs
                 ]
 
+    def _prepare_relay_metadata(self, batch, worker_batch):
+        if batch.forward_mode.is_decode():
+            return
+
+        total_tokens = len(worker_batch.input_ids)
+        per_dp_tokens = total_tokens // self.dp_size
+        indices = np.zeros(total_tokens, dtype=np.int32)
+        mask = np.zeros(total_tokens, dtype=np.bool_)
+
+        for dp_rank, info in enumerate(batch.reqs_info):
+            reqs = info.reqs or []
+            offset = dp_rank * per_dp_tokens
+            decoding_reqs = {id(req) for req in (info.decoding_reqs or [])}
+            req_pool_indices = info.req_pool_indices if info.req_pool_indices is not None else ()
+            for req, req_pool_idx, extend_len in zip(
+                reqs,
+                req_pool_indices,
+                info.extend_lens or (),
+            ):
+                if id(req) in decoding_reqs:
+                    if extend_len != 1:
+                        raise RuntimeError("Relay decode rows must contain one token.")
+                    indices[offset] = req_pool_idx
+                    mask[offset] = True
+                offset += extend_len
+
+        if mask.any():
+            worker_batch.relay_input_indices = indices
+            worker_batch.relay_input_mask = mask
+
+    def _launch_batch_forward(self, batch):
+        self.forward_ct += 1
+        self._profile_batch_predicate(batch)
+        paddings = self.tp_worker.get_precompile_paddings()
+        worker_batch = batch.get_model_worker_batch(
+            *paddings,
+            self.page_size,
+            self.server_args.enable_static_lora,
+        )
+        self._prepare_relay_metadata(batch, worker_batch)
+        return self.tp_worker.launch_forward(worker_batch)
+
+    def _launch_batch_sample(self, batch, context):
+        launch_result = self.tp_worker.launch_sample(context)
+        worker_batch = context.batch
+        placeholders = np.zeros(len(worker_batch.seq_lens), dtype=np.int32)
+        self._extract_dp_output_ids(placeholders, worker_batch, batch)
+
+        extend_input_len_per_req = None
+        extend_logprob_start_len_per_req = None
+        if batch.return_logprob:
+            extend_input_len_per_req = [
+                req.extend_input_len for info in batch.reqs_info for req in (info.reqs or [])
+            ]
+            extend_logprob_start_len_per_req = [
+                req.extend_logprob_start_len
+                for info in batch.reqs_info
+                for req in (info.reqs or [])
+            ]
+
+        return GenerationBatchResult(
+            logits_output=None,
+            next_token_ids=None,
+            extend_input_len_per_req=extend_input_len_per_req,
+            extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
+            bid=worker_batch.bid,
+            cache_miss_count=0,
+            worker_batch=worker_batch,
+            launch_result=launch_result,
+        )
+
     def run_batch(self, batch: ScheduleBatch) -> GenerationBatchResult:
         """Run a batch."""
         self.forward_ct += 1
@@ -2621,7 +2771,10 @@ class Scheduler(
             self.process_batch_result_prefill(batch, result, launch_done)
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
-                self.tp_worker.resolve_last_batch_result(launch_done)
+                if self.enable_overlap_v2:
+                    self._resolve_overlap_v2_result(result)
+                else:
+                    self.tp_worker.resolve_last_batch_result(launch_done)
                 self.set_next_batch_sampling_info_done(batch)
         elif batch.forward_mode.is_dummy_first():
             self.set_next_batch_sampling_info_done(batch)
@@ -2631,7 +2784,8 @@ class Scheduler(
             # Update grammar vocab masks for next batch in overlap mode
             if batch.next_batch_sampling_info.grammars is not None:
                 batch.next_batch_sampling_info.update_grammar_vocab_mask()
-            batch.next_batch_sampling_info.sampling_info_done.set()
+            if batch.next_batch_sampling_info.sampling_info_done is not None:
+                batch.next_batch_sampling_info.sampling_info_done.set()
 
     def _current_sampling_info_owner(self):
         if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
@@ -2976,6 +3130,8 @@ def dispatch_scheduler_event_loop(scheduler: Scheduler, server_args: ServerArgs)
             scheduler.event_loop_normal_disagg_decode()
     elif scheduler.pd == "pathways" and getattr(scheduler, "_pd_n_decode", 1) > 1:
         scheduler.event_loop_overlap_pd_nd()
+    elif scheduler.enable_overlap_v2:
+        scheduler.event_loop_overlap_v2()
     elif scheduler.enable_overlap:
         scheduler.event_loop_overlap()
     else:
