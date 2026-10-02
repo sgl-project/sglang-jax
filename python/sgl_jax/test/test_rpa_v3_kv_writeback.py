@@ -179,3 +179,104 @@ def test_kv_writeback(
         rtol=0.03,
     )
     np.testing.assert_array_equal(decoded_cache.astype(np.float32), expected_cache)
+
+
+@pytest.mark.skipif(jax.default_backend() != "tpu", reason="Requires TPU DMA support")
+@pytest.mark.parametrize(
+    "sequences,page_size,bkv_sz,bkv_csz,perm_mode",
+    [
+        ([(393, 273), (137, 512), (65, 191)], 128, 512, 256, "shuffled"),
+        ([(1, 37), (16, 48), (33, 60), (7, 100)], 128, 256, 128, "shuffled"),
+        ([(256, 640), (192, 384), (320, 512)], 128, 512, 256, "reverse_interleaved"),
+        ([(1, 512), (1, 273), (129, 384), (256, 128)], 128, 512, 256, "shuffled"),
+    ],
+    ids=[
+        "partial-last-page",
+        "single-page-sequences",
+        "non-contiguous-strided-pages",
+        "mixed-decode-prefill-ragged",
+    ],
+)
+def test_ragged_page_table_parity(sequences, page_size, bkv_sz, bkv_csz, perm_mode):
+    q_lens, prefixes = np.array(sequences).T
+    kv_lens = q_lens + prefixes
+    cu_q_lens = np.r_[0, np.cumsum(q_lens)]
+    page_counts = (kv_lens + page_size - 1) // page_size
+    page_offsets = np.r_[0, np.cumsum(page_counts)]
+    num_tokens = int(cu_q_lens[-1])
+    padded_tokens = (num_tokens + 31) // 32 * 32
+    num_q_heads, num_kv_heads, head_dim = 8, 2, 128
+    rng = np.random.default_rng(42)
+    total_mapped_pages = int(page_offsets[-1])
+    if perm_mode == "shuffled":
+        page_indices = rng.permutation(np.arange(1, total_mapped_pages + 1, dtype=np.int32))
+    else:
+        all_p = np.arange(1, total_mapped_pages * 2 + 1, 2, dtype=np.int32)[::-1]
+        page_indices = all_p[:total_mapped_pages]
+
+    max_phys_page = int(np.max(page_indices)) + 2
+    cache = np.full((max_phys_page, page_size, num_kv_heads, 2, head_dim), -7.0, np.float32)
+    expected_cache = cache.copy()
+    new_k = np.zeros((padded_tokens, num_kv_heads, head_dim), np.float32)
+    new_v = np.zeros((padded_tokens, num_kv_heads, head_dim), np.float32)
+    reference_pages = np.zeros((len(sequences), int(max(page_counts))), np.int32)
+
+    for i, prefix in enumerate(prefixes):
+        k_seq = rng.integers(-4, 5, size=(kv_lens[i], num_kv_heads, head_dim)).astype(np.float32)
+        v_seq = rng.integers(-4, 5, size=(kv_lens[i], num_kv_heads, head_dim)).astype(np.float32)
+        pages = page_indices[page_offsets[i] : page_offsets[i + 1]]
+        reference_pages[i, : len(pages)] = pages
+        positions = np.arange(kv_lens[i])
+        physical_pages, slots = pages[positions // page_size], positions % page_size
+        kv_interleaved = np.stack([k_seq, v_seq], axis=2).reshape(
+            kv_lens[i], num_kv_heads, 2, head_dim
+        )
+        expected_cache[physical_pages, slots] = kv_interleaved
+        cache[physical_pages[:prefix], slots[:prefix]] = kv_interleaved[:prefix]
+        new_k[cu_q_lens[i] : cu_q_lens[i + 1]] = k_seq[prefix:]
+        new_v[cu_q_lens[i] : cu_q_lens[i + 1]] = v_seq[prefix:]
+
+    queries = jnp.asarray(
+        rng.uniform(-0.25, 0.25, (padded_tokens, num_q_heads, head_dim)), jnp.bfloat16
+    )
+    cu_q_lens_j = jnp.asarray(cu_q_lens, jnp.int32)
+    kv_lens_j = jnp.asarray(kv_lens, jnp.int32)
+    expected_output = ref_ragged_paged_attention(
+        queries,
+        jnp.asarray(expected_cache[:, :, :, 0, :], jnp.bfloat16),
+        jnp.asarray(expected_cache[:, :, :, 1, :], jnp.bfloat16),
+        kv_lens_j,
+        jnp.asarray(reference_pages, jnp.int32),
+        cu_q_lens_j,
+        jnp.array([len(sequences)], jnp.int32),
+        sm_scale=head_dim**-0.5,
+    )
+
+    count = len(sequences)
+    num_leading_decode = int(np.sum(q_lens == 1))
+    decode_count = num_leading_decode if np.all(q_lens[:num_leading_decode] == 1) else 0
+    output, updated_cache = ragged_paged_attention(
+        queries,
+        jnp.asarray(new_k, jnp.bfloat16),
+        jnp.asarray(new_v, jnp.bfloat16),
+        jnp.asarray(cache, jnp.bfloat16),
+        kv_lens_j,
+        jnp.asarray(page_indices, jnp.int32),
+        cu_q_lens_j,
+        jnp.asarray(page_offsets * page_size, jnp.int32),
+        jnp.array([decode_count, decode_count, count], jnp.int32),
+        None,
+        d_block_sizes=(1, bkv_sz, 1, bkv_csz),
+        p_block_sizes=(32, bkv_sz, 32, bkv_csz),
+        m_block_sizes=(32, bkv_sz, 32, bkv_csz),
+        sm_scale=head_dim**-0.5,
+    )
+    output, updated_cache_host = jax.device_get((output, updated_cache))
+
+    np.testing.assert_allclose(
+        output[:num_tokens].astype(np.float32),
+        np.asarray(expected_output, np.float32),
+        atol=0.03,
+        rtol=0.03,
+    )
+    np.testing.assert_array_equal(updated_cache_host.astype(np.float32), expected_cache)
