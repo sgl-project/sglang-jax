@@ -188,6 +188,55 @@ class EPMoE(nnx.Module):
         except Exception as _:
             return False, "cpu"
 
+    def _apply_activation(self, layer_w0: jax.Array, layer_w1: jax.Array) -> jax.Array:
+        """Gated activation between the two GEMMs. Overridable for gates this one lacks.
+
+        ``layer_w0`` is the gate branch (``wi_0``/``w1``), ``layer_w1`` the up branch
+        (``wi_1``/``w3``). Kimi-K3 overrides this with SITU, which is not expressible as
+        ``f(gate) * up`` with an elementwise ``f`` -- it consumes both branches together.
+        """
+        if self.activation == "silu":
+            return jax.nn.silu(layer_w0) * layer_w1
+        if self.activation == "gelu":
+            return jax.nn.gelu(layer_w0) * layer_w1
+        if self.activation == "swigluoai":
+            gate = jnp.clip(layer_w0, max=self.swiglu_limit)
+            up = jnp.clip(layer_w1, -self.swiglu_limit, self.swiglu_limit)
+            return (up + 1.0) * gate * jax.nn.sigmoid(gate * self.swiglu_alpha)
+        raise ValueError(f"Unsupported activation function {self.activation}")
+
+    def _call_gmm(self, **kwargs):
+        """The GMM this MoE runs on. Overridable so a subclass can swap the kernel.
+
+        A method rather than an attribute on purpose: nnx traverses module *state*, and a callable
+        stored on the instance would be walked by split/jit. Class-level methods are not state.
+
+        Default is the module-level `gmm`, so every existing model is unchanged. Kimi-K3 overrides
+        it with the fp4-capable megablox kernel -- this backend has no sub-byte path.
+        """
+        return gmm(**kwargs)
+
+    def _gmm_scale_sharding(self, scale: jax.Array, scale_name: str) -> P:
+        """Sharding of a [E, k_blocks, 1, out_dim] GMM scale, consistent with its weight.
+
+        wi_* shard their output dim over "tensor", so their scales do too. wo shards its
+        contraction dim K over "tensor", so each rank holds K / tp rows: its block scales must be
+        split along k_blocks the same way, or every rank pairs its K slice with the whole scale
+        array and the kernel applies each block scale to the wrong rows. A single K block
+        (per-channel scale) covers all rows and stays replicated.
+        """
+        if scale_name != "wo_scale":
+            return P("expert", None, None, "tensor")
+        k_blocks = scale.shape[1]
+        if k_blocks == 1:
+            return P("expert", None, None, None)
+        if k_blocks % self.tp_size:
+            raise ValueError(
+                f"wo_scale has {k_blocks} K blocks, which the MoE tensor axis ({self.tp_size}) "
+                "does not divide; each rank's K slice must hold whole scale blocks."
+            )
+        return P("expert", "tensor", None, None)
+
     def _normalize_scale_for_gmm(
         self,
         scale: jax.Array | None,
@@ -234,12 +283,7 @@ class EPMoE(nnx.Module):
                         f"Unsupported {scale_name} shape {scale.shape} for weight shape {weight.shape}. "
                         f"Expected k_blocks dimension to be 1 or {expected_k_blocks}."
                     )
-            final_scale_sharding = (
-                P("expert", None, None, None)
-                if scale_name == "wo_scale"
-                else P("expert", None, None, "tensor")
-            )
-            return jax.sharding.reshard(scale, final_scale_sharding)
+            return jax.sharding.reshard(scale, self._gmm_scale_sharding(scale, scale_name))
 
         if scale.ndim == 2 and scale.shape == (num_experts, out_dim):
             return scale[:, None, None, :]
@@ -261,13 +305,10 @@ class EPMoE(nnx.Module):
                 expected_k_blocks = (in_dim + block_size_k - 1) // block_size_k
 
                 if scale.shape == (num_experts, out_dim, expected_k_blocks):
-                    final_scale_sharding = (
-                        P("expert", None, None, None)
-                        if scale_name == "wo_scale"
-                        else P("expert", None, None, "tensor")
-                    )
                     scale_gmm = jnp.transpose(scale, (0, 2, 1))[:, :, None, :]
-                    return jax.sharding.reshard(scale_gmm, final_scale_sharding)
+                    return jax.sharding.reshard(
+                        scale_gmm, self._gmm_scale_sharding(scale_gmm, scale_name)
+                    )
 
                 if scale.shape == (num_experts, expected_out_blocks, expected_k_blocks):
                     scale_per_out_sharding = (
@@ -275,17 +316,14 @@ class EPMoE(nnx.Module):
                         if scale_name == "wo_scale"
                         else P("expert", "tensor", None)
                     )
-                    final_scale_sharding = (
-                        P("expert", None, None, None)
-                        if scale_name == "wo_scale"
-                        else P("expert", None, None, "tensor")
-                    )
                     out_block_ids = jnp.arange(out_dim, dtype=jnp.int32) // block_size_out
                     scale_per_out = scale.at[:, out_block_ids, :].get(
                         out_sharding=scale_per_out_sharding
                     )
                     scale_gmm = jnp.transpose(scale_per_out, (0, 2, 1))[:, :, None, :]
-                    return jax.sharding.reshard(scale_gmm, final_scale_sharding)
+                    return jax.sharding.reshard(
+                        scale_gmm, self._gmm_scale_sharding(scale_gmm, scale_name)
+                    )
 
                 if scale.shape == (num_experts, expected_k_blocks, out_dim):
                     return scale[:, :, None, :]
@@ -539,10 +577,14 @@ class EPMoE(nnx.Module):
                     P("expert", None, "tensor"),
                     P("expert", None, "tensor"),
                     P("expert", "tensor", None),
-                    # scales [g, 1, 1, n]
+                    # scales [g, k_blocks, 1, n]; wo's follow its K sharding
                     P("expert", None, None, "tensor"),
                     P("expert", None, None, "tensor"),
-                    P("expert", None, None, None),
+                    (
+                        self._gmm_scale_sharding(wo_scale, "wo_scale")
+                        if wo_scale is not None
+                        else P("expert", None, None, None)
+                    ),
                     # biases [g, 1, n] (unused)
                     P("expert", None, "tensor"),
                     P("expert", None, "tensor"),
@@ -761,7 +803,7 @@ class EPMoE(nnx.Module):
         )
 
         # === GEMM1: x @ w0 and x @ w1 ===
-        layer_w0 = gmm(
+        layer_w0 = self._call_gmm(
             lhs=x,
             rhs=w0_kernel,
             rhs_scale=w0_kernel_scale,
@@ -770,7 +812,7 @@ class EPMoE(nnx.Module):
             activation_quantized_dtype=act_q_dtype,
             **gmm_kwargs,
         )
-        layer_w1 = gmm(
+        layer_w1 = self._call_gmm(
             lhs=x,
             rhs=w1_kernel,
             rhs_scale=w1_kernel_scale,
@@ -781,19 +823,10 @@ class EPMoE(nnx.Module):
         )
 
         # === Activation ===
-        if self.activation == "silu":
-            intermediate_layer = jax.nn.silu(layer_w0) * layer_w1
-        elif self.activation == "gelu":
-            intermediate_layer = jax.nn.gelu(layer_w0) * layer_w1
-        elif self.activation == "swigluoai":
-            gate = jnp.clip(layer_w0, max=self.swiglu_limit)
-            up = jnp.clip(layer_w1, -self.swiglu_limit, self.swiglu_limit)
-            intermediate_layer = (up + 1.0) * gate * jax.nn.sigmoid(gate * self.swiglu_alpha)
-        else:
-            raise ValueError(f"Unsupported activation function {self.activation}")
+        intermediate_layer = self._apply_activation(layer_w0, layer_w1)
 
         # === GEMM2: intermediate @ wo ===
-        return gmm(
+        return self._call_gmm(
             lhs=intermediate_layer,
             rhs=wo_kernel,
             rhs_scale=wo_kernel_scale,

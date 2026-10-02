@@ -360,6 +360,23 @@ suites = {
         ),
         TestFile("python/sgl_jax/test/multimodal/test_rotary_embedding.py", 0.1),
         TestFile("test/srt/test_radix_input_ids.py", 0.1, runner="pytest"),
+        # Kimi-K3 port (CPU-safe: TPU/checkpoint-dependent cases self-skip;
+        # torch parity uses importorskip)
+        TestFile("python/sgl_jax/test/test_kimi_k3_registry.py", 0.2, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_kimi_k3_config.py", 0.2, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_kimi_k3_weight_mappings.py", 0.2, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_kimi_k3_layers.py", 0.2, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_kimi_k3_residual.py", 0.1, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_kimi_k3_a_log.py", 0.1, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_kimi_k3_model.py", 0.3, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_kimi_k3_torch_parity.py", 0.3, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_mxfp4.py", 0.3, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_mxfp4_moe.py", 0.3, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_mxfp4_streaming.py", 0.2, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_mxfp4_fp4_native.py", 0.2, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_kimi_k3_fp4_gmm_dispatch.py", 0.1, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_kimi_k3_load_contract.py", 0.2, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_kimi_k3_moe_tensor_parallel.py", 0.2, runner="pytest"),
         TestFile("test/srt/test_tokenizer_manager_event.py", 0.1),
         TestFile(
             "python/sgl_jax/test/mem_cache/test_unified_swa_scheduler.py",
