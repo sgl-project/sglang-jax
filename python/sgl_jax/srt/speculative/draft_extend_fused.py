@@ -22,6 +22,7 @@ from sgl_jax.srt.speculative.relay_buffer import (
     make_dp_valid_mask,
     update_spec_relay_buffers,
 )
+from sgl_jax.srt.speculative.spec_logprob import attach_spec_output_logprobs
 from sgl_jax.srt.speculative.spec_utils import (
     SIMULATED_ACCEPTANCE_CONFIG,
     apply_simulated_acceptance,
@@ -1655,8 +1656,11 @@ def _prepare_logits_metadata(batch, mesh, *, include_accept_lens: bool = True):
         extend_seq_lens_cpu=None,
         extend_logprob_start_lens_cpu=None,
         extend_logprob_pruned_lens_cpu=None,
-        top_logprobs_nums=getattr(batch, "top_logprobs_nums", None),
-        token_ids_logprobs=getattr(batch, "token_ids_logprobs", None),
+        # Draft-model logprobs are never returned, and these lists are part of
+        # the JIT cache key (aux data): keep them None so a logprob batch does
+        # not retrace the fused verify / draft-extend executables.
+        top_logprobs_nums=None,
+        token_ids_logprobs=None,
         extend_input_logprob_token_ids_device=_prepare_device_array(
             getattr(batch, "extend_input_logprob_token_ids", None),
             sharding,
@@ -2565,11 +2569,22 @@ def spec_decode_verify(
         ):
             if hasattr(value, "copy_to_host_async"):
                 value.copy_to_host_async()
+    verify_logits_output = LogitsProcessorOutput(
+        next_token_logits=target_logits,
+        hidden_states=prepared_hidden,
+    )
+    if return_target_logits:
+        # target_logits is gathered at safe_index inside fused_verify:
+        # bs * (steps + 1) rows aligned with prepared_verified_id.
+        attach_spec_output_logprobs(
+            verify_logits_output,
+            prepared_verified_id,
+            model_worker_batch,
+            spec_worker.mesh,
+            width=draft_worker.speculative_num_steps + 1,
+        )
     batch_output = GenerationBatchResult(
-        logits_output=LogitsProcessorOutput(
-            next_token_logits=target_logits,
-            hidden_states=prepared_hidden,
-        ),
+        logits_output=verify_logits_output,
         next_token_ids=prepared_predict,
         next_draft_input=next_draft_input,
         accept_lens=prepared_accept_lens_host,

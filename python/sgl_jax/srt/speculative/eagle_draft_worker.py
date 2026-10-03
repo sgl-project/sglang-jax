@@ -26,6 +26,7 @@ from sgl_jax.srt.speculative.eagle_util import (
 )
 from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+from sgl_jax.srt.speculative.spec_logprob import draft_extend_logits_metadata
 from sgl_jax.srt.utils.jax_utils import device_array
 
 
@@ -250,7 +251,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
         logits_output, _, _ = self.draft_model_runner.forward(
             forward_batch,
-            logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
+            logits_metadata=draft_extend_logits_metadata(model_worker_batch, self.mesh),
         )
         # Restore real_bs so split_spec_info_per_rank cuts on real_bs_per_dp.
         model_worker_batch.spec_info_padded.verified_id = verified_id_np

@@ -40,6 +40,18 @@ class DraftExtendLogprobGuardTest(unittest.TestCase):
         )
         self.assertTrue(batch_has_extend_logprob_lists(b))
 
+    def test_spec_decode_batch_with_top_lists_but_no_start_lens_is_rejected(self):
+        # _get_spec_decode_mwb_dp now carries top_logprobs_nums / token_ids_logprobs
+        # (for verify-row logprobs); without extend_logprob_start_lens it is still
+        # a decode batch and must not build extend-logprob metadata.
+        b = SimpleNamespace(
+            return_logprob=True,
+            top_logprobs_nums=[5, 0],
+            token_ids_logprobs=[None, [1, 2]],
+            extend_logprob_start_lens=None,
+        )
+        self.assertFalse(batch_has_extend_logprob_lists(b))
+
     def test_partial_lists_are_rejected(self):
         b = SimpleNamespace(
             return_logprob=True,

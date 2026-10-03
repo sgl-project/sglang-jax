@@ -336,8 +336,9 @@ class EagleDraftInput:
                 extend_seq_lens_cpu=None,
                 extend_logprob_start_lens_cpu=None,
                 extend_logprob_pruned_lens_cpu=None,
-                top_logprobs_nums=model_worker_batch.top_logprobs_nums,
-                token_ids_logprobs=model_worker_batch.token_ids_logprobs,
+                # Part of the JIT cache key; draft logprobs are never returned.
+                top_logprobs_nums=None,
+                token_ids_logprobs=None,
                 extend_input_logprob_token_ids_device=_to_device(
                     model_worker_batch.extend_input_logprob_token_ids
                 ),
