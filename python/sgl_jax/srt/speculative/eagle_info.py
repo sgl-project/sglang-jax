@@ -73,6 +73,21 @@ def _as_int32_array(value: Any, *, fallback: int = -1) -> Any:
         ) from exc
 
 
+def batch_has_extend_logprob_lists(batch) -> bool:
+    """True only when a batch carries the per-request extend-logprob lists that
+    LogitsMetadata.from_model_worker_batch iterates. The speculative decode batch
+    (schedule_batch.get_model_worker_batch, decode branch) sets return_logprob but
+    leaves top_logprobs_nums / token_ids_logprobs / extend_logprob_start_lens None;
+    the draft-extend step after verify must then build the no-logprob metadata
+    (draft-model logprobs are never returned) instead of crashing on None."""
+    return (
+        bool(getattr(batch, "return_logprob", False))
+        and getattr(batch, "top_logprobs_nums", None) is not None
+        and getattr(batch, "token_ids_logprobs", None) is not None
+        and getattr(batch, "extend_logprob_start_lens", None) is not None
+    )
+
+
 @register_pytree_node_class
 @dataclass
 class EagleDraftInput:
@@ -275,7 +290,9 @@ class EagleDraftInput:
         from sgl_jax.srt.layers.logits_processor import LogitsMetadata
         from sgl_jax.srt.utils.jax_utils import device_array
 
-        if (legacy_non_overlap and not use_device_metadata) or model_worker_batch.return_logprob:
+        if (legacy_non_overlap and not use_device_metadata) or batch_has_extend_logprob_lists(
+            model_worker_batch
+        ):
             logits_metadata = LogitsMetadata.from_model_worker_batch(
                 model_worker_batch, draft_model_runner.mesh
             )
@@ -319,8 +336,9 @@ class EagleDraftInput:
                 extend_seq_lens_cpu=None,
                 extend_logprob_start_lens_cpu=None,
                 extend_logprob_pruned_lens_cpu=None,
-                top_logprobs_nums=model_worker_batch.top_logprobs_nums,
-                token_ids_logprobs=model_worker_batch.token_ids_logprobs,
+                # Part of the JIT cache key; draft logprobs are never returned.
+                top_logprobs_nums=None,
+                token_ids_logprobs=None,
                 extend_input_logprob_token_ids_device=_to_device(
                     model_worker_batch.extend_input_logprob_token_ids
                 ),
