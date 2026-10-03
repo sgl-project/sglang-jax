@@ -11,6 +11,7 @@ from sgl_jax.srt.function_call.base_format_detector import BaseFormatDetector
 from sgl_jax.srt.function_call.core_types import ToolCallItem
 from sgl_jax.srt.function_call.glm4_moe_detector import Glm4MoeDetector
 from sgl_jax.srt.function_call.glm47_moe_detector import Glm47MoeDetector
+from sgl_jax.srt.function_call.kimik2_detector import KimiK2Detector
 from sgl_jax.srt.function_call.ling3_detector import Ling3Detector
 from sgl_jax.srt.function_call.mimo_detector import MiMoDetector
 from sgl_jax.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
@@ -36,6 +37,7 @@ class FunctionCallParser:
         "glm47": Glm47MoeDetector,
         "glm45": Glm4MoeDetector,
         "ling3": Ling3Detector,
+        "kimi_k2": KimiK2Detector,
     }
 
     def __init__(self, tools: list[Tool], tool_call_parser: str):
