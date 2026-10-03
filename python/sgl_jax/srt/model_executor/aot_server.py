@@ -111,6 +111,18 @@ def export_server(server_args):
                 resources.max_num_reqs,
                 config.moe_backend.value,
             )
+            # A per-request buffer in the KV pool (QSA's ring) was sized by the
+            # request limit before this resolution. A server restoring the bundle
+            # sizes it by the resolved one, and a different shape does not load.
+            pool_kwargs = getattr(resources.attn_backend, "token_to_kv_pool_kwargs", None) or {}
+            request_rows = resources._resolve_max_num_reqs(max_running)
+            if "max_reqs" in pool_kwargs and request_rows != resources.max_num_reqs:
+                raise ValueError(
+                    f"the KV pool's per-request buffer was exported with "
+                    f"{resources.max_num_reqs} rows, but a server restoring this bundle "
+                    f"will build {request_rows}; export with --max-running-requests "
+                    f"{max_running}"
+                )
             max_bs, max_tokens = CompilationManager.get_max_padded_size(server_args, max_running)
             max_req_len = min(
                 config.context_len - 1, resources.max_total_num_tokens // server_args.dp_size - 1
