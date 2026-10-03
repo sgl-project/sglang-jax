@@ -1163,7 +1163,7 @@ def pallas_kda_gate_cumsum(
 # ============================================================================
 
 
-def _align_seqs(tensors_4d, tensors_3d, cu_seqlens, align):
+def _align_seqs(tensors_4d, tensors_3d, cu_seqlens, align, pad_values_4d=None):
     N = cu_seqlens.shape[0] - 1
     T_old = tensors_4d[0].shape[1]
 
@@ -1172,26 +1172,30 @@ def _align_seqs(tensors_4d, tensors_3d, cu_seqlens, align):
     padded_cu = jnp.concatenate([jnp.zeros(1, dtype=jnp.int32), jnp.cumsum(padded_lens)])
     T_new = ((T_old + N * (align - 1) + align - 1) // align) * align
 
-    def _build_gather(i, gather_idx):
-        old_start = cu_seqlens[i]
-        new_start = padded_cu[i]
-        sl = seg_lens[i]
-        j = jnp.arange(T_new)
-        in_seg = (j >= new_start) & (j < new_start + sl)
-        src = old_start + (j - new_start)
-        return jnp.where(in_seg, src, gather_idx)
+    j = jnp.arange(T_new, dtype=jnp.int32)[None, :]
+    new_starts = padded_cu[:-1, None]
+    sls = seg_lens[:, None]
+    in_seg = (j >= new_starts) & (j < new_starts + sls)
+    any_valid = jnp.any(in_seg, axis=0)
+    seg_idx = jnp.argmax(in_seg, axis=0)
+    src = cu_seqlens[seg_idx] + (j[0] - padded_cu[seg_idx])
+    gather_idx = jnp.where(any_valid, src, T_old)
 
-    gather_idx = jnp.full(T_new, T_old, dtype=jnp.int32)
-    gather_idx = jax.lax.fori_loop(0, N, _build_gather, gather_idx)
+    if pad_values_4d is None:
+        pad_values_4d = [0] * len(tensors_4d)
 
-    def repack_4d(t):
-        return jnp.pad(t, ((0, 0), (0, T_new - T_old), (0, 0), (0, 0)))[:, gather_idx]
+    def repack_4d(t, val):
+        return jnp.pad(
+            t,
+            ((0, 0), (0, T_new - T_old), (0, 0), (0, 0)),
+            constant_values=jnp.asarray(val, dtype=t.dtype),
+        )[:, gather_idx]
 
     def repack_3d(t):
         return jnp.pad(t, ((0, 0), (0, T_new - T_old), (0, 0)))[:, gather_idx]
 
     return (
-        [repack_4d(t) for t in tensors_4d],
+        [repack_4d(t, val) for t, val in zip(tensors_4d, pad_values_4d)],
         [repack_3d(t) for t in tensors_3d],
         padded_cu,
         cu_seqlens,
@@ -1199,20 +1203,15 @@ def _align_seqs(tensors_4d, tensors_3d, cu_seqlens, align):
 
 
 def _unalign_output(o, orig_cu_seqlens, aligned_cu_seqlens, T_out):
-    N = orig_cu_seqlens.shape[0] - 1
     orig_seg_lens = orig_cu_seqlens[1:] - orig_cu_seqlens[:-1]
-
-    def _build_gather(i, gather_idx):
-        orig_start = orig_cu_seqlens[i]
-        aligned_start = aligned_cu_seqlens[i]
-        sl = orig_seg_lens[i]
-        j = jnp.arange(T_out)
-        in_seg = (j >= orig_start) & (j < orig_start + sl)
-        src = aligned_start + (j - orig_start)
-        return jnp.where(in_seg, src, gather_idx)
-
-    gather_idx = jnp.zeros(T_out, dtype=jnp.int32)
-    gather_idx = jax.lax.fori_loop(0, N, _build_gather, gather_idx)
+    j = jnp.arange(T_out, dtype=jnp.int32)[None, :]
+    orig_starts = orig_cu_seqlens[:-1, None]
+    sls = orig_seg_lens[:, None]
+    in_seg = (j >= orig_starts) & (j < orig_starts + sls)
+    any_valid = jnp.any(in_seg, axis=0)
+    seg_idx = jnp.argmax(in_seg, axis=0)
+    src = aligned_cu_seqlens[seg_idx] + (j[0] - orig_cu_seqlens[seg_idx])
+    gather_idx = jnp.where(any_valid, src, 0)
     return o[:, gather_idx]
 
 
@@ -1313,31 +1312,6 @@ def chunk_kda_fwd(
     assert not return_intermediate_states
     assert not disable_recompute
 
-    chunk_kda_pipeline_handle = (
-        resident_pipeline_kda_fwd
-        if not single_chunk_state_elision and pipeline_impl in ("incumbent", "fused_resident")
-        else None
-    )
-    if chunk_kda_pipeline_handle is not None:
-        return chunk_kda_pipeline_handle(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            scale,
-            initial_state,
-            output_final_state,
-            cu_seqlens,
-            chunk_size=chunk_size,
-            intra_block_size=intra_block_size,
-            safe_gate=safe_gate,
-            lower_bound=lower_bound,
-            use_gate_in_kernel=use_gate_in_kernel,
-            A_log=A_log,
-            dt_bias=dt_bias,
-        )
-
     B, T, H, K = q.shape
     V = v.shape[-1]
     BT = chunk_size
@@ -1368,6 +1342,29 @@ def chunk_kda_fwd(
         assert (
             single_chunk_state_elision
         ), "zero-state output elision requires single_chunk_state_elision"
+
+    chunk_kda_pipeline_handle = (
+        resident_pipeline_kda_fwd if pipeline_impl in ("incumbent", "fused_resident") else None
+    )
+    if chunk_kda_pipeline_handle is not None:
+        return chunk_kda_pipeline_handle(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            initial_state,
+            output_final_state,
+            cu_seqlens,
+            chunk_size=chunk_size,
+            intra_block_size=intra_block_size,
+            safe_gate=safe_gate,
+            lower_bound=lower_bound,
+            use_gate_in_kernel=use_gate_in_kernel,
+            A_log=A_log,
+            dt_bias=dt_bias,
+        )
 
     # Varlen alignment
     _orig_cu_seqlens = cu_seqlens
