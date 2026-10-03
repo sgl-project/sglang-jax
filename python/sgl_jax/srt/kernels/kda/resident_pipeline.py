@@ -73,7 +73,11 @@ def _build_bounded_intra_3d(q, k, g, beta, scale, causal_bt, strict_bt, BC, prec
         if blk == 0:
             k_inv_prefix = k_inv_curr
         else:
-            ref_decay = exp2(ref - prev_ref)
+            if safe_gate and BC > 16:
+                mid_ref = g_blk[:, 0:1, :]
+                ref_decay = exp2(mid_ref - prev_ref) * exp2(ref - mid_ref)
+            else:
+                ref_decay = exp2(ref - prev_ref)
             k_inv_prefix = jnp.concatenate([k_inv_prefix * ref_decay, k_inv_curr], axis=1)
         prev_ref = ref
         qk_scaled = jnp.concatenate([q_scaled, k_scaled], axis=1)
@@ -94,10 +98,15 @@ def _build_bounded_intra_3d(q, k, g, beta, scale, causal_bt, strict_bt, BC, prec
         aqk_rows.append(qk_dot[:, :BC, :])
         l_rows.append(qk_dot[:, BC:, :])
 
-    Aqk = (jnp.concatenate(aqk_rows, axis=1) * scale) * causal_bt[None, :, :]
-    L = (jnp.concatenate(l_rows, axis=1) * beta) * strict_bt[None, :, :]
+    Aqk = jnp.where(causal_bt[None, :, :], jnp.concatenate(aqk_rows, axis=1) * scale, 0.0)
+    L = jnp.where(strict_bt[None, :, :], jnp.concatenate(l_rows, axis=1) * beta, 0.0)
     g_last = g[:, BT - 1 : BT, :]
-    kg = k_inv_prefix * exp2(g_last - prev_ref)
+    if safe_gate and (BT - 1 - ((num_blocks - 1) * BC + ref_idx)) > 16:
+        mid_last = g[:, BT - 16 : BT - 15, :]
+        last_decay = exp2(mid_last - prev_ref) * exp2(g_last - mid_last)
+    else:
+        last_decay = exp2(g_last - prev_ref)
+    kg = k_inv_prefix * last_decay
     return Aqk, L, kg
 
 
@@ -146,8 +155,8 @@ def _build_unbounded_intra_3d(q, k, g, beta, scale, causal_bt, strict_bt, BC, pr
         aqk_rows.append(jnp.concatenate(aqk_parts, axis=2))
         l_rows.append(jnp.concatenate(l_parts, axis=2))
 
-    Aqk = (jnp.concatenate(aqk_rows, axis=1) * scale) * causal_bt[None, :, :]
-    L = (jnp.concatenate(l_rows, axis=1) * beta) * strict_bt[None, :, :]
+    Aqk = jnp.where(causal_bt[None, :, :], jnp.concatenate(aqk_rows, axis=1) * scale, 0.0)
+    L = jnp.where(strict_bt[None, :, :], jnp.concatenate(l_rows, axis=1) * beta, 0.0)
     g_last = g[:, BT - 1 : BT, :]
     kg = k * exp2(jnp.clip(g_last - g, -126.0, 0.0))
     return Aqk, L, kg
@@ -155,7 +164,7 @@ def _build_unbounded_intra_3d(q, k, g, beta, scale, causal_bt, strict_bt, BC, pr
 
 def _solve_intra_3d(L, rhs, identity_bt, same_block_mask, BC_inv, use_neumann, prec):
     """Solve (I + L) x = rhs via block-diagonal Neumann preconditioner on 3D [MB, BT, *]."""
-    BT = L.shape[1]
+    MB, BT, _ = L.shape
 
     def _dot(a, b):
         return jax.lax.dot_general(
@@ -166,9 +175,9 @@ def _solve_intra_3d(L, rhs, identity_bt, same_block_mask, BC_inv, use_neumann, p
             preferred_element_type=jnp.float32,
         )
 
-    L_diag = L * same_block_mask[None, :, :]
+    L_diag = jnp.where(same_block_mask[None, :, :], L, 0.0)
     neg_Ld = -L_diag
-    P = identity_bt[None, :, :] + neg_Ld
+    P = jnp.where(identity_bt[None, :, :], 1.0, neg_Ld)
     Mk = neg_Ld
     num_diag_steps = int(math.log2(BC_inv)) - 1
     for step in range(num_diag_steps):
@@ -185,11 +194,46 @@ def _solve_intra_3d(L, rhs, identity_bt, same_block_mask, BC_inv, use_neumann, p
     if NC_inv == 1:
         return _dot(P, rhs)
     if use_neumann:
-        F = L - L_diag
-        H_mat = -_dot(P, F)
+        F = jnp.where(same_block_mask[None, :, :], 0.0, L)
         v_new = _dot(P, rhs)
-        num_block_steps = int(math.log2(NC_inv))
         half = BT // 2
+        if NC_inv == 8:
+            H_bot56 = -_dot(P[:, BC_inv:, :], F)
+            v_new = jnp.concatenate(
+                [
+                    v_new[:, :BC_inv, :],
+                    v_new[:, BC_inv:, :] + _dot(H_bot56, v_new),
+                ],
+                axis=1,
+            )
+            H_full = jnp.concatenate(
+                [jnp.zeros((MB, BC_inv, BT), dtype=jnp.float32), H_bot56],
+                axis=1,
+            )
+            H_bot48 = _dot(H_bot56[:, BC_inv:, :], H_full)
+            s1 = 2 * BC_inv
+            v_new = jnp.concatenate(
+                [
+                    v_new[:, :s1, :],
+                    v_new[:, s1:, :] + _dot(H_bot48, v_new),
+                ],
+                axis=1,
+            )
+            H2_col_half = jnp.concatenate(
+                [jnp.zeros((MB, s1, half), dtype=jnp.float32), H_bot48[:, :, :half]],
+                axis=1,
+            )
+            H_bot32 = _dot(H_bot48[:, s1:, :], H2_col_half)
+            return jnp.concatenate(
+                [
+                    v_new[:, :half, :],
+                    v_new[:, half:, :] + _dot(H_bot32, v_new[:, :half, :]),
+                ],
+                axis=1,
+            )
+
+        H_mat = -_dot(P, F)
+        num_block_steps = int(math.log2(NC_inv))
         for step in range(num_block_steps):
             if step < num_block_steps - 1:
                 s_row = (1 << step) * BC_inv
@@ -250,7 +294,11 @@ def _build_bounded_intra_2d(q, k, g, beta, scale, causal_bt, strict_bt, BC, prec
         if blk == 0:
             k_inv_prefix = k_inv_curr
         else:
-            ref_decay = exp2(ref - prev_ref)
+            if safe_gate and BC > 16:
+                mid_ref = g_blk[0:1]
+                ref_decay = exp2(mid_ref - prev_ref) * exp2(ref - mid_ref)
+            else:
+                ref_decay = exp2(ref - prev_ref)
             k_inv_prefix = jnp.concatenate([k_inv_prefix * ref_decay, k_inv_curr], axis=0)
         prev_ref = ref
         qk_scaled = jnp.concatenate([q_scaled, k_scaled], axis=0)
@@ -271,10 +319,15 @@ def _build_bounded_intra_2d(q, k, g, beta, scale, causal_bt, strict_bt, BC, prec
         aqk_rows.append(qk_dot[:BC])
         l_rows.append(qk_dot[BC:])
 
-    Aqk = (jnp.concatenate(aqk_rows, axis=0) * scale) * causal_bt
-    L = (jnp.concatenate(l_rows, axis=0) * beta) * strict_bt
+    Aqk = jnp.where(causal_bt, jnp.concatenate(aqk_rows, axis=0) * scale, 0.0)
+    L = jnp.where(strict_bt, jnp.concatenate(l_rows, axis=0) * beta, 0.0)
     g_last = g[BT - 1 : BT, :]
-    kg = k_inv_prefix * exp2(g_last - prev_ref)
+    if safe_gate and (BT - 1 - ((num_blocks - 1) * BC + ref_idx)) > 16:
+        mid_last = g[BT - 16 : BT - 15, :]
+        last_decay = exp2(mid_last - prev_ref) * exp2(g_last - mid_last)
+    else:
+        last_decay = exp2(g_last - prev_ref)
+    kg = k_inv_prefix * last_decay
     return Aqk, L, kg
 
 
@@ -323,8 +376,8 @@ def _build_unbounded_intra_2d(q, k, g, beta, scale, causal_bt, strict_bt, BC, pr
         aqk_rows.append(jnp.concatenate(aqk_parts, axis=1))
         l_rows.append(jnp.concatenate(l_parts, axis=1))
 
-    Aqk = (jnp.concatenate(aqk_rows, axis=0) * scale) * causal_bt
-    L = (jnp.concatenate(l_rows, axis=0) * beta) * strict_bt
+    Aqk = jnp.where(causal_bt, jnp.concatenate(aqk_rows, axis=0) * scale, 0.0)
+    L = jnp.where(strict_bt, jnp.concatenate(l_rows, axis=0) * beta, 0.0)
     g_last = g[BT - 1 : BT, :]
     kg = k * exp2(jnp.clip(g_last - g, -126.0, 0.0))
     return Aqk, L, kg
@@ -343,9 +396,9 @@ def _solve_intra_2d(L, rhs, identity_bt, same_block_mask, BC_inv, use_neumann, p
             preferred_element_type=jnp.float32,
         )
 
-    L_diag = L * same_block_mask
+    L_diag = jnp.where(same_block_mask, L, 0.0)
     neg_Ld = -L_diag
-    P = identity_bt + neg_Ld
+    P = jnp.where(identity_bt, 1.0, neg_Ld)
     Mk = neg_Ld
     num_diag_steps = int(math.log2(BC_inv)) - 1
     for step in range(num_diag_steps):
@@ -362,11 +415,46 @@ def _solve_intra_2d(L, rhs, identity_bt, same_block_mask, BC_inv, use_neumann, p
     if NC_inv == 1:
         return _dot(P, rhs)
     if use_neumann:
-        F = L - L_diag
-        H_mat = -_dot(P, F)
+        F = jnp.where(same_block_mask, 0.0, L)
         v_new = _dot(P, rhs)
-        num_block_steps = int(math.log2(NC_inv))
         half = BT // 2
+        if NC_inv == 8:
+            H_bot56 = -_dot(P[BC_inv:, :], F)
+            v_new = jnp.concatenate(
+                [
+                    v_new[:BC_inv],
+                    v_new[BC_inv:] + _dot(H_bot56, v_new),
+                ],
+                axis=0,
+            )
+            H_full = jnp.concatenate(
+                [jnp.zeros((BC_inv, BT), dtype=jnp.float32), H_bot56],
+                axis=0,
+            )
+            H_bot48 = _dot(H_bot56[BC_inv:, :], H_full)
+            s1 = 2 * BC_inv
+            v_new = jnp.concatenate(
+                [
+                    v_new[:s1],
+                    v_new[s1:] + _dot(H_bot48, v_new),
+                ],
+                axis=0,
+            )
+            H2_col_half = jnp.concatenate(
+                [jnp.zeros((s1, half), dtype=jnp.float32), H_bot48[:, :half]],
+                axis=0,
+            )
+            H_bot32 = _dot(H_bot48[s1:, :], H2_col_half)
+            return jnp.concatenate(
+                [
+                    v_new[:half],
+                    v_new[half:] + _dot(H_bot32, v_new[:half]),
+                ],
+                axis=0,
+            )
+
+        H_mat = -_dot(P, F)
+        num_block_steps = int(math.log2(NC_inv))
         for step in range(num_block_steps):
             if step < num_block_steps - 1:
                 s_row = (1 << step) * BC_inv
@@ -424,6 +512,7 @@ def _resident_pipeline_mb_single_seq_kernel(
     safe_gate: bool,
     lower_bound: float | None,
     USE_GATE_IN_KERNEL: bool,
+    GATE_PACKED: bool,
     USE_QK_L2NORM: bool,
     NEED_CUMSUM: bool,
     BETA_BATCH_FIRST: bool,
@@ -441,20 +530,20 @@ def _resident_pipeline_mb_single_seq_kernel(
 
     use_neumann = lower_bound is not None
     prec = jax.lax.Precision.DEFAULT if use_neumann else _HIGHEST
-    qk_bc = min(16, BT)
+    qk_bc = min(32 if safe_gate else 16, BT)
     inv_bc = min(8 if use_neumann else intra_block_size, BT)
-    causal_bt = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32))
-    strict_bt = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32), k=-1)
-    identity_bt = jnp.eye(BT, dtype=jnp.float32)
+    inv_shift = int(math.log2(inv_bc))
     idx_bt = jnp.arange(BT, dtype=jnp.int32)
-    same_block_mask = ((idx_bt[:, None] // inv_bc) == (idx_bt[None, :] // inv_bc)).astype(
-        jnp.float32
-    )
+    row_idx = idx_bt[:, None]
+    col_idx = idx_bt[None, :]
+    causal_bt = row_idx >= col_idx
+    strict_bt = row_idx > col_idx
+    identity_bt = row_idx == col_idx
+    same_block_mask = (row_idx >> inv_shift) == (col_idx >> inv_shift)
     num_cumsum_steps = int(math.log2(BT))
 
     q = q_ref[0].astype(jnp.float32)
     k = k_ref[0].astype(jnp.float32)
-    v = v_ref[0].astype(jnp.float32)
     g_in = gk_ref[0].astype(jnp.float32)
     if BETA_BATCH_FIRST:
         beta_2d = beta_ref[0, 0].astype(jnp.float32)
@@ -473,9 +562,14 @@ def _resident_pipeline_mb_single_seq_kernel(
         k = k.astype(jnp.bfloat16).astype(jnp.float32)
 
     if USE_GATE_IN_KERNEL:
-        gp = gate_params_ref[:, 0, :, :].astype(jnp.float32)
-        a_scale = gp[:, 0:1, :]
-        dt_b = gp[:, 1:2, :]
+        if GATE_PACKED:
+            gp = gate_params_ref[0, 0, :, :].astype(jnp.float32)
+            dt_b = gp[:MB, None, :]
+            a_scale = gp[MB : 2 * MB, None, :]
+        else:
+            gp = gate_params_ref[:, 0, :, :].astype(jnp.float32)
+            a_scale = gp[:, 0:1, :]
+            dt_b = gp[:, 1:2, :]
         g_val = g_in + dt_b
         if lower_bound is None:
             g_act = -a_scale * jax.nn.softplus(g_val)
@@ -495,35 +589,6 @@ def _resident_pipeline_mb_single_seq_kernel(
     else:
         g = g_act
 
-    state = state_ref[...]
-    if use_neumann:
-        eg = exp2(jnp.maximum(g, -126.0))
-        k_eg_beta = k * eg * beta
-        qg = q * eg
-        kq_state = jax.lax.dot_general(
-            jnp.concatenate([k_eg_beta, qg], axis=1),
-            state,
-            (((2,), (1,)), ((0,), (0,))),
-            precision=prec,
-            preferred_element_type=jnp.float32,
-        )
-    else:
-        g_head = g[:, 0:1, :]
-        eg_rel = exp2(jnp.maximum(g - g_head, -126.0))
-        k_eg_beta = k * eg_rel * beta
-        qg = q * eg_rel
-        state_head = state * exp2(jnp.maximum(g_head[:, 0, :], -126.0))[:, :, None]
-        kq_state = jax.lax.dot_general(
-            jnp.concatenate([k_eg_beta, qg], axis=1),
-            state_head,
-            (((2,), (1,)), ((0,), (0,))),
-            precision=prec,
-            preferred_element_type=jnp.float32,
-        )
-
-    g_last = g[:, BT - 1, :]
-    state_decayed = state * exp2(jnp.maximum(g_last, -126.0))[:, :, None]
-
     if lower_bound is None:
         Aqk, L, kg = _build_unbounded_intra_3d(
             q, k, g, beta, scale, causal_bt, strict_bt, qk_bc, prec
@@ -533,6 +598,33 @@ def _resident_pipeline_mb_single_seq_kernel(
             q, k, g, beta, scale, causal_bt, strict_bt, qk_bc, prec, safe_gate
         )
 
+    g_last_exp = exp2(jnp.maximum(g[:, BT - 1, :], -126.0))[:, :, None]
+    if use_neumann:
+        eg = exp2(jnp.maximum(g, -126.0))
+        k_qg = jnp.concatenate([k * eg * beta, q * eg], axis=1)
+        state = state_ref[...]
+        kq_state = jax.lax.dot_general(
+            k_qg,
+            state,
+            (((2,), (1,)), ((0,), (0,))),
+            precision=prec,
+            preferred_element_type=jnp.float32,
+        )
+    else:
+        g_head = g[:, 0:1, :]
+        eg_rel = exp2(jnp.maximum(g - g_head, -126.0))
+        k_qg = jnp.concatenate([k * eg_rel * beta, q * eg_rel], axis=1)
+        g_head_exp = exp2(jnp.maximum(g_head[:, 0, :], -126.0))[:, :, None]
+        state = state_ref[...]
+        kq_state = jax.lax.dot_general(
+            k_qg,
+            state * g_head_exp,
+            (((2,), (1,)), ((0,), (0,))),
+            precision=prec,
+            preferred_element_type=jnp.float32,
+        )
+
+    v = v_ref[0].astype(jnp.float32)
     rhs = v * beta - kq_state[:, :BT, :]
     o_inter = kq_state[:, BT:, :] * scale
 
@@ -548,7 +640,7 @@ def _resident_pipeline_mb_single_seq_kernel(
     o = o_inter + o_and_ds[:, :BT, :]
     o_ref[0] = o.astype(o_ref.dtype)
 
-    state_next = state_decayed + o_and_ds[:, BT:, :]
+    state_next = state * g_last_exp + o_and_ds[:, BT:, :]
     state_ref[...] = state_next
 
     if STORE_FINAL_STATE:
@@ -606,15 +698,16 @@ def _resident_pipeline_kernel(
 
     use_neumann = lower_bound is not None
     prec = jax.lax.Precision.DEFAULT if use_neumann else _HIGHEST
-    qk_bc = min(16, BT)
+    qk_bc = min(32 if safe_gate else 16, BT)
     inv_bc = min(8 if use_neumann else intra_block_size, BT)
-    causal_bt = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32))
-    strict_bt = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32), k=-1)
-    identity_bt = jnp.eye(BT, dtype=jnp.float32)
+    inv_shift = int(math.log2(inv_bc))
     idx_bt = jnp.arange(BT, dtype=jnp.int32)
-    same_block_mask = ((idx_bt[:, None] // inv_bc) == (idx_bt[None, :] // inv_bc)).astype(
-        jnp.float32
-    )
+    row_idx = idx_bt[:, None]
+    col_idx = idx_bt[None, :]
+    causal_bt = row_idx >= col_idx
+    strict_bt = row_idx > col_idx
+    identity_bt = row_idx == col_idx
+    same_block_mask = (row_idx >> inv_shift) == (col_idx >> inv_shift)
     num_cumsum_steps = int(math.log2(BT))
 
     def _run_group():
@@ -790,22 +883,34 @@ def resident_pipeline_stage(
             beta_t = beta.transpose(2, 0, 1).reshape(H, B, NT, 1, BT)
             beta_spec = pl.BlockSpec([mb, 1, 1, 1, BT], index_map=lambda h, b, c: (h, b, c, 0, 0))
 
+        gate_packed = beta_batch_first and (2 * mb <= 8)
         if use_gate_in_kernel:
             assert A_log is not None
             A_f32 = jnp.minimum(A_log.reshape(-1).astype(jnp.float32), 80.0)
             if A_f32.shape[0] < H:
                 A_f32 = jnp.repeat(A_f32, H // A_f32.shape[0], axis=0)
-            a_scale_full = jnp.broadcast_to(jnp.exp(A_f32).reshape(H, 1, 1, 1), (H, 1, 1, K))
-            if dt_bias is not None:
-                db_f32 = dt_bias.reshape(-1, K).astype(jnp.float32)
-                if db_f32.shape[0] < H:
-                    db_f32 = jnp.repeat(db_f32, H // db_f32.shape[0], axis=0)
-                db_full = db_f32.reshape(H, 1, 1, K)
+            if gate_packed:
+                a_scale_2d = jnp.broadcast_to(jnp.exp(A_f32)[:, None], (H, K))
+                gate_2d = jnp.pad(a_scale_2d, ((mb, 8 - 2 * mb), (0, 0)))
+                if dt_bias is not None:
+                    db_f32 = dt_bias.reshape(-1, K).astype(jnp.float32)
+                    if db_f32.shape[0] < H:
+                        db_f32 = jnp.repeat(db_f32, H // db_f32.shape[0], axis=0)
+                    gate_2d = gate_2d + jnp.pad(db_f32, ((0, 8 - mb), (0, 0)))
+                gate_params = gate_2d.reshape(1, 1, 8, K)
+                gate_spec = pl.BlockSpec([1, 1, 8, K], index_map=lambda h, b, c: (0, 0, 0, 0))
             else:
-                db_full = jnp.zeros((H, 1, 1, K), dtype=jnp.float32)
-            pad_rows = jnp.zeros((H, 1, 6, K), dtype=jnp.float32)
-            gate_params = jnp.concatenate([a_scale_full, db_full, pad_rows], axis=2)
-            gate_spec = pl.BlockSpec([mb, 1, 8, K], index_map=lambda h, b, c: (h, 0, 0, 0))
+                a_scale_full = jnp.broadcast_to(jnp.exp(A_f32).reshape(H, 1, 1, 1), (H, 1, 1, K))
+                if dt_bias is not None:
+                    db_f32 = dt_bias.reshape(-1, K).astype(jnp.float32)
+                    if db_f32.shape[0] < H:
+                        db_f32 = jnp.repeat(db_f32, H // db_f32.shape[0], axis=0)
+                    db_full = db_f32.reshape(H, 1, 1, K)
+                else:
+                    db_full = jnp.zeros((H, 1, 1, K), dtype=jnp.float32)
+                pad_rows = jnp.zeros((H, 1, 6, K), dtype=jnp.float32)
+                gate_params = jnp.concatenate([a_scale_full, db_full, pad_rows], axis=2)
+                gate_spec = pl.BlockSpec([mb, 1, 8, K], index_map=lambda h, b, c: (h, 0, 0, 0))
         else:
             gate_params = None
             gate_spec = None
@@ -829,6 +934,7 @@ def resident_pipeline_stage(
                 safe_gate=safe_gate,
                 lower_bound=lower_bound,
                 USE_GATE_IN_KERNEL=use_gate_in_kernel,
+                GATE_PACKED=gate_packed,
                 USE_QK_L2NORM=use_qk_l2norm_in_kernel,
                 NEED_CUMSUM=need_cumsum,
                 BETA_BATCH_FIRST=beta_batch_first,
