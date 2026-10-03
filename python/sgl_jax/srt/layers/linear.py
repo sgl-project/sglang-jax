@@ -3,6 +3,7 @@ from collections.abc import Sequence
 from functools import partial
 
 import jax
+import numpy as np
 from flax import nnx
 from jax import lax
 from jax import numpy as jnp
@@ -193,6 +194,37 @@ class MergedColumnParallelLinear(LinearBase):
             kernel_axes=(None, "tensor"),
             scope_name=scope_name,
         )
+
+
+# The merged layout helpers take the component sizes rather than the layer:
+# quantization replaces a MergedColumnParallelLinear with a QuantizedLinear.
+
+
+def split_merged_output(
+    out: jax.Array, output_sizes: Sequence[int], mesh: jax.sharding.Mesh
+) -> list[jax.Array]:
+    """Split the output of a :class:`MergedColumnParallelLinear` into its
+    components, each sharded over ``"tensor"`` like the output of a separate
+    column-parallel layer.
+
+    Each device splits its own block, so no data moves between devices.
+    """
+    tp = MergedColumnParallelLinear._mesh_tp_size(mesh)
+    lead = out.shape[:-1]
+    spec = ("data", *([None] * (out.ndim - 2)))
+    out = out.reshape(*lead, tp, -1, out_sharding=NamedSharding(mesh, P(*spec, "tensor", None)))
+    parts = jnp.split(out, np.cumsum([size // tp for size in output_sizes])[:-1], axis=-1)
+    sharding = NamedSharding(mesh, P(*spec, "tensor"))
+    return [part.reshape(*lead, -1, out_sharding=sharding) for part in parts]
+
+
+def stripe_merged_weight(weight: np.ndarray, output_sizes: Sequence[int], tp: int) -> np.ndarray:
+    """Rearrange a host ``[input_size, sum(output_sizes)]`` weight from
+    ``[comp_0 | comp_1 | ...]`` into the per-device block-concat layout of
+    :class:`MergedColumnParallelLinear`."""
+    splits = np.cumsum(output_sizes)[:-1]
+    parts = [np.split(part, tp, axis=1) for part in np.split(weight, splits, axis=1)]
+    return np.concatenate([part[rank] for rank in range(tp) for part in parts], axis=1)
 
 
 class QuantizedLinear(nnx.Module):
