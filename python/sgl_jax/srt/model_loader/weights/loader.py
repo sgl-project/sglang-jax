@@ -183,15 +183,17 @@ class WeightLoader:
         start = time.monotonic()
         error = None
         try:
-            prepare = getattr(self.model, "prepare_weight_loading", None)
+            # Graph nodes such as nnx.Rngs synthesize arbitrary attributes in
+            # __getattr__. Only class-defined methods are preparation hooks.
+            prepare = getattr(type(self.model), "prepare_weight_loading", None)
             if prepare is not None:
-                mappings = prepare(self, mappings)
+                mappings = prepare(self.model, self, mappings)
             for path, module in list(nnx.iter_graph(self.model)):
                 if module is self.model:
                     continue
-                prepare = getattr(module, "prepare_weight_loading", None)
+                prepare = getattr(type(module), "prepare_weight_loading", None)
                 if prepare is not None:
-                    mappings = prepare(self, mappings, ".".join(map(str, path)))
+                    mappings = prepare(module, self, mappings, ".".join(map(str, path)))
         except Exception as exc:
             error = exc
         params = self.model
@@ -236,8 +238,15 @@ class WeightLoader:
         budget = int(os.environ.get("SGLANG_WEIGHT_LOAD_MAX_INFLIGHT_BYTES", str(4 << 30)))
         if budget <= 0:
             raise ValueError("SGLANG_WEIGHT_LOAD_MAX_INFLIGHT_BYTES must be positive")
+        warned_oversized = False
         try:
             for name, spec in tqdm(active, desc="Loading weights"):
+                oversized = False
+                if pending_owners and spec.recipe is None:
+                    # Reader groups manage their own scratch space and wait for
+                    # local uploads. Release preceding recipe inputs first.
+                    jax.block_until_ready(pending)
+                    pending, pending_owners, pending_bytes = [], [], 0
                 if spec.host_recipe is not None:
                     outputs = self.reader.read_host_group(
                         self.source, spec, schemas[name], self._sharding(spec)
@@ -248,13 +257,20 @@ class WeightLoader:
                         for source in spec.sources
                         for info in self.metadata[source]
                     )
-                    # The declared full-group recipes (dequantization, QKV and
-                    # fused MLP) are bounded independently of model layer count.
+                    # Budget concurrent groups, not the size of an indivisible
+                    # conversion. Large recipes run between completion waits.
                     required = 8 * source_bytes
-                    if required > budget:
-                        raise ValueError(
-                            f"Recipe {name} needs up to {required} host bytes, budget={budget}"
+                    oversized = required > budget
+                    if oversized and not warned_oversized:
+                        logger.warning(
+                            "Recipe %s has an estimated working set of %d bytes above the "
+                            "weight-loading target of %d bytes; loading it alone. "
+                            "This target is not a hard memory limit.",
+                            name,
+                            required,
+                            budget,
                         )
+                        warned_oversized = True
                     if pending_bytes + required > budget:
                         jax.block_until_ready(pending)
                         pending, pending_owners, pending_bytes = [], [], 0
@@ -284,7 +300,7 @@ class WeightLoader:
                 pending_bytes += sum(
                     sum(s.data.nbytes for s in v.addressable_shards) for v in values
                 )
-                if pending_bytes >= budget:
+                if oversized or pending_bytes >= budget:
                     jax.block_until_ready(pending)
                     pending, pending_owners, pending_bytes = [], [], 0
                 completed = []
@@ -538,37 +554,52 @@ class WeightLoader:
         identities = {}
         shape_cache = {}
         schemas = {}
-        # Fail before reads. A partial model may intentionally provide only a
-        # subset of targets, but each declared group must be complete.
+        unmatched_inputs, unmatched_targets = [], []
+        # Shared mappings may describe other checkpoint/model variants. Skip
+        # unmatched entries; the outer loader still rejects unfilled parameters.
         for name, spec in entries:
             sources = spec.sources or (name,)
+            targets = (spec.target_path,) if isinstance(spec.target_path, str) else spec.target_path
+            variables, missing_targets = [], []
+            for target in targets:
+                try:
+                    variable = self._get_param(params, target)
+                except (AttributeError, IndexError, KeyError, ValueError):
+                    missing_targets.append(target)
+                else:
+                    if isinstance(variable, nnx.Variable):
+                        variables.append(variable)
+                    else:
+                        missing_targets.append(target)
+            if missing_targets:
+                skipped.extend(sources)
+                used.update(sources)
+                unmatched_targets.append((name, missing_targets))
+                continue
             missing = [s for s in sources if s not in self.metadata]
             if missing:
-                if spec.optional or all(self._is_excluded_layer_weight(s) for s in missing):
-                    skipped.extend(missing)
+                expected_skip = spec.optional or all(
+                    self._is_excluded_layer_weight(s) for s in missing
+                )
+                if expected_skip or len(missing) == len(sources):
+                    skipped.extend(sources)
+                    used.update(sources)
+                    if not expected_skip:
+                        unmatched_inputs.append((name, missing))
                     continue
+                # An existing fused/stacked group cannot be loaded partially.
                 raise ValueError(f"Missing checkpoint inputs for {name}: {missing}")
             if spec.concat_axis is not None:
                 for source in sources:
                     if len(self.metadata[source]) < safetensors_partition:
                         raise ValueError(f"Incomplete checkpoint partitions: {source}")
-            if spec.recipe is not None:
-                required = 8 * sum(
-                    info["byte_size"] for source in sources for info in self.metadata[source]
-                )
-                if required > budget:
-                    raise ValueError(
-                        f"Recipe {name} needs up to {required} host bytes, budget={budget}"
-                    )
-            targets = (spec.target_path,) if isinstance(spec.target_path, str) else spec.target_path
             if spec.sharding is None:
                 from dataclasses import replace
 
-                value = self._get_param(params, targets[0]).value
+                value = variables[0].value
                 axes = getattr(getattr(value, "sharding", None), "spec", P())
                 spec = replace(spec, sharding=tuple(axes))
-            for target in targets:
-                variable = self._get_param(params, target)
+            for target, variable in zip(targets, variables):
                 if id(variable) in identities:
                     raise ValueError(
                         f"Duplicate writer for shared parameter {target}: {identities[id(variable)]} and {name}"
@@ -602,6 +633,17 @@ class WeightLoader:
         )
         if validate_checkpoint_coverage and unexpected:
             raise ValueError(f"Unmapped checkpoint tensors: {unexpected[:10]}")
+        for reason, unmatched in (
+            ("checkpoint inputs", unmatched_inputs),
+            ("model targets", unmatched_targets),
+        ):
+            if unmatched:
+                logger.warning(
+                    "Skipped %d weight mappings with missing %s (showing up to 10): %s",
+                    len(unmatched),
+                    reason,
+                    unmatched[:10],
+                )
         return active, writers, skipped, unexpected, schemas
 
     @staticmethod
