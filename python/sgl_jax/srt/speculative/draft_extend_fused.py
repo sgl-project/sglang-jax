@@ -421,7 +421,17 @@ def _build_chain_verify_arrays(
     bs = batch_size
     tid_range = jnp.arange(n, dtype=jnp.int32)
     verified_column = verified_id.astype(jnp.int32)[:, None]
-    token_chain = token_list[:, : n - 1].astype(jnp.int32)
+    token_list = token_list.astype(jnp.int32)
+    if token_list.ndim == 2 and token_list.shape[1] < n - 1:
+        # Width-1 bootstrap chain (first decode after a non-fused prefill, or a relay
+        # buffer seeded by it) reaching fused verify: gp79/gp80 (10-02) crashed here with
+        # reshape (1, 2) -> 4 on MTP + return_logprob requests. Pad the chain by
+        # repeating its last token; the duplicates are rejected by verify and the
+        # target logits supply the next token, so outputs are unchanged (only this
+        # step's accept length is shorter). Steady-state relay chains are full width.
+        pad = jnp.repeat(token_list[:, -1:], (n - 1) - token_list.shape[1], axis=1)
+        token_list = jnp.concatenate([token_list, pad], axis=1)
+    token_chain = token_list[:, : n - 1]
     verified_sharding = jax.typeof(verified_column).sharding
     if (
         isinstance(verified_sharding, NamedSharding)
