@@ -512,9 +512,6 @@ def _ragged_paged_attention_kernel_loop(
             and bkv_csz + actual_bq_csz <= jnp.iinfo(jnp.int16).max  # widest span below
         ):
             int_ty = jnp.int16
-        q_row = (lax.broadcasted_iota(jnp.int32, s.shape, 0) // num_q_heads_per_kv_head).astype(
-            int_ty
-        )
 
         def rebased_q_span(window):
             """Query span measured from the key tile's origin, less `window`.
@@ -526,13 +523,15 @@ def _ragged_paged_attention_kernel_loop(
             Folding `window` in before the clamp keeps an arbitrarily large
             sliding window out of int16 as well.
             """
+            q_row = (lax.broadcasted_iota(jnp.int32, s.shape, 0) // num_q_heads_per_kv_head).astype(
+                int_ty
+            )
             delta = processed_q_len - processed_kv_len - window
             return jnp.clip(delta, -(actual_bq_csz + 1), bkv_csz + 1).astype(int_ty) + q_row
 
-        q_span = rebased_q_span(0)
         k_span = lax.broadcasted_iota(int_ty, s.shape, 1)
-        v_span = lax.broadcasted_iota(int_ty, v.shape, 0)
-        kv_span_limit = jnp.clip(effective_kv_len - processed_kv_len, 0, bkv_csz).astype(int_ty)
+        if use_causal_mask:
+            q_span = rebased_q_span(0)
 
         mask = None
         if use_causal_mask:
@@ -544,6 +543,8 @@ def _ragged_paged_attention_kernel_loop(
             mask = mask_and(mask, custom_mask_expanded == 1)
 
         if not skip_kv_mask:
+            kv_span_limit = jnp.clip(effective_kv_len - processed_kv_len, 0, bkv_csz).astype(int_ty)
+            v_span = lax.broadcasted_iota(int_ty, v.shape, 0)
             mask = mask_and(mask, k_span < kv_span_limit)
             v = jnp.where(v_span < kv_span_limit, v, 0.0)
 
@@ -677,23 +678,45 @@ def _ragged_paged_attention_kernel_loop(
             # Make sure the current bkv buffer is safe to overwrite.
             wait_update_kv_cache(bkv_sem_idx)
 
-            for i in range(bkv_p):
-                sz = jnp.clip(kv_left_frm_cache - i * page_size, 0, page_size)
-                page_idx = jnp.minimum(page_indices_offset + i, num_page_indices - 1)
+            num_cache_pages = cdiv(bkv_sz_frm_cache, page_size)
+
+            def fetch_cond(i):
+                return i < num_cache_pages
+
+            def fetch_body(i):
+                first_page_idx = jnp.minimum(page_indices_offset + i, num_page_indices - 1)
+                first_page = page_indices_ref[first_page_idx]
+
+                def run_cond(run_len):
+                    next_i = i + run_len
+                    next_page_idx = jnp.minimum(page_indices_offset + next_i, num_page_indices - 1)
+                    return jnp.logical_and(
+                        next_i < num_cache_pages,
+                        page_indices_ref[next_page_idx] == first_page + run_len,
+                    )
+
+                run_len = lax.while_loop(run_cond, lambda r: r + 1, 1)
+                sz = jnp.minimum(bkv_sz_frm_cache - i * page_size, run_len * page_size)
                 _async_copy(
-                    cache_hbm_ref.at[pl.ds(page_indices_ref[page_idx] * page_size, sz)],
+                    cache_hbm_ref.at[pl.ds(first_page * page_size, sz)],
                     vmem_ref.at[pl.ds(i * page_size, sz)],
                     sem,
                     wait=False,
                 )
+                return i + run_len
 
-            new_kv_len_start = q_end - kv_left_frm_new
-            _async_copy(
-                kv_hbm_ref.at[pl.ds(new_kv_len_start, bkv_sz_frm_new)],
-                vmem_ref.at[pl.ds(bkv_sz_frm_cache, bkv_sz_frm_new)],
-                sem,
-                wait,
-            )
+            lax.while_loop(fetch_cond, fetch_body, 0)
+
+            @pl.when(bkv_sz_frm_new > 0)
+            def _():
+                new_kv_len_start = q_end - kv_left_frm_new
+                _async_copy(
+                    kv_hbm_ref.at[pl.ds(new_kv_len_start, bkv_sz_frm_new)],
+                    vmem_ref.at[pl.ds(bkv_sz_frm_cache, bkv_sz_frm_new)],
+                    sem,
+                    wait=False,
+                )
+
         else:
             dst = vmem_ref.at[pl.ds(0, bkv_sz_frm_cache + bkv_sz_frm_new)]
             _async_copy(
@@ -721,30 +744,39 @@ def _ragged_paged_attention_kernel_loop(
             cache_hbm_shape[0] * cache_hbm_shape[1], *cache_hbm_shape[2:]
         )
 
-        def loop_body(i, states):
-            update_sz, ignore = states
-            sz = jnp.minimum(page_size - ignore, update_sz)
+        num_update_pages = kv_p_end - kv_p_start
+
+        def update_cond(state):
+            i, _, _ = state
+            return i < num_update_pages
+
+        def update_body(state):
+            i, rem_update_sz, cur_ignore = state
+            first_page = page_indices_ref[page_indices_offset + i]
+
+            def run_cond(run_len):
+                next_i = i + run_len
+                return jnp.logical_and(
+                    next_i < num_update_pages,
+                    page_indices_ref[page_indices_offset + next_i] == first_page + run_len,
+                )
+
+            run_len = lax.while_loop(run_cond, lambda r: r + 1, 1)
+            sz = jnp.minimum(run_len * page_size - cur_ignore, rem_update_sz)
 
             _async_copy(
-                vmem_ref.at[pl.ds((p_ignore + i) * page_size + ignore, sz)],
-                cache_hbm_ref.at[
-                    pl.ds(
-                        page_indices_ref[page_indices_offset + i] * page_size + ignore,
-                        sz,
-                    )
-                ],
+                vmem_ref.at[pl.ds((p_ignore + i) * page_size + cur_ignore, sz)],
+                cache_hbm_ref.at[pl.ds(first_page * page_size + cur_ignore, sz)],
                 sem,
-                wait,
+                wait=False,
             )
-            return update_sz - sz, 0
+            return i + run_len, rem_update_sz - sz, 0
 
         if not wait:
-            lax.fori_loop(
-                0,
-                kv_p_end - kv_p_start,
-                loop_body,
-                (update_sz, ignore),
-                unroll=False,
+            lax.while_loop(
+                update_cond,
+                update_body,
+                (0, update_sz, ignore),
             )
         else:
             dst = cache_hbm_ref.at[pl.ds(0, update_sz)]
@@ -892,7 +924,7 @@ def _ragged_paged_attention_kernel_loop(
         kv = strided_load(kv_ref, start + offset, sz, step)
         bitwidth = 32 // kv_packing
         repack_ty = jnp.dtype(f"uint{bitwidth}")
-        k = kv >> (kv_idx_in_load * 2 * bitwidth)
+        k = kv >> (kv_idx_in_load * 2 * bitwidth) if kv_idx_in_load != 0 else kv
         v = k >> bitwidth
         k = pltpu.bitcast(k.astype(repack_ty), kv_dtype)
         v = pltpu.bitcast(v.astype(repack_ty), kv_dtype)
