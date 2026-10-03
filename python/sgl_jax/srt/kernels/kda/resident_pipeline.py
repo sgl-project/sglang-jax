@@ -186,21 +186,29 @@ def _solve_intra_3d(L, rhs, identity_bt, same_block_mask, BC_inv, use_neumann, p
         return _dot(P, rhs)
     if use_neumann:
         F = L - L_diag
-        P_merged = _dot(P, jnp.concatenate([F, rhs], axis=2))
-        H_mat = -P_merged[:, :, :BT]
-        v_new = P_merged[:, :, BT:]
+        H_mat = -_dot(P, F)
+        v_new = _dot(P, rhs)
         num_block_steps = int(math.log2(NC_inv))
+        half = BT // 2
         for step in range(num_block_steps):
             if step < num_block_steps - 1:
-                H_merged = _dot(H_mat, jnp.concatenate([H_mat, v_new], axis=2))
-                H_mat = H_merged[:, :, :BT]
-                v_new = v_new + H_merged[:, :, BT:]
+                s_row = (1 << step) * BC_inv
+                v_new = jnp.concatenate(
+                    [
+                        v_new[:, :s_row, :],
+                        v_new[:, s_row:, :] + _dot(H_mat[:, s_row:, :], v_new),
+                    ],
+                    axis=1,
+                )
+                if step == num_block_steps - 2:
+                    H_mat = _dot(H_mat[:, half:, :], H_mat[:, :, :half])
+                else:
+                    H_mat = _dot(H_mat, H_mat)
             else:
-                half = BT // 2
                 v_new = jnp.concatenate(
                     [
                         v_new[:, :half, :],
-                        v_new[:, half:, :] + _dot(H_mat[:, half:, :half], v_new[:, :half, :]),
+                        v_new[:, half:, :] + _dot(H_mat, v_new[:, :half, :]),
                     ],
                     axis=1,
                 )
@@ -355,21 +363,29 @@ def _solve_intra_2d(L, rhs, identity_bt, same_block_mask, BC_inv, use_neumann, p
         return _dot(P, rhs)
     if use_neumann:
         F = L - L_diag
-        P_merged = _dot(P, jnp.concatenate([F, rhs], axis=1))
-        H_mat = -P_merged[:, :BT]
-        v_new = P_merged[:, BT:]
+        H_mat = -_dot(P, F)
+        v_new = _dot(P, rhs)
         num_block_steps = int(math.log2(NC_inv))
+        half = BT // 2
         for step in range(num_block_steps):
             if step < num_block_steps - 1:
-                H_merged = _dot(H_mat, jnp.concatenate([H_mat, v_new], axis=1))
-                H_mat = H_merged[:, :BT]
-                v_new = v_new + H_merged[:, BT:]
+                s_row = (1 << step) * BC_inv
+                v_new = jnp.concatenate(
+                    [
+                        v_new[:s_row],
+                        v_new[s_row:] + _dot(H_mat[s_row:], v_new),
+                    ],
+                    axis=0,
+                )
+                if step == num_block_steps - 2:
+                    H_mat = _dot(H_mat[half:, :], H_mat[:, :half])
+                else:
+                    H_mat = _dot(H_mat, H_mat)
             else:
-                half = BT // 2
                 v_new = jnp.concatenate(
                     [
                         v_new[:half],
-                        v_new[half:] + _dot(H_mat[half:, :half], v_new[:half]),
+                        v_new[half:] + _dot(H_mat, v_new[:half]),
                     ],
                     axis=0,
                 )
@@ -392,8 +408,7 @@ def _resident_pipeline_mb_single_seq_kernel(
     v_ref,
     gk_ref,
     beta_ref,
-    a_scale_ref,
-    db_ref,
+    gate_params_ref,
     h0_ref,
     o_ref,
     ht_ref,
@@ -437,25 +452,30 @@ def _resident_pipeline_mb_single_seq_kernel(
     )
     num_cumsum_steps = int(math.log2(BT))
 
-    q = q_ref[0].transpose(1, 0, 2).astype(jnp.float32)
-    k = k_ref[0].transpose(1, 0, 2).astype(jnp.float32)
-    v = v_ref[0].transpose(1, 0, 2).astype(jnp.float32)
-    g_in = gk_ref[0].transpose(1, 0, 2).astype(jnp.float32)
+    q = q_ref[0].astype(jnp.float32)
+    k = k_ref[0].astype(jnp.float32)
+    v = v_ref[0].astype(jnp.float32)
+    g_in = gk_ref[0].astype(jnp.float32)
     if BETA_BATCH_FIRST:
-        beta = beta_ref[0, 0].transpose(1, 0).astype(jnp.float32)[:, :, None]
+        beta_2d = beta_ref[0, 0].astype(jnp.float32)
+        if USE_QK_L2NORM:
+            beta_2d = jnp.clip(beta_2d, 0.0, 1.0)
+        beta = jnp.stack([beta_2d[:, m : m + 1] for m in range(MB)], axis=0)
     else:
         beta = beta_ref[:, 0, 0, 0, :].astype(jnp.float32)[:, :, None]
+        if USE_QK_L2NORM:
+            beta = jnp.clip(beta, 0.0, 1.0)
 
     if USE_QK_L2NORM:
         q = q * jax.lax.rsqrt(jnp.sum(q * q, axis=-1, keepdims=True) + 1e-6)
         k = k * jax.lax.rsqrt(jnp.sum(k * k, axis=-1, keepdims=True) + 1e-6)
         q = q.astype(jnp.bfloat16).astype(jnp.float32)
         k = k.astype(jnp.bfloat16).astype(jnp.float32)
-        beta = jnp.clip(beta, 0.0, 1.0)
 
     if USE_GATE_IN_KERNEL:
-        a_scale = a_scale_ref[:, 0, 0, 0].astype(jnp.float32)[:, None, None]
-        dt_b = db_ref[:, 0, 0, :].astype(jnp.float32)[:, None, :]
+        gp = gate_params_ref[:, 0, :, :].astype(jnp.float32)
+        a_scale = gp[:, 0:1, :]
+        dt_b = gp[:, 1:2, :]
         g_val = g_in + dt_b
         if lower_bound is None:
             g_act = -a_scale * jax.nn.softplus(g_val)
@@ -474,15 +494,6 @@ def _resident_pipeline_mb_single_seq_kernel(
         g = g_act * _RCP_LN2
     else:
         g = g_act
-
-    if lower_bound is None:
-        Aqk, L, kg = _build_unbounded_intra_3d(
-            q, k, g, beta, scale, causal_bt, strict_bt, qk_bc, prec
-        )
-    else:
-        Aqk, L, kg = _build_bounded_intra_3d(
-            q, k, g, beta, scale, causal_bt, strict_bt, qk_bc, prec, safe_gate
-        )
 
     state = state_ref[...]
     if use_neumann:
@@ -510,6 +521,18 @@ def _resident_pipeline_mb_single_seq_kernel(
             preferred_element_type=jnp.float32,
         )
 
+    g_last = g[:, BT - 1, :]
+    state_decayed = state * exp2(jnp.maximum(g_last, -126.0))[:, :, None]
+
+    if lower_bound is None:
+        Aqk, L, kg = _build_unbounded_intra_3d(
+            q, k, g, beta, scale, causal_bt, strict_bt, qk_bc, prec
+        )
+    else:
+        Aqk, L, kg = _build_bounded_intra_3d(
+            q, k, g, beta, scale, causal_bt, strict_bt, qk_bc, prec, safe_gate
+        )
+
     rhs = v * beta - kq_state[:, :BT, :]
     o_inter = kq_state[:, BT:, :] * scale
 
@@ -523,10 +546,9 @@ def _resident_pipeline_mb_single_seq_kernel(
         preferred_element_type=jnp.float32,
     )
     o = o_inter + o_and_ds[:, :BT, :]
-    o_ref[0] = o.transpose(1, 0, 2).astype(o_ref.dtype)
+    o_ref[0] = o.astype(o_ref.dtype)
 
-    g_last = g[:, BT - 1, :]
-    state_next = state * exp2(jnp.maximum(g_last, -126.0))[:, :, None] + o_and_ds[:, BT:, :]
+    state_next = state_decayed + o_and_ds[:, BT:, :]
     state_ref[...] = state_next
 
     if STORE_FINAL_STATE:
@@ -755,6 +777,11 @@ def resident_pipeline_stage(
         while H % mb != 0:
             mb -= 1
 
+        q_t = jnp.transpose(q, (0, 2, 1, 3))
+        k_t = jnp.transpose(k, (0, 2, 1, 3))
+        v_t = jnp.transpose(v, (0, 2, 1, 3))
+        gk_t = jnp.transpose(gk, (0, 2, 1, 3))
+
         beta_batch_first = mb == H
         if beta_batch_first:
             beta_t = beta.reshape(B, NT, BT, H)
@@ -768,26 +795,25 @@ def resident_pipeline_stage(
             A_f32 = jnp.minimum(A_log.reshape(-1).astype(jnp.float32), 80.0)
             if A_f32.shape[0] < H:
                 A_f32 = jnp.repeat(A_f32, H // A_f32.shape[0], axis=0)
-            a_scale_in = jnp.exp(A_f32).reshape(H, 1, 1, 1)
+            a_scale_full = jnp.broadcast_to(jnp.exp(A_f32).reshape(H, 1, 1, 1), (H, 1, 1, K))
             if dt_bias is not None:
                 db_f32 = dt_bias.reshape(-1, K).astype(jnp.float32)
                 if db_f32.shape[0] < H:
                     db_f32 = jnp.repeat(db_f32, H // db_f32.shape[0], axis=0)
-                db_in = db_f32.reshape(H, 1, 1, K)
+                db_full = db_f32.reshape(H, 1, 1, K)
             else:
-                db_in = jnp.zeros((H, 1, 1, K), dtype=jnp.float32)
-            alog_spec = pl.BlockSpec([mb, 1, 1, 1], index_map=lambda h, b, c: (h, 0, 0, 0))
-            db_spec = pl.BlockSpec([mb, 1, 1, K], index_map=lambda h, b, c: (h, 0, 0, 0))
+                db_full = jnp.zeros((H, 1, 1, K), dtype=jnp.float32)
+            pad_rows = jnp.zeros((H, 1, 6, K), dtype=jnp.float32)
+            gate_params = jnp.concatenate([a_scale_full, db_full, pad_rows], axis=2)
+            gate_spec = pl.BlockSpec([mb, 1, 8, K], index_map=lambda h, b, c: (h, 0, 0, 0))
         else:
-            a_scale_in = None
-            db_in = None
-            alog_spec = None
-            db_spec = None
+            gate_params = None
+            gate_spec = None
 
-        in_spec_k = pl.BlockSpec([1, BT, mb, K], index_map=lambda h, b, c: (b, c, h, 0))
-        in_spec_v = pl.BlockSpec([1, BT, mb, V], index_map=lambda h, b, c: (b, c, h, 0))
+        in_spec_k = pl.BlockSpec([1, mb, BT, K], index_map=lambda h, b, c: (b, h, c, 0))
+        in_spec_v = pl.BlockSpec([1, mb, BT, V], index_map=lambda h, b, c: (b, h, c, 0))
         state_spec = pl.BlockSpec([1, mb, K, V], index_map=lambda h, b, c: (0, h, 0, 0))
-        o_shape = jax.ShapeDtypeStruct([B, T, H, V], q.dtype)
+        o_shape = jax.ShapeDtypeStruct([B, H, T, V], q.dtype)
         ht_shape = jax.ShapeDtypeStruct([N, H, K, V], jnp.float32) if output_final_state else None
 
         o_out, ht_out = pl.pallas_call(
@@ -818,8 +844,7 @@ def resident_pipeline_stage(
                     in_spec_v,
                     in_spec_k,
                     beta_spec,
-                    alog_spec,
-                    db_spec,
+                    gate_spec,
                     None if h0 is None else state_spec,
                 ],
                 out_specs=[
@@ -835,8 +860,8 @@ def resident_pipeline_stage(
             ),
             out_shape=[o_shape, ht_shape],
             interpret=get_interpret(),
-        )(q, k, v, gk, beta_t, a_scale_in, db_in, h0)
-        return o_out, ht_out
+        )(q_t, k_t, v_t, gk_t, beta_t, gate_params, h0)
+        return jnp.transpose(o_out, (0, 2, 1, 3)), ht_out
 
     GBT = BT * group
     assert T % GBT == 0, f"T={T} must be divisible by the group extent {GBT}"
@@ -1000,9 +1025,11 @@ def resident_pipeline_kda_fwd(
         [q, k, v, g], [beta], cu_seqlens, _ = _align_seqs(
             [q, k, v, g], [beta], cu_seqlens, align=GBT
         )
-    T = q.shape[1]
-    orig_lens = _orig_cu_seqlens[1:] - _orig_cu_seqlens[:-1]
-    valid_eos = cu_seqlens[:-1] + orig_lens
+        T = q.shape[1]
+        orig_lens = _orig_cu_seqlens[1:] - _orig_cu_seqlens[:-1]
+        valid_eos = cu_seqlens[:-1] + orig_lens
+    else:
+        valid_eos = None
 
     o, final_state = resident_pipeline_stage(
         q,
