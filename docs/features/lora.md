@@ -87,6 +87,34 @@ there.
 `qkv` and `gate_up` projections are automatically handled by merging the corresponding per-module
 LoRA weights, and adapters with different ranks are padded to `max_lora_rank`.
 
+CLI string preloads are pinned. To allow device-slot eviction, configure unpinned startup
+adapters programmatically through `Engine`/`ServerArgs`, for example:
+
+```python
+lora_paths = [{"name": "adapter1", "path": "/path/to/adapter1", "pinned": False}]
+```
+
+This enables device-slot reuse across batches; it does not enable runtime registration or
+host-memory eviction.
+
+### Testing device-slot eviction
+
+Follow the [contribution guide](../developer_guide/contribution_guide.md) to install the
+CPU development dependencies. From the repository root, run the focused pool and manager tests:
+
+```bash
+python -m unittest discover -s test/srt/lora -p 'test_lora_m*.py' -v
+```
+
+The pool tests use small JAX arrays without downloading a model. They cover LRU order,
+pinned and batch-required adapters, reserved slot zero, capacity errors, and numerical
+equivalence between reused and fresh slots. Manager tests check pin propagation and
+the conditional refresh of model-layer buffer references.
+
+For serving validation on a TPU environment, also run `python test/srt/lora/test_dynamic_lora.py`.
+That existing test downloads model/adapter checkpoints and checks mixed-adapter serving;
+it does not replace the pool tests that deliberately force eviction.
+
 ## Static LoRA
 
 Static LoRA is intended for RL scenarios where only a single adapter is used and requests never
@@ -119,8 +147,10 @@ uv run python -u -m sgl_jax.launch_server \
 
 ## Limitations
 
-- All configured adapters are loaded at startup; dynamic adapter (un)loading and runtime eviction are
-  not yet supported in the current version.
+- All configured adapters are loaded into host memory at startup; dynamic adapter (un)loading
+  and host-memory eviction are not yet supported. Device slots use LRU eviction for unpinned
+  adapters not required by the current batch. Preloaded pinned adapters are never evicted.
+  A batch that cannot fit alongside resident pinned adapters raises a capacity error.
 - KV caches are fully isolated per adapter, so different adapters do not share prefix caches even
   with identical prompts.
 - DFLASH (speculative decoding) does not support LoRA.

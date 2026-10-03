@@ -42,13 +42,11 @@ class LoRAManager:
     - All LoRA adapters are loaded at initialization time
     - No dynamic loading/unloading during inference
     - No eviction policy (all adapters stay in CPU memory)
-    - Adapters are transferred to device memory pool on-demand per batch
+    - Adapters are transferred to device memory pool on-demand per batch, with LRU eviction
 
     Future enhancements (V2+):
     - Dynamic adapter loading/unloading
-    - LRU/FIFO eviction policies
     - Adapter registry with async loading
-    - Support for larger number of adapters than memory pool slots
 
     Attributes:
         max_loras_per_batch: Maximum number of LoRA adapters per batch
@@ -424,8 +422,6 @@ class LoRAManager:
         # Load active loras into lora memory pool
         cur_uids = set(model_worker_batch.lora_ids)
 
-        assert len(cur_uids) <= self.max_loras_per_batch
-
         weight_indices = [0] * len(model_worker_batch.lora_ids)
         lora_ranks = [0] * self.max_loras_per_batch
         scalings = [0] * self.max_loras_per_batch
@@ -444,6 +440,7 @@ class LoRAManager:
             has_new_weights = self.memory_pool.prepare_lora_batch(
                 cur_uids=cur_uids,
                 lora_adapters=self.loras,
+                pinned_uids={uid for uid, ref in self.lora_refs.items() if ref.pinned},
             )
 
             for i, uid in enumerate(model_worker_batch.lora_ids):
@@ -462,6 +459,7 @@ class LoRAManager:
             return has_new_weights
 
         if self.static_lora:
+            assert len(cur_uids) <= self.max_loras_per_batch
             prepare_static_lora_batch()
         else:
             has_new_weights = prepare_dynamic_lora_batch()
