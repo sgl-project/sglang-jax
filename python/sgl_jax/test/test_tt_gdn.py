@@ -85,9 +85,9 @@ def reference_chunk(q, k, v, gate, beta, state):
 
 def reference_decode(state, qkv, b, a, A_log, dt_bias, indices, initial):
     # Like the TT kernel: q, k and v are heads of the flat convolution output,
-    # and the kernel normalizes q and k and scales q.
+    # which the kernel widens to FP32 before it normalizes q and k and scales q.
     dim = state.shape[-2]
-    heads = qkv.reshape(qkv.shape[0], -1, dim)
+    heads = qkv.astype(jnp.float32).reshape(qkv.shape[0], -1, dim)
     count = (heads.shape[1] - b.shape[-1]) // 2
     q = _l2norm(heads[:, :count]) * dim**-0.5
     k = _l2norm(heads[:, count : 2 * count])

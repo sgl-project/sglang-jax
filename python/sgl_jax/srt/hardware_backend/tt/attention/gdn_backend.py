@@ -131,7 +131,7 @@ class TTGDNAttnBackend(GDNAttnBackend):
         # normalizes and scales q and k like _qkv.
         new_rec, out = ops.gated_delta_decode(
             recurrent_state_in,
-            conv_out.astype(jnp.float32),
+            conv_out,
             b,
             a,
             A_log,
