@@ -52,7 +52,7 @@ from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
     _build_non_hybrid_memory_pools,
 )
-from sgl_jax.srt.model_loader.loader import get_model_loader
+from sgl_jax.srt.model_loader.loader import get_model_loader, validate_model_parameters
 from sgl_jax.srt.multimodal.in_model.embedding_pool import EmbeddingPool
 from sgl_jax.srt.multimodal.in_model.host_orchestration import (
     MultimodalBatch,
@@ -271,6 +271,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         )
 
     def initialize_jit(self):
+        validate_model_parameters(self.model)
         model_def, model_state = nnx.split(self.model)
         # note export for external modification
         self.model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
@@ -768,6 +769,10 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             return False
 
         backend = self.server_args.attention_backend
+        from sgl_jax.srt.layers.attention.msa_backend import msa_sparse_config
+
+        if msa_sparse_config(self.model_config) is not None and backend != "fa":
+            raise ValueError(f"MSA models require --attention-backend fa; got {backend!r}.")
         if self.server_args.device == "cpu" and backend in ("fa", "fa_mha"):
             logger.warning(
                 "FlashAttention backend is not supported on CPU; falling back to native."
@@ -862,6 +867,35 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 attention_data_partition_axis="data",
             )
 
+        elif backend == "qsa_sparse":
+            from sgl_jax.srt.layers.attention.qsa_sparse_backend import (
+                QSASparseAttentionBackend,
+            )
+
+            cfg = self.model_config.hf_text_config
+            if getattr(cfg, "indexer_budget", None) is None:
+                raise ValueError(
+                    "attention_backend='qsa_sparse' needs a model with indexer_* "
+                    "config (Qwen3.8-Flash-Next); this one has none"
+                )
+            # Every full-attention layer carries its own indexer -- upstream
+            # builds it per layer with its own prefix and there is no sharing
+            # switch, unlike DSA's IndexShare.
+            full_slot = {
+                layer_id: slot for slot, layer_id in enumerate(cfg.full_attention_layer_ids)
+            }
+            full_attn_backend = QSASparseAttentionBackend(
+                self.num_attn_heads,
+                self.num_kv_heads,
+                self.model_config.head_dim,
+                page_size=self.page_size,
+                mesh=self.mesh,
+                compress_ratio=cfg.indexer_compress_ratio,
+                block_topk=cfg.indexer_budget // cfg.indexer_compress_ratio,
+                full_slot=full_slot,
+                indexer_key_dim=cfg.indexer_head_dim,
+            )
+
         elif backend in ("fa", "fa_mha"):
             from sgl_jax.srt.layers.attention.flashattention_backend import (
                 FlashAttention,
@@ -875,13 +909,28 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 head_dim = self.model_config.head_dim
                 num_kv_heads = self.num_kv_heads
 
-            full_attn_backend = FlashAttention(
-                self.num_attn_heads,
-                num_kv_heads,
-                head_dim,
-                page_size=self.page_size,
-                mesh=self.mesh,
-            )
+            sparse_config = msa_sparse_config(self.model_config)
+            if sparse_config is not None:
+                from sgl_jax.srt.layers.attention.msa_backend import MSAAttentionBackend
+
+                full_attn_backend = MSAAttentionBackend(
+                    self.num_attn_heads,
+                    num_kv_heads,
+                    head_dim,
+                    page_size=self.page_size,
+                    mesh=self.mesh,
+                    sparse_config=sparse_config,
+                    context_len=self.model_config.context_len,
+                    total_num_kv_heads=self.model_config.get_total_num_kv_heads(),
+                )
+            else:
+                full_attn_backend = FlashAttention(
+                    self.num_attn_heads,
+                    num_kv_heads,
+                    head_dim,
+                    page_size=self.page_size,
+                    mesh=self.mesh,
+                )
 
         elif backend == "tt":
             from sgl_jax.srt.hardware_backend.tt.attention.tt_backend import TTAttention

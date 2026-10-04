@@ -59,6 +59,19 @@ class WeightReader(ABC):
 class JaxShardReader(WeightReader):
     def __init__(self, mesh: Mesh):
         self.mesh = mesh
+        self._warned_oversized = False
+
+    def _warn_oversized(self, context, required, budget):
+        if required > budget and not self._warned_oversized:
+            logger.warning(
+                "%s has an estimated working set of %d bytes above the "
+                "weight-loading target of %d bytes; loading one group at a time. "
+                "This target is not a hard memory limit.",
+                context,
+                required,
+                budget,
+            )
+            self._warned_oversized = True
 
     def read(self, source, name, spec, sharding=None):
         if spec.sources:
@@ -92,6 +105,8 @@ class JaxShardReader(WeightReader):
         error = None
         try:
             budget = int(os.environ.get("SGLANG_WEIGHT_LOAD_MAX_INFLIGHT_BYTES", str(4 << 30)))
+            if budget <= 0:
+                raise ValueError("SGLANG_WEIGHT_LOAD_MAX_INFLIGHT_BYTES must be positive")
             for key, assignments in groups.items():
                 expert = slice(*key)
                 input_bytes = sum(
@@ -105,8 +120,7 @@ class JaxShardReader(WeightReader):
                 # Input, conversion copies and all outputs. Prefused gate/up
                 # splits preserve total element count; dtype conversion may double it.
                 required = input_bytes * 8
-                if required > budget:
-                    raise ValueError(f"Host recipe needs up to {required} bytes, budget={budget}")
+                self._warn_oversized("Host recipe", required, budget)
                 inputs = [self._read_host_input(source, name, (expert,)) for name in spec.sources]
                 outputs = spec.host_recipe(inputs)
                 if len(outputs) != len(targets):
@@ -118,6 +132,9 @@ class JaxShardReader(WeightReader):
                     local.append(jax.device_put(value, device))
                     uploaded[output][device] = local[-1]
                 jax.block_until_ready(local)
+                # Drop host owners before reading the next interval, including
+                # views retained by the recipe and the last device_put argument.
+                del inputs, outputs, value, local
         except Exception as exc:
             error = exc
         coordinate_error(error, "host recipe")
@@ -157,6 +174,7 @@ class JaxShardReader(WeightReader):
                 # reuse one read. This wait involves only single-device arrays.
                 jax.block_until_ready(copies)
                 uploaded.update(zip(devices, copies))
+                del value, copies
             arrays = [uploaded[d] for d in sharding.mesh.devices.flat if d in assignments]
         except Exception as exc:
             error = exc
@@ -382,6 +400,8 @@ class JaxShardReader(WeightReader):
             return result.T if do_transpose else result
 
         MAX_WORKERS = int(os.environ.get("SGLANG_MOE_LOAD_WORKERS", "16"))
+        if MAX_WORKERS <= 0:
+            raise ValueError("SGLANG_MOE_LOAD_WORKERS must be positive")
 
         def _load_stacked_slice(index):
             expert_slice = index[0]
@@ -415,16 +435,18 @@ class JaxShardReader(WeightReader):
             expert_bytes = math.prod(inner_shape) * np.dtype(target_dtype).itemsize
             output_bytes = len(physical_indices) * expert_bytes
             budget = int(os.environ.get("SGLANG_WEIGHT_LOAD_MAX_INFLIGHT_BYTES", str(4 << 30)))
+            if budget <= 0:
+                raise ValueError("SGLANG_WEIGHT_LOAD_MAX_INFLIGHT_BYTES must be positive")
             # Split fragments and concatenation can coexist for each worker.
-            workers = min(
-                MAX_WORKERS,
-                len(logical_to_positions),
-                (budget - output_bytes) // max(1, 2 * expert_bytes),
+            workers = max(
+                1,
+                min(
+                    MAX_WORKERS,
+                    len(logical_to_positions),
+                    (budget - output_bytes) // max(1, 2 * expert_bytes),
+                ),
             )
-            if workers < 1:
-                raise ValueError(
-                    f"Split expert shard needs {output_bytes + 2 * expert_bytes} host bytes, budget={budget}"
-                )
+            self._warn_oversized("Split expert shard", output_bytes + 2 * expert_bytes, budget)
             # Pre-load first expert to determine shape
             first_log_idx = logical_indices[0]
             first_data = _load_single_expert_slice(first_log_idx, tuple(inner_slice))
@@ -492,7 +514,11 @@ class JaxShardReader(WeightReader):
         )
         expert_bytes = math.prod(shape) * np.dtype(dtype).itemsize
         budget = int(os.environ.get("SGLANG_WEIGHT_LOAD_MAX_INFLIGHT_BYTES", str(4 << 30)))
+        if budget <= 0:
+            raise ValueError("SGLANG_WEIGHT_LOAD_MAX_INFLIGHT_BYTES must be positive")
         workers = int(os.environ.get("SGLANG_MOE_LOAD_WORKERS", "16"))
+        if workers <= 0:
+            raise ValueError("SGLANG_MOE_LOAD_WORKERS must be positive")
         use_bulk = (
             unsharded
             and (not do_transpose or deferred)
@@ -522,13 +548,17 @@ class JaxShardReader(WeightReader):
                 inner_shape = tuple(
                     len(range(*sl.indices(dim))) for sl, dim in zip(index[1:], final_shape)
                 )
-                required = (
-                    (len(physical) + min(workers, len(unique)))
-                    * math.prod(inner_shape)
-                    * np.dtype(dtype).itemsize
+                shard_bytes = math.prod(inner_shape) * np.dtype(dtype).itemsize
+                output_bytes = len(physical) * shard_bytes
+                local_workers = max(
+                    1,
+                    min(
+                        workers,
+                        len(unique),
+                        (budget - output_bytes) // max(1, shard_bytes),
+                    ),
                 )
-                if required > budget:
-                    raise ValueError(f"Expert shard needs {required} host bytes, budget={budget}")
+                self._warn_oversized("Expert shard", output_bytes + shard_bytes, budget)
                 output = np.empty((len(physical), *inner_shape), dtype=dtype)
                 positions = {
                     key: [i for i, value in enumerate(logical) if value == key] for key in unique
@@ -539,7 +569,7 @@ class JaxShardReader(WeightReader):
                     for position in positions[key]:
                         output[position] = value
 
-                with ThreadPoolExecutor(max_workers=min(workers, max(1, len(unique)))) as executor:
+                with ThreadPoolExecutor(max_workers=local_workers) as executor:
                     list(executor.map(fill, unique))
                 return output
 
@@ -561,10 +591,7 @@ class JaxShardReader(WeightReader):
 
                 batches, batch = [], []
                 for dev in devices:
-                    if estimate([dev]) > budget:
-                        raise ValueError(
-                            f"Expert shard working set {estimate([dev])} exceeds host budget {budget}"
-                        )
+                    self._warn_oversized("Expert shard", estimate([dev]), budget)
                     if batch and estimate([*batch, dev]) > budget:
                         batches.append(batch)
                         batch = []
@@ -590,6 +617,7 @@ class JaxShardReader(WeightReader):
                         )
                     jax.block_until_ready(uploaded)
                     arrays.extend(uploaded)
+                    del raw, values, owners, uploaded
             except Exception as exc:
                 error = exc
             coordinate_error(error, "expert read")

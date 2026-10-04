@@ -47,6 +47,7 @@ class WorkloadSpec:
     chunked_prefill_size: int | None
     mtp_layer_idx: int | None
     cache_loc_size: int | None = None
+    page_count: int | None = None  # decode page-table length (backend bucket), if bounded
 
 
 @dataclass(frozen=True)
@@ -144,6 +145,7 @@ class WorkloadInputBuilder(ABC):
             chunked_prefill_size=options.chunked_prefill_size,
             mtp_layer_idx=options.mtp_layer_idx if self.model_role == "draft" else None,
             cache_loc_size=getattr(options, "cache_loc_size", None),
+            page_count=getattr(options, "decode_page_count", None),
         )
 
     def _token_shape(self, options):
@@ -197,7 +199,9 @@ class DecodeInputBuilder(WorkloadInputBuilder):
     forward_mode = ForwardMode.DECODE
 
     def build(self, context):
-        metadata = _attention_metadata(context.backend, context, self.spec)
+        metadata = _attention_metadata(
+            context.backend, context, self.spec, page_count=self.spec.page_count
+        )
         return WorkloadInputs(self._batch(context, metadata), self._logits(context), metadata)
 
 

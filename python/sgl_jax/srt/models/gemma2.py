@@ -350,7 +350,7 @@ class Gemma2ForCausalLM(nnx.Module):
     def _create_layer_mappings(self, layer_idx: int) -> dict:
         prefix = f"model.layers.{layer_idx}"
 
-        return {
+        mappings = {
             f"{prefix}.input_layernorm.weight": WeightSpec(
                 target_path=f"{prefix}.input_layernorm.weight",
                 sharding=(None,),
@@ -415,6 +415,16 @@ class Gemma2ForCausalLM(nnx.Module):
                 transpose=True,
             ),
         }
+
+        if self.config.attention_bias:
+            for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                mappings[f"{prefix}.self_attn.{proj}.bias"] = WeightSpec(
+                    target_path=f"{prefix}.self_attn.{proj}.bias",
+                    sharding=(None,),
+                    head_dim_padding=proj != "o_proj",
+                    kv_head_padding=proj in ("k_proj", "v_proj"),
+                )
+        return mappings
 
     def __call__(
         self,

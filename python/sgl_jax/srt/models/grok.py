@@ -1097,27 +1097,24 @@ class Grok1ForCausalLM(nnx.Module):
                 sharding=(None,),
                 transpose=False,
             ),
-            f"{prefix}.mlp.gate_proj.weight": WeightSpec(
-                target_path=f"{target_prefix}.mlp.gate_proj.weight",
-                sharding=(None, "tensor"),
-                transpose=True,
-            ),
-            f"{prefix}.mlp.up_proj.weight": WeightSpec(
-                target_path=f"{target_prefix}.mlp.up_proj.weight",
-                sharding=(None, "tensor"),
-                transpose=True,
-            ),
-            f"{prefix}.mlp.down_proj.weight": WeightSpec(
-                target_path=f"{target_prefix}.mlp.down_proj.weight",
-                sharding=("tensor", None),
-                transpose=True,
-            ),
             f"{prefix}.block_sparse_moe.gate.weight": WeightSpec(
                 target_path=f"{target_prefix}.block_sparse_moe.gate.weight",
                 sharding=(None, None),
                 transpose=True,
             ),
         }
+
+        if getattr(self.config, "residual_moe", False):
+            for proj, sharding in (
+                ("gate_proj", (None, "tensor")),
+                ("up_proj", (None, "tensor")),
+                ("down_proj", ("tensor", None)),
+            ):
+                mappings[f"{prefix}.mlp.{proj}.weight"] = WeightSpec(
+                    target_path=f"{target_prefix}.mlp.{proj}.weight",
+                    sharding=sharding,
+                    transpose=True,
+                )
 
         moe_backend = getattr(self.config, "moe_backend", "epmoe")
 

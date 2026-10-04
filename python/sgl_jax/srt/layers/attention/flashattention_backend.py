@@ -226,6 +226,13 @@ class FlashAttention(AttentionBackend):
         self.mesh = mesh
         # SWA dual-pool support: set by model_runner after pool creation.
         # Accessed on host during metadata construction.
+        #
+        # MSA ctx-bucket precompile (G3): when set to a sorted page-count list
+        # (e.g. [16, 64, 512]) by model_runner for MSA models, decode-time
+
+    def _decode_page_limit(self, batch) -> int | None:
+        """Optional per-DP page-table bound for decode (subclasses override)."""
+        return None
 
     def get_forward_metadata(
         self,
@@ -256,6 +263,23 @@ class FlashAttention(AttentionBackend):
         cache_loc_2d = batch.cache_loc.reshape(batch.dp_size, per_dp_loc_len)
         # Stride by page_size to pick one slot per page — O(1) view
         strided_2d = cache_loc_2d[:, :: self.page_size]
+
+        # MSA ctx-bucket: drop the per-DP zero-padded page tail. cache_loc is
+        # cumsum-packed within a DP rank (schedule_batch._merge_cache_loc), so
+        # all valid pages live in the [:, :sum(seq_pages)] prefix and
+        # sum(seq_pages) <= bs_per_dp * max(seq_pages) <= bs_per_dp * bucket.
+        # RPA indexes via cu_kv_lens (unaffected); _msa_inner derives
+        # pages_per_seq from the truncated shape (the point of this opt).
+        # DECODE only — EXTEND uses the largest cache_loc bucket unconditionally.
+        # Backends may bound the decode page table (e.g. MSA context buckets);
+        # the per-request page count still follows kv_lens/cu_kv_lens.
+        if batch.forward_mode == ForwardMode.DECODE:
+            limit = self._decode_page_limit(batch)
+            if limit is not None:
+                n_keep = batch.per_dp_bs_size * limit
+                if n_keep < strided_2d.shape[1]:
+                    strided_2d = strided_2d[:, :n_keep]
+
         # Physical slot -> Physical page index
         page_indices = (strided_2d // self.page_size).ravel()
 
@@ -696,6 +720,10 @@ class FlashAttention(AttentionBackend):
         token_to_kv_pool: KVCache,
         causal: int = 1,
         attention_sink: jax.Array = None,
+        index_q: jax.Array | None = None,
+        index_k: jax.Array | None = None,
+        msa_topk: int = 0,
+        msa_local_blocks: int = 1,
     ):
         """
         Args:
@@ -820,15 +848,7 @@ class FlashAttention(AttentionBackend):
 
             return result, updated_kv_cache_fused
 
-        (
-            attn_output,
-            updated_kv_cache_fused,
-        ) = jax.shard_map(  # Fused KV kernel handles cache updates internally
-            _ragged_paged_attention_with_fused_kv,
-            in_specs=in_specs,
-            out_specs=out_specs,
-            check_vma=False,
-        )(
+        rpa_args = (
             q.reshape(q.shape[0], -1, getattr(layer, "head_dim", self.head_dim)),
             k.reshape(k.shape[0], -1, getattr(layer, "head_dim", self.head_dim)),
             v.reshape(v.shape[0], -1, getattr(layer, "head_dim", self.head_dim)),
@@ -842,9 +862,171 @@ class FlashAttention(AttentionBackend):
             attention_sink,
         )
 
+        is_msa = index_k is not None and hasattr(token_to_kv_pool, "sparse_layer_ids")
+        if not is_msa:
+            attn_output, updated_kv_cache_fused = jax.shard_map(
+                _ragged_paged_attention_with_fused_kv,
+                in_specs=in_specs,
+                out_specs=out_specs,
+                check_vma=False,
+            )(*rpa_args)
+            return attn_output.reshape(q.shape[0], -1), updated_kv_cache_fused
+
+        # --- MSA layer: per-DP-local index_k write + (decode) topk page selection ---
+        ik_buf = token_to_kv_pool.get_index_k_buffer(layer.layer_id)
+        is_decode = forward_batch.forward_mode.is_decode()
+        page_size = self.page_size
+        data = self.attention_data_partition_axis
+        msa_in_specs = in_specs + (
+            P(data, None, None, None),  # ik_buf [pages, ps, 1, d_idx]
+            P(data, None, None),  # index_q [bs, H_idx, d_idx]
+            P(data, None, None),  # index_k [bs, 1, d_idx]
+            P(data),  # out_cache_loc [bs]
+        )
+        msa_out_specs = out_specs + (P(data, None, None, None),)
+
+        def _msa_inner(*args):
+            (
+                queries,
+                keys,
+                values,
+                kv_cache,
+                kv_lens,
+                page_indices,
+                cu_q_lens,
+                cu_kv_lens,
+                distribution,
+                custom_mask,
+                attn_sink,
+                ik_buf_l,
+                iq_l,
+                ik_new_l,
+                out_loc_l,
+            ) = args
+            # out_cache_loc pads with -1 (schedule_batch.py:1865); -1//128=-1 wraps
+            # to the last *allocatable* page (allocator reserves page 0, not -1).
+            # Clamp to page 0 slot 0 so padding writes land on the reserved page.
+            out_loc_l = jnp.maximum(out_loc_l, 0)
+            q_page = out_loc_l // page_size
+            slot_in_page = out_loc_l % page_size
+            ik_cast = ik_new_l[:, 0].astype(ik_buf_l.dtype)
+            # 1. write new index_k into ik_buf (per-DP local page addressing).
+            # Prefill: sort the flat index so XLA emits a sorted+unique scatter
+            # (v7x: 1070→259us/layer, ×57=14.8ms). Decode bs is small and idx is
+            # already scattered across pages — plain .at[].set is faster there.
+            if is_decode:
+                ik_buf_upd = ik_buf_l.at[q_page, slot_in_page, 0].set(ik_cast)
+            else:
+                flat_idx = q_page * page_size + slot_in_page
+                order = jnp.argsort(flat_idx)
+                d_idx = ik_buf_l.shape[-1]
+                _dn = jax.lax.ScatterDimensionNumbers(
+                    update_window_dims=(1,),
+                    inserted_window_dims=(0,),
+                    scatter_dims_to_operand_dims=(0,),
+                )
+                # NOT unique: out_cache_loc -1 padding is clamped to 0 above, so
+                # every prefill has duplicate 0s here. Sorted-only still gets
+                # the vectorized TPU lowering; unique=True would be UB.
+                ik_buf_upd = jax.lax.scatter(
+                    ik_buf_l.reshape(-1, d_idx),
+                    flat_idx[order][:, None],
+                    ik_cast[order],
+                    _dn,
+                    indices_are_sorted=True,
+                    unique_indices=False,
+                    mode="promise_in_bounds",
+                ).reshape(ik_buf_l.shape)
+            bs_l = kv_lens.shape[0]
+            assert page_indices.shape[0] % bs_l == 0
+            pages_per_seq = page_indices.shape[0] // bs_l
+            # Skip MSA topk when the (static) page budget cannot exceed topk —
+            # selecting topk from ≤topk blocks is the identity (≡ dense). This
+            # avoids the O(pages_per_seq) ik gather on short-ctx deployments.
+            if is_decode and msa_topk > 0 and pages_per_seq > msa_topk:
+                # page_indices is cumsum-packed ragged (schedule_batch._merge_cache_loc),
+                # NOT [bs, P] rectangular. reshape(bs, P) misaligns req[k>0] and reads
+                # stale cache_loc_host_buf entries (NOT re-zeroed, see schedule_batch
+                # safety note — that invariant assumes cu_kv_lens-bounded reads).
+                cu_pages = cu_kv_lens[:bs_l] // page_size
+                col = jnp.arange(pages_per_seq, dtype=jnp.int32)
+                gidx = jnp.minimum(cu_pages[:, None] + col[None, :], page_indices.shape[0] - 1)
+                pi_2d = page_indices[gidx]
+                n_blocks_v = (kv_lens + page_size - 1) // page_size
+                # Per-head selection (M3 contract; cf. HF transformers #46719): each
+                # index head selects its own top-k blocks for its KV/GQA group. On
+                # this backend every tensor rank owns exactly one KV head (startup
+                # validation enforces tp % n_kv == 0, tp >= n_kv), KV heads are
+                # replicated contiguously across the tensor axis (loader
+                # kv_head_padding, "replicate" strategy: each original head is
+                # repeated num_replicas times in place) and q heads are sharded
+                # contiguously, so
+                # tensor rank r <-> original KV/index head (r * n_idx) // tp. Scoring
+                # with that head alone makes this rank's page table the per-head
+                # selection, and RPA runs unchanged on it.
+                n_idx = iq_l.shape[1]
+                tp_n = self.mesh.shape[self.kv_partition_axis]
+                head = (jax.lax.axis_index(self.kv_partition_axis) * n_idx) // tp_n
+                iq_h = jax.lax.dynamic_index_in_dim(iq_l, head, axis=1, keepdims=False)
+                # Exact page-level scores, bf16 in / f32 accum. The last (q_block)
+                # block's zero-padded tail contributes score=0 to its max, but that
+                # block is force-selected as local anyway.
+                ik_pages = ik_buf_upd[pi_2d][:, :, :, 0]  # [bs, n_pages, ps, d] bf16
+                s_tok = jnp.einsum(
+                    "bd,bnpd->bnp", iq_h, ik_pages, preferred_element_type=jnp.float32
+                )
+                bscores = s_tok.max(-1)  # [bs, n_pages], per-head (no head collapse)
+                block_mask = jnp.arange(pages_per_seq)[None, :] < n_blocks_v[:, None]
+                bscores = jnp.where(block_mask, bscores, -jnp.inf)
+                q_block = (kv_lens - 1) // page_size
+                ar = jnp.arange(bs_l)
+                for j in range(msa_local_blocks):
+                    bscores = bscores.at[ar, jnp.maximum(q_block - j, 0)].set(jnp.inf)
+                _, topk_idx = jax.lax.top_k(bscores, msa_topk)
+                n_valid = jnp.minimum(n_blocks_v, msa_topk)
+                # 4. sort ascending; pad invalid slots with pages_per_seq so q_block
+                #    (largest valid) lands at [n_valid-1] — RPA writes new K/V there.
+                pad_val = jnp.int32(pages_per_seq)
+                slot = jnp.arange(msa_topk)[None, :]
+                topk_idx = jnp.where(slot < n_valid[:, None], topk_idx, pad_val)
+                topk_idx = jnp.sort(topk_idx, axis=-1)
+                # 5. logical block -> physical page; build MSA metadata
+                msa_pi = jnp.take_along_axis(
+                    jnp.pad(pi_2d, ((0, 0), (0, 1))), topk_idx, axis=-1
+                ).reshape(-1)
+                msa_kvl = (n_valid - 1) * page_size + (kv_lens - 1) % page_size + 1
+                msa_cu = jnp.arange(bs_l + 1, dtype=jnp.int32) * (msa_topk * page_size)
+                page_indices, kv_lens, cu_kv_lens = msa_pi, msa_kvl, msa_cu
+            result, kv_upd = ragged_paged_attention_v3(
+                queries,
+                keys,
+                values,
+                kv_cache,
+                kv_lens,
+                page_indices,
+                cu_q_lens,
+                cu_kv_lens,
+                distribution,
+                custom_mask,
+                attn_sink,
+                causal=causal,
+                sm_scale=scale,
+                sliding_window=layer.sliding_window_size,
+                soft_cap=layer.logit_cap,
+                xai_temperature_len=(
+                    layer.xai_temperature_len if layer.xai_temperature_len > 0 else None
+                ),
+            )
+            return result, kv_upd, ik_buf_upd
+
+        attn_output, updated_kv_cache_fused, updated_ik = jax.shard_map(
+            _msa_inner, in_specs=msa_in_specs, out_specs=msa_out_specs, check_vma=False
+        )(*rpa_args, ik_buf, index_q, index_k, forward_batch.out_cache_loc)
+
         return (
             attn_output.reshape(q.shape[0], -1),
             updated_kv_cache_fused,
+            updated_ik,
         )
 
     def _get_fused_kv_cache(
