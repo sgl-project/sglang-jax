@@ -97,6 +97,12 @@ lora_paths = [{"name": "adapter1", "path": "/path/to/adapter1", "pinned": False}
 This enables device-slot reuse across batches; it does not enable runtime registration or
 host-memory eviction.
 
+With overlap scheduling, the bootstrap handler signals sampling readiness before waiting
+for the first batch's `launch_done` event. This prevents the next preparation from
+replacing shared weight references before the worker captures them. The wait also applies
+after idle and to non-LoRA bootstrap batches. It does not add a device-wide synchronization;
+it can delay the next preparation until the first forward call returns.
+
 ### Testing device-slot eviction
 
 Follow the [contribution guide](../developer_guide/contribution_guide.md) to install the
@@ -110,6 +116,18 @@ The pool tests use small JAX arrays without downloading a model. They cover LRU 
 pinned and batch-required adapters, reserved slot zero, capacity errors, and numerical
 equivalence between reused and fresh slots. Manager tests check pin propagation and
 the conditional refresh of model-layer buffer references.
+
+The pool tests also check that captured JAX arrays retain their numerical output after
+slot replacement. For scheduler bootstrap ordering, run:
+
+```bash
+python -m unittest discover -s test/srt/lora -p 'test_lora_overlap_bootstrap.py' -v
+```
+
+These scheduler tests require the serving runtime dependencies on a supported platform.
+They use controlled thread events to test reference capture before the next preparation,
+repeated bootstrap calls, and sampling-readiness-before-wait ordering. They do not launch
+a model or validate TPU execution, JIT/AOT serving integration, or latency.
 
 For serving validation on a TPU environment, also run `python test/srt/lora/test_dynamic_lora.py`.
 That existing test downloads model/adapter checkpoints and checks mixed-adapter serving;

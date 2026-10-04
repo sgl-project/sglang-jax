@@ -161,6 +161,33 @@ class TestLoRAMemoryPool(unittest.TestCase):
                     np.testing.assert_array_equal(a[1:], 0)
                     np.testing.assert_array_equal(b[:, 1:], 0)
 
+    def test_captured_arrays_survive_slot_replacement(self):
+        pool = self.make_pool(capacity=2)
+        adapters = {
+            "a": self.make_adapter(value=1),
+            "b": self.make_adapter(value=2),
+        }
+        pool.prepare_lora_batch({"a"}, adapters)
+        slot = pool.get_buffer_id("a")
+        captured_a = pool.A_buffer["q_proj"][0]
+        captured_b = pool.B_buffer["q_proj"][0]
+
+        pool.prepare_lora_batch({"b"}, adapters)
+        self.assertEqual(pool.get_buffer_id("b"), slot)
+        self.assertIsNot(pool.A_buffer["q_proj"][0], captured_a)
+        self.assertIsNot(pool.B_buffer["q_proj"][0], captured_b)
+
+        @jax.jit
+        def forward(a, b, x):
+            return b[slot] @ (a[slot] @ x)
+
+        x = jnp.arange(4, dtype=jnp.float32)
+        np.testing.assert_array_equal(forward(captured_a, captured_b, x), np.full(4, 24))
+        np.testing.assert_array_equal(
+            forward(pool.A_buffer["q_proj"][0], pool.B_buffer["q_proj"][0], x),
+            np.full(4, 96),
+        )
+
     def test_failed_replacement_preserves_resident(self):
         self.pool.prepare_lora_batch({"a", "b"}, self.adapters)
         mappings = list(self.pool.uid_to_buffer_id.items())
