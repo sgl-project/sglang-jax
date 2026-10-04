@@ -1,14 +1,26 @@
 """Bit-exact parity tests for the absorbed-MLA v2 kernel against pre-#1733 semantics.
 
-Verifies that ``sgl_jax.srt.kernels.mla.v2.kernel`` produces bit-identical
-(``max_abs_diff == 0``) results for:
-  * ``output`` (normalized bfloat16 latent attention output),
-  * ``l`` (float32 online-softmax normalizer ``l_curr`` in ``l_ref``),
-  * ``acc`` (float32 unnormalized output accumulator ``o_curr`` in ``acc_ref``),
-  * ``updated_cache_kv`` (packed 4D KV cache across aligned and unaligned offsets),
-against the pre-#1733 (``c136c733``) FlashAttention-2 recurrence across prefill
-and decode shapes, so any future change to the floating-point math or KV packing
-lines fails CI immediately.
+Provides two complementary layers of bit-exact parity verification against the
+pre-#1733 (``c136c733``) MLA v2 kernel:
+
+1. **Fast CPU source-level guard (``test_v2_kernel_bitexact_parity_output_and_l``)**:
+   ``run_v2_kernel_with_capture`` replaces ``pl.pallas_call`` with a NumPy/JAX
+   emulation of ``_mla_ragged_paged_attention_kernel``, replaces the
+   ``pl.reciprocal(l, approx=True)`` call with exact ``lax.reciprocal``, and
+   compares ``output``, ``l`` (``l_ref`` normalizer), ``acc`` (``acc_ref``
+   accumulator), and ``updated_cache_kv`` against a Python reimplementation of
+   the ``c136c733`` parent kernel (``pre1733_reference_mla_v2``). This runs on
+   CPU in ~10s and catches source-level numeric or KV-packing edits (such as the
+   ``jnp.exp2`` / ``log2(e)`` rewrite, folded ``float(sm_scale * q_scale)``
+   scaling, or unaligned ``merge_kv`` bounds), without executing the
+   Mosaic-compiled kernel or TPU MXU.
+2. **TPU compiled Mosaic/MXU guard (``test_v2_kernel_tpu_compiled_bitexact_parity``)**:
+   When running on TPU (``jax.default_backend() == "tpu"``), executes
+   ``mla_ragged_paged_attention`` completely unpatched through ``pl.pallas_call``
+   (full Mosaic lowering, MXU ``Q @ K^T`` and ``P @ V`` accumulation, VMEM bitcast
+   reshapes, and hardware ``pl.reciprocal(l, approx=True)``) and asserts
+   ``max_abs_diff == 0.0`` against the frozen ``c136c733`` Pallas block reference
+   compiled on the same TPU device.
 """
 
 from __future__ import annotations
@@ -328,13 +340,146 @@ def run_v2_kernel_with_capture(*args, **kwargs):
             mock.patch.object(pl, "pallas_call", side_effect=fake_pallas_call),
             mock.patch.object(pl, "when", side_effect=_py_when),
             mock.patch.object(pl, "reciprocal", side_effect=_cpu_reciprocal),
-            mock.patch.object(pltpu, "reciprocal", side_effect=_cpu_reciprocal),
+            mock.patch.object(pltpu, "reciprocal", side_effect=_cpu_reciprocal, create=True),
             mock.patch.object(pltpu, "make_async_copy", side_effect=_FakeAsyncCopy),
             mock.patch.object(pltpu, "bitcast", side_effect=_cpu_bitcast),
             mock.patch.object(lax, "fori_loop", side_effect=_py_fori_loop),
         ):
             out, updated_kv = kmod.mla_ragged_paged_attention.__wrapped__(*args, **kwargs)
     return np.asarray(out), np.asarray(updated_kv), l_snapshots, acc_snapshots
+
+
+def _make_tpu_pallas_flash_attention_block_ref(
+    *,
+    bsz: int,
+    bq_sz: int,
+    num_q_heads: int,
+    bkv_sz: int,
+    lkv_dim: int,
+    r_dim: int,
+    num_bkv: int,
+    sm_scale: float,
+    mask_value: float,
+    q_dtype,
+    q_scale: float | None = None,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
+    sliding_window: int | None = None,
+    soft_cap: float | None = None,
+):
+    """Frozen pre-#1733 (``c136c733``) Pallas TPU block kernel for Mosaic/MXU parity."""
+    q_rows = bq_sz * num_q_heads
+
+    def _broadcast_minor(src, shape):
+        if src.shape == shape:
+            return src
+        target_minor = kmod.align_to(shape[-1], src.shape[-1])
+        return jnp.concatenate([src for _ in range(target_minor // src.shape[-1])], axis=-1)[
+            ..., : shape[-1]
+        ]
+
+    def _kernel(
+        meta_ref,
+        ql_ref,
+        qpe_ref,
+        kvc_all_ref,
+        kpe_all_ref,
+        out_ref,
+        m_ref,
+        l_ref,
+        acc_ref,
+    ):
+        bq_idx = meta_ref[0]
+        ql_vec = ql_ref[...]
+        qpe_vec = qpe_ref[...]
+
+        def load_with_init(ref, init_val, bkv_idx):
+            return jnp.where(bkv_idx == 0, jnp.full_like(ref[...], init_val), ref[...])
+
+        def body(bkv_idx, _):
+            kv_c = kvc_all_ref[bkv_idx]
+            k_pe = kpe_all_ref[bkv_idx]
+            q = jnp.concatenate([ql_vec, qpe_vec], axis=-1)
+            k = jnp.concatenate([kv_c, k_pe], axis=-1)
+            s = jnp.einsum("bnd,bmd->bnm", q, k, preferred_element_type=jnp.float32)
+            s *= sm_scale
+            if k_scale is not None:
+                s *= k_scale
+            if q_scale is not None:
+                s *= q_scale
+
+            k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(jnp.int32, s.shape[1:], 1)
+            mask_list = []
+            for b in range(bsz):
+                q_len = meta_ref[1 + 2 * b]
+                kv_len = meta_ref[2 + 2 * b]
+                q_span = (
+                    kv_len
+                    - q_len
+                    + bq_idx * bq_sz
+                    + lax.div(lax.broadcasted_iota(jnp.int32, s.shape[1:], 0), num_q_heads)
+                )
+                mask = q_span < k_span
+                if sliding_window is not None:
+                    mask = jnp.logical_or(mask, q_span - sliding_window >= k_span)
+                mask_list.append(mask)
+            mask = jnp.stack(mask_list, axis=0)
+
+            if soft_cap is not None:
+                s = soft_cap * jnp.tanh(s / soft_cap)
+            s = jnp.where(mask, mask_value, s)
+            s_rowmax = jnp.max(s, axis=2, keepdims=True)
+
+            head_m_ref = m_ref.at[:, : s.shape[1]]
+            head_l_ref = l_ref.at[:, : s.shape[1]]
+            head_acc_ref = acc_ref.at[:, : s.shape[1]]
+
+            m_prev = load_with_init(head_m_ref, -jnp.inf, bkv_idx)
+            m_curr = jnp.maximum(m_prev, s_rowmax)
+            head_m_ref[...] = m_curr
+            p = jnp.exp(s - _broadcast_minor(m_curr, s.shape))
+
+            pv = jnp.einsum("bnm,bmd->bnd", p, kv_c, preferred_element_type=jnp.float32)
+            if v_scale is not None:
+                pv *= v_scale
+
+            p_rowsum = jnp.sum(p, axis=2, keepdims=True)
+            exp_m_diff = jnp.exp(m_prev - m_curr)
+            l_prev = load_with_init(head_l_ref, 0.0, bkv_idx)
+            l_curr = exp_m_diff * l_prev + p_rowsum
+            head_l_ref[...] = l_curr
+            o_prev = load_with_init(head_acc_ref, 0.0, bkv_idx)
+            o_curr = _broadcast_minor(exp_m_diff, o_prev.shape) * o_prev + pv
+            head_acc_ref[...] = o_curr
+
+        lax.fori_loop(0, num_bkv, body, None, unroll=False)
+        acc = acc_ref[...]
+        l_val = _broadcast_minor(l_ref[...], acc.shape)
+        out_ref[...] = (
+            lax.div(acc, l_val)
+            if q_dtype == jnp.float32
+            else (acc * pl.reciprocal(l_val, approx=True)).astype(q_dtype)
+        )
+
+    return pl.pallas_call(
+        _kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            in_specs=[
+                pl.BlockSpec(memory_space=pltpu.VMEM),
+                pl.BlockSpec(memory_space=pltpu.VMEM),
+                pl.BlockSpec(memory_space=pltpu.VMEM),
+                pl.BlockSpec(memory_space=pltpu.VMEM),
+            ],
+            out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
+            scratch_shapes=[
+                pltpu.VMEM((bsz, q_rows, 128), jnp.float32),
+                pltpu.VMEM((bsz, q_rows, 128), jnp.float32),
+                pltpu.VMEM((bsz, q_rows, lkv_dim), jnp.float32),
+            ],
+        ),
+        out_shape=jax.ShapeDtypeStruct((bsz, q_rows, lkv_dim), q_dtype),
+    )
 
 
 def pre1733_reference_mla_v2(
@@ -359,6 +504,7 @@ def pre1733_reference_mla_v2(
     num_kv_pages_per_block=(1, 1, 1),
     num_queries_per_block=(1, 1, 8),
     decode_batch_size=1,
+    use_tpu_pallas=False,
 ):
     """Self-contained pre-#1733 (``c136c733``) reference for the v2 MLA kernel.
 
@@ -370,7 +516,11 @@ def pre1733_reference_mla_v2(
       - ``float32`` ``p`` in ``pv = jnp.einsum("bnm,bmd->bnd", p, kv_c, preferred_element_type=jnp.float32)``
     """
     cpu_devices = jax.devices("cpu")
-    ctx = jax.default_device(cpu_devices[0]) if cpu_devices else mock.MagicMock()
+    ctx = (
+        jax.default_device(cpu_devices[0])
+        if (cpu_devices and not use_tpu_pallas)
+        else mock.MagicMock()
+    )
     with ctx:
         q_dtype = ql_nope.dtype
         kv_dtype = cache_kv.dtype
@@ -489,103 +639,169 @@ def pre1733_reference_mla_v2(
                         bsz, actual_bq_sz * num_q_heads, r_dim
                     )
 
-                    m_curr = jnp.full(
-                        (bsz, actual_bq_sz * num_q_heads, 128), -jnp.inf, dtype=jnp.float32
-                    )
-                    l_curr = jnp.zeros((bsz, actual_bq_sz * num_q_heads, 128), dtype=jnp.float32)
-                    o_curr = jnp.zeros(
-                        (bsz, actual_bq_sz * num_q_heads, lkv_dim), dtype=jnp.float32
-                    )
-
-                    for bkv_idx in range(num_bkv):
-                        kvc_blk = np.zeros((bsz, bkv_sz, lkv_dim), dtype=kv_dtype)
-                        kpe_blk = np.zeros((bsz, bkv_sz, r_dim), dtype=kv_dtype)
+                    if use_tpu_pallas:
+                        kvc_list = []
+                        kpe_list = []
+                        for bkv_idx in range(num_bkv):
+                            kvc_blk = np.zeros((bsz, bkv_sz, lkv_dim), dtype=kv_dtype)
+                            kpe_blk = np.zeros((bsz, bkv_sz, r_dim), dtype=kv_dtype)
+                            for b in range(bsz):
+                                s_i = batch_start + b
+                                kv_len = int(kvl[s_i])
+                                start_page = int(cu_kv[s_i]) // page_size
+                                kv_start = bkv_idx * bkv_sz
+                                valid_n = max(min(kv_len - kv_start, bkv_sz), 0)
+                                for t in range(valid_n):
+                                    pos = kv_start + t
+                                    p_i = pidx[start_page + pos // page_size]
+                                    in_page = pos % page_size
+                                    w_row, w_col = in_page // kv_packing, in_page % kv_packing
+                                    kvc_blk[b, t] = updated_cache[p_i, w_row, w_col, :lkv_dim]
+                                    kpe_blk[b, t] = updated_cache[
+                                        p_i, w_row, w_col, lkv_dim : lkv_dim + r_dim
+                                    ]
+                            kvc_list.append(jnp.asarray(kvc_blk))
+                            kpe_list.append(jnp.asarray(kpe_blk))
+                        meta_vals = [bq_idx]
                         for b in range(bsz):
                             s_i = batch_start + b
-                            kv_len = int(kvl[s_i])
-                            start_page = int(cu_kv[s_i]) // page_size
-                            kv_start = bkv_idx * bkv_sz
-                            valid_n = max(min(kv_len - kv_start, bkv_sz), 0)
-                            for t in range(valid_n):
-                                pos = kv_start + t
-                                p_i = pidx[start_page + pos // page_size]
-                                in_page = pos % page_size
-                                w_row, w_col = in_page // kv_packing, in_page % kv_packing
-                                kvc_blk[b, t] = updated_cache[p_i, w_row, w_col, :lkv_dim]
-                                kpe_blk[b, t] = updated_cache[
-                                    p_i, w_row, w_col, lkv_dim : lkv_dim + r_dim
-                                ]
-
-                        kv_c = jnp.asarray(kvc_blk)
-                        k_pe = jnp.asarray(kpe_blk)
-
-                        q = jnp.concatenate([ql_vec, qpe_vec], axis=-1)
-                        k = jnp.concatenate([kv_c, k_pe], axis=-1)
-                        s = jnp.einsum("bnd,bmd->bnm", q, k, preferred_element_type=jnp.float32)
-                        s *= sm_scale
-                        if k_scale is not None:
-                            s *= k_scale
-                        if q_scale is not None:
-                            s *= q_scale
-
-                        k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(jnp.int32, s.shape[1:], 1)
-                        mask_list = []
-                        for b in range(bsz):
-                            s_i = batch_start + b
-                            q_len = int(cu_q[s_i + 1] - cu_q[s_i])
-                            kv_len = int(kvl[s_i])
-                            q_span = (
-                                kv_len
-                                - q_len
-                                + bq_idx * bq_sz
-                                + (lax.broadcasted_iota(jnp.int32, s.shape[1:], 0) // num_q_heads)
-                            )
-                            mask = q_span < k_span
-                            if sliding_window is not None:
-                                mask = jnp.logical_or(mask, q_span - sliding_window >= k_span)
-                            mask_list.append(mask)
-                        mask = jnp.stack(mask_list, axis=0)
-
-                        if soft_cap is not None:
-                            s = soft_cap * jnp.tanh(s / soft_cap)
-                        s = jnp.where(mask, mask_value, s)
-                        s_rowmax = jnp.max(s, axis=2, keepdims=True)
-                        m_prev = m_curr
-                        m_curr = jnp.maximum(m_prev, s_rowmax)
-                        p = jnp.exp(s - broadcast_minor(m_curr, s.shape))
-
-                        pv = jnp.einsum("bnm,bmd->bnd", p, kv_c, preferred_element_type=jnp.float32)
-                        if v_scale is not None:
-                            pv *= v_scale
-
-                        p_rowsum = jnp.sum(p, axis=2, keepdims=True)
-                        exp_m_diff = jnp.exp(m_prev - m_curr)
-                        l_curr = exp_m_diff * l_curr + p_rowsum
-                        o_curr = broadcast_minor(exp_m_diff, o_curr.shape) * o_curr + pv
-
-                    max_sz = max(
-                        min(
-                            bq_sz,
-                            max(
-                                int(
-                                    cu_q[batch_start + b + 1]
-                                    - (cu_q[batch_start + b] + bq_idx * bq_sz)
-                                ),
-                                0,
-                            ),
+                            meta_vals.append(int(cu_q[s_i + 1] - cu_q[s_i]))
+                            meta_vals.append(int(kvl[s_i]))
+                        while len(meta_vals) % 8 != 0:
+                            meta_vals.append(0)
+                        meta_arr = jnp.asarray(meta_vals, dtype=jnp.int32)
+                        pallas_fn = _make_tpu_pallas_flash_attention_block_ref(
+                            bsz=bsz,
+                            bq_sz=actual_bq_sz,
+                            num_q_heads=num_q_heads,
+                            bkv_sz=bkv_sz,
+                            lkv_dim=lkv_dim,
+                            r_dim=r_dim,
+                            num_bkv=num_bkv,
+                            sm_scale=sm_scale,
+                            mask_value=mask_value,
+                            q_dtype=q_dtype,
+                            q_scale=q_scale,
+                            k_scale=k_scale,
+                            v_scale=v_scale,
+                            sliding_window=sliding_window,
+                            soft_cap=soft_cap,
                         )
-                        for b in range(bsz)
-                    )
-                    valid_q_rows = max_sz * num_q_heads
-                    l_blocks.append((valid_q_rows, np.asarray(l_curr[:, :valid_q_rows, :])))
-                    acc_blocks.append((valid_q_rows, np.asarray(o_curr[:, :valid_q_rows, :])))
+                        out_blk = pallas_fn(
+                            meta_arr,
+                            ql_vec,
+                            qpe_vec,
+                            jnp.stack(kvc_list, axis=0),
+                            jnp.stack(kpe_list, axis=0),
+                        )
+                    else:
+                        m_curr = jnp.full(
+                            (bsz, actual_bq_sz * num_q_heads, 128), -jnp.inf, dtype=jnp.float32
+                        )
+                        l_curr = jnp.zeros(
+                            (bsz, actual_bq_sz * num_q_heads, 128), dtype=jnp.float32
+                        )
+                        o_curr = jnp.zeros(
+                            (bsz, actual_bq_sz * num_q_heads, lkv_dim), dtype=jnp.float32
+                        )
 
-                    l_bcast = broadcast_minor(l_curr, o_curr.shape)
-                    out_blk = (
-                        lax.div(o_curr, l_bcast)
-                        if q_dtype == jnp.float32
-                        else (o_curr * lax.reciprocal(l_bcast)).astype(q_dtype)
-                    )
+                        for bkv_idx in range(num_bkv):
+                            kvc_blk = np.zeros((bsz, bkv_sz, lkv_dim), dtype=kv_dtype)
+                            kpe_blk = np.zeros((bsz, bkv_sz, r_dim), dtype=kv_dtype)
+                            for b in range(bsz):
+                                s_i = batch_start + b
+                                kv_len = int(kvl[s_i])
+                                start_page = int(cu_kv[s_i]) // page_size
+                                kv_start = bkv_idx * bkv_sz
+                                valid_n = max(min(kv_len - kv_start, bkv_sz), 0)
+                                for t in range(valid_n):
+                                    pos = kv_start + t
+                                    p_i = pidx[start_page + pos // page_size]
+                                    in_page = pos % page_size
+                                    w_row, w_col = in_page // kv_packing, in_page % kv_packing
+                                    kvc_blk[b, t] = updated_cache[p_i, w_row, w_col, :lkv_dim]
+                                    kpe_blk[b, t] = updated_cache[
+                                        p_i, w_row, w_col, lkv_dim : lkv_dim + r_dim
+                                    ]
+
+                            kv_c = jnp.asarray(kvc_blk)
+                            k_pe = jnp.asarray(kpe_blk)
+
+                            q = jnp.concatenate([ql_vec, qpe_vec], axis=-1)
+                            k = jnp.concatenate([kv_c, k_pe], axis=-1)
+                            s = jnp.einsum("bnd,bmd->bnm", q, k, preferred_element_type=jnp.float32)
+                            s *= sm_scale
+                            if k_scale is not None:
+                                s *= k_scale
+                            if q_scale is not None:
+                                s *= q_scale
+
+                            k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(
+                                jnp.int32, s.shape[1:], 1
+                            )
+                            mask_list = []
+                            for b in range(bsz):
+                                s_i = batch_start + b
+                                q_len = int(cu_q[s_i + 1] - cu_q[s_i])
+                                kv_len = int(kvl[s_i])
+                                q_span = (
+                                    kv_len
+                                    - q_len
+                                    + bq_idx * bq_sz
+                                    + (
+                                        lax.broadcasted_iota(jnp.int32, s.shape[1:], 0)
+                                        // num_q_heads
+                                    )
+                                )
+                                mask = q_span < k_span
+                                if sliding_window is not None:
+                                    mask = jnp.logical_or(mask, q_span - sliding_window >= k_span)
+                                mask_list.append(mask)
+                            mask = jnp.stack(mask_list, axis=0)
+
+                            if soft_cap is not None:
+                                s = soft_cap * jnp.tanh(s / soft_cap)
+                            s = jnp.where(mask, mask_value, s)
+                            s_rowmax = jnp.max(s, axis=2, keepdims=True)
+                            m_prev = m_curr
+                            m_curr = jnp.maximum(m_prev, s_rowmax)
+                            p = jnp.exp(s - broadcast_minor(m_curr, s.shape))
+
+                            pv = jnp.einsum(
+                                "bnm,bmd->bnd", p, kv_c, preferred_element_type=jnp.float32
+                            )
+                            if v_scale is not None:
+                                pv *= v_scale
+
+                            p_rowsum = jnp.sum(p, axis=2, keepdims=True)
+                            exp_m_diff = jnp.exp(m_prev - m_curr)
+                            l_curr = exp_m_diff * l_curr + p_rowsum
+                            o_curr = broadcast_minor(exp_m_diff, o_curr.shape) * o_curr + pv
+
+                        max_sz = max(
+                            min(
+                                bq_sz,
+                                max(
+                                    int(
+                                        cu_q[batch_start + b + 1]
+                                        - (cu_q[batch_start + b] + bq_idx * bq_sz)
+                                    ),
+                                    0,
+                                ),
+                            )
+                            for b in range(bsz)
+                        )
+                        valid_q_rows = max_sz * num_q_heads
+                        l_blocks.append((valid_q_rows, np.asarray(l_curr[:, :valid_q_rows, :])))
+                        acc_blocks.append((valid_q_rows, np.asarray(o_curr[:, :valid_q_rows, :])))
+
+                        l_bcast = broadcast_minor(l_curr, o_curr.shape)
+                        out_blk = (
+                            lax.div(o_curr, l_bcast)
+                            if q_dtype == jnp.float32
+                            else (o_curr * lax.reciprocal(l_bcast)).astype(q_dtype)
+                        )
+
                     out_blk_np = np.asarray(out_blk).reshape(
                         bsz, actual_bq_sz, num_q_heads, lkv_dim
                     )
@@ -752,6 +968,75 @@ class TestMLAV2BitExactParity(unittest.TestCase):
         for name, lens, page_size, num_heads, dbs, extra_kw in self.PARITY_CASES:
             with self.subTest(case=name):
                 self._assert_bitexact_case(name, lens, page_size, num_heads, dbs, extra_kw)
+
+    TPU_PARITY_CASES = [
+        ("decode_tpu_compiled", [(1, 127), (1, 128), (1, 95), (1, 128)], 128, 16, 2, {}),
+        ("prefill_tpu_compiled", [(8, 128), (5, 119)], 128, 16, 1, {}),
+        ("prefill_multi_bkv_tpu_compiled", [(8, 240)], 128, 16, 1, {}),
+        (
+            "prefill_qkv_scales_tpu_compiled",
+            [(8, 128), (7, 115)],
+            128,
+            16,
+            1,
+            {"q_scale": 0.125, "k_scale": 0.25, "v_scale": 0.5},
+        ),
+    ]
+
+    @unittest.skipIf(
+        jax.default_backend() != "tpu",
+        "Requires TPU backend for unpatched Mosaic/MXU compilation and execution.",
+    )
+    def test_v2_kernel_tpu_compiled_bitexact_parity(self):
+        """Runs ``kmod.mla_ragged_paged_attention`` completely unpatched on TPU
+        (executing full Mosaic lowering, MXU ``Q @ K^T`` / ``P @ V``, and
+        ``pl.reciprocal(l, approx=True)``) and verifies ``max_abs_diff == 0.0``
+        against the frozen ``c136c733`` Pallas block reference."""
+        for name, lens, page_size, num_heads, dbs, extra_kw in self.TPU_PARITY_CASES:
+            with self.subTest(case=name):
+                inputs = make_mla_v2_parity_inputs(
+                    lens, page_size=page_size, num_heads=num_heads, dtype=jnp.bfloat16, seed=42
+                )
+                common_kw = dict(
+                    sm_scale=(512 + 64) ** -0.5,
+                    num_kv_pages_per_block=(1, 1, 1),
+                    num_queries_per_block=(1, 1, 8),
+                    decode_batch_size=dbs,
+                    **extra_kw,
+                )
+                out_tpu, kv_tpu = kmod.mla_ragged_paged_attention(*inputs, **common_kw)
+                out_tpu_np = np.asarray(out_tpu)
+                kv_tpu_np = np.asarray(kv_tpu)
+
+                out_ref, kv_ref, _, _ = pre1733_reference_mla_v2(
+                    *inputs, use_tpu_pallas=True, **common_kw
+                )
+
+                valid_kv_tpu = extract_valid_kv_tokens(
+                    kv_tpu_np, lens, page_size, inputs[8], inputs[6], jnp.bfloat16
+                )
+                valid_kv_ref = extract_valid_kv_tokens(
+                    kv_ref, lens, page_size, inputs[8], inputs[6], jnp.bfloat16
+                )
+
+                max_diff_out = float(
+                    np.max(np.abs(out_tpu_np.astype(np.float32) - out_ref.astype(np.float32)))
+                )
+                max_diff_kv = float(
+                    np.max(
+                        np.abs(valid_kv_tpu.astype(np.float32) - valid_kv_ref.astype(np.float32))
+                    )
+                )
+                self.assertEqual(
+                    max_diff_out, 0.0, f"{name}: TPU output max_abs_diff={max_diff_out}"
+                )
+                self.assertEqual(
+                    max_diff_kv,
+                    0.0,
+                    f"{name}: TPU updated_cache_kv max_abs_diff={max_diff_kv}",
+                )
+                np.testing.assert_array_equal(out_tpu_np, out_ref)
+                np.testing.assert_array_equal(valid_kv_tpu, valid_kv_ref)
 
     def test_prepare_q_inputs_optimization_barrier_for_all_head_counts(self):
         """Whenever ``head_dim != actual_head_dim`` (e.g. ``q_pe`` with dim 64 -> 128),
