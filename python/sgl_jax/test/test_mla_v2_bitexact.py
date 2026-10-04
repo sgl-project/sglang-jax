@@ -1001,15 +1001,41 @@ class TestMLAV2BitExactParity(unittest.TestCase):
 
     TPU_PARITY_CASES = [
         ("decode_tpu_compiled", [(1, 127), (1, 128), (1, 95), (1, 128)], 128, 16, 2, {}),
+        (
+            "decode_multi_bkv_tail_tpu_compiled",
+            [(1, 512), (1, 495), (1, 380), (1, 512), (1, 410)],
+            128,
+            16,
+            2,
+            {},
+        ),
+        ("decode_2heads_tpu_compiled", [(1, 127), (1, 256)], 128, 2, 2, {}),
         ("prefill_tpu_compiled", [(8, 128), (5, 119)], 128, 16, 1, {}),
         ("prefill_multi_bkv_tpu_compiled", [(8, 240)], 128, 16, 1, {}),
+        ("prefill_multi_bq_bkv_tpu_compiled", [(24, 512), (16, 490)], 128, 16, 1, {}),
         (
             "prefill_qkv_scales_tpu_compiled",
-            [(8, 128), (7, 115)],
+            [(16, 256), (12, 235)],
             128,
             16,
             1,
             {"q_scale": 0.125, "k_scale": 0.25, "v_scale": 0.5},
+        ),
+        (
+            "prefill_sliding_window_tpu_compiled",
+            [(16, 360), (12, 300)],
+            128,
+            16,
+            1,
+            {"sliding_window": 192},
+        ),
+        (
+            "prefill_soft_cap_tpu_compiled",
+            [(16, 256), (12, 220)],
+            128,
+            16,
+            1,
+            {"soft_cap": 30.0},
         ),
     ]
 
