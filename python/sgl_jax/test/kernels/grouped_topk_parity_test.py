@@ -1,13 +1,15 @@
 """Bit-exact parity test: live grouped-topk kernel == frozen main kernel == sort-based reference.
 
-PR #1758 restructures `_grouped_topk_kernel` (bias add fused before the transpose when every group
-is retained; two-phase final select) and claims bit-exact parity with main. This test pins that
-claim instead of asserting it: the live kernel is compared against `grouped_topk_main_ref.py`
-(a verbatim copy of main's kernel at c136c733) and against the `lax.top_k` reference, over the
-(E, G, Gtop, k) grid used in production plus adversarial inputs -- exact ties (flat, pairwise,
-whole-group, dyadic grids, post-bias-only ties), +/-inf scores and biases, NaN, signed zeros,
-subnormals, bf16-exact values -- for both select modes (f32 and packed bf16-key) and multi-block
-grids.
+PR #1758 adds an all-groups fast path to `_grouped_topk_kernel` (when every group is retained the
+correction bias is added in the native [BT, E] layout before the transpose, and the group
+selection is skipped) and claims bit-exact parity with main. This test pins that claim instead of
+asserting it: the live kernel is compared against `grouped_topk_main_ref.py` (a verbatim copy of
+main's kernel at c136c733) and against the `lax.top_k` reference, over the (E, G, Gtop, k) grid
+used in production plus adversarial inputs -- exact ties (flat, pairwise, whole-group, dyadic
+grids, post-bias-only ties), +/-inf scores and biases, NaN, signed zeros, subnormals, bf16-exact
+values -- for both select modes (f32 and packed bf16-key) and multi-block grids. It also checks
+that configurations outside the routing contract (e.g. `topk_group > num_expert_group`, for which
+main silently produced input-dependent ids) are rejected at the entry point.
 
 Checks per case:
   PARITY  ids identical AND weights bit-identical (uint32 view, so -0.0/+0.0 and NaN payloads
@@ -297,3 +299,80 @@ def test_nan_and_inf_parity_on_tpu(E, G, Gtop, k, name, pattern, packed):
     w_main, ids_main = _run("main", logits, bias, E=E, G=G, Gtop=Gtop, k=k, packed=packed)
     _assert_parity(w_live, ids_live, w_main, ids_main, f"{name}/{pattern}/packed={packed}")
     assert ids_live.min() >= 0 and ids_live.max() <= E, f"{name}/{pattern}: id out of [0, E]"
+
+
+# ---------------------------------------------------------------------------------------------
+# Contract: configurations the routing does not define are rejected at the entry point, before
+# anything is traced. main computed something for these (e.g. `topk_group > num_expert_group`
+# looped `topk_group` times over `num_expert_group` groups and produced input-dependent ids).
+# ---------------------------------------------------------------------------------------------
+INVALID_CONFIGS = [
+    # (E, G, Gtop, k, packed, error-message fragment)
+    (128, 4, 5, 8, False, "topk_group"),  # more groups selected than exist
+    (128, 4, 5, 8, True, "topk_group"),
+    (128, 4, 0, 8, False, "topk_group"),
+    (128, 0, 1, 8, False, "num_expert_group"),
+    (130, 4, 2, 8, False, "divisible"),  # E % G != 0
+    (128, 4, 2, 0, False, "topk"),
+    (128, 4, 1, 33, False, "topk"),  # more picks than the one retained group holds (32)
+    (128, 4, 4, 129, True, "topk"),  # more picks than experts
+]
+
+# Boundaries of the contract that must still be accepted (and stay bit-exact with main / REF).
+BOUNDARY_CONFIGS = [
+    (128, 4, 1, 32, "one_group_all_its_experts"),  # topk == topk_group * S
+    (128, 4, 4, 128, "all_groups_all_experts"),  # topk == E
+    (64, 1, 1, 64, "single_group_all_experts"),
+]
+
+
+@pytest.mark.parametrize("E,G,Gtop,k,packed,match", INVALID_CONFIGS)
+def test_rejects_out_of_contract_config(E, G, Gtop, k, packed, match):
+    logits, bias = _cast(jnp.zeros((BS, E), jnp.float32), jnp.zeros((E,), jnp.float32), packed)
+    with pytest.raises(ValueError, match=match):
+        grouped_topk_pallas(
+            logits,
+            bias,
+            num_expert_group=G,
+            topk_group=Gtop,
+            topk=k,
+            interpret=_INTERPRET,
+            packed=packed,
+        )
+
+
+def test_rejects_mismatched_shapes():
+    E, G, Gtop, k, _ = CONFIGS[0]
+    kw = dict(num_expert_group=G, topk_group=Gtop, topk=k, interpret=_INTERPRET)
+    with pytest.raises(ValueError, match="correction_bias"):
+        grouped_topk_pallas(jnp.zeros((BS, E)), jnp.zeros((E + 1,)), **kw)
+    with pytest.raises(ValueError, match="router_logits"):
+        grouped_topk_pallas(jnp.zeros((2, BS, E)), jnp.zeros((E,)), **kw)
+
+
+def test_rejects_packed_with_more_than_65536_experts():
+    E = (1 << 16) + 128
+    with pytest.raises(ValueError, match="packed"):
+        grouped_topk_pallas(
+            jnp.zeros((128, E), jnp.bfloat16),
+            jnp.zeros((E,), jnp.bfloat16),
+            num_expert_group=1,
+            topk_group=1,
+            topk=8,
+            interpret=_INTERPRET,
+            packed=True,
+        )
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["f32", "packed"])
+@pytest.mark.parametrize("E,G,Gtop,k,name", BOUNDARY_CONFIGS)
+def test_contract_boundaries_accepted_and_exact(E, G, Gtop, k, name, packed):
+    logits, bias = _cast(*_inputs("dyadic_1/64_ties", BS, E, G), packed)
+    w_live, ids_live = _run("live", logits, bias, E=E, G=G, Gtop=Gtop, k=k, packed=packed)
+    w_main, ids_main = _run("main", logits, bias, E=E, G=G, Gtop=Gtop, k=k, packed=packed)
+    _assert_parity(w_live, ids_live, w_main, ids_main, f"{name}/packed={packed}")
+    if packed and not _ON_TPU:
+        return  # packed vs REF needs the real Mosaic kernel (see module docstring)
+    ref = ref_biased_grouped_topk_bf16 if packed else ref_biased_grouped_topk
+    w_ref, ids_ref = ref(logits, bias, num_expert_group=G, topk_group=Gtop, topk=k)
+    _assert_ref(w_live, ids_live, np.asarray(w_ref), np.asarray(ids_ref), name)
