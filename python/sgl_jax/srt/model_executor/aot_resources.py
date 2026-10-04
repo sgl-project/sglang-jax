@@ -102,7 +102,12 @@ class AbstractResources(ModelRunnerKVCacheMixin):
         return ModelRunner.adjust_layer_num(self)
 
     def create_pools(self, options):
-        pool = self._create_token_to_kv_pool(options.dp_size, abstract=True)
+        # Request-indexed buffers take serving's request limit when server args
+        # resolved one, else the batch, as the recurrent pool below does.
+        max_num_reqs = getattr(self, "max_num_reqs", None) or options.batch_size
+        pool = self._create_token_to_kv_pool(
+            options.dp_size, abstract=True, max_num_reqs=max_num_reqs
+        )
         recurrent_pool = None
         if self.linear_recurrent_config is not None:
             params = _linear_state_params_from_config(self.linear_recurrent_config)
