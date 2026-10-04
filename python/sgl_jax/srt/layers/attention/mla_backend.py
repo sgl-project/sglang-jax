@@ -28,7 +28,7 @@ from jax.tree_util import register_pytree_node_class
 from sgl_jax.srt.kernels.mla.v2.kernel import cdiv, mla_ragged_paged_attention
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
-from sgl_jax.srt.utils.jax_utils import device_array
+from sgl_jax.srt.utils.jax_utils import device_array, packed_device_array
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
 if TYPE_CHECKING:
@@ -201,12 +201,14 @@ class MLAAttentionBackend(AttentionBackend):
         (
             metadata.cu_q_lens,
             metadata.cu_kv_lens,
-            metadata.page_indices,
             metadata.seq_lens,
             metadata.distribution,
-        ) = device_array(
-            (cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
+        ) = packed_device_array(
+            (cu_q_lens, cu_kv_lens, seq_lens, distribution),
             sharding=(NamedSharding(self.mesh, P(self.attention_data_partition_axis))),
+        )
+        metadata.page_indices = device_array(
+            page_indices, sharding=NamedSharding(self.mesh, P(self.attention_data_partition_axis))
         )
         return metadata
 
