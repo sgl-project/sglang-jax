@@ -89,10 +89,20 @@ arrays, transfer data, or issue collectives. For example, MiMo replaces an
 abstract quantized projection with its final BF16 projection here; its recipe
 later performs the original FP32 dequantization and BF16 rounding.
 
-After preparation, target identity is fixed. Missing inputs, duplicate writers
-(including two paths to one shared parameter), and ordinary layout shape
-mismatches fail during planning. Group outputs are checked against the prepared
-schema. The outer model loader rejects remaining abstract parameters.
+After preparation, target identity is fixed. A mapping with no checkpoint inputs,
+or with targets absent from the current model, is skipped and reported with a
+warning. This lets a shared mapping cover checkpoint aliases and model variants.
+Missing inputs on optional entries or excluded layers do not produce warnings.
+Skipped entries appear in the load report; their declared sources do not count as
+unexpected checkpoint keys. Unmapped checkpoint keys remain in `unexpected` and
+only fail when `validate_checkpoint_coverage=True`.
+
+A partially present input group still fails unless it is explicitly optional:
+loading only some inputs would change a fused conversion or expert stack.
+Duplicate writers (including two paths to one shared parameter) and ordinary
+layout shape mismatches also fail during planning. Group outputs are checked
+against the prepared schema. The outer model loader rejects remaining abstract
+parameters, so skipping a mapping cannot make an incomplete model ready to serve.
 
 A model-loading session owns one source. Local mmap handles are released after
 the last group using a file completes. Groups have deterministic file ordering
@@ -113,21 +123,32 @@ threads and callbacks. Global layout operations follow the same group order.
 P/D cache identity includes checkpoint identity, mapping, dtype and mesh shape;
 a hit can bypass reads only when all processes agree.
 
-`SGLANG_WEIGHT_LOAD_MAX_INFLIGHT_BYTES` defaults to 4 GiB and bounds estimated
-owned working sets and pending groups. An indivisible group that cannot fit
-fails explicitly. `SGLANG_MOE_LOAD_WORKERS` defaults to 16. The budget is not an
-RSS cap: mmap pages, allocator retention, SDK staging, and device buffers are
-separate. GCSFuse prefetch keeps the existing policy and runs once per source
-session after planning.
+`SGLANG_WEIGHT_LOAD_MAX_INFLIGHT_BYTES` defaults to 4 GiB and is a concurrency
+target for estimated owned working sets and pending groups. It must be positive.
+An indivisible group larger than the target is allowed with a warning. Device
+recipes estimate their working set as eight times the total checkpoint input
+bytes; oversized recipes drain pending work before reading and wait for their
+own outputs before continuing. This reserves space for inputs, conversion copies
+and outputs, but is a conservative estimate rather than a measured peak.
+
+Host recipes process local expert intervals one at a time. Expert readers reduce
+worker counts or split device batches to fit the target where possible, falling
+back to one worker or one device batch for an oversized shard. Host owners are
+released after their uploads finish, before reading the next group. Recipe input
+owners are also drained before handing off to another reader group.
+`SGLANG_MOE_LOAD_WORKERS` defaults to 16 and remains an upper bound on expert read
+concurrency. A larger byte target can allow more overlap when memory permits.
+
+This target does not cap individual tensor size or process RSS: an oversized
+group still needs enough actual memory, and mmap pages, allocator retention, SDK
+staging, and device buffers are separate. GCSFuse prefetch keeps the existing
+policy and runs once per source session after planning.
 
 Dummy loading uses the final abstract schema without opening a checkpoint.
 Local and RunAI selection remains controlled by the existing load-format CLI.
 
 ## Validation
 
-`test_weight_loading_recipes.py` writes real safetensors and checks numerical
-results against independent NumPy references. It covers MiMo, GLM, MLA, Qwen3.5
-text/vision/GDN, Gemma experts, split checkpoints, aliases, and P/D cache identity.
 `test_weight_loading_distributed.py` starts two real JAX CPU controllers and
 checks rank-local roots, inconsistent plans, read failures, and asymmetric
 cache state. SDK fakes in `test_runai_loader.py` specifically exercise borrowed

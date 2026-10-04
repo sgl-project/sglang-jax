@@ -768,36 +768,12 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module, InModelMultimodalContract):
             ),
         }
 
-        if getattr(self.text_config, "attention_bias", True):
-            mappings.update(
-                {
-                    f"{prefix}.self_attn.q_proj.bias": WeightSpec(
-                        target_path=f"{target_prefix}.self_attn.q_proj.bias",
-                        sharding=(None,),
-                        transpose=False,
-                        head_dim_padding=True,
-                        kv_head_padding=False,
-                    ),
-                    f"{prefix}.self_attn.k_proj.bias": WeightSpec(
-                        target_path=f"{target_prefix}.self_attn.k_proj.bias",
-                        sharding=(None,),
-                        transpose=False,
-                        head_dim_padding=True,
-                        kv_head_padding=True,
-                    ),
-                    f"{prefix}.self_attn.v_proj.bias": WeightSpec(
-                        target_path=f"{target_prefix}.self_attn.v_proj.bias",
-                        sharding=(None,),
-                        transpose=False,
-                        head_dim_padding=True,
-                        kv_head_padding=True,
-                    ),
-                    f"{prefix}.self_attn.o_proj.bias": WeightSpec(
-                        target_path=f"{target_prefix}.self_attn.o_proj.bias",
-                        sharding=(None,),
-                        transpose=False,
-                    ),
-                }
+        for proj in ("q_proj", "k_proj", "v_proj"):
+            mappings[f"{prefix}.self_attn.{proj}.bias"] = WeightSpec(
+                target_path=f"{target_prefix}.self_attn.{proj}.bias",
+                sharding=(None,),
+                head_dim_padding=True,
+                kv_head_padding=proj in ("k_proj", "v_proj"),
             )
 
         return mappings
