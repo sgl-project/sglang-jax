@@ -16,6 +16,7 @@ from sgl_jax.srt.hardware_backend.tt.attention.gdn_backend import (
 from sgl_jax.srt.hardware_backend.tt.attention.tt_backend import TTAttention
 from sgl_jax.srt.kernels.gdn.gated_delta import (
     _gated_delta_step,
+    _l2norm,
     _scatter_idx0_safe,
     jax_causal_conv1d_update,
 )
@@ -66,7 +67,15 @@ def test_weight_precision_policy(monkeypatch):
     assert "experimental_weight_dtype" not in backend.compiler_options
 
 
+def _repeat_heads(q, k, v):
+    # Like the TT kernels, each q/k head serves its group of value heads.
+    group = v.shape[-2] // q.shape[-2]
+    return jnp.repeat(q, group, axis=-2), jnp.repeat(k, group, axis=-2)
+
+
 def reference_chunk(q, k, v, gate, beta, state):
+    q, k = _repeat_heads(q, k, v)
+
     def step(state, inputs):
         return _gated_delta_step(state, *inputs)
 
@@ -74,7 +83,16 @@ def reference_chunk(q, k, v, gate, beta, state):
     return state, out.swapaxes(0, 1)
 
 
-def reference_decode(state, q, k, v, b, a, A_log, dt_bias, indices, initial):
+def reference_decode(state, qkv, b, a, A_log, dt_bias, indices, initial):
+    # Like the TT kernel: q, k and v are heads of the flat convolution output,
+    # which the kernel widens to FP32 before it normalizes q and k and scales q.
+    dim = state.shape[-2]
+    heads = qkv.astype(jnp.float32).reshape(qkv.shape[0], -1, dim)
+    count = (heads.shape[1] - b.shape[-1]) // 2
+    q = _l2norm(heads[:, :count]) * dim**-0.5
+    k = _l2norm(heads[:, count : 2 * count])
+    v = heads[:, 2 * count :]
+    q, k = _repeat_heads(q, k, v)
     active = jnp.where(initial[:, None, None, None], state[indices], 0)
     gate = -jnp.exp(A_log.astype(jnp.float32)) * jax.nn.softplus(
         a.astype(jnp.float32) + dt_bias.astype(jnp.float32)
@@ -258,7 +276,7 @@ def test_device_state_handoff(tt_device, trace, heads, batch):
         return jax.jit(
             forward,
             donate_argnums=(2, 3),
-            compiler_options={"optimization_level": "1", "enable_trace": str(trace).lower()},
+            compiler_options={"optimization_level": "O1", "enable_trace": str(trace).lower()},
         )
 
     compiled = {decode: compile_forward(decode) for decode in (False, True)}
