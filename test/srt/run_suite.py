@@ -407,6 +407,11 @@ suites = {
         TestFile("test/srt/test_dtype_config_consistency.py", 10),
         TestFile("python/sgl_jax/test/test_compilation_manager.py", 1),
         TestFile("python/sgl_jax/test/test_kernel_utils.py", 1),
+        TestFile(
+            "python/sgl_jax/test/test_mla_v2_bitexact.py",
+            0.4,
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
         TestFile("python/sgl_jax/test/speculative/test_dflash_info.py", 0.2, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/speculative/test_dflash_server_args.py",
