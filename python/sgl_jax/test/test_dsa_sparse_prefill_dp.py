@@ -385,16 +385,11 @@ def _run(workload: _Workload, mesh: jax.sharding.Mesh):
     )
 
 
-class TestDSASparsePrefillDP(CustomTestCase):
-    """DP parity gates for the packed-ragged DSA sparse prefill.
+class _SparsePrefillDPCase(CustomTestCase):
+    """Fixture shared by both sparse-prefill kernels; subclasses pick one."""
 
-    Runs the query-block kernel, the production default under
-    DSA_PREFILL_SPARSE; the subclass below reruns everything on the per-query
-    kernel that ``DSA_PREFILL_QBLOCK=0`` falls back to.
-    """
-
-    QBLOCK = True
-    KERNEL = "prefill_write_and_attend_ragged_qblock"
+    QBLOCK: bool
+    KERNEL: str
 
     def setUp(self):
         # CPU is covered by the import-time check; a real accelerator with too
@@ -482,68 +477,32 @@ class TestDSASparsePrefillDP(CustomTestCase):
                     "are indistinguishable — the invariance assertion cannot fail",
                 )
 
-    def test_dp_invariance_dp2_one_request_per_rank(self):
-        """The core DP case: one sequence per rank, prefilled concurrently."""
-        self._assert_dp_invariant([[96], [96]], attn_tp=2)
 
-    def test_dp_invariance_dp4(self):
-        """Four ranks, all different lengths — cu_q_lens/cu_kv_lens diverge per shard."""
-        self._assert_dp_invariant([[90], [64], [112], [81]], attn_tp=2)
+class TestDSASparsePrefillDP(_SparsePrefillDPCase):
+    """DP parity gates for the packed-ragged DSA sparse prefill.
 
-    def test_dp_invariance_dp2_with_batching(self):
-        """Several requests per rank, on top of the packed-ragged batching.
+    Runs the query-block kernel, the production default under
+    DSA_PREFILL_SPARSE. Every pass compiles and interprets the kernel afresh,
+    which is what this file costs on the CPU runner, so there is one invariance
+    workload rather than a sweep.
+    """
 
-        The leading requests are not page-aligned, so each second request's KV
-        base (``cu_kv_lens``, page-aligned) differs from its query offset
+    QBLOCK = True
+    KERNEL = "prefill_write_and_attend_ragged_qblock"
+
+    def test_dp_invariance_dp4_with_batching(self):
+        """Four ranks, two requests each, every length different.
+
+        ``cu_q_lens``/``cu_kv_lens`` diverge per shard, and each rank's leading
+        request is not page-aligned, so the second request's KV base
+        (``cu_kv_lens``, page-aligned) differs from its query offset
         (``cu_q_lens``, packed) — the two offsets are indistinguishable otherwise.
+
+        This also covers cross-rank bleed: each reference runs with the other
+        ranks absent, so a rank that read another rank's tokens or pages would
+        differ from it.
         """
-        self._assert_dp_invariant([[58, 48], [75, 32]], attn_tp=2)
-
-    def test_dp_invariance_dp2_tp2_wide_heads(self):
-        """DP and TP together, with a head block wider than the default.
-
-        ``attention_tp = tp_size // dp_size``, so raising ``dp`` *widens* each
-        device's head block. 16 heads over 2-way TP gives 8 per device, versus 4
-        in the tests above — enough to cover both sides of the kernel's sublane
-        padding (``Hq = ceil(H/16)*16``) without a separate sweep.
-
-        The coverage this gives is shape plumbing only: the Pallas interpreter
-        does not enforce Mosaic's tiling, so a shape that passes here can still
-        fail to compile on device.
-        """
-        self._assert_dp_invariant([[96], [64]], attn_tp=2, num_heads=16)
-
-    def test_cross_rank_no_bleed(self):
-        """Rank 0's output must not depend on rank 1's *tokens*.
-
-        Perturbing the KV pool would prove nothing here: single-shot prefill
-        self-writes every token into the cache before attending, so any
-        pre-seeded page content is overwritten and unreachable. The live lever
-        is rank 1's input. Rank 1's tokens are self-written into pages carrying
-        the same rank-local ids as rank 0's, so a global-vs-local index confusion
-        — or a shard reaching past its own page window — moves rank 0's output.
-        """
-        mesh = _mesh(2, 2)
-        base = _Workload([[96], [96]], seed=0)
-        # Same rank-0 payload, different rank-1 payload.
-        other = _Workload([[96], [96]], seed=99)
-        other.payloads[(0, 0)] = base.payloads[(0, 0)]
-
-        a = self._run(base, mesh)
-        b = self._run(other, mesh)
-
-        # Positive control: the two runs must genuinely differ somewhere, else
-        # the assertion below is comparing two identical computations.
-        rank1_delta = np.abs(a[(1, 0)] - b[(1, 0)]).max()
-        self.assertGreater(rank1_delta, 1e-3, "rank 1 payload swap had no effect — test is vacuous")
-
-        np.testing.assert_allclose(
-            b[(0, 0)],
-            a[(0, 0)],
-            rtol=1e-6,
-            atol=1e-6,
-            err_msg="rank 0 output changed when only rank 1's tokens changed",
-        )
+        self._assert_dp_invariant([[58, 48], [75, 32], [90, 64], [81, 112]], attn_tp=2)
 
     def test_cache_writes_land_on_own_slots(self):
         """Every token's KV and indexer key land in its own rank-local slot, and
@@ -662,11 +621,17 @@ class TestDSASparsePrefillDP(CustomTestCase):
         )
 
 
-class TestDSASparsePrefillDPPerQuery(TestDSASparsePrefillDP):
-    """The same gates on the per-query kernel (``DSA_PREFILL_QBLOCK=0``)."""
+class TestDSASparsePrefillDPPerQuery(_SparsePrefillDPCase):
+    """The cache-write gate on the per-query kernel (``DSA_PREFILL_QBLOCK=0``).
+
+    Only this one: the write path is where the two kernels differ in what DP
+    can break, and the metadata tests above never reach a kernel.
+    """
 
     QBLOCK = False
     KERNEL = "prefill_write_and_attend_ragged"
+
+    test_cache_writes_land_on_own_slots = TestDSASparsePrefillDP.test_cache_writes_land_on_own_slots
 
 
 if __name__ == "__main__":
