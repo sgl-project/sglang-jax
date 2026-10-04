@@ -379,11 +379,10 @@ def _mla_ragged_paged_attention_kernel(
             return jnp.where(bkv_idx == 0, jnp.full_like(ref, init_val), ref[...])
 
         # Follow FlashAttention-2 forward pass.
-        s = jnp.einsum(
-            "bnd,bmd->bnm", ql_nope, kv_c, preferred_element_type=jnp.float32
-        ) + jnp.einsum("bnd,bmd->bnm", q_pe, k_pe, preferred_element_type=jnp.float32)
-        log2_e = 1.4426950408889634 if soft_cap is None else 1.0
-        s *= sm_scale * log2_e
+        q = jnp.concatenate([ql_nope, q_pe], axis=-1)
+        k = jnp.concatenate([kv_c, k_pe], axis=-1)
+        s = jnp.einsum("bnd,bmd->bnm", q, k, preferred_element_type=jnp.float32)
+        s *= sm_scale
         if k_scale is not None:
             s *= k_scale
         if q_scale is not None:
@@ -412,24 +411,19 @@ def _mla_ragged_paged_attention_kernel(
 
         if soft_cap is not None:
             s = soft_cap * jnp.tanh(s / soft_cap)
-        scaled_mask_value = (
-            mask_value * log2_e if (soft_cap is None and mask_value > -1e30) else mask_value
-        )
-        s = jnp.where(mask, scaled_mask_value, s)
+        s = jnp.where(mask, mask_value, s)
         s_rowmax = jnp.max(s, axis=2, keepdims=True)
         m_prev = load_with_init(head_m_ref, -jnp.inf)
         m_curr = jnp.maximum(m_prev, s_rowmax)
         head_m_ref[...] = m_curr
-        exp_fn = lax.exp2 if soft_cap is None else jnp.exp
-        p = exp_fn(s - broadcast_minor(m_curr, s.shape))
-        p_rowsum = jnp.sum(p, axis=2, keepdims=True)
-        if q_dtype == jnp.bfloat16 and kv_dtype == jnp.bfloat16:
-            p = p.astype(jnp.bfloat16)
+        p = jnp.exp(s - broadcast_minor(m_curr, s.shape))
 
         pv = jnp.einsum("bnm,bmd->bnd", p, kv_c, preferred_element_type=jnp.float32)
         if v_scale is not None:
             pv *= v_scale
-        exp_m_diff = exp_fn(m_prev - m_curr)
+
+        p_rowsum = jnp.sum(p, axis=2, keepdims=True)
+        exp_m_diff = jnp.exp(m_prev - m_curr)
         l_prev = load_with_init(head_l_ref, 0.0)
         l_curr = exp_m_diff * l_prev + p_rowsum
         head_l_ref[...] = l_curr
@@ -1330,18 +1324,24 @@ def prepare_q_inputs(
             ),
             constant_values=0,
         )
-    q = q.reshape(
-        max_num_tokens,
-        num_q_heads // q_packing,
-        q_packing,
-        head_dim,
-    )
-    # When actual_num_q_heads % q_packing == 0 (e.g. 2 heads on bf16), the
-    # head-axis pad is (0,0) and XLA may fuse pad+reshape into a lazy view
-    # whose physical layout != [mnt, h//p, p, D]. pallas_call then gets a
-    # non-contiguous HBM ref and the DMA BoundsCheck trips. Force a copy.
-    if num_q_heads // q_packing == 1:
+        q = q.reshape(
+            max_num_tokens,
+            num_q_heads // q_packing,
+            q_packing,
+            head_dim,
+        )
+        # When actual_num_q_heads % q_packing == 0 (e.g. 2 heads on bf16), the
+        # head-axis pad is (0,0) and XLA may fuse pad+reshape into a lazy view
+        # whose physical layout != [mnt, h//p, p, D]. pallas_call then gets a
+        # non-contiguous HBM ref and the DMA BoundsCheck trips. Force a copy.
         q = jax.lax.optimization_barrier(q)
+    else:
+        q = q.reshape(
+            max_num_tokens,
+            num_q_heads // q_packing,
+            q_packing,
+            head_dim,
+        )
     return q
 
 
