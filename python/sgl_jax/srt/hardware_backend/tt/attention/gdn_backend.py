@@ -85,8 +85,9 @@ class TTGDNAttnBackend(GDNAttnBackend):
         if batch.forward_mode.is_extend():
             # Prefill packs each live sequence; exclude the scheduler's dummy rows.
             size = batch.real_bs
-            cu_q_lens = meta.cu_q_lens
-            meta.cu_q_lens = cu_q_lens.at[: size + 1].get(out_sharding=cu_q_lens.sharding)
+            # A static slice runs on the mesh; an indexed get would build its
+            # index as a single-device array, a separate program on one device.
+            meta.cu_q_lens = jax.lax.slice_in_dim(meta.cu_q_lens, 0, size + 1)
             # The native kernel needs dense sequences. Bucket the longest one
             # instead of padding every sequence to the entire batch length.
             length = int(batch.extend_seq_lens[:size].max())
