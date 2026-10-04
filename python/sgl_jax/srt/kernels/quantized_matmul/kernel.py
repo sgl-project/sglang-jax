@@ -24,6 +24,7 @@ def xla_quantized_matmul_local(
     activation_quant_dtype: jnp.dtype | None = None,
     allow_narrow_n_blockwise: bool = False,
     output_scatter_dimension: int | None = None,
+    n_out_valid: int | None = None,
 ) -> jax.Array:
     """
     Local quantized matmul for use inside shard_map.
@@ -40,6 +41,10 @@ def xla_quantized_matmul_local(
         reduce_axis: Axis name for psum reduction (e.g., "tensor"). None skips reduction.
         weight_block_size: ``(block_n, block_k)`` for block-wise quantization.
         activation_quant_dtype: Dtype for activation quantization.
+        n_out_valid: Logical number of output features when ``w_q`` / ``w_scale``
+            were pre-padded along the output dim at load time (see
+            ``QuantizedLinear.pad_out_rows``). The tuned-block lookup uses the
+            logical width and the result is sliced back to it.
 
     Returns:
         Output of the quantized matmul.
@@ -89,7 +94,7 @@ def xla_quantized_matmul_local(
         x_q_dtype = act_quant_dtype if quantize_activation else x.dtype
         tuned_value = get_safe_blockwise_tuned_value(
             n_batch=int(x.shape[0]),
-            n_out=int(out_dim),
+            n_out=int(n_out_valid if n_out_valid is not None else out_dim),
             n_in=int(in_dim),
             x_q_dtype=x_q_dtype,
             w_q_dtype=w_q.dtype,
@@ -103,6 +108,8 @@ def xla_quantized_matmul_local(
             x_q_dtype=x_q_dtype,
             tuned_value=tuned_value,
         )
+        if n_out_valid is not None and out.shape[-1] != n_out_valid:
+            out = out[:, :n_out_valid]
 
     else:
         # === Standard Per-Channel Quantization Path ===
@@ -128,6 +135,8 @@ def xla_quantized_matmul_local(
             )
             out = out.astype(compute_dtype) * jnp.expand_dims(w_scale, 0).astype(compute_dtype)
 
+    if n_out_valid is not None and out.shape[-1] != n_out_valid:
+        out = out[:, :n_out_valid]
     out = out.astype(out_dtype)
     # Reduce across the contracted (input) axis. Caller passes
     # ``output_scatter_dimension`` only when it has already decided that a

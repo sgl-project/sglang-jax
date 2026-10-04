@@ -193,7 +193,7 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         # blocks (128 pages split into 43 grid steps). Seed them with the
         # validated 4-head bs1 value (16, 1, 2) pending a proper sweep.
         ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 2): (16, 1, 2),
-        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 4): (16, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 4): (4, 1, 4),
         ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 1): (16, 1, 2),
         ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 2): (16, 1, 2),
         ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 4): (16, 1, 2),
@@ -208,6 +208,13 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 32): (16, 1, 2),
         ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 64): (16, 1, 4),
         ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 128): (16, 1, 4),
+        # Speculative verify in decode form runs bs x num_draft_tokens queries
+        # through the decode kernel (cc64 x 4 = 256, cc128 x 4 = 512). These
+        # buckets had no entry and fell back to the (3, 1) default: attention
+        # was 62 ms of a 168 ms verify step at cc64 on v7x tp16. Seed with the
+        # validated 64/128 value pending a sweep.
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 256): (16, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 512): (16, 1, 4),
         ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 1): (16, 64),
         ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 2): (16, 64),
         ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 4): (16, 64),
