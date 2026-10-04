@@ -232,6 +232,7 @@ class ModelWorker:
                 has_recurrent_state and server_args.enable_recurrent_extra_buffer
             ),
             moe_backend=effective_moe_backend,
+            attn_backend=self.model_runner.attn_backend,
         )
 
         # Allocate the persistent cache_loc host buffer once (reused every step
