@@ -20,7 +20,8 @@ pre-#1733 (``c136c733``) MLA v2 kernel:
    (full Mosaic lowering, MXU ``Q @ K^T`` and ``P @ V`` accumulation, VMEM bitcast
    reshapes, and hardware ``pl.reciprocal(l, approx=True)``) and asserts
    ``max_abs_diff == 0.0`` against the frozen ``c136c733`` Pallas block reference
-   compiled on the same TPU device.
+   compiled on the same TPU device. Both calls use a scoped single-device
+   explicit mesh and the same ``shard_map`` boundary as the production backend.
 """
 
 from __future__ import annotations
@@ -35,6 +36,8 @@ import numpy as np
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+from jax.sharding import AxisType, Mesh
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.mla.v2 import kernel as kmod
 
@@ -461,7 +464,7 @@ def _make_tpu_pallas_flash_attention_block_ref(
             else (acc * pl.reciprocal(l_val, approx=True)).astype(q_dtype)
         )
 
-    return pl.pallas_call(
+    pallas_fn = pl.pallas_call(
         _kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
@@ -479,6 +482,13 @@ def _make_tpu_pallas_flash_attention_block_ref(
             ],
         ),
         out_shape=jax.ShapeDtypeStruct((bsz, q_rows, lkv_dim), q_dtype),
+    )
+    return jax.shard_map(
+        pallas_fn,
+        mesh=jax.sharding.get_mesh(),
+        in_specs=(P(),) * 5,
+        out_specs=P(),
+        check_vma=False,
     )
 
 
@@ -896,6 +906,26 @@ def extract_valid_kv_tokens(cache_arr, lens, page_size, cu_kv_lens, page_indices
     return np.stack(rows, axis=0)
 
 
+def _single_device_mesh():
+    return Mesh(
+        np.asarray(jax.devices()[:1]).reshape(1, 1),
+        ("data", "tensor"),
+        axis_types=(AxisType.Explicit, AxisType.Explicit),
+    )
+
+
+def _make_sharded_v2_kernel(num_inputs, **kwargs):
+    # Match MLAAttentionBackend: Pallas refs must see per-shard avals, not the
+    # enclosing explicit mesh's rank-dependent sharding specs.
+    return jax.shard_map(
+        lambda *args: kmod.mla_ragged_paged_attention(*args, **kwargs),
+        mesh=jax.sharding.get_mesh(),
+        in_specs=(P(),) * num_inputs,
+        out_specs=(P(), P()),
+        check_vma=False,
+    )
+
+
 class TestMLAV2BitExactParity(unittest.TestCase):
     """Bit-exact parity checks (``max_abs_diff == 0``) for ``output``, ``l``,
     ``acc``, and ``updated_cache_kv`` against the pre-#1733 v2 kernel."""
@@ -983,17 +1013,10 @@ class TestMLAV2BitExactParity(unittest.TestCase):
         ),
     ]
 
-    @unittest.skipIf(
-        jax.default_backend() != "tpu",
-        "Requires TPU backend for unpatched Mosaic/MXU compilation and execution.",
-    )
-    def test_v2_kernel_tpu_compiled_bitexact_parity(self):
-        """Runs ``kmod.mla_ragged_paged_attention`` completely unpatched on TPU
-        (executing full Mosaic lowering, MXU ``Q @ K^T`` / ``P @ V``, and
-        ``pl.reciprocal(l, approx=True)``) and verifies ``max_abs_diff == 0.0``
-        against the frozen ``c136c733`` Pallas block reference."""
+    def test_v2_kernel_traces_under_explicit_mesh(self):
+        """Exercise the compiled test's call boundary without requiring a TPU."""
         for name, lens, page_size, num_heads, dbs, extra_kw in self.TPU_PARITY_CASES:
-            with self.subTest(case=name):
+            with self.subTest(case=name), jax.sharding.set_mesh(_single_device_mesh()):
                 inputs = make_mla_v2_parity_inputs(
                     lens, page_size=page_size, num_heads=num_heads, dtype=jnp.bfloat16, seed=42
                 )
@@ -1004,13 +1027,39 @@ class TestMLAV2BitExactParity(unittest.TestCase):
                     decode_batch_size=dbs,
                     **extra_kw,
                 )
-                out_tpu, kv_tpu = kmod.mla_ragged_paged_attention(*inputs, **common_kw)
-                out_tpu_np = np.asarray(out_tpu)
-                kv_tpu_np = np.asarray(kv_tpu)
+                run = _make_sharded_v2_kernel(len(inputs), **common_kw)
+                jax.jit(run).trace(*inputs)
 
+    @unittest.skipIf(
+        jax.default_backend() != "tpu",
+        "Requires TPU backend for unpatched Mosaic/MXU compilation and execution.",
+    )
+    def test_v2_kernel_tpu_compiled_bitexact_parity(self):
+        """Runs ``kmod.mla_ragged_paged_attention`` completely unpatched on TPU
+        (executing full Mosaic lowering, MXU ``Q @ K^T`` / ``P @ V``, and
+        ``pl.reciprocal(l, approx=True)``) and verifies ``max_abs_diff == 0.0``
+        against the frozen ``c136c733`` Pallas block reference."""
+        for name, lens, page_size, num_heads, dbs, extra_kw in self.TPU_PARITY_CASES:
+            with self.subTest(case=name), jax.sharding.set_mesh(_single_device_mesh()):
+                inputs = make_mla_v2_parity_inputs(
+                    lens, page_size=page_size, num_heads=num_heads, dtype=jnp.bfloat16, seed=42
+                )
+                common_kw = dict(
+                    sm_scale=(512 + 64) ** -0.5,
+                    num_kv_pages_per_block=(1, 1, 1),
+                    num_queries_per_block=(1, 1, 8),
+                    decode_batch_size=dbs,
+                    **extra_kw,
+                )
+                # Read the original cache before invoking the donating kernel.
                 out_ref, kv_ref, _, _ = pre1733_reference_mla_v2(
                     *inputs, use_tpu_pallas=True, **common_kw
                 )
+
+                run = _make_sharded_v2_kernel(len(inputs), **common_kw)
+                out_tpu, kv_tpu = run(*inputs)
+                out_tpu_np = np.asarray(out_tpu)
+                kv_tpu_np = np.asarray(kv_tpu)
 
                 valid_kv_tpu = extract_valid_kv_tokens(
                     kv_tpu_np, lens, page_size, inputs[8], inputs[6], jnp.bfloat16
