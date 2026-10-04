@@ -55,7 +55,21 @@ def floor_div_on_kv_packing(a, kv_packing):
 
 def cdiv(a, b):
     assert b != 0
+    if isinstance(b, int) and b > 0 and (b & (b - 1)) == 0:
+        return (a + b - 1) >> (b.bit_length() - 1)
     return (a + b - 1) // b
+
+
+def floor_div_pow2(a, b):
+    if isinstance(b, int) and b > 0 and (b & (b - 1)) == 0:
+        return a >> (b.bit_length() - 1)
+    return a // b
+
+
+def mod_pow2(a, b):
+    if isinstance(b, int) and b > 0 and (b & (b - 1)) == 0:
+        return a & (b - 1)
+    return a % b
 
 
 def align_to(x, a):
@@ -365,16 +379,22 @@ def _mla_ragged_paged_attention_kernel(
             return jnp.where(bkv_idx == 0, jnp.full_like(ref, init_val), ref[...])
 
         # Follow FlashAttention-2 forward pass.
-        q = jnp.concatenate([ql_nope, q_pe], axis=-1)
-        k = jnp.concatenate([kv_c, k_pe], axis=-1)
-        s = jnp.einsum("bnd,bmd->bnm", q, k, preferred_element_type=jnp.float32)
-        s *= sm_scale
+        s = jnp.einsum(
+            "bnd,bmd->bnm", ql_nope, kv_c, preferred_element_type=jnp.float32
+        ) + jnp.einsum("bnd,bmd->bnm", q_pe, k_pe, preferred_element_type=jnp.float32)
+        log2_e = 1.4426950408889634 if soft_cap is None else 1.0
+        s *= sm_scale * log2_e
         if k_scale is not None:
             s *= k_scale
         if q_scale is not None:
             s *= q_scale
 
         k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(jnp.int32, s.shape[1:], 1)
+        q_row_offset = (
+            0
+            if s.shape[1] == num_q_heads
+            else floor_div_pow2(lax.broadcasted_iota(jnp.int32, s.shape[1:], 0), num_q_heads)
+        )
 
         mask_list = []
         for b in range(batch_size):
@@ -383,12 +403,7 @@ def _mla_ragged_paged_attention_kernel(
             q_end = cu_q_lens_ref[seq_idx + 1]
             q_len = q_end - q_start
             kv_len = kv_lens_ref[seq_idx]
-            q_span = (
-                kv_len
-                - q_len
-                + bq_idx * bq_sz
-                + lax.broadcasted_iota(jnp.int32, s.shape[1:], 0) // num_q_heads
-            )
+            q_span = kv_len - q_len + bq_idx * bq_sz + q_row_offset
             mask = q_span < k_span
             if sliding_window is not None:
                 mask = jnp.logical_or(mask, q_span - sliding_window >= k_span)
@@ -397,19 +412,24 @@ def _mla_ragged_paged_attention_kernel(
 
         if soft_cap is not None:
             s = soft_cap * jnp.tanh(s / soft_cap)
-        s = jnp.where(mask, mask_value, s)
+        scaled_mask_value = (
+            mask_value * log2_e if (soft_cap is None and mask_value > -1e30) else mask_value
+        )
+        s = jnp.where(mask, scaled_mask_value, s)
         s_rowmax = jnp.max(s, axis=2, keepdims=True)
         m_prev = load_with_init(head_m_ref, -jnp.inf)
         m_curr = jnp.maximum(m_prev, s_rowmax)
         head_m_ref[...] = m_curr
-        p = jnp.exp(s - broadcast_minor(m_curr, s.shape))
+        exp_fn = lax.exp2 if soft_cap is None else jnp.exp
+        p = exp_fn(s - broadcast_minor(m_curr, s.shape))
+        p_rowsum = jnp.sum(p, axis=2, keepdims=True)
+        if q_dtype == jnp.bfloat16 and kv_dtype == jnp.bfloat16:
+            p = p.astype(jnp.bfloat16)
 
         pv = jnp.einsum("bnm,bmd->bnd", p, kv_c, preferred_element_type=jnp.float32)
         if v_scale is not None:
             pv *= v_scale
-
-        p_rowsum = jnp.sum(p, axis=2, keepdims=True)
-        exp_m_diff = jnp.exp(m_prev - m_curr)
+        exp_m_diff = exp_fn(m_prev - m_curr)
         l_prev = load_with_init(head_l_ref, 0.0)
         l_curr = exp_m_diff * l_prev + p_rowsum
         head_l_ref[...] = l_curr
@@ -467,7 +487,7 @@ def _mla_ragged_paged_attention_kernel(
             bkv_sz_frm_new_per_kv_packing = cdiv_on_kv_packing(bkv_sz_frm_new, kv_packing)
             # Ragged page_indices: each seq's pages are tightly concatenated.
             # cu_kv_lens is page-aligned so cdiv == //; cdiv mirrors RPA v3 for parity.
-            start_kv_page_idx = cdiv(cu_kv_lens_ref[seq_idx], page_size)
+            start_kv_page_idx = floor_div_pow2(cu_kv_lens_ref[seq_idx], page_size)
             page_indices_offset = start_kv_page_idx + kv_p_start
 
             new_kv_len_start = q_end - kv_left_frm_new
@@ -655,152 +675,155 @@ def _mla_ragged_paged_attention_kernel(
             new KVs begin for a batch.
           update_szs: A list of the number of new tokens to be packed for a batch.
         """
+        if kv_packing == 1:
+            return
         for b in range(batch_size):
             offset = offsets[b]
             update_sz = update_szs[b]
 
             @pl.when(update_sz > 0)
-            def _update(b=b):
-                # shape: [bkv_sz_per_kv_packing + 2, kv_packing, lkv_dim]
-                bkvc_vmem_ref = bkvc_x2_ref.at[bkv_sem_idx, b]
-                # shape: [bkv_sz_per_kv_packing + 2, kv_packing, r_dim]
-                bkvpe_vmem_ref = bkpe_x2_ref.at[bkv_sem_idx, b]
-
+            def _update(b=b, offset=offset, update_sz=update_sz):
                 seq_idx = batch_start_seq_idx + b
                 q_end = cu_q_lens_ref[seq_idx + 1]
                 kv_len = kv_lens_ref[seq_idx]
 
-                kv_packing_offset = offset % kv_packing
+                kv_packing_offset = mod_pow2(offset, kv_packing)
                 new_kv_len_start = q_end - kv_len + offset
-                new_kv_packing_offset = new_kv_len_start % kv_packing
+                new_kv_packing_offset = mod_pow2(new_kv_len_start, kv_packing)
 
-                # _fetch_bkv appends the new KV words right after the last word holding
-                # cached KV. If both the destination and the source token offsets are
-                # word-aligned (e.g. a prefill without cached prefix), those words are
-                # already in their final position and each merge_loop_body iteration
-                # would store a word back unchanged, so merge no words at all.
-                new_kv_in_place = jnp.logical_and(
-                    kv_packing_offset == 0, new_kv_packing_offset == 0
+                @pl.when(
+                    jnp.logical_or(
+                        kv_packing_offset != 0,
+                        new_kv_packing_offset != 0,
+                    )
                 )
-                update_kv_packing_iters = jnp.where(
-                    new_kv_in_place,
-                    0,
-                    cdiv_on_kv_packing(kv_packing_offset + update_sz, kv_packing),
-                )
+                def _realign():
+                    # shape: [bkv_sz_per_kv_packing + 2, kv_packing, lkv_dim]
+                    bkvc_vmem_ref = bkvc_x2_ref.at[bkv_sem_idx, b]
+                    # shape: [bkv_sz_per_kv_packing + 2, kv_packing, r_dim]
+                    bkvpe_vmem_ref = bkpe_x2_ref.at[bkv_sem_idx, b]
 
-                token_offset_in_bkv = offset % bkv_sz
-                kv_packing_idx = floor_div_on_kv_packing(token_offset_in_bkv, kv_packing)
-
-                # Compute the shift amount for each word in bits
-                shift_amount = kv_packing_offset - new_kv_packing_offset
-                bits_per_element = get_dtype_bitwidth(bkvc_vmem_ref.dtype)
-                shift_bits = bits_per_element * (shift_amount % kv_packing)
-                shift_bits = shift_bits.astype(jnp.uint32)
-
-                # Calculate the starting index in the KV buffer corresponding to the new KV
-                # to fetch the data from. This index accounts for the potential offset
-                # caused by the shift_amount.
-                # (-shift_amount) // kv_packing will be:
-                #   0 if new_kv_packing_offset <= kv_packing_offset
-                #  -1 if new_kv_packing_offset > kv_packing_offset.
-                kv_packing_idx_new = cdiv_on_kv_packing(
-                    token_offset_in_bkv, kv_packing
-                ) + floor_div_on_kv_packing(-shift_amount, kv_packing)
-                curr_kvc_reg = bkvc_vmem_ref[kv_packing_idx_new, :, :]
-                curr_kpe_reg = bkvpe_vmem_ref[kv_packing_idx_new, :, :]
-                next_kvc_reg = bkvc_vmem_ref[kv_packing_idx_new + 1, :, :]
-                next_kpe_reg = bkvpe_vmem_ref[kv_packing_idx_new + 1, :, :]
-
-                def merge_loop_body(i, vals):
-                    (
-                        kv_packing_idx,
-                        kv_packing_idx_new,
-                        curr_kvc_reg,
-                        curr_kpe_reg,
-                        next_kvc_reg,
-                        next_kpe_reg,
-                    ) = vals
-                    curr_kvc_reg_u32 = pltpu.bitcast(curr_kvc_reg, jnp.uint32)
-                    curr_kpe_reg_u32 = pltpu.bitcast(curr_kpe_reg, jnp.uint32)
-                    next_kvc_reg_u32 = pltpu.bitcast(next_kvc_reg, jnp.uint32)
-                    next_kpe_reg_u32 = pltpu.bitcast(next_kpe_reg, jnp.uint32)
-
-                    shifted_kvc_u32 = lax.bitwise_or(
-                        lax.shift_right_logical(curr_kvc_reg_u32, 32 - shift_bits),
-                        lax.shift_left(next_kvc_reg_u32, shift_bits),
-                    )
-                    shifted_kpe_u32 = lax.bitwise_or(
-                        lax.shift_right_logical(curr_kpe_reg_u32, 32 - shift_bits),
-                        lax.shift_left(next_kpe_reg_u32, shift_bits),
+                    update_kv_packing_iters = cdiv_on_kv_packing(
+                        kv_packing_offset + update_sz, kv_packing
                     )
 
-                    # If shift_bits is 0, we should use the current word. Otherwise,
-                    # shifting by 32 bits would result in shifted_*_u32 becoming
-                    # next_*_reg_u32, which is incorrect.
-                    rotated_kvc_u32 = lax.select(shift_bits == 0, curr_kvc_reg_u32, shifted_kvc_u32)
-                    rotated_kpe_u32 = lax.select(shift_bits == 0, curr_kpe_reg_u32, shifted_kpe_u32)
+                    token_offset_in_bkv = mod_pow2(offset, bkv_sz)
+                    kv_packing_idx = floor_div_on_kv_packing(token_offset_in_bkv, kv_packing)
 
-                    next_kvc_reg_shifted = pltpu.bitcast(rotated_kvc_u32, next_kvc_reg.dtype)
-                    next_kpe_reg_shifted = pltpu.bitcast(rotated_kpe_u32, next_kpe_reg.dtype)
+                    # Compute the shift amount for each word in bits
+                    shift_amount = kv_packing_offset - new_kv_packing_offset
+                    bits_per_element = get_dtype_bitwidth(bkvc_vmem_ref.dtype)
+                    shift_bits = bits_per_element * mod_pow2(shift_amount, kv_packing)
+                    shift_bits = shift_bits.astype(jnp.uint32)
 
-                    offset_in_word = i * kv_packing + lax.broadcasted_iota(
-                        dtype=jnp.int32, shape=[kv_packing, lkv_dim], dimension=0
-                    )
-                    kvc_mask = jnp.logical_and(
-                        offset_in_word >= kv_packing_offset,
-                        offset_in_word < kv_packing_offset + update_sz,
-                    )
-                    updated_kvc_reg = lax.select(
-                        kvc_mask,
-                        next_kvc_reg_shifted,
-                        bkvc_vmem_ref[kv_packing_idx, :, :],
-                    )
-                    offset_in_word_pe = i * kv_packing + lax.broadcasted_iota(
-                        dtype=jnp.int32, shape=[kv_packing, r_dim], dimension=0
-                    )
-                    kpe_mask = jnp.logical_and(
-                        offset_in_word_pe >= kv_packing_offset,
-                        offset_in_word_pe < kv_packing_offset + update_sz,
-                    )
-                    updated_kpe_reg = lax.select(
-                        kpe_mask,
-                        next_kpe_reg_shifted,
-                        bkvpe_vmem_ref[kv_packing_idx, :, :],
-                    )
-
-                    # Store back the merged word
-                    bkvc_vmem_ref[kv_packing_idx, :, :] = updated_kvc_reg
-                    bkvpe_vmem_ref[kv_packing_idx, :, :] = updated_kpe_reg
-
-                    # Move to the next word.
-                    kv_packing_idx += 1
-                    kv_packing_idx_new += 1
-                    curr_kvc_reg = next_kvc_reg
-                    curr_kpe_reg = next_kpe_reg
+                    # Calculate the starting index in the KV buffer corresponding to the new KV
+                    # to fetch the data from. This index accounts for the potential offset
+                    # caused by the shift_amount.
+                    # (-shift_amount) // kv_packing will be:
+                    #   0 if new_kv_packing_offset <= kv_packing_offset
+                    #  -1 if new_kv_packing_offset > kv_packing_offset.
+                    kv_packing_idx_new = cdiv_on_kv_packing(
+                        token_offset_in_bkv, kv_packing
+                    ) + floor_div_on_kv_packing(-shift_amount, kv_packing)
+                    curr_kvc_reg = bkvc_vmem_ref[kv_packing_idx_new, :, :]
+                    curr_kpe_reg = bkvpe_vmem_ref[kv_packing_idx_new, :, :]
                     next_kvc_reg = bkvc_vmem_ref[kv_packing_idx_new + 1, :, :]
                     next_kpe_reg = bkvpe_vmem_ref[kv_packing_idx_new + 1, :, :]
-                    return (
-                        kv_packing_idx,
-                        kv_packing_idx_new,
-                        curr_kvc_reg,
-                        curr_kpe_reg,
-                        next_kvc_reg,
-                        next_kpe_reg,
-                    )
 
-                lax.fori_loop(
-                    0,
-                    update_kv_packing_iters,
-                    merge_loop_body,
-                    (
-                        kv_packing_idx,
-                        kv_packing_idx_new,
-                        curr_kvc_reg,
-                        curr_kpe_reg,
-                        next_kvc_reg,
-                        next_kpe_reg,
-                    ),
-                )
+                    def merge_loop_body(i, vals):
+                        (
+                            kv_packing_idx,
+                            kv_packing_idx_new,
+                            curr_kvc_reg,
+                            curr_kpe_reg,
+                            next_kvc_reg,
+                            next_kpe_reg,
+                        ) = vals
+                        curr_kvc_reg_u32 = pltpu.bitcast(curr_kvc_reg, jnp.uint32)
+                        curr_kpe_reg_u32 = pltpu.bitcast(curr_kpe_reg, jnp.uint32)
+                        next_kvc_reg_u32 = pltpu.bitcast(next_kvc_reg, jnp.uint32)
+                        next_kpe_reg_u32 = pltpu.bitcast(next_kpe_reg, jnp.uint32)
+
+                        shifted_kvc_u32 = lax.bitwise_or(
+                            lax.shift_right_logical(curr_kvc_reg_u32, 32 - shift_bits),
+                            lax.shift_left(next_kvc_reg_u32, shift_bits),
+                        )
+                        shifted_kpe_u32 = lax.bitwise_or(
+                            lax.shift_right_logical(curr_kpe_reg_u32, 32 - shift_bits),
+                            lax.shift_left(next_kpe_reg_u32, shift_bits),
+                        )
+
+                        # If shift_bits is 0, we should use the current word. Otherwise,
+                        # shifting by 32 bits would result in shifted_*_u32 becoming
+                        # next_*_reg_u32, which is incorrect.
+                        rotated_kvc_u32 = lax.select(
+                            shift_bits == 0, curr_kvc_reg_u32, shifted_kvc_u32
+                        )
+                        rotated_kpe_u32 = lax.select(
+                            shift_bits == 0, curr_kpe_reg_u32, shifted_kpe_u32
+                        )
+
+                        next_kvc_reg_shifted = pltpu.bitcast(rotated_kvc_u32, next_kvc_reg.dtype)
+                        next_kpe_reg_shifted = pltpu.bitcast(rotated_kpe_u32, next_kpe_reg.dtype)
+
+                        offset_in_word = i * kv_packing + lax.broadcasted_iota(
+                            dtype=jnp.int32, shape=[kv_packing, lkv_dim], dimension=0
+                        )
+                        kvc_mask = jnp.logical_and(
+                            offset_in_word >= kv_packing_offset,
+                            offset_in_word < kv_packing_offset + update_sz,
+                        )
+                        updated_kvc_reg = lax.select(
+                            kvc_mask,
+                            next_kvc_reg_shifted,
+                            bkvc_vmem_ref[kv_packing_idx, :, :],
+                        )
+                        offset_in_word_pe = i * kv_packing + lax.broadcasted_iota(
+                            dtype=jnp.int32, shape=[kv_packing, r_dim], dimension=0
+                        )
+                        kpe_mask = jnp.logical_and(
+                            offset_in_word_pe >= kv_packing_offset,
+                            offset_in_word_pe < kv_packing_offset + update_sz,
+                        )
+                        updated_kpe_reg = lax.select(
+                            kpe_mask,
+                            next_kpe_reg_shifted,
+                            bkvpe_vmem_ref[kv_packing_idx, :, :],
+                        )
+
+                        # Store back the merged word
+                        bkvc_vmem_ref[kv_packing_idx, :, :] = updated_kvc_reg
+                        bkvpe_vmem_ref[kv_packing_idx, :, :] = updated_kpe_reg
+
+                        # Move to the next word.
+                        kv_packing_idx += 1
+                        kv_packing_idx_new += 1
+                        curr_kvc_reg = next_kvc_reg
+                        curr_kpe_reg = next_kpe_reg
+                        next_kvc_reg = bkvc_vmem_ref[kv_packing_idx_new + 1, :, :]
+                        next_kpe_reg = bkvpe_vmem_ref[kv_packing_idx_new + 1, :, :]
+                        return (
+                            kv_packing_idx,
+                            kv_packing_idx_new,
+                            curr_kvc_reg,
+                            curr_kpe_reg,
+                            next_kvc_reg,
+                            next_kpe_reg,
+                        )
+
+                    lax.fori_loop(
+                        0,
+                        update_kv_packing_iters,
+                        merge_loop_body,
+                        (
+                            kv_packing_idx,
+                            kv_packing_idx_new,
+                            curr_kvc_reg,
+                            curr_kpe_reg,
+                            next_kvc_reg,
+                            next_kpe_reg,
+                        ),
+                    )
 
     def _update_kv_cache(
         batch_start_seq_idx,
@@ -818,7 +841,9 @@ def _mla_ragged_paged_attention_kernel(
         # shape: [bkv_sz_per_kv_packing + 2, kv_packing, r_dim]
         bkvpe_vmem_ref = bkpe_x2_ref.at[bkv_sem_idx, b]
 
-        update_kv_packing_iters = cdiv_on_kv_packing((offset % kv_packing) + update_sz, kv_packing)
+        update_kv_packing_iters = cdiv_on_kv_packing(
+            mod_pow2(offset, kv_packing) + update_sz, kv_packing
+        )
 
         # Expected shape:
         # [total_num_pages, page_size_per_kv_packing, kv_packing,
@@ -831,12 +856,12 @@ def _mla_ragged_paged_attention_kernel(
 
         if not wait:
             # Issue DMA copy for the updated parts, page by page.
-            kv_p_start = offset // page_size
+            kv_p_start = floor_div_pow2(offset, page_size)
             kv_p_end = cdiv(offset + update_sz, page_size)
-            start_word_in_page = floor_div_on_kv_packing(offset % page_size, kv_packing)
-            start_word_in_vmem = floor_div_on_kv_packing(offset % bkv_sz, kv_packing)
+            start_word_in_page = floor_div_on_kv_packing(mod_pow2(offset, page_size), kv_packing)
+            start_word_in_vmem = floor_div_on_kv_packing(mod_pow2(offset, bkv_sz), kv_packing)
             words_to_transfer = update_kv_packing_iters
-            start_kv_page_idx = cdiv(cu_kv_lens_ref[seq_idx], page_size)
+            start_kv_page_idx = floor_div_pow2(cu_kv_lens_ref[seq_idx], page_size)
             page_indices_offset = start_kv_page_idx + kv_p_start
 
             def loop_body(i, states):
@@ -1031,6 +1056,26 @@ def _mla_ragged_paged_attention_kernel(
                 _update_kv_cache(start_seq_idx, b, bkv_sem_idx, offset, update_sz, wait=True)
 
     def load_bq(bq_sem_idx, *, actual_bq_sz=bq_sz):
+        if num_q_heads_per_q_packing > 1:
+            q_nope_ref = (
+                bq_nope_x2_ref.bitcast(jnp.uint32)
+                .at[bq_sem_idx, :, :actual_bq_sz]
+                .reshape(batch_size, actual_bq_sz * num_q_heads_per_q_packing, lkv_dim)
+            )
+            q_nope_vec = pltpu.bitcast(q_nope_ref[...], q_dtype).reshape(
+                batch_size, actual_bq_sz * num_q_heads, lkv_dim
+            )
+
+            q_rope_ref = (
+                bq_rope_x2_ref.bitcast(jnp.uint32)
+                .at[bq_sem_idx, :, :actual_bq_sz]
+                .reshape(batch_size, actual_bq_sz * num_q_heads_per_q_packing, r_dim)
+            )
+            q_rope_vec = pltpu.bitcast(q_rope_ref[...], q_dtype).reshape(
+                batch_size, actual_bq_sz * num_q_heads, r_dim
+            )
+            return q_nope_vec, q_rope_vec
+
         q_nope_ref = bq_nope_x2_ref.bitcast(jnp.uint32).at[bq_sem_idx]
         q_nope_val = q_nope_ref[...]
         q_nope_val = q_nope_val.reshape(batch_size, bq_sz * num_q_heads_per_q_packing, lkv_dim)
@@ -1054,9 +1099,11 @@ def _mla_ragged_paged_attention_kernel(
         bkpe_vecs = []
         for b in range(batch_size):
             bkvc_ref = bkvc_x2_ref.bitcast(jnp.uint32).at[bkv_sem_idx, b, :bkv_sz_per_kv_packing]
-            bkvc_vec = pltpu.bitcast(bkvc_ref[...], kv_dtype).reshape(bkv_sz, lkv_dim)
-
             bkpe_ref = bkpe_x2_ref.bitcast(jnp.uint32).at[bkv_sem_idx, b, :bkv_sz_per_kv_packing]
+            if bkv_sz_per_kv_packing % 8 == 0:
+                bkvc_ref = bkvc_ref.reshape(bkv_sz_per_kv_packing, lkv_dim)
+                bkpe_ref = bkpe_ref.reshape(bkv_sz_per_kv_packing, r_dim)
+            bkvc_vec = pltpu.bitcast(bkvc_ref[...], kv_dtype).reshape(bkv_sz, lkv_dim)
             bkpe_vec = pltpu.bitcast(bkpe_ref[...], kv_dtype).reshape(bkv_sz, r_dim)
             bkvc_vecs.append(bkvc_vec)
             bkpe_vecs.append(bkpe_vec)
@@ -1269,19 +1316,21 @@ def prepare_q_inputs(
     q_packing = get_dtype_packing(q.dtype)
     num_q_heads = align_to(actual_num_q_heads, q_packing)
     head_dim = align_to(actual_head_dim, 128)
-    q = jnp.pad(
-        q.reshape(
-            max_num_tokens,
-            actual_num_q_heads,
-            actual_head_dim,
-        ),
-        (
-            (0, 0),
-            (0, num_q_heads - actual_num_q_heads),
-            (0, head_dim - actual_head_dim),
-        ),
-        constant_values=0,
-    ).reshape(
+    if num_q_heads != actual_num_q_heads or head_dim != actual_head_dim:
+        q = jnp.pad(
+            q.reshape(
+                max_num_tokens,
+                actual_num_q_heads,
+                actual_head_dim,
+            ),
+            (
+                (0, 0),
+                (0, num_q_heads - actual_num_q_heads),
+                (0, head_dim - actual_head_dim),
+            ),
+            constant_values=0,
+        )
+    q = q.reshape(
         max_num_tokens,
         num_q_heads // q_packing,
         q_packing,
@@ -1291,7 +1340,8 @@ def prepare_q_inputs(
     # head-axis pad is (0,0) and XLA may fuse pad+reshape into a lazy view
     # whose physical layout != [mnt, h//p, p, D]. pallas_call then gets a
     # non-contiguous HBM ref and the DMA BoundsCheck trips. Force a copy.
-    q = jax.lax.optimization_barrier(q)
+    if num_q_heads // q_packing == 1:
+        q = jax.lax.optimization_barrier(q)
     return q
 
 
@@ -1305,7 +1355,8 @@ def prepare_kv_inputs(kv: jax.Array):
 
     head_dim = align_to(actual_head_dim, 128)
     kv = kv.reshape(-1, kv_packing, actual_head_dim)
-    kv = jnp.pad(kv, ((0, 0), (0, 0), (0, head_dim - actual_head_dim)), constant_values=0)
+    if head_dim != actual_head_dim:
+        kv = jnp.pad(kv, ((0, 0), (0, 0), (0, head_dim - actual_head_dim)), constant_values=0)
     return kv
 
 

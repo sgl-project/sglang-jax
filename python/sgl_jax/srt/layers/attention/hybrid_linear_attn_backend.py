@@ -203,6 +203,14 @@ class HybridLinearAttnBackend(AttentionBackend):
         return getattr(self.full_attn_backend, "token_to_kv_pool_class", MHATokenToKVPool)
 
     @property
+    def token_to_kv_pool_kwargs(self) -> dict:
+        return getattr(self.full_attn_backend, "token_to_kv_pool_kwargs", None) or {}
+
+    def extra_kv_bytes_per_token(self, dtype_size: int) -> int:
+        extra = getattr(self.full_attn_backend, "extra_kv_bytes_per_token", None)
+        return extra(dtype_size) if extra is not None else 0
+
+    @property
     def compiler_options(self):
         return getattr(self.linear_attn_backend, "compiler_options", None)
 
