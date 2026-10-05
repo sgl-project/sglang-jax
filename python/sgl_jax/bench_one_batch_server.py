@@ -9,12 +9,17 @@ python3 -m sgl_jax.bench_one_batch_server --model meta-llama/Meta-Llama-3.1-8B -
 
 python3 -m sgl_jax.bench_one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8
 python3 -m sgl_jax.bench_one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8 --show-report --profile --profile-by-stage
+
+The input/output cost columns in --show-report are derived from the *server's* tp_size
+(read from /get_server_info) and a per-chip price:
+python3 -m sgl_jax.bench_one_batch_server --model None --base-url http://localhost:30000 --batch-size 16 --input-len 1024 --output-len 8 --show-report --hourly-cost-per-chip 5.40 --devices-per-chip 2
 """
 
 import argparse
 import dataclasses
 import itertools
 import json
+import math
 import multiprocessing
 import os
 import time
@@ -46,6 +51,13 @@ class BenchArgs:
     profile: bool = False
     profile_by_stage: bool = False
     api_type: str = "native"  # "native" or "openai"
+    # Cost model for the --show-report table.
+    # hourly cost = hourly_cost_per_chip * num_chips,
+    # num_chips  = --num-chips if given, else server tp_size / devices_per_chip.
+    hourly_cost_per_chip: float = 5.40  # $/chip-hour (default: Ironwood / v7x)
+    devices_per_chip: int = 2  # JAX devices (cores) per billable chip (v7x: 2)
+    num_chips: int = 0  # 0 = derive from server tp_size
+    input_util: float = 0.7  # assumed prefill utilization for input cost
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -77,6 +89,32 @@ class BenchArgs:
             default=BenchArgs.api_type,
             choices=["native", "openai"],
             help="API type to use: 'native' for /generate or 'openai' for /v1/completions",
+        )
+        parser.add_argument(
+            "--hourly-cost-per-chip",
+            type=float,
+            default=BenchArgs.hourly_cost_per_chip,
+            help="Price in $/hour of one billable chip (default: $5.40, Ironwood/v7x).",
+        )
+        parser.add_argument(
+            "--devices-per-chip",
+            type=int,
+            default=BenchArgs.devices_per_chip,
+            help="JAX devices (cores) per billable chip, used to convert the server's "
+            "tp_size into a chip count (v7x has 2 cores/chip).",
+        )
+        parser.add_argument(
+            "--num-chips",
+            type=int,
+            default=BenchArgs.num_chips,
+            help="Explicit number of billable chips. If 0 (default), derived as "
+            "ceil(server tp_size / devices_per_chip).",
+        )
+        parser.add_argument(
+            "--input-util",
+            type=float,
+            default=BenchArgs.input_util,
+            help="Assumed prefill utilization when computing input cost.",
         )
 
     @classmethod
@@ -302,6 +340,45 @@ def run_one_case(
     )
 
 
+def resolve_hourly_cost(server_info: dict, server_args: ServerArgs, bench_args: BenchArgs):
+    """Return (hourly_cost_usd, num_chips, server_tp_size) for the cost columns.
+
+    The number of accelerators is taken from the *running server* (via
+    /get_server_info), not from this script's own CLI args. When benchmarking
+    an existing server with --base-url, the client-side ``server_args.tp_size``
+    is just the default (1), which would silently under-price the deployment.
+
+    On TPUs ``tp_size`` counts JAX devices (cores) while billing is per chip,
+    so devices are converted to chips with ``--devices-per-chip`` unless
+    ``--num-chips`` is given explicitly.
+    """
+    server_tp_size = None
+    if isinstance(server_info, dict):
+        if "tp_size" in server_info:
+            server_tp_size = server_info["tp_size"]
+        elif "decode" in server_info and server_info["decode"]:
+            # PD-disaggregated deployments: price the decode side.
+            server_tp_size = server_info["decode"][0].get("tp_size")
+        elif "prefill" in server_info and server_info["prefill"]:
+            server_tp_size = server_info["prefill"][0].get("tp_size")
+
+    if server_tp_size is None:
+        server_tp_size = server_args.tp_size
+        print(
+            "WARNING: could not read tp_size from /get_server_info; falling back to "
+            f"client-side --tp-size={server_tp_size}. Cost columns may be wrong; "
+            "pass --num-chips to override."
+        )
+
+    if bench_args.num_chips > 0:
+        num_chips = bench_args.num_chips
+    else:
+        num_chips = max(1, math.ceil(server_tp_size / bench_args.devices_per_chip))
+
+    hourly_cost = bench_args.hourly_cost_per_chip * num_chips
+    return hourly_cost, num_chips, server_tp_size
+
+
 def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
     if bench_args.base_url:
         proc, base_url = None, bench_args.base_url
@@ -395,7 +472,17 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
     if not bench_args.show_report:
         return
 
+    hourly_cost, num_chips, server_tp_size = resolve_hourly_cost(
+        server_info, server_args, bench_args
+    )
+    input_util = bench_args.input_util
+
     summary = f"\nInput lens: {bench_args.input_len}. Output lens: {bench_args.output_len}.\n"
+    summary += (
+        f"Cost basis: {num_chips} chip(s) x ${bench_args.hourly_cost_per_chip:.2f}/chip-hr "
+        f"= ${hourly_cost:.2f}/hr (server tp_size={server_tp_size}, "
+        f"devices_per_chip={bench_args.devices_per_chip}, input_util={input_util}).\n"
+    )
     summary += "| batch size | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) |"
 
     if bench_args.profile:
@@ -419,8 +506,6 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
         acc_length,
         trace_link,
     ) in result:
-        hourly_cost = 2 * server_args.tp_size  # $2/hour for one H100
-        input_util = 0.7
         accept_length = round(acc_length, 2) if acc_length is not None else "n/a"
         line = (
             f"| {batch_size} | "
