@@ -10,10 +10,11 @@ pre-#1733 (``c136c733``) MLA v2 kernel:
    compares ``output``, ``l`` (``l_ref`` normalizer), ``acc`` (``acc_ref``
    accumulator), and ``updated_cache_kv`` against a Python reimplementation of
    the ``c136c733`` parent kernel (``pre1733_reference_mla_v2``). This runs on
-   CPU in ~10s and catches source-level numeric or KV-packing edits (such as the
-   ``jnp.exp2`` / ``log2(e)`` rewrite, folded ``float(sm_scale * q_scale)``
-   scaling, or unaligned ``merge_kv`` bounds), without executing the
-   Mosaic-compiled kernel or TPU MXU.
+   CPU in ~10s and catches source-level numeric or KV-packing edits (such as
+   casting softmax weights ``p`` to ``bfloat16`` before ``P @ V``, splitting
+   ``Q @ K^T`` into separate ``nope`` and ``pe`` dot products, or replacing
+   ``jnp.exp`` with ``lax.exp2`` and ``log2(e)`` score/mask scaling), without
+   executing the Mosaic-compiled kernel or TPU MXU.
 2. **TPU compiled Mosaic/MXU guard (``test_v2_kernel_tpu_compiled_bitexact_parity``)**:
    When running on TPU (``jax.default_backend() == "tpu"``), executes
    ``mla_ragged_paged_attention`` completely unpatched through ``pl.pallas_call``
@@ -26,6 +27,7 @@ pre-#1733 (``c136c733``) MLA v2 kernel:
 
 from __future__ import annotations
 
+import contextlib
 import unittest
 import warnings
 from unittest import mock
@@ -40,6 +42,27 @@ from jax.sharding import AxisType, Mesh
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.mla.v2 import kernel as kmod
+
+
+@contextlib.contextmanager
+def _cpu_execution_context():
+    """Force array creation and eager ops onto CPU even when an enclosing
+    module (e.g. ``test_mla_attention.py``) has set a global ``AxisType.Explicit``
+    TPU mesh, which would otherwise override ``jax.default_device``."""
+    try:
+        cpu_devices = jax.devices("cpu")
+    except RuntimeError:
+        cpu_devices = []
+    if cpu_devices:
+        cpu_auto_mesh = Mesh(
+            np.asarray(cpu_devices[:1]),
+            ("_cpu",),
+            axis_types=(AxisType.Auto,),
+        )
+        with jax.sharding.set_mesh(cpu_auto_mesh), jax.default_device(cpu_devices[0]):
+            yield
+    else:
+        yield
 
 
 def _cpu_bitcast(arr, target_dtype):
@@ -334,16 +357,13 @@ def run_v2_kernel_with_capture(*args, **kwargs):
 
         return runner
 
-    cpu_devices = jax.devices("cpu")
-    ctx = jax.default_device(cpu_devices[0]) if cpu_devices else mock.MagicMock()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
         with (
-            ctx,
+            _cpu_execution_context(),
             mock.patch.object(pl, "pallas_call", side_effect=fake_pallas_call),
             mock.patch.object(pl, "when", side_effect=_py_when),
             mock.patch.object(pl, "reciprocal", side_effect=_cpu_reciprocal),
-            mock.patch.object(pltpu, "reciprocal", side_effect=_cpu_reciprocal, create=True),
             mock.patch.object(pltpu, "make_async_copy", side_effect=_FakeAsyncCopy),
             mock.patch.object(pltpu, "bitcast", side_effect=_cpu_bitcast),
             mock.patch.object(lax, "fori_loop", side_effect=_py_fori_loop),
@@ -525,12 +545,7 @@ def pre1733_reference_mla_v2(
       - natural-base ``jnp.exp`` online softmax (``m_curr``, ``p``, ``exp_m_diff``, ``l_curr``)
       - ``float32`` ``p`` in ``pv = jnp.einsum("bnm,bmd->bnd", p, kv_c, preferred_element_type=jnp.float32)``
     """
-    cpu_devices = jax.devices("cpu")
-    ctx = (
-        jax.default_device(cpu_devices[0])
-        if (cpu_devices and not use_tpu_pallas)
-        else mock.MagicMock()
-    )
+    ctx = _cpu_execution_context() if not use_tpu_pallas else contextlib.nullcontext()
     with ctx:
         q_dtype = ql_nope.dtype
         kv_dtype = cache_kv.dtype
@@ -544,16 +559,16 @@ def pre1733_reference_mla_v2(
         _, page_size_per_kv_packing, _, _ = cache_kv.shape
         page_size = page_size_per_kv_packing * kv_packing
 
-        ql_pad = jnp.pad(
-            ql_nope,
+        ql_pad = np.pad(
+            np.asarray(ql_nope),
             ((0, 0), (0, num_q_heads - actual_num_q_heads), (0, lkv_dim - actual_lkv_dim)),
         )
-        qpe_pad = jnp.pad(
-            q_pe,
+        qpe_pad = np.pad(
+            np.asarray(q_pe),
             ((0, 0), (0, num_q_heads - actual_num_q_heads), (0, r_dim - actual_r_dim)),
         )
-        kvc_pad = jnp.pad(new_kv_c, ((0, 0), (0, lkv_dim - actual_lkv_dim)))
-        kpe_pad = jnp.pad(new_k_pe, ((0, 0), (0, r_dim - actual_r_dim)))
+        kvc_pad = np.pad(np.asarray(new_kv_c), ((0, 0), (0, lkv_dim - actual_lkv_dim)))
+        kpe_pad = np.pad(np.asarray(new_k_pe), ((0, 0), (0, r_dim - actual_r_dim)))
 
         updated_cache = np.array(cache_kv, copy=True)
         cu_q = np.asarray(cu_q_lens)
@@ -642,11 +657,13 @@ def pre1733_reference_mla_v2(
                             bq_nope_buf[b, :sz] = np.asarray(ql_pad[q_s : q_s + sz])
                             bq_pe_buf[b, :sz] = np.asarray(qpe_pad[q_s : q_s + sz])
 
-                    ql_vec = jnp.asarray(bq_nope_buf[:, :actual_bq_sz]).reshape(
-                        bsz, actual_bq_sz * num_q_heads, lkv_dim
+                    ql_vec = jnp.asarray(
+                        bq_nope_buf[:, :actual_bq_sz].reshape(
+                            bsz, actual_bq_sz * num_q_heads, lkv_dim
+                        )
                     )
-                    qpe_vec = jnp.asarray(bq_pe_buf[:, :actual_bq_sz]).reshape(
-                        bsz, actual_bq_sz * num_q_heads, r_dim
+                    qpe_vec = jnp.asarray(
+                        bq_pe_buf[:, :actual_bq_sz].reshape(bsz, actual_bq_sz * num_q_heads, r_dim)
                     )
 
                     if use_tpu_pallas:
@@ -670,8 +687,8 @@ def pre1733_reference_mla_v2(
                                     kpe_blk[b, t] = updated_cache[
                                         p_i, w_row, w_col, lkv_dim : lkv_dim + r_dim
                                     ]
-                            kvc_list.append(jnp.asarray(kvc_blk))
-                            kpe_list.append(jnp.asarray(kpe_blk))
+                            kvc_list.append(kvc_blk)
+                            kpe_list.append(kpe_blk)
                         meta_vals = [bq_idx]
                         for b in range(bsz):
                             s_i = batch_start + b
@@ -701,8 +718,8 @@ def pre1733_reference_mla_v2(
                             meta_arr,
                             ql_vec,
                             qpe_vec,
-                            jnp.stack(kvc_list, axis=0),
-                            jnp.stack(kpe_list, axis=0),
+                            jnp.asarray(np.stack(kvc_list, axis=0)),
+                            jnp.asarray(np.stack(kpe_list, axis=0)),
                         )
                     else:
                         m_curr = jnp.full(
@@ -950,25 +967,26 @@ class TestMLAV2BitExactParity(unittest.TestCase):
     ]
 
     def _assert_bitexact_case(self, name, lens, page_size, num_heads, dbs, extra_kw):
-        inputs = make_mla_v2_parity_inputs(
-            lens, page_size=page_size, num_heads=num_heads, dtype=jnp.bfloat16, seed=42
-        )
-        common_kw = dict(
-            sm_scale=(512 + 64) ** -0.5,
-            num_kv_pages_per_block=(1, 1, 1),
-            num_queries_per_block=(1, 1, 8),
-            decode_batch_size=dbs,
-            **extra_kw,
-        )
-        out_cur, kv_cur, l_cur, acc_cur = run_v2_kernel_with_capture(*inputs, **common_kw)
-        out_ref, kv_ref, l_ref, acc_ref = pre1733_reference_mla_v2(*inputs, **common_kw)
+        with _cpu_execution_context():
+            inputs = make_mla_v2_parity_inputs(
+                lens, page_size=page_size, num_heads=num_heads, dtype=jnp.bfloat16, seed=42
+            )
+            common_kw = dict(
+                sm_scale=(512 + 64) ** -0.5,
+                num_kv_pages_per_block=(1, 1, 1),
+                num_queries_per_block=(1, 1, 8),
+                decode_batch_size=dbs,
+                **extra_kw,
+            )
+            out_cur, kv_cur, l_cur, acc_cur = run_v2_kernel_with_capture(*inputs, **common_kw)
+            out_ref, kv_ref, l_ref, acc_ref = pre1733_reference_mla_v2(*inputs, **common_kw)
 
-        valid_kv_cur = extract_valid_kv_tokens(
-            kv_cur, lens, page_size, inputs[8], inputs[6], jnp.bfloat16
-        )
-        valid_kv_ref = extract_valid_kv_tokens(
-            kv_ref, lens, page_size, inputs[8], inputs[6], jnp.bfloat16
-        )
+            valid_kv_cur = extract_valid_kv_tokens(
+                kv_cur, lens, page_size, inputs[8], inputs[6], jnp.bfloat16
+            )
+            valid_kv_ref = extract_valid_kv_tokens(
+                kv_ref, lens, page_size, inputs[8], inputs[6], jnp.bfloat16
+            )
 
         max_diff_out = float(
             np.max(np.abs(out_cur.astype(np.float32) - out_ref.astype(np.float32)))
@@ -1040,7 +1058,9 @@ class TestMLAV2BitExactParity(unittest.TestCase):
     ]
 
     def test_v2_kernel_traces_under_explicit_mesh(self):
-        """Exercise the compiled test's call boundary without requiring a TPU."""
+        """Exercise both compiled TPU shard_map call boundaries (the v2 kernel
+        and the frozen Pallas block reference) under an Explicit mesh without
+        requiring a TPU."""
         for name, lens, page_size, num_heads, dbs, extra_kw in self.TPU_PARITY_CASES:
             with self.subTest(case=name), jax.sharding.set_mesh(_single_device_mesh()):
                 inputs = make_mla_v2_parity_inputs(
@@ -1055,6 +1075,37 @@ class TestMLAV2BitExactParity(unittest.TestCase):
                 )
                 run = _make_sharded_v2_kernel(len(inputs), **common_kw)
                 jax.jit(run).trace(*inputs)
+
+                is_decode = all(q == 1 for q, _ in lens)
+                bq_sz = 1 if is_decode else 8
+                num_q_heads_aligned = kmod.align_to(num_heads, 2)
+                q_rows = bq_sz * num_q_heads_aligned
+                num_bkv = max((kv + page_size - 1) // page_size for _, kv in lens)
+                pallas_ref = _make_tpu_pallas_flash_attention_block_ref(
+                    bsz=dbs,
+                    bq_sz=bq_sz,
+                    num_q_heads=num_q_heads_aligned,
+                    bkv_sz=page_size,
+                    lkv_dim=512,
+                    r_dim=128,
+                    num_bkv=num_bkv,
+                    sm_scale=(512 + 64) ** -0.5,
+                    mask_value=extra_kw.get("mask_value", kmod.DEFAULT_MASK_VALUE),
+                    q_dtype=jnp.bfloat16,
+                    q_scale=extra_kw.get("q_scale"),
+                    k_scale=extra_kw.get("k_scale"),
+                    v_scale=extra_kw.get("v_scale"),
+                    sliding_window=extra_kw.get("sliding_window"),
+                    soft_cap=extra_kw.get("soft_cap"),
+                )
+                meta_len = kmod.align_to(1 + 2 * dbs, 8)
+                jax.jit(pallas_ref).trace(
+                    jnp.zeros((meta_len,), dtype=jnp.int32),
+                    jnp.zeros((dbs, q_rows, 512), dtype=jnp.bfloat16),
+                    jnp.zeros((dbs, q_rows, 128), dtype=jnp.bfloat16),
+                    jnp.zeros((num_bkv, dbs, page_size, 512), dtype=jnp.bfloat16),
+                    jnp.zeros((num_bkv, dbs, page_size, 128), dtype=jnp.bfloat16),
+                )
 
     @unittest.skipIf(
         jax.default_backend() != "tpu",
@@ -1118,21 +1169,22 @@ class TestMLAV2BitExactParity(unittest.TestCase):
         ``prepare_q_inputs`` must emit ``optimization_barrier`` regardless of
         ``num_q_heads``, whereas already-aligned ``ql_nope`` (dim 512) skips both
         ``pad`` and ``optimization_barrier``."""
-        for num_q_heads in (2, 4, 8, 16, 64):
-            q_pe = jnp.ones((8, num_q_heads, 64), dtype=jnp.bfloat16)
-            jaxpr_pe = jax.make_jaxpr(kmod.prepare_q_inputs)(q_pe)
-            primitives_pe = [eqn.primitive.name for eqn in jaxpr_pe.jaxpr.eqns]
-            self.assertIn(
-                "optimization_barrier",
-                primitives_pe,
-                f"q_pe (num_q_heads={num_q_heads}) must emit optimization_barrier",
-            )
+        with _cpu_execution_context():
+            for num_q_heads in (2, 4, 8, 16, 64):
+                q_pe = jnp.ones((8, num_q_heads, 64), dtype=jnp.bfloat16)
+                jaxpr_pe = jax.make_jaxpr(kmod.prepare_q_inputs)(q_pe)
+                primitives_pe = [eqn.primitive.name for eqn in jaxpr_pe.jaxpr.eqns]
+                self.assertIn(
+                    "optimization_barrier",
+                    primitives_pe,
+                    f"q_pe (num_q_heads={num_q_heads}) must emit optimization_barrier",
+                )
 
-            ql_nope = jnp.ones((8, num_q_heads, 512), dtype=jnp.bfloat16)
-            jaxpr_nope = jax.make_jaxpr(kmod.prepare_q_inputs)(ql_nope)
-            primitives_nope = [eqn.primitive.name for eqn in jaxpr_nope.jaxpr.eqns]
-            self.assertNotIn("pad", primitives_nope)
-            self.assertNotIn("optimization_barrier", primitives_nope)
+                ql_nope = jnp.ones((8, num_q_heads, 512), dtype=jnp.bfloat16)
+                jaxpr_nope = jax.make_jaxpr(kmod.prepare_q_inputs)(ql_nope)
+                primitives_nope = [eqn.primitive.name for eqn in jaxpr_nope.jaxpr.eqns]
+                self.assertNotIn("pad", primitives_nope)
+                self.assertNotIn("optimization_barrier", primitives_nope)
 
 
 if __name__ == "__main__":
