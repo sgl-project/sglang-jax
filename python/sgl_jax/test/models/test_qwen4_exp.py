@@ -1,10 +1,11 @@
 """Qwen3.8-Flash-Next assembly, on CPU.
 
 Shape and structure only -- numbers need the real checkpoint. What is pinned
-here is the four things the backbone does differently from Qwen3.5, each of
-which is silent if wrong: which layers get which block, that every block is
-wrapped in its own hyper connection, that the streams widen exactly once, and
-that the mapping table names parameters the model actually has.
+here is what the backbone does differently from Qwen3.5, each of which is
+silent if wrong: which layers get which block, that every block is wrapped in
+its own hyper connection, that the streams widen exactly once, that the
+mapping table names parameters the model actually has, and where the N-gram
+layer reads its batch metadata and puts its conv state back.
 """
 
 from __future__ import annotations
@@ -21,13 +22,18 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
-from jax.sharding import AxisType, Mesh
+from jax.sharding import AxisType, Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.model_config import ModelConfig, MoEBackend
 from sgl_jax.srt.configs.qwen4_exp import Qwen4ExpConfig
+from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
+    LinearRecurrentAttnBackendMetadata,
+)
 from sgl_jax.srt.layers.attention.qsa_sparse_backend import QSAFusedCache
 from sgl_jax.srt.layers.embeddings import MRotaryEmbedding, RotaryEmbedding
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE
+from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
 from sgl_jax.srt.models.qwen3_5 import (
     Qwen3_5GatedDeltaNet,
     _create_qwen3_5_weight_mappings,
@@ -289,9 +295,9 @@ class TestPoolUpdates(CustomTestCase):
             def layer_call(self, positions, hidden, forward_batch, pools, dispatch_info=None):
                 i = self.layer_id
                 if not self.is_full_attn:
-                    return hidden, (f"rec{i}", [f"conv{i}"]), None, None
+                    return hidden, (f"rec{i}", [f"conv{i}"]), None
                 state = QSAFusedCache(f"kv{i}", f"compressed{i}", f"ring{i}") if qsa else f"kv{i}"
-                return hidden, state, None, None
+                return hidden, state, None
 
             forward_batch = types.SimpleNamespace(
                 forward_mode=types.SimpleNamespace(
@@ -319,6 +325,125 @@ class TestPoolUpdates(CustomTestCase):
             ),
         )
         self.assertEqual(run(qsa=False), [f"kv{i}" for i in full])
+
+
+class TestNGramLayer(CustomTestCase):
+    """What the decoder layer does around ``NGramEmbedding``: which metadata
+    reaches it, and where its conv state goes back. The module's own math is
+    covered by its tests."""
+
+    SLOT, TRACK = 2, 3
+
+    def setUp(self):
+        self.mesh = _mesh()
+        tc = _config(ple=True).text_config
+        with jax.set_mesh(self.mesh):
+            self.layer = Qwen4ExpDecoderLayer(
+                _config(ple=True), self.mesh, PLE_LAYER_1BASED - 1, dtype=jnp.float32
+            )
+        rng = np.random.default_rng(0)
+        for _, param in nnx.to_flat_state(nnx.state(self.layer.ple, nnx.Param)):
+            value = 0.1 * rng.standard_normal(param[...].shape).astype(np.float32)
+            param[...] = jax.device_put(jnp.asarray(value), param[...].sharding)
+        state = tc.linear_state_params
+        self.pool = RecurrentStatePool(
+            linear_recurrent_layer_ids=state.layers,
+            size=4,
+            num_heads=state.num_heads,
+            head_dim=state.head_dim,
+            conv_kernel_size=state.conv_kernel_size,
+            mesh=self.mesh,
+            conv_dtype=jnp.float32,
+            num_k_heads=state.num_k_heads,
+            head_k_dim=state.head_k_dim,
+            conv_states=tc.conv_state_specs,
+        )
+        self.tc, self.rng = tc, rng
+
+    def _ple(self, hidden, emb, *, decode, has_initial_state, cu=None, boundary=None):
+        def put(x):
+            return jax.device_put(jnp.asarray(x), NamedSharding(self.mesh, P("data")))
+
+        tracked = boundary is not None
+        metadata = LinearRecurrentAttnBackendMetadata(
+            cu_q_lens=None if cu is None else put(np.asarray(cu, np.int32)),
+            recurrent_indices=put(np.array([self.SLOT], np.int32)),
+            has_initial_state=put(np.array([has_initial_state])),
+            recurrent_track_indices=put(np.array([self.TRACK], np.int32)) if tracked else None,
+            recurrent_track_mask=put(np.array([boundary])) if tracked else None,
+        )
+        batch = types.SimpleNamespace(
+            forward_mode=types.SimpleNamespace(is_decode=lambda: decode),
+            ple_embeddings=jnp.asarray(emb),
+            attn_backend=types.SimpleNamespace(
+                linear_attn_backend=types.SimpleNamespace(forward_metadata=metadata)
+            ),
+        )
+        with jax.set_mesh(self.mesh), jax.default_matmul_precision("float32"):
+            return self.layer._ple(jnp.asarray(hidden), batch, self.pool)
+
+    def _write_back(self, ple_state):
+        """What the runner does with the layer's returned state: GDN's list,
+        with the short conv's entry replaced, goes back into the pool."""
+        index = self.pool.layers_mapping[self.layer.layer_id]
+        conv = [list(layer) for layer in self.pool.conv_buffers]
+        _, conv[index] = self.layer._with_ple_conv_state((None, conv[index]), ple_state, self.pool)
+        self.pool.replace_buffer((list(self.pool.recurrent_buffers), conv))
+
+    def test_a_prompt_split_into_extend_and_decode_matches_one_extend(self):
+        """The decode step reads the state the extend wrote, through the pool,
+        and a fresh request ignores what its slot held before."""
+        n = 7
+        hidden = self.rng.standard_normal((n, self.tc.hyper_hidden_size)).astype(np.float32)
+        emb = self.rng.standard_normal((n, self.tc.ple_embed_dim)).astype(np.float32)
+        stale = np.asarray(self.pool.get_short_conv_state(self.layer.layer_id)).copy()
+        stale[self.SLOT] = np.nan
+        self._write_back(jnp.asarray(stale))
+
+        whole, whole_state = self._ple(
+            hidden, emb, decode=False, has_initial_state=False, cu=[0, n]
+        )
+        head, head_state = self._ple(
+            hidden[:-1], emb[:-1], decode=False, has_initial_state=False, cu=[0, n - 1]
+        )
+        linear = self.pool.get_linear_conv_state(self.layer.layer_id)
+        self._write_back(head_state)
+        self.assertIs(self.pool.get_linear_conv_state(self.layer.layer_id), linear)
+        tail, tail_state = self._ple(hidden[-1:], emb[-1:], decode=True, has_initial_state=True)
+
+        self.assertTrue(np.isfinite(np.asarray(whole)).all())
+        np.testing.assert_allclose(np.asarray(head), np.asarray(whole)[:-1], rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(np.asarray(tail), np.asarray(whole)[-1:], rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(
+            np.asarray(tail_state)[self.SLOT],
+            np.asarray(whole_state)[self.SLOT],
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+    def test_the_track_slot_takes_the_state_at_a_boundary(self):
+        """Under --enable-recurrent-extra-buffer the metadata names a track slot
+        per request. At a boundary the short conv's state is copied there, as
+        GDN's is; otherwise the track slot keeps what it held."""
+        n = 5
+        hidden = self.rng.standard_normal((n, self.tc.hyper_hidden_size)).astype(np.float32)
+        emb = self.rng.standard_normal((n, self.tc.ple_embed_dim)).astype(np.float32)
+        held = np.asarray(self.pool.get_short_conv_state(self.layer.layer_id))[self.TRACK]
+        for decode, rows, cu in ((False, slice(None), [0, n]), (True, slice(-1, None), None)):
+            for boundary in (True, False):
+                with self.subTest(decode=decode, boundary=boundary):
+                    _, state = self._ple(
+                        hidden[rows],
+                        emb[rows],
+                        decode=decode,
+                        has_initial_state=decode,
+                        cu=cu,
+                        boundary=boundary,
+                    )
+                    state = np.asarray(state)
+                    np.testing.assert_array_equal(
+                        state[self.TRACK], state[self.SLOT] if boundary else held
+                    )
 
 
 # The released config.json, reduced to what differs from Qwen4ExpTextConfig's

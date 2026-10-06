@@ -35,9 +35,11 @@ from sgl_jax.srt.layers.embeddings import (
 from sgl_jax.srt.layers.hyperconnection import GatedResidual, HyperConnectionConfig
 from sgl_jax.srt.layers.layernorm import GemmaRMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
+from sgl_jax.srt.layers.ngram_embedding import NGramEmbedding
 from sgl_jax.srt.layers.radix_attention import RadixAttention
-from sgl_jax.srt.model_loader.weights import WeightSpec
+from sgl_jax.srt.mem_cache.recurrent_state_pool import SHORT_CONV
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.model_loader.weights import WeightSpec
 from sgl_jax.srt.models.qwen2_moe import Qwen2MoeMLP
 from sgl_jax.srt.models.qwen3_5 import (
     Qwen3_5GatedDeltaNet,
@@ -248,11 +250,11 @@ class Qwen4ExpDecoderLayer(nnx.Module):
             self.self_attn = Qwen3_5GatedDeltaNet(config, mesh, layer_id, dtype=dtype)
 
         # ``ple_layer_ids`` is 1-based, matching the checkpoint's own numbering.
-        self.ple = None
-        if (layer_id + 1) in text_cfg.ple_layer_ids:
-            from sgl_jax.srt.layers.ngram_embedding import NGramEmbedding
-
-            self.ple = NGramEmbedding(text_cfg, mesh, params_dtype=dtype)
+        self.ple = (
+            NGramEmbedding(text_cfg, mesh, params_dtype=dtype)
+            if (layer_id + 1) in text_cfg.ple_layer_ids
+            else None
+        )
 
         if self.is_moe:
             self.mlp = Qwen3_5MoeBlock(config, mesh, layer_id, dtype=dtype)
@@ -295,12 +297,13 @@ class Qwen4ExpDecoderLayer(nnx.Module):
         dispatch_info=None,
     ):
         hidden_states = self._to_streams(hidden_states)
-        ple_state = None
 
+        ple_conv_state = None
         if self.ple is not None:
-            hidden_states = hidden_states + self.ple(
+            delta, ple_conv_state = self._ple(
                 hidden_states, forward_batch, memory_pools.recurrent_state_pool
             )
+            hidden_states = hidden_states + delta
 
         mixed, carry = self.attn_hyper_connection.mix(hidden_states)
         pool = (
@@ -309,6 +312,8 @@ class Qwen4ExpDecoderLayer(nnx.Module):
             else memory_pools.recurrent_state_pool
         )
         block_out, attn_state = self.self_attn(positions, mixed, forward_batch, pool)
+        if ple_conv_state is not None:
+            attn_state = self._with_ple_conv_state(attn_state, ple_conv_state, pool)
         hidden_states = self.attn_hyper_connection.combine(block_out, carry)
 
         mixed, carry = self.mlp_hyper_connection.mix(hidden_states)
@@ -318,7 +323,51 @@ class Qwen4ExpDecoderLayer(nnx.Module):
             block_out, topk_ids = self.mlp(mixed), None
         hidden_states = self.mlp_hyper_connection.combine(block_out, carry)
 
-        return hidden_states, attn_state, topk_ids, ple_state
+        return hidden_states, attn_state, topk_ids
+
+    def _ple(self, hidden_states, forward_batch, pool):
+        """The N-gram delta and the short conv's new state.
+
+        Slots, sequence boundaries and track slots come from the linear
+        backend's metadata, the same arrays this layer's GDN reads, so both
+        convs advance and are snapshotted together.
+        """
+        metadata = forward_batch.attn_backend.linear_attn_backend.forward_metadata
+        conv_state = pool.get_short_conv_state(self.layer_id)
+        track = dict(
+            track_indices=metadata.recurrent_track_indices,
+            track_mask=metadata.recurrent_track_mask,
+        )
+        if forward_batch.forward_mode.is_decode():
+            return self.ple.forward_decode(
+                hidden_states,
+                forward_batch.ple_embeddings,
+                conv_state,
+                metadata.recurrent_indices,
+                metadata.has_initial_state,
+                **track,
+            )
+        return self.ple.forward_extend(
+            hidden_states,
+            forward_batch.ple_embeddings,
+            conv_state,
+            metadata.recurrent_indices,
+            metadata.cu_q_lens,
+            metadata.has_initial_state,
+            **track,
+        )
+
+    def _with_ple_conv_state(self, attn_state, conv_state, pool):
+        """Put the short conv's new state into the list GDN returned.
+
+        GDN replaces only its own entry, so the short conv's still holds the
+        pool's old state. ``pool.with_conv_state`` would rebuild the list from
+        the pool and lose GDN's new one.
+        """
+        recurrent, conv_states = attn_state
+        conv_states = list(conv_states)
+        conv_states[pool.conv_buffer_index(self.layer_id, SHORT_CONV)] = conv_state
+        return recurrent, conv_states
 
 
 class Qwen4ExpModel(nnx.Module):
@@ -380,7 +429,7 @@ class Qwen4ExpModel(nnx.Module):
         layers_conv_buffers = []
         layers_topk_ids = []
         for layer in self.layers:
-            hidden_states, attn_state, topk_ids, ple_state = layer(
+            hidden_states, attn_state, topk_ids = layer(
                 positions,
                 hidden_states,
                 forward_batch,
@@ -397,8 +446,6 @@ class Qwen4ExpModel(nnx.Module):
                 rec_buf, conv_buf_list = attn_state
                 layers_rec_buffers.append(rec_buf)
                 layers_conv_buffers.append(conv_buf_list)
-            if ple_state is not None:
-                layers_conv_buffers.append(ple_state)
             if topk_ids is not None:
                 layers_topk_ids.append(topk_ids)
 
