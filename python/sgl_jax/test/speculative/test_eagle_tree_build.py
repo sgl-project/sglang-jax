@@ -2,7 +2,21 @@
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
+from sgl_jax.srt.kernels.speculative.build_eagle_tree_structure_kernel import (
+    FULL_MASK,
+    QLEN_ONLY,
+)
+from sgl_jax.srt.layers.attention.flashattention_backend import (
+    _expand_verify_tree_mask,
+    _pack_verify_mask,
+    mask_row_width,
+)
+from sgl_jax.srt.speculative.eagle_draft_worker import (
+    select_top_k_tokens,
+    update_eagle_lists,
+)
 from sgl_jax.srt.speculative.eagle_util import (
     build_tree_kernel_efficient,
     build_tree_kernel_efficient_preprocess,
@@ -879,6 +893,60 @@ class TestDraftDecodeMask(CustomTestCase):
         assert draft_tokens.shape[0] > 0, "draft_tokens should not be empty"
 
         print("Simple case test passed!")
+
+    def test_qlen_only_mask_expands_to_the_full_mask(self):
+        """The verify attention expands QLEN_ONLY tree blocks on device. For the
+        same draft round, that must equal the FULL mask through the host repack.
+        """
+        topk, steps, n = 2, 3, 6
+        verified_seq_lens = np.array([5, 130, 0, -1], dtype=np.int32)  # last slot is padding
+        bs = len(verified_seq_lens)
+        rng = np.random.default_rng(0)
+        score_list = jnp.empty((bs, 1 + (steps - 1) * topk, topk))
+        token_list = jnp.empty((bs, topk + (steps - 1) * topk * topk), dtype=jnp.int32)
+        parents_list = jnp.empty((bs, topk + 1 + (steps - 1) * topk), dtype=jnp.int32)
+        topk_p = jnp.asarray(rng.random((bs, topk), dtype=np.float32))
+        topk_index = jnp.asarray(rng.integers(0, 50, (bs, topk), dtype=np.int32))
+        hidden, scores = jnp.zeros((bs, 2), dtype=jnp.float32), None
+        for i in range(steps):
+            _, hidden, scores, tree_info = select_top_k_tokens(
+                i, topk_p, topk_index, hidden, scores, topk
+            )
+            score_list, token_list, parents_list = update_eagle_lists(
+                i, score_list, token_list, parents_list, tree_info, topk
+            )
+            topk_p = jnp.asarray(rng.random((bs * topk, topk), dtype=np.float32))
+            topk_index = jnp.asarray(rng.integers(0, 50, (bs * topk, topk), dtype=np.int32))
+
+        def tree_mask(mode):
+            return build_tree_kernel_efficient(
+                verified_id=jnp.arange(bs, dtype=jnp.int32),
+                score_list=score_list,
+                token_list=token_list,
+                parents_list=parents_list,
+                seq_lens=jnp.asarray(verified_seq_lens),
+                seq_lens_sum=int(verified_seq_lens.sum()),
+                topk=topk,
+                num_verify_tokens=n,
+                max_seq_len_per_req=int(verified_seq_lens.max()),
+                batch_size=bs,
+                speculative_num_steps=steps,
+                mesh=mesh,
+                tree_mask_mode=mode,
+            )[0]
+
+        seq_lens = np.where(verified_seq_lens >= 0, verified_seq_lens + n, 0)
+        cm_off = np.concatenate([[0], np.cumsum(n * np.where(seq_lens > 0, seq_lens, n - 1))])
+        expected = _pack_verify_mask(
+            np.asarray(tree_mask(FULL_MASK)), seq_lens, seq_lens, cm_off, n, 1, bs
+        )
+        expanded = _expand_verify_tree_mask(
+            tree_mask(QLEN_ONLY),
+            jnp.asarray(verified_seq_lens),
+            draft_token_num=n,
+            width=mask_row_width(seq_lens),
+        )
+        np.testing.assert_array_equal(np.asarray(expanded), expected)
 
 
 if __name__ == "__main__":

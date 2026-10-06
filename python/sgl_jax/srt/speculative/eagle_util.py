@@ -10,6 +10,7 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.speculative.build_eagle_tree_structure_kernel import (
+    FULL_MASK,
     build_eagle_tree_structure,
 )
 
@@ -216,6 +217,7 @@ def build_tree_kernel_efficient(
     batch_size: int,
     speculative_num_steps: int,
     mesh: Mesh,
+    tree_mask_mode: int = FULL_MASK,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """JAX implementation of build_tree_kernel_efficient.
 
@@ -229,6 +231,7 @@ def build_tree_kernel_efficient(
         topk: Number of top-k candidates
         num_verify_tokens: Number of tokens to verify
         max_seq_len_per_req: Maximum allowed sequence length per request (static bound)
+        tree_mask_mode: ``FULL_MASK`` or ``QLEN_ONLY`` layout of the returned tree mask
 
     Returns:
         tuple of (tree_mask, positions, retrive_index, retrive_next_token,
@@ -258,7 +261,7 @@ def build_tree_kernel_efficient(
                 topk=topk,
                 seq_lens_sum=seq_lens_sum,
                 max_context_len=max_seq_len_per_req,
-                tree_mask_mode=0,  # FULL_MASK
+                tree_mask_mode=tree_mask_mode,
             )
         )
 

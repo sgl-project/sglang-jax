@@ -1,5 +1,6 @@
 import logging
 from dataclasses import dataclass
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -97,6 +98,36 @@ def _pack_verify_mask(
             packed[row : row + q, 0, :kl] = cm[cm_off[s] : cm_off[s] + q * kl].reshape(q, kl)
             row += q
     return packed
+
+
+def _padding_trails(seq_lens: np.ndarray, dp_size: int, per_dp_bs: int) -> bool:
+    """Whether every DP rank lists its real slots (``seq_lens > 0``) first."""
+    real = (np.asarray(seq_lens) > 0).reshape(dp_size, per_dp_bs)
+    return bool(np.all(real == (np.cumsum(~real, axis=1) == 0)))
+
+
+@partial(jax.jit, static_argnames=("draft_token_num", "width"))
+def _expand_verify_tree_mask(tree_mask, context_lens, draft_token_num: int, width: int):
+    """Lay per-slot tree blocks out as the kernel's `[rows, 1, W]` rectangle.
+
+    ``tree_mask`` is the tree builder's ``QLEN_ONLY`` output: one ``q x q``
+    block per slot whose row ``i`` marks the nodes draft token ``i`` sees. Row
+    ``i`` of slot ``s`` keeps its first ``context_lens[s]`` columns, then block
+    row ``i`` at ``[context_lens[s], context_lens[s] + q)``, then zeros. Slots
+    with ``context_lens < 0`` are padding and stay fully masked.
+
+    Rows follow slot order, which is ``_pack_verify_mask``'s row order when the
+    padding slots trail the real ones in every DP rank.
+    """
+    q = draft_token_num
+    bs = context_lens.shape[0]
+    tree = tree_mask.reshape(bs, q, q)
+    rel = jnp.arange(width, dtype=jnp.int32)[None, :] - context_lens[:, None]
+    mask = jnp.broadcast_to((rel < 0)[:, None, :], (bs, q, width)).astype(jnp.int32)
+    for k in range(q):
+        mask = mask | (tree[:, :, k : k + 1] * (rel == k)[:, None, :])
+    mask = jnp.where((context_lens >= 0)[:, None, None], mask, 0)
+    return mask.reshape(bs * q, 1, width)
 
 
 def _draft_decode_kv_lens(seq_lens, speculative_step_id: int, topk: int) -> np.ndarray:
@@ -453,28 +484,23 @@ class FlashAttention(AttentionBackend):
         if batch.forward_mode.is_target_verify():
             seq_lens += extend_seq_lens
             aligned_seq_lens = ((seq_lens + self.page_size - 1) // self.page_size) * self.page_size
-            # Verify mask must be (a) DP-segmented per rank when dp>1 so each
-            # rank's P("data") shard sees its own slots, and (b) laid out as the
-            # kernel's rectangle [total_q_rows, 1, W] -- kv on the lane axis,
-            # one uniform 128-aligned W for the whole batch (see mask_row_width
-            # and _pack_verify_mask). dp=1 reduces to a single rank chunk;
-            # dp>1 keeps the per-rank repack from #1108 P1-7.
+            # The verify mask is the kernel's rectangle [total_q_rows, 1, W] --
+            # kv on the lane axis, one uniform 128-aligned W for the whole batch
+            # (see mask_row_width) -- sharded P("data") so each DP rank sees its
+            # own slots' rows. It is expanded on device from the tree blocks.
             if metadata.custom_mask is not None:
                 q = batch.spec_info_padded.draft_token_num
-                cm = np.asarray(jax.device_get(metadata.custom_mask))
-                assert cm.ndim == 1, f"unexpected tree-mask rank {cm.shape}"
-                # cm is DP-slot-ordered (build_tree got verified_seq_len = mwb.seq_lens-1
-                # over total_bs). Per-slot cm length = q*(verified_seq_len[s]+q); for pad
-                # slots verified_seq_len=-1 → q*(q-1).
-                cm_kl = np.where(seq_lens > 0, seq_lens, q - 1).astype(np.int64)
-                cm_off = np.concatenate([[0], np.cumsum(q * cm_kl)])
-                packed = _pack_verify_mask(
-                    cm, seq_lens, aligned_seq_lens, cm_off, q, dp_size, per_dp_bs
+                assert _padding_trails(
+                    seq_lens, dp_size, per_dp_bs
+                ), "verify padding slots must trail the real slots in each DP rank"
+                context_lens = np.where(seq_lens > 0, seq_lens - q, -1).astype(np.int32)
+                mask = _expand_verify_tree_mask(
+                    metadata.custom_mask,
+                    jax.device_put(context_lens, NamedSharding(self.mesh, P())),
+                    draft_token_num=q,
+                    width=mask_row_width(aligned_seq_lens),
                 )
-                metadata.custom_mask = device_array(
-                    packed,
-                    sharding=NamedSharding(self.mesh, P("data")),
-                )
+                metadata.custom_mask = jax.device_put(mask, NamedSharding(self.mesh, P("data")))
 
         else:
             aligned_seq_lens = (
@@ -719,9 +745,8 @@ class FlashAttention(AttentionBackend):
         dp_size = batch.dp_size
         per_dp_bs = batch.per_dp_bs_size if dp_size > 1 else len(seq_lens)
         valid = seq_lens > 0
-        valid_2d = valid.reshape(dp_size, per_dp_bs)
-        assert np.all(
-            valid_2d == (np.cumsum(~valid_2d, axis=1) == 0)
+        assert _padding_trails(
+            seq_lens, dp_size, per_dp_bs
         ), "draft-decode padding slots must trail the real slots in each DP rank"
 
         kv_lens = _draft_decode_kv_lens(seq_lens, speculative_step_id, topk)

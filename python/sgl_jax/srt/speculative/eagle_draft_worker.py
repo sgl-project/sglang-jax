@@ -6,6 +6,7 @@ import numpy as np
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.kernels.speculative.build_eagle_tree_structure_kernel import QLEN_ONLY
 from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
@@ -184,6 +185,9 @@ class EagleDraftWorker(BaseDraftWorker):
                 bs,
                 model_worker_batch.speculative_num_steps,
                 self.mesh,
+                # The verify attention lays each tree block out behind the
+                # request's context on device.
+                tree_mask_mode=QLEN_ONLY,
             )
 
         model_worker_batch.spec_info_padded = EagleVerifyInput(

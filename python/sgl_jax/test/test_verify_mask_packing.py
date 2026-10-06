@@ -10,14 +10,23 @@ per-DP-rank cumulative q-token index**, i.e. the same thing ``_per_dp_cumsum``
 produces for ``cu_q_lens``.
 """
 
+from types import SimpleNamespace
+
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.sharding import Mesh
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.attention.flashattention_backend import (
+    FlashAttention,
+    _expand_verify_tree_mask,
     _pack_verify_mask,
     _per_dp_cumsum,
     mask_row_width,
 )
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
 
 def _build(seq_lens, q, page_size, dp_size, per_dp_bs):
@@ -129,3 +138,84 @@ def test_width_bucket_is_stable_across_nearby_batches():
     """Shape churn guard: batches inside one power-of-two bucket share W."""
     widths = {mask_row_width(np.array([n], dtype=np.int32)) for n in (1100, 1500, 2048)}
     assert widths == {2048}
+
+
+def _tree_blocks(context_lens, q, seed):
+    """Per-slot ``q x q`` tree blocks and the flat full-mask layout they imply.
+
+    Real slots get a random tree (node ``k`` hangs off some ``j < k``); row ``i``
+    marks the root-to-``i`` path. Padding slots get noise in both layouts.
+    """
+    rng = np.random.default_rng(seed)
+    blocks, full = [], []
+    for ctx in context_lens:
+        if ctx < 0:
+            blocks.append(rng.integers(0, 2, (q, q)))
+            full.append(rng.integers(0, 2, q * (q - 1)))
+            continue
+        parent = [0] + [int(rng.integers(0, k)) for k in range(1, q)]
+        block = np.zeros((q, q), dtype=np.int64)
+        for i in range(q):
+            node = i
+            while node:
+                block[i, node] = 1
+                node = parent[node]
+            block[i, 0] = 1
+        blocks.append(block)
+        full.append(np.concatenate([np.ones((q, ctx), np.int64), block], axis=1).reshape(-1))
+    return np.stack(blocks).astype(np.int32).reshape(-1), np.concatenate(full).astype(np.int32)
+
+
+@pytest.mark.parametrize(
+    "context_lens, q, page_size, dp_size",
+    [
+        ([1000, 512, -1, -1], 4, 64, 1),
+        ([126, 3], 4, 1, 1),  # one row crosses the 128-lane boundary
+        ([5, 300, -1, 129, -1, -1], 8, 1, 2),
+        ([-1, -1], 4, 1, 1),
+    ],
+)
+def test_device_expansion_matches_the_host_repack(context_lens, q, page_size, dp_size):
+    context_lens = np.asarray(context_lens, dtype=np.int32)
+    per_dp_bs = len(context_lens) // dp_size
+    seq_lens = np.where(context_lens >= 0, context_lens + q, 0).astype(np.int32)
+    aligned = ((seq_lens + page_size - 1) // page_size) * page_size
+    tree, full = _tree_blocks(context_lens, q, seed=int(seq_lens.sum()))
+    cm_off = np.concatenate([[0], np.cumsum(q * np.where(seq_lens > 0, seq_lens, q - 1))])
+
+    expected = _pack_verify_mask(full, seq_lens, aligned, cm_off, q, dp_size, per_dp_bs)
+    expanded = _expand_verify_tree_mask(
+        tree, context_lens, draft_token_num=q, width=mask_row_width(aligned)
+    )
+    np.testing.assert_array_equal(np.asarray(expanded), expected)
+
+
+def test_verify_metadata_expands_the_tree_blocks():
+    """The target-verify metadata turns the tree builder's blocks into the
+    kernel's rectangle, as the host repack of the full mask would."""
+    q, page_size = 4, 64
+    context_lens = np.array([70, 3, -1], dtype=np.int32)
+    tree, full = _tree_blocks(context_lens, q, seed=1)
+    mesh = Mesh(
+        np.array(jax.devices()[:1]).reshape(1, 1),
+        ("data", "tensor"),
+        axis_types=(jax.sharding.AxisType.Explicit,) * 2,
+    )
+    backend = FlashAttention(8, 8, 128, page_size=page_size, mesh=mesh)
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        cache_loc=np.arange(3 * 128, dtype=np.int32),
+        seq_lens=np.maximum(context_lens, 0),
+        logits_indices_selector=np.array([0, 1]),
+        spec_info_padded=SimpleNamespace(custom_mask=jnp.asarray(tree), draft_token_num=q),
+        dp_size=1,
+        per_dp_bs_size=3,
+    )
+    metadata = backend.get_eagle_forward_metadata(batch)
+
+    seq_lens = np.where(context_lens >= 0, context_lens + q, 0)
+    aligned = ((seq_lens + page_size - 1) // page_size) * page_size
+    cm_off = np.concatenate([[0], np.cumsum(q * np.where(seq_lens > 0, seq_lens, q - 1))])
+    expected = _pack_verify_mask(full, seq_lens, aligned, cm_off, q, 1, 3)
+    np.testing.assert_array_equal(np.asarray(metadata.custom_mask), expected)
+    assert metadata.custom_mask.sharding.spec == P("data")
