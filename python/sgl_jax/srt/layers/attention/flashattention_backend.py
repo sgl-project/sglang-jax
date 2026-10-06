@@ -443,6 +443,7 @@ class FlashAttention(AttentionBackend):
         reuse_allocated_pages = (
             page_indices is None and getattr(batch, "allocated_page_indices", None) is not None
         )
+        pages_from_cache_loc = page_indices is None and not reuse_allocated_pages
         if reuse_allocated_pages:
             page_indices = batch.allocated_page_indices
         elif page_indices is None:
@@ -508,13 +509,21 @@ class FlashAttention(AttentionBackend):
             ) * self.page_size
         cu_kv_lens = _per_dp_cumsum(aligned_seq_lens, dp_size, per_dp_bs)
 
-        if batch.forward_mode == ForwardMode.DRAFT_EXTEND and not getattr(
+        repack_draft_extend = batch.forward_mode == ForwardMode.DRAFT_EXTEND and not getattr(
             batch.spec_info_padded, "device_seq_lens_for_draft_extend", False
-        ):
-            # Truncate each req's page list from allocate_len → seq_len, keeping
-            # the DP-segmented layout from padding_for_decode (rank r's pages
-            # at [r*per_dp_pg : ...]). page_indices (line 212) is already
-            # cache_loc[::page_size]//page_size, so re-gather from it per-rank.
+        )
+        repack_verify = (
+            batch.forward_mode == ForwardMode.TARGET_VERIFY
+            and pages_from_cache_loc
+            and getattr(batch.spec_info_padded, "allocate_lens", None) is not None
+        )
+        if repack_draft_extend or repack_verify:
+            # cache_loc gives each req its allocate_len (padding_for_decode), but
+            # attention walks the page table by cu_kv_lens, i.e. by each req's
+            # aligned kv length. Truncate each req's page list to that, keeping
+            # the DP-segmented layout (rank r's pages at [r*per_dp_pg : ...]).
+            # page_indices is already cache_loc[::page_size]//page_size, so
+            # re-gather from it per-rank.
             allocate_lens = batch.spec_info_padded.allocate_lens
             if hasattr(allocate_lens, "device"):
                 allocate_lens = jax.device_get(allocate_lens)

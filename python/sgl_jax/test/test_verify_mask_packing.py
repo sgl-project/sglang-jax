@@ -219,3 +219,46 @@ def test_verify_metadata_expands_the_tree_blocks():
     expected = _pack_verify_mask(full, seq_lens, aligned, cm_off, q, 1, 3)
     np.testing.assert_array_equal(np.asarray(metadata.custom_mask), expected)
     assert metadata.custom_mask.sharding.spec == P("data")
+
+
+@pytest.mark.parametrize("page_size", [1, 64])
+@pytest.mark.parametrize("draft_alloc", [4, 16])  # chain: == q; tree: steps * topk > q
+def test_verify_page_table_follows_the_kv_window(page_size, draft_alloc):
+    """cache_loc gives each request its allocated length, which a tree round
+    makes longer than the verify window. Each request's pages must still start
+    where cu_kv_lens puts them."""
+    q = 4
+    seq_lens = np.array([100, 50, 70, 0], dtype=np.int32)
+    allocate_lens = seq_lens[:3] + draft_alloc
+    bases = [8192 * (k + 1) for k in range(3)]
+    aligned = -(-allocate_lens // page_size) * page_size
+    cache_loc = np.concatenate([b + np.arange(n) for b, n in zip(bases, aligned)])
+    cache_loc = np.pad(cache_loc, (0, 1024 - len(cache_loc))).astype(np.int32)
+    mesh = Mesh(
+        np.array(jax.devices()[:1]).reshape(1, 1),
+        ("data", "tensor"),
+        axis_types=(jax.sharding.AxisType.Explicit,) * 2,
+    )
+    backend = FlashAttention(8, 8, 128, page_size=page_size, mesh=mesh)
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        cache_loc=cache_loc,
+        seq_lens=seq_lens,
+        logits_indices_selector=np.array([0, 1, 2]),
+        spec_info_padded=SimpleNamespace(
+            custom_mask=None, draft_token_num=q, allocate_lens=allocate_lens
+        ),
+        dp_size=1,
+        per_dp_bs_size=4,
+    )
+    metadata = backend.get_eagle_forward_metadata(batch)
+
+    pages, cu_kv_lens = np.asarray(metadata.page_indices), np.asarray(metadata.cu_kv_lens)
+    for k, base in enumerate(bases):
+        num_pages = -(-(int(seq_lens[k]) + q) // page_size)
+        first = cu_kv_lens[k] // page_size
+        np.testing.assert_array_equal(
+            pages[first : first + num_pages],
+            base // page_size + np.arange(num_pages),
+            err_msg=f"request {k} reads another request's pages",
+        )
