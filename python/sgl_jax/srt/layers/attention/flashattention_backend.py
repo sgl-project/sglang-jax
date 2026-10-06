@@ -655,8 +655,18 @@ class FlashAttention(AttentionBackend):
         per_dp_src_pages = full_size // dp_size
         TARGET_PADDING = 16384
         assert TARGET_PADDING % dp_size == 0
-        per_dp_dst_pages = TARGET_PADDING // dp_size
         rank_of_req = (sel // per_dp_bs).astype(np.int64)
+        # The draft page table keeps one size so its shape is stable; it only
+        # grows, to a power of two, for a batch whose windows do not fit.
+        topk = batch.speculative_eagle_topk
+        last_step = batch.speculative_num_steps - 1
+        widest_pages = cdiv(
+            _draft_decode_kv_lens(current_seq_lens, last_step, topk), self.page_size
+        )
+        rank_pages = np.bincount(rank_of_req, weights=widest_pages, minlength=dp_size)
+        per_dp_dst_pages = max(
+            TARGET_PADDING // dp_size, 1 << (max(int(rank_pages.max()), 1) - 1).bit_length()
+        )
 
         def _dp_starts(pages, per_dp_base):
             starts = np.zeros(len(pages), dtype=np.int64)
@@ -670,7 +680,6 @@ class FlashAttention(AttentionBackend):
 
         src_starts = _dp_starts(alloc_pages, per_dp_src_pages)
         seq_lens_list = []
-        topk = batch.speculative_eagle_topk
         for speculative_step_id in range(batch.speculative_num_steps):
             seq_lens = _draft_decode_kv_lens(batch.seq_lens, speculative_step_id, topk)
             seq_lens_list.append(seq_lens)
@@ -696,7 +705,9 @@ class FlashAttention(AttentionBackend):
             write_indices = np.repeat(dst_starts, repeats) + local_off
             gathered_locs = original_selected_cache_locs[gather_indices]
 
-            result_locs = np.zeros(TARGET_PADDING, dtype=original_selected_cache_locs.dtype)
+            result_locs = np.zeros(
+                per_dp_dst_pages * dp_size, dtype=original_selected_cache_locs.dtype
+            )
             result_locs[write_indices] = gathered_locs
             page_indices.append((result_locs // self.page_size).astype(np.int32))
 

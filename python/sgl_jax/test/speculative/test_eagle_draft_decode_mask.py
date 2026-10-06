@@ -47,7 +47,7 @@ def _batch(seq_lens, padded_bs, topk, steps, page_size=1):
     cache_loc = np.concatenate(
         [_base(k) + np.arange(pages[k] * page_size, dtype=np.int32) for k in range(real)]
     )
-    cache_loc = np.pad(cache_loc, (0, 4096 - len(cache_loc)))
+    cache_loc = np.pad(cache_loc, (0, max(0, 4096 - len(cache_loc))))
     return SimpleNamespace(
         cache_loc=cache_loc,
         forward_mode=ForwardMode.DECODE,
@@ -245,3 +245,23 @@ def test_draft_window_must_fit_the_allocation():
     batch.spec_info_padded.allocate_lens = np.asarray([8, 9 + 3 * 4], dtype=np.int32)
     with pytest.raises(AssertionError, match="pages but only"):
         backend.get_eagle_multi_step_metadata(batch)
+
+
+def test_draft_page_table_grows_for_long_windows():
+    """At page_size 1 a page is a token; a batch whose draft windows outgrow
+    the default page table gets a larger one instead of an IndexError."""
+    topk, steps, seq_len = 2, 3, 6000
+    backend = FlashAttention(8, 8, 128, page_size=1, mesh=_mesh())
+    batch = _batch([seq_len] * 3, 3, topk, steps)
+    alloc = seq_len + steps * topk
+    batch.cache_loc = np.concatenate([20000 * (k + 1) + np.arange(alloc) for k in range(3)])
+    metadata = backend.get_eagle_multi_step_metadata(batch)
+
+    for i in range(steps):
+        kv_len = seq_len - 1 + (i + 1) * topk
+        pages = np.asarray(metadata[i].page_indices)
+        assert pages.size >= 3 * kv_len
+        for k in range(3):
+            np.testing.assert_array_equal(
+                pages[k * kv_len : (k + 1) * kv_len], 20000 * (k + 1) + np.arange(kv_len)
+            )
