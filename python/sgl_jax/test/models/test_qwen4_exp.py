@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -20,6 +22,7 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import jax
 import jax.numpy as jnp
+import ml_dtypes
 import numpy as np
 from flax import nnx
 from jax.sharding import AxisType, Mesh, NamedSharding
@@ -33,6 +36,12 @@ from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
 from sgl_jax.srt.layers.attention.qsa_sparse_backend import QSAFusedCache
 from sgl_jax.srt.layers.embeddings import MRotaryEmbedding, RotaryEmbedding
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE
+from sgl_jax.srt.layers.ngram_embedding import build_hash_params
+from sgl_jax.srt.layers.ngram_table import (
+    get_ngram_table,
+    set_ngram_table,
+    shard_placements,
+)
 from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
 from sgl_jax.srt.models.qwen3_5 import (
     Qwen3_5GatedDeltaNet,
@@ -44,6 +53,7 @@ from sgl_jax.srt.models.qwen4_exp import (
     Qwen4ExpForConditionalGeneration,
     Qwen4ExpModel,
     _create_qwen4_exp_weight_mappings,
+    _install_ngram_table,
 )
 from sgl_jax.test.test_utils import CustomTestCase
 
@@ -446,6 +456,80 @@ class TestNGramLayer(CustomTestCase):
                     )
 
 
+class TestNGramTableInstall(CustomTestCase):
+    """The checkpoint's table shards go to the host-side lookup, read from
+    wherever the checkpoint keeps them."""
+
+    LAYER = PLE_LAYER_1BASED - 1
+    PARTS = 4
+
+    def tearDown(self):
+        set_ngram_table(None)
+
+    def _config(self, **overrides):
+        return _config(
+            ple=True,
+            ngram_vocab_size_base=1000,
+            split_ngram_parts=self.PARTS,
+            eos_token_id=7,
+            **overrides,
+        )
+
+    def _write_checkpoint(self, directory, tc):
+        from safetensors.numpy import save_file
+
+        params = build_hash_params(
+            ngram_size=tc.ngram_size,
+            heads_per_ngram=tc.heads_per_ngram,
+            vocab_size=tc.vocab_size,
+            ngram_vocab_size_base=tc.ngram_vocab_size_base,
+            eos_token_id=7,
+        )
+        dim = tc.ple_embed_dim // params.ngram_heads
+        divisor = tc.make_ngram_vocab_size_divisible_by
+        padded = -(-params.total_vocab_size // divisor) * divisor
+        prefix = f"model.language_model.layers.{self.LAYER}.ple.ple_embedding"
+        # Row r holds the bits of r in every column, so a gather can be read
+        # off them. The shards ship as BF16, which the loader checks.
+        tensors = {
+            f"{prefix}.ngram_embedding.shard_{p.index}.weight": np.repeat(
+                np.arange(p.start, p.start + p.rows, dtype=np.uint16)[:, None], dim, axis=1
+            ).view(ml_dtypes.bfloat16)
+            for p in shard_placements(padded, self.PARTS)
+        }
+        tensors[f"{prefix}.layer_multipliers"] = params.multipliers.copy()
+        tensors[f"{prefix}.ngram_heads_vocab_sizes"] = params.sizes.copy()
+        tensors[f"{prefix}.ngram_heads_offsets"] = params.offsets.copy()
+        names = sorted(tensors)
+        half = len(names) // 2
+        save_file({k: tensors[k] for k in names[:half]}, os.path.join(directory, "a.safetensors"))
+        save_file({k: tensors[k] for k in names[half:]}, os.path.join(directory, "b.safetensors"))
+        save_file(
+            {"model.language_model.embed_tokens.weight": np.zeros((2, 2), np.float32)},
+            os.path.join(directory, "c.safetensors"),
+        )
+        return params
+
+    def test_the_table_is_installed_from_the_checkpoint_files(self):
+        cfg = self._config()
+        with tempfile.TemporaryDirectory() as directory:
+            params = self._write_checkpoint(directory, cfg.text_config)
+            _install_ngram_table(types.SimpleNamespace(model_path=directory, hf_config=cfg))
+
+        table = get_ngram_table()
+        self.assertIsNotNone(table)
+        self.assertEqual(table.rows, params.total_vocab_size)
+        rows = np.array([[0, 5, params.total_vocab_size - 1] + [1] * (params.ngram_heads - 3)])
+        got = table.gather(rows).view(np.uint16).reshape(params.ngram_heads, -1)
+        np.testing.assert_array_equal(got[:3, 0], [0, 5, params.total_vocab_size - 1])
+
+    def test_without_the_ngram_layer_nothing_is_installed(self):
+        cfg = _config()
+        with tempfile.TemporaryDirectory() as directory:
+            _install_ngram_table(types.SimpleNamespace(model_path=directory, hf_config=cfg))
+        self.assertIsNone(get_ngram_table())
+
+
 # The released config.json, reduced to what differs from Qwen4ExpTextConfig's
 # defaults (which are the released backbone) and matters for construction.
 RELEASED_TEXT = dict(
@@ -518,27 +602,30 @@ def _mapping_head(config):
 
 class TestWeightMappings(CustomTestCase):
     def test_new_entries_name_parameters_the_model_has(self):
-        """The hyper connections and the indexer are what this table adds over
-        Qwen3.5's. A target that resolves to nothing loads nothing and raises
-        nothing, so check it against the built module tree."""
-        cfg = _config()
+        """The hyper connections, the indexer and the N-gram layer are what this
+        table adds over Qwen3.5's. A target that resolves to nothing loads
+        nothing and raises nothing, so check it against the built module tree."""
+        cfg = _config(ple=True)
         model = _model(cfg, _mesh())
         params = {
-            ".".join(str(p) for p in path)
-            for path, _ in nnx.to_flat_state(nnx.state(model, nnx.Param))
+            ".".join(str(p) for p in path): param[...].shape
+            for path, param in nnx.to_flat_state(nnx.state(model, nnx.Param))
         }
 
         mappings, _, _ = _create_qwen4_exp_weight_mappings(cfg, _mapping_head(cfg))
         prefix = "language_model.model."
-        added = [
-            m.target_path
+        added = {
+            k: m
             for k, m in mappings.items()
-            if "hyper_connection" in k or ".indexer." in k
-        ]
-        self.assertTrue(added)
-        for target in added:
+            if "hyper_connection" in k or ".indexer." in k or ".ple." in k
+        }
+        self.assertEqual(sum(".ple." in k for k in added), 6)
+        for key, mapping in added.items():
+            target = mapping.target_path
             self.assertTrue(target.startswith(prefix), target)
             self.assertIn(target[len(prefix) :], params, f"{target} names no parameter")
+            if mapping.reshape is not None:
+                self.assertEqual(tuple(mapping.reshape), params[target[len(prefix) :]], key)
 
     def test_without_the_ngram_layer_its_tensors_are_skipped(self):
         """With no layer building the N-gram module, its tensors are still in
@@ -547,6 +634,32 @@ class TestWeightMappings(CustomTestCase):
         mappings, visual_skip, mtp_skip = _create_qwen4_exp_weight_mappings(cfg, _mapping_head(cfg))
         weight_info = dict.fromkeys(mappings, [])
         weight_info[f"model.language_model.layers.{PLE_LAYER_1BASED - 1}.ple.key_proj.weight"] = []
+        Qwen4ExpForConditionalGeneration._log_load_summary(
+            mappings, weight_info, visual_skip, mtp_skip
+        )
+
+    def test_with_the_ngram_layer_only_its_table_is_skipped(self):
+        """The six device parameters load; the table shards and hash buffers
+        are skipped, since the host-side table reads them."""
+        cfg = _config(ple=True)
+        tc = cfg.text_config
+        mappings, visual_skip, mtp_skip = _create_qwen4_exp_weight_mappings(cfg, _mapping_head(cfg))
+        prefix = f"model.language_model.layers.{PLE_LAYER_1BASED - 1}.ple"
+        table = [
+            f"{prefix}.ple_embedding.ngram_embedding.shard_{i}.weight"
+            for i in range(tc.split_ngram_parts)
+        ] + [
+            f"{prefix}.ple_embedding.{name}"
+            for name in ("layer_multipliers", "ngram_heads_vocab_sizes", "ngram_heads_offsets")
+        ]
+        skip = [*visual_skip, *mtp_skip]
+        for key in table:
+            self.assertNotIn(key, mappings)
+            self.assertTrue(any(re.match(pattern, key) for pattern in skip), key)
+        for key in (k for k in mappings if k.startswith(f"{prefix}.")):
+            self.assertFalse(any(re.match(pattern, key) for pattern in skip), key)
+
+        weight_info = dict.fromkeys([*mappings, *table], [])
         Qwen4ExpForConditionalGeneration._log_load_summary(
             mappings, weight_info, visual_skip, mtp_skip
         )

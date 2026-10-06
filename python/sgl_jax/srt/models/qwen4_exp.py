@@ -36,6 +36,7 @@ from sgl_jax.srt.layers.hyperconnection import GatedResidual, HyperConnectionCon
 from sgl_jax.srt.layers.layernorm import GemmaRMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.ngram_embedding import NGramEmbedding
+from sgl_jax.srt.layers.ngram_table import NGramTable, set_ngram_table
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.recurrent_state_pool import SHORT_CONV
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
@@ -497,6 +498,11 @@ class Qwen4ExpForConditionalGeneration(Qwen3_5MoeForConditionalGeneration):
     def _weight_mappings(self, hf_config):
         return _create_qwen4_exp_weight_mappings(hf_config, getattr(self, "lm_head", None))
 
+    def load_weights(self, model_config):
+        super().load_weights(model_config)
+        if not getattr(model_config, "_dummy_mode", False):
+            _install_ngram_table(model_config)
+
 
 EntryClass = [Qwen4ExpForConditionalGeneration]
 
@@ -580,8 +586,69 @@ def _create_qwen4_exp_weight_mappings(hf_config, lm_head: ParallelLMHead | None 
         )
     )
 
-    if not tc.ple_layer_ids:
-        # No layer builds the N-gram module, but the checkpoint still ships its
-        # tensors. The loader treats both skip lists alike.
+    for i in tc.short_conv_layer_ids:
+        mappings.update(
+            _ple_mappings(
+                f"model.language_model.layers.{i}.ple", f"language_model.model.layers.{i}.ple", tc
+            )
+        )
+
+    # The loader treats both skip lists alike. With the N-gram layer on, only
+    # its table and hash buffers are skipped: they stay on the host and
+    # _install_ngram_table reads them. With it off, nothing reads any of it.
+    if tc.ple_layer_ids:
+        mtp_skip = [*mtp_skip, r"^model\.language_model\.layers\.\d+\.ple\.ple_embedding\."]
+    else:
         mtp_skip = [*mtp_skip, r"^model\.language_model\.layers\.\d+\.ple\."]
     return mappings, visual_skip, mtp_skip
+
+
+def _ple_mappings(src: str, dst: str, text_cfg) -> dict:
+    """The N-gram layer's six device parameters.
+
+    ``conv1d`` ships as ``[C, 1, K]``, the depthwise layout; the parameter
+    drops the middle axis.
+    """
+    out = {
+        f"{src}.{name}.weight": WeightSpec(
+            target_path=f"{dst}.{name}.weight", sharding=(None, None), transpose=True
+        )
+        for name in ("key_proj", "value_proj")
+    }
+    for name in ("norm_key", "norm_query", "norm_conv"):
+        out[f"{src}.{name}.weight"] = WeightSpec(
+            target_path=f"{dst}.{name}.weight", sharding=(None,), transpose=False
+        )
+    out[f"{src}.conv1d.weight"] = WeightSpec(
+        target_path=f"{dst}.conv1d_weight",
+        sharding=("tensor", None),
+        transpose=False,
+        reshape=(text_cfg.hyper_hidden_size, text_cfg.ple_conv_kernel_size),
+    )
+    return out
+
+
+def _install_ngram_table(model_config) -> None:
+    """Stream the N-gram table into host memory for the scheduler's lookup.
+
+    The table stays off the device (``ngram_table.py``): the scheduler gathers
+    each batch's rows on the host and only those reach the model.
+    """
+    from sgl_jax.srt.model_loader.weights.source import LocalSource
+
+    tc = model_config.hf_config.text_config
+    layers = tc.short_conv_layer_ids
+    if not layers:
+        return
+    if len(layers) != 1:
+        raise NotImplementedError(
+            f"the N-gram table is one per process, but layers {layers} each carry one"
+        )
+    weight_files = {
+        name: infos[0]["file"] for name, infos in LocalSource(model_config).metadata.items()
+    }
+    set_ngram_table(
+        NGramTable.from_safetensors(
+            weight_files, tc, prefix=f"model.language_model.layers.{layers[0]}.ple.ple_embedding"
+        )
+    )
