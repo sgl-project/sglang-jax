@@ -22,14 +22,15 @@ def _eagle_args(**overrides):
 
 
 def _tree_args(**overrides):
-    kwargs = dict(speculative_eagle_topk=4, speculative_num_draft_tokens=8, page_size=1)
+    kwargs = dict(speculative_eagle_topk=4, speculative_num_draft_tokens=8)
     kwargs.update(overrides)
     return _eagle_args(**kwargs)
 
 
 @pytest.mark.parametrize("algorithm", ["EAGLE", "EAGLE3"])
-def test_tree_drafting_passes(algorithm):
-    _tree_args(speculative_algorithm=algorithm).check_server_args()
+@pytest.mark.parametrize("page_size", [1, 64])
+def test_tree_drafting_passes(algorithm, page_size):
+    _tree_args(speculative_algorithm=algorithm, page_size=page_size).check_server_args()
 
 
 def test_chain_drafting_passes():
@@ -50,7 +51,6 @@ def test_tree_drafting_requires_non_overlap_before_the_overlap_gate():
 @pytest.mark.parametrize(
     "overrides, flag",
     [
-        (dict(page_size=64), "--page-size 1"),
         (dict(dp_size=2, tp_size=2), "--dp-size 1"),
         (dict(attention_backend="native"), "--attention-backend fa"),
     ],

@@ -30,16 +30,22 @@ def _mesh():
     return Mesh(np.array(jax.devices()[:1]).reshape(1, 1), ("data", "tensor"))
 
 
-def _batch(seq_lens, padded_bs, topk, steps):
-    """A dp=1 draft-decode batch at page_size=1 with real slots first."""
+def _base(request):
+    """First KV slot of a request; page-aligned for every page size tested."""
+    return 1024 * (request + 1)
+
+
+def _batch(seq_lens, padded_bs, topk, steps, page_size=1):
+    """A dp=1 draft-decode batch with real slots first."""
     real = len(seq_lens)
     seq = np.zeros(padded_bs, dtype=np.int32)
     seq[:real] = seq_lens
     alloc = np.zeros(padded_bs, dtype=np.int32)
     alloc[:real] = np.asarray(seq_lens) + steps * topk
-    # Each request owns distinct slot ids so a window can be traced to its owner.
+    # Each request owns its own pages so a window can be traced to its owner.
+    pages = -(-alloc // page_size)
     cache_loc = np.concatenate(
-        [1000 * (k + 1) + np.arange(alloc[k], dtype=np.int32) for k in range(real)]
+        [_base(k) + np.arange(pages[k] * page_size, dtype=np.int32) for k in range(real)]
     )
     cache_loc = np.pad(cache_loc, (0, 4096 - len(cache_loc)))
     return SimpleNamespace(
@@ -99,6 +105,7 @@ def _expected_rows(seq_len, step, topk, oracle, slot, width):
     return rows
 
 
+@pytest.mark.parametrize("page_size", [1, 64])
 @pytest.mark.parametrize(
     "seq_lens, padded_bs, topk, steps",
     [
@@ -107,9 +114,9 @@ def _expected_rows(seq_len, step, topk, oracle, slot, width):
         ([125, 4, 70], 4, 4, 4),  # the widest row grows from 128 to 136 within the round
     ],
 )
-def test_draft_mask_matches_attention_window(seq_lens, padded_bs, topk, steps):
-    backend = FlashAttention(8, 8, 128, page_size=1, mesh=_mesh())
-    batch = _batch(seq_lens, padded_bs, topk, steps)
+def test_draft_mask_matches_attention_window(seq_lens, padded_bs, topk, steps, page_size):
+    backend = FlashAttention(8, 8, 128, page_size=page_size, mesh=_mesh())
+    batch = _batch(seq_lens, padded_bs, topk, steps, page_size)
     metadata = backend.get_eagle_multi_step_metadata(batch)
     parents_by_step, oracle = _draft_round(padded_bs, topk, steps, seed=sum(seq_lens))
 
@@ -124,11 +131,11 @@ def test_draft_mask_matches_attention_window(seq_lens, padded_bs, topk, steps):
         for slot, seq_len in enumerate(seq_lens):
             kv_len = seq_len - 1 + (i + 1) * topk
             assert kv_lens[slot] == kv_len
-            # The page window is the request's own first kv_len slots.
-            window = np.asarray(metadata[i].page_indices)[
-                sum(len_ - 1 + (i + 1) * topk for len_ in seq_lens[:slot]) :
-            ][:kv_len]
-            np.testing.assert_array_equal(window, 1000 * (slot + 1) + np.arange(kv_len))
+            # The page window is the request's own first pages covering kv_len.
+            num_pages = -(-kv_len // page_size)
+            first = sum(-(-(len_ - 1 + (i + 1) * topk) // page_size) for len_ in seq_lens[:slot])
+            window = np.asarray(metadata[i].page_indices)[first : first + num_pages]
+            np.testing.assert_array_equal(window, _base(slot) // page_size + np.arange(num_pages))
 
             rows = mask[slot * topk : (slot + 1) * topk, 0, :]
             np.testing.assert_array_equal(
@@ -152,6 +159,7 @@ def test_chain_window_is_unchanged(seq_lens, steps):
 
 
 @pytest.mark.skipif(jax.default_backend() != "tpu", reason="Requires TPU DMA support")
+@pytest.mark.parametrize("page_size", [1, 64])
 @pytest.mark.parametrize(
     "seq_lens, padded_bs, topk, steps",
     [
@@ -159,7 +167,7 @@ def test_chain_window_is_unchanged(seq_lens, steps):
         ([300, 4, 130], 4, 3, 4),  # multiple kv blocks per sequence
     ],
 )
-def test_draft_attention_matches_tree_reference(seq_lens, padded_bs, topk, steps):
+def test_draft_attention_matches_tree_reference(seq_lens, padded_bs, topk, steps, page_size):
     """Production metadata and mask through the real kernel.
 
     Every real branch must attend over exactly its oracle-visible positions, and
@@ -167,12 +175,12 @@ def test_draft_attention_matches_tree_reference(seq_lens, padded_bs, topk, steps
     window and nowhere else.
     """
     head_dim, num_q_heads = 128, 4
-    backend = FlashAttention(num_q_heads, 1, head_dim, page_size=1, mesh=_mesh())
-    batch = _batch(seq_lens, padded_bs, topk, steps)
+    backend = FlashAttention(num_q_heads, 1, head_dim, page_size=page_size, mesh=_mesh())
+    batch = _batch(seq_lens, padded_bs, topk, steps, page_size)
     metadata = backend.get_eagle_multi_step_metadata(batch)
     parents_by_step, oracle = _draft_round(padded_bs, topk, steps, seed=len(seq_lens))
     rng = np.random.default_rng(7)
-    num_slots = 1000 * (len(seq_lens) + 1) + 1
+    num_slots = _base(len(seq_lens))
     rows = padded_bs * topk
 
     for i in range(steps - 1):
@@ -186,7 +194,7 @@ def test_draft_attention_matches_tree_reference(seq_lens, padded_bs, topk, steps
         windows = {}
         for b, seq_len in enumerate(seq_lens):
             kv = int(kv_lens[b])
-            win = 1000 * (b + 1) + np.arange(kv)
+            win = _base(b) + np.arange(kv)
             context = rng.integers(-4, 5, size=(kv - topk, 2, head_dim)).astype(np.float32)
             cache[win[: kv - topk], 0, 0] = context
             expected_cache[win[: kv - topk], 0, 0] = context
@@ -198,7 +206,7 @@ def test_draft_attention_matches_tree_reference(seq_lens, padded_bs, topk, steps
             jnp.asarray(queries, jnp.bfloat16),
             jnp.asarray(new_kv[:, 0:1], jnp.bfloat16),
             jnp.asarray(new_kv[:, 1:2], jnp.bfloat16),
-            jnp.asarray(cache, jnp.bfloat16),
+            jnp.asarray(cache.reshape(-1, page_size, *cache.shape[2:]), jnp.bfloat16),
             step.seq_lens,
             step.page_indices,
             step.cu_q_lens,
@@ -209,6 +217,7 @@ def test_draft_attention_matches_tree_reference(seq_lens, padded_bs, topk, steps
             sm_scale=head_dim**-0.5,
         )
         output, updated_cache = jax.device_get((output, updated_cache))
+        updated_cache = updated_cache.reshape(cache.shape)
 
         q_ref = jnp.asarray(queries, jnp.bfloat16).astype(np.float32)
         for b, seq_len in enumerate(seq_lens):

@@ -288,6 +288,16 @@ def front_pack_accepted_tokens(
     return packed.reshape(-1)
 
 
+def _accepted_nodes(accept_index: np.ndarray, slot: int, draft_token_num: int) -> np.ndarray:
+    """Slot ``slot``'s accepted tree nodes, in path order, as window offsets."""
+    n = draft_token_num
+    accepted = accept_index[slot][accept_index[slot] >= 0] - slot * n
+    assert len(np.unique(accepted)) == len(accepted) and np.all(
+        (accepted >= 0) & (accepted < n)
+    ), f"slot {slot}: accepted nodes {accepted} are not a path in a {n}-node tree"
+    return accepted
+
+
 def compact_accepted_paths(
     req_to_token: np.ndarray,
     req_pool_indices: np.ndarray,
@@ -318,11 +328,8 @@ def compact_accepted_paths(
     """
     n = draft_token_num
     for s in slots:
-        accepted = accept_index[s][accept_index[s] >= 0] - s * n
+        accepted = _accepted_nodes(accept_index, s, n)
         perm = np.concatenate([accepted, np.setdiff1d(np.arange(n), accepted)])
-        assert (
-            len(perm) == n and len(np.unique(perm)) == n
-        ), f"slot {s}: accepted nodes {accepted} are not a path in a {n}-node tree"
         if np.array_equal(perm, np.arange(n)):
             continue
         req = req_pool_indices[s]
@@ -335,6 +342,35 @@ def compact_accepted_paths(
         compacted = window[perm]
         req_to_token[req, start : start + n] = compacted
         cache_loc[loc : loc + n] = compacted
+
+
+def accepted_path_kv_copies(
+    req_to_token: np.ndarray,
+    req_pool_indices: np.ndarray,
+    window_starts: np.ndarray,
+    accept_index: np.ndarray,
+    slots: np.ndarray,
+    draft_token_num: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """KV slot copies that move each accepted tree path to its window front.
+
+    The page_size > 1 counterpart of ``compact_accepted_paths``: a paged
+    ``req_to_token`` must stay contiguous within each page, so the KV moves
+    instead of the pointers. Copying every ``src[i]`` to ``dst[i]`` at once
+    leaves position ``window_starts[s] + j`` holding the KV of the ``j``-th
+    accepted node. Positions past the accepted path are left as they are.
+    """
+    src, dst = [], []
+    for s in slots:
+        accepted = _accepted_nodes(accept_index, s, draft_token_num)
+        moved = np.flatnonzero(accepted != np.arange(len(accepted)))
+        start = window_starts[s]
+        window = req_to_token[req_pool_indices[s], start : start + draft_token_num]
+        src.append(window[accepted[moved]])
+        dst.append(window[moved])
+    if not src:
+        return np.empty(0, np.int32), np.empty(0, np.int32)
+    return np.concatenate(src).astype(np.int32), np.concatenate(dst).astype(np.int32)
 
 
 def assign_req_to_token_pool(

@@ -1,20 +1,24 @@
 """After an EAGLE verify: compacting the accepted tree path, and emitting it.
 
 An accepted tree path skips siblings, so its nodes are not a prefix of the
-flat verify window. Both the KV page table and the emitted tokens must follow
-the path, not the window prefix. A chain is the identity case.
+flat verify window. Both the KV behind each position and the emitted tokens
+must follow the path, not the window prefix. A chain is the identity case.
 """
 
 from types import SimpleNamespace
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.sharding import Mesh
 
+from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sgl_jax.srt.speculative.base_worker import BaseSpecWorker
 from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
 from sgl_jax.srt.speculative.eagle_util import (
+    accepted_path_kv_copies,
     compact_accepted_paths,
     front_pack_accepted_tokens,
 )
@@ -101,6 +105,103 @@ def test_cache_loc_must_mirror_the_page_table():
 def test_repeated_node_is_not_a_path():
     with pytest.raises(AssertionError, match="not a path"):
         _compact([[0, 2, 2], [0, 1], []])
+
+
+def _kv_pool(page_size, tp=1, size=640, layer_num=2):
+    """A KV pool whose every row holds ``slot + 1000 * layer``."""
+    mesh = Mesh(
+        np.array(jax.devices()[:tp]).reshape(1, tp),
+        ("data", "tensor"),
+        axis_types=(jax.sharding.AxisType.Explicit,) * 2,
+    )
+    pool = MHATokenToKVPool(
+        size=size,
+        page_size=page_size,
+        dtype=jnp.float32,
+        head_num=tp,
+        head_dim=128,
+        layer_num=layer_num,
+        mesh=mesh,
+    )
+    for layer, kv in enumerate(pool.kv_buffer):
+        values = np.arange(kv.shape[0] * kv.shape[1]).reshape(kv.shape[:2]) + 1000 * layer
+        filled = np.broadcast_to(values[:, :, None, None, None], kv.shape).astype(np.float32)
+        pool.kv_buffer[layer] = jax.device_put(filled, pool.kv_sharding)
+    return pool
+
+
+def _rows(pool, slots):
+    """``(layer_num, len(slots))``: which slot's original KV each slot now holds."""
+    out = []
+    for layer, kv in enumerate(pool.kv_buffer):
+        kv = np.asarray(kv)
+        rows = kv.reshape(-1, *kv.shape[2:])[np.asarray(slots)]
+        assert np.all(rows == rows[:, :1, :1, :1]), "a row mixes KV from several slots"
+        out.append(rows[:, 0, 0, 0] - 1000 * layer)
+    return np.stack(out).astype(np.int64)
+
+
+@pytest.mark.parametrize(
+    "tp",
+    [
+        1,
+        pytest.param(4, marks=pytest.mark.skipif(len(jax.devices()) < 4, reason="needs 4 devices")),
+    ],
+)
+def test_kv_rows_are_copied_all_at_once(tp):
+    pool = _kv_pool(page_size=8, tp=tp)
+    num_slots = pool.kv_buffer[0].shape[0] * pool.kv_buffer[0].shape[1]
+    # 11 and 20 are both read and written; 0 -> 0 is padding.
+    pool.copy_kv_rows(np.array([10, 11, 20, 0]), np.array([11, 20, 5, 0]))
+
+    expected = np.arange(num_slots)
+    expected[[11, 20, 5]] = [10, 11, 20]
+    np.testing.assert_array_equal(_rows(pool, np.arange(num_slots)), [expected, expected])
+
+
+def test_chain_path_needs_no_kv_copies():
+    req_to_token, req_pool_indices, _, _, window_starts = _pool()
+    src, dst = accepted_path_kv_copies(
+        req_to_token,
+        req_pool_indices,
+        window_starts,
+        _accept_index([[0, 1, 2], [0, 1, 2, 3], []]),
+        np.array([0, 1]),
+        N,
+    )
+    assert src.size == dst.size == 0
+
+
+@pytest.mark.parametrize("page_size", [1, 8])
+def test_accepted_path_kv_lands_at_the_window_front(page_size):
+    """Pointer compaction (page_size 1) and KV copies (paged) agree."""
+    paths = [[0, 2, 5], [0, 1, 3], []]
+    req_to_token, req_pool_indices, cache_loc, cache_loc_starts, window_starts = _pool()
+    before = req_to_token.copy()
+    pool = _kv_pool(page_size)
+    worker = SimpleNamespace(
+        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+        page_size=page_size,
+        speculative_num_draft_tokens=N,
+        target_worker=SimpleNamespace(model_runner=SimpleNamespace(token_to_kv_pool=pool)),
+    )
+    mwb = SimpleNamespace(
+        req_pool_indices=req_pool_indices,
+        cache_loc=cache_loc,
+        draft_cache_loc_starts=cache_loc_starts,
+        seq_lens=window_starts,
+        logits_indices_selector=np.array([0, 1]),
+    )
+    BaseSpecWorker._move_accepted_paths_to_front(worker, mwb, _accept_index(paths))
+
+    for s, path in enumerate(paths[:2]):
+        req, start = req_pool_indices[s], window_starts[s]
+        committed = req_to_token[req, : start + len(path)]
+        expected = np.concatenate([before[req, :start], before[req, start + np.asarray(path)]])
+        np.testing.assert_array_equal(_rows(pool, committed), [expected, expected])
+    if page_size > 1:
+        # Paged tables stay page-contiguous: only the KV moves.
+        np.testing.assert_array_equal(req_to_token, before)
 
 
 @pytest.mark.parametrize("draft_token_num", [N, 3])

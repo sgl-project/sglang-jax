@@ -2219,8 +2219,6 @@ class ServerArgs:
             raise ValueError(f"{flag} requires --disable-overlap-schedule.")
         if self.attention_backend != "fa":
             raise ValueError(f"{flag} requires --attention-backend fa.")
-        if self.page_size != 1:
-            raise ValueError(f"{flag} requires --page-size 1.")
         if self.dp_size != 1:
             raise ValueError(f"{flag} requires --dp-size 1.")
         # The verify tree picks num_draft_tokens - 1 nodes out of the drafted

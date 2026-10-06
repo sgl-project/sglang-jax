@@ -12,7 +12,9 @@ import numpy as np
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sgl_jax.srt.speculative.eagle_util import (
+    accepted_path_kv_copies,
     compact_accepted_paths,
     front_pack_accepted_tokens,
 )
@@ -104,6 +106,14 @@ class BaseSpecWorker:
         )
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = target_worker.get_memory_pool()
+        kv_pool = target_worker.model_runner.token_to_kv_pool
+        if self.topk > 1 and self.page_size > 1 and type(kv_pool) is not MHATokenToKVPool:
+            # A paged tree verify copies the accepted path's KV rows, which
+            # covers the fused KV buffer only.
+            raise NotImplementedError(
+                f"--speculative-eagle-topk > 1 with --page-size > 1 does not support "
+                f"{type(kv_pool).__name__}; use --page-size 1."
+            )
 
         (
             self.precompile_token_paddings,
@@ -366,6 +376,41 @@ class BaseSpecWorker:
             model_worker_batch.seq_lens,
         )
 
+    def _move_accepted_paths_to_front(
+        self, model_worker_batch: ModelWorkerBatch, accept_index: np.ndarray
+    ) -> None:
+        req_to_token = self.req_to_token_pool.req_to_token
+        slots = np.asarray(model_worker_batch.logits_indices_selector)
+        if self.page_size == 1:
+            compact_accepted_paths(
+                req_to_token,
+                model_worker_batch.req_pool_indices,
+                model_worker_batch.cache_loc,
+                model_worker_batch.draft_cache_loc_starts,
+                model_worker_batch.seq_lens,
+                accept_index,
+                slots,
+                self.speculative_num_draft_tokens,
+            )
+            return
+        src, dst = accepted_path_kv_copies(
+            req_to_token,
+            model_worker_batch.req_pool_indices,
+            model_worker_batch.seq_lens,
+            accept_index,
+            slots,
+            self.speculative_num_draft_tokens,
+        )
+        if src.size == 0:
+            return
+        # Node 0 never moves, so a slot needs at most accept_width - 1 copies.
+        # Padding to that bound compiles the copy once per batch bucket; slot 0
+        # is never allocated, so the 0 -> 0 padding pairs are no-ops.
+        pad = accept_index.size - accept_index.shape[0] - src.size
+        self.target_worker.model_runner.token_to_kv_pool.copy_kv_rows(
+            np.pad(src, (0, pad)), np.pad(dst, (0, pad))
+        )
+
     def verify(self, model_worker_batch: ModelWorkerBatch, cur_allocate_lens: jax.Array):
         from sgl_jax.srt.managers.scheduler import GenerationBatchResult
         from sgl_jax.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
@@ -399,16 +444,8 @@ class BaseSpecWorker:
         bs = accept_length.shape[0]
         accept_width = self.speculative_num_steps + 1
         if self.topk > 1:
-            req_to_token_pool, _ = self.target_worker.get_memory_pool()
-            compact_accepted_paths(
-                req_to_token_pool.req_to_token,
-                model_worker_batch.req_pool_indices,
-                model_worker_batch.cache_loc,
-                model_worker_batch.draft_cache_loc_starts,
-                model_worker_batch.seq_lens,
-                accept_index.reshape(bs, accept_width),
-                np.asarray(model_worker_batch.logits_indices_selector),
-                self.speculative_num_draft_tokens,
+            self._move_accepted_paths_to_front(
+                model_worker_batch, accept_index.reshape(bs, accept_width)
             )
         emitted = front_pack_accepted_tokens(
             verified_id, accept_width, self.speculative_num_draft_tokens

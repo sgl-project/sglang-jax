@@ -96,9 +96,7 @@ class TestSpeculativeDecodingTree(CustomTestCase):
     """EAGLE3 tree drafting (topk > 1).
 
     num_steps=3 runs two draft forwards, so the per-step tree mask is built
-    from real parents at a step beyond the first. At page_size=1 the draft
-    page table holds 16384 slots across the batch, which bounds
-    max_running_requests * context_length.
+    from real parents at a step beyond the first.
     """
 
     @classmethod
@@ -119,13 +117,13 @@ class TestSpeculativeDecodingTree(CustomTestCase):
                 "--download-dir",
                 "/dev/shm",
                 "--max-running-requests",
-                "8",
+                "64",
                 "--precompile-bs-paddings",
-                "8",
+                "16",
                 "--precompile-token-paddings",
-                "1024",
+                "4096",
                 "--context-length",
-                "1024",
+                "4096",
                 "--speculative-draft-model-path",
                 QWEN3_32B_EAGLE3,
                 "--speculative-draft-model-revision",
@@ -140,7 +138,7 @@ class TestSpeculativeDecodingTree(CustomTestCase):
                 "--speculative-algorithm",
                 "EAGLE3",
                 "--page-size",
-                "1",
+                "64",
                 "--attention-backend",
                 "fa",
                 "--dtype",
@@ -180,8 +178,8 @@ class TestSpeculativeDecodingTree(CustomTestCase):
             model=self.model,
             eval_name="mmlu",
             num_examples=64,
-            num_threads=8,
-            max_tokens=512,
+            num_threads=16,
+            max_tokens=1024,
         )
         metrics = run_eval(args)
         self.assertGreater(metrics["score"], 0.45)
