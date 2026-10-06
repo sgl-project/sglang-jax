@@ -15,6 +15,7 @@ import unittest
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.experimental.pallas import tpu as pltpu
 
 from sgl_jax.srt.kernels.qsa.ref import sparse_gqa_attention_ref
 from sgl_jax.srt.kernels.qsa.sparse_gqa_attention import sparse_gqa_attention
@@ -74,7 +75,7 @@ def _build(
     )
 
 
-def _run(case, *, block_units=16):
+def _run(case, *, block_units=16, interpret=INTERPRET):
     return sparse_gqa_attention(
         case["q"],
         case["blk"],
@@ -85,7 +86,7 @@ def _run(case, *, block_units=16):
         sm_scale=HEAD_DIM**-0.5,
         ratio=RATIO,
         block_units=block_units,
-        interpret=INTERPRET,
+        interpret=interpret,
     )
 
 
@@ -206,6 +207,26 @@ class TestSparseGQAParity(CustomTestCase):
         got = _run({**case, "cache": _repack(case, poisoned)})
         self.assertTrue(bool(jnp.all(jnp.isfinite(got))))
         self.assertLess(_rel_err(got, base), 1e-6)
+
+    def test_padding_chunks_are_left_unfetched(self):
+        """A query sees (pos + 1) // ratio blocks; ids past them are -1 at the
+        tail, and the chunks holding only -1 are not fetched. Off TPU this runs
+        the TPU interpreter with unwritten memory filled with NaN, so reading
+        rows nothing wrote for this query turns its output into NaN. Positions
+        1 and 2 see no block at all, 20 fills one chunk of four, and 71 closes
+        its group with three chunks live."""
+        case = _build(dtype=jnp.float32, t_count=4, k_blocks=32, n_reqs=1, seed=17)
+        positions = np.array([1, 2, 20, 71], np.int32)
+        blocks = np.full((4, 32), -1, np.int32)
+        for t, p in enumerate(positions):
+            visible = (p + 1) // RATIO
+            blocks[t, :visible] = np.arange(visible, dtype=np.int32)[::-1]
+        case["pos"] = jnp.asarray(positions)
+        case["blk"] = jnp.asarray(blocks)
+        interpret = pltpu.InterpretParams(uninitialized_memory="nan") if INTERPRET else False
+        got = _run(case, block_units=8, interpret=interpret)
+        self.assertTrue(bool(jnp.all(jnp.isfinite(got))))
+        self.assertLess(_rel_err(got, _reference(case)), 1e-5)
 
     def test_swapped_kv_is_rejected(self):
         """Reading V where K lives is an O(1) error, well clear of the bf16

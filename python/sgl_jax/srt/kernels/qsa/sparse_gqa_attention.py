@@ -176,12 +176,25 @@ def _kernel(
         valid = (u_vec >= 0) & (in_range > 0) & (kpos <= qpos)
         return _attend(jnp.where(valid, 0.0, float("-inf")), carry)
 
+    # Block ids arrive in descending score order with the -1 padding at the
+    # tail, so the chunks holding a valid block are a prefix: count them from
+    # each chunk's first id and leave the padding chunks unfetched.
+    live = sum((blk_ref[0, 0, c * G] >= 0).astype(jnp.int32) for c in range((K + G - 1) // G))
+
+    # With no live chunk nothing writes the gather rows before the tail step
+    # reads them, so they are zeroed instead.
+    @pl.when(live == 0)
+    def _():
+        kv_scratch[pl.ds(0, G * ratio)] = jnp.zeros(
+            (G * ratio,) + kv_scratch.shape[1:], kv_scratch.dtype
+        )
+
     carry = (
         jnp.full((heads,), float("-inf"), jnp.float32),
         jnp.zeros((heads,), jnp.float32),
         jnp.zeros((heads, head_dim), jnp.float32),
     )
-    carry = jax.lax.fori_loop(0, (K + G - 1) // G, chunk_body, carry)
+    carry = jax.lax.fori_loop(0, live, chunk_body, carry)
 
     # The open group: tokens after the last complete block. They never entered
     # the compressed cache, so they never competed in the top-k, but they are
@@ -190,7 +203,8 @@ def _kernel(
 
     # A closed group leaves no open tokens, and the unit past it may not be
     # written yet, so it is not fetched. The step then masks every lane over
-    # rows the last chunk already attended, and contributes nothing.
+    # rows already in the buffer (the last chunk's, or zeros) and contributes
+    # nothing.
     @pl.when(tail_unit * ratio <= qpos)
     def _():
         copy = _copy(tail_unit, 0)
@@ -226,6 +240,11 @@ def sparse_gqa_attention(
     costs a DMA semaphore and the sflag space holds about 384, so it is a
     ceiling, not a knob with an open top: 512 blocks at 128 per chunk is four
     chunks with room left for the query and output semaphores.
+
+    ``block_ids`` rows hold their valid ids first and -1 after, the order
+    ``select_topk_indices`` returns. A query that sees fewer than K blocks
+    fetches only the chunks holding one, so its cost follows its context up to
+    the K-block budget instead of always paying for K.
 
     The index tables reach SMEM one query at a time: its row of ``block_ids``
     and its request's row of ``page_table``, as blocks the pipeline fetches
