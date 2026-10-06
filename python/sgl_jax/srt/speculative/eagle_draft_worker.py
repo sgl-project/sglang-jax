@@ -22,7 +22,6 @@ from sgl_jax.srt.speculative.eagle_util import (
     build_chain_verify_inputs,
     build_chain_verify_inputs_device,
     build_tree_kernel_efficient,
-    build_tree_mask_for_draft_decode,
 )
 from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -445,15 +444,6 @@ class EagleDraftWorker(BaseDraftWorker):
         topk_index = spec_info.topk_index
         if map_hot_token_ids and self.hot_token_ids is not None:
             model_worker_batch.spec_info_padded.topk_index = self._map_hot_token_ids(topk_index)
-        if self.topk > 1:
-            self.draft_model_runner.attn_backend.forward_metadata.custom_mask = (
-                build_tree_mask_for_draft_decode(
-                    model_worker_batch.seq_lens,
-                    topk=topk_index.shape[1],
-                    speculative_step_id=0,
-                    parents_list=None,
-                )
-            )
         bs = self.precompile_bs_paddings[padding_bs_index]
         dp_size = model_worker_batch.dp_size
         per_dp_padded = bs // dp_size
@@ -511,7 +501,9 @@ class EagleDraftWorker(BaseDraftWorker):
         token_list: jax.Array = jnp.empty(
             (bs, self.topk + step_min_1 * self.topk * self.topk), dtype=jnp.int32
         )
-        parents_list: jax.Array = jnp.empty((bs, self.topk + 1 + step_min_1 * self.topk))
+        parents_list: jax.Array = jnp.empty(
+            (bs, self.topk + 1 + step_min_1 * self.topk), dtype=jnp.int32
+        )
         scores = None
         positions_base = device_array(
             np.repeat(model_worker_batch.seq_lens, self.topk),
@@ -529,6 +521,8 @@ class EagleDraftWorker(BaseDraftWorker):
         forward_batch.cache_loc = np.empty((1,))
         forward_batch.spec_info = EagleDraftInput()
         forward_batch.spec_info.hidden_states = jnp.empty((bs * self.topk, hidden_states.shape[1]))
+        attn_backend = self.draft_model_runner.attn_backend
+        parents_by_step = []
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
@@ -542,7 +536,13 @@ class EagleDraftWorker(BaseDraftWorker):
             forward_batch = update_forward_batch_info(
                 forward_batch, i, input_ids, hidden_states, positions_base
             )
-            self.draft_model_runner.attn_backend.forward_metadata = metadata_per_step[i]
+            if self.topk > 1:
+                # Siblings drafted at the same step must not see each other.
+                parents_by_step.append(tree_info[2])
+                metadata_per_step[i].custom_mask = attn_backend.get_eagle_draft_decode_mask(
+                    model_worker_batch, i, parents_by_step
+                )
+            attn_backend.forward_metadata = metadata_per_step[i]
 
             forward_batch.bid = model_worker_batch.bid
             logits_output, _, _ = self.draft_model_runner.forward(
@@ -739,7 +739,7 @@ def select_top_k_tokens_step_0(
         jnp.expand_dims(topk_p, axis=1),
         topk_index,
         jnp.tile(
-            jnp.expand_dims(jnp.arange(-1, topk, dtype=jnp.float32), axis=0),
+            jnp.expand_dims(jnp.arange(-1, topk, dtype=jnp.int32), axis=0),
             (topk_p.shape[0], 1),
         ),
     )

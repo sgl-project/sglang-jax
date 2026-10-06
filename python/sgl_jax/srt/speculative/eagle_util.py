@@ -73,19 +73,20 @@ def build_tree_mask_for_draft_decode(
     seq_lens: jax.Array | np.ndarray,
     topk: int,
     speculative_step_id: int,
-    parents_list: Sequence[jax.Array],
-) -> jax.Array:
+    parents_list: Sequence[jax.Array | np.ndarray],
+) -> np.ndarray:
     """
     Build flattened custom mask for draft decode that respects branch ancestry.
 
     Args:
-        seq_lens: Sequence lengths (prompt+accepted) for each request.
+        seq_lens: Length of the context every branch sees, per request.
         topk: Number of speculative branches processed in parallel.
         speculative_step_id: Current speculative step (0-indexed).
-        parents_list: List of parent index tensors produced by ``select_top_k_tokens``.
+        parents_list: Parent index tensors produced by ``select_top_k_tokens``,
+            one per step; entry ``s`` is read for every ``1 <= s <= step``.
 
     Returns:
-        Flattened boolean mask concatenating ``topk`` rows per request.
+        Host int32 mask (1 = keep), ``topk`` rows of ``kv_len`` per request.
     """
 
     if topk <= 0:
@@ -123,10 +124,9 @@ def build_tree_mask_for_draft_decode(
         masks.append(mask.reshape(-1))
 
     if not masks:
-        return jnp.zeros((0,), dtype=jnp.bool_)
+        return np.zeros((0,), dtype=np.int32)
 
-    concatenated = np.concatenate(masks)
-    return jnp.asarray(concatenated, dtype=jnp.int32)
+    return np.concatenate(masks).astype(np.int32)
 
 
 def build_chain_verify_inputs(

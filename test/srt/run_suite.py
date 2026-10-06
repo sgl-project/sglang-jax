@@ -287,6 +287,11 @@ suites = {
         TestFile("test/srt/kernels/hca/test_cache.py", 3, runner="pytest"),
         TestFile("python/sgl_jax/test/mem_cache/test_hicache_e2e_tpu.py", 1, runner="pytest"),
         TestFile("python/sgl_jax/test/speculative/test_eagle_tree_build.py", 0.2),
+        TestFile(
+            "python/sgl_jax/test/speculative/test_eagle_draft_decode_mask.py",
+            0.5,
+            runner="pytest",
+        ),
         TestFile("python/sgl_jax/test/speculative/test_eagle_utils.py", 0.2),
         TestFile("python/sgl_jax/test/multimodal/test_wan_vae_precision.py", 0.5),
         TestFile("python/sgl_jax/test/multimodal/test_vae_scheduler.py", 0.2),
