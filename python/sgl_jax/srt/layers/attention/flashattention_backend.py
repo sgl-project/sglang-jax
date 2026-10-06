@@ -22,7 +22,6 @@ from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
-from sgl_jax.srt.speculative.eagle_util import build_tree_mask_for_draft_decode
 from sgl_jax.srt.utils import cdiv
 from sgl_jax.srt.utils.jax_utils import device_array
 from sgl_jax.srt.utils.profiling_utils import named_scope
@@ -128,6 +127,35 @@ def _expand_verify_tree_mask(tree_mask, context_lens, draft_token_num: int, widt
         mask = mask | (tree[:, :, k : k + 1] * (rel == k)[:, None, :])
     mask = jnp.where((context_lens >= 0)[:, None, None], mask, 0)
     return mask.reshape(bs * q, 1, width)
+
+
+@partial(jax.jit, static_argnames=("topk", "width"))
+def _draft_decode_tree_mask(context_lens, parents_by_step, topk: int, width: int):
+    """Draft-decode tree mask, ``topk`` rows per slot, as `[rows, 1, W]` int32.
+
+    At step ``len(parents_by_step)``, branch ``b`` of a slot sees the slot's
+    first ``context_lens`` columns, then one column in every step's
+    ``topk``-wide block: its own ancestor's. ``parents_by_step[s - 1]`` is the
+    parent array ``select_top_k_tokens`` produced at step ``s``: per branch,
+    ``topk + topk * topk * (s - 1)`` plus the branch's index among the step's
+    ``topk * topk`` candidates, which are laid out parent-major. Slots with
+    ``context_lens < 0`` are padding and stay fully masked.
+    """
+    bs = context_lens.shape[0]
+    col = jnp.arange(width, dtype=jnp.int32)[None, None, :]
+    base = context_lens[:, None, None]
+    node = jnp.broadcast_to(jnp.arange(topk, dtype=jnp.int32), (bs, topk))
+    mask = jnp.broadcast_to(col < base, (bs, topk, width))
+    for step in range(len(parents_by_step), -1, -1):
+        mask = mask | (col == base + step * topk + node[:, :, None])
+        if step > 0:
+            offset = topk + topk * topk * (step - 1)
+            parent = jnp.clip(
+                (parents_by_step[step - 1].astype(jnp.int32) - offset) // topk, 0, topk - 1
+            )
+            node = sum(jnp.where(node == k, parent[:, k : k + 1], 0) for k in range(topk))
+    mask = mask & (context_lens >= 0)[:, None, None]
+    return mask.astype(jnp.int32).reshape(bs * topk, 1, width)
 
 
 def _draft_decode_kv_lens(seq_lens, speculative_step_id: int, topk: int) -> np.ndarray:
@@ -753,42 +781,37 @@ class FlashAttention(AttentionBackend):
         Each of a slot's ``topk`` rows is one branch: it sees the draft context
         and its own ancestor in every earlier step's block, never a sibling.
         ``parents_by_step[s]`` is the parent pointer array ``select_top_k_tokens``
-        produced at step ``s``.
+        produced at step ``s``. The mask is built on device from them, so the
+        draft loop does not wait for a step's forward to finish.
 
         Rows follow the draft-decode ``cu_q_lens`` (``topk`` per slot, padding
-        included). That matches ``_pack_verify_mask``'s row order because
-        padding slots trail the real ones in every DP rank. ``W`` is sized for
-        the round's last draft step, so every step of a round shares one shape.
+        included), which is slot order because padding slots trail the real
+        ones in every DP rank. ``W`` is sized for the round's last draft step,
+        so every step of a round shares one shape.
         """
         topk = batch.speculative_eagle_topk
         seq_lens = np.asarray(batch.seq_lens)
         dp_size = batch.dp_size
         per_dp_bs = batch.per_dp_bs_size if dp_size > 1 else len(seq_lens)
-        valid = seq_lens > 0
         assert _padding_trails(
             seq_lens, dp_size, per_dp_bs
         ), "draft-decode padding slots must trail the real slots in each DP rank"
 
-        kv_lens = _draft_decode_kv_lens(seq_lens, speculative_step_id, topk)
         last_step = max(batch.speculative_num_steps - 2, 0)
         widest = _draft_decode_kv_lens(seq_lens, last_step, topk)
         aligned_widest = ((widest + self.page_size - 1) // self.page_size) * self.page_size
-
-        flat = build_tree_mask_for_draft_decode(
-            seq_lens[valid] - 1,
+        replicated = NamedSharding(self.mesh, P())
+        context_lens = np.where(seq_lens > 0, seq_lens - 1, -1).astype(np.int32)
+        mask = _draft_decode_tree_mask(
+            jax.device_put(context_lens, replicated),
+            tuple(
+                jax.device_put(parents, replicated)
+                for parents in parents_by_step[1 : speculative_step_id + 1]
+            ),
             topk=topk,
-            speculative_step_id=speculative_step_id,
-            parents_list=[np.asarray(parents)[valid] for parents in parents_by_step],
+            width=mask_row_width(aligned_widest),
         )
-        assert flat.size == topk * int(kv_lens.sum()), (
-            f"draft tree mask has {flat.size} entries, attention expects "
-            f"{topk * int(kv_lens.sum())} (topk={topk}, kv_lens={kv_lens})"
-        )
-        mask_off = np.concatenate([[0], np.cumsum(topk * kv_lens.astype(np.int64))])
-        packed = _pack_verify_mask(
-            flat, kv_lens, aligned_widest, mask_off, topk, dp_size, per_dp_bs
-        )
-        return device_array(packed, sharding=NamedSharding(self.mesh, P("data")))
+        return jax.device_put(mask, NamedSharding(self.mesh, P("data")))
 
     def tree_flatten(self):
         children = (self.forward_metadata,)

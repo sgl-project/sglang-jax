@@ -147,6 +147,21 @@ def test_draft_mask_matches_attention_window(seq_lens, padded_bs, topk, steps, p
     assert len(widths) == 1, "every step of a round must share one mask shape"
 
 
+def test_draft_mask_does_not_read_parents_back():
+    """A step's mask is built from that step's parents without waiting for
+    them, so it must trace with the parents abstract."""
+    topk, steps = 2, 4
+    backend = FlashAttention(8, 8, 128, page_size=1, mesh=_mesh())
+    batch = _batch([5, 9, 3], 4, topk, steps)
+    parents_by_step, _ = _draft_round(4, topk, steps, seed=0)
+    for i in range(steps - 1):
+        shape = jax.eval_shape(
+            lambda parents, i=i: backend.get_eagle_draft_decode_mask(batch, i, parents),
+            parents_by_step[: i + 1],
+        )
+        assert shape.shape[:2] == (4 * topk, 1)
+
+
 @pytest.mark.parametrize("seq_lens, steps", [([5, 9, 3], 4), ([1, 40], 3)])
 def test_chain_window_is_unchanged(seq_lens, steps):
     """topk == 1 keeps the pre-tree layout: kv_len = seq_len + step."""
