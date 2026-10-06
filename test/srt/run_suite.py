@@ -418,6 +418,11 @@ suites = {
             0.2,
             runner="pytest",
         ),
+        TestFile(
+            "python/sgl_jax/test/speculative/test_eagle_server_args.py",
+            0.2,
+            runner="pytest",
+        ),
         TestFile("python/sgl_jax/test/speculative/test_spec_info.py", 0.2, runner="pytest"),
         TestFile("python/sgl_jax/test/models/test_dflash.py", 0.2, runner="pytest"),
         TestFile("python/sgl_jax/test/models/test_mimo_v2_nextn.py", 0.2, runner="pytest"),

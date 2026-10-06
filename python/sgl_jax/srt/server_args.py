@@ -2111,6 +2111,18 @@ class ServerArgs:
         # Check LoRA configuration
         self.check_lora_server_args()
 
+        # Tree drafting is checked before the overlap gate so a topk > 1 config
+        # is rejected for what it is, whatever the overlap setting.
+        if (
+            self.speculative_algorithm is not None
+            and self.speculative_algorithm not in ("DFLASH", "DSPARK")
+            and self.speculative_eagle_topk > 1
+        ):
+            raise ValueError(
+                "EAGLE tree drafting (--speculative-eagle-topk > 1) is not supported. "
+                "Use --speculative-eagle-topk 1."
+            )
+
         # Speculative overlap uses a fused linear-chain path or DFlash's
         # dedicated relay-backed draft/verify path.
         if self.speculative_algorithm is not None and not self.disable_overlap_schedule:
