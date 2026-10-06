@@ -30,6 +30,10 @@ class RaidenTransferWrapper:
         self._init_lock = threading.Lock()
         self._engines: dict[int, Any] = {}
         self._endpoints_by_dp_rank: dict[int, list[Any]] = {}
+        # Optional hybrid-model recurrent state engines: (group, dp_rank) -> manager.
+        self._recurrent_engines: dict[tuple[str, int], Any] = {}
+        self._recurrent_endpoints_by_dp_rank: dict[int, dict[str, list[Any]]] = {}
+        self._recurrent_groups: tuple[str, ...] = ()
 
     @property
     def host_ip(self) -> str:
@@ -115,7 +119,79 @@ class RaidenTransferWrapper:
                 )
         return self.engine
 
-    def _engine_for_rank(self, dp_rank: int) -> Any:
+    def start_recurrent(
+        self,
+        state_caches: dict[str, list[Any]],
+        *,
+        num_slots: int,
+        dp_size: int = 1,
+        timeout_s: float = 120.0,
+    ) -> None:
+        """Start one Raiden manager per (recurrent group, DP rank).
+
+        Recurrent state is indexed by a rank-local slot, not by KV page, and
+        its per-slot shape differs from the paged KV layout, so it cannot share
+        the KV manager's block space. Each group (e.g. temporal state, conv
+        state) holds same-shaped per-layer buffers whose axis 0 is the slot
+        axis; one Raiden "block" is one request slot.
+        """
+
+        if not self._engines:
+            raise RuntimeError("start() must be called before start_recurrent()")
+        if self._recurrent_engines:
+            return
+        if num_slots <= 0:
+            raise ValueError("Raiden num_slots must be positive")
+        KVCacheManager = get_raiden_kv_cache_manager()
+        with self._init_lock:
+            if self._recurrent_engines:
+                return
+            for group, caches in state_caches.items():
+                if not caches:
+                    raise ValueError(f"Raiden recurrent group {group!r} has no buffers")
+                for dp_rank, rank_caches in _split_kv_caches_by_dp_rank(
+                    list(caches), int(dp_size)
+                ).items():
+                    engine = KVCacheManager(
+                        kv_caches=rank_caches,
+                        local_control_port=0,
+                        max_blocks=1,
+                        num_slots=int(num_slots),
+                        timeout_s=float(timeout_s),
+                        parallelism=self._parallelism,
+                        unsafe_skip_buffer_lock=True,
+                    )
+                    endpoints = list(engine.get_local_endpoints())
+                    self._recurrent_engines[(group, dp_rank)] = engine
+                    self._recurrent_endpoints_by_dp_rank.setdefault(dp_rank, {})[group] = endpoints
+                    logger.info(
+                        "Raiden recurrent group=%s started for dp_rank=%d with endpoints=%s",
+                        group,
+                        dp_rank,
+                        endpoints,
+                    )
+            self._recurrent_groups = tuple(state_caches)
+
+    @property
+    def recurrent_groups(self) -> tuple[str, ...]:
+        return self._recurrent_groups
+
+    @property
+    def recurrent_endpoints_by_dp_rank(self) -> dict[int, dict[str, list[Any]]]:
+        return {
+            rank: {group: list(eps) for group, eps in groups.items()}
+            for rank, groups in self._recurrent_endpoints_by_dp_rank.items()
+        }
+
+    def _engine_for_rank(self, dp_rank: int, group: str | None = None) -> Any:
+        if group is not None:
+            try:
+                return self._recurrent_engines[(group, int(dp_rank))]
+            except KeyError as exc:
+                raise ValueError(
+                    f"Raiden recurrent group={group!r} dp_rank={dp_rank} is unavailable; "
+                    f"started={sorted(self._recurrent_engines)}"
+                ) from exc
         try:
             return self._engines[int(dp_rank)]
         except KeyError as exc:
@@ -124,11 +200,19 @@ class RaidenTransferWrapper:
             ) from exc
 
     def register_read(
-        self, req_id: str, uuid: int, block_ids: list[int], *, dp_rank: int = 0
+        self,
+        req_id: str,
+        uuid: int,
+        block_ids: list[int],
+        *,
+        dp_rank: int = 0,
+        group: str | None = None,
     ) -> bool:
         if not self._engines:
             raise RuntimeError("RaidenTransferWrapper.start() must be called first")
-        return bool(self._engine_for_rank(dp_rank).register_read(req_id, uuid, list(block_ids)))
+        return bool(
+            self._engine_for_rank(dp_rank, group).register_read(req_id, uuid, list(block_ids))
+        )
 
     def start_read(
         self,
@@ -139,10 +223,11 @@ class RaidenTransferWrapper:
         local_block_ids: list[int],
         *,
         decode_dp_rank: int = 0,
+        group: str | None = None,
     ) -> None:
         if not self._engines:
             raise RuntimeError("RaidenTransferWrapper.start() must be called first")
-        self._engine_for_rank(decode_dp_rank).start_read(
+        self._engine_for_rank(decode_dp_rank, group).start_read(
             req_id,
             uuid,
             remote_endpoint,
@@ -157,12 +242,17 @@ class RaidenTransferWrapper:
         sent: list[str] = []
         received: list[str] = []
         failed: list[str] = []
-        for dp_rank, engine in self._engines.items():
+        engines = [(f"dp_rank={rank}", engine) for rank, engine in self._engines.items()]
+        engines.extend(
+            (f"recurrent={group} dp_rank={rank}", engine)
+            for (group, rank), engine in self._recurrent_engines.items()
+        )
+        for label, engine in engines:
             try:
                 rank_sent, rank_received, rank_failed = engine.poll_stats()
             except Exception:
                 # Preserve events already drained from healthy ranks.
-                logger.exception("Raiden poll_stats failed for dp_rank=%d", dp_rank)
+                logger.exception("Raiden poll_stats failed for %s", label)
                 continue
             sent.extend(rank_sent)
             received.extend(rank_received)

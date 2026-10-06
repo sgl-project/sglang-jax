@@ -1231,6 +1231,21 @@ class Scheduler(
         req.disagg_prefill_dp_rank = getattr(recv_req, "disagg_prefill_dp_rank", None)
         req.disagg_transfer_id = recv_req.disagg_transfer_id or req.rid
         if (
+            self.server_args.disaggregation_mode == "prefill"
+            and req.bootstrap_room is not None
+            and getattr(self.req_to_token_pool, "recurrent_state_pool", None) is not None
+        ):
+            from sgl_jax.srt.disaggregation.common.recurrent_state import (
+                pd_transfer_prompt_len,
+            )
+
+            # Hybrid model: P must not consume the last prompt token, because D
+            # re-runs it and recurrent/conv state is cumulative (not idempotent
+            # like KV). See pd_transfer_prompt_len.
+            req.pd_prefill_skip_last_token = pd_transfer_prompt_len(
+                len(req.origin_input_ids), True
+            ) < len(req.origin_input_ids)
+        if (
             getattr(self.server_args, "disaggregation_enable_overlap_schedule", False)
             and self.server_args.disaggregation_mode == "prefill"
             and req.bootstrap_room is None
@@ -2786,6 +2801,11 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            # PD decode: a received hybrid request owns its recurrent slot
+            # before it gets a request row; return it (no-op otherwise).
+            release_recurrent = getattr(self, "_release_decode_recurrent_slot", None)
+            if release_recurrent is not None:
+                release_recurrent(req)
             abort_out = AbortReq(rid=req.rid)
             if self._comm_backend is not None:
                 self._comm_backend.send_pyobj(abort_out)
@@ -2837,6 +2857,7 @@ class Scheduler(
                     entry.receiver.abort()
                 if entry.kv_indices is not None:
                     self._release_decode_kv_indices(entry.kv_indices, entry.req.dp_rank)
+                self._release_decode_recurrent_slot(entry.req)
                 self._abort_decode_request(
                     entry.req,
                     "abort_request",

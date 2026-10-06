@@ -462,7 +462,12 @@ class SchedulerDisaggregationPrefillMixin:
         ]
         if ready_to_transfer and handoffs is None:
             kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
-            self.disagg_kv_manager.prepare_prefill_batch(kv_pool.kv_buffer)
+            rsp = self._prefill_recurrent_state_pool()
+            self.disagg_kv_manager.prepare_prefill_batch(
+                kv_pool.kv_buffer
+                if rsp is None
+                else [*kv_pool.kv_buffer, *rsp.recurrent_buffers, *rsp.conv_buffers]
+            )
         for req in batch_reqs:
             if req.bootstrap_room is None:
                 continue
@@ -523,6 +528,7 @@ class SchedulerDisaggregationPrefillMixin:
             if req_id in self.disagg_prefill_queue._entries:
                 continue
             try:
+                recurrent_slot_idx, recurrent_spec = self._prefill_recurrent_transfer_info(req)
                 req.disagg_host_buffer_id = self.disagg_kv_manager.reserve_prefill_buffer(
                     getattr(req, "disagg_host_buffer_id", None)
                 )
@@ -533,7 +539,7 @@ class SchedulerDisaggregationPrefillMixin:
                         bootstrap_room=req.bootstrap_room,
                         dp_rank=int(req.dp_rank),
                         buffer_id=req.disagg_host_buffer_id,
-                        payload_factory=lambda req_obj=req: {"kv": self._extract_req_kv(req_obj)},
+                        payload_factory=lambda req_obj=req: self._build_prefill_payload(req_obj),
                         block_ids_factory=lambda req_obj=req, snap=snapshot: (
                             list(snap.block_ids) if snap else self._extract_req_block_ids(req_obj)
                         ),
@@ -545,6 +551,8 @@ class SchedulerDisaggregationPrefillMixin:
                             )
                         ),
                         on_ready=lambda req_obj=req: self._pd_mark_time(req_obj, "transfer_start"),
+                        recurrent_slot_idx=recurrent_slot_idx,
+                        recurrent_state_spec=recurrent_spec,
                     )
                 )
             except Exception as exc:
@@ -606,8 +614,18 @@ class SchedulerDisaggregationPrefillMixin:
             req.pd_time_stats = ts
         ts.mark(name)
 
+    def _prefill_transfer_len(self: Scheduler, req: Req) -> int:
+        """Prompt tokens P computed for ``req`` (all but the last for hybrid models).
+
+        Hybrid prefill skips the last prompt token so the shipped recurrent/conv
+        state does not include it (D re-runs it); KV pages are sized to match.
+        """
+
+        n = len(req.origin_input_ids)
+        return n - 1 if getattr(req, "pd_prefill_skip_last_token", False) else n
+
     def _extract_req_block_ids(self: Scheduler, req: Req) -> list[int]:
-        return self._extract_req_block_ids_range(req, 0, len(req.origin_input_ids))
+        return self._extract_req_block_ids_range(req, 0, self._prefill_transfer_len(req))
 
     def _extract_req_block_ids_range(
         self: Scheduler,
@@ -685,7 +703,7 @@ class SchedulerDisaggregationPrefillMixin:
                 if snapshot
                 else self._extract_req_block_ids_range(req, start, end)
             )
-            expected_total_pages = (len(req.origin_input_ids) + page_size - 1) // page_size
+            expected_total_pages = (self._prefill_transfer_len(req) + page_size - 1) // page_size
             if is_final:
                 from sgl_jax.srt.disaggregation.debug_utils import kv_debug_enabled
 
@@ -794,7 +812,9 @@ class SchedulerDisaggregationPrefillMixin:
         req_to_token = self.req_to_token_pool.req_to_token
         kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
         page_size = kv_pool.page_size
-        seqlen = len(req.origin_input_ids)
+        # Hybrid models skip the last prompt token on P (see _prefill_transfer_len);
+        # its page may not even be allocated, so size the gather to what P computed.
+        seqlen = self._prefill_transfer_len(req)
         num_pages = (seqlen + page_size - 1) // page_size
         padded_pages = _pad_to_page_bucket(num_pages)
         # Only the first num_pages slots of req_to_token are written for this
@@ -858,6 +878,71 @@ class SchedulerDisaggregationPrefillMixin:
         from sgl_jax.srt.mem_cache.common import release_kv_cache
 
         release_kv_cache(req, self.tree_cache)
+        # HybridReqToTokenPool.free() already returns the recurrent slot with
+        # the request row. Reclaim a slot that outlived its row (defensive:
+        # never leak the fixed-size per-rank recurrent pool).
+        if getattr(req, "recurrent_pool_idx", None) is not None and req.req_pool_idx is None:
+            free_slot = getattr(self.req_to_token_pool, "free_recurrent_slot", None)
+            if free_slot is not None:
+                free_slot(req.recurrent_pool_idx, int(getattr(req, "dp_rank", 0) or 0))
+            req.recurrent_pool_idx = None
+
+    def _prefill_recurrent_state_pool(self: Scheduler):
+        return getattr(getattr(self, "req_to_token_pool", None), "recurrent_state_pool", None)
+
+    def _prefill_recurrent_transfer_info(self: Scheduler, req: Req):
+        """Return ``(rank_local_slot, spec)`` for hybrid models, else ``(None, None)``.
+
+        The spec enables strict per-layer shape validation of the payload; it
+        is omitted on multi-host where each leaf is only this host's shard.
+        """
+
+        rsp = self._prefill_recurrent_state_pool()
+        if rsp is None:
+            return None, None
+        slot = getattr(req, "recurrent_pool_idx", None)
+        if slot is None:
+            raise RuntimeError(
+                f"hybrid recurrent req_id={req.rid!r} has no recurrent slot at prefill handoff"
+            )
+        from sgl_jax.srt.mem_cache.recurrent_state_pool import get_recurrent_state_spec
+
+        spec = get_recurrent_state_spec(rsp) if jax.process_count() == 1 else None
+        return int(slot), spec
+
+    def _build_prefill_payload(self: Scheduler, req: Req) -> dict:
+        payload = {"kv": self._extract_req_kv(req)}
+        if self._prefill_recurrent_state_pool() is not None:
+            payload.update(self._extract_req_recurrent_state(req))
+        return payload
+
+    def _extract_req_recurrent_state(self: Scheduler, req: Req) -> dict:
+        """Gather ``req``'s recurrent + conv state from its DP rank's slot.
+
+        ``req.recurrent_pool_idx`` is rank-local; the pool buffers are global
+        arrays sharded over DP, so the slot is mapped to
+        ``slot + dp_rank * (slots_per_rank + 1)`` before indexing. Returns
+        ``{"recurrent_state": [...], "conv_state": [[...]]}``.
+        """
+
+        from sgl_jax.srt.disaggregation.common.recurrent_state import (
+            gather_recurrent_slot,
+            global_recurrent_slot,
+        )
+
+        rsp = self._prefill_recurrent_state_pool()
+        if rsp is None:
+            raise RuntimeError("_extract_req_recurrent_state requires a RecurrentStatePool")
+        if req.recurrent_pool_idx is None:
+            raise RuntimeError(f"req_id={req.rid!r} has no recurrent slot to extract")
+        # Same overlap fence as _extract_req_kv: never read a pool buffer that
+        # the newest queued forward has donated but not yet replaced.
+        if getattr(self.server_args, "disaggregation_enable_overlap_schedule", False):
+            current = getattr(self, "cur_batch", None)
+            if current is not None and getattr(current, "launch_done", None) is not None:
+                current.launch_done.wait()
+        global_slot = global_recurrent_slot(rsp, req.recurrent_pool_idx, req.dp_rank)
+        return gather_recurrent_slot(rsp, global_slot)
 
     def _release_prefill_req_resources(self: Scheduler, req: Req) -> None:
         """Release prefill-side KV and request-pool resources."""

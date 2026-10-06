@@ -65,6 +65,20 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
+def _copy_pytree_to_pinned_host(tree: Any) -> Any:
+    """D2H-stage every leaf of ``tree`` into pinned host memory, preserving sharding."""
+
+    from sgl_jax.srt.mem_cache.host_kv_pool import _make_host_sharding
+
+    def _to_host(leaf: jax.Array) -> jax.Array:
+        sharding = leaf.sharding
+        return jax.device_put(leaf, _make_host_sharding(sharding.mesh, sharding.spec))
+
+    staged = jax.tree.map(_to_host, tree)
+    jax.block_until_ready(staged)
+    return staged
+
+
 @dataclass(frozen=True)
 class PMetadata:
     """Out-of-band metadata D needs to pull from P.
@@ -318,8 +332,14 @@ class JaxTransferKVManager(CommonKVManager):
             try:
                 for name, arr_pytree in payload.items():
                     sub = f"{uuid}:{name}"
-                    staged = pool.copy_from_device(arr_pytree, buffer_id)
-                    self._wrapper.register_pull(sub, staged.array_pytree)
+                    if name == "kv":
+                        staged_tree = pool.copy_from_device(arr_pytree, buffer_id).array_pytree
+                    else:
+                        # Recurrent/conv slot state is not paged: the host KV
+                        # pool slot layout does not fit it, so stage it to
+                        # pinned host directly (released with the wrapper ref).
+                        staged_tree = _copy_pytree_to_pinned_host(arr_pytree)
+                    self._wrapper.register_pull(sub, staged_tree)
                     sub_uuids.append(sub)
             except Exception:
                 # Roll back wrapper registrations only. The pool slot is owned

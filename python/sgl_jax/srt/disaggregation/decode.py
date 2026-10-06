@@ -316,6 +316,9 @@ class SchedulerDisaggregationDecodeMixin:
         with jax.profiler.TraceAnnotation("pd_decode_admission_fence"):
             self._wait_donation_safe()
             jax.block_until_ready(self.token_to_kv_pool_allocator.get_kvcache().kv_buffer)
+            rsp = self._decode_recurrent_state_pool()
+            if rsp is not None:
+                jax.block_until_ready((rsp.recurrent_buffers, rsp.conv_buffers))
 
     def event_loop_normal_disagg_decode(self: Scheduler) -> None:
         """Decode event loop."""
@@ -538,6 +541,8 @@ class SchedulerDisaggregationDecodeMixin:
             if entry.cancelled:
                 if entry.kv_indices is not None:
                     self._release_decode_kv_indices(entry.kv_indices, entry.req.dp_rank)
+                # Engine writes into the slot are finished only now (terminal).
+                self._release_decode_recurrent_slot(entry.req)
                 continue
             if state == KVPoll.SUCCESS:
                 try:
@@ -550,6 +555,8 @@ class SchedulerDisaggregationDecodeMixin:
                     # occupies the final received page, the extend allocator
                     # will allocate a replacement page: no prefix slot retains
                     # ownership of this one. Transfer is terminal before reuse.
+                    # (Hybrid models: P skipped that token, so this page was
+                    # never transferred at all; see _decode_transfer_len.)
                     prefix_len = len(entry.req.origin_input_ids) - 1
                     page_size = self.token_to_kv_pool_allocator.page_size
                     if prefix_len >= 0 and prefix_len % page_size == 0:
@@ -579,6 +586,7 @@ class SchedulerDisaggregationDecodeMixin:
                     )
                     if entry.kv_indices is not None:
                         self._release_decode_kv_indices(entry.kv_indices, entry.req.dp_rank)
+                    self._release_decode_recurrent_slot(entry.req)
                     self._abort_decode_request(
                         entry.req,
                         "kv_writeback",
@@ -593,6 +601,7 @@ class SchedulerDisaggregationDecodeMixin:
                 self._record_decode_transfer_failure("receiver_terminal_failed")
                 if entry.kv_indices is not None:
                     self._release_decode_kv_indices(entry.kv_indices, entry.req.dp_rank)
+                self._release_decode_recurrent_slot(entry.req)
                 self._abort_decode_request(
                     entry.req,
                     "receiver_terminal_failed",
@@ -736,6 +745,14 @@ class SchedulerDisaggregationDecodeMixin:
                 capacity_blocked_ranks.add(decode_dp_rank)
                 continue
 
+            # Hybrid models also need one rank-local recurrent slot to receive
+            # the prefill temporal/conv state. It is owned by the request from
+            # here on and is later mapped to its req_pool_idx by alloc().
+            if not self._alloc_decode_recurrent_slot(entry.req, decode_dp_rank):
+                self._release_decode_kv_indices(kv_indices, decode_dp_rank)
+                capacity_blocked_ranks.add(decode_dp_rank)
+                continue
+
             try:
                 admission = self.disagg_kv_manager.try_start_decode(
                     DecodeTransferContext(
@@ -747,11 +764,12 @@ class SchedulerDisaggregationDecodeMixin:
                         peer_info=entry.p_info or {},
                         kv_indices=kv_indices,
                         page_size=page_size,
-                        prompt_tokens=len(entry.req.origin_input_ids),
-                        spec_factory=lambda req=entry.req: self._build_kv_spec_for_req(req),
+                        prompt_tokens=self._decode_transfer_len(entry.req),
+                        spec_factory=lambda req=entry.req: self._build_transfer_spec_for_req(req),
                         direct_commit=lambda expected, req=entry.req, indices=kv_indices: (
                             self._commit_direct_received_kv(req, indices, expected)
                         ),
+                        recurrent_slot_idx=getattr(entry.req, "recurrent_pool_idx", None),
                         recurrent_state_spec=entry.recurrent_state_spec,
                     )
                 )
@@ -762,12 +780,14 @@ class SchedulerDisaggregationDecodeMixin:
                 )
                 self._record_decode_transfer_failure("receiver_init")
                 self._release_decode_kv_indices(kv_indices, decode_dp_rank)
+                self._release_decode_recurrent_slot(entry.req)
                 self.disagg_prealloc_queue.remove(entry.req_id)
                 self._abort_decode_request(entry.req, "receiver_init")
                 continue
 
             if admission.state == AdmissionState.DEFERRED:
                 self._release_decode_kv_indices(kv_indices, decode_dp_rank)
+                self._release_decode_recurrent_slot(entry.req)
                 self._expire_decode_prealloc(entry)
                 continue
 
@@ -823,6 +843,71 @@ class SchedulerDisaggregationDecodeMixin:
             except Exception:
                 logger.exception("failed to free kv_indices=%r", kv_indices)
 
+    def _decode_recurrent_state_pool(self: Scheduler):
+        return getattr(getattr(self, "req_to_token_pool", None), "recurrent_state_pool", None)
+
+    def _decode_transfer_len(self: Scheduler, req: Req) -> int:
+        """Prompt tokens whose KV P ships (all but the last for hybrid models).
+
+        Hybrid P stops before the last prompt token so its recurrent/conv state
+        excludes it (D re-runs that token here). Received page counts must match
+        P's; D still allocates slots for the full prompt for its own extend.
+        """
+
+        from sgl_jax.srt.disaggregation.common.recurrent_state import (
+            pd_transfer_prompt_len,
+        )
+
+        return pd_transfer_prompt_len(
+            len(req.origin_input_ids), self._decode_recurrent_state_pool() is not None
+        )
+
+    def _alloc_decode_recurrent_slot(self: Scheduler, req: Req, dp_rank: int) -> bool:
+        """Reserve a rank-local recurrent slot for a hybrid transfer.
+
+        Returns ``True`` when no slot is needed (non-hybrid) or one is owned.
+        """
+
+        if self._decode_recurrent_state_pool() is None:
+            return True
+        if getattr(req, "recurrent_pool_idx", None) is not None:
+            return True
+        slot = self.req_to_token_pool.alloc_recurrent_slot(int(dp_rank))
+        if slot is None:
+            return False
+        req.recurrent_pool_idx = int(slot)
+        return True
+
+    def _release_decode_recurrent_slot(self: Scheduler, req: Req) -> None:
+        """Return a transfer-owned recurrent slot (no request row yet) to its rank.
+
+        Once the request owns a ``req_pool_idx`` the slot is released together
+        with the row by ``HybridReqToTokenPool.free``.
+        """
+
+        slot = getattr(req, "recurrent_pool_idx", None)
+        if slot is None or getattr(req, "req_pool_idx", None) is not None:
+            return
+        try:
+            dp_rank = 0 if req.dp_rank is None else int(req.dp_rank)
+            self.req_to_token_pool.free_recurrent_slot(slot, dp_rank)
+        except Exception:
+            logger.exception("failed to free recurrent slot=%r for req_id=%s", slot, req.rid)
+        req.recurrent_pool_idx = None
+
+    def _build_transfer_spec_for_req(self: Scheduler, req: Req):
+        """KV-only spec list for standard models; structured dict for hybrid models."""
+
+        kv_spec = self._build_kv_spec_for_req(req)
+        rsp = self._decode_recurrent_state_pool()
+        if rsp is None:
+            return kv_spec
+        from sgl_jax.srt.disaggregation.common.recurrent_state import (
+            build_recurrent_state_specs,
+        )
+
+        return {"kv": kv_spec, **build_recurrent_state_specs(rsp)}
+
     def _build_kv_spec_for_req(self: Scheduler, req: Req) -> list[jax.ShapeDtypeStruct]:
         """Build per-layer ShapeDtypeStructs matching P's KV layout."""
 
@@ -830,7 +915,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
         page_size = kv_pool.page_size
-        seqlen = len(req.origin_input_ids)
+        seqlen = self._decode_transfer_len(req)
         num_pages = (seqlen + page_size - 1) // page_size
         padded_pages = _pad_to_page_bucket(num_pages)
         if jax.process_count() > 1:
@@ -855,6 +940,37 @@ class SchedulerDisaggregationDecodeMixin:
         self._maybe_log_decode_pull_debug(req, kv)
         self._write_kv_to_pool(req, kv_indices, kv)
         self._record_decode_transfer_bytes(kv)
+        if self._decode_recurrent_state_pool() is not None:
+            self._write_recurrent_state_to_pool(req, payload)
+
+    def _write_recurrent_state_to_pool(self: Scheduler, req: Req, payload: TransferPayload) -> None:
+        """Scatter received temporal/conv state into ``req``'s DP-rank slot (in place).
+
+        ``req.recurrent_pool_idx`` is rank-local; the global buffer index is
+        ``slot + dp_rank * (slots_per_rank + 1)``.
+        """
+
+        from sgl_jax.srt.disaggregation.common.recurrent_state import (
+            CONV_STATE_KEY,
+            RECURRENT_STATE_KEY,
+            global_recurrent_slot,
+            scatter_recurrent_slot,
+        )
+
+        rsp = self._decode_recurrent_state_pool()
+        recurrent_state = payload.get(RECURRENT_STATE_KEY)
+        conv_state = payload.get(CONV_STATE_KEY)
+        if recurrent_state is None or conv_state is None:
+            raise RuntimeError(
+                f"hybrid model received no recurrent state for req_id={req.rid!r}; "
+                f"payload keys={sorted(payload)}"
+            )
+        slot = getattr(req, "recurrent_pool_idx", None)
+        if slot is None:
+            raise RuntimeError(f"req_id={req.rid!r} has no recurrent slot to install into")
+        global_slot = global_recurrent_slot(rsp, slot, req.dp_rank)
+        scatter_recurrent_slot(rsp, global_slot, recurrent_state, conv_state)
+        self._record_decode_transfer_bytes([recurrent_state, conv_state])
 
     def _commit_direct_received_kv(
         self: Scheduler,
@@ -865,7 +981,7 @@ class SchedulerDisaggregationDecodeMixin:
         """Record a backend that wrote the destination KV pages directly."""
 
         kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
-        num_pages = (len(req.origin_input_ids) + kv_pool.page_size - 1) // kv_pool.page_size
+        num_pages = (self._decode_transfer_len(req) + kv_pool.page_size - 1) // kv_pool.page_size
         total = 0
         for layer in kv_pool.kv_buffer:
             total += num_pages * (int(layer.nbytes) // int(layer.shape[0]))
@@ -900,7 +1016,8 @@ class SchedulerDisaggregationDecodeMixin:
                 gshape, gsh, [s.data for s in kv.addressable_shards]
             )
         page_size = kv_pool.page_size
-        seqlen = len(req.origin_input_ids)
+        # Hybrid: P never computed the last prompt token; D's extend writes it.
+        seqlen = self._decode_transfer_len(req)
         num_pages = (seqlen + page_size - 1) // page_size
         kv_indices_np = (
             np.asarray(kv_indices) if not isinstance(kv_indices, np.ndarray) else kv_indices
@@ -1164,7 +1281,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
         page_ids = np.asarray(
-            slots_to_page_ids(kv_indices, kv_pool.page_size, len(req.origin_input_ids)),
+            slots_to_page_ids(kv_indices, kv_pool.page_size, self._decode_transfer_len(req)),
             dtype=np.int32,
         )
         page_ids_jax = jax.device_put(
