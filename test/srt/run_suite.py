@@ -344,7 +344,11 @@ suites = {
         TestFile("test/srt/kernels/qsa/test_paging.py", 0.1),
         TestFile("test/srt/kernels/qsa/test_qsa_pipeline.py", 0.5),
         TestFile("test/srt/mem_cache/test_qsa_pool.py", 0.1),
-        TestFile("python/sgl_jax/test/layers/test_ngram_embedding.py", 0.1),
+        TestFile(
+            "python/sgl_jax/test/layers/test_ngram_embedding.py",
+            0.1,
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "2"},
+        ),
         TestFile("python/sgl_jax/test/layers/test_ngram_table.py", 0.1),
         TestFile("python/sgl_jax/test/mem_cache/test_recurrent_short_conv.py", 0.1),
         TestFile(

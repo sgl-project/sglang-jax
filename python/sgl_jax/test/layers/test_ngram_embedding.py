@@ -335,9 +335,10 @@ class TestNGramEmbeddingLayer(CustomTestCase):
 
 @unittest.skipIf(len(jax.devices()) < 2, "tensor parallelism needs >= 2 devices")
 class TestNGramEmbeddingSharding(CustomTestCase):
-    """Channel-sharding the depthwise conv must not change a single value.
+    """Channel-sharding the depthwise conv must not change a single value, and
+    the delta must come back in the layout of the streams it is added to.
 
-    Skipped on a one-device CPU runner; the TPU jobs exercise it. The layer
+    Skipped on a one-device runner. The layer
     reshards its activation from the projections' replicated layout to the
     pool's `P("data", "tensor", None)`, which is where a silent mismatch
     between the conv weight, the state and the activation would show up.
@@ -354,7 +355,9 @@ class TestNGramEmbeddingSharding(CustomTestCase):
             )
             rng = np.random.default_rng(SEED)
             layer, _ = _make_layer(mesh, rng)
-            hyper = jnp.asarray(rng.standard_normal((8, HYPER_SIZE)).astype(np.float32))
+            # The streams' layout, which the delta has to come back in.
+            streams = rng.standard_normal((8, HYPER_SIZE)).astype(np.float32)
+            hyper = _put(streams, mesh, P("data", None))
             emb = jnp.asarray(rng.standard_normal((8, PLE_EMBED_DIM)).astype(np.float32))
             pool = _put(
                 rng.standard_normal((6, HYPER_SIZE, CONV_STATE_LEN)).astype(np.float32),
@@ -366,7 +369,11 @@ class TestNGramEmbeddingSharding(CustomTestCase):
             init = _put(np.array([True, True]), mesh, P("data"))
             with jax.set_mesh(mesh):
                 out, state = layer.forward_extend(hyper, emb, pool, idx, cu, init)
-                dec, _ = layer.forward_decode(hyper[:2], emb[:2], pool, idx, init)
+                dec, _ = layer.forward_decode(
+                    _put(streams[:2], mesh, P("data", None)), emb[:2], pool, idx, init
+                )
+            for delta in (out, dec):
+                self.assertEqual(jax.typeof(delta).sharding.spec, P("data", None))
             return np.asarray(out), np.asarray(state), np.asarray(dec)
 
         ref = run(1)

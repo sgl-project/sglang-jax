@@ -366,6 +366,13 @@ class NGramEmbedding(nnx.Module):
         """Replicated -> channel-sharded, matching the pool's conv state."""
         return jax.sharding.reshard(x, jax.sharding.NamedSharding(self.mesh, P("data", "tensor")))
 
+    def _from_conv_layout(self, x: jax.Array, like: jax.Array) -> jax.Array:
+        """Channel-sharded -> the layout of ``like``, the streams the delta is
+        added to. Their consumers read every channel."""
+        return jax.sharding.reshard(
+            x, jax.sharding.NamedSharding(self.mesh, jax.typeof(like).sharding.spec)
+        )
+
     def _shard_mapped(self, local_fn, extra_in_specs=()):
         """Per-shard conv, as gdn_backend does: XLA cannot shard the slot-indexed
         conv_state once tokens are on `data`."""
@@ -441,7 +448,7 @@ class NGramEmbedding(nnx.Module):
             extra_in_specs += [P("data"), P("data")]  # track_indices, track_mask
             args += [track_indices, track_mask]
         conv_out, new_conv_state = self._shard_mapped(_local, extra_in_specs)(*args)
-        return gated + conv_out, new_conv_state  # [T, HC*HS]
+        return gated + self._from_conv_layout(conv_out, hyper_input), new_conv_state  # [T, HC*HS]
 
     @named_scope
     def forward_decode(
@@ -495,7 +502,7 @@ class NGramEmbedding(nnx.Module):
             extra_in_specs += [P("data"), P("data")]  # track_indices, track_mask
             args += [track_indices, track_mask]
         conv_out, new_conv_state = self._shard_mapped(_local, extra_in_specs)(*args)
-        return gated + conv_out, new_conv_state  # [B, HC*HS]
+        return gated + self._from_conv_layout(conv_out, hyper_input), new_conv_state  # [B, HC*HS]
 
     def _fused_forward(
         self,
