@@ -3746,6 +3746,9 @@ class ModelWorkerBatch:
     # Batch-owned immutable page IDs for supported speculative relay backends.
     allocated_page_indices: np.ndarray | None = None
     eagle_page_indices_device_cache: tuple | None = None
+    # EAGLE decode: where each slot's segment of `cache_loc` starts; -1 for
+    # padding slots.
+    draft_cache_loc_starts: np.ndarray | None = None
 
     # Pre-bucketed per-token gather indices for the padded logprob path; None on
     # the legacy variable-shape path and on non-extend batches.

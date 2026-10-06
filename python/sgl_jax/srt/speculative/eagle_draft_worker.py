@@ -279,6 +279,7 @@ class EagleDraftWorker(BaseDraftWorker):
             self.draft_model_runner,
             batch_output,
             self.speculative_num_draft_tokens,
+            accept_width=self.speculative_num_steps + 1,
         )
 
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
@@ -398,6 +399,7 @@ class EagleDraftWorker(BaseDraftWorker):
             cache_loc_cpu = self._get_decode_cache_loc_buffer(total_cache_loc_size)
         model_worker_batch.allocated_page_indices = None
         model_worker_batch.eagle_page_indices_device_cache = None
+        cache_loc_starts = np.full(len(seq_lens_cpu), -1, dtype=np.int64)
         valid_mask = seq_lens_cpu > 0
         if np.any(valid_mask):
             valid_indices = np.where(valid_mask)[0]
@@ -409,6 +411,7 @@ class EagleDraftWorker(BaseDraftWorker):
             ):
                 r = int(seq_idx) // per_dp_bs
                 base = r * per_dp_cache_len + intra_rank_off[r]
+                cache_loc_starts[seq_idx] = base
                 assert (
                     base + aligned_len <= (r + 1) * per_dp_cache_len
                 ), f"rank {r} cache_loc overflow: {intra_rank_off[r] + aligned_len} > {per_dp_cache_len}"
@@ -439,6 +442,7 @@ class EagleDraftWorker(BaseDraftWorker):
             model_worker_batch.cache_loc = np.empty(0, dtype=np.int32)
         else:
             model_worker_batch.cache_loc = cache_loc_cpu
+            model_worker_batch.draft_cache_loc_starts = cache_loc_starts
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
 
         topk_index = spec_info.topk_index

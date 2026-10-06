@@ -174,6 +174,29 @@ class TestSpeculativeDecodingTree(CustomTestCase):
         self.assertIn("greedy sampling only", r.text)
         requests.get(f"{self.base_url}/health", timeout=10).raise_for_status()
 
+    def test_mmlu(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="mmlu",
+            num_examples=64,
+            num_threads=8,
+            max_tokens=512,
+        )
+        metrics = run_eval(args)
+        self.assertGreater(metrics["score"], 0.45)
+
+    def test_tree_accepts_beyond_the_root(self):
+        # Output correctness depends only on the target side; a broken draft
+        # side shows up as acceptance collapsing to the bonus token alone.
+        for _ in range(4):
+            self._generate(
+                "def fibonacci(n):\n    if n <= 1:\n        return n\n    return",
+                {"temperature": 0, "max_new_tokens": 64},
+            ).raise_for_status()
+        info = requests.get(f"{self.base_url}/get_server_info", timeout=30).json()
+        self.assertGreater(info["internal_states"][0]["avg_spec_accept_length"], 1.5)
+
 
 @unittest.skipUnless(
     os.getenv("SGLANG_NEXTN_E2E_URL"),

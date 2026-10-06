@@ -12,6 +12,10 @@ import numpy as np
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.speculative.eagle_util import (
+    compact_accepted_paths,
+    front_pack_accepted_tokens,
+)
 from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
 
 if TYPE_CHECKING:
@@ -382,7 +386,7 @@ class BaseSpecWorker:
         spec_info.hidden_states = logits_output.hidden_states
 
         (
-            predict,
+            _predict,
             verified_id,
             accept_length,
             accept_index,
@@ -392,6 +396,24 @@ class BaseSpecWorker:
             self.draft_worker.draft_model_runner.rngs,
             self.mesh,
         )
+        bs = accept_length.shape[0]
+        accept_width = self.speculative_num_steps + 1
+        if self.topk > 1:
+            req_to_token_pool, _ = self.target_worker.get_memory_pool()
+            compact_accepted_paths(
+                req_to_token_pool.req_to_token,
+                model_worker_batch.req_pool_indices,
+                model_worker_batch.cache_loc,
+                model_worker_batch.draft_cache_loc_starts,
+                model_worker_batch.seq_lens,
+                accept_index.reshape(bs, accept_width),
+                np.asarray(model_worker_batch.logits_indices_selector),
+                self.speculative_num_draft_tokens,
+            )
+        emitted = front_pack_accepted_tokens(
+            verified_id, accept_width, self.speculative_num_draft_tokens
+        )
+
         legacy_non_overlap = use_legacy_eagle3_non_overlap(
             not self.server_args.disable_overlap_schedule,
             getattr(model_worker_batch, "spec_algorithm", None),
@@ -406,7 +428,6 @@ class BaseSpecWorker:
             # accept_index has length bs*(spec_steps+1); the gathered tensors have
             # length bs*draft_token_num — equal at topk=1, distinct at topk>1.
             draft_n = self.speculative_num_draft_tokens
-            accept_width = self.speculative_num_steps + 1
             req_ids = np.arange(len(accept_index)) // accept_width
             per_req_last = req_ids * draft_n + draft_n - 1
             safe_index = np.where(accept_index >= 0, accept_index, per_req_last)
@@ -432,7 +453,7 @@ class BaseSpecWorker:
         model_worker_batch.spec_info_padded = next_draft_input
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=predict,
+            next_token_ids=emitted,
             next_draft_input=next_draft_input,
             accept_lens=accept_length,
             bid=model_worker_batch.bid,

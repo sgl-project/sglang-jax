@@ -272,6 +272,71 @@ def build_tree_kernel_efficient(
     )
 
 
+def front_pack_accepted_tokens(
+    verified_id: np.ndarray, accept_width: int, draft_token_num: int
+) -> np.ndarray:
+    """Lay each request's accepted tokens out at the front of its draft block.
+
+    ``verified_id`` holds them in path order, ``accept_width`` per request.
+    The output side reads request ``i``'s tokens as the first ``accept_len``
+    entries of block ``[i * draft_token_num, (i + 1) * draft_token_num)``.
+    """
+    bs = verified_id.shape[0] // accept_width
+    packed = np.zeros((bs, draft_token_num), dtype=verified_id.dtype)
+    width = min(draft_token_num, accept_width)
+    packed[:, :width] = verified_id.reshape(bs, accept_width)[:, :width]
+    return packed.reshape(-1)
+
+
+def compact_accepted_paths(
+    req_to_token: np.ndarray,
+    req_pool_indices: np.ndarray,
+    cache_loc: np.ndarray,
+    cache_loc_starts: np.ndarray,
+    window_starts: np.ndarray,
+    accept_index: np.ndarray,
+    slots: np.ndarray,
+    draft_token_num: int,
+) -> None:
+    """Move each request's accepted tree path to the front of its verify window.
+
+    Verify lays the draft tree out flat: node ``k`` of slot ``s`` sits at
+    logical position ``window_starts[s] + k``. An accepted path skips siblings,
+    so its nodes are not a prefix of that window. This permutes the window in
+    ``req_to_token`` so position ``window_starts[s] + j`` holds the KV slot of
+    the ``j``-th accepted node, with the rejected nodes' slots kept in order
+    behind them. The batch's ``cache_loc`` copy of the window is permuted the
+    same way.
+
+    The window keeps the same set of KV slots, so ownership is unchanged:
+    accepted slots become the committed prefix and the rejected ones stay in
+    the uncommitted tail that the request frees or reuses.
+
+    ``accept_index`` is ``(padded_bs, accept_width)`` of flat node ids
+    (``s * draft_token_num + k``), ``-1`` past each slot's accepted length.
+    ``slots`` lists the real slots, page_size is 1.
+    """
+    n = draft_token_num
+    for s in slots:
+        accepted = accept_index[s][accept_index[s] >= 0] - s * n
+        perm = np.concatenate([accepted, np.setdiff1d(np.arange(n), accepted)])
+        assert (
+            len(perm) == n and len(np.unique(perm)) == n
+        ), f"slot {s}: accepted nodes {accepted} are not a path in a {n}-node tree"
+        if np.array_equal(perm, np.arange(n)):
+            continue
+        req = req_pool_indices[s]
+        start = window_starts[s]
+        loc = cache_loc_starts[s] + start
+        window = req_to_token[req, start : start + n]
+        assert np.array_equal(
+            cache_loc[loc : loc + n], window
+        ), f"slot {s}: cache_loc does not mirror req_to_token over the verify window"
+        compacted = window[perm]
+        req_to_token[req, start : start + n] = compacted
+        cache_loc[loc : loc + n] = compacted
+
+
 def assign_req_to_token_pool(
     req_pool_indices,
     req_to_token_pool,
