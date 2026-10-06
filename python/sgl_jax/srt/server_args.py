@@ -2210,9 +2210,11 @@ class ServerArgs:
     def check_tree_drafting_server_args(self):
         """Validate EAGLE tree drafting (--speculative-eagle-topk > 1)."""
         flag = "--speculative-eagle-topk > 1"
-        if self.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+        # EAGLE decodes through the non-legacy allocation path, whose
+        # out_cache_loc bucket assumes a round allocates one verify width.
+        if self.speculative_algorithm != "EAGLE3":
             raise ValueError(
-                f"{flag} is supported for EAGLE and EAGLE3 only; "
+                f"{flag} is supported for EAGLE3 only; "
                 f"got --speculative-algorithm={self.speculative_algorithm}."
             )
         if not self.disable_overlap_schedule:

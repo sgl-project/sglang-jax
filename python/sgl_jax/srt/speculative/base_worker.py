@@ -9,9 +9,11 @@ from typing import TYPE_CHECKING
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sgl_jax.srt.speculative.eagle_util import (
     accepted_path_kv_copies,
@@ -23,6 +25,19 @@ from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
     from sgl_jax.srt.managers.tp_worker import ModelWorker
+
+
+def has_row_positioned_attention(model) -> bool:
+    """Whether an attention layer of ``model`` places queries by row.
+
+    The attention kernel derives a query's position from its row for sliding
+    windows and xai temperature. Tree rows are not in position order.
+    """
+    return any(
+        (layer.sliding_window_size or 0) > 0 or layer.xai_temperature_len > 0
+        for _, layer in nnx.iter_graph(model)
+        if isinstance(layer, RadixAttention)
+    )
 
 
 def replicate_to_mesh(
@@ -114,6 +129,13 @@ class BaseSpecWorker:
                 f"--speculative-eagle-topk > 1 with --page-size > 1 does not support "
                 f"{type(kv_pool).__name__}; use --page-size 1."
             )
+        draft_runner = getattr(draft_worker, "draft_model_runner", None)
+        for runner in (target_worker.model_runner, draft_runner):
+            if self.topk > 1 and runner is not None and has_row_positioned_attention(runner.model):
+                raise NotImplementedError(
+                    "--speculative-eagle-topk > 1 does not support sliding-window or "
+                    "xai-temperature attention layers."
+                )
 
         (
             self.precompile_token_paddings,
