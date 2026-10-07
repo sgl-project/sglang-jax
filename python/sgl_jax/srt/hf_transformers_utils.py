@@ -18,10 +18,12 @@ from transformers import (
     PreTrainedTokenizerBase,
     PreTrainedTokenizerFast,
 )
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from sgl_jax.srt.configs.bailing_hybrid import BailingHybridConfig
 from sgl_jax.srt.configs.gemma4 import Gemma4Config
+from sgl_jax.srt.configs.glm5_next import Glm5NextHFConfig, Glm5NextTextHFConfig
 from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
 from sgl_jax.srt.configs.qwen3_5 import Qwen3_5DenseConfig, Qwen3_5HybridConfig
 from sgl_jax.srt.configs.qwen4_exp import Qwen4ExpConfig
@@ -47,6 +49,11 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
 # GLM uses the native v5 config; it no longer needs a local placeholder.
 for name, cls in _CONFIG_REGISTRY.items():
     AutoConfig.register(name, cls, exist_ok=True)
+
+# GLM-5.3-Flash (glm5_next) is only in newer transformers; keep the native class when present.
+for cls in (Glm5NextHFConfig, Glm5NextTextHFConfig):
+    if cls.model_type not in CONFIG_MAPPING:
+        AutoConfig.register(cls.model_type, cls)
 
 
 _UNSET = object()

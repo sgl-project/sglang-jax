@@ -334,9 +334,18 @@ class ModelRunnerKVCacheMixin:
             getattr(cfg, "indexer_types", None),
             getattr(cfg, "index_skip_topk_offset", 0),
             cfg.num_hidden_layers,
+            active_layers=self.dsa_indexer_layers,
         )
         if num_full == 0:
             return 0, 0
+        kpool = self.dsa_index_kpool
+        if kpool > 1:
+            # KPool: raw (key, gate) rows + pooled keys share one buffer per layer.
+            from sgl_jax.srt.layers.attention.dsa_sparse_backend import (
+                kpool_indexer_dim,
+            )
+
+            return kpool_indexer_dim(cfg.index_head_dim, kpool), num_full
         return cfg.index_head_dim, num_full
 
     def _compute_cell_size(self: ModelRunner) -> int:
@@ -692,11 +701,13 @@ class ModelRunnerKVCacheMixin:
             # `_validate_kv_pool_compatibility` owns the user-facing check at
             # dispatch. Keep this assertion as a defensive invariant in case a
             # future caller constructs a hybrid pool through this lower seam.
-            # QSA's indexer cache is fine: the wrapper forwards its accessors.
+            # QSA's indexer cache is fine: the wrapper forwards its accessors, as it
+            # does for a DSA indexer (GLM-5.3-Flash: KDA + DSA layers).
             assert not (
                 kvcache_kwargs.get("num_indexer_layers")
                 and token_to_kv_pool_class is MLATokenToKVPool
-            ), "hybrid-recurrent models do not support --attention-backend dsa_sparse"
+                and not self._has_dsa_indexer
+            ), "hybrid-recurrent models without a DSA indexer do not support --attention-backend dsa_sparse"
 
             return HybridLinearKVPool(
                 size=self.max_total_num_tokens,
@@ -722,11 +733,16 @@ class ModelRunnerKVCacheMixin:
         if (
             self.linear_recurrent_config is not None
             and self.server_args.attention_backend == "dsa_sparse"
+            and not self._has_dsa_indexer
         ):
             raise ValueError(
-                "hybrid-recurrent models do not support --attention-backend dsa_sparse: "
-                "HybridLinearKVPool has no DSA indexer cache interface"
+                "hybrid-recurrent models without a DSA indexer do not support "
+                "--attention-backend dsa_sparse"
             )
+
+    @property
+    def _has_dsa_indexer(self: ModelRunner) -> bool:
+        return getattr(self.model_config.hf_text_config, "index_topk", None) is not None
 
     def _create_token_to_kv_pool(
         self: ModelRunner,
@@ -989,10 +1005,30 @@ class ModelRunnerKVCacheMixin:
         return get_qwen4_exp_config(self.model_config.hf_config)
 
     @property
+    def dsa_indexer_layers(self: ModelRunner) -> set[int] | None:
+        """Layers that may carry a DSA indexer: in a KDA + DSA hybrid (GLM-5.3-Flash) only the
+        full-attention layers; None means every layer."""
+        recurrent = self.linear_recurrent_config
+        return set(recurrent.full_attention_layer_ids) if recurrent is not None else None
+
+    @property
+    def dsa_index_kpool(self: ModelRunner) -> int:
+        """KPool size of the DSA indexer (GLM-5.3-Flash pools 4 keys); 1 when keys are not pooled."""
+        return getattr(self.model_config.hf_text_config, "index_kpool", 1)
+
+    @property
+    def glm5_next_config(self: ModelRunner):
+        from sgl_jax.srt.configs.glm5_next import get_glm5_next_config
+
+        return get_glm5_next_config(self.model_config.hf_config)
+
+    @property
     def linear_recurrent_config(self: ModelRunner):
         """Return linear recurrent config if the model has linear attention, else None."""
         if self.kimi_linear_config is not None:
             return self.kimi_linear_config
+        if self.glm5_next_config is not None:
+            return self.glm5_next_config
         if self.qwen3_5_hybrid_config is not None:
             return self.qwen3_5_hybrid_config.text_config
         if self.qwen4_exp_config is not None:

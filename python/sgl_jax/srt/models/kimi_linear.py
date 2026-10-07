@@ -85,6 +85,7 @@ class KimiDeltaAttention(nnx.Module):
         layer_idx: int = 0,
         mesh: jax.sharding.Mesh | None = None,
         dtype: jnp.dtype = jnp.bfloat16,
+        v_head_dim: int | None = None,
     ):
         self.mesh = mesh
 
@@ -95,7 +96,7 @@ class KimiDeltaAttention(nnx.Module):
         self.conv_size = linear_config["short_conv_kernel_size"]
         self.head_dim = linear_config["head_dim"]
         self.k_head_dim = self.head_dim
-        self.v_head_dim = getattr(config, "v_head_dim", None) or self.head_dim
+        self.v_head_dim = v_head_dim or getattr(config, "v_head_dim", None) or self.head_dim
         self.num_heads = linear_config["num_heads"]
         self.num_k_heads = self.num_heads
         self.num_v_heads = self.num_heads

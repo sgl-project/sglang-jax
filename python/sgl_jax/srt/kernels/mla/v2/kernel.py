@@ -76,6 +76,16 @@ def align_to(x, a):
     return cdiv(x, a) * a
 
 
+def align_rope_dim(actual_r_dim: int, a: int = 128) -> int:
+    """Padded RoPE dimension used by the MLA cache layout and kernel block shapes.
+
+    A NoPE model (GLM-5.3-Flash) has ``qk_rope_head_dim == 0``; the cache still reserves one aligned
+    block of zeros so the Pallas shapes stay valid. The values are zero and the rotation is a no-op,
+    so this is numerically identical to having no RoPE at all.
+    """
+    return max(cdiv(actual_r_dim, a) * a, a)
+
+
 def get_dtype_bitwidth(dtype):
     return jax.dtypes.itemsize_bits(dtype)
 
@@ -177,7 +187,7 @@ def static_validate_inputs(
     actual_lkv_dim = ql_nope.shape[2]
     actual_r_dim = q_pe.shape[2]
     lkv_dim = align_to(actual_lkv_dim, 128)
-    r_dim = align_to(actual_r_dim, 128)
+    r_dim = align_rope_dim(actual_r_dim)
 
     (
         _,
@@ -1309,7 +1319,8 @@ def prepare_q_inputs(
     max_num_tokens, actual_num_q_heads, actual_head_dim = q.shape
     q_packing = get_dtype_packing(q.dtype)
     num_q_heads = align_to(actual_num_q_heads, q_packing)
-    head_dim = align_to(actual_head_dim, 128)
+    # At least one 128-lane block: a NoPE rope input (GLM-5.3-Flash) is 0 wide.
+    head_dim = align_rope_dim(actual_head_dim)
     if num_q_heads != actual_num_q_heads or head_dim != actual_head_dim:
         q = jnp.pad(
             q.reshape(
@@ -1353,10 +1364,11 @@ def prepare_kv_inputs(kv: jax.Array):
         pad = kv_packing - (max_num_tokens % kv_packing)
         kv = jnp.pad(kv, ((0, pad), (0, 0)), constant_values=0)
 
-    head_dim = align_to(actual_head_dim, 128)
-    kv = kv.reshape(-1, kv_packing, actual_head_dim)
-    if head_dim != actual_head_dim:
-        kv = jnp.pad(kv, ((0, 0), (0, 0), (0, head_dim - actual_head_dim)), constant_values=0)
+    head_dim = align_rope_dim(actual_head_dim)
+    # Pad the head dim before the reshape: a 0-wide axis (NoPE) cannot be reshaped.
+    if head_dim > actual_head_dim:
+        kv = jnp.pad(kv, ((0, 0), (0, head_dim - actual_head_dim)), constant_values=0)
+    kv = kv.reshape(-1, kv_packing, head_dim)
     return kv
 
 

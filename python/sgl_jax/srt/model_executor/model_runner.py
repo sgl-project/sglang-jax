@@ -814,6 +814,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 getattr(cfg, "indexer_types", None),
                 getattr(cfg, "index_skip_topk_offset", 0),
                 cfg.num_hidden_layers,
+                active_layers=self.dsa_indexer_layers,
             )
             # Per-launch override of the indexer top-k budget (page count = ceil(
             # index_topk / page_size) is a static kernel shape, so this is fixed at
@@ -857,6 +858,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 index_n_heads=cfg.index_n_heads,
                 skip_offset=getattr(cfg, "index_skip_topk_offset", 0),
                 full_slot=full_slot,
+                index_kpool=self.dsa_index_kpool,
                 num_attn_heads=self.num_attn_heads,
                 kv_lora_rank=cfg.kv_lora_rank,
                 qk_nope_head_dim=cfg.qk_nope_head_dim,

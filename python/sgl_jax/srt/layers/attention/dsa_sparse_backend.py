@@ -34,6 +34,7 @@ from sgl_jax.srt.kernels.dsa.sparse_mla_prefill_qblock import (
     prefill_write_and_attend_ragged_qblock,
     prefill_write_and_attend_ragged_qblock_tsa,
 )
+from sgl_jax.srt.kernels.dsa.streamindex_live import streamindex_topk_live
 from sgl_jax.srt.kernels.dsa.streamindex_topk import (
     streamindex_page_topk,
     streamindex_topk,
@@ -67,6 +68,8 @@ _INDEXER_KERNEL = os.environ.get("DSA_INDEXER_KERNEL", "0") == "1"
 # [T, max_kv] token scores in HBM — the dominant HLO-temporaries term at long
 # context. Same selection semantics as the ref (parity-gated). Default OFF.
 _INDEXER_KERNEL_PREFILL = os.environ.get("DSA_INDEXER_KERNEL_PREFILL", "0") == "1"
+
+
 # bkv block of 64 pages (4K tokens @ page 64) benched fastest across
 # B=8..64, ctx 8K..128K on v7x/v6e.
 _INDEXER_KERNEL_KV_PAGES_PER_BLOCK = 64
@@ -195,9 +198,13 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         index_n_heads: int,
         skip_offset: int,
         full_slot: dict[int, int],
+        index_kpool: int = 1,
         **mla_kwargs,
     ):
         super().__init__(**mla_kwargs)
+        if index_kpool > 1 and index_topk % index_kpool:
+            raise ValueError(f"index_topk={index_topk} must be a multiple of kpool={index_kpool}")
+        self.index_kpool = index_kpool
         self.index_topk = index_topk
         self.index_head_dim = index_head_dim
         self.index_n_heads = index_n_heads
@@ -213,6 +220,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             "index_n_heads": self.index_n_heads,
             "skip_offset": self.skip_offset,
             "full_slot": self.full_slot,
+            "index_kpool": self.index_kpool,
         }
         return children, aux
 
@@ -224,6 +232,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             index_n_heads=aux_data["index_n_heads"],
             skip_offset=aux_data["skip_offset"],
             full_slot=aux_data["full_slot"],
+            index_kpool=aux_data["index_kpool"],
             num_attn_heads=aux_data["num_attn_heads"],
             kv_lora_rank=aux_data["kv_lora_rank"],
             qk_nope_head_dim=aux_data["qk_nope_head_dim"],
@@ -352,6 +361,8 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         # the per-query-token kernel handles uniformly.
         if not is_decode:
             if _PREFILL_SPARSE:
+                if self.index_kpool > 1:
+                    raise NotImplementedError("DSA_PREFILL_SPARSE=1 does not support KPool yet.")
                 reuse_pages = is_full and dsa_topk_reuse and dsa_topk_pages_in is not None
                 if reuse_pages and bool(getattr(forward_batch, "spec_kvshare_readonly", False)):
                     topk_pages = None  # KVShare: no indexer-key write for draft steps >= 1
@@ -501,6 +512,20 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         out_specs = (P(dpa, None, None, None), P(dpa, None), P(dpa, None))
 
         def _run(q_, k_, w_, cache_, seq_lens_, pi_, cuq_, cukv_, dist_):
+            if self.index_kpool > 1:
+                return self._kpool_index_local(
+                    q_,
+                    k_,
+                    w_,
+                    cache_,
+                    seq_lens_,
+                    pi_,
+                    cuq_,
+                    cukv_,
+                    dist_,
+                    compute_topk=compute_topk,
+                    compute_pages=compute_pages,
+                )
             page_size = cache_.shape[1] * cache_.shape[2]
             idx_dim = cache_.shape[3]
             pages_per_seq = pi_.shape[0] // seq_lens_.shape[0]
@@ -585,6 +610,80 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             md.distribution,
         )
         return idx_cache, topk, (topk_pages if compute_pages else None)
+
+    def _kpool_index_local(
+        self,
+        q_,
+        k_,
+        w_,
+        cache_,
+        seq_lens_,
+        pi_,
+        cuq_,
+        cukv_,
+        dist_,
+        *,
+        compute_topk,
+        compute_pages,
+    ):
+        """KPool indexer on local shards: write raw rows + closed pools, score pooled keys.
+
+        ``k_`` is ``[T, 2 * D]`` = (key, gate logit incl. the pool-slot APE) per token.
+        Selection is the pooled top-``index_topk // kpool`` expanded to tokens plus the
+        unfinished tail pool, i.e. ``index_topk + kpool - 1`` token indices per query.
+        """
+        kp = self.index_kpool
+        D = self.index_head_dim
+        page_size = self.page_size
+        blocks, E, bpp = _kpool_blocks(cache_, D, kp, page_size)
+        pages_per_seq = pi_.shape[0] // seq_lens_.shape[0]
+        blocks = _kpool_write(
+            blocks,
+            k_[:, :D],
+            k_[:, D:],
+            seq_lens_,
+            pi_,
+            cuq_,
+            cukv_,
+            page_size=page_size,
+            E=E,
+            bpp=bpp,
+            kpool=kp,
+        )
+        cache_out = blocks.reshape(cache_.shape)
+        blocks = blocks.reshape(blocks.shape[0], E, D)  # 3D [blocks, E, D] kernel ABI
+        if not compute_topk:
+            return (
+                cache_out,
+                jnp.full((q_.shape[0], 1), -1, jnp.int32),
+                jnp.full((q_.shape[0], 1), -1, jnp.int32),
+            )
+        k_pools = self.index_topk // kp
+        pools = streamindex_topk_live(
+            q_,
+            w_,
+            blocks,
+            seq_lens_,
+            pi_ * bpp,
+            cuq_,
+            cukv_,
+            dist_,
+            k=k_pools,
+            pages_per_seq=pages_per_seq,
+            compression_ratio=kp,
+        )
+        # Decode metadata: query t is (virtual) sequence t, at position seq_lens[t] - 1.
+        topk = _kpool_expand(
+            pools, seq_lens_[: q_.shape[0]] - 1, kpool=kp, k_tokens=self.index_topk
+        )
+        topk_pages = (
+            compute_topk_pages(
+                topk, page_size=self.page_size, pages_per_seq=pages_per_seq, k_pages_max=511
+            )
+            if compute_pages
+            else jnp.full((topk.shape[0], 1), -1, jnp.int32)
+        )
+        return cache_out, topk, topk_pages
 
     def _run_sparse(
         self,
@@ -1431,6 +1530,103 @@ def _placeholder_topk_like(topk_pages: jax.Array) -> jax.Array:
     in_specs check, so derive the placeholder from the data-sharded page topk.
     """
     return jnp.full_like(topk_pages[:, :1], -1, dtype=jnp.int32)
+
+
+def kpool_indexer_dim(index_head_dim: int, kpool: int) -> int:
+    """Per-token indexer-cache width that fits the KPool page layout (see ``_kpool_blocks``).
+
+    One page holds, as ``[page_size // kpool, index_head_dim]`` blocks: 1 block of pooled keys
+    plus ``2 * kpool`` blocks of raw per-token (key, gate-logit) rows.
+    """
+    if kpool <= 1:
+        return index_head_dim
+    need = index_head_dim * (1 + 2 * kpool)
+    return -(-need // (kpool * 128)) * 128
+
+
+def _kpool_blocks(cache_: jax.Array, index_head_dim: int, kpool: int, page_size: int):
+    """View a local KPool indexer buffer ``[pages, rows/pack, pack, D]`` as blocks ``[pages*bpp, E/pack, pack, D]``.
+
+    ``rows = page_size * (1 + 2*kpool) / kpool`` rounded up (see ``kpool_indexer_dim`` and
+    the pool's ``_indexer_cache_shape``). Page ``p`` owns blocks ``bpp*p ..``: block
+    ``bpp*p`` holds the page's ``E = page_size // kpool`` pooled keys (sequence entry ``e`` in
+    page ``e // E``, row ``e % E`` — the compressed layout ``streamindex_topk`` scores) and
+    blocks ``bpp*p + 1 ..`` the raw rows: token offset ``t``'s key at raw row ``2t``, its
+    gate logit at ``2t + 1`` (raw row ``r`` -> block ``1 + r // E``, row ``r % E``). Only
+    major dims are split, so the view is a bitcast.
+    """
+    n_pages, rows_pp, pack, width = cache_.shape
+    assert width == index_head_dim, (width, index_head_dim)
+    rows = rows_pp * pack
+    E = page_size // kpool
+    bpp = rows // E
+    assert bpp >= 1 + 2 * kpool and rows % E == 0 and E % pack == 0, (rows, E, pack)
+    return cache_.reshape(n_pages * bpp, E // pack, pack, width), E, bpp
+
+
+def _kpool_write(
+    blocks, keys, gates, seq_lens, page_indices, cu_q_lens, cu_kv_lens, *, page_size, E, bpp, kpool
+):
+    """Write new tokens' raw (key, gate) rows, then (re)pool every pool a new token closes.
+
+    ``blocks`` is the 4D block view from ``_kpool_blocks``. A pool closes at a token whose
+    position ``pos`` has ``(pos + 1) % kpool == 0``; its pooled key is
+    ``sum_i softmax_i(gate_i) * key_i`` (per dim) over the pool's ``kpool`` raw rows, read
+    back from the cache so pools spanning earlier forwards are covered. Rejected speculative
+    tokens need no rollback: a pool is only visible once its last position is written,
+    which recomputes it.
+    """
+    pack = blocks.shape[2]
+    T = keys.shape[0]
+    S = seq_lens.shape[0]
+    t = jnp.arange(T)
+    seq_id = jnp.clip(jnp.searchsorted(cu_q_lens[1:], t, side="right"), 0, S - 1)
+    q_start = cu_q_lens[seq_id]
+    q_end = cu_q_lens[seq_id + 1]
+    kv_len = seq_lens[seq_id]
+    abs_pos = jnp.maximum(kv_len - (q_end - q_start) + (t - q_start), 0)
+    valid = (t >= q_start) & (t < q_end) & (kv_len > 0)
+    page = page_indices[cu_kv_lens[seq_id] // page_size + abs_pos // page_size]
+    off = abs_pos % page_size
+    # Padding rows -> reserved page 0 (see _scatter_paged).
+    base = jnp.where(valid, page, 0) * bpp
+    off = jnp.where(valid, off, 0)
+
+    def at_raw(r, blk):
+        row = r % E
+        return blk + 1 + r // E, row // pack, row % pack
+
+    dt = blocks.dtype
+    blocks = blocks.at[at_raw(2 * off, base)].set(keys.astype(dt))
+    blocks = blocks.at[at_raw(2 * off + 1, base)].set(gates.astype(dt))
+
+    closes = valid & ((abs_pos + 1) % kpool == 0)
+    first = jnp.where(closes, off - (kpool - 1), 0)  # pools never straddle a page
+    toks = first[:, None] + jnp.arange(kpool)[None, :]  # [T, kpool]
+    k_raw = blocks[at_raw(2 * toks, base[:, None])].astype(jnp.float32)  # [T, kpool, D]
+    g_raw = blocks[at_raw(2 * toks + 1, base[:, None])].astype(jnp.float32)
+    pooled = (jax.nn.softmax(g_raw, axis=1) * k_raw).sum(axis=1)
+    prow = jnp.where(closes, off // kpool, 0)
+    pblk = jnp.where(closes, base, 0)
+    return blocks.at[pblk, prow // pack, prow % pack].set(pooled.astype(dt))
+
+
+def _kpool_expand(topk_pools, q_pos, *, kpool, k_tokens):
+    """Pooled-entry top-k ``[N, k_tokens // kpool]`` -> token top-k ``[N, k_tokens + kpool - 1]``.
+
+    Each selected pool contributes its ``kpool`` tokens; the unfinished tail pool of the
+    visible prefix (positions ``((q_pos + 1) // kpool) * kpool .. q_pos``) is always appended.
+    """
+    offs = jnp.arange(kpool, dtype=jnp.int32)
+    tok = topk_pools[..., None] * kpool + offs
+    tok = jnp.where((topk_pools >= 0)[..., None], tok, -1).reshape(topk_pools.shape[0], -1)
+    tok = jnp.pad(tok, ((0, 0), (0, k_tokens - tok.shape[1])), constant_values=-1)
+    vis = q_pos + 1
+    tail_start = (vis // kpool) * kpool
+    toff = jnp.arange(kpool - 1, dtype=jnp.int32)
+    tail = jnp.where(toff[None, :] < (vis % kpool)[:, None], tail_start[:, None] + toff, -1)
+    tail = jnp.where((q_pos >= 0)[:, None], tail, -1)
+    return jnp.concatenate([tok, tail.astype(jnp.int32)], axis=-1)
 
 
 def _fixed_stride_pages(
