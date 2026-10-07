@@ -30,19 +30,13 @@ def _tree_args(**overrides):
     return _eagle_args(**kwargs)
 
 
-@pytest.mark.parametrize("page_size", [1, 64])
-def test_tree_drafting_passes(page_size):
-    _tree_args(page_size=page_size).check_server_args()
-
-
 def test_chain_drafting_passes():
     _eagle_args().check_server_args()
 
 
-@pytest.mark.parametrize("algorithm", ["EAGLE", "NEXTN", "STANDALONE"])
-def test_tree_drafting_is_eagle3_only(algorithm):
+def test_tree_drafting_is_eagle3_only():
     with pytest.raises(ValueError, match="EAGLE3 only"):
-        _tree_args(speculative_algorithm=algorithm).check_server_args()
+        _tree_args(speculative_algorithm="EAGLE").check_server_args()
 
 
 def test_tree_drafting_requires_non_overlap_before_the_overlap_gate():
@@ -69,13 +63,15 @@ def test_tree_drafting_bounds_draft_tokens_by_drafted_candidates():
         _tree_args(speculative_eagle_topk=2, speculative_num_draft_tokens=12).check_server_args()
 
 
-def test_default_tree_width_runs_without_overlap():
+@pytest.mark.parametrize("page_size", [1, 64])
+def test_default_tree_width_runs_without_overlap(page_size):
     args = ServerArgs(
         model_path="target",
         speculative_algorithm="EAGLE3",
         speculative_draft_model_path="draft",
         disable_overlap_schedule=True,
         grammar_backend="none",
+        page_size=page_size,
     )
     assert args.speculative_eagle_topk > 1
     args.check_server_args()

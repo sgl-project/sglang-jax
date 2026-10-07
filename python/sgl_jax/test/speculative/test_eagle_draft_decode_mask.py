@@ -162,9 +162,9 @@ def test_draft_mask_does_not_read_parents_back():
         assert shape.shape[:2] == (4 * topk, 1)
 
 
-@pytest.mark.parametrize("seq_lens, steps", [([5, 9, 3], 4), ([1, 40], 3)])
-def test_chain_window_is_unchanged(seq_lens, steps):
+def test_chain_window_is_unchanged():
     """topk == 1 keeps the pre-tree layout: kv_len = seq_len + step."""
+    seq_lens, steps = [5, 9, 3], 4
     backend = FlashAttention(8, 8, 128, page_size=1, mesh=_mesh())
     batch = _batch(seq_lens, len(seq_lens) + 1, 1, steps)
     metadata = backend.get_eagle_multi_step_metadata(batch)

@@ -17,6 +17,8 @@ from sgl_jax.test.test_utils import (
 
 
 class TestSpeculativeDecoding(CustomTestCase):
+    topk = 1
+
     @classmethod
     def setUpClass(cls):
         cls.model = QWEN3_32B
@@ -51,7 +53,7 @@ class TestSpeculativeDecoding(CustomTestCase):
                 "67caf31f9062d7ab64872e0a111d499bc16cd205",  # this model revision has .safetensor model file, which is converted by huggingface official
                 # FIXME(pc) topk > 1 has poor performance now, change it when build_tree_mask_for_draft_decode kernel is  implemented
                 "--speculative-eagle-topk",
-                "1",
+                str(cls.topk),
                 "--speculative-num-steps",
                 "3",
                 "--speculative-num-draft-tokens",
@@ -92,65 +94,14 @@ class TestSpeculativeDecoding(CustomTestCase):
         self.assertGreater(metrics["score"], 0.45)
 
 
-class TestSpeculativeDecodingTree(CustomTestCase):
-    """EAGLE3 tree drafting (topk > 1).
+class TestSpeculativeDecodingTree(TestSpeculativeDecoding):
+    """EAGLE3 tree drafting (topk > 1), on the chain test's server setup.
 
     num_steps=3 runs two draft forwards, so the per-step tree mask is built
     from real parents at a step beyond the first.
     """
 
-    @classmethod
-    def setUpClass(cls):
-        cls.model = QWEN3_32B
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            device="tpu",
-            check_cache_miss=False,
-            other_args=[
-                "--trust-remote-code",
-                "--skip-server-warmup",
-                "--mem-fraction-static",
-                "0.8",
-                "--download-dir",
-                "/dev/shm",
-                "--max-running-requests",
-                "64",
-                "--precompile-bs-paddings",
-                "16",
-                "--precompile-token-paddings",
-                "4096",
-                "--context-length",
-                "4096",
-                "--speculative-draft-model-path",
-                QWEN3_32B_EAGLE3,
-                "--speculative-draft-model-revision",
-                "67caf31f9062d7ab64872e0a111d499bc16cd205",
-                "--speculative-eagle-topk",
-                "2",
-                "--speculative-num-steps",
-                "3",
-                "--speculative-num-draft-tokens",
-                "4",
-                "--disable-overlap-schedule",
-                "--speculative-algorithm",
-                "EAGLE3",
-                "--page-size",
-                "64",
-                "--attention-backend",
-                "fa",
-                "--dtype",
-                "bfloat16",
-                "--tp-size",
-                "4",
-            ],
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+    topk = 2
 
     def _generate(self, text: str, sampling_params: dict) -> requests.Response:
         return requests.post(
@@ -159,30 +110,11 @@ class TestSpeculativeDecodingTree(CustomTestCase):
             timeout=600,
         )
 
-    def test_greedy_decode(self):
-        r = self._generate("The capital of France is", {"temperature": 0, "max_new_tokens": 32})
-        r.raise_for_status()
-        d = r.json()
-        self.assertGreater(d["meta_info"]["completion_tokens"], 16)
-        self.assertGreater(len(d["text"]), 0)
-
     def test_sampled_request_is_rejected(self):
         r = self._generate("The capital of France is", {"temperature": 0.7, "max_new_tokens": 8})
         self.assertEqual(r.status_code, 400)
         self.assertIn("greedy sampling only", r.text)
         requests.get(f"{self.base_url}/health", timeout=10).raise_for_status()
-
-    def test_mmlu(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mmlu",
-            num_examples=64,
-            num_threads=16,
-            max_tokens=1024,
-        )
-        metrics = run_eval(args)
-        self.assertGreater(metrics["score"], 0.45)
 
     def test_tree_accepts_beyond_the_root(self):
         # Output correctness depends only on the target side; a broken draft
