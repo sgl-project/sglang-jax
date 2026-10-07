@@ -220,7 +220,14 @@ def _qblock_kernel(
         bias = jnp.where(valid, 0.0, -jnp.inf)  # [RBF, QBHp] fp32
 
         _copy(j, slot).wait()
-        kv_blk = kv_scratch[slot]  # [RBF, Dk_pad]
+        kv_blk = kv_scratch[slot]  # [RBF, Dk_pad], cache dtype
+        # An fp8 cache exists to halve the HBM->VMEM bytes; the math still wants
+        # the query dtype. Upcast once here rather than at each use: the score dot
+        # below would otherwise mix fp8 with bf16, and ``p.astype(kv_blk.dtype)``
+        # would round softmax probabilities to fp8's ~6% relative error -- on the
+        # one tensor whose small values carry the attention tail.
+        if kv_blk.dtype != q.dtype:
+            kv_blk = kv_blk.astype(q.dtype)
 
         # score: [RBF,Dk]·[QBHp,Dk] -> [RBF, QBHp] (keys sublane, queries lane)
         s = (
