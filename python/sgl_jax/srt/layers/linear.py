@@ -194,6 +194,99 @@ class MergedColumnParallelLinear(LinearBase):
             scope_name=scope_name,
         )
 
+    @classmethod
+    def shard_local_merged_column_dot(
+        cls,
+        x: jax.Array,
+        weights: Sequence[jax.Array],
+        output_sizes: Sequence[int],
+        mesh: jax.sharding.Mesh,
+        *,
+        preferred_element_type: jnp.dtype = jnp.float32,
+        out_dtype: jnp.dtype | None = None,
+    ) -> list[jax.Array]:
+        """Execute a merged column-parallel dot_general without cross-shard all-to-all.
+
+        Concatenating column-sharded 2D weights ``P(None, "tensor")`` along
+        ``axis=-1`` concatenates along the sharded TP axis, causing GSPMD to
+        emit cross-shard ``all-to-all`` and ``collective-permute`` collectives
+        when ``x.shape[0] < tp_size`` (e.g., ``M=1`` decode). By reshaping each
+        weight to 3D ``[K, tp_size, N_i // tp_size]`` with ``P(None, "tensor",
+        None)``,
+        concatenating along the local minor axis ``-1``, and splitting the 3D output
+        ``P(..., "tensor", None)`` per shard before restoring the global layout,
+        both the weight merge and output split execute strictly shard-locally.
+        """
+        tp_size = cls._mesh_tp_size(mesh)
+        in_features = x.shape[-1]
+        weight_3d_sharding = NamedSharding(mesh, P(None, "tensor", None))
+        out_2d_sharding = NamedSharding(
+            mesh,
+            P("data", *([None] * (x.ndim - 2)), "tensor"),
+        )
+        out_3d_sharding = NamedSharding(
+            mesh,
+            P("data", *([None] * (x.ndim - 2)), "tensor", None),
+        )
+
+        if tp_size > 1 and all(sz % tp_size == 0 for sz in output_sizes):
+            w_3d_parts = [
+                w.reshape(
+                    in_features,
+                    tp_size,
+                    sz // tp_size,
+                    out_sharding=weight_3d_sharding,
+                )
+                for w, sz in zip(weights, output_sizes)
+            ]
+            w_merged = jnp.concatenate(w_3d_parts, axis=-1).reshape(
+                in_features,
+                sum(output_sizes),
+                out_sharding=NamedSharding(mesh, P(None, "tensor")),
+            )
+            merged_out = lax.dot_general(
+                x,
+                w_merged,
+                (((x.ndim - 1,), (0,)), ((), ())),
+                preferred_element_type=preferred_element_type,
+                out_sharding=out_2d_sharding,
+            )
+            if out_dtype is not None:
+                merged_out = merged_out.astype(out_dtype)
+            merged_3d = merged_out.reshape(
+                *x.shape[:-1],
+                tp_size,
+                sum(output_sizes) // tp_size,
+                out_sharding=out_3d_sharding,
+            )
+            split_offsets = []
+            acc = 0
+            for sz in output_sizes[:-1]:
+                acc += sz // tp_size
+                split_offsets.append(acc)
+            parts_3d = jnp.split(merged_3d, split_offsets, axis=-1)
+            return [
+                p.reshape(*x.shape[:-1], sz, out_sharding=out_2d_sharding)
+                for p, sz in zip(parts_3d, output_sizes)
+            ]
+
+        w_merged = jnp.concatenate(list(weights), axis=-1)
+        merged_out = lax.dot_general(
+            x,
+            w_merged,
+            (((x.ndim - 1,), (0,)), ((), ())),
+            preferred_element_type=preferred_element_type,
+            out_sharding=out_2d_sharding,
+        )
+        if out_dtype is not None:
+            merged_out = merged_out.astype(out_dtype)
+        split_offsets = []
+        acc = 0
+        for sz in output_sizes[:-1]:
+            acc += sz
+            split_offsets.append(acc)
+        return list(jnp.split(merged_out, split_offsets, axis=-1))
+
 
 class QuantizedLinear(nnx.Module):
     """Quantized linear layer using native quantized matmul.

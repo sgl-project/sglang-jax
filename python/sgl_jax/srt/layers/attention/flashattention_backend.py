@@ -844,6 +844,7 @@ class FlashAttention(AttentionBackend):
                 ),
                 softmax_dtype=layer.softmax_dtype,
                 m_block_sizes=target_verify_m_block_sizes,
+                predicate_cache_dma=True,
             )
 
             return result, updated_kv_cache_fused

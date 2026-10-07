@@ -385,6 +385,7 @@ def _ragged_paged_attention_kernel_loop(
     skip_kv_mask: bool = False,
     tpu_version: int = 6,
     debug_mode: bool = False,
+    predicate_cache_dma: bool = True,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
     assert q_hbm_ref.shape[-1] == kv_cache_hbm_ref.shape[-1]
@@ -669,23 +670,29 @@ def _ragged_paged_attention_kernel_loop(
 
         bkv_sz_frm_cache = jnp.minimum(kv_left_frm_cache, bkv_sz)
         bkv_sz_frm_new = jnp.minimum(bkv_sz - bkv_sz_frm_cache, kv_left_frm_new)
-        # sglang-jax: use cu_kv_lens for page_indices offset.
-        start_kv_page_idx = cdiv(cu_kv_lens_ref[seq_idx], page_size)
-        page_indices_offset = start_kv_page_idx + kv_p_start
 
         if not wait:
             # Make sure the current bkv buffer is safe to overwrite.
             wait_update_kv_cache(bkv_sem_idx)
 
-            for i in range(bkv_p):
-                sz = jnp.clip(kv_left_frm_cache - i * page_size, 0, page_size)
-                page_idx = jnp.minimum(page_indices_offset + i, num_page_indices - 1)
-                _async_copy(
-                    cache_hbm_ref.at[pl.ds(page_indices_ref[page_idx] * page_size, sz)],
-                    vmem_ref.at[pl.ds(i * page_size, sz)],
-                    sem,
-                    wait=False,
-                )
+            def _issue_cache_fetches():
+                # sglang-jax: use cu_kv_lens for page_indices offset.
+                start_kv_page_idx = cdiv(cu_kv_lens_ref[seq_idx], page_size)
+                page_indices_offset = start_kv_page_idx + kv_p_start
+                for i in range(bkv_p):
+                    sz = jnp.clip(kv_left_frm_cache - i * page_size, 0, page_size)
+                    page_idx = jnp.minimum(page_indices_offset + i, num_page_indices - 1)
+                    _async_copy(
+                        cache_hbm_ref.at[pl.ds(page_indices_ref[page_idx] * page_size, sz)],
+                        vmem_ref.at[pl.ds(i * page_size, sz)],
+                        sem,
+                        wait=False,
+                    )
+
+            if predicate_cache_dma:
+                pl.when(bkv_sz_frm_cache > 0)(_issue_cache_fetches)
+            else:
+                _issue_cache_fetches()
 
             new_kv_len_start = q_end - kv_left_frm_new
             _async_copy(
@@ -707,45 +714,59 @@ def _ragged_paged_attention_kernel_loop(
     def _update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz, *, wait=False):
         sem = sems.at[3, bkv_sem_idx]
         vmem_ref = bkv_x2_ref.at[bkv_sem_idx, :, :num_kv_heads_x2_per_kv_packing]
-        bkv_id = offset // bkv_sz
-        kv_p_start = offset // page_size
-        kv_p_end = cdiv(offset + update_sz, page_size)
-        ignore = offset % page_size
-        p_ignore = kv_p_start - bkv_id * bkv_p
-        # sglang-jax: use cu_kv_lens for page_indices offset.
-        start_kv_page_idx = cdiv(cu_kv_lens_ref[seq_idx], page_size)
-        page_indices_offset = start_kv_page_idx + kv_p_start
-
         cache_hbm_shape = updated_kv_cache_hbm_ref.shape
         cache_hbm_ref = updated_kv_cache_hbm_ref.reshape(
             cache_hbm_shape[0] * cache_hbm_shape[1], *cache_hbm_shape[2:]
         )
 
-        def loop_body(i, states):
-            update_sz, ignore = states
-            sz = jnp.minimum(page_size - ignore, update_sz)
-
-            _async_copy(
-                vmem_ref.at[pl.ds((p_ignore + i) * page_size + ignore, sz)],
-                cache_hbm_ref.at[
-                    pl.ds(
-                        page_indices_ref[page_indices_offset + i] * page_size + ignore,
-                        sz,
-                    )
-                ],
-                sem,
-                wait,
-            )
-            return update_sz - sz, 0
-
         if not wait:
-            lax.fori_loop(
-                0,
-                kv_p_end - kv_p_start,
-                loop_body,
-                (update_sz, ignore),
-                unroll=False,
-            )
+            bkv_id = offset // bkv_sz
+            kv_p_start = offset // page_size
+            ignore = offset % page_size
+            p_ignore = kv_p_start - bkv_id * bkv_p
+            # sglang-jax: use cu_kv_lens for page_indices offset.
+            start_kv_page_idx = cdiv(cu_kv_lens_ref[seq_idx], page_size)
+            page_indices_offset = start_kv_page_idx + kv_p_start
+
+            if predicate_cache_dma and (static_q_len == 1 or bkv_p == 1):
+                _async_copy(
+                    vmem_ref.at[pl.ds(p_ignore * page_size + ignore, update_sz)],
+                    cache_hbm_ref.at[
+                        pl.ds(
+                            page_indices_ref[page_indices_offset] * page_size + ignore,
+                            update_sz,
+                        )
+                    ],
+                    sem,
+                    wait=False,
+                )
+            else:
+                kv_p_end = cdiv(offset + update_sz, page_size)
+
+                def loop_body(i, states):
+                    cur_update_sz, cur_ignore = states
+                    sz = jnp.minimum(page_size - cur_ignore, cur_update_sz)
+
+                    _async_copy(
+                        vmem_ref.at[pl.ds((p_ignore + i) * page_size + cur_ignore, sz)],
+                        cache_hbm_ref.at[
+                            pl.ds(
+                                page_indices_ref[page_indices_offset + i] * page_size + cur_ignore,
+                                sz,
+                            )
+                        ],
+                        sem,
+                        wait,
+                    )
+                    return cur_update_sz - sz, 0
+
+                lax.fori_loop(
+                    0,
+                    kv_p_end - kv_p_start,
+                    loop_body,
+                    (update_sz, ignore),
+                    unroll=False,
+                )
         else:
             dst = cache_hbm_ref.at[pl.ds(0, update_sz)]
             _async_copy(
@@ -1731,6 +1752,7 @@ def get_vmem_limit():
         "skip_kv_mask",
         "disable_semaphore_checks",
         "debug_mode",
+        "predicate_cache_dma",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache_fused"),
 )
@@ -1766,6 +1788,7 @@ def ragged_paged_attention(
     skip_kv_mask: bool = False,
     disable_semaphore_checks: bool = True,
     debug_mode: bool = False,
+    predicate_cache_dma: bool = True,
 ):
     """Ragged paged attention with fused KV cache.
 
@@ -2019,6 +2042,7 @@ def ragged_paged_attention(
                 skip_kv_mask=skip_kv_mask,
                 tpu_version=tpu_version,
                 debug_mode=debug_mode,
+                predicate_cache_dma=predicate_cache_dma,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=len(scalar_prefetches),
