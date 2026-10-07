@@ -1707,6 +1707,7 @@ class MLATokenToKVPool(KVCache):
         end_layer: int | None = None,
         indexer_key_dim: int = 0,
         num_indexer_layers: int = 0,
+        dcp_size: int = 1,
         abstract: bool = False,
     ):
         super().__init__(size, page_size, dtype, layer_num, mesh, start_layer, end_layer)
@@ -1714,6 +1715,9 @@ class MLATokenToKVPool(KVCache):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.kv_partition_axis = kv_partition_axis
         self.dp_size = dp_size
+        if dcp_size < 1:
+            raise ValueError(f"dcp_size must be >= 1, got {dcp_size}")
+        self.dcp_size = dcp_size
         self.nope_dim, self.rope_dim = self._aligned_latent_dims(kv_lora_rank, qk_rope_head_dim)
         self.kv_dim = self.nope_dim + self.rope_dim
         self.indexer_key_dim_raw = indexer_key_dim
@@ -1737,6 +1741,7 @@ class MLATokenToKVPool(KVCache):
             "kv_sharding": self.kv_sharding,
             "indexer_key_dim": self.indexer_key_dim_raw,
             "num_indexer_layers": self.num_indexer_layers,
+            "dcp_size": self.dcp_size,
         }
         return (children, aux_data)
 
@@ -1767,6 +1772,7 @@ class MLATokenToKVPool(KVCache):
         obj.dp_size = aux_data.get("dp_size", 1)
         obj.kv_sharding = aux_data["kv_sharding"]
         obj.num_indexer_layers = aux_data.get("num_indexer_layers", 0)
+        obj.dcp_size = aux_data.get("dcp_size", 1)
         obj.nope_dim, obj.rope_dim = cls._aligned_latent_dims(
             obj.kv_lora_rank, obj.qk_rope_head_dim
         )
@@ -1798,7 +1804,13 @@ class MLATokenToKVPool(KVCache):
         and align(576,128)=640.
         """
         # MLA cache has no head axis to shard; page axis is sharded by DP.
-        self.kv_sharding = NamedSharding(self.mesh, P("data", None, None, None))
+        # dcp_size=1: replicated across tensor (today). dcp_size>1: leading
+        # DCP axis sharded on tensor so ranks store different tokens.
+        use_dcp_axis = self.dcp_size > 1 and "tensor" in self.mesh.axis_names
+        if use_dcp_axis:
+            self.kv_sharding = NamedSharding(self.mesh, P("tensor", "data", None, None, None))
+        else:
+            self.kv_sharding = NamedSharding(self.mesh, P("data", None, None, None))
 
         assert self.size % self.page_size == 0, "Cache size must be divisible by page size"
 
@@ -1811,8 +1823,10 @@ class MLATokenToKVPool(KVCache):
             qk_rope_head_dim=self.qk_rope_head_dim,
         )
         per_layer_bytes = self._shape_bytes(buffer_shape, self.dtype)
+        if use_dcp_axis:
+            buffer_shape = (self.dcp_size,) + buffer_shape
         logger.info(
-            "MLA KV cache shape per layer: %s, dtype: %s, %.2f GB",
+            "MLA KV cache shape per layer: %s, dtype: %s, %.2f GB/device",
             buffer_shape,
             self.dtype,
             per_layer_bytes / GB,
@@ -1840,6 +1854,8 @@ class MLATokenToKVPool(KVCache):
                     indexer_key_dim=self.indexer_key_dim_raw,
                 )
                 indexer_bytes = self._shape_bytes(idx_shape, self.indexer_dtype)
+                if use_dcp_axis:
+                    idx_shape = (self.dcp_size,) + idx_shape
                 logger.info(
                     "DSA indexer-key cache: %d slots × %s dtype: %s (%.2f GB total)",
                     self.num_indexer_layers,

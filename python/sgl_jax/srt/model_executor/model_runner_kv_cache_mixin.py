@@ -759,6 +759,7 @@ class ModelRunnerKVCacheMixin:
                 qk_rope_head_dim=qk_rope_head_dim,
                 dp_size=dp_size,
                 abstract=abstract,
+                dcp_size=getattr(self.server_args, "dcp_size", 1),
                 **dsa_kwargs,
             )
         else:
@@ -853,6 +854,7 @@ class ModelRunnerKVCacheMixin:
                     kvcache=self.token_to_kv_pool,
                     debug_mode=False,
                     dp_size=dp_size,
+                    dcp_size=getattr(self.server_args, "dcp_size", 1),
                 )
 
     def init_memory_pool(

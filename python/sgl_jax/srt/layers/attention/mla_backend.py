@@ -109,6 +109,7 @@ class MLAAttentionBackend(AttentionBackend):
         # When num_kv_pages_per_block is None, the kernel's lookup path also
         # overrides this with the tuned value if the "decode" entry hits.
         decode_batch_size: int = 4,
+        dcp_size: int = 1,
     ):
         assert page_size > 1, (
             "MLA attention backend does not support page_size=1. "
@@ -132,8 +133,22 @@ class MLAAttentionBackend(AttentionBackend):
         self.num_kv_pages_per_block = num_kv_pages_per_block
         self.num_queries_per_block = num_queries_per_block
         self.decode_batch_size = decode_batch_size
+        if dcp_size < 1:
+            raise ValueError(f"dcp_size must be >= 1, got {dcp_size}")
+        self.dcp_size = dcp_size
 
         self.forward_metadata = nnx.data(MLAAttentionMetadata())
+
+    def paged_cache_spec(self, dpa: str):
+        """Shard spec for the paged MLA/indexer cache.
+
+        ``dcp_size=1`` keeps today's ``P(data, None, None, None)`` (replicated
+        across tensor). ``dcp_size>1`` adds a leading DCP axis sharded on
+        ``tensor`` so ranks can store different tokens.
+        """
+        if self.dcp_size > 1:
+            return P("tensor", dpa, None, None, None)
+        return P(dpa, None, None, None)
 
     def get_forward_metadata(self, batch: ModelWorkerBatch):
         """Build per-batch metadata, DP-aware.
@@ -163,8 +178,9 @@ class MLAAttentionBackend(AttentionBackend):
         per_dp_loc_len = total_loc_len // batch.dp_size
 
         cache_loc_2d = batch.cache_loc.reshape(batch.dp_size, per_dp_loc_len)
-        strided_2d = cache_loc_2d[:, :: self.page_size]
-        page_indices = (strided_2d // self.page_size).ravel()
+        from sgl_jax.srt.layers.dcp.layout import physical_page_indices
+
+        page_indices = physical_page_indices(cache_loc_2d, self.page_size, self.dcp_size).ravel()
 
         if batch.forward_mode == ForwardMode.EXTEND:
             ext_2d = batch.extend_seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
@@ -178,9 +194,17 @@ class MLAAttentionBackend(AttentionBackend):
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
         seq_lens = batch.seq_lens
-        aligned_seq_lens = (
-            (batch.seq_lens + self.page_size - 1) // self.page_size
-        ) * self.page_size
+        if self.dcp_size > 1:
+            # page_indices has one physical page per virtual page. cu_kv must
+            # be physical tokens so ``cu_kv // page_size`` indexes that table
+            # (virtual align would be off by dcp_size and OOB the short table).
+            vpage = self.page_size * self.dcp_size
+            n_vpages = (batch.seq_lens + vpage - 1) // vpage
+            aligned_seq_lens = n_vpages * self.page_size
+        else:
+            aligned_seq_lens = (
+                (batch.seq_lens + self.page_size - 1) // self.page_size
+            ) * self.page_size
 
         aligned_2d = aligned_seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
         cu_kv_2d = np.zeros((batch.dp_size, batch.per_dp_bs_size + 1), dtype=np.int32)
@@ -225,6 +249,7 @@ class MLAAttentionBackend(AttentionBackend):
             "num_kv_pages_per_block": self.num_kv_pages_per_block,
             "num_queries_per_block": self.num_queries_per_block,
             "decode_batch_size": self.decode_batch_size,
+            "dcp_size": self.dcp_size,
         }
         return (children, aux_data)
 
@@ -243,6 +268,7 @@ class MLAAttentionBackend(AttentionBackend):
             num_kv_pages_per_block=aux_data["num_kv_pages_per_block"],
             num_queries_per_block=aux_data["num_queries_per_block"],
             decode_batch_size=aux_data["decode_batch_size"],
+            dcp_size=aux_data.get("dcp_size", 1),
         )
         obj.forward_metadata = children[0]
         return obj
@@ -307,12 +333,13 @@ class MLAAttentionBackend(AttentionBackend):
         sliding_window = layer.sliding_window_size if layer is not None else None
         soft_cap = layer.logit_cap if layer is not None else None
 
+        cache_spec = self.paged_cache_spec(dpa)
         in_specs = (
             P(dpa, "tensor", None),  # ql_nope    [T, n_h/tp, lkv]
             P(dpa, "tensor", None),  # q_pe       [T, n_h/tp, r]
             P(dpa, None),  # new_kv_c   [T, lkv]  (single latent, no head axis)
             P(dpa, None),  # new_k_pe   [T, r]    (single latent)
-            P(dpa, None, None, None),  # cache (page axis sharded by data)
+            cache_spec,  # cache (page axis sharded by data; leading DCP when dcp>1)
             P(dpa),  # seq_lens
             P(dpa),  # page_indices
             P(dpa),  # cu_q_lens
@@ -321,7 +348,7 @@ class MLAAttentionBackend(AttentionBackend):
         )
         out_specs = (
             P(dpa, "tensor", None),  # o_latent       [T, n_h/tp, lkv]
-            P(dpa, None, None, None),  # updated cache  4D
+            cache_spec,  # updated cache
         )
 
         def _run(

@@ -34,6 +34,7 @@ from sgl_jax.srt.disaggregation.pathways_scheduler import PathwaysPDSchedulerMix
 from sgl_jax.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sgl_jax.srt.disaggregation.runtime import install_disaggregation_wiring
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
+from sgl_jax.srt.layers.dcp.layout import virtual_page_size
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.managers.communication import CommunicationBackend
 from sgl_jax.srt.managers.dp_load import DpLoadSnapshot, DpRouter
@@ -244,7 +245,8 @@ class Scheduler(
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.stream_interval = server_args.stream_interval
         self.max_seq_len = server_args.max_seq_len
-        self.page_size = server_args.page_size
+        # Under DCP the allocator's page is page_size * dcp_size tokens.
+        self.page_size = virtual_page_size(server_args.page_size, server_args.dcp_size)
         self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
 
         # PD disaggregation runtime attributes. They are populated by
@@ -1783,8 +1785,11 @@ class Scheduler(
         evictable_size = sum(
             [self.tree_cache.evictable_size(dp_rank=dp) for dp in range(self.dp_size)]
         )
-        num_used = self.max_total_num_tokens - (available_size + evictable_size)
-        token_usage = num_used / self.max_total_num_tokens
+        # Paged DCP reports available_size in virtual tokens (page * dcp_size).
+        dcp = getattr(self.server_args, "dcp_size", 1)
+        cap = self.max_total_num_tokens * max(int(dcp), 1)
+        num_used = cap - (available_size + evictable_size)
+        token_usage = num_used / cap
         return num_used, token_usage, available_size, evictable_size
 
     def _get_swa_token_info(self):

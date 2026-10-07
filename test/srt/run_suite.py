@@ -545,6 +545,18 @@ suites = {
         TestFile("test/srt/test_recurrent_split_equivalence.py", 0.3),
         TestFile("test/srt/test_prepare_for_extend_protected_len.py", 0.2),
         TestFile("test/srt/test_native_attention_paged_decode.py", 1),
+        # DCP: the layout/allocator/merge contracts are pure numpy or JAX on CPU
+        # devices, so they gate the sharding math without a TPU. The DCP tests that
+        # need real chips are the *_tpu.py ones, which require a 16-device 2-host
+        # slice and so have no runner here.
+        TestFile("python/sgl_jax/test/test_dcp_layout.py", 0.2, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_dcp_server_args.py", 0.1, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_dcp_allocator.py", 0.2, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_dcp_write.py", 0.2, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_dcp_indexer.py", 0.2, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_dcp_attend.py", 0.3, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_dcp_merge_scatter.py", 0.3, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_dcp_merge_a2a.py", 0.3, runner="pytest"),
     ],
     "unit-test-tpu-v6e-4": [
         TestFile(
