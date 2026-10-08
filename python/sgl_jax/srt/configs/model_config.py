@@ -386,6 +386,17 @@ class ModelConfig:
         Returns:
             Unified QuantizationConfig object or None
         """
+        hf_quant_config = self._get_hf_quant_config()
+        if hf_quant_config is None:
+            text_config = get_hf_text_config(self.hf_config)
+            hf_quant_config = getattr(text_config, "quantization_config", None)
+        if isinstance(hf_quant_config, dict) and hf_quant_config.get("format") == "pack-quantized":
+            raise NotImplementedError(
+                "compressed-tensors pack-quantized checkpoints are not supported. "
+                "Use a checkpoint in a supported format; disabling quantization or "
+                "setting dtype=bfloat16 does not unpack packed integer weights."
+            )
+
         # 1. If user provided a config path, use it (already loaded in __init__)
         if self.quantization_config is not None:
             logger.info("Using user-provided quantization config")

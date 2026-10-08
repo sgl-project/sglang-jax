@@ -27,7 +27,6 @@ from sgl_jax.srt.multimodal.in_model.interface import (
 from sgl_jax.srt.multimodal.in_model.lane_packing import (
     encoder_num_lanes,
     pack_lanes,
-    restore_encoder_output,
     run_mrope_vision_model,
 )
 from sgl_jax.srt.multimodal.layers.vision_sharding import resolve_encoder_tp
@@ -106,7 +105,7 @@ class MiMoV2ForConditionalGeneration(InModelMultimodalContract, MiMoV2ForCausalL
         if len(items_per_lane) != num_lanes:
             raise ValueError("item lane count does not match the encoder topology")
         batch_sharding = encoder.specs.sharding(encoder.specs.batch_axis)
-        codes, output_indices, _ = pack_lanes(
+        codes, _, _ = pack_lanes(
             items_per_lane,
             merge_unit=encoder.group_size,
             input_sharding=batch_sharding,
@@ -121,7 +120,9 @@ class MiMoV2ForConditionalGeneration(InModelMultimodalContract, MiMoV2ForCausalL
                 codes.reshape(num_lanes, -1, encoder.channels, out_sharding=batch_sharding),
                 jax.device_put(valid, batch_sharding),
             )
-            return restore_encoder_output(output, output_indices, encoder.specs.sharding())
+            return jax.sharding.reshard(
+                output.reshape(-1, output.shape[-1]), encoder.specs.sharding()
+            )
 
     def get_multimodal_encode_funcs(self):
         funcs = {}

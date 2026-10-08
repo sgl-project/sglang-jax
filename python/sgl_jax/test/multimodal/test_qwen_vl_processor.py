@@ -93,7 +93,7 @@ def test_qwen_loads_and_processes_images_and_videos_in_one_worker(monkeypatch, w
         assert source == "video-source"
         assert config["factor"] == 28
         stages.append(("video", threading.get_ident()))
-        return "loaded-video"
+        return "loaded-video", {}
 
     def combine(input_text, images=None, videos=None, *, processor, **kwargs):
         assert input_text == "prompt"

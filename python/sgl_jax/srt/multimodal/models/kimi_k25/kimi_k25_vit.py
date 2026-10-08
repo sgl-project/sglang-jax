@@ -412,7 +412,7 @@ def build_lane_merge_plan(
     * Exactly ``output_cap`` rows are emitted so every lane has the same shape
       and the lanes can be concatenated. Padding rows gather index
       ``base_offset`` with weight 0, so they stay in bounds and contribute
-      nothing; ``restore_encoder_output`` discards them.
+      nothing; consumers skip them using per-item output lengths.
     * ``max_t`` is supplied by the caller rather than derived, so that lanes
       holding different frame counts still agree on the temporal axis. Items
       with ``t < max_t`` duplicate their first frame into the padded slots,
