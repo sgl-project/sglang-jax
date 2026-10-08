@@ -115,9 +115,7 @@ class TestKDATrackScatter(unittest.TestCase):
         new_conv = jax.device_put(new_conv, NamedSharding(mesh, P("data", "tensor", None)))
         buf = jax.device_put(self.conv_buf, NamedSharding(mesh, P("data", "tensor", None)))
 
-        out = np.asarray(
-            self.backend.set_conv_track_state([buf], track_idx, track_mask, new_conv)[0]
-        )
+        out = np.asarray(self.backend.set_conv_track_state(buf, track_idx, track_mask, new_conv))
         np.testing.assert_array_equal(out[3], np.asarray(new_conv)[0])  # mask on
         np.testing.assert_array_equal(out[1], np.asarray(self.conv_buf)[1])  # mask off
 
