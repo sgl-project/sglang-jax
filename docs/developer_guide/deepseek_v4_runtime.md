@@ -215,6 +215,24 @@ spill boundary. The tuner, mHC layer and runtime regressions pass 96 cases
 with one skip on CPU. TPU compilation and serving revalidation remain pending;
 a new Falcon submission requires user confirmation.
 
+The approved mHC follow-up, `exp-subn4khhad` on `a36d5c212`, reached service
+readiness in 630.7 seconds. Prewarm took 160.1 seconds and M loading took
+28.3 seconds; the first 41 E layers averaged 8.10 seconds per layer. The
+final E timing was not captured before shutdown. First-prefill tracing
+passed the mHC device lookup but failed in CSA with
+`streamindex_topk() got an unexpected keyword argument 'return_scores'`.
+No generation check completed and TPU mHC compilation was not established.
+A 2026-10-08 10:08:56 UTC resource snapshot showed no lease, no running or
+pending allocation, and a Failed Pod for this experiment.
+
+The StreamIndex kernel now includes the reference's static `return_scores`
+flag and returns the masked float32 score matrix before top-K selection when
+requested. Default index-returning behavior is retained. CPU tests trace the
+real jitted API and CSA caller with only the TPU-only Pallas scorer replaced,
+cover score/mask preservation and default/explicit index-mode padding. They
+do not validate TPU scoring or lowering. The target-aware SparseCore lookup
+on this branch is retained rather than replaced with a host-backend check.
+
 No TPU acceptance row has been measured or posted. The six RFC rows (single-request decode, 8K and
 32K TTFT, cc64 and cc256 throughput/latency, GSM8K) remain pending on v7x
 2x2x1, tp8/ep8, with the static expert-FP8 checkpoint and the reference's 5%
@@ -244,6 +262,7 @@ Paths in the first six rows are relative to `python/sgl_jax/srt/`.
 | #1717 `utils/jax_utils.py`, `_metadata_unpacker` | 300–328 | Brian, 29 |
 | #1717 `utils/jax_utils.py`, `packed_device_array` | 331–377 | Brian, 47 |
 | `kernels/mhc/tune.py`, v7x platform | 40–77 | Brian, 38 |
+| `kernels/dsa/streamindex_topk.py`, score-return exit | 1055–1058 | Greg Huang, 4 |
 
 The file-level adaptations also touch `forward_batch_info.py`, both workers,
 `model_forward.py`, compilation/export inputs and resources, scheduler batch,
