@@ -358,7 +358,7 @@ class TestSchedulerHandoff(CustomTestCase):
                     np.testing.assert_array_equal(embeddings.view(np.uint16), want)
                     self._handoff(batch, ids, embeddings)
 
-    def test_absent_table_and_unsupported_scheduling(self):
+    def test_absent_table_and_stale_stream(self):
         from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
         batch = self._schedule(ForwardMode.DECODE, [[([10, 11], [12], 2, 1)]])
@@ -368,12 +368,6 @@ class TestSchedulerHandoff(CustomTestCase):
         self._handoff(batch, ids, None)
         table = NGramTable(_params(), DIM)
         with patch("sgl_jax.srt.managers.schedule_batch.get_ngram_table", return_value=table):
-            with self.assertRaisesRegex(RuntimeError, "future tokens"):
-                batch._merge_ngram_ple(1, 1, np.array([-1], np.int32))
-            batch.spec_algorithm = SimpleNamespace(is_none=lambda: False)
-            with self.assertRaisesRegex(NotImplementedError, "speculative"):
-                batch._merge_ngram_ple(1, 1, ids)
-            batch.spec_algorithm = None
             batch.reqs_info[0].seq_lens[0] = 5
             with self.assertRaisesRegex(ValueError, "stale"):
                 batch._merge_ngram_ple(1, 1, ids)

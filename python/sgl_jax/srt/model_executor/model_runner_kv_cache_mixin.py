@@ -115,15 +115,10 @@ def _linear_state_params_from_config(cfg):
     )
 
 
-def _conv_state_specs_from_config(cfg):
-    """Conv specs a config supplies directly; None -> derive GDN's from the
-    recurrent scalars, which is every family but Qwen4Exp."""
-    return getattr(cfg, "conv_state_specs", None)
-
-
 def _per_req_state_bytes_from_config(cfg, tp_size: int) -> int:
     """Per-request recurrent + conv state bytes for a hybrid recurrent model."""
     state_params = _linear_state_params_from_config(cfg)
+    conv_states = getattr(cfg, "conv_state_specs", None)
     return _compute_recurrent_per_req_bytes(
         num_layers=len(state_params.layers),
         num_heads=state_params.num_heads,
@@ -132,7 +127,7 @@ def _per_req_state_bytes_from_config(cfg, tp_size: int) -> int:
         tp_size=tp_size,
         temporal_dtype_bytes=jnp.dtype(state_params.dtype.temporal).itemsize,
         conv_dtype_bytes=jnp.dtype(state_params.dtype.conv).itemsize,
-        conv_states=_conv_state_specs_from_config(cfg),
+        conv_states=conv_states,
         num_k_heads=state_params.num_k_heads,
         head_k_dim=state_params.head_k_dim,
     )
@@ -270,6 +265,7 @@ def _build_hybrid_pools(
     ), f"recurrent state_size ({state_size}) must be divisible by dp_size ({dp_size})."
 
     state_params = _linear_state_params_from_config(cfg)
+    conv_states = getattr(cfg, "conv_state_specs", None)
     rsp = RecurrentStatePool(
         linear_recurrent_layer_ids=state_params.layers,
         size=state_size,
@@ -282,7 +278,7 @@ def _build_hybrid_pools(
         conv_dtype=state_params.dtype.conv,
         num_k_heads=state_params.num_k_heads,
         head_k_dim=state_params.head_k_dim,
-        conv_states=_conv_state_specs_from_config(cfg),
+        conv_states=conv_states,
     )
     hybrid_pool = HybridReqToTokenPool(
         size=max_num_reqs,

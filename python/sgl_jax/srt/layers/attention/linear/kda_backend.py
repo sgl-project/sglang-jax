@@ -277,7 +277,6 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
 
         Conv variant of :meth:`set_ssm_track_state` (3D keep-mask reshape).
         """
-        full_conv = new_conv_full
 
         def _scatter(buf, tidx, tmask, val):
             keep = ((tidx == 0) | (tmask == 0)).reshape(-1, 1, 1)
@@ -295,7 +294,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             ),
             out_specs=P("data", "tensor", None),
             check_vma=False,
-        )(full_conv, track_indices, track_mask, new_conv_packed)
+        )(new_conv_full, track_indices, track_mask, new_conv_packed)
         return jax.lax.optimization_barrier(new_full)
 
     # ------------------------------------------------------------------

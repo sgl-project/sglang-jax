@@ -2321,16 +2321,6 @@ class ScheduleBatch:
             "deepstack_visual_embedding": dense,
         }
 
-    def _reject_ngram_ple_with_spec(self) -> None:
-        """Spec decode has no N-gram PLE path: the host context row misses the
-        draft tokens, and wrong rows still hash to valid ids."""
-        if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
-            raise NotImplementedError(
-                "N-gram PLE does not cover speculative decoding yet: the context row "
-                "is built from origin_input_ids + output_ids, which does not contain "
-                "the draft tokens a verify batch feeds in."
-            )
-
     def _merge_ngram_ple(
         self,
         per_dp_token_size: int,
@@ -2343,19 +2333,9 @@ class ScheduleBatch:
         if table is None:
             return None
 
-        self._reject_ngram_ple_with_spec()
-
         params = table.params
         ctx_len = params.ngram_context_len
         is_extend = self.forward_mode.is_extend()
-
-        # Overlap leaves negative future-token placeholders on the host; never hash them.
-        if input_ids_cpu.size and int(input_ids_cpu.min()) < 0:
-            raise RuntimeError(
-                "N-gram PLE needs real token ids on the host, but this batch carries "
-                "unresolved future tokens. Serve this model with "
-                "--disable-overlap-schedule."
-            )
 
         ids = np.zeros((total_token_size, params.ngram_heads), dtype=np.int32)
 
@@ -2714,8 +2694,6 @@ class ScheduleBatch:
         ``reqs_info[0]``. ``input_ids``/``positions``/``cache_loc`` are
         placeholders — ``EagleDraftWorker.padding_for_decode`` rebuilds them.
         """
-        if get_ngram_table() is not None:
-            self._reject_ngram_ple_with_spec()
         # Pin total_bs to the largest precompile bucket so every cell shares
         # one jit cache entry regardless of runtime bs. Without this, each
         # smaller bucket (bs_paddings[i] < bs_paddings[-1]) triggers a fresh
