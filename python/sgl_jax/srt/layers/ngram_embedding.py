@@ -578,13 +578,14 @@ class NGramEmbedding(nnx.Module):
             in_specs += [P("data"), P("data")]  # track_indices, track_mask
             args += [track_indices, track_mask]
 
-        return jax.shard_map(
+        out, new_conv_state = jax.shard_map(
             local_fn,
             mesh=self.mesh,
             in_specs=tuple(in_specs),
             out_specs=(P("data", "tensor"), P("data", "tensor", None)),
             check_vma=False,
         )(*args)
+        return self._from_conv_layout(out, hyper_input), new_conv_state
 
 
 __all__ = [
