@@ -469,10 +469,16 @@ class ForwardBatch:
                 sharding=NamedSharding(model_runner.mesh, PartitionSpec("data")),
             )
 
-        ple_embeddings = None
-        if batch.ple_embeddings is not None:  # [T, ple_embed_dim]
+        ple_embeddings = batch.ple_embeddings
+        text_config = getattr(getattr(model_runner, "model_config", None), "hf_text_config", None)
+        if ple_embeddings is None and getattr(text_config, "ple_layer_ids", None):
+            # Precompile batches skip _merge_ngram_ple; zeros keep the served treedef.
+            ple_embeddings = np.zeros(
+                (len(batch.input_ids), int(text_config.ple_embed_dim)), jnp.bfloat16
+            )
+        if ple_embeddings is not None:  # [T, ple_embed_dim]
             (ple_embeddings,) = device_array(
-                (batch.ple_embeddings,),
+                (ple_embeddings,),
                 sharding=NamedSharding(model_runner.mesh, PartitionSpec("data")),
             )
 
