@@ -29,11 +29,11 @@ from jax.sharding import NamedSharding, PartitionSpec
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.configs.model_config import need_attention_mask
-from sgl_jax.srt.layers.ngram_table import get_ngram_table
 from sgl_jax.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     get_global_expert_location_metadata,
 )
+from sgl_jax.srt.layers.ngram_table import get_ngram_table
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.jax_utils import device_array
 
