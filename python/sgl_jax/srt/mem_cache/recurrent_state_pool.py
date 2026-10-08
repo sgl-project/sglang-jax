@@ -88,9 +88,7 @@ def _conv_specs(
     conv_kernel_size: int,
     conv_states: tuple[ConvStateSpec, ...] | None,
 ) -> tuple[ConvStateSpec, ...]:
-    """Every conv state the pool allocates.
-    Order is not meaningful. Consumers ask by name.
-    """
+    """Every conv state the pool allocates; consumers look them up by name."""
     if conv_states is None:
         return (ConvStateSpec(LINEAR_CONV, layers, proj_size, conv_kernel_size - 1),)
     return tuple(conv_states)
@@ -257,9 +255,7 @@ class RecurrentStatePool:
         }
         with jax.set_mesh(self.mesh):
             recurrent_buffers = [alloc_recurrent() for _ in range(self.num_linear_recurrent_layers)]
-            # Ragged per layer: a spec only contributes where it lists the
-            # layer. clear / replace_buffer / copy_slots iterate, so only
-            # get_conv_state needs to know an index.
+            # A spec only contributes to the layers it lists.
             conv_buffers = [
                 [alloc_conv[s.name]() for s in self.conv_specs if layer_id in s.layers]
                 for layer_id in self.linear_recurrent_layer_ids
@@ -290,11 +286,8 @@ class RecurrentStatePool:
         return self.get_conv_state(layer_id, SHORT_CONV)
 
     def with_conv_state(self, layer_id: int, name: str, state: jax.Array) -> list[jax.Array]:
-        """Return this layer's buffers with one named state replaced.
-
-        Backends return this list to the model runner; keep peer states and
-        the pool's layout intact without mutating the input pool during jit.
-        """
+        """This layer's conv buffers with one named state replaced, without
+        mutating the pool under jit."""
         current = self.get_conv_state(layer_id, name)
         if state.shape != current.shape:
             raise ValueError(f"{name} state shape {state.shape} != {current.shape}")

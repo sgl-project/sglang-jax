@@ -1,4 +1,4 @@
-"""PLE-only dilated depthwise conv + SiLU reference, independent of GDN.
+"""PLE dilated depthwise conv + SiLU reference.
 
 The pool stores S=(K-1)*dilation consecutive tokens, oldest first. Nonzero
 request slots must be unique; slot zero is padding and is never written.

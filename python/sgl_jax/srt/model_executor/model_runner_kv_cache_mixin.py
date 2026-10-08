@@ -59,9 +59,7 @@ def _compute_recurrent_per_req_bytes(
     per_req_recurrent = (
         num_layers * (num_heads // tp_size) * head_dim * head_dim * temporal_dtype_bytes
     )
-    # Same spec list the pool allocates from, so a state it holds cannot be one
-    # the KV budget below also hands out. GDN is ~110 MiB/request here, the
-    # N-gram short conv 180 KiB.
+    # Same specs the pool allocates, so the KV budget never double-counts them.
     per_req_conv = 0
     for spec in _conv_specs(
         layers=tuple(range(num_layers)),

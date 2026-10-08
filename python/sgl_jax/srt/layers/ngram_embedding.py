@@ -10,10 +10,8 @@ conv kernel=4, dilation=ngram_size=3, conv state len=(4-1)*3=9.
            U = g * V                               -> [T, 10240]
            delta = U + SiLU(DWConv(Norm(U)))       -> [T, 10240]
 
-The default hash is numpy: multipliers reach ~3.7e13 and XOR requires the
-full 64-bit product. A two-uint32-limb TPU alternative is prototyped under
-benchmark/kernels/ngram; native Pallas int64 is unsupported on the pinned
-stack. TPU hashing must return ids to the host table. See ngram_table.py.
+The hash runs on the host in numpy because it needs full 64-bit products.
+See ngram_table.py.
 """
 
 from __future__ import annotations
@@ -92,12 +90,8 @@ def _nth_prime_after(start: int, count: int) -> int:
 
 @dataclass(frozen=True)
 class NGramHashParams:
-    """Hash addressing for one PLE layer.
-
-    The checkpoint ships these three as buffers too; NGramTable checks ours
-    against them. The 8 heads of one n-gram order share a hash and differ only
-    in which prime they reduce it by (multi-head hashing, arXiv:2207.06366).
-    """
+    """Hash addressing for one PLE layer. NGramTable checks it against the
+    copies shipped in the checkpoint."""
 
     multipliers: np.ndarray  # [ngram_size]  int64
     sizes: np.ndarray  # [HEADS]       int64, distinct primes > ngram_vocab_size_base
@@ -187,12 +181,8 @@ def ngram_context_row_split(
     ctx_len: int,  # ngram_size - 1
     eos_token_id: int,
 ) -> np.ndarray:  # [ctx_len] int32
-    """``ngram_context_row`` over ``prompt_ids + output_ids``, without building it.
-
-    Only the ctx_len tokens before chunk_start are ever read, and the scheduler
-    calls this once per request per decode step, so concatenating a
-    thousands-long stream to slice two tokens off it is the whole cost.
-    """
+    """``ngram_context_row`` over ``prompt_ids + output_ids`` without concatenating
+    them; it runs per request per decode step."""
     if ctx_len <= 0:
         return np.zeros(0, np.int32)
     n_prompt = len(prompt_ids)
@@ -209,7 +199,6 @@ def ngram_context_row_split(
         window = output_ids[lo - n_prompt : chunk_start - n_prompt]
     else:
         window = list(prompt_ids[lo:]) + list(output_ids[: chunk_start - n_prompt])
-    # A window shorter than ctx_len is exactly what ngram_context_row EOS-pads.
     return ngram_context_row(window, len(window), ctx_len, eos_token_id)
 
 
@@ -221,16 +210,10 @@ def compute_ngram_ids(
 ) -> np.ndarray:  # [T, HEADS] int32
     """Hash each token's n-grams into table row ids.
 
-    EOS is a barrier: once the walk back crosses one, every older position
-    reads as EOS, so an n-gram never spans two documents. Ids stay under 2^31
-    (the released table tops out at 320,001,446), so int32 is enough.
-
-    The mixing runs in [T], not [T, HEADS], so one [T] prefix XOR produces every
-    order in turn and the head axis appears only in the final reduce.
-
-    The reduce runs in uint64 to skip numpy's floor-mod sign fixup; both
-    operands are non-negative by construction (``build_hash_params`` bounds
-    the multipliers so token * multiplier stays under 2^63).
+    EOS is a barrier: positions older than an EOS read as EOS, so an n-gram
+    never spans two documents. Ids stay under 2^31, so int32 is enough. The
+    reduce runs in uint64; both operands are non-negative because
+    ``build_hash_params`` keeps token * multiplier under 2^63.
     """
     input_ids = np.asarray(input_ids, dtype=np.int64).reshape(-1)  # [T]
     cu_seqlens = np.asarray(cu_seqlens, dtype=np.int64)  # [B+1]
@@ -245,9 +228,7 @@ def compute_ngram_ids(
     sizes = params.sizes.reshape(ctx_len, per_order).astype(np.uint64)  # [ctx_len, hpn]
     offsets = params.offsets.reshape(ctx_len, per_order).astype(np.uint64)
 
-    # One token per request is decode, and there every token sits at chunk
-    # position 0: each lookback is then a fixed column of `context` and none
-    # of the searchsorted/clip position machinery below is needed.
+    # Decode: every token is at chunk position 0, so each lookback is a column of `context`.
     decode = num_tokens == num_reqs and bool((np.diff(cu_seqlens) == 1).all())
     if not decode:
         t_idx = np.arange(num_tokens, dtype=np.int64)  # [T]
@@ -269,8 +250,7 @@ def compute_ngram_ids(
         np.copyto(token, params.eos_token_id, where=crossed)
         crossed |= token == params.eos_token_id  # [T]
         rolling ^= token * params.multipliers[shift]  # [T]
-        # `rolling` now holds the hash of the order-(shift+1) n-gram, which is
-        # what heads [shift-1] of the reshaped head axis reduce.
+        # rolling is now the order-(shift+1) hash, reduced by heads [shift-1].
         np.mod(rolling_u[:, None], sizes[shift - 1][None, :], out=residues)  # [T, hpn]
         residues += offsets[shift - 1][None, :]
         ids[:, shift - 1, :] = residues
@@ -281,8 +261,8 @@ def compute_ngram_ids(
 
 
 class NGramEmbedding(nnx.Module):
-    """Gate and dilated short conv. Return only the PLE delta; Lookup happens on the host;
-    the caller passes its result as ``ple_embeddings``.
+    """Gate and dilated short conv; returns the PLE delta. The host lookup result
+    comes in as ``ple_embeddings``.
 
     Checkpoint weights::
 
@@ -293,9 +273,8 @@ class NGramEmbedding(nnx.Module):
         ple.norm_conv.weight    [HC*HS]
         ple.conv1d.weight       [HC*HS, 1, kernel]       depthwise
 
-    Conv state is [slots, HC*HS, (kernel-1)*ngram_size] = [slots, 10240, 9],
-    against GDN's [slots, 10240, 3] on the same layer. Equal channel counts
-    here are a coincidence; the two are unrelated pool entries.
+    Conv state is [slots, HC*HS, (kernel-1)*ngram_size], a pool entry separate
+    from GDN's conv state on the same layer.
     """
 
     def __init__(
@@ -318,9 +297,7 @@ class NGramEmbedding(nnx.Module):
         self.mesh = mesh
         self.name = scope_name
 
-        # Replicated, like the table itself: `key_proj` emits [..., HC*HS] and
-        # is only read once per forward, so a row-parallel split would buy a
-        # few hundred MB at the price of an all-reduce.
+        # Replicated: sharding the projections would save a few hundred MB but add an all-reduce.
         self.key_proj = LinearBase(
             input_size=int(config.ple_embed_dim),
             output_size=self.hyper_hidden_size,
@@ -350,9 +327,7 @@ class NGramEmbedding(nnx.Module):
         self.norm_conv = GroupedGemmaRMSNorm(
             self.hyper_hidden_size, epsilon=eps, group_size=hidden_size
         )
-        # Channel-sharded, unlike the projections: the conv is depthwise, so
-        # splitting it costs no collective and keeps the weight next to the
-        # conv state, which the pool shards the same way.
+        # Channel-sharded like the pool's conv state; depthwise, so no collective.
         self.conv1d_weight = nnx.Param(
             jnp.zeros(
                 (self.hyper_hidden_size, self.conv_kernel_size),
@@ -378,8 +353,6 @@ class NGramEmbedding(nnx.Module):
 
         k_n = _streams(self.norm_key(key))  # [T, HC, HS] f32
         q_n = _streams(self.norm_query(hyper_input))  # [T, HC, HS] f32
-        # FP32 accumulate; vLLM rounds to BF16 at each boundary to match eager
-        # torch, which is the same computation with more rounding error.
         dot = jnp.sum(k_n * q_n, axis=-1) / math.sqrt(self.hidden_size)  # [T, HC]
         # The sqrt and its 1e-6 floor are the trained gate, not a guard.
         gate = jax.nn.sigmoid(jnp.sign(dot) * jnp.sqrt(jnp.maximum(jnp.abs(dot), 1e-6)))  # [T, HC]
@@ -390,15 +363,12 @@ class NGramEmbedding(nnx.Module):
         return jnp.asarray(self.conv1d_weight, dtype)
 
     def _to_conv_layout(self, x: jax.Array) -> jax.Array:
-        """[T, C] replicated -> [T, C] channel-sharded, to match the pool's
-        conv state. A local slice, not a collective: the projections are
-        replicated and the conv is depthwise."""
+        """Replicated -> channel-sharded, matching the pool's conv state."""
         return jax.sharding.reshard(x, jax.sharding.NamedSharding(self.mesh, P("data", "tensor")))
 
     def _shard_mapped(self, local_fn, extra_in_specs=()):
-        """Per-shard conv, as gdn_backend does. The kernels index conv_state
-        by slot, which XLA cannot shard once tokens are on `data`.
-        check_vma=False: the gathers are slot-local, not cross-device."""
+        """Per-shard conv, as gdn_backend does: XLA cannot shard the slot-indexed
+        conv_state once tokens are on `data`."""
         return jax.shard_map(
             local_fn,
             mesh=self.mesh,
@@ -549,9 +519,7 @@ class NGramEmbedding(nnx.Module):
             raise NotImplementedError("Opt-in Pallas PLE currently supports one data shard")
         if hyper_input.shape[-1] != self.hyper_hidden_size:
             raise ValueError(f"hyper_input last dim must be {self.hyper_hidden_size}")
-        # A custom-call boundary must materialize the key. Keep the MXU's
-        # FP32 accumulator here: the compiled XLA gate can retain that precision
-        # through normalization. Rounding the key early can flip tiny gate dots.
+        # Keep the key in FP32 across the custom call; rounding it early can flip tiny gate dots.
         key = jax.lax.dot_general(
             ple_embeddings,
             jnp.asarray(self.key_proj.weight),

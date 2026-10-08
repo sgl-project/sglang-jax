@@ -29,9 +29,7 @@ def _norm(x, weight, eps):
 
 
 def _gate_and_norm(key, query, value, nk, nq, nc, eps):
-    # The compiled XLA gate retains FP32 normalized K/Q in the product, even
-    # though the Python graph contains a BF16 -> FP32 round trip. Actually
-    # rounding here changes near-zero dot signs and the signed-sqrt gate.
+    # Keep normalized K/Q in FP32, as compiled XLA does; rounding flips near-zero gate dots.
     key = _norm(key.astype(jnp.float32), nk, eps)
     query_n = _norm(query.astype(jnp.float32), nq, eps)
     dot = jnp.sum(key * query_n, axis=-1, keepdims=True) / math.sqrt(key.shape[-1])
@@ -348,9 +346,7 @@ def _extend_kernel(
         pltpu.make_async_copy(src, src, sem.at[0]).wait()
         return ()
 
-    # One owner per (request, group) carries state through the chunks. In
-    # particular a late tile cannot overwrite initial state before an early
-    # tile reads it, even with donation enabled.
+    # One owner per (request, group), so no tile overwrites state another has yet to read.
     jax.lax.fori_loop(0, pl.cdiv(end - start, tile), step, ())
 
     @pl.when(slot != 0)

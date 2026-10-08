@@ -1,19 +1,9 @@
 """Host-resident PLE table: 320,001,446 rows x 160 bf16 = 95.4 GiB.
 
-Stays off the accelerator. v6e HBM is 31.24 GiB, and XLA:TPU cannot gather
-from a pinned_host array at all -- mixed memory spaces are rejected, host-only
-hits a compiler RET_CHECK. So the host gathers 16 rows per token and only
-[T, 16*160] crosses to the device.
-
-Gather is latency-bound: ~143 ns per random row vs a ~57 ns copy floor, and
-sorting the ids buys 8%. Threads help because each core adds outstanding-miss
-budget. Measured on v6e-1 (EPYC 9B14, 44 vCPU, THP on), full table:
-
-    T=8192 prefill (131,072 rows)   18.5 ms @1t   2.3 ms @32t
-    B=256  decode  (4,096 rows)      0.56 ms @1t  0.25 ms @4t
-    B=8    decode  (128 rows)        0.02 ms @1t  (pool dispatch costs more)
-
-Hence _thread_count scales with row count instead of a fixed pool.
+It does not fit in v6e HBM, and XLA:TPU cannot gather from a pinned_host
+array, so the host gathers 16 rows per token and only [T, 16*160] crosses to
+the device. The gather is memory-latency-bound, so _thread_count scales the
+thread count with the row count.
 """
 
 from __future__ import annotations
@@ -55,10 +45,7 @@ class ShardPlacement:
 def shard_placements(total_rows: int, split_parts: int) -> list[ShardPlacement]:
     """Row range of every ``ngram_embedding.shard_{i}.weight``.
 
-    ``total_rows`` is the PADDED height. The exporter shards after padding, so
-    the released checkpoint is 128 x 2,500,012 = 320,001,536 (confirmed against
-    the safetensors headers). Sharding the unpadded 320,001,446 gives a short
-    last shard and misplaces every boundary after the first.
+    ``total_rows`` is the padded height: the exporter shards after padding.
     """
     if split_parts <= 0:
         raise ValueError(f"split_ngram_parts must be positive, got {split_parts}")
@@ -155,12 +142,8 @@ class NGramTable:
         ple_dense_layer_id: int = 0,
         prefix: str = "model.language_model.layers.1.ple.ple_embedding",
     ) -> NGramTable:
-        """Stream the 128 shards into RAM, no disk staging.
-
-        ``weight_files``: tensor name -> its safetensors file, i.e. the
-        checkpoint's index weight_map. safetensors seeks per tensor, so the
-        other 1,521 tensors in those 33 files are never read.
-        """
+        """Stream the shards into RAM. ``weight_files`` is the checkpoint
+        index's weight_map (tensor name -> safetensors file)."""
         from safetensors import safe_open
 
         params = build_hash_params(
@@ -199,11 +182,8 @@ class NGramTable:
         return table
 
     def verify_against_checkpoint(self, weight_files, *, prefix: str) -> None:
-        """Derived hash layout vs the buffers the exporter actually hashed with.
-
-        One wrong multiplier makes every lookup return a real but wrong row --
-        no shape error, no crash. Nothing downstream catches it.
-        """
+        """Check the derived hash layout against the exporter's buffers. A wrong
+        multiplier would silently read valid but wrong rows."""
         from safetensors import safe_open
 
         expected = {
@@ -232,9 +212,8 @@ class NGramTable:
     _STREAM_ROWS = 1 << 20  # ~320 MiB per chunk at the released row width
 
     def write_to(self, stream) -> int:
-        """Raw rows out, chunked; pair with read_into + metadata. A stream and
-        not save/load because v6e-1 has 86 GiB of disk against a 95.4 GiB
-        table, so RAM <-> object store is the only path."""
+        """Raw rows out, chunked; pair with read_into + metadata. A stream because
+        v6e-1's disk is smaller than the table."""
         written = 0
         for lo in range(0, self.padded_rows, self._STREAM_ROWS):
             block = self.data[lo : lo + self._STREAM_ROWS].tobytes()
@@ -290,8 +269,7 @@ class NGramTable:
         return cls(params, meta["dim"], padded_rows=meta["padded_rows"])
 
     def save_cache(self, directory: str | Path) -> Path:
-        """Flat file + json sidecar; restoring is one sequential read instead of
-        33 safetensors opens and 128 seeks."""
+        """Flat file + json sidecar, restored with one sequential read."""
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
         (directory / "ngram_table.json").write_text(json.dumps(self.metadata()))
@@ -309,8 +287,7 @@ class NGramTable:
         got = os.path.getsize(path)
         if got != want:
             raise ValueError(f"{path} is {got} bytes, expected {want}")
-        # mmap, not read(): pages fault in lazily and the OS can evict them,
-        # which a 95 GiB anonymous array cannot. Drops from_metadata's alloc.
+        # mmap: pages load lazily and the OS can evict them.
         table.data = np.memmap(path, dtype=np.uint16, mode="r").reshape(
             table.padded_rows, table.dim
         )
@@ -322,9 +299,8 @@ _MADV_RANDOM = 1
 
 
 def _madvise_random(array: np.ndarray) -> bool:
-    """16 rows of 320 B per token scattered over 95 GiB. Default readahead
-    pulls its whole window per fault -- SGLang measured 1.4 MB of disk per
-    token, ~560x the bytes used. Best-effort."""
+    """Reads are 320 B rows scattered over the table, so readahead only wastes
+    I/O. Best-effort."""
     import ctypes
     import ctypes.util
 
@@ -356,12 +332,7 @@ def _eos_token_id(config) -> int:
     return int(eos)
 
 
-# -- process-global handle --------------------------------------------------
-#
-# The table is 95 GiB of host RAM, so there is exactly one per process by
-# construction; threading it through ScheduleBatch.init_new's five call sites
-# would only restate that. Swap to an explicit owner if a process ever needs
-# two tables (multiple PLE layers with distinct hashes).
+# -- process-global handle: one 95 GiB table per process ---------------------
 
 _TABLE: NGramTable | None = None
 

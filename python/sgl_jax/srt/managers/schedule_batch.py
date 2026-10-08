@@ -2322,15 +2322,8 @@ class ScheduleBatch:
         }
 
     def _reject_ngram_ple_with_spec(self) -> None:
-        """Spec decode has no N-gram PLE path.
-
-        A verify batch feeds draft tokens the host only holds in spec_info, so
-        the context row -- built from origin_input_ids + output_ids -- would be
-        right for the first token and wrong for the rest. Wrong rows still hash
-        to valid ids, so this has to be loud. Spec extend arrives through
-        get_model_worker_batch, spec decode through _get_spec_decode_mwb_dp;
-        both call this.
-        """
+        """Spec decode has no N-gram PLE path: the host context row misses the
+        draft tokens, and wrong rows still hash to valid ids."""
         if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
             raise NotImplementedError(
                 "N-gram PLE does not cover speculative decoding yet: the context row "
@@ -2344,14 +2337,8 @@ class ScheduleBatch:
         total_token_size: int,
         input_ids_cpu: np.ndarray,
     ) -> np.ndarray | None:
-        """Host-side PLE lookup
-
-        On Qwen4Exp, the table is 95 GiB and XLA:TPU cannot gather across memory spaces, so
-        the rows are fetched here and only `[total_token_size, ple_embed_dim]`
-        crosses to the device. See ``sgl_jax/srt/layers/ngram_table.py``.
-
-        Returns None for every model that never installs a table.
-        """
+        """Host-side PLE lookup; only [total_token_size, ple_embed_dim] crosses
+        to the device (see ngram_table.py). None when no table is installed."""
         table = get_ngram_table()
         if table is None:
             return None
@@ -2362,10 +2349,7 @@ class ScheduleBatch:
         ctx_len = params.ngram_context_len
         is_extend = self.forward_mode.is_extend()
 
-        # Overlap scheduling hands the host negative future-token placeholders
-        # that only resolve on device (see resolve_future_token_ids), and the
-        # n-gram hash needs the real ids. Fail loudly rather than hash the
-        # placeholders into garbage rows.
+        # Overlap leaves negative future-token placeholders on the host; never hash them.
         if input_ids_cpu.size and int(input_ids_cpu.min()) < 0:
             raise RuntimeError(
                 "N-gram PLE needs real token ids on the host, but this batch carries "
@@ -2417,10 +2401,7 @@ class ScheduleBatch:
                 )
             offset += per_dp_token_size
 
-        # ponytail: one gather for the whole padded batch. Padded rows read
-        # table row 0 and their output is discarded; skipping them would mean
-        # a scatter, and would shrink the row count the gather's thread pool
-        # sizes itself from. Revisit if a bucket ever pads by more than ~2x.
+        # One gather over the padded batch; padded rows read row 0 and are discarded.
         return table.gather(ids)
 
     def _merge_batch_metadata(
@@ -3334,7 +3315,6 @@ class ScheduleBatch:
         mrope_positions = _mm["mrope_positions"]
         apply_for_deepstack = _mm["apply_for_deepstack"]
         deepstack_visual_embedding = _mm["deepstack_visual_embedding"]
-        # Host PLE gather; None unless a model installed an N-gram table.
         ple_embeddings = self._merge_ngram_ple(
             per_dp_token_padding, total_token_size, input_ids_cpu
         )
