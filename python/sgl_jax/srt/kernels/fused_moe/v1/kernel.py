@@ -43,6 +43,32 @@ def _runtime_hbm_bytes() -> int:
         return 96 * 1024**3
 
 
+def _fit_hidden_tile(
+    hidden_size: int, tile: int, compute: int, step: int, compute_align: int, name: str
+) -> tuple[int, int]:
+    """``(tile, compute)``, reduced if ``tile`` does not divide ``hidden_size``.
+
+    The reduced tile is the largest multiple of ``step`` below ``tile`` that
+    divides ``hidden_size`` and admits a compute tile: a multiple of
+    ``compute_align``, at most the original ``compute``, dividing the tile.
+    """
+    if hidden_size % tile == 0:
+        return tile, compute
+    for candidate in range(tile - step, 0, -step):
+        if hidden_size % candidate != 0:
+            continue
+        compute_candidate = min(compute, candidate)
+        compute_candidate -= compute_candidate % compute_align
+        while compute_candidate >= compute_align and candidate % compute_candidate != 0:
+            compute_candidate -= compute_align
+        if compute_candidate >= compute_align:
+            return candidate, compute_candidate
+    raise ValueError(
+        f"Cannot find a valid {name} (multiple of {step}) that divides "
+        f"{hidden_size=} with a feasible compute tile."
+    )
+
+
 @jax.tree_util.register_pytree_node_class
 @dataclass(frozen=True)
 class FusedMoEBlockConfig:
@@ -65,12 +91,15 @@ class FusedMoEBlockConfig:
         dtype: jnp.dtype,
         quant_block_k: int | None = None,
         intermediate_size: int | None = None,
+        hidden_size: int | None = None,
     ) -> FusedMoEBlockConfig:
         """Return the *effective* config after applying kernel override rules.
 
         If *intermediate_size* is given and ``self.bf`` does not divide it,
         ``bf`` (and correspondingly ``bfc``) are jointly reduced to the largest
-        multiple of 128 that satisfies both divisibility constraints.
+        multiple of 128 that satisfies both divisibility constraints. If
+        *hidden_size* is given, ``bd1``/``bd1c`` and ``bd2``/``bd2c`` are reduced
+        the same way, in steps of the kernel's tile alignment.
 
         Important: validate after overrides, because these overrides affect the
         actual compiled kernel shapes/scratch.
@@ -145,16 +174,23 @@ class FusedMoEBlockConfig:
 
         bse = bf if self.bse is None else self.bse
 
+        bd1, bd2, bd2c = self.bd1, self.bd2, self.bd2c
+        if hidden_size is not None:
+            tile_align = t_packing * 128
+            bd1c_align = tile_align if quant_block_k is None else quant_block_k * t_packing
+            bd1, bd1c = _fit_hidden_tile(hidden_size, bd1, bd1c, tile_align, bd1c_align, "bd1")
+            bd2, bd2c = _fit_hidden_tile(hidden_size, bd2, bd2c, tile_align, tile_align, "bd2")
+
         return FusedMoEBlockConfig(
             bt=bt,
             bts=bts,
             bf=bf,
-            bd1=self.bd1,
-            bd2=self.bd2,
+            bd1=bd1,
+            bd2=bd2,
             btc=btc,
             bfc=bfc,
             bd1c=bd1c,
-            bd2c=self.bd2c,
+            bd2c=bd2c,
             bse=bse,
         )
 
@@ -3390,6 +3426,7 @@ def fused_ep_moe(
         dtype=tokens.dtype,
         quant_block_k=quant_block_k,
         intermediate_size=intermediate_size,
+        hidden_size=tokens.shape[-1],
     )
     _validate_fused_ep_moe_args(
         mesh=mesh,

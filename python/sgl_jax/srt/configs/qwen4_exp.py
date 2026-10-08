@@ -81,8 +81,7 @@ class _Qwen4ExpTextConfig(PretrainedConfig):
         linear_num_value_heads: int = 48,
         mamba_ssm_dtype: str = "float32",
         # Output gate on the GDN branch. Qwen3.5 ships "swish", Flash-Next
-        # "sigmoid"; the repo has always hardcoded silu, which is only
-        # accidentally right for Qwen3.5. Consumed by the model module.
+        # "sigmoid"; Qwen3_5GatedDeltaNet reads it.
         output_gate_type: str = "sigmoid",
         # Hyper connections. The inter-block residual carries hc_count
         # parallel streams, so backbone hidden states are hidden_size *
