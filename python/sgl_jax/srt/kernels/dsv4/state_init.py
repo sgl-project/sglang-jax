@@ -13,6 +13,8 @@ scalar loop over the batch.
 
 from __future__ import annotations
 
+import os
+
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -46,6 +48,14 @@ def _kernel(slots_ref, template_ref, _, state_ref, sem, *, capacity):
 
     lax.fori_loop(0, count, issue, 0)
     lax.fori_loop(0, count, wait, 0)
+
+
+STATE_INIT_KERNEL_ENV = "DSV4_STATE_INIT_KERNEL"
+
+
+def state_init_kernel_enabled() -> bool:
+    """Select the DMA reset, or the numerical XLA fallback for diagnostics."""
+    return os.environ.get(STATE_INIT_KERNEL_ENV, "1") == "1"
 
 
 def init_state_slots(state, slots, template, *, capacity=None, interpret=None):
