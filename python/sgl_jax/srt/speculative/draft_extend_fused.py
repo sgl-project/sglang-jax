@@ -364,6 +364,20 @@ def _prepare_rejection_sampling(sampling_info, batch, total_bs: int, vocab_size:
     return temperatures, top_ks, top_ps, enable_top_k, enable_top_p
 
 
+def draft_worker_list(draft_worker):
+    """Every per-layer draft ModelWorker, in MTP layer order.
+
+    ``MultiLayerDraftWorker._worker`` aliases ``_workers[0]``; collecting weights / pools
+    from it alone made every draft step of a multi-layer MTP model (MiMo-V2-Flash, three
+    independently trained layers) run layer 0 (#1639 review). Single-layer drafts expose
+    only ``_worker``.
+    """
+    workers = getattr(draft_worker, "_workers", None)
+    if workers:
+        return list(workers)
+    return [draft_worker._worker]
+
+
 def _prepare_spec_prefill_output_token_ids(draft_worker, next_token_ids):
     if draft_worker.mesh is None:
         return next_token_ids
@@ -2404,7 +2418,7 @@ def launch_fused_draft_extend_for_decode(
 
     all_memory_pools = []
     all_leaves = []
-    for w in [draft_worker._worker]:
+    for w in draft_worker_list(draft_worker):
         mr = w.model_runner
         all_memory_pools.append(mr.memory_pools)
         all_leaves.append(tuple(mr.model_state_leaves))
@@ -2521,7 +2535,7 @@ def launch_fused_draft_extend_for_decode(
             updated_relay_buffers,
         ) = _fused_out
 
-    for i, w in enumerate([draft_worker._worker]):
+    for i, w in enumerate(draft_worker_list(draft_worker)):
         w.model_runner.memory_pools.replace_all(all_pool_updates[i])
 
     return FusedDraftExtendPendingResult(
@@ -2821,7 +2835,7 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
 
     all_memory_pools = []
     all_leaves = []
-    for w in [draft_worker._worker]:
+    for w in draft_worker_list(draft_worker):
         mr = w.model_runner
         all_memory_pools.append(mr.memory_pools)
         all_leaves.append(tuple(mr.model_state_leaves))
@@ -2898,7 +2912,7 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
         launch_done.set()
 
     target_mr.memory_pools.replace_all(target_pool_updates)
-    for i, w in enumerate([draft_worker._worker]):
+    for i, w in enumerate(draft_worker_list(draft_worker)):
         w.model_runner.memory_pools.replace_all(all_pool_updates[i])
     if update_relay:
         spec_worker.spec_relay_buffers = updated_relay_buffers
