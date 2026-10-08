@@ -261,7 +261,11 @@ def test_shared_weight_source_inventory_hands_off_to_e(tmp_path, static):
         scale_key = "layers.0.ffn.shared_experts.w1.scale"
         scale = source.read_tensor(inventory[scale_key][0]["file"], scale_key, slice(None))
         assert scale.dtype == ml_dtypes.float8_e8m0fnu
-        report = layer.load_owned_weights(inventory, expert_format=expert_format)
+        report = layer.load_owned_weights(
+            inventory, expert_format=expert_format, weight_source=source
+        )
+        # Borrowing the framework session must keep reusable handles alive.
+        assert source.handles
 
     assert report.consumed_keys == set(inventory)
     assert report.local_payload_keys == report.consumed_keys
@@ -273,6 +277,16 @@ def test_static_expert_fp8_loads_directly_with_quantized_shared_expert(
 ):
     from sgl_jax.srt.layers import deepseek_v4_moe_loader as loader
 
+    public_load = loader.WeightLoader.load
+    load_calls = []
+
+    def load_public(self, mappings, **kwargs):
+        assert len(mappings) == 6
+        assert kwargs["validate_checkpoint_coverage"]
+        load_calls.append(mappings)
+        return public_load(self, mappings, **kwargs)
+
+    monkeypatch.setattr(loader.WeightLoader, "load", load_public)
     layer = _static_layer(ep_size=ep_size)
     assigned = _static_checkpoint(tmp_path / "static.safetensors")
 
@@ -285,6 +299,7 @@ def test_static_expert_fp8_loads_directly_with_quantized_shared_expert(
     # inventory and upload whole local shards, without incremental updates.
     monkeypatch.setattr(loader.LocalSource, "_scan", no_online_conversion)
     report = layer.load_owned_weights(assigned, expert_format=STATIC_EXPERT_FORMAT)
+    assert len(load_calls) == 1
     assert report.consumed_keys == expected_moe_keys(layer)
     assert report.local_payload_keys == report.consumed_keys
     assert report.converted_pairs == 0

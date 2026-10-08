@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -18,7 +19,7 @@ import numpy as np
 from jax.sharding import NamedSharding, SingleDeviceSharding
 
 from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
-from sgl_jax.srt.model_loader.weights.reader import JaxShardReader
+from sgl_jax.srt.model_loader.weights.loader import WeightLoader
 from sgl_jax.srt.model_loader.weights.source import LocalSource
 from sgl_jax.srt.model_loader.weights.specs import WeightSpec
 from sgl_jax.srt.utils.quantization.mxfp4_fp8_loader import (
@@ -35,11 +36,13 @@ logger = logging.getLogger(__name__)
 class _AssignedMoESource(LocalSource):
     """Reuse shared reads with M's validated inventory, without another scan."""
 
-    prefers_bulk = True
+    prefers_bulk = False
 
-    def __init__(self, assigned):
+    def __init__(self, assigned, source=None):
         super().__init__()
+        self.source = source
         self.assigned = assigned
+        self._weight_info_cache = assigned
         self.payload_keys = set()
         self.range_keys = {
             (entry["file"], entry["byte_offset"], entry["byte_size"]): key
@@ -59,7 +62,8 @@ class _AssignedMoESource(LocalSource):
     def read_tensor(self, filename, name, index):
         if name not in self.assigned or self.assigned[name][0]["file"] != filename:
             raise ValueError(f"{name}: read outside assigned MoE inventory")
-        value = super().read_tensor(filename, name, index)
+        reader = self.source if self.source is not None else super()
+        value = reader.read_tensor(filename, name, index)
         self._validate_payload(name, value)
         with self._lock:
             self.payload_keys.add(name)
@@ -67,7 +71,8 @@ class _AssignedMoESource(LocalSource):
 
     def read_ranges(self, ranges):
         keys = [self.range_keys[request] for request in ranges]
-        values = super().read_ranges(ranges)
+        reader = self.source if self.source is not None else super()
+        values = reader.read_ranges(ranges)
         for key, value in zip(keys, values):
             dtype = (
                 ml_dtypes.float8_e4m3fn
@@ -78,66 +83,67 @@ class _AssignedMoESource(LocalSource):
         self.payload_keys.update(keys)
         return values
 
+    def release(self, filenames):
+        # The framework session keeps handles reusable across layers. The public
+        # loader drains transfers before this call; final close belongs to M.
+        if self.source is None:
+            super().release(filenames)
 
-def _load_static_routed(layer, assigned, physical_to_logical):
-    """Load published FP8 through the shared, bounded parallel shard reader.
+    def close(self):
+        if self.source is None:
+            super().close()
 
-    Startup validates inventory and checks values in their stored dtype. It
-    reads FP8 bytes directly, avoiding FP32 expansion and
-    tens of thousands of incremental device updates/host synchronizations.
+    @property
+    def identity(self):
+        return self.source.identity if self.source is not None else super().identity
+
+
+def _load_static_routed(layer, assigned, physical_to_logical, weight_source=None):
+    """Use public WeightLoader mappings for published FP8, as in epic/dsv4.
+
+    Large EP-local weights use bounded bulk reads; small scales use cached
+    safetensors handles. TensorLayout supplies the kernel's 4D scale layout.
     """
     mesh = layer.experts.moe_mesh
-    reader = JaxShardReader(mesh)
-    with _AssignedMoESource(assigned) as source:
+    routed = {key: entries for key, entries in assigned.items() if ".ffn.experts." in key}
+    with _AssignedMoESource(routed, weight_source) as source:
+        mappings = {}
         for projection, target in _PROJECTIONS:
-            started = time.monotonic()
             keys = tuple(
                 f"layers.{layer.layer_id}.ffn.experts.{i}.{projection}"
                 for i in range(layer.num_experts)
             )
-            weight_param = getattr(layer.experts, target)
-            old = weight_param.value
-            sharding = NamedSharding(mesh, old.sharding.spec)
-            weight = reader.read(
-                source,
-                target,
-                WeightSpec(
-                    target_path=target,
-                    sources=tuple(key + ".weight" for key in keys),
-                    transpose=True,
+            for suffix in ("weight", "scale"):
+                path = target if suffix == "weight" else target + "_scale"
+                spec = getattr(layer.experts, path).value.sharding.spec
+                # Compact [E,N] scales must be read with their two source axes;
+                # TensorLayout expands them to [E,1,1,N] after stacking.
+                if suffix == "scale":
+                    spec = jax.sharding.PartitionSpec(spec[0], spec[-1])
+                mappings[keys[0] + "." + suffix] = WeightSpec(
+                    target_path=path,
+                    sharding=tuple(spec),
+                    sources=tuple(key + "." + suffix for key in keys),
+                    transpose=suffix == "weight",
                     physical_to_logical_map=physical_to_logical,
-                ),
-                sharding,
-            )
-            scale_param = getattr(layer.experts, target + "_scale")
-            old_scale = scale_param.value
-            scale_sharding = NamedSharding(
-                mesh,
-                jax.sharding.PartitionSpec(old_scale.sharding.spec[0], old_scale.sharding.spec[-1]),
-            )
-            scale = reader.read(
-                source,
-                target + "_scale",
-                WeightSpec(
-                    target_path=target + "_scale",
-                    sources=tuple(key + ".scale" for key in keys),
-                    physical_to_logical_map=physical_to_logical,
-                ),
-                scale_sharding,
-            )
-            with jax.set_mesh(mesh):
-                scale = jax.sharding.reshard(
-                    scale.reshape(old_scale.shape), NamedSharding(mesh, old_scale.sharding.spec)
                 )
-            jax.block_until_ready((weight, scale))
-            weight_param.value = weight
-            scale_param.value = scale
-            logger.info(
-                "Loaded DeepSeek V4 layer %d static FP8 %s via shared shard reader in %.1fs",
-                layer.layer_id + 1,
-                projection,
-                time.monotonic() - started,
+        started = time.monotonic()
+        with jax.set_mesh(mesh):
+            WeightLoader(layer.experts, SimpleNamespace(), mesh, source=source).load(
+                mappings, validate_checkpoint_coverage=True
             )
+        jax.block_until_ready(
+            tuple(
+                getattr(layer.experts, path).value
+                for _, target in _PROJECTIONS
+                for path in (target, target + "_scale")
+            )
+        )
+        logger.info(
+            "Loaded DeepSeek V4 layer %d static FP8 experts via WeightLoader in %.1fs",
+            layer.layer_id + 1,
+            time.monotonic() - started,
+        )
         return source.payload_keys
 
 
@@ -190,7 +196,10 @@ def _entry(assigned: dict[str, list[dict]], key: str, dtype: str, shape: tuple[i
     return entry
 
 
-def _read(entry: dict, dtype) -> np.ndarray:
+def _read(entry: dict, dtype, *, source=None, key=None) -> np.ndarray:
+    if source is not None:
+        value = source.read_tensor(entry["file"], key, slice(None))
+        return np.asarray(value).view(dtype).reshape(entry["shape"])
     with open(entry["file"], "rb") as source:
         source.seek(entry["byte_offset"])
         raw = source.read(entry["byte_size"])
@@ -224,8 +233,8 @@ def _assign(param, value, key: str, *, mesh: jax.sharding.Mesh) -> None:
     param.value.block_until_ready()
 
 
-def _e8m0_scale(entry: dict, key: str) -> np.ndarray:
-    codes = _read(entry, np.uint8)
+def _e8m0_scale(entry: dict, key: str, *, source=None) -> np.ndarray:
+    codes = _read(entry, np.uint8, source=source, key=key)
     if np.any(codes == 255):
         raise ValueError(f"{key}: reserved F8_E8M0 scale code 255")
     values = np.ldexp(np.ones(codes.shape, np.float32), codes.astype(np.int16) - 127)
@@ -281,12 +290,13 @@ def load_moe_weights(
     *,
     expert_format: str | None = None,
     row_chunk_size: int = 128,
+    weight_source=None,
 ) -> MoELoadReport:
     """Validate and consume only M's E-owned inventory for this layer.
 
     M selects the original MXFP4 or published static expert-FP8 format.
     Both paths populate EPMoE [E,K,N] weights and [E,1,1,N] scales,
-    processing one local expert at a time.
+    using public FP8 assembly or incremental MXFP4 conversion.
     """
     if row_chunk_size < 1:
         raise ValueError("row_chunk_size must be positive")
@@ -369,25 +379,42 @@ def load_moe_weights(
 
     # Ordinary and shared projections are read one at a time. Routed
     # projections below are converted by row chunk and local expert.
+    started = time.monotonic()
     gate_numpy = np.float32 if gate_dtype == "F32" else ml_dtypes.bfloat16
     _assign(
-        layer.gate.kernel, _read(assigned[gate_key][0], gate_numpy).T, gate_key, mesh=layer.mesh
+        layer.gate.kernel,
+        _read(assigned[gate_key][0], gate_numpy, source=weight_source, key=gate_key).T,
+        gate_key,
+        mesh=layer.mesh,
     )
     local_payload_keys.add(gate_key)
     if layer.is_hash_layer:
         route_numpy = np.int32 if route_dtype == "I32" else np.int64
-        layer.load_hash_table(_read(assigned[route_key][0], route_numpy))
+        layer.load_hash_table(
+            _read(assigned[route_key][0], route_numpy, source=weight_source, key=route_key)
+        )
     else:
         _assign(
-            layer.gate.bias, _read(assigned[route_key][0], np.float32), route_key, mesh=layer.mesh
+            layer.gate.bias,
+            _read(assigned[route_key][0], np.float32, source=weight_source, key=route_key),
+            route_key,
+            mesh=layer.mesh,
         )
     local_payload_keys.add(route_key)
+    logger.info(
+        "Loaded DeepSeek V4 layer %d MoE gate/routing in %.1fs",
+        layer.layer_id + 1,
+        time.monotonic() - started,
+    )
 
+    started = time.monotonic()
     for source, target in _SHARED:
         stem = prefix + f"shared_experts.{source}"
         linear = getattr(layer.shared_experts, target)
-        weight = _read(assigned[stem + ".weight"][0], np.uint8).view(ml_dtypes.float8_e4m3fn)
-        scale = _e8m0_scale(assigned[stem + ".scale"][0], stem + ".scale")
+        weight = _read(
+            assigned[stem + ".weight"][0], np.uint8, source=weight_source, key=stem + ".weight"
+        ).view(ml_dtypes.float8_e4m3fn)
+        scale = _e8m0_scale(assigned[stem + ".scale"][0], stem + ".scale", source=weight_source)
         local_payload_keys.update((stem + ".weight", stem + ".scale"))
         if layer.static_fp8:
             _assign(linear.weight_q, weight, stem + ".weight", mesh=layer.mesh)
@@ -397,9 +424,16 @@ def load_moe_weights(
             block = np.repeat(np.repeat(scale, 128, axis=0), 128, axis=1)
             dequantized = weight.astype(np.float32) * block[: weight.shape[0], : weight.shape[1]]
             _assign(linear.weight, dequantized.T, stem + ".weight", mesh=layer.mesh)
+    logger.info(
+        "Loaded DeepSeek V4 layer %d shared experts in %.1fs",
+        layer.layer_id + 1,
+        time.monotonic() - started,
+    )
 
     if expert_format == STATIC_EXPERT_FORMAT:
-        local_payload_keys.update(_load_static_routed(layer, assigned, physical_to_logical))
+        local_payload_keys.update(
+            _load_static_routed(layer, assigned, physical_to_logical, weight_source)
+        )
         return MoELoadReport(
             consumed_keys=frozenset(expected),
             local_payload_keys=frozenset(local_payload_keys),

@@ -264,12 +264,18 @@ class DeepseekV4MoE(nnx.Module):
         )
         self._hash_table_loaded = True
 
-    def load_owned_weights(self, assigned_info, *, expert_format=None, row_chunk_size=128):
+    def load_owned_weights(
+        self, assigned_info, *, expert_format=None, row_chunk_size=128, weight_source=None
+    ):
         """Load only this layer's E-owned inventory and report consumed source keys."""
         from sgl_jax.srt.layers.deepseek_v4_moe_loader import load_moe_weights
 
         return load_moe_weights(
-            self, assigned_info, expert_format=expert_format, row_chunk_size=row_chunk_size
+            self,
+            assigned_info,
+            expert_format=expert_format,
+            row_chunk_size=row_chunk_size,
+            weight_source=weight_source,
         )
 
     def route(

@@ -34,13 +34,29 @@ The checkpoint format and validation remain M/E's responsibility; consult
 module contracts. The example is a launch configuration, not a measured
 performance result.
 
-Published static expert-FP8 weights use the shared `JaxShardReader` for
-bounded parallel reads and whole local-shard uploads. E supplies only M's
-validated per-layer inventory, preserves the concrete EP/TP mesh and expert
-placement, and reports locally read source keys. Static payload checks use
-the stored FP8/FP32 dtype, without expanding routed weights to FP32 or running
-incremental per-expert device updates. Original MXFP4 loading retains the
-bounded conversion path. Each static projection logs its loading time.
+Published static expert-FP8 weights use public `WeightLoader` source groups
+and `TensorLayout`, following epic/dsv4's static loading flow. The model
+reuses the framework's checkpoint source, prefetches it once after inventory
+validation, and borrows its cached safetensors handles for M parameters,
+MoE gates, shared experts and small routed scales. Large EP-local weights use
+the public reader's bounded bulk reads and whole local-shard uploads. E sees
+only M's assigned per-layer inventory, preserves the concrete EP/TP mesh and
+expert placement, and reports locally read source keys. Borrowed sources
+remain open until the framework closes the checkpoint session.
+
+Static payload checks use stored FP8/FP32 values, without expanding routed
+weights to FP32 or running incremental device updates. Original MXFP4 retains
+its bounded conversion path. Timings distinguish prefetch, M, gate/routing,
+shared experts, routed experts, whole layers and the complete E stage. The
+reference's non-expert stage also includes gate/shared weights; compare summed
+loading stages, rather than treating its labels as identical to M/E ownership.
+The RFC's EP8 layout and public reader's 4 GiB inflight target remain in force;
+the PR's measured EP1 case is not a guaranteed startup-time target for EP8.
+
+Post-load RoPE caches, grouped output projections and fused HCA projections
+materialize under a concrete device mesh. Offline dummy shape tracing uses
+AbstractMesh explicitly, keeping JIT/AOT graph construction separate from
+actual TPU array initialization.
 
 ## Pool construction and update ownership
 
@@ -163,13 +179,22 @@ and zero completed generation checks. No recurrence of the initial
 `AbstractMesh` error was observed before this timeout. This does not verify
 complete loading or serving correctness.
 
-Static expert loading now uses the shared parallel shard reader described
-above. Its CPU validation passes 34 loading cases and 97 related
-MoE/inventory/runtime/sharding cases, with 21 skips across those suites.
-It includes non-square projection transposes, combined EP/TP layouts,
-prototype materialization, physical expert mapping, invalid payload rejection,
-and a guard against rescanning or incremental static device assembly.
-TPU loading-time and serving revalidation of this optimization remain pending.
+The third approved run, `exp-t5w3l0oa0w`, tested `a00ba3e37` on the same
+hardware and checkpoint. All 43 layers finished loading: M took 115.5 seconds;
+the observed E interval was about 948 seconds, giving about 17 minutes 44
+seconds for the two loading stages. It then failed while creating the RoPE
+cache: `jnp.arange` attempted TPU lowering with only AbstractMesh present.
+The service never became ready and zero generation checks completed. Falcon
+reported FAILED at 2026-10-08 09:02:22 UTC. Source and environment checks had
+matched the reviewed candidate.
+
+The follow-up fixes actual post-load mesh contexts and aligns static loading
+with public WeightLoader, one-time prefetch and checkpoint handle reuse.
+CPU regressions cover source lifetime/validation ordering, dtype and E8M0
+scale preservation, non-square transposes, combined EP/TP layouts, prototype
+materialization, physical expert mapping, invalid payload rejection and
+JIT/AOT preparation. TPU startup-time and serving revalidation of this
+follow-up remain pending; a new Falcon submission requires user confirmation.
 
 No TPU acceptance row has been measured or posted. The six RFC rows (single-request decode, 8K and
 32K TTFT, cc64 and cc256 throughput/latency, GSM8K) remain pending on v7x
