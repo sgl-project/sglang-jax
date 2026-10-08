@@ -422,7 +422,7 @@ class NGramEmbedding(nnx.Module):
         conv_state: jax.Array,  # [num_slots, HC*HS, (kernel-1)*dilation]
         state_indices: jax.Array,  # [B]
         cu_seqlens: jax.Array,  # [B+1]
-        has_initial_state: jax.Array | None = None,  # [B] bool
+        has_initial_state: jax.Array,  # [B] bool
         track_indices: jax.Array | None = None,  # [B] req → track slot (None = OFF)
         track_mask: jax.Array | None = None,  # [B] bool boundary mask
         *,
@@ -441,8 +441,6 @@ class NGramEmbedding(nnx.Module):
                 track_mask=track_mask,
             )
         gated = self.gate(hyper_input, ple_embeddings)
-        if has_initial_state is None:
-            has_initial_state = jnp.ones(state_indices.shape[0], dtype=bool)
 
         def _local(
             x_l, state_l, weight_l, indices_l, init_l, cu_l, track_indices_l=None, track_mask_l=None
@@ -482,7 +480,7 @@ class NGramEmbedding(nnx.Module):
         ple_embeddings: jax.Array,  # [B, ple_embed_dim]
         conv_state: jax.Array,  # [num_slots, HC*HS, (kernel-1)*dilation]
         state_indices: jax.Array,  # [B]
-        has_initial_state: jax.Array | None = None,  # [B] bool
+        has_initial_state: jax.Array,  # [B] bool
         track_indices: jax.Array | None = None,  # [B] req → track slot (None = OFF)
         track_mask: jax.Array | None = None,  # [B] bool boundary mask
         *,
@@ -500,8 +498,6 @@ class NGramEmbedding(nnx.Module):
                 track_mask=track_mask,
             )
         gated = self.gate(hyper_input, ple_embeddings)
-        if has_initial_state is None:
-            has_initial_state = jnp.ones(state_indices.shape[0], dtype=bool)
 
         def _local(
             x_l, state_l, weight_l, indices_l, init_l, track_indices_l=None, track_mask_l=None
@@ -564,8 +560,6 @@ class NGramEmbedding(nnx.Module):
             out_sharding=jax.sharding.NamedSharding(self.mesh, P("data", None)),
         )
         value, _ = self.value_proj(ple_embeddings)
-        if has_init is None:
-            has_init = jnp.ones(state_indices.shape, dtype=bool)
         local_fn = functools.partial(
             ngram_decode_pallas if cu is None else ngram_extend_pallas,
             hidden_size=self.hidden_size,
