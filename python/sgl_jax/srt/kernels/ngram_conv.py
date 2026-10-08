@@ -7,6 +7,8 @@ request slots must be unique; slot zero is padding and is never written.
 import jax
 import jax.numpy as jnp
 
+from sgl_jax.srt.kernels.gdn.gated_delta import _scatter_track
+
 
 def _initial_state(pool, slots, has_initial_state, channels, kernel, dilation):
     if dilation < 1:
@@ -37,6 +39,8 @@ def ngram_conv_prefill(
     state_indices,  # [B]
     has_initial_state=None,
     dilation=3,
+    track_indices=None,  # [B] req → track slot (None = OFF)
+    track_mask=None,  # [B] bool boundary mask
 ):
     """Return SiLU(conv(x)) and the updated full pool for ragged extend."""
     channels, tokens = x.shape
@@ -75,6 +79,8 @@ def ngram_conv_prefill(
     else:
         final = state
     updated = _write_state(pool, state_indices, final)
+    if track_indices is not None:
+        updated = _scatter_track(updated, track_indices, track_mask, final)
     return jax.lax.optimization_barrier((y, updated))
 
 
@@ -86,6 +92,8 @@ def ngram_conv_update(
     *,
     has_initial_state=None,
     dilation=3,
+    track_indices=None,  # [B] req → track slot (None = OFF)
+    track_mask=None,  # [B] bool boundary mask
 ):
     """Single-token decode with the same pool contract as prefill."""
     batch, channels = x.shape
@@ -97,4 +105,6 @@ def ngram_conv_update(
     window = jnp.concatenate([state, x[..., None]], axis=-1)
     y = jax.nn.silu(jnp.einsum("bck,ck->bc", window[..., ::dilation], weight.astype(x.dtype)))
     updated = _write_state(pool, state_indices, window[..., 1:])
+    if track_indices is not None:
+        updated = _scatter_track(updated, track_indices, track_mask, window[..., 1:])
     return jax.lax.optimization_barrier((y, updated))

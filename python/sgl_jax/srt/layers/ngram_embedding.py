@@ -423,6 +423,8 @@ class NGramEmbedding(nnx.Module):
         state_indices: jax.Array,  # [B]
         cu_seqlens: jax.Array,  # [B+1]
         has_initial_state: jax.Array | None = None,  # [B] bool
+        track_indices: jax.Array | None = None,  # [B] req → track slot (None = OFF)
+        track_mask: jax.Array | None = None,  # [B] bool boundary mask
         *,
         use_pallas: bool = False,
     ) -> tuple[jax.Array, jax.Array]:
@@ -435,12 +437,16 @@ class NGramEmbedding(nnx.Module):
                 state_indices,
                 has_initial_state,
                 cu_seqlens,
+                track_indices=track_indices,
+                track_mask=track_mask,
             )
         gated = self.gate(hyper_input, ple_embeddings)
         if has_initial_state is None:
             has_initial_state = jnp.ones(state_indices.shape[0], dtype=bool)
 
-        def _local(x_l, state_l, weight_l, indices_l, init_l, cu_l):
+        def _local(
+            x_l, state_l, weight_l, indices_l, init_l, cu_l, track_indices_l=None, track_mask_l=None
+        ):
             y, new_state = ngram_conv_prefill(
                 x=x_l.T,  # [T, C] -> [C, T], the kernels are channel-first
                 weight=weight_l,
@@ -449,17 +455,24 @@ class NGramEmbedding(nnx.Module):
                 state_indices=indices_l,
                 has_initial_state=init_l,
                 dilation=self.dilation,
+                track_indices=track_indices_l,
+                track_mask=track_mask_l,
             )
             return y.T, new_state  # [T, C], [num_slots, C, S]
 
-        conv_out, new_conv_state = self._shard_mapped(_local, (P("data"),))(
+        extra_in_specs = [P("data")]  # cu_seqlens
+        args = [
             self._to_conv_layout(self.norm_conv(gated)),
             conv_state,
             self._conv_weight(gated.dtype),
             state_indices,
             has_initial_state,
             cu_seqlens,
-        )
+        ]
+        if track_indices is not None:
+            extra_in_specs += [P("data"), P("data")]  # track_indices, track_mask
+            args += [track_indices, track_mask]
+        conv_out, new_conv_state = self._shard_mapped(_local, extra_in_specs)(*args)
         return gated + conv_out, new_conv_state  # [T, HC*HS]
 
     @named_scope
@@ -470,19 +483,29 @@ class NGramEmbedding(nnx.Module):
         conv_state: jax.Array,  # [num_slots, HC*HS, (kernel-1)*dilation]
         state_indices: jax.Array,  # [B]
         has_initial_state: jax.Array | None = None,  # [B] bool
+        track_indices: jax.Array | None = None,  # [B] req → track slot (None = OFF)
+        track_mask: jax.Array | None = None,  # [B] bool boundary mask
         *,
         use_pallas: bool = False,
     ) -> tuple[jax.Array, jax.Array]:
         """PLE delta and state; use_pallas is a static, opt-in JIT argument."""
         if use_pallas:
             return self._fused_forward(
-                hyper_input, ple_embeddings, conv_state, state_indices, has_initial_state
+                hyper_input,
+                ple_embeddings,
+                conv_state,
+                state_indices,
+                has_initial_state,
+                track_indices=track_indices,
+                track_mask=track_mask,
             )
         gated = self.gate(hyper_input, ple_embeddings)
         if has_initial_state is None:
             has_initial_state = jnp.ones(state_indices.shape[0], dtype=bool)
 
-        def _local(x_l, state_l, weight_l, indices_l, init_l):
+        def _local(
+            x_l, state_l, weight_l, indices_l, init_l, track_indices_l=None, track_mask_l=None
+        ):
             return ngram_conv_update(
                 x=x_l,
                 conv_state=state_l,
@@ -490,19 +513,34 @@ class NGramEmbedding(nnx.Module):
                 weight=weight_l,
                 has_initial_state=init_l,
                 dilation=self.dilation,
+                track_indices=track_indices_l,
+                track_mask=track_mask_l,
             )
 
-        conv_out, new_conv_state = self._shard_mapped(_local)(
+        extra_in_specs = []
+        args = [
             self._to_conv_layout(self.norm_conv(gated)),
             conv_state,
             self._conv_weight(gated.dtype),
             state_indices,
             has_initial_state,
-        )
+        ]
+        if track_indices is not None:
+            extra_in_specs += [P("data"), P("data")]  # track_indices, track_mask
+            args += [track_indices, track_mask]
+        conv_out, new_conv_state = self._shard_mapped(_local, extra_in_specs)(*args)
         return gated + conv_out, new_conv_state  # [B, HC*HS]
 
     def _fused_forward(
-        self, hyper_input, ple_embeddings, conv_state, state_indices, has_init, cu=None
+        self,
+        hyper_input,
+        ple_embeddings,
+        conv_state,
+        state_indices,
+        has_init,
+        cu=None,
+        track_indices=None,
+        track_mask=None,
     ):
         from sgl_jax.srt.kernels.ngram_fused import (
             ngram_decode_pallas,
@@ -540,25 +578,19 @@ class NGramEmbedding(nnx.Module):
                 jnp.asarray(param), jax.sharding.NamedSharding(self.mesh, P("tensor"))
             )
 
-        return jax.shard_map(
-            local_fn,
-            mesh=self.mesh,
-            in_specs=(
-                P("data", "tensor"),
-                P("data", "tensor"),
-                P("data", None),
-                P("tensor"),
-                P("tensor"),
-                P("tensor"),
-                P("tensor", None),
-                P("data", "tensor", None),
-                P("data"),
-                P("data"),
-                *((P("data"),) if cu is not None else ()),
-            ),
-            out_specs=(P("data", "tensor"), P("data", "tensor", None)),
-            check_vma=False,
-        )(
+        in_specs = [
+            P("data", "tensor"),
+            P("data", "tensor"),
+            P("data", None),
+            P("tensor"),
+            P("tensor"),
+            P("tensor"),
+            P("tensor", None),
+            P("data", "tensor", None),
+            P("data"),
+            P("data"),
+        ]
+        args = [
             self._to_conv_layout(key),
             self._to_conv_layout(hyper_input),
             value,
@@ -569,8 +601,21 @@ class NGramEmbedding(nnx.Module):
             conv_state,
             state_indices,
             has_init,
-            *((cu,) if cu is not None else ()),
-        )
+        ]
+        if cu is not None:
+            in_specs += [P("data")]  # cu_seqlens
+            args += [cu]
+        if track_indices is not None:
+            in_specs += [P("data"), P("data")]  # track_indices, track_mask
+            args += [track_indices, track_mask]
+
+        return jax.shard_map(
+            local_fn,
+            mesh=self.mesh,
+            in_specs=tuple(in_specs),
+            out_specs=(P("data", "tensor"), P("data", "tensor", None)),
+            check_vma=False,
+        )(*args)
 
 
 __all__ = [

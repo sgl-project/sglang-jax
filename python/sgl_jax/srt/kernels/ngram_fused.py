@@ -19,6 +19,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sgl_jax.srt.kernels.gdn.gated_delta import _scatter_track
+
 
 def _norm(x, weight, eps):
     x32 = x.astype(jnp.float32)
@@ -151,6 +153,8 @@ def ngram_decode_pallas(
     conv_state,
     state_indices,
     has_initial_state,
+    track_indices=None,  # [B] req → track slot (None = OFF)
+    track_mask=None,  # [B] bool boundary mask
     *,
     hidden_size: int,
     dilation: int = 3,
@@ -244,7 +248,10 @@ def ngram_decode_pallas(
         conv_weight.astype(query.dtype).reshape(groups, hidden_size, -1).transpose(0, 2, 1),
         conv_state.transpose(0, 2, 1),
     )
-    return output[:batch].reshape(batch, channels), state.transpose(0, 2, 1)
+    pool = state.transpose(0, 2, 1)
+    if track_indices is not None:
+        pool = _scatter_track(pool, track_indices, track_mask, pool[state_indices])
+    return output[:batch].reshape(batch, channels), pool
 
 
 def _extend_kernel(
@@ -366,6 +373,8 @@ def ngram_extend_pallas(
     state_indices,
     has_initial_state,
     cu_seqlens,
+    track_indices=None,  # [B] req → track slot (None = OFF)
+    track_mask=None,  # [B] bool boundary mask
     *,
     hidden_size: int,
     dilation: int = 3,
@@ -452,4 +461,7 @@ def ngram_extend_pallas(
         conv_weight.astype(query.dtype).reshape(groups, hidden_size, kernel).transpose(0, 2, 1),
         conv_state.transpose(0, 2, 1),
     )
-    return output.reshape(tokens, channels), state.transpose(0, 2, 1)
+    pool = state.transpose(0, 2, 1)
+    if track_indices is not None:
+        pool = _scatter_track(pool, track_indices, track_mask, pool[state_indices])
+    return output.reshape(tokens, channels), pool
