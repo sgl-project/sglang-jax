@@ -193,8 +193,27 @@ with public WeightLoader, one-time prefetch and checkpoint handle reuse.
 CPU regressions cover source lifetime/validation ordering, dtype and E8M0
 scale preservation, non-square transposes, combined EP/TP layouts, prototype
 materialization, physical expert mapping, invalid payload rejection and
-JIT/AOT preparation. TPU startup-time and serving revalidation of this
-follow-up remain pending; a new Falcon submission requires user confirmation.
+JIT/AOT preparation.
+
+The approved `2a7e433a5` resubmission, `exp-nhqerogwgh`, completed GCS
+prewarm in 169.5 seconds, M loading in 28.3 seconds and E loading in 345.3
+seconds (373.6 seconds combined). All 43 layers loaded, RoPE initialized and
+the service became ready in 632.4 seconds. The prior combined loading time
+was about 1063.5 seconds. PR #345 reports 146.3 seconds for prewarm, 474.3
+seconds for weights and 650.9 seconds to readiness; its EP1/TP8, short-context
+setup differs from this EP8/TP8, 32K-context test, so these are contextual
+comparisons rather than matching acceptance measurements.
+
+The first prefill then failed with `mHC has no schedule for 'TPU7x'`;
+zero of the 13 generation checks completed. Falcon reported FAILED and a
+2026-10-08 09:49:01 UTC resource snapshot showed no active lease or running/
+pending allocation for the experiment. The mHC tuner now includes the
+reference epic/dsv4 v7x schedule: 32 MiB scoped Pallas VMEM and 32 MiB XLA
+VMEM, with recognition of the actual `TPU7x` device kind. CPU regressions
+cover that first-prefill selection, Flash tile budgets and the distinct XLA
+spill boundary. The tuner, mHC layer and runtime regressions pass 96 cases
+with one skip on CPU. TPU compilation and serving revalidation remain pending;
+a new Falcon submission requires user confirmation.
 
 No TPU acceptance row has been measured or posted. The six RFC rows (single-request decode, 8K and
 32K TTFT, cc64 and cc256 throughput/latency, GSM8K) remain pending on v7x
@@ -224,6 +243,7 @@ Paths in the first six rows are relative to `python/sgl_jax/srt/`.
 | `model_executor/model_runner_kv_cache_mixin.py`, pool initialization | 909–959 | Brian, 41; Greg Huang, 6; Yun Ting, 4 |
 | #1717 `utils/jax_utils.py`, `_metadata_unpacker` | 300–328 | Brian, 29 |
 | #1717 `utils/jax_utils.py`, `packed_device_array` | 331–377 | Brian, 47 |
+| `kernels/mhc/tune.py`, v7x platform | 40–77 | Brian, 38 |
 
 The file-level adaptations also touch `forward_batch_info.py`, both workers,
 `model_forward.py`, compilation/export inputs and resources, scheduler batch,
