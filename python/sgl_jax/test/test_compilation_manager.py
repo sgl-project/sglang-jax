@@ -1,5 +1,12 @@
+import os
+
+# 4 CPU devices for the dp=2 metadata-shape comparison below (before any jax import).
+os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=4")
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,7 +14,10 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 
-from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
+from sgl_jax.srt.model_executor.compilation_manager import (
+    CompilationManager,
+    CompilationPool,
+)
 from sgl_jax.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -16,6 +26,75 @@ from sgl_jax.srt.model_executor.forward_batch_info import (
 from sgl_jax.srt.multimodal.in_model import host_orchestration
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.utils.common_utils import align_bs_for_fused_ep, pad_to_bucket
+
+
+class TestCompilationPool(unittest.TestCase):
+    def test_parallel_compile_with_serial_lowering_and_bounded_backpressure(self):
+        caller = threading.get_ident()
+        barrier = threading.Barrier(2)
+        finished = []
+        lowered_ids = []
+        compile_threads = set()
+
+        def lower(index):
+            self.assertEqual(threading.get_ident(), caller)
+            if index >= 2:
+                self.assertGreaterEqual(len(finished), index - 1)
+            lowered_ids.append(index)
+
+            def compile(**kwargs):
+                compile_threads.add(threading.get_ident())
+                if index < 2:
+                    barrier.wait(timeout=10)
+                return index
+
+            return SimpleNamespace(compile=compile)
+
+        with CompilationPool(2) as pool:
+            for _, _, compiled in pool.map(lower, range(5)):
+                self.assertEqual(threading.get_ident(), caller)
+                finished.append(compiled)
+        self.assertEqual(lowered_ids, list(range(5)))
+        self.assertEqual(finished, list(range(5)))
+        self.assertEqual(len(compile_threads), 2)
+        self.assertNotIn(caller, compile_threads)
+
+    def test_serial_fallback_runs_on_caller(self):
+        caller = threading.get_ident()
+        compiled_on = []
+        with CompilationPool(1) as pool:
+            list(
+                pool.map(
+                    lambda _: SimpleNamespace(
+                        compile=lambda **_: compiled_on.append(threading.get_ident())
+                    ),
+                    [None],
+                )
+            )
+            self.assertEqual(compiled_on, [caller])
+
+    def test_failure_stops_lowering_and_joins_workers(self):
+        def lower(index):
+            if index == 2:
+                self.fail("Lowered past the failed bounded window")
+            return SimpleNamespace(
+                compile=(
+                    MagicMock(side_effect=RuntimeError("compile failed"))
+                    if index == 0
+                    else lambda **_: 1
+                )
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "compile failed"), CompilationPool(2) as pool:
+            for _ in pool.map(lower, range(3)):
+                self.fail("Returned a result past the failed compilation")
+        self.assertFalse(pool._pending)
+        self.assertIsNone(pool._executor)
+
+    def test_invalid_thread_count(self):
+        for threads in (0, -1):
+            with self.assertRaisesRegex(ValueError, "at least 1"):
+                CompilationPool(threads)
 
 
 class TestAlignBsForFusedEp(unittest.TestCase):
@@ -48,6 +127,7 @@ def _make_server_args(**overrides):
     args = MagicMock()
     args.precompile_token_paddings = None
     args.precompile_bs_paddings = None
+    args.precompile_num_threads = 1
     args.moe_backend = "none"
     args.enable_static_lora = False
     args.multimodal = False
@@ -312,16 +392,121 @@ class TestBucketComputation(unittest.TestCase):
         assert cm.token_buckets == [256, 512, 1024, 131072]
 
     def test_export_plan_matches_online_warmup(self):
+        def observed_shapes(cm, mode):
+            # (bs, tokens, cache_loc, decode_pages): the warmup batch encodes the
+            # decode page bucket as seq_len = pages * page_size - 1 (plain shape: 1).
+            shapes = []
+            for b in _collect_precompile_batches(cm, mode):
+                seq_len = int(b.seq_lens[0])
+                pages = None if seq_len == 1 else (seq_len + 1) // cm.page_size
+                shapes.append((b.real_bs, len(b.input_ids), len(b.cache_loc), pages))
+            return shapes
+
         for dp_size in (1, 2):
             cm = CompilationManager(
                 _make_server_args(), 8, 256 * dp_size, dp_size, 8, 128, 255, 256
             )
             for mode in (ForwardMode.EXTEND, ForwardMode.DECODE):
-                batches = _collect_precompile_batches(cm, mode)
-                observed = [(b.real_bs, len(b.input_ids), len(b.cache_loc)) for b in batches]
-                self.assertEqual(list(cm.iter_model_shapes(mode)), observed)
+                self.assertEqual(list(cm.iter_model_shapes(mode)), observed_shapes(cm, mode))
             self.assertEqual(cm.token_buckets[-1], 256 * dp_size)
             self.assertEqual(cm.bs_buckets[-1], 8)
+
+        # Backends may bound the decode page table per bucket (e.g. MSA); the
+        # shared enumeration crosses every decode shape with those buckets so
+        # export and warmup agree, and extend shapes are unaffected.
+        backend = MagicMock()
+        backend.decode_page_buckets = [1, 2]
+        cm = CompilationManager(
+            _make_server_args(), 8, 256, 1, 8, 128, 255, 256, attn_backend=backend
+        )
+        decode = list(cm.iter_model_shapes(ForwardMode.DECODE))
+        self.assertEqual([s[3] for s in decode], [1, 2] * len(cm.bs_buckets))
+        self.assertEqual(decode, observed_shapes(cm, ForwardMode.DECODE))
+        self.assertTrue(all(s[3] is None for s in cm.iter_model_shapes(ForwardMode.EXTEND)))
+
+    def test_export_decode_page_table_matches_serving_metadata(self):
+        """Actual metadata shapes: the page table serving builds for each warmup
+        batch (FlashAttention.get_forward_metadata, bounded by the MSA bucket and by
+        cache_loc) must equal what offline export constructs from the same shape
+        (``decode_page_count`` -> ``_attention_metadata(page_count=...)``)."""
+        import jax
+
+        from sgl_jax.srt.layers.attention.msa_backend import MSAAttentionBackend
+        from sgl_jax.srt.model_executor.aot_workloads import (
+            InputContext,
+            WorkloadSpec,
+            _attention_metadata,
+        )
+
+        dp, bs, page_size, context_len, max_req_len = 2, 4, 128, 65536, 4095
+        mesh = jax.make_mesh(
+            (dp, 1),
+            ("data", "tensor"),
+            devices=jax.devices()[:dp],
+            axis_types=(jax.sharding.AxisType.Explicit,) * 2,
+        )
+        backend = MSAAttentionBackend(
+            1,
+            1,
+            128,
+            page_size=page_size,
+            mesh=mesh,
+            sparse_config={
+                "sparse_block_size": page_size,
+                "sparse_topk_blocks": 16,
+                "sparse_num_index_heads": 1,
+                "sparse_index_dim": 128,
+                "sparse_attention_freq": [1],
+            },
+            context_len=context_len,
+            total_num_kv_heads=1,
+        )
+        self.assertEqual(backend.decode_page_buckets, [16, 64, 512])
+        cm = CompilationManager(
+            _make_server_args(precompile_bs_paddings=[bs]),
+            bs,
+            256 * dp,
+            dp,
+            dp,
+            page_size,
+            max_req_len,
+            256,
+            attn_backend=backend,
+        )
+        shapes = list(cm.iter_model_shapes(ForwardMode.DECODE))
+        batches = _collect_precompile_batches(cm, ForwardMode.DECODE)
+        self.assertEqual(len(shapes), len(batches))
+        context = InputContext(
+            model_config=MagicMock(), mesh=mesh, backend=backend, memory_pools=MagicMock()
+        )
+        served, exported = [], []
+        for (bs_val, tokens, cache_loc, pages), batch in zip(shapes, batches):
+            with jax.set_mesh(mesh):
+                served.append(int(backend.get_forward_metadata(batch).page_indices.shape[0]))
+            spec = WorkloadSpec(
+                name="decode",
+                request_count=bs_val,
+                input_token_count=tokens,
+                dp_size=dp,
+                context_length=context_len,
+                page_size=page_size,
+                tokens_per_request=1,
+                chunked_prefill_size=None,
+                mtp_layer_idx=None,
+                cache_loc_size=cache_loc,
+                page_count=cm.decode_page_count(bs_val, cache_loc, pages),
+            )
+            exported.append(
+                int(
+                    _attention_metadata(
+                        backend, context, spec, page_count=spec.page_count
+                    ).page_indices.shape[0]
+                )
+            )
+        # cache_loc = bs * 4096 tokens = 128 pages: bucket 16 -> 64 pages; 64 and 512 are
+        # capped by cache_loc (256 / 2048 without the bound).
+        self.assertEqual(served, [64, 128, 128])
+        self.assertEqual(exported, served)
 
     def test_aot_capacity_defaults_and_incomplete_bundle(self):
         with tempfile.TemporaryDirectory() as directory:

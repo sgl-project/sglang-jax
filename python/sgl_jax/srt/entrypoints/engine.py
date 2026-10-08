@@ -165,6 +165,7 @@ class Engine(EngineBase):
         lora_path: list[str] | str | None = None,
         return_routed_experts: list[bool] | bool | None = False,
         *,
+        return_hidden_states: bool = False,
         image_data: MultimodalDataInputFormat | None = None,
         video_data: MultimodalDataInputFormat | None = None,
     ) -> dict | Iterator[dict]:
@@ -187,6 +188,7 @@ class Engine(EngineBase):
             stream=stream,
             lora_path=lora_path,
             return_routed_experts=return_routed_experts,
+            return_hidden_states=return_hidden_states,
             image_data=image_data,
             video_data=video_data,
         )
@@ -221,6 +223,7 @@ class Engine(EngineBase):
         lora_path: list[str] | str | None = None,
         return_routed_experts: list[bool] | bool | None = False,
         *,
+        return_hidden_states: bool = False,
         image_data: MultimodalDataInputFormat | None = None,
         video_data: MultimodalDataInputFormat | None = None,
     ) -> dict | AsyncIterator[dict]:
@@ -243,6 +246,7 @@ class Engine(EngineBase):
             stream=stream,
             lora_path=lora_path,
             return_routed_experts=return_routed_experts,
+            return_hidden_states=return_hidden_states,
             image_data=image_data,
             video_data=video_data,
         )

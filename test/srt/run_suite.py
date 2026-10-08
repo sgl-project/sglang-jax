@@ -265,6 +265,8 @@ suites = {
         TestFile("python/sgl_jax/test/kernels/moe_block_quant_test.py", 0.2, runner="pytest"),
         TestFile("python/sgl_jax/test/kernels/kda_test.py", 10, runner="pytest"),
         TestFile("test/srt/kernels/hca/test_hca.py", 8, runner="pytest"),
+        TestFile("test/srt/kernels/hca/test_v4_backend.py", 5, runner="pytest"),
+        TestFile("test/srt/kernels/csa_compressor/test_compressor.py", 3, runner="pytest"),
         TestFile("test/srt/kernels/mhc/test_mhc.py", 2, runner="pytest"),
         # Pytest tears down the shared FlashAttention mesh cleanly on JAX 0.10.2.
         TestFile("python/sgl_jax/test/test_flashattention_mha.py", 11, runner="pytest"),
@@ -300,6 +302,7 @@ suites = {
         TestFile("python/sgl_jax/test/kernels/simple_gla_fused_test.py", 1, runner="pytest"),
         TestFile("python/sgl_jax/test/layers/test_merged_column_parallel_linear.py", 0.1),
         TestFile("test/srt/kernels/dsa/test_streamindex_topk.py", 3, runner="pytest"),
+        TestFile("test/srt/kernels/qsa/test_sparse_gqa_parity.py", 1),
     ],
     # CPU-only unit tests — moved off the v6e-1 TPU runner to a dedicated
     # CPU runner so they don't consume TPU capacity. Either pure
@@ -309,6 +312,19 @@ suites = {
     # have a conditional CPU pin gated on USE_DEVICE_TYPE=cpu — the
     # cpu-test CI job sets that env var.
     "unit-test-cpu": [
+        TestFile("python/sgl_jax/test/constrained/test_grammar_backend.py", 0.1),
+        TestFile(
+            "python/sgl_jax/test/test_dp_feature_parity.py",
+            0.1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "python/sgl_jax/test/speculative/test_spec_dp_shapes.py",
+            0.1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
         TestFile(
             "test/srt/layers/test_lm_head_parallel.py",
             0.3,
@@ -317,6 +333,16 @@ suites = {
         ),
         TestFile("test/srt/multimodal/test_engine_multimodal.py", 0.1, runner="pytest"),
         TestFile("python/sgl_jax/test/layers/test_hyperconnection.py", 0.1),
+        TestFile("python/sgl_jax/test/layers/test_qsa_indexer.py", 0.1),
+        TestFile(
+            "python/sgl_jax/test/layers/test_qsa_sparse_backend.py",
+            0.1,
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "2"},
+        ),
+        TestFile("test/srt/kernels/qsa/test_sparse_gqa_ref.py", 0.1),
+        TestFile("test/srt/kernels/qsa/test_paging.py", 0.1),
+        TestFile("test/srt/kernels/qsa/test_qsa_pipeline.py", 0.5),
+        TestFile("test/srt/mem_cache/test_qsa_pool.py", 0.1),
         TestFile(
             "python/sgl_jax/test/test_embedding_pool.py",
             0.1,
@@ -381,6 +407,11 @@ suites = {
         TestFile("test/srt/test_dtype_config_consistency.py", 10),
         TestFile("python/sgl_jax/test/test_compilation_manager.py", 1),
         TestFile("python/sgl_jax/test/test_kernel_utils.py", 1),
+        TestFile(
+            "python/sgl_jax/test/test_mla_v2_bitexact.py",
+            0.4,
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
         TestFile("python/sgl_jax/test/speculative/test_dflash_info.py", 0.2, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/speculative/test_dflash_server_args.py",
@@ -413,6 +444,12 @@ suites = {
         ),
         TestFile("python/sgl_jax/test/multimodal/test_encoder_scheduler_kwargs.py", 0.1),
         TestFile("python/sgl_jax/test/models/test_qwen3_5.py", 2, runner="pytest"),
+        TestFile(
+            "python/sgl_jax/test/models/test_minimax_m3_msa.py",
+            3,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "4"},
+        ),
         TestFile("python/sgl_jax/test/test_transformers_compat.py", 2, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/kernels/test_gdn_fused_chunk_parallel_provenance.py",
@@ -439,6 +476,18 @@ suites = {
             0.2,
             runner="pytest",
         ),
+        TestFile(
+            "python/sgl_jax/test/test_runai_loader.py",
+            0.5,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "4"},
+        ),
+        TestFile(
+            "python/sgl_jax/test/test_weight_loading_distributed.py",
+            0.5,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
         TestFile("python/sgl_jax/test/mem_cache/test_req_to_token_pool.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_hybrid_req_to_token_pool.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_swa_allocator.py", 1),
@@ -448,6 +497,24 @@ suites = {
         TestFile("python/sgl_jax/test/mem_cache/test_unified_swa_component.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_unified_radix_tree_flag.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_paged_allocator_multi_dp.py", 1),
+        TestFile(
+            "python/sgl_jax/test/mem_cache/test_deepseek_v4_pool.py",
+            1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "2"},
+        ),
+        TestFile(
+            "python/sgl_jax/test/mem_cache/test_deepseek_v4_allocator.py",
+            1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "2"},
+        ),
+        TestFile(
+            "python/sgl_jax/test/mem_cache/test_deepseek_v4_lifecycle.py",
+            1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "2"},
+        ),
         TestFile("python/sgl_jax/test/mem_cache/test_host_kv_pool.py", 1, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/mem_cache/test_hicache_controller.py",

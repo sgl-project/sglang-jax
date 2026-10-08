@@ -17,6 +17,91 @@ from sgl_jax.srt.model_executor.aot_dispatch import AotDispatcher
 
 
 class TestAotDispatcher(unittest.TestCase):
+    def test_helper_precompile_matches_serving_mesh_context(self):
+        from sgl_jax.srt.model_executor.compilation_manager import CompilationPool
+
+        mesh = jax.sharding.Mesh(
+            np.array(jax.devices()[:1]),
+            ("x",),
+            axis_types=(jax.sharding.AxisType.Explicit,),
+        )
+        value = jax.device_put(
+            np.arange(4, dtype=np.float32),
+            jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("x")),
+        )
+        model = jax.jit(lambda x: x * 2)
+        sampler = jax.jit(lambda x: x + 1)
+        logprob = jax.jit(lambda x, y: x + y)
+        with CompilationPool(2) as pool:
+            outputs = [
+                compiled.out_info for _, _, compiled in pool.map(model.lower, [value], mesh=mesh)
+            ]
+            samples = [compiled.out_info for _, _, compiled in pool.map(sampler.lower, outputs)]
+            list(pool.map(lambda x: logprob.lower(x, x), samples))
+        with patch(
+            "jax._src.compiler.backend_compile_and_load",
+            side_effect=AssertionError("Helper recompiled during serving warmup"),
+        ):
+            with jax.set_mesh(mesh):
+                logits = model(value)
+            tokens = sampler(logits)
+            np.testing.assert_array_equal(logprob(tokens, tokens), np.arange(4) * 4 + 2)
+
+    def test_parallel_precompile_preserves_jit_dispatch(self):
+        from sgl_jax.srt.model_executor.compilation_manager import CompilationPool
+
+        @partial(jax.jit, donate_argnums=(1,))
+        def f(value, buffer):
+            return value * 2, buffer + 1
+
+        inputs = [(jnp.arange(n, dtype=jnp.float32), jnp.zeros(n)) for n in (4, 8, 16)]
+        with CompilationPool(2) as pool:
+            list(pool.map(lambda args: f.lower(*args), inputs))
+        with patch(
+            "jax._src.compiler.backend_compile_and_load",
+            side_effect=AssertionError("Unexpected compilation after precompile"),
+        ):
+            for value, buffer in inputs:
+                for step in range(1, 4):
+                    result, buffer = f(value, buffer)
+                    np.testing.assert_array_equal(result, np.asarray(value) * 2)
+                    np.testing.assert_array_equal(buffer, np.full(value.shape, step))
+
+    def test_parallel_precompile_then_serial_donation_without_compiling(self):
+        from sgl_jax.srt.model_executor.compilation_manager import CompilationPool
+
+        @partial(jax.jit, donate_argnums=(2,))
+        def f(weight, value, pool):
+            return weight * value, pool + 1
+
+        weight = jnp.array(2.0, dtype=jnp.float32)
+        options = {"xla_cpu_enable_fast_math": False}
+        dispatcher = AotDispatcher(
+            f,
+            (weight,),
+            (weight,),
+            "precompile",
+            compiler_options_fn=lambda _: options,
+            allow_fast_dispatch=False,
+        )
+        inputs = [(jnp.arange(n, dtype=jnp.float32), jnp.zeros(n)) for n in (4, 8, 16)]
+        with patch("sgl_jax.srt.model_executor.aot_dispatch._ENV", "1"):
+            with CompilationPool(2) as pool:
+                list(
+                    pool.map(lambda args: f.lower(weight, *args), inputs, compiler_options=options)
+                )
+            self.assertFalse(dispatcher._cache)
+            with patch(
+                "jax._src.compiler.backend_compile_and_load",
+                side_effect=AssertionError("Unexpected compilation after precompile"),
+            ):
+                for value, buffer in inputs:
+                    for step in range(1, 4):
+                        result, buffer = dispatcher(value, buffer)
+                        np.testing.assert_array_equal(result, np.asarray(value) * 2)
+                        np.testing.assert_array_equal(buffer, np.full(value.shape, step))
+            self.assertEqual(len(dispatcher._cache), 3)
+
     def test_batch_metadata_selects_distinct_executable(self):
         @jax.tree_util.register_pytree_node_class
         class Batch:
@@ -63,7 +148,10 @@ class TestAotDispatcher(unittest.TestCase):
         from sgl_jax.srt.model_executor.aot_executable import ExecutableStore
         from sgl_jax.srt.model_executor.aot_inputs import AbstractSampler
         from sgl_jax.srt.model_executor.aot_server import _export_sampling
-        from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
+        from sgl_jax.srt.model_executor.compilation_manager import (
+            CompilationManager,
+            CompilationPool,
+        )
         from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
         from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
         from sgl_jax.srt.utils.mesh_utils import create_device_mesh
@@ -92,17 +180,22 @@ class TestAotDispatcher(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             manifest = {"sampling": []}
-            _export_sampling(
-                AbstractSampler(mesh, 42),
-                jax.tree.map(
-                    lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding), logits
-                ),
-                manager,
-                mesh,
-                None,
-                Path(directory),
-                manifest,
-            )
+            with CompilationPool(2) as pool:
+                _export_sampling(
+                    pool,
+                    AbstractSampler(mesh, 42),
+                    [
+                        jax.tree.map(
+                            lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding),
+                            logits,
+                        )
+                    ],
+                    manager,
+                    mesh,
+                    None,
+                    Path(directory),
+                    manifest,
+                )
             self.assertEqual(len(manifest["sampling"]), 3)
             store = ExecutableStore(directory, mesh)
             cases = []

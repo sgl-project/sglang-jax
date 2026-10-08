@@ -116,8 +116,10 @@ class ModelConfig:
         hf_config: PretrainedConfig | None = None,
         encoder_only: bool = False,
         language_only: bool = False,
+        model_weights: str | None = None,
     ) -> None:
         self.model_path = model_path
+        self.model_weights = model_weights
         self.model_sub_dir = model_sub_dir
         self.revision = revision
         self.model_impl = model_impl
@@ -617,6 +619,9 @@ class ModelConfig:
         model_sub_dir = getattr(server_args, "model_sub_dir", None)
         return ModelConfig(
             model_path=model_path or server_args.model_path,
+            model_weights=getattr(server_args, "runai_model_paths", {}).get(
+                model_path or server_args.model_path
+            ),
             trust_remote_code=server_args.trust_remote_code,
             revision=model_revision or server_args.revision,
             context_length=server_args.context_length,
@@ -955,6 +960,15 @@ class ModelConfig:
 
         """
         from sgl_jax.srt.utils.common_utils import is_remote_url
+        from sgl_jax.srt.utils.runai_utils import download_metadata, is_gcs_path
+
+        # A serialized config can reach a worker with a separate host-local cache.
+        if (
+            self.model_weights
+            and is_gcs_path(self.model_weights)
+            and not os.path.isdir(self.model_path)
+        ):
+            self.model_path = download_metadata(self.model_weights)
 
         if is_remote_url(self.model_path):
             raise ValueError(

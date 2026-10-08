@@ -25,7 +25,7 @@ def bf16(x):
     return np.asarray(x, np.float32).astype(ml_dtypes.bfloat16).astype(np.float32)
 
 
-def records(hidden_req, weights, upto_groups: int):
+def records(hidden_req, weights, upto_groups: int, *, norm_eps=1e-6):
     """Compressed records for complete groups ``[0, upto_groups)`` of one request."""
     tokens = upto_groups * RATIO
     x = bf16(hidden_req[:tokens])
@@ -37,7 +37,7 @@ def records(hidden_req, weights, upto_groups: int):
         weight = np.exp(score[span] - score[span].max(axis=0, keepdims=True))
         weight /= weight.sum(axis=0, keepdims=True)
         pooled = (weight * kv[span]).sum(axis=0)
-        normed = pooled / np.sqrt(np.mean(pooled**2) + 1e-6) * weights["norm"]
+        normed = pooled / np.sqrt(np.mean(pooled**2) + norm_eps) * weights["norm"]
         cos, sin = weights["cos"][group * RATIO], weights["sin"][group * RATIO]
         rotated = normed.copy()
         even, odd = normed[448::2].copy(), normed[449::2].copy()
@@ -60,13 +60,14 @@ def attention_token(q_token, kv_req, recs, position: int, weights, softmax_scale
     return (probs @ keys) / denominator
 
 
-def request_outputs(stream, request: int, positions, weights, softmax_scale):
+def request_outputs(stream, request: int, positions, weights, softmax_scale, *, norm_eps=1e-6):
     """Stack of reference outputs for one request's query positions."""
     kv_req = np.asarray(stream["kv"][request], np.float32)
     recs = records(
         np.asarray(stream["hidden"][request], np.float32),
         weights,
         (int(positions[-1]) + 1) // RATIO,
+        norm_eps=norm_eps,
     )
     return np.stack(
         [

@@ -38,7 +38,7 @@ from sgl_jax.srt.layers.moe import (
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
+from sgl_jax.srt.model_loader.weights import WeightLoader, WeightSpec
 
 logger = logging.getLogger(__name__)
 
@@ -220,8 +220,7 @@ class DeepseekV3Attention(nnx.Module):
         )
 
         self.use_absorbed = use_absorbed
-        # Absorbed-MLA fused projections, populated by post_load_weights() after
-        # weight loading: w_uk[R, n_h, D_k] folds W_UK into Q, w_uv[R, n_h, D_v]
+        # Absorbed-MLA fused projections, populated by the loading group: w_uk[R, n_h, D_k] folds W_UK into Q, w_uv[R, n_h, D_v]
         # folds W_UV into the output. Placeholders here so nnx tracks them in
         # the model state tree; sharded on the head dim like kv_b_proj.weight.
         if use_absorbed:
@@ -309,43 +308,10 @@ class DeepseekV3Attention(nnx.Module):
         del hidden_states
         return attn_output
 
-    def post_load_weights(self):
-        """Split kv_b_proj.weight into absorbed-MLA folded projections.
+    def prepare_weight_loading(self, loader, mappings, prefix):
+        from sgl_jax.srt.layers.weight_loading import prepare_absorbed_mla
 
-        kv_b_proj.weight has layout [kv_lora_rank, n_h * (qk_nope+v_head_dim)],
-        head-major with [nope, v] within each head block. Absorbed MLA folds
-        W_UK into Q (pre-attn) and W_UV into the output (post-attn), so once
-        split we can drop kv_b_proj entirely. Mirrors sglang's
-        deepseek_weight_loader.post_process(). No-op for non-absorbed path.
-        """
-        if not self.use_absorbed:
-            return
-        if hasattr(self.kv_b_proj, "weight"):
-            # Non-quantized LinearBase: weight is [kv_lora_rank, n_h * (qk_nope+v)]
-            raw_weight = self.kv_b_proj.weight.value
-        else:
-            # QuantizedLinear: weight_q is [n_h * (qk_nope+v), kv_lora_rank] (transposed).
-            wq = self.kv_b_proj.weight_q.value  # [out, in]
-            ws = self.kv_b_proj.weight_scale.value
-            wq_f32 = wq.T.astype(jnp.float32)  # [in, out]
-            if ws.ndim == 3:
-                # Block-wise: [in_blocks, 1, out] → dequantize block by block
-                in_blocks, _, n_out = ws.shape
-                block_k = wq.shape[1] // in_blocks
-                wq_f32 = wq_f32.reshape(in_blocks, block_k, n_out)
-                wq_f32 = (wq_f32 * ws.astype(jnp.float32)).reshape(in_blocks * block_k, n_out)
-            else:
-                # Per-channel: [out]
-                wq_f32 = wq_f32 * ws.astype(jnp.float32)[None, :]
-            raw_weight = wq_f32.astype(jnp.bfloat16)
-        w_kv = raw_weight.reshape(
-            self.kv_lora_rank,
-            self.num_heads,
-            self.qk_nope_head_dim + self.v_head_dim,
-        )
-        self.w_uk.value = w_kv[:, :, : self.qk_nope_head_dim]
-        self.w_uv.value = w_kv[:, :, self.qk_nope_head_dim :]
-        self.kv_b_proj = None
+        return prepare_absorbed_mla(self, loader, mappings, prefix)
 
     def _forward_mqa(
         self,
@@ -785,11 +751,7 @@ class DeepseekV3ForCausalLM(nnx.Module):
             dtype=self.dtype,
         )
         weight_mappings = self._create_weight_mappings(model_config)
-        loader.load_weights_from_safetensors(weight_mappings)
-        # Absorbed-MLA path: pre-split kv_b_proj into w_uk/w_uv and drop the
-        # original projection (sglang parity, deepseek_weight_loader.post_process).
-        for layer in self.model.layers:
-            layer.self_attn.post_load_weights()
+        loader.load(weight_mappings)
         logger.info("DeepSeek V3 weights loaded successfully!")
 
     def _create_weight_mappings(self, model_config: ModelConfig) -> dict:
@@ -797,12 +759,12 @@ class DeepseekV3ForCausalLM(nnx.Module):
         is_static_quant = quant_config is not None and quant_config.is_static_checkpoint
 
         mappings = {
-            f"{self.hf_weight_prefix}model.embed_tokens.weight": WeightMapping(
+            f"{self.hf_weight_prefix}model.embed_tokens.weight": WeightSpec(
                 target_path="model.embed_tokens.embedding",
                 sharding=("tensor", None),
                 transpose=False,
             ),
-            f"{self.hf_weight_prefix}model.norm.weight": WeightMapping(
+            f"{self.hf_weight_prefix}model.norm.weight": WeightSpec(
                 target_path="model.norm.scale",
                 sharding=(None,),
                 transpose=False,
@@ -851,14 +813,14 @@ class DeepseekV3ForCausalLM(nnx.Module):
             #   directly; sharding is kernel_axes swapped. Also register the
             #   `weight_scale_inv` sidecar into `weight_scale`.
             if not is_static_quant:
-                mappings[f"{hf_prefix}.weight"] = WeightMapping(
+                mappings[f"{hf_prefix}.weight"] = WeightSpec(
                     target_path=f"{target_prefix}.weight",
                     sharding=sharding_std,
                     transpose=True,
                 )
                 return
             sharding_quant = (sharding_std[1], sharding_std[0])
-            mappings[f"{hf_prefix}.weight"] = WeightMapping(
+            mappings[f"{hf_prefix}.weight"] = WeightSpec(
                 target_path=f"{target_prefix}.weight_q",
                 sharding=sharding_quant,
                 transpose=False,
@@ -870,19 +832,19 @@ class DeepseekV3ForCausalLM(nnx.Module):
             # checkpoint as sharding_quant = (out_blocks_axis, in_blocks_axis):
             #   col-parallel: ("tensor", None) → 3D axis 2 sharded.
             #   row-parallel: (None, "tensor") → 3D axis 0 sharded.
-            mappings[f"{hf_prefix}.weight_scale_inv"] = WeightMapping(
+            mappings[f"{hf_prefix}.weight_scale_inv"] = WeightSpec(
                 target_path=f"{target_prefix}.weight_scale",
                 sharding=sharding_quant,
                 transpose=False,
             )
 
         # Layer norms
-        mappings[f"{prefix}.input_layernorm.weight"] = WeightMapping(
+        mappings[f"{prefix}.input_layernorm.weight"] = WeightSpec(
             target_path=f"{target}.input_layernorm.scale",
             sharding=(None,),
             transpose=False,
         )
-        mappings[f"{prefix}.post_attention_layernorm.weight"] = WeightMapping(
+        mappings[f"{prefix}.post_attention_layernorm.weight"] = WeightSpec(
             target_path=f"{target}.post_attention_layernorm.scale",
             sharding=(None,),
             transpose=False,
@@ -896,14 +858,14 @@ class DeepseekV3ForCausalLM(nnx.Module):
             add_linear(f"{ap}.q_proj", f"{tp}.q_proj", (None, "tensor"))
         else:
             add_linear(f"{ap}.q_a_proj", f"{tp}.q_a_proj", (None, None))
-            mappings[f"{ap}.q_a_layernorm.weight"] = WeightMapping(
+            mappings[f"{ap}.q_a_layernorm.weight"] = WeightSpec(
                 target_path=f"{tp}.q_a_layernorm.scale",
                 sharding=(None,),
                 transpose=False,
             )
             add_linear(f"{ap}.q_b_proj", f"{tp}.q_b_proj", (None, "tensor"))
         add_linear(f"{ap}.kv_a_proj_with_mqa", f"{tp}.kv_a_proj", (None, None))
-        mappings[f"{ap}.kv_a_layernorm.weight"] = WeightMapping(
+        mappings[f"{ap}.kv_a_layernorm.weight"] = WeightSpec(
             target_path=f"{tp}.kv_a_layernorm.scale",
             sharding=(None,),
             transpose=False,
@@ -922,13 +884,13 @@ class DeepseekV3ForCausalLM(nnx.Module):
             return mappings
 
         # MoE gate (router) — NOT quantized in HF FP8 checkpoint.
-        mappings[f"{prefix}.mlp.gate.weight"] = WeightMapping(
+        mappings[f"{prefix}.mlp.gate.weight"] = WeightSpec(
             target_path=f"{target}.moe_gate.kernel",
             sharding=(None, None),
             transpose=True,
         )
         if getattr(self.config, "topk_method", "noaux_tc") == "noaux_tc":
-            mappings[f"{prefix}.mlp.gate.e_score_correction_bias"] = WeightMapping(
+            mappings[f"{prefix}.mlp.gate.e_score_correction_bias"] = WeightSpec(
                 target_path=f"{target}.moe_gate.bias",
                 sharding=(None,),
                 transpose=False,
@@ -958,7 +920,7 @@ class DeepseekV3ForCausalLM(nnx.Module):
         # block scales would need a dedicated fix in fused_moe.py. Skip.
         #
         # For each expert weight group (emitted by create_moe_weights_mapping
-        # as `__MOE_EXPERTS__<target_base>`) register a parallel scale group
+        # as `<target_base>`) register a parallel scale group
         # whose HF keys are the per-expert `*.weight_scale_inv` tensors and
         # whose target is `<target_base>_scale` (e.g. `wi_0_scale`). After
         # stacking, WeightLoader's _maybe_convert_epmoe_scale_for_kernel
@@ -966,20 +928,19 @@ class DeepseekV3ForCausalLM(nnx.Module):
         # kernel-ready `[E, k_blocks, 1, n_out]` expected by GMM.
         if is_static_quant and not use_fused:
             for moe_key, wm in moe_mappings.items():
-                if not moe_key.startswith("__MOE_EXPERTS__"):
+                if not wm.sources:
                     continue
-                target_base = wm.target_path[0]
-                expert_scale_keys = [
-                    k.replace(".weight", ".weight_scale_inv") for k in wm.target_path[1:]
-                ]
+                target_base = wm.target_path
+                expert_scale_keys = [k.replace(".weight", ".weight_scale_inv") for k in wm.sources]
                 scale_target = f"{target_base}_scale"
                 # Stacked checkpoint scale is `[E, out_blocks, in_blocks]`. Load
                 # replicated on the block dims; _maybe_convert_epmoe_scale_for_kernel
                 # expands via jnp.take, which fails if the gathered axis is
                 # tensor-sharded (ambiguous output sharding). The converter reshards
                 # to model_param.value.sharding at the end.
-                mappings[f"__MOE_EXPERTS__{scale_target}"] = WeightMapping(
-                    target_path=[scale_target] + expert_scale_keys,
+                mappings[f"{scale_target}"] = WeightSpec(
+                    target_path=scale_target,
+                    sources=tuple(expert_scale_keys),
                     sharding=("expert", None, None),
                     transpose=False,
                     physical_to_logical_map=wm.physical_to_logical_map,
@@ -998,7 +959,7 @@ class DeepseekV3ForCausalLM(nnx.Module):
                     ("up_proj", "w3_shared"),
                     ("down_proj", "w2_shared"),
                 ]:
-                    mappings[f"{prefix}.mlp.shared_experts.{hf_name}.weight"] = WeightMapping(
+                    mappings[f"{prefix}.mlp.shared_experts.{hf_name}.weight"] = WeightSpec(
                         target_path=f"{target}.mlp.{target_name}",
                         sharding=(None, None),
                         transpose=True,

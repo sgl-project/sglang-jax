@@ -337,6 +337,14 @@ options, use the same overrides for export and serving. For example,
 capacity filtering and inclusion of the maximum bucket. No `--workload` or shell
 loop is needed.
 
+`--precompile-num-threads` defaults to `2` for bounded parallel XLA compilation.
+Use `--precompile-num-threads 1` for the serial fallback. Lowering and artifact
+writes remain on the caller thread, and the number of retained lowerings is
+bounded by the worker count. The exporter marks `serving.json` complete only
+after every required model, sampler, and logprob executable has been saved;
+compilation or serialization failures leave it failed. Artifact signatures and
+strict loading with `--aot-model-dir` are unchanged.
+
 Set `--max-total-tokens` explicitly: serving normally derives this capacity from
 available TPU memory, which the CPU host cannot query. This serving option is a
 **per-DP-rank** cap; the single-graph compiler's `--kv-capacity` is global. Linear

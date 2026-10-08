@@ -265,7 +265,15 @@ def expand_block_scale(
     else:
         # Standard uniform block quant: repeat each block's scale to its
         # constituent channels, then truncate to the actual output size.
-        scale_per_channel = jnp.repeat(scale_2d, repeats=block_size_out, axis=0)[:n_out]
+        # Explicit meshes require an output layout when repeating a sharded
+        # axis. Read the layout from the aval so this also works in eval_shape.
+        sharding = jax.typeof(scale_2d).sharding
+        scale_per_channel = jnp.repeat(
+            scale_2d,
+            repeats=block_size_out,
+            axis=0,
+            out_sharding=None if sharding.mesh.empty else sharding,
+        )[:n_out]
 
     # Transpose to [in_blocks, n_out] and insert the singleton dim expected
     # by the blockwise kernel: [in_blocks, 1, n_out].

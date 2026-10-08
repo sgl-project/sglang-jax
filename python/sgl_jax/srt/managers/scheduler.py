@@ -1262,6 +1262,18 @@ class Scheduler(
             return_hidden_states=recv_req.return_hidden_states,
         )
         req.tokenizer = self.tokenizer
+        if (
+            req.return_hidden_states
+            and self.spec_algorithm is not None
+            and not self.spec_algorithm.is_none()
+        ):
+            req.set_finish_with_abort(
+                "return_hidden_states is not supported with speculative decoding: "
+                "verify rows require accepted-token selection."
+            )
+            req.check_finished()
+            self.stream_output([req], req.return_logprob, req.return_output_logprob_only)
+            return
         # PD disaggregation routing keys.
         req.bootstrap_host = recv_req.bootstrap_host
         req.bootstrap_port = recv_req.bootstrap_port
@@ -1396,7 +1408,10 @@ class Scheduler(
                 req.grammar = req.grammar.result(timeout=0.03)
                 # Cache the compiled grammar
                 if self.grammar_backend and req.grammar_key:
-                    self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
+                    cached_grammar = (
+                        req.grammar if req.grammar is INVALID_GRAMMAR_OBJ else req.grammar.copy()
+                    )
+                    self.grammar_backend.set_cache(req.grammar_key, cached_grammar)
 
                 # Check if compilation resulted in invalid grammar
                 if req.grammar is INVALID_GRAMMAR_OBJ:

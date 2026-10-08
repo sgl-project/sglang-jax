@@ -60,7 +60,7 @@ from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
     _build_non_hybrid_memory_pools,
 )
-from sgl_jax.srt.model_loader.loader import get_model_loader
+from sgl_jax.srt.model_loader.loader import get_model_loader, validate_model_parameters
 from sgl_jax.srt.multimodal.in_model.embedding_pool import EmbeddingPool
 from sgl_jax.srt.multimodal.in_model.host_orchestration import (
     MultimodalBatch,
@@ -175,6 +175,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             load_config=LoadConfig(
                 load_format=server_args.load_format,
                 download_dir=server_args.download_dir,
+                model_loader_extra_config=server_args.model_loader_extra_config,
                 model_class=model_class,
             ),
             mesh=self.mesh,
@@ -290,6 +291,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         )
 
     def initialize_jit(self):
+        validate_model_parameters(self.model)
         model_def, model_state = nnx.split(self.model)
         # note export for external modification
         self.model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
@@ -339,6 +341,26 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
         jitted_sampler = make_jitted_sampler(base_rng_key, sampler_compiler_options)
 
+        # Retain the serving JIT definitions for compile-only preparation.
+        # Warmup still calls the ordinary wrappers and threads donated pools.
+        self._lower_model = lambda batch, metadata: jitted_run_model.lower(
+            model_def,
+            model_state_def,
+            self.model_state_leaves,
+            batch,
+            self.memory_pools,
+            metadata,
+        )
+        self._lower_sampler = lambda logits, metadata: jitted_sampler.lower(
+            sampler_def,
+            sampler_state_def,
+            sampler_state_leaves,
+            self._sampler_step,
+            logits,
+            metadata,
+        )
+        self._lower_compute_logprobs = partial(jitted_compute_logprobs.lower, self.mesh)
+
         aot_model_dir = self.server_args.aot_model_dir
         executable_store = None
         if aot_model_dir:
@@ -346,15 +368,38 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
             executable_store = ExecutableStore(aot_model_dir, self.mesh)
 
-        # Explicit offline loading and opt-in online compilation share one
-        # per-shape executable cache. The default pjit path is unchanged.
+        # Offline loading and opt-in AOT dispatch share an executable cache.
+        # Parallel precompile also warms JAX's cache for the ordinary pjit path.
         use_aot_dispatch = aot_dispatch_requested()
+        self.parallel_precompile = (
+            self.server_args.precompile_num_threads > 1
+            and not self.server_args.disable_precompile
+            and executable_store is None
+            and not self.server_args.speculative_algorithm
+            and not self.server_args.enable_lora
+            and not self.server_args.enable_static_lora
+            and not self.model_config.is_multimodal
+            and not self.server_args.multimodal
+        )
+        if self.server_args.precompile_num_threads > 1 and not self.parallel_precompile:
+            logger.info(
+                "Parallel precompile is unavailable for this configuration; using serial warmup"
+            )
         if use_aot_dispatch and self.server_args.speculative_algorithm:
             logger.warning(
                 "SGLANG_JAX_AOT_DISPATCH is set but speculative decoding is "
                 "enabled; disabling the fast execute_sharded dispatch path."
             )
             use_aot_dispatch = False
+
+        # Match the exact compile options used by the selected serving path so
+        # both ordinary JIT and AOT dispatch reuse JAX's compiled-executable cache.
+        self.model_compile_options = lambda batch: (
+            CompilationManager.compiler_options(self.attn_backend, batch.forward_batch)
+            if use_aot_dispatch
+            else None
+        )
+        self.sampler_compile_options = sampler_compiler_options if use_aot_dispatch else None
 
         if use_aot_dispatch or executable_store is not None:
             self._run_model_dispatcher = AotDispatcher(
@@ -744,6 +789,10 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             return False
 
         backend = self.server_args.attention_backend
+        from sgl_jax.srt.layers.attention.msa_backend import msa_sparse_config
+
+        if msa_sparse_config(self.model_config) is not None and backend != "fa":
+            raise ValueError(f"MSA models require --attention-backend fa; got {backend!r}.")
         if self.server_args.device == "cpu" and backend in ("fa", "fa_mha"):
             logger.warning(
                 "FlashAttention backend is not supported on CPU; falling back to native."
@@ -838,6 +887,35 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 attention_data_partition_axis="data",
             )
 
+        elif backend == "qsa_sparse":
+            from sgl_jax.srt.layers.attention.qsa_sparse_backend import (
+                QSASparseAttentionBackend,
+            )
+
+            cfg = self.model_config.hf_text_config
+            if getattr(cfg, "indexer_budget", None) is None:
+                raise ValueError(
+                    "attention_backend='qsa_sparse' needs a model with indexer_* "
+                    "config (Qwen3.8-Flash-Next); this one has none"
+                )
+            # Every full-attention layer carries its own indexer -- upstream
+            # builds it per layer with its own prefix and there is no sharing
+            # switch, unlike DSA's IndexShare.
+            full_slot = {
+                layer_id: slot for slot, layer_id in enumerate(cfg.full_attention_layer_ids)
+            }
+            full_attn_backend = QSASparseAttentionBackend(
+                self.num_attn_heads,
+                self.num_kv_heads,
+                self.model_config.head_dim,
+                page_size=self.page_size,
+                mesh=self.mesh,
+                compress_ratio=cfg.indexer_compress_ratio,
+                block_topk=cfg.indexer_budget // cfg.indexer_compress_ratio,
+                full_slot=full_slot,
+                indexer_key_dim=cfg.indexer_head_dim,
+            )
+
         elif backend in ("fa", "fa_mha"):
             from sgl_jax.srt.layers.attention.flashattention_backend import (
                 FlashAttention,
@@ -851,13 +929,28 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 head_dim = self.model_config.head_dim
                 num_kv_heads = self.num_kv_heads
 
-            full_attn_backend = FlashAttention(
-                self.num_attn_heads,
-                num_kv_heads,
-                head_dim,
-                page_size=self.page_size,
-                mesh=self.mesh,
-            )
+            sparse_config = msa_sparse_config(self.model_config)
+            if sparse_config is not None:
+                from sgl_jax.srt.layers.attention.msa_backend import MSAAttentionBackend
+
+                full_attn_backend = MSAAttentionBackend(
+                    self.num_attn_heads,
+                    num_kv_heads,
+                    head_dim,
+                    page_size=self.page_size,
+                    mesh=self.mesh,
+                    sparse_config=sparse_config,
+                    context_len=self.model_config.context_len,
+                    total_num_kv_heads=self.model_config.get_total_num_kv_heads(),
+                )
+            else:
+                full_attn_backend = FlashAttention(
+                    self.num_attn_heads,
+                    num_kv_heads,
+                    head_dim,
+                    page_size=self.page_size,
+                    mesh=self.mesh,
+                )
 
         elif backend == "tt":
             from sgl_jax.srt.hardware_backend.tt.attention.tt_backend import TTAttention
@@ -876,6 +969,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         )
 
         return attn_backend_wrapper(self, full_attn_backend)
+
+    def lower_model(self, batch):
+        """Prepare forward metadata and lower under the caller's model mesh."""
+        self.attn_backend.forward_metadata = self.attn_backend.get_forward_metadata(batch)
+        logits_metadata = LogitsMetadata.from_model_worker_batch(batch, self.mesh)
+        return self._lower_model(batch.forward_batch, logits_metadata)
 
     def _forward(
         self,

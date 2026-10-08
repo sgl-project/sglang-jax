@@ -7,6 +7,7 @@ import numpy as np
 from flax import nnx
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
+from sgl_jax.srt.model_loader.weights import WeightSpec
 from sgl_jax.srt.multimodal.configs.kimi.kimi_k25_config import KimiK25ModelVitConfig
 from sgl_jax.srt.multimodal.layers.attention.flash_attention_backend import (
     make_vision_attention_backend,
@@ -15,7 +16,6 @@ from sgl_jax.srt.multimodal.layers.vision_sharding import (
     VisionShardSpecs,
     apply_data_sharding,
 )
-from sgl_jax.srt.utils.weight_utils import WeightMapping
 
 init_fn = nnx.initializers.uniform()
 logger = logging.getLogger(__name__)
@@ -528,7 +528,7 @@ class VisionTower(nnx.Module):
         # is a property of the index values, which JAX cannot see, so it
         # refuses to infer an output sharding. State it explicitly.
         merged_states = hidden_states.at[merge_indices].get(
-            out_sharding=self.specs.sharding(self.specs.batch_axis) if self.specs else None
+            out_sharding=(self.specs.sharding(self.specs.batch_axis) if self.specs else None)
         )
 
         if merge_weights is None:
@@ -725,57 +725,57 @@ def create_kimi_vision_weight_mappings(
     same wherever it is mounted.
     """
     mappings = {
-        "vision_tower.patch_embed.pos_emb.weight": WeightMapping(
+        "vision_tower.patch_embed.pos_emb.weight": WeightSpec(
             target_path=f"{target_prefix}vision_tower.patch_embed.pos_emb.weight",
             sharding=(None,),
             transpose=False,
         ),
-        "vision_tower.patch_embed.proj.weight": WeightMapping(
+        "vision_tower.patch_embed.proj.weight": WeightSpec(
             target_path=f"{target_prefix}vision_tower.patch_embed.proj.kernel",
             sharding=(None, None, None, None),
             transpose_axes=(2, 3, 1, 0),
         ),
-        "vision_tower.patch_embed.proj.bias": WeightMapping(
+        "vision_tower.patch_embed.proj.bias": WeightSpec(
             target_path=f"{target_prefix}vision_tower.patch_embed.proj.bias",
             sharding=(None,),
             transpose=False,
         ),
-        "vision_tower.encoder.final_layernorm.weight": WeightMapping(
+        "vision_tower.encoder.final_layernorm.weight": WeightSpec(
             target_path=f"{target_prefix}vision_tower.encoder.final_layernorm.scale",
             sharding=(None,),
             transpose=False,
         ),
-        "vision_tower.encoder.final_layernorm.bias": WeightMapping(
+        "vision_tower.encoder.final_layernorm.bias": WeightSpec(
             target_path=f"{target_prefix}vision_tower.encoder.final_layernorm.bias",
             sharding=(None,),
             transpose=False,
         ),
-        "mm_projector.pre_norm.bias": WeightMapping(
+        "mm_projector.pre_norm.bias": WeightSpec(
             target_path=f"{target_prefix}mm_projector.pre_norm.bias",
             sharding=(None,),
             transpose=False,
         ),
-        "mm_projector.pre_norm.weight": WeightMapping(
+        "mm_projector.pre_norm.weight": WeightSpec(
             target_path=f"{target_prefix}mm_projector.pre_norm.scale",
             sharding=(None,),
             transpose=False,
         ),
-        "mm_projector.proj.0.weight": WeightMapping(
+        "mm_projector.proj.0.weight": WeightSpec(
             target_path=f"{target_prefix}mm_projector.proj_0.kernel",
             sharding=(None,),
             transpose=True,
         ),
-        "mm_projector.proj.0.bias": WeightMapping(
+        "mm_projector.proj.0.bias": WeightSpec(
             target_path=f"{target_prefix}mm_projector.proj_0.bias",
             sharding=(None,),
             transpose=False,
         ),
-        "mm_projector.proj.2.weight": WeightMapping(
+        "mm_projector.proj.2.weight": WeightSpec(
             target_path=f"{target_prefix}mm_projector.proj_1.kernel",
             sharding=(None,),
             transpose=True,
         ),
-        "mm_projector.proj.2.bias": WeightMapping(
+        "mm_projector.proj.2.bias": WeightSpec(
             target_path=f"{target_prefix}mm_projector.proj_1.bias",
             sharding=(None,),
             transpose=False,
@@ -793,62 +793,62 @@ def create_kimi_vision_layer_mappings(layer_idx: int, target_prefix: str = "") -
     target = f"{target_prefix}vision_tower.encoder.blocks.{layer_idx}"
 
     return {
-        f"{source}.wqkv.weight": WeightMapping(
+        f"{source}.wqkv.weight": WeightSpec(
             target_path=f"{target}.attn.qkv_proj.kernel",
             sharding=(None,),
             transpose=True,
         ),
-        f"{source}.wqkv.bias": WeightMapping(
+        f"{source}.wqkv.bias": WeightSpec(
             target_path=f"{target}.attn.qkv_proj.bias",
             sharding=(None,),
             transpose=False,
         ),
-        f"{source}.wo.weight": WeightMapping(
+        f"{source}.wo.weight": WeightSpec(
             target_path=f"{target}.proj.kernel",
             sharding=(None,),
             transpose=True,
         ),
-        f"{source}.wo.bias": WeightMapping(
+        f"{source}.wo.bias": WeightSpec(
             target_path=f"{target}.proj.bias",
             sharding=(None,),
             transpose=False,
         ),
-        f"{source}.mlp.fc0.weight": WeightMapping(
+        f"{source}.mlp.fc0.weight": WeightSpec(
             target_path=f"{target}.mlp.up_proj.kernel",
             sharding=(None,),
             transpose=True,
         ),
-        f"{source}.mlp.fc0.bias": WeightMapping(
+        f"{source}.mlp.fc0.bias": WeightSpec(
             target_path=f"{target}.mlp.up_proj.bias",
             sharding=(None,),
             transpose=False,
         ),
-        f"{source}.mlp.fc1.weight": WeightMapping(
+        f"{source}.mlp.fc1.weight": WeightSpec(
             target_path=f"{target}.mlp.down_proj.kernel",
             sharding=(None,),
             transpose=True,
         ),
-        f"{source}.mlp.fc1.bias": WeightMapping(
+        f"{source}.mlp.fc1.bias": WeightSpec(
             target_path=f"{target}.mlp.down_proj.bias",
             sharding=(None,),
             transpose=False,
         ),
-        f"{source}.norm0.weight": WeightMapping(
+        f"{source}.norm0.weight": WeightSpec(
             target_path=f"{target}.pre_norm.scale",
             sharding=(None,),
             transpose=False,
         ),
-        f"{source}.norm0.bias": WeightMapping(
+        f"{source}.norm0.bias": WeightSpec(
             target_path=f"{target}.pre_norm.bias",
             sharding=(None,),
             transpose=False,
         ),
-        f"{source}.norm1.weight": WeightMapping(
+        f"{source}.norm1.weight": WeightSpec(
             target_path=f"{target}.post_norm.scale",
             sharding=(None,),
             transpose=False,
         ),
-        f"{source}.norm1.bias": WeightMapping(
+        f"{source}.norm1.bias": WeightSpec(
             target_path=f"{target}.post_norm.bias",
             sharding=(None,),
             transpose=False,

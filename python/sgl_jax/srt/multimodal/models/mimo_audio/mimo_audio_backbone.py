@@ -12,6 +12,7 @@ from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.model_loader.weights import WeightLoader
 from sgl_jax.srt.models.qwen2 import Qwen2DecoderLayer
 from sgl_jax.srt.multimodal.configs.mimo_audio.mimo_audio_backbone_config import (
     MiMoAudioArguments,
@@ -21,7 +22,6 @@ from sgl_jax.srt.multimodal.configs.mimo_audio.mimo_audio_backbone_config import
 from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_backbone_weights_mapping import (
     to_mappings,
 )
-from sgl_jax.srt.utils.weight_utils import WeightLoader
 
 
 @dataclass
@@ -570,7 +570,7 @@ class MiMoAudioForCausalLM(nnx.Module):
             mesh=self.mesh,
             dtype=self.dtype,
         )
-        loader.load_weights_from_safetensors(to_mappings(self.config, self.lm_head))
+        loader.load(to_mappings(self.config, self.lm_head))
 
     def apply_patch_encoder(self, speech_embeddings: jax.Array) -> jax.Array:
         B, T_groups, group_size, hidden_size = speech_embeddings.shape
@@ -642,7 +642,13 @@ class MiMoAudioForCausalLM(nnx.Module):
         text_logits = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         hidden_states = hidden_states.reshape(B, T_groups, H)
         local_hidden_states, _ = self.hidden_states_downcast(hidden_states[:, -1:, :])
-        return text_logits, local_hidden_states, None, layers_kv_fused, layers_callback_flag
+        return (
+            text_logits,
+            local_hidden_states,
+            None,
+            layers_kv_fused,
+            layers_callback_flag,
+        )
 
     def patch_decode(
         self,

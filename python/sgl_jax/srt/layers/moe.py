@@ -22,12 +22,12 @@ from sgl_jax.srt.kernels.sparse_core.moe_permute import (
 # Re-export for backward compatibility: external code imports from this module.
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE, FusedEPMoEV2  # noqa: F401
 from sgl_jax.srt.layers.gate import GateLogit, TopK  # noqa: F401
+from sgl_jax.srt.model_loader.weights import WeightSpec
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import (
     quantize_tensor,
     quantize_tensor_simple,
 )
-from sgl_jax.srt.utils.weight_utils import WeightMapping
 
 
 class EPMoE(nnx.Module):
@@ -42,6 +42,8 @@ class EPMoE(nnx.Module):
         weight_dtype: jnp.dtype = jnp.bfloat16,
         dtype: jnp.dtype = jnp.bfloat16,
         activation: str = "silu",
+        swiglu_alpha: float = 1.702,
+        swiglu_limit: float = 7.0,
         layer_id: int = 0,
         quantization_config=None,
         physical_to_logical_map: "jax.Array | None" = None,
@@ -73,6 +75,8 @@ class EPMoE(nnx.Module):
         self.original_mesh = mesh
         self.mesh = mesh
         self.activation = activation
+        self.swiglu_alpha = swiglu_alpha
+        self.swiglu_limit = swiglu_limit
         self.hidden_size = hidden_size
 
         # Get quantization settings from config
@@ -495,7 +499,7 @@ class EPMoE(nnx.Module):
         # irrelevant inside the per-expert shard_map context.
         out_specs = P(
             *[
-                "tensor" if (s == "tensor" or (isinstance(s, tuple) and "tensor" in s)) else None
+                ("tensor" if (s == "tensor" or (isinstance(s, tuple) and "tensor" in s)) else None)
                 for s in out_sharding.spec
             ]
         )
@@ -778,12 +782,15 @@ class EPMoE(nnx.Module):
 
         # === Activation ===
         if self.activation == "silu":
-            layer_act = jax.nn.silu(layer_w0)
+            intermediate_layer = jax.nn.silu(layer_w0) * layer_w1
         elif self.activation == "gelu":
-            layer_act = jax.nn.gelu(layer_w0)
+            intermediate_layer = jax.nn.gelu(layer_w0) * layer_w1
+        elif self.activation == "swigluoai":
+            gate = jnp.clip(layer_w0, max=self.swiglu_limit)
+            up = jnp.clip(layer_w1, -self.swiglu_limit, self.swiglu_limit)
+            intermediate_layer = (up + 1.0) * gate * jax.nn.sigmoid(gate * self.swiglu_alpha)
         else:
             raise ValueError(f"Unsupported activation function {self.activation}")
-        intermediate_layer = jnp.multiply(layer_act, layer_w1)
 
         # === GEMM2: intermediate @ wo ===
         return gmm(
@@ -994,9 +1001,10 @@ def create_moe_weights_mapping(
 
         concat_axis = expert_concat_axis_map.get(source_name)
 
-        # Use __MOE_EXPERTS__ prefix to indicate aggregated MoE weight loading
-        mappings[f"__MOE_EXPERTS__{target_path_base}"] = WeightMapping(
-            target_path=[target_path_base] + expert_keys,
+        # Use  prefix to indicate aggregated MoE weight loading
+        mappings[f"{target_path_base}"] = WeightSpec(
+            target_path=target_path_base,
+            sources=tuple(expert_keys),
             sharding=sharding,
             transpose=transpose,
             concat_axis=concat_axis,
