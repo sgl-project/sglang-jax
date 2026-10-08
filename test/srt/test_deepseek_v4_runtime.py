@@ -211,26 +211,144 @@ def test_update_rejected_before_donation(runner):
     assert not pools.token_to_kv_pool.get_swa_buffer(0).is_deleted()
 
 
-def test_overlap_reclaims_completed_snapshot_not_next_length(runner):
-    from sgl_jax.srt.managers.schedule_batch import ScheduleBatch
+@pytest.mark.parametrize("return_hidden_states", [False, True])
+def test_overlap_reclaims_completed_snapshot_not_next_length(runner, return_hidden_states):
+    from sgl_jax.srt.managers.schedule_batch import ScheduleBatch, ScheduleReqsInfo
 
     cache = DeepseekV4ChunkCache(
         runner.req_to_token_pool, runner.token_to_kv_pool_allocator, runner.page_size, 128
     )
     req = new_request(runner)
-    step_batch(runner, req, 0, 254)
-    # Preparing the next decode advances the shared request length to 255.
-    step_batch(runner, req, 254, 255, decode=True)
-    submitted = SimpleNamespace(reqs_info=[SimpleNamespace(reqs=[req], seq_lens=np.array([254]))])
+    completed_len = 254
+    step_batch(runner, req, 0, completed_len)
+    batch = ScheduleBatch(
+        reqs_info=[ScheduleReqsInfo(reqs=[req], seq_lens=np.array([completed_len]))],
+        return_hidden_states=return_hidden_states,
+    )
+    submitted = batch.copy()
+    # With page size 128, the next decode crosses the SWA reclamation boundary.
+    step_batch(runner, req, completed_len, completed_len + 1, decode=True)
+    batch.reqs_info[0].seq_lens[:] += 1
+    assert submitted.reqs_info[0].seq_lens.tolist() == [completed_len]
     scheduler_batch = SimpleNamespace(tree_cache=cache, is_hybrid=True)
     ScheduleBatch.maybe_evict_swa(scheduler_batch)
     reclaim_batch_swa(submitted, cache)
     assert req.swa_evicted_seqlen == 0
-    assert req.kv_committed_len == 255
-    # At 254, position 127 in the first page is still needed by the next query.
-    loc = runner.req_to_token_pool.req_to_token[req.req_pool_idx, 127]
+    assert req.kv_committed_len == completed_len + 1
+    # The completed forward still needs the last token of the first page.
+    last_kept = min(completed_len - 1, runner.page_size - 1)
+    loc = runner.req_to_token_pool.req_to_token[req.req_pool_idx, last_kept]
     assert runner.token_to_kv_pool_allocator.full_to_swa_index_mapping[loc] != 0
     release_kv_cache(req, cache)
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize(
+    "phase",
+    ["prefill", "chunk", "mixed", "decode", "finish-prefill", "finish-decode", "abort-chunk"],
+)
+def test_completed_result_reclaims_and_releases_real_batch(runner, overlap, phase):
+    """Exercise real batch copies, output processors and C's lifecycle helpers."""
+    from unittest.mock import Mock
+
+    from sgl_jax.srt.managers.schedule_batch import (
+        FINISH_ABORT,
+        Req,
+        ScheduleBatch,
+        ScheduleReqsInfo,
+    )
+    from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
+        SchedulerOutputProcessorMixin,
+    )
+    from sgl_jax.srt.sampling.sampling_params import SamplingParams
+
+    cache = DeepseekV4ChunkCache(
+        runner.req_to_token_pool, runner.token_to_kv_pool_allocator, runner.page_size, 128
+    )
+    completed_len = 128 if phase == "prefill" else 254
+    finishing = phase.startswith("finish-")
+    req = Req(
+        phase,
+        "",
+        [1] * completed_len,
+        SamplingParams(max_new_tokens=1 if finishing else 4, ignore_eos=True),
+        dp_rank=0,
+    )
+    assert runner.req_to_token_pool.alloc([req]) is not None
+    step_batch(runner, req, 0, completed_len)
+    chunked = phase in ("chunk", "abort-chunk")
+    req.is_chunked = int(chunked)
+    mode = ForwardMode.DECODE if "decode" in phase else ForwardMode.EXTEND
+    original = ScheduleBatch(
+        reqs_info=[
+            ScheduleReqsInfo(
+                reqs=[req],
+                seq_lens=np.array([completed_len], np.int32),
+                extend_lens=[completed_len],
+                extend_logprob_start_lens=[0],
+                decoding_reqs=[req] if phase == "mixed" else None,
+            )
+        ],
+        forward_mode=mode,
+        per_dp_bs_size=1,
+    )
+    submitted = original.copy() if overlap else original
+    if overlap:
+        # Both the array and shared Req may advance before previous-result processing.
+        step_batch(runner, req, completed_len, completed_len + 1, decode=True)
+        original.reqs_info[0].seq_lens[:] += 1
+
+    scheduler = SchedulerOutputProcessorMixin()
+    scheduler.is_generation, scheduler.enable_overlap, scheduler.pd = True, overlap, None
+    scheduler.spec_algorithm, scheduler.tree_cache = None, cache
+    scheduler.token_to_kv_pool_allocator = runner.token_to_kv_pool_allocator
+    scheduler.num_generated_tokens, scheduler.forward_ct_decode = 0, 0
+    scheduler.server_args = SimpleNamespace(decode_log_interval=1000)
+    scheduler._pending_chunked_abort_reqs = [req if phase == "abort-chunk" else None]
+    scheduler.chunked_reqs = [req if chunked else None]
+    scheduler._release_prefill_host_buffer = Mock()
+    scheduler.set_next_batch_sampling_info_done = Mock()
+    scheduler.stream_output = Mock()
+    logits = SimpleNamespace(hidden_states=None, next_token_logprobs=None)
+
+    def resolve(_):
+        # Reclamation must not run until the worker reports completed execution.
+        assert req.swa_evicted_seqlen == 0
+        return logits, [2], 0
+
+    scheduler.tp_worker = SimpleNamespace(resolve_last_batch_result=Mock(side_effect=resolve))
+    result = SimpleNamespace(
+        logits_output=logits,
+        next_token_ids=[2],
+        cache_miss_count=0,
+        bid=1,
+        extend_input_len_per_req=[completed_len],
+        extend_logprob_start_len_per_req=[0],
+        next_draft_input=None,
+    )
+    if phase == "abort-chunk":
+        req.to_finish = FINISH_ABORT("cancelled")
+    try:
+        if mode.is_decode():
+            scheduler.process_batch_result_decode(submitted, result)
+        else:
+            scheduler.process_batch_result_prefill(submitted, result)
+        scheduler.stream_output.assert_called_once()
+        assert scheduler.tp_worker.resolve_last_batch_result.call_count == int(overlap)
+        if finishing or phase == "abort-chunk":
+            assert req.finished() and req.req_pool_idx is None
+            assert req.kv_allocated_len == 0
+        else:
+            assert req.swa_evicted_seqlen == 0
+            assert req.kv_committed_len == completed_len + int(overlap)
+            last_kept = min(completed_len - 1, runner.page_size - 1)
+            loc = runner.req_to_token_pool.req_to_token[req.req_pool_idx, last_kept]
+            assert runner.token_to_kv_pool_allocator.full_to_swa_index_mapping[loc] != 0
+            assert req.output_ids == ([] if chunked else [2])
+        if phase == "abort-chunk":
+            assert scheduler.chunked_reqs == scheduler._pending_chunked_abort_reqs == [None]
+    finally:
+        release_kv_cache(req, cache)
 
 
 @pytest.mark.parametrize(

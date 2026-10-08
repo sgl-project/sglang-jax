@@ -42,6 +42,38 @@ evidence of release.
 
 ## Comparison scope
 
+### Completed-batch snapshot correction
+
+Experiment `exp-kc4pihy5rh` used `3deae8eaf` and reached service readiness
+in 655.9 seconds after M/E loading in 28.1/350.2 seconds. Its first prefill
+result failed in `reclaim_batch_swa`: the overlap result queue uses
+`ScheduleBatch.copy()`, which preserved `seq_lens` only when hidden states
+were requested. Ordinary generation retained the request list but lost its
+completed-forward lengths. No generation check completed.
+
+RFC #1727 items 2 and 4, and C's #1688 completed-forward boundary, require
+the previous-result processor to reclaim only consumed SWA pages. The epic
+reference calls C with the live request's committed length; this runtime uses
+a temporary request view with the completed batch's length to tolerate the
+next overlap submission advancing the shared request. That adaptation must
+preserve `seq_lens` in every result-queue snapshot, independently of hidden
+state collection. C's helper and full-request release path remain unchanged.
+
+The old overlap test constructed a `SimpleNamespace` with lengths already
+present, so it did not test their production. It now uses the actual batch
+copy and mutates both the source array and shared request before reclaiming.
+Additional tests call real prefill/decode output processors and C's helpers
+for regular, chunked, mixed, completion and chunk-abort results, in both
+overlap and ordinary modes, with page sizes 128/256 and JIT/AOT runner pools.
+The worker result and stream output are substituted; these are host lifecycle
+tests, not a complete scheduler event loop or TPU numerical verification.
+
+After this correction, the complete runtime test module passed 119 cases:
+eight real-copy snapshot cases, 56 result-processing lifecycle cases, and
+55 existing runner/config/transport/precompile checks. Both C lifecycle
+functions match the pinned epic reference's AST exactly; the chunk-cache
+implementation differs only in documentation and a return annotation.
+
 An AST comparison covered 57 tracked modules: the unified backend, DSV4
 attention/execution/metadata/compressor/indexer, DSA and HCA kernels, mHC,
 M's model graph, config, E's MoE/loader, C's physical pools/allocator, and

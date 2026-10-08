@@ -3441,12 +3441,12 @@ class ScheduleBatch:
             new_info = ScheduleReqsInfo()
             new_info.reqs = list(info.reqs) if info.reqs else info.reqs
             new_info.out_cache_loc = info.out_cache_loc
-            # Output collection must use the submitted positions, even when
-            # overlap scheduling advances the live request's next batch.
+            # V4 SWA reclamation and hidden-state collection both need the
+            # completed forward's lengths, not the next batch's live lengths.
+            new_info.seq_lens = (
+                np.array(info.seq_lens, copy=True) if info.seq_lens is not None else None
+            )
             if self.return_hidden_states:
-                new_info.seq_lens = (
-                    np.array(info.seq_lens, copy=True) if info.seq_lens is not None else None
-                )
                 new_info.prefix_lens = (
                     list(info.prefix_lens) if info.prefix_lens is not None else None
                 )
