@@ -29,6 +29,7 @@ from jax.sharding import NamedSharding, PartitionSpec
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.configs.model_config import need_attention_mask
+from sgl_jax.srt.layers.ngram_table import get_ngram_table
 from sgl_jax.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     get_global_expert_location_metadata,
@@ -472,6 +473,8 @@ class ForwardBatch:
         ple_embeddings = batch.ple_embeddings
         text_config = getattr(getattr(model_runner, "model_config", None), "hf_text_config", None)
         if ple_embeddings is None and getattr(text_config, "ple_layer_ids", None):
+            if get_ngram_table() is None:
+                raise RuntimeError("Model has N-gram PLE layers but no N-gram table is installed.")
             # Precompile batches skip _merge_ngram_ple; zeros keep the served treedef.
             ple_embeddings = np.zeros(
                 (len(batch.input_ids), int(text_config.ple_embed_dim)), jnp.bfloat16
