@@ -419,6 +419,58 @@ def test_sample_enqueues_before_barrier_and_next_round_waits():
     assert calls[-1] == "barrier"
 
 
+@pytest.mark.parametrize("parked_dp", [0, 1, None])
+def test_idle_checks_wait_for_parked_chunk_admission(parked_dp):
+    scheduler = object.__new__(Scheduler)
+    scheduler._comm_backend = None
+    received = 0
+
+    def receive():
+        nonlocal received
+        if received == 2:
+            raise StopIteration
+        received += 1
+        return []
+
+    scheduler.recv_requests = receive
+    scheduler.select_dp_for_request = lambda reqs: reqs
+    scheduler.process_input_requests = lambda reqs: None
+    scheduler._engine_paused = False
+    # Admission backpressure leaves a chunk owned but no runnable batch.
+    scheduler.get_next_batch_to_run = lambda: None
+    scheduler._pending_h2d = []
+    scheduler.enable_overlap = True
+    scheduler.last_batch = None
+    scheduler.running_batch = None
+    scheduler.waiting_queue = []
+    scheduler.grammar_queue = []
+    scheduler.pending_dp_reqs = []
+    scheduler.chunked_reqs = [None, None]
+    if parked_dp is not None:
+        scheduler.chunked_reqs[parked_dp] = SimpleNamespace(req_pool_idx=0)
+    scheduler.disagg_prefill_queue = None
+    scheduler.disagg_prealloc_queue = None
+    scheduler.disagg_transfer_queue = None
+    scheduler._pd_pending_bootstrap = []
+    scheduler.init_new_token_ratio = 0.5
+    scheduler.new_token_ratio = 0.25
+    checks = []
+
+    def check_memory():
+        assert parked_dp is None, "Parked chunk still owns its KV and request slot"
+        checks.append("memory")
+
+    scheduler.check_memory = check_memory
+    scheduler.check_tree_cache = lambda: checks.append("tree")
+    with pytest.raises(StopIteration):
+        scheduler._event_loop_overlap_v2()
+
+    assert checks == (["memory", "tree"] * 2 if parked_dp is None else [])
+    assert scheduler.new_token_ratio == (0.5 if parked_dp is None else 0.25)
+    if parked_dp is not None:
+        assert scheduler.chunked_reqs[parked_dp].req_pool_idx == 0
+
+
 def _make_logits_output():
     return LogitsProcessorOutput(
         next_token_logits=jnp.zeros((4, 8), dtype=jnp.float32),
