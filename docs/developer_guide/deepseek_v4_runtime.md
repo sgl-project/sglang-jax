@@ -141,6 +141,13 @@ missing or incompatible executable without compiling it.
 
 ## Local validation and pending TPU gate
 
+The [2026-10-08 interface audit](deepseek_v4_runtime_audit.md) records the
+systematic reference comparison, config/layout checks and the production
+Flash-geometry CPU tracing gate. That gate exercises both page sizes,
+SWA/CSA/HCA adapters, static-FP8 model projections, row-local 8K prefill and
+mHC dispatch without loading the full checkpoint. New Falcon submissions
+remain subject to user confirmation after local checks and candidate review.
+
 `test/srt/test_deepseek_v4_runtime.py` exercises a real three-layer
 SWA/CSA/HCA ModelRunner, with dummy weights and CPU reference kernels. It
 covers JIT/parallel warmup, AOT dispatch/serial warmup, pages 128/256, chunked

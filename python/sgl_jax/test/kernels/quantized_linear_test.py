@@ -49,6 +49,37 @@ def _make_linear_test_inputs():
     return x, w_fp, compute_dtype
 
 
+@pytest.mark.parametrize("quantize_activation", [False, True])
+def test_replicated_quantized_projection_preserves_sequence_parallel_rows(quantize_activation):
+    if len(jax.devices()) < 2:
+        pytest.skip("requires two logical devices")
+    mesh = Mesh(
+        np.asarray(jax.devices()[:2]).reshape(1, 2),
+        ("data", "tensor"),
+        axis_types=(AxisType.Explicit,) * 2,
+    )
+    rng = np.random.default_rng(7)
+    x = rng.standard_normal((16, 128)).astype(jnp.bfloat16)
+    with jax.set_mesh(mesh):
+        linear = QuantizedLinear(
+            weight_q=jnp.asarray(rng.standard_normal((128, 128)), jnp.float8_e4m3fn),
+            weight_scale=jnp.ones((128,), jnp.float32),
+            bias=None,
+            activation_dtype=jnp.float8_e4m3fn if quantize_activation else None,
+            mesh=mesh,
+            kernel_axes=(None, None),
+            params_dtype=jnp.bfloat16,
+        )
+        replicated, _ = linear(jax.device_put(x, NamedSharding(mesh, P("data", None))))
+        local, _ = linear(
+            jax.device_put(x, NamedSharding(mesh, P("tensor", None))),
+            out_sharding=NamedSharding(mesh, P("tensor", None)),
+        )
+    assert local.shape == replicated.shape
+    assert local.sharding.spec == P("tensor", None)
+    np.testing.assert_array_equal(np.asarray(local), np.asarray(replicated))
+
+
 def _quantize_linear_weight(weight, weight_dtype, scale_format):
     weight_f32 = weight.astype(jnp.float32)
 

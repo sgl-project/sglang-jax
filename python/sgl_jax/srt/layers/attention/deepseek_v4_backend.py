@@ -211,13 +211,15 @@ class DeepseekV4AttentionBackend(AttentionBackend, DeepseekV4HCABackendMixin):
         self.max_context_len = max_context_len
         self.request_capacity = 1
         self.window_size = int(getattr(config, "sliding_window", 128))
+        # H's shared execution adapter takes this model dimension explicitly.
+        self.compressor_hidden_size = int(getattr(config, "hidden_size", 4096))
         # This selects a shape-specialized TPU implementation, not a different
         # attention algorithm. The general ratio-128 path uses all visible C128
         # records without an indexer, and remains reachable for other geometries.
         from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 
         self.use_pallas_hca = is_tpu_runtime(mesh) and (
-            getattr(config, "hidden_size", 4096),
+            self.compressor_hidden_size,
             getattr(config, "num_attention_heads", 64),
             getattr(config, "head_dim", 512),
             getattr(config, "qk_rope_head_dim", 64),
@@ -492,6 +494,9 @@ class DeepseekV4AttentionBackend(AttentionBackend, DeepseekV4HCABackendMixin):
             if compressor is None:
                 raise ValueError("HCA requires model compressor weights")
             cache = compressor.cos_sin_cache
+            # M may pad cache lanes to 128 for TPU layout. The logical rotary
+            # width, rather than that storage width, separates cos from sin.
+            half_rope = rope_head_dim // 2
             output, (state, window, history) = self._forward_hca(
                 q,
                 k,
@@ -508,14 +513,15 @@ class DeepseekV4AttentionBackend(AttentionBackend, DeepseekV4HCABackendMixin):
                 cos=(
                     compressor.cos_table
                     if getattr(compressor, "cos_table", None) is not None
-                    else cache[:, : cache.shape[-1] // 2]
+                    else cache[:, :half_rope]
                 ),
                 sin=(
                     compressor.sin_table
                     if getattr(compressor, "sin_table", None) is not None
-                    else cache[:, cache.shape[-1] // 2 :]
+                    else cache[:, half_rope:rope_head_dim]
                 ),
                 attention_sink=attention_sink,
+                norm_eps=norm_eps,
                 fused_weight=getattr(compressor, "fused", None),
                 metadata=self.forward_metadata.hca_metadata(self.mesh),
             )

@@ -10,6 +10,7 @@ import pytest
 from jax.sharding import Mesh
 
 from sgl_jax.srt.kernels.hca.tuned_block_sizes import get_hca_kernel_schedule
+from sgl_jax.srt.layers.attention import hca_execution
 from sgl_jax.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttentionBackend
 from sgl_jax.srt.layers.attention.dsv4.execution import CompressorWeights, IndexerInputs
 from sgl_jax.srt.mem_cache.deepseek_v4.allocator import DeepseekV4TokenToKVPoolAllocator
@@ -47,14 +48,14 @@ def append(req_pool, allocator, slot, start, end, rank=0):
     return locations
 
 
-def batch(req_pool, slot, start, end, *, mode=ForwardMode.EXTEND, padding=2):
+def batch(req_pool, slot, start, end, *, mode=ForwardMode.EXTEND, padding=2, page_size=128):
     n = end - start
     return SimpleNamespace(
         forward_mode=mode,
         seq_lens=np.array([end, 0], np.int32),
         req_pool_indices=np.array([slot, req_pool.size], np.int32),
         positions=np.r_[np.arange(start, end), np.zeros(padding)].astype(np.int32),
-        cache_loc=np.zeros(((end + 127) // 128 * 128,), np.int32),
+        cache_loc=np.zeros(((end + page_size - 1) // page_size * page_size,), np.int32),
         out_cache_loc=np.r_[req_pool.req_to_token[slot, start:end], np.full(padding, -1)].astype(
             np.int32
         ),
@@ -297,3 +298,96 @@ def test_pack_pool_updates_rejects_a_family_on_the_wrong_layer():
     backend, _, _, kv, state = resources()
     with pytest.raises(ValueError, match="no 'compressed' resource"):
         backend.pack_pool_updates({0: {"compressed": kv.get_compressed_buffer(1)}}, kv, state)
+
+
+@pytest.mark.parametrize("page_size", [128, 256])
+@pytest.mark.parametrize(
+    "start,end,mode",
+    [(0, 128, ForwardMode.EXTEND), (128, 130, ForwardMode.EXTEND), (129, 130, ForwardMode.DECODE)],
+)
+def test_unified_hca_reaches_shared_execution_with_flash_geometry(
+    monkeypatch, page_size, start, end, mode
+):
+    """Use real C pools, metadata and H execution; substitute only TPU hca_step."""
+    tp = min(8, len(jax.devices()))
+    mesh = Mesh(
+        np.asarray(jax.devices()[:tp]).reshape(1, tp),
+        ("data", "tensor"),
+        axis_types=(jax.sharding.AxisType.Explicit,) * 2,
+    )
+    spec = DeepseekV4CacheSpec((0, 4, 128), head_dim=512, index_head_dim=128)
+    backend = DeepseekV4AttentionBackend(
+        mesh=mesh,
+        page_size=page_size,
+        max_context_len=256,
+        config=SimpleNamespace(hidden_size=4096, num_attention_heads=64, head_dim=512),
+    )
+    backend.use_pallas_hca = True
+    req = ReqToTokenPool(2, 256)
+    with jax.set_mesh(mesh):
+        kv = DeepseekV4TokenToKVPool(4 * page_size, 4 * page_size, page_size, spec, mesh)
+        state = DeepseekV4CompressStatePool(2, spec, mesh)
+    allocator = DeepseekV4TokenToKVPoolAllocator(kv)
+    backend.bind_resources(req, allocator)
+    append(req, allocator, 0, 0, end)
+    b = batch(req, 0, start, end, mode=mode, padding=0, page_size=page_size)
+    monkeypatch.setattr(
+        "sgl_jax.srt.layers.attention.dsv4.hca.get_hca_kernel_schedule",
+        lambda _, **kw: get_hca_kernel_schedule("TPU7x", **kw),
+    )
+    backend.forward_metadata = backend.get_forward_metadata(
+        b, request_pool=req, allocator=allocator
+    )
+    monkeypatch.setattr(hca_execution, "is_tpu_runtime", lambda: True)
+    called = []
+
+    def step(x, q, new_kv, state, window, compressed, *weights, **options):
+        assert x.shape[1] == 4096 and q.shape[1:] == (64 // tp, 512)
+        # The inactive second request makes this prefill ragged.
+        assert options["mode"] == ("decode" if mode == ForwardMode.DECODE else "ragged")
+        assert options["norm_eps"] == 3e-5
+        assert options["page_size"] == page_size
+        assert weights[4].shape == weights[5].shape == (256, 32)
+        called.append(True)
+        return q + weights[4][0, 0] + weights[5][0, 0], state, window, compressed
+
+    monkeypatch.setattr(hca_execution, "hca_step", step)
+    tokens = end - start
+
+    def put(value, *axes):
+        return jax.device_put(
+            value, jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(*axes))
+        )
+
+    q = put(np.zeros((tokens, 64, 512), np.float32).astype(jnp.bfloat16), "data", "tensor", None)
+    new_kv = put(np.zeros((tokens, 512), np.float32).astype(jnp.bfloat16), "data", None)
+    b.positions = put(b.positions, "data")
+    compressor = CompressorWeights(
+        jnp.zeros((512, 4096), jnp.bfloat16),
+        jnp.zeros((512, 4096), jnp.bfloat16),
+        jnp.zeros((128, 512), jnp.float32),
+        jnp.ones(512, jnp.float32),
+        jnp.tile(jnp.r_[jnp.full(32, 2.0), jnp.full(32, 3.0), jnp.full(64, 9.0)], (256, 1)),
+    )
+    with jax.set_mesh(mesh):
+        output, updates = backend(
+            q,
+            new_kv,
+            new_kv,
+            SimpleNamespace(layer_id=2, scaling=512**-0.5),
+            b,
+            kv,
+            compressor_state_pool=state,
+            compressor_input=put(
+                np.zeros((tokens, 4096), np.float32).astype(jnp.bfloat16), "data", None
+            ),
+            compressor=compressor,
+            attention_sink=put(np.zeros(64, np.float32), "tensor"),
+            norm_eps=3e-5,
+        )
+    assert called and output.shape == q.shape
+    np.testing.assert_array_equal(np.asarray(output), np.full(q.shape, 5.0))
+    assert set(updates) == {"state", "swa", "compressed"}
+    assert updates["state"].shape == state.get_buffer("c128", 2).shape
+    assert updates["swa"].shape == kv.get_swa_buffer(2).shape
+    assert updates["compressed"].shape == kv.get_compressed_buffer(2).shape

@@ -489,7 +489,17 @@ class QuantizedLinear(nnx.Module):
         # as q_b_proj. Explicitly reshard the scale to its expected spec — a no-op
         # when it is already correctly sharded.
         scale_val = jax.sharding.reshard(scale_val, NamedSharding(self.mesh, w_scale_spec))
-        in_specs = (P("data", input_axis), P(output_axis, input_axis), w_scale_spec)
+        # Preserve row sharding for local low-rank projections with replicated
+        # weights (DSV4_LOWRANK_AG), as in epic/dsv4 ce1ebb6375. The contraction
+        # axis cannot also partition rows.
+        act_rows = "data"
+        try:
+            x_spec = jax.typeof(x_2d).sharding.spec
+            if len(x_spec) > 0 and x_spec[0] is not None and x_spec[0] != input_axis:
+                act_rows = x_spec[0]
+        except Exception:  # Non-explicit meshes do not carry sharding in types.
+            pass
+        in_specs = (P(act_rows, input_axis), P(output_axis, input_axis), w_scale_spec)
 
         target = out_sharding or NamedSharding(self.mesh, P("data", output_axis))
         output_partition_dim = _shard_map_output_partition_dim(target, input_axis)
