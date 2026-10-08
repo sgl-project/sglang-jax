@@ -61,13 +61,15 @@ def _write_checkpoint(directory, params, *, corrupt=None, drop_buffer=False):
 
     # Shard the padded height, as the exporter does.
     padded = ((params.total_vocab_size + 127) // 128) * 128
-    placements = shard_placements(padded, SPLIT_PARTS)
+    # Derive the exporter layout independently of shard_placements().
+    shard_rows = padded // SPLIT_PARTS
     weight_files = {}
-    for p in placements:
-        rows = (np.arange(p.start, p.start + p.rows) % 65535).astype(np.uint16)
+    for index in range(SPLIT_PARTS):
+        start = index * shard_rows
+        rows = (np.arange(start, start + shard_rows) % 65535).astype(np.uint16)
         tensor = np.repeat(rows[:, None], DIM, axis=1)
-        name = f"{PREFIX}.ngram_embedding.shard_{p.index}.weight"
-        path = Path(directory) / f"shard_{p.index}.safetensors"
+        name = f"{PREFIX}.ngram_embedding.shard_{index}.weight"
+        path = Path(directory) / f"shard_{index}.safetensors"
         save_file({name: tensor}, str(path))
         weight_files[name] = str(path)
 
@@ -117,10 +119,17 @@ class TestLoadAndGather(CustomTestCase):
                 self.assertEqual(table.write_to(stream), table.padded_rows * DIM * 2)
                 stream.seek(0)
                 streamed = NGramTable.from_metadata(table.metadata())
-                streamed.read_into(stream)
-                ids = np.random.default_rng(0).integers(
-                    0, table.rows, size=(6, HEADS), dtype=np.int32
-                )
+                # Legal short reads must be retried until the table is full.
+                with patch.object(
+                    stream,
+                    "read",
+                    side_effect=lambda size, stream=stream: io.BytesIO.read(stream, min(size, 37)),
+                ):
+                    streamed.read_into(stream)
+                shard_rows = table.padded_rows // SPLIT_PARTS
+                boundaries = np.arange(1, SPLIT_PARTS) * shard_rows
+                ids = np.r_[0, table.rows - 1, boundaries - 1, boundaries].astype(np.int32)
+                ids = ids.reshape(-1, HEADS)
                 want = np.repeat((ids % 65535).astype(np.uint16)[:, :, None], DIM, axis=2)
                 for candidate in (table, restored, streamed):
                     for field in ("multipliers", "sizes", "offsets"):
@@ -129,7 +138,9 @@ class TestLoadAndGather(CustomTestCase):
                         )
                     got = candidate.gather(ids)
                     self.assertEqual(got.dtype, ml_dtypes.bfloat16)
-                    np.testing.assert_array_equal(got.view(np.uint16).reshape(6, HEADS, DIM), want)
+                    np.testing.assert_array_equal(
+                        got.view(np.uint16).reshape(*ids.shape, DIM), want
+                    )
 
     def test_gather_shapes_dtypes_and_output_reuse(self):
         for dim in (7, 64, 257):
@@ -164,12 +175,9 @@ class TestLoadAndGather(CustomTestCase):
             ids = rng.integers(0, table.rows, size=(4096, HEADS)).astype(np.int32)
             self.assertGreater(mod._thread_count(ids.size), 1)
             threaded = table.gather(ids).view(np.uint16).copy()
-            saved, mod._ROWS_PER_THREAD = mod._ROWS_PER_THREAD, 1 << 40
-            try:
+            with patch.object(mod, "_ROWS_PER_THREAD", 1 << 40):
                 self.assertEqual(mod._thread_count(ids.size), 1)
                 single = table.gather(ids).view(np.uint16).copy()
-            finally:
-                mod._ROWS_PER_THREAD = saved
             np.testing.assert_array_equal(threaded, single)
 
     def test_checkpoint_and_cache_validation(self):
@@ -186,7 +194,8 @@ class TestLoadAndGather(CustomTestCase):
                 )
                 if bad == "missing_shard":
                     del files[f"{PREFIX}.ngram_embedding.shard_3.weight"]
-                with self.assertRaises((KeyError, ValueError)):
+                error = KeyError if bad == "missing_shard" else ValueError
+                with self.assertRaises(error):
                     NGramTable.from_safetensors(files, _Config())
         for bad in ("truncated_cache", "short_stream", "version"):
             with self.subTest(bad=bad), tempfile.TemporaryDirectory() as directory:

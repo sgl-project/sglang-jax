@@ -303,6 +303,35 @@ class TestNGramEmbeddingLayer(CustomTestCase):
                     )
                 np.testing.assert_array_equal(np.asarray(state)[[0, 2, 4]], pool[[0, 2, 4]])
 
+    def test_track_slot_gets_boundary_state(self):
+        """--enable-recurrent-extra-buffer: a prefix hit clones the track slot
+        into the running slot, so it must hold the boundary state."""
+        mesh, rng = _make_mesh(), np.random.default_rng(SEED)
+        layer, _ = _make_layer(mesh, rng)
+        pool = _put(
+            rng.standard_normal((5, HYPER_SIZE, CONV_STATE_LEN)).astype(np.float32),
+            mesh,
+            P("data", "tensor", None),
+        )
+        idx = _put(np.array([1, 3, 0], np.int32), mesh, P("data"))
+        init = _put(np.array([True, True, False]), mesh, P("data"))
+        track = _put(np.array([2, 4, 0], np.int32), mesh, P("data"))
+        mask = _put(np.array([True, False, True]), mesh, P("data"))
+        cu = _put(np.array([0, 2, 7, 8], np.int32), mesh, P("data"))
+        for tokens, run in (
+            (8, lambda h, e, *t: layer.forward_extend(h, e, pool, idx, cu, init, *t)),
+            (3, lambda h, e, *t: layer.forward_decode(h, e, pool, idx, init, *t)),
+        ):
+            hyper = jnp.asarray(rng.standard_normal((tokens, HYPER_SIZE)).astype(np.float32))
+            emb = jnp.asarray(rng.standard_normal((tokens, PLE_EMBED_DIM)).astype(np.float32))
+            with jax.set_mesh(mesh):
+                out, state = run(hyper, emb)
+                out_t, state_t = run(hyper, emb, track, mask)
+            state, state_t = np.asarray(state), np.asarray(state_t)
+            np.testing.assert_array_equal(np.asarray(out_t), np.asarray(out))
+            np.testing.assert_array_equal(state_t[2], state[1])  # boundary -> track slot
+            np.testing.assert_array_equal(state_t[[0, 1, 3, 4]], state[[0, 1, 3, 4]])
+
 
 @unittest.skipIf(len(jax.devices()) < 2, "tensor parallelism needs >= 2 devices")
 class TestNGramEmbeddingSharding(CustomTestCase):

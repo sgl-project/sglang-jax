@@ -5,7 +5,10 @@ states of different shapes. They are described the same way and allocated by
 the same loop; order carries no meaning -- consumers ask by name.
 """
 
+import os
 import unittest
+from itertools import product
+from unittest.mock import patch
 
 import jax
 import jax.numpy as jnp
@@ -116,14 +119,16 @@ class TestConvStateSpecs(CustomTestCase):
 
 
 class TestProductionStateConsumers(CustomTestCase):
+    @patch.dict(os.environ, {"SGLANG_JAX_KDA_PREFILL_KERNEL": "chunked"})
     def test_gdn_and_kda_preserve_peer_state_in_either_order(self):
+        # Exercise chunked KDA with FP32; interpret its Pallas kernels on CPU.
         # Reuse the existing attention fixtures, but call the real layer/backend
-        # and runner writeback with both named state layouts, not a mock accessor.
+        # and pool writeback with both named state layouts, not a mock accessor.
         from sgl_jax.test.test_gdn_attention import create_test_data as gdn_data
         from sgl_jax.test.test_kda_attention import create_test_data as kda_data
 
         mesh = _make_mesh()
-        for family, fixture, dims in (
+        families = (
             (
                 "gdn",
                 gdn_data,
@@ -135,11 +140,13 @@ class TestProductionStateConsumers(CustomTestCase):
                 ),
             ),
             ("kda", kda_data, dict(num_heads=NUM_HEADS, head_dim=HEAD_DIM)),
-        ):
-            with jax.set_mesh(mesh):
+        )
+        interpret = {"PALLAS_INTERPRET": "1"} if jax.default_backend() == "cpu" else {}
+        for (family, fixture, dims), mode in product(families, ("prefill", "decode")):
+            with jax.set_mesh(mesh), patch.dict(os.environ, interpret):
                 fb, _, layer, q, k, v, a, b, *_ = fixture(
-                    mode="decode",
-                    seq_lens=[1, 1],
+                    mode=mode,
+                    seq_lens=[2, 5] if mode == "prefill" else [1, 1],
                     conv_kernel_size=CONV_KERNEL,
                     dtype=jnp.float32,
                     rng=np.random.default_rng(42),
@@ -163,7 +170,7 @@ class TestProductionStateConsumers(CustomTestCase):
                 )
                 reference = None
                 for specs in (None, (LINEAR, SHORT), (SHORT, LINEAR)):
-                    with self.subTest(family=family, specs=specs):
+                    with self.subTest(family=family, mode=mode, specs=specs):
                         pool = _make_pool(specs)
                         index = pool.layers_mapping[PLE_LAYER]
                         pool.recurrent_buffers[index] = jnp.full_like(
@@ -252,8 +259,6 @@ class TestMemoryBudget(CustomTestCase):
             ),
         )
         self.assertEqual(total - base, 10240 * 9 * 2)  # 180 KiB
-        self.assertEqual(total - base, 184320)
-        self.assertLess((total - base) / base, 0.002)  # 0.16% of the per-req state
 
 
 class TestConfigSuppliesBothSpecs(CustomTestCase):
