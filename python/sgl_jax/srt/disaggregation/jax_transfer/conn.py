@@ -49,6 +49,7 @@ from sgl_jax.srt.disaggregation.common.metrics import (
     time_phase,
 )
 from sgl_jax.srt.disaggregation.common.zmq_notifier import ZmqPullNotifier
+from sgl_jax.srt.disaggregation.host_ip import format_host_port
 from sgl_jax.srt.disaggregation.jax_transfer.wrapper import JaxTransferWrapper
 from sgl_jax.srt.mem_cache.host_kv_pool import HostKVPool
 
@@ -260,7 +261,7 @@ class JaxTransferKVManager(CommonKVManager):
             specs = normalize_decode_specs(context.spec_factory())
             receiver.init(
                 PMetadata(
-                    remote_addr=f"{peer['host']}:{peer['transfer_port']}",
+                    remote_addr=format_host_port(peer["host"], peer["transfer_port"]),
                     uuid=context.transfer_id,
                     specs=specs,
                     p_side_channel_host=str(peer["host"]),

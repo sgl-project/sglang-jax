@@ -28,7 +28,7 @@ from sgl_jax.srt.disaggregation.bootstrap import (
     _Registry,
     check_prefill_compat,
 )
-from sgl_jax.srt.disaggregation.host_ip import resolve_host_ip
+from sgl_jax.srt.disaggregation.host_ip import format_host_port, resolve_host_ip
 from sgl_jax.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReqInput
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 
@@ -930,6 +930,21 @@ def test_resolved_bind_address_is_rejected(monkeypatch):
 
 def test_dns_name_passes_through():
     assert resolve_host_ip("pd-host-3.cluster.local") == "pd-host-3.cluster.local"
+
+
+@pytest.mark.parametrize(
+    ("host", "port", "expected"),
+    [
+        ("10.0.0.1", 31001, "10.0.0.1:31001"),
+        ("0.0.0.0", 0, "0.0.0.0:0"),
+        ("fb12:3456:789a:8002::4", 31001, "[fb12:3456:789a:8002::4]:31001"),
+        ("[fb12::4]", "31002", "[fb12::4]:31002"),
+        ("::", 0, "[::]:0"),
+        ("pd-host-3.cluster.local", 31001, "pd-host-3.cluster.local:31001"),
+    ],
+)
+def test_format_host_port_brackets_only_ipv6(host, port, expected):
+    assert format_host_port(host, port) == expected
 
 
 # ==================================================================

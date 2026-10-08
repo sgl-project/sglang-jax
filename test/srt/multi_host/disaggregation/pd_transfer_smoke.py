@@ -20,6 +20,9 @@ Run it on one host with two shells or on two different hosts/pods.
 from __future__ import annotations
 
 import argparse
+import faulthandler
+import ipaddress
+import logging
 import sys
 import time
 
@@ -33,6 +36,7 @@ from pd_transfer_matrix import (
     _arr_host_bytes,
     _connect,
     _device_sharding,
+    _host_port,
     _payload_numpy,
     _read_line,
     _replicated_sharding,
@@ -64,6 +68,10 @@ def _wait_for_terminal(handle, timeout_s: float) -> KVPoll:
         if state in (KVPoll.SUCCESS, KVPoll.FAILED):
             return state
         if time.perf_counter() > deadline:
+            # Show where each thread is (e.g. the pull worker blocked in the
+            # native connect()/pull()) before giving up.
+            print(f"[diag] {REQ_ID} stuck in {state.value}; thread stacks:", flush=True)
+            faulthandler.dump_traceback(all_threads=True)
             raise TimeoutError(f"{REQ_ID} stuck in {state.value}")
         time.sleep(0.001)
 
@@ -226,8 +234,13 @@ def _decode(args: argparse.Namespace) -> int:
     rx_buf = bytearray()
     handshake = _read_line(ctl, rx_buf)
     p_host, p_transfer_port, p_side_channel_port, p_use_d2h = handshake.split()
-    p_transfer_addr = f"{p_host}:{p_transfer_port}"
+    p_transfer_addr = _host_port(p_host, p_transfer_port)
     use_d2h = bool(int(p_use_d2h))
+    print(
+        f"[D] handshake: pulling from {p_transfer_addr} "
+        f"(use_d2h={use_d2h}, hybrid={args.hybrid}, local_devices={jax.local_device_count()})",
+        flush=True,
+    )
     bind_host = args.my_host or "0.0.0.0"
     wrapper = get_or_create_wrapper(bind_host, args.transfer_port)
     wrapper.start()
@@ -300,6 +313,22 @@ def _decode(args: argparse.Namespace) -> int:
         notifier.stop()
 
 
+def _warn_if_loopback(host: str) -> None:
+    """Flag loopback hosts, e.g. ``hostname -i`` resolving to ``127.0.1.1``."""
+
+    try:
+        addr = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return  # DNS name; assume routable
+    if addr.is_loopback:
+        print(
+            f"[warn] --my-host {host} is a loopback address; a peer on another "
+            "host cannot reach it. Pass a routable IP instead, e.g. "
+            "--my-host $(hostname -I | awk '{print $1}').",
+            flush=True,
+        )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--role", choices=["prefill", "decode"], required=True)
@@ -320,6 +349,8 @@ def main() -> int:
     ap.add_argument("--recurrent-head-dim", type=int, default=128)
     ap.add_argument("--conv-kernel-size", type=int, default=4)
     args = ap.parse_args()
+    logging.basicConfig(level=logging.INFO, format="[%(asctime)s %(name)s] %(message)s")
+    _warn_if_loopback(args.my_host)
     if args.role == "prefill":
         return _prefill(args)
     if not args.remote:
