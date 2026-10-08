@@ -8,7 +8,10 @@ import tiktoken
 from llguidance.tiktoken import lltokenizer_from_encoding
 
 from sgl_jax.srt.constrained.base_grammar_backend import INVALID_GRAMMAR_OBJ
-from sgl_jax.srt.constrained.llguidance_backend import GuidanceBackend
+from sgl_jax.srt.constrained.llguidance_backend import (
+    GuidanceBackend,
+    get_guidance_backend,
+)
 from sgl_jax.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sgl_jax.srt.managers.scheduler import Scheduler
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
@@ -200,6 +203,34 @@ class TestGrammarBackend(unittest.TestCase):
 
         self.assertFalse(cache_hit)
         self.assert_independent(future.result(timeout=10), template)
+
+
+class TestGetGuidanceBackend(unittest.TestCase):
+    def test_slow_tokenizer_wrapping_tiktoken_encoding(self):
+        # Mimics HF slow tokenizers built on tiktoken (e.g. Kimi-K2's remote-code
+        # TikTokenTokenizer), which keep the tiktoken.Encoding on `.model`.
+        class SlowTiktokenTokenizer:
+            eos_token_id = 256
+            model = tiktoken.Encoding(
+                name="slow-tiktoken-test",
+                pat_str=r".",
+                mergeable_ranks={bytes([i]): i for i in range(256)},
+                special_tokens={"[EOS]": 256},
+            )
+
+        backend = get_guidance_backend(SlowTiktokenTokenizer(), n_vocab=257, num_threads=1)
+        self.assertIsInstance(backend, GuidanceBackend)
+        self.addCleanup(backend.executor.shutdown, wait=True)
+        self.assertEqual(backend.llguidance_tokenizer.eos_token, 256)
+
+        grammar = backend.dispatch_json(
+            '{"type": "object", "properties": {"a": {"type": "integer"}}}'
+        )
+        self.assertIsNot(grammar, INVALID_GRAMMAR_OBJ)
+        for token in b'{"a": 1}':
+            grammar.accept_token(token)
+        grammar.accept_token(256)
+        self.assertTrue(grammar.finished)
 
 
 if __name__ == "__main__":

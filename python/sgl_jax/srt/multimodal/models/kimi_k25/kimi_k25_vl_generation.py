@@ -126,9 +126,6 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM, InModelMultimodalCo
             )
         )
         loader.load(weight_mappings)
-
-        for layer in self.model.layers:
-            layer.self_attn.post_load_weights()
         logger.info("Kimi K2.5 language model and vision tower weights loaded successfully!")
 
 
