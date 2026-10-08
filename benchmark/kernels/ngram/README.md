@@ -61,7 +61,6 @@ python $B/bench_ngram_hash_limb.py --tokens 8192 --batch 4
 python $B/bench_ngram_device.py [--hlo]
 python $B/bench_ngram_fused.py --mode extend --tokens 8192 --batch 4 --slots 1024 [--hlo]
 python $B/probe_pallas_i64.py [--x64]   # compares compiled results with NumPy
-python $B/probe_pallas_mod_cost.py
 python $B/probe_host_gather.py          # aborts the process on purpose
 python -m pytest -q $B/test_hash_limb.py
 ```

@@ -1,10 +1,5 @@
 """Can XLA:TPU gather rows from a host-resident table? No -- this proves it.
 
-The whole PLE design turns on this: the table is 95.4 GiB and v6e HBM is
-31.24 GiB, so the table lives in host RAM, so the gather is numpy, so the hash
-that feeds it is numpy too. If this ever starts working, the host round trip
-can go away and the hash should move to the device with it.
-
 WARNING: the third case aborts the process. A gather whose operand is in host
 memory fails an XLA CHECK, not a Python exception:
 

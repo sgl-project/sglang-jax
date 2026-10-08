@@ -4,7 +4,7 @@ Loads the host-side hash section out of both copies of ngram_embedding.py and
 execs it standalone, so what is measured is the shipped source, not a
 transcription of it. No jax/flax needed -- that section is pure numpy.
 
-    python benchmark/kernels/ngram/bench_ngram_hash.py [base-rev-or-path] [--ablation]
+    python benchmark/kernels/ngram/bench_ngram_hash.py <base-rev-or-path> [--ablation]
 """
 
 from __future__ import annotations
@@ -22,7 +22,6 @@ import numpy as np
 
 REPO = str(pathlib.Path(__file__).resolve().parents[3])
 REL = "python/sgl_jax/srt/layers/ngram_embedding.py"
-BASE_REV = "a1c7923"  # last commit before the fusion
 
 
 def _load(src: str, name: str):
@@ -38,7 +37,7 @@ def _load(src: str, name: str):
     return mod
 
 
-def load_versions(base_rev=BASE_REV):
+def load_versions(base_rev):
     """`base_rev` is a git rev, or a path to a copy of the file for checkouts
     that have no .git (the TPU VMs are rsync'd, not cloned)."""
     tree = pathlib.Path(REPO, REL).read_text()
@@ -185,7 +184,7 @@ def run_ablation(base, tree):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("base_rev", nargs="?", default=BASE_REV, help="git revision or source file")
+    parser.add_argument("base_rev", help="git revision or source file to compare against")
     parser.add_argument("--ablation", action="store_true", help="time the prefix-XOR intermediate")
     args = parser.parse_args()
     base, tree = load_versions(args.base_rev)
