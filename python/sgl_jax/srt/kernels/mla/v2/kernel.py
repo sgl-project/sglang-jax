@@ -1365,10 +1365,13 @@ def prepare_kv_inputs(kv: jax.Array):
         kv = jnp.pad(kv, ((0, pad), (0, 0)), constant_values=0)
 
     head_dim = align_rope_dim(actual_head_dim)
-    # Pad the head dim before the reshape: a 0-wide axis (NoPE) cannot be reshaped.
-    if head_dim > actual_head_dim:
-        kv = jnp.pad(kv, ((0, 0), (0, head_dim - actual_head_dim)), constant_values=0)
-    kv = kv.reshape(-1, kv_packing, head_dim)
+    if actual_head_dim == 0:
+        # NoPE: a 0-wide axis cannot be reshaped, so pad first.
+        kv = jnp.pad(kv, ((0, 0), (0, head_dim)), constant_values=0)
+        return kv.reshape(-1, kv_packing, head_dim)
+    kv = kv.reshape(-1, kv_packing, actual_head_dim)
+    if head_dim != actual_head_dim:
+        kv = jnp.pad(kv, ((0, 0), (0, 0), (0, head_dim - actual_head_dim)), constant_values=0)
     return kv
 
 
