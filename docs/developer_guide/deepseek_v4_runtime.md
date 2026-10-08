@@ -34,6 +34,14 @@ The checkpoint format and validation remain M/E's responsibility; consult
 module contracts. The example is a launch configuration, not a measured
 performance result.
 
+Published static expert-FP8 weights use the shared `JaxShardReader` for
+bounded parallel reads and whole local-shard uploads. E supplies only M's
+validated per-layer inventory, preserves the concrete EP/TP mesh and expert
+placement, and reports locally read source keys. Static payload checks use
+the stored FP8/FP32 dtype, without expanding routed weights to FP32 or running
+incremental per-expert device updates. Original MXFP4 loading retains the
+bounded conversion path. Each static projection logs its loading time.
+
 ## Pool construction and update ownership
 
 `ModelRunner` selects `DeepseekV4AttentionBackend` independently of the
@@ -144,8 +152,24 @@ parameter loading completed. The service then failed in E's MoE loader:
 The loader now binds that partition spec to the layer's concrete device mesh
 when materializing gate, bias and shared-expert parameters. Eight additional
 CPU cases exercise this actual `nnx.eval_shape` serving boundary for both
-checkpoint formats, both routing modes and EP1/EP2. TPU revalidation of the
-fix is pending; the failed run reached no generation or acceptance workload.
+checkpoint formats, both routing modes and EP1/EP2. The failed run reached no
+generation or acceptance workload.
+
+The second approved run, `exp-7c1jq2jsyj`, tested `2d11e35f9` with the same
+hardware and checkpoint. M-owned loading completed in 120.9 seconds, but
+expert loading remained active until the 45-minute service-readiness limit.
+The runner reported `TimeoutError('server readiness exceeded 45 minutes')`
+and zero completed generation checks. No recurrence of the initial
+`AbstractMesh` error was observed before this timeout. This does not verify
+complete loading or serving correctness.
+
+Static expert loading now uses the shared parallel shard reader described
+above. Its CPU validation passes 34 loading cases and 97 related
+MoE/inventory/runtime/sharding cases, with 21 skips across those suites.
+It includes non-square projection transposes, combined EP/TP layouts,
+prototype materialization, physical expert mapping, invalid payload rejection,
+and a guard against rescanning or incremental static device assembly.
+TPU loading-time and serving revalidation of this optimization remain pending.
 
 No TPU acceptance row has been measured or posted. The six RFC rows (single-request decode, 8K and
 32K TTFT, cc64 and cc256 throughput/latency, GSM8K) remain pending on v7x

@@ -29,7 +29,8 @@ from sgl_jax.srt.layers.deepseek_v4_moe_loader import (
 )
 from sgl_jax.srt.model_loader.weights.source import LocalSource
 
-save_file = pytest.importorskip("safetensors.numpy").save_file
+_safetensors = pytest.importorskip("safetensors.numpy")
+save_file = _safetensors.save_file
 
 
 def test_nonaddressable_replicated_expert_map_uses_local_replica():
@@ -104,7 +105,15 @@ def _checkpoint(path, *, layer_id=0, hash_layer=True, distinct_experts=False):
     return _inventory(path)
 
 
-def _static_checkpoint(path, *, size=128, shared_scale_codes=None, routed_weight=None, layer_id=0):
+def _static_checkpoint(
+    path,
+    *,
+    size=128,
+    shared_scale_codes=None,
+    routed_weight=None,
+    layer_id=0,
+    intermediate_size=None,
+):
     prefix = f"layers.{layer_id}.ffn."
     values = {
         prefix + "gate.weight": np.ones((2, size), np.float32),
@@ -113,19 +122,25 @@ def _static_checkpoint(path, *, size=128, shared_scale_codes=None, routed_weight
         values[prefix + "gate.tid2eid"] = np.tile(np.asarray([[0], [1]], np.int32), (8, 1))
     else:
         values[prefix + "gate.bias"] = np.asarray([0.25, -0.25], np.float32)
-    if shared_scale_codes is None:
-        shared_scale_codes = np.full((size // 128, size // 128), 127, np.uint8)
-    for source in ("w1", "w3", "w2"):
+    intermediate_size = intermediate_size or size
+    for source, out_size, in_size in (
+        ("w1", intermediate_size, size),
+        ("w3", intermediate_size, size),
+        ("w2", size, intermediate_size),
+    ):
         stem = prefix + f"shared_experts.{source}"
-        values[stem + ".weight"] = np.full((size, size), 0.125, ml_dtypes.float8_e4m3fn)
-        values[stem + ".scale"] = np.asarray(shared_scale_codes, np.uint8).view(
-            ml_dtypes.float8_e8m0fnu
-        )
+        values[stem + ".weight"] = np.full((out_size, in_size), 0.125, ml_dtypes.float8_e4m3fn)
+        codes = shared_scale_codes
+        if codes is None:
+            codes = np.full((out_size // 128, in_size // 128), 127, np.uint8)
+        values[stem + ".scale"] = np.asarray(codes, np.uint8).view(ml_dtypes.float8_e8m0fnu)
         for expert_id in range(2):
             stem = prefix + f"experts.{expert_id}.{source}"
             expert_value = expert_id + 1 if routed_weight is None else routed_weight
-            values[stem + ".weight"] = np.full((size, size), expert_value, ml_dtypes.float8_e4m3fn)
-            values[stem + ".scale"] = np.ones((size,), np.float32)
+            values[stem + ".weight"] = np.full(
+                (out_size, in_size), expert_value, ml_dtypes.float8_e4m3fn
+            )
+            values[stem + ".scale"] = np.ones((out_size,), np.float32)
     save_file(values, str(path))
     return _inventory(path)
 
@@ -154,7 +169,14 @@ def _layer(layer_id=0, *, data=1, tensor=1, ep_size=1, abstract=False):
 
 
 def _static_layer(
-    *, ep_size=1, tensor=1, backend="reference", size=128, layer_id=0, abstract=False
+    *,
+    ep_size=1,
+    tensor=1,
+    backend="reference",
+    size=128,
+    layer_id=0,
+    abstract=False,
+    intermediate_size=None,
 ):
     if len(jax.devices()) < ep_size * tensor:
         pytest.skip("requires enough devices for expert parallel loading")
@@ -169,7 +191,7 @@ def _static_layer(
         n_routed_experts=2,
         num_experts_per_tok=1,
         n_shared_experts=1,
-        moe_intermediate_size=size,
+        moe_intermediate_size=intermediate_size or size,
         vocab_size=16,
         num_hash_layers=1,
         expert_dtype="fp4",
@@ -258,6 +280,10 @@ def test_static_expert_fp8_loads_directly_with_quantized_shared_expert(
         raise AssertionError("static loading must not convert MXFP4")
 
     monkeypatch.setattr(loader, "convert_mxfp4_pair_from_reader", no_online_conversion)
+    monkeypatch.setattr(loader, "_empty_shards", no_online_conversion)
+    # M already scanned the checkpoint. Static E loading must reuse that
+    # inventory and upload whole local shards, without incremental updates.
+    monkeypatch.setattr(loader.LocalSource, "_scan", no_online_conversion)
     report = layer.load_owned_weights(assigned, expert_format=STATIC_EXPERT_FORMAT)
     assert report.consumed_keys == expected_moe_keys(layer)
     assert report.local_payload_keys == report.consumed_keys
@@ -276,7 +302,7 @@ def test_static_expert_fp8_loads_directly_with_quantized_shared_expert(
         np.testing.assert_array_equal(np.asarray(linear.weight_scale.value), 1)
 
 
-@pytest.mark.parametrize("ep_size,tensor", [(1, 1), (2, 1), (1, 2)])
+@pytest.mark.parametrize("ep_size,tensor", [(1, 1), (2, 1), (1, 2), (2, 2)])
 def test_reference_static_expert_fp8_complete_moe_output(tmp_path, ep_size, tensor):
     layer = _static_layer(ep_size=ep_size, tensor=tensor)
     assigned = _static_checkpoint(tmp_path / "static.safetensors")
@@ -355,6 +381,42 @@ def test_static_expert_fp8_rejects_wrong_mode_and_metadata(tmp_path):
     ):
         with pytest.raises(ValueError):
             layer.load_owned_weights(broken, expert_format=STATIC_EXPERT_FORMAT)
+
+
+@pytest.mark.parametrize("tensor", [1, 2])
+def test_static_nonsquare_experts_keep_transpose_and_scales(tmp_path, tensor):
+    path = tmp_path / "nonsquare.safetensors"
+    _static_checkpoint(path, intermediate_size=256)
+    values = _safetensors.load_file(str(path))
+    for key, value in list(values.items()):
+        if ".experts." not in key:
+            continue
+        values[key] = (np.arange(value.size).reshape(value.shape) % 7 + 1).astype(value.dtype)
+    save_file(values, str(path))
+    layer = _static_layer(ep_size=2, tensor=tensor, intermediate_size=256, abstract=True)
+    layer.load_owned_weights(_inventory(path), expert_format=STATIC_EXPERT_FORMAT)
+    for source, target in (("w1", "wi_0"), ("w3", "wi_1"), ("w2", "wo")):
+        stems = [f"layers.0.ffn.experts.{i}.{source}" for i in range(2)]
+        expected = np.stack([values[stem + ".weight"].T for stem in stems])
+        np.testing.assert_array_equal(np.asarray(getattr(layer.experts, target).value), expected)
+        scale = np.stack([values[stem + ".scale"] for stem in stems])[:, None, None, :]
+        np.testing.assert_array_equal(
+            np.asarray(getattr(layer.experts, target + "_scale").value), scale
+        )
+
+
+@pytest.mark.parametrize("suffix,value", [("weight", np.nan), ("scale", np.nan), ("scale", 0)])
+def test_parallel_static_loading_rejects_invalid_payload(tmp_path, suffix, value):
+    path = tmp_path / "invalid.safetensors"
+    _static_checkpoint(path)
+    values = _safetensors.load_file(str(path))
+    key = f"layers.0.ffn.experts.1.w1.{suffix}"
+    values[key][:] = value
+    save_file(values, str(path))
+    with pytest.raises(ValueError, match=key):
+        _static_layer(ep_size=2).load_owned_weights(
+            _inventory(path), expert_format=STATIC_EXPERT_FORMAT
+        )
 
 
 @pytest.mark.parametrize("dispatch_algorithm", ["static", "dynamic"])

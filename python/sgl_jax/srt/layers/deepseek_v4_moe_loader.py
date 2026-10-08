@@ -1,11 +1,14 @@
 """E-owned DeepSeek V4 MoE checkpoint loading.
 
 M scans the checkpoint once and passes only this layer's assigned entries.
-The routed-expert device assembly follows the incremental epic/dsv4 loader.
+Published FP8 uses the shared parallel shard reader; original MXFP4 uses the
+bounded incremental conversion path from epic/dsv4.
 """
 
 from __future__ import annotations
 
+import logging
+import time
 from dataclasses import dataclass
 
 import jax
@@ -15,6 +18,9 @@ import numpy as np
 from jax.sharding import NamedSharding, SingleDeviceSharding
 
 from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
+from sgl_jax.srt.model_loader.weights.reader import JaxShardReader
+from sgl_jax.srt.model_loader.weights.source import LocalSource
+from sgl_jax.srt.model_loader.weights.specs import WeightSpec
 from sgl_jax.srt.utils.quantization.mxfp4_fp8_loader import (
     convert_mxfp4_pair_from_reader,
 )
@@ -23,6 +29,116 @@ _PROJECTIONS = (("w1", "wi_0"), ("w3", "wi_1"), ("w2", "wo"))
 _SHARED = (("w1", "gate_proj"), ("w3", "up_proj"), ("w2", "down_proj"))
 _ITEMSIZE = {"I8": 1, "I32": 4, "I64": 8, "F8_E4M3": 1, "F8_E8M0": 1, "F32": 4, "BF16": 2}
 STATIC_EXPERT_FORMAT = "sglang-jax-deepseek-v4-expert-fp8-per-channel-v1"
+logger = logging.getLogger(__name__)
+
+
+class _AssignedMoESource(LocalSource):
+    """Reuse shared reads with M's validated inventory, without another scan."""
+
+    prefers_bulk = True
+
+    def __init__(self, assigned):
+        super().__init__()
+        self.assigned = assigned
+        self.payload_keys = set()
+        self.range_keys = {
+            (entry["file"], entry["byte_offset"], entry["byte_size"]): key
+            for key, entries in assigned.items()
+            for entry in entries
+        }
+
+    @property
+    def metadata(self):
+        return self.assigned
+
+    def _validate_payload(self, name, value):
+        # Check FP8 in its stored dtype; do not expand full experts to FP32.
+        if not np.isfinite(value).all() or (name.endswith(".scale") and np.any(value <= 0)):
+            raise ValueError(f"{name}: invalid static FP8 weight or scale")
+
+    def read_tensor(self, filename, name, index):
+        if name not in self.assigned or self.assigned[name][0]["file"] != filename:
+            raise ValueError(f"{name}: read outside assigned MoE inventory")
+        value = super().read_tensor(filename, name, index)
+        self._validate_payload(name, value)
+        with self._lock:
+            self.payload_keys.add(name)
+        return value
+
+    def read_ranges(self, ranges):
+        keys = [self.range_keys[request] for request in ranges]
+        values = super().read_ranges(ranges)
+        for key, value in zip(keys, values):
+            dtype = (
+                ml_dtypes.float8_e4m3fn
+                if self.assigned[key][0]["dtype"] == "F8_E4M3"
+                else np.float32
+            )
+            self._validate_payload(key, value.view(dtype))
+        self.payload_keys.update(keys)
+        return values
+
+
+def _load_static_routed(layer, assigned, physical_to_logical):
+    """Load published FP8 through the shared, bounded parallel shard reader.
+
+    Startup validates inventory and checks values in their stored dtype. It
+    reads FP8 bytes directly, avoiding FP32 expansion and
+    tens of thousands of incremental device updates/host synchronizations.
+    """
+    mesh = layer.experts.moe_mesh
+    reader = JaxShardReader(mesh)
+    with _AssignedMoESource(assigned) as source:
+        for projection, target in _PROJECTIONS:
+            started = time.monotonic()
+            keys = tuple(
+                f"layers.{layer.layer_id}.ffn.experts.{i}.{projection}"
+                for i in range(layer.num_experts)
+            )
+            weight_param = getattr(layer.experts, target)
+            old = weight_param.value
+            sharding = NamedSharding(mesh, old.sharding.spec)
+            weight = reader.read(
+                source,
+                target,
+                WeightSpec(
+                    target_path=target,
+                    sources=tuple(key + ".weight" for key in keys),
+                    transpose=True,
+                    physical_to_logical_map=physical_to_logical,
+                ),
+                sharding,
+            )
+            scale_param = getattr(layer.experts, target + "_scale")
+            old_scale = scale_param.value
+            scale_sharding = NamedSharding(
+                mesh,
+                jax.sharding.PartitionSpec(old_scale.sharding.spec[0], old_scale.sharding.spec[-1]),
+            )
+            scale = reader.read(
+                source,
+                target + "_scale",
+                WeightSpec(
+                    target_path=target + "_scale",
+                    sources=tuple(key + ".scale" for key in keys),
+                    physical_to_logical_map=physical_to_logical,
+                ),
+                scale_sharding,
+            )
+            with jax.set_mesh(mesh):
+                scale = jax.sharding.reshard(
+                    scale.reshape(old_scale.shape), NamedSharding(mesh, old_scale.sharding.spec)
+                )
+            jax.block_until_ready((weight, scale))
+            weight_param.value = weight
+            scale_param.value = scale
+            logger.info(
+                "Loaded DeepSeek V4 layer %d static FP8 %s via shared shard reader in %.1fs",
+                layer.layer_id + 1,
+                projection,
+                time.monotonic() - started,
+            )
+        return source.payload_keys
 
 
 @dataclass(frozen=True)
@@ -282,6 +398,17 @@ def load_moe_weights(
             dequantized = weight.astype(np.float32) * block[: weight.shape[0], : weight.shape[1]]
             _assign(linear.weight, dequantized.T, stem + ".weight", mesh=layer.mesh)
 
+    if expert_format == STATIC_EXPERT_FORMAT:
+        local_payload_keys.update(_load_static_routed(layer, assigned, physical_to_logical))
+        return MoELoadReport(
+            consumed_keys=frozenset(expected),
+            local_payload_keys=frozenset(local_payload_keys),
+            converted_pairs=0,
+            max_conversion_error=0.0,
+            peak_host_bytes_calculated=0,
+            peak_memory_method="shared shard reader inflight target; no conversion allocation account",
+        )
+
     converted_pairs = 0
     max_error = 0.0
     peak_host_bytes = 0
@@ -301,39 +428,31 @@ def load_moe_weights(
                 continue
             stem = prefix + f"experts.{expert_id}.{source}"
             wk, sk = stem + ".weight", stem + ".scale"
-            if expert_format == STATIC_EXPERT_FORMAT:
-                weight = _read(assigned[wk][0], ml_dtypes.float8_e4m3fn)
-                scale = _read(assigned[sk][0], np.float32)
-                if not np.isfinite(np.asarray(weight, np.float32)).all() or (
-                    not np.isfinite(scale).all() or np.any(scale <= 0)
-                ):
-                    raise ValueError(f"{stem}: invalid static FP8 weight or scale")
-            else:
-                weight_entry, scale_entry = assigned[wk][0], assigned[sk][0]
-                with (
-                    open(weight_entry["file"], "rb") as weight_source,
-                    open(scale_entry["file"], "rb") as scale_source,
-                ):
-                    converted = convert_mxfp4_pair_from_reader(
-                        weight_name=wk,
-                        scale_name=sk,
-                        weight_shape=weight_entry["shape"],
-                        scale_shape=scale_entry["shape"],
-                        weight_dtype=weight_entry["dtype"],
-                        scale_dtype=scale_entry["dtype"],
-                        read_weight_rows=lambda rows, source=weight_source, entry=weight_entry: _read_rows(
-                            source, entry, rows
-                        ),
-                        read_scale_rows=lambda rows, source=scale_source, entry=scale_entry: _read_rows(
-                            source, entry, rows
-                        ),
-                        row_chunk_size=row_chunk_size,
-                        strict=True,
-                    )
-                weight, scale = converted.weight_fp8, converted.scale_fp32
-                converted_pairs += 1
-                max_error = max(max_error, converted.report.max_abs_error)
-                peak_host_bytes = max(peak_host_bytes, converted.report.calculated_peak_host_bytes)
+            weight_entry, scale_entry = assigned[wk][0], assigned[sk][0]
+            with (
+                open(weight_entry["file"], "rb") as weight_source,
+                open(scale_entry["file"], "rb") as scale_source,
+            ):
+                converted = convert_mxfp4_pair_from_reader(
+                    weight_name=wk,
+                    scale_name=sk,
+                    weight_shape=weight_entry["shape"],
+                    scale_shape=scale_entry["shape"],
+                    weight_dtype=weight_entry["dtype"],
+                    scale_dtype=scale_entry["dtype"],
+                    read_weight_rows=lambda rows, source=weight_source, entry=weight_entry: _read_rows(
+                        source, entry, rows
+                    ),
+                    read_scale_rows=lambda rows, source=scale_source, entry=scale_entry: _read_rows(
+                        source, entry, rows
+                    ),
+                    row_chunk_size=row_chunk_size,
+                    strict=True,
+                )
+            weight, scale = converted.weight_fp8, converted.scale_fp32
+            converted_pairs += 1
+            max_error = max(max_error, converted.report.max_abs_error)
+            peak_host_bytes = max(peak_host_bytes, converted.report.calculated_peak_host_bytes)
             local_payload_keys.update((wk, sk))
             for param, is_scale, _, shards in buffers:
                 value = scale[None, None, :] if is_scale else weight.T
