@@ -19,6 +19,7 @@ from sgl_jax.srt.utils.jax_utils import device_array
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
+    from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
     from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
     from sgl_jax.srt.model_executor.model_runner import ModelRunner
 
@@ -134,7 +135,7 @@ class LinearRecurrentAttnBackend(AttentionBackend):
         return obj
 
     @staticmethod
-    def get_layer_cache(recurrent_state_pool, layer_id: int):
+    def get_layer_cache(recurrent_state_pool: RecurrentStatePool, layer_id: int):
         """Returns (recurrent_cache, conv_cache) for the given layer."""
         return recurrent_state_pool.get_linear_recurrent_layer_cache(layer_id)
 
