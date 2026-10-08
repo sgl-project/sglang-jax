@@ -11,6 +11,8 @@ import os
 import jax
 import jax.numpy as jnp
 
+from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
+
 __all__ = [
     "INDEXER_BACKEND_ENV",
     "INVALID_ENTRY",
@@ -73,7 +75,7 @@ def resolve_indexer_backend(backend: str = "auto") -> str:
         if backend not in ("auto", "kernel", "reference"):
             raise ValueError(f"{INDEXER_BACKEND_ENV}={backend!r} must be auto, kernel or reference")
     if backend == "auto":
-        return "kernel" if jax.default_backend() == "tpu" else "reference"
+        return "kernel" if is_tpu_runtime() else "reference"
     return backend
 
 

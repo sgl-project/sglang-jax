@@ -127,6 +127,10 @@ def release_kv_cache(
     if req.req_pool_idx is None:
         return
 
+    if isinstance(tree_cache, DeepseekV4ChunkCache):
+        tree_cache.release_req(req)
+        return
+
     dp_rank = req.dp_rank if req.dp_rank is not None else 0
 
     tree_cache.cache_finished_req(req, is_insert=is_insert)

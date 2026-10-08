@@ -21,6 +21,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
+
 _NEG_INF = jnp.finfo(jnp.float32).min
 ROWS_ENV = "DSV4_CSA_DECODE_ATTN_ROWS"
 DEFAULT_ROWS = 4
@@ -101,7 +103,7 @@ def gathered_decode_attention(
     if attention_sink.shape != (heads,):
         raise ValueError("attention_sink must be [H]")
     if interpret is None:
-        interpret = jax.default_backend() != "tpu"
+        interpret = not is_tpu_runtime()
     rows = int(os.environ.get(ROWS_ENV, DEFAULT_ROWS)) if rows_per_step is None else rows_per_step
     rows = max(1, min(rows, tokens))
     padded = -(-tokens // rows) * rows

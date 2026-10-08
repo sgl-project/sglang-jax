@@ -324,6 +324,12 @@ suites = {
     # cpu-test CI job sets that env var.
     "unit-test-cpu": [
         TestFile(
+            "test/srt/test_deepseek_v4_runtime.py",
+            2,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "4"},
+        ),
+        TestFile(
             "python/sgl_jax/test/test_deepseek_v4_moe.py",
             1,
             runner="pytest",

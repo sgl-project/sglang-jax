@@ -20,6 +20,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from sgl_jax.srt.kernels.dsv4.wo_a_projection import LANE, _rotate_gptj, widen_cos_sin
+from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 
 # ``DSV4_TAIL_INKERNEL_MASK=1|2``: apply the window validity mask inside the tail
 # kernel (1) and additionally skip the row pad with a partial last block (2).
@@ -104,7 +105,7 @@ def compressor_tail_pallas(
 ):
     """``[N, W, 2*width]`` gathered window rows -> ``[N, head_dim]`` f32 records."""
     if interpret is None:
-        interpret = jax.default_backend() != "tpu"
+        interpret = not is_tpu_runtime()
     combined = jnp.asarray(combined, jnp.float32)
     n, window, two_width = combined.shape
     if two_width != 2 * width or width != coff * head_dim or head_dim % LANE:

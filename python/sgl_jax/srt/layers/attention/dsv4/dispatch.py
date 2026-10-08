@@ -54,7 +54,9 @@ _ROW_SHARD_AXIS = os.environ.get("DSV4_INDEXER_ROW_SHARD_AXIS", "tensor")
 
 def resolve_csa_attention_backend() -> str:
     """``DSV4_CSA_ATTENTION=auto|sparse|dense|fused`` (auto == dense; fused = Pallas flash kernel)."""
-    default = "fused" if jax.default_backend() == "tpu" else "dense"
+    from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
+
+    default = "fused" if is_tpu_runtime() else "dense"
     mode = os.environ.get("DSV4_CSA_ATTENTION", default).lower()
     if mode == "auto":
         # The gathered kernels only pay off when the per-block selection union is far

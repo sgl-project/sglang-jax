@@ -1658,8 +1658,18 @@ class Scheduler(
         if self.is_hybrid:
             # Per-rank invariant: available + evictable + protected == size_per_rank.
             # Checking per-rank avoids one rank's over-count masking another's leak.
-            full_size_per_rank = self.token_to_kv_pool_allocator.full_attn_allocator.size_per_rank
-            swa_size_per_rank = self.token_to_kv_pool_allocator.swa_attn_allocator.size_per_rank
+            from sgl_jax.srt.mem_cache.deepseek_v4.allocator import (
+                DeepseekV4TokenToKVPoolAllocator,
+            )
+
+            if isinstance(self.token_to_kv_pool_allocator, DeepseekV4TokenToKVPoolAllocator):
+                full_size_per_rank = self.token_to_kv_pool_allocator.size_per_rank
+                swa_size_per_rank = self.token_to_kv_pool_allocator.size_swa // self.dp_size
+            else:
+                full_size_per_rank = (
+                    self.token_to_kv_pool_allocator.full_attn_allocator.size_per_rank
+                )
+                swa_size_per_rank = self.token_to_kv_pool_allocator.swa_attn_allocator.size_per_rank
             is_unified = isinstance(self.tree_cache, UnifiedRadixCache)
             if is_unified:
                 # A paged allocation reserves a whole page even when the tree

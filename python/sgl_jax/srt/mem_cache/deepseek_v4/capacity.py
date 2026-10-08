@@ -104,7 +104,7 @@ def plan_deepseek_v4_pools(
 
 
 def build_deepseek_v4_pools(
-    spec, budget, page_size, mesh, max_context_len, dp_size=1, req_pool=None
+    spec, budget, page_size, mesh, max_context_len, dp_size=1, req_pool=None, *, abstract=False
 ):
     if req_pool is None:
         req_pool = ReqToTokenPool(budget.max_num_reqs, max_context_len)
@@ -117,8 +117,9 @@ def build_deepseek_v4_pools(
         spec,
         mesh,
         dp_size,
+        abstract=abstract,
     )
-    state = DeepseekV4CompressStatePool(budget.max_num_reqs, spec, mesh, dp_size)
+    state = DeepseekV4CompressStatePool(budget.max_num_reqs, spec, mesh, dp_size, abstract=abstract)
     pools = MemoryPools(token_to_kv_pool=kv, compressor_state_pool=state)
     allocator = DeepseekV4TokenToKVPoolAllocator(kv)
     if (kv.nbytes + state.nbytes) // dp_size != budget.allocated_bytes_per_device:

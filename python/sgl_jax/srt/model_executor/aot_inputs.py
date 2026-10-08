@@ -177,14 +177,18 @@ class AbstractModel:
                 self.mesh,
                 backend,
                 self.memory_pools,
+                request_pool=getattr(self.resources, "req_to_token_pool", None),
+                allocator=getattr(self.resources, "token_to_kv_pool_allocator", None),
+                v4_capacities=getattr(options, "v4_capacities", None),
                 supports_recurrent_cow=(
-                    self.memory_pools.recurrent_state_pool is not None
+                    getattr(self.memory_pools, "recurrent_state_pool", None) is not None
                     and getattr(server_args, "enable_unified_radix_tree", False)
                     and not server_args.disable_radix_cache
                 ),
             )
         )
-        backend.forward_metadata = inputs.attention_metadata
+        if inputs.batch.deepseek_v4_metadata is None:
+            backend.forward_metadata = inputs.attention_metadata
         args = (
             self.model_def,
             self.model_state_def,

@@ -184,10 +184,11 @@ class DeepseekV4RuntimeMetadata(DeepseekV4HCAMetadata):
 class _PrecompileContextBox:
     """Mutable holder that hashes by identity so its value stays out of jit cache keys."""
 
-    __slots__ = ("context_len",)
+    __slots__ = ("context_len", "capacities")
 
     def __init__(self):
         self.context_len: int | None = None
+        self.capacities: tuple[int, int, int] | None = None
 
 
 class DeepseekV4AttentionBackend(AttentionBackend, DeepseekV4HCABackendMixin):
@@ -213,7 +214,9 @@ class DeepseekV4AttentionBackend(AttentionBackend, DeepseekV4HCABackendMixin):
         # This selects a shape-specialized TPU implementation, not a different
         # attention algorithm. The general ratio-128 path uses all visible C128
         # records without an indexer, and remains reachable for other geometries.
-        self.use_pallas_hca = jax.default_backend() == "tpu" and (
+        from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
+
+        self.use_pallas_hca = is_tpu_runtime(mesh) and (
             getattr(config, "hidden_size", 4096),
             getattr(config, "num_attention_heads", 64),
             getattr(config, "head_dim", 512),
@@ -240,6 +243,16 @@ class DeepseekV4AttentionBackend(AttentionBackend, DeepseekV4HCABackendMixin):
     def precompile_context_len(self, value: int | None) -> None:
         self._precompile_box.context_len = value
 
+    @property
+    def precompile_capacity_override(self):
+        return self._precompile_box.capacities
+
+    @precompile_capacity_override.setter
+    def precompile_capacity_override(self, value):
+        # R can prepare total-history and per-request HCA buckets independently.
+        # This host-only override stays outside executable/nnx graph keys.
+        self._precompile_box.capacities = value
+
     @staticmethod
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
         # TpWorker combines this kernel metadata limit with the actual request
@@ -262,6 +275,8 @@ class DeepseekV4AttentionBackend(AttentionBackend, DeepseekV4HCABackendMixin):
         """
         if os.environ.get("DSV4_HCA_TILE_BUCKET", "1") != "1":
             return None
+        if self.precompile_capacity_override is not None:
+            return self.precompile_capacity_override[2]
         if self.precompile_context_len is not None:
             return precompile_capacities(self.precompile_context_len)[128]
         dp = int(self.mesh.shape["data"])
@@ -342,6 +357,11 @@ class DeepseekV4AttentionBackend(AttentionBackend, DeepseekV4HCABackendMixin):
             compressed_capacities.update(ladder)
             if decode_capacity is not None:
                 decode_capacity = ladder[4]
+        if self.precompile_capacity_override is not None:
+            c4, c128, _ = self.precompile_capacity_override
+            compressed_capacities.update({4: c4, 128: c128})
+            if decode_capacity is not None:
+                decode_capacity = c4
         for rank in range(dp):
             live = int(queries[rank].sum())
             mapping = allocator.full_to_swa_index_mapping

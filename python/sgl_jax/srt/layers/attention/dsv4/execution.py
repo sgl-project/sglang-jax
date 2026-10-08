@@ -146,7 +146,11 @@ def padded_read_tables(
             starts = np.arange(table_width, dtype=np.int64) * page_size  # [N]
             page_mask = starts[None, :] < counts[:, None] * page_size
             anchors = np.asarray(
-                request_pool.req_to_token[live_slots[:, None], starts[None, :]], np.int64
+                request_pool.req_to_token[
+                    live_slots[:, None],
+                    np.minimum(starts, request_pool.req_to_token.shape[1] - 1)[None, :],
+                ],
+                np.int64,
             )
             if np.any(page_mask & ((anchors < page_size) | (anchors % page_size != 0))):
                 raise ValueError("CSA compressed pages must start at allocated page boundaries")

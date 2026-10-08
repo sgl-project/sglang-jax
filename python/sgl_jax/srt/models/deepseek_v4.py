@@ -471,7 +471,7 @@ class DeepseekV4Compressor(nnx.Module):
         step: an f32->bf16 convert of ``wgate`` (8 MB prefetched through VMEM), a
         concatenation and a transpose.
         """
-        with jax.set_mesh(mesh):
+        with jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
             fused = jnp.concatenate(
                 (self.wkv.value.astype(jnp.bfloat16), self.wgate.value.astype(jnp.bfloat16)),
                 axis=0,
@@ -617,7 +617,7 @@ class DeepseekV4Attention(nnx.Module):
             use_fused_wo_a,
         )
 
-        with jax.set_mesh(self.mesh):
+        with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
             weights = group_wo_a(
                 _checkpoint_matrix(self.wo_a),
                 num_groups=self.num_groups,
@@ -1091,6 +1091,19 @@ class DeepseekV4ForCausalLM(nnx.Module):
                 mesh = self.mesh
                 if "experts" in path:
                     mesh = self.model.layers[int(path[2])].mlp.experts.moe_mesh
+                if getattr(model_config, "_abstract_mode", False):
+                    # DummyLoader traces post-load preparation during CPU AOT.
+                    # Expert parameters use their own mesh even while tracing.
+                    spec = (
+                        old.sharding.spec
+                        if isinstance(old, jax.ShapeDtypeStruct)
+                        else jax.typeof(old).sharding.spec
+                    )
+                    with jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
+                        variable.value = jnp.zeros(
+                            old.shape, old.dtype, out_sharding=NamedSharding(mesh, spec)
+                        )
+                    continue
                 sharding = NamedSharding(mesh, old.sharding.spec)
 
                 def initialize(index, shape=old.shape, dtype=old.dtype, seed=i):
@@ -1158,7 +1171,7 @@ class DeepseekV4ForCausalLM(nnx.Module):
                 if m_consumed | e_consumed != required:
                     raise ValueError("V4 required checkpoint tensor was not consumed")
         # eval_shape creates placeholders for these non-parameter tables too.
-        with jax.set_mesh(self.mesh):
+        with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
             self.model.rope_plain.value = _rope_cache(self.config, 0)
             self.model.rope_compressed.value = _rope_cache(self.config, 4)
             cos, sin = _split_rope_cache(

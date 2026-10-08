@@ -43,6 +43,7 @@ import jax
 import jax.numpy as jnp
 
 from sgl_jax.srt.configs.deepseek_v4 import mhc_param_shapes, mix_hc_width
+from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 
 __all__ = [
     "DeepseekV4MHC",
@@ -75,7 +76,7 @@ def resolve_backend(backend: str = "auto") -> str:
         raise ValueError(f"unknown mHC backend {backend!r}")
     if backend != "auto":
         return backend
-    return "pallas" if jax.default_backend() == "tpu" else "reference"
+    return "pallas" if is_tpu_runtime() else "reference"
 
 
 def _rms_scale(flat, norm_eps: float):

@@ -38,14 +38,20 @@ class DeepseekV4CompressStatePool:
     and [content | score] for C128.
     """
 
-    def __init__(self, size, spec, mesh, dp_size=1):
+    def __init__(self, size, spec, mesh, dp_size=1, *, abstract=False):
         if size <= 0 or dp_size <= 0 or mesh.shape.get("data") != dp_size:
             raise ValueError("state size must be positive and DP must match the mesh")
         self._configure(size, spec, mesh, dp_size)
         with jax.set_mesh(mesh):
             self.buffers = {
                 family: tuple(
-                    allocate_buffer(shape, jnp.float32, mesh).at[score_slice(shape)].set(-jnp.inf)
+                    (
+                        allocate_buffer(shape, jnp.float32, mesh, abstract=True)
+                        if abstract
+                        else allocate_buffer(shape, jnp.float32, mesh)
+                        .at[score_slice(shape)]
+                        .set(-jnp.inf)
+                    )
                     for _ in layers
                 )
                 for family, (layers, shape) in self.layout.items()

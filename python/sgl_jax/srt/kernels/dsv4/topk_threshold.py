@@ -26,6 +26,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
+
 _SIGN = 0x80000000  # Python int: kernels must not capture jax constants
 
 
@@ -67,7 +69,7 @@ def _kernel(skey_ref, out_ref, *, k):
 
 
 def _default_interpret() -> bool:
-    return os.environ.get("PALLAS_INTERPRET", "0") == "1" or jax.default_backend() == "cpu"
+    return os.environ.get("PALLAS_INTERPRET", "0") == "1" or not is_tpu_runtime()
 
 
 def topk_threshold(scores, k: int, *, block_rows: int | None = None, interpret: bool | None = None):

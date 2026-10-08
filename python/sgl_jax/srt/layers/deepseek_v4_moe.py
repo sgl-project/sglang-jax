@@ -141,10 +141,10 @@ class DeepseekV4MoE(nnx.Module):
         self.mesh = mesh
         if backend not in ("auto", "epmoe", "reference"):
             raise ValueError(f"unknown V4 MoE backend {backend!r}")
+        from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
+
         self.backend = (
-            ("epmoe" if jax.default_backend() == "tpu" else "reference")
-            if backend == "auto"
-            else backend
+            ("epmoe" if is_tpu_runtime(mesh) else "reference") if backend == "auto" else backend
         )
         self.layer_id = layer_id
         quant = getattr(config, "quantization_config", None)

@@ -2,12 +2,12 @@
 
 import os
 
-import jax
 import jax.numpy as jnp
 
 from sgl_jax.srt.kernels.csa_decode import paged_csa_decode_scores
 from sgl_jax.srt.kernels.dsa.streamindex_topk import select_topk_indices
 from sgl_jax.srt.kernels.dsv4.csa_decode_attention import gathered_decode_attention
+from sgl_jax.srt.utils.jax_utils import get_device_kind, is_tpu_runtime
 
 _NEG_INF = jnp.finfo(jnp.float32).min
 
@@ -31,7 +31,7 @@ def resolve_decode_indexer_backend(backend: str = "auto") -> str:
                 f"{DECODE_INDEXER_BACKEND_ENV}={backend!r} must be auto, kernel or p370"
             )
     if backend == "auto":
-        return "kernel" if jax.default_backend() == "tpu" else "p370"
+        return "kernel" if is_tpu_runtime() else "p370"
     return backend
 
 
@@ -65,7 +65,7 @@ def csa_decode_select_p370(
         page_size=compressed_page_size,
         segments=page_segments,
         segment_counts=page_segment_counts,
-        interpret=jax.default_backend() != "tpu",
+        interpret=not is_tpu_runtime(),
     )
     return select_decode_entries(scores, lengths, take=take, topk_backend=topk_backend)
 
@@ -169,7 +169,7 @@ def _short_kv_streaming_attention(
     window_kv = jnp.take(window_cache, rotated_rows, axis=0).astype(jnp.bfloat16)
     # Off-TPU (CPU interpret tests) there is no device kind to key the schedule
     # table; use the v7x row, which is what the interpret tests exercise.
-    device_kind = jax.devices()[0].device_kind if jax.default_backend() == "tpu" else "TPU7x"
+    device_kind = get_device_kind() if is_tpu_runtime() else "TPU7x"
     schedule = get_hca_kernel_schedule(
         device_kind,
         page_size=compressed_page_size,

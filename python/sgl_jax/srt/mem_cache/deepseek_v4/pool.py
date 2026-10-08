@@ -76,8 +76,10 @@ def native_hca_layout() -> bool:
     return os.environ.get("DSV4_HCA_NATIVE_LAYOUT", "1") != "0"
 
 
-def allocate_buffer(shape, dtype, mesh):
+def allocate_buffer(shape, dtype, mesh, *, abstract=False):
     sharding = NamedSharding(mesh, P("data", *([None] * (len(shape) - 1))))
+    if abstract:
+        return jax.ShapeDtypeStruct(shape, dtype, sharding=sharding)
     with jax.set_mesh(mesh):
         return jax.jit(partial(jnp.zeros, tuple(shape), dtype), out_shardings=sharding)()
 
@@ -141,7 +143,18 @@ class DeepseekV4TokenToKVPool(KVCache):
     Backends use the resource accessors and return functional buffer updates.
     """
 
-    def __init__(self, size, size_swa, page_size, spec, mesh, dp_size=1, dtype=jnp.bfloat16):
+    def __init__(
+        self,
+        size,
+        size_swa,
+        page_size,
+        spec,
+        mesh,
+        dp_size=1,
+        dtype=jnp.bfloat16,
+        *,
+        abstract=False,
+    ):
         if jnp.dtype(dtype) != jnp.dtype(jnp.bfloat16):
             raise ValueError("V4 initial KV cache requires BF16")
         if page_size not in (128, 256):
@@ -152,7 +165,9 @@ class DeepseekV4TokenToKVPool(KVCache):
             raise ValueError("V4 capacities must be positive page/DP aligned token counts")
         self._configure(size, size_swa, page_size, spec, mesh, dp_size)
         self.buffers = {
-            family: tuple(allocate_buffer(shape, self.dtype, mesh) for _ in layers)
+            family: tuple(
+                allocate_buffer(shape, self.dtype, mesh, abstract=abstract) for _ in layers
+            )
             for family, (layers, shape) in self.layout.items()
         }
 

@@ -457,32 +457,64 @@ class CompilationManager:
             patch_paddings=config.precompile_vision_patch_paddings,
         )
 
+    def iter_precompile_batches(self, model_runner, mode):
+        """Prepare exactly the metadata/shape variants serving can submit."""
+        from sgl_jax.srt.model_executor.deepseek_v4_runtime import (
+            precompile_capacity_variants,
+        )
+        from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+
+        backend = model_runner.attn_backend
+        from sgl_jax.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttentionBackend,
+        )
+
+        is_v4 = isinstance(backend, DeepseekV4AttentionBackend)
+        for bs, tokens, cache_loc, pages in dict.fromkeys(self.iter_model_shapes(mode)):
+            capacities = (
+                precompile_capacity_variants(
+                    backend,
+                    mode,
+                    bs,
+                    self.max_total_num_tokens,
+                )
+                if is_v4
+                else [None]
+            )
+            for capacity in capacities:
+                previous = backend.precompile_capacity_override if is_v4 else None
+                try:
+                    if is_v4:
+                        backend.precompile_capacity_override = capacity
+                    batch = self._make_dummy_batch(
+                        bs,
+                        tokens,
+                        mode,
+                        cache_loc,
+                        dp_size=self.dp_size,
+                        per_dp_bs_size=bs // self.dp_size,
+                        dummy_seq_len=self.decode_dummy_seq_len(pages),
+                    )
+                    prepare = getattr(model_runner, "prepare_dummy_batch", None)
+                    if prepare is not None:
+                        prepare(batch)
+                    batch.forward_batch = ForwardBatch.init_new(batch, model_runner)
+                finally:
+                    if is_v4:
+                        backend.precompile_capacity_override = previous
+                yield batch
+
     def _compile_model_buckets(self, model_runner, mode):
         """Compile independent shapes first; the existing forward loop warms them."""
         if self.precompile_num_threads == 1 or not model_runner.parallel_precompile:
             return
         import jax
 
-        from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
         from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 
         logger.info(
             "[%s] Compiling buckets with %d XLA workers", mode.name, self.precompile_num_threads
         )
-
-        def batches():
-            for bs, tokens, cache_loc, pages in dict.fromkeys(self.iter_model_shapes(mode)):
-                batch = self._make_dummy_batch(
-                    bs,
-                    tokens,
-                    mode,
-                    cache_loc,
-                    dp_size=self.dp_size,
-                    per_dp_bs_size=bs // self.dp_size,
-                    dummy_seq_len=self.decode_dummy_seq_len(pages),
-                )
-                batch.forward_batch = ForwardBatch.init_new(batch, model_runner)
-                yield batch
 
         def unique(values):
             # Keep concrete output layouts in the key and in helper inputs;
@@ -500,7 +532,7 @@ class CompilationManager:
                 compiled.out_info[0]
                 for _, _, compiled in pool.map(
                     model_runner.lower_model,
-                    batches(),
+                    self.iter_precompile_batches(model_runner, mode),
                     mesh=model_runner.mesh,
                     compiler_options=model_runner.model_compile_options,
                 )
@@ -553,30 +585,20 @@ class CompilationManager:
         )
 
         with tqdm(
-            self.iter_model_shapes(ForwardMode.EXTEND),
+            self.iter_precompile_batches(model_runner, ForwardMode.EXTEND),
             desc="[EXTEND] PRECOMPILE",
             leave=False,
-            total=len(self.token_buckets),
         ) as pbar:
-            for bs_val, num_tokens, cache_loc_size, _ in pbar:
+            for batch in pbar:
+                bs_val, num_tokens = len(batch.seq_lens), len(batch.input_ids)
                 pbar.set_postfix(bs=bs_val, tokens=num_tokens)
-                if bs_val > num_tokens:
-                    logger.warning("bs=%s > num_tokens=%s, skip this pair", bs_val, num_tokens)
-                    continue
-                batch = self._make_dummy_batch(
-                    bs_val,
-                    num_tokens,
-                    ForwardMode.EXTEND,
-                    cache_loc_size,
-                    dp_size=self.dp_size,
-                    per_dp_bs_size=bs_val // self.dp_size,
-                )
                 if prepare_lora_fn is not None:
                     prepare_lora_fn(batch)
                 sampling_metadata = SamplingMetadata.from_model_worker_batch(
                     batch, 0, mesh, self.vocab_size
                 )
-                batch.forward_batch = ForwardBatch.init_new(batch, model_runner)
+                if prepare_lora_fn is not None:
+                    batch.forward_batch = ForwardBatch.init_new(batch, model_runner)
                 if future_token_ids_map is not None:
                     from sgl_jax.srt.managers.utils import resolve_future_token_ids
 
@@ -618,25 +640,21 @@ class CompilationManager:
             self.decode_page_buckets,
         )
 
-        shapes = list(self.iter_model_shapes(ForwardMode.DECODE))
-        with tqdm(shapes, desc="[DECODE] PRECOMPILE", leave=False) as pbar:
-            for bs_val, num_tokens, aligned_cache_loc_size, pages in pbar:
-                pbar.set_postfix(bs=bs_val, pages=pages)
-                batch = self._make_dummy_batch(
-                    bs_val,
-                    num_tokens,
-                    ForwardMode.DECODE,
-                    aligned_cache_loc_size,
-                    dp_size=self.dp_size,
-                    per_dp_bs_size=bs_val // self.dp_size,
-                    dummy_seq_len=self.decode_dummy_seq_len(pages),
-                )
+        with tqdm(
+            self.iter_precompile_batches(model_runner, ForwardMode.DECODE),
+            desc="[DECODE] PRECOMPILE",
+            leave=False,
+        ) as pbar:
+            for batch in pbar:
+                bs_val = len(batch.seq_lens)
+                pbar.set_postfix(bs=bs_val)
                 if prepare_lora_fn is not None:
                     prepare_lora_fn(batch)
                 sampling_metadata = SamplingMetadata.from_model_worker_batch(
                     batch, 0, mesh, self.vocab_size
                 )
-                batch.forward_batch = ForwardBatch.init_new(batch, model_runner)
+                if prepare_lora_fn is not None:
+                    batch.forward_batch = ForwardBatch.init_new(batch, model_runner)
                 if future_token_ids_map is not None:
                     from sgl_jax.srt.managers.utils import (
                         get_token_ids_gather,

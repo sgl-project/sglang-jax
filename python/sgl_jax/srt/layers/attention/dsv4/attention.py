@@ -311,7 +311,14 @@ def update_window_kv(window_kv, new_kv, write_loc, valid_mask):
     new_kv = jnp.asarray(new_kv, window_kv.dtype)
     loc = jnp.asarray(write_loc)
     keep = jnp.asarray(valid_mask, bool) & (loc >= 0) & (loc < window_kv.shape[0])
-    if _PAGED_KV_WRITE and new_kv.shape[0] >= _PAGED_KV_WRITE_MIN_TOKENS and window_kv.ndim == 2:
+    from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
+
+    if (
+        _PAGED_KV_WRITE
+        and is_tpu_runtime()
+        and new_kv.shape[0] >= _PAGED_KV_WRITE_MIN_TOKENS
+        and window_kv.ndim == 2
+    ):
         # Prefill chunks write thousands of page-contiguous rows; XLA's scatter does
         # them one row at a time (1.2 ms per layer for 8K on v7x).
         from sgl_jax.srt.kernels.dsv4.paged_row_write import paged_row_write
