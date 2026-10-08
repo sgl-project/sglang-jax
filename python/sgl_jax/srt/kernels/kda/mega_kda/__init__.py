@@ -93,10 +93,41 @@ def kda_forward_packed(
         raise ValueError("packed Mega KDA initial_state must have shape [N, H, K, V]")
 
     tokens = q.shape[1]
+    if (
+        cu_seqlens.shape[0] == 2
+        # Bound to TPU sublane register geometry (128 lanes), Neumann doubling stages, and KDA architecture.
+        and chunk_size == 64
+        # Bound to TPU MXU BF16 hardware execution and 60 MB VMEM capacity limits.
+        and q.dtype == jnp.bfloat16
+    ):
+        from sgl_jax.srt.kernels.kda.resident_pipeline import resident_pipeline_kda_fwd
+
+        output, final_state, *_ = resident_pipeline_kda_fwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            initial_state,
+            True,
+            cu_seqlens,
+            chunk_size=chunk_size,
+            safe_gate=True,
+            lower_bound=lower_bound,
+            use_gate_in_kernel=True,
+            use_qk_l2norm_in_kernel=True,
+            A_log=A_log,
+            dt_bias=dt_bias,
+        )
+        return output, final_state
+
     padded_tokens = (tokens + chunk_size - 1) // chunk_size * chunk_size
     token_padding = padded_tokens - tokens
 
     def _pad(array: jax.Array) -> jax.Array:
+        if token_padding == 0:
+            return array
         widths = [(0, 0)] * array.ndim
         widths[1] = (0, token_padding)
         return jnp.pad(array, widths)
