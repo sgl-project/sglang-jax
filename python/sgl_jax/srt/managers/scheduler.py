@@ -360,7 +360,7 @@ class Scheduler(
         if getattr(self.model_config.hf_text_config, "ple_layer_ids", None):
             if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
                 raise NotImplementedError("N-gram PLE does not support speculative decoding yet.")
-            if getattr(server_args, "disaggregation_enable_overlap_schedule", False):
+            if server_args.disaggregation_enable_overlap_schedule:
                 raise ValueError("N-gram PLE does not support PD scheduler overlap yet.")
             if self.enable_overlap:
                 logger.info("Overlap scheduler is disabled for N-gram PLE models.")

@@ -164,6 +164,15 @@ class WorkloadInputBuilder(ABC):
         recurrent_indices = None
         if context.memory_pools.recurrent_state_pool is not None:
             recurrent_indices = metadata.linear_attn_metadata.recurrent_indices
+        text_config = context.model_config.hf_text_config
+        if getattr(text_config, "ple_layer_ids", None):
+            # Same [T, ple_embed_dim] bf16 that ForwardBatch.init_new carries.
+            fields.setdefault(
+                "ple_embeddings",
+                context.shaped(
+                    (spec.input_token_count, int(text_config.ple_embed_dim)), jnp.bfloat16
+                ),
+            )
         return ForwardBatch(
             bid=0,
             forward_mode=self.forward_mode,

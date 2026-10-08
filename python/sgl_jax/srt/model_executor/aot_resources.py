@@ -12,6 +12,7 @@ from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
 from sgl_jax.srt.model_executor.model_runner import ModelRunner
 from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
+    _conv_state_specs_from_config,
     _enforce_recurrent_state_server_constraints,
     _linear_state_params_from_config,
 )
@@ -111,6 +112,7 @@ class AbstractResources(ModelRunnerKVCacheMixin):
         recurrent_pool = None
         if self.linear_recurrent_config is not None:
             params = _linear_state_params_from_config(self.linear_recurrent_config)
+            conv_states = _conv_state_specs_from_config(self.linear_recurrent_config)
             recurrent_pool = RecurrentStatePool(
                 linear_recurrent_layer_ids=params.layers,
                 size=options.recurrent_capacity or options.batch_size,
@@ -123,6 +125,7 @@ class AbstractResources(ModelRunnerKVCacheMixin):
                 conv_dtype=params.dtype.conv,
                 num_k_heads=params.num_k_heads,
                 head_k_dim=params.head_k_dim,
+                conv_states=conv_states,
                 abstract=True,
             )
         elif options.recurrent_capacity is not None:
