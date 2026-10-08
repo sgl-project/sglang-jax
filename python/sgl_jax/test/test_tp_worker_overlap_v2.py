@@ -420,19 +420,34 @@ def test_sample_enqueues_before_barrier_and_next_round_waits():
 
 
 @pytest.mark.parametrize("parked_dp", [0, 1, None])
-def test_idle_checks_wait_for_parked_chunk_admission(parked_dp):
+@pytest.mark.parametrize("use_comm_backend", [False, True])
+def test_idle_checks_wait_for_parked_chunk_admission(parked_dp, use_comm_backend):
     scheduler = object.__new__(Scheduler)
-    scheduler._comm_backend = None
     received = 0
+    waits = []
 
     def receive():
         nonlocal received
-        if received == 2:
+        if received == 3:
             raise StopIteration
+        if received == 2:
+            assert checks == (["memory", "tree"] * 2 if parked_dp is None else [])
+            assert scheduler.new_token_ratio == (0.5 if parked_dp is None else 0.25)
+            if parked_dp is not None:
+                assert scheduler.chunked_reqs[parked_dp].req_pool_idx == 0
+                scheduler.chunked_reqs[parked_dp] = None
         received += 1
         return []
 
     scheduler.recv_requests = receive
+    scheduler._comm_backend = (
+        SimpleNamespace(
+            recv_requests=receive,
+            wait_for_new_requests=lambda timeout: waits.append(timeout),
+        )
+        if use_comm_backend
+        else None
+    )
     scheduler.select_dp_for_request = lambda reqs: reqs
     scheduler.process_input_requests = lambda reqs: None
     scheduler._engine_paused = False
@@ -457,7 +472,7 @@ def test_idle_checks_wait_for_parked_chunk_admission(parked_dp):
     checks = []
 
     def check_memory():
-        assert parked_dp is None, "Parked chunk still owns its KV and request slot"
+        assert scheduler.is_fully_idle(), "Parked chunk still owns its KV and request slot"
         checks.append("memory")
 
     scheduler.check_memory = check_memory
@@ -465,10 +480,9 @@ def test_idle_checks_wait_for_parked_chunk_admission(parked_dp):
     with pytest.raises(StopIteration):
         scheduler._event_loop_overlap_v2()
 
-    assert checks == (["memory", "tree"] * 2 if parked_dp is None else [])
-    assert scheduler.new_token_ratio == (0.5 if parked_dp is None else 0.25)
-    if parked_dp is not None:
-        assert scheduler.chunked_reqs[parked_dp].req_pool_idx == 0
+    assert checks == ["memory", "tree"] * (3 if parked_dp is None else 1)
+    assert scheduler.new_token_ratio == scheduler.init_new_token_ratio
+    assert waits == ([0.001] * 3 if use_comm_backend else [])
 
 
 def _make_logits_output():
