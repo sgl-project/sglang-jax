@@ -15,6 +15,7 @@ import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import pytest
+from flax import nnx
 from jax.sharding import AxisType, Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
@@ -103,12 +104,15 @@ def _checkpoint(path, *, layer_id=0, hash_layer=True, distinct_experts=False):
     return _inventory(path)
 
 
-def _static_checkpoint(path, *, size=128, shared_scale_codes=None, routed_weight=None):
-    prefix = "layers.0.ffn."
+def _static_checkpoint(path, *, size=128, shared_scale_codes=None, routed_weight=None, layer_id=0):
+    prefix = f"layers.{layer_id}.ffn."
     values = {
         prefix + "gate.weight": np.ones((2, size), np.float32),
-        prefix + "gate.tid2eid": np.tile(np.asarray([[0], [1]], np.int32), (8, 1)),
     }
+    if layer_id == 0:
+        values[prefix + "gate.tid2eid"] = np.tile(np.asarray([[0], [1]], np.int32), (8, 1))
+    else:
+        values[prefix + "gate.bias"] = np.asarray([0.25, -0.25], np.float32)
     if shared_scale_codes is None:
         shared_scale_codes = np.full((size // 128, size // 128), 127, np.uint8)
     for source in ("w1", "w3", "w2"):
@@ -126,7 +130,7 @@ def _static_checkpoint(path, *, size=128, shared_scale_codes=None, routed_weight
     return _inventory(path)
 
 
-def _layer(layer_id=0, *, data=1, tensor=1, ep_size=1):
+def _layer(layer_id=0, *, data=1, tensor=1, ep_size=1, abstract=False):
     mesh = Mesh(
         np.asarray(jax.devices()[: data * tensor]).reshape(data, tensor),
         ("data", "tensor"),
@@ -145,10 +149,13 @@ def _layer(layer_id=0, *, data=1, tensor=1, ep_size=1):
         ep_size=ep_size,
     )
     with jax.set_mesh(mesh):
-        return DeepseekV4MoE(config, mesh, layer_id)
+        initialize = lambda: DeepseekV4MoE(config, mesh, layer_id)
+        return nnx.eval_shape(initialize) if abstract else initialize()
 
 
-def _static_layer(*, ep_size=1, tensor=1, backend="reference", size=128):
+def _static_layer(
+    *, ep_size=1, tensor=1, backend="reference", size=128, layer_id=0, abstract=False
+):
     if len(jax.devices()) < ep_size * tensor:
         pytest.skip("requires enough devices for expert parallel loading")
     mesh = Mesh(
@@ -158,7 +165,7 @@ def _static_layer(*, ep_size=1, tensor=1, backend="reference", size=128):
     )
     config = DeepseekV4Config(
         hidden_size=size,
-        num_hidden_layers=1,
+        num_hidden_layers=2,
         n_routed_experts=2,
         num_experts_per_tok=1,
         n_shared_experts=1,
@@ -170,7 +177,48 @@ def _static_layer(*, ep_size=1, tensor=1, backend="reference", size=128):
         quantization_config=QuantizationConfig(is_static_checkpoint=True),
     )
     with jax.set_mesh(mesh):
-        return DeepseekV4MoE(config, mesh, 0, backend=backend)
+        initialize = lambda: DeepseekV4MoE(config, mesh, layer_id, backend=backend)
+        return nnx.eval_shape(initialize) if abstract else initialize()
+
+
+@pytest.mark.parametrize("static", [False, True])
+@pytest.mark.parametrize("layer_id", [0, 1])
+@pytest.mark.parametrize("ep_size", [1, 2])
+def test_serving_abstract_parameters_load_on_concrete_mesh(tmp_path, static, layer_id, ep_size):
+    # JAXModelLoader constructs nnx.eval_shape models, unlike direct layer tests.
+    # Every ordinary parameter starts with AbstractMesh sharding at this boundary.
+    if static:
+        layer = _static_layer(ep_size=ep_size, layer_id=layer_id, abstract=True)
+        assigned = _static_checkpoint(tmp_path / "static.safetensors", layer_id=layer_id)
+        expert_format = STATIC_EXPERT_FORMAT
+    else:
+        layer = _layer(layer_id, data=ep_size, ep_size=ep_size, abstract=True)
+        assigned = _checkpoint(
+            tmp_path / "online.safetensors", layer_id=layer_id, hash_layer=layer_id == 0
+        )
+        expert_format = None
+    assert isinstance(layer.gate.kernel.value, jax.ShapeDtypeStruct)
+    assert isinstance(layer.gate.kernel.value.sharding.mesh, jax.sharding.AbstractMesh)
+    report = layer.load_owned_weights(assigned, expert_format=expert_format)
+    assert report.consumed_keys == set(assigned)
+    prefix = f"layers.{layer_id}.ffn."
+    expected_gate = (
+        np.ones((128, 2), np.float32)
+        if static
+        else np.arange(64, dtype=np.float32).reshape(2, 32).T / 128
+    )
+    np.testing.assert_array_equal(np.asarray(layer.gate.kernel.value), expected_gate)
+    if layer_id:
+        np.testing.assert_array_equal(np.asarray(layer.gate.bias.value), [0.25, -0.25])
+    else:
+        assert layer._hash_table_loaded
+        np.testing.assert_array_equal(
+            np.asarray(layer.gate.tid2eid.value), np.tile([[0], [1]], (8, 1))
+        )
+    for value in jax.tree.leaves(nnx.state(layer, nnx.Param)):
+        assert isinstance(value, jax.Array), f"unmaterialized serving parameter in {prefix}"
+        assert value.is_fully_addressable
+        assert not isinstance(value.sharding.mesh, jax.sharding.AbstractMesh)
 
 
 @pytest.mark.parametrize("static", [False, True])

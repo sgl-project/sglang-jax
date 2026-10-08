@@ -134,8 +134,20 @@ memory and disables the TPU-only fused output projection and routing kernel.
 It uses JAX/jaxlib 0.11.1 and Flax 0.12.9. It does
 not establish full-model accuracy, TPU HBM usage or TPU performance.
 
-Falcon TPU runs were deferred at the user's request. No TPU acceptance row
-has been measured or posted. The six RFC rows (single-request decode, 8K and
+The first approved Falcon smoke run, `exp-jgt28sijsg` on 2026-10-08,
+tested commit `6dc9c772b` on v7x 2x2x1, tp8/ep8, with the
+[published static expert-FP8 checkpoint](https://github.com/primatrix/sglang-jax/pull/345).
+Remote source-tree and runner hashes matched the reviewed inputs. The
+eight-device probe, checkpoint metadata/shard-size validation and M-owned
+parameter loading completed. The service then failed in E's MoE loader:
+`jax.device_put` received a prototype `NamedSharding` backed by `AbstractMesh`.
+The loader now binds that partition spec to the layer's concrete device mesh
+when materializing gate, bias and shared-expert parameters. Eight additional
+CPU cases exercise this actual `nnx.eval_shape` serving boundary for both
+checkpoint formats, both routing modes and EP1/EP2. TPU revalidation of the
+fix is pending; the failed run reached no generation or acceptance workload.
+
+No TPU acceptance row has been measured or posted. The six RFC rows (single-request decode, 8K and
 32K TTFT, cc64 and cc256 throughput/latency, GSM8K) remain pending on v7x
 2x2x1, tp8/ep8, with the static expert-FP8 checkpoint and the reference's 5%
 reproducibility band. Keep other hardware results separate.

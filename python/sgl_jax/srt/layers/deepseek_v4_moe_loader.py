@@ -95,13 +95,16 @@ def _read_rows(source, entry: dict, rows: slice) -> np.ndarray:
     return np.frombuffer(raw, dtype=np.uint8).reshape(stop - start, columns)
 
 
-def _assign(param, value, key: str) -> None:
+def _assign(param, value, key: str, *, mesh: jax.sharding.Mesh) -> None:
     old = param.value
     if value.shape != old.shape:
         raise ValueError(f"{key}: decoded shape {value.shape} != parameter {old.shape}")
     if not np.isfinite(np.asarray(value, np.float32)).all():
         raise ValueError(f"{key}: non-finite checkpoint value")
-    param.value = jax.device_put(np.asarray(value, dtype=old.dtype), old.sharding)
+    # JAXModelLoader builds the graph with nnx.eval_shape. Its prototype
+    # sharding retains the partition spec but has no addressable devices.
+    sharding = NamedSharding(mesh, old.sharding.spec)
+    param.value = jax.device_put(np.asarray(value, dtype=old.dtype), sharding)
     param.value.block_until_ready()
 
 
@@ -251,13 +254,17 @@ def load_moe_weights(
     # Ordinary and shared projections are read one at a time. Routed
     # projections below are converted by row chunk and local expert.
     gate_numpy = np.float32 if gate_dtype == "F32" else ml_dtypes.bfloat16
-    _assign(layer.gate.kernel, _read(assigned[gate_key][0], gate_numpy).T, gate_key)
+    _assign(
+        layer.gate.kernel, _read(assigned[gate_key][0], gate_numpy).T, gate_key, mesh=layer.mesh
+    )
     local_payload_keys.add(gate_key)
     if layer.is_hash_layer:
         route_numpy = np.int32 if route_dtype == "I32" else np.int64
         layer.load_hash_table(_read(assigned[route_key][0], route_numpy))
     else:
-        _assign(layer.gate.bias, _read(assigned[route_key][0], np.float32), route_key)
+        _assign(
+            layer.gate.bias, _read(assigned[route_key][0], np.float32), route_key, mesh=layer.mesh
+        )
     local_payload_keys.add(route_key)
 
     for source, target in _SHARED:
@@ -267,13 +274,13 @@ def load_moe_weights(
         scale = _e8m0_scale(assigned[stem + ".scale"][0], stem + ".scale")
         local_payload_keys.update((stem + ".weight", stem + ".scale"))
         if layer.static_fp8:
-            _assign(linear.weight_q, weight, stem + ".weight")
+            _assign(linear.weight_q, weight, stem + ".weight", mesh=layer.mesh)
             expanded = np.repeat(scale, 128, axis=0)[: weight.shape[0], :].T[:, None, :]
-            _assign(linear.weight_scale, expanded, stem + ".scale")
+            _assign(linear.weight_scale, expanded, stem + ".scale", mesh=layer.mesh)
         else:
             block = np.repeat(np.repeat(scale, 128, axis=0), 128, axis=1)
             dequantized = weight.astype(np.float32) * block[: weight.shape[0], : weight.shape[1]]
-            _assign(linear.weight, dequantized.T, stem + ".weight")
+            _assign(linear.weight, dequantized.T, stem + ".weight", mesh=layer.mesh)
 
     converted_pairs = 0
     max_error = 0.0
