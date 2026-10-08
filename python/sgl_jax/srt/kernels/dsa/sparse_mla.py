@@ -41,20 +41,32 @@ def compute_topk_pages(
 ) -> jax.Array:
     """Unique seq-local pages touched by ``topk_indices``, padded to k_pages_max.
 
-    Returns i32[T, k_pages_max] with -1 padding. Computed once per full-indexer
-    layer and shared across the IndexShare group so ``sparse_mla_page_level``
-    skips its per-layer one_hot+top_k (~0.25ms/layer × 75 layers).
+    Returns i32[T, k_pages_max] with ascending page ids and -1 padding.
+    ``topk_indices`` rows are in indexer order: descending score, -1 padding.
+    When more than k_pages_max pages are touched, each page is ranked by its
+    best (first-occurring) token and the k_pages_max best-ranked pages win.
+    Sort only the selected token slots, avoiding a one-hot membership tensor
+    whose logical size is T * selected_tokens * pages_per_seq.
     """
-    valid = topk_indices >= 0
-    page_local = jnp.where(valid, topk_indices // page_size, pages_per_seq)
-    page_hits = jax.nn.one_hot(page_local, pages_per_seq, dtype=jnp.int32)
-    page_mask = jnp.any(page_hits, axis=1)  # [T, P]
-    n_hit = jnp.sum(page_mask, axis=-1)
-    k_eff = min(k_pages_max, pages_per_seq)
-    _, hit_pages = jax.lax.top_k(page_mask.astype(jnp.int32), k_eff)
-    hit_pages = jnp.pad(hit_pages, ((0, 0), (0, k_pages_max - k_eff)))
-    hit_valid = jnp.arange(k_pages_max)[None, :] < n_hit[:, None]
-    return jnp.where(hit_valid, hit_pages, -1)
+    pages = topk_indices // page_size
+    valid = (topk_indices >= 0) & (pages < pages_per_seq)
+    # The sentinel sorts after every valid page so invalid entries drop out.
+    pages = jnp.where(valid, pages, pages_per_seq)
+    rank = jnp.broadcast_to(jnp.arange(pages.shape[-1], dtype=jnp.int32), pages.shape)
+    # Stable sort by page keeps each page's best-ranked slot first in its run.
+    pages, rank = jax.lax.sort((pages, rank), dimension=-1, num_keys=1, is_stable=True)
+    first = jnp.ones_like(pages[:, :1], dtype=jnp.bool_)
+    unique = jnp.concatenate([first, pages[:, 1:] != pages[:, :-1]], axis=-1)
+    unique &= pages < pages_per_seq
+    pages = jnp.where(unique, pages, pages_per_seq)
+    rank = jnp.where(unique, rank, jnp.iinfo(jnp.int32).max)
+
+    # Keep the best-ranked unique pages, then restore ascending page order.
+    k_eff = min(k_pages_max, pages.shape[-1])
+    _, keep = jax.lax.top_k(-rank, k_eff)
+    hit_pages = jnp.sort(jnp.take_along_axis(pages, keep, axis=-1), axis=-1)
+    hit_pages = jnp.where(hit_pages < pages_per_seq, hit_pages, -1)
+    return jnp.pad(hit_pages, ((0, 0), (0, k_pages_max - k_eff)), constant_values=-1)
 
 
 @functools.partial(
