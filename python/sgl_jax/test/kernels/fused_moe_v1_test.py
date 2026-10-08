@@ -526,9 +526,10 @@ class MoEKernelTest(jtu.JaxTestCase):
     @parameterized.product(num_tokens=[16, 512])
     def test_flash_next_fallback_tiles(self, num_tokens):
         """Qwen3.8-Flash-Next's MoE (hidden 2560, expert intermediate 640,
-        top-10) has no tuned entry, so the default config is reduced to bf=128
-        and bd=512: five intermediate by five hidden tiles per expert, which no
-        other case here runs. 16 tokens is the decode batch the model serves."""
+        top-10) falls back to the default config wherever the table has no
+        entry for it, reduced to bf=128 and bd=512: five intermediate by five
+        hidden tiles per expert, which no other case here runs. 16 tokens is
+        the decode batch the model serves."""
         num_experts, top_k, hidden_size, intermediate_size = 128, 10, 2560, 640
         ep_size = self.mesh.size
         cfg = get_tuned_fused_moe_block_config(
