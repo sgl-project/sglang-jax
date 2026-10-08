@@ -1458,6 +1458,24 @@ def nextn_ignored_layers(ignored_layers, nextn_layer_idx: int) -> list[str]:
     return ignored + extra
 
 
+def nextn_pool_updates(kv_fused, is_dsa: bool):
+    """Pool write-back payload of one NextN forward, in the target model's format.
+
+    On the DSA path the NextN block updates two page buffers: the latent KV and the
+    indexer keys. ``MLATokenToKVPool.replace_buffer`` only touches ``indexer_key_buffer``
+    when it is handed the ``(kv_list, idx_list)`` tuple, so returning the bare KV list
+    silently drops every indexer-key write of the draft model: each later step-0 call
+    then scores pages against a buffer whose historical positions were never written
+    (#1639 review; accept length recovers once the keys survive across calls).
+    """
+    if not is_dsa:
+        return [kv_fused]
+    kv = [kv_fused.kv]
+    if kv_fused.idx is None:
+        return {"token_to_kv_pool": kv}
+    return {"token_to_kv_pool": (kv, [kv_fused.idx])}
+
+
 class GlmMoeDsaForCausalLMNextN(nnx.Module):
     load_lm_head_from_target = True
 
@@ -1581,7 +1599,7 @@ class GlmMoeDsaForCausalLMNextN(nnx.Module):
         )
 
         is_dsa = isinstance(kv_fused, DSAFusedCache)
-        kv_cache_list = [kv_fused.kv] if is_dsa else [kv_fused]
+        kv_cache_list = nextn_pool_updates(kv_fused, is_dsa)
         if return_dsa_topk_pages:
             return output, kv_cache_list, True, None, (kv_fused.topk_pages if is_dsa else None)
         return output, kv_cache_list, True, None
