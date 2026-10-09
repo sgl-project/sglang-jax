@@ -19,6 +19,26 @@ if (( DP_SIZE < 1 || TP_SIZE < 1 || TP_SIZE % DP_SIZE != 0 )); then
   exit 2
 fi
 
+# Accept PREFILL_HOST with or without brackets; IPv6 literals must be
+# bracketed inside URLs (host names never contain ':').
+PREFILL_HOST=${PREFILL_HOST#\[}
+PREFILL_HOST=${PREFILL_HOST%\]}
+if [[ "${PREFILL_HOST}" == *:* ]]; then
+  PREFILL_URL_HOST="[${PREFILL_HOST}]"
+else
+  PREFILL_URL_HOST=${PREFILL_HOST}
+fi
+
+# Listen address for every server. "::" accepts IPv6 (and, on dual-stack
+# Linux, IPv4) connections; 0.0.0.0 is IPv4-only. Override with BIND_HOST.
+if [[ -z "${BIND_HOST:-}" ]]; then
+  if [[ "${PREFILL_HOST}" == *:* ]]; then
+    BIND_HOST="::"
+  else
+    BIND_HOST=0.0.0.0
+  fi
+fi
+
 wait_for_health() {
   local url=$1
   for _ in $(seq 1 180); do
@@ -34,16 +54,16 @@ common_args=(
   --dp-size "${DP_SIZE}"
   --page-size 128
   --disable-radix-cache
-  --disaggregation-bootstrap-url "http://${PREFILL_HOST}:${BOOTSTRAP_PORT}"
+  --disaggregation-bootstrap-url "http://${PREFILL_URL_HOST}:${BOOTSTRAP_PORT}"
   --disaggregation-use-raiden
   --disaggregation-max-inflight-transfers "${MAX_INFLIGHT}"
 )
 
 if [[ "${ROLE}" = prefill ]]; then
   python -m sgl_jax.srt.disaggregation.run_bootstrap \
-    --host 0.0.0.0 --port "${BOOTSTRAP_PORT}" &
+    --host "${BIND_HOST}" --port "${BOOTSTRAP_PORT}" &
   python -m sgl_jax.launch_server "${common_args[@]}" \
-    --host 0.0.0.0 --port "${PREFILL_PORT}" \
+    --host "${BIND_HOST}" --port "${PREFILL_PORT}" \
     --disaggregation-mode prefill &
   wait_for_health "http://localhost:${PREFILL_PORT}/health"
   wait
@@ -54,20 +74,20 @@ if [[ "${ROLE}" != decode ]]; then
   exit 2
 fi
 
-wait_for_health "http://${PREFILL_HOST}:${BOOTSTRAP_PORT}/health"
-wait_for_health "http://${PREFILL_HOST}:${PREFILL_PORT}/health"
+wait_for_health "http://${PREFILL_URL_HOST}:${BOOTSTRAP_PORT}/health"
+wait_for_health "http://${PREFILL_URL_HOST}:${PREFILL_PORT}/health"
 python -m sgl_jax.launch_server "${common_args[@]}" \
-  --host 0.0.0.0 --port "${DECODE_PORT}" \
+  --host "${BIND_HOST}" --port "${DECODE_PORT}" \
   --disaggregation-mode decode &
 wait_for_health "http://localhost:${DECODE_PORT}/health"
 
 python -m sgl_jax.srt.disaggregation.launch_router \
   --pd-disaggregation --mini-lb \
-  --prefill "http://${PREFILL_HOST}:${PREFILL_PORT}" "${BOOTSTRAP_PORT}" \
+  --prefill "http://${PREFILL_URL_HOST}:${PREFILL_PORT}" "${BOOTSTRAP_PORT}" \
   --decode "http://localhost:${DECODE_PORT}" \
-  --prefill-bootstrap-host "${PREFILL_HOST}" \
+  --prefill-bootstrap-host "${PREFILL_URL_HOST}" \
   --max-concurrent-requests "${MAX_INFLIGHT}" \
-  --host 0.0.0.0 --port "${ROUTER_PORT}" &
+  --host "${BIND_HOST}" --port "${ROUTER_PORT}" &
 wait_for_health "http://localhost:${ROUTER_PORT}/health"
 
 curl -fsS "http://localhost:${ROUTER_PORT}/generate" \

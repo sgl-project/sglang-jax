@@ -104,10 +104,9 @@ class ZmqPullNotifier:
             self._listener_thread.start()
         self._started = True
         logger.info(
-            "ZmqPullNotifier started role=%s addr=%s:%d",
+            "ZmqPullNotifier started role=%s addr=%s",
             self._role,
-            self._host,
-            self._port,
+            format_host_port(self._host, self._port),
         )
 
     def stop(self) -> None:
