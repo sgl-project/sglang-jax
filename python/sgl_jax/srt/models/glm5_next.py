@@ -39,7 +39,7 @@ from sgl_jax.srt.layers.moe import FusedEPMoEV2, GateLogit, TopK
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.model_loader.weights import WeightLoader, WeightSpec
 from sgl_jax.srt.models.glm5_moe import Glm5Attention, Glm5ForCausalLM, Glm5MLP
-from sgl_jax.srt.models.kimi_linear import KimiDeltaAttention
+from sgl_jax.srt.models.kimi_linear import KimiDeltaAttention, kda_attention_mappings
 
 logger = logging.getLogger(__name__)
 
@@ -520,7 +520,15 @@ class Glm5NextForConditionalGeneration(nnx.Module):
             )
             if cfg.is_kda_layer(i):
                 layer_map = {k: v for k, v in layer_map.items() if ".self_attn." not in k}
-                layer_map.update(self._create_kda_attention_mappings(i, cfg, HF))
+                layer_map.update(
+                    kda_attention_mappings(
+                        f"{HF}.layers.{i}",
+                        f"model.layers.{i}.self_attn",
+                        cfg.linear_attn_config,
+                        # Checkpoint A_log is 1-D [num_heads]; the param is [1, 1, H, 1].
+                        a_log_shape=(1, 1, cfg.linear_attn_config["num_heads"], 1),
+                    )
+                )
             elif has_indexer:
                 # GLM-5.3-Flash KPool indexer extra tensors (absent on GLM-5.1/5.2).
                 hfp = f"{HF}.layers.{i}.self_attn.indexer"
@@ -552,49 +560,6 @@ class Glm5NextForConditionalGeneration(nnx.Module):
             out[f"{p}.hc_{site}_scale"] = WeightSpec(
                 target_path=f"model.layers.{i}.hc_{site}.scale", sharding=(None,), transpose=False
             )
-        return out
-
-    @staticmethod
-    def _create_kda_attention_mappings(i: int, cfg: Glm5NextConfig, HF: str) -> dict:
-        """KDA (`KimiDeltaAttention`) projections only (norms are added by the base builder)."""
-        prefix = f"{HF}.layers.{i}"
-        tgt = f"model.layers.{i}.self_attn"
-        la = cfg.linear_attn_config
-        conv_size = la["short_conv_kernel_size"]
-        projection_size = la["num_heads"] * la["head_dim"]
-
-        out: dict = {}
-        for name in ("q_proj", "k_proj", "v_proj", "f_b_proj", "b_proj", "g_b_proj"):
-            out[f"{prefix}.self_attn.{name}.weight"] = WeightSpec(
-                target_path=f"{tgt}.{name}.weight", sharding=(None, "tensor"), transpose=True
-            )
-        for name in ("f_a_proj", "g_a_proj"):
-            out[f"{prefix}.self_attn.{name}.weight"] = WeightSpec(
-                target_path=f"{tgt}.{name}.weight", sharding=(None, None), transpose=True
-            )
-        out[f"{prefix}.self_attn.o_proj.weight"] = WeightSpec(
-            target_path=f"{tgt}.o_proj.weight", sharding=("tensor", None), transpose=True
-        )
-        for conv in ("q_conv1d", "k_conv1d", "v_conv1d"):
-            out[f"{prefix}.self_attn.{conv}.weight"] = WeightSpec(
-                target_path=f"{tgt}.attn.{conv}.weight",
-                sharding=("tensor", None),
-                transpose=False,
-                reshape=(projection_size, conv_size),
-            )
-        out[f"{prefix}.self_attn.o_norm.weight"] = WeightSpec(
-            target_path=f"{tgt}.o_norm.weight", sharding=(None,), transpose=False
-        )
-        out[f"{prefix}.self_attn.dt_bias"] = WeightSpec(
-            target_path=f"{tgt}.attn.dt_bias", sharding=("tensor",), transpose=False
-        )
-        out[f"{prefix}.self_attn.A_log"] = WeightSpec(
-            target_path=f"{tgt}.A_log",
-            sharding=(None, None, "tensor", None),
-            transpose=False,
-            # Checkpoint stores A_log as 1-D [num_heads]; the param is [1, 1, H, 1] (Kimi layout).
-            reshape=(1, 1, la["num_heads"], 1),
-        )
         return out
 
     def get_input_embeddings(self):
