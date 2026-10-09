@@ -1632,7 +1632,7 @@ class MLATokenToKVPool(KVCache):
         return get_kv_cache_shape(
             total_num_pages=total_num_pages,
             page_size=page_size * (width // 128) if width > 128 else page_size,
-            kv_dim=min(width, 128) if width % 128 == 0 else width,
+            kv_dim=min(width, 128),
             kv_dtype=dtype,
         )
 

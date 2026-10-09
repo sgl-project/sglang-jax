@@ -346,6 +346,10 @@ class ModelRunnerKVCacheMixin:
             )
 
             return kpool_indexer_dim(cfg.index_head_dim, kpool), num_full
+        if cfg.index_head_dim > 128:
+            # Indexer caches wider than 128 are laid out as extra rows per page, which only the
+            # KPool readers understand.
+            raise NotImplementedError("a non-KPool DSA indexer needs index_head_dim <= 128")
         return cfg.index_head_dim, num_full
 
     def _compute_cell_size(self: ModelRunner) -> int:
@@ -742,7 +746,8 @@ class ModelRunnerKVCacheMixin:
 
     @property
     def _has_dsa_indexer(self: ModelRunner) -> bool:
-        return getattr(self.model_config.hf_text_config, "index_topk", None) is not None
+        cfg = self.glm5_next_config or self.model_config.hf_text_config
+        return getattr(cfg, "index_topk", None) is not None
 
     def _create_token_to_kv_pool(
         self: ModelRunner,
@@ -1013,8 +1018,11 @@ class ModelRunnerKVCacheMixin:
 
     @property
     def dsa_index_kpool(self: ModelRunner) -> int:
-        """KPool size of the DSA indexer (GLM-5.3-Flash pools 4 keys); 1 when keys are not pooled."""
-        return getattr(self.model_config.hf_text_config, "index_kpool", 1)
+        """KPool size of the DSA indexer (GLM-5.3-Flash pools 4 keys); 1 when keys are not pooled.
+        Read from the normalized GLM-5.3 config when there is one: its defaults are the ones the
+        model is built with, while the raw HF config falls back to 1 for omitted fields."""
+        cfg = self.glm5_next_config or self.model_config.hf_text_config
+        return getattr(cfg, "index_kpool", 1)
 
     @property
     def glm5_next_config(self: ModelRunner):
