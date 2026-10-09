@@ -156,13 +156,13 @@ def test_int4_moe_weight_mappings():
     assert "language_model.model.layers.0.mlp.gate_proj.weight" in mappings
 
     # Layer 1 (MoE) expert weights should use weight_packed
-    expert_group_wi_0 = mappings["__MOE_EXPERTS__model.layers.1.mlp.wi_0"]
-    assert any(".weight_packed" in k for k in expert_group_wi_0.target_path[1:])
+    expert_group_wi_0 = mappings["model.layers.1.mlp.wi_0"]
+    assert any(".weight_packed" in k for k in expert_group_wi_0.sources)
 
     # Layer 1 (MoE) scales should use .weight_scale and tensor sharding
-    scale_group_wi_0 = mappings["__MOE_EXPERTS__model.layers.1.mlp.wi_0_scale"]
-    scale_group_wo = mappings["__MOE_EXPERTS__model.layers.1.mlp.wo_scale"]
-    assert any(".weight_scale" in k for k in scale_group_wi_0.target_path[1:])
+    scale_group_wi_0 = mappings["model.layers.1.mlp.wi_0_scale"]
+    scale_group_wo = mappings["model.layers.1.mlp.wo_scale"]
+    assert any(".weight_scale" in k for k in scale_group_wi_0.sources)
     assert scale_group_wi_0.sharding == ("expert", "tensor", None)
     assert scale_group_wo.sharding == ("expert", None, "tensor")
 
@@ -188,9 +188,9 @@ def test_dynamic_int4_and_static_fp8_moe_weight_mappings():
         n_routed_experts=16,
         quant_config=dyn_int4_config,
     )
-    expert_group_dyn = dyn_mappings["__MOE_EXPERTS__model.layers.1.mlp.wi_0"]
-    assert all(k.endswith(".weight") for k in expert_group_dyn.target_path[1:])
-    assert "__MOE_EXPERTS__model.layers.1.mlp.wi_0_scale" not in dyn_mappings
+    expert_group_dyn = dyn_mappings["model.layers.1.mlp.wi_0"]
+    assert all(k.endswith(".weight") for k in expert_group_dyn.sources)
+    assert "model.layers.1.mlp.wi_0_scale" not in dyn_mappings
 
     # 2. Static FP8 must keep replicated scale_sharding ("expert", None, None) and .weight_scale_inv
     fp8_config = QuantizationConfig(
@@ -204,8 +204,8 @@ def test_dynamic_int4_and_static_fp8_moe_weight_mappings():
         n_routed_experts=16,
         quant_config=fp8_config,
     )
-    scale_group_fp8 = fp8_mappings["__MOE_EXPERTS__model.layers.1.mlp.wi_0_scale"]
-    assert all(k.endswith(".weight_scale_inv") for k in scale_group_fp8.target_path[1:])
+    scale_group_fp8 = fp8_mappings["model.layers.1.mlp.wi_0_scale"]
+    assert all(k.endswith(".weight_scale_inv") for k in scale_group_fp8.sources)
     assert scale_group_fp8.sharding == ("expert", None, None)
 
 

@@ -4,8 +4,8 @@ import pytest
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.configs.quantization_config import QuantizationConfig
+from sgl_jax.srt.model_loader.weights import unpack_4bit_jax
 from sgl_jax.srt.utils.quantization.quantization_utils import apply_linear_quantization
-from sgl_jax.srt.utils.weight_utils import unpack_4bit_jax
 
 
 def test_model_config_pack_quantized_parsing():

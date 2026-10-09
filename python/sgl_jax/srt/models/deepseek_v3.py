@@ -837,7 +837,7 @@ class DeepseekV3ForCausalLM(nnx.Module):
             #   Static FP8: loaded into QuantizedLinear.weight_q `[out, in]`
             #   directly; sharding is kernel_axes swapped. Also register the
             #   `weight_scale_inv` sidecar into `weight_scale`.
-            if not is_static_quant:
+            if not _is_linear_quantized(target_prefix):
                 mappings[f"{hf_prefix}.weight"] = WeightSpec(
                     target_path=f"{target_prefix}.weight",
                     sharding=sharding_std,
