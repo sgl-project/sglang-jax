@@ -21,12 +21,18 @@ def _preloaded_namespace() -> str | None:
 
 def raiden_requested(argv: Sequence[str] | None = None) -> bool:
     requested = False
-    for arg in sys.argv[1:] if argv is None else argv:
+    hicache_backend = "jax"
+    args = list(sys.argv[1:] if argv is None else argv)
+    for i, arg in enumerate(args):
         if arg == "--disaggregation-use-raiden":
             requested = True
         elif arg == "--no-disaggregation-use-raiden":
             requested = False
-    return requested
+        elif arg.startswith("--hicache-transfer-backend="):
+            hicache_backend = arg.split("=", 1)[1]
+        elif arg == "--hicache-transfer-backend" and i + 1 < len(args):
+            hicache_backend = args[i + 1]
+    return requested or hicache_backend == "raiden"
 
 
 def preload_raiden() -> None:
