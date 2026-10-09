@@ -349,6 +349,16 @@ class TokenizerManager:
     ):
         """Tokenize one request."""
 
+        if (
+            isinstance(obj, GenerateReqInput)
+            and obj.contains_mm_input()
+            and getattr(self.model_config, "text_only_model", None)
+        ):
+            raise ValueError(
+                f"{self.model_config.text_only_model} currently supports text-only requests; "
+                "image, video and audio inputs are not supported."
+            )
+
         # Tokenize
         input_text = obj.text
         input_ids = obj.input_ids
