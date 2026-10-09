@@ -77,6 +77,8 @@ class FusedEPMoE(nnx.Module):
         disable_all_reduce_metadata: bool = False,
         disable_sync_barrier: bool = False,
         use_jax_allreduce_metadata: bool = True,
+        vmem_2d_tile_relayout: bool = True,
+        vmem_packed_sublane_transpose: bool = True,
     ):
         self.hidden_size = hidden_size
         self.num_experts_per_tok = num_experts_per_tok
@@ -106,6 +108,8 @@ class FusedEPMoE(nnx.Module):
         self.disable_all_reduce_metadata = disable_all_reduce_metadata
         self.disable_sync_barrier = disable_sync_barrier
         self.use_jax_allreduce_metadata = use_jax_allreduce_metadata
+        self.vmem_2d_tile_relayout = vmem_2d_tile_relayout
+        self.vmem_packed_sublane_transpose = vmem_packed_sublane_transpose
 
         metadata = get_global_expert_location_metadata()
         if metadata is not None and layer_id is not None:
@@ -208,7 +212,7 @@ class FusedEPMoE(nnx.Module):
             self.quant_block_k = None
             self.quant_block_n = None
 
-    def quantize_weights(self, is_static: bool = False, *, abstract: bool = False):
+    def quantize_weights(self, is_static: bool = False):
         """Quantize MoE weights in-place. Call once after model loading."""
         if self.quantized_dtype is None:
             return
@@ -225,22 +229,8 @@ class FusedEPMoE(nnx.Module):
             del self.quant_block_k
         self.quant_block_k = wsz
 
-        mesh_context = (
-            jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh)
-            if abstract
-            else jax.set_mesh(self.mesh)
-        )
-        with mesh_context:
+        with jax.set_mesh(self.mesh):
             if is_static:
-                names = ["w1", "w3", "w2"]
-                if self.num_shared_experts > 0:
-                    names += ["w1_shared", "w3_shared", "w2_shared"]
-                for name in names:
-                    param = getattr(self, name)
-                    if isinstance(param.value, jax.ShapeDtypeStruct):
-                        param.value = jax.ShapeDtypeStruct(
-                            param.value.shape, self.quantized_dtype, sharding=param.value.sharding
-                        )
                 ep_scale_sharding = P(("data", "tensor"), None, None, None)
 
                 if wsz is None:
@@ -480,6 +470,8 @@ class FusedEPMoE(nnx.Module):
         *,
         block_config: FusedMoEBlockConfig | None = None,
         out_sharding: jax.sharding.Sharding | None = None,
+        vmem_2d_tile_relayout: bool | None = None,
+        vmem_packed_sublane_transpose: bool | None = None,
     ) -> jax.Array:
         """Forward pass through the fused MoE layer."""
         assert hidden_states.ndim == 2
@@ -527,6 +519,16 @@ class FusedEPMoE(nnx.Module):
             disable_all_reduce_metadata=self.disable_all_reduce_metadata,
             disable_sync_barrier=self.disable_sync_barrier,
             use_jax_allreduce_metadata=self.use_jax_allreduce_metadata,
+            vmem_2d_tile_relayout=(
+                self.vmem_2d_tile_relayout
+                if vmem_2d_tile_relayout is None
+                else vmem_2d_tile_relayout
+            ),
+            vmem_packed_sublane_transpose=(
+                self.vmem_packed_sublane_transpose
+                if vmem_packed_sublane_transpose is None
+                else vmem_packed_sublane_transpose
+            ),
             # Optional parameters (not used in basic case)
             quant_block_k=quant_block_k,
             w1_scale=w1_scale,
