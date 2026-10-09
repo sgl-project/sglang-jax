@@ -123,6 +123,22 @@ class ModelWorkerOverlap(ModelWorker):
             batch, self._submit(self._launch_forward, batch, sampling_metadata)
         )
 
+    def launch_speculative(self, worker, batch, plan):
+        from sgl_jax.srt.speculative.overlap_v2 import (
+            SpeculativeSubmission,
+            execute_speculative_batch,
+            snapshot_speculative_batch,
+        )
+
+        batch = snapshot_speculative_batch(batch)
+        # Snapshotting may materialize a grammar mask. Check fused prefill
+        # eligibility against exactly the sampling state the worker will see.
+        if plan.prefill_relay and not worker._can_use_fused_spec_prefill(batch):
+            plan = dataclasses.replace(plan, prefill_relay=False)
+        return SpeculativeSubmission(
+            batch, plan, self._submit(execute_speculative_batch, worker, batch, plan)
+        )
+
     @partial(jax.profiler.annotate_function, name="run_batch_forward")
     def _launch_forward(
         self,

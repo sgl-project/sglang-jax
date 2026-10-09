@@ -230,7 +230,7 @@ class SchedulerOutputProcessorMixin:
         if self.enable_overlap and not self.pd:
             if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
                 next_token_ids = resolve_spec_prefill_token_ids(result)
-                if launch_done is not None:
+                if launch_done is not None and not self.enable_overlap_v2:
                     launch_done.wait()
             else:
                 if self.enable_overlap_v2:
@@ -481,7 +481,7 @@ class SchedulerOutputProcessorMixin:
                 batch,
                 self.draft_worker.speculative_num_draft_tokens,
             )
-            if self.enable_overlap and launch_done is not None:
+            if self.enable_overlap and launch_done is not None and not self.enable_overlap_v2:
                 launch_done.wait()
             n_real = 0
             total_accepted = 0
