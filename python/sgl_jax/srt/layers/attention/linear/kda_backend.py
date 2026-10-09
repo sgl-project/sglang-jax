@@ -526,11 +526,26 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         self,
         conv_states: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """Slice ``[B, proj_size, K-1]`` into per-stream Q/K/V caches."""
+        """Slice ``[B, proj_size, K-1]`` into per-stream Q/K/V caches.
+
+        The packed buffer is laid out per tensor shard: shard ``r`` holds
+        ``[q_r | k_r | v_r]``, where ``q_r`` is the shard's slice of the Q
+        stream. Splitting inside ``shard_map`` keeps each stream sharded like
+        its conv weight and activations. A global ``jnp.split`` of a
+        ``[q | k | v]`` buffer would cross shard boundaries whenever
+        ``proj_size / tp`` does not align with the stream width, and XLA
+        would reshard every layer, every step.
+        """
         D = conv_states.shape[1]
         assert D % 3 == 0, f"conv_states channel dim {D} must be divisible by 3"
-        q, k, v = jnp.split(conv_states, 3, axis=1)
-        return q, k, v
+        spec = P("data", "tensor", None)
+        return jax.shard_map(
+            lambda c: tuple(jnp.split(c, 3, axis=1)),
+            mesh=self.mesh,
+            in_specs=(spec,),
+            out_specs=(spec, spec, spec),
+            check_vma=False,
+        )(conv_states)
 
     def _pack_conv_states(
         self,
@@ -538,8 +553,18 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         k_state: jax.Array,
         v_state: jax.Array,
     ) -> jax.Array:
-        """Concat per-stream ``[B, D, K-1]`` caches → packed ``[B, proj_size, K-1]``."""
-        return jnp.concatenate([q_state, k_state, v_state], axis=1)
+        """Concat per-stream ``[B, D, K-1]`` caches → packed ``[B, proj_size, K-1]``.
+
+        Inverse of :meth:`_unpack_conv_states`: concatenates per shard.
+        """
+        spec = P("data", "tensor", None)
+        return jax.shard_map(
+            lambda q, k, v: jnp.concatenate([q, k, v], axis=1),
+            mesh=self.mesh,
+            in_specs=(spec, spec, spec),
+            out_specs=spec,
+            check_vma=False,
+        )(q_state, k_state, v_state)
 
 
 __all__ = ["KDAAttnBackend"]
