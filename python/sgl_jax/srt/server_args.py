@@ -20,6 +20,7 @@ from sgl_jax.srt.reasoning_parser import ReasoningParser
 from sgl_jax.srt.utils.common_utils import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
+    get_bool_env_var,
     is_remote_url,
     is_valid_ipv6_address,
     nullable_str,
@@ -2129,12 +2130,23 @@ class ServerArgs:
                 self.speculative_algorithm in ("DFLASH", "DSPARK")
                 and self.attention_backend != "tt"
             )
-            if not (supports_nextn_overlap or supports_eagle3_overlap or supports_dflash_overlap):
+            supports_generic_v2 = (
+                get_bool_env_var("SGLANG_JAX_OVERLAP_V2")
+                and not self.pd_disaggregation
+                and self.speculative_algorithm in ("EAGLE", "EAGLE3", "NEXTN")
+            )
+            if not (
+                supports_generic_v2
+                or supports_nextn_overlap
+                or supports_eagle3_overlap
+                or supports_dflash_overlap
+            ):
                 raise ValueError(
                     "Speculative overlap scheduler only supports DFLASH/DSPARK, EAGLE3+FA, "
                     "or NEXTN with --speculative-eagle-topk=1 and "
                     "--speculative-num-draft-tokens == --speculative-num-steps + 1. "
-                    "Please pass --disable-overlap-schedule for other speculative configs."
+                    "Use SGLANG_JAX_OVERLAP_V2=1 for other non-PD EAGLE/EAGLE3/NEXTN "
+                    "configs, or pass --disable-overlap-schedule."
                 )
 
         if self.speculative_algorithm == "DSPARK":
