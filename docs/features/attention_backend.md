@@ -4,7 +4,7 @@ SGL-JAX exposes a small user-facing attention backend switch, while the runtime 
 
 ## User-facing choices
 
-`--attention-backend` accepts four values:
+`--attention-backend` accepts the following values:
 
 | Value | Runtime behavior |
 |---|---|
@@ -12,6 +12,7 @@ SGL-JAX exposes a small user-facing attention backend switch, while the runtime 
 | `fa_mha` | Forces MLA models through the decompressed MHA FlashAttention path. This is useful for kernel A/B checks, but uses much more KV cache than absorbed MLA. |
 | `native` | Pure JAX/native attention path, mainly for CPU/debugging. If `fa` or `fa_mha` is requested on CPU, the runtime falls back to `native`. |
 | `dsa_sparse` | DeepSeek Sparse Attention (DSA): a lightning-indexer selects the top-scoring pages of past tokens per query and attention runs only over that page set (page-block sparse guided by DSA scores), with IndexShare cross-layer reuse of the selection. For MLA models whose config carries the `index_*` fields only. See [DeepSeek Sparse Attention](#deepseek-sparse-attention-dsa_sparse). |
+| `qsa_sparse` | Qwen Sparse Attention (QSA): a lightweight indexer scores past keys in blocks of `indexer_compress_ratio` tokens and attention runs only over the highest-scoring blocks, within a budget of `indexer_budget` tokens, in prefill and decode alike. For GQA models whose config carries the `indexer_*` fields only. See [Qwen Sparse Attention](#qwen-sparse-attention-qsa_sparse). |
 
 Example:
 
@@ -30,10 +31,11 @@ python3 -u -m sgl_jax.launch_server \
 | `FlashAttention` | `--attention-backend=fa` for MHA/GQA, or `fa_mha` for MLA fallback | TPU production attention with paged KV cache, SWA metadata, and Pallas kernels. |
 | `MLAAttentionBackend` | `--attention-backend=fa` when `model_config.attention_arch == MLA` | Absorbed MLA path for DeepSeek-family models. |
 | `DSASparseAttentionBackend` | `--attention-backend=dsa_sparse` for MLA models with `index_*` config | DeepSeek Sparse Attention: lightning-indexer top-k + sparse MLA over the selected pages (page-block), with IndexShare. |
+| `QSASparseAttentionBackend` | `--attention-backend=qsa_sparse` for GQA models with `indexer_*` config | Qwen Sparse Attention: compressed-key indexer top-k + sparse GQA over the selected blocks. Layers without an indexer take the inherited `FlashAttention` path. |
 | `NativeAttention` | `--attention-backend=native`, or CPU fallback | Debugging and CPU execution. |
-| `HybridLinearAttnBackend` | Automatic wrapper for hybrid recurrent models | Routes full-attention layers to `FlashAttention`/`MLAAttentionBackend` and linear recurrent layers to KDA/GDN/Lightning backends. |
+| `HybridLinearAttnBackend` | Automatic wrapper for hybrid recurrent models | Routes full-attention layers to `FlashAttention`/`MLAAttentionBackend`/`QSASparseAttentionBackend` and linear recurrent layers to KDA/GDN/Lightning backends. |
 | `KDAAttnBackend` | Automatic under `HybridLinearAttnBackend` for Kimi Linear | Kimi Delta Attention recurrent branch. |
-| `GDNAttnBackend` | Automatic under `HybridLinearAttnBackend` for Qwen3.5 hybrid configs | Gated DeltaNet recurrent branch. |
+| `GDNAttnBackend` | Automatic under `HybridLinearAttnBackend` for Qwen3.5 hybrid configs and Qwen3.8-Flash-Next | Gated DeltaNet recurrent branch. |
 | `LightningAttnBackend` | Automatic under `HybridLinearAttnBackend` for Bailing MoE V2.5 / Ling-2.6-flash | Lightning / Simple GLA recurrent branch. |
 
 ## DeepSeek Sparse Attention (`dsa_sparse`)
@@ -105,6 +107,44 @@ Kernel correctness is covered in CI by
 `test/srt/kernels/dsa/test_sparse_mla_prefill_parity.py`, which checks the sparse-MLA
 prefill kernel against a masked-softmax reference on CPU (`interpret=True`, no TPU needed),
 in both flat and paged-cache modes.
+
+## Qwen Sparse Attention (`qsa_sparse`)
+
+QSA is the full attention of Qwen3.8-Flash-Next. A lightweight indexer compresses each
+group of `indexer_compress_ratio` keys into one indexer key, scores the compressed keys
+for every query, and selects the `indexer_budget / indexer_compress_ratio`
+highest-scoring blocks. Attention then runs over the tokens those blocks hold, plus the
+query's own unfinished group, which has no compressed key yet.
+
+Selection is exact at block granularity, and every forward mode is sparse: the model is
+trained to attend over the selected blocks, so prefill selects and attends sparsely too.
+Each full-attention layer has its own indexer; there is no cross-layer reuse.
+
+Only GQA models whose config carries the `indexer_*` fields are eligible. Layers without
+an indexer take the inherited `FlashAttention` path. A QSA layer raises rather than
+falling back when asked for anything its kernel's causal mask cannot express:
+non-causal or encoder-only attention, attention sinks, a custom mask (speculative
+verify), a sliding window, logit soft-capping or temperature scaling.
+
+The compressed keys live in the same KV pool and are addressed through the token cache's
+page table, so `indexer_compress_ratio` must divide `--page-size` and the quotient must
+be a multiple of the KV dtype's packing; see
+[`QSATokenToKVPool`](../architecture/07-kv-cache.md). The validated recipe uses
+`--page-size 64`.
+
+### Enabling it
+
+```bash
+python3 -u -m sgl_jax.launch_server \
+  --model-path Qwen/Qwen3.8-Flash-Next \
+  --device=tpu \
+  --tp-size 8 --ep-size 8 \
+  --page-size 64 \
+  --attention-backend=qsa_sparse
+```
+
+See the [Qwen3.8-Flash-Next recipe](../cookbook/autoregressive/Qwen/Qwen3.8-Flash-Next.md)
+for the full validated command.
 
 ## Notes for contributors
 
