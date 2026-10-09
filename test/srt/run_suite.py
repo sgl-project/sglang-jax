@@ -120,11 +120,7 @@ def run_unittest_files(
                         [sys.executable, "-m", "unittest", test_path],
                         stdout=sys.stdout,
                         stderr=sys.stderr,
-<<<<<<< HEAD
                         env=env,
-=======
-                        env={**os.environ, **(file_entry.env or {})},
->>>>>>> 4f339bb35 (Support Unified FULL and SWA L2 HiCache)
                         cwd=os.path.dirname(filename),
                     )
                     process.wait()
@@ -181,11 +177,7 @@ def run_unittest_files(
                     cmd,
                     stdout=sys.stdout,
                     stderr=sys.stderr,
-<<<<<<< HEAD
                     env=env,
-=======
-                    env={**os.environ, **(file_entry.env or {})},
->>>>>>> 4f339bb35 (Support Unified FULL and SWA L2 HiCache)
                 )
                 process.wait()
 
