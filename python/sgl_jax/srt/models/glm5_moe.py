@@ -84,6 +84,87 @@ def _load_shared_expert(inputs, *, mesh, quantized_dtype):
 # No-op: FP32 accumulation logic removed to keep native BF16 execution.
 
 
+def moe_router(config, mesh, layer_id: int) -> tuple[GateLogit, TopK]:
+    """GLM-5.x router: sigmoid gate with expert bias, grouped top-k."""
+    gate = GateLogit(
+        input_size=config.hidden_size,
+        num_experts=config.n_routed_experts,
+        enable_expert_bias=True,
+        weight_dtype=jnp.float32,
+        # GLM-5.x checkpoints ship the gate weight in BF16 and the
+        # e_score_correction_bias in F32: store both checkpoint-native,
+        # keep the router dot in f32 (unchanged numerics).
+        kernel_dtype=jnp.bfloat16,
+        compute_dtype=jnp.float32,
+        bias_dtype=jnp.float32,
+        score_func=getattr(config, "scoring_func", "sigmoid"),
+    )
+    topk = TopK(
+        topk=config.num_experts_per_tok,
+        renormalize=config.norm_topk_prob,
+        num_expert_group=getattr(config, "n_group", 1),
+        topk_group=getattr(config, "topk_group", 1),
+        routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
+        layer_id=layer_id,
+        mesh=mesh,
+    )
+    return gate, topk
+
+
+def fused_v2_moe(config, mesh, layer_id: int, dtype, num_shared_experts: int) -> FusedEPMoEV2:
+    """Routed (+ in-kernel shared) experts on the fused v2 kernel. A block-FP8 checkpoint's
+    shared-expert scales get block-scale params, requantized per channel at load
+    (Glm5ForCausalLM.prepare_weight_loading)."""
+    quant_config = getattr(config, "quantization_config", None)
+    n_group = getattr(config, "n_group", 1)
+    mlp = FusedEPMoEV2(
+        hidden_size=config.hidden_size,
+        num_experts=config.n_routed_experts,
+        num_experts_per_tok=config.num_experts_per_tok,
+        intermediate_dim=config.moe_intermediate_size,
+        mesh=mesh,
+        ep_size=getattr(config, "ep_size", 1),
+        weight_dtype=dtype,
+        dtype=dtype,
+        layer_id=layer_id,
+        renormalize_topk_logits=config.norm_topk_prob,
+        routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
+        use_grouped_topk=n_group > 1,
+        num_groups=n_group,
+        top_k_groups=getattr(config, "topk_group", 1),
+        num_shared_experts=num_shared_experts,
+        moe_shared_expert_intermediate_size=config.moe_intermediate_size,
+        quantization_config=quant_config,
+    )
+    block_size = getattr(quant_config, "weight_block_size", None)
+    if (
+        num_shared_experts
+        and getattr(quant_config, "is_static_checkpoint", False)
+        and block_size is not None
+    ):
+        block_n, block_k = map(int, block_size)
+        hidden = config.hidden_size
+        inter = config.moe_intermediate_size * num_shared_experts
+        for name, (rows, cols) in (
+            ("w1_shared", (inter, hidden)),
+            ("w3_shared", (inter, hidden)),
+            ("w2_shared", (hidden, inter)),
+        ):
+            if rows % block_n or cols % block_k:
+                raise ValueError(
+                    f"{name} {rows}x{cols} must be divisible by weight_block_size={block_size}"
+                )
+            setattr(
+                mlp,
+                f"{name}_block_scale",
+                nnx.Param(
+                    jnp.zeros((rows // block_n, cols // block_k), dtype=jnp.float32),
+                    out_sharding=P(None, None),
+                ),
+            )
+    return mlp
+
+
 class GlmNorm(nnx.Module):
     def __init__(self, dim: int, dtype: jnp.dtype = jnp.bfloat16):
         self.weight = nnx.Param(jnp.ones((dim,), dtype=dtype))
@@ -612,7 +693,10 @@ class Glm5MLP(nnx.Module):
         self.layer_id = layer_id
         self.mesh = mesh
         self.use_fused = use_fused
-        # silu_and_mul_clamp (upstream DeepseekV2MLP): gate <= limit, |up| <= limit.
+        # silu_and_mul_clamp (upstream DeepseekV2MLP): gate <= limit, |up| <= limit. Only the
+        # unfused path applies it.
+        if use_fused and swiglu_limit is not None:
+            raise ValueError("swiglu_limit needs use_fused=False")
         self.swiglu_limit = None if swiglu_limit is None else float(swiglu_limit)
 
         self.gate_proj = LinearBase(
@@ -828,99 +912,17 @@ class Glm5DecoderLayer(nnx.Module):
             self.is_moe_layer = False
             self.moe_gate = None
         else:
-            router_dtype = jnp.float32
-            self.moe_gate = GateLogit(
-                input_size=config.hidden_size,
-                num_experts=config.n_routed_experts,
-                enable_expert_bias=True,
-                weight_dtype=router_dtype,
-                # GLM-5.2 checkpoints ship the gate weight in BF16 and the
-                # e_score_correction_bias in F32: store both checkpoint-native,
-                # keep the router dot in f32 (unchanged numerics).
-                kernel_dtype=jnp.bfloat16,
-                compute_dtype=jnp.float32,
-                bias_dtype=jnp.float32,
-                score_func=getattr(config, "scoring_func", "sigmoid"),
-            )
+            self.moe_gate, self.topk = moe_router(config, mesh, layer_id)
 
             self.moe_backend = getattr(config, "moe_backend", MoEBackend.EPMOE)
             self.use_fused = self.moe_backend in (MoEBackend.FUSED, MoEBackend.FUSED_V2)
             num_shared_experts = getattr(config, "n_shared_experts", 0)
             use_inkernel_se = self.moe_backend == MoEBackend.FUSED_V2 and num_shared_experts > 0
 
-            self.topk = TopK(
-                topk=config.num_experts_per_tok,
-                renormalize=config.norm_topk_prob,
-                num_expert_group=getattr(config, "n_group", 1),
-                topk_group=getattr(config, "topk_group", 1),
-                routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
-                layer_id=layer_id,
-                mesh=mesh,
-            )
-
             if self.moe_backend == MoEBackend.FUSED_V2:
-                self.mlp = FusedEPMoEV2(
-                    hidden_size=config.hidden_size,
-                    num_experts=config.n_routed_experts,
-                    num_experts_per_tok=config.num_experts_per_tok,
-                    intermediate_dim=config.moe_intermediate_size,
-                    mesh=mesh,
-                    ep_size=getattr(config, "ep_size", 1),
-                    weight_dtype=dtype,
-                    dtype=dtype,
-                    layer_id=layer_id,
-                    renormalize_topk_logits=config.norm_topk_prob,
-                    routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
-                    use_grouped_topk=getattr(config, "n_group", 1) > 1,
-                    num_groups=getattr(config, "n_group", 1),
-                    top_k_groups=getattr(config, "topk_group", 1),
-                    num_shared_experts=num_shared_experts if use_inkernel_se else 0,
-                    moe_shared_expert_intermediate_size=config.moe_intermediate_size,
-                    quantization_config=getattr(config, "quantization_config", None),
+                self.mlp = fused_v2_moe(
+                    config, mesh, layer_id, dtype, num_shared_experts if use_inkernel_se else 0
                 )
-
-                quant_config = getattr(config, "quantization_config", None)
-                weight_block_size = (
-                    getattr(quant_config, "weight_block_size", None) if quant_config else None
-                )
-                if (
-                    use_inkernel_se
-                    and getattr(quant_config, "is_static_checkpoint", False)
-                    and weight_block_size is not None
-                ):
-                    block_n, block_k = map(int, weight_block_size)
-                    shared_intermediate = config.moe_intermediate_size * num_shared_experts
-                    if (
-                        config.hidden_size % block_k
-                        or shared_intermediate % block_n
-                        or config.hidden_size % block_n
-                        or shared_intermediate % block_k
-                    ):
-                        raise ValueError(
-                            "GLM-5.2 shared-expert dimensions must be divisible by "
-                            f"weight_block_size={weight_block_size}"
-                        )
-                    self.mlp.w1_shared_block_scale = nnx.Param(
-                        jnp.zeros(
-                            (shared_intermediate // block_n, config.hidden_size // block_k),
-                            dtype=jnp.float32,
-                        ),
-                        out_sharding=P(None, None),
-                    )
-                    self.mlp.w3_shared_block_scale = nnx.Param(
-                        jnp.zeros(
-                            (shared_intermediate // block_n, config.hidden_size // block_k),
-                            dtype=jnp.float32,
-                        ),
-                        out_sharding=P(None, None),
-                    )
-                    self.mlp.w2_shared_block_scale = nnx.Param(
-                        jnp.zeros(
-                            (config.hidden_size // block_n, shared_intermediate // block_k),
-                            dtype=jnp.float32,
-                        ),
-                        out_sharding=P(None, None),
-                    )
             elif self.use_fused:
                 self.mlp = FusedEPMoE(
                     hidden_size=config.hidden_size,

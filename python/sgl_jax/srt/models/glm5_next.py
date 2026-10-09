@@ -35,10 +35,15 @@ from sgl_jax.srt.configs.model_config import ModelConfig, MoEBackend
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sgl_jax.srt.layers.moe import FusedEPMoEV2, GateLogit, TopK
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.model_loader.weights import WeightLoader, WeightSpec
-from sgl_jax.srt.models.glm5_moe import Glm5Attention, Glm5ForCausalLM, Glm5MLP
+from sgl_jax.srt.models.glm5_moe import (
+    Glm5Attention,
+    Glm5ForCausalLM,
+    Glm5MLP,
+    fused_v2_moe,
+    moe_router,
+)
 from sgl_jax.srt.models.kimi_linear import KimiDeltaAttention, kda_attention_mappings
 
 logger = logging.getLogger(__name__)
@@ -216,67 +221,8 @@ class Glm5NextDecoderLayer(nnx.Module):
 
     def _build_moe(self, config: Glm5NextConfig, mesh, layer_id: int, dtype) -> None:
         """Routed + shared experts on the fused v2 kernel, the only one with the swiglu clamp."""
-        self.moe_gate = GateLogit(
-            input_size=config.hidden_size,
-            num_experts=config.n_routed_experts,
-            enable_expert_bias=True,
-            weight_dtype=jnp.float32,
-            kernel_dtype=jnp.bfloat16,
-            compute_dtype=jnp.float32,
-            bias_dtype=jnp.float32,
-            score_func=config.scoring_func,
-        )
-        self.topk = TopK(
-            topk=config.num_experts_per_tok,
-            renormalize=config.norm_topk_prob,
-            num_expert_group=config.n_group,
-            topk_group=config.topk_group,
-            routed_scaling_factor=config.routed_scaling_factor,
-            layer_id=layer_id,
-            mesh=mesh,
-        )
-        quant_config = getattr(config, "quantization_config", None)
-        self.mlp = FusedEPMoEV2(
-            hidden_size=config.hidden_size,
-            num_experts=config.n_routed_experts,
-            num_experts_per_tok=config.num_experts_per_tok,
-            intermediate_dim=config.moe_intermediate_size,
-            mesh=mesh,
-            ep_size=config.ep_size,
-            weight_dtype=dtype,
-            dtype=dtype,
-            layer_id=layer_id,
-            renormalize_topk_logits=config.norm_topk_prob,
-            routed_scaling_factor=config.routed_scaling_factor,
-            use_grouped_topk=config.n_group > 1,
-            num_groups=config.n_group,
-            top_k_groups=config.topk_group,
-            num_shared_experts=config.n_shared_experts,
-            moe_shared_expert_intermediate_size=config.moe_intermediate_size,
-            quantization_config=quant_config,
-        )
-        block_size = getattr(quant_config, "weight_block_size", None)
-        if getattr(quant_config, "is_static_checkpoint", False) and block_size is not None:
-            # Block-wise FP8 shared-expert scales, requantized per channel at load
-            # (Glm5ForCausalLM.prepare_weight_loading).
-            block_n, block_k = map(int, block_size)
-            hidden = config.hidden_size
-            inter = config.moe_intermediate_size * config.n_shared_experts
-            for name, (rows, cols) in (
-                ("w1_shared", (inter, hidden)),
-                ("w3_shared", (inter, hidden)),
-                ("w2_shared", (hidden, inter)),
-            ):
-                if rows % block_n or cols % block_k:
-                    raise ValueError(f"{name} {rows}x{cols} must divide weight_block_size")
-                setattr(
-                    self.mlp,
-                    f"{name}_block_scale",
-                    nnx.Param(
-                        jnp.zeros((rows // block_n, cols // block_k), dtype=jnp.float32),
-                        out_sharding=P(None, None),
-                    ),
-                )
+        self.moe_gate, self.topk = moe_router(config, mesh, layer_id)
+        self.mlp = fused_v2_moe(config, mesh, layer_id, dtype, config.n_shared_experts)
 
     def __call__(
         self,
