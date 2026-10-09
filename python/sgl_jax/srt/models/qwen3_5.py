@@ -276,8 +276,13 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
             jnp.ones((self.num_v_heads,), dtype=dtype, out_sharding=P("tensor"))
         )
 
-        # GDN output norm: plain RMSNorm over head_v_dim, then explicit silu(z)
-        # gate (norm-before-gate, silu — matches torch RMSNormGated).
+        # GDN output norm: plain RMSNorm over head_v_dim, then a gate on z
+        # (norm-before-gate) whose activation the config picks; "swish" is silu.
+        output_gate = getattr(text_cfg, "output_gate_type", None) or "silu"
+        output_gate = "silu" if output_gate == "swish" else output_gate
+        if output_gate not in ("silu", "sigmoid"):
+            raise ValueError(f"unsupported GDN output_gate_type {output_gate!r}")
+        self.output_gate = output_gate
         self.norm = RMSNorm(self.head_v_dim, epsilon=text_cfg.rms_norm_eps, param_dtype=dtype)
         self.out_proj = LinearBase(
             input_size=self.value_dim,
@@ -310,8 +315,9 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         return jax.sharding.reshard(x, P("data", "tensor"))
 
     def _norm_gate(self, core_out, z):
-        """Per-head RMSNorm over head_v_dim, then a silu(z) gate (silu, NOT the
-        sigmoid of torch RMSNormGated). A method so the activation is unit-tested.
+        """Per-head RMSNorm over head_v_dim, then the output gate on z: silu(z),
+        or sigmoid(z) when the config selects it. A method so the activation is
+        unit-tested.
         """
         T = core_out.shape[0]
         core_out = core_out.reshape(
@@ -326,7 +332,8 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
             self.value_dim,
             out_sharding=NamedSharding(self.mesh, P("data", "tensor")),
         )
-        return core_out * jax.nn.silu(z)
+        gate = jax.nn.sigmoid if self.output_gate == "sigmoid" else jax.nn.silu
+        return core_out * gate(z)
 
     def __call__(self, positions, hidden_states, forward_batch, recurrent_state_pool):
         del positions  # GDN is position-agnostic.
@@ -599,6 +606,9 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
     get_video_feature = Qwen3VLForConditionalGeneration.get_video_feature
     _get_visual_feature = Qwen3VLForConditionalGeneration._get_visual_feature
 
+    causal_lm_class = None  # bound after Qwen3_5MoeForCausalLM is defined
+    vision_model_class = Qwen3VLVisionModel
+
     def get_multimodal_encode_funcs(self):
         if self.visual is None:
             return {}
@@ -618,10 +628,10 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         self.dtype = dtype
 
         # The runner merges visual features before the language-model forward.
-        self.language_model = Qwen3_5MoeForCausalLM(config, mesh, dtype=dtype)
-        if config.vision_config is not None:
+        self.language_model = self.causal_lm_class(config, mesh, dtype=dtype)
+        if config.vision_config is not None and self.vision_model_class is not None:
             encoder_tp = resolve_encoder_tp(mesh, getattr(config, "vision_encoder_parallel", "dp"))
-            self.visual = Qwen3VLVisionModel(
+            self.visual = self.vision_model_class(
                 config.vision_config,
                 dtype,
                 mesh=mesh,
@@ -719,6 +729,11 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
     def _moe_gate_up(inputs):
         return tuple(value.transpose(0, 2, 1) for value in np.split(inputs[0], 2, axis=1))
 
+    def _weight_mappings(self, hf_config):
+        """``(mappings, visual_skip_patterns, mtp_skip_patterns)`` for this
+        checkpoint layout."""
+        return _create_qwen3_5_weight_mappings(hf_config, getattr(self, "lm_head", None))
+
     def load_weights(self, model_config: ModelConfig):
         from sgl_jax.srt.model_loader.weights import WeightLoader
 
@@ -728,9 +743,7 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module, InModelMultimodalContract):
         gdn_layers = list(tc.linear_layer_ids)
         is_moe = tc.is_moe
 
-        mappings, visual_skip, mtp_skip = _create_qwen3_5_weight_mappings(
-            hf_config, getattr(self, "lm_head", None)
-        )
+        mappings, visual_skip, mtp_skip = self._weight_mappings(hf_config)
 
         tp = self.mesh.shape.get("tensor", 1)
         for i in gdn_layers:
@@ -1012,6 +1025,9 @@ def _create_qwen3_5_weight_mappings(hf_config, lm_head: ParallelLMHead | None = 
         )
 
     return mappings, _VISUAL_SKIP_PATTERNS, _MTP_SKIP_PATTERNS
+
+
+Qwen3_5MoeForConditionalGeneration.causal_lm_class = Qwen3_5MoeForCausalLM
 
 
 class Qwen3_5ForConditionalGeneration(Qwen3_5MoeForConditionalGeneration):

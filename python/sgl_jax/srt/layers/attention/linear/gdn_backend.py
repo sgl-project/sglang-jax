@@ -46,6 +46,7 @@ from sgl_jax.srt.kernels.gdn.fused_chunk_parallel_adapter import (
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     LinearRecurrentAttnBackend,
 )
+from sgl_jax.srt.mem_cache.recurrent_state_pool import LINEAR_CONV
 
 logger = logging.getLogger(__name__)
 
@@ -172,9 +173,8 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
         Reshaping to ``[T, tp, *]`` rank-blocks first preserves the stripe (and
         collapses to plain ``[Q|K|V]`` at tp=1).
 
-        ``conv_state`` is the single fused-conv1d buffer (GDN keeps one per
-        layer, vs. KDA's three q/k/v entries). Returns ``(core_attn_out,
-        (new_rec_state, [new_conv_state]))`` per the linear-backend contract.
+        GDN reads its named linear-conv state and preserves any peer states
+        in the returned per-layer buffer list.
         """
         tp = _mesh_tp_size(self.mesh)
         T = q.shape[0]
@@ -191,8 +191,8 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
         A_log = layer.A_log.value
         dt_bias = layer.dt_bias.value
 
-        recurrent_state, conv_states = self.get_layer_cache(recurrent_state_pool, layer.layer_id)
-        conv_state = conv_states[0]
+        recurrent_state, _ = self.get_layer_cache(recurrent_state_pool, layer.layer_id)
+        conv_state = recurrent_state_pool.get_linear_conv_state(layer.layer_id)
 
         if forward_batch.forward_mode.is_decode():
             out, new_conv, new_rec = self.forward_decode(
@@ -220,7 +220,10 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
         # Flatten head dim into channel dim to match KDA's contract
         # (model layer reshapes back to [T, n_v, d_v] before output norm).
         out = out.reshape(out.shape[0], -1)
-        return out, (new_rec, [new_conv])
+        return out, (
+            new_rec,
+            recurrent_state_pool.with_conv_state(layer.layer_id, LINEAR_CONV, new_conv),
+        )
 
     # ------------------------------------------------------------------
     # Decode fast path

@@ -198,6 +198,13 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         ('bfloat16', 'bfloat16', 1024, 128, 4, 6144, 3072, 32, True, False): (32, 1024, 1024, 1024, 64, 64, 1024, 1024, 1024, 512),
         ('bfloat16', 'bfloat16', 2048, 128, 4, 6144, 3072, 32, True, False): (64, 1024, 2048, 2048, 128, 128, 1024, 2048, 2048, 128),
         ('bfloat16', 'bfloat16', 8192, 128, 4, 6144, 3072, 32, True, False): (64, 1024, 2048, 2048, 128, 128, 1024, 2048, 2048, 128),
+        # Qwen3.8-Flash-Next: 512 experts, top_k=10, H=2560, I=640, ep=8; its shared expert runs outside the kernel (use_shared_expert=False), no grouped topk
+        # Tuned on v7x (4 chips, 2x2x1) 2026-10-07 @ balanced routing; one tile holds a whole expert (bf=I, bd=H)
+        ('bfloat16', 'bfloat16', 16, 512, 10, 2560, 640, 8, False, False): (2, 640, 2560, 2560, 2, 2, 640, 2560, 2560, 640),
+        ('bfloat16', 'bfloat16', 64, 512, 10, 2560, 640, 8, False, False): (8, 640, 2560, 2560, 4, 4, 640, 2560, 2560, 640),
+        ('bfloat16', 'bfloat16', 512, 512, 10, 2560, 640, 8, False, False): (64, 640, 2560, 2560, 16, 16, 640, 2560, 2560, 640),
+        ('bfloat16', 'bfloat16', 1024, 512, 10, 2560, 640, 8, False, False): (128, 640, 2560, 2560, 32, 32, 640, 2560, 2560, 640),
+        ('bfloat16', 'bfloat16', 2048, 512, 10, 2560, 640, 8, False, False): (256, 640, 2560, 2560, 64, 64, 640, 2560, 2560, 640),
     },
     "TPU v6e": {
         # MiMoV2Flash: 256 experts, top_k=8, H=4096, I=2048, ep=16, no shared expert, no grouped topk
