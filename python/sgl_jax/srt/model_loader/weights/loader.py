@@ -6,7 +6,7 @@ import os
 import re
 import time
 from collections import Counter
-from dataclasses import fields
+from dataclasses import fields, replace
 from functools import partial
 
 import jax
@@ -18,6 +18,7 @@ from jax.sharding import PartitionSpec as P
 from tqdm import tqdm
 
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.utils.quantization.quantization_utils import is_int4_dtype
 
 from .reader import JaxShardReader, WeightReader
 from .recipes import TensorLayout
@@ -378,10 +379,13 @@ class WeightLoader:
         return self.source.read_tensor(info["file"], source, index)
 
     def _load_tensor(self, params, name, spec):
+        paths = (spec.target_path,) if isinstance(spec.target_path, str) else spec.target_path
+        targets = {path: self._get_param(params, path).value for path in paths}
         direct = (
             isinstance(spec.target_path, str)
             and all(x is None for x in (spec.pad_width, spec.reshape, spec.repeat))
             and not (spec.kv_head_padding or spec.head_dim_padding)
+            and not is_int4_dtype(targets[spec.target_path].dtype)
         )
         sharding = None
         if direct:
@@ -395,8 +399,6 @@ class WeightLoader:
                 axes = axes[::-1]
             sharding = jax.sharding.NamedSharding(self.mesh, P(*axes))
         value = self.reader.read(self.source, name, spec, sharding)
-        paths = (spec.target_path,) if isinstance(spec.target_path, str) else spec.target_path
-        targets = {path: self._get_param(params, path).value for path in paths}
         return self.layout.transform(name, value, spec, targets)
 
     def _load_experts(self, params, name, spec):
@@ -433,9 +435,19 @@ class WeightLoader:
         if cache_hit:
             value = _PD_WEIGHT_CACHE[cache_key]
             return (jax.device_put(value, self._pd_remap_sharding(value.sharding)),)
-        value = self.reader.read(self.source, name, spec, sharding)
+        is_int4_weight = is_int4_dtype(param.value.dtype)
+        read_spec = replace(spec, transpose=False) if is_int4_weight else spec
+        load_sharding = sharding
+        if is_int4_weight and spec.transpose and len(sharding.spec) == 3:
+            pspec = sharding.spec
+            load_sharding = jax.sharding.NamedSharding(
+                sharding.mesh, P(pspec[0], pspec[2], pspec[1])
+            )
+        value = self.reader.read(self.source, name, read_spec, load_sharding)
         with jax.set_mesh(sharding.mesh):
             value = self.layout.transform_experts(value, spec, param.value)
+            if is_int4_weight and getattr(param.value, "sharding", None) is not None:
+                value = jax.sharding.reshard(value, param.value.sharding)
         if cache_enabled:
             _PD_WEIGHT_CACHE[cache_key] = value
         return (value,)
@@ -503,7 +515,7 @@ class WeightLoader:
             shape[spec.concat_axis] = sum(info["shape"][spec.concat_axis] for info in infos)
         dtype = _SAFETENSORS_DTYPE_TO_JAX[infos[0]["dtype"]]
         if spec.sources:
-            if spec.transpose and len(shape) > 1:
+            if spec.transpose and len(shape) > 1 and not is_int4_dtype(targets[paths[0]].dtype):
                 shape[-2:] = shape[-2:][::-1]
             count = (
                 len(spec.physical_to_logical_map)
