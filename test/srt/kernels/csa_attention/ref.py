@@ -5,23 +5,13 @@ import numpy as np
 
 def update_window(new_kv, window_cache, metadata, *, window_size, page_size):
     result = np.array(window_cache, copy=True)
-    requests, cu, ends, pages, offsets = map(np.asarray, metadata[:5])
-    for request in range(len(ends)):
-        begin, end = cu[request], cu[request + 1]
-        prefix = ends[request] - (end - begin)
-        for token in range(max(begin, end - window_size), end):
-            if token >= len(requests) or requests[token] != request:
-                continue
-            if metadata[-1][token] < 0:
-                continue
-            slot = (prefix + token - begin) % window_size
-            entry = offsets[request] // page_size + slot // page_size
-            if not (0 <= entry < len(pages) and entry < offsets[request + 1] // page_size):
-                continue
-            page = pages[entry]
-            if 0 < page < len(result) // page_size:
-                row = slot % page_size
-                result[page * page_size + row] = new_kv[token]
+    requests, cu, ends = map(np.asarray, metadata[:3])
+    for token, request in enumerate(requests):
+        if not 0 <= request < len(ends) or not cu[request] <= token < cu[request + 1]:
+            continue
+        location = int(metadata.window_write_locations[token])
+        if page_size <= location < len(result):
+            result[location] = new_kv[token]
     return result
 
 
@@ -63,7 +53,8 @@ def reference(
             if absolute >= prefix:
                 rows.append(new_kv[cu[request] + absolute - prefix])
             else:
-                location = resolve(wp, wc, request, absolute % window_size, wps, len(window) // wps)
+                first_page = max(0, prefix - window_size + 1) // wps * wps
+                location = resolve(wp, wc, request, absolute - first_page, wps, len(window) // wps)
                 if location is not None:
                     page, slot = location
                     rows.append(window[page * wps + slot])

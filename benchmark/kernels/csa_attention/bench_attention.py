@@ -18,7 +18,7 @@ from sgl_jax.srt.kernels.csa_attention import CSAAttentionMetadata, csa_joint_at
 from sgl_jax.srt.kernels.csa_attention.tune import get_csa_attention_schedule
 
 
-def inputs(batch, sequence, mode, heads, seed, *, device=True):
+def inputs(batch, sequence, mode, heads, seed, *, device=True, select_records=True):
     rng = np.random.default_rng(seed)
     if mode == "decode":
         lengths = [1] * batch
@@ -32,24 +32,32 @@ def inputs(batch, sequence, mode, heads, seed, *, device=True):
     pages = 1 + batch * pages_per_request
     q = rng.normal(0, 0.5, (tokens, heads, 512)).astype(ml_dtypes.bfloat16)
     new = rng.normal(0, 0.5, (tokens, 512)).astype(ml_dtypes.bfloat16)
-    window = rng.normal(0, 0.5, ((batch + 1) * 128, 512)).astype(ml_dtypes.bfloat16)
+    window = rng.normal(0, 0.5, (pages * 128, 512)).astype(ml_dtypes.bfloat16)
     compressed = rng.normal(0, 0.5, (pages, 32, 512)).astype(ml_dtypes.bfloat16)
-    selected = np.full((tokens, 512), -1, np.int32)
-    for r, length in enumerate(lengths):
-        for local in range(length):
-            visible = (sequence - length + local + 1) // 4
-            selected[cu[r] + local, : min(visible, 512)] = rng.permutation(visible)[:512]
-    window_pages = rng.permutation(np.arange(1, batch + 1, dtype=np.int32))
+    selected = None
+    if select_records:
+        selected = np.full((tokens, 512), -1, np.int32)
+        for r, length in enumerate(lengths):
+            for local in range(length):
+                visible = (sequence - length + local + 1) // 4
+                selected[cu[r] + local, : min(visible, 512)] = rng.permutation(visible)[:512]
+    physical_pages = rng.permutation(np.arange(1, pages, dtype=np.int32)).reshape(batch, -1)
+    first_pages = np.maximum(0, sequence - np.asarray(lengths) - 127) // 128
+    window_pages = np.concatenate(
+        [physical_pages[r, first:] for r, first in enumerate(first_pages)]
+    )
+    window_cu = np.r_[0, np.cumsum(pages_per_request - first_pages)].astype(np.int32) * 128
     locations = np.full(tokens, -1, np.int32)
     for r, length in enumerate(lengths):
         local = np.arange(length)
-        locations[cu[r] + local] = window_pages[r] * 128 + (sequence - length + local) % 128
+        positions = sequence - length + local
+        locations[cu[r] + local] = physical_pages[r, positions // 128] * 128 + positions % 128
     metadata = CSAAttentionMetadata(
         np.repeat(np.arange(batch, dtype=np.int32), lengths),
         cu,
         np.full(batch, sequence, np.int32),
         window_pages,
-        np.arange(batch + 1, dtype=np.int32) * 128,
+        window_cu,
         rng.permutation(np.arange(1, pages, dtype=np.int32)),
         np.arange(batch + 1, dtype=np.int32) * pages_per_request * 32,
         np.full(batch, sequence // 4, np.int32),
@@ -133,7 +141,7 @@ def useful_work(args):
         pairs += int(np.minimum(np.arange(prefix + 1, length + 1), 128).sum())
         pairs += int((picks >= 0).sum())
         unique_rows += min(prefix, 127) + np.unique(picks[picks >= 0]).size
-        written_rows += min(count, 128)
+        written_rows += count
     # Compulsory payload only: no metadata, repeated DMA, padding, or replacement copies.
     payload = 2 * q.size * q.dtype.itemsize + new.size * new.dtype.itemsize
     payload += (unique_rows + written_rows) * q.shape[-1] * q.dtype.itemsize

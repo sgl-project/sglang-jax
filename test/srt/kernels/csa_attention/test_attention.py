@@ -25,12 +25,12 @@ def make_case(lengths, prefixes, *, heads=8, pad=2, page_size=128):
     ends = np.asarray(lengths, np.int32) + np.asarray(prefixes, np.int32)
     cu = np.cumsum([0, *lengths], dtype=np.int32)
     tokens = int(cu[-1]) + pad
-    pages_per_request = max(1, (int(max(ends)) + page_size - 1) // page_size)
+    pages_per_request = max(4, (int(max(ends)) + page_size - 1) // page_size)
     mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]).reshape(1, 1), ("data", "tensor"))
     with jax.set_mesh(mesh):
         pool = DeepseekV4TokenToKVPool(
             batch * pages_per_request * page_size,
-            batch * page_size,
+            batch * pages_per_request * page_size,
             page_size,
             DeepseekV4CacheSpec((4,)),
             mesh,
@@ -45,8 +45,10 @@ def make_case(lengths, prefixes, *, heads=8, pad=2, page_size=128):
     c4[0] = np.nan
     q, new = values((tokens, heads, dim)), values((tokens, dim))
     req = np.r_[np.repeat(np.arange(batch), lengths), np.full(pad, -1)].astype(np.int32)
-    wp = np.arange(batch, 0, -1, dtype=np.int32)
-    wc = np.arange(batch + 1, dtype=np.int32) * page_size
+    all_wp = np.arange(batch * pages_per_request, 0, -1, dtype=np.int32).reshape(batch, -1)
+    first_pages = np.maximum(0, np.asarray(prefixes) - window + 1) // page_size
+    wp = np.concatenate([all_wp[r, start:] for r, start in enumerate(first_pages)])
+    wc = np.r_[0, np.cumsum(pages_per_request - first_pages)].astype(np.int32) * page_size
     cp = np.arange(batch * pages_per_request, 0, -1, dtype=np.int32)
     cc = np.arange(batch + 1, dtype=np.int32) * pages_per_request * (page_size // 4)
     selected = np.full((tokens, 512), -1, np.int32)
@@ -58,7 +60,8 @@ def make_case(lengths, prefixes, *, heads=8, pad=2, page_size=128):
             selected[t, :available] = rng.choice(
                 max(1, int(ends[r] // 4)), available, replace=False
             )
-            loc[t] = wp[r] * page_size + (prefix + t - cu[r]) % window
+            position = prefix + t - cu[r]
+            loc[t] = all_wp[r, position // page_size] * page_size + position % page_size
     md = CSAAttentionMetadata(req, cu, ends, wp, wc, cp, cc, ends // 4, loc)
     return (q, new, swa, c4, selected, rng.normal(0, 0.2, heads).astype(np.float32), md)
 
@@ -145,7 +148,8 @@ def test_invalid_decode_schedule():
 def test_decode_empty_and_missing_pages(page_size):
     args = make_case((1, 0, 1, 1), (0, 512, 127, 8191), page_size=page_size)
     args[-1].compressed_page_indices[::3] = 0
-    args[-1].window_page_indices[2] = 0
+    request_two_start = args[-1].window_cu_kv_lens[2] // page_size
+    args[-1].window_page_indices[request_two_start] = 0
     args[-1].window_write_locations[1] = -1
     args[4][2] = -1
     check(
@@ -192,7 +196,7 @@ def test_missing_pages():
     check(args)
 
 
-def test_ring_wrap_and_decode():
+def test_paged_chunk_then_decode():
     args = make_case((257,), (127,))
     _, updated = check(args)
     following = list(make_case((1,), (384,)))
