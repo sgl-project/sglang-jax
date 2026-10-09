@@ -29,6 +29,8 @@ if not hasattr(np, "float8_e4m3fn"):
     np.float8_e4m3fn = ml_dtypes.float8_e4m3fn
 if not hasattr(np, "float8_e5m2"):
     np.float8_e5m2 = ml_dtypes.float8_e5m2
+if not hasattr(np, "float8_e8m0fnu"):
+    np.float8_e8m0fnu = ml_dtypes.float8_e8m0fnu
 
 # safetensors header stores tensor dtype as a string. Map to jax dtype.
 # Kept in one place because multiple callers used to inline the same dict.
@@ -38,9 +40,11 @@ _SAFETENSORS_DTYPE_TO_JAX: dict[str, jnp.dtype] = {
     "F32": jnp.float32,
     "I64": jnp.int64,
     "I32": jnp.int32,
+    "I8": jnp.int8,
     "BOOL": jnp.bool_,
     "F8_E4M3": jnp.float8_e4m3fn,
     "F8_E5M2": jnp.float8_e5m2,
+    "F8_E8M0": jnp.float8_e8m0fnu,
 }
 
 
@@ -50,6 +54,8 @@ def _reinterpret_dtype_if_needed(data: np.ndarray, target_dtype: jnp.dtype) -> n
             return data.view(ml_dtypes.float8_e4m3fn)
         elif target_dtype == jnp.float8_e5m2:
             return data.view(ml_dtypes.float8_e5m2)
+        elif target_dtype == jnp.float8_e8m0fnu:
+            return data.view(ml_dtypes.float8_e8m0fnu)
     elif data.dtype == np.dtype("V2"):
         return data.view(ml_dtypes.bfloat16)
     return data
