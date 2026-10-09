@@ -9,14 +9,35 @@ from typing import TYPE_CHECKING
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.layers.radix_attention import RadixAttention
+from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sgl_jax.srt.speculative.eagle_util import (
+    accepted_path_kv_copies,
+    compact_accepted_paths,
+    front_pack_accepted_tokens,
+)
 from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
     from sgl_jax.srt.managers.tp_worker import ModelWorker
+
+
+def has_row_positioned_attention(model) -> bool:
+    """Whether an attention layer of ``model`` places queries by row.
+
+    The attention kernel derives a query's position from its row for sliding
+    windows and xai temperature. Tree rows are not in position order.
+    """
+    return any(
+        (layer.sliding_window_size or 0) > 0 or layer.xai_temperature_len > 0
+        for _, layer in nnx.iter_graph(model)
+        if isinstance(layer, RadixAttention)
+    )
 
 
 def replicate_to_mesh(
@@ -100,6 +121,21 @@ class BaseSpecWorker:
         )
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = target_worker.get_memory_pool()
+        kv_pool = target_worker.model_runner.token_to_kv_pool
+        if self.topk > 1 and self.page_size > 1 and type(kv_pool) is not MHATokenToKVPool:
+            # A paged tree verify copies the accepted path's KV rows, which
+            # covers the fused KV buffer only.
+            raise NotImplementedError(
+                f"--speculative-eagle-topk > 1 with --page-size > 1 does not support "
+                f"{type(kv_pool).__name__}; use --page-size 1."
+            )
+        draft_runner = getattr(draft_worker, "draft_model_runner", None)
+        for runner in (target_worker.model_runner, draft_runner):
+            if self.topk > 1 and runner is not None and has_row_positioned_attention(runner.model):
+                raise NotImplementedError(
+                    "--speculative-eagle-topk > 1 does not support sliding-window or "
+                    "xai-temperature attention layers."
+                )
 
         (
             self.precompile_token_paddings,
@@ -362,6 +398,41 @@ class BaseSpecWorker:
             model_worker_batch.seq_lens,
         )
 
+    def _move_accepted_paths_to_front(
+        self, model_worker_batch: ModelWorkerBatch, accept_index: np.ndarray
+    ) -> None:
+        req_to_token = self.req_to_token_pool.req_to_token
+        slots = np.asarray(model_worker_batch.logits_indices_selector)
+        if self.page_size == 1:
+            compact_accepted_paths(
+                req_to_token,
+                model_worker_batch.req_pool_indices,
+                model_worker_batch.cache_loc,
+                model_worker_batch.draft_cache_loc_starts,
+                model_worker_batch.seq_lens,
+                accept_index,
+                slots,
+                self.speculative_num_draft_tokens,
+            )
+            return
+        src, dst = accepted_path_kv_copies(
+            req_to_token,
+            model_worker_batch.req_pool_indices,
+            model_worker_batch.seq_lens,
+            accept_index,
+            slots,
+            self.speculative_num_draft_tokens,
+        )
+        if src.size == 0:
+            return
+        # Node 0 never moves, so a slot needs at most accept_width - 1 copies.
+        # Padding to that bound compiles the copy once per batch bucket; slot 0
+        # is never allocated, so the 0 -> 0 padding pairs are no-ops.
+        pad = accept_index.size - accept_index.shape[0] - src.size
+        self.target_worker.model_runner.token_to_kv_pool.copy_kv_rows(
+            np.pad(src, (0, pad)), np.pad(dst, (0, pad))
+        )
+
     def verify(self, model_worker_batch: ModelWorkerBatch, cur_allocate_lens: jax.Array):
         from sgl_jax.srt.managers.scheduler import GenerationBatchResult
         from sgl_jax.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
@@ -382,7 +453,7 @@ class BaseSpecWorker:
         spec_info.hidden_states = logits_output.hidden_states
 
         (
-            predict,
+            _predict,
             verified_id,
             accept_length,
             accept_index,
@@ -392,6 +463,16 @@ class BaseSpecWorker:
             self.draft_worker.draft_model_runner.rngs,
             self.mesh,
         )
+        bs = accept_length.shape[0]
+        accept_width = self.speculative_num_steps + 1
+        if self.topk > 1:
+            self._move_accepted_paths_to_front(
+                model_worker_batch, accept_index.reshape(bs, accept_width)
+            )
+        emitted = front_pack_accepted_tokens(
+            verified_id, accept_width, self.speculative_num_draft_tokens
+        )
+
         legacy_non_overlap = use_legacy_eagle3_non_overlap(
             not self.server_args.disable_overlap_schedule,
             getattr(model_worker_batch, "spec_algorithm", None),
@@ -406,7 +487,6 @@ class BaseSpecWorker:
             # accept_index has length bs*(spec_steps+1); the gathered tensors have
             # length bs*draft_token_num — equal at topk=1, distinct at topk>1.
             draft_n = self.speculative_num_draft_tokens
-            accept_width = self.speculative_num_steps + 1
             req_ids = np.arange(len(accept_index)) // accept_width
             per_req_last = req_ids * draft_n + draft_n - 1
             safe_index = np.where(accept_index >= 0, accept_index, per_req_last)
@@ -432,7 +512,7 @@ class BaseSpecWorker:
         model_worker_batch.spec_info_padded = next_draft_input
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=predict,
+            next_token_ids=emitted,
             next_draft_input=next_draft_input,
             accept_lens=accept_length,
             bid=model_worker_batch.bid,

@@ -2111,6 +2111,15 @@ class ServerArgs:
         # Check LoRA configuration
         self.check_lora_server_args()
 
+        # Tree drafting is checked before the overlap gate so a topk > 1 config
+        # is rejected for what it is, whatever the overlap setting.
+        if (
+            self.speculative_algorithm is not None
+            and self.speculative_algorithm not in ("DFLASH", "DSPARK")
+            and self.speculative_eagle_topk > 1
+        ):
+            self.check_tree_drafting_server_args()
+
         # Speculative overlap uses a fused linear-chain path or DFlash's
         # dedicated relay-backed draft/verify path.
         if self.speculative_algorithm is not None and not self.disable_overlap_schedule:
@@ -2197,6 +2206,33 @@ class ServerArgs:
                 raise ValueError("DFLASH does not support LoRA.")
             if self.grammar_backend not in (None, "none"):
                 raise ValueError("DFLASH does not support constrained decoding.")
+
+    def check_tree_drafting_server_args(self):
+        """Validate EAGLE tree drafting (--speculative-eagle-topk > 1)."""
+        flag = "--speculative-eagle-topk > 1"
+        # EAGLE decodes through the non-legacy allocation path, whose
+        # out_cache_loc bucket assumes a round allocates one verify width.
+        if self.speculative_algorithm != "EAGLE3":
+            raise ValueError(
+                f"{flag} is supported for EAGLE3 only; "
+                f"got --speculative-algorithm={self.speculative_algorithm}."
+            )
+        if not self.disable_overlap_schedule:
+            raise ValueError(f"{flag} requires --disable-overlap-schedule.")
+        if self.attention_backend != "fa":
+            raise ValueError(f"{flag} requires --attention-backend fa.")
+        if self.dp_size != 1:
+            raise ValueError(f"{flag} requires --dp-size 1.")
+        # The verify tree picks num_draft_tokens - 1 nodes out of the drafted
+        # candidates: topk at the first step and topk * topk at each later one.
+        topk, steps = self.speculative_eagle_topk, self.speculative_num_steps
+        max_draft_tokens = 1 + topk * (1 + (steps - 1) * topk)
+        if self.speculative_num_draft_tokens > max_draft_tokens:
+            raise ValueError(
+                f"--speculative-num-draft-tokens must be at most {max_draft_tokens} for "
+                f"--speculative-num-steps {steps} and --speculative-eagle-topk {topk}; "
+                f"got {self.speculative_num_draft_tokens}."
+            )
 
     def check_lora_server_args(self):
         """Validate and normalize LoRA-related server arguments."""

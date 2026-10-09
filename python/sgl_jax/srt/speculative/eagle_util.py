@@ -10,6 +10,7 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.speculative.build_eagle_tree_structure_kernel import (
+    FULL_MASK,
     build_eagle_tree_structure,
 )
 
@@ -73,19 +74,20 @@ def build_tree_mask_for_draft_decode(
     seq_lens: jax.Array | np.ndarray,
     topk: int,
     speculative_step_id: int,
-    parents_list: Sequence[jax.Array],
-) -> jax.Array:
+    parents_list: Sequence[jax.Array | np.ndarray],
+) -> np.ndarray:
     """
     Build flattened custom mask for draft decode that respects branch ancestry.
 
     Args:
-        seq_lens: Sequence lengths (prompt+accepted) for each request.
+        seq_lens: Length of the context every branch sees, per request.
         topk: Number of speculative branches processed in parallel.
         speculative_step_id: Current speculative step (0-indexed).
-        parents_list: List of parent index tensors produced by ``select_top_k_tokens``.
+        parents_list: Parent index tensors produced by ``select_top_k_tokens``,
+            one per step; entry ``s`` is read for every ``1 <= s <= step``.
 
     Returns:
-        Flattened boolean mask concatenating ``topk`` rows per request.
+        Host int32 mask (1 = keep), ``topk`` rows of ``kv_len`` per request.
     """
 
     if topk <= 0:
@@ -123,10 +125,9 @@ def build_tree_mask_for_draft_decode(
         masks.append(mask.reshape(-1))
 
     if not masks:
-        return jnp.zeros((0,), dtype=jnp.bool_)
+        return np.zeros((0,), dtype=np.int32)
 
-    concatenated = np.concatenate(masks)
-    return jnp.asarray(concatenated, dtype=jnp.int32)
+    return np.concatenate(masks).astype(np.int32)
 
 
 def build_chain_verify_inputs(
@@ -216,6 +217,7 @@ def build_tree_kernel_efficient(
     batch_size: int,
     speculative_num_steps: int,
     mesh: Mesh,
+    tree_mask_mode: int = FULL_MASK,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """JAX implementation of build_tree_kernel_efficient.
 
@@ -229,6 +231,7 @@ def build_tree_kernel_efficient(
         topk: Number of top-k candidates
         num_verify_tokens: Number of tokens to verify
         max_seq_len_per_req: Maximum allowed sequence length per request (static bound)
+        tree_mask_mode: ``FULL_MASK`` or ``QLEN_ONLY`` layout of the returned tree mask
 
     Returns:
         tuple of (tree_mask, positions, retrive_index, retrive_next_token,
@@ -258,7 +261,7 @@ def build_tree_kernel_efficient(
                 topk=topk,
                 seq_lens_sum=seq_lens_sum,
                 max_context_len=max_seq_len_per_req,
-                tree_mask_mode=0,  # FULL_MASK
+                tree_mask_mode=tree_mask_mode,
             )
         )
 
@@ -270,6 +273,107 @@ def build_tree_kernel_efficient(
         retrive_next_sibling,
         draft_tokens,
     )
+
+
+def front_pack_accepted_tokens(
+    verified_id: np.ndarray, accept_width: int, draft_token_num: int
+) -> np.ndarray:
+    """Lay each request's accepted tokens out at the front of its draft block.
+
+    ``verified_id`` holds them in path order, ``accept_width`` per request.
+    The output side reads request ``i``'s tokens as the first ``accept_len``
+    entries of block ``[i * draft_token_num, (i + 1) * draft_token_num)``.
+    """
+    bs = verified_id.shape[0] // accept_width
+    packed = np.zeros((bs, draft_token_num), dtype=verified_id.dtype)
+    width = min(draft_token_num, accept_width)
+    packed[:, :width] = verified_id.reshape(bs, accept_width)[:, :width]
+    return packed.reshape(-1)
+
+
+def _accepted_nodes(accept_index: np.ndarray, slot: int, draft_token_num: int) -> np.ndarray:
+    """Slot ``slot``'s accepted tree nodes, in path order, as window offsets."""
+    n = draft_token_num
+    accepted = accept_index[slot][accept_index[slot] >= 0] - slot * n
+    assert len(np.unique(accepted)) == len(accepted) and np.all(
+        (accepted >= 0) & (accepted < n)
+    ), f"slot {slot}: accepted nodes {accepted} are not a path in a {n}-node tree"
+    return accepted
+
+
+def compact_accepted_paths(
+    req_to_token: np.ndarray,
+    req_pool_indices: np.ndarray,
+    cache_loc: np.ndarray,
+    cache_loc_starts: np.ndarray,
+    window_starts: np.ndarray,
+    accept_index: np.ndarray,
+    slots: np.ndarray,
+    draft_token_num: int,
+) -> None:
+    """Move each request's accepted tree path to the front of its verify window.
+
+    Verify lays the draft tree out flat: node ``k`` of slot ``s`` sits at
+    logical position ``window_starts[s] + k``. An accepted path skips siblings,
+    so its nodes are not a prefix of that window. This permutes the window in
+    ``req_to_token`` so position ``window_starts[s] + j`` holds the KV slot of
+    the ``j``-th accepted node, with the rejected nodes' slots kept in order
+    behind them. The batch's ``cache_loc`` copy of the window is permuted the
+    same way.
+
+    The window keeps the same set of KV slots, so ownership is unchanged:
+    accepted slots become the committed prefix and the rejected ones stay in
+    the uncommitted tail that the request frees or reuses.
+
+    ``accept_index`` is ``(padded_bs, accept_width)`` of flat node ids
+    (``s * draft_token_num + k``), ``-1`` past each slot's accepted length.
+    ``slots`` lists the real slots, page_size is 1.
+    """
+    n = draft_token_num
+    for s in slots:
+        accepted = _accepted_nodes(accept_index, s, n)
+        perm = np.concatenate([accepted, np.setdiff1d(np.arange(n), accepted)])
+        if np.array_equal(perm, np.arange(n)):
+            continue
+        req = req_pool_indices[s]
+        start = window_starts[s]
+        loc = cache_loc_starts[s] + start
+        window = req_to_token[req, start : start + n]
+        assert np.array_equal(
+            cache_loc[loc : loc + n], window
+        ), f"slot {s}: cache_loc does not mirror req_to_token over the verify window"
+        compacted = window[perm]
+        req_to_token[req, start : start + n] = compacted
+        cache_loc[loc : loc + n] = compacted
+
+
+def accepted_path_kv_copies(
+    req_to_token: np.ndarray,
+    req_pool_indices: np.ndarray,
+    window_starts: np.ndarray,
+    accept_index: np.ndarray,
+    slots: np.ndarray,
+    draft_token_num: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """KV slot copies that move each accepted tree path to its window front.
+
+    The page_size > 1 counterpart of ``compact_accepted_paths``: a paged
+    ``req_to_token`` must stay contiguous within each page, so the KV moves
+    instead of the pointers. Copying every ``src[i]`` to ``dst[i]`` at once
+    leaves position ``window_starts[s] + j`` holding the KV of the ``j``-th
+    accepted node. Positions past the accepted path are left as they are.
+    """
+    src, dst = [], []
+    for s in slots:
+        accepted = _accepted_nodes(accept_index, s, draft_token_num)
+        moved = np.flatnonzero(accepted != np.arange(len(accepted)))
+        start = window_starts[s]
+        window = req_to_token[req_pool_indices[s], start : start + draft_token_num]
+        src.append(window[accepted[moved]])
+        dst.append(window[moved])
+    if not src:
+        return np.empty(0, np.int32), np.empty(0, np.int32)
+    return np.concatenate(src).astype(np.int32), np.concatenate(dst).astype(np.int32)
 
 
 def assign_req_to_token_pool(
