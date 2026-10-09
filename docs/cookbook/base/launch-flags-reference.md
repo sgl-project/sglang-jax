@@ -89,7 +89,7 @@ grep -n 'add_argument' python/sgl_jax/srt/server_args.py
 | Flag | Default | Choices | Notes |
 |---|---|---|---|
 | `--reasoning-parser` | `None` | `deepseek-r1` / `qwen3` / `mimo` / `kimi` / `glm45` | Splits `<think>` blocks into `reasoning_content` on the OpenAI-compatible response (`ReasoningParser.DetectorMap` in `python/sgl_jax/srt/reasoning_parser.py`). |
-| `--tool-call-parser` | `None` | `qwen25` / `qwen3_coder` / `mimo` / `glm47` / `glm45` | Parses tool/function-call output into `tool_calls` (`FunctionCallParser.ToolCallParserEnum` in `python/sgl_jax/srt/function_call/function_call_parser.py`). |
+| `--tool-call-parser` | `None` | `deepseekv3` / `qwen25` / `qwen3_coder` / `mimo` / `glm47` / `glm45` | Parses tool/function-call output into `tool_calls` (`FunctionCallParser.ToolCallParserEnum` in `python/sgl_jax/srt/function_call/function_call_parser.py`). |
 
 **Parser → recipe mapping** (current cookbook coverage):
 

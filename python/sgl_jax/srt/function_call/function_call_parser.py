@@ -9,6 +9,7 @@ from sgl_jax.srt.entrypoints.openai.protocol import (
 )
 from sgl_jax.srt.function_call.base_format_detector import BaseFormatDetector
 from sgl_jax.srt.function_call.core_types import ToolCallItem
+from sgl_jax.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sgl_jax.srt.function_call.glm4_moe_detector import Glm4MoeDetector
 from sgl_jax.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sgl_jax.srt.function_call.ling3_detector import Ling3Detector
@@ -30,6 +31,7 @@ class FunctionCallParser:
     """
 
     ToolCallParserEnum: dict[str, type[BaseFormatDetector]] = {
+        "deepseekv3": DeepSeekV3Detector,
         "qwen25": Qwen25Detector,
         "qwen3_coder": Qwen3CoderDetector,
         "mimo": MiMoDetector,
