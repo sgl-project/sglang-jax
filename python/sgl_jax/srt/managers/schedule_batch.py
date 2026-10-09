@@ -41,13 +41,14 @@ from sgl_jax.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     MatchPrefixParams,
 )
-from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
+from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache, DeepseekV4ChunkCache
 from sgl_jax.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
     evict_from_tree_cache,
     release_kv_cache,
 )
+from sgl_jax.srt.mem_cache.deepseek_v4.allocator import DeepseekV4TokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sgl_jax.srt.mem_cache.radix_cache import RadixKey, build_radix_key
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
@@ -966,7 +967,10 @@ class ScheduleBatch:
         return_logprob = any(req.return_logprob for req in all_reqs)
         return_output_logprob_only = all(req.return_output_logprob_only for req in all_reqs)
         is_hybrid = False
-        if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
+        if isinstance(
+            token_to_kv_pool_allocator,
+            (SWATokenToKVPoolAllocator, DeepseekV4TokenToKVPoolAllocator),
+        ):
             assert tree_cache is None or isinstance(
                 tree_cache, (SWARadixCache, ChunkCache, UnifiedRadixCache)
             ), "An SWA cache is required for SWATokenToKVPoolAllocator"
@@ -1457,6 +1461,24 @@ class ScheduleBatch:
         Returns:
             False if any DP rank has insufficient memory.
         """
+        if isinstance(self.tree_cache, DeepseekV4ChunkCache):
+            allocator = self.token_to_kv_pool_allocator
+            for rank, info in enumerate(self.reqs_info):
+                indices = selected_indices.get(rank) if selected_indices else None
+                reqs = info.reqs or []
+                reqs = reqs if indices is None else [reqs[i] for i in indices]
+                lengths = np.asarray([r.kv_committed_len + 1 for r in reqs], np.int32)
+                last = np.asarray(
+                    [
+                        self.req_to_token_pool.req_to_token[r.req_pool_idx, r.kv_committed_len - 1]
+                        for r in reqs
+                    ],
+                    np.int32,
+                )
+                if not allocator.can_allocate(allocator.estimate_decode(lengths, last, rank), rank):
+                    return False
+            return True
+
         num_tokens_per_dp = {}
         for dp_rank in range(self.dp_size):
             info = self.reqs_info[dp_rank]
@@ -1506,10 +1528,14 @@ class ScheduleBatch:
             )
 
             while True:
-                num_tokens = self.new_tokens_required_next_decode(dp_rank, sorted_indices)
-                requirements = {dp_rank: num_tokens}
-                self._evict_tree_cache_if_needed(requirements)
-                if self._is_available_size_sufficient(requirements):
+                if isinstance(self.tree_cache, DeepseekV4ChunkCache):
+                    sufficient = self.check_decode_mem({dp_rank: sorted_indices})
+                else:
+                    num_tokens = self.new_tokens_required_next_decode(dp_rank, sorted_indices)
+                    requirements = {dp_rank: num_tokens}
+                    self._evict_tree_cache_if_needed(requirements)
+                    sufficient = self._is_available_size_sufficient(requirements)
+                if sufficient:
                     break
 
                 retract_idx = sorted_indices.pop()
@@ -1602,6 +1628,8 @@ class ScheduleBatch:
 
     def maybe_evict_swa(self, sliding_window_size=None):
         """Evict SWA pool slots outside the sliding window for all requests."""
+        if isinstance(self.tree_cache, DeepseekV4ChunkCache):
+            return  # C reclaims only after the submitted forward completes.
         if not self.is_hybrid:
             return
         if sliding_window_size is None:
@@ -3413,12 +3441,12 @@ class ScheduleBatch:
             new_info = ScheduleReqsInfo()
             new_info.reqs = list(info.reqs) if info.reqs else info.reqs
             new_info.out_cache_loc = info.out_cache_loc
-            # Output collection must use the submitted positions, even when
-            # overlap scheduling advances the live request's next batch.
+            # V4 SWA reclamation and hidden-state collection both need the
+            # completed forward's lengths, not the next batch's live lengths.
+            new_info.seq_lens = (
+                np.array(info.seq_lens, copy=True) if info.seq_lens is not None else None
+            )
             if self.return_hidden_states:
-                new_info.seq_lens = (
-                    np.array(info.seq_lens, copy=True) if info.seq_lens is not None else None
-                )
                 new_info.prefix_lens = (
                     list(info.prefix_lens) if info.prefix_lens is not None else None
                 )
@@ -3512,9 +3540,12 @@ class ScheduleBatch:
                 result_strs.append(
                     f"{prefix}Available full tokens: {full_available_size + full_evictable_size} ({full_available_size=} + {full_evictable_size=})\n"
                     f"{prefix}Available swa tokens: {swa_available_size + swa_evictable_size} ({swa_available_size=} + {swa_evictable_size=})\n"
-                    f"{prefix}Full LRU list evictable size: {self.tree_cache.full_lru_list_evictable_size()}\n"
-                    f"{prefix}SWA LRU list evictable size: {self.tree_cache.swa_lru_list_evictable_size()}\n"
                 )
+                if not isinstance(self.tree_cache, DeepseekV4ChunkCache):
+                    result_strs.append(
+                        f"{prefix}Full LRU list evictable size: {self.tree_cache.full_lru_list_evictable_size()}\n"
+                        f"{prefix}SWA LRU list evictable size: {self.tree_cache.swa_lru_list_evictable_size()}\n"
+                    )
             else:
                 available_size = self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank)
                 evictable_size = self.tree_cache.evictable_size(dp_rank=dp_rank)

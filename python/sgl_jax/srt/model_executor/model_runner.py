@@ -140,7 +140,9 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.is_hybrid = False
-        self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
+        self.use_mla_backend = (
+            self.model_config.attention_arch == AttentionArch.MLA and not self._is_deepseek_v4()
+        )
         self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
 
         self.forward_pass_id = 0
@@ -189,10 +191,15 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
         # Check if the model is using hybrid SWA
         if (
-            not self.server_args.disable_hybrid_swa_memory
+            not self._is_deepseek_v4()
+            and not self.server_args.disable_hybrid_swa_memory
             and self.sliding_window_size is not None
             and self.sliding_window_size > 0
         ):
+            self.is_hybrid = True
+
+        if self._is_deepseek_v4():
+            # V4 has a separate SWA pool even when generic hybrid SWA is disabled.
             self.is_hybrid = True
 
         # Init lora
@@ -201,7 +208,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
         self._sampler_base_rng = jax.random.PRNGKey(server_args.random_seed)
         self._sampler_step = jax.device_put(np.int32(0), NamedSharding(self.mesh, P()))
-        if not self.is_draft_worker:
+        if not self.is_draft_worker and not self._is_deepseek_v4():
             self.initialize_jit()
 
         # Init memory pool and attention backends
@@ -211,6 +218,9 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             total_device_memory,
             dp_size=server_args.dp_size,
         )
+        self.bind_attention_resources()
+        if not self.is_draft_worker and self._is_deepseek_v4():
+            self.initialize_jit()
         self._maybe_warn_dsa_sparse_prefill_temporaries()
         self._build_embedding_pool()
 
@@ -501,9 +511,16 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
             with LoraBatchContext.set_batch(forward_batch):
+                from sgl_jax.srt.model_executor.deepseek_v4_runtime import (
+                    validate_pool_updates,
+                )
+
+                if forward_batch.deepseek_v4_metadata is not None:
+                    forward_batch.attn_backend.forward_metadata = forward_batch.deepseek_v4_metadata
                 output, pool_updates, aux, layers_topk_ids = model(
                     forward_batch, memory_pools, logits_metadata
                 )
+                validate_pool_updates(memory_pools, pool_updates)
             s_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
             sampler = nnx.merge(sampler_def, s_state)
             rng_step = rng_step + jnp.int32(1)
@@ -756,7 +773,48 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         """Init attention kernel backend."""
         self.attn_backend = self._get_attention_backend()
 
+    def bind_attention_resources(self):
+        if self._is_deepseek_v4():
+            self.attn_backend.bind_resources(
+                self.req_to_token_pool, self.token_to_kv_pool_allocator
+            )
+
+    def get_attention_metadata(self, batch):
+        if self._is_deepseek_v4():
+            return self.attn_backend.get_forward_metadata(
+                batch,
+                request_pool=self.req_to_token_pool,
+                allocator=self.token_to_kv_pool_allocator,
+            )
+        return self.attn_backend.get_forward_metadata(batch)
+
+    def prepare_dummy_batch(self, batch):
+        if self._is_deepseek_v4():
+            from sgl_jax.srt.model_executor.deepseek_v4_runtime import (
+                prepare_dummy_batch,
+            )
+
+            prepare_dummy_batch(batch, self.attn_backend.request_capacity)
+
     def _get_attention_backend(self):
+        if self._is_deepseek_v4():
+            from sgl_jax.srt.layers.attention.deepseek_v4_backend import (
+                DeepseekV4AttentionBackend,
+            )
+            from sgl_jax.srt.model_executor.deepseek_v4_runtime import (
+                validate_runtime_config,
+            )
+
+            validate_runtime_config(
+                self.server_args, dp_size=self.dp_size, is_draft=self.is_draft_worker
+            )
+            return DeepseekV4AttentionBackend(
+                mesh=self.mesh,
+                page_size=self.page_size,
+                max_context_len=self.model_config.context_len,
+                config=self.model_config.hf_text_config,
+            )
+
         def _has_softmax_dtype(config) -> bool:
             from sgl_jax.srt.configs.dtype_config import DtypeConfig
 
@@ -952,7 +1010,8 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
     def lower_model(self, batch):
         """Prepare forward metadata and lower under the caller's model mesh."""
-        self.attn_backend.forward_metadata = self.attn_backend.get_forward_metadata(batch)
+        if not self._is_deepseek_v4():
+            self.attn_backend.forward_metadata = self.get_attention_metadata(batch)
         logits_metadata = LogitsMetadata.from_model_worker_batch(batch, self.mesh)
         return self._lower_model(batch.forward_batch, logits_metadata)
 

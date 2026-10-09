@@ -34,6 +34,22 @@ _PLATFORMS = (
         gates_blocks=(512, 1024, 2048),
         post_blocks=(8, 16, 32, 64, 128, 256),
     ),
+    MHCPlatform(
+        name="TPU v7x",
+        # The device reports "TPU7x"; retain the other common spellings too.
+        device_markers=("tpu7x", "v7x", "tpu v7"),
+        lane_width=128,
+        # Match epic/dsv4: Pallas gets 32 MiB scoped VMEM, even though the
+        # device has 64 MiB total. Larger tiles can fail TPU compilation.
+        vmem_bytes=32 * 1024 * 1024,
+        # XLA has 32 MiB after the scoped reserve, versus 96 MiB on v6e.
+        xla_vmem_bytes=32 * 1024 * 1024,
+        xla_vmem_reserve_bytes=64 * 1024,
+        collapse_blocks=(8, 16, 32, 64, 128, 256),
+        highest_collapse_blocks=(8, 16, 32, 64),
+        gates_blocks=(512, 1024, 2048),
+        post_blocks=(8, 16, 32, 64, 128, 256),
+    ),
 )
 
 

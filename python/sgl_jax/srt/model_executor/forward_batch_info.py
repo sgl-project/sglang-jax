@@ -17,7 +17,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import IntEnum, auto
 from functools import total_ordering
 from typing import TYPE_CHECKING
@@ -211,6 +211,8 @@ class ForwardBatch:
     # otherwise.
     recurrent_track_indices: jax.Array | None = None
     recurrent_track_mask: jax.Array | None = None
+    # B produces this host vector; R uploads it with ordinary batch metadata.
+    deepseek_v4_metadata: object | None = None
 
     def tree_flatten(self):
         children = (
@@ -237,6 +239,7 @@ class ForwardBatch:
             self.recurrent_cow_src_indices,
             self.recurrent_track_indices,
             self.recurrent_track_mask,
+            self.deepseek_v4_metadata,
         )
 
         aux_data = {
@@ -288,6 +291,7 @@ class ForwardBatch:
         obj.recurrent_cow_src_indices = children[20]
         obj.recurrent_track_indices = children[21]
         obj.recurrent_track_mask = children[22]
+        obj.deepseek_v4_metadata = children[23]
         return obj
 
     def __repr__(self) -> str:
@@ -350,29 +354,50 @@ class ForwardBatch:
         cls,
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
+        forward_metadata=None,
     ):
+        from sgl_jax.srt.utils.jax_utils import packed_device_array
+
+        v4_metadata = None
+        from sgl_jax.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttentionBackend,
+        )
+
+        if isinstance(model_runner.attn_backend, DeepseekV4AttentionBackend):
+            v4_metadata = (
+                forward_metadata
+                if forward_metadata is not None
+                else model_runner.get_attention_metadata(batch)
+            )
         (
             input_ids,
             seq_lens,
             out_cache_loc,
             positions,
             req_pool_indices,
-            cache_loc,
             extend_prefix_lens,
             extend_seq_lens,
-        ) = device_array(
+            packed_metadata,
+        ) = packed_device_array(
             (
                 batch.input_ids,
                 batch.seq_lens,
                 batch.out_cache_loc,
                 batch.positions,
                 batch.req_pool_indices,
-                batch.cache_loc,
                 batch.extend_prefix_lens,
                 batch.extend_seq_lens,
+                v4_metadata.packed if v4_metadata is not None else None,
             ),
             sharding=NamedSharding(model_runner.mesh, PartitionSpec("data")),
         )
+        # Keep the large padded cache-address vector out of small-field packing.
+        cache_loc = device_array(
+            batch.cache_loc,
+            sharding=NamedSharding(model_runner.mesh, PartitionSpec("data")),
+        )
+        if v4_metadata is not None:
+            v4_metadata = replace(v4_metadata, packed=packed_metadata)
         mrope_positions = batch.mrope_positions
         mrope_position_axes = getattr(
             getattr(model_runner, "model", None),
@@ -482,6 +507,7 @@ class ForwardBatch:
             lora_token_indices=lora_token_indices,
             lora_ranks=lora_ranks,
             attn_backend=model_runner.attn_backend,
+            deepseek_v4_metadata=v4_metadata,
             spec_info=batch.spec_info_padded,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=batch.capture_hidden_mode,

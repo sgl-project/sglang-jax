@@ -660,11 +660,12 @@ class ModelConfig:
         # KV via kv_b_proj and run standard attention. Read by
         # DeepseekV3DecoderLayer to construct DeepseekV3Attention; harmless on
         # non-MLA models that ignore the attribute.
-        self.hf_config.use_absorbed_mla = server_args.attention_backend in (
+        is_v4 = getattr(self.hf_text_config, "model_type", None) == "deepseek_v4"
+        self.hf_config.use_absorbed_mla = not is_v4 and server_args.attention_backend in (
             "fa",
             "dsa_sparse",
         )
-        self.hf_config.use_dsa_sparse = server_args.attention_backend == "dsa_sparse"
+        self.hf_config.use_dsa_sparse = not is_v4 and server_args.attention_backend == "dsa_sparse"
         self.hf_config.enable_sequence_parallel = server_args.enable_sequence_parallel
         self.hf_config.vision_encoder_parallel = server_args.vision_encoder_parallel
 

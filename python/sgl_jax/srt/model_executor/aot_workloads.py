@@ -57,6 +57,9 @@ class InputContext:
     backend: AttentionBackend
     memory_pools: MemoryPools
     supports_recurrent_cow: bool = False
+    request_pool: object = None
+    allocator: object = None
+    v4_capacities: tuple | None = None
 
     def shaped(self, shape, dtype=jnp.int32):
         return jax.ShapeDtypeStruct(shape, dtype, sharding=NamedSharding(self.mesh, P("data")))
@@ -74,6 +77,39 @@ class WorkloadInputs:
 
 def _attention_metadata(backend, context, spec, *, page_count=None, swa=True):
     """Use serving's metadata pytrees and per-DP layouts without allocating arrays."""
+    from sgl_jax.srt.layers.attention.deepseek_v4_backend import (
+        DeepseekV4AttentionBackend,
+    )
+
+    if isinstance(backend, DeepseekV4AttentionBackend):
+        from dataclasses import replace
+        from types import SimpleNamespace
+
+        import numpy as np
+
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE if spec.name == "decode" else ForwardMode.EXTEND,
+            seq_lens=np.zeros(spec.request_count, np.int32),
+            req_pool_indices=np.full(spec.request_count, backend.request_capacity, np.int32),
+            positions=np.zeros(spec.input_token_count, np.int32),
+            out_cache_loc=np.full(spec.input_token_count, -1, np.int32),
+            cache_loc=np.zeros(
+                spec.cache_loc_size
+                or spec.request_count * -(-spec.context_length // spec.page_size) * spec.page_size,
+                np.int32,
+            ),
+            extend_seq_lens=np.zeros(spec.request_count, np.int32),
+            extend_prefix_lens=np.zeros(spec.request_count, np.int32),
+        )
+        previous = backend.precompile_capacity_override
+        try:
+            backend.precompile_capacity_override = context.v4_capacities
+            md = backend.get_forward_metadata(
+                batch, request_pool=context.request_pool, allocator=context.allocator
+            )
+        finally:
+            backend.precompile_capacity_override = previous
+        return replace(md, packed=context.shaped(md.packed.shape, md.packed.dtype))
     vector = context.vector
     bs, dp = spec.request_count, spec.dp_size
     if isinstance(backend, HybridLinearAttnBackend):
@@ -162,7 +198,7 @@ class WorkloadInputBuilder(ABC):
         spec, vector = self.spec, context.vector
         padded_context = -(-spec.context_length // spec.page_size) * spec.page_size
         recurrent_indices = None
-        if context.memory_pools.recurrent_state_pool is not None:
+        if getattr(context.memory_pools, "recurrent_state_pool", None) is not None:
             recurrent_indices = metadata.linear_attn_metadata.recurrent_indices
         return ForwardBatch(
             bid=0,
@@ -174,6 +210,7 @@ class WorkloadInputBuilder(ABC):
             out_cache_loc=vector(spec.input_token_count),
             positions=vector(spec.input_token_count),
             attn_backend=context.backend,
+            deepseek_v4_metadata=metadata if context.request_pool is not None else None,
             cache_loc=vector(spec.cache_loc_size or spec.request_count * padded_context),
             recurrent_indices=recurrent_indices,
             recurrent_cow_src_indices=(

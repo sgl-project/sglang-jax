@@ -139,7 +139,9 @@ def export_server(server_args):
                 max_req_len,
                 config.vocab_size,
                 max_total_num_tokens=(
-                    resources.max_total_num_tokens if server_args.attention_backend == "tt" else 0
+                    resources.max_total_num_tokens
+                    if server_args.attention_backend == "tt" or resources._is_deepseek_v4()
+                    else 0
                 ),
                 moe_backend=config.moe_backend.value,
                 attn_backend=resources.attn_backend,
@@ -170,25 +172,49 @@ def export_server(server_args):
                         )
                         options.cache_loc_size = cache_loc
                         options.decode_page_count = manager.decode_page_count(bs, cache_loc, pages)
-                        fn, args, _, _ = model.build_inputs(options)
-                        entry = dict(
-                            workload=workload,
-                            batch_size=bs,
-                            num_tokens=tokens,
-                            directory=f"{workload}-bs{bs}-tokens{tokens}"
-                            + ("" if pages is None else f"-pages{pages}"),
+                        from sgl_jax.srt.model_executor.deepseek_v4_runtime import (
+                            precompile_capacity_variants,
                         )
-                        yield entry, partial(fn.lower, *args), CompilationManager.compiler_options(
-                            args[3].attn_backend, args[3]
+
+                        variants = (
+                            precompile_capacity_variants(
+                                resources.attn_backend, mode, bs, resources.max_total_num_tokens
+                            )
+                            if resources._is_deepseek_v4()
+                            else [None]
                         )
+                        for capacities in variants:
+                            options.v4_capacities = capacities
+                            fn, args, _, _ = model.build_inputs(options)
+                            entry = dict(
+                                workload=workload,
+                                batch_size=bs,
+                                num_tokens=tokens,
+                                directory=f"{workload}-bs{bs}-tokens{tokens}"
+                                + ("" if pages is None else f"-pages{pages}"),
+                            )
+                            if capacities is not None:
+                                entry["v4_capacities"] = capacities
+                                entry["directory"] += "-v4-" + "-".join(map(str, capacities))
+                            yield entry, partial(
+                                fn.lower, *args
+                            ), CompilationManager.compiler_options(args[3].attn_backend, args[3])
 
             with CompilationPool(server_args.precompile_num_threads) as pool:
                 logits = []
+                logits_keys = set()
                 for entry, outputs in _export(
                     pool, model_jobs(), mesh, output, manifest["buckets"]
                 ):
                     if entry["workload"] == "decode":
-                        logits.append(outputs[0])
+                        value = outputs[0]
+                        key = (
+                            jax.tree.structure(value),
+                            tuple((x.shape, x.dtype, x.sharding) for x in jax.tree.leaves(value)),
+                        )
+                        if key not in logits_keys:
+                            logits_keys.add(key)
+                            logits.append(value)
                     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
                 _export_sampling(
                     pool,

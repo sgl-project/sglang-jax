@@ -77,6 +77,21 @@ def validate_unified_hybrid_swa_route(ctx: TreeCacheBuildContext) -> None:
 
 def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     params = ctx.params
+    from sgl_jax.srt.mem_cache.deepseek_v4.allocator import (
+        DeepseekV4TokenToKVPoolAllocator,
+    )
+
+    if isinstance(params.token_to_kv_pool_allocator, DeepseekV4TokenToKVPoolAllocator):
+        from sgl_jax.srt.mem_cache.chunk_cache import DeepseekV4ChunkCache
+
+        if not ctx.disable_radix_cache:
+            raise ValueError("V4 requires request-owned chunk cache without prefix reuse")
+        return DeepseekV4ChunkCache(
+            params.req_to_token_pool,
+            params.token_to_kv_pool_allocator,
+            params.page_size,
+            params.sliding_window_size,
+        )
     validate_unified_hybrid_swa_route(ctx)
 
     if ctx.is_hybrid_swa:

@@ -215,7 +215,9 @@ class ModelWorker:
             # uncapped buckets because odd shapes slow the Pallas kernel.
             max_total_num_tokens=(
                 self.max_total_num_tokens
-                if os.getenv("JAX_PLATFORMS") == "proxy" or server_args.attention_backend == "tt"
+                if os.getenv("JAX_PLATFORMS") == "proxy"
+                or server_args.attention_backend == "tt"
+                or self.model_runner._is_deepseek_v4()
                 else 0
             ),
             # Multimodal models use the regular in-model path by default.
@@ -281,9 +283,10 @@ class ModelWorker:
             self.compilation_manager.precompile_all(*args)
 
     def set_forward_metadata(self, model_worker_batch: ModelWorkerBatch):
-        self.model_runner.attn_backend.forward_metadata = (
-            self.model_runner.attn_backend.get_forward_metadata(model_worker_batch)
-        )
+        if not self.model_runner._is_deepseek_v4():
+            self.model_runner.attn_backend.forward_metadata = (
+                self.model_runner.get_attention_metadata(model_worker_batch)
+            )
 
     def get_max_padded_size(self):
         from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
@@ -405,12 +408,12 @@ class ModelWorker:
         if model_worker_batch.forward_batch is not None:
             forward_batch = model_worker_batch.forward_batch
         else:
-            forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-
-        if forward_metadata is None:
-            forward_metadata = self.model_runner.attn_backend.get_forward_metadata(
-                model_worker_batch
+            forward_batch = ForwardBatch.init_new(
+                model_worker_batch, self.model_runner, forward_metadata
             )
+
+        if forward_metadata is None and not self.model_runner._is_deepseek_v4():
+            forward_metadata = self.model_runner.get_attention_metadata(model_worker_batch)
 
         if sampling_metadata is None:
             sampling_metadata = SamplingMetadata.from_model_worker_batch(
@@ -420,7 +423,8 @@ class ModelWorker:
                 self.model_config.vocab_size,
             )
 
-        self.model_runner.attn_backend.forward_metadata = forward_metadata
+        if not self.model_runner._is_deepseek_v4():
+            self.model_runner.attn_backend.forward_metadata = forward_metadata
         logits_metadata = LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh)
 
         # Pathways-PD: fuse run_model+sampler+resolve/set into one jit so a

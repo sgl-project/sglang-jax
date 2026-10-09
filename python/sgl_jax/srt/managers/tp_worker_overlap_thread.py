@@ -306,16 +306,14 @@ class ModelWorkerClient:
                 self.worker.model_config.vocab_size,
             )
 
-        forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(
-            model_worker_batch
-        )
+        forward_metadata = self.worker.model_runner.get_attention_metadata(model_worker_batch)
 
         # Prepare LoRA batch if LoRA is enabled
         if self.worker.server_args.enable_lora:
             self.worker.prepare_lora_batch(model_worker_batch)
 
         model_worker_batch.forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.worker.get_model_runner()
+            model_worker_batch, self.worker.get_model_runner(), forward_metadata
         )
 
         # Per-request slots: placeholder value -(req_pool_idx + 1) round-trips

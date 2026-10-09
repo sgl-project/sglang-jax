@@ -850,6 +850,12 @@ class ModelRunnerKVCacheMixin:
         dp_size: int = 1,
     ):
         """Initialize memory pool for KV cache (+ recurrent state if hybrid)."""
+        if self._is_deepseek_v4():
+            self._init_deepseek_v4_memory_pool(
+                max_num_reqs, max_total_tokens, total_device_memory, dp_size
+            )
+            return
+
         # 1. kv_cache_dtype
         self._init_kv_cache_dtype()
 
@@ -915,6 +921,69 @@ class ModelRunnerKVCacheMixin:
                 "swa_index_mapping",
                 self.token_to_kv_pool_allocator.full_to_swa_index_mapping,
             )
+
+    def _is_deepseek_v4(self):
+        cfg = getattr(
+            self.model_config, "hf_text_config", getattr(self.model_config, "hf_config", None)
+        )
+        return getattr(cfg, "model_type", None) == "deepseek_v4" or "DeepseekV4ForCausalLM" in (
+            getattr(cfg, "architectures", None) or ()
+        )
+
+    def _init_deepseek_v4_memory_pool(
+        self, max_num_reqs, max_total_tokens, total_device_memory, dp_size
+    ):
+        from sgl_jax.srt.mem_cache.deepseek_v4.capacity import (
+            build_deepseek_v4_pools,
+            plan_deepseek_v4_pools,
+        )
+        from sgl_jax.srt.mem_cache.deepseek_v4.pool import DeepseekV4CacheSpec
+        from sgl_jax.srt.model_executor.deepseek_v4_runtime import (
+            validate_runtime_config,
+        )
+
+        validate_runtime_config(self.server_args, dp_size=dp_size, is_draft=self.is_draft_worker)
+        if self.token_to_kv_pool_allocator is not None:
+            raise ValueError("V4 must construct its request-owned allocator with its pools")
+        self.kv_cache_dtype = jnp.bfloat16
+        spec = DeepseekV4CacheSpec.from_config(self.model_config.hf_text_config)
+        available = self._profile_available_bytes(total_device_memory)
+        if self.req_to_token_pool is not None:
+            if max_num_reqs is not None and max_num_reqs != self.req_to_token_pool.size:
+                raise ValueError("V4 request pool and requested state capacity disagree")
+            max_num_reqs = self.req_to_token_pool.size
+        ci_size = os.environ.get("SGLANG_CI_SMALL_KV_SIZE")
+        if ci_size:
+            max_total_tokens = (
+                min(int(ci_size), max_total_tokens)
+                if max_total_tokens is not None
+                else int(ci_size)
+            )
+        budget = plan_deepseek_v4_pools(
+            spec,
+            available,
+            max_num_reqs,
+            self.page_size,
+            dp_size,
+            self.server_args.swa_full_tokens_ratio,
+            max_total_tokens,
+        )
+        self.deepseek_v4_pool_budget = budget
+        self.max_total_num_tokens = self.full_max_total_num_tokens = budget.history_tokens
+        self.swa_max_total_num_tokens = budget.swa_tokens
+        self.req_to_token_pool, self.memory_pools, self.token_to_kv_pool_allocator = (
+            build_deepseek_v4_pools(
+                spec,
+                budget,
+                self.page_size,
+                self.mesh,
+                self.model_config.context_len + 4,
+                dp_size,
+                req_pool=self.req_to_token_pool,
+            )
+        )
+        self.token_to_kv_pool = self.memory_pools.token_to_kv_pool
+        logger.info("V4 pool budget (per-device, TP replicated): %s", budget)
 
     # ── Properties ──
 

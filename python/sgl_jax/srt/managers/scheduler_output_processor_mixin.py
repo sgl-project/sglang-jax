@@ -212,6 +212,9 @@ class SchedulerOutputProcessorMixin:
                 logits_output.input_token_logprobs,
                 _input_logprob_lens_per_dp(batch),
             )
+        from sgl_jax.srt.model_executor.deepseek_v4_runtime import reclaim_batch_swa
+
+        reclaim_batch_swa(batch, self.tree_cache)
         _collect_hidden_states(batch, logits_output.hidden_states)
         per_dp_bs_size = batch.per_dp_bs_size
 
@@ -472,6 +475,9 @@ class SchedulerOutputProcessorMixin:
                     float
                 )
 
+        from sgl_jax.srt.model_executor.deepseek_v4_runtime import reclaim_batch_swa
+
+        reclaim_batch_swa(batch, self.tree_cache)
         _collect_hidden_states(batch, logits_output.hidden_states)
         self.token_to_kv_pool_allocator.free_group_begin()
 

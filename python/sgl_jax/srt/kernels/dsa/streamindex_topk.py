@@ -767,6 +767,7 @@ def select_topk_indices(scores: jax.Array, k: int, *, backend: str = "auto") -> 
         "vmem_limit_bytes",
         "decode_req_batch_size",
         "topk_backend",
+        "return_scores",
     ),
 )
 def streamindex_topk(
@@ -785,6 +786,7 @@ def streamindex_topk(
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     decode_req_batch_size: int = 4,
     topk_backend: str = "auto",
+    return_scores: bool = False,
 ) -> jax.Array:
     """StreamIndex Top-K retrieval.
 
@@ -811,9 +813,12 @@ def streamindex_topk(
       vmem_limit_bytes: the vmem limit for the pallas kernel.
       topk_backend: exit-stage selector: "auto" (SparseCore radix select when
         available and the row is large enough, else XLA), "sc" or "xla".
+      return_scores: return masked float32 scores without top-K selection,
+        for the DeepSeek-V4 prefill membership-mask path.
 
     Returns:
-      Top-K indices (in compressed space).
+      Top-K indices (in compressed space), or scores [T, E_padded] when
+      return_scores is true; invisible entries retain their -inf scores.
     """
     # Scale factors for the FP8 index cache format are packed directly inside
     # `cache_kv` along the width dimension, keeping HBM transactions fused.
@@ -1051,6 +1056,8 @@ def streamindex_topk(
     )
 
     scores = scores.reshape(q.shape[0], -1)
+    if return_scores:
+        return scores[: q.shape[0]]
     topk_idxs = select_topk_indices(scores, k, backend=topk_backend)
     return topk_idxs[: q.shape[0], :k]
 

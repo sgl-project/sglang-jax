@@ -6,6 +6,7 @@ import jax
 from flax import nnx
 
 from sgl_jax.srt.lora.context_manager import LoraBatchContext
+from sgl_jax.srt.model_executor.deepseek_v4_runtime import validate_pool_updates
 
 
 def _maybe_apply_recurrent_cow(forward_batch, memory_pools):
@@ -44,6 +45,10 @@ def make_jitted_run_model(attn_backend, compiler_options=None):
         model = nnx.merge(model_def, model_state)
         memory_pools = _maybe_apply_recurrent_cow(forward_batch, memory_pools)
         with LoraBatchContext.set_batch(forward_batch):
-            return model(forward_batch, memory_pools, logits_metadata)
+            if forward_batch.deepseek_v4_metadata is not None:
+                forward_batch.attn_backend.forward_metadata = forward_batch.deepseek_v4_metadata
+            result = model(forward_batch, memory_pools, logits_metadata)
+            validate_pool_updates(memory_pools, result[1])
+            return result
 
     return jitted_run_model

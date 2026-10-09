@@ -268,7 +268,16 @@ suites = {
         TestFile("test/srt/kernels/hca/test_v4_backend.py", 5, runner="pytest"),
         TestFile("test/srt/kernels/csa_attention/test_attention.py", 3, runner="pytest"),
         TestFile("test/srt/kernels/csa_compressor/test_compressor.py", 3, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_backend.py", 3, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_packed_metadata.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_compressor.py", 2, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_csa_attention.py", 2, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_csa_decode.py", 2, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_csa_decode_segments.py", 2, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_indexer_kernel.py", 2, runner="pytest"),
+        TestFile("test/srt/test_deepseek_v4_topk_threshold.py", 1, runner="pytest"),
         TestFile("test/srt/kernels/mhc/test_mhc.py", 2, runner="pytest"),
+        TestFile("python/sgl_jax/test/layers/test_deepseek_v4_mhc.py", 2, runner="pytest"),
         # Pytest tears down the shared FlashAttention mesh cleanly on JAX 0.10.2.
         TestFile("python/sgl_jax/test/test_flashattention_mha.py", 11, runner="pytest"),
         TestFile("python/sgl_jax/test/test_flashattention_gqa.py", 11, runner="pytest"),
@@ -277,6 +286,7 @@ suites = {
         TestFile("python/sgl_jax/test/test_mla_attention.py", 2.5),
         TestFile("test/srt/kernels/hca/test_backend.py", 15, runner="pytest"),
         TestFile("python/sgl_jax/test/test_moe_topk.py", 0.3),
+        TestFile("python/sgl_jax/test/test_deepseek_v4_moe.py", 3, runner="pytest"),
         TestFile("python/sgl_jax/test/kernels/fused_moe_v1_test.py", 9),
         TestFile("python/sgl_jax/test/kernels/fused_moe_v2_test.py", 3),
         TestFile("python/sgl_jax/test/kernels/biased_topk_test.py", 1, runner="pytest"),
@@ -313,6 +323,31 @@ suites = {
     # have a conditional CPU pin gated on USE_DEVICE_TYPE=cpu — the
     # cpu-test CI job sets that env var.
     "unit-test-cpu": [
+        TestFile(
+            "test/srt/test_deepseek_v4_tpu_contract.py",
+            1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "8"},
+        ),
+        TestFile(
+            "test/srt/test_deepseek_v4_runtime.py",
+            2,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "4"},
+        ),
+        TestFile(
+            "python/sgl_jax/test/test_deepseek_v4_moe.py",
+            1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "4"},
+        ),
+        TestFile(
+            "python/sgl_jax/test/test_deepseek_v4_moe_loading.py",
+            1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "4"},
+        ),
+        TestFile("test/srt/quantization/test_mxfp4_fp8_loader.py", 1, runner="pytest"),
         TestFile("python/sgl_jax/test/constrained/test_grammar_backend.py", 0.1),
         TestFile(
             "python/sgl_jax/test/test_dp_feature_parity.py",
@@ -344,6 +379,7 @@ suites = {
         TestFile("test/srt/kernels/qsa/test_paging.py", 0.1),
         TestFile("test/srt/kernels/qsa/test_qsa_pipeline.py", 0.5),
         TestFile("test/srt/mem_cache/test_qsa_pool.py", 0.1),
+        TestFile("python/sgl_jax/test/layers/test_deepseek_v4_mhc.py", 0.2, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/test_embedding_pool.py",
             0.1,

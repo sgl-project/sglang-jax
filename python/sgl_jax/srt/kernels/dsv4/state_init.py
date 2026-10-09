@@ -13,11 +13,15 @@ scalar loop over the batch.
 
 from __future__ import annotations
 
+import os
+
 import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
+from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 
 
 def _kernel(slots_ref, template_ref, _, state_ref, sem, *, capacity):
@@ -48,6 +52,14 @@ def _kernel(slots_ref, template_ref, _, state_ref, sem, *, capacity):
     lax.fori_loop(0, count, wait, 0)
 
 
+STATE_INIT_KERNEL_ENV = "DSV4_STATE_INIT_KERNEL"
+
+
+def state_init_kernel_enabled() -> bool:
+    """Select the DMA reset, or the numerical XLA fallback for diagnostics."""
+    return os.environ.get(STATE_INIT_KERNEL_ENV, "1") == "1"
+
+
 def init_state_slots(state, slots, template, *, capacity=None, interpret=None):
     """``state.at[slots].set(template)`` for every ``0 <= slot < capacity``, in place.
 
@@ -67,7 +79,7 @@ def init_state_slots(state, slots, template, *, capacity=None, interpret=None):
     if not 0 <= capacity <= state.shape[0]:
         raise ValueError("capacity must not exceed the number of state slots")
     if interpret is None:
-        interpret = jax.default_backend() != "tpu"
+        interpret = not is_tpu_runtime()
     return pl.pallas_call(
         lambda *refs: _kernel(*refs, capacity=capacity),
         grid_spec=pltpu.PrefetchScalarGridSpec(

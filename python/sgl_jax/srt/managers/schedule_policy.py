@@ -20,6 +20,7 @@ from sgl_jax.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sgl_jax.srt.mem_cache.deepseek_v4.allocator import DeepseekV4TokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.radix_cache import RadixCache, TreeNode
 from sgl_jax.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
@@ -321,7 +322,10 @@ class PrefillAdder:
                         for r in info.reqs
                     )
 
-        self.is_hybrid = isinstance(self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
+        self.is_hybrid = isinstance(
+            self.token_to_kv_pool_allocator,
+            (SWATokenToKVPoolAllocator, DeepseekV4TokenToKVPoolAllocator),
+        )
         self.rem_swa_token_offset = [0] * dp_size
         if self.is_hybrid and running_batch is not None:
             for dp_rank, info in enumerate(running_batch.reqs_info):
