@@ -11,7 +11,10 @@ Run with:
 import json
 import unittest
 
-from sgl_jax.srt.function_call.glm47_moe_detector import Glm47MoeDetector
+from sgl_jax.srt.function_call.glm47_moe_detector import (
+    Glm47MoeDetector,
+    parse_arguments,
+)
 from sgl_jax.test.test_utils import CustomTestCase
 from sgl_jax.test.tool_parser_test_config import ToolParserTestConfig as C
 
@@ -132,6 +135,49 @@ class TestGlm47Detector(CustomTestCase):
         self.assertEqual(args["ratio"], 3.14)
         self.assertIs(args["flag"], True)
         self.assertEqual(args["obj"], {"k": 1})
+
+    def test_parse_arguments_bare_comma_is_not_a_tuple(self):
+        # literal_eval turns "1,000" into (1, 0); only array args take it, as a list
+        self.assertEqual(parse_arguments("1,000", "number"), ("1,000", True))
+        self.assertEqual(parse_arguments('"a","b"', "object"), ('"a","b"', True))
+        self.assertEqual(parse_arguments("1, 2", "array"), ([1, 2], True))
+
+    def test_string_arg_keeps_model_text(self):
+        tool = C.make_tool("f", {"s": {"type": "string"}})
+        for value in ("false", "null", "1,000"):
+            text = f"<tool_call>f<arg_key>s</arg_key><arg_value>{value}</arg_value></tool_call>"
+            result = Glm47MoeDetector().detect_and_parse(text, [tool])
+            self.assertEqual(json.loads(result.calls[0].parameters), {"s": value})
+
+    def test_streaming_matches_non_streaming_for_non_json_values(self):
+        """Streamed arguments must be valid JSON and equal detect_and_parse,
+        including values that aren't strict JSON and a trailing object value."""
+        cases = [
+            ("number", "1,000"),
+            ("integer", ""),
+            ("boolean", "True"),
+            ("array", "1, 2"),
+            ("array", "[1, 2]"),
+            ("object", '{"a": 1}'),
+            ("string", "false"),
+            (None, "42"),
+            (None, "abc"),
+        ]
+        for arg_type, value in cases:
+            schema = {"type": arg_type} if arg_type else {}
+            tool = C.make_tool("f", {"x": schema})
+            text = f"<tool_call>f<arg_key>x</arg_key><arg_value>{value}</arg_value></tool_call>"
+            expected = json.loads(
+                Glm47MoeDetector().detect_and_parse(text, [tool]).calls[0].parameters
+            )
+            for chunk in (1, 5):
+                with self.subTest(arg_type=arg_type, value=value, chunk=chunk):
+                    det = Glm47MoeDetector()
+                    streamed = ""
+                    for i in range(0, len(text), chunk):
+                        r = det.parse_streaming_increment(text[i : i + chunk], [tool])
+                        streamed += "".join(c.parameters or "" for c in r.calls)
+                    self.assertEqual(json.loads(streamed), expected)
 
 
 if __name__ == "__main__":
