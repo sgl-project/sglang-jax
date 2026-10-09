@@ -280,6 +280,12 @@ def canonicalize_sharding(sharding):
 
 
 def device_array(data, sharding=None, **kwargs) -> jax.Array:
+    """Place host arrays on device under `sharding`.
+
+    The caller must not mutate `data` afterwards: the transfer is asynchronous
+    (lazy and zero-copy on the CPU backend), so a later write to the host
+    buffer can land in the array already handed out.
+    """
     if sharding is None:
         return jax.device_put(data, device=sharding, **kwargs)
 

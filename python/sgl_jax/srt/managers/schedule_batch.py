@@ -2506,12 +2506,9 @@ class ScheduleBatch:
             # Move to next DP rank's section (fixed stride)
             offset_bs += per_dp_cache_loc_size
 
-        # cache_loc_cpu is a view into the reusable host_buf; PD eager-stash
-        # can overwrite it via _disp(nxt) before this batch's H2D consumes the
-        # view. Single-threaded (native/colocated) callers don't need the copy.
-        if global_server_args_dict.get("pd_disaggregation") == "pathways":
-            return cache_loc_cpu.copy()
-        return cache_loc_cpu
+        # Copy: host_buf is rewritten next step while this batch may still be in
+        # flight (#1503).
+        return cache_loc_cpu.copy()
 
     def _merge_sampling_info(
         self,
