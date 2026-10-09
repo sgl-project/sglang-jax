@@ -68,8 +68,6 @@ _INDEXER_KERNEL = os.environ.get("DSA_INDEXER_KERNEL", "0") == "1"
 # [T, max_kv] token scores in HBM — the dominant HLO-temporaries term at long
 # context. Same selection semantics as the ref (parity-gated). Default OFF.
 _INDEXER_KERNEL_PREFILL = os.environ.get("DSA_INDEXER_KERNEL_PREFILL", "0") == "1"
-
-
 # bkv block of 64 pages (4K tokens @ page 64) benched fastest across
 # B=8..64, ctx 8K..128K on v7x/v6e.
 _INDEXER_KERNEL_KV_PAGES_PER_BLOCK = 64

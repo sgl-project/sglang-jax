@@ -223,8 +223,8 @@ class Glm53Detector(Glm45Detector):
     completion starts inside the reasoning block without emitting the start tag.
     """
 
-    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = True):
-        super().__init__(stream_reasoning=stream_reasoning, force_reasoning=force_reasoning)
+    def __init__(self, stream_reasoning: bool = True):
+        super().__init__(stream_reasoning=stream_reasoning, force_reasoning=True)
 
 
 class Gemma4Detector(BaseReasoningFormatDetector):
