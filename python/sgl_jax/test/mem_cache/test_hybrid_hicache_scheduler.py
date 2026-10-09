@@ -108,7 +108,7 @@ def test_restore_overhang_rejects_when_recompute_also_exceeds_capacity():
 
 def test_chunk_rejection_does_not_start_restore():
     adder, req, calls = admission(chunk=0)
-    assert adder.add_one_req(req) is AddReqResult.OTHER
+    assert adder.add_one_req(req) is AddReqResult.DP_BUDGET_EXHAUSTED
     assert not calls
 
 
