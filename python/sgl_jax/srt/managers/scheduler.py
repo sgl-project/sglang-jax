@@ -355,6 +355,18 @@ class Scheduler(
             self.enable_overlap = False
             logger.info("Overlap scheduler is disabled for embedding models.")
 
+        # N-gram PLE hashes real token ids on the host; overlap and spec decode do not
+        # pass them yet. Write the flag back: _recurrent_ping_pong_slots reads it.
+        if getattr(self.model_config.hf_text_config, "ple_layer_ids", None):
+            if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
+                raise NotImplementedError("N-gram PLE does not support speculative decoding yet.")
+            if server_args.disaggregation_enable_overlap_schedule:
+                raise ValueError("N-gram PLE does not support PD scheduler overlap yet.")
+            if self.enable_overlap:
+                logger.info("Overlap scheduler is disabled for N-gram PLE models.")
+            self.enable_overlap = False
+            server_args.disable_overlap_schedule = True
+
         # init distribution
         if self.nnodes > 1:
             if not jax.distributed.is_initialized():

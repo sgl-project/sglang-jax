@@ -31,6 +31,11 @@ from jax._src import mesh as mesh_lib
 
 from sgl_jax.global_config import global_config
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.layers.ngram_embedding import (
+    compute_ngram_ids,
+    ngram_context_row_split,
+)
+from sgl_jax.srt.layers.ngram_table import get_ngram_table
 from sgl_jax.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
@@ -2316,6 +2321,69 @@ class ScheduleBatch:
             "deepstack_visual_embedding": dense,
         }
 
+    def _merge_ngram_ple(
+        self,
+        per_dp_token_size: int,
+        total_token_size: int,
+        input_ids_cpu: np.ndarray,
+    ) -> np.ndarray | None:
+        """Host-side PLE lookup; only [total_token_size, ple_embed_dim] crosses
+        to the device (see ngram_table.py). None when no table is installed."""
+        table = get_ngram_table()
+        if table is None:
+            return None
+
+        params = table.params
+        ctx_len = params.ngram_context_len
+        is_extend = self.forward_mode.is_extend()
+
+        ids = np.zeros((total_token_size, params.ngram_heads), dtype=np.int32)
+
+        offset = 0
+        for dp_rank in range(self.dp_size):
+            info = self.reqs_info[dp_rank]
+            if not info.reqs or info.seq_lens is None or len(info.seq_lens) == 0:
+                offset += per_dp_token_size
+                continue
+
+            lens: list[int] = []
+            context: list[np.ndarray] = []
+            for i, req in enumerate(info.reqs):
+                seq_len = int(info.seq_lens[i])
+                if is_extend:
+                    chunk_start = int(info.prefix_lens[i])
+                    n_tokens = seq_len - chunk_start
+                else:
+                    chunk_start = seq_len - 1
+                    n_tokens = 1
+                if n_tokens <= 0:
+                    continue
+                lens.append(n_tokens)
+                context.append(
+                    ngram_context_row_split(
+                        req.origin_input_ids,
+                        req.output_ids,
+                        chunk_start,
+                        ctx_len,
+                        params.eos_token_id,
+                    )
+                )
+
+            if lens:
+                cu_seqlens = np.zeros(len(lens) + 1, dtype=np.int64)
+                np.cumsum(np.asarray(lens, dtype=np.int64), out=cu_seqlens[1:])
+                dp_len = int(cu_seqlens[-1])
+                ids[offset : offset + dp_len] = compute_ngram_ids(
+                    input_ids_cpu[offset : offset + dp_len],
+                    cu_seqlens,
+                    np.stack(context),
+                    params,
+                )
+            offset += per_dp_token_size
+
+        # One gather over the padded batch; padded rows read row 0 and are discarded.
+        return table.gather(ids)
+
     def _merge_batch_metadata(
         self,
         per_dp_bs_size: int,
@@ -3225,6 +3293,9 @@ class ScheduleBatch:
         mrope_positions = _mm["mrope_positions"]
         apply_for_deepstack = _mm["apply_for_deepstack"]
         deepstack_visual_embedding = _mm["deepstack_visual_embedding"]
+        ple_embeddings = self._merge_ngram_ple(
+            per_dp_token_padding, total_token_size, input_ids_cpu
+        )
         # Keep items whose placeholder rows intersect the current prefill window.
         if self.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
             multimodal_batch = build_multimodal_batch(
@@ -3350,6 +3421,7 @@ class ScheduleBatch:
             recurrent_track_indices=recurrent_track_indices_cpu,
             recurrent_track_mask=recurrent_track_mask_cpu,
             has_initial_state=has_initial_state_cpu,
+            ple_embeddings=ple_embeddings,
             spec_algorithm=self.spec_algorithm,
         )
 
@@ -3799,6 +3871,9 @@ class ModelWorkerBatch:
 
     # MRoPE position information [3, total_tokens]
     mrope_positions: np.ndarray | None = None
+
+    # [num_tokens, ple_embed_dim]
+    ple_embeddings: np.ndarray | None = None
 
     # Recurrent state indices for hybrid recurrent models
     recurrent_indices: np.ndarray | None = None
