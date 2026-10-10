@@ -54,6 +54,21 @@ def _make_host_sharding(mesh: Mesh, partition_spec: PartitionSpec) -> NamedShard
         return NamedSharding(mesh, partition_spec)
 
 
+def _host_to_device_array(x: np.ndarray, sharding: NamedSharding) -> jax.Array:
+    """Place a host ``numpy`` array on the mesh WITHOUT a cross-host collective.
+
+    ``jax.device_put(np_array, <non-fully-addressable NamedSharding>)`` runs
+    ``multihost_utils.assert_equal`` -- an all-gather across every process -- to
+    check all hosts passed the same value. HiCache's index arrays are tiny,
+    derived from scheduler state that is identical on every host by
+    construction, and are built on threads other than the forward launcher, so
+    that implicit collective is both wasted and a launch-order hazard on
+    multi-host meshes. Build the array per addressable device instead.
+    """
+    x = np.ascontiguousarray(x)
+    return jax.make_array_from_callback(x.shape, sharding, lambda idx: x[idx])
+
+
 @dataclass(frozen=True)
 class _BufferGroup:
     """One list of per-layer device buffers that a host slot must carry.
@@ -652,7 +667,9 @@ class LRUHostKVPool(HostKVPool):
         dev_idx_np = np.asarray(device_indices, dtype=np.int32)
         if n_b > n:
             dev_idx_np = np.concatenate([dev_idx_np, np.zeros(n_b - n, dtype=dev_idx_np.dtype)])
-        page_indices = jax.device_put(dev_idx_np, NamedSharding(self._mesh, PartitionSpec(None)))
+        page_indices = _host_to_device_array(
+            dev_idx_np, NamedSharding(self._mesh, PartitionSpec(None))
+        )
         # One batched gather per layer per buffer group (page axis back); keep
         # the per-layer loop so peak HBM stays at one layer's bucket (PD caps it
         # this way too). The gather indexes axis 0 only, so it is layout-agnostic
@@ -686,16 +703,16 @@ class LRUHostKVPool(HostKVPool):
                         gathered[buffer_id],
                     )
 
-    def flush_backup(self, host_buffer_ids: list[int]) -> None:
+    def flush_backup(self, host_buffer_ids: list[int], *, block: bool = True) -> list[jax.Array]:
         """D2H phase 2: ``device_put`` the staged pages into their host slots.
 
-        Touches only ``_pending_gather`` / ``_slots`` (never the KV buffer), so
-        it runs on the D2H worker concurrently with forward.
+        Touches only ``_pending_gather`` / ``_slots`` (never the KV buffer).
+        With ``block=False`` the host copies are only *issued*; the returned
+        arrays can be waited on from any thread (waiting is not a launch).
         """
         if not host_buffer_ids:
-            return
-        # Per-slot host transfer: on the worker thread (off the hot path), never
-        # the profiled bottleneck. Batching would need to slice a pinned-host
+            return []
+        # Per-slot host transfer. Batching would need to slice a pinned-host
         # array, which has no CPU implementation.
         staged: list[jax.Array] = []
         for buffer_id in host_buffer_ids:
@@ -719,7 +736,9 @@ class LRUHostKVPool(HostKVPool):
                 if self._allocated[buffer_id] and self._generation[buffer_id] == gen:
                     self._slots[buffer_id] = host_packed
             staged.extend(host_packed)
-        jax.block_until_ready(staged)
+        if block:
+            jax.block_until_ready(staged)
+        return staged
 
     def copy_into(self, device_indices: list[int], host_buffer_ids: list[int]) -> None:
         # Sync convenience (gather + host transfer on one thread): tests and
@@ -737,18 +756,18 @@ class LRUHostKVPool(HostKVPool):
         self.stage_load(host_buffer_ids)
         self.flush_load(host_buffer_ids, device_indices)
 
-    def stage_load(self, host_buffer_ids: list[int]) -> None:
+    def stage_load(self, host_buffer_ids: list[int], *, block: bool = True) -> list[jax.Array]:
         """H2D phase 1: ``device_put`` host slots onto the device into per-buffer
         staging arrays.
 
-        Touches only ``_slots`` / ``_pending_load`` (never the KV buffer), so it
-        runs on the H2D worker concurrently with forward; the cheap scatter is
-        deferred to :meth:`flush_load`.
+        Touches only ``_slots`` / ``_pending_load`` (never the KV buffer); the
+        cheap scatter is deferred to :meth:`flush_load`. With ``block=False`` the
+        copies are only issued and the returned arrays can be awaited elsewhere.
         """
         if not host_buffer_ids:
-            return
-        # Per-slot transfer: worker thread, off the hot path, not the bottleneck.
-        # Batching would need to stack pinned-host arrays (no CPU implementation).
+            return []
+        # Per-slot transfer. Batching would need to stack pinned-host arrays
+        # (no CPU implementation).
         staged: list[jax.Array] = []
         loaded: dict[int, list[jax.Array]] = {}
         # Read the slot refs + capture epochs under _lock, so the publish can
@@ -768,7 +787,8 @@ class LRUHostKVPool(HostKVPool):
             ]
             loaded[buffer_id] = packed_dev
             staged.extend(packed_dev)
-        jax.block_until_ready(staged)
+        if block:
+            jax.block_until_ready(staged)
         # Publish tagged with the entry epoch (same ABA guard as stage_backup): a
         # free()+realloc() mid-stage bumps the epoch, so the stale device copy is
         # dropped instead of landing in the reused slot's pending load. Lock order
@@ -781,7 +801,9 @@ class LRUHostKVPool(HostKVPool):
                         loaded[buffer_id],
                     )
 
-    def flush_load(self, host_buffer_ids: list[int], device_indices: list[int]) -> None:
+    def flush_load(
+        self, host_buffer_ids: list[int], device_indices: list[int], *, block: bool = True
+    ) -> None:
         """H2D phase 2: scatter the staged pages into the device buffers in place.
 
         Sync + on the KV-owning thread, in a donation-safe window: it reads +
@@ -870,11 +892,11 @@ class LRUHostKVPool(HostKVPool):
         loc_pages = np.asarray([lp for chunk in shard_loc for lp in chunk], dtype=np.int64)
 
         if self._token_scatter:
-            self._flush_load_tokens(staged_pages, sel, loc_pages, n_b)
+            self._flush_load_tokens(staged_pages, sel, loc_pages, n_b, block)
         else:
-            self._flush_load_pages(staged_pages, sel, loc_pages)
+            self._flush_load_pages(staged_pages, sel, loc_pages, block)
 
-    def _flush_load_tokens(self, staged_pages, sel, loc_pages, n_b) -> None:
+    def _flush_load_tokens(self, staged_pages, sel, loc_pages, n_b, block) -> None:
         """MHA fused layout: expand pages to token slots, Pallas in-place write."""
         from sgl_jax.srt.mem_cache.memory_pool import write_kv_layer
 
@@ -893,8 +915,8 @@ class LRUHostKVPool(HostKVPool):
             -1,
             loc_pages[:, None] * PS + np.arange(PS, dtype=np.int64),
         ).reshape(-1)
-        loc = jax.device_put(
-            jnp.asarray(loc_np, dtype=jnp.int32),
+        loc = _host_to_device_array(
+            loc_np.astype(np.int32),
             NamedSharding(dp.mesh, PartitionSpec(dp.attention_data_partition_axis)),
         )
         total_tokens = n_b * PS
@@ -934,9 +956,10 @@ class LRUHostKVPool(HostKVPool):
                     dp.mesh,
                 ),
             )
-        jax.block_until_ready(group.get_buffers())
+        if block:
+            jax.block_until_ready(group.get_buffers())
 
-    def _flush_load_pages(self, staged_pages, sel, loc_pages) -> None:
+    def _flush_load_pages(self, staged_pages, sel, loc_pages, block) -> None:
         """Layout-agnostic: whole-page in-place write per layer per buffer group.
 
         The staged slot already has the device page layout (whatever it is), so
@@ -962,7 +985,8 @@ class LRUHostKVPool(HostKVPool):
                         cache_spec,
                     ),
                 )
-            jax.block_until_ready(group.get_buffers())
+            if block:
+                jax.block_until_ready(group.get_buffers())
 
     def precompile_transfers(self, max_pages: int | None = None) -> None:
         """Warm the JIT/Pallas compile of the four transfer kernels for every

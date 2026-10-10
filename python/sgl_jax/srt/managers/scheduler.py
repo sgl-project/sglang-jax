@@ -776,8 +776,20 @@ class Scheduler(
         # write_back eviction runs inside get_next_batch_to_run, before the event
         # loop's launch_done.wait. Hand the cache a barrier so the D2H gather
         # blocks until kv_buffer is rebound (donation-safe).
-        if self.enable_overlap and getattr(self.tree_cache, "hicache_enabled", False):
-            self.tree_cache._donation_barrier = self._wait_donation_safe
+        if getattr(self.tree_cache, "hicache_enabled", False):
+            controller = getattr(self.tree_cache, "hicache_controller", None)
+            submit = getattr(self.tp_worker, "submit_device_job", None)
+            if controller is not None and submit is not None:
+                # Multi-host safety: every HiCache device launch goes through the
+                # single launch-owning thread (forward thread in overlap mode),
+                # FIFO-ordered with forwards, so all hosts enqueue identical
+                # program sequences. See HiCacheController.
+                controller.set_launcher(submit)
+            if self.enable_overlap:
+                # write_back eviction runs inside get_next_batch_to_run; the gather is
+                # now launched FIFO after the in-flight forward, but keep the barrier
+                # so the device pages are not freed/re-allocated before it is issued.
+                self.tree_cache._donation_barrier = self._wait_donation_safe
 
     @staticmethod
     def _get_input_token_len(req: Req | TokenizedGenerateReqInput) -> int:

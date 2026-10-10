@@ -6,6 +6,7 @@ import os
 import signal
 import threading
 import time
+from concurrent.futures import Future
 from queue import Queue
 
 import jax
@@ -28,6 +29,14 @@ from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass
+class _DeviceJob:
+    """A callable to execute on the forward thread (see submit_device_job)."""
+
+    fn: object
+    future: Future
 
 
 class ModelWorkerClient:
@@ -113,6 +122,19 @@ class ModelWorkerClient:
             logger.error("ModelWorkerClient hit an exception: %s", traceback)
             self.parent_process.send_signal(signal.SIGQUIT)
 
+    def submit_device_job(self, fn) -> Future:
+        """Run ``fn()`` on the forward thread, FIFO-ordered with forwards.
+
+        The forward thread is the only thread that launches device programs in
+        overlap mode. Work that must touch the device from elsewhere (HiCache
+        host<->device transfers) is funneled through here so every host in a
+        multi-controller mesh issues the same launches in the same order, and
+        so it is trivially donation-safe w.r.t. the in-flight forward.
+        """
+        job = _DeviceJob(fn=fn, future=Future())
+        self.input_queue.put((job, None, None, None))
+        return job.future
+
     def forward_thread_func_(self):
         while True:
             (
@@ -121,6 +143,13 @@ class ModelWorkerClient:
                 sampling_metadata,
                 forward_metadata,
             ) = self.input_queue.get()
+            if isinstance(model_worker_batch, _DeviceJob):
+                job = model_worker_batch
+                try:
+                    job.future.set_result(job.fn())
+                except BaseException as e:  # noqa: BLE001 - surfaced to the submitter
+                    job.future.set_exception(e)
+                continue
             if not model_worker_batch:
                 break
 

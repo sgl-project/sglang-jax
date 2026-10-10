@@ -1078,7 +1078,11 @@ class UnifiedRadixCache(BasePrefixCache):
         """Precompile host<->device transfer kernels at startup (no-op if disabled)."""
         if not self.hicache_enabled or self.host_pool is None:
             return
-        self.host_pool.precompile_transfers()
+        if self.hicache_controller is not None:
+            # Issue from the single launch-owning thread (multi-host launch order).
+            self.hicache_controller.run_on_launcher(self.host_pool.precompile_transfers)
+        else:
+            self.host_pool.precompile_transfers()
 
     def writing_check(self) -> None:
         """Settle completed async D2H writes (non-blocking).

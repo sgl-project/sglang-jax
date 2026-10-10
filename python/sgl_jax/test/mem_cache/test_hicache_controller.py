@@ -8,6 +8,8 @@ propagation deterministically.
 from __future__ import annotations
 
 import threading
+from concurrent.futures import Future
+from queue import Queue
 import time
 import unittest
 
@@ -54,12 +56,44 @@ def _make_pool(device_pool, *, pool_size=4):
     )
 
 
+class _SerialLauncher:
+    """Single background FIFO thread standing in for the overlap forward thread.
+
+    The controller issues every device-touching pool call through its launcher;
+    tests that need a transfer to be observably *pending* install this so the
+    (gated) pool call runs off the test thread, as it does in production.
+    """
+
+    def __init__(self):
+        self.q: Queue = Queue()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        while True:
+            fn, fut = self.q.get()
+            if fn is None:
+                return
+            try:
+                fut.set_result(fn())
+            except BaseException as e:  # noqa: BLE001
+                fut.set_exception(e)
+
+    def __call__(self, fn) -> Future:
+        fut: Future = Future()
+        self.q.put((fn, fut))
+        return fut
+
+    def stop(self):
+        self.q.put((None, None))
+        self.thread.join(timeout=5)
+
+
 class _FakePool:
     """Records calls; flush_backup can block on an event to make 'pending'
-    observable. The controller now splits a backup into a synchronous
-    stage_backup (device gather, caller thread) and an async flush_backup
-    (host transfer, worker thread), so the blocking/raising behaviour that
-    models the slow worker lives in flush_backup."""
+    observable. A backup is stage_backup (device gather) + flush_backup (host
+    transfer), both issued on the launcher; the blocking/raising behaviour that
+    models the slow transfer lives in flush_backup."""
 
     def __init__(self, *, block_event: threading.Event | None = None, raise_on_copy=False):
         self.block_event = block_event
@@ -72,8 +106,8 @@ class _FakePool:
         # Synchronous (caller thread): just record the gather request.
         self.staged.append((list(device_indices), list(host_buffer_ids)))
 
-    def flush_backup(self, host_buffer_ids):
-        # Async (worker thread): this is where the slow transfer / errors land.
+    def flush_backup(self, host_buffer_ids, *, block=True):
+        # Launcher thread: this is where the slow transfer / errors land.
         if self.block_event is not None:
             self.block_event.wait(timeout=5.0)
         if self.raise_on_copy:
@@ -83,6 +117,7 @@ class _FakePool:
             if host == list(host_buffer_ids):
                 self.copy_into_calls.append((dev, host))
                 break
+        return []
 
     def copy_into(self, device_indices, host_buffer_ids):
         self.stage_backup(device_indices, host_buffer_ids)
@@ -106,14 +141,15 @@ class _FakeLoadPool:
         self.staged = []
         self.flushed = []
 
-    def stage_load(self, host_buffer_ids):
+    def stage_load(self, host_buffer_ids, *, block=True):
         if self.stage_gate is not None:
             self.stage_gate.wait(timeout=5.0)
         if self.raise_on_stage:
             raise RuntimeError("stage boom")
         self.staged.append(list(host_buffer_ids))
+        return []
 
-    def flush_load(self, host_buffer_ids, device_indices):
+    def flush_load(self, host_buffer_ids, device_indices, *, block=True):
         self.flushed.append((list(host_buffer_ids), list(device_indices)))
 
     def free(self, host_buffer_ids):
@@ -124,10 +160,11 @@ class TestHiCacheControllerAsync(unittest.TestCase):
     def test_write_returns_immediately_and_pending_observable(self):
         gate = threading.Event()
         pool = _FakePool(block_event=gate)
-        ctrl = HiCacheController(pool, device_pool=None)
+        launcher = _SerialLauncher()
+        ctrl = HiCacheController(pool, device_pool=None, launcher=launcher)
         try:
             ctrl.write([1], [0])
-            self.assertEqual(ctrl.pending_count(), 1)  # still blocked in worker
+            self.assertEqual(ctrl.pending_count(), 1)  # still blocked on the launcher
             gate.set()
             ctrl.drain_pending()
             self.assertEqual(ctrl.pending_count(), 0)
@@ -135,6 +172,7 @@ class TestHiCacheControllerAsync(unittest.TestCase):
         finally:
             gate.set()
             ctrl.shutdown()
+            launcher.stop()
 
     def test_check_write_status_clears_completed(self):
         pool = _FakePool()
@@ -189,9 +227,10 @@ class TestHiCacheControllerEvict(unittest.TestCase):
     def test_evict_rejects_inflight_buffer(self):
         gate = threading.Event()
         pool = _FakePool(block_event=gate)
-        ctrl = HiCacheController(pool, device_pool=None)
+        launcher = _SerialLauncher()
+        ctrl = HiCacheController(pool, device_pool=None, launcher=launcher)
         try:
-            ctrl.write([1], [0])  # worker blocks on gate, slot 0 in-flight
+            ctrl.write([1], [0])  # launcher blocks on gate, slot 0 in-flight
             with self.assertRaises(RuntimeError):
                 ctrl.evict_callback([0])
             self.assertEqual(pool.released, [])  # nothing released while in-flight
@@ -202,6 +241,7 @@ class TestHiCacheControllerEvict(unittest.TestCase):
         finally:
             gate.set()
             ctrl.shutdown()
+            launcher.stop()
 
 
 class TestHiCacheControllerLoadAsync(unittest.TestCase):
@@ -212,20 +252,22 @@ class TestHiCacheControllerLoadAsync(unittest.TestCase):
     def test_flush_before_stage_done_raises_then_succeeds_after_drain(self):
         gate = threading.Event()
         pool = _FakeLoadPool(stage_gate=gate)
-        ctrl = HiCacheController(pool, device_pool=None)
+        launcher = _SerialLauncher()
+        ctrl = HiCacheController(pool, device_pool=None, launcher=launcher)
         try:
-            ctrl.stage_load([0])  # worker blocks on gate -> page 0 in-flight
+            ctrl.stage_load([0])  # launcher blocks on gate -> page 0 in-flight
             with self.assertRaises(RuntimeError):
                 ctrl.flush_load([0], [3])  # guard trips: stage not done
             self.assertEqual(pool.flushed, [])  # nothing scattered while in-flight
             gate.set()
             ctrl.drain_loads()
-            ctrl.flush_load([0], [3])  # now allowed
+            ctrl.flush_load([0], [3]).result(timeout=5)  # now allowed
             self.assertEqual(pool.staged, [[0]])
             self.assertEqual(pool.flushed, [([0], [3])])
         finally:
             gate.set()
             ctrl.shutdown()
+            launcher.stop()
 
     def test_drain_loads_reraises_stage_error(self):
         pool = _FakeLoadPool(raise_on_stage=True)
