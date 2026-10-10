@@ -1,9 +1,6 @@
 """CSA correctness, resource ownership and input contracts."""
 
 import importlib
-from test.srt.kernels.csa_attention.ref import reference, update_window
-from test.srt.kernels.csa_compressor import ref as compressor_ref
-from test.srt.kernels.csa_compressor.test_compressor import Case
 from types import SimpleNamespace
 
 import jax
@@ -11,6 +8,9 @@ import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import pytest
+from csa_attention.ref import reference, update_window
+from csa_compressor import ref as compressor_ref
+from csa_compressor.test_compressor import Case
 
 from sgl_jax.srt.kernels.csa import CSAMetadata, csa_step
 from sgl_jax.srt.kernels.csa.tune import CSAIndexerSchedule, get_indexer_schedule
