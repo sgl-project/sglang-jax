@@ -8,6 +8,7 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.ragged_paged_attention.util import align_to, get_dtype_packing
 from sgl_jax.srt.kernels.update_kv_cache.update_kv_cache import (
+    VMEM_HEADROOM_BYTES,
     VMEM_SIZE,
     get_num_slices_per_block,
     get_slot_mapping,
@@ -55,48 +56,68 @@ class TestKVCacheBlockBudget(unittest.TestCase):
     def test_scratch_leaves_compiler_headroom(self):
         # Local shard shapes: Gemma FULL/SWA, then MiMo FULL/SWA. MiMo's
         # 192-wide K and 128-wide V are padded to a shared head_dim of 256.
-        for page_size, heads, head_dim in [
-            (128, 1, 512),
-            (128, 2, 256),
-            (256, 1, 256),
-            (256, 2, 256),
+        for page_size, heads, head_dim, expected_block in [
+            (128, 1, 512, 255),
+            (128, 2, 256, 255),
+            (256, 1, 256, 255),
+            (256, 2, 256, 127),
         ]:
             with self.subTest(page_size=page_size, heads=heads, head_dim=head_dim):
                 kv = jax.ShapeDtypeStruct((4096, 1, heads, 2, head_dim), jnp.bfloat16)
                 cache = jax.ShapeDtypeStruct((77, page_size, heads, 2, head_dim), jnp.bfloat16)
                 block = get_num_slices_per_block(kv, cache, page_size)
-                scratch_bytes = block * page_size * heads * 2 * head_dim * 2
-                # A full 64MiB scratch failed on TPU7x with 64KiB compiler
-                # overhead. Require a larger margin, without lowering its cap.
+                bytes_per_slice = page_size * heads * 2 * head_dim * 2
+                scratch_bytes = block * bytes_per_slice
+                # Use the upstream margin and the largest tile that fits it.
                 self.assertEqual(VMEM_SIZE, 64 * 1024 * 1024)
-                self.assertLessEqual(scratch_bytes, VMEM_SIZE - 1024 * 1024)
+                self.assertEqual(VMEM_HEADROOM_BYTES, 128 * 1024)
+                self.assertEqual(block, expected_block)
+                self.assertLessEqual(scratch_bytes, VMEM_SIZE - VMEM_HEADROOM_BYTES)
+                self.assertGreater(
+                    scratch_bytes + bytes_per_slice, VMEM_SIZE - VMEM_HEADROOM_BYTES
+                )
                 small = jax.ShapeDtypeStruct((17, 1, heads, 2, head_dim), jnp.bfloat16)
                 self.assertEqual(get_num_slices_per_block(small, cache, page_size), 17)
 
     def test_block_tail_padding_preserves_every_real_slice(self):
-        cache = jax.ShapeDtypeStruct((77, 128, 1, 2, 512), jnp.bfloat16)
-        for tokens in (251, 252, 253, 503, 504, 505, 512, 1536):
-            with self.subTest(tokens=tokens):
-                kv = jax.ShapeDtypeStruct((tokens, 1, 1, 2, 512), jnp.bfloat16)
-                block = get_num_slices_per_block(kv, cache, 128)
-                sources = jnp.arange(tokens, dtype=jnp.int32)
-                destinations = sources[::-1] * 2 + 128
-                lengths = jnp.where(sources % 11 == 0, 0, 1)
-                mapping = np.asarray(get_slot_mapping(block, destinations, sources, lengths))
-                self.assertEqual(mapping.shape[1] % block, 0)
-                np.testing.assert_array_equal(
-                    mapping[:, :tokens], np.stack([destinations, sources, lengths])
-                )
-                np.testing.assert_array_equal(mapping[:, tokens:], 0)
+        for page_size, heads, head_dim, max_block in [(128, 1, 512, 255), (256, 2, 256, 127)]:
+            cache = jax.ShapeDtypeStruct((77, page_size, heads, 2, head_dim), jnp.bfloat16)
+            for tokens in (
+                max_block - 1,
+                max_block,
+                max_block + 1,
+                2 * max_block - 1,
+                2 * max_block,
+                2 * max_block + 1,
+                512,
+                1536,
+            ):
+                with self.subTest(page_size=page_size, tokens=tokens):
+                    kv = jax.ShapeDtypeStruct((tokens, 1, heads, 2, head_dim), jnp.bfloat16)
+                    block = get_num_slices_per_block(kv, cache, page_size)
+                    self.assertEqual(block, min(tokens, max_block))
+                    sources = jnp.arange(tokens, dtype=jnp.int32)
+                    destinations = sources[::-1] * 2 + page_size
+                    lengths = jnp.where(sources % 11 == 0, 0, 1).at[-1].set(1)
+                    mapping = np.asarray(get_slot_mapping(block, destinations, sources, lengths))
+                    self.assertEqual(mapping.shape, (3, ((tokens + block - 1) // block) * block))
+                    np.testing.assert_array_equal(
+                        mapping[:, :tokens], np.stack([destinations, sources, lengths])
+                    )
+                    np.testing.assert_array_equal(mapping[:, tokens:], 0)
 
     def test_float32_budget_and_small_page_writes(self):
-        for page_size in (1, 128, 256):
+        for page_size, expected_block in ((1, 32704), (128, 255), (256, 127)):
             with self.subTest(page_size=page_size):
                 kv = jax.ShapeDtypeStruct((65536, 1, 2, 1, 256), jnp.float32)
                 cache = jax.ShapeDtypeStruct((77, page_size, 2, 1, 256), jnp.float32)
                 block = get_num_slices_per_block(kv, cache, page_size)
-                self.assertGreater(block, 0)
-                self.assertLessEqual(block * page_size * 2 * 256 * 4, VMEM_SIZE - 1024 * 1024)
+                self.assertEqual(block, expected_block)
+                scratch_bytes = block * page_size * 2 * 256 * 4
+                self.assertLessEqual(scratch_bytes, VMEM_SIZE - VMEM_HEADROOM_BYTES)
+                self.assertGreater(
+                    scratch_bytes + page_size * 2 * 256 * 4, VMEM_SIZE - VMEM_HEADROOM_BYTES
+                )
 
 
 class TestKVCache(unittest.TestCase):
@@ -247,17 +268,18 @@ class TestKVCache(unittest.TestCase):
         # Exercise the shared ordinary-write and HiCache/FULL-only write paths.
         # CPU uses conftest's scatter shim; TPU executes the real Pallas kernel.
         tensor_size = mesh.shape["tensor"]
-        for page_size, local_heads, head_dim, pages in [
-            (128, 1, 512, 77),
-            (128, 2, 256, 62),
-            (256, 1, 256, 20),
-            (256, 2, 256, 20),
+        for page_size, local_heads, head_dim, pages, expected_block in [
+            (128, 1, 512, 77, 255),
+            (128, 2, 256, 62, 255),
+            (256, 1, 256, 20, 255),
+            (256, 2, 256, 20, 127),
         ]:
             local_cache = jax.ShapeDtypeStruct(
                 (pages, page_size, local_heads, 2, head_dim), jnp.bfloat16
             )
             large = jax.ShapeDtypeStruct((4096, 1, local_heads, 2, head_dim), jnp.bfloat16)
             block = get_num_slices_per_block(large, local_cache, page_size)
+            self.assertEqual(block, expected_block)
             cases = [
                 (n, False)
                 for n in (
@@ -290,6 +312,8 @@ class TestKVCache(unittest.TestCase):
                     locations = np.arange(tokens, dtype=np.int32)[::-1] * 2 + page_size
                     locations[::11] = -1
                     locations[block - 1 : block + 1] = -1
+                    # Keep the last real slice active even for a one-slice tail.
+                    locations[-1] = page_size
                     if all_padding:
                         locations[:] = -1
                     expected = initial.copy().reshape((-1, *tail))
