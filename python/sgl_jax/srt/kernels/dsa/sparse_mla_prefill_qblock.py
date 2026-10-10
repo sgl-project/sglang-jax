@@ -127,6 +127,7 @@ def _qblock_kernel(
     kv_hbm,  # flat: [B, T(+RBF), Dk_pad]; paged: 4D pool or [1, Pn*PS, Dk_pad] HBM
     pt_ref,  # [1, 1, 1, PTW]      SMEM  packed page table (paged only)
     o_ref,  # [1, 1, QBHp, Dv]
+    lse_ref,  # [1, 1, QBHp, 128] float32  LSE in [:,:,:,0]; pad for TPU tile
     kv_scratch,  # [NBUF, RBF, Dk_pad] VMEM  DMA ring
     sem,  # DMA semaphores (NBUF,)
     *,
@@ -220,7 +221,14 @@ def _qblock_kernel(
         bias = jnp.where(valid, 0.0, -jnp.inf)  # [RBF, QBHp] fp32
 
         _copy(j, slot).wait()
-        kv_blk = kv_scratch[slot]  # [RBF, Dk_pad]
+        kv_blk = kv_scratch[slot]  # [RBF, Dk_pad], cache dtype
+        # An fp8 cache exists to halve the HBM->VMEM bytes; the math still wants
+        # the query dtype. Upcast once here rather than at each use: the score dot
+        # below would otherwise mix fp8 with bf16, and ``p.astype(kv_blk.dtype)``
+        # would round softmax probabilities to fp8's ~6% relative error -- on the
+        # one tensor whose small values carry the attention tail.
+        if kv_blk.dtype != q.dtype:
+            kv_blk = kv_blk.astype(q.dtype)
 
         # score: [RBF,Dk]·[QBHp,Dk] -> [RBF, QBHp] (keys sublane, queries lane)
         s = (
@@ -251,6 +259,8 @@ def _qblock_kernel(
     m_i, l_i, acc = jax.lax.fori_loop(0, cnt, unit_body, (m0, l0, acc0))
     out = acc / jnp.where(l_i == 0.0, 1.0, l_i)[:, None]
     o_ref[0, 0] = out.astype(o_ref.dtype)
+    lse = jnp.where((l_i > 0) & jnp.isfinite(m_i), m_i + jnp.log(l_i), jnp.float32(-jnp.inf))
+    lse_ref[0, 0] = jnp.pad(lse[:, None], ((0, 0), (0, 127)))
 
 
 def sparse_mla_attention_qblock(
@@ -271,6 +281,7 @@ def sparse_mla_attention_qblock(
     seq_lens=None,  # [num_seqs] int32       per-request kv length (causal bound)
     cu_kv_lens=None,  # [num_seqs+1] int32    page-aligned kv offsets
     page_indices=None,  # [total_pages] int32 packed physical page ids
+    return_lse: bool = False,
 ):
     """Blocked sparse MLA-latent attention (query-batching kernel).
 
@@ -401,7 +412,7 @@ def sparse_mla_attention_qblock(
     )
     smem = pltpu.SMEM
     row_spec = pl.BlockSpec((1, 1, 1, QBHp), lambda b, n: (b, n, 0, 0))
-    out = pl.pallas_call(
+    out, lse = pl.pallas_call(
         kernel,
         grid=(B, nQB),
         in_specs=[
@@ -415,8 +426,14 @@ def sparse_mla_attention_qblock(
             pl.BlockSpec(memory_space=pltpu.HBM),  # kv (untiled, DMA-gathered)
             pl.BlockSpec((1, 1, 1, PTW), lambda b, n: (b, 0, 0, 0), memory_space=smem),
         ],
-        out_specs=pl.BlockSpec((1, 1, QBHp, Dv), lambda b, n: (b, n, 0, 0)),
-        out_shape=jax.ShapeDtypeStruct((B, nQB, QBHp, Dv), jnp.float32),
+        out_specs=[
+            pl.BlockSpec((1, 1, QBHp, Dv), lambda b, n: (b, n, 0, 0)),
+            pl.BlockSpec((1, 1, QBHp, 128), lambda b, n: (b, n, 0, 0)),
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct((B, nQB, QBHp, Dv), jnp.float32),
+            jax.ShapeDtypeStruct((B, nQB, QBHp, 128), jnp.float32),
+        ],
         scratch_shapes=[
             pltpu.VMEM((_NBUF, RBF, Dk_pad), kv2.dtype),
             pltpu.SemaphoreType.DMA((_NBUF,)),
@@ -425,7 +442,12 @@ def sparse_mla_attention_qblock(
     )(q4, units4, counts4, pos_rows, kvlen_rows, base_rows, memt, kv2, pt_arg)
 
     out = out[:, :, :QBH, :].reshape(B, Sp, H, Dv)
-    return out[:, :S]
+    lse = lse[:, :, :QBH, 0].reshape(B, Sp, H)
+    out = out[:, :S]
+    lse = lse[:, :S]
+    if return_lse:
+        return out, lse
+    return out
 
 
 def prefill_write_and_attend_ragged_qblock(
@@ -436,7 +458,7 @@ def prefill_write_and_attend_ragged_qblock(
     cache,  # [P, ps//pk, pk, Dk_pad]         paged fused latent cache
     topk_pages,  # [total_tokens, K] int32    seq-local page ids (-1 padded)
     positions,  # [total_tokens] int32        absolute query positions (causal bound)
-    loc,  # [total_tokens] int32              physical flat slot per token
+    loc,  # [total_tokens] int32              virtual out_cache_loc (physical when dcp=1)
     seq_lens,  # [num_seqs] int32             per-request kv length
     cu_q_lens,  # [num_seqs+1] int32          per-request query offsets
     cu_kv_lens,  # [num_seqs+1] int32         page-aligned kv offsets
@@ -447,18 +469,30 @@ def prefill_write_and_attend_ragged_qblock(
     sm_scale: float,
     query_block: int = 256,
     interpret: bool = False,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
+    dcp_interleave: int = 1,
+    return_lse: bool = False,
 ):
     """Packed-ragged self-write + **blocked** sparse-MLA prefill.
 
     Drop-in replacement for
     :func:`sparse_mla_prefill.prefill_write_and_attend_ragged` (same signature
     plus ``query_block``); only the attend execution shape differs.
+
+    Under DCP the caller must pass ``topk_pages`` as this rank's **physical** page
+    ids and ``positions``/``seq_lens`` already mapped to physical (owned-token)
+    space — see ``dcp/layout.py``. ``dcp_interleave`` only affects the self-write
+    mapping of ``loc``; the attend is layout-agnostic.
     """
+    from sgl_jax.srt.layers.dcp.write import physical_write_loc_jax
+
     T, H, Dv = ql.shape
     rope = qpe.shape[-1]
     ps = page_size
     Pn, pspk, pk, Dk_pad = cache.shape
     S = seq_lens.shape[0]
+    loc = physical_write_loc_jax(loc, dcp_size, dcp_rank, dcp_interleave)
 
     q_sparse = jnp.concatenate([ql, qpe], axis=-1)  # [T, H, Dv+rope]
 
@@ -488,7 +522,7 @@ def prefill_write_and_attend_ragged_qblock(
         jnp.int32
     )
 
-    out = sparse_mla_attention_qblock(
+    result = sparse_mla_attention_qblock(
         q_sparse.reshape(1, T, H, q_sparse.shape[2]),
         cache_new,
         topk_pages.reshape(1, T, -1),
@@ -503,8 +537,12 @@ def prefill_write_and_attend_ragged_qblock(
         cu_kv_lens=cu_kv_lens,
         page_indices=page_indices,
         interpret=interpret,
+        return_lse=return_lse,
     )
-    return out.reshape(T, H, Dv), cache_new
+    if return_lse:
+        out, lse = result
+        return out.reshape(T, H, Dv), cache_new, lse.reshape(T, H)
+    return result.reshape(T, H, Dv), cache_new
 
 
 # ── pallas paged write-back (self-write without the XLA scatter) ─────────────

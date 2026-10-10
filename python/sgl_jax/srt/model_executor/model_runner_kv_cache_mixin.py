@@ -483,14 +483,27 @@ class ModelRunnerKVCacheMixin:
 
         return max_tokens
 
+    # fp8 needs no per-tensor scale on this path, unlike int8: fp8 precision is
+    # *relative*, so rescaling by a power of two buys nothing. The MLA latent cache
+    # holds post-``kv_a_layernorm`` values (unit RMS) and post-rope ``k_pe``, both
+    # O(1) -- far inside e4m3's 448 range and above its 0.0156 subnormal floor. So
+    # e4m3 is preferred over e5m2: same range headroom to spare, one more mantissa
+    # bit (~6% vs ~12.5% worst-case relative error).
+    _KV_CACHE_DTYPES = {
+        "bf16": jnp.bfloat16,
+        "fp8_e4m3": jnp.float8_e4m3fn,
+        "fp8_e5m2": jnp.float8_e5m2,
+    }
+
     def _init_kv_cache_dtype(self: ModelRunner):
         """Resolve kv_cache_dtype from server_args."""
-        if self.server_args.kv_cache_dtype == "auto":
+        requested = self.server_args.kv_cache_dtype
+        if requested == "auto":
             self.kv_cache_dtype = self.dtype
-        elif self.server_args.kv_cache_dtype == "bf16":
-            self.kv_cache_dtype = jnp.bfloat16
+        elif requested in self._KV_CACHE_DTYPES:
+            self.kv_cache_dtype = self._KV_CACHE_DTYPES[requested]
         else:
-            raise ValueError(f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}.")
+            raise ValueError(f"Unsupported kv_cache_dtype: {requested}.")
         logger.info("ModelRunner kv_cache_dtype: %s", self.kv_cache_dtype)
 
     def _apply_token_constraints(
@@ -746,6 +759,7 @@ class ModelRunnerKVCacheMixin:
                 qk_rope_head_dim=qk_rope_head_dim,
                 dp_size=dp_size,
                 abstract=abstract,
+                dcp_size=getattr(self.server_args, "dcp_size", 1),
                 **dsa_kwargs,
             )
         else:
@@ -840,6 +854,7 @@ class ModelRunnerKVCacheMixin:
                     kvcache=self.token_to_kv_pool,
                     debug_mode=False,
                     dp_size=dp_size,
+                    dcp_size=getattr(self.server_args, "dcp_size", 1),
                 )
 
     def init_memory_pool(

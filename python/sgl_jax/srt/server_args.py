@@ -134,6 +134,7 @@ class ServerArgs:
     pd_prefill_tp_size: int = 0
     pd_prefill_ep_size: int = 0
     tp_size: int = 1
+    dcp_size: int = 1
     ep_size: int = 1
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: str | None = None
@@ -1152,6 +1153,19 @@ class ServerArgs:
             help="The tensor parallelism size.",
         )
         parser.add_argument(
+            "--decode-context-parallel-size",
+            "--dcp-size",
+            dest="dcp_size",
+            type=int,
+            default=ServerArgs.dcp_size,
+            help=(
+                "Decode context parallelism size. Stripes one sequence's MLA KV "
+                "across ranks inside an attention-TP group (owner = position % dcp_size). "
+                "1 keeps today's replicated-KV layout. Must divide attention_tp "
+                "(tp_size / dp_size)."
+            ),
+        )
+        parser.add_argument(
             "--ep-size",
             type=int,
             default=ServerArgs.ep_size,
@@ -2079,6 +2093,10 @@ class ServerArgs:
         if self.precompile_num_threads < 1:
             raise ValueError("--precompile-num-threads must be at least 1")
         assert (self.tp_size) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+
+        from sgl_jax.srt.layers.dcp.layout import validate_dcp_mesh
+
+        validate_dcp_mesh(self.tp_size, self.dp_size, self.dcp_size)
 
         if self.moe_dp_size < 1:
             raise ValueError("--moe-dp-size must be at least 1")

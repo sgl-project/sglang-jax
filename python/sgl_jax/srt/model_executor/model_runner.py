@@ -801,6 +801,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 page_size=self.page_size,
                 mesh=self.mesh,
                 attention_data_partition_axis="data",
+                dcp_size=getattr(self.server_args, "dcp_size", 1),
             )
 
         elif backend == "dsa_sparse" and self.use_mla_backend:
@@ -865,6 +866,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 page_size=self.page_size,
                 mesh=self.mesh,
                 attention_data_partition_axis="data",
+                dcp_size=getattr(self.server_args, "dcp_size", 1),
             )
 
         elif backend == "qsa_sparse":

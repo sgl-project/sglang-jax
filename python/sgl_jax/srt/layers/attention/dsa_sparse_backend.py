@@ -26,7 +26,9 @@ from sgl_jax.srt.kernels.dsa.ref import streamindex_page_topk_ref, streamindex_t
 from sgl_jax.srt.kernels.dsa.sparse_mla import compute_topk_pages, sparse_mla_page_level
 from sgl_jax.srt.kernels.dsa.sparse_mla_prefill import prefill_write_and_attend_ragged
 from sgl_jax.srt.kernels.dsa.sparse_mla_prefill_qblock import (
+    paged_write_back,
     prefill_write_and_attend_ragged_qblock,
+    sparse_mla_attention_qblock,
 )
 from sgl_jax.srt.kernels.dsa.streamindex_topk import (
     streamindex_page_topk,
@@ -91,6 +93,101 @@ _PREFILL_QBLOCK = os.environ.get("DSA_PREFILL_QBLOCK", "1") == "1"
 # 512 projects <2% further and grows the per-block union tail, so 256 is the
 # sweet spot. Override per deployment via DSA_PREFILL_QBLOCK_QB.
 _PREFILL_QBLOCK_QB = int(os.environ.get("DSA_PREFILL_QBLOCK_QB", "256"))
+# Merge DCP partial attention with reduce-scatter (``ag_rs``) instead of
+# all-gathering every rank's all-head output and keeping 1/dcp_size of it. The
+# gather path materializes dcp_size copies of ``[T, H_all, Dv]`` f32 — at
+# 8k/DCP=16 that single collective was 71.9% of device self time. Set
+# ``DSA_DCP_MERGE_SCATTER=0`` to fall back (both paths are pinned equal by
+# ``test_dcp_merge_scatter``).
+_DCP_MERGE_SCATTER = os.environ.get("DSA_DCP_MERGE_SCATTER", "1") == "1"
+# Prefill: gather KV pages and attend local heads instead of gathering Q and merging.
+_DCP_PREFILL_LOCAL_HEADS = os.environ.get("DSA_DCP_PREFILL_LOCAL_HEADS", "1") == "1"
+_DCP_PREFILL_LOCAL_QB = int(os.environ.get("DSA_DCP_PREFILL_LOCAL_QB", "256"))
+# Decode merge with one all-to-all instead of pmax + psum + psum_scatter.
+_DCP_MERGE_A2A = os.environ.get("DSA_DCP_MERGE_A2A", "1") == "1"
+# Send the ``ag_rs`` reduce-scatter in bf16 instead of f32, halving the bytes of
+# the largest remaining DCP collective. Worth 9% of prefill wall time at 128k and
+# 512k and 10.5% of device self time, with the ``reduce-scatter`` category exactly
+# halved and nothing else in the profile moving. The feared loss -- the reduction
+# accumulates dcp_size partials weighted by exp(lse_r - max_lse) <= 1, so the
+# shards that round away are the ones contributing least -- does not show up
+# against the bf16 the rest of the model already runs in: 8k tokens stay
+# bit-identical to dcp=1, the 1M needle keeps 3/3 recall at 975k tokens, and
+# max|dlogprob| vs dcp=1 is *lower* than the f32 path's. Set
+# ``DSA_DCP_MERGE_BF16=0`` to go back to f32.
+_DCP_MERGE_SCATTER_BF16 = os.environ.get("DSA_DCP_MERGE_BF16", "1") == "1"
+_MERGE_SCATTER_DTYPE = jnp.bfloat16 if _DCP_MERGE_SCATTER_BF16 else None
+
+
+def _dcp_prefill_local_heads(
+    ql,
+    qpe,
+    kvc,
+    kpe,
+    cache,
+    global_pages,
+    positions,
+    loc,
+    seq_lens,
+    cu_q_lens,
+    cu_kv_lens,
+    page_indices,
+    *,
+    kv_lora_rank,
+    page_size,
+    sm_scale,
+    dcp_size,
+    dcp_rank,
+    query_block,
+):
+    """DCP prefill on this rank's heads over an all-gathered view of the batch's KV pages."""
+    from sgl_jax.srt.layers.dcp.write import physical_write_loc_jax
+
+    T, H, Dv = ql.shape
+    rope = qpe.shape[-1]
+    S = seq_lens.shape[0]
+    row = jnp.zeros((T, cache.shape[-1]), cache.dtype)
+    row = row.at[:, :Dv].set(kvc.astype(cache.dtype))
+    row = row.at[:, Dv : Dv + rope].set(kpe.reshape(T, rope).astype(cache.dtype))
+    write_loc = physical_write_loc_jax(loc, dcp_size, dcp_rank, page_size).astype(jnp.int32)
+    cache = paged_write_back(
+        cache, row, write_loc, page_size=page_size, r_cap=T // page_size + S + 34
+    )
+    # Global DSA page d is local page d // dcp_size on rank d % dcp_size.
+    view = jax.lax.all_gather(cache[page_indices], "tensor", axis=1)
+    view = view.reshape((-1,) + cache.shape[1:])
+    t = jnp.arange(T, dtype=jnp.int32)
+    q_seq_id = jnp.clip(jnp.searchsorted(cu_q_lens[1:], t, side="right"), 0, S - 1).astype(
+        jnp.int32
+    )
+    q = jnp.concatenate([ql, qpe], axis=-1)
+    out = sparse_mla_attention_qblock(
+        q.reshape(1, T, H, q.shape[-1]),
+        view,
+        global_pages.reshape(1, T, -1),
+        positions.reshape(1, T),
+        kv_lora_rank=Dv,
+        read_block=page_size,
+        query_block=query_block,
+        sm_scale=float(sm_scale),
+        page_size=page_size,
+        q_seq_id=q_seq_id,
+        seq_lens=seq_lens,
+        cu_kv_lens=cu_kv_lens * dcp_size,
+        page_indices=jnp.arange(view.shape[0], dtype=jnp.int32),
+    )
+    return out.reshape(T, H, Dv), cache
+
+
+def _squeeze_dcp_cache(cache_):
+    """Drop the size-1 leading DCP shard so kernels see 4D ``[pages, ...]``."""
+    if cache_.ndim == 5:
+        return cache_[0], True
+    return cache_, False
+
+
+def _unsqueeze_dcp_cache(cache4d, had_dcp_axis: bool):
+    return cache4d[None, ...] if had_dcp_axis else cache4d
 
 
 @register_pytree_node_class
@@ -171,6 +268,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             num_kv_pages_per_block=aux_data["num_kv_pages_per_block"],
             num_queries_per_block=aux_data["num_queries_per_block"],
             decode_batch_size=aux_data["decode_batch_size"],
+            dcp_size=aux_data.get("dcp_size", 1),
         )
         obj.forward_metadata = children[0]
         return obj
@@ -256,8 +354,15 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         # the per-query-token kernel handles uniformly.
         if not is_decode:
             if _PREFILL_SPARSE:
-                idx_cache, topk_pages = self._maybe_index_prefill_pages(
-                    is_full, q_idx, k_idx, idx_weights, idx_cache, dpa, md
+                idx_cache, topk_pages, topk_tokens = self._maybe_index_prefill_pages(
+                    is_full,
+                    q_idx,
+                    k_idx,
+                    idx_weights,
+                    idx_cache,
+                    dpa,
+                    md,
+                    forward_batch.positions.astype(jnp.int32),
                 )
                 # Page selection for the sparse-prefill attend. A FULL (indexer)
                 # layer just produced [T, k_pages] page-topk; a SHARED layer gets
@@ -267,8 +372,10 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 # query rows (the full layer above ran the same single-shot prefill)
                 # — NOT the decode one-query-per-seq shape. None (a shared layer
                 # before any full layer) ⇒ fall through to the dense attend below.
+                # dcp>1 threads token-level owned∩global topk via `dsa_topk_in`.
                 topk_pages_use = topk_pages if is_full else dsa_topk_pages_in
-                if topk_pages_use is not None:
+                topk_use = topk_tokens if is_full else dsa_topk_in
+                if topk_pages_use is not None or (self.dcp_size > 1 and topk_use is not None):
                     o, kv_cache = self._run_sparse_prefill(
                         q,
                         q_rope,
@@ -280,11 +387,12 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                         dpa,
                         md,
                         forward_batch,
+                        topk=topk_use,
                     )
                     return o, DSAFusedCache(
                         kv=kv_cache,
                         idx=idx_cache,
-                        topk=None,
+                        topk=topk_use if is_full else None,
                         topk_pages=topk_pages if is_full else None,
                     )
                 # no selection available (shared layer before any full) → dense
@@ -326,7 +434,17 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
 
         # ── sparse MLA over top-k ─────────────────────────────────────────
         o, kv_cache = self._run_sparse(
-            q, q_rope, new_kv_c, new_k_pe, kv_cache, topk_use, topk_pages_use, sm_scale, dpa, md
+            q,
+            q_rope,
+            new_kv_c,
+            new_k_pe,
+            kv_cache,
+            topk_use,
+            topk_pages_use,
+            sm_scale,
+            dpa,
+            md,
+            forward_batch,
         )
         return o, DSAFusedCache(
             kv=kv_cache,
@@ -361,25 +479,85 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         if not is_full or q_idx is None:
             return idx_cache, None, None
 
+        cache_spec = self.paged_cache_spec(dpa)
         in_specs = (
             P(dpa, None, None),  # q_idx    [T, H_idx, D_idx] — replicated: softmax needs all heads
             P(dpa, None),  # k_idx    [T, D_idx]
             P(dpa, None),  # weights  [T, H_idx]
-            P(dpa, None, None, None),  # idx_cache paged
+            cache_spec,  # idx_cache paged
             P(dpa),  # seq_lens
             P(dpa),  # page_indices
             P(dpa),  # cu_q_lens
             P(dpa),  # cu_kv_lens
             P(dpa),  # distribution
         )
-        out_specs = (P(dpa, None, None, None), P(dpa, None), P(dpa, None))
+        out_specs = (cache_spec, P(dpa, None), P(dpa, None))
 
         def _run(q_, k_, w_, cache_, seq_lens_, pi_, cuq_, cukv_, dist_):
+            cache_, had_dcp = _squeeze_dcp_cache(cache_)
             page_size = cache_.shape[1] * cache_.shape[2]
             idx_dim = cache_.shape[3]
             pages_per_seq = pi_.shape[0] // seq_lens_.shape[0]
             cache3d = cache_.reshape(cache_.shape[0], page_size, idx_dim)
-            cache3d = _scatter_paged(cache3d, k_, seq_lens_, pi_, cuq_, cukv_, pages_per_seq)
+            dcp_rank = 0 if self.dcp_size <= 1 else jax.lax.axis_index("tensor")
+            cache3d = _scatter_paged(
+                cache3d,
+                k_,
+                seq_lens_,
+                pi_,
+                cuq_,
+                cukv_,
+                pages_per_seq,
+                dcp_size=self.dcp_size,
+                dcp_rank=dcp_rank,
+                dcp_interleave=page_size if self.dcp_size > 1 else 1,
+            )
+            if compute_topk and self.dcp_size > 1:
+                from sgl_jax.srt.layers.dcp.indexer import (
+                    page_topk_blocked_jax,
+                    score_decode_local_jax,
+                )
+
+                dcp_rank = jax.lax.axis_index("tensor")
+                local_scores = score_decode_local_jax(
+                    q_,
+                    w_,
+                    cache3d,
+                    seq_lens_,
+                    pi_,
+                    cukv_,
+                    pages_per_seq,
+                    page_size,
+                    self.dcp_size,
+                    dcp_rank,
+                    interleave=page_size,
+                )
+                n_dsa_pages = max(pages_per_seq * self.dcp_size, 1)
+                # Match the dcp=1 budget exactly: same page scores, same max-pool,
+                # same top-k width => bit-identical selection, which is what makes
+                # the greedy-match gate meaningful.
+                k_pages = (
+                    min(_PAGE_TOPK_BUDGET, n_dsa_pages)
+                    if _PAGE_TOPK_BUDGET > 0
+                    else (self.index_topk + page_size - 1) // page_size
+                )
+                # Block-interleaved decode selects at page granularity too: the
+                # attend reads whole physical pages, so a token-level topk is
+                # never materialized (same as the _PAGE_TOPK_BUDGET path).
+                _global_pages, topk_pages = page_topk_blocked_jax(
+                    local_scores,
+                    self.dcp_size,
+                    dcp_rank,
+                    page_size,
+                    k_pages,
+                    seq_lens_ - 1,
+                )
+                topk = jnp.full((q_.shape[0], 1), -1, jnp.int32)
+                return (
+                    _unsqueeze_dcp_cache(cache3d.reshape(cache_.shape), had_dcp),
+                    topk,
+                    topk_pages,
+                )
             if compute_topk and _PAGE_TOPK_BUDGET > 0:
                 # Page-scoring path: budget pages picked directly by max-pooled
                 # page score; token-level topk is not materialized (sparse MLA
@@ -400,7 +578,11 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                     # belongs to seq i — enables the O(S * max_kv) fast path.
                     one_token_per_seq=True,
                 )
-                return cache3d.reshape(cache_.shape), topk, topk_pages
+                return (
+                    _unsqueeze_dcp_cache(cache3d.reshape(cache_.shape), had_dcp),
+                    topk,
+                    topk_pages,
+                )
             if compute_topk and _INDEXER_KERNEL:
                 topk = streamindex_topk(
                     q_,
@@ -442,7 +624,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 )
             else:
                 topk_pages = jnp.full((topk.shape[0], 1), -1, jnp.int32)
-            return cache3d.reshape(cache_.shape), topk, topk_pages
+            return _unsqueeze_dcp_cache(cache3d.reshape(cache_.shape), had_dcp), topk, topk_pages
 
         idx_cache, topk, topk_pages = jax.shard_map(
             _run, in_specs=in_specs, out_specs=out_specs, check_vma=False
@@ -459,16 +641,23 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         )
         return idx_cache, topk, (topk_pages if compute_pages else None)
 
-    def _run_sparse(self, ql, qpe, kvc, kpe, cache, topk, topk_pages, sm_scale, dpa, md):
+    def _run_sparse(
+        self, ql, qpe, kvc, kpe, cache, topk, topk_pages, sm_scale, dpa, md, forward_batch
+    ):
         has_pages = topk_pages is not None
         if not has_pages:
             topk_pages = jnp.full((topk.shape[0], 1), -1, jnp.int32)
+        cache_spec = self.paged_cache_spec(dpa)
+        dcp_size = self.dcp_size
+        return_lse = dcp_size > 1
+        loc = forward_batch.out_cache_loc.astype(jnp.int32)
+        positions = forward_batch.positions.astype(jnp.int32)
         in_specs = (
             P(dpa, "tensor", None),
             P(dpa, "tensor", None),
             P(dpa, None),
             P(dpa, None),
-            P(dpa, None, None, None),
+            cache_spec,
             P(dpa, None),  # topk [T, k]
             P(dpa, None),  # topk_pages [T, k_pages_max]
             P(dpa),
@@ -476,13 +665,84 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             P(dpa),
             P(dpa),
             P(dpa),
+            P(dpa),  # loc
+            P(dpa),  # positions
         )
-        out_specs = (P(dpa, "tensor", None), P(dpa, None, None, None))
+        out_specs = (P(dpa, "tensor", None), cache_spec)
 
-        def _run(ql_, qpe_, kvc_, kpe_, cache_, topk_, tpages_, seq_lens_, pi_, cuq_, cukv_, dist_):
+        def _run(
+            ql_,
+            qpe_,
+            kvc_,
+            kpe_,
+            cache_,
+            topk_,
+            tpages_,
+            seq_lens_,
+            pi_,
+            cuq_,
+            cukv_,
+            dist_,
+            loc_,
+            pos_,
+        ):
+            cache_, had_dcp = _squeeze_dcp_cache(cache_)
             page_size = cache_.shape[1] * cache_.shape[2]
             pages_per_seq = pi_.shape[0] // seq_lens_.shape[0]
-            return sparse_mla_page_level(
+            dcp_rank = 0 if dcp_size <= 1 else jax.lax.axis_index("tensor")
+            h_local = ql_.shape[1]
+            if dcp_size > 1:
+                from sgl_jax.srt.layers.dcp.comm import (
+                    a2a_merge_dcp_attention,
+                    allgather_heads,
+                    gather_merge_dcp_attention,
+                    merge_scatter_dcp_attention,
+                    slice_local_heads,
+                )
+
+                # Block-interleaved: ``tpages_`` is this rank's physical page ids,
+                # so the same page-level kernel the dcp=1 path uses attends here.
+                # Q is all-gathered because the LSE merge only composes the same
+                # heads over different KV shards.
+                ql_use, qpe_use = allgather_heads(ql_, qpe_)
+                o, cache_new, lse = sparse_mla_page_level(
+                    ql_use,
+                    qpe_use,
+                    kvc_,
+                    kpe_,
+                    cache_,
+                    seq_lens_,
+                    topk_,
+                    pi_,
+                    cuq_,
+                    cukv_,
+                    dist_,
+                    tpages_,
+                    sm_scale=float(sm_scale),
+                    page_size=page_size,
+                    pages_per_seq=pages_per_seq,
+                    kv_lora_rank=self.kv_lora_rank,
+                    # A rank owns at most `pages_per_seq` physical pages, and the
+                    # indexer compacts its owned ids to the front of each row, so
+                    # truncating there is lossless — and keeps the kernel's attend
+                    # span at ~4 pages instead of the full global page budget.
+                    k_pages_max=min(tpages_.shape[-1], pages_per_seq) + 1,
+                    vmem_limit_bytes=self.vmem_limit_bytes,
+                    return_lse=True,
+                    dcp_size=dcp_size,
+                    dcp_rank=dcp_rank,
+                    dcp_interleave=page_size,
+                )
+                if _DCP_MERGE_A2A:
+                    o = a2a_merge_dcp_attention(o, lse, h_local)
+                elif _DCP_MERGE_SCATTER:
+                    o = merge_scatter_dcp_attention(
+                        o, lse, h_local, scatter_dtype=_MERGE_SCATTER_DTYPE
+                    )
+                else:
+                    o = slice_local_heads(gather_merge_dcp_attention(o, lse), h_local)
+                return o.astype(ql_.dtype), _unsqueeze_dcp_cache(cache_new, had_dcp)
+            result = sparse_mla_page_level(
                 ql_,
                 qpe_,
                 kvc_,
@@ -503,7 +763,12 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                     min(_PAGE_TOPK_BUDGET, pages_per_seq) + 1 if _PAGE_TOPK_BUDGET > 0 else 512
                 ),
                 vmem_limit_bytes=self.vmem_limit_bytes,
+                return_lse=return_lse,
+                dcp_size=dcp_size,
+                dcp_rank=dcp_rank,
             )
+            o, cache_out = result
+            return o, _unsqueeze_dcp_cache(cache_out, had_dcp)
 
         return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(
             ql,
@@ -518,40 +783,125 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             md.cu_q_lens,
             md.cu_kv_lens,
             md.distribution,
+            loc,
+            positions,
         )
 
-    def _maybe_index_prefill_pages(self, is_full, q_idx, k_idx, idx_weights, idx_cache, dpa, md):
+    def _maybe_index_prefill_pages(
+        self, is_full, q_idx, k_idx, idx_weights, idx_cache, dpa, md, positions
+    ):
         """Prefill page-topk: scatter ``k_idx`` into the paged indexer cache and,
         on full layers, compute per-query **causal** page-level top-k via the
         general (non-decode, ``one_token_per_seq=False``) indexer path.
 
-        Returns ``(idx_cache, topk_pages)`` where ``topk_pages`` is ``[T, k_pages]``
-        seq-local page ids (-1 padded) — exactly the sparse kernel's per-query
-        unit ids at ``read_block == page_size``. ``topk_pages`` is ``None`` on
-        shared layers / when no indexer is wired (caller reuses the threaded one).
+        Returns ``(idx_cache, topk_pages, topk_tokens)``. ``topk_pages`` is
+        ``[T, k_pages]`` seq-local page ids (-1 padded). ``topk_tokens`` is
+        virtual owned∩global top-k when ``dcp_size>1``, else ``None``.
+        Both are ``None`` on shared layers / when no indexer is wired.
         """
         if not is_full or q_idx is None:
-            return idx_cache, None
+            return idx_cache, None, None
         k_pages = (self.index_topk + self.page_size - 1) // self.page_size
+        cache_spec = self.paged_cache_spec(dpa)
         in_specs = (
             P(dpa, None, None),  # q_idx    [T, H_idx, D_idx] replicated
             P(dpa, None),  # k_idx    [T, D_idx]
             P(dpa, None),  # weights  [T, H_idx]
-            P(dpa, None, None, None),  # idx_cache paged
+            cache_spec,  # idx_cache paged
             P(dpa),  # seq_lens
             P(dpa),  # page_indices
             P(dpa),  # cu_q_lens
             P(dpa),  # cu_kv_lens
             P(dpa),  # distribution
+            P(dpa),  # positions
         )
-        out_specs = (P(dpa, None, None, None), P(dpa, None))
+        out_specs = (cache_spec, P(dpa, None), P(dpa, None))
 
-        def _run(q_, k_, w_, cache_, seq_lens_, pi_, cuq_, cukv_, dist_):
+        def _run(q_, k_, w_, cache_, seq_lens_, pi_, cuq_, cukv_, dist_, pos_):
+            cache_, had_dcp = _squeeze_dcp_cache(cache_)
             page_size = cache_.shape[1] * cache_.shape[2]
             idx_dim = cache_.shape[3]
             pages_per_seq = pi_.shape[0] // seq_lens_.shape[0]
+            k_eff = min(k_pages, pages_per_seq)
             cache3d = cache_.reshape(cache_.shape[0], page_size, idx_dim)
-            cache3d = _scatter_paged(cache3d, k_, seq_lens_, pi_, cuq_, cukv_, pages_per_seq)
+            dcp_rank = 0 if self.dcp_size <= 1 else jax.lax.axis_index("tensor")
+            cache3d = _scatter_paged(
+                cache3d,
+                k_,
+                seq_lens_,
+                pi_,
+                cuq_,
+                cukv_,
+                pages_per_seq,
+                dcp_size=self.dcp_size,
+                dcp_rank=dcp_rank,
+                dcp_interleave=page_size if self.dcp_size > 1 else 1,
+            )
+            if self.dcp_size > 1:
+                from sgl_jax.srt.layers.dcp.indexer import (
+                    page_topk_blocked_jax,
+                    page_topk_from_gathered,
+                    score_prefill_local_jax,
+                )
+
+                if _INDEXER_KERNEL_PREFILL:
+                    # Streaming page maxima: never materializes [T, local_kv],
+                    # which is 2.1 GiB/layer at 1M and the long-context OOM.
+                    local_max = streamindex_page_topk(
+                        q_,
+                        w_,
+                        cache3d.reshape(cache_.shape),
+                        seq_lens_,
+                        _fixed_stride_pages(pi_, cukv_, page_size, pages_per_seq),
+                        cuq_,
+                        dist_[2],
+                        k_pages=k_eff,
+                        dcp_size=self.dcp_size,
+                        dcp_rank=dcp_rank,
+                        dcp_interleave=page_size,
+                        return_page_scores=True,
+                    )
+                    global_pages, phys_pages = page_topk_from_gathered(
+                        jax.lax.all_gather(local_max, "tensor", axis=0),
+                        self.dcp_size,
+                        dcp_rank,
+                        page_size,
+                        k_pages,
+                        pos_,
+                    )
+                else:
+                    local_scores = score_prefill_local_jax(
+                        q_,
+                        w_,
+                        cache3d,
+                        seq_lens_,
+                        pi_,
+                        cuq_,
+                        cukv_,
+                        pos_,
+                        pages_per_seq,
+                        page_size,
+                        self.dcp_size,
+                        dcp_rank,
+                        interleave=page_size,
+                    )
+                    # Block-interleaved: rank r's physical page P *is* global page
+                    # P*dcp+r, so the global top-k needs no cross-rank max and each
+                    # selected page is one whole physical page on exactly one rank.
+                    global_pages, phys_pages = page_topk_blocked_jax(
+                        local_scores,
+                        self.dcp_size,
+                        dcp_rank,
+                        page_size,
+                        k_pages,
+                        pos_,
+                    )
+                return (
+                    _unsqueeze_dcp_cache(cache3d.reshape(cache_.shape), had_dcp),
+                    phys_pages,
+                    global_pages,
+                )
+            dummy_topk = jnp.full((q_.shape[0], 1), -1, jnp.int32)
             if _INDEXER_KERNEL_PREFILL:
                 # dist_[2] == number of real (seq_len > 0) sequences in this
                 # EXTEND batch: mla_backend builds distribution = [0, 0, N] for
@@ -571,7 +921,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                     _fixed_stride_pages(pi_, cukv_, page_size, pages_per_seq),
                     cuq_,
                     dist_[2],
-                    k_pages=k_pages,
+                    k_pages=k_eff,
                 )
             else:
                 topk_pages = streamindex_page_topk_ref(
@@ -583,13 +933,17 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                     cuq_,
                     cukv_,
                     dist_,
-                    k_pages=k_pages,
+                    k_pages=k_eff,
                     pages_per_seq=pages_per_seq,
                     one_token_per_seq=False,  # prefill: T>1 tokens/seq, per-query causal
                 )
-            return cache3d.reshape(cache_.shape), topk_pages
+            return (
+                _unsqueeze_dcp_cache(cache3d.reshape(cache_.shape), had_dcp),
+                topk_pages,
+                dummy_topk,
+            )
 
-        idx_cache, topk_pages = jax.shard_map(
+        idx_cache, topk_pages, topk_tokens = jax.shard_map(
             _run, in_specs=in_specs, out_specs=out_specs, check_vma=False
         )(
             q_idx,
@@ -601,11 +955,25 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             md.cu_q_lens,
             md.cu_kv_lens,
             md.distribution,
+            positions,
         )
-        return idx_cache, topk_pages
+        if self.dcp_size <= 1:
+            topk_tokens = None
+        return idx_cache, topk_pages, topk_tokens
 
     def _run_sparse_prefill(
-        self, ql, qpe, kvc, kpe, cache, topk_pages, sm_scale, dpa, md, forward_batch
+        self,
+        ql,
+        qpe,
+        kvc,
+        kpe,
+        cache,
+        topk_pages,
+        sm_scale,
+        dpa,
+        md,
+        forward_batch,
+        topk=None,
     ):
         """Fused sparse-MLA prefill: self-write the current chunk's latent into the
         paged fused cache, then attend only the page-topk pages.
@@ -621,14 +989,23 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         page_size = self.page_size
         kv_lora_rank = self.kv_lora_rank
         sm = float(sm_scale)
+        dcp_size = self.dcp_size
+        cache_spec = self.paged_cache_spec(dpa)
+        # Derive the -1 placeholders from `loc`, which is already sharded on `dpa`:
+        # a bare jnp.full is replicated and does not match in_specs P(dpa, None).
+        if topk_pages is None:
+            topk_pages = jnp.full_like(loc[:, None], -1)
+        if topk is None:
+            topk = jnp.full_like(loc[:, None], -1)
 
         in_specs = (
             P(dpa, "tensor", None),  # ql   [T, H, kv_lora_rank]
             P(dpa, "tensor", None),  # qpe  [T, H, rope]
             P(dpa, None),  # kvc  [T, kv_lora_rank]
             P(dpa, None),  # kpe  [T, rope]
-            P(dpa, None, None, None),  # cache
+            cache_spec,  # cache (5D leading DCP axis when dcp_size>1)
             P(dpa, None),  # topk_pages [T, K]
+            P(dpa, None),  # topk tokens [T, k]
             P(dpa),  # positions [T]
             P(dpa),  # loc [T]
             P(dpa),  # seq_lens [S]
@@ -636,9 +1013,81 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             P(dpa),  # cu_kv_lens [S+1]
             P(dpa),  # page_indices [total_pages]
         )
-        out_specs = (P(dpa, "tensor", None), P(dpa, None, None, None))
+        out_specs = (P(dpa, "tensor", None), cache_spec)
 
-        def _run(ql_, qpe_, kvc_, kpe_, cache_, tp_, pos_, loc_, sl_, cuq_, cukv_, pi_):
+        def _run(ql_, qpe_, kvc_, kpe_, cache_, tp_, topk_, pos_, loc_, sl_, cuq_, cukv_, pi_):
+            cache_, had_dcp = _squeeze_dcp_cache(cache_)
+            dcp_rank = 0 if dcp_size <= 1 else jax.lax.axis_index("tensor")
+            kwargs = dict(
+                kv_lora_rank=kv_lora_rank,
+                page_size=page_size,
+                sm_scale=sm,
+                dcp_size=dcp_size,
+                dcp_rank=dcp_rank,
+            )
+            if dcp_size > 1:
+                from sgl_jax.srt.layers.dcp.comm import (
+                    allgather_heads,
+                    gather_merge_dcp_attention,
+                    merge_scatter_dcp_attention,
+                    slice_local_heads,
+                )
+                from sgl_jax.srt.layers.dcp.write import (
+                    owned_len_jax,
+                    physical_positions_jax,
+                )
+
+                # Block-interleaved KV: ``tp_`` is already this rank's physical
+                # page ids, so the SAME kernel the dcp=1 path uses reads whole
+                # pages here — the only DCP-specific work is (a) all-gathering Q
+                # so every rank runs all heads (the LSE merge is only valid for
+                # the same heads over different KV shards), (b) mapping the causal
+                # bounds into physical slot space, and (c) the merge.
+                if _DCP_PREFILL_LOCAL_HEADS:
+                    o, cache_new = _dcp_prefill_local_heads(
+                        ql_,
+                        qpe_,
+                        kvc_,
+                        kpe_,
+                        cache_,
+                        topk_,
+                        pos_,
+                        loc_,
+                        sl_,
+                        cuq_,
+                        cukv_,
+                        pi_,
+                        query_block=_DCP_PREFILL_LOCAL_QB,
+                        **kwargs,
+                    )
+                    return o.astype(ql_.dtype), _unsqueeze_dcp_cache(cache_new, had_dcp)
+                h_local = ql_.shape[1]
+                ql_use, qpe_use = allgather_heads(ql_, qpe_)
+                o, cache_new, lse = prefill_write_and_attend_ragged_qblock(
+                    ql_use,
+                    qpe_use,
+                    kvc_,
+                    kpe_,
+                    cache_,
+                    tp_,
+                    physical_positions_jax(pos_, dcp_size, dcp_rank, page_size),
+                    loc_,
+                    owned_len_jax(sl_, dcp_size, dcp_rank, page_size),
+                    cuq_,
+                    cukv_,
+                    pi_,
+                    query_block=_PREFILL_QBLOCK_QB,
+                    dcp_interleave=page_size,
+                    return_lse=True,
+                    **kwargs,
+                )
+                if _DCP_MERGE_SCATTER:
+                    o = merge_scatter_dcp_attention(
+                        o, lse, h_local, scatter_dtype=_MERGE_SCATTER_DTYPE
+                    )
+                else:
+                    o = slice_local_heads(gather_merge_dcp_attention(o, lse), h_local)
+                return o.astype(ql_.dtype), _unsqueeze_dcp_cache(cache_new, had_dcp)
             if _PREFILL_QBLOCK:
                 o, cache_new = prefill_write_and_attend_ragged_qblock(
                     ql_,
@@ -653,10 +1102,8 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                     cuq_,
                     cukv_,
                     pi_,
-                    kv_lora_rank=kv_lora_rank,
-                    page_size=page_size,
-                    sm_scale=sm,
                     query_block=_PREFILL_QBLOCK_QB,
+                    **kwargs,
                 )
             else:
                 o, cache_new = prefill_write_and_attend_ragged(
@@ -672,11 +1119,9 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                     cuq_,
                     cukv_,
                     pi_,
-                    kv_lora_rank=kv_lora_rank,
-                    page_size=page_size,
-                    sm_scale=sm,
+                    **kwargs,
                 )
-            return o.astype(ql_.dtype), cache_new
+            return o.astype(ql_.dtype), _unsqueeze_dcp_cache(cache_new, had_dcp)
 
         return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(
             ql,
@@ -685,6 +1130,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             kpe,
             cache,
             topk_pages,
+            topk,
             positions,
             loc,
             md.seq_lens,
@@ -694,24 +1140,26 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         )
 
     def _run_dense(self, ql, qpe, kvc, kpe, cache, sm_scale, layer, dpa, md):
+        cache_spec = self.paged_cache_spec(dpa)
         in_specs = (
             P(dpa, "tensor", None),
             P(dpa, "tensor", None),
             P(dpa, None),
             P(dpa, None),
-            P(dpa, None, None, None),
+            cache_spec,
             P(dpa),
             P(dpa),
             P(dpa),
             P(dpa),
             P(dpa),
         )
-        out_specs = (P(dpa, "tensor", None), P(dpa, None, None, None))
+        out_specs = (P(dpa, "tensor", None), cache_spec)
         sw = layer.sliding_window_size if layer is not None else None
         sc = layer.logit_cap if layer is not None else None
 
         def _run(ql_, qpe_, kvc_, kpe_, cache_, seq_lens_, pi_, cuq_, cukv_, dist_):
-            return mla_ragged_paged_attention(
+            cache_, had_dcp = _squeeze_dcp_cache(cache_)
+            o, cache_out = mla_ragged_paged_attention(
                 ql_,
                 qpe_,
                 kvc_,
@@ -730,6 +1178,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 decode_batch_size=self.decode_batch_size,
                 vmem_limit_bytes=self.vmem_limit_bytes,
             )
+            return o, _unsqueeze_dcp_cache(cache_out, had_dcp)
 
         return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(
             ql,
@@ -776,12 +1225,18 @@ def _scatter_paged(
     cu_q_lens: jax.Array,
     cu_kv_lens: jax.Array,
     pages_per_seq: int,
+    dcp_size: int = 1,
+    dcp_rank: int | jax.Array = 0,
+    dcp_interleave: int = 1,
 ) -> jax.Array:
     """Write new_tokens[t] into cache at (page, offset) for each seq's tail slots.
 
     Jit-compatible reference for the paged cache write that the Pallas kernel
     does via input_output_aliases. For seq i with q tokens cu_q_lens[i]..[i+1),
     token j lands at absolute position seq_lens[i] - (q_end - q_start) + j.
+
+    Under DCP, ``abs_pos`` is the token's **virtual** position; ownership and the
+    physical slot follow ``dcp/layout.py`` for the given ``dcp_interleave``.
     """
     page_size = cache3d.shape[1]
     T = new_tokens.shape[0]
@@ -795,6 +1250,15 @@ def _scatter_paged(
     kv_len = seq_lens[seq_id]
     abs_pos = jnp.maximum(kv_len - (q_end - q_start) + (t - q_start), 0)
     valid = (t >= q_start) & (t < q_end) & (kv_len > 0)
+    if dcp_size > 1:
+        if dcp_interleave == 1:
+            valid = valid & ((abs_pos % dcp_size) == dcp_rank)
+            abs_pos = abs_pos // dcp_size
+        else:
+            i = dcp_interleave
+            blk = abs_pos // i
+            valid = valid & ((blk % dcp_size) == dcp_rank)
+            abs_pos = (blk // dcp_size) * i + (abs_pos % i)
 
     page_local = abs_pos // page_size
     offset = abs_pos % page_size
