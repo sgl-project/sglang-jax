@@ -700,7 +700,20 @@ def _fused_ep_moe_kernel(
         se_inter_size = w2_shared_hbm.shape[0]
         se_total_blocks = cdiv(se_inter_size, bse)
 
+    tp_is_pow2 = tp_size > 0 and (tp_size & (tp_size - 1)) == 0
+    tp_shift = int(math.log2(tp_size)) if tp_is_pow2 else 0
+    tp_mask = jnp.int32(tp_size - 1)
+    local_e_is_pow2 = local_num_experts > 0 and (local_num_experts & (local_num_experts - 1)) == 0
+    local_e_shift = int(math.log2(local_num_experts)) if local_e_is_pow2 else 0
+    local_e_mask = jnp.int32(local_num_experts - 1)
+
     def get_mesh_device_id(ep_rank):
+        if dp_size == 1:
+            return (jnp.int32(0), ep_rank)
+        if tp_size == 1:
+            return (ep_rank, jnp.int32(0))
+        if tp_is_pow2:
+            return (ep_rank >> tp_shift, ep_rank & tp_mask)
         dp_rank = ep_rank // tp_size
         tp_rank = ep_rank % tp_size
         return (dp_rank, tp_rank)
@@ -805,6 +818,7 @@ def _fused_ep_moe_kernel(
                 starts_load.wait()
                 sizes_load.wait()
                 d2e_count_load.wait()
+
                 starts_copy = pltpu.async_copy(
                     src_ref=starts_vmem,
                     dst_ref=expert_starts_x2_smem.at[bt_sem_id],
@@ -1039,8 +1053,13 @@ def _fused_ep_moe_kernel(
                 e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
                 is_valid = e_id >= 0
                 e_id_safe = lax.select(is_valid, e_id, jnp.int32(0))
-                is_active_expert = is_valid & (e_id_safe % local_num_experts == local_e_id)
-                recv_id = e_id_safe // local_num_experts
+                if local_e_is_pow2:
+                    e_local_idx = e_id_safe & local_e_mask
+                    recv_id = e_id_safe >> local_e_shift
+                else:
+                    e_local_idx = e_id_safe % local_num_experts
+                    recv_id = e_id_safe // local_num_experts
+                is_active_expert = is_valid & (e_local_idx == local_e_id)
                 offset = expert_offsets_x2_smem[bt_sem_id, 0, e_id_safe]
                 sz = lax.select(is_active_expert, jnp.int32(1), jnp.int32(0))
                 is_local = recv_id == my_id
@@ -1100,8 +1119,12 @@ def _fused_ep_moe_kernel(
                 e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
                 is_valid = e_id >= 0
                 e_id_safe = lax.select(is_valid, e_id, jnp.int32(0))
-                e_sem_id_k = e_id_safe % jnp.int32(local_num_experts)
-                recv_id = e_id_safe // local_num_experts
+                if local_e_is_pow2:
+                    e_sem_id_k = e_id_safe & local_e_mask
+                    recv_id = e_id_safe >> local_e_shift
+                else:
+                    e_sem_id_k = e_id_safe % jnp.int32(local_num_experts)
+                    recv_id = e_id_safe // local_num_experts
                 offset = expert_offsets_x2_smem[bt_sem_id, 0, e_id_safe]
                 sz = lax.select(is_valid, jnp.int32(1), jnp.int32(0))
                 is_local = recv_id == my_id
@@ -1878,7 +1901,9 @@ def _fused_ep_moe_kernel(
                                 acc1_vmem[*acc_slices] += acc1
                                 acc3_vmem[*acc_slices] += acc3
 
-        if should_init:
+        if token_tile == btc:
+            compute_tile(0, is_init_mode=should_init)
+        elif should_init:
 
             def body_init(i, _):
                 compute_tile(i, is_init_mode=True)
@@ -2001,12 +2026,22 @@ def _fused_ep_moe_kernel(
                             )
                             res += sg_acc
                     else:
-                        # Non-quantized or single scale group: original structure.
+                        # Non-quantized or single scale group: cache activation in acc1_vmem
+                        # across p_id and bd2c_id when num_bd2 == 1.
                         for bfc_id in range(cdiv(bf, bfc)):
                             acc_slices = (pl.ds(btc_id * btc, btc), pl.ds(bfc_id * bfc, bfc))
-                            acc1 = acc1_vmem[*acc_slices]
-                            acc3 = acc3_vmem[*acc_slices]
-                            act = activation_fn(acc1, acc3, act_fn)
+                            if bd2c_id == 0 and p_id == 0:
+                                acc1 = acc1_vmem[*acc_slices]
+                                acc3 = acc3_vmem[*acc_slices]
+                                act = activation_fn(acc1, acc3, act_fn)
+                                if num_bd2 == 1:
+                                    acc1_vmem[*acc_slices] = act
+                            elif num_bd2 == 1:
+                                act = acc1_vmem[*acc_slices]
+                            else:
+                                acc1 = acc1_vmem[*acc_slices]
+                                acc3 = acc3_vmem[*acc_slices]
+                                act = activation_fn(acc1, acc3, act_fn)
                             w2 = w2_vmem[
                                 p_id,
                                 pl.ds(bfc_id * bfc, bfc),
@@ -2024,7 +2059,10 @@ def _fused_ep_moe_kernel(
                                     w2_scale_vmem[*w2_scale_slices], acc.shape
                                 )
                                 acc *= w2_scale
-                            res += acc
+                            if bfc_id == 0 and (b2_vmem is None or not should_init):
+                                res = acc
+                            else:
+                                res += acc
 
                     res_slice = res_vmem.at[
                         pl.ds(btc_id * btc, btc),
@@ -2036,10 +2074,15 @@ def _fused_ep_moe_kernel(
                     else:
                         res_slice[...] = (res_slice[...].astype(jnp.float32) + res).astype(t_dtype)
 
-        lax.fori_loop(0, num_loops, body, None)
+        if token_tile == btc:
+            body(0, None)
+        else:
+            lax.fori_loop(0, num_loops, body, None)
 
     def expert_ffn(bt_sem_id, e_sem_id, local_e_id):
-        b_acc_vmem_2d = b_acc_vmem.reshape(2, a2a_max_tokens, bf)
+        b_acc_vmem_2d = (
+            b_acc_vmem if b_acc_vmem.ndim == 3 else b_acc_vmem.reshape(2, a2a_max_tokens, bf)
+        )
         b_acc1_vmem = b_acc_vmem_2d.at[0]
         b_acc3_vmem = b_acc_vmem_2d.at[1]
 
@@ -2137,6 +2180,8 @@ def _fused_ep_moe_kernel(
             ).start()
 
         def with_static_bw(bw_sem_id, body):
+            if isinstance(bw_sem_id, int):
+                return body(bw_sem_id)
             return lax.cond(
                 bw_sem_id == 0,
                 lambda _: body(0),
@@ -2152,16 +2197,22 @@ def _fused_ep_moe_kernel(
 
                     # Prefetch tile0 only for bd1=0. For later bd1 slices, tile0 is
                     # prefetched by the previous bd1 into the idle token buffer.
-                    @pl.when((num_token_tiles > 0) & (bd1_id == 0))
-                    def _prefetch_tokens_for_bd0_bts0():
+                    if num_bd1 == 1:
                         start_stage_a2a_s_tile_from_hbm(
-                            jnp.int32(0), bd1_id, jnp.int32(token_buf_offset)
+                            jnp.int32(0), 0, jnp.int32(token_buf_offset)
                         )
+                    else:
 
-                    @pl.when(has_tokens & (next_bd1_id < num_bd1))
-                    def _():
-                        start_fetch_bw1(local_e_id, next_bw_sem_id, bf_id, next_bd1_id)
-                        start_fetch_bw3(local_e_id, next_bw_sem_id, bf_id, next_bd1_id)
+                        @pl.when((num_token_tiles > 0) & (bd1_id == 0))
+                        def _prefetch_tokens_for_bd0_bts0():
+                            start_stage_a2a_s_tile_from_hbm(
+                                jnp.int32(0), bd1_id, jnp.int32(token_buf_offset)
+                            )
+
+                        @pl.when(has_tokens & (next_bd1_id < num_bd1))
+                        def _():
+                            start_fetch_bw1(local_e_id, next_bw_sem_id, bf_id, next_bd1_id)
+                            start_fetch_bw3(local_e_id, next_bw_sem_id, bf_id, next_bd1_id)
 
                     w1_scale_vmem = (
                         None if b_w1_scale_x2_vmem is None else b_w1_scale_x2_vmem.at[bw_sem_id]
@@ -2172,10 +2223,8 @@ def _fused_ep_moe_kernel(
                     b1_vmem = None if b_b1_x2_vmem is None else b_b1_x2_vmem.at[bf_id % 2]
                     b3_vmem = None if b_b3_x2_vmem is None else b_b3_x2_vmem.at[bf_id % 2]
 
-                    @pl.when(has_tokens)
-                    def _():
-                        wait_fetch_bw1(local_e_id, bw_sem_id, bf_id, bd1_id)
-                        wait_fetch_bw3(local_e_id, bw_sem_id, bf_id, bd1_id)
+                    wait_fetch_bw1(local_e_id, bw_sem_id, bf_id, bd1_id)
+                    wait_fetch_bw3(local_e_id, bw_sem_id, bf_id, bd1_id)
 
                     w1_vmem = b_w1_x2_vmem.at[bw_sem_id]
                     w3_vmem = b_w3_x2_vmem.at[bw_sem_id]
@@ -2183,9 +2232,13 @@ def _fused_ep_moe_kernel(
                     # Prefetch W2 (down-projection) once FFN1 finishes for this (bf_id) so FFN2's
                     # first slice is less likely to stall, without competing with the last FFN1
                     # W1/W3 prefetches.
-                    @pl.when(has_tokens & (next_bd1_id == num_bd1))
-                    def _():
+                    if num_bd1 == 1:
                         start_fetch_bw2(local_e_id, next_bw_sem_id, bf_id, jnp.int32(0))
+                    else:
+
+                        @pl.when(has_tokens & (next_bd1_id == num_bd1))
+                        def _():
+                            start_fetch_bw2(local_e_id, next_bw_sem_id, bf_id, jnp.int32(0))
 
                     def run_ffn1_tile(
                         token_tile_id,
@@ -2245,50 +2298,61 @@ def _fused_ep_moe_kernel(
                         unroll=False,
                     )
 
-                    # Cross-bd1 token prefetch: stage next bd1's tile0 into the idle
-                    # token buffer returned by the inner tile loop.
-                    @pl.when((num_token_tiles > 0) & (bd1_id + 1 < num_bd1))
-                    def _prefetch_bts0_tokens_for_next_bd():
-                        start_stage_a2a_s_tile_from_hbm(
-                            jnp.int32(0), bd1_id + jnp.int32(1), token_buf_after
-                        )
+                    if num_bd1 > 1:
+                        # Cross-bd1 token prefetch: stage next bd1's tile0 into the idle
+                        # token buffer returned by the inner tile loop.
+                        @pl.when((num_token_tiles > 0) & (bd1_id + 1 < num_bd1))
+                        def _prefetch_bts0_tokens_for_next_bd():
+                            start_stage_a2a_s_tile_from_hbm(
+                                jnp.int32(0), bd1_id + jnp.int32(1), token_buf_after
+                            )
 
-                    return (jnp.int32(next_bw_sem_id), token_buf_after)
+                    out_bw_sem_id = (
+                        next_bw_sem_id
+                        if num_bd1 == 1 and isinstance(bw_sem_id, int)
+                        else jnp.int32(next_bw_sem_id)
+                    )
+                    return (out_bw_sem_id, token_buf_after)
 
                 return with_static_bw(bw_sem_id, body)
 
             if num_bd1 <= 0:
                 return bw_sem_id
-
-            # Peel bd1_id=0 so `should_init_ffn1` stays static.
-            def _run_active(_):
-                active_bw_sem_id, token_buf_offset = run_gate_up_bd1(
+            if num_bd1 == 1:
+                active_bw_sem_id, _ = run_gate_up_bd1(
                     bd1_id=jnp.int32(0),
                     bw_sem_id=bw_sem_id,
                     token_buf_offset=jnp.int32(0),
                     should_init_ffn1=True,
                 )
+                return active_bw_sem_id
 
-                def run_one_bd1_no_init(bd1_id, carry):
-                    bw_sem_id, token_buf_offset = carry
-                    return run_gate_up_bd1(
-                        bd1_id=bd1_id,
-                        bw_sem_id=bw_sem_id,
-                        token_buf_offset=token_buf_offset,
-                        should_init_ffn1=False,
-                    )
+            # Peel bd1_id=0 so `should_init_ffn1` stays static.
+            active_bw_sem_id, token_buf_offset = run_gate_up_bd1(
+                bd1_id=jnp.int32(0),
+                bw_sem_id=jnp.int32(bw_sem_id),
+                token_buf_offset=jnp.int32(0),
+                should_init_ffn1=True,
+            )
 
-                bd1_unroll = 1
-                final_bw_sem_id, _ = lax.fori_loop(
-                    1,
-                    num_bd1,
-                    run_one_bd1_no_init,
-                    (active_bw_sem_id, token_buf_offset),
-                    unroll=bd1_unroll,
+            def run_one_bd1_no_init(bd1_id, carry):
+                bw_sem_id, token_buf_offset = carry
+                return run_gate_up_bd1(
+                    bd1_id=bd1_id,
+                    bw_sem_id=bw_sem_id,
+                    token_buf_offset=token_buf_offset,
+                    should_init_ffn1=False,
                 )
-                return final_bw_sem_id
 
-            return lax.cond(has_tokens, _run_active, lambda _: bw_sem_id, operand=None)
+            bd1_unroll = 1
+            final_bw_sem_id, _ = lax.fori_loop(
+                1,
+                num_bd1,
+                run_one_bd1_no_init,
+                (active_bw_sem_id, token_buf_offset),
+                unroll=bd1_unroll,
+            )
+            return final_bw_sem_id
 
         def run_down_slices(*, bf_id: int, bw_sem_id):
             should_init_ffn2 = bf_id == 0
@@ -2298,36 +2362,48 @@ def _fused_ep_moe_kernel(
                     next_bw_sem_id = 1 - bw_sem_id
                     next_bd2_id = bd2_id + jnp.int32(1)
 
-                    @pl.when(has_tokens & (next_bd2_id < num_bd2))
-                    def _():
-                        start_fetch_bw2(local_e_id, next_bw_sem_id, bf_id, next_bd2_id)
+                    if num_bd2 > 1:
+
+                        @pl.when(has_tokens & (next_bd2_id < num_bd2))
+                        def _():
+                            start_fetch_bw2(local_e_id, next_bw_sem_id, bf_id, next_bd2_id)
 
                     if bf_id + 1 < num_bf:
-
-                        @pl.when(has_tokens & (next_bd2_id == num_bd2))
-                        def _():
+                        if num_bd2 == 1:
                             start_fetch_bw1(local_e_id, next_bw_sem_id, bf_id + 1, jnp.int32(0))
                             start_fetch_bw3(local_e_id, next_bw_sem_id, bf_id + 1, jnp.int32(0))
+                        else:
 
-                    is_last_bf = bf_id == num_bf - 1
-                    is_last_bd2 = next_bd2_id == num_bd2
-                    has_next_expert = local_e_id + 1 < local_num_experts
+                            @pl.when(has_tokens & (next_bd2_id == num_bd2))
+                            def _():
+                                start_fetch_bw1(local_e_id, next_bw_sem_id, bf_id + 1, jnp.int32(0))
+                                start_fetch_bw3(local_e_id, next_bw_sem_id, bf_id + 1, jnp.int32(0))
 
-                    @pl.when(
-                        jnp.logical_and(jnp.logical_and(is_last_bf, is_last_bd2), has_next_expert)
-                    )
-                    def _prefetch_next_expert():
-                        next_e_id = local_e_id + 1
-                        target_sem_id = jnp.int32(0)
-                        next_global_e_id = my_id * local_num_experts + next_e_id
-                        next_sz = expert_sizes_x2_smem[bt_sem_id, 0, next_global_e_id]
+                    if bf_id == num_bf - 1:
+                        has_next_expert = local_e_id + 1 < local_num_experts
+                        cond_prefetch = (
+                            has_next_expert
+                            if num_bd2 == 1
+                            else jnp.logical_and(next_bd2_id == num_bd2, has_next_expert)
+                        )
 
-                        @pl.when(next_sz != 0)
-                        def _():
-                            start_fetch_bw1(next_e_id, target_sem_id, jnp.int32(0), jnp.int32(0))
-                            start_fetch_bw3(next_e_id, target_sem_id, jnp.int32(0), jnp.int32(0))
+                        @pl.when(cond_prefetch)
+                        def _prefetch_next_expert():
+                            next_e_id = local_e_id + 1
+                            target_sem_id = jnp.int32(0)
+                            next_global_e_id = my_id * local_num_experts + next_e_id
+                            next_sz = expert_sizes_x2_smem[bt_sem_id, 0, next_global_e_id]
 
-                    if should_init_ffn2:
+                            @pl.when(next_sz != 0)
+                            def _():
+                                start_fetch_bw1(
+                                    next_e_id, target_sem_id, jnp.int32(0), jnp.int32(0)
+                                )
+                                start_fetch_bw3(
+                                    next_e_id, target_sem_id, jnp.int32(0), jnp.int32(0)
+                                )
+
+                    if should_init_ffn2 and expert_buffer_count < local_num_experts:
 
                         @pl.when(bd2_id == 0)
                         def _():
@@ -2337,9 +2413,7 @@ def _fused_ep_moe_kernel(
                                 local_e_id=local_e_id - expert_buffer_count,
                             )
 
-                    @pl.when(has_tokens)
-                    def _():
-                        wait_fetch_bw2(local_e_id, bw_sem_id, bf_id, bd2_id)
+                    wait_fetch_bw2(local_e_id, bw_sem_id, bf_id, bd2_id)
 
                     w2_scale_vmem = (
                         None if b_w2_scale_x2_vmem is None else b_w2_scale_x2_vmem.at[bw_sem_id]
@@ -2353,15 +2427,11 @@ def _fused_ep_moe_kernel(
                     init_buf_compute = jnp.int32(0)
                     init_buf_store = jnp.int32(1)
                     init_buf_load = jnp.int32(2)
-                    has_tiles = num_token_tiles > 0
 
                     if not should_init_ffn2:
-
-                        @pl.when(has_tiles)
-                        def _(bd2_start=bd2_start, init_buf_compute=init_buf_compute):
-                            start_load_stage_a2a_s_acc_tile_from_hbm(
-                                jnp.int32(0), bd2_start, init_buf_compute
-                            )
+                        start_load_stage_a2a_s_acc_tile_from_hbm(
+                            jnp.int32(0), bd2_start, init_buf_compute
+                        )
 
                     def run_ffn2_tile(
                         token_tile_id,
@@ -2426,14 +2496,9 @@ def _fused_ep_moe_kernel(
                         return (buf_load, buf_compute, buf_store)
 
                     state = (init_buf_compute, init_buf_store, init_buf_load)
+                    lax.fori_loop(0, num_token_tiles, run_ffn2_tile, state, unroll=False)
 
-                    @pl.when(has_tokens)
-                    def _():
-                        lax.fori_loop(0, num_token_tiles, run_ffn2_tile, state, unroll=False)
-
-                    @pl.when(num_token_tiles >= 1)
-                    def _():
-                        wait_stage_a2a_s_acc_tile(jnp.int32(0))
+                    wait_stage_a2a_s_acc_tile(jnp.int32(0))
 
                     @pl.when(num_token_tiles >= 2)
                     def _():
@@ -2443,12 +2508,18 @@ def _fused_ep_moe_kernel(
                     def _():
                         wait_stage_a2a_s_acc_tile(jnp.int32(1))
 
-                    return jnp.int32(next_bw_sem_id)
+                    return (
+                        next_bw_sem_id
+                        if num_bd2 == 1 and isinstance(bw_sem_id, int)
+                        else jnp.int32(next_bw_sem_id)
+                    )
 
                 return with_static_bw(bw_sem_id, body)
 
+            if num_bd2 == 1:
+                return run_down_bd2(jnp.int32(0), bw_sem_id)
             bd2_unroll = 1
-            return lax.fori_loop(0, num_bd2, run_down_bd2, bw_sem_id, unroll=bd2_unroll)
+            return lax.fori_loop(0, num_bd2, run_down_bd2, jnp.int32(bw_sem_id), unroll=bd2_unroll)
 
         def _prefetch_next_expert_if_needed():
             next_local_e_id = local_e_id + jnp.int32(1)
@@ -2466,20 +2537,21 @@ def _fused_ep_moe_kernel(
         def _run_inactive(_):
             # Preserve the gather-send drain and next-expert prefetch side effects so
             # we can skip the bd1/bd2 loops when this expert receives no tokens.
-            wait_a2a_gather_send(
-                bt_sem_id=bt_sem_id,
-                e_sem_id=e_sem_id,
-                local_e_id=local_e_id - expert_buffer_count,
-            )
+            if expert_buffer_count < local_num_experts:
+                wait_a2a_gather_send(
+                    bt_sem_id=bt_sem_id,
+                    e_sem_id=e_sem_id,
+                    local_e_id=local_e_id - expert_buffer_count,
+                )
             _prefetch_next_expert_if_needed()
             return jnp.int32(0)
 
         def _run_active(_):
-            bw_sem_id = jnp.int32(0)
+            bw_sem_id = 0
             for bf_id in range(num_bf):
                 bw_sem_id = run_gate_up_slices(bf_id=bf_id, bw_sem_id=bw_sem_id)
                 bw_sem_id = run_down_slices(bf_id=bf_id, bw_sem_id=bw_sem_id)
-            return bw_sem_id
+            return jnp.int32(bw_sem_id)
 
         lax.cond(has_tokens, _run_active, _run_inactive, operand=None)
 
@@ -2489,7 +2561,7 @@ def _fused_ep_moe_kernel(
         num_acc_tiles = bt // acc_bt
 
         def start_load_acc_bt(*, tile_start, buf_id):
-            def _load_one(t_i, _):
+            def _load_one(t_i, num_valid):
                 t_id = tile_start + t_i
                 # Use the routing sentinel (-1) to identify padding tokens.
                 token_e0 = t2e_routing_x2_smem[bt_sem_id, t_id, 0]
@@ -2513,49 +2585,20 @@ def _fused_ep_moe_kernel(
                     for k_id in range(top_k):
                         a2a_g_acc_vmem.at[buf_id, k_id, pl.ds(t_i, 1)][...] = zeros
 
-                return None
+                return num_valid + is_valid_token.astype(jnp.int32)
 
-            lax.fori_loop(0, acc_bt, _load_one, None, unroll=False)
+            return lax.fori_loop(0, acc_bt, _load_one, jnp.int32(0), unroll=False)
 
-        def wait_load_acc_bt(*, buf_id, tile_start):
-            # If this acc tile contains zero valid tokens, `start_load_acc_bt` does not
-            # launch any HBM->VMEM async copies (it just writes zeros into VMEM).
-            # Waiting on `a2a_acc_sems` in that case can hang because the semaphore
-            # is never signaled.
-            def _count_valid(t_i, acc):
-                token_e0 = t2e_routing_x2_smem[bt_sem_id, tile_start + t_i, 0]
-                return acc + (token_e0 >= 0).astype(jnp.int32)
-
-            num_valid = lax.fori_loop(
-                0,
-                acc_bt,
-                _count_valid,
-                jnp.int32(0),
-                unroll=False,
-            )
-
+        def wait_load_acc_bt(*, buf_id, num_valid):
             @pl.when(num_valid != 0)
             def _():
-                # `start_load_acc_bt` launches one HBM->VMEM DMA per (valid token, top-k),
-                # all sharing `a2a_acc_sems[0]`. To avoid consuming fewer semaphore
-                # signals than DMAs launched (which can stall later stages), drain
-                # exactly `num_valid * top_k` waits here.
-                def _wait_one(_, __):
-                    ref = a2a_g_acc_vmem.at[buf_id, 0, pl.ds(0, 1)]
-                    pltpu.make_async_copy(
-                        src_ref=ref,
-                        dst_ref=ref,
-                        sem=a2a_acc_sems.at[0],
-                    ).wait()
-                    return None
-
-                lax.fori_loop(
-                    0,
-                    num_valid * jnp.int32(top_k),
-                    _wait_one,
-                    None,
-                    unroll=False,
-                )
+                # Drain all `num_valid * top_k` HBM->VMEM DMAs in a single wait.
+                ref = a2a_g_acc_vmem.at[buf_id, pl.ds(0, top_k), pl.ds(0, num_valid)]
+                pltpu.make_async_copy(
+                    src_ref=ref,
+                    dst_ref=ref,
+                    sem=a2a_acc_sems.at[0],
+                ).wait()
 
         def acc_gather_to_output(*, tile_start, out_offset, buf_id):
             output_tile = jnp.zeros((acc_bt, t_packing, h_per_t_packing), dtype=jnp.float32)
@@ -2581,9 +2624,9 @@ def _fused_ep_moe_kernel(
             ]
             target_slice[...] = output_tile.reshape(acc_bt, hidden_size).astype(output_hbm.dtype)
 
-        start_load_acc_bt(tile_start=0, buf_id=0)
+        init_num_valid = start_load_acc_bt(tile_start=0, buf_id=0)
 
-        def run_acc_pipeline(i, _):
+        def run_acc_pipeline(i, curr_num_valid):
             curr_buf_id = i % 2
             next_buf_id = (i + 1) % 2
 
@@ -2591,18 +2634,21 @@ def _fused_ep_moe_kernel(
             next_tile_start = (i + 1) * acc_bt
             out_offset = i * acc_bt
 
-            @pl.when(i + 1 < num_acc_tiles)
-            def _():
-                start_load_acc_bt(tile_start=next_tile_start, buf_id=next_buf_id)
+            next_num_valid = lax.cond(
+                i + 1 < num_acc_tiles,
+                lambda _: start_load_acc_bt(tile_start=next_tile_start, buf_id=next_buf_id),
+                lambda _: jnp.int32(0),
+                operand=None,
+            )
 
-            wait_load_acc_bt(buf_id=curr_buf_id, tile_start=curr_tile_start)
+            wait_load_acc_bt(buf_id=curr_buf_id, num_valid=curr_num_valid)
 
             acc_gather_to_output(
                 tile_start=curr_tile_start, out_offset=out_offset, buf_id=curr_buf_id
             )
-            return None
+            return next_num_valid
 
-        lax.fori_loop(0, num_acc_tiles, run_acc_pipeline, None, unroll=False)
+        lax.fori_loop(0, num_acc_tiles, run_acc_pipeline, init_num_valid, unroll=False)
         return None
 
     def start_send_bo(*, bt_id, priority=0):
@@ -2632,6 +2678,9 @@ def _fused_ep_moe_kernel(
             ).wait()
 
     ### ------- Kernel start ------- ###
+    if num_bt >= 1:
+        start_fetch_topk(bt_id=jnp.int32(0))
+        start_fetch_se_tokens(bt_id=jnp.int32(0))
     sync_barrier()
     start_fetch_and_wait_se_scales()
 
@@ -2770,10 +2819,6 @@ def _fused_ep_moe_kernel(
 
             lax.fori_loop(0, num_bd2, body_w2, None)
 
-    if num_bt >= 1:
-        start_fetch_topk(bt_id=jnp.int32(0))
-        start_fetch_se_tokens(bt_id=jnp.int32(0))
-
     def run_bt(bt_id, e_sem_id):
         bt_start = bt_id * bt
         bt_sem_id = bt_id & jnp.int32(1)
@@ -2819,28 +2864,28 @@ def _fused_ep_moe_kernel(
         if expert_buffer_count >= local_num_experts:
             # === BATCH SCATTER PATH ===
             # Issue all scatter DMAs in one token-loop pass (bt iterations
-            # instead of bt * local_num_experts), then run a tight compute loop
-            # where each expert waits only its own recv semaphore.
+            # instead of bt * local_num_experts), then issue initial weight
+            # prefetch so it overlaps with in-flight ICI scatter before waiting.
             start_a2a_scatter_batch(bt_sem_id=bt_sem_id, bt_start=bt_start)
+
+            if local_num_experts > 0:
+                first_e_id = my_id * local_num_experts
+                first_sz = expert_sizes_x2_smem[bt_sem_id, 0, first_e_id]
+
+                @pl.when(first_sz != 0)
+                def _first_load():
+                    start_fetch_bw1(0, bw1_sem_id=0, bf_id=0, bd1_id=0)
+                    start_fetch_bw3(0, bw3_sem_id=0, bf_id=0, bd3_id=0)
 
             init_carry = jnp.int32(0)
 
             def compute_expert_batch(local_e_id, curr_se_block):
                 e_sem_id_local = local_e_id
 
-                @pl.when(local_e_id == 0)
-                def _first_load():
-                    e_id = my_id * local_num_experts
-                    sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
-
-                    @pl.when(sz != 0)
-                    def _():
-                        start_fetch_bw1(0, bw1_sem_id=0, bf_id=0, bd1_id=0)
-                        start_fetch_bw3(0, bw3_sem_id=0, bf_id=0, bd3_id=0)
-
-                for _ in range(se_before):
-                    run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
-                    curr_se_block += 1
+                if se_total_blocks > 0:
+                    for _ in range(se_before):
+                        run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
+                        curr_se_block += 1
 
                 wait_a2a_scatter_recv(
                     bt_sem_id=bt_sem_id,
@@ -2855,9 +2900,10 @@ def _fused_ep_moe_kernel(
                     local_e_id=local_e_id,
                 )
 
-                for _ in range(se_after):
-                    run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
-                    curr_se_block += 1
+                if se_total_blocks > 0:
+                    for _ in range(se_after):
+                        run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
+                        curr_se_block += 1
 
                 return curr_se_block
 
@@ -2865,13 +2911,14 @@ def _fused_ep_moe_kernel(
                 0, local_num_experts, compute_expert_batch, init_carry, unroll=False
             )
 
-            def cleanup_body_batch(block_idx, _):
-                run_shared_expert_slice(block_idx, bt_id, bt_sem_id, out_buf_id)
-                return None
+            if se_total_blocks > 0:
 
-            lax.fori_loop(final_se_block, se_total_blocks, cleanup_body_batch, None)
+                def cleanup_body_batch(block_idx, _):
+                    run_shared_expert_slice(block_idx, bt_id, bt_sem_id, out_buf_id)
+                    return None
 
-            wait_a2a_scatter_send_batch()
+                lax.fori_loop(final_se_block, se_total_blocks, cleanup_body_batch, None)
+
             wait_a2a_gather_recv_all(bt_sem_id=bt_sem_id)
             sync_barrier()
 
@@ -2879,12 +2926,33 @@ def _fused_ep_moe_kernel(
 
             start_send_bo(bt_id=bt_id)
 
-            tail_start = max(local_num_experts - expert_buffer_count, 0)
-            for tail_local_e_id in range(tail_start, local_num_experts):
-                wait_a2a_gather_send(
-                    bt_sem_id=bt_sem_id,
-                    e_sem_id=tail_local_e_id,
-                    local_e_id=tail_local_e_id,
+            if not disable_a2a:
+
+                def _drain_scatter_and_gather_send(slot, _):
+                    scatter_send_sz = a2a_s_sends_x2_smem[slot]
+
+                    @pl.when(scatter_send_sz != 0)
+                    def _():
+                        ref = a2a_s_x2_hbm.at[slot, pl.ds(0, scatter_send_sz)]
+                        pltpu.make_async_copy(
+                            src_ref=ref,
+                            dst_ref=ref,
+                            sem=send_x2_sems.at[slot],
+                        ).wait()
+
+                    wait_a2a_gather_send(
+                        bt_sem_id=bt_sem_id,
+                        e_sem_id=slot,
+                        local_e_id=slot,
+                    )
+                    return None
+
+                lax.fori_loop(
+                    0,
+                    jnp.int32(local_num_experts),
+                    _drain_scatter_and_gather_send,
+                    None,
+                    unroll=False,
                 )
 
             @pl.when(bt_id + 1 < num_bt)
@@ -2899,20 +2967,19 @@ def _fused_ep_moe_kernel(
                 bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=0, bt_start=bt_start
             )
 
+            if local_num_experts > 0:
+                first_e_id = my_id * local_num_experts
+                first_sz = expert_sizes_x2_smem[bt_sem_id, 0, first_e_id]
+
+                @pl.when(first_sz != 0)
+                def _first_load():
+                    start_fetch_bw1(0, bw1_sem_id=0, bf_id=0, bd1_id=0)
+                    start_fetch_bw3(0, bw3_sem_id=0, bf_id=0, bd3_id=0)
+
             init_carry = (e_sem_id, jnp.int32(0))
 
             def run_per_expert_pipelined(local_e_id, carry):
                 curr_e_sem_id, curr_se_block = carry
-
-                @pl.when(local_e_id == 0)
-                def _first_load():
-                    e_id = my_id * local_num_experts + local_e_id
-                    sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
-
-                    @pl.when(sz != 0)
-                    def _():
-                        start_fetch_bw1(local_e_id, bw1_sem_id=0, bf_id=0, bd1_id=0)
-                        start_fetch_bw3(local_e_id, bw3_sem_id=0, bf_id=0, bd3_id=0)
 
                 @pl.when(curr_se_block == 0)
                 def _():
@@ -2996,10 +3063,14 @@ def _fused_ep_moe_kernel(
 
         return final_e_sem_id
 
-    lax.fori_loop(0, num_bt, run_bt, jnp.int32(0), unroll=False)
-    # Drain outstanding output stores (matches epic wait_send_bo for last two bts).
-    wait_store_output(bt_id=jnp.int32(num_bt - 2))
-    wait_store_output(bt_id=jnp.int32(num_bt - 1))
+    if num_bt == 1:
+        run_bt(jnp.int32(0), jnp.int32(0))
+        wait_store_output(bt_id=jnp.int32(0))
+    else:
+        lax.fori_loop(0, num_bt, run_bt, jnp.int32(0), unroll=False)
+        # Drain outstanding output stores (matches epic wait_send_bo for last two bts).
+        wait_store_output(bt_id=jnp.int32(num_bt - 2))
+        wait_store_output(bt_id=jnp.int32(num_bt - 1))
 
     ### ------- Kernel end ------- ###
 
@@ -3472,8 +3543,6 @@ def fused_ep_moe(
     if w3_shared_scale is not None and w3_shared_scale.dtype != jnp.float32:
         w3_shared_scale = w3_shared_scale.astype(jnp.float32)
 
-    tokens = tokens.reshape(-1, t_packing, hidden_size // t_packing)
-
     hbm_block_spec = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
     renorm_str = "-renorm_k" if renormalize_topk_logits else ""
     scope_name = (
@@ -3504,14 +3573,6 @@ def fused_ep_moe(
         w2_scale_shape = (2, t_packing, block_config.bf // quant_block_k, 1, bd2_per_pack)
         w2_scale_scratch = pltpu.VMEM(w2_scale_shape, jnp.float32)
 
-    if padded_top_k > top_k:
-        topk_ids = jnp.pad(
-            topk_ids, ((0, 0), (0, padded_top_k - top_k)), mode="constant", constant_values=-1
-        )
-        topk_weights = jnp.pad(
-            topk_weights, ((0, 0), (0, padded_top_k - top_k)), mode="constant", constant_values=0
-        )
-
     b1_scratch = None if b1 is None else pltpu.VMEM((2, 1, block_config.bf), jnp.float32)
     b3_scratch = None if b3 is None else pltpu.VMEM((2, 1, block_config.bf), jnp.float32)
     b2_scratch = None if b2 is None else pltpu.VMEM((2, t_packing, 1, bd2_per_pack), jnp.float32)
@@ -3540,7 +3601,7 @@ def fused_ep_moe(
         b1_scratch,  # b_b1_x2_vmem
         b3_scratch,  # b_b3_x2_vmem
         b2_scratch,  # b_b2_x2_vmem
-        pltpu.VMEM((2, a2a_max_tokens, 1, block_config.bf), jnp.float32),  # b_acc_vmem
+        pltpu.VMEM((2, a2a_max_tokens, block_config.bf), jnp.float32),  # b_acc_vmem
         pltpu.VMEM((2, block_config.bts, t_packing, bd1_per_pack), t_dtype),  # b_stage_x2_vmem
         pltpu.VMEM(
             (3, block_config.bts, t_packing, bd2_per_pack),
@@ -3766,6 +3827,7 @@ def fused_ep_moe(
         w3_shared_scale=None,
         w2_shared_scale=None,
     ):
+        tokens = tokens.reshape(-1, t_packing, hidden_size // t_packing)
         if needs_jax_allreduce:
             metadata_starts, metadata_sizes, metadata_d2e_counts = jax_allreduce_metadata_by_bt(
                 topk_ids[:, :top_k],
@@ -3785,6 +3847,17 @@ def fused_ep_moe(
             metadata_starts_arg = None
             metadata_sizes_arg = None
             metadata_d2e_counts_arg = None
+
+        if padded_top_k > top_k:
+            topk_ids = jnp.pad(
+                topk_ids, ((0, 0), (0, padded_top_k - top_k)), mode="constant", constant_values=-1
+            )
+            topk_weights = jnp.pad(
+                topk_weights,
+                ((0, 0), (0, padded_top_k - top_k)),
+                mode="constant",
+                constant_values=0,
+            )
 
         local_output = fused_moe(
             pltpu.with_memory_space_constraint(tokens, pltpu.HBM),  # tokens_hbm
