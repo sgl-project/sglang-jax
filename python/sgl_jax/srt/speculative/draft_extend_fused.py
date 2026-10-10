@@ -22,6 +22,7 @@ from sgl_jax.srt.speculative.relay_buffer import (
     make_dp_valid_mask,
     update_spec_relay_buffers,
 )
+from sgl_jax.srt.speculative.spec_logprob import attach_spec_output_logprobs
 from sgl_jax.srt.speculative.spec_utils import (
     SIMULATED_ACCEPTANCE_CONFIG,
     apply_simulated_acceptance,
@@ -421,7 +422,17 @@ def _build_chain_verify_arrays(
     bs = batch_size
     tid_range = jnp.arange(n, dtype=jnp.int32)
     verified_column = verified_id.astype(jnp.int32)[:, None]
-    token_chain = token_list[:, : n - 1].astype(jnp.int32)
+    token_list = token_list.astype(jnp.int32)
+    if token_list.ndim == 2 and token_list.shape[1] < n - 1:
+        # Width-1 bootstrap chain (first decode after a non-fused prefill, or a relay
+        # buffer seeded by it) reaching fused verify: gp79/gp80 (10-02) crashed here with
+        # reshape (1, 2) -> 4 on MTP + return_logprob requests. Pad the chain by
+        # repeating its last token; the duplicates are rejected by verify and the
+        # target logits supply the next token, so outputs are unchanged (only this
+        # step's accept length is shorter). Steady-state relay chains are full width.
+        pad = jnp.repeat(token_list[:, -1:], (n - 1) - token_list.shape[1], axis=1)
+        token_list = jnp.concatenate([token_list, pad], axis=1)
+    token_chain = token_list[:, : n - 1]
     verified_sharding = jax.typeof(verified_column).sharding
     if (
         isinstance(verified_sharding, NamedSharding)
@@ -1645,8 +1656,11 @@ def _prepare_logits_metadata(batch, mesh, *, include_accept_lens: bool = True):
         extend_seq_lens_cpu=None,
         extend_logprob_start_lens_cpu=None,
         extend_logprob_pruned_lens_cpu=None,
-        top_logprobs_nums=getattr(batch, "top_logprobs_nums", None),
-        token_ids_logprobs=getattr(batch, "token_ids_logprobs", None),
+        # Draft-model logprobs are never returned, and these lists are part of
+        # the JIT cache key (aux data): keep them None so a logprob batch does
+        # not retrace the fused verify / draft-extend executables.
+        top_logprobs_nums=None,
+        token_ids_logprobs=None,
         extend_input_logprob_token_ids_device=_prepare_device_array(
             getattr(batch, "extend_input_logprob_token_ids", None),
             sharding,
@@ -2555,11 +2569,22 @@ def spec_decode_verify(
         ):
             if hasattr(value, "copy_to_host_async"):
                 value.copy_to_host_async()
+    verify_logits_output = LogitsProcessorOutput(
+        next_token_logits=target_logits,
+        hidden_states=prepared_hidden,
+    )
+    if return_target_logits:
+        # target_logits is gathered at safe_index inside fused_verify:
+        # bs * (steps + 1) rows aligned with prepared_verified_id.
+        attach_spec_output_logprobs(
+            verify_logits_output,
+            prepared_verified_id,
+            model_worker_batch,
+            spec_worker.mesh,
+            width=draft_worker.speculative_num_steps + 1,
+        )
     batch_output = GenerationBatchResult(
-        logits_output=LogitsProcessorOutput(
-            next_token_logits=target_logits,
-            hidden_states=prepared_hidden,
-        ),
+        logits_output=verify_logits_output,
         next_token_ids=prepared_predict,
         next_draft_input=next_draft_input,
         accept_lens=prepared_accept_lens_host,

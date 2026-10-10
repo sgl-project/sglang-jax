@@ -2722,6 +2722,21 @@ class ScheduleBatch:
             if target_per_rank_ocl > 0
             else np.empty(0, dtype=np.int32)
         )
+        # Per-request top-k / token-id logprob asks in the same DP-padded slot
+        # order as seq_lens (slot = dp_rank * per_dp_bs + j). The verify step
+        # reads only max(top_k); the scheduler trims per request. The
+        # extend-logprob lists stay None: a decode batch has no prompt logprobs.
+        if self.return_logprob:
+            top_logprobs_nums = [0] * total_bs
+            token_ids_logprobs: list[list[int] | None] = [None] * total_bs
+            for dp_rank, info in enumerate(self.reqs_info):
+                base = dp_rank * per_dp_bs
+                for j, req in enumerate(info.reqs or []):
+                    top_logprobs_nums[base + j] = int(req.top_logprobs_num or 0)
+                    token_ids_logprobs[base + j] = req.token_ids_logprob
+        else:
+            top_logprobs_nums = None
+            token_ids_logprobs = None
         model_worker_batch = ModelWorkerBatch(
             bid=acc_global_bid(),
             forward_mode=self.forward_mode,
@@ -2732,8 +2747,8 @@ class ScheduleBatch:
             out_cache_loc=out_cache_loc,
             return_logprob=self.return_logprob,
             return_output_logprob_only=self.return_output_logprob_only,
-            top_logprobs_nums=None,
-            token_ids_logprobs=None,
+            top_logprobs_nums=top_logprobs_nums,
+            token_ids_logprobs=token_ids_logprobs,
             sampling_info=sampling_info,
             positions=np.empty(0, dtype=np.int32),
             cache_loc=np.empty(0, dtype=np.int32),
