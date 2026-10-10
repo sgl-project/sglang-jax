@@ -130,15 +130,17 @@ def _grouped_topk_kernel(
     #        bits are zero, so packing the id into those 16 bits discards nothing). See gate.py:
     #        the caller selects packed only when router_logits is bf16.
     with jax.named_scope("final_select"):
-        e_iota = jax.lax.broadcasted_iota(jnp.int32, (E, bt), 0)
-        # The same expert ids carried in f32 (`tpu.iota` is integer-only, so this is one
-        # loop-invariant convert). Exact for every E a TPU can hold (E <= 2**24), so 0..E
+        # 1-based expert ids in uint32 (1..E), using idx=0 as the initialization value in
+        # ids_init. The actual 0-based expert id is parsed as `idx - 1` at output.
+        e_iota = jax.lax.broadcasted_iota(jnp.uint32, (E, bt), 0) + jnp.uint32(1)
+        # The same 1-based expert ids carried in f32 (`tpu.iota` is integer-only, so this is one
+        # loop-invariant convert). Exact for every E a TPU can hold (E <= 2**24), so 1..E+1
         # round-trip through f32 unchanged; `_pick` reduces and compares against this copy
         # because the vector core has float min/max but no integer min/max.
         e_iota_f = e_iota.astype(jnp.float32)
-        e_sentinel_f = jnp.float32(E)
-        row_iota = jax.lax.broadcasted_iota(jnp.int32, (topk, bt), 0)
-        ids_init = jnp.full((topk, bt), -1, dtype=jnp.int32)
+        e_sentinel_f = jnp.float32(E + 1)
+        row_iota = jax.lax.broadcasted_iota(jnp.uint32, (topk, bt), 0)
+        ids_init = jnp.zeros((topk, bt), dtype=jnp.uint32)
         w_init = jnp.zeros((topk, bt), dtype=jnp.float32)
 
         if packed:
@@ -152,7 +154,7 @@ def _grouped_topk_kernel(
                 si = jax.lax.bitcast_convert_type(sb, jnp.int32)
                 # flip low 31 bits for negatives so signed int32 compares in float order (incl -inf)
                 key_score = si ^ ((si >> 31) & jnp.int32(0x7FFFFFFF))
-                work0 = (key_score & clear_mask) | (E - 1 - e_iota)  # [E, BT] packed key
+                work0 = (key_score & clear_mask) | (jnp.uint32(E) - e_iota).astype(jnp.int32)
         else:
             work0 = masked  # [E, BT] f32 working scores
 
@@ -160,7 +162,7 @@ def _grouped_topk_kernel(
             cur, ids_buf, w_buf = carry
             if packed:
                 kmax = jnp.max(cur, axis=0, keepdims=True)  # [1, BT] single reduction
-                idx = (E - 1) - (kmax & low_mask)  # [1, BT] lowest-index winner from the low bits
+                idx = jnp.uint32(E) - (kmax & low_mask).astype(jnp.uint32)  # [1, BT] 1..E
                 idxf = idx.astype(jnp.float32)
             else:
                 cmax = jnp.max(cur, axis=0, keepdims=True)
@@ -170,20 +172,20 @@ def _grouped_topk_kernel(
                 # expanded to a `vlt.s32` + `vsel` pair on every vreg of the [E,BT] block.
                 idxf = jnp.min(
                     jnp.where(cur == cmax, e_iota_f, e_sentinel_f), axis=0, keepdims=True
-                )  # [1, BT] lowest expert id achieving the max (E when no element matches)
-                idx = idxf.astype(jnp.int32)
+                )  # [1, BT] 1-based lowest expert id achieving the max (E+1 when no element matches)
+                idx = idxf.astype(jnp.uint32)
             # The winner one-hot feeds two consumers (weight gather, drop-the-winner). Kept as
             # ONE [E,BT] i1 value it outlives both uses, so Mosaic materialises it, spills it to
             # VMEM and re-expands it (`vnez.u8`) at each use. Comparing twice — once in f32 for
-            # the gather, once in i32 for the update, on the same winner id — is one compare per
+            # the gather, once in u32 for the update, on the same winner id — is one compare per
             # use with no shared array: neither CSE nor Mosaic can merge a cmpf with a cmpi, and
             # each mask dies into its consumer inside a vector mask register.
             # weight from PRE-bias logits via masked sum (gather is unsupported in Pallas/Mosaic).
             wval = jnp.sum(
                 jnp.where(e_iota_f == idxf, logits, 0.0), axis=0, keepdims=True
             )  # [1, BT]
-            write = row_iota == k  # [topk, BT] one-hot on row k (loop index)
-            ids_buf = jnp.where(write, idx.astype(jnp.int32), ids_buf)
+            write = row_iota == k.astype(jnp.uint32)  # [topk, BT] one-hot on row k (loop index)
+            ids_buf = jnp.where(write, idx, ids_buf)
             w_buf = jnp.where(write, wval.astype(jnp.float32), w_buf)
             # drop the winner
             cur = jnp.where(e_iota == idx, _I32_MIN if packed else NEG_INF, cur)
@@ -193,7 +195,7 @@ def _grouped_topk_kernel(
             0, topk, _pick, (work0, ids_init, w_init), unroll=True
         )
 
-    ids_ref[...] = ids_out  # [topk, BT]
+    ids_ref[...] = (ids_out - jnp.uint32(1)).astype(jnp.int32)  # [topk, BT]: actual idx = idx - 1
     w_ref[...] = w_out
 
 
@@ -224,8 +226,9 @@ def grouped_topk_pallas(
     bias = correction_bias.astype(jnp.float32)
 
     if block_tokens == "auto":
-        bt = _largest_safe_divisor(bs, cap=SAFE_AUTO_BT, align=128) or bs
-        if bt > SAFE_AUTO_BT:
+        auto_cap = max(128, min(SAFE_AUTO_BT, (256 * SAFE_AUTO_BT // e // 128) * 128))
+        bt = _largest_safe_divisor(bs, cap=auto_cap, align=128) or bs
+        if bt > auto_cap:
             logger.warning(
                 "grouped_topk: auto block_tokens fell back to whole-batch BT=%d (BS=%d has no "
                 "128-aligned VMEM-safe divisor); a single [%d,%d] tile may exceed VMEM. Pad local "
