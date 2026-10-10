@@ -171,6 +171,13 @@ def sparse_mla_page_level(
     sp_cu_kv = jnp.arange(T + 1, dtype=jnp.int32) * (k_pages_max * page_size)
     sp_dist = jnp.array([T, T, T], dtype=jnp.int32)
 
+    # The v2 kernel stores these straight into the packed cache, so it requires
+    # them in the cache dtype. Convert here, at the boundary: handing bf16 to an
+    # fp8 cache would make the store reinterpret rather than convert.
+    if new_kv_c.dtype != cache_kv.dtype:
+        new_kv_c = new_kv_c.astype(cache_kv.dtype)
+        new_k_pe = new_k_pe.astype(cache_kv.dtype)
+
     o, cache_out = mla_ragged_paged_attention(
         ql_nope,
         q_pe,
