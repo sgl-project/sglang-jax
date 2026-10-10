@@ -82,69 +82,74 @@ def init_hicache(cache, server_args, mesh, token_to_kv_pool_allocator) -> None:
     if mesh is None:
         raise ValueError("HiCache needs a mesh to build the host pool sharding")
 
+    from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, SWAKVPool
+    from sgl_jax.srt.mem_cache.unified_cache_components import ComponentType
+
     device_pool = token_to_kv_pool_allocator.get_kvcache()
-    if getattr(server_args, "hicache_transfer_backend", "jax") == "raiden":
-        from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool
-        from sgl_jax.srt.mem_cache.raiden_hicache import create_raiden_hicache
-        from sgl_jax.srt.mem_cache.unified_cache_components.tree_component import (
-            ComponentType,
-        )
+    hybrid = cache.tree_components == (ComponentType.FULL, ComponentType.SWA)
+    if hybrid:
+        if not isinstance(device_pool, SWAKVPool):
+            raise ValueError("FULL+SWA HiCache requires SWAKVPool")
+        device_pools = {
+            ComponentType.FULL: device_pool.full_kv_pool,
+            ComponentType.SWA: device_pool.swa_kv_pool,
+        }
+    elif cache.tree_components == (ComponentType.FULL,):
+        device_pools = {ComponentType.FULL: device_pool}
+    else:
+        raise ValueError("HiCache supports FULL or FULL+SWA components only")
 
-        if (
-            cache.tree_components != (ComponentType.FULL,)
-            or type(device_pool) is not MHATokenToKVPool
-        ):
-            raise ValueError(
-                "Raiden HiCache currently supports only FULL MHA KV (no SWA/recurrent/MLA)"
-            )
-        num_pages = int(server_args.hicache_ratio * device_pool.size) // device_pool.page_size
-        host_pool, controller = create_raiden_hicache(
-            device_pool, num_pages, token_to_kv_pool_allocator.dp_size
-        )
-        cache.host_pool = host_pool
-        cache.hicache_controller = controller
-        cache.hicache_enabled = True
-        cache.write_through_threshold = server_args.hicache_write_through_threshold
-        cache.write_policy = server_args.hicache_write_policy
-        logger.info(
-            "Raiden HiCache enabled: %d host pages; transfer/forward completion barriers enabled",
-            host_pool.total_size(),
-        )
-        return
-    per_layer_shape = tuple(int(d) for d in device_pool.kv_buffer[0].shape[1:])
-    page_size = device_pool.page_size
-    # hicache_ratio is token-based; fold to page count for the page-addressed pool.
-    host_token_budget = int(server_args.hicache_ratio * device_pool.size)
-    num_pages = host_token_budget // page_size
+    backend = getattr(server_args, "hicache_transfer_backend", "jax")
+    if backend == "raiden" and any(type(p) is not MHATokenToKVPool for p in device_pools.values()):
+        raise ValueError("Raiden HiCache supports MHA KV pools only (no recurrent/MLA)")
+    host_pools, controllers = {}, {}
+    try:
+        for component, pool in device_pools.items():
+            num_pages = int(server_args.hicache_ratio * pool.size) // pool.page_size
+            if backend == "raiden":
+                from sgl_jax.srt.mem_cache.raiden_hicache import create_raiden_hicache
 
-    host_pool = LRUHostKVPool(
-        device_pool=device_pool,
-        pool_size=num_pages,
-        page_size=page_size,
-        layer_num=device_pool.layer_num,
-        per_layer_shape=per_layer_shape,
-        dtype=device_pool.dtype,
-        mesh=mesh,
-        partition_spec=device_pool.kv_sharding.spec,
-    )
-    controller = HiCacheController(host_pool, device_pool)
+                host_pool, controller = create_raiden_hicache(
+                    pool, num_pages, token_to_kv_pool_allocator.dp_size
+                )
+            else:
+                host_pool = LRUHostKVPool(
+                    device_pool=pool,
+                    pool_size=num_pages,
+                    page_size=pool.page_size,
+                    layer_num=pool.layer_num,
+                    per_layer_shape=tuple(int(d) for d in pool.kv_buffer[0].shape[1:]),
+                    dtype=pool.dtype,
+                    mesh=mesh,
+                    partition_spec=pool.kv_sharding.spec,
+                    **(
+                        {
+                            "dp_size": token_to_kv_pool_allocator.dp_size,
+                            "pool_name": f"hicache_{component}",
+                        }
+                        if hybrid
+                        else {}
+                    ),
+                )
+                controller = HiCacheController(host_pool, pool)
+            host_pools[component] = host_pool
+            controllers[component] = controller
+    except Exception:
+        for controller in controllers.values():
+            controller.shutdown()
+        raise
 
-    cache.host_pool = host_pool
-    cache.hicache_controller = controller
+    cache.host_pools = host_pools
+    cache.hicache_controllers = controllers
+    cache.host_pool = host_pools[ComponentType.FULL]
+    cache.hicache_controller = controllers[ComponentType.FULL]
     cache.hicache_enabled = True
     cache.write_through_threshold = server_args.hicache_write_through_threshold
     cache.write_policy = server_args.hicache_write_policy
-    # Per-component host-pool hooks deferred to Stage 5 (multi-component reuse).
-    # The current Stage 2/3 HiCache control plane is centralized in
-    # UnifiedRadixCache, so _full_kv_pool_host has no production readers yet.
-
     logger.info(
-        "HiCache enabled: host pool=%d pages (page_size=%d, ~%d tokens, "
-        "ratio=%.1f x device size=%d), write_through_threshold=%d",
-        num_pages,
-        page_size,
-        num_pages * page_size,
-        server_args.hicache_ratio,
-        device_pool.size,
-        server_args.hicache_write_through_threshold,
+        "HiCache enabled: backend=%s, component host pages=%s, page_size=%d, write_policy=%s",
+        backend,
+        {str(ct): p.total_size() for ct, p in host_pools.items()},
+        device_pool.page_size,
+        cache.write_policy,
     )
