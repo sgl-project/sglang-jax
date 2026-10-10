@@ -13,6 +13,12 @@ from typing import TYPE_CHECKING
 import numpy as np
 from tqdm import tqdm
 
+from sgl_jax.srt.model_executor.batch_inputs import BatchInputBuffer
+from sgl_jax.srt.model_executor.batch_layout import (
+    BatchLayoutPlan,
+    SequenceLayout,
+    serving_shape_buckets,
+)
 from sgl_jax.srt.utils.common_utils import (
     PRECOMPILE_DEFAULT_BS_PADDINGS,
     PRECOMPILE_DEFAULT_TOKEN_PADDINGS,
@@ -355,11 +361,14 @@ class CompilationManager:
         per-request page-table bucket a backend traces decode at (None = the
         plain shape; see ``decode_dummy_seq_len``).
         """
+        tokens, requests, cache_locs = serving_shape_buckets(
+            mode, self.token_buckets, self.bs_buckets, self.cache_loc_buckets
+        )
         if mode.is_extend():
-            for tokens in self.token_buckets:
-                yield self.max_padded_batch_size, tokens, self.cache_loc_buckets[-1], None
+            for token_count in tokens:
+                yield requests[-1], token_count, cache_locs[-1], None
         elif mode.is_decode():
-            for bs, cache_loc in zip(self.bs_buckets, self.cache_loc_buckets):
+            for bs, cache_loc in zip(requests, cache_locs):
                 for pages in self.decode_page_buckets or [None]:
                     yield bs, bs, cache_loc, pages
         else:
@@ -685,8 +694,6 @@ class CompilationManager:
         per_dp_bs_size: int = 0,
         dummy_seq_len: int = 1,
     ):
-        import jax.numpy as jnp
-
         from sgl_jax.srt.managers.schedule_batch import (
             ForwardMode,
             ModelWorkerBatch,
@@ -704,22 +711,50 @@ class CompilationManager:
         else:
             spec_algorithm_value = speculative_algorithm
 
-        valid_input_ids = np.array([1] * bs, dtype=jnp.int32)
-        invalid_input_ids = np.array([0] * (num_tokens - bs), dtype=jnp.int32)
-        valid_out_cache_loc = np.arange(1, bs + 1, dtype=jnp.int32)
-        invalid_out_cache_loc = np.array([-1] * (num_tokens - bs), dtype=jnp.int32)
-        valid_positions = np.array([0] * bs, dtype=jnp.int32)
-        invalid_positions = np.array([0] * (num_tokens - bs), dtype=jnp.int32)
-        invalid_cache_loc_size = max_cache_loc_size - bs
-        if invalid_cache_loc_size < 0:
-            raise ValueError(f"padding cache_loc_size {invalid_cache_loc_size} < 0!")
-
-        valid_cache_loc = np.arange(bs)
-        invalid_cache_loc = np.array([0] * invalid_cache_loc_size, dtype=jnp.int32)
+        per_dp_bs_size = bs // dp_size
+        lengths = [np.ones(per_dp_bs_size, dtype=np.int32)] * dp_size
+        sequences = SequenceLayout.create(lengths, None, None, page_size=1)
+        plan = BatchLayoutPlan(
+            (per_dp_bs_size,) * dp_size,
+            (per_dp_bs_size,) * dp_size,
+            bs,
+            num_tokens,
+            sequences,
+        )
+        fields = {
+            "input_ids": ((num_tokens,), np.int32, 0),
+            "seq_lens": ((bs,), np.int32, dummy_seq_len),
+            "out_cache_loc": ((num_tokens,), np.int32, -1),
+            "positions": ((num_tokens,), np.int32, 0),
+            "req_pool_indices": ((bs,), np.int32, -1),
+        }
+        if mode == ForwardMode.EXTEND:
+            fields["extend_prefix_lens"] = ((bs,), np.int32, 0)
+            fields["extend_seq_lens"] = ((bs,), np.int32, 1)
+        if self.has_recurrent_state:
+            fields["recurrent_indices"] = ((bs,), np.int32, 0)
+        if self.supports_recurrent_cow and mode == ForwardMode.EXTEND:
+            fields["recurrent_cow_src_indices"] = ((bs,), np.int32, 0)
+        if self.supports_recurrent_track:
+            fields["recurrent_track_indices"] = ((bs,), np.int32, 0)
+            fields["recurrent_track_mask"] = ((bs,), np.int32, 0)
+        buffer = BatchInputBuffer(dp_size, fields)
+        for rank in range(dp_size):
+            slots = plan.request_slice(rank)
+            buffer.view("input_ids", rank)[:per_dp_bs_size] = 1
+            buffer.view("out_cache_loc", rank)[:per_dp_bs_size] = np.arange(
+                slots.start + 1, slots.stop + 1, dtype=np.int32
+            )
+            buffer.view("req_pool_indices", rank)[:] = np.arange(
+                slots.start, slots.stop, dtype=np.int32
+            )
+        inputs = buffer.finish()
+        if max_cache_loc_size < bs:
+            raise ValueError(f"padding cache_loc_size {max_cache_loc_size - bs} < 0!")
+        cache_loc = np.zeros(max_cache_loc_size, dtype=np.int32)
+        cache_loc[:bs] = np.arange(bs, dtype=np.int32)
         lora_ids = ["0"] * bs
-
-        extend_seq_lens = np.array([1] * bs) if mode == ForwardMode.EXTEND else None
-        logits_indices = np.array([0] * bs) if mode == ForwardMode.EXTEND else None
+        logits_indices = sequences.query_starts if mode == ForwardMode.EXTEND else None
 
         if speculative_algorithm is None:
             sampling_info = ModelWorkerSamplingInfo.generate_for_precompile(bs, self.vocab_size)
@@ -732,22 +767,17 @@ class CompilationManager:
             return_output_logprob_only = False
 
         return ModelWorkerBatch(
+            inputs=inputs,
+            layout=plan,
             bid=1,
             forward_mode=mode,
-            input_ids=np.concat([valid_input_ids, invalid_input_ids], axis=0),
-            real_input_ids_len=len(valid_input_ids),
+            real_input_ids_len=plan.real_tokens,
             real_bs=bs,
-            req_pool_indices=np.arange(bs, dtype=np.int32),
-            seq_lens=np.full(bs, dummy_seq_len, dtype=np.int32),
-            out_cache_loc=np.concat([valid_out_cache_loc, invalid_out_cache_loc], axis=0),
             return_logprob=False,
             return_output_logprob_only=return_output_logprob_only,
             sampling_info=sampling_info,
             extend_input_logprob_token_ids=None,
-            positions=np.concat([valid_positions, invalid_positions], axis=0),
-            cache_loc=np.concat([valid_cache_loc, invalid_cache_loc], axis=0),
-            extend_prefix_lens=(np.array([0] * bs) if mode == ForwardMode.EXTEND else None),
-            extend_seq_lens=extend_seq_lens,
+            cache_loc=cache_loc,
             top_logprobs_nums=None,
             token_ids_logprobs=None,
             extend_logprob_start_lens=None,
@@ -762,23 +792,7 @@ class CompilationManager:
             per_dp_bs_size=per_dp_bs_size,
             real_bs_per_dp=[per_dp_bs_size] * dp_size,
             logits_indices_selector=np.arange(bs, dtype=np.int32),
-            # Hybrid recurrent backends (e.g. KDA) require these per-batch
-            # arrays even at precompile time; slot 0 is RecurrentStatePool's
-            # per-rank dummy slot, safe to point at. Leave None otherwise so
-            # non-recurrent backends are unaffected.
-            recurrent_indices=(np.zeros(bs, dtype=np.int32) if self.has_recurrent_state else None),
-            has_initial_state=(np.zeros(bs, dtype=np.bool_) if self.has_recurrent_state else None),
-            recurrent_cow_src_indices=(
-                np.zeros(bs, dtype=np.int32)
-                if self.supports_recurrent_cow and mode == ForwardMode.EXTEND
-                else None
-            ),
-            recurrent_track_indices=(
-                np.zeros(bs, dtype=np.int32) if self.supports_recurrent_track else None
-            ),
-            recurrent_track_mask=(
-                np.zeros(bs, dtype=np.int32) if self.supports_recurrent_track else None
-            ),
+            has_initial_state=np.zeros(bs, dtype=np.bool_) if self.has_recurrent_state else None,
         )
 
     # ---- Lazy compilation tracking ----

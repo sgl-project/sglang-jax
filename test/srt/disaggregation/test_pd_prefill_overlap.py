@@ -267,6 +267,7 @@ def test_prefill_worker_fences_before_publishing_or_next_forward(monkeypatch, fu
     client = worker_module.ModelWorkerClient.__new__(worker_module.ModelWorkerClient)
     client.input_queue = Queue()
     client.output_queue = NS(put=lambda _: events.append("publish"))
+    client._submission_done = None
     client.future_token_ids_map = object()
     client.mesh = None
     client.async_gather_fn = lambda x: x

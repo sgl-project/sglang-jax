@@ -1,356 +1,282 @@
-"""Unit tests for ScheduleBatch Data Parallelism (DP) merging logic."""
+"""CPU integration checks for scheduled requests -> immutable model inputs."""
 
-import unittest
-from unittest.mock import MagicMock
+import copy
+from types import SimpleNamespace
 
+import jax
 import numpy as np
+import pytest
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
-from sgl_jax.srt.configs import ForwardMode
-from sgl_jax.srt.constrained.jump_forward import JumpForwardMap
 from sgl_jax.srt.managers.schedule_batch import (
+    ModelWorkerSamplingInfo,
+    Req,
     ScheduleBatch,
     ScheduleReqsInfo,
-    find_padding_size,
 )
-from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sgl_jax.srt.model_executor.batch_inputs import FORWARD_INPUT_NAMES
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sgl_jax.srt.sampling.sampling_params import SamplingParams
+from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
-class TestScheduleBatchDPMerging(unittest.TestCase):
-    """Test ScheduleBatch merging logic for Data Parallelism."""
-
-    def setUp(self):
-        """Set up common test fixtures."""
-        # Mock dependencies
-        self.mock_req_to_token_pool = MagicMock()
-        self.mock_req_to_token_pool.req_to_token = np.array(
-            [
-                [0, 1, 2, 3, 4, 5, 6, 7],  # Request 0
-                [8, 9, 10, 11, 12, 13, 14, 15],  # Request 1
-                [16, 17, 18, 19, 20, 21, 22, 23],  # Request 2
-                [24, 25, 26, 27, 28, 29, 30, 31],  # Request 3
-            ],
-            dtype=np.int32,
-        )
-
-        self.mock_token_to_kv_pool = MagicMock()
-        self.mock_model_config = MagicMock()
-        self.mock_model_config.vocab_size = 32000
-
-    def _create_mock_req(self, rid, lora_id="0"):
-        """Create a mock request."""
-        req = MagicMock()
-        req.rid = rid
-        req.lora_id = lora_id
-        req.grammar = None
-        req.fill_ids = None
-        req.origin_input_ids = [1, 2, 3]
-        return req
-
-    def _create_sampling_info(self, batch_size):
-        """Create mock sampling info for a batch."""
-        return SamplingBatchInfo(
-            temperatures=np.ones((batch_size, 1), dtype=np.float32),
-            top_ps=np.ones(batch_size, dtype=np.float32),
-            top_ks=np.ones(batch_size, dtype=np.int32),
-            min_ps=np.zeros(batch_size, dtype=np.float32),
-            sampling_seeds=None,
-            grammars=None,
-        )
-
-    def test_compute_global_padding_sizes(self):
-        """Test _compute_global_padding_sizes calculates correct padding."""
-        # Create ScheduleBatch with 2 DP ranks
-        reqs_info = [
-            ScheduleReqsInfo(
-                reqs=[self._create_mock_req(0), self._create_mock_req(1)],
-                input_ids=np.array([1, 2, 3, 4, 5], dtype=np.int32),  # 5 tokens
-                seq_lens=np.array([3, 2], dtype=np.int32),  # 2 requests
-            ),
-            ScheduleReqsInfo(
-                reqs=[self._create_mock_req(2)],
-                input_ids=np.array([6, 7, 8], dtype=np.int32),  # 3 tokens
-                seq_lens=np.array([3], dtype=np.int32),  # 1 request
-            ),
+def make_batch(counts, mode, *, recurrent=False, logprob=False):
+    infos = []
+    for rank, count in enumerate(counts):
+        lengths = [i + 2 if mode.is_extend() else 1 for i in range(count)]
+        prefixes = [rank + 1] * count
+        seqs = np.array(prefixes, np.int32) + lengths
+        reqs = [
+            Req(
+                f"{rank}-{i}",
+                None,
+                [1, 2, 3],
+                SamplingParams(max_new_tokens=4),
+                lora_id=str(rank + 1),
+            )
+            for i in range(count)
         ]
-
-        batch = ScheduleBatch(
-            reqs_info=reqs_info,
-            dp_size=2,
-            req_to_token_pool=self.mock_req_to_token_pool,
-            token_to_kv_pool=self.mock_token_to_kv_pool,
-            tree_cache=MagicMock(),
-            model_config=self.mock_model_config,
-            forward_mode=ForwardMode.EXTEND,
+        sampling = ModelWorkerSamplingInfo.generate_for_precompile_all_greedy(count, 32)
+        sampling.temperatures[:] = rank + 0.5
+        sampling.top_ks[:] = rank + 2
+        info = ScheduleReqsInfo(
+            reqs=reqs,
+            seq_lens=seqs.astype(np.int32),
+            req_pool_indices=np.arange(rank * 4, rank * 4 + count, dtype=np.int32),
+            input_ids=np.arange(rank * 100, rank * 100 + sum(lengths), dtype=np.int32),
+            out_cache_loc=np.arange(rank * 100 + 1, rank * 100 + 1 + sum(lengths), dtype=np.int32),
+            prefix_lens=prefixes,
+            extend_lens=lengths,
+            extend_logprob_start_lens=[1] * count,
+            extend_input_logprob_token_ids=np.arange(sum(n - 1 for n in lengths), dtype=np.int32),
+            top_logprobs_nums=[2] * count,
+            token_ids_logprobs=[[1, 3]] * count,
+            sampling_info=sampling,
         )
+        if recurrent:
+            info.recurrent_indices = np.arange(rank * 10 + 1, rank * 10 + count + 1, dtype=np.int32)
+            info.recurrent_cow_src_indices = np.full(count, rank + 5, np.int32)
+            info.recurrent_track_indices = np.full(count, rank + 10, np.int32)
+            info.recurrent_track_mask = np.ones(count, np.int32)
+        infos.append(info)
+    return ScheduleBatch(
+        reqs_info=infos,
+        dp_size=len(counts),
+        forward_mode=mode,
+        model_config=SimpleNamespace(
+            is_in_model_multimodal=False, hf_config=SimpleNamespace(vision_encoder_parallel="data")
+        ),
+        req_to_token_pool=SimpleNamespace(
+            req_to_token=np.arange(32 * 64, dtype=np.int32).reshape(32, 64),
+            cache_loc_host_buf=np.zeros(len(counts) * 256, np.int32),
+        ),
+        spec_algorithm=SpeculativeAlgorithm.NONE,
+        return_logprob=logprob,
+    )
 
-        token_paddings = [8, 16, 32]
-        bs_paddings = [4, 8, 16]
 
-        per_dp_token_size, total_token_size, per_dp_bs_size, total_bs = (
-            batch._compute_global_padding_sizes(token_paddings, bs_paddings)
+def build(batch):
+    dp = batch.dp_size
+    return batch.get_model_worker_batch(
+        [dp * 8, dp * 16], [dp * 2, dp * 4], [dp * 128, dp * 256], page_size=4
+    )
+
+
+@pytest.mark.parametrize("counts", [[2], [0, 2], [2, 0, 1, 1]])
+@pytest.mark.parametrize("mode", [ForwardMode.EXTEND, ForwardMode.MIXED, ForwardMode.DECODE])
+def test_request_token_and_feature_layout(counts, mode):
+    batch = make_batch(counts, mode, recurrent=True, logprob=True)
+    result = build(batch)
+    plan = result.layout
+    assert plan.request_counts == tuple(counts)
+    assert result.real_bs == sum(counts)
+    assert result.real_input_ids_len == sum(len(i.input_ids) for i in batch.reqs_info)
+    for rank, info in enumerate(batch.reqs_info):
+        n = counts[rank]
+        rs, ts = plan.request_slice(rank), plan.token_slice(rank)
+        np.testing.assert_array_equal(result.input_ids[ts], info.input_ids)
+        np.testing.assert_array_equal(result.out_cache_loc[ts], info.out_cache_loc)
+        np.testing.assert_array_equal(result.seq_lens[rs], info.seq_lens)
+        np.testing.assert_array_equal(result.req_pool_indices[rs], info.req_pool_indices)
+        expected_positions = (
+            np.concatenate(
+                [
+                    np.arange(p, p + q, dtype=np.int32)
+                    for p, q in zip(info.prefix_lens, info.extend_lens)
+                ]
+            )
+            if n
+            else []
         )
-
-        # Max tokens per DP: 5, should pad to 8
-        self.assertEqual(per_dp_token_size, 8)
-        self.assertEqual(total_token_size, 16)  # 8 * 2 DP ranks
-
-        # Max BS per DP: 2, should pad to 4
-        self.assertEqual(per_dp_bs_size, 4)
-        self.assertEqual(total_bs, 8)  # 4 * 2 DP ranks
-
-    def test_merge_input_and_positions_extend_mode(self):
-        """Test _merge_input_and_positions in EXTEND mode."""
-        # Create ScheduleBatch with 2 DP ranks
-        reqs_info = [
-            ScheduleReqsInfo(
-                reqs=[self._create_mock_req(0), self._create_mock_req(1)],
-                input_ids=np.array([1, 2, 3, 4, 5], dtype=np.int32),
-                seq_lens=np.array([3, 2], dtype=np.int32),
-                prefix_lens=np.array([0, 0], dtype=np.int32),
-                out_cache_loc=np.array([0, 0, 0, 0, 0], dtype=np.int32),
-            ),
-            ScheduleReqsInfo(
-                reqs=[self._create_mock_req(2)],
-                input_ids=np.array([6, 7, 8], dtype=np.int32),
-                seq_lens=np.array([3], dtype=np.int32),
-                prefix_lens=np.array([0], dtype=np.int32),
-                out_cache_loc=np.array([0, 0, 0], dtype=np.int32),
-            ),
-        ]
-
-        batch = ScheduleBatch(
-            reqs_info=reqs_info,
-            dp_size=2,
-            req_to_token_pool=self.mock_req_to_token_pool,
-            token_to_kv_pool=self.mock_token_to_kv_pool,
-            tree_cache=MagicMock(),
-            model_config=self.mock_model_config,
-            forward_mode=ForwardMode.EXTEND,
+        np.testing.assert_array_equal(result.positions[ts], expected_positions)
+        rpad = slice(rs.stop, plan.request_slice(rank, padded=True).stop)
+        tpad = slice(ts.stop, plan.token_slice(rank, padded=True).stop)
+        assert np.all(result.seq_lens[rpad] == 0)
+        assert np.all(result.req_pool_indices[rpad] == -1)
+        assert np.all(result.input_ids[tpad] == 0)
+        assert np.all(result.out_cache_loc[tpad] == -1)
+        np.testing.assert_array_equal(result.recurrent_cow_src_indices[rs], np.full(n, rank + 5))
+        assert info.recurrent_cow_src_indices is None
+        assert info.recurrent_track_mask is None
+        assert result.lora_ids[rs] == [str(rank + 1)] * n
+        assert result.top_logprobs_nums[rs] == [2] * n
+        np.testing.assert_array_equal(
+            result.sampling_info.temperatures[rs, 0], np.full(n, rank + 0.5)
         )
-
-        per_dp_token_size = 8  # Padded size per DP rank
-        total_token_size = 16  # 8 * 2
-
-        input_ids, positions, out_cache_loc, real_len = batch._merge_input_and_positions(
-            per_dp_token_size, total_token_size
-        )
-
-        # Check merged input_ids layout: [dp0: 1,2,3,4,5,0,0,0 | dp1: 6,7,8,0,0,0,0,0]
-        expected_input_ids = np.array(
-            [1, 2, 3, 4, 5, 0, 0, 0, 6, 7, 8, 0, 0, 0, 0, 0], dtype=np.int32
-        )
-        np.testing.assert_array_equal(input_ids, expected_input_ids)
-
-        # Check positions: [0,1,2,0,1,0,0,0 | 0,1,2,0,0,0,0,0]
-        expected_positions = np.array(
-            [0, 1, 2, 0, 1, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 0], dtype=np.int32
-        )
-        np.testing.assert_array_equal(positions, expected_positions)
-
-        # Check real length
-        self.assertEqual(real_len, 8)  # 5 + 3
-
-    def test_merge_batch_metadata_extend_mode(self):
-        """Test _merge_batch_metadata in EXTEND mode."""
-        reqs_info = [
-            ScheduleReqsInfo(
-                reqs=[self._create_mock_req(0), self._create_mock_req(1)],
-                seq_lens=np.array([3, 2], dtype=np.int32),
-                req_pool_indices=np.array([0, 1], dtype=np.int32),
-                prefix_lens=np.array([0, 0], dtype=np.int32),
-                extend_lens=np.array([3, 2], dtype=np.int32),
-                extend_logprob_start_lens=np.array([0, 0], dtype=np.int32),
-            ),
-            ScheduleReqsInfo(
-                reqs=[self._create_mock_req(2)],
-                seq_lens=np.array([3], dtype=np.int32),
-                req_pool_indices=np.array([2], dtype=np.int32),
-                prefix_lens=np.array([0], dtype=np.int32),
-                extend_lens=np.array([3], dtype=np.int32),
-                extend_logprob_start_lens=np.array([0], dtype=np.int32),
-            ),
-        ]
-
-        batch = ScheduleBatch(
-            reqs_info=reqs_info,
-            dp_size=2,
-            req_to_token_pool=self.mock_req_to_token_pool,
-            token_to_kv_pool=self.mock_token_to_kv_pool,
-            tree_cache=MagicMock(),
-            model_config=self.mock_model_config,
-            forward_mode=ForwardMode.EXTEND,
-        )
-
-        per_dp_bs_size = 4
-        total_bs = 8
-
-        (
-            req_pool_indices,
-            seq_lens,
-            extend_prefix_lens,
-            extend_seq_lens,
-            extend_logprob_start_lens,
-            real_bs,
-        ) = batch._merge_batch_metadata(per_dp_bs_size, total_bs)
-
-        # Check merged layout: [dp0: 0,1,pad,pad | dp1: 2,pad,pad,pad]
-        expected_req_pool = np.array([0, 1, -1, -1, 2, -1, -1, -1], dtype=np.int32)
-        np.testing.assert_array_equal(req_pool_indices, expected_req_pool)
-
-        expected_seq_lens = np.array([3, 2, 0, 0, 3, 0, 0, 0], dtype=np.int32)
-        np.testing.assert_array_equal(seq_lens, expected_seq_lens)
-
-        # Check extend_start_loc: [0, 3, 5, 5, 8, 11, 11, 11]
-        # DP0: [0, 3] (start at 0 and 3), DP1: [8] (start at 8 in global array)
-        # Note: The actual implementation uses per_dp_token_size for offset
-        # We need to check the logic carefully
-
-        self.assertEqual(real_bs, 3)  # 2 + 1
-
-    def test_merge_sampling_info(self):
-        """Test _merge_sampling_info merges sampling parameters correctly."""
-        reqs_info = [
-            ScheduleReqsInfo(
-                reqs=[self._create_mock_req(0), self._create_mock_req(1)],
-                seq_lens=np.array([3, 2], dtype=np.int32),
-                sampling_info=self._create_sampling_info(2),
-            ),
-            ScheduleReqsInfo(
-                reqs=[self._create_mock_req(2)],
-                seq_lens=np.array([3], dtype=np.int32),
-                sampling_info=self._create_sampling_info(1),
-            ),
-        ]
-
-        batch = ScheduleBatch(
-            reqs_info=reqs_info,
-            dp_size=2,
-            req_to_token_pool=self.mock_req_to_token_pool,
-            token_to_kv_pool=self.mock_token_to_kv_pool,
-            tree_cache=MagicMock(),
-            model_config=self.mock_model_config,
-            forward_mode=ForwardMode.DECODE,
-            has_grammar=False,
-        )
-
-        per_dp_bs_size = 4
-        total_bs = 8
-
-        merged_sampling = batch._merge_sampling_info(per_dp_bs_size, total_bs)
-
-        # Check shape
-        self.assertEqual(merged_sampling.temperatures.shape, (8, 1))
-        self.assertEqual(merged_sampling.top_ps.shape, (8,))
-
-        # Check that first 2 and 5th positions have data (rest are defaults)
-        self.assertEqual(merged_sampling.top_ps[0], 1.0)
-        self.assertEqual(merged_sampling.top_ps[1], 1.0)
-        self.assertEqual(merged_sampling.top_ps[4], 1.0)
-
-    def test_find_padding_size(self):
-        """Test find_padding_size helper function."""
-        size_buckets = [8, 16, 32, 64]
-
-        # Test exact match
-        target, idx = find_padding_size(8, size_buckets)
-        self.assertEqual(target, 8)
-        self.assertEqual(idx, 0)
-
-        # Test needs padding
-        target, idx = find_padding_size(10, size_buckets)
-        self.assertEqual(target, 16)
-        self.assertEqual(idx, 1)
-
-        # Test needs largest bucket
-        target, idx = find_padding_size(50, size_buckets)
-        self.assertEqual(target, 64)
-        self.assertEqual(idx, 3)
-
-        # Test exceeds all buckets - should raise
-        with self.assertRaises(AssertionError):
-            find_padding_size(100, size_buckets)
-
-    def test_get_model_worker_batch_integration(self):
-        """Integration test for get_model_worker_batch with DP."""
-        # Create a complete ScheduleBatch with 2 DP ranks
-        reqs_info = [
-            ScheduleReqsInfo(
-                reqs=[self._create_mock_req(0, "lora1"), self._create_mock_req(1, "lora2")],
-                input_ids=np.array([1, 2, 3, 4, 5], dtype=np.int32),
-                seq_lens=np.array([3, 2], dtype=np.int32),
-                req_pool_indices=np.array([0, 1], dtype=np.int32),
-                prefix_lens=np.array([0, 0], dtype=np.int32),
-                extend_lens=np.array([3, 2], dtype=np.int32),
-                out_cache_loc=np.array([0, 0, 0, 0, 0], dtype=np.int32),
-                extend_logprob_start_lens=np.array([0, 0], dtype=np.int32),
-                sampling_info=self._create_sampling_info(2),
-            ),
-            ScheduleReqsInfo(
-                reqs=[self._create_mock_req(2, "lora1")],
-                input_ids=np.array([6, 7, 8], dtype=np.int32),
-                seq_lens=np.array([3], dtype=np.int32),
-                req_pool_indices=np.array([2], dtype=np.int32),
-                prefix_lens=np.array([0], dtype=np.int32),
-                extend_lens=np.array([3], dtype=np.int32),
-                out_cache_loc=np.array([0, 0, 0], dtype=np.int32),
-                extend_logprob_start_lens=np.array([0], dtype=np.int32),
-                sampling_info=self._create_sampling_info(1),
-            ),
-        ]
-
-        batch = ScheduleBatch(
-            reqs_info=reqs_info,
-            dp_size=2,
-            req_to_token_pool=self.mock_req_to_token_pool,
-            token_to_kv_pool=self.mock_token_to_kv_pool,
-            tree_cache=MagicMock(),
-            model_config=self.mock_model_config,
-            forward_mode=ForwardMode.EXTEND,
-            return_logprob=False,
-            return_output_logprob_only=False,
-            top_logprobs_nums=[],
-            token_ids_logprobs=[],
-            has_stream=False,
-            has_grammar=False,
-            return_hidden_states=False,
-            extend_input_logprob_token_ids=None,
-            launch_done=False,
-        )
-
-        # Call get_model_worker_batch
-        token_paddings = [8, 16, 32]
-        bs_paddings = [4, 8, 16]
-        cache_loc_paddings = [32, 64, 128]
-        page_size = 16
-
-        worker_batch = batch.get_model_worker_batch(
-            token_paddings=token_paddings,
-            bs_paddings=bs_paddings,
-            cache_loc_paddings=cache_loc_paddings,
-            page_size=page_size,
-        )
-
-        # Verify merged structure
-        # Total tokens: DP0 has 5, DP1 has 3, pad to 8 each = 16 total
-        self.assertEqual(len(worker_batch.input_ids), 16)
-
-        # Total BS: DP0 has 2, DP1 has 1, pad to 4 each = 8 total
-        self.assertEqual(len(worker_batch.seq_lens), 8)
-
-        # Real BS: 3 actual requests
-        self.assertEqual(worker_batch.real_bs, 3)
-
-        # Check lora_ids are correctly collected
-        self.assertEqual(len(worker_batch.lora_ids), 8)
-        self.assertEqual(worker_batch.lora_ids[0], "lora1")
-        self.assertEqual(worker_batch.lora_ids[1], "lora2")
-        self.assertEqual(worker_batch.lora_ids[2], "lora1")
-        # Rest should be padded with "0"
-        self.assertEqual(worker_batch.lora_ids[3], "0")
-
-        # Check sampling info shape
-        self.assertEqual(worker_batch.sampling_info.temperatures.shape, (8, 1))
+        if mode.is_extend():
+            np.testing.assert_array_equal(
+                result.logits_indices[rs], np.cumsum(info.extend_lens) - 1
+            )
+    np.testing.assert_array_equal(
+        result.seq_lens[result.logits_indices_selector],
+        np.concatenate([i.seq_lens for i in batch.reqs_info]),
+    )
+    with pytest.raises(ValueError):
+        result.input_ids[0] = 99
 
 
-if __name__ == "__main__":
-    unittest.main()
+@pytest.mark.parametrize("dp", [1, 2, 4])
+def test_direct_upload_and_inflight_snapshot(dp, monkeypatch):
+    if len(jax.devices()) < dp:
+        pytest.skip("Run with XLA_FLAGS=--xla_force_host_platform_device_count=4")
+    counts = [1 if rank != 1 else 0 for rank in range(dp)]
+    batch = make_batch(counts, ForwardMode.EXTEND, recurrent=True)
+    first = build(batch)
+    mesh = Mesh(np.array(jax.devices()[:dp]), ("data",))
+    sharding = NamedSharding(mesh, PartitionSpec("data"))
+
+    # No flattened host field is needed for the upload. In particular, no
+    # per-field materialization or concatenate is allowed in this path.
+    def unexpected_host_read(*args):
+        raise AssertionError("upload materialized a host field")
+
+    with monkeypatch.context() as m:
+        m.setattr(first.inputs, "host", unexpected_host_read)
+        uploaded = first.inputs.to_device(sharding)
+    saved = {name: getattr(first, name) for name in FORWARD_INPUT_NAMES}
+    for info in batch.reqs_info:
+        info.input_ids[:] += 1000
+        info.seq_lens[:] += 1
+        info.prefix_lens = [p + 1 for p in info.prefix_lens]
+    second = build(batch)
+    for name, actual in zip(FORWARD_INPUT_NAMES, uploaded):
+        if actual is not None:
+            np.testing.assert_array_equal(np.asarray(actual), saved[name])
+            assert actual.sharding.spec == PartitionSpec("data")
+    assert not np.array_equal(first.input_ids, second.input_ids)
+    # A shallow worker copy can replace inputs without changing the first batch.
+    clone = copy.copy(first)
+    clone.seq_lens = first.seq_lens + 10
+    assert first.layout is not None and clone.layout is None
+    np.testing.assert_array_equal(first.seq_lens, saved["seq_lens"])
+    replaced = clone.inputs.to_device(sharding)
+    np.testing.assert_array_equal(replaced[1], saved["seq_lens"] + 10)
+
+
+@pytest.mark.parametrize("dp", [1, 2, 4])
+def test_forward_batch_matches_reference_pack(dp):
+    if len(jax.devices()) < dp:
+        pytest.skip("Requires multiple CPU devices")
+    from sgl_jax.srt.utils.jax_utils import packed_device_array
+
+    mwb = build(make_batch([1] * dp, ForwardMode.DECODE, recurrent=True))
+    mesh = Mesh(np.array(jax.devices()[:dp]), ("data",))
+    runner = SimpleNamespace(
+        mesh=mesh,
+        model=SimpleNamespace(mrope_position_axes=0),
+        attn_backend=None,
+        model_config=SimpleNamespace(
+            is_embedding=False, hf_config=SimpleNamespace(architectures=[])
+        ),
+    )
+    fb = ForwardBatch.init_new(mwb, runner)
+    reference = packed_device_array(
+        tuple(getattr(mwb, n) for n in FORWARD_INPUT_NAMES),
+        NamedSharding(mesh, PartitionSpec("data")),
+    )
+    for name, expected in zip(FORWARD_INPUT_NAMES, reference):
+        actual = getattr(fb, name)
+        if expected is None:
+            assert actual is None
+        else:
+            np.testing.assert_array_equal(actual, expected)
+
+
+def test_speculative_prefill_replaces_the_previous_snapshot():
+    from sgl_jax.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+
+    batch = build(make_batch([2, 0, 1, 1], ForwardMode.EXTEND))
+    previous_inputs = batch.inputs
+    old_ids = batch.input_ids.copy()
+    old_lens = batch.seq_lens.copy()
+    layout = batch.layout
+    accepted = np.arange(batch.real_bs, dtype=np.int32) + 900
+    draft = EagleDraftInput(verified_id=accepted)
+    draft.prepare_for_extend_after_target_prefill(batch)
+    np.testing.assert_array_equal(previous_inputs.host("input_ids"), old_ids)
+    last = layout.sequences.query_starts + layout.sequences.query_lengths - 1
+    offset = 0
+    for rank, count in enumerate(layout.request_counts):
+        slots = last[offset : offset + count] + layout.token_slice(rank).start
+        np.testing.assert_array_equal(batch.input_ids[slots], accepted[offset : offset + count])
+        offset += count
+    verify = SimpleNamespace(
+        draft_token=np.arange(16, dtype=np.int32), positions=np.arange(16, dtype=np.int32)
+    )
+    EagleVerifyInput.prepare_for_verify(verify, batch)
+    expected = old_lens.copy()
+    expected[batch.logits_indices_selector] -= 1
+    np.testing.assert_array_equal(batch.seq_lens, expected)
+    np.testing.assert_array_equal(previous_inputs.host("seq_lens"), old_lens)
+
+
+def test_extend_warmup_uses_the_same_dp_token_segments():
+    from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
+
+    manager = object.__new__(CompilationManager)
+    manager.vocab_size = 32
+    manager.capture_hidden_states = False
+    manager.has_recurrent_state = False
+    manager.supports_recurrent_cow = False
+    manager.supports_recurrent_track = False
+    dummy = manager._make_dummy_batch(8, 32, ForwardMode.EXTEND, 64, dp_size=4)
+    plan = dummy.layout
+    for rank in range(4):
+        tokens = plan.token_slice(rank)
+        padded = plan.token_slice(rank, padded=True)
+        np.testing.assert_array_equal(dummy.input_ids[tokens], [1, 1])
+        assert np.all(dummy.input_ids[tokens.stop : padded.stop] == 0)
+        assert np.all(dummy.out_cache_loc[tokens.stop : padded.stop] == -1)
+    assert plan.token_capacity != plan.request_capacity
+
+
+def test_idle_batch_keeps_safe_padding():
+    batch = build(make_batch([0, 0, 0, 0], ForwardMode.IDLE))
+    assert batch.real_bs == batch.real_input_ids_len == 0
+    assert batch.logits_indices_selector.size == 0
+    assert np.all(batch.seq_lens == 0)
+    assert np.all(batch.req_pool_indices == -1)
+    assert np.all(batch.out_cache_loc == -1)
+
+
+def test_staging_groups_dtypes_without_reusing_storage():
+    from sgl_jax.srt.model_executor.batch_inputs import BatchInputBuffer
+
+    if len(jax.devices()) < 2:
+        pytest.skip("Requires multiple CPU devices")
+    fields = {
+        "input_ids": ((8,), np.int32, 0),
+        "lora_scalings": ((4, 1), np.float32, 1),
+    }
+    first = BatchInputBuffer(2, fields)
+    held_view = first.view("input_ids", 1)
+    held_view[:] = [1, 2, 3, 4]
+    snapshot = first.finish()
+    with pytest.raises(ValueError):
+        held_view[0] = 999
+    second = BatchInputBuffer(2, fields)
+    second.view("input_ids", 1)[:] = 0
+    mesh = Mesh(np.array(jax.devices()[:2]), ("data",))
+    uploaded = snapshot.to_device(NamedSharding(mesh, PartitionSpec("data")))
+    np.testing.assert_array_equal(uploaded[0], [0, 0, 0, 0, 1, 2, 3, 4])
+    np.testing.assert_array_equal(uploaded[7], np.ones((4, 1), np.float32))

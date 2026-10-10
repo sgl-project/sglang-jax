@@ -13,6 +13,7 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
+from sgl_jax.srt.utils.jax_utils import packed_device_array
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
@@ -27,7 +28,7 @@ def replicate_to_mesh(
     JIT outputs are typically vocab/data-sharded; spec-decode host orchestration
     (top_k, gather, build_tree) needs replicated arrays.
     """
-    out = jax.device_put(arrs, NamedSharding(mesh, P()))
+    out = packed_device_array(arrs, NamedSharding(mesh, P()))
     return out[0] if len(out) == 1 else out
 
 

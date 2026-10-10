@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 
 from sgl_jax.srt.managers.schedule_batch import ScheduleBatch, ScheduleReqsInfo
+from sgl_jax.srt.model_executor.batch_input_builder import BatchInputBuilder
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
 from sgl_jax.srt.speculative.overlap_utils import resolve_spec_decode_token_ids
@@ -112,7 +113,7 @@ def _mk_batch(dp_size: int, bs_per_rank: list[int]) -> ScheduleBatch:
 
 @pytest.fixture(autouse=True)
 def _stub_sampling(monkeypatch):
-    monkeypatch.setattr(ScheduleBatch, "_merge_sampling_info", lambda self, per_dp, total: None)
+    monkeypatch.setattr(BatchInputBuilder, "_merge_sampling_info", lambda self: None)
 
 
 BS_BUCKETS = [1, 2, 4, 8, 16]
@@ -136,7 +137,9 @@ def test_get_spec_decode_mwb_dp_shapes(dp, bs_per_rank):
     sb = _mk_batch(dp, bs_per_rank)
     real_bs = sum(bs_per_rank)
     buckets = [b for b in BS_BUCKETS if b >= dp]
-    mwb = sb._get_spec_decode_mwb_dp(buckets, enable_static_lora=False, draft_token_num=DRAFT_N)
+    mwb = BatchInputBuilder(sb).build_spec_decode(
+        buckets, enable_static_lora=False, draft_token_num=DRAFT_N
+    )
 
     assert mwb.dp_size == dp
     assert mwb.real_bs == real_bs
@@ -238,7 +241,9 @@ def test_filter_batch_then_decode_mwb_round_trip():
     assert list(np.asarray(sb.reqs_info[1].spec_info.allocate_lens)) == [120]
 
     buckets = [b for b in BS_BUCKETS if b >= dp]
-    mwb = sb._get_spec_decode_mwb_dp(buckets, enable_static_lora=False, draft_token_num=DRAFT_N)
+    mwb = BatchInputBuilder(sb).build_spec_decode(
+        buckets, enable_static_lora=False, draft_token_num=DRAFT_N
+    )
     assert mwb.real_bs == 1
     assert mwb.real_bs_per_dp == [0, 1]
     assert len(mwb.seq_lens) % dp == 0
@@ -285,7 +290,9 @@ def test_spec_info_aligns_with_dp_padded_slots(dp, bs_per_rank):
         )
         flat_base += bs
     buckets = [b for b in BS_BUCKETS if b >= dp]
-    mwb = sb._get_spec_decode_mwb_dp(buckets, enable_static_lora=False, draft_token_num=DRAFT_N)
+    mwb = BatchInputBuilder(sb).build_spec_decode(
+        buckets, enable_static_lora=False, draft_token_num=DRAFT_N
+    )
     per_dp = mwb.per_dp_bs_size
     total_bs = per_dp * dp
 
@@ -336,7 +343,9 @@ def test_draft_page_indices_dp_segmented(dp, bs_per_rank):
         )
         flat_base += bs
     buckets = [b for b in BS_BUCKETS if b >= dp]
-    mwb = sb._get_spec_decode_mwb_dp(buckets, enable_static_lora=False, draft_token_num=DRAFT_N)
+    mwb = BatchInputBuilder(sb).build_spec_decode(
+        buckets, enable_static_lora=False, draft_token_num=DRAFT_N
+    )
     per_dp = mwb.per_dp_bs_size
     sel = np.asarray(mwb.logits_indices_selector)
     assert sel.shape == (real_bs,)

@@ -13,6 +13,7 @@ from sgl_jax.srt.layers.attention.linear.kda_backend import KDAAttnBackend, l2_n
 from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
+from sgl_jax.srt.model_executor.batch_inputs import BatchInputs
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.test.test_utils import KDAAttnBackendForTest
@@ -365,18 +366,21 @@ def create_test_data(
     backend = KDAAttnBackendForTest(KDAAttnBackend(mesh=test_mesh))
 
     mwb = ModelWorkerBatch(
+        inputs=BatchInputs.from_arrays(
+            input_ids=input_ids,
+            seq_lens=seq_lens_np,
+            out_cache_loc=out_cache_loc,
+            req_pool_indices=req_pool_indices,
+            positions=positions,
+            extend_seq_lens=extend_seq_lens,
+            extend_prefix_lens=extend_prefix_lens,
+            recurrent_indices=recurrent_indices,
+        ),
         bid=1,
         forward_mode=forward_mode,
-        input_ids=input_ids,
         real_input_ids_len=input_ids.shape[0],
-        seq_lens=seq_lens_np,
-        out_cache_loc=out_cache_loc,
-        req_pool_indices=req_pool_indices,
         sampling_info=None,
-        positions=positions,
         cache_loc=out_cache_loc,
-        extend_seq_lens=extend_seq_lens,
-        extend_prefix_lens=extend_prefix_lens,
         return_logprob=False,
         return_output_logprob_only=False,
         top_logprobs_nums=None,
@@ -389,7 +393,6 @@ def create_test_data(
         dp_size=1,
         per_dp_bs_size=batch_size,
         spec_info_padded=None,
-        recurrent_indices=recurrent_indices,
         has_initial_state=has_initial_state_np,
     )
 
