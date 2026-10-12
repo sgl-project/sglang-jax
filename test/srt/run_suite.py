@@ -359,6 +359,18 @@ suites = {
             0.1,
             runner="pytest",
         ),
+        TestFile(
+            "python/sgl_jax/test/multimodal/test_qwen25_vl_disagg_loading.py",
+            0.2,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "test/srt/disaggregation/test_encoder_embeddings.py",
+            0.1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
         TestFile("python/sgl_jax/test/multimodal/test_rotary_embedding.py", 0.1),
         TestFile("test/srt/test_radix_input_ids.py", 0.1, runner="pytest"),
         TestFile("test/srt/test_tokenizer_manager_event.py", 0.1),
