@@ -87,6 +87,16 @@ class Gemma4AssistantConfig(Gemma4Config):
 
     model_type = "gemma4_assistant"
 
+    def __init__(self, text_config=None, vision_config=None, **kwargs):
+        # Transformers 5 generates a dataclass-style initializer for an empty
+        # PreTrainedConfig subclass. Define this explicitly so construction
+        # continues through Gemma4Config's nested-config conversion and remap.
+        super().__init__(
+            text_config=text_config,
+            vision_config=vision_config,
+            **kwargs,
+        )
+
 
 class Gemma4UnifiedAssistantConfig(Gemma4Config):
     """Config for Gemma4 unified assistant (12B) checkpoints.
@@ -96,3 +106,12 @@ class Gemma4UnifiedAssistantConfig(Gemma4Config):
     """
 
     model_type = "gemma4_unified_assistant"
+
+    def __init__(self, text_config=None, vision_config=None, **kwargs):
+        # See Gemma4AssistantConfig.__init__ for why this cannot be inherited
+        # implicitly when running against the repository's Transformers 5.x.
+        super().__init__(
+            text_config=text_config,
+            vision_config=vision_config,
+            **kwargs,
+        )

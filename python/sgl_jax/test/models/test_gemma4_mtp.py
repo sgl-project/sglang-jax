@@ -30,7 +30,10 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from sgl_jax.srt.configs.gemma4 import Gemma4UnifiedAssistantConfig
+from sgl_jax.srt.configs.gemma4 import (
+    Gemma4AssistantConfig,
+    Gemma4UnifiedAssistantConfig,
+)
 from sgl_jax.srt.models.gemma4_mtp import (
     Gemma4AssistantForCausalLM,
     Gemma4MTPAttention,
@@ -147,6 +150,26 @@ class TestConfigRemap:
     def test_the_two_head_dims_differ(self):
         """Guard the fixture itself: equal values would make the swap untestable."""
         assert _TEXT_CONFIG["head_dim"] != _TEXT_CONFIG["global_head_dim"]
+
+    @staticmethod
+    def _assert_assistant_subclass_init(config_cls):
+        """Both assistant model types must retain Gemma4Config construction.
+
+        Transformers 5 synthesizes an initializer for otherwise-empty
+        PreTrainedConfig subclasses. This regression verifies that both local
+        assistant subclasses still perform nested config conversion and the
+        Gemma 4 full/sliding geometry remap.
+        """
+        cfg = config_cls(text_config=dict(_TEXT_CONFIG), **dict(_TOP_CONFIG))
+        assert cfg.text_config.head_dim == _TEXT_CONFIG["global_head_dim"]
+        assert cfg.text_config.swa_head_dim == _TEXT_CONFIG["head_dim"]
+        assert cfg.backbone_hidden_size == _TOP_CONFIG["backbone_hidden_size"]
+
+    def test_assistant_config_uses_gemma4_initializer(self):
+        self._assert_assistant_subclass_init(Gemma4AssistantConfig)
+
+    def test_unified_assistant_config_uses_gemma4_initializer(self):
+        self._assert_assistant_subclass_init(Gemma4UnifiedAssistantConfig)
 
 
 class TestPerLayerTypeGeometry:
