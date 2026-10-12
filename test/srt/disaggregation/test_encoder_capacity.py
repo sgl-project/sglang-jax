@@ -9,7 +9,9 @@ import pytest
 
 from sgl_jax.srt.disaggregation.encoder.errors import EncoderBatchCapacityError
 from sgl_jax.srt.disaggregation.encoder.raiden_pool import create_encoder_pool
-from sgl_jax.srt.disaggregation.encoder.raiden_transfer import RaidenEncoderServerTransfer
+from sgl_jax.srt.disaggregation.encoder.raiden_transfer import (
+    RaidenEncoderServerTransfer,
+)
 from sgl_jax.srt.disaggregation.encoder.runtime import EncoderRequest, EncoderRuntime
 
 
