@@ -18,6 +18,40 @@ from sgl_jax.srt.configs.quantization_config import (
 
 logger = logging.getLogger(__name__)
 
+INT4_DTYPES = tuple(getattr(jnp, t) for t in ("int4", "uint4", "float4_e2m1fn") if hasattr(jnp, t))
+
+
+def is_int4_dtype(dtype) -> bool:
+    """Return True if dtype is a 4-bit integer or float type."""
+    return dtype in INT4_DTYPES
+
+
+def apply_quantization(model_config, model, *, is_static_input=False):
+    """Prepare static checkpoint structure or quantize loaded weights, MoE first."""
+    config = model_config.quantization_config
+    if config is not None:
+        if config.has_moe_quantization():
+            model = apply_moe_quantization(model_config, model, is_static_input=is_static_input)
+        if config.get_linear_rules():
+            model = apply_linear_quantization(model_config, model, is_static_input=is_static_input)
+    return model
+
+
+def _array_sharding(tensor):
+    # Tracers carry explicit sharding on their aval, not on the array object.
+    return getattr(tensor, "sharding", None) or jax.typeof(tensor).sharding
+
+
+def is_linear_quantization_ignored(path: str, ignored_layers: list[str] | None) -> bool:
+    """Match linear paths using the model walker's exact/suffix semantics."""
+    dot_path = path.replace("/", ".")
+    dot_path = re.sub(r"\.(\d+)\.", r"[\1].", dot_path)
+    for ignored in ignored_layers or []:
+        ignored = re.sub(r"\.(\d+)\.", r"[\1].", ignored)
+        if dot_path == ignored or dot_path.endswith(f".{ignored}"):
+            return True
+    return False
+
 
 def _get_block_reshape_sharding(
     tensor: jax.Array,
@@ -32,7 +66,7 @@ def _get_block_reshape_sharding(
     - keep the original sharding on the new ``num_blocks`` axis
     - mark the inner ``block`` axis as replicated
     """
-    input_sharding = getattr(tensor, "sharding", None)
+    input_sharding = _array_sharding(tensor)
     if not isinstance(input_sharding, NamedSharding):
         return None
 
@@ -58,7 +92,7 @@ def _get_safe_block_quant_input_sharding(
     axis replicated, perform the block quantization reshape/reduction, and let
     callers restore a suitable sharding afterwards.
     """
-    input_sharding = getattr(tensor, "sharding", None)
+    input_sharding = _array_sharding(tensor)
     if not isinstance(input_sharding, NamedSharding):
         return None
 
@@ -141,13 +175,6 @@ def apply_linear_quantization(
 
     ignored_layers = quant_config.ignored_layers or []
 
-    # Normalize ignored layer patterns: convert HF dot-index (layers.0.) to
-    # bracket-index (layers[0].) since the model walk uses bracket notation.
-    normalized_ignored = []
-    for ig in ignored_layers:
-        normalized_ignored.append(re.sub(r"\.(\d+)\.", r"[\1].", ig))
-    ignored_layers = normalized_ignored
-
     def _find_matching_rule(path: str):
         """Find the first rule that matches the given module path."""
         for rule in compiled_rules:
@@ -167,16 +194,17 @@ def apply_linear_quantization(
 
         # Try to iterate through attributes
         if hasattr(obj, "__dict__"):
+            # Models can keep named child modules in their original precision.
+            unquantized_modules = getattr(obj, "unquantized_modules", ())
             for attr_name, attr_value in list(obj.__dict__.items()):
+                if attr_name in unquantized_modules:
+                    continue
                 child_path = f"{path}/{attr_name}" if path else attr_name
 
                 if isinstance(attr_value, LinearBase):
                     # Check if this path matches any rule
                     dot_path = child_path.replace("/", ".")
-                    if any(
-                        dot_path == ignored or dot_path.endswith(f".{ignored}")
-                        for ignored in ignored_layers
-                    ):
+                    if is_linear_quantization_ignored(child_path, ignored_layers):
                         logger.info("Skipping %s - in ignored_layers", dot_path)
                         continue
 
@@ -273,12 +301,23 @@ def apply_moe_quantization(
                 logger.info("Skipping MoE quantization for %s (matched ignored_layers)", log_path)
                 return
             logger.debug("Quantizing MoE weights path=%s", log_path)
-            obj.quantize_weights(is_static=is_static_input)
+            if hasattr(obj, "quantized_dtype") and obj.quantized_dtype is None:
+                obj.quantized_dtype = quant_config.get_moe_weight_dtype()
+                obj.activation_quantized_dtype = quant_config.get_moe_activation_dtype()
+                obj.weight_block_size = getattr(quant_config, "weight_block_size", None)
+            obj.quantize_weights(
+                is_static=is_static_input,
+                abstract=getattr(model_config, "_abstract_mode", False),
+            )
             return
 
         # Try to iterate through attributes
         if hasattr(obj, "__dict__"):
+            # Models can keep named child modules in their original precision.
+            unquantized_modules = getattr(obj, "unquantized_modules", ())
             for attr_name, attr_value in obj.__dict__.items():
+                if attr_name in unquantized_modules:
+                    continue
                 child_path = f"{path}/{attr_name}" if path else attr_name
                 if isinstance(attr_value, nnx.Module):
                     _quantize_moe_recursive(attr_value, child_path, visited)
@@ -345,7 +384,7 @@ def quantize_tensor(
         axis = [axis]
 
     orig_shape = tensor.shape
-    original_input_sharding = getattr(tensor, "sharding", None)
+    original_input_sharding = _array_sharding(tensor)
     mask = None
 
     if block_size is not None:

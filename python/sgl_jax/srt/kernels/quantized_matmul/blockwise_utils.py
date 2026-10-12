@@ -26,7 +26,6 @@ After obtaining a seed, the final tile sizes are clamped and snapped to
 the actual local matrix dimensions so that the kernel launch is always valid.
 """
 
-import functools
 import importlib
 import logging
 import math
@@ -34,6 +33,8 @@ import re
 
 import jax
 import jax.numpy as jnp
+
+from sgl_jax.srt.utils.jax_utils import get_device_kind
 
 logger = logging.getLogger(__name__)
 
@@ -150,11 +151,10 @@ def _nearest_power_of_two_multiple(x: int, base: int, upper_bound: int) -> int:
     return min(candidates, key=lambda value: (abs(value - x), -value))
 
 
-@functools.lru_cache(maxsize=1)
 def _get_current_tpu_version() -> int:
     """Return the current TPU major version, or ``-1`` when unavailable."""
     try:
-        kind = jax.devices()[0].device_kind
+        kind = get_device_kind()
     except Exception:
         return -1
     match = re.match(r"^TPU[^\d]*(\d+)", kind)
@@ -265,7 +265,15 @@ def expand_block_scale(
     else:
         # Standard uniform block quant: repeat each block's scale to its
         # constituent channels, then truncate to the actual output size.
-        scale_per_channel = jnp.repeat(scale_2d, repeats=block_size_out, axis=0)[:n_out]
+        # Explicit meshes require an output layout when repeating a sharded
+        # axis. Read the layout from the aval so this also works in eval_shape.
+        sharding = jax.typeof(scale_2d).sharding
+        scale_per_channel = jnp.repeat(
+            scale_2d,
+            repeats=block_size_out,
+            axis=0,
+            out_sharding=None if sharding.mesh.empty else sharding,
+        )[:n_out]
 
     # Transpose to [in_blocks, n_out] and insert the singleton dim expected
     # by the blockwise kernel: [in_blocks, 1, n_out].

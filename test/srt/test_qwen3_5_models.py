@@ -9,6 +9,7 @@ from sgl_jax.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     QWEN3_5_27B,
     QWEN3_5_35B_A3B,
+    QWEN3_8_27B,
     CustomTestCase,
     popen_launch_server,
 )
@@ -97,9 +98,10 @@ class TestQwen35DenseModel(CustomTestCase):
     weights on a single 4-chip host; mem-fraction 0.8 leaves ample headroom
     (the tp16/dp4 e2e needed 0.90 only because dp replicates the weights)."""
 
+    model = QWEN3_5_27B
+
     @classmethod
     def setUpClass(cls):
-        cls.model = QWEN3_5_27B
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -145,6 +147,12 @@ class TestQwen35DenseModel(CustomTestCase):
 
     def test_mmlu_smoke(self):
         _run_mmlu_smoke(self, self.base_url, self.model)
+
+
+class TestQwen38DenseModel(TestQwen35DenseModel):
+    """Qwen3.8-27B reuses the dense Qwen3.5 architecture and checkpoint layout."""
+
+    model = QWEN3_8_27B
 
 
 if __name__ == "__main__":

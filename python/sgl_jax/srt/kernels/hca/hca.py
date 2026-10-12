@@ -14,7 +14,7 @@ from sgl_jax.srt.kernels.hca.attention import (
     uniform_prefill_attention,
 )
 from sgl_jax.srt.kernels.hca.compressor import (
-    hca_project_fused_pallas,
+    hca_project_fused_halves,
     hca_state_pool_emit_pallas,
     hca_state_pool_update_fused_pallas,
     hca_state_pool_update_ragged_fused_pallas,
@@ -112,6 +112,8 @@ def hca_step(
     window_size: int = 128,
     norm_eps: float = 1e-6,
     fused_weight=None,
+    page_size: int | None = None,
+    compressed_page_size: int | None = None,
 ):
     """Run one complete stateful HCA step for ``mode``.
 
@@ -171,6 +173,8 @@ def hca_step(
         "softmax_scale": softmax_scale,
         "window_size": window_size,
         "compress_ratio": compress_ratio,
+        "page_size": page_size,
+        "compressed_page_size": compressed_page_size,
     }
     if mode == "uniform":
         # Zero prefix and equal q_len let this specialization skip the history
@@ -266,7 +270,7 @@ def _hca_compress_uniform_prefill(
             jnp.arange(cutoff, sequence, dtype=jnp.int32)[None, :],
             (batch, remainder),
         )
-        projected = hca_project_fused_pallas(
+        kv_half, score_half = hca_project_fused_halves(
             x_by_request[:, cutoff:].reshape(batch * remainder, x_by_request.shape[-1]),
             fused_weight,
             ape,
@@ -274,12 +278,16 @@ def _hca_compress_uniform_prefill(
             schedule=schedule,
             compress_ratio=compress_ratio,
             head_dim=head_dim,
-        ).reshape(batch, remainder, 2, head_dim)
+        )
         pad_rows = ((0, 0), (0, compress_ratio - remainder), (0, 0))
         tail = jnp.stack(
             (
-                jnp.pad(projected[:, :, 0], pad_rows),
-                jnp.pad(projected[:, :, 1], pad_rows, constant_values=-jnp.inf),
+                jnp.pad(kv_half.reshape(batch, remainder, head_dim), pad_rows),
+                jnp.pad(
+                    score_half.reshape(batch, remainder, head_dim),
+                    pad_rows,
+                    constant_values=-jnp.inf,
+                ),
             ),
             axis=2,
         )

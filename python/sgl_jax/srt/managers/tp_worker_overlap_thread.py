@@ -96,6 +96,9 @@ class ModelWorkerClient:
     def get_kv_cache(self):
         return self.worker.model_runner.token_to_kv_pool
 
+    def get_embedding_pool(self):
+        return self.worker.get_embedding_pool()
+
     def get_max_padded_size(self):
         return self.worker.get_max_padded_size()
 
@@ -140,6 +143,7 @@ class ModelWorkerClient:
                         )
                     )
                 self.future_token_ids_map = new_future_map
+                self._wait_pd_prefill_kv_ready()
                 self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
                 continue
 
@@ -177,7 +181,23 @@ class ModelWorkerClient:
             # client->proxy->worker RTT (#772).
             if hasattr(next_token_ids, "copy_to_host_async"):
                 next_token_ids.copy_to_host_async()
+            self._wait_pd_prefill_kv_ready()
             self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
+
+    def _wait_pd_prefill_kv_ready(self):
+        """Publish a P result only after its raw-buffer writes have finished.
+
+        This runs on the sole forward thread, before it can donate the pool
+        to another batch. The scheduler can prepare/enqueue that next batch
+        concurrently. Waiting on the pool later, on the scheduler thread,
+        would race replace_all or accidentally wait for the next forward.
+        """
+        args = self.worker.server_args
+        if args.disaggregation_mode == "prefill" and getattr(
+            args, "disaggregation_enable_overlap_schedule", False
+        ):
+            with jax.profiler.TraceAnnotation("pd_prefill_kv_ready"):
+                jax.block_until_ready(self.worker.model_runner.token_to_kv_pool.kv_buffer)
 
     def resolve_last_batch_result(self, launch_done: threading.Event | None = None):
         """

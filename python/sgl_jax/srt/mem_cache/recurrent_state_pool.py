@@ -92,6 +92,7 @@ class RecurrentStatePool:
         conv_dtype=None,
         num_k_heads: int | None = None,
         head_k_dim: int | None = None,
+        abstract: bool = False,
     ):
         """`size` is the **global** number of valid slots across all DP ranks
         (mirrors MHATokenToKVPool.size semantics). Internally we partition by
@@ -166,13 +167,27 @@ class RecurrentStatePool:
         )
         self.conv_sharding = NamedSharding(mesh, P(data_partition_axis, conv_partition_axis, None))
 
-        self.recurrent_buffers, self.conv_buffers = self._create_buffers()
+        self.recurrent_buffers, self.conv_buffers = self._create_buffers(abstract=abstract)
 
-    def _create_buffers(self) -> tuple[list, list]:
+    def _create_buffers(self, *, abstract: bool = False) -> tuple[list, list]:
         recurrent_shape = (self.total_slots, self.num_heads, self.head_dim, self.head_dim)
         conv_shape = (self.total_slots, self.proj_size, self.conv_kernel_size - 1)
         temporal_dtype = self.temporal_dtype
         conv_dtype = self.conv_dtype
+
+        if abstract:
+            return (
+                [
+                    jax.ShapeDtypeStruct(
+                        recurrent_shape, temporal_dtype, sharding=self.recurrent_sharding
+                    )
+                    for _ in range(self.num_linear_recurrent_layers)
+                ],
+                [
+                    [jax.ShapeDtypeStruct(conv_shape, conv_dtype, sharding=self.conv_sharding)]
+                    for _ in range(self.num_linear_recurrent_layers)
+                ],
+            )
 
         alloc_recurrent = _get_recurrent_zero_allocator(
             recurrent_shape, temporal_dtype, self.recurrent_sharding

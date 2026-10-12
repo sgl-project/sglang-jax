@@ -187,7 +187,27 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         # hardcoded fallback both fail Mosaic window setup at mnt>=256).
         # Full mnt bucket coverage pending a tuner sweep.
         ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 1): (16, 1, 2),
+        # Runtime lookup-miss fixes from server logs: the 4-head shard missed
+        # buckets 2/4 and the 64-head (unsharded / DP-attention) decode buckets
+        # 1-8 had no entries at all, so both fell back to the default (3, 1)
+        # blocks (128 pages split into 43 grid steps). Seed them with the
+        # validated 4-head bs1 value (16, 1, 2) pending a proper sweep.
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 2): (16, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 4): (16, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 1): (16, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 2): (16, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 4): (16, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 64, 512, 64, 128, 8): (16, 1, 2),
         ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 8): (16, 1, 2),
+        # decode mnt 16-128 tuned 2026-09-16 on v7x (2x2x1 and 2x2x2 hosts) via
+        # get_block_spec_config_mla.py at kv_len 2048 AND 8192 (minimax pick:
+        # (16,1,2) wins kv=2048 by ~44% and trails the kv=8192 winner by <2.5%).
+        # vs heuristic (3,1,4): mnt16 +20.0%/+19.2%, mnt32 +21.8%/+20.4%,
+        # mnt64 +23.5%, mnt128 +24.4% (kv2048/kv8192; two independent sweeps).
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 16): (16, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 32): (16, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 64): (16, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 128, 128): (16, 1, 4),
         ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 1): (16, 64),
         ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 2): (16, 64),
         ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 4): (16, 64),
@@ -195,11 +215,19 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 16): (16, 64),
         ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 32): (16, 64),
         ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 64): (16, 64),
-        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 128): (16, 64),
-        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 256): (16, 128),
-        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 512): (16, 128),
-        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 1024): (16, 128),
-        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 2048): (16, 128),
+        # mixed mnt 128-2048 tuned 2026-09-16 (get_block_spec_config_mla.py,
+        # kv_len=2048, two independent v7x sweeps). 16-row blocks only
+        # (bkv_p>=16): 8-row winners are within 2.4% but 8-row blocks have a
+        # Mosaic window-setup failure history at mnt>=256 on this 4-head
+        # family (see #1546 note above). mnt128 (16,128) is -22% vs the old
+        # (16,64); (16,256) beats the old (16,128) entries by -19%/-29%/-36%/
+        # -42% at mnt 256/512/1024/2048. mnt4096 keeps the previously
+        # validated (16,128) pending a sweep at that size.
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 128): (16, 128),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 256): (16, 256),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 512): (16, 256),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 1024): (16, 256),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 2048): (16, 256),
         ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 128, 4096): (16, 128),
         # ===== GLM-5.1 (TP=32) configurations on TPU v7 =====
         # Decode & Mixed tuned for q_head_num=2 (TP=32 sharding)
@@ -246,6 +274,30 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ),  # Capped from 32 to prevent VMEM OOM when dbs=4
         ("mixed", "bfloat16", "bfloat16", 2, 512, 64, 256, 8192): (1, 512),
         ("mixed", "bfloat16", "bfloat16", 2, 512, 64, 256, 16384): (1, 512),
+        # ===== Kimi-K2.5 (TP=8: num_q_heads=8, kv_lora_rank=512, qk_rope_head_dim=64, page_size=64) =====
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 64, 1): (64, 1, 1),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 64, 2): (32, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 64, 4): (32, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 64, 8): (64, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 64, 16): (64, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 64, 32): (64, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 64, 64): (64, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 64, 128): (64, 1, 2),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 1): (32, 1),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 2): (32, 2),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 4): (32, 4),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 8): (32, 8),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 16): (32, 16),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 32): (32, 32),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 64): (32, 64),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 128): (32, 128),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 256): (32, 256),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 512): (8, 512),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 1024): (8, 512),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 2048): (8, 512),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 4096): (8, 512),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 8192): (12, 512),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 16384): (12, 512),
     },
 }
 

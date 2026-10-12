@@ -1,4 +1,4 @@
-from sgl_jax.srt.utils.weight_utils import WeightMapping
+from sgl_jax.srt.model_loader.weights import WeightSpec
 
 # Multi-dimensional transpose axes for different weight types
 TRANSPOSE_2D_CONV = (2, 3, 1, 0)  # PyTorch OIHW -> JAX HWIO
@@ -12,7 +12,7 @@ def to_mappings(
     *,
     num_res_blocks: int = 2,
     dim_mult: tuple[int, ...] = (1, 2, 4, 4),
-) -> dict[str, WeightMapping]:
+) -> dict[str, WeightSpec]:
     upsampler_spatial_path = (
         "decoder.up_blocks.*.upsampler.spatial_conv.bias"
         if is_residual
@@ -60,234 +60,234 @@ def to_mappings(
 
     mappings = {
         # Decoder conv_in/conv_out
-        "decoder.conv_in.weight": WeightMapping(
+        "decoder.conv_in.weight": WeightSpec(
             target_path="decoder.conv_in.conv.kernel",
             sharding=(None, None),
             transpose_axes=TRANSPOSE_3D_CONV,
         ),
-        "decoder.conv_in.bias": WeightMapping(
+        "decoder.conv_in.bias": WeightSpec(
             target_path="decoder.conv_in.conv.bias",
             sharding=(None,),
         ),
-        "decoder.conv_out.weight": WeightMapping(
+        "decoder.conv_out.weight": WeightSpec(
             target_path="decoder.conv_out.conv.kernel",
             sharding=(None, None),
             transpose_axes=TRANSPOSE_3D_CONV,
         ),
-        "decoder.conv_out.bias": WeightMapping(
+        "decoder.conv_out.bias": WeightSpec(
             target_path="decoder.conv_out.conv.bias",
             sharding=(None,),
         ),
         # Decoder mid_block attentions
-        "decoder.mid_block.attentions.*.norm.gamma": WeightMapping(
+        "decoder.mid_block.attentions.*.norm.gamma": WeightSpec(
             target_path="decoder.mid_block.attentions.*.norm.scale",
             sharding=(None,),
             transpose_axes=TRANSPOSE_2D_SCALE,
         ),
-        "decoder.mid_block.attentions.*.proj.bias": WeightMapping(
+        "decoder.mid_block.attentions.*.proj.bias": WeightSpec(
             target_path="decoder.mid_block.attentions.*.proj.bias",
             sharding=(None,),
         ),
-        "decoder.mid_block.attentions.*.proj.weight": WeightMapping(
+        "decoder.mid_block.attentions.*.proj.weight": WeightSpec(
             target_path="decoder.mid_block.attentions.*.proj.kernel",
             sharding=(None, None),
             transpose_axes=TRANSPOSE_2D_CONV,
         ),
-        "decoder.mid_block.attentions.*.to_qkv.bias": WeightMapping(
+        "decoder.mid_block.attentions.*.to_qkv.bias": WeightSpec(
             target_path="decoder.mid_block.attentions.*.qkv.bias",
             sharding=(None,),
         ),
-        "decoder.mid_block.attentions.*.to_qkv.weight": WeightMapping(
+        "decoder.mid_block.attentions.*.to_qkv.weight": WeightSpec(
             target_path="decoder.mid_block.attentions.*.qkv.kernel",
             sharding=(None, None),
             transpose_axes=TRANSPOSE_2D_CONV,
         ),
         # Decoder mid_block resnets
-        "decoder.mid_block.resnets.*.conv1.bias": WeightMapping(
+        "decoder.mid_block.resnets.*.conv1.bias": WeightSpec(
             target_path="decoder.mid_block.resnets.*.conv1.conv.bias",
             sharding=(None,),
         ),
-        "decoder.mid_block.resnets.*.conv1.weight": WeightMapping(
+        "decoder.mid_block.resnets.*.conv1.weight": WeightSpec(
             target_path="decoder.mid_block.resnets.*.conv1.conv.kernel",
             sharding=(None, None),
             transpose_axes=TRANSPOSE_3D_CONV,
         ),
-        "decoder.mid_block.resnets.*.conv2.bias": WeightMapping(
+        "decoder.mid_block.resnets.*.conv2.bias": WeightSpec(
             target_path="decoder.mid_block.resnets.*.conv2.conv.bias",
             sharding=(None,),
         ),
-        "decoder.mid_block.resnets.*.conv2.weight": WeightMapping(
+        "decoder.mid_block.resnets.*.conv2.weight": WeightSpec(
             target_path="decoder.mid_block.resnets.*.conv2.conv.kernel",
             sharding=(None, None),
             transpose_axes=TRANSPOSE_3D_CONV,
         ),
-        "decoder.mid_block.resnets.*.norm1.gamma": WeightMapping(
+        "decoder.mid_block.resnets.*.norm1.gamma": WeightSpec(
             target_path="decoder.mid_block.resnets.*.norm1.scale",
             sharding=(None,),
             transpose_axes=TRANSPOSE_3D_SCALE,
         ),
-        "decoder.mid_block.resnets.*.norm2.gamma": WeightMapping(
+        "decoder.mid_block.resnets.*.norm2.gamma": WeightSpec(
             target_path="decoder.mid_block.resnets.*.norm2.scale",
             sharding=(None,),
             transpose_axes=TRANSPOSE_3D_SCALE,
         ),
         # Decoder norm_out
-        "decoder.norm_out.gamma": WeightMapping(
+        "decoder.norm_out.gamma": WeightSpec(
             target_path="decoder.norm_out.scale",
             sharding=(None,),
             transpose_axes=TRANSPOSE_3D_SCALE,
         ),
         # Decoder up_blocks resnets
-        "decoder.up_blocks.*.resnets.*.conv1.bias": WeightMapping(
+        "decoder.up_blocks.*.resnets.*.conv1.bias": WeightSpec(
             target_path="decoder.up_blocks.*.resnets.*.conv1.conv.bias",
             sharding=(None,),
         ),
-        "decoder.up_blocks.*.resnets.*.conv1.weight": WeightMapping(
+        "decoder.up_blocks.*.resnets.*.conv1.weight": WeightSpec(
             target_path="decoder.up_blocks.*.resnets.*.conv1.conv.kernel",
             sharding=(None, None),
             transpose_axes=TRANSPOSE_3D_CONV,
         ),
-        "decoder.up_blocks.*.resnets.*.conv2.bias": WeightMapping(
+        "decoder.up_blocks.*.resnets.*.conv2.bias": WeightSpec(
             target_path="decoder.up_blocks.*.resnets.*.conv2.conv.bias",
             sharding=(None,),
         ),
-        "decoder.up_blocks.*.resnets.*.conv2.weight": WeightMapping(
+        "decoder.up_blocks.*.resnets.*.conv2.weight": WeightSpec(
             target_path="decoder.up_blocks.*.resnets.*.conv2.conv.kernel",
             sharding=(None, None),
             transpose_axes=TRANSPOSE_3D_CONV,
         ),
-        "decoder.up_blocks.*.resnets.*.norm1.gamma": WeightMapping(
+        "decoder.up_blocks.*.resnets.*.norm1.gamma": WeightSpec(
             target_path="decoder.up_blocks.*.resnets.*.norm1.scale",
             sharding=(None,),
             transpose_axes=TRANSPOSE_3D_SCALE,
         ),
-        "decoder.up_blocks.*.resnets.*.norm2.gamma": WeightMapping(
+        "decoder.up_blocks.*.resnets.*.norm2.gamma": WeightSpec(
             target_path="decoder.up_blocks.*.resnets.*.norm2.scale",
             sharding=(None,),
             transpose_axes=TRANSPOSE_3D_SCALE,
         ),
         # Decoder up_blocks upsamplers
-        "decoder.up_blocks.*.upsamplers.*.resample.1.bias": WeightMapping(
+        "decoder.up_blocks.*.upsamplers.*.resample.1.bias": WeightSpec(
             target_path=upsampler_spatial_path,
             sharding=(None,),
         ),
-        "decoder.up_blocks.*.upsamplers.*.resample.1.weight": WeightMapping(
+        "decoder.up_blocks.*.upsamplers.*.resample.1.weight": WeightSpec(
             target_path=upsampler_spatial_kernel_path,
             sharding=(None, None),
             transpose_axes=TRANSPOSE_2D_CONV,
         ),
-        "decoder.up_blocks.*.upsamplers.*.time_conv.bias": WeightMapping(
+        "decoder.up_blocks.*.upsamplers.*.time_conv.bias": WeightSpec(
             target_path=upsampler_time_bias_path,
             sharding=(None,),
         ),
-        "decoder.up_blocks.*.upsamplers.*.time_conv.weight": WeightMapping(
+        "decoder.up_blocks.*.upsamplers.*.time_conv.weight": WeightSpec(
             target_path=upsampler_time_kernel_path,
             sharding=(None, None),
             transpose_axes=TRANSPOSE_3D_CONV,
         ),
         # Decoder up_blocks resnets skip_conv
-        "decoder.up_blocks.*.resnets.*.conv_shortcut.bias": WeightMapping(
+        "decoder.up_blocks.*.resnets.*.conv_shortcut.bias": WeightSpec(
             target_path="decoder.up_blocks.*.resnets.*.skip_conv.conv.bias",
             sharding=(None,),
         ),
-        "decoder.up_blocks.*.resnets.*.conv_shortcut.weight": WeightMapping(
+        "decoder.up_blocks.*.resnets.*.conv_shortcut.weight": WeightSpec(
             target_path="decoder.up_blocks.*.resnets.*.skip_conv.conv.kernel",
             sharding=(None, None),
             transpose_axes=TRANSPOSE_3D_CONV,
         ),
         # Encoder conv_in/conv_out
-        "encoder.conv_in.weight": WeightMapping(
+        "encoder.conv_in.weight": WeightSpec(
             target_path="encoder.conv_in.conv.kernel",
             sharding=(None, None),
             transpose_axes=TRANSPOSE_3D_CONV,
         ),
-        "encoder.conv_in.bias": WeightMapping(
+        "encoder.conv_in.bias": WeightSpec(
             target_path="encoder.conv_in.conv.bias",
             sharding=(None,),
         ),
-        "encoder.conv_out.weight": WeightMapping(
+        "encoder.conv_out.weight": WeightSpec(
             target_path="encoder.conv_out.conv.kernel",
             sharding=(None, None),
             transpose_axes=TRANSPOSE_3D_CONV,
         ),
-        "encoder.conv_out.bias": WeightMapping(
+        "encoder.conv_out.bias": WeightSpec(
             target_path="encoder.conv_out.conv.bias",
             sharding=(None,),
         ),
         # Encoder mid_block attentions
-        "encoder.mid_block.attentions.*.norm.gamma": WeightMapping(
+        "encoder.mid_block.attentions.*.norm.gamma": WeightSpec(
             target_path="encoder.mid_block.attentions.*.norm.scale",
             sharding=(None,),
             transpose_axes=TRANSPOSE_2D_SCALE,
         ),
-        "encoder.mid_block.attentions.*.proj.bias": WeightMapping(
+        "encoder.mid_block.attentions.*.proj.bias": WeightSpec(
             target_path="encoder.mid_block.attentions.*.proj.bias",
             sharding=(None,),
         ),
-        "encoder.mid_block.attentions.*.proj.weight": WeightMapping(
+        "encoder.mid_block.attentions.*.proj.weight": WeightSpec(
             target_path="encoder.mid_block.attentions.*.proj.kernel",
             sharding=(None, None),
             transpose_axes=TRANSPOSE_2D_CONV,
         ),
-        "encoder.mid_block.attentions.*.to_qkv.bias": WeightMapping(
+        "encoder.mid_block.attentions.*.to_qkv.bias": WeightSpec(
             target_path="encoder.mid_block.attentions.*.qkv.bias",
             sharding=(None,),
         ),
-        "encoder.mid_block.attentions.*.to_qkv.weight": WeightMapping(
+        "encoder.mid_block.attentions.*.to_qkv.weight": WeightSpec(
             target_path="encoder.mid_block.attentions.*.qkv.kernel",
             sharding=(None, None),
             transpose_axes=TRANSPOSE_2D_CONV,
         ),
         # Encoder mid_block resnets
-        "encoder.mid_block.resnets.*.conv1.bias": WeightMapping(
+        "encoder.mid_block.resnets.*.conv1.bias": WeightSpec(
             target_path="encoder.mid_block.resnets.*.conv1.conv.bias",
             sharding=(None,),
         ),
-        "encoder.mid_block.resnets.*.conv1.weight": WeightMapping(
+        "encoder.mid_block.resnets.*.conv1.weight": WeightSpec(
             target_path="encoder.mid_block.resnets.*.conv1.conv.kernel",
             sharding=(None, None),
             transpose_axes=TRANSPOSE_3D_CONV,
         ),
-        "encoder.mid_block.resnets.*.conv2.bias": WeightMapping(
+        "encoder.mid_block.resnets.*.conv2.bias": WeightSpec(
             target_path="encoder.mid_block.resnets.*.conv2.conv.bias",
             sharding=(None,),
         ),
-        "encoder.mid_block.resnets.*.conv2.weight": WeightMapping(
+        "encoder.mid_block.resnets.*.conv2.weight": WeightSpec(
             target_path="encoder.mid_block.resnets.*.conv2.conv.kernel",
             sharding=(None, None),
             transpose_axes=TRANSPOSE_3D_CONV,
         ),
-        "encoder.mid_block.resnets.*.norm1.gamma": WeightMapping(
+        "encoder.mid_block.resnets.*.norm1.gamma": WeightSpec(
             target_path="encoder.mid_block.resnets.*.norm1.scale",
             sharding=(None,),
             transpose_axes=TRANSPOSE_3D_SCALE,
         ),
-        "encoder.mid_block.resnets.*.norm2.gamma": WeightMapping(
+        "encoder.mid_block.resnets.*.norm2.gamma": WeightSpec(
             target_path="encoder.mid_block.resnets.*.norm2.scale",
             sharding=(None,),
             transpose_axes=TRANSPOSE_3D_SCALE,
         ),
         # Encoder norm_out
-        "encoder.norm_out.gamma": WeightMapping(
+        "encoder.norm_out.gamma": WeightSpec(
             target_path="encoder.norm_out.scale",
             sharding=(None,),
             transpose_axes=TRANSPOSE_3D_SCALE,
         ),
         # Quant conv (not used in encoder and decoder)
-        "post_quant_conv.bias": WeightMapping(
+        "post_quant_conv.bias": WeightSpec(
             target_path="post_quant_conv.conv.bias",
             sharding=(None,),
         ),
-        "post_quant_conv.weight": WeightMapping(
+        "post_quant_conv.weight": WeightSpec(
             target_path="post_quant_conv.conv.kernel",
             sharding=(None, None),
             transpose_axes=TRANSPOSE_3D_CONV,
         ),
-        "quant_conv.bias": WeightMapping(
+        "quant_conv.bias": WeightSpec(
             target_path="quant_conv.conv.bias",
             sharding=(None,),
         ),
-        "quant_conv.weight": WeightMapping(
+        "quant_conv.weight": WeightSpec(
             target_path="quant_conv.conv.kernel",
             sharding=(None, None),
             transpose_axes=TRANSPOSE_3D_CONV,
@@ -303,61 +303,59 @@ def to_mappings(
                 if block_pos < num_res_blocks:
                     resnet_idx = block_pos
                     base = f"encoder.down_blocks.{stage_idx}.resnets.{resnet_idx}"
-                    mappings[f"encoder.down_blocks.{hf_index}.conv1.bias"] = WeightMapping(
+                    mappings[f"encoder.down_blocks.{hf_index}.conv1.bias"] = WeightSpec(
                         target_path=f"{base}.conv1.conv.bias",
                         sharding=(None,),
                     )
-                    mappings[f"encoder.down_blocks.{hf_index}.conv1.weight"] = WeightMapping(
+                    mappings[f"encoder.down_blocks.{hf_index}.conv1.weight"] = WeightSpec(
                         target_path=f"{base}.conv1.conv.kernel",
                         sharding=(None, None),
                         transpose_axes=TRANSPOSE_3D_CONV,
                     )
-                    mappings[f"encoder.down_blocks.{hf_index}.conv2.bias"] = WeightMapping(
+                    mappings[f"encoder.down_blocks.{hf_index}.conv2.bias"] = WeightSpec(
                         target_path=f"{base}.conv2.conv.bias",
                         sharding=(None,),
                     )
-                    mappings[f"encoder.down_blocks.{hf_index}.conv2.weight"] = WeightMapping(
+                    mappings[f"encoder.down_blocks.{hf_index}.conv2.weight"] = WeightSpec(
                         target_path=f"{base}.conv2.conv.kernel",
                         sharding=(None, None),
                         transpose_axes=TRANSPOSE_3D_CONV,
                     )
-                    mappings[f"encoder.down_blocks.{hf_index}.norm1.gamma"] = WeightMapping(
+                    mappings[f"encoder.down_blocks.{hf_index}.norm1.gamma"] = WeightSpec(
                         target_path=f"{base}.norm1.scale",
                         sharding=(None,),
                         transpose_axes=TRANSPOSE_3D_SCALE,
                     )
-                    mappings[f"encoder.down_blocks.{hf_index}.norm2.gamma"] = WeightMapping(
+                    mappings[f"encoder.down_blocks.{hf_index}.norm2.gamma"] = WeightSpec(
                         target_path=f"{base}.norm2.scale",
                         sharding=(None,),
                         transpose_axes=TRANSPOSE_3D_SCALE,
                     )
-                    mappings[f"encoder.down_blocks.{hf_index}.conv_shortcut.bias"] = WeightMapping(
+                    mappings[f"encoder.down_blocks.{hf_index}.conv_shortcut.bias"] = WeightSpec(
                         target_path=f"{base}.skip_conv.conv.bias",
                         sharding=(None,),
                     )
-                    mappings[f"encoder.down_blocks.{hf_index}.conv_shortcut.weight"] = (
-                        WeightMapping(
-                            target_path=f"{base}.skip_conv.conv.kernel",
-                            sharding=(None, None),
-                            transpose_axes=TRANSPOSE_3D_CONV,
-                        )
+                    mappings[f"encoder.down_blocks.{hf_index}.conv_shortcut.weight"] = WeightSpec(
+                        target_path=f"{base}.skip_conv.conv.kernel",
+                        sharding=(None, None),
+                        transpose_axes=TRANSPOSE_3D_CONV,
                     )
                 else:
                     base = f"encoder.down_blocks.{stage_idx}.downsampler"
-                    mappings[f"encoder.down_blocks.{hf_index}.resample.1.bias"] = WeightMapping(
+                    mappings[f"encoder.down_blocks.{hf_index}.resample.1.bias"] = WeightSpec(
                         target_path=f"{base}.spatial_conv.bias",
                         sharding=(None,),
                     )
-                    mappings[f"encoder.down_blocks.{hf_index}.resample.1.weight"] = WeightMapping(
+                    mappings[f"encoder.down_blocks.{hf_index}.resample.1.weight"] = WeightSpec(
                         target_path=f"{base}.spatial_conv.kernel",
                         sharding=(None, None),
                         transpose_axes=TRANSPOSE_2D_CONV,
                     )
-                    mappings[f"encoder.down_blocks.{hf_index}.time_conv.bias"] = WeightMapping(
+                    mappings[f"encoder.down_blocks.{hf_index}.time_conv.bias"] = WeightSpec(
                         target_path=f"{base}.time_conv.conv.bias",
                         sharding=(None,),
                     )
-                    mappings[f"encoder.down_blocks.{hf_index}.time_conv.weight"] = WeightMapping(
+                    mappings[f"encoder.down_blocks.{hf_index}.time_conv.weight"] = WeightSpec(
                         target_path=f"{base}.time_conv.conv.kernel",
                         sharding=(None, None),
                         transpose_axes=TRANSPOSE_3D_CONV,
@@ -367,57 +365,57 @@ def to_mappings(
         mappings.update(
             {
                 # Encoder down_blocks
-                "encoder.down_blocks.*.conv1.bias": WeightMapping(
+                "encoder.down_blocks.*.conv1.bias": WeightSpec(
                     target_path=f"{encoder_resnet_prefix}.conv1.conv.bias",
                     sharding=(None,),
                 ),
-                "encoder.down_blocks.*.conv1.weight": WeightMapping(
+                "encoder.down_blocks.*.conv1.weight": WeightSpec(
                     target_path=f"{encoder_resnet_prefix}.conv1.conv.kernel",
                     sharding=(None, None),
                     transpose_axes=TRANSPOSE_3D_CONV,
                 ),
-                "encoder.down_blocks.*.conv2.bias": WeightMapping(
+                "encoder.down_blocks.*.conv2.bias": WeightSpec(
                     target_path=f"{encoder_resnet_prefix}.conv2.conv.bias",
                     sharding=(None,),
                 ),
-                "encoder.down_blocks.*.conv2.weight": WeightMapping(
+                "encoder.down_blocks.*.conv2.weight": WeightSpec(
                     target_path=f"{encoder_resnet_prefix}.conv2.conv.kernel",
                     sharding=(None, None),
                     transpose_axes=TRANSPOSE_3D_CONV,
                 ),
-                "encoder.down_blocks.*.norm1.gamma": WeightMapping(
+                "encoder.down_blocks.*.norm1.gamma": WeightSpec(
                     target_path=f"{encoder_resnet_prefix}.norm1.scale",
                     sharding=(None,),
                     transpose_axes=TRANSPOSE_3D_SCALE,
                 ),
-                "encoder.down_blocks.*.norm2.gamma": WeightMapping(
+                "encoder.down_blocks.*.norm2.gamma": WeightSpec(
                     target_path=f"{encoder_resnet_prefix}.norm2.scale",
                     sharding=(None,),
                     transpose_axes=TRANSPOSE_3D_SCALE,
                 ),
-                "encoder.down_blocks.*.resample.1.bias": WeightMapping(
+                "encoder.down_blocks.*.resample.1.bias": WeightSpec(
                     target_path=downsampler_spatial_path,
                     sharding=(None,),
                 ),
-                "encoder.down_blocks.*.resample.1.weight": WeightMapping(
+                "encoder.down_blocks.*.resample.1.weight": WeightSpec(
                     target_path=downsampler_spatial_kernel_path,
                     sharding=(None, None),
                     transpose_axes=TRANSPOSE_2D_CONV,
                 ),
-                "encoder.down_blocks.*.time_conv.bias": WeightMapping(
+                "encoder.down_blocks.*.time_conv.bias": WeightSpec(
                     target_path=downsampler_time_bias_path,
                     sharding=(None,),
                 ),
-                "encoder.down_blocks.*.time_conv.weight": WeightMapping(
+                "encoder.down_blocks.*.time_conv.weight": WeightSpec(
                     target_path=downsampler_time_kernel_path,
                     sharding=(None, None),
                     transpose_axes=TRANSPOSE_3D_CONV,
                 ),
-                "encoder.down_blocks.*.conv_shortcut.bias": WeightMapping(
+                "encoder.down_blocks.*.conv_shortcut.bias": WeightSpec(
                     target_path=f"{encoder_resnet_prefix}.skip_conv.conv.bias",
                     sharding=(None,),
                 ),
-                "encoder.down_blocks.*.conv_shortcut.weight": WeightMapping(
+                "encoder.down_blocks.*.conv_shortcut.weight": WeightSpec(
                     target_path=f"{encoder_resnet_prefix}.skip_conv.conv.kernel",
                     sharding=(None, None),
                     transpose_axes=TRANSPOSE_3D_CONV,

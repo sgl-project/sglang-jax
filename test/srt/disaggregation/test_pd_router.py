@@ -867,3 +867,102 @@ class TestServingCompletionsPassthrough:
         assert adapted.bootstrap_host == "10.0.0.2"
         assert adapted.bootstrap_port == 9998
         assert adapted.bootstrap_room == 99
+
+
+@pytest.mark.parametrize(
+    "prefill_metadata",
+    [
+        [{}],
+        [{"input_token_logprobs": [[-0.2, 11, None]]}],
+        [{}, {"input_token_logprobs": [[-0.2, 11, None]]}],
+    ],
+)
+def test_stream_logprobs_allow_missing_or_late_prefill_input_logprobs(prefill_metadata):
+    from types import SimpleNamespace
+
+    import orjson
+
+    class Lines:
+        def __init__(self, values):
+            self.values = values
+
+        def iter_chunked(self, size):
+            async def iterator():
+                for value in self.values:
+                    yield b"data: " + orjson.dumps(value) + b"\n"
+                    yield b"\n"
+                yield b"data: [DONE]\n"
+
+            return iterator()
+
+    instance = MiniLoadBalancer(
+        RouterArgs(
+            mini_lb=True,
+            pd_disaggregation=True,
+            prefill_urls=[("http://p", 8998)],
+            decode_urls=["http://d"],
+        )
+    )
+    instance.prefill_dp_size = instance.decode_dp_size = 1
+    prefill = SimpleNamespace(content=Lines([{"meta_info": item} for item in prefill_metadata]))
+    decode = SimpleNamespace(
+        content=Lines([{"text": "ok", "meta_info": {"output_token_logprobs": [[-0.1, 42, None]]}}])
+    )
+    session = AsyncMock()
+    session.__aenter__.return_value = session
+    session.post.side_effect = [prefill, decode]
+
+    async def consume():
+        with patch("aiohttp.ClientSession", return_value=session):
+            response = await instance.generate_stream(
+                {"input_ids": [1], "return_logprob": True, "bootstrap_room": 1},
+                "http://p",
+                "http://d",
+            )
+            return [chunk async for chunk in response.body_iterator]
+
+    chunks = asyncio.run(consume())
+    records = [orjson.loads(c[5:]) for c in chunks if c.startswith(b"data:") and b"[DONE]" not in c]
+    assert records[0]["meta_info"]["output_token_logprobs"] == [[-0.1, 42, None]]
+    if "input_token_logprobs" in prefill_metadata[-1]:
+        assert records[0]["meta_info"]["input_token_logprobs"] == [[-0.2, 11, None]]
+    else:
+        assert "input_token_logprobs" not in records[0]["meta_info"]
+    assert b"data: [DONE]\n" in chunks
+
+
+@pytest.mark.parametrize("size", [7, 65536])
+def test_stream_lines_support_large_events_and_fragmented_utf8(size):
+    import aiohttp
+    from aiohttp import web
+
+    from sgl_jax.srt.disaggregation.mini_lb import _iter_stream_lines
+
+    async def run():
+        expected = [b"data: " + ("中" * 60000).encode() + b"\n", b"\n", b"data: [DONE]\n", b"tail"]
+        wire = b"".join(expected)
+
+        async def serve(request):
+            response = web.StreamResponse()
+            await response.prepare(request)
+            for offset in range(0, len(wire), size):
+                await response.write(wire[offset : offset + size])
+            await response.write_eof()
+            return response
+
+        app = web.Application()
+        app.router.add_get("/", serve)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"http://127.0.0.1:{port}/") as response:
+                    actual = [line async for line in _iter_stream_lines(response.content)]
+            assert actual == expected
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())

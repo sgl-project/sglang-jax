@@ -32,6 +32,7 @@ from sgl_jax.srt.managers.io_struct import (
     BatchTokenIDOut,
     ProfileReqOutput,
 )
+from sgl_jax.srt.managers.mm_utils import send_mm_request
 from sgl_jax.srt.managers.tokenizer_manager import ReqState, TokenizerManager
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
 from sgl_jax.srt.multimodal.manager.io_struct import (
@@ -911,7 +912,7 @@ class MultimodalTokenizer(TokenizerManager):
         Constructs an `MMReqState` to wait for results and stores it in
         `rid_to_state` keyed by the request id.
         """
-        self.send_to_scheduler.send_pyobj(tokenized_obj)
+        send_mm_request(self.send_to_scheduler, tokenized_obj)
         try:
             caller_loop = asyncio.get_running_loop()
         except RuntimeError:

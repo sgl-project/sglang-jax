@@ -32,8 +32,8 @@ from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.model_loader.weights import WeightLoader, WeightSpec
 from sgl_jax.srt.utils.profiling_utils import named_scope
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
@@ -420,7 +420,7 @@ class Gemma4AssistantForCausalLM(nnx.Module):
                 self.config.hidden_size,
                 dtype=dtype,
                 param_dtype=dtype,
-                kernel_axes=("tensor", None),
+                mesh=mesh,
             )
 
         # -- Sparse masked (centroid-based) embedder (inlined) ------------------
@@ -469,16 +469,16 @@ class Gemma4AssistantForCausalLM(nnx.Module):
         )
         weight_mappings = self._create_weight_mappings()
         if not loader.dummy_mode:
-            weight_info = loader._scan_weight_info()
+            weight_info = loader.metadata
             weight_mappings = {k: v for k, v in weight_mappings.items() if k in weight_info}
-        loader.load_weights_from_safetensors(weight_mappings)
+        loader.load(weight_mappings)
         logger.info("Gemma4 MTP weights loaded successfully!")
 
     def _create_weight_mappings(self) -> dict:
         mappings = {}
 
         # Draft's own embed_tokens (hidden_size-dim, loaded from checkpoint)
-        mappings["model.embed_tokens.weight"] = WeightMapping(
+        mappings["model.embed_tokens.weight"] = WeightSpec(
             target_path="embed_tokens.embedding",
             sharding=("tensor", None),
             transpose=False,
@@ -486,13 +486,13 @@ class Gemma4AssistantForCausalLM(nnx.Module):
 
         # lm_head: tied to embed_tokens by default
         if not hasattr(self, "lm_head") or self.lm_head is None:
-            mappings["lm_head.weight"] = WeightMapping(
+            mappings["lm_head.weight"] = WeightSpec(
                 target_path="embed_tokens.embedding",
                 sharding=("tensor", None),
                 transpose=False,
             )
         else:
-            mappings["lm_head.weight"] = WeightMapping(
+            mappings["lm_head.weight"] = WeightSpec(
                 target_path="lm_head.embedding",
                 sharding=("tensor", None),
                 transpose=False,
@@ -513,17 +513,17 @@ class Gemma4AssistantForCausalLM(nnx.Module):
         # and the first forward died in dot_general with a (0,) contracting
         # dimension. A silent no-match is the dangerous part: nothing warns, and
         # the loader still reports "weights loaded successfully".
-        mappings["pre_projection.weight"] = WeightMapping(
+        mappings["pre_projection.weight"] = WeightSpec(
             target_path="pre_projection.weight",
             sharding=(None, "tensor"),
             transpose=True,
         )
-        mappings["post_projection.weight"] = WeightMapping(
+        mappings["post_projection.weight"] = WeightSpec(
             target_path="post_projection.weight",
             sharding=(None, "tensor"),
             transpose=True,
         )
-        mappings["model.norm.weight"] = WeightMapping(
+        mappings["model.norm.weight"] = WeightSpec(
             target_path="norm.weight",
             sharding=(None,),
             transpose=False,
@@ -531,12 +531,12 @@ class Gemma4AssistantForCausalLM(nnx.Module):
 
         # Centroid masked embedder (inlined attributes)
         if self.masked_centroids is not None:
-            mappings["masked_embedding.centroids.weight"] = WeightMapping(
+            mappings["masked_embedding.centroids.weight"] = WeightSpec(
                 target_path="masked_centroids.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             )
-            mappings["masked_embedding.token_ordering"] = WeightMapping(
+            mappings["masked_embedding.token_ordering"] = WeightSpec(
                 target_path="masked_token_ordering",
                 sharding=(None,),
                 transpose=False,
@@ -565,7 +565,7 @@ class Gemma4AssistantForCausalLM(nnx.Module):
 
         mappings = {}
         for suffix, sharding, transpose in _LAYER_WEIGHT_SPECS:
-            mappings[f"{hf_prefix}.{suffix}"] = WeightMapping(
+            mappings[f"{hf_prefix}.{suffix}"] = WeightSpec(
                 target_path=f"{target_prefix}.{suffix}",
                 sharding=sharding,
                 transpose=transpose,
@@ -573,7 +573,7 @@ class Gemma4AssistantForCausalLM(nnx.Module):
 
         if attn_bias:
             for proj in ("q_proj", "o_proj"):
-                mappings[f"{hf_prefix}.self_attn.{proj}.bias"] = WeightMapping(
+                mappings[f"{hf_prefix}.self_attn.{proj}.bias"] = WeightSpec(
                     target_path=f"{target_prefix}.self_attn.{proj}.bias",
                     sharding=(None,),
                     transpose=False,

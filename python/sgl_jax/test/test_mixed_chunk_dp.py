@@ -85,6 +85,50 @@ def _make_extend_batch(
 
 
 class TestMixedChunkDP(unittest.TestCase):
+    def test_exhausted_chunk_rejection_does_not_consume_kv_budget(self):
+        allocator = _DummyAllocator()
+        allocator.available_size = lambda dp_rank=0: 70784
+
+        def make_adder():
+            return PrefillAdder(
+                page_size=128,
+                tree_cache=_DummyTreeCache(),
+                token_to_kv_pool_allocator=allocator,
+                running_batch=None,
+                new_token_ratio=1.0,
+                rem_input_tokens=16384,
+                rem_chunk_tokens=2048,
+                dp_size=2,
+            )
+
+        def make_req(rid, dp_rank):
+            req = _make_req(rid, dp_rank, input_len=1, output_len=0)
+            req.sampling_params.ignore_eos = True
+            req.sampling_params.max_new_tokens = 1024
+            req.fill_ids = req.origin_input_ids.copy()
+            req.extend_input_len = 1
+            return req
+
+        adder = make_adder()
+        for i in range(16):
+            self.assertEqual(adder.add_one_req(make_req(str(i), 0)), AddReqResult.CONTINUE)
+        states = list(adder.req_states[0])
+        total_offsets = adder.rem_total_token_offset.copy()
+        current_offsets = adder.cur_rem_token_offset.copy()
+        input_budget = adder.rem_input_tokens
+        rejected = [make_req(f"waiting-{i}", 0) for i in range(256)]
+        for req in rejected:
+            self.assertEqual(adder.add_one_req(req), AddReqResult.DP_BUDGET_EXHAUSTED)
+            self.assertEqual(req.extend_input_len, 1)
+        self.assertEqual(adder.req_states[0], states)
+        self.assertEqual(len(adder.can_run_list[0]), 16)
+        self.assertEqual(adder.rem_total_token_offset, total_offsets)
+        self.assertEqual(adder.cur_rem_token_offset, current_offsets)
+        self.assertEqual(adder.rem_input_tokens, input_budget)
+        self.assertEqual(adder.rem_chunk_tokens_list, [0, 2048])
+        self.assertEqual(adder.add_one_req(make_req("other-dp", 1)), AddReqResult.CONTINUE)
+        self.assertEqual(make_adder().add_one_req(rejected[0]), AddReqResult.CONTINUE)
+
     def test_mix_with_running_merges_per_dp_fields(self):
         # DP0: one prefill req + one running decode req
         prefill_req_dp0 = _make_req("prefill-dp0", dp_rank=0)

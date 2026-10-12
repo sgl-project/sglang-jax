@@ -51,7 +51,7 @@ For reusable Docker, GKE, and SkyPilot launchers, see [Deployment](../deployment
 | `--tokenizer-mode` | Select `auto` fast-tokenizer usage or force `slow` tokenization. |
 | `--tokenizer-backend` | Select the tokenizer implementation, such as Hugging Face or `fastokens`. |
 | `--skip-tokenizer-init` | Skip tokenizer initialization; requests must provide `input_ids`. |
-| `--load-format` | Select checkpoint loading format, such as `auto`, `safetensors`, `dummy`, `gguf`, or `layered`. |
+| `--load-format` | Select checkpoint loading format, such as `auto`, `safetensors`, `dummy`, `gguf`, `layered`, or [`runai_streamer`](../deployment/runai-gcs.md) for direct GCS loading. |
 | `--model-loader-extra-config` | Pass load-format-specific JSON config through to the selected model loader. |
 | `--trust-remote-code` | Allow model-specific code from the model repository. Common for Qwen-derived and MiMo recipes. |
 | `--context-length` | Override the model context length from config. |
@@ -171,6 +171,7 @@ For deeper scheduler behavior, see [Scheduler](../architecture/03-scheduler.md) 
 |---|---|
 | `--precompile-token-paddings` | Token buckets used for prefill JIT precompile. |
 | `--precompile-bs-paddings` | Batch-size buckets used for decode JIT precompile. |
+| `--precompile-num-threads` | Maximum concurrent XLA compilations at startup or during `--save-aot` (default: `2`). Use `1` for serial compilation and lower peak host memory. |
 | `--disable-precompile` | Skip startup precompilation. Runtime JIT can still happen on first unseen shape. |
 | `--attention-backend` | Attention backend: `fa`, `fa_mha`, or `native`. |
 | `--moe-backend` | MoE backend: `epmoe`, `fused`, `fused_v2`, or `auto`. |
@@ -178,6 +179,15 @@ For deeper scheduler behavior, see [Scheduler](../architecture/03-scheduler.md) 
 | `--enable-nan-detection` | Enable NaN detection for debugging. |
 
 For the compiled model path, see [Global JIT Compile](global_jit_compile.md). For backend selection, see [Attention Backend](attention_backend.md).
+
+Parallel precompile keeps JAX lowering and device warmup serial. At most
+`--precompile-num-threads` lowered graphs are queued or compiling, and all required
+executables finish before warmup. Compilation errors fail startup. Online
+precompile warms the existing JIT cache; the optional `SGLANG_JAX_AOT_DISPATCH`
+setting and serving dispatch path are unchanged. Speculative decoding,
+LoRA, multimodal models, and offline executable loading retain serial warmup.
+More workers can increase peak host memory; measure cold startup with the same
+buckets before increasing this limit.
 
 ### GDN Prefill Implementation
 

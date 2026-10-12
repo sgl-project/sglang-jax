@@ -12,16 +12,23 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
+from sgl_jax.srt.kernels.sparse_core.moe_permute import (
+    moe_sc_permute_enabled_by_env,
+    sc_combine,
+    sc_dispatch_gather,
+    should_use_sparse_core,
+)
 
 # Re-export for backward compatibility: external code imports from this module.
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE, FusedEPMoEV2  # noqa: F401
 from sgl_jax.srt.layers.gate import GateLogit, TopK  # noqa: F401
+from sgl_jax.srt.model_loader.weights import WeightSpec
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import (
+    is_int4_dtype,
     quantize_tensor,
     quantize_tensor_simple,
 )
-from sgl_jax.srt.utils.weight_utils import WeightMapping
 
 
 class EPMoE(nnx.Module):
@@ -36,13 +43,20 @@ class EPMoE(nnx.Module):
         weight_dtype: jnp.dtype = jnp.bfloat16,
         dtype: jnp.dtype = jnp.bfloat16,
         activation: str = "silu",
+        swiglu_alpha: float = 1.702,
+        swiglu_limit: float = 7.0,
         layer_id: int = 0,
         quantization_config=None,
         physical_to_logical_map: "jax.Array | None" = None,
         pre_gather_quant_dtype=None,
         moe_dp_size: int = 1,
+        use_sc_permute: bool | None = None,
     ):
         self.num_experts_per_tok = num_experts_per_tok
+        # Opt-in SparseCore permute/unpermute kernels; ``None`` defers to the env flag.
+        self.use_sc_permute = (
+            moe_sc_permute_enabled_by_env() if use_sc_permute is None else bool(use_sc_permute)
+        )
         self.physical_to_logical_map = physical_to_logical_map
         self.pre_gather_quant_dtype = pre_gather_quant_dtype
         self.moe_dp_size = moe_dp_size
@@ -62,6 +76,8 @@ class EPMoE(nnx.Module):
         self.original_mesh = mesh
         self.mesh = mesh
         self.activation = activation
+        self.swiglu_alpha = swiglu_alpha
+        self.swiglu_limit = swiglu_limit
         self.hidden_size = hidden_size
 
         # Get quantization settings from config
@@ -173,6 +189,26 @@ class EPMoE(nnx.Module):
         except Exception as _:
             return False, "cpu"
 
+    def _get_wo_scale_sharding(
+        self, scale: jax.Array | None = None, is_block: bool | None = None
+    ) -> P:
+        """Derive the sharding spec for wo_scale.
+
+        When contracting-dimension block quantization is used (k_blocks > 1),
+        wo_scale's K-dimension is partitioned across the tensor axis.
+        """
+        if is_block is None:
+            if scale is not None:
+                is_block = scale.shape[1] > 1 if scale.ndim == 4 else scale.shape[-1] > 1
+            elif self.wo_scale is not None:
+                wo_scale_val = (
+                    self.wo_scale.value if hasattr(self.wo_scale, "value") else self.wo_scale
+                )
+                is_block = wo_scale_val.shape[1] > 1 if wo_scale_val is not None else False
+            else:
+                is_block = False
+        return P("expert", "tensor" if is_block else None, None, None)
+
     def _normalize_scale_for_gmm(
         self,
         scale: jax.Array | None,
@@ -199,6 +235,8 @@ class EPMoE(nnx.Module):
         # Weight layout is [E, k, n] where k=contraction dim, n=output dim.
         num_experts, in_dim, out_dim = weight.shape
 
+        scale_gmm: jax.Array | None = None
+
         if scale.ndim == 4:
             if scale.shape[0] != num_experts or scale.shape[2] != 1 or scale.shape[3] != out_dim:
                 raise ValueError(
@@ -219,23 +257,17 @@ class EPMoE(nnx.Module):
                         f"Unsupported {scale_name} shape {scale.shape} for weight shape {weight.shape}. "
                         f"Expected k_blocks dimension to be 1 or {expected_k_blocks}."
                     )
-            final_scale_sharding = (
-                P("expert", None, None, None)
-                if scale_name == "wo_scale"
-                else P("expert", None, None, "tensor")
-            )
-            return jax.sharding.reshard(scale, final_scale_sharding)
+            scale_gmm = scale
 
-        if scale.ndim == 2 and scale.shape == (num_experts, out_dim):
-            return scale[:, None, None, :]
+        elif scale.ndim == 2 and scale.shape == (num_experts, out_dim):
+            scale_gmm = scale[:, None, None, :]
 
-        if scale.ndim == 3:
+        elif scale.ndim == 3:
             if scale.shape == (num_experts, 1, out_dim):
-                return scale[:, :, None, :]
-
+                scale_gmm = scale[:, :, None, :]
             # Support offline 2D block quant checkpoints whose scales are stored as
             # [num_experts, out_blocks, in_blocks]. GMM expects [E, k_blocks, 1, out_dim].
-            if (
+            elif (
                 self.weight_block_size is not None
                 and isinstance(self.weight_block_size, (list, tuple))
                 and len(self.weight_block_size) == 2
@@ -246,42 +278,35 @@ class EPMoE(nnx.Module):
                 expected_k_blocks = (in_dim + block_size_k - 1) // block_size_k
 
                 if scale.shape == (num_experts, out_dim, expected_k_blocks):
-                    final_scale_sharding = (
-                        P("expert", None, None, None)
-                        if scale_name == "wo_scale"
-                        else P("expert", None, None, "tensor")
-                    )
                     scale_gmm = jnp.transpose(scale, (0, 2, 1))[:, :, None, :]
-                    return jax.sharding.reshard(scale_gmm, final_scale_sharding)
-
-                if scale.shape == (num_experts, expected_out_blocks, expected_k_blocks):
+                elif scale.shape == (num_experts, expected_out_blocks, expected_k_blocks):
                     scale_per_out_sharding = (
                         P("expert", None, None)
                         if scale_name == "wo_scale"
                         else P("expert", "tensor", None)
                     )
-                    final_scale_sharding = (
-                        P("expert", None, None, None)
-                        if scale_name == "wo_scale"
-                        else P("expert", None, None, "tensor")
-                    )
-                    out_block_ids = jnp.arange(out_dim, dtype=jnp.int32) // block_size_out
-                    scale_per_out = scale.at[:, out_block_ids, :].get(
-                        out_sharding=scale_per_out_sharding
-                    )
+                    scale_per_out = scale.at[
+                        :, jnp.arange(out_dim, dtype=jnp.int32) // block_size_out, :
+                    ].get(out_sharding=scale_per_out_sharding)
                     scale_gmm = jnp.transpose(scale_per_out, (0, 2, 1))[:, :, None, :]
-                    return jax.sharding.reshard(scale_gmm, final_scale_sharding)
+                elif scale.shape == (num_experts, expected_k_blocks, out_dim):
+                    scale_gmm = scale[:, :, None, :]
 
-                if scale.shape == (num_experts, expected_k_blocks, out_dim):
-                    return scale[:, :, None, :]
+        if scale_gmm is None:
+            raise ValueError(
+                f"Unsupported {scale_name} shape {scale.shape} for weight shape {weight.shape}. "
+                "Expected one of: [E, out_dim], [E, 1, out_dim], [E, k_blocks, 1, out_dim], "
+                "or offline block format [E, out_blocks, k_blocks]."
+            )
 
-        raise ValueError(
-            f"Unsupported {scale_name} shape {scale.shape} for weight shape {weight.shape}. "
-            "Expected one of: [E, out_dim], [E, 1, out_dim], [E, k_blocks, 1, out_dim], "
-            "or offline block format [E, out_blocks, k_blocks]."
+        final_scale_sharding = (
+            self._get_wo_scale_sharding(scale_gmm)
+            if scale_name == "wo_scale"
+            else P("expert", None, None, "tensor")
         )
+        return jax.sharding.reshard(scale_gmm, final_scale_sharding)
 
-    def quantize_weights(self, is_static: bool = False):
+    def quantize_weights(self, is_static: bool = False, *, abstract: bool = False):
         """Quantize MoE weights in-place or initialize params for static loading."""
         if self.quantized_dtype is None:
             return
@@ -319,8 +344,25 @@ class EPMoE(nnx.Module):
                 )
             return block_size_k
 
-        with jax.set_mesh(self.moe_mesh):
+        mesh_context = (
+            jax.sharding.use_abstract_mesh(self.moe_mesh.abstract_mesh)
+            if abstract
+            else jax.set_mesh(self.moe_mesh)
+        )
+        with mesh_context:
             if is_static:
+                if abstract or isinstance(self.wi_0.value, jax.ShapeDtypeStruct):
+                    # Prepare quantized placeholders for checkpoint and dummy
+                    # loading without replacing already loaded concrete weights.
+                    for name in ("wi_0", "wi_1", "wo"):
+                        param = getattr(self, name)
+                        param.value = jax.ShapeDtypeStruct(
+                            param.value.shape,
+                            self.quantized_dtype,
+                            sharding=jax.sharding.NamedSharding(
+                                self.moe_mesh, param.value.sharding.spec
+                            ),
+                        )
                 # Static checkpoints will load real scale tensors later, but the
                 # placeholders must already satisfy expert sharding shape rules.
                 num_experts = self.wi_0.value.shape[0]
@@ -340,40 +382,48 @@ class EPMoE(nnx.Module):
                 k_blocks_wi = (hidden_size // block_size_k) if block_size_k else 1
                 k_blocks_wo = (intermediate_dim // block_size_k) if block_size_k else 1
                 wi_scale_sharding = P("expert", None, None, "tensor")
-                wo_scale_sharding = P("expert", None, None, None)
+                wo_scale_sharding = self._get_wo_scale_sharding(is_block=(k_blocks_wo > 1))
+                is_abstract = isinstance(self.wi_0.value, jax.ShapeDtypeStruct)
+                scale_dtype = self.dtype if is_int4_dtype(self.quantized_dtype) else jnp.float32
+
+                def _make_param(shape, dtype, sharding_spec):
+                    if is_abstract:
+                        return nnx.Param(
+                            jax.ShapeDtypeStruct(
+                                shape,
+                                dtype=dtype,
+                                sharding=jax.sharding.NamedSharding(self.moe_mesh, sharding_spec),
+                            )
+                        )
+                    return nnx.Param(
+                        jnp.zeros(shape, dtype=dtype, out_sharding=sharding_spec),
+                        out_sharding=sharding_spec,
+                    )
 
                 if hasattr(self, "wi_0_scale"):
                     del self.wi_0_scale
-                self.wi_0_scale = nnx.Param(
-                    jnp.zeros(
-                        (num_experts, k_blocks_wi, 1, intermediate_dim),
-                        dtype=jnp.float32,
-                        out_sharding=wi_scale_sharding,
-                    ),
-                    out_sharding=wi_scale_sharding,
+                self.wi_0_scale = _make_param(
+                    (num_experts, k_blocks_wi, 1, intermediate_dim),
+                    scale_dtype,
+                    wi_scale_sharding,
                 )
 
                 if hasattr(self, "wi_1_scale"):
                     del self.wi_1_scale
-                self.wi_1_scale = nnx.Param(
-                    jnp.zeros(
-                        (num_experts, k_blocks_wi, 1, intermediate_dim),
-                        dtype=jnp.float32,
-                        out_sharding=wi_scale_sharding,
-                    ),
-                    out_sharding=wi_scale_sharding,
+                self.wi_1_scale = _make_param(
+                    (num_experts, k_blocks_wi, 1, intermediate_dim),
+                    scale_dtype,
+                    wi_scale_sharding,
                 )
 
                 if hasattr(self, "wo_scale"):
                     del self.wo_scale
-                self.wo_scale = nnx.Param(
-                    jnp.zeros(
-                        (num_experts, k_blocks_wo, 1, hidden_size),
-                        dtype=jnp.float32,
-                        out_sharding=wo_scale_sharding,
-                    ),
-                    out_sharding=wo_scale_sharding,
+                self.wo_scale = _make_param(
+                    (num_experts, k_blocks_wo, 1, hidden_size),
+                    scale_dtype,
+                    wo_scale_sharding,
                 )
+
                 return
 
             # Quantize weights along k-dim (axis=1 in [g, k, n] layout)
@@ -437,7 +487,7 @@ class EPMoE(nnx.Module):
                 del self.wo_scale
             self.wo_scale = nnx.Param(
                 wo_scale,
-                out_sharding=P("expert", None, None, None),
+                out_sharding=self._get_wo_scale_sharding(wo_scale),
             )
 
     @named_scope
@@ -471,7 +521,7 @@ class EPMoE(nnx.Module):
         # irrelevant inside the per-expert shard_map context.
         out_specs = P(
             *[
-                "tensor" if (s == "tensor" or (isinstance(s, tuple) and "tensor" in s)) else None
+                ("tensor" if (s == "tensor" or (isinstance(s, tuple) and "tensor" in s)) else None)
                 for s in out_sharding.spec
             ]
         )
@@ -514,7 +564,7 @@ class EPMoE(nnx.Module):
                     # scales [g, 1, 1, n]
                     P("expert", None, None, "tensor"),
                     P("expert", None, None, "tensor"),
-                    P("expert", None, None, None),
+                    self._get_wo_scale_sharding(wo_scale),
                     # biases [g, 1, n] (unused)
                     P("expert", None, "tensor"),
                     P("expert", None, "tensor"),
@@ -620,6 +670,25 @@ class EPMoE(nnx.Module):
 
         group_offset = self._dispatch(group_sizes, expert_shard_id)
 
+        local_range = None
+        valid_mask = None
+        # Trace-time gate: small (decode-sized) batches keep the exact XLA path so
+        # their HLO is identical to the flag-off build.
+        if self.use_sc_permute and should_use_sparse_core(
+            token_indices.shape[0], inputs_2d.shape[-1], self.dtype
+        ):
+            # Sorted-row range owned by this expert shard, and which routed slots
+            # (token-major order) landed on a local expert.
+            csum = jnp.cumsum(group_sizes)
+            start = jnp.where(group_offset == 0, 0, csum[jnp.maximum(group_offset - 1, 0)])
+            end = csum[group_offset + self.experts_per_device - 1]
+            if self.ep_size > 1:
+                local_range = (start.astype(jnp.int32), end.astype(jnp.int32))
+            flat_experts = jnp.ravel(topk_ids)
+            valid_mask = (flat_experts >= group_offset) & (
+                flat_experts < group_offset + self.experts_per_device
+            )
+
         intermediate_output = self._gmm_compute(
             inputs_2d,
             token_indices,
@@ -634,12 +703,14 @@ class EPMoE(nnx.Module):
             w0_kernel_bias,
             w1_kernel_bias,
             wo_kernel_bias,
+            local_range=local_range,
         )
 
         output = self._unpermute(
             intermediate_output,
             sorted_selected_experts,
             topk_weights,
+            valid_mask=valid_mask,
         )
 
         # Reduce on the "tensor" axis. RS (psum_scatter) when caller asked
@@ -670,6 +741,7 @@ class EPMoE(nnx.Module):
         w0_kernel_bias=None,
         w1_kernel_bias=None,
         wo_kernel_bias=None,
+        local_range=None,
     ):
         if token_indices.shape[0] == 0:
             return jnp.zeros((0, wo_kernel.shape[-1]), dtype=inputs_2d.dtype)
@@ -683,6 +755,10 @@ class EPMoE(nnx.Module):
             x = x_q[token_indices]
             x_scale = x_scale[token_indices]
             x = (x.astype(jnp.float32) * x_scale).astype(self.dtype)
+        elif local_range is not None:
+            # SparseCore ragged gather: only rows [start, end) (local experts) are
+            # materialized; gmm never reads the others thanks to group_offset.
+            x = sc_dispatch_gather(inputs_2d, token_indices, *local_range).astype(self.dtype)
         else:
             x = inputs_2d[token_indices].astype(self.dtype)
 
@@ -728,12 +804,15 @@ class EPMoE(nnx.Module):
 
         # === Activation ===
         if self.activation == "silu":
-            layer_act = jax.nn.silu(layer_w0)
+            intermediate_layer = jax.nn.silu(layer_w0) * layer_w1
         elif self.activation == "gelu":
-            layer_act = jax.nn.gelu(layer_w0)
+            intermediate_layer = jax.nn.gelu(layer_w0) * layer_w1
+        elif self.activation == "swigluoai":
+            gate = jnp.clip(layer_w0, max=self.swiglu_limit)
+            up = jnp.clip(layer_w1, -self.swiglu_limit, self.swiglu_limit)
+            intermediate_layer = (up + 1.0) * gate * jax.nn.sigmoid(gate * self.swiglu_alpha)
         else:
             raise ValueError(f"Unsupported activation function {self.activation}")
-        intermediate_layer = jnp.multiply(layer_act, layer_w1)
 
         # === GEMM2: intermediate @ wo ===
         return gmm(
@@ -803,7 +882,7 @@ class EPMoE(nnx.Module):
             group_sizes,
         )
 
-    def _unpermute(self, intermediate, sorted_selected_experts, weights):
+    def _unpermute(self, intermediate, sorted_selected_experts, weights, valid_mask=None):
         top_k = self.num_experts_per_tok
         if weights.ndim != 2 or weights.shape[1] != top_k:
             raise ValueError(
@@ -833,6 +912,17 @@ class EPMoE(nnx.Module):
             .at[sorted_selected_experts]
             .set(jnp.arange(expected_tokens, dtype=jnp.int32))
         )
+        if self.use_sc_permute and valid_mask is not None:
+            # SparseCore fused gather + top-k weighted reduce (falls back to XLA when
+            # SparseCore is absent or the problem is too small to benefit).
+            return sc_combine(
+                intermediate,
+                argsort_indices,
+                jnp.reshape(weights, (-1,)),
+                valid_mask,
+                self.num_experts_per_tok,
+            ).astype(self.dtype)
+
         weights_fp32 = weights.astype(jnp.float32)
 
         # Static token-count branch: small (decode) batches avoid the unrolled
@@ -883,6 +973,7 @@ def create_moe_weights_mapping(
     moe_path: str = "mlp",
     source_expert_pattern: str = "experts.{i}",
     physical_to_logical_map=None,  # np.ndarray shape (num_physical,) or None
+    weight_suffix: str = "weight",
 ) -> dict:
     """Generate a unified mapping dictionary for MoE layer expert weights."""
     if moe_backend == "epmoe":
@@ -910,7 +1001,7 @@ def create_moe_weights_mapping(
 
         # Source weight paths for logical experts only
         expert_keys = [
-            f"{prefix}.{moe_path}.{source_expert_pattern.format(i=i)}.{source_name}.weight"
+            f"{prefix}.{moe_path}.{source_expert_pattern.format(i=i)}.{source_name}.{weight_suffix}"
             for i in range(num_experts)
         ]
 
@@ -933,9 +1024,10 @@ def create_moe_weights_mapping(
 
         concat_axis = expert_concat_axis_map.get(source_name)
 
-        # Use __MOE_EXPERTS__ prefix to indicate aggregated MoE weight loading
-        mappings[f"__MOE_EXPERTS__{target_path_base}"] = WeightMapping(
-            target_path=[target_path_base] + expert_keys,
+        # Use  prefix to indicate aggregated MoE weight loading
+        mappings[f"{target_path_base}"] = WeightSpec(
+            target_path=target_path_base,
+            sources=tuple(expert_keys),
             sharding=sharding,
             transpose=transpose,
             concat_axis=concat_axis,

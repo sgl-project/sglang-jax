@@ -48,7 +48,37 @@ def build_index_share_map(
     return full_slot, src_slot, len(full_slot)
 
 
-@functools.partial(jax.jit, static_argnames=("k", "pages_per_seq", "one_token_per_seq"))
+def prefill_score_temp_bytes(num_full_layers: int, chunk_tokens: int, context_len: int) -> int:
+    """Estimated HLO temporaries for the jnp reference indexer scorer.
+
+    The reference scorer materializes one f32 ``[chunk_tokens, context_len]``
+    token-score buffer per full layer during sparse prefill, and XLA keeps
+    them alive together. Observed within ~2% of the RESOURCE_EXHAUSTED report
+    at 135k context (22 full layers x chunk 8192 -> ~98.5G).
+    """
+    return num_full_layers * chunk_tokens * context_len * 4
+
+
+def suggest_chunked_prefill_size(
+    num_full_layers: int, context_len: int, budget_bytes: int
+) -> int | None:
+    """Largest power-of-two ``chunked_prefill_size`` (capped at the context
+    length) whose reference-scorer temporaries fit ``budget_bytes``. Returns
+    ``None`` when even the smallest chunk (256) does not fit."""
+    chunk, best = 256, None
+    while (
+        chunk <= context_len
+        and prefill_score_temp_bytes(num_full_layers, chunk, context_len) <= budget_bytes
+    ):
+        best = chunk
+        chunk *= 2
+    return best
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("k", "pages_per_seq", "compression_ratio", "one_token_per_seq"),
+)
 def streamindex_topk_ref(
     q: jax.Array,
     weights: jax.Array,
@@ -61,6 +91,7 @@ def streamindex_topk_ref(
     *,
     k: int,
     pages_per_seq: int,
+    compression_ratio: int = 1,
     one_token_per_seq: bool = False,
 ) -> jax.Array:
     """Reference lightning-indexer top-k.
@@ -86,9 +117,18 @@ def streamindex_topk_ref(
       distribution: i32[3]      (decode_end, prefill_end, num_seqs)
       k:            top-k budget
       pages_per_seq: static, page_indices stride
+      compression_ratio: each entry in ``cache_kv`` covers ``ratio``
+        consecutive token positions, so entry ``e`` spans
+        ``[e*ratio, (e+1)*ratio - 1]`` and is visible to a query at token
+        position ``p`` only once its last token is at or before ``p``
+        (``e < (p + 1) // ratio``, the DeepSeek-V4 indexer rule). ``seq_lens``
+        stays in **uncompressed** tokens; a partially filled trailing group is
+        not an entry yet and is therefore invisible. ``ratio=1`` (the default)
+        reproduces the uncompressed behaviour exactly.
 
     Returns:
-      i32[T, k]  top-k kv positions per query token; -1 for padding.
+      i32[T, k]  top-k positions per query token, in **compressed** space when
+      ``compression_ratio > 1``; -1 for padding.
     """
     T, H, D = q.shape
     page_size = cache_kv.shape[1]
@@ -101,7 +141,9 @@ def streamindex_topk_ref(
     if one_token_per_seq:
 
         def body_decode(seq_id, out):
-            kv_len = seq_lens[seq_id]
+            # A decode query sits at its sequence's last token, so every
+            # complete entry is visible and the causal bound is just the count.
+            kv_len = seq_lens[seq_id] // compression_ratio
             seq_pages = jax.lax.dynamic_slice_in_dim(
                 page_indices, cu_kv_lens[seq_id] // page_size, pages_per_seq
             )
@@ -136,7 +178,14 @@ def streamindex_topk_ref(
         kv_pos = jnp.arange(max_kv)
         in_seq_q = (q_pos >= q_start) & (q_pos < q_end)
         abs_q = kv_len - (q_end - q_start) + (q_pos - q_start)
-        mask = in_seq_q[:, None] & (kv_pos[None, :] < kv_len) & (kv_pos[None, :] <= abs_q[:, None])
+        # kv_pos indexes entries while abs_q is a token position: fold the
+        # query's bound into compressed space rather than the other way round,
+        # so a partially filled trailing group is excluded on both counts.
+        kv_len_c = kv_len // compression_ratio
+        bound_c = (abs_q + 1) // compression_ratio - 1
+        mask = (
+            in_seq_q[:, None] & (kv_pos[None, :] < kv_len_c) & (kv_pos[None, :] <= bound_c[:, None])
+        )
 
         if T * H * max_kv <= 1 << 26:
             s = jnp.einsum("thd,kd->thk", q, keys, preferred_element_type=jnp.float32)

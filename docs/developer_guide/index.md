@@ -12,6 +12,7 @@ For model-specific onboarding, use the [cookbook overview](../cookbook_overview.
 | [Benchmark and Profiling](benchmark_and_profiling.md) | Benchmark commands and profiling workflow. |
 | [CI Architecture](ci_architecture.md) | Pull request and nightly CI structure. |
 | [JAX Tutorial](jax_tutorial.md) | JAX concepts for contributors. |
+| [Weight Loading](weight_loading.md) | Mapping declarations, grouped conversions, sharding, and load-only validation. |
 | [Release Process](release_process.md) | Release checklist. |
 | [TPU Resources Guide](tpu_resources_guide.md) | TPU access and usage notes. |
 | [How to Join Community](how_to_join_community.md) | Community channels and onboarding. |

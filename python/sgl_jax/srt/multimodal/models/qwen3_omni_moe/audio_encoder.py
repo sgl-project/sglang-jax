@@ -4,6 +4,8 @@ import jax
 from flax import nnx
 from jax import numpy as jnp
 from jax.lax import Precision
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeAudioEncoderConfig,
 )
@@ -24,6 +26,7 @@ class Qwen3OmniMoeAudioAttention(nnx.Module):
     ):
         super().__init__()
         self.embed_dim = config.d_model
+        self.mesh = mesh
         self.num_heads = config.encoder_attention_heads
         self.dropout = config.attention_dropout
         self.head_dim = self.embed_dim // self.num_heads
@@ -75,12 +78,22 @@ class Qwen3OmniMoeAudioAttention(nnx.Module):
     def __call__(
         self,
         hidden_states: jax.Array,
-    ) -> tuple[jax.Array, jax.Array | None, tuple[jax.Array] | None]:
+        attention_mask: jax.Array,
+    ) -> jax.Array:
         seq_length, _ = hidden_states.shape
 
-        query_states = self.q_proj(hidden_states)[0].reshape(1, seq_length, self.num_heads, -1)
-        key_states = self.k_proj(hidden_states)[0].reshape(1, seq_length, self.num_heads, -1)
-        value_states = self.v_proj(hidden_states)[0].reshape(1, seq_length, self.num_heads, -1)
+        # Attention spans the packed sequence, so gather tokens before Q/K/V
+        # reshaping; the output projection restores the data layout.
+        replicated = NamedSharding(self.mesh, P(None, None))
+        query_states = self.q_proj(hidden_states, out_sharding=replicated)[0].reshape(
+            1, seq_length, self.num_heads, self.head_dim
+        )
+        key_states = self.k_proj(hidden_states, out_sharding=replicated)[0].reshape(
+            1, seq_length, self.num_heads, self.head_dim
+        )
+        value_states = self.v_proj(hidden_states, out_sharding=replicated)[0].reshape(
+            1, seq_length, self.num_heads, self.head_dim
+        )
 
         attn_output = simple_attention(
             query_states,
@@ -88,6 +101,7 @@ class Qwen3OmniMoeAudioAttention(nnx.Module):
             value_states,
             scale=self.scaling,
             causal=False,
+            mask=attention_mask,
         )
 
         attn_output = attn_output.reshape(seq_length, -1)
@@ -133,10 +147,11 @@ class Qwen3OmniMoeAudioEncoderLayer(nnx.Module):
     def __call__(
         self,
         hidden_states: jax.Array,
+        attention_mask: jax.Array,
     ) -> jax.Array:
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
-        hidden_states = self.self_attn(hidden_states)
+        hidden_states = self.self_attn(hidden_states, attention_mask)
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
@@ -247,16 +262,15 @@ class Qwen3OmniMoeAudioEncoder(nnx.Module):
         chunk_list = jnp.split(
             input_features.T, split_indices.tolist(), axis=0
         )  # list of [chunk_len, mel_freq]
+        max_chunk_length = int(chunk_lengths.max())
         padded_feature = jnp.stack(
-            [jnp.pad(x, ((0, self.n_window * 2 - x.shape[0]), (0, 0))) for x in chunk_list]
+            [jnp.pad(x, ((0, max_chunk_length - x.shape[0]), (0, 0))) for x in chunk_list]
         ).swapaxes(
             1, 2
         )  # [b, f, t]
 
-        feature_lens_after_cnn = self._get_feat_extract_output_lengths(chunk_lengths)
-        padded_mask_after_cnn = (
-            jnp.arange(jnp.max(feature_lens_after_cnn))[None, :] < feature_lens_after_cnn[:, None]
-        )  # [b, t]
+        # Each chunk passes through three stride-2 convolutions independently.
+        feature_lens_after_cnn = (chunk_lengths + 7) // 8
         padded_feature = jnp.expand_dims(padded_feature, axis=3)  # [b, f, t, c]
         # Split to chunk to avoid OOM during convolution
         padded_embeds = []
@@ -275,30 +289,33 @@ class Qwen3OmniMoeAudioEncoder(nnx.Module):
         pos_embed_slice = self.positional_embedding(padded_embed.shape[1])
         positional_embedding = jnp.expand_dims(pos_embed_slice, axis=0).astype(padded_embed.dtype)
         padded_embed = padded_embed + positional_embedding
-        hidden_states = padded_embed[padded_mask_after_cnn]
+        padded_mask_after_cnn = jnp.arange(t)[None, :] < feature_lens_after_cnn[:, None]
+        hidden_states = padded_embed.at[padded_mask_after_cnn].get(
+            out_sharding=NamedSharding(self.mesh, P(None, None))
+        )
+
+        # Packed samples and inference windows must not attend to one another.
+        sample_lengths = jnp.split(feature_lens_after_cnn, jnp.cumsum(chunk_num)[:-1].tolist())
+        window_size = t * (self.n_window_infer // (self.n_window * 2))
+        attention_mask = jnp.zeros((hidden_states.shape[0], hidden_states.shape[0]), dtype=bool)
+        offset = 0
+        for lengths in sample_lengths:
+            sample_length = int(lengths.sum())
+            for start in range(0, sample_length, window_size):
+                end = offset + min(start + window_size, sample_length)
+                attention_mask = attention_mask.at[offset + start : end, offset + start : end].set(
+                    True
+                )
+            offset += sample_length
 
         for encoder_layer in self.layers:
-            layer_outputs = encoder_layer(
-                hidden_states,
-            )
-
-            hidden_states = layer_outputs
+            hidden_states = encoder_layer(hidden_states, attention_mask)
 
         hidden_states = self.ln_post(hidden_states)
         hidden_states, _ = self.proj1(hidden_states)
         hidden_states = self.act(hidden_states, approximate=False)
         hidden_states, _ = self.proj2(hidden_states)
         return hidden_states
-
-    @staticmethod
-    def _get_feat_extract_output_lengths(input_lengths):
-        """
-        Computes the output length of the convolutional layers and the output length of the audio encoder
-        """
-        input_lengths_leave = input_lengths % 100
-        feat_lengths = (input_lengths_leave - 1) // 2 + 1
-        output_lengths = ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
-        return output_lengths
 
 
 class SinusoidsPositionEmbedding(nnx.Module):

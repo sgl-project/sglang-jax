@@ -5,9 +5,11 @@ import pytest
 
 from sgl_jax.srt.kernels.dsa.ref import (
     build_index_share_map,
+    prefill_score_temp_bytes,
     sparse_mla_ref,
     streamindex_page_topk_ref,
     streamindex_topk_ref,
+    suggest_chunked_prefill_size,
 )
 
 jax.config.update("jax_platform_name", "cpu")
@@ -92,6 +94,57 @@ def test_streamindex_topk_matches_numpy():
         recall = len(got_t & want) / max(len(want), 1)
         assert recall >= 0.9, f"t={t}: recall {recall:.2%} got {got_t} want {want}"
         assert (got[t] == -1).sum() == max(0, k - n_valid)
+
+
+def test_streamindex_topk_ref_compressed_visibility_is_completed_groups():
+    """With ``compression_ratio > 1`` an entry covers ``ratio`` consecutive token
+    positions and is visible only once its LAST token is at or before the query,
+    i.e. entries ``[0, (p + 1) // ratio)``. Giving ``k`` more room than there are
+    entries makes the returned set exactly that range, so the rule is pinned
+    without an oracle. The ratio reaches the scores only through this mask, so
+    this is the whole of what the parameter does. Two sequences over a shuffled
+    page table keep the per-sequence page walk honest.
+    """
+    rng = np.random.default_rng(0)
+    ratio, page_size, pages_per_seq = 4, 8, 2
+    # k has to stay under the reduction width (pages_per_seq * page_size = 16)
+    # while still exceeding the 5 entries any query can see.
+    H, D, k = 2, 8, 12
+    seq_lens = np.array([22, 12], np.int32)  # uncompressed tokens: 5 and 3 entries
+    q_lens = [6, 4]  # prefill chunks ending at token 21 and token 11
+    T = sum(q_lens)
+
+    cache = rng.normal(size=(6, page_size, D)).astype(np.float32)
+    page_idx = np.array([4, 1, 5, 0], np.int32)
+    q = rng.normal(size=(T, H, D)).astype(np.float32)
+    weights = rng.normal(size=(T, H)).astype(np.float32)
+    cu_q = np.array([0, q_lens[0], T], np.int32)
+    stride = pages_per_seq * page_size
+    cu_kv = np.array([0, stride, 2 * stride], np.int32)
+
+    got = np.asarray(
+        streamindex_topk_ref(
+            jnp.array(q),
+            jnp.array(weights),
+            jnp.array(cache),
+            jnp.array(seq_lens),
+            jnp.array(page_idx),
+            jnp.array(cu_q),
+            jnp.array(cu_kv),
+            jnp.array([0, 2, 2], np.int32),
+            k=k,
+            pages_per_seq=pages_per_seq,
+            compression_ratio=ratio,
+        )
+    )
+
+    for seq, n_q in enumerate(q_lens):
+        for i in range(n_q):
+            row = int(cu_q[seq]) + i
+            pos = int(seq_lens[seq]) - n_q + i
+            want = set(range((pos + 1) // ratio))
+            live = {e for e in got[row].tolist() if e >= 0}
+            assert live == want, f"seq {seq} pos {pos}: got {sorted(live)} want {sorted(want)}"
 
 
 def test_sparse_mla_full_topk_equals_dense():
@@ -432,3 +485,25 @@ def test_page_topk_decode_fast_path_matches_general():
         )
         np.testing.assert_array_equal(general, fast)
         assert (fast[2] == -1).all()  # padding seq selects nothing
+
+
+class TestPrefillScoreTempBytes:
+    def test_matches_observed_135k_oom(self):
+        # RESULTS baseline: 22 full layers, chunk 8192, ctx 135168 reported
+        # ~98.5G HLO temporaries; the formula must land within 2%.
+        est = prefill_score_temp_bytes(22, 8192, 135168)
+        assert est == 22 * 8192 * 135168 * 4
+        assert abs(est - 98.54e9) / 98.54e9 < 0.02
+
+    def test_suggest_chunk_picks_largest_fitting_power_of_two(self):
+        # Same 135k case with a 0.8 * 94.75G budget: 8192 overflows (97.4G),
+        # 4096 fits (48.7G) -> suggest 4096.
+        budget = int(0.8 * 94.75e9)
+        assert suggest_chunked_prefill_size(22, 135168, budget) == 4096
+
+    def test_suggest_chunk_none_when_nothing_fits(self):
+        assert suggest_chunked_prefill_size(22, 135168, 1) is None
+
+    def test_suggest_chunk_unbounded_budget_stops_at_context(self):
+        # Never suggest a chunk larger than the context itself.
+        assert suggest_chunked_prefill_size(22, 4096, 10**18) == 4096

@@ -56,8 +56,19 @@ def test_weight_mapping_covers_safetensors(layer_idx: int):
 
     model = SimpleNamespace(
         mtp_layer_idx=layer_idx,
+        mesh=None,
+        model=SimpleNamespace(
+            mtp_block=SimpleNamespace(
+                self_attn=SimpleNamespace(
+                    head_dim=192, v_head_dim=128, q_head_num=128, k_head_num=8
+                )
+            )
+        ),
         loader=SimpleNamespace(
             is_static_quant=True,
+            model_config=SimpleNamespace(
+                quantization_config=SimpleNamespace(weight_block_size=(128, 128))
+            ),
             is_quant_ignored=lambda k: False,
             has_weight_on_disk=lambda k: k.endswith("qkv_proj.weight"),
         ),
@@ -65,7 +76,7 @@ def test_weight_mapping_covers_safetensors(layer_idx: int):
     mappings = MiMoV2MTPForCausalLM._create_weight_mappings(model)
 
     expected = _hf_keys(layer_idx)
-    got = set(mappings.keys())
+    got = {source for key, spec in mappings.items() for source in (spec.sources or (key,))}
     assert (
         got == expected
     ), f"layer {layer_idx}: missing={sorted(expected - got)} extra={sorted(got - expected)}"
@@ -88,8 +99,19 @@ def test_weight_mapping_supports_separate_fp8_qkv(layer_idx: int):
 
     model = SimpleNamespace(
         mtp_layer_idx=layer_idx,
+        mesh=None,
+        model=SimpleNamespace(
+            mtp_block=SimpleNamespace(
+                self_attn=SimpleNamespace(
+                    head_dim=192, v_head_dim=128, q_head_num=128, k_head_num=8
+                )
+            )
+        ),
         loader=SimpleNamespace(
             is_static_quant=True,
+            model_config=SimpleNamespace(
+                quantization_config=SimpleNamespace(weight_block_size=(128, 128))
+            ),
             is_quant_ignored=lambda k: False,
             has_weight_on_disk=lambda k: False,
         ),

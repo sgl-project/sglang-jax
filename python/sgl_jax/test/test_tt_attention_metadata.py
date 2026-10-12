@@ -7,6 +7,7 @@ import numpy as np
 from jax.sharding import Mesh
 
 from sgl_jax.srt.hardware_backend.tt.attention.tt_backend import TTAttention
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
 
 class TTAttentionMetadataTest(unittest.TestCase):
@@ -190,6 +191,21 @@ class TTAttentionMetadataTest(unittest.TestCase):
 
         np.testing.assert_array_equal(np.asarray(metadata.page_table)[:, 0], [1, 2, 0, 0])
         np.testing.assert_array_equal(np.asarray(metadata.positions), [31, 63, -1, -1])
+
+    def test_verify_metadata_repeats_request_rows_per_token(self):
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            seq_lens=np.array([30, 0, 65], np.int32),
+            logits_indices_selector=np.array([0, 2], np.int32),
+            spec_info_padded=SimpleNamespace(draft_token_num=4, custom_mask=None),
+        )
+        pages = np.pad(np.array([5, 2, 9, 7, 11], np.int32), (0, 11))
+        metadata = self.backend.get_eagle_forward_metadata(batch, page_indices=pages)
+        expected = np.zeros((12, 16), np.int32)
+        expected[:4, :2] = [5, 2]
+        expected[8:, :3] = [9, 7, 11]
+        np.testing.assert_array_equal(metadata.page_table, expected)
+        np.testing.assert_array_equal(metadata.positions, [33] * 4 + [-1] * 4 + [68] * 4)
 
     def test_scheduler_chunk_accepts_noncontiguous_physical_pages(self):
         batch = self._batch(prefix_tokens=256, chunk_tokens=256)

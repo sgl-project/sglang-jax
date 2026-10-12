@@ -192,6 +192,7 @@ Test files are located in the folder ```test/srt/*``` and start with prefix ```t
 | --- | --- | --- |
 | Qwen-7B (TP only)<br>Qwen3-8B (TP only)<br>Qwen3-30B-A3B (enable TP and EP)<br>gemma2<br>bailing_moe(enable TP and EP) | • mmlu<br>• mmlu-pro<br>• aime-24/25<br>• gsm8k | 2% |
 | deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B | • mmlu<br>• mmlu-pro<br>• aime-24/25<br>• gsm8k<br>• math | 2% |
+| Qwen3-VL-2B-Instruct (TP4) | MMBench_DEV_EN_V11 CircularEval: 200 questions daily; full dev weekly | Daily: 75% ±5 pp (70–80%); weekly: 77% ±3 pp (74–80%) |
 
 ### Performance Test (1x TPU, 4x TPUs)
 #### PR Test Workflow

@@ -7,13 +7,13 @@ import math
 from typing import Literal
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jax.typing import ArrayLike
-from numba import njit, types
 
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
+from sgl_jax.srt.multimodal.in_model.interface import VisionInputSpec
+from sgl_jax.srt.utils.common_utils import resolve_vision_patch_buckets
 from sgl_jax.srt.utils.jax_utils import canonicalize_sharding
 
 
@@ -24,7 +24,9 @@ def get_grid_thw(item: MultimodalDataItem) -> tuple[int, int, int]:
     return tuple(int(entry) for entry in np.asarray(value).reshape(3))
 
 
-def _validate_vision_items(items: list[MultimodalDataItem], merge_unit: int) -> None:
+def _validate_vision_items(
+    items: list[MultimodalDataItem], merge_unit: int, output_lengths: np.ndarray | None = None
+) -> None:
     for item_index, item in enumerate(items):
         feature = item.feature
         # When the Processor creates an Item, if the feature is None, it should not create the Item.
@@ -33,18 +35,33 @@ def _validate_vision_items(items: list[MultimodalDataItem], merge_unit: int) -> 
 
         feature_patches = int(feature.shape[0])
         grid_patches = math.prod(get_grid_thw(item))
-        placeholder_patches = (
-            sum(end - start for start, end in item.placeholder_ranges or ()) * merge_unit
+        placeholder_tokens = sum(end - start for start, end in item.placeholder_ranges or ())
+        output_length = (
+            feature_patches // merge_unit
+            if output_lengths is None
+            else int(output_lengths[item_index])
         )
-        if not feature_patches == grid_patches == placeholder_patches:
+
+        if feature_patches != grid_patches or feature_patches % merge_unit:
             raise ValueError(
                 f"Vision item {item_index} patch counts must match: "
-                f"feature rows={feature_patches}, grid_thw product={grid_patches}, "
-                f"placeholder tokens * merge_unit={placeholder_patches}."
+                f"feature rows={feature_patches}, grid_thw product={grid_patches}."
+            )
+        if placeholder_tokens != output_length:
+            raise ValueError(
+                f"Vision item {item_index} placeholder tokens={placeholder_tokens} do not "
+                f"match the encoder output length={output_length} declared by the model."
+            )
+        if not 0 < output_length <= feature_patches // merge_unit:
+            raise ValueError(
+                f"Vision item {item_index} output length={output_length} must be in "
+                f"[1, {feature_patches // merge_unit}]."
             )
 
 
-def encoder_num_lanes(mesh: Mesh, tensor_parallel: bool) -> int:
+def encoder_num_lanes(mesh: Mesh | None, tensor_parallel: bool) -> int:
+    if mesh is None:
+        return 1
     data_size = int(mesh.shape.get("data", 1))
     tensor_size = int(mesh.shape.get("tensor", 1))
     return data_size * (1 if tensor_parallel else tensor_size)
@@ -83,79 +100,62 @@ def balance_lanes(item_lengths: list[int] | tuple[int, ...], num_lanes: int) -> 
     return lanes
 
 
-def _bucket_capacity(length: int, buckets: tuple[int, ...], unit: int) -> int:
-    """Smallest ``unit``-aligned bucket that fits ``length`` (power-of-two fallback)."""
-    return next(
-        (bucket for bucket in buckets if bucket >= length and bucket % unit == 0),
-        1 << (length - 1).bit_length(),
-    )
-
-
-# Sizes are runtime values; compile once at import, before serving requests.
-@njit(
-    types.int32[::1](
-        types.Array(types.int32, 1, "C", readonly=True),
-        types.Array(types.int32, 1, "C", readonly=True),
-        types.int32,
-        types.int32,
-    ),
-    nogil=True,
-    cache=True,
-)
-def _build_output_indices(lengths, output_starts, output_size, merge_unit):
-    output_indices = np.full(output_size, -1, dtype=np.int32)
-    cursor = 0
-    for item_index in range(lengths.size):
-        output_len = lengths[item_index] // merge_unit
-        source_start = output_starts[item_index]
-        for index in range(output_len):
-            output_indices[cursor + index] = source_start + index
-        cursor += output_len
-    return output_indices
+def _bucket_capacity(length: int, unit: int) -> int:
+    """Round the number of merge units up to a power of two."""
+    if length < 0 or unit <= 0:
+        raise ValueError("patch count must be nonnegative and merge unit positive")
+    units = max(1, (length + unit - 1) // unit)
+    return (1 << (units - 1).bit_length()) * unit
 
 
 def pack_lanes(
-    items: list[MultimodalDataItem],
-    num_lanes: int,
+    items_per_lane: list[list[MultimodalDataItem]],
     *,
-    buckets: tuple[int, ...],
     merge_unit: int,
+    output_lengths: np.ndarray | None = None,
     input_sharding: NamedSharding,
     dtype: np.dtype | type | None = None,
-) -> tuple[jax.Array, jax.Array, list[list[int]]]:
+) -> tuple[jax.Array, int, list[list[int]]]:
 
-    with jax.profiler.TraceAnnotation("encoder_pack_lane_plan"):
+    num_lanes = len(items_per_lane)
+    items = [item for lane in items_per_lane for item in lane]
+    lanes = []
+    offset = 0
+    for lane in items_per_lane:
+        lanes.append(list(range(offset, offset + len(lane))))
+        offset += len(lane)
+    with jax.profiler.TraceAnnotation("encoder_pack_layout"):
         if not items:
             raise ValueError("cannot pack an empty multimodal batch")
         item_features = [np.asarray(item.feature) for item in items]
         lengths = np.asarray([feature.shape[0] for feature in item_features], dtype=np.int32)
-        lanes = balance_lanes(lengths.tolist(), num_lanes)
+        output_lengths = (
+            lengths // merge_unit
+            if output_lengths is None
+            else np.ascontiguousarray(output_lengths, dtype=np.int32)
+        )
+        if output_lengths.shape != lengths.shape or np.any(
+            (output_lengths <= 0) | (output_lengths > lengths // merge_unit)
+        ):
+            raise ValueError("Each item must declare 1..patch_count/merge_unit output tokens")
         lane_loads = [sum(int(lengths[index]) for index in lane) for lane in lanes]
-        cap = _bucket_capacity(max(lane_loads), buckets, merge_unit)
+        cap = _bucket_capacity(max(lane_loads), merge_unit)
         feature_shape = item_features[0].shape[1:]
         if dtype is None:
             dtype = np.result_type(*(feature.dtype for feature in item_features))
 
     with jax.profiler.TraceAnnotation("encoder_pack_allocate"):
-        features = np.empty((num_lanes, cap, *feature_shape), dtype=dtype)
-        output_cap = cap // merge_unit
-        output_starts = np.empty(len(items), dtype=np.int32)
+        # Keep padding finite: attention may multiply masked values by zero.
+        features = np.zeros((num_lanes, cap, *feature_shape), dtype=dtype)
 
     with jax.profiler.TraceAnnotation("encoder_pack_copy"):
         for lane_index, lane in enumerate(lanes):
-            input_offset = output_offset = 0
+            input_offset = 0
             for item_index in lane:
                 feature = item_features[item_index]
                 end = input_offset + feature.shape[0]
                 features[lane_index, input_offset:end] = feature
-                output_starts[item_index] = lane_index * output_cap + output_offset
                 input_offset = end
-                output_offset += feature.shape[0] // merge_unit
-
-    with jax.profiler.TraceAnnotation("encoder_pack_output_indices"):
-        output_indices = _build_output_indices(
-            lengths, output_starts, num_lanes * output_cap, merge_unit
-        )
 
     shard_shape = input_sharding.shard_shape(features.shape)
     if shard_shape[1:] != features.shape[1:]:
@@ -163,31 +163,28 @@ def pack_lanes(
     flat_sharding = canonicalize_sharding(
         input_sharding.update(spec=PartitionSpec(*input_sharding.spec[:1]))
     )
-    indices_sharding = canonicalize_sharding(NamedSharding(input_sharding.mesh, PartitionSpec()))
 
     with jax.profiler.TraceAnnotation("encoder_pack_device_put"):
-        features, output_indices = jax.device_put(
-            (features.reshape(-1), output_indices), (flat_sharding, indices_sharding)
-        )
-    return features, output_indices, lanes
+        features = jax.device_put(features.reshape(-1), flat_sharding)
+    return features, cap, lanes
 
 
 def pack_vision_inputs(
-    items: list[MultimodalDataItem],
+    items_per_lane: list[list[MultimodalDataItem]],
     *,
-    num_lanes: int,
-    buckets: tuple[int, ...],
     merge_unit: int,
+    output_lengths: np.ndarray | None = None,
     input_sharding: NamedSharding,
     dtype: np.dtype | type | None = None,
-) -> tuple[jax.Array, jax.Array, np.ndarray]:
+) -> tuple[jax.Array, int, np.ndarray]:
+    num_lanes = len(items_per_lane)
+    items = [item for lane in items_per_lane for item in lane]
     with jax.profiler.TraceAnnotation("encoder_pack_validate"):
-        _validate_vision_items(items, merge_unit)
-    features, output_indices, lanes = pack_lanes(
-        items,
-        num_lanes,
-        buckets=buckets,
+        _validate_vision_items(items, merge_unit, output_lengths)
+    features, capacity, lanes = pack_lanes(
+        items_per_lane,
         merge_unit=merge_unit,
+        output_lengths=output_lengths,
         input_sharding=input_sharding,
         dtype=dtype,
     )
@@ -199,19 +196,19 @@ def pack_vision_inputs(
         for lane_index, lane in enumerate(lanes):
             for item_offset, item_index in enumerate(lane):
                 grid_thw[lane_index, item_offset] = get_grid_thw(items[item_index])
-    return features, output_indices, grid_thw
+    return features, capacity, grid_thw
 
 
 def pack_2d_position_inputs(
-    items: list[MultimodalDataItem],
+    items_per_lane: list[list[MultimodalDataItem]],
     *,
-    num_lanes: int,
-    buckets: tuple[int, ...],
     merge_unit: int,
     input_sharding: NamedSharding,
     dtype: np.dtype | type | None = None,
-) -> tuple[jax.Array, jax.Array, np.ndarray, np.ndarray]:
+) -> tuple[jax.Array, int, np.ndarray, np.ndarray]:
     """Pack vision inputs that carry explicit per-patch 2D positions."""
+    num_lanes = len(items_per_lane)
+    items = [item for lane in items_per_lane for item in lane]
     item_positions = []
     for item_index, item in enumerate(items):
         positions_value = item.get("pixel_position_ids")
@@ -241,15 +238,12 @@ def pack_2d_position_inputs(
             raise ValueError(f"Vision item {item_index} pixel_position_ids must be non-negative.")
         item_positions.append(positions)
 
-    features, output_indices, lanes = pack_lanes(
-        items,
-        num_lanes,
-        buckets=buckets,
+    features, capacity, lanes = pack_lanes(
+        items_per_lane,
         merge_unit=merge_unit,
         input_sharding=input_sharding,
         dtype=dtype,
     )
-    capacity = output_indices.size * merge_unit // num_lanes
     position_ids = np.full(
         (num_lanes, capacity, 2),
         -1,
@@ -268,93 +262,78 @@ def pack_2d_position_inputs(
             position_ids[lane_index, offset:end] = positions
             patch_counts[lane_index, item_offset] = item_length
             offset = end
-    return features, output_indices, position_ids, patch_counts
-
-
-def _restore_input_order(
-    output: jax.Array,
-    output_indices: jax.Array,
-    *,
-    out_sharding: NamedSharding,
-) -> jax.Array:
-    output = output.reshape(-1, output.shape[-1])
-    mask = output_indices >= 0
-    indices = jnp.maximum(output_indices, 0)
-    output = output.at[indices].get(out_sharding=out_sharding)
-    return jnp.where(mask[:, None], output, jnp.zeros((), output.dtype))
-
-
-_restore_input_order_jit = jax.jit(_restore_input_order, static_argnames=("out_sharding",))
-
-
-def restore_encoder_output(
-    output: jax.Array,
-    output_indices: jax.Array,
-    output_sharding: NamedSharding,
-) -> jax.Array:
-    """Restore lane-packed output to item order.
-
-    Args:
-        output: Encoder output shaped ``[num_lanes * output_capacity, hidden_size]``.
-        output_indices: Gather indices shaped ``[num_lanes * output_capacity]``;
-            negative entries denote padding rows.
-        output_sharding: Sharding for the restored output.
-
-    Returns:
-        An array shaped ``[num_lanes * output_capacity, hidden_size]`` in item
-        order with ``output_sharding`` and padding rows zeroed.
-    """
-    output_sharding = canonicalize_sharding(output_sharding)
-    return _restore_input_order_jit(
-        output,
-        output_indices,
-        out_sharding=output_sharding,
-    )
+    return features, capacity, position_ids, patch_counts
 
 
 def run_mrope_vision_model(
     vision_model,
-    items: list[MultimodalDataItem],
+    items_per_lane: list[list[MultimodalDataItem]],
     *,
     mesh: Mesh,
     num_lanes: int,
-    buckets: tuple[int, ...],
     merge_unit: int,
     rope_type: Literal["rope_3d", "rope_2d", "rope_2d_packed"],
     input_sharding: NamedSharding,
     output_sharding: NamedSharding,
+    pool_temporal_dimension: bool = False,
 ) -> jax.Array:
-    """Prepare sharded patches and metadata, run the model, and restore order.
+    """Pack vision items into lanes and return the native lane-packed output.
 
-    The model's ``prepare_metadata`` method receives host grids or positions/counts
-    plus ``capacity`` and ``sharding`` and returns a dict of model-specific device arrays.
-    Patches are flat; metadata arrays retain their field shapes. Both use
-    contiguous lane slices following ``input_sharding``.
-    The restored encoder output uses ``output_sharding``.
-    Patches retain their input dtype; the model casts them inside its encode JIT.
+    Items are already assigned to lanes by the caller. Each lane is padded to
+    the same bucketed patch capacity. ``rope_3d`` and ``rope_2d`` use per-item
+    THW grids; ``rope_2d_packed`` uses explicit per-patch 2D positions and
+    per-item patch counts. The encoder converts these inputs into its metadata
+    before running on the packed patches under ``mesh``.
+
+    Args:
+        vision_model: Callable encoder exposing ``prepare_metadata``.
+        items_per_lane: Vision items grouped by lane, including empty lanes.
+        mesh: Device mesh used for encoder execution.
+        num_lanes: Expected number of lanes in ``items_per_lane``.
+        merge_unit: Number of input patches per output token.
+        rope_type: Selects the positional metadata format for the encoder.
+        input_sharding: Input layout, sharded only along the lane dimension.
+        output_sharding: Required output layout; applied without reordering rows.
+        pool_temporal_dimension: Pool away t when computing per-item output lengths.
+
+    Returns:
+        Embeddings shaped ``[num_lanes * capacity // merge_unit, hidden_size]``,
+        where ``capacity`` is the selected patch capacity per lane. Each lane
+        retains its trailing padding; consumers address items by lane offsets.
     """
+
+    if len(items_per_lane) != num_lanes:
+        raise ValueError("item lane count does not match the encoder topology")
+    if pool_temporal_dimension and rope_type == "rope_2d_packed":
+        raise ValueError("Temporal pooling requires grid_thw metadata")
     if rope_type == "rope_2d_packed":
-        patches, output_indices, position_ids, patch_counts = pack_2d_position_inputs(
-            items,
-            num_lanes=num_lanes,
-            buckets=buckets,
+        patches, capacity, position_ids, patch_counts = pack_2d_position_inputs(
+            items_per_lane,
             merge_unit=merge_unit,
             input_sharding=input_sharding,
         )
         metadata_args = (position_ids, patch_counts)
     elif rope_type in ("rope_3d", "rope_2d"):
-        patches, output_indices, grid_thw = pack_vision_inputs(
-            items,
-            num_lanes=num_lanes,
-            buckets=buckets,
+        output_lengths = None
+        if pool_temporal_dimension:
+            output_lengths = np.asarray(
+                [
+                    math.prod(get_grid_thw(item)[1:]) // merge_unit
+                    for lane in items_per_lane
+                    for item in lane
+                ],
+                dtype=np.int32,
+            )
+        patches, capacity, grid_thw = pack_vision_inputs(
+            items_per_lane,
             merge_unit=merge_unit,
+            output_lengths=output_lengths,
             input_sharding=input_sharding,
         )
         metadata_args = (grid_thw,)
     else:
         raise ValueError(f"Unsupported vision RoPE type: {rope_type}")
 
-    capacity = output_indices.size * merge_unit // num_lanes
     with jax.profiler.TraceAnnotation("encoder_build_vision_metadata"):
         metadata = vision_model.prepare_metadata(
             *metadata_args, capacity=capacity, sharding=input_sharding
@@ -362,46 +341,38 @@ def run_mrope_vision_model(
     with jax.set_mesh(mesh):
         with jax.profiler.TraceAnnotation("encoder_vision_dispatch"):
             output = vision_model(patches, **metadata)
-        return restore_encoder_output(output, output_indices, output_sharding)
+        return jax.sharding.reshard(
+            output.reshape(-1, output.shape[-1]), canonicalize_sharding(output_sharding)
+        )
 
 
-def precompile_mrope_vision_model(
-    vision_model,
+def mrope_vision_dummy_inputs(
+    spec: VisionInputSpec,
+    patch_paddings=None,
     *,
-    mesh: Mesh,
-    num_lanes: int,
-    buckets: tuple[int, ...],
-    patch_dim: int,
-    merge_unit: int,
-    rope_type: Literal["rope_3d", "rope_2d", "rope_2d_packed"],
-    input_sharding: NamedSharding,
-    output_sharding: NamedSharding,
-) -> None:
-    merge_size = math.isqrt(merge_unit)
-    for capacity in buckets:
-        model_specific_data = {}
-        if rope_type == "rope_2d_packed":
-            y, x = np.indices((merge_size, capacity // merge_size))
-            model_specific_data["pixel_position_ids"] = np.stack((x, y), axis=-1).reshape(-1, 2)
-        else:
-            model_specific_data["image_grid_thw"] = np.asarray(
-                (1, merge_size, capacity // merge_size), dtype=np.int32
-            )
+    num_lanes: int = 1,
+    modality: Modality = Modality.IMAGE,
+):
+    """Yield one fake image per vision bucket; image/video share this encoder."""
+    merge_size = spec.spatial_merge_size
+    merge_unit = merge_size**2
+    capacities = sorted(
+        {
+            _bucket_capacity(patches, merge_unit)
+            for patches in resolve_vision_patch_buckets(patch_paddings)
+        }
+    )
+    for capacity in capacities:
+        y, x = np.indices((merge_size, capacity // merge_size), dtype=np.int32)
         item = MultimodalDataItem(
-            modality=Modality.IMAGE,
-            feature=np.zeros((capacity, patch_dim), dtype=np.float32),
+            modality=modality,
+            feature=np.zeros((capacity, spec.patch_dim), dtype=spec.dtype),
             placeholder_ranges=[(0, capacity // merge_unit)],
-            model_specific_data=model_specific_data,
+            model_specific_data={
+                "pixel_position_ids": np.stack((x, y), axis=-1).reshape(-1, 2),
+                ("video_grid_thw" if modality == Modality.VIDEO else "image_grid_thw"): np.asarray(
+                    (1, merge_size, capacity // merge_size), dtype=np.int32
+                ),
+            },
         )
-        output = run_mrope_vision_model(
-            vision_model,
-            [item],
-            mesh=mesh,
-            num_lanes=num_lanes,
-            buckets=buckets,
-            merge_unit=merge_unit,
-            rope_type=rope_type,
-            input_sharding=input_sharding,
-            output_sharding=output_sharding,
-        )
-        jax.block_until_ready(output)
+        yield modality, [[item]] + [[] for _ in range(num_lanes - 1)]

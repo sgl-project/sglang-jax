@@ -8,7 +8,10 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
 from sgl_jax.srt.kernels.fused_moe.v1.kernel import FusedMoEBlockConfig, fused_ep_moe
-from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
+from sgl_jax.srt.utils.quantization.quantization_utils import (
+    is_int4_dtype,
+    quantize_tensor,
+)
 
 
 def _expand_moe_block_scale(scale_3d: jax.Array, n_out: int, block_n: int) -> jax.Array:
@@ -208,10 +211,12 @@ class FusedEPMoE(nnx.Module):
             self.quant_block_k = None
             self.quant_block_n = None
 
-    def quantize_weights(self, is_static: bool = False):
+    def quantize_weights(self, is_static: bool = False, *, abstract: bool = False):
         """Quantize MoE weights in-place. Call once after model loading."""
         if self.quantized_dtype is None:
             return
+        if is_static and is_int4_dtype(self.quantized_dtype):
+            raise ValueError("Static INT4 checkpoints require moe_backend='epmoe'.")
 
         # Determine quant_block_k. The v1 kernel requires a block size when
         # scales are provided, so per-channel fp8 must tile to block-256; the v2
@@ -225,8 +230,22 @@ class FusedEPMoE(nnx.Module):
             del self.quant_block_k
         self.quant_block_k = wsz
 
-        with jax.set_mesh(self.mesh):
+        mesh_context = (
+            jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh)
+            if abstract
+            else jax.set_mesh(self.mesh)
+        )
+        with mesh_context:
             if is_static:
+                names = ["w1", "w3", "w2"]
+                if self.num_shared_experts > 0:
+                    names += ["w1_shared", "w3_shared", "w2_shared"]
+                for name in names:
+                    param = getattr(self, name)
+                    if isinstance(param.value, jax.ShapeDtypeStruct):
+                        param.value = jax.ShapeDtypeStruct(
+                            param.value.shape, self.quantized_dtype, sharding=param.value.sharding
+                        )
                 ep_scale_sharding = P(("data", "tensor"), None, None, None)
 
                 if wsz is None:

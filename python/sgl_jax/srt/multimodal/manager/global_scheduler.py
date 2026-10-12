@@ -18,6 +18,7 @@ from sgl_jax.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqOutput,
 )
+from sgl_jax.srt.managers.mm_utils import unwrap_shm_features
 from sgl_jax.srt.multimodal.common.modality_enum import (
     MultimodalDataItem,
     pad_input_tokens,
@@ -415,7 +416,7 @@ class GlobalScheduler:
                 recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
             except zmq.ZMQError:
                 break
-            recv_reqs.append(recv_req)
+            recv_reqs.append(unwrap_shm_features(recv_req))
         return recv_reqs
 
     def event_loop(self):

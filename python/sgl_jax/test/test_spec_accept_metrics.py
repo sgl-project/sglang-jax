@@ -149,7 +149,10 @@ class TestSpecAcceptCounters(unittest.TestCase):
 class TestGetInternalStateExposesAcceptLength(unittest.TestCase):
     def _make_scheduler(self):
         scheduler = Scheduler.__new__(Scheduler)
-        scheduler.server_args = types.SimpleNamespace(enable_metrics=False)
+        scheduler.server_args = types.SimpleNamespace(
+            enable_metrics=False, disaggregation_mode="null"
+        )
+        scheduler.enable_overlap = False
         SchedulerMetricsMixin.init_metrics(scheduler)
         scheduler.token_to_kv_pool_allocator = _Allocator()
         scheduler.max_total_num_tokens = 1024

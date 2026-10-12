@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+from sgl_jax.srt.model_loader.weights import WeightSpec
 from sgl_jax.srt.multimodal.configs.vaes.flux_vae_config import FluxVAEConfig
-from sgl_jax.srt.utils.weight_utils import WeightMapping
 
 TRANSPOSE_2D_CONV = (2, 3, 1, 0)
 
 
 def _replicated(path: str, *, transpose: bool = False, transpose_axes=None):
-    return WeightMapping(
+    return WeightSpec(
         target_path=path,
         sharding=(),
         transpose=transpose,

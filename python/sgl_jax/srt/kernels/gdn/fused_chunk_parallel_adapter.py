@@ -238,31 +238,56 @@ def _fused_chunk_parallel_prefill_local(
     d_v,
     kernel_size,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Adapt one local shard and its state pool to the fused-kernel ABI."""
+    """Adapt one local shard and its state pool to the fused-kernel ABI.
 
-    initial_conv = conv_state[state_indices]
-    initial_recurrent = recurrent_state[state_indices]
-    initial_conv = jnp.where(
-        has_initial_state[:, None, None],
-        initial_conv,
-        jnp.zeros_like(initial_conv),
-    )
-    initial_recurrent = jnp.where(
-        has_initial_state[:, None, None, None],
-        initial_recurrent,
-        jnp.zeros_like(initial_recurrent),
-    )
+    Without tracking, the kernel may donate the incoming pools even in eager
+    execution. Callers must use the returned pools after this call.
+    """
 
-    kernel_conv_pool = _scatter_active(
-        conv_state.swapaxes(-1, -2),
-        state_indices,
-        initial_conv.swapaxes(-1, -2),
-    )
-    kernel_recurrent_pool = _scatter_active(
-        recurrent_state,
-        state_indices,
-        initial_recurrent,
-    )
+    query_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    if track_indices is None:
+        # The kernel aliases its pools and reads initial state only when
+        # seq_lens > query_lens. Encode the explicit reset flag in metadata
+        # instead of building a second pool and retaining the original for
+        # writeback, which forces whole-pool copies despite outer donation.
+        seq_lens = jnp.where(has_initial_state, seq_lens, query_lens)
+        # Materialize the saved dummy slices before donating the pools. Without
+        # this shared barrier, XLA fuses the slice into the later restore and
+        # keeps the original full recurrent pool alive across the kernel.
+        kernel_conv_pool, kernel_recurrent_pool, dummy_conv, dummy_recurrent = (
+            jax.lax.optimization_barrier(
+                (
+                    conv_state.swapaxes(-1, -2),
+                    recurrent_state,
+                    conv_state[0],
+                    recurrent_state[0],
+                )
+            )
+        )
+    else:
+        initial_conv = conv_state[state_indices]
+        initial_recurrent = recurrent_state[state_indices]
+        initial_conv = jnp.where(
+            has_initial_state[:, None, None],
+            initial_conv,
+            jnp.zeros_like(initial_conv),
+        )
+        initial_recurrent = jnp.where(
+            has_initial_state[:, None, None, None],
+            initial_recurrent,
+            jnp.zeros_like(initial_recurrent),
+        )
+
+        kernel_conv_pool = _scatter_active(
+            conv_state.swapaxes(-1, -2),
+            state_indices,
+            initial_conv.swapaxes(-1, -2),
+        )
+        kernel_recurrent_pool = _scatter_active(
+            recurrent_state,
+            state_indices,
+            initial_recurrent,
+        )
     distribution = jnp.asarray(
         [0, 0, state_indices.shape[0]],
         dtype=jnp.int32,
@@ -289,7 +314,38 @@ def _fused_chunk_parallel_prefill_local(
         kernel_size=kernel_size,
     )
 
-    query_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    if track_indices is None:
+        # Empty sequences have no kernel tiles, but a fresh request must still
+        # reset its slot. Compact only metadata and visit the selected slots:
+        # a batched scatter of scalar zero materializes a batch-sized state
+        # tensor on TPU even when every update is dropped.
+        reset_mask = (query_lens == 0) & ~has_initial_state & (state_indices != 0)
+        reset_rows = jnp.nonzero(reset_mask, size=state_indices.size)[0]
+
+        def reset_empty_slot(i, states):
+            conv, recurrent = states
+            slot = state_indices[reset_rows[i]]
+            return (
+                conv.at[slot].set(0, mode="drop"),
+                recurrent.at[slot].set(0, mode="drop"),
+            )
+
+        new_conv_state, new_recurrent_state = jax.lax.fori_loop(
+            0,
+            reset_mask.sum(dtype=jnp.int32),
+            reset_empty_slot,
+            (kernel_conv_result.swapaxes(-1, -2), kernel_recurrent_result),
+        )
+        # Precompile can give dummy requests tokens. Save/restore only slot 0;
+        # keeping the original full pool alive here defeats the kernel alias.
+        new_conv_state = new_conv_state.at[0].set(dummy_conv)
+        new_recurrent_state = new_recurrent_state.at[0].set(dummy_recurrent)
+        return (
+            output.reshape(output.shape[0], n_v, d_v).astype(mixed_qkv.dtype),
+            new_conv_state.astype(conv_state.dtype),
+            new_recurrent_state.astype(recurrent_state.dtype),
+        )
+
     has_tokens = query_lens > 0
     running_conv = kernel_conv_result[state_indices].swapaxes(-1, -2)
     running_recurrent = kernel_recurrent_result[state_indices]

@@ -48,7 +48,7 @@ PRECOMPILE_DEFAULT_VISION_PATCH_PADDINGS = [
 
 
 def resolve_vision_patch_buckets(user_paddings: list[int] | None) -> list[int]:
-    """Return sorted, de-duplicated positive vision patch buckets."""
+    """Return requested positive vision warmup sizes; packing determines alignment."""
     paddings = user_paddings or PRECOMPILE_DEFAULT_VISION_PATCH_PADDINGS
     return sorted({p for p in paddings if p > 0})
 

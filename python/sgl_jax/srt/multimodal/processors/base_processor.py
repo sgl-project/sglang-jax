@@ -70,7 +70,6 @@ class BaseMultimodalProcessor(ABC):
     models: tuple[str, ...] = ()
     auto_mm_processor_worker_num = 1
     supports_mm_processor_concurrency = False
-    use_torchcodec_image_decode = False
 
     def __init__(self, hf_config, server_args, processor):
         self.hf_config = hf_config
@@ -139,15 +138,6 @@ class BaseMultimodalProcessor(ABC):
             return Image.fromarray(source).convert("RGB")
 
         payload = _normalize_image_source(source)
-        if cls.use_torchcodec_image_decode:
-            from torchcodec.decoders import decode_image
-
-            try:
-                image = decode_image(payload, mode="RGB")
-                if image.ndim == 3:
-                    return image
-            except (RuntimeError, ValueError):
-                logger.debug("Falling back to Pillow image decode", exc_info=True)
         if isinstance(payload, bytes):
             return Image.open(io.BytesIO(payload)).convert("RGB")
         return Image.open(payload).convert("RGB")

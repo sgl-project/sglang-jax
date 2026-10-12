@@ -138,7 +138,7 @@ class NativeAttention(AttentionBackend):
         The 5D fused buffer is persisted outside JIT. The 3D k/v views are
         used by forward_attention for the actual attention computation.
         """
-        if is_tpu_runtime():
+        if is_tpu_runtime(self.mesh):
             if save_kv_cache:
                 if forward_batch.forward_mode.is_extend():
                     token_to_kv_pool.set_kv_buffer(

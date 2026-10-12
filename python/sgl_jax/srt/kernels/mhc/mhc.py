@@ -25,13 +25,11 @@ from sgl_jax.srt.kernels.mhc.tune import (
     select_post_backend,
     select_post_block_tokens,
 )
+from sgl_jax.srt.utils.jax_utils import get_device_kind
 
 
 def _device_kind() -> str:
-    devices = jax.devices()
-    if not devices:
-        raise RuntimeError("mHC requires an available JAX device")
-    return devices[0].device_kind
+    return get_device_kind()
 
 
 def mix_hc_width(hc_mult: int) -> int:

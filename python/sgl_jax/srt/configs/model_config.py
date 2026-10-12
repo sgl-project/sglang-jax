@@ -5,11 +5,12 @@ import os
 from enum import Enum, IntEnum, auto
 
 import jax.numpy as jnp
-from transformers import PretrainedConfig
+from transformers import GenerationConfig, PretrainedConfig
 
 from sgl_jax.srt.configs.dtype_config import STR_DTYPE_TO_JAX_DTYPE, DtypeConfig
 from sgl_jax.srt.configs.quantization_config import QuantizationConfig
 from sgl_jax.srt.hf_transformers_utils import (
+    apply_model_config_overrides,
     download_from_hf,
     get_config,
     get_context_length,
@@ -49,6 +50,7 @@ _FUSED_MOE_V2_SUPPORTED_ARCHITECTURES = frozenset(
         "BailingMoeV2ForCausalLM",
         "BailingMoeV2_5ForCausalLM",
         "MiMoV2ForCausalLM",
+        "MiMoV2ForConditionalGeneration",
         "MiMoV2FlashForCausalLM",
         "GlmMoeDsaForCausalLM",
     }
@@ -111,8 +113,11 @@ class ModelConfig:
         moe_backend: str | MoEBackend = MoEBackend.AUTO,
         moe_dp_size: int = 1,
         model_sub_dir: str | None = None,
+        hf_config: PretrainedConfig | None = None,
+        model_weights: str | None = None,
     ) -> None:
         self.model_path = model_path
+        self.model_weights = model_weights
         self.model_sub_dir = model_sub_dir
         self.revision = revision
         self.model_impl = model_impl
@@ -133,33 +138,20 @@ class ModelConfig:
             # If ep_size > 1, use EPMoE (expert parallelism across devices)
             # Otherwise use Fused kernel (single-device TPU optimization)
             self.moe_backend = MoEBackend.EPMOE if self.ep_size > 1 else MoEBackend.FUSED
-        # Parse args
-        self.maybe_pull_model_tokenizer_from_remote()
         self.model_override_args = json.loads(model_override_args)
-        kwargs = {}
-        if override_config_file and override_config_file.strip():
-            kwargs["_configuration_file"] = override_config_file.strip()
-        if multimodal:
-            self.model_path = download_from_hf(self.model_path, allow_patterns=None)
-        if multimodal and self.model_sub_dir is not None:
-            if self.model_sub_dir:
-                self.model_path = os.path.join(self.model_path, self.model_sub_dir)
-            config_path = self.model_path
-
-        config_path = self.model_path
-
-        # get_config is lru_cached; configure_for_tensor_parallel mutates
-        # hf_text_config in-place, so deepcopy to avoid cross-ModelConfig
-        # pollution (e.g. PD disaggregation creates two ModelConfigs).
-        self.hf_config = copy.deepcopy(
-            get_config(
-                config_path,
+        self.hf_generation_config = None
+        if hf_config is None:
+            self.hf_config, self.hf_generation_config = self._load_hf_configs(
                 trust_remote_code=trust_remote_code,
-                revision=revision,
-                model_override_args=self.model_override_args,
-                **kwargs,
+                override_config_file=override_config_file,
+                multimodal=multimodal,
             )
-        )
+        else:
+            # Overrides and draft/TP rewrites must not mutate caller-owned configs.
+            self.hf_config = copy.deepcopy(hf_config)
+            apply_model_config_overrides(self.hf_config, self.model_override_args)
+            if multimodal and self.model_sub_dir:
+                self.model_path = os.path.join(self.model_path, self.model_sub_dir)
 
         if not getattr(self.hf_config, "architectures", None):
             raise ValueError(
@@ -206,26 +198,79 @@ class ModelConfig:
         if self.quantization_config is not None:
             self.hf_config.quantization_config = self.quantization_config
 
-        self.hf_generation_config = get_generation_config(
-            config_path,
-            trust_remote_code=trust_remote_code,
-            revision=revision,
-            **kwargs,
-        )
-
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.sliding_window = getattr(self.hf_text_config, "sliding_window", None)
 
-        if is_draft_model and self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
+        if is_draft_model:
+            self._config_draft_model()
+
+        # Check model type
+        self.is_generation = is_generation_model(self.hf_config.architectures, is_embedding)
+        self.is_multimodal = any(
+            architecture in multimodal_model_archs for architecture in self.hf_config.architectures
+        )
+        self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
+
+        if not isinstance(dtype_config, DtypeConfig):
+            self.dtype_config = DtypeConfig(dtype_config, default_dtype=self.dtype)
+        else:
+            self.dtype_config = dtype_config
+            # The global dtype must be the same as the default dtype provided in dtype_config
+            if self.dtype != self.dtype_config.default_dtype:
+                raise ValueError(
+                    f"Global dtype ({self.dtype}) is not the same as the default dtype provided in dtype_config ({self.dtype_config.default_dtype})."
+                )
+
+        self._derive_context_length(context_length)
+        self._derive_model_shapes(model_layer_nums)
+
+        # Cache attributes
+        self.hf_eos_token_id = self.get_hf_eos_token_id()
+
+        config = self.hf_config
+
+        # multimodal
+        self.image_token_id = getattr(config, "image_token_id", None) or getattr(
+            config, "image_token_index", None
+        )
+
+    def _load_hf_configs(
+        self,
+        *,
+        trust_remote_code: bool,
+        override_config_file: str | None,
+        multimodal: bool,
+    ) -> tuple[PretrainedConfig, GenerationConfig | None]:
+        """Load model and generation files only for path-based construction."""
+        self.maybe_pull_model_tokenizer_from_remote()
+        if multimodal:
+            self.model_path = download_from_hf(self.model_path, allow_patterns=None)
+            if self.model_sub_dir:
+                self.model_path = os.path.join(self.model_path, self.model_sub_dir)
+
+        kwargs = {"trust_remote_code": trust_remote_code, "revision": self.revision}
+        if override_config_file and override_config_file.strip():
+            kwargs["_configuration_file"] = override_config_file.strip()
+
+        # get_config is cached; each instance owns its draft/TP config mutations.
+        return (
+            copy.deepcopy(
+                get_config(self.model_path, model_override_args=self.model_override_args, **kwargs)
+            ),
+            get_generation_config(self.model_path, **kwargs),
+        )
+
+    def _config_draft_model(self) -> None:
+        if self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
-        if is_draft_model and self.hf_config.architectures[0] == "LlamaForCausalLM":
+        elif self.hf_config.architectures[0] == "LlamaForCausalLM":
             self.hf_config.architectures[0] = "LlamaForCausalLMEagle3"
 
-        if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
+        elif self.hf_config.architectures[0] == "MiMoForCausalLM":
             self.hf_config.architectures[0] = "MiMoMTPForCausalLM"
 
-        if is_draft_model and self.hf_config.architectures[0] in (
+        elif self.hf_config.architectures[0] in (
             "MiMoV2ForCausalLM",
             "MiMoV2FlashForCausalLM",
         ):
@@ -252,23 +297,8 @@ class ModelConfig:
                 ignored = list(self.quantization_config.ignored_layers or [])
                 ignored.extend(["model.eh_proj", "model.mtp_block.self_attn.o_proj"])
                 self.quantization_config.ignored_layers = ignored
-        # Check model type
-        self.is_generation = is_generation_model(self.hf_config.architectures, is_embedding)
-        self.is_multimodal = any(
-            architecture in multimodal_model_archs for architecture in self.hf_config.architectures
-        )
-        self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
-        if not isinstance(dtype_config, DtypeConfig):
-            self.dtype_config = DtypeConfig(dtype_config, default_dtype=self.dtype)
-        else:
-            self.dtype_config = dtype_config
-            # The global dtype must be the same as the default dtype provided in dtype_config
-            if self.dtype != self.dtype_config.default_dtype:
-                raise ValueError(
-                    f"Global dtype ({self.dtype}) is not the same as the default dtype provided in dtype_config ({self.dtype_config.default_dtype})."
-                )
-
+    def _derive_context_length(self, context_length: int | None) -> None:
         # Derive context length
         derived_context_len = get_context_length(self.hf_text_config)
         if context_length is not None:
@@ -289,6 +319,7 @@ class ModelConfig:
         else:
             self.context_len = derived_context_len
 
+    def _derive_model_shapes(self, model_layer_nums: int | None) -> None:
         # Unify the config keys for hf_text_config
         self.head_dim = getattr(
             self.hf_text_config,
@@ -331,16 +362,6 @@ class ModelConfig:
                 if hasattr(self, "hf_text_config") and self.hf_text_config is not None:
                     self.hf_text_config.num_hidden_layers = model_layer_nums
 
-        # Cache attributes
-        self.hf_eos_token_id = self.get_hf_eos_token_id()
-
-        config = self.hf_config
-
-        # multimodal
-        self.image_token_id = getattr(config, "image_token_id", None) or getattr(
-            config, "image_token_index", None
-        )
-
     def _get_hf_quant_config(self):
         hf_quant_config = getattr(self.hf_config, "quantization_config", None)
         if hf_quant_config is None:
@@ -365,6 +386,17 @@ class ModelConfig:
         Returns:
             Unified QuantizationConfig object or None
         """
+        hf_quant_config = self._get_hf_quant_config()
+        if hf_quant_config is None:
+            text_config = get_hf_text_config(self.hf_config)
+            hf_quant_config = getattr(text_config, "quantization_config", None)
+        if isinstance(hf_quant_config, dict) and hf_quant_config.get("format") == "pack-quantized":
+            raise NotImplementedError(
+                "compressed-tensors pack-quantized checkpoints are not supported. "
+                "Use a checkpoint in a supported format; disabling quantization or "
+                "setting dtype=bfloat16 does not unpack packed integer weights."
+            )
+
         # 1. If user provided a config path, use it (already loaded in __init__)
         if self.quantization_config is not None:
             logger.info("Using user-provided quantization config")
@@ -537,6 +569,61 @@ class ModelConfig:
                         weight_block_size=weight_block_size,
                     )
                     return quant_config
+                elif format_type == "pack-quantized":
+                    groups = hf_quant_config.get("config_groups")
+                    if not isinstance(groups, dict) or not groups:
+                        raise ValueError("pack-quantized requires non-empty config_groups.")
+                    group_sizes = set()
+                    for name, group in groups.items():
+                        weights = group.get("weights") if isinstance(group, dict) else None
+                        if not isinstance(weights, dict) or not (
+                            weights.get("num_bits") == 4
+                            and weights.get("type") == "int"
+                            and weights.get("symmetric") is True
+                            and weights.get("strategy") == "group"
+                            and not weights.get("dynamic", False)
+                            and weights.get("actorder") is None
+                            and weights.get("block_structure") is None
+                        ):
+                            raise ValueError(
+                                "pack-quantized currently supports only static symmetric "
+                                "INT4 group quantization without actorder or block_structure; "
+                                f"unsupported weights in config group {name!r}: {weights}"
+                            )
+                        if any(
+                            group.get(key) is not None
+                            for key in ("input_activations", "output_activations")
+                        ):
+                            raise ValueError(
+                                "pack-quantized activation quantization is not supported."
+                            )
+                        group_size = weights.get("group_size")
+                        if type(group_size) is not int or group_size <= 0:
+                            raise ValueError(
+                                "pack-quantized requires a positive integer group_size."
+                            )
+                        group_sizes.add(group_size)
+                    if len(group_sizes) != 1:
+                        raise ValueError(
+                            "pack-quantized config groups must use the same group_size."
+                        )
+                    group_size = group_sizes.pop()
+                    logger.info(
+                        "Auto-detected compressed-tensors INT4 pack-quantized model. "
+                        "Creating QuantizationConfig for static int4."
+                    )
+                    weight_block_size = (group_size, group_size)
+
+                    ignored_layers = hf_quant_config.get("ignore") or []
+                    quant_config = QuantizationConfig(
+                        is_static_checkpoint=True,
+                        linear_rules=[],
+                        moe_weight_dtype=getattr(jnp, "int4", None),
+                        moe_activation_dtype=None,
+                        ignored_layers=list(ignored_layers),
+                        weight_block_size=weight_block_size,
+                    )
+                    return quant_config
                 else:
                     logger.warning(
                         "compressed-tensors format '%s' is not yet supported. "
@@ -566,14 +653,16 @@ class ModelConfig:
         `attention_arch` for backend selection — so patches land in time.
         Import is lazy because model modules import ModelConfig back.
         """
-        from sgl_jax.srt.models.registry import ModelRegistry
+        from sgl_jax.srt.model_loader.arch import get_model_architecture
         from sgl_jax.srt.multimodal.in_model.interface import InModelMultimodalContract
 
+        self.is_in_model_multimodal = False
         try:
-            model_cls, _ = ModelRegistry.resolve_model_cls(self.hf_config.architectures)
+            model_cls, _ = get_model_architecture(self)
         except ValueError:
             return
-        self.is_multimodal |= issubclass(model_cls, InModelMultimodalContract)
+        self.is_in_model_multimodal = issubclass(model_cls, InModelMultimodalContract)
+        self.is_multimodal |= self.is_in_model_multimodal
         patch = getattr(model_cls, "patch_model_config", None)
         if patch is not None:
             patch(self)
@@ -588,6 +677,9 @@ class ModelConfig:
         model_sub_dir = getattr(server_args, "model_sub_dir", None)
         return ModelConfig(
             model_path=model_path or server_args.model_path,
+            model_weights=getattr(server_args, "runai_model_paths", {}).get(
+                model_path or server_args.model_path
+            ),
             trust_remote_code=server_args.trust_remote_code,
             revision=model_revision or server_args.revision,
             context_length=server_args.context_length,
@@ -604,6 +696,35 @@ class ModelConfig:
             moe_dp_size=server_args.moe_dp_size,
             model_sub_dir=model_sub_dir,
             **kwargs,
+        )
+
+    def configure_for_serving(self, server_args: ServerArgs):
+        """Apply the same model construction settings to online and offline forwards."""
+        attention_tp_size = server_args.tp_size // server_args.dp_size
+        self.validate_tensor_parallel_config(attention_tp_size)
+        self.configure_for_tensor_parallel(attention_tp_size)
+        self.log_kv_heads_info(attention_tp_size)
+        self.hf_config.enable_dp_lm_head = server_args.enable_dp_lm_head
+        self.hf_config.ep_size = server_args.ep_size
+        self.hf_config.moe_dp_size = server_args.moe_dp_size
+        self.hf_config.ep_num_redundant_experts = server_args.ep_num_redundant_experts
+        self.hf_config.moe_backend = self.moe_backend.value
+        self.hf_config.use_jax_allreduce_metadata = not server_args.disable_jax_allreduce_metadata
+        # Pick MLA forward path at server start. Only `fa` selects absorbed
+        # (the MLA Pallas kernel); `fa_mha` and `native` both decompress latent
+        # KV via kv_b_proj and run standard attention. Read by
+        # DeepseekV3DecoderLayer to construct DeepseekV3Attention; harmless on
+        # non-MLA models that ignore the attribute.
+        self.hf_config.use_absorbed_mla = server_args.attention_backend in (
+            "fa",
+            "dsa_sparse",
+        )
+        self.hf_config.use_dsa_sparse = server_args.attention_backend == "dsa_sparse"
+        self.hf_config.enable_sequence_parallel = server_args.enable_sequence_parallel
+        self.hf_config.vision_encoder_parallel = server_args.vision_encoder_parallel
+
+        self.hf_config.precompile_vision_patch_paddings = (
+            server_args.precompile_vision_patch_paddings
         )
 
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
@@ -895,6 +1016,15 @@ class ModelConfig:
 
         """
         from sgl_jax.srt.utils.common_utils import is_remote_url
+        from sgl_jax.srt.utils.runai_utils import download_metadata, is_gcs_path
+
+        # A serialized config can reach a worker with a separate host-local cache.
+        if (
+            self.model_weights
+            and is_gcs_path(self.model_weights)
+            and not os.path.isdir(self.model_path)
+        ):
+            self.model_path = download_metadata(self.model_weights)
 
         if is_remote_url(self.model_path):
             raise ValueError(
@@ -982,6 +1112,7 @@ multimodal_model_archs = [
     "DeepseekVL2ForCausalLM",
     "Gemma3ForConditionalGeneration",
     "Gemma3nForConditionalGeneration",
+    "Gemma4ForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
     "LlavaLlamaForCausalLM",
@@ -990,6 +1121,7 @@ multimodal_model_archs = [
     "LlavaQwenForCausalLM",
     "LlavaForConditionalGeneration",
     "LlavaVidForCausalLM",
+    "MiMoV2ForConditionalGeneration",
     "MiniCPMO",
     "MiniCPMV",
     "Mistral3ForConditionalGeneration",
@@ -999,6 +1131,8 @@ multimodal_model_archs = [
     "Qwen2VLForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",
     "Qwen3VLForConditionalGeneration",
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForConditionalGeneration",
     "KimiVLForConditionalGeneration",
     "InternVLChatModel",
     "Phi4MMForCausalLM",

@@ -1,10 +1,10 @@
 """Tuned token block sizes for the biased top-k Pallas kernel."""
 
-import jax
+from sgl_jax.srt.utils.jax_utils import get_device_kind
 
 
 def _device_name() -> str:
-    kind = jax.devices()[0].device_kind
+    kind = get_device_kind()
     if "TPU" not in kind:
         raise RuntimeError("not a TPU device")
     if kind.endswith(" lite"):

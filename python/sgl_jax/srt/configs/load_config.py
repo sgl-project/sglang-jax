@@ -20,6 +20,7 @@ class LoadFormat(str, enum.Enum):
     LAYERED = "layered"
     JAX = "jax"
     REMOTE = "remote"
+    RUNAI_STREAMER = "runai_streamer"
 
 
 @dataclass
@@ -39,6 +40,7 @@ class LoadConfig:
         "dummy" will initialize the weights with random values, which is
             mainly for profiling.
         "bitsandbytes" will load nf4 type weights.
+        "runai_streamer" reads GCS or local safetensors through RunAI FileStreamer.
     ignore_patterns: The list of patterns to ignore when loading the model.
         Default to "original/**/*" to avoid repeated loading of llama's
         checkpoints.

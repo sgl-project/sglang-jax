@@ -1,6 +1,8 @@
 import types
 
+import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from sgl_jax.srt.mem_cache.memory_pool import MLATokenToKVPool
@@ -333,6 +335,99 @@ def test_pool_initialization_rejects_hybrid_dsa():
         runner._init_pools(max_num_reqs=1, dp_size=1)
 
 
+class _QSARunner(ModelRunnerKVCacheMixin):
+    """Stand-in runner with a real `Qwen4ExpConfig` whose attention backend is
+    built by `model_runner`'s own arm. Hybrid, as Flash-Next is, the backend
+    comes wrapped in `HybridLinearAttnBackend`, so the pool hooks reach the
+    mixin through its forwarding."""
+
+    is_hybrid = False
+    num_attn_heads, num_kv_heads = 2, 1
+    max_total_num_tokens = 128 * 8
+    req_to_token_pool = None
+    token_to_kv_pool_allocator = None
+
+    def __init__(self, attention_backend, *, hybrid=True, num_layers=8):
+        from sgl_jax.srt.configs.qwen4_exp import Qwen4ExpConfig
+        from sgl_jax.srt.model_executor.model_runner import ModelRunner
+
+        self.kv_cache_dtype = jnp.bfloat16
+        self.page_size = 128
+        self.use_mla_backend = False
+        self.attention_tp_size = 2
+        self.server_args = ServerArgs(model_path="dummy", attention_backend=attention_backend)
+        self.server_args.gdn_prefill_impl = "chunked_jax"
+        config = Qwen4ExpConfig(
+            text_config=dict(
+                num_hidden_layers=num_layers,
+                full_attention_interval=4,
+                head_dim=256,
+                indexer_budget=2048,
+                indexer_compress_ratio=4,
+                indexer_head_dim=128,
+                indexer_n_heads=4,
+                indexer_kv_heads=1,
+            )
+        )
+        text = config.text_config
+        self.model_config = types.SimpleNamespace(
+            hf_config=config if hybrid else types.SimpleNamespace(),
+            hf_text_config=text,
+            head_dim=256,
+            dtype=jnp.bfloat16,
+            context_len=64,
+            get_num_kv_heads=lambda _tp: 1,
+            get_total_num_kv_heads_with_replication=lambda _tp: 1,
+        )
+        self.mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]).reshape(1, 1), ("data", "tensor"))
+        self._num_full = len(text.full_attention_layer_ids)
+        self.attn_backend = ModelRunner._get_attention_backend(self)
+
+    def _kv_pool_layer_count(self):
+        return self._num_full
+
+
+# 1 KV head x align128(256) x 2 (K and V) x 2 full-attention layers x 2 bytes.
+_QSA_GQA_BYTES_PER_TOKEN = 1 * 256 * 2 * 2 * 2
+# One compressed key per 4 tokens: align128(128) x 2 bytes x 2 layers // 4.
+_QSA_INDEXER_BYTES_PER_TOKEN = 128 * 2 * 2 // 4
+
+
+def test_cell_size_charges_for_the_qsa_compressed_cache_only_on_qsa():
+    """`QSATokenToKVPool` allocates a compressed key per compress_ratio tokens
+    for each full-attention layer. Budgeting only the GQA cache over-provisions
+    the pool and the excess comes out of the activation reserve; charging a
+    non-QSA backend for it wastes capacity on every other model."""
+    assert _QSARunner("fa")._compute_cell_size() == _QSA_GQA_BYTES_PER_TOKEN
+    assert (
+        _QSARunner("qsa_sparse")._compute_cell_size()
+        == _QSA_GQA_BYTES_PER_TOKEN + _QSA_INDEXER_BYTES_PER_TOKEN
+    )
+
+
+@pytest.mark.parametrize("max_num_reqs", [None, 16])
+def test_aot_sizes_the_ring_by_the_request_limit(max_num_reqs):
+    """The ring has one row per request. AOT export takes the request limit
+    serving resolved from its args, and without args the batch."""
+    from sgl_jax.srt.model_executor.aot_resources import AbstractResources
+
+    runner = _QSARunner("qsa_sparse", hybrid=False)
+    if max_num_reqs is not None:
+        runner.max_num_reqs = max_num_reqs
+    options = types.SimpleNamespace(dp_size=1, batch_size=4, recurrent_capacity=None)
+    pools = AbstractResources.create_pools(runner, options)
+    assert pools.token_to_kv_pool.get_open_group_buffer(0).shape[0] == (max_num_reqs or 4)
+
+
+def test_init_pools_refuses_a_ring_smaller_than_the_request_pool():
+    """Ring writes drop out-of-range rows, so a request slot without a row
+    would lose its open group silently."""
+    runner = _QSARunner("qsa_sparse", hybrid=False)
+    runner.req_to_token_pool = types.SimpleNamespace(size=32)
+    with pytest.raises(ValueError, match="per-request rows"):
+        runner._init_pools(max_num_reqs=16, dp_size=1)
+
+
 @pytest.mark.parametrize(("embedding_pool_bytes", "expected"), [(0, 700), (100, 600)])
 def test_profile_available_bytes_reserves_static_and_embedding_pool(embedding_pool_bytes, expected):
     runner = types.SimpleNamespace(
@@ -349,6 +444,7 @@ def test_embedding_pool_bytes_only_for_in_model_prefill():
 
     config = types.SimpleNamespace(
         is_multimodal=True,
+        is_in_model_multimodal=True,
         hidden_size=8,
         dtype=jnp.bfloat16,
         hf_config=types.SimpleNamespace(architectures=["Qwen2_5_VLForConditionalGeneration"]),
@@ -361,6 +457,9 @@ def test_embedding_pool_bytes_only_for_in_model_prefill():
         disaggregation_mode="null",
     )
     assert _embedding_pool_bytes(config, args) == 128 * 8 * 2
+    config.is_in_model_multimodal = False
+    assert _embedding_pool_bytes(config, args) == 0
+    config.is_in_model_multimodal = True
     args.disaggregation_mode = "decode"
     assert _embedding_pool_bytes(config, args) == 0
     args.disaggregation_mode = "null"
@@ -376,6 +475,7 @@ def test_deepstack_embedding_pool_uses_packed_feature_width():
 
     config = types.SimpleNamespace(
         is_multimodal=True,
+        is_in_model_multimodal=True,
         hidden_size=8,
         dtype=jnp.bfloat16,
         hf_config=types.SimpleNamespace(architectures=["Qwen2_5_VLForConditionalGeneration"]),
@@ -415,6 +515,7 @@ def test_embedding_pool_capacity_and_pages_follow_lm_limits():
 
     config = types.SimpleNamespace(
         is_multimodal=True,
+        is_in_model_multimodal=True,
         hidden_size=8,
         dtype=jnp.bfloat16,
         hf_config=types.SimpleNamespace(architectures=["Qwen2_5_VLForConditionalGeneration"]),
@@ -444,3 +545,59 @@ def test_embedding_pool_capacity_and_pages_follow_lm_limits():
     assert runner.embedding_pool.hidden == 32
     assert runner.embedding_pool.page_size == 128
     assert runner.embedding_pool.num_pages == 2
+
+
+def test_apply_token_constraints_aligns_allocated_pages_with_reserved_dp_pages():
+    page_size = 64
+
+    # Case 1: data=2, dp_size=1 with 780 initial usable pages.
+    # The pool adds dp_size=1 reserved page (780 + 1 = 781, odd).
+    # Alignment should round allocated pages down to 780 (usable_pages = 779)
+    # so (token_capacity + page_size * dp_size) // page_size == 780 is divisible by data=2.
+    runner_dp1 = types.SimpleNamespace(
+        server_args=types.SimpleNamespace(page_size=page_size),
+        mesh=types.SimpleNamespace(shape={"data": 2, "tensor": 4}),
+    )
+    cap_dp1 = ModelRunnerKVCacheMixin._apply_token_constraints(
+        runner_dp1,
+        token_capacity=780 * page_size,
+        max_total_tokens=None,
+        dp_size=1,
+    )
+    assert cap_dp1 == 779 * page_size
+    allocated_pages_dp1 = (cap_dp1 + page_size * 1) // page_size
+    assert allocated_pages_dp1 == 780
+    assert allocated_pages_dp1 % 2 == 0
+
+    # Case 2: data=4, dp_size=4 with 195 pages per DP (780 usable + 4 reserved = 784).
+    # 784 is already divisible by data=4, so zero capacity is lost.
+    runner_dp4 = types.SimpleNamespace(
+        server_args=types.SimpleNamespace(page_size=page_size),
+        mesh=types.SimpleNamespace(shape={"data": 4, "tensor": 2}),
+    )
+    cap_dp4 = ModelRunnerKVCacheMixin._apply_token_constraints(
+        runner_dp4,
+        token_capacity=195 * page_size,
+        max_total_tokens=None,
+        dp_size=4,
+    )
+    assert cap_dp4 == 780 * page_size
+    allocated_pages_dp4 = (cap_dp4 + page_size * 4) // page_size
+    assert allocated_pages_dp4 == 784
+    assert allocated_pages_dp4 % 4 == 0
+
+
+@pytest.mark.parametrize("pages,expected_pages", [(2, None), (3, 3), (4, 3)])
+def test_apply_token_constraints_small_capacity(pages, expected_pages, monkeypatch):
+    monkeypatch.delenv("SGLANG_CI_SMALL_KV_SIZE", raising=False)
+    runner = types.SimpleNamespace(
+        server_args=types.SimpleNamespace(page_size=64),
+        mesh=types.SimpleNamespace(shape={"data": 4, "tensor": 1}),
+    )
+    if expected_pages is None:
+        with pytest.raises(RuntimeError, match="Not enough KV cache capacity"):
+            ModelRunnerKVCacheMixin._apply_token_constraints(runner, pages * 64, None, 1)
+    else:
+        cap = ModelRunnerKVCacheMixin._apply_token_constraints(runner, pages * 64, None, 1)
+        assert cap == expected_pages * 64
+        assert (cap // 64 + 1) % 4 == 0

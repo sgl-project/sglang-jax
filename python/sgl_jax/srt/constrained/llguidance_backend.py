@@ -27,16 +27,22 @@ class GuidanceGrammar(BaseGrammarObject):
         self,
         llguidance_tokenizer: LLTokenizer,
         serialized_grammar: str,
+        *,
+        ll_matcher: LLMatcher | None = None,
     ):
         super().__init__()
         self.llguidance_tokenizer = llguidance_tokenizer
         self.serialized_grammar = serialized_grammar
         self.eos_token = self.llguidance_tokenizer.eos_token
 
-        self.ll_matcher = LLMatcher(
-            llguidance_tokenizer,
-            serialized_grammar,
-            log_level=int(os.environ.get("LLGUIDANCE_LOG_LEVEL", "1")),
+        self.ll_matcher = (
+            ll_matcher
+            if ll_matcher is not None
+            else LLMatcher(
+                llguidance_tokenizer,
+                serialized_grammar,
+                log_level=int(os.environ.get("LLGUIDANCE_LOG_LEVEL", "1")),
+            )
         )
         self._check_err()
 
@@ -85,9 +91,11 @@ class GuidanceGrammar(BaseGrammarObject):
         return self.finished
 
     def copy(self):
+        # deep_copy preserves parser state, so cached templates must stay untouched.
         return GuidanceGrammar(
             llguidance_tokenizer=self.llguidance_tokenizer,
             serialized_grammar=self.serialized_grammar,
+            ll_matcher=self.ll_matcher.deep_copy(),
         )
 
 

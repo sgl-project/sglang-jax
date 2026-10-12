@@ -58,6 +58,7 @@ class LaunchProfile(BaseModel):
     name: str
     target: str
     model_path: str
+    revision: str | None = None
     tp_size: int = Field(gt=0)
     dp_size: int = Field(gt=0)
     ep_size: int | None = Field(default=None, gt=0)

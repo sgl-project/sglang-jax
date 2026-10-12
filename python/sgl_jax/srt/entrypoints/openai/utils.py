@@ -63,5 +63,5 @@ def process_hidden_states_from_ret(
 
     hidden_states = ret_item["meta_info"].get("hidden_states", None)
     if hidden_states is not None:
-        hidden_states = hidden_states[-1] if len(hidden_states) > 1 else []
+        hidden_states = hidden_states[-1] if hidden_states else []
     return hidden_states

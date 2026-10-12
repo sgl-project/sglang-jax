@@ -10,8 +10,8 @@ from sgl_jax.srt.layers.embeddings import MRotaryEmbedding, ParallelLMHead
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.model_loader.weights import WeightLoader, WeightSpec
 from sgl_jax.srt.models.qwen2 import Qwen2Model
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
@@ -26,11 +26,11 @@ class Qwen2_5_VL_Model(Qwen2Model):
         dtype=jnp.bfloat16,
     ):
         super().__init__(config=config, mesh=mesh, dtype=dtype)
-        rope_scaling = getattr(config, "rope_scaling", None) or {}
+        rope_scaling = config.rope_parameters
         self._mrope_section = rope_scaling.get("mrope_section")
         self._mrope_interleaved = rope_scaling.get("mrope_interleaved", False)
         if self._mrope_section:
-            rope_theta = getattr(config, "rope_theta", 1000000)
+            rope_theta = config.rope_parameters["rope_theta"]
             max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
             for layer in self.layers:
                 head_dim = layer.self_attn.head_dim
@@ -118,9 +118,14 @@ class Qwen2_5_VL_Generation(nnx.Module):
                 self.text_config.hidden_size,
                 dtype=self.dtype,
                 param_dtype=self.dtype,
-                kernel_axes=("tensor", None),
+                mesh=mesh,
+                enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
             )
-        self.logits_processor = LogitsProcessor(self.text_config.vocab_size, mesh=self.mesh)
+        self.logits_processor = LogitsProcessor(
+            self.text_config.vocab_size,
+            mesh=self.mesh,
+            enable_dp_lm_head=getattr(config, "enable_dp_lm_head", False),
+        )
 
         # Multimodal token ids (from full config, if available)
         self.image_token_id = getattr(self.config, "image_token_id", None)
@@ -134,25 +139,23 @@ class Qwen2_5_VL_Generation(nnx.Module):
             dtype=self.dtype,
         )
         weight_mappings = self._create_qwen2_weight_mappings()
-        loader.load_weights_from_safetensors(weight_mappings)
+        loader.load(weight_mappings)
         logger.info("Qwen2.5 VL (LLM) weights loaded successfully!")
 
     def _create_qwen2_weight_mappings(self) -> dict:
         mappings = {
-            "model.embed_tokens.weight": WeightMapping(
+            "model.embed_tokens.weight": WeightSpec(
                 target_path="model.embed_tokens.embedding",
                 sharding=("tensor", None),
                 transpose=False,
             ),
-            "model.norm.weight": WeightMapping(
+            "model.norm.weight": WeightSpec(
                 target_path="model.norm.scale", sharding=(None,), transpose=False
             ),
         }
 
         if not getattr(self.text_config, "tie_word_embeddings", False):
-            mappings["lm_head.weight"] = WeightMapping(
-                target_path="lm_head.embedding", sharding=("tensor", None), transpose=False
-            )
+            mappings["lm_head.weight"] = self.lm_head.weight_mapping("lm_head.embedding")
 
         num_layers = self.text_config.num_hidden_layers
         for layer_idx in range(num_layers):
@@ -165,55 +168,55 @@ class Qwen2_5_VL_Generation(nnx.Module):
         target_prefix = f"model.layers.{layer_idx}"
 
         mappings = {
-            f"{prefix}.input_layernorm.weight": WeightMapping(
+            f"{prefix}.input_layernorm.weight": WeightSpec(
                 target_path=f"{target_prefix}.input_layernorm.scale",
                 sharding=(None,),
                 transpose=False,
             ),
-            f"{prefix}.post_attention_layernorm.weight": WeightMapping(
+            f"{prefix}.post_attention_layernorm.weight": WeightSpec(
                 target_path=f"{target_prefix}.post_attention_layernorm.scale",
                 sharding=(None,),
                 transpose=False,
             ),
-            f"{prefix}.self_attn.q_proj.weight": WeightMapping(
+            f"{prefix}.self_attn.q_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.self_attn.q_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
                 head_dim_padding=True,
                 kv_head_padding=False,
             ),
-            f"{prefix}.self_attn.k_proj.weight": WeightMapping(
+            f"{prefix}.self_attn.k_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.self_attn.k_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
                 head_dim_padding=True,
                 kv_head_padding=True,
             ),
-            f"{prefix}.self_attn.v_proj.weight": WeightMapping(
+            f"{prefix}.self_attn.v_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.self_attn.v_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
                 head_dim_padding=True,
                 kv_head_padding=True,
             ),
-            f"{prefix}.self_attn.o_proj.weight": WeightMapping(
+            f"{prefix}.self_attn.o_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.self_attn.o_proj.weight",
                 sharding=("tensor", None),
                 transpose=True,
                 head_dim_padding=True,
                 kv_head_padding=False,
             ),
-            f"{prefix}.mlp.gate_proj.weight": WeightMapping(
+            f"{prefix}.mlp.gate_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.mlp.gate_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             ),
-            f"{prefix}.mlp.up_proj.weight": WeightMapping(
+            f"{prefix}.mlp.up_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.mlp.up_proj.weight",
                 sharding=(None, "tensor"),
                 transpose=True,
             ),
-            f"{prefix}.mlp.down_proj.weight": WeightMapping(
+            f"{prefix}.mlp.down_proj.weight": WeightSpec(
                 target_path=f"{target_prefix}.mlp.down_proj.weight",
                 sharding=("tensor", None),
                 transpose=True,
@@ -223,21 +226,21 @@ class Qwen2_5_VL_Generation(nnx.Module):
         if getattr(self.text_config, "attention_bias", True):
             mappings.update(
                 {
-                    f"{prefix}.self_attn.q_proj.bias": WeightMapping(
+                    f"{prefix}.self_attn.q_proj.bias": WeightSpec(
                         target_path=f"{target_prefix}.self_attn.q_proj.bias",
                         sharding=(None,),
                         transpose=False,
                         head_dim_padding=True,
                         kv_head_padding=False,
                     ),
-                    f"{prefix}.self_attn.k_proj.bias": WeightMapping(
+                    f"{prefix}.self_attn.k_proj.bias": WeightSpec(
                         target_path=f"{target_prefix}.self_attn.k_proj.bias",
                         sharding=(None,),
                         transpose=False,
                         head_dim_padding=True,
                         kv_head_padding=True,
                     ),
-                    f"{prefix}.self_attn.v_proj.bias": WeightMapping(
+                    f"{prefix}.self_attn.v_proj.bias": WeightSpec(
                         target_path=f"{target_prefix}.self_attn.v_proj.bias",
                         sharding=(None,),
                         transpose=False,

@@ -252,6 +252,7 @@ class SchedulePolicy:
 class AddReqResult(Enum):
     CONTINUE = auto()  # Continue to add requests
     NO_TOKEN = auto()  # No token left
+    DP_BUDGET_EXHAUSTED = auto()  # Only this DP's chunk budget is exhausted
     OTHER = auto()  # Other reasons to stop adding requests
 
 
@@ -598,7 +599,7 @@ class PrefillAdder:
             )
         else:
             if self.rem_chunk_tokens_list[dp_rank] <= 0:
-                return AddReqResult.OTHER
+                return AddReqResult.DP_BUDGET_EXHAUSTED
 
             # Chunked prefill
             trunc_len = self.rem_chunk_tokens_list[dp_rank]
@@ -612,10 +613,15 @@ class PrefillAdder:
         return self._budget_state_after_add(dp_rank)
 
     def add_one_req(self, req: Req):
+        dp_rank = req.dp_rank if req.dp_rank is not None else 0
+        # Reject before ignore-eos admission adds the candidate to req_states.
+        # A caller may continue trying other DP ranks after this rejection.
+        if self.rem_chunk_tokens_list is not None and self.rem_chunk_tokens_list[dp_rank] <= 0:
+            return AddReqResult.DP_BUDGET_EXHAUSTED
+
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
 
-        dp_rank = req.dp_rank if req.dp_rank is not None else 0
         total_tokens = req.extend_input_len + min(
             req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION
         )
@@ -667,7 +673,7 @@ class PrefillAdder:
                         self.rem_chunk_tokens_list[dp_rank] // self.page_size * self.page_size
                     )
                     if trunc_est <= 0:
-                        return AddReqResult.OTHER
+                        return AddReqResult.DP_BUDGET_EXHAUSTED
 
             # HiCache: after budget gate, pull host-only prefix back to device.
             # Must happen after NO_TOKEN check so rejected reqs never trigger H2D.
@@ -738,7 +744,7 @@ class PrefillAdder:
                 # Make sure at least one page is available
                 trunc_len = self.rem_chunk_tokens_list[dp_rank] // self.page_size * self.page_size
                 if trunc_len <= 0:
-                    return AddReqResult.OTHER
+                    return AddReqResult.DP_BUDGET_EXHAUSTED
 
                 # Chunk budget tighter than the boundary cap: min of the two.
                 req.extend_input_len = trunc_len

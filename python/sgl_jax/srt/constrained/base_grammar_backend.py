@@ -1,6 +1,5 @@
 """Base classes for grammar-constrained decoding backends."""
 
-import concurrent.futures as futures
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -58,16 +57,13 @@ class BaseGrammarBackend:
         """
         if key in self.cache:
             value = self.cache[key]
-            # Check if it's a completed grammar or still a Future
-            if isinstance(value, futures.Future):
-                return value, False  # Still compiling
-            else:
-                return value, True  # Cache hit
+            if value is INVALID_GRAMMAR_OBJ:
+                return value, True
+            return value.copy(), True
 
-        # Not in cache, submit async compilation
+        # Concurrent misses also need independent mutable grammar objects.
         key_type, key_string = key
         future = self.executor.submit(self._dispatch, key_type, key_string)
-        self.cache[key] = future
         return future, False
 
     def set_cache(self, key: tuple[str, str], value: BaseGrammarObject):

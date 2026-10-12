@@ -21,10 +21,17 @@ def create_device_mesh(
     allow_split_physical_axes: bool = True,
     use_explicit_sharding: bool = True,
     mesh_axes: Sequence[str] = default_mesh_axes,
+    is_full_topology: bool = False,
 ) -> jax.sharding.Mesh:
     """Create a device mesh"""
     if devices is None:
+        if is_full_topology:
+            raise ValueError("is_full_topology requires explicit target devices")
         devices = jax.devices()
+
+    # Explicit devices can describe a remote compilation topology. Do not query
+    # the host runtime to decide whether that topology is a device subset.
+    topology_devices = devices
 
     offset = get_device_id_offset(devices)
 
@@ -42,7 +49,7 @@ def create_device_mesh(
             allow_split_physical_axes=allow_split_physical_axes,
         )
     else:
-        all_devices = jax.devices()
+        all_devices = topology_devices if is_full_topology else jax.devices()
         is_subset = len(devices) < len(all_devices)
         if is_subset:
             # JAX's create_device_mesh infers the full physical TPU topology

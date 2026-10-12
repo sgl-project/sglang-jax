@@ -179,9 +179,10 @@ class ExpertLocationMetadata:
 
     @staticmethod
     def _init_common(server_args: ServerArgs, model_config: ModelConfig):
-        num_logical_experts = getattr(model_config.hf_config, "num_experts", 0)
-        num_layers = getattr(model_config.hf_config, "num_hidden_layers", 0)
-        num_groups = getattr(model_config.hf_config, "num_expert_group", 1)
+        fields = expert_location_config(model_config)
+        num_logical_experts = fields["num_experts"]
+        num_layers = fields["num_layers"]
+        num_groups = fields["num_groups"]
 
         if num_logical_experts == 0 or num_layers == 0:
             return None
@@ -297,6 +298,27 @@ def compute_initial_expert_location_metadata(
         raise NotImplementedError(
             f"Unknown init_expert_location format. Keys found: {list(data_dict.keys())}"
         )
+
+
+def expert_location_config(model_config: ModelConfig) -> dict:
+    """The fields EPLB needs: num_experts, num_layers, num_groups.
+
+    Models whose MoE config does not live on the outer HF config (e.g. VL
+    wrappers with ``text_config``) expose ``get_expert_location_config(hf_config)``
+    and return these fields themselves; everything else reads ``hf_config``.
+    """
+    from sgl_jax.srt.model_loader.arch import get_model_architecture
+
+    model_cls, _ = get_model_architecture(model_config)
+    hook = getattr(model_cls, "get_expert_location_config", None)
+    if hook is not None:
+        return hook(model_config.hf_config)
+    cfg = model_config.hf_config
+    return {
+        "num_experts": getattr(cfg, "num_experts", 0),
+        "num_layers": getattr(cfg, "num_hidden_layers", 0),
+        "num_groups": getattr(cfg, "num_expert_group", 1),
+    }
 
 
 def init_expert_location_metadata(server_args, model_config):

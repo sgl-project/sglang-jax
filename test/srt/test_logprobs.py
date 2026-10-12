@@ -3,7 +3,7 @@ import unittest
 from sgl_jax.srt.entrypoints.engine import Engine
 from sgl_jax.test.test_utils import DEEPSEEK_R1_DISTILL_QWEN_1_5B
 
-# python3 -u -m sgl_jax.launch_server --model-path deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --trust-remote-code --dist-init-addr=0.0.0.0:10011 --nnodes=1 --tp-size=1 --device=tpu --random-seed=27 --node-rank=0 --mem-fraction-static=0.8 --chunked-prefill-size=8192 --download-dir=/tmp --dtype=bfloat16 --precompile-bs-paddings 1 64 --max-running-requests 64 --max-total-tokens 257536 --skip-server-warmup --attention-backend=fa --precompile-token-paddings 8192 --page-size=64 --disable-overlap-schedule --log-requests --log-requests-level=3 --enable-precision-tracer --use-sort-for-toppk-minp
+# python3 -u -m sgl_jax.launch_server --model-path deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --trust-remote-code --dist-init-addr=0.0.0.0:10011 --nnodes=1 --tp-size=1 --device=tpu --random-seed=27 --node-rank=0 --mem-fraction-static=0.8 --chunked-prefill-size=8192 --download-dir=/tmp --dtype=bfloat16 --precompile-bs-paddings 1 64 --max-running-requests 64 --max-total-tokens 257536 --skip-server-warmup --attention-backend=fa --precompile-token-paddings 8192 --page-size=64 --disable-overlap-schedule --log-requests --log-requests-level=3 --enable-precision-tracer
 
 print("Running on Google TPU")
 # Default engine configuration
@@ -18,7 +18,6 @@ DEFAULT_ENGINE_CONFIG = {
     "max_total_tokens": 257536,
     "precompile_token_paddings": [8192],
     "precompile_bs_paddings": [1, 64],
-    "use_sort_for_toppk_minp": True,
     "mem_fraction_static": 0.8,
     "disable_overlap_schedule": True,
     "trust_remote_code": True,

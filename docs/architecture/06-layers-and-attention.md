@@ -165,10 +165,10 @@ The routing layer's job is to compute, from `hidden_states`, "which experts each
 
 `GateLogit(nnx.Module)` (`layers/gate.py`):
 
-- `kernel` shape `(input_size, num_experts)`, dtype `jnp.float32`, fully replicated (`P(None, None)`). `num_experts` is typically small (tens to hundreds); shard communication cost far exceeds replication cost.
+- `kernel` shape `(input_size, num_experts)`, stored in `kernel_dtype` (default `jnp.float32`; a model may pass its checkpoint-native dtype, e.g. GLM-5.2 stores BF16), fully replicated (`P(None, None)`). `num_experts` is typically small (tens to hundreds); shard communication cost far exceeds replication cost.
 - Optional `bias` (only enabled when `enable_expert_bias=True`, DeepSeek V3's `e_score_correction_bias`), used for auxiliary-loss-free load balancing — its special semantics are explained below.
 - `score_func`: `"softmax"` / `"sigmoid"` / `"tanh"` / `None`.
-- Computes `dot(hidden_states, kernel)` with `Precision.HIGHEST`.
+- Computes `dot(hidden_states, kernel)` in `compute_dtype` (default `jnp.float32`, independent of the storage dtype) with `Precision.HIGHEST`; the optional bias is stored in `bias_dtype` (defaults to the legacy `weight_dtype`).
 
 ##### Four TopK Variants
 

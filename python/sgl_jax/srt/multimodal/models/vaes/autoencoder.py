@@ -8,11 +8,11 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
+from sgl_jax.srt.model_loader.weights import WeightLoader
 from sgl_jax.srt.multimodal.configs.vaes.flux_vae_config import FluxVAEConfig
 from sgl_jax.srt.multimodal.models.vaes.common import Decoder, Encoder
 from sgl_jax.srt.multimodal.models.vaes.flux_vae_weight_mappings import to_mappings
 from sgl_jax.srt.multimodal.models.wan.vaes.commons import DiagonalGaussianDistribution
-from sgl_jax.srt.utils.weight_utils import WeightLoader
 
 
 class AutoencoderKL(nnx.Module):
@@ -134,7 +134,7 @@ class AutoencoderKL(nnx.Module):
             mesh=self.mesh,
             dtype=self.dtype,
         )
-        loader.load_weights_from_safetensors(to_mappings(self.config))
+        loader.load(to_mappings(self.config))
 
     def encode(self, x: jax.Array) -> jax.Array:
         """Encode input to latent space. Returns plain jax.Array (posterior mode)."""

@@ -16,8 +16,8 @@ from transformers import CLIPTextConfig, CLIPVisionConfig
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.embeddings import Embed
 from sgl_jax.srt.layers.linear import LinearBase
+from sgl_jax.srt.model_loader.weights import WeightLoader, WeightSpec
 from sgl_jax.srt.multimodal.models.encoders.base import BaseEncoderOutput
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 # =============================================================================
 # Utilities
@@ -218,32 +218,30 @@ def _layer_mappings(config, idx, src_prefix, tgt_prefix):
     """Generate weight mappings for an encoder layer."""
     s, t = f"{src_prefix}.{idx}", f"{tgt_prefix}.{idx}"
     return {
-        f"{s}.layer_norm1.weight": WeightMapping(f"{t}.layer_norm1.scale", (None,), False),
-        f"{s}.layer_norm1.bias": WeightMapping(f"{t}.layer_norm1.bias", (None,), False),
-        f"{s}.layer_norm2.weight": WeightMapping(f"{t}.layer_norm2.scale", (None,), False),
-        f"{s}.layer_norm2.bias": WeightMapping(f"{t}.layer_norm2.bias", (None,), False),
-        f"{s}.self_attn.q_proj.weight": WeightMapping(
+        f"{s}.layer_norm1.weight": WeightSpec(f"{t}.layer_norm1.scale", (None,), False),
+        f"{s}.layer_norm1.bias": WeightSpec(f"{t}.layer_norm1.bias", (None,), False),
+        f"{s}.layer_norm2.weight": WeightSpec(f"{t}.layer_norm2.scale", (None,), False),
+        f"{s}.layer_norm2.bias": WeightSpec(f"{t}.layer_norm2.bias", (None,), False),
+        f"{s}.self_attn.q_proj.weight": WeightSpec(
             f"{t}.self_attn.q_proj.weight", (None, "tensor"), True
         ),
-        f"{s}.self_attn.q_proj.bias": WeightMapping(f"{t}.self_attn.q_proj.bias", (None,), False),
-        f"{s}.self_attn.k_proj.weight": WeightMapping(
+        f"{s}.self_attn.q_proj.bias": WeightSpec(f"{t}.self_attn.q_proj.bias", (None,), False),
+        f"{s}.self_attn.k_proj.weight": WeightSpec(
             f"{t}.self_attn.k_proj.weight", (None, "tensor"), True
         ),
-        f"{s}.self_attn.k_proj.bias": WeightMapping(f"{t}.self_attn.k_proj.bias", (None,), False),
-        f"{s}.self_attn.v_proj.weight": WeightMapping(
+        f"{s}.self_attn.k_proj.bias": WeightSpec(f"{t}.self_attn.k_proj.bias", (None,), False),
+        f"{s}.self_attn.v_proj.weight": WeightSpec(
             f"{t}.self_attn.v_proj.weight", (None, "tensor"), True
         ),
-        f"{s}.self_attn.v_proj.bias": WeightMapping(f"{t}.self_attn.v_proj.bias", (None,), False),
-        f"{s}.self_attn.out_proj.weight": WeightMapping(
+        f"{s}.self_attn.v_proj.bias": WeightSpec(f"{t}.self_attn.v_proj.bias", (None,), False),
+        f"{s}.self_attn.out_proj.weight": WeightSpec(
             f"{t}.self_attn.out_proj.weight", ("tensor", None), True
         ),
-        f"{s}.self_attn.out_proj.bias": WeightMapping(
-            f"{t}.self_attn.out_proj.bias", (None,), False
-        ),
-        f"{s}.mlp.fc1.weight": WeightMapping(f"{t}.mlp.fc1.weight", (None, "tensor"), True),
-        f"{s}.mlp.fc1.bias": WeightMapping(f"{t}.mlp.fc1.bias", (None,), False),
-        f"{s}.mlp.fc2.weight": WeightMapping(f"{t}.mlp.fc2.weight", ("tensor", None), True),
-        f"{s}.mlp.fc2.bias": WeightMapping(f"{t}.mlp.fc2.bias", (None,), False),
+        f"{s}.self_attn.out_proj.bias": WeightSpec(f"{t}.self_attn.out_proj.bias", (None,), False),
+        f"{s}.mlp.fc1.weight": WeightSpec(f"{t}.mlp.fc1.weight", (None, "tensor"), True),
+        f"{s}.mlp.fc1.bias": WeightSpec(f"{t}.mlp.fc1.bias", (None,), False),
+        f"{s}.mlp.fc2.weight": WeightSpec(f"{t}.mlp.fc2.weight", ("tensor", None), True),
+        f"{s}.mlp.fc2.bias": WeightSpec(f"{t}.mlp.fc2.bias", (None,), False),
     }
 
 
@@ -386,7 +384,7 @@ class CLIPVisionModel(nnx.Module):
 
     def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(self, model_config, self.mesh, self.dtype)
-        loader.load_weights_from_safetensors(self._weight_mappings())
+        loader.load(self._weight_mappings())
 
         # =====================================================================
         # POST-LOAD FIX: PyTorch to JAX Conv2D Kernel Transposition
@@ -401,19 +399,21 @@ class CLIPVisionModel(nnx.Module):
     def _weight_mappings(self):
         # We explicitly map HF's vision_model.* to our self.vision_model.* structure
         m = {
-            "vision_model.embeddings.class_embedding": WeightMapping(
+            "vision_model.embeddings.class_embedding": WeightSpec(
                 "vision_model.embeddings.class_embedding", (None,), False
             ),
-            "vision_model.embeddings.patch_embedding.weight": WeightMapping(
+            "vision_model.embeddings.patch_embedding.weight": WeightSpec(
                 "vision_model.embeddings.patch_embedding.kernel", (None,), False
             ),
-            "vision_model.embeddings.position_embedding.weight": WeightMapping(
-                "vision_model.embeddings.position_embedding.embedding", ("tensor", None), False
+            "vision_model.embeddings.position_embedding.weight": WeightSpec(
+                "vision_model.embeddings.position_embedding.embedding",
+                ("tensor", None),
+                False,
             ),
-            "vision_model.pre_layrnorm.weight": WeightMapping(
+            "vision_model.pre_layrnorm.weight": WeightSpec(
                 "vision_model.pre_layrnorm.scale", (None,), False
             ),
-            "vision_model.pre_layrnorm.bias": WeightMapping(
+            "vision_model.pre_layrnorm.bias": WeightSpec(
                 "vision_model.pre_layrnorm.bias", (None,), False
             ),
         }
@@ -422,15 +422,18 @@ class CLIPVisionModel(nnx.Module):
         for i in range(layer_count):
             m.update(
                 _layer_mappings(
-                    self.config, i, "vision_model.encoder.layers", "vision_model.encoder.layers"
+                    self.config,
+                    i,
+                    "vision_model.encoder.layers",
+                    "vision_model.encoder.layers",
                 )
             )
 
         if self.vision_model.post_layernorm is not None:
-            m["vision_model.post_layernorm.weight"] = WeightMapping(
+            m["vision_model.post_layernorm.weight"] = WeightSpec(
                 "vision_model.post_layernorm.scale", (None,), False
             )
-            m["vision_model.post_layernorm.bias"] = WeightMapping(
+            m["vision_model.post_layernorm.bias"] = WeightSpec(
                 "vision_model.post_layernorm.bias", (None,), False
             )
 
@@ -542,20 +545,24 @@ class CLIPTextModel(nnx.Module):
 
     def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(self, model_config, self.mesh, self.dtype)
-        loader.load_weights_from_safetensors(self._weight_mappings())
+        loader.load(self._weight_mappings())
 
     def _weight_mappings(self):
         m = {
-            "text_model.embeddings.token_embedding.weight": WeightMapping(
-                "text_model.embeddings.token_embedding.embedding", ("tensor", None), False
+            "text_model.embeddings.token_embedding.weight": WeightSpec(
+                "text_model.embeddings.token_embedding.embedding",
+                ("tensor", None),
+                False,
             ),
-            "text_model.embeddings.position_embedding.weight": WeightMapping(
-                "text_model.embeddings.position_embedding.embedding", (None, "tensor"), False
+            "text_model.embeddings.position_embedding.weight": WeightSpec(
+                "text_model.embeddings.position_embedding.embedding",
+                (None, "tensor"),
+                False,
             ),
-            "text_model.final_layer_norm.weight": WeightMapping(
+            "text_model.final_layer_norm.weight": WeightSpec(
                 "text_model.final_layer_norm.scale", (None,), False
             ),
-            "text_model.final_layer_norm.bias": WeightMapping(
+            "text_model.final_layer_norm.bias": WeightSpec(
                 "text_model.final_layer_norm.bias", (None,), False
             ),
         }

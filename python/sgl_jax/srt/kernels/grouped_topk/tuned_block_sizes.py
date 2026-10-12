@@ -4,13 +4,13 @@ Tuned by `benchmark/kernels/grouped_topk/tune_grouped_topk_bt.py` on real TPU: B
 overhead against the largest tile that fits VMEM. Lookup returns None on a miss so callers use a
 safe default.
 
-Key: (next_power_of_2(T), E, G, Gtop, k), T_local = per-device token count. Self-contained
-(only `jax`) to keep the kernel embeddable.
+Key: (next_power_of_2(T), E, G, Gtop, k), T_local = per-device token count.
+Device selection follows the shared runtime or explicit compilation target.
 """
 
 import logging
 
-import jax
+from sgl_jax.srt.utils.jax_utils import get_device_kind
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +21,7 @@ def _next_power_of_2(x: int) -> int:
 
 def _device_name() -> str:
     """Normalized TPU name, mirrors sgl_jax.srt.utils.jax_utils.get_device_name (e.g. 'TPU v7')."""
-    kind = jax.devices()[0].device_kind
+    kind = get_device_kind()
     if "TPU" not in kind:
         raise RuntimeError("not a TPU device")
     if kind.endswith(" lite"):
