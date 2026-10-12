@@ -231,7 +231,7 @@ def test_read_only_attention_uses_only_committed_cache(kv_len, window):
             jnp.array([0, num_pages * page_size], dtype=jnp.int32),
             jnp.array([1, 1, 1], dtype=jnp.int32),
             None,
-            append_kv=False,
+            update_kv_cache=False,
             d_block_sizes=(1, 256, 1, 256),
             **attention_args,
         )
