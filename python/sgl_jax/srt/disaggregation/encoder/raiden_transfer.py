@@ -13,6 +13,7 @@ import jax
 import numpy as np
 
 from sgl_jax.raiden import require_raiden_preloaded
+from sgl_jax.srt.disaggregation.encoder.errors import EncoderBatchCapacityError
 from sgl_jax.srt.disaggregation.raiden_transfer.wrapper import RaidenTransferWrapper
 
 
@@ -96,13 +97,16 @@ class RaidenEncoderServerTransfer:
             reservations.append(request)
             offset += count
         parts = [part for request in reservations for part in request.parts]
-        needed = [
-            sum(self.pool.pages_needed(len(p.token_indices)) for p in parts if p.rank == rank)
-            for rank in range(self.num_lanes)
-        ]
+        try:
+            needed = [
+                sum(self.pool.pages_needed(len(p.token_indices)) for p in parts if p.rank == rank)
+                for rank in range(self.num_lanes)
+            ]
+        except ValueError as exc:
+            raise EncoderBatchCapacityError("encoder request exceeds Raiden pool capacity") from exc
         slots = [sum(p.rank == rank for p in parts) for rank in range(self.num_lanes)]
         if max(needed) > self._pages_per_lane or max(slots) > self._max_inflight:
-            raise ValueError("encoder batch exceeds Raiden pool capacity")
+            raise EncoderBatchCapacityError("encoder batch exceeds Raiden pool capacity")
         deadline = time.monotonic() + self._timeout_s
         while True:
             with self._lock:

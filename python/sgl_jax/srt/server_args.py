@@ -1874,7 +1874,8 @@ class ServerArgs:
             "--encoder-transfer-max-tokens",
             type=int,
             default=ServerArgs.encoder_transfer_max_tokens,
-            help="Token capacity of each Encoder transfer device pool, rounded up to 128-token pages.",
+            help="Total token capacity of each Encoder transfer pool, sharded across devices "
+            "and rounded up to complete 128-token pages per device.",
         )
         parser.add_argument(
             "--encoder-control-timeout-seconds",

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from sgl_jax.srt.disaggregation.encoder.embedding_data import EmbeddingData
+from sgl_jax.srt.disaggregation.encoder.errors import EncoderBatchCapacityError
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalInputs
 
 if TYPE_CHECKING:
@@ -186,7 +187,14 @@ class EncoderRuntime:
             if reserved:
                 for transfer_id in transfer_ids:
                     self._transfer.release(transfer_id)
-            if isinstance(exc, CancelledError) and not reserved:
+            if isinstance(exc, EncoderBatchCapacityError) and not reserved and len(requests) > 1:
+                # Request-count batching can exceed a backend's page/slot limits.
+                # Rebuild each smaller batch's lane layout before reserving again.
+                # A single oversized request must not fail its valid siblings.
+                middle = len(requests) // 2
+                self._encode_batch(requests[:middle])
+                self._encode_batch(requests[middle:])
+            elif isinstance(exc, CancelledError) and not reserved:
                 # Retry live siblings with their original layout after a queued abort.
                 self._encode_batch([r for r in requests if not r.release_requested.is_set()])
             else:
