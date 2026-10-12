@@ -115,7 +115,8 @@ def test_read_only_attention_uses_only_committed_cache(kv_len, window):
     ).astype(np.float32)
     cache_bf16 = jnp.asarray(cache, jnp.bfloat16)
     expected_cache = np.asarray(jax.device_get(cache_bf16), np.float32)
-    query = jnp.asarray(rng.uniform(-0.25, 0.25, (1, num_heads, head_dim)), jnp.bfloat16)
+    query_host = rng.uniform(-0.25, 0.25, (1, num_heads, head_dim))
+    query = jnp.asarray(query_host, jnp.bfloat16)
     page_indices = jnp.arange(num_pages, dtype=jnp.int32)
     reference_pages = page_indices[None, :]
     kv_lens = jnp.array([kv_len], dtype=jnp.int32)
@@ -134,6 +135,10 @@ def test_read_only_attention_uses_only_committed_cache(kv_len, window):
 
     outputs = []
     for fill in (3.0, -5.0):
+        # RPA donates its query buffer, so each independent invocation needs its
+        # own device array. Reusing ``query`` would make the second call fail
+        # before testing that dummy K/V cannot affect read-only attention.
+        query = jnp.asarray(query_host, jnp.bfloat16)
         dummy = jnp.full((1, 1, head_dim), fill, dtype=jnp.bfloat16)
         output, updated_cache = ragged_paged_attention(
             query,
