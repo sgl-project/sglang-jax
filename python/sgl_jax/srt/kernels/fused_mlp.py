@@ -128,11 +128,11 @@ def apply_fused_mlp_sharded(
     b_inter: int = 128,
 ) -> jax.Array:
     in_specs = (
-        P(None, None),  # x
+        P("data", None),  # x (dp-sharded hidden states)
         P(None, "tensor"),  # w_gu (combined gate/up weight, sharded along tensor axis)
         P("tensor", None),  # wd (down weight, sharded along tensor axis)
     )
-    out_specs = P(None, None)
+    out_specs = P("data", None)
 
     @functools.partial(
         shard_map,
