@@ -73,7 +73,12 @@ def _copy_pytree_to_pinned_host(tree: Any) -> Any:
 
     def _to_host(leaf: jax.Array) -> jax.Array:
         sharding = leaf.sharding
-        return jax.device_put(leaf, _make_host_sharding(sharding.mesh, sharding.spec))
+        if hasattr(sharding, "mesh") and hasattr(sharding, "spec"):
+            return jax.device_put(leaf, _make_host_sharding(sharding.mesh, sharding.spec))
+        try:
+            return jax.device_put(leaf, jax.devices("cpu")[0])
+        except Exception:
+            return jax.device_put(leaf)
 
     staged = jax.tree.map(_to_host, tree)
     jax.block_until_ready(staged)

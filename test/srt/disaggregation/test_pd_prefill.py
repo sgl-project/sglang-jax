@@ -773,18 +773,21 @@ def test_path_a_uses_reserved_buffer_and_no_op_on_done():
 
 def test_path_a_rollback_releases_only_registered_sub_uuids_no_double_free():
     w = _FakeWrapper()
-    # raise on the SECOND copy_from_device call
-    pool = _FakePool(raise_on_call=2)
+    pool = _FakePool()
     mgr = JaxTransferKVManager.__new__(JaxTransferKVManager)
     mgr._wrapper = w
     mgr._host_pool = pool
     layers = [jnp.ones((2, 3))]
-    # dicts preserve insertion order: "a" succeeds, "b" raises
-    with pytest.raises(RuntimeError, match="simulated D2H failure"):
-        mgr.producer_handoff(
-            "uuid-1", {"a": layers, "b": layers}, use_d2h_staging=True, buffer_id=7
-        )
-    # only the sub-uuid registered before the failure ("a") was rolled back
-    assert w.released == ["uuid-1:a"]
+    # "kv" succeeds and registers; staging the second entry raises.
+    with mock.patch(
+        "sgl_jax.srt.disaggregation.jax_transfer.conn._copy_pytree_to_pinned_host",
+        side_effect=RuntimeError("simulated D2H failure"),
+    ):
+        with pytest.raises(RuntimeError, match="simulated D2H failure"):
+            mgr.producer_handoff(
+                "uuid-1", {"kv": layers, "rec": layers}, use_d2h_staging=True, buffer_id=7
+            )
+    # only the sub-uuid registered before the failure ("kv") was rolled back
+    assert w.released == ["uuid-1:kv"]
     # pool slot was NEVER released (scheduler prefill-terminal callback owns it)
     assert pool.released == []

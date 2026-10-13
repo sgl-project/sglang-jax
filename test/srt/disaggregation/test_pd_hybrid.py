@@ -16,11 +16,6 @@ Run:
 
 from __future__ import annotations
 
-import os
-
-os.environ.setdefault("JAX_PLATFORMS", "cpu")
-os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
-
 import types  # noqa: E402
 from types import SimpleNamespace  # noqa: E402
 from unittest import mock  # noqa: E402
