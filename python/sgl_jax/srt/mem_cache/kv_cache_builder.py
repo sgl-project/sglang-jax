@@ -23,6 +23,30 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _host_mem_available_bytes() -> int | None:
+    """MemAvailable from /proc/meminfo, bounded by the cgroup limit if any."""
+    avail = None
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    avail = int(line.split()[1]) * 1024
+                    break
+    except OSError:
+        return None
+    for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            with open(path) as f:
+                raw = f.read().strip()
+            if raw and raw != "max":
+                limit = int(raw)
+                avail = limit if avail is None else min(avail, limit)
+            break
+        except (OSError, ValueError):
+            continue
+    return avail
+
+
 def build_kv_cache(
     *,
     server_args: ServerArgs,
@@ -89,16 +113,47 @@ def init_hicache(cache, server_args, mesh, token_to_kv_pool_allocator) -> None:
     host_token_budget = int(server_args.hicache_ratio * device_pool.size)
     num_pages = host_token_budget // page_size
 
-    host_pool = LRUHostKVPool(
-        device_pool=device_pool,
-        pool_size=num_pages,
-        page_size=page_size,
-        layer_num=device_pool.layer_num,
-        per_layer_shape=per_layer_shape,
-        dtype=device_pool.dtype,
-        mesh=mesh,
-        partition_spec=device_pool.kv_sharding.spec,
-    )
+    def _make_pool(n_pages: int) -> LRUHostKVPool:
+        return LRUHostKVPool(
+            device_pool=device_pool,
+            pool_size=n_pages,
+            page_size=page_size,
+            layer_num=device_pool.layer_num,
+            per_layer_shape=per_layer_shape,
+            dtype=device_pool.dtype,
+            mesh=mesh,
+            partition_spec=device_pool.kv_sharding.spec,
+        )
+
+    host_pool = _make_pool(num_pages)
+
+    # Host-RAM budget: cap the pool so its pinned footprint on THIS host stays
+    # under a fraction of currently-available RAM. Pinned slots are allocated
+    # lazily, so without this the pool silently grows until the TPU runtime's
+    # own host allocations fail (observed: posix_memalign ENOMEM at 636 GB).
+    frac = float(getattr(server_args, "hicache_host_mem_fraction", 0.5))
+    avail = _host_mem_available_bytes()
+    per_slot = host_pool.host_bytes_per_slot_local()
+    if avail is not None and per_slot > 0:
+        max_pages = int(avail * frac) // per_slot
+        if max_pages < 1:
+            raise RuntimeError(
+                f"HiCache: one host page slot needs {per_slot / 2**20:.1f} MB pinned RAM "
+                f"but only {avail / 2**30:.1f} GB host RAM is available"
+            )
+        if max_pages < num_pages:
+            logger.warning(
+                "HiCache: capping host pool from %d to %d pages so pinned host RAM stays "
+                "<= %.0f%% of available (%.1f GB; %.1f MB/page/host). Lower --hicache-ratio "
+                "to silence this.",
+                num_pages,
+                max_pages,
+                frac * 100,
+                avail / 2**30,
+                per_slot / 2**20,
+            )
+            num_pages = max_pages
+            host_pool = _make_pool(num_pages)
     controller = HiCacheController(host_pool, device_pool)
 
     cache.host_pool = host_pool

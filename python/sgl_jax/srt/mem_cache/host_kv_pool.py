@@ -104,11 +104,40 @@ class _BufferGroup:
         dtype: Any,
         mesh: Mesh,
         partition_spec: PartitionSpec,
+        shard_slot: bool = False,
     ) -> _BufferGroup:
         # A slot is the page packed over layers: prepend a replicated layer
         # axis and drop the device pool's leading page/DP axis (a single
         # gathered page is not DP-sharded). Any TP axis on trailing dims is kept.
-        slot_spec = PartitionSpec(None, *tuple(partition_spec)[1:])
+        trailing = list(tuple(partition_spec)[1:])
+        trailing += [None] * (len(per_layer_shape) - len(trailing))
+        if shard_slot:
+            # Spread the slot over the page axis' mesh axis ("data") instead of
+            # replicating it on every device. A replicated pinned-host slot costs
+            # one copy PER LOCAL DEVICE PER HOST (8x on a 4-chip tpu7x host, and
+            # again on every host); on GLM-5 that is ~108 MB of pinned RAM per
+            # page per host and exhausted a 990 GB host in 80 s of prefill.
+            # Pick the first trailing dim that is divisible by the axis size and
+            # not already sharded: for MLA [page_size/pack, pack, kv_dim] that is
+            # the token-group dim (64 bf16 / 32 fp8), both divisible by dp=32.
+            data_axis = tuple(partition_spec)[0]
+            size = int(mesh.shape[data_axis]) if data_axis in mesh.shape else 1
+            if size > 1:
+                for i, (dim, ax) in enumerate(zip(per_layer_shape, trailing)):
+                    if ax is None and dim % size == 0:
+                        trailing[i] = data_axis
+                        break
+                else:
+                    logger.warning(
+                        "host pool group %s: no trailing dim of %s divisible by %s=%d; "
+                        "host slots will be replicated (%dx pinned RAM)",
+                        name,
+                        per_layer_shape,
+                        data_axis,
+                        size,
+                        size,
+                    )
+        slot_spec = PartitionSpec(None, *trailing)
         return _BufferGroup(
             name=name,
             get_buffers=get_buffers,
@@ -120,10 +149,33 @@ class _BufferGroup:
             slot_spec=slot_spec,
             host_sharding=_make_host_sharding(mesh, slot_spec),
             device_packed_sharding=NamedSharding(mesh, slot_spec),
-            # Batched gather output (one layer, MANY pages): page axis is back and
-            # replicated (gathered pages are not DP-distributed); same form PD uses.
-            batched_layer_sharding=NamedSharding(mesh, PartitionSpec(None, *tuple(partition_spec)[1:])),
+            # Batched gather output (one layer, MANY pages): page axis is back
+            # (not DP-distributed) and the trailing dims follow the slot layout, so
+            # the gather lands each device's slice directly (no 32x replicated
+            # broadcast) and the host put is a local per-device copy.
+            batched_layer_sharding=NamedSharding(mesh, PartitionSpec(None, *trailing)),
         )
+
+    def slot_bytes(self) -> int:
+        """Bytes of one full (unsharded) slot of this group."""
+        n = self.layer_num
+        for d in self.per_layer_shape:
+            n *= int(d)
+        return n * jnp.dtype(self.dtype).itemsize
+
+    def replicas_per_host(self, mesh: Mesh) -> float:
+        """How many full-slot equivalents one host holds in pinned memory.
+
+        local_devices / (product of mesh-axis sizes the slot is sharded over).
+        Replicated slot on an 8-chip host -> 8.0; sharded 32-way -> 8/32 = 0.25.
+        """
+        shard = 1
+        for ax in tuple(self.slot_spec):
+            if ax is None:
+                continue
+            for a in ax if isinstance(ax, tuple) else (ax,):
+                shard *= int(mesh.shape[a])
+        return len(mesh.local_devices) / shard
 
 
 @partial(jax.jit, static_argnames=("mesh", "cache_spec"), donate_argnames=("kv_cache",))
@@ -421,6 +473,18 @@ class LRUHostKVPool(HostKVPool):
         self._partition_spec = partition_spec
         self._pool_name = pool_name
 
+        # H2D scatter flavour. The MHA fused pool exposes
+        # ``attention_data_partition_axis`` and is written through the
+        # token-granular Pallas kernel (``write_kv_layer``); any other pool
+        # (MLA latent/indexer: no token axis, no head axis) goes through the
+        # page-granular ``write_pages_layer``. Decided first because it also
+        # selects the host-slot layout below.
+        self._token_scatter = hasattr(device_pool, "attention_data_partition_axis")
+        # Page-path slots are sharded over the data axis instead of replicated
+        # (see _BufferGroup.build); the MHA token path keeps its TPU-validated
+        # replicated-over-data layout untouched.
+        shard_slot = not self._token_scatter
+
         # Buffer groups: every list of per-layer device buffers a page lives in.
         # Group 0 is the pool's ``kv_buffer`` (the only group for MHA pools).
         # The MLA pool under ``dsa_sparse`` carries a second paged buffer list,
@@ -437,6 +501,7 @@ class LRUHostKVPool(HostKVPool):
                 dtype=dtype,
                 mesh=mesh,
                 partition_spec=partition_spec,
+                shard_slot=shard_slot,
             )
         ]
         indexer_bufs = getattr(device_pool, "indexer_key_buffer", None)
@@ -455,6 +520,7 @@ class LRUHostKVPool(HostKVPool):
                     dtype=idx0.dtype,
                     mesh=mesh,
                     partition_spec=idx_spec,
+                    shard_slot=shard_slot,
                 )
             )
             logger.info(
@@ -472,18 +538,23 @@ class LRUHostKVPool(HostKVPool):
         self._device_packed_sharding = g0.device_packed_sharding
         self._batched_layer_sharding = g0.batched_layer_sharding
 
-        # H2D scatter flavour. The MHA fused pool exposes
-        # ``attention_data_partition_axis`` and is written through the
-        # token-granular Pallas kernel (``write_kv_layer``); any other pool
-        # (MLA latent/indexer: no token axis, no head axis) goes through the
-        # page-granular ``write_pages_layer``.
-        self._token_scatter = hasattr(device_pool, "attention_data_partition_axis")
         if not self._token_scatter:
             logger.info(
                 "host pool %s: device pool %s has no fused MHA layout; using page-granular H2D scatter",
                 pool_name,
                 type(device_pool).__name__,
             )
+        logger.info(
+            "host pool %s: slot layout %s; pinned host RAM per page per host = %.1f MB "
+            "(full slot %.1f MB x %.3f replicas/host); pool of %d pages = %.1f GB/host",
+            pool_name,
+            [(g.name, tuple(g.slot_spec)) for g in self._groups],
+            self.host_bytes_per_slot_local() / 2**20,
+            sum(g.slot_bytes() for g in self._groups) / 2**20,
+            self._groups[0].replicas_per_host(mesh),
+            pool_size,
+            self.host_bytes_per_slot_local() * pool_size / 2**30,
+        )
         # PD's bucketed batched-gather helpers, reused to bound compiled shapes
         # (one kernel per page bucket). Imported at runtime to avoid a
         # mem_cache <- disaggregation import cycle.
@@ -1046,10 +1117,11 @@ class LRUHostKVPool(HostKVPool):
                 # (SMEM overflow) must never crash the server: serving never
                 # drives a transfer that big either. Log and stop.
                 logger.warning(
-                    "hicache precompile: %d pages failed to warm (%s); stopping "
+                    "hicache precompile: %d pages failed to warm (%s: %s); stopping "
                     "at the largest kernel-safe size",
                     r,
                     type(e).__name__,
+                    str(e).splitlines()[0][:300] if str(e) else "",
                 )
                 break
             self.free(slots)
@@ -1060,6 +1132,11 @@ class LRUHostKVPool(HostKVPool):
             real_counts[warmed - 1] if warmed else 0,
             time.perf_counter() - t0,
         )
+
+    def host_bytes_per_slot_local(self) -> int:
+        """Pinned host bytes one page slot costs on THIS host (all groups, all
+        local replicas/shards). Used to budget the pool against host RAM."""
+        return int(sum(g.slot_bytes() * g.replicas_per_host(self._mesh) for g in self._groups))
 
     def available_size(self) -> int:
         """Free page slots (HiCache control plane counts in pages)."""
