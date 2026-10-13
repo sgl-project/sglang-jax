@@ -178,26 +178,36 @@ class _BufferGroup:
         return len(mesh.local_devices) / shard
 
 
-@partial(jax.jit, static_argnames=("mesh", "cache_spec"), donate_argnames=("kv_cache",))
-def write_pages_layer(pages, local_page_ids, kv_cache, mesh, cache_spec):
-    """One-layer, page-granular in-place write: ``kv_cache[local_page_ids[i]] = pages[i]``.
+@partial(
+    jax.jit, static_argnames=("mesh", "cache_spec", "slot_tail"), donate_argnames=("kv_cache",)
+)
+def write_pages_layer(base_pages, sel, local_page_ids, kv_cache, mesh, cache_spec, slot_tail):
+    """One-layer, page-granular in-place write: ``kv_cache[local_page_ids[i]] = base_pages[sel[i]]``.
 
     Layout-agnostic counterpart of :func:`memory_pool.write_kv_layer`. The MHA
     path expands pages into per-token slots and drives a 5-D fused Pallas
     kernel that assumes ``kv_cache.shape[1] == page_size`` and a head axis; the
     MLA pool stores a page as a ``(page_size // packing, packing, kv_dim)`` token
     grid with no head axis, so neither assumption holds. HiCache only ever moves
-    whole pages, so a page-level ``dynamic-update-slice`` is sufficient — and it
+    whole pages, so a page-level ``dynamic-update-slice`` is sufficient -- and it
     is exactly the device layout already, so no reshape is needed.
 
-    ``pages`` is ``[n_b, *per_layer_shape]`` laid out rank-major (``n_b ==
-    per_shard * dp_size``); ``local_page_ids`` are SHARD-LOCAL page ids, ``-1``
-    for padding (dropped). Under ``shard_map`` each data-shard receives its own
-    contiguous chunk of both, matching the shard-local page indexing of its
-    ``kv_cache`` slice.
+    ``base_pages`` is ``[n_c, *per_layer_shape]`` -- the n_c REAL staged pages
+    for this layer, in slot layout ``P(None, *slot_tail)``. ``sel`` (``[n_b]``,
+    ``n_b == per_shard * dp_size``) picks, for every rank-major padded slot, the
+    row of ``base_pages`` to write (padding rows point at 0 and are dropped via
+    their ``-1`` page id). The padded expansion happens *inside* the jit as a
+    gather, so the Python side never stacks ``n_b`` arrays (with dp=32 that was
+    a 16k-operand concatenate and minutes of XLA compile per bucket).
+    ``local_page_ids`` are SHARD-LOCAL page ids, ``-1`` for padding. Under
+    ``shard_map`` each data-shard receives its own contiguous chunk of both,
+    matching the shard-local page indexing of its ``kv_cache`` slice.
     """
     data_axis = tuple(cache_spec)[0]
     pages_spec = PartitionSpec(data_axis, *tuple(cache_spec)[1:])
+    pages = base_pages.at[sel.astype(jnp.int32)].get(
+        out_sharding=NamedSharding(mesh, PartitionSpec(None, *slot_tail))
+    )
     pages = jax.sharding.reshard(pages, NamedSharding(mesh, pages_spec))
     local_page_ids = jax.sharding.reshard(
         local_page_ids.astype(jnp.int32), NamedSharding(mesh, PartitionSpec(data_axis))
@@ -215,6 +225,11 @@ def write_pages_layer(pages, local_page_ids, kv_cache, mesh, cache_spec):
         return local_cache.at[safe].set(local_pages, mode="drop")
 
     return _update(pages, local_page_ids, kv_cache)
+
+
+# Largest number of real pages one flush_load launch handles; larger restores
+# are split so staged/padded shapes (and compiled buckets) stay bounded.
+_MAX_FLUSH_PAGES = 64
 
 
 @dataclass
@@ -927,55 +942,69 @@ class LRUHostKVPool(HostKVPool):
             staged_pages.append(packed_list)
             fresh.append(cur_gen[buffer_id] == gen)
 
-        n = len(host_buffer_ids)
         dp = self._device_pool
         dp_size = int(dp.dp_size)
         num_dev_pages = int(dp.kv_buffer[0].shape[0])
         pages_per_shard = num_dev_pages // dp_size
 
-        # The KV buffer's page axis is sharded contiguously across the data axis:
-        # shard d owns global pages [d*pages_per_shard, (d+1)*pages_per_shard).
-        # Both scatter kernels shard_map their inputs into dp_size equal
-        # contiguous chunks and index each shard's LOCAL slice -- so a global page
-        # must land in its owning shard's chunk, addressed as a shard-local offset
-        # (passing global ids writes to the wrong shard under dp>1). Give every
-        # shard a fixed per_shard bucket (pad_to_page_bucket(n) == the worst case
-        # where all n pages fall on one shard) so the compiled shape depends only
-        # on (n bucket, dp_size). For dp_size==1 this collapses to one
-        # global==local chunk -- identical to the single-shard layout.
-        per_shard = self._pad_to_page_bucket(n)
-        n_b = per_shard * dp_size
-        # Bucket each transfer page into its owning shard's slot list; padding
-        # slots keep staged index 0 (data ignored) and page id -1 (skipped).
-        shard_sel = [[0] * per_shard for _ in range(dp_size)]
-        shard_loc = [[-1] * per_shard for _ in range(dp_size)]
-        fill_pos = [0] * dp_size
-        for k, gp in enumerate(int(p) for p in device_indices):
-            if not fresh[k]:
-                continue  # slot freed/realloc'd since stage_load: drop stale page
+        # Only fresh (not realloc'd since stage_load) pages are written.
+        live = [k for k in range(len(host_buffer_ids)) if fresh[k]]
+        if not live:
+            return
+        # Split big restores into bounded chunks so shapes/compiles stay small.
+        for c0 in range(0, len(live), _MAX_FLUSH_PAGES):
+            chunk = live[c0 : c0 + _MAX_FLUSH_PAGES]
+            self._flush_chunk(chunk, staged_pages, device_indices, pages_per_shard, dp_size, block)
+
+    def _flush_chunk(self, chunk, staged_pages, device_indices, pages_per_shard, dp_size, block):
+        """Write one bounded chunk of staged pages (indices into ``staged_pages``).
+
+        The KV buffer's page axis is sharded contiguously across the data axis:
+        shard d owns global pages [d*pages_per_shard, (d+1)*pages_per_shard).
+        Both scatter kernels shard_map their inputs into dp_size equal
+        contiguous chunks and index each shard's LOCAL slice -- so a global page
+        must land in its owning shard's chunk, addressed as a shard-local offset
+        (passing global ids writes to the wrong shard under dp>1). Every shard
+        gets the same ``per_shard`` slots = bucket(max pages any one shard owns
+        in this chunk), so the compiled shape depends only on that bucket and
+        dp_size. For dp_size==1 this collapses to one global==local chunk.
+        """
+        # Bucket each page into its owning shard's slot list.
+        by_shard: list[list[tuple[int, int]]] = [[] for _ in range(dp_size)]  # (base_row, local)
+        for row, k in enumerate(chunk):
+            gp = int(device_indices[k])
             d = gp // pages_per_shard
-            pos = fill_pos[d]
-            shard_sel[d][pos] = k
-            shard_loc[d][pos] = gp - d * pages_per_shard
-            fill_pos[d] = pos + 1
-        sel = [k for chunk in shard_sel for k in chunk]
-        # Shard-local page ids in rank-major order, -1 = padding.
-        loc_pages = np.asarray([lp for chunk in shard_loc for lp in chunk], dtype=np.int64)
+            by_shard[d].append((row, gp - d * pages_per_shard))
+        per_shard = self._pad_to_page_bucket(max(len(b) for b in by_shard))
+        n_b = per_shard * dp_size
+        # Rank-major padded layout: ``sel`` = base row per slot (padding -> 0),
+        # ``loc_pages`` = shard-local page id per slot (padding -> -1).
+        sel = np.zeros(n_b, dtype=np.int32)
+        loc_pages = np.full(n_b, -1, dtype=np.int64)
+        for d, entries in enumerate(by_shard):
+            for pos, (row, lp) in enumerate(entries):
+                sel[d * per_shard + pos] = row
+                loc_pages[d * per_shard + pos] = lp
+        # Real slots padded to a bucket too (fewer compiled base shapes); the pad
+        # rows duplicate row 0 and are never selected.
+        n_c = self._pad_to_page_bucket(len(chunk))
+        base_idx = list(chunk) + [chunk[0]] * (n_c - len(chunk))
 
         if self._token_scatter:
-            self._flush_load_tokens(staged_pages, sel, loc_pages, n_b, block)
+            self._flush_load_tokens(staged_pages, base_idx, sel, loc_pages, n_b, block)
         else:
-            self._flush_load_pages(staged_pages, sel, loc_pages, block)
+            self._flush_load_pages(staged_pages, base_idx, sel, loc_pages, block)
 
-    def _flush_load_tokens(self, staged_pages, sel, loc_pages, n_b, block) -> None:
+    def _flush_load_tokens(self, staged_pages, base_idx, sel, loc_pages, n_b, block) -> None:
         """MHA fused layout: expand pages to token slots, Pallas in-place write."""
         from sgl_jax.srt.mem_cache.memory_pool import write_kv_layer
 
         dp = self._device_pool
         PS = self._page_size
         group = self._groups[0]  # MHA pools have exactly one buffer group
-        stack = jnp.stack(
-            [staged_pages[i][0] for i in sel], axis=0
+        base = jnp.stack([staged_pages[i][0] for i in base_idx], axis=0)  # (n_c, L, *shape)
+        stack = base.at[jnp.asarray(sel, dtype=jnp.int32)].get(
+            out_sharding=NamedSharding(dp.mesh, PartitionSpec(None, *tuple(group.slot_spec)))
         )  # (n_b, layer_num, *per_layer_shape)
 
         # Expand shard-local page ids -> shard-local token slots (page*PS + offset),
@@ -1008,7 +1037,7 @@ class LRUHostKVPool(HostKVPool):
         buffers = group.get_buffers()
         for layer in range(group.layer_num):
             # One slice for the whole batch's layer (page axis kept), folded to
-            # tokens — no per-page gather/concatenate.
+            # tokens -- no per-page gather/concatenate.
             layer_kv = stack[:, layer]  # (n_b, page_size, *per_head_tail)
             layer_kv = jax.lax.reshape(
                 layer_kv,
@@ -1030,30 +1059,36 @@ class LRUHostKVPool(HostKVPool):
         if block:
             jax.block_until_ready(group.get_buffers())
 
-    def _flush_load_pages(self, staged_pages, sel, loc_pages, block) -> None:
+    def _flush_load_pages(self, staged_pages, base_idx, sel, loc_pages, block) -> None:
         """Layout-agnostic: whole-page in-place write per layer per buffer group.
 
         The staged slot already has the device page layout (whatever it is), so
         the only work is placing page ``i`` at shard-local page ``loc_pages[i]``
-        of the owning data-shard. No token expansion, no reshape.
+        of the owning data-shard. No token expansion, no reshape. Per layer we
+        stack only the n_c real staged pages; the rank-major padded expansion is
+        a gather inside ``write_pages_layer``.
         """
         dp = self._device_pool
         local_ids = jnp.asarray(loc_pages, dtype=jnp.int32)
+        sel_dev = jnp.asarray(sel, dtype=jnp.int32)
         for gi, group in enumerate(self._groups):
-            stack = jnp.stack(
-                [staged_pages[i][gi] for i in sel], axis=0
-            )  # (n_b, layer_num, *per_layer_shape)
             buffers = group.get_buffers()
             cache_spec = buffers[0].sharding.spec
+            slot_tail = tuple(group.slot_spec)[1:]
+            base = jnp.stack(
+                [staged_pages[i][gi] for i in base_idx], axis=0
+            )  # (n_c, layer_num, *per_layer_shape), slot layout
             for layer in range(group.layer_num):
                 group.set_buffer(
                     layer,
                     write_pages_layer(
-                        stack[:, layer],  # (n_b, *per_layer_shape), page axis replicated
+                        base[:, layer],  # (n_c, *per_layer_shape)
+                        sel_dev,
                         local_ids,
                         buffers[layer],
                         dp.mesh,
                         cache_spec,
+                        slot_tail,
                     ),
                 )
             if block:
@@ -1074,7 +1109,9 @@ class LRUHostKVPool(HostKVPool):
         # count (never more than ``cap_real`` slots, so alloc always fits) and let
         # the transfer pad internally — covering the top partial bucket too.
         dev_pages_total = int(self._device_pool.size) // self._page_size
-        cap_real = min(self._pool_size, dev_pages_total)
+        # flush_load splits anything larger into _MAX_FLUSH_PAGES chunks, so
+        # warming beyond that only compiles shapes serving never launches.
+        cap_real = min(self._pool_size, dev_pages_total, _MAX_FLUSH_PAGES)
         if max_pages is not None:
             cap_real = min(cap_real, int(max_pages))
         if cap_real <= 0:
