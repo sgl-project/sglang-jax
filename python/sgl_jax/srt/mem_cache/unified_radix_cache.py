@@ -1106,7 +1106,12 @@ class UnifiedRadixCache(BasePrefixCache):
                     exc,
                     len(host_pages),
                 )
-        self.hicache_controller.check_write_status()
+        # Failed backups were rolled back above (node simply stays device-only);
+        # a host-side allocation hiccup must not take the serving loop down.
+        try:
+            self.hicache_controller.check_write_status()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("HiCache D2H write failed (node left un-backed-up): %s", e)
 
     def check_hicache_events(self) -> None:
         """Non-blocking poll of in-flight D2H writes (scheduler hook)."""
