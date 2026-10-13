@@ -29,6 +29,7 @@ from sgl_jax.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
 from sgl_jax.srt.managers.schedule_batch import PADDING_BUCKETS, ModelWorkerBatch
 from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
+from sgl_jax.srt.model_executor.batch_inputs import BatchInputs
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.utils.common_utils import pad_to_bucket
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
@@ -534,17 +535,20 @@ def create_test_data(
     )
 
     mwb = ModelWorkerBatch(
+        inputs=BatchInputs.from_arrays(
+            input_ids=input_ids_cpu,
+            seq_lens=seq_lens_cpu,
+            out_cache_loc=out_cache_loc_cpu,
+            req_pool_indices=req_pool_indices_cpu,
+            positions=positions_cpu,
+            extend_seq_lens=extend_seq_lens_cpu,
+            extend_prefix_lens=extend_prefix_lens_cpu,
+            recurrent_indices=recurrent_indices_cpu,
+        ),
         bid=1,
         forward_mode=forward_mode,
-        input_ids=input_ids_cpu,
         real_input_ids_len=input_ids_cpu.shape[0],
-        seq_lens=seq_lens_cpu,
-        out_cache_loc=out_cache_loc_cpu,
-        req_pool_indices=req_pool_indices_cpu,
-        positions=positions_cpu,
         cache_loc=out_cache_loc_cpu,
-        extend_seq_lens=extend_seq_lens_cpu,
-        extend_prefix_lens=extend_prefix_lens_cpu,
         sampling_info=None,
         return_logprob=False,
         return_output_logprob_only=False,
@@ -552,13 +556,12 @@ def create_test_data(
         token_ids_logprobs=None,
         extend_logprob_start_lens=None,
         extend_input_logprob_token_ids=None,
-        logits_indices=(np.zeros(total_bs, dtype=np.int32) if is_prefill else None),
+        logits_indices=np.zeros(total_bs, dtype=np.int32) if is_prefill else None,
         real_bs=total_bs,
         real_bs_per_dp=real_bs_per_dp,
         dp_size=dp_size,
         per_dp_bs_size=per_dp_bs_padding,
         spec_info_padded=None,
-        recurrent_indices=recurrent_indices_cpu,
         has_initial_state=has_initial_state_cpu,
     )
 

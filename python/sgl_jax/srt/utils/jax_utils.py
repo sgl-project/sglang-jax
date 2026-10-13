@@ -296,6 +296,87 @@ def device_array(data, sharding=None, **kwargs) -> jax.Array:
     return jax.tree.map(_to_device, data)
 
 
+@cache
+def _metadata_unpacker(shapes, sharding):
+    """Cache one unpack dispatch per bucket, with no communication between DP ranks."""
+    axis = sharding.spec[0] if sharding.spec else None
+    axes = (axis,) if isinstance(axis, str) else axis or ()
+    num_shards = int(np.prod([sharding.mesh.shape[a] for a in axes]))
+    axis_types = dict(zip(sharding.mesh.axis_names, sharding.mesh.axis_types))
+    reshape_sharding = (
+        sharding if all(axis_types[a] == jax.sharding.AxisType.Explicit for a in axes) else None
+    )
+    sizes = tuple(int(np.prod(shape)) // num_shards for shape in shapes)
+    offsets = np.cumsum((0,) + sizes)
+    buffer_sharding = canonicalize_sharding(
+        jax.sharding.NamedSharding(
+            sharding.mesh, PartitionSpec(axis, None), memory_kind=sharding.memory_kind
+        )
+    )
+
+    def unpack(buffer):
+        return tuple(
+            jax.lax.reshape(buffer[:, start:end], shape, out_sharding=reshape_sharding)
+            for shape, start, end in zip(shapes, offsets[:-1], offsets[1:])
+        )
+
+    return (
+        num_shards,
+        sizes,
+        buffer_sharding,
+        jax.jit(unpack, in_shardings=buffer_sharding, out_shardings=(sharding,) * len(shapes)),
+    )
+
+
+def packed_device_array(data, sharding):
+    """Upload compatible host metadata with one transfer/unpack per dtype.
+
+    The caller groups arrays with the same leading-axis sharding. Pack *within*
+    each DP rank so unpacking only slices local data. Each packed group owns a fresh,
+    read-only host snapshot; JAX retains its callback arrays until the async
+    transfer finishes. No staging storage is reused by an overlapping batch.
+    Device arrays pass through without a host round trip. Singleton groups use
+    a direct transfer. Large arrays and other layouts should be uploaded separately.
+    """
+    sharding = canonicalize_sharding(sharding)
+    if len(sharding.spec) > 1:
+        raise ValueError("Packed metadata requires replicated or leading-axis sharding")
+    leaves, tree = jax.tree.flatten(data)
+    result: list[jax.Array | None] = [None] * len(leaves)
+    groups = defaultdict(list)
+    for index, leaf in enumerate(leaves):
+        if isinstance(leaf, jax.Array):
+            result[index] = leaf if leaf.sharding == sharding else jax.device_put(leaf, sharding)
+            continue
+        array = np.asarray(leaf)
+        # Warmup may supply int64 where serving supplies int32. Match JAX's
+        # upload dtype before grouping so both reuse the same unpack program.
+        groups[jax.dtypes.canonicalize_dtype(array.dtype)].append((index, array))
+
+    for dtype, group in groups.items():
+        if len(group) == 1:
+            index, array = group[0]
+            result[index] = device_array(array, sharding=sharding)
+            continue
+        indices, arrays = zip(*group)
+        shapes = tuple(array.shape for array in arrays)
+        num_shards, sizes, buffer_sharding, unpack = _metadata_unpacker(shapes, sharding)
+        if any(
+            (not shape and num_shards != 1) or (shape and shape[0] % num_shards) for shape in shapes
+        ):
+            raise ValueError("Metadata leading dimensions must be divisible by the shard count")
+        buffer = np.concatenate(
+            [array.reshape(num_shards, size) for array, size in zip(arrays, sizes)],
+            axis=1,
+            dtype=dtype,
+        )
+        buffer.flags.writeable = False
+        outputs = unpack(device_array(buffer, sharding=buffer_sharding))
+        for index, output in zip(indices, outputs):
+            result[index] = output
+    return jax.tree.unflatten(tree, result)
+
+
 _IS_TPU_RUNTIME_CACHED: bool | None = None
 
 

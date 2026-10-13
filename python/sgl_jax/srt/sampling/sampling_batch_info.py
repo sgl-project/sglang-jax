@@ -11,7 +11,7 @@ from jax.tree_util import register_pytree_node_class
 from sgl_jax.srt.sampling import penaltylib
 from sgl_jax.srt.sampling.sampling_params import DEFAULT_SAMPLING_SEED, TOP_K_ALL
 from sgl_jax.srt.utils import get_bool_env_var
-from sgl_jax.srt.utils.jax_utils import device_array
+from sgl_jax.srt.utils.jax_utils import device_array, packed_device_array
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import (
@@ -145,27 +145,29 @@ class SamplingMetadata:
         def to_device(data, sharding):
             if abstract:
                 return jax.tree.map(lambda x: array(x.shape, x.dtype, sharding), data)
-            return device_array(data, sharding=sharding)
+            upload = packed_device_array if len(sharding.spec) <= 1 else device_array
+            return upload(data, sharding=sharding)
 
         sharding = NamedSharding(mesh, PartitionSpec("data"))
-        if batch.sampling_info.sampling_seeds is not None:
-            sampling_seeds_device = to_device(batch.sampling_info.sampling_seeds, sharding=sharding)
-        else:
-            sampling_seeds_device = None
-
         positions = batch.positions if batch.forward_mode.is_decode() else batch.seq_lens - 1
 
-        (temperatures_device, top_ps_device, top_ks_device, min_ps_device, positions_device) = (
-            to_device(
-                (
-                    batch.sampling_info.temperatures,
-                    batch.sampling_info.top_ps,
-                    batch.sampling_info.top_ks,
-                    batch.sampling_info.min_ps,
-                    positions,
-                ),
-                sharding=sharding,
-            )
+        (
+            temperatures_device,
+            top_ps_device,
+            top_ks_device,
+            min_ps_device,
+            positions_device,
+            sampling_seeds_device,
+        ) = to_device(
+            (
+                batch.sampling_info.temperatures,
+                batch.sampling_info.top_ps,
+                batch.sampling_info.top_ks,
+                batch.sampling_info.min_ps,
+                positions,
+                batch.sampling_info.sampling_seeds,
+            ),
+            sharding=sharding,
         )
 
         # Extract penalty information from penalizer orchestrator

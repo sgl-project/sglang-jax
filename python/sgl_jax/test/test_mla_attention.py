@@ -35,6 +35,7 @@ from sgl_jax.srt.layers.attention.mla_backend import MLAAttentionBackend
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sgl_jax.srt.model_executor.batch_inputs import BatchInputs
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.test.test_mla_v2_bitexact import TestMLAV2BitExactParity  # noqa: F401
@@ -284,18 +285,20 @@ def create_mla_forward_batch(
     )
 
     mwb = ModelWorkerBatch(
+        inputs=BatchInputs.from_arrays(
+            input_ids=input_ids,
+            seq_lens=seq_lens,
+            out_cache_loc=out_cache_loc,
+            req_pool_indices=req_pool_indices,
+            positions=positions,
+            extend_seq_lens=q_lens if mode == "prefill" else None,
+            extend_prefix_lens=extend_prefix_lens if mode == "prefill" else None,
+        ),
         bid=1,
         forward_mode=forward_mode,
-        input_ids=input_ids,
         real_input_ids_len=input_ids.shape[0],
-        seq_lens=seq_lens,
-        out_cache_loc=out_cache_loc,
-        req_pool_indices=req_pool_indices,
         sampling_info=None,
-        positions=positions,
         cache_loc=cache_loc_flat,
-        extend_seq_lens=q_lens if mode == "prefill" else None,
-        extend_prefix_lens=extend_prefix_lens if mode == "prefill" else None,
         return_logprob=False,
         return_output_logprob_only=False,
         top_logprobs_nums=None,

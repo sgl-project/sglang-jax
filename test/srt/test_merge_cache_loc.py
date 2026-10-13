@@ -1,4 +1,4 @@
-"""Correctness tests for the vectorized ScheduleBatch._merge_cache_loc.
+"""Correctness tests for the vectorized BatchInputBuilder._merge_cache_loc.
 
 The paged fast path (page_size > 1) reconstructs token-level slot indices from
 page-start values instead of memcpy-ing every token from req_to_token. These
@@ -13,6 +13,8 @@ from unittest.mock import MagicMock
 import numpy as np
 
 from sgl_jax.srt.managers.schedule_batch import ScheduleBatch, ScheduleReqsInfo
+from sgl_jax.srt.model_executor.batch_input_builder import BatchInputBuilder
+from sgl_jax.srt.model_executor.batch_layout import BatchLayoutPlan, SequenceLayout
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
 
@@ -59,11 +61,21 @@ class TestMergeCacheLoc(unittest.TestCase):
             req_to_token_pool=pool,
             forward_mode=ForwardMode.EXTEND,  # extend picks cache_loc_paddings[-1]
         )
-        return batch._merge_cache_loc(
+        seqs = [
+            (
+                np.asarray(info.seq_lens, dtype=np.int32)
+                if info.seq_lens is not None
+                else np.empty(0, np.int32)
+            )
+            for info in reqs_info
+        ]
+        zeros = [np.zeros_like(seq) for seq in seqs]
+        layout = SequenceLayout.create(seqs, zeros, zeros, page_size)
+        plan = BatchLayoutPlan(tuple(map(len, seqs)), (0,) * dp_size, dp_size * 128, 0, layout)
+        return BatchInputBuilder(batch, plan)._merge_cache_loc(
             bs_paddings=[dp_size * 128],
             cache_loc_paddings=[total_cache_loc_size],
             page_size=page_size,
-            per_dp_bs_size=128,
         )
 
     def _assert_real_tokens_match(self, got, ref, reqs_info, dp_size, per_dp, page_size, msg=""):

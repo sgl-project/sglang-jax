@@ -16,6 +16,7 @@ from sgl_jax.srt.mem_cache.memory_pool import (
     _set_fused_kv_buffer,
     merge_kv,
 )
+from sgl_jax.srt.model_executor.batch_inputs import BatchInputs
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.speculative.eagle_info import EagleVerifyInput
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
@@ -322,18 +323,20 @@ def create_test_data(
         attention_backend.xai_temperature_len = model_config["xai_temperature_len"]
 
     mwb = ModelWorkerBatch(
+        inputs=BatchInputs.from_arrays(
+            input_ids=np.asarray(input_ids),
+            seq_lens=np.asarray(seq_lens),
+            out_cache_loc=np.asarray(out_cache_loc),
+            req_pool_indices=np.asarray(req_pool_indices),
+            positions=np.asarray(positions),
+            extend_seq_lens=np.asarray(extend_seq_lens),
+            extend_prefix_lens=np.asarray(extend_prefix_lens),
+        ),
         bid=1,
         forward_mode=forward_mode,
-        input_ids=np.asarray(input_ids),
         real_input_ids_len=input_ids.shape[0],
-        seq_lens=np.asarray(seq_lens),
-        out_cache_loc=np.asarray(out_cache_loc),
-        req_pool_indices=np.asarray(req_pool_indices),
         sampling_info=None,
-        positions=np.asarray(positions),
         cache_loc=np.asarray(cache_loc),
-        extend_seq_lens=np.asarray(extend_seq_lens),
-        extend_prefix_lens=np.asarray(extend_prefix_lens),
         return_logprob=False,
         return_output_logprob_only=False,
         top_logprobs_nums=None,

@@ -13,6 +13,7 @@ from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.managers.schedule_batch import PADDING_BUCKETS, ModelWorkerBatch
 from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sgl_jax.srt.model_executor.batch_inputs import BatchInputs
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.utils.common_utils import pad_to_bucket
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
@@ -251,19 +252,19 @@ def create_test_data(
     real_bs_per_dp = [len(lens_dict.get(r, [])) for r in range(dp_size)]
 
     mwb = ModelWorkerBatch(
+        inputs=BatchInputs.from_arrays(
+            input_ids=input_ids_cpu,
+            seq_lens=seq_lens_cpu,
+            out_cache_loc=out_cache_loc_cpu,
+            req_pool_indices=req_pool_indices_cpu,
+            positions=positions_cpu,
+            extend_seq_lens=extend_seq_lens_cpu,
+            extend_prefix_lens=extend_prefix_lens_cpu,
+        ),
         bid=1,
         forward_mode=ForwardMode.EXTEND if is_prefill else ForwardMode.DECODE,
-        input_ids=input_ids_cpu,
-        real_input_ids_len=input_ids_cpu.shape[
-            0
-        ],  # Correctly reflects prefill tokens vs decode batch
-        seq_lens=seq_lens_cpu,
-        out_cache_loc=out_cache_loc_cpu,
-        req_pool_indices=req_pool_indices_cpu,
-        positions=positions_cpu,
+        real_input_ids_len=input_ids_cpu.shape[0],
         cache_loc=cache_loc_cpu,
-        extend_seq_lens=extend_seq_lens_cpu,
-        extend_prefix_lens=extend_prefix_lens_cpu,
         real_bs=total_bs,
         real_bs_per_dp=real_bs_per_dp,
         dp_size=dp_size,

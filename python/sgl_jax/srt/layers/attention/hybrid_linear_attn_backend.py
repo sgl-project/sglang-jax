@@ -15,7 +15,7 @@ from sgl_jax.srt.layers.attention.base_attn_backend import (
     AttentionBackendMetadata,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
-from sgl_jax.srt.utils.jax_utils import device_array
+from sgl_jax.srt.utils.jax_utils import packed_device_array
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
@@ -103,22 +103,18 @@ class LinearRecurrentAttnBackend(AttentionBackend):
             metadata.cu_q_lens,
             metadata.recurrent_indices,
             metadata.has_initial_state,
-        ) = device_array(
-            (cu_q_lens, batch.recurrent_indices, batch.has_initial_state),
+            metadata.recurrent_track_indices,
+            metadata.recurrent_track_mask,
+        ) = packed_device_array(
+            (
+                cu_q_lens,
+                batch.recurrent_indices,
+                batch.has_initial_state,
+                batch.recurrent_track_indices,
+                batch.recurrent_track_mask,
+            ),
             sharding=NamedSharding(self.mesh, sharding_spec),
         )
-
-        # Track metadata may be None (no boundary): guard each device_array.
-        if batch.recurrent_track_indices is not None:
-            (metadata.recurrent_track_indices,) = device_array(
-                (batch.recurrent_track_indices,),
-                sharding=NamedSharding(self.mesh, sharding_spec),
-            )
-        if batch.recurrent_track_mask is not None:
-            (metadata.recurrent_track_mask,) = device_array(
-                (batch.recurrent_track_mask,),
-                sharding=NamedSharding(self.mesh, sharding_spec),
-            )
 
         return metadata
 

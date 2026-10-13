@@ -12,6 +12,7 @@ from jax.sharding import PartitionSpec as P
 from sgl_jax.srt.kernels.speculative.build_eagle_tree_structure_kernel import (
     build_eagle_tree_structure,
 )
+from sgl_jax.srt.utils.jax_utils import packed_device_array
 
 
 @functools.partial(
@@ -235,7 +236,7 @@ def build_tree_kernel_efficient(
                  retrive_next_sibling, draft_tokens)
     """
     rep = NamedSharding(mesh, P())
-    verified_id, score_list, token_list, parents_list, seq_lens = jax.device_put(
+    verified_id, score_list, token_list, parents_list, seq_lens = packed_device_array(
         (verified_id, score_list, token_list, parents_list, seq_lens), rep
     )
     parent_list, top_scores_index, draft_tokens = build_tree_kernel_efficient_preprocess(

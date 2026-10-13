@@ -12,7 +12,7 @@ from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.layers.embeddings import Embed
 from sgl_jax.srt.layers.lm_head_parallel import compute_lm_head_logits
-from sgl_jax.srt.utils.jax_utils import device_array
+from sgl_jax.srt.utils.jax_utils import device_array, packed_device_array
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
 if TYPE_CHECKING:
@@ -212,12 +212,18 @@ class LogitsMetadata:
             logits_indices_device,
             extend_input_logprob_token_ids_device,
             input_logprob_indices_device,
-        ) = device_array(
+            accept_lens,
+        ) = packed_device_array(
             (
                 batch.extend_seq_lens,
                 batch.logits_indices,
                 batch.extend_input_logprob_token_ids,
                 batch.input_logprob_indices,
+                (
+                    getattr(batch.spec_info_padded, "accept_length", None)
+                    if batch.forward_mode.is_draft_extend()
+                    else None
+                ),
             ),
             sharding=sharding,
         )
@@ -230,14 +236,7 @@ class LogitsMetadata:
             extend_token_ids_logprob=extend_token_ids_logprob,
             extend_seq_lens=extend_seq_lens_device,
             logits_indices=logits_indices_device,
-            accept_lens=(
-                device_array(batch.spec_info_padded.accept_length, sharding=sharding)
-                if batch.forward_mode.is_draft_extend()
-                and batch.spec_info_padded is not None
-                and hasattr(batch.spec_info_padded, "accept_length")
-                and batch.spec_info_padded.accept_length is not None
-                else None
-            ),
+            accept_lens=accept_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             extend_logprob_start_lens_cpu=(
                 batch.extend_logprob_start_lens.tolist()

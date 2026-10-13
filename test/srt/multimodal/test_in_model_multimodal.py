@@ -12,6 +12,8 @@ import pytest
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec
 
 from sgl_jax.srt.managers.schedule_batch import ScheduleBatch, ScheduleReqsInfo
+from sgl_jax.srt.model_executor.batch_input_builder import BatchInputBuilder
+from sgl_jax.srt.model_executor.batch_layout import BatchLayoutPlan
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.models.qwen2_5_vl import Qwen2_5_VisionTransformer
 from sgl_jax.srt.models.qwen3_vl import Qwen3VLVisionModel
@@ -361,7 +363,9 @@ def test_retracted_prefill_continues_mrope_positions_past_prompt():
         return_logprob=False,
         model_config=None,
     )
-    result = batch._merge_multimodal(per_dp_token_size=5, total_token_size=5)
+    builder = BatchInputBuilder(batch)
+    builder.plan = BatchLayoutPlan((1,), (5,), 1, 5, builder._sequences(1))
+    result = builder._merge_multimodal()
     np.testing.assert_array_equal(
         result["mrope_positions"],
         [[30, 31, 3, 4, 5], [40, 41, 3, 4, 5], [50, 51, 3, 4, 5]],

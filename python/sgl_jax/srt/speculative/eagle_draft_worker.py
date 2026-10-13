@@ -26,7 +26,7 @@ from sgl_jax.srt.speculative.eagle_util import (
 )
 from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
-from sgl_jax.srt.utils.jax_utils import device_array
+from sgl_jax.srt.utils.jax_utils import device_array, packed_device_array
 
 
 class EagleDraftWorker(BaseDraftWorker):
@@ -133,7 +133,7 @@ class EagleDraftWorker(BaseDraftWorker):
             verified_id = model_worker_batch.spec_info_padded.verified_id
             if any(isinstance(x, jax.Array) for x in (verified_id, token_list, verified_seq_lens)):
                 rep = NamedSharding(self.mesh, P())
-                verified_id, token_list, verified_seq_lens = jax.device_put(
+                verified_id, token_list, verified_seq_lens = packed_device_array(
                     (verified_id, token_list, verified_seq_lens),
                     rep,
                 )
