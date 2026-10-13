@@ -1,9 +1,15 @@
+from __future__ import annotations
+
 import abc
 import logging
+from typing import TYPE_CHECKING
 
 import numpy as np
 
-from sgl_jax.srt.mem_cache.memory_pool import KVCache, SWAKVPool
+from sgl_jax.srt.layers.dcp.layout import virtual_page_size
+
+if TYPE_CHECKING:
+    from sgl_jax.srt.mem_cache.memory_pool import KVCache, SWAKVPool
 
 logger = logging.getLogger(__name__)
 
@@ -166,10 +172,23 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         kvcache: KVCache,
         debug_mode: bool = False,
         dp_size: int = 1,
+        dcp_size: int = 1,
     ):
-        # super().__init__(size, page_size, dtype, kvcache)
-        super().__init__(size, page_size, kvcache, dp_size)
-        self.num_pages = size // page_size
+        # ``size`` / ``page_size`` are the physical pool (HBM). DCP widens the
+        # allocator's token index space: one virtual page is ``page_size * dcp_size``
+        # and maps to one physical page on every DCP rank. ``dcp_size=1`` is
+        # identical to the pre-DCP constructor.
+        if dcp_size < 1:
+            raise ValueError(f"dcp_size must be >= 1, got {dcp_size}")
+        self.dcp_size = dcp_size
+        self.physical_page_size = page_size
+        super().__init__(
+            size * dcp_size,
+            virtual_page_size(page_size, dcp_size),
+            kvcache,
+            dp_size,
+        )
+        self.num_pages = self.size // self.page_size
         self.pages_per_rank = self.num_pages // dp_size
         self.debug_mode = debug_mode
 
@@ -420,6 +439,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         page_size: int = 1,
         dp_size: int = 1,
     ):
+        from sgl_jax.srt.mem_cache.memory_pool import SWAKVPool
+
         super().__init__(size, page_size, kvcache, dp_size)
         assert isinstance(kvcache, SWAKVPool)
         self._size_full = size

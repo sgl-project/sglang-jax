@@ -280,9 +280,11 @@ def _mla_ragged_paged_attention_kernel(
     new_kv_c_hbm_ref,  # [max_num_tokens_per_kv_packing, kv_packing, lkv_dim]
     new_k_pe_hbm_ref,  # [max_num_tokens_per_kv_packing, kv_packing, r_dim]
     cache_kv_hbm_ref,  # [total_num_pages, page_size_per_kv_packing, kv_packing, align_to(lkv_dim + r_dim, 128)]
+    lse_in_hbm_ref,  # [max_num_tokens, 128] aliased with lse_hbm_ref
     # Output
     o_hbm_ref,  # [max_num_tokens, num_q_heads_per_q_packing, q_packing, lkv_dim]
     updated_cache_kv_hbm_ref,  # [total_num_pages, page_size_per_kv_packing, kv_packing, align_to(lkv_dim + r_dim, 128)]
+    lse_hbm_ref,  # [max_num_tokens, 128] float32; LSE = m + log(l) natural (base-e)
     # Scratch
     bkvc_x2_ref,  # [2, batch_size, bkv_buf_sz_per_kv_packing, kv_packing, lkv_dim]
     bkpe_x2_ref,  # [2, batch_size, bkv_buf_sz_per_kv_packing, kv_packing, r_dim]
@@ -293,6 +295,7 @@ def _mla_ragged_paged_attention_kernel(
     l_ref,  # [batch_size, bq_sz * num_q_heads, 128],
     m_ref,  # [batch_size, bq_sz * num_q_heads, 128],
     acc_ref,  # [batch_size, bq_sz * num_q_heads, lkv_dim],
+    blse_x2_ref,  # [2, batch_size, bq_sz, 128] LSE DMA double buffer
     *,
     static_q_len: int,
     sm_scale: float,
@@ -307,6 +310,7 @@ def _mla_ragged_paged_attention_kernel(
     batch_size: int = 1,
     debug_mode: bool = False,
 ):
+    del lse_in_hbm_ref  # aliased with lse_hbm_ref; writes go to the output ref
     assert ql_nope_hbm_ref.shape == o_hbm_ref.shape
     # Validation checks on the dimensions
     nope_dim = ql_nope_hbm_ref.shape[-1]
@@ -328,6 +332,7 @@ def _mla_ragged_paged_attention_kernel(
     assert get_dtype_packing(kv_dtype) == kv_packing
     assert lkv_dim % 128 == 0
     assert r_dim % 128 == 0
+    assert num_q_heads <= 128, "LSE DMA pads heads to 128"
     bkv_sz_per_kv_packing = bkv_p * page_size_per_kv_packing
     bkv_sz = bkv_sz_per_kv_packing * kv_packing
     page_size = page_size_per_kv_packing * kv_packing
@@ -997,6 +1002,31 @@ def _mla_ragged_paged_attention_kernel(
                     wait,
                 )
 
+    def _send_blse_sync(batch_start_seq_idx, bo_idx, bo_sem_idx):
+        # Reuse the just-waited BO semaphore (channel 2). Same copy object
+        # start+wait so Mosaic sees a paired DMA. A 5th semaphore channel
+        # leaked on dcp>1 decode (empty-rank / kv_len=0 paths).
+        for b in range(batch_size):
+            sem = sems.at[2, b, bo_sem_idx]
+            vmem_ref = blse_x2_ref.at[bo_sem_idx, b]
+
+            seq_idx = batch_start_seq_idx + b
+            q_len_start = cu_q_lens_ref[seq_idx] + bo_idx * bq_sz
+            q_end = cu_q_lens_ref[seq_idx + 1]
+            sz = jnp.minimum(bq_sz, q_end - q_len_start)
+
+            @pl.when(sz > 0)
+            def _copy_lse(vmem_ref=vmem_ref, sz=sz, q_len_start=q_len_start, sem=sem):
+                if debug_mode:
+                    return
+                cp = pltpu.make_async_copy(
+                    vmem_ref.at[pl.ds(0, sz)],
+                    lse_hbm_ref.at[pl.ds(q_len_start, sz)],
+                    sem,
+                )
+                cp.start()
+                cp.wait()
+
     def start_fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx):
         return _fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx)
 
@@ -1254,6 +1284,25 @@ def _mla_ragged_paged_attention_kernel(
                 if q_dtype == jnp.float32
                 else (acc * pl.reciprocal(l, approx=True)).astype(q_dtype)
             )
+            # LSE = m + log(l), natural log (FlashAttention-2 / merge.py).
+            # Empty rows (l==0 or non-finite m) become -inf.
+            #
+            # Without soft_cap the softmax above runs in base 2 (scores scaled by
+            # log2_e, accumulated with exp2), so m is in log2 units and the sum is
+            # 2**m * l. The natural-log LSE is then m*ln2 + log(l): scaling only m
+            # suffices, because log2(l)*ln2 == log(l). Adding m unscaled overstates
+            # the LSE by m*(1-ln2), which leaves each shard's output correct but
+            # corrupts the cross-shard DCP merge weights.
+            m_to_ln = 0.6931471805599453 if soft_cap is None else 1.0
+            m0 = m_ref[...][..., 0]
+            l0 = l_ref[...][..., 0]
+            lse_heads = jnp.where(
+                (l0 > 0) & jnp.isfinite(m0),
+                m0 * m_to_ln + jnp.log(l0),
+                jnp.float32(-jnp.inf),
+            )
+            lse_bq = lse_heads.reshape(batch_size, bq_sz, num_q_heads)
+            lse_bq = jnp.pad(lse_bq, ((0, 0), (0, 0), (0, 128 - num_q_heads)))
 
             # Wait for previous bo to be fully sent before storing new bo.
             bo_sem_idx = sem_ids_ref[2]
@@ -1266,6 +1315,9 @@ def _mla_ragged_paged_attention_kernel(
                 bq_sz * num_q_heads_per_q_packing,
                 lkv_dim,
             )[...] = pltpu.bitcast(out, jnp.int32)
+            blse_x2_ref.at[bo_sem_idx][...] = lse_bq
+            # Channel 2 is free after wait_send_bo. Sync LSE before starting o.
+            _send_blse_sync(batch_start_seq_idx, bq_idx, bo_sem_idx)
 
             # Send cur bo
             start_send_bo(batch_start_seq_idx, bq_idx, bo_sem_idx)
@@ -1394,6 +1446,7 @@ def prepare_outputs(
         "vmem_limit_bytes",
         "decode_batch_size",
         "debug_mode",
+        "return_lse",
     ),
     donate_argnames=("cache_kv",),
 )
@@ -1426,10 +1479,11 @@ def mla_ragged_paged_attention(
     decode_batch_size: int = 1,
     # Debug params.
     debug_mode: bool = False,
-) -> tuple[
-    jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_lkv_dim]
-    jax.Array,  # [total_num_pages, page_size_per_kv_packing, kv_packing, align_to(lkv_dim, 128) + align_to(r_dim, 128)]
-]:
+    # DCP: optional LSE (m + log(l), natural). Default off keeps the (o, cache)
+    # ABI. When True a third array ``[max_num_tokens, actual_num_q_heads]``
+    # float32 is appended.
+    return_lse: bool = False,
+) -> tuple:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
     Args:
@@ -1463,7 +1517,10 @@ def mla_ragged_paged_attention(
         print debug info. Need to compile with `--xla_tpu_enable_log_recorder`.
 
     Returns:
-      The output of attention and the updated kv cache.
+      ``(output, updated_kv)`` or, when ``return_lse``,
+      ``(output, updated_kv, lse)``. ``lse`` is natural-log
+      ``m + log(l)`` from FlashAttention-2 (same base as
+      ``merge_dcp_attention``), not log2.
     """
     if num_kv_pages_per_block is None or num_queries_per_block is None:
         # Look up the auto-tuned block-size table when caller (e.g. the
@@ -1584,6 +1641,7 @@ def mla_ragged_paged_attention(
         new_kv_c: jax.Array,  # [max_num_tokens, actual_lkv_dim]
         new_k_pe: jax.Array,  # [max_num_tokens, actual_r_dim]
         cache_kv: jax.Array,  # [total_num_pages, page_size_per_kv_packing, kv_packing, align_to(lkv_dim, 128)]
+        lse: jax.Array,  # [max_num_tokens, 128] float32
         kv_lens: jax.Array,  # i32[max_num_seqs]
         page_indices: jax.Array,  # i32[num_page_indices]
         cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
@@ -1628,11 +1686,13 @@ def mla_ragged_paged_attention(
             pl.BlockSpec(memory_space=pltpu.HBM),  # new_kv_c
             pl.BlockSpec(memory_space=pltpu.HBM),  # new_k_pe
             pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv
+            pl.BlockSpec(memory_space=pltpu.HBM),  # lse
         ]
 
         out_specs = [
             pl.BlockSpec(memory_space=pltpu.HBM),  # o
             pl.BlockSpec(memory_space=pltpu.HBM),  # updated_cache_kv
+            pl.BlockSpec(memory_space=pltpu.HBM),  # lse
         ]
 
         bkvc_double_buf = pltpu.VMEM(
@@ -1673,12 +1733,13 @@ def mla_ragged_paged_attention(
             bq_nope_double_buf,
             bq_rope_double_buf,
             bo_double_buf,  # Double buffering for output block.
-            # Semaphores for double buffering of bkv, bq, bo and bkv_update.
+            # Semaphores for double buffering of bkv, bq, bo, bkv_update.
             pltpu.SemaphoreType.DMA((4, batch_size, 2)),
             # Intermediate buffers per kv head for flash attention.
             l_scratch,
             m_scratch,
             acc_scratch,
+            pltpu.VMEM((2, batch_size, bq_sz, 128), jnp.float32),
         ]
 
         scalar_prefetches = (
@@ -1728,10 +1789,12 @@ def mla_ragged_paged_attention(
                 out_shape=[
                     jax.ShapeDtypeStruct(shape=ql_nope.shape, dtype=ql_nope.dtype),
                     jax.ShapeDtypeStruct(shape=cache_kv.shape, dtype=cache_kv.dtype),
+                    jax.ShapeDtypeStruct(shape=lse.shape, dtype=lse.dtype),
                 ],
                 input_output_aliases={
                     8: 0,  # Alias output activation with ql_nope
                     12: 1,  # Aliasing cache_kv with updated_cache_kv
+                    13: 2,  # Alias LSE so the 3 case kernels accumulate
                 },
                 name=scope_name,
             )
@@ -1743,16 +1806,19 @@ def mla_ragged_paged_attention(
             new_kv_c,
             new_k_pe,
             cache_kv,
+            lse,
         )
 
+    lse = jnp.full((ql_nope.shape[0], 128), jnp.float32(-jnp.inf))
     batch_distribution = (distribution[0] // decode_batch_size) * decode_batch_size
     # Batched decode
-    ql_nope, updated_kv = run_mla_kernel(
+    ql_nope, updated_kv, lse = run_mla_kernel(
         ql_nope,
         q_pe,
         new_kv_c,
         new_k_pe,
         cache_kv,
+        lse,
         kv_lens,
         page_indices,
         cu_q_lens,
@@ -1767,12 +1833,13 @@ def mla_ragged_paged_attention(
     )
 
     # Decode-only
-    ql_nope, updated_kv = run_mla_kernel(
+    ql_nope, updated_kv, lse = run_mla_kernel(
         ql_nope,
         q_pe,
         new_kv_c,
         new_k_pe,
         updated_kv,
+        lse,
         kv_lens,
         page_indices,
         cu_q_lens,
@@ -1788,12 +1855,13 @@ def mla_ragged_paged_attention(
     # TODO: evaluate if chunk-prefill-only branch is needed
 
     # Mixed
-    ql_nope, updated_kv = run_mla_kernel(
+    ql_nope, updated_kv, lse = run_mla_kernel(
         ql_nope,
         q_pe,
         new_kv_c,
         new_k_pe,
         updated_kv,
+        lse,
         kv_lens,
         page_indices,
         cu_q_lens,
@@ -1808,5 +1876,7 @@ def mla_ragged_paged_attention(
     output = prepare_outputs(
         ql_nope, actual_num_q_heads, actual_lkv_dim
     )  # [max_num_tokens, actual_num_q_heads, actual_lkv_dim]
-
+    lse_out = lse[:, :actual_num_q_heads]
+    if return_lse:
+        return output, updated_kv, lse_out
     return output, updated_kv

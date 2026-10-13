@@ -404,13 +404,16 @@ def prefill_write_and_attend(
     cache,  # [P, ps//pk, pk, Dk_pad]  paged fused latent cache
     topk_pages,  # [T, K] int32          seq-local page ids (-1 padded)
     positions,  # [T] int32             absolute query positions (causal bound)
-    loc,  # [T] int32             physical flat slot per token (out_cache_loc)
+    loc,  # [T] int32             virtual out_cache_loc (physical when dcp_size=1)
     *,
     kv_lora_rank: int,
     page_size: int,
     sm_scale: float,
     read_block: int | None = None,  # defaults to page_size (page-level selection)
     interpret: bool = False,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
+    dcp_interleave: int = 1,
 ):
     """Self-write the current chunk's latent into the paged cache, then attend
     only the indexer-selected pages via the fused sparse-MLA prefill kernel.
@@ -436,6 +439,10 @@ def prefill_write_and_attend(
     assert ps % RB == 0, f"read_block {RB} must divide page_size {ps} (page-aligned units)"
     Pn, pspk, pk, Dk_pad = cache.shape
     K = topk_pages.shape[-1]
+
+    from sgl_jax.srt.layers.dcp.write import physical_write_loc_jax
+
+    loc = physical_write_loc_jax(loc, dcp_size, dcp_rank, dcp_interleave)
 
     q_sparse = jnp.concatenate([ql, qpe], axis=-1)  # [T, H, Dv+rope]
     # per-request logical→physical page table (page p's first token slot // ps).
@@ -480,7 +487,7 @@ def prefill_write_and_attend_ragged(
     cache,  # [P, ps//pk, pk, Dk_pad]         paged fused latent cache
     topk_pages,  # [total_tokens, K] int32    seq-local page ids (-1 padded)
     positions,  # [total_tokens] int32        absolute query positions (causal bound)
-    loc,  # [total_tokens] int32              physical flat slot per token (out_cache_loc)
+    loc,  # [total_tokens] int32              virtual out_cache_loc (physical when dcp=1)
     seq_lens,  # [num_seqs] int32             per-request kv length
     cu_q_lens,  # [num_seqs+1] int32          per-request query offsets (ragged segments)
     cu_kv_lens,  # [num_seqs+1] int32         page-aligned kv offsets (page_indices stride)
@@ -491,6 +498,9 @@ def prefill_write_and_attend_ragged(
     sm_scale: float,
     read_block: int | None = None,  # defaults to page_size (page-level selection)
     interpret: bool = False,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
+    dcp_interleave: int = 1,
 ):
     """Packed-ragged self-write + sparse-MLA prefill for **multi-request** extend.
 
@@ -498,9 +508,9 @@ def prefill_write_and_attend_ragged(
     packed along the token axis (the same layout the dense ``mla_ragged_paged_attention``
     and the indexer consume). Differences from the single-sequence wrapper:
 
-    * The self-write is unchanged — ``loc`` (out_cache_loc) already names each token's
-      physical slot, so ``flat.at[loc].set(...)`` is correct for any number of
-      sequences and any prefix (padded ``-1`` slots are dropped).
+    * The self-write remaps virtual ``out_cache_loc`` through
+      ``physical_write_loc`` (identity at ``dcp_size=1``). Non-owners and
+      padded ``-1`` slots are dropped.
     * The page table is **not** derived by the ``loc[::ps]`` stride (only valid for one
       contiguous request). Instead the kernel reads the packed ``page_indices`` at a
       per-request base ``cu_kv_lens[rid]//ps`` and uses ``seq_lens[rid]`` as the causal
@@ -508,6 +518,8 @@ def prefill_write_and_attend_ragged(
 
     Returns ``(o[total_tokens, H, kv_lora_rank], updated_cache)``.
     """
+    from sgl_jax.srt.layers.dcp.write import physical_write_loc_jax
+
     T, H, Dv = ql.shape
     rope = qpe.shape[-1]
     ps = page_size
@@ -516,6 +528,7 @@ def prefill_write_and_attend_ragged(
     Pn, pspk, pk, Dk_pad = cache.shape
     K = topk_pages.shape[-1]
     S = seq_lens.shape[0]
+    loc = physical_write_loc_jax(loc, dcp_size, dcp_rank, dcp_interleave)
 
     q_sparse = jnp.concatenate([ql, qpe], axis=-1)  # [T, H, Dv+rope]
 

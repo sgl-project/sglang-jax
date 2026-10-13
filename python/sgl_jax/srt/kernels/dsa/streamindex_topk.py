@@ -28,6 +28,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sgl_jax.srt.layers.dcp.write import owned_len_jax
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 
 Enum = enum.Enum
@@ -73,12 +74,26 @@ class MlaCase(Enum):
         }[self]
 
 
+def _owned_len(upto, dcp_size: int, dcp_rank, interleave: int):
+    """Virtual tokens in ``[0, upto)`` owned by ``dcp_rank``, clamped for padding.
+
+    Deliberately delegates to the one implementation in ``layers/dcp/write.py``
+    rather than restating the block-interleave arithmetic here: this bound has to
+    agree exactly with the one ``physical_positions_jax`` hands the attend
+    kernels, and a second copy is a correctness hazard, not a speedup. It is pure
+    integer jnp, so it traces fine inside a Pallas kernel.
+    """
+    if dcp_size <= 1:
+        return upto
+    return owned_len_jax(jnp.maximum(upto, 0), dcp_size, dcp_rank, interleave)
+
+
 def _scores_kernel(
     # Prefetch
-    seq_lens_ref,  # [max_num_seqs]
+    seq_lens_ref,  # [max_num_seqs] VIRTUAL lengths when dcp_size > 1
     page_indices_ref,  # [max_num_seqs * pages_per_seq]
     cu_q_lens_ref,  # [max_num_seqs + 1]
-    start_end_seq_idx_ref,  # [2] (start_seq_idx, end_seq_idx)
+    start_end_seq_idx_ref,  # [3] (start_seq_idx, end_seq_idx, dcp_rank)
     sem_ids_ref,  # [3] (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
     bo_sz_ref,  # [2] row count of each output buffer's in-flight DMA (-1 = none)
     # Input
@@ -102,6 +117,8 @@ def _scores_kernel(
     seq_batch_size: int,
     page_pool_size: int | None = None,
     num_bkv_max: int | None = None,
+    dcp_size: int = 1,
+    dcp_interleave: int = 1,
 ):
     _, num_q_heads, head_dim = q_hbm_ref.shape
     lkv_dim = cache_kv_hbm_ref.shape[-1]
@@ -125,6 +142,7 @@ def _scores_kernel(
 
     start_seq_idx = start_end_seq_idx_ref[0]
     end_seq_idx = start_end_seq_idx_ref[1]
+    dcp_rank = start_end_seq_idx_ref[2]
     batch_start_seq_idx = start_seq_idx + pl.program_id(0) * seq_batch_size
     batch_end_seq_idx = batch_start_seq_idx + seq_batch_size - 1
 
@@ -138,7 +156,12 @@ def _scores_kernel(
         q_lens.append(q_len)
         seq_len = seq_lens_ref[batch_start_seq_idx + batch_idx]
         seq_lens.append(seq_len)
-        kv_len = seq_len // compression_ratio
+        if dcp_size > 1:
+            # seq_lens are virtual; this rank stores only the slots it owns, so
+            # the valid span in physical slot space is the owned count.
+            kv_len = _owned_len(seq_len, dcp_size, dcp_rank, dcp_interleave)
+        else:
+            kv_len = seq_len // compression_ratio
         kv_lens.append(kv_len)
 
     def wait_send_scores(bo_sem_idx):
@@ -502,10 +525,20 @@ def _scores_kernel(
                     + bq_idx * bq_sz
                     + jnp.arange(bq_sz, dtype=jnp.int32)
                 )
-                # Last visible compressed entry: the one whose final token
-                # (entry+1)*ratio-1 is at or before q_pos, i.e. entries
-                # [0, (q_pos+1)//ratio). Identity for ratio == 1.
-                bq_pos_compressed_vec.append((q_pos + 1) // compression_ratio - 1)
+                if dcp_size > 1:
+                    # q_pos is virtual, but k_span is a physical slot. virtual_index
+                    # is monotone in the slot, so "virtual key <= q_pos" is exactly
+                    # "slot < owned_len(q_pos + 1)" — the same bound
+                    # physical_positions_jax hands the attend kernels. A rank owning
+                    # nothing up to q_pos gets -1, so no key passes.
+                    bq_pos_compressed_vec.append(
+                        _owned_len(q_pos + 1, dcp_size, dcp_rank, dcp_interleave) - 1
+                    )
+                else:
+                    # Last visible compressed entry: the one whose final token
+                    # (entry+1)*ratio-1 is at or before q_pos, i.e. entries
+                    # [0, (q_pos+1)//ratio). Identity for ratio == 1.
+                    bq_pos_compressed_vec.append((q_pos + 1) // compression_ratio - 1)
 
             wait_fetch_bq(batch_start_seq_idx, bq_idx, bq_sem_idx)
             bq_vec = load_bq(bq_sem_idx)
@@ -942,7 +975,8 @@ def streamindex_topk(
             seq_lens,
             page_indices,
             cu_q_lens,
-            jnp.array([start_seq_idx, end_seq_idx], jnp.int32),
+            # trailing 0 is dcp_rank: this path is never DCP-sharded
+            jnp.array([start_seq_idx, end_seq_idx, 0], jnp.int32),
             jnp.zeros((3,), jnp.int32),  # (bq, bkv, bo) sem indices
             jnp.full((2,), -1, jnp.int32),  # in-flight out DMA row counts
         )
@@ -1063,6 +1097,9 @@ def streamindex_topk(
         "num_kv_pages_per_block",
         "num_queries_per_block",
         "vmem_limit_bytes",
+        "dcp_size",
+        "dcp_interleave",
+        "return_page_scores",
     ),
 )
 def streamindex_page_topk(
@@ -1079,6 +1116,10 @@ def streamindex_page_topk(
     num_kv_pages_per_block: int = 128,
     num_queries_per_block: int = 512,
     vmem_limit_bytes: int | None = 64 * 1024 * 1024,
+    dcp_size: int = 1,
+    dcp_rank=0,
+    dcp_interleave: int = 1,
+    return_page_scores: bool = False,
 ) -> jax.Array:
     """Page-level lightning-indexer top-k (prefill/extend form).
 
@@ -1087,9 +1128,22 @@ def streamindex_page_topk(
     ``[T, pages_per_seq]`` ever reaches HBM — no ``[T, max_kv]`` token-score
     materialization), then a cheap ``top_k`` over pages selects the budget.
 
+    Under DCP (``dcp_size > 1``) ``seq_lens`` stay **virtual** and ``cache_kv`` /
+    ``page_indices`` are this rank's own pages: the kernel derives the local span
+    and the physical causal bound itself via :func:`_owned_len`. A local top-k is
+    meaningless there (each rank sees 1/dcp_size of the keys), so pass
+    ``return_page_scores=True`` and take the global top-k from the gathered page
+    maxima — see ``layers/dcp/indexer.py:page_topk_from_gathered``.
+
     Returns:
-      i32[T, k_pages] seq-local page ids per query token; -1 for padding.
+      i32[T, k_pages] seq-local page ids per query token (-1 for padding), or
+      f32[T, pages_per_seq] per-page maxima when ``return_page_scores``.
     """
+    if dcp_size > 1 and not return_page_scores:
+        raise ValueError(
+            "dcp_size > 1 needs return_page_scores=True: a per-rank top-k over "
+            "1/dcp_size of the keys is not the global selection"
+        )
     max_num_seqs = seq_lens.shape[0]
     original_dtype = q.dtype
     prepared_indexer_weights = prepare_index_weights(indexer_weights, original_dtype)
@@ -1140,7 +1194,7 @@ def streamindex_page_topk(
         seq_lens,
         page_indices,
         cu_q_lens,
-        jnp.stack([jnp.int32(0), num_seqs.astype(jnp.int32)]),
+        jnp.stack([jnp.int32(0), num_seqs.astype(jnp.int32), jnp.asarray(dcp_rank, jnp.int32)]),
         jnp.zeros((3,), jnp.int32),
         jnp.full((2,), -1, jnp.int32),
     )
@@ -1157,6 +1211,8 @@ def streamindex_page_topk(
                 seq_batch_size=1,
                 page_pool_size=page_size,
                 num_bkv_max=num_bkv_max,
+                dcp_size=dcp_size,
+                dcp_interleave=dcp_interleave,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=len(scalar_prefetches),
@@ -1178,5 +1234,7 @@ def streamindex_page_topk(
     page_scores = kernel(*scalar_prefetches, q, prepared_indexer_weights, cache_kv, scores_init)
 
     page_scores = page_scores.reshape(T, num_page_cols)[:, :pages_per_seq]
+    if return_page_scores:
+        return page_scores
     top_vals, top_idxs = jax.lax.top_k(page_scores, k_pages)
     return jnp.where(top_vals > -jnp.inf, top_idxs, -1)

@@ -16,6 +16,7 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.layers.dcp.layout import virtual_page_size
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.layers.routed_experts_capturer import get_global_experts_capturer
 from sgl_jax.srt.managers.schedule_batch import (
@@ -55,6 +56,21 @@ def _iter_padded_input_logprob_reqs(model_worker_batch, padded_rows: int):
             plen = max(int(eseq[slot]) - int(estart[slot]), 0)
             yield slot, base + cum, plen
             cum += plen
+
+
+def _dcp_tokens_per_slot(server_args) -> int:
+    """Virtual tokens that each per-device KV slot accounts for.
+
+    Under DCP the allocator's index space is virtual, not physical: it is built
+    with ``size * dcp_size`` slots and a virtual page of ``page_size * dcp_size``
+    (see :class:`PagedTokenToKVPoolAllocator`), because one virtual page maps to
+    one physical page on *every* rank. A pool of N per-device slots therefore
+    admits ``N * dcp_size`` tokens of context, and bounding ``max_req_len`` by N
+    alone caps a dcp=16 server at 1/16 of the context its memory can hold --
+    203898 tokens instead of 3.2M on a 16-chip pod. ``scheduler._get_token_info``
+    already applies this same factor to report usage.
+    """
+    return max(int(getattr(server_args, "dcp_size", 1) or 1), 1)
 
 
 class ModelWorker:
@@ -176,7 +192,7 @@ class ModelWorker:
         )
         self.max_req_len = min(
             self.model_config.context_len - 1,
-            per_rank_tokens - 1,
+            per_rank_tokens * _dcp_tokens_per_slot(self.server_args) - 1,
         )
         self.max_req_input_len = self.max_req_len - 5
         assert self.max_req_len > 0 and self.max_req_input_len > 0, "Memory pool size is too small"
@@ -206,7 +222,7 @@ class ModelWorker:
             max_padded_num_tokens=self.max_padded_num_tokens,
             dp_size=self.dp_size,
             tp_size=self.tp_size,
-            page_size=self.page_size,
+            page_size=virtual_page_size(self.page_size, self.server_args.dcp_size),
             max_req_len=self.max_req_len,
             vocab_size=self.model_config.vocab_size,
             # Cap cache_loc buckets for Pathways proxy, where it reduces H2D,
@@ -687,7 +703,7 @@ class MockModelWorker:
         )
         self.max_req_len = min(
             self.model_config.context_len - 1,
-            per_rank_tokens - 1,
+            per_rank_tokens * _dcp_tokens_per_slot(server_args) - 1,
         )
         self.max_req_input_len = self.max_req_len - 5
         assert self.max_req_len > 0 and self.max_req_input_len > 0, "Memory pool size is too small"

@@ -1635,6 +1635,22 @@ class MLATokenToKVPool(KVCache):
     def _shape_bytes(shape: tuple[int, ...], dtype: jnp.dtype) -> int:
         return math.prod(shape) * jnp.dtype(dtype).itemsize
 
+    @staticmethod
+    def indexer_dtype_for(dtype: jnp.dtype) -> jnp.dtype:
+        """The indexer key cache stays bf16 even when the latent cache is fp8.
+
+        The two caches fail differently under quantization. The latent cache feeds
+        a softmax, where per-element error averages out over hundreds of keys. The
+        indexer cache feeds a top-k that *selects* which pages are read at all, so
+        error there does not average -- it flips a page in or out, and a page the
+        needle lives on is either fetched or lost. The asymmetry is cheap to
+        respect: the indexer is 128 of 768 dims over 21 of 78 layers, so 5.1% of
+        the cache. Holding it in bf16 yields 1.90x capacity instead of 2.00x.
+        """
+        if jnp.dtype(dtype).itemsize < 2:
+            return jnp.bfloat16
+        return dtype
+
     @classmethod
     def profiled_bytes_per_token(
         cls,
@@ -1666,13 +1682,14 @@ class MLATokenToKVPool(KVCache):
         )
         bytes_per_page = cls._shape_bytes(latent_shape, dtype) * num_latent_layers
         if num_indexer_layers:
+            idx_dtype = cls.indexer_dtype_for(dtype)
             indexer_shape = cls._indexer_cache_shape(
                 total_num_pages=1,
                 page_size=page_size,
-                dtype=dtype,
+                dtype=idx_dtype,
                 indexer_key_dim=indexer_key_dim,
             )
-            bytes_per_page += cls._shape_bytes(indexer_shape, dtype) * num_indexer_layers
+            bytes_per_page += cls._shape_bytes(indexer_shape, idx_dtype) * num_indexer_layers
         return (bytes_per_page + page_size - 1) // page_size
 
     def __init__(
@@ -1690,6 +1707,7 @@ class MLATokenToKVPool(KVCache):
         end_layer: int | None = None,
         indexer_key_dim: int = 0,
         num_indexer_layers: int = 0,
+        dcp_size: int = 1,
         abstract: bool = False,
     ):
         super().__init__(size, page_size, dtype, layer_num, mesh, start_layer, end_layer)
@@ -1697,11 +1715,15 @@ class MLATokenToKVPool(KVCache):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.kv_partition_axis = kv_partition_axis
         self.dp_size = dp_size
+        if dcp_size < 1:
+            raise ValueError(f"dcp_size must be >= 1, got {dcp_size}")
+        self.dcp_size = dcp_size
         self.nope_dim, self.rope_dim = self._aligned_latent_dims(kv_lora_rank, qk_rope_head_dim)
         self.kv_dim = self.nope_dim + self.rope_dim
         self.indexer_key_dim_raw = indexer_key_dim
         self.indexer_key_dim = self._aligned_indexer_dim(indexer_key_dim)
         self.num_indexer_layers = num_indexer_layers
+        self.indexer_dtype = self.indexer_dtype_for(self.dtype)
 
         self._create_buffers(abstract=abstract)
         self._calculate_memory_usage()
@@ -1719,6 +1741,7 @@ class MLATokenToKVPool(KVCache):
             "kv_sharding": self.kv_sharding,
             "indexer_key_dim": self.indexer_key_dim_raw,
             "num_indexer_layers": self.num_indexer_layers,
+            "dcp_size": self.dcp_size,
         }
         return (children, aux_data)
 
@@ -1749,12 +1772,14 @@ class MLATokenToKVPool(KVCache):
         obj.dp_size = aux_data.get("dp_size", 1)
         obj.kv_sharding = aux_data["kv_sharding"]
         obj.num_indexer_layers = aux_data.get("num_indexer_layers", 0)
+        obj.dcp_size = aux_data.get("dcp_size", 1)
         obj.nope_dim, obj.rope_dim = cls._aligned_latent_dims(
             obj.kv_lora_rank, obj.qk_rope_head_dim
         )
         obj.kv_dim = obj.nope_dim + obj.rope_dim
         obj.indexer_key_dim_raw = aux_data.get("indexer_key_dim", 0)
         obj.indexer_key_dim = cls._aligned_indexer_dim(obj.indexer_key_dim_raw)
+        obj.indexer_dtype = cls.indexer_dtype_for(obj.dtype)
 
         obj.kv_buffer = kv_buffer
         obj.indexer_key_buffer = indexer_key_buffer
@@ -1779,7 +1804,13 @@ class MLATokenToKVPool(KVCache):
         and align(576,128)=640.
         """
         # MLA cache has no head axis to shard; page axis is sharded by DP.
-        self.kv_sharding = NamedSharding(self.mesh, P("data", None, None, None))
+        # dcp_size=1: replicated across tensor (today). dcp_size>1: leading
+        # DCP axis sharded on tensor so ranks store different tokens.
+        use_dcp_axis = self.dcp_size > 1 and "tensor" in self.mesh.axis_names
+        if use_dcp_axis:
+            self.kv_sharding = NamedSharding(self.mesh, P("tensor", "data", None, None, None))
+        else:
+            self.kv_sharding = NamedSharding(self.mesh, P("data", None, None, None))
 
         assert self.size % self.page_size == 0, "Cache size must be divisible by page size"
 
@@ -1792,20 +1823,23 @@ class MLATokenToKVPool(KVCache):
             qk_rope_head_dim=self.qk_rope_head_dim,
         )
         per_layer_bytes = self._shape_bytes(buffer_shape, self.dtype)
+        if use_dcp_axis:
+            buffer_shape = (self.dcp_size,) + buffer_shape
         logger.info(
-            "MLA KV cache shape per layer: %s, dtype: %s, %.2f GB",
+            "MLA KV cache shape per layer: %s, dtype: %s, %.2f GB/device",
             buffer_shape,
             self.dtype,
             per_layer_bytes / GB,
         )
 
-        def allocate_buffers(shape, count):
+        def allocate_buffers(shape, count, dtype=None):
+            dtype = self.dtype if dtype is None else dtype
             if abstract:
                 return [
-                    jax.ShapeDtypeStruct(shape, self.dtype, sharding=self.kv_sharding)
+                    jax.ShapeDtypeStruct(shape, dtype, sharding=self.kv_sharding)
                     for _ in range(count)
                 ]
-            allocate = _get_kv_zero_allocator(shape, self.dtype, self.kv_sharding)
+            allocate = _get_kv_zero_allocator(shape, dtype, self.kv_sharding)
             return [allocate() for _ in range(count)]
 
         with jax.set_mesh(self.mesh):
@@ -1816,17 +1850,22 @@ class MLATokenToKVPool(KVCache):
                 idx_shape = self._indexer_cache_shape(
                     total_num_pages=total_num_pages,
                     page_size=self.page_size,
-                    dtype=self.dtype,
+                    dtype=self.indexer_dtype,
                     indexer_key_dim=self.indexer_key_dim_raw,
                 )
-                indexer_bytes = self._shape_bytes(idx_shape, self.dtype)
+                indexer_bytes = self._shape_bytes(idx_shape, self.indexer_dtype)
+                if use_dcp_axis:
+                    idx_shape = (self.dcp_size,) + idx_shape
                 logger.info(
-                    "DSA indexer-key cache: %d slots × %s (%.2f GB total)",
+                    "DSA indexer-key cache: %d slots × %s dtype: %s (%.2f GB total)",
                     self.num_indexer_layers,
                     idx_shape,
+                    self.indexer_dtype,
                     self.num_indexer_layers * indexer_bytes / GB,
                 )
-                self.indexer_key_buffer = allocate_buffers(idx_shape, self.num_indexer_layers)
+                self.indexer_key_buffer = allocate_buffers(
+                    idx_shape, self.num_indexer_layers, dtype=self.indexer_dtype
+                )
 
     def get_indexer_key_buffer(self, slot_id: int) -> jax.Array:
         return self.indexer_key_buffer[slot_id]
@@ -1869,10 +1908,10 @@ class MLATokenToKVPool(KVCache):
         shape = self._indexer_cache_shape(
             total_num_pages=total_num_pages,
             page_size=self.page_size,
-            dtype=self.dtype,
+            dtype=self.indexer_dtype,
             indexer_key_dim=self.indexer_key_dim_raw,
         )
-        return self._shape_bytes(shape, self.dtype)
+        return self._shape_bytes(shape, self.indexer_dtype)
 
     def get_kv_size_bytes(self):
         """Resident bytes for this pool, including the DSA indexer key buffers."""
