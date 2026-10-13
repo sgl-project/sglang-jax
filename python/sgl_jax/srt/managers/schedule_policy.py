@@ -690,6 +690,17 @@ class PrefillAdder:
                     req.host_hit_length = max(0, req.host_hit_length - len(new_indices))
                     prefix_len = len(req.prefix_indices)
                     req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
+                    logger.info(
+                        "HiCache restore: rid=%s dp_rank=%d restored=%d tokens "
+                        "(%d pages) device_prefix=%d host_hit_left=%d extend=%d",
+                        req.rid,
+                        dp_rank,
+                        len(new_indices),
+                        (len(new_indices) + self.page_size - 1) // self.page_size,
+                        prefix_len,
+                        req.host_hit_length,
+                        req.extend_input_len,
+                    )
 
             req.last_matched_prefix_len = prefix_len
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
