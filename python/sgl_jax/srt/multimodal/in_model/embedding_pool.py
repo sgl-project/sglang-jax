@@ -148,8 +148,9 @@ class EmbeddingPool:
         lengths: list[int],
         *,
         write_mask: list[bool] | None = None,
+        item_offsets: list[int] | None = None,
     ) -> list[EmbeddingPoolEntry | None]:
-        """Cache one padded encoder output whose items are packed in input order."""
+        """Cache items from contiguous rows or explicit lane-packed row offsets."""
         if write_mask is None:
             write_mask = [True] * len(lengths)
         if len(item_hashes) != len(lengths):
@@ -167,6 +168,13 @@ class EmbeddingPool:
         if any(length < 0 for length in lengths) or sum(lengths) > capacity:
             raise ValueError(f"invalid item lengths {lengths} for capacity {capacity}")
 
+        if item_offsets is None:
+            item_offsets = np.cumsum([0, *lengths[:-1]]).tolist() if lengths else []
+        if len(item_offsets) != len(lengths) or any(
+            start < 0 or start + length > capacity for start, length in zip(item_offsets, lengths)
+        ):
+            raise ValueError("invalid packed source offsets")
+
         results = [
             self._reserve(int(item_hash), int(length)) if should_write else None
             for item_hash, length, should_write in zip(
@@ -177,10 +185,10 @@ class EmbeddingPool:
         # Later allocations can evict or replace earlier items in this same batch.
         # Build slots only after all placements are final.
         slots = np.full(capacity, -1, dtype=np.int32)
-        offset = 0
         for i, (item_hash, length, entry) in enumerate(
             zip(item_hashes, lengths, results, strict=True)
         ):
+            offset = item_offsets[i]
             if entry is not None and self._entries.get(int(item_hash)) is entry:
                 rows = np.arange(entry.length, dtype=np.int32)
                 slots[offset : offset + length] = (
@@ -188,7 +196,6 @@ class EmbeddingPool:
                 )
             else:
                 results[i] = None
-            offset += length
 
         if any(entry is not None and entry.length for entry in results):
             slots = self._replicate(slots)

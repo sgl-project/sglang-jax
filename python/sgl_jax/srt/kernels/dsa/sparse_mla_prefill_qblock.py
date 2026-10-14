@@ -564,7 +564,7 @@ def _build_write_runs(loc, *, kv_packing: int, r_cap: int):
     return table, n_raw
 
 
-def _write_back_kernel(tbl_ref, row_ref, cache_in_ref, out_ref, wdst_ref, wsrc_ref, sem):
+def _write_back_kernel(n_ref, tbl_ref, row_ref, cache_in_ref, out_ref, wdst_ref, wsrc_ref, sem):
     del cache_in_ref  # aliased with out_ref; all access goes through out_ref
     Pn, pspk, pk, D = out_ref.shape
     # word view: dim0 (words) is untiled, so dynamic word offsets are legal.
@@ -572,7 +572,12 @@ def _write_back_kernel(tbl_ref, row_ref, cache_in_ref, out_ref, wdst_ref, wsrc_r
     # tile on dim0 and single-token slices at odd offsets fail Mosaic
     # alignment. Edge tokens therefore go through a word-granular RMW below.
     cache_w = out_ref.reshape(Pn * pspk, pk, D)
-    E = tbl_ref.shape[0]
+    # Only the first n_ref[0] = 3 * n_runs table entries can be non-empty (the
+    # builder zero-fills the rows of unused run ids), so the scalar loop stops
+    # there instead of walking all 3 * r_cap entries: at 4 draft tokens x 64
+    # requests the table has 768 entries but ~64-192 runs, and the loop is
+    # scalar-bound (~0.17 us per entry).
+    E = n_ref[0]
 
     def entry(e, carry):
         kind = tbl_ref[e, 0]
@@ -621,6 +626,36 @@ def _write_back_kernel(tbl_ref, row_ref, cache_in_ref, out_ref, wdst_ref, wsrc_r
     jax.lax.fori_loop(0, E, entry, 0)
 
 
+# Row counts up to this size get a run table of at least ``num_rows`` entries by
+# default, so ``pallas_always_fits`` holds and the runtime cond is dropped. The
+# table is ``[3 * r_cap, 4]`` int32 in SMEM (48 KB at 1024 rows). Decode-form
+# speculative verify at 64 requests x 4 draft tokens is 256 rows; the old default
+# (2 * pages + 130 = 134) did not cover it and cost two whole-pool copies per
+# layer (~0.15 ms each on GLM-5.2 tp16).
+STATIC_DISPATCH_MAX_ROWS = 1024
+# Row counts up to this size take the 4D-native scatter when the caller opts in
+# (speculative verify / draft-extend pre-write); see paged_write_back.
+SCATTER_ROWS_MAX = 1024
+
+
+def default_run_capacity(num_rows: int, page_size: int) -> int:
+    """Default ``r_cap`` of ``paged_write_back`` for ``num_rows`` (pk-padded) rows."""
+    r_cap = 2 * (num_rows // page_size) + 130
+    if num_rows <= STATIC_DISPATCH_MAX_ROWS:
+        r_cap = max(r_cap, num_rows)
+    return r_cap
+
+
+def pallas_always_fits(num_rows: int, r_cap: int) -> bool:
+    """True when the run table of ``paged_write_back`` cannot overflow.
+
+    Every row starts at most one run (``n_raw = is_start.sum() <= num_rows``),
+    so ``num_rows <= r_cap`` makes the Pallas branch always valid and the
+    runtime ``lax.cond`` against the scatter fallback unnecessary.
+    """
+    return int(num_rows) <= int(r_cap)
+
+
 def paged_write_back(
     cache,  # [Pn, ps//pk, pk, D] paged pool
     row,  # [T, D] new rows (already cache dtype / padded feature dim)
@@ -629,8 +664,16 @@ def paged_write_back(
     page_size: int,
     r_cap: int | None = None,
     interpret: bool = False,
+    small_rows_scatter: bool = False,
 ):
     """In-place paged self-write: ``cache[loc[t]] = row[t]`` for ``loc >= 0``.
+
+    ``small_rows_scatter``: for row counts up to ``SCATTER_ROWS_MAX`` skip the
+    run table and the Pallas kernel and issue the 4D-native XLA scatter
+    directly. Measured on v7x with the production pool (2274 pages): 0.03 ms
+    at 4 rows and 0.065 ms at 256 rows versus 0.04 / 0.27 ms for the kernel,
+    whose per-run DMAs are latency-bound at those sizes. Opt-in so the
+    prefill path is unchanged.
 
     Bit-identical to ``cache.reshape(-1, D).at[loc].set(row, mode="drop",
     wrap_negative_indices=False)`` but without the scatter's flat-view
@@ -641,19 +684,33 @@ def paged_write_back(
     ps = page_size
     assert pspk * pk == ps, (cache.shape, page_size)
     T = row.shape[0]
+    if loc.shape[0] != T:
+        # Both branches index ``row`` by positions taken from ``loc`` (the run
+        # table's src offsets / the scatter's index set); a longer ``loc`` reads
+        # past ``row`` in the Pallas branch and fails to broadcast in the
+        # scatter branch. Fail at trace time with the real reason instead.
+        raise ValueError(f"paged_write_back: loc has {loc.shape[0]} entries but row has {T} rows")
     Tp = -(-T // pk) * pk
     if Tp != T:
         row = jnp.pad(row, ((0, Tp - T), (0, 0)))
         loc = jnp.pad(loc, ((0, Tp - T),), constant_values=-1)
+    if small_rows_scatter and Tp <= SCATTER_ROWS_MAX:
+        page = jnp.where(loc >= 0, loc // ps, -1)
+        rem = jnp.where(loc >= 0, loc % ps, 0)
+        return cache.at[page, rem // pk, rem % pk].set(
+            row.astype(cache.dtype), mode="drop", wrap_negative_indices=False
+        )
     if r_cap is None:
-        r_cap = 2 * (Tp // ps) + 130
+        r_cap = default_run_capacity(Tp, ps)
     table, n_raw = _build_write_runs(loc, kv_packing=pk, r_cap=r_cap)
     row_w = row.reshape(Tp // pk, pk, D)
+    n_ent = (3 * jnp.minimum(n_raw, r_cap)).reshape(1).astype(jnp.int32)  # live table entries
 
-    def _pallas(cache, row_w, table):
+    def _pallas(cache, row_w, table, n_ent):
         return pl.pallas_call(
             _write_back_kernel,
             in_specs=[
+                pl.BlockSpec(memory_space=pltpu.SMEM),  # live entry count [1]
                 pl.BlockSpec(memory_space=pltpu.SMEM),  # run table
                 pl.BlockSpec(memory_space=pltpu.HBM),  # row (word view)
                 pl.BlockSpec(memory_space=pltpu.HBM),  # cache (aliased)
@@ -665,12 +722,12 @@ def paged_write_back(
                 pltpu.VMEM((1, pk, D), cache.dtype),
                 pltpu.SemaphoreType.DMA,
             ],
-            input_output_aliases={2: 0},
+            input_output_aliases={3: 0},
             interpret=interpret,
-        )(table, row_w, cache)
+        )(n_ent, table, row_w, cache)
 
-    def _scatter(cache, row_w, table):
-        del table
+    def _scatter(cache, row_w, table, n_ent):
+        del table, n_ent
         # 4D-native scatter: same slot semantics as the flat-view version but
         # without cache.reshape(Pn*ps, D), which on jax 0.11.1 materializes a
         # full retile of the pool inside this cond branch (branch_1_fun,
@@ -684,5 +741,12 @@ def paged_write_back(
     if interpret:
         # interpret cannot lower dynamic-size DMAs; the scatter is the
         # bit-identical reference semantics anyway.
-        return _scatter(cache, row_w, table)
-    return jax.lax.cond(n_raw <= r_cap, _pallas, _scatter, cache, row_w, table)
+        return _scatter(cache, row_w, table, n_ent)
+    if pallas_always_fits(Tp, r_cap):
+        # Static dispatch: the run table cannot overflow, so the lax.cond is
+        # not needed. It is also expensive: both branches hand back a whole
+        # pool, XLA cannot alias the pool in place across the conditional
+        # (spec verify: 2 x ~0.02 ms per layer; draft-extend: three 372 MB
+        # pool copies per step on GLM-5.2 tp16).
+        return _pallas(cache, row_w, table, n_ent)
+    return jax.lax.cond(n_raw <= r_cap, _pallas, _scatter, cache, row_w, table, n_ent)

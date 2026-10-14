@@ -55,5 +55,5 @@ class InModelMultimodalContract(ABC):
         raise NotImplementedError
 
     def get_multimodal_encode_funcs(self) -> MultimodalEncodeFuncs:
-        """Return encoders accepting items per lane, with outputs in lane-major item order."""
+        """Return encoders accepting items per lane, with equal-capacity, lane-packed outputs."""
         return {}
