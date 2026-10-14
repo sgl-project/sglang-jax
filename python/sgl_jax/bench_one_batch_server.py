@@ -46,6 +46,7 @@ class BenchArgs:
     result_filename: str = "result.jsonl"
     base_url: str = ""
     skip_warmup: bool = False
+    skip_flush: bool = False
     show_report: bool = False
     profile: bool = False
     profile_by_stage: bool = False
@@ -84,6 +85,12 @@ class BenchArgs:
         parser.add_argument("--result-filename", type=str, default=BenchArgs.result_filename)
         parser.add_argument("--base-url", type=str, default=BenchArgs.base_url)
         parser.add_argument("--skip-warmup", action="store_true")
+        parser.add_argument(
+            "--skip-flush",
+            action="store_true",
+            help="Do not POST /flush_cache before each case (keeps radix + HiCache host state "
+            "from previous runs, e.g. to measure prefix reuse across invocations).",
+        )
         parser.add_argument("--show-report", action="store_true")
         parser.add_argument("--profile", action="store_true")
         parser.add_argument("--profile-by-stage", action="store_true")
@@ -162,7 +169,8 @@ def run_one_case(
     api_type: str = "native",
     bench_args: BenchArgs = None,
 ):
-    requests.post(url + "/flush_cache")
+    if not (bench_args is not None and getattr(bench_args, "skip_flush", False)):
+        requests.post(url + "/flush_cache")
 
     # Determine whether to use text or input_ids based on API type
     return_text = api_type == "openai"
