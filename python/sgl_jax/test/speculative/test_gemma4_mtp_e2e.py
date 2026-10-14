@@ -471,7 +471,16 @@ class TestFrozenKvContract:
             num_kv_heads=NUM_KV_HEADS,
             layer_id=0,
         )
-        q = jnp.ones((1, NUM_HEADS, HEAD_DIM), dtype=DTYPE) * 0.25
+        # Match NativeAttention's production head-axis contract. JAX 0.11
+        # rejects an einsum batch dimension when target K/V carries the
+        # ``tensor`` mesh axis but a synthetic test query is replicated.
+        q = jax.device_put(
+            jnp.ones((1, NUM_HEADS, HEAD_DIM), dtype=DTYPE) * 0.25,
+            jax.sharding.NamedSharding(
+                MESH,
+                jax.sharding.PartitionSpec(None, "tensor", None),
+            ),
+        )
 
         outputs = []
         with jax.set_mesh(MESH):
