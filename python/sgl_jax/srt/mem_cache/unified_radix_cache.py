@@ -983,6 +983,16 @@ class UnifiedRadixCache(BasePrefixCache):
         if target_node is not self.root_node:
             self._refresh_component_lru(target_node, LRURefreshPhase.INSERT_END)
 
+        # HiCache write-through: a brand-new leaf counts as its first hit, exactly
+        # like a walked-through node does above (and like torch HiRadixCache's
+        # inc_hit_count(new_node)). Without this, a prefix seen once is never
+        # backed up and its first eviction destroys it -- the host tier would
+        # only ever hold prefixes that happened to be re-inserted while still
+        # resident. Runs after commit_insert_component_data so the node is
+        # fully formed when write_backup gathers it.
+        if is_new_leaf and self.hicache_enabled:
+            self._inc_hit_count(target_node)
+
         return result
 
     ##### HiCache (L1<->L2) Write Path #####
@@ -1034,6 +1044,9 @@ class UnifiedRadixCache(BasePrefixCache):
         Token->page folding: cd.value is token-level; take every page_size-th
         element and divide by page_size to get local device page ids."""
         if node is self.root_node or node.backuped:
+            return 0
+        if self.host_pool is None or self.hicache_controller is None:
+            # hicache_enabled without the L2 wiring (tests / partial init): nothing to back up to.
             return 0
 
         if not write_back and node.parent is not self.root_node and not node.parent.backuped:

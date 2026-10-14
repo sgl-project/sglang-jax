@@ -677,8 +677,14 @@ class PrefillAdder:
 
             # HiCache: after budget gate, pull host-only prefix back to device.
             # Must happen after NO_TOKEN check so rejected reqs never trigger H2D.
+            # The quota is the admission budget (free + evictable - offset), NOT
+            # the currently-free size: under memory pressure -- the only time a
+            # prefix is host-only -- free HBM is ~0 and a free-only quota would
+            # refuse every reload before init_load_back gets to evict LRU pages
+            # to make room. The request already passed the total_tokens gate
+            # against this same budget, so the reload always fits.
             if getattr(self.tree_cache, "hicache_enabled", False) and req.host_hit_length > 0:
-                mem_quota = self.token_to_kv_pool_allocator.available_size(dp_rank)
+                mem_quota = self.rem_total_tokens_for_dp(dp_rank)
                 new_indices, last_node, flush_plan = self.tree_cache.init_load_back(
                     req.last_host_node, req.host_hit_length, mem_quota=mem_quota
                 )

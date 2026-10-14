@@ -174,19 +174,18 @@ class HiCacheE2EBase(unittest.TestCase):
 
 
 class TestWriteThrough(HiCacheE2EBase):
-    def test_backup_triggers_on_reuse_and_releases_lock(self):
+    def test_new_leaf_is_backed_up_and_lock_released(self):
         tokens = [10, 11, 12, 13]
         idx, _ = self._alloc_and_fill(len(tokens), seed=1)
 
-        # First insert: new leaf, no hit-count bump, no backup.
+        # First insert: a new leaf counts as its first hit, so with
+        # write_through_threshold=1 it is backed up right away (torch
+        # HiRadixCache semantics). Previously only re-inserted nodes were, which
+        # meant a prefix seen once was destroyed by its first eviction.
         self.cache.insert(InsertParams(key=_key(tokens), value=idx))
         node = self._child_of_root()
-        self.assertFalse(node.backuped)
-        self.assertEqual(node.hit_count, 0)
-
-        # Second insert (prefix reuse): hit_count crosses threshold -> backup.
-        self.cache.insert(InsertParams(key=_key(tokens), value=idx, prev_prefix_len=len(idx)))
         self.assertTrue(node.backuped)
+        self.assertEqual(node.hit_count, 1)
         self.assertEqual(len(node.component_data[0].host_value), self._pages(len(tokens)))
         # The device lock is taken only around the synchronous gather inside
         # write_backup and released before it returns, so it is already 0 here
@@ -196,25 +195,52 @@ class TestWriteThrough(HiCacheE2EBase):
         self.assertEqual(node.component_data[0].lock_ref, 0)
         self.assertIn(node, [n for f, (n, _) in self.cache.ongoing_write.items()])
 
+        # A re-insert (prefix reuse) bumps the counter but never re-backs-up.
+        self.cache.insert(InsertParams(key=_key(tokens), value=idx, prev_prefix_len=len(idx)))
+        self.assertEqual(node.hit_count, 1)  # _inc_hit_count short-circuits on backuped
+        self.assertEqual(len(self.cache.ongoing_write), 1)
+
         self._settle_writes()
         # Flush settled, future drained; still backed up, still unlocked.
         self.assertEqual(node.component_data[0].lock_ref, 0)
         self.assertNotIn(node, [n for f, (n, _) in self.cache.ongoing_write.items()])
         self.assertTrue(node.backuped)
 
+    def test_seen_once_prefix_survives_eviction(self):
+        """Regression for run15: a prompt served exactly once must be reloadable
+        from host after HBM pressure evicts it, not silently recomputed."""
+        tokens = [40, 41, 42, 43]
+        idx, orig = self._alloc_and_fill(len(tokens), seed=5)
+        self.cache.insert(InsertParams(key=_key(tokens), value=idx))  # once
+        node = self._child_of_root()
+        self._settle_writes()
+
+        self.cache.evict(EvictParams(num_tokens=len(tokens), dp_rank=0))
+        self.assertTrue(node.evicted)
+        self.assertTrue(node.backuped, "seen-once node was dropped instead of demoted to host")
+
+        mr = self.cache.match_prefix(MatchPrefixParams(key=_key(tokens)))
+        self.assertEqual(len(mr.device_indices), 0)
+        self.assertEqual(mr.host_hit_length, len(tokens))
+        new_indices, last_node = self._load_back(
+            mr.last_host_node, mr.host_hit_length, mem_quota=self.DEVICE_SIZE
+        )
+        self.assertEqual(len(new_indices), len(tokens))
+        self.assertIs(last_node, node)
+        for i, dev_idx in enumerate(new_indices):
+            for layer in range(self.LAYER_NUM):
+                np.testing.assert_allclose(self._read_token(layer, int(dev_idx)), orig[i][layer])
+
     def test_threshold_gt_one(self):
         self.cache.write_through_threshold = 2
         tokens = [1, 2, 3, 4]
         idx, _ = self._alloc_and_fill(len(tokens), seed=2)
-        self.cache.insert(InsertParams(key=_key(tokens), value=idx))
+        self.cache.insert(InsertParams(key=_key(tokens), value=idx))  # hit_count=1 (new leaf)
         node = self._child_of_root()
-        self.cache.insert(
-            InsertParams(key=_key(tokens), value=idx, prev_prefix_len=len(idx))
-        )  # hit_count=1
         self.assertFalse(node.backuped)
         self.cache.insert(
             InsertParams(key=_key(tokens), value=idx, prev_prefix_len=len(idx))
-        )  # hit_count=2
+        )  # hit_count=2 -> backup on first reuse
         self.assertTrue(node.backuped)
         self._settle_writes()
 
@@ -696,6 +722,11 @@ class TestLoadBackPreEvicts(HiCacheE2EBase):
     """init_load_back hits the `avail < total` branch: the device is packed with
     colder evictable cache entries, so reloading the host prefix must trigger a
     device eviction before the alloc succeeds."""
+
+    # Write-through backs the filler up too; the host pool must hold target +
+    # filler, otherwise host LRU evicts the target's copy while reserving slots
+    # for the filler (realistic deployments size host >= device).
+    HOST_PAGES = 256
 
     def test_pre_eviction(self):
         target = [90, 91, 92, 93, 94, 95, 96, 97]  # 8 tokens
