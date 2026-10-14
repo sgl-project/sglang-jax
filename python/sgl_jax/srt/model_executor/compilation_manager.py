@@ -367,13 +367,27 @@ class CompilationManager:
             # schedule_batch.py): cache_loc length is part of the jit cache key,
             # so the ladder shapes must be part of the precompile set.
             ladder_steps = _decode_kv_ladder_steps(self.page_size)
+            seen = set()
             for bs, cache_loc in zip(self.bs_buckets, self.cache_loc_buckets):
                 for pages in self.decode_page_buckets or [None]:
                     yield bs, bs, cache_loc, pages
                     for step in ladder_steps:
                         ladder_size = bs * step
-                        if ladder_size < cache_loc:
-                            yield bs, bs, ladder_size, pages
+                        if ladder_size >= cache_loc:
+                            continue
+                        # A ladder shape holds at most ``step`` tokens per request, so the
+                        # page bucket the warmup fills (decode_dummy_seq_len = pages x
+                        # page_size - 1) must not exceed the ladder's per-request pages:
+                        # bs=1, page_size=128, step=2048, pages=64 would otherwise trace a
+                        # seq_len of 8191 against a 16-entry page table. Capping keeps the
+                        # warmup on the same page-table length serving produces for that
+                        # shape (decode_page_count = min(bs x pages, cache_loc / page)).
+                        pages_l = pages if pages is None else min(pages, step // self.page_size)
+                        key = (bs, ladder_size, pages_l)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        yield bs, bs, ladder_size, pages_l
         else:
             raise ValueError(f"No serving precompile shapes for {mode}")
 
