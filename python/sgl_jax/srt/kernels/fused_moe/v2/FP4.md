@@ -39,10 +39,10 @@ Cache separately for each `bf`; retain the returned logical I so padding
 never becomes real work. This helper does not requantize weights.
 
 ```python
-from sgl_jax.srt.kernels.fused_moe.v2.fp4_prepare import prepare_fp4_weights
 from sgl_jax.srt.kernels.fused_moe.v2.kernel import (
     FusedMoEBlockConfig,
     fused_ep_moe_v2,
+    prepare_fp4_weights,
 )
 
 weights, quant_args = prepare_fp4_weights(
@@ -58,6 +58,15 @@ y = fused_ep_moe_v2(
 The example configuration is for global T8192/DP8. The activation limit
 must be chosen from the caller's model contract; 1.0 is the synthetic test
 setting, not a checkpoint accuracy claim.
+
+## Code organization
+
+All runtime implementation lives in `kernel.py`: `prepare_fp4_weights` is a
+public load-time preparation helper, while `_fp4_*` helpers implement only
+FP4-specific decoding, rounding, buffer handling and ACC computation. There
+is no separate FP4 backend module or group-selector dispatch layer. Reference
+unpacking stays in the test file. Existing BF16/FP8 activation is not reused
+for the FP4 path because its clamp/route-weight rounding order differs.
 
 ## Computation and buffer lifetime
 

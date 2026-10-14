@@ -105,9 +105,9 @@ def activation_fn(acc1, acc3, act_fn, swiglu_limit=None):
     elif act_fn == "gelu":
         act = jax.nn.gelu(acc1)
     else:
-        raise RuntimeError(f"Unsupported activation: {act_fn}")
+        raise RuntimeError(f"Unsupported _fp4_activation: {act_fn}")
     # Optional SwiGLU clamp (e.g. maxtext-trained models such as Ling3-Flash clamp
-    # the gated activation on their late layers). Cap the post-activation gate
+    # the gated _fp4_activation on their late layers). Cap the post-_fp4_activation gate
     # single-sided and the up branch double-sided before the multiply. None =
     # disabled (default), preserving prior behavior bit-for-bit.
     if swiglu_limit is not None:
@@ -246,14 +246,6 @@ def validate_fused_moe_block_config(
         raise ValueError(f"{bts=} must be divisible by {btc=}.")
 
 
-def _get_fp4_ops(group_size):
-    if group_size != 32:
-        raise ValueError("MXFP4 supports only E8M0 group32 weights")
-    from . import fp4
-
-    return fp4
-
-
 def get_ep_size(mesh: jax.sharding.Mesh, dp_axis_name, tp_axis_name):
     dp_size = mesh.shape[dp_axis_name]
     tp_size = mesh.shape[tp_axis_name]
@@ -263,6 +255,340 @@ def get_ep_size(mesh: jax.sharding.Mesh, dp_axis_name, tp_axis_name):
 # ---------------------------------------------------------------------------
 # Pallas kernel
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# MXFP4 group32: preparation and private FFN helpers
+# ---------------------------------------------------------------------------
+
+_FP4_BK = _FP4_BN = 256
+
+
+def prepare_fp4_weights(w1, w2, w3, s1, s2, s3, *, bf, group_size=32):
+    """Return positional weights and keyword metadata; no numerical requantization.
+
+    Input ABI is the unpadded canonical layout. Cache per bf configuration; use
+    the returned logical length so padded channels never become valid work.
+    """
+    if group_size != 32:
+        raise ValueError("Only E8M0 group32 weights are supported")
+    if any(w.ndim != 3 for w in (w1, w2, w3)):
+        raise ValueError("Packed weights must have shape [E,K/2,N]")
+    if bf <= 0 or bf % 256:
+        raise ValueError("bf does not align with the selected FP4 route")
+    e, h2, i = w1.shape
+    if i % 256 or w3.shape != w1.shape or w2.shape != (e, i // 2, 2 * h2):
+        raise ValueError("Invalid canonical FP4 weight shapes")
+    if any(w.dtype != jnp.uint8 for w in (w1, w2, w3)):
+        raise TypeError("Packed weights must be uint8")
+    hidden = h2 * 2
+    gs = (e, hidden // 32, i)
+    ds = (e, i // 32, hidden)
+    dtype = jnp.uint8
+    if hidden % 512:
+        raise ValueError("Hidden dimension must align with the X packing and dot K")
+    if any(s.shape != shape or s.dtype != dtype for s, shape in ((s1, gs), (s3, gs), (s2, ds))):
+        raise ValueError("Invalid canonical scale shape or dtype")
+    padded_i = (i + bf - 1) // bf * bf
+    pad_i = padded_i - i
+    if pad_i:
+        w1 = jnp.pad(w1, ((0, 0), (0, 0), (0, pad_i)))
+        w3 = jnp.pad(w3, ((0, 0), (0, 0), (0, pad_i)))
+        w2 = jnp.pad(w2, ((0, 0), (0, pad_i // 2), (0, 0)))
+        pads = [(0, 0)] * s1.ndim
+        pads[-1] = (0, pad_i)
+        s1, s3 = jnp.pad(s1, pads), jnp.pad(s3, pads)
+        pads = [(0, 0)] * s2.ndim
+        pads[1] = (0, padded_i // group_size - s2.shape[1])
+        s2 = jnp.pad(s2, pads)
+    return (w1, w2, w3), {
+        "w1_scale": s1,
+        "w2_scale": s2,
+        "w3_scale": s3,
+        "logical_intermediate_size": i,
+        "mxfp4": True,
+        "fp4_group_size": group_size,
+    }
+
+
+def _fp4_decode_e8m0(code):
+    """Finite E8M0: 2**(code-127); 255 is NaN, 0 is 2**-127.
+
+    Bit construction avoids an intermediate power overflow; code 0 needs a
+    float32 subnormal, not the zero exponent-bit pattern. Device FTZ must be
+    validated separately from CPU interpretation.
+    """
+    code = code.astype(jnp.uint32)
+    bits = jnp.where(code == 0, jnp.uint32(0x00400000), code << 23)
+    bits = jnp.where(code == 255, jnp.uint32(0x7FC00000), bits)
+    return lax.bitcast_convert_type(bits, jnp.float32)
+
+
+def _fp4_decode_tile_layout(packed, scales):
+    """Construct adjacent BF16 rows in TPU's native second-minor packing.
+
+    Do not stack FP32 low/high planes or create [group,32,N] temporaries.
+    Scale multiplication remains FP32 before the BF16 rounding boundary.
+    """
+    scale = jnp.repeat(_fp4_decode_e8m0(scales), 16, axis=0)
+
+    def half(code):
+        code = code.astype(jnp.uint32)
+        mag = code & 7
+        bits = jnp.where(
+            mag < 2, mag * jnp.uint32(0x3F000000), jnp.uint32(0x3F000000) + (mag << 22)
+        )
+        bits |= (code & 8) << 28
+        value = lax.bitcast_convert_type(bits, jnp.float32) * scale
+        return lax.bitcast_convert_type(value.astype(jnp.bfloat16), jnp.uint16).astype(jnp.uint32)
+
+    lo = half(packed & 15)
+    hi = half(packed >> 4)
+    return pltpu.bitcast(lo | (hi << 16), jnp.bfloat16)
+
+
+def _fp4_activation(gate, up, route, limit):
+    # Unlike activation_fn, this contract clamps Gate before SiLU and
+    # applies the routing weight before the BF16 rounding / Down projection.
+    g = gate.astype(jnp.bfloat16).astype(jnp.float32)
+    u = up.astype(jnp.bfloat16).astype(jnp.float32)
+    if limit is not None and limit > 0:
+        g = jnp.minimum(g, limit)
+        u = jnp.clip(u, -limit, limit)
+    return (jax.nn.silu(g) * u * route).astype(jnp.bfloat16)
+
+
+def _fp4_start_panel_dma(
+    weight,
+    scale,
+    packed_panel,
+    scale_panel,
+    semaphore,
+    *,
+    expert,
+    bf_id,
+    down=False,
+    priority=1,
+):
+    # The wrapper pads physical panel capacity; logical I is passed separately.
+    width = packed_panel.shape[0] * 2 if down else packed_panel.shape[1]
+    if down:
+        payload = weight.at[expert, pl.ds(bf_id * width // 2, width // 2), :]
+        count = width // 32
+        scales = scale.at[expert, pl.ds(bf_id * count, count), ...]
+    else:
+        payload = weight.at[expert, :, pl.ds(bf_id * width, width)]
+        scales = scale.at[expert, ..., pl.ds(bf_id * width, width)]
+    pltpu.make_async_copy(payload, packed_panel, semaphore).start(priority=priority)
+    pltpu.make_async_copy(scales, scale_panel, semaphore).start(priority=priority)
+
+
+def _fp4_wait_panel_dma(packed_panel, scale_panel, semaphore):
+    pltpu.make_async_copy(packed_panel, packed_panel, semaphore).wait()
+    pltpu.make_async_copy(scale_panel, scale_panel, semaphore).wait()
+
+
+def _fp4_load_x_and_route(x_source, x_target, route_source, route_target, semaphore):
+    """Start both independent loads, then drain their total byte count.
+
+    With a shared counting semaphore neither first wait identifies a particular
+    transfer. Callers may consume either input only after this function returns.
+    """
+    x_dma = pltpu.make_async_copy(x_source, x_target, semaphore)
+    route_dma = pltpu.make_async_copy(route_source, route_target, semaphore)
+    x_dma.start(priority=1)
+    route_dma.start()
+    x_dma.wait()
+    route_dma.wait()
+
+
+def _fp4_mask_tail_inputs(x, route, *, tile_start, valid_rows):
+    """Leave complete tiles untouched; clear both inputs for invalid tail rows."""
+    bts, packing, width = x.shape
+
+    @pl.when(tile_start + bts > valid_rows)
+    def tail():
+        token_mask = tile_start + lax.broadcasted_iota(jnp.int32, (bts, width), 0) < valid_rows
+        for lane in range(packing):
+            x.at[:, lane, :][...] = jnp.where(token_mask, x[:, lane, :], 0)
+        route_mask = tile_start + lax.broadcasted_iota(jnp.int32, route.shape, 0) < valid_rows
+        route[...] = jnp.where(route_mask, route[...], 0)
+
+
+def _fp4_require_acc_support():
+    """Keep the optional MXFP4 route from failing deep inside TPU lowering."""
+    required = ("ACC", "matmul_push_rhs", "matmul_acc_lhs", "matmul_pop")
+    if any(not hasattr(pltpu, name) for name in required):
+        raise RuntimeError(
+            "MXFP4 group32 requires the Pallas TPU ACC primitives available in "
+            "JAX/jaxlib 0.11.2 (validated version). The existing BF16/FP8 paths "
+            "do not require these primitives."
+        )
+
+
+def _fp4_validate_inputs(tokens, w1, w2, w3, s1, s2, s3, weights, ids, ep_size, top_k):
+    if tokens.ndim != 2 or tokens.dtype != jnp.bfloat16:
+        raise TypeError("FP4 v2 requires rank-2 BF16 tokens (W4A16)")
+    if any(w.dtype != jnp.uint8 or w.ndim != 3 for w in (w1, w2, w3)):
+        raise TypeError("FP4 weights require rank-3 uint8 [E,K/2,N]")
+    e, h2, intermediate = w1.shape
+    hidden = tokens.shape[1]
+    if hidden != 2 * h2 or w3.shape != w1.shape or w2.shape != (e, intermediate // 2, hidden):
+        raise ValueError("Inconsistent logical Gate/Up/Down dimensions")
+    if hidden % _FP4_BK or intermediate % _FP4_BK or e % ep_size or tokens.shape[0] % ep_size:
+        raise ValueError("H/I must align to 256; E/T must divide the EP group")
+    for scale, shape in [
+        (s1, (e, hidden // 32, intermediate)),
+        (s3, (e, hidden // 32, intermediate)),
+        (s2, (e, intermediate // 32, hidden)),
+    ]:
+        if scale is None or scale.dtype != jnp.uint8 or scale.shape != shape:
+            raise ValueError(f"Expected E8M0 uint8 scale {shape}")
+    if not 0 < top_k <= e or ids.shape != (tokens.shape[0], top_k) or weights.shape != ids.shape:
+        raise ValueError("Expected token-aligned [T,top_k] routing arrays")
+    if ids.dtype != jnp.int32 or weights.dtype != jnp.float32:
+        raise TypeError("Routing IDs/weights must be int32/float32")
+    return e, intermediate, hidden
+
+
+def _fp4_issue(lhs, rhs, acc, *, interpret, reuse_rhs=False):
+    if interpret:
+        acc[...] = acc[...] + jnp.dot(lhs, rhs, preferred_element_type=jnp.float32)
+    else:
+        if not reuse_rhs:
+            pltpu.matmul_push_rhs(rhs, staging_register=0, mxu_index=0)
+        pltpu.matmul_acc_lhs(acc, lhs, load_staged_rhs=None if reuse_rhs else 0)
+
+
+def _fp4_pop(acc, *, interpret):
+    if interpret:
+        value = acc[...]
+        acc[...] = jnp.zeros(acc.shape, jnp.float32)
+        return value
+    return pltpu.matmul_pop(acc)
+
+
+def _fp4_gate_up_k256(
+    x,
+    gate,
+    up,
+    gate_packed,
+    gate_scale,
+    up_packed,
+    up_scale,
+    expanded,
+    *,
+    hidden,
+    bts,
+    btc,
+    valid_f=None,
+    interpret=False,
+):
+    """Projection -> N -> K -> rows; independent MxN accumulators retained across full H.
+
+    `interpret` emulates only the ACC primitives for local Pallas tests. The
+    distributed entrypoint never enables it. No per-K result is materialized.
+    """
+    valid_f = gate.shape[1] if valid_f is None else valid_f
+
+    def run(*accs):
+        if interpret:
+            for acc in accs:
+                acc[...] = jnp.zeros(acc.shape, jnp.float32)
+        for packed, scales, output in (
+            (gate_packed, gate_scale, gate),
+            (up_packed, up_scale, up),
+        ):
+            for n in range(0, valid_f, _FP4_BN):
+
+                def decode(k, slot, packed=packed, scales=scales, n=n):
+                    with jax.named_scope("g32_decode_8groups"):
+                        expanded.at[slot][...] = _fp4_decode_tile_layout(
+                            packed[pl.ds(k // 2, 128), pl.ds(n, _FP4_BN)],
+                            scales[pl.ds(k // 32, 8), pl.ds(n, _FP4_BN)],
+                        )
+
+                decode(0, 0)
+                for k in range(0, hidden, _FP4_BK):
+                    slot = (k // _FP4_BK) % 2
+                    for m in range(0, bts, btc):
+                        with jax.named_scope("g32_accumulate_k256"):
+                            _fp4_issue(
+                                x[
+                                    pl.ds(m, btc),
+                                    k // (hidden // 2),
+                                    pl.ds(k % (hidden // 2), _FP4_BK),
+                                ],
+                                expanded[slot],
+                                accs[m // btc],
+                                interpret=interpret,
+                                reuse_rhs=m > 0,
+                            )
+                    if k + _FP4_BK < hidden:
+                        decode(k + _FP4_BK, 1 - slot)
+                for m in range(0, bts, btc):
+                    with jax.named_scope("g32_pop_full_h"):
+                        output.at[pl.ds(m, btc), pl.ds(n, _FP4_BN)][...] = _fp4_pop(
+                            accs[m // btc], interpret=interpret
+                        )
+
+    memory = pltpu.VMEM if interpret else pltpu.ACC(0)
+    pl.run_scoped(run, *(memory((btc, _FP4_BN), jnp.float32) for _ in range(bts // btc)))
+
+
+def _fp4_activate_down_k256(
+    gate,
+    up,
+    route,
+    y_acc,
+    down_packed,
+    down_scale,
+    expanded,
+    *,
+    hidden,
+    bts,
+    btc,
+    bf_id,
+    limit,
+    valid_f=None,
+    interpret=False,
+):
+    """Keep the original btc/_fp4_activation/panel boundary; pop once per panel."""
+    valid_f = gate.shape[1] if valid_f is None else valid_f
+
+    def run(acc):
+        if interpret:
+            acc[...] = jnp.zeros(acc.shape, jnp.float32)
+        for m in range(0, bts, btc):
+            z = _fp4_activation(
+                gate[pl.ds(m, btc), pl.ds(0, valid_f)],
+                up[pl.ds(m, btc), pl.ds(0, valid_f)],
+                route[pl.ds(m, btc), 0:1],
+                limit,
+            )
+            for n in range(0, hidden, _FP4_BN):
+
+                def decode(k, slot, n=n):
+                    with jax.named_scope("g32_down_decode_8groups"):
+                        expanded.at[slot][...] = _fp4_decode_tile_layout(
+                            down_packed[pl.ds(k // 2, 128), pl.ds(n, _FP4_BN)],
+                            down_scale[pl.ds(k // 32, 8), pl.ds(n, _FP4_BN)],
+                        )
+
+                decode(0, 0)
+                for k in range(0, valid_f, _FP4_BK):
+                    slot = (k // _FP4_BK) % 2
+                    _fp4_issue(z[:, pl.ds(k, _FP4_BK)], expanded[slot], acc, interpret=interpret)
+                    if k + _FP4_BK < valid_f:
+                        decode(k + _FP4_BK, 1 - slot)
+                value = _fp4_pop(acc, interpret=interpret)
+                target = y_acc.at[
+                    pl.ds(m, btc), n // (hidden // 2), pl.ds(n % (hidden // 2), _FP4_BN)
+                ]
+                target[...] = value if bf_id == 0 else target[...] + value
+
+    memory = pltpu.VMEM if interpret else pltpu.ACC(0)
+    pl.run_scoped(run, memory((btc, _FP4_BN), jnp.float32))
 
 
 def _fused_ep_moe_kernel(
@@ -325,7 +651,7 @@ def _fused_ep_moe_kernel(
     b_y_acc_vmem,  # (bts, t_packing, h_per_t) f32
     # Output staging for HBM read-modify-write per bts tile
     b_y_stage_vmem,  # (bts, t_packing, h_per_t) bf16
-    # Per-token activation scale (act_quant only)
+    # Per-token _fp4_activation scale (act_quant only)
     b_x_scale_vmem,  # None | (bts, 128) f32
     # --- Semaphores ---
     x_stage_sem,  # DMA(1,) — token staging
@@ -368,7 +694,6 @@ def _fused_ep_moe_kernel(
     quant_block_k: int | None = None,
     enable_act_quant: bool = False,
     mxfp4: bool = False,
-    fp4_group_size: int = 32,
     logical_intermediate: int | None = None,
     fp4_interpret: bool = False,
 ):
@@ -379,8 +704,6 @@ def _fused_ep_moe_kernel(
     dp_size = lax.axis_size(dp_axis_name)
     my_id = dp_rank * tp_size + tp_rank
     num_devices = tp_size * dp_size
-    if mxfp4:
-        fp4_ops = _get_fp4_ops(fp4_group_size)
     local_num_tokens = tokens_hbm.shape[0]
     local_num_experts, intermediate_size, hidden_size = w2_hbm.shape
     if mxfp4:
@@ -947,9 +1270,7 @@ def _fused_ep_moe_kernel(
     @jax.named_scope("w1_load")
     def start_fetch_w1(local_e_id, slot, bf_id, priority=1):
         if mxfp4:
-            start_panel_dma = fp4_ops.start_panel_dma
-
-            start_panel_dma(
+            _fp4_start_panel_dma(
                 w1_hbm,
                 w1_scale_hbm,
                 fp4_gate_packed_slots.at[slot],
@@ -986,9 +1307,7 @@ def _fused_ep_moe_kernel(
     @jax.named_scope("w1_load_wait")
     def wait_fetch_w1(slot):
         if mxfp4:
-            wait_panel_dma = fp4_ops.wait_panel_dma
-
-            wait_panel_dma(
+            _fp4_wait_panel_dma(
                 fp4_gate_packed_slots.at[slot],
                 fp4_gate_scale_slots.at[slot],
                 local_sems.at[slot, 4],
@@ -1009,9 +1328,7 @@ def _fused_ep_moe_kernel(
     @jax.named_scope("w3_load")
     def start_fetch_w3(local_e_id, slot, bf_id, priority=1):
         if mxfp4:
-            start_panel_dma = fp4_ops.start_panel_dma
-
-            start_panel_dma(
+            _fp4_start_panel_dma(
                 w3_hbm,
                 w3_scale_hbm,
                 fp4_up_packed_slots.at[slot],
@@ -1048,9 +1365,7 @@ def _fused_ep_moe_kernel(
     @jax.named_scope("w3_load_wait")
     def wait_fetch_w3(slot):
         if mxfp4:
-            wait_panel_dma = fp4_ops.wait_panel_dma
-
-            wait_panel_dma(
+            _fp4_wait_panel_dma(
                 fp4_up_packed_slots.at[slot], fp4_up_scale_slots.at[slot], local_sems.at[slot, 5]
             )
             return
@@ -1069,9 +1384,7 @@ def _fused_ep_moe_kernel(
     @jax.named_scope("w2_load")
     def start_fetch_w2(local_e_id, slot, bf_id, priority=0):
         if mxfp4:
-            start_panel_dma = fp4_ops.start_panel_dma
-
-            start_panel_dma(
+            _fp4_start_panel_dma(
                 w2_hbm,
                 w2_scale_hbm,
                 fp4_down_packed_slots.at[slot],
@@ -1108,9 +1421,7 @@ def _fused_ep_moe_kernel(
     @jax.named_scope("w2_load_wait")
     def wait_fetch_w2(slot):
         if mxfp4:
-            wait_panel_dma = fp4_ops.wait_panel_dma
-
-            wait_panel_dma(
+            _fp4_wait_panel_dma(
                 fp4_down_packed_slots.at[slot],
                 fp4_down_scale_slots.at[slot],
                 local_sems.at[slot, 6],
@@ -1302,17 +1613,15 @@ def _fused_ep_moe_kernel(
                 tile_start = bts_id * bts
 
                 if mxfp4:
-                    from .fp4_common import load_x_and_route, mask_tail_inputs
-
                     with jax.named_scope("expert_x_route_load"):
-                        load_x_and_route(
+                        _fp4_load_x_and_route(
                             a2a_s_ref(a2a_bank_id, e_sem_id, tile_start, bts),
                             b_x_vmem,
                             route_s_ref(a2a_bank_id, e_sem_id, tile_start, bts),
                             route_stage_vmem,
                             x_stage_sem.at[0],
                         )
-                    mask_tail_inputs(
+                    _fp4_mask_tail_inputs(
                         b_x_vmem, route_stage_vmem, tile_start=tile_start, valid_rows=dyn_sz_i32
                     )
                 else:
@@ -1396,14 +1705,10 @@ def _fused_ep_moe_kernel(
                     next_bf_id = bf_id + 2
 
                     if mxfp4:
-                        gate_up_k256, activate_down_k256 = (
-                            fp4_ops.gate_up_k256,
-                            fp4_ops.activate_down_k256,
-                        )
 
                         wait_fetch_w1(slot)
                         wait_fetch_w3(slot)
-                        gate_up_k256(
+                        _fp4_gate_up_k256(
                             b_x_vmem,
                             b_gate_acc_vmem,
                             b_up_acc_vmem,
@@ -1412,7 +1717,6 @@ def _fused_ep_moe_kernel(
                             fp4_up_packed_slots.at[slot],
                             fp4_up_scale_slots.at[slot],
                             fp4_decoded_tile,
-                            None,
                             hidden=hidden_size,
                             bts=bts,
                             btc=btc,
@@ -1443,7 +1747,7 @@ def _fused_ep_moe_kernel(
 
                         # Preserve the deferred W2 wait: down DMA overlaps gate/up compute.
                         wait_fetch_w2(slot)
-                        activate_down_k256(
+                        _fp4_activate_down_k256(
                             b_gate_acc_vmem,
                             b_up_acc_vmem,
                             route_stage_vmem,
@@ -1741,7 +2045,7 @@ def _fused_ep_moe_kernel(
                             if not use_direct_w2:
                                 gate = b_gate_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
                                 up_val = b_up_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
-                                with jax.named_scope("activation"):
+                                with jax.named_scope("_fp4_activation"):
                                     act = activation_fn(gate, up_val, act_fn, swiglu_limit)
                             with jax.named_scope("ffn2_down"):
                                 for p_id in range(out_packing):
@@ -2707,12 +3011,11 @@ def fused_ep_moe_v2(
     tp_axis_name: str = "tensor",
 ):
     if mxfp4:
-        fp4_ops = _get_fp4_ops(fp4_group_size)
+        if fp4_group_size != 32:
+            raise ValueError("MXFP4 supports only E8M0 group32 weights")
         if not interpret:
-            fp4_ops.require_acc_support()
-        validate_inputs = fp4_ops.validate_inputs
-
-        validate_inputs(
+            _fp4_require_acc_support()
+        _fp4_validate_inputs(
             tokens,
             w1,
             w2,
@@ -2896,7 +3199,7 @@ def fused_ep_moe_v2(
     t_packing = get_dtype_packing(t_dtype)
     h_per_t = hidden_size // t_packing
 
-    # When activation quantization is on, the kernel-internal "t_*" view of
+    # When _fp4_activation quantization is on, the kernel-internal "t_*" view of
     # tokens becomes fp8 (after prequant), while the kernel output (a2a_g,
     # b_y_stage, etc.) remains bf16. Out_* names below stay bf16 in both modes.
     if enable_act_quant:
@@ -3065,7 +3368,7 @@ def fused_ep_moe_v2(
         pltpu.VMEM((bts, out_packing, h_per_out), jnp.float32),  # y_acc
         # VMEM: output staging for HBM writeback per bts tile
         pltpu.VMEM((bts, out_packing, h_per_out), out_dtype),  # y_stage
-        # VMEM: per-token activation scale (act_quant only)
+        # VMEM: per-token _fp4_activation scale (act_quant only)
         (None if not enable_act_quant else pltpu.VMEM((bts, 128), jnp.float32)),  # x_scale
         # Semaphores
         pltpu.SemaphoreType.DMA((1,)),  # x_stage
@@ -3120,7 +3423,6 @@ def fused_ep_moe_v2(
                 fixed_gather_banks=fixed_gather_banks,
                 enable_act_quant=enable_act_quant,
                 mxfp4=mxfp4,
-                fp4_group_size=fp4_group_size,
                 logical_intermediate=intermediate_size if mxfp4 else None,
                 fp4_interpret=interpret,
                 direct_scaled_dot=direct_scaled_dot,

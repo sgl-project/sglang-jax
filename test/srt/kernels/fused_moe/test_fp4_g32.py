@@ -10,8 +10,8 @@ import pytest
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sgl_jax.srt.kernels.fused_moe.v2 import fp4
-from sgl_jax.srt.kernels.fused_moe.v2.fp4_common import decode_raw, decode_tile_layout
+from sgl_jax.srt.kernels.fused_moe.v2 import kernel
+from sgl_jax.srt.kernels.fused_moe.v2.kernel import _fp4_decode_tile_layout
 
 LUT = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6], np.float32)
 
@@ -24,13 +24,15 @@ def unpack(q):
 
 def test_decode_all_codes():
     q = np.tile(np.arange(256, dtype=np.uint8), (128, 1))
+    # Unit scales exercise every packed code through the production decoder.
+    unit_scales = np.full((8, 256), 127, np.uint8)
     np.testing.assert_array_equal(
-        np.asarray(jax.jit(decode_raw)(q)).view(np.uint16),
+        np.asarray(jax.jit(_fp4_decode_tile_layout)(q, unit_scales)).view(np.uint16),
         np.asarray(jnp.asarray(unpack(q), jnp.bfloat16)).view(np.uint16),
     )
     s = np.full((8, 256), 124, np.uint8)
     np.testing.assert_array_equal(
-        np.asarray(jax.jit(decode_tile_layout)(q, s)).astype(np.float32), unpack(q) / 8
+        np.asarray(jax.jit(_fp4_decode_tile_layout)(q, s)).astype(np.float32), unpack(q) / 8
     )
 
 
@@ -61,12 +63,11 @@ def panel_call(
 ):
     b, h = x.shape
     f = q1.shape[1]
-    ops = fp4
 
     def body(xr, a, c, d, sa, sc, sd, rr, prev, out, gate, up, expanded):
         out[...] = prev[...]
         kw = {"interpret": interpret}
-        ops.gate_up_k256(
+        kernel._fp4_gate_up_k256(
             xr,
             gate,
             up,
@@ -75,14 +76,13 @@ def panel_call(
             c,
             sc,
             expanded,
-            None,
             hidden=h,
             bts=b,
             btc=btc,
             valid_f=valid_f,
             **kw,
         )
-        ops.activate_down_k256(
+        kernel._fp4_activate_down_k256(
             gate,
             up,
             rr,
@@ -282,7 +282,7 @@ def test_device_jaxpr_acc_and_logical_dot_boundaries(group, row_tile, tmp_path):
 
 @pytest.mark.parametrize("group", [32])
 def test_prepare_padding_preserves_tail_and_metadata(group):
-    from sgl_jax.srt.kernels.fused_moe.v2.fp4_prepare import prepare_fp4_weights
+    from sgl_jax.srt.kernels.fused_moe.v2.kernel import prepare_fp4_weights
 
     e, h, i, f = 2, 1024, 768, 512
     q = jnp.full((e, h // 2, i), 0x21, jnp.uint8)
@@ -303,7 +303,6 @@ def test_prepare_padding_preserves_tail_and_metadata(group):
 
 
 def test_input_dma_starts_both_before_any_wait(monkeypatch):
-    from sgl_jax.srt.kernels.fused_moe.v2 import fp4_common as common
 
     events = []
 
@@ -318,8 +317,8 @@ def test_input_dma_starts_both_before_any_wait(monkeypatch):
         def wait(self):
             events.append(("wait", self.source))
 
-    monkeypatch.setattr(common.pltpu, "make_async_copy", DMA)
-    common.load_x_and_route("X", "X_vmem", "route", "route_vmem", "shared_byte_counter")
+    monkeypatch.setattr(kernel.pltpu, "make_async_copy", DMA)
+    kernel._fp4_load_x_and_route("X", "X_vmem", "route", "route_vmem", "shared_byte_counter")
     assert events == [
         ("start", "X"),
         ("start", "route"),
@@ -330,7 +329,7 @@ def test_input_dma_starts_both_before_any_wait(monkeypatch):
 
 @pytest.mark.parametrize("valid_rows", [16, 21, 32])
 def test_tail_mask_preserves_full_tile_and_clears_nan_padding(valid_rows):
-    from sgl_jax.srt.kernels.fused_moe.v2.fp4_common import mask_tail_inputs
+    from sgl_jax.srt.kernels.fused_moe.v2.kernel import _fp4_mask_tail_inputs
 
     b, start = 16, 16
     x = np.arange(b * 2 * 256, dtype=np.float32).reshape(b, 2, 256) / 100
@@ -342,7 +341,7 @@ def test_tail_mask_preserves_full_tile_and_clears_nan_padding(valid_rows):
     def kernel(xr, rr, size, outx, outr):
         outx[...] = xr[...]
         outr[...] = rr[...]
-        mask_tail_inputs(outx, outr, tile_start=jnp.int32(start), valid_rows=size[0])
+        _fp4_mask_tail_inputs(outx, outr, tile_start=jnp.int32(start), valid_rows=size[0])
 
     call = pl.pallas_call(
         kernel,
@@ -359,7 +358,7 @@ def test_tail_mask_preserves_full_tile_and_clears_nan_padding(valid_rows):
     er[valid:] = 0
     np.testing.assert_array_equal(ox, ex)
     np.testing.assert_array_equal(orr, er)
-    # The stores belonging to mask_tail_inputs must remain inside a conditional.
+    # The stores belonging to _fp4_mask_tail_inputs must remain inside a conditional.
     eqs = list(
         _nested_eqns(
             jax.make_jaxpr(call)(
@@ -434,7 +433,7 @@ def test_distributed_entry_abstract_trace(devices, tokens, bf, mxfp4):
 
 
 def test_prepare_rejects_unsupported_group_and_rank():
-    from sgl_jax.srt.kernels.fused_moe.v2.fp4_prepare import prepare_fp4_weights
+    from sgl_jax.srt.kernels.fused_moe.v2.kernel import prepare_fp4_weights
 
     q = jnp.zeros((1, 256, 256), jnp.uint8)
     d = jnp.zeros((1, 128, 512), jnp.uint8)
@@ -447,10 +446,10 @@ def test_prepare_rejects_unsupported_group_and_rank():
 
 
 def test_e8m0_special_values():
-    from sgl_jax.srt.kernels.fused_moe.v2.fp4_common import decode_e8m0
+    from sgl_jax.srt.kernels.fused_moe.v2.kernel import _fp4_decode_e8m0
 
     codes = jnp.asarray([0, 1, 126, 127, 128, 254, 255], jnp.uint8)
-    actual = np.asarray(jax.jit(decode_e8m0)(codes)).view(np.uint32)
+    actual = np.asarray(jax.jit(_fp4_decode_e8m0)(codes)).view(np.uint32)
     np.testing.assert_array_equal(
         actual,
         np.asarray(
