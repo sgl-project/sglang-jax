@@ -138,6 +138,64 @@ class TestReqToTokenPoolCacheLocHostBuffer(CustomTestCase):
         self.assertEqual(self.pool.cache_loc_host_buf.shape[0], 16)
         np.testing.assert_array_equal(self.pool.cache_loc_host_buf, np.zeros(16, dtype=np.int32))
 
+    def test_merge_cache_loc_does_not_alias_across_overlapping_batches_on_cpu(self):
+        from types import SimpleNamespace
+
+        import jax
+        from jax.sharding import NamedSharding
+        from jax.sharding import PartitionSpec as P
+
+        from sgl_jax.srt.managers.schedule_batch import ScheduleBatch
+        from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+        from sgl_jax.srt.utils.jax_utils import device_array
+
+        self.pool.init_cache_loc_host_buffer(256)
+        self.pool.write((0, slice(0, 12)), np.arange(1, 13, dtype=np.int32))
+        self.pool.write((1, slice(0, 15)), np.arange(13, 28, dtype=np.int32))
+
+        mesh = jax.make_mesh((1,), ("data",))
+        sharding = NamedSharding(mesh, P("data"))
+
+        def make_batch(req_idx: int, seq_len: int):
+            batch = object.__new__(ScheduleBatch)
+            batch.forward_mode = ForwardMode.EXTEND
+            batch.dp_size = 1
+            batch.req_to_token_pool = self.pool
+            batch.mesh = mesh
+            batch.reqs_info = [
+                SimpleNamespace(
+                    seq_lens=np.array([seq_len], dtype=np.int32),
+                    req_pool_indices=np.array([req_idx], dtype=np.int32),
+                )
+            ]
+            return batch
+
+        batch1 = make_batch(req_idx=0, seq_len=12)
+        cache_loc_1 = batch1._merge_cache_loc(
+            bs_paddings=[4],
+            cache_loc_paddings=[256],
+            page_size=1,
+            per_dp_bs_size=4,
+        )
+        (cache_loc_1_dev,) = device_array((cache_loc_1,), sharding=sharding)
+
+        # Simulate overlap scheduler preparing batch 2 before forward_thread
+        # executes batch 1 on CPU (where PjRtCpuClient uses zero-copy on
+        # 64-byte-aligned host buffers).
+        batch2 = make_batch(req_idx=1, seq_len=15)
+        _ = batch2._merge_cache_loc(
+            bs_paddings=[4],
+            cache_loc_paddings=[256],
+            page_size=1,
+            per_dp_bs_size=4,
+        )
+
+        read_in_jit = jax.jit(lambda x: x + 0)
+        np.testing.assert_array_equal(
+            np.asarray(read_in_jit(cache_loc_1_dev))[:12],
+            np.arange(1, 13, dtype=np.int32),
+        )
+
 
 class TestReqToTokenPoolChunkedReqLifecycle(CustomTestCase):
     """End-to-end lock-in for chunked-req slot ownership across batches."""
