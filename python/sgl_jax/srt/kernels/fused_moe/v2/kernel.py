@@ -246,6 +246,14 @@ def validate_fused_moe_block_config(
         raise ValueError(f"{bts=} must be divisible by {btc=}.")
 
 
+def _get_fp4_ops(group_size):
+    if group_size != 32:
+        raise ValueError("MXFP4 supports only E8M0 group32 weights")
+    from . import fp4
+
+    return fp4
+
+
 def get_ep_size(mesh: jax.sharding.Mesh, dp_axis_name, tp_axis_name):
     dp_size = mesh.shape[dp_axis_name]
     tp_size = mesh.shape[tp_axis_name]
@@ -278,6 +286,7 @@ def _fused_ep_moe_kernel(
     w1_shared_scale_hbm,  # None | (1, se_intermediate_size) fp32 per-channel
     w3_shared_scale_hbm,  # None | (1, se_intermediate_size) fp32 per-channel
     w2_shared_scale_hbm,  # None | (1, hidden_size) fp32 per-channel
+    route_s_hbm,  # None | per-assignment FP32 weight, padded to 128 lanes
     # --- HBM output ---
     output_hbm,  # (local_num_tokens, hidden_size)
     # --- SMEM scratch ---
@@ -330,6 +339,15 @@ def _fused_ep_moe_kernel(
     md_send_sems,  # (2,) — one DMA semaphore per metadata mailbox bank
     md_recv_sems,  # (2,) — one DMA semaphore per metadata mailbox bank
     barrier_sem,  # BARRIER
+    route_send_vmem,
+    route_stage_vmem,
+    fp4_gate_packed_slots,
+    fp4_up_packed_slots,
+    fp4_down_packed_slots,
+    fp4_gate_scale_slots,
+    fp4_up_scale_slots,
+    fp4_down_scale_slots,
+    fp4_decoded_tile,
     *,
     # Static params
     top_k: int,
@@ -349,6 +367,10 @@ def _fused_ep_moe_kernel(
     bse: int,
     quant_block_k: int | None = None,
     enable_act_quant: bool = False,
+    mxfp4: bool = False,
+    fp4_group_size: int = 32,
+    logical_intermediate: int | None = None,
+    fp4_interpret: bool = False,
 ):
     # ===== Dimension extraction =====
     dp_rank = lax.axis_index(dp_axis_name)
@@ -357,8 +379,14 @@ def _fused_ep_moe_kernel(
     dp_size = lax.axis_size(dp_axis_name)
     my_id = dp_rank * tp_size + tp_rank
     num_devices = tp_size * dp_size
+    if mxfp4:
+        fp4_ops = _get_fp4_ops(fp4_group_size)
     local_num_tokens = tokens_hbm.shape[0]
     local_num_experts, intermediate_size, hidden_size = w2_hbm.shape
+    if mxfp4:
+        intermediate_size = (
+            logical_intermediate if logical_intermediate is not None else intermediate_size * 2
+        )
     assert local_num_tokens % bt == 0
     num_bt = local_num_tokens // bt
     use_bt_scatter_bank = enable_bt_scatter_overlap and num_bt > 1
@@ -467,6 +495,11 @@ def _fused_ep_moe_kernel(
         if use_bt_banking:
             return a2a_s_x2_hbm.at[a2a_bank_id, e_sem_id, pl.ds(start, size)]
         return a2a_s_x2_hbm.at[e_sem_id, pl.ds(start, size)]
+
+    def route_s_ref(bank, expert, start, size):
+        if use_bt_banking:
+            return route_s_hbm.at[bank, expert, pl.ds(start, size)]
+        return route_s_hbm.at[expert, pl.ds(start, size)]
 
     def a2a_s_acc_ref(a2a_bank_id, e_sem_id, start, size):
         if use_bt_banking:
@@ -693,6 +726,10 @@ def _fused_ep_moe_kernel(
     def start_a2a_scatter_batch_range(*, bt_sem_id, bt_start, a2a_bank_id, token_start, token_end):
 
         def _scatter_one_batch(t_id, _, bt_start=bt_start):
+            if mxfp4:
+                route_send_vmem.at[bt_sem_id, t_id, ...][...] = jnp.broadcast_to(
+                    b_topk_weights_x2_vmem[bt_sem_id, t_id, :top_k][:, None], (top_k, 128)
+                )
             src_t_id = bt_start + t_id
             for k_id in range(top_k):
                 e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
@@ -723,6 +760,12 @@ def _fused_ep_moe_kernel(
                             dst_ref=a2a_s_ref(a2a_bank_id, e_sem_id_k, start, local_sz),
                             sem=scatter_recv_sem(a2a_bank_id, e_sem_id_k),
                         ).start()
+                        if mxfp4:
+                            pltpu.make_async_copy(
+                                route_send_vmem.at[bt_sem_id, pl.ds(t_id, local_sz), k_id, :],
+                                route_s_ref(a2a_bank_id, e_sem_id_k, start, local_sz),
+                                scatter_recv_sem(a2a_bank_id, e_sem_id_k),
+                            ).start()
 
                 with jax.named_scope("a2a_scatter_remote_copy"):
 
@@ -743,6 +786,17 @@ def _fused_ep_moe_kernel(
                             device_id=get_mesh_device_id(recv_id),
                             device_id_type=pl.DeviceIdType.MESH,
                         ).start()
+                        if mxfp4:
+                            pltpu.make_async_remote_copy(
+                                src_ref=route_send_vmem.at[
+                                    bt_sem_id, pl.ds(t_id, remote_sz), k_id, :
+                                ],
+                                dst_ref=route_s_ref(a2a_bank_id, e_sem_id_k, start, remote_sz),
+                                send_sem=scatter_send_sem(a2a_bank_id, e_sem_id_k),
+                                recv_sem=scatter_recv_sem(a2a_bank_id, e_sem_id_k),
+                                device_id=get_mesh_device_id(recv_id),
+                                device_id_type=pl.DeviceIdType.MESH,
+                            ).start()
 
             return None
 
@@ -774,6 +828,9 @@ def _fused_ep_moe_kernel(
                     dst_ref=ref,
                     sem=scatter_send_sem(a2a_bank_id, slot),
                 ).wait()
+                if mxfp4:
+                    ref = route_s_ref(a2a_bank_id, slot, 0, scatter_send_sz)
+                    pltpu.make_async_copy(ref, ref, scatter_send_sem(a2a_bank_id, slot)).wait()
 
             return None
 
@@ -793,6 +850,9 @@ def _fused_ep_moe_kernel(
                 dst_ref=ref,
                 sem=scatter_recv_sem(a2a_bank_id, e_sem_id),
             ).wait()
+            if mxfp4:
+                ref = route_s_ref(a2a_bank_id, e_sem_id, 0, sz)
+                pltpu.make_async_copy(ref, ref, scatter_recv_sem(a2a_bank_id, e_sem_id)).wait()
 
     # ===== A2A gather (static for loop, prefix sum, dst position 0) =====
 
@@ -886,6 +946,21 @@ def _fused_ep_moe_kernel(
 
     @jax.named_scope("w1_load")
     def start_fetch_w1(local_e_id, slot, bf_id, priority=1):
+        if mxfp4:
+            start_panel_dma = fp4_ops.start_panel_dma
+
+            start_panel_dma(
+                w1_hbm,
+                w1_scale_hbm,
+                fp4_gate_packed_slots.at[slot],
+                fp4_gate_scale_slots.at[slot],
+                local_sems.at[slot, 4],
+                expert=local_e_id,
+                bf_id=bf_id,
+                down=False,
+                priority=priority,
+            )
+            return
         for p in range(t_packing):
             pltpu.make_async_copy(
                 src_ref=w1_hbm.at[
@@ -910,6 +985,15 @@ def _fused_ep_moe_kernel(
 
     @jax.named_scope("w1_load_wait")
     def wait_fetch_w1(slot):
+        if mxfp4:
+            wait_panel_dma = fp4_ops.wait_panel_dma
+
+            wait_panel_dma(
+                fp4_gate_packed_slots.at[slot],
+                fp4_gate_scale_slots.at[slot],
+                local_sems.at[slot, 4],
+            )
+            return
         pltpu.make_async_copy(
             src_ref=b_w1_x2_vmem.at[slot],
             dst_ref=b_w1_x2_vmem.at[slot],
@@ -924,6 +1008,21 @@ def _fused_ep_moe_kernel(
 
     @jax.named_scope("w3_load")
     def start_fetch_w3(local_e_id, slot, bf_id, priority=1):
+        if mxfp4:
+            start_panel_dma = fp4_ops.start_panel_dma
+
+            start_panel_dma(
+                w3_hbm,
+                w3_scale_hbm,
+                fp4_up_packed_slots.at[slot],
+                fp4_up_scale_slots.at[slot],
+                local_sems.at[slot, 5],
+                expert=local_e_id,
+                bf_id=bf_id,
+                down=False,
+                priority=priority,
+            )
+            return
         for p in range(t_packing):
             pltpu.make_async_copy(
                 src_ref=w3_hbm.at[
@@ -948,6 +1047,13 @@ def _fused_ep_moe_kernel(
 
     @jax.named_scope("w3_load_wait")
     def wait_fetch_w3(slot):
+        if mxfp4:
+            wait_panel_dma = fp4_ops.wait_panel_dma
+
+            wait_panel_dma(
+                fp4_up_packed_slots.at[slot], fp4_up_scale_slots.at[slot], local_sems.at[slot, 5]
+            )
+            return
         pltpu.make_async_copy(
             src_ref=b_w3_x2_vmem.at[slot],
             dst_ref=b_w3_x2_vmem.at[slot],
@@ -962,6 +1068,21 @@ def _fused_ep_moe_kernel(
 
     @jax.named_scope("w2_load")
     def start_fetch_w2(local_e_id, slot, bf_id, priority=0):
+        if mxfp4:
+            start_panel_dma = fp4_ops.start_panel_dma
+
+            start_panel_dma(
+                w2_hbm,
+                w2_scale_hbm,
+                fp4_down_packed_slots.at[slot],
+                fp4_down_scale_slots.at[slot],
+                local_sems.at[slot, 6],
+                expert=local_e_id,
+                bf_id=bf_id,
+                down=True,
+                priority=priority,
+            )
+            return
         for p in range(out_packing):
             pltpu.make_async_copy(
                 src_ref=w2_hbm.at[
@@ -986,6 +1107,15 @@ def _fused_ep_moe_kernel(
 
     @jax.named_scope("w2_load_wait")
     def wait_fetch_w2(slot):
+        if mxfp4:
+            wait_panel_dma = fp4_ops.wait_panel_dma
+
+            wait_panel_dma(
+                fp4_down_packed_slots.at[slot],
+                fp4_down_scale_slots.at[slot],
+                local_sems.at[slot, 6],
+            )
+            return
         pltpu.make_async_copy(
             src_ref=b_w2_x2_vmem.at[slot],
             dst_ref=b_w2_x2_vmem.at[slot],
@@ -1171,18 +1301,32 @@ def _fused_ep_moe_kernel(
             def bts_body(bts_id, next_bf0_prefetched):
                 tile_start = bts_id * bts
 
-                with jax.named_scope("expert_x_load"):
-                    # Load tokens for this bts tile once; weights reuse it across bf tiles.
-                    pltpu.make_async_copy(
-                        src_ref=a2a_s_ref(a2a_bank_id, e_sem_id, tile_start, bts),
-                        dst_ref=b_x_vmem,
-                        sem=x_stage_sem.at[0],
-                    ).start(priority=1)
-                    pltpu.make_async_copy(
-                        src_ref=b_x_vmem,
-                        dst_ref=b_x_vmem,
-                        sem=x_stage_sem.at[0],
-                    ).wait()
+                if mxfp4:
+                    from .fp4_common import load_x_and_route, mask_tail_inputs
+
+                    with jax.named_scope("expert_x_route_load"):
+                        load_x_and_route(
+                            a2a_s_ref(a2a_bank_id, e_sem_id, tile_start, bts),
+                            b_x_vmem,
+                            route_s_ref(a2a_bank_id, e_sem_id, tile_start, bts),
+                            route_stage_vmem,
+                            x_stage_sem.at[0],
+                        )
+                    mask_tail_inputs(
+                        b_x_vmem, route_stage_vmem, tile_start=tile_start, valid_rows=dyn_sz_i32
+                    )
+                else:
+                    with jax.named_scope("expert_x_load"):
+                        pltpu.make_async_copy(
+                            src_ref=a2a_s_ref(a2a_bank_id, e_sem_id, tile_start, bts),
+                            dst_ref=b_x_vmem,
+                            sem=x_stage_sem.at[0],
+                        ).start(priority=1)
+                        pltpu.make_async_copy(
+                            src_ref=b_x_vmem,
+                            dst_ref=b_x_vmem,
+                            sem=x_stage_sem.at[0],
+                        ).wait()
 
                 if enable_act_quant:
                     # Extract per-token scale embedded in the last fp8 column
@@ -1251,342 +1395,421 @@ def _fused_ep_moe_kernel(
 
                     next_bf_id = bf_id + 2
 
-                    if direct_scaled_dot and w1_scale_hbm is not None and bt <= 16:
-                        wait_fetch_w1(slot)
+                    if mxfp4:
+                        gate_up_k256, activate_down_k256 = (
+                            fp4_ops.gate_up_k256,
+                            fp4_ops.activate_down_k256,
+                        )
 
-                        def _gate_only_btc(btc_id, ___):
-                            gate = jnp.zeros((btc, bf), dtype=jnp.float32)
-                            with jax.named_scope("ffn1_gate"):
-                                for p_id in range(t_packing):
-
-                                    def _ffn1_gate_sg(sg_id, gate_acc, _pid=p_id):
-                                        sg_off = sg_id * ffn1_qbk
-                                        x_slice = b_x_vmem[
-                                            pl.ds(btc_id * btc, btc), _pid, pl.ds(sg_off, ffn1_qbk)
-                                        ]
-                                        w1_tile = b_w1_x2_vmem[
-                                            slot, _pid, pl.ds(sg_off, ffn1_qbk), pl.ds(0, bf)
-                                        ]
-                                        d1 = jnp.dot(
-                                            x_slice, w1_tile, preferred_element_type=jnp.float32
-                                        )
-                                        s1 = b_w1_scale_x2_vmem[
-                                            slot, _pid, pl.ds(sg_id, 1), 0, pl.ds(0, bf)
-                                        ].reshape(bf)
-                                        if enable_act_quant:
-                                            x_s = b_x_scale_vmem[
-                                                pl.ds(btc_id * btc, btc), pl.ds(0, 1)
-                                            ]
-                                            return gate_acc + d1 * (x_s * s1[jnp.newaxis, :])
-                                        return gate_acc + jnp.stack(
-                                            [d1[i] * s1 for i in range(btc)], axis=0
-                                        )
-
-                                    gate = lax.fori_loop(0, n_sg, _ffn1_gate_sg, gate, unroll=n_sg)
-                            b_gate_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = gate
-                            return None
-
-                        lax.fori_loop(0, num_btc_per_bts, _gate_only_btc, None)
-
-                        wait_fetch_w3(slot)
-
-                        def _up_only_btc(btc_id, ___):
-                            up = jnp.zeros((btc, bf), dtype=jnp.float32)
-                            with jax.named_scope("ffn1_up"):
-                                for p_id in range(t_packing):
-
-                                    def _ffn1_up_sg(sg_id, up_acc, _pid=p_id):
-                                        sg_off = sg_id * ffn1_qbk
-                                        x_slice = b_x_vmem[
-                                            pl.ds(btc_id * btc, btc), _pid, pl.ds(sg_off, ffn1_qbk)
-                                        ]
-                                        w3_tile = b_w3_x2_vmem[
-                                            slot, _pid, pl.ds(sg_off, ffn1_qbk), pl.ds(0, bf)
-                                        ]
-                                        d3 = jnp.dot(
-                                            x_slice, w3_tile, preferred_element_type=jnp.float32
-                                        )
-                                        s3 = b_w3_scale_x2_vmem[
-                                            slot, _pid, pl.ds(sg_id, 1), 0, pl.ds(0, bf)
-                                        ].reshape(bf)
-                                        if enable_act_quant:
-                                            x_s = b_x_scale_vmem[
-                                                pl.ds(btc_id * btc, btc), pl.ds(0, 1)
-                                            ]
-                                            return up_acc + d3 * (x_s * s3[jnp.newaxis, :])
-                                        return up_acc + jnp.stack(
-                                            [d3[i] * s3 for i in range(btc)], axis=0
-                                        )
-
-                                    up = lax.fori_loop(0, n_sg, _ffn1_up_sg, up, unroll=n_sg)
-                            b_up_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = up
-                            return None
-
-                        lax.fori_loop(0, num_btc_per_bts, _up_only_btc, None)
-
-                    elif direct_scaled_dot and w1_scale_hbm is not None:
                         wait_fetch_w1(slot)
                         wait_fetch_w3(slot)
-
-                        def gate_up_btc_direct(btc_id, ___):
-                            if per_channel and enable_act_quant:
-                                # per-channel scale is whole-K (p_id-invariant), so
-                                # fold it OUT of the t_packing loop: accumulate raw
-                                # f32 dots across the K-slices, apply per-token ×
-                                # per-channel scale ONCE (saves ~3/4 of FFN1's VPU
-                                # scale-muls). n_sg==1 here. Math-identical
-                                # (Σ d·s == (Σ d)·s); f32 rounding within tol.
-                                g_raw = jnp.zeros((btc, bf), dtype=jnp.float32)
-                                u_raw = jnp.zeros((btc, bf), dtype=jnp.float32)
-                                for p_id in range(t_packing):
-                                    x_slice = b_x_vmem[
-                                        pl.ds(btc_id * btc, btc), p_id, pl.ds(0, ffn1_qbk)
-                                    ]
-                                    w1_tile = b_w1_x2_vmem[
-                                        slot, p_id, pl.ds(0, ffn1_qbk), pl.ds(0, bf)
-                                    ]
-                                    w3_tile = b_w3_x2_vmem[
-                                        slot, p_id, pl.ds(0, ffn1_qbk), pl.ds(0, bf)
-                                    ]
-                                    g_raw = g_raw + jnp.dot(
-                                        x_slice, w1_tile, preferred_element_type=jnp.float32
-                                    )
-                                    u_raw = u_raw + jnp.dot(
-                                        x_slice, w3_tile, preferred_element_type=jnp.float32
-                                    )
-                                x_s = b_x_scale_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, 1)]
-                                s1 = b_w1_scale_x2_vmem[
-                                    slot, 0, pl.ds(0, 1), 0, pl.ds(0, bf)
-                                ].reshape(bf)
-                                s3 = b_w3_scale_x2_vmem[
-                                    slot, 0, pl.ds(0, 1), 0, pl.ds(0, bf)
-                                ].reshape(bf)
-                                b_gate_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = (
-                                    g_raw * (x_s * s1[jnp.newaxis, :])
+                        gate_up_k256(
+                            b_x_vmem,
+                            b_gate_acc_vmem,
+                            b_up_acc_vmem,
+                            fp4_gate_packed_slots.at[slot],
+                            fp4_gate_scale_slots.at[slot],
+                            fp4_up_packed_slots.at[slot],
+                            fp4_up_scale_slots.at[slot],
+                            fp4_decoded_tile,
+                            None,
+                            hidden=hidden_size,
+                            bts=bts,
+                            btc=btc,
+                            valid_f=min(bf, intermediate_size - bf_id * bf),
+                            **({"interpret": fp4_interpret}),
+                        )
+                        if (not global_rolling_wb) and can_split_w13_w2_prefetch:
+                            if bf_id == num_bf - 2:
+                                next_has_prefetch = start_prefetch_expert_bf0(
+                                    bt_sem_id,
+                                    (
+                                        next_local_e_id
+                                        if next_local_e_id is not None
+                                        else local_e_id + jnp.int32(1)
+                                    ),
+                                    slot=slot,
+                                    priority=1,
+                                    enabled=(
+                                        jnp.logical_and(num_bts_tiles == jnp.int32(1), has_next)
+                                        if has_next is not None
+                                        else (num_bts_tiles == jnp.int32(1))
+                                    ),
+                                    include_w2=False,
                                 )
-                                b_up_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = (
-                                    u_raw * (x_s * s3[jnp.newaxis, :])
+                                next_bf0_prefetched = jnp.logical_or(
+                                    next_bf0_prefetched, next_has_prefetch
                                 )
-                                return None
-                            gate = jnp.zeros((btc, bf), dtype=jnp.float32)
-                            up = jnp.zeros((btc, bf), dtype=jnp.float32)
-                            with jax.named_scope("ffn1_gate_up"):
-                                for p_id in range(t_packing):
 
-                                    def _ffn1_sg_body(sg_id, carry):
-                                        gate_acc, up_acc = carry
-                                        sg_off = sg_id * ffn1_qbk
-                                        x_slice = b_x_vmem[
-                                            pl.ds(btc_id * btc, btc),
-                                            p_id,
-                                            pl.ds(sg_off, ffn1_qbk),
-                                        ]
-                                        w1_tile = b_w1_x2_vmem[
-                                            slot,
-                                            p_id,
-                                            pl.ds(sg_off, ffn1_qbk),
-                                            pl.ds(0, bf),
-                                        ]
-                                        w3_tile = b_w3_x2_vmem[
-                                            slot,
-                                            p_id,
-                                            pl.ds(sg_off, ffn1_qbk),
-                                            pl.ds(0, bf),
-                                        ]
-                                        d1 = jnp.dot(
-                                            x_slice,
-                                            w1_tile,
-                                            preferred_element_type=jnp.float32,
-                                        )
-                                        s1 = b_w1_scale_x2_vmem[
-                                            slot,
-                                            p_id,
-                                            pl.ds(sg_id, 1),
-                                            0,
-                                            pl.ds(0, bf),
-                                        ].reshape(bf)
-                                        if enable_act_quant:
-                                            x_s = b_x_scale_vmem[
-                                                pl.ds(btc_id * btc, btc), pl.ds(0, 1)
+                        # Preserve the deferred W2 wait: down DMA overlaps gate/up compute.
+                        wait_fetch_w2(slot)
+                        activate_down_k256(
+                            b_gate_acc_vmem,
+                            b_up_acc_vmem,
+                            route_stage_vmem,
+                            b_y_acc_vmem,
+                            fp4_down_packed_slots.at[slot],
+                            fp4_down_scale_slots.at[slot],
+                            fp4_decoded_tile,
+                            hidden=hidden_size,
+                            bts=bts,
+                            btc=btc,
+                            bf_id=bf_id,
+                            limit=swiglu_limit,
+                            valid_f=min(bf, intermediate_size - bf_id * bf),
+                            **({"interpret": fp4_interpret}),
+                        )
+                    else:
+                        if direct_scaled_dot and w1_scale_hbm is not None and bt <= 16:
+                            wait_fetch_w1(slot)
+
+                            def _gate_only_btc(btc_id, ___):
+                                gate = jnp.zeros((btc, bf), dtype=jnp.float32)
+                                with jax.named_scope("ffn1_gate"):
+                                    for p_id in range(t_packing):
+
+                                        def _ffn1_gate_sg(sg_id, gate_acc, _pid=p_id):
+                                            sg_off = sg_id * ffn1_qbk
+                                            x_slice = b_x_vmem[
+                                                pl.ds(btc_id * btc, btc),
+                                                _pid,
+                                                pl.ds(sg_off, ffn1_qbk),
                                             ]
-                                            gate_acc = gate_acc + d1 * (x_s * s1[jnp.newaxis, :])
-                                        else:
-                                            gate_acc += jnp.stack(
+                                            w1_tile = b_w1_x2_vmem[
+                                                slot, _pid, pl.ds(sg_off, ffn1_qbk), pl.ds(0, bf)
+                                            ]
+                                            d1 = jnp.dot(
+                                                x_slice, w1_tile, preferred_element_type=jnp.float32
+                                            )
+                                            s1 = b_w1_scale_x2_vmem[
+                                                slot, _pid, pl.ds(sg_id, 1), 0, pl.ds(0, bf)
+                                            ].reshape(bf)
+                                            if enable_act_quant:
+                                                x_s = b_x_scale_vmem[
+                                                    pl.ds(btc_id * btc, btc), pl.ds(0, 1)
+                                                ]
+                                                return gate_acc + d1 * (x_s * s1[jnp.newaxis, :])
+                                            return gate_acc + jnp.stack(
                                                 [d1[i] * s1 for i in range(btc)], axis=0
                                             )
 
-                                        d3 = jnp.dot(
-                                            x_slice,
-                                            w3_tile,
-                                            preferred_element_type=jnp.float32,
+                                        gate = lax.fori_loop(
+                                            0, n_sg, _ffn1_gate_sg, gate, unroll=n_sg
                                         )
-                                        s3 = b_w3_scale_x2_vmem[
-                                            slot,
-                                            p_id,
-                                            pl.ds(sg_id, 1),
-                                            0,
-                                            pl.ds(0, bf),
-                                        ].reshape(bf)
-                                        if enable_act_quant:
-                                            up_acc = up_acc + d3 * (x_s * s3[jnp.newaxis, :])
-                                        else:
-                                            up_acc += jnp.stack(
+                                b_gate_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][
+                                    ...
+                                ] = gate
+                                return None
+
+                            lax.fori_loop(0, num_btc_per_bts, _gate_only_btc, None)
+
+                            wait_fetch_w3(slot)
+
+                            def _up_only_btc(btc_id, ___):
+                                up = jnp.zeros((btc, bf), dtype=jnp.float32)
+                                with jax.named_scope("ffn1_up"):
+                                    for p_id in range(t_packing):
+
+                                        def _ffn1_up_sg(sg_id, up_acc, _pid=p_id):
+                                            sg_off = sg_id * ffn1_qbk
+                                            x_slice = b_x_vmem[
+                                                pl.ds(btc_id * btc, btc),
+                                                _pid,
+                                                pl.ds(sg_off, ffn1_qbk),
+                                            ]
+                                            w3_tile = b_w3_x2_vmem[
+                                                slot, _pid, pl.ds(sg_off, ffn1_qbk), pl.ds(0, bf)
+                                            ]
+                                            d3 = jnp.dot(
+                                                x_slice, w3_tile, preferred_element_type=jnp.float32
+                                            )
+                                            s3 = b_w3_scale_x2_vmem[
+                                                slot, _pid, pl.ds(sg_id, 1), 0, pl.ds(0, bf)
+                                            ].reshape(bf)
+                                            if enable_act_quant:
+                                                x_s = b_x_scale_vmem[
+                                                    pl.ds(btc_id * btc, btc), pl.ds(0, 1)
+                                                ]
+                                                return up_acc + d3 * (x_s * s3[jnp.newaxis, :])
+                                            return up_acc + jnp.stack(
                                                 [d3[i] * s3 for i in range(btc)], axis=0
                                             )
-                                        return gate_acc, up_acc
 
-                                    gate, up = lax.fori_loop(
-                                        0,
-                                        n_sg,
-                                        _ffn1_sg_body,
-                                        (gate, up),
-                                        unroll=n_sg,
-                                    )
-                            b_gate_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = gate
-                            b_up_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = up
-                            return None
+                                        up = lax.fori_loop(0, n_sg, _ffn1_up_sg, up, unroll=n_sg)
+                                b_up_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = up
+                                return None
 
-                        lax.fori_loop(0, num_btc_per_bts, gate_up_btc_direct, None)
+                            lax.fori_loop(0, num_btc_per_bts, _up_only_btc, None)
 
-                    else:
-                        wait_fetch_w1(slot)
-                        wait_fetch_w3(slot)
-                        dequant_w1(slot)
-                        dequant_w3(slot)
+                        elif direct_scaled_dot and w1_scale_hbm is not None:
+                            wait_fetch_w1(slot)
+                            wait_fetch_w3(slot)
 
-                        def gate_up_btc(btc_id, ___):
-                            gate = jnp.zeros((btc, bf), dtype=jnp.float32)
-                            up = jnp.zeros((btc, bf), dtype=jnp.float32)
-                            with jax.named_scope("ffn1_gate_up"):
-                                for p_id in range(t_packing):
-                                    x_slice = b_x_vmem[
-                                        pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
-                                    ]
-                                    w1_tile = (
-                                        b_w1_dq_vmem[p_id]
-                                        if w1_scale_hbm is not None
-                                        else b_w1_x2_vmem[slot, p_id]
-                                    )
-                                    w3_tile = (
-                                        b_w3_dq_vmem[p_id]
-                                        if w3_scale_hbm is not None
-                                        else b_w3_x2_vmem[slot, p_id]
-                                    )
-                                    gate += jnp.dot(
-                                        x_slice, w1_tile, preferred_element_type=jnp.float32
-                                    )
-                                    up += jnp.dot(
-                                        x_slice, w3_tile, preferred_element_type=jnp.float32
-                                    )
-                            b_gate_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = gate
-                            b_up_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = up
-                            return None
-
-                        lax.fori_loop(0, num_btc_per_bts, gate_up_btc, None)
-
-                    if (not global_rolling_wb) and can_split_w13_w2_prefetch:
-                        if bf_id == num_bf - 2:
-                            next_has_prefetch = start_prefetch_expert_bf0(
-                                bt_sem_id,
-                                (
-                                    next_local_e_id
-                                    if next_local_e_id is not None
-                                    else local_e_id + jnp.int32(1)
-                                ),
-                                slot=slot,
-                                priority=1,
-                                enabled=(
-                                    jnp.logical_and(num_bts_tiles == jnp.int32(1), has_next)
-                                    if has_next is not None
-                                    else (num_bts_tiles == jnp.int32(1))
-                                ),
-                                include_w2=False,
-                            )
-                            next_bf0_prefetched = jnp.logical_or(
-                                next_bf0_prefetched, next_has_prefetch
-                            )
-
-                    # In w13 mode, next-expert W2 is intentionally not
-                    # cross-prefetched here: its own prologue can start W2
-                    # while W1/W3 drive gate/up.
-                    wait_fetch_w2(slot)
-                    dequant_w2(slot)
-
-                    # Act+down — accumulate in VMEM f32 across bf tiles
-                    def act_down_btc(btc_id, ___):
-                        use_direct_w2 = direct_scaled_dot and w2_scale_hbm is not None
-                        if not use_direct_w2:
-                            gate = b_gate_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
-                            up_val = b_up_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
-                            with jax.named_scope("activation"):
-                                act = activation_fn(gate, up_val, act_fn, swiglu_limit)
-                        with jax.named_scope("ffn2_down"):
-                            for p_id in range(out_packing):
-                                if use_direct_w2:
-
-                                    def _ffn2_sg_body(sg_id, partial_acc):
-                                        sg_off = sg_id * ffn2_qbk
-                                        gate_slice = b_gate_acc_vmem[
-                                            pl.ds(btc_id * btc, btc),
-                                            pl.ds(sg_off, ffn2_qbk),
+                            def gate_up_btc_direct(btc_id, ___):
+                                if per_channel and enable_act_quant:
+                                    # per-channel scale is whole-K (p_id-invariant), so
+                                    # fold it OUT of the t_packing loop: accumulate raw
+                                    # f32 dots across the K-slices, apply per-token ×
+                                    # per-channel scale ONCE (saves ~3/4 of FFN1's VPU
+                                    # scale-muls). n_sg==1 here. Math-identical
+                                    # (Σ d·s == (Σ d)·s); f32 rounding within tol.
+                                    g_raw = jnp.zeros((btc, bf), dtype=jnp.float32)
+                                    u_raw = jnp.zeros((btc, bf), dtype=jnp.float32)
+                                    for p_id in range(t_packing):
+                                        x_slice = b_x_vmem[
+                                            pl.ds(btc_id * btc, btc), p_id, pl.ds(0, ffn1_qbk)
                                         ]
-                                        up_slice = b_up_acc_vmem[
-                                            pl.ds(btc_id * btc, btc),
-                                            pl.ds(sg_off, ffn2_qbk),
+                                        w1_tile = b_w1_x2_vmem[
+                                            slot, p_id, pl.ds(0, ffn1_qbk), pl.ds(0, bf)
                                         ]
-                                        act_slice = activation_fn(
-                                            gate_slice, up_slice, act_fn, swiglu_limit
+                                        w3_tile = b_w3_x2_vmem[
+                                            slot, p_id, pl.ds(0, ffn1_qbk), pl.ds(0, bf)
+                                        ]
+                                        g_raw = g_raw + jnp.dot(
+                                            x_slice, w1_tile, preferred_element_type=jnp.float32
                                         )
-                                        w2_tile = b_w2_x2_vmem[
-                                            slot,
-                                            p_id,
-                                            pl.ds(sg_off, ffn2_qbk),
-                                            pl.ds(0, h_per_out),
+                                        u_raw = u_raw + jnp.dot(
+                                            x_slice, w3_tile, preferred_element_type=jnp.float32
+                                        )
+                                    x_s = b_x_scale_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, 1)]
+                                    s1 = b_w1_scale_x2_vmem[
+                                        slot, 0, pl.ds(0, 1), 0, pl.ds(0, bf)
+                                    ].reshape(bf)
+                                    s3 = b_w3_scale_x2_vmem[
+                                        slot, 0, pl.ds(0, 1), 0, pl.ds(0, bf)
+                                    ].reshape(bf)
+                                    b_gate_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][
+                                        ...
+                                    ] = g_raw * (x_s * s1[jnp.newaxis, :])
+                                    b_up_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][
+                                        ...
+                                    ] = u_raw * (x_s * s3[jnp.newaxis, :])
+                                    return None
+                                gate = jnp.zeros((btc, bf), dtype=jnp.float32)
+                                up = jnp.zeros((btc, bf), dtype=jnp.float32)
+                                with jax.named_scope("ffn1_gate_up"):
+                                    for p_id in range(t_packing):
+
+                                        def _ffn1_sg_body(sg_id, carry):
+                                            gate_acc, up_acc = carry
+                                            sg_off = sg_id * ffn1_qbk
+                                            x_slice = b_x_vmem[
+                                                pl.ds(btc_id * btc, btc),
+                                                p_id,
+                                                pl.ds(sg_off, ffn1_qbk),
+                                            ]
+                                            w1_tile = b_w1_x2_vmem[
+                                                slot,
+                                                p_id,
+                                                pl.ds(sg_off, ffn1_qbk),
+                                                pl.ds(0, bf),
+                                            ]
+                                            w3_tile = b_w3_x2_vmem[
+                                                slot,
+                                                p_id,
+                                                pl.ds(sg_off, ffn1_qbk),
+                                                pl.ds(0, bf),
+                                            ]
+                                            d1 = jnp.dot(
+                                                x_slice,
+                                                w1_tile,
+                                                preferred_element_type=jnp.float32,
+                                            )
+                                            s1 = b_w1_scale_x2_vmem[
+                                                slot,
+                                                p_id,
+                                                pl.ds(sg_id, 1),
+                                                0,
+                                                pl.ds(0, bf),
+                                            ].reshape(bf)
+                                            if enable_act_quant:
+                                                x_s = b_x_scale_vmem[
+                                                    pl.ds(btc_id * btc, btc), pl.ds(0, 1)
+                                                ]
+                                                gate_acc = gate_acc + d1 * (
+                                                    x_s * s1[jnp.newaxis, :]
+                                                )
+                                            else:
+                                                gate_acc += jnp.stack(
+                                                    [d1[i] * s1 for i in range(btc)], axis=0
+                                                )
+
+                                            d3 = jnp.dot(
+                                                x_slice,
+                                                w3_tile,
+                                                preferred_element_type=jnp.float32,
+                                            )
+                                            s3 = b_w3_scale_x2_vmem[
+                                                slot,
+                                                p_id,
+                                                pl.ds(sg_id, 1),
+                                                0,
+                                                pl.ds(0, bf),
+                                            ].reshape(bf)
+                                            if enable_act_quant:
+                                                up_acc = up_acc + d3 * (x_s * s3[jnp.newaxis, :])
+                                            else:
+                                                up_acc += jnp.stack(
+                                                    [d3[i] * s3 for i in range(btc)], axis=0
+                                                )
+                                            return gate_acc, up_acc
+
+                                        gate, up = lax.fori_loop(
+                                            0,
+                                            n_sg,
+                                            _ffn1_sg_body,
+                                            (gate, up),
+                                            unroll=n_sg,
+                                        )
+                                b_gate_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][
+                                    ...
+                                ] = gate
+                                b_up_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = up
+                                return None
+
+                            lax.fori_loop(0, num_btc_per_bts, gate_up_btc_direct, None)
+
+                        else:
+                            wait_fetch_w1(slot)
+                            wait_fetch_w3(slot)
+                            dequant_w1(slot)
+                            dequant_w3(slot)
+
+                            def gate_up_btc(btc_id, ___):
+                                gate = jnp.zeros((btc, bf), dtype=jnp.float32)
+                                up = jnp.zeros((btc, bf), dtype=jnp.float32)
+                                with jax.named_scope("ffn1_gate_up"):
+                                    for p_id in range(t_packing):
+                                        x_slice = b_x_vmem[
+                                            pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_t)
                                         ]
-                                        d = jnp.dot(
-                                            act_slice,
+                                        w1_tile = (
+                                            b_w1_dq_vmem[p_id]
+                                            if w1_scale_hbm is not None
+                                            else b_w1_x2_vmem[slot, p_id]
+                                        )
+                                        w3_tile = (
+                                            b_w3_dq_vmem[p_id]
+                                            if w3_scale_hbm is not None
+                                            else b_w3_x2_vmem[slot, p_id]
+                                        )
+                                        gate += jnp.dot(
+                                            x_slice, w1_tile, preferred_element_type=jnp.float32
+                                        )
+                                        up += jnp.dot(
+                                            x_slice, w3_tile, preferred_element_type=jnp.float32
+                                        )
+                                b_gate_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][
+                                    ...
+                                ] = gate
+                                b_up_acc_vmem.at[pl.ds(btc_id * btc, btc), pl.ds(0, bf)][...] = up
+                                return None
+
+                            lax.fori_loop(0, num_btc_per_bts, gate_up_btc, None)
+
+                        if (not global_rolling_wb) and can_split_w13_w2_prefetch:
+                            if bf_id == num_bf - 2:
+                                next_has_prefetch = start_prefetch_expert_bf0(
+                                    bt_sem_id,
+                                    (
+                                        next_local_e_id
+                                        if next_local_e_id is not None
+                                        else local_e_id + jnp.int32(1)
+                                    ),
+                                    slot=slot,
+                                    priority=1,
+                                    enabled=(
+                                        jnp.logical_and(num_bts_tiles == jnp.int32(1), has_next)
+                                        if has_next is not None
+                                        else (num_bts_tiles == jnp.int32(1))
+                                    ),
+                                    include_w2=False,
+                                )
+                                next_bf0_prefetched = jnp.logical_or(
+                                    next_bf0_prefetched, next_has_prefetch
+                                )
+
+                        # In w13 mode, next-expert W2 is intentionally not
+                        # cross-prefetched here: its own prologue can start W2
+                        # while W1/W3 drive gate/up.
+                        wait_fetch_w2(slot)
+                        dequant_w2(slot)
+
+                        # Act+down — accumulate in VMEM f32 across bf tiles
+                        def act_down_btc(btc_id, ___):
+                            use_direct_w2 = direct_scaled_dot and w2_scale_hbm is not None
+                            if not use_direct_w2:
+                                gate = b_gate_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
+                                up_val = b_up_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
+                                with jax.named_scope("activation"):
+                                    act = activation_fn(gate, up_val, act_fn, swiglu_limit)
+                            with jax.named_scope("ffn2_down"):
+                                for p_id in range(out_packing):
+                                    if use_direct_w2:
+
+                                        def _ffn2_sg_body(sg_id, partial_acc):
+                                            sg_off = sg_id * ffn2_qbk
+                                            gate_slice = b_gate_acc_vmem[
+                                                pl.ds(btc_id * btc, btc),
+                                                pl.ds(sg_off, ffn2_qbk),
+                                            ]
+                                            up_slice = b_up_acc_vmem[
+                                                pl.ds(btc_id * btc, btc),
+                                                pl.ds(sg_off, ffn2_qbk),
+                                            ]
+                                            act_slice = activation_fn(
+                                                gate_slice, up_slice, act_fn, swiglu_limit
+                                            )
+                                            w2_tile = b_w2_x2_vmem[
+                                                slot,
+                                                p_id,
+                                                pl.ds(sg_off, ffn2_qbk),
+                                                pl.ds(0, h_per_out),
+                                            ]
+                                            d = jnp.dot(
+                                                act_slice,
+                                                w2_tile,
+                                                preferred_element_type=jnp.float32,
+                                            )
+                                            s = b_w2_scale_x2_vmem[
+                                                slot,
+                                                p_id,
+                                                pl.ds(sg_id, 1),
+                                                0,
+                                                pl.ds(0, h_per_out),
+                                            ].reshape(h_per_out)
+                                            return partial_acc + jnp.stack(
+                                                [d[i] * s for i in range(btc)], axis=0
+                                            )
+
+                                        partial = lax.fori_loop(
+                                            0,
+                                            n_sg2,
+                                            _ffn2_sg_body,
+                                            jnp.zeros((btc, h_per_out), dtype=jnp.float32),
+                                            unroll=n_sg2,
+                                        )
+                                    else:
+                                        w2_tile = (
+                                            b_w2_dq_vmem[p_id]
+                                            if w2_scale_hbm is not None
+                                            else b_w2_x2_vmem[slot, p_id]
+                                        )
+                                        partial = jnp.dot(
+                                            act,
                                             w2_tile,
                                             preferred_element_type=jnp.float32,
                                         )
-                                        s = b_w2_scale_x2_vmem[
-                                            slot,
-                                            p_id,
-                                            pl.ds(sg_id, 1),
-                                            0,
-                                            pl.ds(0, h_per_out),
-                                        ].reshape(h_per_out)
-                                        return partial_acc + jnp.stack(
-                                            [d[i] * s for i in range(btc)], axis=0
-                                        )
+                                    acc_ref = b_y_acc_vmem.at[
+                                        pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_out)
+                                    ]
+                                    if bf_id == 0:
+                                        acc_ref[...] = partial
+                                    else:
+                                        acc_ref[...] = acc_ref[...] + partial
+                            return None
 
-                                    partial = lax.fori_loop(
-                                        0,
-                                        n_sg2,
-                                        _ffn2_sg_body,
-                                        jnp.zeros((btc, h_per_out), dtype=jnp.float32),
-                                        unroll=n_sg2,
-                                    )
-                                else:
-                                    w2_tile = (
-                                        b_w2_dq_vmem[p_id]
-                                        if w2_scale_hbm is not None
-                                        else b_w2_x2_vmem[slot, p_id]
-                                    )
-                                    partial = jnp.dot(
-                                        act,
-                                        w2_tile,
-                                        preferred_element_type=jnp.float32,
-                                    )
-                                acc_ref = b_y_acc_vmem.at[
-                                    pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_out)
-                                ]
-                                if bf_id == 0:
-                                    acc_ref[...] = partial
-                                else:
-                                    acc_ref[...] = acc_ref[...] + partial
-                        return None
-
-                    lax.fori_loop(0, num_btc_per_bts, act_down_btc, None)
+                        lax.fori_loop(0, num_btc_per_bts, act_down_btc, None)
 
                     # Same-expert bf+2 keeps the original full-slot rolling point:
                     # W1/W3/W2 are fetched together after down frees the slot.
@@ -1625,7 +1848,20 @@ def _fused_ep_moe_kernel(
                                 ]
                                 b_y_stage_vmem.at[
                                     pl.ds(btc_id * btc, btc), p_id, pl.ds(0, h_per_out)
-                                ][...] = acc_slice.astype(out_dtype)
+                                ][...] = (
+                                    jnp.where(
+                                        (
+                                            tile_start
+                                            + btc_id * btc
+                                            + lax.broadcasted_iota(jnp.int32, (btc, h_per_out), 0)
+                                        )
+                                        < dyn_sz_i32,
+                                        acc_slice,
+                                        0,
+                                    ).astype(out_dtype)
+                                    if mxfp4
+                                    else acc_slice.astype(out_dtype)
+                                )
                             return None
 
                         lax.fori_loop(0, num_btc_per_bts, writeback_btc, None)
@@ -1717,7 +1953,7 @@ def _fused_ep_moe_kernel(
                 for k_id in range(top_k):
                     acc_tile = a2a_g_acc_vmem[buf_id, k_id, :acc_bt].astype(jnp.float32)
                     logits = logits_tile[:, k_id].reshape(acc_bt, 1, 1)
-                    output_tile += acc_tile * logits
+                    output_tile += acc_tile if mxfp4 else acc_tile * logits
 
             out_offset = pl.multiple_of(out_offset, 16)
 
@@ -2417,6 +2653,10 @@ def _fused_ep_moe_kernel(
         "cross_expert_prefetch_mode",
         "fixed_gather_banks",
         "enable_act_quant",
+        "mxfp4",
+        "fp4_group_size",
+        "logical_intermediate_size",
+        "interpret",
     ],
 )
 def fused_ep_moe_v2(
@@ -2459,13 +2699,55 @@ def fused_ep_moe_v2(
     # per-block banking. num_bt <= 1 (decode) => no overlap.
     fixed_gather_banks: int | None = 2,
     enable_act_quant: bool = False,
+    mxfp4: bool = False,
+    fp4_group_size: int = 32,
+    logical_intermediate_size: int | None = None,
+    interpret: bool = False,
     dp_axis_name: str = "data",
     tp_axis_name: str = "tensor",
 ):
+    if mxfp4:
+        fp4_ops = _get_fp4_ops(fp4_group_size)
+        if not interpret:
+            fp4_ops.require_acc_support()
+        validate_inputs = fp4_ops.validate_inputs
+
+        validate_inputs(
+            tokens,
+            w1,
+            w2,
+            w3,
+            w1_scale,
+            w2_scale,
+            w3_scale,
+            topk_weights,
+            topk_ids,
+            get_ep_size(mesh, dp_axis_name, tp_axis_name),
+            top_k,
+        )
+        if mesh.shape[tp_axis_name] != 1:
+            raise ValueError("FP4 routed path requires TP1, DP=EP")
+        if tokens.shape[1] % 512:
+            raise ValueError("FP4 BF16 packing requires H divisible by 512")
+        if enable_act_quant or direct_scaled_dot or quant_block_k is not None:
+            raise ValueError("FP4 W4A16 has explicit group scales; disable FP8 quant flags")
+        if any(
+            x is not None
+            for x in (
+                w1_shared,
+                w2_shared,
+                w3_shared,
+                w1_shared_scale,
+                w2_shared_scale,
+                w3_shared_scale,
+            )
+        ):
+            raise ValueError("FP4 routed path computes routed experts only; shared is external")
+        if act_fn != "silu":
+            raise ValueError("FP4 routed path uses DeepSeek pre-SiLU clamp")
     if cross_expert_prefetch_mode not in ("none", "full", "w13"):
         raise ValueError(
-            f"Unsupported {cross_expert_prefetch_mode=}; "
-            "expected one of 'none', 'full', or 'w13'."
+            f"Unsupported {cross_expert_prefetch_mode=}; expected one of 'none', 'full', or 'w13'."
         )
     if enable_act_quant:
         if not direct_scaled_dot:
@@ -2497,6 +2779,11 @@ def fused_ep_moe_v2(
 
     num_tokens, hidden_size = tokens.shape
     num_experts, intermediate_size, _ = w2.shape
+    if mxfp4:
+        storage_intermediate = intermediate_size * 2
+        intermediate_size = (
+            storage_intermediate if logical_intermediate_size is None else logical_intermediate_size
+        )
     local_num_experts = num_experts // ep_size
     se_inter_size = w2_shared.shape[0] if w2_shared is not None else 0
 
@@ -2521,6 +2808,15 @@ def fused_ep_moe_v2(
         num_tokens=num_tokens,
         ep_size=ep_size,
     )
+    if mxfp4:
+        alignment = 256
+        if block_config.bf <= 0 or block_config.bf % alignment:
+            raise ValueError(f"FP4 G{fp4_group_size} requires bf multiple of {alignment}")
+        if block_config.btc % 16 or block_config.bts % 16:
+            raise ValueError("FP4 BF16 MXU rows bts/btc must align to 16")
+        if block_config.bts > 1024:
+            raise ValueError("G32 full-H ACC requires bts/8 <= 128 entries")
+
     bt = block_config.bt
     bts = block_config.bts
     bf = block_config.bf
@@ -2541,13 +2837,24 @@ def fused_ep_moe_v2(
         num_experts=num_experts,
         top_k=top_k,
         hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
+        intermediate_size=(cdiv(intermediate_size, bf) * bf if mxfp4 else intermediate_size),
         dtype=tokens.dtype,
         ep_size=ep_size,
         block_config=block_config,
     )
 
-    if w1_scale is not None:
+    if mxfp4:
+        if (
+            intermediate_size <= 0
+            or intermediate_size % 256
+            or cdiv(intermediate_size, bf) * bf != storage_intermediate
+        ):
+            raise ValueError(
+                "Prepare FP4 panel padding once with prepare_fp4_weights; "
+                "pass its logical_intermediate_size and matching bf"
+            )
+
+    if w1_scale is not None and not mxfp4:
         per_channel = quant_block_k is None
         if per_channel:
             if not direct_scaled_dot:
@@ -2660,6 +2967,9 @@ def fused_ep_moe_v2(
     use_w2_dequant_scratch = w2_scale is not None and not direct_scaled_dot
 
     scope_name = f"fused-moe-v2-k_{top_k}-bt_{bt}_{bts}_{btc}-bf_{bf}"
+    if mxfp4:
+        scope_name += f"-group_{fp4_group_size}"
+        scope_name += "-fp4_scoped_w4a16"
     if direct_scaled_dot:
         scope_name += "-direct_scaled_dot"
     scope_name += f"-xprefetch_{cross_expert_prefetch_mode}"
@@ -2703,39 +3013,47 @@ def fused_ep_moe_v2(
         # VMEM: output double buffer
         pltpu.VMEM((num_bt_banks, bt, hidden_size), out_dtype),  # output (K-deep, out_buf_id=%K)
         # VMEM: weight double buffers
-        pltpu.VMEM((wb_slots, t_packing, h_per_t, bf), w1.dtype),  # W1
-        pltpu.VMEM((wb_slots, t_packing, h_per_t, bf), w3.dtype),  # W3
-        pltpu.VMEM((wb_slots, out_packing, bf, h_per_out), w2.dtype),  # W2
+        (None if mxfp4 else pltpu.VMEM((wb_slots, t_packing, h_per_t, bf), w1.dtype)),  # W1
+        (None if mxfp4 else pltpu.VMEM((wb_slots, t_packing, h_per_t, bf), w3.dtype)),  # W3
+        (None if mxfp4 else pltpu.VMEM((wb_slots, out_packing, bf, h_per_out), w2.dtype)),  # W2
         # VMEM: scale double buffers (None when not quantized)
         (
             None
-            if w1_scale is None
-            else pltpu.VMEM((wb_slots, t_packing, _n_sg, 1, bf), jnp.float32)
+            if mxfp4
+            else (
+                None
+                if w1_scale is None
+                else pltpu.VMEM((wb_slots, t_packing, _n_sg, 1, bf), jnp.float32)
+            )
         ),  # W1 scale
         (
             None
-            if w3_scale is None
+            if w3_scale is None or mxfp4
             else pltpu.VMEM((wb_slots, t_packing, _n_sg, 1, bf), jnp.float32)
         ),  # W3 scale
         (
             None
-            if w2_scale is None
+            if w2_scale is None or mxfp4
             else pltpu.VMEM((wb_slots, out_packing, _n_sg2, 1, h_per_out), jnp.float32)
         ),  # W2 scale
         # VMEM: dequant scratch (single-buf, None when not quantized)
         (
             None
-            if not use_w1_dequant_scratch
-            else pltpu.VMEM((t_packing, h_per_t, bf), jnp.bfloat16)
+            if mxfp4
+            else (
+                None
+                if not use_w1_dequant_scratch
+                else pltpu.VMEM((t_packing, h_per_t, bf), jnp.bfloat16)
+            )
         ),  # W1/shared dequant
         (
             None
-            if not use_w3_dequant_scratch
+            if not use_w3_dequant_scratch or mxfp4
             else pltpu.VMEM((t_packing, h_per_t, bf), jnp.bfloat16)
         ),  # W3 dequant
         (
             None
-            if not use_w2_dequant_scratch
+            if not use_w2_dequant_scratch or mxfp4
             else pltpu.VMEM((out_packing, bf, h_per_out), jnp.bfloat16)
         ),  # W2 dequant
         # VMEM: gate/up accumulators (per bts tile).
@@ -2775,6 +3093,16 @@ def fused_ep_moe_v2(
         pltpu.SemaphoreType.DMA((2,)),  # md_send, banked with metadata mailbox
         pltpu.SemaphoreType.DMA((2,)),  # md_recv, banked with metadata mailbox
         pltpu.SemaphoreType.BARRIER,  # barrier
+        None if not mxfp4 else pltpu.VMEM((smem_banks, bt, top_k, 128), jnp.float32),
+        None if not mxfp4 else pltpu.VMEM((bts, 128), jnp.float32),
+        # FP4 panel slots retain v2's expert/bf double-buffer lifetime.
+        None if not mxfp4 else pltpu.VMEM((wb_slots, hidden_size // 2, bf), jnp.uint8),
+        None if not mxfp4 else pltpu.VMEM((wb_slots, hidden_size // 2, bf), jnp.uint8),
+        None if not mxfp4 else pltpu.VMEM((wb_slots, bf // 2, hidden_size), jnp.uint8),
+        None if not mxfp4 else (pltpu.VMEM((wb_slots, hidden_size // 32, bf), jnp.uint8)),
+        None if not mxfp4 else (pltpu.VMEM((wb_slots, hidden_size // 32, bf), jnp.uint8)),
+        None if not mxfp4 else (pltpu.VMEM((wb_slots, bf // 32, hidden_size), jnp.uint8)),
+        None if not mxfp4 else pltpu.VMEM((2, 256, 256), jnp.bfloat16),
     )
 
     fused_moe = jax.named_scope(scope_name)(
@@ -2791,6 +3119,10 @@ def fused_ep_moe_v2(
                 cross_expert_prefetch_mode=cross_expert_prefetch_mode,
                 fixed_gather_banks=fixed_gather_banks,
                 enable_act_quant=enable_act_quant,
+                mxfp4=mxfp4,
+                fp4_group_size=fp4_group_size,
+                logical_intermediate=intermediate_size if mxfp4 else None,
+                fp4_interpret=interpret,
                 direct_scaled_dot=direct_scaled_dot,
                 bt=bt,
                 bf=bf,
@@ -2799,6 +3131,7 @@ def fused_ep_moe_v2(
                 bse=bse,
                 quant_block_k=quant_block_k,
             ),
+            interpret=interpret,
             out_shape=jax.ShapeDtypeStruct((local_num_tokens, hidden_size), out_dtype),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=0,
@@ -2822,6 +3155,7 @@ def fused_ep_moe_v2(
                     None if w1_shared_scale is None else hbm_spec,  # w1_shared_scale
                     None if w3_shared_scale is None else hbm_spec,  # w3_shared_scale
                     None if w2_shared_scale is None else hbm_spec,  # w2_shared_scale
+                    None if not mxfp4 else hbm_spec,  # route_s
                 ],
                 out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
                 scratch_shapes=scratch_shapes,
@@ -2859,6 +3193,7 @@ def fused_ep_moe_v2(
             None if w1_shared_scale is None else P(),  # w1_shared_scale
             None if w3_shared_scale is None else P(),  # w3_shared_scale
             None if w2_shared_scale is None else P(),  # w2_shared_scale
+            None if not mxfp4 else P(),  # route_s
         ),
         out_specs=P((dp_axis_name, tp_axis_name)),
         check_vma=False,
@@ -2883,6 +3218,7 @@ def fused_ep_moe_v2(
         w1_shared_scale=None,
         w3_shared_scale=None,
         w2_shared_scale=None,
+        route_s=None,
     ):
         if pad_local > 0:
             tokens = jnp.pad(tokens, ((0, pad_local), (0, 0), (0, 0)))
@@ -2954,6 +3290,7 @@ def fused_ep_moe_v2(
                 if w2_shared_scale is None
                 else pltpu.with_memory_space_constraint(w2_shared_scale, pltpu.HBM)
             ),
+            None if route_s is None else pltpu.with_memory_space_constraint(route_s, pltpu.HBM),
         )
         if pad_local > 0:
             out = out[:orig_local_num_tokens]
@@ -2975,6 +3312,7 @@ def fused_ep_moe_v2(
         pl.empty((local_num_tokens, t_packing, h_per_t), t_dtype) if enable_act_quant else None
     )
 
+    route_s = pl.empty(a2a_s_shape[:-2] + (128,), jnp.float32) if mxfp4 else None
     return kernel(
         tokens,
         w1,
@@ -2995,4 +3333,5 @@ def fused_ep_moe_v2(
         w1_shared_scale,
         w3_shared_scale,
         w2_shared_scale,
+        route_s,
     )
