@@ -35,6 +35,7 @@ TRAILING_MIN_NIGHTS = 5
 # (results.gate_perf_result), so a floor on a latency metric is checked the
 # right way round.
 METRIC_DIRECTION: dict[str, str] = {
+    "cache_hit_rate": "higher",
     "in_tps": "higher",
     "out_tps": "higher",
     "ttft_ms": "lower",
