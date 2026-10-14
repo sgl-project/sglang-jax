@@ -178,9 +178,17 @@ def _write_temp_video(payload: bytes) -> str:
         return tmp.name
 
 
-def preprocess_video(source, video_config: dict) -> np.ndarray:
+def preprocess_video(source, video_config: dict) -> tuple[np.ndarray, dict]:
     if isinstance(source, np.ndarray):
-        return _resize_video_frames(source, video_config)
+        # Frame arrays are already sampled; fps describes their playback rate.
+        video_fps = video_config.get("fps", FPS)
+        total_frames = len(source)
+        return _resize_video_frames(source, video_config), {
+            "fps": video_fps,
+            "duration": total_frames / video_fps,
+            "total_num_frames": total_frames,
+            "frames_indices": list(range(total_frames)),
+        }
     from decord import VideoReader, cpu
 
     tmp_path = None
@@ -219,7 +227,13 @@ def preprocess_video(source, video_config: dict) -> np.ndarray:
             len(frame_indices),
         )
         video = vr.get_batch(frame_indices).asnumpy()
-        return _resize_video_frames(video, video_config)
+        return _resize_video_frames(video, video_config), {
+            "fps": video_fps,
+            "duration": total_frames / video_fps,
+            "total_num_frames": total_frames,
+            "frames_indices": frame_indices.tolist(),
+            "video_backend": "decord",
+        }
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
@@ -273,9 +287,11 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         processor,
     ) -> MultimodalInputs:
         images = [self.load_image(source) for source in image_sources]
-        videos = [
-            preprocess_video(self.unwrap_source(source), video_config) for source in video_data
-        ]
+        videos, video_metadata = [], []
+        for source in video_data:
+            video, metadata = preprocess_video(self.unwrap_source(source), video_config)
+            videos.append(video)
+            video_metadata.append(metadata)
         processor_kwargs = {}
         if videos:
             processor_kwargs["videos_kwargs"] = {
@@ -285,6 +301,10 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         uses_qwen3vl_processor = not _QWEN3VL_ARCHITECTURES.isdisjoint(self.hf_config.architectures)
         if uses_qwen3vl_processor:
             processor_kwargs["return_mm_token_type_ids"] = True
+            if videos:
+                # Match SGLang: timestamps use source FPS and sampled indices.
+                processor_kwargs["video_metadata"] = video_metadata
+                processor_kwargs["videos_kwargs"] = {"do_sample_frames": False}
 
         return self.process_and_combine_mm_data(
             input_text,

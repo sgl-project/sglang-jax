@@ -37,6 +37,7 @@ from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
+from sgl_jax.test.test_mla_v2_bitexact import TestMLAV2BitExactParity  # noqa: F401
 from sgl_jax.test.test_utils import CustomTestCase
 
 mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])

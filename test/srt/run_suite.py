@@ -266,6 +266,7 @@ suites = {
         TestFile("python/sgl_jax/test/kernels/kda_test.py", 10, runner="pytest"),
         TestFile("test/srt/kernels/hca/test_hca.py", 8, runner="pytest"),
         TestFile("test/srt/kernels/hca/test_v4_backend.py", 5, runner="pytest"),
+        TestFile("test/srt/kernels/csa_attention/test_attention.py", 3, runner="pytest"),
         TestFile("test/srt/kernels/csa_compressor/test_compressor.py", 3, runner="pytest"),
         TestFile("test/srt/kernels/mhc/test_mhc.py", 2, runner="pytest"),
         # Pytest tears down the shared FlashAttention mesh cleanly on JAX 0.10.2.
@@ -407,6 +408,11 @@ suites = {
         TestFile("test/srt/test_dtype_config_consistency.py", 10),
         TestFile("python/sgl_jax/test/test_compilation_manager.py", 1),
         TestFile("python/sgl_jax/test/test_kernel_utils.py", 1),
+        TestFile(
+            "python/sgl_jax/test/test_mla_v2_bitexact.py",
+            0.4,
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
         TestFile("python/sgl_jax/test/speculative/test_dflash_info.py", 0.2, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/speculative/test_dflash_server_args.py",
