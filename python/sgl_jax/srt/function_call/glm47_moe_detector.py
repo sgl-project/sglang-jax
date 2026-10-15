@@ -16,6 +16,8 @@ from sgl_jax.srt.function_call.utils import infer_type_from_json_schema
 
 logger = logging.getLogger(__name__)
 
+_JSON_OPENERS = {"array": "[", "object": "{"}
+
 
 class StreamState(str, Enum):
     """State machine states for XML to JSON streaming conversion."""
@@ -126,7 +128,12 @@ def parse_arguments(json_value: str, arg_type: str | None = None) -> tuple[Any, 
     # Strategy 3: ast.literal_eval
     try:
         parsed_value = ast.literal_eval(json_value)
-        return parsed_value, True
+        # A bare comma makes literal_eval build a tuple ("1,000" -> (1, 0));
+        # only an array-typed argument may take it, as a list.
+        if not isinstance(parsed_value, tuple):
+            return parsed_value, True
+        if arg_type == "array":
+            return list(parsed_value), True
     except (ValueError, SyntaxError):
         pass
 
@@ -237,80 +244,23 @@ class Glm47MoeDetector(BaseFormatDetector):
             return StreamingParseResult(normal_text=text)
 
     def _get_value_type(self, func_name: str, key: str, tools: list[Tool]) -> str:
-        """Get parameter type from tool definition, with fallback to auto-detection.
+        """Schema type of the parameter, or "auto" when the schema has none.
 
-        Args:
-            func_name: Name of the function
-            key: Parameter name
-            tools: List of available tools
-
-        Returns:
-            Type string: 'string', 'number', 'object', 'array', or 'boolean'
+        "auto" values are held and parsed at the closing tag, the same way
+        detect_and_parse handles parameters without a declared type.
         """
-        arg_type = get_argument_type(func_name, key, tools)
-        if arg_type:
-            return arg_type
+        return get_argument_type(func_name, key, tools) or "auto"
 
-        # Improved auto-detection type from value (best effort)
-        value_content = self._current_value.strip() if self._current_value else ""
+    def _format_held_value(self, func_name: str, tools: list[Tool]) -> str:
+        """Format a value that was held until its closing tag.
 
-        if not value_content:
-            return "string"
-
-        # Try to parse as valid JSON first
-        try:
-            parsed = json.loads(value_content)
-            if isinstance(parsed, dict):
-                return "object"
-            elif isinstance(parsed, list):
-                return "array"
-            elif isinstance(parsed, bool):
-                return "boolean"
-            elif isinstance(parsed, (int, float)):
-                return "number"
-            # For string values, check if they look like numbers
-            elif isinstance(parsed, str):
-                if parsed.isdigit() or (parsed.startswith("-") and parsed[1:].isdigit()):
-                    return "number"
-                return "string"
-        except json.JSONDecodeError:
-            # Not valid JSON, try heuristic detection
-            first_char = value_content[0] if value_content else ""
-
-            if first_char.isdigit() or first_char in ["-", "."]:
-                return "number"
-            elif first_char in ["{", "["]:
-                return "object"
-            elif first_char in ['"', "'"]:
-                return "string"
-
-        # Default to string (safest fallback)
-        return "string"
-
-    def _format_value_complete(self, value: str, value_type: str) -> str:
-        """Format complete value based on type.
-
-        Args:
-            value: Raw value string
-            value_type: Expected type ('string', 'number', 'object')
-
-        Returns:
-            Properly formatted JSON value string
+        Uses the non-streaming parser so streamed arguments match
+        detect_and_parse for values that aren't strict JSON ("1, 2", "True", "").
         """
-        if value_type == "string":
-            # Ensure proper JSON string formatting with quotes
-            return json.dumps(value, ensure_ascii=False)
-        elif value_type == "number":
-            try:
-                num = _convert_to_number(value.strip() if value else "")
-                return str(num)
-            except (ValueError, AttributeError):
-                # Fallback to string if not a valid number
-                logger.warning("Failed to parse '%s' as number, treating as string", value)
-                return json.dumps(str(value) if value else "", ensure_ascii=False)
-        else:
-            # For object/array types, return as-is (should already be valid JSON)
-            return value
+        parsed = self._parse_argument_pairs(
+            [(self._current_key, self._current_value)], func_name, tools
+        )[self._current_key]
+        return json.dumps(parsed, ensure_ascii=False)
 
     def _process_xml_to_json_streaming(
         self, raw_increment: str, func_name: str, tools: list[Tool]
@@ -378,9 +328,11 @@ class Glm47MoeDetector(BaseFormatDetector):
                         # Always output closing quote for string type when value was started
                         if value_type == "string":
                             json_output += '"'
+                    elif value_type == "string":
+                        # Empty or complete in one chunk
+                        json_output += json.dumps(self._current_value, ensure_ascii=False)
                     else:
-                        # Value was never started (empty or complete in one chunk)
-                        json_output += self._format_value_complete(self._current_value, value_type)
+                        json_output += self._format_held_value(func_name, tools)
 
                     self._xml_tag_buffer = ""
                     self._stream_state = StreamState.BETWEEN
@@ -406,21 +358,17 @@ class Glm47MoeDetector(BaseFormatDetector):
                                 json_output += json.dumps(content, ensure_ascii=False)[1:-1]
                                 self._current_value += content
                                 self._xml_tag_buffer = ""
-                        elif value_type == "number":
-                            if content:
-                                if not self._value_started:
-                                    self._value_started = True
+                        elif content:
+                            # Object/array values that open as JSON stream through
+                            # verbatim; anything else ("1,000", "True") is held and
+                            # parsed at the closing tag, as non-streaming does.
+                            self._current_value += content
+                            self._xml_tag_buffer = ""
+                            if self._value_started:
                                 json_output += content
-                                self._current_value += content
-                                self._xml_tag_buffer = ""
-                        else:
-                            # For object/array types, output as-is
-                            if content:
-                                if not self._value_started:
-                                    self._value_started = True
-                                json_output += content
-                                self._current_value += content
-                                self._xml_tag_buffer = ""
+                            elif self._current_value.lstrip()[:1] == _JSON_OPENERS.get(value_type):
+                                self._value_started = True
+                                json_output += self._current_value
 
         return json_output
 
@@ -557,8 +505,8 @@ class Glm47MoeDetector(BaseFormatDetector):
             self._last_arguments += "{}"
             self.streamed_args_for_tool[self.current_tool_id] += "{}"
             self._sent_empty_object = True
-        elif not self._last_arguments.endswith("}") and not self._sent_empty_object:
-            # Need to close brace
+        elif not self._sent_empty_object:
+            # Close the arguments object; the last value may itself end with "}"
             calls.append(
                 ToolCallItem(
                     tool_index=self.current_tool_id,
@@ -738,7 +686,8 @@ class Glm47MoeDetector(BaseFormatDetector):
                     # If parsed as dict/list but schema says string, convert to JSON string
                     arguments[arg_key] = json.dumps(parsed_value, ensure_ascii=False)
                 else:
-                    arguments[arg_key] = str(parsed_value)
+                    # Keep the model's text: str(False) would give "False"
+                    arguments[arg_key] = arg_value
             elif arg_type is None:
                 # If type is not defined, keep the parsed value as-is
                 arguments[arg_key] = parsed_value if is_good_json else arg_value
