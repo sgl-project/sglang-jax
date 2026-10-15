@@ -67,6 +67,7 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
         scheduler.pd = ""
         scheduler._engine_paused = False
         scheduler.enable_overlap = False
+        scheduler.enable_overlap_v2 = False
         scheduler.chunked_reqs = active_reqs
         scheduler._pending_chunked_abort_reqs = [None] * dp_size
         scheduler.last_batch = self._make_batch(reqs, batch_owners)

@@ -393,6 +393,18 @@ suites = {
             runner="pytest",
         ),
         TestFile(
+            "python/sgl_jax/test/test_tp_worker_overlap_v2.py",
+            0.2,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "python/sgl_jax/test/test_relay_buffer.py",
+            0.1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
             "python/sgl_jax/test/managers/test_future_token_map.py",
             0.2,
             runner="pytest",
