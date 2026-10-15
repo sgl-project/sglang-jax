@@ -3899,6 +3899,9 @@ class ModelWorkerBatch:
     # Events
     launch_done: threading.Event | None = None
 
+    # V2 has already detached sampling state on the scheduler thread.
+    spec_sampling_prepared: bool = False
+
     # Pre-initialized ForwardBatch for overlap scheduling optimization
     forward_batch: Any | None = None
 

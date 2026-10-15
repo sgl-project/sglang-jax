@@ -104,8 +104,12 @@ from sgl_jax.srt.speculative.overlap_utils import (
     can_merge_spec_non_overlap_prefill,
     can_use_spec_decode_overlap,
     can_use_spec_prefill_overlap,
-    publish_spec_decode_new_seq_lens,
     use_legacy_eagle3_non_overlap,
+)
+from sgl_jax.srt.speculative.overlap_v2 import (
+    SpeculativePlan,
+    compact_speculative_state,
+    execute_speculative_batch,
 )
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import (
@@ -375,16 +379,11 @@ class Scheduler(
 
         self.pd = server_args.pd_disaggregation
         requested_overlap_v2 = get_bool_env_var("SGLANG_JAX_OVERLAP_V2")
-        self.enable_overlap_v2 = (
-            requested_overlap_v2
-            and self.enable_overlap
-            and not self.pd
-            and (self.spec_algorithm is None or self.spec_algorithm.is_none())
-        )
+        self.enable_overlap_v2 = requested_overlap_v2 and self.enable_overlap and not self.pd
         if requested_overlap_v2 and not self.enable_overlap_v2:
-            logger.warning("Overlap v2 only supports non-PD normal generation.")
+            logger.warning("Overlap v2 requires overlap scheduling and non-PD generation.")
         elif self.enable_overlap_v2:
-            logger.info("Normal overlap v2 enabled.")
+            logger.info("Overlap v2 enabled (normal and speculative generation).")
         if mesh is not None:
             self.mesh = mesh
         elif self.pd == "pathways":
@@ -1136,6 +1135,8 @@ class Scheduler(
 
     def _event_loop_overlap_v2(self):
         self.result_queue = deque()
+        algorithm = getattr(self, "spec_algorithm", None)
+        is_spec = algorithm is not None and not algorithm.is_none()
         while True:
             recv_reqs = (
                 self._comm_backend.recv_requests()
@@ -1146,6 +1147,15 @@ class Scheduler(
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
+
+            retired_previous = False
+            if is_spec and self._spec_sampling_needs_retirement():
+                # Stateful sampling snapshots must include the previous tokens.
+                # Do this before preparing the batch, never via a worker/owner
+                # event cycle while resource retirement waits on that worker.
+                last_batch, last_result = self.result_queue.popleft()
+                self.process_batch_result(last_batch, last_result, None)
+                retired_previous = True
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1158,10 +1168,14 @@ class Scheduler(
             if batch:
                 batch.launch_done = threading.Event()
                 with jax.profiler.TraceAnnotation("submit_batch_forward"):
-                    context = self._launch_batch_forward(batch)
+                    context = (
+                        self._launch_speculative_batch(batch)
+                        if is_spec
+                        else self._launch_batch_forward(batch)
+                    )
                 batch.launch_done = context
 
-            if self.last_batch:
+            if self.last_batch and not retired_previous:
                 last_batch, last_result = self.result_queue.popleft()
                 self.process_batch_result(
                     last_batch,
@@ -1171,7 +1185,11 @@ class Scheduler(
 
             if context is not None:
                 with jax.profiler.TraceAnnotation("submit_batch_sample"):
-                    result = self._launch_batch_sample(batch, context)
+                    result = (
+                        self._finish_speculative_batch(batch, context)
+                        if is_spec
+                        else self._launch_batch_sample(batch, context)
+                    )
                 self.result_queue.append((batch.copy(), result))
             elif self.last_batch is None:
                 self.on_idle()
@@ -2584,6 +2602,52 @@ class Scheduler(
             worker_batch.relay_input_indices = indices
             worker_batch.relay_input_mask = mask
 
+    def _spec_sampling_needs_retirement(self):
+        if self.last_batch is None:
+            return False
+        for info in self.last_batch.reqs_info:
+            # Per-rank SamplingBatchInfo has no grammar list. Grammars live
+            # on requests until get_model_worker_batch merges sampling state.
+            if any(req.grammar is not None for req in (info.reqs or [])):
+                return True
+            sampling = info.sampling_info
+            if sampling is not None and getattr(
+                sampling.penalizer_orchestrator, "is_required", False
+            ):
+                return True
+        return False
+
+    def _launch_speculative_batch(self, batch):
+        self.forward_ct += 1
+        self._profile_batch_predicate(batch)
+        worker_batch, plan = self._prepare_speculative_batch(
+            batch, *self.tp_worker.get_precompile_paddings()
+        )
+        return self.tp_worker.launch_speculative(self.draft_worker, worker_batch, plan)
+
+    def _finish_speculative_batch(self, batch, submission):
+        output, new_seq_lens = submission.future.result()
+        (
+            worker_batch,
+            output,
+            next_token_ids,
+            logits_output,
+            cache_miss_count,
+            _,
+            defer_prefill,
+        ) = self._publish_speculative_batch(
+            batch, submission.batch, submission.plan, output, new_seq_lens
+        )
+        return self._make_generation_result(
+            batch,
+            worker_batch,
+            next_token_ids,
+            logits_output,
+            cache_miss_count,
+            output,
+            defer_prefill,
+        )
+
     def _launch_batch_forward(self, batch):
         self.forward_ct += 1
         self._profile_batch_predicate(batch)
@@ -2693,6 +2757,30 @@ class Scheduler(
                 precompile_bs_paddings,
                 precompile_cache_loc_paddings,
             )
+        return self._make_generation_result(
+            batch,
+            model_worker_batch,
+            next_token_ids,
+            logits_output,
+            cache_miss_count,
+            batch_output if self.spec_algorithm and not self.spec_algorithm.is_none() else None,
+            (
+                defer_spec_prefill_output
+                if self.spec_algorithm and not self.spec_algorithm.is_none()
+                else False
+            ),
+        )
+
+    def _make_generation_result(
+        self,
+        batch,
+        model_worker_batch,
+        next_token_ids,
+        logits_output,
+        cache_miss_count,
+        batch_output=None,
+        defer_spec_prefill_output=False,
+    ):
         bid = model_worker_batch.bid
 
         # These 2 values are needed for processing the output, but the values can be
@@ -2770,7 +2858,8 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
                 if self.enable_overlap_v2:
-                    self._resolve_overlap_v2_result(result)
+                    if result.launch_result is not None:
+                        self._resolve_overlap_v2_result(result)
                 else:
                     self.tp_worker.resolve_last_batch_result(launch_done)
                 self.set_next_batch_sampling_info_done(batch)
@@ -2790,7 +2879,7 @@ class Scheduler(
             return self.draft_worker
         return self.tp_worker
 
-    def _run_speculative_batch(
+    def _prepare_speculative_batch(
         self,
         batch: ScheduleBatch,
         precompile_token_paddings,
@@ -2827,28 +2916,32 @@ class Scheduler(
         use_legacy_eagle3_decode = batch.forward_mode.is_decode() and use_legacy_eagle3_non_overlap(
             self.enable_overlap, self.spec_algorithm
         )
-        if use_spec_decode_overlap:
-            batch_output, published_new_seq_lens = (
-                self.draft_worker.forward_batch_speculative_decode_overlap(model_worker_batch)
+        if getattr(self, "enable_overlap_v2", False):
+            # The relay entry is an optimization, not the v2 admission gate.
+            use_spec_decode_overlap = use_spec_decode_overlap and (
+                self.spec_algorithm.is_dflash_family()
+                or self.draft_worker._can_use_fused_spec_decode
+                or self.draft_worker._can_use_fused_eagle3_verify
             )
-        elif use_spec_prefill_overlap:
-            batch_output = self.draft_worker.forward_batch_speculative_prefill_overlap(
-                model_worker_batch
-            )
-            published_new_seq_lens = None
-        else:
-            batch_output = self.draft_worker.forward_batch_speculative_generation(
-                model_worker_batch
-            )
-            if use_legacy_eagle3_decode:
-                published_new_seq_lens = None
-            else:
-                published_new_seq_lens = (
-                    publish_spec_decode_new_seq_lens(batch_output)
-                    if batch.forward_mode.is_decode()
-                    else None
-                )
+        return model_worker_batch, SpeculativePlan(
+            use_spec_decode_overlap, use_spec_prefill_overlap, use_legacy_eagle3_decode
+        )
 
+    def _run_speculative_batch(self, batch, *paddings):
+        worker_batch, plan = self._prepare_speculative_batch(batch, *paddings)
+        output, new_seq_lens = execute_speculative_batch(self.draft_worker, worker_batch, plan)
+        return self._publish_speculative_batch(batch, worker_batch, plan, output, new_seq_lens)
+
+    def _publish_speculative_batch(
+        self, batch, model_worker_batch, plan, batch_output, published_new_seq_lens
+    ):
+        use_spec_decode_overlap = plan.decode_relay
+        use_spec_prefill_overlap = plan.prefill_relay
+        use_legacy_eagle3_decode = plan.legacy_eagle3_decode
+        if getattr(self, "enable_overlap_v2", False):
+            batch_output.next_draft_input = compact_speculative_state(
+                batch_output.next_draft_input, model_worker_batch
+            )
         if batch_output.next_draft_input is not None:
             per_rank_spec = ScheduleBatch._split_spec_info_per_rank(
                 batch_output.next_draft_input, model_worker_batch.real_bs_per_dp

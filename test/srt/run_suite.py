@@ -399,6 +399,12 @@ suites = {
             env={"JAX_PLATFORMS": "cpu"},
         ),
         TestFile(
+            "python/sgl_jax/test/test_speculative_overlap_v2.py",
+            0.2,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
             "python/sgl_jax/test/test_relay_buffer.py",
             0.1,
             runner="pytest",

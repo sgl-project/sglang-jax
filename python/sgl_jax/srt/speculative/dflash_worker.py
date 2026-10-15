@@ -1039,7 +1039,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         runner = target_worker.model_runner
         model_worker_batch = plan.model_worker_batch
 
-        if target_worker.worker.server_args.enable_lora and target_worker.need_prepare_lora_batch:
+        if self._target_impl.server_args.enable_lora and target_worker.need_prepare_lora_batch:
             target_worker.prepare_lora_batch(model_worker_batch)
 
         def _call_and_replace():
