@@ -57,7 +57,9 @@ _FUSED_MOE_V2_SUPPORTED_ARCHITECTURES = frozenset(
 )
 
 
-_FORCED_FUSED_EP_MOE_ARCHS = frozenset({"Qwen3_5MoeForConditionalGeneration"})
+_FORCED_FUSED_EP_MOE_ARCHS = frozenset(
+    {"Qwen3_5MoeForConditionalGeneration", "Qwen4ExpForConditionalGeneration"}
+)
 
 _MOE_DP_SUPPORTED_ARCHITECTURES = frozenset({"BailingMoeV3ForCausalLM"})
 

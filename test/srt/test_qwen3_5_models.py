@@ -10,6 +10,7 @@ from sgl_jax.test.test_utils import (
     QWEN3_5_27B,
     QWEN3_5_35B_A3B,
     QWEN3_8_27B,
+    QWEN3_8_FLASH_NEXT,
     CustomTestCase,
     popen_launch_server,
 )
@@ -153,6 +154,76 @@ class TestQwen38DenseModel(TestQwen35DenseModel):
     """Qwen3.8-27B reuses the dense Qwen3.5 architecture and checkpoint layout."""
 
     model = QWEN3_8_27B
+
+
+class TestQwen38FlashNextModel(CustomTestCase):
+    """Qwen3.8-Flash-Next on one v7x host: 4 chips, 8 devices, tp8/ep8 puts
+    ~30 GiB of weights on each. Full attention is QSA, so it is served by
+    qsa_sparse. The N-gram table stays in host memory (~95 GiB) and its
+    lookup needs real token ids on the host, hence no overlap scheduling.
+    The context length leaves room for the smoke's 32768-token answers plus
+    the prompt; the request pool is pinned to the running limit so the fused
+    MoE keeps its batch size."""
+
+    model = QWEN3_8_FLASH_NEXT
+
+    @classmethod
+    def setUpClass(cls):
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            # A cold start reads the 335 GiB checkpoint and the 95 GiB N-gram
+            # table, then compiles every bucket: well past the default.
+            timeout=1800,
+            device="tpu",
+            other_args=[
+                "--trust-remote-code",
+                "--skip-server-warmup",
+                "--random-seed",
+                "3",
+                "--dtype",
+                "bfloat16",
+                "--tp-size",
+                "8",
+                "--nnodes",
+                "1",
+                "--ep-size",
+                "8",
+                "--dist-init-addr",
+                "0.0.0.0:10011",
+                "--attention-backend",
+                "qsa_sparse",
+                "--context-length",
+                "36864",
+                "--mem-fraction-static",
+                "0.8",
+                "--chunked-prefill-size",
+                "2048",
+                "--page-size",
+                "64",
+                "--max-running-requests",
+                "16",
+                "--max-recurrent-state-size",
+                "16",
+                "--disable-radix-cache",
+                "--disable-overlap-schedule",
+                "--precompile-bs-paddings",
+                "16",
+                "--precompile-token-paddings",
+                "16",
+                "512",
+                "1024",
+            ],
+            env={"JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache"},
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_mmlu_smoke(self):
+        _run_mmlu_smoke(self, self.base_url, self.model)
 
 
 if __name__ == "__main__":
