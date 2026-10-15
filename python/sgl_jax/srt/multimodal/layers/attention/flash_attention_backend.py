@@ -292,6 +292,7 @@ def make_vision_attention_backend(
     causal: bool = False,
     head_tp: bool = False,
     use_varlen: bool = False,
+    backend: str = "auto",
 ) -> AttentionBackend:
     """Build vision attention over flat tokens sharded into complete lanes.
 
@@ -302,7 +303,20 @@ def make_vision_attention_backend(
     ``max_seq_len`` upper bound passed to the backend selects the
     v7x-tuned block sizes. CPU meshes use the flash backend's test-only
     interpreter path.
+
+    ``backend="flash_attention_v2"`` explicitly selects the experimental v7x
+    kernel. ``auto`` preserves the existing selection.
     """
+    if backend == "flash_attention_v2":
+        from sgl_jax.srt.multimodal.layers.attention.flash_attention_v2_backend import (
+            VisionFlashAttentionV2Backend,
+        )
+
+        return VisionFlashAttentionV2Backend(
+            mesh, sm_scale=sm_scale, causal=causal, head_tp=head_tp
+        )
+    if backend != "auto":
+        raise ValueError(f"Unknown vision attention backend: {backend}")
     if use_varlen and mesh.devices.flat[0].platform == "tpu":
         return VisionVarlenAttentionBackend(
             mesh,
