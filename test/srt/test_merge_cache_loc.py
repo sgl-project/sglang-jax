@@ -53,6 +53,7 @@ class TestMergeCacheLoc(unittest.TestCase):
         pool = MagicMock()
         pool.req_to_token = req_to_token
         pool.cache_loc_host_buf = np.zeros(total_cache_loc_size, dtype=np.int32)
+        self._pool = pool
         batch = ScheduleBatch(
             reqs_info=reqs_info,
             dp_size=dp_size,
@@ -144,8 +145,21 @@ class TestMergeCacheLoc(unittest.TestCase):
         ref = _reference_loop(req_to_token, reqs_info, 1, total, 1, total)
         np.testing.assert_array_equal(got, ref)
 
+    def test_result_does_not_alias_host_buffer(self):
+        """The host buffer is rewritten every step, so no view of it may escape (#1503)."""
+        req_to_token = _make_paged_req_to_token(4, 256, 64)
+        reqs_info = [
+            ScheduleReqsInfo(
+                reqs=[],
+                seq_lens=np.array([100, 7], dtype=np.int32),
+                req_pool_indices=np.array([2, 0], dtype=np.int32),
+            )
+        ]
+        got = self._run_merge(reqs_info, 1, req_to_token, 64, 512)
+        self.assertFalse(np.shares_memory(got, self._pool.cache_loc_host_buf))
+
     def test_all_empty_dp(self):
-        """All-empty batch must not crash and returns the buffer view."""
+        """All-empty batch must not crash and returns zeros."""
         req_to_token = np.zeros((8, 256), dtype=np.int32)
         reqs_info = [
             ScheduleReqsInfo(reqs=[], seq_lens=None),
