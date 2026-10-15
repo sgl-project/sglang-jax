@@ -32,6 +32,7 @@ from sgl_jax.srt.kernels.dsa.sparse_mla_prefill import prefill_write_and_attend_
 from sgl_jax.srt.kernels.dsa.sparse_mla_prefill_qblock import (
     paged_write_back,
     prefill_write_and_attend_ragged_qblock,
+    prefill_write_and_attend_ragged_qblock_tsa,
 )
 from sgl_jax.srt.kernels.dsa.streamindex_topk import (
     streamindex_page_topk,
@@ -141,6 +142,20 @@ def _use_verify_qgroup(is_verify: bool, draft_group: int | None, num_tokens: int
 _IDX_VERIFY_BATCHED = os.environ.get("DSA_IDX_VERIFY_BATCHED", "0") == "1"
 _IDX_VERIFY_BATCHED_MIN_BS = int(os.environ.get("DSA_IDX_VERIFY_BATCHED_MIN_BS", "8"))
 _IDX_VERIFY_BATCHED_MAX_KV = int(os.environ.get("DSA_IDX_VERIFY_BATCHED_MAX_KV", "8192"))
+
+# TSA (token-sharded attention) prefill, opt-in via DSA_TSA_PREFILL=1: inside
+# the sparse-prefill shard_map, an all_to_all reshards queries from head-TP
+# ([T, H/tp] per device) to token-sharded ([T/tp, H] per device), each device
+# attends only its contiguous token slice's page union, and a second
+# all_to_all reshards the output back. Head-TP makes QB queries span 4-head
+# fragments of 64 unrelated positions, so a 256-row MXU group unions ~177
+# pages; 16 ADJACENT tokens x all 64 heads union ~66 pages at the same M.
+# QB=16 from the P0 shape sweep on real 110k indices: QB=4 x1.90 / QB=8
+# x2.32 / QB=16 x2.72 vs head-TP at the same depth (smaller groups have
+# denser unions but pay per-block launch/DMA overhead). The two all_to_alls
+# move ~71MB/device/layer/chunk — well under the attend time they unlock.
+_TSA_PREFILL = os.environ.get("DSA_TSA_PREFILL", "0") == "1"
+_TSA_PREFILL_QB = int(os.environ.get("DSA_TSA_PREFILL_QB", "16"))
 
 
 @register_pytree_node_class
@@ -361,7 +376,17 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 # before any full layer) ⇒ fall through to the dense attend below.
                 topk_pages_use = topk_pages if (is_full and not reuse_pages) else dsa_topk_pages_in
                 if topk_pages_use is not None:
-                    o, kv_cache = self._run_sparse_prefill(
+                    # TSA needs the (padded) chunk length divisible by tp so the
+                    # all_to_all tiles evenly; shapes are static at trace time,
+                    # odd buckets just keep the head-TP layout.
+                    tp_size = self.mesh.shape["tensor"]
+                    use_tsa = _TSA_PREFILL and _tsa_eligible(
+                        q.shape[0], self.mesh.shape[dpa], tp_size
+                    )
+                    run_prefill = (
+                        self._run_sparse_prefill_tsa if use_tsa else self._run_sparse_prefill
+                    )
+                    o, kv_cache = run_prefill(
                         q,
                         q_rope,
                         new_kv_c,
@@ -1019,6 +1044,117 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
 
         return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(*args)
 
+    def _run_sparse_prefill_tsa(
+        self, ql, qpe, kvc, kpe, cache, topk_pages, sm_scale, dpa, md, forward_batch
+    ):
+        """Token-sharded-attention sparse prefill (same call contract as
+        :meth:`_run_sparse_prefill`).
+
+        Inside the shard_map an ``all_to_all`` reshards the queries from
+        head-TP ([T, H/tp] per device) to token-sharded ([T/tp, H] per device),
+        each device attends only its contiguous token slice — whose page union
+        is ~2.7x denser than a head-TP query block's — and a second
+        ``all_to_all`` reshards the output back to head-TP for the unchanged
+        w_uv/o_proj epilogue. The write side keeps the replicated full-chunk
+        behaviour, so every device's cache copy stays complete. Projections,
+        weights and the decode path are untouched."""
+        positions = forward_batch.positions.astype(jnp.int32)
+        page_size = self.page_size
+        kv_lora_rank = self.kv_lora_rank
+        sm = float(sm_scale)
+        tp_size = self.mesh.shape["tensor"]
+        # Same write contract as _run_sparse_prefill: speculative verify /
+        # draft-extend batches derive their self-write slots from the ragged
+        # metadata (out_cache_loc is the 2 x draft_token_num allocation list,
+        # not per token), and KVShare read-only draft steps write nothing.
+        mode = forward_batch.forward_mode
+        derive_loc = mode.is_target_verify() or mode.is_draft_extend()
+        readonly = bool(getattr(forward_batch, "spec_kvshare_readonly", False))
+        if readonly or derive_loc:
+            loc = None  # built rank-locally inside the shard_map (see _run)
+        else:
+            loc = forward_batch.out_cache_loc.astype(jnp.int32)
+            if loc.shape[0] != ql.shape[0]:
+                raise ValueError(
+                    "TSA sparse prefill self-write: out_cache_loc has "
+                    f"{loc.shape[0]} entries for {ql.shape[0]} tokens ({mode.name})"
+                )
+
+        in_specs = (
+            P(dpa, "tensor", None),  # ql   [T, H, kv_lora_rank]
+            P(dpa, "tensor", None),  # qpe  [T, H, rope]
+            P(dpa, None),  # kvc  [T, kv_lora_rank]
+            P(dpa, None),  # kpe  [T, rope]
+            P(dpa, None, None, None),  # cache
+            P(dpa, None),  # topk_pages [T, K]
+            P(dpa),  # positions [T]
+            P(dpa),  # seq_lens [S]
+            P(dpa),  # cu_q_lens [S+1]
+            P(dpa),  # cu_kv_lens [S+1]
+            P(dpa),  # page_indices [total_pages]
+        )
+        args = [
+            ql,
+            qpe,
+            kvc,
+            kpe,
+            cache,
+            topk_pages,
+            positions,
+            md.seq_lens,
+            md.cu_q_lens,
+            md.cu_kv_lens,
+            md.page_indices,
+        ]
+        if loc is not None:
+            in_specs = in_specs + (P(dpa),)  # loc [T]
+            args.append(loc)
+        out_specs = (P(dpa, "tensor", None), P(dpa, None, None, None))
+
+        def _run(ql_, qpe_, kvc_, kpe_, cache_, tp_, pos_, sl_, cuq_, cukv_, pi_, *rest):
+            if rest:
+                loc_ = rest[0]
+            elif readonly:
+                # KVShare read-only draft step: all rows dropped by paged_write_back.
+                loc_ = jnp.full((ql_.shape[0],), -1, jnp.int32)
+            else:
+                loc_ = _spec_token_slots(sl_, cuq_, cukv_, pi_, ql_.shape[0], page_size)
+            t_local = ql_.shape[0] // tp_size
+            # head-TP -> token-sharded: [T, H/tp, D] -> [T/tp, H, D]; ranks hold
+            # contiguous token slices in rank order, heads concat in rank order
+            # (matching the contiguous head-block sharding of q_b_proj).
+            ql_t = jax.lax.all_to_all(ql_, "tensor", split_axis=0, concat_axis=1, tiled=True)
+            qpe_t = jax.lax.all_to_all(qpe_, "tensor", split_axis=0, concat_axis=1, tiled=True)
+            off = jax.lax.axis_index("tensor") * t_local
+            tp_loc = jax.lax.dynamic_slice_in_dim(tp_, off, t_local, axis=0)
+            pos_loc = jax.lax.dynamic_slice_in_dim(pos_, off, t_local, axis=0)
+            o_t, cache_new = prefill_write_and_attend_ragged_qblock_tsa(
+                ql_t,
+                qpe_t,
+                kvc_,
+                kpe_,
+                cache_,
+                tp_loc,
+                pos_loc,
+                loc_,
+                sl_,
+                cuq_,
+                cukv_,
+                pi_,
+                kv_lora_rank=kv_lora_rank,
+                page_size=page_size,
+                sm_scale=sm,
+                query_block=_TSA_PREFILL_QB,
+                q_token_offset=off,
+            )
+            # token-sharded -> head-TP: [T/tp, H, Dv] -> [T, H/tp, Dv]
+            o = jax.lax.all_to_all(
+                o_t.astype(ql_.dtype), "tensor", split_axis=1, concat_axis=0, tiled=True
+            )
+            return o, cache_new
+
+        return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(*args)
+
     def _run_dense(self, ql, qpe, kvc, kpe, cache, sm_scale, layer, dpa, md):
         in_specs = (
             P(dpa, "tensor", None),
@@ -1164,6 +1300,15 @@ def _gather_cache_rows(cache: jax.Array, loc: jax.Array, page_size: int) -> jax.
     off = safe % page_size
     rows = cache[page, off // pk, off % pk]
     return jnp.where((loc >= 0)[:, None], rows, jnp.zeros_like(rows))
+
+
+def _tsa_eligible(num_tokens_global: int, dp_size: int, tp_size: int) -> bool:
+    """TSA prefill needs the per-rank (after DP sharding) token count divisible by tp so the
+    all_to_all tiles evenly; checking the global count is wrong (DP=2, tp=2, T=6 passes
+    globally but each rank holds 3 tokens). Shapes are static at trace time."""
+    if tp_size <= 1 or dp_size <= 0:
+        return False
+    return (num_tokens_global // dp_size) % tp_size == 0
 
 
 def _spec_draft_group(forward_batch, num_tokens: int) -> int | None:
