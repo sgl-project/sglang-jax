@@ -21,11 +21,10 @@ class CSAAttentionMetadata(NamedTuple):
     query_seq_ids:[T], cu_q_lens:[B+1], seq_lens:[B]. Flattened page tables
     use page-aligned cu_*_kv_lens:[B+1] in tokens/entries, as in HCA.
     Live queries are request-contiguous in cu_q_lens order.
-    Window tables address a window_size-token ring before this chunk. Compressed
-    lengths:[B] count completed entries. Nonnegative Top-K entries must be unique.
+    Window tables start at the page containing max(0, prefix-window_size+1).
+    Compressed lengths:[B] count completed entries. Top-K entries must be unique.
     window_write_locations:[T] gives raw rank-local row addresses; -1 suppresses a write.
-    The operator selects the last window_size tokens per request before writing.
-    Requests must exclusively own SWA pages.
+    Valid write locations are unique physical rows in caller-owned SWA pages.
     """
 
     query_seq_ids: jax.Array
@@ -97,13 +96,13 @@ def _decode_pages(table, offsets):
 def _decode_kernel(
     position,
     active,
-    pages,
     q,
     new,
     compressed,
     valid,
     sink,
     window,
+    window_valid,
     output,
     maximum,
     denominator,
@@ -113,16 +112,9 @@ def _decode_kernel(
     window_size,
 ):
     token = pl.program_id(0)
-    slots = jnp.arange(window_size)
-    history = jnp.where(
-        slots[:, None] == position[token] % window_size, new[0], window[:window_size]
-    )
-    window_valid = (slots <= position[token]) & (
-        (pages[token] > 0) | (slots == position[token] % window_size)
-    )
-    keep = (jnp.concatenate((window_valid.astype(jnp.int32), valid[0, 0])) != 0) & (
-        active[token] != 0
-    )
+    row = jax.lax.broadcasted_iota(jnp.int32, (window_size, window.shape[-1]), 0)
+    history = jnp.where(row == window_size - 1, new[0], window[0])
+    keep = (jnp.concatenate((window_valid[0, 0], valid[0, 0])) != 0) & (active[token] != 0)
     kv = jnp.where(
         keep.astype(jnp.int32)[:, None] != 0, jnp.concatenate((history, compressed[0]), axis=0), 0
     )
@@ -183,22 +175,27 @@ def _decode_attention(
     gathered = ragged_gather_v2(
         cache.reshape(-1, dim), locations, jnp.int32(0), jnp.int32(locations.size)
     )
-    wp_entry = md.window_cu_kv_lens[safe] // window_page_size
-    wp = md.window_page_indices[jnp.clip(wp_entry, 0, md.window_page_indices.size - 1)]
-    wp = jnp.where(
-        active
-        & (wp_entry >= 0)
-        & (wp_entry < md.window_page_indices.size)
-        & (wp_entry < md.window_cu_kv_lens[safe + 1] // window_page_size)
-        & (wp > 0)
-        & (wp < window.shape[0] // window_page_size),
-        wp,
-        0,
+    absolute = position[:, None] - window_size + 1 + jnp.arange(window_size)[None]
+    first_page = jnp.maximum(0, position - window_size + 1) // window_page_size
+    wp_start = md.window_cu_kv_lens[safe] // window_page_size
+    wp_end = md.window_cu_kv_lens[safe + 1] // window_page_size
+    wp_entry = wp_start[:, None] + absolute // window_page_size - first_page[:, None]
+    historical = active[:, None] & (absolute >= 0) & (absolute < position[:, None])
+    historical &= (wp_entry >= wp_start[:, None]) & (wp_entry < wp_end[:, None])
+    historical &= (wp_entry >= 0) & (wp_entry < md.window_page_indices.size)
+    wp = _decode_pages(md.window_page_indices, jnp.where(historical, wp_entry, -1))
+    historical &= (wp > 0) & (wp < window.shape[0] // window_page_size)
+    window_locations = jnp.where(
+        historical, wp * window_page_size + absolute % window_page_size, 0
+    ).reshape(-1)
+    history = ragged_gather_v2(
+        window, window_locations, jnp.int32(0), jnp.int32(window_locations.size)
     )
+    window_valid = historical | (active[:, None] & (absolute == position[:, None]))
     return pl.pallas_call(
         functools.partial(_decode_kernel, scale=scale, window_size=window_size),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=3,
+            num_scalar_prefetch=2,
             grid=(tokens,),
             in_specs=(
                 pl.BlockSpec((1, heads, dim), lambda t, *_: (t, 0, 0)),
@@ -206,7 +203,8 @@ def _decode_attention(
                 pl.BlockSpec((1, selected, dim), lambda t, *_: (t, 0, 0)),
                 pl.BlockSpec((1, 1, selected), lambda t, *_: (t, 0, 0)),
                 pl.BlockSpec((heads,), lambda t, *_: (0,)),
-                pl.BlockSpec((window_page_size, dim), lambda t, pos, active, pages: (pages[t], 0)),
+                pl.BlockSpec((1, window_size, dim), lambda t, *_: (t, 0, 0)),
+                pl.BlockSpec((1, 1, window_size), lambda t, *_: (t, 0, 0)),
             ),
             out_specs=pl.BlockSpec((1, heads, dim), lambda t, *_: (t, 0, 0)),
             scratch_shapes=(
@@ -221,13 +219,13 @@ def _decode_attention(
     )(
         position,
         active.astype(jnp.int32),
-        wp,
         q,
         new[:, None],
         gathered.reshape(tokens, selected, dim),
         valid[:, None].astype(jnp.int32),
         sink,
-        window,
+        history.reshape(tokens, window_size, dim),
+        window_valid[:, None].astype(jnp.int32),
     )
 
 
@@ -404,9 +402,12 @@ def _kernel(
             def start_compressed():
                 fetch(first_selected, 0)
 
-            # Historical ring: whole physical pages, never one DMA per token.
+            # Backend tables begin at the first retained historical page.
             @pl.when((prefix > 0) & (token - cu_q[safe_request] < window_size - 1))
             def history():
+                first_position = jnp.maximum(0, prefix - window_size + 1)
+                first_page = first_position // window_page_size * window_page_size
+
                 def page_step(part, _):
                     page, _, exists = page_location(
                         window_pages,
@@ -427,19 +428,22 @@ def _kernel(
 
                         copy.start()
                         copy.wait()
-                        slots = part * window_page_size + jnp.arange(window_page_size)
-                        absolute = prefix - 1 - (prefix - 1 - slots) % window_size
+                        absolute = (
+                            first_page + part * window_page_size + jnp.arange(window_page_size)
+                        )
                         keep = (
                             (absolute[None, :] >= 0)
-                            & (slots[None, :] < window_size)
+                            & (absolute[None, :] < prefix)
                             & (absolute[None, :] > position[:, None] - window_size)
                             & (member_bits[:, None] != 0)
                         )
                         consume(window_ref[...].reshape(window_page_size, head_dim), keep)
 
-                jax.lax.fori_loop(0, pl.cdiv(window_size, window_page_size), page_step, None)
+                jax.lax.fori_loop(
+                    0, pl.cdiv(prefix - first_page, window_page_size), page_step, None
+                )
 
-            # Current chunk remains separate from the historical ring during prefill.
+            # Current chunk stays separate until historical reads complete.
             first = jnp.maximum(cu_q[safe_request], token - window_size + 1) // window_size
             last = (
                 jnp.minimum((block + 1) * query_tile, cu_q[safe_request + 1]) - 1
@@ -558,7 +562,7 @@ def csa_joint_attention(
     Backend supplies rank-local read tables and write locations; it must skip its
     own SWA scatter. This chunk's KV remains separate until old history is consumed.
     Top-K entries are unique request-local compressed-record indices, with -1 padding.
-    Decode uses SparseCore gather: at most one live query per request and one SWA page.
+    Decode uses SparseCore gather and requires at most one live query per request.
     """
     if q.ndim != 3 or q.dtype != jnp.bfloat16:
         raise ValueError("q must be BF16 [T,H,D]")
@@ -596,8 +600,8 @@ def csa_joint_attention(
     if not math.isfinite(scale) or scale <= 0:
         raise ValueError("scale must be finite and positive")
     bt, tile = schedule.query_tile, schedule.selected_tile
-    if schedule.decode and (bt != 1 or window_size > window_page_size):
-        raise ValueError("SparseCore decode requires query_tile=1 and a single SWA page")
+    if schedule.decode and bt != 1:
+        raise ValueError("SparseCore decode requires query_tile=1")
     if bt <= 0 or bt > 32 or bt & (bt - 1) or tile not in (128, 256):
         raise ValueError("schedule requires power-of-two query_tile <=32 and selected_tile 128/256")
     batch = metadata.seq_lens.size
@@ -676,25 +680,16 @@ def csa_joint_attention(
             topk_indices[:, None],
             attention_sink,
         )
-    # A long chunk needs at most one final ring per request, not T writeback rows.
-    if tokens > batch * window_size:
-        ids = (metadata.cu_q_lens[1:, None] - window_size + jnp.arange(window_size)).reshape(-1)
-        safe = jnp.clip(ids, 0, tokens - 1)
-        req = jnp.repeat(jnp.arange(batch), window_size)
-        valid = metadata.query_seq_ids[safe] == req
-        values = new_kv[safe]
-    else:
-        ids = jnp.arange(tokens)
-        safe = ids
-        req = jnp.clip(metadata.query_seq_ids, 0, batch - 1)
-        valid = (metadata.query_seq_ids >= 0) & (metadata.query_seq_ids < batch)
-        values = new_kv
-    end = metadata.cu_q_lens[req + 1]
-    loc = metadata.window_write_locations[safe]
-    valid &= (ids >= 0) & (ids < tokens)
-    valid &= (ids >= metadata.cu_q_lens[req]) & (ids < end) & (ids >= end - window_size)
+    ids = jnp.arange(tokens)
+    req = jnp.clip(metadata.query_seq_ids, 0, batch - 1)
+    valid = (metadata.query_seq_ids >= 0) & (metadata.query_seq_ids < batch)
+    valid &= (ids >= metadata.cu_q_lens[req]) & (ids < metadata.cu_q_lens[req + 1])
+    loc = metadata.window_write_locations
     valid &= (loc >= window_page_size) & (loc < window_cache.shape[0])
+    if not interpret:
+        # Keep the aliased pool in HBM instead of staging the whole pool for a few row writes.
+        window_cache = pltpu.with_memory_space_constraint(window_cache, pltpu.HBM)
     updated = paged_row_write(
-        window_cache, values, loc, valid, run=schedule.write_run, interpret=interpret
+        window_cache, new_kv, loc, valid, run=schedule.write_run, interpret=interpret
     )
     return output, updated
