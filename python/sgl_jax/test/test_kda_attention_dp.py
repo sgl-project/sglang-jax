@@ -178,6 +178,24 @@ def set_mesh(tp_size: int, dp_size: int):
     return mesh
 
 
+def _conv_tp(sharding: NamedSharding) -> int:
+    return sharding.mesh.shape["tensor"] if sharding.spec[1] == "tensor" else 1
+
+
+def conv_logical_to_packed(conv: np.ndarray, tp: int) -> np.ndarray:
+    """``[B, q|k|v, K-1]`` -> the pool's per-shard ``[q_r|k_r|v_r]`` channel layout."""
+    B, D3, K1 = conv.shape
+    x = conv.reshape(B, 3, tp, D3 // 3 // tp, K1).transpose(0, 2, 1, 3, 4)
+    return x.reshape(B, D3, K1)
+
+
+def conv_packed_to_logical(conv: np.ndarray, tp: int) -> np.ndarray:
+    """Inverse of :func:`conv_logical_to_packed`."""
+    B, D3, K1 = conv.shape
+    x = conv.reshape(B, tp, 3, D3 // 3 // tp, K1).transpose(0, 2, 1, 3, 4)
+    return x.reshape(B, D3, K1)
+
+
 def create_test_data(
     mode: str,
     lens_per_rank: dict[int, list[int]],  # {dp_rank: [seq_len, ...]}
@@ -386,7 +404,11 @@ def create_test_data(
         jnp.asarray(ssm_init_full_dev, dtype=pool.temporal_dtype), pool.recurrent_sharding
     )
     conv_init_dev = jax.device_put(
-        jnp.asarray(conv_init_full_dev, dtype=pool.conv_dtype), pool.conv_sharding
+        jnp.asarray(
+            conv_logical_to_packed(conv_init_full_dev, _conv_tp(pool.conv_sharding)),
+            dtype=pool.conv_dtype,
+        ),
+        pool.conv_sharding,
     )
     pool.replace_buffer(([ssm_init_dev], [[conv_init_dev]]))
 
@@ -546,7 +568,8 @@ def assert_pool_state_per_rank(
     err_prefix: str,
 ):
     rec_np = np.asarray(rec_buf)
-    conv_np = np.asarray(conv_buf)
+    # The reference states are in the logical [q|k|v] layout.
+    conv_np = conv_packed_to_logical(np.asarray(conv_buf), _conv_tp(conv_buf.sharding))
     rank_stride = rec_np.shape[0] // dp_size
     for dp_rank in range(dp_size):
         info = per_dp_infos[dp_rank]
