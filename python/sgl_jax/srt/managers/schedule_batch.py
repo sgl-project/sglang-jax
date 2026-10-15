@@ -18,6 +18,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 """
 
 import dataclasses
+import functools
 import itertools
 import logging
 import os
@@ -188,6 +189,33 @@ def fit_cache_loc_padding(cache_loc_paddings, per_rank_needs, dp_size: int) -> i
         if padding % dp_size == 0 and padding // dp_size >= need:
             return padding
     return int(cache_loc_paddings[-1])
+
+
+@functools.cache
+def _decode_kv_ladder_min_bs() -> int:
+    """Batches smaller than this skip ladder steps below the small-batch floor."""
+    return int(os.environ.get("SGLANG_JAX_DECODE_KV_LADDER_MIN_BS", "0") or 0)
+
+
+def _decode_kv_ladder_smallbs_floor() -> int:
+    """Smallest ladder step (tokens) allowed for batches below the min bs."""
+    return int(os.environ.get("SGLANG_JAX_DECODE_KV_LADDER_SMALLBS_FLOOR", "4096") or 0)
+
+
+def _decode_kv_ladder_steps(page_size: int) -> tuple[int, ...]:
+    """Optional per-request KV capacity ladder for decode cache_loc sizing.
+
+    SGLANG_JAX_DECODE_KV_LADDER="4096,16384,65536" lets short-context decode
+    batches run on smaller cache_loc shapes (and therefore smaller attention /
+    indexer buffers) instead of always padding every request to max_req_len.
+    Each step is page-aligned; the max-capacity bucket remains the fallback.
+    Unset/empty keeps the single max-capacity bucket (default behavior).
+    """
+    raw = os.environ.get("SGLANG_JAX_DECODE_KV_LADDER", "").strip()
+    if not raw:
+        return ()
+    steps = {(int(s) + page_size - 1) // page_size * page_size for s in raw.split(",") if s.strip()}
+    return tuple(sorted(steps))
 
 
 class BaseFinishReason:
@@ -2554,6 +2582,37 @@ class ScheduleBatch:
                         self.dp_size,
                     ),
                 )
+            else:
+                # Plain decode (no speculative fit): opt-in per-request KV ladder.
+                ladder = _decode_kv_ladder_steps(page_size)
+                if ladder:
+                    # Pick the smallest per-request KV capacity step that holds the
+                    # longest sequence in the batch; fall back to the bs bucket's
+                    # max-capacity padding when every step is too small. The chosen
+                    # size must match a precompiled shape (compilation_manager
+                    # precompiles the same ladder), since cache_loc length is part
+                    # of the jit cache key.
+                    max_kv_len = 0
+                    for info in self.reqs_info:
+                        if info.seq_lens is not None and len(info.seq_lens) > 0:
+                            max_kv_len = max(max_kv_len, int(np.max(info.seq_lens)))
+                    padded_bs = bs_paddings[bs_index]
+                    # Small-batch floor: below SGLANG_JAX_DECODE_KV_LADDER_MIN_BS
+                    # requests the finer ladder steps are skipped (bs1 at the
+                    # 2048 step ran +0.16 ms/step slower than at 4096 -- the sparse
+                    # attend kernel degrades below 2 kv blocks), while T>=MIN_BS
+                    # batches take the full ladder (cc64 1k/1k +4.2%).
+                    floor_step = (
+                        _decode_kv_ladder_smallbs_floor()
+                        if padded_bs < _decode_kv_ladder_min_bs()
+                        else 0
+                    )
+                    for step in ladder:
+                        if step < floor_step:
+                            continue
+                        if max_kv_len <= step and padded_bs * step < total_cache_loc_size:
+                            total_cache_loc_size = padded_bs * step
+                            break
 
         per_dp_cache_loc_size = total_cache_loc_size // self.dp_size
         # View into the persistent buffer; intentionally NOT re-zeroed per step.
