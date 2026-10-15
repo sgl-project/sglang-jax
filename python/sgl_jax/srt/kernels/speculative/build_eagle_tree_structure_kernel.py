@@ -7,6 +7,10 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
+# Tree mask layouts, as SGLang's TreeMaskMode names them.
+FULL_MASK = 0  # per draft token: the request's context, then its tree row
+QLEN_ONLY = 1  # per draft token: its tree row only
+
 
 def _build_eagle_tree_structure_kernel(
     # Prefetch

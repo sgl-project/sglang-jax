@@ -17,6 +17,8 @@ from sgl_jax.test.test_utils import (
 
 
 class TestSpeculativeDecoding(CustomTestCase):
+    topk = 1
+
     @classmethod
     def setUpClass(cls):
         cls.model = QWEN3_32B
@@ -51,7 +53,7 @@ class TestSpeculativeDecoding(CustomTestCase):
                 "67caf31f9062d7ab64872e0a111d499bc16cd205",  # this model revision has .safetensor model file, which is converted by huggingface official
                 # FIXME(pc) topk > 1 has poor performance now, change it when build_tree_mask_for_draft_decode kernel is  implemented
                 "--speculative-eagle-topk",
-                "1",
+                str(cls.topk),
                 "--speculative-num-steps",
                 "3",
                 "--speculative-num-draft-tokens",
@@ -90,6 +92,40 @@ class TestSpeculativeDecoding(CustomTestCase):
 
         metrics = run_eval(args)
         self.assertGreater(metrics["score"], 0.45)
+
+
+class TestSpeculativeDecodingTree(TestSpeculativeDecoding):
+    """EAGLE3 tree drafting (topk > 1), on the chain test's server setup.
+
+    num_steps=3 runs two draft forwards, so the per-step tree mask is built
+    from real parents at a step beyond the first.
+    """
+
+    topk = 2
+
+    def _generate(self, text: str, sampling_params: dict) -> requests.Response:
+        return requests.post(
+            f"{self.base_url}/generate",
+            json={"text": text, "sampling_params": sampling_params},
+            timeout=600,
+        )
+
+    def test_sampled_request_is_rejected(self):
+        r = self._generate("The capital of France is", {"temperature": 0.7, "max_new_tokens": 8})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("greedy sampling only", r.text)
+        requests.get(f"{self.base_url}/health", timeout=10).raise_for_status()
+
+    def test_tree_accepts_beyond_the_root(self):
+        # Output correctness depends only on the target side; a broken draft
+        # side shows up as acceptance collapsing to the bonus token alone.
+        for _ in range(4):
+            self._generate(
+                "def fibonacci(n):\n    if n <= 1:\n        return n\n    return",
+                {"temperature": 0, "max_new_tokens": 64},
+            ).raise_for_status()
+        info = requests.get(f"{self.base_url}/get_server_info", timeout=30).json()
+        self.assertGreater(info["internal_states"][0]["avg_spec_accept_length"], 1.5)
 
 
 @unittest.skipUnless(

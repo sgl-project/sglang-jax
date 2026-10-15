@@ -1,5 +1,6 @@
 import logging
 from dataclasses import dataclass
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -96,6 +97,78 @@ def _pack_verify_mask(
             packed[row : row + q, 0, :kl] = cm[cm_off[s] : cm_off[s] + q * kl].reshape(q, kl)
             row += q
     return packed
+
+
+def _padding_trails(seq_lens: np.ndarray, dp_size: int, per_dp_bs: int) -> bool:
+    """Whether every DP rank lists its real slots (``seq_lens > 0``) first."""
+    real = (np.asarray(seq_lens) > 0).reshape(dp_size, per_dp_bs)
+    return bool(np.all(real == (np.cumsum(~real, axis=1) == 0)))
+
+
+@partial(jax.jit, static_argnames=("draft_token_num", "width"))
+def _expand_verify_tree_mask(tree_mask, context_lens, draft_token_num: int, width: int):
+    """Lay per-slot tree blocks out as the kernel's `[rows, 1, W]` rectangle.
+
+    ``tree_mask`` is the tree builder's ``QLEN_ONLY`` output: one ``q x q``
+    block per slot whose row ``i`` marks the nodes draft token ``i`` sees. Row
+    ``i`` of slot ``s`` keeps its first ``context_lens[s]`` columns, then block
+    row ``i`` at ``[context_lens[s], context_lens[s] + q)``, then zeros. Slots
+    with ``context_lens < 0`` are padding and stay fully masked.
+
+    Rows follow slot order, which is ``_pack_verify_mask``'s row order when the
+    padding slots trail the real ones in every DP rank.
+    """
+    q = draft_token_num
+    bs = context_lens.shape[0]
+    tree = tree_mask.reshape(bs, q, q)
+    rel = jnp.arange(width, dtype=jnp.int32)[None, :] - context_lens[:, None]
+    mask = jnp.broadcast_to((rel < 0)[:, None, :], (bs, q, width)).astype(jnp.int32)
+    for k in range(q):
+        mask = mask | (tree[:, :, k : k + 1] * (rel == k)[:, None, :])
+    mask = jnp.where((context_lens >= 0)[:, None, None], mask, 0)
+    return mask.reshape(bs * q, 1, width)
+
+
+@partial(jax.jit, static_argnames=("topk", "width"))
+def _draft_decode_tree_mask(context_lens, parents_by_step, topk: int, width: int):
+    """Draft-decode tree mask, ``topk`` rows per slot, as `[rows, 1, W]` int32.
+
+    At step ``len(parents_by_step)``, branch ``b`` of a slot sees the slot's
+    first ``context_lens`` columns, then one column in every step's
+    ``topk``-wide block: its own ancestor's. ``parents_by_step[s - 1]`` is the
+    parent array ``select_top_k_tokens`` produced at step ``s``: per branch,
+    ``topk + topk * topk * (s - 1)`` plus the branch's index among the step's
+    ``topk * topk`` candidates, which are laid out parent-major. Slots with
+    ``context_lens < 0`` are padding and stay fully masked.
+    """
+    bs = context_lens.shape[0]
+    col = jnp.arange(width, dtype=jnp.int32)[None, None, :]
+    base = context_lens[:, None, None]
+    node = jnp.broadcast_to(jnp.arange(topk, dtype=jnp.int32), (bs, topk))
+    mask = jnp.broadcast_to(col < base, (bs, topk, width))
+    for step in range(len(parents_by_step), -1, -1):
+        mask = mask | (col == base + step * topk + node[:, :, None])
+        if step > 0:
+            offset = topk + topk * topk * (step - 1)
+            parent = jnp.clip(
+                (parents_by_step[step - 1].astype(jnp.int32) - offset) // topk, 0, topk - 1
+            )
+            node = sum(jnp.where(node == k, parent[:, k : k + 1], 0) for k in range(topk))
+    mask = mask & (context_lens >= 0)[:, None, None]
+    return mask.astype(jnp.int32).reshape(bs * topk, 1, width)
+
+
+def _draft_decode_kv_lens(seq_lens, speculative_step_id: int, topk: int) -> np.ndarray:
+    """KV length of each slot at one EAGLE draft-decode step; 0 for padding slots.
+
+    The draft context ends at ``seq_lens - 1``, and every step appends one
+    ``topk``-wide block of sibling tokens behind it, so step ``i`` attends over
+    ``seq_lens - 1 + (i + 1) * topk`` positions and writes its block to the
+    last ``topk`` of them. The attention kv_lens, the page window and the tree
+    mask row width all come from this one expression.
+    """
+    seq_lens = np.asarray(seq_lens)
+    return np.where(seq_lens > 0, seq_lens - 1 + (speculative_step_id + 1) * topk, 0)
 
 
 def _pad_page_indices(
@@ -398,6 +471,7 @@ class FlashAttention(AttentionBackend):
         reuse_allocated_pages = (
             page_indices is None and getattr(batch, "allocated_page_indices", None) is not None
         )
+        pages_from_cache_loc = page_indices is None and not reuse_allocated_pages
         if reuse_allocated_pages:
             page_indices = batch.allocated_page_indices
         elif page_indices is None:
@@ -439,28 +513,23 @@ class FlashAttention(AttentionBackend):
         if batch.forward_mode.is_target_verify():
             seq_lens += extend_seq_lens
             aligned_seq_lens = ((seq_lens + self.page_size - 1) // self.page_size) * self.page_size
-            # Verify mask must be (a) DP-segmented per rank when dp>1 so each
-            # rank's P("data") shard sees its own slots, and (b) laid out as the
-            # kernel's rectangle [total_q_rows, 1, W] -- kv on the lane axis,
-            # one uniform 128-aligned W for the whole batch (see mask_row_width
-            # and _pack_verify_mask). dp=1 reduces to a single rank chunk;
-            # dp>1 keeps the per-rank repack from #1108 P1-7.
+            # The verify mask is the kernel's rectangle [total_q_rows, 1, W] --
+            # kv on the lane axis, one uniform 128-aligned W for the whole batch
+            # (see mask_row_width) -- sharded P("data") so each DP rank sees its
+            # own slots' rows. It is expanded on device from the tree blocks.
             if metadata.custom_mask is not None:
                 q = batch.spec_info_padded.draft_token_num
-                cm = np.asarray(jax.device_get(metadata.custom_mask))
-                assert cm.ndim == 1, f"unexpected tree-mask rank {cm.shape}"
-                # cm is DP-slot-ordered (build_tree got verified_seq_len = mwb.seq_lens-1
-                # over total_bs). Per-slot cm length = q*(verified_seq_len[s]+q); for pad
-                # slots verified_seq_len=-1 → q*(q-1).
-                cm_kl = np.where(seq_lens > 0, seq_lens, q - 1).astype(np.int64)
-                cm_off = np.concatenate([[0], np.cumsum(q * cm_kl)])
-                packed = _pack_verify_mask(
-                    cm, seq_lens, aligned_seq_lens, cm_off, q, dp_size, per_dp_bs
+                assert _padding_trails(
+                    seq_lens, dp_size, per_dp_bs
+                ), "verify padding slots must trail the real slots in each DP rank"
+                context_lens = np.where(seq_lens > 0, seq_lens - q, -1).astype(np.int32)
+                mask = _expand_verify_tree_mask(
+                    metadata.custom_mask,
+                    jax.device_put(context_lens, NamedSharding(self.mesh, P())),
+                    draft_token_num=q,
+                    width=mask_row_width(aligned_seq_lens),
                 )
-                metadata.custom_mask = device_array(
-                    packed,
-                    sharding=NamedSharding(self.mesh, P("data")),
-                )
+                metadata.custom_mask = jax.device_put(mask, NamedSharding(self.mesh, P("data")))
 
         else:
             aligned_seq_lens = (
@@ -468,13 +537,21 @@ class FlashAttention(AttentionBackend):
             ) * self.page_size
         cu_kv_lens = _per_dp_cumsum(aligned_seq_lens, dp_size, per_dp_bs)
 
-        if batch.forward_mode == ForwardMode.DRAFT_EXTEND and not getattr(
+        repack_draft_extend = batch.forward_mode == ForwardMode.DRAFT_EXTEND and not getattr(
             batch.spec_info_padded, "device_seq_lens_for_draft_extend", False
-        ):
-            # Truncate each req's page list from allocate_len → seq_len, keeping
-            # the DP-segmented layout from padding_for_decode (rank r's pages
-            # at [r*per_dp_pg : ...]). page_indices (line 212) is already
-            # cache_loc[::page_size]//page_size, so re-gather from it per-rank.
+        )
+        repack_verify = (
+            batch.forward_mode == ForwardMode.TARGET_VERIFY
+            and pages_from_cache_loc
+            and getattr(batch.spec_info_padded, "allocate_lens", None) is not None
+        )
+        if repack_draft_extend or repack_verify:
+            # cache_loc gives each req its allocate_len (padding_for_decode), but
+            # attention walks the page table by cu_kv_lens, i.e. by each req's
+            # aligned kv length. Truncate each req's page list to that, keeping
+            # the DP-segmented layout (rank r's pages at [r*per_dp_pg : ...]).
+            # page_indices is already cache_loc[::page_size]//page_size, so
+            # re-gather from it per-rank.
             allocate_lens = batch.spec_info_padded.allocate_lens
             if hasattr(allocate_lens, "device"):
                 allocate_lens = jax.device_get(allocate_lens)
@@ -606,8 +683,18 @@ class FlashAttention(AttentionBackend):
         per_dp_src_pages = full_size // dp_size
         TARGET_PADDING = 16384
         assert TARGET_PADDING % dp_size == 0
-        per_dp_dst_pages = TARGET_PADDING // dp_size
         rank_of_req = (sel // per_dp_bs).astype(np.int64)
+        # The draft page table keeps one size so its shape is stable; it only
+        # grows, to a power of two, for a batch whose windows do not fit.
+        topk = batch.speculative_eagle_topk
+        last_step = batch.speculative_num_steps - 1
+        widest_pages = cdiv(
+            _draft_decode_kv_lens(current_seq_lens, last_step, topk), self.page_size
+        )
+        rank_pages = np.bincount(rank_of_req, weights=widest_pages, minlength=dp_size)
+        per_dp_dst_pages = max(
+            TARGET_PADDING // dp_size, 1 << (max(int(rank_pages.max()), 1) - 1).bit_length()
+        )
 
         def _dp_starts(pages, per_dp_base):
             starts = np.zeros(len(pages), dtype=np.int64)
@@ -621,18 +708,20 @@ class FlashAttention(AttentionBackend):
 
         src_starts = _dp_starts(alloc_pages, per_dp_src_pages)
         seq_lens_list = []
-        valid_slot = np.asarray(batch.seq_lens) > 0
         for speculative_step_id in range(batch.speculative_num_steps):
-            seq_lens = np.where(valid_slot, batch.seq_lens + speculative_step_id, 0)
+            seq_lens = _draft_decode_kv_lens(batch.seq_lens, speculative_step_id, topk)
             seq_lens_list.append(seq_lens)
             aligned_seq_lens = ((seq_lens + self.page_size - 1) // self.page_size) * self.page_size
             cu_kv_lens.append(_per_dp_cumsum(aligned_seq_lens, dp_size, per_dp_bs))
 
             # Vectorized calculation of spec_pages
-            step_spec_tokens = (
-                current_seq_lens + (speculative_step_id) * batch.speculative_eagle_topk
-            )
+            step_spec_tokens = _draft_decode_kv_lens(current_seq_lens, speculative_step_id, topk)
             step_spec_pages = cdiv(step_spec_tokens, self.page_size)
+            # Each req's window is gathered from its own allocated pages.
+            assert np.all(step_spec_pages <= alloc_pages), (
+                f"draft step {speculative_step_id} needs {step_spec_pages} pages "
+                f"but only {alloc_pages} are allocated"
+            )
 
             total_spec_pages = int(np.sum(step_spec_pages))
             dst_starts = _dp_starts(step_spec_pages, per_dp_dst_pages)
@@ -644,14 +733,15 @@ class FlashAttention(AttentionBackend):
             write_indices = np.repeat(dst_starts, repeats) + local_off
             gathered_locs = original_selected_cache_locs[gather_indices]
 
-            result_locs = np.zeros(TARGET_PADDING, dtype=original_selected_cache_locs.dtype)
+            result_locs = np.zeros(
+                per_dp_dst_pages * dp_size, dtype=original_selected_cache_locs.dtype
+            )
             result_locs[write_indices] = gathered_locs
             page_indices.append((result_locs // self.page_size).astype(np.int32))
 
         if batch.spec_algorithm.is_none():
             raise RuntimeError("should not reach here")
         assert isinstance(batch.spec_info_padded, EagleDraftInput)
-        topk = batch.speculative_eagle_topk
         cu_q_lens = np.tile(np.arange(0, per_dp_bs * topk + 1, topk, dtype=np.int32), dp_size)
         seq_2d = np.asarray(batch.seq_lens).reshape(dp_size, per_dp_bs)
         local_n = np.sum(seq_2d > 0, axis=1, dtype=np.int32)
@@ -679,6 +769,49 @@ class FlashAttention(AttentionBackend):
             )
             metadata.append(metadata_tmp)
         return metadata
+
+    def get_eagle_draft_decode_mask(
+        self,
+        batch: ModelWorkerBatch,
+        speculative_step_id: int,
+        parents_by_step,
+    ) -> jax.Array:
+        """Tree mask for one EAGLE draft-decode step, as `[rows, 1, W]` int32.
+
+        Each of a slot's ``topk`` rows is one branch: it sees the draft context
+        and its own ancestor in every earlier step's block, never a sibling.
+        ``parents_by_step[s]`` is the parent pointer array ``select_top_k_tokens``
+        produced at step ``s``. The mask is built on device from them, so the
+        draft loop does not wait for a step's forward to finish.
+
+        Rows follow the draft-decode ``cu_q_lens`` (``topk`` per slot, padding
+        included), which is slot order because padding slots trail the real
+        ones in every DP rank. ``W`` is sized for the round's last draft step,
+        so every step of a round shares one shape.
+        """
+        topk = batch.speculative_eagle_topk
+        seq_lens = np.asarray(batch.seq_lens)
+        dp_size = batch.dp_size
+        per_dp_bs = batch.per_dp_bs_size if dp_size > 1 else len(seq_lens)
+        assert _padding_trails(
+            seq_lens, dp_size, per_dp_bs
+        ), "draft-decode padding slots must trail the real slots in each DP rank"
+
+        last_step = max(batch.speculative_num_steps - 2, 0)
+        widest = _draft_decode_kv_lens(seq_lens, last_step, topk)
+        aligned_widest = ((widest + self.page_size - 1) // self.page_size) * self.page_size
+        replicated = NamedSharding(self.mesh, P())
+        context_lens = np.where(seq_lens > 0, seq_lens - 1, -1).astype(np.int32)
+        mask = _draft_decode_tree_mask(
+            jax.device_put(context_lens, replicated),
+            tuple(
+                jax.device_put(parents, replicated)
+                for parents in parents_by_step[1 : speculative_step_id + 1]
+            ),
+            topk=topk,
+            width=mask_row_width(aligned_widest),
+        )
+        return jax.device_put(mask, NamedSharding(self.mesh, P("data")))
 
     def tree_flatten(self):
         children = (self.forward_metadata,)
