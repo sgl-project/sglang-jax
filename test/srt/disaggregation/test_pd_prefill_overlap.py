@@ -9,6 +9,9 @@ from unittest.mock import Mock
 import pytest
 
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
+from sgl_jax.srt.disaggregation.encoder.scheduler_mixin import (
+    SchedulerDisaggregationEncoderMixin,
+)
 from sgl_jax.srt.disaggregation.prefill import (
     PendingPrefillResult,
     PrefillBootstrapQueue,
@@ -17,9 +20,10 @@ from sgl_jax.srt.disaggregation.prefill import (
 from sgl_jax.srt.managers import tp_worker_overlap_thread as worker_module
 
 
-class Harness(SchedulerDisaggregationPrefillMixin):
+class Harness(SchedulerDisaggregationPrefillMixin, SchedulerDisaggregationEncoderMixin):
     def __init__(self, chunk=True):
         self.server_args = NS(disaggregation_enable_chunk_prefill_transfer=chunk)
+        self.encoder_waiting = {}
         self.chunked_reqs = []
         self.disagg_prefill_queue = PrefillBootstrapQueue()
         self.disagg_kv_manager = Mock()
