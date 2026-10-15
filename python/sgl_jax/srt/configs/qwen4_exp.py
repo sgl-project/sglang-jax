@@ -336,7 +336,7 @@ class _Qwen4ExpTextConfig(PretrainedConfig):
 
     @property
     def linear_state_params(self):
-        """Sizing block for ``RecurrentStatePool`` over the GDN layers."""
+        """The recurrent (temporal) state RecurrentStatePool holds per request."""
         from sgl_jax.srt.mem_cache.recurrent_state_pool import (
             LinearRecurrentStateParams,
             recurrent_state_dtype,
@@ -351,6 +351,35 @@ class _Qwen4ExpTextConfig(PretrainedConfig):
             num_k_heads=self.linear_num_key_heads,
             head_k_dim=self.linear_key_head_dim,
         )
+
+    @property
+    def conv_state_specs(self):
+        """Named state specifications; consumers do not depend on their order."""
+        from sgl_jax.srt.mem_cache.recurrent_state_pool import (
+            LINEAR_CONV,
+            SHORT_CONV,
+            ConvStateSpec,
+        )
+
+        proj_size = self.linear_num_value_heads * self.linear_value_head_dim + 2 * (
+            self.linear_num_key_heads * self.linear_key_head_dim
+        )  # 48*128 + 2*16*128 = 10240
+        specs = [
+            ConvStateSpec(
+                LINEAR_CONV,
+                tuple(self.linear_layer_ids),
+                proj_size,
+                self.linear_conv_kernel_dim - 1,
+            )  # state_len 3
+        ]
+
+        shape = self.short_conv_state_shape
+        if shape is not None:
+            channels, state_len = shape  # 10240, (4-1)*3 = 9
+            specs.append(
+                ConvStateSpec(SHORT_CONV, tuple(self.short_conv_layer_ids), channels, state_len)
+            )
+        return tuple(specs)
 
 
 class Qwen4ExpConfig(PretrainedConfig):
