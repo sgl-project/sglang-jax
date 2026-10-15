@@ -98,6 +98,11 @@ class RpaCase(Enum):
             raise ValueError(f"Unsupported RPA case: {self}")
 
 
+def same_attention_chunk(q_positions, kv_positions, chunk_size):
+    """Chunk-local attention uses absolute sequence positions, not a rolling window."""
+    return q_positions // chunk_size == kv_positions // chunk_size
+
+
 def ref_ragged_paged_attention(
     queries: jax.Array,  # [padded_num_tokens, num_q_heads, head_dim]
     k_pages: jax.Array,  # [total_num_pages, page_size, num_kv_heads, head_dim]
@@ -118,6 +123,7 @@ def ref_ragged_paged_attention(
     xai_temperature_len: float | None = None,
     attention_sink: jax.Array | float | None = None,
     softmax_dtype: jnp.dtype | None = None,
+    attention_chunk_size: int | None = None,
 ):
     """Reference implementation for ragged paged attention."""
     if mask_value is None:
@@ -172,6 +178,8 @@ def ref_ragged_paged_attention(
             mask = jnp.zeros(attn.shape, dtype=jnp.bool_)
         if sliding_window is not None:
             mask = jnp.logical_or(mask, q_span - sliding_window >= kv_span)
+        if attention_chunk_size is not None:
+            mask |= ~same_attention_chunk(q_span, kv_span, attention_chunk_size)
         if soft_cap is not None:
             attn = soft_cap * jnp.tanh(attn / soft_cap)
 
@@ -377,6 +385,7 @@ def _ragged_paged_attention_kernel_loop(
     xai_temperature_len: float | None = None,
     softmax_dtype: jnp.dtype | None = None,
     static_q_len: int | None = None,
+    attention_chunk_size: int | None = None,
     bq_sz,  # bq fetch size
     bkv_sz,  # bkv prefetch size
     bq_csz,  # bq compute size
@@ -549,6 +558,13 @@ def _ragged_paged_attention_kernel_loop(
 
         if sliding_window is not None:
             mask = mask_and(mask, rebased_q_span(sliding_window) < k_span)
+        if attention_chunk_size is not None:
+            # Do not narrow absolute positions to int16: long contexts wrap at 32768.
+            absolute_q = processed_q_len + q_row.astype(jnp.int32)
+            absolute_k = processed_kv_len + k_span.astype(jnp.int32)
+            mask = mask_and(
+                mask, same_attention_chunk(absolute_q, absolute_k, attention_chunk_size)
+            )
 
         if mask is not None:
             s = jnp.where(mask, s, mask_value)
@@ -1715,6 +1731,7 @@ def get_vmem_limit():
         "causal",
         "sm_scale",
         "sliding_window",
+        "attention_chunk_size",
         "soft_cap",
         "mask_value",
         "q_scale",
@@ -1750,6 +1767,7 @@ def ragged_paged_attention(
     causal: int = 1,
     sm_scale: float = 1.0,
     sliding_window: int | None = None,
+    attention_chunk_size: int | None = None,
     soft_cap: float | None = None,
     mask_value: float | None = DEFAULT_MASK_VALUE,
     q_scale: float | None = None,
@@ -1789,6 +1807,7 @@ def ragged_paged_attention(
       causal: 1 for causal mask, 0 for custom mask.
       sm_scale: softmax scale applied to Q@K^T.
       sliding_window: sliding window size.
+      attention_chunk_size: fixed, sequence-aligned local chunks; retains the full KV cache.
       soft_cap: logit soft cap.
       mask_value: mask value for masked positions.
       q_scale: query scale.
@@ -1806,6 +1825,11 @@ def ragged_paged_attention(
       (output, updated_kv_cache_fused)
     """
     q, k, v = queries, keys, values
+    if attention_chunk_size is not None:
+        if attention_chunk_size <= 0:
+            raise ValueError("attention_chunk_size must be positive")
+        if not causal or custom_mask is not None:
+            raise NotImplementedError("Chunk-local attention requires ordinary causal decoding")
 
     if vmem_limit_bytes is None:
         vmem_limit_bytes = get_vmem_limit()
@@ -2003,6 +2027,7 @@ def ragged_paged_attention(
                 causal=use_causal_mask,
                 sm_scale=sm_scale,
                 sliding_window=sliding_window,
+                attention_chunk_size=attention_chunk_size,
                 soft_cap=soft_cap,
                 mask_value=mask_value,
                 q_scale=q_scale,

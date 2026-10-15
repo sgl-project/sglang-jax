@@ -309,6 +309,8 @@ class LlamaDecoderLayer(nnx.Module):
 
 
 class LlamaModel(nnx.Module):
+    layer_class = LlamaDecoderLayer
+
     def __init__(
         self,
         config: LlamaConfig,
@@ -336,7 +338,7 @@ class LlamaModel(nnx.Module):
 
             self.layers = nnx.data(
                 [
-                    LlamaDecoderLayer(
+                    self.layer_class(
                         config=config,
                         layer_id=i,
                         dtype=dtype,
@@ -389,6 +391,8 @@ class LlamaModel(nnx.Module):
 
 
 class LlamaForCausalLM(nnx.Module):
+    model_class = LlamaModel
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -409,7 +413,7 @@ class LlamaForCausalLM(nnx.Module):
                 )
             logger.info("LlamaForCausalLM using dtype_config: %s", dtype_config)
 
-        self.model = LlamaModel(
+        self.model = self.model_class(
             config, dtype=self.dtype, dtype_config=dtype_config.get_config("model"), mesh=mesh
         )
 
