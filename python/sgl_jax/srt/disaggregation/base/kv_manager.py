@@ -14,7 +14,10 @@ import abc
 import enum
 import logging
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from sgl_jax.srt.disaggregation.base.transfer import TransferPayload
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +115,17 @@ class KVSender(abc.ABC):
     """Prefill-side per-request handle."""
 
     @abc.abstractmethod
-    def init(self, kv_indices, transfer_id: str | None = None) -> None: ...
+    def init(self, kv_indices: Any, transfer_id: str | None = None) -> None: ...
+
+    def attach_payload(
+        self,
+        payload: TransferPayload,
+        *,
+        use_d2h_staging: bool = False,
+        buffer_id: int | None = None,
+    ) -> None:
+        """Attach a structured transfer payload (``kv``, optional ``recurrent_state``, ``conv_state``)."""
+        raise NotImplementedError(f"{type(self).__name__} does not support attach_payload()")
 
     @abc.abstractmethod
     def send(self) -> None: ...
@@ -138,14 +151,18 @@ class KVReceiver(abc.ABC):
     """Decode-side per-request handle."""
 
     @abc.abstractmethod
-    def init(self, p_metadata) -> None: ...
+    def init(self, p_metadata: Any) -> None: ...
 
     @abc.abstractmethod
     def poll(self) -> KVPoll: ...
 
     @abc.abstractmethod
-    def commit(self, install: Callable[[Any], None]) -> None:
-        """Make a successful receive visible to the decode scheduler."""
+    def commit(self, install: Callable[[TransferPayload], None]) -> None:
+        """Make a successful receive visible to the decode scheduler.
+
+        ``install`` is invoked with the received ``TransferPayload`` mapping
+        containing ``"kv"`` and optional ``"recurrent_state"`` / ``"conv_state"``.
+        """
 
     @abc.abstractmethod
     def clear(self) -> None:

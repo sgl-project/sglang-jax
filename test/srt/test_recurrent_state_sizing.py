@@ -274,6 +274,38 @@ class TestRecurrentStateConstraints(unittest.TestCase):
         sa = _server_args(hicache_storage="disable")
         _enforce_recurrent_state_server_constraints(sa)  # no raise
 
+    def test_disaggregation_mode_requires_explicit_disable_radix_cache(self):
+        sa = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="prefill",
+            disaggregation_bootstrap_url="http://127.0.0.1:8998",
+            page_size=128,
+            disable_radix_cache=False,
+        )
+        with self.assertRaisesRegex(ValueError, "--disable-radix-cache"):
+            _enforce_recurrent_state_server_constraints(sa)
+
+        sa_ok = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="prefill",
+            disaggregation_bootstrap_url="http://127.0.0.1:8998",
+            page_size=128,
+            disable_radix_cache=True,
+        )
+        _enforce_recurrent_state_server_constraints(sa_ok)
+
+    def test_disaggregation_mode_rejects_unified_radix_tree_on_hybrid_recurrent(self):
+        sa = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_bootstrap_url="http://127.0.0.1:8998",
+            page_size=128,
+            enable_unified_radix_tree=True,
+            disable_radix_cache=False,
+        )
+        with self.assertRaises(ValueError):
+            _enforce_recurrent_state_server_constraints(sa)
+
 
 class TestResolveMaxNumReqsHeadroom(unittest.TestCase):
     """``_resolve_max_num_reqs`` back-cap: the auto/ratio path enforces snapshot

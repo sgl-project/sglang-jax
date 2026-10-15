@@ -139,6 +139,22 @@ def _debug_metadata(payload: dict[str, Any], num_blocks: int) -> dict[str, objec
     }
 
 
+def recurrent_transfer_id(transfer_id: str, group: str) -> str:
+    """Child transfer ID of one recurrent-state group read (e.g. ``"<id>#conv_state"``)."""
+
+    return f"{transfer_id}#{group}"
+
+
+@dataclass(frozen=True)
+class RaidenRecurrentRead:
+    """One slot read on a recurrent-state Raiden group (block == rank-local slot)."""
+
+    group: str
+    remote_endpoint: object
+    remote_slot: int
+    local_slot: int
+
+
 @dataclass(frozen=True)
 class RaidenMetadata:
     uuid: str
@@ -151,6 +167,7 @@ class RaidenMetadata:
     decode_dp_rank: int = 0
     direct_commit: Callable[[Mapping[str, object] | None], None] | None = None
     expected_debug: Mapping[str, object] | None = None
+    recurrent_reads: tuple[RaidenRecurrentRead, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -263,15 +280,35 @@ class RaidenTransferKVManager(CommonKVManager):
         control_port = int(str(endpoints[0]["endpoint"]).rsplit(":", 1)[1])
         if not 0 < control_port <= 65535:
             raise RuntimeError("Raiden did not publish a valid control endpoint")
-        return {
+        metadata: dict[str, object] = {
             "engine": self.engine_name,
             "dp_rank": int(dp_rank),
             "dp_size": self.wrapper.dp_size,
             "local_control_port": control_port,
             "endpoints": endpoints,
         }
+        if self.recurrent_groups:
+            recurrent_endpoints = self.wrapper.recurrent_endpoints_by_dp_rank.get(int(dp_rank))
+            if not recurrent_endpoints or set(recurrent_endpoints) != set(self.recurrent_groups):
+                raise RuntimeError(
+                    f"Raiden did not publish recurrent endpoints for dp_rank={dp_rank}"
+                )
+            metadata["recurrent_endpoints"] = recurrent_endpoints
+        return metadata
+
+    @property
+    def recurrent_groups(self) -> tuple[str, ...]:
+        """Recurrent-state engine groups (empty for non-hybrid models)."""
+
+        return tuple(getattr(self.wrapper, "recurrent_groups", ()) or ())
 
     def start_prefill(self, context: PrefillTransferContext) -> PrefillTransfer:
+        if bool(self.recurrent_groups) != (context.recurrent_slot_idx is not None):
+            raise ValueError(
+                "Raiden recurrent state mismatch: "
+                f"engine_groups={self.recurrent_groups}, "
+                f"recurrent_slot_idx={context.recurrent_slot_idx}"
+            )
         sender = self.create_sender(context.req_id)
         try:
             sender.init(None, transfer_id=context.transfer_id)
@@ -280,6 +317,7 @@ class RaidenTransferKVManager(CommonKVManager):
                 block_ids,
                 bootstrap_room=context.bootstrap_room,
                 dp_rank=context.dp_rank,
+                recurrent_slot=context.recurrent_slot_idx,
             )
             from sgl_jax.srt.disaggregation.debug_utils import kv_debug_enabled
 
@@ -465,6 +503,10 @@ class RaidenTransferKVManager(CommonKVManager):
 
             receiver = self.create_receiver(context.req_id)
             if self.enable_chunk_prefill_transfer:
+                if context.recurrent_slot_idx is not None:
+                    raise ValueError(
+                        "Raiden chunk prefill transfer does not support recurrent state"
+                    )
                 if expected_total_pages <= 0:
                     raise ValueError("Raiden chunk metadata is missing expected_total_pages")
                 if expected_total_pages != len(local_block_ids):
@@ -509,6 +551,12 @@ class RaidenTransferKVManager(CommonKVManager):
                         f"Raiden local block count mismatch: remote={len(remote_block_ids)}, "
                         f"local={len(local_block_ids)}"
                     )
+                recurrent_reads = self._resolve_recurrent_reads(
+                    context,
+                    metadata,
+                    peer_metadata,
+                    peer_host=peer_host,
+                )
                 receiver.init(
                     RaidenMetadata(
                         uuid=context.transfer_id,
@@ -525,6 +573,7 @@ class RaidenTransferKVManager(CommonKVManager):
                             if isinstance(metadata.get("kv_debug"), Mapping)
                             else None
                         ),
+                        recurrent_reads=recurrent_reads,
                     )
                 )
             with self._decode_metadata_lock:
@@ -536,20 +585,72 @@ class RaidenTransferKVManager(CommonKVManager):
                     receiver.fail(reason="receiver_init")
             raise
 
+    def _resolve_recurrent_reads(
+        self,
+        context: DecodeTransferContext,
+        transfer_metadata: Mapping[str, object],
+        peer_metadata: Mapping[str, object],
+        *,
+        peer_host: str,
+    ) -> tuple[RaidenRecurrentRead, ...]:
+        """Map the prefill request's recurrent slot onto this request's slot per group."""
+
+        local_slot = context.recurrent_slot_idx
+        remote_slot = transfer_metadata.get("remote_recurrent_slot")
+        groups = self.recurrent_groups
+        if local_slot is None and remote_slot is None and not groups:
+            return ()
+        if local_slot is None or remote_slot is None or not groups:
+            raise ValueError(
+                "Raiden recurrent state mismatch: "
+                f"decode_slot={local_slot}, prefill_slot={remote_slot}, "
+                f"decode_groups={groups}"
+            )
+        peer_groups = peer_metadata.get("recurrent_endpoints")
+        if not isinstance(peer_groups, Mapping) or set(peer_groups) != set(groups):
+            raise ValueError(
+                "Raiden recurrent group mismatch: "
+                f"prefill={sorted(peer_groups) if isinstance(peer_groups, Mapping) else None}, "
+                f"decode={sorted(groups)}"
+            )
+        local_groups = self.wrapper.recurrent_endpoints_by_dp_rank.get(context.decode_dp_rank, {})
+        reads = []
+        for group in groups:
+            peer_endpoints = _endpoint_descriptors(peer_groups[group], peer_host=peer_host)
+            local_endpoints = list(local_groups.get(group, ()))
+            _validate_endpoint_topology(peer_endpoints, local_endpoints)
+            reads.append(
+                RaidenRecurrentRead(
+                    group=group,
+                    remote_endpoint=(
+                        peer_endpoints[0]["endpoint"]
+                        if len(peer_endpoints) == 1
+                        else peer_endpoints
+                    ),
+                    remote_slot=int(remote_slot),
+                    local_slot=int(local_slot),
+                )
+            )
+        return tuple(reads)
+
     def register_read(
         self,
         req_id: str,
         transfer_id: str,
         block_ids: list[int],
         dp_rank: int = 0,
+        group: str | None = None,
     ) -> bool:
         if not block_ids:
             raise ValueError("Raiden transfer requires at least one KV block")
+        kwargs: dict[str, object] = {"dp_rank": dp_rank}
+        if group is not None:
+            kwargs["group"] = group
         return self.wrapper.register_read(
             req_id,
             _uuid_to_int(transfer_id),
             block_ids,
-            dp_rank=dp_rank,
+            **kwargs,
         )
 
     def publish_transfer(
@@ -565,12 +666,16 @@ class RaidenTransferKVManager(CommonKVManager):
         num_chunks: int = 1,
         chunk_page_offset: int = 0,
         expected_total_pages: int = 0,
+        recurrent_slot: int | None = None,
     ) -> None:
         if bootstrap_room is None:
             return
         transport_metadata: dict[str, object] = {"remote_block_ids": list(block_ids)}
         if debug_metadata is not None:
             transport_metadata["kv_debug"] = dict(debug_metadata)
+        if recurrent_slot is not None:
+            # Rank-local slot on the prefill DP rank's recurrent Raiden engines.
+            transport_metadata["remote_recurrent_slot"] = int(recurrent_slot)
         self.bootstrap_client.register_transfer(
             bootstrap_room,
             transfer_id,
@@ -663,7 +768,7 @@ class RaidenTransferKVManager(CommonKVManager):
         with self._poll_lock:
             return req_id in self._done_sending
 
-    def sender_failed(self, req_id: str, dp_rank: int) -> bool:
+    def sender_failed(self, req_id: str, dp_rank: int, group: str | None = None) -> bool:
         with self._poll_lock:
             failed = req_id in self._failed_receiving
         if not failed:
@@ -675,6 +780,9 @@ class RaidenTransferKVManager(CommonKVManager):
         # TODO: expose per-shard terminal/cancellation acknowledgement in the
         # native wrapper. Multi-endpoint failures can retain pages indefinitely;
         # an ack timeout alone does not prove the remaining readers are done.
+        if group is not None:
+            endpoints = self.wrapper.recurrent_endpoints_by_dp_rank.get(dp_rank, {}).get(group, ())
+            return len(endpoints) == 1
         return len(self.wrapper.endpoints_by_dp_rank.get(dp_rank, ())) == 1
 
     def receiver_state(self, req_id: str) -> str | None:
@@ -722,6 +830,10 @@ class RaidenTransferKVSender(KVSender, StateHolder):
         self._pending_chunks: dict[int, _PendingSenderChunk] = {}
         self._num_chunks: int | None = None
         self._expected_total_pages: int | None = None
+        # Rank-local prefill recurrent slot (hybrid models only).
+        self._recurrent_slot: int | None = None
+        # (group, child_transfer_id) recurrent reads registered with the engine.
+        self._registered_recurrent: list[tuple[str, str]] = []
 
     @property
     def uuid(self) -> str:
@@ -758,12 +870,24 @@ class RaidenTransferKVSender(KVSender, StateHolder):
         *,
         bootstrap_room: int | None,
         dp_rank: int = 0,
+        recurrent_slot: int | None = None,
     ) -> None:
         if self._block_ids is not None:
             raise RuntimeError(f"sender {self._req_id!r} is already configured")
         self._block_ids = list(block_ids)
         self._bootstrap_room = bootstrap_room
         self._dp_rank = int(dp_rank)
+        self._recurrent_slot = None if recurrent_slot is None else int(recurrent_slot)
+
+    def _recurrent_child_ids(self) -> list[tuple[str, str]]:
+        """``(group, child_transfer_id)`` for every recurrent group read of this request."""
+
+        if self._recurrent_slot is None:
+            return []
+        return [
+            (group, recurrent_transfer_id(self.uuid, group))
+            for group in self._manager.recurrent_groups
+        ]
 
     def attach_debug_metadata(self, metadata: Mapping[str, object]) -> None:
         self._debug_metadata = dict(metadata)
@@ -897,6 +1021,7 @@ class RaidenTransferKVSender(KVSender, StateHolder):
     def send(self) -> None:
         if self._block_ids is None:
             raise RuntimeError(f"sender {self._req_id!r} has no block IDs")
+        recurrent_children = self._recurrent_child_ids()
         with self._state_lock:
             needed = self._manager.register_read(
                 self.uuid,
@@ -905,15 +1030,43 @@ class RaidenTransferKVSender(KVSender, StateHolder):
                 dp_rank=self._dp_rank,
             )
             self._transition_to(KVPoll.TRANSFERRING)
-            if needed:
+            if needed or recurrent_children:
                 self._timer = time_phase("ack", "prefill")
                 self._timer.__enter__()
                 self._transfer_started_at = time.monotonic()
-        if not needed:
+        if not needed and not recurrent_children:
             # tpu-raiden@8756479 register_read documents False as "nothing to
             # transfer"; NotifyForRead does not use it for slot admission.
             self._finish(KVPoll.SUCCESS, "raiden_transfer_not_needed")
             return
+        if not needed:
+            # Hybrid requests always pull the full KV together with the
+            # recurrent slot; a declined KV read means the peers disagree.
+            logger.error("Raiden declined KV read for hybrid request %s", self._req_id)
+            self._finish(KVPoll.FAILED, "raiden_kv_not_needed")
+            return
+        registered: list[tuple[str, str]] = []
+        try:
+            for group, child_id in recurrent_children:
+                if not self._manager.register_read(
+                    child_id,
+                    child_id,
+                    [int(self._recurrent_slot)],
+                    dp_rank=self._dp_rank,
+                    group=group,
+                ):
+                    raise RuntimeError(
+                        f"Raiden declined recurrent read for {child_id!r} (group={group})"
+                    )
+                registered.append((group, child_id))
+        except Exception:  # noqa: BLE001
+            logger.exception("Raiden recurrent register_read failed for %s", self._req_id)
+            with self._state_lock:
+                self._registered_recurrent = registered
+            self.request_abort("raiden_recurrent_register")
+            return
+        with self._state_lock:
+            self._registered_recurrent = registered
         try:
             self._manager.publish_transfer(
                 self.uuid,
@@ -921,6 +1074,7 @@ class RaidenTransferKVSender(KVSender, StateHolder):
                 self._bootstrap_room,
                 self._debug_metadata,
                 dp_rank=self._dp_rank,
+                recurrent_slot=self._recurrent_slot,
             )
         except Exception:  # noqa: BLE001
             logger.exception("Raiden transfer metadata publish failed for %s", self._req_id)
@@ -969,9 +1123,23 @@ class RaidenTransferKVSender(KVSender, StateHolder):
                     self._transfer_started_at = None
                 return KVPoll.TRANSFERRING
             return self._finish(KVPoll.SUCCESS, "raiden_chunks_done_sending")
-        if self._manager.sender_failed(self.uuid, self._dp_rank):
+        with self._state_lock:
+            reads = [(None, self.uuid), *self._registered_recurrent]
+        failed = [
+            (
+                self._manager.sender_failed(transfer_id, self._dp_rank)
+                if group is None
+                else self._manager.sender_failed(transfer_id, self._dp_rank, group=group)
+            )
+            for group, transfer_id in reads
+        ]
+        if any(failed):
             self.request_abort("raiden_failed_sending")
-        elif not self._manager.sender_done(self.uuid):
+        if not all(
+            is_failed or self._manager.sender_done(transfer_id)
+            for is_failed, (_, transfer_id) in zip(failed, reads)
+        ):
+            # Pages stay pinned until every engine read of this request settles.
             return KVPoll.TRANSFERRING
         # Native completion permits release, but must not erase an abort reason.
         reason = self._pending_failure_reason
@@ -1025,7 +1193,7 @@ class RaidenTransferKVSender(KVSender, StateHolder):
             forget_ids = (
                 [chunk_transfer_id(self.uuid, k) for k in self._started_chunks]
                 if self._chunk_mode
-                else [self.uuid]
+                else [self.uuid, *(child for _, child in self._registered_recurrent)]
             )
         for transfer_id in forget_ids:
             self._manager.forget(transfer_id)
@@ -1066,6 +1234,8 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
         self._metadata_future: Future | None = None
         self._next_metadata_poll_at = 0.0
         self._metadata_poll_interval = _METADATA_MIN_POLL_SECONDS
+        # Recurrent-group child transfer ids whose start_read succeeded.
+        self._started_recurrent: list[str] = []
 
     @property
     def transfer_started_at(self) -> float | None:
@@ -1119,15 +1289,22 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
                 except Exception:  # noqa: BLE001
                     logger.exception("Raiden start_read() failed for %s", self._req_id)
                     self._finish(KVPoll.FAILED, "raiden_start_read")
+                    return self.state
+                self._start_recurrent_reads(self._metadata)
             return self.state
 
         if state == KVPoll.TRANSFERRING:
             assert self._metadata is not None
             self._manager.poll_engine()
-            remote_state = self._manager.receiver_state(self._metadata.uuid)
-            if remote_state is None:
+            with self._state_lock:
+                read_ids = [self._metadata.uuid, *self._started_recurrent]
+            states = [self._manager.receiver_state(read_id) for read_id in read_ids]
+            if any(value == "failed" for value in states):
+                self.request_abort("raiden_failed_receiving")
+            if any(value is None for value in states):
+                # Decode pages/slots stay owned until every engine read settles.
                 return self.state
-            if remote_state == "failed":
+            if any(value == "failed" for value in states):
                 return self._finish(
                     KVPoll.FAILED,
                     self._pending_failure_reason or "raiden_failed_receiving",
@@ -1138,6 +1315,33 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
                 reason or "raiden_done_receiving",
             )
         return self.state
+
+    def _start_recurrent_reads(self, metadata: RaidenMetadata) -> None:
+        """Start one single-slot read per recurrent group after the KV read."""
+
+        for read in metadata.recurrent_reads:
+            child_id = recurrent_transfer_id(metadata.uuid, read.group)
+            try:
+                self._manager.wrapper.start_read(
+                    child_id,
+                    _uuid_to_int(child_id),
+                    read.remote_endpoint,
+                    [int(read.remote_slot)],
+                    [int(read.local_slot)],
+                    decode_dp_rank=metadata.decode_dp_rank,
+                    group=read.group,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Raiden recurrent start_read() failed for %s (group=%s)",
+                    self._req_id,
+                    read.group,
+                )
+                # The KV read is already in flight; fail once it settles.
+                self.request_abort("raiden_recurrent_start_read")
+                return
+            with self._state_lock:
+                self._started_recurrent.append(child_id)
 
     def _poll_chunked(self) -> KVPoll:
         metadata = self._metadata
@@ -1501,7 +1705,7 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
             forget_ids = (
                 [chunk_transfer_id(metadata.base_uuid, k) for k in self._started_chunks]
                 if isinstance(metadata, RaidenChunkedMetadata)
-                else [transfer_id]
+                else [transfer_id, *self._started_recurrent]
             )
         if metadata_future is not None:
             metadata_future.cancel()

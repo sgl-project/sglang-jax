@@ -140,6 +140,14 @@ def _tree_cache_supports_swa(tree_cache: object) -> bool:
     return bool(supports_swa()) if callable(supports_swa) else False
 
 
+def _recurrent_state_pool_or_none(scheduler: object):
+    """Return the hybrid model's ``RecurrentStatePool``, or ``None`` for pure-KV models."""
+    from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
+
+    rsp = getattr(getattr(scheduler, "req_to_token_pool", None), "recurrent_state_pool", None)
+    return rsp if isinstance(rsp, RecurrentStatePool) else None
+
+
 def _create_raiden_backend(
     scheduler: Scheduler,
     server_args: ServerArgs,
@@ -164,6 +172,11 @@ def _create_raiden_backend(
         and _tree_cache_supports_swa(scheduler.tree_cache)
     ):
         raise ValueError("Raiden chunk prefill transfer does not support sliding-window KV")
+    rsp = _recurrent_state_pool_or_none(scheduler)
+    if chunk_transfer_enabled and rsp is not None:
+        # Recurrent state is only final after the last chunk; per-chunk reads
+        # would ship intermediate state.
+        raise ValueError("Raiden chunk prefill transfer does not support hybrid recurrent models")
     if bootstrap_client is None or not hasattr(bootstrap_client, "require_capability"):
         raise RuntimeError("Raiden requires a bootstrap client with capability probing")
     bootstrap_client.require_capability("transfer_metadata")
@@ -204,6 +217,23 @@ def _create_raiden_backend(
         dp_size=server_args.dp_size,
         timeout_s=float(server_args.disaggregation_pull_timeout_seconds),
     )
+    if rsp is not None:
+        from sgl_jax.srt.disaggregation.common.recurrent_state import (
+            CONV_STATE_KEY,
+            RECURRENT_STATE_KEY,
+        )
+
+        # Temporal and conv state have per-layer shapes unlike KV pages, so
+        # each is registered with its own engine whose "block" is one slot.
+        wrapper.start_recurrent(
+            {
+                RECURRENT_STATE_KEY: list(rsp.recurrent_buffers),
+                CONV_STATE_KEY: [buf for inner in rsp.conv_buffers for buf in inner],
+            },
+            num_slots=num_slots,
+            dp_size=server_args.dp_size,
+            timeout_s=float(server_args.disaggregation_pull_timeout_seconds),
+        )
     logger.info(
         "Raiden backend ready: max_blocks=%d slots_per_rank=%d layers=%d "
         "dp_size=%d chunk_transfer=%s",

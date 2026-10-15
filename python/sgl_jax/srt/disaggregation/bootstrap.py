@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from pydantic import Field as PydanticField
 
 from sgl_jax.srt.disaggregation.base.transfer import (
+    RecurrentStateSpec,
     chunk_transfer_id,
     parse_chunk_transfer_id,
 )
@@ -68,6 +69,7 @@ class PrefillInfo:
     kv_dtype: str = ""
     chunk_prefill_transfer: bool = False
     transport_metadata: dict[str, object] = field(default_factory=lambda: {"engine": "jax"})
+    recurrent_state_spec: RecurrentStateSpec | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -109,6 +111,114 @@ def resolve_kv_dtype_name(dtype: object) -> str:
         return str(dtype)
 
 
+def _coerce_recurrent_spec(
+    spec_or_pool: object | None,
+) -> RecurrentStateSpec | None:
+    if spec_or_pool is None:
+        return None
+    if isinstance(spec_or_pool, dict):
+        return spec_or_pool
+    from sgl_jax.srt.mem_cache.recurrent_state_pool import get_recurrent_state_spec
+
+    return get_recurrent_state_spec(spec_or_pool)
+
+
+def _validate_recurrent_pool_sizing(role: str, spec: RecurrentStateSpec) -> None:
+    has_sizing = any(
+        k in spec and spec.get(k) is not None
+        for k in ("size", "dp_size", "slots_per_rank", "total_slots")
+    )
+    if not has_sizing:
+        return
+
+    dp_size = int(spec.get("dp_size", 1) or 0)
+    size = int(spec.get("size", 0) or 0)
+    slots_per_rank = int(spec.get("slots_per_rank", 0) or 0)
+    total_slots = int(spec.get("total_slots", 0) or 0)
+
+    if dp_size <= 0:
+        raise ValueError(f"{role} recurrent_state_spec invalid dp_size={dp_size} (must be >= 1)")
+    if size <= 0 or size % dp_size != 0:
+        raise ValueError(
+            f"{role} recurrent_state_spec invalid size={size} for dp_size={dp_size} "
+            "(must be > 0 and divisible by dp_size)"
+        )
+    expected_slots_per_rank = size // dp_size
+    if slots_per_rank <= 0 or slots_per_rank != expected_slots_per_rank:
+        raise ValueError(
+            f"{role} recurrent_state_spec invalid slots_per_rank={slots_per_rank} "
+            f"(expected {expected_slots_per_rank} for size={size}, dp_size={dp_size})"
+        )
+    expected_total_slots = size + dp_size
+    if total_slots <= 0 or total_slots != expected_total_slots:
+        raise ValueError(
+            f"{role} recurrent_state_spec invalid total_slots={total_slots} "
+            f"(expected {expected_total_slots} for size={size}, dp_size={dp_size})"
+        )
+
+
+def validate_recurrent_state_compat(
+    prefill_spec_or_pool: object | None,
+    decode_spec_or_pool: object | None,
+) -> None:
+    """Validate that Prefill and Decode recurrent state layouts and buffer sizes are compatible."""
+    p_spec = _coerce_recurrent_spec(prefill_spec_or_pool)
+    d_spec = _coerce_recurrent_spec(decode_spec_or_pool)
+
+    if p_spec is None and d_spec is None:
+        return
+
+    if bool(p_spec) != bool(d_spec):
+        raise ValueError(
+            "prefill/decode recurrent state mode mismatch: "
+            f"prefill has_recurrent_state={bool(p_spec)}, "
+            f"decode has_recurrent_state={bool(d_spec)}"
+        )
+
+    _validate_recurrent_pool_sizing("prefill", p_spec)
+    _validate_recurrent_pool_sizing("decode", d_spec)
+
+    p_layers = int(p_spec.get("num_layers", 0) or 0)
+    d_layers = int(d_spec.get("num_layers", 0) or 0)
+    if p_layers <= 0 or d_layers <= 0 or p_layers != d_layers:
+        raise ValueError(
+            "prefill/decode recurrent layer count mismatch: "
+            f"prefill num_layers={p_layers}, decode num_layers={d_layers}"
+        )
+
+    p_rec_shape = [int(x) for x in (p_spec.get("recurrent_shape") or [])]
+    d_rec_shape = [int(x) for x in (d_spec.get("recurrent_shape") or [])]
+    if not p_rec_shape or not d_rec_shape or p_rec_shape != d_rec_shape:
+        raise ValueError(
+            "prefill/decode recurrent_state shape mismatch: "
+            f"prefill={tuple(p_rec_shape)}, decode={tuple(d_rec_shape)}"
+        )
+
+    p_conv_shape = [int(x) for x in (p_spec.get("conv_shape") or [])]
+    d_conv_shape = [int(x) for x in (d_spec.get("conv_shape") or [])]
+    if not p_conv_shape or not d_conv_shape or p_conv_shape != d_conv_shape:
+        raise ValueError(
+            "prefill/decode conv_state shape mismatch: "
+            f"prefill={tuple(p_conv_shape)}, decode={tuple(d_conv_shape)}"
+        )
+
+    p_temp_dtype = str(p_spec.get("temporal_dtype", "") or "")
+    d_temp_dtype = str(d_spec.get("temporal_dtype", "") or "")
+    if (p_temp_dtype or d_temp_dtype) and p_temp_dtype != d_temp_dtype:
+        raise ValueError(
+            "prefill/decode recurrent temporal_dtype mismatch: "
+            f"prefill={p_temp_dtype!r}, decode={d_temp_dtype!r}"
+        )
+
+    p_conv_dtype = str(p_spec.get("conv_dtype", "") or "")
+    d_conv_dtype = str(d_spec.get("conv_dtype", "") or "")
+    if (p_conv_dtype or d_conv_dtype) and p_conv_dtype != d_conv_dtype:
+        raise ValueError(
+            "prefill/decode recurrent conv_dtype mismatch: "
+            f"prefill={p_conv_dtype!r}, decode={d_conv_dtype!r}"
+        )
+
+
 def check_prefill_compat(
     info: dict[str, object],
     *,
@@ -118,6 +228,7 @@ def check_prefill_compat(
     expected_dp_rank: int | None = None,
     expected_dp_size: int | None = None,
     expected_chunk_prefill_transfer: bool | None = None,
+    local_recurrent_state_spec: RecurrentStateSpec | None = None,
 ) -> None:
     """Raise ``ValueError`` if the prefill peer's KV layout is incompatible.
 
@@ -170,6 +281,9 @@ def check_prefill_compat(
                 f"prefill={peer_chunk_prefill_transfer}, "
                 f"decode={expected_chunk_prefill_transfer}"
             )
+    peer_recurrent_spec = info.get("recurrent_state_spec")
+    if peer_recurrent_spec is not None or local_recurrent_state_spec is not None:
+        validate_recurrent_state_compat(peer_recurrent_spec, local_recurrent_state_spec)
 
 
 class RegisterPrefillRequest(BaseModel):
@@ -187,6 +301,7 @@ class RegisterPrefillRequest(BaseModel):
     kv_dtype: str = ""
     chunk_prefill_transfer: bool = False
     transport_metadata: dict[str, object] = PydanticField(default_factory=lambda: {"engine": "jax"})
+    recurrent_state_spec: RecurrentStateSpec | None = None
 
 
 class RegisterTransferRequest(BaseModel):
@@ -702,6 +817,7 @@ class BootstrapClient:
         kv_dtype: str = "",
         chunk_prefill_transfer: bool = False,
         transport_metadata: dict[str, object] | None = None,
+        recurrent_state_spec: RecurrentStateSpec | None = None,
     ) -> None:
         payload = {
             "bootstrap_key": bootstrap_key,
@@ -718,6 +834,7 @@ class BootstrapClient:
             "kv_dtype": kv_dtype,
             "chunk_prefill_transfer": bool(chunk_prefill_transfer),
             "transport_metadata": transport_metadata or {"engine": "jax"},
+            "recurrent_state_spec": recurrent_state_spec,
         }
         last_err: Exception | None = None
         for attempt in range(self._register_retries):

@@ -133,6 +133,22 @@ def _enforce_recurrent_state_server_constraints(server_args, is_lightning: bool 
     """Assert server constraints for hybrid recurrent state models."""
     if server_args.attention_backend == "tt" and server_args.enable_mixed_chunk:
         raise ValueError("TT recurrent attention does not support --enable-mixed-chunk")
+    if getattr(server_args, "disaggregation_mode", "null") != "null":
+        if server_args.enable_recurrent_extra_buffer:
+            raise ValueError(
+                "--enable-recurrent-extra-buffer is not supported with --disaggregation-mode"
+            )
+        if server_args.enable_unified_radix_tree:
+            raise ValueError(
+                "--enable-unified-radix-tree is not supported for hybrid recurrent models "
+                "with --disaggregation-mode; use --disable-radix-cache."
+            )
+        if not server_args.disable_radix_cache:
+            raise ValueError(
+                "Hybrid recurrent state models require --disable-radix-cache when "
+                "--disaggregation-mode is set."
+            )
+        return
     if server_args.enable_recurrent_extra_buffer:
         # GLA/Lightning decode is a fused Pallas kernel that cannot add a masked
         # recurrent track scatter, so the extra-buffer path is unsupported. Reject

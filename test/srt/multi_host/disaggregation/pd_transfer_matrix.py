@@ -49,6 +49,7 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
 from sgl_jax.srt.disaggregation.common.zmq_notifier import ZmqPullNotifier
+from sgl_jax.srt.disaggregation.host_ip import format_host_port
 from sgl_jax.srt.disaggregation.jax_transfer.conn import (
     JaxTransferKVManager,
     JaxTransferKVReceiver,
@@ -208,12 +209,20 @@ def _print_cell_result(
 # --- control channel --------------------------------------------------------
 
 
+_host_port = format_host_port  # IPv6-aware host:port; also imported by pd_transfer_smoke.py
+
+
 def _accept_one(host: str, port: int) -> socket.socket:
-    listen = socket.socket()
+    host = host.strip("[]")
+    # Resolve the family from the address so IPv6 hosts work too.
+    family, socktype, proto, _, sockaddr = socket.getaddrinfo(
+        host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
+    )[0]
+    listen = socket.socket(family, socktype, proto)
     listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listen.bind((host, port))
+    listen.bind(sockaddr)
     listen.listen(1)
-    print(f"[ctl] waiting for D on {host}:{port}", flush=True)
+    print(f"[ctl] waiting for D on {_host_port(host, port)}", flush=True)
     conn, peer = listen.accept()
     print(f"[ctl] D connected from {peer}", flush=True)
     listen.close()
@@ -221,13 +230,13 @@ def _accept_one(host: str, port: int) -> socket.socket:
 
 
 def _connect(host: str, port: int, timeout_s: float = 120.0) -> socket.socket:
+    host = host.strip("[]")
     deadline = time.perf_counter() + timeout_s
     last_err: Exception = RuntimeError("no attempt yet")
     while time.perf_counter() < deadline:
         try:
-            s = socket.socket()
-            s.settimeout(10.0)
-            s.connect((host, port))
+            # create_connection resolves the address family (IPv4 or IPv6).
+            s = socket.create_connection((host, port), timeout=10.0)
             s.settimeout(None)
             return s
         except (TimeoutError, ConnectionRefusedError) as e:
@@ -410,12 +419,12 @@ def _decode(args: argparse.Namespace) -> int:
     rx_buf = bytearray()
     handshake = _read_line(ctl, rx_buf)
     p_host, p_transfer_port, p_side_channel_port, p_use_d2h = handshake.split()
-    p_transfer_addr = f"{p_host}:{p_transfer_port}"
+    p_transfer_addr = _host_port(p_host, p_transfer_port)
     p_side_channel_port_int = int(p_side_channel_port)
     use_d2h = bool(int(p_use_d2h))
     print(
         f"[D] handshake: p_transfer={p_transfer_addr} "
-        f"p_side_channel={p_host}:{p_side_channel_port_int} "
+        f"p_side_channel={_host_port(p_host, p_side_channel_port_int)} "
         f"use_d2h={use_d2h}",
         flush=True,
     )
