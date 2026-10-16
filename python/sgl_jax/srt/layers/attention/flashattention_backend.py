@@ -206,6 +206,8 @@ class FlashAttentionMetadata:
 class FlashAttention(AttentionBackend):
     """Native Attention layer for variable-length sequences using ForwardBatch."""
 
+    supports_compact_kv_metadata = True
+
     def __init__(
         self,
         num_attn_heads,

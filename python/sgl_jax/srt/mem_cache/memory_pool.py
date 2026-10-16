@@ -120,6 +120,8 @@ class ReqToTokenPool:
         # Allocated once at startup via init_cache_loc_host_buffer (its size is
         # only known after the precompile cache_loc buckets are computed).
         self.cache_loc_host_buf = None
+        # Host metadata layout capability, set by the runner that creates this pool.
+        self.supports_compact_kv_metadata = False
 
     def init_cache_loc_host_buffer(self, size: int):
         """Ensure the persistent cache_loc host buffer has enough capacity."""
@@ -150,6 +152,7 @@ class ReqToTokenPool:
         # is not carried through the pytree. The live serving pool keeps its
         # init-time buffer; _merge_cache_loc never runs on a reconstructed pool.
         obj.cache_loc_host_buf = None
+        obj.supports_compact_kv_metadata = False
 
         return obj
 

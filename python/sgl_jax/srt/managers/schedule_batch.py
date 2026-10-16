@@ -3243,6 +3243,11 @@ class ScheduleBatch:
         page_size: int,
         enable_static_lora: bool = False,
     ) -> ModelWorkerBatch:
+        use_compact_kv_metadata = (
+            self.req_to_token_pool.supports_compact_kv_metadata
+            and self.forward_mode in (ForwardMode.EXTEND, ForwardMode.DECODE)
+            and (self.spec_algorithm is None or self.spec_algorithm.is_none())
+        )
         if self.forward_mode.is_decode_or_idle():
             token_paddings = bs_paddings
         else:
@@ -3278,9 +3283,13 @@ class ScheduleBatch:
             logits_indices_selector,
         ) = self._merge_batch_metadata(per_dp_bs_padding, total_bs)
 
-        # Step 4: Merge cache_loc from all DP ranks
-        cache_loc_cpu = self._merge_cache_loc(
-            bs_paddings, cache_loc_paddings, page_size, per_dp_bs_padding
+        # Step 4: Merge page IDs or token locations from all DP ranks.
+        cache_indices = self._merge_cache_loc(
+            bs_paddings,
+            cache_loc_paddings,
+            page_size,
+            per_dp_bs_padding,
+            return_page_indices=use_compact_kv_metadata,
         )
 
         # Step 5: Merge sampling info from all DP ranks
@@ -3469,7 +3478,8 @@ class ScheduleBatch:
             sampling_info=sampling_info,
             positions=positions_cpu,
             mrope_positions=mrope_positions,
-            cache_loc=cache_loc_cpu,
+            cache_loc=None if use_compact_kv_metadata else cache_indices,
+            allocated_page_indices=cache_indices if use_compact_kv_metadata else None,
             extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens=extend_seq_lens,
             extend_logprob_start_lens=extend_logprob_start_lens,
@@ -3864,8 +3874,8 @@ class ModelWorkerBatch:
     sampling_info: ModelWorkerSamplingInfo
     # Position information [total_tokens]
     positions: np.ndarray
-    # cache_loc
-    cache_loc: np.ndarray
+    # Historical KV token locations; omitted when allocated_page_indices is used.
+    cache_loc: np.ndarray | None
 
     # For logprob
     return_logprob: bool

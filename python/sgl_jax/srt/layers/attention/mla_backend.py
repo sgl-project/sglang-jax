@@ -86,6 +86,8 @@ class MLAAttentionMetadata:
 class MLAAttentionBackend(AttentionBackend):
     """Absorbed-MLA attention backend backed by the v2 Pallas kernel."""
 
+    supports_compact_kv_metadata = True
+
     def __init__(
         self,
         num_attn_heads: int,
