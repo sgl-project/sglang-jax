@@ -3891,7 +3891,8 @@ class ModelWorkerBatch:
     # into original order, removing the need for per-rank index math.
     logits_indices_selector: np.ndarray | None = None
 
-    # Batch-owned immutable page IDs for supported speculative relay backends.
+    # Batch-owned physical page IDs, packed by request in fixed DP segments.
+    # Speculative relay producers make these immutable for upload caching.
     allocated_page_indices: np.ndarray | None = None
     eagle_page_indices_device_cache: tuple | None = None
 
