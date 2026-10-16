@@ -83,6 +83,34 @@ def init_hicache(cache, server_args, mesh, token_to_kv_pool_allocator) -> None:
         raise ValueError("HiCache needs a mesh to build the host pool sharding")
 
     device_pool = token_to_kv_pool_allocator.get_kvcache()
+    if getattr(server_args, "hicache_transfer_backend", "jax") == "raiden":
+        from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool
+        from sgl_jax.srt.mem_cache.raiden_hicache import create_raiden_hicache
+        from sgl_jax.srt.mem_cache.unified_cache_components.tree_component import (
+            ComponentType,
+        )
+
+        if (
+            cache.tree_components != (ComponentType.FULL,)
+            or type(device_pool) is not MHATokenToKVPool
+        ):
+            raise ValueError(
+                "Raiden HiCache currently supports only FULL MHA KV (no SWA/recurrent/MLA)"
+            )
+        num_pages = int(server_args.hicache_ratio * device_pool.size) // device_pool.page_size
+        host_pool, controller = create_raiden_hicache(
+            device_pool, num_pages, token_to_kv_pool_allocator.dp_size
+        )
+        cache.host_pool = host_pool
+        cache.hicache_controller = controller
+        cache.hicache_enabled = True
+        cache.write_through_threshold = server_args.hicache_write_through_threshold
+        cache.write_policy = server_args.hicache_write_policy
+        logger.info(
+            "Raiden HiCache enabled: %d host pages; transfer/forward completion barriers enabled",
+            host_pool.total_size(),
+        )
+        return
     per_layer_shape = tuple(int(d) for d in device_pool.kv_buffer[0].shape[1:])
     page_size = device_pool.page_size
     # hicache_ratio is token-based; fold to page count for the page-addressed pool.
