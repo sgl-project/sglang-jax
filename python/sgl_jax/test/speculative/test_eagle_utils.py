@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import jax
@@ -15,6 +16,53 @@ from sgl_jax.test.test_utils import CustomTestCase
 
 
 class TestVerifyTree(CustomTestCase):
+    @staticmethod
+    def _frozen_args(**overrides):
+        from sgl_jax.srt.server_args import ServerArgs
+
+        kwargs = dict(
+            model_path="target",
+            speculative_algorithm="FROZEN_KV_MTP",
+            speculative_draft_model_path="draft",
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            speculative_eagle_topk=1,
+            disable_overlap_schedule=True,
+            grammar_backend="none",
+        )
+        kwargs.update(overrides)
+        args = ServerArgs(**kwargs)
+        args.get_speculative_draft_hf_config = Mock(
+            return_value=SimpleNamespace(architectures=["Gemma4AssistantForCausalLM"])
+        )
+        return args
+
+    def test_frozen_kv_mtp_server_args_accept_supported_chain(self):
+        self._frozen_args().check_server_args()
+
+    def test_gemma4_nextn_promotes_to_frozen_kv_mtp(self):
+        args = self._frozen_args(speculative_algorithm="NEXTN")
+
+        args.check_server_args()
+
+        self.assertEqual(args.speculative_algorithm, "FROZEN_KV_MTP")
+
+    def test_frozen_kv_mtp_server_args_reject_branching_tree(self):
+        with self.assertRaisesRegex(ValueError, "speculative-eagle-topk=1"):
+            self._frozen_args(speculative_eagle_topk=2).check_server_args()
+
+    def test_frozen_kv_mtp_server_args_reject_wrong_chain_width(self):
+        with self.assertRaisesRegex(ValueError, "speculative-num-draft-tokens"):
+            self._frozen_args(speculative_num_draft_tokens=6).check_server_args()
+
+    def test_frozen_kv_mtp_server_args_reject_other_architecture(self):
+        args = self._frozen_args()
+        args.get_speculative_draft_hf_config.return_value = SimpleNamespace(
+            architectures=["LlamaForCausalLM"]
+        )
+        with self.assertRaisesRegex(ValueError, "supported Gemma 4 assistant"):
+            args.check_server_args()
+
     def test_eagle3_overlap_server_args_allow_linear_fa(self):
         from sgl_jax.srt.server_args import ServerArgs
 
