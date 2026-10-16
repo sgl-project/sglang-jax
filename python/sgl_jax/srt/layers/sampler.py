@@ -110,6 +110,9 @@ class Sampler(nnx.Module):
 
         return LogitsProcessorOutput(
             next_token_logits=logits_output.next_token_logits,
+            # Speculative prefill reads the captured hidden states after
+            # sampling (draft extend); do not drop them on the logprob path.
+            hidden_states=logits_output.hidden_states,
             next_token_logprobs=next_token_logprobs,
             next_token_top_logprobs_val=next_token_top_logprobs_val,
             next_token_top_logprobs_idx=next_token_top_logprobs_idx,

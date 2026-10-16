@@ -13,6 +13,11 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
+from sgl_jax.srt.speculative.spec_logprob import (
+    attach_spec_output_logprobs,
+    batch_needs_output_logprob,
+    spec_prefill_can_skip_sample,
+)
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
@@ -250,7 +255,7 @@ class BaseSpecWorker:
                 self.mesh,
                 vocab_size=self.target_worker.model_config.vocab_size,
             )
-            if model_worker_batch.sampling_info.is_all_greedy and not legacy_non_overlap:
+            if spec_prefill_can_skip_sample(model_worker_batch, legacy_non_overlap):
                 logits_output, _, cache_miss_count, bid, _seq_lens = self.forward_target_extend(
                     model_worker_batch,
                     sampling_metadata,
@@ -413,6 +418,16 @@ class BaseSpecWorker:
         logits_output.next_token_logits = logits_output.next_token_logits[safe_index, :]
         logits_output.hidden_states = logits_output.hidden_states[safe_index, :]
         model_worker_batch.positions = model_worker_batch.positions[safe_index]
+        if batch_needs_output_logprob(model_worker_batch):
+            # Rows are bs * (steps + 1) accepted slots (rejected slots point at
+            # the request's last slot and are never read by the scheduler).
+            attach_spec_output_logprobs(
+                logits_output,
+                verified_id,
+                model_worker_batch,
+                self.mesh,
+                width=self.speculative_num_steps + 1,
+            )
         if legacy_non_overlap:
             # The legacy scheduler path advances seq_lens from accept_lens, as
             # it did before the relay-buffer/new_seq_lens path was introduced.

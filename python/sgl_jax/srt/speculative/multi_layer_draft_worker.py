@@ -21,7 +21,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from sgl_jax.srt.layers.logits_processor import LogitsMetadata
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.managers.scheduler import GenerationBatchResult
 from sgl_jax.srt.managers.tp_worker import ModelWorker
@@ -38,6 +37,7 @@ from sgl_jax.srt.speculative.eagle_draft_worker import (
     update_eagle_lists,
 )
 from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
+from sgl_jax.srt.speculative.spec_logprob import draft_extend_logits_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -264,9 +264,7 @@ class MultiLayerDraftWorker(EagleDraftWorker):
             forward_batch.forward_mode = ForwardMode.EXTEND
             logits_output, _, _ = mr.forward(
                 forward_batch,
-                logits_metadata=LogitsMetadata.from_model_worker_batch(
-                    model_worker_batch, self.mesh
-                ),
+                logits_metadata=draft_extend_logits_metadata(model_worker_batch, self.mesh),
             )
             if i == 0:
                 layer0_out = logits_output
