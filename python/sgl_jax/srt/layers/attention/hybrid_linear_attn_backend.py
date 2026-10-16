@@ -197,6 +197,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         )
 
     @property
+    def supports_compact_kv_metadata(self):
+        return self.full_attn_backend.supports_compact_kv_metadata
+
+    @property
     def token_to_kv_pool_class(self):
         from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool
 

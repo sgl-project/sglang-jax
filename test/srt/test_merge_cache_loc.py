@@ -5,6 +5,7 @@ page-start values instead of memcpy-ing every token from req_to_token. These
 tests verify byte-identity against the reference per-req-loop implementation
 at every real-token position, plus the page-start slice that FA/MLA backends
 actually consume (cache_loc.reshape(dp, -1)[:, ::page_size]).
+The compact path must produce those page IDs directly, without a token buffer.
 """
 
 import unittest
@@ -49,10 +50,21 @@ def _reference_loop(req_to_token, reqs_info, dp_size, per_dp_size, page_size, to
 
 
 class TestMergeCacheLoc(unittest.TestCase):
-    def _run_merge(self, reqs_info, dp_size, req_to_token, page_size, total_cache_loc_size):
+    def _run_merge(
+        self,
+        reqs_info,
+        dp_size,
+        req_to_token,
+        page_size,
+        total_cache_loc_size,
+        *,
+        return_page_indices=False,
+    ):
         pool = MagicMock()
         pool.req_to_token = req_to_token
-        pool.cache_loc_host_buf = np.zeros(total_cache_loc_size, dtype=np.int32)
+        pool.cache_loc_host_buf = (
+            None if return_page_indices else np.zeros(total_cache_loc_size, dtype=np.int32)
+        )
         batch = ScheduleBatch(
             reqs_info=reqs_info,
             dp_size=dp_size,
@@ -64,6 +76,7 @@ class TestMergeCacheLoc(unittest.TestCase):
             cache_loc_paddings=[total_cache_loc_size],
             page_size=page_size,
             per_dp_bs_size=128,
+            return_page_indices=return_page_indices,
         )
 
     def _assert_real_tokens_match(self, got, ref, reqs_info, dp_size, per_dp, page_size, msg=""):
@@ -129,6 +142,18 @@ class TestMergeCacheLoc(unittest.TestCase):
                         got.reshape(dp_size, per_dp)[:, ::page_size],
                         ref.reshape(dp_size, per_dp)[:, ::page_size],
                     )
+                    pages = self._run_merge(
+                        reqs_info,
+                        dp_size,
+                        req_to_token,
+                        page_size,
+                        total,
+                        return_page_indices=True,
+                    )
+                    np.testing.assert_array_equal(
+                        pages.reshape(dp_size, -1),
+                        ref.reshape(dp_size, per_dp)[:, ::page_size] // page_size,
+                    )
 
     def test_page_size_1_full_identity(self):
         """page_size==1 keeps the per-req loop; must be fully byte-identical
@@ -143,6 +168,8 @@ class TestMergeCacheLoc(unittest.TestCase):
         got = self._run_merge(reqs_info, 1, req_to_token, 1, total)
         ref = _reference_loop(req_to_token, reqs_info, 1, total, 1, total)
         np.testing.assert_array_equal(got, ref)
+        pages = self._run_merge(reqs_info, 1, req_to_token, 1, total, return_page_indices=True)
+        np.testing.assert_array_equal(pages, ref)
 
     def test_all_empty_dp(self):
         """All-empty batch must not crash and returns the buffer view."""
@@ -154,6 +181,8 @@ class TestMergeCacheLoc(unittest.TestCase):
         got = self._run_merge(reqs_info, 2, req_to_token, 64, 1024)
         self.assertEqual(got.shape, (1024,))
         np.testing.assert_array_equal(got, np.zeros(1024, dtype=np.int32))
+        pages = self._run_merge(reqs_info, 2, req_to_token, 64, 1024, return_page_indices=True)
+        np.testing.assert_array_equal(pages, np.zeros(16, dtype=np.int32))
 
     def test_single_req_single_token(self):
         """Minimal edge: bs=1, seq_len=1 (one page)."""
@@ -169,6 +198,59 @@ class TestMergeCacheLoc(unittest.TestCase):
         ref = _reference_loop(req_to_token, reqs_info, 1, 256, 64, 256)
         np.testing.assert_array_equal(got[:1], ref[:1])
         self.assertEqual(got[0], req_to_token[2, 0])
+        pages = self._run_merge(reqs_info, 1, req_to_token, 64, 256, return_page_indices=True)
+        np.testing.assert_array_equal(pages, [req_to_token[2, 0] // 64, 0, 0, 0])
+
+    def test_page_indices_keep_empty_dp_segment(self):
+        req_to_token = np.array(
+            [[32, 33, 34, 35, 12, 13, 14, 15], [44, 45, 46, 47, 20, 21, 22, 23]],
+            dtype=np.int32,
+        )
+        reqs_info = [
+            ScheduleReqsInfo(
+                reqs=[],
+                seq_lens=np.array([6, 3], dtype=np.int32),
+                req_pool_indices=np.array([0, 1], dtype=np.int32),
+            ),
+            ScheduleReqsInfo(reqs=[], seq_lens=None),
+            ScheduleReqsInfo(
+                reqs=[],
+                seq_lens=np.array([4], dtype=np.int32),
+                req_pool_indices=np.array([1], dtype=np.int32),
+            ),
+        ]
+        pages = self._run_merge(reqs_info, 3, req_to_token, 4, 48, return_page_indices=True)
+        np.testing.assert_array_equal(pages, [8, 3, 11, 0, 0, 0, 0, 0, 11, 0, 0, 0])
+
+    def test_page_indices_use_decode_bucket(self):
+        pool = MagicMock()
+        pool.req_to_token = np.array([[32, 33, 34, 35]], dtype=np.int32)
+        pool.cache_loc_host_buf = None
+        batch = ScheduleBatch(
+            reqs_info=[
+                ScheduleReqsInfo(
+                    reqs=[],
+                    seq_lens=np.array([1], dtype=np.int32),
+                    req_pool_indices=np.array([0], dtype=np.int32),
+                ),
+                ScheduleReqsInfo(reqs=[], seq_lens=None),
+            ],
+            dp_size=2,
+            req_to_token_pool=pool,
+            forward_mode=ForwardMode.DECODE,
+        )
+        for per_dp_bs, total_pages in ((1, 8), (2, 16)):
+            with self.subTest(per_dp_bs=per_dp_bs):
+                pages = batch._merge_cache_loc(
+                    bs_paddings=[2, 4],
+                    cache_loc_paddings=[32, 64],
+                    page_size=4,
+                    per_dp_bs_size=per_dp_bs,
+                    return_page_indices=True,
+                )
+                expected = np.zeros(total_pages, dtype=np.int32)
+                expected[0] = 8
+                np.testing.assert_array_equal(pages, expected)
 
 
 if __name__ == "__main__":

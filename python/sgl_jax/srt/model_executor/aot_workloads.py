@@ -174,7 +174,11 @@ class WorkloadInputBuilder(ABC):
             out_cache_loc=vector(spec.input_token_count),
             positions=vector(spec.input_token_count),
             attn_backend=context.backend,
-            cache_loc=vector(spec.cache_loc_size or spec.request_count * padded_context),
+            cache_loc=(
+                None
+                if context.backend.use_compact_kv_metadata(self.forward_mode, self.spec_algorithm)
+                else vector(spec.cache_loc_size or spec.request_count * padded_context)
+            ),
             recurrent_indices=recurrent_indices,
             recurrent_cow_src_indices=(
                 vector(spec.request_count)

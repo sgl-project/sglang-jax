@@ -355,6 +355,13 @@ class ForwardBatch:
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
     ):
+        cache_loc = (
+            None
+            if model_runner.attn_backend.use_compact_kv_metadata(
+                batch.forward_mode, batch.spec_algorithm
+            )
+            else batch.cache_loc
+        )
         (
             input_ids,
             seq_lens,
@@ -371,7 +378,7 @@ class ForwardBatch:
                 batch.out_cache_loc,
                 batch.positions,
                 batch.req_pool_indices,
-                batch.cache_loc,
+                cache_loc,
                 batch.extend_prefix_lens,
                 batch.extend_seq_lens,
             ),

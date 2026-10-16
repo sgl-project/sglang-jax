@@ -26,7 +26,10 @@ from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.kernels.mla.v2.kernel import cdiv, mla_ragged_paged_attention
-from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
+from sgl_jax.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    get_batch_page_indices,
+)
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.utils.jax_utils import device_array
 from sgl_jax.srt.utils.profiling_utils import named_scope
@@ -82,6 +85,8 @@ class MLAAttentionMetadata:
 @dataclass
 class MLAAttentionBackend(AttentionBackend):
     """Absorbed-MLA attention backend backed by the v2 Pallas kernel."""
+
+    supports_compact_kv_metadata = True
 
     def __init__(
         self,
@@ -157,18 +162,7 @@ class MLAAttentionBackend(AttentionBackend):
                 "Inconsistent DP batch metadata: expected per_dp_bs_size * dp_size == len(seq_lens), "
                 f"got {batch.per_dp_bs_size} * {batch.dp_size} != {len(batch.seq_lens)}"
             )
-        if len(batch.cache_loc) % batch.dp_size != 0:
-            raise ValueError(
-                "Inconsistent cache_loc layout for DP sharding: "
-                f"len(cache_loc)={len(batch.cache_loc)} is not divisible by dp_size={batch.dp_size}"
-            )
-
-        total_loc_len = len(batch.cache_loc)
-        per_dp_loc_len = total_loc_len // batch.dp_size
-
-        cache_loc_2d = batch.cache_loc.reshape(batch.dp_size, per_dp_loc_len)
-        strided_2d = cache_loc_2d[:, :: self.page_size]
-        page_indices = (strided_2d // self.page_size).ravel()
+        page_indices = get_batch_page_indices(batch, self.page_size).ravel()
 
         if batch.forward_mode == ForwardMode.EXTEND:
             ext_2d = batch.extend_seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
