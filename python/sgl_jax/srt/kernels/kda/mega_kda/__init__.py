@@ -78,6 +78,7 @@ def kda_forward_packed(
     initial_state: jax.Array,
     lower_bound: float | None,
     chunk_size: int = 64,
+    pipeline_impl: str = "incumbent",
 ) -> tuple[jax.Array, jax.Array]:
     """Run Mega KDA for a packed ``B=1`` inference batch.
 
@@ -86,11 +87,45 @@ def kda_forward_packed(
     ``cu_seqlens`` contains the ``N + 1`` packed request boundaries. The
     output is trimmed back to ``T`` and the returned state is
     ``[N, H, K, V]``.
+
+    ``pipeline_impl`` selects the kernel implementation:
+      - ``"incumbent"`` (default): runs the existing native-segment-ID Mega KDA
+        kernel with unchanged numerical behavior.
+      - ``"fused_resident"`` (or ``"resident"``): opt-in dispatch to
+        ``resident_pipeline_kda_fwd``.
     """
     if q.shape[0] != 1:
         raise ValueError(f"packed Mega KDA requires B=1, got B={q.shape[0]}")
     if initial_state.ndim != 4:
         raise ValueError("packed Mega KDA initial_state must have shape [N, H, K, V]")
+    if pipeline_impl not in ("incumbent", "fused_resident", "resident"):
+        raise ValueError(
+            f"pipeline_impl must be 'incumbent', 'fused_resident', or 'resident'; "
+            f"got {pipeline_impl!r}"
+        )
+
+    if pipeline_impl in ("fused_resident", "resident"):
+        from sgl_jax.srt.kernels.kda.resident_pipeline import resident_pipeline_kda_fwd
+
+        output, final_state, *_ = resident_pipeline_kda_fwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            initial_state,
+            True,
+            cu_seqlens,
+            chunk_size=chunk_size,
+            safe_gate=True,
+            lower_bound=lower_bound,
+            use_gate_in_kernel=True,
+            use_qk_l2norm_in_kernel=True,
+            A_log=A_log,
+            dt_bias=dt_bias,
+        )
+        return output, final_state
 
     tokens = q.shape[1]
     padded_tokens = (tokens + chunk_size - 1) // chunk_size * chunk_size
