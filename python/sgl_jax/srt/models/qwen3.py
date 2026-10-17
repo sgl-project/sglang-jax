@@ -122,7 +122,8 @@ class QWen3Attention(nnx.Module):
         token_to_kv_pool: KVCache,
         *,
         out_sharding: jax.sharding.Sharding | None = None,
-    ) -> jax.Array:
+        cos_sin: tuple[jax.Array, jax.Array] | None = None,
+    ) -> tuple[jax.Array, jax.Array]:
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
@@ -149,7 +150,7 @@ class QWen3Attention(nnx.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        q, k = self.rotary_emb(positions, q, k)
+        q, k = self.rotary_emb(positions, q, k, cos_sin=cos_sin)
         attn_output, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
 
         output, _ = self.o_proj(attn_output, out_sharding=out_sharding)
@@ -269,6 +270,7 @@ class QWen3DecoderLayer(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         residual: jax.Array | None = None,
+        cos_sin: tuple[jax.Array, jax.Array] | None = None,
     ):
         layer_callback_flag = []
         if residual is None:
@@ -289,6 +291,7 @@ class QWen3DecoderLayer(nnx.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
+            cos_sin=cos_sin,
         )
 
         attn_callback_flag = precision_tracer.jit_pure_callback_record(
@@ -336,6 +339,8 @@ class QWen3Model(nnx.Module):
             ]
         )
 
+        self.rotary_emb = self.layers[0].self_attn.rotary_emb if len(self.layers) > 0 else None
+
         self.norm = RMSNorm(
             config.hidden_size,
             epsilon=config.rms_norm_eps,
@@ -361,6 +366,7 @@ class QWen3Model(nnx.Module):
         layers_callback_flag = []
         aux_hidden_states = []
         positions = forward_batch.positions if positions is None else positions
+        cos_sin = self.rotary_emb.get_cos_sin(positions) if self.rotary_emb is not None else None
         # When connecting the vision head, even without deepstack, it should be padded with 0, which avoids doubling the EXTEND compilation.
         deepstack = forward_batch.deepstack_visual_embedding
         for layer_id, layer in enumerate(self.layers):
@@ -374,6 +380,7 @@ class QWen3Model(nnx.Module):
                 forward_batch,
                 token_to_kv_pool,
                 residual,
+                cos_sin=cos_sin,
             )
             if deepstack is not None and layer_id < deepstack.shape[0]:
                 hidden_states = jax.lax.cond(
