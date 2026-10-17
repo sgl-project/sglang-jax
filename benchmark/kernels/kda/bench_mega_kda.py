@@ -211,6 +211,30 @@ def main() -> None:
             use_gate_in_kernel=True,
             A_log=a_log,
             dt_bias=dt_bias,
+            pipeline_impl="incumbent",
+        )
+        return result[0], result[1]
+
+    @jax.jit
+    def resident(q, k, v, g, beta, a_log, dt_bias, initial_state, cu_seqlens):
+        result = chunk_kda_fwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale=SCALE,
+            initial_state=initial_state,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            chunk_size=CHUNK_SIZE,
+            safe_gate=True,
+            lower_bound=lower_bound,
+            use_gate_in_kernel=True,
+            use_qk_l2norm_in_kernel=True,
+            A_log=a_log,
+            dt_bias=dt_bias,
+            pipeline_impl="fused_resident",
         )
         return result[0], result[1]
 
@@ -229,13 +253,17 @@ def main() -> None:
             initial_state=initial_state,
             lower_bound=lower_bound,
             chunk_size=CHUNK_SIZE,
+            pipeline_impl="incumbent",
         )
 
-    runners = {"chunked": chunked}
+    runners = {"chunked": chunked, "resident": resident}
     effective_tokens = {
         "chunked": args.segments
         * ((args.tokens // args.segments + CHUNK_SIZE - 1) // CHUNK_SIZE)
-        * CHUNK_SIZE
+        * CHUNK_SIZE,
+        "resident": args.segments
+        * ((args.tokens // args.segments + CHUNK_SIZE - 1) // CHUNK_SIZE)
+        * CHUNK_SIZE,
     }
     if _direct_mega_supported(args.tokens, args.segments):
         runners["mega"] = mega

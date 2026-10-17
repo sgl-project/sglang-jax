@@ -5,6 +5,7 @@ from sgl_jax.srt.kernels.kda.mega_kda import (
     kda_forward_packed,
 )
 from sgl_jax.srt.kernels.kda.naive import naive_recurrent_kda
+from sgl_jax.srt.kernels.kda.resident_pipeline import resident_pipeline_kda_fwd
 
 __all__ = [
     "chunk_kda",
@@ -12,4 +13,5 @@ __all__ = [
     "kda_forward_inference",
     "kda_forward_packed",
     "naive_recurrent_kda",
+    "resident_pipeline_kda_fwd",
 ]

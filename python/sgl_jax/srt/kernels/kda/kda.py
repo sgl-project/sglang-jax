@@ -1131,6 +1131,8 @@ def _unalign_output(o, orig_cu_seqlens, aligned_cu_seqlens, T_out):
         "output_final_state",
         "use_qk_l2norm_in_kernel",
         "chunk_size",
+        "intra_block_size",
+        "pipeline_impl",
         "safe_gate",
         "lower_bound",
         "use_gate_in_kernel",
@@ -1162,6 +1164,8 @@ def chunk_kda_fwd(
     return_intermediate_states: bool = False,
     cp_context: None = None,
     transpose_state_layout: bool = False,
+    intra_block_size: int = 16,
+    pipeline_impl: str = "incumbent",
 ):
     """KDA chunked forward pass for variable-length sequences (varlen).
 
@@ -1173,9 +1177,48 @@ def chunk_kda_fwd(
       3. Inter-chunk hidden state propagation via delta-rule recurrence
       4. Output computation (inter-chunk state + intra-chunk attention)
 
+    ``pipeline_impl`` selects which pipeline executes the recurrence:
+      - ``"incumbent"`` (default): runs the existing four-stage pipeline above
+        with unchanged numerical behavior.
+      - ``"fused_resident"`` (or ``"resident"``): opt-in dispatch to
+        ``resident_pipeline_kda_fwd``, which executes stages 1-4 in a single
+        Pallas launch with the recurrent [K, V] state kept resident in VMEM.
+
     Returns:
         12-tuple: o, final_state, g, Aqk, Akk, w, u, qg, kg, v_new, h, initial_state
     """
+    if pipeline_impl not in ("incumbent", "fused_resident", "resident"):
+        raise ValueError(
+            f"pipeline_impl must be 'incumbent', 'fused_resident', or 'resident'; "
+            f"got {pipeline_impl!r}"
+        )
+    if pipeline_impl in ("fused_resident", "resident"):
+        from sgl_jax.srt.kernels.kda.resident_pipeline import resident_pipeline_kda_fwd
+
+        assert cp_context is None
+        assert not transpose_state_layout
+        assert not return_intermediate_states
+        assert not disable_recompute
+        return resident_pipeline_kda_fwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            initial_state,
+            output_final_state,
+            cu_seqlens,
+            chunk_size=chunk_size,
+            intra_block_size=intra_block_size,
+            safe_gate=safe_gate,
+            lower_bound=lower_bound,
+            use_gate_in_kernel=use_gate_in_kernel,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            A_log=A_log,
+            dt_bias=dt_bias,
+        )
+
     B, T, H, K = q.shape
     V = v.shape[-1]
     BT = chunk_size
