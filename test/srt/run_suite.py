@@ -264,6 +264,7 @@ suites = {
         TestFile("python/sgl_jax/test/kernels/quantized_linear_test.py", 0.3, runner="pytest"),
         TestFile("python/sgl_jax/test/kernels/moe_block_quant_test.py", 0.2, runner="pytest"),
         TestFile("python/sgl_jax/test/kernels/kda_test.py", 10, runner="pytest"),
+        TestFile("python/sgl_jax/test/kernels/test_kda_resident_parity.py", 2, runner="pytest"),
         TestFile("test/srt/kernels/hca/test_hca.py", 8, runner="pytest"),
         TestFile("test/srt/kernels/hca/test_v4_backend.py", 5, runner="pytest"),
         TestFile("test/srt/kernels/csa_attention/test_attention.py", 3, runner="pytest"),
