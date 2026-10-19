@@ -871,32 +871,53 @@ def _ragged_paged_attention_kernel_loop(
                         )
 
                     @pl.when(jnp.logical_not(is_single_span))
-                    def _update_per_page():
-                        def loop_body(i, states):
-                            cur_update_sz, cur_ignore = states
-                            sz = jnp.minimum(page_size - cur_ignore, cur_update_sz)
+                    def _update_page_runs():
+                        def _run_cond(i):
+                            return i < num_update_pages
 
+                        def _run_body(i):
+                            base_idx = jnp.minimum(page_indices_offset + i, num_page_indices - 1)
+                            base_page = page_indices_ref[base_idx]
+
+                            def _ext_cond(run_len):
+                                has_more = (i + run_len) < num_update_pages
+                                next_idx = jnp.minimum(
+                                    page_indices_offset + i + run_len,
+                                    num_page_indices - 1,
+                                )
+                                return jnp.logical_and(
+                                    has_more,
+                                    page_indices_ref[next_idx] == (base_page + run_len),
+                                )
+
+                            def _ext_body(run_len):
+                                return run_len + 1
+
+                            run_len = lax.while_loop(_ext_cond, _ext_body, jnp.int32(1))
+                            cur_ignore = jnp.where(i == 0, ignore, 0)
+                            sz = jnp.minimum(
+                                update_sz - (i * page_size - jnp.where(i > 0, ignore, 0)),
+                                run_len * page_size - cur_ignore,
+                            )
                             _async_copy(
-                                vmem_ref.at[pl.ds((p_ignore + i) * page_size + cur_ignore, sz)],
+                                vmem_ref.at[
+                                    pl.ds(
+                                        (p_ignore + i) * page_size + cur_ignore,
+                                        sz,
+                                    )
+                                ],
                                 cache_hbm_ref.at[
                                     pl.ds(
-                                        page_indices_ref[page_indices_offset + i] * page_size
-                                        + cur_ignore,
+                                        base_page * page_size + cur_ignore,
                                         sz,
                                     )
                                 ],
                                 sem,
-                                wait,
+                                wait=False,
                             )
-                            return cur_update_sz - sz, 0
+                            return i + run_len
 
-                        lax.fori_loop(
-                            0,
-                            num_update_pages,
-                            loop_body,
-                            (update_sz, ignore),
-                            unroll=False,
-                        )
+                        lax.while_loop(_run_cond, _run_body, jnp.int32(0))
 
             else:
                 kv_p_end = cdiv(offset + update_sz, page_size)
