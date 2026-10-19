@@ -38,9 +38,11 @@ from sgl_jax.srt.kernels.ragged_paged_attention.tuned_block_sizes_v3 import (
 from sgl_jax.srt.kernels.ragged_paged_attention.util import (
     align_to,
     cdiv,
+    floor_div_pow2,
     get_dtype_bitwidth,
     get_dtype_packing,
     get_tpu_version,
+    mod_pow2,
     next_power_of_2,
 )
 
@@ -490,7 +492,9 @@ def _ragged_paged_attention_kernel_loop(
 
         s = jnp.matmul(q, k.T, preferred_element_type=jnp.float32)
 
-        s_scale = sm_scale
+        use_exp2 = soft_cap is None and attention_sink_ref is None
+        log2_e = 1.4426950408889634
+        s_scale = sm_scale * (log2_e if use_exp2 else 1.0)
         if k_scale is not None:
             s_scale *= k_scale
         if q_scale is not None:
@@ -527,9 +531,9 @@ def _ragged_paged_attention_kernel_loop(
 
         need_q_span = use_causal_mask or sliding_window is not None or not compact_span_mask
         if need_q_span:
-            q_row = (lax.broadcasted_iota(jnp.int32, s.shape, 0) // num_q_heads_per_kv_head).astype(
-                int_ty
-            )
+            q_row = floor_div_pow2(
+                lax.broadcasted_iota(jnp.int32, s.shape, 0), num_q_heads_per_kv_head
+            ).astype(int_ty)
 
             def rebased_q_span(window):
                 """Query span measured from the key tile's origin, less `window`.
@@ -566,7 +570,12 @@ def _ragged_paged_attention_kernel_loop(
             mask = mask_and(mask, rebased_q_span(sliding_window) < k_span)
 
         if mask is not None:
-            s = jnp.where(mask, s, mask_value)
+            scaled_mask_value = (
+                mask_value * log2_e
+                if (use_exp2 and mask_value is not None and mask_value > -1e30)
+                else mask_value
+            )
+            s = jnp.where(mask, s, scaled_mask_value)
 
         if softmax_dtype is not None:
             s = s.astype(softmax_dtype)
@@ -575,12 +584,16 @@ def _ragged_paged_attention_kernel_loop(
         m_prev = m_ref[...].astype(jnp.float32)
         m_curr = jnp.maximum(m_prev, s_rowmax)
         m_ref[...] = m_curr.astype(out_dtype)
-        p = jnp.exp(s - broadcast_minor(m_curr, s.shape))
+        exp_fn = lax.exp2 if use_exp2 else jnp.exp
+        p = exp_fn(s - broadcast_minor(m_curr, s.shape))
 
         p_rowsum = jnp.sum(p, axis=1, keepdims=True)
-        exp_m_diff = jnp.exp(m_prev - m_curr)
+        exp_m_diff = exp_fn(m_prev - m_curr)
         l_prev = l_ref[...].astype(jnp.float32)
         l_ref[...] = (exp_m_diff * l_prev + p_rowsum).astype(out_dtype)
+
+        if q.dtype == jnp.bfloat16 and v.dtype == jnp.bfloat16:
+            p = p.astype(jnp.bfloat16)
 
         return p, v, exp_m_diff
 
@@ -821,9 +834,9 @@ def _ragged_paged_attention_kernel_loop(
         )
 
         if not wait:
-            bkv_id = offset // bkv_sz
-            kv_p_start = offset // page_size
-            ignore = offset % page_size
+            bkv_id = floor_div_pow2(offset, bkv_sz)
+            kv_p_start = floor_div_pow2(offset, page_size)
+            ignore = mod_pow2(offset, page_size)
             p_ignore = kv_p_start - bkv_id * bkv_p
             # sglang-jax: use cu_kv_lens for page_indices offset.
             start_kv_page_idx = cdiv(cu_kv_lens_ref[seq_idx], page_size)
@@ -1040,12 +1053,17 @@ def _ragged_paged_attention_kernel_loop(
         r, l = ref.shape  # noqa
         assert l % 128 == 0
         folds = l // 128
-        ref = ref.reshape(r * folds, 128)
-        start *= folds
-        sz *= folds
-        step *= folds
-        assert sz % step == 0
-        vec = jnp.concat([ref[pl.ds(start + i, sz // step, step)] for i in range(folds)], axis=1)
+        if folds == 1 and step == 1:
+            vec = ref[pl.ds(start, sz)]
+        else:
+            ref = ref.reshape(r * folds, 128)
+            start *= folds
+            sz *= folds
+            step *= folds
+            assert sz % step == 0
+            vec = jnp.concat(
+                [ref[pl.ds(start + i, sz // step, step)] for i in range(folds)], axis=1
+            )
         if dtype is not None:
             vec = pltpu.bitcast(vec, dtype)
         return vec
@@ -1096,7 +1114,7 @@ def _ragged_paged_attention_kernel_loop(
         kv = strided_load(kv_ref, start + offset, sz, step)
         bitwidth = 32 // kv_packing
         repack_ty = jnp.dtype(f"uint{bitwidth}")
-        k = kv >> (kv_idx_in_load * 2 * bitwidth)
+        k = kv if kv_idx_in_load == 0 else (kv >> (kv_idx_in_load * 2 * bitwidth))
         v = k >> bitwidth
         k = pltpu.bitcast(k.astype(repack_ty), kv_dtype)
         v = pltpu.bitcast(v.astype(repack_ty), kv_dtype)
@@ -1850,7 +1868,7 @@ def get_default_block_sizes(
             if case == RpaCase.DECODE:
                 bq_sz = 1
                 bkv_sz = (
-                    min(min_bkv_sz_to_peak, max_kv) if sliding_window is None else sliding_window
+                    min(2048, max_kv) if sliding_window is None else min(sliding_window, max_kv)
                 )
                 bq_csz = 1
                 bkv_csz = bkv_sz
@@ -1858,7 +1876,7 @@ def get_default_block_sizes(
                 bq_sz = min(MAX_BQ_SZ, max_q // 2)
                 bkv_sz = min(2048, max_kv // 2)
                 bq_csz = min(MAX_BQ_SZ, min(1024 // num_q_heads_per_kv_head, max_q))
-                bkv_csz = min(1024, align_to(max_kv // 2, page_size)) if max_kv > 1 else page_size
+                bkv_csz = min(2048, align_to(max_kv // 2, page_size)) if max_kv > 1 else page_size
         case _:
             raise NotImplementedError(f"Unsupported {tpu_version=}.")
 
