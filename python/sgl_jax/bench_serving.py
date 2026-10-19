@@ -1841,6 +1841,8 @@ def sample_generated_shared_prefix_requests(
     # system prompt (prefix reuse across runs, e.g. HiCache A/B passes) while each
     # pass asks fresh questions. Unset keeps the original single-stream behaviour.
     question_seed = getattr(args, "gsp_question_seed", None)
+    if question_seed is not None and question_seed < 0:
+        question_seed = None
     if question_seed is not None:
         random.seed(getattr(args, "seed", 1))
 

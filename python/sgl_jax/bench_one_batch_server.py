@@ -60,7 +60,7 @@ class BenchArgs:
     gsp_range_ratio: float = 1.0
     seed: int = 1
     gsp_send_routing_key: bool = False
-    gsp_question_seed: int | None = None
+    gsp_question_seed: int = -1  # <0: unset (single random stream)
     gsp_num_turns: int = 1
     gsp_fast_prepare: bool = False
     gsp_ordered: bool = False
