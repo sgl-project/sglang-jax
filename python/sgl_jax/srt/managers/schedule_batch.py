@@ -2561,6 +2561,10 @@ class ScheduleBatch:
         per_dp_cache_loc_size = total_cache_loc_size // self.dp_size
         if return_page_indices:
             assert total_cache_loc_size % (self.dp_size * page_size) == 0
+            # Padding uses physical page 0, which may belong to a live request.
+            # FA/MLA v2 bound KV reads by cu_kv_lens / seq_lens, so padded
+            # entries do not contribute to attention. Page 0 also keeps SWA's
+            # host-side mapping[0] lookup in bounds.
             page_indices = np.zeros(
                 (self.dp_size, per_dp_cache_loc_size // page_size), dtype=np.int32
             )
