@@ -43,6 +43,7 @@ import jax
 import jax.numpy as jnp
 
 from sgl_jax.srt.configs.deepseek_v4 import mhc_param_shapes, mix_hc_width
+from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 
 __all__ = [
     "DeepseekV4MHC",
@@ -75,7 +76,7 @@ def resolve_backend(backend: str = "auto") -> str:
         raise ValueError(f"unknown mHC backend {backend!r}")
     if backend != "auto":
         return backend
-    return "pallas" if jax.default_backend() == "tpu" else "reference"
+    return "pallas" if is_tpu_runtime() else "reference"
 
 
 def _rms_scale(flat, norm_eps: float):
@@ -177,18 +178,26 @@ class DeepseekV4MHC:
     The operations act independently on leading token rows. M may shard those
     rows across devices while keeping the residual-stream and hidden axes local;
     gate parameters are replicated at the operation boundary.
+
+    Pallas operations consume local arrays inside a manual mesh scope. With an
+    Explicit mesh, M wraps these calls in ``jax.shard_map`` with token-row input
+    and output specs and replicated parameter specs. See
+    ``docs/developer_guide/deepseek_v4_mhc_contract.md`` for the calling contract.
     """
 
     def __init__(self, config, *, backend: str = "auto"):
         self.hc_mult = int(config.hc_mult)
         self.hidden_size = int(config.hidden_size)
-        self.sinkhorn_iters = int(config.hc_sinkhorn_iters)
+        iters = config.hc_sinkhorn_iters
+        if type(iters) is not int:
+            raise TypeError(f"hc_sinkhorn_iters must be an int, got {type(iters).__name__}")
+        if iters < 1:
+            raise ValueError(f"hc_sinkhorn_iters must be >= 1, got {iters}")
+        self.sinkhorn_iters = iters
         self.hc_eps = float(config.hc_eps)
         self.norm_eps = float(config.rms_norm_eps)
         if self.hc_mult < 1 or self.hidden_size < 1:
             raise ValueError("mHC residual-stream count and hidden size must be positive")
-        if self.sinkhorn_iters < 1:
-            raise ValueError("hc_sinkhorn_iters must be >= 1")
         if not 0 < self.hc_eps < float("inf") or not 0 < self.norm_eps < float("inf"):
             raise ValueError("mHC epsilon values must be positive and finite")
         self.backend = resolve_backend(backend)

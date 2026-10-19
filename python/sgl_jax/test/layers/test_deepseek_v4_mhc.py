@@ -10,12 +10,13 @@ collapse, and the sequencing a decoder layer performs.
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import Mesh, NamedSharding
+from jax.sharding import AxisType, Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.deepseek_v4 import DeepseekV4Config, mhc_param_shapes
@@ -28,6 +29,7 @@ from sgl_jax.srt.layers.deepseek_v4_mhc import (
     pre_reference,
     resolve_backend,
 )
+from sgl_jax.srt.utils import jax_utils
 
 # The oracle lives under test/srt, which is not a package on the path.
 _ORACLE_DIR = Path(__file__).resolve().parents[4] / "test" / "srt" / "kernels" / "mhc"
@@ -238,6 +240,21 @@ def test_backend_resolution():
         resolve_backend("cuda")
 
 
+@pytest.mark.parametrize("platform,expected", [("tpu", "pallas"), ("cpu", "reference")])
+def test_backend_resolution_uses_compilation_target(monkeypatch, platform, expected):
+    monkeypatch.setattr(jax_utils, "_IS_TPU_RUNTIME_CACHED", platform != "tpu")
+    token = jax_utils._COMPILATION_TARGET.set(
+        SimpleNamespace(platform=platform, device_kind="TPU7x" if platform == "tpu" else "cpu")
+    )
+    try:
+        assert resolve_backend("auto") == expected
+        assert DeepseekV4MHC(_cfg()).backend == expected
+        assert resolve_backend("reference") == "reference"
+        assert resolve_backend("pallas") == "pallas"
+    finally:
+        jax_utils._COMPILATION_TARGET.reset(token)
+
+
 @pytest.mark.usefixtures("highest_matmul_precision")
 def test_layer_pre_post_round_trip_matches_the_oracle():
     mhc = DeepseekV4MHC(_cfg(), backend="reference")
@@ -407,6 +424,27 @@ def test_padding_and_multiple_leading_dimensions_are_token_local():
         )
 
 
+@pytest.mark.parametrize("iters", [1, 20, 40])
+def test_sinkhorn_config_accepts_positive_builtin_integers(iters):
+    mhc = DeepseekV4MHC(_cfg(hc_sinkhorn_iters=iters), backend="reference")
+    assert mhc.sinkhorn_iters == iters
+    assert type(mhc.sinkhorn_iters) is int
+
+
+@pytest.mark.parametrize(
+    "iters", [True, False, 1.9, 20.0, "20", np.int32(20), np.int64(20), None, np.nan, np.inf]
+)
+def test_sinkhorn_config_rejects_non_builtin_integers(iters):
+    with pytest.raises(TypeError, match="hc_sinkhorn_iters must be an int"):
+        DeepseekV4MHC(_cfg(hc_sinkhorn_iters=iters), backend="reference")
+
+
+@pytest.mark.parametrize("iters", [0, -1])
+def test_sinkhorn_config_rejects_non_positive_integers(iters):
+    with pytest.raises(ValueError, match="hc_sinkhorn_iters must be >= 1"):
+        DeepseekV4MHC(_cfg(hc_sinkhorn_iters=iters), backend="reference")
+
+
 def test_invalid_config_and_operation_boundaries_are_rejected():
     for overrides in (
         {"hc_mult": 0},
@@ -459,6 +497,83 @@ def test_row_sharding_preserves_valid_results():
     np.testing.assert_allclose(
         np.asarray(got_head, np.float32)[:-1], np.asarray(want_head, np.float32)[:-1]
     )
+
+
+@pytest.mark.parametrize("tokens", [2, 8])
+def test_pallas_manual_row_sharding_matches_reference(monkeypatch, tokens):
+    if jax.default_backend() != "cpu" or len(jax.devices("cpu")) < 2:
+        pytest.skip("needs at least two CPU devices for Pallas interpretation")
+    from sgl_jax.srt.kernels.mhc import mhc as kernels
+
+    jax.clear_caches()
+    monkeypatch.setenv("PALLAS_INTERPRET", "1")
+    monkeypatch.setattr(kernels, "_device_kind", lambda: "TPU7x")
+    mesh = Mesh(np.asarray(jax.devices("cpu")[:2]), ("tokens",), axis_types=(AxisType.Explicit,))
+    stream_spec, hidden_spec = P("tokens", None, None), P("tokens", None)
+    mhc = DeepseekV4MHC(_cfg(), backend="pallas")
+    reference = DeepseekV4MHC(_cfg(), backend="reference")
+    streams = jnp.asarray(_streams(43, tokens), jnp.bfloat16)
+    padded = streams.at[-1].set(jnp.nan)
+    distributed = jax.device_put(padded, NamedSharding(mesh, stream_spec))
+    params = _params(44)
+    head_params = _params(45, head=True)
+
+    # M owns mesh selection; each operation runs on its local token rows.
+    pre_specs = (hidden_spec, hidden_spec, stream_spec)
+    pre = jax.sharding.auto_axes(
+        jax.shard_map(
+            mhc.pre,
+            mesh=None,
+            in_specs=(stream_spec, P(), P(), P()),
+            out_specs=pre_specs,
+            check_vma=False,
+        ),
+        axes=mesh.axis_names,
+        out_sharding=tuple(NamedSharding(mesh, spec) for spec in pre_specs),
+    )
+    post = jax.sharding.auto_axes(
+        jax.shard_map(
+            mhc.post,
+            mesh=None,
+            in_specs=(hidden_spec, stream_spec, hidden_spec, stream_spec),
+            out_specs=stream_spec,
+            check_vma=False,
+        ),
+        axes=mesh.axis_names,
+        out_sharding=NamedSharding(mesh, stream_spec),
+    )
+    head = jax.sharding.auto_axes(
+        jax.shard_map(
+            mhc.collapse_head,
+            mesh=None,
+            in_specs=(stream_spec, P(), P(), P()),
+            out_specs=hidden_spec,
+            check_vma=False,
+        ),
+        axes=mesh.axis_names,
+        out_sharding=NamedSharding(mesh, hidden_spec),
+    )
+    try:
+        with jax.set_mesh(mesh):
+            got = jax.jit(pre)(distributed, *params)
+            got_post = jax.jit(post)(got[0], distributed, got[1], got[2])
+            got_head = jax.jit(head)(got_post, *head_params)
+        want = reference.pre(streams, *params)
+        output = want[0].astype(streams.dtype)
+        want_post = reference.post(output, streams, want[1], want[2]).astype(streams.dtype)
+        want_head = reference.collapse_head(want_post, *head_params)
+        assert got[0].dtype == got_post.dtype == got_head.dtype == streams.dtype
+        assert got[1].dtype == got[2].dtype == jnp.float32
+        for actual, expected in zip((*got, got_post, got_head), (*want, want_post, want_head)):
+            assert actual.sharding.spec[0] == "tokens"
+            np.testing.assert_allclose(
+                np.asarray(actual, np.float32)[:-1],
+                np.asarray(expected, np.float32)[:-1],
+                rtol=2e-2,
+                atol=1e-2,
+            )
+    finally:
+        jax.clear_caches()
 
 
 @pytest.mark.skipif(jax.default_backend() != "tpu", reason="mHC Pallas kernels need TPU")
