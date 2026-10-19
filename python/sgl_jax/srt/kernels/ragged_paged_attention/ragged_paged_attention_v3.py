@@ -388,6 +388,8 @@ def _ragged_paged_attention_kernel_loop(
     predicate_cache_dma: bool = True,
     elide_single_tile_loops: bool = True,
     compact_span_mask: bool = True,
+    coalesce_page_dma: bool = True,
+    reuse_resident_bkv: bool = True,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
     assert q_hbm_ref.shape[-1] == kv_cache_hbm_ref.shape[-1]
@@ -395,6 +397,12 @@ def _ragged_paged_attention_kernel_loop(
     use_causal_mask = causal
     if case == RpaCase.DECODE:
         use_causal_mask = False
+
+    use_resident_bkv = (
+        reuse_resident_bkv
+        and custom_mask_ref is None
+        and not (elide_single_tile_loops and static_q_len is not None and bq_sz >= static_q_len)
+    )
 
     out_dtype = acc_ref.dtype
     (
@@ -686,17 +694,81 @@ def _ragged_paged_attention_kernel_loop(
                 page_indices_offset = start_kv_page_idx + kv_p_start
                 num_cache_pages = cdiv(bkv_sz_frm_cache, page_size)
 
-                def _fetch_cache_page(i, _):
-                    sz = jnp.minimum(bkv_sz_frm_cache - i * page_size, page_size)
-                    page_idx = jnp.minimum(page_indices_offset + i, num_page_indices - 1)
-                    _async_copy(
-                        cache_hbm_ref.at[pl.ds(page_indices_ref[page_idx] * page_size, sz)],
-                        vmem_ref.at[pl.ds(i * page_size, sz)],
-                        sem,
-                        wait=False,
-                    )
+                if coalesce_page_dma:
 
-                lax.fori_loop(0, num_cache_pages, _fetch_cache_page, None, unroll=False)
+                    @pl.when(num_cache_pages > 0)
+                    def _fetch_cache_pages_coalesced():
+                        first_idx = jnp.minimum(page_indices_offset, num_page_indices - 1)
+                        last_idx = jnp.minimum(
+                            page_indices_offset + num_cache_pages - 1,
+                            num_page_indices - 1,
+                        )
+                        first_page = page_indices_ref[first_idx]
+                        last_page = page_indices_ref[last_idx]
+                        is_single_span = (last_page - first_page) == (num_cache_pages - 1)
+
+                        @pl.when(is_single_span)
+                        def _fetch_contiguous_span():
+                            _async_copy(
+                                cache_hbm_ref.at[pl.ds(first_page * page_size, bkv_sz_frm_cache)],
+                                vmem_ref.at[pl.ds(0, bkv_sz_frm_cache)],
+                                sem,
+                                wait=False,
+                            )
+
+                        @pl.when(jnp.logical_not(is_single_span))
+                        def _fetch_page_runs():
+                            def _run_cond(i):
+                                return i < num_cache_pages
+
+                            def _run_body(i):
+                                base_idx = jnp.minimum(
+                                    page_indices_offset + i, num_page_indices - 1
+                                )
+                                base_page = page_indices_ref[base_idx]
+
+                                def _ext_cond(run_len):
+                                    has_more = (i + run_len) < num_cache_pages
+                                    next_idx = jnp.minimum(
+                                        page_indices_offset + i + run_len,
+                                        num_page_indices - 1,
+                                    )
+                                    return jnp.logical_and(
+                                        has_more,
+                                        page_indices_ref[next_idx] == (base_page + run_len),
+                                    )
+
+                                def _ext_body(run_len):
+                                    return run_len + 1
+
+                                run_len = lax.while_loop(_ext_cond, _ext_body, jnp.int32(1))
+                                sz = jnp.minimum(
+                                    bkv_sz_frm_cache - i * page_size,
+                                    run_len * page_size,
+                                )
+                                _async_copy(
+                                    cache_hbm_ref.at[pl.ds(base_page * page_size, sz)],
+                                    vmem_ref.at[pl.ds(i * page_size, sz)],
+                                    sem,
+                                    wait=False,
+                                )
+                                return i + run_len
+
+                            lax.while_loop(_run_cond, _run_body, jnp.int32(0))
+
+                else:
+
+                    def _fetch_cache_page(i, _):
+                        sz = jnp.minimum(bkv_sz_frm_cache - i * page_size, page_size)
+                        page_idx = jnp.minimum(page_indices_offset + i, num_page_indices - 1)
+                        _async_copy(
+                            cache_hbm_ref.at[pl.ds(page_indices_ref[page_idx] * page_size, sz)],
+                            vmem_ref.at[pl.ds(i * page_size, sz)],
+                            sem,
+                            wait=False,
+                        )
+
+                    lax.fori_loop(0, num_cache_pages, _fetch_cache_page, None, unroll=False)
             else:
                 start_kv_page_idx = cdiv(cu_kv_lens_ref[seq_idx], page_size)
                 page_indices_offset = start_kv_page_idx + kv_p_start
@@ -719,12 +791,25 @@ def _ragged_paged_attention_kernel_loop(
             )
         else:
             dst = vmem_ref.at[pl.ds(0, bkv_sz_frm_cache + bkv_sz_frm_new)]
-            _async_copy(
-                src=dst,
-                dst=dst,
-                sem=sem,
-                wait=True,
-            )
+            if use_resident_bkv:
+
+                @pl.when(bkv_update_ids_ref[10 + bkv_sem_idx] > 0)
+                def _wait_bkv_dma():
+                    bkv_update_ids_ref[10 + bkv_sem_idx] = 0
+                    _async_copy(
+                        src=dst,
+                        dst=dst,
+                        sem=sem,
+                        wait=True,
+                    )
+
+            else:
+                _async_copy(
+                    src=dst,
+                    dst=dst,
+                    sem=sem,
+                    wait=True,
+                )
         return kv_len_start + bkv_sz_frm_cache, bkv_sz_frm_new
 
     def _update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz, *, wait=False):
@@ -756,6 +841,63 @@ def _ragged_paged_attention_kernel_loop(
                     sem,
                     wait=False,
                 )
+            elif coalesce_page_dma:
+                kv_p_end = cdiv(offset + update_sz, page_size)
+                num_update_pages = kv_p_end - kv_p_start
+
+                @pl.when(num_update_pages > 0)
+                def _update_cache_pages_coalesced():
+                    first_idx = jnp.minimum(page_indices_offset, num_page_indices - 1)
+                    last_idx = jnp.minimum(
+                        page_indices_offset + num_update_pages - 1,
+                        num_page_indices - 1,
+                    )
+                    first_page = page_indices_ref[first_idx]
+                    last_page = page_indices_ref[last_idx]
+                    is_single_span = (last_page - first_page) == (num_update_pages - 1)
+
+                    @pl.when(is_single_span)
+                    def _update_contiguous_span():
+                        _async_copy(
+                            vmem_ref.at[pl.ds(p_ignore * page_size + ignore, update_sz)],
+                            cache_hbm_ref.at[
+                                pl.ds(
+                                    first_page * page_size + ignore,
+                                    update_sz,
+                                )
+                            ],
+                            sem,
+                            wait=False,
+                        )
+
+                    @pl.when(jnp.logical_not(is_single_span))
+                    def _update_per_page():
+                        def loop_body(i, states):
+                            cur_update_sz, cur_ignore = states
+                            sz = jnp.minimum(page_size - cur_ignore, cur_update_sz)
+
+                            _async_copy(
+                                vmem_ref.at[pl.ds((p_ignore + i) * page_size + cur_ignore, sz)],
+                                cache_hbm_ref.at[
+                                    pl.ds(
+                                        page_indices_ref[page_indices_offset + i] * page_size
+                                        + cur_ignore,
+                                        sz,
+                                    )
+                                ],
+                                sem,
+                                wait,
+                            )
+                            return cur_update_sz - sz, 0
+
+                        lax.fori_loop(
+                            0,
+                            num_update_pages,
+                            loop_body,
+                            (update_sz, ignore),
+                            unroll=False,
+                        )
+
             else:
                 kv_p_end = cdiv(offset + update_sz, page_size)
 
@@ -827,6 +969,10 @@ def _ragged_paged_attention_kernel_loop(
         return _fetch_mask(seq_idx, bq_idx, bkvmask_idx, bkvmask_sem_idx, wait=True)
 
     def start_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx):
+        if use_resident_bkv:
+            bkv_update_ids_ref[6 + bkv_sem_idx] = seq_idx
+            bkv_update_ids_ref[8 + bkv_sem_idx] = bkv_idx
+            bkv_update_ids_ref[10 + bkv_sem_idx] = 1
         return _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx)
 
     def wait_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx):
@@ -1066,10 +1212,31 @@ def _ragged_paged_attention_kernel_loop(
                 # Prefetch next bkv
                 @pl.when(next_seq_idx < end_seq_idx)
                 def prefetch_next_bkv():
-                    sem_ids_ref[1] = next_bkv_sem_idx
-                    start_fetch_bkv(next_seq_idx, next_bkv_idx, next_bkv_sem_idx)
-                    if custom_mask_ref is not None:
-                        start_fetch_mask(next_seq_idx, next_bq_idx, next_bkv_idx, next_bkv_sem_idx)
+                    if use_resident_bkv:
+                        same_cur_buf = jnp.logical_and(
+                            next_seq_idx == seq_idx, next_bkv_idx == bkv_idx
+                        )
+                        same_other_buf = jnp.logical_and(
+                            bkv_update_ids_ref[6 + next_bkv_sem_idx] == next_seq_idx,
+                            bkv_update_ids_ref[8 + next_bkv_sem_idx] == next_bkv_idx,
+                        )
+                        actual_next_bkv_sem_idx = lax.select(
+                            same_cur_buf, bkv_sem_idx, next_bkv_sem_idx
+                        )
+                        sem_ids_ref[1] = actual_next_bkv_sem_idx
+                        already_resident = jnp.logical_or(same_cur_buf, same_other_buf)
+
+                        @pl.when(jnp.logical_not(already_resident))
+                        def _do_prefetch_bkv():
+                            start_fetch_bkv(next_seq_idx, next_bkv_idx, actual_next_bkv_sem_idx)
+
+                    else:
+                        sem_ids_ref[1] = next_bkv_sem_idx
+                        start_fetch_bkv(next_seq_idx, next_bkv_idx, next_bkv_sem_idx)
+                        if custom_mask_ref is not None:
+                            start_fetch_mask(
+                                next_seq_idx, next_bq_idx, next_bkv_idx, next_bkv_sem_idx
+                            )
 
                 # Wait for cur bq if not ready yet
                 @pl.when(bkv_idx == start_bkv_idx)
@@ -1233,19 +1400,16 @@ def _ragged_paged_attention_kernel_loop(
     @pl.when(seq_idx == start_seq_idx)
     def prologue():
         start_fetch_bq(seq_idx=start_seq_idx, bq_idx=0, bq_sem_idx=0)
-        # Initialize bkv_x2_ref to zeros to avoid NaN issues.
-        # Use bitcast to int32 and preserve actual shape (which may include bank conflict padding)
-        bkv_x2_int32_ref = bkv_x2_ref.bitcast(jnp.int32)
-        zeros = jnp.zeros(bkv_x2_int32_ref.shape[1:], jnp.int32)
-        bkv_x2_int32_ref[0] = zeros
+        # Initialize bkv_x2_ref to zeros to avoid NaN issues when kv mask is skipped.
+        # When not skip_kv_mask and predicate_cache_dma, tail rows >= effective_kv_len
+        # are bitwise-replaced by jnp.where (vnsel) in both s and v, so zero-filling
+        # 2x bkv_sz in VMEM before DMA launch is unnecessary.
+        if not (predicate_cache_dma and not skip_kv_mask):
+            bkv_x2_int32_ref = bkv_x2_ref.bitcast(jnp.int32)
+            zeros = jnp.zeros(bkv_x2_int32_ref.shape[1:], jnp.int32)
+            bkv_x2_int32_ref[0] = zeros
         start_fetch_bkv(seq_idx=start_seq_idx, bkv_idx=cur_seq_start_bkv_idx, bkv_sem_idx=0)
-        if predicate_cache_dma:
-
-            @pl.when(jnp.logical_or(start_seq_idx + 1 < end_seq_idx, kv_len > bkv_sz))
-            def _zero_second_bkv_buf():
-                bkv_x2_int32_ref[1] = zeros
-
-        else:
+        if not (predicate_cache_dma and not skip_kv_mask):
             bkv_x2_int32_ref[1] = zeros
         if custom_mask_ref is not None:
             start_fetch_mask(start_seq_idx, 0, 0, 0)
@@ -1795,6 +1959,8 @@ def get_vmem_limit():
         "predicate_cache_dma",
         "elide_single_tile_loops",
         "compact_span_mask",
+        "coalesce_page_dma",
+        "reuse_resident_bkv",
         "decode_only",
         "skip_decode",
     ),
@@ -1835,6 +2001,8 @@ def ragged_paged_attention(
     predicate_cache_dma: bool = True,
     elide_single_tile_loops: bool = True,
     compact_span_mask: bool = True,
+    coalesce_page_dma: bool = True,
+    reuse_resident_bkv: bool = True,
     decode_only: bool = False,
     skip_decode: bool = False,
 ):
@@ -1951,7 +2119,7 @@ def ragged_paged_attention(
     # Scalar prefetch init values.
     init_sem_ids = jnp.zeros((3,), jnp.int32)
     init_bo_ids = jnp.full((4,), -1, jnp.int32)
-    init_bkv_update_ids = jnp.full((6,), -1, jnp.int32)
+    init_bkv_update_ids = jnp.full((12 if reuse_resident_bkv else 6,), -1, jnp.int32)
 
     use_causal_mask = causal == 1
     tpu_version = get_tpu_version()
@@ -2097,6 +2265,8 @@ def ragged_paged_attention(
                 predicate_cache_dma=predicate_cache_dma,
                 elide_single_tile_loops=elide_single_tile_loops,
                 compact_span_mask=compact_span_mask,
+                coalesce_page_dma=coalesce_page_dma,
+                reuse_resident_bkv=reuse_resident_bkv,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=len(scalar_prefetches),

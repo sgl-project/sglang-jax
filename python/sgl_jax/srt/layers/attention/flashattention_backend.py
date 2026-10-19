@@ -856,6 +856,8 @@ class FlashAttention(AttentionBackend):
                 predicate_cache_dma=True,
                 elide_single_tile_loops=True,
                 compact_span_mask=True,
+                coalesce_page_dma=True,
+                reuse_resident_bkv=True,
                 decode_only=is_decode_only,
                 skip_decode=skip_decode_stage,
             )
