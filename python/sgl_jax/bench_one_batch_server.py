@@ -60,6 +60,7 @@ class BenchArgs:
     gsp_range_ratio: float = 1.0
     seed: int = 1
     gsp_send_routing_key: bool = False
+    gsp_question_seed: int | None = None
     gsp_num_turns: int = 1
     gsp_fast_prepare: bool = False
     gsp_ordered: bool = False
@@ -110,6 +111,12 @@ class BenchArgs:
         parser.add_argument("--gsp-range-ratio", type=float, default=BenchArgs.gsp_range_ratio)
         parser.add_argument("--seed", type=int, default=BenchArgs.seed)
         parser.add_argument("--gsp-send-routing-key", action="store_true", default=BenchArgs.gsp_send_routing_key)
+        parser.add_argument(
+            "--gsp-question-seed",
+            type=int,
+            default=BenchArgs.gsp_question_seed,
+            help="Seed questions separately from system prompts (same --seed => same system prompts across runs).",
+        )
         parser.add_argument("--gsp-num-turns", type=int, default=BenchArgs.gsp_num_turns)
         parser.add_argument("--gsp-fast-prepare", action="store_true", default=BenchArgs.gsp_fast_prepare)
         parser.add_argument("--gsp-ordered", action="store_true", default=BenchArgs.gsp_ordered)

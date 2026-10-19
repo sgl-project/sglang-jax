@@ -1782,6 +1782,7 @@ def get_gen_prefix_cache_path(args, tokenizer):
     cache_key = (
         f"gen_shared_prefix_{args.seed}_{args.gsp_num_groups}_{args.gsp_prompts_per_group}_"
         f"{args.gsp_system_prompt_len}_{args.gsp_question_len}_{args.gsp_output_len}_"
+        f"q{getattr(args, 'gsp_question_seed', None)}_"
         f"{tokenizer.__class__.__name__}.pkl"
     )
     return cache_dir / cache_key
@@ -1835,10 +1836,20 @@ def sample_generated_shared_prefix_requests(
     ).reshape(num_groups, prompts_per_group)
     del system_prompt_len, question_len, output_len
 
+    # --gsp-question-seed: seed system prompts and questions independently, so two
+    # invocations with the same --seed but different question seeds share every
+    # system prompt (prefix reuse across runs, e.g. HiCache A/B passes) while each
+    # pass asks fresh questions. Unset keeps the original single-stream behaviour.
+    question_seed = getattr(args, "gsp_question_seed", None)
+    if question_seed is not None:
+        random.seed(getattr(args, "seed", 1))
+
     # Generate system prompts for each group
     system_prompts = [
         gen_prompt(tokenizer, system_prompt_lens[i].item()) for i in range(num_groups)
     ]
+    if question_seed is not None:
+        random.seed(question_seed)
 
     # Generate questions: shape (num_groups, prompts_per_group, num_turns)
     questions = [
