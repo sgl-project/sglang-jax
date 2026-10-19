@@ -1754,8 +1754,14 @@ def sample_image_requests(
 
 @lru_cache(maxsize=1)
 def get_available_tokens(tokenizer):
-    """Get all available token ids from the tokenizer vocabulary."""
-    return list(tokenizer.get_vocab().values())
+    """Get all available token ids from the tokenizer vocabulary.
+
+    Sorted: HF fast tokenizers build get_vocab() from a Rust HashMap whose
+    iteration order is randomized per process, so an unsorted list makes
+    random.choices() pick different token ids for the same seed in every run
+    (seeded/cached gsp prompts would not actually be reproducible).
+    """
+    return sorted(set(tokenizer.get_vocab().values()))
 
 
 def gen_prompt(tokenizer, token_num):
