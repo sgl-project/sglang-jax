@@ -652,8 +652,12 @@ class Scheduler(
                 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
             # Disable the size gate; the compile-time threshold still controls writes.
             jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
-            # Include XLA sub-caches such as kernel/autotune data.
-            jax.config.update("jax_persistent_cache_enable_xla_caches", "all")
+            # Keep autotune caching, but exclude the kernel cache: JAX hashes its
+            # absolute file path into the key even on CPU/TPU, so relocated caches
+            # miss (jax-ml/jax#41044). The autotune path is excluded from the key.
+            jax.config.update(
+                "jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_autotune_cache_dir"
+            )
             from jax.experimental.compilation_cache import compilation_cache as cc
 
             cc.set_cache_dir(jit_cache_dir)
