@@ -455,6 +455,29 @@ def main_kernel(
         src_row_idx_in_vmem.reverse()
         row_valid_vec.reverse()
 
+        # A group that continues into the NEXT row block must not scatter its
+        # partial sum from this block: the next block writes the full sum to the
+        # same HBM row and column range, and two push streams from one core to
+        # one address carry no HBM write-ordering guarantee (the wait only covers
+        # the VMEM read). Within a block the sub-chunk test below already keeps
+        # partial sums off HBM; this is the same rule across the block boundary.
+        # Peek at the first row of the next block (the sort permutation of the
+        # whole partition is already in VMEM; clamp keeps the read in bounds).
+        last_row_idx = row_chunk_size - 1
+        next_block_start = (row_block_id + 1) * row_chunk_size
+        peek_start = jnp.minimum(
+            next_block_start,
+            scratch.sorted_by_validity_vmem.shape[0] - num_simd_lanes,
+        )
+        next_block_dst = (
+            scratch.sorted_by_validity_vmem[pl.ds(peek_start, num_simd_lanes)]
+            // cfg.reduce_group_size
+        )
+        last_group_continues = jnp.logical_and(
+            next_block_start < num_rows_current_row_partition,
+            next_block_dst[0] == get_dst_idx(last_row_idx),
+        )
+
         # Per source row, the (VMEM source row, HBM destination row) of its
         # scatter. Rows whose group is not yet fully reduced in this sub-chunk,
         # and padding rows, are routed to a throwaway row.
@@ -470,6 +493,12 @@ def main_kernel(
                 is_final_write = jnp.logical_and(
                     row_valid_vec[global_idx],
                     merge_target < (s + 1) * num_simd_lanes,
+                )
+                is_final_write = jnp.logical_and(
+                    is_final_write,
+                    jnp.logical_not(
+                        jnp.logical_and(last_group_continues, merge_target == last_row_idx)
+                    ),
                 )
                 sub_src.append(jnp.where(is_final_write, merge_target % num_simd_lanes, 0))
                 sub_dst.append(jnp.where(is_final_write, dst_indices_list[s][i], garbage_dst))
