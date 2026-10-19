@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import jax
 import numpy as np
 
+from sgl_jax.srt.layers.attention.base_attn_backend import get_batch_page_indices
 from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -53,6 +54,26 @@ class CompactKVBatchTest(unittest.TestCase):
             FlashAttention(2, 2, 64, page_size=PAGE_SIZE, mesh=self.mesh),
             MLAAttentionBackend(2, 64, 64, 64, 64, page_size=PAGE_SIZE, mesh=self.mesh),
             NativeAttention(2, 2, self.mesh),
+        )
+
+    def _compilation_manager(self, backend, pool_capacity=0):
+        return CompilationManager(
+            SimpleNamespace(
+                precompile_token_paddings=[8, 16],
+                precompile_bs_paddings=[4, 8],
+                moe_backend="none",
+                enable_static_lora=False,
+                precompile_num_threads=1,
+            ),
+            max_padded_batch_size=8,
+            max_padded_num_tokens=16,
+            dp_size=2,
+            tp_size=2,
+            page_size=PAGE_SIZE,
+            max_req_len=13,
+            vocab_size=128,
+            max_total_num_tokens=pool_capacity,
+            attn_backend=backend,
         )
 
     def _schedule_batch(self, mode, *, compact, empty_rank=False, spec=SpeculativeAlgorithm.NONE):
@@ -144,6 +165,7 @@ class CompactKVBatchTest(unittest.TestCase):
             (self._backends()[0], SpeculativeAlgorithm.EAGLE3),
             (self._backends()[1], SpeculativeAlgorithm.EAGLE3),
         ):
+            manager = self._compilation_manager(backend)
             for mode in (ForwardMode.EXTEND, ForwardMode.DECODE):
                 with self.subTest(backend=type(backend), mode=mode, spec=spec):
                     self.assertFalse(backend.use_compact_kv_metadata(mode, spec))
@@ -154,6 +176,17 @@ class CompactKVBatchTest(unittest.TestCase):
                     forward = self._forward_batch(worker, backend)
                     np.testing.assert_array_equal(forward.cache_loc, worker.cache_loc)
                     np.testing.assert_array_equal(forward.out_cache_loc, worker.out_cache_loc)
+                    dummy = manager._make_dummy_batch(
+                        4,
+                        8,
+                        mode,
+                        CACHE_CAPACITY,
+                        speculative_algorithm=spec,
+                        dp_size=2,
+                        per_dp_bs_size=2,
+                    )
+                    self.assertEqual(dummy.cache_loc.shape, (CACHE_CAPACITY,))
+                    self.assertIsNone(dummy.allocated_page_indices)
 
     def test_hybrid_preserves_full_and_recurrent_metadata(self):
         for full_backend in self._backends():
@@ -177,12 +210,18 @@ class CompactKVBatchTest(unittest.TestCase):
 
     def test_speculative_modes_keep_token_input_without_algorithm(self):
         for backend in self._backends()[:2]:
+            manager = self._compilation_manager(backend)
             for mode in (ForwardMode.TARGET_VERIFY, ForwardMode.DRAFT_EXTEND):
                 with self.subTest(backend=type(backend), mode=mode):
                     worker = self._worker_batch(mode, compact=True, spec=None)
                     self.assertIsNone(worker.allocated_page_indices)
                     forward = self._forward_batch(worker, backend)
                     np.testing.assert_array_equal(forward.cache_loc, worker.cache_loc)
+                    dummy = manager._make_dummy_batch(
+                        4, 8, mode, CACHE_CAPACITY, dp_size=2, per_dp_bs_size=2
+                    )
+                    self.assertEqual(dummy.cache_loc.shape, (CACHE_CAPACITY,))
+                    self.assertIsNone(dummy.allocated_page_indices)
 
     def test_batch_rechecks_mode_and_algorithm_on_each_call(self):
         batch = self._schedule_batch(ForwardMode.EXTEND, compact=True)
@@ -244,22 +283,62 @@ class CompactKVBatchTest(unittest.TestCase):
         self.assertIsNone(worker.cache_loc)
         self.assertEqual(worker.allocated_page_indices.size, CACHE_CAPACITY // PAGE_SIZE)
 
+    def test_precompile_page_rows_match_runtime_buckets(self):
+        for backend in self._backends()[:2]:
+            for pool_capacity in (0, 48):
+                manager = self._compilation_manager(backend, pool_capacity)
+                for mode in (ForwardMode.EXTEND, ForwardMode.DECODE):
+                    with self.subTest(
+                        backend=type(backend), pool_capacity=pool_capacity, mode=mode
+                    ):
+                        batch = self._schedule_batch(mode, compact=True)
+                        runtime = batch.get_model_worker_batch(
+                            manager.token_buckets,
+                            manager.bs_buckets,
+                            manager.cache_loc_buckets,
+                            PAGE_SIZE,
+                        )
+                        bs, tokens, cache_size, _ = next(
+                            shape
+                            for shape in manager.iter_model_shapes(mode)
+                            if shape[:2] == (len(runtime.seq_lens), len(runtime.input_ids))
+                        )
+                        precompile = manager._make_dummy_batch(
+                            bs, tokens, mode, cache_size, dp_size=2, per_dp_bs_size=bs // 2
+                        )
+                        expected_shape = (2, cache_size // (2 * PAGE_SIZE))
+                        for worker in (precompile, runtime):
+                            self.assertIsNone(worker.cache_loc)
+                            self.assertEqual(
+                                get_batch_page_indices(worker, PAGE_SIZE).shape, expected_shape
+                            )
+                        expected = backend.get_forward_metadata(precompile).page_indices
+                        actual = backend.get_forward_metadata(runtime).page_indices
+                        self.assertEqual(actual.shape, expected.shape)
+                        self.assertEqual(actual.dtype, expected.dtype)
+                        self.assertEqual(actual.sharding, expected.sharding)
+
+    def test_sampler_dummy_batch_with_partial_page(self):
+        for backend in self._backends()[:2]:
+            manager = self._compilation_manager(backend)
+            for bs in (1, PAGE_SIZE - 1, PAGE_SIZE + 1):
+                with self.subTest(backend=type(backend), bs=bs):
+                    dummy = manager._make_dummy_batch(bs, bs, ForwardMode.DECODE, bs)
+                    self.assertIsNone(dummy.cache_loc)
+                    self.assertEqual(
+                        get_batch_page_indices(dummy, PAGE_SIZE).shape,
+                        (1, len(range(0, bs, PAGE_SIZE))),
+                    )
+
     def test_warmup_and_aot_match_runtime_cache_layout(self):
-        manager = SimpleNamespace(
-            vocab_size=128,
-            capture_hidden_states=False,
-            has_recurrent_state=False,
-            supports_recurrent_cow=False,
-            supports_recurrent_track=False,
-        )
         for backend in self._backends():
+            manager = self._compilation_manager(backend)
             for mode in (ForwardMode.EXTEND, ForwardMode.DECODE):
                 with self.subTest(backend=type(backend), mode=mode):
                     compact = backend.use_compact_kv_metadata(mode, SpeculativeAlgorithm.NONE)
                     worker = self._worker_batch(mode, compact=compact)
                     runtime = self._forward_batch(worker, backend)
-                    dummy = CompilationManager._make_dummy_batch(
-                        manager,
+                    dummy = manager._make_dummy_batch(
                         4,
                         len(worker.input_ids),
                         mode,

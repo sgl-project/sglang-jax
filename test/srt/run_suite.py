@@ -407,6 +407,9 @@ suites = {
         TestFile("test/srt/test_dtype_config_llama.py", 1),
         TestFile("test/srt/test_dtype_config_consistency.py", 10),
         TestFile("python/sgl_jax/test/test_compilation_manager.py", 1),
+        TestFile("test/srt/test_merge_cache_loc.py", 0.1),
+        TestFile("test/srt/layers/attention/test_page_metadata.py", 0.1),
+        TestFile("test/srt/managers/test_compact_kv_metadata.py", 0.1),
         TestFile("python/sgl_jax/test/test_kernel_utils.py", 1),
         TestFile(
             "python/sgl_jax/test/test_mla_v2_bitexact.py",

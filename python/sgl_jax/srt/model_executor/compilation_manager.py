@@ -157,6 +157,7 @@ class CompilationManager:
         self.moe_backend = moe_backend if moe_backend is not None else server_args.moe_backend
         self.enable_static_lora = server_args.enable_static_lora
         self.precompile_num_threads = server_args.precompile_num_threads
+        self.attn_backend = attn_backend
         # Backends may request decode variants per pages-per-seq bucket (MSA);
         # None keeps one decode shape per bs. Shared by warmup and AOT export.
         self.decode_page_buckets = getattr(attn_backend, "decode_page_buckets", None)
@@ -714,8 +715,21 @@ class CompilationManager:
         if invalid_cache_loc_size < 0:
             raise ValueError(f"padding cache_loc_size {invalid_cache_loc_size} < 0!")
 
-        valid_cache_loc = np.arange(bs)
-        invalid_cache_loc = np.array([0] * invalid_cache_loc_size, dtype=jnp.int32)
+        allocated_page_indices = None
+        if self.attn_backend is not None and self.attn_backend.use_compact_kv_metadata(
+            mode, spec_algorithm_value
+        ):
+            assert max_cache_loc_size % dp_size == 0
+            per_dp_cache_loc_size = max_cache_loc_size // dp_size
+            # Match the per-DP token-to-page slice length. Model buckets are
+            # page-aligned; sampler-only batches can be smaller than one page.
+            pages_per_dp = (per_dp_cache_loc_size + self.page_size - 1) // self.page_size
+            allocated_page_indices = np.zeros(dp_size * pages_per_dp, dtype=np.int32)
+            cache_loc = None
+        else:
+            valid_cache_loc = np.arange(bs)
+            invalid_cache_loc = np.array([0] * invalid_cache_loc_size, dtype=jnp.int32)
+            cache_loc = np.concat([valid_cache_loc, invalid_cache_loc], axis=0)
         lora_ids = ["0"] * bs
 
         extend_seq_lens = np.array([1] * bs) if mode == ForwardMode.EXTEND else None
@@ -745,7 +759,8 @@ class CompilationManager:
             sampling_info=sampling_info,
             extend_input_logprob_token_ids=None,
             positions=np.concat([valid_positions, invalid_positions], axis=0),
-            cache_loc=np.concat([valid_cache_loc, invalid_cache_loc], axis=0),
+            cache_loc=cache_loc,
+            allocated_page_indices=allocated_page_indices,
             extend_prefix_lens=(np.array([0] * bs) if mode == ForwardMode.EXTEND else None),
             extend_seq_lens=extend_seq_lens,
             top_logprobs_nums=None,
