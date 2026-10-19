@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -21,6 +22,15 @@ if TYPE_CHECKING:
     from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
+
+
+def _vfio_dma_entry_limit() -> int | None:
+    """vfio_iommu_type1.dma_entry_limit (max DMA mappings per VFIO container), or None."""
+    try:
+        with open("/sys/module/vfio_iommu_type1/parameters/dma_entry_limit") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
 
 
 def _host_mem_available_bytes() -> int | None:
@@ -153,6 +163,39 @@ def init_hicache(cache, server_args, mesh, token_to_kv_pool_allocator) -> None:
                 per_slot / 2**20,
             )
             num_pages = max_pages
+            host_pool = _make_pool(num_pages)
+
+    # DMA-mapping budget: every pinned-host slot shard is a separate VFIO DMA
+    # mapping, and the kernel caps mappings per VFIO container at
+    # vfio_iommu_type1.dma_entry_limit (default 65535). Exceeding it fails the
+    # pinned allocation mid-serving ("ioctl failed ... /dev/vfio/vfio, return
+    # code: 8"), after which the TPU runtime errors and the process aborts
+    # (run18: ~16.6k pages with KV+indexer groups on tpu7x). Cap the pool below
+    # the limit; raise the limit (write the sysfs parameter before the server
+    # starts) to lift the cap.
+    dma_limit = _vfio_dma_entry_limit()
+    if dma_limit is not None:
+        entries_per_page = int(
+            os.environ.get(
+                "SGL_HICACHE_DMA_ENTRIES_PER_PAGE",
+                # One mapping per buffer group per device sharing a container;
+                # measured 4 on tpu7x (2 groups x 2 TensorCores per chip).
+                str(2 * len(getattr(host_pool, "_groups", (None,)))),
+            )
+        )
+        dma_pages = int(dma_limit * 0.9) // max(1, entries_per_page)
+        if dma_pages < num_pages:
+            logger.warning(
+                "HiCache: capping host pool from %d to %d pages to stay under "
+                "vfio_iommu_type1.dma_entry_limit=%d (~%d DMA mappings per page). Raise it with "
+                "'echo 4194304 > /sys/module/vfio_iommu_type1/parameters/dma_entry_limit' "
+                "before starting the server to lift this cap.",
+                num_pages,
+                dma_pages,
+                dma_limit,
+                entries_per_page,
+            )
+            num_pages = dma_pages
             host_pool = _make_pool(num_pages)
     controller = HiCacheController(host_pool, device_pool)
 
