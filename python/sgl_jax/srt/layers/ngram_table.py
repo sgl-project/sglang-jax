@@ -8,9 +8,7 @@ thread count with the row count.
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,8 +22,6 @@ logger = logging.getLogger(__name__)
 
 _ROWS_PER_THREAD = 1024  # 128 rows -> 1t, 4,096 -> 4t, 131,072 -> 32t
 _MAX_THREADS = 32  # past this the box fights itself
-
-CACHE_FORMAT_VERSION = 1
 
 
 def _thread_count(rows: int, cap: int | None = None) -> int:
@@ -206,121 +202,6 @@ class NGramTable:
                     f"checkpoint {shipped[bad]} vs derived {derived[bad]}. "
                     "Every N-gram lookup would silently read the wrong row."
                 )
-
-    # -- local cache ---------------------------------------------------------
-
-    _STREAM_ROWS = 1 << 20  # ~320 MiB per chunk at the released row width
-
-    def write_to(self, stream) -> int:
-        """Raw rows out, chunked; pair with read_into + metadata. A stream because
-        v6e-1's disk is smaller than the table."""
-        written = 0
-        for lo in range(0, self.padded_rows, self._STREAM_ROWS):
-            block = self.data[lo : lo + self._STREAM_ROWS].tobytes()
-            stream.write(block)
-            written += len(block)
-        return written
-
-    def read_into(self, stream) -> None:
-        """Fill the table from a stream written by :meth:`write_to`."""
-        view = memoryview(self.data.reshape(-1).view(np.uint8))
-        offset = 0
-        while offset < len(view):
-            chunk = stream.read(min(1 << 26, len(view) - offset))
-            if not chunk:
-                break
-            view[offset : offset + len(chunk)] = chunk
-            offset += len(chunk)
-        if offset != len(view):
-            raise ValueError(f"stream ended after {offset} bytes, expected {len(view)}")
-
-    def metadata(self) -> dict:
-        return {
-            "version": CACHE_FORMAT_VERSION,
-            "rows": self.rows,
-            "padded_rows": self.padded_rows,
-            "dim": self.dim,
-            "dtype": "bfloat16",
-            "ngram_size": self.params.ngram_size,
-            "heads_per_ngram": self.params.heads_per_ngram,
-            "eos_token_id": self.params.eos_token_id,
-            "multipliers": self.params.multipliers.tolist(),
-            "sizes": self.params.sizes.tolist(),
-            "offsets": self.params.offsets.tolist(),
-        }
-
-    @classmethod
-    def from_metadata(cls, meta: dict) -> NGramTable:
-        """Allocated but empty; fill with :meth:`read_into`."""
-        if meta["version"] != CACHE_FORMAT_VERSION:
-            raise ValueError(
-                f"N-gram table cache is version {meta['version']}, "
-                f"this build writes {CACHE_FORMAT_VERSION}"
-            )
-        params = NGramHashParams(
-            multipliers=np.array(meta["multipliers"], np.int64),
-            sizes=np.array(meta["sizes"], np.int64),
-            offsets=np.array(meta["offsets"], np.int64),
-            total_vocab_size=meta["rows"],
-            heads_per_ngram=meta["heads_per_ngram"],
-            ngram_size=meta["ngram_size"],
-            eos_token_id=meta["eos_token_id"],
-        )
-        return cls(params, meta["dim"], padded_rows=meta["padded_rows"])
-
-    def save_cache(self, directory: str | Path) -> Path:
-        """Flat file + json sidecar, restored with one sequential read."""
-        directory = Path(directory)
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / "ngram_table.json").write_text(json.dumps(self.metadata()))
-        with open(directory / "ngram_table.bin", "wb") as f:
-            self.write_to(f)
-        return directory
-
-    @classmethod
-    def from_cache(cls, directory: str | Path) -> NGramTable:
-        directory = Path(directory)
-        meta = json.loads((directory / "ngram_table.json").read_text())
-        table = cls.from_metadata(meta)
-        path = directory / "ngram_table.bin"
-        want = table.padded_rows * table.dim * 2
-        got = os.path.getsize(path)
-        if got != want:
-            raise ValueError(f"{path} is {got} bytes, expected {want}")
-        # mmap: pages load lazily and the OS can evict them.
-        table.data = np.memmap(path, dtype=np.uint16, mode="r").reshape(
-            table.padded_rows, table.dim
-        )
-        _madvise_random(table.data)
-        return table
-
-
-_MADV_RANDOM = 1
-
-
-def _madvise_random(array: np.ndarray) -> bool:
-    """Reads are 320 B rows scattered over the table, so readahead only wastes
-    I/O. Best-effort."""
-    import ctypes
-    import ctypes.util
-
-    try:
-        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-        addr = array.ctypes.data
-        page = os.sysconf("SC_PAGESIZE")
-        base = addr - (addr % page)
-        rc = libc.madvise(
-            ctypes.c_void_p(base),
-            ctypes.c_size_t(array.nbytes + (addr - base)),
-            ctypes.c_int(_MADV_RANDOM),
-        )
-    except Exception as exc:  # noqa: BLE001 - advisory only
-        logger.warning("N-gram table: madvise(MADV_RANDOM) unavailable (%s)", exc)
-        return False
-    if rc != 0:
-        logger.warning("N-gram table: madvise(MADV_RANDOM) failed")
-        return False
-    return True
 
 
 def _eos_token_id(config) -> int:

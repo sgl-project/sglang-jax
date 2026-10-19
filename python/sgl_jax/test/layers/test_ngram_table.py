@@ -4,8 +4,6 @@ Built against synthetic safetensors shards with the released checkpoint's
 naming and split, so it runs on a CPU runner without the 95.4 GiB table.
 """
 
-import io
-import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -104,7 +102,7 @@ class TestShardPlacement(CustomTestCase):
 
 
 class TestLoadAndGather(CustomTestCase):
-    def test_checkpoint_and_cache_round_trip(self):
+    def test_checkpoint_load(self):
         params = _params()
         for drop_buffer in (False, True):
             with self.subTest(drop_buffer=drop_buffer), tempfile.TemporaryDirectory() as directory:
@@ -112,35 +110,18 @@ class TestLoadAndGather(CustomTestCase):
                 table = NGramTable.from_safetensors(files, _Config())
                 self.assertEqual((table.rows, table.dim), (params.total_vocab_size, DIM))
                 self.assertEqual(table.padded_rows % 128, 0)
-                cache = Path(directory) / "cache"
-                table.save_cache(cache)
-                restored = NGramTable.from_cache(cache)
-                stream = io.BytesIO()
-                self.assertEqual(table.write_to(stream), table.padded_rows * DIM * 2)
-                stream.seek(0)
-                streamed = NGramTable.from_metadata(table.metadata())
-                # Legal short reads must be retried until the table is full.
-                with patch.object(
-                    stream,
-                    "read",
-                    side_effect=lambda size, stream=stream: io.BytesIO.read(stream, min(size, 37)),
-                ):
-                    streamed.read_into(stream)
                 shard_rows = table.padded_rows // SPLIT_PARTS
                 boundaries = np.arange(1, SPLIT_PARTS) * shard_rows
                 ids = np.r_[0, table.rows - 1, boundaries - 1, boundaries].astype(np.int32)
                 ids = ids.reshape(-1, HEADS)
                 want = np.repeat((ids % 65535).astype(np.uint16)[:, :, None], DIM, axis=2)
-                for candidate in (table, restored, streamed):
-                    for field in ("multipliers", "sizes", "offsets"):
-                        np.testing.assert_array_equal(
-                            getattr(candidate.params, field), getattr(params, field)
-                        )
-                    got = candidate.gather(ids)
-                    self.assertEqual(got.dtype, ml_dtypes.bfloat16)
+                for field in ("multipliers", "sizes", "offsets"):
                     np.testing.assert_array_equal(
-                        got.view(np.uint16).reshape(*ids.shape, DIM), want
+                        getattr(table.params, field), getattr(params, field)
                     )
+                got = table.gather(ids)
+                self.assertEqual(got.dtype, ml_dtypes.bfloat16)
+                np.testing.assert_array_equal(got.view(np.uint16).reshape(*ids.shape, DIM), want)
 
     def test_gather_shapes_dtypes_and_output_reuse(self):
         for dim in (7, 64, 257):
@@ -180,7 +161,7 @@ class TestLoadAndGather(CustomTestCase):
                 single = table.gather(ids).view(np.uint16).copy()
             np.testing.assert_array_equal(threaded, single)
 
-    def test_checkpoint_and_cache_validation(self):
+    def test_checkpoint_validation(self):
         params = _params()
         for bad in (
             "missing_shard",
@@ -197,30 +178,6 @@ class TestLoadAndGather(CustomTestCase):
                 error = KeyError if bad == "missing_shard" else ValueError
                 with self.assertRaises(error):
                     NGramTable.from_safetensors(files, _Config())
-        for bad in ("truncated_cache", "short_stream", "version"):
-            with self.subTest(bad=bad), tempfile.TemporaryDirectory() as directory:
-                table = NGramTable.from_safetensors(_write_checkpoint(directory, params), _Config())
-                cache = Path(directory) / "cache"
-                table.save_cache(cache)
-                if bad == "short_stream":
-                    stream = io.BytesIO()
-                    table.write_to(stream)
-                    with self.assertRaises(ValueError):
-                        NGramTable.from_metadata(table.metadata()).read_into(
-                            io.BytesIO(stream.getvalue()[:-64])
-                        )
-                    continue
-                if bad == "truncated_cache":
-                    path = cache / "ngram_table.bin"
-                    with path.open("r+b") as file:
-                        file.truncate(path.stat().st_size - 2 * DIM)
-                else:
-                    path = cache / "ngram_table.json"
-                    metadata = json.loads(path.read_text())
-                    metadata["version"] += 1
-                    path.write_text(json.dumps(metadata))
-                with self.assertRaises(ValueError):
-                    NGramTable.from_cache(cache)
 
 
 class TestSchedulerHandoff(CustomTestCase):
