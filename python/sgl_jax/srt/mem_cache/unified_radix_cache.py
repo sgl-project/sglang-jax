@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import heapq
 import logging
+import os
+import time
 from collections import defaultdict
 from functools import partial
 from typing import TYPE_CHECKING
@@ -200,6 +202,16 @@ class UnifiedRadixCache(BasePrefixCache):
         # Injected by the overlap scheduler so write_back's eviction-time D2H
         # gather waits for the prior forward's replace_all (donation-safe).
         self._donation_barrier = None
+        # HiCache observability: cumulative counters + a periodic summary line
+        # (see _maybe_log_hicache_stats). Per-event lines (backup / demote /
+        # restore) log at INFO when SGL_HICACHE_LOG_EVENTS=1, else DEBUG.
+        self.hicache_stats: dict[str, int] = defaultdict(int)
+        self._hicache_stats_logged: dict[str, int] = {}
+        self._hicache_stats_last_t = time.monotonic()
+        self._hicache_stats_interval = float(os.environ.get("SGL_HICACHE_STATS_INTERVAL", "30"))
+        self._hicache_event_level = (
+            logging.INFO if os.environ.get("SGL_HICACHE_LOG_EVENTS", "0") == "1" else logging.DEBUG
+        )
 
         self.reset()
 
@@ -1077,6 +1089,17 @@ class UnifiedRadixCache(BasePrefixCache):
         cd.host_value = np.array(host_pages, dtype=np.int64)
         self.dec_lock_ref(node, lock_result.to_dec_params())
         self.ongoing_write[future] = (node, host_pages)
+        self.hicache_stats["backup_nodes"] += 1
+        self.hicache_stats["backup_pages"] += num_pages
+        logger.log(
+            self._hicache_event_level,
+            "HiCache backup: dp_rank=%d pages=%d (device %s.. -> host slots %s..) policy=%s",
+            node_dp_rank,
+            num_pages,
+            [int(p) for p in global_pages[:3]],
+            host_pages[:3],
+            "write_back" if write_back else self.write_policy,
+        )
         return num_pages
 
     def _free_host_pages(self, node: UnifiedTreeNode) -> None:
@@ -1112,6 +1135,7 @@ class UnifiedRadixCache(BasePrefixCache):
             if exc is not None:
                 node.component_data[BASE_COMPONENT_TYPE].host_value = None
                 self.host_pool.free(list(host_pages))
+                self.hicache_stats["backup_failed_pages"] += len(host_pages)
                 logger.warning(
                     "HiCache write for node %r failed: %s; host_value cleared, "
                     "%d host page(s) freed.",
@@ -1130,6 +1154,60 @@ class UnifiedRadixCache(BasePrefixCache):
         """Non-blocking poll of in-flight D2H writes (scheduler hook)."""
         if self.hicache_enabled:
             self.writing_check()
+            self._maybe_log_hicache_stats()
+
+    def _maybe_log_hicache_stats(self, force: bool = False) -> None:
+        """Periodic one-line HiCache summary (only when something changed).
+
+        Counters are cumulative since start; the line also shows the delta since
+        the previous summary. Page bytes are logical full-page bytes (all layers,
+        all buffer groups), i.e. what one restore/backup of that page moves.
+        """
+        now = time.monotonic()
+        if not force and now - self._hicache_stats_last_t < self._hicache_stats_interval:
+            return
+        self._hicache_stats_last_t = now
+        cur = dict(self.hicache_stats)
+        if cur == self._hicache_stats_logged:
+            return
+        prev = self._hicache_stats_logged
+        self._hicache_stats_logged = cur
+
+        def d(k):
+            return cur.get(k, 0) - prev.get(k, 0)
+
+        page_mb = 0.0
+        if self.host_pool is not None and hasattr(self.host_pool, "_groups"):
+            page_mb = sum(g.slot_bytes() for g in self.host_pool._groups) / 2**20
+        host_used = host_total = 0
+        if self.host_pool is not None:
+            host_total = int(self.host_pool.total_size())
+            host_used = host_total - int(self.host_pool.available_size())
+        logger.info(
+            "HiCache stats: host pool %d/%d pages (%.1f%%) | backup %d pages (+%d, %.2f GB) "
+            "in %d nodes, failed %d | demoted-to-host %d pages (+%d), dropped %d pages (+%d) | "
+            "restore %d pages (+%d, %.2f GB) in %d reqs (+%d), refused %d | host-evicted %d pages (+%d)",
+            host_used,
+            host_total,
+            100.0 * host_used / max(1, host_total),
+            cur.get("backup_pages", 0),
+            d("backup_pages"),
+            d("backup_pages") * page_mb / 1024,
+            cur.get("backup_nodes", 0),
+            cur.get("backup_failed_pages", 0),
+            cur.get("demoted_pages", 0),
+            d("demoted_pages"),
+            cur.get("dropped_pages", 0),
+            d("dropped_pages"),
+            cur.get("restore_pages", 0),
+            d("restore_pages"),
+            d("restore_pages") * page_mb / 1024,
+            cur.get("restore_reqs", 0),
+            d("restore_reqs"),
+            cur.get("restore_refused", 0),
+            cur.get("host_evicted_pages", 0),
+            d("host_evicted_pages"),
+        )
 
     def flush_write_through_acks(self) -> None:
         """Settle finished D2H writes mid-step to free device locks early."""
@@ -1162,6 +1240,8 @@ class UnifiedRadixCache(BasePrefixCache):
         """Evict a device leaf. Backed-up nodes are demoted to tombstones
         instead of deleted, so later matches can reload them from host."""
         assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
+        _dev_val = node.component_data[BASE_COMPONENT_TYPE].value
+        _dev_pages = (len(_dev_val) // max(1, self.page_size)) if _dev_val is not None else 0
 
         # write_back: do the D2H backup BEFORE freeing device pages, otherwise
         # the gather would read reclaimed pages. _donation_barrier is only set
@@ -1183,6 +1263,13 @@ class UnifiedRadixCache(BasePrefixCache):
 
         if self.hicache_enabled and node.backuped:
             # Demote to host tier: keep the tombstone in-tree.
+            self.hicache_stats["demoted_pages"] += len(node.component_data[BASE_COMPONENT_TYPE].host_value)
+            logger.log(
+                self._hicache_event_level,
+                "HiCache demote: dp_rank=%s %d pages evicted from HBM, kept on host (tombstone)",
+                node.key.dp_rank if node.key else None,
+                len(node.component_data[BASE_COMPONENT_TYPE].host_value),
+            )
             self._update_evictable_leaf_sets(node)
             self._update_evictable_leaf_sets(node.parent)
             return
@@ -1197,6 +1284,8 @@ class UnifiedRadixCache(BasePrefixCache):
             return
 
         parent = node.parent
+        if self.hicache_enabled:
+            self.hicache_stats["dropped_pages"] += _dev_pages
         self._remove_leaf_from_parent(node)
         self._update_evictable_leaf_sets(parent)
 
@@ -1264,6 +1353,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
         self.hicache_controller.evict_callback(buffer_ids)
         cd.host_value = None
+        self.hicache_stats["host_evicted_pages"] += len(buffer_ids)
         self.evictable_host_leaves.discard(node)
         parent = node.parent
         self._remove_leaf_from_parent(node)

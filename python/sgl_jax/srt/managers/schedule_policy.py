@@ -696,7 +696,12 @@ class PrefillAdder:
                     req.host_hit_length = max(0, req.host_hit_length - len(new_indices))
                     prefix_len = len(req.prefix_indices)
                     req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-                    logger.info(
+                    stats = getattr(self.tree_cache, "hicache_stats", None)
+                    if stats is not None:
+                        stats["restore_reqs"] += 1
+                        stats["restore_pages"] += (len(new_indices) + self.page_size - 1) // self.page_size
+                    logger.log(
+                        getattr(self.tree_cache, "_hicache_event_level", logging.INFO),
                         "HiCache restore: rid=%s dp_rank=%d restored=%d tokens "
                         "(%d pages) device_prefix=%d host_hit_left=%d extend=%d",
                         req.rid,
@@ -707,6 +712,10 @@ class PrefillAdder:
                         req.host_hit_length,
                         req.extend_input_len,
                     )
+                else:
+                    stats = getattr(self.tree_cache, "hicache_stats", None)
+                    if stats is not None:
+                        stats["restore_refused"] += 1
 
             req.last_matched_prefix_len = prefix_len
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)

@@ -245,6 +245,25 @@ class TestWriteThrough(HiCacheE2EBase):
         self._settle_writes()
 
 
+class TestHiCacheStats(HiCacheE2EBase):
+    def test_counters_backup_demote_drop_and_summary(self):
+        tokens = [60, 61, 62, 63]
+        idx, _ = self._alloc_and_fill(len(tokens), seed=9)
+        self.cache.insert(InsertParams(key=_key(tokens), value=idx))  # backed up (R1)
+        self._settle_writes()
+        st = self.cache.hicache_stats
+        self.assertEqual(st["backup_nodes"], 1)
+        self.assertEqual(st["backup_pages"], self._pages(len(tokens)))
+        self.cache.evict(EvictParams(num_tokens=len(tokens), dp_rank=0))
+        self.assertEqual(st["demoted_pages"], self._pages(len(tokens)))
+        self.assertEqual(st.get("dropped_pages", 0), 0)
+        with self.assertLogs("sgl_jax.srt.mem_cache.unified_radix_cache", level="INFO") as cm:
+            self.cache._maybe_log_hicache_stats(force=True)
+        self.assertTrue(any("HiCache stats:" in m for m in cm.output))
+        # Unchanged counters -> no second line.
+        self.cache._maybe_log_hicache_stats(force=True)
+
+
 class TestEvictAndLoadBack(HiCacheE2EBase):
     def test_device_evict_demotes_to_host_then_load_back(self):
         tokens = [20, 21, 22, 23]
