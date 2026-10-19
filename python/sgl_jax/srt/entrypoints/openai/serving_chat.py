@@ -63,6 +63,16 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> tuple[GenerateReqInput | GenerateOmniReqInput, ChatCompletionRequest]:
         """Convert OpenAI chat completion request to internal format"""
         model_config = getattr(self.tokenizer_manager, "model_config", None)
+        if getattr(model_config, "text_only_model", None):
+            for message in request.messages:
+                if isinstance(message.content, list) and any(
+                    (part.get("type") if isinstance(part, dict) else part.type) != "text"
+                    for part in message.content
+                ):
+                    raise ValueError(
+                        f"{model_config.text_only_model} currently supports text-only requests; "
+                        "image, video and audio inputs are not supported."
+                    )
         is_multimodal = (
             model_config.is_multimodal
             if model_config is not None

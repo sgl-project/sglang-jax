@@ -54,7 +54,15 @@ from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import
     ],
 )
 def test_kv_writeback(
-    sequences, page_size, window, chunk_size, sink, bkv_sz, bkv_csz, reuse_prefix
+    sequences,
+    page_size,
+    window,
+    chunk_size,
+    sink,
+    bkv_sz,
+    bkv_csz,
+    reuse_prefix,
+    attention_chunk_size=None,
 ):
     # Each sequence is (new token count, cached prefix length).
     q_lens, prefixes = np.array(sequences).T
@@ -92,7 +100,12 @@ def test_kv_writeback(
     )
     cu_q_lens = jnp.asarray(cu_q_lens, jnp.int32)
     kv_lens = jnp.asarray(kv_lens, jnp.int32)
-    attention_args = dict(sm_scale=head_dim**-0.5, sliding_window=window, attention_sink=sink)
+    attention_args = dict(
+        sm_scale=head_dim**-0.5,
+        sliding_window=window,
+        attention_sink=sink,
+        attention_chunk_size=attention_chunk_size,
+    )
     expected_output = ref_ragged_paged_attention(
         queries,
         jnp.asarray(expected_cache[:, :, :, 0, :], jnp.bfloat16),
@@ -179,3 +192,27 @@ def test_kv_writeback(
         rtol=0.03,
     )
     np.testing.assert_array_equal(decoded_cache.astype(np.float32), expected_cache)
+
+
+@pytest.mark.skipif(jax.default_backend() != "tpu", reason="Requires TPU DMA support")
+@pytest.mark.parametrize(
+    "sequences,chunk_prefill,reuse_prefix",
+    [
+        ([(393, 0)], None, True),
+        ([(416, 256)], 416, False),
+        ([(33, 8191), (17, 16383)], None, False),
+        ([(1, 8191), (1, 8192), (1, 32768)], None, False),
+    ],
+)
+def test_chunk_local_kv_writeback(sequences, chunk_prefill, reuse_prefix):
+    test_kv_writeback(
+        sequences,
+        128,
+        None,
+        chunk_prefill,
+        None,
+        256,
+        128,
+        reuse_prefix,
+        attention_chunk_size=256 if sequences[0][1] < 8191 else 8192,
+    )

@@ -203,6 +203,8 @@ class FlashAttentionMetadata:
 class FlashAttention(AttentionBackend):
     """Native Attention layer for variable-length sequences using ForwardBatch."""
 
+    supports_attention_chunk_size = True
+
     def __init__(
         self,
         num_attn_heads,
@@ -839,6 +841,7 @@ class FlashAttention(AttentionBackend):
                 sm_scale=scale,
                 sliding_window=layer.sliding_window_size,
                 soft_cap=layer.logit_cap,
+                attention_chunk_size=layer.attention_chunk_size,
                 xai_temperature_len=(
                     layer.xai_temperature_len if layer.xai_temperature_len > 0 else None
                 ),

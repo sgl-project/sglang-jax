@@ -38,6 +38,7 @@ class RadixAttention(nnx.Module):
         logit_cap: float = 0,
         attn_type: AttentionType = AttentionType.DECODER,
         softmax_dtype: jnp.dtype | None = None,
+        attention_chunk_size: int | None = None,
     ):
         super().__init__()
         self.q_head_num = num_heads
@@ -48,6 +49,9 @@ class RadixAttention(nnx.Module):
         self.scaling = scaling
         self.layer_id = layer_id
         self.sliding_window_size = sliding_window_size or None
+        if attention_chunk_size is not None and attention_chunk_size <= 0:
+            raise ValueError("attention_chunk_size must be positive")
+        self.attention_chunk_size = attention_chunk_size
         self.logit_cap = logit_cap or None
         self.attn_type = attn_type
         self.xai_temperature_len = -1
