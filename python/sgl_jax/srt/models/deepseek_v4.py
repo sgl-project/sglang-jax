@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import jax
@@ -464,14 +465,17 @@ class DeepseekV4Compressor(nnx.Module):
         self.norm = RMSNorm(head_dim, epsilon=config.rms_norm_eps, param_dtype=jnp.float32)
         self.ratio = ratio
 
-    def prepare_fused_projection(self, mesh):
+    def prepare_fused_projection(self, mesh, *, abstract=False):
         """Materialise the HCA kernels' fused ``[hidden, 2*D]`` bf16 projection once.
 
         Without it ``fused_projection_weight`` rebuilds it in every HCA layer on every
         step: an f32->bf16 convert of ``wgate`` (8 MB prefetched through VMEM), a
         concatenation and a transpose.
         """
-        with jax.set_mesh(mesh):
+        context = (
+            jax.sharding.use_abstract_mesh(mesh.abstract_mesh) if abstract else jax.set_mesh(mesh)
+        )
+        with context:
             fused = jnp.concatenate(
                 (self.wkv.value.astype(jnp.bfloat16), self.wgate.value.astype(jnp.bfloat16)),
                 axis=0,
@@ -605,7 +609,7 @@ class DeepseekV4Attention(nnx.Module):
         )
         self.indexer = DeepseekV4Indexer(config, mesh, dtype) if self.ratio == 4 else None
 
-    def prepare_grouped_wo_a(self):
+    def prepare_grouped_wo_a(self, *, abstract=False):
         """Materialise the grouped, dequantised wo_a once after loading.
 
         The forward used to dequantise (scale broadcast + multiply) and regroup wo_a on
@@ -617,7 +621,12 @@ class DeepseekV4Attention(nnx.Module):
             use_fused_wo_a,
         )
 
-        with jax.set_mesh(self.mesh):
+        context = (
+            jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh)
+            if abstract
+            else jax.set_mesh(self.mesh)
+        )
+        with context:
             weights = group_wo_a(
                 _checkpoint_matrix(self.wo_a),
                 num_groups=self.num_groups,
@@ -1073,10 +1082,6 @@ class DeepseekV4ForCausalLM(nnx.Module):
 
     def load_weights(self, model_config):
         """Load M's tensors and hand the exact MoE partition to E."""
-        from sgl_jax.srt.layers.deepseek_v4_moe_loader import (
-            STATIC_EXPERT_FORMAT,
-            expected_moe_keys,
-        )
         from sgl_jax.srt.model_loader.deepseek_v4_static import (
             CONFIG_KEY,
             FORMAT,
@@ -1091,6 +1096,18 @@ class DeepseekV4ForCausalLM(nnx.Module):
                 mesh = self.mesh
                 if "experts" in path:
                     mesh = self.model.layers[int(path[2])].mlp.experts.moe_mesh
+                if getattr(model_config, "_abstract_mode", False):
+                    # DummyLoader traces post-load preparation during CPU AOT.
+                    spec = (
+                        old.sharding.spec
+                        if isinstance(old, jax.ShapeDtypeStruct)
+                        else jax.typeof(old).sharding.spec
+                    )
+                    with jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
+                        variable.value = jnp.zeros(
+                            old.shape, old.dtype, out_sharding=NamedSharding(mesh, spec)
+                        )
+                    continue
                 sharding = NamedSharding(mesh, old.sharding.spec)
 
                 def initialize(index, shape=old.shape, dtype=old.dtype, seed=i):
@@ -1108,6 +1125,11 @@ class DeepseekV4ForCausalLM(nnx.Module):
                     ) % self.config.n_routed_experts
                     layer.mlp.load_hash_table(table)
         else:
+            from sgl_jax.srt.layers.deepseek_v4_moe_loader import (
+                STATIC_EXPERT_FORMAT,
+                expected_moe_keys,
+            )
+
             expert_format = getattr(self.config, CONFIG_KEY, None)
             if expert_format not in (None, FORMAT) or FORMAT != STATIC_EXPERT_FORMAT:
                 raise ValueError(f"Unsupported V4 expert format: {expert_format}")
@@ -1117,7 +1139,13 @@ class DeepseekV4ForCausalLM(nnx.Module):
                         "static expert-FP8 export requires static FP8 model parameters"
                     )
                 validate_static_checkpoint(model_config.model_path)
-            with LocalSource(model_config) as source:
+            shared_source = getattr(model_config, "_weight_source", None)
+            source_context = (
+                nullcontext(shared_source)
+                if shared_source is not None
+                else LocalSource(model_config, warmup=True)
+            )
+            with source_context as source:
                 info = source.metadata
                 if any(len(entries) != 1 for entries in info.values()):
                     raise ValueError("V4 tensors must occur exactly once across checkpoint shards")
@@ -1137,7 +1165,8 @@ class DeepseekV4ForCausalLM(nnx.Module):
                 if m_keys | e_keys != required or m_keys & e_keys:
                     raise ValueError("V4 checkpoint ownership does not cover the required trunk")
                 started = time.monotonic()
-                m_consumed = self._load_regular_weights(info)
+                source.prefetch()
+                m_consumed = self._load_regular_weights(info, weight_source=source)
                 logger.info(
                     "Loaded DeepSeek V4 M-owned parameters in %.1fs", time.monotonic() - started
                 )
@@ -1158,7 +1187,13 @@ class DeepseekV4ForCausalLM(nnx.Module):
                 if m_consumed | e_consumed != required:
                     raise ValueError("V4 required checkpoint tensor was not consumed")
         # eval_shape creates placeholders for these non-parameter tables too.
-        with jax.set_mesh(self.mesh):
+        abstract = getattr(model_config, "_abstract_mode", False)
+        context = (
+            jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh)
+            if abstract
+            else jax.set_mesh(self.mesh)
+        )
+        with context:
             self.model.rope_plain.value = _rope_cache(self.config, 0)
             self.model.rope_compressed.value = _rope_cache(self.config, 4)
             cos, sin = _split_rope_cache(
@@ -1167,12 +1202,12 @@ class DeepseekV4ForCausalLM(nnx.Module):
             self.model.rope_compressed_cos.value = cos
             self.model.rope_compressed_sin.value = sin
         for layer in self.model.layers:
-            layer.self_attn.prepare_grouped_wo_a()
+            layer.self_attn.prepare_grouped_wo_a(abstract=abstract)
             compressor = getattr(layer.self_attn, "compressor", None)
             if _HCA_FUSED_PROJ and compressor is not None and compressor.ratio == 128:
-                compressor.prepare_fused_projection(self.mesh)
+                compressor.prepare_fused_projection(self.mesh, abstract=abstract)
 
-    def _load_regular_weights(self, info):
+    def _load_regular_weights(self, info, *, weight_source=None):
         """Populate only M-owned parameters from the assigned byte ranges."""
         import ml_dtypes
 
@@ -1191,17 +1226,29 @@ class DeepseekV4ForCausalLM(nnx.Module):
             itemsize = 1 if dtype == "F8_E8M0" else np.dtype(dtype_map[dtype]).itemsize
             if entry["byte_size"] != int(np.prod(shape)) * itemsize:
                 raise ValueError(f"{key}: invalid checkpoint dtype, shape, or byte count")
-            with open(entry["file"], "rb") as source:
-                source.seek(entry["byte_offset"])
-                raw = source.read(entry["byte_size"])
-            if len(raw) != entry["byte_size"]:
-                raise ValueError(f"{key}: truncated checkpoint tensor")
+            if weight_source is not None and dtype != "F8_E8M0":
+                value = np.asarray(weight_source.read_tensor(entry["file"], key, slice(None)))
+            else:
+                if weight_source is None:
+                    with open(entry["file"], "rb") as stream:
+                        stream.seek(entry["byte_offset"])
+                        raw = stream.read(entry["byte_size"])
+                else:
+                    # Decode E8M0 explicitly even when the source's tensor API
+                    # cannot expose that safetensors dtype through NumPy.
+                    raw = weight_source.read_ranges(
+                        [(entry["file"], entry["byte_offset"], entry["byte_size"])]
+                    )[0]
+                if len(raw) != entry["byte_size"]:
+                    raise ValueError(f"{key}: truncated checkpoint tensor")
+                stored_dtype = np.uint8 if dtype == "F8_E8M0" else dtype_map[dtype]
+                value = np.frombuffer(raw, dtype=stored_dtype).reshape(shape)
             if dtype == "F8_E8M0":
-                codes = np.frombuffer(raw, np.uint8).reshape(shape)
+                codes = value.view(np.uint8)
                 if np.any(codes == 255):
                     raise ValueError(f"{key}: reserved E8M0 scale code 255")
                 return np.ldexp(np.ones(shape, np.float32), codes.astype(np.int16) - 127)
-            return np.frombuffer(raw, dtype=dtype_map[dtype]).reshape(shape)
+            return value
 
         def parameter(path):
             obj = self

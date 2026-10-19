@@ -321,6 +321,24 @@ suites = {
             runner="pytest",
             env={"JAX_PLATFORMS": "cpu"},
         ),
+        TestFile(
+            "python/sgl_jax/test/configs/test_deepseek_v4_config.py",
+            0.1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "python/sgl_jax/test/models/test_deepseek_v4_m_inventory.py",
+            0.1,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu"},
+        ),
+        TestFile(
+            "python/sgl_jax/test/models/test_deepseek_v4_m_loading.py",
+            0.2,
+            runner="pytest",
+            env={"JAX_PLATFORMS": "cpu", "JAX_NUM_CPU_DEVICES": "2"},
+        ),
         TestFile("python/sgl_jax/test/constrained/test_grammar_backend.py", 0.1),
         TestFile(
             "python/sgl_jax/test/test_dp_feature_parity.py",
