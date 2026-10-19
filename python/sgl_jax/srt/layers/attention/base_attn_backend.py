@@ -19,7 +19,11 @@ if TYPE_CHECKING:
 def get_batch_page_indices(
     batch: ModelWorkerBatch, page_size: int, *, max_pages_per_dp: int | None = None
 ) -> np.ndarray:
-    """Return host page IDs as DP rows, bounded before converting token locations."""
+    """Return host page IDs as DP rows, bounded before converting token locations.
+
+    When provided, ``allocated_page_indices`` must contain physical page IDs
+    in fixed-size per-DP segments.
+    """
     page_indices = getattr(batch, "allocated_page_indices", None)
     if page_indices is not None:
         return page_indices.reshape(batch.dp_size, -1)[:, :max_pages_per_dp]
