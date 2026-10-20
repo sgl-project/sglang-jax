@@ -110,6 +110,14 @@ class ScalingRotaryEmbedding(RotaryEmbedding):
         self.mscale = float(_grok_yarn_get_mscale(self.scaling_factor) * attn_factor)
         super().__init__(head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype)
 
+    def get_cos_sin(self, positions: jax.Array) -> tuple[jax.Array, jax.Array]:
+        positions = positions.flatten()
+        inv_freq = self._compute_inv_freq(self.scaling_factor)
+        freqs = positions.astype(jnp.float32)[..., None] * inv_freq
+        cos = (jnp.cos(freqs) * self.mscale).astype(self.dtype)
+        sin = (jnp.sin(freqs) * self.mscale).astype(self.dtype)
+        return cos, sin
+
     def _compute_inv_freq(self, scaling_factor: float) -> jax.Array:
         pos_freqs = self.base ** (
             jnp.arange(0, self.rotary_dim, 2, dtype=jnp.float32) / self.rotary_dim
