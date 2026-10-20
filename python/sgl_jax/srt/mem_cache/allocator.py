@@ -110,6 +110,31 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         slots = self.free_slots[dp_rank]
         if need_size > len(slots):
             return None
+        if need_size <= 1:
+            select_index = slots[:need_size].copy()
+            self.free_slots[dp_rank] = slots[need_size:]
+            return select_index
+
+        # Fast path: check if prefix is contiguous
+        if slots[need_size - 1] - slots[0] == need_size - 1:
+            select_index = slots[:need_size].copy()
+            self.free_slots[dp_rank] = slots[need_size:]
+            return select_index
+
+        # Search for the first contiguous block of length >= need_size
+        diffs = np.diff(slots)
+        breaks = np.where(diffs != 1)[0]
+        starts = np.r_[0, breaks + 1]
+        ends = np.r_[breaks + 1, len(slots)]
+        lengths = ends - starts
+        eligible = np.where(lengths >= need_size)[0]
+        if len(eligible) > 0:
+            run_idx = eligible[0]
+            start = starts[run_idx]
+            select_index = slots[start : start + need_size].copy()
+            self.free_slots[dp_rank] = np.concatenate([slots[:start], slots[start + need_size :]])
+            return select_index
+
         select_index = slots[:need_size].copy()
         self.free_slots[dp_rank] = slots[need_size:]
         return select_index
@@ -118,7 +143,9 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.size == 0:
             return
         if self.is_not_in_free_group:
-            self.free_slots[dp_rank] = np.concatenate([self.free_slots[dp_rank], free_index])
+            self.free_slots[dp_rank] = np.sort(
+                np.concatenate([self.free_slots[dp_rank], free_index])
+            )
         else:
             self.free_group[dp_rank].append(free_index)
 
@@ -139,8 +166,8 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         for rank in range(self.dp_size):
             if self.free_group[rank]:
-                self.free_slots[rank] = np.concatenate(
-                    [self.free_slots[rank]] + self.free_group[rank]
+                self.free_slots[rank] = np.sort(
+                    np.concatenate([self.free_slots[rank]] + self.free_group[rank])
                 )
                 self.free_group[rank] = []
 
