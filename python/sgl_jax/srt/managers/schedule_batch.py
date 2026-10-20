@@ -333,6 +333,10 @@ class Req:
         self.disagg_peer_process_index: int = 0
         self.disagg_chunk_index: int = 0
         self.disagg_chunk_sender = None
+        # PD prefill of a hybrid (recurrent/conv) model: compute only
+        # origin_input_ids[:-1]. D re-runs the last prompt token, and cumulative
+        # recurrent/conv state must not see it twice (see pd_transfer_prompt_len).
+        self.pd_prefill_skip_last_token: bool = False
 
         # Memory pool info
         self.req_pool_idx: int | None = None
@@ -562,6 +566,10 @@ class Req:
         # continuation rounds must also preserve/update last_node and radix
         # lock state, not just prefix_indices.
         if getattr(self, "bootstrap_room", None) is not None and not self.output_ids:
+            if getattr(self, "pd_prefill_skip_last_token", False):
+                # Hybrid PD prefill: stop before the last prompt token so the
+                # shipped recurrent/conv state excludes it; D recomputes it.
+                self.fill_ids = self.origin_input_ids[:-1]
             # A completed middle chunk decrements is_chunked before
             # this continuation round is initialized. kv_committed_len, not the
             # in-flight counter, is the durable signal that prefix_indices owns

@@ -685,3 +685,256 @@ def test_stop_is_idempotent_and_releases_socket():
     n.stop()
     n.stop()  # second stop is a no-op
     assert not n.is_started
+
+
+# ==================================================================
+# Hybrid Recurrent State Transfer Contexts & Payload Contracts
+# ==================================================================
+
+
+def _sample_recurrent_spec(
+    *,
+    num_layers: int = 2,
+    num_heads: int = 4,
+    head_dim: int = 64,
+    proj_size: int = 768,
+    conv_kernel_size: int = 4,
+    size: int = 6,
+    dp_size: int = 2,
+) -> dict[str, object]:
+    return {
+        "num_layers": num_layers,
+        "recurrent_shape": [num_heads, head_dim, head_dim],
+        "conv_shape": [proj_size, conv_kernel_size - 1],
+        "temporal_dtype": "float32",
+        "conv_dtype": "bfloat16",
+        "size": size,
+        "dp_size": dp_size,
+        "slots_per_rank": size // dp_size,
+        "total_slots": size + dp_size,
+    }
+
+
+def test_recurrent_slot_to_global_idx_dp_mapping():
+    from sgl_jax.srt.disaggregation.base.transfer import recurrent_slot_to_global_idx
+
+    # Concrete running example from recurrent_and_kv_memory_model_guide.md:
+    # size=6, dp_size=2 -> slots_per_rank=3, total_slots=8 (4 per rank, slot 0 is dummy)
+    # Req A: dp_rank=0, slot_local_idx=1 -> global_idx = 1 + 0 * (3 + 1) = 1
+    assert recurrent_slot_to_global_idx(1, dp_rank=0, dp_size=2, slots_per_rank=3) == 1
+    # Req B: dp_rank=1, slot_local_idx=2 -> global_idx = 2 + 1 * (3 + 1) = 6
+    assert recurrent_slot_to_global_idx(2, dp_rank=1, dp_size=2, slots_per_rank=3) == 6
+
+    # Dummy slot 0 is rejected unless allow_dummy=True
+    with pytest.raises(ValueError, match="slot_local_idx=0"):
+        recurrent_slot_to_global_idx(0, dp_rank=0, dp_size=2, slots_per_rank=3)
+    assert (
+        recurrent_slot_to_global_idx(0, dp_rank=1, dp_size=2, slots_per_rank=3, allow_dummy=True)
+        == 4
+    )
+
+    # Out-of-bounds slot or dp_rank raises ValueError
+    with pytest.raises(ValueError, match="slot_local_idx=4"):
+        recurrent_slot_to_global_idx(4, dp_rank=0, dp_size=2, slots_per_rank=3)
+    with pytest.raises(ValueError, match="dp_rank=2"):
+        recurrent_slot_to_global_idx(1, dp_rank=2, dp_size=2, slots_per_rank=3)
+
+
+def test_decode_metadata_context_recurrent_spec():
+    from sgl_jax.srt.disaggregation.base.transfer import DecodeMetadataContext
+
+    p_spec = _sample_recurrent_spec(size=6, dp_size=2)
+    d_spec = _sample_recurrent_spec(size=12, dp_size=2)
+
+    ctx = DecodeMetadataContext(
+        req_id="req-hybrid-1",
+        transfer_id="wire-hybrid-1",
+        bootstrap_room=101,
+        prefill_dp_rank=1,
+        peer_info={"host": "10.0.0.1", "recurrent_state_spec": p_spec},
+        recurrent_state_spec=d_spec,
+    )
+    assert ctx.recurrent_state_spec == d_spec
+    assert ctx.peer_info["recurrent_state_spec"] == p_spec
+
+
+def test_validate_transfer_payload_and_normalize_decode_specs():
+    from sgl_jax.srt.disaggregation.base.transfer import (
+        normalize_decode_specs,
+        validate_transfer_payload,
+    )
+
+    spec = _sample_recurrent_spec(num_layers=2, num_heads=4, head_dim=8, proj_size=32)
+    kv_tensors = [jnp.zeros((2, 16, 4, 8), dtype=jnp.bfloat16) for _ in range(2)]
+    rec_tensors = [jnp.zeros((4, 8, 8), dtype=jnp.float32) for _ in range(2)]
+    conv_tensors = [[jnp.zeros((32, 3), dtype=jnp.bfloat16)] for _ in range(2)]
+
+    validated = validate_transfer_payload(
+        {
+            "kv": kv_tensors,
+            "recurrent_state": rec_tensors,
+            "conv_state": conv_tensors,
+        },
+        recurrent_state_spec=spec,
+    )
+    assert set(validated.keys()) == {"kv", "recurrent_state", "conv_state"}
+
+    # Missing conv_state when recurrent_state is provided raises ValueError
+    with pytest.raises(ValueError, match="both 'recurrent_state' and 'conv_state'"):
+        validate_transfer_payload({"kv": kv_tensors, "recurrent_state": rec_tensors})
+
+    # Wrong recurrent_state shape raises ValueError
+    bad_rec = [jnp.zeros((4, 16, 16), dtype=jnp.float32) for _ in range(2)]
+    with pytest.raises(ValueError, match="recurrent_state layer 0 shape mismatch"):
+        validate_transfer_payload(
+            {"kv": kv_tensors, "recurrent_state": bad_rec, "conv_state": conv_tensors},
+            recurrent_state_spec=spec,
+        )
+
+    # normalize_decode_specs supports both legacy KV-only list and structured dict
+    legacy_spec = [jax.ShapeDtypeStruct((2, 16), jnp.bfloat16)]
+    assert normalize_decode_specs(legacy_spec) == {"kv": legacy_spec}
+
+    hybrid_specs = {
+        "kv": legacy_spec,
+        "recurrent_state": [jax.ShapeDtypeStruct((4, 8, 8), jnp.float32)],
+        "conv_state": [[jax.ShapeDtypeStruct((32, 3), jnp.bfloat16)]],
+    }
+    assert normalize_decode_specs(hybrid_specs) == hybrid_specs
+
+
+def test_jax_transfer_manager_dual_payload_prefill_and_decode():
+    from sgl_jax.srt.disaggregation.base.transfer import (
+        DecodeMetadataContext,
+        DecodeTransferContext,
+        PrefillTransferContext,
+    )
+    from sgl_jax.srt.disaggregation.jax_transfer.conn import JaxTransferKVManager
+
+    spec = _sample_recurrent_spec(num_layers=2, num_heads=2, head_dim=8, proj_size=16)
+    registered_sub_uuids: dict[str, object] = {}
+
+    class _MockWrapper:
+        def register_pull(self, sub_uuid, arr):
+            registered_sub_uuids[sub_uuid] = arr
+
+        def release(self, sub_uuid):
+            registered_sub_uuids.pop(sub_uuid, None)
+
+        def pull(self, sub_uuid, _spec, remote_addr=None):
+            del remote_addr
+            return registered_sub_uuids[sub_uuid]
+
+    class _MockNotifier:
+        def __init__(self):
+            self.callbacks = {}
+            self.done_sent = []
+
+        def register_callback(self, uuid_bytes, cb):
+            self.callbacks[uuid_bytes] = cb
+
+        def unregister_callback(self, uuid_bytes):
+            return self.callbacks.pop(uuid_bytes, None)
+
+        def mark_retired(self, uuid_bytes, *, state, reason):
+            pass
+
+        def send_done(self, uuid_bytes, host, port):
+            self.done_sent.append((uuid_bytes, host, port))
+            cb = self.callbacks.pop(uuid_bytes, None)
+            if cb is not None:
+                cb(uuid_bytes)
+
+    class _ReadyArray:
+        def __init__(self, shape):
+            self.shape = shape
+
+        def is_ready(self):
+            return True
+
+    wrapper = _MockWrapper()
+    notifier = _MockNotifier()
+    mgr = JaxTransferKVManager(wrapper=wrapper, zmq_notifier=notifier, pull_worker_count=1)
+    try:
+        kv_payload = [_ReadyArray((2, 16, 4, 8)), _ReadyArray((2, 16, 4, 8))]
+        rec_payload = [_ReadyArray((2, 8, 8)), _ReadyArray((2, 8, 8))]
+        conv_payload = [[_ReadyArray((16, 3))], [_ReadyArray((16, 3))]]
+
+        p_ctx = PrefillTransferContext(
+            req_id="req-dual-1",
+            transfer_id="wire-dual-1",
+            bootstrap_room=200,
+            dp_rank=1,
+            buffer_id=None,
+            payload_factory=lambda: {
+                "kv": kv_payload,
+                "recurrent_state": rec_payload,
+                "conv_state": conv_payload,
+            },
+            block_ids_factory=lambda: [1, 2],
+            recurrent_slot_idx=2,
+            recurrent_state_spec=spec,
+        )
+        p_transfer = mgr.start_prefill(p_ctx)
+        assert set(registered_sub_uuids.keys()) == {
+            "wire-dual-1:kv",
+            "wire-dual-1:recurrent_state",
+            "wire-dual-1:conv_state",
+        }
+
+        peer_info = {
+            "host": "127.0.0.1",
+            "transfer_port": 31000,
+            "side_channel_port": 31001,
+            "recurrent_state_spec": spec,
+        }
+        meta_ctx = DecodeMetadataContext(
+            req_id="req-dual-1",
+            transfer_id="wire-dual-1",
+            bootstrap_room=200,
+            prefill_dp_rank=1,
+            peer_info=peer_info,
+            recurrent_state_spec=spec,
+        )
+        assert mgr.poll_decode_metadata(meta_ctx) is True
+
+        d_ctx = DecodeTransferContext(
+            req_id="req-dual-1",
+            transfer_id="wire-dual-1",
+            bootstrap_room=200,
+            decode_dp_rank=1,
+            prefill_dp_rank=1,
+            peer_info=peer_info,
+            kv_indices=[0, 1],
+            page_size=16,
+            prompt_tokens=16,
+            spec_factory=lambda: {
+                "kv": object(),
+                "recurrent_state": object(),
+                "conv_state": object(),
+            },
+            recurrent_slot_idx=1,
+            recurrent_state_spec=spec,
+        )
+        admission = mgr.try_start_decode(d_ctx)
+        receiver = admission.receiver
+        assert receiver is not None
+
+        receiver._transition_to(KVPoll.TRANSFERRING)
+        receiver._run_pull()
+        assert receiver.poll() == KVPoll.SUCCESS
+        assert p_transfer.sender.poll() == KVPoll.SUCCESS
+
+        committed = []
+        receiver.commit(committed.append)
+        assert len(committed) == 1
+        assert committed[0] == {
+            "kv": kv_payload,
+            "recurrent_state": rec_payload,
+            "conv_state": conv_payload,
+        }
+    finally:
+        for _ in mgr._pull_workers:
+            mgr._pull_queue.put(None)
+        for t in mgr._pull_workers:
+            t.join(timeout=2.0)

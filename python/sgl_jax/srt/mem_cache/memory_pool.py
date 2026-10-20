@@ -265,6 +265,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 self.req_index_to_recurrent_index_mapping[r.req_pool_idx] = slot
                 if self.enable_recurrent_extra_buffer:
                     self._alloc_ping_pong_buffer(r, dp_rank)
+            else:
+                # Slot owned before the request row existed (e.g. PD decode
+                # pre-allocates it at transfer admission and receives the
+                # prefill state into it). Idempotent for chunked reqs.
+                self.req_index_to_recurrent_index_mapping[r.req_pool_idx] = r.recurrent_pool_idx
 
         return result
 

@@ -12,6 +12,8 @@ from collections.abc import Callable
 import msgpack
 import zmq
 
+from sgl_jax.srt.disaggregation.host_ip import format_host_port
+
 logger = logging.getLogger(__name__)
 
 
@@ -90,7 +92,9 @@ class ZmqPullNotifier:
             # still pending would block. We don't care about queued
             # outbound frames at shutdown.
             self._router.setsockopt(zmq.LINGER, 0)
-            self._router.bind(f"tcp://{self._host}:{self._port}")
+            # IPV6=1 makes the socket dual-stack (IPv4 and IPv6 both work).
+            self._router.setsockopt(zmq.IPV6, 1)
+            self._router.bind(f"tcp://{format_host_port(self._host, self._port)}")
             self._stop_event.clear()
             self._listener_thread = threading.Thread(
                 target=self._listen_loop,
@@ -100,10 +104,9 @@ class ZmqPullNotifier:
             self._listener_thread.start()
         self._started = True
         logger.info(
-            "ZmqPullNotifier started role=%s addr=%s:%d",
+            "ZmqPullNotifier started role=%s addr=%s",
             self._role,
-            self._host,
-            self._port,
+            format_host_port(self._host, self._port),
         )
 
     def stop(self) -> None:
@@ -204,8 +207,9 @@ class ZmqPullNotifier:
             payload["hmac"] = compute_tag(self._shared_secret, uuid)
         sock = self._ctx.socket(zmq.DEALER)
         sock.setsockopt(zmq.LINGER, 1000)
+        sock.setsockopt(zmq.IPV6, 1)
         try:
-            sock.connect(f"tcp://{target_host}:{target_port}")
+            sock.connect(f"tcp://{format_host_port(target_host, target_port)}")
             sock.send(msgpack.packb(payload, use_bin_type=True))
         finally:
             sock.close()

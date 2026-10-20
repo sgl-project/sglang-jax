@@ -64,3 +64,23 @@ def test_overlap_cli_opt_in_and_explicit_disable():
             "--no-disaggregation-enable-overlap-schedule",
         ]
     ).disaggregation_enable_overlap_schedule
+
+
+def test_disaggregation_server_args_rejects_invalid_recurrent_options():
+    with pytest.raises(ValueError, match="--enable-recurrent-extra-buffer"):
+        ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="prefill",
+            disaggregation_bootstrap_url="http://127.0.0.1:8998",
+            page_size=128,
+            enable_recurrent_extra_buffer=True,
+        )
+    with pytest.raises(ValueError, match="must be divisible by --dp-size"):
+        ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="prefill",
+            disaggregation_bootstrap_url="http://127.0.0.1:8998",
+            page_size=128,
+            dp_size=2,
+            max_recurrent_state_size=5,
+        )

@@ -460,9 +460,7 @@ class _Batch:
         self.reqs = list(range(n))
 
 
-class _AdmScheduler:
-    _admit_decode_prealloc = SchedulerDisaggregationDecodeMixin._admit_decode_prealloc
-    _expire_decode_prealloc = SchedulerDisaggregationDecodeMixin._expire_decode_prealloc
+class _AdmScheduler(SchedulerDisaggregationDecodeMixin):
 
     def __init__(
         self,
@@ -739,11 +737,7 @@ def test_cancel_matching_retains_inflight_entry_until_terminal():
 
 
 def test_cancelled_terminal_transfer_releases_decode_rank_pages():
-    class _CancelledDrainScheduler:
-        process_decode_queue = SchedulerDisaggregationDecodeMixin.process_decode_queue
-        _drain_decode_transfer_terminals = (
-            SchedulerDisaggregationDecodeMixin._drain_decode_transfer_terminals
-        )
+    class _CancelledDrainScheduler(SchedulerDisaggregationDecodeMixin):
 
         def __init__(self, entry):
             self.entry = entry

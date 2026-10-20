@@ -15,6 +15,22 @@ logger = logging.getLogger(__name__)
 _REJECTED_HOSTNAMES = frozenset({"localhost"})
 
 
+def format_host_port(host: str, port: int | str) -> str:
+    """Return ``host:port``, bracketing IPv6 literals (``[fb12::4]:31001``).
+
+    Accepts hosts that are already bracketed. IPv4 addresses and DNS names
+    are returned unchanged, so this is safe to use for any peer address.
+    """
+
+    host = str(host).strip("[]")
+    try:
+        if isinstance(ipaddress.ip_address(host), ipaddress.IPv6Address):
+            return f"[{host}]:{port}"
+    except ValueError:
+        pass
+    return f"{host}:{port}"
+
+
 def resolve_host_ip(
     explicit: str | None = None,
     *,

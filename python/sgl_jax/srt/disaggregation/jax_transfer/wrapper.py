@@ -81,11 +81,13 @@ class JaxTransferWrapper:
                 return self._server
             from jax.experimental.transfer import start_transfer_server
 
-            server_addr = f"{self._host_ip}:{self._port}"
+            from sgl_jax.srt.disaggregation.host_ip import format_host_port
+
+            server_addr = format_host_port(self._host_ip, self._port)
             self._server = start_transfer_server(
                 jax.local_devices()[0].client,
                 server_addr,
-                [f"{self._host_ip}:0"],
+                [format_host_port(self._host_ip, 0)],
                 max_num_parallel_copies=self._channel_number,
                 transfer_size=64 * 1024 * 1024,
                 use_raw_buffers=False,
