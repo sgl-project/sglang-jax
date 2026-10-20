@@ -1,7 +1,7 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import jax
 import jax.numpy as jnp
 
 from sgl_jax.srt.lora.lora_manager import LoRAManager
@@ -93,11 +93,16 @@ class TestLoRAManagerOptimization(unittest.TestCase):
                 max_loras_per_batch=4,
                 dtype=jnp.float32,
                 mesh=self.mock_mesh,
+                server_args=SimpleNamespace(enable_static_lora=False),
             )
 
         # Manually set attributes needed for prepare_lora_batch
         manager.memory_pool = mock_pool_instance
         manager.loras = {}
+        manager.lora_refs = {
+            "pinned": SimpleNamespace(pinned=True),
+            "unpinned": SimpleNamespace(pinned=False),
+        }
         manager.max_loras_per_batch = 4
         manager.lora_backend = MagicMock()
         manager.update_lora_info = MagicMock()
@@ -111,6 +116,11 @@ class TestLoRAManagerOptimization(unittest.TestCase):
         manager.prepare_lora_batch(batch)
 
         manager.update_lora_info.assert_called_once()
+        mock_pool_instance.prepare_lora_batch.assert_called_once_with(
+            cur_uids={"lora1"},
+            lora_adapters=manager.loras,
+            pinned_uids={"pinned"},
+        )
         manager.update_lora_info.reset_mock()
 
         # Test case 2: memory_pool returns False (no new weights)
@@ -119,6 +129,56 @@ class TestLoRAManagerOptimization(unittest.TestCase):
         manager.prepare_lora_batch(batch)
 
         manager.update_lora_info.assert_not_called()
+
+    def test_base_and_padding_do_not_consume_separate_slots(self):
+        with patch.object(LoRAManager, "init_state"):
+            manager = LoRAManager(
+                base_model=None,
+                base_hf_config=SimpleNamespace(
+                    num_hidden_layers=1, hidden_size=128, num_attention_heads=4
+                ),
+                max_loras_per_batch=3,
+                dtype=jnp.float32,
+                mesh=self.mock_mesh,
+                server_args=SimpleNamespace(enable_static_lora=False),
+            )
+        manager.memory_pool = LoRAMemoryPool(
+            max_loras_per_batch=3,
+            max_lora_rank=8,
+            num_layers=1,
+            target_modules={"q_proj"},
+            mesh=self.mock_mesh,
+        )
+        manager.memory_pool.load_lora_weight_to_buffer = MagicMock()
+        manager.loras = {
+            uid: SimpleNamespace(config=SimpleNamespace(r=8), scaling=2.0)
+            for uid in ("a", "b", "c")
+        }
+        manager.lora_refs = {}
+        manager.lora_backend = MagicMock()
+        manager.update_lora_info = MagicMock()
+        batch = SimpleNamespace(lora_ids=[None, "0", "a", "b"])
+
+        manager.prepare_lora_batch(batch)
+
+        self.assertEqual(manager.memory_pool.get_buffer_id(None), 0)
+        self.assertEqual(manager.memory_pool.get_buffer_id("0"), 0)
+        self.assertEqual(
+            manager.lora_backend.prepare_lora_batch.call_args.kwargs["weight_indices"],
+            [0, 0, 1, 2],
+        )
+        manager.update_lora_info.assert_called_once()
+        manager.update_lora_info.reset_mock()
+        batch.lora_ids = [None, "0", "b", "c"]
+
+        manager.prepare_lora_batch(batch)
+
+        self.assertNotIn("a", manager.memory_pool.uid_to_buffer_id)
+        self.assertEqual(
+            manager.lora_backend.prepare_lora_batch.call_args.kwargs["weight_indices"],
+            [0, 0, 2, 1],
+        )
+        manager.update_lora_info.assert_called_once()
 
 
 if __name__ == "__main__":

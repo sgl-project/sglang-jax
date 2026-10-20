@@ -6,7 +6,12 @@ sglang-jax supports LoRA (Low-Rank Adaptation) dynamic adapters, allowing differ
 
 The system is implemented through a three-tier management architecture: `LoRARegistry` (adapter registry in the TokenizerManager process) → `LoRAManager` (weight management and model surgery in the Scheduler process) → `LoRAMemoryPool` (device-side weight buffer). LoRA weights are injected into the forward computation via the BGMV backend.
 
-The V1 design of sglang-jax loads all configured adapters at startup. The `lora_eviction_policy` and `max_loaded_loras` parameters are reserved for future dynamic eviction support, but in the current version all configured adapters are loaded into memory in one pass at startup, and no eviction is triggered at runtime.
+All configured adapters are loaded into host memory at startup. The device memory pool
+uses LRU eviction when no empty slot remains, protecting adapters needed by the current
+batch and pinned adapters. Slot zero is reserved for the base model and batch padding;
+the remaining `max_loras_per_batch - 1` slots hold adapters. Eviction reuses the existing
+loader's zero-padding and missing-module zeroing so reused slots contain no stale weights.
+Host-memory eviction via `max_loaded_loras` is not implemented.
 
 ![LoRA integration flow](images/10-lora-integration.svg)
 
@@ -40,7 +45,7 @@ Core files involved:
 | `max_lora_rank` | `None` | Maximum LoRA rank (auto-inferred from adapters) |
 | `lora_target_modules` | `None` | Target module names (`"all"` for all supported modules) |
 | `max_loaded_loras` | `None` | Maximum adapters in memory |
-| `lora_eviction_policy` | `"lru"` | Eviction policy (reserved; eviction is not actually triggered in the current version) |
+| `lora_eviction_policy` | `"lru"` | LRU is the only supported device-slot eviction policy |
 | `enable_static_lora` | `None` | Static LoRA mode (RL scenarios; mutually exclusive with `enable_lora`) |
 | `lora_scaling` | `None` | Scaling factor for static LoRA (`alpha / rank`) |
 

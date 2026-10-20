@@ -59,8 +59,8 @@ class LoRAMemoryPool:
     JAX-based memory pool for LoRA adapters.
 
     Unlike PyTorch version, this uses functional updates and pytree registration
-    for JAX jit compatibility. No eviction policy is implemented - uses simple
-    incremental buffer allocation.
+    for JAX jit compatibility. Device slots use LRU eviction, excluding adapters
+    required by the current batch and pinned adapters.
 
     Attributes:
         max_loras_per_batch: Maximum number of LoRA adapters per batch
@@ -137,10 +137,10 @@ class LoRAMemoryPool:
             self.needs_kv_replication = False
             self.num_kv_replicas = 1
 
-        # CPU-side tracking (not in pytree)
-        # These are mutable Python objects used for bookkeeping
+        # Dictionary insertion order tracks least to most recently used adapters.
         self.uid_to_buffer_id: dict[str | None, int] = {}
         self.buffer_id_to_uid: list[str | None | EmptySlot] = [EMPTY_SLOT] * max_loras_per_batch
+        self.buffer_id_to_uid[0] = None
 
         # Device buffers (in pytree) - initialized in init_buffers()
         self.A_buffer: dict[str, list[jax.Array]] = {}
@@ -357,51 +357,64 @@ class LoRAMemoryPool:
         self,
         cur_uids: set[str | None],
         lora_adapters: dict[str | None, LoRAAdapter],
+        pinned_uids: set[str] | None = None,
     ) -> bool:
         """
         Prepare LoRA batch by loading adapters into buffer slots.
 
-        Simplified version without eviction policy - uses incremental allocation.
+        Reuse empty slots before evicting the least recently used eligible adapter.
 
         Args:
             cur_uids: Set of lora_ids needed for current batch
             lora_adapters: Dict mapping lora_id to LoRAAdapter
+            pinned_uids: Adapters that must not be evicted once resident
 
         Returns:
             bool: True if new weights were loaded (requires updating references), False otherwise.
 
         Raises:
-            ValueError: If no buffer slots available
+            ValueError: If adapters are missing or no buffer slots are available
         """
+        # None denotes the base model; "0" is also used for batch padding.
+        required_uids = {uid for uid in cur_uids if uid not in (None, "0")}
+        pinned_uids = pinned_uids or set()
+        missing_uids = {uid for uid in required_uids if lora_adapters.get(uid) is None}
+        if missing_uids:
+            raise ValueError(f"LoRA adapters are not loaded: {sorted(missing_uids)}")
 
-        def get_available_buffer_slot(uid: str) -> int:
-            """Find next available buffer slot (simple incremental allocation)."""
-            # 0 is reserved for request without LoRA
-            if uid == "0":
-                return 0
-            for buffer_id in range(1, self.max_loras_per_batch + 1):
-                # 0 is reserved for zeros, so add 1 to match user's expectation.
+        protected_uids = required_uids | (pinned_uids & self.uid_to_buffer_id.keys())
+        if len(protected_uids) > self.max_loras_per_batch - 1:
+            raise ValueError(
+                "No available buffer slots for the current batch and pinned LoRA adapters "
+                f"({self.max_loras_per_batch - 1} adapter slots; slot 0 is reserved)."
+            )
+
+        def get_available_buffer_slot() -> int:
+            for buffer_id in range(1, self.max_loras_per_batch):
                 if self.buffer_id_to_uid[buffer_id] == EMPTY_SLOT:
                     return buffer_id
-
-            raise ValueError(
-                "No available buffer slots. Max %d LoRA adapters per batch exceeded.",
-                self.max_loras_per_batch,
-            )
+            for uid, buffer_id in self.uid_to_buffer_id.items():
+                if uid not in protected_uids:
+                    return buffer_id
+            raise ValueError("No available buffer slots: all resident LoRA adapters are protected.")
 
         has_new_weights = False
 
-        # Load each adapter that's not already loaded
-        for uid in cur_uids:
+        # Sorting gives adapters first used in the same batch a deterministic order.
+        for uid in sorted(required_uids):
             if uid not in self.uid_to_buffer_id:
-                buffer_id = get_available_buffer_slot(uid)
+                buffer_id = get_available_buffer_slot()
+                self.load_lora_weight_to_buffer(uid, buffer_id, lora_adapters[uid])
+                previous_uid = self.buffer_id_to_uid[buffer_id]
+                if previous_uid != EMPTY_SLOT:
+                    del self.uid_to_buffer_id[previous_uid]
+                    logger.debug("Evicted LoRA %s from buffer slot %d", previous_uid, buffer_id)
                 self.uid_to_buffer_id[uid] = buffer_id
                 self.buffer_id_to_uid[buffer_id] = uid
-                lora_adapter = lora_adapters.get(uid)
-                self.load_lora_weight_to_buffer(uid, buffer_id, lora_adapter)
                 has_new_weights = True
                 logger.info("Loaded LoRA %s into buffer slot %d", uid, buffer_id)
             else:
+                self.uid_to_buffer_id[uid] = self.uid_to_buffer_id.pop(uid)
                 logger.debug("LoRA %s already in buffer slot %d", uid, self.uid_to_buffer_id[uid])
 
         return has_new_weights
@@ -478,6 +491,10 @@ class LoRAMemoryPool:
             # Track loaded weights for debugging
             loaded_modules_count = {module: 0 for module in self.target_modules}
 
+            # Stage functional updates so a failed replacement preserves the old adapter.
+            a_buffers = {module: list(buffers) for module, buffers in self.A_buffer.items()}
+            b_buffers = {module: list(buffers) for module, buffers in self.B_buffer.items()}
+
             # Process each layer
             for layer_id in range(self.num_layers):
                 layer_weights = lora_adapter.layers[layer_id].weights
@@ -507,11 +524,11 @@ class LoRAMemoryPool:
                         )
 
                         # Load into buffer
-                        self.A_buffer[module_name][layer_id] = (
-                            self.A_buffer[module_name][layer_id].at[buffer_id].set(lora_a)
+                        a_buffers[module_name][layer_id] = (
+                            a_buffers[module_name][layer_id].at[buffer_id].set(lora_a)
                         )
-                        self.B_buffer[module_name][layer_id] = (
-                            self.B_buffer[module_name][layer_id].at[buffer_id].set(lora_b)
+                        b_buffers[module_name][layer_id] = (
+                            b_buffers[module_name][layer_id].at[buffer_id].set(lora_b)
                         )
 
                         if layer_id == 0:  # Log details for first layer only
@@ -529,16 +546,19 @@ class LoRAMemoryPool:
                             module_name,
                             layer_id,
                         )
-                        self.A_buffer[module_name][layer_id] = (
-                            self.A_buffer[module_name][layer_id]
+                        a_buffers[module_name][layer_id] = (
+                            a_buffers[module_name][layer_id]
                             .at[buffer_id]
                             .set(jnp.zeros(a_shape, dtype=self.dtype))
                         )
-                        self.B_buffer[module_name][layer_id] = (
-                            self.B_buffer[module_name][layer_id]
+                        b_buffers[module_name][layer_id] = (
+                            b_buffers[module_name][layer_id]
                             .at[buffer_id]
                             .set(jnp.zeros(b_shape, dtype=self.dtype))
                         )
+
+            self.A_buffer = a_buffers
+            self.B_buffer = b_buffers
 
             # Log summary of loaded weights
             logger.info(
@@ -852,6 +872,8 @@ class LoRAMemoryPool:
 
     def get_buffer_id(self, lora_uid: str | None) -> int:
         """Get buffer slot ID for a given LoRA adapter ID."""
+        if lora_uid in (None, "0"):
+            return 0
         return self.uid_to_buffer_id[lora_uid]
 
     def get_array(self, module_name: str, layer_id: int, is_lora_a: bool) -> jax.Array:

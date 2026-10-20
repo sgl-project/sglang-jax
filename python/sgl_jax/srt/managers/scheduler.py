@@ -1062,7 +1062,7 @@ class Scheduler(
 
                 if self.last_batch is None:
                     # Create a dummy first batch to start the pipeline for overlap schedule.
-                    # It is now used for triggering the sampling_info_done event.
+                    # Signal sampling readiness, then wait for the first launch.
                     tmp_batch = ScheduleBatch.init_new(
                         reqs=[[] for _ in range(self.dp_size)],
                         req_to_token_pool=self.req_to_token_pool,
@@ -2625,6 +2625,10 @@ class Scheduler(
                 self.set_next_batch_sampling_info_done(batch)
         elif batch.forward_mode.is_dummy_first():
             self.set_next_batch_sampling_info_done(batch)
+            # Signal first: a fused forward may need the grammar mask before launch.
+            if launch_done is not None:
+                # Do not replace LoRA weights before this batch captures them.
+                launch_done.wait()
 
     def set_next_batch_sampling_info_done(self, batch: ScheduleBatch):
         if batch.next_batch_sampling_info:
