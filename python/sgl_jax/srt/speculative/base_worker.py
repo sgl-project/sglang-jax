@@ -117,6 +117,10 @@ class BaseSpecWorker:
         return self._draft_worker
 
     def init_spec_relay_buffers(self):
+        # V2 also runs generic EAGLE/tree configurations. They carry explicit
+        # draft state and must not enter the relay-only precompile branches.
+        if not (self._can_use_fused_spec_decode or self._can_use_fused_eagle3_verify):
+            return
         if self.spec_relay_buffers is not None:
             return
         from sgl_jax.srt.speculative.relay_buffer import create_spec_relay_buffers
@@ -157,6 +161,9 @@ class BaseSpecWorker:
 
     def _prepare_overlap_sampling_info(self, model_worker_batch: ModelWorkerBatch):
         sampling_info = model_worker_batch.sampling_info
+        if getattr(model_worker_batch, "spec_sampling_prepared", False):
+            self.cur_sampling_info = sampling_info
+            return
         sampling_info.update_penalties()
         model_worker_batch.sampling_info = self.cur_sampling_info = dataclasses.replace(
             sampling_info,
@@ -430,6 +437,14 @@ class BaseSpecWorker:
         )
 
         model_worker_batch.spec_info_padded = next_draft_input
+        if getattr(model_worker_batch, "spec_sampling_prepared", False):
+            from sgl_jax.srt.speculative.overlap_v2 import pack_verified_tokens
+
+            # Generic tree verification returns predictions indexed by tree node.
+            # V2 retirement consumes accepted paths, including non-linear trees.
+            predict = pack_verified_tokens(
+                verified_id, accept_length, self.speculative_num_draft_tokens
+            )
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=predict,
