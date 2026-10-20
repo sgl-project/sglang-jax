@@ -18,6 +18,10 @@ from sgl_jax.srt.speculative.overlap_utils import (
     resolve_spec_prefill_token_ids,
     use_legacy_eagle3_non_overlap,
 )
+from sgl_jax.srt.speculative.spec_logprob import (
+    append_spec_output_logprobs,
+    materialize_spec_output_logprobs,
+)
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.scheduler import (
@@ -189,6 +193,15 @@ class SchedulerOutputProcessorMixin:
                 next_token_ids = resolve_spec_prefill_token_ids(result)
                 if launch_done is not None:
                     launch_done.wait()
+                # Spec prefill with logprobs runs the regular sampler, which
+                # materialized next_token_logprobs on host already; match the
+                # float dtype the non-overlap branch below produces.
+                if (
+                    batch.return_logprob or batch.return_output_logprob_only
+                ) and logits_output.next_token_logprobs is not None:
+                    logits_output.next_token_logprobs = np.asarray(
+                        jax.device_get(logits_output.next_token_logprobs)
+                    ).astype(float)
             else:
                 logits_output, next_token_ids, cache_miss_count = (
                     self.tp_worker.resolve_last_batch_result(launch_done)
@@ -457,20 +470,28 @@ class SchedulerOutputProcessorMixin:
             self.account_spec_decode_tokens(batch, next_token_ids)
         # FIXME(pc) add spec decode metrics
 
-        if self.enable_overlap:
-            if is_spec_decode:
-                next_token_logprobs = None
-            else:
-                logits_output, next_token_ids, cache_miss_count = (
-                    self.tp_worker.resolve_last_batch_result(launch_done)
-                )
-                next_token_logprobs = logits_output.next_token_logprobs
-        else:
-            # spec decoding handles output logprobs inside verify process.
+        next_token_logprobs = None
+        spec_logprobs = None
+        if is_spec_decode:
             if batch.return_logprob or batch.return_output_logprob_only:
-                next_token_logprobs = jax.device_get(logits_output.next_token_logprobs).astype(
-                    float
+                # Verify attached per-row logprobs for bs * (steps + 1) accepted
+                # slots (spec_logprob.attach_spec_output_logprobs); pull them to
+                # host once and split per request below.
+                spec_logprobs = materialize_spec_output_logprobs(
+                    logits_output, self.draft_worker.speculative_num_steps + 1
                 )
+                if spec_logprobs is None:
+                    raise RuntimeError(
+                        "speculative verify returned no output logprobs for a "
+                        f"return_logprob batch (bid={result.bid})"
+                    )
+        elif self.enable_overlap:
+            logits_output, next_token_ids, cache_miss_count = (
+                self.tp_worker.resolve_last_batch_result(launch_done)
+            )
+            next_token_logprobs = logits_output.next_token_logprobs
+        elif batch.return_logprob or batch.return_output_logprob_only:
+            next_token_logprobs = jax.device_get(logits_output.next_token_logprobs).astype(float)
 
         _collect_hidden_states(batch, logits_output.hidden_states)
         self.token_to_kv_pool_allocator.free_group_begin()
@@ -543,12 +564,18 @@ class SchedulerOutputProcessorMixin:
                 ):
                     req.kv_committed_len += new_accepted_len - 1
 
-                if req.return_output_logprob_only:
+                if is_spec_decode and (req.return_logprob or req.return_output_logprob_only):
+                    append_spec_output_logprobs(
+                        req,
+                        spec_logprobs,
+                        per_dp_bs_size * dp_rank + i,
+                        next_token_id,
+                    )
+                elif req.return_output_logprob_only:
                     req.output_token_logprobs_val.append(next_token_logprobs[req_idx])
                     req.output_token_logprobs_idx.append(next_token_id)
 
                 if req.return_logprob and not is_spec_decode:
-                    # speculative worker handles logprob in speculative decoding
                     req.output_token_logprobs_val.append(next_token_logprobs[req_idx])
                     req.output_token_logprobs_idx.append(next_token_id)
                     if req.top_logprobs_num > 0:
