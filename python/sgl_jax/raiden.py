@@ -20,13 +20,17 @@ def _preloaded_namespace() -> str | None:
 
 
 def raiden_requested(argv: Sequence[str] | None = None) -> bool:
-    requested = False
-    for arg in sys.argv[1:] if argv is None else argv:
+    args = list(sys.argv[1:] if argv is None else argv)
+    pd_requested = False
+    encoder_requested = False
+    for arg in args:
         if arg == "--disaggregation-use-raiden":
-            requested = True
+            pd_requested = True
         elif arg == "--no-disaggregation-use-raiden":
-            requested = False
-    return requested
+            pd_requested = False
+        elif arg in ("--encoder-only", "--language-only"):
+            encoder_requested = True
+    return pd_requested or encoder_requested
 
 
 def preload_raiden() -> None:

@@ -13,6 +13,7 @@ import requests
 from PIL import Image
 
 from sgl_jax.srt.multimodal.common.modality_enum import MultimodalInputs
+from sgl_jax.srt.multimodal.processors.encoder import DisaggregatedInputMixin
 from sgl_jax.srt.multimodal.processors.executor import MultimodalProcessorExecutor
 
 if TYPE_CHECKING:
@@ -66,7 +67,7 @@ def _normalize_image_source(source) -> bytes | str:
     return pybase64.b64decode(source, validate=True)
 
 
-class BaseMultimodalProcessor(ABC):
+class BaseMultimodalProcessor(DisaggregatedInputMixin, ABC):
     models: tuple[str, ...] = ()
     auto_mm_processor_worker_num = 1
     supports_mm_processor_concurrency = False

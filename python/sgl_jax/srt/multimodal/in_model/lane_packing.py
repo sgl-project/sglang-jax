@@ -10,6 +10,7 @@ import jax
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jax.typing import ArrayLike
+from numba import njit, types
 
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
 from sgl_jax.srt.multimodal.in_model.interface import VisionInputSpec
@@ -35,23 +36,24 @@ def _validate_vision_items(
 
         feature_patches = int(feature.shape[0])
         grid_patches = math.prod(get_grid_thw(item))
-        placeholder_tokens = sum(end - start for start, end in item.placeholder_ranges or ())
         output_length = (
             feature_patches // merge_unit
             if output_lengths is None
             else int(output_lengths[item_index])
         )
-
         if feature_patches != grid_patches or feature_patches % merge_unit:
             raise ValueError(
                 f"Vision item {item_index} patch counts must match: "
                 f"feature rows={feature_patches}, grid_thw product={grid_patches}."
             )
-        if placeholder_tokens != output_length:
-            raise ValueError(
-                f"Vision item {item_index} placeholder tokens={placeholder_tokens} do not "
-                f"match the encoder output length={output_length} declared by the model."
-            )
+        # Text preprocessing supplies spans; standalone encoder inputs need none.
+        if item.placeholder_ranges is not None:
+            placeholder_tokens = sum(end - start for start, end in item.placeholder_ranges)
+            if placeholder_tokens != output_length:
+                raise ValueError(
+                    f"Vision item {item_index} placeholder tokens={placeholder_tokens} do not "
+                    f"match the encoder output length={output_length} declared by the model."
+                )
         if not 0 < output_length <= feature_patches // merge_unit:
             raise ValueError(
                 f"Vision item {item_index} output length={output_length} must be in "
@@ -106,6 +108,47 @@ def _bucket_capacity(length: int, unit: int) -> int:
         raise ValueError("patch count must be nonnegative and merge unit positive")
     units = max(1, (length + unit - 1) // unit)
     return (1 << (units - 1).bit_length()) * unit
+
+
+# Sizes are runtime values; compile once at import, before serving requests.
+@njit(
+    types.int32[::1](
+        types.Array(types.int32, 1, "C", readonly=True),
+        types.Array(types.int32, 1, "C", readonly=True),
+        types.int32,
+    ),
+    nogil=True,
+    cache=True,
+)
+def _build_output_indices(output_lengths, output_starts, output_size):
+    output_indices = np.full(output_size, -1, dtype=np.int32)
+    cursor = 0
+    for item_index in range(output_lengths.size):
+        output_len = output_lengths[item_index]
+        source_start = output_starts[item_index]
+        for index in range(output_len):
+            output_indices[cursor + index] = source_start + index
+        cursor += output_len
+    return output_indices
+
+
+def plan_encoder_lanes(item_lengths, num_lanes, *, merge_unit):
+    """Map logical tokens to lane-local encoder output without device work."""
+    lengths = np.asarray(item_lengths, dtype=np.int32)
+    lanes = balance_lanes(lengths.tolist(), num_lanes)
+    capacity = (
+        _bucket_capacity(
+            max(sum(int(lengths[index]) for index in lane) for lane in lanes), merge_unit
+        )
+        // merge_unit
+    )
+    starts = np.empty(len(lengths), dtype=np.int32)
+    for rank, lane in enumerate(lanes):
+        offset = rank * capacity
+        for index in lane:
+            starts[index] = offset
+            offset += int(lengths[index]) // merge_unit
+    return lanes, _build_output_indices(lengths // merge_unit, starts, num_lanes * capacity)
 
 
 def pack_lanes(

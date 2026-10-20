@@ -749,6 +749,7 @@ class TestUnifiedSWAComponentPaged(CustomTestCase):
                 cache.req_to_token_pool.write((0, slice(0, len(row))), row)
                 lock = cache.inc_lock_ref(match.last_device_node)
                 self.rid = rid
+                self.mm_inputs = None
                 self.req_pool_idx = 0
                 self.dp_rank = None
                 self.origin_input_ids = tokens + list(range(10, 14))
