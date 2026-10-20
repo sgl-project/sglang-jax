@@ -69,6 +69,7 @@ from sgl_jax.srt.sampling.sampling_params import DEFAULT_SAMPLING_SEED, Sampling
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
 from sgl_jax.srt.utils.common_utils import get_bool_env_var, pad_to_bucket
+from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 
 if TYPE_CHECKING:
     from sgl_jax.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
@@ -2632,10 +2633,18 @@ class ScheduleBatch:
             # Move to next DP rank's section (fixed stride)
             offset_bs += per_dp_cache_loc_size
 
-        # cache_loc_cpu is a view into the reusable host_buf; PD eager-stash
-        # can overwrite it via _disp(nxt) before this batch's H2D consumes the
-        # view. Single-threaded (native/colocated) callers don't need the copy.
-        if global_server_args_dict.get("pd_disaggregation") == "pathways":
+        # cache_loc_cpu is a view into the reusable host_buf:
+        # - Under Pathways PD, eager-stash can overwrite it via _disp(nxt)
+        #   before this batch's H2D consumes the view.
+        # - On CPU, PjRtCpuClient's zero-copy BufferFromHostBuffer aliases the
+        #   aligned host_buf directly, so the next overlap step's
+        #   _merge_cache_loc would mutate this batch's ForwardBatch.cache_loc
+        #   in-place before forward_thread executes it.
+        if (
+            global_server_args_dict.get("pd_disaggregation") == "pathways"
+            or global_server_args_dict.get("device") == "cpu"
+            or not is_tpu_runtime(self.mesh)
+        ):
             return cache_loc_cpu.copy()
         return cache_loc_cpu
 
