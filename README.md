@@ -6,6 +6,7 @@ The engine incorporates state-of-the-art techniques to maximize hardware utiliza
 
 [![Pypi](https://img.shields.io/badge/pypi-sglang--jax-orange.svg)](https://pypi.org/project/sglang-jax) [![License](https://img.shields.io/badge/license-Apache--2.0-green.svg)](https://github.com/sgl-project/sglang-jax?tab=Apache-2.0-1-ov-file#readme) [![View Code Wiki](https://www.gstatic.com/_/boq-sdlc-agents-ui/_/r/YUi5dj2UWvE.svg)](https://codewiki.google/github.com/sgl-project/sglang-jax)
 
+> **Prefer PyTorch?** [SGLang-TorchTPU](https://github.com/sgl-project/sglang-torchtpu) brings SGLang's PyTorch engine to TPU, alongside SGL-JAX. See the [launch post](https://lmsys.org/blog/2026-10-20-sglang-torchtpu).
 
 ## Key Features
 
